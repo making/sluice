@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+	<parent>
+		<groupId>org.springframework.boot</groupId>
+		<artifactId>spring-boot-starter-parent</artifactId>
+		<version>4.1.1</version>
+		<relativePath/> <!-- lookup parent from repository -->
+	</parent>
+	<groupId>am.ik.sluice</groupId>
+	<artifactId>sluice-parent</artifactId>
+	<version>0.0.1-SNAPSHOT</version>
+	<packaging>pom</packaging>
+	<name>sluice-parent</name>
+	<description>HTTP tunnel over gRPC bidirectional streaming, a Java rewrite of inlets</description>
+
+	<modules>
+		<module>sluice-proto</module>
+		<module>sluice-server</module>
+		<module>sluice-client</module>
+		<module>sluice-it</module>
+	</modules>
+
+	<properties>
+		<java.version>25</java.version>
+		<sluice.version>0.0.1-SNAPSHOT</sluice.version>
+	</properties>
+
+	<dependencyManagement>
+		<dependencies>
+			<dependency>
+				<groupId>am.ik.sluice</groupId>
+				<artifactId>sluice-proto</artifactId>
+				<version>${project.version}</version>
+			</dependency>
+			<dependency>
+				<groupId>am.ik.sluice</groupId>
+				<artifactId>sluice-server</artifactId>
+				<version>${project.version}</version>
+			</dependency>
+			<dependency>
+				<groupId>am.ik.sluice</groupId>
+				<artifactId>sluice-client</artifactId>
+				<version>${project.version}</version>
+			</dependency>
+			<dependency>
+				<groupId>org.jspecify</groupId>
+				<artifactId>jspecify</artifactId>
+				<version>1.0.1</version>
+			</dependency>
+			<dependency>
+				<groupId>com.tngtech.archunit</groupId>
+				<artifactId>archunit-junit5</artifactId>
+				<version>1.4.1</version>
+			</dependency>
+		</dependencies>
+	</dependencyManagement>
+
+	<build>
+		<pluginManagement>
+			<plugins>
+				<plugin>
+					<groupId>io.spring.javaformat</groupId>
+					<artifactId>spring-javaformat-maven-plugin</artifactId>
+					<version>0.0.48</version>
+				</plugin>
+				<plugin>
+					<groupId>am.ik.maven</groupId>
+					<artifactId>nullability-maven-plugin</artifactId>
+					<version>0.5.1</version>
+					<extensions>true</extensions>
+					<executions>
+						<execution>
+							<goals>
+								<goal>configure</goal>
+								<goal>generate-package-info</goal>
+							</goals>
+						</execution>
+					</executions>
+					<configuration>
+						<checking>tests</checking>
+					</configuration>
+				</plugin>
+			</plugins>
+		</pluginManagement>
+	</build>
+
+</project>

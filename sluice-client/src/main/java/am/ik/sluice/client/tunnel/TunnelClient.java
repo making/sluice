@@ -1,0 +1,323 @@
+package am.ik.sluice.client.tunnel;
+
+import org.jspecify.annotations.Nullable;
+
+import java.net.Socket;
+import java.util.UUID;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+import am.ik.sluice.client.config.SluiceClientProperties;
+import am.ik.sluice.client.upstream.UpstreamParser;
+import am.ik.sluice.tunnel.SessionSender;
+import am.ik.sluice.tunnel.SocketRelay;
+import am.ik.sluice.tunnel.VirtualConnection;
+import am.ik.sluice.v1.proto.Frame;
+import am.ik.sluice.v1.proto.TunnelGrpc;
+import io.grpc.Metadata;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.netty.GrpcSslContexts;
+import io.grpc.netty.NettyChannelBuilder;
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
+import io.grpc.stub.ClientCallStreamObserver;
+import io.grpc.stub.ClientResponseObserver;
+import io.grpc.stub.MetadataUtils;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.context.SmartLifecycle;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.core.task.TaskExecutor;
+import org.springframework.stereotype.Component;
+
+/**
+ * Maintains the tunnel stream towards the server: connects, advertises the upstream map,
+ * dials local upstreams on CONNECT, and reconnects with exponential backoff (1s..30s)
+ * when the stream drops.
+ */
+@Component
+public class TunnelClient implements SmartLifecycle {
+
+	private static final Logger log = LoggerFactory.getLogger(TunnelClient.class);
+
+	private static final long BACKOFF_INITIAL_SECONDS = 1;
+
+	private static final long BACKOFF_MAX_SECONDS = 30;
+
+	private static final Metadata.Key<String> TOKEN_HEADER = Metadata.Key.of("authorization",
+			Metadata.ASCII_STRING_MARSHALLER);
+
+	private static final Metadata.Key<String> CLIENT_ID_HEADER = Metadata.Key.of("x-sluice-id",
+			Metadata.ASCII_STRING_MARSHALLER);
+
+	private final SluiceClientProperties properties;
+
+	private final TaskExecutor taskExecutor;
+
+	private final MeterRegistry meterRegistry;
+
+	private final Counter reconnects;
+
+	private final ConcurrentHashMap<Long, VirtualConnection> connections = new ConcurrentHashMap<>();
+
+	private volatile boolean running;
+
+	private volatile boolean connected;
+
+	private volatile @Nullable ManagedChannel channel;
+
+	private volatile @Nullable CountDownLatch shutdown;
+
+	private volatile @Nullable SessionSender currentSender;
+
+	public TunnelClient(SluiceClientProperties properties,
+			@Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor, MeterRegistry meterRegistry) {
+		this.properties = properties;
+		this.taskExecutor = taskExecutor;
+		this.meterRegistry = meterRegistry;
+		this.reconnects = Counter.builder("sluice.reconnect.total")
+			.description("Tunnel stream re-establishments after a drop")
+			.register(meterRegistry);
+		meterRegistry.gauge("sluice.connections.active", this.connections, Map::size);
+	}
+
+	public boolean isConnected() {
+		return this.connected;
+	}
+
+	@Override
+	public void start() {
+		if (this.properties.serverUrl() == null || this.properties.serverUrl().isBlank()) {
+			throw new IllegalStateException("sluice.server-url is required");
+		}
+		Map<String, String> upstreams = UpstreamParser.parse(this.properties.upstream());
+		if (upstreams.isEmpty()) {
+			throw new IllegalStateException("sluice.upstream is required");
+		}
+		this.running = true;
+		this.shutdown = new CountDownLatch(1);
+		this.taskExecutor.execute(() -> runLoop(upstreams));
+	}
+
+	private void runLoop(Map<String, String> upstreams) {
+		LocalConnector connector = new LocalConnector(upstreams, this.properties.strictForwarding(),
+				this.properties.insecure());
+		long backoff = BACKOFF_INITIAL_SECONDS;
+		while (this.running) {
+			try {
+				this.channel = buildChannel();
+				runSession(this.channel, connector, upstreamMap(this.properties.upstream()));
+				backoff = BACKOFF_INITIAL_SECONDS;
+			}
+			catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				return;
+			}
+			catch (Exception e) {
+				if (this.running) {
+					log.warn("tunnel stream ended: {}", e.toString());
+				}
+			}
+			finally {
+				shutdownChannel();
+				this.connected = false;
+			}
+			if (!this.running) {
+				return;
+			}
+			// the next loop iteration is the reconnection attempt
+			this.reconnects.increment();
+			try {
+				TimeUnit.SECONDS.sleep(backoff);
+			}
+			catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				return;
+			}
+			backoff = Math.min(BACKOFF_MAX_SECONDS, backoff * 2);
+		}
+	}
+
+	private Map<String, String> upstreamMap(String upstream) {
+		return UpstreamParser.parse(upstream);
+	}
+
+	private ManagedChannel buildChannel() {
+		String url = this.properties.serverUrl();
+		boolean secure = url.startsWith("grpcs://");
+		String authority = url.replaceFirst("^grpcs?://", "");
+		int portSeparator = authority.lastIndexOf(':');
+		String host = portSeparator > 0 ? authority.substring(0, portSeparator) : authority;
+		int port = portSeparator > 0 ? Integer.parseInt(authority.substring(portSeparator + 1)) : 443;
+		ManagedChannelBuilder<?> builder = ManagedChannelBuilder.forAddress(host, port)
+			.enableRetry()
+			.keepAliveTime(30, TimeUnit.SECONDS);
+		if (!secure) {
+			builder.usePlaintext();
+		}
+		else if (this.properties.insecure()) {
+			try {
+				((NettyChannelBuilder) builder)
+					.sslContext(GrpcSslContexts.forClient().trustManager(InsecureTrustManagerFactory.INSTANCE).build());
+			}
+			catch (Exception e) {
+				throw new IllegalStateException("failed to build insecure SSL context", e);
+			}
+		}
+		return builder.build();
+	}
+
+	private void runSession(ManagedChannel channel, LocalConnector connector, Map<String, String> upstreams)
+			throws InterruptedException {
+		CountDownLatch closed = new CountDownLatch(1);
+		AtomicReference<SessionSender> senderRef = new AtomicReference<>();
+		ClientResponseObserver<Frame, Frame> responseObserver = new ClientResponseObserver<>() {
+
+			@Override
+			public void beforeStart(ClientCallStreamObserver<Frame> call) {
+				// the onReady handler may only be installed during beforeStart
+				SessionSender sender = new SessionSender(call);
+				sender.start();
+				senderRef.set(sender);
+			}
+
+			@Override
+			public void onNext(Frame frame) {
+				handle(frame, connector);
+			}
+
+			@Override
+			public void onError(Throwable t) {
+				log.info("tunnel stream error: {}", t.toString());
+				closed.countDown();
+			}
+
+			@Override
+			public void onCompleted() {
+				log.info("tunnel stream closed by server");
+				closed.countDown();
+			}
+
+		};
+		Metadata metadata = new Metadata();
+		String token = this.properties.tokenValue();
+		if (!token.isBlank()) {
+			metadata.put(TOKEN_HEADER, "Bearer " + token);
+		}
+		metadata.put(CLIENT_ID_HEADER, UUID.randomUUID().toString());
+		TunnelGrpc.newStub(channel)
+			.withWaitForReady()
+			.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(metadata))
+			.connect(responseObserver);
+		SessionSender sender = senderRef.get();
+		if (sender == null) {
+			return; // stream failed before starting
+		}
+		this.currentSender = sender;
+		sender.sendAdvertise(upstreams);
+		this.connected = true;
+		log.info("tunnel established; advertising {} upstream(s)", upstreams.size());
+		closed.await();
+		sender.close();
+	}
+
+	private void handle(Frame frame, LocalConnector connector) {
+		switch (frame.getType()) {
+			case CONNECT -> {
+				// register the virtual connection synchronously so DATA frames that
+				// follow the CONNECT are not dropped before the dial task runs
+				SessionSender sender0 = this.currentSender;
+				if (sender0 == null) {
+					return;
+				}
+				VirtualConnection connection = new VirtualConnection(frame.getConnId(), sender0);
+				this.connections.put(frame.getConnId(), connection);
+				this.taskExecutor.execute(() -> dial(frame, connector, connection));
+			}
+			case DATA -> {
+				VirtualConnection connection = this.connections.get(frame.getConnId());
+				if (connection != null) {
+					connection.acceptData(frame.getPayload().toByteArray());
+				}
+			}
+			case CLOSE -> {
+				VirtualConnection connection = this.connections.get(frame.getConnId());
+				if (connection != null) {
+					connection.remoteClosed();
+				}
+			}
+			case ERROR -> {
+				VirtualConnection connection = this.connections.get(frame.getConnId());
+				if (connection != null) {
+					connection.remoteFailed(frame.getMessage());
+				}
+			}
+			case ADVERTISE -> log.warn("unexpected ADVERTISE from server");
+			case KEEPALIVE -> {
+				// liveness no-op
+			}
+			default -> {
+				// unknown future type: ignore
+			}
+		}
+	}
+
+	private void dial(Frame frame, LocalConnector connector, VirtualConnection connection) {
+		long connectionId = frame.getConnId();
+		String address = frame.getAddress();
+		try {
+			if (!connector.permits(address)) {
+				throw new IllegalArgumentException("upstream not permitted: " + address);
+			}
+			Socket socket = connector.dial(address);
+			SessionSender sender = this.currentSender;
+			if (sender == null) {
+				socket.close();
+				return;
+			}
+			SocketRelay relay = SocketRelay.builder(socket, connection, sender)
+				.onComplete(() -> this.connections.remove(connectionId))
+				.build();
+			relay.start();
+		}
+		catch (Exception e) {
+			log.debug("dial {} failed: {}", address, e.toString());
+			SessionSender sender = this.currentSender;
+			if (sender != null) {
+				sender.sendError(connectionId, e.toString());
+			}
+			this.connections.remove(connectionId);
+			connection.close();
+		}
+	}
+
+	private void shutdownChannel() {
+		ManagedChannel channel = this.channel;
+		if (channel != null && !channel.isShutdown()) {
+			channel.shutdownNow();
+		}
+	}
+
+	@Override
+	public void stop() {
+		this.running = false;
+		this.connected = false;
+		CountDownLatch shutdown = this.shutdown;
+		if (shutdown != null) {
+			shutdown.countDown();
+		}
+		shutdownChannel();
+	}
+
+	@Override
+	public boolean isRunning() {
+		return this.running;
+	}
+
+}

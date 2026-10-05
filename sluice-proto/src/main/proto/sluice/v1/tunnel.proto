@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package sluice.v1;
+
+option java_multiple_files = true;
+option java_package = "am.ik.sluice.v1.proto";
+
+// Tunnel service carrying multiplexed virtual TCP connections over a single
+// bidirectional stream (the gRPC counterpart of inlets' WebSocket tunnel).
+service Tunnel {
+  // Opens the control/data stream. The client authenticates with the
+  // `authorization` metadata and identifies itself with `x-sluice-id`.
+  rpc Connect (stream Frame) returns (stream Frame);
+}
+
+message Frame {
+  enum Type {
+    // Payload for the connection identified by conn_id.
+    DATA = 0;
+    // server -> client: dial request. address holds the target host:port.
+    CONNECT = 1;
+    // Half-close of the sender -> receiver direction for conn_id.
+    CLOSE = 2;
+    // Abnormal termination of conn_id. message holds the cause.
+    ERROR = 3;
+    // client -> server: upstream announcement, sent once after connecting.
+    ADVERTISE = 4;
+    // Either direction: no-op liveness signal.
+    KEEPALIVE = 5;
+  }
+  Type type = 1;
+  int64 conn_id = 2;
+  // DATA: forwarded bytes.
+  bytes payload = 3;
+  // CONNECT: dial target ("host:port").
+  string address = 4;
+  // ADVERTISE: upstreams exposed by the client.
+  repeated Upstream upstreams = 5;
+  // ERROR: human readable cause.
+  string message = 6;
+}
+
+message Upstream {
+  // Public domain the server routes requests for (empty means catch-all).
+  string host = 1;
+  // Upstream URL, e.g. http://127.0.0.1:3000.
+  string target_url = 2;
+}

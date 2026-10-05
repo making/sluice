@@ -1,0 +1,120 @@
+sluice
+======
+
+HTTP tunnel over a gRPC bidirectional stream, built on Spring Boot 4.1 and Spring gRPC.
+
+A single gRPC bidi stream multiplexes virtual TCP connections (`conn_id`). The data plane is a raw TCP proxy: only the Host header of the first request is inspected, so WebSocket upgrades and HTTP keep-alive pass through transparently. All blocking I/O runs on virtual threads; outbound frames flow through a bounded queue honoring gRPC flow control.
+
+Architecture
+------------
+
+```
+                          host:8000                          host:8001
+ browser ──HTTP──► ┌─ sluice-server ─┐◄──gRPC bidi stream── ┌─ sluice-client ─┐ ──TCP──► upstream
+                   │                 │   (Frame: CONNECT /  │                 │          :3000 etc.
+                   │  DataProxyServer│    DATA / CLOSE /    │  TunnelClient   │
+                   │  (raw TCP, Host │    ERROR / ADVERTISE)│  (reconnect,    │
+                   │   header route) │                      │   backoff)      │
+                   │  TunnelService ─┼──────────────────────┼► LocalConnector │
+                   │  Router         │   TunnelSession      │   (strict       │
+                   │  SessionRegistry│   SessionSender      │    forwarding)  │
+                   └────────┬────────┘                      └────────┬────────┘
+                            │ actuator :8081                         │ actuator :9001
+                            ▼                                        ▼
+                       health / prometheus                     health / prometheus
+
+ data plane (server, :8000)              tunnel (gRPC bidi, :8001)                 client side
+ ┌───────────────────────────┐           ┌──────────────────────────┐        ┌────────────────────┐
+ │ accept ─► read first head │ CONNECT(id)│ one stream per client,  │ dial   │ Socket(address)    │
+ │ Host ─► Router.lookup     │ ─────────► │ conn_id multiplexed     │ ─────► │ ▲                  │
+ │ VirtualConnection(id)     │ DATA(id,64K)│ VirtualConnection       │        │ │ byte pump x2     │
+ │ SocketRelay(src=socket)   │ ◄───────── │ (bounded queue 128x64K, │ ◄───── │ │ (virtual threads)│
+ │                            │ DATA/CLOSE │ half-close, backpressure)│       ▼                    │
+ └───────────────────────────┘           └──────────────────────────┘        └────────────────────┘
+```
+
+- one bidi stream per client; each proxied TCP connection becomes a `conn_id` on that stream
+- server: accept, route by `Host`, `VirtualConnection` + `CONNECT`, then raw relay (`SocketRelay`, one virtual thread per direction)
+- client: `CONNECT`, dial the local upstream (strict forwarding), same raw relay; upstream URLs with `https://` are dialed with TLS (trust-all)
+- flow control: bounded queues end to end; the gRPC send path honors `isReady()` on a dedicated sender thread
+
+Modules
+-------
+
+- `sluice-proto` - `.proto` contract, generated stubs, and the shared tunnel primitives (`VirtualConnection`, `SessionSender`, `SocketRelay`)
+- `sluice-server` - exit node: gRPC control plane (`spring.grpc.server.port`, default 8001) + raw TCP data plane (`sluice.data-port`, default 8000) + actuator (`server.port`, default 8081)
+- `sluice-client` - tunnel client: connects to the server, advertises upstreams, dials local upstreams on CONNECT, reconnects with exponential backoff (1s..30s)
+- `sluice-it` - full stack integration tests running the real server and client applications in one JVM (proxying, reconnect after server restart, wrong-token rejection)
+
+Build
+-----
+
+    ./mvnw verify
+
+Requires JDK 25+.
+
+Run
+---
+
+    # server
+    java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
+      --sluice.token=SECRET
+
+    # client
+    java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
+      --sluice.server-url=grpcs://example.com:8001 \
+      --sluice.upstream=demo.local=http://127.0.0.1:3000 \
+      --sluice.token=SECRET
+
+`sluice.server-url` schemes: `grpc://` (plaintext) / `grpcs://` (TLS; `--sluice.insecure=true` skips verification).
+
+Configuration (server)
+----------------------
+
+| Property | Default | Description |
+|---|---|---|
+| `sluice.token` | (empty = no auth) | bearer token for tunnel clients (`Authorization: Bearer <token>`, constant-time compare) |
+| `sluice.token-file` | - | read the token from a file |
+| `sluice.data-host` | `0.0.0.0` | bind address of the data plane |
+| `sluice.data-port` | `8000` | data plane port |
+| `spring.grpc.server.port` | `8001` | gRPC control plane port |
+| `server.port` | `8081` | actuator (health / info / prometheus) |
+
+Configuration (client)
+----------------------
+
+| Property | Default | Description |
+|---|---|---|
+| `sluice.server-url` | - | tunnel server endpoint (`grpc://host:port` / `grpcs://host:port`) |
+| `sluice.upstream` | - | `host=targetUrl,...` pairs (`host` empty = catch-all) |
+| `sluice.token` / `sluice.token-file` | - | authentication token |
+| `sluice.insecure` | `false` | skip TLS verification |
+| `sluice.strict-forwarding` | `true` | only dial upstreams present in the map |
+| `management.server.port` | `9001` | actuator port |
+
+Health / metrics
+----------------
+
+- server `GET /actuator/health` - UP while at least one tunnel client is connected
+- client `GET /actuator/health` - UP while the tunnel stream is established
+- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`
+
+Docker
+------
+
+Images are built with Cloud Native Buildpacks (Spring Boot plugin, no Dockerfile):
+
+    ./mvnw -pl sluice-server -am package spring-boot:build-image -DskipTests
+    ./mvnw -pl sluice-client -am package spring-boot:build-image -DskipTests
+
+This produces `sluice/server:latest` and `sluice/client:latest`. Run:
+
+    docker run -p 8000:8000 -p 8001:8001 sluice/server --sluice.token=SECRET
+    docker run sluice/client --sluice.server-url=grpc://host.docker.internal:8001 \
+      --sluice.upstream=demo.local=http://host.docker.internal:3000 --sluice.token=SECRET
+
+Tests
+-----
+
+- unit: `VirtualConnection` (chunk reassembly / half-close / failure), `Router` (fallback / first-target / replace), `TokenValidator`, `UpstreamParser`, `LocalConnector` (strict forwarding)
+- integration (`sluice-it`): full stack E2E - HTTP round trip and keep-alive reuse, WebSocket passthrough, reconnection after a server restart, and wrong-token rejection, against the real server and client applications
