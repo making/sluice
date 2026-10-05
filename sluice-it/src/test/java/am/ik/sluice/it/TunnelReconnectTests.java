@@ -137,8 +137,8 @@ class TunnelReconnectTests {
 	void clientReconnectsAfterServerRestart() throws Exception {
 		startUpstream();
 		pickPorts();
-		startServer("");
-		startClient("");
+		startServer("it-token");
+		startClient("it-token");
 		Awaitility.await().atMost(Duration.ofSeconds(15)).until(() -> serverRegistry().count() == 1);
 		assertThat(roundTrip()).contains("it-ok");
 
@@ -147,7 +147,7 @@ class TunnelReconnectTests {
 		Objects.requireNonNull(this.serverContext).close();
 		this.serverContext = null;
 		awaitServerPortReleased();
-		startServer("");
+		startServer("it-token");
 		Awaitility.await().atMost(Duration.ofSeconds(30)).until(() -> serverRegistry().count() == 1);
 		assertThat(client.getBean(TunnelClient.class).isConnected()).isTrue();
 		assertThat(roundTrip()).contains("it-ok");

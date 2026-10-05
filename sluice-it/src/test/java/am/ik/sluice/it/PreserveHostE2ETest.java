@@ -133,6 +133,7 @@ class PreserveHostE2ETest {
 		dataPort = freePort();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
+		registry.add("sluice.token", () -> "it-token");
 		registry.add("server.port", () -> String.valueOf(freePort()));
 	}
 
@@ -150,6 +151,7 @@ class PreserveHostE2ETest {
 			SluiceClientProperties properties = SluiceClientProperties.builder()
 				.serverUrl("grpc://127.0.0.1:" + grpcPort)
 				.upstream(h, target, preserveHost)
+				.token("it-token")
 				.build();
 			TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());
 			started.start();

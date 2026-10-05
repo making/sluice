@@ -168,6 +168,7 @@ class WebSocketTunnelE2ETest {
 		int webPort = freePort();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
+		registry.add("sluice.token", () -> "it-token");
 		registry.add("server.port", () -> String.valueOf(webPort));
 	}
 
@@ -188,6 +189,7 @@ class WebSocketTunnelE2ETest {
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
 			.upstream("ws.local", "http://127.0.0.1:" + upstream.getLocalPort())
+			.token("it-token")
 			.build();
 		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());
 		started.start();

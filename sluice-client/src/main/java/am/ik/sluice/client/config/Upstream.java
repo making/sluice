@@ -22,7 +22,7 @@ public record Upstream(String host, String target, boolean preserveHost) {
 
 	private static String normalizeTarget(String target) {
 		String trimmed = target == null ? "" : target.trim();
-		boolean hasScheme = trimmed.startsWith("http://") || trimmed.startsWith("https://");
+		boolean hasScheme = trimmed.matches("[a-zA-Z][a-zA-Z0-9+.\\-]*://.*");
 		return hasScheme || trimmed.isEmpty() ? trimmed : "http://" + trimmed;
 	}
 

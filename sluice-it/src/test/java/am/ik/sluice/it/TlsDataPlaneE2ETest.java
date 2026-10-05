@@ -123,6 +123,7 @@ class TlsDataPlaneE2ETest {
 		keystorePath = createKeystore();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
+		registry.add("sluice.token", () -> "it-token");
 		registry.add("server.port", () -> String.valueOf(freePort()));
 		registry.add("spring.ssl.bundle.jks.data-plane.keystore.location",
 				() -> "file:" + requireNonNull(keystorePath).toAbsolutePath());
@@ -199,6 +200,7 @@ class TlsDataPlaneE2ETest {
 			// the h2 stub doubles as the target for both the h2 and the h1-over-TLS path
 			.upstream("tls.local", "http://127.0.0.1:" + h2Upstream.getLocalPort())
 			.upstream("127.0.0.1", "http://127.0.0.1:" + h1UpstreamAddress.getPort())
+			.token("it-token")
 			.build();
 		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());
 		started.start();
