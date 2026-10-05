@@ -126,7 +126,7 @@ Configuration (server)
 
 | Property | Default | Description |
 |---|---|---|
-| `sluice.token` | (empty = no auth) | bearer token for tunnel clients (`Authorization: Bearer <token>`, constant-time compare) |
+| `sluice.token` | (unset = auto-generated; the generated token is written to a temporary file whose path is logged) | bearer token for tunnel clients (`Authorization: Bearer <token>`, constant-time compare) |
 | `sluice.token-file` | - | read the token from a file |
 | `sluice.data-host` | `0.0.0.0` | bind address of the data plane |
 | `sluice.data-port` | `8000` | data plane port |
