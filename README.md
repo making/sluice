@@ -53,14 +53,33 @@ Build
 
 Requires JDK 25+.
 
+Build the executable jars first (the `-exec.jar` files below are produced by this):
+
+    ./mvnw -DskipTests package
+
 Run
 ---
 
-    # server
+Local, plaintext, with a token:
+
+    # terminal 1: upstream (any HTTP server; here python's)
+    python3 -m http.server 3000 --bind 127.0.0.1
+
+    # terminal 2: server
     java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
       --sluice.token=SECRET
 
-    # client
+    # terminal 3: client
+    java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
+      --sluice.server-url=grpc://127.0.0.1:8001 \
+      --sluice.upstream=demo.local=http://127.0.0.1:3000 \
+      --sluice.token=SECRET
+
+    # terminal 4: request through the tunnel (routed by the Host header)
+    curl -H 'Host: demo.local' http://127.0.0.1:8000/
+
+Against a remote server over TLS, use `grpcs://`:
+
     java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
       --sluice.server-url=grpcs://example.com:8001 \
       --sluice.upstream=demo.local=http://127.0.0.1:3000 \
@@ -71,11 +90,20 @@ Run
 Try it manually
 ---------------
 
-```
-java -jar sluice-server/target/sluice-server-*-exec.jar --spring.grpc.server.port=18001 --sluice.data-port=18000 --server.port=18081
-java -jar sluice-client/target/sluice-client-*-exec.jar --sluice.server-url=grpc://127.0.0.1:18001 --sluice.upstream=demo.local=http://127.0.0.1:31080
-curl -H 'Host: demo.local' http://127.0.0.1:18000/
-```
+Same as above on non-default ports, with a one-shot upstream:
+
+    python3 -m http.server 31080 --bind 127.0.0.1 &
+
+    java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
+      --sluice.token=SECRET \
+      --spring.grpc.server.port=18001 --sluice.data-port=18000 --server.port=18081
+
+    java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
+      --sluice.server-url=grpc://127.0.0.1:18001 \
+      --sluice.upstream=demo.local=http://127.0.0.1:31080 \
+      --sluice.token=SECRET
+
+    curl -H 'Host: demo.local' http://127.0.0.1:18000/
 
 h2c / TLS on the data port (same server + client, upstream of choice):
 
