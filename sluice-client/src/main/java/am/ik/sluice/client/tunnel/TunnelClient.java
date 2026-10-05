@@ -151,8 +151,11 @@ public class TunnelClient implements SmartLifecycle {
 	}
 
 	private void runLoop(Map<String, String> upstreams, List<am.ik.sluice.v1.proto.Upstream> advertised) {
-		LocalConnector connector = new LocalConnector(upstreams, this.properties.strictForwarding(),
-				this.properties.insecure());
+		LocalConnector connector = LocalConnector.builder()
+			.upstreams(upstreams)
+			.strict(this.properties.strictForwarding())
+			.insecure(this.properties.insecure())
+			.build();
 		long backoff = BACKOFF_INITIAL_SECONDS;
 		while (this.running) {
 			try {

@@ -5,6 +5,7 @@ import org.jspecify.annotations.Nullable;
 import java.net.Socket;
 import java.net.URI;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 
 import javax.net.ssl.SSLSocket;
@@ -32,10 +33,50 @@ public class LocalConnector {
 
 	private final boolean insecure;
 
-	public LocalConnector(Map<String, String> upstreams, boolean strict, boolean insecure) {
+	private LocalConnector(Map<String, String> upstreams, boolean strict, boolean insecure) {
 		this.upstreams = upstreams;
 		this.strict = strict;
 		this.insecure = insecure;
+	}
+
+	public static Builder builder() {
+		return new Builder();
+	}
+
+	/**
+	 * Builder for {@link LocalConnector}.
+	 */
+	public static final class Builder {
+
+		@Nullable private Map<String, String> upstreams;
+
+		private boolean strict;
+
+		private boolean insecure;
+
+		private Builder() {
+		}
+
+		public Builder upstreams(Map<String, String> upstreams) {
+			this.upstreams = upstreams;
+			return this;
+		}
+
+		public Builder strict(boolean strict) {
+			this.strict = strict;
+			return this;
+		}
+
+		public Builder insecure(boolean insecure) {
+			this.insecure = insecure;
+			return this;
+		}
+
+		public LocalConnector build() {
+			return new LocalConnector(Objects.requireNonNull(this.upstreams, "upstreams is required"), this.strict,
+					this.insecure);
+		}
+
 	}
 
 	/**

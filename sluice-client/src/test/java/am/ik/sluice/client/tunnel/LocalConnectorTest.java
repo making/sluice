@@ -20,26 +20,35 @@ class LocalConnectorTest {
 
 	@Test
 	void permitsRegisteredHost() {
-		LocalConnector connector = new LocalConnector(Map.of("tcp", "http://example.com"), true, false);
+		LocalConnector connector = LocalConnector.builder()
+			.upstreams(Map.of("tcp", "http://example.com"))
+			.strict(true)
+			.build();
 		assertThat(connector.permits("example.com")).isTrue();
 		assertThat(connector.permits("example.com:80")).isTrue();
 	}
 
 	@Test
 	void rejectsUnregisteredHost() {
-		LocalConnector connector = new LocalConnector(Map.of("tcp", "example.com"), true, false);
+		LocalConnector connector = LocalConnector.builder()
+			.upstreams(Map.of("tcp", "example.com"))
+			.strict(true)
+			.build();
 		assertThat(connector.permits("test.com")).isFalse();
 	}
 
 	@Test
 	void nonStrictPermitsAnyHost() {
-		LocalConnector connector = new LocalConnector(Map.of(), false, false);
+		LocalConnector connector = LocalConnector.builder().upstreams(Map.of()).build();
 		assertThat(connector.permits("test.com")).isTrue();
 	}
 
 	@Test
 	void httpsDefaultPortMatches() {
-		LocalConnector connector = new LocalConnector(Map.of("s", "https://example.com"), true, false);
+		LocalConnector connector = LocalConnector.builder()
+			.upstreams(Map.of("s", "https://example.com"))
+			.strict(true)
+			.build();
 		assertThat(connector.permits("example.com:443")).isTrue();
 	}
 
@@ -57,7 +66,10 @@ class LocalConnectorTest {
 					// ignore
 				}
 			});
-			LocalConnector connector = new LocalConnector(Map.of("local", "http://127.0.0.1:" + port), true, false);
+			LocalConnector connector = LocalConnector.builder()
+				.upstreams(Map.of("local", "http://127.0.0.1:" + port))
+				.strict(true)
+				.build();
 			try (Socket socket = connector.dial("127.0.0.1:" + port)) {
 				assertThat(socket.isConnected()).isTrue();
 			}
@@ -67,7 +79,10 @@ class LocalConnectorTest {
 
 	@Test
 	void dialRejectsUnregisteredHostInStrictMode() {
-		LocalConnector connector = new LocalConnector(Map.of("local", "http://127.0.0.1:1"), true, false);
+		LocalConnector connector = LocalConnector.builder()
+			.upstreams(Map.of("local", "http://127.0.0.1:1"))
+			.strict(true)
+			.build();
 		// unreachable port keeps the test hermetic; the filter rejects before dialing
 		assertThatThrownBy(() -> connector.dial("10.255.255.1:1")).isInstanceOf(Exception.class);
 	}
