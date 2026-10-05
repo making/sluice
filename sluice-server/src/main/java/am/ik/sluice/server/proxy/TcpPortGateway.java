@@ -210,6 +210,7 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 
 	private void relay(Socket socket, int port) {
 		AccessLogger.Connection access = this.accessLogger.accepted("tcp:" + port, socket).transport("tcp");
+		access.accept();
 		try {
 			Optional<Router.Route> route = this.router.lookupByPort(port);
 			TunnelSession session = route.map(r -> this.sessions.find(r.clientId()).orElse(null)).orElse(null);

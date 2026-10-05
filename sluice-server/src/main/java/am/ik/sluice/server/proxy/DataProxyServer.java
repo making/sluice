@@ -147,6 +147,7 @@ public class DataProxyServer implements SmartLifecycle {
 
 	private void handle(Socket socket) {
 		AccessLogger.Connection access = this.accessLogger.accepted("data", socket);
+		access.accept();
 		try {
 			Connection connection = this.transport(socket, access);
 			if (connection == null) {

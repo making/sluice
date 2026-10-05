@@ -138,6 +138,14 @@ public class AccessLogger {
 					version, this.remote);
 		}
 
+		/** Logs the connection acceptance, before route and transport are known. */
+		public void accept() {
+			if (!this.connEnabled || this.noop) {
+				return;
+			}
+			log.info("type=conn id={} event=accept listener={} remote={}", this.id, this.listener, this.remote);
+		}
+
 		public void close() {
 			if (!this.connEnabled || this.noop || this.closed) {
 				return;

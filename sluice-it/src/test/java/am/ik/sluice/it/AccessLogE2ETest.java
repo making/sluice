@@ -156,6 +156,12 @@ class AccessLogE2ETest {
 		}
 		List<String> events = this.awaitCloseEvent("log.local");
 		assertThat(events).anySatisfy(e -> {
+			assertThat(e).startsWith("type=conn id=")
+				.contains("event=accept")
+				.contains("listener=data")
+				.contains("remote=127.0.0.1:");
+		});
+		assertThat(events).anySatisfy(e -> {
 			assertThat(e).startsWith("type=req id=")
 				.contains("route=log.local")
 				.contains("method=GET")
