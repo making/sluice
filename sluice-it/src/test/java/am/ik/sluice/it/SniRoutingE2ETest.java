@@ -231,8 +231,8 @@ class SniRoutingE2ETest {
 		}
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
-			.upstream(HOST_A, "http://127.0.0.1:" + upstreamA.getLocalPort())
-			.upstream(HOST_B, "http://127.0.0.1:" + upstreamB.getLocalPort())
+			.upstream(HOST_A, "tcp://127.0.0.1:" + upstreamA.getLocalPort())
+			.upstream(HOST_B, "tcp://127.0.0.1:" + upstreamB.getLocalPort())
 			.token("it-token")
 			.build();
 		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());

@@ -154,7 +154,7 @@ class TlsPassthroughRedisE2ETest {
 			// routed by the ClientHello SNI host name, not the catch-all
 			// plain TCP dial: the TLS records are relayed end to end, the upstream
 			// terminates TLS (the client-side peer is Lettuce with its own truststore)
-			.upstream(HOST, "redis://127.0.0.1:" + REDIS.getMappedPort(6379))
+			.upstream(HOST, "tcp://127.0.0.1:" + REDIS.getMappedPort(6379))
 			.token("it-token")
 			.build();
 		// @formatter:on

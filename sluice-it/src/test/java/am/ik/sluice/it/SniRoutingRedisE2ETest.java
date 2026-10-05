@@ -154,7 +154,7 @@ class SniRoutingRedisE2ETest {
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
 			// routed by the ClientHello SNI host name observed on the terminated TLS
 			// connection; the upstream is a plain Redis
-			.upstream(HOST, "redis://127.0.0.1:" + REDIS.getMappedPort(6379))
+			.upstream(HOST, "tcp://127.0.0.1:" + REDIS.getMappedPort(6379))
 			.token("it-token")
 			.build();
 		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());

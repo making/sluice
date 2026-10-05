@@ -81,7 +81,7 @@ class RedisE2ETest {
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
 			// RESP carries no host: the catch-all route (empty host) serves it
-			.upstream("", "redis://127.0.0.1:" + REDIS.getMappedPort(6379))
+			.upstream("", "tcp://127.0.0.1:" + REDIS.getMappedPort(6379))
 			.token("it-token")
 			.build();
 		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());

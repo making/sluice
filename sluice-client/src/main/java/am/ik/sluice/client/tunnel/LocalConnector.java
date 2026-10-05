@@ -19,7 +19,8 @@ import org.slf4j.LoggerFactory;
  * Dials the local upstream for a tunnel CONNECT request. In strict mode only addresses
  * matching a declared upstream are dialable (the port of makeFilter); upstream URLs with
  * the {@code https://} scheme are wrapped in a trust-on-first-use style TLS socket
- * mirroring the original's InsecureSkipVerify transport.
+ * mirroring the original's InsecureSkipVerify transport; every other scheme ({@code
+ * http://}, {@code tcp://}, ...) is a raw dial whose bytes are relayed untouched.
  */
 public class LocalConnector {
 

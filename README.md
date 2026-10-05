@@ -121,18 +121,43 @@ TLS termination on the data port (same upstream / server / client):
     curl --http2 -k -H 'Host: demo.local' https://127.0.0.1:8000/ -v -o /dev/null 2>&1 | grep 'using HTTP/2' -A2
     curl --http1.1 -k -H 'Host: demo.local' https://127.0.0.1:8000/
 
-TLS passthrough routed by SNI (no `sluice.data-tls-bundle`): the data plane relays the
-TLS bytes untouched and routes by the ClientHello server name; the upstream terminates
-TLS and presents its own certificate. The upstream target stays a plain `http://` URL —
-the tunneled bytes are the already-encrypted TLS records.
+TLS passthrough routed by SNI: see "SNI routing" below.
+
+SNI routing
+-----------
+
+Two variants route a TLS connection by the server name of its ClientHello:
+
+- **TLS passthrough** (no `sluice.data-tls-bundle`): the data plane relays the TLS
+  bytes untouched and routes by the ClientHello SNI; the upstream terminates TLS and
+  presents its own certificate. The upstream target is a plain `tcp://` URL — the
+  tunneled bytes are the already-encrypted TLS records.
+- **TLS termination** (`sluice.data-tls-bundle` set): the data plane terminates TLS and
+  falls back to the SNI host name when the decrypted stream carries no HTTP `Host`
+  header (any protocol works, e.g. RESP); the upstream target is then an everyday
+  plaintext `tcp://` / `http://` URL.
+
+Passthrough example, all four terminals:
 
     # terminal 1: a TLS upstream (any TLS server works; here openssl's demo server
     #   serving the current directory over HTTPS)
     echo 'it-works-sni' > index.html
+    openssl req -x509 -newkey rsa:2048 -keyout cert-key.pem -out cert.pem -days 1 -nodes -subj /CN=demo.local
     openssl s_server -accept 34443 -cert cert.pem -key cert-key.pem -WWW
 
-    # terminal 2: register it as usual, then request by SNI (no server-side TLS config);
-    #   --resolve sends ClientHello server_name=demo.local to the data port
+    # terminal 2: server (no TLS configuration on the data port)
+    java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
+      --sluice.token=SECRET
+
+    # terminal 3: client; the raw TCP target carries the TLS records as-is
+    java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
+      --sluice.server-url=grpc://127.0.0.1:8001 \
+      --sluice.client.upstream[0].host=demo.local \
+      --sluice.client.upstream[0].target=tcp://127.0.0.1:34443 \
+      --sluice.token=SECRET
+
+    # terminal 4: request by SNI; --resolve sends ClientHello server_name=demo.local
+    #   to the data port
     curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
     # -> it-works-sni
 
@@ -156,7 +181,7 @@ Configuration (client)
 |---|---|---|
 | `sluice.server-url` | - | tunnel server endpoint (`grpc://host:port` / `grpcs://host:port`) |
 | `sluice.client.upstream[n].host` | - | public domain routed by the server (empty = catch-all) |
-| `sluice.client.upstream[n].target` | - | upstream URL (`http://` assumed when the scheme is omitted) |
+| `sluice.client.upstream[n].target` | - | upstream URL: `http://` (default when the scheme is omitted), `https://` (TLS terminated by the client), or `tcp://` (raw relay, e.g. a TLS endpoint in passthrough mode) |
 | `sluice.client.upstream[n].preserve-host` | `true` | `false` rewrites the request Host / `:authority` to the target's `host[:port]` |
 | `sluice.token` / `sluice.token-file` | - | authentication token |
 | `sluice.insecure` | `false` | skip TLS verification |
