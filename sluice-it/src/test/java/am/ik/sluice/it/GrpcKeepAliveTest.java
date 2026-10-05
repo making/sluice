@@ -96,7 +96,7 @@ class GrpcKeepAliveTest {
 
 			@Override
 			public void onNext(Frame frame) {
-				if (frame.getType() == Frame.Type.ADVERTISED) {
+				if (frame.getBodyCase() == Frame.BodyCase.ADVERTISE_ACK) {
 					connected.countDown();
 				}
 			}
@@ -120,7 +120,7 @@ class GrpcKeepAliveTest {
 			.withWaitForReady()
 			.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(metadata))
 			.connect(observer);
-		call.onNext(Frame.newBuilder().setType(Frame.Type.ADVERTISE).build());
+		call.onNext(Frame.newBuilder().setAdvertise(am.ik.sluice.v1.proto.Advertise.getDefaultInstance()).build());
 		assertThat(connected.await(5, TimeUnit.SECONDS)).isTrue();
 		assertThat(error.get()).as("stream error: %s", error.get()).isNull();
 
@@ -142,7 +142,7 @@ class GrpcKeepAliveTest {
 
 			@Override
 			public void onNext(Frame frame) {
-				if (frame.getType() == Frame.Type.ADVERTISED) {
+				if (frame.getBodyCase() == Frame.BodyCase.ADVERTISE_ACK) {
 					reconnect.countDown();
 				}
 			}
@@ -167,7 +167,8 @@ class GrpcKeepAliveTest {
 			.withWaitForReady()
 			.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(secondMetadata))
 			.connect(secondObserver);
-		secondCall.onNext(Frame.newBuilder().setType(Frame.Type.ADVERTISE).build());
+		secondCall
+			.onNext(Frame.newBuilder().setAdvertise(am.ik.sluice.v1.proto.Advertise.getDefaultInstance()).build());
 		assertThat(reconnect.await(5, TimeUnit.SECONDS)).isTrue();
 		assertThat(secondError.get()).as("second stream error: %s", secondError.get()).isNull();
 	}

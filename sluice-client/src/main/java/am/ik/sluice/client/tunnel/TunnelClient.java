@@ -273,7 +273,7 @@ public class TunnelClient implements SmartLifecycle {
 	}
 
 	private void handle(Frame frame, LocalConnector connector, Runnable terminateStream) {
-		switch (frame.getType()) {
+		switch (frame.getBodyCase()) {
 			case CONNECT -> {
 				// register the virtual connection synchronously so DATA frames that
 				// follow the CONNECT are not dropped before the dial task runs
@@ -281,30 +281,33 @@ public class TunnelClient implements SmartLifecycle {
 				if (sender0 == null) {
 					return;
 				}
-				VirtualConnection connection = new VirtualConnection(frame.getConnId(), sender0);
-				this.connections.put(frame.getConnId(), connection);
-				this.taskExecutor.execute(() -> dial(frame, connector, connection));
+				am.ik.sluice.v1.proto.Connect request = frame.getConnect();
+				VirtualConnection connection = new VirtualConnection(request.getConnId(), sender0);
+				this.connections.put(request.getConnId(), connection);
+				this.taskExecutor.execute(() -> dial(request, connector, connection));
 			}
 			case DATA -> {
-				VirtualConnection connection = this.connections.get(frame.getConnId());
+				am.ik.sluice.v1.proto.Data data = frame.getData();
+				VirtualConnection connection = this.connections.get(data.getConnId());
 				if (connection != null) {
-					connection.acceptData(frame.getPayload().toByteArray());
+					connection.acceptData(data.getPayload().toByteArray());
 				}
 			}
 			case CLOSE -> {
-				VirtualConnection connection = this.connections.get(frame.getConnId());
+				VirtualConnection connection = this.connections.get(frame.getClose().getConnId());
 				if (connection != null) {
 					connection.remoteClosed();
 				}
 			}
 			case ERROR -> {
-				VirtualConnection connection = this.connections.get(frame.getConnId());
+				am.ik.sluice.v1.proto.Error error = frame.getError();
+				VirtualConnection connection = this.connections.get(error.getConnId());
 				if (connection != null) {
-					connection.remoteFailed(frame.getMessage());
+					connection.remoteFailed(error.getMessage());
 				}
 			}
-			case ADVERTISED -> {
-				List<Integer> rejected = frame.getRejectedPortsList();
+			case ADVERTISE_ACK -> {
+				List<Integer> rejected = frame.getAdvertiseAck().getRejectedPortsList();
 				if (rejected.isEmpty()) {
 					// the server acknowledged the advertise: the tunnel is up for real
 					this.connected = true;
@@ -316,18 +319,18 @@ public class TunnelClient implements SmartLifecycle {
 				terminateStream.run();
 			}
 			case ADVERTISE -> log.warn("unexpected ADVERTISE from server");
-			case KEEPALIVE -> {
+			case KEEP_ALIVE -> {
 				// liveness no-op
 			}
 			default -> {
-				// unknown future type: ignore
+				// empty or unknown future body: ignore
 			}
 		}
 	}
 
-	private void dial(Frame frame, LocalConnector connector, VirtualConnection connection) {
-		long connectionId = frame.getConnId();
-		String address = frame.getAddress();
+	private void dial(am.ik.sluice.v1.proto.Connect request, LocalConnector connector, VirtualConnection connection) {
+		long connectionId = request.getConnId();
+		String address = request.getAddress();
 		try {
 			if (!connector.permits(address)) {
 				throw new IllegalArgumentException("upstream not permitted: " + address);

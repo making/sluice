@@ -126,9 +126,9 @@ class VirtualConnectionTest {
 		sender.sendData(3, large);
 		assertThat(drained.await(5, TimeUnit.SECONDS)).isTrue();
 		assertThat(sent).hasSize(2);
-		assertThat(sent.get(0).getConnId()).isEqualTo(3);
-		assertThat(sent.get(0).getPayload().size()).isEqualTo(SessionSender.MAX_CHUNK);
-		assertThat(sent.get(1).getPayload().size()).isEqualTo(10);
+		assertThat(sent.get(0).getData().getConnId()).isEqualTo(3);
+		assertThat(sent.get(0).getData().getPayload().size()).isEqualTo(SessionSender.MAX_CHUNK);
+		assertThat(sent.get(1).getData().getPayload().size()).isEqualTo(10);
 	}
 
 	@Test

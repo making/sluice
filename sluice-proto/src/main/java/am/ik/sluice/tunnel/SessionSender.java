@@ -10,6 +10,12 @@ import java.util.concurrent.locks.ReentrantLock;
 
 import java.util.List;
 
+import am.ik.sluice.v1.proto.Advertise;
+import am.ik.sluice.v1.proto.AdvertiseAck;
+import am.ik.sluice.v1.proto.Close;
+import am.ik.sluice.v1.proto.Connect;
+import am.ik.sluice.v1.proto.Data;
+import am.ik.sluice.v1.proto.Error;
 import am.ik.sluice.v1.proto.Frame;
 import am.ik.sluice.v1.proto.Upstream;
 import io.grpc.stub.ClientCallStreamObserver;
@@ -119,12 +125,11 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 	@Override
 	public void sendConnect(long connectionId, String address) {
-		Frame frame = Frame.newBuilder()
-			.setType(Frame.Type.CONNECT)
+		Connect connect = Connect.newBuilder()
 			.setConnId(connectionId)
 			.setAddress(address == null ? "" : address)
 			.build();
-		enqueue(new Payload(frame));
+		enqueue(new Payload(Frame.newBuilder().setConnect(connect).build()));
 	}
 
 	@Override
@@ -133,12 +138,11 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 			int length = Math.min(MAX_CHUNK, payload.length - offset);
 			byte[] chunk = new byte[length];
 			System.arraycopy(payload, offset, chunk, 0, length);
-			Frame frame = Frame.newBuilder()
-				.setType(Frame.Type.DATA)
+			Data data = Data.newBuilder()
 				.setConnId(connectionId)
 				.setPayload(com.google.protobuf.UnsafeByteOperations.unsafeWrap(chunk))
 				.build();
-			if (!enqueue(new Payload(frame))) {
+			if (!enqueue(new Payload(Frame.newBuilder().setData(data).build()))) {
 				return;
 			}
 		}
@@ -148,33 +152,29 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	 * Announces the upstreams to the server (client -> server only).
 	 */
 	public void sendAdvertise(List<Upstream> upstreams) {
-		Frame frame = Frame.newBuilder().setType(Frame.Type.ADVERTISE).addAllUpstreams(upstreams).build();
-		enqueue(new Payload(frame));
+		Advertise advertise = Advertise.newBuilder().addAllUpstreams(upstreams).build();
+		enqueue(new Payload(Frame.newBuilder().setAdvertise(advertise).build()));
 	}
 
 	/**
-	 * Acknowledges an ADVERTISE (server -> client only), listing the listen ports that
-	 * were not bound.
+	 * Acknowledges an {@link Advertise} (server -> client only), listing the listen ports
+	 * that were not bound.
 	 */
-	public void sendAdvertised(List<Integer> rejectedPorts) {
-		Frame frame = Frame.newBuilder().setType(Frame.Type.ADVERTISED).addAllRejectedPorts(rejectedPorts).build();
-		enqueue(new Payload(frame));
+	public void sendAdvertiseAck(List<Integer> rejectedPorts) {
+		AdvertiseAck ack = AdvertiseAck.newBuilder().addAllRejectedPorts(rejectedPorts).build();
+		enqueue(new Payload(Frame.newBuilder().setAdvertiseAck(ack).build()));
 	}
 
 	@Override
 	public void sendClose(long connectionId) {
-		Frame frame = Frame.newBuilder().setType(Frame.Type.CLOSE).setConnId(connectionId).build();
-		enqueue(new Payload(frame));
+		Close close = Close.newBuilder().setConnId(connectionId).build();
+		enqueue(new Payload(Frame.newBuilder().setClose(close).build()));
 	}
 
 	@Override
 	public void sendError(long connectionId, String message) {
-		Frame frame = Frame.newBuilder()
-			.setType(Frame.Type.ERROR)
-			.setConnId(connectionId)
-			.setMessage(message == null ? "" : message)
-			.build();
-		enqueue(new Payload(frame));
+		Error error = Error.newBuilder().setConnId(connectionId).setMessage(message == null ? "" : message).build();
+		enqueue(new Payload(Frame.newBuilder().setError(error).build()));
 	}
 
 	/**

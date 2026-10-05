@@ -13,36 +13,61 @@ service Tunnel {
   rpc Connect (stream Frame) returns (stream Frame);
 }
 
+// Envelope for every message on the tunnel stream; exactly one body is set.
 message Frame {
-  enum Type {
-    // Payload for the connection identified by conn_id.
-    DATA = 0;
-    // server -> client: dial request. address holds the target host:port.
-    CONNECT = 1;
-    // Half-close of the sender -> receiver direction for conn_id.
-    CLOSE = 2;
-    // Abnormal termination of conn_id. message holds the cause.
-    ERROR = 3;
+  oneof body {
+    // Payload for the connection identified by `conn_id`.
+    Data data = 1;
+    // server -> client: dial request.
+    Connect connect = 2;
+    // Half-close of the sender -> receiver direction for `conn_id`.
+    Close close = 3;
+    // Abnormal termination of `conn_id`.
+    Error error = 4;
     // client -> server: upstream announcement, sent once after connecting.
-    ADVERTISE = 4;
+    Advertise advertise = 5;
     // Either direction: no-op liveness signal.
-    KEEPALIVE = 5;
-    // server -> client: acknowledgment of the client's ADVERTISE.
-    ADVERTISED = 6;
+    KeepAlive keep_alive = 6;
+    // server -> client: acknowledgment of the client's `Advertise`.
+    AdvertiseAck advertise_ack = 7;
   }
-  Type type = 1;
-  int64 conn_id = 2;
-  // DATA: forwarded bytes.
-  bytes payload = 3;
-  // CONNECT: dial target ("host:port").
-  string address = 4;
-  // ADVERTISE: upstreams exposed by the client.
-  repeated Upstream upstreams = 5;
-  // ERROR: human readable cause.
-  string message = 6;
-  // ADVERTISED: listen ports the server did not bind (e.g. outside the configured
+}
+
+message Data {
+  int64 conn_id = 1;
+  // Forwarded bytes.
+  bytes payload = 2;
+}
+
+message Connect {
+  int64 conn_id = 1;
+  // Dial target ("host:port").
+  string address = 2;
+}
+
+message Close {
+  int64 conn_id = 1;
+}
+
+message Error {
+  int64 conn_id = 1;
+  // Human readable cause.
+  string message = 2;
+}
+
+message Advertise {
+  // Upstream services exposed by the client.
+  repeated Upstream upstreams = 1;
+}
+
+message KeepAlive {
+}
+
+// Acknowledgment of the client's `Advertise`.
+message AdvertiseAck {
+  // Listen ports the server did not bind (e.g. outside the configured
   // tcp-port-range); empty means every advertised route was accepted.
-  repeated uint32 rejected_ports = 7;
+  repeated uint32 rejected_ports = 1;
 }
 
 message Upstream {
@@ -58,5 +83,5 @@ message Upstream {
   bool tls_passthrough = 4;
   // Public port the server listens on to relay raw TCP connections for this upstream
   // verbatim (routed by listen port, no head parsing; 0 disables port routing).
-  int32 listen_port = 5;
+  uint32 listen_port = 5;
 }

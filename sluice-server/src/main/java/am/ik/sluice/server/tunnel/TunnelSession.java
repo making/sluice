@@ -128,14 +128,15 @@ public final class TunnelSession implements AutoCloseable {
 	 * Handles one frame received from the client.
 	 */
 	void handle(Frame frame) {
-		switch (frame.getType()) {
+		switch (frame.getBodyCase()) {
 			case ADVERTISE -> {
-				int registered = this.router.register(this.clientId, frame.getUpstreamsList());
-				Set<Integer> rejected = this.tcpRoutes.reconcile(this.clientId, listenPorts(frame.getUpstreamsList()));
-				this.sender.sendAdvertised(List.copyOf(rejected));
+				List<am.ik.sluice.v1.proto.Upstream> advertised = frame.getAdvertise().getUpstreamsList();
+				int registered = this.router.register(this.clientId, advertised);
+				Set<Integer> rejected = this.tcpRoutes.reconcile(this.clientId, listenPorts(advertised));
+				this.sender.sendAdvertiseAck(List.copyOf(rejected));
 				log.info("client {} advertised {} upstream(s), {} listen port(s) rejected", this.clientId, registered,
 						rejected.size());
-				for (am.ik.sluice.v1.proto.Upstream upstream : frame.getUpstreamsList()) {
+				for (am.ik.sluice.v1.proto.Upstream upstream : advertised) {
 					log.info(
 							"client {} upstream: host=[{}] target={} preserve-host={} tls-passthrough={} listen-port={}",
 							this.clientId, upstream.getHost(), upstream.getTargetUrl(), upstream.getPreserveHost(),
@@ -143,29 +144,31 @@ public final class TunnelSession implements AutoCloseable {
 				}
 			}
 			case DATA -> {
-				VirtualConnection connection = this.connections.get(frame.getConnId());
+				am.ik.sluice.v1.proto.Data data = frame.getData();
+				VirtualConnection connection = this.connections.get(data.getConnId());
 				if (connection != null) {
-					connection.acceptData(frame.getPayload().toByteArray());
+					connection.acceptData(data.getPayload().toByteArray());
 				}
 			}
 			case CLOSE -> {
-				VirtualConnection connection = this.connections.get(frame.getConnId());
+				VirtualConnection connection = this.connections.get(frame.getClose().getConnId());
 				if (connection != null) {
 					connection.remoteClosed();
 				}
 			}
 			case ERROR -> {
-				VirtualConnection connection = this.connections.get(frame.getConnId());
+				am.ik.sluice.v1.proto.Error error = frame.getError();
+				VirtualConnection connection = this.connections.get(error.getConnId());
 				if (connection != null) {
-					connection.remoteFailed(frame.getMessage());
+					connection.remoteFailed(error.getMessage());
 				}
 			}
 			case CONNECT -> log.warn("unexpected CONNECT from client {}", this.clientId);
-			case KEEPALIVE -> {
+			case KEEP_ALIVE -> {
 				// liveness no-op
 			}
 			default -> {
-				// unknown future type: ignore
+				// empty or unknown future body: ignore
 			}
 		}
 	}
