@@ -210,9 +210,3 @@ This produces `sluice/server:latest` and `sluice/client:latest`. Run:
     docker run -p 8000:8000 -p 8001:8001 sluice/server --sluice.token=SECRET
     docker run sluice/client --sluice.server-url=grpc://host.docker.internal:8001 \
       --sluice.client.upstream[0].host=demo.local --sluice.client.upstream[0].target=http://host.docker.internal:3000 --sluice.token=SECRET
-
-Tests
------
-
-- unit: `VirtualConnection` (chunk reassembly / half-close / failure), `Router` (fallback / first-target / replace), `TokenValidator`, `UpstreamParser`, `LocalConnector` (strict forwarding)
-- integration (`sluice-it`): full stack E2E - HTTP round trip and keep-alive reuse, WebSocket passthrough, reconnection after a server restart, and wrong-token rejection, against the real server and client applications
