@@ -57,14 +57,22 @@ public final class ConnectionHeadParser {
 	public record H2Head(byte[] prefix, byte[] headerBlock, byte[] suffix, int streamId) {
 	}
 
-	public record Head(@Nullable String host, byte[] bytes, @Nullable H2Head h2) {
+	public record Head(@Nullable String host, byte[] bytes, @Nullable H2Head h2, boolean encrypted) {
 
 		public static Head http1(byte[] bytes, @Nullable String host) {
-			return new Head(host, bytes, null);
+			return new Head(host, bytes, null, false);
 		}
 
 		public static Head http2(byte[] bytes, @Nullable String host, @Nullable H2Head h2) {
-			return new Head(host, bytes, h2);
+			return new Head(host, bytes, h2, false);
+		}
+
+		/**
+		 * A TLS passthrough head: {@code host} is the SNI value and the bytes are relayed
+		 * verbatim (the rewriter must not touch TLS records).
+		 */
+		public static Head encrypted(byte[] bytes, @Nullable String host) {
+			return new Head(host, bytes, null, true);
 		}
 
 	}

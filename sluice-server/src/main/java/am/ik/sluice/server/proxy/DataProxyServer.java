@@ -41,9 +41,10 @@ import org.slf4j.LoggerFactory;
  * header (HTTP/1.1) or {@code :authority} (HTTP/2 prior knowledge) of the request head
  * and relays it, byte for byte, over a virtual connection of the matching tunnel session.
  * Because only the request head is inspected, WebSocket upgrades, h2c upgrade, and HTTP
- * keep-alive pass through transparently. When an SSL bundle is configured, connections
- * whose first byte is a TLS handshake are terminated locally (ALPN: h2 preferred over
- * http/1.1) before routing.
+ * keep-alive pass through transparently. A TLS handshake (first byte {@code 0x16}) is
+ * either terminated locally when an SSL bundle is configured (ALPN: h2 preferred over
+ * http/1.1), or relayed untouched in passthrough mode otherwise, routed by the SNI host
+ * name of the ClientHello (the backend terminates TLS and presents its own certificate).
  */
 @Component
 public class DataProxyServer implements SmartLifecycle {
@@ -153,8 +154,9 @@ public class DataProxyServer implements SmartLifecycle {
 	}
 
 	/**
-	 * Peeks the first byte to detect a TLS handshake, terminates TLS when configured,
-	 * then parses the connection head for routing.
+	 * Peeks the first byte to detect a TLS handshake, terminates TLS when an SSL bundle
+	 * is configured, routes by SNI in passthrough mode otherwise, and parses the
+	 * connection head for routing.
 	 */
 	private @Nullable Connection transport(Socket socket) throws Exception {
 		InputStream in = socket.getInputStream();
@@ -176,6 +178,16 @@ public class DataProxyServer implements SmartLifecycle {
 			in = ssl.getInputStream();
 			socket = ssl;
 		}
+		else if (first == TLS_HANDSHAKE) {
+			// tls passthrough: route by the ClientHello SNI, relay the bytes untouched;
+			// the consumed first byte is pushed back so the parser sees the whole record
+			PushbackInputStream pushback = new PushbackInputStream(in);
+			pushback.unread(first);
+			SniHeadParser.Head sni = new SniHeadParser(HEAD_LIMIT).parse(pushback)
+				.orElseThrow(() -> new IllegalArgumentException("unrecognized tls handshake"));
+			log.debug("tls passthrough; sni={}", sni.sni());
+			return Connection.of(socket, ConnectionHeadParser.Head.encrypted(sni.bytes(), sni.sni()));
+		}
 		else {
 			PushbackInputStream pushback = new PushbackInputStream(in);
 			pushback.unread(first);
@@ -195,19 +207,22 @@ public class DataProxyServer implements SmartLifecycle {
 		Optional<Router.Route> route = this.router.lookup(conn.head().host());
 		TunnelSession session = route.map(r -> this.sessions.find(r.clientId()).orElse(null)).orElse(null);
 		if (session == null) {
-			try (OutputStream out = conn.pipe().sink()) {
-				out.write(SERVICE_UNAVAILABLE);
-				out.flush();
-			}
-			catch (Exception e) {
-				log.debug("failed to write service unavailable: {}", e.toString());
+			// a passthrough peer mid TLS handshake expects TLS records, not an HTTP error
+			if (!conn.head().encrypted()) {
+				try (OutputStream out = conn.pipe().sink()) {
+					out.write(SERVICE_UNAVAILABLE);
+					out.flush();
+				}
+				catch (Exception e) {
+					log.debug("failed to write service unavailable: {}", e.toString());
+				}
 			}
 			this.close(conn.socket());
 			return;
 		}
 		Router.Route route0 = route.get();
 		VirtualConnection connection = session.open(route0.address());
-		byte[] head = route0.preserveHost() ? conn.head().bytes()
+		byte[] head = route0.preserveHost() || conn.head().encrypted() ? conn.head().bytes()
 				: ConnectionHeadRewriter.rewrite(conn.head(), route0.address());
 		StreamRelay relay = StreamRelay.builder(conn.pipe(), connection, session.sender())
 			.prefix(head)

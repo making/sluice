@@ -121,6 +121,21 @@ TLS termination on the data port (same upstream / server / client):
     curl --http2 -k -H 'Host: demo.local' https://127.0.0.1:8000/ -v -o /dev/null 2>&1 | grep 'using HTTP/2' -A2
     curl --http1.1 -k -H 'Host: demo.local' https://127.0.0.1:8000/
 
+TLS passthrough routed by SNI (no `sluice.data-tls-bundle`): the data plane relays the
+TLS bytes untouched and routes by the ClientHello server name; the upstream terminates
+TLS and presents its own certificate. The upstream target stays a plain `http://` URL —
+the tunneled bytes are the already-encrypted TLS records.
+
+    # terminal 1: a TLS upstream (any TLS server works; here openssl's demo server
+    #   serving the current directory over HTTPS)
+    echo 'it-works-sni' > index.html
+    openssl s_server -accept 34443 -cert cert.pem -key cert-key.pem -WWW
+
+    # terminal 2: register it as usual, then request by SNI (no server-side TLS config);
+    #   --resolve sends ClientHello server_name=demo.local to the data port
+    curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
+    # -> it-works-sni
+
 Configuration (server)
 ----------------------
 
@@ -130,7 +145,7 @@ Configuration (server)
 | `sluice.token-file` | - | read the token from a file |
 | `sluice.data-host` | `0.0.0.0` | bind address of the data plane |
 | `sluice.data-port` | `8000` | data plane port |
-| `sluice.data-tls-bundle` | - | SSL bundle name for data plane TLS termination (h2 / http/1.1 via ALPN); unset = plaintext only |
+| `sluice.data-tls-bundle` | - | SSL bundle name for data plane TLS termination (h2 / http/1.1 via ALPN); unset = plaintext only. With no bundle, TLS ClientHellos are relayed untouched and routed by the ClientHello SNI host name (TLS passthrough; the backend terminates TLS and presents its own certificate) |
 | `spring.grpc.server.port` | `8001` | gRPC control plane port |
 | `server.port` | `8081` | actuator (health / info / prometheus) |
 
