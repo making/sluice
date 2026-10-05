@@ -135,6 +135,12 @@ public final class TunnelSession implements AutoCloseable {
 				this.sender.sendAdvertised(List.copyOf(rejected));
 				log.info("client {} advertised {} upstream(s), {} listen port(s) rejected", this.clientId, registered,
 						rejected.size());
+				for (am.ik.sluice.v1.proto.Upstream upstream : frame.getUpstreamsList()) {
+					log.info(
+							"client {} upstream: host=[{}] target={} preserve-host={} tls-passthrough={} listen-port={}",
+							this.clientId, upstream.getHost(), upstream.getTargetUrl(), upstream.getPreserveHost(),
+							upstream.getTlsPassthrough(), upstream.getListenPort());
+				}
 			}
 			case DATA -> {
 				VirtualConnection connection = this.connections.get(frame.getConnId());
