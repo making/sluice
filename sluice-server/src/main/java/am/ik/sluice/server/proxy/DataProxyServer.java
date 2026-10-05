@@ -74,7 +74,9 @@ public class DataProxyServer implements SmartLifecycle {
 
 	private final SluiceServerProperties properties;
 
-	private final Counter relayedBytes;
+	private static final String METRIC_NAME = "sluice.tunnel.bytes";
+
+	private final MeterRegistry meterRegistry;
 
 	private final TaskExecutor taskExecutor;
 
@@ -90,12 +92,9 @@ public class DataProxyServer implements SmartLifecycle {
 		this.router = router;
 		this.sessions = sessions;
 		this.properties = properties;
+		this.meterRegistry = meterRegistry;
 		this.taskExecutor = taskExecutor;
 		this.sslContext = sslContext;
-		this.relayedBytes = Counter.builder("sluice.tunnel.bytes")
-			.tag("direction", "data")
-			.description("Bytes relayed through the data plane")
-			.register(meterRegistry);
 	}
 
 	/**
@@ -256,10 +255,15 @@ public class DataProxyServer implements SmartLifecycle {
 				: ConnectionHeadRewriter.rewrite(conn.head(), route0.address());
 		StreamRelay relay = StreamRelay.builder(conn.pipe(), connection, session.sender())
 			.prefix(head)
-			.listener(this.relayedBytes::increment)
+			.listener(this.relayedBytes(route0))
 			.onComplete(() -> session.remove(connection.connectionId()))
 			.build();
 		relay.start();
+	}
+
+	private StreamRelay.Listener relayedBytes(Router.Route route) {
+		Counter counter = this.meterRegistry.counter(METRIC_NAME, "direction", "data", "route", route.routeTag());
+		return counter::increment;
 	}
 
 	private void close(Socket socket) {

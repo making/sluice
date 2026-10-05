@@ -53,7 +53,9 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 
 	private final TaskExecutor taskExecutor;
 
-	private final Counter relayedBytes;
+	private static final String METRIC_NAME = "sluice.tunnel.bytes";
+
+	private final MeterRegistry meterRegistry;
 
 	private final ConcurrentMap<Integer, BoundListener> listeners = new ConcurrentHashMap<>();
 
@@ -66,11 +68,7 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 		this.properties = properties;
 		this.tcpPortRange = TcpPortRange.parse(properties.tcpPortRange());
 		this.taskExecutor = taskExecutor;
-		this.relayedBytes = Counter.builder("sluice.tunnel.bytes")
-			.tag("direction", "data")
-			.tag("route", "port")
-			.description("Bytes relayed through the data plane")
-			.register(meterRegistry);
+		this.meterRegistry = meterRegistry;
 	}
 
 	/**
@@ -216,7 +214,7 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 			}
 			VirtualConnection connection = session.open(route.get().address());
 			StreamRelay relay = StreamRelay.builder(DuplexPipe.of(socket), connection, session.sender())
-				.listener(this.relayedBytes::increment)
+				.listener(this.relayedBytes(route.get()))
 				.onComplete(() -> session.remove(connection.connectionId()))
 				.build();
 			relay.start();
@@ -225,6 +223,11 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 			log.debug("tcp route connection failed on port {}: {}", port, e.toString());
 			this.close(socket);
 		}
+	}
+
+	private StreamRelay.Listener relayedBytes(Router.Route route) {
+		Counter counter = this.meterRegistry.counter(METRIC_NAME, "direction", "data", "route", route.routeTag());
+		return counter::increment;
 	}
 
 	private void close(Socket socket) {

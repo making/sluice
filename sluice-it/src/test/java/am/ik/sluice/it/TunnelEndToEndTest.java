@@ -9,6 +9,9 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 
 import com.sun.net.httpserver.HttpServer;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterAll;
@@ -126,6 +129,9 @@ class TunnelEndToEndTest {
 	@Autowired
 	DataProxyServer dataProxyServer;
 
+	@Autowired
+	MeterRegistry meterRegistry;
+
 	@Test
 	void requestRoundTripsThroughTunnel() throws Exception {
 		startClient();
@@ -134,6 +140,22 @@ class TunnelEndToEndTest {
 		Response response = exchange(false);
 		assertThat(response.statusLine).startsWith("HTTP/1.1 200");
 		assertThat(response.body).isEqualTo("hello-from-upstream");
+	}
+
+	@Test
+	void relayedBytesAreCountedPerRoute() throws Exception {
+		startClient();
+		exchange(false);
+		Awaitility.await()
+			.atMost(Duration.ofSeconds(5))
+			.until(() -> this.meterRegistry.find("sluice.tunnel.bytes")
+				.tags("direction", "data", "route", "demo.local")
+				.counter() != null);
+		Counter counter = this.meterRegistry.find("sluice.tunnel.bytes")
+			.tags("direction", "data", "route", "demo.local")
+			.counter();
+		assertThat(counter).isNotNull();
+		assertThat(counter.count()).isPositive();
 	}
 
 	@Test

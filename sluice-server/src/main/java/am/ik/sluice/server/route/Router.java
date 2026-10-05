@@ -27,12 +27,24 @@ import am.ik.sluice.v1.proto.Upstream;
 public class Router {
 
 	/**
-	 * Resolved route: the client owning the upstream, its dial address, whether the
-	 * request Host header passes through unmodified, and whether TLS connections are
-	 * relayed untouched ({@code tls-passthrough}) instead of terminated on the data
-	 * plane.
+	 * Resolved route: the client owning the upstream, the domain the route is registered
+	 * under, its dial address, whether the request Host header passes through unmodified,
+	 * and whether TLS connections are relayed untouched ({@code tls-passthrough}) instead
+	 * of terminated on the data plane.
 	 */
-	public record Route(String clientId, String address, boolean preserveHost, boolean tlsPassthrough) {
+	public record Route(String clientId, String domain, String address, int listenPort, boolean preserveHost,
+			boolean tlsPassthrough) {
+
+		/**
+		 * The route identity used for metrics: the domain, falling back to the listen
+		 * port (tcp routes may carry no domain) and finally the catch-all marker.
+		 */
+		public String routeTag() {
+			if (!this.domain.isEmpty()) {
+				return this.domain;
+			}
+			return this.listenPort > 0 ? "tcp:" + this.listenPort : "*";
+		}
 
 		public static Builder builder() {
 			return new Builder();
@@ -42,7 +54,11 @@ public class Router {
 
 			private @Nullable String clientId;
 
+			private @Nullable String domain;
+
 			private @Nullable String address;
+
+			private int listenPort;
 
 			private boolean preserveHost = true;
 
@@ -56,8 +72,18 @@ public class Router {
 				return this;
 			}
 
+			public Builder domain(String domain) {
+				this.domain = domain;
+				return this;
+			}
+
 			public Builder address(String address) {
 				this.address = address;
+				return this;
+			}
+
+			public Builder listenPort(int listenPort) {
+				this.listenPort = listenPort;
 				return this;
 			}
 
@@ -73,7 +99,8 @@ public class Router {
 
 			public Route build() {
 				return new Route(Objects.requireNonNull(this.clientId, "clientId is required"),
-						Objects.requireNonNull(this.address, "address is required"), this.preserveHost,
+						Objects.requireNonNull(this.domain, "domain is required"),
+						Objects.requireNonNull(this.address, "address is required"), this.listenPort, this.preserveHost,
 						this.tlsPassthrough);
 			}
 
@@ -261,7 +288,9 @@ public class Router {
 	private static Route toRoute(Target target) {
 		return Route.builder()
 			.clientId(target.clientId())
+			.domain(target.domain())
 			.address(target.address())
+			.listenPort(target.listenPort())
 			.preserveHost(target.preserveHost())
 			.tlsPassthrough(target.tlsPassthrough())
 			.build();
