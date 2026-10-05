@@ -161,7 +161,9 @@ public class TunnelClient implements SmartLifecycle {
 			try {
 				this.channel = buildChannel();
 				runSession(this.channel, connector, advertised);
-				backoff = BACKOFF_INITIAL_SECONDS;
+				if (this.connected) {
+					backoff = BACKOFF_INITIAL_SECONDS;
+				}
 			}
 			catch (InterruptedException e) {
 				Thread.currentThread().interrupt();
@@ -256,8 +258,8 @@ public class TunnelClient implements SmartLifecycle {
 			metadata.put(TOKEN_HEADER, "Bearer " + token);
 		}
 		metadata.put(CLIENT_ID_HEADER, UUID.randomUUID().toString());
+		log.info("connecting to {} ...", this.properties.serverUrl());
 		TunnelGrpc.newStub(channel)
-			.withWaitForReady()
 			.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(metadata))
 			.connect(responseObserver);
 		SessionSender sender = senderRef.get();
@@ -266,8 +268,6 @@ public class TunnelClient implements SmartLifecycle {
 		}
 		this.currentSender = sender;
 		sender.sendAdvertise(upstreams);
-		this.connected = true;
-		log.info("tunnel established; advertising {} upstream(s)", upstreams.size());
 		closed.await();
 		sender.close();
 	}
@@ -306,6 +306,9 @@ public class TunnelClient implements SmartLifecycle {
 			case ADVERTISED -> {
 				List<Integer> rejected = frame.getRejectedPortsList();
 				if (rejected.isEmpty()) {
+					// the server acknowledged the advertise: the tunnel is up for real
+					this.connected = true;
+					log.info("tunnel established; advertising {} upstream(s)", this.properties.upstreamMap().size());
 					return;
 				}
 				log.warn("server rejected listen ports {} on advertise; closing the stream to re-advertise", rejected);
