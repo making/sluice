@@ -10,7 +10,7 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  */
 @ConfigurationProperties("sluice")
 public record SluiceServerProperties(String token, @Nullable String tokenFile, @DefaultValue("0.0.0.0") String dataHost,
-		@DefaultValue("8000") int dataPort) {
+		@DefaultValue("8000") int dataPort, @Nullable String dataTlsBundle) {
 
 	public SluiceServerProperties {
 		dataHost = dataHost == null || dataHost.isBlank() ? "0.0.0.0" : dataHost;
@@ -29,6 +29,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		@Nullable private String dataHost;
 
 		private int dataPort = 8000;
+
+		@Nullable private String dataTlsBundle;
 
 		private Builder() {
 		}
@@ -53,9 +55,14 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			return this;
 		}
 
+		public Builder dataTlsBundle(String dataTlsBundle) {
+			this.dataTlsBundle = dataTlsBundle;
+			return this;
+		}
+
 		public SluiceServerProperties build() {
 			return new SluiceServerProperties(this.token == null ? "" : this.token, this.tokenFile,
-					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort);
+					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort, this.dataTlsBundle);
 		}
 
 	}

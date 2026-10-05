@@ -22,11 +22,8 @@ The data plane relays raw bytes (only the Host header of the first request is in
 
 ## Manual E2E check
 
-```
-java -jar sluice-server/target/sluice-server-*-exec.jar --spring.grpc.server.port=18001 --sluice.data-port=18000 --server.port=18081
-java -jar sluice-client/target/sluice-client-*-exec.jar --sluice.server-url=grpc://127.0.0.1:18001 --sluice.upstream=demo.local=http://127.0.0.1:31080
-curl -H 'Host: demo.local' http://127.0.0.1:18000/
-```
+See "Try it manually" in README.md.
+
 
 ## Open work
 

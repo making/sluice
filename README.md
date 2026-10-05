@@ -68,6 +68,31 @@ Run
 
 `sluice.server-url` schemes: `grpc://` (plaintext) / `grpcs://` (TLS; `--sluice.insecure=true` skips verification).
 
+Try it manually
+---------------
+
+```
+java -jar sluice-server/target/sluice-server-*-exec.jar --spring.grpc.server.port=18001 --sluice.data-port=18000 --server.port=18081
+java -jar sluice-client/target/sluice-client-*-exec.jar --sluice.server-url=grpc://127.0.0.1:18001 --sluice.upstream=demo.local=http://127.0.0.1:31080
+curl -H 'Host: demo.local' http://127.0.0.1:18000/
+```
+
+h2c / TLS on the data port (same server + client, upstream of choice):
+
+    # h2c prior knowledge (routed by :authority)
+    curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:18000/ -v -o /dev/null 2>&1 | grep 'using HTTP/2'
+
+    # TLS: self-signed cert registered as an SSL bundle, then restart the server with
+    #   --sluice.data-tls-bundle=data-plane
+    #   --spring.ssl.bundle.pem.data-plane.keystore.certificate=cert.pem
+    #   --spring.ssl.bundle.pem.data-plane.keystore.private-key=cert-key.pem
+    openssl req -x509 -newkey rsa:2048 -keyout cert-key.pem -out cert.pem -days 1 -nodes -subj /CN=localhost
+
+    # h2 over TLS (ALPN) / http/1.1 fallback / plaintext on the same port
+    curl --http2 -k -H 'Host: demo.local' https://127.0.0.1:18000/ -v -o /dev/null 2>&1 | grep 'using HTTP/2' -A2
+    curl --http1.1 -k -H 'Host: demo.local' https://127.0.0.1:18000/
+    curl -H 'Host: demo.local' http://127.0.0.1:18000/
+
 Configuration (server)
 ----------------------
 
@@ -77,6 +102,7 @@ Configuration (server)
 | `sluice.token-file` | - | read the token from a file |
 | `sluice.data-host` | `0.0.0.0` | bind address of the data plane |
 | `sluice.data-port` | `8000` | data plane port |
+| `sluice.data-tls-bundle` | - | SSL bundle name for data plane TLS termination (h2 / http/1.1 via ALPN); unset = plaintext only |
 | `spring.grpc.server.port` | `8001` | gRPC control plane port |
 | `server.port` | `8081` | actuator (health / info / prometheus) |
 
