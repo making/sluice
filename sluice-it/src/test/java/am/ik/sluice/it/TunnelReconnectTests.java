@@ -74,7 +74,7 @@ class TunnelReconnectTests {
 		ConfigurableApplicationContext context = new SpringApplicationBuilder(SluiceServerApplication.class).run(
 				"--server.port=" + this.webPort, "--spring.grpc.server.port=" + this.grpcPort,
 				"--sluice.data-port=" + this.dataPort, "--sluice.token=" + token,
-				"--spring.threads.virtual.enabled=true");
+				"--spring.threads.virtual.enabled=true", "--spring.grpc.server.shutdown.grace-period=2s");
 		this.serverContext = context;
 	}
 
