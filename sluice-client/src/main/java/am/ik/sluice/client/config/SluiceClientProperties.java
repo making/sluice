@@ -1,5 +1,6 @@
 package am.ik.sluice.client.config;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -24,11 +25,15 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * @param tokenFile file to read the authentication token from
  * @param insecure skip TLS verification
  * @param strictForwarding only dial upstreams present in the upstream map
+ * @param keepAliveTime interval of the gRPC keepalive ping towards the server
+ * @param keepAliveTimeout how long a keepalive ping answer may take before the channel is
+ * torn down
  */
 @ConfigurationProperties("sluice")
 public record SluiceClientProperties(String serverUrl, @Nullable Client client, String token,
 		@Nullable String tokenFile, @DefaultValue("false") boolean insecure,
-		@DefaultValue("true") boolean strictForwarding) {
+		@DefaultValue("true") boolean strictForwarding, @DefaultValue("30s") Duration keepAliveTime,
+		@DefaultValue("10s") Duration keepAliveTimeout) {
 
 	/**
 	 * Tunnel settings configured under {@code sluice.client}.
@@ -112,6 +117,10 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 
 		private boolean strictForwarding = true;
 
+		private Duration keepAliveTime = Duration.ofSeconds(30);
+
+		private Duration keepAliveTimeout = Duration.ofSeconds(10);
+
 		private Builder() {
 		}
 
@@ -145,10 +154,20 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 			return this;
 		}
 
+		public Builder keepAliveTime(Duration keepAliveTime) {
+			this.keepAliveTime = keepAliveTime;
+			return this;
+		}
+
+		public Builder keepAliveTimeout(Duration keepAliveTimeout) {
+			this.keepAliveTimeout = keepAliveTimeout;
+			return this;
+		}
+
 		public SluiceClientProperties build() {
 			return new SluiceClientProperties(Objects.requireNonNull(this.serverUrl, "serverUrl is required"),
 					new Client(List.copyOf(this.upstreams)), this.token == null ? "" : this.token, this.tokenFile,
-					this.insecure, this.strictForwarding);
+					this.insecure, this.strictForwarding, this.keepAliveTime, this.keepAliveTimeout);
 		}
 
 	}

@@ -198,7 +198,8 @@ public class TunnelClient implements SmartLifecycle {
 		int port = portSeparator > 0 ? Integer.parseInt(authority.substring(portSeparator + 1)) : 443;
 		ManagedChannelBuilder<?> builder = ManagedChannelBuilder.forAddress(host, port)
 			.enableRetry()
-			.keepAliveTime(30, TimeUnit.SECONDS);
+			.keepAliveTime(this.properties.keepAliveTime().toSeconds(), TimeUnit.SECONDS)
+			.keepAliveTimeout(this.properties.keepAliveTimeout().toSeconds(), TimeUnit.SECONDS);
 		if (!secure) {
 			builder.usePlaintext();
 		}

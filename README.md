@@ -224,8 +224,28 @@ Configuration (client)
 | `sluice.client.upstream[n].listen-port` | `0` | public port the server listens on for this upstream; connections are relayed as raw TCP routed by the listen port -- no head parsing, no rewriting -- so any protocol (ssh, postgres, redis, ...) tunnels through. The listener is bound on advertise and released on disconnect; bind it on the host (`docker -p`, firewall) to expose it |
 | `sluice.token` / `sluice.token-file` | - | authentication token |
 | `sluice.insecure` | `false` | skip TLS verification |
+| `sluice.keep-alive-time` | `30s` | interval of the gRPC keepalive ping towards the server |
+| `sluice.keep-alive-timeout` | `10s` | how long a keepalive ping answer may take before the channel is torn down |
 | `sluice.strict-forwarding` | `true` | only dial upstreams present in the map |
 | `management.server.port` | `9001` | actuator port |
+
+gRPC keepalive
+--------------
+
+The tunnel is one long-lived gRPC stream; NAT / load balancers silently drop idle
+connections, so both sides keep it warm with HTTP/2 pings and the server-side values are
+set explicitly in `sluice-server/src/main/resources/application.properties`:
+
+| Setting | Value | Reason |
+|---|---|---|
+| server `spring.grpc.server.keepalive.time` / `spring.grpc.server.keepalive.timeout` | `30s` / `10s` | the server pings clients and reaps dead ones (session and routes released ~40s after silent death) |
+| server `spring.grpc.server.keepalive.permit.time` / `spring.grpc.server.keepalive.permit.without-calls` | `10s` / `true` | client pings every 30s; grpc's default permit (5m) risks `GOAWAY TOO_MANY_PINGS` |
+| client `sluice.keep-alive-time` / `sluice.keep-alive-timeout` | `30s` / `10s` | pings keep NAT mappings alive; an unanswered ping tears the channel down and the reconnect backoff (1s..30s) takes over |
+
+Application-level `KEEPALIVE` frames are not sent: the gRPC (HTTP/2) ping already
+provides liveness. The frame type stays in the proto for future use and is handled as a
+no-op on both sides. `GrpcKeepAliveTest` (sluice-it) guards the behavior with a 1s-ping
+channel.
 
 Health / metrics
 ----------------
