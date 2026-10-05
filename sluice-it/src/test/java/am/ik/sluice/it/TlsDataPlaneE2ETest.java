@@ -32,6 +32,7 @@ import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
+import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.tunnel.SessionRegistry;
@@ -198,8 +199,14 @@ class TlsDataPlaneE2ETest {
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
 			// the h2 stub doubles as the target for both the h2 and the h1-over-TLS path
-			.upstream("tls.local", "http://127.0.0.1:" + h2Upstream.getLocalPort())
-			.upstream("127.0.0.1", "http://127.0.0.1:" + h1UpstreamAddress.getPort())
+			.upstream(Upstream.builder()
+				.host("tls.local")
+				.target("http://127.0.0.1:" + h2Upstream.getLocalPort())
+				.build())
+			.upstream(Upstream.builder()
+				.host("127.0.0.1")
+				.target("http://127.0.0.1:" + h1UpstreamAddress.getPort())
+				.build())
 			.token("it-token")
 			.build();
 		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());

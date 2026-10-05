@@ -48,4 +48,7 @@ message Upstream {
   // When false the server rewrites the request Host/:authority to the target's
   // host[:port] before relaying; when true the head bytes pass through verbatim.
   bool preserve_host = 3;
+  // TLS connections for this upstream are relayed untouched (routed by ClientHello
+  // SNI, the upstream terminates TLS) instead of terminated on the data plane.
+  bool tls_passthrough = 4;
 }

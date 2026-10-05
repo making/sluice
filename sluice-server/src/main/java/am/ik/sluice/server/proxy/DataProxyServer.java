@@ -169,14 +169,32 @@ public class DataProxyServer implements SmartLifecycle {
 		if (first < 0) {
 			return null;
 		}
-		// captured from the ClientHello server_name extension during termination
+		// captured from the ClientHello server_name extension
 		AtomicReference<String> sni = new AtomicReference<>();
-		SSLSocketFactory factory = this.tlsFactory();
-		if (first == TLS_HANDSHAKE && factory != null) {
-			// the consumed byte is replayed into the ssl handshake via the consumed
-			// stream
-			SSLSocket ssl = (SSLSocket) factory.createSocket(socket,
-					new ByteArrayInputStream(new byte[] { (byte) first }), true);
+		if (first == TLS_HANDSHAKE) {
+			// parse the ClientHello first: the route (resolved by SNI) decides between
+			// termination and passthrough
+			PushbackInputStream pushback = new PushbackInputStream(in);
+			pushback.unread(first);
+			SniHeadParser.Head hello = new SniHeadParser(HEAD_LIMIT).parse(pushback)
+				.orElseThrow(() -> new IllegalArgumentException("unrecognized tls handshake"));
+			// an unresolved route keeps the legacy behavior: terminate when a bundle is
+			// configured, passthrough otherwise
+			boolean passthrough = this.router.lookup(hello.sni())
+				.map(Router.Route::tlsPassthrough)
+				.orElseGet(() -> this.tlsFactory() == null);
+			if (passthrough) {
+				// relay the TLS records untouched; the upstream terminates TLS
+				log.debug("tls passthrough; sni={}", hello.sni());
+				return Connection.of(socket, ConnectionHeadParser.Head.encrypted(hello.bytes(), hello.sni()));
+			}
+			SSLSocketFactory factory = this.tlsFactory();
+			if (factory == null) {
+				log.debug("no ssl bundle to terminate tls for sni={}", hello.sni());
+				return null;
+			}
+			// the consumed ClientHello bytes are replayed into the ssl handshake
+			SSLSocket ssl = (SSLSocket) factory.createSocket(socket, new ByteArrayInputStream(hello.bytes()), true);
 			ssl.setUseClientMode(false);
 			SSLParameters parameters = ssl.getSSLParameters();
 			parameters.setSNIMatchers(List.<SNIMatcher>of(new SNIMatcher(0) {
@@ -194,16 +212,6 @@ public class DataProxyServer implements SmartLifecycle {
 			log.debug("tls handshake done; protocol={} sni={}", ssl.getApplicationProtocol(), sni.get());
 			in = ssl.getInputStream();
 			socket = ssl;
-		}
-		else if (first == TLS_HANDSHAKE) {
-			// tls passthrough: route by the ClientHello SNI, relay the bytes untouched;
-			// the consumed first byte is pushed back so the parser sees the whole record
-			PushbackInputStream pushback = new PushbackInputStream(in);
-			pushback.unread(first);
-			SniHeadParser.Head passthrough = new SniHeadParser(HEAD_LIMIT).parse(pushback)
-				.orElseThrow(() -> new IllegalArgumentException("unrecognized tls handshake"));
-			log.debug("tls passthrough; sni={}", passthrough.sni());
-			return Connection.of(socket, ConnectionHeadParser.Head.encrypted(passthrough.bytes(), passthrough.sni()));
 		}
 		else {
 			PushbackInputStream pushback = new PushbackInputStream(in);

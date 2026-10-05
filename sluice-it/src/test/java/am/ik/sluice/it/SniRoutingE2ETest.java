@@ -29,6 +29,7 @@ import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
+import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.tunnel.SessionRegistry;
@@ -231,8 +232,16 @@ class SniRoutingE2ETest {
 		}
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
-			.upstream(HOST_A, "tcp://127.0.0.1:" + upstreamA.getLocalPort())
-			.upstream(HOST_B, "tcp://127.0.0.1:" + upstreamB.getLocalPort())
+			.upstream(Upstream.builder()
+				.host(HOST_A)
+				.target("tcp://127.0.0.1:" + upstreamA.getLocalPort())
+				.tlsPassthrough(true)
+				.build())
+			.upstream(Upstream.builder()
+				.host(HOST_B)
+				.target("tcp://127.0.0.1:" + upstreamB.getLocalPort())
+				.tlsPassthrough(true)
+				.build())
 			.token("it-token")
 			.build();
 		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());

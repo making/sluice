@@ -128,14 +128,14 @@ SNI routing
 
 Two variants route a TLS connection by the server name of its ClientHello:
 
-- **TLS passthrough** (no `sluice.data-tls-bundle`): the data plane relays the TLS
-  bytes untouched and routes by the ClientHello SNI; the upstream terminates TLS and
-  presents its own certificate. The upstream target is a plain `tcp://` URL — the
-  tunneled bytes are the already-encrypted TLS records.
-- **TLS termination** (`sluice.data-tls-bundle` set): the data plane terminates TLS and
-  falls back to the SNI host name when the decrypted stream carries no HTTP `Host`
-  header (any protocol works, e.g. RESP); the upstream target is then an everyday
-  plaintext `tcp://` / `http://` URL.
+- **TLS passthrough** (`sluice.client.upstream[n].tls-passthrough=true`): the data
+  plane relays the TLS bytes untouched and routes by the ClientHello SNI; the upstream
+  terminates TLS and presents its own certificate. The upstream target is a plain
+  `tcp://` URL — the tunneled bytes are the already-encrypted TLS records.
+- **TLS termination** (the default): the data plane terminates TLS (an SSL bundle via
+  `sluice.data-tls-bundle` is required) and falls back to the SNI host name when the
+  decrypted stream carries no HTTP `Host` header (any protocol works, e.g. RESP); the
+  upstream target is then an everyday plaintext `tcp://` / `http://` URL.
 
 Passthrough example, all four terminals:
 
@@ -149,11 +149,12 @@ Passthrough example, all four terminals:
     java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
       --sluice.token=SECRET
 
-    # terminal 3: client; the raw TCP target carries the TLS records as-is
+    # terminal 3: client; tls-passthrough relays the TLS records as-is
     java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
       --sluice.server-url=grpc://127.0.0.1:8001 \
       --sluice.client.upstream[0].host=demo.local \
       --sluice.client.upstream[0].target=tcp://127.0.0.1:34443 \
+      --sluice.client.upstream[0].tls-passthrough=true \
       --sluice.token=SECRET
 
     # terminal 4: request by SNI; --resolve sends ClientHello server_name=demo.local
@@ -170,7 +171,7 @@ Configuration (server)
 | `sluice.token-file` | - | read the token from a file |
 | `sluice.data-host` | `0.0.0.0` | bind address of the data plane |
 | `sluice.data-port` | `8000` | data plane port |
-| `sluice.data-tls-bundle` | - | SSL bundle name for data plane TLS termination (h2 / http/1.1 via ALPN); unset = plaintext only. With no bundle, TLS ClientHellos are relayed untouched and routed by the ClientHello SNI host name (TLS passthrough; the backend terminates TLS and presents its own certificate) |
+| `sluice.data-tls-bundle` | - | SSL bundle name for data plane TLS termination (h2 / http/1.1 via ALPN); unset = plaintext only (TLS connections are served by upstreams with `tls-passthrough=true`) |
 | `spring.grpc.server.port` | `8001` | gRPC control plane port |
 | `server.port` | `8081` | actuator (health / info / prometheus) |
 
@@ -183,6 +184,7 @@ Configuration (client)
 | `sluice.client.upstream[n].host` | - | public domain routed by the server (empty = catch-all) |
 | `sluice.client.upstream[n].target` | - | upstream URL: `http://` (default when the scheme is omitted), `https://` (TLS terminated by the client), or `tcp://` (raw relay, e.g. a TLS endpoint in passthrough mode) |
 | `sluice.client.upstream[n].preserve-host` | `true` | `false` rewrites the request Host / `:authority` to the target's `host[:port]` |
+| `sluice.client.upstream[n].tls-passthrough` | `false` | TLS connections for this upstream are relayed untouched (routed by ClientHello SNI, the upstream terminates TLS) instead of terminated on the data plane |
 | `sluice.token` / `sluice.token-file` | - | authentication token |
 | `sluice.insecure` | `false` | skip TLS verification |
 | `sluice.strict-forwarding` | `true` | only dial upstreams present in the map |

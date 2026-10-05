@@ -18,6 +18,7 @@ import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
+import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.proxy.DataProxyServer;
@@ -92,7 +93,10 @@ class TunnelEndToEndTest {
 		}
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
-			.upstream("demo.local", "http://127.0.0.1:" + upstream.getAddress().getPort())
+			.upstream(Upstream.builder()
+				.host("demo.local")
+				.target("http://127.0.0.1:" + upstream.getAddress().getPort())
+				.build())
 			.token("it-token")
 			.build();
 		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());

@@ -12,6 +12,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
+import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.tunnel.SessionRegistry;
@@ -81,7 +82,7 @@ class RedisE2ETest {
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
 			// RESP carries no host: the catch-all route (empty host) serves it
-			.upstream("", "tcp://127.0.0.1:" + REDIS.getMappedPort(6379))
+			.upstream(Upstream.builder().host("").target("tcp://127.0.0.1:" + REDIS.getMappedPort(6379)).build())
 			.token("it-token")
 			.build();
 		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());

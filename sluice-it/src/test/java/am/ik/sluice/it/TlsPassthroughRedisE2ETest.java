@@ -20,6 +20,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.MountableFile;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
+import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.tunnel.SessionRegistry;
@@ -154,7 +155,7 @@ class TlsPassthroughRedisE2ETest {
 			// routed by the ClientHello SNI host name, not the catch-all
 			// plain TCP dial: the TLS records are relayed end to end, the upstream
 			// terminates TLS (the client-side peer is Lettuce with its own truststore)
-			.upstream(HOST, "tcp://127.0.0.1:" + REDIS.getMappedPort(6379))
+			.upstream(Upstream.builder().host(HOST).target("tcp://127.0.0.1:" + REDIS.getMappedPort(6379)).tlsPassthrough(true).build())
 			.token("it-token")
 			.build();
 		// @formatter:on

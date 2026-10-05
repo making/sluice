@@ -20,6 +20,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
+import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.tunnel.SessionRegistry;
@@ -154,7 +155,7 @@ class SniRoutingRedisE2ETest {
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
 			// routed by the ClientHello SNI host name observed on the terminated TLS
 			// connection; the upstream is a plain Redis
-			.upstream(HOST, "tcp://127.0.0.1:" + REDIS.getMappedPort(6379))
+			.upstream(Upstream.builder().host(HOST).target("tcp://127.0.0.1:" + REDIS.getMappedPort(6379)).build())
 			.token("it-token")
 			.build();
 		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());

@@ -88,6 +88,7 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 				.setHost(upstream.host())
 				.setTargetUrl(upstream.target())
 				.setPreserveHost(upstream.preserveHost())
+				.setTlsPassthrough(upstream.tlsPassthrough())
 				.build())
 			.toList();
 	}
@@ -118,12 +119,8 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 			return this;
 		}
 
-		public Builder upstream(String host, String target) {
-			return this.upstream(host, target, true);
-		}
-
-		public Builder upstream(String host, String target, boolean preserveHost) {
-			this.upstreams.add(new Upstream(host, target, preserveHost));
+		public Builder upstream(Upstream upstream) {
+			this.upstreams.add(upstream);
 			return this;
 		}
 

@@ -11,6 +11,7 @@ import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -26,13 +27,115 @@ import am.ik.sluice.v1.proto.Upstream;
 public class Router {
 
 	/**
-	 * Resolved route: the client owning the upstream, its dial address, and whether the
-	 * request Host header passes through unmodified.
+	 * Resolved route: the client owning the upstream, its dial address, whether the
+	 * request Host header passes through unmodified, and whether TLS connections are
+	 * relayed untouched ({@code tls-passthrough}) instead of terminated on the data
+	 * plane.
 	 */
-	public record Route(String clientId, String address, boolean preserveHost) {
+	public record Route(String clientId, String address, boolean preserveHost, boolean tlsPassthrough) {
+
+		public static Builder builder() {
+			return new Builder();
+		}
+
+		public static final class Builder {
+
+			private @Nullable String clientId;
+
+			private @Nullable String address;
+
+			private boolean preserveHost = true;
+
+			private boolean tlsPassthrough;
+
+			private Builder() {
+			}
+
+			public Builder clientId(String clientId) {
+				this.clientId = clientId;
+				return this;
+			}
+
+			public Builder address(String address) {
+				this.address = address;
+				return this;
+			}
+
+			public Builder preserveHost(boolean preserveHost) {
+				this.preserveHost = preserveHost;
+				return this;
+			}
+
+			public Builder tlsPassthrough(boolean tlsPassthrough) {
+				this.tlsPassthrough = tlsPassthrough;
+				return this;
+			}
+
+			public Route build() {
+				return new Route(Objects.requireNonNull(this.clientId, "clientId is required"),
+						Objects.requireNonNull(this.address, "address is required"), this.preserveHost,
+						this.tlsPassthrough);
+			}
+
+		}
+
 	}
 
-	record Target(String clientId, String domain, String address, boolean preserveHost) {
+	record Target(String clientId, String domain, String address, boolean preserveHost, boolean tlsPassthrough) {
+
+		static Builder builder() {
+			return new Builder();
+		}
+
+		static final class Builder {
+
+			private @Nullable String clientId;
+
+			private @Nullable String domain;
+
+			private @Nullable String address;
+
+			private boolean preserveHost = true;
+
+			private boolean tlsPassthrough;
+
+			private Builder() {
+			}
+
+			Builder clientId(String clientId) {
+				this.clientId = clientId;
+				return this;
+			}
+
+			Builder domain(String domain) {
+				this.domain = domain;
+				return this;
+			}
+
+			Builder address(String address) {
+				this.address = address;
+				return this;
+			}
+
+			Builder preserveHost(boolean preserveHost) {
+				this.preserveHost = preserveHost;
+				return this;
+			}
+
+			Builder tlsPassthrough(boolean tlsPassthrough) {
+				this.tlsPassthrough = tlsPassthrough;
+				return this;
+			}
+
+			Target build() {
+				return new Target(Objects.requireNonNull(this.clientId, "clientId is required"),
+						Objects.requireNonNull(this.domain, "domain is required"),
+						Objects.requireNonNull(this.address, "address is required"), this.preserveHost,
+						this.tlsPassthrough);
+			}
+
+		}
+
 	}
 
 	private final ConcurrentMap<String, List<Target>> byDomain = new ConcurrentHashMap<>();
@@ -54,7 +157,13 @@ public class Router {
 			if (address == null) {
 				continue;
 			}
-			targets.add(new Target(clientId, domain, address, upstream.getPreserveHost()));
+			targets.add(Target.builder()
+				.clientId(clientId)
+				.domain(domain)
+				.address(address)
+				.preserveHost(upstream.getPreserveHost())
+				.tlsPassthrough(upstream.getTlsPassthrough())
+				.build());
 		}
 		if (clientId == null || clientId.isBlank() || targets.isEmpty()) {
 			return 0;
@@ -116,7 +225,12 @@ public class Router {
 			List<Target> targets = this.byDomain.get(candidate);
 			if (targets != null && !targets.isEmpty()) {
 				Target target = targets.get(0);
-				return Optional.of(new Route(target.clientId(), target.address(), target.preserveHost()));
+				return Optional.of(Route.builder()
+					.clientId(target.clientId())
+					.address(target.address())
+					.preserveHost(target.preserveHost())
+					.tlsPassthrough(target.tlsPassthrough())
+					.build());
 			}
 		}
 		return Optional.empty();

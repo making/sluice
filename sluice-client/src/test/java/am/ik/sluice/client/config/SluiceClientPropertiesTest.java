@@ -21,7 +21,7 @@ class SluiceClientPropertiesTest {
 	void builderCompletesSchemeAndDefaultsPreserveHost() {
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:8001")
-			.upstream("demo.local", "127.0.0.1:8080")
+			.upstream(Upstream.builder().host("demo.local").target("127.0.0.1:8080").build())
 			.build();
 		assertThat(properties.upstreamMap()).containsEntry("demo.local", "http://127.0.0.1:8080");
 		assertThat(properties.toProtoUpstreams()).singleElement().satisfies(upstream -> {
@@ -35,8 +35,8 @@ class SluiceClientPropertiesTest {
 	void builderKeepsExplicitSchemeAndPreserveHostFlag() {
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:8001")
-			.upstream("a.local", "https://192.0.2.1:8443")
-			.upstream("", "example.com:80", false)
+			.upstream(Upstream.builder().host("a.local").target("https://192.0.2.1:8443").build())
+			.upstream(Upstream.builder().host("").target("example.com:80").preserveHost(false).build())
 			.build();
 		assertThat(properties.upstreamMap()).containsEntry("a.local", "https://192.0.2.1:8443")
 			.containsEntry("", "http://example.com:80");

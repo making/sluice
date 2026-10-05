@@ -20,6 +20,7 @@ import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
+import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.proxy.ConnectionHeadParser;
@@ -150,7 +151,7 @@ class PreserveHostE2ETest {
 		clients.computeIfAbsent(host, h -> {
 			SluiceClientProperties properties = SluiceClientProperties.builder()
 				.serverUrl("grpc://127.0.0.1:" + grpcPort)
-				.upstream(h, target, preserveHost)
+				.upstream(Upstream.builder().host(h).target(target).preserveHost(preserveHost).build())
 				.token("it-token")
 				.build();
 			TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());
