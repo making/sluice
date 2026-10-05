@@ -75,8 +75,8 @@ Run
       --sluice.token=SECRET
 
     # terminal 4: request through the tunnel (routed by the Host header / :authority)
-    curl -H 'Host: demo.local' http://127.0.0.1:8000/actuator/health
-    curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:8000/actuator/health
+    curl -H 'Host: demo.local' http://127.0.0.1:8000/
+    curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:8000/
 
 `sluice.server-url` schemes: `grpc://` (plaintext) / `grpcs://` (TLS; `--sluice.insecure=true` skips verification).
 
@@ -89,18 +89,8 @@ TLS termination on the data port (same upstream / server / client):
     openssl req -x509 -newkey rsa:2048 -keyout cert-key.pem -out cert.pem -days 1 -nodes -subj /CN=localhost
 
     # h2 over TLS (ALPN) / http/1.1 fallback / plaintext on the same port
-    curl --http2 -k -H 'Host: demo.local' https://127.0.0.1:8000/actuator/health -v -o /dev/null 2>&1 | grep 'using HTTP/2' -A2
-    curl --http1.1 -k -H 'Host: demo.local' https://127.0.0.1:8000/actuator/health
-
-    # TLS: self-signed cert registered as an SSL bundle, then restart the server with
-    #   --sluice.data-tls-bundle=data-plane
-    #   --spring.ssl.bundle.pem.data-plane.keystore.certificate=cert.pem
-    #   --spring.ssl.bundle.pem.data-plane.keystore.private-key=cert-key.pem
-    openssl req -x509 -newkey rsa:2048 -keyout cert-key.pem -out cert.pem -days 1 -nodes -subj /CN=localhost
-
-    # h2 over TLS (ALPN) / http/1.1 fallback on the same port
-    curl --http2 -k -H 'Host: demo.local' https://127.0.0.1:8000/actuator/health -v -o /dev/null 2>&1 | grep 'using HTTP/2' -A2
-    curl --http1.1 -k -H 'Host: demo.local' https://127.0.0.1:8000/actuator/health
+    curl --http2 -k -H 'Host: demo.local' https://127.0.0.1:8000/ -v -o /dev/null 2>&1 | grep 'using HTTP/2' -A2
+    curl --http1.1 -k -H 'Host: demo.local' https://127.0.0.1:8000/
 
 Configuration (server)
 ----------------------
