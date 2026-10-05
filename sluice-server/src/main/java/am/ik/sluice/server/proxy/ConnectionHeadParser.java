@@ -128,7 +128,12 @@ public final class ConnectionHeadParser {
 						return Optional.of(Head.hostless(bytes));
 					}
 				}
-				else if (endsWithDoubleCrlf(bytes)) {
+				else if (headerEnd(bytes) >= 0) {
+					// the head ends at the blank line; consumed bytes beyond it (a body
+					// or
+					// pipelined request arriving in the same segment) are preserved: they
+					// are
+					// replayed with the head and never re-read from the stream
 					return Optional.of(Head.http1(bytes, http1HostOf(bytes)));
 				}
 			}
@@ -289,13 +294,18 @@ public final class ConnectionHeadParser {
 		return null;
 	}
 
-	private static boolean endsWithDoubleCrlf(byte[] bytes) {
-		if (bytes == null || bytes.length < 4) {
-			return false;
+	/**
+	 * The index just past the blank line that terminates an HTTP/1.1 header section
+	 * ({@code \r\n\r\n}) anywhere in the buffer; {@code -1} while the head is still
+	 * incomplete.
+	 */
+	static int headerEnd(byte[] bytes) {
+		for (int i = 0; i + 3 < bytes.length; i++) {
+			if (bytes[i] == '\r' && bytes[i + 1] == '\n' && bytes[i + 2] == '\r' && bytes[i + 3] == '\n') {
+				return i + 4;
+			}
 		}
-		int length = bytes.length;
-		return bytes[length - 4] == '\r' && bytes[length - 3] == '\n' && bytes[length - 2] == '\r'
-				&& bytes[length - 1] == '\n';
+		return -1;
 	}
 
 	/**

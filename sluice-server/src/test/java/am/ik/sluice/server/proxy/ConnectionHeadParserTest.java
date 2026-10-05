@@ -170,6 +170,19 @@ class ConnectionHeadParserTest {
 	}
 
 	@Test
+	void http1HeadIsCompleteWhenBodyFollowsInTheSameSegment() throws IOException {
+		// a POST whose headers and body arrive in one read: the head ends at the blank
+		// line, the body bytes that follow are consumed but must be preserved
+		byte[] head = "POST / HTTP/1.1\r\nHost: demo.local\r\nContent-Length: 7\r\n\r\na=1&b=2"
+			.getBytes(StandardCharsets.US_ASCII);
+		ConnectionHeadParser.Head parsed = PARSER.parse(new ByteArrayInputStream(head)).orElseThrow();
+		assertThat(parsed.host()).isEqualTo("demo.local");
+		assertThat(parsed.request()).isNotNull();
+		assertThat(parsed.request().method()).isEqualTo("POST");
+		assertThat(parsed.bytes()).isEqualTo(head);
+	}
+
+	@Test
 	void partialHttp1HeadIsNotComplete() throws IOException {
 		byte[] head = "GET / HTTP/1.1\r\nHost: a".getBytes(StandardCharsets.US_ASCII);
 		assertThat(PARSER.parse(new ByteArrayInputStream(head))).isEmpty();

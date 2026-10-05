@@ -43,10 +43,15 @@ final class ConnectionHeadRewriter {
 	}
 
 	private static byte[] rewriteHttp1(byte[] head, String authority) {
-		if (!isAscii(head)) {
+		int headerEnd = ConnectionHeadParser.headerEnd(head);
+		if (headerEnd < 0) {
+			headerEnd = head.length;
+		}
+		byte[] header = java.util.Arrays.copyOfRange(head, 0, headerEnd);
+		if (!isAscii(header)) {
 			return head;
 		}
-		String[] lines = new String(head, StandardCharsets.US_ASCII).split("\r\n", -1);
+		String[] lines = new String(header, StandardCharsets.US_ASCII).split("\r\n", -1);
 		boolean replaced = false;
 		for (int i = 1; i < lines.length - 1; i++) {
 			int colon = lines[i].indexOf(':');
@@ -61,7 +66,11 @@ final class ConnectionHeadRewriter {
 		if (!replaced) {
 			return head;
 		}
-		return String.join("\r\n", lines).getBytes(StandardCharsets.US_ASCII);
+		byte[] rewrittenHeader = String.join("\r\n", lines).getBytes(StandardCharsets.US_ASCII);
+		byte[] rewritten = new byte[rewrittenHeader.length + head.length - headerEnd];
+		System.arraycopy(rewrittenHeader, 0, rewritten, 0, rewrittenHeader.length);
+		System.arraycopy(head, headerEnd, rewritten, rewrittenHeader.length, head.length - headerEnd);
+		return rewritten;
 	}
 
 	private static byte[] rewriteHttp2(H2Head h2, String authority, byte[] original) {
