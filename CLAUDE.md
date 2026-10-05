@@ -10,6 +10,7 @@ Maven multi-module. Build + test with `./mvnw verify` (JDK 25 required).
 - `sluice-server`: gRPC control plane (8001) + raw TCP data plane (`sluice.data-port`, 8000) + actuator (8081)
 - `sluice-client`: tunnel client. grpc:// / grpcs:// (TLS verification skip via `sluice.insecure`)
 - `sluice-it`: full stack E2E tests (real server + client apps in one JVM); E2E tests live here, not in the app modules
+- `sluice-example-upstream`: minimal sample upstream (`It works`, http/1.1 + h2c) for manual checks
 
 The data plane relays raw bytes (only the Host header of the first request is inspected). Honoring half-close (CLOSE frame) is essential for keep-alive / WebSocket passthrough.
 

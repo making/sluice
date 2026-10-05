@@ -19,6 +19,7 @@
 		<module>sluice-proto</module>
 		<module>sluice-server</module>
 		<module>sluice-client</module>
+		<module>sluice-example-upstream</module>
 		<module>sluice-it</module>
 	</modules>
 

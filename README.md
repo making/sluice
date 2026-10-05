@@ -45,6 +45,7 @@ Modules
 - `sluice-server` - exit node: gRPC control plane (`spring.grpc.server.port`, default 8001) + raw TCP data plane (`sluice.data-port`, default 8000) + actuator (`server.port`, default 8081)
 - `sluice-client` - tunnel client: connects to the server, advertises upstreams, dials local upstreams on CONNECT, reconnects with exponential backoff (1s..30s)
 - `sluice-it` - full stack integration tests running the real server and client applications in one JVM (proxying, reconnect after server restart, wrong-token rejection)
+- `sluice-example-upstream` - minimal sample upstream for manual checks (`It works` over http/1.1 and h2c)
 
 Build
 -----
@@ -60,8 +61,8 @@ Build the executable jars first (the `-exec.jar` files below are produced by thi
 Run
 ---
 
-    # terminal 1: upstream (any HTTP server; here python's)
-    python3 -m http.server 3000 --bind 127.0.0.1
+    # terminal 1: upstream (sample server speaking http/1.1 and h2c on one port)
+    java -jar sluice-example-upstream/target/sluice-example-upstream-0.0.1-SNAPSHOT-exec.jar 31080
 
     # terminal 2: server
     java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
@@ -70,24 +71,26 @@ Run
     # terminal 3: client
     java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
       --sluice.server-url=grpc://127.0.0.1:8001 \
-      --sluice.upstream=demo.local=http://127.0.0.1:3000 \
+      --sluice.upstream=demo.local=http://127.0.0.1:31080 \
       --sluice.token=SECRET
 
-    # terminal 4: request through the tunnel (routed by the Host header)
-    curl -H 'Host: demo.local' http://127.0.0.1:8000/
+    # terminal 4: request through the tunnel (routed by the Host header / :authority)
+    curl -H 'Host: demo.local' http://127.0.0.1:8000/actuator/health
+    curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:8000/actuator/health
 
 `sluice.server-url` schemes: `grpc://` (plaintext) / `grpcs://` (TLS; `--sluice.insecure=true` skips verification).
 
-h2c / TLS on the data port (same server + client):
+TLS termination on the data port (same upstream / server / client):
 
-    # h2c prior knowledge (routed by :authority); the upstream must speak h2c too --
-    # the data plane only relays frames. Any sluice-server instance works out of the box
-    # (h2c is enabled on its servlet connector), e.g. run one as
-    #   java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
-    #     --server.port=31080 --spring.grpc.server.port=32001 --sluice.data-port=32000
-    # and point the client's upstream at http://127.0.0.1:31080
-    # (python3 -m http.server is HTTP/1.1 only and will NOT work here)
-    curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:8000/ -v -o /dev/null 2>&1 | grep 'using HTTP/2'
+    # self-signed cert registered as an SSL bundle, then restart the server with
+    #   --sluice.data-tls-bundle=data-plane
+    #   --spring.ssl.bundle.pem.data-plane.keystore.certificate=cert.pem
+    #   --spring.ssl.bundle.pem.data-plane.keystore.private-key=cert-key.pem
+    openssl req -x509 -newkey rsa:2048 -keyout cert-key.pem -out cert.pem -days 1 -nodes -subj /CN=localhost
+
+    # h2 over TLS (ALPN) / http/1.1 fallback / plaintext on the same port
+    curl --http2 -k -H 'Host: demo.local' https://127.0.0.1:8000/actuator/health -v -o /dev/null 2>&1 | grep 'using HTTP/2' -A2
+    curl --http1.1 -k -H 'Host: demo.local' https://127.0.0.1:8000/actuator/health
 
     # TLS: self-signed cert registered as an SSL bundle, then restart the server with
     #   --sluice.data-tls-bundle=data-plane
@@ -95,10 +98,9 @@ h2c / TLS on the data port (same server + client):
     #   --spring.ssl.bundle.pem.data-plane.keystore.private-key=cert-key.pem
     openssl req -x509 -newkey rsa:2048 -keyout cert-key.pem -out cert.pem -days 1 -nodes -subj /CN=localhost
 
-    # h2 over TLS (ALPN) / http/1.1 fallback / plaintext on the same port
-    curl --http2 -k -H 'Host: demo.local' https://127.0.0.1:8000/ -v -o /dev/null 2>&1 | grep 'using HTTP/2' -A2
-    curl --http1.1 -k -H 'Host: demo.local' https://127.0.0.1:8000/
-    curl -H 'Host: demo.local' http://127.0.0.1:8000/
+    # h2 over TLS (ALPN) / http/1.1 fallback on the same port
+    curl --http2 -k -H 'Host: demo.local' https://127.0.0.1:8000/actuator/health -v -o /dev/null 2>&1 | grep 'using HTTP/2' -A2
+    curl --http1.1 -k -H 'Host: demo.local' https://127.0.0.1:8000/actuator/health
 
 Configuration (server)
 ----------------------
