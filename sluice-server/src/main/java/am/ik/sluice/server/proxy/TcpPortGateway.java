@@ -57,18 +57,22 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 
 	private final MeterRegistry meterRegistry;
 
+	private final AccessLogger accessLogger;
+
 	private final ConcurrentMap<Integer, BoundListener> listeners = new ConcurrentHashMap<>();
 
 	private final TcpPortRange tcpPortRange;
 
 	TcpPortGateway(Router router, SessionRegistry sessions, SluiceServerProperties properties,
-			@Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor, MeterRegistry meterRegistry) {
+			@Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor, MeterRegistry meterRegistry,
+			AccessLogger accessLogger) {
 		this.router = router;
 		this.sessions = sessions;
 		this.properties = properties;
 		this.tcpPortRange = TcpPortRange.parse(properties.tcpPortRange());
 		this.taskExecutor = taskExecutor;
 		this.meterRegistry = meterRegistry;
+		this.accessLogger = accessLogger;
 	}
 
 	/**
@@ -205,29 +209,48 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 	}
 
 	private void relay(Socket socket, int port) {
+		AccessLogger.Connection access = this.accessLogger.accepted("tcp:" + port, socket).transport("tcp");
 		try {
 			Optional<Router.Route> route = this.router.lookupByPort(port);
 			TunnelSession session = route.map(r -> this.sessions.find(r.clientId()).orElse(null)).orElse(null);
 			if (session == null) {
 				this.close(socket);
+				access.close();
 				return;
 			}
-			VirtualConnection connection = session.open(route.get().address());
+			Router.Route route0 = route.get();
+			VirtualConnection connection = session.open(route0.address());
+			access.route(route0.routeTag()).connectionId(connection.connectionId());
 			StreamRelay relay = StreamRelay.builder(DuplexPipe.of(socket), connection, session.sender())
-				.listener(this.relayedBytes(route.get()))
-				.onComplete(() -> session.remove(connection.connectionId()))
+				.listener(this.relayedBytes(route0, access))
+				.onComplete(() -> {
+					access.close();
+					session.remove(connection.connectionId());
+				})
 				.build();
 			relay.start();
 		}
 		catch (Exception e) {
 			log.debug("tcp route connection failed on port {}: {}", port, e.toString());
+			access.close();
 			this.close(socket);
 		}
 	}
 
-	private StreamRelay.Listener relayedBytes(Router.Route route) {
+	private StreamRelay.Listener relayedBytes(Router.Route route, AccessLogger.Connection access) {
 		Counter counter = this.meterRegistry.counter(METRIC_NAME, "direction", "data", "route", route.routeTag());
-		return counter::increment;
+		return new StreamRelay.Listener() {
+
+			@Override
+			public void onBytesRelayed(long count) {
+			}
+
+			@Override
+			public void onBytesRelayed(long count, StreamRelay.Direction direction) {
+				counter.increment();
+				access.bytes(count, direction);
+			}
+		};
 	}
 
 	private void close(Socket socket) {

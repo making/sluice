@@ -67,6 +67,38 @@ class ConnectionHeadParserTest {
 	}
 
 	@Test
+	void http1RequestLineIsExtracted() throws IOException {
+		byte[] head = "POST /api?id=1 HTTP/1.1\r\nHost: demo.local\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
+		ConnectionHeadParser.Head.Request request = PARSER.parse(new ByteArrayInputStream(head))
+			.orElseThrow()
+			.request();
+		assertThat(request).isNotNull();
+		assertThat(request.method()).isEqualTo("POST");
+		assertThat(request.path()).isEqualTo("/api?id=1");
+		assertThat(request.version()).isEqualTo("1.1");
+	}
+
+	@Test
+	void http2MethodAndPathAreExtracted() throws IOException {
+		java.io.ByteArrayOutputStream block = new java.io.ByteArrayOutputStream();
+		block.writeBytes(literal(":authority", "demo.local"));
+		block.writeBytes(literal(":method", "GET"));
+		block.writeBytes(literal(":path", "/index.html"));
+		ConnectionHeadParser.Head parsed = PARSER.parse(new ByteArrayInputStream(h2Head(block.toByteArray(), true)))
+			.orElseThrow();
+		assertThat(parsed.request()).isNotNull();
+		assertThat(parsed.request().method()).isEqualTo("GET");
+		assertThat(parsed.request().path()).isEqualTo("/index.html");
+		assertThat(parsed.request().version()).isEqualTo("2");
+	}
+
+	@Test
+	void respHeadHasNoRequest() {
+		byte[] head = "*1\r\n$4\r\nPING\r\n".getBytes(StandardCharsets.US_ASCII);
+		assertThat(PARSER.parse(new ByteArrayInputStream(head)).orElseThrow().request()).isNull();
+	}
+
+	@Test
 	void http1HostIsCaseInsensitiveAndTrimmed() throws IOException {
 		byte[] head = "GET / HTTP/1.1\r\nhost:  demo.local:8080 \r\n\r\n".getBytes(StandardCharsets.US_ASCII);
 		assertThat(PARSER.parse(new ByteArrayInputStream(head)).orElseThrow().host()).isEqualTo("demo.local:8080");

@@ -1,5 +1,8 @@
 package am.ik.sluice.server.config;
 
+import java.util.EnumSet;
+import java.util.Set;
+
 import org.jspecify.annotations.Nullable;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
@@ -13,10 +16,39 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  */
 @ConfigurationProperties("sluice")
 public record SluiceServerProperties(String token, @Nullable String tokenFile, @DefaultValue("0.0.0.0") String dataHost,
-		@DefaultValue("8000") int dataPort, @Nullable String dataTlsBundle, @DefaultValue("") String tcpPortRange) {
+		@DefaultValue("8000") int dataPort, @Nullable String dataTlsBundle, @DefaultValue("") String tcpPortRange,
+		AccessLog accessLog) {
 
 	public SluiceServerProperties {
 		dataHost = dataHost == null || dataHost.isBlank() ? "0.0.0.0" : dataHost;
+		accessLog = accessLog == null ? new AccessLog(true, EnumSet.allOf(AccessLog.Type.class)) : accessLog;
+	}
+
+	/**
+	 * Access log settings.
+	 *
+	 * @param enabled whether access log lines are emitted to the {@code sluice.access}
+	 * logger
+	 * @param types event types to emit (comma separated in configuration): {@code conn}
+	 * (connection accept/close), {@code request} (head request)
+	 */
+	public record AccessLog(@DefaultValue("true") boolean enabled,
+			@DefaultValue("connection,request") Set<Type> types) {
+
+		public enum Type {
+
+			/** Connection accept/close lines. */
+			CONNECTION,
+
+			/** Head request lines. */
+			REQUEST
+
+		}
+
+		public AccessLog {
+			types = types == null || types.isEmpty() ? EnumSet.noneOf(Type.class) : EnumSet.copyOf(types);
+		}
+
 	}
 
 	public static Builder builder() {
@@ -36,6 +68,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		@Nullable private String dataTlsBundle;
 
 		private String tcpPortRange = "";
+
+		@Nullable private AccessLog accessLog;
 
 		private Builder() {
 		}
@@ -70,10 +104,16 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			return this;
 		}
 
+		public Builder accessLog(AccessLog accessLog) {
+			this.accessLog = accessLog;
+			return this;
+		}
+
 		public SluiceServerProperties build() {
 			return new SluiceServerProperties(this.token == null ? "" : this.token, this.tokenFile,
 					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort, this.dataTlsBundle,
-					this.tcpPortRange);
+					this.tcpPortRange,
+					this.accessLog == null ? new AccessLog(true, EnumSet.allOf(AccessLog.Type.class)) : this.accessLog);
 		}
 
 	}

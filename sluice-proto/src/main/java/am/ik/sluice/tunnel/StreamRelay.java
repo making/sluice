@@ -45,11 +45,30 @@ public final class StreamRelay {
 		return new Builder(pipe, connection, frameWriter);
 	}
 
+	/** Direction of a relayed chunk. */
+	public enum Direction {
+
+		/** Local pipe towards the remote (peer to upstream). */
+		TO_REMOTE,
+
+		/** Remote towards the local pipe (upstream to peer). */
+		TO_LOCAL
+
+	}
+
 	/** Observer of relay activity. */
 	public interface Listener {
 
 		/** Called for each chunk relayed towards the remote. */
 		void onBytesRelayed(long count);
+
+		/**
+		 * Called for each relayed chunk when its direction is known; the default
+		 * delegates to the direction-less variant.
+		 */
+		default void onBytesRelayed(long count, Direction direction) {
+			this.onBytesRelayed(count);
+		}
 
 	}
 
@@ -153,7 +172,7 @@ public final class StreamRelay {
 	private void doRelayToRemote(byte[] buffer) throws Exception {
 		if (this.prefix != null && this.prefix.length > 0) {
 			if (this.listener != null) {
-				this.listener.onBytesRelayed(this.prefix.length);
+				this.listener.onBytesRelayed(this.prefix.length, Direction.TO_REMOTE);
 			}
 			this.frameWriter.sendData(this.connection.connectionId(), Arrays.copyOf(this.prefix, this.prefix.length));
 		}
@@ -161,7 +180,7 @@ public final class StreamRelay {
 		int n;
 		while ((n = in.read(buffer)) > 0) {
 			if (this.listener != null) {
-				this.listener.onBytesRelayed(n);
+				this.listener.onBytesRelayed(n, Direction.TO_REMOTE);
 			}
 			this.frameWriter.sendData(this.connection.connectionId(), Arrays.copyOf(buffer, n));
 		}
@@ -174,6 +193,9 @@ public final class StreamRelay {
 		OutputStream out = this.pipe.sink();
 		int n;
 		while ((n = source.read(buffer)) > 0) {
+			if (this.listener != null) {
+				this.listener.onBytesRelayed(n, Direction.TO_LOCAL);
+			}
 			out.write(buffer, 0, n);
 			out.flush();
 		}

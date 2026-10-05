@@ -147,4 +147,64 @@ class StreamRelayTest {
 		pair.client().close();
 	}
 
+	@Test
+	@Timeout(10)
+	void directionLessListenerSeesBothDirections() throws Exception {
+		SocketPair pair = SocketPair.create();
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = new VirtualConnection(5, writer);
+		AtomicLong bytes = new AtomicLong();
+		CountDownLatch done = new CountDownLatch(1);
+		StreamRelay relay = StreamRelay.builder(DuplexPipe.of(pair.serverSide()), connection, writer)
+			.listener(bytes::getAndAdd)
+			.onComplete(done::countDown)
+			.build();
+		relay.start();
+		OutputStream out = pair.client().getOutputStream();
+		out.write("abc".getBytes(StandardCharsets.UTF_8));
+		out.flush();
+		pair.client().shutdownOutput();
+		connection.acceptData("xy".getBytes(StandardCharsets.UTF_8));
+		connection.remoteClosed();
+		assertThat(done.await(5, TimeUnit.SECONDS)).isTrue();
+		assertThat(bytes.get()).isEqualTo(5); // abc(3) to remote + xy(2) to local
+		pair.client().close();
+	}
+
+	@Test
+	@Timeout(10)
+	void directionalListenerReceivesPerDirectionTotals() throws Exception {
+		SocketPair pair = SocketPair.create();
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = new VirtualConnection(6, writer);
+		AtomicLong toRemote = new AtomicLong();
+		AtomicLong toLocal = new AtomicLong();
+		CountDownLatch done = new CountDownLatch(1);
+		StreamRelay relay = StreamRelay.builder(DuplexPipe.of(pair.serverSide()), connection, writer)
+			.listener(new StreamRelay.Listener() {
+
+				@Override
+				public void onBytesRelayed(long count) {
+				}
+
+				@Override
+				public void onBytesRelayed(long count, StreamRelay.Direction direction) {
+					(direction == StreamRelay.Direction.TO_REMOTE ? toRemote : toLocal).addAndGet(count);
+				}
+			})
+			.onComplete(done::countDown)
+			.build();
+		relay.start();
+		OutputStream out = pair.client().getOutputStream();
+		out.write("hello".getBytes(StandardCharsets.UTF_8));
+		out.flush();
+		pair.client().shutdownOutput();
+		connection.acceptData("hi".getBytes(StandardCharsets.UTF_8));
+		connection.remoteClosed();
+		assertThat(done.await(5, TimeUnit.SECONDS)).isTrue();
+		assertThat(toRemote.get()).isEqualTo(5);
+		assertThat(toLocal.get()).isEqualTo(2);
+		pair.client().close();
+	}
+
 }

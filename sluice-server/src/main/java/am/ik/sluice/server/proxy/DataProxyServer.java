@@ -78,6 +78,8 @@ public class DataProxyServer implements SmartLifecycle {
 
 	private final MeterRegistry meterRegistry;
 
+	private final AccessLogger accessLogger;
+
 	private final TaskExecutor taskExecutor;
 
 	private final ObjectProvider<SSLContext> sslContext;
@@ -87,12 +89,13 @@ public class DataProxyServer implements SmartLifecycle {
 	private volatile @Nullable ServerSocket serverSocket;
 
 	DataProxyServer(Router router, SessionRegistry sessions, SluiceServerProperties properties,
-			MeterRegistry meterRegistry, @Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor,
-			ObjectProvider<SSLContext> sslContext) {
+			MeterRegistry meterRegistry, AccessLogger accessLogger,
+			@Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor, ObjectProvider<SSLContext> sslContext) {
 		this.router = router;
 		this.sessions = sessions;
 		this.properties = properties;
 		this.meterRegistry = meterRegistry;
+		this.accessLogger = accessLogger;
 		this.taskExecutor = taskExecutor;
 		this.sslContext = sslContext;
 	}
@@ -143,16 +146,22 @@ public class DataProxyServer implements SmartLifecycle {
 	}
 
 	private void handle(Socket socket) {
+		AccessLogger.Connection access = this.accessLogger.accepted("data", socket);
 		try {
-			Connection connection = this.transport(socket);
+			Connection connection = this.transport(socket, access);
 			if (connection == null) {
+				access.close();
 				this.close(socket);
 				return;
 			}
-			this.relay(connection);
+			if (!this.relay(connection, access)) {
+				// no session: relay() wrote the 503 and closed the socket
+				access.close();
+			}
 		}
 		catch (Exception e) {
 			log.debug("data connection failed: {}", e.toString());
+			access.close();
 			this.close(socket);
 		}
 	}
@@ -162,7 +171,7 @@ public class DataProxyServer implements SmartLifecycle {
 	 * is configured, routes by SNI in passthrough mode otherwise, and parses the
 	 * connection head for routing.
 	 */
-	private @Nullable Connection transport(Socket socket) throws Exception {
+	private @Nullable Connection transport(Socket socket, AccessLogger.Connection access) throws Exception {
 		InputStream in = socket.getInputStream();
 		int first = in.read();
 		if (first < 0) {
@@ -185,6 +194,7 @@ public class DataProxyServer implements SmartLifecycle {
 			if (passthrough) {
 				// relay the TLS records untouched; the upstream terminates TLS
 				log.debug("tls passthrough; sni={}", hello.sni());
+				access.transport("tls-passthrough");
 				return Connection.of(socket, ConnectionHeadParser.Head.encrypted(hello.bytes(), hello.sni()));
 			}
 			SSLSocketFactory factory = this.tlsFactory();
@@ -209,6 +219,7 @@ public class DataProxyServer implements SmartLifecycle {
 					(s, protocols) -> protocols.contains(ALPN_H2) ? ALPN_H2 : ALPN_HTTP_1_1);
 			ssl.startHandshake();
 			log.debug("tls handshake done; protocol={} sni={}", ssl.getApplicationProtocol(), sni.get());
+			access.transport(ALPN_H2.equals(ssl.getApplicationProtocol()) ? "h2" : "h1");
 			in = ssl.getInputStream();
 			socket = ssl;
 		}
@@ -219,10 +230,12 @@ public class DataProxyServer implements SmartLifecycle {
 		}
 		ConnectionHeadParser.Head head = new ConnectionHeadParser(HEAD_LIMIT).parse(in)
 			.orElseThrow(() -> new IllegalArgumentException("unrecognized connection head"));
+		boolean h2 = head.request() != null && "2".equals(head.request().version());
+		access.transport(h2 ? "h2" : "h1");
 		// prefer the HTTP host; fall back to the SNI host name of the terminated
 		// handshake (hostless protocols such as RESP carry no Host header)
 		if (head.host() == null && sni.get() != null) {
-			head = new ConnectionHeadParser.Head(sni.get(), head.bytes(), head.h2(), false);
+			head = head.withHost(sni.get());
 		}
 		return Connection.of(socket, head);
 	}
@@ -232,7 +245,7 @@ public class DataProxyServer implements SmartLifecycle {
 		return context == null ? null : context.getSocketFactory();
 	}
 
-	private void relay(Connection conn) {
+	private boolean relay(Connection conn, AccessLogger.Connection access) {
 		Optional<Router.Route> route = this.router.lookup(conn.head().host());
 		TunnelSession session = route.map(r -> this.sessions.find(r.clientId()).orElse(null)).orElse(null);
 		if (session == null) {
@@ -247,23 +260,43 @@ public class DataProxyServer implements SmartLifecycle {
 				}
 			}
 			this.close(conn.socket());
-			return;
+			return false;
 		}
 		Router.Route route0 = route.get();
 		VirtualConnection connection = session.open(route0.address());
+		access.route(route0.routeTag()).connectionId(connection.connectionId());
+		ConnectionHeadParser.Head.Request request = conn.head().request();
+		if (request != null) {
+			access.request(request.method(), request.path(), request.version());
+		}
 		byte[] head = route0.preserveHost() || conn.head().encrypted() ? conn.head().bytes()
 				: ConnectionHeadRewriter.rewrite(conn.head(), route0.address());
 		StreamRelay relay = StreamRelay.builder(conn.pipe(), connection, session.sender())
 			.prefix(head)
-			.listener(this.relayedBytes(route0))
-			.onComplete(() -> session.remove(connection.connectionId()))
+			.listener(this.relayedBytes(route0, access))
+			.onComplete(() -> {
+				access.close();
+				session.remove(connection.connectionId());
+			})
 			.build();
 		relay.start();
+		return true;
 	}
 
-	private StreamRelay.Listener relayedBytes(Router.Route route) {
+	private StreamRelay.Listener relayedBytes(Router.Route route, AccessLogger.Connection access) {
 		Counter counter = this.meterRegistry.counter(METRIC_NAME, "direction", "data", "route", route.routeTag());
-		return counter::increment;
+		return new StreamRelay.Listener() {
+
+			@Override
+			public void onBytesRelayed(long count) {
+			}
+
+			@Override
+			public void onBytesRelayed(long count, StreamRelay.Direction direction) {
+				counter.increment();
+				access.bytes(count, direction);
+			}
+		};
 	}
 
 	private void close(Socket socket) {

@@ -62,14 +62,27 @@ public final class ConnectionHeadParser {
 	public record H2Head(byte[] prefix, byte[] headerBlock, byte[] suffix, int streamId) {
 	}
 
-	public record Head(@Nullable String host, byte[] bytes, @Nullable H2Head h2, boolean encrypted) {
+	public record Head(@Nullable String host, byte[] bytes, @Nullable H2Head h2, boolean encrypted,
+			@Nullable Request request) {
 
-		public static Head http1(byte[] bytes, @Nullable String host) {
-			return new Head(host, bytes, null, false);
+		/**
+		 * The request of the head: the HTTP/1.1 request-line parts, or the method/path of
+		 * the first HEADERS block for HTTP/2 ({@code version} is {@code 2}).
+		 */
+		public record Request(String method, String path, String version) {
 		}
 
-		public static Head http2(byte[] bytes, @Nullable String host, @Nullable H2Head h2) {
-			return new Head(host, bytes, h2, false);
+		/** A copy of this head with the route host replaced. */
+		public Head withHost(@Nullable String host) {
+			return new Head(host, this.bytes, this.h2, this.encrypted, this.request);
+		}
+
+		public static Head http1(byte[] bytes, @Nullable String host) {
+			return new Head(host, bytes, null, false, http1RequestOf(bytes));
+		}
+
+		public static Head http2(byte[] bytes, @Nullable String host, @Nullable H2Head h2, @Nullable Request request) {
+			return new Head(host, bytes, h2, false, request);
 		}
 
 		/**
@@ -77,7 +90,7 @@ public final class ConnectionHeadParser {
 		 * verbatim (the rewriter must not touch TLS records).
 		 */
 		public static Head encrypted(byte[] bytes, @Nullable String host) {
-			return new Head(host, bytes, null, true);
+			return new Head(host, bytes, null, true, null);
 		}
 
 		/**
@@ -85,7 +98,7 @@ public final class ConnectionHeadParser {
 		 * catch-all route, relayed verbatim.
 		 */
 		public static Head hostless(byte[] bytes) {
-			return new Head(null, bytes, null, false);
+			return new Head(null, bytes, null, false, null);
 		}
 
 	}
@@ -135,6 +148,22 @@ public final class ConnectionHeadParser {
 			return H2_MAGIC.equals(new String(bytes, 0, H2_MAGIC.length(), StandardCharsets.US_ASCII));
 		}
 		return H2_MAGIC.startsWith(new String(bytes, StandardCharsets.US_ASCII));
+	}
+
+	/**
+	 * Extracts the request line ({@code method SP request-target SP HTTP-version}) from
+	 * an HTTP/1.1 request head; {@code null} when the first line is not a well-formed
+	 * request-line.
+	 */
+	static Head.@Nullable Request http1RequestOf(byte[] head) {
+		String text = new String(head, StandardCharsets.US_ASCII);
+		int eol = text.indexOf("\r\n");
+		String line = eol < 0 ? text : text.substring(0, eol);
+		String[] parts = line.split(" ");
+		if (parts.length != 3 || !parts[2].startsWith("HTTP/")) {
+			return null;
+		}
+		return new Head.Request(parts[0], parts[1], parts[2].substring("HTTP/".length()));
 	}
 
 	/**
@@ -211,13 +240,14 @@ public final class ConnectionHeadParser {
 			return Optional.empty();
 		}
 		byte[] block = headerBlock.toByteArray();
-		String host = this.authorityOf(block, headersStreamId);
+		Decoded decoded = decode(block, headersStreamId);
 		if (continuationSeen || headersFrameStart < 0) {
-			return Optional.of(Head.http2(bytes, host, null));
+			return Optional.of(Head.http2(bytes, decoded.host(), null, decoded.request()));
 		}
 		byte[] prefix = Arrays.copyOfRange(bytes, 0, headersFrameStart);
 		byte[] suffix = Arrays.copyOfRange(bytes, buf.position(), bytes.length);
-		return Optional.of(Head.http2(bytes, host, new H2Head(prefix, block, suffix, headersStreamId)));
+		return Optional.of(Head.http2(bytes, decoded.host(), new H2Head(prefix, block, suffix, headersStreamId),
+				decoded.request()));
 	}
 
 	private static int unsigned24(ByteBuffer buf) {
@@ -230,20 +260,31 @@ public final class ConnectionHeadParser {
 		buf.position(target);
 	}
 
-	private @Nullable String authorityOf(byte[] headerBlock, int streamId) {
+	private record Decoded(@Nullable String host, Head.@Nullable Request request) {
+	}
+
+	private Decoded decode(byte[] headerBlock, int streamId) {
 		try {
 			Http2Headers headers = this.headersDecoder.decodeHeaders(streamId, Unpooled.wrappedBuffer(headerBlock));
-			CharSequence authority = headers.authority();
-			if (authority != null && !authority.isEmpty()) {
-				return authority.toString();
-			}
-			CharSequence hostHeader = headers.get(AsciiString.cached("host"));
-			if (hostHeader != null && !hostHeader.isEmpty()) {
-				return hostHeader.toString();
-			}
+			String host = headerOf(headers.authority(), headers.get(AsciiString.cached("host")));
+			CharSequence method = headers.method();
+			CharSequence path = headers.path();
+			Head.Request request = method == null || path == null ? null
+					: new Head.Request(method.toString(), path.toString(), "2");
+			return new Decoded(host, request);
 		}
 		catch (Exception e) {
 			// fall through: unroutable head
+		}
+		return new Decoded(null, null);
+	}
+
+	private static @Nullable String headerOf(@Nullable CharSequence first, @Nullable CharSequence second) {
+		if (first != null && !first.isEmpty()) {
+			return first.toString();
+		}
+		if (second != null && !second.isEmpty()) {
+			return second.toString();
 		}
 		return null;
 	}
