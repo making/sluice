@@ -62,6 +62,19 @@ class SluiceClientPropertiesTest {
 	}
 
 	@Test
+	void boundUpstreamWithoutPreserveHostDefaultsToTrue() {
+		Map<String, Object> source = Map.of("sluice.server-url", "grpc://127.0.0.1:8001",
+				"sluice.client.upstream[0].host", "demo.local", "sluice.client.upstream[0].target",
+				"https://httpbingo.org");
+		StandardEnvironment environment = new StandardEnvironment();
+		environment.getPropertySources().addFirst(new MapPropertySource("test", source));
+		SluiceClientProperties properties = Binder.get(environment)
+			.bind("sluice", Bindable.of(SluiceClientProperties.class))
+			.get();
+		assertThat(properties.toProtoUpstreams().get(0).getPreserveHost()).isTrue();
+	}
+
+	@Test
 	void missingClientSectionYieldsEmptyUpstreams() {
 		SluiceClientProperties properties = SluiceClientProperties.builder().serverUrl("grpc://127.0.0.1:8001").build();
 		assertThat(properties.upstreamMap()).isEmpty();

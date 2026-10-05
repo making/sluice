@@ -7,9 +7,6 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 
 /**
  * Configuration of the sluice server.
- */
-/**
- * Configuration of the sluice server.
  *
  * @param tcpPortRange listen ports a client may claim for tcp routes (comma separated
  * single ports or {@code min-max} ranges, e.g. {@code 9000-9010,8080}; empty = any port)

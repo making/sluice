@@ -2,6 +2,8 @@ package am.ik.sluice.client.config;
 
 import java.util.Objects;
 
+import org.springframework.boot.context.properties.bind.DefaultValue;
+
 /**
  * A single upstream entry: the public host the server routes requests for (blank means
  * catch-all), the target URL to dial, whether the request Host header passes through,
@@ -9,7 +11,8 @@ import java.util.Objects;
  * terminated on the data plane, and the public port for raw TCP routing
  * ({@code listen-port}; 0 disables it).
  */
-public record Upstream(String host, String target, boolean preserveHost, boolean tlsPassthrough, int listenPort) {
+public record Upstream(String host, String target, @DefaultValue("true") boolean preserveHost, boolean tlsPassthrough,
+		int listenPort) {
 
 	public Upstream {
 		host = host == null ? "" : host.trim();
