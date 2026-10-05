@@ -152,6 +152,15 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		enqueue(new Payload(frame));
 	}
 
+	/**
+	 * Acknowledges an ADVERTISE (server -> client only), listing the listen ports that
+	 * were not bound.
+	 */
+	public void sendAdvertised(List<Integer> rejectedPorts) {
+		Frame frame = Frame.newBuilder().setType(Frame.Type.ADVERTISED).addAllRejectedPorts(rejectedPorts).build();
+		enqueue(new Payload(frame));
+	}
+
 	@Override
 	public void sendClose(long connectionId) {
 		Frame frame = Frame.newBuilder().setType(Frame.Type.CLOSE).setConnId(connectionId).build();

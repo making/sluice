@@ -27,6 +27,8 @@ message Frame {
     ADVERTISE = 4;
     // Either direction: no-op liveness signal.
     KEEPALIVE = 5;
+    // server -> client: acknowledgment of the client's ADVERTISE.
+    ADVERTISED = 6;
   }
   Type type = 1;
   int64 conn_id = 2;
@@ -38,6 +40,9 @@ message Frame {
   repeated Upstream upstreams = 5;
   // ERROR: human readable cause.
   string message = 6;
+  // ADVERTISED: listen ports the server did not bind (e.g. outside the configured
+  // tcp-port-range); empty means every advertised route was accepted.
+  repeated uint32 rejected_ports = 7;
 }
 
 message Upstream {
@@ -51,4 +56,7 @@ message Upstream {
   // TLS connections for this upstream are relayed untouched (routed by ClientHello
   // SNI, the upstream terminates TLS) instead of terminated on the data plane.
   bool tls_passthrough = 4;
+  // Public port the server listens on to relay raw TCP connections for this upstream
+  // verbatim (routed by listen port, no head parsing; 0 disables port routing).
+  int32 listen_port = 5;
 }

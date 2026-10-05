@@ -98,4 +98,40 @@ class RouterTest {
 		assertThat(router.register("c1", List.of(upstream("a", "::::")))).isZero();
 	}
 
+	private static Upstream portUpstream(int listenPort, String targetUrl) {
+		return Upstream.newBuilder()
+			.setHost("ignored.local")
+			.setTargetUrl(targetUrl)
+			.setPreserveHost(true)
+			.setListenPort(listenPort)
+			.build();
+	}
+
+	@Test
+	void listenPortRouteIsResolvedByPort() {
+		Router router = new Router();
+		router.register("c1", List.of(portUpstream(16379, "tcp://127.0.0.1:6379")));
+		Router.Route route = router.lookupByPort(16379).orElseThrow();
+		assertThat(route.clientId()).isEqualTo("c1");
+		assertThat(route.address()).isEqualTo("127.0.0.1:6379");
+		assertThat(router.lookupByPort(12345)).isEmpty();
+	}
+
+	@Test
+	void reRegistrationReplacesListenPortRoutes() {
+		Router router = new Router();
+		router.register("c1", List.of(portUpstream(16379, "tcp://127.0.0.1:6379")));
+		router.register("c1", List.of(portUpstream(16380, "tcp://127.0.0.1:6380")));
+		assertThat(router.lookupByPort(16379)).isEmpty();
+		assertThat(router.lookupByPort(16380).orElseThrow().address()).isEqualTo("127.0.0.1:6380");
+	}
+
+	@Test
+	void removeDropsListenPortRoutes() {
+		Router router = new Router();
+		router.register("c1", List.of(portUpstream(16379, "tcp://127.0.0.1:6379")));
+		router.remove("c1");
+		assertThat(router.lookupByPort(16379)).isEmpty();
+	}
+
 }

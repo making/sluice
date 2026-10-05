@@ -154,7 +154,11 @@ class PreserveHostE2ETest {
 				.upstream(Upstream.builder().host(h).target(target).preserveHost(preserveHost).build())
 				.token("it-token")
 				.build();
-			TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());
+			TunnelClient started = TunnelClient.builder()
+				.properties(properties)
+				.taskExecutor(TASK_EXECUTOR)
+				.meterRegistry(new SimpleMeterRegistry())
+				.build();
 			started.start();
 			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> this.sessionsCount() > 0);
 			return started;

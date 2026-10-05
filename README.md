@@ -123,10 +123,45 @@ TLS termination on the data port (same upstream / server / client):
 
 TLS passthrough routed by SNI: see "SNI routing" below.
 
+TCP port routing
+----------------
+
+Upstreams with `listen-port` are routed by the listen port instead of the connection
+head: the server opens one listener per advertised port and relays every accepted
+connection verbatim -- no head parsing, no rewriting -- so any TCP protocol (ssh,
+postgres, redis, ...) tunnels through, not just HTTP.
+
+    # terminal 1: any TCP server, e.g. redis
+    redis-server --port 6379
+
+    # terminal 2: server (listeners bind on the data host)
+    java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
+      --sluice.token=SECRET
+
+    # terminal 3: client; the upstream target is a tcp:// URL
+    java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
+      --sluice.server-url=grpc://127.0.0.1:8001 \
+      --sluice.client.upstream[0].host=redis.local \
+      --sluice.client.upstream[0].target=tcp://127.0.0.1:6379 \
+      --sluice.client.upstream[0].listen-port=16379 \
+      --sluice.token=SECRET
+
+    # terminal 4: connect to the advertised port
+    redis-cli -p 16379 ping
+    # -> PONG
+
+The listener is bound when the client advertises and released on disconnect; the
+server acknowledges the advertisement and reports back the listen ports it could
+not bind (outside `sluice.tcp-port-range`, held by another connected client, or
+already taken) -- the client then closes the stream and re-advertises with
+backoff. The listen ports must be exposed on the host (`docker -p`, firewall) --
+the deployment delta against the single data port.
+
 SNI routing
 -----------
 
-Two variants route a TLS connection by the server name of its ClientHello:
+Where TCP port routing keys on the listen port, these two variants route a TLS
+connection by the server name of its ClientHello:
 
 - **TLS passthrough** (`sluice.client.upstream[n].tls-passthrough=true`): the data
   plane relays the TLS bytes untouched and routes by the ClientHello SNI; the upstream
@@ -172,6 +207,7 @@ Configuration (server)
 | `sluice.data-host` | `0.0.0.0` | bind address of the data plane |
 | `sluice.data-port` | `8000` | data plane port |
 | `sluice.data-tls-bundle` | - | SSL bundle name for data plane TLS termination (h2 / http/1.1 via ALPN); unset = plaintext only (TLS connections are served by upstreams with `tls-passthrough=true`) |
+| `sluice.tcp-port-range` | (unset = any port) | listen ports a client may claim for tcp routes, comma separated single ports or `min-max` ranges (e.g. `9000-9010,8080`); a port outside the range is not bound |
 | `spring.grpc.server.port` | `8001` | gRPC control plane port |
 | `server.port` | `8081` | actuator (health / info / prometheus) |
 
@@ -184,7 +220,8 @@ Configuration (client)
 | `sluice.client.upstream[n].host` | - | public domain routed by the server (empty = catch-all) |
 | `sluice.client.upstream[n].target` | - | upstream URL: `http://` (default when the scheme is omitted), `https://` (TLS terminated by the client), or `tcp://` (raw relay, e.g. a TLS endpoint in passthrough mode) |
 | `sluice.client.upstream[n].preserve-host` | `true` | `false` rewrites the request Host / `:authority` to the target's `host[:port]` |
-| `sluice.client.upstream[n].tls-passthrough` | `false` | TLS connections for this upstream are relayed untouched (routed by ClientHello SNI, the upstream terminates TLS) instead of terminated on the data plane |
+| `sluice.client.upstream[n].tls-passthrough` | `false` | TLS connections for the upstream are relayed untouched (routed by ClientHello SNI, the upstream terminates TLS) instead of terminated on the data plane |
+| `sluice.client.upstream[n].listen-port` | `0` | public port the server listens on for this upstream; connections are relayed as raw TCP routed by the listen port -- no head parsing, no rewriting -- so any protocol (ssh, postgres, redis, ...) tunnels through. The listener is bound on advertise and released on disconnect; bind it on the host (`docker -p`, firewall) to expose it |
 | `sluice.token` / `sluice.token-file` | - | authentication token |
 | `sluice.insecure` | `false` | skip TLS verification |
 | `sluice.strict-forwarding` | `true` | only dial upstreams present in the map |

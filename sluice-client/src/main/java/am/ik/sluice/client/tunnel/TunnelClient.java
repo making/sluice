@@ -4,6 +4,7 @@ import org.jspecify.annotations.Nullable;
 
 import java.net.Socket;
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.Map;
 import java.util.Optional;
@@ -64,6 +65,8 @@ public class TunnelClient implements SmartLifecycle {
 
 	private final Counter reconnects;
 
+	private final Counter rejectedAdvertises;
+
 	private final ConcurrentHashMap<Long, VirtualConnection> connections = new ConcurrentHashMap<>();
 
 	private volatile boolean running;
@@ -76,15 +79,56 @@ public class TunnelClient implements SmartLifecycle {
 
 	private volatile @Nullable SessionSender currentSender;
 
-	public TunnelClient(SluiceClientProperties properties,
-			@Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor, MeterRegistry meterRegistry) {
+	TunnelClient(SluiceClientProperties properties, @Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor,
+			MeterRegistry meterRegistry) {
 		this.properties = properties;
 		this.taskExecutor = taskExecutor;
 		this.meterRegistry = meterRegistry;
 		this.reconnects = Counter.builder("sluice.reconnect.total")
 			.description("Tunnel stream re-establishments after a drop")
 			.register(meterRegistry);
+		this.rejectedAdvertises = Counter.builder("sluice.advertise.rejected")
+			.description("Advertised listen ports rejected by the server")
+			.register(meterRegistry);
 		meterRegistry.gauge("sluice.connections.active", this.connections, Map::size);
+	}
+
+	public static Builder builder() {
+		return new Builder();
+	}
+
+	public static final class Builder {
+
+		private @Nullable SluiceClientProperties properties;
+
+		private @Nullable TaskExecutor taskExecutor;
+
+		private @Nullable MeterRegistry meterRegistry;
+
+		private Builder() {
+		}
+
+		public Builder properties(SluiceClientProperties properties) {
+			this.properties = properties;
+			return this;
+		}
+
+		public Builder taskExecutor(TaskExecutor taskExecutor) {
+			this.taskExecutor = taskExecutor;
+			return this;
+		}
+
+		public Builder meterRegistry(MeterRegistry meterRegistry) {
+			this.meterRegistry = meterRegistry;
+			return this;
+		}
+
+		public TunnelClient build() {
+			return new TunnelClient(Objects.requireNonNull(this.properties, "properties is required"),
+					Objects.requireNonNull(this.taskExecutor, "taskExecutor is required"),
+					Objects.requireNonNull(this.meterRegistry, "meterRegistry is required"));
+		}
+
 	}
 
 	public boolean isConnected() {
@@ -186,7 +230,7 @@ public class TunnelClient implements SmartLifecycle {
 
 			@Override
 			public void onNext(Frame frame) {
-				handle(frame, connector);
+				handle(frame, connector, closed::countDown);
 			}
 
 			@Override
@@ -224,7 +268,7 @@ public class TunnelClient implements SmartLifecycle {
 		sender.close();
 	}
 
-	private void handle(Frame frame, LocalConnector connector) {
+	private void handle(Frame frame, LocalConnector connector, Runnable terminateStream) {
 		switch (frame.getType()) {
 			case CONNECT -> {
 				// register the virtual connection synchronously so DATA frames that
@@ -254,6 +298,15 @@ public class TunnelClient implements SmartLifecycle {
 				if (connection != null) {
 					connection.remoteFailed(frame.getMessage());
 				}
+			}
+			case ADVERTISED -> {
+				List<Integer> rejected = frame.getRejectedPortsList();
+				if (rejected.isEmpty()) {
+					return;
+				}
+				log.warn("server rejected listen ports {} on advertise; closing the stream to re-advertise", rejected);
+				this.rejectedAdvertises.increment();
+				terminateStream.run();
 			}
 			case ADVERTISE -> log.warn("unexpected ADVERTISE from server");
 			case KEEPALIVE -> {

@@ -159,7 +159,11 @@ class TlsPassthroughRedisE2ETest {
 			.token("it-token")
 			.build();
 		// @formatter:on
-		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());
+		TunnelClient started = TunnelClient.builder()
+			.properties(properties)
+			.taskExecutor(TASK_EXECUTOR)
+			.meterRegistry(new SimpleMeterRegistry())
+			.build();
 		started.start();
 		this.client = started;
 		Awaitility.await().atMost(Duration.ofSeconds(5)).until(this.sessions::count, count -> count > 0);

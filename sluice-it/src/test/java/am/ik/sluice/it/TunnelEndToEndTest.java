@@ -99,7 +99,11 @@ class TunnelEndToEndTest {
 				.build())
 			.token("it-token")
 			.build();
-		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());
+		TunnelClient started = TunnelClient.builder()
+			.properties(properties)
+			.taskExecutor(TASK_EXECUTOR)
+			.meterRegistry(new SimpleMeterRegistry())
+			.build();
 		started.start();
 		this.client = started;
 		// the ADVERTISE frame is applied asynchronously on the server

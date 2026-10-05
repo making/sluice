@@ -1,9 +1,14 @@
 package am.ik.sluice.server.tunnel;
 
 import java.util.List;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+
+import org.jspecify.annotations.Nullable;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -29,17 +34,82 @@ public final class TunnelSession implements AutoCloseable {
 
 	private final SessionSender sender;
 
+	private final TcpRouteListener tcpRoutes;
+
 	private final AtomicLong sequence = new AtomicLong(1);
 
 	private final ConcurrentMap<Long, VirtualConnection> connections = new ConcurrentHashMap<>();
 
+	private static Set<Integer> listenPorts(List<am.ik.sluice.v1.proto.Upstream> upstreams) {
+		return upstreams.stream()
+			.map(am.ik.sluice.v1.proto.Upstream::getListenPort)
+			.filter(port -> port > 0)
+			.collect(Collectors.toUnmodifiableSet());
+	}
+
 	private volatile boolean closed;
 
-	TunnelSession(String clientId, Router router, SessionSender sender, SessionRegistry registry) {
+	TunnelSession(String clientId, Router router, SessionSender sender, SessionRegistry registry,
+			TcpRouteListener tcpRoutes) {
 		this.clientId = clientId;
 		this.router = router;
 		this.sender = sender;
+		this.tcpRoutes = tcpRoutes;
 		registry.register(this);
+	}
+
+	public static Builder builder() {
+		return new Builder();
+	}
+
+	public static final class Builder {
+
+		private @Nullable String clientId;
+
+		private @Nullable Router router;
+
+		private @Nullable SessionSender sender;
+
+		private @Nullable SessionRegistry registry;
+
+		private @Nullable TcpRouteListener tcpRoutes;
+
+		private Builder() {
+		}
+
+		public Builder clientId(String clientId) {
+			this.clientId = clientId;
+			return this;
+		}
+
+		public Builder router(Router router) {
+			this.router = router;
+			return this;
+		}
+
+		public Builder sender(SessionSender sender) {
+			this.sender = sender;
+			return this;
+		}
+
+		public Builder registry(SessionRegistry registry) {
+			this.registry = registry;
+			return this;
+		}
+
+		public Builder tcpRoutes(TcpRouteListener tcpRoutes) {
+			this.tcpRoutes = tcpRoutes;
+			return this;
+		}
+
+		public TunnelSession build() {
+			return new TunnelSession(Objects.requireNonNull(this.clientId, "clientId is required"),
+					Objects.requireNonNull(this.router, "router is required"),
+					Objects.requireNonNull(this.sender, "sender is required"),
+					Objects.requireNonNull(this.registry, "registry is required"),
+					Objects.requireNonNull(this.tcpRoutes, "tcpRoutes is required"));
+		}
+
 	}
 
 	String clientId() {
@@ -61,7 +131,10 @@ public final class TunnelSession implements AutoCloseable {
 		switch (frame.getType()) {
 			case ADVERTISE -> {
 				int registered = this.router.register(this.clientId, frame.getUpstreamsList());
-				log.info("client {} advertised {} upstream(s)", this.clientId, registered);
+				Set<Integer> rejected = this.tcpRoutes.reconcile(this.clientId, listenPorts(frame.getUpstreamsList()));
+				this.sender.sendAdvertised(List.copyOf(rejected));
+				log.info("client {} advertised {} upstream(s), {} listen port(s) rejected", this.clientId, registered,
+						rejected.size());
 			}
 			case DATA -> {
 				VirtualConnection connection = this.connections.get(frame.getConnId());
@@ -114,6 +187,7 @@ public final class TunnelSession implements AutoCloseable {
 		}
 		this.closed = true;
 		log.info("closing session for client {}", this.clientId);
+		this.tcpRoutes.reconcile(this.clientId, Set.of());
 		this.router.remove(this.clientId);
 		for (VirtualConnection connection : List.copyOf(this.connections.values())) {
 			connection.remoteFailed("tunnel session closed");

@@ -81,7 +81,8 @@ public class Router {
 
 	}
 
-	record Target(String clientId, String domain, String address, boolean preserveHost, boolean tlsPassthrough) {
+	record Target(String clientId, String domain, String address, boolean preserveHost, boolean tlsPassthrough,
+			int listenPort) {
 
 		static Builder builder() {
 			return new Builder();
@@ -98,6 +99,8 @@ public class Router {
 			private boolean preserveHost = true;
 
 			private boolean tlsPassthrough;
+
+			private int listenPort;
 
 			private Builder() {
 			}
@@ -127,11 +130,16 @@ public class Router {
 				return this;
 			}
 
+			Builder listenPort(int listenPort) {
+				this.listenPort = listenPort;
+				return this;
+			}
+
 			Target build() {
 				return new Target(Objects.requireNonNull(this.clientId, "clientId is required"),
 						Objects.requireNonNull(this.domain, "domain is required"),
 						Objects.requireNonNull(this.address, "address is required"), this.preserveHost,
-						this.tlsPassthrough);
+						this.tlsPassthrough, this.listenPort);
 			}
 
 		}
@@ -139,6 +147,8 @@ public class Router {
 	}
 
 	private final ConcurrentMap<String, List<Target>> byDomain = new ConcurrentHashMap<>();
+
+	private final ConcurrentMap<Integer, List<Target>> byPort = new ConcurrentHashMap<>();
 
 	private final ConcurrentMap<String, List<Target>> byClient = new ConcurrentHashMap<>();
 
@@ -163,6 +173,7 @@ public class Router {
 				.address(address)
 				.preserveHost(upstream.getPreserveHost())
 				.tlsPassthrough(upstream.getTlsPassthrough())
+				.listenPort(upstream.getListenPort())
 				.build());
 		}
 		if (clientId == null || clientId.isBlank() || targets.isEmpty()) {
@@ -172,6 +183,9 @@ public class Router {
 			removeLocked(clientId);
 			for (Target target : targets) {
 				this.byDomain.compute(target.domain(), (k, existing) -> append(existing, target));
+				if (target.listenPort() > 0) {
+					this.byPort.compute(target.listenPort(), (k, existing) -> append(existing, target));
+				}
 			}
 			this.byClient.put(clientId, List.copyOf(targets));
 		}
@@ -194,6 +208,9 @@ public class Router {
 		}
 		for (Target target : old) {
 			this.byDomain.compute(target.domain(), (k, existing) -> without(existing, clientId));
+			if (target.listenPort() > 0) {
+				this.byPort.compute(target.listenPort(), (k, existing) -> without(existing, clientId));
+			}
 		}
 	}
 
@@ -224,16 +241,30 @@ public class Router {
 		for (String candidate : candidates(host)) {
 			List<Target> targets = this.byDomain.get(candidate);
 			if (targets != null && !targets.isEmpty()) {
-				Target target = targets.get(0);
-				return Optional.of(Route.builder()
-					.clientId(target.clientId())
-					.address(target.address())
-					.preserveHost(target.preserveHost())
-					.tlsPassthrough(target.tlsPassthrough())
-					.build());
+				return Optional.of(toRoute(targets.get(0)));
 			}
 		}
 		return Optional.empty();
+	}
+
+	/**
+	 * Resolves the route for the given public listen port (raw TCP routing).
+	 */
+	public Optional<Route> lookupByPort(int port) {
+		List<Target> targets = this.byPort.get(port);
+		if (targets == null || targets.isEmpty()) {
+			return Optional.empty();
+		}
+		return Optional.of(toRoute(targets.get(0)));
+	}
+
+	private static Route toRoute(Target target) {
+		return Route.builder()
+			.clientId(target.clientId())
+			.address(target.address())
+			.preserveHost(target.preserveHost())
+			.tlsPassthrough(target.tlsPassthrough())
+			.build();
 	}
 
 	private static List<String> candidates(@Nullable String host) {

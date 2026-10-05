@@ -8,9 +8,15 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 /**
  * Configuration of the sluice server.
  */
+/**
+ * Configuration of the sluice server.
+ *
+ * @param tcpPortRange listen ports a client may claim for tcp routes (comma separated
+ * single ports or {@code min-max} ranges, e.g. {@code 9000-9010,8080}; empty = any port)
+ */
 @ConfigurationProperties("sluice")
 public record SluiceServerProperties(String token, @Nullable String tokenFile, @DefaultValue("0.0.0.0") String dataHost,
-		@DefaultValue("8000") int dataPort, @Nullable String dataTlsBundle) {
+		@DefaultValue("8000") int dataPort, @Nullable String dataTlsBundle, @DefaultValue("") String tcpPortRange) {
 
 	public SluiceServerProperties {
 		dataHost = dataHost == null || dataHost.isBlank() ? "0.0.0.0" : dataHost;
@@ -31,6 +37,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		private int dataPort = 8000;
 
 		@Nullable private String dataTlsBundle;
+
+		private String tcpPortRange = "";
 
 		private Builder() {
 		}
@@ -60,9 +68,15 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			return this;
 		}
 
+		public Builder tcpPortRange(String tcpPortRange) {
+			this.tcpPortRange = tcpPortRange;
+			return this;
+		}
+
 		public SluiceServerProperties build() {
 			return new SluiceServerProperties(this.token == null ? "" : this.token, this.tokenFile,
-					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort, this.dataTlsBundle);
+					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort, this.dataTlsBundle,
+					this.tcpPortRange);
 		}
 
 	}

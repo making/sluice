@@ -4,7 +4,9 @@ TCP tunnel over a single gRPC bidirectional stream; the HTTP reverse proxy is it
 
 ## Layout
 
-Maven multi-module. Build + test with `./mvnw verify` (JDK 25 required).
+Maven multi-module. Build + test with `./mvnw verify` (JDK 25 required). Always run
+the reactor build from the root: `./mvnw -pl <module>` resolves the other modules from
+stale `~/.m2` snapshots and fails with misleading `NoSuchMethodError`s.
 
 - `sluice-proto`: proto + generated stubs + shared tunnel machinery (`am.ik.sluice.tunnel`: VirtualConnection / SessionSender / SocketRelay)
 - `sluice-server`: gRPC control plane (8001) + raw TCP data plane (`sluice.data-port`, 8000) + actuator (8081)

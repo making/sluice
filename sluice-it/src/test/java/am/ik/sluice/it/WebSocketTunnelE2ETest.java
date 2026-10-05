@@ -192,7 +192,11 @@ class WebSocketTunnelE2ETest {
 			.upstream(Upstream.builder().host("ws.local").target("http://127.0.0.1:" + upstream.getLocalPort()).build())
 			.token("it-token")
 			.build();
-		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());
+		TunnelClient started = TunnelClient.builder()
+			.properties(properties)
+			.taskExecutor(TASK_EXECUTOR)
+			.meterRegistry(new SimpleMeterRegistry())
+			.build();
 		started.start();
 		this.client = started;
 		// the ADVERTISE frame is applied asynchronously on the server

@@ -4,22 +4,17 @@ import java.util.Objects;
 
 /**
  * A single upstream entry: the public host the server routes requests for (blank means
- * catch-all), the target URL to dial, whether the request Host header passes through, and
+ * catch-all), the target URL to dial, whether the request Host header passes through,
  * whether TLS connections are relayed untouched ({@code tls-passthrough}) instead of
- * terminated on the data plane.
+ * terminated on the data plane, and the public port for raw TCP routing
+ * ({@code listen-port}; 0 disables it).
  */
-public record Upstream(String host, String target, boolean preserveHost, boolean tlsPassthrough) {
+public record Upstream(String host, String target, boolean preserveHost, boolean tlsPassthrough, int listenPort) {
 
 	public Upstream {
 		host = host == null ? "" : host.trim();
 		target = normalizeTarget(target);
-	}
-
-	/**
-	 * Creates an entry that preserves the Host header (the default).
-	 */
-	public static Upstream of(String host, String target) {
-		return new Upstream(host, target, true, false);
+		listenPort = Math.max(0, listenPort);
 	}
 
 	private static String normalizeTarget(String target) {
@@ -41,6 +36,8 @@ public record Upstream(String host, String target, boolean preserveHost, boolean
 		private boolean preserveHost = true;
 
 		private boolean tlsPassthrough;
+
+		private int listenPort;
 
 		private Builder() {
 		}
@@ -65,9 +62,14 @@ public record Upstream(String host, String target, boolean preserveHost, boolean
 			return this;
 		}
 
+		public Builder listenPort(int listenPort) {
+			this.listenPort = listenPort;
+			return this;
+		}
+
 		public Upstream build() {
 			return new Upstream(this.host, Objects.requireNonNull(this.target, "target is required"), this.preserveHost,
-					this.tlsPassthrough);
+					this.tlsPassthrough, this.listenPort);
 		}
 
 	}

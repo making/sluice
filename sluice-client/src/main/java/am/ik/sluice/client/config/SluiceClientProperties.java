@@ -34,7 +34,7 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	 * Tunnel settings configured under {@code sluice.client}.
 	 *
 	 * @param upstream upstream entries, bound from
-	 * {@code sluice.client.upstream[n].{host,target,preserve-host}}
+	 * {@code sluice.client.upstream[n].{host,target,preserve-host,listen-port}}
 	 */
 	public record Client(@DefaultValue List<Upstream> upstream) {
 
@@ -89,6 +89,7 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 				.setTargetUrl(upstream.target())
 				.setPreserveHost(upstream.preserveHost())
 				.setTlsPassthrough(upstream.tlsPassthrough())
+				.setListenPort(upstream.listenPort())
 				.build())
 			.toList();
 	}

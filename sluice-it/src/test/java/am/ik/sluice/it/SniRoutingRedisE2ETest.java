@@ -158,7 +158,11 @@ class SniRoutingRedisE2ETest {
 			.upstream(Upstream.builder().host(HOST).target("tcp://127.0.0.1:" + REDIS.getMappedPort(6379)).build())
 			.token("it-token")
 			.build();
-		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());
+		TunnelClient started = TunnelClient.builder()
+			.properties(properties)
+			.taskExecutor(TASK_EXECUTOR)
+			.meterRegistry(new SimpleMeterRegistry())
+			.build();
 		started.start();
 		this.client = started;
 		Awaitility.await().atMost(Duration.ofSeconds(5)).until(this.sessions::count, count -> count > 0);

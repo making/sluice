@@ -50,12 +50,16 @@ class RedisE2ETest {
 
 	private static int dataPort;
 
+	/** dedicated listen port for the tcp route serving the same Redis */
+	private static int tcpRoutePort;
+
 	private @Nullable TunnelClient client;
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
 		grpcPort = freePort();
 		dataPort = freePort();
+		tcpRoutePort = freePort();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.token", () -> "it-token");
@@ -83,9 +87,19 @@ class RedisE2ETest {
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
 			// RESP carries no host: the catch-all route (empty host) serves it
 			.upstream(Upstream.builder().host("").target("tcp://127.0.0.1:" + REDIS.getMappedPort(6379)).build())
+			// the same Redis also exposed on a dedicated tcp route port
+			.upstream(Upstream.builder()
+				.host("redis.local")
+				.target("tcp://127.0.0.1:" + REDIS.getMappedPort(6379))
+				.listenPort(tcpRoutePort)
+				.build())
 			.token("it-token")
 			.build();
-		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());
+		TunnelClient started = TunnelClient.builder()
+			.properties(properties)
+			.taskExecutor(TASK_EXECUTOR)
+			.meterRegistry(new SimpleMeterRegistry())
+			.build();
 		started.start();
 		this.client = started;
 		Awaitility.await().atMost(Duration.ofSeconds(5)).until(this.sessions::count, count -> count > 0);
@@ -125,6 +139,48 @@ class RedisE2ETest {
 		assertThat(ok).isEqualTo("OK");
 		String value = this.redis(cmds -> cmds.get("sluice"));
 		assertThat(value).isEqualTo("tunnel");
+	}
+
+	/** PING over the dedicated tcp route port (bound on advertise). */
+	private void pingOverTcpRoute() {
+		RedisClient lettuce = RedisClient.create("redis://127.0.0.1:" + tcpRoutePort);
+		try (StatefulRedisConnection<String, String> connection = lettuce.connect()) {
+			assertThat(connection.sync().ping()).isEqualTo("PONG");
+		}
+		finally {
+			lettuce.shutdown();
+		}
+	}
+
+	@Test
+	void redisRoundTripsThroughDedicatedTcpRoutePort() {
+		this.startClient();
+		Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(this::pingOverTcpRoute);
+	}
+
+	@Test
+	void tcpRouteListenerIsRestoredAfterClientReadvertises() {
+		this.startClient();
+		Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(this::pingOverTcpRoute);
+		// stop the client: the session ends and the listener is released
+		TunnelClient stopped = this.client;
+		this.client = null;
+		if (stopped != null) {
+			stopped.stop();
+		}
+		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> !reachable(tcpRoutePort));
+		// a fresh client re-advertises; the server re-binds the same port
+		this.startClient();
+		Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(this::pingOverTcpRoute);
+	}
+
+	private static boolean reachable(int port) {
+		try (java.net.Socket socket = new java.net.Socket("127.0.0.1", port)) {
+			return socket.isConnected();
+		}
+		catch (Exception e) {
+			return false;
+		}
 	}
 
 }

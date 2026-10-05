@@ -28,10 +28,14 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	private final SessionRegistry sessions;
 
-	public TunnelService(Router router, TokenValidator tokenValidator, SessionRegistry sessions) {
+	private final TcpRouteListener tcpRoutes;
+
+	public TunnelService(Router router, TokenValidator tokenValidator, SessionRegistry sessions,
+			TcpRouteListener tcpRoutes) {
 		this.router = router;
 		this.tokenValidator = tokenValidator;
 		this.sessions = sessions;
+		this.tcpRoutes = tcpRoutes;
 	}
 
 	@Override
@@ -39,8 +43,13 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 		String clientId = TunnelAuthInterceptor.CLIENT_ID.get();
 		String finalClientId = clientId == null ? "" : clientId;
 		log.info("tunnel stream established for client {}", finalClientId);
-		TunnelSession session = new TunnelSession(clientId, this.router, new SessionSender(responseObserver),
-				this.sessions);
+		TunnelSession session = TunnelSession.builder()
+			.clientId(clientId == null ? "" : clientId)
+			.router(this.router)
+			.sender(new SessionSender(responseObserver))
+			.registry(this.sessions)
+			.tcpRoutes(this.tcpRoutes)
+			.build();
 		session.start();
 		return new StreamObserver<>() {
 
