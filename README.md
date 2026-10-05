@@ -37,13 +37,6 @@ flowchart LR
     ts --- router
     ts --- registry
     ts <-. "TunnelSession / SessionSender" .-> lc
-
-    subgraph metrics
-        h1["server actuator :8081<br/>health / prometheus"]
-        h2["client actuator :9001<br/>health / prometheus"]
-    end
-    server --> h1
-    client --> h2
 ```
 
 ```mermaid
