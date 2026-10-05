@@ -10,6 +10,11 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.List;
+import javax.net.ssl.SNIMatcher;
+import javax.net.ssl.SNIServerName;
+import javax.net.ssl.SSLParameters;
 import java.util.Optional;
 
 import javax.net.ssl.SSLContext;
@@ -164,6 +169,8 @@ public class DataProxyServer implements SmartLifecycle {
 		if (first < 0) {
 			return null;
 		}
+		// captured from the ClientHello server_name extension during termination
+		AtomicReference<String> sni = new AtomicReference<>();
 		SSLSocketFactory factory = this.tlsFactory();
 		if (first == TLS_HANDSHAKE && factory != null) {
 			// the consumed byte is replayed into the ssl handshake via the consumed
@@ -171,10 +178,20 @@ public class DataProxyServer implements SmartLifecycle {
 			SSLSocket ssl = (SSLSocket) factory.createSocket(socket,
 					new ByteArrayInputStream(new byte[] { (byte) first }), true);
 			ssl.setUseClientMode(false);
+			SSLParameters parameters = ssl.getSSLParameters();
+			parameters.setSNIMatchers(List.<SNIMatcher>of(new SNIMatcher(0) {
+
+				@Override
+				public boolean matches(SNIServerName serverName) {
+					sni.set(new String(serverName.getEncoded(), StandardCharsets.US_ASCII));
+					return true;
+				}
+			}));
+			ssl.setSSLParameters(parameters);
 			ssl.setHandshakeApplicationProtocolSelector(
 					(s, protocols) -> protocols.contains(ALPN_H2) ? ALPN_H2 : ALPN_HTTP_1_1);
 			ssl.startHandshake();
-			log.debug("tls handshake done; protocol={}", ssl.getApplicationProtocol());
+			log.debug("tls handshake done; protocol={} sni={}", ssl.getApplicationProtocol(), sni.get());
 			in = ssl.getInputStream();
 			socket = ssl;
 		}
@@ -183,10 +200,10 @@ public class DataProxyServer implements SmartLifecycle {
 			// the consumed first byte is pushed back so the parser sees the whole record
 			PushbackInputStream pushback = new PushbackInputStream(in);
 			pushback.unread(first);
-			SniHeadParser.Head sni = new SniHeadParser(HEAD_LIMIT).parse(pushback)
+			SniHeadParser.Head passthrough = new SniHeadParser(HEAD_LIMIT).parse(pushback)
 				.orElseThrow(() -> new IllegalArgumentException("unrecognized tls handshake"));
-			log.debug("tls passthrough; sni={}", sni.sni());
-			return Connection.of(socket, ConnectionHeadParser.Head.encrypted(sni.bytes(), sni.sni()));
+			log.debug("tls passthrough; sni={}", passthrough.sni());
+			return Connection.of(socket, ConnectionHeadParser.Head.encrypted(passthrough.bytes(), passthrough.sni()));
 		}
 		else {
 			PushbackInputStream pushback = new PushbackInputStream(in);
@@ -195,6 +212,11 @@ public class DataProxyServer implements SmartLifecycle {
 		}
 		ConnectionHeadParser.Head head = new ConnectionHeadParser(HEAD_LIMIT).parse(in)
 			.orElseThrow(() -> new IllegalArgumentException("unrecognized connection head"));
+		// prefer the HTTP host; fall back to the SNI host name of the terminated
+		// handshake (hostless protocols such as RESP carry no Host header)
+		if (head.host() == null && sni.get() != null) {
+			head = new ConnectionHeadParser.Head(sni.get(), head.bytes(), head.h2(), false);
+		}
 		return Connection.of(socket, head);
 	}
 

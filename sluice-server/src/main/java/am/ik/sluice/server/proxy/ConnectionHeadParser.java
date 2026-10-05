@@ -25,6 +25,11 @@ public final class ConnectionHeadParser {
 	/** HTTP/2 client connection preface (RFC 9113 3.5). */
 	static final String H2_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+	/**
+	 * First byte of a RESP array (a Redis command), e.g. {@code *1\r\n$4\r\nPING\r\n}.
+	 */
+	static final byte RESP_ARRAY = '*';
+
 	private static final int FRAME_HEADER_LENGTH = 9;
 
 	private static final int FRAME_HEADERS = 0x1;
@@ -75,6 +80,14 @@ public final class ConnectionHeadParser {
 			return new Head(host, bytes, null, true);
 		}
 
+		/**
+		 * A hostless protocol head such as a RESP command array: routable only via the
+		 * catch-all route, relayed verbatim.
+		 */
+		public static Head hostless(byte[] bytes) {
+			return new Head(null, bytes, null, false);
+		}
+
 	}
 
 	/**
@@ -93,6 +106,13 @@ public final class ConnectionHeadParser {
 					Optional<Head> head = this.parseHttp2(bytes);
 					if (head.isPresent()) {
 						return head;
+					}
+				}
+				else if (bytes[0] == RESP_ARRAY) {
+					if (respArrayEnd(bytes) >= 0) {
+						// the whole buffer is the head: bytes beyond the first array are
+						// pipelined commands that must reach the upstream too
+						return Optional.of(Head.hostless(bytes));
 					}
 				}
 				else if (endsWithDoubleCrlf(bytes)) {
@@ -235,6 +255,63 @@ public final class ConnectionHeadParser {
 		int length = bytes.length;
 		return bytes[length - 4] == '\r' && bytes[length - 3] == '\n' && bytes[length - 2] == '\r'
 				&& bytes[length - 1] == '\n';
+	}
+
+	/**
+	 * Returns the length of the first complete RESP array in the buffer (a {@code *N}
+	 * header followed by N bulk strings {@code $len\r\n<bytes>\r\n}), or {@code -1} while
+	 * the array is still incomplete or malformed.
+	 */
+	static int respArrayEnd(byte[] bytes) {
+		int pos = 0;
+		int crlfAt = indexOfCrlf(bytes, pos);
+		if (crlfAt < 0 || crlfAt == pos + 1) {
+			return -1; // array header not fully buffered, or no count
+		}
+		int count;
+		try {
+			count = Integer.parseInt(new String(bytes, pos + 1, crlfAt - pos - 1, StandardCharsets.US_ASCII));
+		}
+		catch (NumberFormatException e) {
+			return -1;
+		}
+		if (count < 0) {
+			return -1;
+		}
+		pos = crlfAt + 2;
+		for (int i = 0; i < count; i++) {
+			if (pos >= bytes.length || bytes[pos] != '$') {
+				return -1;
+			}
+			crlfAt = indexOfCrlf(bytes, pos);
+			if (crlfAt < 0 || crlfAt == pos + 1) {
+				return -1; // bulk header not fully buffered, or no length
+			}
+			int length;
+			try {
+				length = Integer.parseInt(new String(bytes, pos + 1, crlfAt - pos - 1, StandardCharsets.US_ASCII));
+			}
+			catch (NumberFormatException e) {
+				return -1;
+			}
+			if (length < 0) {
+				return -1;
+			}
+			pos = crlfAt + 2 + length + 2; // header CRLF + data + trailing CRLF
+			if (pos > bytes.length) {
+				return -1;
+			}
+		}
+		return pos;
+	}
+
+	private static int indexOfCrlf(byte[] bytes, int from) {
+		for (int i = from; i + 1 < bytes.length; i++) {
+			if (bytes[i] == '\r' && bytes[i + 1] == '\n') {
+				return i;
+			}
+		}
+		return -1;
 	}
 
 }

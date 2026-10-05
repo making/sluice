@@ -173,6 +173,29 @@ class ConnectionHeadParserTest {
 	}
 
 	@Test
+	void respCommandArrayIsARoutableHeadlessHead() {
+		byte[] head = "*2\r\n$3\r\nSET\r\n$5\r\nsluice\r\n".getBytes(StandardCharsets.US_ASCII);
+		ConnectionHeadParser.Head parsed = PARSER.parse(new ByteArrayInputStream(head)).orElseThrow();
+		assertThat(parsed.host()).isNull(); // routed via the catch-all route
+		assertThat(parsed.encrypted()).isFalse();
+		assertThat(parsed.bytes()).isEqualTo(head);
+	}
+
+	@Test
+	void respHeadKeepsPipelinedBytesBeyondTheFirstArray() {
+		byte[] head = "*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n".getBytes(StandardCharsets.US_ASCII);
+		ConnectionHeadParser.Head parsed = PARSER.parse(new ByteArrayInputStream(head)).orElseThrow();
+		assertThat(parsed.host()).isNull();
+		assertThat(parsed.bytes()).isEqualTo(head); // pipelined bytes must not be dropped
+	}
+
+	@Test
+	void respArrayIsIncompleteUntilTheLastBulkEnds() {
+		byte[] head = "*2\r\n$3\r\nSET\r\n$3\r\nke".getBytes(StandardCharsets.US_ASCII);
+		assertThat(PARSER.parse(new ByteArrayInputStream(head))).isEmpty();
+	}
+
+	@Test
 	void emptyStreamYieldsEmpty() {
 		assertThat(PARSER.parse(new ByteArrayInputStream(new byte[0]))).isEmpty();
 	}
