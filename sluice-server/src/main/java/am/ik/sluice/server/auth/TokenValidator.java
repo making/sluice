@@ -62,7 +62,7 @@ public class TokenValidator {
 		try {
 			Path file = Files.createTempFile("sluice-token-", ".txt");
 			Files.writeString(file, token, StandardCharsets.UTF_8);
-			log.info(
+			log.warn(
 					"No token configured. Generated token is written to: {}. Reuse it by starting with --sluice.token-file={}",
 					file.toAbsolutePath(), file.toAbsolutePath());
 		}
