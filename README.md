@@ -81,10 +81,10 @@ Run
 h2c / TLS on the data port (same server + client):
 
     # h2c prior knowledge (routed by :authority); the upstream must speak h2c too --
-    # the data plane only relays frames. E.g. run the upstream as
+    # the data plane only relays frames. Any sluice-server instance works out of the box
+    # (h2c is enabled on its servlet connector), e.g. run one as
     #   java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
-    #     --server.port=31080 --server.http2.enabled=true \
-    #     --spring.grpc.server.port=32001 --sluice.data-port=32000
+    #     --server.port=31080 --spring.grpc.server.port=32001 --sluice.data-port=32000
     # and point the client's upstream at http://127.0.0.1:31080
     # (python3 -m http.server is HTTP/1.1 only and will NOT work here)
     curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:8000/ -v -o /dev/null 2>&1 | grep 'using HTTP/2'
