@@ -22,7 +22,7 @@ The data plane relays raw bytes (only the Host header of the first request is in
 
 ## Manual E2E check
 
-See "Try it manually" in README.md.
+See "Run" in README.md.
 
 
 ## Open work

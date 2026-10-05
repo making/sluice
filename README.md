@@ -60,8 +60,6 @@ Build the executable jars first (the `-exec.jar` files below are produced by thi
 Run
 ---
 
-Local, plaintext, with a token:
-
     # terminal 1: upstream (any HTTP server; here python's)
     python3 -m http.server 3000 --bind 127.0.0.1
 
@@ -78,37 +76,12 @@ Local, plaintext, with a token:
     # terminal 4: request through the tunnel (routed by the Host header)
     curl -H 'Host: demo.local' http://127.0.0.1:8000/
 
-Against a remote server over TLS, use `grpcs://`:
-
-    java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
-      --sluice.server-url=grpcs://example.com:8001 \
-      --sluice.upstream=demo.local=http://127.0.0.1:3000 \
-      --sluice.token=SECRET
-
 `sluice.server-url` schemes: `grpc://` (plaintext) / `grpcs://` (TLS; `--sluice.insecure=true` skips verification).
-
-Try it manually
----------------
-
-Same as above on non-default ports, with a one-shot upstream:
-
-    python3 -m http.server 31080 --bind 127.0.0.1 &
-
-    java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
-      --sluice.token=SECRET \
-      --spring.grpc.server.port=18001 --sluice.data-port=18000 --server.port=18081
-
-    java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
-      --sluice.server-url=grpc://127.0.0.1:18001 \
-      --sluice.upstream=demo.local=http://127.0.0.1:31080 \
-      --sluice.token=SECRET
-
-    curl -H 'Host: demo.local' http://127.0.0.1:18000/
 
 h2c / TLS on the data port (same server + client, upstream of choice):
 
     # h2c prior knowledge (routed by :authority)
-    curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:18000/ -v -o /dev/null 2>&1 | grep 'using HTTP/2'
+    curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:8000/ -v -o /dev/null 2>&1 | grep 'using HTTP/2'
 
     # TLS: self-signed cert registered as an SSL bundle, then restart the server with
     #   --sluice.data-tls-bundle=data-plane
@@ -117,9 +90,9 @@ h2c / TLS on the data port (same server + client, upstream of choice):
     openssl req -x509 -newkey rsa:2048 -keyout cert-key.pem -out cert.pem -days 1 -nodes -subj /CN=localhost
 
     # h2 over TLS (ALPN) / http/1.1 fallback / plaintext on the same port
-    curl --http2 -k -H 'Host: demo.local' https://127.0.0.1:18000/ -v -o /dev/null 2>&1 | grep 'using HTTP/2' -A2
-    curl --http1.1 -k -H 'Host: demo.local' https://127.0.0.1:18000/
-    curl -H 'Host: demo.local' http://127.0.0.1:18000/
+    curl --http2 -k -H 'Host: demo.local' https://127.0.0.1:8000/ -v -o /dev/null 2>&1 | grep 'using HTTP/2' -A2
+    curl --http1.1 -k -H 'Host: demo.local' https://127.0.0.1:8000/
+    curl -H 'Host: demo.local' http://127.0.0.1:8000/
 
 Configuration (server)
 ----------------------
