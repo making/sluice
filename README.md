@@ -8,30 +8,65 @@ A single gRPC bidi stream multiplexes virtual TCP connections (`conn_id`). The d
 Architecture
 ------------
 
-```
-                          host:8000                          host:8001
- browser ──HTTP──► ┌─ sluice-server ─┐◄──gRPC bidi stream── ┌─ sluice-client ─┐ ──TCP──► upstream
-                   │                 │   (Frame: CONNECT /  │                 │          :3000 etc.
-                   │  DataProxyServer│    DATA / CLOSE /    │  TunnelClient   │
-                   │  (raw TCP, Host │    ERROR / ADVERTISE)│  (reconnect,    │
-                   │   header route) │                      │   backoff)      │
-                   │  TunnelService ─┼──────────────────────┼► LocalConnector │
-                   │  Router         │   TunnelSession      │   (strict       │
-                   │  SessionRegistry│   SessionSender      │    forwarding)  │
-                   └────────┬────────┘                      └────────┬────────┘
-                            │ actuator :8081                         │ actuator :9001
-                            ▼                                        ▼
-                       health / prometheus                     health / prometheus
+```mermaid
+flowchart LR
+    browser["browser"]
 
- data plane (server, :8000)              tunnel (gRPC bidi, :8001)                 client side
- ┌───────────────────────────┐           ┌──────────────────────────┐        ┌────────────────────┐
- │ accept ─► read first head │ CONNECT(id)│ one stream per client,  │ dial   │ Socket(address)    │
- │ Host ─► Router.lookup     │ ─────────► │ conn_id multiplexed     │ ─────► │ ▲                  │
- │ VirtualConnection(id)     │ DATA(id,64K)│ VirtualConnection       │        │ │ byte pump x2     │
- │ SocketRelay(src=socket)   │ ◄───────── │ (bounded queue 128x64K, │ ◄───── │ │ (virtual threads)│
- │                            │ DATA/CLOSE │ half-close, backpressure)│       ▼                    │
- └───────────────────────────┘           └──────────────────────────┘        └────────────────────┘
+    subgraph server["sluice-server"]
+        direction TB
+        dps["DataProxyServer<br/>(raw TCP, Host header route)"]
+        ts["TunnelService"]
+        router["Router"]
+        registry["SessionRegistry"]
+    end
+
+    subgraph client["sluice-client"]
+        direction TB
+        tc["TunnelClient<br/>(reconnect, backoff)"]
+        lc["LocalConnector<br/>(strict forwarding)"]
+    end
+
+    upstream["upstream :3000 etc."]
+
+    browser -- "HTTP :8000" --> dps
+    dps <-- "gRPC bidi stream :8001<br/>Frame: CONNECT / DATA /<br/>CLOSE / ERROR / ADVERTISE" --> tc
+    tc --- lc
+    lc -- TCP --> upstream
+
+    dps --- ts
+    ts --- router
+    ts --- registry
+    ts <-. "TunnelSession / SessionSender" .-> lc
+
+    subgraph metrics
+        h1["server actuator :8081<br/>health / prometheus"]
+        h2["client actuator :9001<br/>health / prometheus"]
+    end
+    server --> h1
+    client --> h2
 ```
+
+```mermaid
+sequenceDiagram
+    participant B as browser
+    participant S as server (data plane / tunnel)
+    participant C as client
+    participant U as upstream
+
+    Note over S: accept, read first head, Host -> Router.lookup
+    B ->> S: TCP connect + HTTP request
+    S ->> C: CONNECT(conn_id) via gRPC bidi stream
+    C ->> U: dial Socket(address)
+    Note over S,C: VirtualConnection (bounded queue 128x64K, half-close, backpressure)
+    loop raw relay (one virtual thread per direction)
+        S ->> C: DATA(conn_id, 64K)
+        C ->> U: bytes
+        U -->> C: bytes
+        C ->> S: DATA(conn_id) / CLOSE
+    end
+    S -->> B: response
+```
+
 
 - one bidi stream per client; each proxied TCP connection becomes a `conn_id` on that stream
 - server: accept, route by `Host`, `VirtualConnection` + `CONNECT`, then raw relay (`SocketRelay`, one virtual thread per direction)
