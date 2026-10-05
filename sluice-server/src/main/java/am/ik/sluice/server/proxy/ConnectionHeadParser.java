@@ -4,6 +4,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Optional;
 
 import org.jspecify.annotations.Nullable;
@@ -19,7 +20,7 @@ import io.netty.util.AsciiString;
  * ({@code :authority}). The consumed bytes are returned verbatim so they can be replayed
  * to the upstream as the beginning of the relayed stream.
  */
-final class ConnectionHeadParser {
+public final class ConnectionHeadParser {
 
 	/** HTTP/2 client connection preface (RFC 9113 3.5). */
 	static final String H2_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -40,17 +41,30 @@ final class ConnectionHeadParser {
 
 	private final DefaultHttp2HeadersDecoder headersDecoder = new DefaultHttp2HeadersDecoder(true);
 
-	ConnectionHeadParser(int maxHeadSize) {
+	public ConnectionHeadParser(int maxHeadSize) {
 		if (maxHeadSize <= 0) {
 			throw new IllegalArgumentException("maxHeadSize must be positive");
 		}
 		this.maxHeadSize = maxHeadSize;
 	}
 
-	record Head(@Nullable String host, byte[] bytes) {
+	/**
+	 * The HTTP/2 parts of the head needed to re-encode the first HEADERS block: the bytes
+	 * before the HEADERS frame, the (padding/priority-stripped) header block, the bytes
+	 * after it, and the stream id. Present only when the head ends with a single HEADERS
+	 * frame (no CONTINUATION).
+	 */
+	public record H2Head(byte[] prefix, byte[] headerBlock, byte[] suffix, int streamId) {
+	}
 
-		static Head of(byte[] bytes, @Nullable String host) {
-			return new Head(host, bytes);
+	public record Head(@Nullable String host, byte[] bytes, @Nullable H2Head h2) {
+
+		public static Head http1(byte[] bytes, @Nullable String host) {
+			return new Head(host, bytes, null);
+		}
+
+		public static Head http2(byte[] bytes, @Nullable String host, @Nullable H2Head h2) {
+			return new Head(host, bytes, h2);
 		}
 
 	}
@@ -59,7 +73,7 @@ final class ConnectionHeadParser {
 	 * Reads from the stream until a routable head (HTTP/1.1 or HTTP/2) has been consumed;
 	 * empty on EOF, error, or when no complete head arrives within the size limit.
 	 */
-	Optional<Head> parse(InputStream in) {
+	public Optional<Head> parse(InputStream in) {
 		ByteArrayOutputStream buffer = new ByteArrayOutputStream(1024);
 		byte[] chunk = new byte[1024];
 		try {
@@ -74,7 +88,7 @@ final class ConnectionHeadParser {
 					}
 				}
 				else if (endsWithDoubleCrlf(bytes)) {
-					return Optional.of(Head.of(bytes, http1HostOf(bytes)));
+					return Optional.of(Head.http1(bytes, http1HostOf(bytes)));
 				}
 			}
 		}
@@ -88,7 +102,7 @@ final class ConnectionHeadParser {
 	 * Returns {@code true} when the accumulated bytes begin with (or are a prefix of) the
 	 * HTTP/2 connection preface.
 	 */
-	static boolean isHttp2(byte[] bytes) {
+	public static boolean isHttp2(byte[] bytes) {
 		if (bytes.length >= H2_MAGIC.length()) {
 			return H2_MAGIC.equals(new String(bytes, 0, H2_MAGIC.length(), StandardCharsets.US_ASCII));
 		}
@@ -99,7 +113,7 @@ final class ConnectionHeadParser {
 	 * Extracts the Host header value from an HTTP/1.1 request head; {@code null} when
 	 * absent.
 	 */
-	static @Nullable String http1HostOf(byte[] head) {
+	public static @Nullable String http1HostOf(byte[] head) {
 		String text = new String(head, StandardCharsets.US_ASCII);
 		String[] lines = text.split("\r\n");
 		for (int i = 1; i < lines.length; i++) {
@@ -125,6 +139,8 @@ final class ConnectionHeadParser {
 		buf.position(H2_MAGIC.length());
 		ByteArrayOutputStream headerBlock = new ByteArrayOutputStream(256);
 		boolean headersEnded = false;
+		boolean continuationSeen = false;
+		int headersFrameStart = -1;
 		int headersStreamId = 1;
 		while (buf.remaining() >= FRAME_HEADER_LENGTH && !headersEnded) {
 			int length = unsigned24(buf);
@@ -136,6 +152,10 @@ final class ConnectionHeadParser {
 			int streamId = buf.getInt() & 0x7fffffff;
 			if (type == FRAME_HEADERS) {
 				headersStreamId = streamId;
+				headersFrameStart = buf.position() - FRAME_HEADER_LENGTH;
+			}
+			if (type == FRAME_CONTINUATION) {
+				continuationSeen = true;
 			}
 			if (type != FRAME_HEADERS && type != FRAME_CONTINUATION) {
 				skip(buf, length);
@@ -162,8 +182,14 @@ final class ConnectionHeadParser {
 		if (!headersEnded) {
 			return Optional.empty();
 		}
-		String host = this.authorityOf(headerBlock.toByteArray(), headersStreamId);
-		return Optional.of(Head.of(bytes, host));
+		byte[] block = headerBlock.toByteArray();
+		String host = this.authorityOf(block, headersStreamId);
+		if (continuationSeen || headersFrameStart < 0) {
+			return Optional.of(Head.http2(bytes, host, null));
+		}
+		byte[] prefix = Arrays.copyOfRange(bytes, 0, headersFrameStart);
+		byte[] suffix = Arrays.copyOfRange(bytes, buf.position(), bytes.length);
+		return Optional.of(Head.http2(bytes, host, new H2Head(prefix, block, suffix, headersStreamId)));
 	}
 
 	private static int unsigned24(ByteBuffer buf) {

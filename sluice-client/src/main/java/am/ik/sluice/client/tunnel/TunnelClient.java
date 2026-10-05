@@ -3,6 +3,7 @@ package am.ik.sluice.client.tunnel;
 import org.jspecify.annotations.Nullable;
 
 import java.net.Socket;
+import java.util.List;
 import java.util.UUID;
 import java.util.Map;
 import java.util.Optional;
@@ -12,7 +13,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
-import am.ik.sluice.client.upstream.UpstreamParser;
 import am.ik.sluice.tunnel.SessionSender;
 import am.ik.sluice.tunnel.SocketRelay;
 import am.ik.sluice.tunnel.VirtualConnection;
@@ -96,23 +96,24 @@ public class TunnelClient implements SmartLifecycle {
 		if (this.properties.serverUrl() == null || this.properties.serverUrl().isBlank()) {
 			throw new IllegalStateException("sluice.server-url is required");
 		}
-		Map<String, String> upstreams = UpstreamParser.parse(this.properties.upstream());
+		Map<String, String> upstreams = this.properties.upstreamMap();
 		if (upstreams.isEmpty()) {
-			throw new IllegalStateException("sluice.upstream is required");
+			throw new IllegalStateException("sluice.client.upstream is required");
 		}
+		List<am.ik.sluice.v1.proto.Upstream> advertised = this.properties.toProtoUpstreams();
 		this.running = true;
 		this.shutdown = new CountDownLatch(1);
-		this.taskExecutor.execute(() -> runLoop(upstreams));
+		this.taskExecutor.execute(() -> runLoop(upstreams, advertised));
 	}
 
-	private void runLoop(Map<String, String> upstreams) {
+	private void runLoop(Map<String, String> upstreams, List<am.ik.sluice.v1.proto.Upstream> advertised) {
 		LocalConnector connector = new LocalConnector(upstreams, this.properties.strictForwarding(),
 				this.properties.insecure());
 		long backoff = BACKOFF_INITIAL_SECONDS;
 		while (this.running) {
 			try {
 				this.channel = buildChannel();
-				runSession(this.channel, connector, upstreamMap(this.properties.upstream()));
+				runSession(this.channel, connector, advertised);
 				backoff = BACKOFF_INITIAL_SECONDS;
 			}
 			catch (InterruptedException e) {
@@ -144,10 +145,6 @@ public class TunnelClient implements SmartLifecycle {
 		}
 	}
 
-	private Map<String, String> upstreamMap(String upstream) {
-		return UpstreamParser.parse(upstream);
-	}
-
 	private ManagedChannel buildChannel() {
 		String url = this.properties.serverUrl();
 		boolean secure = url.startsWith("grpcs://");
@@ -173,8 +170,8 @@ public class TunnelClient implements SmartLifecycle {
 		return builder.build();
 	}
 
-	private void runSession(ManagedChannel channel, LocalConnector connector, Map<String, String> upstreams)
-			throws InterruptedException {
+	private void runSession(ManagedChannel channel, LocalConnector connector,
+			List<am.ik.sluice.v1.proto.Upstream> upstreams) throws InterruptedException {
 		CountDownLatch closed = new CountDownLatch(1);
 		AtomicReference<SessionSender> senderRef = new AtomicReference<>();
 		ClientResponseObserver<Frame, Frame> responseObserver = new ClientResponseObserver<>() {

@@ -1,5 +1,9 @@
 package am.ik.sluice.client.config;
 
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -15,15 +19,30 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  *
  * @param serverUrl tunnel server endpoint, {@code grpc://host:port} or
  * {@code grpcs://host:port} for TLS
- * @param upstream comma separated {@code host=targetUrl} pairs
+ * @param client client tunnel settings, including the upstream entries
  * @param token authentication token
  * @param tokenFile file to read the authentication token from
  * @param insecure skip TLS verification
  * @param strictForwarding only dial upstreams present in the upstream map
  */
 @ConfigurationProperties("sluice")
-public record SluiceClientProperties(String serverUrl, String upstream, String token, @Nullable String tokenFile,
-		@DefaultValue("false") boolean insecure, @DefaultValue("true") boolean strictForwarding) {
+public record SluiceClientProperties(String serverUrl, @Nullable Client client, String token,
+		@Nullable String tokenFile, @DefaultValue("false") boolean insecure,
+		@DefaultValue("true") boolean strictForwarding) {
+
+	/**
+	 * Tunnel settings configured under {@code sluice.client}.
+	 *
+	 * @param upstream upstream entries, bound from
+	 * {@code sluice.client.upstream[n].{host,target,preserve-host}}
+	 */
+	public record Client(@DefaultValue List<Upstream> upstream) {
+
+		public Client {
+			upstream = upstream == null ? List.of() : List.copyOf(upstream);
+		}
+
+	}
 
 	/**
 	 * Resolves the effective token, reading the token file when configured.
@@ -41,6 +60,38 @@ public record SluiceClientProperties(String serverUrl, String upstream, String t
 		return this.token == null ? "" : this.token;
 	}
 
+	/**
+	 * The configured upstreams as a host to target map, preserving declaration order (a
+	 * blank host is the catch-all entry).
+	 */
+	public Map<String, String> upstreamMap() {
+		Map<String, String> map = new LinkedHashMap<>();
+		if (this.client == null) {
+			return map;
+		}
+		for (Upstream upstream : this.client.upstream()) {
+			map.put(upstream.host(), upstream.target());
+		}
+		return map;
+	}
+
+	/**
+	 * The configured upstreams in the proto form carried by the ADVERTISE frame.
+	 */
+	public List<am.ik.sluice.v1.proto.Upstream> toProtoUpstreams() {
+		if (this.client == null) {
+			return List.of();
+		}
+		return this.client.upstream()
+			.stream()
+			.map(upstream -> am.ik.sluice.v1.proto.Upstream.newBuilder()
+				.setHost(upstream.host())
+				.setTargetUrl(upstream.target())
+				.setPreserveHost(upstream.preserveHost())
+				.build())
+			.toList();
+	}
+
 	public static Builder builder() {
 		return new Builder();
 	}
@@ -49,7 +100,7 @@ public record SluiceClientProperties(String serverUrl, String upstream, String t
 
 		@Nullable private String serverUrl;
 
-		@Nullable private String upstream;
+		private final List<Upstream> upstreams = new ArrayList<>();
 
 		@Nullable private String token;
 
@@ -67,8 +118,12 @@ public record SluiceClientProperties(String serverUrl, String upstream, String t
 			return this;
 		}
 
-		public Builder upstream(String upstream) {
-			this.upstream = upstream;
+		public Builder upstream(String host, String target) {
+			return this.upstream(host, target, true);
+		}
+
+		public Builder upstream(String host, String target, boolean preserveHost) {
+			this.upstreams.add(new Upstream(host, target, preserveHost));
 			return this;
 		}
 
@@ -94,8 +149,8 @@ public record SluiceClientProperties(String serverUrl, String upstream, String t
 
 		public SluiceClientProperties build() {
 			return new SluiceClientProperties(Objects.requireNonNull(this.serverUrl, "serverUrl is required"),
-					Objects.requireNonNull(this.upstream, "upstream is required"), this.token == null ? "" : this.token,
-					this.tokenFile, this.insecure, this.strictForwarding);
+					new Client(List.copyOf(this.upstreams)), this.token == null ? "" : this.token, this.tokenFile,
+					this.insecure, this.strictForwarding);
 		}
 
 	}

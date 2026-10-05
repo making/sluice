@@ -91,7 +91,7 @@ class TunnelEndToEndTest {
 		}
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
-			.upstream("demo.local=http://127.0.0.1:" + upstream.getAddress().getPort())
+			.upstream("demo.local", "http://127.0.0.1:" + upstream.getAddress().getPort())
 			.build();
 		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());
 		started.start();

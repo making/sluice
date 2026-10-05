@@ -124,7 +124,7 @@ class H2cDataPlaneE2ETest {
 	private TunnelClient startClient(String host, String targetUrl) {
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
-			.upstream(host + "=" + targetUrl)
+			.upstream(host, targetUrl)
 			.build();
 		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());
 		started.start();

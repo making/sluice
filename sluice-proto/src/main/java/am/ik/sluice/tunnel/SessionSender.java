@@ -8,7 +8,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
-import java.util.Map;
+import java.util.List;
 
 import am.ik.sluice.v1.proto.Frame;
 import am.ik.sluice.v1.proto.Upstream;
@@ -145,16 +145,10 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	}
 
 	/**
-	 * Announces the upstream map to the server (client -> server only).
+	 * Announces the upstreams to the server (client -> server only).
 	 */
-	public void sendAdvertise(Map<String, String> upstreams) {
-		Frame frame = Frame.newBuilder()
-			.setType(Frame.Type.ADVERTISE)
-			.addAllUpstreams(upstreams.entrySet()
-				.stream()
-				.map(entry -> Upstream.newBuilder().setHost(entry.getKey()).setTargetUrl(entry.getValue()).build())
-				.toList())
-			.build();
+	public void sendAdvertise(List<Upstream> upstreams) {
+		Frame frame = Frame.newBuilder().setType(Frame.Type.ADVERTISE).addAllUpstreams(upstreams).build();
 		enqueue(new Payload(frame));
 	}
 

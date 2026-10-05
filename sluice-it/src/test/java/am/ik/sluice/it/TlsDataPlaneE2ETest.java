@@ -197,8 +197,8 @@ class TlsDataPlaneE2ETest {
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
 			// the h2 stub doubles as the target for both the h2 and the h1-over-TLS path
-			.upstream("tls.local=http://127.0.0.1:" + h2Upstream.getLocalPort() + ",127.0.0.1=http://127.0.0.1:"
-					+ h1UpstreamAddress.getPort())
+			.upstream("tls.local", "http://127.0.0.1:" + h2Upstream.getLocalPort())
+			.upstream("127.0.0.1", "http://127.0.0.1:" + h1UpstreamAddress.getPort())
 			.build();
 		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());
 		started.start();

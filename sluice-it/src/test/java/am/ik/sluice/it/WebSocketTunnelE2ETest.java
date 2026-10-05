@@ -187,7 +187,7 @@ class WebSocketTunnelE2ETest {
 		}
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
-			.upstream("ws.local=http://127.0.0.1:" + upstream.getLocalPort())
+			.upstream("ws.local", "http://127.0.0.1:" + upstream.getLocalPort())
 			.build();
 		TunnelClient started = new TunnelClient(properties, TASK_EXECUTOR, new SimpleMeterRegistry());
 		started.start();

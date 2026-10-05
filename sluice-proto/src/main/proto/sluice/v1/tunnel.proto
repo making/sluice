@@ -45,4 +45,7 @@ message Upstream {
   string host = 1;
   // Upstream URL, e.g. http://127.0.0.1:3000.
   string target_url = 2;
+  // When false the server rewrites the request Host/:authority to the target's
+  // host[:port] before relaying; when true the head bytes pass through verbatim.
+  bool preserve_host = 3;
 }

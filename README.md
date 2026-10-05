@@ -71,7 +71,8 @@ Run
     # terminal 3: client
     java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
       --sluice.server-url=grpc://127.0.0.1:8001 \
-      --sluice.upstream=demo.local=http://127.0.0.1:31080 \
+      --sluice.client.upstream[0].host=demo.local \
+      --sluice.client.upstream[0].target=http://127.0.0.1:31080 \
       --sluice.token=SECRET
 
     # terminal 4: request through the tunnel (routed by the Host header / :authority)
@@ -111,7 +112,9 @@ Configuration (client)
 | Property | Default | Description |
 |---|---|---|
 | `sluice.server-url` | - | tunnel server endpoint (`grpc://host:port` / `grpcs://host:port`) |
-| `sluice.upstream` | - | `host=targetUrl,...` pairs (`host` empty = catch-all) |
+| `sluice.client.upstream[n].host` | - | public domain routed by the server (empty = catch-all) |
+| `sluice.client.upstream[n].target` | - | upstream URL (`http://` assumed when the scheme is omitted) |
+| `sluice.client.upstream[n].preserve-host` | `true` | `false` rewrites the request Host / `:authority` to the target's `host[:port]` |
 | `sluice.token` / `sluice.token-file` | - | authentication token |
 | `sluice.insecure` | `false` | skip TLS verification |
 | `sluice.strict-forwarding` | `true` | only dial upstreams present in the map |
@@ -136,7 +139,7 @@ This produces `sluice/server:latest` and `sluice/client:latest`. Run:
 
     docker run -p 8000:8000 -p 8001:8001 sluice/server --sluice.token=SECRET
     docker run sluice/client --sluice.server-url=grpc://host.docker.internal:8001 \
-      --sluice.upstream=demo.local=http://host.docker.internal:3000 --sluice.token=SECRET
+      --sluice.client.upstream[0].host=demo.local --sluice.client.upstream[0].target=http://host.docker.internal:3000 --sluice.token=SECRET
 
 Tests
 -----

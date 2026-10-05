@@ -25,11 +25,14 @@ import am.ik.sluice.v1.proto.Upstream;
 @Component
 public class Router {
 
-	/** Resolved route: the client owning the upstream and its dial address. */
-	public record Route(String clientId, String address) {
+	/**
+	 * Resolved route: the client owning the upstream, its dial address, and whether the
+	 * request Host header passes through unmodified.
+	 */
+	public record Route(String clientId, String address, boolean preserveHost) {
 	}
 
-	record Target(String clientId, String domain, String address) {
+	record Target(String clientId, String domain, String address, boolean preserveHost) {
 	}
 
 	private final ConcurrentMap<String, List<Target>> byDomain = new ConcurrentHashMap<>();
@@ -51,7 +54,7 @@ public class Router {
 			if (address == null) {
 				continue;
 			}
-			targets.add(new Target(clientId, domain, address));
+			targets.add(new Target(clientId, domain, address, upstream.getPreserveHost()));
 		}
 		if (clientId == null || clientId.isBlank() || targets.isEmpty()) {
 			return 0;
@@ -113,7 +116,7 @@ public class Router {
 			List<Target> targets = this.byDomain.get(candidate);
 			if (targets != null && !targets.isEmpty()) {
 				Target target = targets.get(0);
-				return Optional.of(new Route(target.clientId(), target.address()));
+				return Optional.of(new Route(target.clientId(), target.address(), target.preserveHost()));
 			}
 		}
 		return Optional.empty();

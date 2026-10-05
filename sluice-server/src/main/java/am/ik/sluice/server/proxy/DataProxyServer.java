@@ -205,9 +205,12 @@ public class DataProxyServer implements SmartLifecycle {
 			this.close(conn.socket());
 			return;
 		}
-		VirtualConnection connection = session.open(route.get().address());
+		Router.Route route0 = route.get();
+		VirtualConnection connection = session.open(route0.address());
+		byte[] head = route0.preserveHost() ? conn.head().bytes()
+				: ConnectionHeadRewriter.rewrite(conn.head(), route0.address());
 		StreamRelay relay = StreamRelay.builder(conn.pipe(), connection, session.sender())
-			.prefix(conn.head().bytes())
+			.prefix(head)
 			.listener(this.relayedBytes::increment)
 			.onComplete(() -> session.remove(connection.connectionId()))
 			.build();
