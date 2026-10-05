@@ -74,7 +74,7 @@ class TunnelReconnectTests {
 		ConfigurableApplicationContext context = new SpringApplicationBuilder(SluiceServerApplication.class).run(
 				"--server.port=" + this.webPort, "--spring.grpc.server.port=" + this.grpcPort,
 				"--sluice.data-port=" + this.dataPort, "--sluice.token=" + token,
-				"--spring.threads.virtual.enabled=true", "--spring.grpc.server.shutdown.grace-period=2s");
+				"--spring.grpc.server.shutdown.grace-period=2s");
 		this.serverContext = context;
 	}
 
@@ -82,7 +82,7 @@ class TunnelReconnectTests {
 		ConfigurableApplicationContext context = new SpringApplicationBuilder(SluiceClientApplication.class).run(
 				"--sluice.server-url=grpc://127.0.0.1:" + this.grpcPort, "--sluice.client.upstream[0].host=" + HOST,
 				"--sluice.client.upstream[0].target=http://127.0.0.1:" + this.upstreamPort, "--sluice.token=" + token,
-				"--management.server.port=0", "--spring.threads.virtual.enabled=true");
+				"--management.server.port=0");
 		this.clientContext = context;
 	}
 
