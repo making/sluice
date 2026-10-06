@@ -188,9 +188,16 @@ class TcpEchoE2ETest {
 		this.startClient(java.util.List.of(echoUpstream(unclaimedRoutePort)));
 		// the out-of-range port is reported back on ADVERTISED; the client closes the
 		// stream and re-advertises (the counter grows beyond the first advertise)
-		io.micrometer.core.instrument.Counter rejected = this.meterRegistry.counter("sluice.advertise.rejected");
-		Awaitility.await().atMost(Duration.ofSeconds(10)).until(rejected::count, count -> count >= 2);
+		Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> rejectedCount(), count -> count >= 2);
 		assertThat(reachable(unclaimedRoutePort)).isFalse();
+	}
+
+	private double rejectedCount() {
+		return this.meterRegistry.find("sluice.advertise.rejected")
+			.counters()
+			.stream()
+			.mapToDouble(io.micrometer.core.instrument.Counter::count)
+			.sum();
 	}
 
 	private static boolean reachable(int port) {

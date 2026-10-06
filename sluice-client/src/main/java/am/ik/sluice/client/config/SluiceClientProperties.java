@@ -38,12 +38,15 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	/**
 	 * Tunnel settings configured under {@code sluice.client}.
 	 *
+	 * @param id stable client identity sent as {@code x-sluice-id} on every tunnel
+	 * stream; blank = a random id is generated once per process
 	 * @param upstream upstream entries, bound from
 	 * {@code sluice.client.upstream[n].{host,target,preserve-host,listen-port}}
 	 */
-	public record Client(@DefaultValue List<Upstream> upstream) {
+	public record Client(@DefaultValue("") String id, @DefaultValue List<Upstream> upstream) {
 
 		public Client {
+			id = id == null ? "" : id;
 			upstream = upstream == null ? List.of() : List.copyOf(upstream);
 		}
 
@@ -107,6 +110,8 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 
 		@Nullable private String serverUrl;
 
+		private String clientId = "";
+
 		private final List<Upstream> upstreams = new ArrayList<>();
 
 		@Nullable private String token;
@@ -126,6 +131,11 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 
 		public Builder serverUrl(String serverUrl) {
 			this.serverUrl = serverUrl;
+			return this;
+		}
+
+		public Builder clientId(String clientId) {
+			this.clientId = clientId;
 			return this;
 		}
 
@@ -166,8 +176,8 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 
 		public SluiceClientProperties build() {
 			return new SluiceClientProperties(Objects.requireNonNull(this.serverUrl, "serverUrl is required"),
-					new Client(List.copyOf(this.upstreams)), this.token == null ? "" : this.token, this.tokenFile,
-					this.insecure, this.strictForwarding, this.keepAliveTime, this.keepAliveTimeout);
+					new Client(this.clientId, List.copyOf(this.upstreams)), this.token == null ? "" : this.token,
+					this.tokenFile, this.insecure, this.strictForwarding, this.keepAliveTime, this.keepAliveTimeout);
 		}
 
 	}

@@ -153,14 +153,18 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 				if (existing.clientId().equals(clientId)) {
 					continue; // already bound by a previous advertise of the same client
 				}
-				// take the port over when the owner session is already gone (the unbind
-				// of a dropped session may race the advertise of the reconnected one)
-				if (this.sessions.find(existing.clientId()).isPresent()) {
+				// deterministic ownership: the smaller client id owns the port on every
+				// node. A gone owner always loses (the unbind of a dropped session may
+				// race the advertise of the reconnected one)
+				if (this.sessions.find(existing.clientId()).isPresent()
+						&& existing.clientId().compareTo(clientId) < 0) {
 					log.warn("tcp route port {} is owned by client {}; rejecting for client {}", port,
 							existing.clientId(), clientId);
 					rejected.add(port);
 					continue;
 				}
+				log.info("tcp route port {} taken over from client {} by client {}", port, existing.clientId(),
+						clientId);
 				this.listeners.remove(port, existing);
 				existing.close();
 			}
@@ -172,24 +176,37 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 	}
 
 	private boolean bind(String clientId, int port) {
-		try {
-			ServerSocket socket = new ServerSocket();
-			socket.setReuseAddress(true);
-			socket.bind(new InetSocketAddress(InetAddress.getByName(this.properties.dataHost()), port), 128);
-			BoundListener listener = BoundListener.builder()
-				.clientId(clientId)
-				.socket(socket)
-				.running(new AtomicBoolean(true))
-				.build();
-			this.listeners.put(port, listener);
-			Thread.ofVirtual().name("sluice-tcp-accept-" + port).start(() -> this.acceptLoop(port, listener));
-			log.info("bound tcp route port {} for client {}", port, clientId);
-			return true;
-		}
-		catch (Exception e) {
-			// a bind failure must not tear down the session; the port is reported back
-			log.warn("failed to bind tcp route port {} for client {}: {}", port, clientId, e.toString());
-			return false;
+		// a stolen listener's socket may still be in teardown; retry briefly
+		for (int attempt = 0;; attempt++) {
+			try {
+				ServerSocket socket = new ServerSocket();
+				socket.setReuseAddress(true);
+				socket.bind(new InetSocketAddress(InetAddress.getByName(this.properties.dataHost()), port), 128);
+				BoundListener listener = BoundListener.builder()
+					.clientId(clientId)
+					.socket(socket)
+					.running(new AtomicBoolean(true))
+					.build();
+				this.listeners.put(port, listener);
+				Thread.ofVirtual().name("sluice-tcp-accept-" + port).start(() -> this.acceptLoop(port, listener));
+				log.info("bound tcp route port {} for client {}", port, clientId);
+				return true;
+			}
+			catch (Exception e) {
+				if (attempt >= 2) {
+					// a bind failure must not tear down the session; the port is reported
+					// back
+					log.warn("failed to bind tcp route port {} for client {}: {}", port, clientId, e.toString());
+					return false;
+				}
+				try {
+					Thread.sleep(100);
+				}
+				catch (InterruptedException ie) {
+					Thread.currentThread().interrupt();
+					return false;
+				}
+			}
 		}
 	}
 

@@ -17,6 +17,9 @@ import am.ik.sluice.v1.proto.Connect;
 import am.ik.sluice.v1.proto.Data;
 import am.ik.sluice.v1.proto.Error;
 import am.ik.sluice.v1.proto.Frame;
+import am.ik.sluice.v1.proto.MembershipUpdate;
+import am.ik.sluice.v1.proto.Node;
+import am.ik.sluice.v1.proto.Drain;
 import am.ik.sluice.v1.proto.Upstream;
 import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.StreamObserver;
@@ -158,11 +161,33 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 	/**
 	 * Acknowledges an {@link Advertise} (server -> client only), listing the listen ports
-	 * that were not bound.
+	 * that were not bound and this node's id.
 	 */
-	public void sendAdvertiseAck(List<Integer> rejectedPorts) {
-		AdvertiseAck ack = AdvertiseAck.newBuilder().addAllRejectedPorts(rejectedPorts).build();
+	public void sendAdvertiseAck(List<Integer> rejectedPorts, String nodeId) {
+		AdvertiseAck ack = AdvertiseAck.newBuilder()
+			.addAllRejectedPorts(rejectedPorts)
+			.setNodeId(nodeId == null ? "" : nodeId)
+			.build();
 		enqueue(new Payload(Frame.newBuilder().setAdvertiseAck(ack).build()));
+	}
+
+	/**
+	 * Publishes the cluster membership (server -> client only).
+	 */
+	public void sendMembership(List<Node> nodes, long membershipVersion) {
+		MembershipUpdate update = MembershipUpdate.newBuilder()
+			.addAllNodes(nodes)
+			.setMembershipVersion(membershipVersion)
+			.build();
+		enqueue(new Payload(Frame.newBuilder().setMembershipUpdate(update).build()));
+	}
+
+	/**
+	 * Notifies the client that this node is draining (server -> client only).
+	 */
+	public void sendDrain(String reason) {
+		Drain drain = Drain.newBuilder().setReason(reason == null ? "" : reason).build();
+		enqueue(new Payload(Frame.newBuilder().setDrain(drain).build()));
 	}
 
 	@Override

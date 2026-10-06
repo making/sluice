@@ -262,27 +262,40 @@ public class Router {
 
 	/**
 	 * Resolves the route for the given Host header value. Exact match first, then the
-	 * host without its port, then the catch-all entry.
+	 * host without its port, then the catch-all entry. When several clients serve the
+	 * same domain the one with the smallest client id wins -- deterministic across nodes,
+	 * since in fan-out mode every node holds every client.
 	 */
 	public Optional<Route> lookup(@Nullable String host) {
 		for (String candidate : candidates(host)) {
 			List<Target> targets = this.byDomain.get(candidate);
 			if (targets != null && !targets.isEmpty()) {
-				return Optional.of(toRoute(targets.get(0)));
+				return Optional.of(toRoute(winner(targets)));
 			}
 		}
 		return Optional.empty();
 	}
 
 	/**
-	 * Resolves the route for the given public listen port (raw TCP routing).
+	 * Resolves the route for the given public listen port (raw TCP routing); ties are
+	 * broken deterministically by client id (see {@link #lookup}).
 	 */
 	public Optional<Route> lookupByPort(int port) {
 		List<Target> targets = this.byPort.get(port);
 		if (targets == null || targets.isEmpty()) {
 			return Optional.empty();
 		}
-		return Optional.of(toRoute(targets.get(0)));
+		return Optional.of(toRoute(winner(targets)));
+	}
+
+	private static Target winner(List<Target> targets) {
+		Target best = targets.get(0);
+		for (Target target : targets) {
+			if (target.clientId().compareTo(best.clientId()) < 0) {
+				best = target;
+			}
+		}
+		return best;
 	}
 
 	private static Route toRoute(Target target) {

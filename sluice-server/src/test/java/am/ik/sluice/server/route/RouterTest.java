@@ -66,6 +66,23 @@ class RouterTest {
 	}
 
 	@Test
+	void smallestClientIdWinsTheDomainRegardlessOfRegistrationOrder() {
+		Router router = new Router();
+		router.register("c5", List.of(upstream("demo.local", "http://127.0.0.5:3000")));
+		router.register("c2", List.of(upstream("demo.local", "http://127.0.0.2:3000")));
+		router.register("c9", List.of(upstream("demo.local", "http://127.0.0.9:3000")));
+		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c2");
+	}
+
+	@Test
+	void listenPortTieBreakAlsoPicksTheSmallestClientIdentifier() {
+		Router router = new Router();
+		router.register("c5", List.of(portUpstream(16379, "tcp://127.0.0.1:7005")));
+		router.register("c2", List.of(portUpstream(16379, "tcp://127.0.0.1:7002")));
+		assertThat(router.lookupByPort(16379).orElseThrow().clientId()).isEqualTo("c2");
+	}
+
+	@Test
 	void reRegistrationReplacesClientRoutes() {
 		Router router = new Router();
 		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3000")));

@@ -46,6 +46,10 @@ public class TokenValidator {
 		}
 		String token = properties.token();
 		if (token == null || token.isBlank()) {
+			if (properties.clusterEnabled()) {
+				// per-node random tokens would break clients connected to every node
+				throw new IllegalStateException("cluster mode requires an explicit sluice.token / sluice.token-file");
+			}
 			return generateToken();
 		}
 		return token;

@@ -36,6 +36,25 @@ class TokenValidatorTest {
 		assertThat(validator.isValid("Bearer unexpected")).isFalse();
 	}
 
+	@Test
+	void clusterModeWithoutTokenRefusesToStart() {
+		org.assertj.core.api.Assertions
+			.assertThatThrownBy(() -> new TokenValidator(SluiceServerProperties.builder()
+				.cluster(SluiceServerProperties.Cluster.builder().nodes(java.util.List.of("a", "b")).build())
+				.build()))
+			.isInstanceOf(IllegalStateException.class)
+			.hasMessageContaining("cluster mode requires");
+	}
+
+	@Test
+	void clusterModeWithExplicitTokenStarts() {
+		TokenValidator validator = new TokenValidator(SluiceServerProperties.builder()
+			.token("abcdefg")
+			.cluster(SluiceServerProperties.Cluster.builder().nodes(java.util.List.of("a", "b")).build())
+			.build());
+		assertThat(validator.isValid("Bearer abcdefg")).isTrue();
+	}
+
 	private static String slugOfCapturedTokenFile() {
 		// the generated token file path is logged; find the most recent sluice-token temp
 		// file

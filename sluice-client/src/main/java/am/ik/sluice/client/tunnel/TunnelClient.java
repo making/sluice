@@ -1,61 +1,38 @@
 package am.ik.sluice.client.tunnel;
 
-import org.jspecify.annotations.Nullable;
-
-import java.net.Socket;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
-import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-import am.ik.sluice.client.config.SluiceClientProperties;
-import am.ik.sluice.tunnel.SessionSender;
-import am.ik.sluice.tunnel.SocketRelay;
-import am.ik.sluice.tunnel.VirtualConnection;
-import am.ik.sluice.v1.proto.Frame;
-import am.ik.sluice.v1.proto.TunnelGrpc;
-import io.grpc.Metadata;
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.netty.GrpcSslContexts;
-import io.grpc.netty.NettyChannelBuilder;
-import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
-import io.grpc.stub.ClientCallStreamObserver;
-import io.grpc.stub.ClientResponseObserver;
-import io.grpc.stub.MetadataUtils;
-import io.micrometer.core.instrument.Counter;
-import io.micrometer.core.instrument.MeterRegistry;
+import org.jspecify.annotations.Nullable;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.context.SmartLifecycle;
+
+import am.ik.sluice.client.config.SluiceClientProperties;
+import am.ik.sluice.v1.proto.ListNodesResponse;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.SmartLifecycle;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.stereotype.Component;
 
 /**
- * Maintains the tunnel stream towards the server: connects, advertises the upstream map,
- * dials local upstreams on CONNECT, and reconnects with exponential backoff (1s..30s)
- * when the stream drops.
+ * Fan-out supervisor: keeps one {@link NodeConnection} tunnel stream per server node. The
+ * {@code sluice.server-url} is the bootstrap; the node list learned via {@code ListNodes}
+ * and membership updates opens one stream per node (keyed by node id) and closes streams
+ * of nodes that left. All membership transitions run on a single-threaded executor.
  */
 @Component
-public class TunnelClient implements SmartLifecycle {
+public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 
 	private static final Logger log = LoggerFactory.getLogger(TunnelClient.class);
-
-	private static final long BACKOFF_INITIAL_SECONDS = 1;
-
-	private static final long BACKOFF_MAX_SECONDS = 30;
-
-	private static final Metadata.Key<String> TOKEN_HEADER = Metadata.Key.of("authorization",
-			Metadata.ASCII_STRING_MARSHALLER);
-
-	private static final Metadata.Key<String> CLIENT_ID_HEADER = Metadata.Key.of("x-sluice-id",
-			Metadata.ASCII_STRING_MARSHALLER);
 
 	private final SluiceClientProperties properties;
 
@@ -63,34 +40,32 @@ public class TunnelClient implements SmartLifecycle {
 
 	private final MeterRegistry meterRegistry;
 
-	private final Counter reconnects;
+	/** Process-stable client identity sent on every stream. */
+	private final String clientId;
 
-	private final Counter rejectedAdvertises;
+	private final ConcurrentHashMap<String, NodeConnection> connectionsByNode = new ConcurrentHashMap<>();
 
-	private final ConcurrentHashMap<Long, VirtualConnection> connections = new ConcurrentHashMap<>();
+	private final ExecutorService supervisor = Executors
+		.newSingleThreadExecutor(r -> Thread.ofVirtual().name("sluice-supervisor").unstarted(r));
+
+	private final AtomicBoolean membershipLearned = new AtomicBoolean();
 
 	private volatile boolean running;
-
-	private volatile boolean connected;
-
-	private volatile @Nullable ManagedChannel channel;
-
-	private volatile @Nullable CountDownLatch shutdown;
-
-	private volatile @Nullable SessionSender currentSender;
 
 	TunnelClient(SluiceClientProperties properties, @Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor,
 			MeterRegistry meterRegistry) {
 		this.properties = properties;
 		this.taskExecutor = taskExecutor;
 		this.meterRegistry = meterRegistry;
-		this.reconnects = Counter.builder("sluice.reconnect.total")
-			.description("Tunnel stream re-establishments after a drop")
-			.register(meterRegistry);
-		this.rejectedAdvertises = Counter.builder("sluice.advertise.rejected")
-			.description("Advertised listen ports rejected by the server")
-			.register(meterRegistry);
-		meterRegistry.gauge("sluice.connections.active", this.connections, Map::size);
+		String configured = clientid(properties);
+		this.clientId = configured == null || configured.isBlank() ? UUID.randomUUID().toString() : configured;
+		meterRegistry.gauge("sluice.connections.active", this.connectionsByNode,
+				map -> map.values().stream().mapToInt(NodeConnection::activeConnections).sum());
+	}
+
+	private static @Nullable String clientid(SluiceClientProperties properties) {
+		SluiceClientProperties.@Nullable Client client = properties.client();
+		return client == null ? null : client.id();
 	}
 
 	public static Builder builder() {
@@ -132,7 +107,21 @@ public class TunnelClient implements SmartLifecycle {
 	}
 
 	public boolean isConnected() {
-		return this.connected;
+		for (NodeConnection connection : this.connectionsByNode.values()) {
+			if (connection.isConnected()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Connection state per node id (or the bootstrap url before the node id is known).
+	 */
+	public Map<String, Boolean> nodeStates() {
+		Map<String, Boolean> states = new LinkedHashMap<>();
+		this.connectionsByNode.forEach((key, connection) -> states.put(key, connection.isConnected()));
+		return states;
 	}
 
 	@Override
@@ -140,239 +129,130 @@ public class TunnelClient implements SmartLifecycle {
 		if (this.properties.serverUrl() == null || this.properties.serverUrl().isBlank()) {
 			throw new IllegalStateException("sluice.server-url is required");
 		}
-		Map<String, String> upstreams = this.properties.upstreamMap();
-		if (upstreams.isEmpty()) {
+		if (this.properties.upstreamMap().isEmpty()) {
 			throw new IllegalStateException("sluice.client.upstream is required");
 		}
-		List<am.ik.sluice.v1.proto.Upstream> advertised = this.properties.toProtoUpstreams();
 		this.running = true;
-		this.shutdown = new CountDownLatch(1);
-		this.taskExecutor.execute(() -> runLoop(upstreams, advertised));
+		this.startConnection("", this.properties.serverUrl());
 	}
 
-	private void runLoop(Map<String, String> upstreams, List<am.ik.sluice.v1.proto.Upstream> advertised) {
-		LocalConnector connector = LocalConnector.builder()
-			.upstreams(upstreams)
-			.strict(this.properties.strictForwarding())
-			.insecure(this.properties.insecure())
+	private void startConnection(String nodeId, String url) {
+		NodeConnection connection = NodeConnection.builder()
+			.key(nodeId.isBlank() ? url : nodeId)
+			.nodeId(nodeId)
+			.url(url)
+			.properties(this.properties)
+			.clientId(this.clientId)
+			.taskExecutor(this.taskExecutor)
+			.listener(this)
+			.meterRegistry(this.meterRegistry)
 			.build();
-		long backoff = BACKOFF_INITIAL_SECONDS;
-		while (this.running) {
-			try {
-				this.channel = buildChannel();
-				runSession(this.channel, connector, advertised);
-				if (this.connected) {
-					backoff = BACKOFF_INITIAL_SECONDS;
-				}
+		this.connectionsByNode.put(nodeId.isBlank() ? url : nodeId, connection);
+		connection.start();
+	}
+
+	@Override
+	public void onConnected(NodeConnection connection, String nodeId) {
+		this.supervisor.execute(() -> {
+			// rename the connection after the node id is known, so the bootstrap
+			// connection becomes the stream of that node instead of a duplicate
+			if (!nodeId.isBlank()) {
+				this.rekey(connection, nodeId);
 			}
-			catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-				return;
-			}
-			catch (Exception e) {
-				if (this.running) {
-					log.warn("tunnel stream ended: {}", e.toString());
-				}
-			}
-			finally {
-				shutdownChannel();
-				this.connected = false;
-			}
-			if (!this.running) {
-				return;
-			}
-			// the next loop iteration is the reconnection attempt
-			this.reconnects.increment();
-			try {
-				TimeUnit.SECONDS.sleep(backoff);
-			}
-			catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-				return;
-			}
-			backoff = Math.min(BACKOFF_MAX_SECONDS, backoff * 2);
+			// self-healing: re-fetch the node list on every established stream
+			this.reconcile(this.fetchNodes(connection));
+		});
+	}
+
+	private void rekey(NodeConnection connection, String nodeId) {
+		NodeConnection existing = this.connectionsByNode.put(nodeId, connection);
+		if (existing == connection) {
+			return;
+		}
+		// remove the old key only when it still maps to this connection
+		this.connectionsByNode.remove(connection.key(), connection);
+		if (existing != null && existing != connection) {
+			log.info("duplicate stream for node {}; closing the older one", nodeId);
+			existing.close();
+			this.connectionsByNode.remove(nodeId, existing);
 		}
 	}
 
-	private ManagedChannel buildChannel() {
-		String url = this.properties.serverUrl();
-		boolean secure = url.startsWith("grpcs://");
-		String authority = url.replaceFirst("^grpcs?://", "");
-		int portSeparator = authority.lastIndexOf(':');
-		String host = portSeparator > 0 ? authority.substring(0, portSeparator) : authority;
-		int port = portSeparator > 0 ? Integer.parseInt(authority.substring(portSeparator + 1)) : 443;
-		ManagedChannelBuilder<?> builder = ManagedChannelBuilder.forAddress(host, port)
-			.enableRetry()
-			.keepAliveTime(this.properties.keepAliveTime().toSeconds(), TimeUnit.SECONDS)
-			.keepAliveTimeout(this.properties.keepAliveTimeout().toSeconds(), TimeUnit.SECONDS);
-		if (!secure) {
-			builder.usePlaintext();
-		}
-		else if (this.properties.insecure()) {
-			try {
-				((NettyChannelBuilder) builder)
-					.sslContext(GrpcSslContexts.forClient().trustManager(InsecureTrustManagerFactory.INSTANCE).build());
-			}
-			catch (Exception e) {
-				throw new IllegalStateException("failed to build insecure SSL context", e);
-			}
-		}
-		return builder.build();
-	}
-
-	private void runSession(ManagedChannel channel, LocalConnector connector,
-			List<am.ik.sluice.v1.proto.Upstream> upstreams) throws InterruptedException {
-		CountDownLatch closed = new CountDownLatch(1);
-		AtomicReference<SessionSender> senderRef = new AtomicReference<>();
-		ClientResponseObserver<Frame, Frame> responseObserver = new ClientResponseObserver<>() {
-
-			@Override
-			public void beforeStart(ClientCallStreamObserver<Frame> call) {
-				// the onReady handler may only be installed during beforeStart
-				SessionSender sender = new SessionSender(call);
-				sender.start();
-				senderRef.set(sender);
-			}
-
-			@Override
-			public void onNext(Frame frame) {
-				handle(frame, connector, closed::countDown);
-			}
-
-			@Override
-			public void onError(Throwable t) {
-				log.info("tunnel stream error: {}", t.toString());
-				closed.countDown();
-			}
-
-			@Override
-			public void onCompleted() {
-				log.info("tunnel stream closed by server");
-				closed.countDown();
-			}
-
-		};
-		Metadata metadata = new Metadata();
-		String token = this.properties.tokenValue();
-		if (!token.isBlank()) {
-			metadata.put(TOKEN_HEADER, "Bearer " + token);
-		}
-		metadata.put(CLIENT_ID_HEADER, UUID.randomUUID().toString());
-		log.info("connecting to {} ...", this.properties.serverUrl());
-		TunnelGrpc.newStub(channel)
-			.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(metadata))
-			.connect(responseObserver);
-		SessionSender sender = senderRef.get();
-		if (sender == null) {
-			return; // stream failed before starting
-		}
-		this.currentSender = sender;
-		sender.sendAdvertise(upstreams);
-		closed.await();
-		sender.close();
-	}
-
-	private void handle(Frame frame, LocalConnector connector, Runnable terminateStream) {
-		switch (frame.getBodyCase()) {
-			case CONNECT -> {
-				// register the virtual connection synchronously so DATA frames that
-				// follow the CONNECT are not dropped before the dial task runs
-				SessionSender sender0 = this.currentSender;
-				if (sender0 == null) {
-					return;
-				}
-				am.ik.sluice.v1.proto.Connect request = frame.getConnect();
-				VirtualConnection connection = new VirtualConnection(request.getConnId(), sender0);
-				this.connections.put(request.getConnId(), connection);
-				this.taskExecutor.execute(() -> dial(request, connector, connection));
-			}
-			case DATA -> {
-				am.ik.sluice.v1.proto.Data data = frame.getData();
-				VirtualConnection connection = this.connections.get(data.getConnId());
-				if (connection != null) {
-					connection.acceptData(data.getPayload().toByteArray());
-				}
-			}
-			case CLOSE -> {
-				VirtualConnection connection = this.connections.get(frame.getClose().getConnId());
-				if (connection != null) {
-					connection.remoteClosed();
-				}
-			}
-			case ERROR -> {
-				am.ik.sluice.v1.proto.Error error = frame.getError();
-				VirtualConnection connection = this.connections.get(error.getConnId());
-				if (connection != null) {
-					connection.remoteFailed(error.getMessage());
-				}
-			}
-			case ADVERTISE_ACK -> {
-				List<Integer> rejected = frame.getAdvertiseAck().getRejectedPortsList();
-				if (rejected.isEmpty()) {
-					// the server acknowledged the advertise: the tunnel is up for real
-					this.connected = true;
-					log.info("tunnel established; advertising {} upstream(s)", this.properties.upstreamMap().size());
-					return;
-				}
-				log.warn("server rejected listen ports {} on advertise; closing the stream to re-advertise", rejected);
-				this.rejectedAdvertises.increment();
-				terminateStream.run();
-			}
-			case ADVERTISE -> log.warn("unexpected ADVERTISE from server");
-			case KEEP_ALIVE -> {
-				// liveness no-op
-			}
-			default -> {
-				// empty or unknown future body: ignore
-			}
-		}
-	}
-
-	private void dial(am.ik.sluice.v1.proto.Connect request, LocalConnector connector, VirtualConnection connection) {
-		long connectionId = request.getConnId();
-		String address = request.getAddress();
+	private List<am.ik.sluice.v1.proto.Node> fetchNodes(NodeConnection connection) {
 		try {
-			if (!connector.permits(address)) {
-				throw new IllegalArgumentException("upstream not permitted: " + address);
-			}
-			Socket socket = connector.dial(address);
-			SessionSender sender = this.currentSender;
-			if (sender == null) {
-				socket.close();
-				return;
-			}
-			SocketRelay relay = SocketRelay.builder(socket, connection, sender)
-				.onComplete(() -> this.connections.remove(connectionId))
-				.build();
-			relay.start();
+			ListNodesResponse response = connection.listNodes();
+			this.membershipLearned.set(true);
+			return response.getNodesList();
 		}
 		catch (Exception e) {
-			log.debug("dial {} failed: {}", address, e.toString());
-			SessionSender sender = this.currentSender;
-			if (sender != null) {
-				sender.sendError(connectionId, e.toString());
-			}
-			this.connections.remove(connectionId);
-			connection.close();
+			log.debug("ListNodes via {} failed: {}", connection.key(), e.toString());
+			return List.of();
 		}
 	}
 
-	private void shutdownChannel() {
-		ManagedChannel channel = this.channel;
-		if (channel != null && !channel.isShutdown()) {
-			channel.shutdownNow();
+	@Override
+	public void onMembership(List<am.ik.sluice.v1.proto.Node> nodes, long membershipVersion) {
+		this.supervisor.execute(() -> this.reconcile(nodes));
+	}
+
+	private @org.jspecify.annotations.Nullable NodeConnection byEndpoint(String url) {
+		for (NodeConnection connection : this.connectionsByNode.values()) {
+			if (connection.url().equals(url)) {
+				return connection;
+			}
 		}
+		return null;
+	}
+
+	@Override
+	public void onDrain(NodeConnection connection, String reason) {
+		// the stream is closing; the per-node loop retries with backoff until the node
+		// re-appears in the membership
+	}
+
+	/**
+	 * Adopts the given membership: opens streams to new nodes, closes streams of nodes
+	 * that are no longer listed. The bootstrap connection doubles as the stream of a
+	 * listed node without a public url.
+	 */
+	private void reconcile(List<am.ik.sluice.v1.proto.Node> nodes) {
+		if (!this.running || nodes.isEmpty()) {
+			return;
+		}
+		for (am.ik.sluice.v1.proto.Node node : nodes) {
+			String nodeId = node.getNodeId();
+			if (nodeId.isBlank() || this.connectionsByNode.containsKey(nodeId)) {
+				continue;
+			}
+			if (node.getPublicUrl().isBlank()) {
+				continue; // no reachable address known (the bootstrap stream covers it
+							// once acked)
+			}
+			// reuse the connection that already points at this endpoint (the bootstrap
+			// stream): a second stream to the same node would make the server drop the
+			// first session on register and churn the routes
+			NodeConnection sameEndpoint = this.byEndpoint(node.getPublicUrl());
+			if (sameEndpoint != null) {
+				log.info("node {} is the endpoint of the {} stream; adopting it", nodeId, sameEndpoint.key());
+				this.rekey(sameEndpoint, nodeId);
+				continue;
+			}
+			log.info("opening tunnel stream to node {} at {}", nodeId, node.getPublicUrl());
+			this.startConnection(nodeId, node.getPublicUrl());
+		}
+		// close streams of nodes that left the membership
+		java.util.List<String> nodeIds = nodes.stream().map(am.ik.sluice.v1.proto.Node::getNodeId).toList();
+		this.connectionsByNode.keySet().retainAll(nodeIds);
 	}
 
 	@Override
 	public void stop() {
 		this.running = false;
-		this.connected = false;
-		CountDownLatch shutdown = this.shutdown;
-		if (shutdown != null) {
-			shutdown.countDown();
+		this.supervisor.shutdownNow();
+		for (NodeConnection connection : this.connectionsByNode.values()) {
+			connection.close();
 		}
-		shutdownChannel();
+		this.connectionsByNode.clear();
 	}
 
 	@Override

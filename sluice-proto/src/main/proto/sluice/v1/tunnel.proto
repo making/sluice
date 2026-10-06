@@ -11,6 +11,27 @@ service Tunnel {
   // Opens the control/data stream. The client authenticates with the
   // `authorization` metadata and identifies itself with `x-sluice-id`.
   rpc Connect (stream Frame) returns (stream Frame);
+  // Returns the cluster membership (authenticated like Connect). Single-node
+  // servers return only themselves with an empty `public_url`.
+  rpc ListNodes (ListNodesRequest) returns (ListNodesResponse);
+}
+
+message ListNodesRequest {
+}
+
+// One cluster node.
+message Node {
+  string node_id = 1;
+  // Control plane address clients connect to for this node; empty = keep using
+  // the address the client reached the server at (bootstrap).
+  string public_url = 2;
+}
+
+message ListNodesResponse {
+  repeated Node nodes = 1;
+  // Monotonically increasing; greater than a previously seen value means the
+  // membership changed.
+  uint64 membership_version = 2;
 }
 
 // Envelope for every message on the tunnel stream; exactly one body is set.
@@ -30,6 +51,10 @@ message Frame {
     KeepAlive keep_alive = 6;
     // server -> client: acknowledgment of the client's `Advertise`.
     AdvertiseAck advertise_ack = 7;
+    // server -> client: current cluster membership (nodes + version).
+    MembershipUpdate membership_update = 8;
+    // server -> client: this node is going away; move to the other nodes.
+    Drain drain = 9;
   }
 }
 
@@ -63,11 +88,27 @@ message Advertise {
 message KeepAlive {
 }
 
+// Server -> client: the full cluster membership, sent on connect and whenever it changes.
+message MembershipUpdate {
+  repeated Node nodes = 1;
+  uint64 membership_version = 2;
+}
+
+// Server -> client: the sending node is draining (stopping); the client should
+// fail over to the other nodes and only come back once the node is listed again.
+message Drain {
+  // Human readable cause.
+  string reason = 1;
+}
+
 // Acknowledgment of the client's `Advertise`.
 message AdvertiseAck {
   // Listen ports the server did not bind (e.g. outside the configured
   // tcp-port-range); empty means every advertised route was accepted.
   repeated uint32 rejected_ports = 1;
+  // Node id of the server that sent this ack; lets a client that reached the
+  // same node through several addresses keep a single stream per node.
+  string node_id = 2;
 }
 
 message Upstream {

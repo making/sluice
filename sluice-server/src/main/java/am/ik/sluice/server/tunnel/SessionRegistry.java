@@ -26,7 +26,7 @@ public class SessionRegistry {
 		}
 	}
 
-	void remove(TunnelSession session) {
+	public void remove(TunnelSession session) {
 		this.sessions.remove(session.clientId(), session);
 	}
 

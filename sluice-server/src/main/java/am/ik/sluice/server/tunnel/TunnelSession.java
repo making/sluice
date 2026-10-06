@@ -18,6 +18,7 @@ import am.ik.sluice.tunnel.FrameWriter;
 import am.ik.sluice.tunnel.SessionSender;
 import am.ik.sluice.tunnel.VirtualConnection;
 import am.ik.sluice.v1.proto.Frame;
+import am.ik.sluice.v1.proto.Node;
 import io.grpc.Status;
 
 /**
@@ -29,6 +30,8 @@ public final class TunnelSession implements AutoCloseable {
 	private static final Logger log = LoggerFactory.getLogger(TunnelSession.class);
 
 	private final String clientId;
+
+	private final String nodeId;
 
 	private final Router router;
 
@@ -49,9 +52,12 @@ public final class TunnelSession implements AutoCloseable {
 
 	private volatile boolean closed;
 
-	TunnelSession(String clientId, Router router, SessionSender sender, SessionRegistry registry,
+	private volatile boolean drained;
+
+	TunnelSession(String clientId, String nodeId, Router router, SessionSender sender, SessionRegistry registry,
 			TcpRouteListener tcpRoutes) {
 		this.clientId = clientId;
+		this.nodeId = nodeId;
 		this.router = router;
 		this.sender = sender;
 		this.tcpRoutes = tcpRoutes;
@@ -66,6 +72,8 @@ public final class TunnelSession implements AutoCloseable {
 
 		private @Nullable String clientId;
 
+		private String nodeId = "";
+
 		private @Nullable Router router;
 
 		private @Nullable SessionSender sender;
@@ -79,6 +87,11 @@ public final class TunnelSession implements AutoCloseable {
 
 		public Builder clientId(String clientId) {
 			this.clientId = clientId;
+			return this;
+		}
+
+		public Builder nodeId(String nodeId) {
+			this.nodeId = nodeId;
 			return this;
 		}
 
@@ -103,7 +116,7 @@ public final class TunnelSession implements AutoCloseable {
 		}
 
 		public TunnelSession build() {
-			return new TunnelSession(Objects.requireNonNull(this.clientId, "clientId is required"),
+			return new TunnelSession(Objects.requireNonNull(this.clientId, "clientId is required"), this.nodeId,
 					Objects.requireNonNull(this.router, "router is required"),
 					Objects.requireNonNull(this.sender, "sender is required"),
 					Objects.requireNonNull(this.registry, "registry is required"),
@@ -112,7 +125,7 @@ public final class TunnelSession implements AutoCloseable {
 
 	}
 
-	String clientId() {
+	public String clientId() {
 		return this.clientId;
 	}
 
@@ -133,7 +146,7 @@ public final class TunnelSession implements AutoCloseable {
 				List<am.ik.sluice.v1.proto.Upstream> advertised = frame.getAdvertise().getUpstreamsList();
 				int registered = this.router.register(this.clientId, advertised);
 				Set<Integer> rejected = this.tcpRoutes.reconcile(this.clientId, listenPorts(advertised));
-				this.sender.sendAdvertiseAck(List.copyOf(rejected));
+				this.sender.sendAdvertiseAck(List.copyOf(rejected), this.nodeId);
 				log.info("client {} advertised {} upstream(s), {} listen port(s) rejected", this.clientId, registered,
 						rejected.size());
 				for (am.ik.sluice.v1.proto.Upstream upstream : advertised) {
@@ -187,6 +200,37 @@ public final class TunnelSession implements AutoCloseable {
 
 	public void remove(long connectionId) {
 		this.connections.remove(connectionId);
+	}
+
+	/**
+	 * Number of in-flight virtual connections relayed by this session.
+	 */
+	public int connectionCount() {
+		return this.connections.size();
+	}
+
+	/**
+	 * Marks the session as drained and notifies the client that this node is going away.
+	 */
+	public void drain(String reason) {
+		this.drained = true;
+		try {
+			this.sender.sendDrain(reason);
+		}
+		catch (RuntimeException e) {
+			// the stream may already be dead
+		}
+	}
+
+	boolean drained() {
+		return this.drained;
+	}
+
+	/**
+	 * Pushes the current cluster membership to the client.
+	 */
+	public void pushMembership(List<Node> nodes, long membershipVersion) {
+		this.sender.sendMembership(nodes, membershipVersion);
 	}
 
 	@Override

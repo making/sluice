@@ -1,6 +1,8 @@
 package am.ik.sluice.server.tunnel;
 
 import am.ik.sluice.server.auth.TokenValidator;
+import am.ik.sluice.server.cluster.NodeDirectory;
+import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.SessionSender;
 import am.ik.sluice.v1.proto.Frame;
@@ -30,12 +32,38 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	private final TcpRouteListener tcpRoutes;
 
+	private final NodeDirectory nodeDirectory;
+
+	private final MembershipBroadcaster membershipBroadcaster;
+
+	private final SluiceServerProperties properties;
+
 	public TunnelService(Router router, TokenValidator tokenValidator, SessionRegistry sessions,
-			TcpRouteListener tcpRoutes) {
+			TcpRouteListener tcpRoutes, NodeDirectory nodeDirectory, MembershipBroadcaster membershipBroadcaster,
+			SluiceServerProperties properties) {
 		this.router = router;
 		this.tokenValidator = tokenValidator;
 		this.sessions = sessions;
 		this.tcpRoutes = tcpRoutes;
+		this.nodeDirectory = nodeDirectory;
+		this.membershipBroadcaster = membershipBroadcaster;
+		this.properties = properties;
+	}
+
+	@Override
+	public void listNodes(am.ik.sluice.v1.proto.ListNodesRequest request,
+			StreamObserver<am.ik.sluice.v1.proto.ListNodesResponse> responseObserver) {
+		responseObserver.onNext(am.ik.sluice.v1.proto.ListNodesResponse.newBuilder()
+			.addAllNodes(this.nodeDirectory.nodes()
+				.stream()
+				.map(member -> am.ik.sluice.v1.proto.Node.newBuilder()
+					.setNodeId(member.nodeId())
+					.setPublicUrl(member.publicUrl())
+					.build())
+				.toList())
+			.setMembershipVersion(this.nodeDirectory.version())
+			.build());
+		responseObserver.onCompleted();
 	}
 
 	@Override
@@ -45,12 +73,14 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 		log.info("tunnel stream established for client {}", finalClientId);
 		TunnelSession session = TunnelSession.builder()
 			.clientId(clientId == null ? "" : clientId)
+			.nodeId(this.properties.node().id())
 			.router(this.router)
 			.sender(new SessionSender(responseObserver))
 			.registry(this.sessions)
 			.tcpRoutes(this.tcpRoutes)
 			.build();
 		session.start();
+		this.membershipBroadcaster.onSessionCreated(session);
 		return new StreamObserver<>() {
 
 			@Override

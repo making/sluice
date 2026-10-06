@@ -208,6 +208,12 @@ Configuration (server)
 | `sluice.data-port` | `8000` | data plane port |
 | `sluice.data-tls-bundle` | - | SSL bundle name for data plane TLS termination (h2 / http/1.1 via ALPN); unset = plaintext only (TLS connections are served by upstreams with `tls-passthrough=true`) |
 | `sluice.tcp-port-range` | (unset = any port) | listen ports a client may claim for tcp routes, comma separated single ports or `min-max` ranges (e.g. `9000-9010,8080`); a port outside the range is not bound |
+| `sluice.node.id` | hostname | cluster node id (logs, metrics, membership) |
+| `sluice.node.public-url` | - | control plane address clients use for this node (e.g. `grpcs://sluice-0.example.com`); empty = reachable at the bootstrap address only |
+| `sluice.cluster.nodes` | (empty = single-node) | cluster members, `nodeId=publicUrl` entries; see "Cluster (scale-out)" |
+| `sluice.cluster.warmup` | `10s` | readiness stays down this long after start |
+| `sluice.cluster.drain-grace` | `10s` | wait for in-flight virtual connections during drain |
+| `sluice.cluster.membership-poll` | `10s` | membership re-read interval (pushed to clients on change) |
 | `sluice.access-log.enabled` | `true` | emit access logs to the `sluice.access` logger (logfmt, INFO) |
 | `sluice.access-log.types` | `connection,request` | comma separated event types: `connection` (accept/close with route, transport, bytes, duration) / `request` (the head request of each connection -- method, path, HTTP version; keep-alive successors are not parsed, so a browser reusing one connection logs a single `request` line until the connection closes) |
 | `sluice.access-log.rate-limit.enabled` | `true` | rate limit access log lines per line kind, syslog style (as in `rate-limited-logger`) |
@@ -222,6 +228,7 @@ Configuration (client)
 | Property | Default | Description |
 |---|---|---|
 | `sluice.server-url` | - | tunnel server endpoint (`grpc://host:port` / `grpcs://host:port`) |
+| `sluice.client.id` | random, once per process | stable client identity sent as `x-sluice-id` on every stream; breaks route / listen-port ties in cluster mode |
 | `sluice.client.upstream[n].host` | - | public domain routed by the server (empty = catch-all) |
 | `sluice.client.upstream[n].target` | - | upstream URL: `http://` (default when the scheme is omitted), `https://` (TLS terminated by the client), or `tcp://` (raw relay, e.g. a TLS endpoint in passthrough mode) |
 | `sluice.client.upstream[n].preserve-host` | `true` | `false` rewrites the request Host / `:authority` to the target's `host[:port]` |
@@ -252,11 +259,113 @@ provides liveness. The frame type stays in the proto for future use and is handl
 no-op on both sides. `GrpcKeepAliveTest` (sluice-it) guards the behavior with a 1s-ping
 channel.
 
+Cluster (scale-out)
+-------------------
+
+Run N server nodes: every client keeps one tunnel stream to every node, so each node holds
+the full route table locally -- no shared store, no inter-node hop.
+
+Deployment requirements (independent of the front end):
+
+- each node's control plane is reachable from clients at its own address (per-node URL)
+- data plane connections may land on any node (plain L4 balancing is enough)
+
+    # terminal 1/2: two nodes sharing one membership list and token
+    java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
+      --sluice.token=SECRET --sluice.node.id=alpha \
+      --spring.grpc.server.port=8101 --sluice.data-port=8100 --server.port=18180 \
+      --sluice.cluster.nodes=alpha=grpc://127.0.0.1:8101,beta=grpc://127.0.0.1:8201
+    java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
+      --sluice.token=SECRET --sluice.node.id=beta \
+      --spring.grpc.server.port=8201 --sluice.data-port=8200 --server.port=18181 \
+      --sluice.cluster.nodes=alpha=grpc://127.0.0.1:8101,beta=grpc://127.0.0.1:8201
+
+    # terminal 3: client -- server-url is only the bootstrap; the node list is learned
+    # via ListNodes and one stream is opened per node
+    java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
+      --sluice.server-url=grpc://127.0.0.1:8101 --sluice.client.id=client-1 \
+      '--sluice.client.upstream[0]'.host=demo.local \
+      '--sluice.client.upstream[0]'.target=http://127.0.0.1:31080 \
+      --sluice.token=SECRET
+
+    # terminal 4: either node serves the route
+    curl -H 'Host: demo.local' http://127.0.0.1:8100/
+    curl -H 'Host: demo.local' http://127.0.0.1:8200/
+
+```mermaid
+flowchart LR
+    browser["browser"]
+
+    subgraph lb["L4 balancer / DNS"]
+        vip["data plane :any node"]
+    end
+
+    subgraph sa["sluice-server node alpha"]
+        direction TB
+        dpsa["DataProxyServer :8100"]
+    end
+
+    subgraph sb["sluice-server node beta"]
+        direction TB
+        dpsb["DataProxyServer :8200"]
+    end
+
+    subgraph client["sluice-client"]
+        tc["TunnelClient<br/>(one stream per node,<br/>membership watch)"]
+        lc["LocalConnector"]
+    end
+
+    upstream["upstream :3000"]
+
+    browser -- "data plane, any node" --> vip
+    vip -- ":8100" --> dpsa
+    vip -- ":8200" --> dpsb
+
+    tc <-. "stream alpha<br/>CONNECT / DATA / ADVERTISE" .-> sa
+    tc <-. "stream beta" .-> sb
+    sa <-. "MEMBERSHIP_UPDATE / DRAIN" .-> tc
+    sb <-. "MEMBERSHIP_UPDATE / DRAIN" .-> tc
+
+    dpsa -- "CONNECT via alpha stream" --> tc
+    dpsb -- "CONNECT via beta stream" --> tc
+    tc --- lc
+    lc -- TCP --> upstream
+```
+
+Each node routes with its own full copy of the route table (every client advertises to
+every node), so the data plane never hops between nodes.
+
+Behavior:
+
+- membership: `sluice.cluster.nodes` lists the members as `nodeId=publicUrl` entries (the
+  local node is always included). It is pushed to every client on connect and whenever it
+  changes (`MEMBERSHIP_UPDATE` frame); the client opens/closes per-node streams accordingly.
+  A node with an empty public url is reachable at the address the client bootstrapped with
+- routing: a domain (or listen port) claimed by several clients is served by the one with
+  the smallest `sluice.client.id` -- deterministically on every node, since every node sees
+  every client. A smaller id takes over a bound listen port on advertise; a larger id gets
+  the port rejected and retries
+- lifecycle: readiness (`/actuator/health/readiness`) is DOWN for `sluice.cluster.warmup`
+  after start (clients connect first) and while draining. On shutdown the node sends a
+  `DRAIN` frame, waits up to `sluice.cluster.drain-grace` for in-flight virtual connections
+  to finish, then closes the streams. Clients keep their other nodes' streams and retry the
+  drained node with backoff
+- configuration: cluster mode refuses to start without an explicit `sluice.token` /
+  `sluice.token-file` (per-node random tokens would break clients connected to every node)
+- observability: every metric carries a `node` common tag; the client health details show
+  the per-node stream states
+
+Without `sluice.cluster.nodes` the server runs single-node and nothing above applies
+(`ListNodes` returns just the node itself).
+
 Health / metrics
 ----------------
 
-- server `GET /actuator/health` - UP while at least one tunnel client is connected
-- client `GET /actuator/health` - UP while the tunnel stream is established
+- server `GET /actuator/health` - liveness, UP while the process lives; details `clients`
+  (connected tunnel clients) and `draining`. `/actuator/health/readiness` is DOWN during the
+  cluster warmup window and while draining (see "Cluster (scale-out)")
+- client `GET /actuator/health` - UP while at least one per-node tunnel stream is established;
+  the `nodes` detail lists each node's stream state
 - `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`
 
 Docker

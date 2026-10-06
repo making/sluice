@@ -1,12 +1,16 @@
 package am.ik.sluice.client.health;
 
+import java.util.StringJoiner;
+
 import am.ik.sluice.client.tunnel.TunnelClient;
+
 import org.springframework.boot.health.contributor.Health;
 import org.springframework.boot.health.contributor.HealthIndicator;
 import org.springframework.stereotype.Component;
 
 /**
- * UP while the tunnel stream towards the server is established.
+ * UP while at least one per-node tunnel stream is established; the per-node states are
+ * reported as details.
  */
 @Component
 public class TunnelHealthIndicator implements HealthIndicator {
@@ -19,8 +23,13 @@ public class TunnelHealthIndicator implements HealthIndicator {
 
 	@Override
 	public Health health() {
-		return this.client.isConnected() ? Health.up().build()
-				: Health.down().withDetail("tunnel", "not connected").build();
+		boolean connected = this.client.isConnected();
+		Health.Builder builder = connected ? Health.up() : Health.down();
+		StringJoiner nodes = new StringJoiner(",", "nodes=[", "]");
+		this.client.nodeStates().forEach((node, up) -> nodes.add(node + ":" + (up ? "up" : "down")));
+		return builder.withDetail("tunnel", connected ? "connected" : "not connected")
+			.withDetail("nodes", nodes.toString())
+			.build();
 	}
 
 }
