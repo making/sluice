@@ -38,17 +38,20 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	private final MembershipBroadcaster membershipBroadcaster;
 
+	private final ClusterLifecycle clusterLifecycle;
+
 	private final SluiceServerProperties properties;
 
 	public TunnelService(Router router, TokenValidator tokenValidator, SessionRegistry sessions,
 			TcpRouteListener tcpRoutes, NodeDirectory nodeDirectory, MembershipBroadcaster membershipBroadcaster,
-			SluiceServerProperties properties) {
+			ClusterLifecycle clusterLifecycle, SluiceServerProperties properties) {
 		this.router = router;
 		this.tokenValidator = tokenValidator;
 		this.sessions = sessions;
 		this.tcpRoutes = tcpRoutes;
 		this.nodeDirectory = nodeDirectory;
 		this.membershipBroadcaster = membershipBroadcaster;
+		this.clusterLifecycle = clusterLifecycle;
 		this.properties = properties;
 	}
 
@@ -70,6 +73,13 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	@Override
 	public StreamObserver<Frame> connect(StreamObserver<Frame> responseObserver) {
+		if (this.clusterLifecycle.isDraining()) {
+			// the node is going away; a stream accepted here would stall the graceful
+			// shutdown until the client gives up
+			log.info("rejecting tunnel stream: node is draining");
+			responseObserver.onError(Status.UNAVAILABLE.withDescription("node is draining").asException());
+			return noopObserver();
+		}
 		String clientId = TunnelAuthInterceptor.CLIENT_ID.get();
 		String finalClientId = clientId == null ? "" : clientId;
 		log.info("tunnel stream established for client {}", finalClientId);
@@ -101,6 +111,24 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			public void onCompleted() {
 				log.info("tunnel stream closed by client {}", finalClientId);
 				session.close();
+			}
+
+		};
+	}
+
+	private static StreamObserver<Frame> noopObserver() {
+		return new StreamObserver<>() {
+
+			@Override
+			public void onNext(Frame value) {
+			}
+
+			@Override
+			public void onError(Throwable t) {
+			}
+
+			@Override
+			public void onCompleted() {
 			}
 
 		};

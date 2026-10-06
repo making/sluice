@@ -32,6 +32,7 @@ import org.springframework.stereotype.Component;
 
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.route.Router;
+import am.ik.sluice.server.tunnel.Drainable;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import am.ik.sluice.server.tunnel.TunnelSession;
 import am.ik.sluice.tunnel.DuplexPipe;
@@ -53,7 +54,7 @@ import org.slf4j.LoggerFactory;
  * name of the ClientHello (the backend terminates TLS and presents its own certificate).
  */
 @Component
-public class DataProxyServer implements SmartLifecycle {
+public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	private static final Logger log = LoggerFactory.getLogger(DataProxyServer.class);
 
@@ -320,6 +321,16 @@ public class DataProxyServer implements SmartLifecycle {
 		catch (Exception e) {
 			// ignore
 		}
+	}
+
+	/**
+	 * Drain entry point: closes the listen socket so new connections are rejected while
+	 * the relays in flight keep running on their own sockets; the lifecycle stop below
+	 * repeats it harmlessly.
+	 */
+	@Override
+	public void beginDrain() {
+		stop();
 	}
 
 	@Override

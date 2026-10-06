@@ -6,6 +6,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -59,7 +60,7 @@ class SameHostUpstreamsE2ETest {
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
-	private @Nullable TunnelClient client;
+	private final List<TunnelClient> clients = new ArrayList<>();
 
 	@Autowired
 	SessionRegistry sessions;
@@ -157,15 +158,16 @@ class SameHostUpstreamsE2ETest {
 			.meterRegistry(new SimpleMeterRegistry())
 			.build();
 		started.start();
-		this.client = started;
+		this.clients.add(started);
 		Awaitility.await().atMost(Duration.ofSeconds(5)).until(this.sessions::count, count -> count > 0);
 	}
 
 	@AfterAll
 	void tearDown() {
-		if (this.client != null) {
-			this.client.stop();
+		for (TunnelClient stopped : this.clients) {
+			stopped.stop();
 		}
+		this.clients.clear();
 		if (httpUpstream != null) {
 			httpUpstream.stop(0);
 		}

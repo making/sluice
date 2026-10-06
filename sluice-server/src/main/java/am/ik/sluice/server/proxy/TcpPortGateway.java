@@ -19,6 +19,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.jspecify.annotations.Nullable;
 
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.SmartLifecycle;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.stereotype.Component;
 
@@ -27,6 +28,7 @@ import am.ik.sluice.server.config.TcpPortRange;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import am.ik.sluice.server.tunnel.TcpRouteListener;
+import am.ik.sluice.server.tunnel.Drainable;
 import am.ik.sluice.server.tunnel.TunnelSession;
 import am.ik.sluice.tunnel.DuplexPipe;
 import am.ik.sluice.tunnel.StreamRelay;
@@ -44,7 +46,7 @@ import org.slf4j.LoggerFactory;
  * an unbind because each runs on its own accepted socket.
  */
 @Component
-public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
+public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoCloseable, Drainable {
 
 	private static final Logger log = LoggerFactory.getLogger(TcpPortGateway.class);
 
@@ -77,6 +79,8 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 	}
 
 	private final TcpPortRange tcpPortRange;
+
+	private volatile boolean running;
 
 	TcpPortGateway(Router router, SessionRegistry sessions, SluiceServerProperties properties,
 			@Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor, MeterRegistry meterRegistry,
@@ -331,6 +335,32 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 			listener.close();
 		}
 		this.listeners.clear();
+	}
+
+	/**
+	 * Listeners come and go with the advertise lifecycle, so start only marks the gateway
+	 * running; {@link #stop()} releases every bound port (also invoked at drain start by
+	 * the cluster lifecycle).
+	 */
+	@Override
+	public void start() {
+		this.running = true;
+	}
+
+	@Override
+	public void beginDrain() {
+		stop();
+	}
+
+	@Override
+	public void stop() {
+		this.running = false;
+		this.close();
+	}
+
+	@Override
+	public boolean isRunning() {
+		return this.running;
 	}
 
 }

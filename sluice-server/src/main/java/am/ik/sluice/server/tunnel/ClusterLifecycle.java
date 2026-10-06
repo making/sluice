@@ -36,16 +36,20 @@ public class ClusterLifecycle implements SmartLifecycle, ApplicationListener<Con
 
 	private final ApplicationContext context;
 
+	private final List<Drainable> dataPlanes;
+
 	private volatile boolean running;
 
 	private volatile boolean draining;
 
 	private volatile @Nullable Thread warmup;
 
-	public ClusterLifecycle(SessionRegistry sessions, SluiceServerProperties properties, ApplicationContext context) {
+	public ClusterLifecycle(SessionRegistry sessions, SluiceServerProperties properties, ApplicationContext context,
+			List<Drainable> dataPlanes) {
 		this.sessions = sessions;
 		this.properties = properties;
 		this.context = context;
+		this.dataPlanes = List.copyOf(dataPlanes);
 	}
 
 	@Override
@@ -93,6 +97,11 @@ public class ClusterLifecycle implements SmartLifecycle, ApplicationListener<Con
 		}
 		this.draining = true;
 		AvailabilityChangeEvent.publish(this.context, ReadinessState.REFUSING_TRAFFIC);
+		// stop accepting before draining so the in-flight counts only fall; in-flight
+		// relays keep running on their own sockets
+		for (Drainable dataPlane : this.dataPlanes) {
+			dataPlane.beginDrain();
+		}
 		List<TunnelSession> live = this.sessions.all();
 		if (live.isEmpty()) {
 			return;
@@ -113,6 +122,11 @@ public class ClusterLifecycle implements SmartLifecycle, ApplicationListener<Con
 				Thread.currentThread().interrupt();
 				break;
 			}
+		}
+		// the client keeps the stream open on Drain by design; end every stream from the
+		// server side so the gRPC shutdown does not wait out its grace period
+		for (TunnelSession session : this.sessions.all()) {
+			session.close();
 		}
 	}
 

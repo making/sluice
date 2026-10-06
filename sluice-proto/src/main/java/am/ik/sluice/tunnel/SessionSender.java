@@ -59,7 +59,15 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 	private volatile boolean running = true;
 
+	private final ReentrantLock workerLock = new ReentrantLock();
+
+	private final Condition workerDone = workerLock.newCondition();
+
+	private volatile boolean done;
+
 	private volatile @Nullable Worker worker;
+
+	private volatile @Nullable Thread workerThread;
 
 	public SessionSender(StreamObserver<Frame> outbound) {
 		this.outbound = Objects.requireNonNull(outbound, "outbound is required");
@@ -86,8 +94,10 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		if (this.worker != null) {
 			throw new IllegalStateException("sender already started");
 		}
-		this.worker = new Worker();
-		Thread.ofVirtual().name("sluice-sender").start(this.worker);
+		Worker worker = new Worker();
+		this.worker = worker;
+		Thread thread = Thread.ofVirtual().name("sluice-sender").start(worker);
+		this.workerThread = thread;
 	}
 
 	private boolean awaitReady() {
@@ -207,44 +217,100 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	 * window is exhausted.
 	 */
 	private void drain() {
-		while (true) {
-			Entry entry;
-			try {
-				entry = this.queue.takeFirst();
+		try {
+			while (true) {
+				Entry entry;
+				try {
+					entry = this.queue.takeFirst();
+				}
+				catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					continue;
+				}
+				if (entry instanceof Poison) {
+					return;
+				}
+				Frame frame = ((Payload) entry).frame();
+				if (!awaitReady()) {
+					return;
+				}
+				try {
+					this.outbound.onNext(frame);
+				}
+				catch (RuntimeException e) {
+					// stream is dead; drop the remainder
+					return;
+				}
 			}
-			catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-				continue;
-			}
-			if (entry instanceof Poison) {
-				return;
-			}
-			Frame frame = ((Payload) entry).frame();
-			if (!awaitReady()) {
-				return;
-			}
-			try {
-				this.outbound.onNext(frame);
-			}
-			catch (RuntimeException e) {
-				// stream is dead; drop the remainder
-				return;
-			}
+		}
+		finally {
+			complete();
 		}
 	}
 
+	/**
+	 * Completes the outbound stream, telling the peer this side sent its last frame. On
+	 * the server this ends the tunnel stream for the client; on the client it is the
+	 * half-close of the request stream.
+	 */
+	private void complete() {
+		try {
+			this.outbound.onCompleted();
+		}
+		catch (RuntimeException e) {
+			// the stream may already be dead
+		}
+	}
+
+	/**
+	 * Stops the worker and completes the outbound stream; waits for the completion to be
+	 * delivered so a caller tearing the transport down right after (server shutdown) does
+	 * not cut the final frames off. Idempotent.
+	 */
 	@Override
 	public void close() {
 		this.running = false;
 		this.queue.offerFirst(new Poison());
 		this.signalReady();
+		Worker worker = this.worker;
+		Thread thread = this.workerThread;
+		if (worker == null || thread == null || Thread.currentThread() == thread) {
+			return;
+		}
+		this.workerLock.lock();
+		try {
+			while (!this.done) {
+				try {
+					this.workerDone.await(5, TimeUnit.SECONDS);
+				}
+				catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					return;
+				}
+			}
+		}
+		finally {
+			this.workerLock.unlock();
+		}
 	}
 
 	private final class Worker implements Runnable {
 
 		@Override
 		public void run() {
-			drain();
+			try {
+				drain();
+			}
+			finally {
+				workerLock.lock();
+				try {
+					done = true;
+					workerDone.signalAll();
+				}
+				finally {
+					workerLock.unlock();
+				}
+			}
 		}
 
 	}
