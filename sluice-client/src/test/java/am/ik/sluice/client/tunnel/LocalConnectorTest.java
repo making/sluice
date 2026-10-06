@@ -2,7 +2,7 @@ package am.ik.sluice.client.tunnel;
 
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.util.Map;
+import java.util.List;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledOnOs;
@@ -21,7 +21,7 @@ class LocalConnectorTest {
 	@Test
 	void permitsRegisteredHost() {
 		LocalConnector connector = LocalConnector.builder()
-			.upstreams(Map.of("tcp", "http://example.com"))
+			.upstreams(List.of("http://example.com"))
 			.strict(true)
 			.build();
 		assertThat(connector.permits("example.com")).isTrue();
@@ -30,26 +30,34 @@ class LocalConnectorTest {
 
 	@Test
 	void rejectsUnregisteredHost() {
-		LocalConnector connector = LocalConnector.builder()
-			.upstreams(Map.of("tcp", "example.com"))
-			.strict(true)
-			.build();
+		LocalConnector connector = LocalConnector.builder().upstreams(List.of("example.com")).strict(true).build();
 		assertThat(connector.permits("test.com")).isFalse();
 	}
 
 	@Test
 	void nonStrictPermitsAnyHost() {
-		LocalConnector connector = LocalConnector.builder().upstreams(Map.of()).build();
+		LocalConnector connector = LocalConnector.builder().upstreams(List.of()).build();
 		assertThat(connector.permits("test.com")).isTrue();
 	}
 
 	@Test
 	void httpsDefaultPortMatches() {
 		LocalConnector connector = LocalConnector.builder()
-			.upstreams(Map.of("s", "https://example.com"))
+			.upstreams(List.of("https://example.com"))
 			.strict(true)
 			.build();
 		assertThat(connector.permits("example.com:443")).isTrue();
+	}
+
+	@Test
+	void upstreamsSharingOneHostAreBothDialable() {
+		LocalConnector connector = LocalConnector.builder()
+			.upstreams(List.of("http://example.com", "tcp://example.com:9000"))
+			.strict(true)
+			.build();
+		assertThat(connector.permits("example.com")).isTrue();
+		assertThat(connector.permits("example.com:80")).isTrue();
+		assertThat(connector.permits("example.com:9000")).isTrue();
 	}
 
 	@Test
@@ -67,7 +75,7 @@ class LocalConnectorTest {
 				}
 			});
 			LocalConnector connector = LocalConnector.builder()
-				.upstreams(Map.of("local", "http://127.0.0.1:" + port))
+				.upstreams(List.of("http://127.0.0.1:" + port))
 				.strict(true)
 				.build();
 			try (Socket socket = connector.dial("127.0.0.1:" + port)) {
@@ -78,9 +86,42 @@ class LocalConnectorTest {
 	}
 
 	@Test
+	@EnabledOnOs({ OS.LINUX, OS.MAC })
+	void dialsSecondUpstreamOnSharedHost() throws Exception {
+		int httpPort;
+		int tcpPort;
+		try (ServerSocket httpServer = new ServerSocket(0); ServerSocket tcpServer = new ServerSocket(0)) {
+			httpPort = httpServer.getLocalPort();
+			tcpPort = tcpServer.getLocalPort();
+			Thread httpAcceptor = Thread.ofVirtual().start(() -> acceptOnce(httpServer));
+			Thread tcpAcceptor = Thread.ofVirtual().start(() -> acceptOnce(tcpServer));
+			LocalConnector connector = LocalConnector.builder()
+				.upstreams(List.of("http://127.0.0.1:" + httpPort, "tcp://127.0.0.1:" + tcpPort))
+				.strict(true)
+				.build();
+			try (Socket httpSocket = connector.dial("127.0.0.1:" + httpPort);
+					Socket tcpSocket = connector.dial("127.0.0.1:" + tcpPort)) {
+				assertThat(httpSocket.isConnected()).isTrue();
+				assertThat(tcpSocket.isConnected()).isTrue();
+			}
+			httpAcceptor.join(1000);
+			tcpAcceptor.join(1000);
+		}
+	}
+
+	private static void acceptOnce(ServerSocket server) {
+		try (Socket ignored = server.accept()) {
+			// accept and close
+		}
+		catch (Exception e) {
+			// ignore
+		}
+	}
+
+	@Test
 	void dialRejectsUnregisteredHostInStrictMode() {
 		LocalConnector connector = LocalConnector.builder()
-			.upstreams(Map.of("local", "http://127.0.0.1:1"))
+			.upstreams(List.of("http://127.0.0.1:1"))
 			.strict(true)
 			.build();
 		// unreachable port keeps the test hermetic; the filter rejects before dialing

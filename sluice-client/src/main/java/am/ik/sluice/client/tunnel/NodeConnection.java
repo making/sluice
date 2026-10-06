@@ -110,7 +110,7 @@ public final class NodeConnection implements AutoCloseable {
 		this.taskExecutor = Objects.requireNonNull(builder.taskExecutor, "taskExecutor is required");
 		this.listener = Objects.requireNonNull(builder.listener, "listener is required");
 		this.connector = LocalConnector.builder()
-			.upstreams(builder.properties.upstreamMap())
+			.upstreams(builder.properties.upstreamTargets())
 			.strict(builder.properties.strictForwarding())
 			.insecure(builder.properties.insecure())
 			.build();
@@ -402,7 +402,7 @@ public final class NodeConnection implements AutoCloseable {
 					// the server acknowledged the advertise: the tunnel is up for real
 					this.connected = true;
 					log.info("[{}] tunnel established; advertising {} upstream(s)", this.key,
-							this.properties.upstreamMap().size());
+							this.properties.upstreamTargets().size());
 					this.listener.onConnected(this, this.nodeId);
 					return;
 				}

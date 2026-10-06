@@ -4,7 +4,7 @@ import org.jspecify.annotations.Nullable;
 
 import java.net.Socket;
 import java.net.URI;
-import java.util.Map;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -27,13 +27,13 @@ public class LocalConnector {
 
 	private static final Logger log = LoggerFactory.getLogger(LocalConnector.class);
 
-	private final Map<String, String> upstreams;
+	private final List<String> upstreams;
 
 	private final boolean strict;
 
 	private final boolean insecure;
 
-	private LocalConnector(Map<String, String> upstreams, boolean strict, boolean insecure) {
+	private LocalConnector(List<String> upstreams, boolean strict, boolean insecure) {
 		this.upstreams = upstreams;
 		this.strict = strict;
 		this.insecure = insecure;
@@ -48,7 +48,7 @@ public class LocalConnector {
 	 */
 	public static final class Builder {
 
-		@Nullable private Map<String, String> upstreams;
+		@Nullable private List<String> upstreams;
 
 		private boolean strict;
 
@@ -57,7 +57,7 @@ public class LocalConnector {
 		private Builder() {
 		}
 
-		public Builder upstreams(Map<String, String> upstreams) {
+		public Builder upstreams(List<String> upstreams) {
 			this.upstreams = upstreams;
 			return this;
 		}
@@ -87,7 +87,7 @@ public class LocalConnector {
 	}
 
 	/**
-	 * Strict filter: only hosts declared in the upstream map are dialable (the port of
+	 * Strict filter: only targets declared in the upstream list are dialable (the port of
 	 * makeFilter, normalized to host comparison).
 	 */
 	public boolean permits(String address) {
@@ -98,7 +98,7 @@ public class LocalConnector {
 	}
 
 	private Optional<UpstreamEndpoint> resolve(String address) {
-		for (String targetUrl : this.upstreams.values()) {
+		for (String targetUrl : this.upstreams) {
 			UpstreamEndpoint endpoint = UpstreamEndpoint.of(targetUrl);
 			if (endpoint == null) {
 				continue;

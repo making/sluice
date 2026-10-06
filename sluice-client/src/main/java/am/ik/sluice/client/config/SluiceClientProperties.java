@@ -2,9 +2,7 @@ package am.ik.sluice.client.config;
 
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -69,18 +67,16 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	}
 
 	/**
-	 * The configured upstreams as a host to target map, preserving declaration order (a
-	 * blank host is the catch-all entry).
+	 * The configured upstream targets in declaration order, duplicates preserved: several
+	 * upstreams may share one host (e.g. an http route and a tcp route with a listen
+	 * port) and every entry stays dialable; the first match wins for identical host:port
+	 * pairs.
 	 */
-	public Map<String, String> upstreamMap() {
-		Map<String, String> map = new LinkedHashMap<>();
+	public List<String> upstreamTargets() {
 		if (this.client == null) {
-			return map;
+			return List.of();
 		}
-		for (Upstream upstream : this.client.upstream()) {
-			map.put(upstream.host(), upstream.target());
-		}
-		return map;
+		return this.client.upstream().stream().map(Upstream::target).toList();
 	}
 
 	/**

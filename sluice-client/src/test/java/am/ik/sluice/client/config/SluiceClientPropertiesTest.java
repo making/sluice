@@ -23,7 +23,7 @@ class SluiceClientPropertiesTest {
 			.serverUrl("grpc://127.0.0.1:8001")
 			.upstream(Upstream.builder().host("demo.local").target("127.0.0.1:8080").build())
 			.build();
-		assertThat(properties.upstreamMap()).containsEntry("demo.local", "http://127.0.0.1:8080");
+		assertThat(properties.upstreamTargets()).containsExactly("http://127.0.0.1:8080");
 		assertThat(properties.toProtoUpstreams()).singleElement().satisfies(upstream -> {
 			assertThat(upstream.getHost()).isEqualTo("demo.local");
 			assertThat(upstream.getTargetUrl()).isEqualTo("http://127.0.0.1:8080");
@@ -38,9 +38,19 @@ class SluiceClientPropertiesTest {
 			.upstream(Upstream.builder().host("a.local").target("https://192.0.2.1:8443").build())
 			.upstream(Upstream.builder().host("").target("example.com:80").preserveHost(false).build())
 			.build();
-		assertThat(properties.upstreamMap()).containsEntry("a.local", "https://192.0.2.1:8443")
-			.containsEntry("", "http://example.com:80");
+		assertThat(properties.upstreamTargets()).containsExactly("https://192.0.2.1:8443", "http://example.com:80");
 		assertThat(properties.toProtoUpstreams().get(1).getPreserveHost()).isFalse();
+	}
+
+	@Test
+	void upstreamsSharingOneHostBothSurvive() {
+		SluiceClientProperties properties = SluiceClientProperties.builder()
+			.serverUrl("grpc://127.0.0.1:8001")
+			.upstream(Upstream.builder().host("dual.local").target("http://127.0.0.1:8080").build())
+			.upstream(Upstream.builder().host("dual.local").target("tcp://127.0.0.1:9000").listenPort(15000).build())
+			.build();
+		assertThat(properties.upstreamTargets()).containsExactly("http://127.0.0.1:8080", "tcp://127.0.0.1:9000");
+		assertThat(properties.toProtoUpstreams()).hasSize(2);
 	}
 
 	@Test
@@ -56,8 +66,7 @@ class SluiceClientPropertiesTest {
 			.get();
 		assertThat(properties.client()).isNotNull();
 		assertThat(properties.client().upstream()).hasSize(2);
-		assertThat(properties.upstreamMap()).containsEntry("demo.local", "http://127.0.0.1:8080")
-			.containsEntry("", "https://fallback:8443");
+		assertThat(properties.upstreamTargets()).containsExactly("http://127.0.0.1:8080", "https://fallback:8443");
 		assertThat(properties.toProtoUpstreams().get(1).getPreserveHost()).isFalse();
 	}
 
@@ -77,7 +86,7 @@ class SluiceClientPropertiesTest {
 	@Test
 	void missingClientSectionYieldsEmptyUpstreams() {
 		SluiceClientProperties properties = SluiceClientProperties.builder().serverUrl("grpc://127.0.0.1:8001").build();
-		assertThat(properties.upstreamMap()).isEmpty();
+		assertThat(properties.upstreamTargets()).isEmpty();
 		assertThat(properties.toProtoUpstreams()).isEmpty();
 	}
 

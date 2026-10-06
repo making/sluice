@@ -129,7 +129,7 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 		if (this.properties.serverUrl() == null || this.properties.serverUrl().isBlank()) {
 			throw new IllegalStateException("sluice.server-url is required");
 		}
-		if (this.properties.upstreamMap().isEmpty()) {
+		if (this.properties.upstreamTargets().isEmpty()) {
 			throw new IllegalStateException("sluice.client.upstream is required");
 		}
 		this.running = true;
