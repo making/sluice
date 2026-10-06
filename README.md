@@ -360,6 +360,51 @@ Behavior:
 Without `sluice.cluster.nodes` the server runs single-node and nothing above applies
 (`ListNodes` returns just the node itself).
 
+## Cluster (TLS)
+
+The control plane can serve TLS (`spring.grpc.server.ssl.bundle`), so a front end routes
+per node by SNI without terminating TLS. Verified end to end with a self-signed certificate;
+no code difference from the plaintext cluster, only configuration:
+
+```
+# self-signed cert for the gRPC control plane
+openssl req -x509 -newkey rsa:2048 -keyout grpc-key.pem -out grpc-cert.pem -days 1 -nodes -subj /CN=localhost
+
+# terminal 1/2: same cluster as above, plus the TLS bundle on every node
+java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.token=SECRET --sluice.node.id=node-1 \
+  --spring.grpc.server.port=8101 --sluice.data-port=8100 --server.port=18180 \
+  --sluice.cluster.nodes=node-1=grpcs://127.0.0.1:8101,node-2=grpcs://127.0.0.1:8201 \
+  --spring.grpc.server.ssl.bundle=grpc-control \
+  --spring.ssl.bundle.pem.grpc-control.keystore.certificate=file:grpc-cert.pem \
+  --spring.ssl.bundle.pem.grpc-control.keystore.private-key=file:grpc-key.pem
+java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.token=SECRET --sluice.node.id=node-2 \
+  --spring.grpc.server.port=8201 --sluice.data-port=8200 --server.port=18181 \
+  --sluice.cluster.nodes=node-1=grpcs://127.0.0.1:8101,node-2=grpcs://127.0.0.1:8201 \
+  --spring.grpc.server.ssl.bundle=grpc-control \
+  --spring.ssl.bundle.pem.grpc-control.keystore.certificate=file:grpc-cert.pem \
+  --spring.ssl.bundle.pem.grpc-control.keystore.private-key=file:grpc-key.pem
+
+# terminal 3: client -- grpcs:// bootstrap, insecure trusts the self-signed cert;
+# membership URLs (grpcs://) are dialed with the same setting
+java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.server-url=grpcs://127.0.0.1:8101 --sluice.insecure=true --sluice.client.id=client-1 \
+  '--sluice.client.upstream[0]'.host=demo.local \
+  '--sluice.client.upstream[0]'.target=http://127.0.0.1:31080 \
+  --sluice.token=SECRET
+
+# terminal 4: both nodes serve over their TLS control planes
+curl -H 'Host: demo.local' http://127.0.0.1:8100/
+curl -H 'Host: demo.local' http://127.0.0.1:8200/
+
+# the control plane negotiates h2 via ALPN
+echo | openssl s_client -connect 127.0.0.1:8101 -alpn h2 2>/dev/null | grep 'ALPN protocol'
+```
+
+E2E coverage: `ClusterGrpcTlsE2ETests` (sluice-it) -- both nodes serve, failover after a
+node stops, and h2 negotiation on the TLS endpoint.
+
 ## Health / metrics
 
 - server `GET /actuator/health` - liveness, UP while the process lives; details `clients`
