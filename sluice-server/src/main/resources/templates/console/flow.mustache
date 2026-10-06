@@ -1,0 +1,67 @@
+{{#flow}}
+<svg class="drawing" viewBox="0 0 {{width}} {{height}}" role="img" aria-labelledby="flow-title flow-desc"
+     data-state="{{state}}" data-flowing="{{flowing}}">
+  <title id="flow-title">Traffic through this node</title>
+  <desc id="flow-desc">{{openConnections}} open connections across {{clients}}.</desc>
+  <defs>
+    <pattern id="hatch" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <line x1="0" y1="0" x2="0" y2="7" class="hatch-line"/>
+    </pattern>
+  </defs>
+
+  <g class="intakes">
+    {{#intakes}}
+    <g id="intake{{port}}" class="lane{{#active}} is-active{{/active}}">
+      <path class="bank ink" pathLength="1" d="{{path}}"/>
+      <path class="bed" d="{{path}}"/>
+      <path class="water" d="{{path}}" style="--w: {{strokeWidth}}px"/>
+      <path class="stream" d="{{path}}" style="--dur: {{duration}}"/>
+      <text class="label" x="40" y="{{lane.labelY}}"><tspan class="mono strong">{{port}}</tspan> {{protocol}}</text>
+      <text class="detail" x="40" y="{{lane.detailY}}">{{detail}}{{#active}}, {{open}} open{{/active}}</text>
+    </g>
+    {{/intakes}}
+  </g>
+
+  <g class="lock">
+    <path class="bank bank--conduit ink" pathLength="1" d="{{conduitPath}}"/>
+    <path class="bed bed--conduit" d="{{conduitPath}}"/>
+    <path class="water water--conduit" d="{{conduitPath}}"/>
+    {{#conduitStreams}}
+    <path class="stream" d="{{.}}" style="--dur: {{duration}}"/>
+    {{/conduitStreams}}
+    <rect class="wall ink" pathLength="1" x="540" y="{{wallTop}}" width="120" height="64"/>
+    <rect class="wall ink" pathLength="1" x="540" y="{{wallBottom}}" width="120" height="64"/>
+    <line class="leaf" x1="600" y1="{{hingeTop}}" x2="588" y2="{{cy}}"
+          style="transform: rotate({{swing}}deg); transform-origin: 600px {{hingeTop}}px"/>
+    <line class="leaf" x1="600" y1="{{hingeBottom}}" x2="588" y2="{{cy}}"
+          style="transform: rotate(-{{swing}}deg); transform-origin: 600px {{hingeBottom}}px"/>
+    <circle class="hinge" cx="600" cy="{{hingeTop}}" r="3.5"/>
+    <circle class="hinge" cx="600" cy="{{hingeBottom}}" r="3.5"/>
+    <path class="leader" d="{{gateLeader}}"/>
+    <text class="caption" x="532" y="{{gateLabelY}}" text-anchor="end">{{gateLabel}}</text>
+    <text class="figure" x="600" y="{{figureY}}" text-anchor="middle" data-testid="open-connections">{{openConnections}}</text>
+    <text class="caption" x="600" y="{{captionY}}" text-anchor="middle">open connections</text>
+    <text class="caption" x="600" y="{{footY}}" text-anchor="middle">{{clients}}{{#controlPort}}, control plane <tspan class="mono">{{controlPort}}</tspan>{{/controlPort}}</text>
+  </g>
+
+  <g class="outlets">
+    {{#outlets}}
+    <g id="outlet-{{clientId}}" class="lane{{#active}} is-active{{/active}}">
+      <title>{{clientId}}</title>
+      <path class="bank ink" pathLength="1" d="{{path}}"/>
+      <path class="bed" d="{{path}}"/>
+      <path class="water" d="{{path}}" style="--w: {{strokeWidth}}px"/>
+      <path class="stream" d="{{path}}" style="--dur: {{duration}}"/>
+      <text class="label" x="{{labelX}}" y="{{lane.labelY}}"><tspan class="mono strong">{{label}}</tspan><tspan class="detail" dx="8">{{open}} open</tspan></text>
+      {{#serving}}<text class="detail detail--serving" x="{{labelX}}" y="{{lane.detailY}}">{{servingLabel}}</text>{{/serving}}
+      {{#standby}}<text class="detail" x="{{labelX}}" y="{{standbyY}}">{{standbyLabel}}</text>{{/standby}}
+    </g>
+    {{/outlets}}
+    {{^outlets}}
+    <text class="label" x="916" y="{{cy}}">No clients connected</text>
+    <text class="detail" x="916" y="{{cy}}" dy="19">Clients appear here once they</text>
+    <text class="detail" x="916" y="{{cy}}" dy="36">reach the control plane.</text>
+    {{/outlets}}
+  </g>
+</svg>
+{{/flow}}

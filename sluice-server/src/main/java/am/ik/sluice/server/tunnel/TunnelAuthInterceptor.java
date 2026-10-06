@@ -1,10 +1,13 @@
 package am.ik.sluice.server.tunnel;
 
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.UUID;
 
 import am.ik.sluice.server.auth.TokenValidator;
 import io.grpc.Context;
 import io.grpc.Contexts;
+import io.grpc.Grpc;
 import io.grpc.Metadata;
 import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
@@ -13,9 +16,10 @@ import io.grpc.Status;
 
 /**
  * Authenticates tunnel clients via the {@code authorization} metadata and resolves the
- * client id from {@code x-sluice-id} (a UUID is assigned when absent). Both values are
- * exposed to the service handler through the {@link io.grpc.Context}.
+ * client id from {@code x-sluice-id} (a UUID is assigned when absent). The client id and
+ * the peer address are exposed to the service handler through the {@link io.grpc.Context}.
  */
+import org.jspecify.annotations.Nullable;
 import org.springframework.grpc.server.GlobalServerInterceptor;
 import org.springframework.stereotype.Component;
 
@@ -33,6 +37,9 @@ public class TunnelAuthInterceptor implements ServerInterceptor {
 
 	/** Context key carrying the resolved client id. */
 	public static final Context.Key<String> CLIENT_ID = Context.key("sluice-client-id");
+
+	/** Context key carrying the peer address ({@code host:port}) of the client. */
+	public static final Context.Key<String> REMOTE_ADDRESS = Context.key("sluice-remote-address");
 
 	private final TokenValidator tokenValidator;
 
@@ -53,8 +60,17 @@ public class TunnelAuthInterceptor implements ServerInterceptor {
 		if (clientId == null || clientId.isBlank()) {
 			clientId = UUID.randomUUID().toString();
 		}
-		Context context = Context.current().withValue(CLIENT_ID, clientId);
+		Context context = Context.current()
+			.withValue(CLIENT_ID, clientId)
+			.withValue(REMOTE_ADDRESS, remoteAddress(call.getAttributes().get(Grpc.TRANSPORT_ATTR_REMOTE_ADDR)));
 		return Contexts.interceptCall(context, call, headers, next);
+	}
+
+	private static String remoteAddress(@Nullable SocketAddress address) {
+		if (address instanceof InetSocketAddress inet) {
+			return inet.getHostString() + ":" + inet.getPort();
+		}
+		return address == null ? "" : address.toString();
 	}
 
 }

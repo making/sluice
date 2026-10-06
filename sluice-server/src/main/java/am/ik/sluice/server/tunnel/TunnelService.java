@@ -1,5 +1,7 @@
 package am.ik.sluice.server.tunnel;
 
+import java.util.Objects;
+
 import am.ik.sluice.server.auth.TokenValidator;
 import am.ik.sluice.server.cluster.NodeDirectory;
 import am.ik.sluice.server.config.SluiceServerProperties;
@@ -74,6 +76,7 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 		TunnelSession session = TunnelSession.builder()
 			.clientId(clientId == null ? "" : clientId)
 			.nodeId(this.properties.node().id())
+			.remoteAddress(Objects.requireNonNullElse(TunnelAuthInterceptor.REMOTE_ADDRESS.get(), ""))
 			.router(this.router)
 			.sender(new SessionSender(responseObserver))
 			.registry(this.sessions)

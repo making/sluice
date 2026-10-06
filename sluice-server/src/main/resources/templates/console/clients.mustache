@@ -1,0 +1,36 @@
+{{#clients}}
+<article class="client{{#draining}} client--draining{{/draining}}" data-client="{{clientId}}">
+  <header class="client__head">
+    <h3><span class="client__label">Client id</span> <span class="mono">{{clientId}}</span></h3>
+    {{#draining}}<span class="tag tag--marker">Draining</span>{{/draining}}
+    <span class="client__from">{{#remoteAddress}}from <span class="mono">{{remoteAddress}}</span>, {{/remoteAddress}}connected <time datetime="{{connectedAt}}" title="{{connectedAt}}">{{connectedFor}}</time> ago</span>
+  </header>
+  <dl class="figures">
+    <div><dt>Open connections</dt><dd class="num">{{openConnections}}</dd></div>
+    <div><dt>Opened since connect</dt><dd class="num">{{connectionsOpened}}</dd></div>
+    <div><dt title="From visitors into the tunnel">Inbound</dt><dd class="num">{{inbound}}</dd></div>
+    <div><dt title="From the tunnel back to visitors">Outbound</dt><dd class="num">{{outbound}}</dd></div>
+  </dl>
+  <table class="grid upstreams">
+    <caption class="visually-hidden">Upstreams of {{clientId}}</caption>
+    <thead><tr><th scope="col">Kind</th><th scope="col">Host</th><th scope="col">Target</th><th scope="col">Role</th><th scope="col"><span class="visually-hidden">Note</span></th></tr></thead>
+    <tbody>
+    {{#upstreams}}
+    <tr{{#rejected}} class="is-fault"{{/rejected}}>
+      <td>{{kind}}</td>
+      <td class="mono">{{#catchAll}}<span class="catch-all">any host</span>{{/catchAll}}{{^catchAll}}{{host}}{{/catchAll}}</td>
+      <td class="mono">{{target}}</td>
+      <td class="role{{#serving}} is-serving-role{{/serving}}">{{role}}</td>
+      <td class="note">{{note}}</td>
+    </tr>
+    {{/upstreams}}
+    {{^upstreams}}
+    <tr><td colspan="5" class="empty">Waiting for the client to advertise its upstreams.</td></tr>
+    {{/upstreams}}
+    </tbody>
+  </table>
+</article>
+{{/clients}}
+{{^clients}}
+<p class="empty">No clients are connected to this node.</p>
+{{/clients}}

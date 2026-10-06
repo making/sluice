@@ -1,0 +1,20 @@
+{{#lookup}}
+{{#found}}
+<div class="lookup__result" data-testid="lookup-result">
+  <p><span class="mono">{{host}}</span> matches {{#catchAll}}the catch-all route.{{/catchAll}}{{^catchAll}}<span class="mono">{{matched}}</span>. <span class="hint">{{how}}.</span>{{/catchAll}}</p>
+  {{#decision}}<p class="hint">{{decision}}.</p>{{/decision}}
+  <ul class="lookup__candidates">
+    {{#candidates}}
+    <li{{#serving}} class="is-serving"{{/serving}}>
+      <span class="mono">{{clientId}}</span>
+      <span class="mono hint">{{address}}</span>
+      <span class="role">{{role}}</span>
+    </li>
+    {{/candidates}}
+  </ul>
+</div>
+{{/found}}
+{{^found}}
+<p class="lookup__result lookup__result--none" data-testid="lookup-result">No route matches <span class="mono">{{host}}</span>. The data plane answers 503 Service Unavailable.</p>
+{{/found}}
+{{/lookup}}

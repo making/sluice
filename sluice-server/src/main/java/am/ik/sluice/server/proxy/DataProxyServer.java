@@ -10,6 +10,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.List;
 import javax.net.ssl.SNIMatcher;
@@ -75,6 +76,8 @@ public class DataProxyServer implements SmartLifecycle {
 	private final SluiceServerProperties properties;
 
 	private static final String METRIC_NAME = "sluice.tunnel.bytes";
+
+	private final AtomicInteger activeConnections = new AtomicInteger();
 
 	private final MeterRegistry meterRegistry;
 
@@ -274,17 +277,26 @@ public class DataProxyServer implements SmartLifecycle {
 				: ConnectionHeadRewriter.rewrite(conn.head(), route0.address());
 		StreamRelay relay = StreamRelay.builder(conn.pipe(), connection, session.sender())
 			.prefix(head)
-			.listener(this.relayedBytes(route0, access))
+			.listener(this.relayedBytes(route0, session, access))
 			.onComplete(() -> {
+				this.activeConnections.decrementAndGet();
 				access.close();
 				session.remove(connection.connectionId());
 			})
 			.build();
-		relay.start();
+		this.activeConnections.incrementAndGet();
+		try {
+			relay.start();
+		}
+		catch (RuntimeException e) {
+			this.activeConnections.decrementAndGet();
+			throw e;
+		}
 		return true;
 	}
 
-	private StreamRelay.Listener relayedBytes(Router.Route route, AccessLogger.Connection access) {
+	private StreamRelay.Listener relayedBytes(Router.Route route, TunnelSession session,
+			AccessLogger.Connection access) {
 		Counter counter = this.meterRegistry.counter(METRIC_NAME, "direction", "data", "route", route.routeTag());
 		return new StreamRelay.Listener() {
 
@@ -295,6 +307,7 @@ public class DataProxyServer implements SmartLifecycle {
 			@Override
 			public void onBytesRelayed(long count, StreamRelay.Direction direction) {
 				counter.increment();
+				session.recordRelayed(count, direction);
 				access.bytes(count, direction);
 			}
 		};
@@ -326,6 +339,13 @@ public class DataProxyServer implements SmartLifecycle {
 	@Override
 	public boolean isRunning() {
 		return this.running;
+	}
+
+	/**
+	 * Number of connections currently relayed from the data plane listener.
+	 */
+	public int activeConnections() {
+		return this.activeConnections.get();
 	}
 
 	public int boundPort() {

@@ -220,6 +220,57 @@ class RouterTest {
 		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c2");
 	}
 
+	@Test
+	void httpRoutesListEveryDomainSortedWithTheDeterministicWinner() {
+		Router router = new Router();
+		router.register("c2", List.of(upstream("demo.local", "http://127.0.0.1:3002")));
+		router.register("c1",
+				List.of(upstream("demo.local", "http://127.0.0.1:3001"), upstream("", "http://127.0.0.1:3009")));
+		List<Router.RouteGroup> routes = router.httpRoutes();
+		assertThat(routes).extracting(Router.RouteGroup::key).containsExactly("", "demo.local");
+		Router.RouteGroup demo = routes.get(1);
+		assertThat(demo.candidates()).extracting(Router.Route::clientId).containsExactly("c2", "c1");
+		assertThat(demo.preferred()).isNotNull();
+		assertThat(demo.preferred().clientId()).isEqualTo("c1");
+	}
+
+	@Test
+	void rotatingStrategyHasNoPreferredRouteAndResolveDoesNotAdvanceIt() {
+		Router router = new Router(LoadBalance.ROUND_ROBIN, LoadBalance.ROUND_ROBIN);
+		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3001")));
+		router.register("c2", List.of(upstream("demo.local", "http://127.0.0.1:3002")));
+		String first = router.lookup("demo.local").orElseThrow().clientId();
+		Router.RouteGroup resolved = router.resolve("demo.local").orElseThrow();
+		assertThat(resolved.preferred()).isNull();
+		assertThat(resolved.candidates()).hasSize(2);
+		// resolve() leaves the rotation where lookup() left it
+		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isNotEqualTo(first);
+	}
+
+	@Test
+	void resolveReportsTheMatchedKey() {
+		Router router = new Router();
+		router.register("c1",
+				List.of(upstream("demo.local", "http://127.0.0.1:3001"), upstream("", "http://127.0.0.1:3009")));
+		assertThat(router.resolve("demo.local:8000").orElseThrow().key()).isEqualTo("demo.local");
+		assertThat(router.resolve("other.local").orElseThrow().key()).isEmpty();
+		assertThat(new Router().resolve("demo.local")).isEmpty();
+	}
+
+	@Test
+	void tcpRoutesAreKeyedByListenPort() {
+		Router router = new Router();
+		router.register("c1",
+				List.of(Upstream.newBuilder()
+					.setHost("db.local")
+					.setTargetUrl("tcp://127.0.0.1:5432")
+					.setListenPort(15432)
+					.build(), upstream("demo.local", "http://127.0.0.1:3001")));
+		List<Router.RouteGroup> tcp = router.tcpRoutes();
+		assertThat(tcp).extracting(Router.RouteGroup::key).containsExactly("15432");
+		assertThat(tcp.get(0).candidates()).extracting(Router.Route::address).containsExactly("127.0.0.1:5432");
+	}
+
 	private static Upstream tcpUpstream(String host, String targetUrl, int listenPort) {
 		return Upstream.newBuilder().setHost(host).setTargetUrl(targetUrl).setListenPort(listenPort).build();
 	}

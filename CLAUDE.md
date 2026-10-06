@@ -9,7 +9,7 @@ the reactor build from the root: `./mvnw -pl <module>` resolves the other module
 stale `~/.m2` snapshots and fails with misleading `NoSuchMethodError`s.
 
 - `sluice-proto`: proto + generated stubs + shared tunnel machinery (`am.ik.sluice.tunnel`: VirtualConnection / SessionSender / SocketRelay)
-- `sluice-server`: gRPC control plane (8001) + raw TCP data plane (`sluice.data-port`, 8000) + actuator (8081)
+- `sluice-server`: gRPC control plane (8001) + raw TCP data plane (`sluice.data-port`, 8000) + actuator and management console `/console` (8081)
 - `sluice-client`: tunnel client. grpc:// / grpcs:// (TLS verification skip via `sluice.insecure`)
 - `sluice-it`: full stack E2E tests (real server + client apps in one JVM); E2E tests live here, not in the app modules
 - `sluice-example-upstream`: minimal sample upstream (`It works`, http/1.1 + h2c) for manual checks
@@ -22,6 +22,8 @@ The data plane relays raw bytes (only the Host header of the first request is in
 - gRPC 1.83.x quirks: `StreamObserver` / `ClientCallStreamObserver` live in `io.grpc.stub`. The client onReady handler may only be set inside `ClientResponseObserver#beforeStart`.
 - Boot 4.1: `HealthIndicator` is in `org.springframework.boot.health.contributor`.
 - Docker images via buildpack (`spring-boot:build-image`); no Dockerfile.
+- Console: Mustache + htmx 4 (same setup as blog-frontend-htmx: vendored `htmx.min.js`, `{{#src}}` content-hashed URLs from `WebConfig`, `compression-maven-plugin` .br/.gz). htmx 4 inherits nothing implicitly (`:inherited`). The drawing geometry lives in `FlowDrawing`; templates stay logic-less.
+- Console E2E tests use Playwright (`ConsoleE2ETest`); the first run downloads Chromium.
 
 ## Manual E2E check
 

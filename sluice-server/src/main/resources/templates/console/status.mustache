@@ -1,0 +1,9 @@
+{{#status}}
+<dl class="titleblock">
+  <div class="titleblock__node"><dt>Node</dt><dd class="mono">{{nodeId}}</dd></div>
+  <div><dt>State</dt><dd class="state state--{{state}}" data-testid="state">{{stateLabel}}</dd></div>
+  <div><dt>Up</dt><dd class="num">{{uptime}}</dd></div>
+  {{#version}}<div><dt>Revision</dt><dd class="mono">{{version}}</dd></div>{{/version}}
+  <div><dt>Updated</dt><dd class="num"><span class="link__live">{{refreshedAt}}</span><span class="link__lost">Connection lost</span></dd></div>
+</dl>
+{{/status}}

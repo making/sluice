@@ -1,0 +1,953 @@
+/*
+ * sluice console, drawn as an engineering sheet of the sluice it is named after.
+ * Dark scheme: a blueprint (white linework on Prussian blue). Light scheme: a
+ * whiteprint (Prussian-blue ink on cool paper). Water is the only saturated colour and
+ * appears only where traffic flows; amber marks transitions, red marks faults.
+ * Overpass descends from Highway Gothic, the lettering of public works; light weights
+ * match the hairline drawing, the mono cut is kept for literal values.
+ */
+
+@font-face {
+	font-family: "Overpass";
+	src: url("../fonts/overpass.woff2") format("woff2");
+	font-weight: 100 900;
+	font-display: swap;
+}
+
+@font-face {
+	font-family: "Overpass Mono";
+	src: url("../fonts/overpass-mono.woff2") format("woff2");
+	font-weight: 300 700;
+	font-display: swap;
+}
+
+:root {
+	/* whiteprint */
+	--paper: #f3f6f9;
+	--paper-raised: #e9eff5;
+	--ink: #143b69;
+	--ink-soft: #4b6789;
+	--hair: rgb(20 59 105 / 0.32);
+	--hair-faint: rgb(20 59 105 / 0.14);
+	--grid: rgb(20 59 105 / 0.045);
+	--grid-major: rgb(20 59 105 / 0.085);
+	--water: #1b86c2;
+	--water-bed: rgb(27 134 194 / 0.16);
+	--amber: #a86b00;
+	--fault: #c0392b;
+	--on-ink: #f3f6f9;
+
+	--sans: "Overpass", "Helvetica Neue", Arial, sans-serif;
+	--mono: "Overpass Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+	/* modular scale, ratio 1.25 from 15px */
+	--step--1: 0.8125rem;
+	--step-0: 0.9375rem;
+	--step-1: 1.17rem;
+	--step-2: 1.46rem;
+	--step-3: 1.83rem;
+	--step-4: 2.29rem;
+
+	--gutter: clamp(16px, 3.2vw, 44px);
+	color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root:not([data-theme="light"]) {
+		/* blueprint */
+		--paper: #0f2d52;
+		--paper-raised: #0c2646;
+		--ink: #e4edf7;
+		--ink-soft: #a9bdd4;
+		--hair: rgb(228 237 247 / 0.34);
+		--hair-faint: rgb(228 237 247 / 0.14);
+		--grid: rgb(228 237 247 / 0.045);
+		--grid-major: rgb(228 237 247 / 0.09);
+		--water: #6fd0f5;
+		--water-bed: rgb(111 208 245 / 0.2);
+		--amber: #f2b33d;
+		--fault: #ff8a7a;
+		--on-ink: #0f2d52;
+		color-scheme: dark;
+	}
+}
+
+:root[data-theme="dark"] {
+	--paper: #0f2d52;
+	--paper-raised: #0c2646;
+	--ink: #e4edf7;
+	--ink-soft: #a9bdd4;
+	--hair: rgb(228 237 247 / 0.34);
+	--hair-faint: rgb(228 237 247 / 0.14);
+	--grid: rgb(228 237 247 / 0.045);
+	--grid-major: rgb(228 237 247 / 0.09);
+	--water: #6fd0f5;
+	--water-bed: rgb(111 208 245 / 0.2);
+	--amber: #f2b33d;
+	--fault: #ff8a7a;
+	--on-ink: #0f2d52;
+	color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html {
+	-webkit-text-size-adjust: 100%;
+}
+
+body {
+	margin: 0;
+	color: var(--ink);
+	font-family: var(--sans);
+	font-size: var(--step-0);
+	line-height: 1.5;
+	background-color: var(--paper);
+	/* drawing paper: 24px minor grid, 120px major grid */
+	background-image:
+		linear-gradient(var(--grid-major) 1px, transparent 1px),
+		linear-gradient(90deg, var(--grid-major) 1px, transparent 1px),
+		linear-gradient(var(--grid) 1px, transparent 1px),
+		linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+	background-size: 120px 120px, 120px 120px, 24px 24px, 24px 24px;
+	background-position: -1px -1px;
+}
+
+:focus-visible {
+	outline: 2px solid var(--water);
+	outline-offset: 2px;
+}
+
+a {
+	color: inherit;
+	text-decoration-color: var(--hair);
+	text-underline-offset: 0.2em;
+}
+
+a:hover {
+	text-decoration-color: currentColor;
+}
+
+code {
+	font-family: var(--mono);
+	font-size: 0.9em;
+}
+
+.mono {
+	font-family: var(--mono);
+	font-size: 0.92em;
+	letter-spacing: -0.01em;
+	overflow-wrap: anywhere;
+}
+
+.num {
+	font-variant-numeric: tabular-nums;
+}
+
+.hint {
+	margin: 0 0 0.9rem;
+	color: var(--ink-soft);
+	font-size: var(--step--1);
+}
+
+.empty {
+	margin: 0;
+	color: var(--ink-soft);
+	font-style: italic;
+}
+
+.visually-hidden {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- masthead */
+
+.masthead {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 0.5rem 1.5rem;
+	max-width: 1320px;
+	margin: 0 auto;
+	padding: 1.25rem var(--gutter) 0;
+}
+
+.brand {
+	display: inline-flex;
+	align-items: baseline;
+	gap: 0.55rem;
+	text-decoration: none;
+}
+
+.brand__mark {
+	align-self: center;
+	width: 30px;
+	height: 30px;
+}
+
+.brand__word {
+	font-size: var(--step-2);
+	font-weight: 700;
+	letter-spacing: -0.02em;
+}
+
+.brand__sub {
+	font-size: var(--step-2);
+	font-weight: 200;
+	color: var(--ink-soft);
+	letter-spacing: -0.01em;
+}
+
+.masthead__nav {
+	display: flex;
+	gap: 1.25rem;
+	font-size: var(--step--1);
+}
+
+/* ------------------------------------------------------------------- sheet */
+
+/* the drawing sheet: an outer frame and an inset border, title block in the corner */
+.sheet {
+	position: relative;
+	max-width: 1320px;
+	margin: 1.25rem auto 0;
+	padding: 0 var(--gutter);
+}
+
+.sheet__drawing {
+	position: relative;
+	padding: clamp(1rem, 2.5vw, 2rem) clamp(0.5rem, 2vw, 1.5rem) clamp(4.5rem, 7vw, 5.5rem);
+	border: 1px solid var(--hair);
+	outline: 1px solid var(--hair-faint);
+	outline-offset: 5px;
+	background: color-mix(in srgb, var(--paper) 72%, transparent);
+}
+
+.drawing {
+	display: block;
+	width: 100%;
+	height: auto;
+	overflow: visible;
+	font-family: var(--sans);
+}
+
+.drawing text {
+	fill: var(--ink);
+	font-size: 15px;
+}
+
+.drawing .strong {
+	font-weight: 700;
+}
+
+.drawing .mono {
+	font-family: var(--mono);
+	font-size: 14px;
+}
+
+.drawing .detail,
+.drawing .caption {
+	fill: var(--ink-soft);
+	font-size: 13px;
+}
+
+.drawing .figure {
+	font-size: 68px;
+	font-weight: 200;
+	letter-spacing: -0.04em;
+	font-variant-numeric: tabular-nums;
+}
+
+/* channels: a wide bank stroke under a paper-coloured bed leaves two hairline banks */
+.bank {
+	fill: none;
+	stroke: var(--hair);
+	stroke-width: 16.5;
+}
+
+.bank--conduit {
+	stroke-width: 54.5;
+}
+
+.bed {
+	fill: none;
+	stroke: var(--paper);
+	stroke-width: 14;
+}
+
+.bed--conduit {
+	stroke-width: 52;
+}
+
+.water,
+.stream {
+	fill: none;
+	opacity: 0;
+	transition: opacity 0.6s ease;
+}
+
+.water {
+	stroke: var(--water-bed);
+	stroke-width: var(--w, 6px);
+}
+
+.water--conduit {
+	stroke-width: 52;
+}
+
+.stream {
+	stroke: var(--water);
+	stroke-width: 2;
+	stroke-linecap: round;
+	stroke-dasharray: 1.5 11;
+	animation: stream var(--dur, 2s) linear infinite;
+}
+
+.lane.is-active .water,
+.lane.is-active .stream,
+[data-flowing="true"] .lock .water,
+[data-flowing="true"] .lock .stream {
+	opacity: 1;
+}
+
+@keyframes stream {
+	to {
+		stroke-dashoffset: -12.5;
+	}
+}
+
+.wall {
+	fill: url(#hatch);
+	stroke: var(--ink);
+	stroke-width: 1.25;
+}
+
+.hatch-line {
+	stroke: var(--hair);
+	stroke-width: 1;
+}
+
+.leaf {
+	stroke: var(--ink);
+	stroke-width: 5;
+	stroke-linecap: round;
+	transition: transform 1.4s cubic-bezier(0.3, 0, 0.2, 1), stroke 0.6s ease;
+}
+
+.leader {
+	fill: none;
+	stroke: var(--ink-soft);
+	stroke-width: 0.75;
+}
+
+.hinge {
+	fill: var(--paper);
+	stroke: var(--ink);
+	stroke-width: 1.5;
+}
+
+/* a node that is not accepting traffic holds its gates shut in amber */
+[data-state="warming"] .leaf,
+[data-state="draining"] .leaf {
+	stroke: var(--amber);
+}
+
+.lane.is-active .label {
+	fill: var(--ink);
+}
+
+/* the one orchestrated moment: linework draws itself on first paint, and a client
+   joining later draws only its own channel */
+.ink {
+	stroke-dasharray: 1;
+	stroke-dashoffset: 1;
+	animation: draw 1.3s cubic-bezier(0.6, 0, 0.3, 1) forwards;
+}
+
+.lock .ink {
+	animation-delay: 0.35s;
+}
+
+.outlets .ink {
+	animation-delay: 0.6s;
+}
+
+@keyframes draw {
+	to {
+		stroke-dashoffset: 0;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.ink {
+		animation: none;
+		stroke-dasharray: none;
+		stroke-dashoffset: 0;
+	}
+
+	.stream {
+		animation: none;
+	}
+
+	.leaf {
+		transition: none;
+	}
+}
+
+/* ------------------------------------------------------------- title block */
+
+.sheet__title {
+	position: absolute;
+	right: var(--gutter);
+	bottom: 0;
+	max-width: calc(100% - 2 * var(--gutter));
+}
+
+.titleblock {
+	display: grid;
+	grid-template-columns: repeat(3, auto);
+	margin: 0;
+	border-top: 1px solid var(--hair);
+	border-left: 1px solid var(--hair);
+	background: var(--paper-raised);
+	font-size: var(--step--1);
+}
+
+.titleblock div {
+	display: flex;
+	flex-direction: column;
+	gap: 0.05rem;
+	min-width: 7.5rem;
+	padding: 0.4rem 0.8rem 0.45rem;
+	border-right: 1px solid var(--hair-faint);
+	border-bottom: 1px solid var(--hair-faint);
+}
+
+.titleblock .titleblock__node {
+	grid-row: span 2;
+	justify-content: center;
+	min-width: 10rem;
+}
+
+.titleblock__node dd {
+	font-size: var(--step-2);
+	font-weight: 600;
+}
+
+.titleblock dt {
+	color: var(--ink-soft);
+	font-size: 0.72rem;
+}
+
+.titleblock dd {
+	margin: 0;
+	font-weight: 600;
+	white-space: nowrap;
+}
+
+.state {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.4rem;
+}
+
+.state::before {
+	content: "";
+	width: 0.55rem;
+	height: 0.55rem;
+	border-radius: 50%;
+	background: var(--water);
+}
+
+.state--warming,
+.state--draining {
+	color: var(--amber);
+}
+
+.state--warming::before,
+.state--draining::before {
+	background: var(--amber);
+}
+
+.link__lost {
+	display: none;
+	color: var(--fault);
+}
+
+[data-link="lost"] .link__live {
+	display: none;
+}
+
+[data-link="lost"] .link__lost {
+	display: inline;
+}
+
+[data-link="lost"] .sheet__drawing,
+[data-link="lost"] .layout__main,
+[data-link="lost"] #cluster {
+	opacity: 0.5;
+	transition: opacity 0.4s ease;
+}
+
+/* ------------------------------------------------------------------ layout */
+
+.layout {
+	display: grid;
+	grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+	gap: 0 clamp(1.5rem, 4vw, 4rem);
+	max-width: 1320px;
+	margin: 0 auto;
+	padding: 1rem var(--gutter) 5rem;
+}
+
+.panel {
+	padding-top: 2.25rem;
+}
+
+/* a heading extended by a hairline to the edge, like a drawing's detail label */
+.rule-heading {
+	display: flex;
+	align-items: baseline;
+	gap: 1rem;
+	margin: 0 0 1.1rem;
+	font-size: var(--step-3);
+	font-weight: 300;
+	letter-spacing: -0.02em;
+	line-height: 1.1;
+}
+
+.rule-heading::after {
+	content: "";
+	flex: 1;
+	border-bottom: 1px solid var(--hair);
+	transform: translateY(-0.3em);
+}
+
+/* ----------------------------------------------------------------- clients */
+
+.client {
+	position: relative;
+	margin-top: 1.6rem;
+	padding: 1.3rem 1.2rem 1rem;
+	border: 1px solid var(--hair);
+	background: color-mix(in srgb, var(--paper) 80%, transparent);
+}
+
+/* the client id sits on the frame, like a detail callout */
+.client__head {
+	position: absolute;
+	top: 0;
+	left: 0.9rem;
+	right: 0.9rem;
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 0 0.75rem;
+	transform: translateY(-55%);
+}
+
+.client__head h3 {
+	margin: 0;
+	padding: 0 0.4rem;
+	font-size: var(--step-1);
+	font-weight: 700;
+	line-height: 1.3;
+	background: var(--paper);
+}
+
+.client__from {
+	padding: 0 0.4rem;
+	color: var(--ink-soft);
+	font-size: var(--step--1);
+	background: var(--paper);
+}
+
+.client--draining {
+	border-color: var(--amber);
+}
+
+.figures {
+	display: grid;
+	grid-template-columns: repeat(4, minmax(0, 1fr));
+	gap: 0.5rem 1rem;
+	margin: 0.4rem 0 1rem;
+}
+
+.figures div {
+	display: flex;
+	flex-direction: column-reverse;
+}
+
+.figures dt {
+	color: var(--ink-soft);
+	font-size: var(--step--1);
+}
+
+.figures dd {
+	margin: 0;
+	font-size: var(--step-3);
+	font-weight: 200;
+	letter-spacing: -0.03em;
+	line-height: 1.15;
+}
+
+/* ------------------------------------------------------------------ tables */
+
+/* fixed layout: columns line up across the stacked client and route tables */
+.grid {
+	width: 100%;
+	border-collapse: collapse;
+	table-layout: fixed;
+	font-size: var(--step--1);
+}
+
+.upstreams th:nth-child(1) { width: 5.5rem; }
+.upstreams th:nth-child(2) { width: 19%; }
+.upstreams th:nth-child(4) { width: 10.5rem; }
+.upstreams th:nth-child(5) { width: 7rem; }
+
+.routes th:nth-child(1) { width: 30%; }
+.routes th:nth-child(3) { width: 8rem; }
+.routes th:nth-child(4) { width: 8.5rem; }
+
+.grid th,
+.grid td {
+	padding: 0.42rem 0.75rem 0.42rem 0;
+	text-align: left;
+	vertical-align: baseline;
+}
+
+.grid thead th {
+	color: var(--ink-soft);
+	font-weight: 600;
+	border-bottom: 1px solid var(--hair);
+}
+
+.grid tbody td {
+	border-bottom: 1px solid var(--hair-faint);
+}
+
+.grid .note {
+	color: var(--ink-soft);
+}
+
+.is-fault td,
+.is-fault .note {
+	color: var(--fault);
+}
+
+.is-fault .note {
+	font-weight: 700;
+}
+
+.catch-all {
+	font-family: var(--sans);
+	font-style: italic;
+}
+
+.subhead {
+	margin: 1.6rem 0 0.2rem;
+	font-size: var(--step-0);
+	font-weight: 600;
+	color: var(--ink-soft);
+}
+
+.subhead:first-child {
+	margin-top: 0;
+}
+
+.routes__key th {
+	padding-top: 1rem;
+	font-size: var(--step-0);
+	font-weight: 700;
+}
+
+.routes tr:not(.routes__key) td:first-child {
+	padding-left: 0.75rem;
+}
+
+.routes .role {
+	color: var(--ink-soft);
+}
+
+.is-serving td:first-child {
+	box-shadow: inset 2px 0 0 var(--water);
+}
+
+.is-serving .role {
+	color: var(--water);
+	font-weight: 700;
+}
+
+.decision {
+	margin-left: 0.75rem;
+	font-family: var(--sans);
+	font-size: var(--step--1);
+	font-weight: 400;
+	color: var(--ink-soft);
+}
+
+.upstreams .role {
+	color: var(--ink-soft);
+}
+
+.upstreams .is-serving-role {
+	color: var(--water);
+	font-weight: 700;
+}
+
+.client__label {
+	font-size: var(--step--1);
+	font-weight: 400;
+	color: var(--ink-soft);
+}
+
+.drawing .detail--serving {
+	fill: var(--ink);
+}
+
+.bound {
+	margin-left: 0.4rem;
+	font-weight: 400;
+	color: var(--ink-soft);
+	font-size: var(--step--1);
+}
+
+.tag {
+	display: inline-block;
+	padding: 0 0.4rem;
+	border: 1px solid currentColor;
+	font-size: 0.75rem;
+	font-weight: 600;
+	line-height: 1.5;
+	color: var(--ink-soft);
+	background: var(--paper);
+}
+
+.tag--marker {
+	color: var(--amber);
+}
+
+.tag--fault {
+	color: var(--fault);
+}
+
+/* ------------------------------------------------------------------- aside */
+
+.lookup {
+	display: grid;
+	gap: 0.3rem;
+}
+
+.lookup label {
+	font-size: var(--step--1);
+	font-weight: 600;
+}
+
+.lookup input {
+	width: 100%;
+	padding: 0.6rem 0.1rem 0.5rem;
+	border: 0;
+	border-bottom: 1px solid var(--ink);
+	border-radius: 0;
+	background: transparent;
+	color: var(--ink);
+	font-family: var(--mono);
+	font-size: var(--step-1);
+}
+
+.lookup input::placeholder {
+	color: var(--hair);
+}
+
+.lookup input:focus-visible {
+	outline: none;
+	border-bottom-color: var(--water);
+	box-shadow: 0 1px 0 var(--water);
+}
+
+.lookup__result {
+	margin: 1rem 0 0;
+}
+
+.lookup__result p {
+	margin: 0 0 0.5rem;
+}
+
+.lookup__result--none {
+	color: var(--fault);
+}
+
+.lookup__candidates {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+}
+
+.lookup__candidates li {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.15rem 0.6rem;
+	padding: 0.35rem 0 0.35rem 0.7rem;
+	border-left: 1px solid var(--hair);
+	font-size: var(--step--1);
+}
+
+.lookup__candidates .is-serving {
+	border-left: 2px solid var(--water);
+}
+
+.lookup__candidates .role {
+	margin-left: auto;
+	color: var(--ink-soft);
+}
+
+.lookup__candidates .is-serving .role {
+	color: var(--water);
+	font-weight: 700;
+}
+
+.nodes {
+	list-style: none;
+	margin: 0 0 0.75rem;
+	padding: 0;
+}
+
+.nodes li {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 0.15rem 0.6rem;
+	padding: 0.55rem 0;
+	border-bottom: 1px solid var(--hair-faint);
+}
+
+.nodes li.is-self {
+	font-weight: 700;
+}
+
+.nodes__url {
+	flex-basis: 100%;
+	font-weight: 400;
+	font-size: var(--step--1);
+	color: var(--ink-soft);
+}
+
+.nodes__url .hint {
+	margin: 0;
+	font-family: var(--sans);
+}
+
+.settings {
+	margin: 0;
+	font-size: var(--step--1);
+}
+
+.settings div {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+	gap: 0.75rem;
+	padding: 0.4rem 0;
+	border-bottom: 1px solid var(--hair-faint);
+}
+
+.settings dt {
+	color: var(--ink-soft);
+}
+
+.settings dd {
+	margin: 0;
+	overflow-wrap: anywhere;
+}
+
+/* -------------------------------------------------------------- responsive */
+
+@media (max-width: 960px) {
+	.layout {
+		grid-template-columns: minmax(0, 1fr);
+	}
+}
+
+@media (max-width: 760px) {
+	/* the drawing keeps a legible scale and scrolls inside its frame */
+	.sheet__drawing {
+		overflow-x: auto;
+		padding-bottom: 1rem;
+	}
+
+	.drawing {
+		width: 760px;
+	}
+
+	.sheet__title {
+		position: static;
+		max-width: none;
+		margin-top: 0.75rem;
+	}
+
+	.titleblock {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+
+	.titleblock .titleblock__node {
+		grid-row: auto;
+		grid-column: span 2;
+	}
+
+	.titleblock dd {
+		white-space: normal;
+		overflow-wrap: anywhere;
+	}
+
+	.figures {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+
+	.client {
+		padding: 0.9rem 0.8rem 0.8rem;
+	}
+
+	.client__head {
+		position: static;
+		transform: none;
+	}
+
+	.client__head h3,
+	.client__from {
+		padding: 0;
+		background: none;
+	}
+
+	.grid thead {
+		display: none;
+	}
+
+	.grid tbody tr:not(.routes__key) {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto;
+		padding: 0.35rem 0;
+		border-bottom: 1px solid var(--hair-faint);
+	}
+
+	.grid tbody td {
+		border: 0;
+		padding: 0.1rem 0.6rem;
+	}
+
+	.grid tbody tr.routes__key {
+		display: block;
+	}
+
+	.routes tr:not(.routes__key) td:first-child {
+		padding-left: 0.6rem;
+	}
+}

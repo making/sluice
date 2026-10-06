@@ -66,7 +66,7 @@ sequenceDiagram
 ## Modules
 
 - `sluice-proto` - `.proto` contract, generated stubs, and the shared tunnel primitives (`VirtualConnection`, `SessionSender`, `SocketRelay`)
-- `sluice-server` - exit node: gRPC control plane (`spring.grpc.server.port`, default 8001) + raw TCP data plane (`sluice.data-port`, default 8000) + actuator (`server.port`, default 8081)
+- `sluice-server` - exit node: gRPC control plane (`spring.grpc.server.port`, default 8001) + raw TCP data plane (`sluice.data-port`, default 8000) + actuator and management console (`server.port`, default 8081)
 - `sluice-client` - tunnel client: connects to the server, advertises upstreams, dials local upstreams on CONNECT, reconnects with exponential backoff (1s..30s)
 - `sluice-it` - full stack integration tests running the real server and client applications in one JVM (proxying, reconnect after server restart, wrong-token rejection)
 - `sluice-example-upstream` - minimal sample upstream for manual checks (`It works` over http/1.1 and h2c)
@@ -227,7 +227,7 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.access-log.rate-limit.max-rate` | `10` | max lines emitted per line kind (`conn-accept` / `conn-close` / `request`) within one period; the line that reaches the limit is still emitted |
 | `sluice.access-log.rate-limit.period` | `10s` | rate limit window; lines beyond the limit are counted and one `type=ratelimit` summary line reports the suppressed count when the period rolls over |
 | `spring.grpc.server.port` | `8001` | gRPC control plane port |
-| `server.port` | `8081` | actuator (health / info / prometheus) |
+| `server.port` | `8081` | actuator (health / info / prometheus) and the management console (`/console`) |
 
 ## Configuration (client)
 
@@ -417,6 +417,19 @@ node stops, and h2 negotiation on the TLS endpoint.
 - client `GET /actuator/health` - UP while at least one per-node tunnel stream is established;
   the `nodes` detail lists each node's stream state
 - `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`
+
+## Console
+
+`http://<server>:8081/console` (the actuator port) shows the live state of one node: the
+public listeners, connected clients with their upstreams and traffic, the http / tcp route
+tables with the client each route resolves to, the cluster membership and the effective
+settings. A "Find a route" box tells which client serves a given Host header without
+touching load balancing state. The page refreshes every 2s.
+
+The console has no authentication yet: keep `server.port` off public networks.
+
+Built with Mustache and htmx 4 (vendored in `static/console/js/vendor`, source URL in the
+template); static assets ship pre-compressed (`.br` / `.gz`) and content-hashed.
 
 ## Docker
 

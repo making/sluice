@@ -9,9 +9,12 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeSet;
 import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.jspecify.annotations.Nullable;
 
@@ -60,6 +63,18 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 	private final AccessLogger accessLogger;
 
 	private final ConcurrentMap<Integer, BoundListener> listeners = new ConcurrentHashMap<>();
+
+	private final ConcurrentMap<Integer, AtomicInteger> activeConnections = new ConcurrentHashMap<>();
+
+	/**
+	 * A bound tcp route listener as reported to observers.
+	 *
+	 * @param clientId client owning the listener
+	 * @param activeConnections connections currently relayed from the port
+	 */
+	public record Binding(String clientId, int activeConnections) {
+
+	}
 
 	private final TcpPortRange tcpPortRange;
 
@@ -239,14 +254,23 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 			Router.Route route0 = route.get();
 			VirtualConnection connection = session.open(route0.address());
 			access.route(route0.routeTag()).connectionId(connection.connectionId());
+			AtomicInteger active = this.activeConnections.computeIfAbsent(port, p -> new AtomicInteger());
 			StreamRelay relay = StreamRelay.builder(DuplexPipe.of(socket), connection, session.sender())
-				.listener(this.relayedBytes(route0, access))
+				.listener(this.relayedBytes(route0, session, access))
 				.onComplete(() -> {
+					active.decrementAndGet();
 					access.close();
 					session.remove(connection.connectionId());
 				})
 				.build();
-			relay.start();
+			active.incrementAndGet();
+			try {
+				relay.start();
+			}
+			catch (RuntimeException e) {
+				active.decrementAndGet();
+				throw e;
+			}
 		}
 		catch (Exception e) {
 			log.debug("tcp route connection failed on port {}: {}", port, e.toString());
@@ -255,7 +279,8 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 		}
 	}
 
-	private StreamRelay.Listener relayedBytes(Router.Route route, AccessLogger.Connection access) {
+	private StreamRelay.Listener relayedBytes(Router.Route route, TunnelSession session,
+			AccessLogger.Connection access) {
 		Counter counter = this.meterRegistry.counter(METRIC_NAME, "direction", "data", "route", route.routeTag());
 		return new StreamRelay.Listener() {
 
@@ -266,6 +291,7 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 			@Override
 			public void onBytesRelayed(long count, StreamRelay.Direction direction) {
 				counter.increment();
+				session.recordRelayed(count, direction);
 				access.bytes(count, direction);
 			}
 		};
@@ -283,6 +309,18 @@ public class TcpPortGateway implements TcpRouteListener, AutoCloseable {
 	/**
 	 * Whether the given port currently has a bound listener.
 	 */
+	/**
+	 * Currently bound tcp route listeners by listen port, ordered by port.
+	 */
+	public SortedMap<Integer, Binding> bindings() {
+		SortedMap<Integer, Binding> bindings = new TreeMap<>();
+		this.listeners.forEach((port, listener) -> {
+			AtomicInteger active = this.activeConnections.get(port);
+			bindings.put(port, new Binding(listener.clientId(), active == null ? 0 : active.get()));
+		});
+		return Collections.unmodifiableSortedMap(bindings);
+	}
+
 	public boolean isBound(int port) {
 		return this.listeners.containsKey(port);
 	}

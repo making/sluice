@@ -7,6 +7,7 @@ import java.util.Optional;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -107,6 +108,59 @@ public class Router {
 
 	}
 
+	/**
+	 * The routes registered under one lookup key.
+	 *
+	 * @param key the domain ({@code ""} = catch-all) or the listen port of tcp routes
+	 * @param candidates every registered route, in registration order
+	 * @param preferred the route lookups resolve to when the load balancing is
+	 * deterministic; {@code null} when the strategy rotates or randomizes
+	 */
+	public record RouteGroup(String key, List<Route> candidates, @Nullable Route preferred) {
+
+		public RouteGroup {
+			candidates = List.copyOf(candidates);
+		}
+
+		public static Builder builder() {
+			return new Builder();
+		}
+
+		public static final class Builder {
+
+			private @Nullable String key;
+
+			private List<Route> candidates = List.of();
+
+			private @Nullable Route preferred;
+
+			private Builder() {
+			}
+
+			public Builder key(String key) {
+				this.key = key;
+				return this;
+			}
+
+			public Builder candidates(List<Route> candidates) {
+				this.candidates = candidates;
+				return this;
+			}
+
+			public Builder preferred(@Nullable Route preferred) {
+				this.preferred = preferred;
+				return this;
+			}
+
+			public RouteGroup build() {
+				return new RouteGroup(Objects.requireNonNull(this.key, "key is required"), this.candidates,
+						this.preferred);
+			}
+
+		}
+
+	}
+
 	record Target(String clientId, String domain, String address, boolean preserveHost, boolean tlsPassthrough,
 			int listenPort) {
 
@@ -180,6 +234,10 @@ public class Router {
 
 	private final Object lock = new Object();
 
+	private final LoadBalance httpLoadBalance;
+
+	private final LoadBalance tcpLoadBalance;
+
 	private final LoadBalanceStrategy httpStrategy;
 
 	private final LoadBalanceStrategy tcpStrategy;
@@ -193,6 +251,8 @@ public class Router {
 	}
 
 	public Router(LoadBalance httpLoadBalance, LoadBalance tcpLoadBalance) {
+		this.httpLoadBalance = httpLoadBalance;
+		this.tcpLoadBalance = tcpLoadBalance;
 		this.httpStrategy = httpLoadBalance.instance();
 		this.tcpStrategy = tcpLoadBalance.instance();
 	}
@@ -307,6 +367,63 @@ public class Router {
 			return Optional.empty();
 		}
 		return Optional.of(toRoute(this.tcpStrategy.pick(Integer.toString(port), targets)));
+	}
+
+	/**
+	 * Explains which routes the given Host header value resolves to, following the same
+	 * candidate order as {@link #lookup} but without advancing any load balancing state.
+	 */
+	public Optional<RouteGroup> resolve(@Nullable String host) {
+		for (String candidate : candidates(host)) {
+			List<Target> targets = this.byDomain.get(candidate);
+			if (targets != null && !targets.isEmpty()) {
+				return Optional.of(group(candidate, targets, this.httpLoadBalance));
+			}
+		}
+		return Optional.empty();
+	}
+
+	/**
+	 * Current http route table ordered by domain (the catch-all first).
+	 */
+	public List<RouteGroup> httpRoutes() {
+		return this.byDomain.entrySet()
+			.stream()
+			.filter(entry -> !entry.getValue().isEmpty())
+			.sorted(Map.Entry.comparingByKey())
+			.map(entry -> group(entry.getKey(), entry.getValue(), this.httpLoadBalance))
+			.toList();
+	}
+
+	/**
+	 * Current tcp route table ordered by listen port.
+	 */
+	public List<RouteGroup> tcpRoutes() {
+		return this.byPort.entrySet()
+			.stream()
+			.filter(entry -> !entry.getValue().isEmpty())
+			.sorted(Comparator.comparing(Map.Entry::getKey))
+			.map(entry -> group(Integer.toString(entry.getKey()), entry.getValue(), this.tcpLoadBalance))
+			.toList();
+	}
+
+	public LoadBalance httpLoadBalance() {
+		return this.httpLoadBalance;
+	}
+
+	public LoadBalance tcpLoadBalance() {
+		return this.tcpLoadBalance;
+	}
+
+	private static RouteGroup group(String key, List<Target> targets, LoadBalance loadBalance) {
+		// only the stateless deterministic strategy can be previewed without side effects
+		Route preferred = loadBalance == LoadBalance.SMALLEST_CLIENT_ID
+				? toRoute(LoadBalance.SMALLEST_CLIENT_ID.instance().pick(key, targets)) : null;
+		return RouteGroup.builder()
+			.key(key)
+			.candidates(targets.stream().map(Router::toRoute).toList())
+			.preferred(preferred)
+			.build();
 	}
 
 	private static Route toRoute(Target target) {

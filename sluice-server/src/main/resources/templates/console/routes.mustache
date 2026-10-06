@@ -1,0 +1,41 @@
+<h3 class="subhead">HTTP, by host</h3>
+<table class="grid routes">
+  <thead><tr><th scope="col">Client id</th><th scope="col">Target</th><th scope="col">Role</th><th scope="col"><span class="visually-hidden">Note</span></th></tr></thead>
+  {{#httpRoutes}}
+  <tbody data-route="{{domain}}">
+    <tr class="routes__key"><th colspan="4" scope="rowgroup" class="mono">{{#catchAll}}<span class="catch-all">any host</span> (catch-all){{/catchAll}}{{^catchAll}}{{domain}}{{/catchAll}}{{#decision}} <span class="decision">{{decision}}</span>{{/decision}}</th></tr>
+    {{#candidates}}
+    <tr{{#serving}} class="is-serving"{{/serving}}>
+      <td class="mono">{{clientId}}</td>
+      <td class="mono">{{address}}</td>
+      <td class="role">{{role}}</td>
+      <td class="note">{{note}}</td>
+    </tr>
+    {{/candidates}}
+  </tbody>
+  {{/httpRoutes}}
+  {{^httpRoutes}}
+  <tbody><tr><td colspan="4" class="empty">No HTTP routes. Routes appear when a client advertises its upstreams.</td></tr></tbody>
+  {{/httpRoutes}}
+</table>
+
+<h3 class="subhead">TCP, by listen port</h3>
+<table class="grid routes">
+  <thead><tr><th scope="col">Client id</th><th scope="col">Target</th><th scope="col">Role</th><th scope="col"><span class="visually-hidden">Note</span></th></tr></thead>
+  {{#tcpRoutes}}
+  <tbody data-port="{{port}}">
+    <tr class="routes__key"><th colspan="4" scope="rowgroup"><span class="mono">:{{port}}</span> {{#bound}}<span class="bound">listening, owned by <span class="mono">{{owner}}</span></span>{{/bound}}{{^bound}}<span class="tag tag--fault">Not listening</span>{{/bound}}{{#decision}} <span class="decision">{{decision}}</span>{{/decision}}</th></tr>
+    {{#candidates}}
+    <tr{{#serving}} class="is-serving"{{/serving}}>
+      <td class="mono">{{clientId}}</td>
+      <td class="mono">{{address}}</td>
+      <td class="role">{{role}}</td>
+      <td class="note">{{note}}</td>
+    </tr>
+    {{/candidates}}
+  </tbody>
+  {{/tcpRoutes}}
+  {{^tcpRoutes}}
+  <tbody><tr><td colspan="4" class="empty">No TCP routes. A client upstream with a listen port adds one.</td></tr></tbody>
+  {{/tcpRoutes}}
+</table>

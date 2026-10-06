@@ -1,0 +1,13 @@
+{{#cluster}}
+{{^enabled}}<p class="hint">Single node. Set <code>sluice.cluster.nodes</code> to run several nodes behind one address.</p>{{/enabled}}
+<ul class="nodes">
+  {{#nodes}}
+  <li{{#self}} class="is-self"{{/self}}>
+    <span class="mono">{{nodeId}}</span>
+    {{#self}}<span class="tag">This node</span>{{/self}}
+    <span class="nodes__url mono">{{#publicUrl}}{{publicUrl}}{{/publicUrl}}{{^publicUrl}}<span class="hint">bootstrap address</span>{{/publicUrl}}</span>
+  </li>
+  {{/nodes}}
+</ul>
+{{#enabled}}<p class="hint">Membership version {{membershipVersion}}</p>{{/enabled}}
+{{/cluster}}
