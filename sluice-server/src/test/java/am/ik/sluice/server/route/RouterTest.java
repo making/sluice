@@ -151,4 +151,73 @@ class RouterTest {
 		assertThat(router.lookupByPort(16379)).isEmpty();
 	}
 
+	@Test
+	void roundRobinRotatesThroughTheRegisteredTargets() {
+		Router router = new Router(LoadBalance.ROUND_ROBIN, LoadBalance.ROUND_ROBIN);
+		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3000")));
+		router.register("c2", List.of(upstream("demo.local", "http://127.0.0.2:3000")));
+		router.register("c3", List.of(upstream("demo.local", "http://127.0.0.3:3000")));
+		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c1");
+		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c2");
+		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c3");
+		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c1");
+	}
+
+	@Test
+	void roundRobinCountersAreIndependentPerKey() {
+		Router router = new Router(LoadBalance.ROUND_ROBIN, LoadBalance.ROUND_ROBIN);
+		router.register("c1", List.of(upstream("a.local", "http://127.0.0.1:3000")));
+		router.register("c2", List.of(upstream("a.local", "http://127.0.0.2:3000")));
+		router.register("c3", List.of(upstream("b.local", "http://127.0.0.3:3001")));
+		router.register("c4", List.of(upstream("b.local", "http://127.0.0.4:3001")));
+		assertThat(router.lookup("a.local").orElseThrow().clientId()).isEqualTo("c1");
+		assertThat(router.lookup("b.local").orElseThrow().clientId()).isEqualTo("c3");
+		assertThat(router.lookup("a.local").orElseThrow().clientId()).isEqualTo("c2");
+		assertThat(router.lookup("b.local").orElseThrow().clientId()).isEqualTo("c4");
+	}
+
+	@Test
+	void roundRobinAlsoAppliesToListenPortRoutes() {
+		Router router = new Router(LoadBalance.ROUND_ROBIN, LoadBalance.ROUND_ROBIN);
+		router.register("c1", List.of(portUpstream(16379, "tcp://10.0.0.1:7001")));
+		router.register("c2", List.of(portUpstream(16379, "tcp://10.0.0.2:7002")));
+		assertThat(router.lookupByPort(16379).orElseThrow().address()).isEqualTo("10.0.0.1:7001");
+		assertThat(router.lookupByPort(16379).orElseThrow().address()).isEqualTo("10.0.0.2:7002");
+		assertThat(router.lookupByPort(16379).orElseThrow().address()).isEqualTo("10.0.0.1:7001");
+	}
+
+	@Test
+	void randomPicksOneOfTheRegisteredTargets() {
+		Router router = new Router(LoadBalance.RANDOM, LoadBalance.RANDOM);
+		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3000")));
+		router.register("c2", List.of(upstream("demo.local", "http://127.0.0.2:3000")));
+		for (int i = 0; i < 10; i++) {
+			assertThat(router.lookup("demo.local").orElseThrow().clientId()).isIn("c1", "c2");
+		}
+	}
+
+	@Test
+	void httpAndTcpLoadBalancingAreConfiguredIndependently() {
+		Router router = new Router(LoadBalance.SMALLEST_CLIENT_ID, LoadBalance.ROUND_ROBIN);
+		router.register("c1",
+				List.of(upstream("demo.local", "http://127.0.0.1:3000"), portUpstream(16379, "tcp://127.0.0.1:7001")));
+		router.register("c2",
+				List.of(upstream("demo.local", "http://127.0.0.2:3000"), portUpstream(16379, "tcp://127.0.0.2:7002")));
+		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c1");
+		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c1");
+		assertThat(router.lookupByPort(16379).orElseThrow().clientId()).isEqualTo("c1");
+		assertThat(router.lookupByPort(16379).orElseThrow().clientId()).isEqualTo("c2");
+	}
+
+	@Test
+	void removalRebasesTheRoundRobinRotation() {
+		Router router = new Router(LoadBalance.ROUND_ROBIN, LoadBalance.ROUND_ROBIN);
+		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3000")));
+		router.register("c2", List.of(upstream("demo.local", "http://127.0.0.2:3000")));
+		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c1");
+		router.remove("c1");
+		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c2");
+		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c2");
+	}
+
 }

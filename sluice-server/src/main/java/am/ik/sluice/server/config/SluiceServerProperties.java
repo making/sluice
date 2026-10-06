@@ -10,16 +10,24 @@ import org.jspecify.annotations.Nullable;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 
+import am.ik.sluice.server.route.LoadBalance;
+
 /**
  * Configuration of the sluice server.
  *
  * @param tcpPortRange listen ports a client may claim for tcp routes (comma separated
  * single ports or {@code min-max} ranges, e.g. {@code 9000-9010,8080}; empty = any port)
+ * @param httpLoadBalance load balancing applied when several clients serve the same
+ * domain (http routes)
+ * @param tcpLoadBalance load balancing applied when several clients serve the same listen
+ * port (tcp routes)
  */
 @ConfigurationProperties("sluice")
 public record SluiceServerProperties(String token, @Nullable String tokenFile, @DefaultValue("0.0.0.0") String dataHost,
 		@DefaultValue("8000") int dataPort, @Nullable String dataTlsBundle, @DefaultValue("") String tcpPortRange,
-		AccessLog accessLog, Node node, Cluster cluster) {
+		AccessLog accessLog, Node node, Cluster cluster,
+		@DefaultValue("smallest-client-id") LoadBalance httpLoadBalance,
+		@DefaultValue("smallest-client-id") LoadBalance tcpLoadBalance) {
 
 	public SluiceServerProperties {
 		dataHost = dataHost == null || dataHost.isBlank() ? "0.0.0.0" : dataHost;
@@ -310,6 +318,10 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 		@Nullable private Cluster cluster;
 
+		private LoadBalance httpLoadBalance = LoadBalance.SMALLEST_CLIENT_ID;
+
+		private LoadBalance tcpLoadBalance = LoadBalance.SMALLEST_CLIENT_ID;
+
 		private Builder() {
 		}
 
@@ -358,12 +370,23 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			return this;
 		}
 
+		public Builder httpLoadBalance(LoadBalance httpLoadBalance) {
+			this.httpLoadBalance = httpLoadBalance;
+			return this;
+		}
+
+		public Builder tcpLoadBalance(LoadBalance tcpLoadBalance) {
+			this.tcpLoadBalance = tcpLoadBalance;
+			return this;
+		}
+
 		public SluiceServerProperties build() {
 			return new SluiceServerProperties(this.token == null ? "" : this.token, this.tokenFile,
 					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort, this.dataTlsBundle,
 					this.tcpPortRange, this.accessLog == null ? AccessLog.builder().build() : this.accessLog,
 					this.node == null ? Node.builder().build() : this.node,
-					this.cluster == null ? Cluster.builder().build() : this.cluster);
+					this.cluster == null ? Cluster.builder().build() : this.cluster, this.httpLoadBalance,
+					this.tcpLoadBalance);
 		}
 
 	}

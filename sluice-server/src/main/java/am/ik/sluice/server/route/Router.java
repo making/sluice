@@ -4,8 +4,6 @@ import org.jspecify.annotations.Nullable;
 
 import java.util.Optional;
 
-import org.springframework.stereotype.Component;
-
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
@@ -23,7 +21,6 @@ import am.ik.sluice.v1.proto.Upstream;
  * and always returns the first registered target; no load balancing is performed,
  * mirroring the original behavior.
  */
-@Component
 public class Router {
 
 	/**
@@ -181,6 +178,23 @@ public class Router {
 
 	private final Object lock = new Object();
 
+	private final LoadBalanceStrategy httpStrategy;
+
+	private final LoadBalanceStrategy tcpStrategy;
+
+	/**
+	 * The load balancing strategies default to {@link LoadBalance#SMALLEST_CLIENT_ID}
+	 * (deterministic across nodes).
+	 */
+	public Router() {
+		this(LoadBalance.SMALLEST_CLIENT_ID, LoadBalance.SMALLEST_CLIENT_ID);
+	}
+
+	public Router(LoadBalance httpLoadBalance, LoadBalance tcpLoadBalance) {
+		this.httpStrategy = httpLoadBalance.instance();
+		this.tcpStrategy = tcpLoadBalance.instance();
+	}
+
 	/**
 	 * (Re-)registers the upstreams announced by a client. Any previous entry for the
 	 * client is replaced, so re-announcement after reconnect is idempotent.
@@ -263,39 +277,30 @@ public class Router {
 	/**
 	 * Resolves the route for the given Host header value. Exact match first, then the
 	 * host without its port, then the catch-all entry. When several clients serve the
-	 * same domain the one with the smallest client id wins -- deterministic across nodes,
-	 * since in fan-out mode every node holds every client.
+	 * same domain the configured http load balancing strategy picks the target (the
+	 * default, smallest client id, is deterministic across nodes -- in fan-out mode every
+	 * node holds every client).
 	 */
 	public Optional<Route> lookup(@Nullable String host) {
 		for (String candidate : candidates(host)) {
 			List<Target> targets = this.byDomain.get(candidate);
 			if (targets != null && !targets.isEmpty()) {
-				return Optional.of(toRoute(winner(targets)));
+				return Optional.of(toRoute(this.httpStrategy.pick(candidate, targets)));
 			}
 		}
 		return Optional.empty();
 	}
 
 	/**
-	 * Resolves the route for the given public listen port (raw TCP routing); ties are
-	 * broken deterministically by client id (see {@link #lookup}).
+	 * Resolves the route for the given public listen port (raw TCP routing); the
+	 * configured tcp load balancing strategy picks the target (see {@link #lookup}).
 	 */
 	public Optional<Route> lookupByPort(int port) {
 		List<Target> targets = this.byPort.get(port);
 		if (targets == null || targets.isEmpty()) {
 			return Optional.empty();
 		}
-		return Optional.of(toRoute(winner(targets)));
-	}
-
-	private static Target winner(List<Target> targets) {
-		Target best = targets.get(0);
-		for (Target target : targets) {
-			if (target.clientId().compareTo(best.clientId()) < 0) {
-				best = target;
-			}
-		}
-		return best;
+		return Optional.of(toRoute(this.tcpStrategy.pick(Integer.toString(port), targets)));
 	}
 
 	private static Route toRoute(Target target) {
