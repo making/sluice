@@ -16,10 +16,12 @@ import java.util.concurrent.ConcurrentMap;
 import am.ik.sluice.v1.proto.Upstream;
 
 /**
- * Route table mapping public domains to client upstreams (the port of inlets'
- * pkg/router). Lookup falls back to the catch-all entry registered with an empty domain
- * and always returns the first registered target; no load balancing is performed,
- * mirroring the original behavior.
+ * Route table mapping public domains and listen ports to client upstreams (the port of
+ * inlets' pkg/router). An upstream with a listen port is a tcp route reached only through
+ * that port; its host takes no part in Host / SNI routing. Every other upstream is an
+ * http route keyed by its domain, and lookup falls back to the catch-all entry registered
+ * with an empty domain. When several clients serve one key the configured load balancing
+ * strategy picks the target.
  */
 public class Router {
 
@@ -223,9 +225,11 @@ public class Router {
 		synchronized (this.lock) {
 			removeLocked(clientId);
 			for (Target target : targets) {
-				this.byDomain.compute(target.domain(), (k, existing) -> append(existing, target));
 				if (target.listenPort() > 0) {
 					this.byPort.compute(target.listenPort(), (k, existing) -> append(existing, target));
+				}
+				else {
+					this.byDomain.compute(target.domain(), (k, existing) -> append(existing, target));
 				}
 			}
 			this.byClient.put(clientId, List.copyOf(targets));
@@ -248,9 +252,11 @@ public class Router {
 			return;
 		}
 		for (Target target : old) {
-			this.byDomain.compute(target.domain(), (k, existing) -> without(existing, clientId));
 			if (target.listenPort() > 0) {
 				this.byPort.compute(target.listenPort(), (k, existing) -> without(existing, clientId));
+			}
+			else {
+				this.byDomain.compute(target.domain(), (k, existing) -> without(existing, clientId));
 			}
 		}
 	}

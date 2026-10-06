@@ -220,4 +220,33 @@ class RouterTest {
 		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c2");
 	}
 
+	private static Upstream tcpUpstream(String host, String targetUrl, int listenPort) {
+		return Upstream.newBuilder().setHost(host).setTargetUrl(targetUrl).setListenPort(listenPort).build();
+	}
+
+	@Test
+	void tcpUpstreamIsNotAnHttpRouteForItsHost() {
+		Router router = new Router();
+		router.register("c1", List.of(tcpUpstream("db.local", "tcp://127.0.0.1:5432", 15432)));
+		assertThat(router.lookup("db.local")).isEmpty();
+		assertThat(router.lookupByPort(15432).orElseThrow().address()).isEqualTo("127.0.0.1:5432");
+	}
+
+	@Test
+	void tcpUpstreamWithoutHostDoesNotBecomeTheCatchAll() {
+		Router router = new Router();
+		router.register("c1", List.of(tcpUpstream("", "tcp://127.0.0.1:7", 10007)));
+		assertThat(router.lookup("anything.example")).isEmpty();
+		assertThat(router.lookupByPort(10007)).isPresent();
+	}
+
+	@Test
+	void httpLookupIgnoresATcpUpstreamDeclaredFirstOnTheSameHost() {
+		Router router = new Router();
+		router.register("c1", List.of(tcpUpstream("dual.local", "tcp://127.0.0.1:6000", 16000),
+				upstream("dual.local", "http://127.0.0.1:3000")));
+		assertThat(router.lookup("dual.local").orElseThrow().address()).isEqualTo("127.0.0.1:3000");
+		assertThat(router.lookupByPort(16000).orElseThrow().address()).isEqualTo("127.0.0.1:6000");
+	}
+
 }

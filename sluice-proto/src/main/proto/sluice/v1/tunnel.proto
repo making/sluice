@@ -123,6 +123,8 @@ message Upstream {
   // SNI, the upstream terminates TLS) instead of terminated on the data plane.
   bool tls_passthrough = 4;
   // Public port the server listens on to relay raw TCP connections for this upstream
-  // verbatim (routed by listen port, no head parsing; 0 disables port routing).
+  // verbatim (routed by listen port, no head parsing; 0 disables port routing). An
+  // upstream with a listen port is reached only through it: `host` is then not used
+  // for Host / SNI routing on the data port.
   uint32 listen_port = 5;
 }

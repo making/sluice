@@ -130,7 +130,9 @@ TLS passthrough routed by SNI: see "SNI routing" below.
 Upstreams with `listen-port` are routed by the listen port instead of the connection
 head: the server opens one listener per advertised port and relays every accepted
 connection verbatim -- no head parsing, no rewriting -- so any TCP protocol (ssh,
-postgres, redis, ...) tunnels through, not just HTTP.
+postgres, redis, ...) tunnels through, not just HTTP. Such an upstream is reached only
+through its port: its `host` takes no part in Host / SNI routing on the data port, so it
+neither captures http traffic for that host nor becomes the catch-all when empty.
 
 ```
 # terminal 1: any TCP server, e.g. redis
