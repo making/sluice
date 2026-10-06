@@ -273,13 +273,13 @@ Deployment requirements (independent of the front end):
 ```
 # terminal 1/2: two nodes sharing one membership list and token
 java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
-  --sluice.token=SECRET --sluice.node.id=alpha \
+  --sluice.token=SECRET --sluice.node.id=node-1 \
   --spring.grpc.server.port=8101 --sluice.data-port=8100 --server.port=18180 \
-  --sluice.cluster.nodes=alpha=grpc://127.0.0.1:8101,beta=grpc://127.0.0.1:8201
+  --sluice.cluster.nodes=node-1=grpc://127.0.0.1:8101,node-2=grpc://127.0.0.1:8201
 java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
-  --sluice.token=SECRET --sluice.node.id=beta \
+  --sluice.token=SECRET --sluice.node.id=node-2 \
   --spring.grpc.server.port=8201 --sluice.data-port=8200 --server.port=18181 \
-  --sluice.cluster.nodes=alpha=grpc://127.0.0.1:8101,beta=grpc://127.0.0.1:8201
+  --sluice.cluster.nodes=node-1=grpc://127.0.0.1:8101,node-2=grpc://127.0.0.1:8201
 
 # terminal 3: client -- server-url is only the bootstrap; the node list is learned
 # via ListNodes and one stream is opened per node
@@ -302,12 +302,12 @@ flowchart LR
         vip["data plane :any node"]
     end
 
-    subgraph sa["sluice-server node alpha"]
+    subgraph sa["sluice-server node-1"]
         direction TB
         dpsa["DataProxyServer :8100"]
     end
 
-    subgraph sb["sluice-server node beta"]
+    subgraph sb["sluice-server node-2"]
         direction TB
         dpsb["DataProxyServer :8200"]
     end
@@ -323,13 +323,13 @@ flowchart LR
     vip -- ":8100" --> dpsa
     vip -- ":8200" --> dpsb
 
-    tc <-. "stream alpha<br/>CONNECT / DATA / ADVERTISE" .-> sa
-    tc <-. "stream beta" .-> sb
+    tc <-. "stream node-1<br/>CONNECT / DATA / ADVERTISE" .-> sa
+    tc <-. "stream node-2" .-> sb
     sa <-. "MEMBERSHIP_UPDATE / DRAIN" .-> tc
     sb <-. "MEMBERSHIP_UPDATE / DRAIN" .-> tc
 
-    dpsa -- "CONNECT via alpha stream" --> tc
-    dpsb -- "CONNECT via beta stream" --> tc
+    dpsa -- "CONNECT via node-1 stream" --> tc
+    dpsb -- "CONNECT via node-2 stream" --> tc
     tc --- lc
     lc -- TCP --> upstream
 ```

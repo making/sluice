@@ -58,7 +58,7 @@ class ClusterFanoutE2ETests {
 
 	private @org.jspecify.annotations.Nullable ConfigurableApplicationContext clientContext;
 
-	private final String[] nodeNames = { "alpha", "beta", "gamma" };
+	private final String[] nodeNames = { "node-1", "node-2", "node-3" };
 
 	@AfterEach
 	void stopApps() {
