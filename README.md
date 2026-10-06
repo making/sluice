@@ -1,12 +1,10 @@
-sluice
-======
+# sluice
 
 HTTP tunnel over a gRPC bidirectional stream, built on Spring Boot 4.1 and Spring gRPC.
 
 A single gRPC bidi stream multiplexes virtual TCP connections (`conn_id`). The data plane is a raw TCP proxy: only the Host header of the first request is inspected, so WebSocket upgrades and HTTP keep-alive pass through transparently. All blocking I/O runs on virtual threads; outbound frames flow through a bounded queue honoring gRPC flow control.
 
-Architecture
-------------
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -60,14 +58,12 @@ sequenceDiagram
     S -->> B: response
 ```
 
-
 - one bidi stream per client; each proxied TCP connection becomes a `conn_id` on that stream
 - server: accept, route by `Host`, `VirtualConnection` + `CONNECT`, then raw relay (`SocketRelay`, one virtual thread per direction)
 - client: `CONNECT`, dial the local upstream (strict forwarding), same raw relay; upstream URLs with `https://` are dialed with TLS (trust-all)
 - flow control: bounded queues end to end; the gRPC send path honors `isReady()` on a dedicated sender thread
 
-Modules
--------
+## Modules
 
 - `sluice-proto` - `.proto` contract, generated stubs, and the shared tunnel primitives (`VirtualConnection`, `SessionSender`, `SocketRelay`)
 - `sluice-server` - exit node: gRPC control plane (`spring.grpc.server.port`, default 8001) + raw TCP data plane (`sluice.data-port`, default 8000) + actuator (`server.port`, default 8081)
@@ -75,80 +71,87 @@ Modules
 - `sluice-it` - full stack integration tests running the real server and client applications in one JVM (proxying, reconnect after server restart, wrong-token rejection)
 - `sluice-example-upstream` - minimal sample upstream for manual checks (`It works` over http/1.1 and h2c)
 
-Build
------
+## Build
 
-    ./mvnw verify
+```
+./mvnw verify
+```
 
 Requires JDK 25+.
 
 Build the executable jars first (the `-exec.jar` files below are produced by this):
 
-    ./mvnw -DskipTests package
+```
+./mvnw -DskipTests package
+```
 
-Run
----
+## Run
 
-    # terminal 1: upstream (sample server speaking http/1.1 and h2c on one port)
-    java -jar sluice-example-upstream/target/sluice-example-upstream-0.0.1-SNAPSHOT-exec.jar 31080
+```
+# terminal 1: upstream (sample server speaking http/1.1 and h2c on one port)
+java -jar sluice-example-upstream/target/sluice-example-upstream-0.0.1-SNAPSHOT-exec.jar 31080
 
-    # terminal 2: server
-    java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
-      --sluice.token=SECRET
+# terminal 2: server
+java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.token=SECRET
 
-    # terminal 3: client
-    java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
-      --sluice.server-url=grpc://127.0.0.1:8001 \
-      '--sluice.client.upstream[0]'.host=demo.local \
-      '--sluice.client.upstream[0]'.target=http://127.0.0.1:31080 \
-      --sluice.token=SECRET
+# terminal 3: client
+java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.server-url=grpc://127.0.0.1:8001 \
+  '--sluice.client.upstream[0]'.host=demo.local \
+  '--sluice.client.upstream[0]'.target=http://127.0.0.1:31080 \
+  --sluice.token=SECRET
 
-    # terminal 4: request through the tunnel (routed by the Host header / :authority)
-    curl -H 'Host: demo.local' http://127.0.0.1:8000/
-    curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:8000/
+# terminal 4: request through the tunnel (routed by the Host header / :authority)
+curl -H 'Host: demo.local' http://127.0.0.1:8000/
+curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:8000/
+```
 
 `sluice.server-url` schemes: `grpc://` (plaintext) / `grpcs://` (TLS; `--sluice.insecure=true` skips verification).
 
 TLS termination on the data port (same upstream / server / client):
 
-    # self-signed cert registered as an SSL bundle, then restart the server with
-    #   --sluice.data-tls-bundle=data-plane
-    #   --spring.ssl.bundle.pem.data-plane.keystore.certificate=cert.pem
-    #   --spring.ssl.bundle.pem.data-plane.keystore.private-key=cert-key.pem
-    openssl req -x509 -newkey rsa:2048 -keyout cert-key.pem -out cert.pem -days 1 -nodes -subj /CN=localhost
+```
+# self-signed cert registered as an SSL bundle, then restart the server with
+#   --sluice.data-tls-bundle=data-plane
+#   --spring.ssl.bundle.pem.data-plane.keystore.certificate=cert.pem
+#   --spring.ssl.bundle.pem.data-plane.keystore.private-key=cert-key.pem
+openssl req -x509 -newkey rsa:2048 -keyout cert-key.pem -out cert.pem -days 1 -nodes -subj /CN=localhost
 
-    # h2 over TLS (ALPN) / http/1.1 fallback / plaintext on the same port
-    curl --http2 -k -H 'Host: demo.local' https://127.0.0.1:8000/ -v -o /dev/null 2>&1 | grep 'using HTTP/2' -A2
-    curl --http1.1 -k -H 'Host: demo.local' https://127.0.0.1:8000/
+# h2 over TLS (ALPN) / http/1.1 fallback / plaintext on the same port
+curl --http2 -k -H 'Host: demo.local' https://127.0.0.1:8000/ -v -o /dev/null 2>&1 | grep 'using HTTP/2' -A2
+curl --http1.1 -k -H 'Host: demo.local' https://127.0.0.1:8000/
+```
 
 TLS passthrough routed by SNI: see "SNI routing" below.
 
-TCP port routing
-----------------
+## TCP port routing
 
 Upstreams with `listen-port` are routed by the listen port instead of the connection
 head: the server opens one listener per advertised port and relays every accepted
 connection verbatim -- no head parsing, no rewriting -- so any TCP protocol (ssh,
 postgres, redis, ...) tunnels through, not just HTTP.
 
-    # terminal 1: any TCP server, e.g. redis
-    redis-server --port 6379
+```
+# terminal 1: any TCP server, e.g. redis
+redis-server --port 6379
 
-    # terminal 2: server (listeners bind on the data host)
-    java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
-      --sluice.token=SECRET
+# terminal 2: server (listeners bind on the data host)
+java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.token=SECRET
 
-    # terminal 3: client; the upstream target is a tcp:// URL
-    java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
-      --sluice.server-url=grpc://127.0.0.1:8001 \
-      '--sluice.client.upstream[0]'.host=redis.local \
-      '--sluice.client.upstream[0]'.target=tcp://127.0.0.1:6379 \
-      '--sluice.client.upstream[0]'.listen-port=16379 \
-      --sluice.token=SECRET
+# terminal 3: client; the upstream target is a tcp:// URL
+java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.server-url=grpc://127.0.0.1:8001 \
+  '--sluice.client.upstream[0]'.host=redis.local \
+  '--sluice.client.upstream[0]'.target=tcp://127.0.0.1:6379 \
+  '--sluice.client.upstream[0]'.listen-port=16379 \
+  --sluice.token=SECRET
 
-    # terminal 4: connect to the advertised port
-    redis-cli -p 16379 ping
-    # -> PONG
+# terminal 4: connect to the advertised port
+redis-cli -p 16379 ping
+# -> PONG
+```
 
 The listener is bound when the client advertises and released on disconnect; the
 server acknowledges the advertisement and reports back the listen ports it could
@@ -157,8 +160,7 @@ already taken) -- the client then closes the stream and re-advertises with
 backoff. The listen ports must be exposed on the host (`docker -p`, firewall) --
 the deployment delta against the single data port.
 
-SNI routing
------------
+## SNI routing
 
 Where TCP port routing keys on the listen port, these two variants route a TLS
 connection by the server name of its ClientHello:
@@ -174,31 +176,32 @@ connection by the server name of its ClientHello:
 
 Passthrough example, all four terminals:
 
-    # terminal 1: a TLS upstream (any TLS server works; here openssl's demo server
-    #   serving the current directory over HTTPS)
-    echo 'it-works-sni' > index.html
-    openssl req -x509 -newkey rsa:2048 -keyout cert-key.pem -out cert.pem -days 1 -nodes -subj /CN=demo.local
-    openssl s_server -accept 34443 -cert cert.pem -key cert-key.pem -WWW
+```
+# terminal 1: a TLS upstream (any TLS server works; here openssl's demo server
+#   serving the current directory over HTTPS)
+echo 'it-works-sni' > index.html
+openssl req -x509 -newkey rsa:2048 -keyout cert-key.pem -out cert.pem -days 1 -nodes -subj /CN=demo.local
+openssl s_server -accept 34443 -cert cert.pem -key cert-key.pem -WWW
 
-    # terminal 2: server (no TLS configuration on the data port)
-    java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
-      --sluice.token=SECRET
+# terminal 2: server (no TLS configuration on the data port)
+java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.token=SECRET
 
-    # terminal 3: client; tls-passthrough relays the TLS records as-is
-    java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
-      --sluice.server-url=grpc://127.0.0.1:8001 \
-      '--sluice.client.upstream[0]'.host=demo.local \
-      '--sluice.client.upstream[0]'.target=tcp://127.0.0.1:34443 \
-      '--sluice.client.upstream[0]'.tls-passthrough=true \
-      --sluice.token=SECRET
+# terminal 3: client; tls-passthrough relays the TLS records as-is
+java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.server-url=grpc://127.0.0.1:8001 \
+  '--sluice.client.upstream[0]'.host=demo.local \
+  '--sluice.client.upstream[0]'.target=tcp://127.0.0.1:34443 \
+  '--sluice.client.upstream[0]'.tls-passthrough=true \
+  --sluice.token=SECRET
 
-    # terminal 4: request by SNI; --resolve sends ClientHello server_name=demo.local
-    #   to the data port
-    curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
-    # -> it-works-sni
+# terminal 4: request by SNI; --resolve sends ClientHello server_name=demo.local
+#   to the data port
+curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
+# -> it-works-sni
+```
 
-Configuration (server)
-----------------------
+## Configuration (server)
 
 | Property | Default | Description |
 |---|---|---|
@@ -222,8 +225,7 @@ Configuration (server)
 | `spring.grpc.server.port` | `8001` | gRPC control plane port |
 | `server.port` | `8081` | actuator (health / info / prometheus) |
 
-Configuration (client)
-----------------------
+## Configuration (client)
 
 | Property | Default | Description |
 |---|---|---|
@@ -241,8 +243,7 @@ Configuration (client)
 | `sluice.strict-forwarding` | `true` | only dial upstreams present in the map |
 | `management.server.port` | `9001` | actuator port |
 
-gRPC keepalive
---------------
+## gRPC keepalive
 
 The tunnel is one long-lived gRPC stream; NAT / load balancers silently drop idle
 connections, so both sides keep it warm with HTTP/2 pings and the server-side values are
@@ -259,8 +260,7 @@ provides liveness. The frame type stays in the proto for future use and is handl
 no-op on both sides. `GrpcKeepAliveTest` (sluice-it) guards the behavior with a 1s-ping
 channel.
 
-Cluster (scale-out)
--------------------
+## Cluster (scale-out)
 
 Run N server nodes: every client keeps one tunnel stream to every node, so each node holds
 the full route table locally -- no shared store, no inter-node hop.
@@ -270,27 +270,29 @@ Deployment requirements (independent of the front end):
 - each node's control plane is reachable from clients at its own address (per-node URL)
 - data plane connections may land on any node (plain L4 balancing is enough)
 
-    # terminal 1/2: two nodes sharing one membership list and token
-    java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
-      --sluice.token=SECRET --sluice.node.id=alpha \
-      --spring.grpc.server.port=8101 --sluice.data-port=8100 --server.port=18180 \
-      --sluice.cluster.nodes=alpha=grpc://127.0.0.1:8101,beta=grpc://127.0.0.1:8201
-    java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
-      --sluice.token=SECRET --sluice.node.id=beta \
-      --spring.grpc.server.port=8201 --sluice.data-port=8200 --server.port=18181 \
-      --sluice.cluster.nodes=alpha=grpc://127.0.0.1:8101,beta=grpc://127.0.0.1:8201
+```
+# terminal 1/2: two nodes sharing one membership list and token
+java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.token=SECRET --sluice.node.id=alpha \
+  --spring.grpc.server.port=8101 --sluice.data-port=8100 --server.port=18180 \
+  --sluice.cluster.nodes=alpha=grpc://127.0.0.1:8101,beta=grpc://127.0.0.1:8201
+java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.token=SECRET --sluice.node.id=beta \
+  --spring.grpc.server.port=8201 --sluice.data-port=8200 --server.port=18181 \
+  --sluice.cluster.nodes=alpha=grpc://127.0.0.1:8101,beta=grpc://127.0.0.1:8201
 
-    # terminal 3: client -- server-url is only the bootstrap; the node list is learned
-    # via ListNodes and one stream is opened per node
-    java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
-      --sluice.server-url=grpc://127.0.0.1:8101 --sluice.client.id=client-1 \
-      '--sluice.client.upstream[0]'.host=demo.local \
-      '--sluice.client.upstream[0]'.target=http://127.0.0.1:31080 \
-      --sluice.token=SECRET
+# terminal 3: client -- server-url is only the bootstrap; the node list is learned
+# via ListNodes and one stream is opened per node
+java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.server-url=grpc://127.0.0.1:8101 --sluice.client.id=client-1 \
+  '--sluice.client.upstream[0]'.host=demo.local \
+  '--sluice.client.upstream[0]'.target=http://127.0.0.1:31080 \
+  --sluice.token=SECRET
 
-    # terminal 4: either node serves the route
-    curl -H 'Host: demo.local' http://127.0.0.1:8100/
-    curl -H 'Host: demo.local' http://127.0.0.1:8200/
+# terminal 4: either node serves the route
+curl -H 'Host: demo.local' http://127.0.0.1:8100/
+curl -H 'Host: demo.local' http://127.0.0.1:8200/
+```
 
 ```mermaid
 flowchart LR
@@ -358,8 +360,7 @@ Behavior:
 Without `sluice.cluster.nodes` the server runs single-node and nothing above applies
 (`ListNodes` returns just the node itself).
 
-Health / metrics
-----------------
+## Health / metrics
 
 - server `GET /actuator/health` - liveness, UP while the process lives; details `clients`
   (connected tunnel clients) and `draining`. `/actuator/health/readiness` is DOWN during the
@@ -368,16 +369,19 @@ Health / metrics
   the `nodes` detail lists each node's stream state
 - `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`
 
-Docker
-------
+## Docker
 
 Images are built with Cloud Native Buildpacks (Spring Boot plugin, no Dockerfile):
 
-    ./mvnw -pl sluice-server -am package spring-boot:build-image -DskipTests
-    ./mvnw -pl sluice-client -am package spring-boot:build-image -DskipTests
+```
+./mvnw -pl sluice-server -am package spring-boot:build-image -DskipTests
+./mvnw -pl sluice-client -am package spring-boot:build-image -DskipTests
+```
 
 This produces `sluice/server:latest` and `sluice/client:latest`. Run:
 
-    docker run -p 8000:8000 -p 8001:8001 sluice/server --sluice.token=SECRET
-    docker run sluice/client --sluice.server-url=grpc://host.docker.internal:8001 \
-      '--sluice.client.upstream[0]'.host=demo.local '--sluice.client.upstream[0]'.target=http://host.docker.internal:3000 --sluice.token=SECRET
+```
+docker run -p 8000:8000 -p 8001:8001 sluice/server --sluice.token=SECRET
+docker run sluice/client --sluice.server-url=grpc://host.docker.internal:8001 \
+  '--sluice.client.upstream[0]'.host=demo.local '--sluice.client.upstream[0]'.target=http://host.docker.internal:3000 --sluice.token=SECRET
+```
