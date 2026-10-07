@@ -73,6 +73,11 @@
 					<version>0.2.1</version>
 				</plugin>
 				<plugin>
+					<groupId>com.github.blutorange</groupId>
+					<artifactId>closure-compiler-maven-plugin</artifactId>
+					<version>3.0.1</version>
+				</plugin>
+				<plugin>
 					<groupId>am.ik.maven</groupId>
 					<artifactId>nullability-maven-plugin</artifactId>
 					<version>0.5.2</version>

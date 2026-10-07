@@ -135,6 +135,40 @@
 				<artifactId>nullability-maven-plugin</artifactId>
 			</plugin>
 			<plugin>
+				<groupId>com.github.blutorange</groupId>
+				<artifactId>closure-compiler-maven-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>minify-js</id>
+						<phase>generate-resources</phase>
+						<goals>
+							<goal>minify</goal>
+						</goals>
+						<configuration>
+							<baseSourceDir>${basedir}/src/main/resources</baseSourceDir>
+							<baseTargetDir>${project.build.outputDirectory}</baseTargetDir>
+							<sourceDir>static/console/js</sourceDir>
+							<targetDir>static/console/js</targetDir>
+							<outputFilename>console.min.js</outputFilename>
+							<includes>
+								<include>console.js</include>
+							</includes>
+							<!--
+							  Optimization level: SIMPLE is safest for code touching
+							  htmx's public API by string name. languageOut=NO_TRANSPILE
+							  preserves modern syntax instead of down-compiling to ES5.
+							  vendor/htmx.min.js is deliberately NOT bundled: htmx 4 uses
+							  private class fields (#foo), which Closure Compiler cannot
+							  parse; it ships as its own <script> tag.
+							-->
+							<closureCompilationLevel>SIMPLE_OPTIMIZATIONS</closureCompilationLevel>
+							<closureLanguageIn>ECMASCRIPT_NEXT</closureLanguageIn>
+							<closureLanguageOut>NO_TRANSPILE</closureLanguageOut>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
 				<!-- pre-compressed .br / .gz siblings of the console assets
 				     (served via spring.web.resources.chain.compressed) -->
 				<groupId>am.ik.maven</groupId>
