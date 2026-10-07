@@ -148,10 +148,10 @@ Multi-arch (amd64 / aarch64) JVM and native images are published to ghcr.io on e
 `ghcr.io/making/sluice/sluice-client:{jvm,native}` (immutable `jvm_<sha>` / `native_<sha>` tags too).
 
 ```
-docker run --rm --name sluice-server -p 8000:8000 -p 8001:8001 \
+docker run --rm --pull always --name sluice-server -p 8000:8000 -p 8001:8001 -p 8081:8081 \
   ghcr.io/making/sluice/sluice-server:native --sluice.token=SECRET
 
-docker run --rm --name sluice-client \
+docker run --rm --pull always --name sluice-client \
   -e SLUICE_SERVER_URL=grpc://host.docker.internal:8001 \
   -e SLUICE_TOKEN=SECRET \
   -e SLUICE_CLIENT_UPSTREAM_0_HOST=demo.local \
