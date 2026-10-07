@@ -5,10 +5,7 @@ import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.URI;
 import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -39,7 +36,10 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.http.MediaType;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.core.task.TaskExecutor;
+import org.springframework.test.web.servlet.client.RestTestClient;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -275,20 +275,24 @@ class HttpPostE2ETest {
 	@Test
 	void httpsPostOverTlsTerminationIsRelayed() throws Exception {
 		if (this.tlsClient == null) {
-			// HttpClient derives the Host header from the URI, so the upstream is
+			// the client derives the Host header from the URI, so the upstream is
 			// registered as localhost
 			this.tlsClient = this.startClient("localhost", "http://127.0.0.1:" + h1Upstream.getAddress().getPort());
 		}
-		HttpClient client = HttpClient.newBuilder()
+		HttpClient httpClient = HttpClient.newBuilder()
 			.version(HttpClient.Version.HTTP_1_1)
 			.sslContext(clientSslContext())
 			.build();
-		HttpResponse<String> response = client
-			.send(HttpRequest.newBuilder(URI.create("https://localhost:" + dataPort + "/"))
-				.POST(HttpRequest.BodyPublishers.ofString(POST_BODY))
-				.build(), HttpResponse.BodyHandlers.ofString());
-		assertThat(response.statusCode()).isEqualTo(200);
-		assertThat(response.body()).isEqualTo(POST_BODY);
+		RestTestClient client = RestTestClient.bindToServer(new JdkClientHttpRequestFactory(httpClient)).build();
+		client.post()
+			.uri("https://localhost:" + dataPort + "/")
+			.contentType(MediaType.TEXT_PLAIN)
+			.body(POST_BODY)
+			.exchange()
+			.expectStatus()
+			.isOk()
+			.expectBody(String.class)
+			.isEqualTo(POST_BODY);
 	}
 
 }

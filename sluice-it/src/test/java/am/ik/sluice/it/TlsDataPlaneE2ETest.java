@@ -4,12 +4,9 @@ import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.URI;
 import com.sun.net.httpserver.HttpServer;
 
 import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -41,6 +38,9 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.core.task.TaskExecutor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
+import org.springframework.test.web.servlet.client.RestTestClient;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -235,34 +235,36 @@ class TlsDataPlaneE2ETest {
 		}
 	}
 
+	/** A RestTestClient bound to the data plane over TLS with the given HTTP version. */
+	private static RestTestClient tlsRestClient(HttpClient.Version version) throws Exception {
+		HttpClient httpClient = HttpClient.newBuilder().version(version).sslContext(clientSslContext()).build();
+		return RestTestClient.bindToServer(new JdkClientHttpRequestFactory(httpClient)).build();
+	}
+
 	@Test
 	void httpsHttp1_1Fallback() throws Exception {
 		this.startClient();
-		HttpClient client = HttpClient.newBuilder()
-			.version(HttpClient.Version.HTTP_1_1)
-			.sslContext(clientSslContext())
-			.build();
-		HttpResponse<String> response = client.send(
-				HttpRequest.newBuilder(URI.create("https://127.0.0.1:" + dataPort + "/")).GET().build(),
-				HttpResponse.BodyHandlers.ofString());
-		assertThat(response.statusCode()).isEqualTo(200);
-		assertThat(response.body()).isEqualTo(H1_BODY);
+		tlsRestClient(HttpClient.Version.HTTP_1_1).get()
+			.uri("https://127.0.0.1:" + dataPort + "/")
+			.exchange()
+			.expectStatus()
+			.isOk()
+			.expectBody(String.class)
+			.isEqualTo(H1_BODY);
 	}
 
 	@Test
 	void unroutedHostGetsTheNoRoutePageOverH2() throws Exception {
 		this.startClient();
-		HttpClient client = HttpClient.newBuilder()
-			.version(HttpClient.Version.HTTP_2)
-			.sslContext(clientSslContext())
-			.build();
-		HttpResponse<String> response = client.send(
-				HttpRequest.newBuilder(URI.create("https://localhost:" + dataPort + "/")).GET().build(),
-				HttpResponse.BodyHandlers.ofString());
-		assertThat(response.version()).isEqualTo(HttpClient.Version.HTTP_2);
-		assertThat(response.statusCode()).isEqualTo(503);
-		assertThat(response.headers().firstValue("content-type")).hasValue("text/html; charset=utf-8");
-		assertThat(response.body()).startsWith("<!DOCTYPE html>").endsWith("</html>\n");
+		tlsRestClient(HttpClient.Version.HTTP_2).get()
+			.uri("https://localhost:" + dataPort + "/")
+			.exchange()
+			.expectStatus()
+			.isEqualTo(HttpStatus.SERVICE_UNAVAILABLE)
+			.expectHeader()
+			.valueEquals("content-type", "text/html; charset=utf-8")
+			.expectBody(String.class)
+			.value(body -> assertThat(body).startsWith("<!DOCTYPE html>").endsWith("</html>\n"));
 	}
 
 	@Test
