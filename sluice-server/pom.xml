@@ -90,7 +90,6 @@
 				<configuration>
 					<classifier>exec</classifier>
 					<image>
-						<name>sluice/server:latest</name>
 						<env>
 							<BP_OCI_SOURCE>https://github.com/${env.GITHUB_REPOSITORY}</BP_OCI_SOURCE>
 							<BP_OCI_REVISION>${env.GITHUB_SHA}</BP_OCI_REVISION>
