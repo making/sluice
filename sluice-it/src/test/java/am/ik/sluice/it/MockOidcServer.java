@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
@@ -24,7 +25,9 @@ import com.sun.net.httpserver.HttpServer;
 /**
  * Minimal OIDC provider backed by the JDK {@link HttpServer}. It implements just enough
  * of the authorization code flow for Spring Security's {@code oauth2Login}: discovery,
- * authorization (immediate consent redirect), token (an RS256-signed id token) and JWKS.
+ * authorization (immediate consent redirect), token (an RS256-signed id token) and JWKS,
+ * plus optionally RP-initiated logout (an end session endpoint that redirects straight
+ * back).
  */
 class MockOidcServer implements AutoCloseable {
 
@@ -38,10 +41,23 @@ class MockOidcServer implements AutoCloseable {
 
 	private final String clientId;
 
+	private final boolean endSession;
+
 	private volatile @org.jspecify.annotations.Nullable String nonce;
 
+	private volatile Map<String, String> lastLogout = Map.of();
+
 	MockOidcServer(String clientId) {
+		this(clientId, true);
+	}
+
+	/**
+	 * @param endSession whether discovery advertises an end session endpoint (some
+	 * providers, Google among them, do not)
+	 */
+	MockOidcServer(String clientId, boolean endSession) {
 		this.clientId = clientId;
+		this.endSession = endSession;
 		try {
 			this.server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
 		}
@@ -63,6 +79,7 @@ class MockOidcServer implements AutoCloseable {
 		this.server.createContext("/oauth2/jwks", exchange -> json(exchange, jwks()));
 		this.server.createContext("/oauth2/authorize", this::authorize);
 		this.server.createContext("/oauth2/token", this::token);
+		this.server.createContext("/oauth2/logout", this::logout);
 		this.server.setExecutor(Executors.newSingleThreadExecutor());
 		this.server.start();
 	}
@@ -76,6 +93,11 @@ class MockOidcServer implements AutoCloseable {
 		return "http://127.0.0.1:" + this.server.getAddress().getPort();
 	}
 
+	/** Decoded query parameters of the last end session request, empty if none. */
+	Map<String, String> lastLogout() {
+		return this.lastLogout;
+	}
+
 	private String discovery() {
 		Map<String, Object> claims = new LinkedHashMap<>();
 		claims.put("issuer", issuer());
@@ -87,6 +109,9 @@ class MockOidcServer implements AutoCloseable {
 		claims.put("id_token_signing_alg_values_supported", List.of("RS256"));
 		claims.put("scopes_supported", List.of("openid", "email"));
 		claims.put("token_endpoint_auth_methods_supported", List.of("client_secret_basic"));
+		if (this.endSession) {
+			claims.put("end_session_endpoint", issuer() + "/oauth2/logout");
+		}
 		return toJson(claims);
 	}
 
@@ -109,6 +134,24 @@ class MockOidcServer implements AutoCloseable {
 		// Spring Security validates the nonce claim of the id token itself
 		this.nonce = query.get("nonce");
 		exchange.getResponseHeaders().set("Location", redirectUri + "?code=mock-code&state=" + state);
+		exchange.sendResponseHeaders(302, -1);
+	}
+
+	/**
+	 * Ends the (implicit) provider session and redirects to the requested post logout
+	 * redirect URI.
+	 */
+	private void logout(HttpExchange exchange) throws IOException {
+		Map<String, String> query = new LinkedHashMap<>();
+		parseQuery(exchange.getRequestURI().getRawQuery())
+			.forEach((key, value) -> query.put(key, URLDecoder.decode(value, StandardCharsets.UTF_8)));
+		this.lastLogout = Map.copyOf(query);
+		String redirectUri = query.get("post_logout_redirect_uri");
+		if (redirectUri == null) {
+			exchange.sendResponseHeaders(204, -1);
+			return;
+		}
+		exchange.getResponseHeaders().set("Location", redirectUri);
 		exchange.sendResponseHeaders(302, -1);
 	}
 

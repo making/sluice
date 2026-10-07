@@ -110,7 +110,7 @@ class ConsoleAuthE2ETest {
 		}
 	}
 
-	private String csrfOf(HttpResponse<String> loginPage) {
+	private static String csrfOf(HttpResponse<String> loginPage) {
 		return Pattern.compile("name=\"_csrf\" value=\"([^\"]+)\"")
 			.matcher(loginPage.body())
 			.results()
@@ -201,6 +201,9 @@ class ConsoleAuthE2ETest {
 
 		private static final MockOidcServer oidcServer = new MockOidcServer("sluice-console");
 
+		/** A provider without RP-initiated logout. */
+		private static final MockOidcServer localLogoutServer = new MockOidcServer("sluice-console", false);
+
 		@LocalServerPort
 		int port;
 
@@ -215,17 +218,77 @@ class ConsoleAuthE2ETest {
 			registry.add("spring.security.oauth2.client.registration.sluice-console.scope",
 					() -> "openid,profile,email");
 			registry.add("spring.security.oauth2.client.provider.sluice-console.issuer-uri", oidcServer::issuer);
-			// a second provider whose id and name sort in opposite orders
+			// a second provider whose id and name sort in opposite orders, without an
+			// end session endpoint
 			registry.add("spring.security.oauth2.client.registration.aaa.client-id", () -> "sluice-console");
 			registry.add("spring.security.oauth2.client.registration.aaa.client-secret", () -> "it-secret");
 			registry.add("spring.security.oauth2.client.registration.aaa.client-name", () -> "Zeta IdP");
 			registry.add("spring.security.oauth2.client.registration.aaa.scope", () -> "openid,profile,email");
-			registry.add("spring.security.oauth2.client.provider.aaa.issuer-uri", oidcServer::issuer);
+			registry.add("spring.security.oauth2.client.provider.aaa.issuer-uri", localLogoutServer::issuer);
 		}
 
 		@AfterAll
 		static void stopOidc() {
 			oidcServer.close();
+			localLogoutServer.close();
+		}
+
+		private String base() {
+			return "http://127.0.0.1:" + this.port;
+		}
+
+		/**
+		 * A browser-like client: a cookie jar, and redirects followed across the console
+		 * and the mock IdP (the IdP consent is instant).
+		 */
+		private static HttpClient browser() {
+			return HttpClient.newBuilder()
+				.cookieHandler(new CookieManager())
+				.followRedirects(HttpClient.Redirect.ALWAYS)
+				.build();
+		}
+
+		private HttpResponse<String> send(HttpClient client, HttpRequest.Builder request) throws Exception {
+			return client.send(request.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+		}
+
+		private HttpResponse<String> signIn(HttpClient client, String registrationId) throws Exception {
+			HttpResponse<String> console = send(client,
+					HttpRequest.newBuilder(URI.create(base() + "/oauth2/authorization/" + registrationId)));
+			assertThat(console.uri().getPath()).isEqualTo("/console");
+			return console;
+		}
+
+		private HttpResponse<String> signOut(HttpClient client, HttpResponse<String> console) throws Exception {
+			return send(client,
+					HttpRequest.newBuilder(URI.create(base() + "/logout"))
+						.header("Content-Type", "application/x-www-form-urlencoded")
+						.POST(HttpRequest.BodyPublishers.ofString("_csrf=" + urlEncode(csrfOf(console)))));
+		}
+
+		@Test
+		void signOutEndsTheProviderSessionToo() throws Exception {
+			try (HttpClient client = browser()) {
+				HttpResponse<String> console = signIn(client, "sluice-console");
+				HttpResponse<String> loginPage = signOut(client, console);
+				assertThat(loginPage.uri()).hasToString(base() + "/login?logout");
+				assertThat(oidcServer.lastLogout()).containsEntry("post_logout_redirect_uri", base() + "/login?logout")
+					.containsKey("id_token_hint");
+				assertThat(send(client, HttpRequest.newBuilder(URI.create(base() + "/console"))).uri().getPath())
+					.isEqualTo("/login");
+			}
+		}
+
+		@Test
+		void signOutStaysLocalWhenTheProviderHasNoEndSessionEndpoint() throws Exception {
+			try (HttpClient client = browser()) {
+				HttpResponse<String> console = signIn(client, "aaa");
+				HttpResponse<String> loginPage = signOut(client, console);
+				assertThat(loginPage.uri()).hasToString(base() + "/login?logout");
+				assertThat(localLogoutServer.lastLogout()).isEmpty();
+				assertThat(send(client, HttpRequest.newBuilder(URI.create(base() + "/console"))).uri().getPath())
+					.isEqualTo("/login");
+			}
 		}
 
 		@Test

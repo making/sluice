@@ -17,6 +17,7 @@ import org.springframework.boot.security.oauth2.client.autoconfigure.OAuth2Clien
 import org.springframework.boot.security.oauth2.client.autoconfigure.OAuth2ClientPropertiesMapper;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.security.oauth2.client.oidc.web.logout.OidcClientInitiatedLogoutSuccessHandler;
 import org.springframework.security.oauth2.client.registration.ClientRegistration;
 import org.springframework.security.oauth2.client.registration.ClientRegistrationRepository;
 import org.springframework.security.oauth2.client.registration.InMemoryClientRegistrationRepository;
@@ -32,6 +33,7 @@ import org.springframework.security.provisioning.InMemoryUserDetailsManager;
 import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.LoginUrlAuthenticationEntryPoint;
+import org.springframework.security.web.authentication.logout.LogoutSuccessHandler;
 import org.springframework.security.web.util.matcher.RequestHeaderRequestMatcher;
 import org.springframework.security.web.util.matcher.RequestMatcher;
 
@@ -60,9 +62,11 @@ enum AnyRequest implements RequestMatcher {
 @EnableConfigurationProperties(OAuth2ClientProperties.class)
 class ConsoleSecurityConfiguration {
 
+	private static final String LOGGED_OUT_URL = "/login?logout";
+
 	@Bean
-	SecurityFilterChain consoleSecurityFilterChain(HttpSecurity http, SluiceServerProperties properties)
-			throws Exception {
+	SecurityFilterChain consoleSecurityFilterChain(HttpSecurity http, SluiceServerProperties properties,
+			ClientRegistrationRepository clientRegistrationRepository) throws Exception {
 		// @formatter:off
 		http
 			.authorizeHttpRequests(authz -> authz
@@ -78,13 +82,29 @@ class ConsoleSecurityConfiguration {
 				.defaultAuthenticationEntryPointFor(htmxAuthenticationEntryPoint(),
 						new RequestHeaderRequestMatcher("HX-Request", "true"))
 				.defaultAuthenticationEntryPointFor(new LoginUrlAuthenticationEntryPoint("/login"), AnyRequest.INSTANCE))
-			.logout(logout -> logout.logoutUrl("/logout").logoutSuccessUrl("/login?logout").deleteCookies("JSESSIONID"));
+			.logout(logout -> logout.logoutUrl("/logout").logoutSuccessUrl(LOGGED_OUT_URL).deleteCookies("JSESSIONID"));
 		// @formatter:on
 		switch (properties.console().auth().type()) {
 			case SIMPLE -> http.formLogin(form -> form.loginPage("/login").defaultSuccessUrl("/console", true));
-			case OIDC -> http.oauth2Login(oauth2 -> oauth2.loginPage("/login").defaultSuccessUrl("/console", true));
+			case OIDC -> http.oauth2Login(oauth2 -> oauth2.loginPage("/login").defaultSuccessUrl("/console", true))
+				.logout(logout -> logout.logoutSuccessHandler(oidcLogoutSuccessHandler(clientRegistrationRepository)));
 		}
 		return http.build();
+	}
+
+	/**
+	 * RP-initiated logout: signing out of the console also ends the session at the
+	 * provider, which then redirects back to the login page. Otherwise the next "Sign in
+	 * with" would pass straight through the provider. Providers without an end session
+	 * endpoint (e.g. Google) end only the console session.
+	 */
+	private static LogoutSuccessHandler oidcLogoutSuccessHandler(
+			ClientRegistrationRepository clientRegistrationRepository) {
+		OidcClientInitiatedLogoutSuccessHandler handler = new OidcClientInitiatedLogoutSuccessHandler(
+				clientRegistrationRepository);
+		handler.setPostLogoutRedirectUri("{baseUrl}" + LOGGED_OUT_URL);
+		handler.setDefaultTargetUrl(LOGGED_OUT_URL);
+		return handler;
 	}
 
 	/**

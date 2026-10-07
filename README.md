@@ -549,6 +549,11 @@ Multiple providers can be configured simultaneously; the login page shows one bu
 provider. Register the redirect URI `http://<server>:8081/login/oauth2/code/<registration-id>`
 at the provider (e.g. `.../login/oauth2/code/google` for the configuration above).
 
+Signing out of the console also ends the session at the provider (RP-initiated logout) when
+its discovery document advertises an `end_session_endpoint`; register
+`http://<server>:8081/login?logout` as the post-logout redirect URI. Providers without one
+(e.g. Google) end only the console session.
+
 ## Docker
 
 Images are built with Cloud Native Buildpacks (Spring Boot plugin, no Dockerfile). Build deps
