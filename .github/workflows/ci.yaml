@@ -153,6 +153,8 @@ jobs:
         path: ${{ matrix.app }}_${{ matrix.variant }}.yaml
   save-image:
     needs: push-manifest
+    permissions:
+      contents: write
     strategy:
       matrix:
         include:
