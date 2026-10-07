@@ -42,8 +42,10 @@ import org.springframework.core.task.TaskExecutor;
 /**
  * One tunnel stream toward one server node: connects, advertises the upstream map, dials
  * local upstreams on CONNECT, and reconnects with exponential backoff (1s..30s) when the
- * stream drops. The lifecycle of the per-node virtual connections lives here; the fan-out
- * across nodes is the supervisor's ({@link TunnelClient}) concern.
+ * stream drops. Listen ports the server rejects (taken, or outside its range) are
+ * re-advertised on the same stream with the same backoff, so the other routes stay up.
+ * The lifecycle of the per-node virtual connections lives here; the fan-out across nodes
+ * is the supervisor's ({@link TunnelClient}) concern.
  */
 public final class NodeConnection implements AutoCloseable {
 
@@ -62,7 +64,10 @@ public final class NodeConnection implements AutoCloseable {
 	/** Supervisor callbacks; invoked from the receive path, keep them fast. */
 	public interface Listener {
 
-		/** The stream is up and the advertise was acknowledged. */
+		/**
+		 * The stream is up and the first advertise was acknowledged, possibly with
+		 * rejected listen ports.
+		 */
 		void onConnected(NodeConnection connection, String nodeId);
 
 		/** The server pushed a membership update. */
@@ -102,6 +107,8 @@ public final class NodeConnection implements AutoCloseable {
 	private volatile boolean running;
 
 	private volatile boolean connected;
+
+	private volatile long readvertiseBackoff = BACKOFF_INITIAL_SECONDS;
 
 	private volatile @Nullable ManagedChannel channel;
 
@@ -365,6 +372,7 @@ public final class NodeConnection implements AutoCloseable {
 		if (sender == null) {
 			return; // stream failed before starting
 		}
+		this.readvertiseBackoff = BACKOFF_INITIAL_SECONDS;
 		sender.sendAdvertise(this.advertised);
 		closed.await();
 		sender.close();
@@ -431,16 +439,23 @@ public final class NodeConnection implements AutoCloseable {
 					this.nodeId = ackNodeId;
 				}
 				if (rejected.isEmpty()) {
-					// the server acknowledged the advertise: the tunnel is up for real
+					this.readvertiseBackoff = BACKOFF_INITIAL_SECONDS;
+				}
+				else {
+					// the other routes are up; only the rejected ports are retried
+					long delay = this.readvertiseBackoff;
+					this.readvertiseBackoff = Math.min(BACKOFF_MAX_SECONDS, delay * 2);
+					log.warn("[{}] server rejected listen ports {}; re-advertising in {}s", this.key, rejected, delay);
+					this.rejectedAdvertises.increment();
+					readvertiseAfter(delay, closed);
+				}
+				if (!this.connected) {
+					// the first advertise is acknowledged: the tunnel is up for real
 					this.connected = true;
 					log.info("[{}] tunnel established; advertising {} upstream(s)", this.key,
 							this.properties.upstreamTargets().size());
 					this.listener.onConnected(this, this.nodeId);
-					return;
 				}
-				log.warn("server rejected listen ports {} on advertise; closing the stream to re-advertise", rejected);
-				this.rejectedAdvertises.increment();
-				closed.countDown();
 			}
 			case MEMBERSHIP_UPDATE -> this.listener.onMembership(frame.getMembershipUpdate().getNodesList(),
 					frame.getMembershipUpdate().getMembershipVersion());
@@ -458,6 +473,25 @@ public final class NodeConnection implements AutoCloseable {
 				// empty or unknown future body: ignore
 			}
 		}
+	}
+
+	/** Re-sends the advertise on this stream after the delay unless it closes first. */
+	private void readvertiseAfter(long delaySeconds, CountDownLatch closed) {
+		Thread.ofVirtual().name("sluice-readvertise-" + this.key).start(() -> {
+			try {
+				if (closed.await(delaySeconds, TimeUnit.SECONDS)) {
+					return;
+				}
+			}
+			catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				return;
+			}
+			SessionSender sender = this.senderRef.get();
+			if (sender != null) {
+				sender.sendAdvertise(this.advertised);
+			}
+		});
 	}
 
 	private void dial(am.ik.sluice.v1.proto.Connect request, VirtualConnection connection) {

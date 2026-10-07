@@ -198,9 +198,10 @@ redis-cli -p 16379 ping
 The listener is bound when the client advertises and released on disconnect; the
 server acknowledges the advertisement and reports back the listen ports it could
 not bind (outside `sluice.tcp-port-range`, held by another connected client, or
-already taken) -- the client then closes the stream and re-advertises with
-backoff. The listen ports must be exposed on the host (`docker -p`, firewall) --
-the deployment delta against the single data port.
+already taken) -- the client keeps the stream (its other routes stay up) and
+re-advertises on it with backoff (1s..30s) until the ports bind. The listen ports
+must be exposed on the host (`docker -p`, firewall) -- the deployment delta against
+the single data port.
 
 ## SNI routing
 
@@ -392,7 +393,7 @@ Behavior:
 - routing: a domain (or listen port) claimed by several clients is served by the one with
   the smallest `sluice.client.id` -- deterministically on every node, since every node sees
   every client. A smaller id takes over a bound listen port on advertise; a larger id gets
-  the port rejected and retries
+  the port rejected and retries on the same stream
 - lifecycle: readiness (`/actuator/health/readiness`) is DOWN for `sluice.cluster.warmup`
   after start (clients connect first) and while draining. On shutdown the node sends a
   `DRAIN` frame, waits up to `sluice.cluster.drain-grace` for in-flight virtual connections

@@ -7,6 +7,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Objects;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
@@ -19,12 +20,10 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
-import am.ik.sluice.server.tunnel.SessionRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -51,14 +50,14 @@ class TcpEchoE2ETest {
 	/** a listen port outside the server-side tcp-port-range */
 	private static int unclaimedRoutePort;
 
+	/** a listen port in the server-side tcp-port-range that a test holds bound */
+	private static int occupiedRoutePort;
+
 	private static @Nullable ServerSocket echoServer;
 
 	private @Nullable TunnelClient client;
 
-	private final io.micrometer.core.instrument.MeterRegistry meterRegistry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
-
-	@Autowired
-	SessionRegistry sessions;
+	private SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
@@ -66,6 +65,7 @@ class TcpEchoE2ETest {
 		dataPort = TestPorts.freePort();
 		tcpRoutePort = TestPorts.freePort();
 		unclaimedRoutePort = TestPorts.freePort();
+		occupiedRoutePort = TestPorts.freePort();
 		try {
 			ServerSocket server = new ServerSocket();
 			server.setReuseAddress(true);
@@ -78,8 +78,8 @@ class TcpEchoE2ETest {
 		Thread.ofVirtual().name("e2e-echo-accept").start(TcpEchoE2ETest::acceptLoop);
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
-		// only the intended route port is claimable
-		registry.add("sluice.tcp-port-range", () -> String.valueOf(tcpRoutePort));
+		// only the intended route ports are claimable
+		registry.add("sluice.tcp-port-range", () -> tcpRoutePort + "," + occupiedRoutePort);
 		registry.add("sluice.token", () -> "it-token");
 		registry.add("server.port", () -> 0);
 	}
@@ -124,6 +124,7 @@ class TcpEchoE2ETest {
 			.serverUrl("grpc://127.0.0.1:" + grpcPort);
 		upstreams.forEach(properties::upstream);
 		SluiceClientProperties built = properties.token("it-token").build();
+		this.meterRegistry = new SimpleMeterRegistry();
 		TunnelClient started = TunnelClient.builder()
 			.properties(built)
 			.taskExecutor(TASK_EXECUTOR)
@@ -131,10 +132,7 @@ class TcpEchoE2ETest {
 			.build();
 		started.start();
 		this.client = started;
-		// a rejected advertise makes the client close the stream and re-advertise with
-		// backoff, so the registry only holds a session for a moment; wait for the first
-		// exchange with the server instead (the counters only grow)
-		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> this.sessions.count() > 0 || rejectedCount() >= 1);
+		Awaitility.await().atMost(Duration.ofSeconds(5)).until(started::isConnected);
 	}
 
 	private Upstream echoUpstream(int listenPort) {
@@ -180,14 +178,38 @@ class TcpEchoE2ETest {
 	@Test
 	void listenPortOutsideServerRangeIsRejectedAndReadvertised() {
 		this.startClient(java.util.List.of(echoUpstream(unclaimedRoutePort)));
-		// the out-of-range port is reported back on ADVERTISED; the client closes the
-		// stream and re-advertises (the counter grows beyond the first advertise)
-		Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> rejectedCount(), count -> count >= 2);
+		// the out-of-range port is reported back on ADVERTISE_ACK; the client keeps the
+		// stream and re-advertises on it (the counter grows beyond the first advertise)
+		Awaitility.await()
+			.atMost(Duration.ofSeconds(10))
+			.until(() -> counted("sluice.advertise.rejected"), count -> count >= 2);
 		assertThat(reachable(unclaimedRoutePort)).isFalse();
+		assertThat(Objects.requireNonNull(this.client).isConnected()).isTrue();
+		assertThat(counted("sluice.reconnect.total")).isZero();
 	}
 
-	private double rejectedCount() {
-		return this.meterRegistry.find("sluice.advertise.rejected")
+	@Test
+	void occupiedListenPortIsClaimedOnceFreedWithoutReconnecting() throws Exception {
+		try (ServerSocket blocker = new ServerSocket()) {
+			blocker.bind(new InetSocketAddress("0.0.0.0", occupiedRoutePort));
+			this.startClient(java.util.List.of(echoUpstream(occupiedRoutePort)));
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.until(() -> counted("sluice.advertise.rejected"), count -> count >= 1);
+		}
+		Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> reachable(occupiedRoutePort));
+		try (Socket socket = new Socket("127.0.0.1", occupiedRoutePort)) {
+			socket.setSoTimeout(10_000);
+			socket.getOutputStream().write("freed".getBytes(StandardCharsets.US_ASCII));
+			socket.shutdownOutput();
+			assertThat(new String(socket.getInputStream().readAllBytes(), StandardCharsets.US_ASCII))
+				.isEqualTo("freed");
+		}
+		assertThat(counted("sluice.reconnect.total")).isZero();
+	}
+
+	private double counted(String name) {
+		return this.meterRegistry.find(name)
 			.counters()
 			.stream()
 			.mapToDouble(io.micrometer.core.instrument.Counter::count)
