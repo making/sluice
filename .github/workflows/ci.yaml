@@ -83,9 +83,10 @@ jobs:
         ARCH: ${{ matrix.arch }}
         APP: ${{ matrix.app }}
         NATIVE_FLAGS: ${{ matrix.variant == 'native' && '-Pnative' || '' }}
-      run: >
-        ./mvnw -V -B --no-transfer-progress -pl ${APP} -am spring-boot:build-image -DskipTests ${NATIVE_FLAGS}
-        -Dspring-boot.build-image.imageName=${IMAGE}:${VARIANT}_${ARCH}_${GITHUB_SHA}
+      run: |
+        ./mvnw -B --no-transfer-progress -pl ${APP} -am install -DskipTests ${NATIVE_FLAGS}
+        ./mvnw -B --no-transfer-progress -pl ${APP} spring-boot:build-image -DskipTests \
+          -Dspring-boot.build-image.imageName=${IMAGE}:${VARIANT}_${ARCH}_${GITHUB_SHA}
     - name: Push image
       if: github.ref == 'refs/heads/main' && github.event_name == 'push'
       env:
