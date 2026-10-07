@@ -78,9 +78,9 @@ class ClusterGrpcMutualTlsE2ETests {
 
 	private static Path serverKeyPemPath;
 
-	private static Path clientPemPath;
+	private static final Path[] clientPemPaths = new Path[2];
 
-	private static Path clientKeyPemPath;
+	private static final Path[] clientKeyPemPaths = new Path[2];
 
 	private static KeyStore caStore;
 
@@ -94,11 +94,9 @@ class ClusterGrpcMutualTlsE2ETests {
 
 	private final @org.jspecify.annotations.Nullable ConfigurableApplicationContext[] servers = new ConfigurableApplicationContext[2];
 
-	private @org.jspecify.annotations.Nullable ConfigurableApplicationContext clientContext;
+	private final @org.jspecify.annotations.Nullable ConfigurableApplicationContext[] clients = new ConfigurableApplicationContext[2];
 
-	private @org.jspecify.annotations.Nullable HttpServer plainUpstream;
-
-	private int plainUpstreamPort;
+	private final List<HttpServer> plainUpstreams = new ArrayList<>();
 
 	private @org.jspecify.annotations.Nullable ServerSocket tlsUpstream;
 
@@ -118,11 +116,19 @@ class ClusterGrpcMutualTlsE2ETests {
 				"-storepass", "changeit", "-dname", "CN=localhost", "-ext", "san=dns:localhost,ip:127.0.0.1",
 				"-validity", "1", "-keystore", serverStorePath.toAbsolutePath().toString());
 		signWithCa(caStorePath, serverStorePath, "server", "san=dns:localhost,ip:127.0.0.1");
-		Path clientStorePath = keyStore("sluice-mtls-client", "client");
-		keytool("-genkeypair", "-alias", "client", "-keyalg", "RSA", "-keysize", "2048", "-storetype", "PKCS12",
-				"-storepass", "changeit", "-dname", "CN=sluice-client", "-validity", "1", "-keystore",
-				clientStorePath.toAbsolutePath().toString());
-		signWithCa(caStorePath, clientStorePath, "client", null);
+		// one certificate per client identity
+		for (int i = 0; i < 2; i++) {
+			String alias = "client-" + (i + 1);
+			Path clientStorePath = keyStore("sluice-mtls-" + alias, alias);
+			keytool("-genkeypair", "-alias", alias, "-keyalg", "RSA", "-keysize", "2048", "-storetype", "PKCS12",
+					"-storepass", "changeit", "-dname", "CN=" + alias, "-validity", "1", "-keystore",
+					clientStorePath.toAbsolutePath().toString());
+			signWithCa(caStorePath, clientStorePath, alias, null);
+			clientPemPaths[i] = exportPem(loadStore(clientStorePath, alias), alias, "CERTIFICATE",
+					store -> store.getCertificate(alias).getEncoded());
+			clientKeyPemPaths[i] = exportPem(loadStore(clientStorePath, alias), alias, "PRIVATE KEY",
+					store -> ((RSAPrivateCrtKey) store.getKey(alias, STORE_PASS)).getEncoded());
+		}
 		// the upstream store doubles as trust anchor and upstream keystore (passthrough)
 		Path upstreamStorePath = keyStore("sluice-mtls-upstream", "upstream");
 		keytool("-genkeypair", "-alias", "upstream", "-keyalg", "RSA", "-keysize", "2048", "-storetype", "PKCS12",
@@ -135,10 +141,6 @@ class ClusterGrpcMutualTlsE2ETests {
 				store -> store.getCertificate("server").getEncoded());
 		serverKeyPemPath = exportPem(loadStore(serverStorePath, "server"), "server", "PRIVATE KEY",
 				store -> ((RSAPrivateCrtKey) store.getKey("server", STORE_PASS)).getEncoded());
-		clientPemPath = exportPem(loadStore(clientStorePath, "client"), "client", "CERTIFICATE",
-				store -> store.getCertificate("client").getEncoded());
-		clientKeyPemPath = exportPem(loadStore(clientStorePath, "client"), "client", "PRIVATE KEY",
-				store -> ((RSAPrivateCrtKey) store.getKey("client", STORE_PASS)).getEncoded());
 	}
 
 	/**
@@ -217,16 +219,18 @@ class ClusterGrpcMutualTlsE2ETests {
 
 	@AfterEach
 	void stopApps() {
-		closeContext(this.clientContext);
-		this.clientContext = null;
+		for (int i = 0; i < this.clients.length; i++) {
+			closeContext(this.clients[i]);
+			this.clients[i] = null;
+		}
 		for (int i = 0; i < this.servers.length; i++) {
 			closeContext(this.servers[i]);
 			this.servers[i] = null;
 		}
-		if (this.plainUpstream != null) {
-			this.plainUpstream.stop(0);
-			this.plainUpstream = null;
+		for (HttpServer upstream : this.plainUpstreams) {
+			upstream.stop(0);
 		}
+		this.plainUpstreams.clear();
 		if (this.tlsUpstream != null) {
 			try {
 				this.tlsUpstream.close();
@@ -243,8 +247,8 @@ class ClusterGrpcMutualTlsE2ETests {
 		UPSTREAM_EXECUTOR.shutdown();
 	}
 
-	/** Plain HTTP upstream for the TLS termination case. */
-	private void startPlainUpstream(String body) throws Exception {
+	/** Plain HTTP upstream; the caller keeps the returned port. */
+	private int startPlainUpstream(String body) throws Exception {
 		HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
 		server.createContext("/", exchange -> {
 			byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
@@ -255,8 +259,8 @@ class ClusterGrpcMutualTlsE2ETests {
 			}
 		});
 		server.start();
-		this.plainUpstream = server;
-		this.plainUpstreamPort = server.getAddress().getPort();
+		this.plainUpstreams.add(server);
+		return server.getAddress().getPort();
 	}
 
 	/** TLS echo upstream for the passthrough case: answers one line per received line. */
@@ -342,19 +346,24 @@ class ClusterGrpcMutualTlsE2ETests {
 		this.servers[index] = new SpringApplicationBuilder(SluiceServerApplication.class).run(all);
 	}
 
-	private void startClient(String... extraArgs) {
+	/**
+	 * Starts a client that authenticates with the certificate of its own identity
+	 * (1-based).
+	 */
+	private void startClient(int identity, String... extraArgs) {
 		// @formatter:off
 		String[] args = new String[] { "--sluice.server-url=grpcs://127.0.0.1:" + this.grpcPorts[0],
-				"--sluice.tls-bundle=" + CLIENT_BUNDLE, "--sluice.client.id=mtls-it-client",
-				"--spring.ssl.bundle.pem." + CLIENT_BUNDLE + ".keystore.certificate=file:" + clientPemPath,
-				"--spring.ssl.bundle.pem." + CLIENT_BUNDLE + ".keystore.private-key=file:" + clientKeyPemPath,
+				"--sluice.tls-bundle=" + CLIENT_BUNDLE, "--sluice.client.id=mtls-it-client-" + identity,
+				"--spring.ssl.bundle.pem." + CLIENT_BUNDLE + ".keystore.certificate=file:" + clientPemPaths[identity - 1],
+				"--spring.ssl.bundle.pem." + CLIENT_BUNDLE + ".keystore.private-key=file:" + clientKeyPemPaths[identity - 1],
 				"--spring.ssl.bundle.pem." + CLIENT_BUNDLE + ".truststore.certificate=file:" + caPemPath,
 				"--sluice.token=" + TOKEN, "--server.port=0", "--management.server.port=0" };
 		// @formatter:on
 		String[] all = new String[args.length + extraArgs.length];
 		System.arraycopy(args, 0, all, 0, args.length);
 		System.arraycopy(extraArgs, 0, all, args.length, extraArgs.length);
-		this.clientContext = new SpringApplicationBuilder(SluiceClientApplication.class).run(all);
+		int slot = identity - 1;
+		this.clients[slot] = new SpringApplicationBuilder(SluiceClientApplication.class).run(all);
 	}
 
 	/**
@@ -369,7 +378,7 @@ class ClusterGrpcMutualTlsE2ETests {
 		String[] all = new String[args.length + extraArgs.length];
 		System.arraycopy(args, 0, all, 0, args.length);
 		System.arraycopy(extraArgs, 0, all, args.length, extraArgs.length);
-		this.clientContext = new SpringApplicationBuilder(SluiceClientApplication.class).run(all);
+		this.clients[0] = new SpringApplicationBuilder(SluiceClientApplication.class).run(all);
 	}
 
 	private static int freePort() {
@@ -392,16 +401,16 @@ class ClusterGrpcMutualTlsE2ETests {
 		return server == null ? -1 : server.getBean(SessionRegistry.class).count();
 	}
 
-	private TunnelClient tunnelClient() {
-		return Objects.requireNonNull(this.clientContext).getBean(TunnelClient.class);
+	private TunnelClient tunnelClient(int identity) {
+		return Objects.requireNonNull(this.clients[identity - 1]).getBean(TunnelClient.class);
 	}
 
 	/** One plain HTTP round trip through the data plane of the given node. */
-	private String httpRoundTrip(int index) throws Exception {
+	private String httpRoundTrip(int index, String host) throws Exception {
 		try (Socket socket = new Socket("127.0.0.1", this.dataPorts[index])) {
 			socket.setSoTimeout(10_000);
 			OutputStream out = socket.getOutputStream();
-			out.write(("GET / HTTP/1.1\r\nHost: " + HOST + "\r\nConnection: close\r\n\r\n")
+			out.write(("GET / HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n")
 				.getBytes(StandardCharsets.US_ASCII));
 			out.flush();
 			return new String(socket.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
@@ -425,19 +434,42 @@ class ClusterGrpcMutualTlsE2ETests {
 			this.grpcPorts[i] = freePort();
 			this.dataPorts[i] = freePort();
 		}
-		this.startPlainUpstream("mtls-tunnel-ok");
+		int upstreamPort = this.startPlainUpstream("mtls-tunnel-ok");
 		this.startServer(0);
 		this.startServer(1);
-		this.startClient("--sluice.client.upstream[0].host=" + HOST,
-				"--sluice.client.upstream[0].target=http://127.0.0.1:" + this.plainUpstreamPort);
+		this.startClient(1, "--sluice.client.upstream[0].host=" + HOST,
+				"--sluice.client.upstream[0].target=http://127.0.0.1:" + upstreamPort);
 		this.awaitSessionOnAllNodes(2, Duration.ofSeconds(20));
-		assertThat(this.httpRoundTrip(0)).contains("mtls-tunnel-ok");
-		assertThat(this.httpRoundTrip(1)).contains("mtls-tunnel-ok");
+		assertThat(this.httpRoundTrip(0, HOST)).contains("mtls-tunnel-ok");
+		assertThat(this.httpRoundTrip(1, HOST)).contains("mtls-tunnel-ok");
 		// node failure: the remaining node keeps serving over mTLS
 		closeContext(this.servers[1]);
 		this.servers[1] = null;
-		assertThat(this.tunnelClient().isConnected()).isTrue();
-		assertThat(this.httpRoundTrip(0)).contains("mtls-tunnel-ok");
+		assertThat(this.tunnelClient(1).isConnected()).isTrue();
+		assertThat(this.httpRoundTrip(0, HOST)).contains("mtls-tunnel-ok");
+	}
+
+	@Test
+	void clientsWithDistinctCertificatesTunnelSideBySide() throws Exception {
+		this.grpcPorts[0] = freePort();
+		this.dataPorts[0] = freePort();
+		int upstream1 = this.startPlainUpstream("mtls-client1-ok");
+		int upstream2 = this.startPlainUpstream("mtls-client2-ok");
+		this.startServer(0);
+		// each client authenticates with its own certificate
+		this.startClient(1, "--sluice.client.upstream[0].host=client1." + HOST,
+				"--sluice.client.upstream[0].target=http://127.0.0.1:" + upstream1);
+		this.startClient(2, "--sluice.client.upstream[0].host=client2." + HOST,
+				"--sluice.client.upstream[0].target=http://127.0.0.1:" + upstream2);
+		Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> sessionCount(0) == 2);
+		assertThat(this.httpRoundTrip(0, "client1." + HOST)).contains("mtls-client1-ok");
+		assertThat(this.httpRoundTrip(0, "client2." + HOST)).contains("mtls-client2-ok");
+		// one client leaving does not disturb the other
+		closeContext(this.clients[0]);
+		this.clients[0] = null;
+		Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> sessionCount(0) == 1);
+		assertThat(this.tunnelClient(2).isConnected()).isTrue();
+		assertThat(this.httpRoundTrip(0, "client2." + HOST)).contains("mtls-client2-ok");
 	}
 
 	@Test
@@ -452,20 +484,20 @@ class ClusterGrpcMutualTlsE2ETests {
 		Awaitility.await()
 			.during(3, TimeUnit.SECONDS)
 			.atMost(10, TimeUnit.SECONDS)
-			.until(() -> sessionCount(0) == 0 && !this.tunnelClient().isConnected());
+			.until(() -> sessionCount(0) == 0 && !this.tunnelClient(1).isConnected());
 	}
 
 	@Test
 	void dataPlaneTerminatesTlsOverTheMutualTlsTunnel() throws Exception {
 		this.grpcPorts[0] = freePort();
 		this.dataPorts[0] = freePort();
-		this.startPlainUpstream("mtls-tls-termination-ok");
+		int upstreamPort = this.startPlainUpstream("mtls-tls-termination-ok");
 		// the data plane terminates TLS with the same server certificate
 		this.startServer(0, "--sluice.data-tls-bundle=" + DATA_BUNDLE,
 				"--spring.ssl.bundle.pem." + DATA_BUNDLE + ".keystore.certificate=file:" + serverPemPath,
 				"--spring.ssl.bundle.pem." + DATA_BUNDLE + ".keystore.private-key=file:" + serverKeyPemPath);
-		this.startClient("--sluice.client.upstream[0].host=localhost",
-				"--sluice.client.upstream[0].target=http://127.0.0.1:" + this.plainUpstreamPort);
+		this.startClient(2, "--sluice.client.upstream[0].host=localhost",
+				"--sluice.client.upstream[0].target=http://127.0.0.1:" + upstreamPort);
 		Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> sessionCount(0) == 1);
 		javax.net.ssl.SSLSocketFactory socketFactory = sslContext(null, trustManagerFactory(caStore))
 			.getSocketFactory();
@@ -487,7 +519,7 @@ class ClusterGrpcMutualTlsE2ETests {
 		this.dataPorts[0] = freePort();
 		this.startTlsUpstream("mtls-passthru:");
 		this.startServer(0);
-		this.startClient("--sluice.client.upstream[0].host=" + PASSTHRU_HOST,
+		this.startClient(1, "--sluice.client.upstream[0].host=" + PASSTHRU_HOST,
 				"--sluice.client.upstream[0].target=tcp://127.0.0.1:" + this.tlsUpstreamPort,
 				"--sluice.client.upstream[0].tls-passthrough=true");
 		Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> sessionCount(0) == 1);
