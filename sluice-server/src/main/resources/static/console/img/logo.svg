@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!--
+    The brand mark from the console masthead, with the palette pinned to the
+    light-theme values (a favicon cannot inherit CSS custom properties).
+  -->
+  <path d="M3 9h9M3 23h9M20 9h9M20 23h9" fill="none" stroke="#143b69" stroke-width="1.5"/>
+  <path d="M12 9l4 7M12 23l4-7" fill="none" stroke="#143b69" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M2 16h8M22 16h8" fill="none" stroke="#1b86c2" stroke-width="1.5" stroke-dasharray="2 3"/>
+</svg>
