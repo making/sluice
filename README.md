@@ -268,6 +268,7 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.access-log.rate-limit.period` | `10s` | rate limit window; lines beyond the limit are counted and one `type=ratelimit` summary line reports the suppressed count when the period rolls over |
 | `spring.grpc.server.port` | `8001` | gRPC control plane port |
 | `server.port` | `8081` | actuator (health / info / prometheus) and the management console (`/console`) |
+| `sluice.console.auth.type` | `simple` | console authentication: `simple` (form login with `spring.security.user.name` / `spring.security.user.password`) / `oidc` (OpenID Connect via `spring.security.oauth2.client.*`; see "Console authentication") |
 
 ## Configuration (client)
 
@@ -521,8 +522,31 @@ assets stay open. The mechanism is `sluice.console.auth.type`:
   `spring.security.user.password` (`{noop}` / `{bcrypt}` prefixed values supported), e.g.
   `docker run ... -e SPRING_SECURITY_USER_NAME=admin -e SPRING_SECURITY_USER_PASSWORD='{noop}secret'`
 - `oidc`: sign in through an OpenID Provider, configured with the standard
-  `spring.security.oauth2.client.registration.<id>.*` / `...provider.<id>.*` properties,
-  e.g. `--sluice.console.auth.type=oidc --spring.security.oauth2.client.registration.myidp.client-id=... --spring.security.oauth2.client.provider.myidp.issuer-uri=https://idp.example.com`
+  `spring.security.oauth2.client.*` properties
+
+```properties
+# Enable OIDC authentication
+sluice.console.auth.type=oidc
+
+# Configure Google as the identity provider
+spring.security.oauth2.client.provider.google.issuer-uri=https://accounts.google.com
+spring.security.oauth2.client.provider.google.user-name-attribute=email
+spring.security.oauth2.client.registration.google.client-id=your-google-client-id
+spring.security.oauth2.client.registration.google.client-secret=your-google-client-secret
+spring.security.oauth2.client.registration.google.client-name=Google
+spring.security.oauth2.client.registration.google.scope=openid,email
+
+# Configure Microsoft Entra ID (formerly Azure AD) as another provider
+spring.security.oauth2.client.provider.microsoft-entra-id.issuer-uri=https://sts.windows.net/{tenant-id}/
+spring.security.oauth2.client.provider.microsoft-entra-id.user-name-attribute=email
+spring.security.oauth2.client.registration.microsoft-entra-id.client-id=your-client-id
+spring.security.oauth2.client.registration.microsoft-entra-id.client-secret=your-client-secret
+spring.security.oauth2.client.registration.microsoft-entra-id.client-name=Microsoft Entra ID
+spring.security.oauth2.client.registration.microsoft-entra-id.scope=openid,email
+```
+
+Multiple providers can be configured simultaneously; the login page shows one button per
+provider. The redirect URI to register at the provider is `http://<server>:8081/login`.
 
 Built with Mustache and htmx 4 (vendored in `static/console/js/vendor`, source URL in the
 template); static assets ship pre-compressed (`.br` / `.gz`) and content-hashed.
