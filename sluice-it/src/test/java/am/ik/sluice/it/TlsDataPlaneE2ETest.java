@@ -250,6 +250,22 @@ class TlsDataPlaneE2ETest {
 	}
 
 	@Test
+	void unroutedHostGetsTheNoRoutePageOverH2() throws Exception {
+		this.startClient();
+		HttpClient client = HttpClient.newBuilder()
+			.version(HttpClient.Version.HTTP_2)
+			.sslContext(clientSslContext())
+			.build();
+		HttpResponse<String> response = client.send(
+				HttpRequest.newBuilder(URI.create("https://localhost:" + dataPort + "/")).GET().build(),
+				HttpResponse.BodyHandlers.ofString());
+		assertThat(response.version()).isEqualTo(HttpClient.Version.HTTP_2);
+		assertThat(response.statusCode()).isEqualTo(503);
+		assertThat(response.headers().firstValue("content-type")).hasValue("text/html; charset=utf-8");
+		assertThat(response.body()).startsWith("<!DOCTYPE html>").endsWith("</html>\n");
+	}
+
+	@Test
 	void plaintextHttp1_1StillWorksOnTheSamePort() throws Exception {
 		this.startClient();
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {

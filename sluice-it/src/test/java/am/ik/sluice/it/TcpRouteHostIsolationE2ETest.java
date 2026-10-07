@@ -176,7 +176,7 @@ class TcpRouteHostIsolationE2ETest {
 
 	@Test
 	void httpRequestForAnUnknownHostIsRefusedInsteadOfRelayedToATcpUpstream() throws Exception {
-		assertThat(httpGet("unknown.local")).isEqualToNormalizingWhitespace("HTTP/1.1 503 Service Unavailable");
+		assertThat(httpGet("unknown.local").lines().findFirst()).hasValue("HTTP/1.1 503 Service Unavailable");
 	}
 
 	@Test

@@ -8,8 +8,11 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.List;
@@ -66,9 +69,11 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	private static final String ALPN_HTTP_1_1 = "http/1.1";
 
-	private static final byte[] SERVICE_UNAVAILABLE = ("HTTP/1.1 503 Service Unavailable\r\n"
-			+ "Content-Length: 0\r\nConnection: close\r\n\r\n")
-		.getBytes(StandardCharsets.US_ASCII);
+	/** How long a rejected connection is drained for its peer to read the response. */
+	private static final Duration LINGER = Duration.ofSeconds(2);
+
+	/** The most a rejected connection drains before closing regardless. */
+	private static final long LINGER_LIMIT = 1024 * 1024;
 
 	private final Router router;
 
@@ -88,13 +93,16 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	private final ObjectProvider<SSLContext> sslContext;
 
+	private final NoRouteResponse noRouteResponse;
+
 	private volatile boolean running;
 
 	private volatile @Nullable ServerSocket serverSocket;
 
 	DataProxyServer(Router router, SessionRegistry sessions, SluiceServerProperties properties,
 			MeterRegistry meterRegistry, AccessLogger accessLogger,
-			@Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor, ObjectProvider<SSLContext> sslContext) {
+			@Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor, ObjectProvider<SSLContext> sslContext,
+			NoRouteResponse noRouteResponse) {
 		this.router = router;
 		this.sessions = sessions;
 		this.properties = properties;
@@ -102,6 +110,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		this.accessLogger = accessLogger;
 		this.taskExecutor = taskExecutor;
 		this.sslContext = sslContext;
+		this.noRouteResponse = noRouteResponse;
 	}
 
 	/**
@@ -160,7 +169,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				return;
 			}
 			if (!this.relay(connection, access)) {
-				// no session: relay() wrote the 503 and closed the socket
+				// no session: relay() answered with the no-route response and closed
+				// the socket
 				access.close();
 			}
 		}
@@ -254,17 +264,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		Optional<Router.Route> route = this.router.lookup(conn.head().host());
 		TunnelSession session = route.map(r -> this.sessions.find(r.clientId()).orElse(null)).orElse(null);
 		if (session == null) {
-			// a passthrough peer mid TLS handshake expects TLS records, not an HTTP error
-			if (!conn.head().encrypted()) {
-				try (OutputStream out = conn.pipe().sink()) {
-					out.write(SERVICE_UNAVAILABLE);
-					out.flush();
-				}
-				catch (Exception e) {
-					log.debug("failed to write service unavailable: {}", e.toString());
-				}
-			}
-			this.close(conn.socket());
+			this.reject(conn);
 			return false;
 		}
 		Router.Route route0 = route.get();
@@ -294,6 +294,58 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			throw e;
 		}
 		return true;
+	}
+
+	/**
+	 * Answers an unroutable connection with the no-route response, then half-closes and
+	 * drains it before closing: closing with unread request bytes (a body, or HTTP/2
+	 * frames sent after the head) would reset the connection and discard the response
+	 * before the peer reads it.
+	 */
+	private void reject(Connection conn) {
+		byte[] response = this.noRouteResponse.render(conn.head());
+		try {
+			if (response.length > 0) {
+				OutputStream out = conn.pipe().sink();
+				out.write(response);
+				out.flush();
+				this.linger(conn);
+			}
+		}
+		catch (Exception e) {
+			log.debug("failed to write no-route response: {}", e.toString());
+		}
+		finally {
+			this.close(conn.socket());
+		}
+	}
+
+	private void linger(Connection conn) throws Exception {
+		if (!(conn.socket() instanceof SSLSocket)) {
+			// TLS has no half-close; the peer closes after the response instead
+			conn.pipe().shutdownOutput();
+		}
+		long deadline = System.nanoTime() + LINGER.toNanos();
+		long drained = 0;
+		byte[] buffer = new byte[8192];
+		InputStream in = conn.pipe().source();
+		try {
+			while (drained < LINGER_LIMIT) {
+				long remaining = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+				if (remaining <= 0) {
+					return;
+				}
+				conn.socket().setSoTimeout((int) remaining);
+				int n = in.read(buffer);
+				if (n < 0) {
+					return;
+				}
+				drained += n;
+			}
+		}
+		catch (SocketTimeoutException e) {
+			// the peer kept the connection open past the linger period
+		}
 	}
 
 	private StreamRelay.Listener relayedBytes(Router.Route route, TunnelSession session,
