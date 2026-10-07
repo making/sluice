@@ -22,6 +22,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * @param token authentication token
  * @param tokenFile file to read the authentication token from
  * @param insecure skip TLS verification
+ * @param tlsBundle name of the SSL bundle providing the client keystore (mTLS client
+ * certificate) and the truststore for the {@code grpcs://} control plane connection
  * @param strictForwarding only dial upstreams present in the upstream map
  * @param keepAliveTime interval of the gRPC keepalive ping towards the server
  * @param keepAliveTimeout how long a keepalive ping answer may take before the channel is
@@ -29,7 +31,7 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  */
 @ConfigurationProperties("sluice")
 public record SluiceClientProperties(String serverUrl, @Nullable Client client, String token,
-		@Nullable String tokenFile, @DefaultValue("false") boolean insecure,
+		@Nullable String tokenFile, @DefaultValue("false") boolean insecure, @Nullable String tlsBundle,
 		@DefaultValue("true") boolean strictForwarding, @DefaultValue("30s") Duration keepAliveTime,
 		@DefaultValue("10s") Duration keepAliveTimeout) {
 
@@ -116,6 +118,8 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 
 		private boolean insecure;
 
+		@Nullable private String tlsBundle;
+
 		private boolean strictForwarding = true;
 
 		private Duration keepAliveTime = Duration.ofSeconds(30);
@@ -155,6 +159,11 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 			return this;
 		}
 
+		public Builder tlsBundle(@Nullable String tlsBundle) {
+			this.tlsBundle = tlsBundle;
+			return this;
+		}
+
 		public Builder strictForwarding(boolean strictForwarding) {
 			this.strictForwarding = strictForwarding;
 			return this;
@@ -173,7 +182,8 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 		public SluiceClientProperties build() {
 			return new SluiceClientProperties(Objects.requireNonNull(this.serverUrl, "serverUrl is required"),
 					new Client(this.clientId, List.copyOf(this.upstreams)), this.token == null ? "" : this.token,
-					this.tokenFile, this.insecure, this.strictForwarding, this.keepAliveTime, this.keepAliveTimeout);
+					this.tokenFile, this.insecure, this.tlsBundle, this.strictForwarding, this.keepAliveTime,
+					this.keepAliveTimeout);
 		}
 
 	}

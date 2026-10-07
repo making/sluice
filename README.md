@@ -107,7 +107,11 @@ curl -H 'Host: demo.local' http://127.0.0.1:8000/
 curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:8000/
 ```
 
-`sluice.server-url` schemes: `grpc://` (plaintext) / `grpcs://` (TLS; `--sluice.insecure=true` skips verification).
+`sluice.server-url` schemes: `grpc://` (plaintext) / `grpcs://` (TLS; `--sluice.insecure=true` skips
+verification). For mutual TLS set `sluice.tls-bundle` to a `spring.ssl.bundle.pem.*` bundle whose
+keystore holds the client certificate and whose truststore holds the CA of the server certificate;
+on the server side pair `spring.grpc.server.ssl.bundle` with `spring.grpc.server.ssl.client-auth=REQUIRE`
+and a truststore with the CA of the client certificates.
 
 ### Native image (client / server)
 
@@ -254,6 +258,7 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.client.upstream[n].listen-port` | `0` | public port the server listens on for this upstream; connections are relayed as raw TCP routed by the listen port -- no head parsing, no rewriting -- so any protocol (ssh, postgres, redis, ...) tunnels through. The listener is bound on advertise and released on disconnect; bind it on the host (`docker -p`, firewall) to expose it |
 | `sluice.token` / `sluice.token-file` | - | authentication token |
 | `sluice.insecure` | `false` | skip TLS verification |
+| `sluice.tls-bundle` | - | SSL bundle for the `grpcs://` control plane connection: keystore = client certificate (mutual TLS), truststore = CAs to verify the server; takes precedence over `sluice.insecure` |
 | `sluice.keep-alive-time` | `30s` | interval of the gRPC keepalive ping towards the server |
 | `sluice.keep-alive-timeout` | `10s` | how long a keepalive ping answer may take before the channel is torn down |
 | `sluice.strict-forwarding` | `true` | only dial upstreams present in the map |
@@ -420,6 +425,51 @@ echo | openssl s_client -connect 127.0.0.1:8101 -alpn h2 2>/dev/null | grep 'ALP
 
 E2E coverage: `ClusterGrpcTlsE2ETests` (sluice-it) -- both nodes serve, failover after a
 node stops, and h2 negotiation on the TLS endpoint.
+
+## Mutual TLS (server <-> client)
+
+The server requires a client certificate (`client-auth=REQUIRE`) and the client presents one
+from an SSL bundle (`sluice.tls-bundle`); no `sluice.insecure` needed. Example with a local CA:
+
+```sh
+# a private CA and two leaf certificates signed by it
+openssl req -x509 -newkey rsa:2048 -nodes -keyout ca-key.pem -out ca.pem \
+  -days 3650 -subj /CN=sluice-ca -addext basicConstraints=critical,CA:TRUE
+openssl req -newkey rsa:2048 -nodes -keyout server-key.pem -out server.csr -subj /CN=localhost
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca-key.pem -days 3650 \
+  -extfile <(printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\n') -out server-cert.pem
+openssl req -newkey rsa:2048 -nodes -keyout client-key.pem -out client.csr -subj /CN=sluice-client
+openssl x509 -req -in client.csr -CA ca.pem -CAkey ca-key.pem -days 3650 -out client-cert.pem
+openssl verify -CAfile ca.pem server-cert.pem client-cert.pem
+```
+
+```sh
+# server: terminate TLS on the control plane and require client certificates
+java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.token=SECRET --spring.grpc.server.port=8001 --sluice.data-port=8000 \
+  --spring.grpc.server.ssl.bundle=grpc-control \
+  --spring.grpc.server.ssl.client-auth=REQUIRE \
+  --spring.ssl.bundle.pem.grpc-control.keystore.certificate=file:server-cert.pem \
+  --spring.ssl.bundle.pem.grpc-control.keystore.private-key=file:server-key.pem \
+  --spring.ssl.bundle.pem.grpc-control.truststore.certificate=file:ca.pem
+
+# client: keystore = the client certificate, truststore = the CA that signed the server cert
+java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.server-url=grpcs://127.0.0.1:8001 --sluice.tls-bundle=grpc-client --sluice.client.id=client-1 \
+  '--sluice.client.upstream[0]'.host=demo.local \
+  '--sluice.client.upstream[0]'.target=http://127.0.0.1:31080 \
+  --spring.ssl.bundle.pem.grpc-client.keystore.certificate=file:client-cert.pem \
+  --spring.ssl.bundle.pem.grpc-client.keystore.private-key=file:client-key.pem \
+  --spring.ssl.bundle.pem.grpc-client.truststore.certificate=file:ca.pem \
+  --sluice.token=SECRET
+```
+
+The client bundle is applied to every node connection (the bootstrap and the membership
+`grpcs://` URLs alike). `client-auth` also accepts `OPTIONAL` / `WANT` / `NONE`.
+
+E2E coverage: `ClusterGrpcMutualTlsE2ETests` (sluice-it) -- mTLS to both nodes with failover,
+rejection of a certificate-less client, and TLS termination / passthrough on the data plane
+over the mTLS tunnel.
 
 ## Health / metrics
 

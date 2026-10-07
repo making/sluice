@@ -19,6 +19,8 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.v1.proto.ListNodesResponse;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.ssl.SslBundle;
+import org.springframework.boot.ssl.SslBundles;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.stereotype.Component;
@@ -40,6 +42,8 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 
 	private final MeterRegistry meterRegistry;
 
+	private final @Nullable SslBundles sslBundles;
+
 	/** Process-stable client identity sent on every stream. */
 	private final String clientId;
 
@@ -53,10 +57,11 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 	private volatile boolean running;
 
 	TunnelClient(SluiceClientProperties properties, @Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor,
-			MeterRegistry meterRegistry) {
+			MeterRegistry meterRegistry, @Nullable SslBundles sslBundles) {
 		this.properties = properties;
 		this.taskExecutor = taskExecutor;
 		this.meterRegistry = meterRegistry;
+		this.sslBundles = sslBundles;
 		String configured = clientid(properties);
 		this.clientId = configured == null || configured.isBlank() ? UUID.randomUUID().toString() : configured;
 		meterRegistry.gauge("sluice.connections.active", this.connectionsByNode,
@@ -80,6 +85,8 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 
 		private @Nullable MeterRegistry meterRegistry;
 
+		private @Nullable SslBundles sslBundles;
+
 		private Builder() {
 		}
 
@@ -98,10 +105,15 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 			return this;
 		}
 
+		public Builder sslBundles(@Nullable SslBundles sslBundles) {
+			this.sslBundles = sslBundles;
+			return this;
+		}
+
 		public TunnelClient build() {
 			return new TunnelClient(Objects.requireNonNull(this.properties, "properties is required"),
 					Objects.requireNonNull(this.taskExecutor, "taskExecutor is required"),
-					Objects.requireNonNull(this.meterRegistry, "meterRegistry is required"));
+					Objects.requireNonNull(this.meterRegistry, "meterRegistry is required"), this.sslBundles);
 		}
 
 	}
@@ -137,11 +149,15 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 	}
 
 	private void startConnection(String nodeId, String url) {
+		String bundleName = this.properties.tlsBundle();
+		SslBundle sslBundle = bundleName == null || bundleName.isBlank() || this.sslBundles == null ? null
+				: this.sslBundles.getBundle(bundleName);
 		NodeConnection connection = NodeConnection.builder()
 			.key(nodeId.isBlank() ? url : nodeId)
 			.nodeId(nodeId)
 			.url(url)
 			.properties(this.properties)
+			.sslBundle(sslBundle)
 			.clientId(this.clientId)
 			.taskExecutor(this.taskExecutor)
 			.listener(this)

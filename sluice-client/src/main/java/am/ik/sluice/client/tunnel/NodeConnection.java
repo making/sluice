@@ -1,6 +1,8 @@
 package am.ik.sluice.client.tunnel;
 
 import java.net.Socket;
+import javax.net.ssl.TrustManagerFactory;
+
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -30,9 +32,11 @@ import io.grpc.netty.NettyChannelBuilder;
 import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.ClientResponseObserver;
 import io.grpc.stub.MetadataUtils;
+import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.boot.ssl.SslBundle;
 import org.springframework.core.task.TaskExecutor;
 
 /**
@@ -75,6 +79,8 @@ public final class NodeConnection implements AutoCloseable {
 
 	private final SluiceClientProperties properties;
 
+	private final @Nullable SslBundle sslBundle;
+
 	private final String clientId;
 
 	private final TaskExecutor taskExecutor;
@@ -106,6 +112,7 @@ public final class NodeConnection implements AutoCloseable {
 		this.nodeId = builder.nodeId == null ? "" : builder.nodeId;
 		this.url = Objects.requireNonNull(builder.url, "url is required");
 		this.properties = Objects.requireNonNull(builder.properties, "properties is required");
+		this.sslBundle = builder.sslBundle;
 		this.clientId = Objects.requireNonNull(builder.clientId, "clientId is required");
 		this.taskExecutor = Objects.requireNonNull(builder.taskExecutor, "taskExecutor is required");
 		this.listener = Objects.requireNonNull(builder.listener, "listener is required");
@@ -141,6 +148,8 @@ public final class NodeConnection implements AutoCloseable {
 
 		private @Nullable SluiceClientProperties properties;
 
+		private @Nullable SslBundle sslBundle;
+
 		private @Nullable String clientId;
 
 		private @Nullable TaskExecutor taskExecutor;
@@ -173,6 +182,15 @@ public final class NodeConnection implements AutoCloseable {
 
 		public Builder properties(SluiceClientProperties properties) {
 			this.properties = properties;
+			return this;
+		}
+
+		/**
+		 * SSL bundle supplying the client certificate (mTLS) and the truststore; takes
+		 * precedence over {@code insecure}.
+		 */
+		public Builder sslBundle(@Nullable SslBundle sslBundle) {
+			this.sslBundle = sslBundle;
 			return this;
 		}
 
@@ -276,6 +294,20 @@ public final class NodeConnection implements AutoCloseable {
 			.keepAliveTimeout(this.properties.keepAliveTimeout().toSeconds(), TimeUnit.SECONDS);
 		if (!secure) {
 			builder.usePlaintext();
+		}
+		else if (this.sslBundle != null) {
+			try {
+				SslContextBuilder ssl = GrpcSslContexts.forClient()
+					.keyManager(this.sslBundle.getManagers().getKeyManagerFactory());
+				TrustManagerFactory trustManagerFactory = this.sslBundle.getManagers().getTrustManagerFactory();
+				if (trustManagerFactory != null) {
+					ssl.trustManager(trustManagerFactory);
+				}
+				((NettyChannelBuilder) builder).sslContext(ssl.build());
+			}
+			catch (Exception e) {
+				throw new IllegalStateException("failed to build SSL context from bundle " + this.sslBundle, e);
+			}
 		}
 		else if (this.properties.insecure()) {
 			try {
