@@ -8,3 +8,4 @@ target/
 *.ipr
 .vscode/
 .DS_Store
+.todo/.icebox
