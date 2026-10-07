@@ -70,7 +70,7 @@ jobs:
         APP: ${{ matrix.app }}
         VARIANT: ${{ matrix.variant }}
         ARCH: ${{ matrix.arch }}
-      run: echo "name=${REGISTRY}/$(echo '${{ github.repository }}/${APP}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      run: echo "name=${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/${APP} | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
     - name: Set version
       run: |
         CURRENT_VERSION=$(./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout)
@@ -120,7 +120,7 @@ jobs:
         APP: ${{ matrix.app }}
         VARIANT: ${{ matrix.variant }}
       run: |
-        IMAGE="${REGISTRY}/$(echo '${{ github.repository }}/${APP}' | tr '[:upper:]' '[:lower:]')"
+        IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/${APP} | tr '[:upper:]' '[:lower:]')"
         docker manifest create ${IMAGE}:${VARIANT}_${GITHUB_SHA} \
           --amend ${IMAGE}:${VARIANT}_amd64_${GITHUB_SHA} \
           --amend ${IMAGE}:${VARIANT}_aarch64_${GITHUB_SHA}
@@ -134,7 +134,7 @@ jobs:
         APP: ${{ matrix.app }}
         VARIANT: ${{ matrix.variant }}
       run: |
-        IMAGE="${REGISTRY}/$(echo '${{ github.repository }}/${APP}' | tr '[:upper:]' '[:lower:]')"
+        IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/${APP} | tr '[:upper:]' '[:lower:]')"
         DIGEST=$(docker buildx imagetools inspect ${IMAGE}:${VARIANT}_${GITHUB_SHA} | awk '/^Digest:/{print $2}')
         cat <<EOF > ${APP}_${VARIANT}.yaml
         image: ${IMAGE}@${DIGEST}
