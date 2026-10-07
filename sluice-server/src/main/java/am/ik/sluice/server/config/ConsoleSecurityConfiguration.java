@@ -1,9 +1,8 @@
-package am.ik.sluice.server.console.auth;
+package am.ik.sluice.server.config;
 
 import java.util.List;
 import java.util.Map;
 
-import am.ik.sluice.server.config.SluiceServerProperties;
 import jakarta.servlet.http.HttpServletRequest;
 
 import org.jspecify.annotations.Nullable;
