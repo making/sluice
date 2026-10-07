@@ -1,6 +1,5 @@
 package am.ik.sluice.it;
 
-import java.net.ServerSocket;
 import java.time.Duration;
 
 import org.junit.jupiter.api.AfterAll;
@@ -57,22 +56,13 @@ class RedisE2ETest {
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
-		grpcPort = freePort();
-		dataPort = freePort();
-		tcpRoutePort = freePort();
+		grpcPort = TestPorts.freePort();
+		dataPort = TestPorts.freePort();
+		tcpRoutePort = TestPorts.freePort();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.token", () -> "it-token");
 		registry.add("server.port", () -> 0);
-	}
-
-	private static int freePort() {
-		try (ServerSocket socket = new ServerSocket(0)) {
-			return socket.getLocalPort();
-		}
-		catch (Exception e) {
-			throw new IllegalStateException(e);
-		}
 	}
 
 	@Autowired

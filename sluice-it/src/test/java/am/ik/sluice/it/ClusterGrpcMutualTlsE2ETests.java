@@ -331,7 +331,7 @@ class ClusterGrpcMutualTlsE2ETests {
 				+ "=grpcs://127.0.0.1:" + this.grpcPorts[1];
 		// @formatter:off
 		String[] args = new String[] {
-				"--server.port=" + freePort(), "--spring.grpc.server.port=" + this.grpcPorts[index],
+				"--server.port=" + TestPorts.freePort(), "--spring.grpc.server.port=" + this.grpcPorts[index],
 				"--sluice.data-port=" + this.dataPorts[index], "--sluice.token=" + TOKEN,
 				"--sluice.node.id=" + this.nodeNames[index], "--sluice.cluster.nodes=" + membership,
 				"--sluice.cluster.warmup=1s", "--spring.grpc.server.ssl.bundle=" + SERVER_BUNDLE,
@@ -381,15 +381,6 @@ class ClusterGrpcMutualTlsE2ETests {
 		this.clients[0] = new SpringApplicationBuilder(SluiceClientApplication.class).run(all);
 	}
 
-	private static int freePort() {
-		try (ServerSocket socket = new ServerSocket(0)) {
-			return socket.getLocalPort();
-		}
-		catch (Exception e) {
-			throw new IllegalStateException(e);
-		}
-	}
-
 	private static void closeContext(@org.jspecify.annotations.Nullable ConfigurableApplicationContext context) {
 		if (context != null) {
 			context.close();
@@ -431,8 +422,8 @@ class ClusterGrpcMutualTlsE2ETests {
 	@Test
 	void bothNodesRequireAndAcceptTheClientCertificate() throws Exception {
 		for (int i = 0; i < this.grpcPorts.length; i++) {
-			this.grpcPorts[i] = freePort();
-			this.dataPorts[i] = freePort();
+			this.grpcPorts[i] = TestPorts.freePort();
+			this.dataPorts[i] = TestPorts.freePort();
 		}
 		int upstreamPort = this.startPlainUpstream("mtls-tunnel-ok");
 		this.startServer(0);
@@ -451,8 +442,8 @@ class ClusterGrpcMutualTlsE2ETests {
 
 	@Test
 	void clientsWithDistinctCertificatesTunnelSideBySide() throws Exception {
-		this.grpcPorts[0] = freePort();
-		this.dataPorts[0] = freePort();
+		this.grpcPorts[0] = TestPorts.freePort();
+		this.dataPorts[0] = TestPorts.freePort();
 		int upstream1 = this.startPlainUpstream("mtls-client1-ok");
 		int upstream2 = this.startPlainUpstream("mtls-client2-ok");
 		this.startServer(0);
@@ -474,8 +465,8 @@ class ClusterGrpcMutualTlsE2ETests {
 
 	@Test
 	void clientWithoutCertificateIsRejected() throws Exception {
-		this.grpcPorts[0] = freePort();
-		this.dataPorts[0] = freePort();
+		this.grpcPorts[0] = TestPorts.freePort();
+		this.dataPorts[0] = TestPorts.freePort();
 		this.startServer(0);
 		this.startUnbundledClient("--sluice.client.upstream[0].host=" + HOST,
 				"--sluice.client.upstream[0].target=http://127.0.0.1:1");
@@ -489,8 +480,8 @@ class ClusterGrpcMutualTlsE2ETests {
 
 	@Test
 	void dataPlaneTerminatesTlsOverTheMutualTlsTunnel() throws Exception {
-		this.grpcPorts[0] = freePort();
-		this.dataPorts[0] = freePort();
+		this.grpcPorts[0] = TestPorts.freePort();
+		this.dataPorts[0] = TestPorts.freePort();
 		int upstreamPort = this.startPlainUpstream("mtls-tls-termination-ok");
 		// the data plane terminates TLS with the same server certificate
 		this.startServer(0, "--sluice.data-tls-bundle=" + DATA_BUNDLE,
@@ -515,8 +506,8 @@ class ClusterGrpcMutualTlsE2ETests {
 
 	@Test
 	void dataPlanePassesTlsThroughToTheUpstreamOverTheMutualTlsTunnel() throws Exception {
-		this.grpcPorts[0] = freePort();
-		this.dataPorts[0] = freePort();
+		this.grpcPorts[0] = TestPorts.freePort();
+		this.dataPorts[0] = TestPorts.freePort();
 		this.startTlsUpstream("mtls-passthru:");
 		this.startServer(0);
 		this.startClient(1, "--sluice.client.upstream[0].host=" + PASSTHRU_HOST,

@@ -1,6 +1,5 @@
 package am.ik.sluice.it;
 
-import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.UUID;
@@ -50,20 +49,11 @@ class GrpcKeepAliveTest {
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
-		grpcPort = freePort();
+		grpcPort = TestPorts.freePort();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
-		registry.add("sluice.data-port", () -> String.valueOf(freePort()));
+		registry.add("sluice.data-port", () -> String.valueOf(TestPorts.freePort()));
 		registry.add("sluice.token", () -> "it-token");
-		registry.add("server.port", () -> String.valueOf(freePort()));
-	}
-
-	private static int freePort() {
-		try (ServerSocket socket = new ServerSocket(0)) {
-			return socket.getLocalPort();
-		}
-		catch (Exception e) {
-			throw new IllegalStateException(e);
-		}
+		registry.add("server.port", () -> String.valueOf(TestPorts.freePort()));
 	}
 
 	@BeforeAll

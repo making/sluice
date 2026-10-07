@@ -140,7 +140,7 @@ class ClusterFanoutE2ETests {
 				+ "=grpc://127.0.0.1:" + this.grpcPorts[1] + "," + this.nodeNames[2] + "=grpc://127.0.0.1:"
 				+ this.grpcPorts[2];
 		ConfigurableApplicationContext context = new SpringApplicationBuilder(SluiceServerApplication.class).run(
-				"--server.port=" + freePort(), "--spring.grpc.server.port=" + this.grpcPorts[index],
+				"--server.port=" + TestPorts.freePort(), "--spring.grpc.server.port=" + this.grpcPorts[index],
 				"--sluice.data-port=" + this.dataPorts[index], "--sluice.token=" + TOKEN,
 				"--sluice.node.id=" + this.nodeNames[index], "--sluice.cluster.nodes=" + membership,
 				"--sluice.cluster.warmup=1s", "--sluice.cluster.drain-grace=10s", "--sluice.tcp-port-range=" + TCP_PORT,
@@ -159,15 +159,6 @@ class ClusterFanoutE2ETests {
 				"--sluice.client.upstream[1].listen-port=" + TCP_PORT, "--sluice.token=" + TOKEN, "--server.port=0",
 				"--management.server.port=0");
 		this.clientContext = context;
-	}
-
-	private static int freePort() {
-		try (ServerSocket socket = new ServerSocket(0)) {
-			return socket.getLocalPort();
-		}
-		catch (Exception e) {
-			throw new IllegalStateException(e);
-		}
 	}
 
 	private static void closeContext(@org.jspecify.annotations.Nullable ConfigurableApplicationContext context) {
@@ -243,8 +234,8 @@ class ClusterFanoutE2ETests {
 	void bothNodesServeAndClientFailsOver() throws Exception {
 		startUpstreams();
 		for (int i = 0; i < 3; i++) {
-			this.grpcPorts[i] = freePort();
-			this.dataPorts[i] = freePort();
+			this.grpcPorts[i] = TestPorts.freePort();
+			this.dataPorts[i] = TestPorts.freePort();
 		}
 		startServer(0);
 		startServer(1);
@@ -269,8 +260,8 @@ class ClusterFanoutE2ETests {
 	void addedNodeIsPickedUpThroughTheMembershipPush() throws Exception {
 		startUpstreams();
 		for (int i = 0; i < 3; i++) {
-			this.grpcPorts[i] = freePort();
-			this.dataPorts[i] = freePort();
+			this.grpcPorts[i] = TestPorts.freePort();
+			this.dataPorts[i] = TestPorts.freePort();
 		}
 		startServer(0);
 		startServer(1);
@@ -288,8 +279,8 @@ class ClusterFanoutE2ETests {
 	void drainLetsInFlightConnectionFinish() throws Exception {
 		startUpstreams();
 		for (int i = 0; i < 3; i++) {
-			this.grpcPorts[i] = freePort();
-			this.dataPorts[i] = freePort();
+			this.grpcPorts[i] = TestPorts.freePort();
+			this.dataPorts[i] = TestPorts.freePort();
 		}
 		startServer(0);
 		startServer(1);

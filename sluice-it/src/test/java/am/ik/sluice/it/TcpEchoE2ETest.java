@@ -62,10 +62,10 @@ class TcpEchoE2ETest {
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
-		grpcPort = freePort();
-		dataPort = freePort();
-		tcpRoutePort = freePort();
-		unclaimedRoutePort = freePort();
+		grpcPort = TestPorts.freePort();
+		dataPort = TestPorts.freePort();
+		tcpRoutePort = TestPorts.freePort();
+		unclaimedRoutePort = TestPorts.freePort();
 		try {
 			ServerSocket server = new ServerSocket();
 			server.setReuseAddress(true);
@@ -82,15 +82,6 @@ class TcpEchoE2ETest {
 		registry.add("sluice.tcp-port-range", () -> String.valueOf(tcpRoutePort));
 		registry.add("sluice.token", () -> "it-token");
 		registry.add("server.port", () -> 0);
-	}
-
-	private static int freePort() {
-		try (ServerSocket socket = new ServerSocket(0)) {
-			return socket.getLocalPort();
-		}
-		catch (Exception e) {
-			throw new IllegalStateException(e);
-		}
 	}
 
 	private static ServerSocket server() {

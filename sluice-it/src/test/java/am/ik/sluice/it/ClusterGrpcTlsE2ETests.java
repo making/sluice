@@ -3,7 +3,6 @@ package am.ik.sluice.it;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -152,7 +151,7 @@ class ClusterGrpcTlsE2ETests {
 				+ "=grpcs://127.0.0.1:" + this.grpcPorts[1];
 		// @formatter:off
 		ConfigurableApplicationContext context = new SpringApplicationBuilder(SluiceServerApplication.class).run(
-				"--server.port=" + freePort(), "--spring.grpc.server.port=" + this.grpcPorts[index],
+				"--server.port=" + TestPorts.freePort(), "--spring.grpc.server.port=" + this.grpcPorts[index],
 				"--sluice.data-port=" + this.dataPorts[index], "--sluice.token=" + TOKEN,
 				"--sluice.node.id=" + this.nodeNames[index], "--sluice.cluster.nodes=" + membership,
 				"--sluice.cluster.warmup=1s", "--spring.grpc.server.ssl.bundle=" + GRPC_TLS_BUNDLE,
@@ -172,15 +171,6 @@ class ClusterGrpcTlsE2ETests {
 				"--sluice.token=" + TOKEN, "--server.port=0", "--management.server.port=0");
 		// @formatter:on
 		this.clientContext = context;
-	}
-
-	private static int freePort() {
-		try (ServerSocket socket = new ServerSocket(0)) {
-			return socket.getLocalPort();
-		}
-		catch (Exception e) {
-			throw new IllegalStateException(e);
-		}
 	}
 
 	private static void closeContext(@org.jspecify.annotations.Nullable ConfigurableApplicationContext context) {
@@ -231,8 +221,8 @@ class ClusterGrpcTlsE2ETests {
 	void bothNodesServeOverTlsAndClientFailsOver() throws Exception {
 		startUpstreams();
 		for (int i = 0; i < this.grpcPorts.length; i++) {
-			this.grpcPorts[i] = freePort();
-			this.dataPorts[i] = freePort();
+			this.grpcPorts[i] = TestPorts.freePort();
+			this.dataPorts[i] = TestPorts.freePort();
 		}
 		startServer(0);
 		startServer(1);
@@ -254,8 +244,8 @@ class ClusterGrpcTlsE2ETests {
 	void controlPlaneNegotiatesH2OverTls() throws Exception {
 		startUpstreams();
 		for (int i = 0; i < this.grpcPorts.length; i++) {
-			this.grpcPorts[i] = freePort();
-			this.dataPorts[i] = freePort();
+			this.grpcPorts[i] = TestPorts.freePort();
+			this.dataPorts[i] = TestPorts.freePort();
 		}
 		startServer(0);
 		// the server cert is the trust anchor: the TLS endpoint really is the gRPC port

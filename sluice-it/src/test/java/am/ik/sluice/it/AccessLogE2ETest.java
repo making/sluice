@@ -1,7 +1,6 @@
 package am.ik.sluice.it;
 
 import java.net.InetSocketAddress;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -75,21 +74,12 @@ class AccessLogE2ETest {
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
-		grpcPort = freePort();
-		dataPort = freePort();
+		grpcPort = TestPorts.freePort();
+		dataPort = TestPorts.freePort();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.token", () -> "it-token");
-		registry.add("server.port", () -> String.valueOf(freePort()));
-	}
-
-	private static int freePort() {
-		try (ServerSocket socket = new ServerSocket(0)) {
-			return socket.getLocalPort();
-		}
-		catch (Exception e) {
-			throw new IllegalStateException(e);
-		}
+		registry.add("server.port", () -> String.valueOf(TestPorts.freePort()));
 	}
 
 	private void startClient() {

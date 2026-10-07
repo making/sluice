@@ -3,7 +3,6 @@ package am.ik.sluice.it;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -80,27 +79,12 @@ class ServerShutdownE2ETest {
 		}
 	}
 
-	private static int freePort() throws Exception {
-		try (ServerSocket socket = new ServerSocket(0)) {
-			return socket.getLocalPort();
-		}
-	}
-
 	private void startServer() {
-		this.grpcPort = freePortUnchecked();
-		this.dataPort = freePortUnchecked();
+		this.grpcPort = TestPorts.freePort();
+		this.dataPort = TestPorts.freePort();
 		this.serverContext = new SpringApplicationBuilder(SluiceServerApplication.class).run("--server.port=0",
 				"--spring.grpc.server.port=" + this.grpcPort, "--sluice.data-port=" + this.dataPort,
 				"--sluice.token=it-token", "--sluice.cluster.drain-grace=" + DRAIN_GRACE.getSeconds() + "s");
-	}
-
-	private static int freePortUnchecked() {
-		try {
-			return freePort();
-		}
-		catch (Exception e) {
-			throw new IllegalStateException(e);
-		}
 	}
 
 	private void startClient() {

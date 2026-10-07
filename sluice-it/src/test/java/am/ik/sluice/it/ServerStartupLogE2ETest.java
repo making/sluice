@@ -1,7 +1,5 @@
 package am.ik.sluice.it;
 
-import java.net.ServerSocket;
-
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 
@@ -25,23 +23,14 @@ class ServerStartupLogE2ETest {
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
-		registry.add("spring.grpc.server.port", () -> String.valueOf(freePort()));
-		registry.add("sluice.data-port", () -> String.valueOf(freePort()));
+		registry.add("spring.grpc.server.port", () -> String.valueOf(TestPorts.freePort()));
+		registry.add("sluice.data-port", () -> String.valueOf(TestPorts.freePort()));
 		registry.add("sluice.token", () -> "it-token");
 	}
 
 	@Test
 	void startsWithoutIntrospectionFailures(CapturedOutput output) {
 		assertThat(output.getAll()).contains("Started ServerStartupLogE2ETest").doesNotContain("Failed to introspect");
-	}
-
-	private static int freePort() {
-		try (ServerSocket socket = new ServerSocket(0)) {
-			return socket.getLocalPort();
-		}
-		catch (Exception e) {
-			throw new IllegalStateException(e);
-		}
 	}
 
 }

@@ -86,16 +86,10 @@ class TunnelReconnectTests {
 		this.clientContext = context;
 	}
 
-	private void pickPorts() throws Exception {
-		this.grpcPort = freePort();
-		this.dataPort = freePort();
-		this.webPort = freePort();
-	}
-
-	private static int freePort() throws Exception {
-		try (ServerSocket socket = new ServerSocket(0)) {
-			return socket.getLocalPort();
-		}
+	private void pickPorts() {
+		this.grpcPort = TestPorts.freePort();
+		this.dataPort = TestPorts.freePort();
+		this.webPort = TestPorts.freePort();
 	}
 
 	private static void closeQuietly(@org.jspecify.annotations.Nullable ConfigurableApplicationContext context) {

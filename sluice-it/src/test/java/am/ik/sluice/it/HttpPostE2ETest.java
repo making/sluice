@@ -136,13 +136,13 @@ class HttpPostE2ETest {
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) throws Exception {
-		grpcPort = freePort();
-		dataPort = freePort();
+		grpcPort = TestPorts.freePort();
+		dataPort = TestPorts.freePort();
 		keystorePath = createKeystore();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.token", () -> "it-token");
-		registry.add("server.port", () -> String.valueOf(freePort()));
+		registry.add("server.port", () -> String.valueOf(TestPorts.freePort()));
 		registry.add("spring.ssl.bundle.jks.data-plane.keystore.location",
 				() -> "file:" + requireNonNull(keystorePath).toAbsolutePath());
 		registry.add("spring.ssl.bundle.jks.data-plane.keystore.password", () -> "changeit");
@@ -178,15 +178,6 @@ class HttpPostE2ETest {
 		SSLContext sslContext = SSLContext.getInstance("TLS");
 		sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
 		return sslContext;
-	}
-
-	private static int freePort() {
-		try (ServerSocket socket = new ServerSocket(0)) {
-			return socket.getLocalPort();
-		}
-		catch (Exception e) {
-			throw new IllegalStateException(e);
-		}
 	}
 
 	private TunnelClient startClient(String host, String targetUrl) {

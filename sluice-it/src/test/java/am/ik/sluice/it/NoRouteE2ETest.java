@@ -2,7 +2,6 @@ package am.ik.sluice.it;
 
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -53,8 +52,8 @@ class NoRouteE2ETest {
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
-		dataPort = freePort();
-		registry.add("spring.grpc.server.port", () -> String.valueOf(freePort()));
+		dataPort = TestPorts.freePort();
+		registry.add("spring.grpc.server.port", () -> String.valueOf(TestPorts.freePort()));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.token", () -> "it-token");
 	}
@@ -195,15 +194,6 @@ class NoRouteE2ETest {
 			socket.getOutputStream().write(request.getBytes(StandardCharsets.US_ASCII));
 			socket.getOutputStream().flush();
 			return new String(socket.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-		}
-	}
-
-	private static int freePort() {
-		try (ServerSocket socket = new ServerSocket(0)) {
-			return socket.getLocalPort();
-		}
-		catch (Exception e) {
-			throw new IllegalStateException(e);
 		}
 	}
 

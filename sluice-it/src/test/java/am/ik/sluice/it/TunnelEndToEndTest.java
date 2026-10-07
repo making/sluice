@@ -3,7 +3,6 @@ package am.ik.sluice.it;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -71,22 +70,13 @@ class TunnelEndToEndTest {
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
-		grpcPort = freePort();
-		dataPort = freePort();
-		int webPort = freePort();
+		grpcPort = TestPorts.freePort();
+		dataPort = TestPorts.freePort();
+		int webPort = TestPorts.freePort();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.token", () -> "it-token");
 		registry.add("server.port", () -> String.valueOf(webPort));
-	}
-
-	private static int freePort() {
-		try (ServerSocket socket = new ServerSocket(0)) {
-			return socket.getLocalPort();
-		}
-		catch (Exception e) {
-			throw new IllegalStateException(e);
-		}
 	}
 
 	/** Starts the real client against the running server and waits for registration. */

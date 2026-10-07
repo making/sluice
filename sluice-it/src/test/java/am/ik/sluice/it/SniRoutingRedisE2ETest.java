@@ -1,7 +1,6 @@
 package am.ik.sluice.it;
 
 import java.io.IOException;
-import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -115,8 +114,8 @@ class SniRoutingRedisE2ETest {
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
-		grpcPort = freePort();
-		dataPort = freePort();
+		grpcPort = TestPorts.freePort();
+		dataPort = TestPorts.freePort();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.token", () -> "it-token");
@@ -125,15 +124,6 @@ class SniRoutingRedisE2ETest {
 				() -> "file:" + TLS_DIR.resolve("server.p12").toAbsolutePath());
 		registry.add("spring.ssl.bundle.jks.data-plane.keystore.password", () -> STORE_PASSWORD);
 		registry.add("sluice.data-tls-bundle", () -> "data-plane");
-	}
-
-	private static int freePort() {
-		try (ServerSocket socket = new ServerSocket(0)) {
-			return socket.getLocalPort();
-		}
-		catch (Exception e) {
-			throw new IllegalStateException(e);
-		}
 	}
 
 	@Autowired
