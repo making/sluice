@@ -54,6 +54,8 @@ public final class TunnelSession implements AutoCloseable {
 
 	private final TcpRouteListener tcpRoutes;
 
+	private final SessionRegistry registry;
+
 	private final AtomicLong sequence = new AtomicLong(1);
 
 	private final ConcurrentMap<Long, VirtualConnection> connections = new ConcurrentHashMap<>();
@@ -77,6 +79,7 @@ public final class TunnelSession implements AutoCloseable {
 		this.router = router;
 		this.sender = sender;
 		this.tcpRoutes = tcpRoutes;
+		this.registry = registry;
 		registry.register(this);
 	}
 
@@ -316,6 +319,7 @@ public final class TunnelSession implements AutoCloseable {
 			return;
 		}
 		this.closed = true;
+		this.registry.remove(this);
 		log.info("closing session for client {}", this.clientId);
 		this.tcpRoutes.reconcile(this.clientId, Set.of());
 		this.router.remove(this.clientId);

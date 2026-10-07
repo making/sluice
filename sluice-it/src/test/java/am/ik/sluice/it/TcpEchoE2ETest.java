@@ -140,7 +140,10 @@ class TcpEchoE2ETest {
 			.build();
 		started.start();
 		this.client = started;
-		Awaitility.await().atMost(Duration.ofSeconds(5)).until(this.sessions::count, count -> count > 0);
+		// a rejected advertise makes the client close the stream and re-advertise with
+		// backoff, so the registry only holds a session for a moment; wait for the first
+		// exchange with the server instead (the counters only grow)
+		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> this.sessions.count() > 0 || rejectedCount() >= 1);
 	}
 
 	private Upstream echoUpstream(int listenPort) {
