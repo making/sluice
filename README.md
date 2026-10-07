@@ -121,16 +121,6 @@ sluice-client/target/sluice-client --sluice.server-url=grpc://127.0.0.1:8001 ...
 sluice-server/target/sluice-server --sluice.token=SECRET ...
 ```
 
-Native container images via buildpacks (no Dockerfile; build deps first, then the app module only --
-running `build-image` on the reactor also hits the library modules):
-
-```
-./mvnw -pl sluice-client -am -Pnative -DskipTests package
-./mvnw -pl sluice-client -Pnative -DskipTests spring-boot:build-image   # sluice/client:latest
-./mvnw -pl sluice-server -am -Pnative -DskipTests package
-./mvnw -pl sluice-server -Pnative -DskipTests spring-boot:build-image   # sluice/server:latest
-```
-
 TLS termination on the data port (same upstream / server / client):
 
 ```
@@ -455,11 +445,18 @@ template); static assets ship pre-compressed (`.br` / `.gz`) and content-hashed.
 
 ## Docker
 
-Images are built with Cloud Native Buildpacks (Spring Boot plugin, no Dockerfile):
+Images are built with Cloud Native Buildpacks (Spring Boot plugin, no Dockerfile). Build deps
+first, then the app module only -- running `build-image` on the reactor also hits the library
+modules. Append `-Pnative` for GraalVM native images:
 
 ```
 ./mvnw -pl sluice-server -am package spring-boot:build-image -DskipTests
 ./mvnw -pl sluice-client -am package spring-boot:build-image -DskipTests
+
+./mvnw -pl sluice-server -am -Pnative -DskipTests package
+./mvnw -pl sluice-server -Pnative -DskipTests spring-boot:build-image   # native image
+./mvnw -pl sluice-client -am -Pnative -DskipTests package
+./mvnw -pl sluice-client -Pnative -DskipTests spring-boot:build-image   # native image
 ```
 
 This produces `sluice/server:latest` and `sluice/client:latest`. Run:
