@@ -89,43 +89,54 @@ class PreserveHostE2ETest {
 		});
 	}
 
+	/**
+	 * Answers every request head arriving on the socket, one canned response per parsed
+	 * head, so several requests can share a single connection.
+	 */
 	private static void serveH2(Socket socket) {
 		try (socket) {
 			InputStream in = socket.getInputStream();
 			ByteArrayOutputStream buffer = new ByteArrayOutputStream();
 			byte[] chunk = new byte[1024];
-			String authority = null;
-			while (authority == null) {
+			boolean prefaceSeen = false;
+			while (true) {
 				int n = in.read(chunk);
 				if (n < 0) {
 					return;
 				}
 				buffer.write(chunk, 0, n);
 				byte[] bytes = buffer.toByteArray();
-				authority = authorityOf(bytes);
-				if (authority == null && !ConnectionHeadParser.isHttp2(bytes)) {
+				if (!prefaceSeen && !ConnectionHeadParser.isHttp2(bytes)) {
 					return;
 				}
+				// later requests arrive without the preface; the parser expects it, and
+				// the
+				// re-encoded heads carry no dynamic table references so a fresh decoder
+				// per
+				// request parses them
+				InputStream stream = prefaceSeen ? new java.io.ByteArrayInputStream(concat(TestH2.PREFACE, bytes))
+						: new java.io.ByteArrayInputStream(bytes);
+				ConnectionHeadParser.Head head = new ConnectionHeadParser(64 * 1024).parse(stream).orElse(null);
+				if (head == null || head.request() == null || head.host() == null) {
+					continue;
+				}
+				prefaceSeen = true;
+				int streamId = head.h2() == null ? 1 : head.h2().streamId();
+				buffer.reset();
+				socket.getOutputStream().write(TestH2.cannedResponse(streamId, head.host()));
+				socket.getOutputStream().flush();
 			}
-			socket.getOutputStream().write(TestH2.cannedResponse(1, authority));
-			socket.getOutputStream().flush();
-			in.read(new byte[1]); // keep the relay open until the client hangs up
 		}
 		catch (Exception e) {
 			// connection ended
 		}
 	}
 
-	/**
-	 * Parses the buffered bytes with the production head parser; null while partial.
-	 */
-	private static @Nullable String authorityOf(byte[] bytes) {
-		if (!ConnectionHeadParser.isHttp2(bytes)) {
-			return null;
-		}
-		return new ConnectionHeadParser(64 * 1024).parse(new java.io.ByteArrayInputStream(bytes))
-			.map(ConnectionHeadParser.Head::host)
-			.orElse(null);
+	private static byte[] concat(byte[] a, byte[] b) {
+		byte[] out = new byte[a.length + b.length];
+		System.arraycopy(a, 0, out, 0, a.length);
+		System.arraycopy(b, 0, out, a.length, b.length);
+		return out;
 	}
 
 	@DynamicPropertySource
@@ -236,6 +247,75 @@ class PreserveHostE2ETest {
 			assertThat(TestH2.bodyOf(TestH2.readResponseFrames(socket.getInputStream())))
 				.isEqualTo("127.0.0.1:" + port);
 		}
+	}
+
+	@Test
+	void disabledPreserveHostRewritesHttp1HostOnKeepAliveConnection() throws Exception {
+		int port = http1Upstream.getAddress().getPort();
+		String host = "keepalive.rewrite.local";
+		startClient(host, "http://127.0.0.1:" + port, false);
+		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+			socket.setSoTimeout(10_000);
+			String first = exchange(socket, host);
+			String second = exchange(socket, host);
+			assertThat(first).isEqualTo("Host=127.0.0.1:" + port);
+			assertThat(second).isEqualTo("Host=127.0.0.1:" + port);
+		}
+	}
+
+	@Test
+	void disabledPreserveHostRewritesH2AuthorityOnSecondRequestOfSameConnection() throws Exception {
+		int port = h2Upstream.getLocalPort();
+		String host = "h2.keepalive.local";
+		startClient(host, "http://127.0.0.1:" + port, false);
+		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+			socket.setSoTimeout(10_000);
+			TestH2.writeClientHead(socket.getOutputStream(), 1, ":authority=" + host, ":method=GET", ":path=/");
+			assertThat(TestH2.bodyOf(TestH2.readResponseFrames(socket.getInputStream())))
+				.isEqualTo("127.0.0.1:" + port);
+			TestH2.writeFrame(socket.getOutputStream(), TestH2.HEADERS,
+					TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 3,
+					TestH2.headerBlock(":authority=" + host, ":method=GET", ":path=/"));
+			assertThat(TestH2.bodyOf(TestH2.readResponseFrames(socket.getInputStream())))
+				.isEqualTo("127.0.0.1:" + port);
+		}
+	}
+
+	/**
+	 * Sends one keep-alive request on the open socket and returns the response body.
+	 */
+	private static String exchange(Socket socket, String host) throws Exception {
+		socket.getOutputStream()
+			.write(("GET / HTTP/1.1\r\nHost: " + host + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+		socket.getOutputStream().flush();
+		InputStream in = socket.getInputStream();
+		ByteArrayOutputStream head = new ByteArrayOutputStream();
+		int current;
+		while ((current = in.read()) >= 0) {
+			head.write(current);
+			if (endsWithBlankLine(head)) {
+				break;
+			}
+		}
+		String[] lines = head.toString(StandardCharsets.UTF_8).split("\r\n");
+		int contentLength = 0;
+		for (String line : lines) {
+			int colon = line.indexOf(':');
+			if (colon > 0 && "content-length".equalsIgnoreCase(line.substring(0, colon))) {
+				contentLength = Integer.parseInt(line.substring(colon + 1).trim());
+			}
+		}
+		ByteArrayOutputStream body = new ByteArrayOutputStream();
+		for (int i = 0; i < contentLength; i++) {
+			body.write(in.read());
+		}
+		return body.toString(StandardCharsets.UTF_8);
+	}
+
+	private static boolean endsWithBlankLine(ByteArrayOutputStream stream) {
+		byte[] bytes = stream.toByteArray();
+		return bytes.length >= 4 && bytes[bytes.length - 4] == '\r' && bytes[bytes.length - 3] == '\n'
+				&& bytes[bytes.length - 2] == '\r' && bytes[bytes.length - 1] == '\n';
 	}
 
 }

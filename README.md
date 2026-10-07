@@ -2,7 +2,7 @@
 
 HTTP tunnel over a gRPC bidirectional stream, built on Spring Boot 4.1 and Spring gRPC.
 
-A single gRPC bidi stream multiplexes virtual TCP connections (`conn_id`). The data plane is a raw TCP proxy: only the Host header of the first request is inspected, so WebSocket upgrades and HTTP keep-alive pass through transparently. All blocking I/O runs on virtual threads; outbound frames flow through a bounded queue honoring gRPC flow control.
+A single gRPC bidi stream multiplexes virtual TCP connections (`conn_id`). The data plane is a raw TCP proxy: the request head is inspected for routing (Host / :authority), so WebSocket upgrades and HTTP keep-alive pass through transparently. All blocking I/O runs on virtual threads; outbound frames flow through a bounded queue honoring gRPC flow control.
 
 ## Architecture
 
@@ -516,3 +516,8 @@ docker run -p 8000:8000 -p 8001:8001 sluice-server --sluice.token=SECRET
 docker run sluice-client --sluice.server-url=grpc://host.docker.internal:8001 \
   '--sluice.client.upstream[0]'.host=demo.local '--sluice.client.upstream[0]'.target=http://host.docker.internal:3000 --sluice.token=SECRET
 ```
+
+## Constraints and notes
+
+- The data plane relays raw bytes. With `preserve-host=false` the authority (`Host` / `:authority`) is rewritten on every request of the connection by a best-effort stream rewriter (both HTTP/1.1 and h2): upgraded connections (WebSocket, h2c upgrade, CONNECT) are rewritten up to the protocol switch, and any head or frame the rewriter cannot reproduce (non ASCII headers, HPACK failures) degrades that connection to verbatim passthrough.
+- h2 specific: the rewriter assumes the upstream negotiates the spec-default frame and HPACK limits (16 KiB max frame size, 4096 header table size, 64 KiB header list) and does not track tighter upstream SETTINGS values.

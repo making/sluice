@@ -14,7 +14,7 @@ stale `~/.m2` snapshots and fails with misleading `NoSuchMethodError`s.
 - `sluice-it`: full stack E2E tests (real server + client apps in one JVM); E2E tests live here, not in the app modules
 - `sluice-example-upstream`: minimal sample upstream (`It works`, http/1.1 + h2c) for manual checks
 
-The data plane relays raw bytes (only the Host header of the first request is inspected). Honoring half-close (CLOSE frame) is essential for keep-alive / WebSocket passthrough.
+The data plane relays raw bytes (the request head is inspected for routing; with `preserve-host=false` every request head is rewritten on the wire). Honoring half-close (CLOSE frame) is essential for keep-alive / WebSocket passthrough.
 
 ## Conventions
 
