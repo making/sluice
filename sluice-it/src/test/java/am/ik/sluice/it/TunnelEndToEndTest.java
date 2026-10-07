@@ -143,19 +143,28 @@ class TunnelEndToEndTest {
 	}
 
 	@Test
-	void relayedBytesAreCountedPerRoute() throws Exception {
+	void relayedBytesAreCountedPerRouteAndDirection() throws Exception {
 		startClient();
+		String request = "GET / HTTP/1.1\r\nHost: demo.local\r\nConnection: close\r\n\r\n";
 		exchange(false);
 		Awaitility.await()
 			.atMost(Duration.ofSeconds(5))
 			.until(() -> this.meterRegistry.find("sluice.tunnel.bytes")
-				.tags("direction", "data", "route", "demo.local")
+				.tags("direction", "outbound", "route", "demo.local")
 				.counter() != null);
-		Counter counter = this.meterRegistry.find("sluice.tunnel.bytes")
-			.tags("direction", "data", "route", "demo.local")
+		Counter inbound = this.meterRegistry.find("sluice.tunnel.bytes")
+			.tags("direction", "inbound", "route", "demo.local")
 			.counter();
-		assertThat(counter).isNotNull();
-		assertThat(counter.count()).isPositive();
+		Counter outbound = this.meterRegistry.find("sluice.tunnel.bytes")
+			.tags("direction", "outbound", "route", "demo.local")
+			.counter();
+		assertThat(inbound).isNotNull();
+		assertThat(outbound).isNotNull();
+		// counters are byte-accurate: the relayed totals cover the full request and the
+		// 19-byte "hello-from-upstream" body plus its response head
+		assertThat(inbound.count()).isGreaterThanOrEqualTo(request.length());
+		assertThat(outbound.count())
+			.isGreaterThanOrEqualTo("hello-from-upstream".getBytes(StandardCharsets.UTF_8).length);
 	}
 
 	@Test

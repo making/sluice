@@ -285,7 +285,8 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 
 	private StreamRelay.Listener relayedBytes(Router.Route route, TunnelSession session,
 			AccessLogger.Connection access) {
-		Counter counter = this.meterRegistry.counter(METRIC_NAME, "direction", "data", "route", route.routeTag());
+		Counter inbound = this.meterRegistry.counter(METRIC_NAME, "direction", "inbound", "route", route.routeTag());
+		Counter outbound = this.meterRegistry.counter(METRIC_NAME, "direction", "outbound", "route", route.routeTag());
 		return new StreamRelay.Listener() {
 
 			@Override
@@ -294,7 +295,7 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 
 			@Override
 			public void onBytesRelayed(long count, StreamRelay.Direction direction) {
-				counter.increment();
+				(direction == StreamRelay.Direction.TO_REMOTE ? inbound : outbound).increment(count);
 				session.recordRelayed(count, direction);
 				access.bytes(count, direction);
 			}
