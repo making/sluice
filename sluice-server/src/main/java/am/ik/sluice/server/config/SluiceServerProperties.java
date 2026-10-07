@@ -19,13 +19,14 @@ import am.ik.sluice.server.route.LoadBalance;
  * single ports or {@code min-max} ranges, e.g. {@code 9000-9010,8080}; empty = any port)
  * @param httpLoadBalance load balancing applied when several clients serve the same
  * domain (http routes)
+ * @param console management console settings (authentication)
  * @param tcpLoadBalance load balancing applied when several clients serve the same listen
  * port (tcp routes)
  */
 @ConfigurationProperties("sluice")
 public record SluiceServerProperties(String token, @Nullable String tokenFile, @DefaultValue("0.0.0.0") String dataHost,
 		@DefaultValue("8000") int dataPort, @Nullable String dataTlsBundle, @DefaultValue("") String tcpPortRange,
-		AccessLog accessLog, Node node, Cluster cluster,
+		AccessLog accessLog, Node node, Cluster cluster, Console console,
 		@DefaultValue("smallest-client-id") LoadBalance httpLoadBalance,
 		@DefaultValue("smallest-client-id") LoadBalance tcpLoadBalance) {
 
@@ -34,6 +35,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		accessLog = accessLog == null ? AccessLog.builder().build() : accessLog;
 		node = node == null ? Node.builder().build() : node;
 		cluster = cluster == null ? Cluster.builder().build() : cluster;
+		console = console == null ? Console.builder().build() : console;
 	}
 
 	public boolean clusterEnabled() {
@@ -294,6 +296,64 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 	}
 
+	/**
+	 * Management console settings.
+	 *
+	 * @param auth console authentication; the console is always authenticated, only the
+	 * mechanism varies
+	 */
+	public record Console(Auth auth) {
+
+		/**
+		 * Console authentication mechanism.
+		 *
+		 * @param SIMPLE form login against {@code spring.security.user.*}
+		 * @param OIDC OpenID Connect login against
+		 * {@code spring.security.oauth2.client.*}
+		 */
+		public enum AuthType {
+
+			/** Username / password form login. */
+			SIMPLE,
+
+			/** OpenID Connect login. */
+			OIDC
+
+		}
+
+		/**
+		 * Console authentication settings.
+		 *
+		 * @param type authentication mechanism ({@code simple} by default)
+		 */
+		public record Auth(@DefaultValue("simple") AuthType type) {
+
+		}
+
+		public static Builder builder() {
+			return new Builder();
+		}
+
+		public static final class Builder {
+
+			@Nullable private Auth auth;
+
+			private Builder() {
+			}
+
+			public Builder auth(Auth auth) {
+				this.auth = auth;
+				return this;
+			}
+
+			public Console build() {
+				return new Console(this.auth == null ? new Auth(AuthType.SIMPLE) : this.auth);
+			}
+
+		}
+
+	}
+
 	public static Builder builder() {
 		return new Builder();
 	}
@@ -317,6 +377,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		@Nullable private Node node;
 
 		@Nullable private Cluster cluster;
+
+		@Nullable private Console console;
 
 		private LoadBalance httpLoadBalance = LoadBalance.SMALLEST_CLIENT_ID;
 
@@ -370,6 +432,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			return this;
 		}
 
+		public Builder console(Console console) {
+			this.console = console;
+			return this;
+		}
+
 		public Builder httpLoadBalance(LoadBalance httpLoadBalance) {
 			this.httpLoadBalance = httpLoadBalance;
 			return this;
@@ -385,7 +452,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort, this.dataTlsBundle,
 					this.tcpPortRange, this.accessLog == null ? AccessLog.builder().build() : this.accessLog,
 					this.node == null ? Node.builder().build() : this.node,
-					this.cluster == null ? Cluster.builder().build() : this.cluster, this.httpLoadBalance,
+					this.cluster == null ? Cluster.builder().build() : this.cluster,
+					this.console == null ? Console.builder().build() : this.console, this.httpLoadBalance,
 					this.tcpLoadBalance);
 		}
 

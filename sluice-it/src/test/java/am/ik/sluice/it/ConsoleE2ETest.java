@@ -57,6 +57,10 @@ class ConsoleE2ETest {
 
 	private static final String CLIENT_ID = "console-client";
 
+	private static final String CONSOLE_USER = "console-e2e";
+
+	private static final String CONSOLE_PASSWORD = "console-pass";
+
 	/** A second client on the same host; the larger id stands by. */
 	private static final String STANDBY_ID = "console-z";
 
@@ -103,6 +107,8 @@ class ConsoleE2ETest {
 		registry.add("sluice.tcp-port-range", () -> String.valueOf(tcpRoutePort));
 		registry.add("sluice.node.id", () -> "console-node");
 		registry.add("server.port", () -> 0);
+		registry.add("spring.security.user.name", () -> CONSOLE_USER);
+		registry.add("spring.security.user.password", () -> "{noop}" + CONSOLE_PASSWORD);
 	}
 
 	@BeforeAll
@@ -212,6 +218,17 @@ class ConsoleE2ETest {
 	void openPage() {
 		this.context = Objects.requireNonNull(this.browser).newContext();
 		this.page = this.context.newPage();
+		this.signIn(this.page);
+	}
+
+	/** Form-login through the console login page so the context carries the session. */
+	private void signIn(Page page) {
+		String base = "http://127.0.0.1:" + this.port;
+		page.navigate(base + "/console");
+		page.locator("#username").fill(CONSOLE_USER);
+		page.locator("#password").fill(CONSOLE_PASSWORD);
+		page.locator(".login-submit").click();
+		page.waitForURL(base + "/console");
 	}
 
 	@AfterEach

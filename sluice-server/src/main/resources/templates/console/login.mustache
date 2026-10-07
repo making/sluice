@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Sluice console - sign in</title>
+  <link rel="icon" type="image/svg+xml" href="{{#src}}/console/img/logo.svg{{/src}}">
+  <link rel="preload" href="{{#src}}/console/fonts/overpass.woff2{{/src}}" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="{{#src}}/console/css/console.css{{/src}}">
+  <style>
+    .login-body{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1rem}
+    .login-card{width:min(20rem,100%);display:flex;flex-direction:column;gap:1rem;padding:2rem;border:1px solid var(--line,a#ddd);border-radius:.5rem;background:var(--panel,#fff)}
+    .login-card h1{margin:0;font-size:1.1rem}
+    .login-field{display:flex;flex-direction:column;gap:.25rem}
+    .login-field label{font-size:.8rem}
+    .login-field input{padding:.4rem .5rem;border:1px solid var(--line,#bbb);border-radius:.25rem;background:inherit;color:inherit;font:inherit}
+    .login-submit{padding:.45rem .75rem;border:none;border-radius:.25rem;background:var(--accent,#0a6);color:#fff;font:inherit;cursor:pointer}
+    .login-note{margin:0;font-size:.85rem}
+    .login-providers{display:flex;flex-direction:column;gap:.5rem}
+    .login-provider{padding:.45rem .75rem;border:1px solid var(--line,#bbb);border-radius:.25rem;text-align:center;text-decoration:none;color:inherit}
+  </style>
+</head>
+<body class="login-body">
+  <main class="login-card">
+    <h1><span class="brand__word">sluice</span> <span class="brand__sub">console</span></h1>
+    {{#logout}}<p class="login-note">Signed out.</p>{{/logout}}
+    {{#error}}<p class="login-note" role="alert">{{error}}</p>{{/error}}
+    {{#simple}}
+    <form method="post" action="/login">
+      {{#_csrf}}<input type="hidden" name="{{_csrf.parameterName}}" value="{{_csrf.token}}">{{/_csrf}}
+      <div class="login-field">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username" required autofocus autocomplete="username">
+      </div>
+      <div class="login-field">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" required autocomplete="current-password">
+      </div>
+      <button class="login-submit" type="submit">Sign in</button>
+    </form>
+    {{/simple}}
+    {{^simple}}
+    <nav class="login-providers" aria-label="Sign-in providers">
+      {{#oidcClients}}<a class="login-provider" href="/oauth2/authorization/{{provider}}">{{name}}</a>{{/oidcClients}}
+    </nav>
+    {{/simple}}
+  </main>
+</body>
+</html>

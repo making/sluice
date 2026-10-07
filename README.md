@@ -512,7 +512,17 @@ tables with the client each route resolves to, the cluster membership and the ef
 settings. A "Find a route" box tells which client serves a given Host header without
 touching load balancing state. The page refreshes every 2s.
 
-The console has no authentication yet: keep `server.port` off public networks.
+### Console authentication
+
+The console requires a signed-in user; the actuator endpoints and the console static
+assets stay open. The mechanism is `sluice.console.auth.type`:
+
+- `simple` (default): form login with `spring.security.user.name` /
+  `spring.security.user.password` (`{noop}` / `{bcrypt}` prefixed values supported), e.g.
+  `docker run ... -e SPRING_SECURITY_USER_NAME=admin -e SPRING_SECURITY_USER_PASSWORD='{noop}secret'`
+- `oidc`: sign in through an OpenID Provider, configured with the standard
+  `spring.security.oauth2.client.registration.<id>.*` / `...provider.<id>.*` properties,
+  e.g. `--sluice.console.auth.type=oidc --spring.security.oauth2.client.registration.myidp.client-id=... --spring.security.oauth2.client.provider.myidp.issuer-uri=https://idp.example.com`
 
 Built with Mustache and htmx 4 (vendored in `static/console/js/vendor`, source URL in the
 template); static assets ship pre-compressed (`.br` / `.gz`) and content-hashed.
