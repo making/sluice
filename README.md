@@ -546,7 +546,8 @@ spring.security.oauth2.client.registration.microsoft-entra-id.scope=openid,email
 ```
 
 Multiple providers can be configured simultaneously; the login page shows one button per
-provider. The redirect URI to register at the provider is `http://<server>:8081/login`.
+provider. Register the redirect URI `http://<server>:8081/login/oauth2/code/<registration-id>`
+at the provider (e.g. `.../login/oauth2/code/google` for the configuration above).
 
 Built with Mustache and htmx 4 (vendored in `static/console/js/vendor`, source URL in the
 template); static assets ship pre-compressed (`.br` / `.gz`) and content-hashed.
