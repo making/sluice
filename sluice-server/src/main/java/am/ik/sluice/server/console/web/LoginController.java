@@ -1,5 +1,6 @@
 package am.ik.sluice.server.console.web;
 
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -10,6 +11,8 @@ import jakarta.servlet.http.HttpSession;
 
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.security.oauth2.client.autoconfigure.OAuth2ClientProperties;
+import org.springframework.security.authentication.BadCredentialsException;
+import org.springframework.security.web.WebAttributes;
 import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -48,13 +51,21 @@ class LoginController {
 		return "console/login";
 	}
 
+	/**
+	 * The reason for the last failed sign-in. Rejected credentials get a fixed message:
+	 * Spring Security localizes its own by the request locale, while the console is in
+	 * English.
+	 */
 	private String lastExceptionMessage(HttpServletRequest request) {
 		HttpSession session = request.getSession(false);
-		if (session == null) {
-			return "Sign in failed";
+		Object exception = (session != null) ? session.getAttribute(WebAttributes.AUTHENTICATION_EXCEPTION) : null;
+		if (exception instanceof BadCredentialsException) {
+			return "Incorrect username or password.";
 		}
-		Throwable exception = (Throwable) session.getAttribute("SPRING_SECURITY_LAST_EXCEPTION");
-		return exception == null ? "Sign in failed" : Objects.requireNonNullElse(exception.getMessage(), "");
+		if (exception instanceof Throwable throwable && throwable.getMessage() != null) {
+			return throwable.getMessage();
+		}
+		return "Sign in failed.";
 	}
 
 	private List<Map<String, String>> oidcClients() {
@@ -67,6 +78,8 @@ class LoginController {
 			.stream()
 			.map(entry -> Map.of("provider", entry.getKey(), "name",
 					Objects.requireNonNullElseGet(entry.getValue().getClientName(), entry::getKey)))
+			// the registrations are a hash map, so their configured order is lost
+			.sorted(Comparator.comparing(client -> client.get("name"), String.CASE_INSENSITIVE_ORDER))
 			.toList();
 	}
 

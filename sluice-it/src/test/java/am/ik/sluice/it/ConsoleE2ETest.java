@@ -19,6 +19,7 @@ import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
 import com.microsoft.playwright.Playwright;
 import com.microsoft.playwright.assertions.LocatorAssertions;
+import com.microsoft.playwright.options.AriaRole;
 import com.microsoft.playwright.assertions.PlaywrightAssertions;
 import com.sun.net.httpserver.HttpServer;
 import org.awaitility.Awaitility;
@@ -227,7 +228,7 @@ class ConsoleE2ETest {
 		page.navigate(base + "/console");
 		page.locator("#username").fill(CONSOLE_USER);
 		page.locator("#password").fill(CONSOLE_PASSWORD);
-		page.locator(".login-submit").click();
+		page.locator(".login__submit").click();
 		page.waitForURL(base + "/console");
 	}
 
@@ -259,6 +260,19 @@ class ConsoleE2ETest {
 		assertThat(page.title()).isEqualTo("Sluice console");
 		assertThat(page.locator(".titleblock__node").innerText()).isEqualToNormalizingWhitespace("Node console-node");
 		assertThat(page.getByTestId("state").innerText()).isEqualTo("Accepting traffic");
+	}
+
+	@Test
+	void signOutEndsTheSession() {
+		Page page = page();
+		String base = "http://127.0.0.1:" + this.port;
+		page.navigate(base + "/console");
+		assertThat(page.getByTestId("signed-in-user").innerText()).isEqualTo(CONSOLE_USER);
+		page.getByRole(AriaRole.BUTTON, new Page.GetByRoleOptions().setName("Sign out")).click();
+		page.waitForURL(base + "/login?logout");
+		assertThat(page.locator(".login__note").innerText()).isEqualTo("You have signed out.");
+		page.navigate(base + "/console");
+		assertThat(page.url()).isEqualTo(base + "/login");
 	}
 
 	@Test

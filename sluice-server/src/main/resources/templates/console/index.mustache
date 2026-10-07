@@ -31,11 +31,18 @@
     <span class="brand__word">sluice</span>
     <span class="brand__sub">console</span>
   </a>
-  <nav class="masthead__nav" aria-label="Actuator">
-    <a href="/actuator/health">Health</a>
-    <a href="/actuator/info">Info</a>
-    <a href="/actuator/prometheus">Metrics</a>
-  </nav>
+  <div class="masthead__end">
+    <nav class="masthead__nav" aria-label="Actuator">
+      <a href="/actuator/health">Health</a>
+      <a href="/actuator/info">Info</a>
+      <a href="/actuator/prometheus">Metrics</a>
+    </nav>
+    <form class="session" method="post" action="/logout">
+      {{#_csrf}}<input type="hidden" name="{{_csrf.parameterName}}" value="{{_csrf.token}}">{{/_csrf}}
+      <span class="session__user"><span class="visually-hidden">Signed in as </span><span data-testid="signed-in-user">{{user}}</span></span>
+      <button class="session__signout" type="submit">Sign out</button>
+    </form>
+  </div>
 </header>
 
 <section class="sheet" aria-label="Traffic through this node">

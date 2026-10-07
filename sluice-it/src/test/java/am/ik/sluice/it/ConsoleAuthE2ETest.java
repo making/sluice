@@ -139,6 +139,26 @@ class ConsoleAuthE2ETest {
 	}
 
 	@Test
+	void loginPageExplainsRejectedCredentialsInTheConsoleLanguage() throws Exception {
+		try (HttpClient client = newClient()) {
+			HttpResponse<String> loginPage = client.send(HttpRequest.newBuilder(URI.create(base() + "/login")).build(),
+					HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+			HttpResponse<String> login = client.send(HttpRequest.newBuilder(URI.create(base() + "/login"))
+				.header("Content-Type", "application/x-www-form-urlencoded")
+				.header("Accept-Language", "ja")
+				.POST(HttpRequest.BodyPublishers.ofString(
+						"username=%s&password=wrong&_csrf=%s".formatted(urlEncode(USER), urlEncode(csrfOf(loginPage)))))
+				.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+			assertThat(login.headers().firstValue("Location"))
+				.hasValueSatisfying(loc -> assertThat(loc).endsWith("/login?error"));
+			HttpResponse<String> error = client.send(
+					HttpRequest.newBuilder(URI.create(base() + "/login?error")).header("Accept-Language", "ja").build(),
+					HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+			assertThat(error.body()).contains("Incorrect username or password.");
+		}
+	}
+
+	@Test
 	void actuatorStaysOpenWithoutLogin() {
 		assertThat(get("/actuator/health").statusCode()).isEqualTo(200);
 		assertThat(get("/actuator/prometheus").statusCode()).isEqualTo(200);
@@ -195,6 +215,12 @@ class ConsoleAuthE2ETest {
 			registry.add("spring.security.oauth2.client.registration.sluice-console.scope",
 					() -> "openid,profile,email");
 			registry.add("spring.security.oauth2.client.provider.sluice-console.issuer-uri", oidcServer::issuer);
+			// a second provider whose id and name sort in opposite orders
+			registry.add("spring.security.oauth2.client.registration.aaa.client-id", () -> "sluice-console");
+			registry.add("spring.security.oauth2.client.registration.aaa.client-secret", () -> "it-secret");
+			registry.add("spring.security.oauth2.client.registration.aaa.client-name", () -> "Zeta IdP");
+			registry.add("spring.security.oauth2.client.registration.aaa.scope", () -> "openid,profile,email");
+			registry.add("spring.security.oauth2.client.provider.aaa.issuer-uri", oidcServer::issuer);
 		}
 
 		@AfterAll
@@ -203,19 +229,44 @@ class ConsoleAuthE2ETest {
 		}
 
 		@Test
+		void loginPageListsProvidersByName() throws Exception {
+			try (HttpClient client = HttpClient.newHttpClient()) {
+				HttpResponse<String> response = client.send(
+						HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + this.port + "/login")).build(),
+						HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+				assertThat(Pattern.compile("Sign in with ([^<]+)<")
+					.matcher(response.body())
+					.results()
+					.map(result -> result.group(1))
+					.toList()).containsExactly("sluice-console", "Zeta IdP");
+			}
+		}
+
+		@Test
 		void oidcLoginGrantsAccess() throws Exception {
 			// the mock IdP consent is instant, so following redirects with a cookie jar
 			// walks the whole authorization code flow
 			CookieManager cookies = new CookieManager();
+			String base = "http://127.0.0.1:" + this.port;
 			try (HttpClient client = HttpClient.newBuilder()
 				.cookieHandler(cookies)
 				.followRedirects(HttpClient.Redirect.ALWAYS)
 				.build()) {
-				HttpResponse<String> response = client.send(
-						HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + this.port + "/console")).build(),
+				HttpResponse<String> loginPage = client.send(
+						HttpRequest.newBuilder(URI.create(base + "/console")).build(),
 						HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-				assertThat(response.statusCode()).isEqualTo(200);
-				assertThat(response.body()).contains("Sluice console");
+				assertThat(loginPage.uri().getPath()).isEqualTo("/login");
+				assertThat(loginPage.body()).contains("href=\"/oauth2/authorization/sluice-console\"");
+
+				HttpResponse<String> console = client.send(
+						HttpRequest.newBuilder(URI.create(base + "/oauth2/authorization/sluice-console")).build(),
+						HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+				assertThat(console.statusCode()).isEqualTo(200);
+				assertThat(console.uri().getPath()).isEqualTo("/console");
+				// the id token's sub is opaque; the console names the user by a readable
+				// claim
+				assertThat(console.body())
+					.contains("<span data-testid=\"signed-in-user\">console-user@example.com</span>");
 			}
 		}
 

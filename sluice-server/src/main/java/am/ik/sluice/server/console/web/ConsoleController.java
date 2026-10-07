@@ -1,5 +1,7 @@
 package am.ik.sluice.server.console.web;
 
+import org.springframework.security.core.Authentication;
+import org.springframework.security.oauth2.core.oidc.user.OidcUser;
 import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -24,8 +26,9 @@ class ConsoleController {
 	}
 
 	@GetMapping("/console")
-	String index(Model model) {
+	String index(Authentication authentication, Model model) {
 		this.addLive(model);
+		model.addAttribute("user", displayName(authentication));
 		model.addAttribute("settings", this.view.settings());
 		return "console/index";
 	}
@@ -44,6 +47,21 @@ class ConsoleController {
 	String lookup(@RequestParam(defaultValue = "") String host, Model model) {
 		this.view.lookup(host).ifPresent(lookup -> model.addAttribute("lookup", lookup));
 		return "console/lookup";
+	}
+
+	/**
+	 * The signed-in user as shown in the masthead. An OIDC subject is usually an opaque
+	 * id, so a readable claim is preferred when the provider sends one.
+	 */
+	private static String displayName(Authentication authentication) {
+		if (authentication.getPrincipal() instanceof OidcUser user) {
+			for (String name : new String[] { user.getPreferredUsername(), user.getEmail(), user.getFullName() }) {
+				if (name != null && !name.isBlank()) {
+					return name;
+				}
+			}
+		}
+		return authentication.getName();
 	}
 
 	private void addLive(Model model) {
