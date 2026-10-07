@@ -5,6 +5,12 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <meta name="robots" content="noindex">
+  <!--
+    The console's brand mark as a data URI: the data plane cannot serve the console
+    assets, and a link to /console/img/logo.svg would itself hit this 503 page.
+  -->
+  <link rel="icon" type="image/svg+xml"
+    href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Cpath%20d='M3%209h9M3%2023h9M20%209h9M20%2023h9'%20fill='none'%20stroke='%23143b69'%20stroke-width='1.5'/%3E%3Cpath%20d='M12%209l4%207M12%2023l4-7'%20fill='none'%20stroke='%23143b69'%20stroke-width='2.5'%20stroke-linecap='round'/%3E%3Cpath%20d='M2%2016h8M22%2016h8'%20fill='none'%20stroke='%231b86c2'%20stroke-width='1.5'%20stroke-dasharray='2%203'/%3E%3C/svg%3E">
   <title>No route - sluice</title>
   <!--
     Served by the data plane, which cannot reach the console assets on the management
