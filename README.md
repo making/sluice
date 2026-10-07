@@ -109,6 +109,18 @@ curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:8000/
 
 `sluice.server-url` schemes: `grpc://` (plaintext) / `grpcs://` (TLS; `--sluice.insecure=true` skips verification).
 
+### Native image (client / server)
+
+GraalVM native images (require a GraalVM JDK; AOT processing and `native-image` run in
+the `package` phase):
+
+```
+./mvnw -pl sluice-client -am -Pnative -DskipTests package
+./mvnw -pl sluice-server -am -Pnative -DskipTests package
+sluice-client/target/sluice-client --sluice.server-url=grpc://127.0.0.1:8001 ...
+sluice-server/target/sluice-server --sluice.token=SECRET ...
+```
+
 TLS termination on the data port (same upstream / server / client):
 
 ```

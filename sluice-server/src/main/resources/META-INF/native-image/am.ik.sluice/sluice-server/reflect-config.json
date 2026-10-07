@@ -1,0 +1,92 @@
+[
+	{
+		"name": "am.ik.sluice.server.console.web.ConsoleView$Candidate",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ConsoleView$Cluster",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ConsoleView$Client",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ConsoleView$Duties",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ConsoleView$Lookup",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ConsoleView$NodeRow",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ConsoleView$PortRow",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ConsoleView$RouteRow",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ConsoleView$Setting",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ConsoleView$Status",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ConsoleView$UpstreamRow",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.FlowDrawing",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.FlowDrawing$Intake",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.FlowDrawing$Lane",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.FlowDrawing$Outlet",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	}
+]
