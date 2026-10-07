@@ -19,6 +19,7 @@ The data plane relays raw bytes (the request head is inspected for routing; with
 ## Conventions
 
 - Coding standards: user-level skills (java-code-standards / spring-code-standards / java-package-structure / java-testing-standards). spring-javaformat validate is wired into the build.
+- `application.properties`: keys in alphabetical order; a comment stays directly above the key it describes.
 - gRPC 1.83.x quirks: `StreamObserver` / `ClientCallStreamObserver` live in `io.grpc.stub`. The client onReady handler may only be set inside `ClientResponseObserver#beforeStart`.
 - Boot 4.1: `HealthIndicator` is in `org.springframework.boot.health.contributor`.
 - Docker images via buildpack (`spring-boot:build-image`); no Dockerfile.
