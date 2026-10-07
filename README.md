@@ -141,6 +141,30 @@ curl --http1.1 -k -H 'Host: demo.local' https://127.0.0.1:8000/
 
 TLS passthrough routed by SNI: see "SNI routing" below.
 
+### Pre-built Docker images
+
+Multi-arch (amd64 / aarch64) JVM and native images are published to ghcr.io on every push to
+`main`: `ghcr.io/making/sluice/sluice-server:{jvm,native}` and
+`ghcr.io/making/sluice/sluice-client:{jvm,native}` (immutable `jvm_<sha>` / `native_<sha>` tags too).
+
+```
+docker run --rm --name sluice-server -p 8000:8000 -p 8001:8001 \
+  ghcr.io/making/sluice/sluice-server:native --sluice.token=SECRET
+
+docker run --rm --name sluice-client \
+  -e SLUICE_SERVER_URL=grpc://host.docker.internal:8001 \
+  -e SLUICE_TOKEN=SECRET \
+  -e SLUICE_CLIENT_UPSTREAM_0_HOST=demo.local \
+  -e SLUICE_CLIENT_UPSTREAM_0_TARGET=http://host.docker.internal:31080 \
+  ghcr.io/making/sluice/sluice-client:native
+
+curl -H 'Host: demo.local' http://127.0.0.1:8000/
+```
+
+Relaxed binding maps `SLUICE_SERVER_URL` / `SLUICE_TOKEN` /
+`SLUICE_CLIENT_UPSTREAM_0_HOST` / `SLUICE_CLIENT_UPSTREAM_0_TARGET` to the properties above
+(`host.docker.internal` reaches ports published on the host).
+
 ## TCP port routing
 
 Upstreams with `listen-port` are routed by the listen port instead of the connection
