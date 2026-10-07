@@ -1,0 +1,166 @@
+name: CI
+on:
+  push:
+    branches:
+    - main
+    paths:
+    - '**/src/**'
+    - '**/pom.xml'
+    - 'mvnw'
+    - '.github/workflows/*'
+  pull_request:
+    branches:
+    - main
+    paths:
+    - '**/src/**'
+    - '**/pom.xml'
+    - 'mvnw'
+    - '.github/workflows/*'
+permissions:
+  contents: read
+  packages: write
+env:
+  REGISTRY: ghcr.io
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - uses: graalvm/setup-graalvm@v1
+      with:
+        java-version: '25'
+        distribution: graalvm
+        cache: 'maven'
+    - name: Test
+      run: ./mvnw -V -B --no-transfer-progress verify
+  build-image:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - { app: sluice-server, variant: jvm,    arch: amd64,   runs_on: ubuntu-latest }
+        - { app: sluice-server, variant: jvm,    arch: aarch64, runs_on: ubuntu-24.04-arm }
+        - { app: sluice-server, variant: native, arch: amd64,   runs_on: ubuntu-latest }
+        - { app: sluice-server, variant: native, arch: aarch64, runs_on: ubuntu-24.04-arm }
+        - { app: sluice-client, variant: jvm,    arch: amd64,    runs_on: ubuntu-latest }
+        - { app: sluice-client, variant: jvm,    arch: aarch64,  runs_on: ubuntu-24.04-arm }
+        - { app: sluice-client, variant: native, arch: amd64,    runs_on: ubuntu-latest }
+        - { app: sluice-client, variant: native, arch: aarch64,  runs_on: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - uses: graalvm/setup-graalvm@v1
+      with:
+        java-version: '25'
+        distribution: graalvm
+        cache: 'maven'
+    - name: Login to GitHub Container Registry
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Prepare image name
+      id: image
+      env:
+        APP: ${{ matrix.app }}
+        VARIANT: ${{ matrix.variant }}
+        ARCH: ${{ matrix.arch }}
+      run: echo "name=${REGISTRY}/$(echo '${{ github.repository }}/${APP}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+    - name: Set version
+      run: |
+        CURRENT_VERSION=$(./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout)
+        NEW_VERSION=$(echo $CURRENT_VERSION | sed "s/-SNAPSHOT/.${GITHUB_SHA}/")
+        ./mvnw versions:set -DnewVersion=${NEW_VERSION} -DprocessAllModules -DgenerateBackupPoms=false -B --no-transfer-progress
+    - name: Build image (${{ matrix.app }} / ${{ matrix.variant }} / ${{ matrix.arch }})
+      env:
+        IMAGE: ${{ steps.image.outputs.name }}
+        VARIANT: ${{ matrix.variant }}
+        ARCH: ${{ matrix.arch }}
+        APP: ${{ matrix.app }}
+        NATIVE_FLAGS: ${{ matrix.variant == 'native' && '-Pnative' || '' }}
+      run: >
+        ./mvnw -V -B --no-transfer-progress -pl ${APP} -am spring-boot:build-image -DskipTests ${NATIVE_FLAGS}
+        -Dspring-boot.build-image.imageName=${IMAGE}:${VARIANT}_${ARCH}_${GITHUB_SHA}
+    - name: Push image
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      env:
+        IMAGE: ${{ steps.image.outputs.name }}
+        VARIANT: ${{ matrix.variant }}
+        ARCH: ${{ matrix.arch }}
+      run: |
+        docker push ${IMAGE}:${VARIANT}_${ARCH}_${GITHUB_SHA}
+        docker tag ${IMAGE}:${VARIANT}_${ARCH}_${GITHUB_SHA} ${IMAGE}:${VARIANT}_${ARCH}
+        docker push ${IMAGE}:${VARIANT}_${ARCH}
+  push-manifest:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: build-image
+    strategy:
+      matrix:
+        app:
+        - sluice-server
+        - sluice-client
+        variant:
+        - jvm
+        - native
+    runs-on: ubuntu-latest
+    steps:
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Create and push manifest
+      env:
+        APP: ${{ matrix.app }}
+        VARIANT: ${{ matrix.variant }}
+      run: |
+        IMAGE="${REGISTRY}/$(echo '${{ github.repository }}/${APP}' | tr '[:upper:]' '[:lower:]')"
+        docker manifest create ${IMAGE}:${VARIANT}_${GITHUB_SHA} \
+          --amend ${IMAGE}:${VARIANT}_amd64_${GITHUB_SHA} \
+          --amend ${IMAGE}:${VARIANT}_aarch64_${GITHUB_SHA}
+        docker manifest push ${IMAGE}:${VARIANT}_${GITHUB_SHA}
+        docker manifest create ${IMAGE}:${VARIANT} \
+          --amend ${IMAGE}:${VARIANT}_amd64_${GITHUB_SHA} \
+          --amend ${IMAGE}:${VARIANT}_aarch64_${GITHUB_SHA}
+        docker manifest push ${IMAGE}:${VARIANT}
+    - name: Generate image file
+      env:
+        APP: ${{ matrix.app }}
+        VARIANT: ${{ matrix.variant }}
+      run: |
+        IMAGE="${REGISTRY}/$(echo '${{ github.repository }}/${APP}' | tr '[:upper:]' '[:lower:]')"
+        DIGEST=$(docker buildx imagetools inspect ${IMAGE}:${VARIANT}_${GITHUB_SHA} | awk '/^Digest:/{print $2}')
+        cat <<EOF > ${APP}_${VARIANT}.yaml
+        image: ${IMAGE}@${DIGEST}
+        git_revision: ${GITHUB_SHA}
+        deployment:
+          image:
+            repository: ${IMAGE}
+            digest: ${DIGEST}
+          podLabels:
+            github.com/revision: ${GITHUB_SHA}
+        EOF
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.app }}_${{ matrix.variant }}
+        path: ${{ matrix.app }}_${{ matrix.variant }}.yaml
+  save-image:
+    needs: push-manifest
+    strategy:
+      matrix:
+        include:
+        - { app: sluice-server, variant: jvm }
+        - { app: sluice-server, variant: native }
+        - { app: sluice-client, variant: jvm }
+        - { app: sluice-client, variant: native }
+    uses: categolj/workflows/.github/workflows/save-images.yaml@main
+    with:
+      image_name: ${{ matrix.app }}_${{ matrix.variant }}
+      image_file: ${{ matrix.app }}_${{ matrix.variant }}.yaml
