@@ -117,22 +117,22 @@ message Upstream {
   // Optional regular expression the request host (without its port) is matched
   // against; the match is against the whole name. When non-empty it takes
   // precedence over `host`.
-  string host_pattern = 7;
+  string host_pattern = 2;
   // Upstream URL, e.g. http://127.0.0.1:3000.
-  string target_url = 2;
+  string target_url = 3;
   // When false the server rewrites the request Host/:authority to the target's
   // host[:port] before relaying; when true the head bytes pass through verbatim.
-  bool preserve_host = 3;
+  bool preserve_host = 4;
   // TLS connections for this upstream are relayed untouched (routed by ClientHello
   // SNI, the upstream terminates TLS) instead of terminated on the data plane.
-  bool tls_passthrough = 4;
+  bool tls_passthrough = 5;
   // Public port the server listens on to relay raw TCP connections for this upstream
   // verbatim (routed by listen port, no head parsing; 0 disables port routing). An
   // upstream with a listen port is reached only through it: `host` is then not used
   // for Host / SNI routing on the data port.
-  uint32 listen_port = 5;
+  uint32 listen_port = 6;
   // IP networks (CIDR or bare address) allowed to connect to this upstream on
   // the data plane; empty = the server-wide allow list applies. Literal
   // addresses only.
-  repeated string allowed_cidrs = 6;
+  repeated string allowed_cidrs = 7;
 }
