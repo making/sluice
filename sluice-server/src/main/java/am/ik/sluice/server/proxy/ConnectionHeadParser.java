@@ -63,10 +63,15 @@ public final class ConnectionHeadParser {
 	}
 
 	public record Head(@Nullable String host, byte[] bytes, @Nullable H2Head h2, boolean encrypted,
-			@Nullable Request request, @Nullable String forwardedFor) {
+			@Nullable Request request, @Nullable String forwardedFor, @Nullable String forwarded) {
 
 		/** The forwarded-for header the access control trusts; literal addresses only. */
 		static final String FORWARDED_FOR = "x-forwarded-for";
+
+		/**
+		 * The RFC 7239 {@code Forwarded} header; preferred over {@link #FORWARDED_FOR}.
+		 */
+		static final String FORWARDED = "forwarded";
 
 		/**
 		 * The request of the head: the HTTP/1.1 request-line parts, or the method/path of
@@ -77,16 +82,17 @@ public final class ConnectionHeadParser {
 
 		/** A copy of this head with the route host replaced. */
 		public Head withHost(@Nullable String host) {
-			return new Head(host, this.bytes, this.h2, this.encrypted, this.request, this.forwardedFor);
+			return new Head(host, this.bytes, this.h2, this.encrypted, this.request, this.forwardedFor, this.forwarded);
 		}
 
 		public static Head http1(byte[] bytes, @Nullable String host) {
-			return new Head(host, bytes, null, false, http1RequestOf(bytes), http1HeaderOf(bytes, FORWARDED_FOR));
+			return new Head(host, bytes, null, false, http1RequestOf(bytes), http1HeaderOf(bytes, FORWARDED_FOR),
+					http1HeaderOf(bytes, FORWARDED));
 		}
 
 		public static Head http2(byte[] bytes, @Nullable String host, @Nullable H2Head h2, @Nullable Request request,
-				@Nullable String forwardedFor) {
-			return new Head(host, bytes, h2, false, request, forwardedFor);
+				@Nullable String forwardedFor, @Nullable String forwarded) {
+			return new Head(host, bytes, h2, false, request, forwardedFor, forwarded);
 		}
 
 		/**
@@ -94,7 +100,7 @@ public final class ConnectionHeadParser {
 		 * verbatim (the rewriter must not touch TLS records).
 		 */
 		public static Head encrypted(byte[] bytes, @Nullable String host) {
-			return new Head(host, bytes, null, true, null, null);
+			return new Head(host, bytes, null, true, null, null, null);
 		}
 
 		/**
@@ -102,7 +108,7 @@ public final class ConnectionHeadParser {
 		 * catch-all route, relayed verbatim.
 		 */
 		public static Head hostless(byte[] bytes) {
-			return new Head(null, bytes, null, false, null, null);
+			return new Head(null, bytes, null, false, null, null, null);
 		}
 
 	}
@@ -259,12 +265,13 @@ public final class ConnectionHeadParser {
 		byte[] block = headerBlock.toByteArray();
 		Decoded decoded = decode(block, headersStreamId);
 		if (continuationSeen || headersFrameStart < 0) {
-			return Optional.of(Head.http2(bytes, decoded.host(), null, decoded.request(), decoded.forwardedFor()));
+			return Optional.of(Head.http2(bytes, decoded.host(), null, decoded.request(), decoded.forwardedFor(),
+					decoded.forwarded()));
 		}
 		byte[] prefix = Arrays.copyOfRange(bytes, 0, headersFrameStart);
 		byte[] suffix = Arrays.copyOfRange(bytes, buf.position(), bytes.length);
 		return Optional.of(Head.http2(bytes, decoded.host(), new H2Head(prefix, block, suffix, headersStreamId),
-				decoded.request(), decoded.forwardedFor()));
+				decoded.request(), decoded.forwardedFor(), decoded.forwarded()));
 	}
 
 	private static int unsigned24(ByteBuffer buf) {
@@ -277,7 +284,8 @@ public final class ConnectionHeadParser {
 		buf.position(target);
 	}
 
-	private record Decoded(@Nullable String host, Head.@Nullable Request request, @Nullable String forwardedFor) {
+	private record Decoded(@Nullable String host, Head.@Nullable Request request, @Nullable String forwardedFor,
+			@Nullable String forwarded) {
 	}
 
 	private Decoded decode(byte[] headerBlock, int streamId) {
@@ -289,12 +297,13 @@ public final class ConnectionHeadParser {
 			Head.Request request = method == null || path == null ? null
 					: new Head.Request(method.toString(), path.toString(), "2");
 			String forwardedFor = headerOf(null, headers.get(AsciiString.of(Head.FORWARDED_FOR)));
-			return new Decoded(host, request, forwardedFor);
+			String forwarded = headerOf(null, headers.get(AsciiString.of(Head.FORWARDED)));
+			return new Decoded(host, request, forwardedFor, forwarded);
 		}
 		catch (Exception e) {
 			// fall through: unroutable head
 		}
-		return new Decoded(null, null, null);
+		return new Decoded(null, null, null, null);
 	}
 
 	private static @Nullable String headerOf(@Nullable CharSequence first, @Nullable CharSequence second) {

@@ -142,6 +142,38 @@ class ConnectionHeadParserTest {
 	}
 
 	@Test
+	void http1ForwardedIsExtractedCaseInsensitively() throws IOException {
+		byte[] head = "GET / HTTP/1.1\r\nHost: demo.local\r\nFORWARDED: for=198.51.100.7;by=10.1.2.3\r\n\r\n"
+			.getBytes(StandardCharsets.US_ASCII);
+		assertThat(PARSER.parse(new ByteArrayInputStream(head)).orElseThrow().forwarded())
+			.isEqualTo("for=198.51.100.7;by=10.1.2.3");
+	}
+
+	@Test
+	void http1WithoutForwardedYieldsNull() throws IOException {
+		byte[] head = "GET / HTTP/1.1\r\nHost: demo.local\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
+		assertThat(PARSER.parse(new ByteArrayInputStream(head)).orElseThrow().forwarded()).isNull();
+	}
+
+	@Test
+	void http2ForwardedIsExtracted() throws IOException {
+		java.io.ByteArrayOutputStream block = new java.io.ByteArrayOutputStream();
+		block.writeBytes(literal(":authority", "demo.local"));
+		block.writeBytes(literal(":method", "GET"));
+		block.writeBytes(literal(":path", "/"));
+		block.writeBytes(literal("forwarded", "for=198.51.100.7"));
+		ConnectionHeadParser.Head parsed = PARSER.parse(new ByteArrayInputStream(h2Head(block.toByteArray(), true)))
+			.orElseThrow();
+		assertThat(parsed.forwarded()).isEqualTo("for=198.51.100.7");
+	}
+
+	@Test
+	void respHeadHasNoForwarded() {
+		byte[] head = "*1\r\n$4\r\nPING\r\n".getBytes(StandardCharsets.US_ASCII);
+		assertThat(PARSER.parse(new ByteArrayInputStream(head)).orElseThrow().forwarded()).isNull();
+	}
+
+	@Test
 	void http2AuthorityIsExtracted() throws IOException {
 		byte[] head = h2Head(literal(":authority", "demo.local"), true);
 		ConnectionHeadParser.Head parsed = PARSER.parse(new ByteArrayInputStream(head)).orElseThrow();

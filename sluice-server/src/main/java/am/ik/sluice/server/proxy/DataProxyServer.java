@@ -282,7 +282,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		Optional<Router.Route> route = this.router.lookup(conn.head().host());
 		InetAddress peer = conn.peer() != null ? conn.peer() : peerOf(conn.socket());
 		// a trusted proxy's forwarded-for entry replaces the peer as the judged address
-		if (!this.accessControl.allowed(route.orElse(null), peer, conn.head().forwardedFor())) {
+		if (!this.accessControl.allowed(route.orElse(null), peer, conn.head().forwardedFor(),
+				conn.head().forwarded())) {
 			this.reject(conn, this.errorResponse.forbidden(conn.head()));
 			return false;
 		}

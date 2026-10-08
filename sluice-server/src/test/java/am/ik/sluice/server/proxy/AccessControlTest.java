@@ -199,4 +199,56 @@ class AccessControlTest {
 		assertThat(accessControl.allowed(null, peer("10.1.2.3"), "2001:db9::1")).isFalse();
 	}
 
+	@Test
+	void aTrustedPeersRightmostForwardedForParameterIsJudged() {
+		AccessControl accessControl = rules(List.of("198.51.100.0/24"), List.of(), List.of("10.0.0.0/8"));
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), null, "for=203.0.113.1,for=198.51.100.7;by=10.1.2.3"))
+			.isTrue();
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), null, "for=198.51.100.7,proto=https,for=203.0.113.1"))
+			.isFalse();
+	}
+
+	@Test
+	void forwardedPrecedesForwardedForWhenBothArePresent() {
+		AccessControl accessControl = rules(List.of("198.51.100.0/24"), List.of(), List.of("10.0.0.0/8"));
+		// Forwarded wins even though X-Forwarded-For would decide otherwise
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), "203.0.113.1", "for=198.51.100.7")).isTrue();
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), "198.51.100.7", "for=203.0.113.1")).isFalse();
+	}
+
+	@Test
+	void obfuscatedOrMissingForParametersAreSkippedToEarlierElements() {
+		AccessControl accessControl = rules(List.of("198.51.100.0/24"), List.of(), List.of("10.0.0.0/8"));
+		// obfuscated and missing entries fall back to the rightmost literal
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), null, "for=198.51.100.7,for=_hidden,by=10.1.2.3"))
+			.isTrue();
+		// a hostname is not a literal and is skipped too
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), null, "for=198.51.100.7,for=client.example.com"))
+			.isTrue();
+		// no literal at all: fall back to the peer
+		assertThat(accessControl.allowed(null, peer("203.0.113.7"), null, "for=unknown")).isFalse();
+	}
+
+	@Test
+	void aQuotedOrBracketedIpv6ForwardedForIsJudged() {
+		AccessControl accessControl = rules(List.of("2001:db8::/32"), List.of(), List.of("10.0.0.0/8"));
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), null, "for=\"[2001:db8::1]:443\"")).isTrue();
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), null, "for=\"[2001:db9::1]\"")).isFalse();
+	}
+
+	@Test
+	void aForwardedForParameterMayCarryAPort() {
+		AccessControl accessControl = rules(List.of("198.51.100.0/24"), List.of(), List.of("10.0.0.0/8"));
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), null, "for=198.51.100.7:8080")).isTrue();
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), null, "for=203.0.113.1:8080")).isFalse();
+	}
+
+	@Test
+	void aForwardedHeaderWithoutTrustedProxyStillDefersToForwardedForFallback() {
+		// unparseable Forwarded falls through to X-Forwarded-For, then the peer
+		AccessControl accessControl = rules(List.of("198.51.100.0/24"), List.of(), List.of("10.0.0.0/8"));
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), "198.51.100.7", "for=unknown")).isTrue();
+		assertThat(accessControl.allowed(null, peer("203.0.113.7"), "198.51.100.7", "for=unknown")).isFalse();
+	}
+
 }
