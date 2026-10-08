@@ -13,8 +13,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 class AccessControlTest {
 
 	private static AccessControl rules(List<String> allow, List<String> deny) {
+		return rules(allow, deny, List.of());
+	}
+
+	private static AccessControl rules(List<String> allow, List<String> deny, List<String> trustedProxies) {
 		return new AccessControl(SluiceServerProperties.builder()
-			.accessControl(new SluiceServerProperties.AccessControl(allow, deny))
+			.accessControl(new SluiceServerProperties.AccessControl(allow, deny, trustedProxies))
 			.build());
 	}
 
@@ -142,6 +146,57 @@ class AccessControlTest {
 	void aPeerOutsideEveryRouteListIsRejectedWhenTheRouteRestricts() {
 		AccessControl accessControl = rules(List.of(), List.of());
 		assertThat(accessControl.allowed(route("10.0.0.0/8"), peer("203.0.113.7"))).isFalse();
+	}
+
+	@Test
+	void aTrustedPeersRightmostForwardedEntryIsJudged() {
+		AccessControl accessControl = rules(List.of("198.51.100.0/24"), List.of(), List.of("10.0.0.0/8"));
+		// the peer is the proxy; the entry it appended decides
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), "203.0.113.1, 198.51.100.7")).isTrue();
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), "198.51.100.7, 203.0.113.1")).isFalse();
+	}
+
+	@Test
+	void theDenyListAppliesToTheForwardedEntry() {
+		AccessControl accessControl = rules(List.of(), List.of("203.0.113.0/24"), List.of("10.0.0.0/8"));
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), "198.51.100.7, 203.0.113.1")).isFalse();
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), "203.0.113.1, 198.51.100.7")).isTrue();
+	}
+
+	@Test
+	void anUntrustedPeerIsJudgedByItsOwnAddressDespiteTheHeader() {
+		AccessControl accessControl = rules(List.of("192.168.0.0/16"), List.of(), List.of("10.0.0.0/8"));
+		// 203.0.113.7 is neither the peer nor in the allow list; the header is ignored
+		assertThat(accessControl.allowed(null, peer("192.168.1.2"), "203.0.113.7")).isTrue();
+		assertThat(accessControl.allowed(null, peer("203.0.113.7"), "192.168.1.2")).isFalse();
+	}
+
+	@Test
+	void aForwardedHeaderWithoutTrustedProxiesConfiguredIsIgnored() {
+		AccessControl accessControl = rules(List.of("192.168.0.0/16"), List.of());
+		assertThat(accessControl.allowed(null, peer("192.168.1.2"), "203.0.113.7")).isTrue();
+	}
+
+	@Test
+	void aBlankOrMalformedForwardedEntryFallsBackToThePeer() {
+		AccessControl accessControl = rules(List.of("10.0.0.0/8"), List.of(), List.of("10.0.0.0/8"));
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), "203.0.113.1,")).isTrue();
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), "300.400.500.600")).isTrue();
+		assertThat(accessControl.allowed(null, peer("203.0.113.7"), "300.400.500.600")).isFalse();
+	}
+
+	@Test
+	void aNullPeerOrMissingHeaderNeverConsultsTheTrustedProxies() {
+		AccessControl accessControl = rules(List.of(), List.of(), List.of("10.0.0.0/8"));
+		assertThat(accessControl.allowed(route("10.0.0.0/8"), null, "198.51.100.7")).isTrue();
+		assertThat(accessControl.allowed(route("10.0.0.0/8"), peer("203.0.113.7"), null)).isFalse();
+	}
+
+	@Test
+	void anIpv6ForwardedEntryIsJudgedAsIpv6() {
+		AccessControl accessControl = rules(List.of("2001:db8::/32"), List.of(), List.of("10.0.0.0/8"));
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), "2001:db8::1")).isTrue();
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"), "2001:db9::1")).isFalse();
 	}
 
 }

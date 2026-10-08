@@ -50,6 +50,19 @@ class SluiceServerPropertiesTest {
 	}
 
 	@Test
+	void accessControlTrustedProxiesDefaultToEmpty() {
+		SluiceServerProperties properties = bind(Map.of("sluice.data-port", "8000"));
+		assertThat(properties.accessControl().trustedProxyCidrs()).isEmpty();
+	}
+
+	@Test
+	void accessControlTrustedProxiesAreBoundInKebabCase() {
+		SluiceServerProperties properties = bind(
+				Map.of("sluice.access-control.trusted-proxy-cidrs", "10.0.0.0/8,127.0.0.1"));
+		assertThat(properties.accessControl().trustedProxyCidrs()).containsExactly("10.0.0.0/8", "127.0.0.1");
+	}
+
+	@Test
 	void proxyProtocolDefaultsToDisabled() {
 		SluiceServerProperties properties = bind(Map.of("sluice.data-port", "8000"));
 		assertThat(properties.proxyProtocol()).isFalse();

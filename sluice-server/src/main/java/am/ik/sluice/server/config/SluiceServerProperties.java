@@ -309,12 +309,17 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * (comma separated in configuration); empty = every address is allowed. Overridden
 	 * per route by the upstream's {@code allowed-cidrs}
 	 * @param denyCidrs CIDRs / bare addresses rejected before any allow evaluation
+	 * @param trustedProxyCidrs CIDRs / bare addresses of proxying load balancers whose
+	 * {@code X-Forwarded-For} is trusted: when the connection peer matches, the rightmost
+	 * header entry (the one the proxy appended) is judged instead of the peer address
 	 */
-	public record AccessControl(@DefaultValue List<String> allowCidrs, @DefaultValue List<String> denyCidrs) {
+	public record AccessControl(@DefaultValue List<String> allowCidrs, @DefaultValue List<String> denyCidrs,
+			@DefaultValue List<String> trustedProxyCidrs) {
 
 		public AccessControl {
 			allowCidrs = allowCidrs == null ? List.of() : List.copyOf(allowCidrs);
 			denyCidrs = denyCidrs == null ? List.of() : List.copyOf(denyCidrs);
+			trustedProxyCidrs = trustedProxyCidrs == null ? List.of() : List.copyOf(trustedProxyCidrs);
 		}
 
 		public static Builder builder() {
@@ -326,6 +331,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			private List<String> allowCidrs = List.of();
 
 			private List<String> denyCidrs = List.of();
+
+			private List<String> trustedProxyCidrs = List.of();
 
 			private Builder() {
 			}
@@ -340,8 +347,13 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder trustedProxyCidrs(List<String> trustedProxyCidrs) {
+				this.trustedProxyCidrs = trustedProxyCidrs;
+				return this;
+			}
+
 			public AccessControl build() {
-				return new AccessControl(this.allowCidrs, this.denyCidrs);
+				return new AccessControl(this.allowCidrs, this.denyCidrs, this.trustedProxyCidrs);
 			}
 
 		}
