@@ -122,10 +122,10 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	 * peer -- the source of a parsed PROXY protocol header when one was present, the
 	 * socket peer otherwise.
 	 */
-	record Connection(Socket socket, DuplexPipe pipe, ConnectionHeadParser.Head head) {
+	record Connection(Socket socket, DuplexPipe pipe, ConnectionHeadParser.Head head, @Nullable InetAddress peer) {
 
-		static Connection of(Socket socket, ConnectionHeadParser.Head head) {
-			return new Connection(socket, DuplexPipe.of(socket), head);
+		static Connection of(Socket socket, ConnectionHeadParser.Head head, @Nullable InetAddress peer) {
+			return new Connection(socket, DuplexPipe.of(socket), head, peer);
 		}
 
 	}
@@ -165,7 +165,6 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	private void handle(Socket socket) {
 		AccessLogger.Connection access = this.accessLogger.accepted("data", socket);
-		access.accept();
 		try {
 			Connection connection = this.transport(socket, access);
 			if (connection == null) {
@@ -187,12 +186,26 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	}
 
 	/**
-	 * Peeks the first byte to detect a TLS handshake, terminates TLS when an SSL bundle
-	 * is configured, routes by SNI in passthrough mode otherwise, and parses the
-	 * connection head for routing.
+	 * Consumes the PROXY protocol header when enabled, peeks the first byte to detect a
+	 * TLS handshake, terminates TLS when an SSL bundle is configured, routes by SNI in
+	 * passthrough mode otherwise, and parses the connection head for routing.
 	 */
 	private @Nullable Connection transport(Socket socket, AccessLogger.Connection access) throws Exception {
 		InputStream in = socket.getInputStream();
+		InetAddress peer = null;
+		if (this.properties.proxyProtocol()) {
+			// the header is consumed here and never relayed: the remainder is parsed
+			// exactly
+			// as on a plain connection, and headerless connections pass untouched
+			ProxyProtocolParser.Result proxied = new ProxyProtocolParser().parse(in);
+			in = proxied.input();
+			ProxyProtocolParser.Header header = proxied.header();
+			if (header != null && header.source() != null) {
+				peer = header.source();
+				access.remote(peer.getHostAddress() + ":" + header.sourcePort());
+			}
+		}
+		access.accept();
 		int first = in.read();
 		if (first < 0) {
 			return null;
@@ -215,7 +228,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				// relay the TLS records untouched; the upstream terminates TLS
 				log.debug("tls passthrough; sni={}", hello.sni());
 				access.transport("tls-passthrough");
-				return Connection.of(socket, ConnectionHeadParser.Head.encrypted(hello.bytes(), hello.sni()));
+				return Connection.of(socket, ConnectionHeadParser.Head.encrypted(hello.bytes(), hello.sni()), peer);
 			}
 			SSLSocketFactory factory = this.tlsFactory();
 			if (factory == null) {
@@ -257,7 +270,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		if (head.host() == null && sni.get() != null) {
 			head = head.withHost(sni.get());
 		}
-		return Connection.of(socket, head);
+		return Connection.of(socket, head, peer);
 	}
 
 	private @Nullable SSLSocketFactory tlsFactory() {
@@ -267,7 +280,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	private boolean relay(Connection conn, AccessLogger.Connection access) {
 		Optional<Router.Route> route = this.router.lookup(conn.head().host());
-		if (!this.accessControl.allowed(route.orElse(null), peerOf(conn.socket()))) {
+		InetAddress peer = conn.peer() != null ? conn.peer() : peerOf(conn.socket());
+		if (!this.accessControl.allowed(route.orElse(null), peer)) {
 			this.reject(conn, this.errorResponse.forbidden(conn.head()));
 			return false;
 		}

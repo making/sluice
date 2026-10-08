@@ -25,6 +25,45 @@ public interface DuplexPipe extends AutoCloseable {
 	@Override
 	void close() throws Exception;
 
+	/**
+	 * Adapts a {@link Socket} into a {@link DuplexPipe} whose reads come from the given
+	 * stream instead of the socket: for sockets whose head bytes were already consumed
+	 * upstream of the relay (a parsed PROXY protocol header, say) and must not be read
+	 * twice. Writes, half-close and close remain socket operations.
+	 */
+	static DuplexPipe of(InputStream source, Socket socket) {
+		Objects.requireNonNull(source, "source is required");
+		Objects.requireNonNull(socket, "socket is required");
+		return new DuplexPipe() {
+
+			@Override
+			public InputStream source() {
+				return source;
+			}
+
+			@Override
+			public OutputStream sink() {
+				try {
+					return socket.getOutputStream();
+				}
+				catch (Exception e) {
+					throw new IllegalStateException("failed to get output stream", e);
+				}
+			}
+
+			@Override
+			public void shutdownOutput() throws Exception {
+				socket.shutdownOutput();
+			}
+
+			@Override
+			public void close() throws Exception {
+				socket.close();
+			}
+
+		};
+	}
+
 	/** Adapts a {@link Socket} into a {@link DuplexPipe}. */
 	static DuplexPipe of(Socket socket) {
 		Objects.requireNonNull(socket, "socket is required");

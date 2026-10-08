@@ -148,7 +148,7 @@ public class AccessLogger {
 
 		private final String listener;
 
-		private final String remote;
+		private String remote;
 
 		private final boolean noop;
 
@@ -186,6 +186,15 @@ public class AccessLogger {
 
 		Connection transport(String transport) {
 			this.transport = transport;
+			return this;
+		}
+
+		/**
+		 * Overrides the peer of the connection (the source of a PROXY protocol header,
+		 * say); lines emitted afterwards report it.
+		 */
+		Connection remote(String remote) {
+			this.remote = remote;
 			return this;
 		}
 

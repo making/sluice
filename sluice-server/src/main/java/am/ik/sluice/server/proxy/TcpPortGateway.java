@@ -1,5 +1,6 @@
 package am.ik.sluice.server.proxy;
 
+import java.io.InputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -249,10 +250,24 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 
 	private void relay(Socket socket, int port) {
 		AccessLogger.Connection access = this.accessLogger.accepted("tcp:" + port, socket).transport("tcp");
-		access.accept();
 		try {
+			InputStream source = socket.getInputStream();
+			InetAddress peer = peerOf(socket);
+			if (this.properties.proxyProtocol()) {
+				// the header is consumed here and never relayed: the relay starts past
+				// it,
+				// and headerless connections pass untouched
+				ProxyProtocolParser.Result proxied = new ProxyProtocolParser().parse(source);
+				source = proxied.input();
+				ProxyProtocolParser.Header header = proxied.header();
+				if (header != null && header.source() != null) {
+					peer = header.source();
+					access.remote(peer.getHostAddress() + ":" + header.sourcePort());
+				}
+			}
+			access.accept();
 			Optional<Router.Route> route = this.router.lookupByPort(port);
-			if (!this.accessControl.allowed(route.orElse(null), peerOf(socket))) {
+			if (!this.accessControl.allowed(route.orElse(null), peer)) {
 				this.close(socket);
 				access.close();
 				return;
@@ -267,7 +282,9 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 			VirtualConnection connection = session.open(route0.address());
 			access.route(route0.routeTag()).connectionId(connection.connectionId());
 			AtomicInteger active = this.activeConnections.computeIfAbsent(port, p -> new AtomicInteger());
-			StreamRelay relay = StreamRelay.builder(DuplexPipe.of(socket), connection, session.sender())
+			// reads continue from the proxy parser's position: past the consumed header,
+			// or (no header present) from the first byte the probe pushed back
+			StreamRelay relay = StreamRelay.builder(DuplexPipe.of(source, socket), connection, session.sender())
 				.listener(this.relayedBytes(route0, session, access))
 				.onComplete(() -> {
 					active.decrementAndGet();

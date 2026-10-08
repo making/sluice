@@ -49,4 +49,16 @@ class SluiceServerPropertiesTest {
 		assertThat(properties.accessControl().denyCidrs()).containsExactly("203.0.113.0/24");
 	}
 
+	@Test
+	void proxyProtocolDefaultsToDisabled() {
+		SluiceServerProperties properties = bind(Map.of("sluice.data-port", "8000"));
+		assertThat(properties.proxyProtocol()).isFalse();
+	}
+
+	@Test
+	void proxyProtocolIsBoundInKebabCase() {
+		SluiceServerProperties properties = bind(Map.of("sluice.proxy-protocol", "true"));
+		assertThat(properties.proxyProtocol()).isTrue();
+	}
+
 }

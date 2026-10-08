@@ -17,6 +17,10 @@ import am.ik.sluice.server.route.LoadBalance;
  *
  * @param tcpPortRange listen ports a client may claim for tcp routes (comma separated
  * single ports or {@code min-max} ranges, e.g. {@code 9000-9010,8080}; empty = any port)
+ * @param proxyProtocol whether a PROXY protocol (v1 / v2) header preceding the payload is
+ * parsed on the data plane: the header is stripped before routing / relay and its source
+ * address becomes the connection peer (access control, access log); headerless
+ * connections are unaffected, a malformed one fails the connection
  * @param httpLoadBalance load balancing applied when several clients serve the same
  * domain (http routes)
  * @param console management console settings (authentication)
@@ -25,8 +29,9 @@ import am.ik.sluice.server.route.LoadBalance;
  */
 @ConfigurationProperties("sluice")
 public record SluiceServerProperties(String token, @Nullable String tokenFile, @DefaultValue("0.0.0.0") String dataHost,
-		@DefaultValue("8000") int dataPort, @Nullable String dataTlsBundle, @DefaultValue("") String tcpPortRange,
-		AccessLog accessLog, AccessControl accessControl, Node node, Cluster cluster, Console console,
+		@DefaultValue("8000") int dataPort, @Nullable String dataTlsBundle,
+		@DefaultValue("false") boolean proxyProtocol, @DefaultValue("") String tcpPortRange, AccessLog accessLog,
+		AccessControl accessControl, Node node, Cluster cluster, Console console,
 		@DefaultValue("smallest-client-id") LoadBalance httpLoadBalance,
 		@DefaultValue("smallest-client-id") LoadBalance tcpLoadBalance) {
 
@@ -417,6 +422,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 		@Nullable private String dataTlsBundle;
 
+		private boolean proxyProtocol;
+
 		private String tcpPortRange = "";
 
 		@Nullable private AccessLog accessLog;
@@ -458,6 +465,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 		public Builder dataTlsBundle(String dataTlsBundle) {
 			this.dataTlsBundle = dataTlsBundle;
+			return this;
+		}
+
+		public Builder proxyProtocol(boolean proxyProtocol) {
+			this.proxyProtocol = proxyProtocol;
 			return this;
 		}
 
@@ -504,8 +516,9 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		public SluiceServerProperties build() {
 			return new SluiceServerProperties(this.token == null ? "" : this.token, this.tokenFile,
 					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort, this.dataTlsBundle,
-					this.tcpPortRange, this.accessLog == null ? AccessLog.builder().build() : this.accessLog,
-					this.accessControl, this.node == null ? Node.builder().build() : this.node,
+					this.proxyProtocol, this.tcpPortRange,
+					this.accessLog == null ? AccessLog.builder().build() : this.accessLog, this.accessControl,
+					this.node == null ? Node.builder().build() : this.node,
 					this.cluster == null ? Cluster.builder().build() : this.cluster,
 					this.console == null ? Console.builder().build() : this.console, this.httpLoadBalance,
 					this.tcpLoadBalance);
