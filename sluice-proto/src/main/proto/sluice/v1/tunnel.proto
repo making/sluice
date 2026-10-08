@@ -127,4 +127,8 @@ message Upstream {
   // upstream with a listen port is reached only through it: `host` is then not used
   // for Host / SNI routing on the data port.
   uint32 listen_port = 5;
+  // IP networks (CIDR or bare address) allowed to connect to this upstream on
+  // the data plane; empty = the server-wide allow list applies. Literal
+  // addresses only.
+  repeated string allowed_cidrs = 6;
 }

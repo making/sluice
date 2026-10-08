@@ -93,29 +93,34 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	private final ObjectProvider<SSLContext> sslContext;
 
-	private final NoRouteResponse noRouteResponse;
+	private final ErrorResponse errorResponse;
+
+	private final AccessControl accessControl;
 
 	private volatile boolean running;
 
 	private volatile @Nullable ServerSocket serverSocket;
 
 	DataProxyServer(Router router, SessionRegistry sessions, SluiceServerProperties properties,
-			MeterRegistry meterRegistry, AccessLogger accessLogger,
+			MeterRegistry meterRegistry, AccessLogger accessLogger, AccessControl accessControl,
 			@Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor, ObjectProvider<SSLContext> sslContext,
-			NoRouteResponse noRouteResponse) {
+			ErrorResponse errorResponse) {
 		this.router = router;
 		this.sessions = sessions;
 		this.properties = properties;
 		this.meterRegistry = meterRegistry;
 		this.accessLogger = accessLogger;
+		this.accessControl = accessControl;
 		this.taskExecutor = taskExecutor;
 		this.sslContext = sslContext;
-		this.noRouteResponse = noRouteResponse;
+		this.errorResponse = errorResponse;
 	}
 
 	/**
-	 * A routed connection: the transport socket, its {@link DuplexPipe} view, and the
-	 * parsed connection head (verbatim bytes plus the resolved route host).
+	 * A routed connection: the transport socket, its {@link DuplexPipe} view, the parsed
+	 * connection head (verbatim bytes plus the resolved route host), and the connection
+	 * peer -- the source of a parsed PROXY protocol header when one was present, the
+	 * socket peer otherwise.
 	 */
 	record Connection(Socket socket, DuplexPipe pipe, ConnectionHeadParser.Head head) {
 
@@ -169,8 +174,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				return;
 			}
 			if (!this.relay(connection, access)) {
-				// no session: relay() answered with the no-route response and closed
-				// the socket
+				// access denied or no session: relay() answered with the error response
+				// and closed the socket
 				access.close();
 			}
 		}
@@ -262,9 +267,13 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	private boolean relay(Connection conn, AccessLogger.Connection access) {
 		Optional<Router.Route> route = this.router.lookup(conn.head().host());
+		if (!this.accessControl.allowed(route.orElse(null), peerOf(conn.socket()))) {
+			this.reject(conn, this.errorResponse.forbidden(conn.head()));
+			return false;
+		}
 		TunnelSession session = route.map(r -> this.sessions.find(r.clientId()).orElse(null)).orElse(null);
 		if (session == null) {
-			this.reject(conn);
+			this.reject(conn, this.errorResponse.noRoute(conn.head()));
 			return false;
 		}
 		Router.Route route0 = route.get();
@@ -300,13 +309,12 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	}
 
 	/**
-	 * Answers an unroutable connection with the no-route response, then half-closes and
+	 * Answers a rejected connection with the given error response, then half-closes and
 	 * drains it before closing: closing with unread request bytes (a body, or HTTP/2
 	 * frames sent after the head) would reset the connection and discard the response
 	 * before the peer reads it.
 	 */
-	private void reject(Connection conn) {
-		byte[] response = this.noRouteResponse.render(conn.head());
+	private void reject(Connection conn, byte[] response) {
 		try {
 			if (response.length > 0) {
 				OutputStream out = conn.pipe().sink();
@@ -368,6 +376,13 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				access.bytes(count, direction);
 			}
 		};
+	}
+
+	private static @Nullable InetAddress peerOf(Socket socket) {
+		if (socket.getRemoteSocketAddress() instanceof InetSocketAddress remote) {
+			return remote.getAddress();
+		}
+		return null;
 	}
 
 	private void close(Socket socket) {

@@ -32,8 +32,9 @@ class TcpPortGatewayPreemptTest {
 	private final Router router = new Router();
 
 	private final TcpPortGateway gateway = new TcpPortGateway(this.router, this.sessions,
-			SluiceServerProperties.builder().dataPort(0).tcpPortRange("19000").build(), this.directExecutor,
-			this.meters, new AccessLogger(SluiceServerProperties.builder().build()));
+			SluiceServerProperties.builder().dataPort(0).tcpPortRange("19000").build(),
+			new AccessControl(SluiceServerProperties.builder().build()), this.directExecutor, this.meters,
+			new AccessLogger(SluiceServerProperties.builder().build()));
 
 	private TunnelSession session(String clientId) {
 		return TunnelSession.builder()

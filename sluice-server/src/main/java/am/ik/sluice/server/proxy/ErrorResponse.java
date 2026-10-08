@@ -20,49 +20,58 @@ import io.netty.handler.codec.http2.Http2Headers;
 import org.springframework.stereotype.Component;
 
 /**
- * The data plane's answer to a request no tunnel session can serve: 503 with the no-route
- * error page, encoded in the protocol the request arrived in (HTTP/1.1, or HTTP/2 for
- * prior knowledge and ALPN h2), after which the connection closes.
+ * The data plane's error answers, encoded in the protocol the request arrived in
+ * (HTTP/1.1, or HTTP/2 for prior knowledge and ALPN h2), after which the connection
+ * closes: the 503 no-route page for a request no tunnel session can serve, and the 403
+ * forbidden page for a peer address the access control excludes.
  */
 @Component
-public class NoRouteResponse {
+public class ErrorResponse {
 
 	private static final String CONTENT_TYPE = "text/html; charset=utf-8";
 
 	/** The minimum SETTINGS_MAX_FRAME_SIZE every HTTP/2 peer accepts (RFC 9113 4.2). */
 	private static final int MAX_FRAME_SIZE = 16_384;
 
-	/** Answer to a head that is not an HTTP request, e.g. a hostless RESP command. */
-	private static final byte[] BARE = ("HTTP/1.1 503 Service Unavailable\r\n"
-			+ "Content-Length: 0\r\nConnection: close\r\n\r\n")
-		.getBytes(StandardCharsets.US_ASCII);
+	private final Page noRoute;
 
-	private final Template page;
+	private final Page forbidden;
 
-	public NoRouteResponse(Mustache.Compiler compiler) {
-		this.page = compiler.loadTemplate("proxy/no-route");
+	ErrorResponse(Mustache.Compiler compiler) {
+		this.noRoute = new Page(compiler.loadTemplate("proxy/no-route"), "503 Service Unavailable");
+		this.forbidden = new Page(compiler.loadTemplate("proxy/forbidden"), "403 Forbidden");
 	}
 
 	/**
-	 * The response bytes for the given connection head. Empty for a TLS passthrough head:
-	 * the peer is mid handshake and expects TLS records, not an HTTP error.
+	 * The no-route response bytes for the given connection head.
 	 */
-	public byte[] render(ConnectionHeadParser.Head head) {
+	public byte[] noRoute(ConnectionHeadParser.Head head) {
+		return this.render(head, this.noRoute);
+	}
+
+	/**
+	 * The forbidden response bytes for the given connection head.
+	 */
+	public byte[] forbidden(ConnectionHeadParser.Head head) {
+		return this.render(head, this.forbidden);
+	}
+
+	private byte[] render(ConnectionHeadParser.Head head, Page page) {
 		if (head.encrypted()) {
 			return new byte[0];
 		}
 		if (ConnectionHeadParser.isHttp2(head.bytes())) {
-			return this.http2(head);
+			return this.http2(head, page);
 		}
 		if (head.request() == null) {
-			return BARE;
+			return bare(page);
 		}
-		return this.http1(head, head.request());
+		return this.http1(head, head.request(), page);
 	}
 
-	private byte[] http1(ConnectionHeadParser.Head head, ConnectionHeadParser.Head.Request request) {
-		byte[] body = this.page(head);
-		String responseHead = "HTTP/1.1 503 Service Unavailable\r\n" + "Content-Type: " + CONTENT_TYPE + "\r\n"
+	private byte[] http1(ConnectionHeadParser.Head head, ConnectionHeadParser.Head.Request request, Page page) {
+		byte[] body = this.page(head, page);
+		String responseHead = "HTTP/1.1 " + page.reason() + "\r\n" + "Content-Type: " + CONTENT_TYPE + "\r\n"
 				+ "Content-Length: " + body.length + "\r\n" + "Cache-Control: no-store\r\n"
 				+ "Connection: close\r\n\r\n";
 		ByteArrayOutputStream out = new ByteArrayOutputStream(responseHead.length() + body.length);
@@ -78,12 +87,12 @@ public class NoRouteResponse {
 	 * consumed with the head, the response on the request's stream, and a GOAWAY that
 	 * refuses any further stream. The page fits the default 64 KiB flow-control window.
 	 */
-	private byte[] http2(ConnectionHeadParser.Head head) {
+	private byte[] http2(ConnectionHeadParser.Head head, Page page) {
 		ConnectionHeadParser.Head.Request request = head.request();
 		int streamId = head.h2() == null ? 1 : head.h2().streamId();
 		boolean withBody = request != null && !isHead(request);
-		byte[] body = request == null ? new byte[0] : this.page(head);
-		Http2Headers headers = new DefaultHttp2Headers().status("503")
+		byte[] body = request == null ? new byte[0] : this.page(head, page);
+		Http2Headers headers = new DefaultHttp2Headers().status(page.status())
 			.set("content-type", CONTENT_TYPE)
 			.set("content-length", String.valueOf(body.length))
 			.set("cache-control", "no-store");
@@ -103,12 +112,17 @@ public class NoRouteResponse {
 		return frames.toByteArray();
 	}
 
-	private byte[] page(ConnectionHeadParser.Head head) {
+	private byte[] page(ConnectionHeadParser.Head head, Page page) {
 		ConnectionHeadParser.Head.Request request = head.request();
 		// an empty value skips its section (emptyStringIsFalse)
 		Map<String, String> context = Map.of("host", head.host() == null ? "" : head.host(), "method",
 				request == null ? "" : request.method(), "path", request == null ? "" : request.path());
-		return this.page.execute(context).getBytes(StandardCharsets.UTF_8);
+		return page.page().execute(context).getBytes(StandardCharsets.UTF_8);
+	}
+
+	private static byte[] bare(Page page) {
+		return ("HTTP/1.1 " + page.reason() + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			.getBytes(StandardCharsets.US_ASCII);
 	}
 
 	private static boolean isHead(ConnectionHeadParser.Head.Request request) {
@@ -116,21 +130,16 @@ public class NoRouteResponse {
 	}
 
 	/**
-	 * HPACK-encodes the headers as never-indexed literals, so the block leaves the peer's
-	 * dynamic table untouched whatever SETTINGS_HEADER_TABLE_SIZE it announced.
+	 * An error page: its template and its HTTP status line (the bare status code is the
+	 * leading token of the reason).
 	 */
-	private static byte[] headerBlock(int streamId, Http2Headers headers) {
-		ByteBuf buf = Unpooled.buffer(128);
-		try {
-			new DefaultHttp2HeadersEncoder((name, value) -> true).encodeHeaders(streamId, headers, buf);
-			return ByteBufUtil.getBytes(buf);
+	private record Page(Template page, String reason) {
+
+		private String status() {
+			int end = this.reason.indexOf(' ');
+			return end < 0 ? this.reason : this.reason.substring(0, end);
 		}
-		catch (Http2Exception e) {
-			throw new IllegalStateException(Http2Error.INTERNAL_ERROR.name(), e);
-		}
-		finally {
-			buf.release();
-		}
+
 	}
 
 	/**
@@ -181,6 +190,24 @@ public class NoRouteResponse {
 			return this.out.toByteArray();
 		}
 
+	}
+
+	/**
+	 * HPACK-encodes the headers as never-indexed literals, so the block leaves the peer's
+	 * dynamic table untouched whatever SETTINGS_HEADER_TABLE_SIZE it announced.
+	 */
+	private static byte[] headerBlock(int streamId, Http2Headers headers) {
+		ByteBuf buf = Unpooled.buffer(128);
+		try {
+			new DefaultHttp2HeadersEncoder((name, value) -> true).encodeHeaders(streamId, headers, buf);
+			return ByteBufUtil.getBytes(buf);
+		}
+		catch (Http2Exception e) {
+			throw new IllegalStateException(Http2Error.INTERNAL_ERROR.name(), e);
+		}
+		finally {
+			buf.release();
+		}
 	}
 
 }

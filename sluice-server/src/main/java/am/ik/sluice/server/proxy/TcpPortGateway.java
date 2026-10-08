@@ -64,6 +64,8 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 
 	private final AccessLogger accessLogger;
 
+	private final AccessControl accessControl;
+
 	private final ConcurrentMap<Integer, BoundListener> listeners = new ConcurrentHashMap<>();
 
 	private final ConcurrentMap<Integer, AtomicInteger> activeConnections = new ConcurrentHashMap<>();
@@ -83,11 +85,12 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 	private volatile boolean running;
 
 	TcpPortGateway(Router router, SessionRegistry sessions, SluiceServerProperties properties,
-			@Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor, MeterRegistry meterRegistry,
-			AccessLogger accessLogger) {
+			AccessControl accessControl, @Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor,
+			MeterRegistry meterRegistry, AccessLogger accessLogger) {
 		this.router = router;
 		this.sessions = sessions;
 		this.properties = properties;
+		this.accessControl = accessControl;
 		this.tcpPortRange = TcpPortRange.parse(properties.tcpPortRange());
 		this.taskExecutor = taskExecutor;
 		this.meterRegistry = meterRegistry;
@@ -249,6 +252,11 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 		access.accept();
 		try {
 			Optional<Router.Route> route = this.router.lookupByPort(port);
+			if (!this.accessControl.allowed(route.orElse(null), peerOf(socket))) {
+				this.close(socket);
+				access.close();
+				return;
+			}
 			TunnelSession session = route.map(r -> this.sessions.find(r.clientId()).orElse(null)).orElse(null);
 			if (session == null) {
 				this.close(socket);
@@ -300,6 +308,13 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 				access.bytes(count, direction);
 			}
 		};
+	}
+
+	private static @Nullable InetAddress peerOf(Socket socket) {
+		if (socket.getRemoteSocketAddress() instanceof InetSocketAddress remote) {
+			return remote.getAddress();
+		}
+		return null;
 	}
 
 	private void close(Socket socket) {

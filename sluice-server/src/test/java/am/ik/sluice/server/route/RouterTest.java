@@ -300,4 +300,39 @@ class RouterTest {
 		assertThat(router.lookupByPort(16000).orElseThrow().address()).isEqualTo("127.0.0.1:6000");
 	}
 
+	@Test
+	void allowedCidrsPropagateToTheRoute() {
+		Router router = new Router();
+		router.register("c1",
+				List.of(Upstream.newBuilder()
+					.setHost("demo.local")
+					.setTargetUrl("http://127.0.0.1:3000")
+					.addAllowedCidrs("10.0.0.0/8")
+					.addAllowedCidrs("192.168.1.1")
+					.build()));
+		Router.Route route = router.lookup("demo.local").orElseThrow();
+		assertThat(route.allowedCidrs()).containsExactly("10.0.0.0/8", "192.168.1.1");
+	}
+
+	@Test
+	void allowedCidrsDefaultToEmpty() {
+		Router router = new Router();
+		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3000")));
+		assertThat(router.lookup("demo.local").orElseThrow().allowedCidrs()).isEmpty();
+	}
+
+	@Test
+	void allowedCidrsSurviveReRegistrationAndRemovalOfOtherClients() {
+		Router router = new Router();
+		router.register("c1",
+				List.of(Upstream.newBuilder()
+					.setHost("demo.local")
+					.setTargetUrl("http://127.0.0.1:3000")
+					.addAllowedCidrs("10.0.0.0/8")
+					.build()));
+		router.register("c2", List.of(upstream("demo.local", "http://127.0.0.2:3000")));
+		router.remove("c2");
+		assertThat(router.lookup("demo.local").orElseThrow().allowedCidrs()).containsExactly("10.0.0.0/8");
+	}
+
 }

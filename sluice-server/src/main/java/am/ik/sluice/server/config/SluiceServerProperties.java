@@ -26,13 +26,14 @@ import am.ik.sluice.server.route.LoadBalance;
 @ConfigurationProperties("sluice")
 public record SluiceServerProperties(String token, @Nullable String tokenFile, @DefaultValue("0.0.0.0") String dataHost,
 		@DefaultValue("8000") int dataPort, @Nullable String dataTlsBundle, @DefaultValue("") String tcpPortRange,
-		AccessLog accessLog, Node node, Cluster cluster, Console console,
+		AccessLog accessLog, AccessControl accessControl, Node node, Cluster cluster, Console console,
 		@DefaultValue("smallest-client-id") LoadBalance httpLoadBalance,
 		@DefaultValue("smallest-client-id") LoadBalance tcpLoadBalance) {
 
 	public SluiceServerProperties {
 		dataHost = dataHost == null || dataHost.isBlank() ? "0.0.0.0" : dataHost;
 		accessLog = accessLog == null ? AccessLog.builder().build() : accessLog;
+		accessControl = accessControl == null ? AccessControl.builder().build() : accessControl;
 		node = node == null ? Node.builder().build() : node;
 		cluster = cluster == null ? Cluster.builder().build() : cluster;
 		console = console == null ? Console.builder().build() : console;
@@ -297,6 +298,52 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	}
 
 	/**
+	 * Data plane IP access control.
+	 *
+	 * @param allowCidrs CIDRs / bare addresses allowed to connect on the data plane
+	 * (comma separated in configuration); empty = every address is allowed. Overridden
+	 * per route by the upstream's {@code allowed-cidrs}
+	 * @param denyCidrs CIDRs / bare addresses rejected before any allow evaluation
+	 */
+	public record AccessControl(@DefaultValue List<String> allowCidrs, @DefaultValue List<String> denyCidrs) {
+
+		public AccessControl {
+			allowCidrs = allowCidrs == null ? List.of() : List.copyOf(allowCidrs);
+			denyCidrs = denyCidrs == null ? List.of() : List.copyOf(denyCidrs);
+		}
+
+		public static Builder builder() {
+			return new Builder();
+		}
+
+		public static final class Builder {
+
+			private List<String> allowCidrs = List.of();
+
+			private List<String> denyCidrs = List.of();
+
+			private Builder() {
+			}
+
+			public Builder allowCidrs(List<String> allowCidrs) {
+				this.allowCidrs = allowCidrs;
+				return this;
+			}
+
+			public Builder denyCidrs(List<String> denyCidrs) {
+				this.denyCidrs = denyCidrs;
+				return this;
+			}
+
+			public AccessControl build() {
+				return new AccessControl(this.allowCidrs, this.denyCidrs);
+			}
+
+		}
+
+	}
+
+	/**
 	 * Management console settings.
 	 *
 	 * @param auth console authentication; the console is always authenticated, only the
@@ -374,6 +421,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 		@Nullable private AccessLog accessLog;
 
+		private AccessControl accessControl = AccessControl.builder().build();
+
 		@Nullable private Node node;
 
 		@Nullable private Cluster cluster;
@@ -422,6 +471,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			return this;
 		}
 
+		public Builder accessControl(AccessControl accessControl) {
+			this.accessControl = accessControl;
+			return this;
+		}
+
 		public Builder node(Node node) {
 			this.node = node;
 			return this;
@@ -451,7 +505,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			return new SluiceServerProperties(this.token == null ? "" : this.token, this.tokenFile,
 					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort, this.dataTlsBundle,
 					this.tcpPortRange, this.accessLog == null ? AccessLog.builder().build() : this.accessLog,
-					this.node == null ? Node.builder().build() : this.node,
+					this.accessControl, this.node == null ? Node.builder().build() : this.node,
 					this.cluster == null ? Cluster.builder().build() : this.cluster,
 					this.console == null ? Console.builder().build() : this.console, this.httpLoadBalance,
 					this.tcpLoadBalance);

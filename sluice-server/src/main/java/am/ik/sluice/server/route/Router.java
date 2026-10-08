@@ -29,11 +29,16 @@ public class Router {
 	/**
 	 * Resolved route: the client owning the upstream, the domain the route is registered
 	 * under, its dial address, whether the request Host header passes through unmodified,
-	 * and whether TLS connections are relayed untouched ({@code tls-passthrough}) instead
-	 * of terminated on the data plane.
+	 * whether TLS connections are relayed untouched ({@code tls-passthrough}) instead of
+	 * terminated on the data plane, and the IP networks allowed to connect (empty = the
+	 * server-wide allow list applies).
 	 */
 	public record Route(String clientId, String domain, String address, int listenPort, boolean preserveHost,
-			boolean tlsPassthrough) {
+			boolean tlsPassthrough, List<String> allowedCidrs) {
+
+		public Route {
+			allowedCidrs = allowedCidrs == null ? List.of() : List.copyOf(allowedCidrs);
+		}
 
 		/**
 		 * The route identity used for metrics: the domain, falling back to the listen
@@ -63,6 +68,8 @@ public class Router {
 			private boolean preserveHost = true;
 
 			private boolean tlsPassthrough;
+
+			private List<String> allowedCidrs = List.of();
 
 			private Builder() {
 			}
@@ -97,11 +104,16 @@ public class Router {
 				return this;
 			}
 
+			public Builder allowedCidrs(List<String> allowedCidrs) {
+				this.allowedCidrs = allowedCidrs;
+				return this;
+			}
+
 			public Route build() {
 				return new Route(Objects.requireNonNull(this.clientId, "clientId is required"),
 						Objects.requireNonNull(this.domain, "domain is required"),
 						Objects.requireNonNull(this.address, "address is required"), this.listenPort, this.preserveHost,
-						this.tlsPassthrough);
+						this.tlsPassthrough, this.allowedCidrs);
 			}
 
 		}
@@ -162,7 +174,11 @@ public class Router {
 	}
 
 	record Target(String clientId, String domain, String address, boolean preserveHost, boolean tlsPassthrough,
-			int listenPort) {
+			int listenPort, List<String> allowedCidrs) {
+
+		Target {
+			allowedCidrs = allowedCidrs == null ? List.of() : List.copyOf(allowedCidrs);
+		}
 
 		static Builder builder() {
 			return new Builder();
@@ -181,6 +197,8 @@ public class Router {
 			private boolean tlsPassthrough;
 
 			private int listenPort;
+
+			private List<String> allowedCidrs = List.of();
 
 			private Builder() {
 			}
@@ -215,11 +233,16 @@ public class Router {
 				return this;
 			}
 
+			Builder allowedCidrs(List<String> allowedCidrs) {
+				this.allowedCidrs = allowedCidrs;
+				return this;
+			}
+
 			Target build() {
 				return new Target(Objects.requireNonNull(this.clientId, "clientId is required"),
 						Objects.requireNonNull(this.domain, "domain is required"),
 						Objects.requireNonNull(this.address, "address is required"), this.preserveHost,
-						this.tlsPassthrough, this.listenPort);
+						this.tlsPassthrough, this.listenPort, this.allowedCidrs);
 			}
 
 		}
@@ -277,6 +300,7 @@ public class Router {
 				.preserveHost(upstream.getPreserveHost())
 				.tlsPassthrough(upstream.getTlsPassthrough())
 				.listenPort(upstream.getListenPort())
+				.allowedCidrs(upstream.getAllowedCidrsList())
 				.build());
 		}
 		if (clientId == null || clientId.isBlank() || targets.isEmpty()) {
@@ -434,6 +458,7 @@ public class Router {
 			.listenPort(target.listenPort())
 			.preserveHost(target.preserveHost())
 			.tlsPassthrough(target.tlsPassthrough())
+			.allowedCidrs(target.allowedCidrs())
 			.build();
 	}
 

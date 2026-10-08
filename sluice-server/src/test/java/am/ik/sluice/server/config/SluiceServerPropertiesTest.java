@@ -34,4 +34,19 @@ class SluiceServerPropertiesTest {
 		assertThat(properties.tcpLoadBalance()).isEqualTo(LoadBalance.RANDOM);
 	}
 
+	@Test
+	void accessControlDefaultsToEmptyLists() {
+		SluiceServerProperties properties = bind(Map.of("sluice.data-port", "8000"));
+		assertThat(properties.accessControl().allowCidrs()).isEmpty();
+		assertThat(properties.accessControl().denyCidrs()).isEmpty();
+	}
+
+	@Test
+	void accessControlListsAreBoundInKebabCase() {
+		SluiceServerProperties properties = bind(Map.of("sluice.access-control.allow-cidrs", "10.0.0.0/8,127.0.0.1",
+				"sluice.access-control.deny-cidrs", "203.0.113.0/24"));
+		assertThat(properties.accessControl().allowCidrs()).containsExactly("10.0.0.0/8", "127.0.0.1");
+		assertThat(properties.accessControl().denyCidrs()).containsExactly("203.0.113.0/24");
+	}
+
 }
