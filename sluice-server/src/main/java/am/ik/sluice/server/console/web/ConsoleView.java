@@ -189,7 +189,7 @@ class ConsoleView {
 		String note = rejected ? "Port not bound" : listenPort > 0 || upstream.getTlsPassthrough() ? ""
 				: upstream.getPreserveHost() ? "Keeps Host" : "Rewrites Host";
 		return UpstreamRow.builder()
-			.host(upstream.getHost())
+			.host(routeKey(upstream))
 			.target(upstream.getTargetUrl())
 			.kind(kind)
 			.note(note)
@@ -208,7 +208,7 @@ class ConsoleView {
 			}
 			return binding.clientId().equals(clientId) ? "Serving" : "Standby, " + binding.clientId() + " serves";
 		}
-		Router.RouteGroup group = httpByKey.get(upstream.getHost());
+		Router.RouteGroup group = httpByKey.get(routeKey(upstream));
 		if (group == null) {
 			return "";
 		}
@@ -220,6 +220,14 @@ class ConsoleView {
 			return this.router.httpLoadBalance() == LoadBalance.ROUND_ROBIN ? "In rotation" : "Picked at random";
 		}
 		return preferred.clientId().equals(clientId) ? "Serving" : "Standby, " + preferred.clientId() + " serves";
+	}
+
+	/**
+	 * The route key the upstream is registered under: the host pattern when declared, the
+	 * literal host otherwise.
+	 */
+	private static String routeKey(Upstream upstream) {
+		return upstream.getHostPattern().isEmpty() ? upstream.getHost() : upstream.getHostPattern();
 	}
 
 	/**
@@ -284,8 +292,8 @@ class ConsoleView {
 			return Optional.empty();
 		}
 		return Optional.of(this.router.resolve(trimmed).map(group -> {
-			String how = group.key().equals(trimmed) ? "Exact match"
-					: group.key().isEmpty() ? "Catch-all route" : "Matched without the port";
+			String how = group.key().equals(trimmed) ? "Exact match" : group.key().isEmpty() ? "Catch-all route"
+					: this.router.isPattern(group.key()) ? "Pattern match" : "Matched without the port";
 			return Lookup.builder()
 				.host(trimmed)
 				.matched(group.key())

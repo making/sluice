@@ -1,6 +1,8 @@
 package am.ik.sluice.server.route;
 
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Optional;
 
@@ -11,8 +13,13 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentNavigableMap;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 import am.ik.sluice.v1.proto.Upstream;
 
@@ -20,11 +27,14 @@ import am.ik.sluice.v1.proto.Upstream;
  * Route table mapping public domains and listen ports to client upstreams (the port of
  * inlets' pkg/router). An upstream with a listen port is a tcp route reached only through
  * that port; its host takes no part in Host / SNI routing. Every other upstream is an
- * http route keyed by its domain, and lookup falls back to the catch-all entry registered
- * with an empty domain. When several clients serve one key the configured load balancing
- * strategy picks the target.
+ * http route keyed by its domain or, when it declares a host pattern, by that regular
+ * expression; lookup tries the exact matches, then the patterns, and falls back to the
+ * catch-all entry registered with an empty domain. When several clients serve one key the
+ * configured load balancing strategy picks the target.
  */
 public class Router {
+
+	private static final Logger log = LoggerFactory.getLogger(Router.class);
 
 	/**
 	 * Resolved route: the client owning the upstream, the domain the route is registered
@@ -174,7 +184,7 @@ public class Router {
 	}
 
 	record Target(String clientId, String domain, String address, boolean preserveHost, boolean tlsPassthrough,
-			int listenPort, List<String> allowedCidrs) {
+			int listenPort, List<String> allowedCidrs, @Nullable Pattern hostPattern) {
 
 		Target {
 			allowedCidrs = allowedCidrs == null ? List.of() : List.copyOf(allowedCidrs);
@@ -199,6 +209,8 @@ public class Router {
 			private int listenPort;
 
 			private List<String> allowedCidrs = List.of();
+
+			private @Nullable Pattern hostPattern;
 
 			private Builder() {
 			}
@@ -238,11 +250,16 @@ public class Router {
 				return this;
 			}
 
+			Builder hostPattern(@Nullable Pattern hostPattern) {
+				this.hostPattern = hostPattern;
+				return this;
+			}
+
 			Target build() {
 				return new Target(Objects.requireNonNull(this.clientId, "clientId is required"),
 						Objects.requireNonNull(this.domain, "domain is required"),
 						Objects.requireNonNull(this.address, "address is required"), this.preserveHost,
-						this.tlsPassthrough, this.listenPort, this.allowedCidrs);
+						this.tlsPassthrough, this.listenPort, this.allowedCidrs, this.hostPattern);
 			}
 
 		}
@@ -250,6 +267,13 @@ public class Router {
 	}
 
 	private final ConcurrentMap<String, List<Target>> byDomain = new ConcurrentHashMap<>();
+
+	/**
+	 * Host pattern routes keyed by the pattern source; keys are tried in their natural
+	 * String order and entries are removed once their last target goes. The compiled
+	 * pattern is carried by every target of the key.
+	 */
+	private final ConcurrentNavigableMap<String, List<Target>> byPattern = new ConcurrentSkipListMap<>();
 
 	private final ConcurrentMap<Integer, List<Target>> byPort = new ConcurrentHashMap<>();
 
@@ -288,19 +312,20 @@ public class Router {
 	public int register(String clientId, List<Upstream> upstreams) {
 		List<Target> targets = new ArrayList<>();
 		for (Upstream upstream : upstreams) {
-			String domain = upstream.getHost();
 			String address = addressOf(upstream.getTargetUrl()).orElse(null);
 			if (address == null) {
 				continue;
 			}
+			Pattern hostPattern = compiledPattern(upstream.getHostPattern(), upstream.getTargetUrl());
 			targets.add(Target.builder()
 				.clientId(clientId)
-				.domain(domain)
+				.domain(hostPattern == null ? upstream.getHost() : upstream.getHostPattern())
 				.address(address)
 				.preserveHost(upstream.getPreserveHost())
 				.tlsPassthrough(upstream.getTlsPassthrough())
 				.listenPort(upstream.getListenPort())
 				.allowedCidrs(upstream.getAllowedCidrsList())
+				.hostPattern(hostPattern)
 				.build());
 		}
 		if (clientId == null || clientId.isBlank() || targets.isEmpty()) {
@@ -312,6 +337,9 @@ public class Router {
 				if (target.listenPort() > 0) {
 					this.byPort.compute(target.listenPort(), (k, existing) -> append(existing, target));
 				}
+				else if (target.hostPattern() != null) {
+					this.byPattern.compute(target.domain(), (k, existing) -> append(existing, target));
+				}
 				else {
 					this.byDomain.compute(target.domain(), (k, existing) -> append(existing, target));
 				}
@@ -319,6 +347,23 @@ public class Router {
 			this.byClient.put(clientId, List.copyOf(targets));
 		}
 		return targets.size();
+	}
+
+	/**
+	 * Compiles the declared host pattern; {@code null} when blank (the literal host
+	 * applies) or invalid (logged, the literal host applies).
+	 */
+	private static @Nullable Pattern compiledPattern(String hostPattern, String targetUrl) {
+		if (hostPattern == null || hostPattern.isEmpty()) {
+			return null;
+		}
+		try {
+			return Pattern.compile(hostPattern);
+		}
+		catch (PatternSyntaxException e) {
+			log.warn("ignoring invalid host pattern [{}] of upstream {}: {}", hostPattern, targetUrl, e.getMessage());
+			return null;
+		}
 	}
 
 	/**
@@ -338,6 +383,13 @@ public class Router {
 		for (Target target : old) {
 			if (target.listenPort() > 0) {
 				this.byPort.compute(target.listenPort(), (k, existing) -> without(existing, clientId));
+			}
+			else if (target.hostPattern() != null) {
+				// an empty list is dropped entirely so stale pattern keys go away
+				this.byPattern.compute(target.domain(), (k, existing) -> {
+					List<Target> remaining = without(existing, clientId);
+					return remaining.isEmpty() ? null : remaining;
+				});
 			}
 			else {
 				this.byDomain.compute(target.domain(), (k, existing) -> without(existing, clientId));
@@ -366,19 +418,14 @@ public class Router {
 
 	/**
 	 * Resolves the route for the given Host header value. Exact match first, then the
-	 * host without its port, then the catch-all entry. When several clients serve the
-	 * same domain the configured http load balancing strategy picks the target (the
-	 * default, smallest client id, is deterministic across nodes -- in fan-out mode every
-	 * node holds every client).
+	 * host without its port, then the host pattern routes (matched against the host
+	 * without its port, whole match, keys in their natural String order), then the
+	 * catch-all entry. When several clients serve the same domain the configured http
+	 * load balancing strategy picks the target (the default, smallest client id, is
+	 * deterministic across nodes -- in fan-out mode every node holds every client).
 	 */
 	public Optional<Route> lookup(@Nullable String host) {
-		for (String candidate : candidates(host)) {
-			List<Target> targets = this.byDomain.get(candidate);
-			if (targets != null && !targets.isEmpty()) {
-				return Optional.of(toRoute(this.httpStrategy.pick(candidate, targets)));
-			}
-		}
-		return Optional.empty();
+		return match(host).map(candidate -> toRoute(this.httpStrategy.pick(candidate.key(), candidate.targets())));
 	}
 
 	/**
@@ -398,25 +445,70 @@ public class Router {
 	 * candidate order as {@link #lookup} but without advancing any load balancing state.
 	 */
 	public Optional<RouteGroup> resolve(@Nullable String host) {
-		for (String candidate : candidates(host)) {
-			List<Target> targets = this.byDomain.get(candidate);
-			if (targets != null && !targets.isEmpty()) {
-				return Optional.of(group(candidate, targets, this.httpLoadBalance));
-			}
-		}
-		return Optional.empty();
+		return match(host).map(candidate -> group(candidate.key(), candidate.targets(), this.httpLoadBalance));
 	}
 
 	/**
-	 * Current http route table ordered by domain (the catch-all first).
+	 * Whether the key is a registered host pattern route.
+	 */
+	public boolean isPattern(String key) {
+		return this.byPattern.containsKey(key);
+	}
+
+	private Optional<Match> match(@Nullable String host) {
+		if (host != null && !host.isBlank()) {
+			int portSeparator = host.lastIndexOf(':');
+			boolean hasPort = portSeparator > host.lastIndexOf(']'); // not an IPv6 suffix
+			String bareHost = hasPort ? host.substring(0, portSeparator) : host;
+			for (String candidate : hasPort ? List.of(host, bareHost) : List.of(host)) {
+				List<Target> targets = this.byDomain.get(candidate);
+				if (targets != null && !targets.isEmpty()) {
+					return Optional.of(new Match(candidate, targets));
+				}
+			}
+			for (Map.Entry<String, List<Target>> entry : this.byPattern.entrySet()) {
+				Pattern pattern = entry.getValue().get(0).hostPattern();
+				if (pattern != null && pattern.matcher(bareHost).matches()) {
+					return Optional.of(new Match(entry.getKey(), entry.getValue()));
+				}
+			}
+		}
+		List<Target> catchAll = this.byDomain.get("");
+		if (catchAll == null || catchAll.isEmpty()) {
+			return Optional.empty();
+		}
+		return Optional.of(new Match("", catchAll));
+	}
+
+	private record Match(String key, List<Target> targets) {
+	}
+
+	/**
+	 * Current http route table ordered by key (the catch-all first); pattern routes are
+	 * merged in by their pattern source.
 	 */
 	public List<RouteGroup> httpRoutes() {
-		return this.byDomain.entrySet()
+		Map<String, List<Target>> merged = new TreeMap<>();
+		this.byDomain.forEach((key, targets) -> {
+			if (!targets.isEmpty()) {
+				merged.put(key, targets);
+			}
+		});
+		this.byPattern.forEach((key, targets) -> {
+			if (!targets.isEmpty()) {
+				merged.merge(key, targets, Router::concat);
+			}
+		});
+		return merged.entrySet()
 			.stream()
-			.filter(entry -> !entry.getValue().isEmpty())
-			.sorted(Map.Entry.comparingByKey())
 			.map(entry -> group(entry.getKey(), entry.getValue(), this.httpLoadBalance))
 			.toList();
+	}
+
+	private static List<Target> concat(List<Target> first, List<Target> second) {
+		List<Target> merged = new ArrayList<>(first);
+		merged.addAll(second);
+		return List.copyOf(merged);
 	}
 
 	/**
@@ -460,15 +552,6 @@ public class Router {
 			.tlsPassthrough(target.tlsPassthrough())
 			.allowedCidrs(target.allowedCidrs())
 			.build();
-	}
-
-	private static List<String> candidates(@Nullable String host) {
-		if (host == null || host.isBlank()) {
-			return List.of("");
-		}
-		int portSeparator = host.lastIndexOf(':');
-		boolean hasPort = portSeparator > host.lastIndexOf(']'); // not an IPv6 suffix
-		return hasPort ? List.of(host, host.substring(0, portSeparator), "") : List.of(host, "");
 	}
 
 	/**

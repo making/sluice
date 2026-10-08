@@ -335,4 +335,105 @@ class RouterTest {
 		assertThat(router.lookup("demo.local").orElseThrow().allowedCidrs()).containsExactly("10.0.0.0/8");
 	}
 
+	private static Upstream patternUpstream(String hostPattern, String targetUrl) {
+		return Upstream.newBuilder().setHostPattern(hostPattern).setTargetUrl(targetUrl).build();
+	}
+
+	@Test
+	void hostPatternMatchesTheWholeHostNameWithoutItsPort() {
+		Router router = new Router();
+		router.register("c1", List.of(patternUpstream("svc-.*\\.local", "http://127.0.0.1:3000")));
+		assertThat(router.lookup("svc-a.local").orElseThrow().address()).isEqualTo("127.0.0.1:3000");
+		assertThat(router.lookup("svc-b.local:8000")).isPresent();
+		// the dot is escaped: the sub domain is not a whole match
+		assertThat(router.lookup("svc-a.local.sub")).isEmpty();
+		assertThat(router.lookup("other.local")).isEmpty();
+	}
+
+	@Test
+	void exactMatchBeatsThePatternAndThePatternBeatsTheCatchAll() {
+		Router router = new Router();
+		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3001")));
+		router.register("c2", List.of(patternUpstream(".*", "http://127.0.0.1:3002")));
+		router.register("c3", List.of(upstream("", "http://127.0.0.1:3003")));
+		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c1");
+		assertThat(router.lookup("anything.example").orElseThrow().clientId()).isEqualTo("c2");
+	}
+
+	@Test
+	void patternRoutesApplyTheirKeysInNaturalOrder() {
+		Router router = new Router();
+		router.register("c1", List.of(patternUpstream("b.*", "http://127.0.0.1:3001")));
+		router.register("c2", List.of(patternUpstream(".*", "http://127.0.0.1:3002")));
+		// ".*" sorts before "b.*" and matches everything, so it wins for both hosts
+		assertThat(router.lookup("berry.local").orElseThrow().clientId()).isEqualTo("c2");
+		assertThat(router.lookup("apple.local").orElseThrow().clientId()).isEqualTo("c2");
+	}
+
+	@Test
+	void everyClientOnOnePatternGoesThroughLoadBalancing() {
+		Router router = new Router();
+		router.register("c5", List.of(patternUpstream("svc-.*\\.local", "http://127.0.0.5:3005")));
+		router.register("c2", List.of(patternUpstream("svc-.*\\.local", "http://127.0.0.2:3002")));
+		assertThat(router.lookup("svc-a.local").orElseThrow().clientId()).isEqualTo("c2");
+	}
+
+	@Test
+	void invalidHostPatternFallsBackToTheLiteralHost() {
+		Router router = new Router();
+		router.register("c1",
+				List.of(Upstream.newBuilder()
+					.setHost("demo.local")
+					.setHostPattern("[")
+					.setTargetUrl("http://127.0.0.1:3000")
+					.build()));
+		assertThat(router.lookup("demo.local").orElseThrow().address()).isEqualTo("127.0.0.1:3000");
+		assertThat(router.lookup("other.local")).isEmpty();
+	}
+
+	@Test
+	void patternRoutesShowUpInTheRouteTableAndResolve() {
+		Router router = new Router();
+		router.register("c1", List.of(patternUpstream("svc-.*\\.local", "http://127.0.0.1:3000")));
+		assertThat(router.httpRoutes()).extracting(Router.RouteGroup::key).containsExactly("svc-.*\\.local");
+		Router.RouteGroup resolved = router.resolve("svc-a.local").orElseThrow();
+		assertThat(resolved.key()).isEqualTo("svc-.*\\.local");
+		assertThat(resolved.candidates()).extracting(Router.Route::clientId).containsExactly("c1");
+		assertThat(router.isPattern("svc-.*\\.local")).isTrue();
+		assertThat(router.isPattern("svc-a.local")).isFalse();
+	}
+
+	@Test
+	void reRegistrationReplacesPatternRoutes() {
+		Router router = new Router();
+		router.register("c1", List.of(patternUpstream("svc-.*\\.local", "http://127.0.0.1:3001")));
+		router.register("c1", List.of(patternUpstream("app-.*\\.local", "http://127.0.0.1:3002")));
+		assertThat(router.lookup("svc-a.local")).isEmpty();
+		assertThat(router.lookup("app-a.local").orElseThrow().address()).isEqualTo("127.0.0.1:3002");
+		assertThat(router.isPattern("svc-.*\\.local")).isFalse();
+	}
+
+	@Test
+	void removeDropsPatternRoutes() {
+		Router router = new Router();
+		router.register("c1", List.of(patternUpstream("svc-.*\\.local", "http://127.0.0.1:3000")));
+		router.remove("c1");
+		assertThat(router.lookup("svc-a.local")).isEmpty();
+		assertThat(router.httpRoutes()).isEmpty();
+		assertThat(router.isPattern("svc-.*\\.local")).isFalse();
+	}
+
+	@Test
+	void tcpUpstreamKeepsItsPortRouteWhenItDeclaresAPattern() {
+		Router router = new Router();
+		router.register("c1",
+				List.of(Upstream.newBuilder()
+					.setHostPattern("svc-.*\\.local")
+					.setTargetUrl("tcp://127.0.0.1:5432")
+					.setListenPort(15432)
+					.build()));
+		assertThat(router.lookup("svc-a.local")).isEmpty();
+		assertThat(router.lookupByPort(15432).orElseThrow().address()).isEqualTo("127.0.0.1:5432");
+	}
+
 }

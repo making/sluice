@@ -114,6 +114,10 @@ message AdvertiseAck {
 message Upstream {
   // Public domain the server routes requests for (empty means catch-all).
   string host = 1;
+  // Optional regular expression the request host (without its port) is matched
+  // against; the match is against the whole name. When non-empty it takes
+  // precedence over `host`.
+  string host_pattern = 7;
   // Upstream URL, e.g. http://127.0.0.1:3000.
   string target_url = 2;
   // When false the server rewrites the request Host/:authority to the target's
