@@ -21,7 +21,7 @@ class NodeDirectoryConfigurationTest {
 						"  gamma = grpc://g:9000 "))
 				.build())
 			.build();
-		NodeDirectory directory = this.configuration.staticNodeDirectory(properties);
+		NodeDirectory directory = this.configuration.nodeDirectory(properties);
 		assertThat(directory.version()).isEqualTo(1);
 		assertThat(directory.nodes()).containsExactly(new NodeDirectory.NodeMember("alpha", "grpcs://alpha:8001"),
 				new NodeDirectory.NodeMember("beta", ""), new NodeDirectory.NodeMember("self", "grpcs://self:8001"),
@@ -33,7 +33,7 @@ class NodeDirectoryConfigurationTest {
 		SluiceServerProperties properties = SluiceServerProperties.builder()
 			.node(SluiceServerProperties.Node.builder().id("alone").build())
 			.build();
-		NodeDirectory directory = this.configuration.singleNodeDirectory(properties);
+		NodeDirectory directory = this.configuration.nodeDirectory(properties);
 		assertThat(directory.version()).isZero();
 		assertThat(directory.nodes()).containsExactly(new NodeDirectory.NodeMember("alone", ""));
 	}

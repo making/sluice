@@ -1,10 +1,9 @@
 package am.ik.sluice.server.config;
 
-import java.util.Objects;
-
 import javax.net.ssl.SSLContext;
 
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.jspecify.annotations.Nullable;
+
 import org.springframework.boot.ssl.SslBundles;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -14,12 +13,23 @@ import org.springframework.context.annotation.Configuration;
  * Spring Boot SSL bundle named by {@code sluice.data-tls-bundle}.
  */
 @Configuration(proxyBeanMethods = false)
-@ConditionalOnProperty("sluice.data-tls-bundle")
 class DataPlaneSslConfiguration {
 
+	/**
+	 * The bundle is resolved in this bean body instead of a
+	 * {@code @ConditionalOnProperty} bean: conditions are evaluated at build time in the
+	 * native image, which would pin the feature to the properties of the build machine
+	 * (the configuration vanished whenever the image was built without
+	 * {@code sluice.data-tls-bundle}, so runtime configuration was silently ignored). A
+	 * {@code null} becomes a NullBean that {@code ObjectProvider#getIfAvailable} reports
+	 * as absent.
+	 */
 	@Bean
-	SSLContext dataPlaneSslContext(SslBundles sslBundles, SluiceServerProperties properties) {
-		String bundleName = Objects.requireNonNull(properties.dataTlsBundle(), "dataTlsBundle is required");
+	@Nullable SSLContext dataPlaneSslContext(SslBundles sslBundles, SluiceServerProperties properties) {
+		String bundleName = properties.dataTlsBundle();
+		if (bundleName == null || bundleName.isBlank()) {
+			return null;
+		}
 		try {
 			return sslBundles.getBundle(bundleName).createSslContext();
 		}

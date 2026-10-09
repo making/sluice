@@ -6,8 +6,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
-import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -19,6 +17,22 @@ import am.ik.sluice.server.cluster.NodeDirectory.NodeMember;
 public class NodeDirectoryConfiguration {
 
 	/**
+	 * The provider is decided in this bean body instead of {@code @ConditionalOnProperty}
+	 * beans: bean conditions are evaluated at build time in the native image, which would
+	 * pin the membership source to the properties of the build machine (the static
+	 * provider vanished whenever the image was built without
+	 * {@code sluice.cluster.nodes}, so runtime configuration was silently ignored).
+	 * Future providers (e.g. DNS SRV) must be selected here for the same reason.
+	 */
+	@Bean
+	NodeDirectory nodeDirectory(SluiceServerProperties properties) {
+		if (properties.cluster().nodes().isEmpty()) {
+			return singleNodeDirectory(properties);
+		}
+		return staticNodeDirectory(properties);
+	}
+
+	/**
 	 * {@link NodeDirectory} backed by the static {@code sluice.cluster.nodes} list
 	 * ({@code nodeId=publicUrl} entries). The local node is always part of the
 	 * membership.
@@ -26,9 +40,7 @@ public class NodeDirectoryConfiguration {
 	 * A static list never changes at runtime, so the version is constant; the version
 	 * hook exists for future dynamic providers (e.g. DNS SRV).
 	 */
-	@Bean
-	@ConditionalOnProperty("sluice.cluster.nodes")
-	NodeDirectory staticNodeDirectory(SluiceServerProperties properties) {
+	static NodeDirectory staticNodeDirectory(SluiceServerProperties properties) {
 		Map<String, String> byId = new LinkedHashMap<>();
 		for (String entry : properties.cluster().nodes()) {
 			int sep = entry.indexOf('=');
@@ -64,9 +76,7 @@ public class NodeDirectoryConfiguration {
 	 * keep their bootstrap address. Keeps {@code ListNodes} meaningful without cluster
 	 * configuration.
 	 */
-	@Bean
-	@ConditionalOnMissingBean(NodeDirectory.class)
-	NodeDirectory singleNodeDirectory(SluiceServerProperties properties) {
+	static NodeDirectory singleNodeDirectory(SluiceServerProperties properties) {
 		NodeMember self = new NodeMember(properties.node().id(), properties.node().publicUrl());
 		return new NodeDirectory() {
 
