@@ -67,7 +67,7 @@ sequenceDiagram
 
 - `sluice-proto` - `.proto` contract, generated stubs, and the shared tunnel primitives (`VirtualConnection`, `SessionSender`, `SocketRelay`)
 - `sluice-server` - exit node: gRPC control plane (`spring.grpc.server.port`, default 8001) + raw TCP data plane (`sluice.data-port`, default 8000) + actuator and management console (`server.port`, default 8081)
-- `sluice-client` - tunnel client: connects to the server, advertises upstreams, dials local upstreams on CONNECT, reconnects with exponential backoff (1s..30s)
+- `sluice-client` - tunnel client: connects to the server, advertises upstreams, dials local upstreams on CONNECT, reconnects with exponential backoff (1s..30s), actuator on `server.port` (default 9001)
 - `sluice-it` - full stack integration tests running the real server and client applications in one JVM (proxying, reconnect after server restart, wrong-token rejection)
 - `sluice-example-upstream` - minimal sample upstream for manual checks (`It works` over http/1.1 and h2c)
 
@@ -294,7 +294,7 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.keep-alive-time` | `30s` | interval of the gRPC keepalive ping towards the server |
 | `sluice.keep-alive-timeout` | `10s` | how long a keepalive ping answer may take before the channel is torn down |
 | `sluice.strict-forwarding` | `true` | only dial upstreams present in the map |
-| `management.server.port` | `9001` | actuator port |
+| `server.port` | `9001` | actuator (health / info / prometheus) |
 
 ## gRPC keepalive
 
@@ -508,8 +508,8 @@ over the mTLS tunnel.
 - server `GET /actuator/health` - liveness, UP while the process lives; details `clients`
   (connected tunnel clients) and `draining`. `/actuator/health/readiness` is DOWN during the
   cluster warmup window and while draining (see "Cluster (scale-out)")
-- client `GET /actuator/health` - UP while at least one per-node tunnel stream is established;
-  the `nodes` detail lists each node's stream state
+- client `GET /actuator/health` (port 9001) - UP while at least one per-node tunnel stream is
+  established; the `tunnel` detail shows the connection state and `nodes` each node's stream state
 - `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`
 
 ## Console

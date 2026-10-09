@@ -168,7 +168,7 @@ class ClusterGrpcTlsE2ETests {
 				"--sluice.client.id=it-client",
 				"--sluice.client.upstream[0].host=" + HOST,
 				"--sluice.client.upstream[0].target=http://127.0.0.1:" + this.httpPort,
-				"--sluice.token=" + TOKEN, "--server.port=0", "--management.server.port=0");
+				"--sluice.token=" + TOKEN, "--server.port=0");
 		// @formatter:on
 		this.clientContext = context;
 	}

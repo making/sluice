@@ -156,8 +156,7 @@ class ClusterFanoutE2ETests {
 				"--sluice.client.upstream[1].host=",
 				"--sluice.client.upstream[1].target=tcp://127.0.0.1:"
 						+ Objects.requireNonNull(this.echoUpstream).getLocalPort(),
-				"--sluice.client.upstream[1].listen-port=" + TCP_PORT, "--sluice.token=" + TOKEN, "--server.port=0",
-				"--management.server.port=0");
+				"--sluice.client.upstream[1].listen-port=" + TCP_PORT, "--sluice.token=" + TOKEN, "--server.port=0");
 		this.clientContext = context;
 	}
 

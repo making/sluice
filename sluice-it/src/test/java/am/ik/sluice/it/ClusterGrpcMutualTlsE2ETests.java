@@ -357,7 +357,7 @@ class ClusterGrpcMutualTlsE2ETests {
 				"--spring.ssl.bundle.pem." + CLIENT_BUNDLE + ".keystore.certificate=file:" + clientPemPaths[identity - 1],
 				"--spring.ssl.bundle.pem." + CLIENT_BUNDLE + ".keystore.private-key=file:" + clientKeyPemPaths[identity - 1],
 				"--spring.ssl.bundle.pem." + CLIENT_BUNDLE + ".truststore.certificate=file:" + caPemPath,
-				"--sluice.token=" + TOKEN, "--server.port=0", "--management.server.port=0" };
+				"--sluice.token=" + TOKEN, "--server.port=0" };
 		// @formatter:on
 		String[] all = new String[args.length + extraArgs.length];
 		System.arraycopy(args, 0, all, 0, args.length);
@@ -372,8 +372,7 @@ class ClusterGrpcMutualTlsE2ETests {
 	private void startUnbundledClient(String... extraArgs) {
 		// @formatter:off
 		String[] args = new String[] { "--sluice.server-url=grpcs://127.0.0.1:" + this.grpcPorts[0],
-				"--sluice.client.id=mtls-it-unbundled", "--sluice.token=" + TOKEN, "--server.port=0",
-				"--management.server.port=0" };
+				"--sluice.client.id=mtls-it-unbundled", "--sluice.token=" + TOKEN, "--server.port=0" };
 		// @formatter:on
 		String[] all = new String[args.length + extraArgs.length];
 		System.arraycopy(args, 0, all, 0, args.length);
