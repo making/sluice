@@ -133,10 +133,6 @@ clients are -- each node gets its own LoadBalancer Service with a pinned
 static, so `spec.replicas` and the `sluice.cluster.nodes` env below must be kept in
 sync; scaling means editing both and re-applying.
 
-Use the `jvm` image for multi-node: the `native` image bakes `@ConditionalOnProperty`
-bean conditions at build time (Spring AOT), so its static membership provider never
-sees runtime `sluice.cluster.nodes` and silently stays single-node.
-
 ```yaml
 # per-node control plane: one LB per pod, pinned into the MetalLB pool so the
 # membership env below can reference the addresses
@@ -229,7 +225,7 @@ spec:
       enableServiceLinks: false
       containers:
         - name: sluice-server
-          image: ghcr.io/making/sluice/sluice-server:jvm
+          image: ghcr.io/making/sluice/sluice-server:native
           imagePullPolicy: Always
           resources:
             limits:
