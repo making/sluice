@@ -31,8 +31,8 @@ deployment:
     limits:
       memory: 512Mi
   env:
-    SLUICE_TOKEN:
-      value: SECRET # tunnel token; clients must pass the same value
+    sluice.token-file:
+      value: /mnt/secrets/token # the secret below; clients must pass the same token
   readinessProbe:
     enabled: true
     httpGet:
@@ -52,9 +52,14 @@ deployment:
   volumes:
     tmp:
       emptyDir: {}
+    token:
+      secret:
+        name: sluice-token
   volumeMounts:
     tmp:
       mountPath: /tmp
+    token:
+      mountPath: /mnt/secrets
 
 service:
   type: LoadBalancer # MetalLB assigns a routable IP
@@ -77,6 +82,9 @@ service:
 
 ```sh
 kubectl create namespace sluice
+
+# tunnel token; clients must pass the same value
+kubectl -n sluice create secret generic sluice-token --from-literal=token=SECRET
 
 # only needed when the image is not yet pushed and was built locally:
 kind load docker-image ghcr.io/making/sluice/sluice-server:native --name kind
@@ -231,8 +239,8 @@ spec:
             limits:
               memory: 512Mi
           env:
-            - name: sluice.token
-              value: SECRET
+            - name: sluice.token-file
+              value: /mnt/secrets/token # the sluice-token secret from the single-node section
             - name: sluice.node.id
               valueFrom:
                 fieldRef:
@@ -257,9 +265,14 @@ spec:
               port: 8081
             periodSeconds: 10
           volumeMounts:
+            - name: token
+              mountPath: /mnt/secrets
             - name: tmp
               mountPath: /tmp
       volumes:
+        - name: token
+          secret:
+            secretName: sluice-token
         - name: tmp
           emptyDir: {}
 ```
@@ -267,7 +280,7 @@ spec:
 Notes:
 
 - Replace the single-node release when switching (`helm uninstall sluice-server -n sluice`).
-- Env vars may use the plain property names (`sluice.token`) -- no need for
+- Env vars may use the plain property names (`sluice.token-file`) -- no need for
   `UPPER_SNAKE`; the values are plain strings and Spring binds them as-is.
 - Clients only need one entry point: the bootstrap `--sluice.server-url` (any node LB);
     the rest of the membership arrives via the control plane. The data plane LB is the
