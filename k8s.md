@@ -14,7 +14,12 @@ image `ghcr.io/making/sluice/sluice-server:native`.
 
 ## values.yaml
 
+Written against chart `9.3.2` -- the chart's values schema changes between releases
+(Stakater reworks keys without a stable contract), so pin the version and re-verify the
+keys below on any bump.
+
 ```yaml
+# stakater/application 9.3.2
 applicationName: sluice-server
 
 deployment:
@@ -76,6 +81,7 @@ kubectl create namespace sluice
 # only needed when the image is not yet pushed and was built locally:
 kind load docker-image ghcr.io/making/sluice/sluice-server:native --name kind
 
+# --version is load-bearing: the values below match 9.3.2 exactly
 helm upgrade --install sluice-server oci://ghcr.io/stakater/charts/application \
   --version 9.3.2 \
   --namespace sluice \
@@ -132,23 +138,6 @@ bean conditions at build time (Spring AOT), so its static membership provider ne
 sees runtime `sluice.cluster.nodes` and silently stays single-node.
 
 ```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: sluice-headless
-  namespace: sluice
-  labels:
-    app: sluice-server
-spec:
-  clusterIP: None
-  selector:
-    app: sluice-server
-  ports:
-    - name: grpc
-      port: 8001
-      protocol: TCP
-      targetPort: 8001
----
 # per-node control plane: one LB per pod, pinned into the MetalLB pool so the
 # membership env below can reference the addresses
 apiVersion: v1
@@ -287,10 +276,8 @@ Notes:
 - Clients only need one entry point: the bootstrap `--sluice.server-url` (any node LB);
     the rest of the membership arrives via the control plane. The data plane LB is the
     front for ordinary HTTP traffic (`Host` header routing); any node answers.
-- In-cluster-only clients could use the headless pod DNS in `sluice.cluster.nodes`
-  instead of pinned LB IPs.
-- A dynamic membership provider (DNS SRV) is planned; once it lands the env goes away
-  and `kubectl scale` is enough.
+- A dynamic membership provider is planned; once it lands the env goes away and
+  `kubectl scale` is enough.
 
 Verify two tunnels on the client, then request through the data LB:
 
