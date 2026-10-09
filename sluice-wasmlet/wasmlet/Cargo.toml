@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-tonic = "0.14"
+tonic = { version = "0.14", features = ["tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14"
 prost = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs"] }
@@ -24,6 +24,8 @@ http-body-util = "0.1"
 bytes = "1"
 # component fetch from http(s) locators
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+# control-plane TLS (grpcs / --insecure); the ring provider matches tonic's tls-ring
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

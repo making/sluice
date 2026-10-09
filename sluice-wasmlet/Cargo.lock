@@ -1888,6 +1888,7 @@ dependencies = [
  "hyper-util",
  "prost",
  "reqwest",
+ "rustls",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -2178,11 +2179,13 @@ dependencies = [
  "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]

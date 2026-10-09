@@ -33,6 +33,15 @@ target/debug/sluice-wasmlet --server grpc://127.0.0.1:8001 --token SECRET \
     --wasm demo.local=target/wasm32-wasip2/release/hello.wasm
 ```
 
+`--server` also accepts `grpcs://` (TLS). Verification uses `--ca-cert <file>` (PEM, may
+hold a chain), the webPKI roots when omitted, or nothing at all with `--insecure`
+(self-signed setups; the `sluice.insecure` equivalent):
+
+```text
+target/debug/sluice-wasmlet --server grpcs://127.0.0.1:8001 --ca-cert ca.pem ...
+target/debug/sluice-wasmlet --server grpcs://127.0.0.1:8001 --insecure ...
+```
+
 Multiple `--wasm host=<locator>` routes per process. The locator is a bare
 path, `file://<path>`, or `http(s)://<url>` (fetched once at startup); the
 advertised target is `wasm:<locator>` and further schemes slot into the same
@@ -64,7 +73,7 @@ demonstrate guest isolation.
 
 ## Known limitations (PoC scope)
 
-- plaintext `grpc://` only; no reconnect logic, single node
+- no mTLS (client certificates) yet; no reconnect logic, single node
 - buffered responses, one instance per request, no epoch-based CPU/memory
   limits yet
 - guest async tasks live within `wit-bindgen`'s runtime; the `spawn`

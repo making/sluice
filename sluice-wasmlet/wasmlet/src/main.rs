@@ -6,7 +6,8 @@
 //! component (`wasi:http/handler@0.3.0`). One process, N routes.
 //!
 //! Scope (deliberately minimal):
-//! - plaintext `grpc://` control plane only, no TLS / mTLS
+//! - `grpc://` / `grpcs://` control plane (`--ca-cert` pins the CA,
+//!   `--insecure` skips verification); no mTLS yet
 //! - single server node: no ListNodes bootstrap, no membership / drain handling
 //! - response bodies are buffered; one instance per request
 //!
@@ -28,6 +29,7 @@ mod pb {
     include!(concat!(env!("OUT_DIR"), "/sluice.v1.rs"));
 }
 
+mod tls;
 mod wasm_host;
 
 use pb::frame::Body;
@@ -43,6 +45,8 @@ struct Config {
     server: String,
     token: String,
     id: String,
+    insecure: bool,
+    ca_cert: Option<String>,
     routes: Vec<Route>,
 }
 
@@ -75,6 +79,8 @@ fn parse_args() -> Config {
         server: String::new(),
         token: String::new(),
         id: "sluice-wasmlet".into(),
+        insecure: false,
+        ca_cert: None,
         routes: Vec::new(),
     };
     let mut args = std::env::args().skip(1);
@@ -89,6 +95,8 @@ fn parse_args() -> Config {
             "--server" => config.server = value("server"),
             "--token" => config.token = value("token"),
             "--id" => config.id = value("id"),
+            "--insecure" => config.insecure = true,
+            "--ca-cert" => config.ca_cert = Some(value("ca-cert")),
             "--wasm" => {
                 let spec = value("wasm");
                 let (host, target) = spec
@@ -110,18 +118,32 @@ fn parse_args() -> Config {
     config
 }
 
+/// Splits the `--server` value into `(secure, authority)`; a bare host:port
+/// and `grpc://` are plaintext, `grpcs://` is TLS.
+fn resolve_server(server: &str) -> (bool, &str) {
+    match server.strip_prefix("grpcs://") {
+        Some(authority) => (true, authority),
+        None => (false, server.strip_prefix("grpc://").unwrap_or(server)),
+    }
+}
+
 async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let authority = config
-        .server
-        .strip_prefix("grpc://")
-        .unwrap_or(&config.server)
-        .to_owned();
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://{authority}"))?
-        .http2_keep_alive_interval(Duration::from_secs(30))
-        .keep_alive_timeout(Duration::from_secs(10))
-        .keep_alive_while_idle(true)
-        .connect()
-        .await?;
+    let (secure, authority) = resolve_server(&config.server);
+    let mut endpoint = tonic::transport::Endpoint::from_shared(format!(
+        "{}://{authority}",
+        if secure { "https" } else { "http" }
+    ))?
+    .http2_keep_alive_interval(Duration::from_secs(30))
+    .keep_alive_timeout(Duration::from_secs(10))
+    .keep_alive_while_idle(true);
+    if secure {
+        let ca_pem = match &config.ca_cert {
+            Some(path) => Some(std::fs::read(path).map_err(|e| format!("--ca-cert {path}: {e}"))?),
+            None => None,
+        };
+        endpoint = tls::configure(endpoint, config.insecure, ca_pem.as_deref())?;
+    }
+    let channel = endpoint.connect().await?;
 
     // The bidi stream: outbound frames flow through `tx`, inbound via `inbound`.
     let (tx, rx) = mpsc::channel::<Frame>(64);
@@ -228,4 +250,22 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("tunnel stream closed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_server;
+
+    #[test]
+    fn resolves_plain_grpc_https_and_bare_authority() {
+        assert_eq!(
+            resolve_server("grpc://127.0.0.1:8001"),
+            (false, "127.0.0.1:8001")
+        );
+        assert_eq!(
+            resolve_server("grpcs://tunnel.example.com:8443"),
+            (true, "tunnel.example.com:8443")
+        );
+        assert_eq!(resolve_server("127.0.0.1:8001"), (false, "127.0.0.1:8001"));
+    }
 }
