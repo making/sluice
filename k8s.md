@@ -29,7 +29,7 @@ deployment:
     pullPolicy: Always
   resources:
     limits:
-      memory: 1Gi
+      memory: 512Mi
   env:
     SLUICE_TOKEN:
       value: SECRET # tunnel token; clients must pass the same value
@@ -229,7 +229,7 @@ spec:
           imagePullPolicy: Always
           resources:
             limits:
-              memory: 1Gi
+              memory: 512Mi
           env:
             - name: sluice.token
               value: SECRET
