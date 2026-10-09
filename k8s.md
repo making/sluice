@@ -84,7 +84,14 @@ service:
 kubectl create namespace sluice
 
 # tunnel token; clients must pass the same value
-kubectl -n sluice create secret generic sluice-token --from-literal=token=SECRET
+kubectl apply -n sluice -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sluice-token
+stringData:
+  token: SECRET
+EOF
 
 # only needed when the image is not yet pushed and was built locally:
 kind load docker-image ghcr.io/making/sluice/sluice-server:native --name kind
@@ -142,6 +149,15 @@ static, so `spec.replicas` and the `sluice.cluster.nodes` env below must be kept
 sync; scaling means editing both and re-applying.
 
 ```yaml
+# tunnel token; clients must pass the same value
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sluice-token
+  namespace: sluice
+stringData:
+  token: SECRET
+---
 # per-node control plane: one LB per pod, pinned into the MetalLB pool so the
 # membership env below can reference the addresses
 apiVersion: v1
@@ -240,7 +256,7 @@ spec:
               memory: 512Mi
           env:
             - name: sluice.token-file
-              value: /mnt/secrets/token # the sluice-token secret from the single-node section
+              value: /mnt/secrets/token # the sluice-token secret above
             - name: sluice.node.id
               valueFrom:
                 fieldRef:
