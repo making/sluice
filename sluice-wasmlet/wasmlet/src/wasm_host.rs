@@ -17,9 +17,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_util::sync::PollSender;
 
+use crate::Ctrl;
 use crate::pb::frame::Body;
 use crate::pb::{Close, Data, Frame};
-use crate::Ctrl;
 
 /// Upper bound for a single DATA frame emitted by the hyper write path.
 const CHUNK: usize = 16 * 1024;
@@ -47,9 +47,9 @@ impl Locator {
         };
         match scheme {
             "file" => Ok(Locator::File(file_url_path(rest))),
-            "http" | "https" => {
-                http::Uri::from_str(spec).map(Locator::Http).map_err(|e| format!("bad url '{spec}': {e}"))
-            }
+            "http" | "https" => http::Uri::from_str(spec)
+                .map(Locator::Http)
+                .map_err(|e| format!("bad url '{spec}': {e}")),
             other => Err(format!("unsupported wasm locator scheme '{other}://'")),
         }
     }
@@ -69,16 +69,19 @@ impl Locator {
 
     async fn fetch(&self) -> Result<Vec<u8>, String> {
         match self {
-            Locator::File(path) => {
-                tokio::fs::read(path).await.map_err(|e| format!("read {}: {e}", path.display()))
-            }
+            Locator::File(path) => tokio::fs::read(path)
+                .await
+                .map_err(|e| format!("read {}: {e}", path.display())),
             Locator::Http(uri) => {
                 let response = reqwest::get(uri.to_string())
                     .await
                     .map_err(|e| format!("GET {uri}: {e}"))?
                     .error_for_status()
                     .map_err(|e| format!("GET {uri}: {e}"))?;
-                let bytes = response.bytes().await.map_err(|e| format!("GET {uri}: {e}"))?;
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("GET {uri}: {e}"))?;
                 Ok(bytes.to_vec())
             }
         }
@@ -119,8 +122,12 @@ pub async fn load(locator: &Locator) -> Result<Arc<Loaded>, String> {
     let mut config = wasmtime::Config::new();
     config.wasm_component_model_async(true);
     let engine = wasmtime::Engine::new(&config).map_err(|e| format!("engine: {e}"))?;
-    let component = wasmtime::component::Component::new(&engine, &bytes)
-        .map_err(|e| format!("component {}: {e}", key.strip_prefix("wasm:").unwrap_or(&key)))?;
+    let component = wasmtime::component::Component::new(&engine, &bytes).map_err(|e| {
+        format!(
+            "component {}: {e}",
+            key.strip_prefix("wasm:").unwrap_or(&key)
+        )
+    })?;
     let mut linker = wasmtime::component::Linker::<Ctx>::new(&engine);
     // p2 hosts the rust std imports of wasm32-wasip2 components; p3 hosts the
     // wasi 0.3 world the guest is written against.
@@ -183,14 +190,20 @@ impl wasmtime_wasi_http::WasiHttpView for Ctx {
 // ---------------------------------------------------------------------------
 // Request handling
 
-fn plain_response(status: u16, body: String) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+fn plain_response(
+    status: u16,
+    body: String,
+) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
     hyper::Response::builder()
         .status(status)
         .body(http_body_util::Full::new(bytes::Bytes::from(body)))
         .expect("static response")
 }
 
-async fn respond(loaded: &Loaded, req: hyper::Request<hyper::body::Incoming>) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+async fn respond(
+    loaded: &Loaded,
+    req: hyper::Request<hyper::body::Incoming>,
+) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
     let mut store = wasmtime::Store::new(&loaded.engine, Ctx::new());
     let service = match wasmtime_wasi_http::p3::bindings::Service::instantiate_async(
         &mut store,
@@ -275,9 +288,7 @@ pub async fn serve(
 
     let service = hyper::service::service_fn(move |req| {
         let component = component.clone();
-        async move {
-            Ok::<_, std::convert::Infallible>(respond(&component, req).await)
-        }
+        async move { Ok::<_, std::convert::Infallible>(respond(&component, req).await) }
     });
     let served = if h2 {
         hyper::server::conn::http2::Builder::new(TokioExecutor)
@@ -435,10 +446,7 @@ impl AsyncWrite for TunnelIo {
         }
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
@@ -450,4 +458,3 @@ impl AsyncWrite for TunnelIo {
         self.send_close(cx)
     }
 }
-

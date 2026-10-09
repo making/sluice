@@ -71,9 +71,18 @@ demonstrate guest isolation.
   server passes `wasm:` targets through verbatim as the dial address — oci /
   s3 resolvers slot into the same form)
 
+## Cluster / reconnect
+
+Same semantics as the Java client (see "Cluster (scale-out)" in the root
+README): `--server` is only the bootstrap -- the node list is learned via
+`ListNodes` / `MembershipUpdate` and one tunnel stream is kept per node
+(`grpc://` / `grpcs://` addresses). A dropped stream reconnects with
+exponential backoff (1s..30s); exactly one stream per node is kept, so a
+duplicate is closed on the client side before the server drops it.
+
 ## Known limitations (PoC scope)
 
-- no mTLS (client certificates) yet; no reconnect logic, single node
+- no mTLS (client certificates) yet
 - buffered responses, one instance per request, no epoch-based CPU/memory
   limits yet
 - guest async tasks live within `wit-bindgen`'s runtime; the `spawn`
