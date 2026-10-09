@@ -563,10 +563,15 @@ public class Router {
 
 	/**
 	 * Extracts {@code host[:port]} from an upstream URL; {@code null} when unparseable.
+	 * {@code wasm:} targets are component locators resolved by the client (file / oci /
+	 * s3 / ...): they pass through verbatim as the dial address.
 	 */
 	static Optional<String> addressOf(String targetUrl) {
 		if (targetUrl == null || targetUrl.isBlank()) {
 			return Optional.empty();
+		}
+		if (targetUrl.startsWith("wasm:")) {
+			return Optional.of(targetUrl.trim());
 		}
 		try {
 			URI uri = new URI(targetUrl.trim());

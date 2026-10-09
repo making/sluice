@@ -115,6 +115,14 @@ class RouterTest {
 		assertThat(router.register("c1", List.of(upstream("a", "::::")))).isZero();
 	}
 
+	@Test
+	void wasmLocatorTargetIsPassedThroughVerbatim() {
+		Router router = new Router();
+		String locator = "wasm:file:///opt/hello.wasm";
+		assertThat(router.register("c1", List.of(upstream("demo.local", locator)))).isOne();
+		assertThat(router.lookup("demo.local").orElseThrow().address()).isEqualTo(locator);
+	}
+
 	private static Upstream portUpstream(int listenPort, String targetUrl) {
 		return Upstream.newBuilder()
 			.setHost("ignored.local")

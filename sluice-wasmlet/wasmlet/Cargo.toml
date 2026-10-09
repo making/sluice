@@ -1,0 +1,29 @@
+[package]
+name = "sluice-wasmlet"
+version = "0.0.1-SNAPSHOT"
+edition = "2024"
+publish = false
+
+[dependencies]
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs"] }
+http = "1"
+tokio-stream = "0.1"
+tokio-util = "0.7"
+futures-util = "0.3"
+# wasi 0.2 (p2) + 0.3 (p3) host support; the guest uses p3, the p2 linker is
+# still required for the rust std imports of wasm32-wasip2 components
+wasmtime = "49"
+wasmtime-wasi = "49"
+wasmtime-wasi-http = "49"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+# component fetch from http(s) locators
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"

@@ -1,0 +1,9 @@
+// Guest world: only what the handler needs, so generated bindings stay
+// minimal (the stock `wasi:http/service` world drags in cli/random/sockets
+// and conflicts with the http error type in the async runtime impls).
+package sluice:guest;
+
+world handler {
+    import wasi:http/types@0.3.0;
+    export wasi:http/handler@0.3.0;
+}

@@ -1,0 +1,6 @@
+[workspace]
+resolver = "3"
+members = ["wasmlet", "examples/*"]
+
+[profile.release]
+strip = true
