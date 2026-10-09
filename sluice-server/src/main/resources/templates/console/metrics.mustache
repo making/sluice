@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Metrics | Sluice console</title>
+  <link rel="icon" type="image/svg+xml" href="{{#src}}/console/img/logo.svg{{/src}}">
+  <link rel="stylesheet" href="{{#src}}/console/css/console.css{{/src}}">
+  <!-- source: https://unpkg.com/htmx.org@4.0.0/dist/htmx.min.js -->
+  <script src="{{#src}}/console/js/vendor/htmx.min.js{{/src}}" defer></script>
+</head>
+<body>
+
+{{>console/masthead}}
+
+<div class="layout layout--metrics">
+  <section class="panel" aria-labelledby="metrics-heading">
+    <h1 id="metrics-heading" class="rule-heading">Metrics</h1>
+    <p class="hint">The meters of this node, as scraped by Prometheus -- <span class="num">{{total}}</span> registered. Filter by substring; pick one for its series.</p>
+    <search class="lookup">
+      <label for="metric-filter">Filter</label>
+      <input type="hidden" id="metric-name" name="name" value="{{selectedName}}">
+      <input id="metric-filter" name="q" type="search" autocomplete="off" spellcheck="false"
+             placeholder="jvm.memory" value="{{q}}"
+             hx-get="/console/metrics/list"
+             hx-include="#metric-name"
+             hx-target="#metric-list"
+             hx-trigger="input changed delay:250ms, search">
+    </search>
+    <div id="metric-list" class="metrics__list" data-testid="metric-list">{{>console/metric-list}}</div>
+  </section>
+
+  <section class="panel" aria-labelledby="metric-heading" data-testid="metric-detail">
+    {{#hasSelection}}
+    <h2 id="metric-heading" class="rule-heading"><span class="mono">{{selectedName}}</span></h2>
+    {{#detail}}
+    <p class="hint">
+      {{#description}}{{description}}. {{/description}}
+      {{#baseUnit}}Unit <span class="mono">{{baseUnit}}</span>. {{/baseUnit}}
+    </p>
+    <table class="grid metric-series">
+      <thead>
+        <tr><th>Tags</th><th>Measurements</th></tr>
+      </thead>
+      <tbody>
+        {{#series}}
+        <tr>
+          <td class="metric-tags">{{#tags}}<span class="tag mono">{{key}}={{value}}</span> {{/tags}}</td>
+          <td class="metric-measures">
+            {{#measures}}
+            <div class="measure"><span class="measure__stat">{{statistic}}</span><span class="measure__value mono num">{{value}}</span></div>
+            {{/measures}}
+          </td>
+        </tr>
+        {{/series}}
+      </tbody>
+    </table>
+    {{/detail}}
+    {{^detail}}
+    <p class="empty">No metric named <span class="mono">{{selectedName}}</span> is registered.</p>
+    {{/detail}}
+    {{/hasSelection}}
+    {{^hasSelection}}
+    <h2 id="metric-heading" class="rule-heading">&nbsp;</h2>
+    <p class="empty">Pick a metric to see its tag combinations and values.</p>
+    {{/hasSelection}}
+    <p class="hint source-note">The same meters, scraped in Prometheus format: <a href="/actuator/prometheus">/actuator/prometheus</a>.</p>
+  </section>
+</div>
+</body>
+</html>

@@ -326,6 +326,52 @@ class ConsoleE2ETest {
 	}
 
 	@Test
+	void healthPageReportsTheOverallStatusAndEveryIndicator() {
+		Page page = page();
+		page.navigate("http://127.0.0.1:" + this.port + "/console/health");
+		assertThat(page.title()).isEqualTo("Health | Sluice console");
+		assertThat(page.getByTestId("health-overall").innerText()).isEqualTo("UP");
+		Locator tunnelRow = page.getByTestId("health-table")
+			.locator("tbody tr")
+			.filter(new Locator.FilterOptions().setHasText("tunnel"));
+		assertThat(tunnelRow.innerText()).contains("UP")
+			.contains("clients=" + this.sessions.count())
+			.contains("draining=false");
+	}
+
+	@Test
+	void infoPageListsOneSectionPerInfoEntry() {
+		Page page = page();
+		page.navigate("http://127.0.0.1:" + this.port + "/console/info");
+		assertThat(page.title()).isEqualTo("Info | Sluice console");
+		assertThat(page.locator(".report").innerText()).contains("java").contains("os");
+	}
+
+	@Test
+	void metricSearchNarrowsTheListAndSelectionShowsTheSeries() {
+		Page page = page();
+		page.navigate("http://127.0.0.1:" + this.port + "/console/metrics");
+		Locator list = page.getByTestId("metric-list");
+		// the groups start collapsed; the names are in the dom regardless
+		assertThat(list.textContent()).contains("jvm.memory.used").contains("jvm");
+
+		page.locator("#metric-filter").fill("memory");
+		Locator diskRow = page.locator("#metric-list a").filter(new Locator.FilterOptions().setHasText("disk"));
+		PlaywrightAssertions.assertThat(diskRow)
+			.hasCount(0, new LocatorAssertions.HasCountOptions().setTimeout(10_000));
+		assertThat(list.textContent()).contains("jvm.memory.used");
+
+		page.locator("#metric-list a")
+			.filter(new Locator.FilterOptions().setHasText("jvm.memory.used"))
+			.first()
+			.click();
+		page.waitForURL(Pattern.compile("name=jvm\\.memory\\.used"));
+		Locator detail = page.getByTestId("metric-detail");
+		PlaywrightAssertions.assertThat(detail)
+			.containsText("area=heap", new LocatorAssertions.ContainsTextOptions().setTimeout(10_000));
+	}
+
+	@Test
 	void liveRegionsFollowOpenConnections() throws Exception {
 		Page page = page();
 		page.navigate("http://127.0.0.1:" + this.port + "/console");

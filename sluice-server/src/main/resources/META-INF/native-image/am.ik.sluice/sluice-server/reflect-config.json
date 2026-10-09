@@ -1,5 +1,47 @@
 [
 	{
+		"name": "am.ik.sluice.server.console.web.ActuatorView$HealthReport",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ActuatorView$HealthRow",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ActuatorView$InfoEntry",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ActuatorView$InfoSection",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ActuatorView$MetricLink",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ActuatorView$MetricSeries",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ActuatorView$MetricDetail",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
 		"name": "am.ik.sluice.server.console.web.ConsoleController$ClientCertificate",
 		"allDeclaredConstructors": true,
 		"allDeclaredMethods": true,

@@ -1,0 +1,14 @@
+<p class="metrics__count"><span class="num">{{matched}}</span> of <span class="num">{{total}}</span> metrics</p>
+{{#groups}}
+<details class="metric-group"{{#open}} open{{/open}}>
+  <summary>{{name}} <span class="metric-group__count num">{{count}}</span></summary>
+  <ul class="metric-list">
+    {{#entries}}
+    <li><a class="mono" href="/console/metrics?name={{name}}&amp;q={{q}}"{{#selected}} aria-current="true"{{/selected}}>{{name}}</a></li>
+    {{/entries}}
+  </ul>
+</details>
+{{/groups}}
+{{^groups}}
+<p class="empty">No metric matches{{#q}} <span class="mono">{{q}}</span>{{/q}}.</p>
+{{/groups}}

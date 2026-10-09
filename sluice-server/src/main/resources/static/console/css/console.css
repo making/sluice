@@ -1121,6 +1121,179 @@ code {
 	text-align: center;
 }
 
+/* -------------------------------------------- health / info / metrics pages */
+
+/* the diagnostic pages: a single reading column (metrics adds a second) */
+.report {
+	width: min(100%, 72rem);
+	margin: 0 auto;
+	padding: 1rem var(--gutter) 5rem;
+}
+
+.health__overall {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 0.5rem 1.5rem;
+	margin: 0 0 1.25rem;
+}
+
+.health__overall .state {
+	font-size: var(--step-3);
+	font-weight: 200;
+	letter-spacing: -0.02em;
+}
+
+/* statuses beyond up: down faults, the rest hold in amber */
+.state--down {
+	color: var(--fault);
+}
+
+.state--down::before {
+	background: var(--fault);
+}
+
+.state--unknown,
+.state--out_of_service {
+	color: var(--amber);
+}
+
+.state--unknown::before,
+.state--out_of_service::before {
+	background: var(--amber);
+}
+
+.is-degraded td {
+	color: var(--amber);
+}
+
+/* the link to the raw endpoint each page renders */
+.source-note {
+	margin: 1.25rem 0 0;
+}
+
+/* the metric chooser: groups by subsystem, collapsed until needed */
+.layout--metrics {
+	grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr);
+}
+
+.metrics__list {
+	margin-top: 1rem;
+	max-height: 34rem;
+	overflow-y: auto;
+}
+
+.metrics__count {
+	margin: 0 0 0.4rem;
+	color: var(--ink-soft);
+	font-size: var(--step--1);
+}
+
+.metric-group summary {
+	display: flex;
+	align-items: baseline;
+	gap: 0.5rem;
+	padding: 0.3rem 0;
+	list-style: none;
+	font-weight: 600;
+	cursor: pointer;
+}
+
+.metric-group summary::-webkit-details-marker {
+	display: none;
+}
+
+/* the disclosure drawn as a plus that closes to a minus, like a drawing revision mark */
+.metric-group summary::before {
+	width: 0.8rem;
+	color: var(--ink-soft);
+	font-weight: 400;
+	text-align: center;
+	content: "+";
+}
+
+.metric-group[open] summary::before {
+	content: "−";
+}
+
+.metric-group summary:hover {
+	color: var(--water);
+}
+
+.metric-group__count {
+	color: var(--ink-soft);
+	font-size: 0.75rem;
+	font-weight: 400;
+}
+
+.metric-list {
+	list-style: none;
+	margin: 0 0 0.4rem 0.4rem;
+	padding: 0 0 0 0.75rem;
+	border-left: 1px solid var(--hair-faint);
+}
+
+.metric-list li {
+	border-bottom: 1px solid var(--hair-faint);
+}
+
+.metric-list a {
+	display: block;
+	padding: 0.3rem 0.6rem;
+	text-decoration: none;
+}
+
+.metric-list a:hover {
+	color: var(--water);
+}
+
+.metric-list a[aria-current] {
+	color: var(--water);
+	font-weight: 700;
+	box-shadow: inset 2px 0 0 var(--water);
+}
+
+/* tag chips keep the table cell: inline, wrapping between chips, never inside one */
+.metric-tags .tag {
+	margin: 0.1rem 0.25rem 0.1rem 0;
+	white-space: nowrap;
+}
+
+/* auto layout: long tag chips claim the width they need instead of spilling
+   into the measurements column as they would under the fixed .grid layout */
+.metric-series {
+	table-layout: auto;
+}
+
+/* record boundaries: a firmer rule and more air than the default grid rows */
+.metric-series tbody td {
+	padding-top: 0.6rem;
+	padding-bottom: 0.55rem;
+	border-bottom: 1px solid var(--hair);
+}
+
+/* the measurements of one record set like a table column: statistic left, value right */
+.measure {
+	display: flex;
+	justify-content: space-between;
+	gap: 1.5rem;
+	min-width: 8rem;
+	white-space: nowrap;
+}
+
+.measure + .measure {
+	padding-top: 0.2rem;
+	border-top: 1px solid var(--hair-faint);
+}
+
+.measure__stat {
+	color: var(--ink-soft);
+}
+
+.metric-tags {
+	padding-right: 1.5rem;
+}
+
 /* -------------------------------------------------------------- responsive */
 
 @media (max-width: 960px) {

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Info | Sluice console</title>
+  <link rel="icon" type="image/svg+xml" href="{{#src}}/console/img/logo.svg{{/src}}">
+  <link rel="stylesheet" href="{{#src}}/console/css/console.css{{/src}}">
+</head>
+<body>
+
+{{>console/masthead}}
+
+<main class="report">
+  <section class="panel" aria-labelledby="info-heading">
+    <h1 id="info-heading" class="rule-heading">Info</h1>
+    {{#sections}}
+    <h2 class="subhead mono">{{name}}</h2>
+    <dl class="settings">
+      {{#entries}}
+      <div><dt class="mono">{{key}}</dt><dd>{{value}}</dd></div>
+      {{/entries}}
+    </dl>
+    {{/sections}}
+    {{^sections}}
+    <p class="empty">No info contributors are enabled.</p>
+    {{/sections}}
+    <p class="hint source-note">Same document as <a href="/actuator/info">/actuator/info</a>.</p>
+  </section>
+</main>
+</body>
+</html>

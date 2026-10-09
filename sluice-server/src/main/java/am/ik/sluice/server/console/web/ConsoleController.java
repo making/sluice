@@ -1,6 +1,9 @@
 package am.ik.sluice.server.console.web;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+
+import org.jspecify.annotations.Nullable;
 
 import am.ik.sluice.server.cert.ClientCertificateIssuer;
 import am.ik.sluice.server.cert.ClientCertificateIssuers;
@@ -26,10 +29,13 @@ class ConsoleController {
 
 	private final ConsoleView view;
 
+	private final ActuatorView actuatorView;
+
 	private final ClientCertificateIssuers clientCertificateIssuers;
 
-	ConsoleController(ConsoleView view, ClientCertificateIssuers clientCertificateIssuers) {
+	ConsoleController(ConsoleView view, ActuatorView actuatorView, ClientCertificateIssuers clientCertificateIssuers) {
 		this.view = view;
+		this.actuatorView = actuatorView;
 		this.clientCertificateIssuers = clientCertificateIssuers;
 	}
 
@@ -86,6 +92,64 @@ class ConsoleController {
 	String live(Model model) {
 		this.addLive(model);
 		return "console/live";
+	}
+
+	/** The health of this node as reported by the actuator, indicator by indicator. */
+	@GetMapping("/console/health")
+	String health(Authentication authentication, Model model) {
+		model.addAttribute("user", displayName(authentication));
+		model.addAttribute("health", this.actuatorView.health());
+		return "console/health";
+	}
+
+	/** The polled health region as an {@code <hx-partial>} element. */
+	@GetMapping("/console/health/live")
+	String healthLive(Model model) {
+		model.addAttribute("health", this.actuatorView.health());
+		return "console/health-live";
+	}
+
+	/** The info document, its top level entries one section each. */
+	@GetMapping("/console/info")
+	String info(Authentication authentication, Model model) {
+		model.addAttribute("user", displayName(authentication));
+		model.addAttribute("sections", this.actuatorView.info());
+		return "console/info";
+	}
+
+	/**
+	 * The metrics of this node: the filtered names, plus the tag combinations of the
+	 * selected one.
+	 */
+	@GetMapping("/console/metrics")
+	String metrics(@RequestParam(defaultValue = "") String q, @RequestParam(required = false) String name,
+			Authentication authentication, Model model) {
+		model.addAttribute("user", displayName(authentication));
+		this.addMetrics(q, name, model);
+		return "console/metrics";
+	}
+
+	/** The filtered metric list, swapped in under the filter box. */
+	@GetMapping("/console/metrics/list")
+	String metricList(@RequestParam(defaultValue = "") String q, @RequestParam(required = false) String name,
+			Model model) {
+		this.addMetrics(q, name, model);
+		return "console/metric-list";
+	}
+
+	private void addMetrics(String q, @Nullable String name, Model model) {
+		String filter = q == null ? "" : q;
+		String selected = name == null ? "" : name.strip();
+		List<ActuatorView.MetricGroup> groups = this.actuatorView.metricGroups(filter, selected);
+		model.addAttribute("q", filter);
+		model.addAttribute("selectedName", selected);
+		model.addAttribute("hasSelection", !selected.isEmpty());
+		if (!selected.isEmpty()) {
+			model.addAttribute("detail", this.actuatorView.metric(selected));
+		}
+		model.addAttribute("groups", groups);
+		model.addAttribute("matched", groups.stream().mapToInt(ActuatorView.MetricGroup::count).sum());
+		model.addAttribute("total", this.actuatorView.metricCount());
 	}
 
 	@GetMapping("/console/lookup")

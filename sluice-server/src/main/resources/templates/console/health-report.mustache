@@ -1,0 +1,23 @@
+{{#health}}
+<div class="health" data-testid="health-report">
+  <p class="health__overall">
+    <span class="state state--{{state}}" data-testid="health-overall">{{status}}</span>
+    <span class="hint">Checked <span class="num"><span class="link__live">{{checkedAt}}</span><span class="link__lost">Connection lost</span></span></span>
+  </p>
+  <table class="grid health-table" data-testid="health-table">
+    <thead>
+      <tr><th>Indicator</th><th>Status</th><th>Details</th></tr>
+    </thead>
+    <tbody>
+      {{#rows}}
+      <tr{{#fault}} class="is-fault"{{/fault}}{{#degraded}} class="is-degraded"{{/degraded}}>
+        <td class="mono">{{name}}</td>
+        <td><span class="state state--{{state}}">{{status}}</span></td>
+        <td class="note">{{#details}}{{details}}{{/details}}</td>
+      </tr>
+      {{/rows}}
+    </tbody>
+  </table>
+  <p class="hint source-note">Same document as <a href="/actuator/health">/actuator/health</a>.</p>
+</div>
+{{/health}}
