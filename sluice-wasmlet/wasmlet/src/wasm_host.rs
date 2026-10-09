@@ -3,9 +3,10 @@
 //! The tunnel connection's byte stream is served by hyper (http/1.1 vs h2c
 //! sniffed from the first bytes); every request is handled by a fresh
 //! instance of the guest component through `wasmtime-wasi-http`'s p3
-//! `Service.handle`. Response bodies stream: the store task relays frames to
-//! hyper through a bounded channel, so a slow client backpressures the guest
-//! instead of buffering the response.
+//! `Service.handle`. Instantiation is pre-linked (`InstancePre`) and bounded
+//! by per-route epoch budgets and memory caps. Response bodies stream: the
+//! store task relays frames to hyper through a bounded channel, so a slow
+//! client backpressures the guest instead of buffering the response.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -33,6 +34,46 @@ const RELAY_BUFFER: usize = 2;
 
 /// Sniff timeout for the first bytes of a connection (h2 preface check).
 const SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Granularity of every request budget: the shared engine's epoch is
+/// incremented at this interval, and budgets are denominated in ticks.
+const EPOCH_TICK_MS: u64 = 10;
+
+const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(EPOCH_TICK_MS);
+
+/// Request budget when the route does not name one. Must cover the slowest
+/// legitimate handler, including time it spends suspended (the epoch deadline
+/// is absolute, checked at the guest's next yield point).
+const DEFAULT_BUDGET_MS: u64 = 10_000;
+
+/// Linear-memory cap per instance when the route does not name one; a guest
+/// growing beyond it traps instead of OOM-ing the process.
+const DEFAULT_MEMORY_MIB: usize = 256;
+
+// ---------------------------------------------------------------------------
+// Engine
+
+/// The engine shared by every component: one epoch ticker drives the
+/// per-request deadlines of all stores.
+fn engine() -> &'static wasmtime::Engine {
+    static ENGINE: OnceLock<wasmtime::Engine> = OnceLock::new();
+    ENGINE.get_or_init(|| {
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model_async(true);
+        // Epoch deadlines raise `Trap::Interrupt` in guest code; without this
+        // a budget could not interrupt a guest between yield points.
+        config.epoch_interruption(true);
+        let engine = wasmtime::Engine::new(&config).expect("valid engine config");
+        // A dedicated thread: guests run on tokio workers and can starve the
+        // timer wheel with a busy loop, which would stall their own budget.
+        let ticker = engine.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(EPOCH_TICK);
+            ticker.increment_epoch();
+        });
+        engine
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Component locators
@@ -112,9 +153,37 @@ fn file_url_path(rest: &str) -> PathBuf {
 // Loaded components
 
 pub struct Loaded {
-    engine: wasmtime::Engine,
-    component: wasmtime::component::Component,
-    linker: wasmtime::component::Linker<Ctx>,
+    /// The pre-linked instantiation plan: import resolution and interface
+    /// typechecking happen once here, so the per-request `instantiate_async`
+    /// skips them. Measured on the hello guest (see the ignored
+    /// `instantiation_latency_reference`): ~265us full vs ~171us pre-linked
+    /// (dev profile) per instantiation, i.e. the warm path stays far below a
+    /// millisecond -- so instances are NOT pooled: `Store::run_concurrent`
+    /// consumes the store, and guests legitimately keep module state across
+    /// requests, so reuse would need per-guest reentrancy knowledge.
+    service_pre: wasmtime_wasi_http::p3::bindings::ServicePre<Ctx>,
+}
+
+/// Per-route resource limits, applied to every request's instance.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Limits {
+    /// Request budget, enforced with a wasmtime epoch deadline: past it the
+    /// guest is interrupted at its next yield point (`Trap::Interrupt` ->
+    /// HTTP 504). The deadline is absolute, so suspended time counts too --
+    /// this bounds runaway CPU and hung handlers alike.
+    pub budget: std::time::Duration,
+    /// Linear-memory cap per instance in bytes; growth beyond it fails and
+    /// surfaces as a guest trap (HTTP 500) instead of OOM-ing the process.
+    pub memory: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            budget: std::time::Duration::from_millis(DEFAULT_BUDGET_MS),
+            memory: DEFAULT_MEMORY_MIB << 20,
+        }
+    }
 }
 
 /// Loads (or fetches from cache) the component behind `locator`.
@@ -126,9 +195,7 @@ pub async fn load(locator: &Locator) -> Result<Arc<Loaded>, String> {
         return Ok(loaded.clone());
     }
     let bytes = locator.fetch().await?;
-    let mut config = wasmtime::Config::new();
-    config.wasm_component_model_async(true);
-    let engine = wasmtime::Engine::new(&config).map_err(|e| format!("engine: {e}"))?;
+    let engine = engine().clone();
     let component = wasmtime::component::Component::new(&engine, &bytes).map_err(|e| {
         format!(
             "component {}: {e}",
@@ -141,11 +208,12 @@ pub async fn load(locator: &Locator) -> Result<Arc<Loaded>, String> {
     wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| format!("linker: {e}"))?;
     wasmtime_wasi::p3::add_to_linker(&mut linker).map_err(|e| format!("linker: {e}"))?;
     wasmtime_wasi_http::p3::add_to_linker(&mut linker).map_err(|e| format!("linker: {e}"))?;
-    let loaded = Arc::new(Loaded {
-        engine,
-        component,
-        linker,
-    });
+    let pre = linker
+        .instantiate_pre(&component)
+        .map_err(|e| format!("pre-instantiate {}: {e}", key.strip_prefix("wasm:").unwrap_or(&key)))?;
+    let service_pre =
+        wasmtime_wasi_http::p3::bindings::ServicePre::new(pre).map_err(|e| format!("bind: {e}"))?;
+    let loaded = Arc::new(Loaded { service_pre });
     cache.lock().unwrap().insert(key, loaded.clone());
     Ok(loaded)
 }
@@ -162,16 +230,48 @@ struct Ctx {
     wasi: wasmtime_wasi::WasiCtx,
     http: wasmtime_wasi_http::WasiHttpCtx,
     hooks: NoHooks,
+    limiter: MemoryCap,
 }
 
 impl Ctx {
-    fn new() -> Self {
+    fn new(limits: Limits) -> Self {
         Self {
             table: wasmtime::component::ResourceTable::default(),
             wasi: wasmtime_wasi::WasiCtxBuilder::new().build(),
             http: wasmtime_wasi_http::WasiHttpCtx::new(),
             hooks: NoHooks,
+            limiter: MemoryCap {
+                max: limits.memory,
+            },
         }
+    }
+}
+
+/// The per-store linear-memory cap backing `Limits::memory`: growth past the
+/// cap is denied, which the guest sees as a failed allocation / `memory.grow`.
+struct MemoryCap {
+    max: usize,
+}
+
+// the trait itself is `#[async_trait]`, so the impl must match its boxed form
+#[async_trait::async_trait]
+impl wasmtime::ResourceLimiterAsync for MemoryCap {
+    async fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(desired <= self.max)
+    }
+
+    async fn table_growing(
+        &mut self,
+        _current: usize,
+        _desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(true)
     }
 }
 
@@ -248,18 +348,28 @@ async fn relay(
     }
 }
 
+/// Maps a handler failure to its response: 504 when the epoch budget
+/// interrupted the guest, 500 for any other trap or error.
+fn failure(e: &wasmtime::Error) -> (u16, String) {
+    if e.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::Interrupt) {
+        (504, "wasm budget exhausted".into())
+    } else {
+        (500, format!("wasm trap: {e}"))
+    }
+}
+
 async fn respond(
     loaded: &Loaded,
+    limits: Limits,
     req: hyper::Request<hyper::body::Incoming>,
 ) -> hyper::Response<RelayBody> {
-    let mut store = wasmtime::Store::new(&loaded.engine, Ctx::new());
-    let service = match wasmtime_wasi_http::p3::bindings::Service::instantiate_async(
-        &mut store,
-        &loaded.component,
-        &loaded.linker,
-    )
-    .await
-    {
+    let mut store = wasmtime::Store::new(engine(), Ctx::new(limits));
+    store.limiter_async(|ctx| &mut ctx.limiter);
+    // The deadline must exist before any wasm runs: with epoch interruption
+    // enabled, a store without one traps on the first observed tick. The
+    // budget thus covers instantiation and the handler alike.
+    store.set_epoch_deadline((limits.budget.as_millis() as u64 / EPOCH_TICK_MS).max(1));
+    let service = match loaded.service_pre.instantiate_async(&mut store).await {
         Ok(service) => service,
         Err(e) => return plain_response(500, format!("wasm instantiate failed: {e}")),
     };
@@ -300,7 +410,10 @@ async fn respond(
                             }
                         }
                         Ok(Err(code)) => failed(head, 502, format!("wasi error: {code:?}")).await,
-                        Err(e) => failed(head, 500, format!("wasm trap: {e}")).await,
+                        Err(e) => {
+                            let (status, message) = failure(&e);
+                            failed(head, status, message).await
+                        }
                     }
                 };
                 let ((), ()) = tokio::join!(response, async {
@@ -311,7 +424,8 @@ async fn respond(
         });
         if let Err(e) = driven.await {
             eprintln!("[wasm] store ended with error: {e}");
-            let _ = head_tx.try_send(Head::Failure(500, format!("wasm handler failed: {e}")));
+            let (status, message) = failure(&e);
+            let _ = head_tx.try_send(Head::Failure(status, format!("wasm handler failed: {message}")));
             let _ = frame_tx.try_send(Err(e.into()));
         }
     });
@@ -338,6 +452,7 @@ pub async fn serve(
     registry: crate::Registry,
     conn_id: i64,
     component: Arc<Loaded>,
+    limits: Limits,
     ctrl: mpsc::Receiver<Ctrl>,
 ) {
     let mut io = TunnelIo::new(tx, conn_id, ctrl);
@@ -357,7 +472,7 @@ pub async fn serve(
 
     let service = hyper::service::service_fn(move |req| {
         let component = component.clone();
-        async move { Ok::<_, std::convert::Infallible>(respond(&component, req).await) }
+        async move { Ok::<_, std::convert::Infallible>(respond(&component, limits, req).await) }
     });
     let served = if h2 {
         hyper::server::conn::http2::Builder::new(TokioExecutor)
@@ -567,6 +682,142 @@ mod tests {
         std::path::Path::new(&target).join("wasm32-wasip2/release/hello.wasm")
     }
 
+    /// Reference latencies for the instantiation paths, backing the decision
+    /// recorded on `Loaded`. Run with:
+    /// `cargo test -p sluice-wasmlet --bin sluice-wasmlet instantiation_latency -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "reference numbers; run manually with --nocapture"]
+    async fn instantiation_latency_reference() {
+        let bytes = std::fs::read(hello_wasm()).unwrap();
+        let engine = engine().clone();
+        let component = wasmtime::component::Component::new(&engine, &bytes).unwrap();
+        let mut linker = wasmtime::component::Linker::<Ctx>::new(&engine);
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker).unwrap();
+        wasmtime_wasi::p3::add_to_linker(&mut linker).unwrap();
+        wasmtime_wasi_http::p3::add_to_linker(&mut linker).unwrap();
+
+        // full path: import resolution + instantiation, once per request
+        async fn full<'a>(
+            linker: &'a wasmtime::component::Linker<Ctx>,
+            component: &'a wasmtime::component::Component,
+        ) -> wasmtime::Result<()> {
+            let mut store = wasmtime::Store::new(linker.engine(), Ctx::new(Limits::default()));
+            store.set_epoch_deadline(u64::MAX / 2);
+            let _ = wasmtime_wasi_http::p3::bindings::Service::instantiate_async(
+                &mut store,
+                component,
+                linker,
+            )
+            .await?;
+            Ok(())
+        }
+        // pre-linked path: instantiation only, what `respond` pays
+        let pre = linker.instantiate_pre(&component).unwrap();
+        async fn pre_linked(pre: &wasmtime::component::InstancePre<Ctx>) -> wasmtime::Result<()> {
+            let mut store = wasmtime::Store::new(pre.engine(), Ctx::new(Limits::default()));
+            store.set_epoch_deadline(u64::MAX / 2);
+            let _ = pre.instantiate_async(&mut store).await?;
+            Ok(())
+        }
+
+        let iterations = 200;
+        for _ in 0..10 {
+            full(&linker, &component).await.unwrap();
+            pre_linked(&pre).await.unwrap();
+        }
+        let started = Instant::now();
+        for _ in 0..iterations {
+            full(&linker, &component).await.unwrap();
+        }
+        let full = started.elapsed() / iterations;
+        let started = Instant::now();
+        for _ in 0..iterations {
+            pre_linked(&pre).await.unwrap();
+        }
+        let pre = started.elapsed() / iterations;
+        println!("full instantiate: {full:?} / pre-linked instantiate: {pre:?} (mean of {iterations})");
+    }
+
+    /// Drives one request through `serve` over in-memory frame channels and
+    /// returns the raw response bytes up to the tunnel Close.
+    async fn exchange(loaded: &std::sync::Arc<Loaded>, limits: Limits, request: &str) -> String {
+        let (tx, mut rx) = mpsc::channel::<Frame>(64);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<Ctrl>(32);
+        let registry = crate::Registry::default();
+        tokio::spawn(serve(tx, registry, 1, loaded.clone(), limits, ctrl_rx));
+        ctrl_tx
+            .send(Ctrl::Payload(request.as_bytes().to_vec()))
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        loop {
+            let Some(frame) = rx.recv().await else {
+                break;
+            };
+            match frame.body.expect("frame body") {
+                Body::Data(data) => raw.extend_from_slice(&data.payload),
+                Body::Close(..) => break,
+                _ => {}
+            }
+        }
+        assert!(!raw.is_empty(), "no response bytes");
+        String::from_utf8(raw).expect("utf8 response")
+    }
+
+    /// A guest overrunning its epoch budget degrades to a clean 504 and the
+    /// next request on the same component is unaffected.
+    #[tokio::test]
+    async fn budget_exhaustion_is_a_504_and_later_requests_keep_serving() {
+        let loaded = load(&Locator::File(hello_wasm())).await.unwrap();
+        let limits = Limits {
+            budget: Duration::from_millis(100),
+            ..Limits::default()
+        };
+        let body = exchange(
+            &loaded,
+            limits,
+            "GET /spin HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(body.starts_with("HTTP/1.1 504"), "head: {body}");
+        assert!(body.contains("budget"), "body: {body}");
+
+        let body = exchange(
+            &loaded,
+            Limits::default(),
+            "GET / HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
+    }
+
+    /// A memory-hungry guest capped by the limiter degrades to a clean 5xx
+    /// instead of OOM-ing the process, and later requests keep serving.
+    #[tokio::test]
+    async fn memory_cap_yields_a_clean_error_and_later_requests_keep_serving() {
+        let loaded = load(&Locator::File(hello_wasm())).await.unwrap();
+        // above the guest's instantiation footprint, below its ballooning
+        let limits = Limits {
+            memory: 8 << 20,
+            ..Limits::default()
+        };
+        let body = exchange(
+            &loaded,
+            limits,
+            "GET /balloon HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(body.starts_with("HTTP/1.1 5"), "head: {body}");
+
+        let body = exchange(
+            &loaded,
+            limits,
+            "GET / HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
+    }
+
     /// Drives `serve` over in-memory frame channels with a `GET /stream`
     /// request and collects the response: 10 MiB must arrive progressively
     /// (the guest paces chunks), not as one buffered blob.
@@ -578,7 +829,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Frame>(64);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<Ctrl>(32);
         let registry = crate::Registry::default();
-        tokio::spawn(serve(tx, registry, 1, loaded, ctrl_rx));
+        tokio::spawn(serve(tx, registry, 1, loaded, Limits::default(), ctrl_rx));
 
         ctrl_tx
             .send(Ctrl::Payload(

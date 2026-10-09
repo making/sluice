@@ -45,7 +45,15 @@ target/debug/sluice-wasmlet --server grpcs://127.0.0.1:8001 --insecure ...
 Multiple `--wasm host=<locator>` routes per process. The locator is a bare
 path, `file://<path>`, or `http(s)://<url>` (fetched once at startup); the
 advertised target is `wasm:<locator>` and further schemes slot into the same
-resolver.
+resolver. A `?query` suffix sets the route's resource limits, applied to
+every request's instance: `budget-ms` is the epoch-based CPU/deadline budget
+(exceeded -> 504; defaults 10000) and `memory-mib` the per-instance linear
+memory cap in MiB (exceeded -> guest trap, 500; defaults 256). A literal `?`
+in a file path needs URL-escaping.
+
+```text
+--wasm demo.local=hello.wasm?budget-ms=5000&memory-mib=64
+```
 
 ```text
 curl -H 'Host: demo.local' http://127.0.0.1:8000/hello
@@ -55,8 +63,10 @@ curl -H 'Host: demo.local' http://127.0.0.1:8000/panic   # guest trap -> 500, tu
 ```
 
 The sample handler echoes method / path / body size; `/panic` panics to
-demonstrate guest isolation; `/stream` trickles 10 MiB in paced chunks to
-demonstrate response streaming:
+demonstrate guest isolation; `/spin` busy-loops until the epoch budget
+interrupts it (504); `/balloon` allocates until the memory cap denies it
+(500); `/stream` trickles 10 MiB in paced chunks to demonstrate response
+streaming:
 
 ```text
 curl -H 'Host: demo.local' http://127.0.0.1:8000/stream
@@ -68,9 +78,16 @@ curl -H 'Host: demo.local' http://127.0.0.1:8000/stream
   first bytes) through an `AsyncRead`/`AsyncWrite` adapter over the frame
   channels; no loopback sockets
 - per request: `wasmtime_wasi_http::p3::Request::from_http` -> fresh instance
-  -> `Service.handle`; the store runs in a detached task and relays response
-  body frames to hyper through a bounded channel, so responses stream and a
-  slow client backpressures the guest
+  from a pre-linked `InstancePre` -> `Service.handle`; the store runs in a
+  detached task and relays response body frames to hyper through a bounded
+  channel, so responses stream and a slow client backpressures the guest.
+  Instances are deliberately not pooled: the warm path (~170us instantiate,
+  measured by the ignored `instantiation_latency_reference` test) is cheap,
+  `Store::run_concurrent` consumes the store, and guest module state makes
+  blind reuse incorrect
+- every request's store carries an epoch deadline (`budget-ms`) and a memory
+  limiter (`memory-mib`); the shared engine's epoch is incremented by a
+  dedicated thread, so a guest busy-loop cannot starve its own budget
 - guests are ordinary wasm components: the host links wasi p2 (rust std
   imports of the `wasm32-wasip2` target) + p3 (the 0.3 world), same as
   wasmtime's own p3 test suite
@@ -90,7 +107,9 @@ duplicate is closed on the client side before the server drops it.
 ## Known limitations (PoC scope)
 
 - no mTLS (client certificates) yet
-- one instance per request, no epoch-based CPU/memory limits yet
+- the epoch budget is absolute (suspended time counts) and granular to the
+  10ms tick; a CPU-limiting `fuel` accounting or per-route concurrency caps
+  are not there yet
 - guest async tasks live within `wit-bindgen`'s runtime; the `spawn`
   caveats about task lifetime apply
 

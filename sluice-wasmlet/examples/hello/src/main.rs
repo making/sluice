@@ -42,6 +42,16 @@ impl Guest for Component {
             panic!("guest panic (PoC)");
         }
 
+        if path == "/spin" {
+            // Limits demo: a CPU-bound guest, interrupted by the epoch budget.
+            spin();
+        }
+
+        if path == "/balloon" {
+            // Limits demo: a memory-hungry guest, capped by the memory limiter.
+            balloon();
+        }
+
         if path == "/stream" {
             // 10 MiB in paced chunks: exercises the streaming response path
             // (bytes must reach the client while the body is still produced).
@@ -84,5 +94,23 @@ impl Guest for Component {
 }
 
 export!(Component);
+
+/// Burns CPU forever; the host's epoch budget is what ends it (504).
+fn spin() -> ! {
+    let mut x = 1u64;
+    loop {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        std::hint::black_box(x);
+    }
+}
+
+/// Keeps allocating 1 MiB chunks; the host's memory limiter is what ends it
+/// (allocation failure -> trap).
+fn balloon() -> ! {
+    let mut keep: Vec<Vec<u8>> = Vec::new();
+    loop {
+        keep.push(vec![0x41; 1024 * 1024]);
+    }
+}
 
 fn main() {}

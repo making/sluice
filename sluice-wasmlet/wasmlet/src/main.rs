@@ -17,7 +17,8 @@
 //!
 //! - `grpc://` / `grpcs://` control plane (`--ca-cert` pins the CA,
 //!   `--insecure` skips verification); no mTLS yet
-//! - one instance per request; response bodies stream via a bounded relay
+//! - one pre-linked (`InstancePre`) instance per request, under a per-route
+//!   epoch CPU budget and memory cap; response bodies stream via a bounded relay
 //!
 //! Usage:
 //!
@@ -43,11 +44,18 @@ mod wasm_host;
 
 use pb::frame::Body;
 use pb::{Advertise, Error, Frame, Upstream};
-use wasm_host::{Loaded, Locator};
+use wasm_host::{Loaded, Limits, Locator};
 
 struct Route {
     host: String,
     component: Locator,
+    limits: Limits,
+}
+
+/// A resolved route target: the shared `Loaded` plus this route's limits.
+struct ComponentEntry {
+    component: Arc<Loaded>,
+    limits: Limits,
 }
 
 struct Config {
@@ -95,8 +103,9 @@ struct Shared {
     ca_pem: Option<Vec<u8>>,
     /// Upstreams advertised on every stream.
     advertised: Vec<Upstream>,
-    /// Target (`wasm:...`) -> loaded component; the dial address key.
-    components: HashMap<String, Arc<Loaded>>,
+    /// Target (`wasm:...`) -> component entry; the dial address key. Two
+    /// routes on one target keep the last limits configured.
+    components: HashMap<String, ComponentEntry>,
 }
 
 /// One tunnel stream toward one node. The supervisor's `Arc` identity survives
@@ -164,11 +173,13 @@ fn parse_args() -> Config {
                 let (host, target) = spec.split_once('=').unwrap_or_else(|| {
                     panic!("--wasm must be host=component-locator, got '{spec}'")
                 });
+                let (target, limits) = parse_route_target(target);
                 let component =
-                    Locator::parse(target).unwrap_or_else(|e| panic!("--wasm {spec}: {e}"));
+                    Locator::parse(&target).unwrap_or_else(|e| panic!("--wasm {spec}: {e}"));
                 config.routes.push(Route {
                     host: host.to_string(),
                     component,
+                    limits,
                 });
             }
             other => panic!("unknown argument '{other}'"),
@@ -178,6 +189,30 @@ fn parse_args() -> Config {
         panic!("--server and at least one --wasm host=locator are required");
     }
     config
+}
+
+/// Splits `locator[?budget-ms=N&memory-mib=N]` into the locator and the
+/// per-route limits. The `?` separator means literal `?` in file paths needs
+/// URL-escaping (`file://...%3F...`).
+fn parse_route_target(spec: &str) -> (String, Limits) {
+    let Some((target, query)) = spec.split_once('?') else {
+        return (spec.to_string(), Limits::default());
+    };
+    let mut limits = Limits::default();
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            panic!("--wasm: expected key=value in '{query}'");
+        };
+        let number = |name: &str| -> u64 {
+            value.parse().unwrap_or_else(|_| panic!("--wasm {name}: not a number '{value}'"))
+        };
+        match key {
+            "budget-ms" => limits.budget = Duration::from_millis(number(key).max(1)),
+            "memory-mib" => limits.memory = (number(key) as usize) << 20,
+            other => panic!("--wasm: unknown option '{other}' (budget-ms, memory-mib)"),
+        }
+    }
+    (target.to_string(), limits)
 }
 
 /// Splits the `--server` value into `(secure, authority)`; a bare host:port
@@ -214,7 +249,7 @@ async fn run(config: Config) -> Result<(), BoxError> {
     // Fetch / prewarm every component (fail fast). The target is the component
     // locator (`wasm:<url>`); the server passes it through verbatim as the dial
     // address and the client resolves it back.
-    let mut components: HashMap<String, Arc<Loaded>> = HashMap::new();
+    let mut components: HashMap<String, ComponentEntry> = HashMap::new();
     let mut advertised = Vec::with_capacity(routes.len());
     for route in &routes {
         let target = route.component.target().await?;
@@ -222,7 +257,13 @@ async fn run(config: Config) -> Result<(), BoxError> {
             Ok(component) => component,
             Err(e) => return Err(format!("wasm route '{}': {e}", route.host).into()),
         };
-        components.insert(target.clone(), component);
+        components.insert(
+            target.clone(),
+            ComponentEntry {
+                component,
+                limits: route.limits,
+            },
+        );
         advertised.push(Upstream {
             host: route.host.clone(),
             target_url: target,
@@ -498,7 +539,7 @@ impl NodeTask {
                     }
                 }
                 Some(Body::Connect(connect)) => {
-                    let Some(component) = self.shared.components.get(&connect.address) else {
+                    let Some(entry) = self.shared.components.get(&connect.address) else {
                         let _ = tx
                             .send(Frame {
                                 body: Some(Body::Error(Error {
@@ -511,12 +552,14 @@ impl NodeTask {
                     };
                     let (ctrl_tx, ctrl_rx) = mpsc::channel(SERVE_BUFFER);
                     registry.lock().unwrap().insert(connect.conn_id, ctrl_tx);
-                    let component = component.clone();
+                    let component = entry.component.clone();
+                    let limits = entry.limits;
                     tokio::spawn(wasm_host::serve(
                         tx.clone(),
                         registry.clone(),
                         connect.conn_id,
                         component,
+                        limits,
                         ctrl_rx,
                     ));
                 }
@@ -591,6 +634,21 @@ async fn list_nodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_target_without_options_keeps_defaults() {
+        let (target, limits) = parse_route_target("target/wasm32-wasip2/release/hello.wasm");
+        assert_eq!(target, "target/wasm32-wasip2/release/hello.wasm");
+        assert_eq!(limits, Limits::default());
+    }
+
+    #[test]
+    fn route_target_options_override_limits() {
+        let (target, limits) = parse_route_target("./a.wasm?budget-ms=250&memory-mib=64");
+        assert_eq!(target, "./a.wasm");
+        assert_eq!(limits.budget, Duration::from_millis(250));
+        assert_eq!(limits.memory, 64 << 20);
+    }
 
     fn session(url: &str) -> Arc<Session> {
         Arc::new(Session {
