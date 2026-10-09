@@ -27,6 +27,7 @@ The data plane relays raw bytes (the request head is inspected for routing; with
 - Native image (`-Pnative`, client/server): console view records are rendered via Mustache reflection -- when adding/renaming a record under `console/web`, register it in `sluice-server/src/main/resources/META-INF/native-image/am.ik.sluice/sluice-server/reflect-config.json`.
 - Tests that need a port before the server starts take it from `TestPorts.freePort()` (sluice-it), never by probing `new ServerSocket(0)` and closing it: the OS may hand that port out again.
 - Console E2E tests use Playwright (`ConsoleE2ETest`); the first run downloads Chromium.
+- `.todo` numbers come from `.todo/claim-number.sh`.
 
 ## Manual E2E check
 
