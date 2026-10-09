@@ -1,10 +1,17 @@
 package am.ik.sluice.it;
 
+import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.CookieManager;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -13,11 +20,16 @@ import java.security.interfaces.RSAPrivateCrtKey;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import java.util.regex.Pattern;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SNIHostName;
@@ -74,6 +86,8 @@ class ClusterGrpcMutualTlsE2ETests {
 
 	private static Path caPemPath;
 
+	private static Path caKeyPemPath;
+
 	private static Path serverPemPath;
 
 	private static Path serverKeyPemPath;
@@ -91,6 +105,8 @@ class ClusterGrpcMutualTlsE2ETests {
 	private final int[] grpcPorts = new int[2];
 
 	private final int[] dataPorts = new int[2];
+
+	private final int[] consolePorts = new int[2];
 
 	private final @org.jspecify.annotations.Nullable ConfigurableApplicationContext[] servers = new ConfigurableApplicationContext[2];
 
@@ -137,6 +153,8 @@ class ClusterGrpcMutualTlsE2ETests {
 		upstreamStore = loadStore(upstreamStorePath, "upstream");
 		caStore = loadStore(caStorePath, "ca");
 		caPemPath = exportPem(caStore, "ca", "CERTIFICATE", store -> store.getCertificate("ca").getEncoded());
+		caKeyPemPath = exportPem(caStore, "ca", "PRIVATE KEY",
+				store -> ((RSAPrivateCrtKey) store.getKey("ca", STORE_PASS)).getEncoded());
 		serverPemPath = exportPem(loadStore(serverStorePath, "server"), "server", "CERTIFICATE",
 				store -> store.getCertificate("server").getEncoded());
 		serverKeyPemPath = exportPem(loadStore(serverStorePath, "server"), "server", "PRIVATE KEY",
@@ -329,9 +347,11 @@ class ClusterGrpcMutualTlsE2ETests {
 	private void startServer(int index, String... extraArgs) {
 		String membership = this.nodeNames[0] + "=grpcs://127.0.0.1:" + this.grpcPorts[0] + "," + this.nodeNames[1]
 				+ "=grpcs://127.0.0.1:" + this.grpcPorts[1];
+		int consolePort = TestPorts.freePort();
+		this.consolePorts[index] = consolePort;
 		// @formatter:off
 		String[] args = new String[] {
-				"--server.port=" + TestPorts.freePort(), "--spring.grpc.server.port=" + this.grpcPorts[index],
+				"--server.port=" + consolePort, "--spring.grpc.server.port=" + this.grpcPorts[index],
 				"--sluice.data-port=" + this.dataPorts[index], "--sluice.token=" + TOKEN,
 				"--sluice.node.id=" + this.nodeNames[index], "--sluice.cluster.nodes=" + membership,
 				"--sluice.cluster.warmup=1s", "--spring.grpc.server.ssl.bundle=" + SERVER_BUNDLE,
@@ -351,11 +371,19 @@ class ClusterGrpcMutualTlsE2ETests {
 	 * (1-based).
 	 */
 	private void startClient(int identity, String... extraArgs) {
+		startClientWith(identity, clientPemPaths[identity - 1], clientKeyPemPaths[identity - 1], extraArgs);
+	}
+
+	/**
+	 * Starts a client that authenticates with the given certificate and key, e.g. one
+	 * issued through the console.
+	 */
+	private void startClientWith(int identity, Path certificatePem, Path privateKeyPem, String... extraArgs) {
 		// @formatter:off
 		String[] args = new String[] { "--sluice.server-url=grpcs://127.0.0.1:" + this.grpcPorts[0],
 				"--sluice.tls-bundle=" + CLIENT_BUNDLE, "--sluice.client.id=mtls-it-client-" + identity,
-				"--spring.ssl.bundle.pem." + CLIENT_BUNDLE + ".keystore.certificate=file:" + clientPemPaths[identity - 1],
-				"--spring.ssl.bundle.pem." + CLIENT_BUNDLE + ".keystore.private-key=file:" + clientKeyPemPaths[identity - 1],
+				"--spring.ssl.bundle.pem." + CLIENT_BUNDLE + ".keystore.certificate=file:" + certificatePem,
+				"--spring.ssl.bundle.pem." + CLIENT_BUNDLE + ".keystore.private-key=file:" + privateKeyPem,
 				"--spring.ssl.bundle.pem." + CLIENT_BUNDLE + ".truststore.certificate=file:" + caPemPath,
 				"--sluice.token=" + TOKEN, "--server.port=0" };
 		// @formatter:on
@@ -475,6 +503,84 @@ class ClusterGrpcMutualTlsE2ETests {
 			.during(3, TimeUnit.SECONDS)
 			.atMost(10, TimeUnit.SECONDS)
 			.until(() -> sessionCount(0) == 0 && !this.tunnelClient(1).isConnected());
+	}
+
+	@Test
+	void certificateIssuedThroughTheConsoleAuthenticatesTheClient() throws Exception {
+		this.grpcPorts[0] = TestPorts.freePort();
+		this.dataPorts[0] = TestPorts.freePort();
+		int upstreamPort = this.startPlainUpstream("console-issued-ok");
+		// the console signs with the CA the control plane truststore pins, so the issued
+		// certificate authenticates with no server side change
+		this.startServer(0, "--sluice.ca-bundle=console-ca",
+				"--spring.ssl.bundle.pem.console-ca.keystore.certificate=file:" + caPemPath,
+				"--spring.ssl.bundle.pem.console-ca.keystore.private-key=file:" + caKeyPemPath);
+		Map<String, String> archive = issueThroughTheConsole(this.consolePorts[0], "console-issued-client");
+		this.startClientWith(1, pemFile("console-issued-client.crt.pem", archive),
+				pemFile("console-issued-client.key.pem", archive), "--sluice.client.upstream[0].host=" + HOST,
+				"--sluice.client.upstream[0].target=http://127.0.0.1:" + upstreamPort);
+		Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> sessionCount(0) == 1);
+		assertThat(this.httpRoundTrip(0, HOST)).contains("console-issued-ok");
+	}
+
+	/**
+	 * Signs in to the console, submits the issuance form and returns the download
+	 * archive: a zip of the certificate, its PKCS#8 key and the CA certificate as
+	 * separate PEM files.
+	 */
+	private static Map<String, String> issueThroughTheConsole(int consolePort, String commonName) throws Exception {
+		HttpClient console = HttpClient.newBuilder().cookieHandler(new CookieManager()).build();
+		String base = "http://127.0.0.1:" + consolePort;
+		String csrf = csrfOf(get(console, base + "/login").body());
+		postForm(console, base + "/login", "username=admin&password=admin&_csrf=" + urlEncode(csrf));
+		// the session was renewed by the sign-in; the token comes from the issuance page
+		String sessionCsrf = csrfOf(get(console, base + "/console/certificates").body());
+		HttpResponse<byte[]> response = postForm(console, base + "/console/certificates",
+				"cn=" + urlEncode(commonName) + "&days=365&_csrf=" + urlEncode(sessionCsrf));
+		assertThat(response.statusCode()).isEqualTo(200);
+		Map<String, String> entries = new HashMap<>();
+		try (ZipInputStream zip = new ZipInputStream(new ByteArrayInputStream(response.body()))) {
+			for (ZipEntry entry; (entry = zip.getNextEntry()) != null;) {
+				entries.put(entry.getName(), new String(zip.readAllBytes(), StandardCharsets.UTF_8));
+			}
+		}
+		assertThat(entries.keySet()).containsExactlyInAnyOrder(commonName + ".crt.pem", commonName + ".key.pem",
+				"ca.crt.pem");
+		assertThat(entries.get("ca.crt.pem")).isEqualTo(Files.readString(caPemPath));
+		return entries;
+	}
+
+	private static HttpResponse<String> get(HttpClient client, String url) throws Exception {
+		return client.send(HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(10)).build(),
+				HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+	}
+
+	private static HttpResponse<byte[]> postForm(HttpClient client, String url, String body) throws Exception {
+		return client.send(HttpRequest.newBuilder(URI.create(url))
+			.header("Content-Type", "application/x-www-form-urlencoded")
+			.timeout(Duration.ofSeconds(10))
+			.POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+			.build(), HttpResponse.BodyHandlers.ofByteArray());
+	}
+
+	private static String csrfOf(String page) {
+		return Pattern.compile("name=\"_csrf\" value=\"([^\"]+)\"")
+			.matcher(page)
+			.results()
+			.findFirst()
+			.orElseThrow(() -> new AssertionError("no csrf parameter in the page"))
+			.group(1);
+	}
+
+	private static String urlEncode(String value) {
+		return URLEncoder.encode(value, StandardCharsets.UTF_8);
+	}
+
+	/** One PEM file of the download archive, written to a file for an SSL bundle. */
+	private static Path pemFile(String name, Map<String, String> archive) throws Exception {
+		String pem = archive.get(name);
+		assertThat(pem).isNotNull();
+		return Files.writeString(Files.createTempFile("console-issued-", ".pem"), pem);
 	}
 
 	@Test

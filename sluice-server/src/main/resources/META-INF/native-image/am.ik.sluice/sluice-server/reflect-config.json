@@ -1,5 +1,11 @@
 [
 	{
+		"name": "am.ik.sluice.server.console.web.ConsoleController$ClientCertificate",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
 		"name": "am.ik.sluice.server.console.web.ConsoleView$Candidate",
 		"allDeclaredConstructors": true,
 		"allDeclaredMethods": true,

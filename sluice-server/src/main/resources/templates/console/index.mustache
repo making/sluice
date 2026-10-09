@@ -82,6 +82,17 @@
       <div id="cluster">{{>console/cluster}}</div>
     </section>
 
+    <section class="panel" aria-labelledby="certificates-heading">
+      <h2 id="certificates-heading" class="rule-heading">Client certificate</h2>
+      {{#clientCertificate}}
+      <p class="hint">Client certificates for the mTLS control plane are signed by <span class="mono">{{caSubject}}</span>.</p>
+      <a class="cert-link" href="/console/certificates">Issue a certificate</a>
+      {{/clientCertificate}}
+      {{^clientCertificate}}
+      <p class="empty">No CA configured. Point <code>sluice.ca-bundle</code> at an SSL bundle holding the issuer key pair to enable issuance.</p>
+      {{/clientCertificate}}
+    </section>
+
     <section class="panel" aria-labelledby="settings-heading">
       <h2 id="settings-heading" class="rule-heading">Settings</h2>
       <dl class="settings">

@@ -17,7 +17,7 @@ import am.ik.sluice.server.route.LoadBalance;
  *
  * @param tcpPortRange listen ports a client may claim for tcp routes (comma separated
  * single ports or {@code min-max} ranges, e.g. {@code 9000-9010,8080}; empty = any port)
- * @param proxyProtocol whether a PROXY protocol (v1 / v2) header preceding the payload is
+ * @param caBundle SSL bundle naming the CA ({@code null} = console issuance disabled)
  * parsed on the data plane: the header is stripped before routing / relay and its source
  * address becomes the connection peer (access control, access log); headerless
  * connections are unaffected, a malformed one fails the connection
@@ -29,7 +29,7 @@ import am.ik.sluice.server.route.LoadBalance;
  */
 @ConfigurationProperties("sluice")
 public record SluiceServerProperties(String token, @Nullable String tokenFile, @DefaultValue("0.0.0.0") String dataHost,
-		@DefaultValue("8000") int dataPort, @Nullable String dataTlsBundle,
+		@DefaultValue("8000") int dataPort, @Nullable String dataTlsBundle, @Nullable String caBundle,
 		@DefaultValue("false") boolean proxyProtocol, @DefaultValue("") String tcpPortRange, AccessLog accessLog,
 		AccessControl accessControl, Node node, Cluster cluster, Console console,
 		@DefaultValue("smallest-client-id") LoadBalance httpLoadBalance,
@@ -434,6 +434,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 		@Nullable private String dataTlsBundle;
 
+		@Nullable private String caBundle;
+
 		private boolean proxyProtocol;
 
 		private String tcpPortRange = "";
@@ -477,6 +479,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 		public Builder dataTlsBundle(String dataTlsBundle) {
 			this.dataTlsBundle = dataTlsBundle;
+			return this;
+		}
+
+		public Builder caBundle(String caBundle) {
+			this.caBundle = caBundle;
 			return this;
 		}
 
@@ -527,7 +534,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 		public SluiceServerProperties build() {
 			return new SluiceServerProperties(this.token == null ? "" : this.token, this.tokenFile,
-					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort, this.dataTlsBundle,
+					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort, this.dataTlsBundle, this.caBundle,
 					this.proxyProtocol, this.tcpPortRange,
 					this.accessLog == null ? AccessLog.builder().build() : this.accessLog, this.accessControl,
 					this.node == null ? Node.builder().build() : this.node,

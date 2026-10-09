@@ -909,6 +909,96 @@ code {
 	overflow-wrap: anywhere;
 }
 
+/* ------------------------------------------------- client certificate issuance */
+
+.cert-form {
+	display: grid;
+	gap: 1.1rem;
+}
+
+.cert-form__field {
+	display: grid;
+	gap: 0.15rem;
+}
+
+.cert-form__field label {
+	font-size: var(--step--1);
+	font-weight: 600;
+}
+
+.cert-form__field input {
+	width: 100%;
+	padding: 0.5rem 0.1rem 0.4rem;
+	border: 0;
+	border-bottom: 1px solid var(--ink);
+	border-radius: 0;
+	background: transparent;
+	color: var(--ink);
+	font-family: var(--mono);
+	font-size: var(--step-0);
+}
+
+.cert-form__field input:focus-visible {
+	outline: none;
+	border-bottom-color: var(--water);
+	box-shadow: 0 1px 0 var(--water);
+}
+
+.cert-form__submit {
+	justify-self: start;
+	padding: 0.65rem 1.6rem 0.55rem;
+	border: 1px solid var(--ink);
+	border-radius: 0;
+	background: var(--ink);
+	color: var(--on-ink);
+	font-family: var(--sans);
+	font-size: var(--step-0);
+	font-weight: 600;
+	cursor: pointer;
+}
+
+.cert-form__submit:hover {
+	border-color: var(--water);
+	background: var(--water);
+}
+
+/* the issuance page: one narrow column of paper on the drawing sheet */
+.cert-page__column {
+	width: min(100%, 44rem);
+	margin: 0 auto;
+	padding: 2.5rem var(--gutter) 4rem;
+}
+
+/* the index panel links here instead of hosting the form itself */
+.cert-link {
+	display: inline-block;
+	padding: 0.5rem 1.3rem 0.4rem;
+	border: 1px solid var(--ink);
+	border-radius: 0;
+	color: inherit;
+	font-size: var(--step--1);
+	font-weight: 600;
+	text-decoration: none;
+}
+
+.cert-link:hover {
+	border-color: var(--water);
+	color: var(--water);
+}
+
+/* the client configuration example, set like a specimen label */
+.cert-example {
+	margin: 0;
+	padding: 0.9rem 1.1rem;
+	border: 1px solid var(--hair);
+	overflow-x: auto;
+	background: color-mix(in srgb, var(--paper-raised) 55%, transparent);
+	color: var(--ink);
+	font-family: var(--mono);
+	font-size: var(--step--1);
+	line-height: 1.6;
+}
+
 /* ------------------------------------------------------------------- login */
 
 /* a single drawing sheet: the lock with its gates shut above the sign-in form */

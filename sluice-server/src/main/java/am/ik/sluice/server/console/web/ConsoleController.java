@@ -1,10 +1,20 @@
 package am.ik.sluice.server.console.web;
 
+import java.nio.charset.StandardCharsets;
+
+import am.ik.sluice.server.cert.ClientCertificateIssuer;
+import am.ik.sluice.server.cert.ClientCertificateIssuers;
+import am.ik.sluice.server.cert.IssuedClientCertificate;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.oauth2.core.oidc.user.OidcUser;
 import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 
 /**
@@ -16,8 +26,11 @@ class ConsoleController {
 
 	private final ConsoleView view;
 
-	ConsoleController(ConsoleView view) {
+	private final ClientCertificateIssuers clientCertificateIssuers;
+
+	ConsoleController(ConsoleView view, ClientCertificateIssuers clientCertificateIssuers) {
 		this.view = view;
+		this.clientCertificateIssuers = clientCertificateIssuers;
 	}
 
 	@GetMapping("/")
@@ -30,7 +43,39 @@ class ConsoleController {
 		this.addLive(model);
 		model.addAttribute("user", displayName(authentication));
 		model.addAttribute("settings", this.view.settings());
+		ClientCertificateIssuer issuer = this.clientCertificateIssuers.find();
+		model.addAttribute("clientCertificate", issuer == null ? null : new ClientCertificate(issuer.caSubject()));
 		return "console/index";
+	}
+
+	/** The standalone client certificate issuance page. */
+	@GetMapping("/console/certificates")
+	String certificates(Model model) {
+		ClientCertificateIssuer issuer = this.clientCertificateIssuers.find();
+		model.addAttribute("clientCertificate", issuer == null ? null : new ClientCertificate(issuer.caSubject()));
+		return "console/certificates";
+	}
+
+	/**
+	 * Issues a client certificate: the response is a zip download with the certificate,
+	 * its PKCS#8 key and the CA certificate as separate PEM files, for the operator to
+	 * hand to the client.
+	 */
+	@PostMapping("/console/certificates")
+	ResponseEntity<byte[]> issueCertificate(@RequestParam String cn, @RequestParam(defaultValue = "365") int days) {
+		ClientCertificateIssuer issuer = this.clientCertificateIssuers.find();
+		if (issuer == null) {
+			return ResponseEntity.status(HttpStatus.CONFLICT).build();
+		}
+		String name = ClientCertificateIssuer.sanitize(cn);
+		if (name.isEmpty()) {
+			return ResponseEntity.badRequest().build();
+		}
+		IssuedClientCertificate issued = issuer.issue(name, days);
+		return ResponseEntity.ok()
+			.header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + name + ".zip\"")
+			.contentType(MediaType.parseMediaType("application/zip"))
+			.body(issued.zip(name, issuer.caCertificatePem()));
 	}
 
 	/**
@@ -71,6 +116,15 @@ class ConsoleController {
 		model.addAttribute("httpRoutes", this.view.httpRoutes());
 		model.addAttribute("tcpRoutes", this.view.tcpRoutes());
 		model.addAttribute("cluster", this.view.cluster());
+	}
+
+	/**
+	 * Panel model of the client certificate form; rendered only when a CA is configured.
+	 *
+	 * @param caSubject the CA the issued certificates are signed by
+	 */
+	record ClientCertificate(String caSubject) {
+
 	}
 
 }
