@@ -24,6 +24,18 @@
 		"allDeclaredFields": true
 	},
 	{
+		"name": "am.ik.sluice.server.console.web.ActuatorView$Measure",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ActuatorView$MetricGroup",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
 		"name": "am.ik.sluice.server.console.web.ActuatorView$MetricLink",
 		"allDeclaredConstructors": true,
 		"allDeclaredMethods": true,
@@ -31,6 +43,12 @@
 	},
 	{
 		"name": "am.ik.sluice.server.console.web.ActuatorView$MetricSeries",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.ActuatorView$TagPair",
 		"allDeclaredConstructors": true,
 		"allDeclaredMethods": true,
 		"allDeclaredFields": true
