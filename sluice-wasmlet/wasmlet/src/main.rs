@@ -17,7 +17,7 @@
 //!
 //! - `grpc://` / `grpcs://` control plane (`--ca-cert` pins the CA,
 //!   `--insecure` skips verification); no mTLS yet
-//! - response bodies are buffered; one instance per request
+//! - one instance per request; response bodies stream via a bounded relay
 //!
 //! Usage:
 //!

@@ -42,9 +42,32 @@ impl Guest for Component {
             panic!("guest panic (PoC)");
         }
 
-        let payload = format!(
-            "hello from wasm\nmethod={method:?}\npath={path}\nbody_bytes={body_len}\n"
-        );
+        if path == "/stream" {
+            // 10 MiB in paced chunks: exercises the streaming response path
+            // (bytes must reach the client while the body is still produced).
+            const CHUNKS: usize = 20;
+            const CHUNK_LEN: usize = 512 * 1024;
+            const PACE_NANOS: u64 = 50 * 1000 * 1000;
+
+            let response_headers = wasi::http::types::Headers::new();
+            let _ = response_headers.append("content-type", b"application/octet-stream");
+            let _ = response_headers.append("content-length", b"10485760");
+            let (mut body_tx, body_rx) = wit_stream::new();
+            let (trailers_tx, trailers_rx) = wit_future::new(|| todo!());
+            let (response, _transmit) = Response::new(response_headers, Some(body_rx), trailers_rx);
+            wit_bindgen::spawn(async move {
+                for _ in 0..CHUNKS {
+                    let _ = body_tx.write_all(vec![0xAB; CHUNK_LEN]).await;
+                    wasi::clocks::monotonic_clock::wait_for(PACE_NANOS).await;
+                }
+                drop(body_tx);
+                let _ = trailers_tx.write(Ok(None)).await;
+            });
+            return Ok(response);
+        }
+
+        let payload =
+            format!("hello from wasm\nmethod={method:?}\npath={path}\nbody_bytes={body_len}\n");
         // Fresh headers: the request's would carry a mismatched content-length.
         let response_headers = wasi::http::types::Headers::new();
         let _ = response_headers.append("content-type", b"text/plain");

@@ -3,7 +3,9 @@
 //! The tunnel connection's byte stream is served by hyper (http/1.1 vs h2c
 //! sniffed from the first bytes); every request is handled by a fresh
 //! instance of the guest component through `wasmtime-wasi-http`'s p3
-//! `Service.handle`. Response bodies are buffered (PoC scope).
+//! `Service.handle`. Response bodies stream: the store task relays frames to
+//! hyper through a bounded channel, so a slow client backpressures the guest
+//! instead of buffering the response.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,6 +25,11 @@ use crate::pb::{Close, Data, Frame};
 
 /// Upper bound for a single DATA frame emitted by the hyper write path.
 const CHUNK: usize = 16 * 1024;
+
+/// Relay slots between the guest's store task and hyper; together with the
+/// pipe buffer inside the body conversion this bounds the in-flight response
+/// bytes and applies backpressure to the guest.
+const RELAY_BUFFER: usize = 2;
 
 /// Sniff timeout for the first bytes of a connection (h2 preface check).
 const SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -190,20 +197,61 @@ impl wasmtime_wasi_http::WasiHttpView for Ctx {
 // ---------------------------------------------------------------------------
 // Request handling
 
-fn plain_response(
-    status: u16,
-    body: String,
-) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+/// One relayed body frame, or the error that truncated the body. The error is
+/// boxed: it may come from the body conversion (`wasmtime_wasi_http::Error`)
+/// or the store event loop (`wasmtime::Error`).
+type RelayError = Box<dyn std::error::Error + Send + Sync>;
+type RelayFrame = Result<http_body::Frame<bytes::Bytes>, RelayError>;
+
+/// The body hyper consumes: frames relayed from the guest's store task.
+type RelayBody = http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, RelayError>;
+
+/// The response head, or a synthesized failure with its message (the body is
+/// that single frame).
+enum Head {
+    Response(http::response::Parts),
+    Failure(u16, String),
+}
+
+fn plain_response(status: u16, body: String) -> hyper::Response<RelayBody> {
+    let frame = Ok(http_body::Frame::data(bytes::Bytes::from(body)));
     hyper::Response::builder()
         .status(status)
-        .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+        .body(http_body_util::StreamBody::new(tokio_stream::iter([frame])).boxed_unsync())
         .expect("static response")
+}
+
+/// Error response synthesized inside the store task.
+async fn failed(head_tx: mpsc::Sender<Head>, status: u16, message: String) {
+    let _ = head_tx.send(Head::Failure(status, message)).await;
+}
+
+/// Forwards guest body frames to hyper until either side ends. A body error
+/// is relayed so hyper sees the truncation instead of a silent short body; a
+/// gone client just ends the relay and the guest drains through the pipe.
+async fn relay(
+    mut body: http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, wasmtime_wasi_http::Error>,
+    frame_tx: mpsc::Sender<RelayFrame>,
+) {
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if frame_tx.send(Ok(frame)).await.is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                let _ = frame_tx.send(Err(e.into())).await;
+                return;
+            }
+        }
+    }
 }
 
 async fn respond(
     loaded: &Loaded,
     req: hyper::Request<hyper::body::Incoming>,
-) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+) -> hyper::Response<RelayBody> {
     let mut store = wasmtime::Store::new(&loaded.engine, Ctx::new());
     let service = match wasmtime_wasi_http::p3::bindings::Service::instantiate_async(
         &mut store,
@@ -217,45 +265,66 @@ async fn respond(
     };
     let (req, pump) = wasmtime_wasi_http::p3::Request::from_http(&mut store.data_mut().hooks, req);
 
-    let handled = store.run_concurrent(async |accessor| {
-        let (result, ()) = tokio::join!(
-            async {
-                let outcome = match service.handle(accessor, req).await {
-                    Ok(outcome) => outcome,
-                    Err(e) => return Err(format!("wasm trap: {e}")),
+    // The response head is handed to hyper as soon as it is known; body frames
+    // are relayed by the store task, which must outlive this future for the
+    // guest to keep producing while hyper drains at the client's pace.
+    let (head_tx, mut head_rx) = mpsc::channel::<Head>(1);
+    let (frame_tx, frame_rx) = mpsc::channel::<RelayFrame>(RELAY_BUFFER);
+
+    // A detached task: it ends when the response is fully relayed (or the
+    // client disappeared). A store-level failure (e.g. a guest trap) cancels
+    // the closure, so the fallback is synthesized here: a pending head wins,
+    // a missing one becomes the 500 below, and an already-streaming body is
+    // marked truncated via the error frame.
+    tokio::spawn(async move {
+        let driven = store.run_concurrent({
+            let head = head_tx.clone();
+            let frames = frame_tx.clone();
+            async move |accessor| {
+                let response = async {
+                    match service.handle(accessor, req).await {
+                        Ok(Ok(response)) => {
+                            let http = accessor.with(|store| {
+                                response.into_http(store, futures_util::future::ready(Ok(())))
+                            });
+                            match http {
+                                Ok(http) => {
+                                    let (parts, body) = http.into_parts();
+                                    let _ = head.send(Head::Response(parts)).await;
+                                    relay(body, frames).await;
+                                }
+                                Err(e) => {
+                                    failed(head, 500, format!("response conversion failed: {e}"))
+                                        .await;
+                                }
+                            }
+                        }
+                        Ok(Err(code)) => failed(head, 502, format!("wasi error: {code:?}")).await,
+                        Err(e) => failed(head, 500, format!("wasm trap: {e}")).await,
+                    }
                 };
-                let response = match outcome {
-                    Ok(response) => response,
-                    Err(code) => return Ok(plain_response(502, format!("wasi error: {code:?}"))),
-                };
-                let http = accessor
-                    .with(|store| response.into_http(store, futures_util::future::ready(Ok(()))));
-                let http = match http {
-                    Ok(http) => http,
-                    Err(e) => return Err(format!("response conversion failed: {e}")),
-                };
-                let (parts, body) = http.into_parts();
-                match body.collect().await {
-                    Ok(collected) => Ok(hyper::Response::from_parts(
-                        parts,
-                        http_body_util::Full::new(collected.to_bytes()),
-                    )),
-                    Err(e) => Err(format!("body collection failed: {e}")),
-                }
-            },
-            async {
-                // Drains request-body bookkeeping; errors surface in the response path.
-                let _ = pump.await;
-            },
-        );
-        result
+                let ((), ()) = tokio::join!(response, async {
+                    // Drains request-body bookkeeping; errors surface in the response path.
+                    let _ = pump.await;
+                },);
+            }
+        });
+        if let Err(e) = driven.await {
+            eprintln!("[wasm] store ended with error: {e}");
+            let _ = head_tx.try_send(Head::Failure(500, format!("wasm handler failed: {e}")));
+            let _ = frame_tx.try_send(Err(e.into()));
+        }
     });
 
-    let handled = handled.await;
-    match handled {
-        Ok(Ok(response)) => response,
-        Ok(Err(message)) => plain_response(500, format!("wasm handler failed: {message}")),
-        Err(e) => plain_response(500, format!("wasm execution failed: {e}")),
+    match head_rx.recv().await {
+        Some(Head::Response(parts)) => hyper::Response::from_parts(
+            parts,
+            http_body_util::StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(frame_rx))
+                .boxed_unsync(),
+        ),
+        Some(Head::Failure(status, message)) => plain_response(status, message),
+        // The task died before any head (panic / abort).
+        None => plain_response(500, "wasm handler failed".into()),
     }
 }
 
@@ -456,5 +525,110 @@ impl AsyncWrite for TunnelIo {
     ) -> Poll<std::io::Result<()>> {
         // Half-close the tunnel direction when hyper is done with the connection.
         self.send_close(cx)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Builds the hello guest (a no-op when fresh) and returns the component
+    /// path. The `wasm32-wasip2` artifacts live in the regular target dir, so
+    /// repeated runs reuse cargo's incrementality.
+    fn hello_wasm() -> std::path::PathBuf {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let output = std::process::Command::new(cargo)
+            .args([
+                "build",
+                "--release",
+                "-p",
+                "hello",
+                "--target",
+                "wasm32-wasip2",
+            ])
+            .current_dir(&root)
+            .output()
+            .expect("run cargo for the guest build");
+        assert!(
+            output.status.success(),
+            "guest build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let target = std::env::var("CARGO_TARGET_DIR")
+            .unwrap_or_else(|_| root.join("target").into_os_string().into_string().unwrap());
+        std::path::Path::new(&target).join("wasm32-wasip2/release/hello.wasm")
+    }
+
+    /// Drives `serve` over in-memory frame channels with a `GET /stream`
+    /// request and collects the response: 10 MiB must arrive progressively
+    /// (the guest paces chunks), not as one buffered blob.
+    #[tokio::test]
+    async fn streams_response_frames_as_the_guest_produces_them() {
+        let wasm = hello_wasm();
+        let loaded = load(&Locator::File(wasm)).await.unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<Frame>(64);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<Ctrl>(32);
+        let registry = crate::Registry::default();
+        tokio::spawn(serve(tx, registry, 1, loaded, ctrl_rx));
+
+        ctrl_tx
+            .send(Ctrl::Payload(
+                b"GET /stream HTTP/1.1\r\nhost: demo.local\r\nconnection: close\r\n\r\n".to_vec(),
+            ))
+            .await
+            .unwrap();
+
+        let started = Instant::now();
+        let mut raw: Vec<u8> = Vec::new();
+        let mut head_end = None;
+        let mut first_body_at = None;
+        let mut closed_at = None;
+        let completed = async {
+            while closed_at.is_none() {
+                let Some(frame) = rx.recv().await else {
+                    panic!("serve task ended without Close");
+                };
+                match frame.body.expect("frame body") {
+                    Body::Data(data) => {
+                        raw.extend_from_slice(&data.payload);
+                        if head_end.is_none() {
+                            head_end = raw
+                                .windows(4)
+                                .position(|w| w == b"\r\n\r\n")
+                                .map(|pos| pos + 4);
+                        }
+                        if let (Some(end), None) = (head_end, first_body_at) {
+                            if raw.len() > end {
+                                first_body_at = Some(Instant::now() - started);
+                            }
+                        }
+                    }
+                    Body::Close(..) => closed_at = Some(Instant::now() - started),
+                    _ => {}
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), completed)
+            .await
+            .expect("response did not complete in time");
+
+        let head = std::str::from_utf8(&raw[..head_end.unwrap()]).unwrap();
+        assert!(head.starts_with("HTTP/1.1 200"), "head: {head}");
+        let body = &raw[head_end.unwrap()..];
+        assert_eq!(body.len(), 10 * 1024 * 1024, "streamed body length");
+
+        // The guest paces 20 x 512 KiB over ~1s: body bytes must spread over
+        // that window instead of appearing at once (the old buffered path).
+        let spread = closed_at.unwrap().as_millis() - first_body_at.unwrap().as_millis();
+        assert!(spread > 300, "body spread too small: {spread}ms");
     }
 }
