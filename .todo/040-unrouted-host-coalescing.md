@@ -21,6 +21,15 @@ management console host:
 Fresh connections to the console host are unaffected (the front proxy sends them to
 8081 directly); only reuse of a data-plane connection hits this.
 
+## Status (2026-10-11)
+
+On hold: the coalescing itself was addressed on the operations side by splitting the
+data-plane certificate from the server's own listeners' certificate (gitops
+`sluice-apps-ik-am` / `sluice-system-ik-am`) -- with the apps-only SAN the browsers no
+longer coalesce the console onto a data-plane connection, so the 503 path below should
+no longer trigger. Revisit this todo only if coalesced no-route requests reappear (the
+`type=req route=-` access lines make them visible).
+
 ## Decision needed (product), then implement
 
 1. **Register the console host as a tunnel route** on some client, targeting the
