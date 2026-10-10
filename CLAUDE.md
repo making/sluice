@@ -22,23 +22,13 @@ The data plane relays raw bytes (the request head is inspected for routing; with
 - `application.properties`: keys in alphabetical order; a comment stays directly above the key it describes.
 - gRPC 1.83.x quirks: `StreamObserver` / `ClientCallStreamObserver` live in `io.grpc.stub`. The client onReady handler may only be set inside `ClientResponseObserver#beforeStart`.
 - Boot 4.1: `HealthIndicator` is in `org.springframework.boot.health.contributor`.
+- wasmtime 49 (`sluice-wasmlet`): a timer raced inside the `run_concurrent` closure may never fire; put timeouts / watchdogs outside the call (see `supervise` in `wasm_host.rs`).
 - Docker images via buildpack (`spring-boot:build-image`); no Dockerfile.
 - Console: Mustache + htmx 4 (same setup as blog-frontend-htmx: vendored `htmx.min.js`, `{{#src}}` content-hashed URLs from `WebConfig`, `compression-maven-plugin` .br/.gz). htmx 4 inherits nothing implicitly (`:inherited`). The drawing geometry lives in `FlowDrawing`; templates stay logic-less.
 - Native image (`-Pnative`, client/server): console view records are rendered via Mustache reflection -- when adding/renaming a record under `console/web`, register it in `sluice-server/src/main/resources/META-INF/native-image/am.ik.sluice/sluice-server/reflect-config.json`.
 - Tests that need a port before the server starts take it from `TestPorts.freePort()` (sluice-it), never by probing `new ServerSocket(0)` and closing it: the OS may hand that port out again.
 - Console E2E tests use Playwright (`ConsoleE2ETest`); the first run downloads Chromium.
 - `.todo` numbers come from `.todo/claim-number.sh`.
-
-## Working a task
-
-A working happy path is not done. Failure paths, tests and docs must not overstate what the code does.
-
-- Treat every requirement, duty and acceptance item in the todo as a checklist. Before declaring done, map each item to the code that does it and the test that proves it. An item that is not done stays open in a todo and is reported, never silently dropped.
-- Enumerate the failure modes first: hangs (including waiting on host I/O, not just CPU), client disconnect at each phase, startup failure, resource exhaustion and leaks, partial or truncated output. Each one gets a test or an explicit todo.
-- Read the docs and caveats of the primitives you build on (e.g. wasmtime's `run_concurrent` cannot reliably race a timer inside its closure) before designing the error handling.
-- A test must fail without the behavior it names. Watch it fail first (bug fixes: always), and check that it exercises the configuration it claims: one source per setting, assertions on timing / counters where the result alone cannot tell.
-- Docs and comments claim only what a test demonstrates. "X bounds Y" needs a test where Y happens.
-- Before finishing, review your own diff as an adversarial reviewer would: what is uncovered, what does a passing test not actually check?
 
 ## Manual E2E check
 
