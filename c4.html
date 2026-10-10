@@ -1,0 +1,511 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>sluice — C4 model</title>
+<link rel="preconnect href=https://fonts.googleapis.com">
+<link rel="preconnect href=https://fonts.gstatic.com crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Semi+Condensed:wght@600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper:#DFE5EA; --sheet:#F7FAFB; --ink:#16283C; --mut:#5A6B7C;
+    --line:#B7C4CF; --red:#A63D2F;
+    --c4-per:#08427B; --c4-sys:#1168BD; --c4-ext:#8B95A1; --c4-cnt:#438DD5; --c4-cmp:#85BBF0;
+    --sans:"Barlow","Helvetica Neue",Arial,"Hiragino Sans",sans-serif;
+    --cond:"Barlow Semi Condensed","Barlow",sans-serif;
+    --mono:"IBM Plex Mono","Menlo",monospace;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--paper); color:var(--ink); font-family:var(--sans); font-size:15px; line-height:1.6; }
+  main { max-width:1240px; margin:0 auto; padding:0 20px 90px; }
+  .vh { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
+
+  /* masthead */
+  header { max-width:1240px; margin:0 auto; padding:26px 20px 14px; display:flex; gap:18px; align-items:flex-end;
+           border-bottom:2px solid var(--ink); }
+  .mark { flex:none; }
+  .mark svg { display:block; }
+  h1 { font-family:var(--cond); font-weight:700; font-size:40px; letter-spacing:.5px; line-height:1; margin:0; }
+  .sub { margin:2px 0 0; font-size:14px; color:var(--mut); }
+  .strip { margin-left:auto; text-align:right; font-family:var(--mono); font-size:10px; line-height:1.7; color:var(--mut);
+           text-transform:uppercase; letter-spacing:.5px; }
+  .strip b { color:var(--ink); font-weight:500; }
+
+  nav { max-width:1240px; margin:0 auto; padding:10px 20px 0; font-family:var(--mono); font-size:11px;
+        text-transform:uppercase; letter-spacing:.8px; }
+  nav a { color:var(--ink); text-decoration:none; margin-right:22px; border-bottom:1px solid var(--line); padding-bottom:2px; }
+  nav a:hover { border-color:var(--ink); }
+  section { scroll-margin-top:24px; }
+
+  /* sheet frame */
+  figure.sheet { margin:42px 0 0; }
+  .frame { border:1.5px solid var(--ink); background:var(--sheet); padding:9px; }
+  .frame svg { display:block; width:100%; height:auto; border:1px solid rgba(22,40,60,.35);
+    background-color:var(--sheet);
+    background-image:
+      repeating-linear-gradient(0deg,  rgba(22,40,60,.05) 0 1px, transparent 1px 24px),
+      repeating-linear-gradient(90deg, rgba(22,40,60,.05) 0 1px, transparent 1px 24px); }
+  .tblock { display:flex; flex-wrap:wrap; border:1px solid var(--ink); border-top:none; background:var(--sheet); }
+  .tblock div { padding:5px 12px 6px; border-left:1px solid var(--ink); min-width:72px; }
+  .tblock div:first-child { border-left:none; flex:1; min-width:150px; }
+  .tblock .l { display:block; font-family:var(--mono); font-size:7.5px; letter-spacing:1px; text-transform:uppercase; color:var(--mut); }
+  .tblock .v { display:block; font-family:var(--mono); font-size:10.5px; color:var(--ink); letter-spacing:.3px; }
+  figcaption { max-width:76ch; font-size:13px; color:var(--mut); margin:10px 2px 0; }
+  figcaption b { color:var(--ink); font-weight:600; }
+
+  /* schedule table */
+  .sched { width:100%; border-collapse:collapse; margin-top:44px; background:var(--sheet); border:1.5px solid var(--ink); }
+  caption { caption-side:top; text-align:left; font-family:var(--cond); font-weight:700; font-size:15px;
+            letter-spacing:.5px; padding:0 0 6px 2px; }
+  .sched th { font-family:var(--mono); font-size:9.5px; text-transform:uppercase; letter-spacing:1px; font-weight:500;
+              background:var(--ink); color:var(--sheet); padding:7px 12px; text-align:left; }
+  .sched td { border:1px solid var(--line); padding:9px 12px; font-size:13.5px; vertical-align:top; }
+  .sched th + th { border-left:1px solid rgba(247,250,251,.35); }
+  td code { font-family:var(--mono); font-size:11px; background:rgba(22,40,60,.06); padding:1px 4px; border-radius:2px; }
+  .sched td:first-child { font-weight:600; white-space:nowrap; }
+
+  /* notes */
+  #notes { margin-top:56px; }
+  #notes h2 { font-family:var(--cond); font-size:15px; letter-spacing:.5px; border-bottom:2px solid var(--ink);
+              padding-bottom:5px; margin:0 0 12px; }
+  #notes ol { margin:0; padding:0; list-style:none; max-width:90ch; }
+  #notes li { counter-increment:note; display:flex; gap:14px; padding:7px 0; border-bottom:1px solid var(--line); font-size:13.5px; }
+  #notes li::before { content:counter(note,decimal-leading-zero); font-family:var(--mono); font-size:11px; color:var(--red); padding-top:2px; }
+  #notes code { font-family:var(--mono); font-size:11.5px; background:rgba(22,40,60,.06); padding:1px 4px; border-radius:2px; }
+  .colophon { margin-top:26px; font-family:var(--mono); font-size:9.5px; color:var(--mut); letter-spacing:.4px; }
+
+  /* legend */
+  .legend { display:flex; flex-wrap:wrap; align-items:center; gap:6px 4px; margin-top:56px; padding:12px 14px;
+            border:1.5px solid var(--ink); background:var(--sheet); }
+  .lg-title { font-family:var(--mono); font-size:9.5px; letter-spacing:1px; color:var(--mut); margin-right:10px; }
+  .legend button { display:inline-flex; align-items:center; gap:7px; font-family:var(--sans); font-size:12.5px; color:var(--ink);
+            background:none; border:1px solid var(--line); border-radius:2px; padding:4px 10px; cursor:pointer; }
+  .legend button i { width:11px; height:11px; border-radius:2px; display:inline-block; }
+  .legend button[aria-pressed="true"] { border-color:var(--ink); box-shadow:inset 0 0 0 1px var(--ink); }
+  .legend button:focus-visible, nav a:focus-visible { outline:2px solid var(--red); outline-offset:2px; }
+  .lg-note { font-family:var(--mono); font-size:9.5px; color:var(--mut); margin-left:8px; }
+
+  /* kind filter: dim every node group except the selected kind */
+  g.k { transition:opacity .18s ease; }
+  body[data-k="per"] g.k:not(.k-per),
+  body[data-k="sys"] g.k:not(.k-sys),
+  body[data-k="ext"] g.k:not(.k-ext),
+  body[data-k="cnt"] g.k:not(.k-cnt),
+  body[data-k="cmp"] g.k:not(.k-cmp) { opacity:.16; }
+
+  /* svg text + shapes */
+  svg text { font-family:var(--sans); }
+  .bt  { font-size:12px; font-weight:700; fill:#0d3a5c; }
+  .name{ font-size:12.5px; font-weight:700; fill:#fff; }
+  .desc{ font-size:9.5px; fill:#dbeafe; }
+  .nd  { font-size:12px; font-weight:700; fill:#0d3a5c; }
+  .dd  { font-size:9.5px; fill:#23425f; }
+  .tag { font-size:9px; fill:#cfe3f8; letter-spacing:.4px; }
+  .el  { font-size:9.5px; fill:#334155; paint-order:stroke; stroke:#F7FAFB; stroke-width:3px; stroke-linejoin:round; }
+  .note{ font-size:9.5px; fill:#475569; }
+  .bnd { fill:rgba(255,255,255,.45); stroke:#1168BD; stroke-width:1.2; stroke-dasharray:5 4; }
+  .per { fill:var(--c4-per); stroke:var(--ink); stroke-width:.75; }
+  .sys { fill:var(--c4-sys); stroke:var(--ink); stroke-width:.75; }
+  .ext { fill:var(--c4-ext); stroke:var(--ink); stroke-width:.75; }
+  .cnt { fill:var(--c4-cnt); stroke:var(--ink); stroke-width:.75; }
+  .cmp { fill:var(--c4-cmp); stroke:var(--ink); stroke-width:.75; }
+  .e   { stroke:#2E4257; stroke-width:1.3; fill:none; }
+  .ed  { stroke:#5E7183; stroke-width:1.2; fill:none; stroke-dasharray:5 4; }
+
+  @media (max-width:720px) {
+    header { flex-wrap:wrap; } .strip { text-align:left; margin-left:0; width:100%; }
+    h1 { font-size:30px; }
+  }
+  @media print {
+    body { background:#fff; } .legend, nav { display:none; }
+    section, figure.sheet { page-break-before:always; }
+    figure.sheet:first-of-type { page-break-before:avoid; }
+  }
+  @media (prefers-reduced-motion:reduce) { g.k { transition:none; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="mark" aria-hidden="true">
+    <svg width="34" height="34" viewBox="0 0 34 34" fill="none">
+      <rect x="1.5" y="1.5" width="31" height="31" stroke="#16283C" stroke-width="2"/>
+      <path d="M4 11h10M4 17h10M4 23h10" stroke="#16283C" stroke-width="2"/>
+      <path d="M20 11h10M20 17h10M20 23h10" stroke="#16283C" stroke-width="2"/>
+      <path d="M17 6v22" stroke="#A63D2F" stroke-width="2"/>
+    </svg>
+  </div>
+  <div>
+    <h1>SLUICE</h1>
+    <p class="sub">TCP / HTTP tunnel over a single gRPC bidirectional stream; the HTTP reverse proxy is its first consumer.</p>
+  </div>
+  <div class="strip">
+    <div>C4 MODEL &mdash; L1&ndash;L3</div>
+    <div>DWG <b>sluice-arch</b> / REV <b>A</b></div>
+    <div><b>2026-10-10</b> &mdash; maintained by hand</div>
+  </div>
+</header>
+
+<nav aria-label="Sheets">
+  <a href="#s1">Sheet 01 &mdash; Context</a>
+  <a href="#s2">Sheet 02 &mdash; Containers</a>
+  <a href="#s3">Sheet 03 &mdash; Components</a>
+  <a href="#notes">Notes</a>
+</nav>
+
+<main>
+  <section id="s1" aria-label="Sheet 01, system context">
+    <h2 class="vh">Level 1 &mdash; System Context</h2>
+    <figure class="sheet">
+      <div class="frame">
+        <svg viewBox="0 0 960 440" role="img" aria-label="C4 system context diagram">
+          <defs>
+            <marker id="arr1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="#2E4257"/>
+            </marker>
+          </defs>
+          <g class="k k-per">
+            <rect class="per" x="40" y="70" width="210" height="80" rx="3"/>
+            <text class="name" x="145" y="102" text-anchor="middle">HTTP client</text>
+            <text class="desc" x="145" y="120" text-anchor="middle">curl / browser / any TCP client</text>
+          </g>
+          <g class="k k-per">
+            <rect class="per" x="40" y="330" width="210" height="80" rx="3"/>
+            <text class="name" x="145" y="362" text-anchor="middle">Operator</text>
+            <text class="desc" x="145" y="380" text-anchor="middle">management console user</text>
+          </g>
+          <g class="k k-sys">
+            <rect class="sys" x="380" y="150" width="280" height="180" rx="3"/>
+            <text class="name" x="520" y="185" text-anchor="middle" font-size="15">sluice</text>
+            <text class="tag" x="520" y="203" text-anchor="middle">[Software System]</text>
+            <text class="desc" x="520" y="232" text-anchor="middle">HTTP / TCP tunnel over a</text>
+            <text class="desc" x="520" y="247" text-anchor="middle">single gRPC bidi stream</text>
+            <text class="desc" x="520" y="272" text-anchor="middle">Spring Boot 4.1 / Spring gRPC</text>
+            <text class="desc" x="520" y="287" text-anchor="middle">JVM / GraalVM native image</text>
+          </g>
+          <g class="k k-ext">
+            <rect class="ext" x="740" y="180" width="200" height="110" rx="3"/>
+            <text class="name" x="840" y="212" text-anchor="middle" font-size="12">Upstream applications</text>
+            <text class="tag" x="840" y="228" text-anchor="middle">[External System]</text>
+            <text class="desc" x="840" y="250" text-anchor="middle">HTTP / any TCP services</text>
+          </g>
+          <path class="e" d="M250,110 L380,195" marker-end="url(#arr1)"/>
+          <text class="el" x="300" y="128" text-anchor="middle">HTTP / TCP :8000</text>
+          <path class="e" d="M250,370 L380,290" marker-end="url(#arr1)"/>
+          <text class="el" x="300" y="326" text-anchor="middle">HTTPS :8081 /console</text>
+          <path class="e" d="M660,240 L740,240" marker-end="url(#arr1)"/>
+          <text class="el" x="700" y="226" text-anchor="middle">raw TCP relay</text>
+          <text class="el" x="700" y="264" text-anchor="middle" font-size="8.5">h1 / h2c / h2 / TLS / any TCP</text>
+        </svg>
+        <div class="tblock" aria-hidden="true">
+          <div><span class="l">Project</span><span class="v">SLUICE</span></div>
+          <div><span class="l">View</span><span class="v">C4 L1 &mdash; SYSTEM CONTEXT</span></div>
+          <div><span class="l">Sheet</span><span class="v">01 / 03</span></div>
+          <div><span class="l">Scale</span><span class="v">NTS</span></div>
+          <div><span class="l">Rev</span><span class="v">A</span></div>
+          <div><span class="l">Date</span><span class="v">2026-10-10</span></div>
+        </div>
+      </div>
+      <figcaption>Actors and the system boundary. The tunnel hides the topology: any TCP client reaches any upstream as if it were local.</figcaption>
+    </figure>
+  </section>
+
+  <section id="s2" aria-label="Sheet 02, containers">
+    <h2 class="vh">Level 2 &mdash; Containers</h2>
+    <figure class="sheet">
+      <div class="frame">
+        <svg viewBox="0 0 1200 890" role="img" aria-label="C4 container diagram">
+          <defs>
+            <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="#2E4257"/>
+            </marker>
+          </defs>
+          <g class="k k-per">
+            <rect class="per" x="20" y="120" width="180" height="80" rx="3"/>
+            <text class="name" x="110" y="150" text-anchor="middle" font-size="12">HTTP client</text>
+            <text class="desc" x="110" y="168" text-anchor="middle">curl / browser / any TCP</text>
+          </g>
+          <g class="k k-per">
+            <rect class="per" x="20" y="380" width="180" height="80" rx="3"/>
+            <text class="name" x="110" y="410" text-anchor="middle" font-size="12">Operator</text>
+            <text class="desc" x="110" y="428" text-anchor="middle">management console</text>
+          </g>
+          <rect class="bnd" x="230" y="30" width="450" height="430" rx="3"/>
+          <text class="bt" x="245" y="55">sluice-server &#8212; JVM / GraalVM native image</text>
+          <g class="k k-cnt">
+            <rect class="cnt" x="325" y="80" width="260" height="100" rx="3"/>
+            <text class="name" x="455" y="104" text-anchor="middle">Data plane</text>
+            <text class="desc" x="455" y="124" text-anchor="middle">DataProxyServer / TcpPortGateway</text>
+            <text class="desc" x="455" y="140" text-anchor="middle">raw TCP :8000 / optional TLS (ALPN h2)</text>
+            <text class="desc" x="455" y="156" text-anchor="middle">Host / SNI / listen-port routing, PROXY protocol</text>
+          </g>
+          <g class="k k-cnt">
+            <rect class="cnt" x="325" y="210" width="260" height="100" rx="3"/>
+            <text class="name" x="455" y="234" text-anchor="middle">Control plane</text>
+            <text class="desc" x="455" y="254" text-anchor="middle">TunnelService &#8212; sluice.v1.Tunnel gRPC</text>
+            <text class="desc" x="455" y="270" text-anchor="middle">bidi stream :8001 / token / TLS / mTLS</text>
+            <text class="desc" x="455" y="286" text-anchor="middle">Connect / ListNodes</text>
+          </g>
+          <g class="k k-cnt">
+            <rect class="cnt" x="325" y="340" width="260" height="80" rx="3"/>
+            <text class="name" x="455" y="364" text-anchor="middle">Console / Actuator</text>
+            <text class="desc" x="455" y="384" text-anchor="middle">:8081 / Mustache + htmx</text>
+            <text class="desc" x="455" y="400" text-anchor="middle">health / metrics / client-cert issuance</text>
+          </g>
+          <rect class="bnd" x="740" y="30" width="440" height="430" rx="3"/>
+          <text class="bt" x="755" y="55">sluice-client &#8212; JVM / GraalVM native image</text>
+          <g class="k k-cnt">
+            <rect class="cnt" x="835" y="80" width="250" height="100" rx="3"/>
+            <text class="name" x="960" y="104" text-anchor="middle" font-size="12">TunnelClient / NodeConnection</text>
+            <text class="desc" x="960" y="124" text-anchor="middle">one bidi stream per node</text>
+            <text class="desc" x="960" y="140" text-anchor="middle">reconnect backoff 1&#8211;30 s</text>
+          </g>
+          <g class="k k-cnt">
+            <rect class="cnt" x="835" y="210" width="250" height="100" rx="3"/>
+            <text class="name" x="960" y="234" text-anchor="middle">LocalConnector</text>
+            <text class="desc" x="960" y="254" text-anchor="middle">strict forwarding dial</text>
+            <text class="desc" x="960" y="270" text-anchor="middle">http:// tcp:// https:// (trust-all)</text>
+          </g>
+          <text class="note" x="757" y="395">actuator :9001</text>
+          <text class="note" x="757" y="410">health: per-node stream state</text>
+          <rect class="bnd" x="230" y="520" width="450" height="240" rx="3"/>
+          <text class="bt" x="245" y="545">sluice-wasmlet &#8212; Rust (experimental)</text>
+          <g class="k k-cnt">
+            <rect class="cnt" x="255" y="570" width="190" height="110" rx="3"/>
+            <text class="name" x="350" y="596" text-anchor="middle" font-size="12">wasm host</text>
+            <text class="desc" x="350" y="616" text-anchor="middle">wasmtime + hyper</text>
+            <text class="desc" x="350" y="632" text-anchor="middle">tunnel client in Rust</text>
+          </g>
+          <g class="k k-cnt">
+            <rect class="cnt" x="465" y="570" width="190" height="110" rx="3"/>
+            <text class="name" x="560" y="596" text-anchor="middle" font-size="12">wasi:http component</text>
+            <text class="desc" x="560" y="616" text-anchor="middle">wasm32-wasip3 handler</text>
+            <text class="desc" x="560" y="632" text-anchor="middle">HTTP terminated on the tunnel</text>
+          </g>
+          <g class="k k-ext">
+            <rect class="ext" x="740" y="560" width="250" height="110" rx="3"/>
+            <text class="name" x="865" y="592" text-anchor="middle" font-size="12">Upstream applications</text>
+            <text class="tag" x="865" y="608" text-anchor="middle">[External System]</text>
+            <text class="desc" x="865" y="630" text-anchor="middle">HTTP / any TCP services</text>
+          </g>
+          <path class="e" d="M200,160 L325,135" marker-end="url(#arr2)"/>
+          <text class="el" x="262" y="128" text-anchor="middle">HTTP / TCP :8000</text>
+          <path class="e" d="M455,180 L455,210" marker-end="url(#arr2)"/>
+          <text class="el" x="463" y="199">CONNECT / DATA / CLOSE per conn_id</text>
+          <path class="e" d="M585,260 L835,130" marker-end="url(#arr2)" marker-start="url(#arr2)"/>
+          <text class="el" x="700" y="222" text-anchor="middle">gRPC bidi :8001</text>
+          <text class="el" x="700" y="235" text-anchor="middle">token / TLS / mTLS</text>
+          <path class="e" d="M960,180 L960,210" marker-end="url(#arr2)"/>
+          <text class="el" x="968" y="199">CONNECT &#8594; dial</text>
+          <path class="e" d="M960,310 L865,560" marker-end="url(#arr2)"/>
+          <text class="el" x="922" y="468">TCP dial</text>
+          <path class="e" d="M200,420 L325,398" marker-end="url(#arr2)"/>
+          <text class="el" x="258" y="430" text-anchor="middle">HTTPS :8081 /console</text>
+          <path class="e" d="M300,570 L300,260 L325,260" marker-end="url(#arr2)"/>
+          <text class="el" x="306" y="498">gRPC bidi :8001</text>
+          <text class="el" x="306" y="511">(Rust client)</text>
+          <path class="e" d="M445,625 L465,625" marker-end="url(#arr2)"/>
+          <text class="el" x="455" y="612" text-anchor="middle" font-size="8.5">handle()</text>
+          <rect x="230" y="800" width="950" height="70" rx="3" fill="rgba(255,255,255,.6)" stroke="#5E7183" stroke-dasharray="4 3"/>
+          <text class="nd" x="245" y="822">shared tunnel primitives &#8212; sluice-proto (am.ik.sluice.tunnel)</text>
+          <text class="note" x="245" y="842">VirtualConnection: bounded 128 x 64 KiB per direction, half-close &#183; SessionSender: isReady()-aware sender thread</text>
+          <text class="note" x="245" y="858">SocketRelay: one virtual thread per direction &#183; DuplexPipe / FrameWriter</text>
+        </svg>
+        <div class="tblock" aria-hidden="true">
+          <div><span class="l">Project</span><span class="v">SLUICE</span></div>
+          <div><span class="l">View</span><span class="v">C4 L2 &mdash; CONTAINERS</span></div>
+          <div><span class="l">Sheet</span><span class="v">02 / 03</span></div>
+          <div><span class="l">Scale</span><span class="v">NTS</span></div>
+          <div><span class="l">Rev</span><span class="v">A</span></div>
+          <div><span class="l">Date</span><span class="v">2026-10-10</span></div>
+        </div>
+      </div>
+      <figcaption><b>Containers.</b> Deployable units and the ports they listen on. Server, client and wasmlet speak the same Frame protocol; the relay machinery lives in <code>sluice-proto</code>.</figcaption>
+    </figure>
+
+    <table class="sched">
+      <caption>SCHEDULE 1 &mdash; CONTAINERS</caption>
+      <tr><th>Container</th><th>Implementation</th><th>Port</th><th>Notes</th></tr>
+      <tr><td>Data plane</td><td><code>DataProxyServer</code> / <code>TcpPortGateway</code></td><td>8000 (<code>sluice.data-port</code>)</td>
+          <td>Raw-byte relay. Routes by <code>Host</code> / <code>:authority</code> / SNI / listen-port. PROXY protocol, TLS termination (ALPN h2 / h1 fallback), on-the-wire head rewrite (<code>preserve-host=false</code>).</td></tr>
+      <tr><td>Control plane</td><td><code>TunnelService</code> (gRPC)</td><td>8001</td>
+          <td><code>sluice.v1.Tunnel</code>: <code>Connect</code> (bidi) and <code>ListNodes</code>. token / TLS / mTLS (<code>TunnelAuthInterceptor</code>).</td></tr>
+      <tr><td>Console / Actuator</td><td><code>ConsoleController</code> et al.</td><td>8081</td>
+          <td><code>/console</code> (self-refresh 2s), <code>/actuator/*</code>, client-certificate issuance. Authenticated.</td></tr>
+      <tr><td>sluice-client</td><td><code>TunnelClient</code> / <code>NodeConnection</code> / <code>LocalConnector</code></td><td>9001 (actuator)</td>
+          <td>One bidi stream per node (learns nodes via ListNodes + MembershipUpdate). Reconnects with exponential backoff 1&ndash;30s. Advertises upstreams (<code>ADVERTISE</code>), dials on <code>CONNECT</code>.</td></tr>
+      <tr><td>sluice-wasmlet</td><td>Rust wasm host (wasmtime + hyper)</td><td>&ndash;</td>
+          <td>PoC. Terminates HTTP on the tunnel into a wasi:http 0.3 component instead of relaying to TCP upstreams.</td></tr>
+    </table>
+  </section>
+
+  <section id="s3" aria-label="Sheet 03, components">
+    <h2 class="vh">Level 3 &mdash; Components (data path)</h2>
+    <figure class="sheet">
+      <div class="frame">
+        <svg viewBox="0 0 1200 850" role="img" aria-label="C4 component diagram">
+          <defs>
+            <marker id="arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="#2E4257"/>
+            </marker>
+          </defs>
+          <rect class="bnd" x="20" y="40" width="660" height="600" rx="3"/>
+          <text class="bt" x="35" y="62">sluice-server &#8212; components</text>
+          <g class="k k-cmp"><rect class="cmp" x="45" y="90" width="180" height="90" rx="3"/>
+            <text class="nd" x="55" y="110">TcpPortGateway &#183;</text>
+            <text class="nd" x="55" y="124">DataProxyServer</text>
+            <text class="dd" x="55" y="144">listeners :8000 + per</text>
+            <text class="dd" x="55" y="157">listen-port; accept, peek head</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="265" y="90" width="180" height="90" rx="3"/>
+            <text class="nd" x="275" y="110">ConnectionHeadParser</text>
+            <text class="dd" x="275" y="130">Host / :authority / SNI</text>
+            <text class="dd" x="275" y="144">PROXY protocol / listen-port</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="485" y="90" width="180" height="90" rx="3"/>
+            <text class="nd" x="495" y="110">Host / Http1 / Http2</text>
+            <text class="nd" x="495" y="124">rewriters</text>
+            <text class="dd" x="495" y="144">on-wire head rewrite when</text>
+            <text class="dd" x="495" y="157">preserve-host=false</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="45" y="210" width="180" height="90" rx="3"/>
+            <text class="nd" x="55" y="230">AccessControl &#183;</text>
+            <text class="nd" x="55" y="244">AccessLogger</text>
+            <text class="dd" x="55" y="264">CIDR allow / deny,</text>
+            <text class="dd" x="55" y="277">per-connection audit</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="265" y="210" width="180" height="90" rx="3"/>
+            <text class="nd" x="275" y="230">Router</text>
+            <text class="nd" x="275" y="244">LoadBalanceStrategy</text>
+            <text class="dd" x="275" y="264">random / round-robin /</text>
+            <text class="dd" x="275" y="277">smallest-client-id</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="485" y="210" width="180" height="90" rx="3"/>
+            <text class="nd" x="495" y="230">SessionRegistry</text>
+            <text class="dd" x="495" y="250">conn_id &#8596; TunnelSession</text>
+            <text class="dd" x="495" y="264">drain bookkeeping</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="45" y="330" width="180" height="90" rx="3"/>
+            <text class="nd" x="55" y="350">MembershipBroadcaster &#183;</text>
+            <text class="nd" x="55" y="364">ClusterLifecycle</text>
+            <text class="dd" x="55" y="384">versioned membership,</text>
+            <text class="dd" x="55" y="397">graceful drain</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="265" y="330" width="180" height="90" rx="3"/>
+            <text class="nd" x="275" y="350">TunnelService (gRPC)</text>
+            <text class="dd" x="275" y="370">sluice.v1.Tunnel/Connect</text>
+            <text class="dd" x="275" y="384">Frame &#8596; virtual streams</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="485" y="330" width="180" height="90" rx="3"/>
+            <text class="nd" x="495" y="350">TunnelSession &#183;</text>
+            <text class="nd" x="495" y="364">SessionSender</text>
+            <text class="dd" x="495" y="384">per-conn egress,</text>
+            <text class="dd" x="495" y="397">isReady() backpressure</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="45" y="460" width="180" height="90" rx="3"/>
+            <text class="nd" x="55" y="480">TokenValidator &#183;</text>
+            <text class="nd" x="55" y="494">TunnelAuthInterceptor</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="265" y="460" width="180" height="90" rx="3"/>
+            <text class="nd" x="275" y="480">ClientCertificateIssuers &#183;</text>
+            <text class="nd" x="275" y="494">X509CertificateSigner</text>
+            <text class="dd" x="275" y="514">console PKI (mTLS)</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="485" y="460" width="180" height="90" rx="3"/>
+            <text class="nd" x="495" y="480">Console web &#183;</text>
+            <text class="nd" x="495" y="494">TunnelHealthIndicator</text></g>
+          <text class="note" x="35" y="585">lower row: management / PKI path (not the data-plane hot path)</text>
+
+          <rect class="bnd" x="760" y="40" width="420" height="600" rx="3"/>
+          <text class="bt" x="775" y="62">sluice-client &#8212; components</text>
+          <g class="k k-cmp"><rect class="cmp" x="870" y="90" width="200" height="90" rx="3"/>
+            <text class="nd" x="880" y="110">TunnelClient</text>
+            <text class="dd" x="880" y="130">bootstrap + membership;</text>
+            <text class="dd" x="880" y="144">reconnect backoff 1&#8211;30 s</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="870" y="210" width="200" height="90" rx="3"/>
+            <text class="nd" x="880" y="230">NodeConnection</text>
+            <text class="dd" x="880" y="250">one bidi stream per node;</text>
+            <text class="dd" x="880" y="264">Frame reader / writer loops</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="870" y="330" width="200" height="90" rx="3"/>
+            <text class="nd" x="880" y="350">LocalConnector</text>
+            <text class="dd" x="880" y="370">strict forwarding dial;</text>
+            <text class="dd" x="880" y="384">https:// (trust-all) / tcp://</text></g>
+          <text class="note" x="780" y="480">actuator :9001</text>
+          <text class="note" x="780" y="496">health: per-node stream state</text>
+          <text class="note" x="780" y="512">metrics: sluice_tunnel_bytes_total &#8230;</text>
+
+          <rect class="bnd" x="20" y="690" width="1160" height="130" rx="3" fill="rgba(255,255,255,.5)"/>
+          <text class="bt" x="35" y="712">sluice-proto &#8212; am.ik.sluice.tunnel (shared library)</text>
+          <g class="k k-cmp"><rect class="cmp" x="45" y="722" width="250" height="72" rx="3"/>
+            <text class="nd" x="55" y="742">VirtualConnection</text>
+            <text class="dd" x="55" y="760">bounded 128 x 64 KiB per direction,</text>
+            <text class="dd" x="55" y="774">half-close via CLOSE frame</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="320" y="722" width="250" height="72" rx="3"/>
+            <text class="nd" x="330" y="742">SessionSender</text>
+            <text class="dd" x="330" y="760">dedicated sender thread;</text>
+            <text class="dd" x="330" y="774">honors gRPC isReady() flow control</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="595" y="722" width="250" height="72" rx="3"/>
+            <text class="nd" x="605" y="742">SocketRelay</text>
+            <text class="dd" x="605" y="760">one virtual thread per direction;</text>
+            <text class="dd" x="605" y="774">raw byte pump</text></g>
+          <g class="k k-cmp"><rect class="cmp" x="870" y="722" width="250" height="72" rx="3"/>
+            <text class="nd" x="880" y="742">DuplexPipe &#183; FrameWriter</text>
+            <text class="dd" x="880" y="760">plumbing / Frame codec</text></g>
+
+          <path class="e" d="M225,135 L265,135" marker-end="url(#arr3)"/>
+          <path class="e" d="M445,135 L485,135" marker-end="url(#arr3)"/>
+          <path class="e" d="M355,180 L355,210" marker-end="url(#arr3)"/>
+          <path class="e" d="M135,180 L135,210" marker-end="url(#arr3)"/>
+          <path class="e" d="M445,255 L485,255" marker-end="url(#arr3)"/>
+          <path class="e" d="M575,300 L575,330" marker-end="url(#arr3)"/>
+          <path class="e" d="M485,375 L445,375" marker-end="url(#arr3)" marker-start="url(#arr3)"/>
+          <path class="e" d="M225,375 L265,375" marker-end="url(#arr3)"/>
+          <path class="e" d="M970,180 L970,210" marker-end="url(#arr3)"/>
+          <path class="e" d="M970,300 L970,330" marker-end="url(#arr3)"/>
+          <path class="ed" d="M870,255 L680,255" marker-end="url(#arr3)" marker-start="url(#arr3)"/>
+          <text class="el" x="775" y="240" text-anchor="middle">sluice.v1.Tunnel/Connect</text>
+          <text class="el" x="775" y="252" text-anchor="middle" font-size="8.5">bidi stream per node</text>
+          <path class="ed" d="M350,640 L350,690" marker-end="url(#arr3)"/>
+          <text class="el" x="358" y="668">shared library</text>
+        </svg>
+        <div class="tblock" aria-hidden="true">
+          <div><span class="l">Project</span><span class="v">SLUICE</span></div>
+          <div><span class="l">View</span><span class="v">C4 L3 &mdash; COMPONENTS (DATA PATH)</span></div>
+          <div><span class="l">Sheet</span><span class="v">03 / 03</span></div>
+          <div><span class="l">Scale</span><span class="v">NTS</span></div>
+          <div><span class="l">Rev</span><span class="v">A</span></div>
+          <div><span class="l">Date</span><span class="v">2026-10-10</span></div>
+        </div>
+      </div>
+      <figcaption><b>Components.</b> The data path through server and client, plus the shared library both depend on. The lower row is the management / PKI path, off the hot path.</figcaption>
+    </figure>
+  </section>
+
+  <section id="notes">
+    <h2>General notes</h2>
+    <ol>
+      <li>A single gRPC bidi stream multiplexes virtual TCP connections by <code>conn_id</code>. Frame types: <code>DATA / CONNECT / CLOSE / ERROR / ADVERTISE / ADVERTISE_ACK / KEEP_ALIVE / MEMBERSHIP_UPDATE / DRAIN</code>.</li>
+      <li>The data plane relays raw bytes; only the request head is inspected (for routing), rewritten on the wire when <code>preserve-host=false</code>. Honoring half-close (CLOSE frame) keeps keep-alive / WebSocket passthrough transparent.</li>
+      <li>Cluster: every client keeps one stream per node and each node holds the full route table (no shared store, no inter-node hop). <code>DRAIN</code> signals scale-down.</li>
+      <li>Security: token / TLS (<code>grpcs://</code>, verification skip via <code>sluice.insecure</code>) / mTLS. Client certificates are issued by the console CA (<code>sluice.ca-bundle</code>).</li>
+      <li>All blocking I/O runs on virtual threads; the sender side propagates backpressure into gRPC flow control via bounded queues + <code>isReady()</code>.</li>
+      <li>Level 4 (Code) is omitted on purpose: class-level diagrams would duplicate the source and go stale. For the code level, start from the relay core in <code>sluice-proto</code> &mdash; <code>am.ik.sluice.tunnel</code> (<code>VirtualConnection</code> / <code>SessionSender</code> / <code>SocketRelay</code> / <code>StreamRelay</code> / <code>DuplexPipe</code> / <code>FrameWriter</code>).</li>
+    </ol>
+    <p class="colophon">Sources: README.md / sluice-proto/src/main/proto/sluice/v1/tunnel.proto / module sources. sluice-wasmlet is experimental (PoC).</p>
+  </section>
+
+  <div class="legend" role="group" aria-label="Highlight element kind">
+    <span class="lg-title">LEGEND</span>
+    <button type="button" data-k="per" aria-pressed="false"><i style="background:var(--c4-per)"></i>Person</button>
+    <button type="button" data-k="sys" aria-pressed="false"><i style="background:var(--c4-sys)"></i>Software system</button>
+    <button type="button" data-k="ext" aria-pressed="false"><i style="background:var(--c4-ext)"></i>External system</button>
+    <button type="button" data-k="cnt" aria-pressed="false"><i style="background:var(--c4-cnt)"></i>Container</button>
+    <button type="button" data-k="cmp" aria-pressed="false"><i style="background:var(--c4-cmp)"></i>Component</button>
+    <span class="lg-note">solid arrow = relation / dashed = gRPC stream / dashed box = boundary</span>
+  </div>
+</main>
+
+<script>
+  const legend = document.querySelector('.legend');
+  legend.addEventListener('click', e => {
+    const btn = e.target.closest('button[data-k]');
+    if (!btn) return;
+    const on = btn.getAttribute('aria-pressed') === 'true';
+    legend.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', 'false'));
+    if (on) { delete document.body.dataset.k; } else {
+      btn.setAttribute('aria-pressed', 'true');
+      document.body.dataset.k = btn.dataset.k;
+    }
+  });
+</script>
+</body>
+</html>
