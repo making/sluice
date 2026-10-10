@@ -46,19 +46,11 @@ mod wasm_host;
 
 use pb::frame::Body;
 use pb::{Advertise, Error, Frame, Upstream};
-use wasm_host::{Loaded, Locator, Sandbox};
+use wasm_host::{Handler, Locator, Sandbox};
 
 struct Route {
     host: String,
     component: Locator,
-    sandbox: Sandbox,
-}
-
-/// A resolved route target: the shared `Loaded`, its optional warm-instance
-/// pool, and the sandbox its target names.
-struct ComponentEntry {
-    component: Arc<Loaded>,
-    pool: Option<Arc<wasm_host::Pool>>,
     sandbox: Sandbox,
 }
 
@@ -107,10 +99,10 @@ struct Shared {
     ca_pem: Option<Vec<u8>>,
     /// Upstreams advertised on every stream.
     advertised: Vec<Upstream>,
-    /// Target (`wasm:<locator>[?<sandbox>]`) -> component entry; the dial
-    /// address key. The target carries the sandbox, so routes sharing a
-    /// component with different sandboxes stay distinct.
-    components: HashMap<String, ComponentEntry>,
+    /// Target (`wasm:<locator>[?<sandbox>]`) -> its handler; the dial address
+    /// key. The target carries the sandbox, so routes sharing a component
+    /// with different sandboxes stay distinct.
+    components: HashMap<String, Arc<Handler>>,
 }
 
 /// One tunnel stream toward one node. The supervisor's `Arc` identity survives
@@ -250,7 +242,7 @@ async fn run(config: Config) -> Result<(), BoxError> {
     // Fetch / prewarm every component (fail fast). The target is the component
     // locator (`wasm:<url>`); the server passes it through verbatim as the dial
     // address and the client resolves it back.
-    let mut components: HashMap<String, ComponentEntry> = HashMap::new();
+    let mut components: HashMap<String, Arc<Handler>> = HashMap::new();
     let mut advertised = Vec::with_capacity(routes.len());
     for route in &routes {
         let target = route_target(&route.component.target().await?, &route.sandbox);
@@ -258,16 +250,7 @@ async fn run(config: Config) -> Result<(), BoxError> {
             Ok(component) => component,
             Err(e) => return Err(format!("wasm route '{}': {e}", route.host).into()),
         };
-        let pool = (route.sandbox.pool > 0)
-            .then(|| wasm_host::Pool::new(component.clone(), route.sandbox));
-        components.insert(
-            target.clone(),
-            ComponentEntry {
-                component,
-                pool,
-                sandbox: route.sandbox,
-            },
-        );
+        components.insert(target.clone(), Handler::new(component, route.sandbox));
         advertised.push(Upstream {
             host: route.host.clone(),
             target_url: target,
@@ -543,7 +526,7 @@ impl NodeTask {
                     }
                 }
                 Some(Body::Connect(connect)) => {
-                    let Some(entry) = self.shared.components.get(&connect.address) else {
+                    let Some(handler) = self.shared.components.get(&connect.address) else {
                         let _ = tx
                             .send(Frame {
                                 body: Some(Body::Error(Error {
@@ -556,16 +539,11 @@ impl NodeTask {
                     };
                     let (ctrl_tx, ctrl_rx) = mpsc::channel(SERVE_BUFFER);
                     registry.lock().unwrap().insert(connect.conn_id, ctrl_tx);
-                    let component = entry.component.clone();
-                    let pool = entry.pool.clone();
-                    let sandbox = entry.sandbox;
                     tokio::spawn(wasm_host::serve(
                         tx.clone(),
                         registry.clone(),
                         connect.conn_id,
-                        component,
-                        pool,
-                        sandbox,
+                        handler.clone(),
                         ctrl_rx,
                     ));
                 }

@@ -66,6 +66,16 @@ impl Guest for Component {
             balloon();
         }
 
+        if path == "/leak" {
+            // Pool demo: a guest leaking 1 MiB of linear memory per request.
+            std::hint::black_box(Box::leak(vec![0x41u8; 1024 * 1024].into_boxed_slice()));
+        }
+
+        if path == "/leak-handle" {
+            // Pool demo: a guest leaking a host resource handle.
+            std::mem::forget(wasi::http::types::Headers::new());
+        }
+
         if path == "/stream" {
             // 10 MiB in paced chunks: exercises the streaming response path
             // (bytes must reach the client while the body is still produced).
