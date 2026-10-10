@@ -11,14 +11,15 @@ import org.jspecify.annotations.Nullable;
 import am.ik.sluice.tunnel.DuplexPipe;
 
 /**
- * Wraps the local {@link DuplexPipe} of a relayed connection so that every request
- * heading towards the upstream carries the route authority: the HTTP/1.1 {@code Host}
- * header and the h2 {@code :authority} are rewritten per request, keeping keep-alive and
- * pipelined connections correct where the one-shot connection-head rewrite only ever saw
- * the first request. The upstream-facing direction is relayed untouched.
+ * Wraps the local {@link DuplexPipe} of a relayed HTTP/2 connection so that every
+ * request's {@code :authority} carries the route authority -- h2 multiplexes requests, so
+ * every HEADERS block is re-encoded, keeping connections correct where the one-shot
+ * connection-head rewrite only ever saw the first stream. (The HTTP/1.1 counterpart is
+ * the rerouting relay, which resolves the route of every request head.) The
+ * upstream-facing direction is relayed untouched.
  * <p>
- * Rewriting is best-effort: any structure the rewriter cannot reproduce (upgrades, non
- * ASCII heads, HPACK failures) degrades that connection to verbatim passthrough.
+ * Rewriting is best-effort: any structure the rewriter cannot reproduce (upgrades, HPACK
+ * failures) degrades that connection to verbatim passthrough.
  */
 final class HostRewritingPipe implements DuplexPipe {
 
@@ -35,16 +36,16 @@ final class HostRewritingPipe implements DuplexPipe {
 	}
 
 	/**
-	 * Wraps the pipe with a per-request head rewriter; {@code null} when the connection
-	 * must be relayed verbatim (TLS passthrough, hostless protocols, blank authority).
+	 * Wraps the pipe with a per-request authority rewriter; {@code null} when the
+	 * connection is not plain HTTP/2 (TLS passthrough, hostless protocols, h1 relayed by
+	 * the rerouting relay) or the authority is blank.
 	 */
 	static @Nullable HostRewritingPipe of(DuplexPipe delegate, ConnectionHeadParser.Head head, String authority) {
-		if (head.encrypted() || head.host() == null || authority == null || authority.isBlank()) {
+		boolean h2 = head.h2() != null || head.request() != null && "2".equals(head.request().version());
+		if (!h2 || head.encrypted() || head.host() == null || authority == null || authority.isBlank()) {
 			return null;
 		}
-		boolean h2 = head.h2() != null || head.request() != null && "2".equals(head.request().version());
-		Rewriter rewriter = h2 ? new Http2Rewriter(authority) : new Http1Rewriter(authority);
-		return new HostRewritingPipe(delegate, head.bytes(), rewriter);
+		return new HostRewritingPipe(delegate, head.bytes(), new Http2Rewriter(authority));
 	}
 
 	/** Consumes bytes of the local stream and emits the rewritten equivalents. */

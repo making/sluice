@@ -37,8 +37,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * End to end for the access log: an HTTP request through the data plane must emit one
- * {@code request} line (the head request only -- keep-alive successors are not parsed)
- * and one {@code conn ... event=close} line with the final byte counts, in logfmt.
+ * {@code request} line per request head (keep-alive successors included, each with its
+ * own route) and one {@code conn ... event=close} line with the final byte counts, in
+ * logfmt.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -178,7 +179,7 @@ class AccessLogE2ETest {
 	}
 
 	@Test
-	void keepAliveRequestsAreLoggedOncePerConnection() throws Exception {
+	void keepAliveRequestsAreLoggedPerRequest() throws Exception {
 		this.startClient();
 		this.clearEvents();
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
@@ -195,7 +196,7 @@ class AccessLogE2ETest {
 		}
 		List<String> events = this.awaitCloseEvent("log.local");
 		long requests = events.stream().filter(e -> e.startsWith("type=req id=")).count();
-		assertThat(requests).isEqualTo(1);
+		assertThat(requests).isEqualTo(2);
 	}
 
 	private static String field(String line, String key) {

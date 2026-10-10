@@ -296,9 +296,26 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			return false;
 		}
 		Router.Route route0 = route.get();
-		VirtualConnection connection = session.open(route0.address());
-		access.route(route0.routeTag()).connectionId(connection.connectionId());
+		access.route(route0.routeTag());
 		ConnectionHeadParser.Head.Request request = conn.head().request();
+		if (request != null && !conn.head().encrypted() && !"2".equals(request.version())) {
+			// plaintext HTTP/1.1: every request head is routed; keep-alive successors may
+			// belong to another client's upstream
+			ReroutingRelay rerouting = new ReroutingRelay(conn.pipe(), conn.head(), this.router, this.sessions,
+					this.accessControl, this.errorResponse, access, this.meterRegistry, route0, session, peer,
+					this.activeConnections::decrementAndGet);
+			this.activeConnections.incrementAndGet();
+			try {
+				rerouting.start();
+			}
+			catch (RuntimeException e) {
+				this.activeConnections.decrementAndGet();
+				throw e;
+			}
+			return true;
+		}
+		VirtualConnection connection = session.open(route0.address());
+		access.connectionId(connection.connectionId());
 		if (request != null) {
 			access.request(request.method(), request.path(), request.version());
 		}

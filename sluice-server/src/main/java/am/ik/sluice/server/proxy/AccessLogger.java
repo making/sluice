@@ -214,13 +214,21 @@ public class AccessLogger {
 
 		/**
 		 * Logs the head request of the connection; later requests on a keep-alive
-		 * connection are not parsed and not logged.
+		 * connection are logged by the rerouting relay with their own route.
 		 */
 		public void request(String method, String path, String version) {
+			this.request(this.route, method, path, version);
+		}
+
+		/**
+		 * Logs a request head with the route it resolved to, which differs from the
+		 * connection's when the request is rerouted.
+		 */
+		public void request(String routeTag, String method, String path, String version) {
 			if (!this.requestEnabled || this.noop || this.closed || this.owner == null || !this.owner.allowRequest()) {
 				return;
 			}
-			log.info("type=req id={} route={} method={} path={} http={} remote={}", this.id, this.route, method, path,
+			log.info("type=req id={} route={} method={} path={} http={} remote={}", this.id, routeTag, method, path,
 					version, this.remote);
 		}
 
