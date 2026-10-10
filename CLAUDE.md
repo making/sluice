@@ -29,6 +29,17 @@ The data plane relays raw bytes (the request head is inspected for routing; with
 - Console E2E tests use Playwright (`ConsoleE2ETest`); the first run downloads Chromium.
 - `.todo` numbers come from `.todo/claim-number.sh`.
 
+## Working a task
+
+A working happy path is not done. Failure paths, tests and docs must not overstate what the code does.
+
+- Treat every requirement, duty and acceptance item in the todo as a checklist. Before declaring done, map each item to the code that does it and the test that proves it. An item that is not done stays open in a todo and is reported, never silently dropped.
+- Enumerate the failure modes first: hangs (including waiting on host I/O, not just CPU), client disconnect at each phase, startup failure, resource exhaustion and leaks, partial or truncated output. Each one gets a test or an explicit todo.
+- Read the docs and caveats of the primitives you build on (e.g. wasmtime's `run_concurrent` cannot reliably race a timer inside its closure) before designing the error handling.
+- A test must fail without the behavior it names. Watch it fail first (bug fixes: always), and check that it exercises the configuration it claims: one source per setting, assertions on timing / counters where the result alone cannot tell.
+- Docs and comments claim only what a test demonstrates. "X bounds Y" needs a test where Y happens.
+- Before finishing, review your own diff as an adversarial reviewer would: what is uncovered, what does a passing test not actually check?
+
 ## Manual E2E check
 
 See "Run" in README.md.
