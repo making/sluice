@@ -254,7 +254,7 @@ async fn run(config: Config) -> Result<(), BoxError> {
         advertised.push(Upstream {
             host: route.host.clone(),
             target_url: target,
-            preserve_host: true,
+            rewrite_host: false,
             ..Default::default()
         });
     }
