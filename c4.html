@@ -327,7 +327,7 @@
       <caption>SCHEDULE 1 &mdash; CONTAINERS</caption>
       <tr><th>Container</th><th>Implementation</th><th>Port</th><th>Notes</th></tr>
       <tr><td>Data plane</td><td><code>DataProxyServer</code> / <code>TcpPortGateway</code></td><td>8000 (<code>sluice.data-port</code>)</td>
-          <td>Raw-byte relay. Routes by <code>Host</code> / <code>:authority</code> / SNI / listen-port. PROXY protocol, TLS termination (ALPN h2 / h1 fallback), on-the-wire head rewrite (<code>preserve-host=false</code>).</td></tr>
+          <td>Raw-byte relay. Routes by <code>Host</code> / <code>:authority</code> / SNI / listen-port. PROXY protocol, TLS termination (ALPN h2 / h1 fallback), on-the-wire head rewrite (<code>rewrite-host=true</code>).</td></tr>
       <tr><td>Control plane</td><td><code>TunnelService</code> (gRPC)</td><td>8001</td>
           <td><code>sluice.v1.Tunnel</code>: <code>Connect</code> (bidi) and <code>ListNodes</code>. token / TLS / mTLS (<code>TunnelAuthInterceptor</code>).</td></tr>
       <tr><td>Console / Actuator</td><td><code>ConsoleController</code> et al.</td><td>8081</td>
@@ -364,7 +364,7 @@
             <text class="nd" x="495" y="110">Host / Http1 / Http2</text>
             <text class="nd" x="495" y="124">rewriters</text>
             <text class="dd" x="495" y="144">on-wire head rewrite when</text>
-            <text class="dd" x="495" y="157">preserve-host=false</text></g>
+            <text class="dd" x="495" y="157">rewrite-host=true</text></g>
           <g class="k k-cmp"><rect class="cmp" x="45" y="210" width="180" height="90" rx="3"/>
             <text class="nd" x="55" y="230">AccessControl &#183;</text>
             <text class="nd" x="55" y="244">AccessLogger</text>
@@ -474,7 +474,7 @@
     <h2>General notes</h2>
     <ol>
       <li>A single gRPC bidi stream multiplexes virtual TCP connections by <code>conn_id</code>. Frame types: <code>DATA / CONNECT / CLOSE / ERROR / ADVERTISE / ADVERTISE_ACK / KEEP_ALIVE / MEMBERSHIP_UPDATE / DRAIN</code>.</li>
-      <li>The data plane relays raw bytes; only the request head is inspected (for routing), rewritten on the wire when <code>preserve-host=false</code>. Honoring half-close (CLOSE frame) keeps keep-alive / WebSocket passthrough transparent.</li>
+      <li>The data plane relays raw bytes; only the request head is inspected (for routing), rewritten on the wire when <code>rewrite-host=true</code>. Honoring half-close (CLOSE frame) keeps keep-alive / WebSocket passthrough transparent.</li>
       <li>Cluster: every client keeps one stream per node and each node holds the full route table (no shared store, no inter-node hop). <code>DRAIN</code> signals scale-down.</li>
       <li>Security: token / TLS (<code>grpcs://</code>, verification skip via <code>sluice.insecure</code>) / mTLS. Client certificates are issued by the console CA (<code>sluice.ca-bundle</code>).</li>
       <li>All blocking I/O runs on virtual threads; the sender side propagates backpressure into gRPC flow control via bounded queues + <code>isReady()</code>.</li>
