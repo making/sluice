@@ -26,6 +26,7 @@ use http_body_util::BodyExt as _;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_util::sync::PollSender;
+use wasmtime::AsContextMut as _;
 
 use crate::Ctrl;
 use crate::pb::frame::Body;
@@ -78,9 +79,11 @@ fn engine() -> &'static wasmtime::Engine {
         // A dedicated thread: guests run on tokio workers and can starve the
         // timer wheel with a busy loop, which would stall their own budget.
         let ticker = engine.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(EPOCH_TICK);
-            ticker.increment_epoch();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(EPOCH_TICK);
+                ticker.increment_epoch();
+            }
         });
         engine
     })
@@ -169,9 +172,10 @@ pub struct Loaded {
     /// skips them. Measured on the hello guest (see the ignored
     /// `instantiation_latency_reference`): ~260us full vs ~200us pre-linked
     /// (dev profile) per instantiation, i.e. the warm path stays far below a
-    /// millisecond -- so instances are NOT pooled: `Store::run_concurrent`
-    /// consumes the store, and guests legitimately keep module state across
-    /// requests, so reuse would need per-guest reentrancy knowledge.
+    /// millisecond -- so instances are not pooled by default. `pool=N` opts a
+    /// route into `Pool`, which amortizes even that by keeping whole
+    /// `(Store, Service)` units warm; pooling assumes stateless guests (see
+    /// `Pool`).
     service_pre: wasmtime_wasi_http::p3::bindings::ServicePre<Ctx>,
     /// Short component name (the locator's last path segment) for log prefixes.
     label: String,
@@ -203,7 +207,9 @@ impl Limits {
     /// Applies one `key=value` route option; false when the key is not a limit.
     fn set(&mut self, key: &str, value: &str) -> Result<bool, String> {
         let number = || -> Result<u64, String> {
-            value.parse().map_err(|_| format!("{key}: not a number '{value}'"))
+            value
+                .parse()
+                .map_err(|_| format!("{key}: not a number '{value}'"))
         };
         match key {
             "budget-ms" => self.budget = std::time::Duration::from_millis(number()?.max(1)),
@@ -266,7 +272,11 @@ impl Caps {
     /// Parses a comma-separated capability list (`cli,inherit-network`).
     pub fn parse(list: &str) -> Result<Caps, String> {
         let mut caps = Caps::default();
-        for name in list.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+        for name in list
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
             if name == Caps::HTTP {
                 continue;
             }
@@ -281,7 +291,9 @@ impl Caps {
         }
         let network = caps.inherit_network || caps.allow_ip_name_lookup || caps.tcp || caps.udp;
         if network && !caps.cli {
-            return Err("network capabilities need 'cli' (wasi:sockets is linked only with it)".into());
+            return Err(
+                "network capabilities need 'cli' (wasi:sockets is linked only with it)".into(),
+            );
         }
         Ok(caps)
     }
@@ -311,16 +323,19 @@ impl Caps {
     }
 }
 
-/// Everything a route configures for its instances: resource limits and
-/// WASI capabilities.
+/// Everything a route configures for its instances: resource limits, WASI
+/// capabilities and instance pooling.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct Sandbox {
     pub limits: Limits,
     pub caps: Caps,
+    /// Warm `(Store, Service)` units kept for the route (see `Pool`); 0
+    /// instantiates per request.
+    pub pool: usize,
 }
 
 impl Sandbox {
-    /// Parses the route query (`budget-ms=N&memory-mib=N&wasi=cli,tcp`).
+    /// Parses the route query (`budget-ms=N&memory-mib=N&pool=N&wasi=cli,tcp`).
     pub fn parse(query: &str) -> Result<Sandbox, String> {
         let mut sandbox = Sandbox::default();
         for pair in query.split('&').filter(|pair| !pair.is_empty()) {
@@ -329,9 +344,13 @@ impl Sandbox {
             };
             if key == "wasi" {
                 sandbox.caps = Caps::parse(value)?;
+            } else if key == "pool" {
+                sandbox.pool = value
+                    .parse()
+                    .map_err(|_| format!("pool: not a number '{value}'"))?;
             } else if !sandbox.limits.set(key, value)? {
                 return Err(format!(
-                    "unknown option '{key}' (budget-ms, memory-mib, wasi)"
+                    "unknown option '{key}' (budget-ms, memory-mib, pool, wasi)"
                 ));
             }
         }
@@ -349,6 +368,9 @@ impl Sandbox {
         }
         if self.limits.memory != defaults.memory {
             pairs.push(format!("memory-mib={}", self.limits.memory >> 20));
+        }
+        if self.pool > 0 {
+            pairs.push(format!("pool={}", self.pool));
         }
         let caps = self.caps.names();
         if !caps.is_empty() {
@@ -388,7 +410,11 @@ pub async fn load(locator: &Locator, caps: Caps) -> Result<Arc<Loaded>, String> 
     }
     let linker = linker(&engine, caps).map_err(|e| format!("linker: {e}"))?;
     let pre = linker.instantiate_pre(&component).map_err(|e| {
-        let hint = if caps.cli { "" } else { " (the route may need wasi=cli)" };
+        let hint = if caps.cli {
+            ""
+        } else {
+            " (the route may need wasi=cli)"
+        };
         format!("pre-instantiate {name}: {e:#}{hint}")
     })?;
     let service_pre =
@@ -439,8 +465,14 @@ impl Ctx {
         static REQUESTS: AtomicU64 = AtomicU64::new(1);
         let request = REQUESTS.fetch_add(1, Ordering::Relaxed);
         let mut wasi = wasmtime_wasi::WasiCtxBuilder::new();
-        wasi.stdout(GuestLog::new(format!("stdout [{label}#{request}] :: "), Output::Stdout));
-        wasi.stderr(GuestLog::new(format!("stderr [{label}#{request}] :: "), Output::Stderr));
+        wasi.stdout(GuestLog::new(
+            format!("stdout [{label}#{request}] :: "),
+            Output::Stdout,
+        ));
+        wasi.stderr(GuestLog::new(
+            format!("stderr [{label}#{request}] :: "),
+            Output::Stderr,
+        ));
         sandbox.caps.configure(&mut wasi);
         Self {
             table: wasmtime::component::ResourceTable::default(),
@@ -543,7 +575,10 @@ impl GuestLogState {
             out.push(b'\n');
         }
         #[cfg(test)]
-        tests::captured_log().lock().unwrap().extend_from_slice(&out);
+        tests::captured_log()
+            .lock()
+            .unwrap()
+            .extend_from_slice(&out);
         match self.output {
             Output::Stdout => std::io::stdout().lock().write_all(&out),
             Output::Stderr => std::io::stderr().lock().write_all(&out),
@@ -644,23 +679,26 @@ async fn failed(head_tx: mpsc::Sender<Head>, status: u16, message: String) {
 /// Forwards guest body frames to hyper until either side ends. A body error
 /// is relayed so hyper sees the truncation instead of a silent short body; a
 /// gone client just ends the relay and the guest drains through the pipe.
+/// False when the relay ended early (the client disappeared before the body
+/// did): the serving store's fate is then uncertain.
 async fn relay(
     mut body: http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, wasmtime_wasi_http::Error>,
     frame_tx: mpsc::Sender<RelayFrame>,
-) {
+) -> bool {
     while let Some(frame) = body.frame().await {
         match frame {
             Ok(frame) => {
                 if frame_tx.send(Ok(frame)).await.is_err() {
-                    return;
+                    return false;
                 }
             }
             Err(e) => {
                 let _ = frame_tx.send(Err(e.into())).await;
-                return;
+                return true;
             }
         }
     }
+    true
 }
 
 /// Maps a handler failure to its response: 504 when the epoch budget
@@ -673,28 +711,119 @@ fn failure(e: &wasmtime::Error) -> (u16, String) {
     }
 }
 
+/// The epoch ticks for a request budget: granular to the tick, at least one.
+fn budget_ticks(budget: std::time::Duration) -> u64 {
+    (budget.as_millis() as u64 / EPOCH_TICK_MS).max(1)
+}
+
+/// Serves one request on an already-instantiated `service`, within a store
+/// closure: re-arms nothing (the caller owns the deadline), converts the
+/// request, runs the handler, streams the response, and drains the request
+/// body. Reports whether the store came out of it cleanly.
+async fn serve_on(
+    accessor: &wasmtime::component::Accessor<Ctx>,
+    service: &wasmtime_wasi_http::p3::bindings::Service,
+    request: hyper::Request<hyper::body::Incoming>,
+    head: mpsc::Sender<Head>,
+    frames: mpsc::Sender<RelayFrame>,
+) -> Outcome {
+    let (req, pump) = accessor.with(|mut access| {
+        wasmtime_wasi_http::p3::Request::from_http(&mut access.data_mut().hooks, request)
+    });
+
+    let served = async {
+        match service.handle(accessor, req).await {
+            Ok(Ok(response)) => {
+                let http = accessor
+                    .with(|access| response.into_http(access, futures_util::future::ready(Ok(()))));
+                match http {
+                    Ok(http) => {
+                        let (parts, body) = http.into_parts();
+                        let _ = head.send(Head::Response(parts)).await;
+                        let ended = relay(body, frames).await;
+                        if ended {
+                            Outcome::Clean
+                        } else {
+                            // The relay ended early: the client disappeared.
+                            // The store is likely fine, but guest tasks may
+                            // still be draining -- recycle the unit.
+                            Outcome::Uncertain
+                        }
+                    }
+                    Err(e) => {
+                        failed(head, 500, format!("response conversion failed: {e}")).await;
+                        Outcome::Uncertain
+                    }
+                }
+            }
+            Ok(Err(code)) => {
+                failed(head, 502, format!("wasi error: {code:?}")).await;
+                // A guest-level error, no trap: the store is unharmed.
+                Outcome::Clean
+            }
+            Err(e) => {
+                let (status, message) = failure(&e);
+                failed(head, status, message).await;
+                Outcome::Uncertain
+            }
+        }
+    };
+    let (outcome, ()) = tokio::join!(served, async {
+        // Drains request-body bookkeeping; errors surface in the response path.
+        let _ = pump.await;
+    });
+    outcome
+}
+
+/// Turns the head / frame channels into the hyper response: the head as known,
+/// a synthesized failure, or a generic 500 when none arrived (the serving
+/// task died before any head).
+async fn realized(
+    mut head_rx: mpsc::Receiver<Head>,
+    frames: mpsc::Receiver<RelayFrame>,
+) -> hyper::Response<RelayBody> {
+    match head_rx.recv().await {
+        Some(Head::Response(parts)) => hyper::Response::from_parts(
+            parts,
+            http_body_util::StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(frames))
+                .boxed_unsync(),
+        ),
+        Some(Head::Failure(status, message)) => plain_response(status, message),
+        None => plain_response(500, "wasm handler failed".into()),
+    }
+}
+
 async fn respond(
+    pool: Option<&Pool>,
     loaded: &Loaded,
     sandbox: Sandbox,
-    req: hyper::Request<hyper::body::Incoming>,
+    request: hyper::Request<hyper::body::Incoming>,
 ) -> hyper::Response<RelayBody> {
-    let limits = sandbox.limits;
+    let mut request = request;
+    if let Some(pool) = pool {
+        let (head_tx, head_rx) = mpsc::channel::<Head>(1);
+        let (frame_tx, frame_rx) = mpsc::channel::<RelayFrame>(RELAY_BUFFER);
+        match pool.dispatch(request, head_tx, frame_tx) {
+            Ok(()) => return realized(head_rx, frame_rx).await,
+            Err(req) => request = req,
+        }
+    }
+
     let mut store = wasmtime::Store::new(engine(), Ctx::new(&sandbox, &loaded.label));
     store.limiter_async(|ctx| &mut ctx.limiter);
     // The deadline must exist before any wasm runs: with epoch interruption
     // enabled, a store without one traps on the first observed tick. The
     // budget thus covers instantiation and the handler alike.
-    store.set_epoch_deadline((limits.budget.as_millis() as u64 / EPOCH_TICK_MS).max(1));
+    store.set_epoch_deadline(budget_ticks(sandbox.limits.budget));
     let service = match loaded.service_pre.instantiate_async(&mut store).await {
         Ok(service) => service,
         Err(e) => return plain_response(500, format!("wasm instantiate failed: {e}")),
     };
-    let (req, pump) = wasmtime_wasi_http::p3::Request::from_http(&mut store.data_mut().hooks, req);
 
     // The response head is handed to hyper as soon as it is known; body frames
     // are relayed by the store task, which must outlive this future for the
     // guest to keep producing while hyper drains at the client's pace.
-    let (head_tx, mut head_rx) = mpsc::channel::<Head>(1);
+    let (head_tx, head_rx) = mpsc::channel::<Head>(1);
     let (frame_tx, frame_rx) = mpsc::channel::<RelayFrame>(RELAY_BUFFER);
 
     // A detached task: it ends when the response is fully relayed (or the
@@ -707,67 +836,289 @@ async fn respond(
             let head = head_tx.clone();
             let frames = frame_tx.clone();
             async move |accessor| {
-                let response = async {
-                    match service.handle(accessor, req).await {
-                        Ok(Ok(response)) => {
-                            let http = accessor.with(|store| {
-                                response.into_http(store, futures_util::future::ready(Ok(())))
-                            });
-                            match http {
-                                Ok(http) => {
-                                    let (parts, body) = http.into_parts();
-                                    let _ = head.send(Head::Response(parts)).await;
-                                    relay(body, frames).await;
-                                }
-                                Err(e) => {
-                                    failed(head, 500, format!("response conversion failed: {e}"))
-                                        .await;
-                                }
-                            }
-                        }
-                        Ok(Err(code)) => failed(head, 502, format!("wasi error: {code:?}")).await,
-                        Err(e) => {
-                            let (status, message) = failure(&e);
-                            failed(head, status, message).await
-                        }
-                    }
-                };
-                let ((), ()) = tokio::join!(response, async {
-                    // Drains request-body bookkeeping; errors surface in the response path.
-                    let _ = pump.await;
-                },);
+                serve_on(accessor, &service, request, head, frames).await;
             }
         });
         if let Err(e) = driven.await {
             eprintln!("[wasm] store ended with error: {e}");
             let (status, message) = failure(&e);
-            let _ = head_tx.try_send(Head::Failure(status, format!("wasm handler failed: {message}")));
+            let _ = head_tx.try_send(Head::Failure(
+                status,
+                format!("wasm handler failed: {message}"),
+            ));
             let _ = frame_tx.try_send(Err(e.into()));
         }
     });
 
-    match head_rx.recv().await {
-        Some(Head::Response(parts)) => hyper::Response::from_parts(
-            parts,
-            http_body_util::StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(frame_rx))
-                .boxed_unsync(),
-        ),
-        Some(Head::Failure(status, message)) => plain_response(status, message),
-        // The task died before any head (panic / abort).
-        None => plain_response(500, "wasm handler failed".into()),
+    realized(head_rx, frame_rx).await
+}
+
+// ---------------------------------------------------------------------------
+// Instance pool
+
+/// Whether a unit's store came out of a request reusable.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Outcome {
+    /// Normal end: the unit is reusable once its resource table drains.
+    Clean,
+    /// A trap, a failed conversion or an interrupted relay: unit state is
+    /// uncertain, retire it.
+    Uncertain,
+}
+
+/// One request handed to a pooled unit.
+struct Job {
+    request: hyper::Request<hyper::body::Incoming>,
+    head: mpsc::Sender<Head>,
+    frames: mpsc::Sender<RelayFrame>,
+}
+
+/// A per-route pool of warm `(Store, Service)` units: each unit is a detached
+/// task owning its store for its lifetime, running `run_concurrent` once
+/// (which consumes the store) with a per-request job loop inside. A unit
+/// serves one request at a time; the pool's size is the warm concurrency, and
+/// requests beyond it fall back to the per-request path (`respond`), so the
+/// pool only ever improves the warm latency.
+///
+/// Reuse assumes stateless / reentrant-safe guests: module state legitimately
+/// persists across a unit's requests. A guest that misbehaves poisons its own
+/// unit only -- traps, failed conversions and interrupted relays retire it,
+/// and a retired unit is replaced while stock lasts.
+pub struct Pool {
+    loaded: Arc<Loaded>,
+    sandbox: Sandbox,
+    state: Mutex<PoolState>,
+}
+
+struct PoolState {
+    /// Senders to idle units; one entry per waiting unit.
+    idle: Vec<mpsc::Sender<Job>>,
+    /// Live unit tasks.
+    units: usize,
+    /// Units ever spawned; growth beyond the target signals recycling
+    /// (diagnostics, and asserted in tests).
+    spawned: usize,
+    /// Requests served by a pooled unit instead of the per-request path.
+    served: usize,
+}
+
+impl Pool {
+    /// Spawns `sandbox.pool` units. Each instantiates asynchronously; a job
+    /// handed to a not-yet-ready unit queues behind the instantiate.
+    pub fn new(loaded: Arc<Loaded>, sandbox: Sandbox) -> Arc<Self> {
+        let pool = Arc::new(Self {
+            state: Mutex::new(PoolState {
+                idle: Vec::new(),
+                units: 0,
+                spawned: 0,
+                served: 0,
+            }),
+            loaded,
+            sandbox,
+        });
+        for _ in 0..pool.sandbox.pool {
+            let mut state = pool.state.lock().unwrap();
+            state.units += 1;
+            drop(state);
+            // spawn_unit takes the lock itself: never called under ours.
+            Self::spawn_unit(pool.clone());
+        }
+        pool
     }
+
+    /// Starts one unit: its channel goes idle immediately, before the
+    /// instance exists.
+    fn spawn_unit(pool: Arc<Pool>) {
+        let (tx, rx) = mpsc::channel::<Job>(1);
+        {
+            let mut state = pool.state.lock().unwrap();
+            state.spawned += 1;
+            state.idle.push(tx.clone());
+        }
+        tokio::spawn(run_unit(pool, tx, rx));
+    }
+
+    /// Hands the request to an idle unit. `Err(request)` when none accepted
+    /// it (no stock, or a unit vanished): the caller instantiates per request.
+    fn dispatch(
+        &self,
+        mut request: hyper::Request<hyper::body::Incoming>,
+        head: mpsc::Sender<Head>,
+        frames: mpsc::Sender<RelayFrame>,
+    ) -> Result<(), hyper::Request<hyper::body::Incoming>> {
+        loop {
+            let Some(tx) = self.state.lock().unwrap().idle.pop() else {
+                return Err(request);
+            };
+            let job = Job {
+                request,
+                head: head.clone(),
+                frames: frames.clone(),
+            };
+            request = match tx.try_send(job) {
+                Ok(()) => {
+                    self.state.lock().unwrap().served += 1;
+                    return Ok(());
+                }
+                // A unit died since it went idle; its entry is stale.
+                Err(tokio::sync::mpsc::error::TrySendError::Full(job))
+                | Err(tokio::sync::mpsc::error::TrySendError::Closed(job)) => job.request,
+            };
+        }
+    }
+
+    // Diagnostics, asserted in tests.
+    #[cfg(test)]
+    fn units(&self) -> usize {
+        self.state.lock().unwrap().units
+    }
+
+    /// Units ever spawned.
+    #[cfg(test)]
+    fn spawned(&self) -> usize {
+        self.state.lock().unwrap().spawned
+    }
+
+    /// Requests served by the pool.
+    #[cfg(test)]
+    fn served(&self) -> usize {
+        self.state.lock().unwrap().served
+    }
+
+    /// Idle units.
+    #[cfg(test)]
+    fn idle(&self) -> usize {
+        self.state.lock().unwrap().idle.len()
+    }
+}
+
+/// Runs at unit exit, however it exits: frees the slot and, unless the unit
+/// never got viable, spawns a replacement while the pool is below target.
+struct Retire {
+    pool: Arc<Pool>,
+    /// False when the unit never served (e.g. its instantiate failed): the
+    /// pool shrinks instead of respawning into the same failure.
+    replace: bool,
+}
+
+impl Drop for Retire {
+    fn drop(&mut self) {
+        let respawn = {
+            let mut state = self.pool.state.lock().unwrap();
+            state.units -= 1;
+            let respawn = self.replace && state.units < self.pool.sandbox.pool;
+            if respawn {
+                state.units += 1;
+            }
+            respawn
+        };
+        if respawn {
+            Pool::spawn_unit(self.pool.clone());
+        }
+    }
+}
+
+/// The body of one pooled unit.
+async fn run_unit(pool: Arc<Pool>, tx: mpsc::Sender<Job>, mut rx: mpsc::Receiver<Job>) {
+    let mut retire = Retire {
+        pool: pool.clone(),
+        replace: true,
+    };
+    let loaded = pool.loaded.clone();
+    let mut store = wasmtime::Store::new(engine(), Ctx::new(&pool.sandbox, &loaded.label));
+    store.limiter_async(|ctx| &mut ctx.limiter);
+    // As in `respond`: the deadline must exist before any wasm runs.
+    store.set_epoch_deadline(budget_ticks(pool.sandbox.limits.budget));
+    let service = match loaded.service_pre.instantiate_async(&mut store).await {
+        Ok(service) => service,
+        Err(e) => {
+            eprintln!("[wasm] pooled instance of {} failed: {e}", loaded.label);
+            retire.replace = false;
+            return;
+        }
+    };
+
+    // The in-flight job's channels, for the failure fallback after a store
+    // level death: the serving closure is gone by then, but its job's head
+    // and body must still be failed / marked truncated, as on the per
+    // request path.
+    let inflight: Arc<Mutex<Option<(mpsc::Sender<Head>, mpsc::Sender<RelayFrame>)>>> =
+        Arc::new(Mutex::new(None));
+    let reported = inflight.clone();
+
+    let driven = store.run_concurrent(async move |accessor| {
+        while let Some(job) = rx.recv().await {
+            *inflight.lock().unwrap() = Some((job.head.clone(), job.frames.clone()));
+            // The budget covers handler, request body drain and response
+            // relay alike; re-armed per request (the deadline is relative to
+            // now). A unit idle past its budget just re-arms on the next
+            // job; no wasm runs to trap in between.
+            accessor.with(|mut store| {
+                store
+                    .as_context_mut()
+                    .set_epoch_deadline(budget_ticks(pool.sandbox.limits.budget))
+            });
+
+            let outcome = serve_on(accessor, &service, job.request, job.head, job.frames).await;
+            *inflight.lock().unwrap() = None;
+
+            // Reuse only a clean unit with an emptied resource table; table
+            // leftovers mean guest state leaked into this store: retire.
+            let reusable = match outcome {
+                Outcome::Uncertain => false,
+                Outcome::Clean => {
+                    let e0 = accessor.with(|mut store| store.data_mut().table.is_empty());
+                    e0
+                }
+            };
+            if reusable {
+                pool.state.lock().unwrap().idle.push(tx.clone());
+            } else {
+                if outcome == Outcome::Uncertain {
+                    eprintln!(
+                        "[wasm] recycling {} pool unit after uncertain request",
+                        pool.loaded.label
+                    );
+                } else {
+                    eprintln!(
+                        "[wasm] recycling {} pool unit: resource table left dirty",
+                        pool.loaded.label
+                    );
+                }
+                break;
+            }
+        }
+    });
+
+    if let Err(e) = driven.await {
+        eprintln!(
+            "[wasm] pooled store for {} ended with error: {e}",
+            loaded.label
+        );
+        if let Some((head, frames)) = reported.lock().unwrap().take() {
+            let (status, message) = failure(&e);
+            let _ = head.try_send(Head::Failure(
+                status,
+                format!("wasm handler failed: {message}"),
+            ));
+            let _ = frames.try_send(Err(e.into()));
+        }
+    }
+    // `retire` drops here: the slot frees and a replacement spawns.
 }
 
 // ---------------------------------------------------------------------------
 // Tunnel <-> hyper byte stream adapter
 
 /// Serves one tunnel connection by feeding its frames through hyper and the
-/// guest component; http/1.1 and h2c are auto-detected.
+/// guest component; http/1.1 and h2c are auto-detected. `pool` is the route's
+/// warm-instance pool, shared across connections.
 pub async fn serve(
     tx: mpsc::Sender<Frame>,
     registry: crate::Registry,
     conn_id: i64,
     component: Arc<Loaded>,
+    pool: Option<Arc<Pool>>,
     sandbox: Sandbox,
     ctrl: mpsc::Receiver<Ctrl>,
 ) {
@@ -788,7 +1139,12 @@ pub async fn serve(
 
     let service = hyper::service::service_fn(move |req| {
         let component = component.clone();
-        async move { Ok::<_, std::convert::Infallible>(respond(&component, sandbox, req).await) }
+        let pool = pool.clone();
+        async move {
+            Ok::<_, std::convert::Infallible>(
+                respond(pool.as_deref(), &component, sandbox, req).await,
+            )
+        }
     });
     let served = if h2 {
         hyper::server::conn::http2::Builder::new(TokioExecutor)
@@ -1028,9 +1384,7 @@ mod tests {
                 wasmtime::Store::new(linker.engine(), Ctx::new(&Sandbox::default(), "bench"));
             store.set_epoch_deadline(u64::MAX / 2);
             let _ = wasmtime_wasi_http::p3::bindings::Service::instantiate_async(
-                &mut store,
-                component,
-                linker,
+                &mut store, component, linker,
             )
             .await?;
             Ok(())
@@ -1060,16 +1414,73 @@ mod tests {
             pre_linked(&pre).await.unwrap();
         }
         let pre = started.elapsed() / iterations;
-        println!("full instantiate: {full:?} / pre-linked instantiate: {pre:?} (mean of {iterations})");
+        println!(
+            "full instantiate: {full:?} / pre-linked instantiate: {pre:?} (mean of {iterations})"
+        );
+    }
+
+    /// Reference throughput for the cold vs pooled request path, backing the
+    /// pool evaluation recorded in the todo history. End-to-end over the
+    /// in-process tunnel on the hello guest. Run with:
+    /// `cargo test -p sluice-wasmlet --bin sluice-wasmlet load_comparison -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "reference numbers; run manually with --nocapture"]
+    async fn load_comparison_reference() {
+        let loaded = load(&Locator::File(hello_wasm()), Caps::default())
+            .await
+            .unwrap();
+        let request = "GET / HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n";
+        let iterations = 200;
+
+        for _ in 0..20 {
+            exchange(&loaded, None, Sandbox::default(), request).await;
+        }
+        let started = Instant::now();
+        for _ in 0..iterations {
+            exchange(&loaded, None, Sandbox::default(), request).await;
+        }
+        let cold = started.elapsed() / iterations;
+
+        let pool = pool_of(loaded.clone(), 4);
+        for _ in 0..20 {
+            exchange(&loaded, Some(pool.clone()), Sandbox::default(), request).await;
+        }
+        let started = Instant::now();
+        for _ in 0..iterations {
+            exchange(&loaded, Some(pool.clone()), Sandbox::default(), request).await;
+        }
+        let pooled = started.elapsed() / iterations;
+        assert_eq!(
+            pool.served(),
+            (20 + iterations) as usize,
+            "every measured request pooled"
+        );
+
+        println!(
+            "cold: {cold:?} / pooled(4): {pooled:?} per request (mean of {iterations}, dev profile)"
+        );
     }
 
     /// Drives one request through `serve` over in-memory frame channels and
     /// returns the raw response bytes up to the tunnel Close.
-    async fn exchange(loaded: &std::sync::Arc<Loaded>, sandbox: Sandbox, request: &str) -> String {
+    async fn exchange(
+        loaded: &std::sync::Arc<Loaded>,
+        pool: Option<std::sync::Arc<Pool>>,
+        sandbox: Sandbox,
+        request: &str,
+    ) -> String {
         let (tx, mut rx) = mpsc::channel::<Frame>(64);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<Ctrl>(32);
         let registry = crate::Registry::default();
-        tokio::spawn(serve(tx, registry, 1, loaded.clone(), sandbox, ctrl_rx));
+        tokio::spawn(serve(
+            tx,
+            registry,
+            1,
+            loaded.clone(),
+            pool,
+            sandbox,
+            ctrl_rx,
+        ));
         ctrl_tx
             .send(Ctrl::Payload(request.as_bytes().to_vec()))
             .await
@@ -1089,11 +1500,51 @@ mod tests {
         String::from_utf8(raw).expect("utf8 response")
     }
 
+    /// `exchange` for binary bodies: the raw response bytes.
+    async fn exchange_raw(
+        loaded: &std::sync::Arc<Loaded>,
+        pool: Option<std::sync::Arc<Pool>>,
+        sandbox: Sandbox,
+        request: &str,
+    ) -> Vec<u8> {
+        let (tx, mut rx) = mpsc::channel::<Frame>(64);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<Ctrl>(32);
+        let registry = crate::Registry::default();
+        tokio::spawn(serve(
+            tx,
+            registry,
+            1,
+            loaded.clone(),
+            pool,
+            sandbox,
+            ctrl_rx,
+        ));
+        ctrl_tx
+            .send(Ctrl::Payload(request.as_bytes().to_vec()))
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        loop {
+            let Some(frame) = rx.recv().await else {
+                break;
+            };
+            match frame.body.expect("frame body") {
+                Body::Data(data) => raw.extend_from_slice(&data.payload),
+                Body::Close(..) => break,
+                _ => {}
+            }
+        }
+        assert!(!raw.is_empty(), "no response bytes");
+        raw
+    }
+
     /// A guest overrunning its epoch budget degrades to a clean 504 and the
     /// next request on the same component is unaffected.
     #[tokio::test]
     async fn budget_exhaustion_is_a_504_and_later_requests_keep_serving() {
-        let loaded = load(&Locator::File(hello_wasm()), Caps::default()).await.unwrap();
+        let loaded = load(&Locator::File(hello_wasm()), Caps::default())
+            .await
+            .unwrap();
         let sandbox = Sandbox {
             limits: Limits {
                 budget: Duration::from_millis(100),
@@ -1103,6 +1554,7 @@ mod tests {
         };
         let body = exchange(
             &loaded,
+            None,
             sandbox,
             "GET /spin HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
         )
@@ -1112,6 +1564,7 @@ mod tests {
 
         let body = exchange(
             &loaded,
+            None,
             Sandbox::default(),
             "GET / HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
         )
@@ -1123,7 +1576,9 @@ mod tests {
     /// instead of OOM-ing the process, and later requests keep serving.
     #[tokio::test]
     async fn memory_cap_yields_a_clean_error_and_later_requests_keep_serving() {
-        let loaded = load(&Locator::File(hello_wasm()), Caps::default()).await.unwrap();
+        let loaded = load(&Locator::File(hello_wasm()), Caps::default())
+            .await
+            .unwrap();
         // above the guest's instantiation footprint, below its ballooning
         let sandbox = Sandbox {
             limits: Limits {
@@ -1134,6 +1589,7 @@ mod tests {
         };
         let body = exchange(
             &loaded,
+            None,
             sandbox,
             "GET /balloon HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
         )
@@ -1142,6 +1598,7 @@ mod tests {
 
         let body = exchange(
             &loaded,
+            None,
             sandbox,
             "GET / HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
         )
@@ -1160,7 +1617,15 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Frame>(64);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<Ctrl>(32);
         let registry = crate::Registry::default();
-        tokio::spawn(serve(tx, registry, 1, loaded, Sandbox::default(), ctrl_rx));
+        tokio::spawn(serve(
+            tx,
+            registry,
+            1,
+            loaded,
+            None,
+            Sandbox::default(),
+            ctrl_rx,
+        ));
 
         ctrl_tx
             .send(Ctrl::Payload(
@@ -1219,9 +1684,12 @@ mod tests {
     /// under `wasmtime serve`.
     #[tokio::test]
     async fn guest_stdio_lands_in_the_log_with_a_request_prefix() {
-        let loaded = load(&Locator::File(hello_wasm()), Caps::default()).await.unwrap();
+        let loaded = load(&Locator::File(hello_wasm()), Caps::default())
+            .await
+            .unwrap();
         let body = exchange(
             &loaded,
+            None,
             Sandbox::default(),
             "GET /log HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
         )
@@ -1231,7 +1699,9 @@ mod tests {
         let log = String::from_utf8_lossy(&captured_log().lock().unwrap()).into_owned();
         let line = |stream: &str, text: &str| {
             log.lines()
-                .find(|line| line.starts_with(&format!("{stream} [hello.wasm#")) && line.ends_with(text))
+                .find(|line| {
+                    line.starts_with(&format!("{stream} [hello.wasm#")) && line.ends_with(text)
+                })
                 .map(str::to_string)
         };
         let stdout = line("stdout", "] :: hello stdout: Method::Get /log body_bytes=0")
@@ -1239,7 +1709,15 @@ mod tests {
         let stderr = line("stderr", "] :: hello stderr: Method::Get /log")
             .unwrap_or_else(|| panic!("stderr line missing in: {log}"));
         // one request, one id
-        let id = |line: &str| line.split_once('#').unwrap().1.split_once(']').unwrap().0.to_string();
+        let id = |line: &str| {
+            line.split_once('#')
+                .unwrap()
+                .1
+                .split_once(']')
+                .unwrap()
+                .0
+                .to_string()
+        };
         assert_eq!(id(&stdout), id(&stderr));
     }
 
@@ -1260,7 +1738,10 @@ mod tests {
             .lines()
             .filter_map(|line| line.strip_prefix(prefix).map(str::to_string))
             .collect();
-        assert_eq!(lines, ["x".repeat(GUEST_LOG_LINE_MAX + 10), "tail".to_string()]);
+        assert_eq!(
+            lines,
+            ["x".repeat(GUEST_LOG_LINE_MAX + 10), "tail".to_string()]
+        );
     }
 
     /// A raw TCP upstream: reads each request head, answers `pong` (HTTP/1.0,
@@ -1296,15 +1777,20 @@ mod tests {
     #[tokio::test]
     async fn granted_network_lets_the_guest_dial_a_tcp_upstream() {
         let caps = Caps::parse("cli,inherit-network").unwrap();
-        let loaded = load(&Locator::File(guest_wasm("relay")), caps).await.unwrap();
+        let loaded = load(&Locator::File(guest_wasm("relay")), caps)
+            .await
+            .unwrap();
         let upstream = pong_upstream().await;
         let sandbox = Sandbox {
             caps,
             ..Sandbox::default()
         };
-        let body = exchange(&loaded, sandbox, &relay_request(upstream)).await;
+        let body = exchange(&loaded, None, sandbox, &relay_request(upstream)).await;
         assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
-        assert!(body.contains(&format!("relayed from {upstream}")), "body: {body}");
+        assert!(
+            body.contains(&format!("relayed from {upstream}")),
+            "body: {body}"
+        );
         assert!(body.contains("HTTP/1.0 200 OK\r\n\r\npong"), "body: {body}");
     }
 
@@ -1316,23 +1802,27 @@ mod tests {
         let upstream = pong_upstream().await;
         for granted in ["cli", "cli,tcp"] {
             let caps = Caps::parse(granted).unwrap();
-            let loaded = load(&Locator::File(guest_wasm("relay")), caps).await.unwrap();
+            let loaded = load(&Locator::File(guest_wasm("relay")), caps)
+                .await
+                .unwrap();
             let sandbox = Sandbox {
                 caps,
                 ..Sandbox::default()
             };
-            let body = exchange(&loaded, sandbox, &relay_request(upstream)).await;
+            let body = exchange(&loaded, None, sandbox, &relay_request(upstream)).await;
             assert!(body.starts_with("HTTP/1.1 502"), "{granted}: {body}");
             assert!(body.contains("AccessDenied"), "{granted}: {body}");
         }
 
         let caps = Caps::parse("cli,inherit-network").unwrap();
-        let loaded = load(&Locator::File(guest_wasm("relay")), caps).await.unwrap();
+        let loaded = load(&Locator::File(guest_wasm("relay")), caps)
+            .await
+            .unwrap();
         let sandbox = Sandbox {
             caps,
             ..Sandbox::default()
         };
-        let body = exchange(&loaded, sandbox, &relay_request(upstream)).await;
+        let body = exchange(&loaded, None, sandbox, &relay_request(upstream)).await;
         assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
     }
 
@@ -1365,7 +1855,8 @@ mod tests {
     /// link (or a misleading `wasi=cli` hint).
     #[tokio::test]
     async fn loading_a_p2_component_is_rejected_as_unsupported() {
-        let path = std::env::temp_dir().join(format!("sluice-p2-import-{}.wat", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("sluice-p2-import-{}.wat", std::process::id()));
         std::fs::write(
             &path,
             r#"(component
@@ -1379,7 +1870,10 @@ mod tests {
                 Ok(_) => panic!("{caps:?} loaded a p2 component"),
                 Err(error) => error,
             };
-            assert!(error.contains("imports wasi:cli/environment@0.2.6"), "{error}");
+            assert!(
+                error.contains("imports wasi:cli/environment@0.2.6"),
+                "{error}"
+            );
             assert!(error.contains("wasi p2 is unsupported"), "{error}");
         }
     }
@@ -1404,12 +1898,17 @@ mod tests {
     /// `wasmtime serve`: the guest calls the upstream and composes its reply.
     #[tokio::test]
     async fn outgoing_http_needs_no_capability() {
-        let loaded = load(&Locator::File(guest_wasm("fetch")), Caps::default()).await.unwrap();
+        let loaded = load(&Locator::File(guest_wasm("fetch")), Caps::default())
+            .await
+            .unwrap();
         let upstream = pong_upstream().await;
         let url = format!("http://{upstream}/ping?x=1");
-        let body = exchange(&loaded, Sandbox::default(), &fetch_request(&url)).await;
+        let body = exchange(&loaded, None, Sandbox::default(), &fetch_request(&url)).await;
         assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
-        assert!(body.contains(&format!("fetched {url} -> 200\n")), "body: {body}");
+        assert!(
+            body.contains(&format!("fetched {url} -> 200\n")),
+            "body: {body}"
+        );
         assert!(body.contains("pong"), "body: {body}");
     }
 
@@ -1417,7 +1916,9 @@ mod tests {
     /// guest as an `ErrorCode` (rendered as a 502); later requests keep serving.
     #[tokio::test]
     async fn outgoing_http_failure_reaches_the_guest_and_later_requests_keep_serving() {
-        let loaded = load(&Locator::File(guest_wasm("fetch")), Caps::default()).await.unwrap();
+        let loaded = load(&Locator::File(guest_wasm("fetch")), Caps::default())
+            .await
+            .unwrap();
         // accepts and hangs up without a response
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let hangup = listener.local_addr().unwrap();
@@ -1427,13 +1928,200 @@ mod tests {
             }
         });
         let url = format!("http://{hangup}/");
-        let body = exchange(&loaded, Sandbox::default(), &fetch_request(&url)).await;
+        let body = exchange(&loaded, None, Sandbox::default(), &fetch_request(&url)).await;
         assert!(body.starts_with("HTTP/1.1 502"), "head: {body}");
-        assert!(body.contains(&format!("fetch {url} failed: ErrorCode::")), "body: {body}");
+        assert!(
+            body.contains(&format!("fetch {url} failed: ErrorCode::")),
+            "body: {body}"
+        );
 
         let upstream = pong_upstream().await;
         let url = format!("http://{upstream}/");
-        let body = exchange(&loaded, Sandbox::default(), &fetch_request(&url)).await;
+        let body = exchange(&loaded, None, Sandbox::default(), &fetch_request(&url)).await;
         assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
+    }
+
+    // -- instance pool ------------------------------------------------------
+
+    fn pool_of(loaded: std::sync::Arc<Loaded>, units: usize) -> std::sync::Arc<Pool> {
+        Pool::new(
+            loaded,
+            Sandbox {
+                pool: units,
+                ..Sandbox::default()
+            },
+        )
+    }
+
+    /// The warm path serves repeated requests through one unit: no
+    /// instantiation per request (by construction the unit instantiates once),
+    /// no recycling (one spawned unit despite the table checks), streaming
+    /// included.
+    #[tokio::test]
+    async fn pooled_units_serve_repeated_requests_without_reinstantiating() {
+        let loaded = load(&Locator::File(hello_wasm()), Caps::default())
+            .await
+            .unwrap();
+        let pool = pool_of(loaded.clone(), 1);
+
+        for request in [
+            "GET /stream HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+            "GET / HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+            "GET / HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+        ] {
+            let raw = exchange_raw(&loaded, Some(pool.clone()), Sandbox::default(), &request).await;
+            assert!(
+                raw.starts_with(b"HTTP/1.1 200"),
+                "head: {}",
+                String::from_utf8_lossy(&raw)
+            );
+            // The single unit is busy until its response is fully relayed
+            // (the guest's closing trailer trails the last data frame); wait
+            // for it to restock so the next request is pooled, not cold.
+            let restocked = async {
+                while pool.idle() != 1 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(10), restocked)
+                .await
+                .expect("unit restocks after each request");
+        }
+        assert_eq!(pool.served(), 3, "every request via the pool");
+        assert_eq!(pool.units(), 1, "the unit stayed viable");
+        assert_eq!(pool.spawned(), 1, "no unit was recycled");
+    }
+
+    /// A guest panic mid-request retires the unit; the pool replaces it and
+    /// later requests on the route keep succeeding.
+    #[tokio::test]
+    async fn a_panicking_unit_is_replaced_and_requests_keep_serving() {
+        let loaded = load(&Locator::File(hello_wasm()), Caps::default())
+            .await
+            .unwrap();
+        let pool = pool_of(loaded.clone(), 1);
+
+        let body = exchange(
+            &loaded,
+            Some(pool.clone()),
+            Sandbox::default(),
+            "GET /panic HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(body.starts_with("HTTP/1.1 5"), "head: {body}");
+
+        // the replacement is asynchronous: wait for the stock to refill
+        let restored = async {
+            while pool.units() != 1 || pool.idle() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), restored)
+            .await
+            .expect("pool did not replace the retired unit");
+
+        let body = exchange(
+            &loaded,
+            Some(pool.clone()),
+            Sandbox::default(),
+            "GET / HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
+        assert_eq!(pool.spawned(), 2, "one replacement");
+    }
+
+    /// `/spin` and `/balloon` still degrade to clean responses with the pool
+    /// enabled: the budget trips into a 504, the memory cap into a 5xx, and
+    /// later requests keep serving.
+    #[tokio::test]
+    async fn pool_degrades_spin_and_balloon_cleanly() {
+        let loaded = load(&Locator::File(hello_wasm()), Caps::default())
+            .await
+            .unwrap();
+        let pool = pool_of(loaded.clone(), 1);
+
+        let body = exchange(
+            &loaded,
+            Some(pool.clone()),
+            Sandbox {
+                limits: Limits {
+                    budget: Duration::from_millis(100),
+                    ..Limits::default()
+                },
+                ..Sandbox::default()
+            },
+            "GET /spin HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(body.starts_with("HTTP/1.1 504"), "head: {body}");
+        assert!(body.contains("budget"), "body: {body}");
+
+        let body = exchange(
+            &loaded,
+            Some(pool.clone()),
+            Sandbox {
+                limits: Limits {
+                    memory: 8 << 20,
+                    ..Limits::default()
+                },
+                ..Sandbox::default()
+            },
+            "GET /balloon HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(body.starts_with("HTTP/1.1 5"), "head: {body}");
+
+        let body = exchange(
+            &loaded,
+            Some(pool.clone()),
+            Sandbox::default(),
+            "GET / HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
+    }
+
+    /// Beyond the pool's size requests fall back to per-request instantiation:
+    /// a second concurrent connection is served while the single unit streams.
+    #[tokio::test]
+    async fn pool_exhaustion_falls_back_to_per_request_instantiation() {
+        let loaded = load(&Locator::File(hello_wasm()), Caps::default())
+            .await
+            .unwrap();
+        let pool = pool_of(loaded.clone(), 1);
+
+        // occupy the only unit for the ~1s the stream takes
+        let (streamed, stream_pool) = (loaded.clone(), pool.clone());
+        let first = tokio::spawn(async move {
+            exchange_raw(
+                &streamed,
+                Some(stream_pool),
+                Sandbox::default(),
+                "GET /stream HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(pool.idle(), 0, "the unit is busy streaming");
+
+        // no stock: served on the cold path, still a clean 200
+        let body = exchange(
+            &loaded,
+            Some(pool.clone()),
+            Sandbox::default(),
+            "GET / HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
+        assert_eq!(pool.served(), 1, "the fallback is not counted as pooled");
+
+        let first = first.await.unwrap();
+        assert!(
+            first.starts_with(b"HTTP/1.1 200"),
+            "head: {}",
+            String::from_utf8_lossy(&first)
+        );
+        assert!(first.len() > 1000, "streaming body arrived");
     }
 }

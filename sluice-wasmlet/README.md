@@ -57,11 +57,13 @@ further schemes slot into the same resolver. A `?query` suffix sets the
 route's resource limits and WASI capabilities (`wasi`, see [Capabilities](#capabilities)), applied to every
 request's instance: `budget-ms` is the epoch-based CPU/deadline budget
 (exceeded -> 504; defaults 10000) and `memory-mib` the per-instance linear
-memory cap in MiB (exceeded -> guest trap, 500; defaults 256). A literal `?`
+memory cap in MiB (exceeded -> guest trap, 500; defaults 256). `pool=N`
+keeps `N` warm instances per route (see [Instance pool](#instance-pool)). A literal `?`
 in a file path needs URL-escaping.
 
 ```text
 --wasm demo.local=hello.wasm?budget-ms=5000&memory-mib=64
+--wasm demo.local=hello.wasm?pool=8
 curl -H 'Host: demo.local' http://127.0.0.1:8000/hello
 ```
 
@@ -101,11 +103,24 @@ lines, prefixed with the component and a request id
 - per request: `wasmtime_wasi_http::p3::Request::from_http` -> fresh instance
   from a pre-linked `InstancePre` -> `Service.handle`; the store runs in a
   detached task and relays response body frames to hyper through a bounded
-  channel, so responses stream and a slow client backpressures the guest.
-  Instances are deliberately not pooled: the warm path (~200us instantiate,
-  measured by the ignored `instantiation_latency_reference` test) is cheap,
-  `Store::run_concurrent` consumes the store, and guest module state makes
-  blind reuse incorrect
+  channel, so responses stream and a slow client backpressures the guest
+
+### Instance pool
+
+`pool=N` (opt-in, per route) keeps `N` warm `(Store, Service)` pairs. Each is
+a detached task that runs `Store::run_concurrent` once — it consumes the
+store — with a per-request job loop inside, so reuse cannot hand instances
+back: a unit serves one request at a time and the pool size is the warm
+concurrency. A request beyond the stock, or on a route without `pool`, uses
+the per-request path above; the pool only ever improves the warm latency.
+
+Reuse assumes stateless / reentrant-safe guests: module state legitimately
+persists across a unit's requests, so a misbehaving guest poisons its own
+unit only. A unit is retired and replaced when its request ends in a trap, a
+failed conversion, an interrupted relay, or a non-empty resource table; the
+epoch budget (`budget-ms`, re-armed per request) bounds a hung guest. Guest
+stdio is prefixed with the per-store id, so all requests a pooled unit serves
+share that unit's single id.
 - every request's store carries an epoch deadline (`budget-ms`) and a memory
   limiter (`memory-mib`); the shared engine's epoch is incremented by a
   dedicated thread, so a guest busy-loop cannot starve its own budget

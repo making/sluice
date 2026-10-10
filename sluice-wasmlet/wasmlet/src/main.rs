@@ -54,10 +54,11 @@ struct Route {
     sandbox: Sandbox,
 }
 
-/// A resolved route target: the shared `Loaded` plus the sandbox its target
-/// names.
+/// A resolved route target: the shared `Loaded`, its optional warm-instance
+/// pool, and the sandbox its target names.
 struct ComponentEntry {
     component: Arc<Loaded>,
+    pool: Option<Arc<wasm_host::Pool>>,
     sandbox: Sandbox,
 }
 
@@ -257,10 +258,13 @@ async fn run(config: Config) -> Result<(), BoxError> {
             Ok(component) => component,
             Err(e) => return Err(format!("wasm route '{}': {e}", route.host).into()),
         };
+        let pool = (route.sandbox.pool > 0)
+            .then(|| wasm_host::Pool::new(component.clone(), route.sandbox));
         components.insert(
             target.clone(),
             ComponentEntry {
                 component,
+                pool,
                 sandbox: route.sandbox,
             },
         );
@@ -553,12 +557,14 @@ impl NodeTask {
                     let (ctrl_tx, ctrl_rx) = mpsc::channel(SERVE_BUFFER);
                     registry.lock().unwrap().insert(connect.conn_id, ctrl_tx);
                     let component = entry.component.clone();
+                    let pool = entry.pool.clone();
                     let sandbox = entry.sandbox;
                     tokio::spawn(wasm_host::serve(
                         tx.clone(),
                         registry.clone(),
                         connect.conn_id,
                         component,
+                        pool,
                         sandbox,
                         ctrl_rx,
                     ));
@@ -641,7 +647,10 @@ mod tests {
             parse_route_target("target/wasm32-wasip3/release/hello.wasm").unwrap();
         assert_eq!(target, "target/wasm32-wasip3/release/hello.wasm");
         assert_eq!(sandbox, Sandbox::default());
-        assert_eq!(route_target("wasm:file:///hello.wasm", &sandbox), "wasm:file:///hello.wasm");
+        assert_eq!(
+            route_target("wasm:file:///hello.wasm", &sandbox),
+            "wasm:file:///hello.wasm"
+        );
     }
 
     #[test]
@@ -682,7 +691,10 @@ mod tests {
         let (_, sandbox) = parse_route_target("./a.wasm?wasi=http").unwrap();
         assert_eq!(sandbox, Sandbox::default());
         let (_, sandbox) = parse_route_target("./a.wasm?wasi=http,cli").unwrap();
-        assert_eq!(route_target("wasm:file:///a.wasm", &sandbox), "wasm:file:///a.wasm?wasi=cli");
+        assert_eq!(
+            route_target("wasm:file:///a.wasm", &sandbox),
+            "wasm:file:///a.wasm?wasi=cli"
+        );
     }
 
     #[test]
@@ -696,15 +708,23 @@ mod tests {
     /// addresses, and equal sandboxes share one regardless of spelling.
     #[test]
     fn route_target_canonicalizes_the_sandbox_query() {
-        let (_, a) = parse_route_target("a.wasm?wasi=tcp,cli,inherit-network&memory-mib=64").unwrap();
-        let (_, b) = parse_route_target("a.wasm?memory-mib=64&wasi=cli,inherit-network,tcp").unwrap();
+        let (_, a) =
+            parse_route_target("a.wasm?wasi=tcp,cli,inherit-network&memory-mib=64").unwrap();
+        let (_, b) =
+            parse_route_target("a.wasm?memory-mib=64&wasi=cli,inherit-network,tcp").unwrap();
         let (_, c) = parse_route_target("a.wasm?budget-ms=10000&wasi=cli").unwrap();
         assert_eq!(
             route_target("wasm:file:///a.wasm", &a),
             "wasm:file:///a.wasm?memory-mib=64&wasi=cli,inherit-network,tcp"
         );
-        assert_eq!(route_target("wasm:file:///a.wasm", &a), route_target("wasm:file:///a.wasm", &b));
-        assert_eq!(route_target("wasm:file:///a.wasm", &c), "wasm:file:///a.wasm?wasi=cli");
+        assert_eq!(
+            route_target("wasm:file:///a.wasm", &a),
+            route_target("wasm:file:///a.wasm", &b)
+        );
+        assert_eq!(
+            route_target("wasm:file:///a.wasm", &c),
+            "wasm:file:///a.wasm?wasi=cli"
+        );
     }
 
     fn session(url: &str) -> Arc<Session> {
