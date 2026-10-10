@@ -429,28 +429,34 @@ final class Http2DemuxRelay {
 	}
 
 	/**
-	 * Resolves the route of a request head; on any refusal an error response is written
-	 * on the stream and {@code null} returned, leaving the connection alive.
+	 * Resolves the route of a request head; on any refusal the request is logged, an
+	 * error response is written on the stream, and {@code null} returned, leaving the
+	 * connection alive.
 	 */
 	private @Nullable Resolved resolveOrRespond(int streamId, @Nullable String host,
 			ConnectionHeadParser.Head.@Nullable Request request, io.netty.handler.codec.http2.Http2Headers headers) {
 		Optional<Router.Route> route = this.router.lookup(host);
 		if (route.isEmpty()) {
-			writeToClient(this.errorResponse.noRouteStream(streamId, host, request));
-			return null;
+			return this.refuse(streamId, request, this.errorResponse.noRouteStream(streamId, host, request));
 		}
 		TunnelSession session = this.sessions.find(route.get().clientId()).orElse(null);
 		if (session == null) {
-			writeToClient(this.errorResponse.noRouteStream(streamId, host, request));
-			return null;
+			return this.refuse(streamId, request, this.errorResponse.noRouteStream(streamId, host, request));
 		}
 		String forwardedFor = headerOf(headers, ConnectionHeadParser.Head.FORWARDED_FOR);
 		String forwarded = headerOf(headers, ConnectionHeadParser.Head.FORWARDED);
 		if (!this.accessControl.allowed(route.get(), this.peer, forwardedFor, forwarded)) {
-			writeToClient(this.errorResponse.forbiddenStream(streamId, host, request));
-			return null;
+			return this.refuse(streamId, request, this.errorResponse.forbiddenStream(streamId, host, request));
 		}
 		return new Resolved(route.get(), session);
+	}
+
+	/** Logs a refused stream, mirroring the connection-level refusals. */
+	private @Nullable Resolved refuse(int streamId, ConnectionHeadParser.Head.@Nullable Request request,
+			byte[] response) {
+		this.access.request("-", request == null ? "-" : request.method(), request == null ? "-" : request.path(), "2");
+		writeToClient(response);
+		return null;
 	}
 
 	/** The leg relaying the route: the alive leg serving it, or a new one. */
