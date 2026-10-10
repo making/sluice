@@ -120,6 +120,20 @@ impl Guest for Component {
             return Ok(response);
         }
 
+        if path == "/no-content" || path == "/not-modified" {
+            // Bodiless demo: 204 / 304 -- hyper drops the declared body
+            // unread, so the unit survives only if that is no departure.
+            let status = if path == "/no-content" { 204 } else { 304 };
+            let response_headers = wasi::http::types::Headers::new();
+            let (trailers_tx, trailers_rx) = wit_future::new(|| todo!());
+            let (response, _transmit) = Response::new(response_headers, None, trailers_rx);
+            let _ = response.set_status_code(status);
+            wit_bindgen::spawn_local(async move {
+                let _ = trailers_tx.write(Ok(None)).await;
+            });
+            return Ok(response);
+        }
+
         let payload =
             format!("hello from wasm\nmethod={method:?}\npath={path}\nbody_bytes={body_len}\n");
         // Fresh headers: the request's would carry a mismatched content-length.

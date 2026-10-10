@@ -724,19 +724,33 @@ fn truncate(frames: mpsc::Sender<RelayFrame>, error: RelayError) {
     });
 }
 
+/// Whether HTTP gives the response no body on the wire: a HEAD's (its
+/// `content-length` describes the GET's), an informational status, a 204 or
+/// a 304. hyper drops such a body without polling it, so it is neither
+/// forwarded -- the guest's is drained instead -- nor read as a departure.
+fn bodiless(head_only: bool, status: http::StatusCode) -> bool {
+    head_only
+        || status.is_informational()
+        || status == http::StatusCode::NO_CONTENT
+        || status == http::StatusCode::NOT_MODIFIED
+}
+
 /// Forwards guest body frames to hyper until either side ends. A body error
 /// is relayed so hyper sees the truncation instead of a silent short body; a
 /// gone client just ends the relay and the guest drains through the pipe.
-/// False when the relay ended early (the client disappeared before the body
-/// did): the serving store's fate is then uncertain.
+/// Without `forward` (a bodiless response) nothing is sent: the frames are
+/// consumed and a closed channel is no failure. False when the relay ended
+/// early (the client disappeared before the body did): the serving store's
+/// fate is then uncertain.
 async fn relay(
     mut body: http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, wasmtime_wasi_http::Error>,
     frame_tx: mpsc::Sender<RelayFrame>,
+    forward: bool,
 ) -> bool {
     while let Some(frame) = body.frame().await {
         match frame {
             Ok(frame) => {
-                if frame_tx.send(Ok(frame)).await.is_err() {
+                if forward && frame_tx.send(Ok(frame)).await.is_err() {
                     return false;
                 }
             }
@@ -777,6 +791,8 @@ async fn serve_on(
     head: mpsc::Sender<Head>,
     frames: mpsc::Sender<RelayFrame>,
 ) -> Outcome {
+    // Captured before the conversion consumes the request: the drain decision.
+    let head_only = request.method() == hyper::Method::HEAD;
     let (req, pump) = accessor.with(|mut access| {
         wasmtime_wasi_http::p3::Request::from_http(&mut access.data_mut().hooks, request)
     });
@@ -789,8 +805,9 @@ async fn serve_on(
                 match http {
                     Ok(http) => {
                         let (parts, body) = http.into_parts();
+                        let forward = !bodiless(head_only, parts.status);
                         let _ = head.send(Head::Response(parts)).await;
-                        let ended = relay(body, frames).await;
+                        let ended = relay(body, frames, forward).await;
                         if ended {
                             Outcome::Clean
                         } else {
@@ -841,9 +858,12 @@ struct Awaited {
     frames: mpsc::Receiver<RelayFrame>,
     /// Cancels the reply's `client` when dropped before the head arrived.
     client: DropGuard,
+    /// The request was a HEAD: whatever the head says, hyper drops the body
+    /// unread (`bodiless`).
+    head_only: bool,
 }
 
-fn reply() -> (Reply, Awaited) {
+fn reply(head_only: bool) -> (Reply, Awaited) {
     let (head_tx, head_rx) = mpsc::channel::<Head>(1);
     let (frame_tx, frame_rx) = mpsc::channel::<RelayFrame>(RELAY_BUFFER);
     let client = CancellationToken::new();
@@ -856,6 +876,7 @@ fn reply() -> (Reply, Awaited) {
         head: head_rx,
         frames: frame_rx,
         client: client.drop_guard(),
+        head_only,
     };
     (reply, awaited)
 }
@@ -865,13 +886,15 @@ impl Awaited {
     /// generic 500 when none arrived (the serving store died before any
     /// head). A client leaving before the head cancels through the guard;
     /// past it, the departure is the tracked body's early drop (`Tracked`) --
-    /// hyper's own body drops say nothing by themselves, as it drops the
-    /// body once a `content-length` is satisfied, trailers pending or not.
+    /// hyper's own body drops say nothing by themselves: a satisfied
+    /// `content-length`, a trailers-only end, and a bodiless response's
+    /// body, dropped unread.
     async fn response(mut self) -> hyper::Response<RelayBody> {
         let head = self.head.recv().await;
         let token = self.client.disarm();
         match head {
             Some(Head::Response(parts)) => {
+                let bodiless = bodiless(self.head_only, parts.status);
                 let expected = parts
                     .headers
                     .get(http::header::CONTENT_LENGTH)
@@ -882,6 +905,7 @@ impl Awaited {
                     token,
                     sent: 0,
                     expected,
+                    bodiless,
                     ended: false,
                 };
                 hyper::Response::from_parts(parts, body.boxed_unsync())
@@ -895,10 +919,10 @@ impl Awaited {
 /// The relayed body hyper consumes, telling a client's mid-body departure
 /// from the drops hyper does on its own: on a connection's end or a reset,
 /// which is a departure -- and once a declared `content-length` is satisfied,
-/// which is not, the trailers being all that is left. An early drop fires the
-/// reply's token, and the watchdog reclaims the serving store at once: the
-/// relay notices a gone client only at its next frame, which a guest stalled
-/// mid-body never produces.
+/// or the response is bodiless and dropped unread, which is not. An early
+/// drop fires the reply's token, and the watchdog reclaims the serving store
+/// at once: the relay notices a gone client only at its next frame, which a
+/// guest stalled mid-body never produces.
 struct Tracked {
     frames: mpsc::Receiver<RelayFrame>,
     token: CancellationToken,
@@ -906,6 +930,8 @@ struct Tracked {
     sent: usize,
     /// The head's `content-length`, when declared.
     expected: Option<usize>,
+    /// A bodiless response: hyper drops the body unread, never a departure.
+    bodiless: bool,
     /// Whether the stream's end went through: the channel's close, an error
     /// frame, or the trailers -- the terminal frames. Past any of them a
     /// drop is hyper's own.
@@ -950,9 +976,10 @@ impl http_body::Body for Tracked {
 
 impl Drop for Tracked {
     fn drop(&mut self) {
-        // A satisfied `content-length` leaves at most the trailers: not a
-        // departure, the pool must not recycle over it.
-        if self.ended || self.expected.is_some_and(|len| self.sent >= len) {
+        // A satisfied `content-length` leaves at most the trailers, and a
+        // bodiless response is dropped unread by design: not departures, the
+        // pool must not recycle over either.
+        if self.ended || self.bodiless || self.expected.is_some_and(|len| self.sent >= len) {
             return;
         }
         self.token.cancel();
@@ -1005,6 +1032,19 @@ async fn watchdog(mut watched: watch::Receiver<Option<InFlight>>) -> Stop {
     }
 }
 
+/// The `[wasm]` line for a store stopped under a client that went away: a
+/// unit retired this way would otherwise churn invisibly, unlike the relay
+/// path's recycle.
+fn gone_stop(label: &str) {
+    let line = format!("[wasm] {label} client went away: store stopped\n");
+    #[cfg(test)]
+    tests::captured_log()
+        .lock()
+        .unwrap()
+        .extend_from_slice(line.as_bytes());
+    eprint!("{line}");
+}
+
 /// Drives a store under its watchdog. The watchdog sits outside the store:
 /// a guest suspended on a host future (an upstream that never answers) runs
 /// no wasm the epoch deadline could interrupt, and wasmtime cannot reliably
@@ -1029,7 +1069,10 @@ async fn supervise(
                 eprintln!("[wasm] {label} request overran its budget: store stopped");
                 (504, BUDGET_EXHAUSTED.to_string())
             }
-            Stop::Gone => return,
+            Stop::Gone => {
+                gone_stop(label);
+                return;
+            }
         },
     };
     let reply = watched.borrow().as_ref().map(|job| job.reply.clone());
@@ -1065,7 +1108,7 @@ async fn respond(
     handler: &Handler,
     request: hyper::Request<hyper::body::Incoming>,
 ) -> hyper::Response<RelayBody> {
-    let (reply, awaited) = reply();
+    let (reply, awaited) = reply(request.method() == hyper::Method::HEAD);
     let request = match &handler.pool {
         Some(pool) => match pool.dispatch(request, &reply) {
             Ok(()) => {
@@ -1625,8 +1668,9 @@ mod tests {
         guest_wasm("hello")
     }
 
-    /// Process-wide copy of every guest log line, so tests can assert on
-    /// guest stdio (they filter by their own marker: tests run concurrently).
+    /// Process-wide copy of every log line, guest or host, so tests can
+    /// assert on them (they filter by their own marker: tests run
+    /// concurrently).
     pub(super) fn captured_log() -> &'static Mutex<Vec<u8>> {
         static CAPTURED: Mutex<Vec<u8>> = Mutex::new(Vec::new());
         &CAPTURED
@@ -1731,6 +1775,21 @@ mod tests {
 
     fn get(path: &str) -> String {
         format!("GET {path} HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n")
+    }
+
+    fn head(path: &str) -> String {
+        format!("HEAD {path} HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n")
+    }
+
+    /// The raw bytes of a bodiless response: head only, nothing after the
+    /// blank line (hyper drops such a body unread).
+    fn assert_bare_head(raw: &[u8]) {
+        let end = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("a response head")
+            + 4;
+        assert_eq!(raw.len(), end, "no body follows: {:?}", raw);
     }
 
     /// Opens a tunnel connection to `handler` and sends `request`: the
@@ -2204,6 +2263,7 @@ mod tests {
                 token: token.clone(),
                 sent,
                 expected,
+                bodiless: false,
                 ended: false,
             }
         }
@@ -2640,6 +2700,62 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(pool(&handler).spawned(), 2, "the unit was replaced");
+
+        let log = String::from_utf8_lossy(&captured_log().lock().unwrap()).into_owned();
+        assert!(
+            log.contains("[wasm] hello.wasm client went away: store stopped"),
+            "the stop is logged like any other recycle: {log}"
+        );
+    }
+
+    /// A HEAD response: hyper drops the declared body unread, so the unit
+    /// survives only if that is no departure -- the guest's body is drained,
+    /// never forwarded, and no reinstantiation happens.
+    #[tokio::test]
+    async fn a_head_response_leaves_its_unit_reusable() {
+        let handler = pooled(&hello().await, Sandbox::default(), 1);
+        for _ in 0..3 {
+            restocked(&handler, 1).await;
+            let raw = exchange_raw(&handler, &head("/")).await;
+            assert!(
+                raw.starts_with(b"HTTP/1.1 200"),
+                "head: {}",
+                String::from_utf8_lossy(&raw)
+            );
+            assert!(
+                raw.windows(b"text/plain".len())
+                    .any(|window| window == b"text/plain"),
+                "the head declares a body: {}",
+                String::from_utf8_lossy(&raw)
+            );
+            assert_bare_head(&raw);
+        }
+        let pool = pool(&handler);
+        assert_eq!(pool.served(), 3, "every head via the pool");
+        assert_eq!(pool.spawned(), 1, "no unit was recycled");
+    }
+
+    /// A 204 and a 304: their body hyper drops unread as well; the unit
+    /// survives both, the responses bare heads.
+    #[tokio::test]
+    async fn a_204_and_a_304_leave_the_unit_reusable() {
+        let handler = pooled(&hello().await, Sandbox::default(), 1);
+        for (path, status) in [
+            ("/no-content", "HTTP/1.1 204"),
+            ("/not-modified", "HTTP/1.1 304"),
+        ] {
+            restocked(&handler, 1).await;
+            let raw = exchange_raw(&handler, &head(path)).await;
+            assert!(
+                raw.starts_with(status.as_bytes()),
+                "{status}: {}",
+                String::from_utf8_lossy(&raw)
+            );
+            assert_bare_head(&raw);
+        }
+        let pool = pool(&handler);
+        assert_eq!(pool.served(), 2, "both via the pool");
+        assert_eq!(pool.spawned(), 1, "no unit was recycled");
     }
 
     /// The same departure on the cold path: the per-request store is freed
