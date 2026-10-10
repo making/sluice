@@ -78,7 +78,7 @@ importing anything else fails at startup.
 
 | `wasi=` | `wasmtime serve` | effect |
 |---|---|---|
-| `http` | `-Shttp` | outgoing requests via `wasi:http/client`; always linked as in serve, so accepted but no effect |
+| `http` | `-Shttp` | outgoing requests via `wasi:http/client`; always linked as in serve, so accepted but no effect. Ungated: a guest reaches any address the wasmlet host can, internal networks included |
 | `cli` | `-Scli` | links the full wasi p3 set (sockets, filesystem, ...) |
 | `inherit-network` | `-Sinherit-network` | sockets may use every address; implies `tcp` + `udp` |
 | `tcp` / `udp` | `-Stcp` / `-Sudp` | allows the protocol (every address stays denied without `inherit-network`) |
