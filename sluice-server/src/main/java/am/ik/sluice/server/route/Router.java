@@ -40,11 +40,12 @@ public class Router {
 	 * Resolved route: the client owning the upstream, the domain the route is registered
 	 * under, its dial address, whether the request Host header is rewritten to the target
 	 * ({@code rewrite-host}), whether TLS connections are relayed untouched
-	 * ({@code tls-passthrough}) instead of terminated on the data plane, and the IP
+	 * ({@code tls-passthrough}) instead of terminated on the data plane, whether the data
+	 * plane's TLS termination prefers http/1.1 in ALPN ({@code force-http1}), and the IP
 	 * networks allowed to connect (empty = the server-wide allow list applies).
 	 */
 	public record Route(String clientId, String domain, String address, int listenPort, boolean rewriteHost,
-			boolean tlsPassthrough, List<String> allowedCidrs) {
+			boolean tlsPassthrough, boolean forceHttp1, List<String> allowedCidrs) {
 
 		public Route {
 			allowedCidrs = allowedCidrs == null ? List.of() : List.copyOf(allowedCidrs);
@@ -78,6 +79,8 @@ public class Router {
 			private boolean rewriteHost;
 
 			private boolean tlsPassthrough;
+
+			private boolean forceHttp1;
 
 			private List<String> allowedCidrs = List.of();
 
@@ -114,6 +117,11 @@ public class Router {
 				return this;
 			}
 
+			public Builder forceHttp1(boolean forceHttp1) {
+				this.forceHttp1 = forceHttp1;
+				return this;
+			}
+
 			public Builder allowedCidrs(List<String> allowedCidrs) {
 				this.allowedCidrs = allowedCidrs;
 				return this;
@@ -123,7 +131,7 @@ public class Router {
 				return new Route(Objects.requireNonNull(this.clientId, "clientId is required"),
 						Objects.requireNonNull(this.domain, "domain is required"),
 						Objects.requireNonNull(this.address, "address is required"), this.listenPort, this.rewriteHost,
-						this.tlsPassthrough, this.allowedCidrs);
+						this.tlsPassthrough, this.forceHttp1, this.allowedCidrs);
 			}
 
 		}
@@ -184,7 +192,7 @@ public class Router {
 	}
 
 	record Target(String clientId, String domain, String address, boolean rewriteHost, boolean tlsPassthrough,
-			int listenPort, List<String> allowedCidrs, @Nullable Pattern hostPattern) {
+			boolean forceHttp1, int listenPort, List<String> allowedCidrs, @Nullable Pattern hostPattern) {
 
 		Target {
 			allowedCidrs = allowedCidrs == null ? List.of() : List.copyOf(allowedCidrs);
@@ -205,6 +213,8 @@ public class Router {
 			private boolean rewriteHost;
 
 			private boolean tlsPassthrough;
+
+			private boolean forceHttp1;
 
 			private int listenPort;
 
@@ -240,6 +250,11 @@ public class Router {
 				return this;
 			}
 
+			Builder forceHttp1(boolean forceHttp1) {
+				this.forceHttp1 = forceHttp1;
+				return this;
+			}
+
 			Builder listenPort(int listenPort) {
 				this.listenPort = listenPort;
 				return this;
@@ -259,7 +274,7 @@ public class Router {
 				return new Target(Objects.requireNonNull(this.clientId, "clientId is required"),
 						Objects.requireNonNull(this.domain, "domain is required"),
 						Objects.requireNonNull(this.address, "address is required"), this.rewriteHost,
-						this.tlsPassthrough, this.listenPort, this.allowedCidrs, this.hostPattern);
+						this.tlsPassthrough, this.forceHttp1, this.listenPort, this.allowedCidrs, this.hostPattern);
 			}
 
 		}
@@ -323,6 +338,7 @@ public class Router {
 				.address(address)
 				.rewriteHost(upstream.getRewriteHost())
 				.tlsPassthrough(upstream.getTlsPassthrough())
+				.forceHttp1(upstream.getForceHttp1())
 				.listenPort(upstream.getListenPort())
 				.allowedCidrs(upstream.getAllowedCidrsList())
 				.hostPattern(hostPattern)
@@ -550,6 +566,7 @@ public class Router {
 			.listenPort(target.listenPort())
 			.rewriteHost(target.rewriteHost())
 			.tlsPassthrough(target.tlsPassthrough())
+			.forceHttp1(target.forceHttp1())
 			.allowedCidrs(target.allowedCidrs())
 			.build();
 	}

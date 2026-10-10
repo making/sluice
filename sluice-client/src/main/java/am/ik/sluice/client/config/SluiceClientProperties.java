@@ -41,7 +41,7 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	 * @param id stable client identity sent as {@code x-sluice-id} on every tunnel
 	 * stream; blank = a random id is generated once per process
 	 * @param upstream upstream entries, bound from
-	 * {@code sluice.client.upstream[n].{host,host-pattern,target,rewrite-host,listen-port,allowed-cidrs}}
+	 * {@code sluice.client.upstream[n].{host,host-pattern,target,rewrite-host,force-http1,listen-port,allowed-cidrs}}
 	 */
 	public record Client(@DefaultValue("") String id, @DefaultValue List<Upstream> upstream) {
 
@@ -96,6 +96,7 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 				.setTargetUrl(upstream.target())
 				.setRewriteHost(upstream.rewriteHost())
 				.setTlsPassthrough(upstream.tlsPassthrough())
+				.setForceHttp1(upstream.forceHttp1())
 				.setListenPort(upstream.listenPort())
 				.addAllAllowedCidrs(upstream.allowedCidrs())
 				.build())

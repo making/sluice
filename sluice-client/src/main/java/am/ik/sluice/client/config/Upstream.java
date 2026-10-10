@@ -13,13 +13,15 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * ({@code host-pattern}; whole match, without the port), the target URL to dial, whether
  * the request Host header is rewritten to the target ({@code rewrite-host}), whether TLS
  * connections are relayed untouched ({@code tls-passthrough}) instead of terminated on
- * the data plane, the public port for raw TCP routing ({@code listen-port}; 0 disables
- * it), and the CIDRs / bare addresses allowed to connect on the data plane
- * ({@code allowed-cidrs}; empty = the server-wide allow list).
+ * the data plane, whether the data plane's TLS termination prefers http/1.1 in ALPN
+ * ({@code force-http1}; for upstreams without HTTP/2 support), the public port for raw
+ * TCP routing ({@code listen-port}; 0 disables it), and the CIDRs / bare addresses
+ * allowed to connect on the data plane ({@code allowed-cidrs}; empty = the server-wide
+ * allow list).
  */
 public record Upstream(String host, @DefaultValue("") String hostPattern, String target,
-		@DefaultValue("false") boolean rewriteHost, boolean tlsPassthrough, int listenPort,
-		@DefaultValue List<String> allowedCidrs) {
+		@DefaultValue("false") boolean rewriteHost, boolean tlsPassthrough, @DefaultValue("false") boolean forceHttp1,
+		int listenPort, @DefaultValue List<String> allowedCidrs) {
 
 	public Upstream {
 		host = host == null ? "" : host.trim();
@@ -59,6 +61,8 @@ public record Upstream(String host, @DefaultValue("") String hostPattern, String
 
 		private boolean tlsPassthrough;
 
+		private boolean forceHttp1;
+
 		private int listenPort;
 
 		private List<String> allowedCidrs = List.of();
@@ -91,6 +95,11 @@ public record Upstream(String host, @DefaultValue("") String hostPattern, String
 			return this;
 		}
 
+		public Builder forceHttp1(boolean forceHttp1) {
+			this.forceHttp1 = forceHttp1;
+			return this;
+		}
+
 		public Builder listenPort(int listenPort) {
 			this.listenPort = listenPort;
 			return this;
@@ -103,7 +112,7 @@ public record Upstream(String host, @DefaultValue("") String hostPattern, String
 
 		public Upstream build() {
 			return new Upstream(this.host, this.hostPattern, Objects.requireNonNull(this.target, "target is required"),
-					this.rewriteHost, this.tlsPassthrough, this.listenPort, this.allowedCidrs);
+					this.rewriteHost, this.tlsPassthrough, this.forceHttp1, this.listenPort, this.allowedCidrs);
 		}
 
 	}

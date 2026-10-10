@@ -36,6 +36,25 @@ class RouterTest {
 	}
 
 	@Test
+	void forceHttp1FlagPropagatesToRoute() {
+		Router router = new Router();
+		Upstream flagged = Upstream.newBuilder()
+			.setHost("legacy.local")
+			.setTargetUrl("http://127.0.0.1:3000")
+			.setRewriteHost(false)
+			.setForceHttp1(true)
+			.build();
+		Upstream plain = Upstream.newBuilder()
+			.setHost("demo.local")
+			.setTargetUrl("http://127.0.0.1:3001")
+			.setRewriteHost(false)
+			.build();
+		router.register("c1", List.of(flagged, plain));
+		assertThat(router.lookup("legacy.local").orElseThrow().forceHttp1()).isTrue();
+		assertThat(router.lookup("demo.local").orElseThrow().forceHttp1()).isFalse();
+	}
+
+	@Test
 	void hostWithPortMatchesBareHostRoute() {
 		Router router = new Router();
 		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3000")));

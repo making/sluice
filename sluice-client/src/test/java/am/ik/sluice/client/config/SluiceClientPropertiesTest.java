@@ -124,4 +124,30 @@ class SluiceClientPropertiesTest {
 		assertThatThrownBy(builder::build).isInstanceOf(IllegalArgumentException.class);
 	}
 
+	@Test
+	void forceHttp1DefaultsToFalseAndIsCarriedToTheAdvertisedUpstream() {
+		SluiceClientProperties properties = SluiceClientProperties.builder()
+			.serverUrl("grpc://127.0.0.1:8001")
+			.upstream(Upstream.builder().host("demo.local").target("127.0.0.1:8080").build())
+			.upstream(Upstream.builder().host("legacy.local").target("http://192.0.2.1:80").forceHttp1(true).build())
+			.build();
+		assertThat(properties.toProtoUpstreams()).satisfies(upstreams -> {
+			assertThat(upstreams.get(0).getForceHttp1()).isFalse();
+			assertThat(upstreams.get(1).getForceHttp1()).isTrue();
+		});
+	}
+
+	@Test
+	void forceHttp1BindsFromIndexedProperties() {
+		Map<String, Object> source = Map.of("sluice.server-url", "grpc://127.0.0.1:8001",
+				"sluice.client.upstream[0].host", "legacy.local", "sluice.client.upstream[0].target",
+				"http://192.0.2.1:80", "sluice.client.upstream[0].force-http1", "true");
+		StandardEnvironment environment = new StandardEnvironment();
+		environment.getPropertySources().addFirst(new MapPropertySource("test", source));
+		SluiceClientProperties properties = Binder.get(environment)
+			.bind("sluice", Bindable.of(SluiceClientProperties.class))
+			.get();
+		assertThat(properties.toProtoUpstreams().get(0).getForceHttp1()).isTrue();
+	}
+
 }

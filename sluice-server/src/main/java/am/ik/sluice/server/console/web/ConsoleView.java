@@ -319,7 +319,7 @@ class ConsoleView {
 			else {
 				role = loadBalance == LoadBalance.ROUND_ROBIN ? "In rotation" : "Picked at random";
 			}
-			String note = route.tlsPassthrough() ? "TLS passthrough"
+			String note = route.tlsPassthrough() ? "TLS passthrough" : route.forceHttp1() ? "HTTP/1.1 only"
 					: route.listenPort() > 0 || !route.rewriteHost() ? "" : "Rewrites Host";
 			return Candidate.builder()
 				.clientId(route.clientId())

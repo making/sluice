@@ -1,5 +1,6 @@
 package am.ik.sluice.it;
 
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -198,6 +199,11 @@ class TlsDataPlaneE2ETest {
 				.host("127.0.0.1")
 				.target("http://127.0.0.1:" + h1UpstreamAddress.getPort())
 				.build())
+			.upstream(Upstream.builder()
+				.host("h1only.local")
+				.target("http://127.0.0.1:" + h1UpstreamAddress.getPort())
+				.forceHttp1(true)
+				.build())
 			.token("it-token")
 			.build();
 		TunnelClient started = TunnelClient.builder()
@@ -270,6 +276,40 @@ class TlsDataPlaneE2ETest {
 			InputStream in = socket.getInputStream();
 			String head = new String(in.readNBytes(12), StandardCharsets.US_ASCII);
 			assertThat(head).startsWith("HTTP/1.1 200");
+		}
+	}
+
+	/**
+	 * A {@code force-http1} route negotiates http/1.1 over ALPN even when the client
+	 * offers h2, so h1-only upstreams are reached over HTTP/1.1.
+	 */
+	@Test
+	void forceHttp1RouteNegotiatesHttp1_1OverAlpn() throws Exception {
+		this.startClient();
+		try (SSLSocket socket = (SSLSocket) clientSslContext().getSocketFactory().createSocket("127.0.0.1", dataPort)) {
+			socket.setSoTimeout(10_000);
+			javax.net.ssl.SSLParameters parameters = socket.getSSLParameters();
+			// the dial address is the loopback IP: SNI carries the route host
+			parameters.setServerNames(List.of(new javax.net.ssl.SNIHostName("h1only.local")));
+			parameters.setApplicationProtocols(new String[] { "http/1.1", "h2" });
+			socket.setSSLParameters(parameters);
+			socket.startHandshake();
+			assertThat(socket.getApplicationProtocol()).isEqualTo("http/1.1");
+			socket.getOutputStream()
+				.write("GET / HTTP/1.1\r\nHost: h1only.local\r\nConnection: close\r\n\r\n"
+					.getBytes(StandardCharsets.US_ASCII));
+			socket.getOutputStream().flush();
+			InputStream in = socket.getInputStream();
+			ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+			byte[] buffer = new byte[1024];
+			int n;
+			while ((n = in.read(buffer)) > 0) {
+				bytes.write(buffer, 0, n);
+				if (bytes.toString(StandardCharsets.UTF_8).contains(H1_BODY)) {
+					break;
+				}
+			}
+			assertThat(bytes.toString(StandardCharsets.UTF_8)).startsWith("HTTP/1.1 200").contains(H1_BODY);
 		}
 	}
 

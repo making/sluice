@@ -135,4 +135,8 @@ message Upstream {
   // the data plane; empty = the server-wide allow list applies. Literal
   // addresses only.
   repeated string allowed_cidrs = 7;
+  // When true the data plane's TLS termination prefers http/1.1 in ALPN for
+  // this upstream (for upstreams without HTTP/2 support); plaintext and
+  // tls-passthrough routes are unaffected.
+  bool force_http1 = 8;
 }

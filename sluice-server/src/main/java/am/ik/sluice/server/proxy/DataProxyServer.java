@@ -221,9 +221,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				.orElseThrow(() -> new IllegalArgumentException("unrecognized tls handshake"));
 			// an unresolved route keeps the legacy behavior: terminate when a bundle is
 			// configured, passthrough otherwise
-			boolean passthrough = this.router.lookup(hello.sni())
-				.map(Router.Route::tlsPassthrough)
-				.orElseGet(() -> this.tlsFactory() == null);
+			Optional<Router.Route> resolved = this.router.lookup(hello.sni());
+			boolean passthrough = resolved.map(Router.Route::tlsPassthrough).orElseGet(() -> this.tlsFactory() == null);
 			if (passthrough) {
 				// relay the TLS records untouched; the upstream terminates TLS
 				log.debug("tls passthrough; sni={}", hello.sni());
@@ -248,8 +247,12 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				}
 			}));
 			ssl.setSSLParameters(parameters);
+			// force-http1 routes prefer http/1.1 in ALPN so h1-only upstreams are reached
+			// over h1 (the route is the SNI-resolved one above)
+			boolean forceHttp1 = resolved.map(Router.Route::forceHttp1).orElse(false);
 			ssl.setHandshakeApplicationProtocolSelector(
-					(s, protocols) -> protocols.contains(ALPN_H2) ? ALPN_H2 : ALPN_HTTP_1_1);
+					(s, protocols) -> forceHttp1 ? protocols.contains(ALPN_HTTP_1_1) ? ALPN_HTTP_1_1 : ALPN_H2
+							: protocols.contains(ALPN_H2) ? ALPN_H2 : ALPN_HTTP_1_1);
 			ssl.startHandshake();
 			log.debug("tls handshake done; protocol={} sni={}", ssl.getApplicationProtocol(), sni.get());
 			access.transport(ALPN_H2.equals(ssl.getApplicationProtocol()) ? "h2" : "h1");

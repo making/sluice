@@ -252,7 +252,7 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.token-file` | - | read the token from a file |
 | `sluice.data-host` | `0.0.0.0` | bind address of the data plane |
 | `sluice.data-port` | `8000` | data plane port |
-| `sluice.data-tls-bundle` | - | SSL bundle name for data plane TLS termination (h2 / http/1.1 via ALPN); unset = plaintext only (TLS connections are served by upstreams with `tls-passthrough=true`) |
+| `sluice.data-tls-bundle` | - | SSL bundle name for data plane TLS termination (h2 / http/1.1 via ALPN, `force-http1` flips the preference); unset = plaintext only (TLS connections are served by upstreams with `tls-passthrough=true`) |
 | `sluice.ca-bundle` | - | SSL bundle whose keystore holds the CA private key + certificate; enables client certificate issuance in the console (the signed certificates authenticate against the gRPC `client-auth=REQUIRE` truststore, no restart) |
 | `sluice.proxy-protocol` | `false` | parse the PROXY protocol (v1 / v2) header an SNAT front end prepends on the data plane: the header is consumed before routing / relay (never forwarded) and its source address becomes the connection peer for access control and the access log; headerless connections are unaffected, a malformed header fails the connection |
 | `sluice.tcp-port-range` | (unset = any port) | listen ports a client may claim for tcp routes, comma separated single ports or `min-max` ranges (e.g. `9000-9010,8080`); a port outside the range is not bound |
@@ -287,6 +287,7 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.client.upstream[n].target` | - | upstream URL: `http://` (default when the scheme is omitted), `https://` (TLS terminated by the client), or `tcp://` (raw relay, e.g. a TLS endpoint in passthrough mode) |
 | `sluice.client.upstream[n].rewrite-host` | `false` | rewrites the request Host / `:authority` to the target's `host[:port]` |
 | `sluice.client.upstream[n].tls-passthrough` | `false` | TLS connections for the upstream are relayed untouched (routed by ClientHello SNI, the upstream terminates TLS) instead of terminated on the data plane |
+| `sluice.client.upstream[n].force-http1` | `false` | the data plane's TLS termination prefers http/1.1 in ALPN for the route (for upstreams without HTTP/2 support); plaintext and `tls-passthrough` routes are unaffected |
 | `sluice.client.upstream[n].listen-port` | `0` | public port the server listens on for this upstream; connections are relayed as raw TCP routed by the listen port -- no head parsing, no rewriting -- so any protocol (ssh, postgres, redis, ...) tunnels through. The listener is bound on advertise and released on disconnect; bind it on the host (`docker -p`, firewall) to expose it |
 | `sluice.client.upstream[n].allowed-cidrs` | (empty = the server-wide `sluice.access-control.allow-cidrs` applies) | CIDRs / bare addresses allowed to connect to this upstream on the data plane; replaces the server-wide allow list for the route (the deny list still applies) |
 | `sluice.token` / `sluice.token-file` | - | authentication token |
@@ -609,3 +610,4 @@ docker run sluice-client --sluice.server-url=grpc://host.docker.internal:8001 \
 
 - The data plane relays raw bytes. With `rewrite-host=true` the authority (`Host` / `:authority`) is rewritten on every request of the connection by a best-effort stream rewriter (both HTTP/1.1 and h2): upgraded connections (WebSocket, h2c upgrade, CONNECT) are rewritten up to the protocol switch, and any head or frame the rewriter cannot reproduce (non ASCII headers, HPACK failures) degrades that connection to verbatim passthrough.
 - h2 specific: the rewriter assumes the upstream negotiates the spec-default frame and HPACK limits (16 KiB max frame size, 4096 header table size, 64 KiB header list) and does not track tighter upstream SETTINGS values.
+- Upstream without HTTP/2 support: set `force-http1=true` on the upstream so the data plane's TLS termination offers http/1.1 first in ALPN and ingress falls back to HTTP/1.1. The preference applies to the route resolved from the ClientHello SNI (ingress by bare IP sends no SNI and resolves via the catch-all route). Plaintext connections are not converted: an h2c prior-knowledge client reaches the upstream with h2 frames as-is.
