@@ -142,6 +142,12 @@ class ConsoleE2ETest {
 					.target("tcp://127.0.0.1:" + tcp.getLocalPort())
 					.listenPort(tcpRoutePort)
 					.build())
+				.upstream(Upstream.builder()
+					.host("h1only.local")
+					.target("http://127.0.0.1:" + http.getAddress().getPort())
+					.rewriteHost(false)
+					.forceHttp1(true)
+					.build())
 				.token("it-token")
 				.build())
 			.taskExecutor(TASK_EXECUTOR)
@@ -278,7 +284,8 @@ class ConsoleE2ETest {
 			.isEqualToNormalizingWhitespace("""
 					HTTP demo.local http://127.0.0.1:%d Serving Keeps Host
 					TCP :%d db.local tcp://127.0.0.1:%d Serving
-					""".formatted(httpPort, tcpRoutePort, tcpPort));
+					HTTP h1only.local http://127.0.0.1:%d Serving Keeps Host, HTTP/1.1 only
+					""".formatted(httpPort, tcpRoutePort, tcpPort, httpPort));
 		assertThat(page.locator("[data-client='" + STANDBY_ID + "'] table.upstreams tbody").innerText())
 			.isEqualToNormalizingWhitespace("""
 					HTTP demo.local http://127.0.0.1:%d Standby, console-client serves Keeps Host
@@ -300,7 +307,7 @@ class ConsoleE2ETest {
 		Page page = page();
 		page.navigate("http://127.0.0.1:" + this.port + "/console");
 		assertThat(page.locator("[id='outlet-" + CLIENT_ID + "'] text").allTextContents())
-			.containsExactly("console-client0 open", "Serves demo.local, :" + tcpRoutePort);
+			.containsExactly("console-client0 open", "Serves demo.local, h1only.local, :" + tcpRoutePort);
 		assertThat(page.locator("[id='outlet-" + STANDBY_ID + "'] text").allTextContents())
 			.containsExactly("console-z0 open", "Standby for demo.local");
 	}
