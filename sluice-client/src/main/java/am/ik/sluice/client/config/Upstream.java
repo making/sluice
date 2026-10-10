@@ -11,14 +11,14 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * A single upstream entry: the public host the server routes requests for (blank means
  * catch-all) or, instead of it, a regular expression the request host is matched against
  * ({@code host-pattern}; whole match, without the port), the target URL to dial, whether
- * the request Host header passes through, whether TLS connections are relayed untouched
- * ({@code tls-passthrough}) instead of terminated on the data plane, the public port for
- * raw TCP routing ({@code listen-port}; 0 disables it), and the CIDRs / bare addresses
- * allowed to connect on the data plane ({@code allowed-cidrs}; empty = the server-wide
- * allow list).
+ * the request Host header is rewritten to the target ({@code rewrite-host}), whether TLS
+ * connections are relayed untouched ({@code tls-passthrough}) instead of terminated on
+ * the data plane, the public port for raw TCP routing ({@code listen-port}; 0 disables
+ * it), and the CIDRs / bare addresses allowed to connect on the data plane
+ * ({@code allowed-cidrs}; empty = the server-wide allow list).
  */
 public record Upstream(String host, @DefaultValue("") String hostPattern, String target,
-		@DefaultValue("true") boolean preserveHost, boolean tlsPassthrough, int listenPort,
+		@DefaultValue("false") boolean rewriteHost, boolean tlsPassthrough, int listenPort,
 		@DefaultValue List<String> allowedCidrs) {
 
 	public Upstream {
@@ -55,7 +55,7 @@ public record Upstream(String host, @DefaultValue("") String hostPattern, String
 
 		private String target = "";
 
-		private boolean preserveHost = true;
+		private boolean rewriteHost;
 
 		private boolean tlsPassthrough;
 
@@ -81,8 +81,8 @@ public record Upstream(String host, @DefaultValue("") String hostPattern, String
 			return this;
 		}
 
-		public Builder preserveHost(boolean preserveHost) {
-			this.preserveHost = preserveHost;
+		public Builder rewriteHost(boolean rewriteHost) {
+			this.rewriteHost = rewriteHost;
 			return this;
 		}
 
@@ -103,7 +103,7 @@ public record Upstream(String host, @DefaultValue("") String hostPattern, String
 
 		public Upstream build() {
 			return new Upstream(this.host, this.hostPattern, Objects.requireNonNull(this.target, "target is required"),
-					this.preserveHost, this.tlsPassthrough, this.listenPort, this.allowedCidrs);
+					this.rewriteHost, this.tlsPassthrough, this.listenPort, this.allowedCidrs);
 		}
 
 	}

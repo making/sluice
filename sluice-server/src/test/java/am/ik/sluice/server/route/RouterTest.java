@@ -10,7 +10,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class RouterTest {
 
 	private static Upstream upstream(String host, String targetUrl) {
-		return Upstream.newBuilder().setHost(host).setTargetUrl(targetUrl).setPreserveHost(true).build();
+		return Upstream.newBuilder().setHost(host).setTargetUrl(targetUrl).setRewriteHost(false).build();
 	}
 
 	@Test
@@ -20,19 +20,19 @@ class RouterTest {
 		Router.Route route = router.lookup("demo.local").orElseThrow();
 		assertThat(route.clientId()).isEqualTo("c1");
 		assertThat(route.address()).isEqualTo("127.0.0.1:3000");
-		assertThat(route.preserveHost()).isTrue();
+		assertThat(route.rewriteHost()).isFalse();
 	}
 
 	@Test
-	void preserveHostFlagPropagatesToRoute() {
+	void rewriteHostFlagPropagatesToRoute() {
 		Router router = new Router();
 		Upstream upstream = Upstream.newBuilder()
 			.setHost("demo.local")
 			.setTargetUrl("http://127.0.0.1:3000")
-			.setPreserveHost(false)
+			.setRewriteHost(true)
 			.build();
 		router.register("c1", List.of(upstream));
-		assertThat(router.lookup("demo.local").orElseThrow().preserveHost()).isFalse();
+		assertThat(router.lookup("demo.local").orElseThrow().rewriteHost()).isTrue();
 	}
 
 	@Test
@@ -127,7 +127,7 @@ class RouterTest {
 		return Upstream.newBuilder()
 			.setHost("ignored.local")
 			.setTargetUrl(targetUrl)
-			.setPreserveHost(true)
+			.setRewriteHost(false)
 			.setListenPort(listenPort)
 			.build();
 	}

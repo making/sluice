@@ -36,16 +36,16 @@ import org.springframework.test.context.DynamicPropertySource;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * End to end verification of the per-upstream {@code preserve-host} option: the default
+ * End to end verification of the per-upstream {@code rewrite-host} option: the default
  * relays the request head verbatim (the upstream sees the public host), while
- * {@code preserve-host=false} rewrites the Host header (HTTP/1.1) or the
- * {@code :authority} (h2) to the upstream target's host[:port].
+ * {@code rewrite-host=true} rewrites the Host header (HTTP/1.1) or the {@code :authority}
+ * (h2) to the upstream target's host[:port].
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
-class PreserveHostE2ETest {
+class RewriteHostE2ETest {
 
-	private static final TaskExecutor TASK_EXECUTOR = task -> Thread.ofVirtual().name("e2e-preserve-host").start(task);
+	private static final TaskExecutor TASK_EXECUTOR = task -> Thread.ofVirtual().name("e2e-rewrite-host").start(task);
 
 	private static int grpcPort;
 
@@ -149,11 +149,11 @@ class PreserveHostE2ETest {
 		registry.add("server.port", () -> String.valueOf(TestPorts.freePort()));
 	}
 
-	private void startClient(String host, String target, boolean preserveHost) {
+	private void startClient(String host, String target, boolean rewriteHost) {
 		clients.computeIfAbsent(host, h -> {
 			SluiceClientProperties properties = SluiceClientProperties.builder()
 				.serverUrl("grpc://127.0.0.1:" + grpcPort)
-				.upstream(Upstream.builder().host(h).target(target).preserveHost(preserveHost).build())
+				.upstream(Upstream.builder().host(h).target(target).rewriteHost(rewriteHost).build())
 				.token("it-token")
 				.build();
 			TunnelClient started = TunnelClient.builder()
@@ -169,7 +169,7 @@ class PreserveHostE2ETest {
 
 	private final @Nullable SessionRegistry sessions;
 
-	PreserveHostE2ETest(@Autowired SessionRegistry sessions) {
+	RewriteHostE2ETest(@Autowired SessionRegistry sessions) {
 		this.sessions = sessions;
 	}
 
@@ -213,25 +213,25 @@ class PreserveHostE2ETest {
 	}
 
 	@Test
-	void defaultPreservesThePublicHost() throws Exception {
+	void defaultKeepsThePublicHost() throws Exception {
 		String host = "keep.local";
-		startClient(host, "http://127.0.0.1:" + http1Upstream.getAddress().getPort(), true);
+		startClient(host, "http://127.0.0.1:" + http1Upstream.getAddress().getPort(), false);
 		assertThat(get(host)).isEqualTo("Host=keep.local");
 	}
 
 	@Test
-	void disabledPreserveHostRewritesHttp1Host() throws Exception {
+	void rewriteHostRewritesHttp1Host() throws Exception {
 		int port = http1Upstream.getAddress().getPort();
 		String host = "rewrite.local";
-		startClient(host, "http://127.0.0.1:" + port, false);
+		startClient(host, "http://127.0.0.1:" + port, true);
 		assertThat(get(host)).isEqualTo("Host=127.0.0.1:" + port);
 	}
 
 	@Test
-	void disabledPreserveHostRewritesH2Authority() throws Exception {
+	void rewriteHostRewritesH2Authority() throws Exception {
 		int port = h2Upstream.getLocalPort();
 		String host = "h2.rewrite.local";
-		startClient(host, "http://127.0.0.1:" + port, false);
+		startClient(host, "http://127.0.0.1:" + port, true);
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.setSoTimeout(10_000);
 			TestH2.writeClientHead(socket.getOutputStream(), 1, ":authority=" + host, ":method=GET", ":path=/");
@@ -241,10 +241,10 @@ class PreserveHostE2ETest {
 	}
 
 	@Test
-	void disabledPreserveHostRewritesHttp1HostOnKeepAliveConnection() throws Exception {
+	void rewriteHostRewritesHttp1HostOnKeepAliveConnection() throws Exception {
 		int port = http1Upstream.getAddress().getPort();
 		String host = "keepalive.rewrite.local";
-		startClient(host, "http://127.0.0.1:" + port, false);
+		startClient(host, "http://127.0.0.1:" + port, true);
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.setSoTimeout(10_000);
 			String first = exchange(socket, host);
@@ -255,10 +255,10 @@ class PreserveHostE2ETest {
 	}
 
 	@Test
-	void disabledPreserveHostRewritesH2AuthorityOnSecondRequestOfSameConnection() throws Exception {
+	void rewriteHostRewritesH2AuthorityOnSecondRequestOfSameConnection() throws Exception {
 		int port = h2Upstream.getLocalPort();
 		String host = "h2.keepalive.local";
-		startClient(host, "http://127.0.0.1:" + port, false);
+		startClient(host, "http://127.0.0.1:" + port, true);
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.setSoTimeout(10_000);
 			TestH2.writeClientHead(socket.getOutputStream(), 1, ":authority=" + host, ":method=GET", ":path=/");

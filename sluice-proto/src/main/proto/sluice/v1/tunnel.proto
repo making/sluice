@@ -120,9 +120,9 @@ message Upstream {
   string host_pattern = 2;
   // Upstream URL, e.g. http://127.0.0.1:3000.
   string target_url = 3;
-  // When false the server rewrites the request Host/:authority to the target's
-  // host[:port] before relaying; when true the head bytes pass through verbatim.
-  bool preserve_host = 4;
+  // When true the server rewrites the request Host/:authority to the target's
+  // host[:port] before relaying; when false the head bytes pass through verbatim.
+  bool rewrite_host = 4;
   // TLS connections for this upstream are relayed untouched (routed by ClientHello
   // SNI, the upstream terminates TLS) instead of terminated on the data plane.
   bool tls_passthrough = 5;

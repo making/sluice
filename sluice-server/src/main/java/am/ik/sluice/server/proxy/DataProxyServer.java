@@ -300,8 +300,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			access.request(request.method(), request.path(), request.version());
 		}
 		// per-request host rewriting on the relayed stream; connections that must stay
-		// verbatim (preserve-host, TLS passthrough) keep the one-shot head prefix
-		HostRewritingPipe rewriting = route0.preserveHost() || conn.head().encrypted() ? null
+		// verbatim (host rewrite off, TLS passthrough) keep the one-shot head prefix
+		HostRewritingPipe rewriting = !route0.rewriteHost() || conn.head().encrypted() ? null
 				: HostRewritingPipe.of(conn.pipe(), conn.head(), route0.address());
 		StreamRelay relay = StreamRelay
 			.builder(rewriting != null ? rewriting : conn.pipe(), connection, session.sender())

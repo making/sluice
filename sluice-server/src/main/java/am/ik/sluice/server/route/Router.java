@@ -38,12 +38,12 @@ public class Router {
 
 	/**
 	 * Resolved route: the client owning the upstream, the domain the route is registered
-	 * under, its dial address, whether the request Host header passes through unmodified,
-	 * whether TLS connections are relayed untouched ({@code tls-passthrough}) instead of
-	 * terminated on the data plane, and the IP networks allowed to connect (empty = the
-	 * server-wide allow list applies).
+	 * under, its dial address, whether the request Host header is rewritten to the target
+	 * ({@code rewrite-host}), whether TLS connections are relayed untouched
+	 * ({@code tls-passthrough}) instead of terminated on the data plane, and the IP
+	 * networks allowed to connect (empty = the server-wide allow list applies).
 	 */
-	public record Route(String clientId, String domain, String address, int listenPort, boolean preserveHost,
+	public record Route(String clientId, String domain, String address, int listenPort, boolean rewriteHost,
 			boolean tlsPassthrough, List<String> allowedCidrs) {
 
 		public Route {
@@ -75,7 +75,7 @@ public class Router {
 
 			private int listenPort;
 
-			private boolean preserveHost = true;
+			private boolean rewriteHost;
 
 			private boolean tlsPassthrough;
 
@@ -104,8 +104,8 @@ public class Router {
 				return this;
 			}
 
-			public Builder preserveHost(boolean preserveHost) {
-				this.preserveHost = preserveHost;
+			public Builder rewriteHost(boolean rewriteHost) {
+				this.rewriteHost = rewriteHost;
 				return this;
 			}
 
@@ -122,7 +122,7 @@ public class Router {
 			public Route build() {
 				return new Route(Objects.requireNonNull(this.clientId, "clientId is required"),
 						Objects.requireNonNull(this.domain, "domain is required"),
-						Objects.requireNonNull(this.address, "address is required"), this.listenPort, this.preserveHost,
+						Objects.requireNonNull(this.address, "address is required"), this.listenPort, this.rewriteHost,
 						this.tlsPassthrough, this.allowedCidrs);
 			}
 
@@ -183,7 +183,7 @@ public class Router {
 
 	}
 
-	record Target(String clientId, String domain, String address, boolean preserveHost, boolean tlsPassthrough,
+	record Target(String clientId, String domain, String address, boolean rewriteHost, boolean tlsPassthrough,
 			int listenPort, List<String> allowedCidrs, @Nullable Pattern hostPattern) {
 
 		Target {
@@ -202,7 +202,7 @@ public class Router {
 
 			private @Nullable String address;
 
-			private boolean preserveHost = true;
+			private boolean rewriteHost;
 
 			private boolean tlsPassthrough;
 
@@ -230,8 +230,8 @@ public class Router {
 				return this;
 			}
 
-			Builder preserveHost(boolean preserveHost) {
-				this.preserveHost = preserveHost;
+			Builder rewriteHost(boolean rewriteHost) {
+				this.rewriteHost = rewriteHost;
 				return this;
 			}
 
@@ -258,7 +258,7 @@ public class Router {
 			Target build() {
 				return new Target(Objects.requireNonNull(this.clientId, "clientId is required"),
 						Objects.requireNonNull(this.domain, "domain is required"),
-						Objects.requireNonNull(this.address, "address is required"), this.preserveHost,
+						Objects.requireNonNull(this.address, "address is required"), this.rewriteHost,
 						this.tlsPassthrough, this.listenPort, this.allowedCidrs, this.hostPattern);
 			}
 
@@ -321,7 +321,7 @@ public class Router {
 				.clientId(clientId)
 				.domain(hostPattern == null ? upstream.getHost() : upstream.getHostPattern())
 				.address(address)
-				.preserveHost(upstream.getPreserveHost())
+				.rewriteHost(upstream.getRewriteHost())
 				.tlsPassthrough(upstream.getTlsPassthrough())
 				.listenPort(upstream.getListenPort())
 				.allowedCidrs(upstream.getAllowedCidrsList())
@@ -548,7 +548,7 @@ public class Router {
 			.domain(target.domain())
 			.address(target.address())
 			.listenPort(target.listenPort())
-			.preserveHost(target.preserveHost())
+			.rewriteHost(target.rewriteHost())
 			.tlsPassthrough(target.tlsPassthrough())
 			.allowedCidrs(target.allowedCidrs())
 			.build();

@@ -187,7 +187,7 @@ class ConsoleView {
 		int listenPort = upstream.getListenPort();
 		String kind = listenPort > 0 ? "TCP :" + listenPort : upstream.getTlsPassthrough() ? "TLS passthrough" : "HTTP";
 		String note = rejected ? "Port not bound" : listenPort > 0 || upstream.getTlsPassthrough() ? ""
-				: upstream.getPreserveHost() ? "Keeps Host" : "Rewrites Host";
+				: upstream.getRewriteHost() ? "Rewrites Host" : "Keeps Host";
 		return UpstreamRow.builder()
 			.host(routeKey(upstream))
 			.target(upstream.getTargetUrl())
@@ -320,7 +320,7 @@ class ConsoleView {
 				role = loadBalance == LoadBalance.ROUND_ROBIN ? "In rotation" : "Picked at random";
 			}
 			String note = route.tlsPassthrough() ? "TLS passthrough"
-					: route.listenPort() > 0 || route.preserveHost() ? "" : "Rewrites Host";
+					: route.listenPort() > 0 || !route.rewriteHost() ? "" : "Rewrites Host";
 			return Candidate.builder()
 				.clientId(route.clientId())
 				.address(route.address())

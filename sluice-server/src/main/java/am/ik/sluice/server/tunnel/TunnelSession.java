@@ -204,8 +204,8 @@ public final class TunnelSession implements AutoCloseable {
 						rejected.size());
 				for (Upstream upstream : advertised) {
 					log.info(
-							"client {} upstream: host=[{}] target={} preserve-host={} tls-passthrough={} listen-port={}",
-							this.clientId, upstream.getHost(), upstream.getTargetUrl(), upstream.getPreserveHost(),
+							"client {} upstream: host=[{}] target={} rewrite-host={} tls-passthrough={} listen-port={}",
+							this.clientId, upstream.getHost(), upstream.getTargetUrl(), upstream.getRewriteHost(),
 							upstream.getTlsPassthrough(), upstream.getListenPort());
 				}
 			}
