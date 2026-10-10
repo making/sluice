@@ -100,6 +100,26 @@ impl Guest for Component {
             return Ok(response);
         }
 
+        if path == "/stall" {
+            // Departure demo: one chunk, then the guest suspends on the host
+            // clock -- no further frame for the relay to fail on, so a client
+            // leaving mid-body is seen only by the tracked body's drop.
+            const STALL_NANOS: u64 = 60 * 1000 * 1000 * 1000;
+
+            let response_headers = wasi::http::types::Headers::new();
+            let _ = response_headers.append("content-type", b"text/plain");
+            let (mut body_tx, body_rx) = wit_stream::new();
+            let (trailers_tx, trailers_rx) = wit_future::new(|| todo!());
+            let (response, _transmit) = Response::new(response_headers, Some(body_rx), trailers_rx);
+            wit_bindgen::spawn_local(async move {
+                let _ = body_tx.write_all(vec![0xAB; 16]).await;
+                wasi::clocks::monotonic_clock::wait_for(STALL_NANOS).await;
+                drop(body_tx);
+                let _ = trailers_tx.write(Ok(None)).await;
+            });
+            return Ok(response);
+        }
+
         let payload =
             format!("hello from wasm\nmethod={method:?}\npath={path}\nbody_bytes={body_len}\n");
         // Fresh headers: the request's would carry a mismatched content-length.

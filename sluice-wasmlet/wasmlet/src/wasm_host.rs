@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context as TaskContext, Poll};
 
@@ -826,7 +826,8 @@ async fn serve_on(
 }
 
 /// Where a request's response goes: its head, its body frames, and its
-/// client, cancelled when hyper drops the response before its head.
+/// client, cancelled when hyper drops the response before its head, or its
+/// body mid-stream (`Tracked`).
 #[derive(Clone)]
 struct Reply {
     head: mpsc::Sender<Head>,
@@ -862,25 +863,99 @@ fn reply() -> (Reply, Awaited) {
 impl Awaited {
     /// The hyper response: the head as known, a synthesized failure, or a
     /// generic 500 when none arrived (the serving store died before any
-    /// head). Only a client leaving before the head cancels the request:
-    /// once the body streams, hyper drops it as soon as a `content-length`
-    /// is satisfied, which says nothing about the client. A client leaving
-    /// mid-body fails the relay's next send instead (`Outcome::Uncertain`),
-    /// and a guest stalled mid-body runs into its budget.
+    /// head). A client leaving before the head cancels through the guard;
+    /// past it, the departure is the tracked body's early drop (`Tracked`) --
+    /// hyper's own body drops say nothing by themselves, as it drops the
+    /// body once a `content-length` is satisfied, trailers pending or not.
     async fn response(mut self) -> hyper::Response<RelayBody> {
         let head = self.head.recv().await;
-        self.client.disarm();
+        let token = self.client.disarm();
         match head {
-            Some(Head::Response(parts)) => hyper::Response::from_parts(
-                parts,
-                http_body_util::StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(
-                    self.frames,
-                ))
-                .boxed_unsync(),
-            ),
+            Some(Head::Response(parts)) => {
+                let expected = parts
+                    .headers
+                    .get(http::header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse().ok());
+                let body = Tracked {
+                    frames: self.frames,
+                    token,
+                    sent: 0,
+                    expected,
+                    ended: false,
+                };
+                hyper::Response::from_parts(parts, body.boxed_unsync())
+            }
             Some(Head::Failure(status, message)) => plain_response(status, message),
             None => plain_response(500, "wasm handler failed".into()),
         }
+    }
+}
+
+/// The relayed body hyper consumes, telling a client's mid-body departure
+/// from the drops hyper does on its own: on a connection's end or a reset,
+/// which is a departure -- and once a declared `content-length` is satisfied,
+/// which is not, the trailers being all that is left. An early drop fires the
+/// reply's token, and the watchdog reclaims the serving store at once: the
+/// relay notices a gone client only at its next frame, which a guest stalled
+/// mid-body never produces.
+struct Tracked {
+    frames: mpsc::Receiver<RelayFrame>,
+    token: CancellationToken,
+    /// Body bytes handed to hyper so far.
+    sent: usize,
+    /// The head's `content-length`, when declared.
+    expected: Option<usize>,
+    /// Whether the stream's end went through: the channel's close, an error
+    /// frame, or the trailers -- the terminal frames. Past any of them a
+    /// drop is hyper's own.
+    ended: bool,
+}
+
+impl http_body::Body for Tracked {
+    type Data = bytes::Bytes;
+    type Error = RelayError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        match this.frames.poll_recv(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if frame.is_trailers() {
+                    // The terminal frame; nothing follows but the close.
+                    this.ended = true;
+                } else if let Some(data) = frame.data_ref() {
+                    this.sent += data.len();
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                this.ended = true;
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                this.ended = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.ended
+    }
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        // A satisfied `content-length` leaves at most the trailers: not a
+        // departure, the pool must not recycle over it.
+        if self.ended || self.expected.is_some_and(|len| self.sent >= len) {
+            return;
+        }
+        self.token.cancel();
     }
 }
 
@@ -967,6 +1042,25 @@ async fn supervise(
     }
 }
 
+/// Marks a live store on its handler's gauge, for the owning task's
+/// lifetime: the store is dropped inside `supervise` on the stop paths and
+/// with `run_concurrent`'s future on success -- never past the task.
+struct LiveStore(Arc<AtomicUsize>);
+
+impl LiveStore {
+    /// Marks a store on `live`.
+    fn mark(live: &Arc<AtomicUsize>) -> Self {
+        live.fetch_add(1, Ordering::Relaxed);
+        Self(live.clone())
+    }
+}
+
+impl Drop for LiveStore {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 async fn respond(
     handler: &Handler,
     request: hyper::Request<hyper::body::Incoming>,
@@ -1003,7 +1097,9 @@ async fn respond(
     // guest to keep producing while hyper drains at the client's pace. The
     // task ends when the response is fully relayed or the watchdog stops it.
     let label = loaded.label.clone();
+    let live = handler.live.clone();
     tokio::spawn(async move {
+        let _live = LiveStore::mark(&live);
         let (_watch, watched) = watch::channel(Some(InFlight {
             reply: reply.clone(),
             deadline,
@@ -1027,17 +1123,29 @@ pub struct Handler {
     loaded: Arc<Loaded>,
     sandbox: Sandbox,
     pool: Option<Arc<Pool>>,
+    /// Backing for `live_stores`, marked by `LiveStore`.
+    live: Arc<AtomicUsize>,
 }
 
 impl Handler {
     /// Starts the route's pool when its sandbox names one.
     pub fn new(loaded: Arc<Loaded>, sandbox: Sandbox) -> Arc<Handler> {
-        let pool = (sandbox.pool > 0).then(|| Pool::new(loaded.clone(), sandbox));
+        let live = Arc::new(AtomicUsize::new(0));
+        let pool = (sandbox.pool > 0).then(|| Pool::new(loaded.clone(), sandbox, live.clone()));
         Arc::new(Handler {
+            live,
             loaded,
             sandbox,
             pool,
         })
+    }
+
+    /// Stores whose owning task is alive: the pool's units and the
+    /// per-request ones. Every reclaim -- a departed client, a stop,
+    /// a completion -- is one mark fewer.
+    #[cfg(test)]
+    pub fn live_stores(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
     }
 }
 
@@ -1075,6 +1183,8 @@ struct Job {
 struct Pool {
     loaded: Arc<Loaded>,
     sandbox: Sandbox,
+    /// The handler's gauge: every unit marks its store on it.
+    live: Arc<AtomicUsize>,
     state: Mutex<PoolState>,
 }
 
@@ -1094,7 +1204,7 @@ struct PoolState {
 impl Pool {
     /// Spawns `sandbox.pool` units. Each instantiates asynchronously and is
     /// offered once ready; until then requests take the per-request path.
-    fn new(loaded: Arc<Loaded>, sandbox: Sandbox) -> Arc<Self> {
+    fn new(loaded: Arc<Loaded>, sandbox: Sandbox, live: Arc<AtomicUsize>) -> Arc<Self> {
         let pool = Arc::new(Self {
             state: Mutex::new(PoolState {
                 idle: Vec::new(),
@@ -1102,6 +1212,7 @@ impl Pool {
                 spawned: 0,
                 served: 0,
             }),
+            live,
             loaded,
             sandbox,
         });
@@ -1207,6 +1318,7 @@ async fn run_unit(pool: Arc<Pool>) {
     };
     let loaded = pool.loaded.clone();
     let budget = pool.sandbox.limits.budget;
+    let _live = LiveStore::mark(&pool.live);
     let mut store = wasmtime::Store::new(engine(), Ctx::new(&pool.sandbox, &loaded.label));
     store.limiter_async(|ctx| &mut ctx.limiter);
     // As in `respond`: the deadline must exist before any wasm runs.
@@ -2076,6 +2188,84 @@ mod tests {
 
     // -- instance pool ------------------------------------------------------
 
+    /// The tracked body's drop tells a departure from hyper's own drops: an
+    /// endless, unsatisfied body fires the token; the stream's end, its
+    /// error, a trailer or a satisfied `content-length` does not.
+    #[tokio::test]
+    async fn tracked_body_drop_tells_a_departure_from_the_benign_drops() {
+        fn tracked(
+            frames: mpsc::Receiver<RelayFrame>,
+            token: &CancellationToken,
+            sent: usize,
+            expected: Option<usize>,
+        ) -> Tracked {
+            Tracked {
+                frames,
+                token: token.clone(),
+                sent,
+                expected,
+                ended: false,
+            }
+        }
+
+        // the bare mid-body drop: a departure
+        let (_, rx) = mpsc::channel::<RelayFrame>(1);
+        let token = CancellationToken::new();
+        drop(tracked(rx, &token, 0, None));
+        assert!(token.is_cancelled(), "an endless body is a departure");
+
+        // a satisfied `content-length`, trailers owed: hyper's own drop
+        let (tx, rx) = mpsc::channel::<RelayFrame>(1);
+        let token = CancellationToken::new();
+        let mut body = tracked(rx, &token, 0, Some(3));
+        tx.send(Ok(http_body::Frame::data(bytes::Bytes::from("abc"))))
+            .await
+            .unwrap();
+        body.frame().await.unwrap().expect("the data frame");
+        drop(body);
+        assert!(!token.is_cancelled(), "a satisfied length is no departure");
+
+        // a trailer: the terminal frame
+        let (tx, rx) = mpsc::channel::<RelayFrame>(1);
+        let token = CancellationToken::new();
+        let mut body = tracked(rx, &token, 0, None);
+        tx.send(Ok(http_body::Frame::trailers(http::HeaderMap::new())))
+            .await
+            .unwrap();
+        body.frame().await.unwrap().expect("the trailer frame");
+        drop(body);
+        assert!(!token.is_cancelled(), "a trailed body is no departure");
+
+        // a body error: the terminal frame
+        let (tx, rx) = mpsc::channel::<RelayFrame>(1);
+        let token = CancellationToken::new();
+        let mut body = tracked(rx, &token, 0, None);
+        tx.send(Err("wasm body failed".into())).await.unwrap();
+        body.frame().await.expect("the error frame").unwrap_err();
+        drop(body);
+        assert!(!token.is_cancelled(), "an errored body is no departure");
+
+        // the stream's end
+        let (tx, rx) = mpsc::channel::<RelayFrame>(1);
+        let token = CancellationToken::new();
+        let mut body = tracked(rx, &token, 0, None);
+        drop(tx);
+        assert!(body.frame().await.is_none(), "the end");
+        drop(body);
+        assert!(!token.is_cancelled(), "an ended body is no departure");
+
+        // a length declared but not reached: back to a departure
+        let (tx, rx) = mpsc::channel::<RelayFrame>(1);
+        let token = CancellationToken::new();
+        let mut body = tracked(rx, &token, 0, Some(3));
+        tx.send(Ok(http_body::Frame::data(bytes::Bytes::from("ab"))))
+            .await
+            .unwrap();
+        body.frame().await.unwrap().expect("the short body frame");
+        drop(body);
+        assert!(token.is_cancelled(), "a short body is a departure");
+    }
+
     /// A handler whose route keeps `units` warm instances.
     fn pooled(loaded: &Arc<Loaded>, sandbox: Sandbox, units: usize) -> Arc<Handler> {
         Handler::new(
@@ -2390,6 +2580,105 @@ mod tests {
         let body = exchange(&handler, &get("/")).await;
         assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
         assert_eq!(pool(&handler).spawned(), 2, "the unit was replaced");
+    }
+
+    /// A `/stall` connection past its first body byte: the response head is
+    /// out (the tracked body live) and the guest suspended before any further
+    /// frame. Returns the connection's sides, for the abort.
+    async fn stalled_connection(
+        handler: &Arc<Handler>,
+    ) -> (mpsc::Sender<Ctrl>, mpsc::Receiver<Frame>) {
+        let (ctrl, mut frames) = open(handler, &get("/stall")).await;
+        let head_and_chunk = async {
+            let mut raw: Vec<u8> = Vec::new();
+            loop {
+                let frame = frames.recv().await.expect("the stalled response starts");
+                if let Body::Data(data) = frame.body.expect("frame body") {
+                    raw.extend_from_slice(&data.payload);
+                }
+                let Some(head_end) = raw
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|at| at + 4)
+                else {
+                    continue;
+                };
+                if raw.len() > head_end {
+                    break; // the head is out with a body byte: mid-body now
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), head_and_chunk)
+            .await
+            .expect("the stalled body starts");
+        (ctrl, frames)
+    }
+
+    /// A client leaving mid-body frees its unit at once, though the guest is
+    /// suspended and the relay sees no frame to fail on: the tracked body's
+    /// early drop fires, well before the budget.
+    #[tokio::test]
+    async fn a_client_leaving_mid_body_frees_its_unit_before_the_budget() {
+        let handler = pooled(&hello().await, Sandbox::default(), 1);
+        restocked(&handler, 1).await;
+
+        let (ctrl, frames) = stalled_connection(&handler).await;
+        assert_eq!(
+            pool(&handler).idle(),
+            0,
+            "the unit is serving the stalled body"
+        );
+
+        let started = Instant::now();
+        ctrl.send(Ctrl::Abort).await.unwrap();
+        drop(frames);
+
+        restocked(&handler, 1).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "freed well before the 10s budget: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(pool(&handler).spawned(), 2, "the unit was replaced");
+    }
+
+    /// The same departure on the cold path: the per-request store is freed
+    /// well before its budget, and the handler keeps serving.
+    #[tokio::test]
+    async fn a_client_leaving_mid_body_frees_the_cold_store_before_the_budget() {
+        let handler = Handler::new(hello().await, Sandbox::default());
+        assert_eq!(
+            handler.live_stores(),
+            0,
+            "no store before the first request"
+        );
+
+        let (ctrl, frames) = stalled_connection(&handler).await;
+        assert_eq!(handler.live_stores(), 1, "the request's store is held");
+
+        let started = Instant::now();
+        ctrl.send(Ctrl::Abort).await.unwrap();
+        drop(frames);
+
+        let freed = async {
+            while handler.live_stores() > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(3), freed)
+            .await
+            .expect("the store is freed well before the budget");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "freed within the wait: {:?}",
+            started.elapsed()
+        );
+
+        let body = tokio::time::timeout(Duration::from_secs(5), exchange(&handler, &get("/")))
+            .await
+            .expect("the handler keeps serving");
+        assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
+        assert_eq!(handler.live_stores(), 0, "the follow-up store left too");
     }
 
     /// A guest leaking a host handle leaves the resource table dirty: the
