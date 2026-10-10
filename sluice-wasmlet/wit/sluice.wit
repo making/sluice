@@ -1,10 +1,4 @@
-// Guest world: only what the handler needs, so generated bindings stay
-// minimal (the stock `wasi:http/service` world drags in cli/random/sockets
-// and conflicts with the http error type in the async runtime impls).
-package sluice:guest;
-
-world handler {
-    import wasi:clocks/monotonic-clock@0.3.0;
-    import wasi:http/types@0.3.0;
-    export wasi:http/handler@0.3.0;
-}
+// Anchor package: wit-bindgen resolves `deps/` (the vendored wasi 0.3
+// packages) through the root package of this directory. Guest worlds live
+// inline in each example, so adding one never touches this directory.
+package sluice:wit;

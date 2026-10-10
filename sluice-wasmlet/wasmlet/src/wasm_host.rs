@@ -7,11 +7,18 @@
 //! by per-route epoch budgets and memory caps. Response bodies stream: the
 //! store task relays frames to hyper through a bounded channel, so a slow
 //! client backpressures the guest instead of buffering the response.
+//!
+//! The WASI surface follows `wasmtime serve` for p3: a route links http +
+//! the p3 cli/clocks/random interfaces, `cli` links the full wasi p3 set, and
+//! the network capabilities configure the per-request `WasiCtx`. wasi p2 is
+//! unsupported: a p2-importing component is rejected at load. Guest stdout /
+//! stderr always reach the process log, line-prefixed.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context as TaskContext, Poll};
 
@@ -49,6 +56,10 @@ const DEFAULT_BUDGET_MS: u64 = 10_000;
 /// Linear-memory cap per instance when the route does not name one; a guest
 /// growing beyond it traps instead of OOM-ing the process.
 const DEFAULT_MEMORY_MIB: usize = 256;
+
+/// Longest guest log line buffered on the host; a longer run without newline
+/// is emitted in pieces, so a guest cannot grow host memory past its own cap.
+const GUEST_LOG_LINE_MAX: usize = 16 * 1024;
 
 // ---------------------------------------------------------------------------
 // Engine
@@ -156,12 +167,14 @@ pub struct Loaded {
     /// The pre-linked instantiation plan: import resolution and interface
     /// typechecking happen once here, so the per-request `instantiate_async`
     /// skips them. Measured on the hello guest (see the ignored
-    /// `instantiation_latency_reference`): ~265us full vs ~171us pre-linked
+    /// `instantiation_latency_reference`): ~260us full vs ~200us pre-linked
     /// (dev profile) per instantiation, i.e. the warm path stays far below a
     /// millisecond -- so instances are NOT pooled: `Store::run_concurrent`
     /// consumes the store, and guests legitimately keep module state across
     /// requests, so reuse would need per-guest reentrancy knowledge.
     service_pre: wasmtime_wasi_http::p3::bindings::ServicePre<Ctx>,
+    /// Short component name (the locator's last path segment) for log prefixes.
+    label: String,
 }
 
 /// Per-route resource limits, applied to every request's instance.
@@ -186,36 +199,222 @@ impl Default for Limits {
     }
 }
 
-/// Loads (or fetches from cache) the component behind `locator`.
-pub async fn load(locator: &Locator) -> Result<Arc<Loaded>, String> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Arc<Loaded>>>> = OnceLock::new();
+impl Limits {
+    /// Applies one `key=value` route option; false when the key is not a limit.
+    fn set(&mut self, key: &str, value: &str) -> Result<bool, String> {
+        let number = || -> Result<u64, String> {
+            value.parse().map_err(|_| format!("{key}: not a number '{value}'"))
+        };
+        match key {
+            "budget-ms" => self.budget = std::time::Duration::from_millis(number()?.max(1)),
+            "memory-mib" => self.memory = (number()? as usize) << 20,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+/// Per-route WASI capabilities, named after the `-S` options `wasmtime serve`
+/// takes, so a component runs here with the flags it runs with there. None
+/// granted is the serve default: http plus the p3 cli / clocks / random
+/// interfaces (stdio included).
+///
+/// - `http` (outgoing requests via `wasi:http/client`) is always linked, as in
+///   serve; the name is accepted for parity with `-S http` and changes nothing.
+/// - `cli` is linker-level, as in serve: the full wasi p3 surface (sockets
+///   and filesystem included) is linked. wasi p2 is never linked: p2 guests
+///   are unsupported. A component importing an
+///   interface its route does not link fails at startup.
+/// - the network capabilities are enforced by `wasmtime-wasi` on every socket
+///   call (`WasiCtx`): `tcp` / `udp` allow the protocol, `inherit-network`
+///   allows every address (and implies `tcp` + `udp`), `allow-ip-name-lookup`
+///   allows `wasi:sockets/ip-name-lookup`. Without `inherit-network` every
+///   address is denied. They need `cli`, since sockets are not linked otherwise.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Caps {
+    pub cli: bool,
+    pub inherit_network: bool,
+    pub allow_ip_name_lookup: bool,
+    pub tcp: bool,
+    pub udp: bool,
+}
+
+impl Caps {
+    /// Accepted but always granted (see the type doc), so not a flag.
+    const HTTP: &'static str = "http";
+
+    /// Capability names in canonical order.
+    const NAMES: [&'static str; 5] = [
+        "cli",
+        "inherit-network",
+        "allow-ip-name-lookup",
+        "tcp",
+        "udp",
+    ];
+
+    fn flag(&mut self, name: &str) -> Option<&mut bool> {
+        match name {
+            "cli" => Some(&mut self.cli),
+            "inherit-network" => Some(&mut self.inherit_network),
+            "allow-ip-name-lookup" => Some(&mut self.allow_ip_name_lookup),
+            "tcp" => Some(&mut self.tcp),
+            "udp" => Some(&mut self.udp),
+            _ => None,
+        }
+    }
+
+    /// Parses a comma-separated capability list (`cli,inherit-network`).
+    pub fn parse(list: &str) -> Result<Caps, String> {
+        let mut caps = Caps::default();
+        for name in list.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+            if name == Caps::HTTP {
+                continue;
+            }
+            let Some(flag) = caps.flag(name) else {
+                return Err(format!(
+                    "unknown wasi capability '{name}' ({}, {})",
+                    Caps::NAMES.join(", "),
+                    Caps::HTTP
+                ));
+            };
+            *flag = true;
+        }
+        let network = caps.inherit_network || caps.allow_ip_name_lookup || caps.tcp || caps.udp;
+        if network && !caps.cli {
+            return Err("network capabilities need 'cli' (wasi:sockets is linked only with it)".into());
+        }
+        Ok(caps)
+    }
+
+    /// The granted names in canonical order.
+    fn names(&self) -> Vec<&'static str> {
+        let mut caps = *self;
+        Caps::NAMES
+            .into_iter()
+            .filter(|name| *caps.flag(name).expect("known name"))
+            .collect()
+    }
+
+    fn configure(&self, wasi: &mut wasmtime_wasi::WasiCtxBuilder) {
+        if self.inherit_network {
+            wasi.inherit_network().allow_tcp(true).allow_udp(true);
+        }
+        if self.allow_ip_name_lookup {
+            wasi.allow_ip_name_lookup(true);
+        }
+        if self.tcp {
+            wasi.allow_tcp(true);
+        }
+        if self.udp {
+            wasi.allow_udp(true);
+        }
+    }
+}
+
+/// Everything a route configures for its instances: resource limits and
+/// WASI capabilities.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Sandbox {
+    pub limits: Limits,
+    pub caps: Caps,
+}
+
+impl Sandbox {
+    /// Parses the route query (`budget-ms=N&memory-mib=N&wasi=cli,tcp`).
+    pub fn parse(query: &str) -> Result<Sandbox, String> {
+        let mut sandbox = Sandbox::default();
+        for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+            let Some((key, value)) = pair.split_once('=') else {
+                return Err(format!("expected key=value in '{query}'"));
+            };
+            if key == "wasi" {
+                sandbox.caps = Caps::parse(value)?;
+            } else if !sandbox.limits.set(key, value)? {
+                return Err(format!(
+                    "unknown option '{key}' (budget-ms, memory-mib, wasi)"
+                ));
+            }
+        }
+        Ok(sandbox)
+    }
+
+    /// The canonical query of the non-default settings; empty for defaults.
+    /// Part of the advertised target, so every distinct sandbox of one
+    /// component is its own dial address.
+    pub fn query(&self) -> String {
+        let defaults = Limits::default();
+        let mut pairs = Vec::new();
+        if self.limits.budget != defaults.budget {
+            pairs.push(format!("budget-ms={}", self.limits.budget.as_millis()));
+        }
+        if self.limits.memory != defaults.memory {
+            pairs.push(format!("memory-mib={}", self.limits.memory >> 20));
+        }
+        let caps = self.caps.names();
+        if !caps.is_empty() {
+            pairs.push(format!("wasi={}", caps.join(",")));
+        }
+        pairs.join("&")
+    }
+}
+
+/// Loads (or fetches from cache) the component behind `locator`, linked for
+/// the `caps` it runs with (only `cli` changes the linker).
+pub async fn load(locator: &Locator, caps: Caps) -> Result<Arc<Loaded>, String> {
+    // (target, cli) -> component: `cli` selects the linker
+    type Cache = Mutex<HashMap<(String, bool), Arc<Loaded>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = locator.target().await?;
+    let target = locator.target().await?;
+    let key = (target, caps.cli);
     if let Some(loaded) = cache.lock().unwrap().get(&key) {
         return Ok(loaded.clone());
     }
+    let label = key.0.rsplit('/').next().unwrap_or(&key.0).to_string();
     let bytes = locator.fetch().await?;
     let engine = engine().clone();
-    let component = wasmtime::component::Component::new(&engine, &bytes).map_err(|e| {
-        format!(
-            "component {}: {e}",
-            key.strip_prefix("wasm:").unwrap_or(&key)
-        )
+    let name = key.0.strip_prefix("wasm:").unwrap_or(&key.0);
+    let component = wasmtime::component::Component::new(&engine, &bytes)
+        .map_err(|e| format!("component {name}: {e}"))?;
+    if let Some(p2) = component
+        .component_type()
+        .imports(&engine)
+        .map(|(import, _)| import)
+        .find(|import| import.starts_with("wasi:") && import.contains("@0.2."))
+    {
+        return Err(format!(
+            "component {name} imports {p2}: wasi p2 is unsupported (build for wasm32-wasip3)"
+        ));
+    }
+    let linker = linker(&engine, caps).map_err(|e| format!("linker: {e}"))?;
+    let pre = linker.instantiate_pre(&component).map_err(|e| {
+        let hint = if caps.cli { "" } else { " (the route may need wasi=cli)" };
+        format!("pre-instantiate {name}: {e:#}{hint}")
     })?;
-    let mut linker = wasmtime::component::Linker::<Ctx>::new(&engine);
-    // p2 hosts the rust std imports of wasm32-wasip2 components; p3 hosts the
-    // wasi 0.3 world the guest is written against.
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| format!("linker: {e}"))?;
-    wasmtime_wasi::p3::add_to_linker(&mut linker).map_err(|e| format!("linker: {e}"))?;
-    wasmtime_wasi_http::p3::add_to_linker(&mut linker).map_err(|e| format!("linker: {e}"))?;
-    let pre = linker
-        .instantiate_pre(&component)
-        .map_err(|e| format!("pre-instantiate {}: {e}", key.strip_prefix("wasm:").unwrap_or(&key)))?;
     let service_pre =
         wasmtime_wasi_http::p3::bindings::ServicePre::new(pre).map_err(|e| format!("bind: {e}"))?;
-    let loaded = Arc::new(Loaded { service_pre });
+    let loaded = Arc::new(Loaded { service_pre, label });
     cache.lock().unwrap().insert(key, loaded.clone());
     Ok(loaded)
+}
+
+/// The interfaces a route links, as `wasmtime serve` does for p3: http plus
+/// cli / clocks / random, or with `cli` the full wasi p3 set. Unlike serve's
+/// `-Scli`, no p2 interface is linked.
+fn linker(
+    engine: &wasmtime::Engine,
+    caps: Caps,
+) -> wasmtime::Result<wasmtime::component::Linker<Ctx>> {
+    let mut linker = wasmtime::component::Linker::<Ctx>::new(engine);
+    if caps.cli {
+        wasmtime_wasi::p3::add_to_linker(&mut linker)?;
+    } else {
+        wasmtime_wasi::p3::clocks::add_to_linker(&mut linker)?;
+        wasmtime_wasi::p3::random::add_to_linker(&mut linker)?;
+        wasmtime_wasi::p3::cli::add_to_linker(&mut linker)?;
+    }
+    wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
+    Ok(linker)
 }
 
 // ---------------------------------------------------------------------------
@@ -234,14 +433,22 @@ struct Ctx {
 }
 
 impl Ctx {
-    fn new(limits: Limits) -> Self {
+    /// A request's store state; `label` names the component in the guest's
+    /// log lines.
+    fn new(sandbox: &Sandbox, label: &str) -> Self {
+        static REQUESTS: AtomicU64 = AtomicU64::new(1);
+        let request = REQUESTS.fetch_add(1, Ordering::Relaxed);
+        let mut wasi = wasmtime_wasi::WasiCtxBuilder::new();
+        wasi.stdout(GuestLog::new(format!("stdout [{label}#{request}] :: "), Output::Stdout));
+        wasi.stderr(GuestLog::new(format!("stderr [{label}#{request}] :: "), Output::Stderr));
+        sandbox.caps.configure(&mut wasi);
         Self {
             table: wasmtime::component::ResourceTable::default(),
-            wasi: wasmtime_wasi::WasiCtxBuilder::new().build(),
+            wasi: wasi.build(),
             http: wasmtime_wasi_http::WasiHttpCtx::new(),
             hooks: NoHooks,
             limiter: MemoryCap {
-                max: limits.memory,
+                max: sandbox.limits.memory,
             },
         }
     }
@@ -272,6 +479,114 @@ impl wasmtime::ResourceLimiterAsync for MemoryCap {
         _maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
         Ok(true)
+    }
+}
+
+/// Which process stream a guest stream is logged to.
+#[derive(Clone, Copy)]
+enum Output {
+    Stdout,
+    Stderr,
+}
+
+/// A guest stdout / stderr: whole lines, each prefixed with the component and
+/// request, are written to the process stream in one call, so concurrent
+/// requests do not interleave mid-line. A trailing partial line is flushed
+/// when the request's store goes away, an overlong one at
+/// `GUEST_LOG_LINE_MAX`.
+#[derive(Clone)]
+struct GuestLog {
+    state: Arc<GuestLogState>,
+}
+
+struct GuestLogState {
+    prefix: String,
+    output: Output,
+    pending: Mutex<Vec<u8>>,
+}
+
+impl GuestLog {
+    fn new(prefix: String, output: Output) -> Self {
+        Self {
+            state: Arc::new(GuestLogState {
+                prefix,
+                output,
+                pending: Mutex::new(Vec::new()),
+            }),
+        }
+    }
+
+    fn write(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut pending = self.state.pending.lock().unwrap();
+        pending.extend_from_slice(bytes);
+        let end = match pending.iter().rposition(|b| *b == b'\n') {
+            Some(newline) => newline + 1,
+            None if pending.len() >= GUEST_LOG_LINE_MAX => pending.len(),
+            None => return Ok(()),
+        };
+        let lines: Vec<u8> = pending.drain(..end).collect();
+        drop(pending);
+        self.state.emit(&lines)
+    }
+}
+
+impl GuestLogState {
+    /// Writes complete lines (the last may lack its newline) with the prefix.
+    fn emit(&self, lines: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut out = Vec::with_capacity(lines.len() + 16);
+        for line in lines.split_inclusive(|b| *b == b'\n') {
+            out.extend_from_slice(self.prefix.as_bytes());
+            out.extend_from_slice(line);
+        }
+        if !out.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+        #[cfg(test)]
+        tests::captured_log().lock().unwrap().extend_from_slice(&out);
+        match self.output {
+            Output::Stdout => std::io::stdout().lock().write_all(&out),
+            Output::Stderr => std::io::stderr().lock().write_all(&out),
+        }
+    }
+}
+
+impl Drop for GuestLogState {
+    fn drop(&mut self) {
+        let pending = std::mem::take(self.pending.get_mut().unwrap_or_else(|e| e.into_inner()));
+        if !pending.is_empty() {
+            let _ = self.emit(&pending);
+        }
+    }
+}
+
+impl wasmtime_wasi::cli::StdoutStream for GuestLog {
+    fn async_stream(&self) -> Box<dyn AsyncWrite + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+impl wasmtime_wasi::cli::IsTerminal for GuestLog {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl AsyncWrite for GuestLog {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(self.write(buf).map(|()| buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -360,10 +675,11 @@ fn failure(e: &wasmtime::Error) -> (u16, String) {
 
 async fn respond(
     loaded: &Loaded,
-    limits: Limits,
+    sandbox: Sandbox,
     req: hyper::Request<hyper::body::Incoming>,
 ) -> hyper::Response<RelayBody> {
-    let mut store = wasmtime::Store::new(engine(), Ctx::new(limits));
+    let limits = sandbox.limits;
+    let mut store = wasmtime::Store::new(engine(), Ctx::new(&sandbox, &loaded.label));
     store.limiter_async(|ctx| &mut ctx.limiter);
     // The deadline must exist before any wasm runs: with epoch interruption
     // enabled, a store without one traps on the first observed tick. The
@@ -452,7 +768,7 @@ pub async fn serve(
     registry: crate::Registry,
     conn_id: i64,
     component: Arc<Loaded>,
-    limits: Limits,
+    sandbox: Sandbox,
     ctrl: mpsc::Receiver<Ctrl>,
 ) {
     let mut io = TunnelIo::new(tx, conn_id, ctrl);
@@ -472,7 +788,7 @@ pub async fn serve(
 
     let service = hyper::service::service_fn(move |req| {
         let component = component.clone();
-        async move { Ok::<_, std::convert::Infallible>(respond(&component, limits, req).await) }
+        async move { Ok::<_, std::convert::Infallible>(respond(&component, sandbox, req).await) }
     });
     let served = if h2 {
         hyper::server::conn::http2::Builder::new(TokioExecutor)
@@ -651,35 +967,45 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// Builds the hello guest (a no-op when fresh) and returns the component
-    /// path. The `wasm32-wasip2` artifacts live in the regular target dir, so
-    /// repeated runs reuse cargo's incrementality.
-    fn hello_wasm() -> std::path::PathBuf {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    /// Builds the example guests (a no-op when fresh, serialized across
+    /// tests) and returns the path of `name`'s component. The examples are
+    /// their own workspace with a pinned nightly toolchain (wasm32-wasip3), so
+    /// the build goes through the rustup proxy from that directory -- not
+    /// `$CARGO`, and without the `RUSTUP_TOOLCHAIN` the outer build exports.
+    fn guest_wasm(name: &str) -> std::path::PathBuf {
+        static BUILD: Mutex<()> = Mutex::new(());
+        let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .to_path_buf();
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let output = std::process::Command::new(cargo)
-            .args([
-                "build",
-                "--release",
-                "-p",
-                "hello",
-                "--target",
-                "wasm32-wasip2",
-            ])
-            .current_dir(&root)
+            .join("examples");
+        let _serialized = BUILD.lock().unwrap_or_else(|e| e.into_inner());
+        let output = std::process::Command::new("cargo")
+            .args(["build", "--release"])
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .env_remove("CARGO")
+            .current_dir(&examples)
             .output()
-            .expect("run cargo for the guest build");
+            .expect("run cargo (rustup) for the guest build");
         assert!(
             output.status.success(),
             "guest build failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         let target = std::env::var("CARGO_TARGET_DIR")
-            .unwrap_or_else(|_| root.join("target").into_os_string().into_string().unwrap());
-        std::path::Path::new(&target).join("wasm32-wasip2/release/hello.wasm")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| examples.join("target"));
+        target.join(format!("wasm32-wasip3/release/{name}.wasm"))
+    }
+
+    fn hello_wasm() -> std::path::PathBuf {
+        guest_wasm("hello")
+    }
+
+    /// Process-wide copy of every guest log line, so tests can assert on
+    /// guest stdio (they filter by their own marker: tests run concurrently).
+    pub(super) fn captured_log() -> &'static Mutex<Vec<u8>> {
+        static CAPTURED: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+        &CAPTURED
     }
 
     /// Reference latencies for the instantiation paths, backing the decision
@@ -691,17 +1017,15 @@ mod tests {
         let bytes = std::fs::read(hello_wasm()).unwrap();
         let engine = engine().clone();
         let component = wasmtime::component::Component::new(&engine, &bytes).unwrap();
-        let mut linker = wasmtime::component::Linker::<Ctx>::new(&engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker).unwrap();
-        wasmtime_wasi::p3::add_to_linker(&mut linker).unwrap();
-        wasmtime_wasi_http::p3::add_to_linker(&mut linker).unwrap();
+        let linker = linker(&engine, Caps::default()).unwrap();
 
         // full path: import resolution + instantiation, once per request
         async fn full<'a>(
             linker: &'a wasmtime::component::Linker<Ctx>,
             component: &'a wasmtime::component::Component,
         ) -> wasmtime::Result<()> {
-            let mut store = wasmtime::Store::new(linker.engine(), Ctx::new(Limits::default()));
+            let mut store =
+                wasmtime::Store::new(linker.engine(), Ctx::new(&Sandbox::default(), "bench"));
             store.set_epoch_deadline(u64::MAX / 2);
             let _ = wasmtime_wasi_http::p3::bindings::Service::instantiate_async(
                 &mut store,
@@ -714,7 +1038,8 @@ mod tests {
         // pre-linked path: instantiation only, what `respond` pays
         let pre = linker.instantiate_pre(&component).unwrap();
         async fn pre_linked(pre: &wasmtime::component::InstancePre<Ctx>) -> wasmtime::Result<()> {
-            let mut store = wasmtime::Store::new(pre.engine(), Ctx::new(Limits::default()));
+            let mut store =
+                wasmtime::Store::new(pre.engine(), Ctx::new(&Sandbox::default(), "bench"));
             store.set_epoch_deadline(u64::MAX / 2);
             let _ = pre.instantiate_async(&mut store).await?;
             Ok(())
@@ -740,11 +1065,11 @@ mod tests {
 
     /// Drives one request through `serve` over in-memory frame channels and
     /// returns the raw response bytes up to the tunnel Close.
-    async fn exchange(loaded: &std::sync::Arc<Loaded>, limits: Limits, request: &str) -> String {
+    async fn exchange(loaded: &std::sync::Arc<Loaded>, sandbox: Sandbox, request: &str) -> String {
         let (tx, mut rx) = mpsc::channel::<Frame>(64);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<Ctrl>(32);
         let registry = crate::Registry::default();
-        tokio::spawn(serve(tx, registry, 1, loaded.clone(), limits, ctrl_rx));
+        tokio::spawn(serve(tx, registry, 1, loaded.clone(), sandbox, ctrl_rx));
         ctrl_tx
             .send(Ctrl::Payload(request.as_bytes().to_vec()))
             .await
@@ -768,14 +1093,17 @@ mod tests {
     /// next request on the same component is unaffected.
     #[tokio::test]
     async fn budget_exhaustion_is_a_504_and_later_requests_keep_serving() {
-        let loaded = load(&Locator::File(hello_wasm())).await.unwrap();
-        let limits = Limits {
-            budget: Duration::from_millis(100),
-            ..Limits::default()
+        let loaded = load(&Locator::File(hello_wasm()), Caps::default()).await.unwrap();
+        let sandbox = Sandbox {
+            limits: Limits {
+                budget: Duration::from_millis(100),
+                ..Limits::default()
+            },
+            ..Sandbox::default()
         };
         let body = exchange(
             &loaded,
-            limits,
+            sandbox,
             "GET /spin HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
         )
         .await;
@@ -784,7 +1112,7 @@ mod tests {
 
         let body = exchange(
             &loaded,
-            Limits::default(),
+            Sandbox::default(),
             "GET / HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
         )
         .await;
@@ -795,15 +1123,18 @@ mod tests {
     /// instead of OOM-ing the process, and later requests keep serving.
     #[tokio::test]
     async fn memory_cap_yields_a_clean_error_and_later_requests_keep_serving() {
-        let loaded = load(&Locator::File(hello_wasm())).await.unwrap();
+        let loaded = load(&Locator::File(hello_wasm()), Caps::default()).await.unwrap();
         // above the guest's instantiation footprint, below its ballooning
-        let limits = Limits {
-            memory: 8 << 20,
-            ..Limits::default()
+        let sandbox = Sandbox {
+            limits: Limits {
+                memory: 8 << 20,
+                ..Limits::default()
+            },
+            ..Sandbox::default()
         };
         let body = exchange(
             &loaded,
-            limits,
+            sandbox,
             "GET /balloon HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
         )
         .await;
@@ -811,7 +1142,7 @@ mod tests {
 
         let body = exchange(
             &loaded,
-            limits,
+            sandbox,
             "GET / HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
         )
         .await;
@@ -824,12 +1155,12 @@ mod tests {
     #[tokio::test]
     async fn streams_response_frames_as_the_guest_produces_them() {
         let wasm = hello_wasm();
-        let loaded = load(&Locator::File(wasm)).await.unwrap();
+        let loaded = load(&Locator::File(wasm), Caps::default()).await.unwrap();
 
         let (tx, mut rx) = mpsc::channel::<Frame>(64);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<Ctrl>(32);
         let registry = crate::Registry::default();
-        tokio::spawn(serve(tx, registry, 1, loaded, Limits::default(), ctrl_rx));
+        tokio::spawn(serve(tx, registry, 1, loaded, Sandbox::default(), ctrl_rx));
 
         ctrl_tx
             .send(Ctrl::Payload(
@@ -881,5 +1212,228 @@ mod tests {
         // that window instead of appearing at once (the old buffered path).
         let spread = closed_at.unwrap().as_millis() - first_body_at.unwrap().as_millis();
         assert!(spread > 300, "body spread too small: {spread}ms");
+    }
+
+    /// Guest stdout and stderr reach the process log as whole lines, each
+    /// prefixed with the component and the request -- with no capability, as
+    /// under `wasmtime serve`.
+    #[tokio::test]
+    async fn guest_stdio_lands_in_the_log_with_a_request_prefix() {
+        let loaded = load(&Locator::File(hello_wasm()), Caps::default()).await.unwrap();
+        let body = exchange(
+            &loaded,
+            Sandbox::default(),
+            "GET /log HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
+
+        let log = String::from_utf8_lossy(&captured_log().lock().unwrap()).into_owned();
+        let line = |stream: &str, text: &str| {
+            log.lines()
+                .find(|line| line.starts_with(&format!("{stream} [hello.wasm#")) && line.ends_with(text))
+                .map(str::to_string)
+        };
+        let stdout = line("stdout", "] :: hello stdout: Method::Get /log body_bytes=0")
+            .unwrap_or_else(|| panic!("stdout line missing in: {log}"));
+        let stderr = line("stderr", "] :: hello stderr: Method::Get /log")
+            .unwrap_or_else(|| panic!("stderr line missing in: {log}"));
+        // one request, one id
+        let id = |line: &str| line.split_once('#').unwrap().1.split_once(']').unwrap().0.to_string();
+        assert_eq!(id(&stdout), id(&stderr));
+    }
+
+    /// A guest writing without newlines is emitted in bounded pieces instead
+    /// of buffering on the host; the remainder is flushed when the log drops.
+    #[test]
+    fn guest_log_bounds_an_unterminated_line() {
+        let prefix = "stdout [unterminated-test] :: ";
+        let log = GuestLog::new(prefix.into(), Output::Stdout);
+        log.write(&vec![b'x'; GUEST_LOG_LINE_MAX + 10]).unwrap();
+        assert_eq!(log.state.pending.lock().unwrap().len(), 0);
+        log.write(b"tail").unwrap();
+        drop(log);
+
+        let captured = captured_log().lock().unwrap().clone();
+        let lines: Vec<String> = String::from_utf8(captured)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix(prefix).map(str::to_string))
+            .collect();
+        assert_eq!(lines, ["x".repeat(GUEST_LOG_LINE_MAX + 10), "tail".to_string()]);
+    }
+
+    /// A raw TCP upstream: reads each request head, answers `pong` (HTTP/1.0,
+    /// read to EOF).
+    async fn pong_upstream() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = socket.write_all(b"HTTP/1.0 200 OK\r\n\r\npong").await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn relay_request(addr: std::net::SocketAddr) -> String {
+        format!("GET /?addr={addr} HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n")
+    }
+
+    /// `cli,inherit-network` lets the guest dial a TCP upstream and compose
+    /// its response from the reply.
+    #[tokio::test]
+    async fn granted_network_lets_the_guest_dial_a_tcp_upstream() {
+        let caps = Caps::parse("cli,inherit-network").unwrap();
+        let loaded = load(&Locator::File(guest_wasm("relay")), caps).await.unwrap();
+        let upstream = pong_upstream().await;
+        let sandbox = Sandbox {
+            caps,
+            ..Sandbox::default()
+        };
+        let body = exchange(&loaded, sandbox, &relay_request(upstream)).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
+        assert!(body.contains(&format!("relayed from {upstream}")), "body: {body}");
+        assert!(body.contains("HTTP/1.0 200 OK\r\n\r\npong"), "body: {body}");
+    }
+
+    /// Without `inherit-network` the socket call is denied by the host: the
+    /// guest gets `access-denied` (here: a 502 it renders), the tunnel
+    /// connection and later requests are unaffected.
+    #[tokio::test]
+    async fn ungranted_network_is_denied_and_later_requests_keep_serving() {
+        let upstream = pong_upstream().await;
+        for granted in ["cli", "cli,tcp"] {
+            let caps = Caps::parse(granted).unwrap();
+            let loaded = load(&Locator::File(guest_wasm("relay")), caps).await.unwrap();
+            let sandbox = Sandbox {
+                caps,
+                ..Sandbox::default()
+            };
+            let body = exchange(&loaded, sandbox, &relay_request(upstream)).await;
+            assert!(body.starts_with("HTTP/1.1 502"), "{granted}: {body}");
+            assert!(body.contains("AccessDenied"), "{granted}: {body}");
+        }
+
+        let caps = Caps::parse("cli,inherit-network").unwrap();
+        let loaded = load(&Locator::File(guest_wasm("relay")), caps).await.unwrap();
+        let sandbox = Sandbox {
+            caps,
+            ..Sandbox::default()
+        };
+        let body = exchange(&loaded, sandbox, &relay_request(upstream)).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
+    }
+
+    /// A component importing one wasi interface of version `version`.
+    fn importing_environment(version: &str) -> wasmtime::component::Component {
+        let wat = format!(
+            r#"(component
+                 (import "wasi:cli/environment@{version}" (instance
+                   (export "get-environment" (func (result (list (tuple string string)))))))
+               )"#
+        );
+        wasmtime::component::Component::new(engine(), wat).unwrap()
+    }
+
+    /// wasi p2 is unsupported: no route links it, not even with `cli`, so a
+    /// p2 import fails at startup while its p3 counterpart links.
+    #[test]
+    fn p2_imports_are_never_linked() {
+        for caps in [Caps::default(), Caps::parse("cli").unwrap()] {
+            let linker = linker(engine(), caps).unwrap();
+            let p2 = linker.instantiate_pre(&importing_environment("0.2.6"));
+            assert!(p2.is_err(), "{caps:?} linked wasi p2");
+            linker
+                .instantiate_pre(&importing_environment("0.3.0"))
+                .unwrap_or_else(|e| panic!("{caps:?}: {e:#}"));
+        }
+    }
+
+    /// Loading a p2-importing component names the cause instead of a missing
+    /// link (or a misleading `wasi=cli` hint).
+    #[tokio::test]
+    async fn loading_a_p2_component_is_rejected_as_unsupported() {
+        let path = std::env::temp_dir().join(format!("sluice-p2-import-{}.wat", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"(component
+                 (import "wasi:cli/environment@0.2.6" (instance
+                   (export "get-environment" (func (result (list (tuple string string)))))))
+               )"#,
+        )
+        .unwrap();
+        for caps in [Caps::default(), Caps::parse("cli").unwrap()] {
+            let error = match load(&Locator::File(path.clone()), caps).await {
+                Ok(_) => panic!("{caps:?} loaded a p2 component"),
+                Err(error) => error,
+            };
+            assert!(error.contains("imports wasi:cli/environment@0.2.6"), "{error}");
+            assert!(error.contains("wasi p2 is unsupported"), "{error}");
+        }
+    }
+
+    /// Without `cli` wasi:sockets is not linked: a component importing it
+    /// fails at load (startup), as under `wasmtime serve` without `-Scli`.
+    #[tokio::test]
+    async fn a_socket_importing_component_needs_cli_to_load() {
+        let error = match load(&Locator::File(guest_wasm("relay")), Caps::default()).await {
+            Ok(_) => panic!("loaded without cli"),
+            Err(error) => error,
+        };
+        assert!(error.contains("wasi:sockets/types@0.3.0"), "{error}");
+        assert!(error.contains("wasi=cli"), "{error}");
+    }
+
+    fn fetch_request(url: &str) -> String {
+        format!("GET /?url={url} HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n")
+    }
+
+    /// Outgoing http (wasi:http/client) needs no capability, as under
+    /// `wasmtime serve`: the guest calls the upstream and composes its reply.
+    #[tokio::test]
+    async fn outgoing_http_needs_no_capability() {
+        let loaded = load(&Locator::File(guest_wasm("fetch")), Caps::default()).await.unwrap();
+        let upstream = pong_upstream().await;
+        let url = format!("http://{upstream}/ping?x=1");
+        let body = exchange(&loaded, Sandbox::default(), &fetch_request(&url)).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
+        assert!(body.contains(&format!("fetched {url} -> 200\n")), "body: {body}");
+        assert!(body.contains("pong"), "body: {body}");
+    }
+
+    /// A failing upstream (here: hang-up before any response) surfaces to the
+    /// guest as an `ErrorCode` (rendered as a 502); later requests keep serving.
+    #[tokio::test]
+    async fn outgoing_http_failure_reaches_the_guest_and_later_requests_keep_serving() {
+        let loaded = load(&Locator::File(guest_wasm("fetch")), Caps::default()).await.unwrap();
+        // accepts and hangs up without a response
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hangup = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
+        let url = format!("http://{hangup}/");
+        let body = exchange(&loaded, Sandbox::default(), &fetch_request(&url)).await;
+        assert!(body.starts_with("HTTP/1.1 502"), "head: {body}");
+        assert!(body.contains(&format!("fetch {url} failed: ErrorCode::")), "body: {body}");
+
+        let upstream = pong_upstream().await;
+        let url = format!("http://{upstream}/");
+        let body = exchange(&loaded, Sandbox::default(), &fetch_request(&url)).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
     }
 }

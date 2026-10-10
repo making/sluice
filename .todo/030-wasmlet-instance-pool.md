@@ -3,7 +3,7 @@ Difficulty: Medium
 # sluice-wasmlet: reuse guest instances via a persistent store-worker pool
 
 Trigger: load testing shows instantiation in the profile. The warm path is
-~171us today (`Loaded` doc in `wasm_host.rs`, the ignored
+~200us today (`Loaded` doc in `wasm_host.rs`, the ignored
 `instantiation_latency_reference`); at ~1k req/s that is ~0.2 core and the
 point where a pool starts paying.
 

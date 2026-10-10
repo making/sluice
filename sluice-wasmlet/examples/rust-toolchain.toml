@@ -1,0 +1,5 @@
+# wasm32-wasip3 ships rust-std on nightly only; pinned for reproducible guests.
+[toolchain]
+channel = "nightly-2026-10-09"
+profile = "minimal"
+targets = ["wasm32-wasip3"]

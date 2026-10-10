@@ -1,0 +1,17 @@
+# Guest components: a separate workspace so its toolchain pin (nightly, for the
+# wasm32-wasip3 target) does not leak into the host build. Every directory
+# with a Cargo.toml is an example; each declares its world inline (see
+# hello/src/lib.rs), so adding one touches nothing outside its directory.
+[workspace]
+resolver = "3"
+members = ["*"]
+# `*` also matches the non-example directories
+exclude = [".cargo", "target"]
+
+[workspace.dependencies]
+# >= 0.62: older async runtimes keep their task state in context slot 0, which
+# the wasm32-wasip3 std also uses -- every async export panics there.
+wit-bindgen = { version = "0.62", features = ["async-spawn"] }
+
+[profile.release]
+strip = true

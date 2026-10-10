@@ -1,9 +1,17 @@
 // Sluice guest handler: a wasi:http 0.3 incoming-handler component.
 //
-// Build: cargo build --release --target wasm32-wasip2 -p sluice-guest
+// Build (from `examples/`): cargo build --release -p hello
 wit_bindgen::generate!({
     path: "../../wit",
-    world: "sluice:guest/handler",
+    inline: "
+        package sluice:hello;
+
+        world hello {
+            import wasi:clocks/monotonic-clock@0.3.0;
+            import wasi:http/types@0.3.0;
+            export wasi:http/handler@0.3.0;
+        }
+    ",
     features: ["clocks-timezone"],
     generate_all,
 });
@@ -37,6 +45,12 @@ impl Guest for Component {
         }
         drop(result_tx);
 
+        if path == "/log" {
+            // Guest stdio demo: both lines land in the wasmlet log, prefixed.
+            println!("hello stdout: {method:?} {path} body_bytes={body_len}");
+            eprintln!("hello stderr: {method:?} {path}");
+        }
+
         if path == "/panic" {
             // Sandbox demo: a guest trap must not take the tunnel down.
             panic!("guest panic (PoC)");
@@ -65,7 +79,7 @@ impl Guest for Component {
             let (mut body_tx, body_rx) = wit_stream::new();
             let (trailers_tx, trailers_rx) = wit_future::new(|| todo!());
             let (response, _transmit) = Response::new(response_headers, Some(body_rx), trailers_rx);
-            wit_bindgen::spawn(async move {
+            wit_bindgen::spawn_local(async move {
                 for _ in 0..CHUNKS {
                     let _ = body_tx.write_all(vec![0xAB; CHUNK_LEN]).await;
                     wasi::clocks::monotonic_clock::wait_for(PACE_NANOS).await;
@@ -84,7 +98,7 @@ impl Guest for Component {
         let (mut body_tx, body_rx) = wit_stream::new();
         let (trailers_tx, trailers_rx) = wit_future::new(|| todo!());
         let (response, _transmit) = Response::new(response_headers, Some(body_rx), trailers_rx);
-        wit_bindgen::spawn(async move {
+        wit_bindgen::spawn_local(async move {
             let _ = body_tx.write_all(payload.into_bytes()).await;
             drop(body_tx);
             let _ = trailers_tx.write(Ok(None)).await;
@@ -112,5 +126,3 @@ fn balloon() -> ! {
         keep.push(vec![0x41; 1024 * 1024]);
     }
 }
-
-fn main() {}

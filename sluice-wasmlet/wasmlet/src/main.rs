@@ -18,13 +18,15 @@
 //! - `grpc://` / `grpcs://` control plane (`--ca-cert` pins the CA,
 //!   `--insecure` skips verification); no mTLS yet
 //! - one pre-linked (`InstancePre`) instance per request, under a per-route
-//!   epoch CPU budget and memory cap; response bodies stream via a bounded relay
+//!   epoch CPU budget, memory cap and `wasmtime serve`-style WASI
+//!   capabilities; response bodies stream via a bounded relay
 //!
 //! Usage:
 //!
 //! ```text
 //! sluice-wasmlet --server grpc://127.0.0.1:8001 --token SECRET \
-//!     --wasm demo.local=./examples/hello.wasm
+//!     --wasm demo.local=./hello.wasm \
+//!     --wasm relay.local='./relay.wasm?wasi=cli,inherit-network'
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -44,18 +46,19 @@ mod wasm_host;
 
 use pb::frame::Body;
 use pb::{Advertise, Error, Frame, Upstream};
-use wasm_host::{Loaded, Limits, Locator};
+use wasm_host::{Loaded, Locator, Sandbox};
 
 struct Route {
     host: String,
     component: Locator,
-    limits: Limits,
+    sandbox: Sandbox,
 }
 
-/// A resolved route target: the shared `Loaded` plus this route's limits.
+/// A resolved route target: the shared `Loaded` plus the sandbox its target
+/// names.
 struct ComponentEntry {
     component: Arc<Loaded>,
-    limits: Limits,
+    sandbox: Sandbox,
 }
 
 struct Config {
@@ -103,8 +106,9 @@ struct Shared {
     ca_pem: Option<Vec<u8>>,
     /// Upstreams advertised on every stream.
     advertised: Vec<Upstream>,
-    /// Target (`wasm:...`) -> component entry; the dial address key. Two
-    /// routes on one target keep the last limits configured.
+    /// Target (`wasm:<locator>[?<sandbox>]`) -> component entry; the dial
+    /// address key. The target carries the sandbox, so routes sharing a
+    /// component with different sandboxes stay distinct.
     components: HashMap<String, ComponentEntry>,
 }
 
@@ -173,13 +177,14 @@ fn parse_args() -> Config {
                 let (host, target) = spec.split_once('=').unwrap_or_else(|| {
                     panic!("--wasm must be host=component-locator, got '{spec}'")
                 });
-                let (target, limits) = parse_route_target(target);
+                let (target, sandbox) =
+                    parse_route_target(target).unwrap_or_else(|e| panic!("--wasm {spec}: {e}"));
                 let component =
                     Locator::parse(&target).unwrap_or_else(|e| panic!("--wasm {spec}: {e}"));
                 config.routes.push(Route {
                     host: host.to_string(),
                     component,
-                    limits,
+                    sandbox,
                 });
             }
             other => panic!("unknown argument '{other}'"),
@@ -191,28 +196,23 @@ fn parse_args() -> Config {
     config
 }
 
-/// Splits `locator[?budget-ms=N&memory-mib=N]` into the locator and the
-/// per-route limits. The `?` separator means literal `?` in file paths needs
-/// URL-escaping (`file://...%3F...`).
-fn parse_route_target(spec: &str) -> (String, Limits) {
-    let Some((target, query)) = spec.split_once('?') else {
-        return (spec.to_string(), Limits::default());
-    };
-    let mut limits = Limits::default();
-    for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            panic!("--wasm: expected key=value in '{query}'");
-        };
-        let number = |name: &str| -> u64 {
-            value.parse().unwrap_or_else(|_| panic!("--wasm {name}: not a number '{value}'"))
-        };
-        match key {
-            "budget-ms" => limits.budget = Duration::from_millis(number(key).max(1)),
-            "memory-mib" => limits.memory = (number(key) as usize) << 20,
-            other => panic!("--wasm: unknown option '{other}' (budget-ms, memory-mib)"),
-        }
+/// Splits `locator[?budget-ms=N&memory-mib=N&wasi=cap,...]` into the locator
+/// and the per-route sandbox. The `?` separator means literal `?` in file
+/// paths needs URL-escaping (`file://...%3F...`).
+fn parse_route_target(spec: &str) -> Result<(String, Sandbox), String> {
+    match spec.split_once('?') {
+        Some((target, query)) => Ok((target.to_string(), Sandbox::parse(query)?)),
+        None => Ok((spec.to_string(), Sandbox::default())),
     }
-    (target.to_string(), limits)
+}
+
+/// The advertised target of a route: the component locator plus its
+/// canonical sandbox query (omitted when all defaults).
+fn route_target(locator: &str, sandbox: &Sandbox) -> String {
+    match sandbox.query() {
+        query if query.is_empty() => locator.to_string(),
+        query => format!("{locator}?{query}"),
+    }
 }
 
 /// Splits the `--server` value into `(secure, authority)`; a bare host:port
@@ -252,8 +252,8 @@ async fn run(config: Config) -> Result<(), BoxError> {
     let mut components: HashMap<String, ComponentEntry> = HashMap::new();
     let mut advertised = Vec::with_capacity(routes.len());
     for route in &routes {
-        let target = route.component.target().await?;
-        let component = match wasm_host::load(&route.component).await {
+        let target = route_target(&route.component.target().await?, &route.sandbox);
+        let component = match wasm_host::load(&route.component, route.sandbox.caps).await {
             Ok(component) => component,
             Err(e) => return Err(format!("wasm route '{}': {e}", route.host).into()),
         };
@@ -261,7 +261,7 @@ async fn run(config: Config) -> Result<(), BoxError> {
             target.clone(),
             ComponentEntry {
                 component,
-                limits: route.limits,
+                sandbox: route.sandbox,
             },
         );
         advertised.push(Upstream {
@@ -553,13 +553,13 @@ impl NodeTask {
                     let (ctrl_tx, ctrl_rx) = mpsc::channel(SERVE_BUFFER);
                     registry.lock().unwrap().insert(connect.conn_id, ctrl_tx);
                     let component = entry.component.clone();
-                    let limits = entry.limits;
+                    let sandbox = entry.sandbox;
                     tokio::spawn(wasm_host::serve(
                         tx.clone(),
                         registry.clone(),
                         connect.conn_id,
                         component,
-                        limits,
+                        sandbox,
                         ctrl_rx,
                     ));
                 }
@@ -637,17 +637,74 @@ mod tests {
 
     #[test]
     fn route_target_without_options_keeps_defaults() {
-        let (target, limits) = parse_route_target("target/wasm32-wasip2/release/hello.wasm");
-        assert_eq!(target, "target/wasm32-wasip2/release/hello.wasm");
-        assert_eq!(limits, Limits::default());
+        let (target, sandbox) =
+            parse_route_target("target/wasm32-wasip3/release/hello.wasm").unwrap();
+        assert_eq!(target, "target/wasm32-wasip3/release/hello.wasm");
+        assert_eq!(sandbox, Sandbox::default());
+        assert_eq!(route_target("wasm:file:///hello.wasm", &sandbox), "wasm:file:///hello.wasm");
     }
 
     #[test]
     fn route_target_options_override_limits() {
-        let (target, limits) = parse_route_target("./a.wasm?budget-ms=250&memory-mib=64");
+        let (target, sandbox) = parse_route_target("./a.wasm?budget-ms=250&memory-mib=64").unwrap();
         assert_eq!(target, "./a.wasm");
-        assert_eq!(limits.budget, Duration::from_millis(250));
-        assert_eq!(limits.memory, 64 << 20);
+        assert_eq!(sandbox.limits.budget, Duration::from_millis(250));
+        assert_eq!(sandbox.limits.memory, 64 << 20);
+        assert_eq!(sandbox.caps, wasm_host::Caps::default());
+    }
+
+    #[test]
+    fn route_target_grants_wasi_capabilities() {
+        let (_, sandbox) = parse_route_target("./a.wasm?wasi=inherit-network,cli").unwrap();
+        assert_eq!(
+            sandbox.caps,
+            wasm_host::Caps {
+                cli: true,
+                inherit_network: true,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn route_target_rejects_unknown_capabilities_and_options() {
+        let error = parse_route_target("./a.wasm?wasi=cli,fs").unwrap_err();
+        assert!(error.contains("unknown wasi capability 'fs'"), "{error}");
+        let error = parse_route_target("./a.wasm?fuel=1").unwrap_err();
+        assert!(error.contains("unknown option 'fuel'"), "{error}");
+    }
+
+    /// `http` is accepted for flag parity with `-S http` but changes nothing:
+    /// outgoing http is always linked, as under `wasmtime serve`, so it does
+    /// not split the advertised target either.
+    #[test]
+    fn route_target_accepts_http_as_always_granted() {
+        let (_, sandbox) = parse_route_target("./a.wasm?wasi=http").unwrap();
+        assert_eq!(sandbox, Sandbox::default());
+        let (_, sandbox) = parse_route_target("./a.wasm?wasi=http,cli").unwrap();
+        assert_eq!(route_target("wasm:file:///a.wasm", &sandbox), "wasm:file:///a.wasm?wasi=cli");
+    }
+
+    #[test]
+    fn network_capabilities_require_cli() {
+        let error = parse_route_target("./a.wasm?wasi=inherit-network").unwrap_err();
+        assert!(error.contains("need 'cli'"), "{error}");
+    }
+
+    /// The advertised target carries the canonical sandbox query, so two
+    /// routes on one component with different sandboxes get distinct dial
+    /// addresses, and equal sandboxes share one regardless of spelling.
+    #[test]
+    fn route_target_canonicalizes_the_sandbox_query() {
+        let (_, a) = parse_route_target("a.wasm?wasi=tcp,cli,inherit-network&memory-mib=64").unwrap();
+        let (_, b) = parse_route_target("a.wasm?memory-mib=64&wasi=cli,inherit-network,tcp").unwrap();
+        let (_, c) = parse_route_target("a.wasm?budget-ms=10000&wasi=cli").unwrap();
+        assert_eq!(
+            route_target("wasm:file:///a.wasm", &a),
+            "wasm:file:///a.wasm?memory-mib=64&wasi=cli,inherit-network,tcp"
+        );
+        assert_eq!(route_target("wasm:file:///a.wasm", &a), route_target("wasm:file:///a.wasm", &b));
+        assert_eq!(route_target("wasm:file:///a.wasm", &c), "wasm:file:///a.wasm?wasi=cli");
     }
 
     fn session(url: &str) -> Arc<Session> {

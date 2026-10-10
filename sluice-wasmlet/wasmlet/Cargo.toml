@@ -13,11 +13,10 @@ http = "1"
 tokio-stream = "0.1"
 tokio-util = "0.7"
 futures-util = "0.3"
-# wasi 0.2 (p2) + 0.3 (p3) host support; the guest uses p3, the p2 linker is
-# still required for the rust std imports of wasm32-wasip2 components
+# wasi 0.3 (p3) host support only; p2 guests are unsupported
 wasmtime = "49"
-wasmtime-wasi = "49"
-wasmtime-wasi-http = "49"
+wasmtime-wasi = { version = "49", default-features = false, features = ["p3"] }
+wasmtime-wasi-http = { version = "49", default-features = false, features = ["default-send-request", "p3"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body = "1"

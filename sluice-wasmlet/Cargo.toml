@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["wasmlet", "examples/*"]
+members = ["wasmlet"]
+# The guest examples are their own workspace (nightly toolchain, wasm32-wasip3).
+exclude = ["examples"]
 
 [profile.release]
 strip = true

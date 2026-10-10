@@ -1,5 +1,5 @@
 [package]
-name = "hello"
+name = "fetch"
 version = "0.0.1-SNAPSHOT"
 edition = "2024"
 publish = false

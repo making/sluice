@@ -16,22 +16,30 @@ sluice server --tunnel--> sluice-wasmlet --hyper(h1/h2c)--> wasi:http handler co
 
 ## Layout
 
-Cargo workspace:
+Two Cargo workspaces:
 
 - `wasmlet/` — `sluice-wasmlet`, the tunnel-side wasm host (wasmtime + hyper)
-- `examples/hello/` — the sample handler component (`wasm32-wasip2`)
-- `wit/` — vendored `wasi:http@0.3.0` (from wasmtime v49) + the guest world
+- `examples/` — sample handler components (`wasm32-wasip3`), a separate
+  workspace pinned to a nightly toolchain by `rust-toolchain.toml`
+  (wasm32-wasip3 ships rust-std on nightly only; rustup installs it on the
+  first build). Each example's README says what it demonstrates and which
+  capabilities its route needs
+- `wit/` — vendored wasi 0.3 (from wasmtime v49); each example declares its
+  own world inline, so a new example is just a new directory under `examples/`
 
 ## Run
 
 ```text
 cargo build -p sluice-wasmlet
-cargo build --release -p hello --target wasm32-wasip2
+(cd examples && cargo build --release)   # -> examples/target/wasm32-wasip3/release/<example>.wasm
 
 # sluice server as in the root README, then:
 target/debug/sluice-wasmlet --server grpc://127.0.0.1:8001 --token SECRET \
-    --wasm demo.local=target/wasm32-wasip2/release/hello.wasm
+    --wasm demo.local=examples/target/wasm32-wasip3/release/hello.wasm
 ```
+
+`cargo test -p sluice-wasmlet` builds the examples the same way (through the
+rustup `cargo` proxy, so rustup must be installed).
 
 `--server` also accepts `grpcs://` (TLS). Verification uses `--ca-cert <file>` (PEM, may
 hold a chain), the webPKI roots when omitted, or nothing at all with `--insecure`
@@ -44,33 +52,46 @@ target/debug/sluice-wasmlet --server grpcs://127.0.0.1:8001 --insecure ...
 
 Multiple `--wasm host=<locator>` routes per process. The locator is a bare
 path, `file://<path>`, or `http(s)://<url>` (fetched once at startup); the
-advertised target is `wasm:<locator>` and further schemes slot into the same
-resolver. A `?query` suffix sets the route's resource limits, applied to
-every request's instance: `budget-ms` is the epoch-based CPU/deadline budget
+advertised target is `wasm:<locator>` (plus the non-default options) and
+further schemes slot into the same resolver. A `?query` suffix sets the
+route's resource limits and WASI capabilities (`wasi`, see [Capabilities](#capabilities)), applied to every
+request's instance: `budget-ms` is the epoch-based CPU/deadline budget
 (exceeded -> 504; defaults 10000) and `memory-mib` the per-instance linear
 memory cap in MiB (exceeded -> guest trap, 500; defaults 256). A literal `?`
 in a file path needs URL-escaping.
 
 ```text
 --wasm demo.local=hello.wasm?budget-ms=5000&memory-mib=64
-```
-
-```text
 curl -H 'Host: demo.local' http://127.0.0.1:8000/hello
-curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:8000/hello
-curl -H 'Host: demo.local' -d data http://127.0.0.1:8000/echo
-curl -H 'Host: demo.local' http://127.0.0.1:8000/panic   # guest trap -> 500, tunnel survives
 ```
 
-The sample handler echoes method / path / body size; `/panic` panics to
-demonstrate guest isolation; `/spin` busy-loops until the epoch budget
-interrupts it (504); `/balloon` allocates until the memory cap denies it
-(500); `/stream` trickles 10 MiB in paced chunks to demonstrate response
-streaming:
+### Capabilities
+
+The `wasi` route option grants WASI capabilities, named after the `-S`
+options of `wasmtime serve` (v49), so a component runs here with the flags it
+runs with there. Without it a route gets the serve default: `wasi:http` (incoming and
+outgoing) plus the p3 `cli` / `clocks` / `random` interfaces. A component
+importing anything else fails at startup.
+
+| `wasi=` | `wasmtime serve` | effect |
+|---|---|---|
+| `http` | `-Shttp` | outgoing requests via `wasi:http/client`; always linked as in serve, so accepted but no effect |
+| `cli` | `-Scli` | links the full wasi p3 set (sockets, filesystem, ...) |
+| `inherit-network` | `-Sinherit-network` | sockets may use every address; implies `tcp` + `udp` |
+| `tcp` / `udp` | `-Stcp` / `-Sudp` | allows the protocol (every address stays denied without `inherit-network`) |
+| `allow-ip-name-lookup` | `-Sallow-ip-name-lookup` | allows `wasi:sockets/ip-name-lookup` |
+
+The network capabilities require `cli` (sockets are not linked otherwise) and
+are enforced by `wasmtime-wasi` on every socket call: a denied call returns
+`access-denied` to the guest. Unknown names are a startup error.
 
 ```text
-curl -H 'Host: demo.local' http://127.0.0.1:8000/stream
+--wasm 'api.local=app.wasm?wasi=cli,inherit-network'
 ```
+
+Guest stdout / stderr always go to the wasmlet's stdout / stderr as whole
+lines, prefixed with the component and a request id
+(`stdout [app.wasm#12] :: ...`), as `wasmtime serve` does.
 
 ## Design notes
 
@@ -81,19 +102,22 @@ curl -H 'Host: demo.local' http://127.0.0.1:8000/stream
   from a pre-linked `InstancePre` -> `Service.handle`; the store runs in a
   detached task and relays response body frames to hyper through a bounded
   channel, so responses stream and a slow client backpressures the guest.
-  Instances are deliberately not pooled: the warm path (~170us instantiate,
+  Instances are deliberately not pooled: the warm path (~200us instantiate,
   measured by the ignored `instantiation_latency_reference` test) is cheap,
   `Store::run_concurrent` consumes the store, and guest module state makes
   blind reuse incorrect
 - every request's store carries an epoch deadline (`budget-ms`) and a memory
   limiter (`memory-mib`); the shared engine's epoch is incremented by a
   dedicated thread, so a guest busy-loop cannot starve its own budget
-- guests are ordinary wasm components: the host links wasi p2 (rust std
-  imports of the `wasm32-wasip2` target) + p3 (the 0.3 world), same as
-  wasmtime's own p3 test suite
-- `--wasm` routes advertise the component locator (`wasm:file://...`; the
-  server passes `wasm:` targets through verbatim as the dial address — oci /
-  s3 resolvers slot into the same form)
+- guests are ordinary wasm components exporting `wasi:http/handler@0.3.0`;
+  the linked wasi surface follows `wasmtime serve` (see `wasi` above) for
+  p3 only. wasi p2 is unsupported and never linked (unlike serve's `-Scli`):
+  a component importing any p2 interface is rejected at startup
+- `--wasm` routes advertise the component locator plus its canonical
+  non-default options (`wasm:file://...?wasi=cli,inherit-network`; the server
+  passes `wasm:` targets through verbatim as the dial address — oci / s3
+  resolvers slot into the same form), so routes sharing a component with
+  different options stay distinct
 
 ## Cluster / reconnect
 
