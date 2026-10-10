@@ -48,10 +48,12 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Data plane: a TCP listener on the data port that routes each connection by the Host
- * header (HTTP/1.1) or {@code :authority} (HTTP/2 prior knowledge) of the request head
- * and relays it, byte for byte, over a virtual connection of the matching tunnel session.
- * Because only the request head is inspected, WebSocket upgrades, h2c upgrade, and HTTP
- * keep-alive pass through transparently. A TLS handshake (first byte {@code 0x16}) is
+ * header (HTTP/1.1) or {@code :authority} (HTTP/2 prior knowledge) of the request head.
+ * Plaintext HTTP relays per request -- every HTTP/1.1 request head and every HTTP/2
+ * stream is routed anew, so keep-alive successors and coalesced streams reach the
+ * upstream of their own route (see {@link ReroutingRelay} and {@link Http2DemuxRelay});
+ * TLS-terminated, encrypted-passthrough, and hostless connections relay verbatim over the
+ * virtual connection of the resolved route. A TLS handshake (first byte {@code 0x16}) is
  * either terminated locally when an SSL bundle is configured (ALPN: h2 preferred over
  * http/1.1), or relayed untouched in passthrough mode otherwise, routed by the SNI host
  * name of the ClientHello (the backend terminates TLS and presents its own certificate).
@@ -298,12 +300,26 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		Router.Route route0 = route.get();
 		access.route(route0.routeTag());
 		ConnectionHeadParser.Head.Request request = conn.head().request();
-		if (request != null && !conn.head().encrypted() && !"2".equals(request.version())) {
-			// plaintext HTTP/1.1: every request head is routed; keep-alive successors may
-			// belong to another client's upstream
+		if (request != null && !conn.head().encrypted()) {
+			// plaintext HTTP: every request head / stream is routed; successors may
+			// belong to another client's upstream (keep-alive, h2 multiplexing)
+			Runnable relayed = this.relayed(access);
+			if ("2".equals(request.version())) {
+				Http2DemuxRelay demux = new Http2DemuxRelay(conn.pipe(), conn.head(), this.router, this.sessions,
+						this.accessControl, this.errorResponse, access, this.meterRegistry, route0, session, peer,
+						relayed);
+				this.activeConnections.incrementAndGet();
+				try {
+					demux.start();
+				}
+				catch (RuntimeException e) {
+					this.activeConnections.decrementAndGet();
+					throw e;
+				}
+				return true;
+			}
 			ReroutingRelay rerouting = new ReroutingRelay(conn.pipe(), conn.head(), this.router, this.sessions,
-					this.accessControl, this.errorResponse, access, this.meterRegistry, route0, session, peer,
-					this.activeConnections::decrementAndGet);
+					this.accessControl, this.errorResponse, access, this.meterRegistry, route0, session, peer, relayed);
 			this.activeConnections.incrementAndGet();
 			try {
 				rerouting.start();
@@ -319,13 +335,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		if (request != null) {
 			access.request(request.method(), request.path(), request.version());
 		}
-		// per-request host rewriting on the relayed stream; connections that must stay
-		// verbatim (host rewrite off, TLS passthrough) keep the one-shot head prefix
-		HostRewritingPipe rewriting = !route0.rewriteHost() || conn.head().encrypted() ? null
-				: HostRewritingPipe.of(conn.pipe(), conn.head(), route0.address());
-		StreamRelay relay = StreamRelay
-			.builder(rewriting != null ? rewriting : conn.pipe(), connection, session.sender())
-			.prefix(rewriting != null ? null : conn.head().bytes())
+		StreamRelay relay = StreamRelay.builder(conn.pipe(), connection, session.sender())
+			.prefix(conn.head().bytes())
 			.listener(this.relayedBytes(route0, session, access))
 			.onComplete(() -> {
 				this.activeConnections.decrementAndGet();
@@ -342,6 +353,17 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			throw e;
 		}
 		return true;
+	}
+
+	/**
+	 * The once-only completion of a demultiplexing relay: the connection level of the
+	 * access log and the active-connection count, shared by every leg.
+	 */
+	private Runnable relayed(AccessLogger.Connection access) {
+		return () -> {
+			this.activeConnections.decrementAndGet();
+			access.close();
+		};
 	}
 
 	/**

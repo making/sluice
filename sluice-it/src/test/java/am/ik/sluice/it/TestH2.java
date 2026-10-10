@@ -25,6 +25,8 @@ final class TestH2 {
 
 	static final int SETTINGS = 0x4;
 
+	static final int RST_STREAM = 0x3;
+
 	static final int CONTINUATION = 0x9;
 
 	static final int FLAG_END_STREAM = 0x1;

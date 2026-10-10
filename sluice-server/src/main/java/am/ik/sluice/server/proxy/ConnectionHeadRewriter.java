@@ -6,8 +6,8 @@ import java.nio.charset.StandardCharsets;
  * Rewrites the HTTP/1.1 {@code Host} header line of a request head so the request reaches
  * the upstream with the target's authority. Rewriting is best-effort; any head the
  * rewriter cannot reproduce (non ASCII bytes, missing Host header) is returned verbatim.
- * The h2 equivalent lives in {@link Http2Rewriter}, which re-encodes every HEADERS block
- * of the connection with a single stateful HPACK encoder pair.
+ * On relayed plaintext connections the rerouting relay rewrites every head; the HTTP/2
+ * demultiplexing relay re-encodes every request HEADERS block likewise.
  */
 final class ConnectionHeadRewriter {
 

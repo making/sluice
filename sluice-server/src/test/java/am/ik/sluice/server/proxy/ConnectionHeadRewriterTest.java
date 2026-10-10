@@ -9,7 +9,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Unit tests for {@link ConnectionHeadRewriter}: HTTP/1.1 Host line replacement,
  * verifiable by re-parsing with the production {@link ConnectionHeadParser}. The h2
- * equivalent is covered by {@link Http2RewriterTest}.
+ * equivalents are covered end to end by the rerouting and demultiplexing E2E tests.
  */
 class ConnectionHeadRewriterTest {
 

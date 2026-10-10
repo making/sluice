@@ -8,6 +8,9 @@ import java.util.Map;
 
 import com.samskivert.mustache.Mustache;
 import com.samskivert.mustache.Template;
+
+import org.jspecify.annotations.Nullable;
+
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
@@ -54,6 +57,50 @@ public class ErrorResponse {
 	 */
 	public byte[] forbidden(ConnectionHeadParser.Head head) {
 		return this.render(head, this.forbidden);
+	}
+
+	/**
+	 * The no-route response on a single stream of a living HTTP/2 connection: a later
+	 * stream of a demultiplexed connection is answered without touching its siblings.
+	 */
+	public byte[] noRouteStream(int streamId, @Nullable String host,
+			ConnectionHeadParser.Head.@Nullable Request request) {
+		return this.streamResponse(streamId, this.noRoute, host, request);
+	}
+
+	/**
+	 * The forbidden response on a single stream of a living HTTP/2 connection.
+	 */
+	public byte[] forbiddenStream(int streamId, @Nullable String host,
+			ConnectionHeadParser.Head.@Nullable Request request) {
+		return this.streamResponse(streamId, this.forbidden, host, request);
+	}
+
+	private byte[] streamResponse(int streamId, Page page, @Nullable String host,
+			ConnectionHeadParser.Head.@Nullable Request request) {
+		boolean withBody = request != null && !isHead(request);
+		byte[] body = this.page(host, request, page);
+		Http2Headers headers = new DefaultHttp2Headers().status(page.status())
+			.set("content-type", CONTENT_TYPE)
+			.set("content-length", String.valueOf(body.length))
+			.set("cache-control", "no-store");
+		Http2Frames frames = new Http2Frames(streamId);
+		frames.write(withBody ? Http2Frame.HEADERS : Http2Frame.HEADERS_END_STREAM, headerBlock(streamId, headers));
+		if (withBody) {
+			for (int offset = 0; offset < body.length; offset += MAX_FRAME_SIZE) {
+				int end = Math.min(offset + MAX_FRAME_SIZE, body.length);
+				frames.write(end == body.length ? Http2Frame.DATA_END_STREAM : Http2Frame.DATA,
+						Arrays.copyOfRange(body, offset, end));
+			}
+		}
+		return frames.toByteArray();
+	}
+
+	private byte[] page(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request, Page page) {
+		// an empty value skips its section (emptyStringIsFalse)
+		Map<String, String> context = Map.of("host", host == null ? "" : host, "method",
+				request == null ? "" : request.method(), "path", request == null ? "" : request.path());
+		return page.page().execute(context).getBytes(StandardCharsets.UTF_8);
 	}
 
 	private byte[] render(ConnectionHeadParser.Head head, Page page) {
