@@ -110,7 +110,9 @@ lines, prefixed with the component and a request id
   dedicated thread, so a guest busy-loop cannot starve its own budget. The
   epoch deadline only interrupts running wasm: a host-side watchdog outside
   the store ends a request suspended past its budget (e.g. on an upstream
-  that never answers) and one whose client left before the response head
+  that never answers) and one whose client left -- before the response
+  head, or mid-body (once a declared `content-length` is satisfied, the body
+  counts as done: hyper drops it there itself, trailers owed or not)
 - guests are ordinary wasm components exporting `wasi:http/handler@0.3.0`;
   the linked wasi surface follows `wasmtime serve` (see `wasi` above) for
   p3 only. wasi p2 is unsupported and never linked (unlike serve's `-Scli`):
@@ -136,7 +138,7 @@ Reuse assumes stateless / reentrant-safe guests: module state legitimately
 persists across a unit's requests, so a misbehaving guest poisons its own
 unit only. A unit is retired and replaced when its request ends in a trap, a
 failed conversion, an interrupted relay, an overrun budget (re-armed per
-request) or a client leaving before the response head, and when it leaves
+request) or a client leaving mid-request (as above), and when it leaves
 the resource table non-empty or grows its linear memory past half of
 `memory-mib`. Wasm memory never shrinks, so a pooled route holds up to
 `N` x `memory-mib`; the half-cap rule recycles a guest leaking per request
