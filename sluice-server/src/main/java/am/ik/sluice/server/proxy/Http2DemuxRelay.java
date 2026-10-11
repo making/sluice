@@ -8,7 +8,9 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -47,20 +49,33 @@ import io.micrometer.core.instrument.MeterRegistry;
  * answered, and the connection windows are regenerated from the DATA payload relayed over
  * each hop. It also owns the client's stream windows, which bound what it queues: it
  * advertises {@link #MAX_CONCURRENT_STREAMS}, refuses a stream beyond it, and grants a
- * stream's window -- the upstream's increments, plus the padding it strips -- only while
- * the stream's queued payload and its window stay within {@link #STREAM_BUDGET}. A client
- * sending past a stream window gets a GOAWAY {@code FLOW_CONTROL_ERROR}. A header block
- * is written whole in either direction, and the relay's own connection-level frames
+ * stream's window as far as the stream's queued payload and its window stay within
+ * {@link #STREAM_BUDGET} -- the leg writer's drain makes room, padding never takes any. A
+ * client sending past a stream window gets a GOAWAY {@code FLOW_CONTROL_ERROR}. A header
+ * block is written whole in either direction, and the relay's own connection-level frames
  * towards an upstream are written ahead of the request frames queued for it.
  * <p>
- * The client ending its side of the connection half-closes every leg after the frames
- * queued for it, unless a routed request is unfinished: that request can never complete,
- * so the relay ends instead, closing the legs.
+ * Towards each upstream the relay is a sender bound by the upstream's windows (RFC 9113
+ * 6.9): the connection window and every stream's window, initially as the upstream's
+ * SETTINGS announce (the spec default until they arrive), adjusted when they change, and
+ * replenished by its WINDOW_UPDATEs. A stream's DATA is written only as far as both
+ * windows allow; a stream without window waits without holding back the leg's other
+ * streams, and the stream's trailers wait behind its data while the client's window
+ * updates do not. An upstream pushing a window past 2^31-1 ends the relay.
  * <p>
- * The relay does not track the upstream's windows: an upstream announcing an initial
- * stream window below the spec default can see a stream exceed it. HPACK blocks are
- * re-encoded table-less, so each side's decoder sees self-contained blocks whichever leg
- * produced them, or when.
+ * The client ending its side of the connection half-closes each leg once the frames
+ * queued for it are written and its responses ended -- until then the relay keeps
+ * granting the upstream's connection window, and an upstream that closes on reading EOF
+ * (as Netty does by default) still delivers them -- unless a routed request is
+ * unfinished: that request can never complete, so the relay ends instead, closing the
+ * legs. While a leg waits so, the relay writes a PING to the client whenever it wrote
+ * nothing for {@link #PROBE_INTERVAL_NANOS}: a client gone entirely rather than
+ * half-closed fails the write and ends the relay. An upstream ending its side with no
+ * response owed retires its leg: the data still queued for it is dropped, and a stream
+ * the client still sends on is reset with {@code NO_ERROR}.
+ * <p>
+ * HPACK blocks are re-encoded table-less, so each side's decoder sees self-contained
+ * blocks whichever leg produced them, or when.
  */
 final class Http2DemuxRelay {
 
@@ -96,6 +111,8 @@ final class Http2DemuxRelay {
 
 	private static final int FRAME_HEADER_LENGTH = 9;
 
+	private static final int ERROR_NO_ERROR = 0x0;
+
 	private static final int ERROR_FLOW_CONTROL = 0x3;
 
 	private static final int ERROR_REFUSED_STREAM = 0x7;
@@ -103,6 +120,8 @@ final class Http2DemuxRelay {
 	private static final int SETTINGS_HEADER_TABLE_SIZE = 0x1;
 
 	private static final int SETTINGS_MAX_CONCURRENT_STREAMS = 0x3;
+
+	private static final int SETTINGS_INITIAL_WINDOW_SIZE = 0x4;
 
 	private static final int SETTINGS_MAX_HEADER_LIST_SIZE = 0x6;
 
@@ -120,12 +139,19 @@ final class Http2DemuxRelay {
 	/** The concurrent streams the relay advertises to the client. */
 	static final int MAX_CONCURRENT_STREAMS = 100;
 
-	/** The client's initial stream window: the spec default, never re-announced. */
+	/**
+	 * The initial window of every stream and connection (RFC 9113 6.9.2); the relay never
+	 * re-announces it to the client.
+	 */
 	private static final int STREAM_WINDOW = 65535;
 
+	/** The largest flow-control window (RFC 9113 6.9.1). */
+	private static final long MAX_WINDOW = Integer.MAX_VALUE;
+
 	/**
-	 * Per stream, the most the queued payload plus the client's window may reach: a grant
-	 * waits until the leg writer's drain makes room. 64KiB above the initial window.
+	 * Per stream, the most the queued payload plus the client's window may reach: the
+	 * relay grants the client up to it, and the leg writer's drain makes room. 64KiB
+	 * above the initial window.
 	 */
 	static final int STREAM_BUDGET = STREAM_WINDOW + 64 * 1024;
 
@@ -143,6 +169,16 @@ final class Http2DemuxRelay {
 
 	/** The PING acks one leg may owe its upstream; more end the relay. */
 	private static final int MAX_PENDING_PING_ACKS = 1024;
+
+	/**
+	 * After the client's EOF, while a leg waits for its responses: the most the relay
+	 * goes without writing to the client before it probes with a PING.
+	 */
+	static final long PROBE_INTERVAL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
+
+	private static final byte[] PROBE_PAYLOAD = "sluice-p".getBytes(StandardCharsets.US_ASCII);
+
+	private static final byte[] EMPTY = new byte[0];
 
 	private final DuplexPipe pipe;
 
@@ -186,6 +222,12 @@ final class Http2DemuxRelay {
 	private final Map<Integer, Stream> streams = new ConcurrentHashMap<>();
 
 	private final List<Leg> legs = new CopyOnWriteArrayList<>();
+
+	/** Signals that a leg half-closed or closed; with {@link #lock}. */
+	private final Condition legSettled = this.lock.newCondition();
+
+	/** When the relay last wrote to the client, {@link System#nanoTime()}. */
+	private volatile long lastClientWrite = System.nanoTime();
 
 	/** The outbound side plus two sides per leg; the relay ends when all drain. */
 	private final AtomicInteger pending = new AtomicInteger(1);
@@ -303,6 +345,7 @@ final class Http2DemuxRelay {
 				for (Leg leg : this.legs) {
 					leg.halfClose();
 				}
+				probeUntilLegsSettled();
 			}
 		}
 		catch (Exception e) {
@@ -310,6 +353,34 @@ final class Http2DemuxRelay {
 		}
 		finally {
 			settle();
+		}
+	}
+
+	/**
+	 * Waits until every leg half-closed or closed; meanwhile probes the client with a
+	 * PING whenever nothing was written to it for {@link #PROBE_INTERVAL_NANOS}. A client
+	 * that half-closed reads on; one gone entirely fails a write (the second at the
+	 * latest, once its stack answered the first with a reset), which ends the relay.
+	 */
+	private void probeUntilLegsSettled() throws InterruptedException {
+		while (true) {
+			long idle;
+			this.lock.lock();
+			try {
+				if (this.legs.stream().allMatch(Leg::settledLocked)) {
+					return;
+				}
+				idle = System.nanoTime() - this.lastClientWrite;
+				if (idle < PROBE_INTERVAL_NANOS) {
+					this.legSettled.awaitNanos(PROBE_INTERVAL_NANOS - idle);
+				}
+			}
+			finally {
+				this.lock.unlock();
+			}
+			if (idle >= PROBE_INTERVAL_NANOS) {
+				writeToClient(frame(FRAME_PING, 0, 0, PROBE_PAYLOAD, 0, PROBE_PAYLOAD.length));
+			}
 		}
 	}
 
@@ -381,9 +452,10 @@ final class Http2DemuxRelay {
 
 	/**
 	 * A client DATA frame: the whole payload, padding included, leaves the connection
-	 * window at once and is released; the stream's window is charged with it, the padding
-	 * is given back since it never leaves the relay, and the bare payload joins the
-	 * stream's queued data. Frames of streams unknown or already ended are dropped.
+	 * window at once and is released; the stream's window is charged with it, and the
+	 * bare payload joins the stream's queued data -- the padding, never queued, is
+	 * granted back with the budget's room. Frames of streams unknown or already ended are
+	 * dropped.
 	 */
 	private void onData(Frame frame) {
 		if (frame.streamId() == 0) {
@@ -410,7 +482,6 @@ final class Http2DemuxRelay {
 			}
 			else {
 				stream.clientWindow -= frame.length();
-				stream.held = Math.min(Integer.MAX_VALUE, stream.held + frame.length() - dataLength);
 				stream.leg.queueData(stream, frame.bytes(), dataOffset, dataLength, frame.has(FLAG_END_STREAM));
 				release = releaseLocked(stream);
 			}
@@ -428,20 +499,19 @@ final class Http2DemuxRelay {
 	}
 
 	/**
-	 * Grants the client stream window the relay holds back: the increment owed, as far as
-	 * the stream's queued payload plus its window stay within the budget. A stream the
-	 * client ended gets nothing more.
+	 * Grants the client stream window as far as the stream's queued payload plus its
+	 * window stay within the budget. A stream the client ended gets nothing more.
 	 */
 	private int releaseLocked(Stream stream) {
 		if (stream.clientEnded) {
-			stream.held = 0;
 			return 0;
 		}
 		long room = STREAM_BUDGET - stream.queuedPayload - stream.clientWindow;
-		int release = (int) Math.max(0, Math.min(stream.held, room));
-		stream.held -= release;
-		stream.clientWindow += release;
-		return release;
+		if (room <= 0) {
+			return 0;
+		}
+		stream.clientWindow += room;
+		return (int) room;
 	}
 
 	private void grantStream(int streamId, int increment) {
@@ -463,10 +533,9 @@ final class Http2DemuxRelay {
 			}
 			stream.reset = true;
 			stream.clientEnded = true;
-			stream.held = 0;
 			stream.leg.purgeData(stream);
 			stream.leg.queueBlock(stream, frame(FRAME_RST_STREAM, frame.flags(), frame.streamId(), frame.bytes(),
-					frame.payload(), frame.length()));
+					frame.payload(), frame.length()), false);
 			updateActiveLocked(stream);
 		}
 		finally {
@@ -605,7 +674,7 @@ final class Http2DemuxRelay {
 			}
 			stream.trailers = true;
 			stream.clientEnded = endStream;
-			stream.leg.queueBlock(stream, frames);
+			stream.leg.queueBlock(stream, frames, true);
 		}
 		finally {
 			this.lock.unlock();
@@ -637,26 +706,36 @@ final class Http2DemuxRelay {
 		Router.Route route = resolved.route();
 		Leg leg = legFor(route, resolved.session());
 		Stream stream = new Stream(streamId, leg);
-		this.streams.put(Integer.valueOf(streamId), stream);
-		leg.routeMeters.trackedStreams().increment();
-		this.lastStreamId = Math.max(this.lastStreamId, streamId);
-		leg.streamOpened(streamId);
 		// always re-encoded: the client's blocks reference its dynamic table, whose
 		// state a leg joining later (tunnel recovery, a second upstream of a coalesced
 		// connection) does not have -- the table-less encoder keeps every block
 		// self-contained no matter which leg decodes it or when
 		byte[] frames = encodedHead(streamId, endStream, headers, route.rewriteHost() ? route.address() : null,
 				this.headersEncoder);
+		boolean admitted;
 		this.lock.lock();
 		try {
-			this.activeStreams++;
-			stream.active = true;
-			stream.clientEnded = endStream;
-			leg.queueBlock(stream, frames);
+			// a leg its upstream retired meanwhile takes no new stream
+			admitted = leg.acceptingLocked();
+			if (admitted) {
+				this.streams.put(Integer.valueOf(streamId), stream);
+				leg.routeMeters.trackedStreams().increment();
+				this.activeStreams++;
+				stream.active = true;
+				stream.clientEnded = endStream;
+				stream.upstreamWindow = leg.initialWindow;
+				leg.streamOpened(streamId);
+				leg.queueBlock(stream, frames, false);
+			}
 		}
 		finally {
 			this.lock.unlock();
 		}
+		if (!admitted) {
+			writeToClient(rstStream(streamId, ERROR_REFUSED_STREAM));
+			return;
+		}
+		this.lastStreamId = Math.max(this.lastStreamId, streamId);
 		if (request != null) {
 			this.access.request(route.routeTag(), request.method(), request.path(), "2");
 		}
@@ -918,6 +997,7 @@ final class Http2DemuxRelay {
 				throw new IllegalStateException(e);
 			}
 		}
+		this.lastClientWrite = System.nanoTime();
 	}
 
 	/**
@@ -934,6 +1014,7 @@ final class Http2DemuxRelay {
 				throw new IllegalStateException(e);
 			}
 		}
+		this.lastClientWrite = System.nanoTime();
 		leg.outbound.increment(length);
 		leg.session.recordRelayed(length, StreamRelay.Direction.TO_LOCAL);
 		this.access.bytes(length, StreamRelay.Direction.TO_LOCAL);
@@ -951,8 +1032,11 @@ final class Http2DemuxRelay {
 		/** The client's send window, as the relay granted it. */
 		long clientWindow = STREAM_WINDOW;
 
-		/** Window owed to the client but held back by the budget. */
-		long held;
+		/**
+		 * The relay's send window towards the upstream, as the upstream granted it; may
+		 * be negative after the upstream lowered its initial window (RFC 9113 6.9.2).
+		 */
+		long upstreamWindow;
 
 		/** DATA payload of the stream queued or being written. */
 		int queuedPayload;
@@ -960,7 +1044,7 @@ final class Http2DemuxRelay {
 		/** Every byte queued for the stream, frame headers of its entries included. */
 		long queuedBytes;
 
-		/** Payload not yet taken by the leg writer. */
+		/** Payload not yet written by the leg writer. */
 		final ByteArrayOutputStream pendingData = new ByteArrayOutputStream(0);
 
 		boolean pendingEnd;
@@ -1051,13 +1135,23 @@ final class Http2DemuxRelay {
 
 		private final Map<Integer, Long> settings = new LinkedHashMap<>();
 
+		/** The relay's connection send window towards the upstream; with the lock. */
+		private long sendWindow = STREAM_WINDOW;
+
+		/** The upstream's SETTINGS_INITIAL_WINDOW_SIZE; guarded by the lock. */
+		private long initialWindow = STREAM_WINDOW;
+
 		/** The streams relayed whose response has not ended. */
 		private final Set<Integer> openStreams = ConcurrentHashMap.newKeySet();
 
+		/** The leg takes no new stream: its upstream went away, or it closed. */
 		private volatile boolean ended;
 
 		/** Set by {@link #close()}; guarded by {@link #lock}. */
 		private boolean closed;
+
+		/** The client is done sending: half-close once nothing is owed; with the lock. */
+		private boolean halfCloseRequested;
 
 		/** The writer half-closed the upstream and exited; guarded by {@link #lock}. */
 		private boolean halfClosed;
@@ -1096,6 +1190,11 @@ final class Http2DemuxRelay {
 			return !this.closed && !this.halfClosed;
 		}
 
+		/** Whether the leg half-closed or closed; with {@link #lock}. */
+		private boolean settledLocked() {
+			return this.closed || this.halfClosed;
+		}
+
 		private void addQueuedLocked(@Nullable Stream stream, long bytes) {
 			this.queuedBytes += bytes;
 			Http2DemuxRelay.this.queuedBytes += bytes;
@@ -1109,12 +1208,16 @@ final class Http2DemuxRelay {
 			this.wake.signal();
 		}
 
-		/** Queues a relayed block -- a whole header block, or a reset; with the lock. */
-		void queueBlock(Stream stream, byte[] bytes) {
+		/**
+		 * Queues a relayed block -- a whole header block, or a reset; with the lock.
+		 * {@code followsData}: written only after the stream's data queued before it
+		 * (trailers).
+		 */
+		void queueBlock(Stream stream, byte[] bytes, boolean followsData) {
 			if (!acceptingLocked()) {
 				return;
 			}
-			this.entries.addLast(new LegEntry.Block(stream, bytes));
+			this.entries.addLast(new LegEntry.Block(stream, bytes, followsData));
 			addQueuedLocked(stream, bytes.length);
 			signalLocked();
 		}
@@ -1144,7 +1247,10 @@ final class Http2DemuxRelay {
 			}
 		}
 
-		/** Drops the stream's payload not yet taken by the writer; with the lock. */
+		/**
+		 * Drops the stream's payload not yet taken by the writer; with the lock. Its data
+		 * entry, now empty, no longer waits for window: the writer is woken to drop it.
+		 */
 		void purgeData(Stream stream) {
 			int pending = stream.pendingData.size();
 			if (pending > 0) {
@@ -1153,6 +1259,7 @@ final class Http2DemuxRelay {
 				addQueuedLocked(stream, -pending);
 			}
 			stream.pendingEnd = false;
+			signalLocked();
 		}
 
 		/** Queues a stream window update, coalescing into a queued one; with the lock. */
@@ -1239,12 +1346,15 @@ final class Http2DemuxRelay {
 			}
 		}
 
-		/** Half-closes the upstream once the queued frames are written. */
+		/**
+		 * Half-closes the upstream once the queued frames are written and no response is
+		 * owed; until then the priority lane keeps flowing.
+		 */
 		void halfClose() {
 			Http2DemuxRelay.this.lock.lock();
 			try {
 				if (acceptingLocked()) {
-					this.entries.addLast(LegEntry.HalfClose.INSTANCE);
+					this.halfCloseRequested = true;
 					signalLocked();
 				}
 			}
@@ -1254,8 +1364,88 @@ final class Http2DemuxRelay {
 		}
 
 		/**
-		 * The writer's next batch: the priority lane, then one entry; blocks while both
-		 * are empty, {@code null} once the leg is closed.
+		 * Applies the upstream's SETTINGS (RFC 9113 6.5.3, 6.9.2): a changed initial
+		 * window shifts the window of every stream of the leg by the difference.
+		 * {@code false} when a window would pass 2^31-1, a connection error.
+		 */
+		boolean applySettings(byte[] bytes, int payload, int length) {
+			Http2DemuxRelay.this.lock.lock();
+			try {
+				for (int i = 0; i + 6 <= length; i += 6) {
+					int at = payload + i;
+					int id = (bytes[at] & 0xff) << 8 | (bytes[at + 1] & 0xff);
+					if (id != SETTINGS_INITIAL_WINDOW_SIZE) {
+						continue;
+					}
+					long value = (bytes[at + 2] & 0xffL) << 24 | (bytes[at + 3] & 0xff) << 16
+							| (bytes[at + 4] & 0xff) << 8 | (bytes[at + 5] & 0xff);
+					if (value > MAX_WINDOW) {
+						return false;
+					}
+					long delta = value - this.initialWindow;
+					this.initialWindow = value;
+					for (Stream stream : Http2DemuxRelay.this.streams.values()) {
+						if (stream.leg == this && stream.active) {
+							stream.upstreamWindow += delta;
+							if (stream.upstreamWindow > MAX_WINDOW) {
+								return false;
+							}
+						}
+					}
+				}
+				signalLocked();
+				return true;
+			}
+			finally {
+				Http2DemuxRelay.this.lock.unlock();
+			}
+		}
+
+		/**
+		 * The upstream's connection-level WINDOW_UPDATE; {@code false} when the window
+		 * would pass 2^31-1.
+		 */
+		boolean creditConnection(int increment) {
+			Http2DemuxRelay.this.lock.lock();
+			try {
+				this.sendWindow += increment;
+				if (this.sendWindow > MAX_WINDOW) {
+					return false;
+				}
+				signalLocked();
+				return true;
+			}
+			finally {
+				Http2DemuxRelay.this.lock.unlock();
+			}
+		}
+
+		/**
+		 * The upstream's WINDOW_UPDATE of a stream of the leg; {@code false} when the
+		 * window would pass 2^31-1. Updates of streams the relay forgot are void.
+		 */
+		boolean creditStream(Stream stream, int increment) {
+			Http2DemuxRelay.this.lock.lock();
+			try {
+				if (!stream.active) {
+					return true;
+				}
+				stream.upstreamWindow += increment;
+				if (stream.upstreamWindow > MAX_WINDOW) {
+					return false;
+				}
+				signalLocked();
+				return true;
+			}
+			finally {
+				Http2DemuxRelay.this.lock.unlock();
+			}
+		}
+
+		/**
+		 * The writer's next batch: the priority lane, then the first entry ready to go;
+		 * once the client is done and nothing is owed, the half-close. Blocks while there
+		 * is none, {@code null} once the leg is closed.
 		 */
 		@Nullable Batch take() throws InterruptedException {
 			Http2DemuxRelay.this.lock.lock();
@@ -1265,9 +1455,17 @@ final class Http2DemuxRelay {
 						return null;
 					}
 					byte[] control = drainControlLocked();
-					LegEntry entry = this.entries.pollFirst();
-					if (control.length > 0 || entry != null) {
-						return batchLocked(control, entry);
+					Batch batch = nextEntryLocked(control);
+					if (batch != null) {
+						return batch;
+					}
+					if (this.halfCloseRequested && this.entries.isEmpty() && this.openStreams.isEmpty()) {
+						this.halfClosed = true;
+						Http2DemuxRelay.this.legSettled.signalAll();
+						return new Batch(control, EMPTY, null, 0, 0, true);
+					}
+					if (control.length > 0) {
+						return new Batch(control, EMPTY, null, 0, 0, false);
 					}
 					this.wake.await();
 					this.routeMeters.writerWakeups().increment();
@@ -1281,7 +1479,7 @@ final class Http2DemuxRelay {
 		private byte[] drainControlLocked() {
 			if (this.settings.isEmpty() && this.settingsAcks == 0 && this.pingAcks.isEmpty()
 					&& this.connectionGrant == 0) {
-				return new byte[0];
+				return EMPTY;
 			}
 			ByteArrayOutputStream out = new ByteArrayOutputStream(64);
 			if (!this.settings.isEmpty()) {
@@ -1301,33 +1499,85 @@ final class Http2DemuxRelay {
 			return out.toByteArray();
 		}
 
-		private Batch batchLocked(byte[] control, @Nullable LegEntry entry) {
-			return switch (entry) {
-				case null -> new Batch(control, new byte[0], null, 0, 0, false);
-				case LegEntry.Block block ->
-					new Batch(control, block.bytes(), block.stream(), 0, block.bytes().length, false);
-				case LegEntry.Data data -> {
-					Stream stream = data.stream();
-					stream.dataQueued = false;
-					byte[] payload = stream.pendingData.toByteArray();
-					stream.pendingData.reset();
-					boolean end = stream.pendingEnd;
-					stream.pendingEnd = false;
-					// nothing left once a reset purged the payload
-					byte[] frames = payload.length > 0 || end ? dataFrames(stream.id, payload, end) : new byte[0];
-					yield new Batch(control, frames, stream, payload.length, payload.length + FRAME_HEADER_LENGTH,
-							false);
+		/**
+		 * Takes the first queued entry ready to go, in queue order: a stream's data as
+		 * far as the upstream's windows allow -- what is left goes to the back of the
+		 * queue, so the streams take turns -- and a stream's trailers only once its data
+		 * is out. Header blocks, resets and window updates never wait for window (RFC
+		 * 9113 5.2.1): a client's window update overtakes its stream's waiting data,
+		 * which the upstream may only accept once it could send.
+		 */
+		private @Nullable Batch nextEntryLocked(byte[] control) {
+			Iterator<LegEntry> iterator = this.entries.iterator();
+			while (iterator.hasNext()) {
+				LegEntry entry = iterator.next();
+				switch (entry) {
+					case LegEntry.Block block -> {
+						if (block.followsData() && block.stream().dataQueued) {
+							continue;
+						}
+						iterator.remove();
+						return new Batch(control, block.bytes(), block.stream(), 0, block.bytes().length, false);
+					}
+					case LegEntry.WindowUpdate update -> {
+						iterator.remove();
+						update.stream().windowUpdate = null;
+						return new Batch(control, windowUpdate(update.stream().id, update.increment), update.stream(),
+								0, FRAME_HEADER_LENGTH + 4, false);
+					}
+					case LegEntry.Data data -> {
+						Batch batch = dataBatchLocked(data.stream(), control);
+						if (batch == null) {
+							continue;
+						}
+						iterator.remove();
+						if (data.stream().dataQueued) {
+							this.entries.addLast(data);
+						}
+						return batch;
+					}
 				}
-				case LegEntry.WindowUpdate update -> {
-					update.stream().windowUpdate = null;
-					yield new Batch(control, windowUpdate(update.stream().id, update.increment), update.stream(), 0,
-							FRAME_HEADER_LENGTH + 4, false);
+			}
+			return null;
+		}
+
+		/**
+		 * The stream's pending payload as DATA frames, as far as the stream's and the
+		 * connection's upstream windows allow; {@code null} while they allow none. An
+		 * empty END_STREAM needs no window (RFC 9113 6.9.1); a payload a reset purged
+		 * yields no frame.
+		 */
+		private @Nullable Batch dataBatchLocked(Stream stream, byte[] control) {
+			int pending = stream.pendingData.size();
+			int length = pending;
+			if (pending > 0) {
+				long allowed = Math.min(stream.upstreamWindow, this.sendWindow);
+				if (allowed <= 0) {
+					return null;
 				}
-				case LegEntry.HalfClose halfClose -> {
-					this.halfClosed = true;
-					yield new Batch(control, new byte[0], null, 0, 0, true);
-				}
-			};
+				length = (int) Math.min(pending, allowed);
+			}
+			byte[] all = stream.pendingData.toByteArray();
+			byte[] payload = all;
+			if (length < pending) {
+				payload = Arrays.copyOf(all, length);
+				stream.pendingData.reset();
+				stream.pendingData.write(all, length, pending - length);
+			}
+			else {
+				stream.pendingData.reset();
+			}
+			stream.upstreamWindow -= length;
+			this.sendWindow -= length;
+			boolean whole = length == pending;
+			boolean end = whole && stream.pendingEnd;
+			if (whole) {
+				stream.dataQueued = false;
+				stream.pendingEnd = false;
+			}
+			byte[] frames = length > 0 || end ? dataFrames(stream.id, payload, end) : EMPTY;
+			// the entry's frame header stays accounted while the entry is queued
+			return new Batch(control, frames, stream, length, length + (whole ? FRAME_HEADER_LENGTH : 0L), false);
 		}
 
 		/**
@@ -1361,7 +1611,20 @@ final class Http2DemuxRelay {
 
 		/** No response follows on the stream (reset by either side). */
 		void streamClosed(int streamId) {
-			this.openStreams.remove(Integer.valueOf(streamId));
+			forgetOpen(streamId);
+		}
+
+		/** Uncounts a stream owing a response; the last one may let the writer finish. */
+		private void forgetOpen(int streamId) {
+			if (this.openStreams.remove(Integer.valueOf(streamId)) && this.openStreams.isEmpty()) {
+				Http2DemuxRelay.this.lock.lock();
+				try {
+					signalLocked();
+				}
+				finally {
+					Http2DemuxRelay.this.lock.unlock();
+				}
+			}
 		}
 
 		/**
@@ -1369,7 +1632,7 @@ final class Http2DemuxRelay {
 		 * end reaches the client, so a stream the client opens on seeing it is admitted.
 		 */
 		void responseEnded(int streamId) {
-			this.openStreams.remove(Integer.valueOf(streamId));
+			forgetOpen(streamId);
 			Stream stream = Http2DemuxRelay.this.streams.get(Integer.valueOf(streamId));
 			if (stream == null || stream.leg != this) {
 				return;
@@ -1424,22 +1687,13 @@ final class Http2DemuxRelay {
 			writeToClient(frames, 0, frames.length, this);
 		}
 
-		boolean hasOpenStreams() {
-			return !this.openStreams.isEmpty();
-		}
-
 		/** Closes the virtual connection, releasing the upstream. */
 		void close() {
 			Http2DemuxRelay.this.lock.lock();
 			try {
-				if (this.closed) {
+				if (!closeLocked()) {
 					return;
 				}
-				this.closed = true;
-				addQueuedLocked(null, -this.queuedBytes);
-				this.entries.clear();
-				this.pingAcks.clear();
-				this.wake.signalAll();
 			}
 			finally {
 				Http2DemuxRelay.this.lock.unlock();
@@ -1447,13 +1701,79 @@ final class Http2DemuxRelay {
 			this.connection.close();
 		}
 
+		/**
+		 * The upstream ended its side: with no response owed the leg retires -- closed,
+		 * the data still queued for it dropped, and every stream the client still sends
+		 * on reset with {@code NO_ERROR}, its response being complete. {@code false} when
+		 * a response is owed, which the caller turns into the end of the relay.
+		 */
+		boolean retire() {
+			List<Integer> sending = new ArrayList<>();
+			Http2DemuxRelay.this.lock.lock();
+			try {
+				if (this.closed) {
+					return true;
+				}
+				if (!this.openStreams.isEmpty()) {
+					return false;
+				}
+				for (Stream stream : Http2DemuxRelay.this.streams.values()) {
+					if (stream.leg == this && !stream.clientEnded) {
+						sending.add(Integer.valueOf(stream.id));
+					}
+				}
+				closeLocked();
+			}
+			finally {
+				Http2DemuxRelay.this.lock.unlock();
+			}
+			this.connection.close();
+			for (Integer streamId : sending) {
+				writeToClient(rstStream(streamId, ERROR_NO_ERROR));
+			}
+			return true;
+		}
+
+		/**
+		 * Marks the leg closed and forgets what is queued for it, its streams included,
+		 * which end for good; {@code false} when it was closed already. With the lock.
+		 */
+		private boolean closeLocked() {
+			if (this.closed) {
+				return false;
+			}
+			this.closed = true;
+			this.ended = true;
+			for (Stream stream : Http2DemuxRelay.this.streams.values()) {
+				if (stream.leg != this) {
+					continue;
+				}
+				stream.pendingData.reset();
+				stream.pendingEnd = false;
+				stream.dataQueued = false;
+				stream.windowUpdate = null;
+				stream.queuedPayload = 0;
+				stream.queuedBytes = 0;
+				stream.reset = true;
+				stream.clientEnded = true;
+				stream.responseEnded = true;
+				updateActiveLocked(stream);
+			}
+			addQueuedLocked(null, -this.queuedBytes);
+			this.entries.clear();
+			this.pingAcks.clear();
+			this.wake.signalAll();
+			Http2DemuxRelay.this.legSettled.signalAll();
+			return true;
+		}
+
 	}
 
 	/**
 	 * The leg's writer: writes the preface, then batch after batch -- the priority lane
-	 * ahead of the next queued entry -- on the leg's upstream sink, so a stalled leg
-	 * never stops the others. It sleeps while nothing is queued, and exits once the leg
-	 * is closed or after the upstream's half-close. A write failure tears the relay down.
+	 * ahead of the next entry ready to go -- on the leg's upstream sink, so a stalled leg
+	 * never stops the others. It sleeps while nothing is ready, and exits once the leg is
+	 * closed or after the upstream's half-close. A write failure tears the relay down.
 	 */
 	private void pumpLegOutbound(Leg leg) {
 		try {
@@ -1533,7 +1853,7 @@ final class Http2DemuxRelay {
 				relayInbound(leg, scan, buffer, n);
 			}
 			// the upstream half-closed: owed responses end the relay, an idle leg retires
-			if (leg.hasOpenStreams()) {
+			if (!leg.retire()) {
 				abort();
 			}
 		}
@@ -1549,9 +1869,8 @@ final class Http2DemuxRelay {
 	/**
 	 * Relays the leg's stream-scoped frames to the client and handles the
 	 * connection-level ones locally: the client face of the relay owns that state, so the
-	 * leg's settings are acked, its pings answered, its stream window updates granted
-	 * through the stream's budget, and its connection window updates and goaway absorbed
-	 * -- never forwarded.
+	 * leg's settings are applied and acked, its pings answered, its window updates
+	 * credited to the relay's send windows, and its goaway absorbed -- never forwarded.
 	 */
 	private void relayInbound(Leg leg, ByteArrayOutputStream scan, byte[] chunk, int length) {
 		scan.write(chunk, 0, length);
@@ -1572,7 +1891,16 @@ final class Http2DemuxRelay {
 				relayStreamFrame(leg, new Frame(type, flags, streamId, all, payload, frameLength), position);
 			}
 			else if (type == FRAME_SETTINGS && (flags & FLAG_ACK) == 0) {
+				if (!leg.applySettings(all, payload, frameLength)) {
+					abort(); // a window past 2^31-1: a connection error
+				}
 				leg.queueSettingsAck();
+			}
+			else if (type == FRAME_WINDOW_UPDATE && frameLength == 4) {
+				int increment = int31(all, payload);
+				if (increment > 0 && !leg.creditConnection(increment)) {
+					abort(); // a window past 2^31-1: a connection error
+				}
 			}
 			else if (type == FRAME_PING && (flags & FLAG_ACK) == 0 && frameLength == 8) {
 				byte[] ping = new byte[8];
@@ -1613,22 +1941,20 @@ final class Http2DemuxRelay {
 		}
 	}
 
-	/** The upstream's stream window grant, owed to the client within the budget. */
+	/**
+	 * The upstream's stream window grant, credited to the relay's send window of the
+	 * stream; one past 2^31-1 ends the relay (a stream error, which RFC 9113 5.4.1 lets
+	 * an endpoint treat as a connection error).
+	 */
 	private void onUpstreamWindowUpdate(Leg leg, Frame frame) {
 		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
 		if (stream == null || stream.leg != leg || frame.length() != 4) {
 			return;
 		}
-		int release;
-		this.lock.lock();
-		try {
-			stream.held = Math.min(Integer.MAX_VALUE, stream.held + int31(frame.bytes(), frame.payload()));
-			release = releaseLocked(stream);
+		int increment = int31(frame.bytes(), frame.payload());
+		if (increment > 0 && !leg.creditStream(stream, increment)) {
+			abort();
 		}
-		finally {
-			this.lock.unlock();
-		}
-		grantStream(stream.id, release);
 	}
 
 	/**
@@ -1646,7 +1972,6 @@ final class Http2DemuxRelay {
 			stream.reset = true;
 			stream.clientEnded = true;
 			stream.responseEnded = true;
-			stream.held = 0;
 			leg.purgeData(stream);
 			updateActiveLocked(stream);
 		}
@@ -1703,7 +2028,8 @@ final class Http2DemuxRelay {
 
 	/**
 	 * One batch of the leg writer: the priority lane's frames, then one entry's bytes,
-	 * with what the entry held queued for its stream.
+	 * with the payload and the queued bytes they release for the stream; or the
+	 * half-close.
 	 */
 	private record Batch(byte[] control, byte[] bytes, @Nullable Stream stream, int payload, long queued,
 			boolean halfClose) {
@@ -1712,12 +2038,18 @@ final class Http2DemuxRelay {
 	/** One entry of a leg's queue. */
 	private sealed interface LegEntry {
 
-		/** Relayed frames written as one: a whole header block, or a reset. */
-		record Block(Stream stream, byte[] bytes) implements LegEntry {
+		/**
+		 * Relayed frames written as one: a whole header block, or a reset; trailers
+		 * ({@code followsData}) wait until the stream's queued data is out.
+		 */
+		record Block(Stream stream, byte[] bytes, boolean followsData) implements LegEntry {
 
 		}
 
-		/** The stream's pending DATA payload, framed when the writer takes it. */
+		/**
+		 * The stream's pending DATA payload, framed when the writer takes it; queued
+		 * again behind the others while the upstream's windows leave some of it pending.
+		 */
 		record Data(Stream stream) implements LegEntry {
 
 		}
@@ -1737,13 +2069,6 @@ final class Http2DemuxRelay {
 			Stream stream() {
 				return this.stream;
 			}
-
-		}
-
-		/** The final half-close of the client side, after the pending frames. */
-		enum HalfClose implements LegEntry {
-
-			INSTANCE
 
 		}
 

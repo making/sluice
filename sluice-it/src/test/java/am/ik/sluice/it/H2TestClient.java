@@ -375,6 +375,13 @@ public final class H2TestClient implements AutoCloseable {
 		return block.toByteArray();
 	}
 
+	/** Ends the client's sending side of the TCP connection; reading goes on. */
+	public void halfClose() throws IOException {
+		synchronized (this.out) {
+			this.socket.shutdownOutput();
+		}
+	}
+
 	@Override
 	public void close() throws IOException {
 		this.socket.close();

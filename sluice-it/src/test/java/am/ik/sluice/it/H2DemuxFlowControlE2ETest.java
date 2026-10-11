@@ -240,7 +240,7 @@ class H2DemuxFlowControlE2ETest {
 	/**
 	 * Padding counts against both windows (RFC 9113 6.9.1): the relay releases the whole
 	 * frame at connection level, gives the padding back at stream level since it never
-	 * leaves the relay, and relays the payload unpadded.
+	 * queues it, and relays the payload unpadded.
 	 */
 	@Test
 	void paddedDataIsReleasedInFullAndRelayedUnpadded() throws Exception {
@@ -258,15 +258,19 @@ class H2DemuxFlowControlE2ETest {
 			assertThat(client.awaitTrue(() -> client.connectionGranted() >= payload.length, Duration.ofSeconds(5)))
 				.as("connection grant %d", client.connectionGranted())
 				.isTrue();
-			assertThat(client.awaitTrue(() -> client.streamGranted(1) >= 1 + padding, Duration.ofSeconds(5)))
+			// once the payload is written nothing stays queued: the stream's window is
+			// back at the budget, the padding included
+			long streamGrant = STREAM_BUDGET - H2TestClient.INITIAL_WINDOW + payload.length;
+			assertThat(client.awaitTrue(() -> client.streamGranted(1) >= streamGrant, Duration.ofSeconds(5)))
 				.as("stream grant %d", client.streamGranted(1))
 				.isTrue();
 			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> !upstreamData.isEmpty());
 			TestH2.Frame relayed = upstreamData.get(0);
 			assertThat(relayed.flags() & TestH2.FLAG_PADDED).as("relayed unpadded").isZero();
 			assertThat(relayed.payload()).hasSize(data);
+			Thread.sleep(200); // a surplus grant would follow the exact one
 			assertThat(client.connectionGranted()).isEqualTo(payload.length);
-			assertThat(client.streamGranted(1)).isEqualTo(1 + padding);
+			assertThat(client.streamGranted(1)).isEqualTo(streamGrant);
 		}
 	}
 

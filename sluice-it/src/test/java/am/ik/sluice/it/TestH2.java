@@ -81,7 +81,7 @@ public final class TestH2 {
 	 * Emits the client preface (magic + empty SETTINGS) followed by a HEADERS frame.
 	 * Header block: literal-no-index entries as {@code name=value} pairs.
 	 */
-	static void writeClientHead(OutputStream out, int streamId, String... headers) throws IOException {
+	public static void writeClientHead(OutputStream out, int streamId, String... headers) throws IOException {
 		out.write(PREFACE);
 		writeFrame(out, SETTINGS, 0x0, 0, new byte[0]);
 		writeFrame(out, HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, streamId, headerBlock(headers));
