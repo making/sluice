@@ -79,13 +79,14 @@ in the same investigation is todo 042.
 | 043-tunnel-sender-backpressure-and-teardown | F2, F3, F6 (+ non-blocking markers) | Medium | - |
 | 049-tunnel-teardown-under-full-queues | 043 review follow-up | Medium | 043 |
 | 044-session-sender-fair-scheduling | F4 | Medium | 043 |
+| 050-session-sender-scheduler-scaling | 044 review follow-up | Medium | 044; before or with 046 |
 | 045-h2-demux-per-leg-writers | F7 | Medium | 043, 044; before or with 046 |
 | 046-per-connection-flow-control-java | F1 (protocol + Java) | High | 043, 044, 045 |
 | 047-per-connection-flow-control-wasmlet | F5 | High | 046 |
 | 048-data-plane-connection-limits | memory bound (see "Residual after the children") | Medium | - (defaults derive from 044-046) |
 
 Each child is one commit series with its own tests and docs. This parent is done when all
-seven are, and the legacy-removal todo below is filed.
+children are, and the legacy-removal todo below is filed.
 
 ## Protocol contract (shared by 046 and 047)
 
