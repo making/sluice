@@ -2,8 +2,11 @@ package am.ik.sluice.tunnel;
 
 import org.jspecify.annotations.Nullable;
 
+import java.util.ArrayDeque;
+import java.util.Iterator;
+import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.LinkedBlockingDeque;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -25,38 +28,67 @@ import io.grpc.stub.CallStreamObserver;
 import io.grpc.stub.StreamObserver;
 
 /**
- * Serializes outbound frames through a bounded queue and flushes them to the underlying
- * gRPC stream observer, honoring flow control via {@link CallStreamObserver#isReady()}.
+ * Schedules outbound frames to the underlying gRPC stream observer, honoring flow control
+ * via {@link CallStreamObserver#isReady()}.
  * <p>
  * Callbacks must never call {@code onNext} directly from a receive callback; everything
- * goes through this queue and a dedicated virtual thread instead.
+ * goes through this class and a dedicated virtual thread instead. Frames are scheduled,
+ * not just queued: control frames (CONNECT, KEEP_ALIVE, ADVERTISE, ADVERTISE_ACK,
+ * MEMBERSHIP_UPDATE, DRAIN, and WINDOW_UPDATE once it exists) wait on an unbounded queue
+ * that is always sent first, so enqueueing one never blocks. Connection frames (DATA,
+ * CLOSE, ERROR) wait on a per-connection queue holding at most
+ * {@link #DATA_QUEUE_CAPACITY} DATA frames; only that connection's producer blocks once
+ * the cap is reached, and CLOSE / ERROR bypass it. The worker drains the connection
+ * queues round-robin, one frame per turn over the connections with pending frames, so one
+ * bulk transfer cannot starve the others. CONNECT stays ahead of its connection's DATA:
+ * it is enqueued before any relay thread of the connection exists, and control frames
+ * drain first. A connection's queue is dropped once it empties after its CLOSE or ERROR;
+ * a late frame for the id starts a new queue. A dead worker wakes and fails every waiting
+ * producer.
  */
 public final class SessionSender implements FrameWriter, AutoCloseable {
 
 	/** Maximum payload per DATA frame, leaving headroom below the 4MiB gRPC limit. */
 	static final int MAX_CHUNK = 64 * 1024;
 
-	private static final int QUEUE_CAPACITY = 256;
+	/** Maximum DATA frames queued per connection: 16 x 64KiB = 1MiB of payload. */
+	static final int DATA_QUEUE_CAPACITY = 16;
 
-	private sealed interface Entry permits Payload, Poison {
+	/** Frames of one connection waiting for the worker; guarded by {@link #lock}. */
+	private static final class ConnectionQueue {
 
-	}
+		final ArrayDeque<Frame> frames = new ArrayDeque<>();
 
-	private record Payload(Frame frame) implements Entry {
-	}
+		/** DATA frames within {@code #frames}; the per-connection producer bound. */
+		int dataFrames;
 
-	private record Poison() implements Entry {
+		/** A CLOSE or ERROR is queued; the empty queue can be dropped. */
+		boolean ended;
+
 	}
 
 	private final StreamObserver<Frame> outbound;
 
-	private final LinkedBlockingDeque<Entry> queue = new LinkedBlockingDeque<>(QUEUE_CAPACITY);
+	/**
+	 * Control frames; always sent before any connection frame. Guarded by {@link #lock}.
+	 */
+	private final ArrayDeque<Frame> control = new ArrayDeque<>();
+
+	/** Connection frames by id; guarded by {@link #lock}. */
+	private final TreeMap<Long, ConnectionQueue> queues = new TreeMap<>();
 
 	private final ReentrantLock lock = new ReentrantLock();
 
-	private final Condition onReady = lock.newCondition();
+	/** Signals enqueues, freed slots, readiness changes and shutdown. */
+	private final Condition activity = lock.newCondition();
 
 	private volatile boolean running = true;
+
+	/**
+	 * The connection served last; the round-robin resumes after it. Guarded by
+	 * {@link #lock}.
+	 */
+	private long lastServed = -1;
 
 	private final ReentrantLock workerLock = new ReentrantLock();
 
@@ -71,17 +103,18 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	public SessionSender(StreamObserver<Frame> outbound) {
 		this.outbound = Objects.requireNonNull(outbound, "outbound is required");
 		if (outbound instanceof CallStreamObserver<?> call) {
-			call.setOnReadyHandler(this::signalReady);
+			call.setOnReadyHandler(this::wakeWaiters);
 		}
 	}
 
-	private void signalReady() {
-		lock.lock();
+	/** Wakes the worker and any producer; a readiness change may unblock either. */
+	private void wakeWaiters() {
+		this.lock.lock();
 		try {
-			onReady.signalAll();
+			this.activity.signalAll();
 		}
 		finally {
-			lock.unlock();
+			this.lock.unlock();
 		}
 	}
 
@@ -107,7 +140,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		try {
 			while (this.running && !call.isReady()) {
 				try {
-					this.onReady.awaitNanos(TimeUnit.MILLISECONDS.toNanos(100));
+					this.activity.awaitNanos(TimeUnit.MILLISECONDS.toNanos(100));
 				}
 				catch (InterruptedException e) {
 					Thread.currentThread().interrupt();
@@ -121,18 +154,66 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		return this.running;
 	}
 
-	private boolean enqueue(Entry entry) {
+	/** Queues a control frame; never blocks. */
+	private void enqueueControl(Frame frame) {
+		this.lock.lock();
 		try {
-			while (this.running) {
-				if (this.queue.offer(entry, 50, TimeUnit.MILLISECONDS)) {
+			this.control.addLast(frame);
+			this.activity.signalAll();
+		}
+		finally {
+			this.lock.unlock();
+		}
+	}
+
+	/**
+	 * Queues a DATA frame, blocking while this connection's queue is at
+	 * {@link #DATA_QUEUE_CAPACITY} -- only this connection's producer waits. Returns
+	 * false when the sender is gone.
+	 */
+	private boolean enqueueData(long connectionId, Frame frame) {
+		this.lock.lock();
+		try {
+			while (true) {
+				if (!this.running) {
+					return false;
+				}
+				ConnectionQueue queue = this.queues.computeIfAbsent(connectionId, id -> new ConnectionQueue());
+				if (queue.dataFrames < DATA_QUEUE_CAPACITY) {
+					queue.frames.addLast(frame);
+					queue.dataFrames++;
+					this.activity.signalAll();
 					return true;
+				}
+				try {
+					this.activity.awaitNanos(TimeUnit.MILLISECONDS.toNanos(100));
+				}
+				catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					return false;
 				}
 			}
 		}
-		catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
+		finally {
+			this.lock.unlock();
 		}
-		return false;
+	}
+
+	/**
+	 * Queues CLOSE / ERROR for the connection, bypassing the DATA cap; never blocks, so
+	 * close paths cannot hang behind a full queue.
+	 */
+	private void enqueueMarker(long connectionId, Frame frame) {
+		this.lock.lock();
+		try {
+			ConnectionQueue queue = this.queues.computeIfAbsent(connectionId, id -> new ConnectionQueue());
+			queue.frames.addLast(frame);
+			queue.ended = true;
+			this.activity.signalAll();
+		}
+		finally {
+			this.lock.unlock();
+		}
 	}
 
 	@Override
@@ -141,7 +222,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 			.setConnId(connectionId)
 			.setAddress(address == null ? "" : address)
 			.build();
-		enqueue(new Payload(Frame.newBuilder().setConnect(connect).build()));
+		enqueueControl(Frame.newBuilder().setConnect(connect).build());
 	}
 
 	@Override
@@ -154,7 +235,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 				.setConnId(connectionId)
 				.setPayload(com.google.protobuf.UnsafeByteOperations.unsafeWrap(chunk))
 				.build();
-			if (!enqueue(new Payload(Frame.newBuilder().setData(data).build()))) {
+			if (!enqueueData(connectionId, Frame.newBuilder().setData(data).build())) {
 				return false;
 			}
 		}
@@ -166,7 +247,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	 */
 	public void sendAdvertise(List<Upstream> upstreams) {
 		Advertise advertise = Advertise.newBuilder().addAllUpstreams(upstreams).build();
-		enqueue(new Payload(Frame.newBuilder().setAdvertise(advertise).build()));
+		enqueueControl(Frame.newBuilder().setAdvertise(advertise).build());
 	}
 
 	/**
@@ -178,7 +259,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 			.addAllRejectedPorts(rejectedPorts)
 			.setNodeId(nodeId == null ? "" : nodeId)
 			.build();
-		enqueue(new Payload(Frame.newBuilder().setAdvertiseAck(ack).build()));
+		enqueueControl(Frame.newBuilder().setAdvertiseAck(ack).build());
 	}
 
 	/**
@@ -189,7 +270,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 			.addAllNodes(nodes)
 			.setMembershipVersion(membershipVersion)
 			.build();
-		enqueue(new Payload(Frame.newBuilder().setMembershipUpdate(update).build()));
+		enqueueControl(Frame.newBuilder().setMembershipUpdate(update).build());
 	}
 
 	/**
@@ -197,19 +278,91 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	 */
 	public void sendDrain(String reason) {
 		Drain drain = Drain.newBuilder().setReason(reason == null ? "" : reason).build();
-		enqueue(new Payload(Frame.newBuilder().setDrain(drain).build()));
+		enqueueControl(Frame.newBuilder().setDrain(drain).build());
 	}
 
 	@Override
 	public void sendClose(long connectionId) {
 		Close close = Close.newBuilder().setConnId(connectionId).build();
-		enqueue(new Payload(Frame.newBuilder().setClose(close).build()));
+		enqueueMarker(connectionId, Frame.newBuilder().setClose(close).build());
 	}
 
 	@Override
 	public void sendError(long connectionId, String message) {
 		Error error = Error.newBuilder().setConnId(connectionId).setMessage(message == null ? "" : message).build();
-		enqueue(new Payload(Frame.newBuilder().setError(error).build()));
+		enqueueMarker(connectionId, Frame.newBuilder().setError(error).build());
+	}
+
+	/**
+	 * The next frame to send: control frames first, then one frame per turn over the
+	 * connections with pending frames, resuming after the connection served last. Waits
+	 * while nothing is pending; null once the sender is stopped, in which case the
+	 * remaining frames are dropped -- the peer is gone anyway.
+	 */
+	private @Nullable Frame next() {
+		this.lock.lock();
+		try {
+			while (true) {
+				if (!this.running) {
+					return null;
+				}
+				Frame control = this.control.pollFirst();
+				if (control != null) {
+					return control;
+				}
+				Frame frame = nextConnectionFrame();
+				if (frame != null) {
+					return frame;
+				}
+				try {
+					this.activity.awaitNanos(TimeUnit.MILLISECONDS.toNanos(100));
+				}
+				catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+				}
+			}
+		}
+		finally {
+			this.lock.unlock();
+		}
+	}
+
+	/**
+	 * Pops one frame from the next connection in round-robin order; queues empty after
+	 * their CLOSE or ERROR are dropped along the way.
+	 */
+	private @Nullable Frame nextConnectionFrame() {
+		Map.Entry<Long, ConnectionQueue> first = null;
+		Map.Entry<Long, ConnectionQueue> next = null;
+		for (Iterator<Map.Entry<Long, ConnectionQueue>> it = this.queues.entrySet().iterator(); it.hasNext();) {
+			Map.Entry<Long, ConnectionQueue> entry = it.next();
+			ConnectionQueue queue = entry.getValue();
+			if (queue.frames.isEmpty()) {
+				if (queue.ended) {
+					it.remove();
+				}
+				continue;
+			}
+			if (first == null) {
+				first = entry;
+			}
+			if (entry.getKey() > this.lastServed && next == null) {
+				next = entry;
+			}
+		}
+		Map.Entry<Long, ConnectionQueue> chosen = next != null ? next : first;
+		if (chosen == null) {
+			return null;
+		}
+		this.lastServed = chosen.getKey();
+		ConnectionQueue queue = chosen.getValue();
+		Frame frame = queue.frames.pollFirst();
+		if (frame.getBodyCase() == Frame.BodyCase.DATA) {
+			queue.dataFrames--;
+			// a producer parked on the cap of this connection may continue
+			this.activity.signalAll();
+		}
+		return frame;
 	}
 
 	/**
@@ -219,18 +372,10 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	private void drain() {
 		try {
 			while (true) {
-				Entry entry;
-				try {
-					entry = this.queue.takeFirst();
-				}
-				catch (InterruptedException e) {
-					Thread.currentThread().interrupt();
-					continue;
-				}
-				if (entry instanceof Poison) {
+				Frame frame = next();
+				if (frame == null) {
 					return;
 				}
-				Frame frame = ((Payload) entry).frame();
 				if (!awaitReady()) {
 					return;
 				}
@@ -270,8 +415,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	@Override
 	public void close() {
 		this.running = false;
-		this.queue.offerFirst(new Poison());
-		this.signalReady();
+		this.wakeWaiters();
 		Worker worker = this.worker;
 		Thread thread = this.workerThread;
 		if (worker == null || thread == null || Thread.currentThread() == thread) {
@@ -302,10 +446,10 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 				drain();
 			}
 			finally {
-				// a dead worker must release the producers parked in enqueue and the
+				// a dead worker must release the producers parked in enqueueData and the
 				// awaitReady loop; close() alone cannot be relied on to run
 				running = false;
-				signalReady();
+				wakeWaiters();
 				workerLock.lock();
 				try {
 					done = true;
