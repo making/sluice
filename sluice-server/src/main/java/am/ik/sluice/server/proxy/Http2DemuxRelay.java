@@ -63,14 +63,14 @@ import io.micrometer.core.instrument.MeterRegistry;
  * allowance and the budget is exhausted, it withholds the client's connection window --
  * the client stops sending DATA once the at most 64KiB it holds are spent -- until its
  * legs drain below the allowance or the budget has room again; a new stream whose head
- * fits neither is refused ({@code REFUSED_STREAM}), and trailers that fit neither end the
- * connection ({@code ENHANCE_YOUR_CALM}). What a relay may not refuse -- DATA within the
- * windows it granted, resets and window updates -- is bounded per connection
- * ({@link #UNBUDGETED_BYTES}). A leg beyond the first takes a slot of the connection
- * limit; a stream whose route needs a leg while none is free is refused. A closed leg
- * keeps its slot -- its own, or the connection's -- until the frames queued for it left
- * the tunnel sender, and the connection's own slot is released once the relay ended and
- * no leg holds it any more.
+ * fits neither is refused ({@code REFUSED_STREAM}), and trailers that fit neither reset
+ * their stream ({@code ENHANCE_YOUR_CALM} to the client, {@code CANCEL} to the upstream).
+ * What a relay may not refuse -- DATA within the windows it granted, resets and window
+ * updates -- is bounded per connection ({@link #UNBUDGETED_BYTES}). A leg beyond the
+ * first takes a slot of the connection limit; a stream whose route needs a leg while none
+ * is free is refused. A closed leg keeps its slot -- its own, or the connection's --
+ * until the frames queued for it left the tunnel sender, and the connection's own slot is
+ * released once the relay ended and no leg holds it any more.
  * <p>
  * Towards each upstream the relay is a sender bound by the upstream's windows (RFC 9113
  * 6.9): the connection window and every stream's window, initially as the upstream's
@@ -94,7 +94,11 @@ import io.micrometer.core.instrument.MeterRegistry;
  * resets go on. Trailers follow their stream's waiting data; past
  * {@link #RESPONSE_BLOCK_ALLOWANCE} of them per leg, the inbound side stops reading until
  * the queue drains. A reset by either side drops the stream's waiting data and grants its
- * window back to the upstream.
+ * window back to the upstream. Whatever the upstream still sends on a stream the relay
+ * reset itself is dropped -- its DATA granted back, its header blocks decoded all the
+ * same to keep the leg's decoder in step --, and the relay keeps no state for the stream
+ * once the reset is written to the upstream, however long the upstream goes on sending on
+ * it.
  * <p>
  * The client ending its side of the connection half-closes each leg once the frames
  * queued for it are written and its responses ended -- until then the relay keeps
@@ -159,6 +163,8 @@ final class Http2DemuxRelay {
 	private static final int ERROR_FRAME_SIZE = 0x6;
 
 	private static final int ERROR_REFUSED_STREAM = 0x7;
+
+	private static final int ERROR_CANCEL = 0x8;
 
 	private static final int ERROR_ENHANCE_YOUR_CALM = 0xb;
 
@@ -817,10 +823,7 @@ final class Http2DemuxRelay {
 			if (stream.reset) {
 				return;
 			}
-			stream.reset = true;
-			stream.clientEnded = true;
-			stream.leg.purgeData(stream);
-			dropped = purgeResponseLocked(stream);
+			dropped = resetLocked(stream);
 			stream.leg.queueBlock(stream, frame(FRAME_RST_STREAM, frame.flags(), frame.streamId(), frame.bytes(),
 					frame.payload(), frame.length()), false);
 			updateActiveLocked(stream);
@@ -828,8 +831,62 @@ final class Http2DemuxRelay {
 		finally {
 			this.lock.unlock();
 		}
-		stream.leg.streamClosed(frame.streamId());
+		afterReset(stream);
 		stream.leg.queueConnectionGrant(dropped);
+	}
+
+	/**
+	 * Resets the stream both ways on the relay's own account (a stream error, RFC 9113
+	 * 5.4.2): RST_STREAM with the error code to the client, {@code CANCEL} to the
+	 * upstream once the frames queued for the stream ahead of it are written, the
+	 * stream's queued data and its response waiting for the client's window dropped --
+	 * the latter's window granted back to the upstream. The stream owes no response any
+	 * more, and whatever the upstream or the client still sends on it is dropped. It
+	 * stays counted against the advertised limit until its reset is written to the
+	 * upstream. Called by the outbound parse; a stream already reset by either side is
+	 * left alone, and {@code false} returned.
+	 */
+	private boolean resetStream(Stream stream, int errorCode) {
+		int dropped;
+		// under the sink lock, so no response frame of the stream follows the reset
+		synchronized (this.sinkLock) {
+			this.lock.lock();
+			try {
+				if (stream.reset) {
+					return false;
+				}
+				dropped = resetLocked(stream);
+				stream.leg.queueBlock(stream, rstStream(stream.id, ERROR_CANCEL), false);
+				updateActiveLocked(stream);
+			}
+			finally {
+				this.lock.unlock();
+			}
+			writeToClient(rstStream(stream.id, errorCode));
+		}
+		afterReset(stream);
+		stream.leg.queueConnectionGrant(dropped);
+		return true;
+	}
+
+	/**
+	 * Marks the stream reset and drops its queued data and its response waiting for the
+	 * client's window; returns the flow-controlled bytes of the latter, for the caller to
+	 * grant back to the upstream once the lock is released. With {@link #lock}.
+	 */
+	private int resetLocked(Stream stream) {
+		stream.reset = true;
+		stream.clientEnded = true;
+		stream.leg.purgeData(stream);
+		return purgeResponseLocked(stream);
+	}
+
+	/**
+	 * After a reset towards the upstream: the stream owes no response, and the bytes it
+	 * released may let the withheld connection window go.
+	 */
+	private void afterReset(Stream stream) {
+		stream.leg.streamClosed(stream.id);
 		grantOwed();
 		checkQueueBound();
 	}
@@ -1004,7 +1061,8 @@ final class Http2DemuxRelay {
 			}
 			if (!admitLocked(frames.length)) {
 				// trailers cannot be refused without leaving the stream unfinished: the
-				// connection, past its allowance with the budget exhausted, ends instead
+				// stream, its connection past its allowance with the budget exhausted, is
+				// reset instead
 				exhausted = true;
 			}
 			else {
@@ -1018,8 +1076,9 @@ final class Http2DemuxRelay {
 			this.lock.unlock();
 		}
 		if (exhausted) {
-			goAway(ERROR_ENHANCE_YOUR_CALM);
-			abort();
+			if (resetStream(stream, ERROR_ENHANCE_YOUR_CALM)) {
+				this.meters.resetForBudget();
+			}
 			return;
 		}
 		checkQueueBound();
@@ -2531,11 +2590,33 @@ final class Http2DemuxRelay {
 					frame.bytes(), frame.payload(), frame.length());
 			case FRAME_WINDOW_UPDATE -> onUpstreamWindowUpdate(leg, frame);
 			case FRAME_DATA -> relayData(leg, frame, position);
-			case FRAME_RST_STREAM -> {
-				onUpstreamReset(leg, frame.streamId());
-				writeToClient(frame.bytes(), position, frameBytes, leg);
+			case FRAME_RST_STREAM -> onUpstreamReset(leg, frame, position);
+			default -> {
+				Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
+				synchronized (this.sinkLock) {
+					if (trackedUnreset(leg, stream)) {
+						writeToClient(frame.bytes(), position, frameBytes, leg);
+					}
+				}
 			}
-			default -> writeToClient(frame.bytes(), position, frameBytes, leg);
+		}
+	}
+
+	/**
+	 * Whether the stream is tracked on the leg and reset by neither side: the frames of
+	 * the upstream on it may go to the client. Called with the sink lock, under which the
+	 * caller writes, so no frame follows the relay's own reset of the stream.
+	 */
+	private boolean trackedUnreset(Leg leg, @Nullable Stream stream) {
+		if (stream == null || stream.leg != leg) {
+			return false;
+		}
+		this.lock.lock();
+		try {
+			return !stream.reset;
+		}
+		finally {
+			this.lock.unlock();
 		}
 	}
 
@@ -2544,8 +2625,9 @@ final class Http2DemuxRelay {
 	 * past it ends the relay. Written as it is while no response waits and the client's
 	 * connection window admits it, else queued for the response writer: its payload, its
 	 * padding as octets owed, its END_STREAM. Frames of streams the relay no longer
-	 * relays a response on are dropped. The upstream's connection window comes back for
-	 * what is written or dropped, so a leg holds at most that window for the client.
+	 * relays a response on -- ended, reset by either side, or no longer tracked -- are
+	 * dropped. The upstream's connection window comes back for what is written or
+	 * dropped, so a leg holds at most that window for the client.
 	 */
 	private void relayData(Leg leg, Frame frame, int position) {
 		int length = frame.length();
@@ -2622,32 +2704,34 @@ final class Http2DemuxRelay {
 	 * A re-encoded response header block, written whole in one write so no other frame
 	 * lands inside it -- or queued behind the stream's response data waiting for the
 	 * client's window (trailers). Before queueing, the leg's inbound side waits while the
-	 * blocks queued for the leg would pass {@link #RESPONSE_BLOCK_ALLOWANCE}. A block
-	 * after the stream's end is dropped.
+	 * blocks queued for the leg would pass {@link #RESPONSE_BLOCK_ALLOWANCE}. A block of
+	 * a stream the relay no longer relays a response on -- ended, reset by either side,
+	 * or no longer tracked -- is dropped; the caller decoded it all the same, keeping the
+	 * leg's decoder in step with the upstream's encoder.
 	 */
 	private void relayHead(Leg leg, int streamId, byte[] frames, boolean endStream) {
-		Stream found = this.streams.get(Integer.valueOf(streamId));
-		Stream stream = found != null && found.leg == leg ? found : null;
-		if (stream != null) {
-			awaitBlockRoom(stream, frames.length);
+		Stream stream = this.streams.get(Integer.valueOf(streamId));
+		if (stream == null || stream.leg != leg) {
+			return;
 		}
+		awaitBlockRoom(stream, frames.length);
 		synchronized (this.sinkLock) {
-			boolean direct = stream == null || relayHeadLocked(stream, frames, endStream);
-			if (direct) {
+			if (relayHeadLocked(stream, frames, endStream)) {
 				writeToClient(frames, 0, frames.length, leg);
 			}
 		}
 	}
 
 	/**
-	 * Queues the block behind the stream's waiting response, or drops it after the
-	 * stream's end; {@code true} when it is to be written now.
+	 * Queues the block behind the stream's waiting response, or drops it once the relay
+	 * no longer relays a response on the stream; {@code true} when it is to be written
+	 * now.
 	 */
 	private boolean relayHeadLocked(Stream stream, byte[] frames, boolean endStream) {
 		this.lock.lock();
 		try {
-			if (stream.responseEnd || stream.responseBlock != null) {
-				return false; // the upstream ended the stream already
+			if (!relayingResponseLocked(stream.leg, stream)) {
+				return false;
 			}
 			if (stream.responseWaiting) {
 				stream.responseBlock = frames;
@@ -2910,26 +2994,32 @@ final class Http2DemuxRelay {
 	/**
 	 * The upstream reset the stream: closed both ways, its pending data and its response
 	 * waiting for the client's window dropped, the latter's window granted back to the
-	 * upstream; uncounted before the reset reaches the client.
+	 * upstream; uncounted before the reset, relayed as it is, reaches the client. The
+	 * reset of a stream already reset by either side, or no longer tracked, is dropped.
 	 */
-	private void onUpstreamReset(Leg leg, int streamId) {
-		leg.streamClosed(streamId);
-		Stream stream = this.streams.get(Integer.valueOf(streamId));
-		if (stream == null || stream.leg != leg) {
-			return;
-		}
-		int dropped;
-		this.lock.lock();
-		try {
-			stream.reset = true;
-			stream.clientEnded = true;
-			stream.responseEnded = true;
-			leg.purgeData(stream);
-			dropped = purgeResponseLocked(stream);
-			updateActiveLocked(stream);
-		}
-		finally {
-			this.lock.unlock();
+	private void onUpstreamReset(Leg leg, Frame frame, int position) {
+		leg.streamClosed(frame.streamId());
+		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
+		int dropped = 0;
+		synchronized (this.sinkLock) {
+			boolean relay = false;
+			if (stream != null && stream.leg == leg) {
+				this.lock.lock();
+				try {
+					relay = !stream.reset;
+					if (relay) {
+						dropped = resetLocked(stream);
+						stream.responseEnded = true;
+						updateActiveLocked(stream);
+					}
+				}
+				finally {
+					this.lock.unlock();
+				}
+			}
+			if (relay) {
+				writeToClient(frame.bytes(), position, FRAME_HEADER_LENGTH + frame.length(), leg);
+			}
 		}
 		leg.queueConnectionGrant(dropped);
 		grantOwed();

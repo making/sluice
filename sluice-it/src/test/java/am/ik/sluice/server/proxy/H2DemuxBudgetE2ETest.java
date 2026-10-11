@@ -8,8 +8,13 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -36,6 +41,10 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.netty.buffer.Unpooled;
+import io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder;
+import io.netty.handler.codec.http2.Http2Exception;
+import io.netty.handler.codec.http2.Http2Headers;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
@@ -73,6 +82,15 @@ class H2DemuxBudgetE2ETest {
 
 	private static final int MAX_FRAME_SIZE = 16 * 1024;
 
+	private static final int NO_ERROR = 0x0;
+
+	private static final int CANCEL = 0x8;
+
+	private static final int ENHANCE_YOUR_CALM = 0xb;
+
+	/** A RST_STREAM frame: its header and error code. */
+	private static final int RST_STREAM_BYTES = 9 + 4;
+
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
 	private final List<AutoCloseable> closeables = new CopyOnWriteArrayList<>();
@@ -94,6 +112,10 @@ class H2DemuxBudgetE2ETest {
 	@Nullable
 	@Autowired
 	private ConnectionLimits limits;
+
+	@Nullable
+	@Autowired
+	private DataProxyServer dataProxyServer;
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
@@ -219,26 +241,145 @@ class H2DemuxBudgetE2ETest {
 	}
 
 	/**
-	 * Trailers on a connection past its allowance with the budget exhausted cannot be
-	 * refused without leaving the stream unfinished: the connection ends with GOAWAY
-	 * ENHANCE_YOUR_CALM.
+	 * Trailers on a connection past its allowance with the budget exhausted reset their
+	 * stream only: RST_STREAM ENHANCE_YOUR_CALM to the client, CANCEL to the upstream,
+	 * the stream's queued data dropped. What the client still sends on the stream is void
+	 * -- its DATA granted back, its trailers decoded (a later head refers to their
+	 * dynamic table entry) but not relayed --, so is the reset the upstream answers with,
+	 * and the other streams of the connection complete. The stream stays tracked until
+	 * its reset is written to the upstream.
 	 */
 	@Test
-	void trailersPastTheAllowanceWithTheBudgetExhaustedEndTheConnection() throws Exception {
+	void trailersPastTheAllowanceWithTheBudgetExhaustedResetOnlyTheirStream() throws Exception {
 		String route = "bud.trailers.test";
 		CountDownLatch gate = new CountDownLatch(1);
-		startClient(route, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
-		try (Stalled first = stall(route); Stalled second = stall(route)) {
-			awaitStable(() -> queuedBytes(route));
+		UpstreamLog log = new UpstreamLog();
+		startClient(route, stub(socket -> serveGatedLogging(socket, gate, log)));
+		int reset = streamId(0);
+		int after = streamId(STREAMS + 1);
+		int body = 4096;
+		int late = 1024;
+		H2TestClient client = H2TestClient.connect(dataPort, reset);
+		client.headers(reset, false, head(route, "/reset"));
+		try (Stalled first = open(client, route, 1, BODY, body + late); Stalled second = stall(route)) {
+			first.awaitWithheld();
 			assertThat(budgetUsed()).as("exhausted").isGreaterThanOrEqualTo(BUDGET);
 			first.stop();
-			int stream = first.unfinishedStream();
-			first.client().headers(stream, true, TestH2.headerBlock("x-trailer=1"));
-			assertThat(first.client().awaitTrue(first.client()::closed, Duration.ofSeconds(5))).isTrue();
-			assertThat(first.client().goAwayCode()).isEqualTo(0xb);
+			long before = awaitSteady(() -> queuedBytes(route));
+			assertThat(client.connectionWindow()).as("the window kept for the stream to reset")
+				.isGreaterThanOrEqualTo(body + late);
+			client.sendData(reset, new byte[body], 0);
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> queuedBytes(route) >= before + body);
+			long queued = queuedBytes(route);
+			double resetsBefore = resets("budget");
+			client.headers(reset, true, TestH2.headerBlock("x-trailer=1"));
+			assertThat(client.awaitTrue(() -> client.reset(reset) != null, Duration.ofSeconds(5))).isTrue();
+			assertThat(client.reset(reset)).isEqualTo(ENHANCE_YOUR_CALM);
+			assertThat(resets("budget")).isEqualTo(resetsBefore + 1);
+			assertThat(queuedBytes(route)).as("the stream's queued data dropped, a reset queued")
+				.isLessThanOrEqualTo(queued - body + RST_STREAM_BYTES);
+			assertThat(trackedStreams(route)).as("counted until its reset is written to the stalled upstream")
+				.isEqualTo(2 * STREAMS + 1);
+			assertThat(client.goAwayCode()).isEqualTo(-1);
+			assertThat(client.closed()).isFalse();
+			// sent before the reset arrived, as far as the relay can tell
+			long granted = awaitStable(client::connectionGranted);
+			client.sendData(reset, new byte[late], 0);
+			client.headers(reset, true, TestH2.appendLiteralIncremental(new byte[0], "x-late", "1"));
+			assertThat(client.awaitTrue(() -> client.connectionGranted() >= granted + late, Duration.ofSeconds(5)))
+				.as("the DATA dropped is granted back")
+				.isTrue();
 			gate.countDown();
+			first.resume();
+			first.awaitEnds();
 			second.awaitEnds();
+			client.headers(after, true, TestH2
+				.appendIndexedDynamic(TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/after"), 62));
+			assertThat(client.awaitEnd(after, Duration.ofSeconds(10))).isTrue();
+			assertThat(log.heads.get(after)).as("decoded with the entry of the trailers dropped")
+				.isEqualTo(List.of(":authority: " + route, ":method: GET", ":path: /after", "x-late: 1"));
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.untilAsserted(() -> assertThat(trackedStreams(route)).as("the reset stream no longer tracked either")
+					.isZero());
+			assertThat(log.resets).as("the upstream was told").isEqualTo(Map.of(reset, CANCEL));
+			assertThat(log.afterReset).as("nothing of the stream relayed after its reset").isEmpty();
+			assertThat(types(client.frames(reset))).as("the upstream's reset in answer is not relayed")
+				.isEqualTo(List.of(TestH2.RST_STREAM));
+			assertThat(client.reset(reset)).isEqualTo(ENHANCE_YOUR_CALM);
+			assertThat(client.goAwayCode()).isEqualTo(-1);
 		}
+		awaitReleased(route);
+	}
+
+	/**
+	 * A stream the relay reset while its response waits for the client's connection
+	 * window: the waiting response is dropped and its window granted back to the
+	 * upstream, and nothing the upstream had in flight on the stream -- DATA, a header
+	 * block, an unknown frame -- reaches the client, though the header block is decoded
+	 * (another stream's trailers refer to its dynamic table entry). The stream is no
+	 * longer tracked, and owing no response -- the upstream never ended it --, the
+	 * upstream leaving retires the leg without ending the connection.
+	 */
+	@Test
+	void upstreamFramesOnAStreamTheRelayResetNeverReachTheClient() throws Exception {
+		String stalledRoute = "bud.cancel.held.test";
+		String route = "bud.cancel.test";
+		CountDownLatch gate = new CountDownLatch(1);
+		int reset = streamId(0);
+		int probe = streamId(1);
+		CancelScript script = new CancelScript(reset, probe);
+		startClient(stalledRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
+		startClient(route, stub(script::serve));
+		H2TestClient client = H2TestClient.connect(dataPort, reset, probe);
+		client.headers(reset, false, head(route, "/reset"));
+		client.headers(probe, false, head(route, "/probe"));
+		try (Stalled first = open(client, stalledRoute, 2, BODY, 0); Stalled second = stall(stalledRoute)) {
+			first.awaitWithheld();
+			assertThat(budgetUsed()).as("exhausted").isGreaterThanOrEqualTo(BUDGET);
+			first.stop();
+			client.withholdConnectionWindow();
+			script.respond.countDown();
+			assertThat(script.queued.await(10, TimeUnit.SECONDS)).as("the upstream's PING fence came back").isTrue();
+			assertThat(client.awaitTrue(() -> client.dataReceived(probe) == H2TestClient.INITIAL_WINDOW,
+					Duration.ofSeconds(5)))
+				.as("the probe's response took the whole connection window")
+				.isTrue();
+			assertThat(client.awaitTrue(() -> types(client.frames(reset)).equals(List.of(TestH2.HEADERS)),
+					Duration.ofSeconds(5)))
+				.as("the head of the response reached the client, its DATA waits")
+				.isTrue();
+			assertThat(script.granted.get()).as("the waiting DATA's window is held")
+				.isEqualTo(H2TestClient.INITIAL_WINDOW);
+			assertThat(trackedStreams(route)).isEqualTo(2);
+			double resetsBefore = resets("budget");
+			client.headers(reset, true, TestH2.headerBlock("x-trailer=1"));
+			assertThat(client.awaitTrue(() -> client.reset(reset) != null, Duration.ofSeconds(5))).isTrue();
+			assertThat(client.reset(reset)).isEqualTo(ENHANCE_YOUR_CALM);
+			assertThat(resets("budget")).isEqualTo(resetsBefore + 1);
+			assertThat(script.answered.await(10, TimeUnit.SECONDS)).as("the upstream read the reset").isTrue();
+			assertThat(script.resetCode.get()).isEqualTo(CANCEL);
+			assertThat(client.awaitEnd(probe, Duration.ofSeconds(5))).as("the probe's trailers arrived").isTrue();
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.untilAsserted(() -> assertThat(script.granted.get())
+					.as("the waiting DATA and the DATA in flight granted back")
+					.isEqualTo(H2TestClient.INITIAL_WINDOW + CancelScript.WAITING + CancelScript.IN_FLIGHT));
+			assertThat(types(client.frames(reset))).as("nothing after the relay's reset")
+				.isEqualTo(List.of(TestH2.HEADERS, TestH2.RST_STREAM));
+			assertThat(lastHeaderBlock(client.frames(probe))).as("decoded with the entry of the block dropped")
+				.isEqualTo(List.of("x-dropped: 1"));
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> trackedStreams(route) == 1);
+			script.leave.countDown();
+			assertThat(client.awaitTrue(() -> client.reset(probe) != null, Duration.ofSeconds(5)))
+				.as("the leg retired, resetting the stream the client still sends on")
+				.isTrue();
+			assertThat(client.reset(probe)).isEqualTo(NO_ERROR);
+			assertThat(client.closed()).isFalse();
+			assertThat(client.goAwayCode()).isEqualTo(-1);
+			gate.countDown();
+		}
+		awaitReleased(stalledRoute);
 		awaitReleased(route);
 	}
 
@@ -307,14 +448,26 @@ class H2DemuxBudgetE2ETest {
 	 * {@code body} bytes as fast as its windows admit.
 	 */
 	private Stalled open(String route, int streams, int body) throws Exception {
-		H2TestClient client = H2TestClient.connect(dataPort);
-		for (int i = 0; i < streams; i++) {
-			client.headers(streamId(i), false,
-					TestH2.headerBlock(":authority=" + route, ":method=POST", ":path=/" + i));
-		}
-		Stalled stalled = new Stalled(client, streams, body);
+		Stalled stalled = new Stalled(H2TestClient.connect(dataPort), 0, streams, body, 0);
+		stalled.open(route);
 		stalled.start();
 		return stalled;
+	}
+
+	/**
+	 * Opens {@link #STREAMS} streams on the route over the client, the first one at the
+	 * stream index {@code first}, each sending {@code body} bytes as fast as its windows
+	 * admit, while leaving {@code reserve} bytes of the connection window unspent.
+	 */
+	private static Stalled open(H2TestClient client, String route, int first, int body, int reserve) throws Exception {
+		Stalled stalled = new Stalled(client, first, STREAMS, body, reserve);
+		stalled.open(route);
+		stalled.start();
+		return stalled;
+	}
+
+	private static byte[] head(String route, String path) {
+		return TestH2.headerBlock(":authority=" + route, ":method=POST", ":path=" + path);
 	}
 
 	private static int streamId(int index) {
@@ -332,16 +485,35 @@ class H2DemuxBudgetE2ETest {
 
 		private final AtomicLong idleSince = new AtomicLong();
 
+		/** The connection window the pump leaves unspent. */
+		private final int reserve;
+
 		private @Nullable Thread pump;
 
-		Stalled(H2TestClient client, int streams, int body) {
+		/** The stream index of the first stream. */
+		private final int first;
+
+		Stalled(H2TestClient client, int first, int streams, int body, int reserve) {
 			this.client = client;
+			this.first = first;
 			this.remaining = new long[streams];
+			this.reserve = reserve;
 			java.util.Arrays.fill(this.remaining, body);
 		}
 
 		H2TestClient client() {
 			return this.client;
+		}
+
+		/** Sends the heads of the streams. */
+		void open(String route) throws IOException {
+			for (int i = 0; i < this.remaining.length; i++) {
+				this.client.headers(id(i), false, head(route, "/" + i));
+			}
+		}
+
+		private int id(int index) {
+			return streamId(this.first + index);
 		}
 
 		void start() {
@@ -358,8 +530,9 @@ class H2DemuxBudgetE2ETest {
 							continue;
 						}
 						done = false;
-						int id = streamId(i);
-						int n = (int) Math.min(Math.min(this.remaining[i], this.client.sendable(id)), MAX_FRAME_SIZE);
+						int id = id(i);
+						long window = Math.min(this.client.sendable(id), this.client.connectionWindow() - this.reserve);
+						int n = (int) Math.min(Math.min(this.remaining[i], window), MAX_FRAME_SIZE);
 						if (n > 0) {
 							this.remaining[i] -= n;
 							this.client.sendData(id, new byte[n], this.remaining[i] == 0 ? TestH2.FLAG_END_STREAM : 0);
@@ -391,6 +564,14 @@ class H2DemuxBudgetE2ETest {
 			return since != 0 && System.nanoTime() - since > TimeUnit.MILLISECONDS.toNanos(500);
 		}
 
+		/**
+		 * Waits until the pump got no window for a while: the connection's own queue is
+		 * stalled, not only the route's.
+		 */
+		void awaitWithheld() {
+			Awaitility.await().atMost(Duration.ofSeconds(60)).until(this::withheld);
+		}
+
 		/** Stops the pump; the streams stay unfinished. */
 		void stop() throws InterruptedException {
 			this.stop.set(true);
@@ -400,20 +581,16 @@ class H2DemuxBudgetE2ETest {
 			}
 		}
 
-		/** A stream with body left; only after {@link #stop()}. */
-		int unfinishedStream() {
-			for (int i = 0; i < this.remaining.length; i++) {
-				if (this.remaining[i] > 0) {
-					return streamId(i);
-				}
-			}
-			throw new IllegalStateException("every stream finished");
+		/** Starts the pump again after {@link #stop()}. */
+		void resume() {
+			this.stop.set(false);
+			start();
 		}
 
 		/** Waits until every stream sent its body and got its response. */
 		void awaitEnds() throws InterruptedException {
 			for (int i = 0; i < this.remaining.length; i++) {
-				int id = streamId(i);
+				int id = id(i);
 				assertThat(this.client.awaitEnd(id, Duration.ofSeconds(30)))
 					.as("stream %d completes (closed %s, resets %s)", id, this.client.closed(), this.client.resets())
 					.isTrue();
@@ -426,6 +603,23 @@ class H2DemuxBudgetE2ETest {
 			this.client.close();
 		}
 
+	}
+
+	/** Waits until the value has not changed for a second; returns it. */
+	private static long awaitSteady(LongSupplier value) throws InterruptedException {
+		long last = value.getAsLong();
+		long changedAt = System.nanoTime();
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+		while (System.nanoTime() - changedAt < TimeUnit.SECONDS.toNanos(1)) {
+			assertThat(System.nanoTime()).as("the value settles").isLessThan(deadline);
+			long current = value.getAsLong();
+			if (current != last) {
+				last = current;
+				changedAt = System.nanoTime();
+			}
+			Thread.sleep(10);
+		}
+		return last;
 	}
 
 	/** Waits until the value has not grown for a second; returns its maximum. */
@@ -496,6 +690,223 @@ class H2DemuxBudgetE2ETest {
 		catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
 		}
+	}
+
+	/**
+	 * {@link #serveGated} that decodes every request head and, once the gate opened, logs
+	 * the heads, the resets, and any frame on a stream after its reset; it answers a
+	 * reset with one of its own.
+	 */
+	private static void serveGatedLogging(Socket socket, CountDownLatch gate, UpstreamLog log) {
+		try (socket) {
+			InputStream in = socket.getInputStream();
+			OutputStream out = socket.getOutputStream();
+			if (in.readNBytes(TestH2.PREFACE.length).length < TestH2.PREFACE.length) {
+				return;
+			}
+			TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
+			TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(Integer.MAX_VALUE - 65535));
+			DefaultHttp2HeadersDecoder decoder = new DefaultHttp2HeadersDecoder(true);
+			Set<Integer> reset = new HashSet<>();
+			int seen = 0;
+			TestH2.@Nullable Frame frame;
+			while (gate.getCount() > 0 && seen < STREAMS && (frame = TestH2.readFrame(in)) != null) {
+				if (frame.type() == TestH2.HEADERS) {
+					decoder.decodeHeaders(frame.streamId(), Unpooled.wrappedBuffer(frame.payload()));
+					seen++;
+					TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, frame.streamId(),
+							TestH2.int32(Integer.MAX_VALUE - 65535));
+				}
+			}
+			gate.await();
+			while ((frame = TestH2.readFrame(in)) != null) {
+				int streamId = frame.streamId();
+				if (reset.contains(streamId)) {
+					log.afterReset.add("type=%d stream=%d".formatted(frame.type(), streamId));
+				}
+				if (frame.type() == TestH2.HEADERS) {
+					log.heads.put(streamId,
+							lines(decoder.decodeHeaders(streamId, Unpooled.wrappedBuffer(frame.payload()))));
+					TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, streamId, TestH2.int32(Integer.MAX_VALUE - 65535));
+				}
+				else if (frame.type() == TestH2.RST_STREAM) {
+					reset.add(streamId);
+					log.resets.put(streamId, TestH2.errorCode(frame));
+					// as if sent before the reset arrived
+					TestH2.writeFrame(out, TestH2.RST_STREAM, 0, streamId, TestH2.int32(NO_ERROR));
+				}
+				boolean ended = streamId != 0 && (frame.type() == TestH2.HEADERS || frame.type() == TestH2.DATA)
+						&& (frame.flags() & TestH2.FLAG_END_STREAM) != 0;
+				if (ended) {
+					out.write(TestH2.cannedResponse(streamId, "ok"));
+					out.flush();
+				}
+			}
+		}
+		catch (IOException | Http2Exception e) {
+			// connection ended
+		}
+		catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
+	}
+
+	/**
+	 * What the gated upstreams of a route saw once their gate opened, across their
+	 * connections: request heads (decoded, by stream), resets (error code by stream), and
+	 * frames on a stream after its reset.
+	 */
+	private static final class UpstreamLog {
+
+		private final Map<Integer, List<String>> heads = new ConcurrentHashMap<>();
+
+		private final Map<Integer, Integer> resets = new ConcurrentHashMap<>();
+
+		private final List<String> afterReset = new CopyOnWriteArrayList<>();
+
+	}
+
+	/**
+	 * An upstream scripted around a stream the relay resets: once both request heads
+	 * arrived and {@link #respond} opened, it answers the probe stream with a head and a
+	 * whole connection window of DATA, then -- granted that back -- answers the stream to
+	 * reset with a head and {@link #WAITING} bytes of DATA, followed by a PING whose ack
+	 * ({@link #queued}) tells the relay processed them. On the relay's reset it writes
+	 * what it might have had in flight on the stream ({@link #IN_FLIGHT} bytes of DATA, a
+	 * header block adding a dynamic table entry, an unknown frame), none of it ending the
+	 * stream, then the probe's trailers referring to that entry ({@link #answered}); it
+	 * leaves once {@link #leave} opens.
+	 */
+	private static final class CancelScript {
+
+		static final int WAITING = 1000;
+
+		static final int IN_FLIGHT = 500;
+
+		private static final byte[] FENCE = "fence-01".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+
+		private final int reset;
+
+		private final int probe;
+
+		private final CountDownLatch heads = new CountDownLatch(2);
+
+		private final CountDownLatch respond = new CountDownLatch(1);
+
+		private final CountDownLatch queued = new CountDownLatch(1);
+
+		private final CountDownLatch cancelled = new CountDownLatch(1);
+
+		private final CountDownLatch answered = new CountDownLatch(1);
+
+		private final CountDownLatch leave = new CountDownLatch(1);
+
+		/** The connection window the relay granted back. */
+		private final AtomicLong granted = new AtomicLong();
+
+		private final AtomicInteger resetCode = new AtomicInteger(-1);
+
+		CancelScript(int reset, int probe) {
+			this.reset = reset;
+			this.probe = probe;
+		}
+
+		void serve(Socket socket) {
+			try (socket) {
+				InputStream in = socket.getInputStream();
+				OutputStream out = socket.getOutputStream();
+				if (in.readNBytes(TestH2.PREFACE.length).length < TestH2.PREFACE.length) {
+					return;
+				}
+				TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
+				Thread.ofVirtual().name("e2e-bud-cancel-reader").start(() -> read(in));
+				this.heads.await();
+				this.respond.await();
+				TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS, this.probe, new byte[] { (byte) 0x88 });
+				for (int left = H2TestClient.INITIAL_WINDOW; left > 0; left -= MAX_FRAME_SIZE) {
+					TestH2.writeFrame(out, TestH2.DATA, 0, this.probe, new byte[Math.min(left, MAX_FRAME_SIZE)]);
+				}
+				Awaitility.await()
+					.atMost(Duration.ofSeconds(10))
+					.until(() -> this.granted.get() >= H2TestClient.INITIAL_WINDOW);
+				TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS, this.reset, new byte[] { (byte) 0x88 });
+				TestH2.writeFrame(out, TestH2.DATA, 0, this.reset, new byte[WAITING]);
+				TestH2.writeFrame(out, TestH2.PING, 0, 0, FENCE);
+				this.cancelled.await();
+				TestH2.writeFrame(out, TestH2.DATA, 0, this.reset, new byte[IN_FLIGHT]);
+				TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS, this.reset,
+						TestH2.appendLiteralIncremental(new byte[0], "x-dropped", "1"));
+				TestH2.writeFrame(out, 0xfa, 0, this.reset, new byte[4]);
+				TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, this.probe,
+						TestH2.appendIndexedDynamic(new byte[0], 62));
+				this.answered.countDown();
+				this.leave.await();
+			}
+			catch (IOException e) {
+				// connection ended
+			}
+			catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+		}
+
+		private void read(InputStream in) {
+			try {
+				TestH2.@Nullable Frame frame;
+				while ((frame = TestH2.readFrame(in)) != null) {
+					switch (frame.type()) {
+						case TestH2.HEADERS -> this.heads.countDown();
+						case TestH2.WINDOW_UPDATE -> {
+							if (frame.streamId() == 0) {
+								this.granted.addAndGet(TestH2.increment(frame));
+							}
+						}
+						case TestH2.PING -> {
+							if ((frame.flags() & TestH2.FLAG_ACK) != 0 && Arrays.equals(frame.payload(), FENCE)) {
+								this.queued.countDown();
+							}
+						}
+						case TestH2.RST_STREAM -> {
+							if (frame.streamId() == this.reset) {
+								this.resetCode.set(TestH2.errorCode(frame));
+								this.cancelled.countDown();
+							}
+						}
+						default -> {
+							// not tracked
+						}
+					}
+				}
+			}
+			catch (IOException e) {
+				// connection ended
+			}
+		}
+
+	}
+
+	/** The decoded headers as {@code name: value} lines, in order. */
+	private static List<String> lines(Http2Headers headers) {
+		List<String> lines = new ArrayList<>();
+		headers.forEach(header -> lines.add(header.getKey() + ": " + header.getValue()));
+		return lines;
+	}
+
+	/** The types of the frames, the relay's own stream window grants left out. */
+	private static List<Integer> types(List<TestH2.Frame> frames) {
+		return frames.stream().map(TestH2.Frame::type).filter(type -> type != TestH2.WINDOW_UPDATE).toList();
+	}
+
+	/** The last header block of the frames, decoded in order with the ones before it. */
+	private static List<String> lastHeaderBlock(List<TestH2.Frame> frames) throws Http2Exception {
+		DefaultHttp2HeadersDecoder decoder = new DefaultHttp2HeadersDecoder(true);
+		List<String> last = List.of();
+		for (TestH2.Frame frame : frames) {
+			if (frame.type() == TestH2.HEADERS) {
+				last = lines(decoder.decodeHeaders(frame.streamId(), Unpooled.wrappedBuffer(frame.payload())));
+			}
+		}
+		return last;
 	}
 
 	/**
@@ -604,6 +1015,18 @@ class H2DemuxBudgetE2ETest {
 			.tag("reason", reason)
 			.counter();
 		return counter.count();
+	}
+
+	private double resets(String reason) {
+		return Objects.requireNonNull(this.meterRegistry)
+			.get("sluice.h2demux.streams.reset")
+			.tag("reason", reason)
+			.counter()
+			.count();
+	}
+
+	private long trackedStreams(String route) {
+		return Objects.requireNonNull(this.dataProxyServer).h2DemuxMeters().trackedStreams(route);
 	}
 
 	private void startClient(String host, ServerSocket upstream) {

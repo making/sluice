@@ -578,11 +578,14 @@ past its 128KiB and the budget is exhausted, the relay withholds its connection 
 (the client stops sending once the at most 64KiB it holds are spent) until the
 connection's own queue drains below 128KiB or the budget has room again; a new stream
 whose head fits neither is refused with `REFUSED_STREAM`, and trailers that fit neither
-end the connection with GOAWAY `ENHANCE_YOUR_CALM`. So a connection whose upstreams read
-keeps flowing however exhausted the budget is, while connections whose upstreams do not
-read stop at the budget plus what each queues outside it: its 128KiB, the 64KiB of
-connection window it still holds, and per stream a buffer rounding (under 1KiB), a reset
-and a window update, about 295KiB (`Http2DemuxRelay.UNBUDGETED_BYTES`).
+reset their stream (`RST_STREAM` `ENHANCE_YOUR_CALM` to the client, `CANCEL` to the
+upstream, the stream's queued data and waiting response dropped) while the connection's
+other streams go on; what the upstream still sends on that stream is dropped. So a
+connection whose upstreams read keeps flowing however exhausted the budget is, while
+connections whose upstreams do not read stop at the budget plus what each queues outside
+it: its 128KiB, the 64KiB of connection window it still holds, and per stream a buffer
+rounding (under 1KiB), a reset and a window update, about 295KiB
+(`Http2DemuxRelay.UNBUDGETED_BYTES`).
 
 Towards the client, each leg holds what the client's connection window does not admit
 yet: at most the 64KiB of connection window the relay granted its upstream (granted back
@@ -612,7 +615,7 @@ taken until it drains or the session ends.
   cluster warmup window and while draining (see "Cluster (scale-out)")
 - client `GET /actuator/health` (port 9001) - UP while at least one per-node tunnel stream is
   established; the `tunnel` detail shows the connection state and `nodes` each node's stream state
-- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`, `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_h2demux_queued_bytes` (bytes the h2 demux holds queued towards upstreams, one series per route), `sluice_h2demux_budget_bytes` / `sluice_h2demux_budget_used_bytes` (the shared h2 queue budget and the bytes charged to it, which may pass the budget by what the relays cannot refuse), `sluice_h2demux_window_withheld_total` (times a connection window was withheld for want of budget), `sluice_h2demux_streams_refused_total` (`reason` = `budget` / `leg-limit`) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_rejected_total` (`reason` = `limit` / `address-limit` / `head-timeout`) / `sluice_data_connections_idle_closed_total` (connections closed for idling between requests)
+- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`, `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_h2demux_queued_bytes` (bytes the h2 demux holds queued towards upstreams, one series per route), `sluice_h2demux_budget_bytes` / `sluice_h2demux_budget_used_bytes` (the shared h2 queue budget and the bytes charged to it, which may pass the budget by what the relays cannot refuse), `sluice_h2demux_window_withheld_total` (times a connection window was withheld for want of budget), `sluice_h2demux_streams_refused_total` (`reason` = `budget` / `leg-limit`), `sluice_h2demux_streams_reset_total` (streams the relay reset on its own account, `reason` = `budget`) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_rejected_total` (`reason` = `limit` / `address-limit` / `head-timeout`) / `sluice_data_connections_idle_closed_total` (connections closed for idling between requests)
 
 ## Console
 

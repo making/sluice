@@ -434,6 +434,11 @@ public final class H2TestClient implements AutoCloseable {
 		return Math.min(this.connectionWindow.get(), windowOf(streamId).get());
 	}
 
+	/** The connection window the client may still send into, as the relay granted it. */
+	public long connectionWindow() {
+		return this.connectionWindow.get();
+	}
+
 	public long connectionGranted() {
 		return this.connectionGranted.get();
 	}

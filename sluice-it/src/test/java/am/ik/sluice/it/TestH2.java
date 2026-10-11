@@ -142,7 +142,7 @@ public final class TestH2 {
 	 * Appends a literal-with-incremental-indexing header: the entry becomes dynamic index
 	 * 62+order.
 	 */
-	static byte[] appendLiteralIncremental(byte[] block, String name, String value) {
+	public static byte[] appendLiteralIncremental(byte[] block, String name, String value) {
 		ByteArrayOutputStream out = new ByteArrayOutputStream(block.length + 64);
 		out.write(block, 0, block.length);
 		byte[] nameBytes = name.getBytes(StandardCharsets.US_ASCII);
@@ -158,7 +158,7 @@ public final class TestH2 {
 	/**
 	 * Appends a reference to a dynamic-table entry (index >= 62) set by an earlier block.
 	 */
-	static byte[] appendIndexedDynamic(byte[] block, int index) {
+	public static byte[] appendIndexedDynamic(byte[] block, int index) {
 		ByteArrayOutputStream out = new ByteArrayOutputStream(block.length + 1);
 		out.write(block, 0, block.length);
 		out.write(0x80 | index);

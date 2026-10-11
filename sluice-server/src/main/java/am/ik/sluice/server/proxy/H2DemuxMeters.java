@@ -13,9 +13,9 @@ import io.micrometer.core.instrument.MeterRegistry;
  * The meters shared by every h2 demux relay of one data proxy: per route, the bytes
  * queued for the leg writers of all live legs -- one gauge per route, so the series count
  * follows the routes, not the connections --, the streams refused for want of queue
- * budget or of a slot for a new leg, the times a relay withheld the client's connection
- * window, and, for tests, the number of times a leg writer woke up and the streams the
- * relays track.
+ * budget or of a slot for a new leg, the streams a relay reset for want of queue budget,
+ * the times a relay withheld the client's connection window, and, for tests, the number
+ * of times a leg writer woke up and the streams the relays track.
  */
 final class H2DemuxMeters {
 
@@ -30,12 +30,18 @@ final class H2DemuxMeters {
 
 	private final Counter refusedLegLimit;
 
+	private final Counter resetBudget;
+
 	private final Counter windowWithheld;
 
 	H2DemuxMeters(MeterRegistry registry) {
 		this.registry = registry;
 		this.refusedBudget = refused(registry, "budget");
 		this.refusedLegLimit = refused(registry, "leg-limit");
+		this.resetBudget = Counter.builder("sluice.h2demux.streams.reset")
+			.tag("reason", "budget")
+			.description("h2 streams an h2 demux relay reset on its own account, both ways")
+			.register(registry);
 		this.windowWithheld = Counter.builder("sluice.h2demux.window.withheld")
 			.description("Times an h2 demux relay withheld the client's connection window: its queue was past its"
 					+ " allowance and the shared budget exhausted")
@@ -59,6 +65,11 @@ final class H2DemuxMeters {
 	 */
 	void refusedForLegLimit() {
 		this.refusedLegLimit.increment();
+	}
+
+	/** A stream reset: its trailers did not fit the queue budget. */
+	void resetForBudget() {
+		this.resetBudget.increment();
 	}
 
 	/** A relay withheld the client's connection window. */
