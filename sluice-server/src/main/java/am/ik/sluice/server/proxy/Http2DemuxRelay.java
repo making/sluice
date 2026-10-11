@@ -115,13 +115,19 @@ final class Http2DemuxRelay {
 
 	private static final int ERROR_FLOW_CONTROL = 0x3;
 
+	private static final int ERROR_FRAME_SIZE = 0x6;
+
 	private static final int ERROR_REFUSED_STREAM = 0x7;
+
+	private static final int ERROR_ENHANCE_YOUR_CALM = 0xb;
 
 	private static final int SETTINGS_HEADER_TABLE_SIZE = 0x1;
 
 	private static final int SETTINGS_MAX_CONCURRENT_STREAMS = 0x3;
 
 	private static final int SETTINGS_INITIAL_WINDOW_SIZE = 0x4;
+
+	private static final int SETTINGS_MAX_FRAME_SIZE = 0x5;
 
 	private static final int SETTINGS_MAX_HEADER_LIST_SIZE = 0x6;
 
@@ -130,6 +136,9 @@ final class Http2DemuxRelay {
 
 	/**
 	 * SETTINGS_MAX_FRAME_SIZE every endpoint accepts without announcing more (RFC 9113).
+	 * The relay announces no other value to either side, so a larger frame from the
+	 * client or an upstream is a connection error: this caps the bytes buffered for a
+	 * frame not yet complete.
 	 */
 	private static final int MAX_FRAME_SIZE = 16 * 1024;
 
@@ -402,6 +411,11 @@ final class Http2DemuxRelay {
 		while (all.length - position >= FRAME_HEADER_LENGTH) {
 			ByteBuffer header = ByteBuffer.wrap(all, position, FRAME_HEADER_LENGTH);
 			int frameLength = unsigned24(header);
+			if (frameLength > MAX_FRAME_SIZE) {
+				// before its payload arrives: nothing of it is buffered
+				goAway(ERROR_FRAME_SIZE);
+				throw new IllegalStateException("client frame of %d bytes".formatted(frameLength));
+			}
 			if (all.length - position < FRAME_HEADER_LENGTH + frameLength) {
 				break;
 			}
@@ -581,9 +595,10 @@ final class Http2DemuxRelay {
 			int id = (frame.bytes()[at] & 0xff) << 8 | (frame.bytes()[at + 1] & 0xff);
 			long value = (frame.bytes()[at + 2] & 0xffL) << 24 | (frame.bytes()[at + 3] & 0xff) << 16
 					| (frame.bytes()[at + 4] & 0xff) << 8 | (frame.bytes()[at + 5] & 0xff);
-			if (id == SETTINGS_HEADER_TABLE_SIZE || !KNOWN_SETTINGS.contains(id)) {
+			if (id == SETTINGS_HEADER_TABLE_SIZE || id == SETTINGS_MAX_FRAME_SIZE || !KNOWN_SETTINGS.contains(id)) {
 				// the upstreams encode for the relay's decoders, which keep the default
-				// table; unknown settings belong to this hop
+				// table, and frame for its parser, which takes the default frame size;
+				// unknown settings belong to this hop
 				continue;
 			}
 			if (id == SETTINGS_MAX_HEADER_LIST_SIZE) {
@@ -620,6 +635,12 @@ final class Http2DemuxRelay {
 			this.assembling.reset();
 		}
 		appendFragmentTo(this.assembling, frame, head);
+		if (this.assembling.size() > MAX_HEADER_LIST_SIZE) {
+			// an encoded block never outgrows its decoded list, so this block is beyond
+			// the decoder's limit; dropping it would desynchronize the decoder
+			goAway(ERROR_ENHANCE_YOUR_CALM);
+			throw new IllegalStateException("client header block over %d bytes".formatted(MAX_HEADER_LIST_SIZE));
+		}
 		if (frame.has(FLAG_END_HEADERS)) {
 			onHeadBlock();
 		}
@@ -1655,6 +1676,10 @@ final class Http2DemuxRelay {
 		 */
 		void inboundHead(int type, int flags, int streamId, byte[] all, int payload, int length) {
 			boolean head = type == FRAME_HEADERS;
+			if (head && !this.inboundHeads.isEmpty()) {
+				// header blocks never interleave (RFC 9113 6.10)
+				throw new IllegalStateException("upstream header blocks interleaved");
+			}
 			if (head) {
 				this.inboundHeads.put(Integer.valueOf(streamId), new ByteArrayOutputStream(256));
 				this.inboundHeadEndStream.put(Integer.valueOf(streamId), (flags & FLAG_END_STREAM) != 0);
@@ -1664,6 +1689,9 @@ final class Http2DemuxRelay {
 				return; // a continuation of a head this leg never saw the start of
 			}
 			appendFragmentTo(buffer, new Frame(type, flags, streamId, all, payload, length), head);
+			if (buffer.size() > MAX_HEADER_LIST_SIZE) {
+				throw new IllegalStateException("upstream header block over %d bytes".formatted(MAX_HEADER_LIST_SIZE));
+			}
 			if ((flags & FLAG_END_HEADERS) == 0) {
 				return;
 			}
@@ -1879,6 +1907,9 @@ final class Http2DemuxRelay {
 		while (all.length - position >= FRAME_HEADER_LENGTH) {
 			ByteBuffer header = ByteBuffer.wrap(all, position, FRAME_HEADER_LENGTH);
 			int frameLength = unsigned24(header);
+			if (frameLength > MAX_FRAME_SIZE) {
+				throw new IllegalStateException("upstream frame of %d bytes".formatted(frameLength));
+			}
 			if (all.length - position < FRAME_HEADER_LENGTH + frameLength) {
 				break;
 			}

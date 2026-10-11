@@ -170,8 +170,9 @@ class H2DemuxFramingE2ETest {
 
 	/**
 	 * The client's settings reach the upstream, except the header table size -- the
-	 * upstream encodes for the relay's decoder, which keeps the default table -- and
-	 * settings unknown to the relay; later ones too, once the leg is open.
+	 * upstream encodes for the relay's decoder, which keeps the default table --, the max
+	 * frame size -- the upstream frames for the relay's parser, which takes the default
+	 * -- and settings unknown to the relay; later ones too, once the leg is open.
 	 */
 	@Test
 	void clientSettingsReachTheUpstreamWithoutTheHeaderTableSize() throws Exception {
@@ -182,7 +183,7 @@ class H2DemuxFramingE2ETest {
 			client.frame(TestH2.SETTINGS, 0, 0, settings(0x1, 65536, 0x2, 0, 0x99, 1));
 			client.headers(1, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/"));
 			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
-			client.frame(TestH2.SETTINGS, 0, 0, settings(0x1, 4096, 0x4, 1048576, 0x6, 1048576));
+			client.frame(TestH2.SETTINGS, 0, 0, settings(0x1, 4096, 0x4, 1048576, 0x5, 1048576, 0x6, 1048576));
 			client.headers(3, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/"));
 			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).isTrue();
 		}

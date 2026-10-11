@@ -267,6 +267,14 @@ public final class H2TestClient implements AutoCloseable {
 		this.maxOvershoot.accumulateAndGet(-window, Math::max);
 	}
 
+	/** Writes the bytes as they are: frames the client would never send whole. */
+	public void raw(byte[] bytes) throws IOException {
+		synchronized (this.out) {
+			this.out.write(bytes);
+			this.out.flush();
+		}
+	}
+
 	public void frame(int type, int flags, int streamId, byte[] payload) throws IOException {
 		synchronized (this.out) {
 			TestH2.writeFrame(this.out, type, flags, streamId, payload);
