@@ -85,6 +85,22 @@ class SluiceClientPropertiesTest {
 	}
 
 	@Test
+	void maxConnectionsDefaultsToDerivedAndBindsInKebabCase() {
+		Map<String, Object> source = Map.of("sluice.server-url", "grpc://127.0.0.1:8001",
+				"sluice.client.upstream[0].host", "demo.local", "sluice.client.upstream[0].target", "127.0.0.1:8080");
+		assertThat(bind(source).maxConnections()).isZero();
+		Map<String, Object> limited = new java.util.HashMap<>(source);
+		limited.put("sluice.client.max-connections", "16");
+		assertThat(bind(limited).maxConnections()).isEqualTo(16);
+	}
+
+	private static SluiceClientProperties bind(Map<String, Object> source) {
+		StandardEnvironment environment = new StandardEnvironment();
+		environment.getPropertySources().addFirst(new MapPropertySource("test", source));
+		return Binder.get(environment).bind("sluice", Bindable.of(SluiceClientProperties.class)).get();
+	}
+
+	@Test
 	void missingClientSectionYieldsEmptyUpstreams() {
 		SluiceClientProperties properties = SluiceClientProperties.builder().serverUrl("grpc://127.0.0.1:8001").build();
 		assertThat(properties.upstreamTargets()).isEmpty();

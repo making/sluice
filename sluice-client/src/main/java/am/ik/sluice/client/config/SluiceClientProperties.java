@@ -42,14 +42,61 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	 * stream; blank = a random id is generated once per process
 	 * @param upstream upstream entries, bound from
 	 * {@code sluice.client.upstream[n].{host,host-pattern,target,rewrite-host,force-http1,listen-port,allowed-cidrs}}
+	 * @param maxConnections upstream connections open at once over every server node; a
+	 * CONNECT beyond it is answered with an ERROR without dialing. {@code 0} = derived
+	 * from the maximum heap so the worst-case buffering of every connection fits in half
+	 * of it
 	 */
-	public record Client(@DefaultValue("") String id, @DefaultValue List<Upstream> upstream) {
+	public record Client(@DefaultValue("") String id, @DefaultValue List<Upstream> upstream,
+			@DefaultValue("0") int maxConnections) {
 
 		public Client {
 			id = id == null ? "" : id;
 			upstream = upstream == null ? List.of() : List.copyOf(upstream);
+			maxConnections = Math.max(0, maxConnections);
 		}
 
+		public static Builder builder() {
+			return new Builder();
+		}
+
+		public static final class Builder {
+
+			private String id = "";
+
+			private List<Upstream> upstream = List.of();
+
+			private int maxConnections;
+
+			private Builder() {
+			}
+
+			public Builder id(String id) {
+				this.id = id;
+				return this;
+			}
+
+			public Builder upstream(List<Upstream> upstream) {
+				this.upstream = upstream;
+				return this;
+			}
+
+			public Builder maxConnections(int maxConnections) {
+				this.maxConnections = maxConnections;
+				return this;
+			}
+
+			public Client build() {
+				return new Client(this.id, this.upstream, this.maxConnections);
+			}
+
+		}
+
+	}
+
+	/** The configured connection limit; {@code 0} = derived. */
+	public int maxConnections() {
+		return this.client == null ? 0 : this.client.maxConnections();
 	}
 
 	/**
@@ -115,6 +162,8 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 
 		private final List<Upstream> upstreams = new ArrayList<>();
 
+		private int maxConnections;
+
 		@Nullable private String token;
 
 		@Nullable private String tokenFile;
@@ -144,6 +193,11 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 
 		public Builder upstream(Upstream upstream) {
 			this.upstreams.add(upstream);
+			return this;
+		}
+
+		public Builder maxConnections(int maxConnections) {
+			this.maxConnections = maxConnections;
 			return this;
 		}
 
@@ -184,9 +238,13 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 
 		public SluiceClientProperties build() {
 			return new SluiceClientProperties(Objects.requireNonNull(this.serverUrl, "serverUrl is required"),
-					new Client(this.clientId, List.copyOf(this.upstreams)), this.token == null ? "" : this.token,
-					this.tokenFile, this.insecure, this.tlsBundle, this.strictForwarding, this.keepAliveTime,
-					this.keepAliveTimeout);
+					Client.builder()
+						.id(this.clientId)
+						.upstream(List.copyOf(this.upstreams))
+						.maxConnections(this.maxConnections)
+						.build(),
+					this.token == null ? "" : this.token, this.tokenFile, this.insecure, this.tlsBundle,
+					this.strictForwarding, this.keepAliveTime, this.keepAliveTimeout);
 		}
 
 	}

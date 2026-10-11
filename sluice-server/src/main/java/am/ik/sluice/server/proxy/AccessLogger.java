@@ -25,9 +25,9 @@ import org.springframework.stereotype.Component;
  * the {@code close} line is emitted when the relay completes, so the counts are final.
  * <p>
  * When {@code sluice.access-log.rate-limit.enabled=true} (the default), each line kind
- * ({@code conn-accept} / {@code conn-close} / {@code request}) is rate limited the same
- * way as UNIX syslog: the first {@code maxRate} lines of each kind within a
- * {@code period} are emitted, further lines are suppressed and counted, and one
+ * ({@code conn-accept} / {@code conn-close} / {@code conn-reject} / {@code request}) is
+ * rate limited the same way as UNIX syslog: the first {@code maxRate} lines of each kind
+ * within a {@code period} are emitted, further lines are suppressed and counted, and one
  * {@code type=ratelimit} summary line reports the suppressed count when the next period
  * starts.
  */
@@ -47,6 +47,8 @@ public class AccessLogger {
 	private final @Nullable RateLimiter connAcceptLimiter;
 
 	private final @Nullable RateLimiter connCloseLimiter;
+
+	private final @Nullable RateLimiter connRejectLimiter;
 
 	private final @Nullable RateLimiter requestLimiter;
 
@@ -75,6 +77,12 @@ public class AccessLogger {
 				.period(rateLimit.period())
 				.clock(clock)
 				.build();
+			this.connRejectLimiter = RateLimiter.builder()
+				.kind("conn-reject")
+				.maxRate(rateLimit.maxRate())
+				.period(rateLimit.period())
+				.clock(clock)
+				.build();
 			this.requestLimiter = RateLimiter.builder()
 				.kind("request")
 				.maxRate(rateLimit.maxRate())
@@ -85,6 +93,7 @@ public class AccessLogger {
 		else {
 			this.connAcceptLimiter = null;
 			this.connCloseLimiter = null;
+			this.connRejectLimiter = null;
 			this.requestLimiter = null;
 		}
 	}
@@ -128,6 +137,10 @@ public class AccessLogger {
 
 	boolean allowClose() {
 		return allows(this.connCloseLimiter);
+	}
+
+	boolean allowReject() {
+		return allows(this.connRejectLimiter);
 	}
 
 	boolean allowRequest() {
@@ -238,6 +251,22 @@ public class AccessLogger {
 				return;
 			}
 			log.info("type=conn id={} event=accept listener={} remote={}", this.id, this.listener, this.remote);
+		}
+
+		/**
+		 * Logs the connection as rejected before it was served (a connection limit, the
+		 * head deadline) instead of the close line, which is not emitted afterwards.
+		 */
+		void reject(String reason) {
+			if (!this.connEnabled || this.noop || this.closed || this.owner == null) {
+				return;
+			}
+			this.closed = true;
+			if (!this.owner.allowReject()) {
+				return;
+			}
+			log.info("type=conn id={} event=reject listener={} remote={} reason={} durationMs={}", this.id,
+					this.listener, this.remote, reason, (System.nanoTime() - this.startNanos) / 1_000_000);
 		}
 
 		public void close() {

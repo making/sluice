@@ -1,5 +1,6 @@
 package am.ik.sluice.server.config;
 
+import java.time.Duration;
 import java.util.Map;
 
 import am.ik.sluice.server.route.LoadBalance;
@@ -72,6 +73,23 @@ class SluiceServerPropertiesTest {
 	void proxyProtocolIsBoundInKebabCase() {
 		SluiceServerProperties properties = bind(Map.of("sluice.proxy-protocol", "true"));
 		assertThat(properties.proxyProtocol()).isTrue();
+	}
+
+	@Test
+	void limitsDefaultToDerivedConnectionLimitsAndATenSecondHeadDeadline() {
+		SluiceServerProperties properties = bind(Map.of("sluice.data-port", "8000"));
+		assertThat(properties.limits().maxConnections()).isZero();
+		assertThat(properties.limits().maxConnectionsPerAddress()).isZero();
+		assertThat(properties.limits().headTimeout()).isEqualTo(Duration.ofSeconds(10));
+	}
+
+	@Test
+	void limitsAreBoundInKebabCase() {
+		SluiceServerProperties properties = bind(Map.of("sluice.limits.max-connections", "100",
+				"sluice.limits.max-connections-per-address", "10", "sluice.limits.head-timeout", "2s"));
+		assertThat(properties.limits().maxConnections()).isEqualTo(100);
+		assertThat(properties.limits().maxConnectionsPerAddress()).isEqualTo(10);
+		assertThat(properties.limits().headTimeout()).isEqualTo(Duration.ofSeconds(2));
 	}
 
 }

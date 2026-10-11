@@ -2989,4 +2989,42 @@ mod tests {
         assert_eq!(pool(&handler).served(), requests, "every request pooled");
         assert!(pool(&handler).spawned() > 1, "a filled unit was recycled");
     }
+
+    /// A CONNECT beyond the connection limit is answered with an ERROR and
+    /// never served; the slot frees once the admitted connection ends.
+    #[tokio::test]
+    async fn a_connect_beyond_the_limit_is_refused_until_a_slot_frees() {
+        let handler = Handler::new(hello().await, Sandbox::default());
+        let limit = crate::tunnel::Limit::new(1);
+        let mut peer = Peer::limited(
+            HashMap::from([(ROUTE.to_string(), handler.clone())]),
+            limit.clone(),
+        );
+        // admitted, and held open: no request yet
+        peer.connect(1, ROUTE, crate::tunnel::WINDOW).await;
+        assert_eq!(limit.open(), 1);
+
+        peer.connect(2, ROUTE, crate::tunnel::WINDOW).await;
+        let frames = frames_until_quiet(&mut peer, Duration::from_millis(300)).await;
+        assert!(
+            matches!(&frames[..], [Body::Error(error)]
+                if error.conn_id == 2 && error.message == crate::tunnel::LIMIT_REACHED),
+            "{frames:?}"
+        );
+        assert_eq!(limit.open(), 1, "the refused connection holds no slot");
+
+        // the server fails the admitted connection: its slot frees
+        peer.error(1, "gone").await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while limit.open() > 0 {
+            assert!(Instant::now() < deadline, "the slot was never freed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        frames_until_quiet(&mut peer, Duration::from_millis(300)).await;
+
+        peer.connect(3, ROUTE, crate::tunnel::WINDOW).await;
+        peer.data(3, get("/").as_bytes()).await;
+        let response = String::from_utf8(response_raw(&mut peer).await).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
 }

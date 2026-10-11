@@ -50,6 +50,12 @@ target/debug/sluice-wasmlet --server grpcs://127.0.0.1:8001 --ca-cert ca.pem ...
 target/debug/sluice-wasmlet --server grpcs://127.0.0.1:8001 --insecure ...
 ```
 
+`--max-connections N` (default 256) caps the connections open at once over every
+node stream; a CONNECT beyond it is answered with the ERROR `connection limit reached`
+and not served. A windowed connection buffers at most its 1MiB receive window of
+request bytes, so the windows total at most N x 1MiB (256MiB by default). Guest
+instances (`memory-mib` each, one per request in flight) are not bounded by it.
+
 Multiple `--wasm host=<locator>` routes per process. The locator is a bare
 path, `file://<path>`, or `http(s)://<url>` (fetched once at startup); the
 advertised target is `wasm:<locator>` (plus the non-default options) and

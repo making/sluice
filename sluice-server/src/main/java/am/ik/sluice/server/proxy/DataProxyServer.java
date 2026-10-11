@@ -101,6 +101,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	private final AccessControl accessControl;
 
+	private final ConnectionLimits limits;
+
 	private volatile boolean running;
 
 	private volatile @Nullable ServerSocket serverSocket;
@@ -108,7 +110,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	DataProxyServer(Router router, SessionRegistry sessions, SluiceServerProperties properties,
 			MeterRegistry meterRegistry, AccessLogger accessLogger, AccessControl accessControl,
 			@Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor, ObjectProvider<SSLContext> sslContext,
-			ErrorResponse errorResponse) {
+			ErrorResponse errorResponse, ConnectionLimits limits) {
 		this.router = router;
 		this.sessions = sessions;
 		this.properties = properties;
@@ -119,6 +121,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		this.taskExecutor = taskExecutor;
 		this.sslContext = sslContext;
 		this.errorResponse = errorResponse;
+		this.limits = limits;
 	}
 
 	/**
@@ -157,8 +160,22 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		while (this.running) {
 			try {
 				Socket socket = serverSocket.accept();
-				socket.setTcpNoDelay(true);
-				this.taskExecutor.execute(() -> this.handle(socket));
+				AccessLogger.Connection access = this.accessLogger.accepted("data", socket);
+				ConnectionLimits.Admission admission = this.limits.admit(access);
+				if (admission == null) {
+					// at the limit: closed unread, before any thread is spent on it
+					this.close(socket);
+					continue;
+				}
+				try {
+					socket.setTcpNoDelay(true);
+					this.taskExecutor.execute(() -> this.handle(socket, access, admission));
+				}
+				catch (RuntimeException e) {
+					admission.release();
+					this.close(socket);
+					throw e;
+				}
 			}
 			catch (Exception e) {
 				if (this.running) {
@@ -168,34 +185,49 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		}
 	}
 
-	private void handle(Socket socket) {
-		AccessLogger.Connection access = this.accessLogger.accepted("data", socket);
+	/**
+	 * Serves one admitted connection. The admission is released exactly when the
+	 * connection ends: here on every path that does not hand it to a relay, by the
+	 * relay's completion otherwise.
+	 */
+	private void handle(Socket socket, AccessLogger.Connection access, ConnectionLimits.Admission admission) {
+		boolean relaying = false;
 		try {
-			Connection connection = this.transport(socket, access);
-			if (connection == null) {
+			admission.startHead(socket);
+			Connection connection = this.transport(socket, access, admission);
+			if (connection == null || !admission.endHead()) {
 				access.close();
 				this.close(socket);
 				return;
 			}
-			if (!this.relay(connection, access)) {
+			relaying = this.relay(connection, access, admission::release);
+			if (!relaying) {
 				// access denied or no session: relay() answered with the error response
 				// and closed the socket
 				access.close();
 			}
 		}
 		catch (Exception e) {
-			log.debug("data connection failed: {}", e.toString());
+			log.debug("data connection failed: {}", admission.expired() ? "head timeout" : e.toString());
 			access.close();
 			this.close(socket);
+		}
+		finally {
+			if (!relaying) {
+				admission.release();
+			}
 		}
 	}
 
 	/**
 	 * Consumes the PROXY protocol header when enabled, peeks the first byte to detect a
 	 * TLS handshake, terminates TLS when an SSL bundle is configured, routes by SNI in
-	 * passthrough mode otherwise, and parses the connection head for routing.
+	 * passthrough mode otherwise, and parses the connection head for routing. Claims the
+	 * slot of the source address first -- the PROXY protocol source is known only once
+	 * the header is parsed -- and returns null when the address is at its limit.
 	 */
-	private @Nullable Connection transport(Socket socket, AccessLogger.Connection access) throws Exception {
+	private @Nullable Connection transport(Socket socket, AccessLogger.Connection access,
+			ConnectionLimits.Admission admission) throws Exception {
 		InputStream in = socket.getInputStream();
 		InetAddress peer = null;
 		if (this.properties.proxyProtocol()) {
@@ -209,6 +241,9 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				peer = header.source();
 				access.remote(peer.getHostAddress() + ":" + header.sourcePort());
 			}
+		}
+		if (!admission.claim(peer != null ? peer : peerOf(socket))) {
+			return null;
 		}
 		access.accept();
 		int first = in.read();
@@ -286,7 +321,12 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		return context == null ? null : context.getSocketFactory();
 	}
 
-	private boolean relay(Connection conn, AccessLogger.Connection access) {
+	/**
+	 * Routes and relays the connection; true once a relay owns it, in which case
+	 * {@code release} runs when the relay completes. False when the connection was
+	 * answered with an error response and closed.
+	 */
+	private boolean relay(Connection conn, AccessLogger.Connection access, Runnable release) {
 		Optional<Router.Route> route = this.router.lookup(conn.head().host());
 		InetAddress peer = conn.peer() != null ? conn.peer() : peerOf(conn.socket());
 		// a trusted proxy's forwarded-for entry replaces the peer as the judged address
@@ -306,7 +346,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		if (request != null && !conn.head().encrypted()) {
 			// plaintext HTTP: every request head / stream is routed; successors may
 			// belong to another client's upstream (keep-alive, h2 multiplexing)
-			Runnable relayed = this.relayed(access);
+			Runnable relayed = this.relayed(access, release);
 			if ("2".equals(request.version())) {
 				Http2DemuxRelay demux = new Http2DemuxRelay(conn.pipe(), conn.head(), this.router, this.sessions,
 						this.accessControl, this.errorResponse, access, this.h2DemuxMeters, route0, session, peer,
@@ -345,6 +385,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				this.activeConnections.decrementAndGet();
 				access.close();
 				session.remove(connection.connectionId());
+				release.run();
 			})
 			.build();
 		this.activeConnections.incrementAndGet();
@@ -360,12 +401,14 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	/**
 	 * The once-only completion of a demultiplexing relay: the connection level of the
-	 * access log and the active-connection count, shared by every leg.
+	 * access log, the active-connection count and the connection's admission, shared by
+	 * every leg.
 	 */
-	private Runnable relayed(AccessLogger.Connection access) {
+	private Runnable relayed(AccessLogger.Connection access, Runnable release) {
 		return () -> {
 			this.activeConnections.decrementAndGet();
 			access.close();
+			release.run();
 		};
 	}
 

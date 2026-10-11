@@ -17,6 +17,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
+import am.ik.sluice.tunnel.ConnectionLimit;
 import am.ik.sluice.tunnel.SessionSender;
 import am.ik.sluice.tunnel.SocketRelay;
 import am.ik.sluice.tunnel.VirtualConnection;
@@ -98,6 +99,13 @@ public final class NodeConnection implements AutoCloseable {
 
 	private final ConcurrentHashMap<Long, VirtualConnection> connections = new ConcurrentHashMap<>();
 
+	/** The slot each registered connection holds; released when it is forgotten. */
+	private final ConcurrentHashMap<Long, ConnectionLimit.Permit> permits = new ConcurrentHashMap<>();
+
+	private final ConnectionLimit connectionLimit;
+
+	private final Counter rejectedConnections;
+
 	private final Counter reconnects;
 
 	private final Counter rejectedAdvertises;
@@ -143,6 +151,11 @@ public final class NodeConnection implements AutoCloseable {
 			.tag("node", metricsTag)
 			.description("Advertised listen ports rejected by the server")
 			.register(meterRegistry);
+		this.connectionLimit = Objects.requireNonNull(builder.connectionLimit, "connectionLimit is required");
+		this.rejectedConnections = Counter.builder("sluice.connections.rejected")
+			.tag("reason", "limit")
+			.description("CONNECTs answered with an ERROR because the connection limit was reached")
+			.register(meterRegistry);
 		this.windowUpdatesSent = windowUpdates(meterRegistry, metricsTag, "sent");
 		this.windowUpdatesReceived = windowUpdates(meterRegistry, metricsTag, "received");
 	}
@@ -178,6 +191,8 @@ public final class NodeConnection implements AutoCloseable {
 		private @Nullable Listener listener;
 
 		private @Nullable MeterRegistry meterRegistry;
+
+		private @Nullable ConnectionLimit connectionLimit;
 
 		private Builder() {
 		}
@@ -232,6 +247,12 @@ public final class NodeConnection implements AutoCloseable {
 
 		public Builder meterRegistry(MeterRegistry meterRegistry) {
 			this.meterRegistry = meterRegistry;
+			return this;
+		}
+
+		/** The limit shared by the connections of every node stream of the process. */
+		public Builder connectionLimit(ConnectionLimit connectionLimit) {
+			this.connectionLimit = connectionLimit;
 			return this;
 		}
 
@@ -416,11 +437,26 @@ public final class NodeConnection implements AutoCloseable {
 	 * sockets are released. Idempotent; safe to run while relays are still registering.
 	 */
 	private void closeConnections() {
-		for (VirtualConnection connection : this.connections.values()) {
-			connection.remoteFailed("tunnel stream closed");
-			connection.close();
+		for (Long connectionId : this.connections.keySet()) {
+			VirtualConnection connection = this.forget(connectionId);
+			if (connection != null) {
+				connection.remoteFailed("tunnel stream closed");
+				connection.close();
+			}
 		}
-		this.connections.clear();
+	}
+
+	/**
+	 * Unregisters a connection and frees its slot of the connection limit; the first call
+	 * for an id does both, later ones nothing.
+	 */
+	private @Nullable VirtualConnection forget(long connectionId) {
+		VirtualConnection connection = this.connections.remove(connectionId);
+		ConnectionLimit.Permit permit = this.permits.remove(connectionId);
+		if (permit != null) {
+			permit.release();
+		}
+		return connection;
 	}
 
 	/**
@@ -453,13 +489,30 @@ public final class NodeConnection implements AutoCloseable {
 					return;
 				}
 				am.ik.sluice.v1.proto.Connect request = frame.getConnect();
+				ConnectionLimit.Permit permit = this.connectionLimit.tryAcquire();
+				if (permit == null) {
+					// neither dialed nor registered: the server fails its side on the
+					// ERROR, and DATA that follows the CONNECT finds no connection
+					this.rejectedConnections.increment();
+					log.debug("[{}] {}; rejecting conn {}", this.key, ConnectionLimit.LIMIT_REACHED,
+							request.getConnId());
+					sender.sendError(request.getConnId(), ConnectionLimit.LIMIT_REACHED);
+					return;
+				}
 				// windowed iff the server announced its receive window for it
 				long serverWindow = Integer.toUnsignedLong(request.getConnectionWindow());
 				VirtualConnection connection = serverWindow > 0 ? VirtualConnection.builder(request.getConnId(), sender)
 					.window(VirtualConnection.DEFAULT_WINDOW, serverWindow)
 					.build() : new VirtualConnection(request.getConnId(), sender);
+				this.permits.put(request.getConnId(), permit);
 				this.connections.put(request.getConnId(), connection);
-				this.taskExecutor.execute(() -> dial(request, connection));
+				try {
+					this.taskExecutor.execute(() -> dial(request, connection));
+				}
+				catch (RuntimeException e) {
+					this.forget(request.getConnId());
+					connection.abort(e.toString());
+				}
 			}
 			case DATA -> {
 				am.ik.sluice.v1.proto.Data data = frame.getData();
@@ -561,16 +614,17 @@ public final class NodeConnection implements AutoCloseable {
 			SessionSender sender = this.senderRef.get();
 			if (sender == null) {
 				socket.close();
+				this.forget(connectionId);
 				return;
 			}
 			SocketRelay relay = SocketRelay.builder(socket, connection, sender)
-				.onComplete(() -> this.connections.remove(connectionId))
+				.onComplete(() -> this.forget(connectionId))
 				.build();
 			relay.start();
 		}
 		catch (Exception e) {
 			log.debug("dial {} failed: {}", address, e.toString());
-			this.connections.remove(connectionId);
+			this.forget(connectionId);
 			connection.abort(e.toString());
 		}
 	}

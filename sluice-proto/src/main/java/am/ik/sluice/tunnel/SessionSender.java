@@ -64,6 +64,9 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	/** Maximum DATA frames queued per connection: 16 x 64KiB = 1MiB of payload. */
 	static final int DATA_QUEUE_CAPACITY = 16;
 
+	/** The DATA payload one connection's queue holds at most: 1MiB. */
+	static final int MAX_QUEUED_PAYLOAD = DATA_QUEUE_CAPACITY * MAX_CHUNK;
+
 	/**
 	 * The connection frames of one connection; guarded by {@link #lock}. A queue lives
 	 * only while it holds frames or a {@link #sendData} call runs in it: it is dropped as

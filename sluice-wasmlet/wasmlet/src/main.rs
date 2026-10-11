@@ -62,6 +62,7 @@ struct Config {
     insecure: bool,
     ca_cert: Option<String>,
     routes: Vec<Route>,
+    max_connections: usize,
 }
 
 /// Reconnect backoff: exponential seconds, as `NodeConnection`.
@@ -72,6 +73,10 @@ const BACKOFF_MAX_SECS: u64 = 30;
 /// Bound on one connect attempt, so a black-holed node cannot park the
 /// reconnect loop.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default of `--max-connections`: 256 connections x one 1MiB receive window
+/// = 256MiB of the server's payload buffered at most.
+const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -87,6 +92,8 @@ struct Shared {
     /// key. The target carries the sandbox, so routes sharing a component
     /// with different sandboxes stay distinct.
     components: Arc<HashMap<String, Arc<Handler>>>,
+    /// Connections open at once, over every node session.
+    limit: Arc<tunnel::Limit>,
 }
 
 /// One tunnel stream toward one node. The supervisor's `Arc` identity survives
@@ -135,6 +142,7 @@ fn parse_args() -> Config {
         insecure: false,
         ca_cert: None,
         routes: Vec::new(),
+        max_connections: DEFAULT_MAX_CONNECTIONS,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -150,6 +158,13 @@ fn parse_args() -> Config {
             "--client-id" => config.id = value("client-id"),
             "--insecure" => config.insecure = true,
             "--ca-cert" => config.ca_cert = Some(value("ca-cert")),
+            "--max-connections" => {
+                let max = value("max-connections");
+                config.max_connections = match max.parse() {
+                    Ok(max) if max > 0 => max,
+                    _ => panic!("--max-connections must be a positive number, got '{max}'"),
+                };
+            }
             "--wasm" => {
                 let spec = value("wasm");
                 let (host, target) = spec.split_once('=').unwrap_or_else(|| {
@@ -222,6 +237,7 @@ async fn run(config: Config) -> Result<(), BoxError> {
         insecure,
         ca_cert,
         routes,
+        max_connections,
     } = config;
 
     // Fetch / prewarm every component (fail fast). The target is the component
@@ -254,7 +270,9 @@ async fn run(config: Config) -> Result<(), BoxError> {
         ca_pem,
         advertised,
         components: Arc::new(components),
+        limit: tunnel::Limit::new(max_connections),
     });
+    println!("connection limit {max_connections}");
 
     let (tx, rx) = mpsc::channel::<Event>(32);
     supervise(rx, tx, shared, server).await
@@ -440,8 +458,12 @@ impl NodeTask {
             .await?
             .into_inner();
 
-        let connections =
-            Connections::new(self.key.clone(), outbound, self.shared.components.clone());
+        let connections = Connections::new(
+            self.key.clone(),
+            outbound,
+            self.shared.components.clone(),
+            self.shared.limit.clone(),
+        );
         let established = self.stream(inbound, &connections, &channel).await;
 
         // Tear down this attempt's virtual connections: their tunnel side is

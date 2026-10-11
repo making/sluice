@@ -26,6 +26,7 @@ import am.ik.sluice.server.route.LoadBalance;
  * @param console management console settings (authentication)
  * @param tcpLoadBalance load balancing applied when several clients serve the same listen
  * port (tcp routes)
+ * @param limits data plane connection limits and the head deadline
  */
 @ConfigurationProperties("sluice")
 public record SluiceServerProperties(String token, @Nullable String tokenFile, @DefaultValue("0.0.0.0") String dataHost,
@@ -33,7 +34,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		@DefaultValue("false") boolean proxyProtocol, @DefaultValue("") String tcpPortRange, AccessLog accessLog,
 		AccessControl accessControl, Node node, Cluster cluster, Console console,
 		@DefaultValue("smallest-client-id") LoadBalance httpLoadBalance,
-		@DefaultValue("smallest-client-id") LoadBalance tcpLoadBalance) {
+		@DefaultValue("smallest-client-id") LoadBalance tcpLoadBalance, Limits limits) {
 
 	public SluiceServerProperties {
 		dataHost = dataHost == null || dataHost.isBlank() ? "0.0.0.0" : dataHost;
@@ -42,6 +43,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		node = node == null ? Node.builder().build() : node;
 		cluster = cluster == null ? Cluster.builder().build() : cluster;
 		console = console == null ? Console.builder().build() : console;
+		limits = limits == null ? Limits.builder().build() : limits;
 	}
 
 	public boolean clusterEnabled() {
@@ -361,6 +363,66 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	}
 
 	/**
+	 * Data plane connection limits, shared by the data port and every tcp route port.
+	 *
+	 * @param maxConnections connections open at once; {@code 0} = derived from the
+	 * maximum heap so the worst-case buffering of every connection fits in half of it
+	 * @param maxConnectionsPerAddress connections open at once from one source address
+	 * (the PROXY protocol source when {@code proxy-protocol} is on, the socket peer
+	 * otherwise); {@code 0} = no limit beyond {@code maxConnections}
+	 * @param headTimeout deadline for the whole head phase of a connection (PROXY header,
+	 * TLS handshake, request head); established relays have no timeout
+	 */
+	public record Limits(@DefaultValue("0") int maxConnections, @DefaultValue("0") int maxConnectionsPerAddress,
+			@DefaultValue("10s") Duration headTimeout) {
+
+		public Limits {
+			maxConnections = Math.max(0, maxConnections);
+			maxConnectionsPerAddress = Math.max(0, maxConnectionsPerAddress);
+			headTimeout = headTimeout == null || headTimeout.isNegative() || headTimeout.isZero()
+					? Duration.ofSeconds(10) : headTimeout;
+		}
+
+		public static Builder builder() {
+			return new Builder();
+		}
+
+		public static final class Builder {
+
+			private int maxConnections;
+
+			private int maxConnectionsPerAddress;
+
+			@Nullable private Duration headTimeout;
+
+			private Builder() {
+			}
+
+			public Builder maxConnections(int maxConnections) {
+				this.maxConnections = maxConnections;
+				return this;
+			}
+
+			public Builder maxConnectionsPerAddress(int maxConnectionsPerAddress) {
+				this.maxConnectionsPerAddress = maxConnectionsPerAddress;
+				return this;
+			}
+
+			public Builder headTimeout(Duration headTimeout) {
+				this.headTimeout = headTimeout;
+				return this;
+			}
+
+			public Limits build() {
+				return new Limits(this.maxConnections, this.maxConnectionsPerAddress,
+						this.headTimeout == null ? Duration.ofSeconds(10) : this.headTimeout);
+			}
+
+		}
+
+	}
+
+	/**
 	 * Management console settings.
 	 *
 	 * @param auth console authentication; the console is always authenticated, only the
@@ -454,6 +516,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 		private LoadBalance tcpLoadBalance = LoadBalance.SMALLEST_CLIENT_ID;
 
+		@Nullable private Limits limits;
+
 		private Builder() {
 		}
 
@@ -532,6 +596,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			return this;
 		}
 
+		public Builder limits(Limits limits) {
+			this.limits = limits;
+			return this;
+		}
+
 		public SluiceServerProperties build() {
 			return new SluiceServerProperties(this.token == null ? "" : this.token, this.tokenFile,
 					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort, this.dataTlsBundle, this.caBundle,
@@ -540,7 +609,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 					this.node == null ? Node.builder().build() : this.node,
 					this.cluster == null ? Cluster.builder().build() : this.cluster,
 					this.console == null ? Console.builder().build() : this.console, this.httpLoadBalance,
-					this.tcpLoadBalance);
+					this.tcpLoadBalance, this.limits == null ? Limits.builder().build() : this.limits);
 		}
 
 	}

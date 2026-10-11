@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -52,6 +53,13 @@ pub const CONNECTION_CLOSED: &str = "connection closed";
 
 /// Failure of every connection still registered when the stream ends.
 const STREAM_CLOSED: &str = "tunnel stream closed";
+
+/// ERROR message of a CONNECT beyond the connection limit; the Java side's
+/// `ConnectionLimit.LIMIT_REACHED`.
+pub const LIMIT_REACHED: &str = "connection limit reached";
+
+/// Read error of a connection the server failed.
+const ABORTED: &str = "connection aborted by the tunnel peer";
 
 /// Upper bound for a single DATA frame emitted by the hyper write path.
 const CHUNK: usize = 16 * 1024;
@@ -118,6 +126,52 @@ fn error_frame(conn_id: i64, message: &str) -> Frame {
 fn close_frame(conn_id: i64) -> Frame {
     Frame {
         body: Some(Body::Close(Close { conn_id })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection limit
+
+/// A cap on the connections open at once over every stream of the process.
+/// A windowed connection buffers at most [`WINDOW`] of the server's payload,
+/// so the cap bounds the total.
+pub struct Limit {
+    max: usize,
+    open: AtomicUsize,
+}
+
+impl Limit {
+    pub fn new(max: usize) -> Arc<Limit> {
+        Arc::new(Limit {
+            max,
+            open: AtomicUsize::new(0),
+        })
+    }
+
+    /// A slot for one more connection, or None when `max` are open.
+    pub fn try_acquire(self: &Arc<Self>) -> Option<Permit> {
+        self.open
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
+                (open < self.max).then_some(open + 1)
+            })
+            .ok()
+            .map(|_| Permit(self.clone()))
+    }
+
+    /// The permits currently held.
+    #[cfg(test)]
+    pub fn open(&self) -> usize {
+        self.open.load(Ordering::Acquire)
+    }
+}
+
+/// The slot of one connection, freed when dropped -- with the connection's
+/// byte stream, which owns its buffered payload.
+pub struct Permit(Arc<Limit>);
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -306,6 +360,7 @@ pub struct Connections {
     /// Dial address (the advertised target) -> its handler.
     routes: Arc<HashMap<String, Arc<Handler>>>,
     registry: Registry,
+    limit: Arc<Limit>,
 }
 
 impl Connections {
@@ -313,12 +368,14 @@ impl Connections {
         key: String,
         outbound: Outbound,
         routes: Arc<HashMap<String, Arc<Handler>>>,
+        limit: Arc<Limit>,
     ) -> Self {
         Connections {
             key,
             outbound,
             routes,
             registry: Registry::default(),
+            limit,
         }
     }
 
@@ -390,7 +447,14 @@ impl Connections {
             ));
             return;
         };
-        let io = self.register(connect.conn_id, connect.connection_window);
+        // answered like a missing route: neither registered nor served
+        let Some(permit) = self.limit.try_acquire() else {
+            self.outbound
+                .control(error_frame(connect.conn_id, LIMIT_REACHED));
+            return;
+        };
+        let mut io = self.register(connect.conn_id, connect.connection_window);
+        io.permit = Some(permit);
         tokio::spawn(wasm_host::serve(io, handler.clone()));
     }
 
@@ -448,6 +512,8 @@ impl Connections {
             buf: bytes::BytesMut::new(),
             eof: false,
             consumed: 0,
+            permit: None,
+            aborted: false,
         }
     }
 
@@ -489,6 +555,10 @@ pub struct TunnelIo {
     eof: bool,
     /// Bytes handed to hyper and not yet granted back (windowed).
     consumed: u64,
+    /// The connection's slot of the connection limit; freed with this stream.
+    permit: Option<Permit>,
+    /// `fill` consumed the server's abort.
+    aborted: bool,
 }
 
 impl TunnelIo {
@@ -515,7 +585,13 @@ impl TunnelIo {
                 self.eof = true;
                 false
             }
-            Some(Ctrl::Abort) | None => false,
+            Some(Ctrl::Abort) => {
+                // remembered: the reader after the sniff must fail, not wait for
+                // frames that never come
+                self.aborted = true;
+                false
+            }
+            None => false,
         }
     }
 
@@ -595,6 +671,9 @@ impl AsyncRead for TunnelIo {
         if let Some(failure) = this.flow.reset_failure() {
             return Poll::Ready(Err(std::io::Error::other(failure)));
         }
+        if this.aborted && this.buf.is_empty() {
+            return Poll::Ready(Err(std::io::Error::other(ABORTED)));
+        }
         if !this.buf.is_empty() {
             this.hand_off(buf);
             return Poll::Ready(Ok(()));
@@ -613,9 +692,7 @@ impl AsyncRead for TunnelIo {
                 this.eof = true;
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Some(Ctrl::Abort)) => Poll::Ready(Err(std::io::Error::other(
-                "connection aborted by the tunnel peer",
-            ))),
+            Poll::Ready(Some(Ctrl::Abort)) => Poll::Ready(Err(std::io::Error::other(ABORTED))),
             Poll::Ready(None) => match this.flow.reset_failure() {
                 Some(failure) => Poll::Ready(Err(std::io::Error::other(failure))),
                 None => {
@@ -742,9 +819,14 @@ pub(crate) mod testing {
 
     impl Peer {
         pub(crate) fn new(routes: HashMap<String, Arc<Handler>>) -> Peer {
+            Peer::limited(routes, Limit::new(usize::MAX))
+        }
+
+        /// A peer whose connections share `limit`.
+        pub(crate) fn limited(routes: HashMap<String, Arc<Handler>>, limit: Arc<Limit>) -> Peer {
             let (outbound, frames) = Outbound::new();
             Peer {
-                connections: Connections::new("test".into(), outbound, Arc::new(routes)),
+                connections: Connections::new("test".into(), outbound, Arc::new(routes), limit),
                 frames: Box::pin(frames),
                 auto_grant: true,
             }
@@ -1141,7 +1223,12 @@ mod tests {
         for _ in 0..DATA_BUFFER {
             outbound.data.try_send(close_frame(9)).unwrap();
         }
-        let connections = Connections::new("test".into(), outbound, Arc::default());
+        let connections = Connections::new(
+            "test".into(),
+            outbound,
+            Arc::default(),
+            Limit::new(usize::MAX),
+        );
         let dispatched = connections.dispatch(Body::Connect(Connect {
             conn_id: 7,
             address: "wasm:missing".into(),
@@ -1155,6 +1242,18 @@ mod tests {
                 if error.conn_id == 7 && error.message.contains("no wasm route")),
             "{first:?}"
         );
+    }
+
+    #[test]
+    fn a_limit_admits_up_to_its_max_and_a_dropped_permit_frees_its_slot() {
+        let limit = Limit::new(2);
+        let first = limit.try_acquire().expect("first slot");
+        let _second = limit.try_acquire().expect("second slot");
+        assert!(limit.try_acquire().is_none());
+        assert_eq!(limit.open(), 2);
+        drop(first);
+        assert_eq!(limit.open(), 1);
+        assert!(limit.try_acquire().is_some());
     }
 
     #[tokio::test]

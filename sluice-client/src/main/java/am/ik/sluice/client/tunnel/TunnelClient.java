@@ -16,7 +16,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
+import am.ik.sluice.tunnel.ConnectionLimit;
 import am.ik.sluice.v1.proto.ListNodesResponse;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.ssl.SslBundle;
@@ -54,6 +56,9 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 
 	private final AtomicBoolean membershipLearned = new AtomicBoolean();
 
+	/** Upstream connections open at once, shared by every node stream. */
+	private final ConnectionLimit connectionLimit;
+
 	private volatile boolean running;
 
 	TunnelClient(SluiceClientProperties properties, @Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor,
@@ -66,6 +71,17 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 		this.clientId = configured == null || configured.isBlank() ? UUID.randomUUID().toString() : configured;
 		meterRegistry.gauge("sluice.connections.active", this.connectionsByNode,
 				map -> map.values().stream().mapToInt(NodeConnection::activeConnections).sum());
+		this.connectionLimit = new ConnectionLimit(ConnectionLimit.resolve(properties.maxConnections()));
+		Gauge.builder("sluice.connections.limit", this.connectionLimit, ConnectionLimit::max)
+			.description("Upstream connections allowed open at once")
+			.register(meterRegistry);
+		Gauge.builder("sluice.connections.admitted", this.connectionLimit, ConnectionLimit::open)
+			.description("Upstream connections holding a slot of the connection limit")
+			.register(meterRegistry);
+		log.info("upstream connection limit {} ({})", this.connectionLimit.max(),
+				properties.maxConnections() > 0 ? "configured"
+						: "derived: half of max heap %dMiB / %dKiB per connection"
+							.formatted(Runtime.getRuntime().maxMemory() >> 20, ConnectionLimit.CONNECTION_BYTES >> 10));
 	}
 
 	private static @Nullable String clientid(SluiceClientProperties properties) {
@@ -162,6 +178,7 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 			.taskExecutor(this.taskExecutor)
 			.listener(this)
 			.meterRegistry(this.meterRegistry)
+			.connectionLimit(this.connectionLimit)
 			.build();
 		this.connectionsByNode.put(nodeId.isBlank() ? url : nodeId, connection);
 		connection.start();

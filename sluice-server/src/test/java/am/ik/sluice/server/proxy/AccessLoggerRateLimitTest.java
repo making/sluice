@@ -99,6 +99,40 @@ class AccessLoggerRateLimitTest {
 	}
 
 	@Test
+	void rateLimitsRejectLinesAndOmitsTheCloseLineOfARejectedConnection() throws Exception {
+		SluiceServerProperties properties = SluiceServerProperties.builder()
+			.accessLog(SluiceServerProperties.AccessLog.builder()
+				.rateLimit(SluiceServerProperties.AccessLog.RateLimit.builder()
+					.maxRate(1)
+					.period(Duration.ofMillis(50))
+					.build())
+				.build())
+			.build();
+		AccessLogger accessLogger = new AccessLogger(properties, this.now::get);
+		try (ServerSocket serverSocket = new ServerSocket(0);
+				Socket socket = new Socket("127.0.0.1", serverSocket.getLocalPort());
+				Socket accepted = serverSocket.accept()) {
+			AccessLogger.Connection first = accessLogger.accepted("data", socket);
+			first.reject("limit");
+			first.close();
+			accessLogger.accepted("data", socket).reject("limit");
+			accessLogger.accepted("data", socket).reject("limit");
+			this.now.addAndGet(Duration.ofMillis(100).toNanos());
+			accessLogger.accepted("data", socket).reject("head-timeout");
+			List<String> messages = this.messages()
+				.stream()
+				.map(m -> m.replaceAll("durationMs=\\d+", "durationMs=N"))
+				.toList();
+			String remote = "127.0.0.1:" + serverSocket.getLocalPort();
+			assertThat(String.join("\n", messages)).isEqualToNormalizingWhitespace("""
+					type=conn id=1 event=reject listener=data remote=%s reason=limit durationMs=N
+					type=ratelimit kind=conn-reject suppressed=2 periodMs=50
+					type=conn id=4 event=reject listener=data remote=%s reason=head-timeout durationMs=N
+					""".formatted(remote, remote));
+		}
+	}
+
+	@Test
 	void noRateLimitWhenDisabled() {
 		AccessLogger.RateLimiter limiter = AccessLogger.RateLimiter.builder()
 			.kind("request")

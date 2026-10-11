@@ -17,7 +17,8 @@ import org.jspecify.annotations.Nullable;
  */
 public final class StreamRelay {
 
-	private static final int BUFFER_SIZE = 64 * 1024;
+	/** The buffer of each direction's pump. */
+	static final int BUFFER_SIZE = 64 * 1024;
 
 	private final DuplexPipe pipe;
 

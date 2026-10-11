@@ -67,6 +67,8 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 
 	private final AccessControl accessControl;
 
+	private final ConnectionLimits limits;
+
 	private final ConcurrentMap<Integer, BoundListener> listeners = new ConcurrentHashMap<>();
 
 	private final ConcurrentMap<Integer, AtomicInteger> activeConnections = new ConcurrentHashMap<>();
@@ -87,7 +89,7 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 
 	TcpPortGateway(Router router, SessionRegistry sessions, SluiceServerProperties properties,
 			AccessControl accessControl, @Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor,
-			MeterRegistry meterRegistry, AccessLogger accessLogger) {
+			MeterRegistry meterRegistry, AccessLogger accessLogger, ConnectionLimits limits) {
 		this.router = router;
 		this.sessions = sessions;
 		this.properties = properties;
@@ -96,6 +98,7 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 		this.taskExecutor = taskExecutor;
 		this.meterRegistry = meterRegistry;
 		this.accessLogger = accessLogger;
+		this.limits = limits;
 	}
 
 	/**
@@ -237,8 +240,22 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 		while (listener.running().get()) {
 			try {
 				Socket socket = listener.socket().accept();
-				socket.setTcpNoDelay(true);
-				this.taskExecutor.execute(() -> this.relay(socket, port));
+				AccessLogger.Connection access = this.accessLogger.accepted("tcp:" + port, socket).transport("tcp");
+				ConnectionLimits.Admission admission = this.limits.admit(access);
+				if (admission == null) {
+					// at the limit: closed unread, before any thread is spent on it
+					this.close(socket);
+					continue;
+				}
+				try {
+					socket.setTcpNoDelay(true);
+					this.taskExecutor.execute(() -> this.relay(socket, port, access, admission));
+				}
+				catch (RuntimeException e) {
+					admission.release();
+					this.close(socket);
+					throw e;
+				}
 			}
 			catch (Exception e) {
 				if (listener.running().get()) {
@@ -248,15 +265,21 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 		}
 	}
 
-	private void relay(Socket socket, int port) {
-		AccessLogger.Connection access = this.accessLogger.accepted("tcp:" + port, socket).transport("tcp");
+	/**
+	 * Relays one admitted connection. The admission is released exactly when the
+	 * connection ends: here on every path that does not start the relay, by the relay's
+	 * completion otherwise.
+	 */
+	private void relay(Socket socket, int port, AccessLogger.Connection access, ConnectionLimits.Admission admission) {
+		boolean relaying = false;
 		try {
 			InputStream source = socket.getInputStream();
 			InetAddress peer = peerOf(socket);
 			if (this.properties.proxyProtocol()) {
 				// the header is consumed here and never relayed: the relay starts past
-				// it,
-				// and headerless connections pass untouched
+				// it, and headerless connections pass untouched. The parse is the only
+				// head phase of a tcp route connection, so it alone has the deadline
+				admission.startHead(socket);
 				ProxyProtocolParser.Result proxied = new ProxyProtocolParser().parse(source);
 				source = proxied.input();
 				ProxyProtocolParser.Header header = proxied.header();
@@ -264,6 +287,14 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 					peer = header.source();
 					access.remote(peer.getHostAddress() + ":" + header.sourcePort());
 				}
+				if (!admission.endHead()) {
+					this.close(socket);
+					return;
+				}
+			}
+			if (!admission.claim(peer)) {
+				this.close(socket);
+				return;
 			}
 			access.accept();
 			Optional<Router.Route> route = this.router.lookupByPort(port);
@@ -290,11 +321,13 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 					active.decrementAndGet();
 					access.close();
 					session.remove(connection.connectionId());
+					admission.release();
 				})
 				.build();
 			active.incrementAndGet();
 			try {
 				relay.start();
+				relaying = true;
 			}
 			catch (RuntimeException e) {
 				active.decrementAndGet();
@@ -302,9 +335,15 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 			}
 		}
 		catch (Exception e) {
-			log.debug("tcp route connection failed on port {}: {}", port, e.toString());
+			log.debug("tcp route connection failed on port {}: {}", port,
+					admission.expired() ? "head timeout" : e.toString());
 			access.close();
 			this.close(socket);
+		}
+		finally {
+			if (!relaying) {
+				admission.release();
+			}
 		}
 	}
 
