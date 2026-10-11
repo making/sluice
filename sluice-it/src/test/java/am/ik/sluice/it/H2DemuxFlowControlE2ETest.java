@@ -210,9 +210,14 @@ class H2DemuxFlowControlE2ETest {
 			// window: the slow upstream's reads pace the stream
 			assertThat(client.streamSent(1)).as("the bulk stream got past the initial window")
 				.isGreaterThan(STREAM_BUDGET + 2L * VirtualConnection.DEFAULT_WINDOW);
+			// the bulk stream's payload within its budget, accounted as the buffers that
+			// hold it -- the pending buffer rounds up to a 1KiB granule, and the buffer a
+			// batch in flight was taken from stays accounted until written, less than
+			// another granule -- plus its data entry's frame header, and under 1KiB for
+			// the other stream's head
 			assertThat(maxQueued.get()).as("queued for the bulk stream, plus the other stream's head")
 				.isGreaterThan(0)
-				.isLessThanOrEqualTo(STREAM_BUDGET + 1024);
+				.isLessThanOrEqualTo(STREAM_BUDGET + 2 * 1024 + 9 + 1024);
 			client.close();
 			pusher.join(TimeUnit.SECONDS.toMillis(5));
 		}
