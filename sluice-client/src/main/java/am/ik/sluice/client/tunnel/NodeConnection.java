@@ -102,6 +102,10 @@ public final class NodeConnection implements AutoCloseable {
 
 	private final Counter rejectedAdvertises;
 
+	private final Counter windowUpdatesSent;
+
+	private final Counter windowUpdatesReceived;
+
 	private final AtomicReference<SessionSender> senderRef = new AtomicReference<>();
 
 	private volatile boolean running;
@@ -138,6 +142,16 @@ public final class NodeConnection implements AutoCloseable {
 		this.rejectedAdvertises = Counter.builder("sluice.advertise.rejected")
 			.tag("node", metricsTag)
 			.description("Advertised listen ports rejected by the server")
+			.register(meterRegistry);
+		this.windowUpdatesSent = windowUpdates(meterRegistry, metricsTag, "sent");
+		this.windowUpdatesReceived = windowUpdates(meterRegistry, metricsTag, "received");
+	}
+
+	private static Counter windowUpdates(MeterRegistry meterRegistry, String node, String direction) {
+		return Counter.builder("sluice.tunnel.window.updates")
+			.tag("node", node)
+			.tag("direction", direction)
+			.description("Per-connection flow control credit grants (WINDOW_UPDATE frames) sent / received")
 			.register(meterRegistry);
 	}
 
@@ -335,7 +349,7 @@ public final class NodeConnection implements AutoCloseable {
 			@Override
 			public void beforeStart(ClientCallStreamObserver<Frame> call) {
 				// the onReady handler may only be installed during beforeStart
-				SessionSender sender = new SessionSender(call);
+				SessionSender sender = new SessionSender(call, windowUpdatesSent::increment);
 				sender.start();
 				senderRef.set(sender);
 			}
@@ -375,7 +389,7 @@ public final class NodeConnection implements AutoCloseable {
 			return; // stream failed before starting
 		}
 		this.readvertiseBackoff = BACKOFF_INITIAL_SECONDS;
-		sender.sendAdvertise(this.advertised);
+		sender.sendAdvertise(this.advertised, VirtualConnection.DEFAULT_WINDOW);
 		closed.await();
 		// the sender first, as in TunnelSession#close: a dead or stalled stream must not
 		// leave the connection teardown below waiting on a full send queue (closing the
@@ -439,7 +453,11 @@ public final class NodeConnection implements AutoCloseable {
 					return;
 				}
 				am.ik.sluice.v1.proto.Connect request = frame.getConnect();
-				VirtualConnection connection = new VirtualConnection(request.getConnId(), sender);
+				// windowed iff the server announced its receive window for it
+				long serverWindow = Integer.toUnsignedLong(request.getConnectionWindow());
+				VirtualConnection connection = serverWindow > 0 ? VirtualConnection.builder(request.getConnId(), sender)
+					.window(VirtualConnection.DEFAULT_WINDOW, serverWindow)
+					.build() : new VirtualConnection(request.getConnId(), sender);
 				this.connections.put(request.getConnId(), connection);
 				this.taskExecutor.execute(() -> dial(request, connection));
 			}
@@ -448,6 +466,13 @@ public final class NodeConnection implements AutoCloseable {
 				VirtualConnection connection = this.connections.get(data.getConnId());
 				if (connection != null) {
 					connection.acceptData(data.getPayload().toByteArray());
+				}
+			}
+			case WINDOW_UPDATE -> {
+				this.windowUpdatesReceived.increment();
+				VirtualConnection connection = this.connections.get(frame.getWindowUpdate().getConnId());
+				if (connection != null) {
+					connection.grant(frame.getWindowUpdate().getIncrement());
 				}
 			}
 			case CLOSE -> {
@@ -520,7 +545,7 @@ public final class NodeConnection implements AutoCloseable {
 			}
 			SessionSender sender = this.senderRef.get();
 			if (sender != null) {
-				sender.sendAdvertise(this.advertised);
+				sender.sendAdvertise(this.advertised, VirtualConnection.DEFAULT_WINDOW);
 			}
 		});
 	}
@@ -545,12 +570,8 @@ public final class NodeConnection implements AutoCloseable {
 		}
 		catch (Exception e) {
 			log.debug("dial {} failed: {}", address, e.toString());
-			SessionSender sender = this.senderRef.get();
-			if (sender != null) {
-				sender.sendError(connectionId, e.toString());
-			}
 			this.connections.remove(connectionId);
-			connection.close();
+			connection.abort(e.toString());
 		}
 	}
 

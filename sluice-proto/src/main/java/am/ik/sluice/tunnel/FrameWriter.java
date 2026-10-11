@@ -1,5 +1,7 @@
 package am.ik.sluice.tunnel;
 
+import am.ik.sluice.v1.proto.Connect;
+
 /**
  * Abstraction over the outbound direction of the tunnel stream. Implemented by
  * {@link SessionSender} on both the server and the client side.
@@ -9,7 +11,7 @@ public interface FrameWriter {
 	/**
 	 * Sends a CONNECT frame, requesting the client to dial the address.
 	 */
-	void sendConnect(long connectionId, String address);
+	void sendConnect(Connect connect);
 
 	/**
 	 * Sends a DATA frame. Payloads larger than 64KiB are split into multiple frames; the
@@ -27,5 +29,19 @@ public interface FrameWriter {
 	 * Abnormally terminates the given connection with a cause.
 	 */
 	void sendError(long connectionId, String message);
+
+	/**
+	 * Grants the remote {@code increment} more payload bytes of the given windowed
+	 * connection. Never blocks: called by the local consumer of the connection.
+	 */
+	void sendWindowUpdate(long connectionId, int increment);
+
+	/**
+	 * False once no frame can reach the remote any more (the stream ended); a producer
+	 * waiting for credit gives up instead of waiting for a grant that cannot arrive.
+	 */
+	default boolean isOpen() {
+		return true;
+	}
 
 }

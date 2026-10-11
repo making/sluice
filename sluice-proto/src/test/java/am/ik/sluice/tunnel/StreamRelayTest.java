@@ -11,6 +11,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
+import am.ik.sluice.v1.proto.Connect;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -23,8 +24,13 @@ class StreamRelayTest {
 		final CopyOnWriteArrayList<String> frames = new CopyOnWriteArrayList<>();
 
 		@Override
-		public void sendConnect(long connectionId, String address) {
-			this.frames.add("connect:%d:%s".formatted(connectionId, address));
+		public void sendConnect(Connect connect) {
+			this.frames.add("connect:%d:%s".formatted(connect.getConnId(), connect.getAddress()));
+		}
+
+		@Override
+		public void sendWindowUpdate(long connectionId, int increment) {
+			this.frames.add("window:%d:%d".formatted(connectionId, increment));
 		}
 
 		@Override

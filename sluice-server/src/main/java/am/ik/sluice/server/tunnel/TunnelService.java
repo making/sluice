@@ -13,6 +13,8 @@ import io.grpc.ServerInterceptors;
 import io.grpc.ServerServiceDefinition;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.grpc.server.service.GrpcService;
@@ -42,9 +44,13 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	private final SluiceServerProperties properties;
 
+	private final Counter windowUpdatesSent;
+
+	private final Counter windowUpdatesReceived;
+
 	public TunnelService(Router router, TokenValidator tokenValidator, SessionRegistry sessions,
 			TcpRouteListener tcpRoutes, NodeDirectory nodeDirectory, MembershipBroadcaster membershipBroadcaster,
-			ClusterLifecycle clusterLifecycle, SluiceServerProperties properties) {
+			ClusterLifecycle clusterLifecycle, SluiceServerProperties properties, MeterRegistry meterRegistry) {
 		this.router = router;
 		this.tokenValidator = tokenValidator;
 		this.sessions = sessions;
@@ -53,6 +59,15 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 		this.membershipBroadcaster = membershipBroadcaster;
 		this.clusterLifecycle = clusterLifecycle;
 		this.properties = properties;
+		this.windowUpdatesSent = windowUpdates(meterRegistry, "sent");
+		this.windowUpdatesReceived = windowUpdates(meterRegistry, "received");
+	}
+
+	private static Counter windowUpdates(MeterRegistry meterRegistry, String direction) {
+		return Counter.builder("sluice.tunnel.window.updates")
+			.tag("direction", direction)
+			.description("Per-connection flow control credit grants (WINDOW_UPDATE frames) sent / received")
+			.register(meterRegistry);
 	}
 
 	@Override
@@ -88,9 +103,10 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			.nodeId(this.properties.node().id())
 			.remoteAddress(Objects.requireNonNullElse(TunnelAuthInterceptor.REMOTE_ADDRESS.get(), ""))
 			.router(this.router)
-			.sender(new SessionSender(responseObserver))
+			.sender(new SessionSender(responseObserver, this.windowUpdatesSent::increment))
 			.registry(this.sessions)
 			.tcpRoutes(this.tcpRoutes)
+			.windowUpdateReceived(this.windowUpdatesReceived::increment)
 			.build();
 		session.start();
 		this.membershipBroadcaster.onSessionCreated(session);

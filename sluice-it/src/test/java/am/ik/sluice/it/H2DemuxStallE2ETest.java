@@ -29,6 +29,7 @@ import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.proxy.DataProxyServer;
 import am.ik.sluice.server.route.Router;
+import am.ik.sluice.tunnel.VirtualConnection;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -165,14 +166,18 @@ class H2DemuxStallE2ETest {
 			assertThat(queued).as("the stall reached the leg queue when the second request was sent")
 				.isGreaterThan(0)
 				.isLessThanOrEqualTo(STREAM_QUEUE_BOUND);
-			assertThat(client.streamSent(1)).as("bytes pushed on the stalled leg").isGreaterThan(2L * 1024 * 1024);
+			// past the relay's budget and the tunnel connection's credit window: the
+			// stall
+			// holds the tunnel path too, not only the relay
+			assertThat(client.streamSent(1)).as("bytes pushed on the stalled leg")
+				.isGreaterThan(STREAM_QUEUE_BOUND + VirtualConnection.DEFAULT_WINDOW);
 			assertThat(client.maxOvershoot()).isLessThanOrEqualTo(0);
 		}
 	}
 
 	/**
 	 * A client closing in the middle of a request releases a relay whose leg writer is
-	 * parked at the tunnel sender's per-connection cap: the relay finishes and the
+	 * parked waiting for the tunnel connection's credit: the relay finishes and the
 	 * active-connection count drops while the stalled upstream still holds its socket.
 	 */
 	@Test
@@ -199,6 +204,7 @@ class H2DemuxStallE2ETest {
 			awaitOutboundPlateau(route);
 			// the leg's writer is parked: the leg queue holds what it could not write
 			assertThat(queuedBytes(route)).as("the stall reached the leg queue").isGreaterThan(0);
+			assertThat(ThreadDumps.anyThreadWaitingForCredit()).as("the leg writer waits for credit").isTrue();
 			assertThat(proxy.activeConnections()).as("the relay is live").isEqualTo(1);
 		}
 		finally {

@@ -29,10 +29,9 @@ import org.jspecify.annotations.Nullable;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Repro: the client -> server direction is stalled (the public peer never reads), so the
- * client sender queue is full and the client relay is parked in SessionSender.enqueue.
- * When the server vanishes, NodeConnection#closeConnections closes each connection BEFORE
- * the sender, and VirtualConnection#close -> sendClose parks on the full queue.
+ * The client -> server direction is stalled (the public peer never reads), so the client
+ * relay waits for send credit. When the server vanishes, the client teardown must still
+ * complete and release the upstream socket instead of leaving the relay parked.
  */
 class ClientTeardownFullQueueE2ETest {
 
@@ -95,27 +94,20 @@ class ClientTeardownFullQueueE2ETest {
 		peer.getOutputStream().write("hello".getBytes());
 		peer.getOutputStream().flush();
 
-		// precondition: the client relay is parked on the full client sender queue
+		// precondition: the client relay waits for the credit the stalled server
+		// withholds
 		Awaitility.await()
 			.atMost(Duration.ofSeconds(30))
-			.alias("client relay parked in SessionSender.enqueue")
-			.until(() -> anyThreadIn("am.ik.sluice.tunnel.SessionSender", "enqueueData"));
+			.alias("client relay parked in VirtualConnection.awaitCredit")
+			.until(ThreadDumps::anyThreadWaitingForCredit);
 
 		this.serverContext.close();
 		this.serverContext = null;
 
 		boolean closed = this.upstreamClosed.await(10, TimeUnit.SECONDS);
-		boolean stuck = anyThreadIn("am.ik.sluice.client.tunnel.NodeConnection", "closeConnections");
+		boolean stuck = ThreadDumps.anyThreadIn("am.ik.sluice.client.tunnel.NodeConnection", "closeConnections");
 		assertThat(stuck).as("no thread stuck in NodeConnection.closeConnections").isFalse();
 		assertThat(closed).as("upstream socket closed after the tunnel stream ended").isTrue();
-	}
-
-	/** Includes virtual threads, unlike Thread.getAllStackTraces. */
-	static boolean anyThreadIn(String className, String methodName) throws Exception {
-		java.nio.file.Path file = java.nio.file.Files.createTempDirectory("dump").resolve("threads.txt");
-		java.lang.management.ManagementFactory.getPlatformMXBean(com.sun.management.HotSpotDiagnosticMXBean.class)
-			.dumpThreads(file.toString(), com.sun.management.HotSpotDiagnosticMXBean.ThreadDumpFormat.TEXT_PLAIN);
-		return java.nio.file.Files.readString(file).contains(className + "." + methodName + "(");
 	}
 
 	/** Upstream that writes as fast as it can; latches when the write fails. */

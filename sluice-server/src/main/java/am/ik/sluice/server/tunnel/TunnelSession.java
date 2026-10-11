@@ -1,11 +1,17 @@
 package am.ik.sluice.server.tunnel;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
@@ -19,6 +25,8 @@ import am.ik.sluice.tunnel.FrameWriter;
 import am.ik.sluice.tunnel.SessionSender;
 import am.ik.sluice.tunnel.StreamRelay;
 import am.ik.sluice.tunnel.VirtualConnection;
+import am.ik.sluice.v1.proto.Advertise;
+import am.ik.sluice.v1.proto.Connect;
 import am.ik.sluice.v1.proto.Frame;
 import am.ik.sluice.v1.proto.Node;
 import am.ik.sluice.v1.proto.Upstream;
@@ -27,6 +35,11 @@ import io.grpc.Status;
 /**
  * State of one connected tunnel client: the multiplexed virtual connections and the
  * router registration.
+ * <p>
+ * The receive path ({@link #handle(Frame)}) never waits on anything slow: ADVERTISE is
+ * applied on the session's own serial executor (route registration and port binding can
+ * take a while), and windowed connections accept DATA without blocking. A connection is
+ * windowed when the client announced a receive window ({@code Advertise}).
  */
 public final class TunnelSession implements AutoCloseable {
 
@@ -67,20 +80,39 @@ public final class TunnelSession implements AutoCloseable {
 			.collect(Collectors.toUnmodifiableSet());
 	}
 
-	private volatile boolean closed;
+	private final AtomicBoolean closed = new AtomicBoolean();
 
 	private volatile boolean drained;
 
-	TunnelSession(String clientId, String nodeId, String remoteAddress, Router router, SessionSender sender,
-			SessionRegistry registry, TcpRouteListener tcpRoutes) {
-		this.clientId = clientId;
-		this.nodeId = nodeId;
-		this.remoteAddress = remoteAddress;
-		this.router = router;
-		this.sender = sender;
-		this.tcpRoutes = tcpRoutes;
-		this.registry = registry;
-		registry.register(this);
+	/**
+	 * The client's per-connection receive window from its latest {@code Advertise}; 0 =
+	 * the client has no per-connection flow control.
+	 */
+	private volatile long clientWindow;
+
+	/**
+	 * Applies ADVERTISE off the receive path, in order; the route removal of
+	 * {@link #close()} runs here too, after the queued advertises.
+	 */
+	private final ExecutorService advertiser;
+
+	private final Duration closeTimeout;
+
+	private final Runnable windowUpdateReceived;
+
+	private TunnelSession(Builder builder) {
+		this.clientId = Objects.requireNonNull(builder.clientId, "clientId is required");
+		this.nodeId = builder.nodeId;
+		this.remoteAddress = builder.remoteAddress;
+		this.router = Objects.requireNonNull(builder.router, "router is required");
+		this.sender = Objects.requireNonNull(builder.sender, "sender is required");
+		this.tcpRoutes = Objects.requireNonNull(builder.tcpRoutes, "tcpRoutes is required");
+		this.registry = Objects.requireNonNull(builder.registry, "registry is required");
+		this.closeTimeout = builder.closeTimeout;
+		this.windowUpdateReceived = builder.windowUpdateReceived;
+		this.advertiser = Executors.newSingleThreadExecutor(
+				task -> Thread.ofVirtual().name("sluice-advertise-" + this.clientId).unstarted(task));
+		this.registry.register(this);
 	}
 
 	public static Builder builder() {
@@ -102,6 +134,11 @@ public final class TunnelSession implements AutoCloseable {
 		private @Nullable SessionRegistry registry;
 
 		private @Nullable TcpRouteListener tcpRoutes;
+
+		private Duration closeTimeout = Duration.ofSeconds(5);
+
+		private Runnable windowUpdateReceived = () -> {
+		};
 
 		private Builder() {
 		}
@@ -141,12 +178,23 @@ public final class TunnelSession implements AutoCloseable {
 			return this;
 		}
 
+		/** Runs for every WINDOW_UPDATE received; a metrics hook. */
+		public Builder windowUpdateReceived(Runnable windowUpdateReceived) {
+			this.windowUpdateReceived = windowUpdateReceived;
+			return this;
+		}
+
+		/**
+		 * How long {@link TunnelSession#close()} waits for a pending advertise and the
+		 * route removal queued behind it.
+		 */
+		Builder closeTimeout(Duration closeTimeout) {
+			this.closeTimeout = closeTimeout;
+			return this;
+		}
+
 		public TunnelSession build() {
-			return new TunnelSession(Objects.requireNonNull(this.clientId, "clientId is required"), this.nodeId,
-					this.remoteAddress, Objects.requireNonNull(this.router, "router is required"),
-					Objects.requireNonNull(this.sender, "sender is required"),
-					Objects.requireNonNull(this.registry, "registry is required"),
-					Objects.requireNonNull(this.tcpRoutes, "tcpRoutes is required"));
+			return new TunnelSession(this);
 		}
 
 	}
@@ -189,24 +237,20 @@ public final class TunnelSession implements AutoCloseable {
 	}
 
 	/**
-	 * Handles one frame received from the client.
+	 * Handles one frame received from the client; never blocks on a slow consumer, except
+	 * for DATA of a legacy connection.
 	 */
 	void handle(Frame frame) {
 		switch (frame.getBodyCase()) {
 			case ADVERTISE -> {
-				List<Upstream> advertised = frame.getAdvertise().getUpstreamsList();
-				int registered = this.router.register(this.clientId, advertised);
-				Set<Integer> rejected = this.tcpRoutes.reconcile(this.clientId, listenPorts(advertised));
-				this.upstreams = List.copyOf(advertised);
-				this.rejectedPorts = Set.copyOf(rejected);
-				this.sender.sendAdvertiseAck(List.copyOf(rejected), this.nodeId);
-				log.info("client {} advertised {} upstream(s), {} listen port(s) rejected", this.clientId, registered,
-						rejected.size());
-				for (Upstream upstream : advertised) {
-					log.info(
-							"client {} upstream: host=[{}] target={} rewrite-host={} tls-passthrough={} listen-port={}",
-							this.clientId, upstream.getHost(), upstream.getTargetUrl(), upstream.getRewriteHost(),
-							upstream.getTlsPassthrough(), upstream.getListenPort());
+				Advertise advertise = frame.getAdvertise();
+				// before the routes exist: every CONNECT they lead to sees the window
+				this.clientWindow = Integer.toUnsignedLong(advertise.getConnectionWindow());
+				try {
+					this.advertiser.execute(() -> advertise(advertise.getUpstreamsList()));
+				}
+				catch (RejectedExecutionException e) {
+					// closed: the routes of a closed session are not registered again
 				}
 			}
 			case DATA -> {
@@ -214,6 +258,13 @@ public final class TunnelSession implements AutoCloseable {
 				VirtualConnection connection = this.connections.get(data.getConnId());
 				if (connection != null) {
 					connection.acceptData(data.getPayload().toByteArray());
+				}
+			}
+			case WINDOW_UPDATE -> {
+				this.windowUpdateReceived.run();
+				VirtualConnection connection = this.connections.get(frame.getWindowUpdate().getConnId());
+				if (connection != null) {
+					connection.grant(frame.getWindowUpdate().getIncrement());
 				}
 			}
 			case CLOSE -> {
@@ -240,14 +291,44 @@ public final class TunnelSession implements AutoCloseable {
 	}
 
 	/**
+	 * Registers the advertised routes and binds their ports, then acknowledges; runs on
+	 * {@link #advertiser}. Skipped once the session is closed: the route removal of
+	 * {@link #close()} runs after every advertise started before it.
+	 */
+	private void advertise(List<Upstream> advertised) {
+		if (this.closed.get()) {
+			return;
+		}
+		int registered = this.router.register(this.clientId, advertised);
+		Set<Integer> rejected = this.tcpRoutes.reconcile(this.clientId, listenPorts(advertised));
+		this.upstreams = List.copyOf(advertised);
+		this.rejectedPorts = Set.copyOf(rejected);
+		this.sender.sendAdvertiseAck(List.copyOf(rejected), this.nodeId);
+		log.info("client {} advertised {} upstream(s), {} listen port(s) rejected", this.clientId, registered,
+				rejected.size());
+		for (Upstream upstream : advertised) {
+			log.info("client {} upstream: host=[{}] target={} rewrite-host={} tls-passthrough={} listen-port={}",
+					this.clientId, upstream.getHost(), upstream.getTargetUrl(), upstream.getRewriteHost(),
+					upstream.getTlsPassthrough(), upstream.getListenPort());
+		}
+	}
+
+	/**
 	 * Opens a virtual connection to the given dial address and sends the CONNECT request
-	 * to the client.
+	 * to the client. Windowed when the client announced a receive window.
 	 */
 	public VirtualConnection open(String address) {
 		long connectionId = this.sequence.getAndIncrement();
-		VirtualConnection connection = new VirtualConnection(connectionId, this.sender);
+		long clientWindow = this.clientWindow;
+		VirtualConnection connection = clientWindow > 0 ? VirtualConnection.builder(connectionId, this.sender)
+			.window(VirtualConnection.DEFAULT_WINDOW, clientWindow)
+			.build() : new VirtualConnection(connectionId, this.sender);
 		this.connections.put(connectionId, connection);
-		this.sender.sendConnect(connectionId, address);
+		this.sender.sendConnect(Connect.newBuilder()
+			.setConnId(connectionId)
+			.setAddress(address)
+			.setConnectionWindow(connection.windowed() ? VirtualConnection.DEFAULT_WINDOW : 0)
+			.build());
 		return connection;
 	}
 
@@ -313,16 +394,32 @@ public final class TunnelSession implements AutoCloseable {
 		this.sender.sendMembership(nodes, membershipVersion);
 	}
 
+	/**
+	 * Tears the session down: unregisters it, removes its routes, stops the sender and
+	 * fails its connections. The route removal runs on {@link #advertiser} after the
+	 * advertises queued before it, so none of them registers the routes again; close
+	 * waits for it at most {@code closeTimeout}, and an advertise stuck past that leaves
+	 * the removal to run once it finishes. That advertise still registers its routes when
+	 * it ends, after a newer session of the client may have registered its own.
+	 */
 	@Override
 	public void close() {
-		if (this.closed) {
+		if (!this.closed.compareAndSet(false, true)) {
 			return;
 		}
-		this.closed = true;
 		this.registry.remove(this);
 		log.info("closing session for client {}", this.clientId);
-		this.tcpRoutes.reconcile(this.clientId, Set.of());
-		this.router.remove(this.clientId);
+		this.advertiser.execute(this::removeRoutes);
+		this.advertiser.shutdown();
+		try {
+			if (!this.advertiser.awaitTermination(this.closeTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
+				log.warn("client {}: advertise still running after {}; its routes are removed once it ends",
+						this.clientId, this.closeTimeout);
+			}
+		}
+		catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
 		// the sender first: a dead or stalled stream must not leave the connection
 		// teardown below waiting on a full send queue (the worker stops and releases
 		// every producer); from here on the frames of the closing connections are
@@ -333,6 +430,19 @@ public final class TunnelSession implements AutoCloseable {
 			connection.close();
 		}
 		this.connections.clear();
+	}
+
+	/**
+	 * Releases the client's routes and ports, unless a newer session of the same client
+	 * id is live: the routes are keyed by client id, and that session owns them now (its
+	 * advertise replaces them, its close removes them).
+	 */
+	private void removeRoutes() {
+		if (this.registry.find(this.clientId).isPresent()) {
+			return;
+		}
+		this.tcpRoutes.reconcile(this.clientId, Set.of());
+		this.router.remove(this.clientId);
 	}
 
 }

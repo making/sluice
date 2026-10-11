@@ -1,9 +1,7 @@
 package am.ik.sluice.tunnel;
 
-import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.util.Arrays;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -170,12 +168,17 @@ public final class StreamRelay {
 		}
 	}
 
+	/**
+	 * Writes through the connection's sink, so a windowed connection sends only against
+	 * the remote's credit and the half-close is recorded on the connection.
+	 */
 	private void doRelayToRemote(byte[] buffer) throws Exception {
+		OutputStream sink = this.connection.sink();
 		if (this.prefix != null && this.prefix.length > 0) {
 			if (this.listener != null) {
 				this.listener.onBytesRelayed(this.prefix.length, Direction.TO_REMOTE);
 			}
-			sendOrThrow(Arrays.copyOf(this.prefix, this.prefix.length));
+			sink.write(this.prefix);
 		}
 		InputStream in = this.pipe.source();
 		int n;
@@ -183,16 +186,9 @@ public final class StreamRelay {
 			if (this.listener != null) {
 				this.listener.onBytesRelayed(n, Direction.TO_REMOTE);
 			}
-			sendOrThrow(Arrays.copyOf(buffer, n));
+			sink.write(buffer, 0, n);
 		}
-		this.frameWriter.sendClose(this.connection.connectionId());
-	}
-
-	/** Ends the relay when the tunnel stream no longer accepts the chunk. */
-	private void sendOrThrow(byte[] payload) throws IOException {
-		if (!this.frameWriter.sendData(this.connection.connectionId(), payload)) {
-			throw new IOException("tunnel stream closed");
-		}
+		sink.close();
 	}
 
 	private void doRelayToLocal() throws Exception {

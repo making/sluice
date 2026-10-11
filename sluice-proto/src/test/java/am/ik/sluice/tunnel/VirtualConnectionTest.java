@@ -3,11 +3,11 @@ package am.ik.sluice.tunnel;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Arrays;
 
+import am.ik.sluice.v1.proto.Connect;
 import am.ik.sluice.v1.proto.Frame;
 import io.grpc.stub.StreamObserver;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CompletableFuture;
@@ -19,22 +19,37 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.fail;
 
+@Timeout(30)
 class VirtualConnectionTest {
 
 	/** Records every frame without a real stream. */
 	private static final class RecordingWriter implements FrameWriter {
 
-		final List<String> frames = new ArrayList<>();
+		final List<String> frames = new CopyOnWriteArrayList<>();
 
 		final AtomicLong bytes = new AtomicLong();
 
+		volatile boolean open = true;
+
 		@Override
-		public void sendConnect(long connectionId, String address) {
-			this.frames.add("connect:%d:%s".formatted(connectionId, address));
+		public boolean isOpen() {
+			return this.open;
+		}
+
+		@Override
+		public void sendConnect(Connect connect) {
+			this.frames.add("connect:%d:%s".formatted(connect.getConnId(), connect.getAddress()));
+		}
+
+		@Override
+		public void sendWindowUpdate(long connectionId, int increment) {
+			this.frames.add("window:%d:%d".formatted(connectionId, increment));
 		}
 
 		@Override
@@ -302,6 +317,260 @@ class VirtualConnectionTest {
 		finally {
 			sender.close();
 		}
+	}
+
+	private static VirtualConnection windowed(long id, FrameWriter writer, int receiveWindow, long sendCredit) {
+		return VirtualConnection.builder(id, writer).window(receiveWindow, sendCredit).build();
+	}
+
+	/** A write running on its own virtual thread; the future fails with its exception. */
+	private record AsyncWrite(Thread thread, CompletableFuture<Void> done) {
+
+		static AsyncWrite start(OutputStream sink, byte[] bytes) {
+			CompletableFuture<Void> done = new CompletableFuture<>();
+			Thread thread = Thread.ofVirtual().name("test-writer").start(() -> {
+				try {
+					sink.write(bytes);
+					done.complete(null);
+				}
+				catch (IOException | RuntimeException e) {
+					done.completeExceptionally(e);
+				}
+			});
+			return new AsyncWrite(thread, done);
+		}
+
+		/** Waits until the writer is parked in the credit wait, not merely slow. */
+		void awaitParkedInCreditWait() throws InterruptedException {
+			long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(5);
+			while (System.currentTimeMillis() < deadline) {
+				Thread.State state = this.thread.getState();
+				boolean waiting = state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING;
+				if (waiting && Arrays.stream(this.thread.getStackTrace())
+					.anyMatch(frame -> frame.getMethodName().equals("awaitCredit"))) {
+					return;
+				}
+				TimeUnit.MILLISECONDS.sleep(10);
+			}
+			fail("writer never parked in awaitCredit: " + this.thread.getState());
+		}
+
+	}
+
+	private static void awaitFrames(RecordingWriter writer, int count) throws InterruptedException {
+		long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(5);
+		while (writer.frames.size() < count && System.currentTimeMillis() < deadline) {
+			TimeUnit.MILLISECONDS.sleep(10);
+		}
+		assertThat(writer.frames).hasSizeGreaterThanOrEqualTo(count);
+	}
+
+	@Test
+	void windowedAcceptDataNeverBlocksWithinTheWindow() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(20, writer, 200 * 1024, 1);
+		byte[] chunk = new byte[1024];
+		// the whole window with no reader, in more chunks than the legacy bound (128); on
+		// a thread so a regression fails the join instead of hanging the build
+		Thread producer = Thread.ofVirtual().start(() -> {
+			for (int i = 0; i < 200; i++) {
+				connection.acceptData(chunk);
+			}
+		});
+		producer.join(100);
+		assertThat(producer.isAlive()).as("acceptData of a full window returns within 100ms").isFalse();
+		assertThat(connection.pendingInbound()).isEqualTo(200);
+		assertThat(writer.frames).as("no ERROR within the window").isEmpty();
+	}
+
+	@Test
+	void windowedAcceptDataBeyondTheWindowFailsOnlyThisConnection() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(21, writer, 1000, 1);
+		connection.acceptData(new byte[1000]);
+		assertThat(writer.frames).isEmpty();
+		connection.acceptData(new byte[1]);
+		assertThat(writer.frames).containsExactly("error:21:flow control window exceeded");
+		assertThatThrownBy(() -> connection.source().read()).isInstanceOf(IOException.class)
+			.hasMessage("flow control window exceeded");
+		assertThatThrownBy(() -> connection.sink().write('x')).isInstanceOf(IOException.class);
+		// more violating payload neither queues nor repeats the ERROR
+		connection.acceptData(new byte[1000]);
+		connection.close();
+		assertThat(writer.frames).containsExactly("error:21:flow control window exceeded");
+	}
+
+	@Test
+	void windowedReaderGrantsOnceHalfTheWindowIsConsumed() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(22, writer, 1000, 1);
+		connection.acceptData(new byte[1000]);
+		InputStream source = connection.source();
+		assertThat(source.readNBytes(499)).hasSize(499);
+		assertThat(writer.frames).as("below half the window").isEmpty();
+		assertThat(source.readNBytes(1)).hasSize(1);
+		assertThat(writer.frames).containsExactly("window:22:500");
+		assertThat(source.readNBytes(500)).hasSize(500);
+		assertThat(writer.frames).containsExactly("window:22:500", "window:22:500");
+		// the grants made room: a whole window fits again
+		connection.acceptData(new byte[1000]);
+		assertThat(writer.frames).as("no ERROR after the grants").noneMatch(frame -> frame.startsWith("error"));
+	}
+
+	@Test
+	void windowedWriteWaitsForCreditAndResumesOnGrant() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(23, writer, 1000, 10);
+		OutputStream sink = connection.sink();
+		sink.write(new byte[10]);
+		assertThat(connection.sendCredit()).isZero();
+		AsyncWrite parked = AsyncWrite.start(sink, new byte[1]);
+		parked.awaitParkedInCreditWait();
+		assertThat(parked.done()).isNotDone();
+		assertThat(writer.frames).containsExactly("data:23:10");
+		connection.grant(1);
+		parked.done().get(1, TimeUnit.SECONDS);
+		assertThat(writer.frames).containsExactly("data:23:10", "data:23:1");
+	}
+
+	@Test
+	void windowedWriteLargerThanTheCreditIsSplitAtTheCredit() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(24, writer, 1000, 100);
+		AsyncWrite write = AsyncWrite.start(connection.sink(), new byte[250]);
+		write.awaitParkedInCreditWait();
+		assertThat(writer.frames).containsExactly("data:24:100");
+		connection.grant(100);
+		awaitFrames(writer, 2);
+		write.awaitParkedInCreditWait();
+		assertThat(writer.frames).containsExactly("data:24:100", "data:24:100");
+		connection.grant(100);
+		write.done().get(1, TimeUnit.SECONDS);
+		assertThat(writer.frames).containsExactly("data:24:100", "data:24:100", "data:24:50");
+		assertThat(connection.sendCredit()).isEqualTo(50);
+	}
+
+	@Test
+	void windowedCreditWaitFailsOnClose() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(25, writer, 1000, 1);
+		connection.sink().write(new byte[1]);
+		AsyncWrite parked = AsyncWrite.start(connection.sink(), new byte[1]);
+		parked.awaitParkedInCreditWait();
+		connection.close();
+		assertThatThrownBy(() -> parked.done().get(100, TimeUnit.MILLISECONDS)).isInstanceOf(ExecutionException.class)
+			.cause()
+			.isInstanceOf(IOException.class)
+			.hasMessage("connection 25 is closed");
+	}
+
+	@Test
+	void windowedCreditWaitFailsOnRemoteFailure() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(26, writer, 1000, 1);
+		connection.sink().write(new byte[1]);
+		AsyncWrite parked = AsyncWrite.start(connection.sink(), new byte[1]);
+		parked.awaitParkedInCreditWait();
+		connection.remoteFailed("upstream reset");
+		assertThatThrownBy(() -> parked.done().get(100, TimeUnit.MILLISECONDS)).isInstanceOf(ExecutionException.class)
+			.cause()
+			.isInstanceOf(IOException.class)
+			.hasMessage("upstream reset");
+	}
+
+	/** The stream ending has no signal on the connection; the timed wait notices it. */
+	@Test
+	void windowedCreditWaitFailsOnceTheStreamEnded() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(27, writer, 1000, 1);
+		connection.sink().write(new byte[1]);
+		AsyncWrite parked = AsyncWrite.start(connection.sink(), new byte[1]);
+		parked.awaitParkedInCreditWait();
+		writer.open = false;
+		assertThatThrownBy(() -> parked.done().get(500, TimeUnit.MILLISECONDS)).isInstanceOf(ExecutionException.class)
+			.cause()
+			.isInstanceOf(IOException.class)
+			.hasMessage("tunnel stream closed");
+	}
+
+	/**
+	 * The credit lock pitfall: a windowed writer parked at the session sender's
+	 * per-connection cap (the stream is never ready) must not hold the lock a grant on
+	 * the receive path takes.
+	 */
+	@Test
+	void grantReturnsWhileTheWriterIsParkedAtTheSenderCap() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		SessionSender sender = new SessionSender(observer);
+		sender.start();
+		try {
+			VirtualConnection connection = windowed(28, sender, 1000, 64L * 1024 * 1024);
+			byte[] beyondTheCap = new byte[(SessionSender.DATA_QUEUE_CAPACITY + 1) * SessionSender.MAX_CHUNK];
+			AsyncWrite parked = AsyncWrite.start(connection.sink(), beyondTheCap);
+			long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(5);
+			while (sender.capWaiterWakeups(28) == 0 && System.currentTimeMillis() < deadline) {
+				TimeUnit.MILLISECONDS.sleep(10);
+			}
+			assertThat(sender.capWaiterWakeups(28)).as("precondition: the writer waits at the sender cap")
+				.isGreaterThan(0);
+			CompletableFuture<Void> grant = CompletableFuture.runAsync(() -> connection.grant(1),
+					task -> Thread.ofVirtual().start(task));
+			grant.get(100, TimeUnit.MILLISECONDS);
+			assertThat(parked.done()).isNotDone();
+		}
+		finally {
+			sender.close();
+		}
+	}
+
+	/**
+	 * A windowed connection closed while the remote may still send tells it to stop: the
+	 * remote's payload would be dropped and never granted.
+	 */
+	@Test
+	void windowedCloseWhileTheRemoteSendsAborts() {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(29, writer, 1000, 1);
+		connection.close();
+		assertThat(writer.frames).containsExactly("error:29:connection closed");
+	}
+
+	@Test
+	void windowedCloseAfterTheRemoteClosedHalfCloses() {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(30, writer, 1000, 1);
+		connection.remoteClosed();
+		connection.close();
+		assertThat(writer.frames).containsExactly("close:30");
+	}
+
+	@Test
+	void legacyConnectionIgnoresGrantsAndHalfClosesOnClose() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = new VirtualConnection(31, writer);
+		connection.grant(100);
+		connection.sink().write(new byte[3 * SessionSender.MAX_CHUNK]);
+		connection.close();
+		assertThat(connection.windowed()).isFalse();
+		assertThat(writer.frames).containsExactly("data:31:%d".formatted(3 * SessionSender.MAX_CHUNK), "close:31");
+	}
+
+	@Test
+	void grantIncrementIsUnsigned() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(33, writer, 1000, 1);
+		connection.sink().write(new byte[1]);
+		connection.grant(-1); // uint32 max on the wire
+		assertThat(connection.sendCredit()).isEqualTo(0xFFFFFFFFL);
+	}
+
+	@Test
+	void abortSendsOneErrorWithTheCause() {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(32, writer, 1000, 1);
+		connection.abort("dial failed");
+		assertThat(writer.frames).containsExactly("error:32:dial failed");
+		assertThatThrownBy(() -> connection.sink().write('x')).isInstanceOf(IOException.class);
 	}
 
 }

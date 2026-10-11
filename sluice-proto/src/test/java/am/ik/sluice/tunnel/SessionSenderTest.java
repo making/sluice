@@ -307,6 +307,44 @@ class SessionSenderTest {
 		}
 	}
 
+	/**
+	 * A grant leaves on the control queue: neither the connection's queued DATA nor an
+	 * unready stream holds it back, and the metrics hook counts it.
+	 */
+	@Test
+	void windowUpdateBypassesQueuedDataAndReadiness() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.gate.countDown();
+		AtomicInteger counted = new AtomicInteger();
+		SessionSender sender = new SessionSender(observer, counted::incrementAndGet);
+		try {
+			sender.start();
+			assertThat(observer.isReady()).as("precondition: the stream is not ready").isFalse();
+			sender.sendData(1, new byte[1]);
+			sender.sendWindowUpdate(1, 7);
+			awaitSentFrames(observer, 1);
+			assertThat(observer.sent.getFirst().getWindowUpdate().getConnId()).isEqualTo(1);
+			assertThat(observer.sent.getFirst().getWindowUpdate().getIncrement()).isEqualTo(7);
+			TimeUnit.MILLISECONDS.sleep(200);
+			assertThat(observer.sent).as("the DATA waits for readiness").hasSize(1);
+			assertThat(counted).hasValue(1);
+		}
+		finally {
+			sender.close();
+		}
+	}
+
+	@Test
+	void isOpenUntilTheCallClosesOrTheSenderStops() {
+		SessionSender closedCall = new SessionSender(new FakeServerObserver());
+		SessionSender stopped = new SessionSender(new FakeServerObserver());
+		assertThat(closedCall.isOpen()).isTrue();
+		closedCall.markCallClosed();
+		assertThat(closedCall.isOpen()).isFalse();
+		stopped.close();
+		assertThat(stopped.isOpen()).isFalse();
+	}
+
 	@Test
 	void perConnectionCapBlocksOnlyItsOwnProducer() throws Exception {
 		FakeServerObserver observer = new FakeServerObserver();

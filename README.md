@@ -2,7 +2,7 @@
 
 HTTP tunnel over a gRPC bidirectional stream, built on Spring Boot 4.1 and Spring gRPC.
 
-A single gRPC bidi stream multiplexes virtual TCP connections (`conn_id`). The data plane is a raw TCP proxy: the request head is inspected for routing (Host / :authority), so WebSocket upgrades and HTTP keep-alive pass through transparently. All blocking I/O runs on virtual threads; outbound frames are scheduled, not merely queued: control frames go first, connection frames wait on a per-connection bounded queue drained round-robin, and gRPC flow control is honored.
+A single gRPC bidi stream multiplexes virtual TCP connections (`conn_id`). The data plane is a raw TCP proxy: the request head is inspected for routing (Host / :authority), so WebSocket upgrades and HTTP keep-alive pass through transparently. All blocking I/O runs on virtual threads; outbound frames are scheduled, not merely queued: control frames go first, connection frames wait on a per-connection bounded queue drained round-robin, and gRPC flow control is honored. Each virtual connection has its own credit window (1MiB per direction), so a connection whose reader stalls holds back only its own writer, never the stream.
 
 ## Architecture
 
@@ -48,10 +48,11 @@ sequenceDiagram
     B ->> S: TCP connect + HTTP request
     S ->> C: CONNECT(conn_id) via gRPC bidi stream
     C ->> U: dial Socket(address)
-    Note over S,C: VirtualConnection (bounded queue 128x64K, half-close, backpressure)
+    Note over S,C: VirtualConnection (1MiB credit window per direction, half-close)
     loop raw relay (one virtual thread per direction)
         S ->> C: DATA(conn_id, 64K)
         C ->> U: bytes
+        C -->> S: WINDOW_UPDATE(conn_id) per 512K consumed
         U -->> C: bytes
         C ->> S: DATA(conn_id) / CLOSE
     end
@@ -62,6 +63,7 @@ sequenceDiagram
 - server: accept, route by `Host`, `VirtualConnection` + `CONNECT`, then raw relay (`SocketRelay`, one virtual thread per direction)
 - client: `CONNECT`, dial the local upstream (strict forwarding), same raw relay; upstream URLs with `https://` are dialed with TLS (trust-all)
 - flow control: bounded queues end to end; the gRPC send path honors `isReady()` on a dedicated sender thread, sends control frames before connection frames, and drains the per-connection queues round-robin so one busy connection cannot starve the others
+- per-connection flow control (credit windows, as in HTTP/2 streams): each side announces a 1MiB receive window per connection (`Advertise` / `Connect`), and a writer sends only against the credit its peer granted back with `WINDOW_UPDATE`. The receive path never blocks, so one stalled connection does not stall the others on the stream; a peer sending past its window fails only that connection. Bounds: a receiver buffers at most one window per connection, window x connections in total (the number of connections is not limited); and one connection has at most one window in flight, so its throughput is at most window / RTT (about 20MiB/s at 50ms). A peer without the window (an older client or server) keeps the old behavior on its connections: a slow consumer blocks the whole stream
 
 ## Modules
 
@@ -513,7 +515,7 @@ tunnel.
   cluster warmup window and while draining (see "Cluster (scale-out)")
 - client `GET /actuator/health` (port 9001) - UP while at least one per-node tunnel stream is
   established; the `tunnel` detail shows the connection state and `nodes` each node's stream state
-- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`, and on the server `sluice_h2demux_queued_bytes` (bytes the h2 demux holds queued towards upstreams, one series per route)
+- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`, `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), and on the server `sluice_h2demux_queued_bytes` (bytes the h2 demux holds queued towards upstreams, one series per route)
 
 ## Console
 

@@ -308,7 +308,7 @@
           <text class="el" x="455" y="612" text-anchor="middle" font-size="8.5">handle()</text>
           <rect x="230" y="800" width="950" height="70" rx="3" fill="rgba(255,255,255,.6)" stroke="#5E7183" stroke-dasharray="4 3"/>
           <text class="nd" x="245" y="822">shared tunnel primitives &#8212; sluice-proto (am.ik.sluice.tunnel)</text>
-          <text class="note" x="245" y="842">VirtualConnection: bounded 128 x 64 KiB per direction, half-close &#183; SessionSender: isReady()-aware sender thread</text>
+          <text class="note" x="245" y="842">VirtualConnection: 1 MiB credit window per direction, half-close &#183; SessionSender: isReady()-aware sender thread</text>
           <text class="note" x="245" y="858">SocketRelay: one virtual thread per direction &#183; DuplexPipe / FrameWriter</text>
         </svg>
         <div class="tblock" aria-hidden="true">
@@ -427,7 +427,7 @@
           <text class="bt" x="35" y="712">sluice-proto &#8212; am.ik.sluice.tunnel (shared library)</text>
           <g class="k k-cmp"><rect class="cmp" x="45" y="722" width="250" height="72" rx="3"/>
             <text class="nd" x="55" y="742">VirtualConnection</text>
-            <text class="dd" x="55" y="760">bounded 128 x 64 KiB per direction,</text>
+            <text class="dd" x="55" y="760">1 MiB credit window per direction,</text>
             <text class="dd" x="55" y="774">half-close via CLOSE frame</text></g>
           <g class="k k-cmp"><rect class="cmp" x="320" y="722" width="250" height="72" rx="3"/>
             <text class="nd" x="330" y="742">SessionSender</text>

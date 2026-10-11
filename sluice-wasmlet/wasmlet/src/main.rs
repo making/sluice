@@ -457,6 +457,8 @@ impl NodeTask {
         tx.send(Frame {
             body: Some(Body::Advertise(Advertise {
                 upstreams: self.shared.advertised.clone(),
+                // no per-connection flow control yet: every connection is legacy
+                connection_window: 0,
             })),
         })
         .await?;

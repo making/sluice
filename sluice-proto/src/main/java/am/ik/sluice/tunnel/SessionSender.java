@@ -23,6 +23,7 @@ import am.ik.sluice.v1.proto.MembershipUpdate;
 import am.ik.sluice.v1.proto.Node;
 import am.ik.sluice.v1.proto.Drain;
 import am.ik.sluice.v1.proto.Upstream;
+import am.ik.sluice.v1.proto.WindowUpdate;
 import io.grpc.stub.CallStreamObserver;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
@@ -34,8 +35,8 @@ import io.grpc.stub.StreamObserver;
  * Callbacks must never call {@code onNext} directly from a receive callback; everything
  * goes through this class and a dedicated virtual thread instead. Frames are scheduled,
  * not just queued: control frames (CONNECT, ADVERTISE, ADVERTISE_ACK, MEMBERSHIP_UPDATE,
- * DRAIN, and WINDOW_UPDATE once it exists) wait on an unbounded queue that is always sent
- * first, so enqueueing one never blocks. Connection frames (DATA, CLOSE, ERROR) wait on a
+ * DRAIN, WINDOW_UPDATE) wait on an unbounded queue that is always sent first, so
+ * enqueueing one never blocks. Connection frames (DATA, CLOSE, ERROR) wait on a
  * per-connection queue holding at most {@link #DATA_QUEUE_CAPACITY} DATA frames; only
  * that connection's producer blocks once the cap is reached, and CLOSE / ERROR bypass it.
  * Queueing CLOSE / ERROR closes the queue to DATA: the producers parked on its cap fail
@@ -141,8 +142,20 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 	private volatile @Nullable Thread workerThread;
 
+	/** Runs for every WINDOW_UPDATE queued; a metrics hook. */
+	private final Runnable windowUpdateSent;
+
 	public SessionSender(StreamObserver<Frame> outbound) {
+		this(outbound, () -> {
+		});
+	}
+
+	/**
+	 * A sender that runs {@code windowUpdateSent} for every WINDOW_UPDATE it queues.
+	 */
+	public SessionSender(StreamObserver<Frame> outbound, Runnable windowUpdateSent) {
 		this.outbound = Objects.requireNonNull(outbound, "outbound is required");
+		this.windowUpdateSent = Objects.requireNonNull(windowUpdateSent, "windowUpdateSent is required");
 		if (outbound instanceof CallStreamObserver<?> call) {
 			call.setOnReadyHandler(this::wakeWorker);
 		}
@@ -247,18 +260,24 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		return !(this.outbound instanceof CallStreamObserver<?> call) || call.isReady();
 	}
 
+	@Override
+	public boolean isOpen() {
+		return this.running && !callClosed();
+	}
+
 	/**
 	 * Queues a control frame; never blocks. Dropped once the sender is stopped: the
-	 * worker is gone and nobody would drain it.
+	 * worker is gone and nobody would drain it. Returns whether it was queued.
 	 */
-	private void enqueueControl(Frame frame) {
+	private boolean enqueueControl(Frame frame) {
 		this.lock.lock();
 		try {
 			if (!this.running) {
-				return;
+				return false;
 			}
 			this.control.addLast(frame);
 			this.wakeWorker.signal();
+			return true;
 		}
 		finally {
 			this.lock.unlock();
@@ -360,12 +379,20 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	}
 
 	@Override
-	public void sendConnect(long connectionId, String address) {
-		Connect connect = Connect.newBuilder()
-			.setConnId(connectionId)
-			.setAddress(address == null ? "" : address)
-			.build();
+	public void sendConnect(Connect connect) {
 		enqueueControl(Frame.newBuilder().setConnect(connect).build());
+	}
+
+	/**
+	 * Queues the grant on the control queue: it is never delayed by DATA of any
+	 * connection, and never blocks.
+	 */
+	@Override
+	public void sendWindowUpdate(long connectionId, int increment) {
+		WindowUpdate update = WindowUpdate.newBuilder().setConnId(connectionId).setIncrement(increment).build();
+		if (enqueueControl(Frame.newBuilder().setWindowUpdate(update).build())) {
+			this.windowUpdateSent.run();
+		}
 	}
 
 	/**
@@ -397,10 +424,14 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	}
 
 	/**
-	 * Announces the upstreams to the server (client -> server only).
+	 * Announces the upstreams and the client's per-connection receive window (0 = no
+	 * per-connection flow control) to the server (client -> server only).
 	 */
-	public void sendAdvertise(List<Upstream> upstreams) {
-		Advertise advertise = Advertise.newBuilder().addAllUpstreams(upstreams).build();
+	public void sendAdvertise(List<Upstream> upstreams, int connectionWindow) {
+		Advertise advertise = Advertise.newBuilder()
+			.addAllUpstreams(upstreams)
+			.setConnectionWindow(connectionWindow)
+			.build();
 		enqueueControl(Frame.newBuilder().setAdvertise(advertise).build());
 	}
 

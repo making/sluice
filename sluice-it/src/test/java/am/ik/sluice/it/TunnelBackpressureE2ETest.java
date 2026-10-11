@@ -3,21 +3,17 @@ package am.ik.sluice.it;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.lang.management.ManagementFactory;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
-
-import com.sun.management.HotSpotDiagnosticMXBean;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -63,6 +59,8 @@ class TunnelBackpressureE2ETest {
 
 	private static int echoRoutePort;
 
+	private static int answerRoutePort;
+
 	/** The never-read sockets of the current stall test, closed to end the local side. */
 	private static final List<Socket> stallUpstreams = new java.util.concurrent.CopyOnWriteArrayList<>();
 
@@ -85,9 +83,11 @@ class TunnelBackpressureE2ETest {
 		sinkRoutePort = TestPorts.freePort();
 		stallRoutePort = TestPorts.freePort();
 		echoRoutePort = TestPorts.freePort();
+		answerRoutePort = TestPorts.freePort();
 		properties.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		properties.add("sluice.data-port", () -> String.valueOf(dataPort));
-		properties.add("sluice.tcp-port-range", () -> sinkRoutePort + "," + stallRoutePort + "," + echoRoutePort);
+		properties.add("sluice.tcp-port-range",
+				() -> sinkRoutePort + "," + stallRoutePort + "," + echoRoutePort + "," + answerRoutePort);
 		properties.add("sluice.token", () -> "it-token");
 		properties.add("server.port", () -> 0);
 	}
@@ -121,10 +121,9 @@ class TunnelBackpressureE2ETest {
 	}
 
 	/**
-	 * A client vanishing while the server sender queue is full must not leave threads
-	 * parked in {@code SessionSender.enqueueData} forever: the session leaves the
-	 * registry, no relay stays parked, and the public peer socket is released (EOF /
-	 * reset).
+	 * A client vanishing while the server relay waits for send credit must not leave it
+	 * parked forever: the session leaves the registry, no relay stays parked, and the
+	 * public peer socket is released (EOF / reset).
 	 */
 	@Test
 	void deadStreamReleasesSessionConnectionsAndThreads() throws Exception {
@@ -156,12 +155,11 @@ class TunnelBackpressureE2ETest {
 			// teardown below must work with frames in flight and queues full
 			Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> sunk.get() > 1024L * 1024);
 			Thread.sleep(5000);
-			// precondition: a relay is parked on the full sender queue; the dump includes
-			// virtual threads, unlike Thread.getAllStackTraces
+			// precondition: the relay waits for the credit the stalled client withholds
 			Awaitility.await()
 				.atMost(Duration.ofSeconds(10))
-				.alias("server relay parked in SessionSender.enqueueData")
-				.until(() -> anyThreadIn("am.ik.sluice.tunnel.SessionSender", "enqueueData"));
+				.alias("server relay parked in VirtualConnection.awaitCredit")
+				.until(ThreadDumps::anyThreadWaitingForCredit);
 			started.stop();
 			Awaitility.await()
 				.atMost(Duration.ofSeconds(5))
@@ -169,8 +167,8 @@ class TunnelBackpressureE2ETest {
 				.until(() -> registry.count() == 0);
 			Awaitility.await()
 				.atMost(Duration.ofSeconds(5))
-				.alias("no thread parked in SessionSender.enqueueData")
-				.until(() -> !anyThreadIn("am.ik.sluice.tunnel.SessionSender", "enqueueData"));
+				.alias("no thread parked in VirtualConnection.awaitCredit")
+				.until(() -> !ThreadDumps.anyThreadWaitingForCredit());
 			Awaitility.await()
 				.atMost(Duration.ofSeconds(5))
 				.alias("public peer socket released (EOF / reset)")
@@ -180,30 +178,33 @@ class TunnelBackpressureE2ETest {
 	}
 
 	/**
-	 * A connection whose local side ends while the remote keeps pushing must not leave
-	 * the session's receive path parked on the full inbound bound: the producer waiting
-	 * in {@code acceptData} wakes on close and another connection on the same stream
-	 * keeps working.
+	 * A connection whose local side ends while the remote keeps pushing makes the
+	 * remote's writer, waiting for credit that the closed side will never grant, give up;
+	 * another connection on the same stream keeps working.
 	 */
 	@Test
-	void localCloseWhileReceivingKeepsOtherConnectionsWorking() throws Exception {
+	void localCloseWhileReceivingReleasesTheRemoteWriter() throws Exception {
 		int stall = upstream(TunnelBackpressureE2ETest::holdUnread);
 		int echo = upstream(TunnelBackpressureE2ETest::echo);
 		startClient(List.of(route("stall.local", stall, stallRoutePort), route("echo.local", echo, echoRoutePort)));
 		stallUpstreams.clear();
 		try (Socket victim = new Socket("127.0.0.1", stallRoutePort)) {
 			Thread.ofVirtual().name("e2e-bp-stall-pusher").start(() -> push(victim));
-			// the stalled upstream never reads, the inbound bound fills and the producer
-			// parks inside acceptData; sightings on two consecutive dumps pin the park
+			// the stalled upstream never reads, the client stops granting and the server
+			// relay parks waiting for credit; sightings on two consecutive dumps pin it
 			Awaitility.await()
 				.atMost(Duration.ofSeconds(30))
-				.alias("producer parked in VirtualConnection.acceptData")
-				.until(() -> anyThreadIn("am.ik.sluice.tunnel.VirtualConnection", "acceptData") && parkedAgain());
+				.alias("server relay parked in VirtualConnection.awaitCredit")
+				.until(() -> ThreadDumps.anyThreadWaitingForCredit() && parkedAgain());
 			// the local side ends: the relay's writes to the upstream fail and it closes
 			// the connection while the remote keeps pushing
 			for (Socket socket : stallUpstreams) {
 				socket.close();
 			}
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.alias("the server relay leaves the credit wait")
+				.until(() -> !ThreadDumps.anyThreadWaitingForCredit());
 			try (Socket peer = new Socket("127.0.0.1", echoRoutePort)) {
 				peer.setSoTimeout(10_000);
 				OutputStream out = peer.getOutputStream();
@@ -222,25 +223,70 @@ class TunnelBackpressureE2ETest {
 		}
 	}
 
+	/**
+	 * An upstream that answers and closes without reading the upload (a 413, say) must
+	 * not leave the server's writer waiting for credit: the client's side of the
+	 * connection is gone, so it tells the server with an ERROR, and the public peer gets
+	 * the answer and the end of the connection.
+	 */
+	@Test
+	void upstreamClosingWithoutReadingReleasesTheUploadingPeer() throws Exception {
+		CountDownLatch uploadStalled = new CountDownLatch(1);
+		CountDownLatch answer = new CountDownLatch(1);
+		int answering = upstream(socket -> answerWithoutReading(socket, uploadStalled, answer));
+		startClient(List.of(route("answer.local", answering, answerRoutePort)));
+		try (Socket peer = new Socket("127.0.0.1", answerRoutePort)) {
+			peer.setSoTimeout(10_000);
+			Thread.ofVirtual().name("e2e-bp-uploader").start(() -> push(peer));
+			uploadStalled.countDown();
+			// precondition: the upload is held by the credit the client withholds
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(30))
+				.alias("server relay parked in VirtualConnection.awaitCredit")
+				.until(() -> ThreadDumps.anyThreadWaitingForCredit() && parkedAgain());
+			answer.countDown();
+			byte[] response = peer.getInputStream().readNBytes(ANSWER.length);
+			assertThat(new String(response, java.nio.charset.StandardCharsets.US_ASCII))
+				.isEqualTo(new String(ANSWER, java.nio.charset.StandardCharsets.US_ASCII));
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.alias("the server relay leaves the credit wait")
+				.until(() -> !ThreadDumps.anyThreadWaitingForCredit());
+			try {
+				assertThat(peer.getInputStream().read()).as("the peer sees the end").isEqualTo(-1);
+			}
+			catch (IOException e) {
+				// a reset ends the connection too
+			}
+		}
+	}
+
+	private static final byte[] ANSWER = "HTTP/1.1 413 Content Too Large\r\ncontent-length: 0\r\n\r\n"
+		.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+
+	/**
+	 * Never reads; once told to, answers, half-closes (the client sends CLOSE) and then
+	 * closes with the upload unread.
+	 */
+	private static void answerWithoutReading(Socket socket, CountDownLatch uploadStalled, CountDownLatch answer) {
+		try (socket) {
+			uploadStalled.await();
+			answer.await();
+			OutputStream out = socket.getOutputStream();
+			out.write(ANSWER);
+			out.flush();
+			socket.shutdownOutput();
+			Thread.sleep(500);
+		}
+		catch (Exception e) {
+			// torn down
+		}
+	}
+
 	/** Second park sighting, after a pause, for the stability check above. */
 	private static boolean parkedAgain() throws Exception {
 		Thread.sleep(500);
-		return anyThreadIn("am.ik.sluice.tunnel.VirtualConnection", "acceptData");
-	}
-
-	/** Includes virtual threads, unlike Thread.getAllStackTraces. */
-	private static boolean anyThreadIn(String className, String methodName) throws Exception {
-		Path dump = Files.createTempDirectory("sluice-thread-dump").resolve("threads.txt");
-		try {
-			// dumpThreads refuses an existing path, hence the fresh directory per call
-			ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class)
-				.dumpThreads(dump.toString(), HotSpotDiagnosticMXBean.ThreadDumpFormat.TEXT_PLAIN);
-			return Files.readString(dump).contains(className + "." + methodName + "(");
-		}
-		finally {
-			Files.deleteIfExists(dump);
-			Files.deleteIfExists(dump.getParent());
-		}
+		return ThreadDumps.anyThreadWaitingForCredit();
 	}
 
 	private static void push(Socket socket) {

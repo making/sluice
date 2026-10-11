@@ -25,6 +25,7 @@ import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.route.Router;
+import am.ik.sluice.tunnel.VirtualConnection;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -204,8 +205,11 @@ class H2DemuxFlowControlE2ETest {
 			assertThat(client.closed()).as("the connection stays up (sent %d)", client.streamSent(1)).isFalse();
 			assertThat(answered && client.ended(3)).as("the other stream of the leg completes").isTrue();
 			assertThat(client.maxOvershoot()).isLessThanOrEqualTo(0);
+			// past the initial window, the relay's budget and the tunnel connection's
+			// credit
+			// window: the slow upstream's reads pace the stream
 			assertThat(client.streamSent(1)).as("the bulk stream got past the initial window")
-				.isGreaterThan(4L * 1024 * 1024);
+				.isGreaterThan(STREAM_BUDGET + 2L * VirtualConnection.DEFAULT_WINDOW);
 			assertThat(maxQueued.get()).as("queued for the bulk stream, plus the other stream's head")
 				.isGreaterThan(0)
 				.isLessThanOrEqualTo(STREAM_BUDGET + 1024);
