@@ -86,6 +86,7 @@ in the same investigation is todo 042.
 | 046-per-connection-flow-control-java | F1 (protocol + Java) | High | 043, 044, 045 |
 | 047-per-connection-flow-control-wasmlet | F5 | High | 046 |
 | 048-data-plane-connection-limits | memory bound (see "Residual after the children") | Medium | - (defaults derive from 044-046) |
+| 054-remove-legacy-flow-control | legacy removal (see "Follow-up"; not a child, the parent does not wait for it) | Medium | 047; no pre-046/047 peer deployed |
 
 Each child is one commit series with its own tests and docs. This parent is done when all
 children are, and the legacy-removal todo below is filed.
@@ -147,6 +148,12 @@ message Connect {
   "flow control window exceeded", close locally). The stream stays up.
 - **The receive path never blocks** on a windowed connection. The sender waits for credit
   on the connection's own producer, never on a shared thread.
+- **Local close while the peer may still send** (added by 046): a windowed connection
+  closed before the peer's CLOSE or ERROR arrived sends ERROR ("connection closed")
+  instead of CLOSE, like a TCP RST. Its later payload would be dropped and never granted,
+  so a peer writer waiting for credit would wait forever. A writer waiting for credit
+  gives up on the peer's ERROR. Grants are only sent for windowed connections; a
+  WindowUpdate for an unknown or legacy connection is ignored.
 
 ## Residual after the children
 
@@ -160,10 +167,11 @@ What 043-048 still leave open, by design or elsewhere. Do not report the parent 
   peer. That is protocol semantics, not tunnel HOL.
 - TCP-level HOL of the single transport connection: only a QUIC transport removes it.
   Out of scope (no todo).
-- Covered in the children, listed here so they are not lost: ADVERTISE handling on the
-  receive path and the credit-lock pitfall (046); total memory (048).
+- Covered in the children, listed here so they are not lost: total memory (048). (ADVERTISE
+  off the receive path and the credit-lock pitfall are done in 046.)
 
-## Follow-up (file as its own todo when 046 lands)
+## Follow-up
 
-Remove legacy mode (the blocking `acceptData`, `connection_window == 0` paths in Java and
-wasmlet) once no pre-046 client or server is deployed.
+Filed as `.todo/054-remove-legacy-flow-control.md`: remove legacy mode (the blocking
+`acceptData`, `connection_window == 0` paths in Java and wasmlet) once no pre-046 client
+or server is deployed.

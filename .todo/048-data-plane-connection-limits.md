@@ -6,9 +6,9 @@ Parent: `.todo/041-tunnel-head-of-line-blocking.md`. After 043-046, buffering is
 per connection (window, sender cap, h2 demux queue bound) but not in total: the total is
 per-connection worst case x connections, and the number of connections is unlimited. An
 anonymous peer can open many connections that never read and exhaust memory. Not HOL
-itself; it is what makes the parent's memory bound real. Can be done before or after
-046. The defaults depend on the per-connection worst case, so recompute them if 044-046
-change their caps.
+itself; it is what makes the parent's memory bound real. 046 is done (receive window
+1MiB per connection and direction). The defaults depend on the per-connection worst
+case, so recompute them if 044-046 change their caps.
 
 ## Today
 
