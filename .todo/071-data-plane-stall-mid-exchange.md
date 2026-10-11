@@ -12,6 +12,12 @@ of `sluice.limits.max-connections` (and, for h2, the leg and the queue behind it
   blocks the relay's write to it (`ReroutingRelay#writeToClient`,
   `Http2DemuxRelay#writeToClient`, `StreamRelay`). A response that fits the buffers
   completes and is then cut by the idle timeout; only the large ones escape.
+- Not granting (h2, since 062): a client that reads but never grants its connection
+  window keeps the response data waiting in the relay's response queue
+  (`Http2DemuxRelay#responseQueue`) and the stream open, so the idle timeout never
+  starts; after the upstream left, its leg waits in `awaitResponsesWritten`. A client gone
+  after its TCP half-close is noticed by the probe PINGs; one that keeps the connection
+  open is not.
 - Not sending: a request head announcing a body (`Content-Length`, chunked) followed by
   nothing, or by a byte now and then; on h2, a stream opened without END_STREAM and never
   continued. The upstream waits for the body, so no response ends the exchange either.
@@ -39,7 +45,8 @@ slow to answer is not the client's stall: waiting for a response must stay unbou
 ## Tests (`sluice-it`; watch each fail first)
 
 - h1: a client requesting a 16MiB response and never reading is closed within the timeout
-  plus a margin, and its slot released; the same for one h2 stream.
+  plus a margin, and its slot released; the same for one h2 stream, and for an h2 client
+  that reads but never grants its connection window.
 - h1: a request head with `Content-Length: 10` and no body is closed at the timeout; one
   dripping a byte every second past it is closed too (progress per byte must not keep it
   alive forever -- decide between a minimum rate and an overall body deadline); h2: a

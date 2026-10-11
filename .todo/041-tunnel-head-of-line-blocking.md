@@ -144,8 +144,8 @@ message Connect {
 - **Bounds**:
   - Memory per side = window x active connections; capped by the connection limits
     of 048 (derived default on the server since 057: 2.16MiB per virtual connection
-    plus an h2 relay's unbudgeted queue, and the shared h2 queue budget, in half the
-    max heap). Since 058 the receive buffer coalesces DATA payload into 16KiB
+    plus an h2 relay's unbudgeted queue and, since 062, one leg's response queue, and
+    the shared h2 queue budget, in half the max heap). Since 058 the receive buffer coalesces DATA payload into 16KiB
     segments, so tiny frames add no per-frame overhead: the window plus 37KiB.
   - Throughput per connection <= window / RTT (1MiB at 50ms ~ 20MiB/s).
 - **Grant rule**: the receiver sends WindowUpdate once its consumed-but-ungranted bytes
