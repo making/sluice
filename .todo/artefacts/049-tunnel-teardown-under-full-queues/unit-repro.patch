@@ -1,0 +1,60 @@
+diff --git a/sluice-proto/src/test/java/am/ik/sluice/tunnel/SessionSenderTest.java b/sluice-proto/src/test/java/am/ik/sluice/tunnel/SessionSenderTest.java
+index c599df3..5552d92 100644
+--- a/sluice-proto/src/test/java/am/ik/sluice/tunnel/SessionSenderTest.java
++++ b/sluice-proto/src/test/java/am/ik/sluice/tunnel/SessionSenderTest.java
+@@ -164,4 +164,24 @@ class SessionSenderTest {
+ 		}
+ 	}
+ 
++	@Test
++	void closeReturnsWithFullQueueOnReadyStream() throws Exception {
++		FakeServerObserver observer = new FakeServerObserver();
++		observer.ready.set(true);
++		SessionSender sender = new SessionSender(observer);
++		sender.start();
++		// the worker takes one frame and parks inside onNext; then fill the queue (256)
++		assertThat(sender.sendData(1, new byte[1])).isTrue();
++		assertThat(observer.enteredOnNext.await(5, TimeUnit.SECONDS)).isTrue();
++		for (int i = 0; i < 256; i++) {
++			assertThat(sender.sendData(1, new byte[1])).isTrue();
++		}
++		Thread closer = Thread.ofVirtual().start(sender::close);
++		Thread.sleep(200);
++		// the stream is healthy: the worker resumes and drains
++		observer.gate.countDown();
++		closer.join(TimeUnit.SECONDS.toMillis(10));
++		assertThat(closer.isAlive()).as("close returns with a full queue on a ready stream").isFalse();
++	}
++
+ }
+diff --git a/sluice-proto/src/test/java/am/ik/sluice/tunnel/VirtualConnectionTest.java b/sluice-proto/src/test/java/am/ik/sluice/tunnel/VirtualConnectionTest.java
+index 699a01f..35952b1 100644
+--- a/sluice-proto/src/test/java/am/ik/sluice/tunnel/VirtualConnectionTest.java
++++ b/sluice-proto/src/test/java/am/ik/sluice/tunnel/VirtualConnectionTest.java
+@@ -204,4 +204,26 @@ class VirtualConnectionTest {
+ 		assertThatThrownBy(() -> connection.source().read()).isInstanceOf(IOException.class).hasMessage("boom");
+ 	}
+ 
++	@Test
++	void acceptDataBlockedOnFullBoundReturnsAfterClose() throws Exception {
++		RecordingWriter writer = new RecordingWriter();
++		VirtualConnection connection = new VirtualConnection(9, writer);
++		byte[] chunk = new byte[1000];
++		for (int i = 0; i < 128; i++) { // fill the 128-chunk inbound bound
++			connection.acceptData(chunk);
++		}
++		CountDownLatch entered = new CountDownLatch(1);
++		Thread producer = Thread.ofVirtual().start(() -> {
++			entered.countDown();
++			connection.acceptData(chunk);
++		});
++		assertThat(entered.await(1, TimeUnit.SECONDS)).isTrue();
++		Thread.sleep(200);
++		assertThat(producer.isAlive()).as("precondition: producer parked on the full bound").isTrue();
++		// the local side gives up on the connection (relay ended)
++		connection.close();
++		producer.join(1000);
++		assertThat(producer.isAlive()).as("acceptData returns once the connection is closed").isFalse();
++	}
++
+ }

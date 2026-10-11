@@ -77,6 +77,7 @@ in the same investigation is todo 042.
 | todo | finding | difficulty | depends on |
 |---|---|---|---|
 | 043-tunnel-sender-backpressure-and-teardown | F2, F3, F6 (+ non-blocking markers) | Medium | - |
+| 049-tunnel-teardown-under-full-queues | 043 review follow-up | Medium | 043 |
 | 044-session-sender-fair-scheduling | F4 | Medium | 043 |
 | 045-h2-demux-per-leg-writers | F7 | Medium | 043, 044; before or with 046 |
 | 046-per-connection-flow-control-java | F1 (protocol + Java) | High | 043, 044, 045 |
@@ -84,7 +85,7 @@ in the same investigation is todo 042.
 | 048-data-plane-connection-limits | memory bound (see "Residual after the children") | Medium | - (defaults derive from 044-046) |
 
 Each child is one commit series with its own tests and docs. This parent is done when all
-six are, and the legacy-removal todo below is filed.
+seven are, and the legacy-removal todo below is filed.
 
 ## Protocol contract (shared by 046 and 047)
 
