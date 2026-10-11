@@ -1,6 +1,6 @@
 Difficulty: Medium
 
-# SessionSender: control priority and per-connection round-robin (041 child 2/5)
+# SessionSender: control priority and per-connection round-robin (041 child 2/6)
 
 Parent: `.todo/041-tunnel-head-of-line-blocking.md` (Finding F4). Depends on 043 (same
 class). No protocol change. 046 relies on the control queue added here.

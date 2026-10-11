@@ -81,9 +81,10 @@ in the same investigation is todo 042.
 | 045-h2-demux-per-leg-writers | F7 | Medium | 043, 044; before or with 046 |
 | 046-per-connection-flow-control-java | F1 (protocol + Java) | High | 043, 044, 045 |
 | 047-per-connection-flow-control-wasmlet | F5 | High | 046 |
+| 048-data-plane-connection-limits | memory bound (see "Residual after the children") | Medium | - (defaults derive from 044-046) |
 
 Each child is one commit series with its own tests and docs. This parent is done when all
-five are, and the legacy-removal todo below is filed.
+six are, and the legacy-removal todo below is filed.
 
 ## Protocol contract (shared by 046 and 047)
 
@@ -132,7 +133,8 @@ message Connect {
   protocol, a later tuning needs no protocol change. Rationale: grpc-java's default HTTP/2
   stream window is 1MiB, so one connection can still fill the stream as today.
 - **Bounds**:
-  - Memory per side = window x active connections.
+  - Memory per side = window x active connections; finite only with the connection
+    limit of 048.
   - Throughput per connection <= window / RTT (1MiB at 50ms ~ 20MiB/s).
 - **Grant rule**: the receiver sends WindowUpdate once its consumed-but-ungranted bytes
   reach half the window. Consumed means handed to the local consumer, not merely
@@ -141,6 +143,21 @@ message Connect {
   "flow control window exceeded", close locally). The stream stays up.
 - **The receive path never blocks** on a windowed connection. The sender waits for credit
   on the connection's own producer, never on a shared thread.
+
+## Residual after the children
+
+What 043-048 still leave open, by design or elsewhere. Do not report the parent as
+"HOL solved" without these caveats.
+- Legacy peers keep the stream-wide stall on their connections until legacy removal
+  (follow-up below).
+- wasmlet: a CPU-bound guest stalls every connection by holding a tokio worker (042, not
+  a tunnel mechanism).
+- Inside one public connection, h1 is sequential and h2 shares one TCP socket to the
+  peer. That is protocol semantics, not tunnel HOL.
+- TCP-level HOL of the single transport connection: only a QUIC transport removes it.
+  Out of scope (no todo).
+- Covered in the children, listed here so they are not lost: ADVERTISE handling on the
+  receive path and the credit-lock pitfall (046); total memory (048).
 
 ## Follow-up (file as its own todo when 046 lands)
 

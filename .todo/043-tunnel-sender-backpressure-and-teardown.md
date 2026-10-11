@@ -1,6 +1,6 @@
 Difficulty: Medium
 
-# Tunnel sender backpressure and teardown fixes (041 child 1/5)
+# Tunnel sender backpressure and teardown fixes (041 child 1/6)
 
 Parent: `.todo/041-tunnel-head-of-line-blocking.md` (read Findings F2, F3, F6, F1). No
 protocol change. Order: 043 -> 044 -> 045 -> 046 -> 047.

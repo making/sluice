@@ -1,6 +1,6 @@
 Difficulty: Medium
 
-# h2 demux: one stalled leg must not stall the client connection (041 child 3/5)
+# h2 demux: one stalled leg must not stall the client connection (041 child 3/6)
 
 Parent: `.todo/041-tunnel-head-of-line-blocking.md` (Finding F7). Depends on 043 and 044:
 they make a leg's writes block per connection, which exposes this. It must land before

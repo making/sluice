@@ -1,6 +1,6 @@
 Difficulty: High
 
-# Per-connection credit flow control: wasmlet (041 child 5/5)
+# Per-connection credit flow control: wasmlet (041 child 5/6)
 
 Parent: `.todo/041-tunnel-head-of-line-blocking.md` (Finding F5, section "Protocol
 contract"). Depends on 046: the proto and Java side define and test the contract. Code:

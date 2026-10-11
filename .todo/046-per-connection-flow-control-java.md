@@ -1,6 +1,6 @@
 Difficulty: High
 
-# Per-connection credit flow control: protocol + Java (041 child 4/5)
+# Per-connection credit flow control: protocol + Java (041 child 4/6)
 
 Parent: `.todo/041-tunnel-head-of-line-blocking.md` (Finding F1, section "Protocol
 contract": implement exactly that contract; 047 implements the same in Rust). Depends on
@@ -56,7 +56,31 @@ branches of both `handle` switches.
   - The wait wakes on grant, `close()`, remote failure, and sender death (043); the last
     three throw `IOException`.
   - No timeout: the wait blocks only this connection's producer.
+  - **Pitfall:** never hold the credit lock while calling the `FrameWriter`. The send can
+    block at 044's per-connection cap. If the lock were held, `grant()` on the gRPC
+    receive path would wait for it and the stream-wide stall would be back. Take the
+    credit under the lock, release it, then send. Today's `Sink#write` already releases
+    `writeLock` before `sendData`; keep that shape.
 - **Send, legacy**: unchanged.
+
+### ADVERTISE off the receive path
+
+`TunnelSession#handle` runs ADVERTISE inline, which calls `Router#register` and
+`TcpPortGateway#reconcile`. `reconcile` is `synchronized` across all sessions, and its
+`bind` retries a failed bind after 100ms sleeps (up to 200ms per port). For that time
+the session's receive path stalls every connection. A client re-advertises its rejected
+ports with a 1-30s backoff, so the stall repeats.
+
+- Hand ADVERTISE to a per-session serial executor: one virtual thread, or a
+  single-threaded executor. Advertises stay in order, and the AdvertiseAck is still sent
+  after the registration.
+- Race with `TunnelSession#close`: an advertise that runs after `close()` would
+  re-register the routes of a dead session. Run close's route removal (`router.remove`,
+  `reconcile(clientId, Set.of())`) on the same executor after the queued advertises, or
+  check `closed` under one lock shared with the removal. `close()` must still return
+  without waiting for a stuck advertise; use a bounded wait, then shut the executor down.
+- `NodeConnection` (client) needs no change: its listener callbacks already run on the
+  supervisor executor.
 
 ### Writers and callers
 
@@ -75,6 +99,15 @@ branches of both `handle` switches.
 
 ## Tests (watch each fail first)
 
+- Lock pitfall: a windowed writer blocked at 044's per-connection cap (fake observer not
+  ready); `grant()` from another thread returns within 100ms.
+- ADVERTISE (`sluice-server`, unit test with a fake `TcpRouteListener` whose `reconcile`
+  sleeps 2s):
+  - `TunnelSession#handle(ADVERTISE)` returns within 100ms, and a DATA handled right after
+    reaches its connection at once;
+  - `close()` while that advertise is pending: once both finish, `Router` has no route of
+    the client and the fake saw `reconcile(clientId, {})` last;
+  - `close()` with an advertise stuck in `reconcile` returns within the bounded wait.
 - `VirtualConnectionTest`, windowed:
   - `acceptData` returns within 100ms with exactly `window` bytes buffered and no reader;
   - one more byte -> ERROR recorded by the fake writer, and the reader gets `IOException`;
