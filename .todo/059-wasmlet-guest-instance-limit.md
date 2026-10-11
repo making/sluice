@@ -20,5 +20,5 @@ slot within its budget, or is answered 503. Relate it to hyper's h2
 
 - With a cap of 1, a second concurrent request waits (or gets 503) while the first runs,
   and completes after it.
-- The cap is released when a request ends by its budget, by the client leaving, and by
-  a guest trap.
+- The cap is released when a request ends by its budget, by the client leaving (the
+  server's ERROR; its CLOSE is a half-close), and by a guest trap.
