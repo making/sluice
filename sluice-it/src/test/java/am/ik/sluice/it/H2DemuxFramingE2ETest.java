@@ -107,6 +107,7 @@ class H2DemuxFramingE2ETest {
 		startClient(route, stub(socket -> checkRequestBlocks(socket, violation, heads, continuations)));
 		byte[] bigBlock = bigRequestHead(route);
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
+			unboundedStreamWindows(client);
 			client.headers(1, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/stream"));
 			sendRequests(client, bigBlock, violation);
 			Awaitility.await()
@@ -133,6 +134,7 @@ class H2DemuxFramingE2ETest {
 		startClient(big, stub(H2DemuxFramingE2ETest::answerWithBigHeads));
 		AtomicReference<String> violation = new AtomicReference<>("");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 3)) {
+			unboundedStreamWindows(client);
 			client.headers(1, true, TestH2.headerBlock(":authority=" + streaming, ":method=GET", ":path=/stream"));
 			Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> client.dataReceived() > 0);
 			byte[] block = TestH2.headerBlock(":authority=" + big, ":method=GET", ":path=/big");
@@ -351,11 +353,13 @@ class H2DemuxFramingE2ETest {
 			InputStream in = socket.getInputStream();
 			OutputStream out = socket.getOutputStream();
 			Queue<byte[]> responses = new ConcurrentLinkedQueue<>();
+			SendWindow window = new SendWindow();
 			in.readNBytes(TestH2.PREFACE.length);
 			int blockOf = -1;
 			boolean streaming = false;
 			TestH2.@Nullable Frame frame;
 			while ((frame = TestH2.readFrame(in)) != null) {
+				window.credit(frame);
 				if (blockOf != -1 && (frame.type() != TestH2.CONTINUATION || frame.streamId() != blockOf)) {
 					violation.compareAndSet("", "type=%d stream=%d inside the header block of stream %d"
 						.formatted(frame.type(), frame.streamId(), blockOf));
@@ -375,7 +379,7 @@ class H2DemuxFramingE2ETest {
 				}
 				if (!streaming && frame.type() == TestH2.HEADERS && frame.streamId() == 1) {
 					streaming = true;
-					Thread.ofVirtual().start(() -> writeEndlessly(out, responses));
+					Thread.ofVirtual().start(() -> writeEndlessly(out, responses, window));
 				}
 			}
 		}
@@ -403,12 +407,14 @@ class H2DemuxFramingE2ETest {
 			InputStream in = socket.getInputStream();
 			OutputStream out = socket.getOutputStream();
 			in.readNBytes(TestH2.PREFACE.length);
+			SendWindow window = new SendWindow();
 			TestH2.@Nullable Frame frame;
 			boolean streaming = false;
 			while ((frame = TestH2.readFrame(in)) != null) {
+				window.credit(frame);
 				if (!streaming && frame.type() == TestH2.HEADERS) {
 					streaming = true;
-					Thread.ofVirtual().start(() -> writeEndlessly(out, new ConcurrentLinkedQueue<>()));
+					Thread.ofVirtual().start(() -> writeEndlessly(out, new ConcurrentLinkedQueue<>(), window));
 				}
 			}
 		}
@@ -418,10 +424,44 @@ class H2DemuxFramingE2ETest {
 	}
 
 	/**
-	 * The stub's only writer: an endless response on stream 1 at about 16MiB/s, the
-	 * queued responses written between its frames.
+	 * Announces stream windows of 2^31-1, relayed to the upstreams: a stub streaming
+	 * endlessly is bound by the connection window the relay grants it alone.
 	 */
-	private static void writeEndlessly(OutputStream out, Queue<byte[]> responses) {
+	private static void unboundedStreamWindows(H2TestClient client) throws IOException {
+		client.frame(TestH2.SETTINGS, 0, 0,
+				WindowedH2Upstream.setting(WindowedH2Upstream.SETTINGS_INITIAL_WINDOW_SIZE, Integer.MAX_VALUE));
+	}
+
+	/**
+	 * The connection window the relay granted a stub upstream: its reader credits the
+	 * relay's grants, its writer takes from it before every DATA frame.
+	 */
+	private static final class SendWindow {
+
+		private long window = WindowedH2Upstream.DEFAULT_WINDOW;
+
+		synchronized void credit(TestH2.Frame frame) {
+			if (frame.type() == TestH2.WINDOW_UPDATE && frame.streamId() == 0) {
+				this.window += TestH2.increment(frame);
+				notifyAll();
+			}
+		}
+
+		synchronized void take(int length) throws InterruptedException {
+			while (this.window < length) {
+				wait();
+			}
+			this.window -= length;
+		}
+
+	}
+
+	/**
+	 * The stub's only writer: an endless response on stream 1 at about 16MiB/s within the
+	 * connection window the relay granted, the queued responses written between its
+	 * frames.
+	 */
+	private static void writeEndlessly(OutputStream out, Queue<byte[]> responses, SendWindow window) {
 		try {
 			TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
 			TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS, 1, new byte[] { (byte) 0x88 });
@@ -430,6 +470,7 @@ class H2DemuxFramingE2ETest {
 				for (byte[] response = responses.poll(); response != null; response = responses.poll()) {
 					out.write(response);
 				}
+				window.take(chunk.length);
 				TestH2.writeFrame(out, TestH2.DATA, 0, 1, chunk);
 				if (i % 16 == 15) {
 					Thread.sleep(1);

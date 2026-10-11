@@ -36,8 +36,9 @@ import io.micrometer.core.instrument.MeterRegistry;
  * several routes takes one more slot per further leg ({@link #tryAcquireLeg()}). An unset
  * cap is derived so that the worst case of every slot -- the buffering of one virtual
  * connection ({@link ConnectionLimit#CONNECTION_BYTES}) plus what an h2 demux relay
- * queues outside the budget ({@link Http2DemuxRelay#UNBUDGETED_BYTES}) -- and the budget
- * fit in half the maximum heap.
+ * queues outside the budget ({@link Http2DemuxRelay#UNBUDGETED_BYTES}) and what one of
+ * its legs holds for the client ({@link Http2DemuxRelay#RESPONSE_QUEUE_BYTES}) -- and the
+ * budget fit in half the maximum heap.
  * <p>
  * A connection is admitted at accept ({@link #admit}) and holds its {@link Admission}
  * until it ended and the frames its virtual connections queued left the tunnel sender (a
@@ -122,9 +123,13 @@ public class ConnectionLimits implements DisposableBean {
 				limits.h2QueueBudget().toBytes() > 0 ? "configured" : "derived: an eighth of half of max heap");
 	}
 
-	/** The worst case of one slot: a virtual connection plus an h2 relay's own queue. */
+	/**
+	 * The worst case of one slot: a virtual connection plus an h2 relay's own queue and
+	 * one leg's response queue.
+	 */
 	static long connectionBytes() {
-		return ConnectionLimit.CONNECTION_BYTES + Http2DemuxRelay.UNBUDGETED_BYTES;
+		return ConnectionLimit.CONNECTION_BYTES + Http2DemuxRelay.UNBUDGETED_BYTES
+				+ Http2DemuxRelay.RESPONSE_QUEUE_BYTES;
 	}
 
 	/** The h2 queue budget an unset value derives: an eighth of half the heap. */

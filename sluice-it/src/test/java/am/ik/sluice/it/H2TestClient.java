@@ -26,6 +26,12 @@ import org.jspecify.annotations.Nullable;
  * the bytes. The reader thread records the relay's settings, window grants, resets,
  * GOAWAY, the stream ends, and whether any frame landed inside a header block (RFC 9113
  * 6.10).
+ * <p>
+ * As a receiver it keeps its connection window: every DATA frame received is charged to
+ * it, padding included, and the largest excess over what it granted is kept. By default
+ * it grants back every frame's bytes on receipt; {@link #paceConnectionGrants} and
+ * {@link #withholdConnectionWindow} make it sparser. Stream windows are never granted:
+ * the initial stream window it announces bounds each stream.
  */
 public final class H2TestClient implements AutoCloseable {
 
@@ -76,6 +82,26 @@ public final class H2TestClient implements AutoCloseable {
 	private final List<byte[]> pingAcks = new CopyOnWriteArrayList<>();
 
 	private final AtomicBoolean closed = new AtomicBoolean();
+
+	/** The connection window the relay may still send into, as granted. */
+	private final AtomicLong receiveWindow = new AtomicLong(INITIAL_WINDOW);
+
+	/** The largest {@code received - granted} ever seen; above 0 is a breach. */
+	private final AtomicLong maxReceiveExcess = new AtomicLong(Long.MIN_VALUE);
+
+	private final Map<Integer, AtomicLong> streamReceived = new ConcurrentHashMap<>();
+
+	private final Object grantLock = new Object();
+
+	/**
+	 * The connection grant policy: 0 grants every frame on receipt, a positive step is
+	 * paced by {@link #paceConnectionGrants}, -1 grants nothing; guarded by
+	 * {@link #grantLock}.
+	 */
+	private int grantStep;
+
+	/** Received and not granted back yet; guarded by {@link #grantLock}. */
+	private long ungranted;
 
 	private H2TestClient(Socket socket, Set<Integer> collected) throws IOException {
 		this.socket = socket;
@@ -154,9 +180,11 @@ public final class H2TestClient implements AutoCloseable {
 			}
 			case TestH2.DATA -> {
 				this.dataReceived.addAndGet(frame.payload().length);
+				this.streamReceived.computeIfAbsent(streamId, id -> new AtomicLong()).addAndGet(frame.payload().length);
 				if ((frame.flags() & TestH2.FLAG_END_STREAM) != 0) {
 					this.ended.add(streamId);
 				}
+				onDataReceived(frame.payload().length);
 			}
 			case TestH2.HEADERS -> {
 				if ((frame.flags() & TestH2.FLAG_END_STREAM) != 0) {
@@ -177,6 +205,95 @@ public final class H2TestClient implements AutoCloseable {
 				// not tracked
 			}
 		}
+	}
+
+	/** Charges the connection window and grants back as the policy says. */
+	private void onDataReceived(int length) {
+		long window = this.receiveWindow.addAndGet(-length);
+		this.maxReceiveExcess.accumulateAndGet(-window, Math::max);
+		synchronized (this.grantLock) {
+			this.ungranted += length;
+			grantDueLocked();
+		}
+	}
+
+	private void grantDueLocked() {
+		if (this.grantStep == 0 && this.ungranted > 0) {
+			grantConnection(this.ungranted);
+			this.ungranted = 0;
+		}
+	}
+
+	private void grantConnection(long increment) {
+		try {
+			frame(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32((int) increment));
+			this.receiveWindow.addAndGet(increment);
+		}
+		catch (IOException e) {
+			// the connection is gone, or half-closed: nothing was granted
+		}
+	}
+
+	/**
+	 * Grants every DATA frame's bytes on receipt from now on, and what was received and
+	 * not granted so far at once.
+	 */
+	public void grantConnectionWindowOnReceipt() {
+		synchronized (this.grantLock) {
+			this.grantStep = 0;
+			grantDueLocked();
+		}
+	}
+
+	/**
+	 * Grants the connection window {@code step} bytes at a time, at most one grant per
+	 * {@code interval} and only for bytes received and not granted yet: a reader
+	 * consuming slowly, which a sender ignoring the window outpaces.
+	 */
+	public void paceConnectionGrants(int step, Duration interval) {
+		synchronized (this.grantLock) {
+			this.grantStep = step;
+		}
+		Thread.ofVirtual().name("e2e-h2-client-granter").start(() -> {
+			while (!this.closed.get()) {
+				try {
+					Thread.sleep(interval);
+				}
+				catch (InterruptedException e) {
+					return;
+				}
+				synchronized (this.grantLock) {
+					if (this.grantStep != step) {
+						return;
+					}
+					if (this.ungranted >= step) {
+						grantConnection(step);
+						this.ungranted -= step;
+					}
+				}
+			}
+		});
+	}
+
+	/** Grants no connection window from now on: the relay keeps what it holds. */
+	public void withholdConnectionWindow() {
+		synchronized (this.grantLock) {
+			this.grantStep = -1;
+		}
+	}
+
+	/**
+	 * The largest excess of the DATA received over the connection window granted; at most
+	 * 0 when the relay honored it.
+	 */
+	public long maxReceiveExcess() {
+		return this.maxReceiveExcess.get();
+	}
+
+	/** The DATA payload received on the stream, padding included. */
+	public long dataReceived(int streamId) {
+		AtomicLong received = this.streamReceived.get(streamId);
+		return received == null ? 0 : received.get();
 	}
 
 	private AtomicLong windowOf(int streamId) {

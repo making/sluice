@@ -7,7 +7,9 @@ import java.net.Socket;
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 import org.jspecify.annotations.Nullable;
 
@@ -18,7 +20,7 @@ import org.jspecify.annotations.Nullable;
  * the old value until it processed them, 6.9.3); every DATA frame is checked against both
  * windows and the largest excess kept, above 0 a violation. Sending: {@link #sendData}
  * waits for the windows the relay advertised, which only a thread calling {@link #next}
- * concurrently can replenish.
+ * concurrently can replenish, and stops on a stream either side reset.
  */
 public final class WindowedH2Upstream implements AutoCloseable {
 
@@ -69,6 +71,12 @@ public final class WindowedH2Upstream implements AutoCloseable {
 	private final Map<Integer, Long> sendStreamWindows = new HashMap<>();
 
 	private boolean eof;
+
+	/** The flow-controlled bytes of every DATA frame sent, padding included. */
+	private long sent;
+
+	/** The streams either side reset; {@link #sendData} stops on them. */
+	private final Set<Integer> resetStreams = new HashSet<>();
 
 	private WindowedH2Upstream(Socket socket) throws IOException {
 		this.socket = socket;
@@ -127,6 +135,7 @@ public final class WindowedH2Upstream implements AutoCloseable {
 					this.sendStreamWindows.putIfAbsent(streamId, this.sendInitialWindow);
 				}
 				case TestH2.DATA -> onData(streamId, frame.payload().length);
+				case TestH2.RST_STREAM -> this.resetStreams.add(streamId);
 				case TestH2.SETTINGS -> {
 					if ((frame.flags() & TestH2.FLAG_ACK) != 0) {
 						onSettingsAck();
@@ -233,6 +242,9 @@ public final class WindowedH2Upstream implements AutoCloseable {
 					if (this.eof) {
 						throw new IOException("the relay went away");
 					}
+					if (this.resetStreams.contains(streamId)) {
+						return;
+					}
 					long available = Math.min(this.sendConnectionWindow,
 							this.sendStreamWindows.getOrDefault(streamId, this.sendInitialWindow));
 					n = (int) Math.min(Math.min(payload.length - offset, MAX_FRAME_SIZE), Math.max(0, available));
@@ -242,6 +254,7 @@ public final class WindowedH2Upstream implements AutoCloseable {
 					wait();
 				}
 				int sent = n;
+				this.sent += sent;
 				this.sendConnectionWindow -= sent;
 				this.sendStreamWindows.merge(streamId, this.sendInitialWindow - sent,
 						(window, ignored) -> window - sent);
@@ -252,6 +265,60 @@ public final class WindowedH2Upstream implements AutoCloseable {
 			offset += n;
 		}
 		while (offset < payload.length);
+	}
+
+	/**
+	 * Sends one padded DATA frame -- the pad length octet, the content, {@code padLength}
+	 * zero octets -- once both windows the relay advertised admit all of it.
+	 */
+	public void sendPadded(int streamId, byte[] content, int padLength, boolean endStream)
+			throws IOException, InterruptedException {
+		byte[] payload = new byte[1 + content.length + padLength];
+		payload[0] = (byte) padLength;
+		System.arraycopy(content, 0, payload, 1, content.length);
+		synchronized (this) {
+			while (Math.min(this.sendConnectionWindow,
+					this.sendStreamWindows.getOrDefault(streamId, this.sendInitialWindow)) < payload.length) {
+				if (this.eof) {
+					throw new IOException("the relay went away");
+				}
+				wait();
+			}
+			this.sent += payload.length;
+			this.sendConnectionWindow -= payload.length;
+			this.sendStreamWindows.merge(streamId, this.sendInitialWindow - payload.length,
+					(window, ignored) -> window - payload.length);
+		}
+		write(TestH2.DATA, TestH2.FLAG_PADDED | (endStream ? TestH2.FLAG_END_STREAM : 0), streamId, payload);
+	}
+
+	/** Resets the stream: {@link #sendData} stops on it. */
+	public void reset(int streamId, int errorCode) throws IOException {
+		synchronized (this) {
+			this.resetStreams.add(streamId);
+			notifyAll();
+		}
+		write(TestH2.RST_STREAM, 0, streamId, TestH2.int32(errorCode));
+	}
+
+	/** The flow-controlled bytes of the DATA sent so far, padding included. */
+	public synchronized long sent() {
+		return this.sent;
+	}
+
+	/** Writes the bytes as they are, in one write. */
+	public void raw(byte[] bytes) throws IOException {
+		synchronized (this.writeLock) {
+			this.out.write(bytes);
+			this.out.flush();
+		}
+	}
+
+	/** Waits until a thread calling {@link #next} read EOF. */
+	public synchronized void awaitEof() throws InterruptedException {
+		while (!this.eof) {
+			wait();
+		}
 	}
 
 	/** Writes a frame as given. */
@@ -309,6 +376,12 @@ public final class WindowedH2Upstream implements AutoCloseable {
 	/** The connection-level grants the relay sent for this upstream's DATA. */
 	public synchronized long connectionGrantsReceived() {
 		return this.connectionGrantsReceived;
+	}
+
+	/** Closes the connection with a TCP reset (SO_LINGER 0). */
+	public void abort() throws IOException {
+		this.socket.setSoLinger(true, 0);
+		this.socket.close();
 	}
 
 	@Override

@@ -166,9 +166,26 @@ public final class TestH2 {
 	}
 
 	public static String bodyOf(List<Frame> frames) {
+		return new String(contentOf(frames), StandardCharsets.UTF_8);
+	}
+
+	/** The DATA content of the frames, padding stripped. */
+	public static byte[] contentOf(List<Frame> frames) {
 		ByteArrayOutputStream body = new ByteArrayOutputStream();
-		frames.stream().filter(frame -> frame.type == DATA).forEach(frame -> body.writeBytes(frame.payload()));
-		return body.toString(StandardCharsets.UTF_8);
+		for (Frame frame : frames) {
+			if (frame.type != DATA) {
+				continue;
+			}
+			byte[] payload = frame.payload();
+			if ((frame.flags & FLAG_PADDED) != 0 && payload.length > 0) {
+				int padLength = payload[0] & 0xff;
+				body.write(payload, 1, payload.length - 1 - padLength);
+			}
+			else {
+				body.writeBytes(payload);
+			}
+		}
+		return body.toByteArray();
 	}
 
 	/**
@@ -193,7 +210,7 @@ public final class TestH2 {
 	 * Reads and discards frames up to the completed client request head, contents unused;
 	 * tolerates any framing the relay produced (settings, continuations).
 	 */
-	static void readClientHead(java.io.InputStream in) throws IOException {
+	public static void readClientHead(java.io.InputStream in) throws IOException {
 		if (in.readNBytes(PREFACE.length).length < PREFACE.length) {
 			return;
 		}

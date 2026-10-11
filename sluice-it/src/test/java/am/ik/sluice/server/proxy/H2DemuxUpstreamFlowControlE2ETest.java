@@ -476,9 +476,11 @@ class H2DemuxUpstreamFlowControlE2ETest {
 			}
 		}));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
-			// the client's stream window covers the response; it sends nothing more
+			// the client's stream and connection windows cover the response: it can grant
+			// nothing once half-closed
 			client.frame(TestH2.SETTINGS, 0, 0,
 					WindowedH2Upstream.setting(WindowedH2Upstream.SETTINGS_INITIAL_WINDOW_SIZE, 4 * length));
+			client.frame(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(4 * length));
 			client.headers(1, true, get(route));
 			client.halfClose();
 			assertThat(client.awaitEnd(1, Duration.ofSeconds(20))).as("received %d", client.dataReceived()).isTrue();

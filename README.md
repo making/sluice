@@ -561,10 +561,16 @@ read stop at the budget plus what each queues outside it: its 128KiB, the 64KiB 
 connection window it still holds, and per stream a buffer rounding (under 1KiB), a reset
 and a window update, about 295KiB (`Http2DemuxRelay.UNBUDGETED_BYTES`).
 
+Towards the client, each leg holds what the client's connection window does not admit
+yet: at most the 64KiB of connection window the relay granted its upstream (granted back
+only as that data is written to the client), plus trailers waiting behind it up to one
+header block (about 64KiB; past it the leg stops reading its upstream until the client
+grants) and per stream a buffer rounding, about 228KiB (`Http2DemuxRelay.RESPONSE_QUEUE_BYTES`).
+
 An unset (`0`) budget is an eighth of half the max heap, and an unset (`0`) connection
-limit is derived so that the worst case of every slot (2.16MiB + 295KiB) and the budget
-fit in half the max heap: `max(1, (max heap / 2 - budget) / 2.45MiB)`, e.g. 71 for a
-400MiB heap, 731 for 4GiB. The effective values are logged at startup (`data plane
+limit is derived so that the worst case of every slot (2.16MiB + 295KiB + 228KiB) and the
+budget fit in half the max heap: `max(1, (max heap / 2 - budget) / 2.67MiB)`, e.g. 65 for
+a 400MiB heap, 670 for 4GiB. The effective values are logged at startup (`data plane
 connection limit` / `upstream connection limit`) and exported as gauges; with the 512Mi
 container of `k8s.md` they follow the heap the server gets there.
 
@@ -680,6 +686,6 @@ docker run sluice-client --sluice.server-url=grpc://host.docker.internal:8001 \
 
 - The data plane relays raw bytes. With `rewrite-host=true` the authority (`Host` / `:authority`) is rewritten on every request of the connection by a best-effort stream rewriter (both HTTP/1.1 and h2): upgraded connections (WebSocket, h2c upgrade, CONNECT) are rewritten up to the protocol switch, and any head or frame the rewriter cannot reproduce (non ASCII headers, HPACK failures) degrades that connection to verbatim passthrough.
 - h2 specific: the rewriter assumes the upstream negotiates the spec-default frame and HPACK limits (16 KiB max frame size, 4096 header table size, 64 KiB header list) and does not track tighter upstream SETTINGS values.
-- h2 flow control (plaintext and TLS-terminated h2): request DATA towards an upstream stays within the upstream's stream and connection windows (its SETTINGS, mid-stream changes included, and its WINDOW_UPDATEs); a stream without window does not hold back the other streams to that upstream. A client that half-closes its TCP connection after its requests still gets the responses: each upstream connection is half-closed only once its responses ended. On the response path the client's connection window is not tracked, only its stream windows (relayed to the upstream): a client granting its connection window more sparingly than the sum of its stream windows can receive more than it granted.
+- h2 flow control (plaintext and TLS-terminated h2): request DATA towards an upstream stays within the upstream's stream and connection windows (its SETTINGS, mid-stream changes included, and its WINDOW_UPDATEs); a stream without window does not hold back the other streams to that upstream. A client that half-closes its TCP connection after its requests still gets the responses, within the windows it granted before (it can grant no more): each upstream connection is half-closed only once its responses ended. On the response path the relay honors the client's connection window: response DATA of every upstream stays within it, the streams taking turns, while the client's stream windows bind each upstream (its settings and stream window updates are relayed). An upstream whose data waits for the client's window is held back by its own connection window, and its connection keeps being read (pings, window updates, the heads of other streams), except past one header block of trailers waiting behind data. A client WINDOW_UPDATE taking the connection window past 2^31-1 ends the connection with GOAWAY `FLOW_CONTROL_ERROR`; an upstream sending past the window the relay granted it ends the relay. A client that never grants window holds the waiting data, and the leg, with no deadline.
 - h2 framing limits (plaintext and TLS-terminated h2): the relay announces neither a larger frame size nor a larger header list to either side, so a client frame above 16KiB ends the connection with GOAWAY `FRAME_SIZE_ERROR`, a client header block above 64KiB (HEADERS plus its CONTINUATIONs) with GOAWAY `ENHANCE_YOUR_CALM`, and the same from an upstream (or interleaved header blocks) ends the relay. The client's `SETTINGS_MAX_FRAME_SIZE` is not relayed to the upstreams.
 - Upstream without HTTP/2 support: set `force-http1=true` on the upstream so the data plane's TLS termination offers http/1.1 first in ALPN and ingress falls back to HTTP/1.1. The preference applies to the route resolved from the ClientHello SNI (ingress by bare IP sends no SNI and resolves via the catch-all route). Plaintext connections are not converted: an h2c prior-knowledge client reaches the upstream with h2 frames as-is.
