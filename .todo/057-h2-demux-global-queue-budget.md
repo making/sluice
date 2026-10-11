@@ -14,7 +14,10 @@ slot but can hold far more:
 
 With the derived limit the h2 worst case is about 12x what the heap budget assumes, so
 an anonymous peer opening h2 connections whose upstreams do not read can still exhaust
-memory. README "Connection limits" states the gap.
+memory. README "Connection limits" states the gap. Since 053 the relay grants the
+client each stream's budget whatever the upstream grants, and holds the data until the
+upstream's window admits it: any upstream that stops granting (not only one granting
+ahead of reading) fills its streams' budgets.
 
 ## Direction
 
