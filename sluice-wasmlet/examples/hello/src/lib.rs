@@ -35,6 +35,8 @@ impl Guest for Component {
         loop {
             let (status, buf) = body.read(chunk).await;
             chunk = buf;
+            // a read fills only the spare capacity: empty it for the next
+            chunk.clear();
             match status {
                 StreamResult::Complete(n) => body_len += n,
                 StreamResult::Dropped | StreamResult::Cancelled => break,

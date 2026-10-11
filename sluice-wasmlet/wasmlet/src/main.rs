@@ -30,11 +30,10 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 mod pb {
@@ -42,10 +41,12 @@ mod pb {
 }
 
 mod tls;
+mod tunnel;
 mod wasm_host;
 
 use pb::frame::Body;
-use pb::{Advertise, Error, Frame, Upstream};
+use pb::{Advertise, Frame, Upstream};
+use tunnel::{Connections, Outbound};
 use wasm_host::{Handler, Locator, Sandbox};
 
 struct Route {
@@ -72,23 +73,6 @@ const BACKOFF_MAX_SECS: u64 = 30;
 /// reconnect loop.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Downstream control for one virtual connection, consumed by its serve task.
-enum Ctrl {
-    /// Bytes to write into the connection (hyper's read side).
-    Payload(Vec<u8>),
-    /// The server half-closed: no more tunnel -> hyper data.
-    WriteClose,
-    /// The connection failed on the tunnel side: tear it down.
-    Abort,
-}
-
-/// conn id -> sender into that connection's serve task; one per stream
-/// attempt, since conn ids are the server's.
-type Registry = Arc<Mutex<HashMap<i64, mpsc::Sender<Ctrl>>>>;
-
-/// Frames received before the serve task starts are absorbed by this buffer.
-const SERVE_BUFFER: usize = 32;
-
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// State shared by every node session.
@@ -102,7 +86,7 @@ struct Shared {
     /// Target (`wasm:<locator>[?<sandbox>]`) -> its handler; the dial address
     /// key. The target carries the sandbox, so routes sharing a component
     /// with different sandboxes stay distinct.
-    components: HashMap<String, Arc<Handler>>,
+    components: Arc<HashMap<String, Arc<Handler>>>,
 }
 
 /// One tunnel stream toward one node. The supervisor's `Arc` identity survives
@@ -269,7 +253,7 @@ async fn run(config: Config) -> Result<(), BoxError> {
         insecure,
         ca_pem,
         advertised,
-        components,
+        components: Arc::new(components),
     });
 
     let (tx, rx) = mpsc::channel::<Event>(32);
@@ -445,33 +429,29 @@ impl NodeTask {
         }
         let channel = endpoint.connect().await?;
 
-        // The bidi stream: outbound frames flow through `tx`, inbound via `inbound`.
-        let (tx, rx) = mpsc::channel::<Frame>(64);
-        let mut request = tonic::Request::new(ReceiverStream::new(rx));
+        // The bidi stream: outbound frames flow through the two lanes of
+        // `outbound`, inbound via `inbound`.
+        let (outbound, frames) = Outbound::new();
+        outbound.control(Frame {
+            body: Some(Body::Advertise(Advertise {
+                upstreams: self.shared.advertised.clone(),
+                connection_window: tunnel::WINDOW,
+            })),
+        });
+        let mut request = tonic::Request::new(frames);
         identify(&mut request, &self.shared.token, &self.shared.id)?;
         let inbound = <pb::tunnel_client::TunnelClient<_>>::new(channel.clone())
             .connect(request)
             .await?
             .into_inner();
 
-        tx.send(Frame {
-            body: Some(Body::Advertise(Advertise {
-                upstreams: self.shared.advertised.clone(),
-                // no per-connection flow control yet: every connection is legacy
-                connection_window: 0,
-            })),
-        })
-        .await?;
-
-        let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
-        let established = self.stream(inbound, &tx, &registry, &channel).await;
+        let connections =
+            Connections::new(self.key.clone(), outbound, self.shared.components.clone());
+        let established = self.stream(inbound, &connections, &channel).await;
 
         // Tear down this attempt's virtual connections: their tunnel side is
         // gone, and the next attempt carries fresh conn ids.
-        let pending: Vec<_> = registry.lock().unwrap().drain().collect();
-        for (_, sender) in pending {
-            let _ = sender.send(Ctrl::Abort).await;
-        }
+        connections.teardown();
 
         established
     }
@@ -481,8 +461,7 @@ impl NodeTask {
     async fn stream(
         &self,
         mut inbound: tonic::Streaming<Frame>,
-        tx: &mpsc::Sender<Frame>,
-        registry: &Registry,
+        connections: &Connections,
         channel: &tonic::transport::Channel,
     ) -> Result<bool, BoxError> {
         let mut established = false;
@@ -528,50 +507,6 @@ impl NodeTask {
                         });
                     }
                 }
-                Some(Body::Connect(connect)) => {
-                    let Some(handler) = self.shared.components.get(&connect.address) else {
-                        let _ = tx
-                            .send(Frame {
-                                body: Some(Body::Error(Error {
-                                    conn_id: connect.conn_id,
-                                    message: format!("no wasm route for '{}'", connect.address),
-                                })),
-                            })
-                            .await;
-                        continue;
-                    };
-                    let (ctrl_tx, ctrl_rx) = mpsc::channel(SERVE_BUFFER);
-                    registry.lock().unwrap().insert(connect.conn_id, ctrl_tx);
-                    tokio::spawn(wasm_host::serve(
-                        tx.clone(),
-                        registry.clone(),
-                        connect.conn_id,
-                        handler.clone(),
-                        ctrl_rx,
-                    ));
-                }
-                Some(Body::Data(data)) => {
-                    let sender = registry.lock().unwrap().get(&data.conn_id).cloned();
-                    if let Some(sender) = sender {
-                        let _ = sender.send(Ctrl::Payload(data.payload)).await;
-                    }
-                }
-                Some(Body::Close(close)) => {
-                    let sender = registry.lock().unwrap().get(&close.conn_id).cloned();
-                    if let Some(sender) = sender {
-                        let _ = sender.send(Ctrl::WriteClose).await;
-                    }
-                }
-                Some(Body::Error(error)) => {
-                    println!(
-                        "[{}] conn {} failed: {}",
-                        self.key, error.conn_id, error.message
-                    );
-                    let sender = registry.lock().unwrap().get(&error.conn_id).cloned();
-                    if let Some(sender) = sender {
-                        let _ = sender.send(Ctrl::Abort).await;
-                    }
-                }
                 Some(Body::Drain(drain)) => {
                     // keep the stream: the server drains in-flight connections
                     // before it closes the stream itself; the failover is the
@@ -596,8 +531,10 @@ impl NodeTask {
                         })
                         .await;
                 }
-                // Advertise from the server is unexpected; keep-alive is a no-op.
-                _ => {}
+                // connection frames; Advertise from the server is unexpected and
+                // keep-alive a no-op, both ignored there
+                Some(body) => connections.deliver(body).await,
+                None => {}
             }
         }
     }

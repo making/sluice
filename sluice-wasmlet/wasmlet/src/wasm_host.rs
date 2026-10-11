@@ -23,17 +23,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context as TaskContext, Poll};
 
 use http_body_util::BodyExt as _;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::AsyncWrite;
 use tokio::sync::{mpsc, watch};
-use tokio_util::sync::{CancellationToken, DropGuard, PollSender};
+use tokio_util::sync::{CancellationToken, DropGuard};
 use wasmtime::AsContextMut as _;
 
-use crate::Ctrl;
-use crate::pb::frame::Body;
-use crate::pb::{Close, Data, Frame};
-
-/// Upper bound for a single DATA frame emitted by the hyper write path.
-const CHUNK: usize = 16 * 1024;
+use crate::tunnel::TunnelIo;
 
 /// Relay slots between the guest's store task and hyper; together with the
 /// pipe buffer inside the body conversion this bounds the in-flight response
@@ -1426,19 +1421,14 @@ async fn run_unit(pool: Arc<Pool>) {
 }
 
 // ---------------------------------------------------------------------------
-// Tunnel <-> hyper byte stream adapter
+// Serving a tunnel connection
 
 /// Serves one tunnel connection by feeding its frames through hyper and the
 /// route's handler (shared across connections); http/1.1 and h2c are
 /// auto-detected.
-pub async fn serve(
-    tx: mpsc::Sender<Frame>,
-    registry: crate::Registry,
-    conn_id: i64,
-    handler: Arc<Handler>,
-    ctrl: mpsc::Receiver<Ctrl>,
-) {
-    let mut io = TunnelIo::new(tx, conn_id, ctrl);
+pub async fn serve(mut io: TunnelIo, handler: Arc<Handler>) {
+    let conn_id = io.conn_id();
+    let ending = io.ending();
 
     // Sniff the first bytes: HTTP/2 prior-knowledge starts with the
     // (unencrypted) preface "PRI"; everything else is treated as http/1.1.
@@ -1469,7 +1459,7 @@ pub async fn serve(
     if let Err(e) = served {
         eprintln!("[wasm] conn {conn_id} serve error: {e}");
     }
-    registry.lock().unwrap().remove(&conn_id);
+    ending.finish().await;
 }
 
 #[derive(Clone)]
@@ -1485,153 +1475,14 @@ where
     }
 }
 
-/// AsyncRead/AsyncWrite adapter over the tunnel frame channel: reads consume
-/// `Ctrl::Payload` frames, writes emit `Data` frames.
-struct TunnelIo {
-    rx: mpsc::Receiver<Ctrl>,
-    sender: PollSender<Frame>,
-    conn_id: i64,
-    buf: bytes::BytesMut,
-    eof: bool,
-}
-
-impl TunnelIo {
-    fn new(tx: mpsc::Sender<Frame>, conn_id: i64, rx: mpsc::Receiver<Ctrl>) -> Self {
-        Self {
-            rx,
-            sender: PollSender::new(tx),
-            conn_id,
-            buf: bytes::BytesMut::new(),
-            eof: false,
-        }
-    }
-
-    fn buffered(&self) -> usize {
-        self.buf.len()
-    }
-
-    fn peek_prefix(&self, prefix: &[u8]) -> bool {
-        self.buf.starts_with(prefix)
-    }
-
-    /// Pulls one control message into the buffer; false on close/abort.
-    async fn fill(&mut self) -> bool {
-        match self.rx.recv().await {
-            Some(Ctrl::Payload(data)) => {
-                self.buf.extend_from_slice(&data);
-                true
-            }
-            Some(Ctrl::WriteClose) => {
-                self.eof = true;
-                false
-            }
-            Some(Ctrl::Abort) | None => false,
-        }
-    }
-
-    fn send_close(&mut self, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        let frame = Frame {
-            body: Some(Body::Close(Close {
-                conn_id: self.conn_id,
-            })),
-        };
-        match self.sender.poll_reserve(cx) {
-            Poll::Ready(Ok(())) => {
-                let _ = self.sender.send_item(frame);
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::other(e.to_string()))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl AsyncRead for TunnelIo {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = &mut *self;
-        if !this.buf.is_empty() {
-            let n = this.buf.len().min(buf.remaining());
-            let data = this.buf.split_to(n);
-            buf.put_slice(&data);
-            return Poll::Ready(Ok(()));
-        }
-        if this.eof {
-            // Unfilled ReadBuf on return signals EOF to hyper.
-            return Poll::Ready(Ok(()));
-        }
-        match this.rx.poll_recv(cx) {
-            Poll::Ready(Some(Ctrl::Payload(data))) => {
-                this.buf.extend_from_slice(&data);
-                let n = this.buf.len().min(buf.remaining());
-                let data = this.buf.split_to(n);
-                buf.put_slice(&data);
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Some(Ctrl::WriteClose)) => {
-                this.eof = true;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Some(Ctrl::Abort)) => Poll::Ready(Err(std::io::Error::other(
-                "connection aborted by the tunnel peer",
-            ))),
-            Poll::Ready(None) => {
-                this.eof = true;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl AsyncWrite for TunnelIo {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = &mut *self;
-        let n = buf.len().min(CHUNK);
-        let frame = Frame {
-            body: Some(Body::Data(Data {
-                conn_id: this.conn_id,
-                payload: buf[..n].to_vec(),
-            })),
-        };
-        match this.sender.poll_reserve(cx) {
-            Poll::Ready(Ok(())) => {
-                let _ = this.sender.send_item(frame);
-                Poll::Ready(Ok(n))
-            }
-            Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(std::io::Error::other(format!("tunnel closed: {e}"))))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        // Half-close the tunnel direction when hyper is done with the connection.
-        self.send_close(cx)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pb::frame::Body;
+    use crate::tunnel::testing::Peer;
     use std::time::{Duration, Instant};
 
     /// Builds the example guests (a no-op when fresh, serialized across
@@ -1792,29 +1643,27 @@ mod tests {
         assert_eq!(raw.len(), end, "no body follows: {:?}", raw);
     }
 
-    /// Opens a tunnel connection to `handler` and sends `request`: the
-    /// connection's control side and the frames it emits.
-    async fn open(
-        handler: &Arc<Handler>,
-        request: &str,
-    ) -> (mpsc::Sender<Ctrl>, mpsc::Receiver<Frame>) {
-        let (tx, rx) = mpsc::channel::<Frame>(64);
-        let (ctrl_tx, ctrl_rx) = mpsc::channel::<Ctrl>(32);
-        let registry = crate::Registry::default();
-        tokio::spawn(serve(tx, registry, 1, handler.clone(), ctrl_rx));
-        ctrl_tx
-            .send(Ctrl::Payload(request.as_bytes().to_vec()))
-            .await
-            .unwrap();
-        (ctrl_tx, rx)
+    /// Dial address of the test route.
+    const ROUTE: &str = "wasm:test";
+
+    /// Opens conn 1 to `handler` through the dispatch, as a server CONNECT
+    /// announcing `window` (0 = legacy), and sends `request`.
+    async fn open_with(handler: &Arc<Handler>, request: &str, window: u32) -> Peer {
+        let peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
+        peer.connect(1, ROUTE, window).await;
+        peer.data(1, request.as_bytes()).await;
+        peer
     }
 
-    /// Drives one request through `serve` over in-memory frame channels and
-    /// returns the raw response bytes up to the tunnel Close.
-    async fn exchange_raw(handler: &Arc<Handler>, request: &str) -> Vec<u8> {
-        let (_ctrl, mut rx) = open(handler, request).await;
+    /// `open_with` on a windowed connection, as every current server opens.
+    async fn open(handler: &Arc<Handler>, request: &str) -> Peer {
+        open_with(handler, request, crate::tunnel::WINDOW).await
+    }
+
+    /// Reads the response bytes up to the tunnel Close.
+    async fn response_raw(peer: &mut Peer) -> Vec<u8> {
         let mut raw = Vec::new();
-        while let Some(frame) = rx.recv().await {
+        while let Some(frame) = peer.recv().await {
             match frame.body.expect("frame body") {
                 Body::Data(data) => raw.extend_from_slice(&data.payload),
                 Body::Close(..) => break,
@@ -1825,9 +1674,328 @@ mod tests {
         raw
     }
 
+    /// Drives one request through `serve` over in-memory frame channels and
+    /// returns the raw response bytes up to the tunnel Close.
+    async fn exchange_raw(handler: &Arc<Handler>, request: &str) -> Vec<u8> {
+        response_raw(&mut open(handler, request).await).await
+    }
+
     /// `exchange_raw` for text responses.
     async fn exchange(handler: &Arc<Handler>, request: &str) -> String {
         String::from_utf8(exchange_raw(handler, request).await).expect("utf8 response")
+    }
+
+    /// The frames the wasmlet sends until none arrives for `quiet`.
+    async fn frames_until_quiet(peer: &mut Peer, quiet: Duration) -> Vec<Body> {
+        let mut frames = Vec::new();
+        while let Ok(Some(frame)) = tokio::time::timeout(quiet, peer.recv()).await {
+            frames.push(frame.body.expect("frame body"));
+        }
+        frames
+    }
+
+    fn data_bytes(frames: &[Body], conn_id: i64) -> Vec<u8> {
+        frames
+            .iter()
+            .filter_map(|body| match body {
+                Body::Data(data) if data.conn_id == conn_id => Some(data.payload.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    /// The legacy path (a CONNECT without a window, as from a server
+    /// predating the window) serves as before: no grant, no ERROR.
+    #[tokio::test]
+    async fn a_legacy_connection_serves_without_flow_control_frames() {
+        let handler = Handler::new(hello().await, Sandbox::default());
+        let mut peer = open_with(&handler, &get("/"), 0).await;
+        let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+        let response = String::from_utf8(data_bytes(&frames, 1)).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let control: Vec<_> = frames
+            .iter()
+            .filter(|body| !matches!(body, Body::Data(_)))
+            .collect();
+        assert!(
+            matches!(control[..], [Body::Close(_)]),
+            "only the CLOSE: {control:?}"
+        );
+    }
+
+    /// `connection: close` ends the connection while the server may still
+    /// send: CLOSE, then ERROR, so a server writer waiting for credit is
+    /// released. After the server's CLOSE, CLOSE alone.
+    #[tokio::test]
+    async fn a_windowed_connection_ends_with_error_unless_the_server_closed() {
+        let handler = Handler::new(hello().await, Sandbox::default());
+        let mut peer = open(&handler, &get("/")).await;
+        let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+        let tail: Vec<_> = frames
+            .iter()
+            .filter(|body| !matches!(body, Body::Data(_)))
+            .collect();
+        assert!(
+            matches!(tail[..], [Body::Close(_), Body::Error(error)]
+                if error.message == crate::tunnel::CONNECTION_CLOSED),
+            "{tail:?}"
+        );
+
+        // keep-alive: the response leaves the connection open until the
+        // server's CLOSE
+        let keep_alive = "GET / HTTP/1.1\r\nhost: t\r\n\r\n";
+        let mut peer = open(&handler, keep_alive).await;
+        let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+        assert!(
+            String::from_utf8(data_bytes(&frames, 1))
+                .unwrap()
+                .starts_with("HTTP/1.1 200")
+        );
+        assert!(
+            frames.iter().all(|body| matches!(body, Body::Data(_))),
+            "still open: {frames:?}"
+        );
+        peer.send(Body::Close(crate::pb::Close { conn_id: 1 }))
+            .await;
+        let tail = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+        assert!(matches!(tail[..], [Body::Close(_)]), "{tail:?}");
+    }
+
+    /// hyper skips its shutdown when the connection fails; the connection
+    /// still ends with a terminal frame, or the server's side of it would
+    /// wait forever.
+    #[tokio::test]
+    async fn a_connection_failing_in_hyper_still_ends_with_a_terminal_frame() {
+        fn terminal(frames: &[Body]) -> Vec<String> {
+            frames
+                .iter()
+                .filter_map(|body| match body {
+                    Body::Close(_) => Some("CLOSE".to_string()),
+                    Body::Error(error) => Some(format!("ERROR {}", error.message)),
+                    _ => None,
+                })
+                .collect()
+        }
+        let handler = Handler::new(hello().await, Sandbox::default());
+        for window in [0, crate::tunnel::WINDOW] {
+            // a head cut short by the server's CLOSE: hyper fails the read;
+            // the server closed, so CLOSE is owed, not ERROR
+            let mut peer = open_with(&handler, "GET / HTTP/1.1\r\nhost:", window).await;
+            peer.send(Body::Close(crate::pb::Close { conn_id: 1 }))
+                .await;
+            let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+            assert_eq!(
+                terminal(&frames),
+                vec!["CLOSE"],
+                "window {window}: {frames:?}"
+            );
+        }
+        // a response body cut short by the budget fails hyper while the
+        // server may still send: ERROR alone (windowed), so the public peer
+        // sees an abort, not a clean end; CLOSE (legacy)
+        let short = Handler::new(
+            hello().await,
+            Sandbox {
+                limits: Limits {
+                    budget: Duration::from_millis(300),
+                    ..Limits::default()
+                },
+                ..Sandbox::default()
+            },
+        );
+        let expected = [
+            (0, "CLOSE".to_string()),
+            (
+                crate::tunnel::WINDOW,
+                format!("ERROR {}", crate::tunnel::CONNECTION_CLOSED),
+            ),
+        ];
+        for (window, expected) in expected {
+            let mut peer = open_with(&short, &get("/stream"), window).await;
+            let frames = frames_until_quiet(&mut peer, Duration::from_secs(1)).await;
+            let body = data_bytes(&frames, 1);
+            assert!(
+                body.len() < 10 * 1024 * 1024,
+                "truncated: {} bytes",
+                body.len()
+            );
+            assert_eq!(terminal(&frames), vec![expected], "window {window}");
+        }
+    }
+
+    /// The response stops at exactly the server's credit and resumes on its
+    /// grant: hyper's writes never put more on the wire than granted.
+    #[tokio::test]
+    async fn a_windowed_response_stops_at_the_servers_credit() {
+        let handler = Handler::new(hello().await, Sandbox::default());
+        let mut peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
+        peer.auto_grant = false;
+        peer.connect(1, ROUTE, 64 * 1024).await;
+        peer.data(1, get("/stream").as_bytes()).await;
+
+        let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+        assert_eq!(
+            data_bytes(&frames, 1).len(),
+            64 * 1024,
+            "the initial credit"
+        );
+
+        peer.send(Body::WindowUpdate(crate::pb::WindowUpdate {
+            conn_id: 1,
+            increment: 100_000,
+        }))
+        .await;
+        let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+        assert_eq!(data_bytes(&frames, 1).len(), 100_000, "exactly the grant");
+    }
+
+    /// What a credit-respecting server saw while uploading.
+    #[derive(Default)]
+    struct Upload {
+        sent: usize,
+        credit: u64,
+        grants: usize,
+        frames: Vec<Body>,
+    }
+
+    /// Uploads `head` plus `body_len` bytes to conn 1 as a server would:
+    /// within the credit, which the wasmlet's grants refill. Stops once
+    /// everything is sent, the wasmlet fails the connection, or nothing
+    /// arrives for `quiet` while the credit is exhausted.
+    async fn upload(peer: &mut Peer, head: &str, body_len: usize, quiet: Duration) -> Upload {
+        let total = head.len() + body_len;
+        let mut payload = head.as_bytes().to_vec();
+        payload.resize(total, 0x42);
+        let mut upload = Upload {
+            credit: u64::from(crate::tunnel::WINDOW),
+            ..Default::default()
+        };
+        while upload.sent < total {
+            if upload.credit > 0 {
+                let n = (total - upload.sent)
+                    .min(64 * 1024)
+                    .min(upload.credit as usize);
+                peer.data(1, &payload[upload.sent..upload.sent + n]).await;
+                upload.sent += n;
+                upload.credit -= n as u64;
+                continue;
+            }
+            let Ok(Some(frame)) = tokio::time::timeout(quiet, peer.recv()).await else {
+                break; // no grant: the upload stalls here
+            };
+            let body = frame.body.expect("frame body");
+            match &body {
+                Body::WindowUpdate(update) if update.conn_id == 1 => {
+                    upload.credit += u64::from(update.increment);
+                    upload.grants += 1;
+                }
+                Body::Error(error) if error.conn_id == 1 => {
+                    upload.frames.push(body);
+                    break;
+                }
+                _ => {}
+            }
+            upload.frames.push(body);
+        }
+        upload
+    }
+
+    /// An upload beyond one window flows as the guest reads, on the grants
+    /// hyper's reads produce. The guest stops reading past 1MiB and answers;
+    /// the connection ends with ERROR, which releases the server's upload.
+    #[tokio::test]
+    async fn an_upload_flows_on_grants_and_an_unread_rest_is_released() {
+        let handler = Handler::new(hello().await, Sandbox::default());
+        let mut peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
+        peer.connect(1, ROUTE, crate::tunnel::WINDOW).await;
+        let body_len = 4 * crate::tunnel::WINDOW as usize;
+        let head = format!(
+            "POST / HTTP/1.1\r\nhost: t\r\ncontent-length: {body_len}\r\nconnection: close\r\n\r\n"
+        );
+
+        let upload = tokio::time::timeout(
+            Duration::from_secs(10),
+            upload(&mut peer, &head, body_len, Duration::from_secs(5)),
+        )
+        .await
+        .expect("the upload ends");
+
+        assert!(upload.grants >= 1, "the guest's reads were granted");
+        assert!(
+            upload.sent > crate::tunnel::WINDOW as usize,
+            "more than one window went out: {}",
+            upload.sent
+        );
+        assert!(
+            upload.sent < head.len() + body_len,
+            "the rest was never read"
+        );
+        let response = String::from_utf8(data_bytes(&upload.frames, 1)).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let read: usize = response
+            .lines()
+            .find_map(|line| line.strip_prefix("body_bytes="))
+            .expect("body_bytes")
+            .parse()
+            .unwrap();
+        assert!(read > 1024 * 1024, "the guest read past one window: {read}");
+        assert!(
+            matches!(upload.frames.last(), Some(Body::Error(error))
+                if error.message == crate::tunnel::CONNECTION_CLOSED),
+            "the ERROR ended the upload: {:?}",
+            upload.frames.last()
+        );
+    }
+
+    /// One connection's upload stalls (its guest reads no more and the
+    /// server has no credit left) while another connection on the same
+    /// stream is served at once.
+    #[tokio::test]
+    async fn a_stalled_upload_leaves_other_connections_served() {
+        let handler = Handler::new(hello().await, Sandbox::default());
+        let mut peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
+        peer.connect(1, ROUTE, crate::tunnel::WINDOW).await;
+        let body_len = 8 * crate::tunnel::WINDOW as usize;
+        // the guest reads just past 1MiB, then answers /stall slowly
+        let head = format!("POST /stall HTTP/1.1\r\nhost: t\r\ncontent-length: {body_len}\r\n\r\n");
+        let stalled = upload(&mut peer, &head, body_len, Duration::from_millis(500)).await;
+        assert_eq!(stalled.credit, 0, "the upload waits for credit");
+        assert!(stalled.sent < head.len() + body_len);
+        assert!(
+            !stalled
+                .frames
+                .iter()
+                .any(|body| matches!(body, Body::Close(_) | Body::Error(_))),
+            "conn 1 is still open"
+        );
+
+        let started = Instant::now();
+        peer.connect(2, ROUTE, crate::tunnel::WINDOW).await;
+        peer.data(2, get("/").as_bytes()).await;
+        let mut frames = Vec::new();
+        let served = async {
+            while let Some(frame) = peer.recv().await {
+                let body = frame.body.expect("frame body");
+                let done = matches!(&body, Body::Close(close) if close.conn_id == 2);
+                frames.push(body);
+                if done {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(3), served)
+            .await
+            .expect("conn 2 is served while conn 1 stalls");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let response = String::from_utf8(data_bytes(&frames, 2)).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            !frames.iter().any(|body| matches!(body,
+                Body::Close(close) if close.conn_id == 1)),
+            "conn 1 still stalls"
+        );
     }
 
     /// A guest overrunning its epoch budget degrades to a clean 504 and the
@@ -1898,23 +2066,11 @@ mod tests {
         let wasm = hello_wasm();
         let loaded = load(&Locator::File(wasm), Caps::default()).await.unwrap();
 
-        let (tx, mut rx) = mpsc::channel::<Frame>(64);
-        let (ctrl_tx, ctrl_rx) = mpsc::channel::<Ctrl>(32);
-        let registry = crate::Registry::default();
-        tokio::spawn(serve(
-            tx,
-            registry,
-            1,
-            Handler::new(loaded, Sandbox::default()),
-            ctrl_rx,
-        ));
-
-        ctrl_tx
-            .send(Ctrl::Payload(
-                b"GET /stream HTTP/1.1\r\nhost: demo.local\r\nconnection: close\r\n\r\n".to_vec(),
-            ))
-            .await
-            .unwrap();
+        let mut peer = open(
+            &Handler::new(loaded, Sandbox::default()),
+            "GET /stream HTTP/1.1\r\nhost: demo.local\r\nconnection: close\r\n\r\n",
+        )
+        .await;
 
         let started = Instant::now();
         let mut raw: Vec<u8> = Vec::new();
@@ -1923,7 +2079,7 @@ mod tests {
         let mut closed_at = None;
         let completed = async {
             while closed_at.is_none() {
-                let Some(frame) = rx.recv().await else {
+                let Some(frame) = peer.recv().await else {
                     panic!("serve task ended without Close");
                 };
                 match frame.body.expect("frame body") {
@@ -2602,11 +2758,11 @@ mod tests {
         let handler = pooled(&loaded, Sandbox::default(), 1);
         restocked(&handler, 1).await;
 
-        let (ctrl, frames) = open(&handler, &fetch_request(&format!("http://{silent}/"))).await;
+        let peer = open(&handler, &fetch_request(&format!("http://{silent}/"))).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(pool(&handler).idle(), 0, "the unit is busy");
-        ctrl.send(Ctrl::Abort).await.unwrap();
-        drop(frames);
+        peer.error(1, "public peer left").await;
+        drop(peer);
 
         let started = Instant::now();
         restocked(&handler, 1).await;
@@ -2625,16 +2781,16 @@ mod tests {
         let handler = pooled(&hello().await, Sandbox::default(), 1);
         restocked(&handler, 1).await;
 
-        let (ctrl, mut frames) = open(&handler, &get("/stream")).await;
+        let mut peer = open(&handler, &get("/stream")).await;
         let mut received = 0;
         while received < 64 * 1024 {
-            match frames.recv().await.and_then(|frame| frame.body) {
+            match peer.recv().await.and_then(|frame| frame.body) {
                 Some(Body::Data(data)) => received += data.payload.len(),
                 other => panic!("stream ended early: {other:?}"),
             }
         }
-        ctrl.send(Ctrl::Abort).await.unwrap();
-        drop(frames);
+        peer.error(1, "public peer left").await;
+        drop(peer);
 
         restocked(&handler, 1).await;
         let body = exchange(&handler, &get("/")).await;
@@ -2645,14 +2801,12 @@ mod tests {
     /// A `/stall` connection past its first body byte: the response head is
     /// out (the tracked body live) and the guest suspended before any further
     /// frame. Returns the connection's sides, for the abort.
-    async fn stalled_connection(
-        handler: &Arc<Handler>,
-    ) -> (mpsc::Sender<Ctrl>, mpsc::Receiver<Frame>) {
-        let (ctrl, mut frames) = open(handler, &get("/stall")).await;
+    async fn stalled_connection(handler: &Arc<Handler>) -> Peer {
+        let mut peer = open(handler, &get("/stall")).await;
         let head_and_chunk = async {
             let mut raw: Vec<u8> = Vec::new();
             loop {
-                let frame = frames.recv().await.expect("the stalled response starts");
+                let frame = peer.recv().await.expect("the stalled response starts");
                 if let Body::Data(data) = frame.body.expect("frame body") {
                     raw.extend_from_slice(&data.payload);
                 }
@@ -2671,7 +2825,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), head_and_chunk)
             .await
             .expect("the stalled body starts");
-        (ctrl, frames)
+        peer
     }
 
     /// A client leaving mid-body frees its unit at once, though the guest is
@@ -2682,7 +2836,7 @@ mod tests {
         let handler = pooled(&hello().await, Sandbox::default(), 1);
         restocked(&handler, 1).await;
 
-        let (ctrl, frames) = stalled_connection(&handler).await;
+        let peer = stalled_connection(&handler).await;
         assert_eq!(
             pool(&handler).idle(),
             0,
@@ -2690,8 +2844,8 @@ mod tests {
         );
 
         let started = Instant::now();
-        ctrl.send(Ctrl::Abort).await.unwrap();
-        drop(frames);
+        peer.error(1, "public peer left").await;
+        drop(peer);
 
         restocked(&handler, 1).await;
         assert!(
@@ -2769,12 +2923,12 @@ mod tests {
             "no store before the first request"
         );
 
-        let (ctrl, frames) = stalled_connection(&handler).await;
+        let peer = stalled_connection(&handler).await;
         assert_eq!(handler.live_stores(), 1, "the request's store is held");
 
         let started = Instant::now();
-        ctrl.send(Ctrl::Abort).await.unwrap();
-        drop(frames);
+        peer.error(1, "public peer left").await;
+        drop(peer);
 
         let freed = async {
             while handler.live_stores() > 0 {

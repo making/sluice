@@ -101,6 +101,12 @@ lines, prefixed with the component and a request id
 - the tunnel stream is served by `hyper` (http/1.1 and h2c, sniffed from the
   first bytes) through an `AsyncRead`/`AsyncWrite` adapter over the frame
   channels; no loopback sockets
+- per-connection flow control as in the root README: the wasmlet announces a
+  1MiB receive window per connection and grants back what hyper read; its
+  writes send only against the server's grants. A guest slow to read a
+  request body holds back only its own connection, and frames for the other
+  connections keep flowing. A server without the window gets the old behavior
+  (a connection whose guest does not read stalls the whole stream)
 - per request: `wasmtime_wasi_http::p3::Request::from_http` -> fresh instance
   from a pre-linked `InstancePre` -> `Service.handle`; the store runs in a
   detached task and relays response body frames to hyper through a bounded
