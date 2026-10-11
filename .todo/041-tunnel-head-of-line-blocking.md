@@ -180,9 +180,11 @@ What 043-048 still leave open, by design or elsewhere. Do not report the parent 
   connection's further legs take slots and its demux queue beyond a per-connection
   allowance is charged to a budget shared by the node; since 058 (done) tiny DATA
   frames add no per-frame overhead to the receive buffers; since 059 (done) the
-  wasmlet's guest instances are capped by `--max-instances`. Not within the bound:
-  keep-alive connections idle between requests hold their slots (060), and the Java
-  send queues of connections whose slot was already released (061). (ADVERTISE
+  wasmlet's guest instances are capped by `--max-instances`; since 060 (done) HTTP
+  connections idle between requests are closed at `sluice.limits.idle-timeout`. Not
+  within the bound: the Java send queues of connections whose slot was already released
+  (061), and slots held where no deadline reaches: verbatim relays gone quiet (070),
+  exchanges stalled mid-flight (071), h1 input the parser cannot follow (072). (ADVERTISE
   off the receive path and the credit-lock pitfall are done in 046.)
 
 ## Follow-up
