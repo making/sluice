@@ -88,7 +88,7 @@ in the same investigation is todo 042.
 | 056-wasmlet-outbound-fair-scheduling | F4 on the wasmlet (047 review follow-up); done | Medium | 047 |
 | 048-data-plane-connection-limits | memory bound (see "Residual after the children"); done | Medium | - (defaults derive from 044-046) |
 | 057-h2-demux-global-queue-budget | h2 memory outside the 048 bound; done | High | 048 |
-| 058-receive-buffer-per-frame-overhead | per-frame overhead outside the 048 bound | Medium | 048 |
+| 058-receive-buffer-per-frame-overhead | per-frame overhead outside the 048 bound; done | Medium | 048 |
 | 061-slot-released-before-queued-frames-left | Java send queues of ended connections outside the 048 bound (056 review) | Medium | 048 |
 | 054-remove-legacy-flow-control | legacy removal (see "Follow-up"; not a child, the parent does not wait for it) | Medium | 047; no pre-046/047 peer deployed |
 
@@ -143,9 +143,10 @@ message Connect {
   stream window is 1MiB, so one connection can still fill the stream as today.
 - **Bounds**:
   - Memory per side = window x active connections; capped by the connection limits
-    of 048 (derived default on the server since 057: 2.125MiB per virtual connection
+    of 048 (derived default on the server since 057: 2.16MiB per virtual connection
     plus an h2 relay's unbudgeted queue, and the shared h2 queue budget, in half the
-    max heap), except per-frame overhead (058).
+    max heap). Since 058 the receive buffer coalesces DATA payload into 16KiB
+    segments, so tiny frames add no per-frame overhead: the window plus 37KiB.
   - Throughput per connection <= window / RTT (1MiB at 50ms ~ 20MiB/s).
 - **Grant rule**: the receiver sends WindowUpdate once its consumed-but-ungranted bytes
   reach half the window. Consumed means handed to the local consumer, not merely
@@ -177,9 +178,10 @@ What 043-048 still leave open, by design or elsewhere. Do not report the parent 
   Out of scope (no todo).
 - Total memory (048, done): the connection limits bound it; since 057 (done) an h2
   connection's further legs take slots and its demux queue beyond a per-connection
-  allowance is charged to a budget shared by the node. Not within the bound:
-  per-frame overhead of tiny DATA frames (058), wasmlet guest instances (059),
-  keep-alive connections idle between requests hold their slots (060), and the Java
+  allowance is charged to a budget shared by the node; since 058 (done) tiny DATA
+  frames add no per-frame overhead to the receive buffers. Not within the bound:
+  wasmlet guest instances (059), keep-alive connections idle between requests hold
+  their slots (060), and the Java
   send queues of connections whose slot was already released (061). (ADVERTISE
   off the receive path and the credit-lock pitfall are done in 046.)
 

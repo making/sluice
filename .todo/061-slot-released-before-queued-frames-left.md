@@ -7,7 +7,7 @@ Found in the 056 review (by reading, not tested). Parent:
 
 ## Problem
 
-The 048 bound (`ConnectionLimit.CONNECTION_BYTES`: receive window + send queue cap +
+The 048 bound (`ConnectionLimit.CONNECTION_BYTES`: receive buffer + send queue cap +
 relay buffers per connection, times the limit) assumes a connection's buffers are gone
 once its slot is free. The send queue is not: the server (`DataProxyServer`, the
 `release` run when the relay completes) and the client (`NodeConnection`,
