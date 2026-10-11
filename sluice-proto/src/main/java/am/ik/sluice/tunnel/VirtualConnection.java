@@ -191,6 +191,17 @@ public final class VirtualConnection implements AutoCloseable {
 
 	private volatile @Nullable String failure;
 
+	/** Guards {@link #remoteFailed} and {@link #onRemoteFailure}. */
+	private final Object remoteFailureLock = new Object();
+
+	/** The remote sent ERROR; guarded by {@link #remoteFailureLock}. */
+	private boolean remoteFailed;
+
+	/**
+	 * Runs once when the remote sent ERROR; guarded by {@link #remoteFailureLock}.
+	 */
+	private @Nullable Runnable onRemoteFailure;
+
 	/** A legacy-mode connection: no per-connection flow control. */
 	public VirtualConnection(long connectionId, FrameWriter frameWriter) {
 		this(connectionId, frameWriter, 0, 0);
@@ -469,6 +480,34 @@ public final class VirtualConnection implements AutoCloseable {
 		endWith(new End(message == null ? "remote failure" : message));
 		if (windowed()) {
 			signalCredit(); // the remote grants nothing more
+		}
+		Runnable action;
+		synchronized (this.remoteFailureLock) {
+			if (this.remoteFailed) {
+				return;
+			}
+			this.remoteFailed = true;
+			action = this.onRemoteFailure;
+		}
+		if (action != null) {
+			action.run();
+		}
+	}
+
+	/**
+	 * Runs {@code action} once the remote sent ERROR -- at once if it already did. Unlike
+	 * the failure a reader gets, it also fires after the remote's CLOSE, when the reader
+	 * already returned EOF. Runs on the thread delivering the ERROR, so it must not
+	 * block; one action per connection.
+	 */
+	public void onRemoteFailure(Runnable action) {
+		boolean failed;
+		synchronized (this.remoteFailureLock) {
+			this.onRemoteFailure = action;
+			failed = this.remoteFailed;
+		}
+		if (failed) {
+			action.run();
 		}
 	}
 

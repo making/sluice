@@ -13,7 +13,8 @@ import org.jspecify.annotations.Nullable;
  * per connection in the original implementation).
  * <p>
  * Half-close semantics: local EOF emits CLOSE to the remote while the local side keeps
- * reading; remote CLOSE shuts down the pipe output only.
+ * reading; remote CLOSE shuts down the pipe output only. A remote ERROR tears the relay
+ * down, also after the remote's CLOSE.
  */
 public final class StreamRelay {
 
@@ -140,6 +141,9 @@ public final class StreamRelay {
 	public void start() {
 		Completion completion = new Completion();
 		long connectionId = this.connection.connectionId();
+		// after the remote's CLOSE its ERROR reaches no reader: the pipe would stay open
+		// until the local peer ends its side
+		this.connection.onRemoteFailure(this::abandon);
 		Thread.ofVirtual().name("sluice-relay-out-" + connectionId).start(() -> this.relayToRemote(completion));
 		Thread.ofVirtual().name("sluice-relay-in-" + connectionId).start(() -> this.relayToLocal(completion));
 	}

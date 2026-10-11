@@ -111,6 +111,31 @@ class StreamRelayTest {
 		assertThat(writer.frames).contains("close:2");
 	}
 
+	/**
+	 * The remote failing the connection after its half-close -- the local pipe's output
+	 * already shut down, its input still open -- tears the relay down: the remote's peer
+	 * is gone, so nothing read from the pipe can reach it.
+	 */
+	@Test
+	@Timeout(10)
+	void remoteErrorAfterItsCloseTearsTheRelayDown() throws Exception {
+		SocketPair pair = SocketPair.create();
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = new VirtualConnection(5, writer);
+		CountDownLatch done = new CountDownLatch(1);
+		StreamRelay relay = StreamRelay.builder(DuplexPipe.of(pair.serverSide()), connection, writer)
+			.onComplete(done::countDown)
+			.build();
+		relay.start();
+		connection.remoteClosed();
+		assertThat(pair.client().getInputStream().read()).as("the half-close reached the local peer").isEqualTo(-1);
+		assertThat(done.await(200, TimeUnit.MILLISECONDS)).as("the relay waits for the local side").isFalse();
+		connection.remoteFailed("connection closed");
+		assertThat(done.await(5, TimeUnit.SECONDS)).isTrue();
+		assertThat(pair.serverSide().isClosed()).isTrue();
+		pair.client().close();
+	}
+
 	@Test
 	@Timeout(10)
 	void localErrorSendsErrorFrameAndClosesPipe() throws Exception {
