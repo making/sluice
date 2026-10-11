@@ -31,5 +31,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # wasmtime's ResourceLimiterAsync is #[async_trait]; the impl must match
 async-trait = "0.1"
 
+[dev-dependencies]
+# an h2 client for the per-connection stream limit; the version hyper uses
+h2 = "0.4"
+
 [build-dependencies]
 tonic-prost-build = "0.14"

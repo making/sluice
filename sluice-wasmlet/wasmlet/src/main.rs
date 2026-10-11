@@ -19,7 +19,8 @@
 //!   `--insecure` skips verification); no mTLS yet
 //! - one pre-linked (`InstancePre`) instance per request, under a per-route
 //!   epoch CPU budget, memory cap and `wasmtime serve`-style WASI
-//!   capabilities; response bodies stream via a bounded relay
+//!   capabilities, and a process-wide instance limit (`--max-instances`);
+//!   response bodies stream via a bounded relay
 //!
 //! Usage:
 //!
@@ -47,7 +48,7 @@ mod wasm_host;
 use pb::frame::Body;
 use pb::{Advertise, Frame, Upstream};
 use tunnel::{Connections, Outbound};
-use wasm_host::{Handler, Locator, Sandbox};
+use wasm_host::{Handler, Instances, Locator, Sandbox};
 
 struct Route {
     host: String,
@@ -63,6 +64,7 @@ struct Config {
     ca_cert: Option<String>,
     routes: Vec<Route>,
     max_connections: usize,
+    max_instances: usize,
 }
 
 /// Reconnect backoff: exponential seconds, as `NodeConnection`.
@@ -78,6 +80,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (plus at most two partly used 16KiB segments and 80 segments' overhead
 /// each) = about 265MiB of the server's payload buffered at most.
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
+
+/// Default of `--max-instances`: 64 guest instances alive at once, i.e. at
+/// most 64 x the largest `memory-mib` of guest linear memory (16GiB at the
+/// default 256MiB).
+const DEFAULT_MAX_INSTANCES: usize = 64;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -144,6 +151,7 @@ fn parse_args() -> Config {
         ca_cert: None,
         routes: Vec::new(),
         max_connections: DEFAULT_MAX_CONNECTIONS,
+        max_instances: DEFAULT_MAX_INSTANCES,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -160,11 +168,17 @@ fn parse_args() -> Config {
             "--insecure" => config.insecure = true,
             "--ca-cert" => config.ca_cert = Some(value("ca-cert")),
             "--max-connections" => {
-                let max = value("max-connections");
-                config.max_connections = match max.parse() {
-                    Ok(max) if max > 0 => max,
-                    _ => panic!("--max-connections must be a positive number, got '{max}'"),
-                };
+                config.max_connections =
+                    parse_limit("max-connections", &value("max-connections"), usize::MAX)
+                        .unwrap_or_else(|e| panic!("{e}"));
+            }
+            "--max-instances" => {
+                config.max_instances = parse_limit(
+                    "max-instances",
+                    &value("max-instances"),
+                    wasm_host::Instances::MAX,
+                )
+                .unwrap_or_else(|e| panic!("{e}"));
             }
             "--wasm" => {
                 let spec = value("wasm");
@@ -188,6 +202,17 @@ fn parse_args() -> Config {
         panic!("--server and at least one --wasm host=locator are required");
     }
     config
+}
+
+/// The value of a `--max-*` limit: a number from 1 to `max`.
+fn parse_limit(name: &str, value: &str, max: usize) -> Result<usize, String> {
+    match value.parse() {
+        Ok(limit) if limit > 0 && limit <= max => Ok(limit),
+        _ if max == usize::MAX => Err(format!("--{name} must be a positive number, got '{value}'")),
+        _ => Err(format!(
+            "--{name} must be a number from 1 to {max}, got '{value}'"
+        )),
+    }
 }
 
 /// Splits `locator[?budget-ms=N&memory-mib=N&wasi=cap,...]` into the locator
@@ -239,7 +264,9 @@ async fn run(config: Config) -> Result<(), BoxError> {
         ca_cert,
         routes,
         max_connections,
+        max_instances,
     } = config;
+    let instances = Instances::new(max_instances);
 
     // Fetch / prewarm every component (fail fast). The target is the component
     // locator (`wasm:<url>`); the server passes it through verbatim as the dial
@@ -252,7 +279,9 @@ async fn run(config: Config) -> Result<(), BoxError> {
             Ok(component) => component,
             Err(e) => return Err(format!("wasm route '{}': {e}", route.host).into()),
         };
-        components.insert(target.clone(), Handler::new(component, route.sandbox));
+        let handler = Handler::new(component, route.sandbox, &instances)
+            .map_err(|e| format!("wasm route '{}': {e}", route.host))?;
+        components.insert(target.clone(), handler);
         advertised.push(Upstream {
             host: route.host.clone(),
             target_url: target,
@@ -274,6 +303,10 @@ async fn run(config: Config) -> Result<(), BoxError> {
         limit: tunnel::Limit::new(max_connections),
     });
     println!("connection limit {max_connections}");
+    println!(
+        "instance limit {max_instances} ({} h2 streams per connection)",
+        instances.streams_per_connection()
+    );
 
     let (tx, rx) = mpsc::channel::<Event>(32);
     supervise(rx, tx, shared, server).await
@@ -587,6 +620,24 @@ async fn list_nodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limits_take_a_number_from_one_to_their_max() {
+        assert_eq!(parse_limit("max-instances", "8", 64), Ok(8));
+        assert_eq!(parse_limit("max-instances", "64", 64), Ok(64));
+        for bad in ["0", "65", "-1", "x", ""] {
+            assert_eq!(
+                parse_limit("max-instances", bad, 64),
+                Err(format!(
+                    "--max-instances must be a number from 1 to 64, got '{bad}'"
+                )),
+            );
+        }
+        assert_eq!(
+            parse_limit("max-connections", "0", usize::MAX),
+            Err("--max-connections must be a positive number, got '0'".to_string()),
+        );
+    }
 
     #[test]
     fn route_target_without_options_keeps_defaults() {

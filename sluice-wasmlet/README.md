@@ -57,7 +57,18 @@ request bytes, coalesced into 16KiB segments whatever the size of the frames (pl
 most two partly used segments and the overhead of 80 segments), so the windows total
 about N x 1.04MiB (265MiB by default), and its outbound queue at most 256KiB of
 response DATA (N x 256KiB in total; an ended connection keeps its slot until its
-queued frames left). Guest instances (`memory-mib` each, one per request in flight) are not bounded by it.
+queued frames left). Guest instances are bounded by `--max-instances` instead.
+
+`--max-instances N` (default 64) caps the guest instances alive at once over every route,
+so guest linear memory stays within N x the largest `memory-mib` (16GiB at the defaults).
+Every instance holds one of the N slots until it is gone: a request's, or a pooled unit's
+for the unit's lifetime (see [Instance pool](#instance-pool)). A request finding no slot
+waits for one within its `budget-ms` (freed slots go to the waiting requests in arrival
+order), and is answered 503 (`wasm instance limit reached`) when the budget runs out
+first; admitted late, it runs only for what is left of its budget. One connection holds at most half the slots (at least one):
+an h2 connection announces that many concurrent streams, and a stream reset while its
+guest still runs keeps its slot until the instance is gone, so the connection's next
+stream waits for it.
 
 Multiple `--wasm host=<locator>` routes per process. The locator is a bare
 path, `file://<path>`, or `http(s)://<url>` (fetched once at startup); the
@@ -65,8 +76,9 @@ advertised target is `wasm:<locator>` (plus the non-default options) and
 further schemes slot into the same resolver. A `?query` suffix sets the
 route's resource limits and WASI capabilities (`wasi`, see [Capabilities](#capabilities)), applied to every
 request's instance: `budget-ms` is the request's wall-clock budget, covering
-instantiation, handler and response relay (exceeded -> 504, or a truncated
-body once streaming; defaults 10000) and `memory-mib` the per-instance linear
+the wait for an instance slot, instantiation, handler and response relay
+(exceeded -> 504, or a truncated body once streaming, or 503 while still
+waiting for a slot; defaults 10000) and `memory-mib` the per-instance linear
 memory cap in MiB (exceeded -> guest trap, 500; defaults 256). `pool=N`
 keeps `N` warm instances per route (see [Instance pool](#instance-pool)). A literal `?`
 in a file path needs URL-escaping.
@@ -157,9 +169,13 @@ a detached task that runs `Store::run_concurrent` once (it consumes the
 store) with a per-request job loop inside, so reuse cannot hand instances
 back: a unit serves one request at a time and the pool size is the warm
 concurrency. A unit is offered once instantiated; a request beyond the
-stock, or on a route without `pool`, uses the per-request path above, so the
-pool only ever improves the warm latency (hello guest, dev profile: ~380us
-cold vs ~120us pooled per request).
+stock, or on a route without `pool`, uses the per-request path above while
+an instance slot is free, so the pool only ever improves the warm latency
+(hello guest, dev profile: ~380us cold vs ~120us pooled per request). Each
+unit holds an instance slot of `--max-instances` for its lifetime (a retired
+unit's replacement takes it over); the pools of all routes together may not
+exceed the limit, which is checked at startup. With no slot free, a request
+waits for whichever comes first, an idle unit or a free slot.
 
 Reuse assumes stateless / reentrant-safe guests: module state legitimately
 persists across a unit's requests, so a misbehaving guest poisons its own
@@ -187,8 +203,9 @@ duplicate is closed on the client side before the server drops it.
 
 - no mTLS (client certificates) yet
 - the epoch budget is absolute (suspended time counts) and granular to the
-  10ms tick; a CPU-limiting `fuel` accounting or per-route concurrency caps
-  are not there yet
+  10ms tick; a CPU-limiting `fuel` accounting is not there yet
+- the instance slots are shared by every route, with no per-route share: busy
+  routes can hold every slot and delay the others
 - guest async tasks live within `wit-bindgen`'s runtime; the `spawn`
   caveats about task lifetime apply
 

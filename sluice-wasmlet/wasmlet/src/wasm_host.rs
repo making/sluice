@@ -4,7 +4,9 @@
 //! sniffed from the first bytes); every request is handled by a fresh
 //! instance of the guest component (or, with `pool=N`, a warm one) through
 //! `wasmtime-wasi-http`'s p3 `Service.handle`. Instantiation is pre-linked
-//! (`InstancePre`) and bounded by per-route epoch budgets and memory caps. Response bodies stream: the
+//! (`InstancePre`) and bounded by per-route epoch budgets and memory caps,
+//! and the instances alive at once by the process-wide `Instances` limit.
+//! Response bodies stream: the
 //! store task relays frames to hyper through a bounded channel, so a slow
 //! client backpressures the guest instead of buffering the response.
 //!
@@ -775,6 +777,11 @@ fn budget_ticks(budget: std::time::Duration) -> u64 {
     (budget.as_millis() as u64 / EPOCH_TICK_MS).max(1)
 }
 
+/// The budget left until `deadline`.
+fn remaining(deadline: tokio::time::Instant) -> std::time::Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
+}
+
 /// Serves one request on an already-instantiated `service`, within a store
 /// closure: re-arms nothing (the caller owns the deadline), converts the
 /// request, runs the handler, streams the response, and drains the request
@@ -1080,51 +1087,143 @@ async fn supervise(
     }
 }
 
-/// Marks a live store on its handler's gauge, for the owning task's
-/// lifetime: the store is dropped inside `supervise` on the stop paths and
-/// with `run_concurrent`'s future on success -- never past the task.
-struct LiveStore(Arc<AtomicUsize>);
+/// A handler's stores alive, the most there ever were at once, and how many
+/// were ever created.
+#[derive(Default)]
+struct Gauge {
+    live: AtomicUsize,
+    peak: AtomicUsize,
+    created: AtomicUsize,
+}
+
+/// Marks a store on its handler's gauge from before its creation to the end
+/// of its owning task: the store is dropped with that task, never past it.
+struct LiveStore(Arc<Gauge>);
 
 impl LiveStore {
-    /// Marks a store on `live`.
-    fn mark(live: &Arc<AtomicUsize>) -> Self {
-        live.fetch_add(1, Ordering::Relaxed);
-        Self(live.clone())
+    /// Marks a store on `gauge`.
+    fn mark(gauge: &Arc<Gauge>) -> Self {
+        let live = gauge.live.fetch_add(1, Ordering::Relaxed) + 1;
+        gauge.peak.fetch_max(live, Ordering::Relaxed);
+        gauge.created.fetch_add(1, Ordering::Relaxed);
+        Self(gauge.clone())
     }
 }
 
 impl Drop for LiveStore {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.live.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// The body of the 503 answering a request that found no instance slot
+/// within its budget.
+pub const INSTANCE_LIMIT_REACHED: &str = "wasm instance limit reached";
+
+/// The guest instances alive at once over every route of the process: every
+/// store -- a request's, or a pooled unit's for the unit's lifetime -- holds
+/// one slot from before its creation until after it was dropped. A request
+/// finding none free waits for one within its budget (`Handler::admit`); the
+/// semaphore hands them out in request order.
+pub struct Instances {
+    slots: Arc<tokio::sync::Semaphore>,
+    max: usize,
+}
+
+/// One instance slot, freed when dropped.
+type Slot = tokio::sync::OwnedSemaphorePermit;
+
+impl Instances {
+    /// The largest limit the semaphore takes.
+    pub const MAX: usize = tokio::sync::Semaphore::MAX_PERMITS;
+
+    pub fn new(max: usize) -> Arc<Instances> {
+        Arc::new(Instances {
+            slots: Arc::new(tokio::sync::Semaphore::new(max)),
+            max,
+        })
+    }
+
+    /// The slots one connection may hold at once (`Share`), announced as its
+    /// h2 `max_concurrent_streams`: half the slots (at least one), so one
+    /// connection cannot take every slot.
+    pub fn streams_per_connection(&self) -> u32 {
+        u32::try_from((self.max / 2).max(1)).unwrap_or(u32::MAX)
+    }
+
+    /// A new connection's share of the slots.
+    fn share(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::new(tokio::sync::Semaphore::new(
+            self.streams_per_connection() as usize
+        ))
+    }
+
+    /// Slots currently held.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.max - self.slots.available_permits()
+    }
+}
+
+/// One of a connection's slots: held with the slot of every instance serving
+/// the connection, until the request's store (or, on a pooled unit, its job)
+/// is gone -- not just its h2 stream, which a reset ends while the instance
+/// may still run.
+type Share = tokio::sync::OwnedSemaphorePermit;
+
+/// How a request got its instance, or why not.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "returned once per request and destructured at once; boxing would allocate on every request"
+)]
+enum Admission {
+    /// Handed to an idle pooled unit.
+    Pooled,
+    /// A slot for a per-request instance.
+    Cold(Job, Slot),
+    /// No share, slot or unit within the budget.
+    Full,
 }
 
 async fn respond(
     handler: &Handler,
+    share: &Arc<tokio::sync::Semaphore>,
     request: hyper::Request<hyper::body::Incoming>,
 ) -> hyper::Response<RelayBody> {
+    // The budget runs from the request's arrival: it covers the wait for an
+    // instance, instantiation, handler and response relay alike.
+    let deadline = tokio::time::Instant::now() + handler.sandbox.limits.budget;
     let (reply, awaited) = reply(request.method() == hyper::Method::HEAD);
-    let request = match &handler.pool {
-        Some(pool) => match pool.dispatch(request, &reply) {
-            Ok(()) => {
-                // The unit's job holds the reply now: a job lost with its
-                // unit must close the head channel, so the 500 below wins.
-                drop(reply);
-                return awaited.response().await;
-            }
-            Err(request) => request,
-        },
-        None => request,
+    let (job, slot) = match handler.admit(request, &reply, share, deadline).await {
+        Admission::Pooled => {
+            // The unit's job holds the reply now: a job lost with its
+            // unit must close the head channel, so the 500 below wins.
+            drop(reply);
+            return awaited.response().await;
+        }
+        Admission::Cold(job, slot) => (job, slot),
+        Admission::Full => return plain_response(503, INSTANCE_LIMIT_REACHED.into()),
     };
+    // The job's reply is the one the store task takes: no other head sender
+    // may stay here, or a task dying before the head would leave the head
+    // channel open, and `Awaited::response` would never fall back to its 500.
+    drop(reply);
+    let Job {
+        request,
+        reply,
+        share,
+        ..
+    } = job;
 
     let (loaded, sandbox) = (&handler.loaded, handler.sandbox);
-    // The budget covers instantiation, handler and response relay alike.
-    let deadline = tokio::time::Instant::now() + sandbox.limits.budget;
+    // Declared after the slot and share, so dropped before them on every
+    // path.
+    let live = LiveStore::mark(&handler.live);
     let mut store = wasmtime::Store::new(engine(), Ctx::new(&sandbox, &loaded.label));
     store.limiter_async(|ctx| &mut ctx.limiter);
     // The deadline must exist before any wasm runs: with epoch interruption
     // enabled, a store without one traps on the first observed tick.
-    store.set_epoch_deadline(budget_ticks(sandbox.limits.budget));
+    store.set_epoch_deadline(budget_ticks(remaining(deadline)));
     let service = match loaded.service_pre.instantiate_async(&mut store).await {
         Ok(service) => service,
         Err(e) => return plain_response(500, format!("wasm instantiate failed: {e}")),
@@ -1135,9 +1234,12 @@ async fn respond(
     // guest to keep producing while hyper drains at the client's pace. The
     // task ends when the response is fully relayed or the watchdog stops it.
     let label = loaded.label.clone();
-    let live = handler.live.clone();
     tokio::spawn(async move {
-        let _live = LiveStore::mark(&live);
+        // Locals drop in reverse: the store, then its mark, then its slots.
+        let _slot = slot;
+        let _share = share;
+        let _live = live;
+        let mut store = store;
         let (_watch, watched) = watch::channel(Some(InFlight {
             reply: reply.clone(),
             deadline,
@@ -1161,21 +1263,101 @@ pub struct Handler {
     loaded: Arc<Loaded>,
     sandbox: Sandbox,
     pool: Option<Arc<Pool>>,
+    /// The process-wide instance slots every store of the route takes.
+    instances: Arc<Instances>,
     /// Backing for `live_stores`, marked by `LiveStore`.
-    live: Arc<AtomicUsize>,
+    live: Arc<Gauge>,
 }
 
 impl Handler {
-    /// Starts the route's pool when its sandbox names one.
-    pub fn new(loaded: Arc<Loaded>, sandbox: Sandbox) -> Arc<Handler> {
-        let live = Arc::new(AtomicUsize::new(0));
-        let pool = (sandbox.pool > 0).then(|| Pool::new(loaded.clone(), sandbox, live.clone()));
-        Arc::new(Handler {
+    /// Starts the route's pool when its sandbox names one; its units take
+    /// their slots of `instances` for good, so a pool larger than the slots
+    /// left fails here (at startup).
+    pub fn new(
+        loaded: Arc<Loaded>,
+        sandbox: Sandbox,
+        instances: &Arc<Instances>,
+    ) -> Result<Arc<Handler>, String> {
+        let live = Arc::new(Gauge::default());
+        let pool = match sandbox.pool {
+            0 => None,
+            units => {
+                let free = instances.slots.available_permits();
+                let slots = (0..units)
+                    .map(|_| instances.slots.clone().try_acquire_owned().ok())
+                    .collect::<Option<Vec<Slot>>>()
+                    .ok_or_else(|| {
+                        format!(
+                            "pool={units} needs {units} instance slots, {free} left of \
+                             --max-instances {}",
+                            instances.max
+                        )
+                    })?;
+                Some(Pool::new(loaded.clone(), sandbox, live.clone(), slots))
+            }
+        };
+        Ok(Arc::new(Handler {
             live,
             loaded,
             sandbox,
             pool,
-        })
+            instances: instances.clone(),
+        }))
+    }
+
+    /// Finds the request an instance: first one of its connection's slots,
+    /// then an idle pooled unit, else a slot for a per-request instance.
+    /// With none free it waits until `deadline` -- for the share, then for
+    /// whichever comes first of a unit going idle and a slot freeing -- and
+    /// keeps its place in the slots' queue meanwhile.
+    async fn admit(
+        &self,
+        request: hyper::Request<hyper::body::Incoming>,
+        reply: &Reply,
+        share: &Arc<tokio::sync::Semaphore>,
+        deadline: tokio::time::Instant,
+    ) -> Admission {
+        let expired = tokio::time::sleep_until(deadline);
+        tokio::pin!(expired);
+        let share = tokio::select! {
+            biased;
+            share = share.clone().acquire_owned() => share.expect("never closed"),
+            () = &mut expired => return Admission::Full,
+        };
+        let mut job = Job {
+            request,
+            reply: reply.clone(),
+            deadline,
+            share,
+        };
+        let slot = self.instances.slots.clone().acquire_owned();
+        tokio::pin!(slot);
+        loop {
+            let Some(pool) = &self.pool else {
+                return tokio::select! {
+                    biased;
+                    slot = &mut slot => Admission::Cold(job, slot.expect("never closed")),
+                    () = &mut expired => Admission::Full,
+                };
+            };
+            // Registered before the dispatch, so a unit offered in between
+            // still wakes this request.
+            let offered = pool.offered.notified();
+            tokio::pin!(offered);
+            offered.as_mut().enable();
+            job = match pool.dispatch(job) {
+                Ok(()) => return Admission::Pooled,
+                Err(job) => job,
+            };
+            tokio::select! {
+                biased;
+                // a warm unit first: a slot acquired meanwhile stays in the
+                // pinned future for the next round, or frees with it
+                () = &mut offered => {}
+                slot = &mut slot => return Admission::Cold(job, slot.expect("never closed")),
+                () = &mut expired => return Admission::Full,
+            }
+        }
     }
 
     /// Stores whose owning task is alive: the pool's units and the
@@ -1183,7 +1365,19 @@ impl Handler {
     /// a completion -- is one mark fewer.
     #[cfg(test)]
     pub fn live_stores(&self) -> usize {
-        self.live.load(Ordering::Relaxed)
+        self.live.live.load(Ordering::Relaxed)
+    }
+
+    /// The most stores alive at once so far.
+    #[cfg(test)]
+    fn peak_stores(&self) -> usize {
+        self.live.peak.load(Ordering::Relaxed)
+    }
+
+    /// Stores ever created.
+    #[cfg(test)]
+    fn stores_created(&self) -> usize {
+        self.live.created.load(Ordering::Relaxed)
     }
 }
 
@@ -1202,16 +1396,22 @@ enum Outcome {
 struct Job {
     request: hyper::Request<hyper::body::Incoming>,
     reply: Reply,
+    /// End of the request's budget, which started at its arrival.
+    deadline: tokio::time::Instant,
+    /// The connection's slot the request holds while it is served.
+    share: Share,
 }
 
 /// A per-route pool of warm `(Store, Service)` units: each unit is a detached
 /// task owning its store for its lifetime, running `run_concurrent` once
 /// (which consumes the store) with a per-request job loop inside. A unit
 /// serves one request at a time; the pool's size is the warm concurrency, and
-/// requests beyond it fall back to the per-request path (`respond`), so the
-/// pool only ever improves the warm latency. Measured on the hello guest (the
-/// ignored `load_comparison_reference`, sequential requests, dev profile):
-/// ~380us cold vs ~120us pooled per request.
+/// requests beyond it fall back to the per-request path (`respond`) while an
+/// instance slot is free, so the pool only ever improves the warm latency.
+/// Measured on the hello guest (the ignored `load_comparison_reference`,
+/// sequential requests, dev profile): ~380us cold vs ~120us pooled per
+/// request. Every unit holds an instance slot for its lifetime, handed on to
+/// its replacement.
 ///
 /// Reuse assumes stateless / reentrant-safe guests: module state legitimately
 /// persists across a unit's requests. A guest that misbehaves poisons its own
@@ -1222,8 +1422,11 @@ struct Pool {
     loaded: Arc<Loaded>,
     sandbox: Sandbox,
     /// The handler's gauge: every unit marks its store on it.
-    live: Arc<AtomicUsize>,
+    live: Arc<Gauge>,
     state: Mutex<PoolState>,
+    /// Signalled whenever a unit is offered, for requests waiting on an
+    /// instance (`Handler::admit`).
+    offered: tokio::sync::Notify,
 }
 
 struct PoolState {
@@ -1240,59 +1443,59 @@ struct PoolState {
 }
 
 impl Pool {
-    /// Spawns `sandbox.pool` units. Each instantiates asynchronously and is
-    /// offered once ready; until then requests take the per-request path.
-    fn new(loaded: Arc<Loaded>, sandbox: Sandbox, live: Arc<AtomicUsize>) -> Arc<Self> {
+    /// Spawns one unit per slot (`sandbox.pool` of them). Each instantiates
+    /// asynchronously and is offered once ready; until then requests take
+    /// the per-request path.
+    fn new(loaded: Arc<Loaded>, sandbox: Sandbox, live: Arc<Gauge>, slots: Vec<Slot>) -> Arc<Self> {
         let pool = Arc::new(Self {
             state: Mutex::new(PoolState {
                 idle: Vec::new(),
-                units: sandbox.pool,
+                units: slots.len(),
                 spawned: 0,
                 served: 0,
             }),
             live,
             loaded,
             sandbox,
+            offered: tokio::sync::Notify::new(),
         });
-        for _ in 0..sandbox.pool {
-            Self::spawn_unit(pool.clone());
+        for slot in slots {
+            Self::spawn_unit(pool.clone(), slot);
         }
         pool
     }
 
-    /// Starts one unit, already counted in `units`.
-    fn spawn_unit(pool: Arc<Pool>) {
+    /// Starts one unit on `slot`, already counted in `units`.
+    fn spawn_unit(pool: Arc<Pool>, slot: Slot) {
         pool.state.lock().unwrap().spawned += 1;
-        tokio::spawn(run_unit(pool));
+        tokio::spawn(run_unit(pool, slot));
     }
 
-    /// Hands the request to an idle unit. `Err(request)` when none accepted
-    /// it (no stock, or a unit vanished): the caller instantiates per request.
+    /// Offers an idle unit and wakes a request waiting for an instance.
+    fn offer(&self, unit: mpsc::Sender<Job>) {
+        self.state.lock().unwrap().idle.push(unit);
+        self.offered.notify_one();
+    }
+
+    /// Hands the job to an idle unit. `Err(job)` when none accepted it (no
+    /// stock, or a unit vanished): the caller instantiates per request.
     #[expect(
         clippy::result_large_err,
-        reason = "handed back once, on the cold path that instantiates anyway"
+        reason = "handed back to the caller, which waits or instantiates anyway"
     )]
-    fn dispatch(
-        &self,
-        mut request: hyper::Request<hyper::body::Incoming>,
-        reply: &Reply,
-    ) -> Result<(), hyper::Request<hyper::body::Incoming>> {
+    fn dispatch(&self, mut job: Job) -> Result<(), Job> {
         loop {
             let Some(tx) = self.state.lock().unwrap().idle.pop() else {
-                return Err(request);
+                return Err(job);
             };
-            let job = Job {
-                request,
-                reply: reply.clone(),
-            };
-            request = match tx.try_send(job) {
+            job = match tx.try_send(job) {
                 Ok(()) => {
                     self.state.lock().unwrap().served += 1;
                     return Ok(());
                 }
                 // A unit died since it went idle; its entry is stale.
                 Err(tokio::sync::mpsc::error::TrySendError::Full(job))
-                | Err(tokio::sync::mpsc::error::TrySendError::Closed(job)) => job.request,
+                | Err(tokio::sync::mpsc::error::TrySendError::Closed(job)) => job,
             };
         }
     }
@@ -1322,13 +1525,17 @@ impl Pool {
     }
 }
 
-/// Runs at unit exit, however it exits: frees the slot and, unless the unit
-/// never got viable, spawns a replacement while the pool is below target.
+/// Runs at unit exit, however it exits, after the unit's store is gone:
+/// frees the unit's place and, unless the unit never got viable, spawns a
+/// replacement on its instance slot while the pool is below target; else the
+/// slot frees.
 struct Retire {
     pool: Arc<Pool>,
     /// False when the unit never served (e.g. its instantiate failed): the
     /// pool shrinks instead of respawning into the same failure.
     replace: bool,
+    /// The unit's instance slot.
+    slot: Option<Slot>,
 }
 
 impl Drop for Retire {
@@ -1343,16 +1550,19 @@ impl Drop for Retire {
             respawn
         };
         if respawn {
-            Pool::spawn_unit(self.pool.clone());
+            let slot = self.slot.take().expect("a unit holds its slot");
+            Pool::spawn_unit(self.pool.clone(), slot);
         }
     }
 }
 
-/// The body of one pooled unit.
-async fn run_unit(pool: Arc<Pool>) {
+/// The body of one pooled unit, on its instance slot.
+async fn run_unit(pool: Arc<Pool>, slot: Slot) {
+    // Declared first, so dropped last: after the store.
     let mut retire = Retire {
         pool: pool.clone(),
         replace: true,
+        slot: Some(slot),
     };
     let loaded = pool.loaded.clone();
     let budget = pool.sandbox.limits.budget;
@@ -1373,22 +1583,23 @@ async fn run_unit(pool: Arc<Pool>) {
     // Offered only now: a request never queues behind an instantiate that
     // may fail.
     let (tx, mut rx) = mpsc::channel::<Job>(1);
-    pool.state.lock().unwrap().idle.push(tx.clone());
+    pool.offer(tx.clone());
 
     let (watch, watched) = watch::channel(None);
     let driven = store.run_concurrent(async move |accessor| {
         while let Some(job) = rx.recv().await {
-            // The budget covers handler, request body drain and response
-            // relay alike; re-armed per request on both clocks. A unit idle
-            // past its budget just re-arms on the next job.
+            // The request's budget, from its arrival, covers handler,
+            // request body drain and response relay alike; re-armed per
+            // request on both clocks. A unit idle past a budget just
+            // re-arms on the next job.
             watch.send_replace(Some(InFlight {
                 reply: job.reply.clone(),
-                deadline: tokio::time::Instant::now() + budget,
+                deadline: job.deadline,
             }));
             accessor.with(|mut store| {
                 store
                     .as_context_mut()
-                    .set_epoch_deadline(budget_ticks(budget));
+                    .set_epoch_deadline(budget_ticks(remaining(job.deadline)));
                 store.data_mut().limiter.rearm();
             });
 
@@ -1412,7 +1623,7 @@ async fn run_unit(pool: Arc<Pool>) {
                 eprintln!("[wasm] recycling {} pool unit: {reason}", pool.loaded.label);
                 break;
             }
-            pool.state.lock().unwrap().idle.push(tx.clone());
+            pool.offer(tx.clone());
         }
     });
 
@@ -1425,7 +1636,9 @@ async fn run_unit(pool: Arc<Pool>) {
 
 /// Serves one tunnel connection by feeding its frames through hyper and the
 /// route's handler (shared across connections); http/1.1 and h2c are
-/// auto-detected.
+/// auto-detected. An http/1.1 connection has one request in flight at a
+/// time; an h2 one announces `Instances::streams_per_connection` streams,
+/// and its requests hold at most that many instances at once.
 ///
 /// The server's CLOSE (the public client's FIN) is a half-close: http/1.1
 /// runs with hyper's `half_close`, so a request already received is still
@@ -1451,13 +1664,16 @@ pub async fn serve(mut io: TunnelIo, handler: Arc<Handler>) {
         io.peek_prefix(b"PRI")
     };
 
+    let streams = handler.instances.streams_per_connection();
+    let share = handler.instances.share();
     let service = hyper::service::service_fn(move |req| {
-        let handler = handler.clone();
-        async move { Ok::<_, std::convert::Infallible>(respond(&handler, req).await) }
+        let (handler, share) = (handler.clone(), share.clone());
+        async move { Ok::<_, std::convert::Infallible>(respond(&handler, &share, req).await) }
     });
     let served = async {
         if h2 {
             hyper::server::conn::http2::Builder::new(TokioExecutor)
+                .max_concurrent_streams(streams)
                 .serve_connection(hyper_util::rt::TokioIo::new(io), service)
                 .await
         } else {
@@ -1535,6 +1751,11 @@ mod tests {
 
     fn hello_wasm() -> std::path::PathBuf {
         guest_wasm("hello")
+    }
+
+    /// A route handler without an instance limit to speak of.
+    fn route(loaded: Arc<Loaded>, sandbox: Sandbox) -> Arc<Handler> {
+        Handler::new(loaded, sandbox, &Instances::new(Instances::MAX)).unwrap()
     }
 
     /// Process-wide copy of every log line, guest or host, so tests can
@@ -1621,7 +1842,7 @@ mod tests {
             started.elapsed() / iterations
         };
 
-        let cold = mean(&Handler::new(loaded.clone(), Sandbox::default())).await;
+        let cold = mean(&route(loaded.clone(), Sandbox::default())).await;
         let handler = pooled(&loaded, Sandbox::default(), 4);
         restocked(&handler, 4).await;
         let pooled = mean(&handler).await;
@@ -1728,7 +1949,7 @@ mod tests {
     /// predating the window) serves as before: no grant, no ERROR.
     #[tokio::test]
     async fn a_legacy_connection_serves_without_flow_control_frames() {
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         let mut peer = open_with(&handler, &get("/"), 0).await;
         let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
         let response = String::from_utf8(data_bytes(&frames, 1)).unwrap();
@@ -1748,7 +1969,7 @@ mod tests {
     /// released. After the server's CLOSE, CLOSE alone.
     #[tokio::test]
     async fn a_windowed_connection_ends_with_error_unless_the_server_closed() {
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         let mut peer = open(&handler, &get("/")).await;
         let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
         let tail: Vec<_> = frames
@@ -1796,7 +2017,7 @@ mod tests {
                 })
                 .collect()
         }
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         for window in [0, crate::tunnel::WINDOW] {
             // a head cut short by the server's CLOSE: hyper fails the read;
             // the server closed, so CLOSE is owed, not ERROR
@@ -1813,7 +2034,7 @@ mod tests {
         // a response body cut short by the budget fails hyper while the
         // server may still send: ERROR alone (windowed), so the public peer
         // sees an abort, not a clean end; CLOSE (legacy)
-        let short = Handler::new(
+        let short = route(
             hello().await,
             Sandbox {
                 limits: Limits {
@@ -1847,7 +2068,7 @@ mod tests {
     /// grant: hyper's writes never put more on the wire than granted.
     #[tokio::test]
     async fn a_windowed_response_stops_at_the_servers_credit() {
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         let mut peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
         peer.auto_grant = false;
         peer.connect(1, ROUTE, 64 * 1024).await;
@@ -1882,7 +2103,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         let mut peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
         peer.auto_grant = false;
         peer.connect(1, ROUTE, crate::tunnel::WINDOW).await;
@@ -1991,7 +2212,7 @@ mod tests {
     /// the connection ends with ERROR, which releases the server's upload.
     #[tokio::test]
     async fn an_upload_flows_on_grants_and_an_unread_rest_is_released() {
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         let mut peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
         peer.connect(1, ROUTE, crate::tunnel::WINDOW).await;
         let body_len = 4 * crate::tunnel::WINDOW as usize;
@@ -2038,7 +2259,7 @@ mod tests {
     /// stream is served at once.
     #[tokio::test]
     async fn a_stalled_upload_leaves_other_connections_served() {
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         let mut peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
         peer.connect(1, ROUTE, crate::tunnel::WINDOW).await;
         let body_len = 8 * crate::tunnel::WINDOW as usize;
@@ -2097,7 +2318,7 @@ mod tests {
             ..Sandbox::default()
         };
         let body = exchange(
-            &Handler::new(loaded.clone(), sandbox),
+            &route(loaded.clone(), sandbox),
             "GET /spin HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
         )
         .await;
@@ -2105,7 +2326,7 @@ mod tests {
         assert!(body.contains("budget"), "body: {body}");
 
         let body = exchange(
-            &Handler::new(loaded.clone(), Sandbox::default()),
+            &route(loaded.clone(), Sandbox::default()),
             "GET / HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
         )
         .await;
@@ -2128,14 +2349,14 @@ mod tests {
             ..Sandbox::default()
         };
         let body = exchange(
-            &Handler::new(loaded.clone(), sandbox),
+            &route(loaded.clone(), sandbox),
             "GET /balloon HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
         )
         .await;
         assert!(body.starts_with("HTTP/1.1 5"), "head: {body}");
 
         let body = exchange(
-            &Handler::new(loaded.clone(), sandbox),
+            &route(loaded.clone(), sandbox),
             "GET / HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
         )
         .await;
@@ -2151,7 +2372,7 @@ mod tests {
         let loaded = load(&Locator::File(wasm), Caps::default()).await.unwrap();
 
         let mut peer = open(
-            &Handler::new(loaded, Sandbox::default()),
+            &route(loaded, Sandbox::default()),
             "GET /stream HTTP/1.1\r\nhost: demo.local\r\nconnection: close\r\n\r\n",
         )
         .await;
@@ -2210,7 +2431,7 @@ mod tests {
             .await
             .unwrap();
         let body = exchange(
-            &Handler::new(loaded.clone(), Sandbox::default()),
+            &route(loaded.clone(), Sandbox::default()),
             "GET /log HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
         )
         .await;
@@ -2305,11 +2526,7 @@ mod tests {
             caps,
             ..Sandbox::default()
         };
-        let body = exchange(
-            &Handler::new(loaded.clone(), sandbox),
-            &relay_request(upstream),
-        )
-        .await;
+        let body = exchange(&route(loaded.clone(), sandbox), &relay_request(upstream)).await;
         assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
         assert!(
             body.contains(&format!("relayed from {upstream}")),
@@ -2333,11 +2550,7 @@ mod tests {
                 caps,
                 ..Sandbox::default()
             };
-            let body = exchange(
-                &Handler::new(loaded.clone(), sandbox),
-                &relay_request(upstream),
-            )
-            .await;
+            let body = exchange(&route(loaded.clone(), sandbox), &relay_request(upstream)).await;
             assert!(body.starts_with("HTTP/1.1 502"), "{granted}: {body}");
             assert!(body.contains("AccessDenied"), "{granted}: {body}");
         }
@@ -2350,11 +2563,7 @@ mod tests {
             caps,
             ..Sandbox::default()
         };
-        let body = exchange(
-            &Handler::new(loaded.clone(), sandbox),
-            &relay_request(upstream),
-        )
-        .await;
+        let body = exchange(&route(loaded.clone(), sandbox), &relay_request(upstream)).await;
         assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
     }
 
@@ -2436,7 +2645,7 @@ mod tests {
         let upstream = pong_upstream().await;
         let url = format!("http://{upstream}/ping?x=1");
         let body = exchange(
-            &Handler::new(loaded.clone(), Sandbox::default()),
+            &route(loaded.clone(), Sandbox::default()),
             &fetch_request(&url),
         )
         .await;
@@ -2465,7 +2674,7 @@ mod tests {
         });
         let url = format!("http://{hangup}/");
         let body = exchange(
-            &Handler::new(loaded.clone(), Sandbox::default()),
+            &route(loaded.clone(), Sandbox::default()),
             &fetch_request(&url),
         )
         .await;
@@ -2478,7 +2687,7 @@ mod tests {
         let upstream = pong_upstream().await;
         let url = format!("http://{upstream}/");
         let body = exchange(
-            &Handler::new(loaded.clone(), Sandbox::default()),
+            &route(loaded.clone(), Sandbox::default()),
             &fetch_request(&url),
         )
         .await;
@@ -2568,7 +2777,7 @@ mod tests {
 
     /// A handler whose route keeps `units` warm instances.
     fn pooled(loaded: &Arc<Loaded>, sandbox: Sandbox, units: usize) -> Arc<Handler> {
-        Handler::new(
+        route(
             loaded.clone(),
             Sandbox {
                 pool: units,
@@ -2805,7 +3014,7 @@ mod tests {
             },
             ..Sandbox::default()
         };
-        let cold = Handler::new(loaded.clone(), sandbox);
+        let cold = route(loaded.clone(), sandbox);
         let warm = pooled(&loaded, sandbox, 1);
         restocked(&warm, 1).await;
 
@@ -3000,7 +3209,7 @@ mod tests {
     /// well before its budget, and the handler keeps serving.
     #[tokio::test]
     async fn a_client_leaving_mid_body_frees_the_cold_store_before_the_budget() {
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         assert_eq!(
             handler.live_stores(),
             0,
@@ -3078,7 +3287,7 @@ mod tests {
     /// never served; the slot frees once the admitted connection ends.
     #[tokio::test]
     async fn a_connect_beyond_the_limit_is_refused_until_a_slot_frees() {
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         let limit = crate::tunnel::Limit::new(1);
         let mut peer = Peer::limited(
             HashMap::from([(ROUTE.to_string(), handler.clone())]),
@@ -3150,7 +3359,7 @@ mod tests {
     /// CLOSE right behind the request) still gets the response.
     #[tokio::test]
     async fn a_request_followed_by_the_servers_half_close_is_answered() {
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         for window in [0, crate::tunnel::WINDOW] {
             let mut peer = open_with(&handler, &get("/"), window).await;
             peer.send(Body::Close(crate::pb::Close { conn_id: 1 }))
@@ -3168,7 +3377,7 @@ mod tests {
     /// owed) and frees its slot.
     #[tokio::test]
     async fn a_half_closed_connection_gets_the_whole_response_then_closes() {
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         let keep_alive = "GET / HTTP/1.1\r\nhost: t\r\n\r\n";
         for request in [get("/"), keep_alive.to_string()] {
             for window in [0, crate::tunnel::WINDOW] {
@@ -3201,7 +3410,7 @@ mod tests {
     /// before its first byte.
     #[tokio::test]
     async fn a_streamed_response_survives_the_servers_half_close() {
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         for window in [0, crate::tunnel::WINDOW] {
             let mut peer = open_with(&handler, &get("/stream"), window).await;
             half_close(&peer).await;
@@ -3222,7 +3431,7 @@ mod tests {
     /// CLOSE and frees its slot: the truncation is no reason to wait.
     #[tokio::test]
     async fn a_request_body_cut_short_by_the_half_close_ends_the_connection() {
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         let post = "POST / HTTP/1.1\r\nhost: t\r\ncontent-length: 100\r\n\r\n0123456789";
         for window in [0, crate::tunnel::WINDOW] {
             let limit = crate::tunnel::Limit::new(1);
@@ -3278,7 +3487,7 @@ mod tests {
     #[tokio::test]
     async fn a_half_closed_stalled_request_ends_at_the_budget() {
         let budget = Duration::from_millis(1500);
-        let handler = Handler::new(
+        let handler = route(
             hello().await,
             Sandbox {
                 limits: Limits {
@@ -3318,7 +3527,7 @@ mod tests {
     /// request's store; it is not the stream's teardown that does it.
     #[tokio::test]
     async fn the_servers_error_alone_frees_a_stalled_store() {
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         let peer = stalled_connection(&handler).await;
         assert_eq!(handler.live_stores(), 1, "the request's store is held");
         peer.error(1, "public peer left").await;
@@ -3337,7 +3546,7 @@ mod tests {
     /// before the budget.
     #[tokio::test]
     async fn the_streams_end_frees_a_stalled_store() {
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         let peer = stalled_connection(&handler).await;
         assert_eq!(handler.live_stores(), 1, "the request's store is held");
         peer.connections.teardown();
@@ -3353,7 +3562,7 @@ mod tests {
     /// store before the budget.
     #[tokio::test]
     async fn payload_past_the_window_frees_a_stalled_store() {
-        let handler = Handler::new(hello().await, Sandbox::default());
+        let handler = route(hello().await, Sandbox::default());
         let mut peer = stalled_connection(&handler).await;
         peer.data(1, &vec![0x5a; crate::tunnel::WINDOW as usize + 1])
             .await;
@@ -3367,5 +3576,517 @@ mod tests {
             vec![format!("ERROR {}", crate::tunnel::WINDOW_EXCEEDED)],
             "{frames:?}"
         );
+    }
+
+    // -- instance limit -----------------------------------------------------
+
+    /// A route on `instances`, with `budget` (the default when None).
+    fn limited(
+        loaded: &Arc<Loaded>,
+        instances: &Arc<Instances>,
+        budget: Option<Duration>,
+    ) -> Arc<Handler> {
+        let mut sandbox = Sandbox::default();
+        if let Some(budget) = budget {
+            sandbox.limits.budget = budget;
+        }
+        Handler::new(loaded.clone(), sandbox, instances).unwrap()
+    }
+
+    /// Waits for the end of conn 1's response: the HTTP response, or None
+    /// when nothing arrives within `within`.
+    async fn answered(peer: &mut Peer, within: Duration) -> Option<String> {
+        tokio::time::timeout(within, response_raw(peer))
+            .await
+            .ok()
+            .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+    }
+
+    #[test]
+    fn half_the_instances_are_one_connections_streams() {
+        let streams = |max| Instances::new(max).streams_per_connection();
+        assert_eq!(streams(1), 1);
+        assert_eq!(streams(2), 1);
+        assert_eq!(streams(3), 1);
+        assert_eq!(streams(64), 32);
+        assert_eq!(streams(Instances::MAX), u32::MAX);
+    }
+
+    /// With every slot held, a further request waits -- no store is created
+    /// for it -- and is served once a slot frees, in arrival order.
+    #[tokio::test]
+    async fn a_request_beyond_the_instance_limit_waits_for_a_slot() {
+        let instances = Instances::new(2);
+        let handler = limited(&hello().await, &instances, None);
+        let first = stalled_connection(&handler).await;
+        let second = stalled_connection(&handler).await;
+        assert_eq!(instances.held(), 2, "both slots held");
+
+        // the third holds the slot it gets (a stalled body), the fourth not
+        let mut third = open(&handler, &get("/stall")).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut fourth = open(&handler, &get("/")).await;
+        let waiting = frames_until_quiet(&mut third, Duration::from_millis(300)).await;
+        assert!(waiting.is_empty(), "{waiting:?}");
+        assert_eq!(
+            answered(&mut fourth, Duration::from_millis(100)).await,
+            None
+        );
+        assert_eq!(
+            handler.live_stores(),
+            2,
+            "no store for the waiting requests"
+        );
+
+        first.error(1, "public peer left").await;
+        let head = tokio::time::timeout(Duration::from_secs(3), third.recv())
+            .await
+            .expect("the first waiter takes the freed slot");
+        assert!(
+            matches!(head.and_then(|frame| frame.body), Some(Body::Data(data))
+                if data.payload.starts_with(b"HTTP/1.1 200")),
+            "the third's response starts"
+        );
+        assert_eq!(
+            answered(&mut fourth, Duration::from_millis(300)).await,
+            None,
+            "the later waiter still waits: one slot freed"
+        );
+
+        second.error(1, "public peer left").await;
+        let response = answered(&mut fourth, Duration::from_secs(3)).await;
+        assert!(
+            response
+                .as_deref()
+                .is_some_and(|r| r.starts_with("HTTP/1.1 200")),
+            "{response:?}"
+        );
+        assert_eq!(handler.peak_stores(), 2, "never more stores than slots");
+        assert_eq!(handler.stores_created(), 4);
+        third.error(1, "public peer left").await;
+        eventually("every slot frees", Duration::from_secs(3), || {
+            instances.held() == 0
+        })
+        .await;
+    }
+
+    /// A request finding no slot within its budget is answered 503 at the
+    /// budget, without ever getting an instance.
+    #[tokio::test]
+    async fn a_request_finding_no_slot_within_its_budget_is_a_503() {
+        let loaded = hello().await;
+        let instances = Instances::new(1);
+        let holder = limited(&loaded, &instances, None);
+        let budget = Duration::from_millis(800);
+        let waiter = limited(&loaded, &instances, Some(budget));
+        let occupant = stalled_connection(&holder).await;
+
+        let started = Instant::now();
+        let mut peer = open(&waiter, &get("/")).await;
+        let response = answered(&mut peer, budget + Duration::from_secs(2))
+            .await
+            .expect("answered at the budget");
+        let elapsed = started.elapsed();
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.contains(INSTANCE_LIMIT_REACHED), "{response}");
+        assert!(elapsed >= budget, "not before the budget: {elapsed:?}");
+        assert!(elapsed < budget + Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(waiter.stores_created(), 0, "the waiter got no instance");
+        assert_eq!(instances.held(), 1, "the occupant still holds its slot");
+        drop(occupant);
+    }
+
+    /// The wait counts against the request's budget: admitted late -- to a
+    /// per-request instance, or to a pooled unit -- the request runs only for
+    /// what is left of it.
+    #[tokio::test]
+    async fn the_wait_for_a_slot_counts_against_the_budget() {
+        let loaded = hello().await;
+        let budget = Duration::from_millis(1500);
+        for pooled in [false, true] {
+            let instances = Instances::new(1);
+            let mut sandbox = Sandbox::default();
+            sandbox.limits.budget = budget;
+            let (holder, waiter) = if pooled {
+                sandbox.pool = 1;
+                let handler = Handler::new(loaded.clone(), sandbox, &instances).unwrap();
+                restocked(&handler, 1).await;
+                (handler.clone(), handler)
+            } else {
+                (
+                    limited(&loaded, &instances, None),
+                    Handler::new(loaded.clone(), sandbox, &instances).unwrap(),
+                )
+            };
+            let occupant = stalled_connection(&holder).await;
+            let created = waiter.stores_created();
+
+            let started = Instant::now();
+            let mut peer = open(&waiter, &get("/stall")).await;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            assert_eq!(
+                waiter.stores_created(),
+                created,
+                "pooled {pooled}: still waiting at 1s"
+            );
+            occupant.error(1, "public peer left").await;
+
+            // admitted at ~1s: the stalled body ends at the budget from arrival
+            let end = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut started = false;
+                loop {
+                    match peer.recv().await.and_then(|frame| frame.body) {
+                        Some(Body::Data(_)) => started = true,
+                        other => return (started, other),
+                    }
+                }
+            })
+            .await
+            .expect("the request ends");
+            let elapsed = started.elapsed();
+            assert!(
+                matches!(end, (true, Some(Body::Close(_) | Body::Error(_)))),
+                "pooled {pooled}: admitted, then ended: {end:?}"
+            );
+            assert!(elapsed >= budget, "pooled {pooled}: {elapsed:?}");
+            assert!(
+                elapsed < budget + Duration::from_millis(700),
+                "pooled {pooled}: ended at the budget from its arrival, not a fresh one: \
+                 {elapsed:?}"
+            );
+            if pooled {
+                assert_eq!(pool(&waiter).served(), 2, "both requests pooled");
+            }
+        }
+    }
+
+    /// Asserts the only slot of `instances` frees, then serves a follow-up
+    /// request on it.
+    async fn assert_slot_freed(instances: &Arc<Instances>, loaded: &Arc<Loaded>, what: &str) {
+        eventually(what, Duration::from_secs(3), || instances.held() == 0).await;
+        let next = limited(loaded, instances, None);
+        let body = tokio::time::timeout(Duration::from_secs(5), exchange(&next, &get("/")))
+            .await
+            .unwrap_or_else(|_| panic!("{what}: the follow-up is served"));
+        assert!(body.starts_with("HTTP/1.1 200"), "{what}: {body}");
+    }
+
+    /// The slot frees when the request ends by its budget: the watchdog
+    /// stopping a suspended guest, and the epoch interrupting a busy one.
+    #[tokio::test]
+    async fn the_slot_frees_when_the_budget_ends_the_request() {
+        let loaded = hello().await;
+        for (path, budget) in [("/stall", 300), ("/spin", 100)] {
+            let instances = Instances::new(1);
+            let handler = limited(&loaded, &instances, Some(Duration::from_millis(budget)));
+            let mut peer = open(&handler, &get(path)).await;
+            // a spinning guest holds this current-thread runtime until its
+            // budget: the request's instance is the precondition seen after
+            let frames = frames_until_quiet(&mut peer, Duration::from_secs(1)).await;
+            assert_eq!(handler.stores_created(), 1, "{path}: it had an instance");
+            assert!(!terminal_frames(&frames).is_empty(), "{path}: ended");
+            assert_slot_freed(&instances, &loaded, path).await;
+        }
+    }
+
+    /// The slot frees when the client leaves (the server's ERROR), also
+    /// after a half-close -- which by itself keeps the request and its slot.
+    #[tokio::test]
+    async fn the_slot_frees_when_the_client_leaves() {
+        let loaded = hello().await;
+        for half_closed in [false, true] {
+            let instances = Instances::new(1);
+            let handler = limited(&loaded, &instances, None);
+            let peer = stalled_connection(&handler).await;
+            if half_closed {
+                half_close(&peer).await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert_eq!(instances.held(), 1, "a half-close keeps the slot");
+            }
+            assert_eq!(instances.held(), 1);
+            peer.error(1, "public peer left").await;
+            assert_slot_freed(&instances, &loaded, &format!("half-closed {half_closed}")).await;
+            drop(peer);
+        }
+    }
+
+    /// The slot frees when the guest traps, and when its instantiation
+    /// fails.
+    #[tokio::test]
+    async fn the_slot_frees_on_a_guest_trap_and_a_failed_instantiation() {
+        let loaded = hello().await;
+        let instances = Instances::new(1);
+        let handler = limited(&loaded, &instances, None);
+        let body = exchange(&handler, &get("/panic")).await;
+        assert!(body.starts_with("HTTP/1.1 500"), "{body}");
+        assert_eq!(handler.stores_created(), 1);
+        assert_slot_freed(&instances, &loaded, "trap").await;
+
+        let tiny = Handler::new(
+            loaded.clone(),
+            Sandbox {
+                limits: Limits {
+                    memory: 1 << 20,
+                    ..Limits::default()
+                },
+                ..Sandbox::default()
+            },
+            &instances,
+        )
+        .unwrap();
+        let body = exchange(&tiny, &get("/")).await;
+        assert!(body.contains("instantiate failed"), "{body}");
+        assert_slot_freed(&instances, &loaded, "failed instantiation").await;
+    }
+
+    /// A request whose client leaves while it waits gives up its place: it
+    /// never takes the slot freed later.
+    #[tokio::test]
+    async fn a_request_whose_client_leaves_while_it_waits_never_takes_a_slot() {
+        let instances = Instances::new(1);
+        let handler = limited(&hello().await, &instances, None);
+        let occupant = stalled_connection(&handler).await;
+        let waiter = open(&handler, &get("/")).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        waiter.error(1, "public peer left").await;
+        eventually(
+            "the waiter's connection ends",
+            Duration::from_secs(1),
+            || !waiter.registered(1),
+        )
+        .await;
+
+        occupant.error(1, "public peer left").await;
+        eventually("the slot frees", Duration::from_secs(3), || {
+            instances.held() == 0
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(handler.stores_created(), 1, "only the occupant's store");
+        assert_eq!(instances.held(), 0);
+    }
+
+    /// Pooled units hold their slots: with every slot pooled, a request
+    /// finding no idle unit waits for one -- no per-request store is created
+    /// -- and a retired unit's replacement takes over its slot.
+    #[tokio::test]
+    async fn a_request_waits_for_an_idle_unit_when_the_units_hold_every_slot() {
+        let instances = Instances::new(1);
+        let handler = Handler::new(
+            hello().await,
+            Sandbox {
+                pool: 1,
+                ..Sandbox::default()
+            },
+            &instances,
+        )
+        .unwrap();
+        restocked(&handler, 1).await;
+        assert_eq!(instances.held(), 1, "the idle unit holds the slot");
+
+        let occupant = stalled_connection(&handler).await;
+        let mut waiter = open(&handler, &get("/")).await;
+        assert_eq!(
+            answered(&mut waiter, Duration::from_millis(300)).await,
+            None
+        );
+        assert_eq!(handler.live_stores(), 1, "no per-request store");
+
+        // the unit retires; its replacement, on the same slot, takes the
+        // waiting request once offered
+        occupant.error(1, "public peer left").await;
+        let response = answered(&mut waiter, Duration::from_secs(3)).await;
+        assert!(
+            response
+                .as_deref()
+                .is_some_and(|r| r.starts_with("HTTP/1.1 200")),
+            "{response:?}"
+        );
+        let pool = pool(&handler);
+        assert_eq!(pool.served(), 2, "both requests pooled");
+        assert_eq!(pool.spawned(), 2, "one replacement");
+        assert_eq!(handler.peak_stores(), 1, "never more stores than slots");
+        assert_eq!(instances.held(), 1, "the replacement holds the slot");
+    }
+
+    /// A unit that never got viable frees its slot for per-request
+    /// instances.
+    #[tokio::test]
+    async fn an_unviable_unit_frees_its_slot() {
+        let instances = Instances::new(1);
+        let handler = Handler::new(
+            hello().await,
+            Sandbox {
+                pool: 1,
+                limits: Limits {
+                    memory: 1 << 20,
+                    ..Limits::default()
+                },
+                ..Sandbox::default()
+            },
+            &instances,
+        )
+        .unwrap();
+        eventually("the pool shrinks", Duration::from_secs(5), || {
+            pool(&handler).units() == 0
+        })
+        .await;
+        assert_slot_freed(&instances, &hello().await, "unviable unit").await;
+    }
+
+    /// Pools are carved out of the limit at startup: one larger than the
+    /// slots left fails, and takes none.
+    #[tokio::test]
+    async fn a_pool_larger_than_the_slots_left_fails_at_startup() {
+        let loaded = hello().await;
+        let instances = Instances::new(3);
+        let sandbox = Sandbox {
+            pool: 2,
+            ..Sandbox::default()
+        };
+        let first = Handler::new(loaded.clone(), sandbox, &instances).unwrap();
+        assert_eq!(instances.held(), 2);
+        let error = match Handler::new(loaded.clone(), sandbox, &instances) {
+            Ok(_) => panic!("a second pool=2 fit in 1 slot"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "pool=2 needs 2 instance slots, 1 left of --max-instances 3"
+        );
+        assert_eq!(instances.held(), 2, "the failed pool took no slot");
+        drop(first);
+    }
+
+    /// An h2 client on conn 1 of a peer of its own, its bytes pumped
+    /// through the peer.
+    async fn h2_client(handler: &Arc<Handler>) -> h2::client::SendRequest<bytes::Bytes> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
+        peer.connect(1, ROUTE, crate::tunnel::WINDOW).await;
+        let (io, mut pumped) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                tokio::select! {
+                    read = pumped.read(&mut buf) => match read {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => peer.data(1, &buf[..n]).await,
+                    },
+                    frame = peer.recv() => match frame.and_then(|frame| frame.body) {
+                        Some(Body::Data(data)) => {
+                            if pumped.write_all(&data.payload).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Body::Close(_) | Body::Error(_)) | None => break,
+                        Some(_) => {}
+                    },
+                }
+            }
+        });
+        let (client, connection) = h2::client::handshake(io).await.expect("h2 handshake");
+        tokio::spawn(connection);
+        client
+    }
+
+    fn h2_get(path: &str) -> http::Request<()> {
+        http::Request::get(format!("http://t{path}"))
+            .body(())
+            .unwrap()
+    }
+
+    /// One h2 connection may have half the slots in flight: its further
+    /// streams wait at the client, and another connection is served at once.
+    #[tokio::test]
+    async fn one_h2_connection_cannot_take_every_slot() {
+        let loaded = hello().await;
+        let instances = Instances::new(2);
+        let handler = limited(&loaded, &instances, None);
+        let mut client = h2_client(&handler).await;
+
+        let (first, _) = client.send_request(h2_get("/stall"), true).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the first stream's head")
+            .unwrap();
+        assert_eq!(first.status(), 200);
+        assert_eq!(
+            client.current_max_send_streams(),
+            1,
+            "the connection's SETTINGS allow one stream"
+        );
+        client = client.ready().await.unwrap();
+        let (_second, _) = client.send_request(h2_get("/stall"), true).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(instances.held(), 1, "the connection holds one slot");
+
+        let other = limited(&loaded, &instances, Some(Duration::from_secs(1)));
+        let body = exchange(&other, &get("/")).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+    }
+
+    /// A reset stream keeps its connection's share until its instance is
+    /// gone, not just until the stream ended: a spinning guest runs on to
+    /// its budget after the reset, and the connection's next stream waits
+    /// for it instead of taking a further slot -- per request and on a
+    /// pooled unit. Multi-threaded, as the spin holds its worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reset_stream_keeps_its_share_until_its_instance_is_gone() {
+        let loaded = hello().await;
+        for pooled in [false, true] {
+            let instances = Instances::new(2);
+            let mut sandbox = Sandbox::default();
+            sandbox.limits.budget = Duration::from_millis(1500);
+            sandbox.pool = usize::from(pooled);
+            let spinning = Handler::new(loaded.clone(), sandbox, &instances).unwrap();
+            if pooled {
+                restocked(&spinning, 1).await;
+            }
+            let created = spinning.stores_created();
+            let mut client = h2_client(&spinning).await;
+            let (first, _) = client.send_request(h2_get("/spin"), true).unwrap();
+            eventually("the first is served", Duration::from_secs(2), || {
+                if pooled {
+                    pool(&spinning).served() == 1
+                } else {
+                    spinning.stores_created() == 1
+                }
+            })
+            .await;
+            eventually("the one-stream SETTINGS", Duration::from_secs(1), || {
+                client.current_max_send_streams() == 1
+            })
+            .await;
+
+            // the reset ends the stream; the spinning guest keeps its
+            // instance. The second stream comes later, so its budget
+            // outlasts the first's: the spin ends on epoch ticks, which lag
+            // the wall clock under load (up to ~2s for these 1.5s measured
+            // in the parallel suite).
+            drop(first);
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            client = client.ready().await.unwrap();
+            let (second, _) = client.send_request(h2_get("/spin"), true).unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                spinning.stores_created(),
+                created + usize::from(!pooled),
+                "pooled {pooled}: the second stream waits for the share"
+            );
+            assert_eq!(instances.held(), 1, "pooled {pooled}: one slot held");
+
+            let other = limited(&loaded, &instances, Some(Duration::from_secs(1)));
+            let body = exchange(&other, &get("/")).await;
+            assert!(body.starts_with("HTTP/1.1 200"), "pooled {pooled}: {body}");
+
+            // the first instance gone at its budget, the second stream runs
+            // into its own: a 504, not the 503 of a request never admitted
+            let second = tokio::time::timeout(Duration::from_secs(3), second)
+                .await
+                .expect("the second stream is answered")
+                .unwrap();
+            assert_eq!(second.status(), 504, "pooled {pooled}");
+        }
     }
 }
