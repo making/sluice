@@ -266,9 +266,9 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 	}
 
 	/**
-	 * Relays one admitted connection. The admission is released exactly when the
-	 * connection ends: here on every path that does not start the relay, by the relay's
-	 * completion otherwise.
+	 * Relays one admitted connection. The admission is released exactly once: here on
+	 * every path that does not start the relay, otherwise once the relay completed and
+	 * the frames its virtual connection queued left the tunnel sender.
 	 */
 	private void relay(Socket socket, int port, AccessLogger.Connection access, ConnectionLimits.Admission admission) {
 		boolean relaying = false;
@@ -321,7 +321,8 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 					active.decrementAndGet();
 					access.close();
 					session.remove(connection.connectionId());
-					admission.release();
+					// the slot covers what the connection still queues for the tunnel
+					connection.afterQueued(admission::release);
 				})
 				.build();
 			active.incrementAndGet();

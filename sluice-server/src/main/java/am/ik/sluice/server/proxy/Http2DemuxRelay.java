@@ -65,7 +65,10 @@ import io.micrometer.core.instrument.MeterRegistry;
  * connection ({@code ENHANCE_YOUR_CALM}). What a relay may not refuse -- DATA within the
  * windows it granted, resets and window updates -- is bounded per connection
  * ({@link #UNBUDGETED_BYTES}). A leg beyond the first takes a slot of the connection
- * limit; a stream whose route needs a leg while none is free is refused.
+ * limit; a stream whose route needs a leg while none is free is refused. A closed leg
+ * keeps its slot -- its own, or the connection's -- until the frames queued for it left
+ * the tunnel sender, and the connection's own slot is released once the relay ended and
+ * no leg holds it any more.
  * <p>
  * Towards each upstream the relay is a sender bound by the upstream's windows (RFC 9113
  * 6.9): the connection window and every stream's window, initially as the upstream's
@@ -255,6 +258,9 @@ final class Http2DemuxRelay {
 
 	private final Runnable onFinish;
 
+	/** Frees the connection's own slot; run once the relay ended and no leg holds it. */
+	private final Runnable release;
+
 	private final ConnectionLimits.KeepAliveDeadline deadline;
 
 	/** Serializes the writes of the shared client stream. */
@@ -312,8 +318,17 @@ final class Http2DemuxRelay {
 	/** Grants the withheld window once the budget has room; one instance, to dedupe. */
 	private final Runnable owedGrantRetry = this::retryOwedGrant;
 
-	/** A leg holds the slot of the connection itself; guarded by {@link #lock}. */
+	/**
+	 * A leg holds the slot of the connection itself -- alive, or closed with frames still
+	 * queued; guarded by {@link #lock}.
+	 */
 	private boolean baseLegTaken;
+
+	/**
+	 * {@link #release}, once the relay ended while a leg still held the connection's
+	 * slot; guarded by {@link #lock}.
+	 */
+	private @Nullable Runnable baseRelease;
 
 	/** The highest stream id routed, for GOAWAY; written by the outbound parse only. */
 	private volatile int lastStreamId;
@@ -364,7 +379,8 @@ final class Http2DemuxRelay {
 	Http2DemuxRelay(DuplexPipe pipe, ConnectionHeadParser.Head head, Router router, SessionRegistry sessions,
 			AccessControl accessControl, ErrorResponse errorResponse, AccessLogger.Connection access,
 			H2DemuxMeters meters, ConnectionLimits limits, Router.Route initialRoute, TunnelSession initialSession,
-			@Nullable InetAddress peer, ConnectionLimits.KeepAliveDeadline deadline, Runnable onFinish) {
+			@Nullable InetAddress peer, ConnectionLimits.KeepAliveDeadline deadline, Runnable onFinish,
+			Runnable release) {
 		this.pipe = pipe;
 		this.seedHead = head.bytes();
 		this.router = router;
@@ -380,6 +396,7 @@ final class Http2DemuxRelay {
 		this.initialSession = initialSession;
 		this.peer = peer;
 		this.onFinish = onFinish;
+		this.release = release;
 		this.deadline = deadline;
 		deadline.onExpiry(this::closeIdle);
 		try {
@@ -1212,23 +1229,27 @@ final class Http2DemuxRelay {
 		}
 	}
 
-	/** Frees a leg's slot: its own permit, or the connection's. */
+	/**
+	 * Frees a leg's slot: its own permit, or the connection's -- which the relay releases
+	 * when it ended already.
+	 */
 	private void releaseSlot(ConnectionLimit.@Nullable Permit permit) {
+		if (permit != null) {
+			permit.release();
+			return;
+		}
+		Runnable release;
 		this.lock.lock();
 		try {
-			releaseSlotLocked(permit);
+			this.baseLegTaken = false;
+			release = this.baseRelease;
+			this.baseRelease = null;
 		}
 		finally {
 			this.lock.unlock();
 		}
-	}
-
-	private void releaseSlotLocked(ConnectionLimit.@Nullable Permit permit) {
-		if (permit != null) {
-			permit.release();
-		}
-		else {
-			this.baseLegTaken = false;
+		if (release != null) {
+			release.run();
 		}
 	}
 
@@ -2081,6 +2102,16 @@ final class Http2DemuxRelay {
 				Http2DemuxRelay.this.lock.unlock();
 			}
 			this.connection.close();
+			releaseSlotAfterQueued();
+		}
+
+		/**
+		 * Frees the closed leg's slot once the frames queued for it left the tunnel
+		 * sender.
+		 */
+		private void releaseSlotAfterQueued() {
+			ConnectionLimit.@Nullable Permit permit = this.permit;
+			this.connection.afterQueued(() -> releaseSlot(permit));
 		}
 
 		/**
@@ -2110,6 +2141,7 @@ final class Http2DemuxRelay {
 				Http2DemuxRelay.this.lock.unlock();
 			}
 			this.connection.close();
+			releaseSlotAfterQueued();
 			for (Integer streamId : sending) {
 				writeToClient(rstStream(streamId, ERROR_NO_ERROR));
 			}
@@ -2145,7 +2177,6 @@ final class Http2DemuxRelay {
 			addQueuedLocked(null, -this.queuedBytes);
 			this.entries.clear();
 			this.pingAcks.clear();
-			releaseSlotLocked(this.permit);
 			this.wake.signalAll();
 			Http2DemuxRelay.this.legSettled.signalAll();
 			return true;
@@ -2384,12 +2415,20 @@ final class Http2DemuxRelay {
 			leg.close();
 			leg.session.remove(leg.connection.connectionId());
 		}
+		Runnable release = null;
 		this.lock.lock();
 		try {
 			// the legs released the budget's share; no grant is owed any more
 			this.grantsClosed = true;
 			this.owedGrant = 0;
 			this.budget.cancel(this.owedGrantRetry);
+			// a closed leg with frames queued still holds the connection's slot
+			if (this.baseLegTaken) {
+				this.baseRelease = this.release;
+			}
+			else {
+				release = this.release;
+			}
 		}
 		finally {
 			this.lock.unlock();
@@ -2407,6 +2446,9 @@ final class Http2DemuxRelay {
 		}
 		this.access.close();
 		this.onFinish.run();
+		if (release != null) {
+			release.run();
+		}
 	}
 
 	/** Tears the relay down after a failure or the loss of an owed response. */

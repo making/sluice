@@ -7,11 +7,15 @@ import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -166,6 +170,21 @@ public final class VirtualConnection implements AutoCloseable {
 	private final AtomicBoolean errorSent = new AtomicBoolean();
 
 	private volatile boolean writeClosed;
+
+	/**
+	 * {@link #afterQueued(Runnable)} ended the sending side; guarded by
+	 * {@link #writeLock}.
+	 */
+	private boolean sendingEnded;
+
+	/** Sends in flight in the frame writer; guarded by {@link #writeLock}. */
+	private int sending;
+
+	/**
+	 * Actions of {@link #afterQueued(Runnable)} waiting for the sends in flight; guarded
+	 * by {@link #writeLock}.
+	 */
+	private final List<Runnable> afterSends = new ArrayList<>(1);
 
 	/** The remote sent CLOSE or ERROR: no more DATA arrives from it. */
 	private volatile boolean remoteDone;
@@ -581,7 +600,7 @@ public final class VirtualConnection implements AutoCloseable {
 		this.writeLock.lock();
 		try {
 			while (true) {
-				if (this.writeClosed || this.closed) {
+				if (this.writeClosed || this.closed || this.sendingEnded) {
 					throw new IOException("connection %d is closed".formatted(this.connectionId));
 				}
 				String failure = this.failure;
@@ -608,6 +627,85 @@ public final class VirtualConnection implements AutoCloseable {
 		}
 		finally {
 			this.writeLock.unlock();
+		}
+	}
+
+	/**
+	 * Ends the sending side for good -- later DATA fails -- and runs {@code action} once
+	 * none of the connection's frames waits in the frame writer any more: the sends in
+	 * flight return first, then the writer runs it after their frames and the markers
+	 * queued before left ({@link FrameWriter#afterQueued}). For the owner of a slot of
+	 * the connection limit, which covers what the connection still queues; call it once
+	 * the connection ended or was closed. Runs the action exactly once.
+	 */
+	public void afterQueued(Runnable action) {
+		Objects.requireNonNull(action, "action is required");
+		this.writeLock.lock();
+		try {
+			this.sendingEnded = true;
+			this.creditChanged.signalAll();
+			if (this.sending > 0) {
+				this.afterSends.add(action);
+				return;
+			}
+		}
+		finally {
+			this.writeLock.unlock();
+		}
+		this.frameWriter.afterQueued(this.connectionId, action);
+	}
+
+	/**
+	 * Runs {@code action} once, after {@link #afterQueued(Runnable)} ran for every one of
+	 * the connections.
+	 */
+	public static void afterQueued(Collection<VirtualConnection> connections, Runnable action) {
+		Objects.requireNonNull(action, "action is required");
+		AtomicInteger pending = new AtomicInteger(connections.size() + 1);
+		Runnable countDown = () -> {
+			if (pending.decrementAndGet() == 0) {
+				action.run();
+			}
+		};
+		for (VirtualConnection connection : connections) {
+			connection.afterQueued(countDown);
+		}
+		countDown.run();
+	}
+
+	/**
+	 * Enters a send: fails once the sending side ended, else counts the send in flight
+	 * for {@link #afterQueued(Runnable)}.
+	 */
+	private void enterSend() throws IOException {
+		this.writeLock.lock();
+		try {
+			if (this.sendingEnded || this.writeClosed || this.closed) {
+				throw new IOException("connection %d is closed".formatted(this.connectionId));
+			}
+			this.sending++;
+		}
+		finally {
+			this.writeLock.unlock();
+		}
+	}
+
+	/** Leaves a send; the last one out hands the actions waiting for it over. */
+	private void exitSend() {
+		List<Runnable> ready = List.of();
+		this.writeLock.lock();
+		try {
+			this.sending--;
+			if (this.sending == 0 && !this.afterSends.isEmpty()) {
+				ready = List.copyOf(this.afterSends);
+				this.afterSends.clear();
+			}
+		}
+		finally {
+			this.writeLock.unlock();
+		}
+		for (Runnable action : ready) {
+			this.frameWriter.afterQueued(this.connectionId, action);
 		}
 	}
 
@@ -749,15 +847,6 @@ public final class VirtualConnection implements AutoCloseable {
 				writeWindowed(b, off, len);
 				return;
 			}
-			VirtualConnection.this.writeLock.lock();
-			try {
-				if (VirtualConnection.this.writeClosed || VirtualConnection.this.closed) {
-					throw new IOException("connection %d is closed".formatted(VirtualConnection.this.connectionId));
-				}
-			}
-			finally {
-				VirtualConnection.this.writeLock.unlock();
-			}
 			send(Arrays.copyOfRange(b, off, off + len));
 		}
 
@@ -779,7 +868,15 @@ public final class VirtualConnection implements AutoCloseable {
 		}
 
 		private void send(byte[] payload) throws IOException {
-			if (!VirtualConnection.this.frameWriter.sendData(VirtualConnection.this.connectionId, payload)) {
+			enterSend();
+			boolean sent;
+			try {
+				sent = VirtualConnection.this.frameWriter.sendData(VirtualConnection.this.connectionId, payload);
+			}
+			finally {
+				exitSend();
+			}
+			if (!sent) {
 				// the sender refuses DATA once this connection's CLOSE / ERROR is queued
 				if (VirtualConnection.this.writeClosed || VirtualConnection.this.closed) {
 					throw new IOException("connection %d is closed".formatted(VirtualConnection.this.connectionId));

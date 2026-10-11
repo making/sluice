@@ -13,6 +13,7 @@ import java.util.stream.IntStream;
 import am.ik.sluice.v1.proto.Frame;
 import io.grpc.stub.ServerCallStreamObserver;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.fail;
@@ -24,6 +25,7 @@ import static org.assertj.core.api.Assertions.fail;
  * -- control frames first, then one frame per turn per connection -- and must fail fast
  * once its worker is gone.
  */
+@Timeout(60)
 class SessionSenderTest {
 
 	/** Waits until the worker has written {@code count} frames. */
@@ -613,6 +615,198 @@ class SessionSenderTest {
 		observer.gate.countDown();
 		closer.join(TimeUnit.SECONDS.toMillis(10));
 		assertThat(closer.isAlive()).as("close returns with a full queue on a ready stream").isFalse();
+	}
+
+	/**
+	 * An ended connection's DATA and CLOSE wait for an unready stream: the action held
+	 * for it runs only once both were handed to the stream, and only once.
+	 */
+	@Test
+	void afterQueuedRunsOnceTheConnectionsQueuedFramesLeft() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.gate.countDown();
+		SessionSender sender = new SessionSender(observer);
+		try {
+			sender.start();
+			assertThat(sender.sendData(1, new byte[] { 1 })).isTrue();
+			sender.sendClose(1);
+			AtomicInteger runs = new AtomicInteger();
+			AtomicInteger sentAtRun = new AtomicInteger(-1);
+			sender.afterQueued(1, () -> {
+				sentAtRun.set(observer.sent.size());
+				runs.incrementAndGet();
+			});
+			TimeUnit.MILLISECONDS.sleep(200);
+			assertThat(observer.sent).as("precondition: the stream is not ready, nothing left").isEmpty();
+			assertThat(sender.connectionQueues()).as("precondition: the frames are queued").isEqualTo(1);
+			assertThat(runs).as("held while the frames are queued").hasValue(0);
+			observer.becomeReady();
+			awaitCount(runs, 1);
+			assertThat(sentAtRun).as("frames handed to the stream when the action ran").hasValue(2);
+			awaitConnectionQueues(sender, 0);
+			sender.close();
+			assertThat(runs).as("run exactly once, the teardown included").hasValue(1);
+		}
+		finally {
+			sender.close();
+		}
+	}
+
+	@Test
+	void afterQueuedRunsAtOnceWhenNothingIsQueued() {
+		FakeServerObserver observer = new FakeServerObserver();
+		SessionSender sender = new SessionSender(observer);
+		try {
+			sender.start();
+			sender.sendData(2, new byte[1]);
+			AtomicInteger runs = new AtomicInteger();
+			sender.afterQueued(1, runs::incrementAndGet);
+			assertThat(runs).as("connection 1 has nothing queued").hasValue(1);
+		}
+		finally {
+			observer.gate.countDown();
+			sender.close();
+		}
+	}
+
+	@Test
+	void afterQueuedRunsAtOnceOnceTheSenderStopped() {
+		SessionSender sender = new SessionSender(new FakeServerObserver());
+		sender.start();
+		sender.sendData(1, new byte[1]);
+		sender.close();
+		AtomicInteger runs = new AtomicInteger();
+		sender.afterQueued(1, runs::incrementAndGet);
+		assertThat(runs).hasValue(1);
+	}
+
+	@Test
+	void closeRunsTheActionsHeldForQueuedFrames() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.gate.countDown();
+		SessionSender sender = new SessionSender(observer);
+		sender.start();
+		AtomicInteger runs = new AtomicInteger();
+		for (long id = 1; id <= 3; id++) {
+			assertThat(sender.sendData(id, new byte[1])).isTrue();
+			sender.sendClose(id);
+			sender.afterQueued(id, runs::incrementAndGet);
+		}
+		assertThat(runs).as("precondition: held on the unready stream").hasValue(0);
+		sender.close();
+		assertThat(runs).as("the teardown drops the frames and runs every action").hasValue(3);
+		assertThat(observer.sent).isEmpty();
+	}
+
+	@Test
+	void theEndOfTheCallRunsTheActionsHeldForQueuedFrames() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.gate.countDown();
+		SessionSender sender = new SessionSender(observer);
+		try {
+			sender.start();
+			assertThat(sender.sendData(1, new byte[1])).isTrue();
+			AtomicInteger runs = new AtomicInteger();
+			sender.afterQueued(1, runs::incrementAndGet);
+			TimeUnit.MILLISECONDS.sleep(100);
+			assertThat(runs).as("precondition: held on the unready stream").hasValue(0);
+			// the worker exits on its own, without close()
+			sender.markCallClosed();
+			awaitCount(runs, 1);
+		}
+		finally {
+			sender.close();
+		}
+	}
+
+	@Test
+	void aDeadWorkerRunsTheActionsHeldForQueuedFrames() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.ready.set(true);
+		SessionSender sender = new SessionSender(observer);
+		try {
+			sender.start();
+			// the worker takes conn 9's frame and parks inside onNext
+			assertThat(sender.sendData(9, new byte[1])).isTrue();
+			assertThat(observer.enteredOnNext.await(5, TimeUnit.SECONDS)).isTrue();
+			assertThat(sender.sendData(1, new byte[1])).isTrue();
+			AtomicInteger queued = new AtomicInteger();
+			sender.afterQueued(1, queued::incrementAndGet);
+			assertThat(queued).as("precondition: conn 1's frame is queued").hasValue(0);
+			observer.die.set(true);
+			observer.gate.countDown();
+			awaitCount(queued, 1);
+			assertThat(observer.sent).as("the stream died before any frame was recorded").isEmpty();
+		}
+		finally {
+			observer.gate.countDown();
+			sender.close();
+		}
+	}
+
+	@Test
+	void aFailingActionNeitherStopsTheWorkerNorTheOtherActions() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.gate.countDown();
+		SessionSender sender = new SessionSender(observer);
+		try {
+			sender.start();
+			assertThat(sender.sendData(1, new byte[1])).isTrue();
+			sender.afterQueued(1, () -> {
+				throw new IllegalStateException("boom");
+			});
+			AtomicInteger runs = new AtomicInteger();
+			sender.afterQueued(1, runs::incrementAndGet);
+			assertThat(sender.sendData(2, new byte[1])).isTrue();
+			sender.afterQueued(2, runs::incrementAndGet);
+			observer.becomeReady();
+			awaitCount(runs, 2);
+			assertThat(sender.sendData(3, new byte[1])).as("the worker survived").isTrue();
+			awaitSentFrames(observer, 3);
+		}
+		finally {
+			sender.close();
+		}
+	}
+
+	/**
+	 * An action registered while a multi-chunk send runs on a ready stream -- the queue
+	 * may be empty between two chunks, kept alive by the call only -- still runs once the
+	 * call returned and its frames left. Repeated because the interleaving is up to the
+	 * scheduler.
+	 */
+	@Test
+	void afterQueuedRacingASendStillRuns() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.ready.set(true);
+		observer.gate.countDown();
+		SessionSender sender = new SessionSender(observer);
+		try {
+			sender.start();
+			byte[] payload = new byte[4 * SessionSender.MAX_CHUNK];
+			for (long id = 1; id <= 200; id++) {
+				long connectionId = id;
+				Thread producer = Thread.ofVirtual().start(() -> sender.sendData(connectionId, payload));
+				CountDownLatch ran = new CountDownLatch(1);
+				awaitSent(observer, frame -> frame.getBodyCase() == Frame.BodyCase.DATA
+						&& frame.getData().getConnId() == connectionId);
+				sender.afterQueued(connectionId, ran::countDown);
+				producer.join(TimeUnit.SECONDS.toMillis(5));
+				assertThat(ran.await(5, TimeUnit.SECONDS)).as("the action of connection %d ran", connectionId).isTrue();
+			}
+			awaitConnectionQueues(sender, 0);
+		}
+		finally {
+			sender.close();
+		}
+	}
+
+	private static void awaitCount(AtomicInteger count, int expected) throws InterruptedException {
+		long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(5);
+		while (count.get() < expected && System.currentTimeMillis() < deadline) {
+			TimeUnit.MILLISECONDS.sleep(10);
+		}
+		assertThat(count).hasValue(expected);
 	}
 
 }

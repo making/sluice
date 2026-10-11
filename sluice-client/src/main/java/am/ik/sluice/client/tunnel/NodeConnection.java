@@ -99,7 +99,10 @@ public final class NodeConnection implements AutoCloseable {
 
 	private final ConcurrentHashMap<Long, VirtualConnection> connections = new ConcurrentHashMap<>();
 
-	/** The slot each registered connection holds; released when it is forgotten. */
+	/**
+	 * The slot each registered connection holds; released once it is forgotten and the
+	 * frames it queued left the sender.
+	 */
 	private final ConcurrentHashMap<Long, ConnectionLimit.Permit> permits = new ConcurrentHashMap<>();
 
 	private final ConnectionLimit connectionLimit;
@@ -447,14 +450,21 @@ public final class NodeConnection implements AutoCloseable {
 	}
 
 	/**
-	 * Unregisters a connection and frees its slot of the connection limit; the first call
-	 * for an id does both, later ones nothing.
+	 * Unregisters a connection and frees its slot of the connection limit once the frames
+	 * it queued left the sender ({@link VirtualConnection#afterQueued(Runnable)}); the
+	 * first call for an id does both, later ones nothing. Call it once the connection
+	 * queued its last frame: its relay ended, or it was aborted.
 	 */
 	private @Nullable VirtualConnection forget(long connectionId) {
 		VirtualConnection connection = this.connections.remove(connectionId);
 		ConnectionLimit.Permit permit = this.permits.remove(connectionId);
 		if (permit != null) {
-			permit.release();
+			if (connection != null) {
+				connection.afterQueued(permit::release);
+			}
+			else {
+				permit.release();
+			}
 		}
 		return connection;
 	}
@@ -510,8 +520,8 @@ public final class NodeConnection implements AutoCloseable {
 					this.taskExecutor.execute(() -> dial(request, connection));
 				}
 				catch (RuntimeException e) {
-					this.forget(request.getConnId());
 					connection.abort(e.toString());
+					this.forget(request.getConnId());
 				}
 			}
 			case DATA -> {
@@ -624,8 +634,9 @@ public final class NodeConnection implements AutoCloseable {
 		}
 		catch (Exception e) {
 			log.debug("dial {} failed: {}", address, e.toString());
-			this.forget(connectionId);
+			// the ERROR first: the slot is held until it left
 			connection.abort(e.toString());
+			this.forget(connectionId);
 		}
 	}
 
@@ -648,6 +659,12 @@ public final class NodeConnection implements AutoCloseable {
 		this.running = false;
 		this.connected = false;
 		shutdownChannel();
+	}
+
+	/** The live queues of the stream's sender; 0 without a stream. For tests. */
+	int queuedConnectionsForTest() {
+		SessionSender sender = this.senderRef.get();
+		return sender == null ? 0 : sender.connectionQueues();
 	}
 
 	Map<Long, VirtualConnection> connectionsForTest() {

@@ -11,8 +11,11 @@ import org.jspecify.annotations.Nullable;
  * connection may release without counting twice.
  * <p>
  * The buffering of one relayed virtual connection is bounded ({@link #CONNECTION_BYTES}),
- * so a cap on connections bounds the total. When no cap is configured, {@link #resolve}
- * derives one that keeps the worst case within half the maximum heap.
+ * so a cap on connections bounds the total -- provided a slot is held for as long as the
+ * connection's frames wait in the {@link SessionSender}, which
+ * {@link VirtualConnection#afterQueued(Runnable)} lets its owner wait for. When no cap is
+ * configured, {@link #resolve} derives one that keeps the worst case within half the
+ * maximum heap.
  */
 public final class ConnectionLimit {
 

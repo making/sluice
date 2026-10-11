@@ -741,4 +741,129 @@ class VirtualConnectionTest {
 		assertThat(connection.source().readNBytes(100)).isEqualTo(pattern(0, 100));
 	}
 
+	/**
+	 * A writer whose {@code sendData} parks until {@link #proceed} opens, and whose
+	 * {@code afterQueued} holds each action until {@link #drain} runs it -- standing in
+	 * for frames still queued.
+	 */
+	private static final class HoldingWriter implements FrameWriter {
+
+		final List<String> calls = new CopyOnWriteArrayList<>();
+
+		final CountDownLatch entered = new CountDownLatch(1);
+
+		final CountDownLatch proceed = new CountDownLatch(1);
+
+		final java.util.Map<Long, List<Runnable>> held = new java.util.concurrent.ConcurrentHashMap<>();
+
+		@Override
+		public void sendConnect(Connect connect) {
+		}
+
+		@Override
+		public boolean sendData(long connectionId, byte[] payload) {
+			this.calls.add("data:%d:%d".formatted(connectionId, payload.length));
+			this.entered.countDown();
+			try {
+				this.proceed.await();
+			}
+			catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				return false;
+			}
+			this.calls.add("data-returned:%d".formatted(connectionId));
+			return true;
+		}
+
+		@Override
+		public void sendClose(long connectionId) {
+			this.calls.add("close:%d".formatted(connectionId));
+		}
+
+		@Override
+		public void sendError(long connectionId, String message) {
+			this.calls.add("error:%d".formatted(connectionId));
+		}
+
+		@Override
+		public void sendWindowUpdate(long connectionId, int increment) {
+		}
+
+		@Override
+		public void afterQueued(long connectionId, Runnable action) {
+			this.calls.add("after-queued:%d".formatted(connectionId));
+			this.held.computeIfAbsent(connectionId, id -> new CopyOnWriteArrayList<>()).add(action);
+		}
+
+		/** The connection's queued frames left: runs what was held for it. */
+		void drain(long connectionId) {
+			List<Runnable> actions = this.held.remove(connectionId);
+			if (actions != null) {
+				actions.forEach(Runnable::run);
+			}
+		}
+
+	}
+
+	/**
+	 * A send in flight when the connection is closed may still queue its frames: the
+	 * action reaches the frame writer only once that send returned, so it covers them.
+	 */
+	@Test
+	void afterQueuedWaitsForTheSendsInFlight() throws Exception {
+		for (boolean windowedMode : new boolean[] { false, true }) {
+			HoldingWriter writer = new HoldingWriter();
+			VirtualConnection connection = windowedMode ? windowed(40, writer, 1000, 1000)
+					: new VirtualConnection(40, writer);
+			AsyncWrite write = AsyncWrite.start(connection.sink(), new byte[10]);
+			assertThat(writer.entered.await(5, TimeUnit.SECONDS)).as("precondition: the send is in flight").isTrue();
+			connection.close();
+			java.util.concurrent.atomic.AtomicInteger runs = new java.util.concurrent.atomic.AtomicInteger();
+			connection.afterQueued(runs::incrementAndGet);
+			assertThat(writer.calls).as("windowed=%s: not handed over while the send runs", windowedMode)
+				.doesNotContain("after-queued:40");
+			writer.proceed.countDown();
+			write.done().get(5, TimeUnit.SECONDS);
+			awaitCall(writer, "after-queued:40");
+			assertThat(writer.calls.indexOf("after-queued:40")).as("windowed=%s: after the send returned", windowedMode)
+				.isGreaterThan(writer.calls.indexOf("data-returned:40"));
+			assertThat(runs).as("windowed=%s: held while frames are queued", windowedMode).hasValue(0);
+			writer.drain(40);
+			assertThat(runs).hasValue(1);
+		}
+	}
+
+	@Test
+	void afterQueuedEndsTheSendingSide() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = new VirtualConnection(41, writer);
+		java.util.concurrent.atomic.AtomicInteger runs = new java.util.concurrent.atomic.AtomicInteger();
+		connection.afterQueued(runs::incrementAndGet);
+		assertThat(runs).as("nothing in flight: handed over at once").hasValue(1);
+		assertThatThrownBy(() -> connection.sink().write(new byte[1])).isInstanceOf(IOException.class);
+		assertThat(writer.frames).as("no DATA after the action was handed over").isEmpty();
+	}
+
+	@Test
+	void afterQueuedOfSeveralConnectionsWaitsForEach() {
+		HoldingWriter first = new HoldingWriter();
+		HoldingWriter second = new HoldingWriter();
+		java.util.concurrent.atomic.AtomicInteger runs = new java.util.concurrent.atomic.AtomicInteger();
+		VirtualConnection.afterQueued(List.of(new VirtualConnection(42, first), new VirtualConnection(43, second),
+				new VirtualConnection(44, second)), runs::incrementAndGet);
+		first.drain(42);
+		second.drain(44);
+		assertThat(runs).as("connection 43 still has frames queued").hasValue(0);
+		second.drain(43);
+		assertThat(runs).hasValue(1);
+	}
+
+	private static void awaitCall(HoldingWriter writer, String call) throws InterruptedException {
+		long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(5);
+		while (!writer.calls.contains(call) && System.currentTimeMillis() < deadline) {
+			TimeUnit.MILLISECONDS.sleep(10);
+		}
+		assertThat(writer.calls).contains(call);
+	}
+
 }

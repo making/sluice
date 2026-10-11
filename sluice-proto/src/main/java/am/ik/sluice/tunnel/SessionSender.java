@@ -3,6 +3,7 @@ package am.ik.sluice.tunnel;
 import org.jspecify.annotations.Nullable;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -55,6 +56,12 @@ import io.grpc.stub.StreamObserver;
  * enqueued before any relay thread of the connection exists, and control frames drain
  * first. Control and marker frames are dropped once the sender is stopped. A dead worker
  * wakes and fails every waiting producer.
+ * <p>
+ * {@link #afterQueued} holds an action on a connection's queue until the queue is
+ * dropped: run by the worker after the last frame was handed to the stream (or once the
+ * {@link #sendData} call keeping the queue alive returned), and by the teardown -- the
+ * stop, the end of the call or the death of the worker -- for the queues it drops. The
+ * actions run outside the sender's lock; one that throws is ignored.
  */
 public final class SessionSender implements FrameWriter, AutoCloseable {
 
@@ -101,6 +108,12 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 		/** Waits the producers parked on the cap; the worker signals it on a DATA pop. */
 		final Condition capWaiters;
+
+		/**
+		 * The actions of {@link #afterQueued} to run once the queue is dropped; null
+		 * while none is held.
+		 */
+		@Nullable List<Runnable> held;
 
 		ConnectionQueue(long id, ReentrantLock lock) {
 			this.id = id;
@@ -226,10 +239,11 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	}
 
 	/**
-	 * Test hook: the number of live connection queues. A queue lives only while it holds
-	 * frames, so this is zero once everything is drained -- idle connections included.
+	 * The number of live connection queues, for monitoring and tests. A queue lives only
+	 * while it holds frames or a {@link #sendData} call runs in it, so this is zero once
+	 * everything is drained -- idle connections included.
 	 */
-	int connectionQueues() {
+	public int connectionQueues() {
 		this.lock.lock();
 		try {
 			return this.queues.size();
@@ -303,18 +317,24 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		}
 	}
 
-	/** Leaves a {@link #sendData} call; drops the queue if that was all it held. */
+	/**
+	 * Leaves a {@link #sendData} call; drops the queue if that was all it held, running
+	 * the actions held on it.
+	 */
 	private void exit(ConnectionQueue queue) {
+		List<Runnable> held = null;
 		this.lock.lock();
 		try {
 			queue.writers--;
-			if (queue.writers == 0 && queue.frames.isEmpty()) {
-				this.queues.remove(queue.id, queue);
+			if (queue.writers == 0 && queue.frames.isEmpty() && this.queues.remove(queue.id, queue)) {
+				held = queue.held;
+				queue.held = null;
 			}
 		}
 		finally {
 			this.lock.unlock();
 		}
+		runAll(held);
 	}
 
 	/**
@@ -482,6 +502,70 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	}
 
 	/**
+	 * Holds {@code action} on the connection's queue until it is dropped; runs it at once
+	 * when the connection has no queue or the sender is stopped.
+	 */
+	@Override
+	public void afterQueued(long connectionId, Runnable action) {
+		Objects.requireNonNull(action, "action is required");
+		this.lock.lock();
+		try {
+			ConnectionQueue queue = this.running ? this.queues.get(connectionId) : null;
+			if (queue != null) {
+				if (queue.held == null) {
+					queue.held = new ArrayList<>(1);
+				}
+				queue.held.add(action);
+				return;
+			}
+		}
+		finally {
+			this.lock.unlock();
+		}
+		runAll(List.of(action));
+	}
+
+	/** Runs the actions outside the lock; one that throws does not stop the others. */
+	private static void runAll(@Nullable List<Runnable> actions) {
+		if (actions == null) {
+			return;
+		}
+		for (Runnable action : actions) {
+			try {
+				action.run();
+			}
+			catch (RuntimeException e) {
+				// the owner's failure; the sender and the other owners go on
+			}
+		}
+	}
+
+	/**
+	 * Drops every connection queue with the frames in it -- the sender stopped -- and
+	 * runs the actions held on them.
+	 */
+	private void dropQueues() {
+		List<Runnable> held = new ArrayList<>();
+		this.lock.lock();
+		try {
+			for (ConnectionQueue queue : this.queues.values()) {
+				if (queue.held != null) {
+					held.addAll(queue.held);
+					queue.held = null;
+				}
+			}
+			// producers parked on a cap hold their queue and fail on the stop
+			this.queues.clear();
+			this.ring.clear();
+			this.control.clear();
+		}
+		finally {
+			this.lock.unlock();
+		}
+		runAll(held);
+	}
+
+	/**
 	 * The next frame to send: control frames first, then one frame per turn over the
 	 * connections with pending frames -- the head of the ring, re-appended while frames
 	 * remain. A queue emptied by the pop is dropped, and its slot frees only its own
@@ -489,7 +573,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	 * sender is stopped or the call closed, in which case the remaining frames are
 	 * dropped -- the peer is gone anyway.
 	 */
-	private @Nullable Frame next() {
+	private @Nullable Next next() {
 		this.lock.lock();
 		try {
 			while (true) {
@@ -498,7 +582,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 				}
 				Frame control = this.control.pollFirst();
 				if (control != null) {
-					return control;
+					return new Next(control, null);
 				}
 				// readiness is consulted only for a pending connection frame: polling it
 				// unguarded races the delayed call's start, where grpc's isReady NPEs
@@ -525,11 +609,11 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 	/**
 	 * Pops one frame; drops the queue it emptied unless a {@link #sendData} call runs in
-	 * it, and wakes only its own producers.
+	 * it, handing the actions held on it to the worker, and wakes only its own producers.
 	 */
-	private Frame pop(ConnectionQueue queue) {
+	private Next pop(ConnectionQueue queue) {
 		queue.queued = false;
-		Frame frame = queue.frames.pollFirst();
+		Frame frame = Objects.requireNonNull(queue.frames.pollFirst(), "a ringed queue holds frames");
 		if (frame.getBodyCase() == Frame.BodyCase.DATA) {
 			queue.dataFrames--;
 			// a producer parked on the cap of this connection may continue
@@ -541,8 +625,18 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		}
 		else if (queue.writers == 0) {
 			this.queues.remove(queue.id);
+			List<Runnable> held = queue.held;
+			queue.held = null;
+			return new Next(frame, held);
 		}
-		return frame;
+		return new Next(frame, null);
+	}
+
+	/**
+	 * A frame to send, and the actions to run once it was handed to the stream: those
+	 * held on the queue it emptied.
+	 */
+	private record Next(Frame frame, @Nullable List<Runnable> held) {
 	}
 
 	/**
@@ -552,16 +646,19 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	private void drain() {
 		try {
 			while (true) {
-				Frame frame = next();
-				if (frame == null) {
+				Next next = next();
+				if (next == null) {
 					return;
 				}
 				try {
-					this.outbound.onNext(frame);
+					this.outbound.onNext(next.frame());
 				}
 				catch (RuntimeException e) {
 					// stream is dead; drop the remainder
 					return;
+				}
+				finally {
+					runAll(next.held());
 				}
 			}
 		}
@@ -587,14 +684,16 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	/**
 	 * Stops the worker and completes the outbound stream; waits for the completion to be
 	 * delivered so a caller tearing the transport down right after (server shutdown) does
-	 * not cut the frame in flight off. Frames still queued are not flushed: the peer is
-	 * gone by definition of a teardown, and waiting for them could hang on a full queue
-	 * -- close never depends on queue space. Idempotent.
+	 * not cut the frame in flight off. Frames still queued are dropped, not flushed, and
+	 * the actions held on them run: the peer is gone by definition of a teardown, and
+	 * waiting for them could hang on a full queue -- close never depends on queue space.
+	 * Idempotent.
 	 */
 	@Override
 	public void close() {
 		this.running = false;
 		this.releaseWaiters();
+		this.dropQueues();
 		Worker worker = this.worker;
 		Thread thread = this.workerThread;
 		if (worker == null || thread == null || Thread.currentThread() == thread) {
@@ -629,6 +728,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 				// alone cannot be relied on to run
 				running = false;
 				releaseWaiters();
+				dropQueues();
 				workerLock.lock();
 				try {
 					done = true;

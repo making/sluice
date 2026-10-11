@@ -9,6 +9,7 @@ import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -30,9 +31,12 @@ import io.micrometer.core.instrument.MeterRegistry;
  * route at the request boundary -- the requests of a keep-alive connection are strictly
  * sequential, and the switch waits for the outstanding response of the old leg to be
  * relayed completely before the new leg is opened, so responses never interleave. The
- * drained leg is closed once replaced; the closure of the leg in charge by its upstream
- * ends the whole relay, as does any failure. Each leg pumps its inbound side on its own
- * virtual thread for the lifetime of its virtual connection.
+ * drained leg is closed once replaced, and the new leg's first request waits until the
+ * frames still queued for the old one left the tunnel sender, so the connection's slot of
+ * the connection limit never covers the send queues of two legs. The closure of the leg
+ * in charge by its upstream ends the whole relay, as does any failure; the slot is
+ * released once the relay ended and every leg's queued frames left. Each leg pumps its
+ * inbound side on its own virtual thread for the lifetime of its virtual connection.
  * <p>
  * A request asking for an upgrade, or a CONNECT, holds the parse -- the relay reads no
  * further client bytes -- until the leg's response to it: switched (101, a 2xx to
@@ -78,6 +82,9 @@ final class ReroutingRelay {
 
 	private final Runnable onFinish;
 
+	/** Frees the connection's slot; run once the legs' queued frames left. */
+	private final Runnable release;
+
 	private final ConnectionLimits.KeepAliveDeadline deadline;
 
 	/** Guards {@link #owed}, {@link #position} and {@link #starting}. */
@@ -109,7 +116,8 @@ final class ReroutingRelay {
 	ReroutingRelay(DuplexPipe pipe, ConnectionHeadParser.Head head, Router router, SessionRegistry sessions,
 			AccessControl accessControl, ErrorResponse errorResponse, AccessLogger.Connection access,
 			MeterRegistry meterRegistry, Router.Route initialRoute, TunnelSession initialSession,
-			@Nullable InetAddress peer, ConnectionLimits.KeepAliveDeadline deadline, Runnable onFinish) {
+			@Nullable InetAddress peer, ConnectionLimits.KeepAliveDeadline deadline, Runnable onFinish,
+			Runnable release) {
 		this.pipe = pipe;
 		this.seedHead = head.bytes();
 		this.router = router;
@@ -122,6 +130,7 @@ final class ReroutingRelay {
 		this.initialSession = initialSession;
 		this.peer = peer;
 		this.onFinish = onFinish;
+		this.release = release;
 		this.deadline = deadline;
 		deadline.onExpiry(this::abort);
 	}
@@ -282,6 +291,7 @@ final class ReroutingRelay {
 			this.current = leg; // visible to the old pump before its close below
 			if (old != null && !old.ended) {
 				old.close(); // the switch ends the previous conversation
+				old.awaitQueued();
 			}
 		}
 		ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser.http1RequestOf(head);
@@ -441,6 +451,21 @@ final class ReroutingRelay {
 			this.connection.close();
 		}
 
+		/**
+		 * Waits until the frames queued for the closed leg left the tunnel sender, or the
+		 * sender stopped and dropped them.
+		 */
+		void awaitQueued() {
+			CountDownLatch left = new CountDownLatch(1);
+			this.connection.afterQueued(left::countDown);
+			try {
+				left.await();
+			}
+			catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+		}
+
 		void requestSent(@Nullable String method, boolean upgrade) {
 			synchronized (this) {
 				this.sent++;
@@ -580,6 +605,7 @@ final class ReroutingRelay {
 		}
 		this.access.close();
 		this.onFinish.run();
+		VirtualConnection.afterQueued(this.legs.stream().map(leg -> leg.connection).toList(), this.release);
 	}
 
 	/** Tears the relay down after a failure or a final error response. */

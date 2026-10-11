@@ -40,12 +40,14 @@ import io.micrometer.core.instrument.MeterRegistry;
  * fit in half the maximum heap.
  * <p>
  * A connection is admitted at accept ({@link #admit}) and holds its {@link Admission}
- * until it ends; {@link Admission#release()} frees its slots and may be called on every
- * exit path, only the first call counts. A connection over a limit is closed without
- * being read. Rejections are counted as {@code sluice.data.connections.rejected} by
- * {@code reason} ({@code limit}, {@code address-limit}, {@code head-timeout}) and logged
- * through the access log's rate limit. Connections closed for idling between requests
- * count as {@code sluice.data.connections.idle.closed}.
+ * until it ended and the frames its virtual connections queued left the tunnel sender (a
+ * stream that stays not ready keeps them, and the slots, until the session ends);
+ * {@link Admission#release()} frees its slots and may be called on every exit path, only
+ * the first call counts. A connection over a limit is closed without being read.
+ * Rejections are counted as {@code sluice.data.connections.rejected} by {@code reason}
+ * ({@code limit}, {@code address-limit}, {@code head-timeout}) and logged through the
+ * access log's rate limit. Connections closed for idling between requests count as
+ * {@code sluice.data.connections.idle.closed}.
  */
 @Component
 public class ConnectionLimits implements DisposableBean {

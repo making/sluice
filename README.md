@@ -566,9 +566,15 @@ limit is derived so that the worst case of every slot (2.16MiB + 295KiB) and the
 fit in half the max heap: `max(1, (max heap / 2 - budget) / 2.45MiB)`, e.g. 71 for a
 400MiB heap, 731 for 4GiB. The effective values are logged at startup (`data plane
 connection limit` / `upstream connection limit`) and exported as gauges; with the 512Mi
-container of `k8s.md` they follow the heap the server gets there. Not within that bound:
-the send queue of a connection that already ended, whose slot is free while its frames
-still wait for the stream (up to 1MiB each while the stream is not ready).
+container of `k8s.md` they follow the heap the server gets there.
+
+A slot is released only once its connection ended and the frames it queued for the tunnel
+stream left the sender, on the server as on the client (`sluice.client.max-connections`);
+the end of the tunnel session drops the frames and releases their slots. A closed h2 leg
+keeps its slot the same way, and an HTTP/1.1 connection switching routes sends nothing to
+the new route until the frames queued for the previous one left. So the send queues of
+ended connections stay within the bound; while a stream stays not ready, their slots stay
+taken until it drains or the session ends.
 
 ## Health / metrics
 

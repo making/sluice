@@ -37,6 +37,16 @@ public interface FrameWriter {
 	void sendWindowUpdate(long connectionId, int increment);
 
 	/**
+	 * Runs {@code action} once none of the frames queued for the connection so far waits
+	 * any more: at once when none is queued, else once the last one was handed to the
+	 * stream, or when the writer stops and drops them. Runs it exactly once, never on the
+	 * caller's thread while holding a lock of the writer.
+	 */
+	default void afterQueued(long connectionId, Runnable action) {
+		action.run();
+	}
+
+	/**
 	 * False once no frame can reach the remote any more (the stream ended); a producer
 	 * waiting for credit gives up instead of waiting for a grant that cannot arrive.
 	 */

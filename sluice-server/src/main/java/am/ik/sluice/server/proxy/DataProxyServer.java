@@ -186,9 +186,9 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	}
 
 	/**
-	 * Serves one admitted connection. The admission is released exactly when the
-	 * connection ends: here on every path that does not hand it to a relay, by the
-	 * relay's completion otherwise.
+	 * Serves one admitted connection. The admission is released exactly once: here on
+	 * every path that does not hand it to a relay, by the relay otherwise, once it ended
+	 * and the frames its virtual connections queued left the tunnel sender.
 	 */
 	private void handle(Socket socket, AccessLogger.Connection access, ConnectionLimits.Admission admission) {
 		boolean relaying = false;
@@ -323,10 +323,10 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	/**
 	 * Routes and relays the connection; true once a relay owns it, in which case
-	 * {@code release} runs when the relay completes. False when the connection was
-	 * answered with an error response and closed. Plaintext and TLS-terminated HTTP
-	 * relays drive {@code deadline} between their requests; the verbatim relays leave it
-	 * disarmed.
+	 * {@code release} runs once the relay completed and the frames its virtual
+	 * connections queued left the tunnel sender. False when the connection was answered
+	 * with an error response and closed. Plaintext and TLS-terminated HTTP relays drive
+	 * {@code deadline} between their requests; the verbatim relays leave it disarmed.
 	 */
 	private boolean relay(Connection conn, AccessLogger.Connection access, ConnectionLimits.KeepAliveDeadline deadline,
 			Runnable release) {
@@ -349,11 +349,11 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		if (request != null && !conn.head().encrypted()) {
 			// plaintext HTTP: every request head / stream is routed; successors may
 			// belong to another client's upstream (keep-alive, h2 multiplexing)
-			Runnable relayed = this.relayed(access, release);
+			Runnable relayed = this.relayed(access);
 			if ("2".equals(request.version())) {
 				Http2DemuxRelay demux = new Http2DemuxRelay(conn.pipe(), conn.head(), this.router, this.sessions,
 						this.accessControl, this.errorResponse, access, this.h2DemuxMeters, this.limits, route0,
-						session, peer, deadline, relayed);
+						session, peer, deadline, relayed, release);
 				this.activeConnections.incrementAndGet();
 				try {
 					demux.start();
@@ -366,7 +366,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			}
 			ReroutingRelay rerouting = new ReroutingRelay(conn.pipe(), conn.head(), this.router, this.sessions,
 					this.accessControl, this.errorResponse, access, this.meterRegistry, route0, session, peer, deadline,
-					relayed);
+					relayed, release);
 			this.activeConnections.incrementAndGet();
 			try {
 				rerouting.start();
@@ -389,7 +389,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				this.activeConnections.decrementAndGet();
 				access.close();
 				session.remove(connection.connectionId());
-				release.run();
+				// the slot covers what the connection still queues for the tunnel
+				connection.afterQueued(release);
 			})
 			.build();
 		this.activeConnections.incrementAndGet();
@@ -405,14 +406,13 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	/**
 	 * The once-only completion of a demultiplexing relay: the connection level of the
-	 * access log, the active-connection count and the connection's admission, shared by
-	 * every leg.
+	 * access log and the active-connection count, shared by every leg. The relay releases
+	 * the admission itself, once the frames its legs queued left.
 	 */
-	private Runnable relayed(AccessLogger.Connection access, Runnable release) {
+	private Runnable relayed(AccessLogger.Connection access) {
 		return () -> {
 			this.activeConnections.decrementAndGet();
 			access.close();
-			release.run();
 		};
 	}
 
