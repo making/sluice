@@ -13,9 +13,15 @@ client relying on the error (conformance suites such as h2spec) sees none.
 ## Direction
 
 Connection errors: GOAWAY with the code, then end the relay (as the overflow does since
-062). The stream error needs the stream reset both ways: RST_STREAM `PROTOCOL_ERROR` to
-the client, `CANCEL` to the upstream, which runs into 065's problem of the upstream's
-frames still arriving on the reset stream; decide whether to share 065's mechanism.
+062). The stream error is `Http2DemuxRelay#resetStream(stream, ERROR_PROTOCOL)` (a new
+0x1 constant; the method since 065, for trailers past the budget): RST_STREAM with the
+code to the client, `CANCEL` to the upstream behind the frames queued for the stream, its
+queued data and waiting response dropped; the upstream's later frames on the stream are
+dropped and the stream stops being tracked once the reset is written to the upstream. It
+returns `false` for a stream already reset by either side; count a meter only on `true`
+(e.g. a `protocol` reason on `sluice.h2demux.streams.reset`). An increment of 0 on a
+stream the relay no longer tracks has nothing to reset (RFC 9113 5.1 lets a closed
+stream's frames be ignored).
 
 ## Tests (`sluice-it`; watch each fail first)
 
