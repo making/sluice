@@ -23,12 +23,18 @@ peer.
   announces no window is rejected (server: fail the stream with a clear status;
   client: answer the CONNECT with ERROR), or given the default window -- decide, and log
   it either way.
-- wasmlet: the legacy branches 047 keeps (bounded ctrl channel, forwarding task).
+- wasmlet (`tunnel.rs`): `CtrlTx::Legacy` / `CtrlRx::Legacy`, `Deferred` and
+  `LEGACY_BUFFER` (the bounded channel whose send the receive loop awaits after the
+  dispatch), the `server_window == 0` branch of `Connections::register`, and the
+  legacy branches of `TunnelIo::poll_write` / `consumed`. `Connections::deliver` then
+  never awaits and can become the plain `dispatch`. A CONNECT without a window is
+  answered as decided for the Java client.
 - Proto: keep the fields (0 stays meaningful as "no window" for rejection); update their
   comments.
 - Tests: `LegacyClientInteropE2ETest` / `LegacyServerInteropE2ETest` change to assert
   the rejection; the legacy unit tests in `VirtualConnectionTest` go; tests that build
-  `new VirtualConnection(id, writer)` switch to the builder.
+  `new VirtualConnection(id, writer)` switch to the builder. wasmlet: the `a_legacy_*`
+  tests in `tunnel.rs` and `wasm_host.rs` and the `window = 0` cases go.
 - README: drop the sentence on legacy peers.
 
 ## Tests (watch each fail first)

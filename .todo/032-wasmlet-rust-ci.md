@@ -20,5 +20,5 @@ never built or tested there.
   `collapsible_if` warnings first (`rekey` in `main.rs`,
   `streams_response_frames_as_the_guest_produces_them` in `wasm_host.rs`)
 
-Acceptance: a PR touching `sluice-wasmlet` runs its 34+ tests in CI, and fmt / clippy findings fail it.
+Acceptance: a PR touching `sluice-wasmlet` runs its 61+ tests in CI, and fmt / clippy findings fail it.
 Related: 025 (E2E in sluice-it) may reuse the built guests as artifacts.

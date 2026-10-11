@@ -19,5 +19,11 @@ The PoC was verified by hand only; nothing runs it in `./mvnw verify`.
   on the same route (the sandbox regression guard)
 - reuse `TestPorts.freePort()` for any listener; the client needs no inbound port
 
+- per-connection flow control (047): the head-of-line scenario against the real
+  server -- a large POST to `hello` `/stall` (the guest reads just past 1MiB, then
+  stalls) while a GET on another connection answers at once (before 047: only after
+  the stalled request's budget). Also h2c over the windowed path (a 10MiB `/stream`
+  arrives complete): 047 checked both by hand only, its Rust tests use http/1.1
+
 Acceptance: `./mvnw verify` covers the wasm path; CI without rust still passes
 (skipped, not failed).

@@ -18,7 +18,9 @@ case, so recompute them if 044-046 change their caps.
   a peer that connects and sends nothing, or drips one byte at a time, holds the
   connection forever (slowloris).
 - The client (`NodeConnection`, `CONNECT` case) dials every CONNECT; the server can make
-  a client open unlimited upstream sockets.
+  a client open unlimited upstream sockets. The wasmlet likewise serves every CONNECT
+  (`tunnel::Connections::connect`), each with up to one 1MiB receive window buffered
+  since 047.
 
 ## Design
 
@@ -45,7 +47,8 @@ keys in alphabetical order (CLAUDE.md).
    design (WebSocket, keep-alive).
 4. **Client limit** (`sluice.client.max-connections`): a CONNECT beyond the limit is
    answered with ERROR "connection limit reached" without dialing or registering. The
-   server side sees `remoteFailed` and closes the public connection.
+   server side sees `remoteFailed` and closes the public connection. The wasmlet needs
+   the same (a CLI flag; answer on its control lane, as the no-route ERROR).
 
 Defaults: derive from the worst-case memory per connection after 044-046 (receive window
 1MiB + sender cap 1MiB + socket buffers, per virtual connection). An h2 client connection
