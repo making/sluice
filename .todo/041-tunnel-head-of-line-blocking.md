@@ -85,10 +85,11 @@ in the same investigation is todo 042.
 | 052-sender-cap-wait-ignores-connection-close | 051 review follow-up (teardown hang) | Medium | before or with 046 |
 | 046-per-connection-flow-control-java | F1 (protocol + Java) | High | 043, 044, 045 |
 | 047-per-connection-flow-control-wasmlet | F5 | High | 046 |
-| 056-wasmlet-outbound-fair-scheduling | F4 on the wasmlet (047 review follow-up) | Medium | 047 |
+| 056-wasmlet-outbound-fair-scheduling | F4 on the wasmlet (047 review follow-up); done | Medium | 047 |
 | 048-data-plane-connection-limits | memory bound (see "Residual after the children"); done | Medium | - (defaults derive from 044-046) |
 | 057-h2-demux-global-queue-budget | h2 memory outside the 048 bound | High | 048 |
 | 058-receive-buffer-per-frame-overhead | per-frame overhead outside the 048 bound | Medium | 048 |
+| 061-slot-released-before-queued-frames-left | Java send queues of ended connections outside the 048 bound (056 review) | Medium | 048 |
 | 054-remove-legacy-flow-control | legacy removal (see "Follow-up"; not a child, the parent does not wait for it) | Medium | 047; no pre-046/047 peer deployed |
 
 Each child is one commit series with its own tests and docs. This parent is done when all
@@ -176,7 +177,8 @@ What 043-048 still leave open, by design or elsewhere. Do not report the parent 
 - Total memory (048, done): the connection limits bound it for connections with one
   virtual connection. Not within the bound: an h2 connection's demux queue and legs
   (057), per-frame overhead of tiny DATA frames (058), wasmlet guest instances (059),
-  and keep-alive connections idle between requests hold their slots (060). (ADVERTISE
+  keep-alive connections idle between requests hold their slots (060), and the Java
+  send queues of connections whose slot was already released (061). (ADVERTISE
   off the receive path and the credit-lock pitfall are done in 046.)
 
 ## Follow-up
