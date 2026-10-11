@@ -11,6 +11,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import am.ik.sluice.server.config.SluiceServerProperties;
+import am.ik.sluice.tunnel.ConnectionLimit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -105,6 +106,47 @@ class ConnectionLimitsTest {
 			admission.release();
 			assertThat(this.limits.admitted()).isZero();
 		}
+	}
+
+	@Test
+	void anUnsetLimitFitsEverySlotsWorstCaseAndTheBudgetInHalfTheHeap() {
+		long mib = 1024 * 1024;
+		// a virtual connection's 2.125MiB plus an h2 relay's own queue
+		assertThat(ConnectionLimits.connectionBytes()).isEqualTo(2228224 + Http2DemuxRelay.UNBUDGETED_BYTES);
+		assertThat(ConnectionLimits.deriveBudget(400 * mib)).isEqualTo(25 * mib);
+		// (200MiB - 25MiB) / 2.41MiB
+		assertThat(ConnectionLimits.deriveMaxConnections(400 * mib, 25 * mib)).isEqualTo(72);
+		// (2048MiB - 256MiB) / 2.41MiB
+		assertThat(ConnectionLimits.deriveMaxConnections(4096 * mib, 256 * mib)).isEqualTo(742);
+		assertThat(ConnectionLimits.deriveMaxConnections(400 * mib, 400 * mib)).isEqualTo(1);
+	}
+
+	@Test
+	void aConfiguredBudgetIsTaken() {
+		SluiceServerProperties configured = SluiceServerProperties.builder()
+			.limits(SluiceServerProperties.Limits.builder()
+				.maxConnections(3)
+				.h2QueueBudget(org.springframework.util.unit.DataSize.ofKilobytes(512))
+				.build())
+			.build();
+		ConnectionLimits limits = new ConnectionLimits(configured, new SimpleMeterRegistry());
+		try {
+			assertThat(limits.h2Budget().max()).isEqualTo(512 * 1024);
+		}
+		finally {
+			limits.destroy();
+		}
+	}
+
+	@Test
+	void aLegTakesASlotOfTheGlobalLimit() {
+		admit();
+		admit();
+		ConnectionLimit.Permit leg = Objects.requireNonNull(this.limits.tryAcquireLeg());
+		assertThat(this.limits.tryAcquireLeg()).isNull();
+		assertThat(this.limits.admit(this.access)).as("the leg holds the last slot").isNull();
+		leg.release();
+		assertThat(this.limits.admitted()).isEqualTo(2);
 	}
 
 	private ConnectionLimits.Admission admit() {

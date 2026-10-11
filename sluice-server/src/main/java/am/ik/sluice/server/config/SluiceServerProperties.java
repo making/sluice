@@ -9,6 +9,7 @@ import org.jspecify.annotations.Nullable;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
+import org.springframework.util.unit.DataSize;
 
 import am.ik.sluice.server.route.LoadBalance;
 
@@ -372,15 +373,19 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * otherwise); {@code 0} = no limit beyond {@code maxConnections}
 	 * @param headTimeout deadline for the whole head phase of a connection (PROXY header,
 	 * TLS handshake, request head); established relays have no timeout
+	 * @param h2QueueBudget bytes the h2 demux relays may queue towards their upstreams
+	 * beyond each connection's own allowance, shared by all of them; {@code 0} = an
+	 * eighth of half the maximum heap
 	 */
 	public record Limits(@DefaultValue("0") int maxConnections, @DefaultValue("0") int maxConnectionsPerAddress,
-			@DefaultValue("10s") Duration headTimeout) {
+			@DefaultValue("10s") Duration headTimeout, @DefaultValue("0") DataSize h2QueueBudget) {
 
 		public Limits {
 			maxConnections = Math.max(0, maxConnections);
 			maxConnectionsPerAddress = Math.max(0, maxConnectionsPerAddress);
 			headTimeout = headTimeout == null || headTimeout.isNegative() || headTimeout.isZero()
 					? Duration.ofSeconds(10) : headTimeout;
+			h2QueueBudget = h2QueueBudget == null || h2QueueBudget.isNegative() ? DataSize.ofBytes(0) : h2QueueBudget;
 		}
 
 		public static Builder builder() {
@@ -394,6 +399,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			private int maxConnectionsPerAddress;
 
 			@Nullable private Duration headTimeout;
+
+			@Nullable private DataSize h2QueueBudget;
 
 			private Builder() {
 			}
@@ -413,9 +420,15 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder h2QueueBudget(DataSize h2QueueBudget) {
+				this.h2QueueBudget = h2QueueBudget;
+				return this;
+			}
+
 			public Limits build() {
 				return new Limits(this.maxConnections, this.maxConnectionsPerAddress,
-						this.headTimeout == null ? Duration.ofSeconds(10) : this.headTimeout);
+						this.headTimeout == null ? Duration.ofSeconds(10) : this.headTimeout,
+						this.h2QueueBudget == null ? DataSize.ofBytes(0) : this.h2QueueBudget);
 			}
 
 		}

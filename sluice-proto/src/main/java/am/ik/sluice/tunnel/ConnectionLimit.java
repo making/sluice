@@ -56,7 +56,15 @@ public final class ConnectionLimit {
 	 * half of {@code maxHeap}, the rest left to everything else; at least 1.
 	 */
 	public static int derive(long maxHeap) {
-		return (int) Math.clamp(maxHeap / 2 / CONNECTION_BYTES, 1, Integer.MAX_VALUE);
+		return derive(maxHeap / 2, CONNECTION_BYTES);
+	}
+
+	/**
+	 * The connections of {@code connectionBytes} worst-case buffering each that fit in
+	 * {@code bytes}; at least 1.
+	 */
+	public static int derive(long bytes, long connectionBytes) {
+		return (int) Math.clamp(Math.max(0, bytes) / connectionBytes, 1, Integer.MAX_VALUE);
 	}
 
 	/** A slot for one more connection, or null when {@link #max()} are open. */

@@ -349,8 +349,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			Runnable relayed = this.relayed(access, release);
 			if ("2".equals(request.version())) {
 				Http2DemuxRelay demux = new Http2DemuxRelay(conn.pipe(), conn.head(), this.router, this.sessions,
-						this.accessControl, this.errorResponse, access, this.h2DemuxMeters, route0, session, peer,
-						relayed);
+						this.accessControl, this.errorResponse, access, this.h2DemuxMeters, this.limits, route0,
+						session, peer, relayed);
 				this.activeConnections.incrementAndGet();
 				try {
 					demux.start();

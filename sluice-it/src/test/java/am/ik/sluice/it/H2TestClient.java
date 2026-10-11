@@ -307,6 +307,11 @@ public final class H2TestClient implements AutoCloseable {
 		return this.settings.get(id);
 	}
 
+	/** The payload both the stream's and the connection's windows admit now. */
+	public long sendable(int streamId) {
+		return Math.min(this.connectionWindow.get(), windowOf(streamId).get());
+	}
+
 	public long connectionGranted() {
 		return this.connectionGranted.get();
 	}

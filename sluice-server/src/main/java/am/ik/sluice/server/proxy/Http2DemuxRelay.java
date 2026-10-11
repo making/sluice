@@ -8,7 +8,6 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -28,6 +27,7 @@ import org.jspecify.annotations.Nullable;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import am.ik.sluice.server.tunnel.TunnelSession;
+import am.ik.sluice.tunnel.ConnectionLimit;
 import am.ik.sluice.tunnel.DuplexPipe;
 import am.ik.sluice.tunnel.StreamRelay;
 import am.ik.sluice.tunnel.VirtualConnection;
@@ -54,6 +54,18 @@ import io.micrometer.core.instrument.MeterRegistry;
  * client sending past a stream window gets a GOAWAY {@code FLOW_CONTROL_ERROR}. A header
  * block is written whole in either direction, and the relay's own connection-level frames
  * towards an upstream are written ahead of the request frames queued for it.
+ * <p>
+ * What the relay queues is bounded across connections too: each relay may queue
+ * {@link #CONNECTION_ALLOWANCE}, and the bytes beyond it are charged to the
+ * {@link H2DemuxBudget} every relay of the node shares. While a relay is past its
+ * allowance and the budget is exhausted, it withholds the client's connection window --
+ * the client stops sending DATA once the at most 64KiB it holds are spent -- until its
+ * legs drain below the allowance or the budget has room again; a new stream whose head
+ * fits neither is refused ({@code REFUSED_STREAM}), and trailers that fit neither end the
+ * connection ({@code ENHANCE_YOUR_CALM}). What a relay may not refuse -- DATA within the
+ * windows it granted, resets and window updates -- is bounded per connection
+ * ({@link #UNBUDGETED_BYTES}). A leg beyond the first takes a slot of the connection
+ * limit; a stream whose route needs a leg while none is free is refused.
  * <p>
  * Towards each upstream the relay is a sender bound by the upstream's windows (RFC 9113
  * 6.9): the connection window and every stream's window, initially as the upstream's
@@ -170,11 +182,29 @@ final class Http2DemuxRelay {
 	/**
 	 * The bound the rules above derive for the bytes queued for one connection's legs: a
 	 * stream holding queued bytes counts against the stream limit and queues at most its
-	 * budget of payload, its head and trailers, a reset, and one coalesced window update.
-	 * A backstop: passing it ends the relay with a GOAWAY {@code FLOW_CONTROL_ERROR}.
+	 * budget of payload (in a buffer less than a granule larger), its head and trailers,
+	 * a reset, and one coalesced window update. A backstop: passing it ends the relay
+	 * with a GOAWAY {@code FLOW_CONTROL_ERROR}.
 	 */
-	static final long MAX_QUEUED_BYTES = (long) MAX_CONCURRENT_STREAMS
-			* (STREAM_BUDGET + FRAME_HEADER_LENGTH + 2L * MAX_BLOCK_BYTES + 2L * (FRAME_HEADER_LENGTH + 4));
+	static final long MAX_QUEUED_BYTES = (long) MAX_CONCURRENT_STREAMS * (STREAM_BUDGET + PendingPayload.GRANULE
+			+ FRAME_HEADER_LENGTH + 2L * MAX_BLOCK_BYTES + 2L * (FRAME_HEADER_LENGTH + 4));
+
+	/**
+	 * The bytes a relay may queue without charging the shared budget: what it always
+	 * admits, so a connection whose legs drain keeps flowing however exhausted the budget
+	 * is. One stream budget.
+	 */
+	static final int CONNECTION_ALLOWANCE = 128 * 1024;
+
+	/**
+	 * The most one relay queues outside the shared budget: its allowance, plus what it
+	 * cannot refuse once past it -- the DATA of the connection window the client still
+	 * holds (at most the initial 64KiB: the relay grants the window only as DATA
+	 * arrives), each stream's buffer rounding and data entry, a reset and a coalesced
+	 * window update.
+	 */
+	static final long UNBUDGETED_BYTES = CONNECTION_ALLOWANCE + STREAM_WINDOW + (long) MAX_CONCURRENT_STREAMS
+			* (PendingPayload.GRANULE + FRAME_HEADER_LENGTH + 2L * (FRAME_HEADER_LENGTH + 4));
 
 	/** The PING acks one leg may owe its upstream; more end the relay. */
 	private static final int MAX_PENDING_PING_ACKS = 1024;
@@ -206,6 +236,10 @@ final class Http2DemuxRelay {
 	private final MeterRegistry meterRegistry;
 
 	private final H2DemuxMeters meters;
+
+	private final ConnectionLimits limits;
+
+	private final H2DemuxBudget budget;
 
 	private final Router.Route initialRoute;
 
@@ -248,6 +282,24 @@ final class Http2DemuxRelay {
 
 	/** The bytes queued for every leg of the connection; guarded by {@link #lock}. */
 	private long queuedBytes;
+
+	/**
+	 * The part of {@link #queuedBytes} beyond the allowance, charged to the budget;
+	 * guarded by {@link #lock}.
+	 */
+	private long pooled;
+
+	/** Client connection window withheld, to grant once allowed; with {@link #lock}. */
+	private long owedGrant;
+
+	/** The relay finished: no grant is owed or awaited; guarded by {@link #lock}. */
+	private boolean grantsClosed;
+
+	/** Grants the withheld window once the budget has room; one instance, to dedupe. */
+	private final Runnable owedGrantRetry = this::retryOwedGrant;
+
+	/** A leg holds the slot of the connection itself; guarded by {@link #lock}. */
+	private boolean baseLegTaken;
 
 	/** The highest stream id routed, for GOAWAY; outbound parse only. */
 	private int lastStreamId;
@@ -294,8 +346,8 @@ final class Http2DemuxRelay {
 
 	Http2DemuxRelay(DuplexPipe pipe, ConnectionHeadParser.Head head, Router router, SessionRegistry sessions,
 			AccessControl accessControl, ErrorResponse errorResponse, AccessLogger.Connection access,
-			H2DemuxMeters meters, Router.Route initialRoute, TunnelSession initialSession, @Nullable InetAddress peer,
-			Runnable onFinish) {
+			H2DemuxMeters meters, ConnectionLimits limits, Router.Route initialRoute, TunnelSession initialSession,
+			@Nullable InetAddress peer, Runnable onFinish) {
 		this.pipe = pipe;
 		this.seedHead = head.bytes();
 		this.router = router;
@@ -305,6 +357,8 @@ final class Http2DemuxRelay {
 		this.access = access;
 		this.meterRegistry = meters.registry();
 		this.meters = meters;
+		this.limits = limits;
+		this.budget = limits.h2Budget();
 		this.initialRoute = initialRoute;
 		this.initialSession = initialSession;
 		this.peer = peer;
@@ -466,50 +520,163 @@ final class Http2DemuxRelay {
 
 	/**
 	 * A client DATA frame: the whole payload, padding included, leaves the connection
-	 * window at once and is released; the stream's window is charged with it, and the
-	 * bare payload joins the stream's queued data -- the padding, never queued, is
-	 * granted back with the budget's room. Frames of streams unknown or already ended are
-	 * dropped.
+	 * window, which is granted back at once while the relay is within its allowance or
+	 * the budget has room, and withheld otherwise; the stream's window is charged with
+	 * it, and the bare payload joins the stream's queued data -- the padding, never
+	 * queued, is granted back with the stream budget's room. Frames of streams unknown or
+	 * already ended are dropped, their window granted back at once.
 	 */
 	private void onData(Frame frame) {
 		if (frame.streamId() == 0) {
 			return; // DATA is stream-scoped; an unexpected connection-level frame
 		}
-		if (frame.length() > 0) {
-			grantClient(frame.length());
-		}
 		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
 		if (stream == null) {
-			return; // frames of streams never routed
+			grantClient(frame.length()); // frames of streams never routed
+			return;
 		}
 		int dataLength = dataPayloadLength(frame);
 		int dataOffset = frame.payload() + (frame.has(FLAG_PADDED) ? 1 : 0);
 		boolean violation = false;
+		boolean dropped = false;
 		int release = 0;
+		int connectionGrant = 0;
 		this.lock.lock();
 		try {
 			if (stream.clientEnded || stream.trailers) {
-				return; // the client ended the stream: its late frames are void
+				dropped = true; // the client ended the stream: its late frames are void
 			}
-			if (frame.length() > stream.clientWindow) {
+			else if (frame.length() > stream.clientWindow) {
 				violation = true;
 			}
 			else {
 				stream.clientWindow -= frame.length();
 				stream.leg.queueData(stream, frame.bytes(), dataOffset, dataLength, frame.has(FLAG_END_STREAM));
 				release = releaseLocked(stream);
+				boolean owing = this.owedGrant > 0;
+				connectionGrant = connectionGrantLocked(frame.length());
+				if (connectionGrant == 0 && this.owedGrant > 0) {
+					if (!owing) {
+						this.meters.windowWithheld();
+					}
+					awaitBudgetLocked();
+				}
 			}
 		}
 		finally {
 			this.lock.unlock();
+		}
+		if (dropped) {
+			grantClient(frame.length());
+			return;
 		}
 		if (violation) {
 			goAway(ERROR_FLOW_CONTROL);
 			abort();
 			return;
 		}
+		grantClient(connectionGrant);
 		grantStream(stream.id, release);
 		checkQueueBound();
+	}
+
+	/**
+	 * Adds {@code units} to the client connection window owed and returns what may be
+	 * granted now: all of it while the relay is within its allowance or the budget has
+	 * room, nothing otherwise.
+	 */
+	private int connectionGrantLocked(int units) {
+		this.owedGrant += units;
+		if (this.owedGrant == 0 || this.grantsClosed || !grantAllowedLocked()) {
+			return 0;
+		}
+		int grant = (int) this.owedGrant;
+		this.owedGrant = 0;
+		return grant;
+	}
+
+	private boolean grantAllowedLocked() {
+		return this.queuedBytes <= CONNECTION_ALLOWANCE || this.budget.hasRoom();
+	}
+
+	/** Has the withheld window granted once the budget has room; with {@link #lock}. */
+	private void awaitBudgetLocked() {
+		if (!this.grantsClosed) {
+			this.budget.awaitRoom(this.owedGrantRetry);
+		}
+	}
+
+	/** Grants the withheld window if allowed by now; called as queued bytes leave. */
+	private void grantOwed() {
+		int grant;
+		this.lock.lock();
+		try {
+			grant = this.owedGrant > 0 ? connectionGrantLocked(0) : 0;
+		}
+		finally {
+			this.lock.unlock();
+		}
+		grantClient(grant);
+	}
+
+	/** The budget has room: grants the withheld window, or waits again. */
+	private void retryOwedGrant() {
+		int grant;
+		this.lock.lock();
+		try {
+			grant = connectionGrantLocked(0);
+			if (grant == 0 && this.owedGrant > 0) {
+				awaitBudgetLocked();
+			}
+		}
+		finally {
+			this.lock.unlock();
+		}
+		try {
+			grantClient(grant);
+		}
+		catch (RuntimeException e) {
+			abort(); // the client is gone
+		}
+	}
+
+	/** Moves {@link #queuedBytes} and settles the budget's share; with {@link #lock}. */
+	private void accountLocked(long bytes) {
+		this.queuedBytes += bytes;
+		settleBudgetLocked();
+	}
+
+	/**
+	 * Charges to the budget, or releases, what makes its share the part of
+	 * {@link #queuedBytes} beyond the allowance; with {@link #lock}.
+	 */
+	private void settleBudgetLocked() {
+		long share = Math.max(0, this.queuedBytes - CONNECTION_ALLOWANCE);
+		long change = share - this.pooled;
+		this.pooled = share;
+		if (change > 0) {
+			this.budget.charge(change);
+		}
+		else if (change < 0) {
+			this.budget.release(-change);
+		}
+	}
+
+	/**
+	 * Whether {@code bytes} more may be queued: within the allowance, or charged to the
+	 * budget now if it has room for the part beyond. The caller queues them, or settles
+	 * the budget when it does not. With {@link #lock}.
+	 */
+	private boolean admitLocked(long bytes) {
+		long change = Math.max(0, this.queuedBytes + bytes - CONNECTION_ALLOWANCE) - this.pooled;
+		if (change <= 0) {
+			return true;
+		}
+		if (!this.budget.tryCharge(change)) {
+			return false;
+		}
+		this.pooled += change;
+		return true;
 	}
 
 	/**
@@ -556,6 +723,7 @@ final class Http2DemuxRelay {
 			this.lock.unlock();
 		}
 		stream.leg.streamClosed(frame.streamId());
+		grantOwed();
 		checkQueueBound();
 	}
 
@@ -688,17 +856,31 @@ final class Http2DemuxRelay {
 	 */
 	private void onTrailers(Stream stream, boolean endStream, io.netty.handler.codec.http2.Http2Headers headers) {
 		byte[] frames = encodedHead(stream.id, endStream, headers, null, this.headersEncoder);
+		boolean exhausted = false;
 		this.lock.lock();
 		try {
 			if (stream.clientEnded || stream.trailers) {
 				return;
 			}
-			stream.trailers = true;
-			stream.clientEnded = endStream;
-			stream.leg.queueBlock(stream, frames, true);
+			if (!admitLocked(frames.length)) {
+				// trailers cannot be refused without leaving the stream unfinished: the
+				// connection, past its allowance with the budget exhausted, ends instead
+				exhausted = true;
+			}
+			else {
+				stream.trailers = true;
+				stream.clientEnded = endStream;
+				stream.leg.queueBlock(stream, frames, true);
+				settleBudgetLocked();
+			}
 		}
 		finally {
 			this.lock.unlock();
+		}
+		if (exhausted) {
+			goAway(ERROR_ENHANCE_YOUR_CALM);
+			abort();
+			return;
 		}
 		checkQueueBound();
 	}
@@ -725,20 +907,48 @@ final class Http2DemuxRelay {
 			}
 		}
 		Router.Route route = resolved.route();
-		Leg leg = legFor(route, resolved.session());
-		Stream stream = new Stream(streamId, leg);
 		// always re-encoded: the client's blocks reference its dynamic table, whose
 		// state a leg joining later (tunnel recovery, a second upstream of a coalesced
 		// connection) does not have -- the table-less encoder keeps every block
 		// self-contained no matter which leg decodes it or when
 		byte[] frames = encodedHead(streamId, endStream, headers, route.rewriteHost() ? route.address() : null,
 				this.headersEncoder);
+		boolean budgeted;
+		this.lock.lock();
+		try {
+			budgeted = admitLocked(frames.length);
+		}
+		finally {
+			this.lock.unlock();
+		}
+		if (!budgeted) {
+			this.meters.refusedForBudget();
+			writeToClient(rstStream(streamId, ERROR_REFUSED_STREAM));
+			return;
+		}
+		Leg leg = legFor(route, resolved.session());
+		if (leg == null) {
+			this.lock.lock();
+			try {
+				settleBudgetLocked();
+			}
+			finally {
+				this.lock.unlock();
+			}
+			this.meters.refusedForLegLimit();
+			writeToClient(rstStream(streamId, ERROR_REFUSED_STREAM));
+			return;
+		}
+		Stream stream = new Stream(streamId, leg);
 		boolean admitted;
 		this.lock.lock();
 		try {
 			// a leg its upstream retired meanwhile takes no new stream
 			admitted = leg.acceptingLocked();
-			if (admitted) {
+			if (!admitted) {
+				settleBudgetLocked();
+			}
+			else {
 				this.streams.put(Integer.valueOf(streamId), stream);
 				leg.routeMeters.trackedStreams().increment();
 				this.activeStreams++;
@@ -747,6 +957,7 @@ final class Http2DemuxRelay {
 				stream.upstreamWindow = leg.initialWindow;
 				leg.streamOpened(streamId);
 				leg.queueBlock(stream, frames, false);
+				settleBudgetLocked();
 			}
 		}
 		finally {
@@ -880,14 +1091,60 @@ final class Http2DemuxRelay {
 		return null;
 	}
 
-	/** The leg relaying the route: the alive leg serving it, or a new one. */
-	private Leg legFor(Router.Route route, TunnelSession session) {
+	/**
+	 * The leg relaying the route: the alive leg serving it, or a new one -- on the
+	 * connection's own slot when no leg holds it, else on a slot of its own; null when
+	 * the connection limit has none left.
+	 */
+	private @Nullable Leg legFor(Router.Route route, TunnelSession session) {
 		for (Leg leg : this.legs) {
 			if (!leg.ended && leg.route.equals(route)) {
 				return leg;
 			}
 		}
-		return new Leg(route, session);
+		boolean base;
+		this.lock.lock();
+		try {
+			base = !this.baseLegTaken;
+			this.baseLegTaken = true;
+		}
+		finally {
+			this.lock.unlock();
+		}
+		ConnectionLimit.Permit permit = null;
+		if (!base) {
+			permit = this.limits.tryAcquireLeg();
+			if (permit == null) {
+				return null;
+			}
+		}
+		try {
+			return new Leg(route, session, permit);
+		}
+		catch (RuntimeException e) {
+			releaseSlot(permit);
+			throw e;
+		}
+	}
+
+	/** Frees a leg's slot: its own permit, or the connection's. */
+	private void releaseSlot(ConnectionLimit.@Nullable Permit permit) {
+		this.lock.lock();
+		try {
+			releaseSlotLocked(permit);
+		}
+		finally {
+			this.lock.unlock();
+		}
+	}
+
+	private void releaseSlotLocked(ConnectionLimit.@Nullable Permit permit) {
+		if (permit != null) {
+			permit.release();
+		}
+		else {
+			this.baseLegTaken = false;
+		}
 	}
 
 	/**
@@ -974,7 +1231,9 @@ final class Http2DemuxRelay {
 	 * Grants the client connection window; called as DATA leaves towards the legs.
 	 */
 	private void grantClient(int units) {
-		writeToClient(windowUpdate(0, units));
+		if (units > 0) {
+			writeToClient(windowUpdate(0, units));
+		}
 	}
 
 	private static byte[] windowUpdate(int streamId, int units) {
@@ -1062,11 +1321,14 @@ final class Http2DemuxRelay {
 		/** DATA payload of the stream queued or being written. */
 		int queuedPayload;
 
-		/** Every byte queued for the stream, frame headers of its entries included. */
+		/**
+		 * Every byte queued for the stream: the payload's buffer, frame headers of its
+		 * entries included.
+		 */
 		long queuedBytes;
 
 		/** Payload not yet written by the leg writer. */
-		final ByteArrayOutputStream pendingData = new ByteArrayOutputStream(0);
+		final PendingPayload pending = new PendingPayload();
 
 		boolean pendingEnd;
 
@@ -1168,6 +1430,12 @@ final class Http2DemuxRelay {
 		/** The leg takes no new stream: its upstream went away, or it closed. */
 		private volatile boolean ended;
 
+		/**
+		 * The leg's own slot of the connection limit; null when it holds the
+		 * connection's.
+		 */
+		private final ConnectionLimit.@Nullable Permit permit;
+
 		/** Set by {@link #close()}; guarded by {@link #lock}. */
 		private boolean closed;
 
@@ -1177,9 +1445,10 @@ final class Http2DemuxRelay {
 		/** The writer half-closed the upstream and exited; guarded by {@link #lock}. */
 		private boolean halfClosed;
 
-		Leg(Router.Route route, TunnelSession session) {
+		Leg(Router.Route route, TunnelSession session, ConnectionLimit.@Nullable Permit permit) {
 			this.route = route;
 			this.session = session;
+			this.permit = permit;
 			this.connection = session.open(route.address());
 			this.inbound = Http2DemuxRelay.this.meterRegistry.counter(METRIC_NAME, "direction", "inbound", "route",
 					route.routeTag());
@@ -1218,7 +1487,7 @@ final class Http2DemuxRelay {
 
 		private void addQueuedLocked(@Nullable Stream stream, long bytes) {
 			this.queuedBytes += bytes;
-			Http2DemuxRelay.this.queuedBytes += bytes;
+			Http2DemuxRelay.this.accountLocked(bytes);
 			this.routeMeters.queuedBytes().addAndGet(bytes);
 			if (stream != null) {
 				stream.queuedBytes += bytes;
@@ -1252,9 +1521,10 @@ final class Http2DemuxRelay {
 				return;
 			}
 			if (length > 0) {
-				stream.pendingData.write(bytes, offset, length);
+				int capacity = stream.pending.capacity();
+				stream.pending.append(bytes, offset, length);
 				stream.queuedPayload += length;
-				addQueuedLocked(stream, length);
+				addQueuedLocked(stream, stream.pending.capacity() - capacity);
 			}
 			if (endStream) {
 				stream.pendingEnd = true;
@@ -1273,11 +1543,12 @@ final class Http2DemuxRelay {
 		 * entry, now empty, no longer waits for window: the writer is woken to drop it.
 		 */
 		void purgeData(Stream stream) {
-			int pending = stream.pendingData.size();
-			if (pending > 0) {
-				stream.pendingData.reset();
+			int pending = stream.pending.size();
+			int capacity = stream.pending.capacity();
+			if (capacity > 0) {
+				stream.pending.clear();
 				stream.queuedPayload -= pending;
-				addQueuedLocked(stream, -pending);
+				addQueuedLocked(stream, -capacity);
 			}
 			stream.pendingEnd = false;
 			signalLocked();
@@ -1569,7 +1840,7 @@ final class Http2DemuxRelay {
 		 * yields no frame.
 		 */
 		private @Nullable Batch dataBatchLocked(Stream stream, byte[] control) {
-			int pending = stream.pendingData.size();
+			int pending = stream.pending.size();
 			int length = pending;
 			if (pending > 0) {
 				long allowed = Math.min(stream.upstreamWindow, this.sendWindow);
@@ -1578,16 +1849,9 @@ final class Http2DemuxRelay {
 				}
 				length = (int) Math.min(pending, allowed);
 			}
-			byte[] all = stream.pendingData.toByteArray();
-			byte[] payload = all;
-			if (length < pending) {
-				payload = Arrays.copyOf(all, length);
-				stream.pendingData.reset();
-				stream.pendingData.write(all, length, pending - length);
-			}
-			else {
-				stream.pendingData.reset();
-			}
+			int capacity = stream.pending.capacity();
+			byte[] payload = stream.pending.take(length);
+			long released = capacity - stream.pending.capacity();
 			stream.upstreamWindow -= length;
 			this.sendWindow -= length;
 			boolean whole = length == pending;
@@ -1597,8 +1861,9 @@ final class Http2DemuxRelay {
 				stream.pendingEnd = false;
 			}
 			byte[] frames = length > 0 || end ? dataFrames(stream.id, payload, end) : EMPTY;
-			// the entry's frame header stays accounted while the entry is queued
-			return new Batch(control, frames, stream, length, length + (whole ? FRAME_HEADER_LENGTH : 0L), false);
+			// the entry's frame header stays accounted while the entry is queued; the
+			// buffer released stays accounted until the payload is written
+			return new Batch(control, frames, stream, length, released + (whole ? FRAME_HEADER_LENGTH : 0L), false);
 		}
 
 		/**
@@ -1759,6 +2024,7 @@ final class Http2DemuxRelay {
 			for (Integer streamId : sending) {
 				writeToClient(rstStream(streamId, ERROR_NO_ERROR));
 			}
+			grantOwed();
 			return true;
 		}
 
@@ -1776,7 +2042,7 @@ final class Http2DemuxRelay {
 				if (stream.leg != this) {
 					continue;
 				}
-				stream.pendingData.reset();
+				stream.pending.clear();
 				stream.pendingEnd = false;
 				stream.dataQueued = false;
 				stream.windowUpdate = null;
@@ -1790,6 +2056,7 @@ final class Http2DemuxRelay {
 			addQueuedLocked(null, -this.queuedBytes);
 			this.entries.clear();
 			this.pingAcks.clear();
+			releaseSlotLocked(this.permit);
 			this.wake.signalAll();
 			Http2DemuxRelay.this.legSettled.signalAll();
 			return true;
@@ -1828,6 +2095,7 @@ final class Http2DemuxRelay {
 				if (stream != null) {
 					grantStream(stream.id, release);
 				}
+				grantOwed();
 				if (batch.halfClose()) {
 					sink.close();
 					return;
@@ -2009,6 +2277,7 @@ final class Http2DemuxRelay {
 		finally {
 			this.lock.unlock();
 		}
+		grantOwed();
 	}
 
 	private void settle() {
@@ -2024,6 +2293,16 @@ final class Http2DemuxRelay {
 		for (Leg leg : this.legs) {
 			leg.close();
 			leg.session.remove(leg.connection.connectionId());
+		}
+		this.lock.lock();
+		try {
+			// the legs released the budget's share; no grant is owed any more
+			this.grantsClosed = true;
+			this.owedGrant = 0;
+			this.budget.cancel(this.owedGrantRetry);
+		}
+		finally {
+			this.lock.unlock();
 		}
 		for (Stream stream : this.streams.values()) {
 			if (this.streams.remove(Integer.valueOf(stream.id), stream)) {

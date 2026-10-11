@@ -257,9 +257,10 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.data-tls-bundle` | - | SSL bundle name for data plane TLS termination (h2 / http/1.1 via ALPN, `force-http1` flips the preference); unset = plaintext only (TLS connections are served by upstreams with `tls-passthrough=true`) |
 | `sluice.ca-bundle` | - | SSL bundle whose keystore holds the CA private key + certificate; enables client certificate issuance in the console (the signed certificates authenticate against the gRPC `client-auth=REQUIRE` truststore, no restart) |
 | `sluice.proxy-protocol` | `false` | parse the PROXY protocol (v1 / v2) header an SNAT front end prepends on the data plane: the header is consumed before routing / relay (never forwarded) and its source address becomes the connection peer for access control and the access log; headerless connections are unaffected, a malformed header fails the connection |
-| `sluice.limits.max-connections` | `0` = derived from the max heap | connections open at once over the data port and every tcp route port; see "Connection limits" |
+| `sluice.limits.max-connections` | `0` = derived from the max heap | connections open at once over the data port and every tcp route port, an h2 connection counting once more per further route it reaches; see "Connection limits" |
 | `sluice.limits.max-connections-per-address` | `0` = no limit beyond `max-connections` | connections open at once from one source address (the PROXY protocol source with `proxy-protocol=true`, the socket peer otherwise) |
 | `sluice.limits.head-timeout` | `10s` | one deadline for the whole head phase of a data plane connection (PROXY header, TLS handshake, request head) |
+| `sluice.limits.h2-queue-budget` | `0` = an eighth of half the max heap | bytes the h2 demux relays may queue towards upstreams beyond each connection's allowance, shared by all of them; see "Connection limits" |
 | `sluice.tcp-port-range` | (unset = any port) | listen ports a client may claim for tcp routes, comma separated single ports or `min-max` ranges (e.g. `9000-9010,8080`); a port outside the range is not bound |
 | `sluice.http-load-balance` | `smallest-client-id` | target picked when several clients serve the same domain: `smallest-client-id` (deterministic across nodes) / `round-robin` (per node) / `random` |
 | `sluice.tcp-load-balance` | `smallest-client-id` | target picked for tcp routes when several clients serve the same listen port (same values); the listen port bind itself always follows the smallest client id |
@@ -528,15 +529,30 @@ the server closes the public connection.
 
 The most one relayed connection buffers on each side of the tunnel is its receive window
 (1MiB) + its send queue cap (16 x 64KiB = 1MiB) + the two relay buffers (2 x 64KiB) =
-2.125MiB. An unset (`0`) limit is derived so that this worst case for every connection
-fits in half the max heap: `max(1, max heap / 2 / 2.125MiB)`, e.g. 94 for a 400MiB heap,
-963 for 4GiB. The effective value is logged at startup (`data plane connection limit` /
-`upstream connection limit`) and exported as a gauge; with the 512Mi container of
-`k8s.md` it follows the heap the server gets there. Not within that bound:
-- h2: a public connection opens one virtual connection per route it reaches, and its
-  demux queue holds up to about 25MiB more (`Http2DemuxRelay.MAX_QUEUED_BYTES`: 100
-  streams x (a 128KiB payload budget + two 64KiB header blocks)); it counts as one
-  connection.
+2.125MiB.
+
+h2 (plaintext and TLS-terminated) relays each stream to a virtual connection of its
+route, one per route the connection reaches: every one beyond the first takes a slot of
+`sluice.limits.max-connections`, and a stream whose route needs one while none is free is
+refused with `REFUSED_STREAM`. What the relay queues towards the upstreams is bounded
+across connections: each connection may queue 128KiB, and the bytes beyond it are charged
+to `sluice.limits.h2-queue-budget`, shared by every h2 connection. While a connection is
+past its 128KiB and the budget is exhausted, the relay withholds its connection window
+(the client stops sending once the at most 64KiB it holds are spent) until the
+connection's own queue drains below 128KiB or the budget has room again; a new stream
+whose head fits neither is refused with `REFUSED_STREAM`, and trailers that fit neither
+end the connection with GOAWAY `ENHANCE_YOUR_CALM`. So a connection whose upstreams read
+keeps flowing however exhausted the budget is, while connections whose upstreams do not
+read stop at the budget plus what each queues outside it: its 128KiB, the 64KiB of
+connection window it still holds, and per stream a buffer rounding (under 1KiB), a reset
+and a window update, about 295KiB (`Http2DemuxRelay.UNBUDGETED_BYTES`).
+
+An unset (`0`) budget is an eighth of half the max heap, and an unset (`0`) connection
+limit is derived so that the worst case of every slot (2.125MiB + 295KiB) and the budget
+fit in half the max heap: `max(1, (max heap / 2 - budget) / 2.41MiB)`, e.g. 72 for a
+400MiB heap, 742 for 4GiB. The effective values are logged at startup (`data plane
+connection limit` / `upstream connection limit`) and exported as gauges; with the 512Mi
+container of `k8s.md` they follow the heap the server gets there. Not within that bound:
 - tiny DATA frames: the window counts payload bytes, each buffered frame adds its own
   object overhead.
 
@@ -547,7 +563,7 @@ fits in half the max heap: `max(1, max heap / 2 / 2.125MiB)`, e.g. 94 for a 400M
   cluster warmup window and while draining (see "Cluster (scale-out)")
 - client `GET /actuator/health` (port 9001) - UP while at least one per-node tunnel stream is
   established; the `tunnel` detail shows the connection state and `nodes` each node's stream state
-- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`, `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_h2demux_queued_bytes` (bytes the h2 demux holds queued towards upstreams, one series per route) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_rejected_total` (`reason` = `limit` / `address-limit` / `head-timeout`)
+- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`, `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_h2demux_queued_bytes` (bytes the h2 demux holds queued towards upstreams, one series per route), `sluice_h2demux_budget_bytes` / `sluice_h2demux_budget_used_bytes` (the shared h2 queue budget and the bytes charged to it, which may pass the budget by what the relays cannot refuse), `sluice_h2demux_window_withheld_total` (times a connection window was withheld for want of budget), `sluice_h2demux_streams_refused_total` (`reason` = `budget` / `leg-limit`) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_rejected_total` (`reason` = `limit` / `address-limit` / `head-timeout`)
 
 ## Console
 

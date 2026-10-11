@@ -28,7 +28,14 @@ import io.micrometer.core.instrument.MeterRegistry;
 /**
  * The limits every data plane connection lives under, shared by the data port and every
  * tcp route port: a cap on the connections open at once, a cap per source address, and
- * one deadline for the whole head phase.
+ * one deadline for the whole head phase; plus the queue budget the h2 demux relays share.
+ * <p>
+ * The connection cap counts virtual connections: an h2 connection whose streams reach
+ * several routes takes one more slot per further leg ({@link #tryAcquireLeg()}). An unset
+ * cap is derived so that the worst case of every slot -- the buffering of one virtual
+ * connection ({@link ConnectionLimit#CONNECTION_BYTES}) plus what an h2 demux relay
+ * queues outside the budget ({@link Http2DemuxRelay#UNBUDGETED_BYTES}) -- and the budget
+ * fit in half the maximum heap.
  * <p>
  * A connection is admitted at accept ({@link #admit}) and holds its {@link Admission}
  * until it ends; {@link Admission#release()} frees its slots and may be called on every
@@ -45,6 +52,8 @@ public class ConnectionLimits implements DisposableBean {
 	private static final String REJECTED = "sluice.data.connections.rejected";
 
 	private final ConnectionLimit global;
+
+	private final H2DemuxBudget h2Budget;
 
 	private final int maxPerAddress;
 
@@ -63,7 +72,11 @@ public class ConnectionLimits implements DisposableBean {
 
 	ConnectionLimits(SluiceServerProperties properties, MeterRegistry meterRegistry) {
 		SluiceServerProperties.Limits limits = properties.limits();
-		this.global = new ConnectionLimit(ConnectionLimit.resolve(limits.maxConnections()));
+		long maxHeap = Runtime.getRuntime().maxMemory();
+		long budget = limits.h2QueueBudget().toBytes() > 0 ? limits.h2QueueBudget().toBytes() : deriveBudget(maxHeap);
+		this.h2Budget = new H2DemuxBudget(budget);
+		this.global = new ConnectionLimit(
+				limits.maxConnections() > 0 ? limits.maxConnections() : deriveMaxConnections(maxHeap, budget));
 		int perAddress = limits.maxConnectionsPerAddress();
 		this.maxPerAddress = perAddress > 0 ? Math.min(perAddress, this.global.max()) : this.global.max();
 		this.headTimeout = limits.headTimeout();
@@ -78,13 +91,39 @@ public class ConnectionLimits implements DisposableBean {
 			.description("Data plane connections allowed open at once")
 			.register(meterRegistry);
 		Gauge.builder("sluice.data.connections.admitted", this.global, ConnectionLimit::open)
-			.description("Data plane connections holding a slot of the connection limit")
+			.description("Data plane connections and further h2 demux legs holding a slot of the connection limit")
 			.register(meterRegistry);
-		log.info("data plane connection limit {} ({}), per address {}, head timeout {}", this.global.max(),
+		Gauge.builder("sluice.h2demux.budget.bytes", this.h2Budget, H2DemuxBudget::max)
+			.description("Bytes the h2 demux relays may queue beyond their per-connection allowance, shared")
+			.register(meterRegistry);
+		Gauge.builder("sluice.h2demux.budget.used.bytes", this.h2Budget, H2DemuxBudget::used)
+			.description("Bytes the h2 demux relays queue beyond their per-connection allowance")
+			.register(meterRegistry);
+		log.info("data plane connection limit {} ({}), per address {}, head timeout {}, h2 queue budget {}KiB ({})",
+				this.global.max(),
 				limits.maxConnections() > 0 ? "configured"
-						: "derived: half of max heap %dMiB / %dKiB per connection"
-							.formatted(Runtime.getRuntime().maxMemory() >> 20, ConnectionLimit.CONNECTION_BYTES >> 10),
-				this.maxPerAddress, this.headTimeout);
+						: "derived: (half of max heap %dMiB - h2 queue budget) / %dKiB per connection"
+							.formatted(maxHeap >> 20, connectionBytes() >> 10),
+				this.maxPerAddress, this.headTimeout, budget >> 10,
+				limits.h2QueueBudget().toBytes() > 0 ? "configured" : "derived: an eighth of half of max heap");
+	}
+
+	/** The worst case of one slot: a virtual connection plus an h2 relay's own queue. */
+	static long connectionBytes() {
+		return ConnectionLimit.CONNECTION_BYTES + Http2DemuxRelay.UNBUDGETED_BYTES;
+	}
+
+	/** The h2 queue budget an unset value derives: an eighth of half the heap. */
+	static long deriveBudget(long maxHeap) {
+		return maxHeap / 2 / 8;
+	}
+
+	/**
+	 * The connections whose worst case ({@link #connectionBytes()}) fits in half the heap
+	 * besides the h2 queue budget; at least 1.
+	 */
+	static int deriveMaxConnections(long maxHeap, long budget) {
+		return ConnectionLimit.derive(maxHeap / 2 - budget, connectionBytes());
 	}
 
 	private static Counter rejected(MeterRegistry meterRegistry, String reason) {
@@ -106,6 +145,19 @@ public class ConnectionLimits implements DisposableBean {
 			return null;
 		}
 		return new Admission(permit, access);
+	}
+
+	/**
+	 * A slot for one more leg of an h2 demux relay beyond the one its connection's own
+	 * slot covers, or null when the limit is reached: the stream needing it is refused.
+	 */
+	ConnectionLimit.@Nullable Permit tryAcquireLeg() {
+		return this.global.tryAcquire();
+	}
+
+	/** The queue budget shared by the h2 demux relays. */
+	H2DemuxBudget h2Budget() {
+		return this.h2Budget;
 	}
 
 	/** Connections open at once, at most. */

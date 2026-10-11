@@ -47,6 +47,13 @@ class ConnectionLimitTest {
 	}
 
 	@Test
+	void deriveFitsConnectionsOfTheGivenSizeInTheGivenBytes() {
+		assertThat(ConnectionLimit.derive(10 * MIB, 3 * MIB)).isEqualTo(3);
+		assertThat(ConnectionLimit.derive(0, MIB)).isEqualTo(1);
+		assertThat(ConnectionLimit.derive(-MIB, MIB)).isEqualTo(1);
+	}
+
+	@Test
 	void resolvePrefersTheConfiguredLimit() {
 		assertThat(ConnectionLimit.resolve(7)).isEqualTo(7);
 		assertThat(ConnectionLimit.resolve(0)).isEqualTo(ConnectionLimit.derive(Runtime.getRuntime().maxMemory()));
