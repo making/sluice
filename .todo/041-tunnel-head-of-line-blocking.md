@@ -82,6 +82,7 @@ in the same investigation is todo 042.
 | 050-session-sender-scheduler-scaling | 044 review follow-up | Medium | 044; before or with 046 |
 | 045-h2-demux-per-leg-writers | F7 | Medium | 043, 044; before or with 046 |
 | 051-h2-demux-leg-queue-follow-up | 045 review follow-up | High | 045; before or with 046 |
+| 052-sender-cap-wait-ignores-connection-close | 051 review follow-up (teardown hang) | Medium | before or with 046 |
 | 046-per-connection-flow-control-java | F1 (protocol + Java) | High | 043, 044, 045 |
 | 047-per-connection-flow-control-wasmlet | F5 | High | 046 |
 | 048-data-plane-connection-limits | memory bound (see "Residual after the children") | Medium | - (defaults derive from 044-046) |
