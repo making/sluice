@@ -375,7 +375,21 @@ public final class NodeConnection implements AutoCloseable {
 		this.readvertiseBackoff = BACKOFF_INITIAL_SECONDS;
 		sender.sendAdvertise(this.advertised);
 		closed.await();
+		this.closeConnections();
 		sender.close();
+	}
+
+	/**
+	 * Fails and closes every virtual connection of the ended stream, mirroring
+	 * {@code TunnelSession#close}: relays waiting on the connections end and the local
+	 * sockets are released. Idempotent; safe to run while relays are still registering.
+	 */
+	private void closeConnections() {
+		for (VirtualConnection connection : this.connections.values()) {
+			connection.remoteFailed("tunnel stream closed");
+			connection.close();
+		}
+		this.connections.clear();
 	}
 
 	/**

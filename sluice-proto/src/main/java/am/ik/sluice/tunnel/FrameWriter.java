@@ -13,9 +13,10 @@ public interface FrameWriter {
 
 	/**
 	 * Sends a DATA frame. Payloads larger than 64KiB are split into multiple frames; the
-	 * array is copied before queueing.
+	 * array is copied before queueing. Returns false when the frame could not be fully
+	 * queued (the tunnel stream is gone); callers are expected to end their side.
 	 */
-	void sendData(long connectionId, byte[] payload);
+	boolean sendData(long connectionId, byte[] payload);
 
 	/**
 	 * Half-closes the local -> remote direction of the given connection.

@@ -1,5 +1,6 @@
 package am.ik.sluice.tunnel;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.Arrays;
@@ -174,7 +175,7 @@ public final class StreamRelay {
 			if (this.listener != null) {
 				this.listener.onBytesRelayed(this.prefix.length, Direction.TO_REMOTE);
 			}
-			this.frameWriter.sendData(this.connection.connectionId(), Arrays.copyOf(this.prefix, this.prefix.length));
+			sendOrThrow(Arrays.copyOf(this.prefix, this.prefix.length));
 		}
 		InputStream in = this.pipe.source();
 		int n;
@@ -182,9 +183,16 @@ public final class StreamRelay {
 			if (this.listener != null) {
 				this.listener.onBytesRelayed(n, Direction.TO_REMOTE);
 			}
-			this.frameWriter.sendData(this.connection.connectionId(), Arrays.copyOf(buffer, n));
+			sendOrThrow(Arrays.copyOf(buffer, n));
 		}
 		this.frameWriter.sendClose(this.connection.connectionId());
+	}
+
+	/** Ends the relay when the tunnel stream no longer accepts the chunk. */
+	private void sendOrThrow(byte[] payload) throws IOException {
+		if (!this.frameWriter.sendData(this.connection.connectionId(), payload)) {
+			throw new IOException("tunnel stream closed");
+		}
 	}
 
 	private void doRelayToLocal() throws Exception {

@@ -8,18 +8,19 @@ import java.io.OutputStream;
 import java.util.Arrays;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.Objects;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * One multiplexed virtual TCP connection over the tunnel stream (the port of
  * remotedialer's connection.go).
  * <p>
- * The inbound direction is an unbounded-number-of-writers / single-reader bounded queue:
- * {@link #acceptData(byte[])} may block briefly to propagate backpressure to the gRPC
- * stream. The outbound direction forwards to the session's {@link FrameWriter}. CLOSE is
- * honored as a half-close so the opposite direction may keep flowing (required for HTTP
- * keep-alive and half-duplex protocols).
+ * The inbound direction is an unbounded-number-of-writers / single-reader queue; DATA is
+ * bounded (a producer blocks in {@link #acceptData(byte[])} to propagate backpressure to
+ * the gRPC stream) while close/failure markers are never delayed by it. The outbound
+ * direction forwards to the session's {@link FrameWriter}. CLOSE is honored as a
+ * half-close so the opposite direction may keep flowing (required for HTTP keep-alive and
+ * half-duplex protocols).
  */
 public final class VirtualConnection implements AutoCloseable {
 
@@ -45,7 +46,13 @@ public final class VirtualConnection implements AutoCloseable {
 
 	private final FrameWriter frameWriter;
 
-	private final LinkedBlockingDeque<Inbound> inbound = new LinkedBlockingDeque<>(QUEUE_CAPACITY);
+	private final LinkedBlockingDeque<Inbound> inbound = new LinkedBlockingDeque<>();
+
+	/**
+	 * Bounds the buffered DATA chunks; released by {@link Source#read}. Markers are not
+	 * counted, so remote close/failure can never be delayed by the data bound.
+	 */
+	private final Semaphore inboundPermits = new Semaphore(QUEUE_CAPACITY);
 
 	private final Source source = new Source();
 
@@ -81,48 +88,40 @@ public final class VirtualConnection implements AutoCloseable {
 	}
 
 	/**
-	 * Feeds a chunk received from the remote side. Blocks while the inbound queue is
-	 * full, which applies backpressure to the gRPC stream.
+	 * Feeds a chunk received from the remote side. Blocks while the DATA bound (128
+	 * chunks) is reached, which applies backpressure to the gRPC stream; markers queued
+	 * by {@link #remoteClosed()} / {@link #remoteFailed(String)} are never delayed by it.
 	 */
 	public void acceptData(byte[] data) {
-		Chunk chunk = new Chunk(Arrays.copyOf(data, data.length));
-		while (!this.readClosed && !this.closed) {
-			try {
-				if (this.inbound.offer(chunk, 100, TimeUnit.MILLISECONDS)) {
-					return;
-				}
-			}
-			catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-				return;
-			}
+		if (this.readClosed || this.closed) {
+			return;
 		}
+		Chunk chunk = new Chunk(Arrays.copyOf(data, data.length));
+		try {
+			this.inboundPermits.acquire();
+		}
+		catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			return;
+		}
+		if (this.readClosed || this.closed) {
+			this.inboundPermits.release();
+			return;
+		}
+		this.inbound.offerLast(chunk);
 	}
 
 	/**
 	 * The remote half-closed its -> local direction; the local side may continue writing.
 	 */
 	public void remoteClosed() {
-		this.enqueueAfterDrained(new Eof());
+		this.inbound.offerLast(new Eof());
 	}
 
 	/** The remote terminated the connection abnormally. */
 	public void remoteFailed(String message) {
 		this.failure = message;
-		this.enqueueAfterDrained(new Failure(message == null ? "remote failure" : message));
-	}
-
-	private void enqueueAfterDrained(Inbound marker) {
-		try {
-			while (!this.readClosed && !this.closed) {
-				if (this.inbound.offer(marker, 100, TimeUnit.MILLISECONDS)) {
-					return;
-				}
-			}
-		}
-		catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-		}
+		this.inbound.offerLast(new Failure(message == null ? "remote failure" : message));
 	}
 
 	@Override
@@ -198,6 +197,7 @@ public final class VirtualConnection implements AutoCloseable {
 				}
 				switch (inbound) {
 					case Chunk chunk -> {
+						VirtualConnection.this.inboundPermits.release();
 						if (chunk.data().length == 0) {
 							this.eofSeen = true;
 						}
@@ -241,7 +241,9 @@ public final class VirtualConnection implements AutoCloseable {
 				VirtualConnection.this.writeLock.unlock();
 			}
 			byte[] payload = Arrays.copyOfRange(b, off, off + len);
-			VirtualConnection.this.frameWriter.sendData(VirtualConnection.this.connectionId, payload);
+			if (!VirtualConnection.this.frameWriter.sendData(VirtualConnection.this.connectionId, payload)) {
+				throw new IOException("tunnel stream closed");
+			}
 		}
 
 		/**

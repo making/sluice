@@ -28,8 +28,9 @@ class StreamRelayTest {
 		}
 
 		@Override
-		public void sendData(long connectionId, byte[] payload) {
+		public boolean sendData(long connectionId, byte[] payload) {
 			this.frames.add("data:%d:%s".formatted(connectionId, new String(payload, StandardCharsets.UTF_8)));
+			return true;
 		}
 
 		@Override

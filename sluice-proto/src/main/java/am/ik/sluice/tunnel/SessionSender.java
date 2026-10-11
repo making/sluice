@@ -21,13 +21,12 @@ import am.ik.sluice.v1.proto.MembershipUpdate;
 import am.ik.sluice.v1.proto.Node;
 import am.ik.sluice.v1.proto.Drain;
 import am.ik.sluice.v1.proto.Upstream;
-import io.grpc.stub.ClientCallStreamObserver;
+import io.grpc.stub.CallStreamObserver;
 import io.grpc.stub.StreamObserver;
 
 /**
  * Serializes outbound frames through a bounded queue and flushes them to the underlying
- * gRPC stream observer, honoring flow control via
- * {@link ClientCallStreamObserver#isReady()}.
+ * gRPC stream observer, honoring flow control via {@link CallStreamObserver#isReady()}.
  * <p>
  * Callbacks must never call {@code onNext} directly from a receive callback; everything
  * goes through this queue and a dedicated virtual thread instead.
@@ -71,7 +70,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 	public SessionSender(StreamObserver<Frame> outbound) {
 		this.outbound = Objects.requireNonNull(outbound, "outbound is required");
-		if (outbound instanceof ClientCallStreamObserver<?> call) {
+		if (outbound instanceof CallStreamObserver<?> call) {
 			call.setOnReadyHandler(this::signalReady);
 		}
 	}
@@ -101,7 +100,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	}
 
 	private boolean awaitReady() {
-		if (!(this.outbound instanceof ClientCallStreamObserver<?> call) || call.isReady()) {
+		if (!(this.outbound instanceof CallStreamObserver<?> call) || call.isReady()) {
 			return true;
 		}
 		this.lock.lock();
@@ -146,7 +145,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	}
 
 	@Override
-	public void sendData(long connectionId, byte[] payload) {
+	public boolean sendData(long connectionId, byte[] payload) {
 		for (int offset = 0; offset < payload.length; offset += MAX_CHUNK) {
 			int length = Math.min(MAX_CHUNK, payload.length - offset);
 			byte[] chunk = new byte[length];
@@ -156,9 +155,10 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 				.setPayload(com.google.protobuf.UnsafeByteOperations.unsafeWrap(chunk))
 				.build();
 			if (!enqueue(new Payload(Frame.newBuilder().setData(data).build()))) {
-				return;
+				return false;
 			}
 		}
+		return true;
 	}
 
 	/**
@@ -302,6 +302,10 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 				drain();
 			}
 			finally {
+				// a dead worker must release the producers parked in enqueue and the
+				// awaitReady loop; close() alone cannot be relied on to run
+				running = false;
+				signalReady();
 				workerLock.lock();
 				try {
 					done = true;

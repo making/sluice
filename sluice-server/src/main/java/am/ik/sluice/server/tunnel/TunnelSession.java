@@ -323,12 +323,16 @@ public final class TunnelSession implements AutoCloseable {
 		log.info("closing session for client {}", this.clientId);
 		this.tcpRoutes.reconcile(this.clientId, Set.of());
 		this.router.remove(this.clientId);
+		// the sender first: a dead or stalled stream must not leave the connection
+		// teardown below waiting on a full send queue (the worker stops and releases
+		// every producer); from here on the frames of the closing connections are
+		// dropped, the peer is gone anyway
+		this.sender.close();
 		for (VirtualConnection connection : List.copyOf(this.connections.values())) {
 			connection.remoteFailed("tunnel session closed");
 			connection.close();
 		}
 		this.connections.clear();
-		this.sender.close();
 	}
 
 }

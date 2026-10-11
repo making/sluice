@@ -35,9 +35,10 @@ class VirtualConnectionTest {
 		}
 
 		@Override
-		public void sendData(long connectionId, byte[] payload) {
+		public boolean sendData(long connectionId, byte[] payload) {
 			this.frames.add("data:%d:%d".formatted(connectionId, payload.length));
 			this.bytes.addAndGet(payload.length);
+			return true;
 		}
 
 		@Override
@@ -169,6 +170,38 @@ class VirtualConnectionTest {
 		reader.join(1000);
 		assertThat(reader.isAlive()).isFalse();
 		assertThat(writer.frames).contains("close:6");
+	}
+
+	@Test
+	void remoteClosedIsNotBlockedByFullInboundQueue() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = new VirtualConnection(7, writer);
+		byte[] chunk = new byte[1000];
+		for (int i = 0; i < 128; i++) { // fill the 128-chunk inbound bound
+			connection.acceptData(chunk);
+		}
+		Thread marker = Thread.ofVirtual().start(connection::remoteClosed);
+		marker.join(TimeUnit.MILLISECONDS.toMillis(100));
+		assertThat(marker.isAlive()).as("remoteClosed returns").isFalse();
+		byte[] all = connection.source().readNBytes(128 * 1000);
+		assertThat(all).hasSize(128 * 1000);
+		assertThat(connection.source().read()).as("EOF after all data").isEqualTo(-1);
+	}
+
+	@Test
+	void remoteFailedIsNotBlockedByFullInboundQueue() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = new VirtualConnection(8, writer);
+		byte[] chunk = new byte[1000];
+		for (int i = 0; i < 128; i++) { // fill the 128-chunk inbound bound
+			connection.acceptData(chunk);
+		}
+		Thread marker = Thread.ofVirtual().start(() -> connection.remoteFailed("boom"));
+		marker.join(TimeUnit.MILLISECONDS.toMillis(100));
+		assertThat(marker.isAlive()).as("remoteFailed returns").isFalse();
+		byte[] all = connection.source().readNBytes(128 * 1000);
+		assertThat(all).hasSize(128 * 1000);
+		assertThatThrownBy(() -> connection.source().read()).isInstanceOf(IOException.class).hasMessage("boom");
 	}
 
 }
