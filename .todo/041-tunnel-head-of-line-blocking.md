@@ -86,7 +86,9 @@ in the same investigation is todo 042.
 | 046-per-connection-flow-control-java | F1 (protocol + Java) | High | 043, 044, 045 |
 | 047-per-connection-flow-control-wasmlet | F5 | High | 046 |
 | 056-wasmlet-outbound-fair-scheduling | F4 on the wasmlet (047 review follow-up) | Medium | 047 |
-| 048-data-plane-connection-limits | memory bound (see "Residual after the children") | Medium | - (defaults derive from 044-046) |
+| 048-data-plane-connection-limits | memory bound (see "Residual after the children"); done | Medium | - (defaults derive from 044-046) |
+| 057-h2-demux-global-queue-budget | h2 memory outside the 048 bound | High | 048 |
+| 058-receive-buffer-per-frame-overhead | per-frame overhead outside the 048 bound | Medium | 048 |
 | 054-remove-legacy-flow-control | legacy removal (see "Follow-up"; not a child, the parent does not wait for it) | Medium | 047; no pre-046/047 peer deployed |
 
 Each child is one commit series with its own tests and docs. This parent is done when all
@@ -139,8 +141,9 @@ message Connect {
   protocol, a later tuning needs no protocol change. Rationale: grpc-java's default HTTP/2
   stream window is 1MiB, so one connection can still fill the stream as today.
 - **Bounds**:
-  - Memory per side = window x active connections; finite only with the connection
-    limit of 048.
+  - Memory per side = window x active connections; capped by the connection limits
+    of 048 (derived default: 2.125MiB per connection in half the max heap), except
+    the h2 demux queue (057) and per-frame overhead (058).
   - Throughput per connection <= window / RTT (1MiB at 50ms ~ 20MiB/s).
 - **Grant rule**: the receiver sends WindowUpdate once its consumed-but-ungranted bytes
   reach half the window. Consumed means handed to the local consumer, not merely
@@ -170,7 +173,10 @@ What 043-048 still leave open, by design or elsewhere. Do not report the parent 
   peer. That is protocol semantics, not tunnel HOL.
 - TCP-level HOL of the single transport connection: only a QUIC transport removes it.
   Out of scope (no todo).
-- Covered in the children, listed here so they are not lost: total memory (048). (ADVERTISE
+- Total memory (048, done): the connection limits bound it for connections with one
+  virtual connection. Not within the bound: an h2 connection's demux queue and legs
+  (057), per-frame overhead of tiny DATA frames (058), wasmlet guest instances (059),
+  and keep-alive connections idle between requests hold their slots (060). (ADVERTISE
   off the receive path and the credit-lock pitfall are done in 046.)
 
 ## Follow-up
