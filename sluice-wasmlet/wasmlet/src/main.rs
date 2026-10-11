@@ -432,12 +432,7 @@ impl NodeTask {
         // The bidi stream: outbound frames flow through the two lanes of
         // `outbound`, inbound via `inbound`.
         let (outbound, frames) = Outbound::new();
-        outbound.control(Frame {
-            body: Some(Body::Advertise(Advertise {
-                upstreams: self.shared.advertised.clone(),
-                connection_window: tunnel::WINDOW,
-            })),
-        });
+        outbound.control(advertise(self.shared.advertised.clone()));
         let mut request = tonic::Request::new(frames);
         identify(&mut request, &self.shared.token, &self.shared.id)?;
         let inbound = <pb::tunnel_client::TunnelClient<_>>::new(channel.clone())
@@ -537,6 +532,17 @@ impl NodeTask {
                 None => {}
             }
         }
+    }
+}
+
+/// The Advertise opening every stream: the routes plus the receive window
+/// that makes the server open windowed connections.
+fn advertise(upstreams: Vec<Upstream>) -> Frame {
+    Frame {
+        body: Some(Body::Advertise(Advertise {
+            upstreams,
+            connection_window: tunnel::WINDOW,
+        })),
     }
 }
 
@@ -643,6 +649,17 @@ mod tests {
             route_target("wasm:file:///a.wasm", &c),
             "wasm:file:///a.wasm?wasi=cli"
         );
+    }
+
+    /// Without the window the server opens every connection in legacy mode,
+    /// and no other test would notice.
+    #[test]
+    fn the_advertise_announces_the_connection_window() {
+        let Some(Body::Advertise(advertise)) = advertise(Vec::new()).body else {
+            panic!("an Advertise");
+        };
+        assert_eq!(advertise.connection_window, 1024 * 1024);
+        assert_eq!(advertise.connection_window, tunnel::WINDOW);
     }
 
     fn session(url: &str) -> Arc<Session> {
