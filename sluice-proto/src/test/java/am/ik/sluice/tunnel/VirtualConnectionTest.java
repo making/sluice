@@ -10,7 +10,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -263,6 +266,42 @@ class VirtualConnectionTest {
 		assertThat(connection.pendingInbound()).as("the chunks plus one Failure marker").isEqualTo(129);
 		assertThat(connection.source().readNBytes(128 * 1000)).hasSize(128 * 1000);
 		assertThatThrownBy(() -> connection.source().read()).isInstanceOf(IOException.class).hasMessage("boom");
+	}
+
+	/**
+	 * A write parked at the session sender's per-connection cap (the stream never becomes
+	 * ready) fails within 100ms of the local close, which queued the CLOSE.
+	 */
+	@Test
+	void sinkWriteParkedAtTheSenderCapFailsOnClose() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		SessionSender sender = new SessionSender(observer);
+		sender.start();
+		try {
+			VirtualConnection connection = new VirtualConnection(1, sender);
+			OutputStream sink = connection.sink();
+			for (int i = 0; i < SessionSender.DATA_QUEUE_CAPACITY; i++) {
+				sink.write(new byte[1]);
+			}
+			CompletableFuture<Void> parked = CompletableFuture.runAsync(() -> {
+				try {
+					sink.write(new byte[1]);
+				}
+				catch (IOException e) {
+					throw new CompletionException(e);
+				}
+			}, task -> Thread.ofVirtual().start(task));
+			TimeUnit.MILLISECONDS.sleep(200);
+			assertThat(parked).as("the write waits at the cap").isNotDone();
+			connection.close();
+			assertThatThrownBy(() -> parked.get(100, TimeUnit.MILLISECONDS)).isInstanceOf(ExecutionException.class)
+				.cause()
+				.isInstanceOf(IOException.class)
+				.hasMessage("connection 1 is closed");
+		}
+		finally {
+			sender.close();
+		}
 	}
 
 }

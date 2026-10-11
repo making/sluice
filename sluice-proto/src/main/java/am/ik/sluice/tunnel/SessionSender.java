@@ -38,17 +38,22 @@ import io.grpc.stub.StreamObserver;
  * first, so enqueueing one never blocks. Connection frames (DATA, CLOSE, ERROR) wait on a
  * per-connection queue holding at most {@link #DATA_QUEUE_CAPACITY} DATA frames; only
  * that connection's producer blocks once the cap is reached, and CLOSE / ERROR bypass it.
+ * Queueing CLOSE / ERROR closes the queue to DATA: the producers parked on its cap fail
+ * at once, and so does every later chunk while the queue lives.
  * <p>
  * Per-frame work is O(1) in the number of connections: the worker pops the head of a ring
  * of the connections with pending frames, sends one frame, and re-appends the queue while
  * frames remain, so one bulk transfer cannot starve the others. A queue is dropped as
- * soon as it empties -- CLOSE / ERROR or not -- and a late frame for the id starts a new
- * one. Waiting is targeted: the worker waits on its own condition, and the producers
- * parked on a connection's cap are woken by that connection's DATA pops and liveness
- * changes only -- an enqueue anywhere else never wakes them. CONNECT stays ahead of its
- * connection's DATA: it is enqueued before any relay thread of the connection exists, and
- * control frames drain first. Control and marker frames are dropped once the sender is
- * stopped. A dead worker wakes and fails every waiting producer.
+ * soon as it is empty and no {@link #sendData} call runs in it -- CLOSE / ERROR or not --
+ * and a late frame for the id starts a new one. Keeping it for the running call means a
+ * CLOSE racing a multi-chunk send always lands on the queue that send checks, so no chunk
+ * of the call follows the CLOSE. Waiting is targeted: the worker waits on its own
+ * condition, and the producers parked on a connection's cap are woken by that
+ * connection's DATA pops, its CLOSE / ERROR and liveness changes only -- an enqueue
+ * anywhere else never wakes them. CONNECT stays ahead of its connection's DATA: it is
+ * enqueued before any relay thread of the connection exists, and control frames drain
+ * first. Control and marker frames are dropped once the sender is stopped. A dead worker
+ * wakes and fails every waiting producer.
  */
 public final class SessionSender implements FrameWriter, AutoCloseable {
 
@@ -60,8 +65,8 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 	/**
 	 * The connection frames of one connection; guarded by {@link #lock}. A queue lives
-	 * only while it holds frames: the worker drops it as soon as it empties, so a late
-	 * frame for the id starts a new queue.
+	 * only while it holds frames or a {@link #sendData} call runs in it: it is dropped as
+	 * soon as neither holds, so a late frame for the id starts a new queue.
 	 */
 	private static final class ConnectionQueue {
 
@@ -74,6 +79,15 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 		/** The queue is in the active ring; a fresh one joins with its first frame. */
 		boolean queued;
+
+		/** CLOSE or ERROR was queued: no DATA may follow it. */
+		boolean closed;
+
+		/**
+		 * The {@link #sendData} calls inside this queue; it outlives its frames while one
+		 * runs, so a CLOSE racing the call lands on the queue the call checks.
+		 */
+		int writers;
 
 		/**
 		 * Test hook: completions of cap-waiter awaits parked on this queue; counted per
@@ -252,18 +266,48 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	}
 
 	/**
+	 * Enters a {@link #sendData} call: the connection's queue, created if absent, stays
+	 * live until {@link #exit} even when it empties.
+	 */
+	private ConnectionQueue enter(long connectionId) {
+		this.lock.lock();
+		try {
+			ConnectionQueue queue = this.queues.computeIfAbsent(connectionId, id -> new ConnectionQueue(id, lock));
+			queue.writers++;
+			return queue;
+		}
+		finally {
+			this.lock.unlock();
+		}
+	}
+
+	/** Leaves a {@link #sendData} call; drops the queue if that was all it held. */
+	private void exit(ConnectionQueue queue) {
+		this.lock.lock();
+		try {
+			queue.writers--;
+			if (queue.writers == 0 && queue.frames.isEmpty()) {
+				this.queues.remove(queue.id, queue);
+			}
+		}
+		finally {
+			this.lock.unlock();
+		}
+	}
+
+	/**
 	 * Queues a DATA frame, blocking while this connection's queue is at
 	 * {@link #DATA_QUEUE_CAPACITY} -- only this connection's producer waits, and only
-	 * this connection's pops wake it. Returns false when the sender is gone.
+	 * this connection's pops and markers wake it. Returns false when the sender is gone
+	 * or CLOSE / ERROR was queued for the connection.
 	 */
-	private boolean enqueueData(long connectionId, Frame frame) {
+	private boolean enqueueData(ConnectionQueue queue, Frame frame) {
 		this.lock.lock();
 		try {
 			while (true) {
-				if (!this.running || callClosed()) {
+				if (!this.running || callClosed() || queue.closed) {
 					return false;
 				}
-				ConnectionQueue queue = this.queues.computeIfAbsent(connectionId, id -> new ConnectionQueue(id, lock));
 				if (queue.dataFrames < DATA_QUEUE_CAPACITY) {
 					queue.frames.addLast(frame);
 					queue.dataFrames++;
@@ -291,7 +335,8 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 	/**
 	 * Queues CLOSE / ERROR for the connection, bypassing the DATA cap; never blocks, so
-	 * close paths cannot hang behind a full queue. Dropped once the sender is stopped.
+	 * close paths cannot hang behind a full queue. Closes the queue to DATA and wakes the
+	 * producers parked on its cap, which then fail. Dropped once the sender is stopped.
 	 */
 	private void enqueueMarker(long connectionId, Frame frame) {
 		this.lock.lock();
@@ -301,6 +346,8 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 			}
 			ConnectionQueue queue = this.queues.computeIfAbsent(connectionId, id -> new ConnectionQueue(id, lock));
 			queue.frames.addLast(frame);
+			queue.closed = true;
+			queue.capWaiters.signalAll();
 			if (!queue.queued) {
 				queue.queued = true;
 				this.ring.addLast(queue);
@@ -321,21 +368,32 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		enqueueControl(Frame.newBuilder().setConnect(connect).build());
 	}
 
+	/**
+	 * Queues the payload in chunks of at most {@link #MAX_CHUNK}. Returns false once the
+	 * sender is gone or CLOSE / ERROR is queued for the connection while the call runs;
+	 * the chunks queued before stay ahead of the marker, none follows it.
+	 */
 	@Override
 	public boolean sendData(long connectionId, byte[] payload) {
-		for (int offset = 0; offset < payload.length; offset += MAX_CHUNK) {
-			int length = Math.min(MAX_CHUNK, payload.length - offset);
-			byte[] chunk = new byte[length];
-			System.arraycopy(payload, offset, chunk, 0, length);
-			Data data = Data.newBuilder()
-				.setConnId(connectionId)
-				.setPayload(com.google.protobuf.UnsafeByteOperations.unsafeWrap(chunk))
-				.build();
-			if (!enqueueData(connectionId, Frame.newBuilder().setData(data).build())) {
-				return false;
+		ConnectionQueue queue = enter(connectionId);
+		try {
+			for (int offset = 0; offset < payload.length; offset += MAX_CHUNK) {
+				int length = Math.min(MAX_CHUNK, payload.length - offset);
+				byte[] chunk = new byte[length];
+				System.arraycopy(payload, offset, chunk, 0, length);
+				Data data = Data.newBuilder()
+					.setConnId(connectionId)
+					.setPayload(com.google.protobuf.UnsafeByteOperations.unsafeWrap(chunk))
+					.build();
+				if (!enqueueData(queue, Frame.newBuilder().setData(data).build())) {
+					return false;
+				}
 			}
+			return true;
 		}
-		return true;
+		finally {
+			exit(queue);
+		}
 	}
 
 	/**
@@ -431,7 +489,10 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		}
 	}
 
-	/** Pops one frame; drops the queue it emptied and wakes only its own producers. */
+	/**
+	 * Pops one frame; drops the queue it emptied unless a {@link #sendData} call runs in
+	 * it, and wakes only its own producers.
+	 */
 	private Frame pop(ConnectionQueue queue) {
 		queue.queued = false;
 		Frame frame = queue.frames.pollFirst();
@@ -440,12 +501,12 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 			// a producer parked on the cap of this connection may continue
 			queue.capWaiters.signal();
 		}
-		if (queue.frames.isEmpty()) {
-			this.queues.remove(queue.id);
-		}
-		else {
+		if (!queue.frames.isEmpty()) {
 			queue.queued = true;
 			this.ring.addLast(queue);
+		}
+		else if (queue.writers == 0) {
+			this.queues.remove(queue.id);
 		}
 		return frame;
 	}

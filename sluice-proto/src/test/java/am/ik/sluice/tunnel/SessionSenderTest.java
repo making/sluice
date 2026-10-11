@@ -1,11 +1,13 @@
 package am.ik.sluice.tunnel;
 
 import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
+import java.util.function.Predicate;
 import java.util.stream.IntStream;
 
 import am.ik.sluice.v1.proto.Frame;
@@ -23,93 +25,6 @@ import static org.assertj.core.api.Assertions.fail;
  * once its worker is gone.
  */
 class SessionSenderTest {
-
-	/** Fake server-side observer whose readiness is controlled by the test. */
-	private static final class FakeServerObserver extends ServerCallStreamObserver<Frame> {
-
-		private final AtomicBoolean ready = new AtomicBoolean();
-
-		private final List<Frame> sent = new CopyOnWriteArrayList<>();
-
-		private final AtomicReference<Runnable> onReadyHandler = new AtomicReference<>();
-
-		private final AtomicBoolean die = new AtomicBoolean();
-
-		private final CountDownLatch enteredOnNext = new CountDownLatch(1);
-
-		private final CountDownLatch gate = new CountDownLatch(1);
-
-		private final CountDownLatch firstSent = new CountDownLatch(1);
-
-		@Override
-		public boolean isReady() {
-			return this.ready.get();
-		}
-
-		@Override
-		public void setOnReadyHandler(Runnable onReadyHandler) {
-			this.onReadyHandler.set(onReadyHandler);
-		}
-
-		/** Flips to ready and fires the handler registered by the sender. */
-		void becomeReady() {
-			this.ready.set(true);
-			Runnable onReadyHandler = this.onReadyHandler.get();
-			if (onReadyHandler != null) {
-				onReadyHandler.run();
-			}
-		}
-
-		@Override
-		public void onNext(Frame frame) {
-			this.enteredOnNext.countDown();
-			try {
-				this.gate.await();
-			}
-			catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-			}
-			if (this.die.get()) {
-				throw new RuntimeException("stream died");
-			}
-			this.sent.add(frame);
-			this.firstSent.countDown();
-		}
-
-		@Override
-		public void onError(Throwable t) {
-		}
-
-		@Override
-		public void onCompleted() {
-		}
-
-		@Override
-		public boolean isCancelled() {
-			return false;
-		}
-
-		@Override
-		public void setOnCancelHandler(Runnable onCancelHandler) {
-		}
-
-		@Override
-		public void setCompression(String compression) {
-		}
-
-		@Override
-		public void setMessageCompression(boolean messageCompression) {
-		}
-
-		@Override
-		public void request(int count) {
-		}
-
-		@Override
-		public void disableAutoInboundFlowControl() {
-		}
-
-	}
 
 	/** Waits until the worker has written {@code count} frames. */
 	private static void awaitSentFrames(FakeServerObserver observer, int count) throws InterruptedException {
@@ -312,8 +227,10 @@ class SessionSenderTest {
 			observer.gate.countDown();
 			// the producer parked on the cap and a fresh sender both fail fast
 			AtomicBoolean parkedResult = new AtomicBoolean(true);
+			// a marker on another connection must not block either; one on connection 1
+			// would end its producer by itself and hide the worker's death
 			Thread parked = Thread.ofVirtual().start(() -> {
-				sender.sendClose(1);
+				sender.sendClose(3);
 				parkedResult.set(sender.sendData(1, new byte[1]));
 			});
 			parked.join(TimeUnit.SECONDS.toMillis(1));
@@ -442,6 +359,123 @@ class SessionSenderTest {
 			fail("producer never observed blocked: " + producer.getState());
 		}
 		assertThat(producer.isAlive()).as("producer blocked, not done").isTrue();
+	}
+
+	@Test
+	void capWaiterGivesUpOnceCloseIsQueuedForItsConnection() throws Exception {
+		assertCapWaiterGivesUp((sender, id) -> sender.sendClose(id));
+	}
+
+	@Test
+	void capWaiterGivesUpOnceErrorIsQueuedForItsConnection() throws Exception {
+		assertCapWaiterGivesUp((sender, id) -> sender.sendError(id, "boom"));
+	}
+
+	/**
+	 * Parks one producer on the cap of connection 1 and one on connection 2 (the observer
+	 * never becomes ready, so nothing pops); the marker for connection 1 ends its
+	 * producer within 100ms and leaves connection 2's parked.
+	 */
+	private static void assertCapWaiterGivesUp(BiConsumer<SessionSender, Long> marker) throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		SessionSender sender = new SessionSender(observer);
+		try {
+			sender.start();
+			for (long id = 1; id <= 2; id++) {
+				for (int i = 0; i < SessionSender.DATA_QUEUE_CAPACITY; i++) {
+					assertThat(sender.sendData(id, new byte[1])).isTrue();
+				}
+			}
+			AtomicReference<Boolean> closedResult = new AtomicReference<>();
+			Thread closed = Thread.ofVirtual().start(() -> closedResult.set(sender.sendData(1, new byte[1])));
+			AtomicReference<Boolean> otherResult = new AtomicReference<>();
+			Thread other = Thread.ofVirtual().start(() -> otherResult.set(sender.sendData(2, new byte[1])));
+			observeBlocked(closed);
+			observeBlocked(other);
+			marker.accept(sender, 1L);
+			closed.join(100);
+			assertThat(closed.isAlive()).as("the producer of the closed connection returns within 100ms").isFalse();
+			assertThat(closedResult.get()).as("its chunk is refused").isFalse();
+			TimeUnit.MILLISECONDS.sleep(200);
+			assertThat(other.isAlive()).as("the other connection's producer stays parked").isTrue();
+			assertThat(otherResult.get()).as("and has not returned").isNull();
+			assertThat(observer.sent).as("nothing was sent: the stream never became ready").isEmpty();
+		}
+		finally {
+			sender.close();
+		}
+	}
+
+	@Test
+	void dataQueuedAfterCloseIsRefusedWhileTheCloseIsPending() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		SessionSender sender = new SessionSender(observer);
+		try {
+			sender.start();
+			assertThat(sender.sendData(1, new byte[] { 1 })).isTrue();
+			sender.sendClose(1);
+			assertThat(sender.sendData(1, new byte[] { 2 })).as("DATA after the queued CLOSE").isFalse();
+			observer.gate.countDown();
+			observer.becomeReady();
+			awaitSentFrames(observer, 2);
+			awaitConnectionQueues(sender, 0);
+			assertThat(observer.sent).extracting(Frame::getBodyCase)
+				.containsExactly(Frame.BodyCase.DATA, Frame.BodyCase.CLOSE);
+			assertThat(observer.sent.get(0).getData().getPayload().toByteArray()).containsExactly(1);
+		}
+		finally {
+			sender.close();
+		}
+	}
+
+	/**
+	 * A multi-chunk send racing its connection's CLOSE stops at the CLOSE: no DATA of the
+	 * call follows it on the stream, even when the stream drains the queue between two
+	 * chunks. Repeated because the interleaving is up to the scheduler.
+	 */
+	@Test
+	void sendRacingCloseNeverPutsDataAfterTheClose() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.ready.set(true);
+		observer.gate.countDown();
+		SessionSender sender = new SessionSender(observer);
+		try {
+			sender.start();
+			byte[] payload = new byte[SessionSender.DATA_QUEUE_CAPACITY * SessionSender.MAX_CHUNK];
+			AtomicInteger refused = new AtomicInteger();
+			for (long id = 1; id <= 200; id++) {
+				long connectionId = id;
+				Thread producer = Thread.ofVirtual().start(() -> {
+					if (!sender.sendData(connectionId, payload)) {
+						refused.incrementAndGet();
+					}
+				});
+				awaitSent(observer, frame -> frame.getBodyCase() == Frame.BodyCase.DATA);
+				sender.sendClose(connectionId);
+				producer.join(TimeUnit.SECONDS.toMillis(5));
+				assertThat(producer.isAlive()).as("producer of connection %d returned", connectionId).isFalse();
+				awaitSent(observer, frame -> frame.getBodyCase() == Frame.BodyCase.CLOSE);
+				awaitConnectionQueues(sender, 0);
+				List<Frame.BodyCase> frames = observer.sent.stream().map(Frame::getBodyCase).toList();
+				assertThat(frames.indexOf(Frame.BodyCase.CLOSE)).as("CLOSE of connection %d is its last frame", id)
+					.isEqualTo(frames.size() - 1);
+				observer.sent.clear();
+			}
+			// the race happened: some CLOSE landed while its send was still running
+			assertThat(refused.get()).as("sends cut short by their CLOSE").isGreaterThan(0);
+		}
+		finally {
+			sender.close();
+		}
+	}
+
+	/** Waits until a frame matching the predicate was sent. */
+	private static void awaitSent(FakeServerObserver observer, Predicate<Frame> predicate) {
+		long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(5);
+		while (observer.sent.stream().noneMatch(predicate) && System.currentTimeMillis() < deadline) {
+			Thread.onSpinWait();
+		}
+		assertThat(observer.sent).anyMatch(predicate);
 	}
 
 	@Test

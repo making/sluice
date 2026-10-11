@@ -277,6 +277,10 @@ public final class VirtualConnection implements AutoCloseable {
 			}
 			byte[] payload = Arrays.copyOfRange(b, off, off + len);
 			if (!VirtualConnection.this.frameWriter.sendData(VirtualConnection.this.connectionId, payload)) {
+				// the sender refuses DATA once this connection's CLOSE / ERROR is queued
+				if (VirtualConnection.this.writeClosed || VirtualConnection.this.closed) {
+					throw new IOException("connection %d is closed".formatted(VirtualConnection.this.connectionId));
+				}
 				throw new IOException("tunnel stream closed");
 			}
 		}

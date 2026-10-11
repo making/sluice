@@ -208,4 +208,58 @@ class StreamRelayTest {
 		pair.client().close();
 	}
 
+	/**
+	 * The relay's sending side parked at the session sender's per-connection cap (the
+	 * stream never becomes ready) returns once the relay is abandoned, so the relay
+	 * completes instead of waiting for the stream to drain.
+	 */
+	@Test
+	@Timeout(10)
+	void abandonReleasesTheSendingSideParkedAtTheSenderCap() throws Exception {
+		SocketPair pair = SocketPair.create();
+		FakeServerObserver observer = new FakeServerObserver();
+		SessionSender sender = new SessionSender(observer);
+		sender.start();
+		try {
+			VirtualConnection connection = new VirtualConnection(7, sender);
+			CountDownLatch done = new CountDownLatch(1);
+			StreamRelay relay = StreamRelay.builder(DuplexPipe.of(pair.serverSide()), connection, sender)
+				.onComplete(done::countDown)
+				.build();
+			relay.start();
+			// more than the cap holds, on its own thread: what the relay cannot take
+			// stays in the socket buffers or blocks this writer
+			Thread.ofVirtual().start(() -> {
+				try {
+					OutputStream out = pair.client().getOutputStream();
+					byte[] chunk = new byte[SessionSender.MAX_CHUNK];
+					for (int i = 0; i <= 2 * SessionSender.DATA_QUEUE_CAPACITY; i++) {
+						out.write(chunk);
+					}
+				}
+				catch (IOException e) {
+					// torn down
+				}
+			});
+			// a cap waiter of connection 7 completed a timed wait: the sending side is
+			// parked on the cap, not merely slow
+			awaitCapWaiter(sender, 7);
+			relay.abandon();
+			assertThat(done.await(1, TimeUnit.SECONDS)).as("the relay completes once abandoned").isTrue();
+		}
+		finally {
+			sender.close();
+			pair.client().close();
+		}
+	}
+
+	private static void awaitCapWaiter(SessionSender sender, long connectionId) throws InterruptedException {
+		long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(5);
+		while (sender.capWaiterWakeups(connectionId) == 0 && System.currentTimeMillis() < deadline) {
+			TimeUnit.MILLISECONDS.sleep(10);
+		}
+		assertThat(sender.capWaiterWakeups(connectionId)).as("cap waits of connection %d", connectionId)
+			.isGreaterThan(0);
+	}
+
 }

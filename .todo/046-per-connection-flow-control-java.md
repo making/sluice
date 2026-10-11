@@ -61,6 +61,13 @@ branches of both `handle` switches.
     receive path would wait for it and the stream-wide stall would be back. Take the
     credit under the lock, release it, then send. Today's `Sink#write` already releases
     `writeLock` before `sendData`; keep that shape.
+  - The cap wait under the credit wait already ends when CLOSE / ERROR is queued for the
+    connection (`SessionSender` closes the queue to DATA; 052). The credit wait needs its
+    own wake on `close()`.
+  - Known gap (pre-existing, benign): `Sink#write` checks `writeClosed`, releases the
+    lock, then sends. A `close()` whose CLOSE is sent in between lets that write's DATA
+    follow the CLOSE; the peer's reader stops at the EOF and never sees it. Close the gap
+    only if the credit restructuring makes it cheap.
 - **Send, legacy**: unchanged.
 
 ### ADVERTISE off the receive path
