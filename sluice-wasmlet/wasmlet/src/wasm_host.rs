@@ -1459,7 +1459,7 @@ pub async fn serve(mut io: TunnelIo, handler: Arc<Handler>) {
     if let Err(e) = served {
         eprintln!("[wasm] conn {conn_id} serve error: {e}");
     }
-    ending.finish().await;
+    ending.finish();
 }
 
 #[derive(Clone)]
@@ -1849,6 +1849,72 @@ mod tests {
         .await;
         let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
         assert_eq!(data_bytes(&frames, 1).len(), 100_000, "exactly the grant");
+    }
+
+    /// A streaming response that filled its connection's queue delays
+    /// another connection's response by one frame per frame of it, not by
+    /// its backlog.
+    #[tokio::test]
+    async fn a_response_backlog_delays_another_connection_by_one_frame_per_frame() {
+        use crate::tunnel::DATA_QUEUE_CAPACITY;
+        async fn until(what: &str, condition: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !condition() {
+                assert!(Instant::now() < deadline, "{what}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let handler = Handler::new(hello().await, Sandbox::default());
+        let mut peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
+        peer.auto_grant = false;
+        peer.connect(1, ROUTE, crate::tunnel::WINDOW).await;
+        peer.data(1, get("/stream").as_bytes()).await;
+        until("conn 1 fills its queue", || {
+            peer.queued_data(1) == DATA_QUEUE_CAPACITY
+        })
+        .await;
+
+        peer.connect(2, ROUTE, crate::tunnel::WINDOW).await;
+        peer.data(2, get("/").as_bytes()).await;
+        until("conn 2's response is queued to its end", || {
+            !peer.registered(2)
+        })
+        .await;
+        assert_eq!(
+            peer.queued_data(1),
+            DATA_QUEUE_CAPACITY,
+            "conn 1 still holds its backlog"
+        );
+
+        let mut order = Vec::new();
+        while !order
+            .iter()
+            .any(|(conn_id, kind)| *conn_id == 2 && *kind == "ERROR")
+        {
+            let body = tokio::time::timeout(Duration::from_secs(1), peer.recv())
+                .await
+                .expect("frames flow")
+                .unwrap()
+                .body
+                .unwrap();
+            order.push(match body {
+                Body::Data(data) => (data.conn_id, "DATA"),
+                Body::Close(close) => (close.conn_id, "CLOSE"),
+                Body::Error(error) => (error.conn_id, "ERROR"),
+                other => panic!("unexpected {other:?}"),
+            });
+        }
+        let conn2 = order.iter().filter(|(conn_id, _)| *conn_id == 2).count();
+        let conn1 = order.len() - conn2;
+        assert!(
+            conn1 <= conn2 && conn1 < DATA_QUEUE_CAPACITY,
+            "{conn1} of conn 1's queued frames went first: {order:?}"
+        );
+        let tail: Vec<_> = order.iter().filter(|(conn_id, _)| *conn_id == 2).collect();
+        assert!(
+            matches!(tail[..], [.., (2, "DATA"), (2, "CLOSE"), (2, "ERROR")]),
+            "{tail:?}"
+        );
     }
 
     /// What a credit-respecting server saw while uploading.
@@ -3013,14 +3079,21 @@ mod tests {
         );
         assert_eq!(limit.open(), 1, "the refused connection holds no slot");
 
-        // the server fails the admitted connection: its slot frees
+        // the server fails the admitted connection: its slot frees once the
+        // connection ended and its CLOSE left
         peer.error(1, "gone").await;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while limit.open() > 0 {
-            assert!(Instant::now() < deadline, "the slot was never freed");
+        while peer.registered(1) {
+            assert!(Instant::now() < deadline, "the connection never ended");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        frames_until_quiet(&mut peer, Duration::from_millis(300)).await;
+        assert_eq!(limit.open(), 1, "held while its CLOSE is queued");
+        let frames = frames_until_quiet(&mut peer, Duration::from_millis(300)).await;
+        assert!(
+            matches!(&frames[..], [Body::Close(close)] if close.conn_id == 1),
+            "{frames:?}"
+        );
+        assert_eq!(limit.open(), 0, "freed once the CLOSE left");
 
         peer.connect(3, ROUTE, crate::tunnel::WINDOW).await;
         peer.data(3, get("/").as_bytes()).await;

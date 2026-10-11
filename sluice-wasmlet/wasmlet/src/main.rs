@@ -447,8 +447,8 @@ impl NodeTask {
         }
         let channel = endpoint.connect().await?;
 
-        // The bidi stream: outbound frames flow through the two lanes of
-        // `outbound`, inbound via `inbound`.
+        // The bidi stream: outbound frames are scheduled by `outbound`,
+        // inbound arrive via `inbound`.
         let (outbound, frames) = Outbound::new();
         outbound.control(advertise(self.shared.advertised.clone()));
         let mut request = tonic::Request::new(frames);

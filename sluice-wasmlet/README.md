@@ -53,7 +53,9 @@ target/debug/sluice-wasmlet --server grpcs://127.0.0.1:8001 --insecure ...
 `--max-connections N` (default 256) caps the connections open at once over every
 node stream; a CONNECT beyond it is answered with the ERROR `connection limit reached`
 and not served. A windowed connection buffers at most its 1MiB receive window of
-request bytes, so the windows total at most N x 1MiB (256MiB by default). Guest
+request bytes, so the windows total at most N x 1MiB (256MiB by default), and its
+outbound queue at most 256KiB of response DATA (N x 256KiB in total; an ended
+connection keeps its slot until its queued frames left). Guest
 instances (`memory-mib` each, one per request in flight) are not bounded by it.
 
 Multiple `--wasm host=<locator>` routes per process. The locator is a bare
@@ -113,6 +115,12 @@ lines, prefixed with the component and a request id
   request body holds back only its own connection, and frames for the other
   connections keep flowing. A server without the window gets the old behavior
   (a connection whose guest does not read stalls the whole stream)
+- outbound frames are scheduled as by the Java sender: control frames
+  (Advertise, WindowUpdate) first, then one frame per turn from each
+  connection with frames queued: another connection's DATA, CLOSE or ERROR
+  waits for one frame of each busy connection, not behind its backlog. A
+  connection queues at most 16 DATA frames (up to 16KiB each); only its own
+  writer waits beyond that
 - per request: `wasmtime_wasi_http::p3::Request::from_http` -> fresh instance
   from a pre-linked `InstancePre` -> `Service.handle`; the store runs in a
   detached task and relays response body frames to hyper through a bounded

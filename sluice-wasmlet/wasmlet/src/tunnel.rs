@@ -1,6 +1,7 @@
 //! The virtual connections of one tunnel stream: dispatch of the server's
-//! frames, per-connection credit flow control, and the byte stream adapter
-//! hyper serves each connection over.
+//! frames, per-connection credit flow control, the scheduling of outbound
+//! frames ([`Outbound`]), and the byte stream adapter hyper serves each
+//! connection over.
 //!
 //! The flow control follows the protocol of the Java `VirtualConnection`
 //! (`sluice-proto`). A connection is windowed when the server's CONNECT
@@ -23,17 +24,15 @@
 //! connection in legacy mode: a bounded channel, on which the receive loop
 //! waits, so one slow connection stalls the stream as before.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use futures_util::stream::{self, PollNext, Stream};
+use futures_util::stream::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
-use tokio_util::sync::PollSender;
 
 use crate::pb::frame::Body;
 use crate::pb::{Close, Connect, Data, Error, Frame, WindowUpdate};
@@ -68,9 +67,12 @@ const CHUNK: usize = 16 * 1024;
 /// the connection's reader.
 const LEGACY_BUFFER: usize = 32;
 
-/// DATA / CLOSE / connection-end ERROR frames of every connection, in one
-/// FIFO so that each connection's frames keep their order.
-const DATA_BUFFER: usize = 64;
+/// DATA frames one connection may have queued on the outbound stream; its
+/// writer waits beyond it. 16 x [`CHUNK`] = 256KiB.
+pub(crate) const DATA_QUEUE_CAPACITY: usize = 16;
+
+/// Write error after the connection's CLOSE or ERROR was queued.
+const WRITE_CLOSED: &str = "connection closed for writing";
 
 /// Downstream control for one virtual connection, consumed by its reader.
 pub enum Ctrl {
@@ -85,32 +87,250 @@ pub enum Ctrl {
 // ---------------------------------------------------------------------------
 // Outbound
 
-/// The two lanes of the outbound stream. Control frames (Advertise,
-/// WindowUpdate, ERRORs no DATA precedes) go on an unbounded lane that is
-/// always sent first, so queueing one never waits; connection frames go on
-/// the bounded data lane.
+/// The frames queued for the request stream, scheduled like the Java
+/// `SessionSender`:
+///
+/// - control frames (Advertise, WindowUpdate, ERRORs no DATA precedes) wait
+///   on an unbounded queue that is always sent first, so queueing one never
+///   waits;
+/// - DATA, CLOSE and the connection-end ERROR wait on their connection's
+///   queue, in order. The stream takes one frame per turn from the head of a
+///   ring of the connections with pending frames and re-appends the
+///   connection while frames remain, so besides control frames one
+///   connection's backlog delays another's frame by one frame per turn, not
+///   by the backlog;
+/// - a connection's queue holds at most [`DATA_QUEUE_CAPACITY`] DATA frames.
+///   Only that connection's writer waits at the cap, and only a DATA frame
+///   taken from that queue, a failure of the connection or the end of the
+///   stream wakes it. CLOSE / ERROR bypass the cap;
+/// - a queue is dropped as soon as it is empty, so an idle connection costs
+///   nothing; a later frame starts a new one;
+/// - once the stream ends (the teardown, or gRPC dropping the request
+///   stream), queued frames are dropped, later ones too, and writers waiting
+///   at the cap fail.
 #[derive(Clone)]
 pub struct Outbound {
-    control: mpsc::UnboundedSender<Frame>,
-    data: mpsc::Sender<Frame>,
+    queues: Arc<Mutex<Queues>>,
 }
 
+#[derive(Default)]
+struct Queues {
+    control: VecDeque<Frame>,
+    /// Live (non-empty) connection queues by conn id.
+    connections: HashMap<i64, ConnectionQueue>,
+    /// The ids of the live queues in serve order; each exactly once.
+    ring: VecDeque<i64>,
+    /// The request stream waiting for a frame.
+    stream: Option<Waker>,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct ConnectionQueue {
+    frames: VecDeque<Frame>,
+    /// DATA frames within `frames`.
+    data: usize,
+    /// The writer waiting at the cap.
+    writer: Option<Waker>,
+    /// The ended connection's slot, freed with the queue.
+    permit: Option<Permit>,
+}
+
+/// The tunnel stream was closed: no frame can be sent any more.
+#[derive(Debug)]
+struct Closed;
+
 impl Outbound {
-    /// The lanes and the request stream merging them, control first.
-    pub fn new() -> (Outbound, impl Stream<Item = Frame> + Send + Sync + 'static) {
-        let (control, control_rx) = mpsc::unbounded_channel();
-        let (data, data_rx) = mpsc::channel(DATA_BUFFER);
-        let frames = stream::select_with_strategy(
-            UnboundedReceiverStream::new(control_rx),
-            ReceiverStream::new(data_rx),
-            |_: &mut ()| PollNext::Left,
-        );
-        (Outbound { control, data }, frames)
+    /// The queues and the request stream draining them.
+    pub fn new() -> (Outbound, Frames) {
+        let queues = Arc::new(Mutex::new(Queues::default()));
+        (
+            Outbound {
+                queues: queues.clone(),
+            },
+            Frames(Outbound { queues }),
+        )
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Queues> {
+        self.queues.lock().unwrap()
     }
 
     /// Queues a control frame; never waits. Dropped once the stream is gone.
     pub fn control(&self, frame: Frame) {
-        let _ = self.control.send(frame);
+        let waker = {
+            let mut queues = self.lock();
+            if queues.closed {
+                return;
+            }
+            queues.control.push_back(frame);
+            queues.stream.take()
+        };
+        wake(waker);
+    }
+
+    /// Ready once `conn_id`'s queue has room for a DATA frame; otherwise
+    /// parks the writer until a DATA frame of the queue leaves, the
+    /// connection fails ([`Outbound::wake_writer`]) or the stream ends.
+    fn poll_data_slot(&self, conn_id: i64, cx: &mut Context<'_>) -> Poll<Result<(), Closed>> {
+        let mut queues = self.lock();
+        if queues.closed {
+            return Poll::Ready(Err(Closed));
+        }
+        match queues.connections.get_mut(&conn_id) {
+            Some(queue) if queue.data >= DATA_QUEUE_CAPACITY => {
+                queue.writer = Some(cx.waker().clone());
+                Poll::Pending
+            }
+            _ => Poll::Ready(Ok(())),
+        }
+    }
+
+    /// Queues a DATA frame for `conn_id`. The cap is the caller's, through
+    /// [`Outbound::poll_data_slot`]: a connection has a single writer.
+    fn data(&self, conn_id: i64, frame: Frame) {
+        self.push(conn_id, frame, true);
+    }
+
+    /// Queues CLOSE / ERROR for `conn_id` after its DATA; never waits.
+    fn marker(&self, conn_id: i64, frame: Frame) {
+        self.push(conn_id, frame, false);
+    }
+
+    fn push(&self, conn_id: i64, frame: Frame, data: bool) {
+        let waker = {
+            let mut queues = self.lock();
+            if queues.closed {
+                return;
+            }
+            let queue = queues.connections.entry(conn_id).or_default();
+            let joins = queue.frames.is_empty();
+            queue.frames.push_back(frame);
+            if data {
+                queue.data += 1;
+            }
+            if joins {
+                queues.ring.push_back(conn_id);
+            }
+            queues.stream.take()
+        };
+        wake(waker);
+    }
+
+    /// Keeps an ended connection's slot until its queued frames left, so the
+    /// connection limit also bounds what ended connections still queue.
+    /// Freed at once when nothing is queued or the stream ended.
+    fn hold(&self, conn_id: i64, permit: Permit) {
+        let mut queues = self.lock();
+        if let Some(queue) = queues.connections.get_mut(&conn_id) {
+            queue.permit = Some(permit);
+        }
+    }
+
+    /// Wakes `conn_id`'s writer if it waits at the cap, so it sees the
+    /// connection's failure.
+    fn wake_writer(&self, conn_id: i64) {
+        let waker = self
+            .lock()
+            .connections
+            .get_mut(&conn_id)
+            .and_then(|queue| queue.writer.take());
+        wake(waker);
+    }
+
+    /// Ends the stream: drops every queued frame and wakes the stream and
+    /// every writer waiting at a cap. Idempotent.
+    pub fn shutdown(&self) {
+        let (stream, writers) = {
+            let mut queues = self.lock();
+            queues.closed = true;
+            queues.control.clear();
+            queues.ring.clear();
+            let writers: Vec<Waker> = queues
+                .connections
+                .drain()
+                .filter_map(|(_, queue)| queue.writer)
+                .collect();
+            (queues.stream.take(), writers)
+        };
+        wake(stream);
+        writers.into_iter().for_each(Waker::wake);
+    }
+
+    /// The next frame: control first, then one frame of the connection at
+    /// the head of the ring. Pending while nothing is queued; None once the
+    /// stream ended.
+    fn poll_frame(&self, cx: &mut Context<'_>) -> Poll<Option<Frame>> {
+        let (frame, writer) = {
+            let mut queues = self.lock();
+            if queues.closed {
+                return Poll::Ready(None);
+            }
+            if let Some(frame) = queues.control.pop_front() {
+                return Poll::Ready(Some(frame));
+            }
+            let Some(conn_id) = queues.ring.pop_front() else {
+                queues.stream = Some(cx.waker().clone());
+                return Poll::Pending;
+            };
+            let queue = queues
+                .connections
+                .get_mut(&conn_id)
+                .expect("a ringed queue is live");
+            let frame = queue.frames.pop_front().expect("a live queue holds frames");
+            let mut writer = None;
+            if matches!(frame.body, Some(Body::Data(_))) {
+                queue.data -= 1;
+                writer = queue.writer.take();
+            }
+            if queue.frames.is_empty() {
+                queues.connections.remove(&conn_id);
+            } else {
+                queues.ring.push_back(conn_id);
+            }
+            (frame, writer)
+        };
+        wake(writer);
+        Poll::Ready(Some(frame))
+    }
+
+    /// The live connection queues.
+    #[cfg(test)]
+    fn queues(&self) -> usize {
+        self.lock().connections.len()
+    }
+
+    /// The DATA frames queued for `conn_id`.
+    #[cfg(test)]
+    fn queued_data(&self, conn_id: i64) -> usize {
+        self.lock()
+            .connections
+            .get(&conn_id)
+            .map_or(0, |queue| queue.data)
+    }
+}
+
+fn wake(waker: Option<Waker>) {
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
+/// The request stream of one stream attempt. Dropping it (gRPC is done with
+/// the request) ends the stream as [`Outbound::shutdown`] does.
+pub struct Frames(Outbound);
+
+impl Stream for Frames {
+    type Item = Frame;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Frame>> {
+        self.0.poll_frame(cx)
+    }
+}
+
+impl Drop for Frames {
+    fn drop(&mut self) {
+        self.0.shutdown();
     }
 }
 
@@ -133,8 +353,9 @@ fn close_frame(conn_id: i64) -> Frame {
 // Connection limit
 
 /// A cap on the connections open at once over every stream of the process.
-/// A windowed connection buffers at most [`WINDOW`] of the server's payload,
-/// so the cap bounds the total.
+/// A windowed connection buffers at most [`WINDOW`] of the server's payload
+/// and [`DATA_QUEUE_CAPACITY`] outbound DATA frames, so the cap bounds the
+/// total.
 pub struct Limit {
     max: usize,
     open: AtomicUsize,
@@ -165,8 +386,9 @@ impl Limit {
     }
 }
 
-/// The slot of one connection, freed when dropped -- with the connection's
-/// byte stream, which owns its buffered payload.
+/// The slot of one connection, freed when dropped: held by its byte stream,
+/// which owns its buffered payload, then by its end, then by its outbound
+/// queue until the last queued frame left ([`Outbound::hold`]).
 pub struct Permit(Arc<Limit>);
 
 impl Drop for Permit {
@@ -413,6 +635,7 @@ impl Connections {
                 if !flow.remote_fail(&error.message) {
                     return None;
                 }
+                self.outbound.wake_writer(error.conn_id);
                 send(ctrl, Ctrl::Abort)
             }
             Body::WindowUpdate(update) => {
@@ -473,6 +696,7 @@ impl Connections {
                 eprintln!("[{}] conn {}: {WINDOW_EXCEEDED}", self.key, data.conn_id);
                 self.outbound
                     .control(error_frame(data.conn_id, WINDOW_EXCEEDED));
+                self.outbound.wake_writer(data.conn_id);
                 // drops the sender: the reader wakes and fails
                 self.registry.lock().unwrap().remove(&data.conn_id);
             }
@@ -506,7 +730,6 @@ impl Connections {
             conn_id,
             rx,
             outbound: self.outbound.clone(),
-            data: PollSender::new(self.outbound.data.clone()),
             flow,
             registry: self.registry.clone(),
             buf: bytes::BytesMut::new(),
@@ -517,13 +740,16 @@ impl Connections {
         }
     }
 
-    /// The stream ended: fails every connection without waiting. Readers and
-    /// writers wake with an error; nothing more is sent for them.
+    /// The stream ended: fails every connection without waiting and ends the
+    /// outbound stream. Readers and writers wake with an error; nothing more
+    /// is sent.
     pub fn teardown(&self) {
         let drained: Vec<_> = self.registry.lock().unwrap().drain().collect();
         for (_, conn) in drained {
             conn.flow.reset(STREAM_CLOSED);
         }
+        // after the resets: the writers it wakes see the connection's failure
+        self.outbound.shutdown();
     }
 }
 
@@ -548,14 +774,14 @@ pub struct TunnelIo {
     conn_id: i64,
     rx: CtrlRx,
     outbound: Outbound,
-    data: PollSender<Frame>,
     flow: Arc<Flow>,
     registry: Registry,
     buf: bytes::BytesMut,
     eof: bool,
     /// Bytes handed to hyper and not yet granted back (windowed).
     consumed: u64,
-    /// The connection's slot of the connection limit; freed with this stream.
+    /// The connection's slot of the connection limit, until `ending` takes
+    /// it.
     permit: Option<Permit>,
     /// `fill` consumed the server's abort.
     aborted: bool,
@@ -595,13 +821,15 @@ impl TunnelIo {
         }
     }
 
-    /// What the serve task needs once hyper is done with the connection.
-    pub fn ending(&self) -> Ending {
+    /// What the serve task needs once hyper is done with the connection;
+    /// takes over the connection's slot.
+    pub fn ending(&mut self) -> Ending {
         Ending {
             conn_id: self.conn_id,
             flow: self.flow.clone(),
-            data: self.outbound.data.clone(),
+            outbound: self.outbound.clone(),
             registry: self.registry.clone(),
+            permit: self.permit.take(),
         }
     }
 
@@ -614,7 +842,7 @@ impl TunnelIo {
     }
 
     /// Grants the consumed bytes back once they reach half the window. The
-    /// grant goes on the control lane: it never waits.
+    /// grant goes on the control queue: it never waits.
     fn consumed(&mut self, n: usize) {
         if !self.flow.windowed() {
             return;
@@ -642,22 +870,17 @@ impl TunnelIo {
         });
     }
 
-    fn send_close(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    /// Queues CLOSE after the connection's DATA, once; never waits.
+    fn send_close(&mut self) {
         {
-            let state = self.flow.lock();
+            let mut state = self.flow.lock();
             if state.close_sent || state.error_sent || state.reset {
-                return Poll::Ready(Ok(()));
+                return;
             }
+            state.close_sent = true;
         }
-        match self.data.poll_reserve(cx) {
-            Poll::Ready(Ok(())) => {
-                self.flow.lock().close_sent = true;
-                let _ = self.data.send_item(close_frame(self.conn_id));
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::other(e.to_string()))),
-            Poll::Pending => Poll::Pending,
-        }
+        self.outbound
+            .marker(self.conn_id, close_frame(self.conn_id));
     }
 }
 
@@ -713,31 +936,31 @@ impl AsyncWrite for TunnelIo {
     ) -> Poll<std::io::Result<usize>> {
         let this = &mut *self;
         let windowed = this.flow.windowed();
-        if windowed {
+        {
             let mut state = this.flow.lock();
-            if let Some(failure) = &state.failure {
+            if windowed && let Some(failure) = &state.failure {
                 return Poll::Ready(Err(std::io::Error::other(failure.clone())));
             }
-            if state.credit == 0 {
+            if state.close_sent || state.error_sent {
+                return Poll::Ready(Err(std::io::Error::other(WRITE_CLOSED)));
+            }
+            if windowed && state.credit == 0 {
                 // a grant, the server's ERROR or the teardown wakes it
                 state.writer = Some(cx.waker().clone());
                 return Poll::Pending;
             }
         }
-        match this.data.poll_reserve(cx) {
+        match this.outbound.poll_data_slot(this.conn_id, cx) {
             Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(e)) => {
-                return Poll::Ready(Err(std::io::Error::other(format!("tunnel closed: {e}"))));
+            Poll::Ready(Err(Closed)) => {
+                return Poll::Ready(Err(std::io::Error::other(STREAM_CLOSED)));
             }
             Poll::Pending => return Poll::Pending,
         }
         let n = if windowed {
             let mut state = this.flow.lock();
             if let Some(failure) = &state.failure {
-                let failure = failure.clone();
-                drop(state);
-                this.data.abort_send();
-                return Poll::Ready(Err(std::io::Error::other(failure)));
+                return Poll::Ready(Err(std::io::Error::other(failure.clone())));
             }
             // only this writer takes credit: it is still >= what was seen
             let n = buf.len().min(CHUNK).min(state.credit as usize);
@@ -746,12 +969,15 @@ impl AsyncWrite for TunnelIo {
         } else {
             buf.len().min(CHUNK)
         };
-        let _ = this.data.send_item(Frame {
-            body: Some(Body::Data(Data {
-                conn_id: this.conn_id,
-                payload: buf[..n].to_vec(),
-            })),
-        });
+        this.outbound.data(
+            this.conn_id,
+            Frame {
+                body: Some(Body::Data(Data {
+                    conn_id: this.conn_id,
+                    payload: buf[..n].to_vec(),
+                })),
+            },
+        );
         Poll::Ready(Ok(n))
     }
 
@@ -759,9 +985,10 @@ impl AsyncWrite for TunnelIo {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         // Half-close the tunnel direction when hyper is done with the connection.
-        self.send_close(cx)
+        self.send_close();
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -769,16 +996,18 @@ impl AsyncWrite for TunnelIo {
 pub struct Ending {
     conn_id: i64,
     flow: Arc<Flow>,
-    data: mpsc::Sender<Frame>,
+    outbound: Outbound,
     registry: Registry,
+    permit: Option<Permit>,
 }
 
 impl Ending {
-    /// Unregisters the connection and sends its terminal frame on the data
-    /// lane, after its DATA: ERROR ("connection closed") for a windowed
+    /// Unregisters the connection and queues its terminal frame after its
+    /// DATA, without waiting: ERROR ("connection closed") for a windowed
     /// connection the server may still send on, else CLOSE unless one went
-    /// out (hyper skips its shutdown on an error).
-    pub async fn finish(self) {
+    /// out (hyper skips its shutdown on an error). The connection's slot is
+    /// freed once its queued frames left.
+    pub fn finish(mut self) {
         self.registry.lock().unwrap().remove(&self.conn_id);
         let frame = {
             let mut state = self.flow.lock();
@@ -795,7 +1024,10 @@ impl Ending {
             }
         };
         if let Some(frame) = frame {
-            let _ = self.data.send(frame).await;
+            self.outbound.marker(self.conn_id, frame);
+        }
+        if let Some(permit) = self.permit.take() {
+            self.outbound.hold(self.conn_id, permit);
         }
     }
 }
@@ -863,7 +1095,17 @@ pub(crate) mod testing {
             .await;
         }
 
-        /// The next frame the wasmlet sent; None once every sender is gone.
+        /// The DATA frames queued for `conn_id`.
+        pub(crate) fn queued_data(&self, conn_id: i64) -> usize {
+            self.connections.outbound.queued_data(conn_id)
+        }
+
+        /// The connection is registered (its end has not run).
+        pub(crate) fn registered(&self, conn_id: i64) -> bool {
+            self.connections.lookup(conn_id).is_some()
+        }
+
+        /// The next frame the wasmlet sent; None once the stream ended.
         pub(crate) async fn recv(&mut self) -> Option<Frame> {
             use futures_util::StreamExt as _;
             let frame = self.frames.next().await?;
@@ -909,6 +1151,12 @@ mod tests {
 
     fn peer() -> Peer {
         Peer::new(HashMap::new())
+    }
+
+    fn data_frame(conn_id: i64, len: usize) -> Frame {
+        Frame {
+            body: Some(data_body(conn_id, len)),
+        }
     }
 
     fn data_body(conn_id: i64, len: usize) -> Body {
@@ -1203,8 +1451,8 @@ mod tests {
     async fn control_frames_overtake_queued_data() {
         let (outbound, frames) = Outbound::new();
         let mut frames = Box::pin(frames);
-        for _ in 0..DATA_BUFFER {
-            outbound.data.try_send(close_frame(1)).unwrap();
+        for _ in 0..DATA_QUEUE_CAPACITY {
+            outbound.data(1, data_frame(1, 1));
         }
         outbound.control(error_frame(2, "x"));
         use futures_util::StreamExt as _;
@@ -1216,12 +1464,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_connect_without_a_route_is_answered_on_the_control_lane() {
+    async fn a_connect_without_a_route_is_answered_on_the_control_queue() {
         let (outbound, frames) = Outbound::new();
         let mut frames = Box::pin(frames);
-        // the data lane is full: an answer queued there would wait
-        for _ in 0..DATA_BUFFER {
-            outbound.data.try_send(close_frame(9)).unwrap();
+        // another connection's queue is full: an answer queued behind it
+        // would wait
+        for _ in 0..DATA_QUEUE_CAPACITY {
+            outbound.data(9, data_frame(9, 1));
         }
         let connections = Connections::new(
             "test".into(),
@@ -1268,8 +1517,8 @@ mod tests {
         assert_eq!(error.to_string(), STREAM_CLOSED);
     }
 
-    async fn finish(io: TunnelIo) {
-        io.ending().finish().await;
+    async fn finish(mut io: TunnelIo) {
+        io.ending().finish();
     }
 
     #[tokio::test]
@@ -1324,5 +1573,450 @@ mod tests {
         finish(io).await;
         let frames = drain_frames(&mut peer).await;
         assert!(matches!(&frames[..], [Body::Close(_)]), "{frames:?}");
+    }
+
+    // -- outbound scheduling
+
+    fn label(body: &Body) -> String {
+        match body {
+            Body::Data(data) => format!("{} DATA", data.conn_id),
+            Body::Close(close) => format!("{} CLOSE", close.conn_id),
+            Body::Error(error) => format!("{} ERROR", error.conn_id),
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn labels(frames: &[Body]) -> Vec<String> {
+        frames.iter().map(label).collect()
+    }
+
+    /// Writes into `io` until a write is pending (the writer parked); the
+    /// bytes accepted.
+    fn fill_until_pending(io: &mut TunnelIo, waker: &Waker) -> usize {
+        let mut written = 0;
+        for _ in 0..1000 {
+            match poll_write(io, waker, &[0x33; CHUNK]) {
+                Poll::Ready(Ok(n)) => written += n,
+                Poll::Pending => return written,
+                Poll::Ready(Err(e)) => panic!("the write failed: {e}"),
+            }
+        }
+        panic!("the writer never parked: {written} bytes accepted");
+    }
+
+    /// A task writing `payload` into `io` as fast as it takes it, then
+    /// closing; the bytes accepted so far.
+    fn spawn_writer(
+        mut io: TunnelIo,
+        payload: Vec<u8>,
+    ) -> (Arc<AtomicUsize>, tokio::task::JoinHandle<TunnelIo>) {
+        let written = Arc::new(AtomicUsize::new(0));
+        let counter = written.clone();
+        let task = tokio::spawn(async move {
+            let mut offset = 0;
+            while offset < payload.len() {
+                offset +=
+                    std::future::poll_fn(|cx| Pin::new(&mut io).poll_write(cx, &payload[offset..]))
+                        .await
+                        .unwrap();
+                counter.store(offset, Ordering::SeqCst);
+            }
+            std::future::poll_fn(|cx| Pin::new(&mut io).poll_shutdown(cx))
+                .await
+                .unwrap();
+            io
+        });
+        (written, task)
+    }
+
+    fn pattern(len: usize, seed: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i + seed) % 251) as u8).collect()
+    }
+
+    /// Connection 1 has 1MiB of credit and a writer that queues all it may;
+    /// connection 2's DATA and CLOSE leave one turn each after it, not
+    /// behind its backlog (one shared FIFO sent them after all 64 frames).
+    #[tokio::test]
+    async fn another_connections_data_and_close_overtake_a_full_backlog() {
+        let mut peer = peer();
+        peer.auto_grant = false;
+        let io1 = peer.connections.register(1, WINDOW);
+        let mut io2 = peer.connections.register(2, WINDOW);
+        let backlog = pattern(WINDOW as usize, 0);
+        let (written, writer) = spawn_writer(io1, backlog.clone());
+        while peer.queued_data(1) < DATA_QUEUE_CAPACITY {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            written.load(Ordering::SeqCst),
+            DATA_QUEUE_CAPACITY * CHUNK,
+            "conn 1 queued its cap and has credit left"
+        );
+        assert!(!writer.is_finished(), "conn 1's writer waits at its cap");
+
+        let (_, waker) = counting_waker();
+        assert!(
+            matches!(poll_write(&mut io2, &waker, b"x"), Poll::Ready(Ok(1))),
+            "conn 2's writer does not wait on conn 1's queue"
+        );
+        let closed = Pin::new(&mut io2).poll_shutdown(&mut Context::from_waker(&waker));
+        assert!(matches!(closed, Poll::Ready(Ok(()))), "{closed:?}");
+
+        let mut order = Vec::new();
+        let mut received = Vec::new();
+        while !order.contains(&"1 CLOSE".to_string()) {
+            let frame = tokio::time::timeout(Duration::from_secs(1), peer.recv())
+                .await
+                .expect("conn 1's backlog keeps flowing")
+                .expect("the stream is open");
+            let body = frame.body.unwrap();
+            if let Body::Data(data) = &body
+                && data.conn_id == 1
+            {
+                received.extend_from_slice(&data.payload);
+            }
+            order.push(label(&body));
+        }
+        assert_eq!(
+            order[..4],
+            ["1 DATA", "2 DATA", "1 DATA", "2 CLOSE"],
+            "one turn each"
+        );
+        assert_eq!(received, backlog, "conn 1's bytes complete and in order");
+        writer.await.unwrap();
+    }
+
+    /// A writer waiting at its cap is woken by DATA leaving its own queue
+    /// only: other connections' frames, queued or sent, never wake it.
+    #[tokio::test]
+    async fn only_its_own_frames_leaving_wake_a_writer_waiting_at_its_cap() {
+        let mut peer = peer();
+        let outbound = peer.connections.outbound.clone();
+        let mut io = peer.connections.register(1, WINDOW);
+        let (wakes, waker) = counting_waker();
+        assert_eq!(
+            fill_until_pending(&mut io, &waker),
+            DATA_QUEUE_CAPACITY * CHUNK
+        );
+        for _ in 0..100 {
+            outbound.data(2, data_frame(2, 1));
+        }
+        outbound.marker(2, close_frame(2));
+        outbound.control(error_frame(3, "x"));
+        outbound.wake_writer(2);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0, "queueing elsewhere");
+
+        let mut own = 0;
+        let mut others = 0;
+        for _ in 0..1000 {
+            let body = next_frame(&mut peer).await.unwrap().body.unwrap();
+            match &body {
+                Body::Data(data) if data.conn_id == 1 => own += 1,
+                _ => others += 1,
+            }
+            if own == wakes.0.load(Ordering::SeqCst) {
+                // woken: refill as hyper would, parking again at the cap
+                fill_until_pending(&mut io, &waker);
+            }
+            if matches!(body, Body::Close(_)) {
+                break;
+            }
+        }
+        assert_eq!(others, 102, "conn 2's frames and the control frame left");
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            own,
+            "one wake per own frame, none for the {others} others"
+        );
+    }
+
+    /// CLOSE and the connection-end ERROR are queued at once behind a full
+    /// queue, after the connection's DATA.
+    #[tokio::test]
+    async fn close_and_error_bypass_the_cap_after_the_connections_data() {
+        let mut peer = peer();
+        let mut io = peer.connections.register(1, WINDOW);
+        let (_, waker) = counting_waker();
+        fill_until_pending(&mut io, &waker);
+        assert_eq!(peer.queued_data(1), DATA_QUEUE_CAPACITY);
+
+        let closed = Pin::new(&mut io).poll_shutdown(&mut Context::from_waker(&waker));
+        assert!(matches!(closed, Poll::Ready(Ok(()))), "{closed:?}");
+        io.ending().finish();
+
+        let mut expected = vec!["1 DATA".to_string(); DATA_QUEUE_CAPACITY];
+        expected.extend(["1 CLOSE".to_string(), "1 ERROR".to_string()]);
+        assert_eq!(labels(&drain_frames(&mut peer).await), expected);
+    }
+
+    #[tokio::test]
+    async fn a_write_after_the_close_fails() {
+        let mut peer = peer();
+        let (_, waker) = counting_waker();
+        for (conn_id, window) in [(1, 0), (2, WINDOW)] {
+            let mut io = peer.connections.register(conn_id, window);
+            let closed = Pin::new(&mut io).poll_shutdown(&mut Context::from_waker(&waker));
+            assert!(matches!(closed, Poll::Ready(Ok(()))), "{closed:?}");
+            let Poll::Ready(Err(error)) = poll_write(&mut io, &waker, b"x") else {
+                panic!("conn {conn_id}: the write fails");
+            };
+            assert_eq!(error.to_string(), WRITE_CLOSED);
+        }
+        assert_eq!(
+            labels(&drain_frames(&mut peer).await),
+            ["1 CLOSE", "2 CLOSE"],
+            "no DATA after a CLOSE"
+        );
+    }
+
+    /// Two connections writing at once: their frames interleave, and each
+    /// connection's bytes and CLOSE keep their order.
+    #[tokio::test]
+    async fn interleaved_connections_keep_their_own_order() {
+        let mut peer = peer();
+        let payloads = [pattern(40 * CHUNK, 0), pattern(40 * CHUNK, 7)];
+        let writers: Vec<_> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, payload)| {
+                let io = peer.connections.register(i as i64 + 1, WINDOW);
+                spawn_writer(io, payload.clone()).1
+            })
+            .collect();
+        let mut received = [Vec::new(), Vec::new()];
+        let mut order: Vec<String> = Vec::new();
+        while order
+            .iter()
+            .filter(|label| label.ends_with("CLOSE"))
+            .count()
+            < 2
+        {
+            let body = tokio::time::timeout(Duration::from_secs(1), peer.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .body
+                .unwrap();
+            match &body {
+                Body::Data(data) => {
+                    assert!(
+                        !order.contains(&format!("{} CLOSE", data.conn_id)),
+                        "DATA after its CLOSE"
+                    );
+                    received[data.conn_id as usize - 1].extend_from_slice(&data.payload);
+                }
+                Body::Close(_) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+            order.push(label(&body));
+        }
+        assert_eq!(received, payloads);
+        let switches = order.windows(2).filter(|pair| pair[0] != pair[1]).count();
+        assert!(
+            switches >= 40,
+            "the connections interleave: {switches} switches"
+        );
+        for writer in writers {
+            writer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_queue_lives_only_while_it_holds_frames() {
+        let mut peer = peer();
+        let outbound = peer.connections.outbound.clone();
+        let mut open = peer.connections.register(1, WINDOW);
+        let (_, waker) = counting_waker();
+        assert!(matches!(
+            poll_write(&mut open, &waker, b"x"),
+            Poll::Ready(Ok(1))
+        ));
+        assert_eq!(outbound.queues(), 1);
+        drain_frames(&mut peer).await;
+        assert_eq!(outbound.queues(), 0, "an open connection whose DATA left");
+
+        outbound.data(2, data_frame(2, 1));
+        outbound.marker(2, close_frame(2));
+        drain_frames(&mut peer).await;
+        assert_eq!(outbound.queues(), 0, "a closed connection");
+        outbound.data(2, data_frame(2, 1));
+        assert_eq!(
+            drain_frames(&mut peer).await.len(),
+            1,
+            "a late frame is sent"
+        );
+        assert_eq!(outbound.queues(), 0, "and leaves no queue behind");
+
+        for conn_id in 100..10_100 {
+            outbound.data(conn_id, data_frame(conn_id, 1));
+        }
+        assert_eq!(outbound.queues(), 10_000);
+        assert_eq!(drain_frames(&mut peer).await.len(), 10_000);
+        assert_eq!(outbound.queues(), 0);
+    }
+
+    /// The server's ERROR, a window violation and the teardown each wake
+    /// a writer waiting at its cap, which then fails.
+    #[tokio::test]
+    async fn a_writer_waiting_at_its_cap_fails_with_its_connection() {
+        let peer = peer();
+        let mut ios: Vec<_> = [WINDOW, WINDOW, 0, WINDOW]
+            .into_iter()
+            .enumerate()
+            .map(|(i, window)| {
+                let mut io = peer.connections.register(i as i64 + 1, window);
+                let (wakes, waker) = counting_waker();
+                assert_eq!(
+                    fill_until_pending(&mut io, &waker),
+                    DATA_QUEUE_CAPACITY * CHUNK
+                );
+                (io, wakes, waker)
+            })
+            .collect();
+        let woken = |ios: &Vec<(TunnelIo, Arc<CountingWaker>, Waker)>| -> Vec<usize> {
+            ios.iter()
+                .map(|(_, wakes, _)| wakes.0.load(Ordering::SeqCst))
+                .collect()
+        };
+        let failure = |i: usize, ios: &mut Vec<(TunnelIo, Arc<CountingWaker>, Waker)>| {
+            let (io, _, waker) = &mut ios[i];
+            match poll_write(io, waker, b"x") {
+                Poll::Ready(Err(error)) => error.to_string(),
+                other => panic!("conn {}: the write fails: {other:?}", i + 1),
+            }
+        };
+
+        peer.error(1, "public peer reset").await;
+        assert_eq!(woken(&ios), [1, 0, 0, 0], "the server's ERROR");
+        assert_eq!(failure(0, &mut ios), "public peer reset");
+
+        feed(&peer, 2, WINDOW as usize + 1).await;
+        assert_eq!(woken(&ios), [1, 1, 0, 0], "the violation");
+        assert_eq!(failure(1, &mut ios), WINDOW_EXCEEDED);
+
+        peer.connections.teardown();
+        assert_eq!(woken(&ios), [1, 1, 1, 1], "the teardown");
+        assert_eq!(failure(2, &mut ios), STREAM_CLOSED, "legacy");
+        assert_eq!(failure(3, &mut ios), STREAM_CLOSED, "windowed");
+    }
+
+    /// gRPC dropping the request stream ends it like the teardown: the
+    /// queued frames are freed, a writer at its cap fails, later frames are
+    /// dropped.
+    #[tokio::test]
+    async fn dropping_the_request_stream_fails_a_writer_waiting_at_its_cap() {
+        let (outbound, frames) = Outbound::new();
+        let connections = Connections::new(
+            "test".into(),
+            outbound.clone(),
+            Arc::default(),
+            Limit::new(usize::MAX),
+        );
+        let mut io = connections.register(1, WINDOW);
+        let (wakes, waker) = counting_waker();
+        assert_eq!(
+            fill_until_pending(&mut io, &waker),
+            DATA_QUEUE_CAPACITY * CHUNK
+        );
+
+        drop(frames);
+
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        let Poll::Ready(Err(error)) = poll_write(&mut io, &waker, b"x") else {
+            panic!("the write fails");
+        };
+        assert_eq!(error.to_string(), STREAM_CLOSED);
+        assert_eq!(outbound.queues(), 0, "the queued frames are freed");
+        outbound.control(error_frame(2, "x"));
+        outbound.marker(1, close_frame(1));
+        assert_eq!(outbound.queues(), 0);
+        assert!(outbound.lock().control.is_empty());
+    }
+
+    /// The request stream waits for a frame, is woken by every kind of
+    /// frame queued, and ends with the teardown, dropping what is queued.
+    #[tokio::test]
+    async fn the_request_stream_waits_for_frames_and_ends_with_the_teardown() {
+        let (outbound, frames) = Outbound::new();
+        let connections = Connections::new(
+            "test".into(),
+            outbound.clone(),
+            Arc::default(),
+            Limit::new(usize::MAX),
+        );
+        let mut frames = Box::pin(frames);
+        let (wakes, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let queue: [&dyn Fn(); 3] = [
+            &|| outbound.control(error_frame(1, "x")),
+            &|| outbound.data(1, data_frame(1, 1)),
+            &|| outbound.marker(1, close_frame(1)),
+        ];
+        for (i, queue) in queue.iter().enumerate() {
+            assert!(frames.as_mut().poll_next(&mut cx).is_pending());
+            queue();
+            assert_eq!(wakes.0.load(Ordering::SeqCst), i + 1);
+            assert!(matches!(
+                frames.as_mut().poll_next(&mut cx),
+                Poll::Ready(Some(_))
+            ));
+        }
+
+        assert!(frames.as_mut().poll_next(&mut cx).is_pending());
+        outbound.data(1, data_frame(1, 1));
+        connections.teardown();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 4);
+        assert!(
+            matches!(frames.as_mut().poll_next(&mut cx), Poll::Ready(None)),
+            "ended, the queued frame dropped"
+        );
+    }
+
+    /// An ended connection keeps its slot while frames of it are queued, so
+    /// the connection limit bounds what ended connections still queue.
+    #[tokio::test]
+    async fn an_ended_connection_holds_its_slot_until_its_frames_left() {
+        let mut peer = peer();
+        let limit = Limit::new(usize::MAX);
+        let (_, waker) = counting_waker();
+        let mut io = peer.connections.register(1, WINDOW);
+        io.permit = limit.try_acquire();
+        assert!(matches!(
+            poll_write(&mut io, &waker, b"x"),
+            Poll::Ready(Ok(1))
+        ));
+        let ending = io.ending();
+        drop(io);
+        assert_eq!(limit.open(), 1, "the end holds the slot");
+        ending.finish();
+        assert_eq!(limit.open(), 1, "held while DATA and ERROR are queued");
+        assert_eq!(
+            labels(&drain_frames(&mut peer).await),
+            ["1 DATA", "1 ERROR"]
+        );
+        assert_eq!(limit.open(), 0, "freed once they left");
+
+        // nothing queued: freed at once
+        let mut io = peer.connections.register(2, WINDOW);
+        io.permit = limit.try_acquire();
+        peer.error(2, "gone").await;
+        let closed = Pin::new(&mut io).poll_shutdown(&mut Context::from_waker(&waker));
+        assert!(matches!(closed, Poll::Ready(Ok(()))));
+        drain_frames(&mut peer).await;
+        io.ending().finish();
+        assert_eq!(limit.open(), 0, "nothing was left to send");
+
+        // the stream ends with frames queued: freed with them
+        let mut io = peer.connections.register(3, WINDOW);
+        io.permit = limit.try_acquire();
+        assert!(matches!(
+            poll_write(&mut io, &waker, b"x"),
+            Poll::Ready(Ok(1))
+        ));
+        io.ending().finish();
+        assert_eq!(limit.open(), 1);
+        peer.connections.teardown();
+        assert_eq!(limit.open(), 0, "the teardown frees it");
     }
 }
