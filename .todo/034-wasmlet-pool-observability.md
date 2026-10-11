@@ -16,6 +16,13 @@ Options:
   console's wasm route (proto change)
 - a local metrics endpoint (wasmlet has no HTTP listener today)
 
+The instance limit (`--max-instances`, `Instances` in `wasm_host.rs`) is
+silent too: requests that waited for a slot and the 503s of those that found
+none within their budget are neither logged nor counted, so the limit cannot
+be sized from evidence either. The tests read only `Handler`'s gauge (live /
+peak / created stores) and `Instances::held`.
+
 Decide with the user before implementing. Acceptance: the cold-fallback
-and recycle counts per route are visible without a debugger; a test
-asserts them for exhaustion and for a recycle.
+and recycle counts per route, and the instance-limit waits and 503s, are
+visible without a debugger; a test asserts them for exhaustion, for a
+recycle and for a 503.

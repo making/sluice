@@ -7,7 +7,7 @@ Found during the 041 investigation (by reading, not tested).
 ## Problem
 
 `wasm_host.rs` enables `epoch_interruption(true)` and arms each store with
-`set_epoch_deadline(budget_ticks(budget))` (`:1132`, `:1368`, `:1396`). No
+`set_epoch_deadline(budget_ticks(..))` (in `respond`, `run_unit` and its job loop). No
 `epoch_deadline_callback` / `epoch_deadline_async_yield_and_update` is installed, so the
 default applies: the guest runs uninterrupted until the deadline, then traps. A busy-loop
 guest therefore holds its tokio worker thread for the whole budget (default 10s,
@@ -35,4 +35,12 @@ fire, so the budget must stay enforced by the epoch count / the outside watchdog
   it fail before the fix.
 - Test: a busy guest still traps at its budget (the yield must not extend it); assert the
   elapsed time is within budget + one tick.
-- Needs a busy-loop example guest under `sluice-wasmlet/examples/` if none exists.
+- Needs a busy-loop example guest under `sluice-wasmlet/examples/` if none exists (the
+  hello guest's `/spin` is one).
+- The epoch ticker lags the wall clock under load (068): the budget + one tick bound
+  holds only once 068 is done, or the assertion allows for the lag.
+- `a_reset_stream_keeps_its_share_until_its_instance_is_gone` (059) relies on a
+  spinning guest outliving its reset stream until the budget: the watchdog shares the
+  guest's task and cannot stop it. Once the guest yields, the watchdog stops it at the
+  next tick, and that test needs another way to keep an instance past its stream's end
+  (or its premise is gone: then reduce it to the share being released with the store).

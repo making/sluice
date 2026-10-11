@@ -179,9 +179,9 @@ What 043-048 still leave open, by design or elsewhere. Do not report the parent 
 - Total memory (048, done): the connection limits bound it; since 057 (done) an h2
   connection's further legs take slots and its demux queue beyond a per-connection
   allowance is charged to a budget shared by the node; since 058 (done) tiny DATA
-  frames add no per-frame overhead to the receive buffers. Not within the bound:
-  wasmlet guest instances (059), keep-alive connections idle between requests hold
-  their slots (060), and the Java
+  frames add no per-frame overhead to the receive buffers; since 059 (done) the
+  wasmlet's guest instances are capped by `--max-instances`. Not within the bound:
+  keep-alive connections idle between requests hold their slots (060), and the Java
   send queues of connections whose slot was already released (061). (ADVERTISE
   off the receive path and the credit-lock pitfall are done in 046.)
 
