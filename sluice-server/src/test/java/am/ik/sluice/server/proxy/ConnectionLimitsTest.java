@@ -111,13 +111,13 @@ class ConnectionLimitsTest {
 	@Test
 	void anUnsetLimitFitsEverySlotsWorstCaseAndTheBudgetInHalfTheHeap() {
 		long mib = 1024 * 1024;
-		// a virtual connection's 2.125MiB plus an h2 relay's own queue
-		assertThat(ConnectionLimits.connectionBytes()).isEqualTo(2228224 + Http2DemuxRelay.UNBUDGETED_BYTES);
+		// a virtual connection's 2.16MiB plus an h2 relay's own queue
+		assertThat(ConnectionLimits.connectionBytes()).isEqualTo(2266112 + Http2DemuxRelay.UNBUDGETED_BYTES);
 		assertThat(ConnectionLimits.deriveBudget(400 * mib)).isEqualTo(25 * mib);
-		// (200MiB - 25MiB) / 2.41MiB
-		assertThat(ConnectionLimits.deriveMaxConnections(400 * mib, 25 * mib)).isEqualTo(72);
-		// (2048MiB - 256MiB) / 2.41MiB
-		assertThat(ConnectionLimits.deriveMaxConnections(4096 * mib, 256 * mib)).isEqualTo(742);
+		// (200MiB - 25MiB) / 2.45MiB
+		assertThat(ConnectionLimits.deriveMaxConnections(400 * mib, 25 * mib)).isEqualTo(71);
+		// (2048MiB - 256MiB) / 2.45MiB
+		assertThat(ConnectionLimits.deriveMaxConnections(4096 * mib, 256 * mib)).isEqualTo(731);
 		assertThat(ConnectionLimits.deriveMaxConnections(400 * mib, 400 * mib)).isEqualTo(1);
 	}
 

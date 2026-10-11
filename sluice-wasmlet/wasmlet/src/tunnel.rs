@@ -10,7 +10,9 @@
 //! - the server may have at most [`WINDOW`] payload bytes in flight beyond what
 //!   this side granted back. Payload past it fails only that connection
 //!   (ERROR [`WINDOW_EXCEEDED`]); the receive loop never waits on a windowed
-//!   connection;
+//!   connection. The payload waits in the connection's [`Inbox`], coalesced
+//!   into segments of at most [`SEGMENT`], so its memory stays near the window
+//!   whatever the size of the frames;
 //! - bytes handed to hyper are granted back (WindowUpdate) once they reach
 //!   half the window;
 //! - hyper's writes send only against the server's credit; a write without
@@ -64,6 +66,19 @@ const ABORTED: &str = "connection aborted by the tunnel peer";
 /// Upper bound for a single DATA frame emitted by the hyper write path.
 const CHUNK: usize = 16 * 1024;
 
+/// The most payload one receive segment of a windowed connection holds;
+/// the Java side's `VirtualConnection.SEGMENT_SIZE`.
+const SEGMENT: usize = 16 * 1024;
+
+/// The most segments the inbox of a windowed connection with `window` holds:
+/// segments smaller than [`SEGMENT`] at least double one after another, so at
+/// most log2([`SEGMENT`]) of them; every full-size one but the head and the
+/// tail holds only unread payload, which the window bounds.
+#[cfg(test)]
+const fn max_segments(window: usize) -> usize {
+    window / SEGMENT + SEGMENT.trailing_zeros() as usize + 2
+}
+
 /// Legacy connections: frames buffered before the receive loop waits for
 /// the connection's reader.
 const LEGACY_BUFFER: usize = 32;
@@ -75,7 +90,7 @@ pub(crate) const DATA_QUEUE_CAPACITY: usize = 16;
 /// Write error after the connection's CLOSE or ERROR was queued.
 const WRITE_CLOSED: &str = "connection closed for writing";
 
-/// Downstream control for one virtual connection, consumed by its reader.
+/// Downstream control for one legacy connection, consumed by its reader.
 pub enum Ctrl {
     /// Bytes to write into the connection (hyper's read side).
     Payload(Vec<u8>),
@@ -355,8 +370,8 @@ fn close_frame(conn_id: i64) -> Frame {
 
 /// A cap on the connections open at once over every stream of the process.
 /// A windowed connection buffers at most [`WINDOW`] of the server's payload
-/// and [`DATA_QUEUE_CAPACITY`] outbound DATA frames, so the cap bounds the
-/// total.
+/// in at most `max_segments` segments of its [`Inbox`], and
+/// [`DATA_QUEUE_CAPACITY`] outbound DATA frames, so the cap bounds the total.
 pub struct Limit {
     max: usize,
     open: AtomicUsize,
@@ -430,6 +445,110 @@ struct FlowState {
     error_sent: bool,
     /// The writer waiting for credit.
     writer: Option<Waker>,
+    /// The server's payload not yet read (windowed).
+    inbox: Inbox,
+    /// How the inbound stream ends once the inbox is read: the server's first
+    /// CLOSE or ERROR (windowed). Payload after it is dropped.
+    remote_end: Option<RemoteEnd>,
+    /// The reader waiting for payload or the end (windowed).
+    reader: Option<Waker>,
+    /// Test hook: the times the reader waited (windowed).
+    #[cfg(test)]
+    reader_waits: usize,
+}
+
+#[derive(Clone, Copy)]
+enum RemoteEnd {
+    Closed,
+    Failed,
+}
+
+/// The payload of a windowed connection in arrival order, in segments of at
+/// most [`SEGMENT`]: small frames are coalesced and large ones split, so
+/// neither the per-segment overhead nor the read part of the head segment
+/// grows with the way the server frames its payload. At most
+/// `window + 2 x SEGMENT` of capacity in `max_segments` segments: every
+/// segment but the tail is full, and the unread payload is within the window.
+#[derive(Default)]
+struct Inbox {
+    segments: VecDeque<Vec<u8>>,
+    /// Read offset in the head segment.
+    head: usize,
+}
+
+impl Inbox {
+    /// Fills the tail segment's room, then appends segments of at most
+    /// [`SEGMENT`], each at least twice the capacity of the one before it (up
+    /// to the segment size) or the rest of the payload. The first segment of
+    /// an empty inbox is the payload itself when it fits one: a reader that
+    /// keeps up costs no copy here.
+    fn push(&mut self, payload: Vec<u8>) {
+        if self.segments.is_empty() && payload.capacity() <= SEGMENT {
+            self.segments.push_back(payload);
+            return;
+        }
+        let mut data = &payload[..];
+        while !data.is_empty() {
+            let full = self
+                .segments
+                .back()
+                .is_none_or(|tail| tail.len() == tail.capacity());
+            if full {
+                let capacity = match self.segments.back() {
+                    None => data.len().min(SEGMENT),
+                    Some(tail) => SEGMENT.min(data.len().max(2 * tail.capacity())),
+                };
+                self.segments.push_back(Vec::with_capacity(capacity));
+            }
+            let tail = self.segments.back_mut().expect("a tail segment");
+            let n = data.len().min(tail.capacity() - tail.len());
+            tail.extend_from_slice(&data[..n]);
+            data = &data[n..];
+        }
+    }
+
+    /// Copies up to `buf.remaining()` bytes, across segments; the bytes copied.
+    fn read_into(&mut self, buf: &mut ReadBuf<'_>) -> usize {
+        let mut n = 0;
+        while buf.remaining() > 0 {
+            let Some(segment) = self.segments.front() else {
+                break;
+            };
+            let count = buf.remaining().min(segment.len() - self.head);
+            buf.put_slice(&segment[self.head..self.head + count]);
+            n += count;
+            self.head += count;
+            if self.head == segment.len() {
+                self.segments.pop_front();
+                self.head = 0;
+            }
+        }
+        n
+    }
+
+    /// Whether the unread bytes start with `prefix`, across segments.
+    fn starts_with(&self, prefix: &[u8]) -> bool {
+        let mut unread = self
+            .segments
+            .iter()
+            .enumerate()
+            .flat_map(|(i, segment)| &segment[if i == 0 { self.head } else { 0 }..]);
+        prefix.iter().all(|byte| unread.next() == Some(byte))
+    }
+
+    fn clear(&mut self) {
+        self.segments = VecDeque::new();
+        self.head = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.segments.iter().map(Vec::len).sum::<usize>() - self.head
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.segments.iter().map(Vec::capacity).sum()
+    }
 }
 
 /// What the dispatch does with received payload.
@@ -460,28 +579,41 @@ impl Flow {
         self.state.lock().unwrap()
     }
 
-    /// Accounts received payload against the window (windowed only). A
-    /// violation resets the connection and wakes its writer.
-    fn receive(&self, len: usize) -> Receive {
-        let waker = {
+    /// Accounts received payload against the window and queues it in the
+    /// inbox (windowed only). Payload after the server's CLOSE is dropped; an
+    /// empty payload ends the reader after the inbox, as on the Java side. A
+    /// violation resets the connection, drops the inbox and wakes the reader
+    /// and the writer.
+    fn receive(&self, payload: Vec<u8>) -> Receive {
+        let (received, reader, writer) = {
             let mut state = self.lock();
             if state.reset || state.remote_failed {
                 return Receive::Drop;
             }
-            state.outstanding += len as u64;
-            if state.outstanding <= u64::from(self.window) {
-                return Receive::Accept;
+            state.outstanding += payload.len() as u64;
+            if state.outstanding > u64::from(self.window) {
+                state.reset = true;
+                state.error_sent = true;
+                state.failure = Some(WINDOW_EXCEEDED.to_string());
+                state.inbox.clear();
+                (Receive::Exceeded, state.reader.take(), state.writer.take())
+            } else if payload.is_empty() {
+                state.remote_end.get_or_insert(RemoteEnd::Closed);
+                (Receive::Accept, state.reader.take(), None)
+            } else if state.remote_end.is_some() {
+                return Receive::Drop;
+            } else {
+                state.inbox.push(payload);
+                (Receive::Accept, state.reader.take(), None)
             }
-            state.reset = true;
-            state.error_sent = true;
-            state.failure = Some(WINDOW_EXCEEDED.to_string());
-            state.writer.take()
         };
-        self.failed.cancel();
-        if let Some(waker) = waker {
+        if matches!(received, Receive::Exceeded) {
+            self.failed.cancel();
+        }
+        for waker in [reader, writer].into_iter().flatten() {
             waker.wake();
         }
-        Receive::Exceeded
+        received
     }
 
     /// Adds the server's grant (saturating) and wakes the writer.
@@ -496,37 +628,50 @@ impl Flow {
         }
     }
 
-    /// The server's CLOSE; true the first time.
+    /// The server's CLOSE: the reader ends after the inbox. True the first
+    /// time.
     fn remote_close(&self) -> bool {
-        let mut state = self.lock();
-        !std::mem::replace(&mut state.remote_closed, true)
-    }
-
-    /// The server's ERROR: writes fail from now on. True the first time.
-    fn remote_fail(&self, message: &str) -> bool {
-        let (first, waker) = {
+        let (first, reader) = {
             let mut state = self.lock();
-            let first = !std::mem::replace(&mut state.remote_failed, true);
-            state.failure.get_or_insert_with(|| message.to_string());
-            (first, state.writer.take())
+            let first = !std::mem::replace(&mut state.remote_closed, true);
+            state.remote_end.get_or_insert(RemoteEnd::Closed);
+            (first, state.reader.take())
         };
-        self.failed.cancel();
-        if let Some(waker) = waker {
+        if let Some(waker) = reader {
             waker.wake();
         }
         first
     }
 
-    /// Local teardown: reader and writer fail, nothing more is sent.
+    /// The server's ERROR: writes fail from now on, the reader after the
+    /// inbox. True the first time.
+    fn remote_fail(&self, message: &str) -> bool {
+        let (first, reader, writer) = {
+            let mut state = self.lock();
+            let first = !std::mem::replace(&mut state.remote_failed, true);
+            state.failure.get_or_insert_with(|| message.to_string());
+            state.remote_end.get_or_insert(RemoteEnd::Failed);
+            (first, state.reader.take(), state.writer.take())
+        };
+        self.failed.cancel();
+        for waker in [reader, writer].into_iter().flatten() {
+            waker.wake();
+        }
+        first
+    }
+
+    /// Local teardown: reader and writer fail, the inbox is dropped, nothing
+    /// more is sent.
     fn reset(&self, message: &str) {
-        let waker = {
+        let (reader, writer) = {
             let mut state = self.lock();
             state.reset = true;
             state.failure.get_or_insert_with(|| message.to_string());
-            state.writer.take()
+            state.inbox.clear();
+            (state.reader.take(), state.writer.take())
         };
         self.failed.cancel();
-        if let Some(waker) = waker {
+        for waker in [reader, writer].into_iter().flatten() {
             waker.wake();
         }
     }
@@ -544,27 +689,10 @@ impl Flow {
 // ---------------------------------------------------------------------------
 // Registry and dispatch
 
-enum CtrlTx {
-    Windowed(mpsc::UnboundedSender<Ctrl>),
-    Legacy(mpsc::Sender<Ctrl>),
-}
-
-enum CtrlRx {
-    Windowed(mpsc::UnboundedReceiver<Ctrl>),
-    Legacy(mpsc::Receiver<Ctrl>),
-}
-
-impl CtrlRx {
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Ctrl>> {
-        match self {
-            CtrlRx::Windowed(rx) => rx.poll_recv(cx),
-            CtrlRx::Legacy(rx) => rx.poll_recv(cx),
-        }
-    }
-}
-
 struct Conn {
-    ctrl: CtrlTx,
+    /// The channel of a legacy connection; a windowed one queues in its
+    /// flow's inbox.
+    legacy: Option<mpsc::Sender<Ctrl>>,
     flow: Arc<Flow>,
 }
 
@@ -628,23 +756,23 @@ impl Connections {
             }
             Body::Data(data) => self.data(data),
             Body::Close(close) => {
-                let (ctrl, flow) = self.lookup(close.conn_id)?;
+                let (legacy, flow) = self.lookup(close.conn_id)?;
                 if !flow.remote_close() {
                     return None;
                 }
-                send(ctrl, Ctrl::WriteClose)
+                legacy.map(|tx| Deferred(tx, Ctrl::WriteClose))
             }
             Body::Error(error) => {
                 println!(
                     "[{}] conn {} failed: {}",
                     self.key, error.conn_id, error.message
                 );
-                let (ctrl, flow) = self.lookup(error.conn_id)?;
+                let (legacy, flow) = self.lookup(error.conn_id)?;
                 if !flow.remote_fail(&error.message) {
                     return None;
                 }
                 self.outbound.wake_writer(error.conn_id);
-                send(ctrl, Ctrl::Abort)
+                legacy.map(|tx| Deferred(tx, Ctrl::Abort))
             }
             Body::WindowUpdate(update) => {
                 // ignored for unknown and legacy connections, as on the Java side
@@ -660,14 +788,10 @@ impl Connections {
         }
     }
 
-    fn lookup(&self, conn_id: i64) -> Option<(CtrlTx, Arc<Flow>)> {
+    fn lookup(&self, conn_id: i64) -> Option<(Option<mpsc::Sender<Ctrl>>, Arc<Flow>)> {
         let registry = self.registry.lock().unwrap();
         let conn = registry.get(&conn_id)?;
-        let ctrl = match &conn.ctrl {
-            CtrlTx::Windowed(tx) => CtrlTx::Windowed(tx.clone()),
-            CtrlTx::Legacy(tx) => CtrlTx::Legacy(tx.clone()),
-        };
-        Some((ctrl, conn.flow.clone()))
+        Some((conn.legacy.clone(), conn.flow.clone()))
     }
 
     fn connect(&self, connect: Connect) {
@@ -690,22 +814,17 @@ impl Connections {
     }
 
     fn data(&self, data: Data) -> Option<Deferred> {
-        let (ctrl, flow) = self.lookup(data.conn_id)?;
-        let tx = match ctrl {
-            CtrlTx::Legacy(tx) => return Some(Deferred(tx, Ctrl::Payload(data.payload))),
-            CtrlTx::Windowed(tx) => tx,
-        };
-        match flow.receive(data.payload.len()) {
-            Receive::Accept => {
-                let _ = tx.send(Ctrl::Payload(data.payload));
-            }
-            Receive::Drop => {}
+        let (legacy, flow) = self.lookup(data.conn_id)?;
+        if let Some(tx) = legacy {
+            return Some(Deferred(tx, Ctrl::Payload(data.payload)));
+        }
+        match flow.receive(data.payload) {
+            Receive::Accept | Receive::Drop => {}
             Receive::Exceeded => {
                 eprintln!("[{}] conn {}: {WINDOW_EXCEEDED}", self.key, data.conn_id);
                 self.outbound
                     .control(error_frame(data.conn_id, WINDOW_EXCEEDED));
                 self.outbound.wake_writer(data.conn_id);
-                // drops the sender: the reader wakes and fails
                 self.registry.lock().unwrap().remove(&data.conn_id);
             }
         }
@@ -715,28 +834,23 @@ impl Connections {
     /// Registers a connection and returns the byte stream hyper serves it
     /// over. `server_window` > 0 makes it windowed, with that initial credit.
     fn register(&self, conn_id: i64, server_window: u32) -> TunnelIo {
-        let (ctrl, rx, flow) = if server_window > 0 {
-            let (tx, rx) = mpsc::unbounded_channel();
-            (
-                CtrlTx::Windowed(tx),
-                CtrlRx::Windowed(rx),
-                Flow::new(WINDOW, u64::from(server_window)),
-            )
+        let (tx, rx, flow) = if server_window > 0 {
+            (None, None, Flow::new(WINDOW, u64::from(server_window)))
         } else {
             let (tx, rx) = mpsc::channel(LEGACY_BUFFER);
-            (CtrlTx::Legacy(tx), CtrlRx::Legacy(rx), Flow::new(0, 0))
+            (Some(tx), Some(rx), Flow::new(0, 0))
         };
         let flow = Arc::new(flow);
         self.registry.lock().unwrap().insert(
             conn_id,
             Conn {
-                ctrl,
+                legacy: tx,
                 flow: flow.clone(),
             },
         );
         TunnelIo {
             conn_id,
-            rx,
+            legacy: rx,
             outbound: self.outbound.clone(),
             flow,
             registry: self.registry.clone(),
@@ -761,37 +875,29 @@ impl Connections {
     }
 }
 
-/// Windowed: an unbounded send, done here. Legacy: deferred to the caller.
-fn send(ctrl: CtrlTx, message: Ctrl) -> Option<Deferred> {
-    match ctrl {
-        CtrlTx::Windowed(tx) => {
-            let _ = tx.send(message);
-            None
-        }
-        CtrlTx::Legacy(tx) => Some(Deferred(tx, message)),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tunnel <-> hyper byte stream adapter
 
-/// AsyncRead/AsyncWrite over one virtual connection: reads consume `Ctrl`
-/// messages, writes emit DATA frames (against the server's credit when
-/// windowed).
+/// AsyncRead/AsyncWrite over one virtual connection: reads take the inbox
+/// (windowed) or `Ctrl` messages (legacy), writes emit DATA frames (against
+/// the server's credit when windowed).
 pub struct TunnelIo {
     conn_id: i64,
-    rx: CtrlRx,
+    /// The channel of a legacy connection.
+    legacy: Option<mpsc::Receiver<Ctrl>>,
     outbound: Outbound,
     flow: Arc<Flow>,
     registry: Registry,
+    /// Legacy: the payload pulled from the channel, handed to hyper first.
     buf: bytes::BytesMut,
+    /// Legacy: the server's CLOSE was read.
     eof: bool,
     /// Bytes handed to hyper and not yet granted back (windowed).
     consumed: u64,
     /// The connection's slot of the connection limit, until `ending` takes
     /// it.
     permit: Option<Permit>,
-    /// `fill` consumed the server's abort.
+    /// Legacy: `fill` consumed the server's abort.
     aborted: bool,
 }
 
@@ -800,12 +906,24 @@ impl TunnelIo {
         self.conn_id
     }
 
+    /// The bytes received and not yet read: the inbox (windowed) or what
+    /// `fill` pulled (legacy).
     pub fn buffered(&self) -> usize {
-        self.buf.len()
+        if self.legacy.is_some() {
+            self.buf.len()
+        } else {
+            self.flow.lock().inbox.len()
+        }
     }
 
+    /// Whether the unread bytes start with `prefix`; across frames when
+    /// windowed.
     pub fn peek_prefix(&self, prefix: &[u8]) -> bool {
-        self.buf.starts_with(prefix)
+        if self.legacy.is_some() {
+            self.buf.starts_with(prefix)
+        } else {
+            self.flow.lock().inbox.starts_with(prefix)
+        }
     }
 
     /// Resolves once the connection failed: the server's ERROR, payload past
@@ -815,9 +933,13 @@ impl TunnelIo {
         self.flow.failed.clone().cancelled_owned()
     }
 
-    /// Pulls one control message into the buffer; false on close/abort.
+    /// Waits for unread bytes (windowed; they stay in the inbox) or pulls one
+    /// control message into the buffer (legacy); false on close/abort.
     pub async fn fill(&mut self) -> bool {
-        match std::future::poll_fn(|cx| self.rx.poll_recv(cx)).await {
+        let Some(rx) = self.legacy.as_mut() else {
+            return std::future::poll_fn(|cx| self.poll_fill(cx)).await;
+        };
+        match std::future::poll_fn(|cx| rx.poll_recv(cx)).await {
             Some(Ctrl::Payload(data)) => {
                 self.buf.extend_from_slice(&data);
                 true
@@ -836,6 +958,22 @@ impl TunnelIo {
         }
     }
 
+    /// Windowed `fill`: true once the inbox holds bytes, false at the end.
+    fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+        let mut state = self.flow.lock();
+        if state.reset {
+            return Poll::Ready(false);
+        }
+        if !state.inbox.segments.is_empty() {
+            return Poll::Ready(true);
+        }
+        if state.remote_end.is_some() {
+            return Poll::Ready(false);
+        }
+        state.reader = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
     /// What the serve task needs once hyper is done with the connection;
     /// takes over the connection's slot.
     pub fn ending(&mut self) -> Ending {
@@ -848,12 +986,71 @@ impl TunnelIo {
         }
     }
 
-    /// Hands up to `buf.remaining()` buffered bytes to hyper.
+    /// Hands up to `buf.remaining()` buffered bytes to hyper (legacy).
     fn hand_off(&mut self, buf: &mut ReadBuf<'_>) {
         let n = self.buf.len().min(buf.remaining());
         let data = self.buf.split_to(n);
         buf.put_slice(&data);
         self.consumed(n);
+    }
+
+    /// Windowed read: the inbox, then the end.
+    fn poll_read_windowed(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Some(failure) = self.flow.reset_failure() {
+            return Poll::Ready(Err(std::io::Error::other(failure)));
+        }
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let n = {
+            let mut state = self.flow.lock();
+            // checked again under the lock: a reset in between took no waker
+            if state.reset {
+                let failure = state.failure.clone().unwrap_or_default();
+                return Poll::Ready(Err(std::io::Error::other(failure)));
+            }
+            let n = state.inbox.read_into(buf);
+            if n == 0 {
+                return match state.remote_end {
+                    // an unfilled ReadBuf on return signals EOF to hyper
+                    Some(RemoteEnd::Closed) => Poll::Ready(Ok(())),
+                    Some(RemoteEnd::Failed) => Poll::Ready(Err(std::io::Error::other(ABORTED))),
+                    None => {
+                        state.reader = Some(cx.waker().clone());
+                        #[cfg(test)]
+                        {
+                            state.reader_waits += 1;
+                        }
+                        Poll::Pending
+                    }
+                };
+            }
+            n
+        };
+        self.consumed(n);
+        Poll::Ready(Ok(()))
+    }
+
+    /// Test hook: the inbox's segments.
+    #[cfg(test)]
+    fn inbox_segments(&self) -> usize {
+        self.flow.lock().inbox.segments.len()
+    }
+
+    /// Test hook: the payload in the inbox, not yet read.
+    #[cfg(test)]
+    fn inbox_bytes(&self) -> usize {
+        self.flow.lock().inbox.len()
+    }
+
+    /// Test hook: the capacity of the inbox's segments, read, unread or empty.
+    #[cfg(test)]
+    fn inbox_capacity(&self) -> usize {
+        self.flow.lock().inbox.capacity()
     }
 
     /// Grants the consumed bytes back once they reach half the window. The
@@ -906,6 +1103,9 @@ impl AsyncRead for TunnelIo {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = &mut *self;
+        let Some(rx) = this.legacy.as_mut() else {
+            return this.poll_read_windowed(cx, buf);
+        };
         if let Some(failure) = this.flow.reset_failure() {
             return Poll::Ready(Err(std::io::Error::other(failure)));
         }
@@ -920,7 +1120,7 @@ impl AsyncRead for TunnelIo {
             // Unfilled ReadBuf on return signals EOF to hyper.
             return Poll::Ready(Ok(()));
         }
-        match this.rx.poll_recv(cx) {
+        match rx.poll_recv(cx) {
             Poll::Ready(Some(Ctrl::Payload(data))) => {
                 this.buf.extend_from_slice(&data);
                 this.hand_off(buf);
@@ -1026,6 +1226,8 @@ impl Ending {
         self.registry.lock().unwrap().remove(&self.conn_id);
         let frame = {
             let mut state = self.flow.lock();
+            // hyper is done: what it did not read is never read
+            state.inbox.clear();
             if state.reset || state.error_sent {
                 None
             } else if self.flow.window > 0 && !state.remote_closed && !state.remote_failed {
@@ -1399,7 +1601,8 @@ mod tests {
 
         // what was granted may be sent again: the window is open, no violation
         feed(&peer, 1, WINDOW as usize).await;
-        read_exact(&mut io, WINDOW as usize).await.unwrap();
+        read_exact(&mut io, half).await.unwrap();
+        read_exact(&mut io, half).await.unwrap();
         let frames = drain_frames(&mut peer).await;
         assert_eq!(grants(&frames), vec![WINDOW / 2, WINDOW / 2], "{frames:?}");
     }
@@ -2033,5 +2236,285 @@ mod tests {
         assert_eq!(limit.open(), 1);
         peer.connections.teardown();
         assert_eq!(limit.open(), 0, "the teardown frees it");
+    }
+
+    /// The byte at each position of the test streams.
+    fn stream_bytes(from: usize, len: usize) -> Vec<u8> {
+        (from..from + len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Asserts the inbox holds `bytes` within the bound of a full window.
+    fn assert_inbox_bound(io: &TunnelIo, bytes: usize) {
+        assert_eq!(io.inbox_bytes(), bytes);
+        assert!(
+            io.inbox_segments() <= max_segments(WINDOW as usize),
+            "segments: {}",
+            io.inbox_segments()
+        );
+        assert!(
+            io.inbox_capacity() <= WINDOW as usize + 2 * SEGMENT,
+            "capacity: {}",
+            io.inbox_capacity()
+        );
+    }
+
+    #[tokio::test]
+    async fn tiny_frames_keep_a_bounded_number_of_segments() {
+        let mut peer = peer();
+        let mut io = peer.connections.register(1, WINDOW);
+        let window = WINDOW as usize;
+        for i in 0..window {
+            peer.data(1, &stream_bytes(i, 1)).await;
+        }
+        assert!(
+            drain_frames(&mut peer).await.is_empty(),
+            "precondition: a full window is no violation"
+        );
+        assert_inbox_bound(&io, window);
+        assert_eq!(
+            read_exact(&mut io, window).await.unwrap(),
+            stream_bytes(0, window)
+        );
+        assert_eq!(io.inbox_segments(), 0, "read segments are dropped");
+    }
+
+    #[tokio::test]
+    async fn frames_of_mixed_sizes_keep_a_bounded_number_of_segments() {
+        let mut peer = peer();
+        let mut io = peer.connections.register(1, WINDOW);
+        let window = WINDOW as usize;
+        // sizes around the segment size, so frames straddle segment boundaries
+        let sizes = [1, SEGMENT - 1, SEGMENT + 1, 2, 3 * SEGMENT, 7, SEGMENT, 1];
+        let mut accepted = 0;
+        for size in sizes.iter().cycle() {
+            if accepted == window {
+                break;
+            }
+            let size = (*size).min(window - accepted);
+            peer.data(1, &stream_bytes(accepted, size)).await;
+            accepted += size;
+        }
+        assert!(
+            drain_frames(&mut peer).await.is_empty(),
+            "precondition: a full window is no violation"
+        );
+        assert_inbox_bound(&io, window);
+        assert_eq!(
+            read_exact(&mut io, window).await.unwrap(),
+            stream_bytes(0, window)
+        );
+    }
+
+    /// A frame of a whole window, half read and granted, then the granted
+    /// half again: the read half must not stay allocated beside it.
+    #[tokio::test]
+    async fn the_read_part_of_a_large_frame_is_released() {
+        let mut peer = peer();
+        let mut io = peer.connections.register(1, WINDOW);
+        let window = WINDOW as usize;
+        let half = window / 2;
+        peer.data(1, &stream_bytes(0, window)).await;
+        assert_eq!(
+            read_exact(&mut io, half).await.unwrap(),
+            stream_bytes(0, half)
+        );
+        assert_eq!(
+            grants(&drain_frames(&mut peer).await),
+            vec![WINDOW / 2],
+            "precondition: half the window granted back"
+        );
+        peer.data(1, &stream_bytes(window, half)).await;
+        assert!(
+            drain_frames(&mut peer).await.is_empty(),
+            "precondition: no violation"
+        );
+        assert_inbox_bound(&io, window);
+        assert_eq!(
+            read_exact(&mut io, window).await.unwrap(),
+            stream_bytes(half, window)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_frames_and_reads_arrive_byte_exact() {
+        use tokio::io::AsyncReadExt as _;
+        let peer = Arc::new(peer());
+        let mut io = peer.connections.register(1, WINDOW);
+        let total = WINDOW as usize;
+        let producer = {
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                // a small LCG: deterministic frame sizes from 1 byte to 40KB
+                let mut seed: u64 = 58;
+                let mut sent = 0;
+                while sent < total {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let bound = if seed >> 63 == 0 { 16 } else { 40_000 };
+                    let size = (1 + (seed >> 33) as usize % bound).min(total - sent);
+                    peer.data(1, &stream_bytes(sent, size)).await;
+                    sent += size;
+                    // paced, so the reader catches up and waits for frames
+                    tokio::time::sleep(Duration::from_micros(200)).await;
+                }
+            })
+        };
+        let mut seed: u64 = 85;
+        let mut buffer = vec![0; 70_000];
+        let mut read = 0;
+        let start = std::time::Instant::now();
+        // no CLOSE before the last byte was read: only the frames wake the reader
+        while read < total {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let len = 1 + (seed >> 33) as usize % buffer.len();
+            // a missed wake shows as a stall to the timer, whose wake then
+            // finds the payload: asserted on the elapsed time below
+            let n = tokio::time::timeout(Duration::from_secs(5), io.read(&mut buffer[..len]))
+                .await
+                .expect("the reader wakes")
+                .unwrap();
+            assert!(n > 0, "EOF at byte {read}");
+            assert_eq!(buffer[..n], stream_bytes(read, n)[..], "at byte {read}");
+            read += n;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "every frame wakes the reader: {:?}",
+            start.elapsed()
+        );
+        producer.await.unwrap();
+        let (_, flow) = peer.connections.lookup(1).unwrap();
+        assert!(
+            flow.lock().reader_waits > 0,
+            "precondition: the reader waited"
+        );
+        peer.send(Body::Close(Close { conn_id: 1 })).await;
+        assert_eq!(
+            io.read(&mut buffer).await.unwrap(),
+            0,
+            "EOF after the CLOSE"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_violation_drops_the_inbox() {
+        let peer = peer();
+        let mut io = peer.connections.register(1, WINDOW);
+        feed(&peer, 1, WINDOW as usize).await;
+        assert_eq!(io.inbox_bytes(), WINDOW as usize, "precondition");
+        feed(&peer, 1, 1).await;
+        assert_eq!(io.inbox_capacity(), 0);
+        let error = read_exact(&mut io, 1).await.unwrap_err();
+        assert_eq!(error.to_string(), WINDOW_EXCEEDED);
+    }
+
+    #[tokio::test]
+    async fn the_teardown_drops_the_inbox_and_wakes_the_reader() {
+        let peer = peer();
+        let mut io = peer.connections.register(1, WINDOW);
+        let mut idle = peer.connections.register(2, WINDOW);
+        feed(&peer, 1, 1000).await;
+        assert_eq!(io.inbox_bytes(), 1000, "precondition");
+        let waiting = tokio::spawn(async move { read_exact(&mut idle, 1).await });
+        tokio::task::yield_now().await;
+        let (_, flow) = peer.connections.lookup(2).unwrap();
+        assert!(
+            flow.lock().reader.is_some(),
+            "precondition: the reader waits"
+        );
+        peer.connections.teardown();
+        assert_eq!(io.inbox_capacity(), 0);
+        let error = read_exact(&mut io, 1).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            STREAM_CLOSED,
+            "the buffered payload is not read"
+        );
+        let error = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the waiting reader wakes")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.to_string(), STREAM_CLOSED);
+    }
+
+    #[tokio::test]
+    async fn the_end_of_the_connection_drops_the_inbox() {
+        let peer = peer();
+        let mut io = peer.connections.register(1, WINDOW);
+        feed(&peer, 1, 1000).await;
+        assert_eq!(io.inbox_bytes(), 1000, "precondition");
+        io.ending().finish();
+        assert_eq!(io.inbox_capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn payload_after_the_servers_close_is_not_buffered() {
+        use tokio::io::AsyncReadExt as _;
+        let peer = peer();
+        let mut io = peer.connections.register(1, WINDOW);
+        peer.data(1, b"ab").await;
+        peer.send(Body::Close(Close { conn_id: 1 })).await;
+        peer.data(1, b"cd").await;
+        assert_eq!(io.inbox_bytes(), 2);
+        let mut all = Vec::new();
+        io.read_to_end(&mut all).await.unwrap();
+        assert_eq!(all, b"ab");
+    }
+
+    #[tokio::test]
+    async fn the_servers_error_fails_the_reader_after_the_buffered_payload() {
+        let peer = peer();
+        let mut io = peer.connections.register(1, WINDOW);
+        peer.data(1, b"ab").await;
+        peer.error(1, "boom").await;
+        assert_eq!(read_exact(&mut io, 2).await.unwrap(), b"ab");
+        let error = read_exact(&mut io, 1).await.unwrap_err();
+        assert_eq!(error.to_string(), ABORTED);
+    }
+
+    /// The sniff peeks the inbox in place, across frames: nothing is copied
+    /// out of the window's accounting.
+    #[tokio::test]
+    async fn the_sniff_peeks_the_inbox_across_frames() {
+        let peer = peer();
+        let mut io = peer.connections.register(1, WINDOW);
+        let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        for (i, byte) in preface.iter().enumerate() {
+            peer.data(1, std::slice::from_ref(byte)).await;
+            if i == 0 {
+                assert!(io.fill().await, "bytes arrived");
+            }
+        }
+        assert_eq!(io.buffered(), preface.len());
+        assert!(io.peek_prefix(b"PRI"), "the prefix spans three frames");
+        assert!(!io.peek_prefix(b"PRX"));
+        assert!(io.peek_prefix(preface), "the whole preface");
+        assert_eq!(read_exact(&mut io, preface.len()).await.unwrap(), preface);
+    }
+
+    #[tokio::test]
+    async fn an_empty_payload_ends_the_reader_after_the_buffered_payload() {
+        use tokio::io::AsyncReadExt as _;
+        let peer = peer();
+        let mut io = peer.connections.register(1, WINDOW);
+        peer.data(1, b"ab").await;
+        peer.data(1, b"").await;
+        peer.data(1, b"cd").await;
+        let mut all = Vec::new();
+        io.read_to_end(&mut all).await.unwrap();
+        assert_eq!(all, b"ab");
+    }
+
+    #[tokio::test]
+    async fn an_error_after_the_servers_close_still_ends_the_reader_with_eof() {
+        use tokio::io::AsyncReadExt as _;
+        let peer = peer();
+        let mut io = peer.connections.register(1, WINDOW);
+        peer.data(1, b"ab").await;
+        peer.send(Body::Close(Close { conn_id: 1 })).await;
+        peer.error(1, "boom").await;
+        let mut all = Vec::new();
+        io.read_to_end(&mut all).await.unwrap();
+        assert_eq!(all, b"ab");
     }
 }

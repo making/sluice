@@ -245,7 +245,7 @@ class VirtualConnectionTest {
 	}
 
 	@Test
-	void repeatedRemoteClosedKeepASinglePendingMarker() throws Exception {
+	void repeatedRemoteClosedEndTheStreamOnce() throws Exception {
 		RecordingWriter writer = new RecordingWriter();
 		VirtualConnection connection = new VirtualConnection(10, writer);
 		byte[] chunk = new byte[1000];
@@ -255,20 +255,16 @@ class VirtualConnectionTest {
 		for (int i = 0; i < 1000; i++) {
 			connection.remoteClosed();
 		}
-		assertThat(connection.pendingInbound()).as("the chunks plus one EOF marker").isEqualTo(129);
+		assertThat(connection.bufferedSegments()).as("one segment per legacy frame").isEqualTo(128);
 		byte[] all = connection.source().readNBytes(128 * 1000);
 		assertThat(all).hasSize(128 * 1000);
 		assertThat(connection.source().read()).as("EOF after all data").isEqualTo(-1);
-		// past the consumed EOF the reader stops taking: further markers must not pile up
-		int drained = connection.pendingInbound();
-		for (int i = 0; i < 1000; i++) {
-			connection.remoteClosed();
-		}
-		assertThat(connection.pendingInbound()).as("no growth once the marker was consumed").isEqualTo(drained);
+		connection.remoteClosed();
+		assertThat(connection.source().read()).as("EOF stays").isEqualTo(-1);
 	}
 
 	@Test
-	void repeatedRemoteFailedKeepASinglePendingMarker() throws Exception {
+	void repeatedRemoteFailedEndTheStreamOnce() throws Exception {
 		RecordingWriter writer = new RecordingWriter();
 		VirtualConnection connection = new VirtualConnection(11, writer);
 		byte[] chunk = new byte[1000];
@@ -278,9 +274,10 @@ class VirtualConnectionTest {
 		for (int i = 0; i < 1000; i++) {
 			connection.remoteFailed("boom");
 		}
-		assertThat(connection.pendingInbound()).as("the chunks plus one Failure marker").isEqualTo(129);
+		assertThat(connection.bufferedSegments()).as("one segment per legacy frame").isEqualTo(128);
 		assertThat(connection.source().readNBytes(128 * 1000)).hasSize(128 * 1000);
 		assertThatThrownBy(() -> connection.source().read()).isInstanceOf(IOException.class).hasMessage("boom");
+		assertThat(connection.source().read()).as("EOF after the failure").isEqualTo(-1);
 	}
 
 	/**
@@ -379,7 +376,7 @@ class VirtualConnectionTest {
 		});
 		producer.join(100);
 		assertThat(producer.isAlive()).as("acceptData of a full window returns within 100ms").isFalse();
-		assertThat(connection.pendingInbound()).isEqualTo(200);
+		assertThat(connection.bufferedBytes()).isEqualTo(200 * 1024);
 		assertThat(writer.frames).as("no ERROR within the window").isEmpty();
 	}
 
@@ -571,6 +568,177 @@ class VirtualConnectionTest {
 		connection.abort("dial failed");
 		assertThat(writer.frames).containsExactly("error:32:dial failed");
 		assertThatThrownBy(() -> connection.sink().write('x')).isInstanceOf(IOException.class);
+	}
+
+	/** The byte at {@code position} of the test streams. */
+	private static byte patternAt(long position) {
+		return (byte) (position % 251);
+	}
+
+	private static byte[] pattern(long from, int length) {
+		byte[] bytes = new byte[length];
+		for (int i = 0; i < length; i++) {
+			bytes[i] = patternAt(from + i);
+		}
+		return bytes;
+	}
+
+	@Test
+	void windowedTinyFramesKeepABoundedNumberOfSegments() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		int window = VirtualConnection.DEFAULT_WINDOW;
+		VirtualConnection connection = windowed(30, writer, window, 1);
+		for (int i = 0; i < window; i++) {
+			connection.acceptData(pattern(i, 1));
+		}
+		assertThat(writer.frames).as("precondition: a full window is no violation").isEmpty();
+		assertThat(connection.bufferedBytes()).isEqualTo(window);
+		assertThat(connection.bufferedSegments()).isLessThanOrEqualTo(VirtualConnection.maxSegments(window));
+		assertThat(connection.bufferedCapacity()).isLessThanOrEqualTo(window + 2L * VirtualConnection.SEGMENT_SIZE);
+		assertThat(connection.source().readNBytes(window)).isEqualTo(pattern(0, window));
+		assertThat(connection.bufferedSegments()).as("read segments are dropped").isZero();
+	}
+
+	@Test
+	void windowedFramesOfMixedSizesKeepABoundedNumberOfSegments() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		int window = VirtualConnection.DEFAULT_WINDOW;
+		int segment = VirtualConnection.SEGMENT_SIZE;
+		VirtualConnection connection = windowed(31, writer, window, 1);
+		// sizes around the segment size, so frames straddle segment boundaries
+		int[] sizes = { 1, segment - 1, segment + 1, 2, 3 * segment, 7, segment, 1 };
+		int accepted = 0;
+		for (int i = 0; accepted < window; i++) {
+			int size = Math.min(sizes[i % sizes.length], window - accepted);
+			connection.acceptData(pattern(accepted, size));
+			accepted += size;
+		}
+		assertThat(writer.frames).as("precondition: a full window is no violation").isEmpty();
+		assertThat(connection.bufferedBytes()).isEqualTo(window);
+		assertThat(connection.bufferedSegments()).isLessThanOrEqualTo(VirtualConnection.maxSegments(window));
+		assertThat(connection.bufferedCapacity()).isLessThanOrEqualTo(window + 2L * segment);
+		assertThat(connection.source().readNBytes(window)).isEqualTo(pattern(0, window));
+	}
+
+	/**
+	 * A frame of a whole window, half read and granted, then the granted half again: the
+	 * read half must not stay referenced beside the new payload.
+	 */
+	@Test
+	void windowedReadPartOfALargeFrameIsReleased() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		int window = VirtualConnection.DEFAULT_WINDOW;
+		VirtualConnection connection = windowed(32, writer, window, 1);
+		connection.acceptData(pattern(0, window));
+		assertThat(connection.source().readNBytes(window / 2)).isEqualTo(pattern(0, window / 2));
+		assertThat(writer.frames).as("precondition: half the window granted back")
+			.containsExactly("window:32:" + window / 2);
+		connection.acceptData(pattern(window, window / 2));
+		assertThat(writer.frames).as("precondition: no violation").hasSize(1);
+		assertThat(connection.bufferedBytes()).isEqualTo(window);
+		assertThat(connection.bufferedCapacity()).isLessThanOrEqualTo(window + 2L * VirtualConnection.SEGMENT_SIZE);
+		assertThat(connection.source().readNBytes(window)).isEqualTo(pattern(window / 2, window));
+	}
+
+	@Test
+	void windowedConcurrentFramesAndReadsArriveByteExact() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		int total = 8 * 1024 * 1024;
+		// a window above the total: the producer never waits for grants
+		VirtualConnection connection = windowed(33, writer, 2 * total, 1);
+		java.util.Random sizes = new java.util.Random(58);
+		Thread producer = Thread.ofVirtual().start(() -> {
+			int sent = 0;
+			while (sent < total) {
+				int size = Math.min(1 + sizes.nextInt(sizes.nextBoolean() ? 16 : 40_000), total - sent);
+				connection.acceptData(pattern(sent, size));
+				sent += size;
+				// paced, so the reader catches up and waits for frames
+				java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MICROSECONDS.toNanos(100));
+			}
+		});
+		java.util.Random lengths = new java.util.Random(85);
+		InputStream source = connection.source();
+		byte[] buffer = new byte[70_000];
+		long read = 0;
+		// no end before the last byte was read: only the frames wake the reader (a missed
+		// wake hangs until the class timeout)
+		while (read < total) {
+			int n = source.read(buffer, 0, 1 + lengths.nextInt(buffer.length));
+			assertThat(n).as("no EOF at byte %d", read).isPositive();
+			for (int i = 0; i < n; i++) {
+				if (buffer[i] != patternAt(read + i)) {
+					fail("byte %d differs".formatted(read + i));
+				}
+			}
+			read += n;
+		}
+		producer.join();
+		assertThat(connection.readerWaits()).as("precondition: the reader waited").isPositive();
+		connection.remoteClosed();
+		assertThat(source.read()).as("EOF after the CLOSE").isEqualTo(-1);
+		assertThat(read).isEqualTo(total);
+		assertThat(writer.frames).noneMatch(frame -> frame.startsWith("error"));
+	}
+
+	@Test
+	void closeDropsTheBufferedSegments() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(34, writer, 1000, 1);
+		for (int i = 0; i < 100; i++) {
+			connection.acceptData(new byte[3]);
+		}
+		assertThat(connection.bufferedBytes()).as("precondition").isEqualTo(300);
+		connection.close();
+		assertThat(connection.bufferedSegments()).isZero();
+		assertThat(connection.bufferedCapacity()).isZero();
+		assertThat(connection.source().read()).isEqualTo(-1);
+	}
+
+	@Test
+	void windowExceededDropsTheBufferedSegments() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(35, writer, 1000, 1);
+		for (int i = 0; i < 100; i++) {
+			connection.acceptData(new byte[10]);
+		}
+		assertThat(connection.bufferedBytes()).as("precondition").isEqualTo(1000);
+		connection.acceptData(new byte[1]);
+		assertThat(writer.frames).containsExactly("error:35:flow control window exceeded");
+		assertThat(connection.bufferedSegments()).isZero();
+		assertThat(connection.bufferedCapacity()).isZero();
+	}
+
+	@Test
+	void windowedPayloadAfterTheRemoteClosedIsNotBuffered() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(36, writer, 1000, 1);
+		connection.acceptData("ab".getBytes());
+		connection.remoteClosed();
+		connection.acceptData("cd".getBytes());
+		assertThat(connection.bufferedBytes()).isEqualTo(2);
+		assertThat(connection.source().readAllBytes()).isEqualTo("ab".getBytes());
+	}
+
+	@Test
+	void emptyPayloadEndsTheStreamAfterTheBufferedData() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = windowed(37, writer, 1000, 1);
+		connection.acceptData("ab".getBytes());
+		connection.acceptData(new byte[0]);
+		connection.acceptData("cd".getBytes());
+		assertThat(connection.source().readAllBytes()).isEqualTo("ab".getBytes());
+	}
+
+	@Test
+	void legacyFramesStayOneSegmentEach() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = new VirtualConnection(38, writer);
+		for (int i = 0; i < 100; i++) {
+			connection.acceptData(pattern(i, 1));
+		}
+		assertThat(connection.bufferedSegments()).isEqualTo(100);
+		assertThat(connection.source().readNBytes(100)).isEqualTo(pattern(0, 100));
 	}
 
 }

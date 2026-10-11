@@ -18,12 +18,13 @@ public final class ConnectionLimit {
 
 	/**
 	 * The most one relayed virtual connection buffers on one side of the tunnel: its
-	 * receive window ({@link VirtualConnection#DEFAULT_WINDOW}), the cap of its send
-	 * queue ({@link SessionSender#MAX_QUEUED_PAYLOAD}) and the buffers of the relay's two
+	 * receive buffer ({@link VirtualConnection#MAX_RECEIVE_BUFFER}: the window plus the
+	 * segments' slack and overhead), the cap of its send queue
+	 * ({@link SessionSender#MAX_QUEUED_PAYLOAD}) and the buffers of the relay's two
 	 * pumps.
 	 */
-	public static final long CONNECTION_BYTES = (long) VirtualConnection.DEFAULT_WINDOW
-			+ SessionSender.MAX_QUEUED_PAYLOAD + 2L * StreamRelay.BUFFER_SIZE;
+	public static final long CONNECTION_BYTES = VirtualConnection.MAX_RECEIVE_BUFFER + SessionSender.MAX_QUEUED_PAYLOAD
+			+ 2L * StreamRelay.BUFFER_SIZE;
 
 	/** The ERROR message a CONNECT beyond the limit is answered with. */
 	public static final String LIMIT_REACHED = "connection limit reached";

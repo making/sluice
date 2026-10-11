@@ -527,9 +527,11 @@ access log lines. The client caps its upstream connections over every node
 (`sluice.client.max-connections`): a `CONNECT` beyond it gets an ERROR without a dial, and
 the server closes the public connection.
 
-The most one relayed connection buffers on each side of the tunnel is its receive window
-(1MiB) + its send queue cap (16 x 64KiB = 1MiB) + the two relay buffers (2 x 64KiB) =
-2.125MiB.
+The most one relayed connection buffers on each side of the tunnel is its receive buffer
++ its send queue cap (16 x 64KiB = 1MiB) + the two relay buffers (2 x 64KiB) = 2.16MiB.
+The receive buffer holds at most the 1MiB window of unread payload, coalesced into 16KiB
+segments whatever the size of the DATA frames, plus 37KiB: a partly read and a partly
+filled segment, and the overhead of at most 80 segments.
 
 h2 (plaintext and TLS-terminated) relays each stream to a virtual connection of its
 route, one per route the connection reaches: every one beyond the first takes a slot of
@@ -548,13 +550,13 @@ connection window it still holds, and per stream a buffer rounding (under 1KiB),
 and a window update, about 295KiB (`Http2DemuxRelay.UNBUDGETED_BYTES`).
 
 An unset (`0`) budget is an eighth of half the max heap, and an unset (`0`) connection
-limit is derived so that the worst case of every slot (2.125MiB + 295KiB) and the budget
-fit in half the max heap: `max(1, (max heap / 2 - budget) / 2.41MiB)`, e.g. 72 for a
-400MiB heap, 742 for 4GiB. The effective values are logged at startup (`data plane
+limit is derived so that the worst case of every slot (2.16MiB + 295KiB) and the budget
+fit in half the max heap: `max(1, (max heap / 2 - budget) / 2.45MiB)`, e.g. 71 for a
+400MiB heap, 731 for 4GiB. The effective values are logged at startup (`data plane
 connection limit` / `upstream connection limit`) and exported as gauges; with the 512Mi
 container of `k8s.md` they follow the heap the server gets there. Not within that bound:
-- tiny DATA frames: the window counts payload bytes, each buffered frame adds its own
-  object overhead.
+the send queue of a connection that already ended, whose slot is free while its frames
+still wait for the stream (up to 1MiB each while the stream is not ready).
 
 ## Health / metrics
 

@@ -75,7 +75,8 @@ const BACKOFF_MAX_SECS: u64 = 30;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default of `--max-connections`: 256 connections x one 1MiB receive window
-/// = 256MiB of the server's payload buffered at most.
+/// (plus at most two partly used 16KiB segments and 80 segments' overhead
+/// each) = about 265MiB of the server's payload buffered at most.
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;

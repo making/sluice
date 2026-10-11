@@ -6,9 +6,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
+import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Objects;
-import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -20,27 +20,29 @@ import java.util.concurrent.locks.ReentrantLock;
  * One multiplexed virtual TCP connection over the tunnel stream (the port of
  * remotedialer's connection.go).
  * <p>
- * The inbound direction is an unbounded-number-of-writers / single-reader queue; close
- * and failure markers are never delayed by the DATA bound. The outbound direction
- * forwards to the session's {@link FrameWriter}. CLOSE is honored as a half-close so the
- * opposite direction may keep flowing (required for HTTP keep-alive and half-duplex
- * protocols).
+ * The inbound direction buffers the remote's payload in segments for a single reader; the
+ * end of the stream (the remote's CLOSE or ERROR) is never delayed by the DATA bound. The
+ * outbound direction forwards to the session's {@link FrameWriter}. CLOSE is honored as a
+ * half-close so the opposite direction may keep flowing (required for HTTP keep-alive and
+ * half-duplex protocols).
  * <p>
  * A connection runs in one of two flow control modes, fixed at construction:
  * <ul>
  * <li><b>Windowed</b> ({@link #builder}): credit-based per-connection flow control. The
  * remote may have at most the receive window of DATA payload in flight beyond what this
  * side granted back; {@link #acceptData(byte[])} never blocks, and payload past the
- * window fails only this connection ({@code flow control window exceeded}). The reader
- * grants the bytes it consumed once they reach half the window. The writer sends only
- * against the credit the remote granted and waits for more on its own thread; the credit
- * lock is never held while the frame writer is called, so a grant on the receive path
- * never waits for a blocked writer. Closing while the remote may still send tells it to
- * stop with an ERROR, since a remote waiting for credit would otherwise wait
+ * window fails only this connection ({@code flow control window exceeded}). The payload
+ * is coalesced into segments of at most {@link #SEGMENT_SIZE}, so the buffer stays within
+ * {@link #MAX_RECEIVE_BUFFER} for the default window whatever the size of the frames. The
+ * reader grants the bytes it consumed once they reach half the window. The writer sends
+ * only against the credit the remote granted and waits for more on its own thread; the
+ * credit lock is never held while the frame writer is called, so a grant on the receive
+ * path never waits for a blocked writer. Closing while the remote may still send tells it
+ * to stop with an ERROR, since a remote waiting for credit would otherwise wait
  * forever.</li>
  * <li><b>Legacy</b> ({@link #VirtualConnection(long, FrameWriter)}): for peers without
- * per-connection flow control. {@link #acceptData(byte[])} blocks while 128 chunks are
- * buffered, propagating backpressure to the whole gRPC stream.</li>
+ * per-connection flow control. {@link #acceptData(byte[])} blocks while 128 frames are
+ * buffered, one segment each, propagating backpressure to the whole gRPC stream.</li>
  * </ul>
  */
 public final class VirtualConnection implements AutoCloseable {
@@ -54,20 +56,50 @@ public final class VirtualConnection implements AutoCloseable {
 	/** The ERROR message sent for payload beyond the granted window. */
 	public static final String WINDOW_EXCEEDED = "flow control window exceeded";
 
-	private static final int QUEUE_CAPACITY = 128; // x 64KiB chunks
+	/**
+	 * Windowed mode: the most payload one receive segment holds. Small frames are
+	 * coalesced into segments and large ones split, so neither the per-segment overhead
+	 * nor the read part of the head segment grows with the way the remote frames its
+	 * payload.
+	 */
+	static final int SEGMENT_SIZE = 16 * 1024;
 
-	private sealed interface Inbound permits Chunk, Eof, Failure {
+	/**
+	 * The heap one receive segment costs beyond its payload capacity, rounded up: the
+	 * segment object, the array header and its deque slots (about 50 bytes measured with
+	 * compressed oops).
+	 */
+	static final int SEGMENT_OVERHEAD = 64;
+
+	/**
+	 * The most heap the receive buffer of a windowed connection with the
+	 * {@link #DEFAULT_WINDOW} holds: the window of unread payload, the read part of the
+	 * head segment and the room of the tail segment (under one segment each), and the
+	 * overhead of {@link #maxSegments} segments.
+	 */
+	static final long MAX_RECEIVE_BUFFER = DEFAULT_WINDOW + 2L * SEGMENT_SIZE
+			+ (long) maxSegments(DEFAULT_WINDOW) * SEGMENT_OVERHEAD;
+
+	private static final int QUEUE_CAPACITY = 128; // legacy: frames, x 64KiB
+
+	/** A receive segment: the payload is {@code data[0, length)}. */
+	private static final class Segment {
+
+		final byte[] data;
+
+		int length;
+
+		Segment(int capacity) {
+			this.data = new byte[capacity];
+		}
 
 	}
 
-	private record Chunk(byte[] data) implements Inbound {
+	/** The end of the inbound stream: EOF, or a failure the reader gets. */
+	private record End(@Nullable String failure) {
 	}
 
-	private record Eof() implements Inbound {
-	}
-
-	private record Failure(String message) implements Inbound {
-	}
+	private static final End EOF = new End(null);
 
 	private final long connectionId;
 
@@ -76,12 +108,38 @@ public final class VirtualConnection implements AutoCloseable {
 	/** The receive window announced to the remote; 0 in legacy mode. */
 	private final int receiveWindow;
 
-	private final LinkedBlockingDeque<Inbound> inbound = new LinkedBlockingDeque<>();
+	/**
+	 * Guards the receive buffer and its end. Held for O(1) work and the copy of one frame
+	 * or one read only, never while waiting, so the receive path never waits on the
+	 * reader.
+	 */
+	private final ReentrantLock inboundLock = new ReentrantLock();
+
+	/** Signals the reader: payload, the end. */
+	private final Condition inboundChanged = this.inboundLock.newCondition();
 
 	/**
-	 * Legacy mode: bounds the buffered DATA chunks; released by {@link Source#read}.
-	 * Markers are not counted, so remote close/failure can never be delayed by the data
-	 * bound.
+	 * The payload received and not yet read, in order; guarded by {@link #inboundLock}.
+	 */
+	private final ArrayDeque<Segment> segments = new ArrayDeque<>();
+
+	/** The read offset in the head segment; guarded by {@link #inboundLock}. */
+	private int headPosition;
+
+	/** Test hook: the times the reader waited; guarded by {@link #inboundLock}. */
+	private long readerWaits;
+
+	/**
+	 * How the inbound stream ends once the segments are read; null while open. The first
+	 * end the remote sends stays, and payload after it is dropped; {@link #close()} and a
+	 * window violation replace it, dropping the segments. Guarded by
+	 * {@link #inboundLock}.
+	 */
+	private @Nullable End end;
+
+	/**
+	 * Legacy mode: bounds the buffered DATA frames; released by {@link Source#read}. The
+	 * end is not counted, so remote close/failure can never be delayed by the data bound.
 	 */
 	private final Semaphore inboundPermits = new Semaphore(QUEUE_CAPACITY);
 
@@ -103,11 +161,6 @@ public final class VirtualConnection implements AutoCloseable {
 	private volatile boolean closed;
 
 	private volatile boolean readClosed;
-
-	/** A marker of each kind is queued at most once; reset when the queue is cleared. */
-	private final AtomicBoolean eofPending = new AtomicBoolean();
-
-	private final AtomicBoolean failurePending = new AtomicBoolean();
 
 	/** This side sent an ERROR for the connection; at most one is sent. */
 	private final AtomicBoolean errorSent = new AtomicBoolean();
@@ -191,20 +244,25 @@ public final class VirtualConnection implements AutoCloseable {
 	}
 
 	/**
-	 * Feeds a chunk received from the remote side. Windowed: never blocks; payload past
-	 * the receive window fails the connection. Legacy: blocks while the DATA bound (128
-	 * chunks) is reached, which applies backpressure to the gRPC stream. Markers queued
-	 * by {@link #remoteClosed()} / {@link #remoteFailed(String)} are never delayed.
+	 * Feeds a payload received from the remote side; it is copied. Windowed: never
+	 * blocks; payload past the receive window fails the connection. Legacy: blocks while
+	 * the DATA bound (128 frames) is reached, which applies backpressure to the gRPC
+	 * stream. The end set by {@link #remoteClosed()} / {@link #remoteFailed(String)} is
+	 * never delayed. An empty payload ends the stream like the remote's CLOSE, after the
+	 * buffered payload.
 	 */
 	public void acceptData(byte[] data) {
 		if (this.readClosed || this.closed) {
+			return;
+		}
+		if (data.length == 0) {
+			endWith(EOF);
 			return;
 		}
 		if (windowed()) {
 			acceptWindowed(data);
 			return;
 		}
-		Chunk chunk = new Chunk(Arrays.copyOf(data, data.length));
 		while (!this.closed && !this.readClosed) {
 			boolean acquired;
 			try {
@@ -219,12 +277,9 @@ public final class VirtualConnection implements AutoCloseable {
 			if (!acquired) {
 				continue;
 			}
-			if (this.closed || this.readClosed) {
-				this.inboundPermits.release(); // the chunk would be dropped; keep the
-												// permit
-				return;
+			if (this.closed || this.readClosed || !append(data, false)) {
+				this.inboundPermits.release(); // the frame was dropped: keep the permit
 			}
-			this.inbound.offerLast(chunk);
 			return;
 		}
 	}
@@ -234,7 +289,102 @@ public final class VirtualConnection implements AutoCloseable {
 			failWindowExceeded();
 			return;
 		}
-		this.inbound.offerLast(new Chunk(Arrays.copyOf(data, data.length)));
+		append(data, true);
+	}
+
+	/**
+	 * Appends a copy of the payload unless the stream already ended; false when dropped.
+	 * Coalescing (windowed) fills the tail segment's room first; legacy appends one
+	 * segment per frame, which its frame bound counts.
+	 */
+	private boolean append(byte[] data, boolean coalesce) {
+		this.inboundLock.lock();
+		try {
+			if (this.end != null) {
+				return false;
+			}
+			if (coalesce) {
+				appendCoalesced(data);
+			}
+			else {
+				Segment segment = new Segment(data.length);
+				System.arraycopy(data, 0, segment.data, 0, data.length);
+				segment.length = data.length;
+				this.segments.addLast(segment);
+			}
+			this.inboundChanged.signalAll();
+			return true;
+		}
+		finally {
+			this.inboundLock.unlock();
+		}
+	}
+
+	/**
+	 * Fills the tail segment's room, then appends segments of at most
+	 * {@link #SEGMENT_SIZE}, each at least twice the capacity of the one before it (up to
+	 * the segment size) or the rest of the payload, so every segment but the tail is full
+	 * and at most log2({@link #SEGMENT_SIZE}) are smaller than the segment size
+	 * ({@link #maxSegments}). The first segment of an empty buffer fits the payload: a
+	 * reader that keeps up costs one exact allocation per frame.
+	 */
+	private void appendCoalesced(byte[] data) {
+		Segment tail = this.segments.peekLast();
+		int offset = 0;
+		while (offset < data.length) {
+			int remaining = data.length - offset;
+			if (tail == null || tail.length == tail.data.length) {
+				int capacity = (tail == null) ? Math.min(remaining, SEGMENT_SIZE)
+						: Math.min(SEGMENT_SIZE, Math.max(remaining, 2 * tail.data.length));
+				tail = new Segment(capacity);
+				this.segments.addLast(tail);
+			}
+			int n = Math.min(remaining, tail.data.length - tail.length);
+			System.arraycopy(data, offset, tail.data, tail.length, n);
+			tail.length += n;
+			offset += n;
+		}
+	}
+
+	/**
+	 * The most segments the receive buffer of a windowed connection holds: segments
+	 * smaller than {@link #SEGMENT_SIZE} at least double one after another, so at most
+	 * log2({@link #SEGMENT_SIZE}) of them; every full-size one but the head and the tail
+	 * holds only unread payload, which the window bounds.
+	 */
+	static int maxSegments(int receiveWindow) {
+		return receiveWindow / SEGMENT_SIZE + Integer.numberOfTrailingZeros(SEGMENT_SIZE) + 2;
+	}
+
+	/** Ends the inbound stream after the buffered payload, unless it already ended. */
+	private void endWith(End end) {
+		this.inboundLock.lock();
+		try {
+			if (this.end == null) {
+				this.end = end;
+				this.inboundChanged.signalAll();
+			}
+		}
+		finally {
+			this.inboundLock.unlock();
+		}
+	}
+
+	/**
+	 * Drops the buffered payload and ends the inbound stream at once with {@code end}.
+	 */
+	private void dropInbound(End end) {
+		this.inboundLock.lock();
+		try {
+			this.segments.clear(); // legacy: the dropped frames' permits die with the
+									// connection
+			this.headPosition = 0;
+			this.end = end;
+			this.inboundChanged.signalAll();
+		}
+		finally {
+			this.inboundLock.unlock();
+		}
 	}
 
 	/**
@@ -255,10 +405,7 @@ public final class VirtualConnection implements AutoCloseable {
 		}
 		sendErrorOnce(WINDOW_EXCEEDED);
 		this.failure = WINDOW_EXCEEDED;
-		this.inbound.clear();
-		this.eofPending.set(false);
-		this.failurePending.set(false);
-		this.offerMarker(this.failurePending, new Failure(WINDOW_EXCEEDED));
+		dropInbound(new End(WINDOW_EXCEEDED));
 	}
 
 	private void sendErrorOnce(String message) {
@@ -293,14 +440,14 @@ public final class VirtualConnection implements AutoCloseable {
 	 */
 	public void remoteClosed() {
 		this.remoteDone = true;
-		this.offerMarker(this.eofPending, new Eof());
+		endWith(EOF);
 	}
 
 	/** The remote terminated the connection abnormally. */
 	public void remoteFailed(String message) {
 		this.remoteDone = true;
 		this.failure = message;
-		this.offerMarker(this.failurePending, new Failure(message == null ? "remote failure" : message));
+		endWith(new End(message == null ? "remote failure" : message));
 		if (windowed()) {
 			signalCredit(); // the remote grants nothing more
 		}
@@ -316,19 +463,48 @@ public final class VirtualConnection implements AutoCloseable {
 		}
 	}
 
-	/** Queues the marker unless one of its kind still waits unread in the queue. */
-	private void offerMarker(AtomicBoolean pending, Inbound marker) {
-		if (!pending.compareAndSet(false, true)) {
-			return;
+	/** Test hook: the segments of the receive buffer. */
+	int bufferedSegments() {
+		this.inboundLock.lock();
+		try {
+			return this.segments.size();
 		}
-		this.inbound.offerLast(marker);
+		finally {
+			this.inboundLock.unlock();
+		}
 	}
 
-	/**
-	 * Number of entries waiting in the inbound queue; for tests.
-	 */
-	int pendingInbound() {
-		return this.inbound.size();
+	/** Test hook: the times the reader waited for payload or the end. */
+	long readerWaits() {
+		this.inboundLock.lock();
+		try {
+			return this.readerWaits;
+		}
+		finally {
+			this.inboundLock.unlock();
+		}
+	}
+
+	/** Test hook: the payload received and not yet read. */
+	long bufferedBytes() {
+		this.inboundLock.lock();
+		try {
+			return this.segments.stream().mapToLong(segment -> segment.length).sum() - this.headPosition;
+		}
+		finally {
+			this.inboundLock.unlock();
+		}
+	}
+
+	/** Test hook: the payload capacity the segments hold, read, unread or empty. */
+	long bufferedCapacity() {
+		this.inboundLock.lock();
+		try {
+			return this.segments.stream().mapToLong(segment -> segment.data.length).sum();
+		}
+		finally {
+			this.inboundLock.unlock();
+		}
 	}
 
 	/**
@@ -346,11 +522,7 @@ public final class VirtualConnection implements AutoCloseable {
 		}
 		this.closed = true;
 		this.readClosed = true;
-		this.inbound.clear(); // the dropped chunks' permits die with the connection
-		this.eofPending.set(false);
-		this.failurePending.set(false);
-		this.offerMarker(this.eofPending, new Eof()); // wake a blocked reader; queue was
-														// cleared
+		dropInbound(EOF); // wakes a blocked reader
 	}
 
 	/**
@@ -452,13 +624,8 @@ public final class VirtualConnection implements AutoCloseable {
 
 	private final class Source extends InputStream {
 
-		private byte @Nullable [] pending;
-
-		private int pendingPos;
-
-		private int pendingLength;
-
-		private boolean eofSeen;
+		/** The end was returned (EOF or the failure); later reads return EOF. */
+		private boolean endSeen;
 
 		/** Windowed mode: bytes handed to the reader and not yet granted back. */
 		private long consumed;
@@ -479,48 +646,67 @@ public final class VirtualConnection implements AutoCloseable {
 			if (len == 0) {
 				return 0;
 			}
-			while (true) {
-				if (this.pending != null) {
-					int n = Math.min(len, this.pendingLength - this.pendingPos);
-					System.arraycopy(this.pending, this.pendingPos, b, off, n);
-					this.pendingPos += n;
-					if (this.pendingPos == this.pendingLength) {
-						this.pending = null;
-					}
-					consumed(n);
-					return n;
-				}
-				if (this.eofSeen) {
-					return -1;
-				}
-				Inbound inbound;
-				try {
-					inbound = VirtualConnection.this.inbound.take();
-				}
-				catch (InterruptedException e) {
-					Thread.currentThread().interrupt();
-					throw new IOException("interrupted while waiting for inbound data", e);
-				}
-				switch (inbound) {
-					case Chunk chunk -> {
-						if (!windowed()) {
-							VirtualConnection.this.inboundPermits.release();
-						}
-						if (chunk.data().length == 0) {
-							this.eofSeen = true;
+			if (this.endSeen) {
+				return -1;
+			}
+			int n = take(b, off, len);
+			if (n < 0) {
+				return -1;
+			}
+			consumed(n);
+			return n;
+		}
+
+		/**
+		 * Copies up to {@code len} buffered bytes, across segments, waiting while the
+		 * buffer is empty and the stream has not ended; -1 at the end.
+		 */
+		private int take(byte[] b, int off, int len) throws IOException {
+			VirtualConnection.this.inboundLock.lock();
+			try {
+				while (true) {
+					int n = 0;
+					Segment head;
+					while (n < len && (head = VirtualConnection.this.segments.peekFirst()) != null) {
+						int position = VirtualConnection.this.headPosition;
+						int copied = Math.min(len - n, head.length - position);
+						System.arraycopy(head.data, position, b, off + n, copied);
+						n += copied;
+						if (position + copied == head.length) {
+							VirtualConnection.this.segments.pollFirst();
+							VirtualConnection.this.headPosition = 0;
+							if (!windowed()) {
+								VirtualConnection.this.inboundPermits.release();
+							}
 						}
 						else {
-							this.pending = chunk.data();
-							this.pendingPos = 0;
-							this.pendingLength = chunk.data().length;
+							VirtualConnection.this.headPosition = position + copied;
 						}
 					}
-					case Eof eof -> this.eofSeen = true;
-					case Failure failure -> {
-						this.eofSeen = true;
-						throw new IOException(failure.message());
+					if (n > 0) {
+						return n;
+					}
+					End end = VirtualConnection.this.end;
+					if (end != null) {
+						this.endSeen = true;
+						String failure = end.failure();
+						if (failure != null) {
+							throw new IOException(failure);
+						}
+						return -1;
+					}
+					try {
+						VirtualConnection.this.readerWaits++;
+						VirtualConnection.this.inboundChanged.await();
+					}
+					catch (InterruptedException e) {
+						Thread.currentThread().interrupt();
+						throw new IOException("interrupted while waiting for inbound data", e);
 					}
 				}
+			}
+			finally {
+				VirtualConnection.this.inboundLock.unlock();
 			}
 		}
 
