@@ -85,6 +85,7 @@ in the same investigation is todo 042.
 | 052-sender-cap-wait-ignores-connection-close | 051 review follow-up (teardown hang) | Medium | before or with 046 |
 | 046-per-connection-flow-control-java | F1 (protocol + Java) | High | 043, 044, 045 |
 | 047-per-connection-flow-control-wasmlet | F5 | High | 046 |
+| 056-wasmlet-outbound-fair-scheduling | F4 on the wasmlet (047 review follow-up) | Medium | 047 |
 | 048-data-plane-connection-limits | memory bound (see "Residual after the children") | Medium | - (defaults derive from 044-046) |
 | 054-remove-legacy-flow-control | legacy removal (see "Follow-up"; not a child, the parent does not wait for it) | Medium | 047; no pre-046/047 peer deployed |
 
@@ -160,7 +161,9 @@ message Connect {
 What 043-048 still leave open, by design or elsewhere. Do not report the parent as
 "HOL solved" without these caveats.
 - Legacy peers keep the stream-wide stall on their connections until legacy removal
-  (follow-up below).
+  (follow-up below). This includes the wasmlet behind a pre-046 server (047 confirmed
+  the stall in a test: the receive loop waits on a connection whose guest stopped
+  reading).
 - wasmlet: a CPU-bound guest stalls every connection by holding a tokio worker (042, not
   a tunnel mechanism).
 - Inside one public connection, h1 is sequential and h2 shares one TCP socket to the
