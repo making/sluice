@@ -193,7 +193,9 @@ class SessionSenderTest {
 			assertThat(sender.sendData(2, new byte[1])).isTrue();
 			observer.becomeReady();
 			awaitSentFrames(observer, 2);
-			assertThat(observer.sent.subList(0, 2)).as("connection 2's frame is among the first 2 written")
+			// snapshot: the worker keeps appending while the assertion runs
+			List<Frame> firstTwo = List.copyOf(observer.sent.subList(0, 2));
+			assertThat(firstTwo).as("connection 2's frame is among the first 2 written")
 				.anyMatch(SessionSenderTest::isDataForConnection2);
 			bulk.join(TimeUnit.SECONDS.toMillis(5));
 			assertThat(bulk.isAlive()).as("bulk producer drained").isFalse();
@@ -351,6 +353,27 @@ class SessionSenderTest {
 		finally {
 			sender.close();
 		}
+	}
+
+	@Test
+	void closeReturnsWithFullQueueOnReadyStream() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.ready.set(true);
+		SessionSender sender = new SessionSender(observer);
+		sender.start();
+		// the worker takes one frame and parks inside onNext; then fill the queue to the
+		// per-connection cap
+		assertThat(sender.sendData(1, new byte[1])).isTrue();
+		assertThat(observer.enteredOnNext.await(5, TimeUnit.SECONDS)).isTrue();
+		for (int i = 0; i < SessionSender.DATA_QUEUE_CAPACITY; i++) {
+			assertThat(sender.sendData(1, new byte[1])).isTrue();
+		}
+		Thread closer = Thread.ofVirtual().start(sender::close);
+		Thread.sleep(200);
+		// the stream is healthy: the worker resumes and drains
+		observer.gate.countDown();
+		closer.join(TimeUnit.SECONDS.toMillis(10));
+		assertThat(closer.isAlive()).as("close returns with a full queue on a ready stream").isFalse();
 	}
 
 }

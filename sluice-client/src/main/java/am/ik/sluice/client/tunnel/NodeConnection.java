@@ -348,12 +348,14 @@ public final class NodeConnection implements AutoCloseable {
 			@Override
 			public void onError(Throwable t) {
 				log.info("[{}] tunnel stream error: {}", NodeConnection.this.key, t.toString());
+				markCallClosed();
 				closed.countDown();
 			}
 
 			@Override
 			public void onCompleted() {
 				log.info("[{}] tunnel stream closed by server", NodeConnection.this.key);
+				markCallClosed();
 				closed.countDown();
 			}
 
@@ -375,8 +377,23 @@ public final class NodeConnection implements AutoCloseable {
 		this.readvertiseBackoff = BACKOFF_INITIAL_SECONDS;
 		sender.sendAdvertise(this.advertised);
 		closed.await();
-		this.closeConnections();
+		// the sender first, as in TunnelSession#close: a dead or stalled stream must not
+		// leave the connection teardown below waiting on a full send queue (closing the
+		// sender releases every producer); from here on the frames of the closing
+		// connections are dropped, the peer is gone anyway
 		sender.close();
+		this.closeConnections();
+	}
+
+	/**
+	 * The receive side of the stream ended: producers and the worker parked on the sender
+	 * give up without waiting for the session teardown.
+	 */
+	private void markCallClosed() {
+		SessionSender sender = this.senderRef.get();
+		if (sender != null) {
+			sender.markCallClosed();
+		}
 	}
 
 	/**

@@ -6,9 +6,11 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.Arrays;
-import java.util.concurrent.LinkedBlockingDeque;
 import java.util.Objects;
+import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -64,6 +66,11 @@ public final class VirtualConnection implements AutoCloseable {
 
 	private volatile boolean readClosed;
 
+	/** A marker of each kind is queued at most once; reset when the queue is cleared. */
+	private final AtomicBoolean eofPending = new AtomicBoolean();
+
+	private final AtomicBoolean failurePending = new AtomicBoolean();
+
 	private volatile boolean writeClosed;
 
 	private volatile @Nullable String failure;
@@ -97,31 +104,56 @@ public final class VirtualConnection implements AutoCloseable {
 			return;
 		}
 		Chunk chunk = new Chunk(Arrays.copyOf(data, data.length));
-		try {
-			this.inboundPermits.acquire();
-		}
-		catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
+		while (!this.closed && !this.readClosed) {
+			boolean acquired;
+			try {
+				// bounded: close() drops the queued chunks instead of releasing their
+				// permits, so a producer parked here must recheck the flags on its own
+				acquired = this.inboundPermits.tryAcquire(100, TimeUnit.MILLISECONDS);
+			}
+			catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				return;
+			}
+			if (!acquired) {
+				continue;
+			}
+			if (this.closed || this.readClosed) {
+				this.inboundPermits.release(); // the chunk would be dropped; keep the
+												// permit
+				return;
+			}
+			this.inbound.offerLast(chunk);
 			return;
 		}
-		if (this.readClosed || this.closed) {
-			this.inboundPermits.release();
-			return;
-		}
-		this.inbound.offerLast(chunk);
 	}
 
 	/**
 	 * The remote half-closed its -> local direction; the local side may continue writing.
 	 */
 	public void remoteClosed() {
-		this.inbound.offerLast(new Eof());
+		this.offerMarker(this.eofPending, new Eof());
 	}
 
 	/** The remote terminated the connection abnormally. */
 	public void remoteFailed(String message) {
 		this.failure = message;
-		this.inbound.offerLast(new Failure(message == null ? "remote failure" : message));
+		this.offerMarker(this.failurePending, new Failure(message == null ? "remote failure" : message));
+	}
+
+	/** Queues the marker unless one of its kind still waits unread in the queue. */
+	private void offerMarker(AtomicBoolean pending, Inbound marker) {
+		if (!pending.compareAndSet(false, true)) {
+			return;
+		}
+		this.inbound.offerLast(marker);
+	}
+
+	/**
+	 * Number of entries waiting in the inbound queue; for tests.
+	 */
+	int pendingInbound() {
+		return this.inbound.size();
 	}
 
 	@Override
@@ -129,8 +161,11 @@ public final class VirtualConnection implements AutoCloseable {
 		this.closeSink();
 		this.closed = true;
 		this.readClosed = true;
-		this.inbound.clear();
-		this.inbound.offer(new Eof()); // wake a blocked reader; queue was cleared
+		this.inbound.clear(); // the dropped chunks' permits die with the connection
+		this.eofPending.set(false);
+		this.failurePending.set(false);
+		this.offerMarker(this.eofPending, new Eof()); // wake a blocked reader; queue was
+														// cleared
 	}
 
 	private void closeSink() {

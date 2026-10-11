@@ -204,4 +204,65 @@ class VirtualConnectionTest {
 		assertThatThrownBy(() -> connection.source().read()).isInstanceOf(IOException.class).hasMessage("boom");
 	}
 
+	@Test
+	void acceptDataBlockedOnFullBoundReturnsAfterClose() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = new VirtualConnection(9, writer);
+		byte[] chunk = new byte[1000];
+		for (int i = 0; i < 128; i++) { // fill the 128-chunk inbound bound
+			connection.acceptData(chunk);
+		}
+		CountDownLatch entered = new CountDownLatch(1);
+		Thread producer = Thread.ofVirtual().start(() -> {
+			entered.countDown();
+			connection.acceptData(chunk);
+		});
+		assertThat(entered.await(1, TimeUnit.SECONDS)).isTrue();
+		Thread.sleep(200);
+		assertThat(producer.isAlive()).as("precondition: producer parked on the full bound").isTrue();
+		// the local side gives up on the connection (relay ended)
+		connection.close();
+		producer.join(1000);
+		assertThat(producer.isAlive()).as("acceptData returns once the connection is closed").isFalse();
+	}
+
+	@Test
+	void repeatedRemoteClosedKeepASinglePendingMarker() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = new VirtualConnection(10, writer);
+		byte[] chunk = new byte[1000];
+		for (int i = 0; i < 128; i++) { // fill the 128-chunk inbound bound
+			connection.acceptData(chunk);
+		}
+		for (int i = 0; i < 1000; i++) {
+			connection.remoteClosed();
+		}
+		assertThat(connection.pendingInbound()).as("the chunks plus one EOF marker").isEqualTo(129);
+		byte[] all = connection.source().readNBytes(128 * 1000);
+		assertThat(all).hasSize(128 * 1000);
+		assertThat(connection.source().read()).as("EOF after all data").isEqualTo(-1);
+		// past the consumed EOF the reader stops taking: further markers must not pile up
+		int drained = connection.pendingInbound();
+		for (int i = 0; i < 1000; i++) {
+			connection.remoteClosed();
+		}
+		assertThat(connection.pendingInbound()).as("no growth once the marker was consumed").isEqualTo(drained);
+	}
+
+	@Test
+	void repeatedRemoteFailedKeepASinglePendingMarker() throws Exception {
+		RecordingWriter writer = new RecordingWriter();
+		VirtualConnection connection = new VirtualConnection(11, writer);
+		byte[] chunk = new byte[1000];
+		for (int i = 0; i < 128; i++) { // fill the 128-chunk inbound bound
+			connection.acceptData(chunk);
+		}
+		for (int i = 0; i < 1000; i++) {
+			connection.remoteFailed("boom");
+		}
+		assertThat(connection.pendingInbound()).as("the chunks plus one Failure marker").isEqualTo(129);
+		assertThat(connection.source().readNBytes(128 * 1000)).hasSize(128 * 1000);
+		assertThatThrownBy(() -> connection.source().read()).isInstanceOf(IOException.class).hasMessage("boom");
+	}
+
 }

@@ -25,6 +25,7 @@ import am.ik.sluice.v1.proto.Node;
 import am.ik.sluice.v1.proto.Drain;
 import am.ik.sluice.v1.proto.Upstream;
 import io.grpc.stub.CallStreamObserver;
+import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 
 /**
@@ -84,6 +85,9 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 	private volatile boolean running = true;
 
+	/** The receive side observed the end of the call; waiters give up. */
+	private volatile boolean callClosed;
+
 	/**
 	 * The connection served last; the round-robin resumes after it. Guarded by
 	 * {@link #lock}.
@@ -132,13 +136,32 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		this.workerThread = thread;
 	}
 
+	/**
+	 * True once no more frames can reach the peer: the sender stopped, or the call is
+	 * closed / cancelled. The client observer has no liveness probe, so the owner marks
+	 * it via {@link #markCallClosed()} when the receive side ends.
+	 */
+	private boolean callClosed() {
+		return this.callClosed || this.outbound instanceof ServerCallStreamObserver<?> server && server.isCancelled();
+	}
+
+	/**
+	 * Marks the underlying call as closed: the worker parked on readiness and producers
+	 * parked on the per-connection cap give up instead of waiting for {@link #close()}.
+	 * Idempotent; the sender stays usable for a final {@link #close()}.
+	 */
+	public void markCallClosed() {
+		this.callClosed = true;
+		this.wakeWaiters();
+	}
+
 	private boolean awaitReady() {
 		if (!(this.outbound instanceof CallStreamObserver<?> call) || call.isReady()) {
 			return true;
 		}
 		this.lock.lock();
 		try {
-			while (this.running && !call.isReady()) {
+			while (this.running && !callClosed() && !call.isReady()) {
 				try {
 					this.activity.awaitNanos(TimeUnit.MILLISECONDS.toNanos(100));
 				}
@@ -151,7 +174,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		finally {
 			lock.unlock();
 		}
-		return this.running;
+		return this.running && !callClosed();
 	}
 
 	/** Queues a control frame; never blocks. */
@@ -175,7 +198,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		this.lock.lock();
 		try {
 			while (true) {
-				if (!this.running) {
+				if (!this.running || callClosed()) {
 					return false;
 				}
 				ConnectionQueue queue = this.queues.computeIfAbsent(connectionId, id -> new ConnectionQueue());
@@ -410,7 +433,9 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	/**
 	 * Stops the worker and completes the outbound stream; waits for the completion to be
 	 * delivered so a caller tearing the transport down right after (server shutdown) does
-	 * not cut the final frames off. Idempotent.
+	 * not cut the frame in flight off. Frames still queued are not flushed: the peer is
+	 * gone by definition of a teardown, and waiting for them could hang on a full queue
+	 * -- close never depends on queue space. Idempotent.
 	 */
 	@Override
 	public void close() {
