@@ -6,17 +6,20 @@ import java.io.OutputStream;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 
 import org.jspecify.annotations.Nullable;
 
@@ -27,32 +30,33 @@ import am.ik.sluice.tunnel.DuplexPipe;
 import am.ik.sluice.tunnel.StreamRelay;
 import am.ik.sluice.tunnel.VirtualConnection;
 import io.micrometer.core.instrument.Counter;
-import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 
 /**
  * Relays one plaintext HTTP/2 client connection over per-route legs: the
  * {@code :authority} of every request HEADERS block is resolved through the router and
- * the stream is relayed, frame for frame with its stream id unchanged, to a virtual
- * connection of the matching route -- concurrent streams of one connection (h2
- * multiplexing, connection coalescing) each reach their own upstream. Streams sharing a
- * route share the route's leg. Every leg's writes are performed by the leg's own writer
- * thread off a bounded queue -- the outbound parse only enqueues, so one stalled leg
- * never stops the frames of the others; the queue's overflow means the client ignored the
- * flow-control windows and ends the relay. The relay is the HTTP/2 endpoint of the client
- * connection for everything connection-level: settings are answered and re-announced to
- * the legs, pings are answered, and the connection-level flow-control windows are
- * regenerated from the bytes relayed (bytes forwarded over a hop release that hop's
- * connection window for the sender), while stream-level WINDOW_UPDATE frames and all
- * other stream traffic pass through verbatim. The end of the client stream half-closes
- * every leg; the end of a leg that still has streams awaiting their response ends the
- * whole relay, as does any failure.
+ * the stream is relayed, with its stream id unchanged, to a virtual connection of the
+ * matching route -- concurrent streams of one connection (h2 multiplexing, connection
+ * coalescing) each reach their own upstream. Streams sharing a route share the route's
+ * leg. Every leg's writes are performed by the leg's own writer thread off the leg's
+ * queue -- the outbound parse only enqueues, so one stalled leg never stops the frames of
+ * the others.
  * <p>
- * The initial connection window is the spec default on every connection and the relay
- * advertises no settings of its own, so a stream can transiently exceed a leg's tighter
- * window; every hop in between is buffered (the leg queue, socket, tunnel queue, gRPC),
- * which absorbs it. HPACK blocks are relayed verbatim, so each side's dynamic table only
- * ever sees a subsequence of one connection's blocks, which decodes identically.
+ * The relay is the HTTP/2 endpoint of the client connection for everything
+ * connection-level: settings are answered and re-announced to the legs, pings are
+ * answered, and the connection windows are regenerated from the DATA payload relayed over
+ * each hop. It also owns the client's stream windows, which bound what it queues: it
+ * advertises {@link #MAX_CONCURRENT_STREAMS}, refuses a stream beyond it, and grants a
+ * stream's window -- the upstream's increments, plus the padding it strips -- only while
+ * the stream's queued payload and its window stay within {@link #STREAM_BUDGET}. A client
+ * sending past a stream window gets a GOAWAY {@code FLOW_CONTROL_ERROR}. A header block
+ * is written whole in either direction, and the relay's own connection-level frames
+ * towards an upstream are written ahead of the request frames queued for it.
+ * <p>
+ * The relay does not track the upstream's windows: an upstream announcing an initial
+ * stream window below the spec default can see a stream exceed it. HPACK blocks are
+ * re-encoded table-less, so each side's decoder sees self-contained blocks whichever leg
+ * produced them, or when.
  */
 final class Http2DemuxRelay {
 
@@ -68,9 +72,9 @@ final class Http2DemuxRelay {
 
 	private static final int FRAME_SETTINGS = 0x4;
 
-	private static final int FRAME_PUSH_PROMISE = 0x5;
-
 	private static final int FRAME_PING = 0x6;
+
+	private static final int FRAME_GOAWAY = 0x7;
 
 	private static final int FRAME_WINDOW_UPDATE = 0x8;
 
@@ -88,20 +92,53 @@ final class Http2DemuxRelay {
 
 	private static final int FRAME_HEADER_LENGTH = 9;
 
+	private static final int ERROR_FLOW_CONTROL = 0x3;
+
+	private static final int ERROR_REFUSED_STREAM = 0x7;
+
+	private static final int SETTINGS_HEADER_TABLE_SIZE = 0x1;
+
+	private static final int SETTINGS_MAX_CONCURRENT_STREAMS = 0x3;
+
+	private static final int SETTINGS_MAX_HEADER_LIST_SIZE = 0x6;
+
+	/** The settings defined by RFC 9113, RFC 8441 and RFC 9218, the ones re-announced. */
+	private static final Set<Integer> KNOWN_SETTINGS = Set.of(0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x8, 0x9);
+
 	/**
 	 * SETTINGS_MAX_FRAME_SIZE every endpoint accepts without announcing more (RFC 9113).
 	 */
 	private static final int MAX_FRAME_SIZE = 16 * 1024;
 
-	/**
-	 * Hard cap of the bytes queued for one leg, backing the per-stream windows against
-	 * clients that ignore them: exceeding it is a flow-control violation and tears the
-	 * relay down.
-	 */
-	private static final int MAX_QUEUED_BYTES = 4 * 1024 * 1024;
+	/** The header list size limit of every decoder, mirroring the connection head. */
+	private static final int MAX_HEADER_LIST_SIZE = 64 * 1024;
 
-	/** Name of the per-leg gauge counting the bytes queued for the leg's writer. */
-	private static final String QUEUED_GAUGE_NAME = "sluice.h2demux.queued.bytes";
+	/** The concurrent streams the relay advertises to the client. */
+	static final int MAX_CONCURRENT_STREAMS = 100;
+
+	/** The client's initial stream window: the spec default, never re-announced. */
+	private static final int STREAM_WINDOW = 65535;
+
+	/**
+	 * Per stream, the most the queued payload plus the client's window may reach: a grant
+	 * waits until the leg writer's drain makes room. 64KiB above the initial window.
+	 */
+	static final int STREAM_BUDGET = STREAM_WINDOW + 64 * 1024;
+
+	/** A re-encoded header block with its frame headers, at most. */
+	private static final int MAX_BLOCK_BYTES = MAX_HEADER_LIST_SIZE + 5 * FRAME_HEADER_LENGTH;
+
+	/**
+	 * The bound the rules above derive for the bytes queued for one connection's legs: a
+	 * stream holding queued bytes counts against the stream limit and queues at most its
+	 * budget of payload, its head and trailers, a reset, and one coalesced window update.
+	 * A backstop: passing it ends the relay with a GOAWAY {@code FLOW_CONTROL_ERROR}.
+	 */
+	static final long MAX_QUEUED_BYTES = (long) MAX_CONCURRENT_STREAMS
+			* (STREAM_BUDGET + FRAME_HEADER_LENGTH + 2L * MAX_BLOCK_BYTES + 2L * (FRAME_HEADER_LENGTH + 4));
+
+	/** The PING acks one leg may owe its upstream; more end the relay. */
+	private static final int MAX_PENDING_PING_ACKS = 1024;
 
 	private final DuplexPipe pipe;
 
@@ -119,6 +156,8 @@ final class Http2DemuxRelay {
 
 	private final MeterRegistry meterRegistry;
 
+	private final H2DemuxMeters meters;
+
 	private final Router.Route initialRoute;
 
 	private final TunnelSession initialSession;
@@ -130,21 +169,36 @@ final class Http2DemuxRelay {
 	/** Serializes the writes of the shared client stream. */
 	private final Object sinkLock = new Object();
 
-	/** Stream id to the leg relaying it; entries live for the life of the connection. */
-	private final Map<Integer, Leg> streams = new ConcurrentHashMap<>();
+	/**
+	 * Guards the stream flow state, the leg queues and the counters below; never held
+	 * across a socket write.
+	 */
+	private final ReentrantLock lock = new ReentrantLock();
+
+	/**
+	 * Stream id to its state, until the stream is closed for the client and drained;
+	 * frames arriving later find no stream and are dropped.
+	 */
+	private final Map<Integer, Stream> streams = new ConcurrentHashMap<>();
 
 	private final List<Leg> legs = new CopyOnWriteArrayList<>();
 
-	/** The outbound side plus one side per leg; the relay ends when all drain. */
-	private final java.util.concurrent.atomic.AtomicInteger pending = new java.util.concurrent.atomic.AtomicInteger(1);
+	/** The outbound side plus two sides per leg; the relay ends when all drain. */
+	private final AtomicInteger pending = new AtomicInteger(1);
 
-	/**
-	 * Set once the client is done sending and every leg's half-close is queued: the leg
-	 * writers' input is complete and they exit once their queues drain.
-	 */
-	private volatile boolean outboundDrained;
+	private final AtomicBoolean finished = new AtomicBoolean();
 
-	private final java.util.concurrent.atomic.AtomicBoolean finished = new java.util.concurrent.atomic.AtomicBoolean();
+	/** Streams counted against the advertised limit; guarded by {@link #lock}. */
+	private int activeStreams;
+
+	/** The bytes queued for every leg of the connection; guarded by {@link #lock}. */
+	private long queuedBytes;
+
+	/** The highest stream id routed, for GOAWAY; outbound parse only. */
+	private int lastStreamId;
+
+	/** The highest stream id the client opened, routed or not; outbound parse only. */
+	private int highestStreamId;
 
 	/** Client bytes read but not yet parsed into complete frames. */
 	private final ByteArrayOutputStream buffer = new ByteArrayOutputStream(BUFFER_SIZE);
@@ -156,8 +210,8 @@ final class Http2DemuxRelay {
 
 	private boolean assemblingEndStream;
 
-	/** SETTINGS payloads announced by the client, replayed to every new leg. */
-	private final ByteArrayOutputStream clientSettings = new ByteArrayOutputStream(128);
+	/** The settings announced by the client, replayed to every new leg. */
+	private final Map<Integer, Long> clientSettings = new LinkedHashMap<>();
 
 	private final io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder headersDecoder = new io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder(
 			true);
@@ -174,8 +228,7 @@ final class Http2DemuxRelay {
 	static io.netty.handler.codec.http2.DefaultHttp2HeadersEncoder newHeadersEncoder() {
 		io.netty.handler.codec.http2.DefaultHttp2HeadersEncoder encoder = new io.netty.handler.codec.http2.DefaultHttp2HeadersEncoder();
 		try {
-			// mirror the connection-head limit
-			encoder.maxHeaderListSize(64 * 1024);
+			encoder.maxHeaderListSize(MAX_HEADER_LIST_SIZE);
 			encoder.maxHeaderTableSize(0);
 		}
 		catch (io.netty.handler.codec.http2.Http2Exception e) {
@@ -186,8 +239,8 @@ final class Http2DemuxRelay {
 
 	Http2DemuxRelay(DuplexPipe pipe, ConnectionHeadParser.Head head, Router router, SessionRegistry sessions,
 			AccessControl accessControl, ErrorResponse errorResponse, AccessLogger.Connection access,
-			MeterRegistry meterRegistry, Router.Route initialRoute, TunnelSession initialSession,
-			@Nullable InetAddress peer, Runnable onFinish) {
+			H2DemuxMeters meters, Router.Route initialRoute, TunnelSession initialSession, @Nullable InetAddress peer,
+			Runnable onFinish) {
 		this.pipe = pipe;
 		this.seedHead = head.bytes();
 		this.router = router;
@@ -195,18 +248,14 @@ final class Http2DemuxRelay {
 		this.accessControl = accessControl;
 		this.errorResponse = errorResponse;
 		this.access = access;
-		this.meterRegistry = meterRegistry;
+		this.meterRegistry = meters.registry();
+		this.meters = meters;
 		this.initialRoute = initialRoute;
 		this.initialSession = initialSession;
 		this.peer = peer;
 		this.onFinish = onFinish;
 		try {
-			// mirror the connection-head limit; the encoder keeps no dynamic table so the
-			// blocks re-encoded with a rewritten authority are self-contained
-			long maxHeaderListSize = 64 * 1024;
-			this.headersEncoder.maxHeaderListSize(maxHeaderListSize);
-			this.headersEncoder.maxHeaderTableSize(0);
-			this.headersDecoder.configuration().maxHeaderListSize(maxHeaderListSize, maxHeaderListSize);
+			this.headersDecoder.configuration().maxHeaderListSize(MAX_HEADER_LIST_SIZE, MAX_HEADER_LIST_SIZE);
 		}
 		catch (io.netty.handler.codec.http2.Http2Exception e) {
 			throw new IllegalStateException(e);
@@ -227,9 +276,9 @@ final class Http2DemuxRelay {
 	 */
 	private void pumpOutbound() {
 		try {
-			// the server face opens with its own settings (RFC 9113 6.5): defaults only,
-			// every window stays at the spec initial on this side (see the class doc)
-			writeToClient(frame(FRAME_SETTINGS, 0, 0, null, 0, 0));
+			// the server face opens with its own settings (RFC 9113 6.5)
+			writeToClient(frame(FRAME_SETTINGS, 0, 0, setting(SETTINGS_MAX_CONCURRENT_STREAMS, MAX_CONCURRENT_STREAMS),
+					0, 6));
 			// the connection head ends with the magic; the frames follow it
 			int magic = ConnectionHeadParser.H2_MAGIC.length();
 			feed(this.seedHead, magic, this.seedHead.length - magic);
@@ -239,12 +288,10 @@ final class Http2DemuxRelay {
 			while ((n = in.read(buffer)) > 0) {
 				feed(buffer, 0, n);
 			}
-			// the client is done sending: no further request on any leg; the flag goes
-			// last, after the half-closes, so a leg writer seeing it finds them queued
+			// the client is done sending: no further request on any leg
 			for (Leg leg : this.legs) {
 				leg.halfClose();
 			}
-			this.outboundDrained = true;
 		}
 		catch (Exception e) {
 			abort();
@@ -267,7 +314,7 @@ final class Http2DemuxRelay {
 			int type = header.get() & 0xff;
 			int flags = header.get() & 0xff;
 			int streamId = header.getInt() & 0x7fffffff;
-			onFrame(type, flags, streamId, all, position + FRAME_HEADER_LENGTH, frameLength);
+			onFrame(new Frame(type, flags, streamId, all, position + FRAME_HEADER_LENGTH, frameLength));
 			position += FRAME_HEADER_LENGTH + frameLength;
 		}
 		if (position > 0) {
@@ -278,68 +325,185 @@ final class Http2DemuxRelay {
 		}
 	}
 
-	private void onFrame(int type, int flags, int streamId, byte[] bytes, int payload, int length) {
-		switch (type) {
-			case FRAME_SETTINGS -> onSettings(flags, bytes, payload, length);
-			case FRAME_HEADERS -> onHeaders(flags, streamId, bytes, payload, length, true);
-			case FRAME_CONTINUATION -> onHeaders(flags, streamId, bytes, payload, length, false);
-			case FRAME_DATA -> {
-				if (streamId == 0) {
-					return; // DATA is stream-scoped; an unexpected connection-level frame
-				}
-				Leg leg = this.streams.get(Integer.valueOf(streamId));
-				if (leg == null) {
-					return; // frames of streams never routed (or already answered)
-				}
-				leg.relayFrame(frame(FRAME_DATA, flags, streamId, bytes, payload, length));
-				int dataLength = dataPayloadLength(flags, bytes, payload, length);
-				if (dataLength > 0) {
-					// the payload left towards the leg: release the client's connection
-					// window, whichever leg it went to
-					grantClient(dataLength);
-				}
-			}
-			case FRAME_RST_STREAM -> {
-				Leg leg = this.streams.get(Integer.valueOf(streamId));
-				if (leg != null) {
-					leg.relayFrame(frame(FRAME_RST_STREAM, flags, streamId, bytes, payload, length));
-					leg.streamClosedByClient(streamId);
-				}
-			}
-			case FRAME_WINDOW_UPDATE -> {
-				// stream-level grants pair stream for stream; connection-level grants are
-				// regenerated from the bytes relayed
-				Leg leg = streamId == 0 ? null : this.streams.get(Integer.valueOf(streamId));
-				if (leg != null) {
-					leg.relayFrame(frame(FRAME_WINDOW_UPDATE, 0, streamId, bytes, payload, length));
-				}
-			}
+	/**
+	 * One parsed frame: its header fields and where its payload lies in {@code bytes}.
+	 */
+	private record Frame(int type, int flags, int streamId, byte[] bytes, int payload, int length) {
+
+		boolean has(int flag) {
+			return (this.flags & flag) != 0;
+		}
+
+	}
+
+	private void onFrame(Frame frame) {
+		switch (frame.type()) {
+			case FRAME_SETTINGS -> onSettings(frame);
+			case FRAME_HEADERS -> onHeaders(frame, true);
+			case FRAME_CONTINUATION -> onHeaders(frame, false);
+			case FRAME_DATA -> onData(frame);
+			case FRAME_RST_STREAM -> onClientReset(frame);
+			case FRAME_WINDOW_UPDATE -> onClientWindowUpdate(frame);
 			case FRAME_PING -> {
-				if ((flags & FLAG_ACK) == 0) {
-					writeToClient(frame(FRAME_PING, FLAG_ACK, 0, bytes, payload, length));
+				if (!frame.has(FLAG_ACK)) {
+					writeToClient(frame(FRAME_PING, FLAG_ACK, 0, frame.bytes(), frame.payload(), frame.length()));
 				}
 			}
 			default -> {
-				// priority, push promise, and unknown frames follow their stream
-				Leg leg = streamId == 0 ? null : this.streams.get(Integer.valueOf(streamId));
-				if (leg != null) {
-					leg.relayFrame(frame(type, flags, streamId, bytes, payload, length));
-				}
+				// priority (advisory, deprecated), push promise (never sent by a client),
+				// goaway, and unknown types (hop-by-hop extensions) end here
 			}
 		}
 	}
 
-	private void onSettings(int flags, byte[] bytes, int payload, int length) {
-		if ((flags & FLAG_ACK) != 0) {
+	/**
+	 * A client DATA frame: the whole payload, padding included, leaves the connection
+	 * window at once and is released; the stream's window is charged with it, the padding
+	 * is given back since it never leaves the relay, and the bare payload joins the
+	 * stream's queued data. Frames of streams unknown or already ended are dropped.
+	 */
+	private void onData(Frame frame) {
+		if (frame.streamId() == 0) {
+			return; // DATA is stream-scoped; an unexpected connection-level frame
+		}
+		if (frame.length() > 0) {
+			grantClient(frame.length());
+		}
+		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
+		if (stream == null) {
+			return; // frames of streams never routed
+		}
+		int dataLength = dataPayloadLength(frame);
+		int dataOffset = frame.payload() + (frame.has(FLAG_PADDED) ? 1 : 0);
+		boolean violation = false;
+		int release = 0;
+		this.lock.lock();
+		try {
+			if (stream.clientEnded || stream.trailers) {
+				return; // the client ended the stream: its late frames are void
+			}
+			if (frame.length() > stream.clientWindow) {
+				violation = true;
+			}
+			else {
+				stream.clientWindow -= frame.length();
+				stream.held = Math.min(Integer.MAX_VALUE, stream.held + frame.length() - dataLength);
+				stream.leg.queueData(stream, frame.bytes(), dataOffset, dataLength, frame.has(FLAG_END_STREAM));
+				release = releaseLocked(stream);
+			}
+		}
+		finally {
+			this.lock.unlock();
+		}
+		if (violation) {
+			goAway(ERROR_FLOW_CONTROL);
+			abort();
+			return;
+		}
+		grantStream(stream.id, release);
+		checkQueueBound();
+	}
+
+	/**
+	 * Grants the client stream window the relay holds back: the increment owed, as far as
+	 * the stream's queued payload plus its window stay within the budget. A stream the
+	 * client ended gets nothing more.
+	 */
+	private int releaseLocked(Stream stream) {
+		if (stream.clientEnded) {
+			stream.held = 0;
+			return 0;
+		}
+		long room = STREAM_BUDGET - stream.queuedPayload - stream.clientWindow;
+		int release = (int) Math.max(0, Math.min(stream.held, room));
+		stream.held -= release;
+		stream.clientWindow += release;
+		return release;
+	}
+
+	private void grantStream(int streamId, int increment) {
+		if (increment > 0) {
+			writeToClient(windowUpdate(streamId, increment));
+		}
+	}
+
+	/** A client RST_STREAM: relayed once; the stream's pending data is dropped. */
+	private void onClientReset(Frame frame) {
+		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
+		if (stream == null) {
+			return;
+		}
+		this.lock.lock();
+		try {
+			if (stream.reset) {
+				return;
+			}
+			stream.reset = true;
+			stream.clientEnded = true;
+			stream.held = 0;
+			stream.leg.purgeData(stream);
+			stream.leg.queueBlock(stream, frame(FRAME_RST_STREAM, frame.flags(), frame.streamId(), frame.bytes(),
+					frame.payload(), frame.length()));
+			updateActiveLocked(stream);
+		}
+		finally {
+			this.lock.unlock();
+		}
+		stream.leg.streamClosed(frame.streamId());
+		checkQueueBound();
+	}
+
+	/**
+	 * A client stream-level WINDOW_UPDATE: relayed to the stream's leg, coalesced into
+	 * the one still queued for the stream if any. Connection-level grants are regenerated
+	 * from the bytes relayed.
+	 */
+	private void onClientWindowUpdate(Frame frame) {
+		if (frame.streamId() == 0 || frame.length() != 4) {
+			return;
+		}
+		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
+		int increment = int31(frame.bytes(), frame.payload());
+		if (stream == null || increment == 0) {
+			return;
+		}
+		this.lock.lock();
+		try {
+			if (!stream.reset) {
+				stream.leg.queueWindowUpdate(stream, increment);
+			}
+		}
+		finally {
+			this.lock.unlock();
+		}
+		checkQueueBound();
+	}
+
+	private void onSettings(Frame frame) {
+		if (frame.has(FLAG_ACK)) {
 			return; // the ack of the settings announced towards the client
 		}
-		if (length > 0) {
-			byte[] settings = new byte[length];
-			System.arraycopy(bytes, payload, settings, 0, length);
-			this.clientSettings.write(settings, 0, settings.length);
+		Map<Integer, Long> changes = new LinkedHashMap<>();
+		for (int i = 0; i + 6 <= frame.length(); i += 6) {
+			int at = frame.payload() + i;
+			int id = (frame.bytes()[at] & 0xff) << 8 | (frame.bytes()[at + 1] & 0xff);
+			long value = (frame.bytes()[at + 2] & 0xffL) << 24 | (frame.bytes()[at + 3] & 0xff) << 16
+					| (frame.bytes()[at + 4] & 0xff) << 8 | (frame.bytes()[at + 5] & 0xff);
+			if (id == SETTINGS_HEADER_TABLE_SIZE || !KNOWN_SETTINGS.contains(id)) {
+				// the upstreams encode for the relay's decoders, which keep the default
+				// table; unknown settings belong to this hop
+				continue;
+			}
+			if (id == SETTINGS_MAX_HEADER_LIST_SIZE) {
+				value = Math.min(value, MAX_HEADER_LIST_SIZE);
+			}
+			changes.put(id, value);
+		}
+		if (!changes.isEmpty()) {
+			this.clientSettings.putAll(changes);
 			// re-announce the peer's settings to the legs already serving the connection
 			for (Leg leg : this.legs) {
-				leg.relaySettings(settings);
+				leg.queueSettings(changes);
 			}
 		}
 		writeToClient(frame(FRAME_SETTINGS, FLAG_ACK, 0, null, 0, 0));
@@ -347,10 +511,11 @@ final class Http2DemuxRelay {
 
 	/**
 	 * The head frame of a possibly split HEADERS; streams already routed receive their
-	 * block verbatim (trailers), new streams are routed by the decoded
+	 * block re-encoded (trailers), new streams are routed by the decoded
 	 * {@code :authority}.
 	 */
-	private void onHeaders(int flags, int streamId, byte[] bytes, int payload, int length, boolean head) {
+	private void onHeaders(Frame frame, boolean head) {
+		int streamId = frame.streamId();
 		if (streamId == 0) {
 			return;
 		}
@@ -359,35 +524,29 @@ final class Http2DemuxRelay {
 		}
 		if (this.assemblingStream == -1) {
 			this.assemblingStream = streamId;
-			this.assemblingEndStream = (flags & FLAG_END_STREAM) != 0;
+			this.assemblingEndStream = frame.has(FLAG_END_STREAM);
 			this.assembling.reset();
 		}
-		appendFragment(flags, bytes, payload, length, head);
-		if ((flags & FLAG_END_HEADERS) != 0) {
+		appendFragmentTo(this.assembling, frame, head);
+		if (frame.has(FLAG_END_HEADERS)) {
 			onHeadBlock();
 		}
 	}
 
-	/** Strips padding and priority fields, keeping the bare header block fragment. */
-	private void appendFragment(int flags, byte[] bytes, int payload, int length, boolean headers) {
-		appendFragmentTo(this.assembling, flags, bytes, payload, length, headers);
-	}
-
-	private static void appendFragmentTo(ByteArrayOutputStream out, int flags, byte[] bytes, int payload, int length,
-			boolean headers) {
-		int start = payload;
-		int fragmentLength = length;
-		if ((flags & FLAG_PADDED) != 0 && length > 0) {
-			int padLength = bytes[start] & 0xff;
+	private static void appendFragmentTo(ByteArrayOutputStream out, Frame frame, boolean headers) {
+		int start = frame.payload();
+		int fragmentLength = frame.length();
+		if (frame.has(FLAG_PADDED) && frame.length() > 0) {
+			int padLength = frame.bytes()[start] & 0xff;
 			start += 1;
 			fragmentLength -= 1 + padLength;
 		}
-		if ((flags & FLAG_PRIORITY) != 0 && headers && fragmentLength > 0) {
+		if (frame.has(FLAG_PRIORITY) && headers && fragmentLength > 0) {
 			start += 5;
 			fragmentLength -= 5;
 		}
 		if (fragmentLength > 0) {
-			out.write(bytes, start, fragmentLength);
+			out.write(frame.bytes(), start, fragmentLength);
 		}
 	}
 
@@ -396,19 +555,47 @@ final class Http2DemuxRelay {
 		boolean endStream = this.assemblingEndStream;
 		byte[] block = this.assembling.toByteArray();
 		this.assemblingStream = -1;
-		Leg leg = this.streams.get(Integer.valueOf(streamId));
-		if (leg != null) {
-			// trailers of a started stream: decoded to keep the connection decoder in
-			// sync, re-encoded so the leg's decoder needs no earlier state
-			io.netty.handler.codec.http2.Http2Headers trailers = decode(streamId, block);
-			leg.relayFrames(encodedHead(streamId, endStream, trailers, null, this.headersEncoder));
+		// decoded even when dropped, to keep the connection decoder in sync
+		io.netty.handler.codec.http2.Http2Headers headers = decode(streamId, block);
+		Stream stream = this.streams.get(Integer.valueOf(streamId));
+		if (stream != null) {
+			onTrailers(stream, endStream, headers);
 			return;
 		}
-		onRequestHead(streamId, endStream, block);
+		if (streamId <= this.highestStreamId) {
+			return; // a later block of a stream refused or answered by the relay
+		}
+		this.highestStreamId = streamId;
+		onRequestHead(streamId, endStream, headers);
 	}
 
-	private void onRequestHead(int streamId, boolean endStream, byte[] block) {
-		io.netty.handler.codec.http2.Http2Headers headers = decode(streamId, block);
+	/**
+	 * Trailers of a started stream, re-encoded so the leg's decoder needs no earlier
+	 * state; one block per stream after its head, none once the client ended it.
+	 */
+	private void onTrailers(Stream stream, boolean endStream, io.netty.handler.codec.http2.Http2Headers headers) {
+		byte[] frames = encodedHead(stream.id, endStream, headers, null, this.headersEncoder);
+		this.lock.lock();
+		try {
+			if (stream.clientEnded || stream.trailers) {
+				return;
+			}
+			stream.trailers = true;
+			stream.clientEnded = endStream;
+			stream.leg.queueBlock(stream, frames);
+		}
+		finally {
+			this.lock.unlock();
+		}
+		checkQueueBound();
+	}
+
+	private void onRequestHead(int streamId, boolean endStream, io.netty.handler.codec.http2.Http2Headers headers) {
+		if (activeStreams() >= MAX_CONCURRENT_STREAMS) {
+			// beyond the advertised limit (RFC 9113 5.1.2); safe for the client to retry
+			writeToClient(rstStream(streamId, ERROR_REFUSED_STREAM));
+			return;
+		}
 		String host = hostOf(headers);
 		ConnectionHeadParser.Head.@Nullable Request request = requestOf(headers);
 		Resolved resolved;
@@ -426,16 +613,74 @@ final class Http2DemuxRelay {
 		}
 		Router.Route route = resolved.route();
 		Leg leg = legFor(route, resolved.session());
-		this.streams.put(Integer.valueOf(streamId), leg);
+		Stream stream = new Stream(streamId, leg);
+		this.streams.put(Integer.valueOf(streamId), stream);
+		leg.routeMeters.trackedStreams().increment();
+		this.lastStreamId = Math.max(this.lastStreamId, streamId);
 		leg.streamOpened(streamId);
 		// always re-encoded: the client's blocks reference its dynamic table, whose
 		// state a leg joining later (tunnel recovery, a second upstream of a coalesced
 		// connection) does not have -- the table-less encoder keeps every block
 		// self-contained no matter which leg decodes it or when
-		leg.relayFrames(encodedHead(streamId, endStream, headers, route.rewriteHost() ? route.address() : null,
-				this.headersEncoder));
+		byte[] frames = encodedHead(streamId, endStream, headers, route.rewriteHost() ? route.address() : null,
+				this.headersEncoder);
+		this.lock.lock();
+		try {
+			this.activeStreams++;
+			stream.active = true;
+			stream.clientEnded = endStream;
+			leg.queueBlock(stream, frames);
+		}
+		finally {
+			this.lock.unlock();
+		}
 		if (request != null) {
 			this.access.request(route.routeTag(), request.method(), request.path(), "2");
+		}
+		checkQueueBound();
+	}
+
+	private int activeStreams() {
+		this.lock.lock();
+		try {
+			return this.activeStreams;
+		}
+		finally {
+			this.lock.unlock();
+		}
+	}
+
+	/**
+	 * Uncounts a stream from the advertised limit once it is closed for the client and
+	 * nothing of it is queued any more.
+	 */
+	private void updateActiveLocked(Stream stream) {
+		if (!stream.active) {
+			return;
+		}
+		boolean closed = stream.reset || (stream.clientEnded && stream.responseEnded);
+		if (closed && stream.queuedBytes == 0) {
+			stream.active = false;
+			this.activeStreams--;
+			if (this.streams.remove(Integer.valueOf(stream.id), stream)) {
+				stream.leg.routeMeters.trackedStreams().decrement();
+			}
+		}
+	}
+
+	/** Ends the relay like a flow-control violation once the queue passed its bound. */
+	private void checkQueueBound() {
+		boolean exceeded;
+		this.lock.lock();
+		try {
+			exceeded = this.queuedBytes > MAX_QUEUED_BYTES;
+		}
+		finally {
+			this.lock.unlock();
+		}
+		if (exceeded) {
+			goAway(ERROR_FLOW_CONTROL);
+			abort();
 		}
 	}
 
@@ -491,23 +736,22 @@ final class Http2DemuxRelay {
 			ConnectionHeadParser.Head.@Nullable Request request, io.netty.handler.codec.http2.Http2Headers headers) {
 		Optional<Router.Route> route = this.router.lookup(host);
 		if (route.isEmpty()) {
-			return this.refuse(streamId, request, this.errorResponse.noRouteStream(streamId, host, request));
+			return this.refuse(request, this.errorResponse.noRouteStream(streamId, host, request));
 		}
 		TunnelSession session = this.sessions.find(route.get().clientId()).orElse(null);
 		if (session == null) {
-			return this.refuse(streamId, request, this.errorResponse.noRouteStream(streamId, host, request));
+			return this.refuse(request, this.errorResponse.noRouteStream(streamId, host, request));
 		}
 		String forwardedFor = headerOf(headers, ConnectionHeadParser.Head.FORWARDED_FOR);
 		String forwarded = headerOf(headers, ConnectionHeadParser.Head.FORWARDED);
 		if (!this.accessControl.allowed(route.get(), this.peer, forwardedFor, forwarded)) {
-			return this.refuse(streamId, request, this.errorResponse.forbiddenStream(streamId, host, request));
+			return this.refuse(request, this.errorResponse.forbiddenStream(streamId, host, request));
 		}
 		return new Resolved(route.get(), session);
 	}
 
 	/** Logs a refused stream, mirroring the connection-level refusals. */
-	private @Nullable Resolved refuse(int streamId, ConnectionHeadParser.Head.@Nullable Request request,
-			byte[] response) {
+	private @Nullable Resolved refuse(ConnectionHeadParser.Head.@Nullable Request request, byte[] response) {
 		this.access.request("-", request == null ? "-" : request.method(), request == null ? "-" : request.path(), "2");
 		writeToClient(response);
 		return null;
@@ -526,9 +770,9 @@ final class Http2DemuxRelay {
 	/**
 	 * The head re-encoded with the given table-less encoder (see
 	 * {@link #newHeadersEncoder()}), the authority replaced when {@code address} is
-	 * given; the block is split to the default maximum frame size.
+	 * given, as HEADERS plus CONTINUATION frames of the default maximum frame size.
 	 */
-	private static List<byte[]> encodedHead(int streamId, boolean endStream,
+	private static byte[] encodedHead(int streamId, boolean endStream,
 			io.netty.handler.codec.http2.Http2Headers headers, java.lang.@Nullable String address,
 			io.netty.handler.codec.http2.DefaultHttp2HeadersEncoder encoder) {
 		if (address != null) {
@@ -552,8 +796,8 @@ final class Http2DemuxRelay {
 	}
 
 	/** Splits an encoded header block to HEADERS plus CONTINUATION frames. */
-	private static List<byte[]> blockFrames(int streamId, boolean endStream, byte[] block) {
-		List<byte[]> frames = new ArrayList<>();
+	private static byte[] blockFrames(int streamId, boolean endStream, byte[] block) {
+		ByteArrayOutputStream frames = new ByteArrayOutputStream(block.length + 2 * FRAME_HEADER_LENGTH);
 		int offset = 0;
 		boolean first = true;
 		do {
@@ -564,16 +808,12 @@ final class Http2DemuxRelay {
 			if (last) {
 				flags |= FLAG_END_HEADERS;
 			}
-			frames.add(frame(type, flags, streamId, block, offset, length));
+			frames.writeBytes(frame(type, flags, streamId, block, offset, length));
 			first = false;
 			offset += length;
 		}
 		while (offset < block.length);
-		return frames;
-	}
-
-	private static byte[] headFrame(int streamId, int flags, byte[] block) {
-		return frame(FRAME_HEADERS, flags, streamId, block, 0, block.length);
+		return frames.toByteArray();
 	}
 
 	private static byte[] frame(int type, int flags, int streamId, byte @Nullable [] bytes, int payload, int length) {
@@ -593,26 +833,55 @@ final class Http2DemuxRelay {
 		return frame;
 	}
 
-	private static int dataPayloadLength(int flags, byte[] bytes, int payload, int length) {
-		int dataLength = length;
-		if ((flags & FLAG_PADDED) != 0 && length > 0) {
-			int padLength = bytes[payload] & 0xff;
+	private static byte[] setting(int id, long value) {
+		return new byte[] { (byte) (id >>> 8), (byte) id, (byte) (value >>> 24), (byte) (value >>> 16),
+				(byte) (value >>> 8), (byte) value };
+	}
+
+	private static int dataPayloadLength(Frame frame) {
+		int dataLength = frame.length();
+		if (frame.has(FLAG_PADDED) && frame.length() > 0) {
+			int padLength = frame.bytes()[frame.payload()] & 0xff;
 			dataLength -= 1 + padLength;
 		}
 		return Math.max(0, dataLength);
 	}
 
 	/**
-	 * Grants the client connection window; called as payload bytes leave towards legs.
+	 * Grants the client connection window; called as DATA leaves towards the legs.
 	 */
 	private void grantClient(int units) {
 		writeToClient(windowUpdate(0, units));
 	}
 
 	private static byte[] windowUpdate(int streamId, int units) {
-		byte[] payload = { (byte) (units >>> 24 & 0x7f), (byte) (units >>> 16 & 0xff), (byte) (units >>> 8 & 0xff),
-				(byte) (units & 0xff) };
-		return frame(FRAME_WINDOW_UPDATE, 0, streamId, payload, 0, 4);
+		return frame(FRAME_WINDOW_UPDATE, 0, streamId, int32(units & 0x7fffffff), 0, 4);
+	}
+
+	private static byte[] rstStream(int streamId, int errorCode) {
+		return frame(FRAME_RST_STREAM, 0, streamId, int32(errorCode), 0, 4);
+	}
+
+	private static byte[] int32(int value) {
+		return new byte[] { (byte) (value >>> 24), (byte) (value >>> 16), (byte) (value >>> 8), (byte) value };
+	}
+
+	private static int int31(byte[] bytes, int offset) {
+		return (bytes[offset] & 0x7f) << 24 | (bytes[offset + 1] & 0xff) << 16 | (bytes[offset + 2] & 0xff) << 8
+				| (bytes[offset + 3] & 0xff);
+	}
+
+	/** Tells the client the connection ends with the error; best effort. */
+	private void goAway(int errorCode) {
+		byte[] payload = new byte[8];
+		System.arraycopy(int32(this.lastStreamId), 0, payload, 0, 4);
+		System.arraycopy(int32(errorCode), 0, payload, 4, 4);
+		try {
+			writeToClient(frame(FRAME_GOAWAY, 0, 0, payload, 0, payload.length));
+		}
+		catch (RuntimeException e) {
+			// the client is gone already
+		}
 	}
 
 	private void writeToClient(byte[] bytes) {
@@ -629,8 +898,8 @@ final class Http2DemuxRelay {
 	}
 
 	/**
-	 * Relays response bytes to the client and accounts them to the leg and the access
-	 * log; the single reader per leg keeps the writes in stream order.
+	 * Relays response bytes to the client in one write and accounts them to the leg and
+	 * the access log; the single reader per leg keeps the writes in stream order.
 	 */
 	private void writeToClient(byte[] bytes, int offset, int length, Leg leg) {
 		synchronized (this.sinkLock) {
@@ -645,6 +914,60 @@ final class Http2DemuxRelay {
 		leg.outbound.increment(length);
 		leg.session.recordRelayed(length, StreamRelay.Direction.TO_LOCAL);
 		this.access.bytes(length, StreamRelay.Direction.TO_LOCAL);
+	}
+
+	/**
+	 * The client-facing state of one routed stream; guarded by {@link #lock}.
+	 */
+	private static final class Stream {
+
+		final int id;
+
+		final Leg leg;
+
+		/** The client's send window, as the relay granted it. */
+		long clientWindow = STREAM_WINDOW;
+
+		/** Window owed to the client but held back by the budget. */
+		long held;
+
+		/** DATA payload of the stream queued or being written. */
+		int queuedPayload;
+
+		/** Every byte queued for the stream, frame headers of its entries included. */
+		long queuedBytes;
+
+		/** Payload not yet taken by the leg writer. */
+		final ByteArrayOutputStream pendingData = new ByteArrayOutputStream(0);
+
+		boolean pendingEnd;
+
+		/** A {@link LegEntry.Data} of the stream waits in its leg's queue. */
+		boolean dataQueued;
+
+		/** The window update of the stream still queued, to coalesce into. */
+		LegEntry.@Nullable WindowUpdate windowUpdate;
+
+		/** The client sent END_STREAM or a reset, or the upstream reset the stream. */
+		boolean clientEnded;
+
+		/** A second header block (trailers) was relayed. */
+		boolean trailers;
+
+		/** Reset by either side. */
+		boolean reset;
+
+		/** The response ended (END_STREAM written to the client). */
+		boolean responseEnded;
+
+		/** Counted against the advertised limit. */
+		boolean active;
+
+		Stream(int id, Leg leg) {
+			this.id = id;
+			this.leg = leg;
+		}
+
 	}
 
 	/**
@@ -663,13 +986,15 @@ final class Http2DemuxRelay {
 
 		private final Counter outbound;
 
+		private final H2DemuxMeters.Route routeMeters;
+
 		/**
 		 * Mirrors the upstream's HPACK encoder for the blocks relayed towards the client;
 		 * the responses are re-encoded table-less so the client's single decoder is
 		 * untouched by whichever leg produced the block, or when.
 		 */
 		private final io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder responseDecoder = new io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder(
-				true);
+				true, MAX_HEADER_LIST_SIZE);
 
 		private final io.netty.handler.codec.http2.DefaultHttp2HeadersEncoder responseEncoder = Http2DemuxRelay
 			.newHeadersEncoder();
@@ -680,49 +1005,61 @@ final class Http2DemuxRelay {
 		private final Map<Integer, Boolean> inboundHeadEndStream = new HashMap<>();
 
 		/**
-		 * The writes towards the upstream, in relay order; drained by the leg's writer
-		 * thread. Bounded to {@code MAX_QUEUED_BYTES} of frame bytes.
+		 * The client role's opening towards the upstream: the preface and the client's
+		 * settings, so the upstream's encoder and flow control mirror the client's.
 		 */
-		private final LinkedBlockingDeque<LegWrite> outboundWrites = new LinkedBlockingDeque<>();
+		private final byte[] preface;
 
-		/** The bytes of the queued frames; guarded by {@code this}. */
-		private final AtomicInteger queuedBytes = new AtomicInteger();
+		/** Signals the writer; with {@link #lock}. */
+		private final Condition wake = Http2DemuxRelay.this.lock.newCondition();
+
+		/** Relayed client frames, in relay order; guarded by {@link #lock}. */
+		private final ArrayDeque<LegEntry> entries = new ArrayDeque<>();
+
+		/** The bytes of {@link #entries}; guarded by {@link #lock}. */
+		private long queuedBytes;
+
+		/** The priority lane, written ahead of {@link #entries}; guarded by the lock. */
+		private int settingsAcks;
+
+		private final ArrayDeque<byte[]> pingAcks = new ArrayDeque<>();
+
+		private long connectionGrant;
+
+		private final Map<Integer, Long> settings = new LinkedHashMap<>();
 
 		/** The streams relayed whose response has not ended. */
 		private final Set<Integer> openStreams = ConcurrentHashMap.newKeySet();
 
 		private volatile boolean ended;
 
-		private volatile boolean closed;
+		/** Set by {@link #close()}; guarded by {@link #lock}. */
+		private boolean closed;
 
-		private final Gauge queuedGauge;
+		/** The writer half-closed the upstream and exited; guarded by {@link #lock}. */
+		private boolean halfClosed;
 
 		Leg(Router.Route route, TunnelSession session) {
 			this.route = route;
 			this.session = session;
 			this.connection = session.open(route.address());
-			this.inbound = meterRegistry.counter(METRIC_NAME, "direction", "inbound", "route", route.routeTag());
-			this.outbound = meterRegistry.counter(METRIC_NAME, "direction", "outbound", "route", route.routeTag());
-			// the client role of the upstream connection: preface and the peer's
-			// settings,
-			// so its encoder and flow control mirror the client's -- queued ahead of
-			// every
-			// frame the relay emits later
-			enqueue(new LegWrite.Frame(ConnectionHeadParser.H2_MAGIC.getBytes(StandardCharsets.US_ASCII), false));
-			enqueue(new LegWrite.Frame(frame(FRAME_SETTINGS, 0, 0, null, 0, 0), false));
-			byte[] settings = Http2DemuxRelay.this.clientSettings.toByteArray();
-			if (settings.length > 0) {
-				enqueue(new LegWrite.Frame(frame(FRAME_SETTINGS, 0, 0, settings, 0, settings.length), false));
+			this.inbound = Http2DemuxRelay.this.meterRegistry.counter(METRIC_NAME, "direction", "inbound", "route",
+					route.routeTag());
+			this.outbound = Http2DemuxRelay.this.meterRegistry.counter(METRIC_NAME, "direction", "outbound", "route",
+					route.routeTag());
+			this.routeMeters = Http2DemuxRelay.this.meters.route(route.routeTag());
+			ByteArrayOutputStream preface = new ByteArrayOutputStream(64);
+			preface.writeBytes(ConnectionHeadParser.H2_MAGIC.getBytes(StandardCharsets.US_ASCII));
+			preface.writeBytes(frame(FRAME_SETTINGS, 0, 0, null, 0, 0));
+			if (!Http2DemuxRelay.this.clientSettings.isEmpty()) {
+				preface.writeBytes(settingsFrame(Http2DemuxRelay.this.clientSettings));
 			}
-			this.queuedGauge = Gauge.builder(QUEUED_GAUGE_NAME, this.queuedBytes, AtomicInteger::doubleValue)
-				.tag("route", route.routeTag())
-				.tag("connection", String.valueOf(this.connection.connectionId()))
-				.register(meterRegistry);
+			this.preface = preface.toByteArray();
 			if (Http2DemuxRelay.this.legs.isEmpty()) {
 				Http2DemuxRelay.this.access.connectionId(this.connection.connectionId());
 			}
 			Http2DemuxRelay.this.legs.add(this);
-			pending.addAndGet(2);
+			Http2DemuxRelay.this.pending.addAndGet(2);
 			Thread.ofVirtual()
 				.name("sluice-h2demux-leg-out-" + this.connection.connectionId())
 				.start(() -> pumpLegOutbound(this));
@@ -731,63 +1068,304 @@ final class Http2DemuxRelay {
 				.start(() -> pumpInbound(this));
 		}
 
+		/** Whether the writer still takes entries; with {@link #lock}. */
+		private boolean acceptingLocked() {
+			return !this.closed && !this.halfClosed;
+		}
+
+		private void addQueuedLocked(@Nullable Stream stream, long bytes) {
+			this.queuedBytes += bytes;
+			Http2DemuxRelay.this.queuedBytes += bytes;
+			this.routeMeters.queuedBytes().addAndGet(bytes);
+			if (stream != null) {
+				stream.queuedBytes += bytes;
+			}
+		}
+
+		private void signalLocked() {
+			this.wake.signal();
+		}
+
+		/** Queues a relayed block -- a whole header block, or a reset; with the lock. */
+		void queueBlock(Stream stream, byte[] bytes) {
+			if (!acceptingLocked()) {
+				return;
+			}
+			this.entries.addLast(new LegEntry.Block(stream, bytes));
+			addQueuedLocked(stream, bytes.length);
+			signalLocked();
+		}
+
 		/**
-		 * Queues a write for the leg's writer, bounding the queued frame bytes; the cap
-		 * overflow is a client flow-control violation and tears the relay down. Once the
-		 * leg is closed the write is dropped: the relay is ending anyway.
+		 * Appends DATA payload to the stream's pending data, queueing an entry for it
+		 * unless one still waits; with the lock.
 		 */
-		void enqueue(LegWrite write) {
-			int bytes = write instanceof LegWrite.Frame frame ? frame.bytes().length : 0;
-			boolean overflow = false;
-			synchronized (this) {
+		void queueData(Stream stream, byte[] bytes, int offset, int length, boolean endStream) {
+			if (!acceptingLocked()) {
+				return;
+			}
+			if (length > 0) {
+				stream.pendingData.write(bytes, offset, length);
+				stream.queuedPayload += length;
+				addQueuedLocked(stream, length);
+			}
+			if (endStream) {
+				stream.pendingEnd = true;
+				stream.clientEnded = true;
+			}
+			if ((length > 0 || endStream) && !stream.dataQueued) {
+				stream.dataQueued = true;
+				this.entries.addLast(new LegEntry.Data(stream));
+				addQueuedLocked(stream, FRAME_HEADER_LENGTH);
+				signalLocked();
+			}
+		}
+
+		/** Drops the stream's payload not yet taken by the writer; with the lock. */
+		void purgeData(Stream stream) {
+			int pending = stream.pendingData.size();
+			if (pending > 0) {
+				stream.pendingData.reset();
+				stream.queuedPayload -= pending;
+				addQueuedLocked(stream, -pending);
+			}
+			stream.pendingEnd = false;
+		}
+
+		/** Queues a stream window update, coalescing into a queued one; with the lock. */
+		void queueWindowUpdate(Stream stream, int increment) {
+			if (!acceptingLocked()) {
+				return;
+			}
+			LegEntry.WindowUpdate queued = stream.windowUpdate;
+			if (queued != null) {
+				queued.increment = (int) Math.min(Integer.MAX_VALUE, (long) queued.increment + increment);
+				return;
+			}
+			LegEntry.WindowUpdate update = new LegEntry.WindowUpdate(stream, increment);
+			stream.windowUpdate = update;
+			this.entries.addLast(update);
+			addQueuedLocked(stream, FRAME_HEADER_LENGTH + 4);
+			signalLocked();
+		}
+
+		/** Re-announces client settings to the upstream, in the priority lane. */
+		void queueSettings(Map<Integer, Long> changes) {
+			Http2DemuxRelay.this.lock.lock();
+			try {
+				if (acceptingLocked()) {
+					this.settings.putAll(changes);
+					signalLocked();
+				}
+			}
+			finally {
+				Http2DemuxRelay.this.lock.unlock();
+			}
+		}
+
+		/** Acks an upstream SETTINGS, in the priority lane. */
+		void queueSettingsAck() {
+			Http2DemuxRelay.this.lock.lock();
+			try {
+				if (acceptingLocked()) {
+					this.settingsAcks++;
+					signalLocked();
+				}
+			}
+			finally {
+				Http2DemuxRelay.this.lock.unlock();
+			}
+		}
+
+		/**
+		 * Acks an upstream PING, in the priority lane; {@code false} when the upstream
+		 * already waits for too many acks.
+		 */
+		boolean queuePingAck(byte[] payload) {
+			Http2DemuxRelay.this.lock.lock();
+			try {
+				if (!acceptingLocked()) {
+					return true;
+				}
+				if (this.pingAcks.size() >= MAX_PENDING_PING_ACKS) {
+					return false;
+				}
+				this.pingAcks.addLast(payload);
+				signalLocked();
+				return true;
+			}
+			finally {
+				Http2DemuxRelay.this.lock.unlock();
+			}
+		}
+
+		/**
+		 * Releases the upstream's connection window for DATA payload relayed to the
+		 * client, in the priority lane.
+		 */
+		void queueConnectionGrant(int units) {
+			Http2DemuxRelay.this.lock.lock();
+			try {
+				if (acceptingLocked()) {
+					this.connectionGrant = Math.min(Integer.MAX_VALUE, this.connectionGrant + units);
+					signalLocked();
+				}
+			}
+			finally {
+				Http2DemuxRelay.this.lock.unlock();
+			}
+		}
+
+		/** Half-closes the upstream once the queued frames are written. */
+		void halfClose() {
+			Http2DemuxRelay.this.lock.lock();
+			try {
+				if (acceptingLocked()) {
+					this.entries.addLast(LegEntry.HalfClose.INSTANCE);
+					signalLocked();
+				}
+			}
+			finally {
+				Http2DemuxRelay.this.lock.unlock();
+			}
+		}
+
+		/**
+		 * The writer's next batch: the priority lane, then one entry; blocks while both
+		 * are empty, {@code null} once the leg is closed.
+		 */
+		@Nullable Batch take() throws InterruptedException {
+			Http2DemuxRelay.this.lock.lock();
+			try {
+				while (true) {
+					if (this.closed) {
+						return null;
+					}
+					byte[] control = drainControlLocked();
+					LegEntry entry = this.entries.pollFirst();
+					if (control.length > 0 || entry != null) {
+						return batchLocked(control, entry);
+					}
+					this.wake.await();
+					this.routeMeters.writerWakeups().increment();
+				}
+			}
+			finally {
+				Http2DemuxRelay.this.lock.unlock();
+			}
+		}
+
+		private byte[] drainControlLocked() {
+			if (this.settings.isEmpty() && this.settingsAcks == 0 && this.pingAcks.isEmpty()
+					&& this.connectionGrant == 0) {
+				return new byte[0];
+			}
+			ByteArrayOutputStream out = new ByteArrayOutputStream(64);
+			if (!this.settings.isEmpty()) {
+				out.writeBytes(settingsFrame(this.settings));
+				this.settings.clear();
+			}
+			for (; this.settingsAcks > 0; this.settingsAcks--) {
+				out.writeBytes(frame(FRAME_SETTINGS, FLAG_ACK, 0, null, 0, 0));
+			}
+			for (byte[] ping = this.pingAcks.pollFirst(); ping != null; ping = this.pingAcks.pollFirst()) {
+				out.writeBytes(frame(FRAME_PING, FLAG_ACK, 0, ping, 0, ping.length));
+			}
+			if (this.connectionGrant > 0) {
+				out.writeBytes(windowUpdate(0, (int) this.connectionGrant));
+				this.connectionGrant = 0;
+			}
+			return out.toByteArray();
+		}
+
+		private Batch batchLocked(byte[] control, @Nullable LegEntry entry) {
+			return switch (entry) {
+				case null -> new Batch(control, new byte[0], null, 0, 0, false);
+				case LegEntry.Block block ->
+					new Batch(control, block.bytes(), block.stream(), 0, block.bytes().length, false);
+				case LegEntry.Data data -> {
+					Stream stream = data.stream();
+					stream.dataQueued = false;
+					byte[] payload = stream.pendingData.toByteArray();
+					stream.pendingData.reset();
+					boolean end = stream.pendingEnd;
+					stream.pendingEnd = false;
+					// nothing left once a reset purged the payload
+					byte[] frames = payload.length > 0 || end ? dataFrames(stream.id, payload, end) : new byte[0];
+					yield new Batch(control, frames, stream, payload.length, payload.length + FRAME_HEADER_LENGTH,
+							false);
+				}
+				case LegEntry.WindowUpdate update -> {
+					update.stream().windowUpdate = null;
+					yield new Batch(control, windowUpdate(update.stream().id, update.increment), update.stream(), 0,
+							FRAME_HEADER_LENGTH + 4, false);
+				}
+				case LegEntry.HalfClose halfClose -> {
+					this.halfClosed = true;
+					yield new Batch(control, new byte[0], null, 0, 0, true);
+				}
+			};
+		}
+
+		/**
+		 * Accounts a written batch; returns the stream window the drain released to the
+		 * client.
+		 */
+		int written(Batch batch) {
+			Http2DemuxRelay.this.lock.lock();
+			try {
 				if (this.closed) {
-					return;
+					return 0;
 				}
-				overflow = this.queuedBytes.get() + bytes > MAX_QUEUED_BYTES;
-				if (!overflow) {
-					this.queuedBytes.addAndGet(bytes);
-					this.outboundWrites.offerLast(write);
+				Stream stream = batch.stream();
+				addQueuedLocked(stream, -batch.queued());
+				if (stream == null) {
+					return 0;
 				}
+				stream.queuedPayload -= batch.payload();
+				int release = releaseLocked(stream);
+				updateActiveLocked(stream);
+				return release;
 			}
-			if (overflow) {
-				abort();
+			finally {
+				Http2DemuxRelay.this.lock.unlock();
 			}
-		}
-
-		/** Queues one frame towards the upstream. */
-		void relayFrame(byte[] frameBytes) {
-			enqueue(new LegWrite.Frame(frameBytes, true));
-		}
-
-		void relayFrames(List<byte[]> frames) {
-			for (byte[] frame : frames) {
-				relayFrame(frame);
-			}
-		}
-
-		/** A late SETTINGS payload from the client, re-announced to the upstream. */
-		void relaySettings(byte[] payload) {
-			relayFrame(frame(FRAME_SETTINGS, 0, 0, payload, 0, payload.length));
 		}
 
 		void streamOpened(int streamId) {
 			this.openStreams.add(Integer.valueOf(streamId));
 		}
 
-		/** The client reset the stream: no response follows on it. */
-		void streamClosedByClient(int streamId) {
+		/** No response follows on the stream (reset by either side). */
+		void streamClosed(int streamId) {
 			this.openStreams.remove(Integer.valueOf(streamId));
 		}
 
-		/** The response of a stream ended on the leg's inbound side. */
+		/**
+		 * The response of a stream ended on the leg's inbound side; uncounted before its
+		 * end reaches the client, so a stream the client opens on seeing it is admitted.
+		 */
 		void responseEnded(int streamId) {
 			this.openStreams.remove(Integer.valueOf(streamId));
+			Stream stream = Http2DemuxRelay.this.streams.get(Integer.valueOf(streamId));
+			if (stream == null || stream.leg != this) {
+				return;
+			}
+			Http2DemuxRelay.this.lock.lock();
+			try {
+				stream.responseEnded = true;
+				updateActiveLocked(stream);
+			}
+			finally {
+				Http2DemuxRelay.this.lock.unlock();
+			}
 		}
 
 		/**
 		 * Assembles one response-head fragment; on the completed block the head is
 		 * decoded with this leg's decoder -- mirroring the upstream's encoder -- and
-		 * re-encoded table-less towards the client.
+		 * re-encoded table-less towards the client, in one write so no other frame lands
+		 * inside the block.
 		 */
 		void inboundHead(int type, int flags, int streamId, byte[] all, int payload, int length) {
 			boolean head = type == FRAME_HEADERS;
@@ -799,7 +1377,7 @@ final class Http2DemuxRelay {
 			if (buffer == null) {
 				return; // a continuation of a head this leg never saw the start of
 			}
-			appendFragmentTo(buffer, flags, all, payload, length, head);
+			appendFragmentTo(buffer, new Frame(type, flags, streamId, all, payload, length), head);
 			if ((flags & FLAG_END_HEADERS) == 0) {
 				return;
 			}
@@ -816,54 +1394,71 @@ final class Http2DemuxRelay {
 				// alive
 				headers = new io.netty.handler.codec.http2.DefaultHttp2Headers();
 			}
-			for (byte[] frame : Http2DemuxRelay.encodedHead(streamId, endStream, headers, null, this.responseEncoder)) {
-				writeToClient(frame, 0, frame.length, this);
-			}
+			byte[] frames = Http2DemuxRelay.encodedHead(streamId, endStream, headers, null, this.responseEncoder);
 			if (endStream) {
 				responseEnded(streamId);
 			}
+			writeToClient(frames, 0, frames.length, this);
 		}
 
 		boolean hasOpenStreams() {
 			return !this.openStreams.isEmpty();
 		}
 
-		/** Half-closes the client side once the queued frames are written. */
-		void halfClose() {
-			enqueue(LegWrite.HalfClose.INSTANCE);
-		}
-
 		/** Closes the virtual connection, releasing the upstream. */
 		void close() {
-			this.closed = true;
+			Http2DemuxRelay.this.lock.lock();
+			try {
+				if (this.closed) {
+					return;
+				}
+				this.closed = true;
+				addQueuedLocked(null, -this.queuedBytes);
+				this.entries.clear();
+				this.pingAcks.clear();
+				this.wake.signalAll();
+			}
+			finally {
+				Http2DemuxRelay.this.lock.unlock();
+			}
 			this.connection.close();
-			meterRegistry.remove(this.queuedGauge.getId());
 		}
 
 	}
 
 	/**
-	 * The leg's writer: performs the queued writes on the leg's upstream sink, one
-	 * {@code pumpOutbound} per leg so a stalled leg never stops the others. A write
-	 * failure is treated as one in {@code pumpOutbound}: the relay is torn down. The
-	 * thread's exit takes part in {@code pending} like the inbound pumps; it ends once
-	 * the relay closed the leg, or once both of its feeders are done -- the client
-	 * drained and the leg's inbound pump ended -- and the queue is empty.
+	 * The leg's writer: writes the preface, then batch after batch -- the priority lane
+	 * ahead of the next queued entry -- on the leg's upstream sink, so a stalled leg
+	 * never stops the others. It sleeps while nothing is queued, and exits once the leg
+	 * is closed or after the upstream's half-close. A write failure tears the relay down.
 	 */
 	private void pumpLegOutbound(Leg leg) {
 		try {
-			while (true) {
-				LegWrite write = leg.outboundWrites.poll(100, TimeUnit.MILLISECONDS);
-				if (write != null) {
-					if (write instanceof LegWrite.Frame frame) {
-						writeToUpstream(leg, frame.bytes(), frame.counted());
-					}
-					else {
-						halfCloseUpstream(leg);
-					}
-					continue;
+			OutputStream sink = leg.connection.sink();
+			sink.write(leg.preface);
+			sink.flush();
+			Batch batch;
+			while ((batch = leg.take()) != null) {
+				byte[] bytes = batch.bytes();
+				if (batch.control().length + bytes.length > 0) {
+					byte[] all = new byte[batch.control().length + bytes.length];
+					System.arraycopy(batch.control(), 0, all, 0, batch.control().length);
+					System.arraycopy(bytes, 0, all, batch.control().length, bytes.length);
+					sink.write(all);
+					sink.flush();
 				}
-				if (leg.closed || (this.outboundDrained && leg.ended && leg.outboundWrites.isEmpty())) {
+				if (bytes.length > 0) {
+					leg.inbound.increment(bytes.length);
+					leg.session.recordRelayed(bytes.length, StreamRelay.Direction.TO_REMOTE);
+					this.access.bytes(bytes.length, StreamRelay.Direction.TO_REMOTE);
+				}
+				Stream stream = batch.stream();
+				int release = leg.written(batch);
+				if (stream != null) {
+					grantStream(stream.id, release);
+				}
+				if (batch.halfClose()) {
+					sink.close();
 					return;
 				}
 			}
@@ -879,39 +1474,31 @@ final class Http2DemuxRelay {
 		}
 	}
 
-	private void halfCloseUpstream(Leg leg) {
-		try {
-			leg.connection.sink().close();
+	/** DATA frames of at most the default maximum frame size carrying the payload. */
+	private static byte[] dataFrames(int streamId, byte[] payload, boolean endStream) {
+		ByteArrayOutputStream frames = new ByteArrayOutputStream(payload.length + 2 * FRAME_HEADER_LENGTH);
+		int offset = 0;
+		do {
+			int length = Math.min(MAX_FRAME_SIZE, payload.length - offset);
+			boolean last = offset + length >= payload.length;
+			frames.writeBytes(
+					frame(FRAME_DATA, last && endStream ? FLAG_END_STREAM : 0, streamId, payload, offset, length));
+			offset += length;
 		}
-		catch (Exception e) {
-			throw new IllegalStateException(e);
-		}
+		while (offset < payload.length);
+		return frames.toByteArray();
 	}
 
-	/**
-	 * Writes one frame to the leg's upstream, accounting it to the leg and the access log
-	 * when counted; the leg's single writer keeps the writes in stream order.
-	 */
-	private void writeToUpstream(Leg leg, byte[] frameBytes, boolean counted) {
-		try {
-			OutputStream sink = leg.connection.sink();
-			sink.write(frameBytes);
-			sink.flush();
-		}
-		catch (Exception e) {
-			throw new IllegalStateException(e);
-		}
-		leg.queuedBytes.addAndGet(-frameBytes.length);
-		if (counted) {
-			leg.outbound.increment(frameBytes.length);
-			leg.session.recordRelayed(frameBytes.length, StreamRelay.Direction.TO_REMOTE);
-			this.access.bytes(frameBytes.length, StreamRelay.Direction.TO_REMOTE);
-		}
+	private static byte[] settingsFrame(Map<Integer, Long> settings) {
+		ByteArrayOutputStream payload = new ByteArrayOutputStream(settings.size() * 6);
+		settings.forEach((id, value) -> payload.writeBytes(setting(id, value)));
+		byte[] bytes = payload.toByteArray();
+		return frame(FRAME_SETTINGS, 0, 0, bytes, 0, bytes.length);
 	}
 
 	/**
 	 * The inbound side of a leg: relays the response frames and releases the leg's
-	 * connection window for the bytes forwarded (see {@link #relayInbound}).
+	 * connection window for the DATA forwarded (see {@link #relayInbound}).
 	 */
 	private void pumpInbound(Leg leg) {
 		try {
@@ -921,8 +1508,6 @@ final class Http2DemuxRelay {
 			int n;
 			while ((n = in.read(buffer)) > 0) {
 				relayInbound(leg, scan, buffer, n);
-				// the bytes left towards the client: released upstream through the queue
-				leg.enqueue(new LegWrite.Frame(windowUpdate(0, n), false));
 			}
 			// the upstream half-closed: owed responses end the relay, an idle leg retires
 			if (leg.hasOpenStreams()) {
@@ -939,10 +1524,11 @@ final class Http2DemuxRelay {
 	}
 
 	/**
-	 * Relays the leg's stream-scoped frames verbatim to the client and handles the
+	 * Relays the leg's stream-scoped frames to the client and handles the
 	 * connection-level ones locally: the client face of the relay owns that state, so the
-	 * leg's settings are acked, its pings answered, and its window updates and goaway
-	 * absorbed by the regeneration below -- never forwarded.
+	 * leg's settings are acked, its pings answered, its stream window updates granted
+	 * through the stream's budget, and its connection window updates and goaway absorbed
+	 * -- never forwarded.
 	 */
 	private void relayInbound(Leg leg, ByteArrayOutputStream scan, byte[] chunk, int length) {
 		scan.write(chunk, 0, length);
@@ -957,24 +1543,20 @@ final class Http2DemuxRelay {
 			int type = header.get() & 0xff;
 			int flags = header.get() & 0xff;
 			int streamId = header.getInt() & 0x7fffffff;
-			int end = position + FRAME_HEADER_LENGTH + frameLength;
+			int payload = position + FRAME_HEADER_LENGTH;
+			int end = payload + frameLength;
 			if (streamId != 0) {
-				if (type == FRAME_HEADERS || type == FRAME_CONTINUATION) {
-					leg.inboundHead(type, flags, streamId, all, position + FRAME_HEADER_LENGTH, frameLength);
-				}
-				else {
-					writeToClient(all, position, end - position, leg);
-					if (type == FRAME_DATA && (flags & FLAG_END_STREAM) != 0) {
-						leg.responseEnded(streamId);
-					}
-				}
+				relayStreamFrame(leg, new Frame(type, flags, streamId, all, payload, frameLength), position);
 			}
 			else if (type == FRAME_SETTINGS && (flags & FLAG_ACK) == 0) {
-				leg.enqueue(new LegWrite.Frame(frame(FRAME_SETTINGS, FLAG_ACK, 0, null, 0, 0), false));
+				leg.queueSettingsAck();
 			}
 			else if (type == FRAME_PING && (flags & FLAG_ACK) == 0 && frameLength == 8) {
-				leg.enqueue(new LegWrite.Frame(frame(FRAME_PING, FLAG_ACK, 0, all, position + FRAME_HEADER_LENGTH, 8),
-						false));
+				byte[] ping = new byte[8];
+				System.arraycopy(all, payload, ping, 0, 8);
+				if (!leg.queuePingAck(ping)) {
+					abort(); // a ping flood while the leg is stalled
+				}
 			}
 			position = end;
 		}
@@ -984,8 +1566,74 @@ final class Http2DemuxRelay {
 		scan.write(remainder, 0, remainder.length);
 	}
 
+	private void relayStreamFrame(Leg leg, Frame frame, int position) {
+		int frameBytes = FRAME_HEADER_LENGTH + frame.length();
+		switch (frame.type()) {
+			case FRAME_HEADERS, FRAME_CONTINUATION -> leg.inboundHead(frame.type(), frame.flags(), frame.streamId(),
+					frame.bytes(), frame.payload(), frame.length());
+			case FRAME_WINDOW_UPDATE -> onUpstreamWindowUpdate(leg, frame);
+			case FRAME_DATA -> {
+				if (frame.has(FLAG_END_STREAM)) {
+					leg.responseEnded(frame.streamId());
+				}
+				writeToClient(frame.bytes(), position, frameBytes, leg);
+				if (frame.length() > 0) {
+					// the payload left towards the client: released upstream
+					leg.queueConnectionGrant(frame.length());
+				}
+			}
+			case FRAME_RST_STREAM -> {
+				onUpstreamReset(leg, frame.streamId());
+				writeToClient(frame.bytes(), position, frameBytes, leg);
+			}
+			default -> writeToClient(frame.bytes(), position, frameBytes, leg);
+		}
+	}
+
+	/** The upstream's stream window grant, owed to the client within the budget. */
+	private void onUpstreamWindowUpdate(Leg leg, Frame frame) {
+		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
+		if (stream == null || stream.leg != leg || frame.length() != 4) {
+			return;
+		}
+		int release;
+		this.lock.lock();
+		try {
+			stream.held = Math.min(Integer.MAX_VALUE, stream.held + int31(frame.bytes(), frame.payload()));
+			release = releaseLocked(stream);
+		}
+		finally {
+			this.lock.unlock();
+		}
+		grantStream(stream.id, release);
+	}
+
+	/**
+	 * The upstream reset the stream: closed both ways, its pending data dropped;
+	 * uncounted before the reset reaches the client.
+	 */
+	private void onUpstreamReset(Leg leg, int streamId) {
+		leg.streamClosed(streamId);
+		Stream stream = this.streams.get(Integer.valueOf(streamId));
+		if (stream == null || stream.leg != leg) {
+			return;
+		}
+		this.lock.lock();
+		try {
+			stream.reset = true;
+			stream.clientEnded = true;
+			stream.responseEnded = true;
+			stream.held = 0;
+			leg.purgeData(stream);
+			updateActiveLocked(stream);
+		}
+		finally {
+			this.lock.unlock();
+		}
+	}
+
 	private void settle() {
-		if (pending.decrementAndGet() == 0) {
+		if (this.pending.decrementAndGet() == 0) {
 			finishRelay();
 		}
 	}
@@ -997,6 +1645,11 @@ final class Http2DemuxRelay {
 		for (Leg leg : this.legs) {
 			leg.close();
 			leg.session.remove(leg.connection.connectionId());
+		}
+		for (Stream stream : this.streams.values()) {
+			if (this.streams.remove(Integer.valueOf(stream.id), stream)) {
+				stream.leg.routeMeters.trackedStreams().decrement();
+			}
 		}
 		try {
 			this.pipe.close();
@@ -1026,17 +1679,46 @@ final class Http2DemuxRelay {
 	}
 
 	/**
-	 * One write on a leg's upstream sink, queued for the leg's writer thread.
+	 * One batch of the leg writer: the priority lane's frames, then one entry's bytes,
+	 * with what the entry held queued for its stream.
 	 */
-	private sealed interface LegWrite {
+	private record Batch(byte[] control, byte[] bytes, @Nullable Stream stream, int payload, long queued,
+			boolean halfClose) {
+	}
 
-		/** A protocol frame; a counted one is metered as relayed payload bytes. */
-		record Frame(byte[] bytes, boolean counted) implements LegWrite {
+	/** One entry of a leg's queue. */
+	private sealed interface LegEntry {
+
+		/** Relayed frames written as one: a whole header block, or a reset. */
+		record Block(Stream stream, byte[] bytes) implements LegEntry {
+
+		}
+
+		/** The stream's pending DATA payload, framed when the writer takes it. */
+		record Data(Stream stream) implements LegEntry {
+
+		}
+
+		/** A stream window update; later ones coalesce into it while it waits. */
+		final class WindowUpdate implements LegEntry {
+
+			private final Stream stream;
+
+			int increment;
+
+			WindowUpdate(Stream stream, int increment) {
+				this.stream = stream;
+				this.increment = increment;
+			}
+
+			Stream stream() {
+				return this.stream;
+			}
 
 		}
 
 		/** The final half-close of the client side, after the pending frames. */
-		enum HalfClose implements LegWrite {
+		enum HalfClose implements LegEntry {
 
 			INSTANCE
 

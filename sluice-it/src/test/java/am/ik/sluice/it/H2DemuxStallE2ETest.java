@@ -49,10 +49,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * The h2 demux must not couple its legs on the outbound side: with one leg's upstream
- * gone quiet -- every buffer between the relay and that upstream filled -- the other leg
- * of the same client connection still completes. And the per-leg queue stays bounded: a
- * client ignoring the flow-control windows gets the connection closed instead of the
- * relay buffering without limit.
+ * gone quiet -- every buffer between the relay and that upstream filled, the leg's queue
+ * engaged -- the other leg of the same client connection still completes. And a client
+ * sending past a stream's window gets the connection closed with a FLOW_CONTROL_ERROR
+ * instead of the relay queueing beyond the stream's budget.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -63,14 +63,10 @@ class H2DemuxStallE2ETest {
 	private static final int CHUNK = 16 * 1024;
 
 	/**
-	 * The total pushed on the stalled leg: past the per-connection bounds and socket
-	 * buffers of the whole relay path (the client's 8MiB inbound bound, the server's 1MiB
-	 * sender queue, the gRPC windows), yet below that path plus the 4MiB leg queue cap,
-	 * so the relay survives with its queue engaged.
+	 * What the relay may queue for one stream: its payload budget (the client window plus
+	 * the queue allowance) and the framing of its entries.
 	 */
-	private static final long PUSHED_TOTAL = 4L * 1024 * 1024;
-
-	private static final long MAX_QUEUED_BYTES = 4L * 1024 * 1024;
+	private static final long STREAM_QUEUE_BOUND = 65535 + 64 * 1024 + 1024;
 
 	private static final String ECHO_BODY = "echo-h2d";
 
@@ -100,7 +96,7 @@ class H2DemuxStallE2ETest {
 
 	@BeforeAll
 	static void startUpstreams() {
-		stallUpstream = stub(H2DemuxStallE2ETest::hold);
+		stallUpstream = stub(H2DemuxStallE2ETest::grantThenHold);
 		echoUpstream = stub(H2DemuxStallE2ETest::serveEcho);
 		capUpstream = stub(H2DemuxStallE2ETest::hold);
 	}
@@ -131,136 +127,70 @@ class H2DemuxStallE2ETest {
 	}
 
 	/**
-	 * A leg held on the full relay path -- its upstream accepts and never reads -- must
-	 * not stop the other leg of the same client connection.
+	 * A leg held on the full relay path -- its upstream granted a huge window, then
+	 * accepts and never reads -- must not stop the other leg of the same client
+	 * connection.
 	 */
 	@Test
 	void stalledLegKeepsTheOtherLegsFlowing() throws Exception {
 		startClient("h2d.stall.test", stallUpstream);
 		startClient("h2d.echo.test", echoUpstream);
-		AtomicLong written = new AtomicLong();
-		Map<Integer, List<TestH2.Frame>> seen = new ConcurrentHashMap<>();
-		CountDownLatch echoDone = new CountDownLatch(1);
-		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
-			OutputStream out = socket.getOutputStream();
-			Thread.ofVirtual().name("e2e-h2d-reader").start(() -> readFrames(socket, echoDone, seen));
-			byte[] head = TestH2.headerBlock(":authority=h2d.stall.test", ":method=POST", ":path=/slow");
-			synchronized (out) {
-				out.write(TestH2.PREFACE);
-				TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
-				TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS, 1, head);
-			}
-			Thread pusher = Thread.ofVirtual().name("e2e-h2d-push-a").start(() -> pushData(out, 1, written));
+		AtomicBoolean stop = new AtomicBoolean();
+		try (H2TestClient client = H2TestClient.connect(dataPort, 3)) {
+			client.headers(1, false, TestH2.headerBlock(":authority=h2d.stall.test", ":method=POST", ":path=/slow"));
+			Thread.ofVirtual().name("e2e-h2d-push-a").start(() -> {
+				try {
+					while (!stop.get() && !client.closed()) {
+						client.fill(1, Duration.ofMillis(100));
+					}
+				}
+				catch (IOException | InterruptedException e) {
+					// torn down
+				}
+			});
 			// the path saturates: the relayed bytes plateau above the per-connection
 			// bounds and the socket buffers, and stay there
 			awaitOutboundPlateau("h2d.stall.test");
-			byte[] second = TestH2.headerBlock(":authority=h2d.echo.test", ":method=GET", ":path=/fast");
-			synchronized (out) {
-				TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 3, second);
-			}
-			assertThat(echoDone.await(5, TimeUnit.SECONDS)).as("the second leg answers within 5s").isTrue();
-			assertThat(TestH2.bodyOf(Objects.requireNonNull(seen.get(Integer.valueOf(3))))).isEqualTo(ECHO_BODY);
-			assertThat(written.get()).as("bytes pushed on the stalled leg").isGreaterThan(2L * 1024 * 1024);
-			socket.close(); // ends the reader and the pusher
+			long queued = queuedBytes("h2d.stall.test");
+			client.headers(3, true, TestH2.headerBlock(":authority=h2d.echo.test", ":method=GET", ":path=/fast"));
+			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).as("the second leg answers within 5s").isTrue();
+			stop.set(true);
+			assertThat(TestH2.bodyOf(client.frames(3))).isEqualTo(ECHO_BODY);
+			assertThat(queued).as("the stall reached the leg queue when the second request was sent")
+				.isGreaterThan(0)
+				.isLessThanOrEqualTo(STREAM_QUEUE_BOUND);
+			assertThat(client.streamSent(1)).as("bytes pushed on the stalled leg").isGreaterThan(2L * 1024 * 1024);
+			assertThat(client.maxOvershoot()).isLessThanOrEqualTo(0);
 		}
 	}
 
 	/**
-	 * A client ignoring the stream windows pushes past the per-leg queue cap: the
-	 * connection is closed, and the queued bytes never grew past the cap.
+	 * A client sending past the stream window gets a GOAWAY FLOW_CONTROL_ERROR and the
+	 * connection closed; the leg queue never held more than the stream's budget.
 	 */
 	@Test
-	void legQueueOverflowClosesTheConnection() throws Exception {
+	void streamOverItsWindowClosesTheConnection() throws Exception {
 		String route = "h2d.cap.test";
 		startClient(route, capUpstream);
-		AtomicBoolean closed = new AtomicBoolean();
 		AtomicLong maxQueued = new AtomicLong();
-		AtomicLong pushed = new AtomicLong();
-		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
-			OutputStream out = socket.getOutputStream();
-			Thread.ofVirtual().name("e2e-h2d-cap-reader").start(() -> drainUntilClosed(socket, closed));
-			byte[] head = TestH2.headerBlock(":authority=h2d.cap.test", ":method=POST", ":path=/flood");
-			out.write(TestH2.PREFACE);
-			TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
-			TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS, 1, head);
-			Thread pusher = Thread.ofVirtual()
-				.name("e2e-h2d-cap-push")
-				.start(() -> pushUntilClosed(out, 1, closed, pushed, maxQueued, route));
-			Awaitility.await().atMost(Duration.ofSeconds(60)).untilTrue(closed);
-			assertThat(pushed.get()).as("bytes pushed past the queues").isGreaterThan(2 * 1024 * 1024);
-			assertThat(maxQueued.get()).as("queued-bytes high-water mark")
-				.isGreaterThan(1024 * 1024)
-				.isLessThanOrEqualTo(MAX_QUEUED_BYTES);
-			socket.close();
-			pusher.join(TimeUnit.SECONDS.toMillis(5));
-		}
-	}
-
-	/** Collects the echo stream's frames, signalling its DATA END_STREAM. */
-	private static void readFrames(Socket socket, CountDownLatch echoDone, Map<Integer, List<TestH2.Frame>> seen) {
-		try {
-			InputStream in = socket.getInputStream();
-			TestH2.@Nullable Frame frame;
-			while ((frame = TestH2.readFrame(in)) != null) {
-				if (frame.streamId() == 3) {
-					seen.computeIfAbsent(Integer.valueOf(3), id -> new ArrayList<>()).add(frame);
-					if (frame.type() == TestH2.DATA && (frame.flags() & TestH2.FLAG_END_STREAM) != 0) {
-						echoDone.countDown();
-					}
-				}
-			}
-		}
-		catch (IOException e) {
-			// the socket ended
-		}
-	}
-
-	/** The connection is over once the server's side closes; every read byte counts. */
-	private static void drainUntilClosed(Socket socket, AtomicBoolean closed) {
-		try {
-			InputStream in = socket.getInputStream();
-			while (in.read() != -1) {
-				// the window grants must drain, or the relay's writes would stall
-			}
-			closed.set(true);
-		}
-		catch (IOException e) {
-			closed.set(true); // reset counts as closed
-		}
-	}
-
-	/** Pushes DATA frames on the stream until {@code #PUSHED_TOTAL}, then ends it. */
-	private static void pushData(OutputStream out, int streamId, AtomicLong written) {
-		try {
+		try (H2TestClient client = H2TestClient.connect(dataPort)) {
+			client.headers(1, false, TestH2.headerBlock(":authority=h2d.cap.test", ":method=POST", ":path=/flood"));
 			byte[] chunk = new byte[CHUNK];
-			for (long sent = 0; sent < PUSHED_TOTAL; sent += CHUNK) {
-				int flags = sent + CHUNK >= PUSHED_TOTAL ? TestH2.FLAG_END_STREAM : 0;
-				synchronized (out) {
-					TestH2.writeFrame(out, TestH2.DATA, flags, streamId, chunk);
-				}
-				written.addAndGet(CHUNK);
-			}
-		}
-		catch (IOException e) {
-			// torn down
-		}
-	}
-
-	/** Pushes DATA frames until the connection closes, sampling the leg queue gauge. */
-	private void pushUntilClosed(OutputStream out, int streamId, AtomicBoolean closed, AtomicLong pushed,
-			AtomicLong maxQueued, String route) {
-		byte[] chunk = new byte[CHUNK];
-		while (!closed.get()) {
+			long pushed = 0;
 			try {
-				synchronized (out) {
-					TestH2.writeFrame(out, TestH2.DATA, 0, streamId, chunk);
+				while (!client.closed() && pushed < 64L * 1024 * 1024) {
+					client.sendData(1, chunk, 0);
+					pushed += CHUNK;
+					maxQueued.accumulateAndGet(queuedBytes(route), Math::max);
 				}
 			}
 			catch (IOException e) {
-				return; // the server closed the connection
+				// the server closed the connection
 			}
-			pushed.addAndGet(CHUNK);
-			maxQueued.accumulateAndGet(queuedBytes(route), Math::max);
+			Awaitility.await().atMost(Duration.ofSeconds(10)).until(client::closed);
+			assertThat(client.goAwayCode()).as("GOAWAY error code").isEqualTo(TestH2.FLOW_CONTROL_ERROR);
+			assertThat(client.maxOvershoot()).as("the client did exceed the window").isGreaterThan(0);
+			assertThat(maxQueued.get()).as("queued-bytes high-water mark").isLessThanOrEqualTo(STREAM_QUEUE_BOUND);
 		}
 	}
 
@@ -282,12 +212,13 @@ class H2DemuxStallE2ETest {
 	}
 
 	/**
-	 * The route's {@code sluice.tunnel.bytes} outbound counter; zero before it exists.
+	 * The route's {@code sluice.tunnel.bytes} inbound counter (bytes towards the
+	 * upstream); zero before it exists.
 	 */
 	private double relayedBytes(String route) {
 		Counter counter = Objects.requireNonNull(meterRegistry)
-			.get("sluice.tunnel.bytes")
-			.tags("direction", "outbound", "route", route)
+			.find("sluice.tunnel.bytes")
+			.tags("direction", "inbound", "route", route)
 			.counter();
 		return counter == null ? 0 : counter.count();
 	}
@@ -345,6 +276,23 @@ class H2DemuxStallE2ETest {
 		catch (IOException e) {
 			throw new IllegalStateException(e);
 		}
+	}
+
+	/**
+	 * Grants the connection and stream 1 a huge window, then never reads, holding the
+	 * socket for the teardown.
+	 */
+	private static void grantThenHold(Socket socket) {
+		try {
+			OutputStream out = socket.getOutputStream();
+			TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
+			TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(Integer.MAX_VALUE - 65535));
+			TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(Integer.MAX_VALUE - 65535));
+		}
+		catch (IOException e) {
+			return;
+		}
+		hold(socket);
 	}
 
 	/** Accepts and never reads, holding the socket for the teardown. */

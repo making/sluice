@@ -14,7 +14,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * its own, and each is handed out at most once per JVM. The random start keeps concurrent
  * builds on one host apart.
  */
-final class TestPorts {
+public final class TestPorts {
 
 	private static final int FIRST = 20000;
 
@@ -27,7 +27,7 @@ final class TestPorts {
 	private TestPorts() {
 	}
 
-	static int freePort() {
+	public static int freePort() {
 		int n;
 		while ((n = cursor.getAndIncrement()) < SIZE) {
 			int port = FIRST + (START + n) % SIZE;

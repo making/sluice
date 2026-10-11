@@ -15,30 +15,44 @@ import java.util.List;
  * h2 with the data plane and a stub upstream (frame encode/decode, no HPACK table
  * dynamics -- literal no-index encoding only).
  */
-final class TestH2 {
+public final class TestH2 {
 
-	static final byte[] PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
+	public static final byte[] PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
 
-	static final int DATA = 0x0;
+	public static final int DATA = 0x0;
 
-	static final int HEADERS = 0x1;
+	public static final int HEADERS = 0x1;
 
-	static final int SETTINGS = 0x4;
+	public static final int SETTINGS = 0x4;
 
-	static final int RST_STREAM = 0x3;
+	public static final int RST_STREAM = 0x3;
 
-	static final int CONTINUATION = 0x9;
+	public static final int CONTINUATION = 0x9;
 
-	static final int FLAG_END_STREAM = 0x1;
+	public static final int PING = 0x6;
 
-	static final int FLAG_ACK = 0x1;
+	public static final int GOAWAY = 0x7;
 
-	static final int FLAG_END_HEADERS = 0x4;
+	public static final int WINDOW_UPDATE = 0x8;
+
+	public static final int FLAG_PADDED = 0x8;
+
+	public static final int SETTINGS_MAX_CONCURRENT_STREAMS = 0x3;
+
+	public static final int REFUSED_STREAM = 0x7;
+
+	public static final int FLOW_CONTROL_ERROR = 0x3;
+
+	public static final int FLAG_END_STREAM = 0x1;
+
+	public static final int FLAG_ACK = 0x1;
+
+	public static final int FLAG_END_HEADERS = 0x4;
 
 	private TestH2() {
 	}
 
-	record Frame(int type, int flags, int streamId, byte[] payload) {
+	public record Frame(int type, int flags, int streamId, byte[] payload) {
 
 		boolean endStream() {
 			return (this.flags & FLAG_END_STREAM) != 0 && this.type == DATA;
@@ -46,7 +60,8 @@ final class TestH2 {
 
 	}
 
-	static void writeFrame(OutputStream out, int type, int flags, int streamId, byte[] payload) throws IOException {
+	public static void writeFrame(OutputStream out, int type, int flags, int streamId, byte[] payload)
+			throws IOException {
 		ByteArrayOutputStream frame = new ByteArrayOutputStream(9 + payload.length);
 		frame.write((payload.length >>> 16) & 0xff);
 		frame.write((payload.length >>> 8) & 0xff);
@@ -72,7 +87,7 @@ final class TestH2 {
 		writeFrame(out, HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, streamId, headerBlock(headers));
 	}
 
-	static byte[] headerBlock(String... headers) {
+	public static byte[] headerBlock(String... headers) {
 		ByteArrayOutputStream block = new ByteArrayOutputStream();
 		for (String header : headers) {
 			int eq = header.indexOf('=');
@@ -93,7 +108,7 @@ final class TestH2 {
 	}
 
 	/** Reads frames until the next frame; returns it, or null on EOF. */
-	static @Nullable Frame readFrame(InputStream in) throws IOException {
+	public static @Nullable Frame readFrame(InputStream in) throws IOException {
 		byte[] header = in.readNBytes(9);
 		if (header.length < 9) {
 			return null;
@@ -150,7 +165,7 @@ final class TestH2 {
 		return out.toByteArray();
 	}
 
-	static String bodyOf(List<Frame> frames) {
+	public static String bodyOf(List<Frame> frames) {
 		ByteArrayOutputStream body = new ByteArrayOutputStream();
 		frames.stream().filter(frame -> frame.type == DATA).forEach(frame -> body.writeBytes(frame.payload()));
 		return body.toString(StandardCharsets.UTF_8);
@@ -160,7 +175,7 @@ final class TestH2 {
 	 * The stub upstream's canned response: SETTINGS, HEADERS with {@code :status 200}
 	 * (HPACK static-table index 8) and a DATA frame with END_STREAM.
 	 */
-	static byte[] cannedResponse(int streamId, String body) {
+	public static byte[] cannedResponse(int streamId, String body) {
 		ByteArrayOutputStream out = new ByteArrayOutputStream();
 		try {
 			writeFrame(out, SETTINGS, 0x0, 0, new byte[0]);
@@ -189,6 +204,28 @@ final class TestH2 {
 				return;
 			}
 		}
+	}
+
+	/** The 31-bit value at the start of the payload: a WINDOW_UPDATE increment. */
+	public static int increment(Frame frame) {
+		return int31(frame.payload(), 0);
+	}
+
+	/** The error code of a RST_STREAM (offset 0) or GOAWAY (offset 4) payload. */
+	public static int errorCode(Frame frame) {
+		int offset = frame.type() == GOAWAY ? 4 : 0;
+		byte[] p = frame.payload();
+		return (p[offset] & 0xff) << 24 | (p[offset + 1] & 0xff) << 16 | (p[offset + 2] & 0xff) << 8
+				| (p[offset + 3] & 0xff);
+	}
+
+	public static byte[] int32(int value) {
+		return new byte[] { (byte) (value >>> 24), (byte) (value >>> 16), (byte) (value >>> 8), (byte) value };
+	}
+
+	private static int int31(byte[] bytes, int offset) {
+		return (bytes[offset] & 0x7f) << 24 | (bytes[offset + 1] & 0xff) << 16 | (bytes[offset + 2] & 0xff) << 8
+				| (bytes[offset + 3] & 0xff);
 	}
 
 	static final class UncheckedIOException extends RuntimeException {

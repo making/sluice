@@ -89,6 +89,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	private final MeterRegistry meterRegistry;
 
+	private final H2DemuxMeters h2DemuxMeters;
+
 	private final AccessLogger accessLogger;
 
 	private final TaskExecutor taskExecutor;
@@ -111,6 +113,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		this.sessions = sessions;
 		this.properties = properties;
 		this.meterRegistry = meterRegistry;
+		this.h2DemuxMeters = new H2DemuxMeters(meterRegistry);
 		this.accessLogger = accessLogger;
 		this.accessControl = accessControl;
 		this.taskExecutor = taskExecutor;
@@ -306,7 +309,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			Runnable relayed = this.relayed(access);
 			if ("2".equals(request.version())) {
 				Http2DemuxRelay demux = new Http2DemuxRelay(conn.pipe(), conn.head(), this.router, this.sessions,
-						this.accessControl, this.errorResponse, access, this.meterRegistry, route0, session, peer,
+						this.accessControl, this.errorResponse, access, this.h2DemuxMeters, route0, session, peer,
 						relayed);
 				this.activeConnections.incrementAndGet();
 				try {
@@ -484,6 +487,11 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	/**
 	 * Number of connections currently relayed from the data plane listener.
 	 */
+	/** The meters of the h2 demux relays; for tests. */
+	H2DemuxMeters h2DemuxMeters() {
+		return this.h2DemuxMeters;
+	}
+
 	public int activeConnections() {
 		return this.activeConnections.get();
 	}

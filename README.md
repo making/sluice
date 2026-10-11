@@ -513,7 +513,7 @@ tunnel.
   cluster warmup window and while draining (see "Cluster (scale-out)")
 - client `GET /actuator/health` (port 9001) - UP while at least one per-node tunnel stream is
   established; the `tunnel` detail shows the connection state and `nodes` each node's stream state
-- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`
+- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`, and on the server `sluice_h2demux_queued_bytes` (bytes the h2 demux holds queued towards upstreams, one series per route)
 
 ## Console
 

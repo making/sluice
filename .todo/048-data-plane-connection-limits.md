@@ -3,7 +3,7 @@ Difficulty: Medium
 # Connection limits: bound the per-connection buffers (041 child 6/6)
 
 Parent: `.todo/041-tunnel-head-of-line-blocking.md`. After 043-046, buffering is bounded
-per connection (window, sender cap, h2 leg cap) but not in total: the total is
+per connection (window, sender cap, h2 demux queue bound) but not in total: the total is
 per-connection worst case x connections, and the number of connections is unlimited. An
 anonymous peer can open many connections that never read and exhaust memory. Not HOL
 itself; it is what makes the parent's memory bound real. Can be done before or after
@@ -48,7 +48,11 @@ keys in alphabetical order (CLAUDE.md).
    server side sees `remoteFailed` and closes the public connection.
 
 Defaults: derive from the worst-case memory per connection after 044-046 (receive window
-1MiB + sender cap 1MiB + h2 leg cap 4MiB per leg + socket buffers). Starting point:
+1MiB + sender cap 1MiB + socket buffers, per virtual connection). An h2 client connection
+opens one virtual connection per route it reaches (a leg), and its demux queue adds at
+most `Http2DemuxRelay.MAX_QUEUED_BYTES` per client connection (051: 100 streams x
+(128KiB payload budget + 2 x 64KiB header blocks + framing), about 25MiB; the payload
+part alone is 12.5MiB). Starting point:
 `max-connections` 2048, `max-connections-per-address` 256, client `max-connections` 2048.
 Check them against the memory limits of the deployment in `k8s.md` and write the formula
 and the resulting worst case in the README.
