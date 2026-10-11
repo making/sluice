@@ -28,7 +28,9 @@ import io.micrometer.core.instrument.MeterRegistry;
 /**
  * The limits every data plane connection lives under, shared by the data port and every
  * tcp route port: a cap on the connections open at once, a cap per source address, and
- * one deadline for the whole head phase; plus the queue budget the h2 demux relays share.
+ * one deadline for the whole head phase; the deadlines between the requests of a relayed
+ * HTTP connection ({@link KeepAliveDeadline}); plus the queue budget the h2 demux relays
+ * share.
  * <p>
  * The connection cap counts virtual connections: an h2 connection whose streams reach
  * several routes takes one more slot per further leg ({@link #tryAcquireLeg()}). An unset
@@ -42,7 +44,8 @@ import io.micrometer.core.instrument.MeterRegistry;
  * exit path, only the first call counts. A connection over a limit is closed without
  * being read. Rejections are counted as {@code sluice.data.connections.rejected} by
  * {@code reason} ({@code limit}, {@code address-limit}, {@code head-timeout}) and logged
- * through the access log's rate limit.
+ * through the access log's rate limit. Connections closed for idling between requests
+ * count as {@code sluice.data.connections.idle.closed}.
  */
 @Component
 public class ConnectionLimits implements DisposableBean {
@@ -59,6 +62,8 @@ public class ConnectionLimits implements DisposableBean {
 
 	private final Duration headTimeout;
 
+	private final Duration idleTimeout;
+
 	/** Open connections per source address; an entry lives while its count is > 0. */
 	private final ConcurrentMap<InetAddress, Integer> perAddress = new ConcurrentHashMap<>();
 
@@ -70,6 +75,8 @@ public class ConnectionLimits implements DisposableBean {
 
 	private final Counter rejectedHeadTimeout;
 
+	private final Counter idleClosed;
+
 	ConnectionLimits(SluiceServerProperties properties, MeterRegistry meterRegistry) {
 		SluiceServerProperties.Limits limits = properties.limits();
 		long maxHeap = Runtime.getRuntime().maxMemory();
@@ -80,13 +87,17 @@ public class ConnectionLimits implements DisposableBean {
 		int perAddress = limits.maxConnectionsPerAddress();
 		this.maxPerAddress = perAddress > 0 ? Math.min(perAddress, this.global.max()) : this.global.max();
 		this.headTimeout = limits.headTimeout();
+		this.idleTimeout = limits.idleTimeout();
 		this.deadlines = new ScheduledThreadPoolExecutor(1,
-				Thread.ofPlatform().name("sluice-head-deadline").daemon().factory());
+				Thread.ofPlatform().name("sluice-deadline").daemon().factory());
 		// a cancelled deadline leaves the queue at once instead of after the timeout
 		this.deadlines.setRemoveOnCancelPolicy(true);
 		this.rejectedLimit = rejected(meterRegistry, "limit");
 		this.rejectedAddressLimit = rejected(meterRegistry, "address-limit");
 		this.rejectedHeadTimeout = rejected(meterRegistry, "head-timeout");
+		this.idleClosed = Counter.builder("sluice.data.connections.idle.closed")
+			.description("Data plane connections closed after idling between requests for the idle timeout")
+			.register(meterRegistry);
 		Gauge.builder("sluice.data.connections.limit", this.global, ConnectionLimit::max)
 			.description("Data plane connections allowed open at once")
 			.register(meterRegistry);
@@ -99,12 +110,13 @@ public class ConnectionLimits implements DisposableBean {
 		Gauge.builder("sluice.h2demux.budget.used.bytes", this.h2Budget, H2DemuxBudget::used)
 			.description("Bytes the h2 demux relays queue beyond their per-connection allowance")
 			.register(meterRegistry);
-		log.info("data plane connection limit {} ({}), per address {}, head timeout {}, h2 queue budget {}KiB ({})",
+		log.info(
+				"data plane connection limit {} ({}), per address {}, head timeout {}, idle timeout {}, h2 queue budget {}KiB ({})",
 				this.global.max(),
 				limits.maxConnections() > 0 ? "configured"
 						: "derived: (half of max heap %dMiB - h2 queue budget) / %dKiB per connection"
 							.formatted(maxHeap >> 20, connectionBytes() >> 10),
-				this.maxPerAddress, this.headTimeout, budget >> 10,
+				this.maxPerAddress, this.headTimeout, this.idleTimeout, budget >> 10,
 				limits.h2QueueBudget().toBytes() > 0 ? "configured" : "derived: an eighth of half of max heap");
 	}
 
@@ -153,6 +165,19 @@ public class ConnectionLimits implements DisposableBean {
 	 */
 	ConnectionLimit.@Nullable Permit tryAcquireLeg() {
 		return this.global.tryAcquire();
+	}
+
+	/**
+	 * A disarmed deadline for the requests after the head phase of a relayed HTTP
+	 * connection; its expiry closes {@code socket}, the connection's transport.
+	 */
+	KeepAliveDeadline keepAliveDeadline(Socket socket) {
+		return new KeepAliveDeadline(socket);
+	}
+
+	/** Deadlines scheduled and not yet passed or cancelled; for tests. */
+	int scheduledDeadlines() {
+		return this.deadlines.getQueue().size();
 	}
 
 	/** The queue budget shared by the h2 demux relays. */
@@ -316,6 +341,152 @@ public class ConnectionLimits implements DisposableBean {
 
 		private void unclaim(InetAddress source) {
 			ConnectionLimits.this.perAddress.computeIfPresent(source, (key, count) -> count <= 1 ? null : count - 1);
+		}
+
+	}
+
+	/**
+	 * The deadline of a relayed HTTP connection after its head phase, driven by the relay
+	 * through {@link #enter(Phase)}: none while a request or response is in flight
+	 * ({@link Phase#BUSY}), the idle timeout while the connection idles between requests
+	 * ({@link Phase#IDLE}), the head timeout while a later request head is incomplete
+	 * ({@link Phase#HEAD}). A phase entered anew starts its timeout over; entering the
+	 * current phase keeps the running one. Once a timeout passes, the relay's teardown
+	 * runs on a virtual thread of its own -- never on the shared deadline thread, as it
+	 * may write -- and the transport socket is closed after it, or after
+	 * {@link #TEARDOWN_GRACE} at the latest should the teardown block on a write the peer
+	 * does not read. {@link #disarm()} ends the deadline for good: the relay ended, or
+	 * left HTTP (an upgrade).
+	 */
+	final class KeepAliveDeadline {
+
+		/** The most a teardown may take before the transport is closed under it. */
+		static final Duration TEARDOWN_GRACE = Duration.ofSeconds(1);
+
+		/** What the connection is doing, which decides its deadline. */
+		enum Phase {
+
+			/** A request or response is in flight: no deadline. */
+			BUSY,
+
+			/** Between requests: the idle timeout. */
+			IDLE,
+
+			/** A later request head is incomplete: the head timeout. */
+			HEAD
+
+		}
+
+		private final Socket socket;
+
+		private final Object lock = new Object();
+
+		private Phase phase = Phase.BUSY;
+
+		/** Bumped by every change, so a timeout that fires stale does nothing. */
+		private long generation;
+
+		private @Nullable ScheduledFuture<?> future;
+
+		private boolean expired;
+
+		private boolean disarmed;
+
+		private volatile Runnable teardown = () -> {
+		};
+
+		private KeepAliveDeadline(Socket socket) {
+			this.socket = socket;
+		}
+
+		/** The relay's teardown, run once a timeout passes. */
+		void onExpiry(Runnable teardown) {
+			this.teardown = teardown;
+		}
+
+		/**
+		 * Enters {@code next}; {@code false} once a timeout passed, in which case the
+		 * caller drops what it was about to relay: the connection is being closed.
+		 */
+		boolean enter(Phase next) {
+			synchronized (this.lock) {
+				if (this.expired) {
+					return false;
+				}
+				if (this.disarmed || next == this.phase) {
+					return true;
+				}
+				cancelLocked();
+				this.phase = next;
+				if (next != Phase.BUSY) {
+					long armed = this.generation;
+					Duration timeout = next == Phase.IDLE ? ConnectionLimits.this.idleTimeout
+							: ConnectionLimits.this.headTimeout;
+					this.future = ConnectionLimits.this.deadlines.schedule(() -> expire(armed), timeout.toNanos(),
+							TimeUnit.NANOSECONDS);
+				}
+				return true;
+			}
+		}
+
+		/** Cancels the deadline for good; later phases arm nothing. */
+		void disarm() {
+			synchronized (this.lock) {
+				this.disarmed = true;
+				this.phase = Phase.BUSY;
+				cancelLocked();
+			}
+		}
+
+		/** Whether a timeout passed. */
+		boolean expired() {
+			synchronized (this.lock) {
+				return this.expired;
+			}
+		}
+
+		private void cancelLocked() {
+			this.generation++;
+			ScheduledFuture<?> scheduled = this.future;
+			this.future = null;
+			if (scheduled != null) {
+				scheduled.cancel(false);
+			}
+		}
+
+		private void expire(long armed) {
+			Phase passed;
+			synchronized (this.lock) {
+				if (this.expired || this.disarmed || armed != this.generation) {
+					return;
+				}
+				this.expired = true;
+				this.future = null;
+				passed = this.phase;
+			}
+			(passed == Phase.IDLE ? ConnectionLimits.this.idleClosed : ConnectionLimits.this.rejectedHeadTimeout)
+				.increment();
+			ScheduledFuture<?> backstop = ConnectionLimits.this.deadlines.schedule(this::closeSocket,
+					TEARDOWN_GRACE.toNanos(), TimeUnit.NANOSECONDS);
+			Runnable teardown = this.teardown;
+			Thread.ofVirtual().name("sluice-deadline-teardown").start(() -> {
+				try {
+					teardown.run();
+				}
+				finally {
+					closeSocket();
+					backstop.cancel(false);
+				}
+			});
+		}
+
+		private void closeSocket() {
+			try {
+				this.socket.close();
+			}
+			catch (Exception e) {
+				// ignore
+			}
 		}
 
 	}

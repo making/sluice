@@ -67,6 +67,8 @@ public final class H2TestClient implements AutoCloseable {
 
 	private final AtomicInteger goAwayCode = new AtomicInteger(-1);
 
+	private final AtomicInteger goAwayLastStreamId = new AtomicInteger(-1);
+
 	private final AtomicReference<String> interleaving = new AtomicReference<>("");
 
 	private final AtomicInteger headerBlocks = new AtomicInteger();
@@ -162,7 +164,10 @@ public final class H2TestClient implements AutoCloseable {
 				}
 			}
 			case TestH2.RST_STREAM -> this.resets.put(streamId, TestH2.errorCode(frame));
-			case TestH2.GOAWAY -> this.goAwayCode.set(TestH2.errorCode(frame));
+			case TestH2.GOAWAY -> {
+				this.goAwayLastStreamId.set(TestH2.increment(frame));
+				this.goAwayCode.set(TestH2.errorCode(frame));
+			}
 			case TestH2.PING -> {
 				if ((frame.flags() & TestH2.FLAG_ACK) != 0) {
 					this.pingAcks.add(frame.payload());
@@ -341,6 +346,11 @@ public final class H2TestClient implements AutoCloseable {
 
 	public int goAwayCode() {
 		return this.goAwayCode.get();
+	}
+
+	/** The last stream id of the GOAWAY received, or -1. */
+	public int goAwayLastStreamId() {
+		return this.goAwayLastStreamId.get();
 	}
 
 	public boolean closed() {

@@ -42,13 +42,22 @@ class Http1RequestParserTest {
 		}
 	};
 
+	private final Http1RequestParser parser = new Http1RequestParser(this.listener);
+
 	private String parseAll(String... chunks) {
-		Http1RequestParser parser = new Http1RequestParser(this.listener);
+		feed(chunks);
+		this.parser.finish();
+		return output();
+	}
+
+	private void feed(String... chunks) {
 		for (String chunk : chunks) {
 			byte[] bytes = chunk.getBytes(StandardCharsets.UTF_8);
-			parser.feed(bytes, 0, bytes.length);
+			this.parser.feed(bytes, 0, bytes.length);
 		}
-		parser.finish();
+	}
+
+	private String output() {
 		return this.passthrough.toString(StandardCharsets.UTF_8);
 	}
 
@@ -85,12 +94,75 @@ class Http1RequestParserTest {
 	}
 
 	@Test
-	void upgradedConnectionEmitsOneHeadThenVerbatimFrames() {
+	void anUpgradeHoldsTheBytesAfterItUntilItsAnswer() {
 		String upgrade = request("GET /ws", "Upgrade: websocket\r\nConnection: Upgrade\r\n");
 		String frames = "\0binary websocket frames \r\n\r\n inside";
-		String output = parseAll(upgrade + frames);
+		feed(upgrade + frames.substring(0, 10), frames.substring(10));
 		assertThat(this.heads).containsExactly(upgrade);
-		assertThat(output).isEqualTo(upgrade + frames);
+		assertThat(output()).isEqualTo(upgrade);
+		assertThat(this.parser.position()).isEqualTo(Http1RequestParser.Position.AWAITING_UPGRADE);
+	}
+
+	@Test
+	void aSwitchedUpgradeRelaysEverythingAfterItVerbatim() {
+		String upgrade = request("GET /ws", "Upgrade: websocket\r\nConnection: Upgrade\r\n");
+		String frames = "\0binary websocket frames \r\n\r\n inside";
+		String later = request("GET /not-a-request", null);
+		feed(upgrade + frames);
+		this.parser.upgradeAnswered(true);
+		feed(later);
+		assertThat(this.heads).containsExactly(upgrade);
+		assertThat(output()).isEqualTo(upgrade + frames + later);
+		assertThat(this.parser.position()).isEqualTo(Http1RequestParser.Position.PASSTHROUGH);
+	}
+
+	@Test
+	void aDeclinedUpgradeResumesParsingWithTheBytesHeld() {
+		String upgrade = request("GET /ws", "Upgrade: h2c\r\nConnection: Upgrade, HTTP2-Settings\r\n");
+		String next = request("GET /next", null);
+		String partial = "GET /third HTTP/1.1\r\n";
+		feed(upgrade + next + partial);
+		assertThat(this.heads).containsExactly(upgrade);
+		this.parser.upgradeAnswered(false);
+		assertThat(this.heads).containsExactly(upgrade, next);
+		assertThat(output()).isEqualTo(upgrade + next);
+		assertThat(this.parser.position()).isEqualTo(Http1RequestParser.Position.IN_HEAD);
+	}
+
+	@Test
+	void anUpgradeWithABodyAwaitsItsAnswerAfterTheBody() {
+		String upgrade = request("POST /up", "Upgrade: h2c\r\nConnection: Upgrade\r\nContent-Length: 4\r\n");
+		feed(upgrade + "bo");
+		assertThat(this.parser.position()).isEqualTo(Http1RequestParser.Position.IN_BODY);
+		feed("dy" + "after");
+		assertThat(output()).isEqualTo(upgrade + "body");
+		assertThat(this.parser.position()).isEqualTo(Http1RequestParser.Position.AWAITING_UPGRADE);
+	}
+
+	@Test
+	void aConnectAwaitsItsAnswer() {
+		String connect = "CONNECT upstream.local:443 HTTP/1.1\r\nHost: upstream.local:443\r\n\r\n";
+		feed(connect + "\u0016tls");
+		assertThat(this.parser.position()).isEqualTo(Http1RequestParser.Position.AWAITING_UPGRADE);
+		this.parser.upgradeAnswered(true);
+		assertThat(output()).isEqualTo(connect + "\u0016tls");
+	}
+
+	@Test
+	void heldBytesAreFlushedVerbatimAtEndOfInput() {
+		String upgrade = request("GET /ws", "Upgrade: websocket\r\nConnection: Upgrade\r\n");
+		assertThat(parseAll(upgrade + "early")).isEqualTo(upgrade + "early");
+	}
+
+	@Test
+	void thePositionFollowsTheRequestStream() {
+		assertThat(this.parser.position()).isEqualTo(Http1RequestParser.Position.BETWEEN_REQUESTS);
+		feed("POST / HTTP/1.1\r\n");
+		assertThat(this.parser.position()).isEqualTo(Http1RequestParser.Position.IN_HEAD);
+		feed("Host: demo.local\r\nContent-Length: 2\r\n\r\n");
+		assertThat(this.parser.position()).isEqualTo(Http1RequestParser.Position.IN_BODY);
+		feed("ok");
+		assertThat(this.parser.position()).isEqualTo(Http1RequestParser.Position.BETWEEN_REQUESTS);
 	}
 
 	@Test

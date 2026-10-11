@@ -10,8 +10,11 @@ import org.jspecify.annotations.Nullable;
  * Push parser for the request side of a relayed HTTP/1.1 connection: every complete
  * request head is emitted with its Host header, body bytes in between are passed through,
  * and the body extent (Content-Length or chunked framing) is tracked to find the next
- * head. Upgraded connections (WebSocket, h2c, CONNECT) and any structure the parser
- * cannot follow degrade the remainder to verbatim passthrough.
+ * head. A request asking for an upgrade (WebSocket, h2c) or a CONNECT holds the parse
+ * after its message: the bytes that follow are kept until the caller reports the answer
+ * ({@link #upgradeAnswered(boolean)}) -- switched, they are passed through verbatim from
+ * then on; declined, they are parsed as the next request. Any structure the parser cannot
+ * follow degrades the remainder to verbatim passthrough.
  */
 final class Http1RequestParser {
 
@@ -31,9 +34,29 @@ final class Http1RequestParser {
 
 	}
 
+	/** Where the parser stands in the request stream. */
+	enum Position {
+
+		/** At a request boundary with nothing of the next request read. */
+		BETWEEN_REQUESTS,
+
+		/** Part of a request head read. */
+		IN_HEAD,
+
+		/** Inside a request body. */
+		IN_BODY,
+
+		/** After a request asking for an upgrade, until its answer is reported. */
+		AWAITING_UPGRADE,
+
+		/** Left HTTP/1.1 parsing: an upgrade, CONNECT, or unparseable bytes. */
+		PASSTHROUGH
+
+	}
+
 	private enum Mode {
 
-		HEAD, BODY, CHUNK_SIZE, CHUNK_DATA, CHUNK_CRLF, TRAILERS, PASSTHROUGH
+		HEAD, BODY, CHUNK_SIZE, CHUNK_DATA, CHUNK_CRLF, TRAILERS, AWAIT_UPGRADE, PASSTHROUGH
 
 	}
 
@@ -43,7 +66,13 @@ final class Http1RequestParser {
 
 	private final ByteArrayOutputStream line = new ByteArrayOutputStream(64);
 
+	/** The bytes fed while an upgrade's answer is awaited. */
+	private final ByteArrayOutputStream held = new ByteArrayOutputStream(0);
+
 	private Mode mode = Mode.HEAD;
+
+	/** The message being parsed asked for an upgrade. */
+	private boolean upgrading;
 
 	private long remaining;
 
@@ -90,8 +119,12 @@ final class Http1RequestParser {
 					boolean lineEnded = bytes[offset + i] == '\n';
 					i++;
 					if (lineEnded && this.onTrailerLine()) {
-						this.mode = Mode.HEAD;
+						this.endMessage();
 					}
+				}
+				case AWAIT_UPGRADE -> {
+					this.held.write(bytes, offset + i, length - i);
+					return;
 				}
 				case PASSTHROUGH -> {
 					this.listener.data(bytes, offset + i, length - i);
@@ -119,10 +152,8 @@ final class Http1RequestParser {
 			return;
 		}
 		this.listener.head(head, ConnectionHeadParser.http1HostOf(head));
-		if (this.isUpgrade(head)) {
-			this.mode = Mode.PASSTHROUGH;
-		}
-		else if (this.isChunked(head)) {
+		this.upgrading = isUpgrade(head);
+		if (this.isChunked(head)) {
 			this.mode = Mode.CHUNK_SIZE;
 		}
 		else {
@@ -132,8 +163,37 @@ final class Http1RequestParser {
 				this.mode = Mode.BODY;
 			}
 			else {
-				this.mode = Mode.HEAD;
+				this.endMessage();
 			}
+		}
+	}
+
+	/** The request message ended: the next head follows, or an upgrade's answer. */
+	private void endMessage() {
+		this.mode = this.upgrading ? Mode.AWAIT_UPGRADE : Mode.HEAD;
+		this.upgrading = false;
+	}
+
+	/**
+	 * Reports the answer to the request asking for an upgrade: {@code switched}, the
+	 * bytes held and every byte after them pass through verbatim; declined, they are
+	 * parsed as the next request. Ignored unless the parser awaits an answer.
+	 */
+	void upgradeAnswered(boolean switched) {
+		if (this.mode != Mode.AWAIT_UPGRADE) {
+			return;
+		}
+		byte[] held = this.held.toByteArray();
+		this.held.reset();
+		if (switched) {
+			this.mode = Mode.PASSTHROUGH;
+			if (held.length > 0) {
+				this.listener.data(held, 0, held.length);
+			}
+		}
+		else {
+			this.mode = Mode.HEAD;
+			this.feed(held, 0, held.length);
 		}
 	}
 
@@ -142,7 +202,7 @@ final class Http1RequestParser {
 		this.listener.data(bytes, offset, n);
 		this.remaining -= n;
 		if (this.remaining == 0) {
-			this.mode = Mode.HEAD;
+			this.endMessage();
 		}
 		return n;
 	}
@@ -186,10 +246,23 @@ final class Http1RequestParser {
 		return line.length == 2 && line[0] == '\r' && line[1] == '\n';
 	}
 
-	/** Flushes a partially consumed head or line verbatim at end of input. */
+	/** Where the parser stands after the bytes fed so far. */
+	Position position() {
+		return switch (this.mode) {
+			case HEAD -> this.head.size() == 0 ? Position.BETWEEN_REQUESTS : Position.IN_HEAD;
+			case BODY, CHUNK_SIZE, CHUNK_DATA, CHUNK_CRLF, TRAILERS -> Position.IN_BODY;
+			case AWAIT_UPGRADE -> Position.AWAITING_UPGRADE;
+			case PASSTHROUGH -> Position.PASSTHROUGH;
+		};
+	}
+
+	/**
+	 * Flushes a partially consumed head or line, or held bytes, verbatim at end of input.
+	 */
 	void finish() {
 		this.emitVerbatim(this.head);
 		this.emitVerbatim(this.line);
+		this.emitVerbatim(this.held);
 	}
 
 	private void emitVerbatim(ByteArrayOutputStream buffer) {
@@ -200,7 +273,8 @@ final class Http1RequestParser {
 		}
 	}
 
-	private boolean isUpgrade(byte[] head) {
+	/** Whether the request head asks for an upgrade or is a CONNECT. */
+	static boolean isUpgrade(byte[] head) {
 		ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser.http1RequestOf(head);
 		if (request != null && "CONNECT".equals(request.method())) {
 			return true;

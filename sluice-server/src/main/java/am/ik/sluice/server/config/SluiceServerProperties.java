@@ -372,19 +372,26 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * (the PROXY protocol source when {@code proxy-protocol} is on, the socket peer
 	 * otherwise); {@code 0} = no limit beyond {@code maxConnections}
 	 * @param headTimeout deadline for the whole head phase of a connection (PROXY header,
-	 * TLS handshake, request head); established relays have no timeout
+	 * TLS handshake, request head), and for a later request head of a plaintext or
+	 * TLS-terminated HTTP/1.1 connection left incomplete between requests
+	 * @param idleTimeout how long a plaintext or TLS-terminated HTTP connection may idle
+	 * between requests -- h1: every response complete and no next request begun; h2: no
+	 * open stream -- before it is closed; an upgraded connection has none
 	 * @param h2QueueBudget bytes the h2 demux relays may queue towards their upstreams
 	 * beyond each connection's own allowance, shared by all of them; {@code 0} = an
 	 * eighth of half the maximum heap
 	 */
 	public record Limits(@DefaultValue("0") int maxConnections, @DefaultValue("0") int maxConnectionsPerAddress,
-			@DefaultValue("10s") Duration headTimeout, @DefaultValue("0") DataSize h2QueueBudget) {
+			@DefaultValue("10s") Duration headTimeout, @DefaultValue("60s") Duration idleTimeout,
+			@DefaultValue("0") DataSize h2QueueBudget) {
 
 		public Limits {
 			maxConnections = Math.max(0, maxConnections);
 			maxConnectionsPerAddress = Math.max(0, maxConnectionsPerAddress);
 			headTimeout = headTimeout == null || headTimeout.isNegative() || headTimeout.isZero()
 					? Duration.ofSeconds(10) : headTimeout;
+			idleTimeout = idleTimeout == null || idleTimeout.isNegative() || idleTimeout.isZero()
+					? Duration.ofSeconds(60) : idleTimeout;
 			h2QueueBudget = h2QueueBudget == null || h2QueueBudget.isNegative() ? DataSize.ofBytes(0) : h2QueueBudget;
 		}
 
@@ -399,6 +406,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			private int maxConnectionsPerAddress;
 
 			@Nullable private Duration headTimeout;
+
+			@Nullable private Duration idleTimeout;
 
 			@Nullable private DataSize h2QueueBudget;
 
@@ -420,6 +429,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder idleTimeout(Duration idleTimeout) {
+				this.idleTimeout = idleTimeout;
+				return this;
+			}
+
 			public Builder h2QueueBudget(DataSize h2QueueBudget) {
 				this.h2QueueBudget = h2QueueBudget;
 				return this;
@@ -428,6 +442,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			public Limits build() {
 				return new Limits(this.maxConnections, this.maxConnectionsPerAddress,
 						this.headTimeout == null ? Duration.ofSeconds(10) : this.headTimeout,
+						this.idleTimeout == null ? Duration.ofSeconds(60) : this.idleTimeout,
 						this.h2QueueBudget == null ? DataSize.ofBytes(0) : this.h2QueueBudget);
 			}
 

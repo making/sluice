@@ -76,22 +76,30 @@ class SluiceServerPropertiesTest {
 	}
 
 	@Test
-	void limitsDefaultToDerivedConnectionLimitsAndATenSecondHeadDeadline() {
+	void limitsDefaultToDerivedConnectionLimitsATenSecondHeadDeadlineAndAMinuteOfIdle() {
 		SluiceServerProperties properties = bind(Map.of("sluice.data-port", "8000"));
 		assertThat(properties.limits().maxConnections()).isZero();
 		assertThat(properties.limits().maxConnectionsPerAddress()).isZero();
 		assertThat(properties.limits().headTimeout()).isEqualTo(Duration.ofSeconds(10));
+		assertThat(properties.limits().idleTimeout()).isEqualTo(Duration.ofSeconds(60));
 		assertThat(properties.limits().h2QueueBudget().toBytes()).isZero();
 	}
 
 	@Test
+	void aNonPositiveIdleTimeoutFallsBackToTheDefault() {
+		SluiceServerProperties properties = bind(Map.of("sluice.limits.idle-timeout", "0s"));
+		assertThat(properties.limits().idleTimeout()).isEqualTo(Duration.ofSeconds(60));
+	}
+
+	@Test
 	void limitsAreBoundInKebabCase() {
-		SluiceServerProperties properties = bind(
-				Map.of("sluice.limits.max-connections", "100", "sluice.limits.max-connections-per-address", "10",
-						"sluice.limits.head-timeout", "2s", "sluice.limits.h2-queue-budget", "512KB"));
+		SluiceServerProperties properties = bind(Map.of("sluice.limits.max-connections", "100",
+				"sluice.limits.max-connections-per-address", "10", "sluice.limits.head-timeout", "2s",
+				"sluice.limits.idle-timeout", "3s", "sluice.limits.h2-queue-budget", "512KB"));
 		assertThat(properties.limits().maxConnections()).isEqualTo(100);
 		assertThat(properties.limits().maxConnectionsPerAddress()).isEqualTo(10);
 		assertThat(properties.limits().headTimeout()).isEqualTo(Duration.ofSeconds(2));
+		assertThat(properties.limits().idleTimeout()).isEqualTo(Duration.ofSeconds(3));
 		assertThat(properties.limits().h2QueueBudget().toBytes()).isEqualTo(512 * 1024);
 	}
 

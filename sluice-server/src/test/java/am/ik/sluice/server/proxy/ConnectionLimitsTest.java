@@ -5,8 +5,11 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -24,6 +27,7 @@ class ConnectionLimitsTest {
 			.maxConnections(3)
 			.maxConnectionsPerAddress(2)
 			.headTimeout(Duration.ofMillis(200))
+			.idleTimeout(Duration.ofMillis(300))
 			.build())
 		.build();
 
@@ -109,6 +113,71 @@ class ConnectionLimitsTest {
 	}
 
 	@Test
+	void aKeepAlivePhaseEnteredAnewStartsItsTimeoutOver() throws Exception {
+		try (ServerSocket server = new ServerSocket(0);
+				Socket client = new Socket("127.0.0.1", server.getLocalPort());
+				Socket accepted = server.accept()) {
+			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(accepted);
+			CountDownLatch teardown = new CountDownLatch(1);
+			deadline.onExpiry(teardown::countDown);
+			assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.IDLE)).isTrue();
+			Thread.sleep(200);
+			assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.BUSY)).isTrue();
+			assertThat(this.limits.scheduledDeadlines()).as("busy: nothing scheduled").isZero();
+			assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.IDLE)).isTrue();
+			Thread.sleep(200);
+			// the first idle timeout would have passed by now
+			assertThat(deadline.expired()).isFalse();
+			assertThat(teardown.await(1, TimeUnit.SECONDS)).isTrue();
+			assertThat(deadline.expired()).isTrue();
+			Awaitility.await().atMost(Duration.ofSeconds(1)).until(accepted::isClosed);
+			assertThat(idleClosed()).isEqualTo(1);
+			assertThat(rejected("head-timeout")).isZero();
+			assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.BUSY)).as("expired").isFalse();
+		}
+	}
+
+	@Test
+	void aKeepAlivePhaseEnteredAgainKeepsItsRunningTimeout() throws Exception {
+		try (ServerSocket server = new ServerSocket(0);
+				Socket client = new Socket("127.0.0.1", server.getLocalPort());
+				Socket accepted = server.accept()) {
+			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(accepted);
+			long start = System.nanoTime();
+			assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.HEAD)).isTrue();
+			Thread.sleep(100);
+			assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.HEAD)).isTrue();
+			Awaitility.await()
+				.pollInterval(Duration.ofMillis(5))
+				.atMost(Duration.ofSeconds(1))
+				.until(accepted::isClosed);
+			assertThat(Duration.ofNanos(System.nanoTime() - start)).as("the head timeout from the first entry")
+				.isLessThan(Duration.ofMillis(290));
+			assertThat(rejected("head-timeout")).isEqualTo(1);
+			assertThat(idleClosed()).isZero();
+		}
+	}
+
+	@Test
+	void aDisarmedKeepAliveDeadlineNeverPasses() throws Exception {
+		try (ServerSocket server = new ServerSocket(0);
+				Socket client = new Socket("127.0.0.1", server.getLocalPort());
+				Socket accepted = server.accept()) {
+			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(accepted);
+			assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.IDLE)).isTrue();
+			assertThat(this.limits.scheduledDeadlines()).isEqualTo(1);
+			deadline.disarm();
+			assertThat(this.limits.scheduledDeadlines()).isZero();
+			assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.IDLE)).isTrue();
+			assertThat(this.limits.scheduledDeadlines()).as("nothing armed once disarmed").isZero();
+			Thread.sleep(500);
+			assertThat(accepted.isClosed()).isFalse();
+			assertThat(deadline.expired()).isFalse();
+			assertThat(idleClosed()).isZero();
+		}
+	}
+
+	@Test
 	void anUnsetLimitFitsEverySlotsWorstCaseAndTheBudgetInHalfTheHeap() {
 		long mib = 1024 * 1024;
 		// a virtual connection's 2.16MiB plus an h2 relay's own queue
@@ -151,6 +220,10 @@ class ConnectionLimitsTest {
 
 	private ConnectionLimits.Admission admit() {
 		return Objects.requireNonNull(this.limits.admit(this.access));
+	}
+
+	private double idleClosed() {
+		return this.meters.get("sluice.data.connections.idle.closed").counter().count();
 	}
 
 	private double rejected(String reason) {

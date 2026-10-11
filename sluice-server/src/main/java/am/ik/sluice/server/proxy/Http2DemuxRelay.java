@@ -86,6 +86,12 @@ import io.micrometer.core.instrument.MeterRegistry;
  * response owed retires its leg: the data still queued for it is dropped, and a stream
  * the client still sends on is reset with {@code NO_ERROR}.
  * <p>
+ * While no stream is open the connection lives under the idle timeout of its
+ * {@link ConnectionLimits.KeepAliveDeadline}, from the connection head on unless its
+ * stream was admitted: only a new stream stops it -- a PING does not -- and a stream the
+ * relay refuses or answers itself starts it over. Its expiry ends the connection with a
+ * GOAWAY {@code NO_ERROR} naming the highest stream the client opened.
+ * <p>
  * HPACK blocks are re-encoded table-less, so each side's decoder sees self-contained
  * blocks whichever leg produced them, or when.
  */
@@ -249,6 +255,8 @@ final class Http2DemuxRelay {
 
 	private final Runnable onFinish;
 
+	private final ConnectionLimits.KeepAliveDeadline deadline;
+
 	/** Serializes the writes of the shared client stream. */
 	private final Object sinkLock = new Object();
 
@@ -280,6 +288,12 @@ final class Http2DemuxRelay {
 	/** Streams counted against the advertised limit; guarded by {@link #lock}. */
 	private int activeStreams;
 
+	/**
+	 * A new stream's head is being routed: the connection is not idle even with no stream
+	 * open; guarded by {@link #lock}.
+	 */
+	private boolean routingHead;
+
 	/** The bytes queued for every leg of the connection; guarded by {@link #lock}. */
 	private long queuedBytes;
 
@@ -301,11 +315,14 @@ final class Http2DemuxRelay {
 	/** A leg holds the slot of the connection itself; guarded by {@link #lock}. */
 	private boolean baseLegTaken;
 
-	/** The highest stream id routed, for GOAWAY; outbound parse only. */
-	private int lastStreamId;
+	/** The highest stream id routed, for GOAWAY; written by the outbound parse only. */
+	private volatile int lastStreamId;
 
-	/** The highest stream id the client opened, routed or not; outbound parse only. */
-	private int highestStreamId;
+	/**
+	 * The highest stream id the client opened, routed or not; written by the outbound
+	 * parse only.
+	 */
+	private volatile int highestStreamId;
 
 	/** Client bytes read but not yet parsed into complete frames. */
 	private final ByteArrayOutputStream buffer = new ByteArrayOutputStream(BUFFER_SIZE);
@@ -347,7 +364,7 @@ final class Http2DemuxRelay {
 	Http2DemuxRelay(DuplexPipe pipe, ConnectionHeadParser.Head head, Router router, SessionRegistry sessions,
 			AccessControl accessControl, ErrorResponse errorResponse, AccessLogger.Connection access,
 			H2DemuxMeters meters, ConnectionLimits limits, Router.Route initialRoute, TunnelSession initialSession,
-			@Nullable InetAddress peer, Runnable onFinish) {
+			@Nullable InetAddress peer, ConnectionLimits.KeepAliveDeadline deadline, Runnable onFinish) {
 		this.pipe = pipe;
 		this.seedHead = head.bytes();
 		this.router = router;
@@ -363,6 +380,8 @@ final class Http2DemuxRelay {
 		this.initialSession = initialSession;
 		this.peer = peer;
 		this.onFinish = onFinish;
+		this.deadline = deadline;
+		deadline.onExpiry(this::closeIdle);
 		try {
 			this.headersDecoder.configuration().maxHeaderListSize(MAX_HEADER_LIST_SIZE, MAX_HEADER_LIST_SIZE);
 		}
@@ -391,6 +410,15 @@ final class Http2DemuxRelay {
 			// the connection head ends with the magic; the frames follow it
 			int magic = ConnectionHeadParser.H2_MAGIC.length();
 			feed(this.seedHead, magic, this.seedHead.length - magic);
+			// a head whose stream was not admitted (or not even taken as a stream)
+			// leaves the connection idle
+			this.lock.lock();
+			try {
+				idleIfQuietLocked();
+			}
+			finally {
+				this.lock.unlock();
+			}
 			InputStream in = this.pipe.source();
 			byte[] buffer = new byte[BUFFER_SIZE];
 			int n;
@@ -886,6 +914,62 @@ final class Http2DemuxRelay {
 	}
 
 	private void onRequestHead(int streamId, boolean endStream, io.netty.handler.codec.http2.Http2Headers headers) {
+		if (!beginHead()) {
+			return; // the idle timeout passed first: the stream is left unprocessed
+		}
+		try {
+			routeRequestHead(streamId, endStream, headers);
+		}
+		finally {
+			endHead();
+		}
+	}
+
+	/**
+	 * Marks a new stream's head as being routed; {@code false} once the deadline passed.
+	 */
+	private boolean beginHead() {
+		this.lock.lock();
+		try {
+			this.routingHead = this.deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.BUSY);
+			return this.routingHead;
+		}
+		finally {
+			this.lock.unlock();
+		}
+	}
+
+	/**
+	 * The head was routed, refused or answered: with no stream open, the idle timeout.
+	 */
+	private void endHead() {
+		this.lock.lock();
+		try {
+			this.routingHead = false;
+			idleIfQuietLocked();
+		}
+		finally {
+			this.lock.unlock();
+		}
+	}
+
+	/** Starts the idle timeout when no stream is open or being routed; with the lock. */
+	private void idleIfQuietLocked() {
+		if (this.activeStreams == 0 && !this.routingHead) {
+			this.deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.IDLE);
+		}
+	}
+
+	/**
+	 * The idle timeout passed: tells the client no stream above the highest it opened was
+	 * processed, then ends the relay.
+	 */
+	private void closeIdle() {
+		goAway(this.highestStreamId, ERROR_NO_ERROR);
+		abort();
+	}
+
+	private void routeRequestHead(int streamId, boolean endStream, io.netty.handler.codec.http2.Http2Headers headers) {
 		if (activeStreams() >= MAX_CONCURRENT_STREAMS) {
 			// beyond the advertised limit (RFC 9113 5.1.2); safe for the client to retry
 			writeToClient(rstStream(streamId, ERROR_REFUSED_STREAM));
@@ -951,6 +1035,7 @@ final class Http2DemuxRelay {
 			else {
 				this.streams.put(Integer.valueOf(streamId), stream);
 				leg.routeMeters.trackedStreams().increment();
+				this.lastStreamId = Math.max(this.lastStreamId, streamId);
 				this.activeStreams++;
 				stream.active = true;
 				stream.clientEnded = endStream;
@@ -967,7 +1052,6 @@ final class Http2DemuxRelay {
 			writeToClient(rstStream(streamId, ERROR_REFUSED_STREAM));
 			return;
 		}
-		this.lastStreamId = Math.max(this.lastStreamId, streamId);
 		if (request != null) {
 			this.access.request(route.routeTag(), request.method(), request.path(), "2");
 		}
@@ -996,6 +1080,7 @@ final class Http2DemuxRelay {
 		if (closed && stream.queuedBytes == 0) {
 			stream.active = false;
 			this.activeStreams--;
+			idleIfQuietLocked();
 			if (this.streams.remove(Integer.valueOf(stream.id), stream)) {
 				stream.leg.routeMeters.trackedStreams().decrement();
 			}
@@ -1255,8 +1340,12 @@ final class Http2DemuxRelay {
 
 	/** Tells the client the connection ends with the error; best effort. */
 	private void goAway(int errorCode) {
+		goAway(this.lastStreamId, errorCode);
+	}
+
+	private void goAway(int lastStreamId, int errorCode) {
 		byte[] payload = new byte[8];
-		System.arraycopy(int32(this.lastStreamId), 0, payload, 0, 4);
+		System.arraycopy(int32(lastStreamId), 0, payload, 0, 4);
 		System.arraycopy(int32(errorCode), 0, payload, 4, 4);
 		try {
 			writeToClient(frame(FRAME_GOAWAY, 0, 0, payload, 0, payload.length));
@@ -2290,6 +2379,7 @@ final class Http2DemuxRelay {
 		if (!this.finished.compareAndSet(false, true)) {
 			return;
 		}
+		this.deadline.disarm();
 		for (Leg leg : this.legs) {
 			leg.close();
 			leg.session.remove(leg.connection.connectionId());

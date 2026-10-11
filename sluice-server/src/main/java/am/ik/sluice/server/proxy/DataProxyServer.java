@@ -200,7 +200,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				this.close(socket);
 				return;
 			}
-			relaying = this.relay(connection, access, admission::release);
+			relaying = this.relay(connection, access, this.limits.keepAliveDeadline(socket), admission::release);
 			if (!relaying) {
 				// access denied or no session: relay() answered with the error response
 				// and closed the socket
@@ -324,9 +324,12 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	/**
 	 * Routes and relays the connection; true once a relay owns it, in which case
 	 * {@code release} runs when the relay completes. False when the connection was
-	 * answered with an error response and closed.
+	 * answered with an error response and closed. Plaintext and TLS-terminated HTTP
+	 * relays drive {@code deadline} between their requests; the verbatim relays leave it
+	 * disarmed.
 	 */
-	private boolean relay(Connection conn, AccessLogger.Connection access, Runnable release) {
+	private boolean relay(Connection conn, AccessLogger.Connection access, ConnectionLimits.KeepAliveDeadline deadline,
+			Runnable release) {
 		Optional<Router.Route> route = this.router.lookup(conn.head().host());
 		InetAddress peer = conn.peer() != null ? conn.peer() : peerOf(conn.socket());
 		// a trusted proxy's forwarded-for entry replaces the peer as the judged address
@@ -350,7 +353,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			if ("2".equals(request.version())) {
 				Http2DemuxRelay demux = new Http2DemuxRelay(conn.pipe(), conn.head(), this.router, this.sessions,
 						this.accessControl, this.errorResponse, access, this.h2DemuxMeters, this.limits, route0,
-						session, peer, relayed);
+						session, peer, deadline, relayed);
 				this.activeConnections.incrementAndGet();
 				try {
 					demux.start();
@@ -362,7 +365,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				return true;
 			}
 			ReroutingRelay rerouting = new ReroutingRelay(conn.pipe(), conn.head(), this.router, this.sessions,
-					this.accessControl, this.errorResponse, access, this.meterRegistry, route0, session, peer, relayed);
+					this.accessControl, this.errorResponse, access, this.meterRegistry, route0, session, peer, deadline,
+					relayed);
 			this.activeConnections.incrementAndGet();
 			try {
 				rerouting.start();

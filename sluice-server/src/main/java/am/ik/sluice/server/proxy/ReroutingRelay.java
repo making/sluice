@@ -5,6 +5,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -33,8 +34,19 @@ import io.micrometer.core.instrument.MeterRegistry;
  * ends the whole relay, as does any failure. Each leg pumps its inbound side on its own
  * virtual thread for the lifetime of its virtual connection.
  * <p>
- * Upgrades, CONNECT, and any structure the parser cannot follow are relayed verbatim on
- * the leg in charge from then on.
+ * A request asking for an upgrade, or a CONNECT, holds the parse -- the relay reads no
+ * further client bytes -- until the leg's response to it: switched (101, a 2xx to
+ * CONNECT), the connection is relayed verbatim on the leg in charge from then on;
+ * declined, the parse resumes with the next request. Any structure the parser cannot
+ * follow is relayed verbatim too.
+ * <p>
+ * Between requests the connection lives under its
+ * {@link ConnectionLimits.KeepAliveDeadline}: once every response owed is relayed and
+ * nothing of a next request was read, the idle timeout runs; the first bytes of the next
+ * request stop it, and the head timeout runs until that head is complete. While a request
+ * or response is in flight -- a response not yet complete, a request body still arriving
+ * -- there is none, and an upgrade disarms it for good. A response whose framing the
+ * tracker cannot follow stays owed, so such a connection keeps no deadline either.
  */
 final class ReroutingRelay {
 
@@ -66,6 +78,20 @@ final class ReroutingRelay {
 
 	private final Runnable onFinish;
 
+	private final ConnectionLimits.KeepAliveDeadline deadline;
+
+	/** Guards {@link #owed}, {@link #position} and {@link #starting}. */
+	private final Object deadlineLock = new Object();
+
+	/** Responses owed by the legs: requests relayed whose response is not complete. */
+	private int owed;
+
+	/** Where the outbound parse stood after the last bytes it was fed. */
+	private Http1RequestParser.Position position = Http1RequestParser.Position.BETWEEN_REQUESTS;
+
+	/** The outbound side is feeding bytes read at a request boundary. */
+	private boolean starting = true;
+
 	/** Serializes the writes of the shared client stream. */
 	private final Object sinkLock = new Object();
 
@@ -83,7 +109,7 @@ final class ReroutingRelay {
 	ReroutingRelay(DuplexPipe pipe, ConnectionHeadParser.Head head, Router router, SessionRegistry sessions,
 			AccessControl accessControl, ErrorResponse errorResponse, AccessLogger.Connection access,
 			MeterRegistry meterRegistry, Router.Route initialRoute, TunnelSession initialSession,
-			@Nullable InetAddress peer, Runnable onFinish) {
+			@Nullable InetAddress peer, ConnectionLimits.KeepAliveDeadline deadline, Runnable onFinish) {
 		this.pipe = pipe;
 		this.seedHead = head.bytes();
 		this.router = router;
@@ -96,6 +122,8 @@ final class ReroutingRelay {
 		this.initialSession = initialSession;
 		this.peer = peer;
 		this.onFinish = onFinish;
+		this.deadline = deadline;
+		deadline.onExpiry(this::abort);
 	}
 
 	/**
@@ -125,11 +153,20 @@ final class ReroutingRelay {
 				}
 			});
 			parser.feed(this.seedHead, 0, this.seedHead.length);
+			awaitUpgradeAnswers(parser);
+			fed(parser.position());
 			InputStream in = this.pipe.source();
 			byte[] buffer = new byte[BUFFER_SIZE];
 			int n;
 			while ((n = in.read(buffer)) > 0) {
+				if (!feeding()) {
+					// the deadline passed before these bytes arrived: the connection is
+					// being closed, and its request must not reach an upstream
+					return;
+				}
 				parser.feed(buffer, 0, n);
+				awaitUpgradeAnswers(parser);
+				fed(parser.position());
 			}
 			parser.finish();
 			Leg leg = this.current;
@@ -143,6 +180,73 @@ final class ReroutingRelay {
 		finally {
 			settle();
 		}
+	}
+
+	/**
+	 * While the parser holds after a request asking for an upgrade, waits for the leg's
+	 * answer and reports it; a leg ending first counts as switched (verbatim), the relay
+	 * ending with it.
+	 */
+	private void awaitUpgradeAnswers(Http1RequestParser parser) {
+		while (parser.position() == Http1RequestParser.Position.AWAITING_UPGRADE) {
+			Leg leg = this.current;
+			parser.upgradeAnswered(leg == null || leg.awaitUpgradeAnswer());
+		}
+	}
+
+	/**
+	 * Bytes were read: at a request boundary they begin a request, which stops the idle
+	 * timeout. {@code false} when a timeout passed first.
+	 */
+	private boolean feeding() {
+		synchronized (this.deadlineLock) {
+			if (this.position == Http1RequestParser.Position.BETWEEN_REQUESTS) {
+				this.starting = true;
+			}
+			return updateDeadlineLocked();
+		}
+	}
+
+	/** The bytes read were parsed; the parser now stands at {@code position}. */
+	private void fed(Http1RequestParser.Position position) {
+		synchronized (this.deadlineLock) {
+			this.starting = false;
+			this.position = position;
+			updateDeadlineLocked();
+		}
+	}
+
+	/** A leg's responses owed changed by {@code delta}. */
+	private void owedChanged(int delta) {
+		if (delta == 0) {
+			return;
+		}
+		synchronized (this.deadlineLock) {
+			this.owed += delta;
+			updateDeadlineLocked();
+		}
+	}
+
+	/**
+	 * Enters the phase the connection's state calls for; with {@link #deadlineLock}.
+	 * {@code false} once a timeout passed.
+	 */
+	private boolean updateDeadlineLocked() {
+		if (this.position == Http1RequestParser.Position.PASSTHROUGH) {
+			this.deadline.disarm();
+			return true;
+		}
+		ConnectionLimits.KeepAliveDeadline.Phase phase;
+		if (this.starting || this.owed > 0 || this.position == Http1RequestParser.Position.IN_BODY) {
+			phase = ConnectionLimits.KeepAliveDeadline.Phase.BUSY;
+		}
+		else if (this.position == Http1RequestParser.Position.IN_HEAD) {
+			phase = ConnectionLimits.KeepAliveDeadline.Phase.HEAD;
+		}
+		else {
+			phase = ConnectionLimits.KeepAliveDeadline.Phase.IDLE;
+		}
+		return this.deadline.enter(phase);
 	}
 
 	private void onRequestHead(byte[] head, @Nullable String host) {
@@ -181,7 +285,7 @@ final class ReroutingRelay {
 			}
 		}
 		ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser.http1RequestOf(head);
-		leg.requestSent(request == null ? null : request.method());
+		leg.requestSent(request == null ? null : request.method(), Http1RequestParser.isUpgrade(head));
 		byte[] relayed = route.rewriteHost() ? ConnectionHeadRewriter.rewriteHttp1(head, route.address()) : head;
 		leg.toUpstream(relayed, 0, relayed.length);
 		if (request != null) {
@@ -284,7 +388,14 @@ final class ReroutingRelay {
 
 		private volatile boolean replaced;
 
-		private volatile @Nullable String method;
+		/** The requests whose final response has not begun, in order. */
+		private final ArrayDeque<Sent> unanswered = new ArrayDeque<>();
+
+		/** A request asking for an upgrade waits for its answer. */
+		private boolean upgradeAwaited;
+
+		/** The answer to the upgrade awaited, once known: switched or declined. */
+		private @Nullable Boolean upgradeAnswer;
 
 		private int sent;
 
@@ -330,20 +441,88 @@ final class ReroutingRelay {
 			this.connection.close();
 		}
 
-		void requestSent(@Nullable String method) {
+		void requestSent(@Nullable String method, boolean upgrade) {
 			synchronized (this) {
 				this.sent++;
-				this.method = method;
+				this.unanswered.addLast(new Sent(method == null ? "" : method, upgrade));
+				if (upgrade) {
+					this.upgradeAwaited = true;
+					this.upgradeAnswer = null;
+				}
+			}
+			owedChanged(1);
+		}
+
+		/** The request the next final response answers; null for one sent unasked. */
+		@Nullable Sent nextRequest() {
+			synchronized (this) {
+				return this.unanswered.pollFirst();
 			}
 		}
 
-		void responseCompleted() {
+		/** Reports the answer to the upgrade awaited, if one is. */
+		void upgradeAnswered(boolean switched) {
 			synchronized (this) {
-				this.completed++;
+				if (this.upgradeAwaited) {
+					this.upgradeAwaited = false;
+					this.upgradeAnswer = switched;
+					this.notifyAll();
+				}
+			}
+		}
+
+		/**
+		 * Waits for the answer to the upgrade awaited: whether it switched. The leg
+		 * ending first counts as switched.
+		 */
+		boolean awaitUpgradeAnswer() {
+			synchronized (this) {
+				while (this.upgradeAnswer == null && !this.ended) {
+					try {
+						this.wait(1000);
+					}
+					catch (InterruptedException e) {
+						Thread.currentThread().interrupt();
+						return true;
+					}
+				}
+				Boolean answer = this.upgradeAnswer;
+				this.upgradeAnswer = null;
+				return answer == null || answer;
+			}
+		}
+
+		/** A response completed; one the upstream sent unasked counts for nothing. */
+		void responseCompleted() {
+			boolean counted;
+			synchronized (this) {
+				counted = this.completed < this.sent;
+				if (counted) {
+					this.completed++;
+				}
 				this.notifyAll();
 			}
+			if (counted) {
+				owedChanged(-1);
+			}
 		}
 
+		/** The leg ended: the responses it still owed never come. */
+		void markEnded() {
+			int lost;
+			synchronized (this) {
+				this.ended = true;
+				lost = this.sent - this.completed;
+				this.completed = this.sent;
+				this.notifyAll();
+			}
+			owedChanged(-lost);
+		}
+
+	}
+
+	/** A request relayed on a leg: its method, and whether it asked for an upgrade. */
+	private record Sent(String method, boolean upgrade) {
 	}
 
 	/**
@@ -373,10 +552,7 @@ final class ReroutingRelay {
 			abort();
 		}
 		finally {
-			synchronized (leg) {
-				leg.ended = true;
-				leg.notifyAll();
-			}
+			leg.markEnded();
 			settle();
 		}
 	}
@@ -391,6 +567,7 @@ final class ReroutingRelay {
 		if (!this.finished.compareAndSet(false, true)) {
 			return;
 		}
+		this.deadline.disarm();
 		for (Leg leg : this.legs) {
 			leg.close();
 			leg.session.remove(leg.connection.connectionId());
@@ -420,9 +597,10 @@ final class ReroutingRelay {
 
 	/**
 	 * Tracks the response framing of one leg to mark its conversation drained: a response
-	 * is complete at the end of its body (Content-Length or last chunk), at the end of an
-	 * unframed body, or when it switches to a tunneled mode; anything unrecognized drains
-	 * too. Exactly one completion is counted per response.
+	 * is complete at the end of its body (Content-Length or last chunk), at its head when
+	 * it has no body (a response to HEAD, 204, 304), at the end of an unframed body, or
+	 * when it switches to a tunneled mode (101, a 2xx to CONNECT); anything unrecognized
+	 * drains too and ends the tracking. Exactly one completion is counted per response.
 	 */
 	private final class ResponseTracker {
 
@@ -528,7 +706,6 @@ final class ReroutingRelay {
 				return;
 			}
 			int status = statusOf(bytes);
-			String method = this.leg.method;
 			if (status < 0) {
 				this.drain(Mode.PASS);
 				return;
@@ -536,9 +713,19 @@ final class ReroutingRelay {
 			if (status >= 100 && status < 200 && status != 101) {
 				return; // interim: the final response follows on the same stream
 			}
-			if (status == 101 || upgrade(bytes) || "CONNECT".equals(method) && status >= 200 && status < 300
-					|| "HEAD".equals(method) || status == 204 || status == 304) {
+			Sent request = this.leg.nextRequest();
+			@Nullable String method = request == null ? null : request.method();
+			boolean switched = status == 101 || "CONNECT".equals(method) && status >= 200 && status < 300;
+			if (request != null && request.upgrade()) {
+				this.leg.upgradeAnswered(switched);
+			}
+			if (switched) {
 				this.drain(Mode.PASS);
+				return;
+			}
+			if ("HEAD".equals(method) || status == 204 || status == 304) {
+				// no body, whatever its framing headers say (RFC 9112 6.3)
+				this.drain(Mode.HEAD);
 				return;
 			}
 			String contentLength = header(bytes, "content-length");
@@ -606,6 +793,10 @@ final class ReroutingRelay {
 
 		private void drain(Mode next) {
 			this.mode = next;
+			if (next == Mode.PASS) {
+				// untracked from here on: an upgrade awaited is relayed verbatim
+				this.leg.upgradeAnswered(true);
+			}
 			this.leg.responseCompleted();
 		}
 
@@ -623,12 +814,6 @@ final class ReroutingRelay {
 			catch (NumberFormatException e) {
 				return -1;
 			}
-		}
-
-		private static boolean upgrade(byte[] head) {
-			String connection = header(head, "connection");
-			return header(head, "upgrade") != null
-					|| connection != null && connection.toLowerCase(java.util.Locale.ROOT).contains("upgrade");
 		}
 
 		private static @Nullable String header(byte[] head, String name) {
