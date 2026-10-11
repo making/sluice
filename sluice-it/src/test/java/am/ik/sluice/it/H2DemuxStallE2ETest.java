@@ -27,6 +27,7 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.server.proxy.DataProxyServer;
 import am.ik.sluice.server.route.Router;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
@@ -52,7 +53,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * gone quiet -- every buffer between the relay and that upstream filled, the leg's queue
  * engaged -- the other leg of the same client connection still completes. And a client
  * sending past a stream's window gets the connection closed with a FLOW_CONTROL_ERROR
- * instead of the relay queueing beyond the stream's budget.
+ * instead of the relay queueing beyond the stream's budget. A client that goes away in
+ * the middle of a request releases a relay stalled that way.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -93,6 +95,10 @@ class H2DemuxStallE2ETest {
 	@Nullable
 	@Autowired
 	private MeterRegistry meterRegistry;
+
+	@Nullable
+	@Autowired
+	private DataProxyServer dataProxyServer;
 
 	@BeforeAll
 	static void startUpstreams() {
@@ -161,6 +167,64 @@ class H2DemuxStallE2ETest {
 				.isLessThanOrEqualTo(STREAM_QUEUE_BOUND);
 			assertThat(client.streamSent(1)).as("bytes pushed on the stalled leg").isGreaterThan(2L * 1024 * 1024);
 			assertThat(client.maxOvershoot()).isLessThanOrEqualTo(0);
+		}
+	}
+
+	/**
+	 * A client closing in the middle of a request releases a relay whose leg writer is
+	 * parked at the tunnel sender's per-connection cap: the relay finishes and the
+	 * active-connection count drops while the stalled upstream still holds its socket.
+	 */
+	@Test
+	void closingTheClientReleasesTheStalledLeg() throws Exception {
+		String route = "h2d.release.test";
+		startClient(route, stallUpstream);
+		DataProxyServer proxy = Objects.requireNonNull(this.dataProxyServer);
+		// the relays of the other tests have ended: the count below is this relay's
+		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> proxy.activeConnections() == 0);
+		int heldBefore = heldUpstreamSockets();
+		AtomicBoolean stop = new AtomicBoolean();
+		try (H2TestClient client = H2TestClient.connect(dataPort)) {
+			client.headers(1, false, TestH2.headerBlock(":authority=h2d.release.test", ":method=POST", ":path=/slow"));
+			Thread.ofVirtual().name("e2e-h2d-push-release").start(() -> {
+				try {
+					while (!stop.get() && !client.closed()) {
+						client.fill(1, Duration.ofMillis(100));
+					}
+				}
+				catch (IOException | InterruptedException e) {
+					// torn down
+				}
+			});
+			awaitOutboundPlateau(route);
+			// the leg's writer is parked: the leg queue holds what it could not write
+			assertThat(queuedBytes(route)).as("the stall reached the leg queue").isGreaterThan(0);
+			assertThat(proxy.activeConnections()).as("the relay is live").isEqualTo(1);
+		}
+		finally {
+			stop.set(true);
+		}
+		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> proxy.activeConnections() == 0);
+		assertThat(heldUpstreamSockets()).as("the stalled upstream still holds its socket").isEqualTo(heldBefore + 1);
+	}
+
+	/**
+	 * The release above aborts only for an unfinished request: a client half-closing
+	 * after its request ended still gets the response.
+	 */
+	@Test
+	void halfCloseAfterAFinishedRequestStillGetsTheResponse() throws Exception {
+		startClient("h2d.halfclose.test", echoUpstream);
+		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+			socket.setSoTimeout((int) TimeUnit.SECONDS.toMillis(10));
+			TestH2.writeClientHead(socket.getOutputStream(), 1, ":authority=h2d.halfclose.test", ":method=GET",
+					":path=/done");
+			socket.shutdownOutput();
+			List<TestH2.Frame> frames = TestH2.readResponseFrames(socket.getInputStream())
+				.stream()
+				.filter(frame -> frame.streamId() == 1)
+				.toList();
+			assertThat(TestH2.bodyOf(frames)).isEqualTo(ECHO_BODY);
 		}
 	}
 
@@ -252,6 +316,13 @@ class H2DemuxStallE2ETest {
 		Awaitility.await()
 			.atMost(Duration.ofSeconds(10))
 			.until(() -> Objects.requireNonNull(router).lookup(host).isPresent());
+	}
+
+	/** The upstream sockets currently held open by the stubs. */
+	private static int heldUpstreamSockets() {
+		synchronized (heldUpstreamSockets) {
+			return (int) heldUpstreamSockets.stream().filter(socket -> !socket.isClosed()).count();
+		}
 	}
 
 	/** A raw TCP stub serving every accepted socket with the handler. */

@@ -53,6 +53,10 @@ import io.micrometer.core.instrument.MeterRegistry;
  * is written whole in either direction, and the relay's own connection-level frames
  * towards an upstream are written ahead of the request frames queued for it.
  * <p>
+ * The client ending its side of the connection half-closes every leg after the frames
+ * queued for it, unless a routed request is unfinished: that request can never complete,
+ * so the relay ends instead, closing the legs.
+ * <p>
  * The relay does not track the upstream's windows: an upstream announcing an initial
  * stream window below the spec default can see a stream exceed it. HPACK blocks are
  * re-encoded table-less, so each side's decoder sees self-contained blocks whichever leg
@@ -288,9 +292,17 @@ final class Http2DemuxRelay {
 			while ((n = in.read(buffer)) > 0) {
 				feed(buffer, 0, n);
 			}
-			// the client is done sending: no further request on any leg
-			for (Leg leg : this.legs) {
-				leg.halfClose();
+			if (requestUnfinished()) {
+				// HTTP/2 has no half-closed connection: a request without its end can
+				// never complete, so the client is gone -- and so is the reason to wait
+				// on a leg writer parked behind it
+				abort();
+			}
+			else {
+				// the client is done sending: no further request on any leg
+				for (Leg leg : this.legs) {
+					leg.halfClose();
+				}
 			}
 		}
 		catch (Exception e) {
@@ -298,6 +310,17 @@ final class Http2DemuxRelay {
 		}
 		finally {
 			settle();
+		}
+	}
+
+	/** Whether a routed stream still waits for the rest of its request. */
+	private boolean requestUnfinished() {
+		this.lock.lock();
+		try {
+			return this.streams.values().stream().anyMatch(stream -> !stream.clientEnded);
+		}
+		finally {
+			this.lock.unlock();
 		}
 	}
 
