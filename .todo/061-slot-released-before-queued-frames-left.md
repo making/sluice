@@ -17,13 +17,18 @@ CLOSE / ERROR. While the stream is not ready (gRPC flow control, a congested tra
 connections that end keep handing their slots to new connections whose responses queue
 too, so the queued bytes grow without the limit applying.
 
+Since 057 the h2 demux's further legs hold slots of their own, released when the leg
+closes (`Http2DemuxRelay.Leg#closeLocked`, or the relay's end), with the same gap: the
+leg's frames may still sit in `SessionSender`.
+
 The wasmlet does it the other way since 056: the ended connection's `Permit` moves into
 its outbound queue and is dropped with it (`Outbound::hold`).
 
 ## Direction
 
 Release the slot when the connection's last queued frame was handed to gRPC, or at once
-when nothing is queued; the sender's teardown releases what it still holds. Keep the
+when nothing is queued; the sender's teardown releases what it still holds. The same for
+an h2 leg's own slot. Keep the
 release exactly once on every path (048's `ConnectionReleaseE2ETest`).
 
 ## Tests (watch each fail first)
