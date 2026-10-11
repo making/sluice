@@ -123,6 +123,33 @@ final class TestH2 {
 		return frames;
 	}
 
+	/**
+	 * Appends a literal-with-incremental-indexing header: the entry becomes dynamic index
+	 * 62+order.
+	 */
+	static byte[] appendLiteralIncremental(byte[] block, String name, String value) {
+		ByteArrayOutputStream out = new ByteArrayOutputStream(block.length + 64);
+		out.write(block, 0, block.length);
+		byte[] nameBytes = name.getBytes(StandardCharsets.US_ASCII);
+		byte[] valueBytes = value.getBytes(StandardCharsets.US_ASCII);
+		out.write(0x40);
+		out.write(nameBytes.length);
+		out.writeBytes(nameBytes);
+		out.write(valueBytes.length);
+		out.writeBytes(valueBytes);
+		return out.toByteArray();
+	}
+
+	/**
+	 * Appends a reference to a dynamic-table entry (index >= 62) set by an earlier block.
+	 */
+	static byte[] appendIndexedDynamic(byte[] block, int index) {
+		ByteArrayOutputStream out = new ByteArrayOutputStream(block.length + 1);
+		out.write(block, 0, block.length);
+		out.write(0x80 | index);
+		return out.toByteArray();
+	}
+
 	static String bodyOf(List<Frame> frames) {
 		ByteArrayOutputStream body = new ByteArrayOutputStream();
 		frames.stream().filter(frame -> frame.type == DATA).forEach(frame -> body.writeBytes(frame.payload()));
@@ -145,6 +172,23 @@ final class TestH2 {
 			throw new UncheckedIOException(e);
 		}
 		return out.toByteArray();
+	}
+
+	/**
+	 * Reads and discards frames up to the completed client request head, contents unused;
+	 * tolerates any framing the relay produced (settings, continuations).
+	 */
+	static void readClientHead(java.io.InputStream in) throws IOException {
+		if (in.readNBytes(PREFACE.length).length < PREFACE.length) {
+			return;
+		}
+		Frame frame;
+		while ((frame = readFrame(in)) != null) {
+			boolean headFragment = frame.type == HEADERS || frame.type == CONTINUATION;
+			if (headFragment && (frame.flags & FLAG_END_HEADERS) != 0) {
+				return;
+			}
+		}
 	}
 
 	static final class UncheckedIOException extends RuntimeException {

@@ -74,9 +74,10 @@ class H2cDataPlaneE2ETest {
 					Socket socket = h2Upstream.accept();
 					UPSTREAM_EXECUTOR.execute(() -> {
 						try (socket) {
-							socket.getInputStream().readNBytes(64); // preface + settings
-																	// + headers, contents
-																	// unused
+							TestH2.readClientHead(socket.getInputStream()); // preface +
+																			// settings
+							// + headers, contents
+							// unused
 							socket.getOutputStream().write(TestH2.cannedResponse(1, H2_BODY));
 							socket.getOutputStream().flush();
 							socket.getInputStream().read(new byte[1]); // keep the relay

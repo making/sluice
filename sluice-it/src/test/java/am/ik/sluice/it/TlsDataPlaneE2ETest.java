@@ -91,7 +91,7 @@ class TlsDataPlaneE2ETest {
 					Socket socket = h2Upstream.accept();
 					UPSTREAM_EXECUTOR.execute(() -> {
 						try (socket) {
-							socket.getInputStream().readNBytes(64);
+							TestH2.readClientHead(socket.getInputStream());
 							socket.getOutputStream().write(TestH2.cannedResponse(1, H2_BODY));
 							socket.getOutputStream().flush();
 							socket.getInputStream().read(new byte[1]);

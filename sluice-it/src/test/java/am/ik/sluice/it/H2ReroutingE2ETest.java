@@ -325,6 +325,30 @@ class H2ReroutingE2ETest {
 	}
 
 	@Test
+	void routesHeadsThatReferenceEarlierEntries() throws Exception {
+		// real clients index into the connection's dynamic table (Chrome): a head on the
+		// second route references entries established by the first head's block, so every
+		// leg's decoder needs the block itself to be self-contained
+		startClient("dyn.a.test", alphaUpstream, false);
+		startClient("dynb.a.test", betaUpstream, false);
+		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+			socket.setSoTimeout(10_000);
+			var out = socket.getOutputStream();
+			out.write(TestH2.PREFACE);
+			TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
+			byte[] first = TestH2.appendLiteralIncremental(
+					TestH2.headerBlock(":authority=dyn.a.test", ":method=GET", ":path=/one"), "x-marker", "one");
+			TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 1, first);
+			byte[] second = TestH2
+				.appendIndexedDynamic(TestH2.headerBlock(":authority=dynb.a.test", ":method=GET", ":path=/two"), 62);
+			TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 3, second);
+			Map<Integer, List<TestH2.Frame>> frames = drainStreams(socket.getInputStream(), 1, 3);
+			assertThat(TestH2.bodyOf(Objects.requireNonNull(frames.get(1)))).isEqualTo("alpha:dyn.a.test");
+			assertThat(TestH2.bodyOf(Objects.requireNonNull(frames.get(3)))).isEqualTo("beta:dynb.a.test");
+		}
+	}
+
+	@Test
 	void routesConcurrentStreamsInEitherOrder() throws Exception {
 		startClient("ord.a.test", alphaUpstream, false);
 		startClient("ord.b.test", betaUpstream, false);

@@ -7,6 +7,7 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -138,9 +139,27 @@ final class Http2DemuxRelay {
 	private final io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder headersDecoder = new io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder(
 			true);
 
-	private final io.netty.handler.codec.http2.DefaultHttp2HeadersEncoder headersEncoder = new io.netty.handler.codec.http2.DefaultHttp2HeadersEncoder();
+	private final io.netty.handler.codec.http2.DefaultHttp2HeadersEncoder headersEncoder = newHeadersEncoder();
 
 	private boolean firstHead = true;
+
+	/**
+	 * The request-head encoder shared by the re-encode path: it keeps no dynamic table,
+	 * so every emitted block is self-contained and decodable by a leg that joins the
+	 * connection mid-flight.
+	 */
+	static io.netty.handler.codec.http2.DefaultHttp2HeadersEncoder newHeadersEncoder() {
+		io.netty.handler.codec.http2.DefaultHttp2HeadersEncoder encoder = new io.netty.handler.codec.http2.DefaultHttp2HeadersEncoder();
+		try {
+			// mirror the connection-head limit
+			encoder.maxHeaderListSize(64 * 1024);
+			encoder.maxHeaderTableSize(0);
+		}
+		catch (io.netty.handler.codec.http2.Http2Exception e) {
+			throw new IllegalStateException(e);
+		}
+		return encoder;
+	}
 
 	Http2DemuxRelay(DuplexPipe pipe, ConnectionHeadParser.Head head, Router router, SessionRegistry sessions,
 			AccessControl accessControl, ErrorResponse errorResponse, AccessLogger.Connection access,
@@ -326,6 +345,11 @@ final class Http2DemuxRelay {
 
 	/** Strips padding and priority fields, keeping the bare header block fragment. */
 	private void appendFragment(int flags, byte[] bytes, int payload, int length, boolean headers) {
+		appendFragmentTo(this.assembling, flags, bytes, payload, length, headers);
+	}
+
+	private static void appendFragmentTo(ByteArrayOutputStream out, int flags, byte[] bytes, int payload, int length,
+			boolean headers) {
 		int start = payload;
 		int fragmentLength = length;
 		if ((flags & FLAG_PADDED) != 0 && length > 0) {
@@ -338,7 +362,7 @@ final class Http2DemuxRelay {
 			fragmentLength -= 5;
 		}
 		if (fragmentLength > 0) {
-			this.assembling.write(bytes, start, fragmentLength);
+			out.write(bytes, start, fragmentLength);
 		}
 	}
 
@@ -349,8 +373,10 @@ final class Http2DemuxRelay {
 		this.assemblingStream = -1;
 		Leg leg = this.streams.get(Integer.valueOf(streamId));
 		if (leg != null) {
-			// trailers of a started stream: same leg, block untouched
-			leg.relayFrame(headFrame(streamId, FLAG_END_HEADERS | (endStream ? FLAG_END_STREAM : 0), block));
+			// trailers of a started stream: decoded to keep the connection decoder in
+			// sync, re-encoded so the leg's decoder needs no earlier state
+			io.netty.handler.codec.http2.Http2Headers trailers = decode(streamId, block);
+			leg.relayFrames(encodedHead(streamId, endStream, trailers, null, this.headersEncoder));
 			return;
 		}
 		onRequestHead(streamId, endStream, block);
@@ -377,12 +403,12 @@ final class Http2DemuxRelay {
 		Leg leg = legFor(route, resolved.session());
 		this.streams.put(Integer.valueOf(streamId), leg);
 		leg.streamOpened(streamId);
-		if (route.rewriteHost()) {
-			leg.relayFrames(rewrittenHead(streamId, endStream, headers, route.address()));
-		}
-		else {
-			leg.relayFrame(headFrame(streamId, FLAG_END_HEADERS | (endStream ? FLAG_END_STREAM : 0), block));
-		}
+		// always re-encoded: the client's blocks reference its dynamic table, whose
+		// state a leg joining later (tunnel recovery, a second upstream of a coalesced
+		// connection) does not have -- the table-less encoder keeps every block
+		// self-contained no matter which leg decodes it or when
+		leg.relayFrames(encodedHead(streamId, endStream, headers, route.rewriteHost() ? route.address() : null,
+				this.headersEncoder));
 		if (request != null) {
 			this.access.request(route.routeTag(), request.method(), request.path(), "2");
 		}
@@ -473,16 +499,20 @@ final class Http2DemuxRelay {
 	}
 
 	/**
-	 * The request head re-encoded with the route authority; the block is split to the
-	 * default maximum frame size.
+	 * The head re-encoded with the given table-less encoder (see
+	 * {@link #newHeadersEncoder()}), the authority replaced when {@code address} is
+	 * given; the block is split to the default maximum frame size.
 	 */
-	private List<byte[]> rewrittenHead(int streamId, boolean endStream,
-			io.netty.handler.codec.http2.Http2Headers headers, String address) {
-		headers.authority(io.netty.util.AsciiString.of(address));
+	private static List<byte[]> encodedHead(int streamId, boolean endStream,
+			io.netty.handler.codec.http2.Http2Headers headers, java.lang.@Nullable String address,
+			io.netty.handler.codec.http2.DefaultHttp2HeadersEncoder encoder) {
+		if (address != null) {
+			headers.authority(io.netty.util.AsciiString.of(address));
+		}
 		io.netty.buffer.ByteBuf encoded = io.netty.buffer.Unpooled.buffer(256);
 		byte[] block;
 		try {
-			this.headersEncoder.encodeHeaders(streamId, headers, encoded);
+			encoder.encodeHeaders(streamId, headers, encoded);
 			block = new byte[encoded.readableBytes()];
 			encoded.readBytes(block);
 		}
@@ -493,6 +523,11 @@ final class Http2DemuxRelay {
 		finally {
 			encoded.release();
 		}
+		return blockFrames(streamId, endStream, block);
+	}
+
+	/** Splits an encoded header block to HEADERS plus CONTINUATION frames. */
+	private static List<byte[]> blockFrames(int streamId, boolean endStream, byte[] block) {
 		List<byte[]> frames = new ArrayList<>();
 		int offset = 0;
 		boolean first = true;
@@ -603,6 +638,22 @@ final class Http2DemuxRelay {
 
 		private final Counter outbound;
 
+		/**
+		 * Mirrors the upstream's HPACK encoder for the blocks relayed towards the client;
+		 * the responses are re-encoded table-less so the client's single decoder is
+		 * untouched by whichever leg produced the block, or when.
+		 */
+		private final io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder responseDecoder = new io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder(
+				true);
+
+		private final io.netty.handler.codec.http2.DefaultHttp2HeadersEncoder responseEncoder = Http2DemuxRelay
+			.newHeadersEncoder();
+
+		/** Response head blocks being assembled, keyed by stream. */
+		private final Map<Integer, ByteArrayOutputStream> inboundHeads = new HashMap<>();
+
+		private final Map<Integer, Boolean> inboundHeadEndStream = new HashMap<>();
+
 		private final Object upstreamWriteLock = new Object();
 
 		/** The streams relayed whose response has not ended. */
@@ -686,6 +737,46 @@ final class Http2DemuxRelay {
 			this.openStreams.remove(Integer.valueOf(streamId));
 		}
 
+		/**
+		 * Assembles one response-head fragment; on the completed block the head is
+		 * decoded with this leg's decoder -- mirroring the upstream's encoder -- and
+		 * re-encoded table-less towards the client.
+		 */
+		void inboundHead(int type, int flags, int streamId, byte[] all, int payload, int length) {
+			boolean head = type == FRAME_HEADERS;
+			if (head) {
+				this.inboundHeads.put(Integer.valueOf(streamId), new ByteArrayOutputStream(256));
+				this.inboundHeadEndStream.put(Integer.valueOf(streamId), (flags & FLAG_END_STREAM) != 0);
+			}
+			ByteArrayOutputStream buffer = this.inboundHeads.get(Integer.valueOf(streamId));
+			if (buffer == null) {
+				return; // a continuation of a head this leg never saw the start of
+			}
+			appendFragmentTo(buffer, flags, all, payload, length, head);
+			if ((flags & FLAG_END_HEADERS) == 0) {
+				return;
+			}
+			byte[] block = buffer.toByteArray();
+			Boolean endStreamFlag = this.inboundHeadEndStream.remove(Integer.valueOf(streamId));
+			boolean endStream = endStreamFlag != null && endStreamFlag;
+			this.inboundHeads.remove(Integer.valueOf(streamId));
+			io.netty.handler.codec.http2.Http2Headers headers;
+			try {
+				headers = this.responseDecoder.decodeHeaders(streamId, io.netty.buffer.Unpooled.wrappedBuffer(block));
+			}
+			catch (io.netty.handler.codec.http2.Http2Exception e) {
+				// undecodable from the upstream's state; an empty head keeps the stream
+				// alive
+				headers = new io.netty.handler.codec.http2.DefaultHttp2Headers();
+			}
+			for (byte[] frame : Http2DemuxRelay.encodedHead(streamId, endStream, headers, null, this.responseEncoder)) {
+				writeToClient(frame, 0, frame.length, this);
+			}
+			if (endStream) {
+				responseEnded(streamId);
+			}
+		}
+
 		boolean hasOpenStreams() {
 			return !this.openStreams.isEmpty();
 		}
@@ -756,9 +847,14 @@ final class Http2DemuxRelay {
 			int streamId = header.getInt() & 0x7fffffff;
 			int end = position + FRAME_HEADER_LENGTH + frameLength;
 			if (streamId != 0) {
-				writeToClient(all, position, end - position, leg);
-				if ((type == FRAME_DATA || type == FRAME_HEADERS) && (flags & FLAG_END_STREAM) != 0) {
-					leg.responseEnded(streamId);
+				if (type == FRAME_HEADERS || type == FRAME_CONTINUATION) {
+					leg.inboundHead(type, flags, streamId, all, position + FRAME_HEADER_LENGTH, frameLength);
+				}
+				else {
+					writeToClient(all, position, end - position, leg);
+					if (type == FRAME_DATA && (flags & FLAG_END_STREAM) != 0) {
+						leg.responseEnded(streamId);
+					}
 				}
 			}
 			else if (type == FRAME_SETTINGS && (flags & FLAG_ACK) == 0) {
