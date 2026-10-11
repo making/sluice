@@ -31,6 +31,8 @@ final class TestH2 {
 
 	static final int FLAG_END_STREAM = 0x1;
 
+	static final int FLAG_ACK = 0x1;
+
 	static final int FLAG_END_HEADERS = 0x4;
 
 	private TestH2() {

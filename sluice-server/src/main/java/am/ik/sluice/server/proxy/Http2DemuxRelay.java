@@ -185,6 +185,9 @@ final class Http2DemuxRelay {
 	 */
 	private void pumpOutbound() {
 		try {
+			// the server face opens with its own settings (RFC 9113 6.5): defaults only,
+			// every window stays at the spec initial on this side (see the class doc)
+			writeToClient(frame(FRAME_SETTINGS, 0, 0, null, 0, 0));
 			// the connection head ends with the magic; the frames follow it
 			int magic = ConnectionHeadParser.H2_MAGIC.length();
 			feed(this.seedHead, magic, this.seedHead.length - magic);
@@ -705,9 +708,8 @@ final class Http2DemuxRelay {
 	}
 
 	/**
-	 * The inbound side of a leg: relays response frames to the client, releases the leg's
-	 * connection window for the bytes forwarded, and watches the relayed frames for the
-	 * stream endings and the settings and pings to answer.
+	 * The inbound side of a leg: relays the response frames and releases the leg's
+	 * connection window for the bytes forwarded (see {@link #relayInbound}).
 	 */
 	private void pumpInbound(Leg leg) {
 		try {
@@ -716,9 +718,8 @@ final class Http2DemuxRelay {
 			byte[] buffer = new byte[BUFFER_SIZE];
 			int n;
 			while ((n = in.read(buffer)) > 0) {
-				writeToClient(buffer, 0, n, leg);
+				relayInbound(leg, scan, buffer, n);
 				writeToLeg(leg, windowUpdate(0, n)); // the bytes left towards the client
-				scanInbound(leg, scan, buffer, n);
 			}
 			// the upstream half-closed: owed responses end the relay, an idle leg retires
 			if (leg.hasOpenStreams()) {
@@ -734,7 +735,13 @@ final class Http2DemuxRelay {
 		}
 	}
 
-	private void scanInbound(Leg leg, ByteArrayOutputStream scan, byte[] chunk, int length) {
+	/**
+	 * Relays the leg's stream-scoped frames verbatim to the client and handles the
+	 * connection-level ones locally: the client face of the relay owns that state, so the
+	 * leg's settings are acked, its pings answered, and its window updates and goaway
+	 * absorbed by the regeneration below -- never forwarded.
+	 */
+	private void relayInbound(Leg leg, ByteArrayOutputStream scan, byte[] chunk, int length) {
 		scan.write(chunk, 0, length);
 		byte[] all = scan.toByteArray();
 		int position = 0;
@@ -747,8 +754,12 @@ final class Http2DemuxRelay {
 			int type = header.get() & 0xff;
 			int flags = header.get() & 0xff;
 			int streamId = header.getInt() & 0x7fffffff;
-			if ((type == FRAME_DATA || type == FRAME_HEADERS) && (flags & FLAG_END_STREAM) != 0 && streamId != 0) {
-				leg.responseEnded(streamId);
+			int end = position + FRAME_HEADER_LENGTH + frameLength;
+			if (streamId != 0) {
+				writeToClient(all, position, end - position, leg);
+				if ((type == FRAME_DATA || type == FRAME_HEADERS) && (flags & FLAG_END_STREAM) != 0) {
+					leg.responseEnded(streamId);
+				}
 			}
 			else if (type == FRAME_SETTINGS && (flags & FLAG_ACK) == 0) {
 				writeToLeg(leg, frame(FRAME_SETTINGS, FLAG_ACK, 0, null, 0, 0));
@@ -756,7 +767,7 @@ final class Http2DemuxRelay {
 			else if (type == FRAME_PING && (flags & FLAG_ACK) == 0 && frameLength == 8) {
 				writeToLeg(leg, frame(FRAME_PING, FLAG_ACK, 0, all, position + FRAME_HEADER_LENGTH, 8));
 			}
-			position += FRAME_HEADER_LENGTH + frameLength;
+			position = end;
 		}
 		byte[] remainder = new byte[all.length - position];
 		System.arraycopy(all, position, remainder, 0, remainder.length);

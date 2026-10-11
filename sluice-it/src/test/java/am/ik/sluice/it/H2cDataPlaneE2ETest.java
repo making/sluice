@@ -7,6 +7,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -169,6 +170,45 @@ class H2cDataPlaneE2ETest {
 			assertThat(frames).anyMatch(frame -> frame.type() == TestH2.HEADERS);
 			assertThat(TestH2.bodyOf(frames)).isEqualTo(H2_BODY);
 		}
+	}
+
+	@Test
+	void h2cServerAnnouncesSettingsBeforeAnythingElse() throws Exception {
+		if (this.h2Client == null) {
+			this.h2Client = this.startClient("h2.local", "http://127.0.0.1:" + h2Upstream.getLocalPort());
+		}
+		List<TestH2.Frame> frames = new ArrayList<>();
+		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+			socket.setSoTimeout(2_000);
+			TestH2.writeClientHead(socket.getOutputStream(), 1, ":authority=h2.local", ":method=GET", ":path=/");
+			// every frame the server side emits, in order, settings included
+			while (frames.size() < 100) {
+				try {
+					TestH2.Frame frame = TestH2.readFrame(socket.getInputStream());
+					if (frame == null) {
+						break;
+					}
+					frames.add(frame);
+				}
+				catch (java.net.SocketTimeoutException e) {
+					break; // drain deadline: the connection idle after the response
+				}
+			}
+		}
+		assertThat(frames).isNotEmpty();
+		// RFC 9113 6.5: SETTINGS is the first frame of the server-facing connection
+		TestH2.Frame first = frames.get(0);
+		assertThat(first.type()).as("frames seen: %s", frames).isEqualTo(TestH2.SETTINGS);
+		assertThat(first.flags() & TestH2.FLAG_ACK).as("frames seen: %s", frames).isZero();
+		// exactly one SETTINGS ack for the single client SETTINGS block
+		long acks = frames.stream()
+			.filter(frame -> frame.type() == TestH2.SETTINGS && (frame.flags() & TestH2.FLAG_ACK) != 0)
+			.count();
+		assertThat(acks).as("frames seen: %s", frames).isEqualTo(1);
+		// and the request is answered without a stream reset
+		assertThat(frames).anyMatch(frame -> frame.type() == TestH2.HEADERS);
+		assertThat(frames).noneMatch(frame -> frame.type() == TestH2.RST_STREAM);
+		assertThat(TestH2.bodyOf(frames)).isEqualTo(H2_BODY);
 	}
 
 	@Test
