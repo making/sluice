@@ -1,0 +1,22 @@
+Difficulty: Low
+
+# h2 demux: no test for a stream routed to a leg its upstream retires meanwhile
+
+Left open by 053, carried over from 062. `Http2DemuxRelay#routeRequestHead` picks the
+route's leg (`legFor`, which skips legs marked `ended`) and admits the stream under the
+lock only while `Leg#acceptingLocked` holds; a leg whose upstream ended its side or failed
+in between refuses it with `REFUSED_STREAM`. Since 062 a leg whose upstream left first
+writes its responses waiting for the client's connection window (`upstreamGone`, then
+`awaitResponsesWritten`, then `retire`), so the leg is `gone` (not accepting) for longer
+before it closes. The deterministic part is tested
+(`H2DemuxClientWindowE2ETest.newStreamOfARouteWhoseLegDrainsGoesToANewLeg`: a stream
+opened once the leg is marked goes to a new leg); the race between `legFor` and the mark
+is not.
+
+## Tests (watch each fail first)
+
+- A stream whose head is routed to a leg that is marked gone between `legFor` and the
+  admission is refused with `REFUSED_STREAM`, not admitted to the gone leg (needs a test
+  hook to hold the routing between the two, e.g. a latch in `legFor`); removing the
+  `acceptingLocked` check must make it fail (the stream hangs, or the relay ends when the
+  leg retires with a response owed).
