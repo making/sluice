@@ -3,10 +3,9 @@ package am.ik.sluice.tunnel;
 import org.jspecify.annotations.Nullable;
 
 import java.util.ArrayDeque;
-import java.util.Iterator;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
-import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -34,18 +33,22 @@ import io.grpc.stub.StreamObserver;
  * <p>
  * Callbacks must never call {@code onNext} directly from a receive callback; everything
  * goes through this class and a dedicated virtual thread instead. Frames are scheduled,
- * not just queued: control frames (CONNECT, KEEP_ALIVE, ADVERTISE, ADVERTISE_ACK,
- * MEMBERSHIP_UPDATE, DRAIN, and WINDOW_UPDATE once it exists) wait on an unbounded queue
- * that is always sent first, so enqueueing one never blocks. Connection frames (DATA,
- * CLOSE, ERROR) wait on a per-connection queue holding at most
- * {@link #DATA_QUEUE_CAPACITY} DATA frames; only that connection's producer blocks once
- * the cap is reached, and CLOSE / ERROR bypass it. The worker drains the connection
- * queues round-robin, one frame per turn over the connections with pending frames, so one
- * bulk transfer cannot starve the others. CONNECT stays ahead of its connection's DATA:
- * it is enqueued before any relay thread of the connection exists, and control frames
- * drain first. A connection's queue is dropped once it empties after its CLOSE or ERROR;
- * a late frame for the id starts a new queue. A dead worker wakes and fails every waiting
- * producer.
+ * not just queued: control frames (CONNECT, ADVERTISE, ADVERTISE_ACK, MEMBERSHIP_UPDATE,
+ * DRAIN, and WINDOW_UPDATE once it exists) wait on an unbounded queue that is always sent
+ * first, so enqueueing one never blocks. Connection frames (DATA, CLOSE, ERROR) wait on a
+ * per-connection queue holding at most {@link #DATA_QUEUE_CAPACITY} DATA frames; only
+ * that connection's producer blocks once the cap is reached, and CLOSE / ERROR bypass it.
+ * <p>
+ * Per-frame work is O(1) in the number of connections: the worker pops the head of a ring
+ * of the connections with pending frames, sends one frame, and re-appends the queue while
+ * frames remain, so one bulk transfer cannot starve the others. A queue is dropped as
+ * soon as it empties -- CLOSE / ERROR or not -- and a late frame for the id starts a new
+ * one. Waiting is targeted: the worker waits on its own condition, and the producers
+ * parked on a connection's cap are woken by that connection's DATA pops and liveness
+ * changes only -- an enqueue anywhere else never wakes them. CONNECT stays ahead of its
+ * connection's DATA: it is enqueued before any relay thread of the connection exists, and
+ * control frames drain first. Control and marker frames are dropped once the sender is
+ * stopped. A dead worker wakes and fails every waiting producer.
  */
 public final class SessionSender implements FrameWriter, AutoCloseable {
 
@@ -55,16 +58,36 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	/** Maximum DATA frames queued per connection: 16 x 64KiB = 1MiB of payload. */
 	static final int DATA_QUEUE_CAPACITY = 16;
 
-	/** Frames of one connection waiting for the worker; guarded by {@link #lock}. */
+	/**
+	 * The connection frames of one connection; guarded by {@link #lock}. A queue lives
+	 * only while it holds frames: the worker drops it as soon as it empties, so a late
+	 * frame for the id starts a new queue.
+	 */
 	private static final class ConnectionQueue {
+
+		final long id;
 
 		final ArrayDeque<Frame> frames = new ArrayDeque<>();
 
 		/** DATA frames within {@code #frames}; the per-connection producer bound. */
 		int dataFrames;
 
-		/** A CLOSE or ERROR is queued; the empty queue can be dropped. */
-		boolean ended;
+		/** The queue is in the active ring; a fresh one joins with its first frame. */
+		boolean queued;
+
+		/**
+		 * Test hook: completions of cap-waiter awaits parked on this queue; counted per
+		 * live queue, so it resets when the queue is dropped and recreated.
+		 */
+		long wakes;
+
+		/** Waits the producers parked on the cap; the worker signals it on a DATA pop. */
+		final Condition capWaiters;
+
+		ConnectionQueue(long id, ReentrantLock lock) {
+			this.id = id;
+			this.capWaiters = lock.newCondition();
+		}
 
 	}
 
@@ -75,24 +98,24 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	 */
 	private final ArrayDeque<Frame> control = new ArrayDeque<>();
 
-	/** Connection frames by id; guarded by {@link #lock}. */
-	private final TreeMap<Long, ConnectionQueue> queues = new TreeMap<>();
+	/** Live connection queues by id; only non-empty queues. Guarded by {@link #lock}. */
+	private final Map<Long, ConnectionQueue> queues = new HashMap<>();
+
+	/**
+	 * The ring of connection queues with pending frames, in serve order: the worker pops
+	 * the head and re-appends the queue while frames remain. Guarded by {@link #lock}.
+	 */
+	private final ArrayDeque<ConnectionQueue> ring = new ArrayDeque<>();
 
 	private final ReentrantLock lock = new ReentrantLock();
 
-	/** Signals enqueues, freed slots, readiness changes and shutdown. */
-	private final Condition activity = lock.newCondition();
+	/** Signals the worker: enqueues, readiness changes and shutdown. */
+	private final Condition wakeWorker = lock.newCondition();
 
 	private volatile boolean running = true;
 
 	/** The receive side observed the end of the call; waiters give up. */
 	private volatile boolean callClosed;
-
-	/**
-	 * The connection served last; the round-robin resumes after it. Guarded by
-	 * {@link #lock}.
-	 */
-	private long lastServed = -1;
 
 	private final ReentrantLock workerLock = new ReentrantLock();
 
@@ -107,15 +130,32 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	public SessionSender(StreamObserver<Frame> outbound) {
 		this.outbound = Objects.requireNonNull(outbound, "outbound is required");
 		if (outbound instanceof CallStreamObserver<?> call) {
-			call.setOnReadyHandler(this::wakeWaiters);
+			call.setOnReadyHandler(this::wakeWorker);
 		}
 	}
 
-	/** Wakes the worker and any producer; a readiness change may unblock either. */
-	private void wakeWaiters() {
+	/** Wakes the worker; a readiness change may let it pop a frame. */
+	private void wakeWorker() {
 		this.lock.lock();
 		try {
-			this.activity.signalAll();
+			this.wakeWorker.signalAll();
+		}
+		finally {
+			this.lock.unlock();
+		}
+	}
+
+	/**
+	 * Liveness changed -- the sender stopped or the call closed: the worker rechecks and
+	 * every producer parked on a cap gives up instead of waiting for {@link #close()}.
+	 */
+	private void releaseWaiters() {
+		this.lock.lock();
+		try {
+			this.wakeWorker.signalAll();
+			for (ConnectionQueue queue : this.queues.values()) {
+				queue.capWaiters.signalAll();
+			}
 		}
 		finally {
 			this.lock.unlock();
@@ -152,37 +192,59 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	 */
 	public void markCallClosed() {
 		this.callClosed = true;
-		this.wakeWaiters();
+		this.releaseWaiters();
 	}
 
-	private boolean awaitReady() {
-		if (!(this.outbound instanceof CallStreamObserver<?> call) || call.isReady()) {
-			return true;
-		}
+	/**
+	 * Test hook: the number of live connection queues. A queue lives only while it holds
+	 * frames, so this is zero once everything is drained -- idle connections included.
+	 */
+	int connectionQueues() {
 		this.lock.lock();
 		try {
-			while (this.running && !callClosed() && !call.isReady()) {
-				try {
-					this.activity.awaitNanos(TimeUnit.MILLISECONDS.toNanos(100));
-				}
-				catch (InterruptedException e) {
-					Thread.currentThread().interrupt();
-					return false;
-				}
-			}
+			return this.queues.size();
 		}
 		finally {
-			lock.unlock();
+			this.lock.unlock();
 		}
-		return this.running && !callClosed();
 	}
 
-	/** Queues a control frame; never blocks. */
+	/**
+	 * Test hook: completions of cap-waiter awaits parked on the connection's queue; 0
+	 * once the queue is dropped. The herd this counts is the wakeups of one connection's
+	 * waiters caused by unrelated connections.
+	 */
+	long capWaiterWakeups(long connectionId) {
+		this.lock.lock();
+		try {
+			ConnectionQueue queue = this.queues.get(connectionId);
+			return queue == null ? 0 : queue.wakes;
+		}
+		finally {
+			this.lock.unlock();
+		}
+	}
+
+	/**
+	 * The outbound stream accepts frames right now; a plain observer has no backpressure
+	 * and is always ready.
+	 */
+	private boolean outboundReady() {
+		return !(this.outbound instanceof CallStreamObserver<?> call) || call.isReady();
+	}
+
+	/**
+	 * Queues a control frame; never blocks. Dropped once the sender is stopped: the
+	 * worker is gone and nobody would drain it.
+	 */
 	private void enqueueControl(Frame frame) {
 		this.lock.lock();
 		try {
+			if (!this.running) {
+				return;
+			}
 			this.control.addLast(frame);
-			this.activity.signalAll();
+			this.wakeWorker.signal();
 		}
 		finally {
 			this.lock.unlock();
@@ -191,8 +253,8 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 	/**
 	 * Queues a DATA frame, blocking while this connection's queue is at
-	 * {@link #DATA_QUEUE_CAPACITY} -- only this connection's producer waits. Returns
-	 * false when the sender is gone.
+	 * {@link #DATA_QUEUE_CAPACITY} -- only this connection's producer waits, and only
+	 * this connection's pops wake it. Returns false when the sender is gone.
 	 */
 	private boolean enqueueData(long connectionId, Frame frame) {
 		this.lock.lock();
@@ -201,15 +263,20 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 				if (!this.running || callClosed()) {
 					return false;
 				}
-				ConnectionQueue queue = this.queues.computeIfAbsent(connectionId, id -> new ConnectionQueue());
+				ConnectionQueue queue = this.queues.computeIfAbsent(connectionId, id -> new ConnectionQueue(id, lock));
 				if (queue.dataFrames < DATA_QUEUE_CAPACITY) {
 					queue.frames.addLast(frame);
 					queue.dataFrames++;
-					this.activity.signalAll();
+					if (!queue.queued) {
+						queue.queued = true;
+						this.ring.addLast(queue);
+					}
+					this.wakeWorker.signal();
 					return true;
 				}
 				try {
-					this.activity.awaitNanos(TimeUnit.MILLISECONDS.toNanos(100));
+					queue.capWaiters.awaitNanos(TimeUnit.MILLISECONDS.toNanos(100));
+					queue.wakes++;
 				}
 				catch (InterruptedException e) {
 					Thread.currentThread().interrupt();
@@ -224,15 +291,21 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 	/**
 	 * Queues CLOSE / ERROR for the connection, bypassing the DATA cap; never blocks, so
-	 * close paths cannot hang behind a full queue.
+	 * close paths cannot hang behind a full queue. Dropped once the sender is stopped.
 	 */
 	private void enqueueMarker(long connectionId, Frame frame) {
 		this.lock.lock();
 		try {
-			ConnectionQueue queue = this.queues.computeIfAbsent(connectionId, id -> new ConnectionQueue());
+			if (!this.running) {
+				return;
+			}
+			ConnectionQueue queue = this.queues.computeIfAbsent(connectionId, id -> new ConnectionQueue(id, lock));
 			queue.frames.addLast(frame);
-			queue.ended = true;
-			this.activity.signalAll();
+			if (!queue.queued) {
+				queue.queued = true;
+				this.ring.addLast(queue);
+			}
+			this.wakeWorker.signal();
 		}
 		finally {
 			this.lock.unlock();
@@ -318,30 +391,38 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 	/**
 	 * The next frame to send: control frames first, then one frame per turn over the
-	 * connections with pending frames, resuming after the connection served last. Waits
-	 * while nothing is pending; null once the sender is stopped, in which case the
-	 * remaining frames are dropped -- the peer is gone anyway.
+	 * connections with pending frames -- the head of the ring, re-appended while frames
+	 * remain. A queue emptied by the pop is dropped, and its slot frees only its own
+	 * producers. Waits while nothing is pending or the stream is not ready; null once the
+	 * sender is stopped or the call closed, in which case the remaining frames are
+	 * dropped -- the peer is gone anyway.
 	 */
 	private @Nullable Frame next() {
 		this.lock.lock();
 		try {
 			while (true) {
-				if (!this.running) {
+				if (!this.running || callClosed()) {
 					return null;
 				}
 				Frame control = this.control.pollFirst();
 				if (control != null) {
 					return control;
 				}
-				Frame frame = nextConnectionFrame();
-				if (frame != null) {
-					return frame;
+				// readiness is consulted only for a pending connection frame: polling it
+				// unguarded races the delayed call's start, where grpc's isReady NPEs
+				ConnectionQueue head = this.ring.peekFirst();
+				if (head == null || outboundReady()) {
+					ConnectionQueue queue = this.ring.pollFirst();
+					if (queue != null) {
+						return pop(queue);
+					}
 				}
 				try {
-					this.activity.awaitNanos(TimeUnit.MILLISECONDS.toNanos(100));
+					this.wakeWorker.awaitNanos(TimeUnit.MILLISECONDS.toNanos(100));
 				}
 				catch (InterruptedException e) {
 					Thread.currentThread().interrupt();
+					return null;
 				}
 			}
 		}
@@ -350,56 +431,34 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		}
 	}
 
-	/**
-	 * Pops one frame from the next connection in round-robin order; queues empty after
-	 * their CLOSE or ERROR are dropped along the way.
-	 */
-	private @Nullable Frame nextConnectionFrame() {
-		Map.Entry<Long, ConnectionQueue> first = null;
-		Map.Entry<Long, ConnectionQueue> next = null;
-		for (Iterator<Map.Entry<Long, ConnectionQueue>> it = this.queues.entrySet().iterator(); it.hasNext();) {
-			Map.Entry<Long, ConnectionQueue> entry = it.next();
-			ConnectionQueue queue = entry.getValue();
-			if (queue.frames.isEmpty()) {
-				if (queue.ended) {
-					it.remove();
-				}
-				continue;
-			}
-			if (first == null) {
-				first = entry;
-			}
-			if (entry.getKey() > this.lastServed && next == null) {
-				next = entry;
-			}
-		}
-		Map.Entry<Long, ConnectionQueue> chosen = next != null ? next : first;
-		if (chosen == null) {
-			return null;
-		}
-		this.lastServed = chosen.getKey();
-		ConnectionQueue queue = chosen.getValue();
+	/** Pops one frame; drops the queue it emptied and wakes only its own producers. */
+	private Frame pop(ConnectionQueue queue) {
+		queue.queued = false;
 		Frame frame = queue.frames.pollFirst();
 		if (frame.getBodyCase() == Frame.BodyCase.DATA) {
 			queue.dataFrames--;
 			// a producer parked on the cap of this connection may continue
-			this.activity.signalAll();
+			queue.capWaiters.signal();
+		}
+		if (queue.frames.isEmpty()) {
+			this.queues.remove(queue.id);
+		}
+		else {
+			queue.queued = true;
+			this.ring.addLast(queue);
 		}
 		return frame;
 	}
 
 	/**
-	 * Flushes queued frames to the gRPC stream, blocking while the peer's flow control
-	 * window is exhausted.
+	 * Flushes queued frames to the gRPC stream. Readiness is part of {@link #next()}, so
+	 * no frame is taken from a queue while the peer's flow control window is exhausted.
 	 */
 	private void drain() {
 		try {
 			while (true) {
 				Frame frame = next();
 				if (frame == null) {
-					return;
-				}
-				if (!awaitReady()) {
 					return;
 				}
 				try {
@@ -440,7 +499,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	@Override
 	public void close() {
 		this.running = false;
-		this.wakeWaiters();
+		this.releaseWaiters();
 		Worker worker = this.worker;
 		Thread thread = this.workerThread;
 		if (worker == null || thread == null || Thread.currentThread() == thread) {
@@ -471,10 +530,10 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 				drain();
 			}
 			finally {
-				// a dead worker must release the producers parked in enqueueData and the
-				// awaitReady loop; close() alone cannot be relied on to run
+				// a dead worker must release the producers parked in enqueueData; close()
+				// alone cannot be relied on to run
 				running = false;
-				wakeWaiters();
+				releaseWaiters();
 				workerLock.lock();
 				try {
 					done = true;

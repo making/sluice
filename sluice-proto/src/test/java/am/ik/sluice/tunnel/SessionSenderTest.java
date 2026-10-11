@@ -6,6 +6,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.IntStream;
 
 import am.ik.sluice.v1.proto.Frame;
 import io.grpc.stub.ServerCallStreamObserver;
@@ -119,6 +120,157 @@ class SessionSenderTest {
 		assertThat(observer.sent).hasSizeGreaterThanOrEqualTo(count);
 	}
 
+	/** Waits until the sender holds the expected number of live connection queues. */
+	private static void awaitConnectionQueues(SessionSender sender, int expected) throws InterruptedException {
+		long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(5);
+		while (sender.connectionQueues() != expected && System.currentTimeMillis() < deadline) {
+			TimeUnit.MILLISECONDS.sleep(10);
+		}
+		assertThat(sender.connectionQueues()).as("live connection queues").isEqualTo(expected);
+	}
+
+	@Test
+	void queueIsDroppedOnceCloseDrains() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.ready.set(true);
+		observer.gate.countDown();
+		SessionSender sender = new SessionSender(observer);
+		try {
+			sender.start();
+			sender.sendData(1, new byte[] { 1 });
+			sender.sendClose(1);
+			awaitSentFrames(observer, 2);
+			awaitConnectionQueues(sender, 0);
+		}
+		finally {
+			sender.close();
+		}
+	}
+
+	@Test
+	void queueOfOpenConnectionIsDroppedOnceItsDataIsSent() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.ready.set(true);
+		observer.gate.countDown();
+		SessionSender sender = new SessionSender(observer);
+		try {
+			sender.start();
+			// no CLOSE: the connection stays open, yet nothing must remain to scan
+			sender.sendData(1, new byte[] { 1 });
+			awaitSentFrames(observer, 1);
+			awaitConnectionQueues(sender, 0);
+		}
+		finally {
+			sender.close();
+		}
+	}
+
+	@Test
+	void idleConnectionsLeaveNoQueueOnceTheirDataIsSent() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.ready.set(true);
+		observer.gate.countDown();
+		SessionSender sender = new SessionSender(observer);
+		try {
+			sender.start();
+			int connections = 10_000;
+			for (int id = 1; id <= connections; id++) {
+				sender.sendData(id, new byte[] { 1 });
+			}
+			awaitSentFrames(observer, connections);
+			// no CLOSE anywhere: the per-frame scan must not grow with idle connections
+			awaitConnectionQueues(sender, 0);
+		}
+		finally {
+			sender.close();
+		}
+	}
+
+	@Test
+	void capWaitersAreWokenOnlyByTheirOwnConnection() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.ready.set(true);
+		SessionSender sender = new SessionSender(observer);
+		try {
+			sender.start();
+			// park the worker inside a write: nothing pops during the measurement
+			sender.sendData(1, new byte[1]);
+			assertThat(observer.enteredOnNext.await(5, TimeUnit.SECONDS)).isTrue();
+			for (int i = 0; i < SessionSender.DATA_QUEUE_CAPACITY; i++) {
+				assertThat(sender.sendData(1, new byte[1])).isTrue();
+			}
+			AtomicBoolean parkedResult = new AtomicBoolean();
+			Thread parked = Thread.ofVirtual().start(() -> parkedResult.set(sender.sendData(1, new byte[1])));
+			observeBlocked(parked);
+			long baseline = sender.capWaiterWakeups(1);
+			// 99 other connections fill their queues; none of it touches conn 1's waiter
+			for (int id = 2; id <= 100; id++) {
+				for (int i = 0; i < SessionSender.DATA_QUEUE_CAPACITY; i++) {
+					assertThat(sender.sendData(id, new byte[1])).isTrue();
+				}
+			}
+			// let delivered signals and the 100ms timer wakes settle
+			TimeUnit.MILLISECONDS.sleep(200);
+
+			assertThat(sender.capWaiterWakeups(1)).as("wakes of connection 1's cap waiter").isLessThanOrEqualTo(100);
+			observer.gate.countDown();
+			parked.join(TimeUnit.SECONDS.toMillis(5));
+			assertThat(parked.isAlive()).as("parked producer resumed").isFalse();
+			assertThat(parkedResult).as("the chunk is queued once a slot frees").isTrue();
+		}
+		finally {
+			observer.gate.countDown();
+			sender.close();
+		}
+	}
+
+	@Test
+	void perConnectionOrderSurvivesInterleavedProducers() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.ready.set(true);
+		observer.gate.countDown();
+		SessionSender sender = new SessionSender(observer);
+		try {
+			sender.start();
+			int frames = 500;
+			Thread low = Thread.ofVirtual().start(() -> {
+				for (int i = 0; i < frames; i++) {
+					sender.sendData(1, new byte[] { (byte) (i >>> 8), (byte) i });
+				}
+			});
+			Thread high = Thread.ofVirtual().start(() -> {
+				for (int i = 0; i < frames; i++) {
+					sender.sendData(2, new byte[] { (byte) (i >>> 8), (byte) i });
+				}
+			});
+			low.join(TimeUnit.SECONDS.toMillis(5));
+			high.join(TimeUnit.SECONDS.toMillis(5));
+			assertThat(low.isAlive()).isFalse();
+			assertThat(high.isAlive()).isFalse();
+			awaitSentFrames(observer, 2 * frames);
+			assertThat(sequenceOf(observer.sent, 1)).as("connection 1 subsequence")
+				.containsExactlyElementsOf(expectedSequence(frames));
+			assertThat(sequenceOf(observer.sent, 2)).as("connection 2 subsequence")
+				.containsExactlyElementsOf(expectedSequence(frames));
+		}
+		finally {
+			sender.close();
+		}
+	}
+
+	private static List<Integer> expectedSequence(int frames) {
+		return IntStream.range(0, frames).mapToObj(Integer::valueOf).toList();
+	}
+
+	/** The payload values of the connection's DATA frames, in sent order. */
+	private static List<Integer> sequenceOf(List<Frame> sent, long connectionId) {
+		return sent.stream()
+			.filter(frame -> frame.getBodyCase() == Frame.BodyCase.DATA && frame.getData().getConnId() == connectionId)
+			.map(frame -> (frame.getData().getPayload().byteAt(0) & 0xff) << 8
+					| frame.getData().getPayload().byteAt(1) & 0xff)
+			.toList();
+	}
+
 	@Test
 	void serverObserverOnReadyHandlerIsRegisteredAndHonored() throws Exception {
 		FakeServerObserver observer = new FakeServerObserver();
@@ -188,8 +340,9 @@ class SessionSenderTest {
 					sender.sendData(1, new byte[1]);
 				}
 			});
-			// let the bulk reach the per-connection cap before connection 2 shows up
-			Thread.sleep(200);
+			// the bulk producer is parked on its cap before connection 2 shows up: the
+			// fairness assertion below cannot pass vacuously
+			observeBlocked(bulk);
 			assertThat(sender.sendData(2, new byte[1])).isTrue();
 			observer.becomeReady();
 			awaitSentFrames(observer, 2);
@@ -254,8 +407,13 @@ class SessionSenderTest {
 			AtomicBoolean capResult = new AtomicBoolean();
 			Thread producer = Thread.ofVirtual().start(() -> capResult.set(sender.sendData(1, new byte[1])));
 			observeBlocked(producer);
-			// another connection's producer is unaffected by the full queue of conn 1
-			assertThat(sender.sendData(2, new byte[1])).isTrue();
+			// another connection's producer is unaffected by the full queue of conn 1; on
+			// a thread with a timeout so a regression hangs the join, not the build
+			AtomicBoolean otherResult = new AtomicBoolean();
+			Thread other = Thread.ofVirtual().start(() -> otherResult.set(sender.sendData(2, new byte[1])));
+			other.join(TimeUnit.SECONDS.toMillis(1));
+			assertThat(other.isAlive()).as("another connection's send never blocks").isFalse();
+			assertThat(otherResult).as("queued on the other connection").isTrue();
 			// release the worker: slots free up and the parked producer completes
 			observer.gate.countDown();
 			producer.join(TimeUnit.SECONDS.toMillis(5));
@@ -299,9 +457,14 @@ class SessionSenderTest {
 			for (int i = 0; i < SessionSender.DATA_QUEUE_CAPACITY; i++) {
 				assertThat(sender.sendData(1, new byte[1])).isTrue();
 			}
-			// markers are accepted with the connection at its cap; never blocked
-			sender.sendClose(1);
-			sender.sendError(1, "boom");
+			// markers are accepted with the connection at its cap; never blocked -- on a
+			// thread with a timeout so a regression hangs the join, not the build
+			Thread markers = Thread.ofVirtual().start(() -> {
+				sender.sendClose(1);
+				sender.sendError(1, "boom");
+			});
+			markers.join(TimeUnit.SECONDS.toMillis(1));
+			assertThat(markers.isAlive()).as("markers never block on the cap").isFalse();
 			observer.gate.countDown();
 			// 1 held frame + cap + 2 markers
 			awaitSentFrames(observer, 1 + SessionSender.DATA_QUEUE_CAPACITY + 2);
@@ -319,6 +482,8 @@ class SessionSenderTest {
 			assertThat(error.getBodyCase()).isEqualTo(Frame.BodyCase.ERROR);
 			assertThat(error.getError().getConnId()).isEqualTo(1);
 			assertThat(error.getError().getMessage()).isEqualTo("boom");
+			// both connections drained: nothing must remain to scan per frame
+			awaitConnectionQueues(sender, 0);
 		}
 		finally {
 			sender.close();
@@ -338,11 +503,13 @@ class SessionSenderTest {
 			assertThat(observer.firstSent.await(5, TimeUnit.SECONDS)).isTrue();
 			sender.sendClose(1);
 			awaitSentFrames(observer, 2);
-			// give the worker a turn to drop the emptied queue
-			Thread.sleep(100);
+			// the emptied queue is really gone, not kept for later scans
+			awaitConnectionQueues(sender, 0);
 			// a late frame for the removed id starts a new queue and drains normally
 			sender.sendData(1, new byte[] { 2 });
 			awaitSentFrames(observer, 3);
+			// and the new queue is dropped too once it drains
+			awaitConnectionQueues(sender, 0);
 			assertThat(observer.sent).hasSize(3);
 			assertThat(observer.sent.get(0).getBodyCase()).isEqualTo(Frame.BodyCase.DATA);
 			assertThat(observer.sent.get(0).getData().getPayload().toByteArray()).containsExactly(1);
