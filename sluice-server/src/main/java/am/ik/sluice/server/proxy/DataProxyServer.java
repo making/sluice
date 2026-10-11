@@ -366,7 +366,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			}
 			ReroutingRelay rerouting = new ReroutingRelay(conn.pipe(), conn.head(), this.router, this.sessions,
 					this.accessControl, this.errorResponse, access, this.meterRegistry, route0, session, peer, deadline,
-					relayed, release);
+					this.properties.limits().halfCloseProbeInterval(), relayed, release);
 			this.activeConnections.incrementAndGet();
 			try {
 				rerouting.start();

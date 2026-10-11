@@ -83,6 +83,15 @@ class SluiceServerPropertiesTest {
 		assertThat(properties.limits().headTimeout()).isEqualTo(Duration.ofSeconds(10));
 		assertThat(properties.limits().idleTimeout()).isEqualTo(Duration.ofSeconds(60));
 		assertThat(properties.limits().h2QueueBudget().toBytes()).isZero();
+		assertThat(properties.limits().halfCloseProbeInterval()).isEqualTo(Duration.ofSeconds(1));
+	}
+
+	@Test
+	void aZeroHalfCloseProbeIntervalTurnsTheProbeOffAndANegativeOneFallsBackToTheDefault() {
+		assertThat(bind(Map.of("sluice.limits.half-close-probe-interval", "0")).limits().halfCloseProbeInterval())
+			.isZero();
+		assertThat(bind(Map.of("sluice.limits.half-close-probe-interval", "-1s")).limits().halfCloseProbeInterval())
+			.isEqualTo(Duration.ofSeconds(1));
 	}
 
 	@Test
@@ -93,14 +102,16 @@ class SluiceServerPropertiesTest {
 
 	@Test
 	void limitsAreBoundInKebabCase() {
-		SluiceServerProperties properties = bind(Map.of("sluice.limits.max-connections", "100",
-				"sluice.limits.max-connections-per-address", "10", "sluice.limits.head-timeout", "2s",
-				"sluice.limits.idle-timeout", "3s", "sluice.limits.h2-queue-budget", "512KB"));
+		SluiceServerProperties properties = bind(
+				Map.of("sluice.limits.max-connections", "100", "sluice.limits.max-connections-per-address", "10",
+						"sluice.limits.head-timeout", "2s", "sluice.limits.idle-timeout", "3s",
+						"sluice.limits.h2-queue-budget", "512KB", "sluice.limits.half-close-probe-interval", "250ms"));
 		assertThat(properties.limits().maxConnections()).isEqualTo(100);
 		assertThat(properties.limits().maxConnectionsPerAddress()).isEqualTo(10);
 		assertThat(properties.limits().headTimeout()).isEqualTo(Duration.ofSeconds(2));
 		assertThat(properties.limits().idleTimeout()).isEqualTo(Duration.ofSeconds(3));
 		assertThat(properties.limits().h2QueueBudget().toBytes()).isEqualTo(512 * 1024);
+		assertThat(properties.limits().halfCloseProbeInterval()).isEqualTo(Duration.ofMillis(250));
 	}
 
 }

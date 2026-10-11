@@ -5,11 +5,13 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -51,12 +53,33 @@ import io.micrometer.core.instrument.MeterRegistry;
  * or response is in flight -- a response not yet complete, a request body still arriving
  * -- there is none, and an upgrade disarms it for good. A response whose framing the
  * tracker cannot follow stays owed, so such a connection keeps no deadline either.
+ * <p>
+ * TCP tells a client that half-closed from one gone entirely only on a write: the second
+ * write to a gone client fails, once its stack answered the first with a reset. So once
+ * the client ended its side, while a response is owed and none of it was relayed, the
+ * relay writes a {@code 100 Continue} whenever the connection stayed quiet -- nothing
+ * written to the client, no request relayed -- for the probe interval; a failed write
+ * ends the relay, failing its tunnel connection. A 1xx is the only thing HTTP/1.1 lets a
+ * server write before a final response (RFC 9110 15.2); nothing can be added to a
+ * response begun, to a response the tracker cannot follow, to an upgraded connection, or
+ * towards an HTTP/1.0 request, which must not get a 1xx. One response gets at most
+ * {@link #MAX_PROBES} probes.
  */
 final class ReroutingRelay {
 
 	private static final int BUFFER_SIZE = 64 * 1024;
 
 	private static final String METRIC_NAME = "sluice.tunnel.bytes";
+
+	/** What a probe writes; README "Connection limits" tells why a 100. */
+	private static final byte[] PROBE = "HTTP/1.1 100 Continue\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
+
+	/**
+	 * The probes one response may get: some clients fail a response after a few interim
+	 * responses (Go's net/http before 1.24 at the sixth, the JDK HttpClient at the
+	 * ninth), and the upstream may send its own.
+	 */
+	private static final int MAX_PROBES = 4;
 
 	private final DuplexPipe pipe;
 
@@ -87,6 +110,15 @@ final class ReroutingRelay {
 
 	private final ConnectionLimits.KeepAliveDeadline deadline;
 
+	/** The quiet after which a half-closed client is probed; zero = never. */
+	private final long probeIntervalNanos;
+
+	/** When the client was last written to. */
+	private volatile long lastClientWrite = System.nanoTime();
+
+	/** When a request head was last relayed. */
+	private volatile long lastRequest = System.nanoTime();
+
 	/** Guards {@link #owed}, {@link #position} and {@link #starting}. */
 	private final Object deadlineLock = new Object();
 
@@ -116,8 +148,8 @@ final class ReroutingRelay {
 	ReroutingRelay(DuplexPipe pipe, ConnectionHeadParser.Head head, Router router, SessionRegistry sessions,
 			AccessControl accessControl, ErrorResponse errorResponse, AccessLogger.Connection access,
 			MeterRegistry meterRegistry, Router.Route initialRoute, TunnelSession initialSession,
-			@Nullable InetAddress peer, ConnectionLimits.KeepAliveDeadline deadline, Runnable onFinish,
-			Runnable release) {
+			@Nullable InetAddress peer, ConnectionLimits.KeepAliveDeadline deadline, Duration probeInterval,
+			Runnable onFinish, Runnable release) {
 		this.pipe = pipe;
 		this.seedHead = head.bytes();
 		this.router = router;
@@ -132,6 +164,7 @@ final class ReroutingRelay {
 		this.onFinish = onFinish;
 		this.release = release;
 		this.deadline = deadline;
+		this.probeIntervalNanos = probeInterval.toNanos();
 		deadline.onExpiry(this::abort);
 	}
 
@@ -181,6 +214,8 @@ final class ReroutingRelay {
 			Leg leg = this.current;
 			if (leg != null) {
 				leg.halfClose();
+				// the legs before it are drained: only this one can still owe responses
+				probeWhileOwed(leg);
 			}
 		}
 		catch (Exception e) {
@@ -188,6 +223,50 @@ final class ReroutingRelay {
 		}
 		finally {
 			settle();
+		}
+	}
+
+	/**
+	 * After the client ended its side: probes it while {@code leg} owes a response, until
+	 * the leg ended or relayed every response owed. A write failing throws, which ends
+	 * the relay.
+	 */
+	private void probeWhileOwed(Leg leg) throws InterruptedException {
+		if (this.probeIntervalNanos <= 0) {
+			return;
+		}
+		int probes = 0;
+		int completed = -1;
+		long attempted = Long.MIN_VALUE;
+		while (true) {
+			synchronized (leg) {
+				if (leg.ended || leg.completed >= leg.sent) {
+					return;
+				}
+				if (leg.completed != completed) {
+					// a response completed since: the next one starts its own count
+					completed = leg.completed;
+					probes = 0;
+				}
+				long quiet = System.nanoTime() - Math.max(Math.max(this.lastClientWrite, this.lastRequest), attempted);
+				if (probes >= MAX_PROBES) {
+					leg.wait(); // until a response completes or the leg ends
+					continue;
+				}
+				if (quiet < this.probeIntervalNanos) {
+					TimeUnit.NANOSECONDS.timedWait(leg, this.probeIntervalNanos - quiet);
+					continue;
+				}
+			}
+			attempted = System.nanoTime();
+			synchronized (this.sinkLock) {
+				// the inbound side writes and tracks under this lock: the decision holds
+				// until the probe is written
+				if (leg.probeable()) {
+					writeToClient(PROBE, 0, PROBE.length);
+					probes++;
+				}
+			}
 		}
 	}
 
@@ -295,7 +374,8 @@ final class ReroutingRelay {
 			}
 		}
 		ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser.http1RequestOf(head);
-		leg.requestSent(request == null ? null : request.method(), Http1RequestParser.isUpgrade(head));
+		leg.requestSent(request, Http1RequestParser.isUpgrade(head));
+		this.lastRequest = System.nanoTime();
 		byte[] relayed = route.rewriteHost() ? ConnectionHeadRewriter.rewriteHttp1(head, route.address()) : head;
 		leg.toUpstream(relayed, 0, relayed.length);
 		if (request != null) {
@@ -354,6 +434,7 @@ final class ReroutingRelay {
 			try {
 				sink.write(bytes, offset, length);
 				sink.flush();
+				this.lastClientWrite = System.nanoTime();
 			}
 			catch (Exception e) {
 				throw new IllegalStateException(e);
@@ -394,6 +475,9 @@ final class ReroutingRelay {
 
 		private final Counter outbound;
 
+		/** The response framing; driven by the inbound side under the sink lock. */
+		private final ResponseTracker tracker;
+
 		private volatile boolean ended;
 
 		private volatile boolean replaced;
@@ -417,6 +501,7 @@ final class ReroutingRelay {
 			this.connection = session.open(route.address());
 			this.inbound = meterRegistry.counter(METRIC_NAME, "direction", "inbound", "route", route.routeTag());
 			this.outbound = meterRegistry.counter(METRIC_NAME, "direction", "outbound", "route", route.routeTag());
+			this.tracker = new ResponseTracker(this);
 			pending.incrementAndGet();
 			Thread.ofVirtual()
 				.name("sluice-reroute-in-" + this.connection.connectionId())
@@ -466,16 +551,28 @@ final class ReroutingRelay {
 			}
 		}
 
-		void requestSent(@Nullable String method, boolean upgrade) {
+		void requestSent(ConnectionHeadParser.Head.@Nullable Request request, boolean upgrade) {
 			synchronized (this) {
 				this.sent++;
-				this.unanswered.addLast(new Sent(method == null ? "" : method, upgrade));
+				this.unanswered.addLast(new Sent(request == null ? "" : request.method(),
+						request == null ? "" : request.version(), upgrade));
 				if (upgrade) {
 					this.upgradeAwaited = true;
 					this.upgradeAnswer = null;
 				}
 			}
 			owedChanged(1);
+		}
+
+		/**
+		 * Whether a probe may be written now: a request awaits its final response, none
+		 * of which was relayed, and the request is HTTP/1.1. With the sink lock held.
+		 */
+		boolean probeable() {
+			synchronized (this) {
+				Sent next = this.unanswered.peekFirst();
+				return !this.ended && next != null && "1.1".equals(next.version()) && this.tracker.atResponseStart();
+			}
 		}
 
 		/** The request the next final response answers; null for one sent unasked. */
@@ -546,8 +643,11 @@ final class ReroutingRelay {
 
 	}
 
-	/** A request relayed on a leg: its method, and whether it asked for an upgrade. */
-	private record Sent(String method, boolean upgrade) {
+	/**
+	 * A request relayed on a leg: its method, its HTTP version, and whether it asked for
+	 * an upgrade.
+	 */
+	private record Sent(String method, String version, boolean upgrade) {
 	}
 
 	/**
@@ -556,18 +656,24 @@ final class ReroutingRelay {
 	 */
 	private void pumpInbound(Leg leg) {
 		try {
-			ResponseTracker tracker = new ResponseTracker(leg);
+			ResponseTracker tracker = leg.tracker;
 			InputStream in = leg.connection.source();
 			byte[] buffer = new byte[BUFFER_SIZE];
 			int n;
 			while ((n = in.read(buffer)) > 0) {
-				this.writeToClient(buffer, 0, n);
+				synchronized (this.sinkLock) {
+					// written and tracked at once: a probe sees the tracker's state of
+					// the bytes written
+					this.writeToClient(buffer, 0, n);
+					tracker.data(buffer, 0, n);
+				}
 				leg.outbound.increment(n);
 				leg.session.recordRelayed(n, StreamRelay.Direction.TO_LOCAL);
 				this.access.bytes(n, StreamRelay.Direction.TO_LOCAL);
-				tracker.data(buffer, 0, n);
 			}
-			tracker.ended();
+			synchronized (this.sinkLock) {
+				tracker.ended();
+			}
 			if (this.current == leg && !leg.replaced) {
 				// the upstream of the leg in charge is gone; the client reconnects
 				abort();
@@ -707,6 +813,15 @@ final class ReroutingRelay {
 					}
 				}
 			}
+		}
+
+		/**
+		 * At the start of a response: none of the next head arrived, and no response is
+		 * in progress or untracked. An interim response the upstream relayed counts as
+		 * begun only while its head is incomplete.
+		 */
+		boolean atResponseStart() {
+			return this.mode == Mode.HEAD && this.head.size() == 0;
 		}
 
 		/** The upstream half-closed: an unframed or truncated response ends here. */

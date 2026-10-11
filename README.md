@@ -261,6 +261,7 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.limits.max-connections-per-address` | `0` = no limit beyond `max-connections` | connections open at once from one source address (the PROXY protocol source with `proxy-protocol=true`, the socket peer otherwise) |
 | `sluice.limits.head-timeout` | `10s` | one deadline for the whole head phase of a data plane connection (PROXY header, TLS handshake, request head); on plaintext and TLS-terminated HTTP/1.1 it also bounds a later request head left incomplete between requests |
 | `sluice.limits.idle-timeout` | `60s` | how long a plaintext or TLS-terminated HTTP connection may idle between requests before it is closed; see "Connection limits" |
+| `sluice.limits.half-close-probe-interval` | `1s` | quiet after which a plaintext or TLS-terminated HTTP/1.1 connection whose client ended its side, a response owed, gets a `100 Continue` to learn whether the client is gone; `0` = off; see "Connection limits" |
 | `sluice.limits.h2-queue-budget` | `0` = an eighth of half the max heap | bytes the h2 demux relays may queue towards upstreams beyond each connection's allowance, shared by all of them; see "Connection limits" |
 | `sluice.tcp-port-range` | (unset = any port) | listen ports a client may claim for tcp routes, comma separated single ports or `min-max` ranges (e.g. `9000-9010,8080`); a port outside the range is not bound |
 | `sluice.http-load-balance` | `smallest-client-id` | target picked when several clients serve the same domain: `smallest-client-id` (deterministic across nodes) / `round-robin` (per node) / `random` |
@@ -538,6 +539,28 @@ parser cannot follow) keep no idle deadline. Behind a front end that reuses its
 connections to the data plane, set the timeout above the front end's idle timeout, so the
 front end closes an idle connection before sluice does. Connections closed so count as
 `sluice.data.connections.idle.closed`.
+
+A client's FIN does not tell whether it half-closed or left: HTTP/1.1 lets a half-closed
+client still wait for its response (RFC 9112 9.6), and only a write fails on a client gone.
+So once a plaintext or TLS-terminated HTTP/1.1 client ended its side while a response is
+owed and none of it relayed, the relay writes `HTTP/1.1 100 Continue` after each
+`sluice.limits.half-close-probe-interval` without a write to the client or a request
+relayed, at most four per response. A client gone fails the second write: the relay ends,
+fails its tunnel connection, and the client closes the upstream connection. A client that
+only half-closed reads the 100s, then its response. A gone client is not noticed, and is
+held until the upstream answers or closes (for a wasmlet route, its request budget), once
+a response has begun (nothing can be added to it), towards an HTTP/1.0 request (which must
+not get a 1xx), while a request asking for an upgrade awaits its answer (the relay reads
+nothing from the client meanwhile), and after the four probes. `0` turns the probe off. h2
+relays probe with PINGs instead.
+
+The clients measured (curl, wget, Go, the JDK `HttpClient` and `HttpURLConnection`,
+Python's `http.client`, Node's `http` and `fetch`) do not half-close after a request, so a
+live client that gets a probe half-closed on purpose (`nc`-style tools). No 1xx suits every
+client: Node's `fetch` (undici 7.28) fails on an unsolicited 100, while Python's
+`http.client` and `HttpURLConnection` before JDK 20 mishandle a 102 or 103 as the final
+response; the others skip a 100 too. Go before 1.24 fails a response at its sixth 1xx and
+the JDK `HttpClient` at its ninth, hence four.
 
 The most one relayed connection buffers on each side of the tunnel is its receive buffer
 + its send queue cap (16 x 64KiB = 1MiB) + the two relay buffers (2 x 64KiB) = 2.16MiB.

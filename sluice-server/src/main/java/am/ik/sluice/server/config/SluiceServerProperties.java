@@ -380,10 +380,15 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * @param h2QueueBudget bytes the h2 demux relays may queue towards their upstreams
 	 * beyond each connection's own allowance, shared by all of them; {@code 0} = an
 	 * eighth of half the maximum heap
+	 * @param halfCloseProbeInterval how long a plaintext or TLS-terminated HTTP/1.1
+	 * connection whose client ended its side stays quiet, a response owed and none of it
+	 * relayed, before the relay writes a {@code 100 Continue} to learn whether the client
+	 * is still there; at most four per response, never to an HTTP/1.0 request; {@code 0}
+	 * = off
 	 */
 	public record Limits(@DefaultValue("0") int maxConnections, @DefaultValue("0") int maxConnectionsPerAddress,
 			@DefaultValue("10s") Duration headTimeout, @DefaultValue("60s") Duration idleTimeout,
-			@DefaultValue("0") DataSize h2QueueBudget) {
+			@DefaultValue("0") DataSize h2QueueBudget, @DefaultValue("1s") Duration halfCloseProbeInterval) {
 
 		public Limits {
 			maxConnections = Math.max(0, maxConnections);
@@ -393,6 +398,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			idleTimeout = idleTimeout == null || idleTimeout.isNegative() || idleTimeout.isZero()
 					? Duration.ofSeconds(60) : idleTimeout;
 			h2QueueBudget = h2QueueBudget == null || h2QueueBudget.isNegative() ? DataSize.ofBytes(0) : h2QueueBudget;
+			halfCloseProbeInterval = halfCloseProbeInterval == null || halfCloseProbeInterval.isNegative()
+					? Duration.ofSeconds(1) : halfCloseProbeInterval;
 		}
 
 		public static Builder builder() {
@@ -410,6 +417,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			@Nullable private Duration idleTimeout;
 
 			@Nullable private DataSize h2QueueBudget;
+
+			@Nullable private Duration halfCloseProbeInterval;
 
 			private Builder() {
 			}
@@ -439,11 +448,17 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder halfCloseProbeInterval(Duration halfCloseProbeInterval) {
+				this.halfCloseProbeInterval = halfCloseProbeInterval;
+				return this;
+			}
+
 			public Limits build() {
 				return new Limits(this.maxConnections, this.maxConnectionsPerAddress,
 						this.headTimeout == null ? Duration.ofSeconds(10) : this.headTimeout,
 						this.idleTimeout == null ? Duration.ofSeconds(60) : this.idleTimeout,
-						this.h2QueueBudget == null ? DataSize.ofBytes(0) : this.h2QueueBudget);
+						this.h2QueueBudget == null ? DataSize.ofBytes(0) : this.h2QueueBudget,
+						this.halfCloseProbeInterval == null ? Duration.ofSeconds(1) : this.halfCloseProbeInterval);
 			}
 
 		}
