@@ -146,7 +146,8 @@ fn parse_args() -> Config {
     let mut config = Config {
         server: String::new(),
         token: String::new(),
-        id: "sluice-wasmlet".into(),
+        // same default policy as the Java client: random id unless --client-id is given
+        id: uuid::Uuid::new_v4().to_string(),
         insecure: false,
         ca_cert: None,
         routes: Vec::new(),
@@ -162,7 +163,7 @@ fn parse_args() -> Config {
         match arg.as_str() {
             "--server" => config.server = value("server"),
             "--token" => config.token = value("token"),
-            "--id" => config.id = value("id"),
+            "--client-id" => config.id = value("client-id"),
             "--insecure" => config.insecure = true,
             "--ca-cert" => config.ca_cert = Some(value("ca-cert")),
             "--wasm" => {

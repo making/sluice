@@ -13,6 +13,8 @@ http = "1"
 tokio-stream = "0.1"
 tokio-util = "0.7"
 futures-util = "0.3"
+# random default client id, same policy as the Java client
+uuid = { version = "1", features = ["v4"] }
 # wasi 0.3 (p3) host support only; p2 guests are unsupported
 wasmtime = "49"
 wasmtime-wasi = { version = "49", default-features = false, features = ["p3"] }
