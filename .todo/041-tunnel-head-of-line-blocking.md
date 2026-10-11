@@ -89,7 +89,7 @@ in the same investigation is todo 042.
 | 048-data-plane-connection-limits | memory bound (see "Residual after the children"); done | Medium | - (defaults derive from 044-046) |
 | 057-h2-demux-global-queue-budget | h2 memory outside the 048 bound; done | High | 048 |
 | 058-receive-buffer-per-frame-overhead | per-frame overhead outside the 048 bound; done | Medium | 048 |
-| 061-slot-released-before-queued-frames-left | Java send queues of ended connections outside the 048 bound (056 review) | Medium | 048 |
+| 061-slot-released-before-queued-frames-left | Java send queues of ended connections outside the 048 bound (056 review); done | Medium | 048 |
 | 054-remove-legacy-flow-control | legacy removal (see "Follow-up"; not a child, the parent does not wait for it) | Medium | 047; no pre-046/047 peer deployed |
 
 Each child is one commit series with its own tests and docs. This parent is done when all
@@ -181,10 +181,11 @@ What 043-048 still leave open, by design or elsewhere. Do not report the parent 
   allowance is charged to a budget shared by the node; since 058 (done) tiny DATA
   frames add no per-frame overhead to the receive buffers; since 059 (done) the
   wasmlet's guest instances are capped by `--max-instances`; since 060 (done) HTTP
-  connections idle between requests are closed at `sluice.limits.idle-timeout`. Not
-  within the bound: the Java send queues of connections whose slot was already released
-  (061), and slots held where no deadline reaches: verbatim relays gone quiet (070),
-  exchanges stalled mid-flight (071), h1 input the parser cannot follow (072). (ADVERTISE
+  connections idle between requests are closed at `sluice.limits.idle-timeout`; since
+  061 (done) a slot is held until the frames its connection queued left the Java sender.
+  Slots held where no deadline reaches: verbatim relays gone quiet (070), exchanges
+  stalled mid-flight (071), h1 input the parser cannot follow (072), a tunnel stream that
+  stays not ready (074). (ADVERTISE
   off the receive path and the credit-lock pitfall are done in 046.)
 
 ## Follow-up
