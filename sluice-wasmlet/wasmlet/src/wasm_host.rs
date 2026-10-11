@@ -1426,9 +1426,17 @@ async fn run_unit(pool: Arc<Pool>) {
 /// Serves one tunnel connection by feeding its frames through hyper and the
 /// route's handler (shared across connections); http/1.1 and h2c are
 /// auto-detected.
+///
+/// The server's CLOSE (the public client's FIN) is a half-close: http/1.1
+/// runs with hyper's `half_close`, so a request already received is still
+/// answered. With it hyper does not read between a request's end and its
+/// response's end, so the connection's failure (the server's ERROR, payload
+/// past the window, the stream's end) is watched beside hyper and drops it
+/// with the request in flight.
 pub async fn serve(mut io: TunnelIo, handler: Arc<Handler>) {
     let conn_id = io.conn_id();
     let ending = io.ending();
+    let failed = io.failed();
 
     // Sniff the first bytes: HTTP/2 prior-knowledge starts with the
     // (unencrypted) preface "PRI"; everything else is treated as http/1.1.
@@ -1447,17 +1455,27 @@ pub async fn serve(mut io: TunnelIo, handler: Arc<Handler>) {
         let handler = handler.clone();
         async move { Ok::<_, std::convert::Infallible>(respond(&handler, req).await) }
     });
-    let served = if h2 {
-        hyper::server::conn::http2::Builder::new(TokioExecutor)
-            .serve_connection(hyper_util::rt::TokioIo::new(io), service)
-            .await
-    } else {
-        hyper::server::conn::http1::Builder::new()
-            .serve_connection(hyper_util::rt::TokioIo::new(io), service)
-            .await
+    let served = async {
+        if h2 {
+            hyper::server::conn::http2::Builder::new(TokioExecutor)
+                .serve_connection(hyper_util::rt::TokioIo::new(io), service)
+                .await
+        } else {
+            hyper::server::conn::http1::Builder::new()
+                .half_close(true)
+                .serve_connection(hyper_util::rt::TokioIo::new(io), service)
+                .await
+        }
     };
-    if let Err(e) = served {
-        eprintln!("[wasm] conn {conn_id} serve error: {e}");
+    tokio::select! {
+        biased;
+        served = served => {
+            if let Err(e) = served {
+                eprintln!("[wasm] conn {conn_id} serve error: {e}");
+            }
+        }
+        // dropping hyper drops the request in flight
+        () = failed => {}
     }
     ending.finish();
 }
@@ -3099,5 +3117,255 @@ mod tests {
         peer.data(3, get("/").as_bytes()).await;
         let response = String::from_utf8(response_raw(&mut peer).await).unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    /// The server's CLOSE: the public client half-closed (a FIN).
+    async fn half_close(peer: &Peer) {
+        peer.send(Body::Close(crate::pb::Close { conn_id: 1 }))
+            .await;
+    }
+
+    /// The connection-end frames among `frames`.
+    fn terminal_frames(frames: &[Body]) -> Vec<String> {
+        frames
+            .iter()
+            .filter_map(|body| match body {
+                Body::Close(_) => Some("CLOSE".to_string()),
+                Body::Error(error) => Some(format!("ERROR {}", error.message)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Polls `condition` every 5ms until it holds; panics past `within`.
+    async fn eventually(what: &str, within: Duration, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + within;
+        while !condition() {
+            assert!(Instant::now() < deadline, "{what} within {within:?}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A public client that half-closes after its request (the server's
+    /// CLOSE right behind the request) still gets the response.
+    #[tokio::test]
+    async fn a_request_followed_by_the_servers_half_close_is_answered() {
+        let handler = Handler::new(hello().await, Sandbox::default());
+        for window in [0, crate::tunnel::WINDOW] {
+            let mut peer = open_with(&handler, &get("/"), window).await;
+            peer.send(Body::Close(crate::pb::Close { conn_id: 1 }))
+                .await;
+            let response = String::from_utf8(response_raw(&mut peer).await).unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "window {window}: {response}"
+            );
+        }
+    }
+
+    /// The half-close answered in full, keep-alive or not, and the
+    /// connection then ends with CLOSE alone (the server closed: no ERROR
+    /// owed) and frees its slot.
+    #[tokio::test]
+    async fn a_half_closed_connection_gets_the_whole_response_then_closes() {
+        let handler = Handler::new(hello().await, Sandbox::default());
+        let keep_alive = "GET / HTTP/1.1\r\nhost: t\r\n\r\n";
+        for request in [get("/"), keep_alive.to_string()] {
+            for window in [0, crate::tunnel::WINDOW] {
+                let limit = crate::tunnel::Limit::new(1);
+                let mut peer = Peer::limited(
+                    HashMap::from([(ROUTE.to_string(), handler.clone())]),
+                    limit.clone(),
+                );
+                peer.connect(1, ROUTE, window).await;
+                peer.data(1, request.as_bytes()).await;
+                half_close(&peer).await;
+                let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+                let response = String::from_utf8(data_bytes(&frames, 1)).unwrap();
+                assert!(
+                    response.starts_with("HTTP/1.1 200")
+                        && response.ends_with("body_bytes=0\n\r\n0\r\n\r\n"),
+                    "{request:?} window {window}: {response}"
+                );
+                assert_eq!(
+                    terminal_frames(&frames),
+                    vec!["CLOSE"],
+                    "{request:?} window {window}"
+                );
+                assert_eq!(limit.open(), 0, "{request:?} window {window}: slot freed");
+            }
+        }
+    }
+
+    /// A long streamed response is not cut by the half-close that arrived
+    /// before its first byte.
+    #[tokio::test]
+    async fn a_streamed_response_survives_the_servers_half_close() {
+        let handler = Handler::new(hello().await, Sandbox::default());
+        for window in [0, crate::tunnel::WINDOW] {
+            let mut peer = open_with(&handler, &get("/stream"), window).await;
+            half_close(&peer).await;
+            let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+            let raw = data_bytes(&frames, 1);
+            let head_end = raw
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("a response head")
+                + 4;
+            assert!(raw.starts_with(b"HTTP/1.1 200"), "window {window}");
+            assert_eq!(raw.len() - head_end, 10 * 1024 * 1024, "window {window}");
+            assert_eq!(terminal_frames(&frames), vec!["CLOSE"], "window {window}");
+        }
+    }
+
+    /// A request body cut short by the half-close ends the connection with
+    /// CLOSE and frees its slot: the truncation is no reason to wait.
+    #[tokio::test]
+    async fn a_request_body_cut_short_by_the_half_close_ends_the_connection() {
+        let handler = Handler::new(hello().await, Sandbox::default());
+        let post = "POST / HTTP/1.1\r\nhost: t\r\ncontent-length: 100\r\n\r\n0123456789";
+        for window in [0, crate::tunnel::WINDOW] {
+            let limit = crate::tunnel::Limit::new(1);
+            let mut peer = Peer::limited(
+                HashMap::from([(ROUTE.to_string(), handler.clone())]),
+                limit.clone(),
+            );
+            peer.connect(1, ROUTE, window).await;
+            peer.data(1, post.as_bytes()).await;
+            half_close(&peer).await;
+            let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+            assert_eq!(terminal_frames(&frames), vec!["CLOSE"], "window {window}");
+            eventually("the slot frees", Duration::from_secs(1), || {
+                limit.open() == 0
+            })
+            .await;
+        }
+    }
+
+    /// A half-close is no departure: the stalled request keeps its unit.
+    /// The server's ERROR after it (the public client gone) still frees the
+    /// unit at once, though hyper is not reading the connection.
+    #[tokio::test]
+    async fn a_client_leaving_after_its_half_close_frees_its_unit() {
+        let handler = pooled(&hello().await, Sandbox::default(), 1);
+        restocked(&handler, 1).await;
+
+        let peer = stalled_connection(&handler).await;
+        half_close(&peer).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            pool(&handler).idle(),
+            0,
+            "still serving after the half-close"
+        );
+        assert!(peer.registered(1), "the connection is still served");
+
+        let started = Instant::now();
+        peer.error(1, "public peer left").await;
+        // the peer (and so the stream) stays up: the ERROR alone frees it
+        restocked(&handler, 1).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "freed well before the 10s budget: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(pool(&handler).spawned(), 2, "the unit was replaced");
+        drop(peer);
+    }
+
+    /// A half-closed connection whose guest stalls is held no longer than
+    /// the budget: the truncated response ends it with CLOSE.
+    #[tokio::test]
+    async fn a_half_closed_stalled_request_ends_at_the_budget() {
+        let budget = Duration::from_millis(1500);
+        let handler = Handler::new(
+            hello().await,
+            Sandbox {
+                limits: Limits {
+                    budget,
+                    ..Limits::default()
+                },
+                ..Sandbox::default()
+            },
+        );
+        let started = Instant::now();
+        let mut peer = stalled_connection(&handler).await;
+        half_close(&peer).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(handler.live_stores(), 1, "held after the half-close");
+        let end = tokio::time::timeout(budget + Duration::from_secs(2), async {
+            loop {
+                match peer.recv().await.and_then(|frame| frame.body) {
+                    Some(Body::Data(_)) => {}
+                    other => return other,
+                }
+            }
+        })
+        .await
+        .expect("the connection ends at the budget");
+        assert!(matches!(end, Some(Body::Close(_))), "{end:?}");
+        assert!(
+            started.elapsed() >= budget,
+            "not before the budget: {:?}",
+            started.elapsed()
+        );
+        let frames = frames_until_quiet(&mut peer, Duration::from_millis(300)).await;
+        assert!(frames.is_empty(), "nothing after the CLOSE: {frames:?}");
+        assert_eq!(handler.live_stores(), 0, "the store left with the budget");
+    }
+
+    /// The server's ERROR alone (the stream staying up) frees a stalled
+    /// request's store; it is not the stream's teardown that does it.
+    #[tokio::test]
+    async fn the_servers_error_alone_frees_a_stalled_store() {
+        let handler = Handler::new(hello().await, Sandbox::default());
+        let peer = stalled_connection(&handler).await;
+        assert_eq!(handler.live_stores(), 1, "the request's store is held");
+        peer.error(1, "public peer left").await;
+        eventually("the store is freed", Duration::from_secs(3), || {
+            handler.live_stores() == 0
+        })
+        .await;
+        eventually("the connection ends", Duration::from_secs(1), || {
+            !peer.registered(1)
+        })
+        .await;
+        drop(peer);
+    }
+
+    /// The stream ending mid-request frees the stalled request's store
+    /// before the budget.
+    #[tokio::test]
+    async fn the_streams_end_frees_a_stalled_store() {
+        let handler = Handler::new(hello().await, Sandbox::default());
+        let peer = stalled_connection(&handler).await;
+        assert_eq!(handler.live_stores(), 1, "the request's store is held");
+        peer.connections.teardown();
+        eventually("the store is freed", Duration::from_secs(3), || {
+            handler.live_stores() == 0
+        })
+        .await;
+        drop(peer);
+    }
+
+    /// Payload past the window while hyper is not reading (the request is
+    /// complete, its response stalled) fails the connection and frees the
+    /// store before the budget.
+    #[tokio::test]
+    async fn payload_past_the_window_frees_a_stalled_store() {
+        let handler = Handler::new(hello().await, Sandbox::default());
+        let mut peer = stalled_connection(&handler).await;
+        peer.data(1, &vec![0x5a; crate::tunnel::WINDOW as usize + 1])
+            .await;
+        eventually("the store is freed", Duration::from_secs(3), || {
+            handler.live_stores() == 0
+        })
+        .await;
+        let frames = frames_until_quiet(&mut peer, Duration::from_millis(300)).await;
+        assert_eq!(
+            terminal_frames(&frames),
+            vec![format!("ERROR {}", crate::tunnel::WINDOW_EXCEEDED)],
+            "{frames:?}"
+        );
     }
 }

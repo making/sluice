@@ -135,6 +135,10 @@ lines, prefixed with the component and a request id
   counts as done: hyper drops it there itself, trailers owed or not; a
   bodiless response -- HEAD, 1xx, 204, 304 -- is drained behind the scenes,
   never a departure)
+- only the server's ERROR counts as the client leaving. Its CLOSE (the
+  public client's FIN) is a half-close: an http/1.1 request already received
+  is still answered, and one whose guest stalls is held until the server's
+  ERROR or the budget
 - guests are ordinary wasm components exporting `wasi:http/handler@0.3.0`;
   the linked wasi surface follows `wasmtime serve` (see `wasi` above) for
   p3 only. wasi p2 is unsupported and never linked (unlike serve's `-Scli`):

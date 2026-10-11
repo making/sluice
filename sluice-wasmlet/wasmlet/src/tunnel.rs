@@ -33,6 +33,7 @@ use std::task::{Context, Poll, Waker};
 use futures_util::stream::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::pb::frame::Body;
 use crate::pb::{Close, Connect, Data, Error, Frame, WindowUpdate};
@@ -405,6 +406,9 @@ struct Flow {
     /// Receive window announced to the server; 0 = legacy connection.
     window: u32,
     state: Mutex<FlowState>,
+    /// Cancelled once the connection failed: the server's ERROR or a local
+    /// reset. The serve task watches it, since hyper may not be reading.
+    failed: CancellationToken,
 }
 
 #[derive(Default)]
@@ -444,6 +448,7 @@ impl Flow {
                 credit,
                 ..Default::default()
             }),
+            failed: CancellationToken::new(),
         }
     }
 
@@ -472,6 +477,7 @@ impl Flow {
             state.failure = Some(WINDOW_EXCEEDED.to_string());
             state.writer.take()
         };
+        self.failed.cancel();
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -504,6 +510,7 @@ impl Flow {
             state.failure.get_or_insert_with(|| message.to_string());
             (first, state.writer.take())
         };
+        self.failed.cancel();
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -518,6 +525,7 @@ impl Flow {
             state.failure.get_or_insert_with(|| message.to_string());
             state.writer.take()
         };
+        self.failed.cancel();
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -798,6 +806,13 @@ impl TunnelIo {
 
     pub fn peek_prefix(&self, prefix: &[u8]) -> bool {
         self.buf.starts_with(prefix)
+    }
+
+    /// Resolves once the connection failed: the server's ERROR, payload past
+    /// the window, or the stream's end. Unlike the read error these cause,
+    /// it does not depend on hyper reading.
+    pub fn failed(&self) -> WaitForCancellationFutureOwned {
+        self.flow.failed.clone().cancelled_owned()
     }
 
     /// Pulls one control message into the buffer; false on close/abort.
