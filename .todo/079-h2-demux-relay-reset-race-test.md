@@ -17,6 +17,11 @@ Since 076 a client WINDOW_UPDATE with an increment of 0 also calls `resetStream`
 not yet written to the upstream) is not tested: the 076 test sends its second one only
 once the reset stream is untracked.
 
+The h1 relay has such a seam (`ReroutingRelay.ProbeSeam`, `ProbeResponseRaceE2ETest`):
+its sink lock is a `ReentrantLock`, so the test tells the other side waits behind the
+held one by `hasQueuedThreads` rather than by a sleep; the h2 demux's sink lock is still
+a monitor.
+
 ## Tests (watch each fail first)
 
 - A response DATA frame of the stream relayed directly by the leg's inbound side while
