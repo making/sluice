@@ -557,12 +557,14 @@ for an upstream does not count: a slow or long-polling response, an upload the u
 not read yet, an h2 request whose window the relay withholds. Nor does a client awaiting a
 `100 Continue` it asked for (until a response head or a byte of its body), an h2 request
 while its response is in progress (a streaming exchange), or an h2 CONNECT stream (a
-tunnel). The time is sampled eight times per timeout, so a stall is cut up to a quarter of
-the timeout past it. Write progress is what the client's TCP stack accepts: once the
-buffers towards a client that reads slowly have filled up, a blocked write may return long
-after the client resumed reading (`StallTimeoutSlowReaderE2ETest` tells what was observed on
-macOS and Linux loopback: on Linux, only once the client drained about 900KB), so keep the
-timeout well above such gaps. A client streaming small h2 messages (a gRPC client stream) slower than the
+tunnel). The time waited is checked eight times per timeout, so a stall is cut up to a
+quarter of the timeout past it. The HTTP/1.1 relay measures the time it waits; the h2 relay
+is sampled at each check instead, and a check finding it not waiting voids the intervals on
+both sides. Write progress is what the client's TCP stack accepts: once the buffers towards
+a client that reads slowly have filled up, a blocked write may return long after the client
+resumed reading (`StallTimeoutSlowReaderE2ETest` tells what was observed on macOS and Linux
+loopback: on Linux, only once the client drained about 900KB), so keep the timeout well
+above such gaps. A client streaming small h2 messages (a gRPC client stream) slower than the
 minimum is cut too: set `stall-min-bytes=1B` to count every byte, or raise the timeout.
 Connections relayed verbatim (TLS passthrough, tcp routes, upgraded connections) keep no
 stall timeout.

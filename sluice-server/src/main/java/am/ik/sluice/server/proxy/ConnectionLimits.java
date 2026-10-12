@@ -13,6 +13,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.function.LongSupplier;
 
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -384,14 +385,18 @@ public class ConnectionLimits implements DisposableBean {
 	 * ended, or left HTTP (an upgrade).
 	 * <p>
 	 * The stall timeout counts only the time the relay waits on its client: busy, the
-	 * deadline asks the relay {@link #STALL_SAMPLES} times per stall timeout whether it
-	 * does, and adds the time between two samples that both found it waiting. Progress --
-	 * the stall minimum of bytes moved to or from the client, reported through
-	 * {@link #progress(long)} -- starts the count over, and so does the busy phase
-	 * entered anew. Once the count reaches the stall timeout the relay's stall teardown
-	 * runs as above. A wait shorter than a sample interval may go unseen and a wait
-	 * spanning two samples counts whole, so a stall is cut between the stall timeout and
-	 * two sample intervals past it.
+	 * deadline reads the relay's clock of that time {@link #STALL_SAMPLES} times per
+	 * stall timeout ({@link #watchStallClock}) and adds what it advanced since the
+	 * previous reading. A relay that can only tell whether it waits right now
+	 * ({@link #watchStalls}) is sampled instead: the time between two samples counts when
+	 * both found it waiting, so a wait shorter than a sample interval may go unseen, a
+	 * wait spanning two samples counts whole, and a sample that finds the relay between
+	 * two waits loses both intervals around it. Progress -- the stall minimum of bytes
+	 * moved to or from the client, reported through {@link #progress(long)} -- starts the
+	 * count over, and so does the busy phase entered anew. Once the count reaches the
+	 * stall timeout the relay's stall teardown runs as above. The first reading after the
+	 * count starts only sets where it counts from, so a stall is cut between the stall
+	 * timeout and two sample intervals past it.
 	 */
 	final class KeepAliveDeadline {
 
@@ -442,8 +447,8 @@ public class ConnectionLimits implements DisposableBean {
 		private volatile Runnable teardown = () -> {
 		};
 
-		/** Whether the relay waits on its client; null = no stall timeout. */
-		private volatile @Nullable BooleanSupplier waitsOnClient;
+		/** The time the relay waited on its client so far; null = no stall timeout. */
+		private volatile @Nullable LongSupplier clientWaitNanos;
 
 		private volatile Runnable stallTeardown = () -> {
 		};
@@ -457,11 +462,13 @@ public class ConnectionLimits implements DisposableBean {
 		/** The time waited on the client since the count started; with the lock. */
 		private long waitedNanos;
 
-		/** When the relay was last sampled; with the lock. */
-		private long lastSample;
+		/** {@link #clientWaitNanos} at the last sample; with the lock. */
+		private long clientWaitAtLastSample;
 
-		/** Whether the last sample found the relay waiting; with the lock. */
-		private boolean waitingAtLastSample;
+		/**
+		 * Whether a sample since the count started set {@link #clientWaitAtLastSample}.
+		 */
+		private boolean sampledSinceArmed;
 
 		/** {@link #progresses} at the last sample; with the lock. */
 		private long progressesAtLastSample;
@@ -476,14 +483,26 @@ public class ConnectionLimits implements DisposableBean {
 		}
 
 		/**
-		 * Subjects the busy phase to the stall timeout: {@code waitsOnClient} tells
-		 * whether the relay waits on its client -- asked on the shared deadline thread,
-		 * it must not block --, and {@code teardown} runs once the stall timeout passed.
-		 * Starts the count when the connection is busy already.
+		 * Subjects the busy phase to the stall timeout, sampling the relay:
+		 * {@code waitsOnClient} tells whether the relay waits on its client right now --
+		 * asked on the shared deadline thread, it must not block --, and {@code teardown}
+		 * runs once the stall timeout passed. Starts the count when the connection is
+		 * busy already.
 		 */
 		void watchStalls(BooleanSupplier waitsOnClient, Runnable teardown) {
+			watchStallClock(sampled(waitsOnClient), teardown);
+		}
+
+		/**
+		 * Subjects the busy phase to the stall timeout: {@code clientWaitNanos} tells the
+		 * time the relay waited on its client so far, the wait in progress included --
+		 * read on the shared deadline thread, it must not block --, and {@code teardown}
+		 * runs once the stall timeout passed. Starts the count when the connection is
+		 * busy already.
+		 */
+		void watchStallClock(LongSupplier clientWaitNanos, Runnable teardown) {
 			synchronized (this.lock) {
-				this.waitsOnClient = waitsOnClient;
+				this.clientWaitNanos = clientWaitNanos;
 				this.stallTeardown = teardown;
 				if (!this.expired && !this.disarmed && this.phase == Phase.BUSY) {
 					cancelLocked();
@@ -558,13 +577,12 @@ public class ConnectionLimits implements DisposableBean {
 
 		/** Starts the stall count of a watched relay; with the lock. */
 		private void armStallLocked() {
-			if (this.waitsOnClient == null) {
+			if (this.clientWaitNanos == null) {
 				return;
 			}
 			this.moved.set(0);
 			this.waitedNanos = 0;
-			this.lastSample = System.nanoTime();
-			this.waitingAtLastSample = false;
+			this.sampledSinceArmed = false;
 			this.progressesAtLastSample = this.progresses.get();
 			scheduleSampleLocked(this.generation);
 		}
@@ -576,28 +594,27 @@ public class ConnectionLimits implements DisposableBean {
 		}
 
 		/**
-		 * Asks the relay whether it waits on its client and counts the time since the
-		 * last sample when both found it waiting; past the stall timeout, tears down.
+		 * Reads the relay's clock and counts what it advanced since the last sample; past
+		 * the stall timeout, tears down.
 		 */
 		private void sample(long armed) {
-			BooleanSupplier probe = this.waitsOnClient;
-			// asked outside the lock: the relay enters phases under its own locks
-			boolean waiting = probe != null && probe.getAsBoolean();
+			LongSupplier clock = this.clientWaitNanos;
+			// read outside the lock: the relay enters phases under its own locks
+			long clientWait = clock != null ? clock.getAsLong() : 0;
 			synchronized (this.lock) {
 				if (this.expired || this.disarmed || armed != this.generation) {
 					return;
 				}
-				long now = System.nanoTime();
 				long progresses = this.progresses.get();
 				if (progresses != this.progressesAtLastSample) {
 					this.progressesAtLastSample = progresses;
 					this.waitedNanos = 0;
 				}
-				else if (waiting && this.waitingAtLastSample) {
-					this.waitedNanos += now - this.lastSample;
+				else if (this.sampledSinceArmed) {
+					this.waitedNanos += Math.max(0, clientWait - this.clientWaitAtLastSample);
 				}
-				this.waitingAtLastSample = waiting;
-				this.lastSample = now;
+				this.clientWaitAtLastSample = clientWait;
+				this.sampledSinceArmed = true;
 				if (this.waitedNanos < ConnectionLimits.this.stallTimeout.toNanos()) {
 					scheduleSampleLocked(armed);
 					return;
@@ -607,6 +624,34 @@ public class ConnectionLimits implements DisposableBean {
 			}
 			ConnectionLimits.this.stallClosed.increment();
 			tearDown(this.stallTeardown);
+		}
+
+		/**
+		 * The clock of a relay sampled through {@code waitsOnClient}: advances by the
+		 * time between two readings that both found the relay waiting.
+		 */
+		private static LongSupplier sampled(BooleanSupplier waitsOnClient) {
+			return new LongSupplier() {
+
+				private long waited;
+
+				private long lastReading;
+
+				private boolean waitingAtLastReading;
+
+				@Override
+				public synchronized long getAsLong() {
+					boolean waiting = waitsOnClient.getAsBoolean();
+					long now = System.nanoTime();
+					if (waiting && this.waitingAtLastReading) {
+						this.waited += now - this.lastReading;
+					}
+					this.waitingAtLastReading = waiting;
+					this.lastReading = now;
+					return this.waited;
+				}
+
+			};
 		}
 
 		private void expire(long armed) {

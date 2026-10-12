@@ -7,6 +7,7 @@ import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -253,6 +254,37 @@ class ConnectionLimitsTest {
 				assertThat(deadline.expired()).isTrue();
 				assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.IDLE)).isFalse();
 				assertThat(stallClosed()).isEqualTo(1);
+			}
+			finally {
+				limits.destroy();
+			}
+		}
+	}
+
+	/**
+	 * A relay waiting on its client but for a millisecond at every second sample -- the
+	 * h1 relay caught forwarding a byte its client dripped -- is torn down at the stall
+	 * timeout all the same.
+	 */
+	@Test
+	void aRelayFoundBetweenTwoWaitsAtEverySecondSampleIsTornDownAtTheStallTimeout() throws Exception {
+		try (ServerSocket server = new ServerSocket(0);
+				Socket client = new Socket("127.0.0.1", server.getLocalPort());
+				Socket accepted = server.accept()) {
+			ConnectionLimits limits = stallLimits(DataSize.ofKilobytes(16));
+			try {
+				ConnectionLimits.KeepAliveDeadline deadline = limits.keepAliveDeadline(accepted);
+				CountDownLatch stalled = new CountDownLatch(1);
+				AtomicLong readings = new AtomicLong();
+				long start = System.nanoTime();
+				long gap = TimeUnit.MILLISECONDS.toNanos(1);
+				deadline.watchStallClock(() -> System.nanoTime() - start - readings.incrementAndGet() / 2 * gap,
+						stalled::countDown);
+				assertThat(stalled.await(2, TimeUnit.SECONDS)).isTrue();
+				assertThat(Duration.ofNanos(System.nanoTime() - start))
+					.as("between the stall timeout and two sample intervals past it")
+					.isGreaterThanOrEqualTo(STALL_TIMEOUT)
+					.isLessThan(STALL_TIMEOUT.plus(STALL_TIMEOUT.dividedBy(4)).plusMillis(100));
 			}
 			finally {
 				limits.destroy();

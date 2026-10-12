@@ -161,6 +161,9 @@ final class ReroutingRelay {
 	/** The outbound side waits in a read from the client. */
 	private volatile boolean reading;
 
+	/** The time {@link #waitsOnClient()} held, for the stall watch. */
+	private final WaitClock clientWaits = new WaitClock(this::waitsOnClient);
+
 	/**
 	 * The last request head asked for {@code 100 Continue}, and neither a response head
 	 * nor a body byte of it came since: the client may hold its body back meanwhile.
@@ -215,12 +218,13 @@ final class ReroutingRelay {
 		this.probeIntervalNanos = probeInterval.toNanos();
 		this.probeSeam = probeSeam;
 		deadline.onExpiry(this::abort);
-		deadline.watchStalls(this::waitsOnClient, this::abort);
+		deadline.watchStallClock(this.clientWaits::nanos, this::abort);
 	}
 
 	/**
 	 * Whether the relay waits on the client: a write to it not completed, or a read of a
-	 * request body that is due. Asked by the stall watch; never blocks.
+	 * request body that is due. Measured by {@link #clientWaits}, told every change of
+	 * what it reads; never blocks.
 	 */
 	private boolean waitsOnClient() {
 		return this.writers.get() > 0
@@ -301,6 +305,7 @@ final class ReroutingRelay {
 	/** Reads from the client, marked for the stall watch; bytes read are progress. */
 	private int readClient(InputStream in, byte[] buffer) throws IOException {
 		this.reading = true;
+		this.clientWaits.update();
 		try {
 			int n = in.read(buffer);
 			if (n > 0) {
@@ -310,6 +315,7 @@ final class ReroutingRelay {
 		}
 		finally {
 			this.reading = false;
+			this.clientWaits.update();
 		}
 	}
 
@@ -392,6 +398,7 @@ final class ReroutingRelay {
 		synchronized (this.deadlineLock) {
 			this.starting = false;
 			this.position = position;
+			this.clientWaits.update();
 			updateDeadlineLocked();
 		}
 	}
@@ -552,6 +559,7 @@ final class ReroutingRelay {
 		ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser.http1RequestOf(head);
 		String expect = ConnectionHeadParser.http1HeaderOf(head, "expect");
 		this.continueAwaited = expect != null && expect.toLowerCase(java.util.Locale.ROOT).contains("100-continue");
+		this.clientWaits.update();
 		leg.requestSent(request, Http1RequestParser.isUpgrade(head));
 		this.lastRequest = System.nanoTime();
 		byte[] relayed = route.rewriteHost() ? ConnectionHeadRewriter.rewriteHttp1(head, route.address()) : head;
@@ -568,6 +576,7 @@ final class ReroutingRelay {
 		}
 		if (length > 0) {
 			this.continueAwaited = false; // the client sends its body without the 100
+			this.clientWaits.update();
 		}
 		leg.toUpstream(bytes, offset, length);
 	}
@@ -616,6 +625,7 @@ final class ReroutingRelay {
 	private void writeToClient(byte[] bytes, int offset, int length) {
 		OutputStream sink = this.pipe.sink();
 		this.writers.incrementAndGet();
+		this.clientWaits.update();
 		this.sinkLock.lock();
 		try {
 			for (int written = 0; written < length;) {
@@ -633,6 +643,7 @@ final class ReroutingRelay {
 		finally {
 			this.sinkLock.unlock();
 			this.writers.decrementAndGet();
+			this.clientWaits.update();
 		}
 	}
 
@@ -1110,6 +1121,7 @@ final class ReroutingRelay {
 			this.head.reset();
 			// a response head, interim or final: no 100 Continue is awaited any more
 			ReroutingRelay.this.continueAwaited = false;
+			ReroutingRelay.this.clientWaits.update();
 			int status = statusOf(bytes);
 			if (status < 0) {
 				this.untracked();
