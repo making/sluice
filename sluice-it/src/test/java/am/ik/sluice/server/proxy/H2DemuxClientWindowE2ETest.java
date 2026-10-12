@@ -91,6 +91,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 @TestInstance(Lifecycle.PER_CLASS)
 class H2DemuxClientWindowE2ETest {
 
+	private static final int INTERNAL_ERROR = 0x2;
+
 	private static final int KIB = 1024;
 
 	private static final int WINDOW = WindowedH2Upstream.DEFAULT_WINDOW;
@@ -680,12 +682,19 @@ class H2DemuxClientWindowE2ETest {
 	}
 
 	/**
-	 * An upstream sending past the connection window the relay granted it ends the relay
-	 * rather than having the relay hold what the client has no window for.
+	 * An upstream sending past the connection window the relay granted it ends its leg (a
+	 * connection error {@code FLOW_CONTROL_ERROR}, RFC 9113 6.9.1) rather than having the
+	 * relay hold what the client has no window for: the upstream gets a GOAWAY, the
+	 * client RST_STREAM {@code INTERNAL_ERROR} on the stream whose response began, never
+	 * more than its window, and its connection goes on: a stream of another route
+	 * completes.
 	 */
 	@Test
-	void upstreamIgnoringTheRelayWindowEndsTheRelay() throws Exception {
+	void upstreamIgnoringTheRelayWindowEndsItsLeg() throws Exception {
 		String route = "cw.ignoring.test";
+		String otherRoute = "cw.ignoring-other.test";
+		startClient(otherRoute, upstream(new AtomicReference<>(), upstream -> respondToEach(upstream, 10)));
+		List<TestH2.Frame> received = new CopyOnWriteArrayList<>();
 		startClient(route, stub(socket -> {
 			try (socket) {
 				InputStream in = socket.getInputStream();
@@ -696,18 +705,36 @@ class H2DemuxClientWindowE2ETest {
 				for (int i = 0; i < 13; i++) {
 					TestH2.writeFrame(out, TestH2.DATA, 0, 1, new byte[16 * KIB]);
 				}
-				in.transferTo(OutputStream.nullOutputStream());
+				TestH2.@Nullable Frame frame;
+				while ((frame = TestH2.readFrame(in)) != null) {
+					received.add(frame);
+				}
 			}
 			catch (IOException e) {
 				// the relay went away
 			}
 		}));
-		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.withholdConnectionWindow();
 			streamWindow(client, 1024 * KIB);
 			client.headers(1, true, get(route));
-			assertThat(client.awaitTrue(client::closed, Duration.ofSeconds(10))).as("the relay ended").isTrue();
+			assertThat(client.awaitTrue(() -> client.reset(1) != null, Duration.ofSeconds(10))).as("stream 1 reset")
+				.isTrue();
+			assertThat(client.reset(1)).isEqualTo(INTERNAL_ERROR);
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.until(() -> received.stream().anyMatch(frame -> frame.type() == TestH2.GOAWAY));
+			TestH2.Frame goAway = received.stream()
+				.filter(frame -> frame.type() == TestH2.GOAWAY)
+				.findFirst()
+				.orElseThrow();
+			assertThat(TestH2.errorCode(goAway)).isEqualTo(TestH2.FLOW_CONTROL_ERROR);
 			assertThat(client.maxReceiveExcess()).isLessThanOrEqualTo(0);
+			client.grantConnectionWindowOnReceipt();
+			client.headers(3, true, get(otherRoute));
+			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).as("another route's stream completes").isTrue();
+			assertThat(client.goAwayCode()).isEqualTo(-1);
+			assertThat(client.closed()).isFalse();
 		}
 	}
 

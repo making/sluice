@@ -9,6 +9,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -60,9 +61,9 @@ import io.micrometer.core.instrument.MeterRegistry;
  * ({@link #onClientWindowUpdate}) -- ends the connection with a GOAWAY of the error's
  * code before it has any effect; one making a stream error -- a stream window update of 0
  * or past 2^31-1, a PRIORITY of a wrong length ({@link #onPriority}) -- resets a tracked
- * stream. A WINDOW_UPDATE RFC 9113 6.9 makes an error from an upstream ends the relay. A
- * header block is written whole in either direction, and the relay's own connection-level
- * frames towards an upstream are written ahead of the request frames queued for it.
+ * stream. A header block is written whole in either direction, and the relay's own
+ * connection-level frames towards an upstream are written ahead of the request frames
+ * queued for it.
  * <p>
  * What the relay queues is bounded across connections too: each relay may queue
  * {@link #CONNECTION_ALLOWANCE}, and the bytes beyond it are charged to the
@@ -85,7 +86,7 @@ import io.micrometer.core.instrument.MeterRegistry;
  * replenished by its WINDOW_UPDATEs. A stream's DATA is written only as far as both
  * windows allow; a stream without window waits without holding back the leg's other
  * streams, and the stream's trailers wait behind its data while the client's window
- * updates do not. An upstream pushing a window past 2^31-1 ends the relay.
+ * updates do not.
  * <p>
  * The relay also keeps to the upstream's SETTINGS_MAX_CONCURRENT_STREAMS (RFC 9113 5.1.2)
  * -- one stream until the upstream's first SETTINGS arrived, then as announced, unlimited
@@ -108,9 +109,9 @@ import io.micrometer.core.instrument.MeterRegistry;
  * the window, one frame per stream in turn, splitting frames to the window and delivering
  * their padding as padding. The upstream's connection window is granted back only for
  * DATA written or dropped, so a leg holds at most that window (65535) of data for the
- * client, and an upstream sending past it ends the relay. The inbound side never waits
- * for the client's window: the upstream's pings and window updates, response heads and
- * resets go on. Trailers follow their stream's waiting data; past
+ * client, and an upstream sending past it makes a connection error. The inbound side
+ * never waits for the client's window: the upstream's pings and window updates, response
+ * heads and resets go on. Trailers follow their stream's waiting data; past
  * {@link #RESPONSE_BLOCK_ALLOWANCE} of them per leg, the inbound side stops reading until
  * the queue drains. A reset by either side drops the stream's waiting data and grants its
  * window back to the upstream. Whatever the upstream still sends on a stream the relay
@@ -127,12 +128,25 @@ import io.micrometer.core.instrument.MeterRegistry;
  * legs. While a leg waits so, or a response waits for the client's connection window, the
  * relay writes a PING to the client whenever it wrote nothing for
  * {@link #PROBE_INTERVAL_NANOS}: a client gone entirely rather than half-closed fails the
- * write and ends the relay. An upstream ending its side -- or its connection failing --
- * with no response owed retires its leg: the leg takes no new stream, its responses
- * waiting for the client's window are written first, then the data still queued for it is
- * dropped, a stream waiting for the upstream's concurrency limit is refused
- * ({@code REFUSED_STREAM}), and a stream the client still sends on is reset with
- * {@code NO_ERROR}.
+ * write and ends the relay.
+ * <p>
+ * An upstream's failure ends its leg alone, never the client's connection nor the other
+ * legs: the leg takes no new stream -- the route's next stream opens a new leg --, a
+ * stream waiting for the upstream's concurrency limit is refused ({@code REFUSED_STREAM}:
+ * the upstream never saw it, RFC 9113 8.7), and a stream whose response the upstream had
+ * not ended is lost: answered with a {@code 502} by the relay while no response frame but
+ * interim (1xx) heads was relayed on it, reset with {@code INTERNAL_ERROR} once one was.
+ * The responses the upstream ended that wait for the client's window are written, then
+ * the data still queued for the leg is dropped and a stream the client still sends on is
+ * reset with {@code NO_ERROR}. That holds for the upstream ending its side, its
+ * connection failing, and for its connection errors (RFC 9113 5.4.1, see
+ * {@link #relayInbound}), which also have the leg send it a GOAWAY of the error's code;
+ * with nothing else open, the client's connection then idles under the idle timeout. A
+ * stream error of the upstream -- a stream WINDOW_UPDATE of 0 or taking the stream's
+ * window past 2^31-1 (RFC 9113 6.9, 6.9.1) -- loses that stream alike and resets it
+ * towards the upstream with the error's code. An upstream's GOAWAY ends new streams on
+ * the leg: the streams it did not process are refused ({@code REFUSED_STREAM}), the
+ * others go on, and the leg half-closes once they are done ({@link #onUpstreamGoAway}).
  * <p>
  * While no stream is open the connection lives under the idle timeout of its
  * {@link ConnectionLimits.KeepAliveDeadline}, from the connection head on unless its
@@ -196,6 +210,8 @@ final class Http2DemuxRelay {
 	private static final int ERROR_NO_ERROR = 0x0;
 
 	private static final int ERROR_PROTOCOL = 0x1;
+
+	private static final int ERROR_INTERNAL = 0x2;
 
 	private static final int ERROR_FLOW_CONTROL = 0x3;
 
@@ -304,7 +320,7 @@ final class Http2DemuxRelay {
 	static final long RESPONSE_QUEUE_BYTES = STREAM_WINDOW + (long) MAX_CONCURRENT_STREAMS * PendingPayload.GRANULE
 			+ RESPONSE_BLOCK_ALLOWANCE;
 
-	/** The PING acks one leg may owe its upstream; more end the relay. */
+	/** The PING acks one leg may owe its upstream; more end the leg. */
 	private static final int MAX_PENDING_PING_ACKS = 1024;
 
 	/**
@@ -312,6 +328,14 @@ final class Http2DemuxRelay {
 	 * goes without writing to the client before it probes with a PING.
 	 */
 	static final long PROBE_INTERVAL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
+
+	/**
+	 * After a leg sent its upstream a GOAWAY for a connection error and half-closed: the
+	 * most the relay waits for the upstream to close its side before it closes the leg's
+	 * connection itself (RFC 9113 5.4.1 has the sender of the GOAWAY close the
+	 * connection).
+	 */
+	static final long UPSTREAM_CLOSE_GRACE_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
 
 	private static final byte[] PROBE_PAYLOAD = "sluice-p".getBytes(StandardCharsets.US_ASCII);
 
@@ -1043,7 +1067,7 @@ final class Http2DemuxRelay {
 						Stream stream = waiting.get(i);
 						bytes -= stream.queuedBytes;
 						resetLocked(stream);
-						stream.leg.dropUnopenedLocked(stream);
+						stream.leg.dropEntriesLocked(stream);
 						updateActiveLocked(stream);
 						refused.add(stream);
 					}
@@ -1731,8 +1755,9 @@ final class Http2DemuxRelay {
 		boolean admitted;
 		this.lock.lock();
 		try {
-			// a leg its upstream retired meanwhile takes no new stream
-			admitted = leg.acceptingLocked();
+			// a leg whose upstream ended, failed or sent a GOAWAY meanwhile takes no new
+			// stream
+			admitted = leg.admitsLocked();
 			if (!admitted) {
 				settleBudgetLocked();
 			}
@@ -2222,6 +2247,12 @@ final class Http2DemuxRelay {
 		/** A final (non-1xx) response head was relayed. */
 		boolean finalResponseBegun;
 
+		/**
+		 * A response frame other than an interim head was written to the client or queued
+		 * for it: a response the relay answers itself can no longer follow.
+		 */
+		boolean responseRelayed;
+
 		Stream(int id, Leg leg) {
 			this.id = id;
 			this.leg = leg;
@@ -2350,10 +2381,29 @@ final class Http2DemuxRelay {
 		private boolean halfClosed;
 
 		/**
-		 * The upstream ended its side; the leg retires once its queued responses are
-		 * written. Guarded by {@link #lock}.
+		 * The upstream ended its side, its connection failed, or it made a connection
+		 * error; the leg retires once its queued responses are written. Guarded by
+		 * {@link #lock}.
 		 */
 		private boolean gone;
+
+		/**
+		 * The GOAWAY the writer sends the upstream before it half-closes, after the
+		 * upstream's connection error; guarded by {@link #lock}.
+		 */
+		private byte @Nullable [] goAway;
+
+		/**
+		 * The upstream sent a GOAWAY: no stream opens on the leg any more; guarded by
+		 * {@link #lock}.
+		 */
+		private boolean goingAway;
+
+		/**
+		 * The highest stream the writer opened on the upstream (heads go in stream id
+		 * order); written with {@link #lock}.
+		 */
+		private volatile int highestOpened;
 
 		Leg(Router.Route route, TunnelSession session, ConnectionLimit.@Nullable Permit permit) {
 			this.route = route;
@@ -2390,36 +2440,20 @@ final class Http2DemuxRelay {
 			return !this.closed && !this.halfClosed && !this.gone;
 		}
 
-		/**
-		 * The upstream ended its side: unless a response is owed, the leg takes no new
-		 * stream nor frame -- no waiting head goes any more --, its writer exits, and
-		 * {@code true} is returned.
-		 */
-		boolean upstreamGoneUnlessOwed() {
-			Http2DemuxRelay.this.lock.lock();
-			try {
-				if (responseOwedLocked()) {
-					return false;
-				}
-				this.gone = true;
-				this.ended = true;
-				this.wake.signalAll();
-				return true;
-			}
-			finally {
-				Http2DemuxRelay.this.lock.unlock();
-			}
+		/** Whether a new stream may be routed to the leg; with {@link #lock}. */
+		private boolean admitsLocked() {
+			return acceptingLocked() && !this.goingAway;
 		}
 
-		/** Whether the upstream ended its side. */
-		boolean isGone() {
-			Http2DemuxRelay.this.lock.lock();
-			try {
-				return this.gone;
-			}
-			finally {
-				Http2DemuxRelay.this.lock.unlock();
-			}
+		/**
+		 * The upstream sent a GOAWAY: the leg takes no new stream, opens none of the
+		 * waiting ones, and half-closes once its streams are done; with {@link #lock}.
+		 */
+		void goingAwayLocked() {
+			this.goingAway = true;
+			this.ended = true;
+			this.halfCloseRequested = true;
+			this.wake.signalAll();
 		}
 
 		/** Whether the leg half-closed or closed; with {@link #lock}. */
@@ -2461,14 +2495,15 @@ final class Http2DemuxRelay {
 				queueBlock(new LegEntry.Block(stream, frame, BlockKind.RESET, false));
 				return;
 			}
-			dropUnopenedLocked(stream);
+			dropEntriesLocked(stream);
 		}
 
 		/**
-		 * Drops what is queued for a stream not opened on the upstream yet, its head
-		 * included, so nothing of it reaches the upstream; with the lock.
+		 * Drops every entry queued for the stream -- for a stream not opened on the
+		 * upstream yet its head included, so nothing of it reaches the upstream; with the
+		 * lock.
 		 */
-		void dropUnopenedLocked(Stream stream) {
+		void dropEntriesLocked(Stream stream) {
 			long dropped = 0;
 			Iterator<LegEntry> iterator = this.entries.iterator();
 			while (iterator.hasNext()) {
@@ -2755,8 +2790,15 @@ final class Http2DemuxRelay {
 			Http2DemuxRelay.this.lock.lock();
 			try {
 				while (true) {
-					if (this.closed || this.gone) {
+					if (this.closed) {
 						return null;
+					}
+					if (this.gone) {
+						// after the upstream's connection error: its GOAWAY, then the
+						// half-close
+						byte[] goAway = this.goAway;
+						this.goAway = null;
+						return goAway == null ? null : new Batch(goAway, EMPTY, null, 0, 0, true);
 					}
 					byte[] control = drainControlLocked();
 					Batch batch = nextEntryLocked(control);
@@ -2905,7 +2947,7 @@ final class Http2DemuxRelay {
 
 		/** Whether the upstream's limit admits one more stream; with the lock. */
 		private boolean mayOpenLocked() {
-			return this.upstreamStreams.size() < this.maxStreams;
+			return !this.goingAway && this.upstreamStreams.size() < this.maxStreams;
 		}
 
 		/**
@@ -2929,6 +2971,7 @@ final class Http2DemuxRelay {
 		/** The writer took the stream's head: the stream opens on the upstream. */
 		private void openedLocked(Stream stream, boolean endStream) {
 			stream.upstreamOpened = true;
+			this.highestOpened = stream.id;
 			this.upstreamStreams.put(Integer.valueOf(stream.id), stream);
 			if (endStream) {
 				requestSentLocked(stream);
@@ -2982,20 +3025,6 @@ final class Http2DemuxRelay {
 			finally {
 				Http2DemuxRelay.this.lock.unlock();
 			}
-		}
-
-		/**
-		 * Whether a stream the upstream knows of still owes its response -- a stream
-		 * waiting for the upstream's limit owes none; with the lock.
-		 */
-		private boolean responseOwedLocked() {
-			for (Integer streamId : this.openStreams) {
-				Stream stream = Http2DemuxRelay.this.streams.get(streamId);
-				if (stream != null && stream.leg == this && stream.upstreamOpened) {
-					return true;
-				}
-			}
-			return false;
 		}
 
 		/**
@@ -3054,7 +3083,7 @@ final class Http2DemuxRelay {
 			boolean head = type == FRAME_HEADERS;
 			if (head && !this.inboundHeads.isEmpty()) {
 				// header blocks never interleave (RFC 9113 6.10)
-				throw new IllegalStateException("upstream header blocks interleaved");
+				throw new UpstreamError(ERROR_PROTOCOL, "header blocks interleaved");
 			}
 			if (head) {
 				this.inboundHeads.put(Integer.valueOf(streamId), new ByteArrayOutputStream(256));
@@ -3066,7 +3095,8 @@ final class Http2DemuxRelay {
 			}
 			appendFragmentTo(buffer, new Frame(type, flags, streamId, all, payload, length), head);
 			if (buffer.size() > MAX_HEADER_LIST_SIZE) {
-				throw new IllegalStateException("upstream header block over %d bytes".formatted(MAX_HEADER_LIST_SIZE));
+				throw new UpstreamError(ERROR_ENHANCE_YOUR_CALM,
+						"header block over %d bytes".formatted(MAX_HEADER_LIST_SIZE));
 			}
 			if ((flags & FLAG_END_HEADERS) == 0) {
 				return;
@@ -3119,32 +3149,85 @@ final class Http2DemuxRelay {
 		}
 
 		/**
-		 * The upstream ended its side: with no response owed the leg retires -- closed,
-		 * the data still queued for it dropped, every stream waiting for the upstream's
-		 * limit refused ({@code REFUSED_STREAM}: the upstream never saw it, RFC 9113
-		 * 8.7), and every other stream the client still sends on reset with
-		 * {@code NO_ERROR}, its response being complete. {@code false} when a response is
-		 * owed, which the caller turns into the end of the relay.
+		 * The upstream ended its side, its connection failed, or it made a connection
+		 * error of the {@code goAwayCode} ({@code -1} for none): the leg takes no new
+		 * stream nor frame, and its writer exits -- after sending the upstream a GOAWAY
+		 * of the code and half-closing, on a connection error. Every stream waiting for
+		 * the upstream's concurrency limit is refused ({@code REFUSED_STREAM}: the
+		 * upstream never saw it, RFC 9113 8.7), and every stream whose response the
+		 * upstream had not ended is lost ({@link #lostStreamFrames}), each marked reset
+		 * and written as one step; a stream whose response ended is left to
+		 * {@link #retire}.
 		 */
-		boolean retire() {
+		void fail(int goAwayCode) {
+			List<Stream> ended = new ArrayList<>();
+			List<byte[]> frames = new ArrayList<>();
+			Http2DemuxRelay.this.sinkLock.lock();
+			try {
+				Http2DemuxRelay.this.lock.lock();
+				try {
+					this.gone = true;
+					this.ended = true;
+					if (goAwayCode >= 0 && !this.closed) {
+						byte[] payload = new byte[8];
+						// the relay processed no stream the upstream opened (RFC 9113
+						// 6.8)
+						System.arraycopy(int32(goAwayCode), 0, payload, 4, 4);
+						this.goAway = frame(FRAME_GOAWAY, 0, 0, payload, 0, payload.length);
+					}
+					this.wake.signalAll();
+					for (Stream stream : Http2DemuxRelay.this.streams.values()) {
+						if (stream.leg != this || stream.reset) {
+							continue;
+						}
+						if (!stream.upstreamOpened) {
+							frames.add(rstStream(stream.id, ERROR_REFUSED_STREAM));
+						}
+						else if (this.openStreams.contains(Integer.valueOf(stream.id))) {
+							frames.add(lostStreamFrames(stream));
+						}
+						else {
+							continue;
+						}
+						resetLocked(stream);
+						dropEntriesLocked(stream);
+						updateActiveLocked(stream);
+						ended.add(stream);
+					}
+				}
+				finally {
+					Http2DemuxRelay.this.lock.unlock();
+				}
+				for (int i = 0; i < ended.size(); i++) {
+					Http2DemuxRelay.this.writeSeam.decided(Http2DemuxRelay.this,
+							new WriteSeam.Decision(WriteSeam.Site.RESET, ended.get(i).id));
+					writeToClient(frames.get(i));
+				}
+			}
+			finally {
+				Http2DemuxRelay.this.sinkLock.unlock();
+			}
+			for (Stream stream : ended) {
+				streamClosed(stream.id);
+			}
+			grantOwed();
+		}
+
+		/**
+		 * After {@link #fail} and once the leg's responses waiting for the client's
+		 * window were written: the leg closes, the data still queued for it is dropped,
+		 * and every stream the client still sends on is reset with {@code NO_ERROR}, its
+		 * response being complete.
+		 */
+		void retire() {
 			List<Integer> sending = new ArrayList<>();
-			List<Integer> waiting = new ArrayList<>();
 			Http2DemuxRelay.this.lock.lock();
 			try {
 				if (this.closed) {
-					return true;
-				}
-				if (responseOwedLocked()) {
-					return false;
+					return;
 				}
 				for (Stream stream : Http2DemuxRelay.this.streams.values()) {
-					if (stream.leg != this || stream.reset) {
-						continue;
-					}
-					if (!stream.upstreamOpened) {
-						waiting.add(Integer.valueOf(stream.id));
-					}
-					else if (!stream.clientEnded) {
+					if (stream.leg == this && !stream.reset && !stream.clientEnded) {
 						sending.add(Integer.valueOf(stream.id));
 					}
 				}
@@ -3155,14 +3238,10 @@ final class Http2DemuxRelay {
 			}
 			this.connection.close();
 			releaseSlotAfterQueued();
-			for (Integer streamId : waiting) {
-				writeToClient(rstStream(streamId, ERROR_REFUSED_STREAM));
-			}
 			for (Integer streamId : sending) {
 				writeToClient(rstStream(streamId, ERROR_NO_ERROR));
 			}
 			grantOwed();
-			return true;
 		}
 
 		/**
@@ -3207,7 +3286,9 @@ final class Http2DemuxRelay {
 	 * The leg's writer: writes the preface, then batch after batch -- the priority lane
 	 * ahead of the next entry ready to go -- on the leg's upstream sink, so a stalled leg
 	 * never stops the others. It sleeps while nothing is ready, and exits once the leg is
-	 * closed or after the upstream's half-close. A write failure tears the relay down.
+	 * closed or after the upstream's half-close. A failed write to the upstream closes
+	 * the leg's connection, whose inbound side then ends the leg; a failed write to the
+	 * client ends the relay.
 	 */
 	private void pumpLegOutbound(Leg leg) {
 		try {
@@ -3244,10 +3325,14 @@ final class Http2DemuxRelay {
 		catch (InterruptedException e) {
 			Thread.currentThread().interrupt(); // fall through to the exit
 		}
+		catch (IOException e) {
+			// the upstream connection failed: its inbound side reads the end, and ends
+			// the
+			// leg
+			leg.connection.close();
+		}
 		catch (Exception e) {
-			if (!leg.isGone()) {
-				abort();
-			}
+			abort(); // the client is gone
 		}
 		finally {
 			settle();
@@ -3278,28 +3363,29 @@ final class Http2DemuxRelay {
 
 	/**
 	 * The inbound side of a leg: relays the response frames and releases the leg's
-	 * connection window for the DATA forwarded (see {@link #relayInbound}).
+	 * connection window for the DATA forwarded (see {@link #relayInbound}). The upstream
+	 * ending its side, its connection failing, or a connection error of its own ends the
+	 * leg alone ({@link #endLeg}); only a failure towards the client ends the relay.
 	 */
 	private void pumpInbound(Leg leg) {
 		try {
 			InputStream in = leg.connection.source();
 			ByteArrayOutputStream scan = new ByteArrayOutputStream(2048);
 			byte[] buffer = new byte[BUFFER_SIZE];
-			int n;
-			while ((n = readUpstream(in, buffer)) > 0) {
-				relayInbound(leg, scan, buffer, n);
+			UpstreamError error = null;
+			try {
+				int n;
+				while ((n = readUpstream(in, buffer)) > 0) {
+					relayInbound(leg, scan, buffer, n);
+				}
 			}
-			// the upstream ended its side or failed: owed responses end the relay; an
-			// idle leg retires once its responses waiting for the client's window left
-			if (leg.upstreamGoneUnlessOwed()) {
-				awaitResponsesWritten(leg);
+			catch (UpstreamError e) {
+				error = e;
 			}
-			if (!leg.retire()) {
-				abort();
-			}
+			endLeg(leg, error, in, buffer);
 		}
 		catch (Exception e) {
-			abort();
+			abort(); // the client is gone
 		}
 		finally {
 			leg.ended = true;
@@ -3308,8 +3394,45 @@ final class Http2DemuxRelay {
 	}
 
 	/**
-	 * Reads from the leg's upstream; a failed connection reads as its end, which the
-	 * caller tells apart by whether a response is owed.
+	 * Ends the leg once its upstream ended its side, its connection failed, or it made a
+	 * connection error ({@code error}), the other legs going on. The leg takes no new
+	 * stream; a stream waiting for the upstream's concurrency limit is refused
+	 * ({@code REFUSED_STREAM}: the upstream never saw it, RFC 9113 8.7), and a stream
+	 * whose response the upstream had not ended is lost ({@link #lostStreamFrames}). On a
+	 * connection error the leg writer sends the upstream a GOAWAY of the error's code and
+	 * half-closes (RFC 9113 5.4.1), and what the upstream still sends is dropped until it
+	 * closes its side, for {@link #UPSTREAM_CLOSE_GRACE_NANOS} at most. Then the leg
+	 * retires once its complete responses waiting for the client's connection window are
+	 * written ({@link Leg#retire}).
+	 */
+	private void endLeg(Leg leg, @Nullable UpstreamError error, InputStream in, byte[] buffer) {
+		java.util.concurrent.CountDownLatch upstreamClosed = new java.util.concurrent.CountDownLatch(1);
+		if (error != null) {
+			this.meters.legFailed();
+			Thread.ofVirtual().name("sluice-h2demux-leg-grace-" + leg.connection.connectionId()).start(() -> {
+				try {
+					if (!upstreamClosed.await(UPSTREAM_CLOSE_GRACE_NANOS, java.util.concurrent.TimeUnit.NANOSECONDS)) {
+						leg.connection.close(); // wakes the drain below
+					}
+				}
+				catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+				}
+			});
+		}
+		leg.fail(error == null ? -1 : error.code);
+		awaitResponsesWritten(leg);
+		if (error != null) {
+			while (readUpstream(in, buffer) > 0) {
+				// dropped: the leg relays nothing more
+			}
+			upstreamClosed.countDown();
+		}
+		leg.retire();
+	}
+
+	/**
+	 * Reads from the leg's upstream; a failed connection reads as its end.
 	 */
 	private static int readUpstream(InputStream in, byte[] buffer) {
 		try {
@@ -3324,7 +3447,18 @@ final class Http2DemuxRelay {
 	 * Relays the leg's stream-scoped frames to the client and handles the
 	 * connection-level ones locally: the client face of the relay owns that state, so the
 	 * leg's settings are applied and acked, its pings answered, its window updates
-	 * credited to the relay's send windows, and its goaway absorbed -- never forwarded.
+	 * credited to the relay's send windows, and its goaway taken as the end of new
+	 * streams on the leg ({@link #onUpstreamGoAway}) -- never forwarded. A connection
+	 * error of the upstream (RFC 9113 5.4.1) throws an {@link UpstreamError} before the
+	 * frame has any effect: a frame above 16KiB or a WINDOW_UPDATE of a length other than
+	 * 4 ({@code FRAME_SIZE_ERROR}, 4.2, 6.9), as is a GOAWAY under 8 (6.8); a header
+	 * block past the limit ({@code ENHANCE_YOUR_CALM}) or interleaved with another
+	 * ({@code PROTOCOL_ERROR}, 6.10); a connection WINDOW_UPDATE of 0
+	 * ({@code PROTOCOL_ERROR}, 6.9) or taking the window past 2^31-1, a
+	 * SETTINGS_INITIAL_WINDOW_SIZE past 2^31-1 or taking a stream's window past it, DATA
+	 * past the relay's window ({@code FLOW_CONTROL_ERROR}, 6.9.1, 6.9.2, 6.5.2); a frame
+	 * on a stream the relay has not opened on the leg ({@code PROTOCOL_ERROR}, 5.1); and
+	 * pings past {@link #MAX_PENDING_PING_ACKS} unacked ({@code ENHANCE_YOUR_CALM}).
 	 */
 	private void relayInbound(Leg leg, ByteArrayOutputStream scan, byte[] chunk, int length) {
 		scan.write(chunk, 0, length);
@@ -3334,7 +3468,7 @@ final class Http2DemuxRelay {
 			ByteBuffer header = ByteBuffer.wrap(all, position, FRAME_HEADER_LENGTH);
 			int frameLength = unsigned24(header);
 			if (frameLength > MAX_FRAME_SIZE) {
-				throw new IllegalStateException("upstream frame of %d bytes".formatted(frameLength));
+				throw new UpstreamError(ERROR_FRAME_SIZE, "frame of %d bytes".formatted(frameLength));
 			}
 			if (all.length - position < FRAME_HEADER_LENGTH + frameLength) {
 				break;
@@ -3349,23 +3483,32 @@ final class Http2DemuxRelay {
 			}
 			else if (type == FRAME_SETTINGS && (flags & FLAG_ACK) == 0) {
 				if (!leg.applySettings(all, payload, frameLength)) {
-					abort(); // a window past 2^31-1: a connection error
+					throw new UpstreamError(ERROR_FLOW_CONTROL, "SETTINGS taking a window past 2^31-1");
 				}
 				leg.queueSettingsAck();
 			}
 			else if (type == FRAME_WINDOW_UPDATE) {
 				requireWindowUpdateLength(frameLength);
-				// an increment of 0, or a window past 2^31-1: a connection error
-				if (!leg.creditConnection(int31(all, payload))) {
-					abort();
+				int increment = int31(all, payload);
+				if (increment == 0) {
+					throw new UpstreamError(ERROR_PROTOCOL, "connection WINDOW_UPDATE of 0");
+				}
+				if (!leg.creditConnection(increment)) {
+					throw new UpstreamError(ERROR_FLOW_CONTROL, "connection window past 2^31-1");
 				}
 			}
 			else if (type == FRAME_PING && (flags & FLAG_ACK) == 0 && frameLength == 8) {
 				byte[] ping = new byte[8];
 				System.arraycopy(all, payload, ping, 0, 8);
 				if (!leg.queuePingAck(ping)) {
-					abort(); // a ping flood while the leg is stalled
+					throw new UpstreamError(ERROR_ENHANCE_YOUR_CALM, "a ping flood while the leg is stalled");
 				}
+			}
+			else if (type == FRAME_GOAWAY) {
+				if (frameLength < 8) {
+					throw new UpstreamError(ERROR_FRAME_SIZE, "GOAWAY of %d bytes".formatted(frameLength));
+				}
+				onUpstreamGoAway(leg, int31(all, payload));
 			}
 			position = end;
 		}
@@ -3376,6 +3519,7 @@ final class Http2DemuxRelay {
 	}
 
 	private void relayStreamFrame(Leg leg, Frame frame, int position) {
+		requireOpenedOnLeg(leg, frame);
 		int frameBytes = FRAME_HEADER_LENGTH + frame.length();
 		switch (frame.type()) {
 			case FRAME_HEADERS, FRAME_CONTINUATION -> leg.inboundHead(frame.type(), frame.flags(), frame.streamId(),
@@ -3399,6 +3543,22 @@ final class Http2DemuxRelay {
 	}
 
 	/**
+	 * A frame of a defined type other than PRIORITY on an odd stream above the highest
+	 * the relay opened on the leg -- a stream idle on the upstream, one waiting for its
+	 * concurrency limit included -- is a connection error {@code PROTOCOL_ERROR} (RFC
+	 * 9113 5.1). Even streams are the upstream's own (pushes).
+	 */
+	private static void requireOpenedOnLeg(Leg leg, Frame frame) {
+		int type = frame.type();
+		boolean checked = type == FRAME_DATA || type == FRAME_HEADERS || type == FRAME_RST_STREAM
+				|| type == FRAME_PUSH_PROMISE || type == FRAME_WINDOW_UPDATE || type == FRAME_CONTINUATION;
+		if (checked && frame.streamId() % 2 == 1 && frame.streamId() > leg.highestOpened) {
+			throw new UpstreamError(ERROR_PROTOCOL,
+					"frame type %d on the idle stream %d".formatted(type, frame.streamId()));
+		}
+	}
+
+	/**
 	 * Whether the stream is tracked on the leg and reset by neither side: the frames of
 	 * the upstream on it may go to the client. Called with the sink lock, under which the
 	 * caller writes, so no frame follows the relay's own reset of the stream.
@@ -3418,17 +3578,17 @@ final class Http2DemuxRelay {
 
 	/**
 	 * An upstream DATA frame, charged to the leg's receive window -- an upstream sending
-	 * past it ends the relay. Written as it is while no response waits and the client's
-	 * connection window admits it, else queued for the response writer: its payload, its
-	 * padding as octets owed, its END_STREAM. Frames of streams the relay no longer
-	 * relays a response on -- ended, reset by either side, or no longer tracked -- are
-	 * dropped. The upstream's connection window comes back for what is written or
+	 * past it makes a connection error. Written as it is while no response waits and the
+	 * client's connection window admits it, else queued for the response writer: its
+	 * payload, its padding as octets owed, its END_STREAM. Frames of streams the relay no
+	 * longer relays a response on -- ended, reset by either side, or no longer tracked --
+	 * are dropped. The upstream's connection window comes back for what is written or
 	 * dropped, so a leg holds at most that window for the client.
 	 */
 	private void relayData(Leg leg, Frame frame, int position) {
 		int length = frame.length();
 		if (!leg.receive(length)) {
-			throw new IllegalStateException("upstream DATA past the relay's connection window");
+			throw new UpstreamError(ERROR_FLOW_CONTROL, "DATA past the relay's connection window");
 		}
 		if (frame.has(FLAG_END_STREAM)) {
 			leg.upstreamEnded(frame.streamId());
@@ -3446,6 +3606,7 @@ final class Http2DemuxRelay {
 					stream.responseWindow -= length;
 				}
 				if (stream != null && relayingResponseLocked(leg, stream)) {
+					stream.responseRelayed = true;
 					if (!stream.responseWaiting && this.responseQueue.isEmpty() && this.clientSendWindow >= length) {
 						this.clientSendWindow -= length;
 						if (frame.has(FLAG_END_STREAM)) {
@@ -3545,6 +3706,9 @@ final class Http2DemuxRelay {
 			}
 			if (!relayingResponseLocked(stream.leg, stream)) {
 				return false;
+			}
+			if (!interim) {
+				stream.responseRelayed = true;
 			}
 			if (stream.responseWaiting) {
 				stream.responseBlock = frames;
@@ -3794,8 +3958,10 @@ final class Http2DemuxRelay {
 
 	/**
 	 * The upstream's stream window grant, credited to the relay's send window of the
-	 * stream; an increment of 0 or a window past 2^31-1 ends the relay (stream errors,
-	 * which RFC 9113 5.4.2 lets an endpoint treat as connection errors).
+	 * stream. An increment of 0 or a window past 2^31-1 is a stream error (RFC 9113 6.9,
+	 * 6.9.1): the stream is reset with {@code PROTOCOL_ERROR} or
+	 * {@code FLOW_CONTROL_ERROR} towards the upstream and lost towards the client
+	 * ({@link #resetForUpstream}).
 	 */
 	private void onUpstreamWindowUpdate(Leg leg, Frame frame) {
 		requireWindowUpdateLength(frame.length());
@@ -3803,19 +3969,130 @@ final class Http2DemuxRelay {
 		if (stream == null || stream.leg != leg) {
 			return;
 		}
-		if (!leg.creditStream(stream, int31(frame.bytes(), frame.payload()))) {
-			abort();
+		int increment = int31(frame.bytes(), frame.payload());
+		if (!leg.creditStream(stream, increment)) {
+			resetForUpstream(stream, increment == 0 ? ERROR_PROTOCOL : ERROR_FLOW_CONTROL);
 		}
 	}
 
 	/**
 	 * An upstream WINDOW_UPDATE of a length other than 4 is a connection error
-	 * {@code FRAME_SIZE_ERROR} whatever its stream (RFC 9113 6.9): it ends the relay.
+	 * {@code FRAME_SIZE_ERROR} whatever its stream (RFC 9113 6.9).
 	 */
 	private static void requireWindowUpdateLength(int length) {
 		if (length != 4) {
-			throw new IllegalStateException("upstream WINDOW_UPDATE of %d bytes".formatted(length));
+			throw new UpstreamError(ERROR_FRAME_SIZE, "WINDOW_UPDATE of %d bytes".formatted(length));
 		}
+	}
+
+	/**
+	 * Resets the stream on its upstream's stream error (RFC 9113 5.4.2): RST_STREAM with
+	 * the error's code to the upstream once the frames queued for the stream ahead of it
+	 * are written, and the stream lost towards the client ({@link #lostStreamFrames}),
+	 * marked reset and written as one step as {@link #resetStream} does; the other
+	 * streams of the leg go on. Called by the leg's inbound side; a stream already reset
+	 * by either side, or closed both ways, is left alone.
+	 */
+	private void resetForUpstream(Stream stream, int errorCode) {
+		int dropped;
+		byte[] frames;
+		this.sinkLock.lock();
+		try {
+			this.lock.lock();
+			try {
+				if (stream.reset || (stream.clientEnded && stream.responseEnded)) {
+					return;
+				}
+				frames = lostStreamFrames(stream);
+				dropped = resetLocked(stream);
+				stream.leg.queueReset(stream, rstStream(stream.id, errorCode));
+				updateActiveLocked(stream);
+			}
+			finally {
+				this.lock.unlock();
+			}
+			this.writeSeam.decided(this, new WriteSeam.Decision(WriteSeam.Site.RESET, stream.id));
+			writeToClient(frames);
+		}
+		finally {
+			this.sinkLock.unlock();
+		}
+		afterReset(stream);
+		stream.leg.queueConnectionGrant(dropped);
+		this.meters.resetForUpstream();
+	}
+
+	/**
+	 * What the client gets for a stream lost to its upstream's error, before the stream
+	 * is marked reset: while no response frame but interim (1xx) heads was relayed, a
+	 * {@code 502} response the relay answers itself, followed by RST_STREAM
+	 * {@code NO_ERROR} when the client has not ended its request (RFC 9113 8.1: no more
+	 * of it is wanted); once a response began, RST_STREAM {@code INTERNAL_ERROR}. With
+	 * {@link #lock}.
+	 */
+	private byte[] lostStreamFrames(Stream stream) {
+		if (stream.responseRelayed) {
+			return rstStream(stream.id, ERROR_INTERNAL);
+		}
+		byte[] response = this.errorResponse.badGatewayStream(stream.id);
+		if (stream.clientEnded) {
+			return response;
+		}
+		byte[] reset = rstStream(stream.id, ERROR_NO_ERROR);
+		byte[] frames = Arrays.copyOf(response, response.length + reset.length);
+		System.arraycopy(reset, 0, frames, response.length, reset.length);
+		return frames;
+	}
+
+	/**
+	 * The upstream's GOAWAY (RFC 9113 6.8): the leg takes no new stream -- the route's
+	 * next stream opens a new leg -- and half-closes once its streams are done. Every
+	 * stream of the leg the upstream did not process -- above the last stream id, or
+	 * waiting for its concurrency limit, which may not open any more -- is refused
+	 * ({@code REFUSED_STREAM}, safe to retry: 8.7); a later GOAWAY lowering the id
+	 * refuses more.
+	 */
+	private void onUpstreamGoAway(Leg leg, int lastStreamId) {
+		List<Stream> refused = new ArrayList<>();
+		List<byte[]> frames = new ArrayList<>();
+		int dropped = 0;
+		this.sinkLock.lock();
+		try {
+			this.lock.lock();
+			try {
+				leg.goingAwayLocked();
+				for (Stream stream : this.streams.values()) {
+					if (stream.leg != leg || stream.reset || (stream.upstreamOpened && stream.id <= lastStreamId)) {
+						continue;
+					}
+					// a response relayed on a stream the upstream claims it never
+					// processed
+					// is lost all the same
+					frames.add(stream.responseRelayed ? rstStream(stream.id, ERROR_INTERNAL)
+							: rstStream(stream.id, ERROR_REFUSED_STREAM));
+					dropped += resetLocked(stream);
+					leg.dropEntriesLocked(stream);
+					leg.closeUpstreamLocked(stream);
+					updateActiveLocked(stream);
+					refused.add(stream);
+				}
+			}
+			finally {
+				this.lock.unlock();
+			}
+			for (int i = 0; i < refused.size(); i++) {
+				this.writeSeam.decided(this, new WriteSeam.Decision(WriteSeam.Site.RESET, refused.get(i).id));
+				writeToClient(frames.get(i));
+			}
+		}
+		finally {
+			this.sinkLock.unlock();
+		}
+		for (Stream stream : refused) {
+			leg.streamClosed(stream.id);
+		}
+		leg.queueConnectionGrant(dropped);
+		grantOwed();
 	}
 
 	/**
@@ -3908,7 +4185,7 @@ final class Http2DemuxRelay {
 		}
 	}
 
-	/** Tears the relay down after a failure or the loss of an owed response. */
+	/** Tears the relay down after a failure towards the client. */
 	private void abort() {
 		for (Leg leg : this.legs) {
 			leg.close();
@@ -3919,6 +4196,21 @@ final class Http2DemuxRelay {
 		catch (Exception e) {
 			// ignore
 		}
+	}
+
+	/**
+	 * A connection error of an upstream (RFC 9113 5.4.1), thrown by the leg's inbound
+	 * side before the frame has any effect: it ends the leg with a GOAWAY of the code.
+	 */
+	private static final class UpstreamError extends RuntimeException {
+
+		private final int code;
+
+		UpstreamError(int code, String reason) {
+			super("upstream connection error 0x%x: %s".formatted(code, reason), null, false, false);
+			this.code = code;
+		}
+
 	}
 
 	/**

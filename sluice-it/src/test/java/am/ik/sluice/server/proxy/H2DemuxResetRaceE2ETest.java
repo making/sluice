@@ -55,8 +55,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * between its decision and its write (the relay's write seam), with the client stream's
  * lock held, while the other side runs, and the client sees the frame before the
  * RST_STREAM or not at all, never after it (RFC 9113 5.1). The relay's own reset is a
- * client WINDOW_UPDATE with an increment of 0 (RFC 9113 6.9). In the relay's package for
- * the package-private write seam.
+ * WINDOW_UPDATE with an increment of 0 (RFC 9113 6.9) from the client, decided by the
+ * outbound parse, or from the upstream, decided by the leg's inbound side. In the relay's
+ * package for the package-private write seam.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -67,6 +68,8 @@ class H2DemuxResetRaceE2ETest {
 	private static final int PROTOCOL_ERROR = 0x1;
 
 	private static final int CANCEL = 0x8;
+
+	private static final int INTERNAL_ERROR = 0x2;
 
 	/** The stream window the relay extends a stream by once its head is written. */
 	private static final int HEAD_GRANT = Http2DemuxRelay.STREAM_BUDGET - H2TestClient.INITIAL_WINDOW;
@@ -347,6 +350,100 @@ class H2DemuxResetRaceE2ETest {
 		}
 	}
 
+	/**
+	 * The upstream's stream error, decided by the leg's inbound side: the outbound parse
+	 * computed the stream window grant of the padding of a client DATA frame and is held
+	 * before writing it when the upstream sends a WINDOW_UPDATE of 0 on the stream (RFC
+	 * 9113 6.9): the reset waits for the client stream behind the held grant, and the
+	 * client reads the grant, then the RST_STREAM {@code INTERNAL_ERROR} (a response head
+	 * was relayed); the upstream reads RST_STREAM {@code PROTOCOL_ERROR}.
+	 */
+	@Test
+	void aStreamGrantHeldPastItsCheckIsWrittenBeforeAnUpstreamStreamError() throws Exception {
+		String route = "race.upstream-error-grant.test";
+		GrantScript script = grantScript(route, true);
+		HeldWrite held = hold(Http2DemuxRelay.WriteSeam.Site.DATA_GRANT);
+		try (H2TestClient client = H2TestClient.connect(dataPort, STREAM)) {
+			client.headers(STREAM, false, post(route));
+			assertThat(client.awaitTrue(() -> types(client.frames(STREAM)).equals(List.of(TestH2.HEADERS))
+					&& client.streamGranted(STREAM) == HEAD_GRANT, Duration.ofSeconds(5)))
+				.as("the response head and the grant for the written head arrived")
+				.isTrue();
+			int padding = 100;
+			byte[] padded = new byte[1 + 10 + padding];
+			padded[0] = (byte) padding;
+			client.sendData(STREAM, padded, TestH2.FLAG_PADDED);
+			Http2DemuxRelay relay = held.awaitDecided();
+			List<TestH2.Frame> before = client.frames(STREAM);
+			assertThat(relay.sinkWaiters()).as("no other write waits for the client yet").isZero();
+			script.send(TestH2.WINDOW_UPDATE, 0, STREAM, TestH2.int32(0));
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.pollInterval(Duration.ofMillis(1))
+				.until(() -> relay.sinkWaiters() > 0 || client.reset(STREAM) != null);
+			boolean waited = relay.sinkWaiters() > 0;
+			held.proceed();
+			assertThat(script.cancelled.await(5, TimeUnit.SECONDS)).as("the upstream read the reset").isTrue();
+			awaitPingAck(client);
+			List<TestH2.Frame> frames = client.frames(STREAM);
+			assertThat(frames.subList(before.size(), frames.size())).extracting(TestH2.Frame::type)
+				.as("the grant, then the reset")
+				.containsExactly(TestH2.WINDOW_UPDATE, TestH2.RST_STREAM);
+			assertThat(client.streamGranted(STREAM)).as("the padding given back").isEqualTo(HEAD_GRANT + 1 + padding);
+			assertThat(waited).as("the reset waited behind the held grant").isTrue();
+			assertThat(client.reset(STREAM)).isEqualTo(INTERNAL_ERROR);
+			assertThat(script.resetCode.get()).isEqualTo(PROTOCOL_ERROR);
+			assertThat(client.goAwayCode()).isEqualTo(-1);
+		}
+	}
+
+	/**
+	 * The upstream's stream error waits for the client stream, not marked yet, behind a
+	 * write held on another route's stream, and so does the outbound parse with the
+	 * stream window grant it computed for the padding of a client DATA frame: once the
+	 * held write goes on, the RST_STREAM is written and the grant dropped -- no
+	 * WINDOW_UPDATE follows the reset (RFC 9113 5.1).
+	 */
+	@Test
+	void aStreamGrantWaitingBehindAnUpstreamStreamErrorIsDropped() throws Exception {
+		String route = "race.upstream-error-dropped.test";
+		String otherRoute = "race.upstream-error-holder.test";
+		int other = STREAM + 2;
+		GrantScript script = grantScript(route, true);
+		grantScript(otherRoute, false);
+		HeldWrite held = HeldWrite.install(dataProxyServer(),
+				new Http2DemuxRelay.WriteSeam.Decision(Http2DemuxRelay.WriteSeam.Site.DRAIN_GRANT, other));
+		this.held.add(held);
+		try (H2TestClient client = H2TestClient.connect(dataPort, STREAM)) {
+			client.headers(STREAM, false, post(route));
+			assertThat(client.awaitTrue(() -> types(client.frames(STREAM)).equals(List.of(TestH2.HEADERS))
+					&& client.streamGranted(STREAM) == HEAD_GRANT, Duration.ofSeconds(5)))
+				.as("the response head and the grant for the written head arrived")
+				.isTrue();
+			client.headers(other, false, post(otherRoute));
+			Http2DemuxRelay relay = held.awaitDecided();
+			script.send(TestH2.WINDOW_UPDATE, 0, STREAM, TestH2.int32(0));
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> relay.sinkWaiters() == 1);
+			byte[] padded = new byte[1 + 10 + 100];
+			padded[0] = (byte) 100;
+			client.sendData(STREAM, padded, TestH2.FLAG_PADDED);
+			// the outbound parse computed the padding's grant, and waits behind the reset
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> relay.sinkWaiters() == 2);
+			List<TestH2.Frame> before = client.frames(STREAM);
+			assertThat(client.reset(STREAM)).as("the reset waits too").isNull();
+			held.proceed();
+			assertThat(script.cancelled.await(5, TimeUnit.SECONDS)).as("the upstream read the reset").isTrue();
+			awaitPingAck(client);
+			List<TestH2.Frame> frames = client.frames(STREAM);
+			assertThat(frames.subList(before.size(), frames.size())).extracting(TestH2.Frame::type)
+				.as("the reset, no grant after it")
+				.containsExactly(TestH2.RST_STREAM);
+			assertThat(client.streamGranted(STREAM)).as("the padding's grant dropped").isEqualTo(HEAD_GRANT);
+			assertThat(client.reset(STREAM)).isEqualTo(INTERNAL_ERROR);
+			assertThat(script.resetCode.get()).isEqualTo(PROTOCOL_ERROR);
+		}
+	}
+
 	/** Starts a grant-scripted upstream for the route. */
 	private GrantScript grantScript(String route, boolean respond) {
 		GrantScript script = new GrantScript(respond);
@@ -458,6 +555,9 @@ class H2DemuxResetRaceE2ETest {
 
 		private final CountDownLatch cancelled = new CountDownLatch(1);
 
+		/** The error code of the relay's RST_STREAM of {@link #STREAM}; -1 before it. */
+		private final AtomicLong resetCode = new AtomicLong(-1);
+
 		private final CountDownLatch fenced = new CountDownLatch(1);
 
 		private final CountDownLatch leave = new CountDownLatch(1);
@@ -521,6 +621,7 @@ class H2DemuxResetRaceE2ETest {
 						this.dataReceived.addAndGet(frame.payload().length);
 					}
 					else if (frame.type() == TestH2.RST_STREAM && frame.streamId() == STREAM) {
+						this.resetCode.compareAndSet(-1, TestH2.errorCode(frame));
 						this.cancelled.countDown();
 					}
 					else if (frame.type() == TestH2.PING && (frame.flags() & TestH2.FLAG_ACK) != 0

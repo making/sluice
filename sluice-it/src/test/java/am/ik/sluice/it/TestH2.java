@@ -165,6 +165,26 @@ public final class TestH2 {
 		return out.toByteArray();
 	}
 
+	/**
+	 * The {@code :status} of the first header block among the frames (a single HEADERS
+	 * frame), decoded with a fresh HPACK decoder: the blocks the relay writes are
+	 * self-contained.
+	 */
+	public static String status(List<Frame> frames) {
+		Frame head = frames.stream()
+			.filter(frame -> frame.type() == HEADERS)
+			.findFirst()
+			.orElseThrow(() -> new AssertionError("no header block"));
+		try {
+			return String.valueOf(new io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder(true)
+				.decodeHeaders(head.streamId(), io.netty.buffer.Unpooled.wrappedBuffer(head.payload()))
+				.status());
+		}
+		catch (io.netty.handler.codec.http2.Http2Exception e) {
+			throw new AssertionError("undecodable header block", e);
+		}
+	}
+
 	public static String bodyOf(List<Frame> frames) {
 		return new String(contentOf(frames), StandardCharsets.UTF_8);
 	}

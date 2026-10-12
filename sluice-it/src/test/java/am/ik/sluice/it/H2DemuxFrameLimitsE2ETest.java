@@ -42,12 +42,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * The h2 demux buffers at most one default-sized frame and one header block of the
  * decoder's limit per peer: a larger frame or block from the client ends the connection
- * with a GOAWAY, one from an upstream ends the relay -- before the rest arrives, so
- * nothing beyond the limit is ever buffered.
+ * with a GOAWAY, one from an upstream ends its leg with a GOAWAY to the upstream, the
+ * client's connection going on -- before the rest arrives, so nothing beyond the limit is
+ * ever buffered.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
 class H2DemuxFrameLimitsE2ETest {
+
+	private static final int PROTOCOL_ERROR = 0x1;
 
 	private static final int FRAME_SIZE_ERROR = 0x6;
 
@@ -152,20 +155,24 @@ class H2DemuxFrameLimitsE2ETest {
 	}
 
 	/**
-	 * An upstream frame announcing more than the default max frame size ends the relay.
+	 * An upstream frame announcing more than the default max frame size ends its leg with
+	 * a GOAWAY {@code FRAME_SIZE_ERROR} (RFC 9113 4.2).
 	 */
 	@Test
-	void upstreamFrameAboveTheMaxFrameSizeEndsTheRelay() throws Exception {
-		assertUpstreamEndsTheRelay("lim.up-frame.test", out -> {
+	void upstreamFrameAboveTheMaxFrameSizeEndsItsLeg() throws Exception {
+		assertUpstreamEndsItsLeg("lim.up-frame.test", FRAME_SIZE_ERROR, out -> {
 			out.write(frameHeader(MAX_FRAME_SIZE + 1, TestH2.DATA, 0, 1));
 			out.write(new byte[100]);
 		});
 	}
 
-	/** An upstream header block past the header list limit ends the relay. */
+	/**
+	 * An upstream header block past the header list limit ends its leg with a GOAWAY
+	 * {@code ENHANCE_YOUR_CALM}.
+	 */
 	@Test
-	void upstreamHeaderBlockAboveTheListLimitEndsTheRelay() throws Exception {
-		assertUpstreamEndsTheRelay("lim.up-block.test", out -> {
+	void upstreamHeaderBlockAboveTheListLimitEndsItsLeg() throws Exception {
+		assertUpstreamEndsItsLeg("lim.up-block.test", ENHANCE_YOUR_CALM, out -> {
 			TestH2.writeFrame(out, TestH2.HEADERS, 0, 1, new byte[MAX_FRAME_SIZE]);
 			for (int i = 0; i < 4; i++) {
 				TestH2.writeFrame(out, TestH2.CONTINUATION, 0, 1, new byte[MAX_FRAME_SIZE]);
@@ -174,12 +181,13 @@ class H2DemuxFrameLimitsE2ETest {
 	}
 
 	/**
-	 * An upstream starting a header block while another is unfinished (RFC 9113 6.10)
-	 * ends the relay: one unfinished block per leg is all the relay holds.
+	 * An upstream starting a header block while another is unfinished ends its leg with a
+	 * GOAWAY {@code PROTOCOL_ERROR} (RFC 9113 6.10): one unfinished block per leg is all
+	 * the relay holds.
 	 */
 	@Test
-	void upstreamInterleavingHeaderBlocksEndsTheRelay() throws Exception {
-		assertUpstreamEndsTheRelay("lim.up-interleave.test", out -> {
+	void upstreamInterleavingHeaderBlocksEndsItsLeg() throws Exception {
+		assertUpstreamEndsItsLeg("lim.up-interleave.test", PROTOCOL_ERROR, out -> {
 			TestH2.writeFrame(out, TestH2.HEADERS, 0, 1, new byte[] { (byte) 0x88 });
 			TestH2.writeFrame(out, TestH2.HEADERS, 0, 3, new byte[] { (byte) 0x88 });
 		});
@@ -187,10 +195,12 @@ class H2DemuxFrameLimitsE2ETest {
 
 	/**
 	 * Opens streams 1 and 3; once both reached the upstream, it writes the frames: the
-	 * client connection closes without a response.
+	 * upstream gets a GOAWAY of the code, the client a {@code 502} on both streams (no
+	 * response head reached it) and no GOAWAY, and a stream of another route completes.
 	 */
-	private void assertUpstreamEndsTheRelay(String route, Writer frames) throws Exception {
+	private void assertUpstreamEndsItsLeg(String route, int code, Writer frames) throws Exception {
 		AtomicBoolean answered = new AtomicBoolean();
+		List<TestH2.Frame> received = new CopyOnWriteArrayList<>();
 		startClient(route, stub((in, out) -> {
 			try {
 				// the server preface first: the relay opens one stream until it arrived
@@ -205,21 +215,39 @@ class H2DemuxFrameLimitsE2ETest {
 				frames.write(out);
 				out.flush();
 				answered.set(true);
-				// held open: only the frames end the relay
-				while (TestH2.readFrame(in) != null) {
-					// drain
-				}
+				// held open: only the frames end the leg
+				recordFrames(in, received);
 			}
 			catch (IOException e) {
 				// ended
 			}
 		}));
-		try (H2TestClient client = H2TestClient.connect(dataPort)) {
+		String otherRoute = "other." + route;
+		ScriptedH2Upstream other = ScriptedH2Upstream.start(new byte[0], ScriptedH2Upstream.answering("other"));
+		this.closeables.add(other);
+		startClient(otherRoute, other.port());
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5)) {
 			client.headers(1, false, TestH2.headerBlock(":authority=" + route, ":method=POST", ":path=/"));
 			client.headers(3, false, TestH2.headerBlock(":authority=" + route, ":method=POST", ":path=/"));
 			Awaitility.await().atMost(Duration.ofSeconds(5)).untilTrue(answered);
-			assertThat(client.awaitTrue(client::closed, Duration.ofSeconds(5))).as("the relay ended").isTrue();
-			assertThat(client.headerBlocks()).as("no response head reached the client").isZero();
+			assertThat(client.awaitTrue(() -> client.ended(1) && client.ended(3), Duration.ofSeconds(5)))
+				.as("both streams answered")
+				.isTrue();
+			assertThat(TestH2.status(client.frames(1))).isEqualTo("502");
+			assertThat(TestH2.status(client.frames(3))).isEqualTo("502");
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.until(() -> received.stream().anyMatch(frame -> frame.type() == TestH2.GOAWAY));
+			TestH2.Frame goAway = received.stream()
+				.filter(frame -> frame.type() == TestH2.GOAWAY)
+				.findFirst()
+				.orElseThrow();
+			assertThat(TestH2.errorCode(goAway)).isEqualTo(code);
+			client.headers(5, true, TestH2.headerBlock(":authority=" + otherRoute, ":method=GET", ":path=/"));
+			assertThat(client.awaitEnd(5, Duration.ofSeconds(5))).as("another route's stream completes").isTrue();
+			assertThat(TestH2.bodyOf(client.frames(5))).isEqualTo("other");
+			assertThat(client.goAwayCode()).isEqualTo(-1);
+			assertThat(client.closed()).isFalse();
 		}
 	}
 
@@ -249,10 +277,14 @@ class H2DemuxFrameLimitsE2ETest {
 	}
 
 	private void startClient(String host, ServerSocket upstream) {
+		startClient(host, upstream.getLocalPort());
+	}
+
+	private void startClient(String host, int port) {
 		TunnelClient client = TunnelClient.builder()
 			.properties(SluiceClientProperties.builder()
 				.serverUrl("grpc://127.0.0.1:" + grpcPort)
-				.upstream(Upstream.builder().host(host).target("tcp://127.0.0.1:" + upstream.getLocalPort()).build())
+				.upstream(Upstream.builder().host(host).target("tcp://127.0.0.1:" + port).build())
 				.token("it-token")
 				.build())
 			.taskExecutor(task -> Thread.ofVirtual().name("e2e-lim").start(task))

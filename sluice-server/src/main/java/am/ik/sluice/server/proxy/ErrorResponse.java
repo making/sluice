@@ -26,8 +26,8 @@ import org.springframework.stereotype.Component;
  * The data plane's error answers, encoded in the protocol the request arrived in
  * (HTTP/1.1, or HTTP/2 for prior knowledge and ALPN h2), after which the connection
  * closes: the 503 no-route page for a request no tunnel session can serve, the 403
- * forbidden page for a peer address the access control excludes, and a bare HTTP/1.1 400
- * for a malformed request.
+ * forbidden page for a peer address the access control excludes, a bare HTTP/1.1 400 for
+ * a malformed request, and a bodiless HTTP/2 502 for a stream its upstream lost.
  */
 @Component
 public class ErrorResponse {
@@ -85,6 +85,20 @@ public class ErrorResponse {
 	public byte[] forbiddenStream(int streamId, @Nullable String host,
 			ConnectionHeadParser.Head.@Nullable Request request) {
 		return this.streamResponse(streamId, this.forbidden, host, request);
+	}
+
+	/**
+	 * The response on a single stream of a living HTTP/2 connection whose upstream lost
+	 * it before answering: {@code 502} without a body, so it takes no flow-control
+	 * window.
+	 */
+	public byte[] badGatewayStream(int streamId) {
+		Http2Headers headers = new DefaultHttp2Headers().status("502")
+			.set("content-length", "0")
+			.set("cache-control", "no-store");
+		Http2Frames frames = new Http2Frames(streamId);
+		frames.write(Http2Frame.HEADERS_END_STREAM, headerBlock(streamId, headers));
+		return frames.toByteArray();
 	}
 
 	private byte[] streamResponse(int streamId, Page page, @Nullable String host,

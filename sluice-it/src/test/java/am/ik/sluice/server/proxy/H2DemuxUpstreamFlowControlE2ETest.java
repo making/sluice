@@ -20,6 +20,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -78,7 +79,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * from its SETTINGS, changed mid-stream, replenished by its WINDOW_UPDATEs -- while a
  * stream without window holds back nothing else of its leg. After the client's TCP
  * half-close the relay keeps the leg open, granting the upstream's connection window,
- * until the leg's responses ended. In the relay's package for the tracked-streams meter.
+ * until the leg's responses ended. An upstream breaking the flow-control rules ends its
+ * leg (a connection error) or resets its stream (a stream error), never the client's
+ * connection. In the relay's package for the tracked-streams meter.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -89,6 +92,12 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	private static final int CANCEL = 0x8;
 
 	private static final int NO_ERROR = 0x0;
+
+	private static final int PROTOCOL_ERROR = 0x1;
+
+	private static final int FLOW_CONTROL_ERROR = 0x3;
+
+	private static final int FRAME_SIZE_ERROR = 0x6;
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
@@ -370,56 +379,63 @@ class H2DemuxUpstreamFlowControlE2ETest {
 		}
 	}
 
-	/** An upstream connection-level WINDOW_UPDATE past 2^31-1 ends the relay. */
+	/**
+	 * An upstream connection-level WINDOW_UPDATE past 2^31-1 ends its leg (a connection
+	 * error {@code FLOW_CONTROL_ERROR}, RFC 9113 6.9.1).
+	 */
 	@Test
-	void connectionWindowOverflowEndsTheConnection() throws Exception {
-		assertOffenceEndsTheConnection("uf.overflow-connection.test",
+	void connectionWindowOverflowEndsTheLeg() throws Exception {
+		assertOffenceEndsTheLeg("uf.overflow-connection.test", FLOW_CONTROL_ERROR,
 				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(Integer.MAX_VALUE)));
 	}
 
-	/** An upstream stream-level WINDOW_UPDATE past 2^31-1 ends the relay. */
+	/**
+	 * An upstream stream-level WINDOW_UPDATE past 2^31-1 resets the stream (a stream
+	 * error {@code FLOW_CONTROL_ERROR}, RFC 9113 6.9.1).
+	 */
 	@Test
-	void streamWindowOverflowEndsTheConnection() throws Exception {
-		assertOffenceEndsTheConnection("uf.overflow-stream.test",
+	void streamWindowOverflowResetsTheStream() throws Exception {
+		assertOffenceResetsTheStream("uf.overflow-stream.test", FLOW_CONTROL_ERROR,
 				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(Integer.MAX_VALUE)));
 	}
 
 	/**
-	 * An upstream connection-level WINDOW_UPDATE of a length other than 4 ends the relay
-	 * (a connection error {@code FRAME_SIZE_ERROR}, RFC 9113 6.9).
+	 * An upstream connection-level WINDOW_UPDATE of a length other than 4 ends its leg (a
+	 * connection error {@code FRAME_SIZE_ERROR}, RFC 9113 6.9).
 	 */
 	@Test
-	void connectionWindowUpdateOfAWrongLengthEndsTheConnection() throws Exception {
-		assertOffenceEndsTheConnection("uf.length-connection.test",
+	void connectionWindowUpdateOfAWrongLengthEndsTheLeg() throws Exception {
+		assertOffenceEndsTheLeg("uf.length-connection.test", FRAME_SIZE_ERROR,
 				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 0, new byte[] { 0, 0, 1 }));
 	}
 
 	/**
-	 * An upstream stream-level WINDOW_UPDATE of a length other than 4 ends the relay
+	 * An upstream stream-level WINDOW_UPDATE of a length other than 4 ends its leg
 	 * whatever the stream.
 	 */
 	@Test
-	void streamWindowUpdateOfAWrongLengthEndsTheConnection() throws Exception {
-		assertOffenceEndsTheConnection("uf.length-stream.test",
+	void streamWindowUpdateOfAWrongLengthEndsTheLeg() throws Exception {
+		assertOffenceEndsTheLeg("uf.length-stream.test", FRAME_SIZE_ERROR,
 				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 1, new byte[] { 0, 0, 0, 1, 0 }));
 	}
 
 	/**
-	 * An upstream connection-level WINDOW_UPDATE with an increment of 0 ends the relay.
+	 * An upstream connection-level WINDOW_UPDATE with an increment of 0 ends its leg (a
+	 * connection error {@code PROTOCOL_ERROR}, RFC 9113 6.9).
 	 */
 	@Test
-	void zeroConnectionWindowIncrementEndsTheConnection() throws Exception {
-		assertOffenceEndsTheConnection("uf.zero-connection.test",
+	void zeroConnectionWindowIncrementEndsTheLeg() throws Exception {
+		assertOffenceEndsTheLeg("uf.zero-connection.test", PROTOCOL_ERROR,
 				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(0)));
 	}
 
 	/**
 	 * An upstream stream-level WINDOW_UPDATE with an increment of 0 on an open stream
-	 * ends the relay (a stream error, treated as a connection error).
+	 * resets the stream (a stream error {@code PROTOCOL_ERROR}, RFC 9113 6.9).
 	 */
 	@Test
-	void zeroStreamWindowIncrementEndsTheConnection() throws Exception {
-		assertOffenceEndsTheConnection("uf.zero-stream.test",
+	void zeroStreamWindowIncrementResetsTheStream() throws Exception {
+		assertOffenceResetsTheStream("uf.zero-stream.test", PROTOCOL_ERROR,
 				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(0)));
 	}
 
@@ -452,20 +468,24 @@ class H2DemuxUpstreamFlowControlE2ETest {
 		}
 	}
 
-	/** An upstream SETTINGS_INITIAL_WINDOW_SIZE above 2^31-1 ends the relay. */
+	/**
+	 * An upstream SETTINGS_INITIAL_WINDOW_SIZE above 2^31-1 ends its leg (a connection
+	 * error {@code FLOW_CONTROL_ERROR}, RFC 9113 6.5.2).
+	 */
 	@Test
-	void initialWindowAboveTheMaximumEndsTheConnection() throws Exception {
-		assertOffenceEndsTheConnection("uf.overflow-setting.test", upstream -> upstream.write(TestH2.SETTINGS, 0, 0,
-				WindowedH2Upstream.setting(WindowedH2Upstream.SETTINGS_INITIAL_WINDOW_SIZE, 0x80000000L)));
+	void initialWindowAboveTheMaximumEndsTheLeg() throws Exception {
+		assertOffenceEndsTheLeg("uf.overflow-setting.test", FLOW_CONTROL_ERROR,
+				upstream -> upstream.write(TestH2.SETTINGS, 0, 0,
+						WindowedH2Upstream.setting(WindowedH2Upstream.SETTINGS_INITIAL_WINDOW_SIZE, 0x80000000L)));
 	}
 
 	/**
-	 * An initial window change pushing an open stream's window past 2^31-1 ends the
-	 * relay.
+	 * An initial window change pushing an open stream's window past 2^31-1 ends its leg
+	 * (a connection error {@code FLOW_CONTROL_ERROR}, RFC 9113 6.9.2).
 	 */
 	@Test
-	void initialWindowChangeOverflowingAStreamEndsTheConnection() throws Exception {
-		assertOffenceEndsTheConnection("uf.overflow-delta.test", upstream -> {
+	void initialWindowChangeOverflowingAStreamEndsTheLeg() throws Exception {
+		assertOffenceEndsTheLeg("uf.overflow-delta.test", FLOW_CONTROL_ERROR, upstream -> {
 			upstream.write(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(1));
 			upstream.write(TestH2.SETTINGS, 0, 0,
 					WindowedH2Upstream.setting(WindowedH2Upstream.SETTINGS_INITIAL_WINDOW_SIZE, Integer.MAX_VALUE));
@@ -833,19 +853,89 @@ class H2DemuxUpstreamFlowControlE2ETest {
 		assertThat(eof.await(5, TimeUnit.SECONDS)).as("the upstream connection was closed").isTrue();
 	}
 
-	private void assertOffenceEndsTheConnection(String route, Offence offence) throws Exception {
+	/**
+	 * The upstream commits the offence on reading stream 1's head, before answering: it
+	 * gets a GOAWAY of the code, and the relay's EOF; the client gets a {@code 502} on
+	 * stream 1 and no GOAWAY, and a stream of another route completes after.
+	 */
+	private void assertOffenceEndsTheLeg(String route, int code, Offence offence) throws Exception {
+		List<TestH2.Frame> received = new CopyOnWriteArrayList<>();
+		CountDownLatch eof = new CountDownLatch(1);
 		startClient(route, upstream(new AtomicReference<>(), upstream -> {
 			TestH2.@Nullable Frame frame;
 			while ((frame = upstream.next()) != null) {
+				received.add(frame);
 				if (frame.type() == TestH2.HEADERS) {
 					offence.commit(upstream);
 				}
 			}
+			eof.countDown();
 		}));
-		try (H2TestClient client = H2TestClient.connect(dataPort)) {
+		String otherRoute = "other." + route;
+		startClient(otherRoute, upstream(new AtomicReference<>(), upstream -> grantAndAnswer(upstream, false)));
+		double failed = legsFailed();
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.headers(1, true, get(route));
-			assertThat(client.awaitTrue(client::closed, Duration.ofSeconds(5))).as("the connection ended").isTrue();
+			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).as("stream 1 answered").isTrue();
+			assertThat(TestH2.status(client.frames(1))).isEqualTo("502");
+			assertThat(eof.await(5, TimeUnit.SECONDS)).as("the relay half-closed the upstream").isTrue();
+			List<TestH2.Frame> goAways = received.stream().filter(frame -> frame.type() == TestH2.GOAWAY).toList();
+			assertThat(goAways).as("one GOAWAY to the upstream").hasSize(1);
+			assertThat(TestH2.errorCode(goAways.get(0))).isEqualTo(code);
+			client.headers(3, true, get(otherRoute));
+			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).as("another route's stream completes").isTrue();
+			assertThat(TestH2.bodyOf(client.frames(3))).isEqualTo("0");
+			assertThat(client.goAwayCode()).isEqualTo(-1);
+			assertThat(client.closed()).isFalse();
+			assertThat(legsFailed() - failed).isEqualTo(1);
 		}
+	}
+
+	/**
+	 * The upstream commits the offence on reading a head, before answering: on stream 1,
+	 * it gets RST_STREAM with the code and no GOAWAY, the client gets a {@code 502}, and
+	 * stream 3 of the same route completes over the same upstream connection.
+	 */
+	private void assertOffenceResetsTheStream(String route, int code, Offence offence) throws Exception {
+		List<TestH2.Frame> received = new CopyOnWriteArrayList<>();
+		AtomicInteger connections = new AtomicInteger();
+		startClient(route, upstream(new AtomicReference<>(), upstream -> {
+			connections.incrementAndGet();
+			TestH2.@Nullable Frame frame;
+			while ((frame = upstream.next()) != null) {
+				received.add(frame);
+				if (frame.type() == TestH2.HEADERS && frame.streamId() == 1) {
+					offence.commit(upstream);
+				}
+				else if (frame.type() == TestH2.HEADERS) {
+					answer(upstream, frame.streamId(), "next");
+				}
+			}
+		}));
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
+			client.headers(1, true, get(route));
+			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).as("stream 1 answered").isTrue();
+			assertThat(TestH2.status(client.frames(1))).isEqualTo("502");
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.until(() -> received.stream().anyMatch(frame -> frame.type() == TestH2.RST_STREAM));
+			TestH2.Frame reset = received.stream()
+				.filter(frame -> frame.type() == TestH2.RST_STREAM)
+				.findFirst()
+				.orElseThrow();
+			assertThat(reset.streamId()).isEqualTo(1);
+			assertThat(TestH2.errorCode(reset)).isEqualTo(code);
+			client.headers(3, true, get(route));
+			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).as("the leg goes on").isTrue();
+			assertThat(TestH2.bodyOf(client.frames(3))).isEqualTo("next");
+			assertThat(connections.get()).as("over the same upstream connection").isEqualTo(1);
+			assertThat(received).noneMatch(frame -> frame.type() == TestH2.GOAWAY);
+			assertThat(client.goAwayCode()).isEqualTo(-1);
+		}
+	}
+
+	private double legsFailed() {
+		return Objects.requireNonNull(this.meterRegistry).get("sluice.h2demux.legs.failed").counter().count();
 	}
 
 	/** What an upstream does wrong. */

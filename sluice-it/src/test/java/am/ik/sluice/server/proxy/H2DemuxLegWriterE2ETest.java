@@ -148,16 +148,41 @@ class H2DemuxLegWriterE2ETest {
 		}
 	}
 
-	/** An upstream flooding PINGs while its leg is stalled ends the connection. */
+	/**
+	 * An upstream flooding PINGs while its leg is stalled ends its leg (a connection
+	 * error {@code ENHANCE_YOUR_CALM}; the stalled upstream cannot read the GOAWAY): the
+	 * client's streams on it are answered with a {@code 502}, and its connection goes on:
+	 * a stream of another route completes.
+	 */
 	@Test
-	void upstreamPingFloodEndsTheConnection() throws Exception {
+	void upstreamPingFloodEndsItsLeg() throws Exception {
 		String route = "lw.flood.test";
+		String otherRoute = "lw.flood-other.test";
 		CountDownLatch ping = new CountDownLatch(1);
 		startClient(route, stub(socket -> stallThenFlood(socket, ping)));
-		try (H2TestClient client = H2TestClient.connect(dataPort)) {
+		startClient(otherRoute, stub(H2DemuxLegWriterE2ETest::answerEndedRequests));
+		double failed = Objects.requireNonNull(this.meterRegistry).get("sluice.h2demux.legs.failed").counter().count();
+		Integer[] streams = new Integer[BULK_STREAMS];
+		for (int i = 0; i < BULK_STREAMS; i++) {
+			streams[i] = 1 + 2 * i;
+		}
+		int other = 1 + 2 * BULK_STREAMS;
+		try (H2TestClient client = H2TestClient.connect(dataPort, streams)) {
 			fillStalledLeg(client, route);
 			ping.countDown();
-			assertThat(client.awaitTrue(client::closed, Duration.ofSeconds(10))).as("connection closed").isTrue();
+			for (Integer streamId : streams) {
+				assertThat(client.awaitEnd(streamId, Duration.ofSeconds(10))).as("stream %d answered", streamId)
+					.isTrue();
+				assertThat(TestH2.status(client.frames(streamId))).isEqualTo("502");
+			}
+			assertThat(Objects.requireNonNull(this.meterRegistry).get("sluice.h2demux.legs.failed").counter().count()
+					- failed)
+				.as("the leg ended on the flood")
+				.isEqualTo(1);
+			client.headers(other, true, TestH2.headerBlock(":authority=" + otherRoute, ":method=GET", ":path=/"));
+			assertThat(client.awaitEnd(other, Duration.ofSeconds(5))).as("another route's stream completes").isTrue();
+			assertThat(client.goAwayCode()).isEqualTo(-1);
+			assertThat(client.closed()).isFalse();
 		}
 	}
 
