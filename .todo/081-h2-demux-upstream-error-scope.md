@@ -15,7 +15,10 @@ errors the relay treats as connection errors (RFC 9113 5.4.2): a stream window p
 
 - Stream errors: reset only the stream, the code to the upstream (`FLOW_CONTROL_ERROR`,
   `PROTOCOL_ERROR`), a code to the client, like `Http2DemuxRelay#resetStream` with the
-  roles swapped (it is called by the outbound parse only today; 079 covers its races).
+  roles swapped (it is called by the outbound parse only today). Its races with the
+  response frames and stream window grants are pinned by `H2DemuxResetRaceE2ETest`
+  through the write seam (`Http2DemuxRelay.WriteSeam`, site `RESET`); a reset decided
+  on the leg's inbound side needs the same pair of tests from that thread.
 - Connection errors: GOAWAY with the code to the upstream and end only its leg; its
   streams are reset to the client, the other legs go on. Today a leg whose upstream
   fails with a response owed ends the relay (`pumpInbound`, `Leg#retire`); this changes
