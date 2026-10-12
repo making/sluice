@@ -45,6 +45,19 @@ class SniHeadParserTest {
 		assertThat(head.bytes()).isEqualTo(bytes);
 	}
 
+	/**
+	 * Bytes after the ClientHello read along with it (TLS 1.3 early data, say) belong to
+	 * the head: they are relayed, not dropped.
+	 */
+	@Test
+	void keepsTheBytesReadPastTheClientHello() {
+		byte[] hello = clientHello("c.sni.test");
+		byte[] bytes = concat(hello, "early".getBytes(StandardCharsets.US_ASCII));
+		SniHeadParser.Head head = PARSER.parse(new ByteArrayInputStream(bytes)).orElseThrow();
+		assertThat(head.sni()).isEqualTo("c.sni.test");
+		assertThat(head.bytes()).isEqualTo(bytes);
+	}
+
 	@Test
 	void returnsEmptyForNonTlsBytes() {
 		assertThat(PARSER.parse(new ByteArrayInputStream("GET / HTTP/1.1\r\n\r\n".getBytes(StandardCharsets.US_ASCII))))

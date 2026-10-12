@@ -61,10 +61,11 @@ public final class SniHeadParser {
 			while (buffer.size() < this.maxHeadSize && (n = in.read(chunk)) > 0) {
 				buffer.write(chunk, 0, n);
 				byte[] bytes = buffer.toByteArray();
-				ClientHello hello = clientHelloOf(bytes);
+				byte[] hello = clientHelloOf(bytes);
 				if (hello != null) {
-					byte[] consumed = Arrays.copyOf(bytes, hello.consumed());
-					return Optional.of(new Head(serverNameOf(hello.handshake()), consumed));
+					// the whole buffer is the head: bytes read past the ClientHello (TLS
+					// 1.3 early data, say) must reach the upstream too
+					return Optional.of(new Head(serverNameOf(hello), bytes));
 				}
 			}
 		}
@@ -75,19 +76,11 @@ public final class SniHeadParser {
 	}
 
 	/**
-	 * A reassembled ClientHello handshake message and the number of record bytes consumed
-	 * to obtain it (record headers included).
+	 * Walks consecutive TLS handshake records and reassembles the ClientHello handshake
+	 * message; {@code null} while the handshake is still incomplete, or when the bytes
+	 * are not a ClientHello.
 	 */
-	private record ClientHello(byte[] handshake, int consumed) {
-
-	}
-
-	/**
-	 * Walks consecutive TLS handshake records and reassembles the ClientHello;
-	 * {@code null} while the handshake is still incomplete, or when the bytes are not a
-	 * ClientHello.
-	 */
-	private static @Nullable ClientHello clientHelloOf(byte[] bytes) {
+	private static byte @Nullable [] clientHelloOf(byte[] bytes) {
 		ByteArrayOutputStream handshake = new ByteArrayOutputStream(256);
 		int handshakeLength = -1;
 		int pos = 0;
@@ -113,7 +106,7 @@ public final class SniHeadParser {
 			handshake.write(bytes, pos, Math.min(recordLength, remaining));
 			pos += recordLength;
 			if (handshake.size() >= handshakeLength) {
-				return new ClientHello(Arrays.copyOf(handshake.toByteArray(), handshakeLength), pos);
+				return Arrays.copyOf(handshake.toByteArray(), handshakeLength);
 			}
 		}
 	}
