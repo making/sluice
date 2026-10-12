@@ -1,0 +1,26 @@
+# ./mvnw -f .todo/artefacts/096/pom.xml test   (2026-10-12 18:39, netty 4.2.17.Final, java version "25.0.3" 2026-04-21 LTS)
+[INFO] Running am.ik.sluice.spike.h2demux.RetainedSliceProbeTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.649 s -- in am.ik.sluice.spike.h2demux.RetainedSliceProbeTest
+[INFO] Running am.ik.sluice.spike.h2demux.NettyDemuxSpikeTest
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 8.998 s -- in am.ik.sluice.spike.h2demux.NettyDemuxSpikeTest
+[INFO] Tests run: 13, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+
+# race probe: ./mvnw -f .todo/artefacts/096/pom.xml test -Dgroups=probe -Dspike.excludedGroups=   (10 JVM runs)
+PROBE adaptive misplaced=2
+PROBE adaptive misplaced=1
+PROBE adaptive misplaced=1
+PROBE adaptive misplaced=1
+PROBE adaptive misplaced=1
+PROBE adaptive misplaced=1
+PROBE adaptive misplaced=2
+PROBE adaptive misplaced=1
+PROBE adaptive misplaced=1
+PROBE adaptive misplaced=0
+
+# corruption experiment (2026-10-12): NettyDemuxSpikeTest#aRequestBodyIsHeld*+consumingOnArrivalBuffersTheWholeRequest*, 40 runs each
+zero-copy writer (-Dspike.writerReadsByteBufs=true): 6/40 runs with a corrupted payload
+heap copy under the lock (default): 0/40
+copy at the bridge instead of retainedSlice: 0/40
+full suite, final code: 20/20 runs green
+final code with -Dspike.argLine='-Dio.netty.leakDetection.level=paranoid -Dspike.writerReadsByteBufs=true', same two tests: 11/30 runs failed
