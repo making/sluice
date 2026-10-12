@@ -100,7 +100,7 @@ class StreamRelayTest {
 	void prefixIsRelayedBeforeReadBytes() throws Exception {
 		SocketPair pair = SocketPair.create();
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(1, writer);
+		VirtualConnection connection = VirtualConnection.builder(1, writer).build();
 		CountDownLatch done = new CountDownLatch(1);
 		StreamRelay relay = StreamRelay.builder(DuplexPipe.of(pair.serverSide()), connection, writer)
 			.prefix("HEAD".getBytes(StandardCharsets.UTF_8))
@@ -120,7 +120,7 @@ class StreamRelayTest {
 	void remoteCloseShutsDownLocalOutputOnly() throws Exception {
 		SocketPair pair = SocketPair.create();
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(2, writer);
+		VirtualConnection connection = VirtualConnection.builder(2, writer).build();
 		CountDownLatch done = new CountDownLatch(1);
 		StreamRelay relay = StreamRelay.builder(DuplexPipe.of(pair.serverSide()), connection, writer)
 			.onComplete(done::countDown)
@@ -153,7 +153,7 @@ class StreamRelayTest {
 	void remoteErrorAfterItsCloseTearsTheRelayDown() throws Exception {
 		SocketPair pair = SocketPair.create();
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(5, writer);
+		VirtualConnection connection = VirtualConnection.builder(5, writer).build();
 		CountDownLatch done = new CountDownLatch(1);
 		StreamRelay relay = StreamRelay.builder(DuplexPipe.of(pair.serverSide()), connection, writer)
 			.onComplete(done::countDown)
@@ -175,7 +175,7 @@ class StreamRelayTest {
 		pair.client().close();
 		Socket server = pair.serverSide();
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(3, writer);
+		VirtualConnection connection = VirtualConnection.builder(3, writer).build();
 		connection.acceptData("x".getBytes(StandardCharsets.UTF_8));
 		server.close(); // force IO errors on both relay directions
 		CountDownLatch done = new CountDownLatch(1);
@@ -192,7 +192,7 @@ class StreamRelayTest {
 	void listenerCountsRelayedBytes() throws Exception {
 		SocketPair pair = SocketPair.create();
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(4, writer);
+		VirtualConnection connection = VirtualConnection.builder(4, writer).build();
 		AtomicLong bytes = new AtomicLong();
 		CountDownLatch done = new CountDownLatch(1);
 		StreamRelay relay = StreamRelay.builder(DuplexPipe.of(pair.serverSide()), connection, writer)
@@ -216,7 +216,7 @@ class StreamRelayTest {
 	void directionLessListenerSeesBothDirections() throws Exception {
 		SocketPair pair = SocketPair.create();
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(5, writer);
+		VirtualConnection connection = VirtualConnection.builder(5, writer).build();
 		AtomicLong bytes = new AtomicLong();
 		CountDownLatch done = new CountDownLatch(1);
 		StreamRelay relay = StreamRelay.builder(DuplexPipe.of(pair.serverSide()), connection, writer)
@@ -240,7 +240,7 @@ class StreamRelayTest {
 	void directionalListenerReceivesPerDirectionTotals() throws Exception {
 		SocketPair pair = SocketPair.create();
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(6, writer);
+		VirtualConnection connection = VirtualConnection.builder(6, writer).build();
 		AtomicLong toRemote = new AtomicLong();
 		AtomicLong toLocal = new AtomicLong();
 		CountDownLatch done = new CountDownLatch(1);
@@ -284,7 +284,11 @@ class StreamRelayTest {
 		SessionSender sender = new SessionSender(observer);
 		sender.start();
 		try {
-			VirtualConnection connection = new VirtualConnection(7, sender);
+			// credit beyond what the cap holds: the sending side parks at the cap, not on
+			// credit
+			VirtualConnection connection = VirtualConnection.builder(7, sender)
+				.window(VirtualConnection.DEFAULT_WINDOW, 4L * SessionSender.MAX_QUEUED_PAYLOAD)
+				.build();
 			CountDownLatch done = new CountDownLatch(1);
 			StreamRelay relay = StreamRelay.builder(DuplexPipe.of(pair.serverSide()), connection, sender)
 				.onComplete(done::countDown)

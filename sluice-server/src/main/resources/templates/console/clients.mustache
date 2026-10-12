@@ -3,7 +3,6 @@
   <header class="client__head">
     <h3><span class="client__label">Client id</span> <span class="mono">{{clientId}}</span></h3>
     {{#draining}}<span class="tag tag--marker">Draining</span>{{/draining}}
-    {{#legacy}}<span class="tag tag--marker" data-testid="legacy" title="The client announced no per-connection receive window">Legacy flow control</span>{{/legacy}}
     <span class="client__from">{{#remoteAddress}}from <span class="mono">{{remoteAddress}}</span>, {{/remoteAddress}}connected <time datetime="{{connectedAt}}" title="{{connectedAt}}">{{connectedFor}}</time> ago</span>
   </header>
   <dl class="figures">

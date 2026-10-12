@@ -10,6 +10,7 @@ import java.util.function.BiConsumer;
 import java.util.function.Predicate;
 import java.util.stream.IntStream;
 
+import am.ik.sluice.v1.proto.Connect;
 import am.ik.sluice.v1.proto.Frame;
 import io.grpc.stub.ServerCallStreamObserver;
 import org.junit.jupiter.api.Test;
@@ -44,6 +45,40 @@ class SessionSenderTest {
 			TimeUnit.MILLISECONDS.sleep(10);
 		}
 		assertThat(sender.connectionQueues()).as("live connection queues").isEqualTo(expected);
+	}
+
+	@Test
+	void failEndsTheCallWithTheErrorAndDropsTheQueuedFrames() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.gate.countDown();
+		SessionSender sender = new SessionSender(observer);
+		try {
+			sender.start();
+			// not ready: the DATA stays queued
+			sender.sendData(1, new byte[] { 1 });
+			IllegalStateException error = new IllegalStateException("rejected");
+			sender.fail(error);
+			assertThat(observer.endings).as("failed once, never completed").containsExactly(error);
+			observer.becomeReady();
+			sender.sendConnect(Connect.newBuilder().setConnId(2).build());
+			TimeUnit.MILLISECONDS.sleep(200);
+			assertThat(observer.sent).as("nothing sent after the failure").isEmpty();
+			assertThat(sender.isOpen()).isFalse();
+		}
+		finally {
+			sender.close();
+		}
+		assertThat(observer.endings).hasSize(1);
+	}
+
+	@Test
+	void failAfterTheWorkerEndedChangesNothing() {
+		FakeServerObserver observer = new FakeServerObserver();
+		SessionSender sender = new SessionSender(observer);
+		sender.start();
+		sender.close();
+		sender.fail(new IllegalStateException("too late"));
+		assertThat(observer.endings).containsExactly("completed");
 	}
 
 	@Test

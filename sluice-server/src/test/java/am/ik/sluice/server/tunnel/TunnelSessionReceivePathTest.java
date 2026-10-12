@@ -16,6 +16,9 @@ import com.google.protobuf.ByteString;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.SessionSender;
@@ -25,6 +28,7 @@ import am.ik.sluice.v1.proto.Data;
 import am.ik.sluice.v1.proto.Frame;
 import am.ik.sluice.v1.proto.Upstream;
 import am.ik.sluice.v1.proto.WindowUpdate;
+import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -32,8 +36,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * The session's receive path never waits on a slow ADVERTISE or a slow consumer of a
- * windowed connection, and the route removal of close() is not undone by an advertise
- * that was pending.
+ * connection, the route removal of close() is not undone by an advertise that was
+ * pending, and a client announcing no per-connection window is rejected.
  */
 @Timeout(30)
 class TunnelSessionReceivePathTest {
@@ -104,7 +108,6 @@ class TunnelSessionReceivePathTest {
 		handleWithin100ms(session, advertise(VirtualConnection.DEFAULT_WINDOW));
 		awaitReconcileEntered();
 		VirtualConnection connection = session.open("127.0.0.1:1");
-		assertThat(connection.windowed()).as("precondition: the advertised window took effect").isTrue();
 		handleWithin100ms(session, data(connection.connectionId(), 3));
 		CompletableFuture<byte[]> read = CompletableFuture.supplyAsync(() -> readN(connection.source(), 3),
 				task -> Thread.ofVirtual().start(task));
@@ -188,22 +191,108 @@ class TunnelSessionReceivePathTest {
 	}
 
 	@Test
-	void connectCarriesTheWindowOnlyForAWindowedClient() throws Exception {
+	@ExtendWith(OutputCaptureExtension.class)
+	void advertiseWithoutAWindowFailsTheStream(CapturedOutput output) throws Exception {
 		TunnelSession session = session(Duration.ofSeconds(5));
 		this.tcpRoutes.release.countDown();
-		VirtualConnection beforeAdvertise = session.open("127.0.0.1:1");
 		session.handle(advertise(0));
-		VirtualConnection legacy = session.open("127.0.0.1:1");
-		session.handle(advertise(VirtualConnection.DEFAULT_WINDOW));
-		VirtualConnection windowed = session.open("127.0.0.1:1");
-		assertThat(beforeAdvertise.windowed()).isFalse();
-		assertThat(legacy.windowed()).isFalse();
-		assertThat(windowed.windowed()).isTrue();
-		List<Integer> windows = this.stream.awaitConnects(3)
+		Throwable failure = this.stream.awaitFailure();
+		Status status = Status.fromThrowable(failure);
+		assertThat(status.getCode()).isEqualTo(Status.Code.FAILED_PRECONDITION);
+		assertThat(status.getDescription()).isEqualTo(TunnelSession.WINDOW_REQUIRED);
+		// a second windowless advertise on the same stream fails nothing more
+		session.handle(advertise(0));
+		TimeUnit.MILLISECONDS.sleep(200);
+		assertThat(this.stream.failures).as("the stream failed once").hasSize(1);
+		assertThat(this.stream.completions).as("failed, not completed").hasValue(0);
+		assertThat(this.stream.frames).as("no ack, no route").isEmpty();
+		assertThat(this.router.clientCount()).isZero();
+		assertThat(this.tcpRoutes.calls).as("only the removal of close()").containsExactly(Set.of());
+		assertThat(this.registry.find(CLIENT_ID)).as("no session left").isEmpty();
+		assertThat(output.getAll().lines().filter(line -> line.contains(TunnelSession.WINDOW_REQUIRED)))
+			.as("one line per rejected stream")
+			.hasSize(1);
+	}
+
+	@Test
+	void connectBeforeTheAdvertiseWaitsForTheClientsWindow() throws Exception {
+		TunnelSession session = session(Duration.ofSeconds(5));
+		this.tcpRoutes.release.countDown();
+		VirtualConnection early = session.open("127.0.0.1:1");
+		CompletableFuture<Void> parked = write(early, 1);
+		TimeUnit.MILLISECONDS.sleep(200);
+		assertThat(parked).as("no credit before the client announced its window").isNotDone();
+		assertThat(this.stream.frames.stream().filter(Frame::hasData)).as("nothing sent before the window").isEmpty();
+		session.handle(advertise(10));
+		parked.get(1, TimeUnit.SECONDS);
+		write(early, 9).get(1, TimeUnit.SECONDS);
+		CompletableFuture<Void> beyond = write(early, 1);
+		TimeUnit.MILLISECONDS.sleep(200);
+		assertThat(beyond).as("the client's 10-byte window is used up").isNotDone();
+		VirtualConnection late = session.open("127.0.0.1:1");
+		write(late, 10).get(1, TimeUnit.SECONDS);
+		List<Integer> windows = this.stream.awaitConnects(2)
 			.stream()
 			.map(frame -> frame.getConnect().getConnectionWindow())
 			.toList();
-		assertThat(windows).containsExactly(0, 0, VirtualConnection.DEFAULT_WINDOW);
+		assertThat(windows).as("every CONNECT announces the server's window")
+			.containsExactly(VirtualConnection.DEFAULT_WINDOW, VirtualConnection.DEFAULT_WINDOW);
+	}
+
+	/**
+	 * A connection opened while the first advertise arrives gets the window either way:
+	 * at open, or from the advertise.
+	 */
+	@Test
+	void connectRacingTheAdvertiseGetsTheWindow() throws Exception {
+		for (int i = 0; i < 200; i++) {
+			SessionRegistry registry = new SessionRegistry();
+			TunnelSession session = TunnelSession.builder()
+				.clientId(CLIENT_ID + i)
+				.router(new Router())
+				.sender(new SessionSender(new RecordingStream()))
+				.registry(registry)
+				.tcpRoutes((clientId, listenPorts) -> Set.of())
+				.build();
+			session.start();
+			try {
+				CountDownLatch go = new CountDownLatch(1);
+				CompletableFuture<VirtualConnection> opened = CompletableFuture.supplyAsync(() -> {
+					awaitQuietly(go);
+					return session.open("127.0.0.1:1");
+				}, task -> Thread.ofVirtual().start(task));
+				CompletableFuture<Void> advertised = CompletableFuture.runAsync(() -> {
+					awaitQuietly(go);
+					session.handle(advertise(10));
+				}, task -> Thread.ofVirtual().start(task));
+				go.countDown();
+				advertised.get(5, TimeUnit.SECONDS);
+				write(opened.get(5, TimeUnit.SECONDS), 10).get(5, TimeUnit.SECONDS);
+			}
+			finally {
+				session.close();
+			}
+		}
+	}
+
+	private static void awaitQuietly(CountDownLatch latch) {
+		try {
+			latch.await();
+		}
+		catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
+	}
+
+	private static CompletableFuture<Void> write(VirtualConnection connection, int length) {
+		return CompletableFuture.runAsync(() -> {
+			try {
+				connection.sink().write(new byte[length]);
+			}
+			catch (IOException e) {
+				throw new IllegalStateException(e);
+			}
+		}, task -> Thread.ofVirtual().start(task));
 	}
 
 	@Test
@@ -299,6 +388,10 @@ class TunnelSessionReceivePathTest {
 
 		final List<Frame> frames = new CopyOnWriteArrayList<>();
 
+		final List<Throwable> failures = new CopyOnWriteArrayList<>();
+
+		final AtomicInteger completions = new AtomicInteger();
+
 		List<Frame> awaitConnects(int count) throws InterruptedException {
 			return await(Frame.BodyCase.CONNECT, count);
 		}
@@ -322,10 +415,21 @@ class TunnelSessionReceivePathTest {
 
 		@Override
 		public void onError(Throwable t) {
+			this.failures.add(t);
 		}
 
 		@Override
 		public void onCompleted() {
+			this.completions.incrementAndGet();
+		}
+
+		Throwable awaitFailure() throws InterruptedException {
+			long deadline = System.currentTimeMillis() + 5000;
+			while (this.failures.isEmpty() && System.currentTimeMillis() < deadline) {
+				TimeUnit.MILLISECONDS.sleep(10);
+			}
+			assertThat(this.failures).as("the stream failed").isNotEmpty();
+			return this.failures.getFirst();
 		}
 
 	}

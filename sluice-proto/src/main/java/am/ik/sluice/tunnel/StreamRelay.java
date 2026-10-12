@@ -174,8 +174,8 @@ public final class StreamRelay {
 	}
 
 	/**
-	 * Writes through the connection's sink, so a windowed connection sends only against
-	 * the remote's credit and the half-close is recorded on the connection.
+	 * Writes through the connection's sink, so the connection sends only against the
+	 * remote's credit and the half-close is recorded on the connection.
 	 */
 	private void doRelayToRemote(byte[] buffer) throws Exception {
 		OutputStream sink = this.connection.sink();

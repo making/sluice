@@ -24,6 +24,9 @@ final class FakeServerObserver extends ServerCallStreamObserver<Frame> {
 
 	final AtomicBoolean die = new AtomicBoolean();
 
+	/** How the stream was ended: the error of onError, or "completed". */
+	final List<Object> endings = new CopyOnWriteArrayList<>();
+
 	final CountDownLatch enteredOnNext = new CountDownLatch(1);
 
 	final CountDownLatch gate = new CountDownLatch(1);
@@ -73,10 +76,12 @@ final class FakeServerObserver extends ServerCallStreamObserver<Frame> {
 
 	@Override
 	public void onError(Throwable t) {
+		this.endings.add(t);
 	}
 
 	@Override
 	public void onCompleted() {
+		this.endings.add("completed");
 	}
 
 	@Override

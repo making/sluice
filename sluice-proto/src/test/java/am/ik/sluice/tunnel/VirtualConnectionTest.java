@@ -74,7 +74,7 @@ class VirtualConnectionTest {
 	@Test
 	void chunkBoundaryReassembly() throws IOException {
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(1, writer);
+		VirtualConnection connection = VirtualConnection.builder(1, writer).build();
 		InputStream source = connection.source();
 		Executors.newSingleThreadExecutor().execute(() -> {
 			connection.acceptData("hel".getBytes());
@@ -96,7 +96,7 @@ class VirtualConnectionTest {
 	@Test
 	void largePayloadSplitIntoSingleReads() throws Exception {
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(2, writer);
+		VirtualConnection connection = VirtualConnection.builder(2, writer).build();
 		byte[] payload = new byte[10_000];
 		for (int i = 0; i < payload.length; i++) {
 			payload[i] = (byte) i;
@@ -153,7 +153,7 @@ class VirtualConnectionTest {
 	@Test
 	void sinkHalfCloseNotifiesRemoteAndRejectsFurtherWrites() throws IOException {
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(4, writer);
+		VirtualConnection connection = VirtualConnection.builder(4, writer).build();
 		OutputStream sink = connection.sink();
 		sink.close();
 		assertThat(writer.frames).contains("close:4");
@@ -166,7 +166,7 @@ class VirtualConnectionTest {
 	@Test
 	void remoteFailureSurfacesAsIOException() {
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(5, writer);
+		VirtualConnection connection = VirtualConnection.builder(5, writer).build();
 		connection.remoteFailed("boom");
 		assertThatThrownBy(() -> connection.source().read()).isInstanceOf(IOException.class).hasMessage("boom");
 	}
@@ -174,7 +174,7 @@ class VirtualConnectionTest {
 	@Test
 	void closeWakesBlockedReader() throws Exception {
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(6, writer);
+		VirtualConnection connection = VirtualConnection.builder(6, writer).build();
 		Thread reader = Thread.ofVirtual().start(() -> {
 			try {
 				connection.source().read();
@@ -187,15 +187,15 @@ class VirtualConnectionTest {
 		connection.close();
 		reader.join(1000);
 		assertThat(reader.isAlive()).isFalse();
-		assertThat(writer.frames).contains("close:6");
+		assertThat(writer.frames).contains("error:6:connection closed");
 	}
 
 	@Test
-	void remoteClosedIsNotBlockedByFullInboundQueue() throws Exception {
+	void remoteClosedIsNotBlockedByAFullWindow() throws Exception {
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(7, writer);
+		VirtualConnection connection = windowed(7, writer, 128 * 1000, 1);
 		byte[] chunk = new byte[1000];
-		for (int i = 0; i < 128; i++) { // fill the 128-chunk inbound bound
+		for (int i = 0; i < 128; i++) { // fill the whole window
 			connection.acceptData(chunk);
 		}
 		Thread marker = Thread.ofVirtual().start(connection::remoteClosed);
@@ -207,11 +207,11 @@ class VirtualConnectionTest {
 	}
 
 	@Test
-	void remoteFailedIsNotBlockedByFullInboundQueue() throws Exception {
+	void remoteFailedIsNotBlockedByAFullWindow() throws Exception {
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(8, writer);
+		VirtualConnection connection = windowed(8, writer, 128 * 1000, 1);
 		byte[] chunk = new byte[1000];
-		for (int i = 0; i < 128; i++) { // fill the 128-chunk inbound bound
+		for (int i = 0; i < 128; i++) { // fill the whole window
 			connection.acceptData(chunk);
 		}
 		Thread marker = Thread.ofVirtual().start(() -> connection.remoteFailed("boom"));
@@ -223,39 +223,17 @@ class VirtualConnectionTest {
 	}
 
 	@Test
-	void acceptDataBlockedOnFullBoundReturnsAfterClose() throws Exception {
-		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(9, writer);
-		byte[] chunk = new byte[1000];
-		for (int i = 0; i < 128; i++) { // fill the 128-chunk inbound bound
-			connection.acceptData(chunk);
-		}
-		CountDownLatch entered = new CountDownLatch(1);
-		Thread producer = Thread.ofVirtual().start(() -> {
-			entered.countDown();
-			connection.acceptData(chunk);
-		});
-		assertThat(entered.await(1, TimeUnit.SECONDS)).isTrue();
-		Thread.sleep(200);
-		assertThat(producer.isAlive()).as("precondition: producer parked on the full bound").isTrue();
-		// the local side gives up on the connection (relay ended)
-		connection.close();
-		producer.join(1000);
-		assertThat(producer.isAlive()).as("acceptData returns once the connection is closed").isFalse();
-	}
-
-	@Test
 	void repeatedRemoteClosedEndTheStreamOnce() throws Exception {
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(10, writer);
+		VirtualConnection connection = windowed(10, writer, 128 * 1000, 1);
 		byte[] chunk = new byte[1000];
-		for (int i = 0; i < 128; i++) { // fill the 128-chunk inbound bound
+		for (int i = 0; i < 128; i++) { // fill the whole window
 			connection.acceptData(chunk);
 		}
 		for (int i = 0; i < 1000; i++) {
 			connection.remoteClosed();
 		}
-		assertThat(connection.bufferedSegments()).as("one segment per legacy frame").isEqualTo(128);
+		assertThat(connection.bufferedBytes()).as("precondition: the window is full").isEqualTo(128 * 1000);
 		byte[] all = connection.source().readNBytes(128 * 1000);
 		assertThat(all).hasSize(128 * 1000);
 		assertThat(connection.source().read()).as("EOF after all data").isEqualTo(-1);
@@ -266,15 +244,15 @@ class VirtualConnectionTest {
 	@Test
 	void repeatedRemoteFailedEndTheStreamOnce() throws Exception {
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(11, writer);
+		VirtualConnection connection = windowed(11, writer, 128 * 1000, 1);
 		byte[] chunk = new byte[1000];
-		for (int i = 0; i < 128; i++) { // fill the 128-chunk inbound bound
+		for (int i = 0; i < 128; i++) { // fill the whole window
 			connection.acceptData(chunk);
 		}
 		for (int i = 0; i < 1000; i++) {
 			connection.remoteFailed("boom");
 		}
-		assertThat(connection.bufferedSegments()).as("one segment per legacy frame").isEqualTo(128);
+		assertThat(connection.bufferedBytes()).as("precondition: the window is full").isEqualTo(128 * 1000);
 		assertThat(connection.source().readNBytes(128 * 1000)).hasSize(128 * 1000);
 		assertThatThrownBy(() -> connection.source().read()).isInstanceOf(IOException.class).hasMessage("boom");
 		assertThat(connection.source().read()).as("EOF after the failure").isEqualTo(-1);
@@ -282,7 +260,7 @@ class VirtualConnectionTest {
 
 	/**
 	 * A write parked at the session sender's per-connection cap (the stream never becomes
-	 * ready) fails within 100ms of the local close, which queued the CLOSE.
+	 * ready) fails within 100ms of the local close, which queued the connection's ERROR.
 	 */
 	@Test
 	void sinkWriteParkedAtTheSenderCapFailsOnClose() throws Exception {
@@ -290,7 +268,7 @@ class VirtualConnectionTest {
 		SessionSender sender = new SessionSender(observer);
 		sender.start();
 		try {
-			VirtualConnection connection = new VirtualConnection(1, sender);
+			VirtualConnection connection = VirtualConnection.builder(1, sender).build();
 			OutputStream sink = connection.sink();
 			for (int i = 0; i < SessionSender.DATA_QUEUE_CAPACITY; i++) {
 				sink.write(new byte[1]);
@@ -367,8 +345,8 @@ class VirtualConnectionTest {
 		RecordingWriter writer = new RecordingWriter();
 		VirtualConnection connection = windowed(20, writer, 200 * 1024, 1);
 		byte[] chunk = new byte[1024];
-		// the whole window with no reader, in more chunks than the legacy bound (128); on
-		// a thread so a regression fails the join instead of hanging the build
+		// the whole window with no reader, in many small chunks; on a thread so a
+		// regression fails the join instead of hanging the build
 		Thread producer = Thread.ofVirtual().start(() -> {
 			for (int i = 0; i < 200; i++) {
 				connection.acceptData(chunk);
@@ -539,17 +517,6 @@ class VirtualConnectionTest {
 		connection.remoteClosed();
 		connection.close();
 		assertThat(writer.frames).containsExactly("close:30");
-	}
-
-	@Test
-	void legacyConnectionIgnoresGrantsAndHalfClosesOnClose() throws Exception {
-		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(31, writer);
-		connection.grant(100);
-		connection.sink().write(new byte[3 * SessionSender.MAX_CHUNK]);
-		connection.close();
-		assertThat(connection.windowed()).isFalse();
-		assertThat(writer.frames).containsExactly("data:31:%d".formatted(3 * SessionSender.MAX_CHUNK), "close:31");
 	}
 
 	@Test
@@ -730,17 +697,6 @@ class VirtualConnectionTest {
 		assertThat(connection.source().readAllBytes()).isEqualTo("ab".getBytes());
 	}
 
-	@Test
-	void legacyFramesStayOneSegmentEach() throws Exception {
-		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(38, writer);
-		for (int i = 0; i < 100; i++) {
-			connection.acceptData(pattern(i, 1));
-		}
-		assertThat(connection.bufferedSegments()).isEqualTo(100);
-		assertThat(connection.source().readNBytes(100)).isEqualTo(pattern(0, 100));
-	}
-
 	/**
 	 * A writer whose {@code sendData} parks until {@link #proceed} opens, and whose
 	 * {@code afterQueued} holds each action until {@link #drain} runs it -- standing in
@@ -811,32 +767,28 @@ class VirtualConnectionTest {
 	 */
 	@Test
 	void afterQueuedWaitsForTheSendsInFlight() throws Exception {
-		for (boolean windowedMode : new boolean[] { false, true }) {
-			HoldingWriter writer = new HoldingWriter();
-			VirtualConnection connection = windowedMode ? windowed(40, writer, 1000, 1000)
-					: new VirtualConnection(40, writer);
-			AsyncWrite write = AsyncWrite.start(connection.sink(), new byte[10]);
-			assertThat(writer.entered.await(5, TimeUnit.SECONDS)).as("precondition: the send is in flight").isTrue();
-			connection.close();
-			java.util.concurrent.atomic.AtomicInteger runs = new java.util.concurrent.atomic.AtomicInteger();
-			connection.afterQueued(runs::incrementAndGet);
-			assertThat(writer.calls).as("windowed=%s: not handed over while the send runs", windowedMode)
-				.doesNotContain("after-queued:40");
-			writer.proceed.countDown();
-			write.done().get(5, TimeUnit.SECONDS);
-			awaitCall(writer, "after-queued:40");
-			assertThat(writer.calls.indexOf("after-queued:40")).as("windowed=%s: after the send returned", windowedMode)
-				.isGreaterThan(writer.calls.indexOf("data-returned:40"));
-			assertThat(runs).as("windowed=%s: held while frames are queued", windowedMode).hasValue(0);
-			writer.drain(40);
-			assertThat(runs).hasValue(1);
-		}
+		HoldingWriter writer = new HoldingWriter();
+		VirtualConnection connection = windowed(40, writer, 1000, 1000);
+		AsyncWrite write = AsyncWrite.start(connection.sink(), new byte[10]);
+		assertThat(writer.entered.await(5, TimeUnit.SECONDS)).as("precondition: the send is in flight").isTrue();
+		connection.close();
+		java.util.concurrent.atomic.AtomicInteger runs = new java.util.concurrent.atomic.AtomicInteger();
+		connection.afterQueued(runs::incrementAndGet);
+		assertThat(writer.calls).as("not handed over while the send runs").doesNotContain("after-queued:40");
+		writer.proceed.countDown();
+		write.done().get(5, TimeUnit.SECONDS);
+		awaitCall(writer, "after-queued:40");
+		assertThat(writer.calls.indexOf("after-queued:40")).as("after the send returned")
+			.isGreaterThan(writer.calls.indexOf("data-returned:40"));
+		assertThat(runs).as("held while frames are queued").hasValue(0);
+		writer.drain(40);
+		assertThat(runs).hasValue(1);
 	}
 
 	@Test
 	void afterQueuedEndsTheSendingSide() throws Exception {
 		RecordingWriter writer = new RecordingWriter();
-		VirtualConnection connection = new VirtualConnection(41, writer);
+		VirtualConnection connection = VirtualConnection.builder(41, writer).build();
 		java.util.concurrent.atomic.AtomicInteger runs = new java.util.concurrent.atomic.AtomicInteger();
 		connection.afterQueued(runs::incrementAndGet);
 		assertThat(runs).as("nothing in flight: handed over at once").hasValue(1);
@@ -849,8 +801,9 @@ class VirtualConnectionTest {
 		HoldingWriter first = new HoldingWriter();
 		HoldingWriter second = new HoldingWriter();
 		java.util.concurrent.atomic.AtomicInteger runs = new java.util.concurrent.atomic.AtomicInteger();
-		VirtualConnection.afterQueued(List.of(new VirtualConnection(42, first), new VirtualConnection(43, second),
-				new VirtualConnection(44, second)), runs::incrementAndGet);
+		VirtualConnection.afterQueued(List.of(VirtualConnection.builder(42, first).build(),
+				VirtualConnection.builder(43, second).build(), VirtualConnection.builder(44, second).build()),
+				runs::incrementAndGet);
 		first.drain(42);
 		second.drain(44);
 		assertThat(runs).as("connection 43 still has frames queued").hasValue(0);

@@ -31,8 +31,8 @@ public interface FrameWriter {
 	void sendError(long connectionId, String message);
 
 	/**
-	 * Grants the remote {@code increment} more payload bytes of the given windowed
-	 * connection. Never blocks: called by the local consumer of the connection.
+	 * Grants the remote {@code increment} more payload bytes of the given connection.
+	 * Never blocks: called by the local consumer of the connection.
 	 */
 	void sendWindowUpdate(long connectionId, int increment);
 

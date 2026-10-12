@@ -16,6 +16,7 @@ import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.jspecify.annotations.Nullable;
 
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.tunnel.VirtualConnection;
 import am.ik.sluice.v1.proto.Frame;
 import am.ik.sluice.v1.proto.TunnelGrpc;
 import io.grpc.ManagedChannel;
@@ -110,7 +111,10 @@ class GrpcKeepAliveTest {
 			.withWaitForReady()
 			.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(metadata))
 			.connect(observer);
-		call.onNext(Frame.newBuilder().setAdvertise(am.ik.sluice.v1.proto.Advertise.getDefaultInstance()).build());
+		call.onNext(Frame.newBuilder()
+			.setAdvertise(
+					am.ik.sluice.v1.proto.Advertise.newBuilder().setConnectionWindow(VirtualConnection.DEFAULT_WINDOW))
+			.build());
 		assertThat(connected.await(5, TimeUnit.SECONDS)).isTrue();
 		assertThat(error.get()).as("stream error: %s", error.get()).isNull();
 
@@ -157,8 +161,10 @@ class GrpcKeepAliveTest {
 			.withWaitForReady()
 			.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(secondMetadata))
 			.connect(secondObserver);
-		secondCall
-			.onNext(Frame.newBuilder().setAdvertise(am.ik.sluice.v1.proto.Advertise.getDefaultInstance()).build());
+		secondCall.onNext(Frame.newBuilder()
+			.setAdvertise(
+					am.ik.sluice.v1.proto.Advertise.newBuilder().setConnectionWindow(VirtualConnection.DEFAULT_WINDOW))
+			.build());
 		assertThat(reconnect.await(5, TimeUnit.SECONDS)).isTrue();
 		assertThat(secondError.get()).as("second stream error: %s", secondError.get()).isNull();
 	}

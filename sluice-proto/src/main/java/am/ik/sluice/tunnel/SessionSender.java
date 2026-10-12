@@ -9,6 +9,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
@@ -194,6 +195,9 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 	/** The stall that stopped the worker; null while the watchdog has not fired. */
 	private volatile @Nullable Duration stallFailure;
+
+	/** The error {@link #fail} ends the call with instead of completing it. */
+	private final AtomicReference<@Nullable Throwable> callFailure = new AtomicReference<>();
 
 	public SessionSender(StreamObserver<Frame> outbound) {
 		this(builder(outbound));
@@ -817,17 +821,34 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	}
 
 	/**
-	 * Completes the outbound stream, telling the peer this side sent its last frame. On
-	 * the server this ends the tunnel stream for the client; on the client it is the
-	 * half-close of the request stream.
+	 * Completes the outbound stream, telling the peer this side sent its last frame, or
+	 * fails it with the error of {@link #fail}. On the server this ends the tunnel stream
+	 * for the client; on the client it is the half-close of the request stream.
 	 */
 	private void complete() {
 		try {
-			this.outbound.onCompleted();
+			Throwable failure = this.callFailure.get();
+			if (failure != null) {
+				this.outbound.onError(failure);
+			}
+			else {
+				this.outbound.onCompleted();
+			}
 		}
 		catch (RuntimeException e) {
 			// the stream may already be dead
 		}
+	}
+
+	/**
+	 * {@link #close()}, but the worker ends the outbound stream with {@code error}
+	 * instead of completing it -- on its own thread, so no frame races the error. Frames
+	 * still queued are dropped. Changes nothing once the worker ended: the stream is
+	 * completed or failed already.
+	 */
+	public void fail(Throwable error) {
+		this.callFailure.compareAndSet(null, Objects.requireNonNull(error, "error is required"));
+		close();
 	}
 
 	/**

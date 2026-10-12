@@ -177,7 +177,6 @@ class ConsoleView {
 				.outbound(Humanize.bytes(session.bytesOutbound()))
 				.draining(session.drained())
 				.peerBuild(session.advertised() ? peerBuild(session.clientBuild().orElse(null)) : null)
-				.legacy(session.legacy())
 				.upstreams(session.upstreams()
 					.stream()
 					.map(upstream -> upstreamRow(upstream, session.rejectedPorts().contains(upstream.getListenPort()))
@@ -503,7 +502,7 @@ class ConsoleView {
 	 */
 	public record Client(String clientId, String remoteAddress, String connectedFor, String connectedAt,
 			int openConnections, long connectionsOpened, String inbound, String outbound, boolean draining,
-			@Nullable PeerBuildView peerBuild, boolean legacy, List<UpstreamRow> upstreams) {
+			@Nullable PeerBuildView peerBuild, List<UpstreamRow> upstreams) {
 
 		public static Builder builder() {
 			return new Builder();
@@ -530,8 +529,6 @@ class ConsoleView {
 			private boolean draining;
 
 			private @Nullable PeerBuildView peerBuild;
-
-			private boolean legacy;
 
 			private List<UpstreamRow> upstreams = List.of();
 
@@ -589,11 +586,6 @@ class ConsoleView {
 				return this;
 			}
 
-			public Builder legacy(boolean legacy) {
-				this.legacy = legacy;
-				return this;
-			}
-
 			public Builder upstreams(List<UpstreamRow> upstreams) {
 				this.upstreams = upstreams;
 				return this;
@@ -603,7 +595,7 @@ class ConsoleView {
 				return new Client(Objects.requireNonNull(this.clientId, "clientId is required"), this.remoteAddress,
 						Objects.requireNonNull(this.connectedFor, "connectedFor is required"),
 						Objects.requireNonNull(this.connectedAt, "connectedAt is required"), this.openConnections,
-						this.connectionsOpened, this.inbound, this.outbound, this.draining, this.peerBuild, this.legacy,
+						this.connectionsOpened, this.inbound, this.outbound, this.draining, this.peerBuild,
 						List.copyOf(this.upstreams));
 			}
 

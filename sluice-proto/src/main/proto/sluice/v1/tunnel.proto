@@ -70,8 +70,9 @@ message Connect {
   int64 conn_id = 1;
   // Dial target ("host:port").
   string address = 2;
-  // Server's receive window for this connection, in bytes; 0 = legacy mode
-  // for this connection (no WindowUpdate either way).
+  // Server's receive window for this connection, in bytes. 0 (a server
+  // without per-connection flow control, before 046cd21) is answered with an
+  // Error for the connection.
   uint32 connection_window = 3;
 }
 
@@ -88,8 +89,9 @@ message Error {
 message Advertise {
   // Upstream services exposed by the client.
   repeated Upstream upstreams = 1;
-  // Client's receive window per connection, in bytes; 0 = the client has no
-  // per-connection flow control (legacy).
+  // Client's receive window per connection, in bytes. 0 (a client without
+  // per-connection flow control: sluice-client before 046cd21, sluice-wasmlet
+  // before f76388d) fails the tunnel stream with FAILED_PRECONDITION.
   uint32 connection_window = 2;
   // Build of the client; unset by clients that predate the field.
   PeerBuild build = 3;

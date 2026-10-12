@@ -59,9 +59,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * The build each peer announces reaches the server's console: a real client application
- * reports the build packaged with it, a wasmlet-shaped peer its own, a peer that predates
- * build reporting shows as unknown, and a peer without a connection window is marked
- * legacy and counted.
+ * reports the build packaged with it, a wasmlet-shaped peer its own, and a peer that
+ * predates build reporting shows as unknown and is counted.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -72,7 +71,7 @@ class ConsolePeerBuildE2ETest {
 
 	private static final String WASMLET_ID = "build-wasmlet";
 
-	private static final String LEGACY_ID = "build-legacy";
+	private static final String UNKNOWN_ID = "build-unknown";
 
 	private static final String HOSTILE_ID = "build-hostile";
 
@@ -147,8 +146,8 @@ class ConsolePeerBuildE2ETest {
 						.setVersion("0.0.1-SNAPSHOT")
 						.setCommit(WASMLET_COMMIT)
 						.setBuildTime("2026-10-12T00:00:00Z")));
-		// a client from before build reporting and per-connection flow control
-		advertise(LEGACY_ID, Advertise.newBuilder());
+		// a client from before build reporting
+		advertise(UNKNOWN_ID, Advertise.newBuilder().setConnectionWindow(VirtualConnection.DEFAULT_WINDOW));
 		advertise(HOSTILE_ID,
 				Advertise.newBuilder()
 					.setConnectionWindow(VirtualConnection.DEFAULT_WINDOW)
@@ -159,7 +158,7 @@ class ConsolePeerBuildE2ETest {
 						.setBuildTime("<b>now</b>")));
 		Awaitility.await()
 			.atMost(Duration.ofSeconds(15))
-			.until(() -> List.of(CLIENT_ID, WASMLET_ID, LEGACY_ID, HOSTILE_ID)
+			.until(() -> List.of(CLIENT_ID, WASMLET_ID, UNKNOWN_ID, HOSTILE_ID)
 				.stream()
 				.allMatch(id -> this.sessions.find(id).map(TunnelSession::advertised).orElse(false)));
 		this.playwright = Playwright.create();
@@ -259,7 +258,6 @@ class ConsolePeerBuildE2ETest {
 				"Build sluice-client " + version + " " + shortCommit + (dirty ? " dirty" : ""));
 		assertThat(buildLine.locator(".mono").getAttribute("title")).isEqualTo("Commit " + commit + ", built "
 				+ Objects.requireNonNull(build.getTime()).truncatedTo(ChronoUnit.SECONDS));
-		assertThat(row(CLIENT_ID).getByTestId("legacy").count()).isZero();
 	}
 
 	@Test
@@ -268,23 +266,20 @@ class ConsolePeerBuildE2ETest {
 		assertThat(buildLine.innerText()).isEqualToNormalizingWhitespace("Build sluice-wasmlet 0.0.1-SNAPSHOT 0123456");
 		assertThat(buildLine.locator(".mono").getAttribute("title"))
 			.isEqualTo("Commit " + WASMLET_COMMIT + ", built 2026-10-12T00:00:00Z");
-		assertThat(row(WASMLET_ID).getByTestId("legacy").count()).isZero();
 	}
 
 	@Test
-	void peerWithoutBuildAndWindowIsUnknownAndLegacy() {
-		assertThat(row(LEGACY_ID).getByTestId("build").innerText())
+	void peerWithoutBuildIsUnknown() {
+		assertThat(row(UNKNOWN_ID).getByTestId("build").innerText())
 			.isEqualToNormalizingWhitespace("Build Unknown (older build)");
-		assertThat(row(LEGACY_ID).getByTestId("legacy").innerText()).isEqualTo("Legacy flow control");
 	}
 
 	@Test
-	void gaugesCountLegacyAndUnknownBuildSessions() {
-		// precondition: the legacy peer without a build is live; the others announce both
-		assertThat(this.sessions.find(LEGACY_ID).map(TunnelSession::legacy)).hasValue(true);
+	void gaugeCountsUnknownBuildSessions() {
+		// precondition: the peer without a build is live; the others announce one
+		assertThat(this.sessions.find(UNKNOWN_ID).flatMap(TunnelSession::clientBuild)).isEmpty();
 		assertThat(List.of(CLIENT_ID, WASMLET_ID, HOSTILE_ID)).allSatisfy(id -> assertThat(this.sessions.find(id))
-			.hasValueSatisfying(session -> assertThat(session.legacy()).isFalse()));
-		assertThat(this.meterRegistry.get("sluice.tunnel.sessions.legacy").gauge().value()).isEqualTo(1.0);
+			.hasValueSatisfying(session -> assertThat(session.clientBuild()).isPresent()));
 		assertThat(this.meterRegistry.get("sluice.tunnel.sessions.build.unknown").gauge().value()).isEqualTo(1.0);
 	}
 
@@ -325,8 +320,7 @@ class ConsolePeerBuildE2ETest {
 			.containsOnlyOnce(
 					"client " + WASMLET_ID
 							+ " runs sluice-wasmlet 0.0.1-SNAPSHOT (0123456, built 2026-10-12T00:00:00Z)",
-					"client " + LEGACY_ID + " runs " + PeerBuilds.UNKNOWN
-							+ "; it announced no connection window (legacy flow control)",
+					"client " + UNKNOWN_ID + " runs " + PeerBuilds.UNKNOWN,
 					"client " + HOSTILE_ID + " runs <img src=x onerror=\"window.pwned=1\"> " + "9".repeat(64)
 							+ "... (abc?def, built <b>now</b>)");
 	}

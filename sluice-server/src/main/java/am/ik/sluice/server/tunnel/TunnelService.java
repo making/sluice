@@ -84,11 +84,6 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			.register(meterRegistry);
 		log.info("server build: {}", PeerBuilds.describe(serverBuild));
 		Gauge
-			.builder("sluice.tunnel.sessions.legacy", sessions,
-					registry -> registry.all().stream().filter(TunnelSession::legacy).count())
-			.description("Connected clients that advertised no per-connection receive window (legacy flow control)")
-			.register(meterRegistry);
-		Gauge
 			.builder("sluice.tunnel.sessions.build.unknown", sessions,
 					registry -> registry.all()
 						.stream()

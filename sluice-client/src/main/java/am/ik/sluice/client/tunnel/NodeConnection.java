@@ -58,6 +58,13 @@ public final class NodeConnection implements AutoCloseable {
 
 	private static final Logger log = LoggerFactory.getLogger(NodeConnection.class);
 
+	/**
+	 * The ERROR message answering a CONNECT that announces no per-connection receive
+	 * window; names the first server build that announces one.
+	 */
+	public static final String SERVER_WINDOW_REQUIRED = "the server announced no per-connection receive window "
+			+ "(Connect.connection_window); this client requires sluice-server 046cd21 (2026-10-12) or later";
+
 	private static final long BACKOFF_INITIAL_SECONDS = 1;
 
 	private static final long BACKOFF_MAX_SECONDS = 30;
@@ -555,6 +562,13 @@ public final class NodeConnection implements AutoCloseable {
 					return;
 				}
 				am.ik.sluice.v1.proto.Connect request = frame.getConnect();
+				if (request.getConnectionWindow() == 0) {
+					// a server predating per-connection flow control: neither dialed nor
+					// registered, like a CONNECT beyond the limit
+					log.warn("[{}] {}; rejecting conn {}", this.key, SERVER_WINDOW_REQUIRED, request.getConnId());
+					sender.sendError(request.getConnId(), SERVER_WINDOW_REQUIRED);
+					return;
+				}
 				ConnectionLimit.Permit permit = this.connectionLimit.tryAcquire();
 				if (permit == null) {
 					// neither dialed nor registered: the server fails its side on the
@@ -565,11 +579,9 @@ public final class NodeConnection implements AutoCloseable {
 					sender.sendError(request.getConnId(), ConnectionLimit.LIMIT_REACHED);
 					return;
 				}
-				// windowed iff the server announced its receive window for it
-				long serverWindow = Integer.toUnsignedLong(request.getConnectionWindow());
-				VirtualConnection connection = serverWindow > 0 ? VirtualConnection.builder(request.getConnId(), sender)
-					.window(VirtualConnection.DEFAULT_WINDOW, serverWindow)
-					.build() : new VirtualConnection(request.getConnId(), sender);
+				VirtualConnection connection = VirtualConnection.builder(request.getConnId(), sender)
+					.window(VirtualConnection.DEFAULT_WINDOW, Integer.toUnsignedLong(request.getConnectionWindow()))
+					.build();
 				this.permits.put(request.getConnId(), permit);
 				this.connections.put(request.getConnId(), connection);
 				try {

@@ -13,7 +13,6 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -30,24 +29,17 @@ import java.util.concurrent.locks.ReentrantLock;
  * half-close so the opposite direction may keep flowing (required for HTTP keep-alive and
  * half-duplex protocols).
  * <p>
- * A connection runs in one of two flow control modes, fixed at construction:
- * <ul>
- * <li><b>Windowed</b> ({@link #builder}): credit-based per-connection flow control. The
- * remote may have at most the receive window of DATA payload in flight beyond what this
- * side granted back; {@link #acceptData(byte[])} never blocks, and payload past the
- * window fails only this connection ({@code flow control window exceeded}). The payload
- * is coalesced into segments of at most {@link #SEGMENT_SIZE}, so the buffer stays within
+ * Credit-based per-connection flow control: the remote may have at most the receive
+ * window of DATA payload in flight beyond what this side granted back;
+ * {@link #acceptData(byte[])} never blocks, and payload past the window fails only this
+ * connection ({@code flow control window exceeded}). The payload is coalesced into
+ * segments of at most {@link #SEGMENT_SIZE}, so the buffer stays within
  * {@link #MAX_RECEIVE_BUFFER} for the default window whatever the size of the frames. The
  * reader grants the bytes it consumed once they reach half the window. The writer sends
  * only against the credit the remote granted and waits for more on its own thread; the
  * credit lock is never held while the frame writer is called, so a grant on the receive
  * path never waits for a blocked writer. Closing while the remote may still send tells it
- * to stop with an ERROR, since a remote waiting for credit would otherwise wait
- * forever.</li>
- * <li><b>Legacy</b> ({@link #VirtualConnection(long, FrameWriter)}): for peers without
- * per-connection flow control. {@link #acceptData(byte[])} blocks while 128 frames are
- * buffered, one segment each, propagating backpressure to the whole gRPC stream.</li>
- * </ul>
+ * to stop with an ERROR, since a remote waiting for credit would otherwise wait forever.
  */
 public final class VirtualConnection implements AutoCloseable {
 
@@ -61,10 +53,9 @@ public final class VirtualConnection implements AutoCloseable {
 	public static final String WINDOW_EXCEEDED = "flow control window exceeded";
 
 	/**
-	 * Windowed mode: the most payload one receive segment holds. Small frames are
-	 * coalesced into segments and large ones split, so neither the per-segment overhead
-	 * nor the read part of the head segment grows with the way the remote frames its
-	 * payload.
+	 * The most payload one receive segment holds. Small frames are coalesced into
+	 * segments and large ones split, so neither the per-segment overhead nor the read
+	 * part of the head segment grows with the way the remote frames its payload.
 	 */
 	static final int SEGMENT_SIZE = 16 * 1024;
 
@@ -76,15 +67,13 @@ public final class VirtualConnection implements AutoCloseable {
 	static final int SEGMENT_OVERHEAD = 64;
 
 	/**
-	 * The most heap the receive buffer of a windowed connection with the
-	 * {@link #DEFAULT_WINDOW} holds: the window of unread payload, the read part of the
-	 * head segment and the room of the tail segment (under one segment each), and the
-	 * overhead of {@link #maxSegments} segments.
+	 * The most heap the receive buffer of a connection with the {@link #DEFAULT_WINDOW}
+	 * holds: the window of unread payload, the read part of the head segment and the room
+	 * of the tail segment (under one segment each), and the overhead of
+	 * {@link #maxSegments} segments.
 	 */
 	static final long MAX_RECEIVE_BUFFER = DEFAULT_WINDOW + 2L * SEGMENT_SIZE
 			+ (long) maxSegments(DEFAULT_WINDOW) * SEGMENT_OVERHEAD;
-
-	private static final int QUEUE_CAPACITY = 128; // legacy: frames, x 64KiB
 
 	/** A receive segment: the payload is {@code data[0, length)}. */
 	private static final class Segment {
@@ -109,7 +98,7 @@ public final class VirtualConnection implements AutoCloseable {
 
 	private final FrameWriter frameWriter;
 
-	/** The receive window announced to the remote; 0 in legacy mode. */
+	/** The receive window announced to the remote. */
 	private final int receiveWindow;
 
 	/**
@@ -141,13 +130,7 @@ public final class VirtualConnection implements AutoCloseable {
 	 */
 	private @Nullable End end;
 
-	/**
-	 * Legacy mode: bounds the buffered DATA frames; released by {@link Source#read}. The
-	 * end is not counted, so remote close/failure can never be delayed by the data bound.
-	 */
-	private final Semaphore inboundPermits = new Semaphore(QUEUE_CAPACITY);
-
-	/** Windowed mode: payload received minus payload granted back. */
+	/** Payload received minus payload granted back. */
 	private final AtomicLong outstanding = new AtomicLong();
 
 	private final Source source = new Source();
@@ -159,7 +142,7 @@ public final class VirtualConnection implements AutoCloseable {
 	/** Signals the writer waiting for credit: grant, close, remote failure. */
 	private final Condition creditChanged = this.writeLock.newCondition();
 
-	/** Windowed mode: payload the remote still accepts; guarded by {@link #writeLock}. */
+	/** Payload the remote still accepts; guarded by {@link #writeLock}. */
 	private long sendCredit;
 
 	private volatile boolean closed;
@@ -202,11 +185,6 @@ public final class VirtualConnection implements AutoCloseable {
 	 */
 	private @Nullable Runnable onRemoteFailure;
 
-	/** A legacy-mode connection: no per-connection flow control. */
-	public VirtualConnection(long connectionId, FrameWriter frameWriter) {
-		this(connectionId, frameWriter, 0, 0);
-	}
-
 	private VirtualConnection(long connectionId, FrameWriter frameWriter, int receiveWindow, long sendCredit) {
 		this.connectionId = connectionId;
 		this.frameWriter = Objects.requireNonNull(frameWriter, "frameWriter is required");
@@ -214,7 +192,7 @@ public final class VirtualConnection implements AutoCloseable {
 		this.sendCredit = sendCredit;
 	}
 
-	/** Builds a windowed connection. */
+	/** Builds a connection; both windows default to {@link #DEFAULT_WINDOW}. */
 	public static Builder builder(long connectionId, FrameWriter frameWriter) {
 		return new Builder(connectionId, frameWriter);
 	}
@@ -235,13 +213,14 @@ public final class VirtualConnection implements AutoCloseable {
 		}
 
 		/**
-		 * The receive window this side announced and the initial send credit, the
-		 * remote's announced window (both positive).
+		 * The receive window this side announced (positive) and the initial send credit,
+		 * the remote's announced window; 0 while the remote's window is not known yet,
+		 * until a {@link VirtualConnection#grant} supplies it.
 		 */
 		public Builder window(int receiveWindow, long sendCredit) {
-			if (receiveWindow <= 0 || sendCredit <= 0) {
+			if (receiveWindow <= 0 || sendCredit < 0) {
 				throw new IllegalArgumentException(
-						"windows must be positive: receive=%d send=%d".formatted(receiveWindow, sendCredit));
+						"windows out of range: receive=%d send=%d".formatted(receiveWindow, sendCredit));
 			}
 			this.receiveWindow = receiveWindow;
 			this.sendCredit = sendCredit;
@@ -258,11 +237,6 @@ public final class VirtualConnection implements AutoCloseable {
 		return this.connectionId;
 	}
 
-	/** Whether the connection runs per-connection credit flow control. */
-	public boolean windowed() {
-		return this.receiveWindow > 0;
-	}
-
 	/** Blocking end for the locally consumed direction. */
 	public InputStream source() {
 		return this.source;
@@ -274,12 +248,10 @@ public final class VirtualConnection implements AutoCloseable {
 	}
 
 	/**
-	 * Feeds a payload received from the remote side; it is copied. Windowed: never
-	 * blocks; payload past the receive window fails the connection. Legacy: blocks while
-	 * the DATA bound (128 frames) is reached, which applies backpressure to the gRPC
-	 * stream. The end set by {@link #remoteClosed()} / {@link #remoteFailed(String)} is
-	 * never delayed. An empty payload ends the stream like the remote's CLOSE, after the
-	 * buffered payload.
+	 * Feeds a payload received from the remote side; it is copied. Never blocks; payload
+	 * past the receive window fails the connection. The end set by
+	 * {@link #remoteClosed()} / {@link #remoteFailed(String)} is never delayed. An empty
+	 * payload ends the stream like the remote's CLOSE, after the buffered payload.
 	 */
 	public void acceptData(byte[] data) {
 		if (this.readClosed || this.closed) {
@@ -289,61 +261,25 @@ public final class VirtualConnection implements AutoCloseable {
 			endWith(EOF);
 			return;
 		}
-		if (windowed()) {
-			acceptWindowed(data);
-			return;
-		}
-		while (!this.closed && !this.readClosed) {
-			boolean acquired;
-			try {
-				// bounded: close() drops the queued chunks instead of releasing their
-				// permits, so a producer parked here must recheck the flags on its own
-				acquired = this.inboundPermits.tryAcquire(100, TimeUnit.MILLISECONDS);
-			}
-			catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-				return;
-			}
-			if (!acquired) {
-				continue;
-			}
-			if (this.closed || this.readClosed || !append(data, false)) {
-				this.inboundPermits.release(); // the frame was dropped: keep the permit
-			}
-			return;
-		}
-	}
-
-	private void acceptWindowed(byte[] data) {
 		if (this.outstanding.addAndGet(data.length) > this.receiveWindow) {
 			failWindowExceeded();
 			return;
 		}
-		append(data, true);
+		append(data);
 	}
 
 	/**
-	 * Appends a copy of the payload unless the stream already ended; false when dropped.
-	 * Coalescing (windowed) fills the tail segment's room first; legacy appends one
-	 * segment per frame, which its frame bound counts.
+	 * Appends a copy of the payload, coalesced into the tail segment's room first, unless
+	 * the stream already ended.
 	 */
-	private boolean append(byte[] data, boolean coalesce) {
+	private void append(byte[] data) {
 		this.inboundLock.lock();
 		try {
 			if (this.end != null) {
-				return false;
+				return;
 			}
-			if (coalesce) {
-				appendCoalesced(data);
-			}
-			else {
-				Segment segment = new Segment(data.length);
-				System.arraycopy(data, 0, segment.data, 0, data.length);
-				segment.length = data.length;
-				this.segments.addLast(segment);
-			}
+			appendCoalesced(data);
 			this.inboundChanged.signalAll();
-			return true;
 		}
 		finally {
 			this.inboundLock.unlock();
@@ -377,8 +313,8 @@ public final class VirtualConnection implements AutoCloseable {
 	}
 
 	/**
-	 * The most segments the receive buffer of a windowed connection holds: segments
-	 * smaller than {@link #SEGMENT_SIZE} at least double one after another, so at most
+	 * The most segments the receive buffer of a connection holds: segments smaller than
+	 * {@link #SEGMENT_SIZE} at least double one after another, so at most
 	 * log2({@link #SEGMENT_SIZE}) of them; every full-size one but the head and the tail
 	 * holds only unread payload, which the window bounds.
 	 */
@@ -406,8 +342,7 @@ public final class VirtualConnection implements AutoCloseable {
 	private void dropInbound(End end) {
 		this.inboundLock.lock();
 		try {
-			this.segments.clear(); // legacy: the dropped frames' permits die with the
-									// connection
+			this.segments.clear();
 			this.headPosition = 0;
 			this.end = end;
 			this.inboundChanged.signalAll();
@@ -447,12 +382,9 @@ public final class VirtualConnection implements AutoCloseable {
 	/**
 	 * The remote granted {@code increment} (unsigned) more payload bytes; wakes the
 	 * writer waiting for credit. Never blocks beyond the brief credit lock, which no
-	 * writer holds across a send. Ignored in legacy mode.
+	 * writer holds across a send.
 	 */
 	public void grant(int increment) {
-		if (!windowed()) {
-			return;
-		}
 		long added = Integer.toUnsignedLong(increment);
 		this.writeLock.lock();
 		try {
@@ -478,9 +410,7 @@ public final class VirtualConnection implements AutoCloseable {
 		this.remoteDone = true;
 		this.failure = message;
 		endWith(new End(message == null ? "remote failure" : message));
-		if (windowed()) {
-			signalCredit(); // the remote grants nothing more
-		}
+		signalCredit(); // the remote grants nothing more
 		Runnable action;
 		synchronized (this.remoteFailureLock) {
 			if (this.remoteFailed) {
@@ -566,13 +496,13 @@ public final class VirtualConnection implements AutoCloseable {
 	}
 
 	/**
-	 * Ends the connection locally. A windowed connection whose remote may still send
-	 * (neither CLOSE nor ERROR arrived) sends ERROR instead of CLOSE: its payload would
-	 * be dropped and never granted, so a remote waiting for credit would wait forever.
+	 * Ends the connection locally. While the remote may still send (neither CLOSE nor
+	 * ERROR arrived) it sends ERROR instead of CLOSE: the remote's payload would be
+	 * dropped and never granted, so a remote waiting for credit would wait forever.
 	 */
 	@Override
 	public void close() {
-		if (windowed() && !this.remoteDone) {
+		if (!this.remoteDone) {
 			abortSink();
 		}
 		else {
@@ -764,7 +694,7 @@ public final class VirtualConnection implements AutoCloseable {
 		/** The end was returned (EOF or the failure); later reads return EOF. */
 		private boolean endSeen;
 
-		/** Windowed mode: bytes handed to the reader and not yet granted back. */
+		/** Bytes handed to the reader and not yet granted back. */
 		private long consumed;
 
 		@Override
@@ -812,9 +742,6 @@ public final class VirtualConnection implements AutoCloseable {
 						if (position + copied == head.length) {
 							VirtualConnection.this.segments.pollFirst();
 							VirtualConnection.this.headPosition = 0;
-							if (!windowed()) {
-								VirtualConnection.this.inboundPermits.release();
-							}
 						}
 						else {
 							VirtualConnection.this.headPosition = position + copied;
@@ -852,9 +779,6 @@ public final class VirtualConnection implements AutoCloseable {
 		 * reader's thread, never on the receive path.
 		 */
 		private void consumed(int n) {
-			if (!windowed()) {
-				return;
-			}
 			this.consumed += n;
 			if (this.consumed < VirtualConnection.this.receiveWindow / 2 || VirtualConnection.this.closed) {
 				return;
@@ -876,26 +800,18 @@ public final class VirtualConnection implements AutoCloseable {
 			write(new byte[] { (byte) b }, 0, 1);
 		}
 
+		/**
+		 * Sends frame by frame, each against the credit taken for it. The closed check
+		 * and the send are not atomic: a {@link #close()} whose CLOSE is queued in
+		 * between lets this frame follow the CLOSE, and the remote reader, stopped at the
+		 * EOF, never reads it.
+		 */
 		@Override
 		public void write(byte[] b, int off, int len) throws IOException {
 			Objects.requireNonNull(b, "b is required");
 			if (off < 0 || len < 0 || off + len > b.length) {
 				throw new IndexOutOfBoundsException("off=%d len=%d b.length=%d".formatted(off, len, b.length));
 			}
-			if (windowed()) {
-				writeWindowed(b, off, len);
-				return;
-			}
-			send(Arrays.copyOfRange(b, off, off + len));
-		}
-
-		/**
-		 * Sends frame by frame, each against the credit taken for it. As in legacy mode,
-		 * the closed check and the send are not atomic: a {@link #close()} whose CLOSE is
-		 * queued in between lets this frame follow the CLOSE, and the remote reader,
-		 * stopped at the EOF, never reads it.
-		 */
-		private void writeWindowed(byte[] b, int off, int len) throws IOException {
 			int offset = off;
 			int remaining = len;
 			while (remaining > 0) {
