@@ -227,7 +227,10 @@ duplicate is closed on the client side before the server drops it.
 
 - no mTLS (client certificates) yet
 - the epoch budget is absolute (suspended time counts) and granular to the
-  10ms tick; a CPU-limiting `fuel` accounting is not there yet
+  10ms tick; a CPU-limiting `fuel` accounting is not there yet. The ticker
+  follows a fixed schedule and catches up a late wake-up, but replays at most
+  100 ticks (1s) at once: a longer stall (a suspended process) is forgotten, so
+  budgets stretch by the excess
 - routes without `instances` share the instance slots unbounded: busy ones can
   hold every slot not pooled and delay the others. A route keeps slots of its
   own only through `pool`, or by capping the other routes below

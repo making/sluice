@@ -76,14 +76,99 @@ fn engine() -> &'static wasmtime::Engine {
         // A dedicated thread: guests run on tokio workers and can starve the
         // timer wheel with a busy loop, which would stall their own budget.
         let ticker = engine.clone();
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(EPOCH_TICK);
-                ticker.increment_epoch();
-            }
-        });
+        std::thread::Builder::new()
+            .name("wasm-epoch-ticker".into())
+            .spawn(move || {
+                // Without the ticker no budget ever fires: fail stop.
+                run_guarded(
+                    || {
+                        run_ticker(
+                            || ticker.increment_epoch(),
+                            EpochSchedule::new(std::time::Instant::now(), EPOCH_TICK),
+                            std::time::Instant::now,
+                            |until| {
+                                std::thread::sleep(
+                                    until.saturating_duration_since(std::time::Instant::now()),
+                                );
+                                true
+                            },
+                        )
+                    },
+                    || {
+                        eprintln!("[wasm] epoch ticker stopped: aborting");
+                        std::process::abort()
+                    },
+                )
+            })
+            .expect("spawn epoch ticker");
         engine
     })
+}
+
+/// Most ticks one wake-up increments. A ticker that wakes later than this
+/// (the process was stopped, e.g. a suspended laptop) forgets the excess
+/// instead of replaying it, which would trap every guest whose deadline lies
+/// within the stall at once; the cap is the longest lag a budget absorbs.
+const MAX_CATCH_UP_TICKS: u64 = 100;
+
+/// The ticker's fixed schedule: tick `n` is due at `start + n * tick`, so a
+/// late wake-up does not push the later ticks back.
+struct EpochSchedule {
+    start: std::time::Instant,
+    tick: std::time::Duration,
+    done: u64,
+}
+
+impl EpochSchedule {
+    fn new(start: std::time::Instant, tick: std::time::Duration) -> Self {
+        EpochSchedule {
+            start,
+            tick,
+            done: 0,
+        }
+    }
+
+    /// The ticks to increment at `now`: those elapsed since the last call, at
+    /// most `MAX_CATCH_UP_TICKS`; a longer backlog is dropped.
+    fn due(&mut self, now: std::time::Instant) -> u64 {
+        let elapsed =
+            (now.saturating_duration_since(self.start).as_nanos() / self.tick.as_nanos()) as u64;
+        let due = elapsed.saturating_sub(self.done);
+        if due > MAX_CATCH_UP_TICKS {
+            self.done = elapsed;
+            MAX_CATCH_UP_TICKS
+        } else {
+            self.done += due;
+            due
+        }
+    }
+
+    /// When the next tick is due.
+    fn next_due(&self) -> std::time::Instant {
+        self.start + self.tick * (self.done + 1) as u32
+    }
+}
+
+/// Calls `increment` (the engine's `increment_epoch`) from `schedule` until `sleep_until` returns false.
+/// The clock and the sleep are parameters so tests can stall the thread.
+fn run_ticker(
+    mut increment: impl FnMut(),
+    mut schedule: EpochSchedule,
+    mut now: impl FnMut() -> std::time::Instant,
+    mut sleep_until: impl FnMut(std::time::Instant) -> bool,
+) {
+    while sleep_until(schedule.next_due()) {
+        for _ in 0..schedule.due(now()) {
+            increment();
+        }
+    }
+}
+
+/// Runs `body`; if it panics, runs `on_death` (which should not return).
+fn run_guarded(body: impl FnOnce(), on_death: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err() {
+        on_death();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1807,6 +1892,112 @@ where
 
 #[cfg(test)]
 pub(crate) mod tests {
+    // -- epoch ticker ------------------------------------------------------
+
+    const T: Duration = Duration::from_millis(10);
+
+    /// Runs `run_ticker` against a virtual clock: each entry of `wakes` is the
+    /// instant (ms after start) the thread actually wakes for one sleep, so a
+    /// value past the due time is an oversleep. Returns the increments seen.
+    fn ticks_after_wakes(wakes: &[u64]) -> Vec<u64> {
+        let start = std::time::Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut queue = wakes.iter().copied();
+        let clock = std::cell::Cell::new(start);
+        let count = std::cell::Cell::new(0u64);
+        let mut seen = Vec::new();
+        let mut sleeps = 0;
+        run_ticker(
+            || count.set(count.get() + 1),
+            EpochSchedule::new(start, T),
+            || clock.get(),
+            |_| match queue.next() {
+                Some(ms) => {
+                    if sleeps > 0 {
+                        seen.push(count.get());
+                    }
+                    sleeps += 1;
+                    clock.set(at(ms));
+                    true
+                }
+                None => {
+                    seen.push(count.get());
+                    false
+                }
+            },
+        );
+        seen
+    }
+
+    /// A stalled ticker thread catches up: the epoch follows the wall clock
+    /// (elapsed / tick) instead of losing the stalled ticks.
+    #[test]
+    fn a_stalled_ticker_catches_the_epoch_up_to_the_wall_clock() {
+        // Wakes: on time (10ms), then stalled 5 ticks (60ms), then on time.
+        let seen = ticks_after_wakes(&[10, 60, 70]);
+        // seen is sampled before each following wake and at the end.
+        assert_eq!(
+            seen,
+            vec![1, 6, 7],
+            "epoch == elapsed / tick after each wake"
+        );
+    }
+
+    /// Oversleeping every tick by a little does not push later ticks back:
+    /// each sleep targets `start + n * tick`, and the count tracks elapsed.
+    #[test]
+    fn small_oversleeps_do_not_accumulate() {
+        let start = std::time::Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let count = std::cell::Cell::new(0u64);
+        let mut targets = Vec::new();
+        run_ticker(
+            || count.set(count.get() + 1),
+            EpochSchedule::new(start, T),
+            || clock.get(),
+            |target| {
+                targets.push(target);
+                // Every wake is 3ms late.
+                clock.set(target + Duration::from_millis(3));
+                targets.len() <= 100
+            },
+        );
+        for (n, target) in targets.iter().enumerate() {
+            assert_eq!(*target, start + T * (n as u32 + 1), "target {n}");
+        }
+        assert_eq!(count.get(), 100);
+    }
+
+    /// A stall longer than the cap (a suspended process) replays at most
+    /// `MAX_CATCH_UP_TICKS`, drops the rest and resumes on the fixed schedule.
+    #[test]
+    fn a_huge_backlog_is_capped_and_the_schedule_resumes() {
+        let start = std::time::Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut s = EpochSchedule::new(start, T);
+        assert_eq!(s.due(at(3_600_000)), MAX_CATCH_UP_TICKS);
+        // Nothing is owed right after, and the next tick is the next slot.
+        assert_eq!(s.due(at(3_600_000)), 0);
+        assert_eq!(s.next_due(), at(3_600_010));
+        assert_eq!(s.due(at(3_600_010)), 1);
+        // A backlog at the cap is replayed in full, not dropped.
+        let mut s = EpochSchedule::new(start, T);
+        assert_eq!(s.due(at(MAX_CATCH_UP_TICKS * 10)), MAX_CATCH_UP_TICKS);
+        assert_eq!(s.due(at(MAX_CATCH_UP_TICKS * 10 + 10)), 1);
+    }
+
+    /// A ticker thread that panics must not die silently: budgets would never
+    /// fire again.
+    #[test]
+    fn a_panicking_ticker_reports_its_death() {
+        let died = std::cell::Cell::new(false);
+        run_guarded(|| panic!("ticker bug"), || died.set(true));
+        assert!(died.get());
+        let died = std::cell::Cell::new(false);
+        run_guarded(|| (), || died.set(true));
+        assert!(!died.get());
+    }
+
     use super::*;
     use crate::pb::frame::Body;
     use crate::tunnel::testing::Peer;
