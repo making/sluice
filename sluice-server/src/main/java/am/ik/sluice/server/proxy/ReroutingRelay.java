@@ -15,6 +15,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 
 import org.jspecify.annotations.Nullable;
 
@@ -170,7 +171,10 @@ final class ReroutingRelay {
 	private boolean starting = true;
 
 	/** Serializes the writes of the shared client stream. */
-	private final Object sinkLock = new Object();
+	private final ReentrantLock sinkLock = new ReentrantLock();
+
+	/** Runs between a probe's decision and its write. */
+	private final ProbeSeam probeSeam;
 
 	/**
 	 * A malformed request was rejected: the legs relay nothing more to the client, and
@@ -193,7 +197,7 @@ final class ReroutingRelay {
 			AccessControl accessControl, ErrorResponse errorResponse, AccessLogger.Connection access,
 			MeterRegistry meterRegistry, Router.Route initialRoute, TunnelSession initialSession,
 			@Nullable InetAddress peer, ConnectionLimits.KeepAliveDeadline deadline, Duration probeInterval,
-			Runnable onFinish, Runnable release) {
+			ProbeSeam probeSeam, Runnable onFinish, Runnable release) {
 		this.pipe = pipe;
 		this.seedHead = head.bytes();
 		this.router = router;
@@ -209,6 +213,7 @@ final class ReroutingRelay {
 		this.release = release;
 		this.deadline = deadline;
 		this.probeIntervalNanos = probeInterval.toNanos();
+		this.probeSeam = probeSeam;
 		deadline.onExpiry(this::abort);
 		deadline.watchStalls(this::waitsOnClient, this::abort);
 	}
@@ -220,6 +225,11 @@ final class ReroutingRelay {
 	private boolean waitsOnClient() {
 		return this.writers.get() > 0
 				|| this.reading && this.position == Http1RequestParser.Position.IN_BODY && !this.continueAwaited;
+	}
+
+	/** Whether a thread waits to write to the client; for tests. */
+	boolean sinkAwaited() {
+		return this.sinkLock.hasQueuedThreads();
 	}
 
 	/**
@@ -336,13 +346,18 @@ final class ReroutingRelay {
 				}
 			}
 			attempted = System.nanoTime();
-			synchronized (this.sinkLock) {
+			this.sinkLock.lock();
+			try {
 				// the inbound side writes and tracks under this lock: the decision holds
 				// until the probe is written
 				if (leg.probeable()) {
+					this.probeSeam.decided(this);
 					writeToClient(PROBE, 0, PROBE.length);
 					probes++;
 				}
+			}
+			finally {
+				this.sinkLock.unlock();
 			}
 		}
 	}
@@ -432,12 +447,16 @@ final class ReroutingRelay {
 		Leg leg = this.current;
 		// the requests before the malformed one: every one relayed, but its own head
 		int before = leg == null ? 0 : leg.awaitAnswered(inBody);
-		synchronized (this.sinkLock) {
+		this.sinkLock.lock();
+		try {
 			this.rejected = true;
 			if (leg == null || leg.atResponseStart(before)) {
 				byte[] response = this.errorResponse.badRequest();
 				writeToClient(response, 0, response.length);
 			}
+		}
+		finally {
+			this.sinkLock.unlock();
 		}
 		for (Leg each : this.legs) {
 			each.close();
@@ -597,22 +616,22 @@ final class ReroutingRelay {
 	private void writeToClient(byte[] bytes, int offset, int length) {
 		OutputStream sink = this.pipe.sink();
 		this.writers.incrementAndGet();
+		this.sinkLock.lock();
 		try {
-			synchronized (this.sinkLock) {
-				for (int written = 0; written < length;) {
-					int piece = Math.min(ConnectionLimits.KeepAliveDeadline.WRITE_PIECE, length - written);
-					sink.write(bytes, offset + written, piece);
-					written += piece;
-					this.deadline.progress(piece);
-				}
-				sink.flush();
-				this.lastClientWrite = System.nanoTime();
+			for (int written = 0; written < length;) {
+				int piece = Math.min(ConnectionLimits.KeepAliveDeadline.WRITE_PIECE, length - written);
+				sink.write(bytes, offset + written, piece);
+				written += piece;
+				this.deadline.progress(piece);
 			}
+			sink.flush();
+			this.lastClientWrite = System.nanoTime();
 		}
 		catch (Exception e) {
 			throw new IllegalStateException(e);
 		}
 		finally {
+			this.sinkLock.unlock();
 			this.writers.decrementAndGet();
 		}
 	}
@@ -850,6 +869,21 @@ final class ReroutingRelay {
 	}
 
 	/**
+	 * Runs on the probing thread between a probe's decision and its write, with the
+	 * client stream's lock held; a seam for tests to hold a probe there.
+	 */
+	@FunctionalInterface
+	interface ProbeSeam {
+
+		/** Does nothing. */
+		ProbeSeam NONE = relay -> {
+		};
+
+		void decided(ReroutingRelay relay);
+
+	}
+
+	/**
 	 * A request relayed on a leg: its method, its HTTP version, and whether it asked for
 	 * an upgrade.
 	 */
@@ -867,7 +901,8 @@ final class ReroutingRelay {
 			byte[] buffer = new byte[BUFFER_SIZE];
 			int n;
 			while ((n = in.read(buffer)) > 0) {
-				synchronized (this.sinkLock) {
+				this.sinkLock.lock();
+				try {
 					if (this.rejected) {
 						return; // a malformed request ended the connection
 					}
@@ -876,12 +911,19 @@ final class ReroutingRelay {
 					this.writeToClient(buffer, 0, n);
 					tracker.data(buffer, 0, n);
 				}
+				finally {
+					this.sinkLock.unlock();
+				}
 				leg.outbound.increment(n);
 				leg.session.recordRelayed(n, StreamRelay.Direction.TO_LOCAL);
 				this.access.bytes(n, StreamRelay.Direction.TO_LOCAL);
 			}
-			synchronized (this.sinkLock) {
+			this.sinkLock.lock();
+			try {
 				tracker.ended();
+			}
+			finally {
+				this.sinkLock.unlock();
 			}
 			if (this.current == leg && !leg.replaced && !this.rejected) {
 				// the upstream of the leg in charge is gone; the client reconnects

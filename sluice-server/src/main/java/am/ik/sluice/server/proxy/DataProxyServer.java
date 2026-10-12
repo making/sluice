@@ -103,6 +103,9 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	private final ConnectionLimits limits;
 
+	/** Handed to every HTTP/1.1 relay started from now on. */
+	private volatile ReroutingRelay.ProbeSeam probeSeam = ReroutingRelay.ProbeSeam.NONE;
+
 	private volatile boolean running;
 
 	private volatile @Nullable ServerSocket serverSocket;
@@ -370,7 +373,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			}
 			ReroutingRelay rerouting = new ReroutingRelay(conn.pipe(), conn.head(), this.router, this.sessions,
 					this.accessControl, this.errorResponse, access, this.meterRegistry, route0, session, peer, deadline,
-					this.properties.limits().halfCloseProbeInterval(), relayed, release);
+					this.properties.limits().halfCloseProbeInterval(), this.probeSeam, relayed, release);
 			this.activeConnections.incrementAndGet();
 			try {
 				rerouting.start();
@@ -548,14 +551,19 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		return this.running;
 	}
 
-	/**
-	 * Number of connections currently relayed from the data plane listener.
-	 */
 	/** The meters of the h2 demux relays; for tests. */
 	H2DemuxMeters h2DemuxMeters() {
 		return this.h2DemuxMeters;
 	}
 
+	/** Sets the probe seam of the HTTP/1.1 relays started from now on; for tests. */
+	void probeSeam(ReroutingRelay.ProbeSeam probeSeam) {
+		this.probeSeam = probeSeam;
+	}
+
+	/**
+	 * Number of connections currently relayed from the data plane listener.
+	 */
 	public int activeConnections() {
 		return this.activeConnections.get();
 	}
