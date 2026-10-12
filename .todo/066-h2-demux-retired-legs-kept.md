@@ -2,10 +2,11 @@ Difficulty: Low
 
 # h2 demux: retired legs stay referenced until the connection ends
 
-Found while working on 057 (by reading, not tested). A leg whose upstream ended its side
-with no response owed retires (`Http2DemuxRelay.Leg#retire`): it closes, releases its
-slot of the connection limit (057) and its queued bytes, but stays in the relay's `legs`
-list, and its virtual connection stays in `TunnelSession.connections`: only
+Found while working on 057 (by reading, not tested). A leg whose upstream ended its side,
+failed, or made a connection error retires (`Http2DemuxRelay#endLeg`, then
+`Http2DemuxRelay.Leg#retire`; since 081 also with responses owed, and a leg its upstream's
+GOAWAY ended retires once its upstream closes): it closes, releases its slot of the
+connection limit (057) and its queued bytes, but stays in the relay's `legs` list, and its virtual connection stays in `TunnelSession.connections`: only
 `finishRelay` calls `session.remove`. A long-lived client connection that keeps reaching
 a route whose upstream closes idle h2 connections (a common idle timeout) adds one dead
 `Leg` (HPACK coder state, maps, meters) and one closed `VirtualConnection` per cycle

@@ -39,3 +39,12 @@ connection error since 082, before anything is replayed.
 Follows 081's decision: a PUSH_PROMISE from an upstream is a connection error on that
 leg only (GOAWAY `PROTOCOL_ERROR` to the upstream, its streams handled as 081 decided);
 the relay and the other legs go on. Do this after 081.
+
+Since 081: throwing `Http2DemuxRelay.UpstreamError(ERROR_PROTOCOL, ...)` from the leg's
+inbound side (`relayStreamFrame`) is all a connection error on the leg takes --
+`Http2DemuxRelay#endLeg` sends the GOAWAY, answers the leg's unanswered streams with a
+`502`, resets the ones whose response began with `INTERNAL_ERROR`, refuses the waiting
+ones. A PUSH_PROMISE on an odd stream above the highest the relay opened on the leg is
+already one (`requireOpenedOnLeg`, RFC 9113 5.1); even streams are left unchecked there
+for this todo. `H2DemuxUpstreamErrorE2ETest` shows the assertions to mirror (the upstream
+reads the GOAWAY, the client gets none, another route completes).

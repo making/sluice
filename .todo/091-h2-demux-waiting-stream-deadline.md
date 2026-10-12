@@ -43,3 +43,10 @@ User decision: the policy and the default.
   disables. Count refusals as `sluice.h2demux.streams.refused{reason=wait-timeout}`.
 - An upstream announcing a limit of 0 is covered by the same deadline.
 - Do it after 081 so the error scope matches.
+
+Since 081: a waiting stream is also refused (`REFUSED_STREAM`) when its leg ends --
+upstream closed, failed or made a connection error (`Http2DemuxRelay.Leg#fail`) -- and when
+its upstream sends a GOAWAY (`Http2DemuxRelay#onUpstreamGoAway`; a GOAWAY'd leg opens no
+waiting stream any more, `Leg#mayOpenLocked`). The deadline refusal follows the same
+pattern: marked reset (`resetLocked`), its entries dropped (`Leg#dropEntriesLocked`) and
+the RST_STREAM written as one step under the sink lock (`WriteSeam.Site.RESET`).
