@@ -15,8 +15,10 @@ verbatim relay whose client stops reading also holds its slot: the relay's write
 and nothing moves either way. A byte-level idle timeout covers that case as well, provided
 its expiry closes the transport under the blocked write (a blocking socket write takes no
 timeout) -- as `ConnectionLimits.KeepAliveDeadline` does with its teardown grace. The same
-holds for an upgraded HTTP/1.1 connection (WebSocket) and for HTTP/1.1 input the parser
-cannot follow (072), both relayed verbatim with no deadline.
+holds for an upgraded HTTP/1.1 connection (WebSocket, or a request asking for an upgrade
+whose response the relay cannot frame), relayed verbatim with no deadline.
+(HTTP/1.1 input the parser cannot follow no longer is: since 072 a malformed request is
+answered 400 and closed, and a response the relay cannot frame ends with its upstream.)
 
 ## Needs a decision
 
