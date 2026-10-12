@@ -659,15 +659,16 @@ impl NodeTask {
                 }
                 // connection frames; Advertise from the server is unexpected and
                 // keep-alive a no-op, both ignored there
-                Some(body) => connections.deliver(body).await,
+                Some(body) => connections.dispatch(body),
                 None => {}
             }
         }
     }
 }
 
-/// The Advertise opening every stream: the routes, the receive window that
-/// makes the server open windowed connections, and this binary's build.
+/// The Advertise opening every stream: the routes, the receive window the
+/// server requires (it fails the stream of a peer announcing none), and this
+/// binary's build.
 fn advertise(upstreams: Vec<Upstream>) -> Frame {
     Frame {
         body: Some(Body::Advertise(Advertise {
@@ -1081,8 +1082,8 @@ mod tests {
         );
     }
 
-    /// Without the window the server opens every connection in legacy mode,
-    /// and no other test would notice.
+    /// Without the window the server fails the stream (FAILED_PRECONDITION),
+    /// and no other test here would notice.
     #[test]
     fn the_advertise_announces_the_connection_window() {
         let Some(Body::Advertise(advertise)) = advertise(Vec::new()).body else {

@@ -4,8 +4,9 @@
 //! connection over.
 //!
 //! The flow control follows the protocol of the Java `VirtualConnection`
-//! (`sluice-proto`). A connection is windowed when the server's CONNECT
-//! announces a receive window:
+//! (`sluice-proto`). Every connection is windowed; a CONNECT without a
+//! window (a server predating the protocol) is answered with ERROR
+//! [`SERVER_WINDOW_REQUIRED`] and neither registered nor served:
 //!
 //! - the server may have at most [`WINDOW`] payload bytes in flight beyond what
 //!   this side granted back. Payload past it fails only that connection
@@ -21,10 +22,6 @@
 //! - a connection ending before the server's CLOSE / ERROR arrived sends ERROR
 //!   ("connection closed"), since the payload the server still sends would be
 //!   dropped and never granted.
-//!
-//! A CONNECT without a window (a server predating the protocol) runs the
-//! connection in legacy mode: a bounded channel, on which the receive loop
-//! waits, so one slow connection stalls the stream as before.
 
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
@@ -35,7 +32,6 @@ use std::time::Duration;
 
 use futures_util::stream::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
@@ -43,7 +39,7 @@ use crate::pb::frame::Body;
 use crate::pb::{Close, Connect, Data, Error, Frame, WindowUpdate};
 use crate::wasm_host::{self, Handler};
 
-/// Receive window of every windowed connection, announced in `Advertise`;
+/// Receive window of every connection, announced in `Advertise`;
 /// the Java side's `VirtualConnection.DEFAULT_WINDOW`.
 pub const WINDOW: u32 = 1024 * 1024;
 
@@ -51,8 +47,7 @@ pub const WINDOW: u32 = 1024 * 1024;
 /// `VirtualConnection.WINDOW_EXCEEDED`.
 pub const WINDOW_EXCEEDED: &str = "flow control window exceeded";
 
-/// ERROR message of a windowed connection ending while the server may still
-/// send.
+/// ERROR message of a connection ending while the server may still send.
 pub const CONNECTION_CLOSED: &str = "connection closed";
 
 /// Failure of every connection still registered when the stream ends.
@@ -62,17 +57,23 @@ const STREAM_CLOSED: &str = "tunnel stream closed";
 /// `ConnectionLimit.LIMIT_REACHED`.
 pub const LIMIT_REACHED: &str = "connection limit reached";
 
+/// ERROR message answering a CONNECT that announces no receive window (a
+/// server predating per-connection flow control); the Java side's
+/// `NodeConnection.SERVER_WINDOW_REQUIRED`.
+pub const SERVER_WINDOW_REQUIRED: &str = "the server announced no per-connection receive window \
+     (Connect.connection_window); this client requires sluice-server 046cd21 (2026-10-12) or later";
+
 /// Read error of a connection the server failed.
 const ABORTED: &str = "connection aborted by the tunnel peer";
 
 /// Upper bound for a single DATA frame emitted by the hyper write path.
 const CHUNK: usize = 16 * 1024;
 
-/// The most payload one receive segment of a windowed connection holds;
+/// The most payload one receive segment holds;
 /// the Java side's `VirtualConnection.SEGMENT_SIZE`.
 const SEGMENT: usize = 16 * 1024;
 
-/// The most segments the inbox of a windowed connection with `window` holds:
+/// The most segments the inbox of a connection with `window` holds:
 /// segments smaller than [`SEGMENT`] at least double one after another, so at
 /// most log2([`SEGMENT`]) of them; every full-size one but the head and the
 /// tail holds only unread payload, which the window bounds.
@@ -81,26 +82,12 @@ const fn max_segments(window: usize) -> usize {
     window / SEGMENT + SEGMENT.trailing_zeros() as usize + 2
 }
 
-/// Legacy connections: frames buffered before the receive loop waits for
-/// the connection's reader.
-const LEGACY_BUFFER: usize = 32;
-
 /// DATA frames one connection may have queued on the outbound stream; its
 /// writer waits beyond it. 16 x [`CHUNK`] = 256KiB.
 pub(crate) const DATA_QUEUE_CAPACITY: usize = 16;
 
 /// Write error after the connection's CLOSE or ERROR was queued.
 const WRITE_CLOSED: &str = "connection closed for writing";
-
-/// Downstream control for one legacy connection, consumed by its reader.
-pub enum Ctrl {
-    /// Bytes to write into the connection (hyper's read side).
-    Payload(Vec<u8>),
-    /// The server half-closed: no more tunnel -> hyper data.
-    WriteClose,
-    /// The server failed the connection: tear it down.
-    Abort,
-}
 
 // ---------------------------------------------------------------------------
 // Outbound
@@ -411,7 +398,7 @@ fn close_frame(conn_id: i64) -> Frame {
 // Connection limit
 
 /// A cap on the connections open at once over every stream of the process.
-/// A windowed connection buffers at most [`WINDOW`] of the server's payload
+/// A connection buffers at most [`WINDOW`] of the server's payload
 /// in at most `max_segments` segments of its [`Inbox`], and
 /// [`DATA_QUEUE_CAPACITY`] outbound DATA frames, so the cap bounds the total.
 pub struct Limit {
@@ -460,7 +447,7 @@ impl Drop for Permit {
 
 /// State shared by the dispatch and the connection's reader / writer.
 struct Flow {
-    /// Receive window announced to the server; 0 = legacy connection.
+    /// Receive window announced to the server.
     window: u32,
     state: Mutex<FlowState>,
     /// Cancelled once the connection failed: the server's ERROR or a local
@@ -470,9 +457,9 @@ struct Flow {
 
 #[derive(Default)]
 struct FlowState {
-    /// Payload the server still accepts (windowed).
+    /// Payload the server still accepts.
     credit: u64,
-    /// Payload received minus payload granted back (windowed).
+    /// Payload received minus payload granted back.
     outstanding: u64,
     /// The server sent CLOSE.
     remote_closed: bool,
@@ -487,14 +474,14 @@ struct FlowState {
     error_sent: bool,
     /// The writer waiting for credit.
     writer: Option<Waker>,
-    /// The server's payload not yet read (windowed).
+    /// The server's payload not yet read.
     inbox: Inbox,
     /// How the inbound stream ends once the inbox is read: the server's first
-    /// CLOSE or ERROR (windowed). Payload after it is dropped.
+    /// CLOSE or ERROR. Payload after it is dropped.
     remote_end: Option<RemoteEnd>,
-    /// The reader waiting for payload or the end (windowed).
+    /// The reader waiting for payload or the end.
     reader: Option<Waker>,
-    /// Test hook: the times the reader waited (windowed).
+    /// Test hook: the times the reader waited.
     #[cfg(test)]
     reader_waits: usize,
 }
@@ -505,7 +492,7 @@ enum RemoteEnd {
     Failed,
 }
 
-/// The payload of a windowed connection in arrival order, in segments of at
+/// The payload of a connection in arrival order, in segments of at
 /// most [`SEGMENT`]: small frames are coalesced and large ones split, so
 /// neither the per-segment overhead nor the read part of the head segment
 /// grows with the way the server frames its payload. At most
@@ -613,16 +600,12 @@ impl Flow {
         }
     }
 
-    fn windowed(&self) -> bool {
-        self.window > 0
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, FlowState> {
         self.state.lock().unwrap()
     }
 
     /// Accounts received payload against the window and queues it in the
-    /// inbox (windowed only). Payload after the server's CLOSE is dropped; an
+    /// inbox. Payload after the server's CLOSE is dropped; an
     /// empty payload ends the reader after the inbox, as on the Java side. A
     /// violation resets the connection, drops the inbox and wakes the reader
     /// and the writer.
@@ -731,26 +714,9 @@ impl Flow {
 // ---------------------------------------------------------------------------
 // Registry and dispatch
 
-struct Conn {
-    /// The channel of a legacy connection; a windowed one queues in its
-    /// flow's inbox.
-    legacy: Option<mpsc::Sender<Ctrl>>,
-    flow: Arc<Flow>,
-}
-
-/// conn id -> registered connection; one per stream attempt, since conn ids
-/// are the server's.
-type Registry = Arc<Mutex<HashMap<i64, Conn>>>;
-
-/// A send on a legacy connection's bounded channel; the receive loop awaits
-/// it after the dispatch returned.
-pub struct Deferred(mpsc::Sender<Ctrl>, Ctrl);
-
-impl Deferred {
-    async fn run(self) {
-        let _ = self.0.send(self.1).await;
-    }
-}
+/// conn id -> the flow state of a registered connection; one per stream
+/// attempt, since conn ids are the server's.
+type Registry = Arc<Mutex<HashMap<i64, Arc<Flow>>>>;
 
 /// The virtual connections of one stream attempt.
 pub struct Connections {
@@ -761,6 +727,9 @@ pub struct Connections {
     routes: Arc<HashMap<String, Arc<Handler>>>,
     registry: Registry,
     limit: Arc<Limit>,
+    /// Test hook: the CONNECTs rejected for announcing no window.
+    #[cfg(test)]
+    windowless_rejections: AtomicUsize,
 }
 
 impl Connections {
@@ -776,67 +745,62 @@ impl Connections {
             routes,
             registry: Registry::default(),
             limit,
+            #[cfg(test)]
+            windowless_rejections: AtomicUsize::new(0),
         }
     }
 
-    /// Hands one connection frame of the server to its connection. Waits
-    /// only for a legacy connection's reader; never for a windowed one.
-    pub async fn deliver(&self, body: Body) {
-        if let Some(deferred) = self.dispatch(body) {
-            deferred.run().await;
-        }
-    }
-
-    /// Routes one frame to its connection. A plain function: it cannot await,
-    /// so a slow connection never stalls the receive loop here; keep it
-    /// non-`async`. The legacy channel's send is returned for the caller.
-    fn dispatch(&self, body: Body) -> Option<Deferred> {
+    /// Routes one connection frame of the server to its connection. A plain
+    /// function: it cannot await, so a slow connection never stalls the
+    /// receive loop here; keep it non-`async`.
+    pub fn dispatch(&self, body: Body) {
         match body {
-            Body::Connect(connect) => {
-                self.connect(connect);
-                None
-            }
+            Body::Connect(connect) => self.connect(connect),
             Body::Data(data) => self.data(data),
             Body::Close(close) => {
-                let (legacy, flow) = self.lookup(close.conn_id)?;
-                if !flow.remote_close() {
-                    return None;
+                if let Some(flow) = self.lookup(close.conn_id) {
+                    flow.remote_close();
                 }
-                legacy.map(|tx| Deferred(tx, Ctrl::WriteClose))
             }
             Body::Error(error) => {
                 println!(
                     "[{}] conn {} failed: {}",
                     self.key, error.conn_id, error.message
                 );
-                let (legacy, flow) = self.lookup(error.conn_id)?;
-                if !flow.remote_fail(&error.message) {
-                    return None;
+                if let Some(flow) = self.lookup(error.conn_id)
+                    && flow.remote_fail(&error.message)
+                {
+                    self.outbound.wake_writer(error.conn_id);
                 }
-                self.outbound.wake_writer(error.conn_id);
-                legacy.map(|tx| Deferred(tx, Ctrl::Abort))
             }
             Body::WindowUpdate(update) => {
-                // ignored for unknown and legacy connections, as on the Java side
-                if let Some((_, flow)) = self.lookup(update.conn_id)
-                    && flow.windowed()
-                {
+                // ignored for unknown connections, as on the Java side
+                if let Some(flow) = self.lookup(update.conn_id) {
                     flow.grant(update.increment);
                 }
-                None
             }
             // session frames are the receive loop's; KeepAlive is a no-op
-            _ => None,
+            _ => {}
         }
     }
 
-    fn lookup(&self, conn_id: i64) -> Option<(Option<mpsc::Sender<Ctrl>>, Arc<Flow>)> {
-        let registry = self.registry.lock().unwrap();
-        let conn = registry.get(&conn_id)?;
-        Some((conn.legacy.clone(), conn.flow.clone()))
+    fn lookup(&self, conn_id: i64) -> Option<Arc<Flow>> {
+        self.registry.lock().unwrap().get(&conn_id).cloned()
     }
 
     fn connect(&self, connect: Connect) {
+        if connect.connection_window == 0 {
+            // neither registered nor served, like a CONNECT beyond the limit
+            eprintln!(
+                "[{}] {SERVER_WINDOW_REQUIRED}; rejecting conn {}",
+                self.key, connect.conn_id
+            );
+            #[cfg(test)]
+            self.windowless_rejections.fetch_add(1, Ordering::AcqRel);
+            self.outbound
+                .control(error_frame(connect.conn_id, SERVER_WINDOW_REQUIRED));
+            return;
+        }
         let Some(handler) = self.routes.get(&connect.address) else {
             self.outbound.control(error_frame(
                 connect.conn_id,
@@ -855,11 +819,10 @@ impl Connections {
         tokio::spawn(wasm_host::serve(io, handler.clone()));
     }
 
-    fn data(&self, data: Data) -> Option<Deferred> {
-        let (legacy, flow) = self.lookup(data.conn_id)?;
-        if let Some(tx) = legacy {
-            return Some(Deferred(tx, Ctrl::Payload(data.payload)));
-        }
+    fn data(&self, data: Data) {
+        let Some(flow) = self.lookup(data.conn_id) else {
+            return;
+        };
         match flow.receive(data.payload) {
             Receive::Accept | Receive::Drop => {}
             Receive::Exceeded => {
@@ -870,38 +833,27 @@ impl Connections {
                 self.registry.lock().unwrap().remove(&data.conn_id);
             }
         }
-        None
     }
 
-    /// Registers a connection and returns the byte stream hyper serves it
-    /// over. `server_window` > 0 makes it windowed, with that initial credit.
+    /// Registers a connection with the server's window as its initial credit
+    /// and returns the byte stream hyper serves it over.
     fn register(&self, conn_id: i64, server_window: u32) -> TunnelIo {
-        let (tx, rx, flow) = if server_window > 0 {
-            (None, None, Flow::new(WINDOW, u64::from(server_window)))
-        } else {
-            let (tx, rx) = mpsc::channel(LEGACY_BUFFER);
-            (Some(tx), Some(rx), Flow::new(0, 0))
-        };
-        let flow = Arc::new(flow);
-        self.registry.lock().unwrap().insert(
-            conn_id,
-            Conn {
-                legacy: tx,
-                flow: flow.clone(),
-            },
-        );
+        let flow = Arc::new(Flow::new(WINDOW, u64::from(server_window)));
+        self.registry.lock().unwrap().insert(conn_id, flow.clone());
         TunnelIo {
             conn_id,
-            legacy: rx,
             outbound: self.outbound.clone(),
             flow,
             registry: self.registry.clone(),
-            buf: bytes::BytesMut::new(),
-            eof: false,
             consumed: 0,
             permit: None,
-            aborted: false,
         }
+    }
+
+    /// Test hook: the CONNECTs rejected for announcing no window.
+    #[cfg(test)]
+    pub(crate) fn windowless_rejections(&self) -> usize {
+        self.windowless_rejections.load(Ordering::Acquire)
     }
 
     /// The stream ended: fails every connection without waiting and ends the
@@ -909,8 +861,8 @@ impl Connections {
     /// is sent.
     pub fn teardown(&self) {
         let drained: Vec<_> = self.registry.lock().unwrap().drain().collect();
-        for (_, conn) in drained {
-            conn.flow.reset(STREAM_CLOSED);
+        for (_, flow) in drained {
+            flow.reset(STREAM_CLOSED);
         }
         // after the resets: the writers it wakes see the connection's failure
         self.outbound.shutdown();
@@ -920,27 +872,18 @@ impl Connections {
 // ---------------------------------------------------------------------------
 // Tunnel <-> hyper byte stream adapter
 
-/// AsyncRead/AsyncWrite over one virtual connection: reads take the inbox
-/// (windowed) or `Ctrl` messages (legacy), writes emit DATA frames (against
-/// the server's credit when windowed).
+/// AsyncRead/AsyncWrite over one virtual connection: reads take the inbox,
+/// writes emit DATA frames against the server's credit.
 pub struct TunnelIo {
     conn_id: i64,
-    /// The channel of a legacy connection.
-    legacy: Option<mpsc::Receiver<Ctrl>>,
     outbound: Outbound,
     flow: Arc<Flow>,
     registry: Registry,
-    /// Legacy: the payload pulled from the channel, handed to hyper first.
-    buf: bytes::BytesMut,
-    /// Legacy: the server's CLOSE was read.
-    eof: bool,
-    /// Bytes handed to hyper and not yet granted back (windowed).
+    /// Bytes handed to hyper and not yet granted back.
     consumed: u64,
     /// The connection's slot of the connection limit, until `ending` takes
     /// it.
     permit: Option<Permit>,
-    /// Legacy: `fill` consumed the server's abort.
-    aborted: bool,
 }
 
 impl TunnelIo {
@@ -948,24 +891,14 @@ impl TunnelIo {
         self.conn_id
     }
 
-    /// The bytes received and not yet read: the inbox (windowed) or what
-    /// `fill` pulled (legacy).
+    /// The bytes received and not yet read.
     pub fn buffered(&self) -> usize {
-        if self.legacy.is_some() {
-            self.buf.len()
-        } else {
-            self.flow.lock().inbox.len()
-        }
+        self.flow.lock().inbox.len()
     }
 
-    /// Whether the unread bytes start with `prefix`; across frames when
-    /// windowed.
+    /// Whether the unread bytes start with `prefix`, across frames.
     pub fn peek_prefix(&self, prefix: &[u8]) -> bool {
-        if self.legacy.is_some() {
-            self.buf.starts_with(prefix)
-        } else {
-            self.flow.lock().inbox.starts_with(prefix)
-        }
+        self.flow.lock().inbox.starts_with(prefix)
     }
 
     /// Resolves once the connection failed: the server's ERROR, payload past
@@ -975,32 +908,13 @@ impl TunnelIo {
         self.flow.failed.clone().cancelled_owned()
     }
 
-    /// Waits for unread bytes (windowed; they stay in the inbox) or pulls one
-    /// control message into the buffer (legacy); false on close/abort.
+    /// Waits for unread bytes, which stay in the inbox; false at the end
+    /// (the server's CLOSE or ERROR, or a reset).
     pub async fn fill(&mut self) -> bool {
-        let Some(rx) = self.legacy.as_mut() else {
-            return std::future::poll_fn(|cx| self.poll_fill(cx)).await;
-        };
-        match std::future::poll_fn(|cx| rx.poll_recv(cx)).await {
-            Some(Ctrl::Payload(data)) => {
-                self.buf.extend_from_slice(&data);
-                true
-            }
-            Some(Ctrl::WriteClose) => {
-                self.eof = true;
-                false
-            }
-            Some(Ctrl::Abort) => {
-                // remembered: the reader after the sniff must fail, not wait for
-                // frames that never come
-                self.aborted = true;
-                false
-            }
-            None => false,
-        }
+        std::future::poll_fn(|cx| self.poll_fill(cx)).await
     }
 
-    /// Windowed `fill`: true once the inbox holds bytes, false at the end.
+    /// `fill`: true once the inbox holds bytes, false at the end.
     fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
         let mut state = self.flow.lock();
         if state.reset {
@@ -1028,16 +942,8 @@ impl TunnelIo {
         }
     }
 
-    /// Hands up to `buf.remaining()` buffered bytes to hyper (legacy).
-    fn hand_off(&mut self, buf: &mut ReadBuf<'_>) {
-        let n = self.buf.len().min(buf.remaining());
-        let data = self.buf.split_to(n);
-        buf.put_slice(&data);
-        self.consumed(n);
-    }
-
-    /// Windowed read: the inbox, then the end.
-    fn poll_read_windowed(
+    /// The read: the inbox, then the end.
+    fn poll_inbox(
         &mut self,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
@@ -1098,9 +1004,6 @@ impl TunnelIo {
     /// Grants the consumed bytes back once they reach half the window. The
     /// grant goes on the control queue: it never waits.
     fn consumed(&mut self, n: usize) {
-        if !self.flow.windowed() {
-            return;
-        }
         self.consumed += n as u64;
         if self.consumed < u64::from(self.flow.window / 2) {
             return;
@@ -1144,44 +1047,7 @@ impl AsyncRead for TunnelIo {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let this = &mut *self;
-        let Some(rx) = this.legacy.as_mut() else {
-            return this.poll_read_windowed(cx, buf);
-        };
-        if let Some(failure) = this.flow.reset_failure() {
-            return Poll::Ready(Err(std::io::Error::other(failure)));
-        }
-        if this.aborted && this.buf.is_empty() {
-            return Poll::Ready(Err(std::io::Error::other(ABORTED)));
-        }
-        if !this.buf.is_empty() {
-            this.hand_off(buf);
-            return Poll::Ready(Ok(()));
-        }
-        if this.eof {
-            // Unfilled ReadBuf on return signals EOF to hyper.
-            return Poll::Ready(Ok(()));
-        }
-        match rx.poll_recv(cx) {
-            Poll::Ready(Some(Ctrl::Payload(data))) => {
-                this.buf.extend_from_slice(&data);
-                this.hand_off(buf);
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Some(Ctrl::WriteClose)) => {
-                this.eof = true;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Some(Ctrl::Abort)) => Poll::Ready(Err(std::io::Error::other(ABORTED))),
-            Poll::Ready(None) => match this.flow.reset_failure() {
-                Some(failure) => Poll::Ready(Err(std::io::Error::other(failure))),
-                None => {
-                    this.eof = true;
-                    Poll::Ready(Ok(()))
-                }
-            },
-            Poll::Pending => Poll::Pending,
-        }
+        self.poll_inbox(cx, buf)
     }
 }
 
@@ -1192,16 +1058,15 @@ impl AsyncWrite for TunnelIo {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = &mut *self;
-        let windowed = this.flow.windowed();
         {
             let mut state = this.flow.lock();
-            if windowed && let Some(failure) = &state.failure {
+            if let Some(failure) = &state.failure {
                 return Poll::Ready(Err(std::io::Error::other(failure.clone())));
             }
             if state.close_sent || state.error_sent {
                 return Poll::Ready(Err(std::io::Error::other(WRITE_CLOSED)));
             }
-            if windowed && state.credit == 0 {
+            if state.credit == 0 {
                 // a grant, the server's ERROR or the teardown wakes it
                 state.writer = Some(cx.waker().clone());
                 return Poll::Pending;
@@ -1214,7 +1079,7 @@ impl AsyncWrite for TunnelIo {
             }
             Poll::Pending => return Poll::Pending,
         }
-        let n = if windowed {
+        let n = {
             let mut state = this.flow.lock();
             if let Some(failure) = &state.failure {
                 return Poll::Ready(Err(std::io::Error::other(failure.clone())));
@@ -1223,8 +1088,6 @@ impl AsyncWrite for TunnelIo {
             let n = buf.len().min(CHUNK).min(state.credit as usize);
             state.credit -= n as u64;
             n
-        } else {
-            buf.len().min(CHUNK)
         };
         this.outbound.data(
             this.conn_id,
@@ -1260,8 +1123,8 @@ pub struct Ending {
 
 impl Ending {
     /// Unregisters the connection and queues its terminal frame after its
-    /// DATA, without waiting: ERROR ("connection closed") for a windowed
-    /// connection the server may still send on, else CLOSE unless one went
+    /// DATA, without waiting: ERROR ("connection closed") for a connection
+    /// the server may still send on, else CLOSE unless one went
     /// out (hyper skips its shutdown on an error). The connection's slot is
     /// freed once its queued frames left.
     pub fn finish(mut self) {
@@ -1272,7 +1135,7 @@ impl Ending {
             state.inbox.clear();
             if state.reset || state.error_sent {
                 None
-            } else if self.flow.window > 0 && !state.remote_closed && !state.remote_failed {
+            } else if !state.remote_closed && !state.remote_failed {
                 state.error_sent = true;
                 Some(error_frame(self.conn_id, CONNECTION_CLOSED))
             } else if !state.close_sent {
@@ -1323,35 +1186,31 @@ pub(crate) mod testing {
             }
         }
 
-        /// One frame from the server, delivered with the receive loop's
-        /// semantics.
-        pub(crate) async fn send(&self, body: Body) {
-            self.connections.deliver(body).await;
+        /// One frame from the server, dispatched as the receive loop does.
+        pub(crate) fn send(&self, body: Body) {
+            self.connections.dispatch(body);
         }
 
-        pub(crate) async fn connect(&self, conn_id: i64, address: &str, window: u32) {
+        pub(crate) fn connect(&self, conn_id: i64, address: &str, window: u32) {
             self.send(Body::Connect(Connect {
                 conn_id,
                 address: address.into(),
                 connection_window: window,
-            }))
-            .await;
+            }));
         }
 
-        pub(crate) async fn data(&self, conn_id: i64, payload: &[u8]) {
+        pub(crate) fn data(&self, conn_id: i64, payload: &[u8]) {
             self.send(Body::Data(Data {
                 conn_id,
                 payload: payload.to_vec(),
-            }))
-            .await;
+            }));
         }
 
-        pub(crate) async fn error(&self, conn_id: i64, message: &str) {
+        pub(crate) fn error(&self, conn_id: i64, message: &str) {
             self.send(Body::Error(Error {
                 conn_id,
                 message: message.into(),
-            }))
-            .await;
+            }));
         }
 
         /// The DATA frames queued for `conn_id`.
@@ -1425,16 +1284,12 @@ mod tests {
         })
     }
 
-    /// Feeds `total` bytes to `conn_id` in 16KiB frames (more frames than a
-    /// bounded channel would buffer); panics when the receive loop would
-    /// wait.
-    async fn feed(peer: &Peer, conn_id: i64, total: usize) {
+    /// Feeds `total` bytes to `conn_id` in 16KiB frames.
+    fn feed(peer: &Peer, conn_id: i64, total: usize) {
         let mut left = total;
         while left > 0 {
             let n = left.min(CHUNK);
-            tokio::time::timeout(Duration::from_secs(1), peer.send(data_body(conn_id, n)))
-                .await
-                .expect("the receive loop never waits on a windowed connection");
+            peer.send(data_body(conn_id, n));
             left -= n;
         }
     }
@@ -1474,8 +1329,8 @@ mod tests {
         let mut served = peer.connections.register(2, WINDOW);
 
         // conn 1 takes its whole window while its reader never polls
-        feed(&peer, 1, WINDOW as usize).await;
-        feed(&peer, 2, 5).await;
+        feed(&peer, 1, WINDOW as usize);
+        feed(&peer, 2, 5);
 
         let received = tokio::time::timeout(Duration::from_secs(1), read_exact(&mut served, 5))
             .await
@@ -1489,13 +1344,13 @@ mod tests {
         let mut peer = peer();
         let mut violated = peer.connections.register(1, WINDOW);
         let mut other = peer.connections.register(2, WINDOW);
-        feed(&peer, 1, WINDOW as usize).await;
+        feed(&peer, 1, WINDOW as usize);
         assert!(
             drain_frames(&mut peer).await.is_empty(),
             "a full window is no violation"
         );
 
-        feed(&peer, 1, 1).await;
+        feed(&peer, 1, 1);
 
         let frames = drain_frames(&mut peer).await;
         assert!(
@@ -1516,8 +1371,8 @@ mod tests {
         assert_eq!(error.to_string(), WINDOW_EXCEEDED);
 
         // later payload is dropped, not counted again; conn 2 is unaffected
-        feed(&peer, 1, 64 * 1024).await;
-        feed(&peer, 2, 3).await;
+        feed(&peer, 1, 64 * 1024);
+        feed(&peer, 2, 3);
         assert_eq!(read_exact(&mut other, 3).await.unwrap(), vec![0x5a; 3]);
         assert!(drain_frames(&mut peer).await.is_empty(), "a single ERROR");
     }
@@ -1538,8 +1393,7 @@ mod tests {
         peer.send(Body::WindowUpdate(WindowUpdate {
             conn_id: 1,
             increment: 4,
-        }))
-        .await;
+        }));
         assert_eq!(
             wakes.0.load(Ordering::SeqCst),
             1,
@@ -1572,7 +1426,7 @@ mod tests {
         ));
         assert!(poll_write(&mut io, &waker, b"b").is_pending());
 
-        peer.error(1, "public peer reset").await;
+        peer.error(1, "public peer reset");
 
         assert_eq!(
             wakes.0.load(Ordering::SeqCst),
@@ -1629,7 +1483,7 @@ mod tests {
         let mut peer = peer();
         let mut io = peer.connections.register(1, WINDOW);
         let half = WINDOW as usize / 2;
-        feed(&peer, 1, WINDOW as usize).await;
+        feed(&peer, 1, WINDOW as usize);
 
         read_exact(&mut io, half - 1).await.unwrap();
         assert!(
@@ -1642,69 +1496,11 @@ mod tests {
         assert_eq!(grants(&drain_frames(&mut peer).await), vec![WINDOW / 2]);
 
         // what was granted may be sent again: the window is open, no violation
-        feed(&peer, 1, WINDOW as usize).await;
+        feed(&peer, 1, WINDOW as usize);
         read_exact(&mut io, half).await.unwrap();
         read_exact(&mut io, half).await.unwrap();
         let frames = drain_frames(&mut peer).await;
         assert_eq!(grants(&frames), vec![WINDOW / 2, WINDOW / 2], "{frames:?}");
-    }
-
-    #[tokio::test]
-    async fn a_legacy_connection_neither_grants_nor_enforces_a_window() {
-        let mut peer = peer();
-        let mut io = peer.connections.register(1, 0);
-        let total = 4 * WINDOW as usize;
-        let reader = tokio::spawn(async move {
-            let received = read_exact(&mut io, total).await.map(|bytes| bytes.len());
-            (io, received)
-        });
-        // the receive loop waits for the reader here (legacy backpressure)
-        let mut left = total;
-        while left > 0 {
-            let n = left.min(64 * 1024);
-            peer.send(data_body(1, n)).await;
-            left -= n;
-        }
-        let (_io, received) = reader.await.unwrap();
-        assert_eq!(received.unwrap(), total);
-        assert!(
-            drain_frames(&mut peer).await.is_empty(),
-            "no WindowUpdate, no ERROR"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_legacy_connection_backpressures_the_receive_loop() {
-        let peer = peer();
-        let _never_read = peer.connections.register(1, 0);
-        for _ in 0..LEGACY_BUFFER {
-            peer.send(data_body(1, 1)).await;
-        }
-        let waited = tokio::time::timeout(Duration::from_millis(200), peer.send(data_body(1, 1)))
-            .await
-            .is_err();
-        assert!(waited, "the bounded channel is kept for legacy peers");
-    }
-
-    #[tokio::test]
-    async fn a_legacy_write_ignores_credit() {
-        let mut peer = peer();
-        peer.auto_grant = false;
-        let mut io = peer.connections.register(1, 0);
-        // two windows' worth, never granted: no credit applies
-        for _ in 0..(2 * WINDOW as usize / CHUNK) {
-            let written = tokio::time::timeout(
-                Duration::from_secs(1),
-                std::future::poll_fn(|cx| Pin::new(&mut io).poll_write(cx, &[0; 64 * 1024])),
-            )
-            .await
-            .expect("no credit wait");
-            assert_eq!(written.unwrap(), CHUNK);
-            assert!(matches!(
-                peer.recv().await.and_then(|frame| frame.body),
-                Some(Body::Data(data)) if data.payload.len() == CHUNK
-            ));
-        }
     }
 
     #[tokio::test]
@@ -1844,12 +1640,11 @@ mod tests {
             Arc::default(),
             Limit::new(usize::MAX),
         );
-        let dispatched = connections.dispatch(Body::Connect(Connect {
+        connections.dispatch(Body::Connect(Connect {
             conn_id: 7,
             address: "wasm:missing".into(),
             connection_window: WINDOW,
         }));
-        assert!(dispatched.is_none());
         use futures_util::StreamExt as _;
         let first = frames.next().await.unwrap();
         assert!(
@@ -1869,18 +1664,6 @@ mod tests {
         drop(first);
         assert_eq!(limit.open(), 1);
         assert!(limit.try_acquire().is_some());
-    }
-
-    #[tokio::test]
-    async fn teardown_never_waits_on_a_full_legacy_channel() {
-        let peer = peer();
-        let mut io = peer.connections.register(1, 0);
-        for _ in 0..LEGACY_BUFFER {
-            peer.send(data_body(1, 1)).await;
-        }
-        peer.connections.teardown();
-        let error = read_exact(&mut io, 1).await.unwrap_err();
-        assert_eq!(error.to_string(), STREAM_CLOSED);
     }
 
     async fn finish(mut io: TunnelIo) {
@@ -1911,7 +1694,7 @@ mod tests {
     async fn a_windowed_connection_ending_after_the_servers_close_sends_close() {
         let mut peer = peer();
         let io = peer.connections.register(1, WINDOW);
-        peer.send(Body::Close(Close { conn_id: 1 })).await;
+        peer.send(Body::Close(Close { conn_id: 1 }));
         finish(io).await;
         let frames = drain_frames(&mut peer).await;
         assert!(matches!(&frames[..], [Body::Close(_)]), "{frames:?}");
@@ -1921,21 +1704,22 @@ mod tests {
     async fn a_windowed_connection_ending_after_the_servers_error_sends_no_error() {
         let mut peer = peer();
         let io = peer.connections.register(1, WINDOW);
-        peer.error(1, "gone").await;
+        peer.error(1, "gone");
         finish(io).await;
         let frames = drain_frames(&mut peer).await;
         assert!(matches!(&frames[..], [Body::Close(_)]), "{frames:?}");
     }
 
     #[tokio::test]
-    async fn a_legacy_connection_ending_sends_close_once() {
+    async fn a_connection_shut_down_twice_sends_close_once() {
         let mut peer = peer();
-        let mut io = peer.connections.register(1, 0);
+        let mut io = peer.connections.register(1, WINDOW);
         for _ in 0..2 {
             std::future::poll_fn(|cx| Pin::new(&mut io).poll_shutdown(cx))
                 .await
                 .unwrap();
         }
+        peer.send(Body::Close(Close { conn_id: 1 }));
         finish(io).await;
         let frames = drain_frames(&mut peer).await;
         assert!(matches!(&frames[..], [Body::Close(_)]), "{frames:?}");
@@ -2227,11 +2011,9 @@ mod tests {
     #[tokio::test]
     async fn a_writer_waiting_at_its_cap_fails_with_its_connection() {
         let peer = peer();
-        let mut ios: Vec<_> = [WINDOW, WINDOW, 0, WINDOW]
-            .into_iter()
-            .enumerate()
-            .map(|(i, window)| {
-                let mut io = peer.connections.register(i as i64 + 1, window);
+        let mut ios: Vec<_> = (0..4)
+            .map(|i| {
+                let mut io = peer.connections.register(i as i64 + 1, WINDOW);
                 let (wakes, waker) = counting_waker();
                 assert_eq!(
                     fill_until_pending(&mut io, &waker),
@@ -2253,18 +2035,18 @@ mod tests {
             }
         };
 
-        peer.error(1, "public peer reset").await;
+        peer.error(1, "public peer reset");
         assert_eq!(woken(&ios), [1, 0, 0, 0], "the server's ERROR");
         assert_eq!(failure(0, &mut ios), "public peer reset");
 
-        feed(&peer, 2, WINDOW as usize + 1).await;
+        feed(&peer, 2, WINDOW as usize + 1);
         assert_eq!(woken(&ios), [1, 1, 0, 0], "the violation");
         assert_eq!(failure(1, &mut ios), WINDOW_EXCEEDED);
 
         peer.connections.teardown();
         assert_eq!(woken(&ios), [1, 1, 1, 1], "the teardown");
-        assert_eq!(failure(2, &mut ios), STREAM_CLOSED, "legacy");
-        assert_eq!(failure(3, &mut ios), STREAM_CLOSED, "windowed");
+        assert_eq!(failure(2, &mut ios), STREAM_CLOSED);
+        assert_eq!(failure(3, &mut ios), STREAM_CLOSED);
     }
 
     /// gRPC dropping the request stream ends it like the teardown: the
@@ -2366,7 +2148,7 @@ mod tests {
         // nothing queued: freed at once
         let mut io = peer.connections.register(2, WINDOW);
         io.permit = limit.try_acquire();
-        peer.error(2, "gone").await;
+        peer.error(2, "gone");
         let closed = Pin::new(&mut io).poll_shutdown(&mut Context::from_waker(&waker));
         assert!(matches!(closed, Poll::Ready(Ok(()))));
         drain_frames(&mut peer).await;
@@ -2412,7 +2194,7 @@ mod tests {
         let mut io = peer.connections.register(1, WINDOW);
         let window = WINDOW as usize;
         for i in 0..window {
-            peer.data(1, &stream_bytes(i, 1)).await;
+            peer.data(1, &stream_bytes(i, 1));
         }
         assert!(
             drain_frames(&mut peer).await.is_empty(),
@@ -2439,7 +2221,7 @@ mod tests {
                 break;
             }
             let size = (*size).min(window - accepted);
-            peer.data(1, &stream_bytes(accepted, size)).await;
+            peer.data(1, &stream_bytes(accepted, size));
             accepted += size;
         }
         assert!(
@@ -2461,7 +2243,7 @@ mod tests {
         let mut io = peer.connections.register(1, WINDOW);
         let window = WINDOW as usize;
         let half = window / 2;
-        peer.data(1, &stream_bytes(0, window)).await;
+        peer.data(1, &stream_bytes(0, window));
         assert_eq!(
             read_exact(&mut io, half).await.unwrap(),
             stream_bytes(0, half)
@@ -2471,7 +2253,7 @@ mod tests {
             vec![WINDOW / 2],
             "precondition: half the window granted back"
         );
-        peer.data(1, &stream_bytes(window, half)).await;
+        peer.data(1, &stream_bytes(window, half));
         assert!(
             drain_frames(&mut peer).await.is_empty(),
             "precondition: no violation"
@@ -2499,7 +2281,7 @@ mod tests {
                     seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                     let bound = if seed >> 63 == 0 { 16 } else { 40_000 };
                     let size = (1 + (seed >> 33) as usize % bound).min(total - sent);
-                    peer.data(1, &stream_bytes(sent, size)).await;
+                    peer.data(1, &stream_bytes(sent, size));
                     sent += size;
                     // paced, so the reader catches up and waits for frames
                     tokio::time::sleep(Duration::from_micros(200)).await;
@@ -2530,12 +2312,12 @@ mod tests {
             start.elapsed()
         );
         producer.await.unwrap();
-        let (_, flow) = peer.connections.lookup(1).unwrap();
+        let flow = peer.connections.lookup(1).unwrap();
         assert!(
             flow.lock().reader_waits > 0,
             "precondition: the reader waited"
         );
-        peer.send(Body::Close(Close { conn_id: 1 })).await;
+        peer.send(Body::Close(Close { conn_id: 1 }));
         assert_eq!(
             io.read(&mut buffer).await.unwrap(),
             0,
@@ -2547,9 +2329,9 @@ mod tests {
     async fn a_violation_drops_the_inbox() {
         let peer = peer();
         let mut io = peer.connections.register(1, WINDOW);
-        feed(&peer, 1, WINDOW as usize).await;
+        feed(&peer, 1, WINDOW as usize);
         assert_eq!(io.inbox_bytes(), WINDOW as usize, "precondition");
-        feed(&peer, 1, 1).await;
+        feed(&peer, 1, 1);
         assert_eq!(io.inbox_capacity(), 0);
         let error = read_exact(&mut io, 1).await.unwrap_err();
         assert_eq!(error.to_string(), WINDOW_EXCEEDED);
@@ -2560,11 +2342,11 @@ mod tests {
         let peer = peer();
         let mut io = peer.connections.register(1, WINDOW);
         let mut idle = peer.connections.register(2, WINDOW);
-        feed(&peer, 1, 1000).await;
+        feed(&peer, 1, 1000);
         assert_eq!(io.inbox_bytes(), 1000, "precondition");
         let waiting = tokio::spawn(async move { read_exact(&mut idle, 1).await });
         tokio::task::yield_now().await;
-        let (_, flow) = peer.connections.lookup(2).unwrap();
+        let flow = peer.connections.lookup(2).unwrap();
         assert!(
             flow.lock().reader.is_some(),
             "precondition: the reader waits"
@@ -2589,7 +2371,7 @@ mod tests {
     async fn the_end_of_the_connection_drops_the_inbox() {
         let peer = peer();
         let mut io = peer.connections.register(1, WINDOW);
-        feed(&peer, 1, 1000).await;
+        feed(&peer, 1, 1000);
         assert_eq!(io.inbox_bytes(), 1000, "precondition");
         io.ending().finish();
         assert_eq!(io.inbox_capacity(), 0);
@@ -2600,9 +2382,9 @@ mod tests {
         use tokio::io::AsyncReadExt as _;
         let peer = peer();
         let mut io = peer.connections.register(1, WINDOW);
-        peer.data(1, b"ab").await;
-        peer.send(Body::Close(Close { conn_id: 1 })).await;
-        peer.data(1, b"cd").await;
+        peer.data(1, b"ab");
+        peer.send(Body::Close(Close { conn_id: 1 }));
+        peer.data(1, b"cd");
         assert_eq!(io.inbox_bytes(), 2);
         let mut all = Vec::new();
         io.read_to_end(&mut all).await.unwrap();
@@ -2613,8 +2395,8 @@ mod tests {
     async fn the_servers_error_fails_the_reader_after_the_buffered_payload() {
         let peer = peer();
         let mut io = peer.connections.register(1, WINDOW);
-        peer.data(1, b"ab").await;
-        peer.error(1, "boom").await;
+        peer.data(1, b"ab");
+        peer.error(1, "boom");
         assert_eq!(read_exact(&mut io, 2).await.unwrap(), b"ab");
         let error = read_exact(&mut io, 1).await.unwrap_err();
         assert_eq!(error.to_string(), ABORTED);
@@ -2628,7 +2410,7 @@ mod tests {
         let mut io = peer.connections.register(1, WINDOW);
         let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
         for (i, byte) in preface.iter().enumerate() {
-            peer.data(1, std::slice::from_ref(byte)).await;
+            peer.data(1, std::slice::from_ref(byte));
             if i == 0 {
                 assert!(io.fill().await, "bytes arrived");
             }
@@ -2645,9 +2427,9 @@ mod tests {
         use tokio::io::AsyncReadExt as _;
         let peer = peer();
         let mut io = peer.connections.register(1, WINDOW);
-        peer.data(1, b"ab").await;
-        peer.data(1, b"").await;
-        peer.data(1, b"cd").await;
+        peer.data(1, b"ab");
+        peer.data(1, b"");
+        peer.data(1, b"cd");
         let mut all = Vec::new();
         io.read_to_end(&mut all).await.unwrap();
         assert_eq!(all, b"ab");
@@ -2658,9 +2440,9 @@ mod tests {
         use tokio::io::AsyncReadExt as _;
         let peer = peer();
         let mut io = peer.connections.register(1, WINDOW);
-        peer.data(1, b"ab").await;
-        peer.send(Body::Close(Close { conn_id: 1 })).await;
-        peer.error(1, "boom").await;
+        peer.data(1, b"ab");
+        peer.send(Body::Close(Close { conn_id: 1 }));
+        peer.error(1, "boom");
         let mut all = Vec::new();
         io.read_to_end(&mut all).await.unwrap();
         assert_eq!(all, b"ab");

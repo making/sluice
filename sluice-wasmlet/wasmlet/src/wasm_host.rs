@@ -2191,17 +2191,12 @@ pub(crate) mod tests {
     const ROUTE: &str = "wasm:test";
 
     /// Opens conn 1 to `handler` through the dispatch, as a server CONNECT
-    /// announcing `window` (0 = legacy), and sends `request`.
-    async fn open_with(handler: &Arc<Handler>, request: &str, window: u32) -> Peer {
+    /// announcing its window, and sends `request`.
+    fn open(handler: &Arc<Handler>, request: &str) -> Peer {
         let peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
-        peer.connect(1, ROUTE, window).await;
-        peer.data(1, request.as_bytes()).await;
+        peer.connect(1, ROUTE, crate::tunnel::WINDOW);
+        peer.data(1, request.as_bytes());
         peer
-    }
-
-    /// `open_with` on a windowed connection, as every current server opens.
-    async fn open(handler: &Arc<Handler>, request: &str) -> Peer {
-        open_with(handler, request, crate::tunnel::WINDOW).await
     }
 
     /// Reads the response bytes up to the tunnel Close.
@@ -2221,7 +2216,7 @@ pub(crate) mod tests {
     /// Drives one request through `serve` over in-memory frame channels and
     /// returns the raw response bytes up to the tunnel Close.
     async fn exchange_raw(handler: &Arc<Handler>, request: &str) -> Vec<u8> {
-        response_raw(&mut open(handler, request).await).await
+        response_raw(&mut open(handler, request)).await
     }
 
     /// `exchange_raw` for text responses.
@@ -2250,23 +2245,37 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// The legacy path (a CONNECT without a window, as from a server
-    /// predating the window) serves as before: no grant, no ERROR.
+    /// A CONNECT without a window (a server predating per-connection flow
+    /// control) is answered with an ERROR naming the server build required,
+    /// logged once, and neither served nor given a slot: the only slot
+    /// still serves a windowed CONNECT after it.
     #[tokio::test]
-    async fn a_legacy_connection_serves_without_flow_control_frames() {
+    async fn a_connect_without_a_window_is_answered_with_an_error() {
         let handler = route(hello().await, Sandbox::default());
-        let mut peer = open_with(&handler, &get("/"), 0).await;
-        let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
-        let response = String::from_utf8(data_bytes(&frames, 1)).unwrap();
-        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        let control: Vec<_> = frames
-            .iter()
-            .filter(|body| !matches!(body, Body::Data(_)))
-            .collect();
-        assert!(
-            matches!(control[..], [Body::Close(_)]),
-            "only the CLOSE: {control:?}"
+        let limit = crate::tunnel::Limit::new(1);
+        let mut peer = Peer::limited(
+            HashMap::from([(ROUTE.to_string(), handler.clone())]),
+            limit.clone(),
         );
+        peer.connect(1, ROUTE, 0);
+        // DATA right behind it, as such a server sends: dropped
+        peer.data(1, get("/").as_bytes());
+        let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+        assert!(
+            matches!(&frames[..], [Body::Error(error)]
+                if error.conn_id == 1 && error.message == crate::tunnel::SERVER_WINDOW_REQUIRED),
+            "{frames:?}"
+        );
+        assert!(!peer.registered(1), "not registered");
+        assert_eq!(limit.open(), 0, "no slot taken");
+        assert_eq!(peer.connections.windowless_rejections(), 1, "logged once");
+
+        peer.connect(2, ROUTE, crate::tunnel::WINDOW);
+        peer.data(2, get("/").as_bytes());
+        let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+        let response = String::from_utf8(data_bytes(&frames, 2)).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(peer.connections.windowless_rejections(), 1);
     }
 
     /// `connection: close` ends the connection while the server may still
@@ -2275,7 +2284,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_windowed_connection_ends_with_error_unless_the_server_closed() {
         let handler = route(hello().await, Sandbox::default());
-        let mut peer = open(&handler, &get("/")).await;
+        let mut peer = open(&handler, &get("/"));
         let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
         let tail: Vec<_> = frames
             .iter()
@@ -2290,7 +2299,7 @@ pub(crate) mod tests {
         // keep-alive: the response leaves the connection open until the
         // server's CLOSE
         let keep_alive = "GET / HTTP/1.1\r\nhost: t\r\n\r\n";
-        let mut peer = open(&handler, keep_alive).await;
+        let mut peer = open(&handler, keep_alive);
         let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
         assert!(
             String::from_utf8(data_bytes(&frames, 1))
@@ -2301,8 +2310,7 @@ pub(crate) mod tests {
             frames.iter().all(|body| matches!(body, Body::Data(_))),
             "still open: {frames:?}"
         );
-        peer.send(Body::Close(crate::pb::Close { conn_id: 1 }))
-            .await;
+        peer.send(Body::Close(crate::pb::Close { conn_id: 1 }));
         let tail = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
         assert!(matches!(tail[..], [Body::Close(_)]), "{tail:?}");
     }
@@ -2323,22 +2331,15 @@ pub(crate) mod tests {
                 .collect()
         }
         let handler = route(hello().await, Sandbox::default());
-        for window in [0, crate::tunnel::WINDOW] {
-            // a head cut short by the server's CLOSE: hyper fails the read;
-            // the server closed, so CLOSE is owed, not ERROR
-            let mut peer = open_with(&handler, "GET / HTTP/1.1\r\nhost:", window).await;
-            peer.send(Body::Close(crate::pb::Close { conn_id: 1 }))
-                .await;
-            let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
-            assert_eq!(
-                terminal(&frames),
-                vec!["CLOSE"],
-                "window {window}: {frames:?}"
-            );
-        }
+        // a head cut short by the server's CLOSE: hyper fails the read; the
+        // server closed, so CLOSE is owed, not ERROR
+        let mut peer = open(&handler, "GET / HTTP/1.1\r\nhost:");
+        peer.send(Body::Close(crate::pb::Close { conn_id: 1 }));
+        let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+        assert_eq!(terminal(&frames), vec!["CLOSE"], "{frames:?}");
         // a response body cut short by the budget fails hyper while the
-        // server may still send: ERROR alone (windowed), so the public peer
-        // sees an abort, not a clean end; CLOSE (legacy)
+        // server may still send: ERROR alone, so the public peer sees an
+        // abort, not a clean end
         let short = route(
             hello().await,
             Sandbox {
@@ -2349,24 +2350,18 @@ pub(crate) mod tests {
                 ..Sandbox::default()
             },
         );
-        let expected = [
-            (0, "CLOSE".to_string()),
-            (
-                crate::tunnel::WINDOW,
-                format!("ERROR {}", crate::tunnel::CONNECTION_CLOSED),
-            ),
-        ];
-        for (window, expected) in expected {
-            let mut peer = open_with(&short, &get("/stream"), window).await;
-            let frames = frames_until_quiet(&mut peer, Duration::from_secs(1)).await;
-            let body = data_bytes(&frames, 1);
-            assert!(
-                body.len() < 10 * 1024 * 1024,
-                "truncated: {} bytes",
-                body.len()
-            );
-            assert_eq!(terminal(&frames), vec![expected], "window {window}");
-        }
+        let mut peer = open(&short, &get("/stream"));
+        let frames = frames_until_quiet(&mut peer, Duration::from_secs(1)).await;
+        let body = data_bytes(&frames, 1);
+        assert!(
+            body.len() < 10 * 1024 * 1024,
+            "truncated: {} bytes",
+            body.len()
+        );
+        assert_eq!(
+            terminal(&frames),
+            vec![format!("ERROR {}", crate::tunnel::CONNECTION_CLOSED)]
+        );
     }
 
     /// The response stops at exactly the server's credit and resumes on its
@@ -2376,8 +2371,8 @@ pub(crate) mod tests {
         let handler = route(hello().await, Sandbox::default());
         let mut peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
         peer.auto_grant = false;
-        peer.connect(1, ROUTE, 64 * 1024).await;
-        peer.data(1, get("/stream").as_bytes()).await;
+        peer.connect(1, ROUTE, 64 * 1024);
+        peer.data(1, get("/stream").as_bytes());
 
         let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
         assert_eq!(
@@ -2389,8 +2384,7 @@ pub(crate) mod tests {
         peer.send(Body::WindowUpdate(crate::pb::WindowUpdate {
             conn_id: 1,
             increment: 100_000,
-        }))
-        .await;
+        }));
         let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
         assert_eq!(data_bytes(&frames, 1).len(), 100_000, "exactly the grant");
     }
@@ -2411,15 +2405,15 @@ pub(crate) mod tests {
         let handler = route(hello().await, Sandbox::default());
         let mut peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
         peer.auto_grant = false;
-        peer.connect(1, ROUTE, crate::tunnel::WINDOW).await;
-        peer.data(1, get("/stream").as_bytes()).await;
+        peer.connect(1, ROUTE, crate::tunnel::WINDOW);
+        peer.data(1, get("/stream").as_bytes());
         until("conn 1 fills its queue", || {
             peer.queued_data(1) == DATA_QUEUE_CAPACITY
         })
         .await;
 
-        peer.connect(2, ROUTE, crate::tunnel::WINDOW).await;
-        peer.data(2, get("/").as_bytes()).await;
+        peer.connect(2, ROUTE, crate::tunnel::WINDOW);
+        peer.data(2, get("/").as_bytes());
         until("conn 2's response is queued to its end", || {
             !peer.registered(2)
         })
@@ -2487,7 +2481,7 @@ pub(crate) mod tests {
                 let n = (total - upload.sent)
                     .min(64 * 1024)
                     .min(upload.credit as usize);
-                peer.data(1, &payload[upload.sent..upload.sent + n]).await;
+                peer.data(1, &payload[upload.sent..upload.sent + n]);
                 upload.sent += n;
                 upload.credit -= n as u64;
                 continue;
@@ -2519,7 +2513,7 @@ pub(crate) mod tests {
     async fn an_upload_flows_on_grants_and_an_unread_rest_is_released() {
         let handler = route(hello().await, Sandbox::default());
         let mut peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
-        peer.connect(1, ROUTE, crate::tunnel::WINDOW).await;
+        peer.connect(1, ROUTE, crate::tunnel::WINDOW);
         let body_len = 4 * crate::tunnel::WINDOW as usize;
         let head = format!(
             "POST / HTTP/1.1\r\nhost: t\r\ncontent-length: {body_len}\r\nconnection: close\r\n\r\n"
@@ -2566,7 +2560,7 @@ pub(crate) mod tests {
     async fn a_stalled_upload_leaves_other_connections_served() {
         let handler = route(hello().await, Sandbox::default());
         let mut peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
-        peer.connect(1, ROUTE, crate::tunnel::WINDOW).await;
+        peer.connect(1, ROUTE, crate::tunnel::WINDOW);
         let body_len = 8 * crate::tunnel::WINDOW as usize;
         // the guest reads just past 1MiB, then answers /stall slowly
         let head = format!("POST /stall HTTP/1.1\r\nhost: t\r\ncontent-length: {body_len}\r\n\r\n");
@@ -2582,8 +2576,8 @@ pub(crate) mod tests {
         );
 
         let started = Instant::now();
-        peer.connect(2, ROUTE, crate::tunnel::WINDOW).await;
-        peer.data(2, get("/").as_bytes()).await;
+        peer.connect(2, ROUTE, crate::tunnel::WINDOW);
+        peer.data(2, get("/").as_bytes());
         let mut frames = Vec::new();
         let served = async {
             while let Some(frame) = peer.recv().await {
@@ -2679,8 +2673,7 @@ pub(crate) mod tests {
         let mut peer = open(
             &route(loaded, Sandbox::default()),
             "GET /stream HTTP/1.1\r\nhost: demo.local\r\nconnection: close\r\n\r\n",
-        )
-        .await;
+        );
 
         let started = Instant::now();
         let mut raw: Vec<u8> = Vec::new();
@@ -3356,10 +3349,10 @@ pub(crate) mod tests {
         let handler = pooled(&loaded, Sandbox::default(), 1);
         restocked(&handler, 1).await;
 
-        let peer = open(&handler, &fetch_request(&format!("http://{silent}/"))).await;
+        let peer = open(&handler, &fetch_request(&format!("http://{silent}/")));
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(pool(&handler).idle(), 0, "the unit is busy");
-        peer.error(1, "public peer left").await;
+        peer.error(1, "public peer left");
         drop(peer);
 
         let started = Instant::now();
@@ -3379,7 +3372,7 @@ pub(crate) mod tests {
         let handler = pooled(&hello().await, Sandbox::default(), 1);
         restocked(&handler, 1).await;
 
-        let mut peer = open(&handler, &get("/stream")).await;
+        let mut peer = open(&handler, &get("/stream"));
         let mut received = 0;
         while received < 64 * 1024 {
             match peer.recv().await.and_then(|frame| frame.body) {
@@ -3387,7 +3380,7 @@ pub(crate) mod tests {
                 other => panic!("stream ended early: {other:?}"),
             }
         }
-        peer.error(1, "public peer left").await;
+        peer.error(1, "public peer left");
         drop(peer);
 
         restocked(&handler, 1).await;
@@ -3400,7 +3393,7 @@ pub(crate) mod tests {
     /// out (the tracked body live) and the guest suspended before any further
     /// frame. Returns the connection's sides, for the abort.
     async fn stalled_connection(handler: &Arc<Handler>) -> Peer {
-        let mut peer = open(handler, &get("/stall")).await;
+        let mut peer = open(handler, &get("/stall"));
         let head_and_chunk = async {
             let mut raw: Vec<u8> = Vec::new();
             loop {
@@ -3442,7 +3435,7 @@ pub(crate) mod tests {
         );
 
         let started = Instant::now();
-        peer.error(1, "public peer left").await;
+        peer.error(1, "public peer left");
         drop(peer);
 
         restocked(&handler, 1).await;
@@ -3525,7 +3518,7 @@ pub(crate) mod tests {
         assert_eq!(handler.live_stores(), 1, "the request's store is held");
 
         let started = Instant::now();
-        peer.error(1, "public peer left").await;
+        peer.error(1, "public peer left");
         drop(peer);
 
         let freed = async {
@@ -3599,10 +3592,10 @@ pub(crate) mod tests {
             limit.clone(),
         );
         // admitted, and held open: no request yet
-        peer.connect(1, ROUTE, crate::tunnel::WINDOW).await;
+        peer.connect(1, ROUTE, crate::tunnel::WINDOW);
         assert_eq!(limit.open(), 1);
 
-        peer.connect(2, ROUTE, crate::tunnel::WINDOW).await;
+        peer.connect(2, ROUTE, crate::tunnel::WINDOW);
         let frames = frames_until_quiet(&mut peer, Duration::from_millis(300)).await;
         assert!(
             matches!(&frames[..], [Body::Error(error)]
@@ -3613,7 +3606,7 @@ pub(crate) mod tests {
 
         // the server fails the admitted connection: its slot frees once the
         // connection ended and its CLOSE left
-        peer.error(1, "gone").await;
+        peer.error(1, "gone");
         let deadline = Instant::now() + Duration::from_secs(5);
         while peer.registered(1) {
             assert!(Instant::now() < deadline, "the connection never ended");
@@ -3627,16 +3620,15 @@ pub(crate) mod tests {
         );
         assert_eq!(limit.open(), 0, "freed once the CLOSE left");
 
-        peer.connect(3, ROUTE, crate::tunnel::WINDOW).await;
-        peer.data(3, get("/").as_bytes()).await;
+        peer.connect(3, ROUTE, crate::tunnel::WINDOW);
+        peer.data(3, get("/").as_bytes());
         let response = String::from_utf8(response_raw(&mut peer).await).unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     }
 
     /// The server's CLOSE: the public client half-closed (a FIN).
-    async fn half_close(peer: &Peer) {
-        peer.send(Body::Close(crate::pb::Close { conn_id: 1 }))
-            .await;
+    fn half_close(peer: &Peer) {
+        peer.send(Body::Close(crate::pb::Close { conn_id: 1 }));
     }
 
     /// The connection-end frames among `frames`.
@@ -3665,16 +3657,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_request_followed_by_the_servers_half_close_is_answered() {
         let handler = route(hello().await, Sandbox::default());
-        for window in [0, crate::tunnel::WINDOW] {
-            let mut peer = open_with(&handler, &get("/"), window).await;
-            peer.send(Body::Close(crate::pb::Close { conn_id: 1 }))
-                .await;
-            let response = String::from_utf8(response_raw(&mut peer).await).unwrap();
-            assert!(
-                response.starts_with("HTTP/1.1 200"),
-                "window {window}: {response}"
-            );
-        }
+        let mut peer = open(&handler, &get("/"));
+        peer.send(Body::Close(crate::pb::Close { conn_id: 1 }));
+        let response = String::from_utf8(response_raw(&mut peer).await).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     }
 
     /// The half-close answered in full, keep-alive or not, and the
@@ -3685,29 +3671,23 @@ pub(crate) mod tests {
         let handler = route(hello().await, Sandbox::default());
         let keep_alive = "GET / HTTP/1.1\r\nhost: t\r\n\r\n";
         for request in [get("/"), keep_alive.to_string()] {
-            for window in [0, crate::tunnel::WINDOW] {
-                let limit = crate::tunnel::Limit::new(1);
-                let mut peer = Peer::limited(
-                    HashMap::from([(ROUTE.to_string(), handler.clone())]),
-                    limit.clone(),
-                );
-                peer.connect(1, ROUTE, window).await;
-                peer.data(1, request.as_bytes()).await;
-                half_close(&peer).await;
-                let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
-                let response = String::from_utf8(data_bytes(&frames, 1)).unwrap();
-                assert!(
-                    response.starts_with("HTTP/1.1 200")
-                        && response.ends_with("body_bytes=0\n\r\n0\r\n\r\n"),
-                    "{request:?} window {window}: {response}"
-                );
-                assert_eq!(
-                    terminal_frames(&frames),
-                    vec!["CLOSE"],
-                    "{request:?} window {window}"
-                );
-                assert_eq!(limit.open(), 0, "{request:?} window {window}: slot freed");
-            }
+            let limit = crate::tunnel::Limit::new(1);
+            let mut peer = Peer::limited(
+                HashMap::from([(ROUTE.to_string(), handler.clone())]),
+                limit.clone(),
+            );
+            peer.connect(1, ROUTE, crate::tunnel::WINDOW);
+            peer.data(1, request.as_bytes());
+            half_close(&peer);
+            let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+            let response = String::from_utf8(data_bytes(&frames, 1)).unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 200")
+                    && response.ends_with("body_bytes=0\n\r\n0\r\n\r\n"),
+                "{request:?}: {response}"
+            );
+            assert_eq!(terminal_frames(&frames), vec!["CLOSE"], "{request:?}");
+            assert_eq!(limit.open(), 0, "{request:?}: slot freed");
         }
     }
 
@@ -3716,20 +3696,18 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_streamed_response_survives_the_servers_half_close() {
         let handler = route(hello().await, Sandbox::default());
-        for window in [0, crate::tunnel::WINDOW] {
-            let mut peer = open_with(&handler, &get("/stream"), window).await;
-            half_close(&peer).await;
-            let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
-            let raw = data_bytes(&frames, 1);
-            let head_end = raw
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .expect("a response head")
-                + 4;
-            assert!(raw.starts_with(b"HTTP/1.1 200"), "window {window}");
-            assert_eq!(raw.len() - head_end, 10 * 1024 * 1024, "window {window}");
-            assert_eq!(terminal_frames(&frames), vec!["CLOSE"], "window {window}");
-        }
+        let mut peer = open(&handler, &get("/stream"));
+        half_close(&peer);
+        let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+        let raw = data_bytes(&frames, 1);
+        let head_end = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("a response head")
+            + 4;
+        assert!(raw.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(raw.len() - head_end, 10 * 1024 * 1024);
+        assert_eq!(terminal_frames(&frames), vec!["CLOSE"]);
     }
 
     /// A request body cut short by the half-close ends the connection with
@@ -3738,22 +3716,20 @@ pub(crate) mod tests {
     async fn a_request_body_cut_short_by_the_half_close_ends_the_connection() {
         let handler = route(hello().await, Sandbox::default());
         let post = "POST / HTTP/1.1\r\nhost: t\r\ncontent-length: 100\r\n\r\n0123456789";
-        for window in [0, crate::tunnel::WINDOW] {
-            let limit = crate::tunnel::Limit::new(1);
-            let mut peer = Peer::limited(
-                HashMap::from([(ROUTE.to_string(), handler.clone())]),
-                limit.clone(),
-            );
-            peer.connect(1, ROUTE, window).await;
-            peer.data(1, post.as_bytes()).await;
-            half_close(&peer).await;
-            let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
-            assert_eq!(terminal_frames(&frames), vec!["CLOSE"], "window {window}");
-            eventually("the slot frees", Duration::from_secs(1), || {
-                limit.open() == 0
-            })
-            .await;
-        }
+        let limit = crate::tunnel::Limit::new(1);
+        let mut peer = Peer::limited(
+            HashMap::from([(ROUTE.to_string(), handler.clone())]),
+            limit.clone(),
+        );
+        peer.connect(1, ROUTE, crate::tunnel::WINDOW);
+        peer.data(1, post.as_bytes());
+        half_close(&peer);
+        let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
+        assert_eq!(terminal_frames(&frames), vec!["CLOSE"]);
+        eventually("the slot frees", Duration::from_secs(1), || {
+            limit.open() == 0
+        })
+        .await;
     }
 
     /// A half-close is no departure: the stalled request keeps its unit.
@@ -3765,7 +3741,7 @@ pub(crate) mod tests {
         restocked(&handler, 1).await;
 
         let peer = stalled_connection(&handler).await;
-        half_close(&peer).await;
+        half_close(&peer);
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             pool(&handler).idle(),
@@ -3775,7 +3751,7 @@ pub(crate) mod tests {
         assert!(peer.registered(1), "the connection is still served");
 
         let started = Instant::now();
-        peer.error(1, "public peer left").await;
+        peer.error(1, "public peer left");
         // the peer (and so the stream) stays up: the ERROR alone frees it
         restocked(&handler, 1).await;
         assert!(
@@ -3804,7 +3780,7 @@ pub(crate) mod tests {
         );
         let started = Instant::now();
         let mut peer = stalled_connection(&handler).await;
-        half_close(&peer).await;
+        half_close(&peer);
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(handler.live_stores(), 1, "held after the half-close");
         let end = tokio::time::timeout(budget + Duration::from_secs(2), async {
@@ -3835,7 +3811,7 @@ pub(crate) mod tests {
         let handler = route(hello().await, Sandbox::default());
         let peer = stalled_connection(&handler).await;
         assert_eq!(handler.live_stores(), 1, "the request's store is held");
-        peer.error(1, "public peer left").await;
+        peer.error(1, "public peer left");
         eventually("the store is freed", Duration::from_secs(3), || {
             handler.live_stores() == 0
         })
@@ -3869,8 +3845,7 @@ pub(crate) mod tests {
     async fn payload_past_the_window_frees_a_stalled_store() {
         let handler = route(hello().await, Sandbox::default());
         let mut peer = stalled_connection(&handler).await;
-        peer.data(1, &vec![0x5a; crate::tunnel::WINDOW as usize + 1])
-            .await;
+        peer.data(1, &vec![0x5a; crate::tunnel::WINDOW as usize + 1]);
         eventually("the store is freed", Duration::from_secs(3), || {
             handler.live_stores() == 0
         })
@@ -3928,9 +3903,9 @@ pub(crate) mod tests {
         assert_eq!(instances.held(), 2, "both slots held");
 
         // the third holds the slot it gets (a stalled body), the fourth not
-        let mut third = open(&handler, &get("/stall")).await;
+        let mut third = open(&handler, &get("/stall"));
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut fourth = open(&handler, &get("/")).await;
+        let mut fourth = open(&handler, &get("/"));
         let waiting = frames_until_quiet(&mut third, Duration::from_millis(300)).await;
         assert!(waiting.is_empty(), "{waiting:?}");
         assert_eq!(
@@ -3943,7 +3918,7 @@ pub(crate) mod tests {
             "no store for the waiting requests"
         );
 
-        first.error(1, "public peer left").await;
+        first.error(1, "public peer left");
         let head = tokio::time::timeout(Duration::from_secs(3), third.recv())
             .await
             .expect("the first waiter takes the freed slot");
@@ -3958,7 +3933,7 @@ pub(crate) mod tests {
             "the later waiter still waits: one slot freed"
         );
 
-        second.error(1, "public peer left").await;
+        second.error(1, "public peer left");
         let response = answered(&mut fourth, Duration::from_secs(3)).await;
         assert!(
             response
@@ -3968,7 +3943,7 @@ pub(crate) mod tests {
         );
         assert_eq!(handler.peak_stores(), 2, "never more stores than slots");
         assert_eq!(handler.stores_created(), 4);
-        third.error(1, "public peer left").await;
+        third.error(1, "public peer left");
         eventually("every slot frees", Duration::from_secs(3), || {
             instances.held() == 0
         })
@@ -3987,7 +3962,7 @@ pub(crate) mod tests {
         let occupant = stalled_connection(&holder).await;
 
         let started = Instant::now();
-        let mut peer = open(&waiter, &get("/")).await;
+        let mut peer = open(&waiter, &get("/"));
         let response = answered(&mut peer, budget + Duration::from_secs(2))
             .await
             .expect("answered at the budget");
@@ -4027,14 +4002,14 @@ pub(crate) mod tests {
             let created = waiter.stores_created();
 
             let started = Instant::now();
-            let mut peer = open(&waiter, &get("/stall")).await;
+            let mut peer = open(&waiter, &get("/stall"));
             tokio::time::sleep(Duration::from_millis(1000)).await;
             assert_eq!(
                 waiter.stores_created(),
                 created,
                 "pooled {pooled}: still waiting at 1s"
             );
-            occupant.error(1, "public peer left").await;
+            occupant.error(1, "public peer left");
 
             // admitted at ~1s: the stalled body ends at the budget from arrival
             let end = tokio::time::timeout(Duration::from_secs(5), async {
@@ -4084,7 +4059,7 @@ pub(crate) mod tests {
         for (path, budget) in [("/stall", 300), ("/spin", 100)] {
             let instances = Instances::new(1);
             let handler = limited(&loaded, &instances, Some(Duration::from_millis(budget)));
-            let mut peer = open(&handler, &get(path)).await;
+            let mut peer = open(&handler, &get(path));
             // a spinning guest holds this current-thread runtime until its
             // budget: the request's instance is the precondition seen after
             let frames = frames_until_quiet(&mut peer, Duration::from_secs(1)).await;
@@ -4104,12 +4079,12 @@ pub(crate) mod tests {
             let handler = limited(&loaded, &instances, None);
             let peer = stalled_connection(&handler).await;
             if half_closed {
-                half_close(&peer).await;
+                half_close(&peer);
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 assert_eq!(instances.held(), 1, "a half-close keeps the slot");
             }
             assert_eq!(instances.held(), 1);
-            peer.error(1, "public peer left").await;
+            peer.error(1, "public peer left");
             assert_slot_freed(&instances, &loaded, &format!("half-closed {half_closed}")).await;
             drop(peer);
         }
@@ -4151,9 +4126,9 @@ pub(crate) mod tests {
         let instances = Instances::new(1);
         let handler = limited(&hello().await, &instances, None);
         let occupant = stalled_connection(&handler).await;
-        let waiter = open(&handler, &get("/")).await;
+        let waiter = open(&handler, &get("/"));
         tokio::time::sleep(Duration::from_millis(200)).await;
-        waiter.error(1, "public peer left").await;
+        waiter.error(1, "public peer left");
         eventually(
             "the waiter's connection ends",
             Duration::from_secs(1),
@@ -4161,7 +4136,7 @@ pub(crate) mod tests {
         )
         .await;
 
-        occupant.error(1, "public peer left").await;
+        occupant.error(1, "public peer left");
         eventually("the slot frees", Duration::from_secs(3), || {
             instances.held() == 0
         })
@@ -4190,7 +4165,7 @@ pub(crate) mod tests {
         assert_eq!(instances.held(), 1, "the idle unit holds the slot");
 
         let occupant = stalled_connection(&handler).await;
-        let mut waiter = open(&handler, &get("/")).await;
+        let mut waiter = open(&handler, &get("/"));
         assert_eq!(
             answered(&mut waiter, Duration::from_millis(300)).await,
             None
@@ -4199,7 +4174,7 @@ pub(crate) mod tests {
 
         // the unit retires; its replacement, on the same slot, takes the
         // waiting request once offered
-        occupant.error(1, "public peer left").await;
+        occupant.error(1, "public peer left");
         let response = answered(&mut waiter, Duration::from_secs(3)).await;
         assert!(
             response
@@ -4268,7 +4243,7 @@ pub(crate) mod tests {
     async fn h2_client(handler: &Arc<Handler>) -> h2::client::SendRequest<bytes::Bytes> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let mut peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
-        peer.connect(1, ROUTE, crate::tunnel::WINDOW).await;
+        peer.connect(1, ROUTE, crate::tunnel::WINDOW);
         let (io, mut pumped) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             let mut buf = vec![0u8; 16 * 1024];
@@ -4276,7 +4251,7 @@ pub(crate) mod tests {
                 tokio::select! {
                     read = pumped.read(&mut buf) => match read {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => peer.data(1, &buf[..n]).await,
+                        Ok(n) => peer.data(1, &buf[..n]),
                     },
                     frame = peer.recv() => match frame.and_then(|frame| frame.body) {
                         Some(Body::Data(data)) => {
@@ -4438,7 +4413,7 @@ pub(crate) mod tests {
         let occupant = stalled_connection(&busy).await;
         assert_eq!(busy.route_held(), 1, "precondition: the route's slot held");
 
-        let mut waiter = open(&busy, &get("/")).await;
+        let mut waiter = open(&busy, &get("/"));
         assert_eq!(
             answered(&mut waiter, Duration::from_millis(300)).await,
             None,
@@ -4451,7 +4426,7 @@ pub(crate) mod tests {
         let body = exchange(&other, &get("/")).await;
         assert!(body.starts_with("HTTP/1.1 200"), "{body}");
 
-        occupant.error(1, "public peer left").await;
+        occupant.error(1, "public peer left");
         assert_ok(
             answered(&mut waiter, Duration::from_secs(3)).await,
             "the waiter takes the route's freed slot",
@@ -4470,7 +4445,7 @@ pub(crate) mod tests {
         assert_eq!(handler.route_held(), 1, "the unit holds the route's slot");
 
         let occupant = stalled_connection(&handler).await;
-        let mut waiter = open(&handler, &get("/")).await;
+        let mut waiter = open(&handler, &get("/"));
         assert_eq!(
             answered(&mut waiter, Duration::from_millis(300)).await,
             None
@@ -4478,7 +4453,7 @@ pub(crate) mod tests {
         assert_eq!(handler.stores_created(), 1, "no per-request store");
         assert_eq!(instances.held(), 1, "process-wide slots stay free");
 
-        occupant.error(1, "public peer left").await;
+        occupant.error(1, "public peer left");
         assert_ok(
             answered(&mut waiter, Duration::from_secs(3)).await,
             "the replacement unit serves the waiter",
@@ -4504,7 +4479,7 @@ pub(crate) mod tests {
         assert_eq!(handler.stores_created(), 2, "precondition: one cold");
         assert_eq!(handler.route_held(), 2);
 
-        let mut waiter = open(&handler, &get("/")).await;
+        let mut waiter = open(&handler, &get("/"));
         assert_eq!(
             answered(&mut waiter, Duration::from_millis(300)).await,
             None
@@ -4512,7 +4487,7 @@ pub(crate) mod tests {
         assert_eq!(handler.stores_created(), 2, "no store past the cap");
         assert_eq!(instances.held(), 2);
 
-        cold.error(1, "public peer left").await;
+        cold.error(1, "public peer left");
         assert_ok(
             answered(&mut waiter, Duration::from_secs(3)).await,
             "the waiter takes the freed cold slot",
@@ -4532,7 +4507,7 @@ pub(crate) mod tests {
         let occupant = handler.route.clone().unwrap().try_acquire_owned().unwrap();
 
         let started = Instant::now();
-        let mut peer = open(&handler, &get("/")).await;
+        let mut peer = open(&handler, &get("/"));
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(instances.held(), 0, "waiting holds no process-wide slot");
         let response = answered(&mut peer, budget + Duration::from_secs(2))
@@ -4555,10 +4530,10 @@ pub(crate) mod tests {
         let instances = Instances::new(2);
         let handler = capped(&hello().await, &instances, 1, 0, None);
         let occupant = stalled_connection(&handler).await;
-        let waiter = open(&handler, &get("/")).await;
+        let waiter = open(&handler, &get("/"));
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(handler.stores_created(), 1, "precondition: it waits");
-        waiter.error(1, "public peer left").await;
+        waiter.error(1, "public peer left");
         eventually(
             "the waiter's connection ends",
             Duration::from_secs(1),
@@ -4566,7 +4541,7 @@ pub(crate) mod tests {
         )
         .await;
 
-        occupant.error(1, "public peer left").await;
+        occupant.error(1, "public peer left");
         eventually("the slots free", Duration::from_secs(3), || {
             handler.route_held() == 0 && instances.held() == 0
         })
@@ -4589,14 +4564,14 @@ pub(crate) mod tests {
         let budget = Duration::from_millis(800);
         let handler = capped(&loaded, &instances, 1, 0, Some(budget));
 
-        let waiter = open(&handler, &get("/")).await;
+        let waiter = open(&handler, &get("/"));
         eventually(
             "the waiter takes its route's slot",
             Duration::from_secs(1),
             || handler.route_held() == 1,
         )
         .await;
-        waiter.error(1, "public peer left").await;
+        waiter.error(1, "public peer left");
         eventually(
             "the route's slot frees with the client",
             Duration::from_secs(1),
@@ -4604,7 +4579,7 @@ pub(crate) mod tests {
         )
         .await;
 
-        let mut waiter = open(&handler, &get("/")).await;
+        let mut waiter = open(&handler, &get("/"));
         eventually(
             "the waiter takes its route's slot",
             Duration::from_secs(1),
@@ -4653,7 +4628,7 @@ pub(crate) mod tests {
             let instances = Instances::new(2);
             let budget = Some(Duration::from_millis(budget));
             let handler = capped(&loaded, &instances, 1, 0, budget);
-            let mut peer = open(&handler, &get(path)).await;
+            let mut peer = open(&handler, &get(path));
             let frames = frames_until_quiet(&mut peer, Duration::from_secs(1)).await;
             assert_eq!(handler.stores_created(), 1, "{path}: it had an instance");
             assert!(!terminal_frames(&frames).is_empty(), "{path}: ended");
@@ -4664,7 +4639,7 @@ pub(crate) mod tests {
         let handler = capped(&loaded, &instances, 1, 0, None);
         let peer = stalled_connection(&handler).await;
         assert_eq!(handler.route_held(), 1, "precondition: held while served");
-        peer.error(1, "public peer left").await;
+        peer.error(1, "public peer left");
         assert_route_slots_freed(&handler, &instances, "client gone").await;
 
         let instances = Instances::new(2);
