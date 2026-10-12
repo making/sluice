@@ -31,3 +31,15 @@ User decision: the policy and the default.
   deadline stream 3 is refused, the route's queued bytes and tracked streams drop, nothing
   of stream 3 reached the upstream, and stream 1 still completes.
 - A waiting stream that opens before the deadline is not refused.
+
+## Decision (2026-10-12)
+
+- A wait deadline per waiting stream, not a shared upstream response timeout. Waiting for a
+  slot is a relay-internal queue the upstream never saw, so `REFUSED_STREAM` is always safe
+  for the client to retry; a response timeout on open streams would cut legitimate long
+  polls and streams, which the stall timeout deliberately never counts. No response
+  timeout for open streams is added.
+- Setting under `sluice.limits.*` (e.g. `h2-stream-wait-timeout`), default 30s, `0`
+  disables. Count refusals as `sluice.h2demux.streams.refused{reason=wait-timeout}`.
+- An upstream announcing a limit of 0 is covered by the same deadline.
+- Do it after 081 so the error scope matches.
