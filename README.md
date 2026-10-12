@@ -261,6 +261,8 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.limits.max-connections-per-address` | `0` = no limit beyond `max-connections` | connections open at once from one source address (the PROXY protocol source with `proxy-protocol=true`, the socket peer otherwise) |
 | `sluice.limits.head-timeout` | `10s` | one deadline for the whole head phase of a data plane connection (PROXY header, TLS handshake, request head); on plaintext and TLS-terminated HTTP/1.1 it also bounds a later request head left incomplete between requests |
 | `sluice.limits.idle-timeout` | `60s` | how long a plaintext or TLS-terminated HTTP connection may idle between requests before it is closed; see "Connection limits" |
+| `sluice.limits.stall-timeout` | `60s` | how long a request or response in flight on a plaintext or TLS-terminated HTTP connection may wait on its client without progress before the connection is closed; see "Connection limits" |
+| `sluice.limits.stall-min-bytes` | `16KB` | the bytes moved to or from the client that count as progress against `stall-timeout` (`1B`: every byte counts) |
 | `sluice.limits.half-close-probe-interval` | `1s` | quiet after which a plaintext or TLS-terminated HTTP/1.1 connection whose client ended its side, a response owed, gets a `100 Continue` to learn whether the client is gone; `0` = off; see "Connection limits" |
 | `sluice.limits.h2-queue-budget` | `0` = an eighth of half the max heap | bytes the h2 demux relays may queue towards upstreams beyond each connection's allowance, shared by all of them; see "Connection limits" |
 | `sluice.tcp-port-range` | (unset = any port) | listen ports a client may claim for tcp routes, comma separated single ports or `min-max` ranges (e.g. `9000-9010,8080`); a port outside the range is not bound |
@@ -540,6 +542,28 @@ connections to the data plane, set the timeout above the front end's idle timeou
 front end closes an idle connection before sluice does. Connections closed so count as
 `sluice.data.connections.idle.closed`.
 
+While a request or response is in flight on such a connection, `sluice.limits.stall-timeout`
+bounds the time the relay waits on the client without `sluice.limits.stall-min-bytes`
+moving to or from it (the counterpart of nginx `send_timeout` / `client_body_timeout`, with a
+minimum rate): a write to the client not completing (it does not read), a response waiting
+for the client's h2 connection window, an h2 response begun whose stream window the client
+leaves exhausted, or a request body that is due and not sent -- an HTTP/1.1 body announced
+by `Content-Length` or chunked, an h2 stream not ended by the client. A client dripping
+bytes below the minimum is cut as if it sent none. The connection is closed (h2: GOAWAY
+`ENHANCE_YOUR_CALM` first) and counted as `sluice.data.connections.stall.closed`. Waiting
+for an upstream does not count: a slow or long-polling response, an upload the upstream does
+not read yet, an h2 request whose window the relay withholds. Nor does a client awaiting a
+`100 Continue` it asked for (until a response head or a byte of its body), an h2 request
+while its response is in progress (a streaming exchange), or an h2 CONNECT stream (a
+tunnel). The time is sampled eight times per timeout, so a stall is cut up to a quarter of
+the timeout past it. Write progress is what the client's TCP stack accepts: a client that
+reads slowly with a full receive buffer may reopen its window late
+(`StallTimeoutSlowReaderE2ETest` tells what was observed on macOS), so keep the timeout well
+above such gaps. A client streaming small h2 messages (a gRPC client stream) slower than the
+minimum is cut too: set `stall-min-bytes=1B` to count every byte, or raise the timeout.
+Connections relayed verbatim (TLS passthrough, tcp routes, upgraded connections, HTTP/1.1
+input the parser cannot follow) keep no stall timeout.
+
 A client's FIN does not tell whether it half-closed or left: HTTP/1.1 lets a half-closed
 client still wait for its response (RFC 9112 9.6), and only a write fails on a client gone.
 So once a plaintext or TLS-terminated HTTP/1.1 client ended its side while a response is
@@ -618,7 +642,7 @@ taken until it drains or the session ends.
   cluster warmup window and while draining (see "Cluster (scale-out)")
 - client `GET /actuator/health` (port 9001) - UP while at least one per-node tunnel stream is
   established; the `tunnel` detail shows the connection state and `nodes` each node's stream state
-- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`, `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_h2demux_queued_bytes` (bytes the h2 demux holds queued towards upstreams, one series per route), `sluice_h2demux_budget_bytes` / `sluice_h2demux_budget_used_bytes` (the shared h2 queue budget and the bytes charged to it, which may pass the budget by what the relays cannot refuse), `sluice_h2demux_window_withheld_total` (times a connection window was withheld for want of budget), `sluice_h2demux_streams_refused_total` (`reason` = `budget` / `leg-limit`), `sluice_h2demux_streams_reset_total` (streams the relay reset on its own account, `reason` = `budget` / `protocol`) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_rejected_total` (`reason` = `limit` / `address-limit` / `head-timeout`) / `sluice_data_connections_idle_closed_total` (connections closed for idling between requests)
+- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`, `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_h2demux_queued_bytes` (bytes the h2 demux holds queued towards upstreams, one series per route), `sluice_h2demux_budget_bytes` / `sluice_h2demux_budget_used_bytes` (the shared h2 queue budget and the bytes charged to it, which may pass the budget by what the relays cannot refuse), `sluice_h2demux_window_withheld_total` (times a connection window was withheld for want of budget), `sluice_h2demux_streams_refused_total` (`reason` = `budget` / `leg-limit`), `sluice_h2demux_streams_reset_total` (streams the relay reset on its own account, `reason` = `budget` / `protocol`) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_rejected_total` (`reason` = `limit` / `address-limit` / `head-timeout`) / `sluice_data_connections_idle_closed_total` (connections closed for idling between requests) / `sluice_data_connections_stall_closed_total` (connections closed for an exchange stalled on its client)
 
 ## Console
 

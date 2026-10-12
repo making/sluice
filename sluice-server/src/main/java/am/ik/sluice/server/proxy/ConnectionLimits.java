@@ -10,7 +10,9 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -28,9 +30,9 @@ import io.micrometer.core.instrument.MeterRegistry;
 /**
  * The limits every data plane connection lives under, shared by the data port and every
  * tcp route port: a cap on the connections open at once, a cap per source address, and
- * one deadline for the whole head phase; the deadlines between the requests of a relayed
- * HTTP connection ({@link KeepAliveDeadline}); plus the queue budget the h2 demux relays
- * share.
+ * one deadline for the whole head phase; the deadlines between and during the requests of
+ * a relayed HTTP connection ({@link KeepAliveDeadline}); plus the queue budget the h2
+ * demux relays share.
  * <p>
  * The connection cap counts virtual connections: an h2 connection whose streams reach
  * several routes takes one more slot per further leg ({@link #tryAcquireLeg()}). An unset
@@ -48,7 +50,8 @@ import io.micrometer.core.instrument.MeterRegistry;
  * Rejections are counted as {@code sluice.data.connections.rejected} by {@code reason}
  * ({@code limit}, {@code address-limit}, {@code head-timeout}) and logged through the
  * access log's rate limit. Connections closed for idling between requests count as
- * {@code sluice.data.connections.idle.closed}.
+ * {@code sluice.data.connections.idle.closed}, those closed for stalling an exchange as
+ * {@code sluice.data.connections.stall.closed}.
  */
 @Component
 public class ConnectionLimits implements DisposableBean {
@@ -67,6 +70,10 @@ public class ConnectionLimits implements DisposableBean {
 
 	private final Duration idleTimeout;
 
+	private final Duration stallTimeout;
+
+	private final long stallMinBytes;
+
 	/** Open connections per source address; an entry lives while its count is > 0. */
 	private final ConcurrentMap<InetAddress, Integer> perAddress = new ConcurrentHashMap<>();
 
@@ -80,6 +87,8 @@ public class ConnectionLimits implements DisposableBean {
 
 	private final Counter idleClosed;
 
+	private final Counter stallClosed;
+
 	ConnectionLimits(SluiceServerProperties properties, MeterRegistry meterRegistry) {
 		SluiceServerProperties.Limits limits = properties.limits();
 		long maxHeap = Runtime.getRuntime().maxMemory();
@@ -91,6 +100,8 @@ public class ConnectionLimits implements DisposableBean {
 		this.maxPerAddress = perAddress > 0 ? Math.min(perAddress, this.global.max()) : this.global.max();
 		this.headTimeout = limits.headTimeout();
 		this.idleTimeout = limits.idleTimeout();
+		this.stallTimeout = limits.stallTimeout();
+		this.stallMinBytes = limits.stallMinBytes().toBytes();
 		this.deadlines = new ScheduledThreadPoolExecutor(1,
 				Thread.ofPlatform().name("sluice-deadline").daemon().factory());
 		// a cancelled deadline leaves the queue at once instead of after the timeout
@@ -100,6 +111,10 @@ public class ConnectionLimits implements DisposableBean {
 		this.rejectedHeadTimeout = rejected(meterRegistry, "head-timeout");
 		this.idleClosed = Counter.builder("sluice.data.connections.idle.closed")
 			.description("Data plane connections closed after idling between requests for the idle timeout")
+			.register(meterRegistry);
+		this.stallClosed = Counter.builder("sluice.data.connections.stall.closed")
+			.description("Data plane connections closed after an exchange in flight waited on its client "
+					+ "for the stall timeout without progress")
 			.register(meterRegistry);
 		Gauge.builder("sluice.data.connections.limit", this.global, ConnectionLimit::max)
 			.description("Data plane connections allowed open at once")
@@ -114,12 +129,13 @@ public class ConnectionLimits implements DisposableBean {
 			.description("Bytes the h2 demux relays queue beyond their per-connection allowance")
 			.register(meterRegistry);
 		log.info(
-				"data plane connection limit {} ({}), per address {}, head timeout {}, idle timeout {}, h2 queue budget {}KiB ({})",
+				"data plane connection limit {} ({}), per address {}, head timeout {}, idle timeout {}, stall timeout {} per {}B, h2 queue budget {}KiB ({})",
 				this.global.max(),
 				limits.maxConnections() > 0 ? "configured"
 						: "derived: (half of max heap %dMiB - h2 queue budget) / %dKiB per connection"
 							.formatted(maxHeap >> 20, connectionBytes() >> 10),
-				this.maxPerAddress, this.headTimeout, this.idleTimeout, budget >> 10,
+				this.maxPerAddress, this.headTimeout, this.idleTimeout, this.stallTimeout, this.stallMinBytes,
+				budget >> 10,
 				limits.h2QueueBudget().toBytes() > 0 ? "configured" : "derived: an eighth of half of max heap");
 	}
 
@@ -175,8 +191,9 @@ public class ConnectionLimits implements DisposableBean {
 	}
 
 	/**
-	 * A disarmed deadline for the requests after the head phase of a relayed HTTP
-	 * connection; its expiry closes {@code socket}, the connection's transport.
+	 * The deadline for the requests after the head phase of a relayed HTTP connection,
+	 * busy and arming nothing until the relay watches it or enters another phase; its
+	 * expiry closes {@code socket}, the connection's transport.
 	 */
 	KeepAliveDeadline keepAliveDeadline(Socket socket) {
 		return new KeepAliveDeadline(socket);
@@ -354,26 +371,49 @@ public class ConnectionLimits implements DisposableBean {
 
 	/**
 	 * The deadline of a relayed HTTP connection after its head phase, driven by the relay
-	 * through {@link #enter(Phase)}: none while a request or response is in flight
-	 * ({@link Phase#BUSY}), the idle timeout while the connection idles between requests
-	 * ({@link Phase#IDLE}), the head timeout while a later request head is incomplete
-	 * ({@link Phase#HEAD}). A phase entered anew starts its timeout over; entering the
-	 * current phase keeps the running one. Once a timeout passes, the relay's teardown
-	 * runs on a virtual thread of its own -- never on the shared deadline thread, as it
-	 * may write -- and the transport socket is closed after it, or after
-	 * {@link #TEARDOWN_GRACE} at the latest should the teardown block on a write the peer
-	 * does not read. {@link #disarm()} ends the deadline for good: the relay ended, or
-	 * left HTTP (an upgrade).
+	 * through {@link #enter(Phase)}: the idle timeout while the connection idles between
+	 * requests ({@link Phase#IDLE}), the head timeout while a later request head is
+	 * incomplete ({@link Phase#HEAD}), and while a request or response is in flight
+	 * ({@link Phase#BUSY}) the stall timeout of a relay watched through
+	 * {@link #watchStalls}, none otherwise. A phase entered anew starts its timeout over;
+	 * entering the current phase keeps the running one. Once a timeout passes, the
+	 * relay's teardown runs on a virtual thread of its own -- never on the shared
+	 * deadline thread, as it may write -- and the transport socket is closed after it, or
+	 * after {@link #TEARDOWN_GRACE} at the latest should the teardown block on a write
+	 * the peer does not read. {@link #disarm()} ends the deadline for good: the relay
+	 * ended, or left HTTP (an upgrade).
+	 * <p>
+	 * The stall timeout counts only the time the relay waits on its client: busy, the
+	 * deadline asks the relay {@link #STALL_SAMPLES} times per stall timeout whether it
+	 * does, and adds the time between two samples that both found it waiting. Progress --
+	 * the stall minimum of bytes moved to or from the client, reported through
+	 * {@link #progress(long)} -- starts the count over, and so does the busy phase
+	 * entered anew. Once the count reaches the stall timeout the relay's stall teardown
+	 * runs as above. A wait shorter than a sample interval may go unseen and a wait
+	 * spanning two samples counts whole, so a stall is cut between the stall timeout and
+	 * two sample intervals past it.
 	 */
 	final class KeepAliveDeadline {
 
 		/** The most a teardown may take before the transport is closed under it. */
 		static final Duration TEARDOWN_GRACE = Duration.ofSeconds(1);
 
+		/** How often per stall timeout a busy relay is asked whether it waits. */
+		static final int STALL_SAMPLES = 8;
+
+		/**
+		 * The most a relay writes to the client at once: a blocking write tells nothing
+		 * until it returns, so a large one is made in pieces, each reported as progress.
+		 */
+		static final int WRITE_PIECE = 16 * 1024;
+
 		/** What the connection is doing, which decides its deadline. */
 		enum Phase {
 
-			/** A request or response is in flight: no deadline. */
+			/**
+			 * A request or response is in flight: the stall timeout when the relay is
+			 * watched, none otherwise.
+			 */
 			BUSY,
 
 			/** Between requests: the idle timeout. */
@@ -402,13 +442,65 @@ public class ConnectionLimits implements DisposableBean {
 		private volatile Runnable teardown = () -> {
 		};
 
+		/** Whether the relay waits on its client; null = no stall timeout. */
+		private volatile @Nullable BooleanSupplier waitsOnClient;
+
+		private volatile Runnable stallTeardown = () -> {
+		};
+
+		/** Bytes moved since the last progress counted. */
+		private final AtomicLong moved = new AtomicLong();
+
+		/** Bumped by every progress counted. */
+		private final AtomicLong progresses = new AtomicLong();
+
+		/** The time waited on the client since the count started; with the lock. */
+		private long waitedNanos;
+
+		/** When the relay was last sampled; with the lock. */
+		private long lastSample;
+
+		/** Whether the last sample found the relay waiting; with the lock. */
+		private boolean waitingAtLastSample;
+
+		/** {@link #progresses} at the last sample; with the lock. */
+		private long progressesAtLastSample;
+
 		private KeepAliveDeadline(Socket socket) {
 			this.socket = socket;
 		}
 
-		/** The relay's teardown, run once a timeout passes. */
+		/** The relay's teardown, run once the idle or head timeout passes. */
 		void onExpiry(Runnable teardown) {
 			this.teardown = teardown;
+		}
+
+		/**
+		 * Subjects the busy phase to the stall timeout: {@code waitsOnClient} tells
+		 * whether the relay waits on its client -- asked on the shared deadline thread,
+		 * it must not block --, and {@code teardown} runs once the stall timeout passed.
+		 * Starts the count when the connection is busy already.
+		 */
+		void watchStalls(BooleanSupplier waitsOnClient, Runnable teardown) {
+			synchronized (this.lock) {
+				this.waitsOnClient = waitsOnClient;
+				this.stallTeardown = teardown;
+				if (!this.expired && !this.disarmed && this.phase == Phase.BUSY) {
+					cancelLocked();
+					armStallLocked();
+				}
+			}
+		}
+
+		/**
+		 * Reports {@code bytes} moved to or from the client; every stall minimum of them
+		 * starts the stall count over.
+		 */
+		void progress(long bytes) {
+			if (bytes > 0 && this.moved.addAndGet(bytes) >= ConnectionLimits.this.stallMinBytes) {
+				this.moved.set(0);
+				this.progresses.incrementAndGet();
+			}
 		}
 
 		/**
@@ -425,7 +517,10 @@ public class ConnectionLimits implements DisposableBean {
 				}
 				cancelLocked();
 				this.phase = next;
-				if (next != Phase.BUSY) {
+				if (next == Phase.BUSY) {
+					armStallLocked();
+				}
+				else {
 					long armed = this.generation;
 					Duration timeout = next == Phase.IDLE ? ConnectionLimits.this.idleTimeout
 							: ConnectionLimits.this.headTimeout;
@@ -461,6 +556,59 @@ public class ConnectionLimits implements DisposableBean {
 			}
 		}
 
+		/** Starts the stall count of a watched relay; with the lock. */
+		private void armStallLocked() {
+			if (this.waitsOnClient == null) {
+				return;
+			}
+			this.moved.set(0);
+			this.waitedNanos = 0;
+			this.lastSample = System.nanoTime();
+			this.waitingAtLastSample = false;
+			this.progressesAtLastSample = this.progresses.get();
+			scheduleSampleLocked(this.generation);
+		}
+
+		private void scheduleSampleLocked(long armed) {
+			long interval = Math.max(TimeUnit.MILLISECONDS.toNanos(1),
+					ConnectionLimits.this.stallTimeout.toNanos() / STALL_SAMPLES);
+			this.future = ConnectionLimits.this.deadlines.schedule(() -> sample(armed), interval, TimeUnit.NANOSECONDS);
+		}
+
+		/**
+		 * Asks the relay whether it waits on its client and counts the time since the
+		 * last sample when both found it waiting; past the stall timeout, tears down.
+		 */
+		private void sample(long armed) {
+			BooleanSupplier probe = this.waitsOnClient;
+			// asked outside the lock: the relay enters phases under its own locks
+			boolean waiting = probe != null && probe.getAsBoolean();
+			synchronized (this.lock) {
+				if (this.expired || this.disarmed || armed != this.generation) {
+					return;
+				}
+				long now = System.nanoTime();
+				long progresses = this.progresses.get();
+				if (progresses != this.progressesAtLastSample) {
+					this.progressesAtLastSample = progresses;
+					this.waitedNanos = 0;
+				}
+				else if (waiting && this.waitingAtLastSample) {
+					this.waitedNanos += now - this.lastSample;
+				}
+				this.waitingAtLastSample = waiting;
+				this.lastSample = now;
+				if (this.waitedNanos < ConnectionLimits.this.stallTimeout.toNanos()) {
+					scheduleSampleLocked(armed);
+					return;
+				}
+				this.expired = true;
+				this.future = null;
+			}
+			ConnectionLimits.this.stallClosed.increment();
+			tearDown(this.stallTeardown);
+		}
+
 		private void expire(long armed) {
 			Phase passed;
 			synchronized (this.lock) {
@@ -473,9 +621,16 @@ public class ConnectionLimits implements DisposableBean {
 			}
 			(passed == Phase.IDLE ? ConnectionLimits.this.idleClosed : ConnectionLimits.this.rejectedHeadTimeout)
 				.increment();
+			tearDown(this.teardown);
+		}
+
+		/**
+		 * Runs the teardown on a virtual thread, then closes the transport; after the
+		 * grace at the latest.
+		 */
+		private void tearDown(Runnable teardown) {
 			ScheduledFuture<?> backstop = ConnectionLimits.this.deadlines.schedule(this::closeSocket,
 					TEARDOWN_GRACE.toNanos(), TimeUnit.NANOSECONDS);
-			Runnable teardown = this.teardown;
 			Thread.ofVirtual().name("sluice-deadline-teardown").start(() -> {
 				try {
 					teardown.run();

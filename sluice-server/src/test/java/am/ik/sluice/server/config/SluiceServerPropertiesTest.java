@@ -76,7 +76,7 @@ class SluiceServerPropertiesTest {
 	}
 
 	@Test
-	void limitsDefaultToDerivedConnectionLimitsATenSecondHeadDeadlineAndAMinuteOfIdle() {
+	void limitsDefaultToDerivedConnectionLimitsATenSecondHeadDeadlineAndAMinuteOfIdleAndOfStall() {
 		SluiceServerProperties properties = bind(Map.of("sluice.data-port", "8000"));
 		assertThat(properties.limits().maxConnections()).isZero();
 		assertThat(properties.limits().maxConnectionsPerAddress()).isZero();
@@ -84,6 +84,16 @@ class SluiceServerPropertiesTest {
 		assertThat(properties.limits().idleTimeout()).isEqualTo(Duration.ofSeconds(60));
 		assertThat(properties.limits().h2QueueBudget().toBytes()).isZero();
 		assertThat(properties.limits().halfCloseProbeInterval()).isEqualTo(Duration.ofSeconds(1));
+		assertThat(properties.limits().stallTimeout()).isEqualTo(Duration.ofSeconds(60));
+		assertThat(properties.limits().stallMinBytes().toBytes()).isEqualTo(16 * 1024);
+	}
+
+	@Test
+	void aNonPositiveStallTimeoutOrMinimumFallsBackToTheDefault() {
+		SluiceServerProperties properties = bind(
+				Map.of("sluice.limits.stall-timeout", "0s", "sluice.limits.stall-min-bytes", "0B"));
+		assertThat(properties.limits().stallTimeout()).isEqualTo(Duration.ofSeconds(60));
+		assertThat(properties.limits().stallMinBytes().toBytes()).isEqualTo(16 * 1024);
 	}
 
 	@Test
@@ -105,13 +115,16 @@ class SluiceServerPropertiesTest {
 		SluiceServerProperties properties = bind(
 				Map.of("sluice.limits.max-connections", "100", "sluice.limits.max-connections-per-address", "10",
 						"sluice.limits.head-timeout", "2s", "sluice.limits.idle-timeout", "3s",
-						"sluice.limits.h2-queue-budget", "512KB", "sluice.limits.half-close-probe-interval", "250ms"));
+						"sluice.limits.h2-queue-budget", "512KB", "sluice.limits.half-close-probe-interval", "250ms",
+						"sluice.limits.stall-timeout", "5s", "sluice.limits.stall-min-bytes", "1B"));
 		assertThat(properties.limits().maxConnections()).isEqualTo(100);
 		assertThat(properties.limits().maxConnectionsPerAddress()).isEqualTo(10);
 		assertThat(properties.limits().headTimeout()).isEqualTo(Duration.ofSeconds(2));
 		assertThat(properties.limits().idleTimeout()).isEqualTo(Duration.ofSeconds(3));
 		assertThat(properties.limits().h2QueueBudget().toBytes()).isEqualTo(512 * 1024);
 		assertThat(properties.limits().halfCloseProbeInterval()).isEqualTo(Duration.ofMillis(250));
+		assertThat(properties.limits().stallTimeout()).isEqualTo(Duration.ofSeconds(5));
+		assertThat(properties.limits().stallMinBytes().toBytes()).isEqualTo(1);
 	}
 
 }

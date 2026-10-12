@@ -1,6 +1,7 @@
 package am.ik.sluice.server.proxy;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
@@ -51,8 +52,15 @@ import io.micrometer.core.instrument.MeterRegistry;
  * nothing of a next request was read, the idle timeout runs; the first bytes of the next
  * request stop it, and the head timeout runs until that head is complete. While a request
  * or response is in flight -- a response not yet complete, a request body still arriving
- * -- there is none, and an upgrade disarms it for good. A response whose framing the
- * tracker cannot follow stays owed, so such a connection keeps no deadline either.
+ * -- the stall timeout counts the time the relay waits on the client: a write to it not
+ * completed, or a read of a request body -- not while the relay is held back from reading
+ * by a leg that takes no more, nor while a {@code 100 Continue} is awaited (the request
+ * asked for one, and neither a response head nor a body byte came since). Waiting for an
+ * upstream's response does not count. Bytes read from the client and written to it count
+ * as progress, a write as each of its pieces of
+ * {@link ConnectionLimits.KeepAliveDeadline#WRITE_PIECE} completes. An upgrade disarms
+ * the deadline for good, and a response whose framing the tracker cannot follow stays
+ * owed, so such a connection keeps no deadline between requests either.
  * <p>
  * TCP tells a client that half-closed from one gone entirely only on a write: the second
  * write to a gone client fails, once its stack answered the first with a reset. So once
@@ -125,8 +133,23 @@ final class ReroutingRelay {
 	/** Responses owed by the legs: requests relayed whose response is not complete. */
 	private int owed;
 
-	/** Where the outbound parse stood after the last bytes it was fed. */
-	private Http1RequestParser.Position position = Http1RequestParser.Position.BETWEEN_REQUESTS;
+	/**
+	 * Where the outbound parse stood after the last bytes it was fed; written with
+	 * {@link #deadlineLock}, read by the stall watch without it.
+	 */
+	private volatile Http1RequestParser.Position position = Http1RequestParser.Position.BETWEEN_REQUESTS;
+
+	/** Threads writing to the client, or waiting to; the stall watch reads it. */
+	private final AtomicInteger writers = new AtomicInteger();
+
+	/** The outbound side waits in a read from the client. */
+	private volatile boolean reading;
+
+	/**
+	 * The last request head asked for {@code 100 Continue}, and neither a response head
+	 * nor a body byte of it came since: the client may hold its body back meanwhile.
+	 */
+	private volatile boolean continueAwaited;
 
 	/** The outbound side is feeding bytes read at a request boundary. */
 	private boolean starting = true;
@@ -166,6 +189,16 @@ final class ReroutingRelay {
 		this.deadline = deadline;
 		this.probeIntervalNanos = probeInterval.toNanos();
 		deadline.onExpiry(this::abort);
+		deadline.watchStalls(this::waitsOnClient, this::abort);
+	}
+
+	/**
+	 * Whether the relay waits on the client: a write to it not completed, or a read of a
+	 * request body that is due. Asked by the stall watch; never blocks.
+	 */
+	private boolean waitsOnClient() {
+		return this.writers.get() > 0
+				|| this.reading && this.position == Http1RequestParser.Position.IN_BODY && !this.continueAwaited;
 	}
 
 	/**
@@ -200,7 +233,7 @@ final class ReroutingRelay {
 			InputStream in = this.pipe.source();
 			byte[] buffer = new byte[BUFFER_SIZE];
 			int n;
-			while ((n = in.read(buffer)) > 0) {
+			while ((n = readClient(in, buffer)) > 0) {
 				if (!feeding()) {
 					// the deadline passed before these bytes arrived: the connection is
 					// being closed, and its request must not reach an upstream
@@ -223,6 +256,21 @@ final class ReroutingRelay {
 		}
 		finally {
 			settle();
+		}
+	}
+
+	/** Reads from the client, marked for the stall watch; bytes read are progress. */
+	private int readClient(InputStream in, byte[] buffer) throws IOException {
+		this.reading = true;
+		try {
+			int n = in.read(buffer);
+			if (n > 0) {
+				this.deadline.progress(n);
+			}
+			return n;
+		}
+		finally {
+			this.reading = false;
 		}
 	}
 
@@ -374,6 +422,8 @@ final class ReroutingRelay {
 			}
 		}
 		ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser.http1RequestOf(head);
+		String expect = ConnectionHeadParser.http1HeaderOf(head, "expect");
+		this.continueAwaited = expect != null && expect.toLowerCase(java.util.Locale.ROOT).contains("100-continue");
 		leg.requestSent(request, Http1RequestParser.isUpgrade(head));
 		this.lastRequest = System.nanoTime();
 		byte[] relayed = route.rewriteHost() ? ConnectionHeadRewriter.rewriteHttp1(head, route.address()) : head;
@@ -387,6 +437,9 @@ final class ReroutingRelay {
 		Leg leg = this.current;
 		if (leg == null) {
 			return; // unreachable: a head always precedes the body
+		}
+		if (length > 0) {
+			this.continueAwaited = false; // the client sends its body without the 100
 		}
 		leg.toUpstream(bytes, offset, length);
 	}
@@ -428,17 +481,30 @@ final class ReroutingRelay {
 		return null;
 	}
 
+	/**
+	 * Writes to the client in pieces, each one progress; counted as a writer for the
+	 * stall watch from before the sink lock is taken.
+	 */
 	private void writeToClient(byte[] bytes, int offset, int length) {
 		OutputStream sink = this.pipe.sink();
-		synchronized (this.sinkLock) {
-			try {
-				sink.write(bytes, offset, length);
+		this.writers.incrementAndGet();
+		try {
+			synchronized (this.sinkLock) {
+				for (int written = 0; written < length;) {
+					int piece = Math.min(ConnectionLimits.KeepAliveDeadline.WRITE_PIECE, length - written);
+					sink.write(bytes, offset + written, piece);
+					written += piece;
+					this.deadline.progress(piece);
+				}
 				sink.flush();
 				this.lastClientWrite = System.nanoTime();
 			}
-			catch (Exception e) {
-				throw new IllegalStateException(e);
-			}
+		}
+		catch (Exception e) {
+			throw new IllegalStateException(e);
+		}
+		finally {
+			this.writers.decrementAndGet();
 		}
 	}
 
@@ -842,6 +908,8 @@ final class ReroutingRelay {
 				return;
 			}
 			this.head.reset();
+			// a response head, interim or final: no 100 Continue is awaited any more
+			ReroutingRelay.this.continueAwaited = false;
 			if (!ConnectionHeadRewriter.isAscii(bytes)) {
 				this.drain(Mode.PASS);
 				return;

@@ -132,6 +132,18 @@ import io.micrometer.core.instrument.MeterRegistry;
  * relay refuses or answers itself starts it over. Its expiry ends the connection with a
  * GOAWAY {@code NO_ERROR} naming the highest stream the client opened.
  * <p>
+ * While a stream is open, the deadline's stall timeout counts the time the relay waits on
+ * the client ({@link #waitsOnClient()}): a write to it not completed, a response waiting
+ * for its connection window, a response begun whose stream window the client left
+ * exhausted (the upstream, bound by it, can send nothing), or a stream whose request is
+ * due -- not ended by the client, the client holding window to send it, no
+ * {@code 100 Continue} awaited, and no response in progress (a response begun and not
+ * ended makes it a streaming exchange). A CONNECT stream is a tunnel: neither its request
+ * nor its stream window counts. Waiting for an upstream does not count. DATA read from
+ * the client and response frames written to it count as progress, a write as each of its
+ * pieces of {@link ConnectionLimits.KeepAliveDeadline#WRITE_PIECE} completes. The expiry
+ * ends the connection with a GOAWAY {@code ENHANCE_YOUR_CALM}.
+ * <p>
  * HPACK blocks are re-encoded table-less, so each side's decoder sees self-contained
  * blocks whichever leg produced them, or when.
  */
@@ -322,6 +334,21 @@ final class Http2DemuxRelay {
 	/** Serializes the writes of the shared client stream. */
 	private final Object sinkLock = new Object();
 
+	/** Threads writing to the client, or waiting to; the stall watch reads it. */
+	private final AtomicInteger writers = new AtomicInteger();
+
+	/**
+	 * What the stall watch found when it last got the lock, its answer while another
+	 * thread holds it.
+	 */
+	private volatile boolean lastWaiting;
+
+	/**
+	 * The client's SETTINGS_INITIAL_WINDOW_SIZE, the initial window of a response;
+	 * written by the outbound parse only.
+	 */
+	private long clientInitialWindow = STREAM_WINDOW;
+
 	/**
 	 * Guards the stream flow state, the leg queues and the counters below; never held
 	 * across a socket write.
@@ -474,6 +501,7 @@ final class Http2DemuxRelay {
 		this.release = release;
 		this.deadline = deadline;
 		deadline.onExpiry(this::closeIdle);
+		deadline.watchStalls(this::waitsOnClient, this::closeStalled);
 		try {
 			this.headersDecoder.configuration().maxHeaderListSize(MAX_HEADER_LIST_SIZE, MAX_HEADER_LIST_SIZE);
 		}
@@ -651,6 +679,7 @@ final class Http2DemuxRelay {
 		if (frame.streamId() == 0) {
 			return; // DATA is stream-scoped; an unexpected connection-level frame
 		}
+		this.deadline.progress(frame.length());
 		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
 		if (stream == null) {
 			grantClient(frame.length()); // frames of streams never routed
@@ -672,6 +701,8 @@ final class Http2DemuxRelay {
 			}
 			else {
 				stream.clientWindow -= frame.length();
+				// the body comes: no 100 Continue is awaited any more
+				stream.continueAwaited = false;
 				stream.leg.queueData(stream, frame.bytes(), dataOffset, dataLength, frame.has(FLAG_END_STREAM));
 				release = releaseLocked(stream);
 				boolean owing = this.owedGrant > 0;
@@ -950,6 +981,7 @@ final class Http2DemuxRelay {
 		try {
 			if (!stream.reset) {
 				stream.leg.queueWindowUpdate(stream, increment);
+				stream.responseWindow += increment;
 			}
 		}
 		finally {
@@ -1007,6 +1039,21 @@ final class Http2DemuxRelay {
 				value = Math.min(value, MAX_HEADER_LIST_SIZE);
 			}
 			changes.put(id, value);
+		}
+		Long initialWindow = changes.get(SETTINGS_INITIAL_WINDOW_SIZE);
+		if (initialWindow != null && initialWindow != this.clientInitialWindow) {
+			// shifts the window of every response by the difference (RFC 9113 6.9.2)
+			long delta = initialWindow - this.clientInitialWindow;
+			this.clientInitialWindow = initialWindow;
+			this.lock.lock();
+			try {
+				for (Stream stream : this.streams.values()) {
+					stream.responseWindow += delta;
+				}
+			}
+			finally {
+				this.lock.unlock();
+			}
 		}
 		if (!changes.isEmpty()) {
 			this.clientSettings.putAll(changes);
@@ -1177,6 +1224,66 @@ final class Http2DemuxRelay {
 		abort();
 	}
 
+	/** The stall timeout passed: tells the client why, then ends the relay. */
+	private void closeStalled() {
+		goAway(ERROR_ENHANCE_YOUR_CALM);
+		abort();
+	}
+
+	/**
+	 * Whether the relay waits on the client: a write to it not completed, a response
+	 * waiting for its connection window, a response begun whose stream window it left
+	 * exhausted, or a request due from it (see {@link #requestDueLocked}); tunnels aside.
+	 * Asked by the stall watch, it never blocks: with the lock taken elsewhere, it
+	 * answers what it found last.
+	 */
+	private boolean waitsOnClient() {
+		if (this.writers.get() > 0) {
+			return true;
+		}
+		if (!this.lock.tryLock()) {
+			return this.lastWaiting;
+		}
+		try {
+			this.lastWaiting = waitsOnClientLocked();
+			return this.lastWaiting;
+		}
+		finally {
+			this.lock.unlock();
+		}
+	}
+
+	private boolean waitsOnClientLocked() {
+		if (!this.responseQueue.isEmpty()) {
+			return true;
+		}
+		// the client's connection window: 65535 plus the grants, less the DATA it sent
+		boolean connectionWindowLeft = this.owedGrant < STREAM_WINDOW;
+		for (Stream stream : this.streams.values()) {
+			if (!stream.active || stream.reset || stream.tunnel) {
+				continue;
+			}
+			if (stream.finalResponseBegun && !stream.responseEnded && stream.responseWindow <= 0) {
+				return true;
+			}
+			if (connectionWindowLeft && requestDueLocked(stream)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Whether the stream waits for request bytes the client may send: not ended by it,
+	 * window granted, no {@code 100 Continue} awaited, and no response in progress -- a
+	 * response begun and not ended makes it a streaming exchange, whose request may rest.
+	 * With {@link #lock}.
+	 */
+	private static boolean requestDueLocked(Stream stream) {
+		return !stream.clientEnded && stream.clientWindow > 0 && !stream.continueAwaited
+				&& (!stream.finalResponseBegun || stream.responseEnded);
+	}
+
 	private void routeRequestHead(int streamId, boolean endStream, io.netty.handler.codec.http2.Http2Headers headers) {
 		if (activeStreams() >= MAX_CONCURRENT_STREAMS) {
 			// beyond the advertised limit (RFC 9113 5.1.2); safe for the client to retry
@@ -1248,6 +1355,11 @@ final class Http2DemuxRelay {
 				stream.active = true;
 				stream.clientEnded = endStream;
 				stream.upstreamWindow = leg.initialWindow;
+				stream.responseWindow = this.clientInitialWindow;
+				stream.tunnel = "CONNECT".equals(String.valueOf(headers.method()));
+				String expect = headerOf(headers, "expect");
+				stream.continueAwaited = expect != null
+						&& expect.toLowerCase(java.util.Locale.ROOT).contains("100-continue");
 				leg.streamOpened(streamId);
 				leg.queueBlock(new LegEntry.Block(stream, frames, BlockKind.HEAD, endStream));
 				settleBudgetLocked();
@@ -1567,38 +1679,52 @@ final class Http2DemuxRelay {
 		}
 	}
 
+	/** Writes the relay's own frames to the client; no progress. */
 	private void writeToClient(byte[] bytes) {
-		OutputStream sink = this.pipe.sink();
-		synchronized (this.sinkLock) {
-			try {
-				sink.write(bytes);
-				sink.flush();
-			}
-			catch (Exception e) {
-				throw new IllegalStateException(e);
-			}
-		}
+		writePieces(bytes, 0, bytes.length, false);
 		this.lastClientWrite = System.nanoTime();
 	}
 
 	/**
-	 * Relays response bytes to the client in one write and accounts them to the leg and
-	 * the access log; the single reader per leg keeps the writes in stream order.
+	 * Relays response bytes to the client under the sink lock, so no other frame lands
+	 * among them, and accounts them to the leg and the access log; the single reader per
+	 * leg keeps the writes in stream order.
 	 */
 	private void writeToClient(byte[] bytes, int offset, int length, Leg leg) {
-		synchronized (this.sinkLock) {
-			try {
-				this.pipe.sink().write(bytes, offset, length);
-				this.pipe.sink().flush();
-			}
-			catch (Exception e) {
-				throw new IllegalStateException(e);
-			}
-		}
+		writePieces(bytes, offset, length, true);
 		this.lastClientWrite = System.nanoTime();
 		leg.outbound.increment(length);
 		leg.session.recordRelayed(length, StreamRelay.Direction.TO_LOCAL);
 		this.access.bytes(length, StreamRelay.Direction.TO_LOCAL);
+	}
+
+	/**
+	 * Writes to the client in pieces under the sink lock, each one progress when
+	 * {@code progress}; counted as a writer for the stall watch from before the lock is
+	 * taken.
+	 */
+	private void writePieces(byte[] bytes, int offset, int length, boolean progress) {
+		OutputStream sink = this.pipe.sink();
+		this.writers.incrementAndGet();
+		try {
+			synchronized (this.sinkLock) {
+				for (int written = 0; written < length;) {
+					int piece = Math.min(ConnectionLimits.KeepAliveDeadline.WRITE_PIECE, length - written);
+					sink.write(bytes, offset + written, piece);
+					written += piece;
+					if (progress) {
+						this.deadline.progress(piece);
+					}
+				}
+				sink.flush();
+			}
+		}
+		catch (Exception e) {
+			throw new IllegalStateException(e);
+		}
+		finally {
+			this.writers.decrementAndGet();
+		}
 	}
 
 	/**
@@ -1687,6 +1813,25 @@ final class Http2DemuxRelay {
 
 		/** In the relay's response queue: something of the response waits. */
 		boolean responseWaiting;
+
+		/**
+		 * The client's window for the response, as the upstream bound by it sees it: the
+		 * client's initial window, less the response DATA received, plus the client's
+		 * window updates of the stream.
+		 */
+		long responseWindow;
+
+		/** A CONNECT stream: a tunnel, whose request and stream window may rest. */
+		boolean tunnel;
+
+		/**
+		 * The request asked for {@code 100 Continue}, and neither a response head nor
+		 * request DATA came since: the client may hold its body back meanwhile.
+		 */
+		boolean continueAwaited;
+
+		/** A final (non-1xx) response head was relayed. */
+		boolean finalResponseBegun;
 
 		Stream(int id, Leg leg) {
 			this.id = id;
@@ -2529,7 +2674,9 @@ final class Http2DemuxRelay {
 				upstreamEnded(streamId);
 				forgetOpen(streamId);
 			}
-			relayHead(this, streamId, frames, endStream);
+			CharSequence status = headers.status();
+			boolean interim = status != null && status.length() == 3 && status.charAt(0) == '1';
+			relayHead(this, streamId, frames, endStream, interim);
 		}
 
 		/** Closes the virtual connection, releasing the upstream. */
@@ -2875,6 +3022,9 @@ final class Http2DemuxRelay {
 			boolean direct = false;
 			this.lock.lock();
 			try {
+				if (stream != null && stream.leg == leg) {
+					stream.responseWindow -= length;
+				}
 				if (stream != null && relayingResponseLocked(leg, stream)) {
 					if (!stream.responseWaiting && this.responseQueue.isEmpty() && this.clientSendWindow >= length) {
 						this.clientSendWindow -= length;
@@ -2940,14 +3090,14 @@ final class Http2DemuxRelay {
 	 * or no longer tracked -- is dropped; the caller decoded it all the same, keeping the
 	 * leg's decoder in step with the upstream's encoder.
 	 */
-	private void relayHead(Leg leg, int streamId, byte[] frames, boolean endStream) {
+	private void relayHead(Leg leg, int streamId, byte[] frames, boolean endStream, boolean interim) {
 		Stream stream = this.streams.get(Integer.valueOf(streamId));
 		if (stream == null || stream.leg != leg) {
 			return;
 		}
 		awaitBlockRoom(stream, frames.length);
 		synchronized (this.sinkLock) {
-			if (relayHeadLocked(stream, frames, endStream)) {
+			if (relayHeadLocked(stream, frames, endStream, interim)) {
 				writeToClient(frames, 0, frames.length, leg);
 			}
 		}
@@ -2958,9 +3108,13 @@ final class Http2DemuxRelay {
 	 * no longer relays a response on the stream; {@code true} when it is to be written
 	 * now.
 	 */
-	private boolean relayHeadLocked(Stream stream, byte[] frames, boolean endStream) {
+	private boolean relayHeadLocked(Stream stream, byte[] frames, boolean endStream, boolean interim) {
 		this.lock.lock();
 		try {
+			stream.continueAwaited = false;
+			if (!interim) {
+				stream.finalResponseBegun = true;
+			}
 			if (!relayingResponseLocked(stream.leg, stream)) {
 				return false;
 			}

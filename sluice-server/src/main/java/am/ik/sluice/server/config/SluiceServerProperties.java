@@ -385,10 +385,18 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * relayed, before the relay writes a {@code 100 Continue} to learn whether the client
 	 * is still there; at most four per response, never to an HTTP/1.0 request; {@code 0}
 	 * = off
+	 * @param stallTimeout how long a request or response in flight on a plaintext or
+	 * TLS-terminated HTTP connection may wait on its client -- to accept the relay's
+	 * writes or grant h2 flow-control window, or to send request bytes due -- without
+	 * {@code stallMinBytes} moving before the connection is closed; waiting for an
+	 * upstream does not count
+	 * @param stallMinBytes the bytes moved to or from the client that count as progress
+	 * against {@code stallTimeout}: less within it is a stall (a minimum rate)
 	 */
 	public record Limits(@DefaultValue("0") int maxConnections, @DefaultValue("0") int maxConnectionsPerAddress,
 			@DefaultValue("10s") Duration headTimeout, @DefaultValue("60s") Duration idleTimeout,
-			@DefaultValue("0") DataSize h2QueueBudget, @DefaultValue("1s") Duration halfCloseProbeInterval) {
+			@DefaultValue("0") DataSize h2QueueBudget, @DefaultValue("1s") Duration halfCloseProbeInterval,
+			@DefaultValue("60s") Duration stallTimeout, @DefaultValue("16KB") DataSize stallMinBytes) {
 
 		public Limits {
 			maxConnections = Math.max(0, maxConnections);
@@ -400,6 +408,10 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			h2QueueBudget = h2QueueBudget == null || h2QueueBudget.isNegative() ? DataSize.ofBytes(0) : h2QueueBudget;
 			halfCloseProbeInterval = halfCloseProbeInterval == null || halfCloseProbeInterval.isNegative()
 					? Duration.ofSeconds(1) : halfCloseProbeInterval;
+			stallTimeout = stallTimeout == null || stallTimeout.isNegative() || stallTimeout.isZero()
+					? Duration.ofSeconds(60) : stallTimeout;
+			stallMinBytes = stallMinBytes == null || stallMinBytes.toBytes() <= 0 ? DataSize.ofKilobytes(16)
+					: stallMinBytes;
 		}
 
 		public static Builder builder() {
@@ -419,6 +431,10 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			@Nullable private DataSize h2QueueBudget;
 
 			@Nullable private Duration halfCloseProbeInterval;
+
+			@Nullable private Duration stallTimeout;
+
+			@Nullable private DataSize stallMinBytes;
 
 			private Builder() {
 			}
@@ -453,12 +469,24 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder stallTimeout(Duration stallTimeout) {
+				this.stallTimeout = stallTimeout;
+				return this;
+			}
+
+			public Builder stallMinBytes(DataSize stallMinBytes) {
+				this.stallMinBytes = stallMinBytes;
+				return this;
+			}
+
 			public Limits build() {
 				return new Limits(this.maxConnections, this.maxConnectionsPerAddress,
 						this.headTimeout == null ? Duration.ofSeconds(10) : this.headTimeout,
 						this.idleTimeout == null ? Duration.ofSeconds(60) : this.idleTimeout,
 						this.h2QueueBudget == null ? DataSize.ofBytes(0) : this.h2QueueBudget,
-						this.halfCloseProbeInterval == null ? Duration.ofSeconds(1) : this.halfCloseProbeInterval);
+						this.halfCloseProbeInterval == null ? Duration.ofSeconds(1) : this.halfCloseProbeInterval,
+						this.stallTimeout == null ? Duration.ofSeconds(60) : this.stallTimeout,
+						this.stallMinBytes == null ? DataSize.ofKilobytes(16) : this.stallMinBytes);
 			}
 
 		}

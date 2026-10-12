@@ -7,11 +7,14 @@ import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+
+import org.springframework.util.unit.DataSize;
 
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.tunnel.ConnectionLimit;
@@ -20,7 +23,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class ConnectionLimitsTest {
 
+	private static final Duration STALL_TIMEOUT = Duration.ofMillis(400);
+
 	private final SimpleMeterRegistry meters = new SimpleMeterRegistry();
+
+	/** The meters of the limits with a short stall timeout. */
+	private final SimpleMeterRegistry stallMeters = new SimpleMeterRegistry();
 
 	private final SluiceServerProperties properties = SluiceServerProperties.builder()
 		.limits(SluiceServerProperties.Limits.builder()
@@ -218,6 +226,153 @@ class ConnectionLimitsTest {
 		assertThat(this.limits.admit(this.access)).as("the leg holds the last slot").isNull();
 		leg.release();
 		assertThat(this.limits.admitted()).isEqualTo(2);
+	}
+
+	@Test
+	void aWatchedRelayWaitingOnItsClientIsTornDownAtTheStallTimeout() throws Exception {
+		try (ServerSocket server = new ServerSocket(0);
+				Socket client = new Socket("127.0.0.1", server.getLocalPort());
+				Socket accepted = server.accept()) {
+			ConnectionLimits limits = stallLimits(DataSize.ofKilobytes(16));
+			try {
+				ConnectionLimits.KeepAliveDeadline deadline = limits.keepAliveDeadline(accepted);
+				CountDownLatch idle = new CountDownLatch(1);
+				CountDownLatch stalled = new CountDownLatch(1);
+				deadline.onExpiry(idle::countDown);
+				long start = System.nanoTime();
+				// busy from the start: watching arms the stall count at once
+				deadline.watchStalls(() -> true, stalled::countDown);
+				assertThat(limits.scheduledDeadlines()).isEqualTo(1);
+				assertThat(stalled.await(2, TimeUnit.SECONDS)).isTrue();
+				Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
+				assertThat(elapsed).as("between the stall timeout and two sample intervals past it")
+					.isGreaterThanOrEqualTo(STALL_TIMEOUT)
+					.isLessThan(STALL_TIMEOUT.plus(STALL_TIMEOUT.dividedBy(4)).plusMillis(100));
+				assertThat(idle.getCount()).as("the idle teardown did not run").isEqualTo(1);
+				Awaitility.await().atMost(Duration.ofSeconds(1)).until(accepted::isClosed);
+				assertThat(deadline.expired()).isTrue();
+				assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.IDLE)).isFalse();
+				assertThat(stallClosed()).isEqualTo(1);
+			}
+			finally {
+				limits.destroy();
+			}
+		}
+	}
+
+	@Test
+	void aWatchedRelayWaitingOnItsUpstreamIsNeverTornDown() throws Exception {
+		assertStallsAfter(DataSize.ofKilobytes(16), () -> false, 0, false);
+	}
+
+	@Test
+	void progressOfTheStallMinimumPerSampleKeepsAWaitingRelay() throws Exception {
+		assertStallsAfter(DataSize.ofKilobytes(16), () -> true, 16 * 1024, false);
+	}
+
+	@Test
+	void progressBelowTheStallMinimumDoesNotKeepAWaitingRelay() throws Exception {
+		assertStallsAfter(DataSize.ofKilobytes(16), () -> true, 1, true);
+	}
+
+	@Test
+	void aStallMinimumOfOneByteCountsEveryByte() throws Exception {
+		assertStallsAfter(DataSize.ofBytes(1), () -> true, 1, false);
+	}
+
+	@Test
+	void anotherPhaseStopsTheStallCountAndBusyAgainStartsItOver() throws Exception {
+		try (ServerSocket server = new ServerSocket(0);
+				Socket client = new Socket("127.0.0.1", server.getLocalPort());
+				Socket accepted = server.accept()) {
+			ConnectionLimits limits = stallLimits(DataSize.ofKilobytes(16));
+			try {
+				ConnectionLimits.KeepAliveDeadline deadline = limits.keepAliveDeadline(accepted);
+				CountDownLatch stalled = new CountDownLatch(1);
+				deadline.watchStalls(() -> true, stalled::countDown);
+				Thread.sleep(STALL_TIMEOUT.multipliedBy(3).dividedBy(4).toMillis());
+				assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.HEAD)).isTrue();
+				long busy = System.nanoTime();
+				assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.BUSY)).isTrue();
+				assertThat(limits.scheduledDeadlines()).as("the head timeout gave way to the stall count").isEqualTo(1);
+				assertThat(stalled.await(2, TimeUnit.SECONDS)).isTrue();
+				assertThat(Duration.ofNanos(System.nanoTime() - busy)).as("counted from the busy phase entered anew")
+					.isGreaterThanOrEqualTo(STALL_TIMEOUT);
+				assertThat(this.stallMeters.get("sluice.data.connections.rejected")
+					.tag("reason", "head-timeout")
+					.counter()
+					.count()).isZero();
+			}
+			finally {
+				limits.destroy();
+			}
+		}
+	}
+
+	@Test
+	void aDisarmedWatchedDeadlineNeverStalls() throws Exception {
+		try (ServerSocket server = new ServerSocket(0);
+				Socket client = new Socket("127.0.0.1", server.getLocalPort());
+				Socket accepted = server.accept()) {
+			ConnectionLimits limits = stallLimits(DataSize.ofKilobytes(16));
+			try {
+				ConnectionLimits.KeepAliveDeadline deadline = limits.keepAliveDeadline(accepted);
+				deadline.watchStalls(() -> true, () -> {
+				});
+				deadline.disarm();
+				assertThat(limits.scheduledDeadlines()).isZero();
+				Thread.sleep(STALL_TIMEOUT.multipliedBy(2).toMillis());
+				assertThat(accepted.isClosed()).isFalse();
+				assertThat(stallClosed()).isZero();
+			}
+			finally {
+				limits.destroy();
+			}
+		}
+	}
+
+	/**
+	 * Watches a busy deadline whose relay answers {@code waiting}, reporting
+	 * {@code progress} bytes every quarter of a sample interval for three stall timeouts;
+	 * asserts whether it stalled.
+	 */
+	private void assertStallsAfter(DataSize minBytes, BooleanSupplier waiting, int progress, boolean stalls)
+			throws Exception {
+		try (ServerSocket server = new ServerSocket(0);
+				Socket client = new Socket("127.0.0.1", server.getLocalPort());
+				Socket accepted = server.accept()) {
+			ConnectionLimits limits = stallLimits(minBytes);
+			try {
+				ConnectionLimits.KeepAliveDeadline deadline = limits.keepAliveDeadline(accepted);
+				CountDownLatch stalled = new CountDownLatch(1);
+				deadline.watchStalls(waiting, stalled::countDown);
+				long end = System.nanoTime() + STALL_TIMEOUT.multipliedBy(3).toNanos();
+				long step = STALL_TIMEOUT.dividedBy(ConnectionLimits.KeepAliveDeadline.STALL_SAMPLES * 4).toMillis();
+				while (System.nanoTime() < end && stalled.getCount() > 0) {
+					deadline.progress(progress);
+					Thread.sleep(step);
+				}
+				assertThat(stalled.getCount() == 0).as("stalled").isEqualTo(stalls);
+				assertThat(stallClosed()).isEqualTo(stalls ? 1 : 0);
+			}
+			finally {
+				limits.destroy();
+			}
+		}
+	}
+
+	private ConnectionLimits stallLimits(DataSize minBytes) {
+		return new ConnectionLimits(SluiceServerProperties.builder()
+			.limits(SluiceServerProperties.Limits.builder()
+				.maxConnections(3)
+				.stallTimeout(STALL_TIMEOUT)
+				.stallMinBytes(minBytes)
+				.build())
+			.build(), this.stallMeters);
+	}
+
+	private double stallClosed() {
+		return this.stallMeters.get("sluice.data.connections.stall.closed").counter().count();
 	}
 
 	private ConnectionLimits.Admission admit() {
