@@ -17,7 +17,8 @@ Options:
 - a local metrics endpoint (wasmlet has no HTTP listener today)
 
 The instance limit (`--max-instances`, `Instances` in `wasm_host.rs`) is
-silent too: requests that waited for a slot and the 503s of those that found
+silent too: requests that waited for a slot (the process-wide one or their
+route's under an `instances=N` cap) and the 503s of those that found
 none within their budget are neither logged nor counted, so the limit cannot
 be sized from evidence either. The tests read only `Handler`'s gauge (live /
 peak / created stores) and `Instances::held`.

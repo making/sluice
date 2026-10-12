@@ -331,29 +331,56 @@ pub struct Sandbox {
     /// Warm `(Store, Service)` units kept for the route (see `Pool`); 0
     /// instantiates per request.
     pub pool: usize,
+    /// The route's cap on the instance slots it holds at once, its pooled
+    /// units included (`Handler::admit`); None leaves the route bounded by
+    /// `Instances` alone.
+    pub instances: Option<usize>,
 }
 
 impl Sandbox {
-    /// Parses the route query (`budget-ms=N&memory-mib=N&pool=N&wasi=cli,tcp`).
+    /// Parses the route query
+    /// (`budget-ms=N&instances=N&memory-mib=N&pool=N&wasi=cli,tcp`).
     pub fn parse(query: &str) -> Result<Sandbox, String> {
         let mut sandbox = Sandbox::default();
         for pair in query.split('&').filter(|pair| !pair.is_empty()) {
             let Some((key, value)) = pair.split_once('=') else {
                 return Err(format!("expected key=value in '{query}'"));
             };
+            let count = || -> Result<usize, String> {
+                value
+                    .parse()
+                    .map_err(|_| format!("{key}: not a number '{value}'"))
+            };
             if key == "wasi" {
                 sandbox.caps = Caps::parse(value)?;
             } else if key == "pool" {
-                sandbox.pool = value
-                    .parse()
-                    .map_err(|_| format!("pool: not a number '{value}'"))?;
+                sandbox.pool = count()?;
+            } else if key == "instances" {
+                sandbox.instances = match count()? {
+                    0 => return Err("instances: must be at least 1".into()),
+                    cap => Some(cap),
+                };
             } else if !sandbox.limits.set(key, value)? {
                 return Err(format!(
-                    "unknown option '{key}' (budget-ms, memory-mib, pool, wasi)"
+                    "unknown option '{key}' (budget-ms, instances, memory-mib, pool, wasi)"
                 ));
             }
         }
+        sandbox.check()?;
         Ok(sandbox)
+    }
+
+    /// Rejects a cap below the route's pool: every pooled unit holds one of
+    /// the route's slots for its lifetime.
+    fn check(&self) -> Result<(), String> {
+        match self.instances {
+            Some(cap) if cap < self.pool => Err(format!(
+                "instances={cap} is below pool={}: every pooled unit holds one of the \
+                 route's instance slots",
+                self.pool
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// The canonical query of the non-default settings; empty for defaults.
@@ -364,6 +391,9 @@ impl Sandbox {
         let mut pairs = Vec::new();
         if self.limits.budget != defaults.budget {
             pairs.push(format!("budget-ms={}", self.limits.budget.as_millis()));
+        }
+        if let Some(cap) = self.instances {
+            pairs.push(format!("instances={cap}"));
         }
         if self.limits.memory != defaults.memory {
             pairs.push(format!("memory-mib={}", self.limits.memory >> 20));
@@ -1124,14 +1154,19 @@ pub const INSTANCE_LIMIT_REACHED: &str = "wasm instance limit reached";
 /// store -- a request's, or a pooled unit's for the unit's lifetime -- holds
 /// one slot from before its creation until after it was dropped. A request
 /// finding none free waits for one within its budget (`Handler::admit`); the
-/// semaphore hands them out in request order.
+/// semaphore hands them out in request order. A route's `instances` cap
+/// bounds its share of them (`Handler::slot`) but reserves none.
 pub struct Instances {
     slots: Arc<tokio::sync::Semaphore>,
     max: usize,
 }
 
-/// One instance slot, freed when dropped.
-type Slot = tokio::sync::OwnedSemaphorePermit;
+/// One instance slot -- the process-wide one, plus the route's own under
+/// its `instances` cap -- freed when dropped.
+struct Slot {
+    _route: Option<tokio::sync::OwnedSemaphorePermit>,
+    _global: tokio::sync::OwnedSemaphorePermit,
+}
 
 impl Instances {
     /// The largest limit the semaphore takes.
@@ -1160,7 +1195,7 @@ impl Instances {
 
     /// Slots currently held.
     #[cfg(test)]
-    fn held(&self) -> usize {
+    pub(crate) fn held(&self) -> usize {
         self.max - self.slots.available_permits()
     }
 }
@@ -1265,27 +1300,35 @@ pub struct Handler {
     pool: Option<Arc<Pool>>,
     /// The process-wide instance slots every store of the route takes.
     instances: Arc<Instances>,
+    /// The route's own slots under its `instances` cap, taken with every
+    /// process-wide one; None without a cap.
+    route: Option<Arc<tokio::sync::Semaphore>>,
     /// Backing for `live_stores`, marked by `LiveStore`.
     live: Arc<Gauge>,
 }
 
 impl Handler {
     /// Starts the route's pool when its sandbox names one; its units take
-    /// their slots of `instances` for good, so a pool larger than the slots
-    /// left fails here (at startup).
+    /// their slots of `instances` (and of the route's cap) for good, so a
+    /// pool larger than the slots left, or than the cap, fails here (at
+    /// startup).
     pub fn new(
         loaded: Arc<Loaded>,
         sandbox: Sandbox,
         instances: &Arc<Instances>,
     ) -> Result<Arc<Handler>, String> {
+        sandbox.check()?;
         let live = Arc::new(Gauge::default());
+        let route = sandbox
+            .instances
+            .map(|cap| Arc::new(tokio::sync::Semaphore::new(cap)));
         let pool = match sandbox.pool {
             0 => None,
             units => {
                 let free = instances.slots.available_permits();
-                let slots = (0..units)
+                let globals = (0..units)
                     .map(|_| instances.slots.clone().try_acquire_owned().ok())
-                    .collect::<Option<Vec<Slot>>>()
+                    .collect::<Option<Vec<_>>>()
                     .ok_or_else(|| {
                         format!(
                             "pool={units} needs {units} instance slots, {free} left of \
@@ -1293,6 +1336,18 @@ impl Handler {
                             instances.max
                         )
                     })?;
+                let slots = globals
+                    .into_iter()
+                    .map(|global| Slot {
+                        _route: route.as_ref().map(|route| {
+                            route
+                                .clone()
+                                .try_acquire_owned()
+                                .expect("checked: the cap covers the pool")
+                        }),
+                        _global: global,
+                    })
+                    .collect();
                 Some(Pool::new(loaded.clone(), sandbox, live.clone(), slots))
             }
         };
@@ -1302,14 +1357,51 @@ impl Handler {
             sandbox,
             pool,
             instances: instances.clone(),
+            route,
         }))
     }
 
+    /// Waits for an instance slot: one of the route's under its cap first,
+    /// then a process-wide one. In this order a request held back by its
+    /// route's cap waits outside the process-wide queue, holding no slot
+    /// another route could use; the route's own slot it may hold meanwhile
+    /// only delays the route's later requests, which queue behind it anyway.
+    async fn slot(&self) -> Slot {
+        let route = match &self.route {
+            Some(route) => Some(route.clone().acquire_owned().await.expect("never closed")),
+            None => None,
+        };
+        let global = self
+            .instances
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("never closed");
+        Slot {
+            _route: route,
+            _global: global,
+        }
+    }
+
+    /// The route's slots held under its cap: its pooled units' and its
+    /// requests'; 0 without a cap.
+    #[cfg(test)]
+    fn route_held(&self) -> usize {
+        match (&self.route, self.sandbox.instances) {
+            (Some(route), Some(cap)) => cap - route.available_permits(),
+            _ => 0,
+        }
+    }
+
     /// Finds the request an instance: first one of its connection's slots,
-    /// then an idle pooled unit, else a slot for a per-request instance.
-    /// With none free it waits until `deadline` -- for the share, then for
+    /// then an idle pooled unit, else a slot for a per-request instance
+    /// (`slot`: the route's under its cap, then a process-wide one). With
+    /// none free it waits until `deadline` -- for the share, then for
     /// whichever comes first of a unit going idle and a slot freeing -- and
-    /// keeps its place in the slots' queue meanwhile.
+    /// keeps its place in the slots' queues meanwhile. While a route's units
+    /// hold every one of its slots (a cap equal to the pool), its requests
+    /// get none here and wait for a unit.
     async fn admit(
         &self,
         request: hyper::Request<hyper::body::Incoming>,
@@ -1330,13 +1422,13 @@ impl Handler {
             deadline,
             share,
         };
-        let slot = self.instances.slots.clone().acquire_owned();
+        let slot = self.slot();
         tokio::pin!(slot);
         loop {
             let Some(pool) = &self.pool else {
                 return tokio::select! {
                     biased;
-                    slot = &mut slot => Admission::Cold(job, slot.expect("never closed")),
+                    slot = &mut slot => Admission::Cold(job, slot),
                     () = &mut expired => Admission::Full,
                 };
             };
@@ -1354,7 +1446,7 @@ impl Handler {
                 // a warm unit first: a slot acquired meanwhile stays in the
                 // pinned future for the next round, or frees with it
                 () = &mut offered => {}
-                slot = &mut slot => return Admission::Cold(job, slot.expect("never closed")),
+                slot = &mut slot => return Admission::Cold(job, slot),
                 () = &mut expired => return Admission::Full,
             }
         }
@@ -1407,7 +1499,8 @@ struct Job {
 /// (which consumes the store) with a per-request job loop inside. A unit
 /// serves one request at a time; the pool's size is the warm concurrency, and
 /// requests beyond it fall back to the per-request path (`respond`) while an
-/// instance slot is free, so the pool only ever improves the warm latency.
+/// instance slot is free (within the route's cap, which counts the units), so
+/// the pool only ever improves the warm latency.
 /// Measured on the hello guest (the ignored `load_comparison_reference`,
 /// sequential requests, dev profile): ~380us cold vs ~120us pooled per
 /// request. Every unit holds an instance slot for its lifetime, handed on to
@@ -4088,5 +4181,380 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(second.status(), 504, "pooled {pooled}");
         }
+    }
+
+    // -- per-route cap ------------------------------------------------------
+
+    /// A route on `instances` capped at `cap` of the slots, keeping `pool`
+    /// units, with `budget` (the default when None).
+    fn capped(
+        loaded: &Arc<Loaded>,
+        instances: &Arc<Instances>,
+        cap: usize,
+        pool: usize,
+        budget: Option<Duration>,
+    ) -> Arc<Handler> {
+        let mut sandbox = Sandbox {
+            instances: Some(cap),
+            pool,
+            ..Sandbox::default()
+        };
+        if let Some(budget) = budget {
+            sandbox.limits.budget = budget;
+        }
+        Handler::new(loaded.clone(), sandbox, instances).unwrap()
+    }
+
+    /// Asserts `response` is a 200.
+    fn assert_ok(response: Option<String>, what: &str) {
+        assert!(
+            response
+                .as_deref()
+                .is_some_and(|r| r.starts_with("HTTP/1.1 200")),
+            "{what}: {response:?}"
+        );
+    }
+
+    /// A route at its cap holds back its own further requests, which take no
+    /// process-wide slot while they wait: another route is served at once.
+    #[tokio::test]
+    async fn a_route_at_its_cap_leaves_the_other_routes_their_slots() {
+        let loaded = hello().await;
+        let instances = Instances::new(2);
+        let busy = capped(&loaded, &instances, 1, 0, None);
+        let other = limited(&loaded, &instances, Some(Duration::from_secs(1)));
+        let occupant = stalled_connection(&busy).await;
+        assert_eq!(busy.route_held(), 1, "precondition: the route's slot held");
+
+        let mut waiter = open(&busy, &get("/")).await;
+        assert_eq!(
+            answered(&mut waiter, Duration::from_millis(300)).await,
+            None,
+            "the route's next request waits for its slot"
+        );
+        assert_eq!(instances.held(), 1, "the waiter takes no process-wide slot");
+        assert_eq!(busy.stores_created(), 1, "no store for the waiter");
+
+        // served within its 1s budget, while the occupant holds on for 10s
+        let body = exchange(&other, &get("/")).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+
+        occupant.error(1, "public peer left").await;
+        assert_ok(
+            answered(&mut waiter, Duration::from_secs(3)).await,
+            "the waiter takes the route's freed slot",
+        );
+        assert_eq!(busy.peak_stores(), 1, "never past the cap");
+    }
+
+    /// A route capped at its pool's size never instantiates per request: a
+    /// request finding every unit busy waits for one, though process-wide
+    /// slots are free.
+    #[tokio::test]
+    async fn a_route_capped_at_its_pool_never_instantiates_per_request() {
+        let instances = Instances::new(4);
+        let handler = capped(&hello().await, &instances, 1, 1, None);
+        restocked(&handler, 1).await;
+        assert_eq!(handler.route_held(), 1, "the unit holds the route's slot");
+
+        let occupant = stalled_connection(&handler).await;
+        let mut waiter = open(&handler, &get("/")).await;
+        assert_eq!(
+            answered(&mut waiter, Duration::from_millis(300)).await,
+            None
+        );
+        assert_eq!(handler.stores_created(), 1, "no per-request store");
+        assert_eq!(instances.held(), 1, "process-wide slots stay free");
+
+        occupant.error(1, "public peer left").await;
+        assert_ok(
+            answered(&mut waiter, Duration::from_secs(3)).await,
+            "the replacement unit serves the waiter",
+        );
+        let pool = pool(&handler);
+        assert_eq!(pool.served(), 2, "both requests pooled");
+        assert_eq!(pool.spawned(), 2, "one replacement");
+        assert_eq!(handler.stores_created(), 2, "the units' stores only");
+        assert_eq!(handler.peak_stores(), 1);
+        assert_eq!(handler.route_held(), 1, "the replacement holds the slot");
+    }
+
+    /// The cap counts the route's pooled units: with the pool busy, per-request
+    /// instances make up the rest of the cap and no more.
+    #[tokio::test]
+    async fn a_routes_cap_counts_its_pooled_units() {
+        let instances = Instances::new(4);
+        let handler = capped(&hello().await, &instances, 2, 1, None);
+        restocked(&handler, 1).await;
+        let pooled = stalled_connection(&handler).await;
+        let cold = stalled_connection(&handler).await;
+        assert_eq!(pool(&handler).served(), 1, "precondition: one pooled");
+        assert_eq!(handler.stores_created(), 2, "precondition: one cold");
+        assert_eq!(handler.route_held(), 2);
+
+        let mut waiter = open(&handler, &get("/")).await;
+        assert_eq!(
+            answered(&mut waiter, Duration::from_millis(300)).await,
+            None
+        );
+        assert_eq!(handler.stores_created(), 2, "no store past the cap");
+        assert_eq!(instances.held(), 2);
+
+        cold.error(1, "public peer left").await;
+        assert_ok(
+            answered(&mut waiter, Duration::from_secs(3)).await,
+            "the waiter takes the freed cold slot",
+        );
+        assert_eq!(handler.peak_stores(), 2, "never past the cap");
+        drop(pooled);
+    }
+
+    /// A request finding no slot of its route within its budget is answered
+    /// 503 at the budget, holding no process-wide slot meanwhile.
+    #[tokio::test]
+    async fn a_request_finding_no_route_slot_within_its_budget_is_a_503() {
+        let instances = Instances::new(2);
+        let budget = Duration::from_millis(800);
+        let handler = capped(&hello().await, &instances, 1, 0, Some(budget));
+        // the occupant: the route's only slot, taken as a request would
+        let occupant = handler.route.clone().unwrap().try_acquire_owned().unwrap();
+
+        let started = Instant::now();
+        let mut peer = open(&handler, &get("/")).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(instances.held(), 0, "waiting holds no process-wide slot");
+        let response = answered(&mut peer, budget + Duration::from_secs(2))
+            .await
+            .expect("answered at the budget");
+        let elapsed = started.elapsed();
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.contains(INSTANCE_LIMIT_REACHED), "{response}");
+        assert!(elapsed >= budget, "not before the budget: {elapsed:?}");
+        assert!(elapsed < budget + Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(handler.stores_created(), 0, "never instantiated");
+        assert_eq!(handler.route_held(), 1, "only the occupant's slot");
+        drop(occupant);
+    }
+
+    /// A request whose client leaves while it waits for its route's slot
+    /// gives up its place: it never takes the slot freed later.
+    #[tokio::test]
+    async fn a_request_whose_client_leaves_while_it_waits_for_its_route_never_takes_a_slot() {
+        let instances = Instances::new(2);
+        let handler = capped(&hello().await, &instances, 1, 0, None);
+        let occupant = stalled_connection(&handler).await;
+        let waiter = open(&handler, &get("/")).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(handler.stores_created(), 1, "precondition: it waits");
+        waiter.error(1, "public peer left").await;
+        eventually(
+            "the waiter's connection ends",
+            Duration::from_secs(1),
+            || !waiter.registered(1),
+        )
+        .await;
+
+        occupant.error(1, "public peer left").await;
+        eventually("the slots free", Duration::from_secs(3), || {
+            handler.route_held() == 0 && instances.held() == 0
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(handler.stores_created(), 1, "only the occupant's store");
+        assert_eq!(handler.route_held(), 0);
+        assert_eq!(instances.held(), 0);
+    }
+
+    /// A request holding its route's slot while it waits for a process-wide
+    /// one gives the route's slot back when it gives up: its client leaving,
+    /// and its budget running out (503).
+    #[tokio::test]
+    async fn a_request_giving_up_on_a_process_wide_slot_frees_its_route_slot() {
+        let loaded = hello().await;
+        let instances = Instances::new(1);
+        let holder = limited(&loaded, &instances, None);
+        let occupant = stalled_connection(&holder).await;
+        let budget = Duration::from_millis(800);
+        let handler = capped(&loaded, &instances, 1, 0, Some(budget));
+
+        let waiter = open(&handler, &get("/")).await;
+        eventually(
+            "the waiter takes its route's slot",
+            Duration::from_secs(1),
+            || handler.route_held() == 1,
+        )
+        .await;
+        waiter.error(1, "public peer left").await;
+        eventually(
+            "the route's slot frees with the client",
+            Duration::from_secs(1),
+            || handler.route_held() == 0,
+        )
+        .await;
+
+        let mut waiter = open(&handler, &get("/")).await;
+        eventually(
+            "the waiter takes its route's slot",
+            Duration::from_secs(1),
+            || handler.route_held() == 1,
+        )
+        .await;
+        let response = answered(&mut waiter, budget + Duration::from_secs(2))
+            .await
+            .expect("answered at the budget");
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        eventually(
+            "the route's slot frees at the budget",
+            Duration::from_secs(1),
+            || handler.route_held() == 0,
+        )
+        .await;
+        assert_eq!(handler.stores_created(), 0, "never instantiated");
+        assert_eq!(instances.held(), 1, "the occupant's slot only");
+        drop(occupant);
+    }
+
+    /// Asserts `handler`'s route slots and the process-wide ones free.
+    async fn assert_route_slots_freed(handler: &Handler, instances: &Instances, what: &str) {
+        eventually(what, Duration::from_secs(3), || {
+            handler.route_held() == handler.sandbox.pool && instances.held() == handler.sandbox.pool
+        })
+        .await;
+    }
+
+    /// A capped route's slot frees on every end of its request: a guest
+    /// trap, the budget (the watchdog and the epoch), the client leaving, a
+    /// failed instantiation, and a pooled unit that never got viable.
+    #[tokio::test]
+    async fn a_routes_slot_frees_on_every_exit() {
+        let loaded = hello().await;
+
+        let instances = Instances::new(2);
+        let handler = capped(&loaded, &instances, 1, 0, None);
+        let body = exchange(&handler, &get("/panic")).await;
+        assert!(body.starts_with("HTTP/1.1 500"), "{body}");
+        assert_route_slots_freed(&handler, &instances, "trap").await;
+        let body = exchange(&handler, &get("/")).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "after the trap: {body}");
+
+        for (path, budget) in [("/stall", 300), ("/spin", 100)] {
+            let instances = Instances::new(2);
+            let budget = Some(Duration::from_millis(budget));
+            let handler = capped(&loaded, &instances, 1, 0, budget);
+            let mut peer = open(&handler, &get(path)).await;
+            let frames = frames_until_quiet(&mut peer, Duration::from_secs(1)).await;
+            assert_eq!(handler.stores_created(), 1, "{path}: it had an instance");
+            assert!(!terminal_frames(&frames).is_empty(), "{path}: ended");
+            assert_route_slots_freed(&handler, &instances, path).await;
+        }
+
+        let instances = Instances::new(2);
+        let handler = capped(&loaded, &instances, 1, 0, None);
+        let peer = stalled_connection(&handler).await;
+        assert_eq!(handler.route_held(), 1, "precondition: held while served");
+        peer.error(1, "public peer left").await;
+        assert_route_slots_freed(&handler, &instances, "client gone").await;
+
+        let instances = Instances::new(2);
+        let tiny = |pool| {
+            let sandbox = Sandbox {
+                instances: Some(1),
+                pool,
+                limits: Limits {
+                    memory: 1 << 20,
+                    ..Limits::default()
+                },
+                ..Sandbox::default()
+            };
+            Handler::new(loaded.clone(), sandbox, &instances).unwrap()
+        };
+        let handler = tiny(0);
+        let body = exchange(&handler, &get("/")).await;
+        assert!(body.contains("instantiate failed"), "{body}");
+        assert_route_slots_freed(&handler, &instances, "failed instantiation").await;
+        let body = exchange(&handler, &get("/")).await;
+        assert!(
+            body.contains("instantiate failed"),
+            "the slot again: {body}"
+        );
+
+        let handler = tiny(1);
+        eventually("the pool shrinks", Duration::from_secs(5), || {
+            pool(&handler).units() == 0
+        })
+        .await;
+        eventually(
+            "the unviable unit's slot frees",
+            Duration::from_secs(3),
+            || handler.route_held() == 0,
+        )
+        .await;
+    }
+
+    /// The connection's share and the route's cap compose: an h2 connection
+    /// announces its share of the process-wide slots, and its streams beyond
+    /// the route's cap wait for the route's slot without a process-wide one.
+    #[tokio::test]
+    async fn h2_streams_beyond_the_routes_cap_wait_without_a_slot() {
+        let loaded = hello().await;
+        let instances = Instances::new(4);
+        let handler = capped(&loaded, &instances, 1, 0, None);
+        let mut client = h2_client(&handler).await;
+        let (first, _) = client.send_request(h2_get("/stall"), true).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the first stream's head")
+            .unwrap();
+        assert_eq!(first.status(), 200);
+        assert_eq!(
+            client.current_max_send_streams(),
+            2,
+            "the connection's share, not the route's cap"
+        );
+        client = client.ready().await.unwrap();
+        let (second, _) = client.send_request(h2_get("/"), true).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(handler.stores_created(), 1, "the second stream waits");
+        assert_eq!(instances.held(), 1, "holding no process-wide slot");
+
+        let other = limited(&loaded, &instances, Some(Duration::from_secs(1)));
+        let body = exchange(&other, &get("/")).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+
+        // the first stream's reset ends its store: the second takes the slot
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(3), second)
+            .await
+            .expect("the second stream is answered")
+            .unwrap();
+        assert_eq!(second.status(), 200);
+    }
+
+    /// A cap below the route's pool fails at startup and takes no slot; one
+    /// equal to it, or above `--max-instances`, is accepted.
+    #[tokio::test]
+    async fn a_cap_below_the_pool_fails_at_startup() {
+        let loaded = hello().await;
+        let instances = Instances::new(2);
+        let sandbox = Sandbox {
+            instances: Some(1),
+            pool: 2,
+            ..Sandbox::default()
+        };
+        let error = match Handler::new(loaded.clone(), sandbox, &instances) {
+            Ok(_) => panic!("pool=2 fit a cap of 1"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "instances=1 is below pool=2: every pooled unit holds one of the route's \
+             instance slots"
+        );
+        assert_eq!(instances.held(), 0, "the failed route took no slot");
+
+        let at_pool = capped(&loaded, &instances, 2, 2, None);
+        assert_eq!(at_pool.route_held(), 2);
+        let above = capped(&loaded, &Instances::new(1), 8, 0, None);
+        assert_eq!(above.route_held(), 0);
     }
 }

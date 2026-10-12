@@ -19,7 +19,8 @@
 //!   `--insecure` skips verification); no mTLS yet
 //! - one pre-linked (`InstancePre`) instance per request, under a per-route
 //!   epoch CPU budget, memory cap and `wasmtime serve`-style WASI
-//!   capabilities, and a process-wide instance limit (`--max-instances`);
+//!   capabilities, and a process-wide instance limit (`--max-instances`)
+//!   with optional per-route caps (`instances=N`);
 //!   response bodies stream via a bounded relay
 //!
 //! Usage:
@@ -243,8 +244,8 @@ fn parse_seconds(name: &str, value: &str) -> Result<Duration, String> {
         .map_err(|_| format!("--{name} must be a number of seconds (0 = off), got '{value}'"))
 }
 
-/// Splits `locator[?budget-ms=N&memory-mib=N&wasi=cap,...]` into the locator
-/// and the per-route sandbox. The `?` separator means literal `?` in file
+/// Splits `locator[?budget-ms=N&instances=N&memory-mib=N&pool=N&wasi=cap,...]`
+/// into the locator and the per-route sandbox. The `?` separator means literal `?` in file
 /// paths needs URL-escaping (`file://...%3F...`).
 fn parse_route_target(spec: &str) -> Result<(String, Sandbox), String> {
     match spec.split_once('?') {
@@ -283,6 +284,43 @@ fn identify<T>(request: &mut tonic::Request<T>, token: &str, id: &str) -> Result
     Ok(())
 }
 
+/// Target (`wasm:<locator>[?<sandbox>]`) -> its route handler.
+type Handlers = HashMap<String, Arc<Handler>>;
+
+/// Fetches / prewarms every route's component (fail fast) and builds its
+/// handler on `instances`, returning the handlers by target and the upstreams
+/// to advertise. The target is the component locator (`wasm:<url>`) plus the
+/// sandbox query; the server passes it through verbatim as the dial address
+/// and the wasmlet resolves it back.
+async fn handlers(
+    routes: &[Route],
+    instances: &Arc<Instances>,
+) -> Result<(Handlers, Vec<Upstream>), BoxError> {
+    let mut components = Handlers::new();
+    let mut advertised = Vec::with_capacity(routes.len());
+    for route in routes {
+        let target = route_target(&route.component.target().await?, &route.sandbox);
+        if !components.contains_key(&target) {
+            let component = match wasm_host::load(&route.component, route.sandbox.caps).await {
+                Ok(component) => component,
+                Err(e) => return Err(format!("wasm route '{}': {e}", route.host).into()),
+            };
+            // A second handler on the target would never serve, its pool's
+            // units holding their slots for good.
+            let handler = Handler::new(component, route.sandbox, instances)
+                .map_err(|e| format!("wasm route '{}': {e}", route.host))?;
+            components.insert(target.clone(), handler);
+        }
+        advertised.push(Upstream {
+            host: route.host.clone(),
+            target_url: target,
+            rewrite_host: false,
+            ..Default::default()
+        });
+    }
+    Ok((components, advertised))
+}
+
 async fn run(config: Config) -> Result<(), BoxError> {
     let Config {
         server,
@@ -298,27 +336,7 @@ async fn run(config: Config) -> Result<(), BoxError> {
     println!("wasmlet build: {}", describe(&peer_build()));
     let instances = Instances::new(max_instances);
 
-    // Fetch / prewarm every component (fail fast). The target is the component
-    // locator (`wasm:<url>`); the server passes it through verbatim as the dial
-    // address and the client resolves it back.
-    let mut components: HashMap<String, Arc<Handler>> = HashMap::new();
-    let mut advertised = Vec::with_capacity(routes.len());
-    for route in &routes {
-        let target = route_target(&route.component.target().await?, &route.sandbox);
-        let component = match wasm_host::load(&route.component, route.sandbox.caps).await {
-            Ok(component) => component,
-            Err(e) => return Err(format!("wasm route '{}': {e}", route.host).into()),
-        };
-        let handler = Handler::new(component, route.sandbox, &instances)
-            .map_err(|e| format!("wasm route '{}': {e}", route.host))?;
-        components.insert(target.clone(), handler);
-        advertised.push(Upstream {
-            host: route.host.clone(),
-            target_url: target,
-            rewrite_host: false,
-            ..Default::default()
-        });
-    }
+    let (components, advertised) = handlers(&routes, &instances).await?;
     let ca_pem = match ca_cert {
         Some(path) => Some(std::fs::read(&path).map_err(|e| format!("--ca-cert {path}: {e}"))?),
         None => None,
@@ -963,6 +981,73 @@ mod tests {
         assert_eq!(
             route_target("wasm:file:///a.wasm", &sandbox),
             "wasm:file:///a.wasm?wasi=cli"
+        );
+    }
+
+    /// `instances=N` caps the route's slots and is part of the advertised
+    /// target; a cap equal to the pool is accepted.
+    #[test]
+    fn route_target_caps_the_routes_instances() {
+        let (_, sandbox) = parse_route_target("./a.wasm?pool=2&instances=4").unwrap();
+        assert_eq!(sandbox.instances, Some(4));
+        assert_eq!(sandbox.pool, 2);
+        assert_eq!(
+            route_target("wasm:file:///a.wasm", &sandbox),
+            "wasm:file:///a.wasm?instances=4&pool=2"
+        );
+        let (_, sandbox) = parse_route_target("./a.wasm?instances=2&pool=2").unwrap();
+        assert_eq!(sandbox.instances, Some(2));
+        let (_, sandbox) = parse_route_target("./a.wasm").unwrap();
+        assert_eq!(sandbox.instances, None, "no cap unless set");
+    }
+
+    /// Routes naming one component with the same options share a dial
+    /// address, so they share one handler: its pool starts once (no unit
+    /// orphaned on a slot), and its cap bounds the routes together.
+    #[tokio::test]
+    async fn routes_sharing_a_target_share_one_handler() {
+        let path = wasm_host::tests::guest_wasm("hello");
+        let route = |host: &str| Route {
+            host: host.into(),
+            component: Locator::parse(path.to_str().unwrap()).unwrap(),
+            sandbox: Sandbox {
+                pool: 1,
+                instances: Some(1),
+                ..Sandbox::default()
+            },
+        };
+        let instances = Instances::new(4);
+        let (handlers, advertised) = handlers(&[route("a.local"), route("b.local")], &instances)
+            .await
+            .unwrap();
+        let hosts: Vec<_> = advertised.iter().map(|up| up.host.as_str()).collect();
+        assert_eq!(hosts, ["a.local", "b.local"], "both hosts advertised");
+        assert_eq!(advertised[0].target_url, advertised[1].target_url);
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(instances.held(), 1, "one pool started");
+    }
+
+    /// A zero cap, a cap below the pool (in either order) and a non-number
+    /// are startup errors.
+    #[test]
+    fn route_target_rejects_a_cap_below_one_or_the_pool() {
+        assert_eq!(
+            parse_route_target("./a.wasm?instances=0").unwrap_err(),
+            "instances: must be at least 1"
+        );
+        let below = "instances=1 is below pool=2: every pooled unit holds one of the route's \
+                     instance slots";
+        assert_eq!(
+            parse_route_target("./a.wasm?instances=1&pool=2").unwrap_err(),
+            below
+        );
+        assert_eq!(
+            parse_route_target("./a.wasm?pool=2&instances=1").unwrap_err(),
+            below
+        );
+        assert_eq!(
+            parse_route_target("./a.wasm?instances=many").unwrap_err(),
+            "instances: not a number 'many'"
         );
     }
 

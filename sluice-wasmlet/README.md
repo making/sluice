@@ -93,12 +93,21 @@ the wait for an instance slot, instantiation, handler and response relay
 (exceeded -> 504, or a truncated body once streaming, or 503 while still
 waiting for a slot; defaults 10000) and `memory-mib` the per-instance linear
 memory cap in MiB (exceeded -> guest trap, 500; defaults 256). `pool=N`
-keeps `N` warm instances per route (see [Instance pool](#instance-pool)). A literal `?`
-in a file path needs URL-escaping.
+keeps `N` warm instances per route (see [Instance pool](#instance-pool)).
+`instances=N` caps the instance slots the route holds at once, its pooled
+units included; unset, the route is bounded by `--max-instances` alone. A
+request finding the route at its cap waits for one of the route's slots within
+its budget (503 when it runs out, as above), holding no `--max-instances` slot
+meanwhile: requests waiting on a route's cap take no slot from the other
+routes. The cap reserves nothing: only `pool` does. It must be at least 1 and
+at least `pool` (a startup error otherwise). With a cap equal to `pool`, a
+request finding every unit busy waits for one instead of instantiating per
+request. A literal `?` in a file path needs URL-escaping.
 
 ```text
 --wasm demo.local=hello.wasm?budget-ms=5000&memory-mib=64
 --wasm demo.local=hello.wasm?pool=8
+--wasm batch.local=batch.wasm?instances=4
 curl -H 'Host: demo.local' http://127.0.0.1:8000/hello
 ```
 
@@ -173,7 +182,8 @@ lines, prefixed with the component and a request id
   non-default options (`wasm:file://...?wasi=cli,inherit-network`; the server
   passes `wasm:` targets through verbatim as the dial address — oci / s3
   resolvers slot into the same form), so routes sharing a component with
-  different options stay distinct
+  different options stay distinct, and routes (hosts) with the same component
+  and options share one handler: one pool, one `instances` cap
 
 ### Instance pool
 
@@ -183,10 +193,11 @@ store) with a per-request job loop inside, so reuse cannot hand instances
 back: a unit serves one request at a time and the pool size is the warm
 concurrency. A unit is offered once instantiated; a request beyond the
 stock, or on a route without `pool`, uses the per-request path above while
-an instance slot is free, so the pool only ever improves the warm latency
-(hello guest, dev profile: ~380us cold vs ~120us pooled per request). Each
-unit holds an instance slot of `--max-instances` for its lifetime (a retired
-unit's replacement takes it over); the pools of all routes together may not
+an instance slot is free (and the route's `instances` cap allows), so the
+pool only ever improves the warm latency (hello guest, dev profile: ~380us
+cold vs ~120us pooled per request). Each unit holds an instance slot of
+`--max-instances`, and one of its route's cap, for its lifetime (a retired
+unit's replacement takes them over); the pools of all routes together may not
 exceed the limit, which is checked at startup. With no slot free, a request
 waits for whichever comes first, an idle unit or a free slot.
 
@@ -217,8 +228,10 @@ duplicate is closed on the client side before the server drops it.
 - no mTLS (client certificates) yet
 - the epoch budget is absolute (suspended time counts) and granular to the
   10ms tick; a CPU-limiting `fuel` accounting is not there yet
-- the instance slots are shared by every route, with no per-route share: busy
-  routes can hold every slot and delay the others
+- routes without `instances` share the instance slots unbounded: busy ones can
+  hold every slot not pooled and delay the others. A route keeps slots of its
+  own only through `pool`, or by capping the other routes below
+  `--max-instances` together
 - guest async tasks live within `wit-bindgen`'s runtime; the `spawn`
   caveats about task lifetime apply
 
