@@ -15,6 +15,7 @@ import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.UnaryOperator;
 import java.util.List;
 import javax.net.ssl.SNIMatcher;
 import javax.net.ssl.SNIServerName;
@@ -108,6 +109,9 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	/** Handed to every h2 demux relay started from now on. */
 	private volatile Http2DemuxRelay.WriteSeam h2WriteSeam = Http2DemuxRelay.WriteSeam.NONE;
+
+	/** Wraps the client pipe of every HTTP/1.1 relay started from now on. */
+	private volatile UnaryOperator<DuplexPipe> clientPipeSeam = UnaryOperator.identity();
 
 	private volatile boolean running;
 
@@ -375,9 +379,10 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				}
 				return true;
 			}
-			ReroutingRelay rerouting = new ReroutingRelay(conn.pipe(), conn.head(), this.router, this.sessions,
-					this.accessControl, this.errorResponse, access, this.meterRegistry, route0, session, peer, deadline,
-					this.properties.limits().halfCloseProbeInterval(), this.probeSeam, relayed, release);
+			ReroutingRelay rerouting = new ReroutingRelay(this.clientPipeSeam.apply(conn.pipe()), conn.head(),
+					this.router, this.sessions, this.accessControl, this.errorResponse, access, this.meterRegistry,
+					route0, session, peer, deadline, this.properties.limits().halfCloseProbeInterval(), this.probeSeam,
+					relayed, release);
 			this.activeConnections.incrementAndGet();
 			try {
 				rerouting.start();
@@ -573,6 +578,14 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	/** Sets the write seam of the h2 demux relays started from now on; for tests. */
 	void h2WriteSeam(Http2DemuxRelay.WriteSeam h2WriteSeam) {
 		this.h2WriteSeam = h2WriteSeam;
+	}
+
+	/**
+	 * Wraps the client pipe of the HTTP/1.1 relays started from now on in
+	 * {@code clientPipeSeam}; for tests.
+	 */
+	void clientPipeSeam(UnaryOperator<DuplexPipe> clientPipeSeam) {
+		this.clientPipeSeam = clientPipeSeam;
 	}
 
 	/**

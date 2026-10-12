@@ -563,11 +563,12 @@ quarter of the timeout past it. The HTTP/1.1 relay measures the time it waits; t
 is sampled at each check instead, and a check finding it not waiting voids the intervals on
 both sides. Write progress is what the client's TCP stack accepts: once the buffers towards
 a client that reads slowly have filled up, a blocked write may return long after the client
-resumed reading (`StallTimeoutSlowReaderE2ETest` tells what was observed on macOS and Linux
-loopback: on Linux, only once the client drained about 900KB), so keep the timeout well
-above such gaps. A client streaming small h2 messages (a gRPC client stream) slower than the
-minimum is cut too: set `stall-min-bytes=1B` to count every byte, or raise the timeout.
-Connections relayed verbatim keep no stall timeout; see the verbatim idle timeout below.
+resumed reading (observed on Linux loopback: only once the client drained about 900KB), so
+keep the timeout well above such gaps.
+The HTTP/1.1 relay writes in 16KiB pieces, each counted as progress once it completes. A
+client streaming small h2 messages (a gRPC client stream) slower than the minimum is cut too:
+set `stall-min-bytes=1B` to count every byte, or raise the timeout. Connections relayed
+verbatim keep no stall timeout; see the verbatim idle timeout below.
 
 A connection relayed verbatim -- TLS passthrough, a tcp route, a hostless connection (a
 RESP head, plaintext or TLS-terminated), an upgraded HTTP/1.1 connection (a WebSocket,

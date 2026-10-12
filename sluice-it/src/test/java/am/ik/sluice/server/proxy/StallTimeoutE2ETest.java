@@ -1,12 +1,15 @@
 package am.ik.sluice.server.proxy;
 
 import java.io.ByteArrayOutputStream;
+import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -21,6 +24,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.function.UnaryOperator;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocket;
@@ -42,6 +46,7 @@ import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.it.TestSockets;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.route.Router;
+import am.ik.sluice.tunnel.DuplexPipe;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
@@ -57,9 +62,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * does not read the response, or does not send the request body due -- or drips it below
  * the stall minimum --, is closed at the stall timeout and its slot released, plaintext
  * and TLS-terminated; an upstream slower than the timeout, a response trickling, an
- * upload held back by its upstream, and a client awaiting a {@code 100 Continue} are not
- * cut (a client reading slowly: {@link StallTimeoutSlowReaderE2ETest}). In the relay's
- * package for the deadline queue of {@link ConnectionLimits}.
+ * upload held back by its upstream, a client awaiting a {@code 100 Continue}, and a
+ * client taking one write piece per second are not cut. In the relay's package for the
+ * deadline queue of {@link ConnectionLimits} and the client pipe seam of
+ * {@link DataProxyServer}.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -78,6 +84,12 @@ class StallTimeoutE2ETest {
 	private static final int BIG = 16 * 1024 * 1024;
 
 	private static final int UPLOAD = 16 * 1024 * 1024;
+
+	/**
+	 * The bytes per second the slow client takes: one write piece, and the stall minimum
+	 * (16KiB by default).
+	 */
+	private static final int SLOW_CLIENT_RATE = ConnectionLimits.KeepAliveDeadline.WRITE_PIECE;
 
 	private static final String OK = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 
@@ -106,6 +118,10 @@ class StallTimeoutE2ETest {
 	@Nullable
 	@Autowired
 	private Router router;
+
+	@Nullable
+	@Autowired
+	private DataProxyServer dataProxyServer;
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) throws Exception {
@@ -311,6 +327,53 @@ class StallTimeoutE2ETest {
 			exchange(socket, "ok", OK);
 			assertThat(stallClosed()).isEqualTo(stalls);
 		}
+	}
+
+	/**
+	 * A client taking the response at one write piece per second -- the relay's client
+	 * pipe accepts {@link #SLOW_CLIENT_RATE} bytes per second, no kernel buffers in
+	 * between -- is not cut, though the relay waits on it nearly all the time: each piece
+	 * completed is progress. Written at once, a 64KiB read of the tunnel would keep the
+	 * relay waiting 4s, past the stall timeout.
+	 */
+	@Test
+	void aClientTakingOneWritePieceASecondIsNotCut() throws Exception {
+		double stalls = stallClosed();
+		dataProxyServer().clientPipeSeam(pipe -> new RateLimitedPipe(pipe, SLOW_CLIENT_RATE));
+		try (Socket socket = connect()) {
+			send(socket, "GET /big HTTP/1.1\r\nHost: " + HOST + "\r\n\r\n");
+			long start = System.nanoTime();
+			Duration watched = STALL_TIMEOUT.multipliedBy(3);
+			long received = readFor(socket, watched);
+			Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
+			assertThat(received).as("the client pipe held the response back to its rate")
+				.isLessThanOrEqualTo(SLOW_CLIENT_RATE * (elapsed.toMillis() / 1000 + 1))
+				.isGreaterThanOrEqualTo(SLOW_CLIENT_RATE * (watched.toSeconds() - 2));
+			assertThat(admitted()).as("the connection is still relayed").isEqualTo(1);
+			assertThat(stallClosed()).isEqualTo(stalls);
+		}
+		finally {
+			dataProxyServer().clientPipeSeam(UnaryOperator.identity());
+		}
+	}
+
+	/** Reads what arrives for {@code duration}; the bytes read, failing at EOF. */
+	private static long readFor(Socket socket, Duration duration) throws IOException {
+		long end = System.nanoTime() + duration.toNanos();
+		byte[] buffer = new byte[64 * 1024];
+		long total = 0;
+		socket.setSoTimeout(100);
+		while (System.nanoTime() < end) {
+			try {
+				int n = socket.getInputStream().read(buffer);
+				assertThat(n).as("no EOF after %d bytes", total).isPositive();
+				total += n;
+			}
+			catch (SocketTimeoutException e) {
+				// nothing yet
+			}
+		}
+		return total;
 	}
 
 	/**
@@ -597,6 +660,10 @@ class StallTimeoutE2ETest {
 		return Objects.requireNonNull(this.router, "router");
 	}
 
+	private DataProxyServer dataProxyServer() {
+		return Objects.requireNonNull(this.dataProxyServer, "dataProxyServer");
+	}
+
 	private static void close(AutoCloseable closeable) {
 		try {
 			closeable.close();
@@ -604,6 +671,62 @@ class StallTimeoutE2ETest {
 		catch (Exception e) {
 			// ignore
 		}
+	}
+
+	/**
+	 * A client pipe whose writes take as long as the bytes they carry at {@code rate}
+	 * bytes per second before they pass on: a client taking the bytes at that rate.
+	 */
+	private static final class RateLimitedPipe implements DuplexPipe {
+
+		private final DuplexPipe pipe;
+
+		private final OutputStream sink;
+
+		RateLimitedPipe(DuplexPipe pipe, int rate) {
+			this.pipe = pipe;
+			this.sink = new FilterOutputStream(pipe.sink()) {
+
+				@Override
+				public void write(int b) throws IOException {
+					write(new byte[] { (byte) b }, 0, 1);
+				}
+
+				@Override
+				public void write(byte[] bytes, int offset, int length) throws IOException {
+					try {
+						Thread.sleep(Duration.ofNanos(length * 1_000_000_000L / rate));
+					}
+					catch (InterruptedException e) {
+						Thread.currentThread().interrupt();
+						throw new InterruptedIOException();
+					}
+					this.out.write(bytes, offset, length);
+				}
+
+			};
+		}
+
+		@Override
+		public InputStream source() {
+			return this.pipe.source();
+		}
+
+		@Override
+		public OutputStream sink() {
+			return this.sink;
+		}
+
+		@Override
+		public void shutdownOutput() throws Exception {
+			this.pipe.shutdownOutput();
+		}
+
+		@Override
+		public void close() throws Exception {
+			this.pipe.close();
+		}
+
 	}
 
 }
