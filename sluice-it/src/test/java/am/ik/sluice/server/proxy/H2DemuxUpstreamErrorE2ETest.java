@@ -3,6 +3,7 @@ package am.ik.sluice.server.proxy;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -475,6 +476,14 @@ class H2DemuxUpstreamErrorE2ETest {
 			client.headers(1, true, get(route));
 			client.headers(3, true, get(route));
 			client.headers(5, true, get(route));
+			// the relay handles the client's frames in order: once it acked the PING,
+			// stream 5 waits for the concurrency limit
+			byte[] ping = Arrays.copyOf(TestH2.int32(5), 8);
+			client.frame(TestH2.PING, 0, 0, ping);
+			assertThat(client.awaitTrue(() -> client.pingAcks().stream().anyMatch(ack -> Arrays.equals(ack, ping)),
+					WITHIN))
+				.as("the relay acked the PING")
+				.isTrue();
 			ScriptedH2Upstream.Connection connection = upstream.awaitConnection(0, WITHIN);
 			assertThat(connection.await(frame -> frame.type() == TestH2.HEADERS && frame.streamId() == 3, WITHIN))
 				.isNotNull();

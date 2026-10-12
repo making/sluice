@@ -15,7 +15,9 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -121,6 +123,9 @@ class MalformedRequestE2ETest {
 	/** The bytes every connection of the echo upstreams received, per connection. */
 	private final List<ByteArrayOutputStream> received = new CopyOnWriteArrayList<>();
 
+	/** The records of {@link #received} whose connection ended. */
+	private final Set<ByteArrayOutputStream> ended = new CopyOnWriteArraySet<>();
+
 	private @Nullable TunnelClient client;
 
 	@Nullable
@@ -190,6 +195,7 @@ class MalformedRequestE2ETest {
 		awaitAdmitted(0);
 		Awaitility.await().atMost(Duration.ofSeconds(3)).until(() -> connectionLimits().scheduledDeadlines() == 0);
 		this.received.clear();
+		this.ended.clear();
 	}
 
 	@AfterAll
@@ -267,11 +273,12 @@ class MalformedRequestE2ETest {
 				ascii("POST /upload HTTP/1.1\r\nHost: " + ECHO_HOST + "\r\nTransfer-Encoding: chunked\r\n\r\n"));
 		// the upstream reads the head, then waits for a chunk-size line until its EOF
 		Awaitility.await().atMost(Duration.ofSeconds(3)).until(() -> this.received.size() == 1);
-		Awaitility.await()
-			.atMost(Duration.ofSeconds(3))
-			.untilAsserted(() -> assertThat(this.received.getFirst().toByteArray())
-				.as("the invalid chunk-size line is not relayed")
-				.isEqualTo(relayed));
+		ByteArrayOutputStream record = this.received.getFirst();
+		Awaitility.await().atMost(Duration.ofSeconds(3)).until(() -> this.ended.contains(record));
+		// the head relayed before the invalid line may be dropped with the leg's teardown
+		assertThat(record.toByteArray()).as("the invalid chunk-size line is not relayed")
+			.satisfiesAnyOf(bytes -> assertThat(bytes).isEqualTo(relayed),
+					bytes -> assertThat(bytes).isEqualTo(get(ECHO_HOST)));
 	}
 
 	@Test
@@ -525,6 +532,9 @@ class MalformedRequestE2ETest {
 		}
 		catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
+		}
+		finally {
+			this.ended.add(record);
 		}
 	}
 
