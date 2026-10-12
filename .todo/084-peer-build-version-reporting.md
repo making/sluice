@@ -18,9 +18,11 @@ identification at all (`Cargo.toml` version only, no commit, no `--version`).
 - wasmlet: `build.rs` embeds the git commit (and dirty flag) and build time as env vars
   (`git` unavailable -> "unknown", the build must not fail); add `--version`; log the
   build at startup; send it in `Advertise`.
-- Server: keep the peer build on `TunnelSession`; log it at session open; show it per
-  client in the console (`ConsoleView.Client`; register the record change in
-  `reflect-config.json`).
+- Server: keep the peer build on `TunnelSession`; log it at session open.
+- Console (required by the user): each connected client / wasmlet row on the server's
+  `/console` shows its build -- implementation, version and short git commit (build time
+  on hover or in a detail cell). Add it to `ConsoleView.Client` and the template; register
+  the record change in `reflect-config.json` so the native image renders it too.
 - Legacy visibility, the direct check for 054: mark sessions whose `Advertise` has
   `connection_window == 0` as legacy in the console, and expose a gauge of legacy
   sessions (a wasmlet's legacy state shows the same way).
@@ -29,6 +31,8 @@ identification at all (`Cargo.toml` version only, no commit, no `--version`).
 
 - The server records and renders the build a client and a wasmlet send; a peer sending
   no build renders as unknown.
+- Console E2E (`sluice-it`, real server + client): the client's version and commit appear
+  in its row on `/console`, matching the client's own `BuildProperties` / `GitProperties`.
 - The client logs the server's build from the ack.
 - wasmlet: `--version` prints the embedded commit; a build without git still succeeds.
 - A legacy-window session counts in the gauge and is marked in the console; a windowed
