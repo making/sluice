@@ -185,9 +185,18 @@ class ClusterGrpcTlsE2ETests {
 		}
 	}
 
-	private long sessionCount(int index) {
+	/**
+	 * The sessions of the node whose advertised routes are registered: a session is
+	 * registered before its routes, and a request in between finds no route.
+	 */
+	private long routedSessions(int index) {
 		ConfigurableApplicationContext server = this.servers[index];
-		return server == null ? -1 : server.getBean(SessionRegistry.class).count();
+		return server == null ? -1
+				: server.getBean(SessionRegistry.class)
+					.all()
+					.stream()
+					.filter(session -> !session.upstreams().isEmpty())
+					.count();
 	}
 
 	private TunnelClient tunnelClient() {
@@ -209,7 +218,7 @@ class ClusterGrpcTlsE2ETests {
 	private void awaitSessionOnAllNodes(int nodes, Duration timeout) {
 		Awaitility.await().atMost(timeout).until(() -> {
 			for (int i = 0; i < nodes; i++) {
-				if (this.servers[i] == null || sessionCount(i) != 1) {
+				if (this.servers[i] == null || routedSessions(i) != 1) {
 					return false;
 				}
 			}

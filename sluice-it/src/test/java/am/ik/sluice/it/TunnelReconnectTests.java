@@ -134,6 +134,9 @@ class TunnelReconnectTests {
 		startServer("it-token");
 		startClient("it-token");
 		Awaitility.await().atMost(Duration.ofSeconds(15)).until(() -> serverRegistry().count() == 1);
+		Awaitility.await()
+			.atMost(Duration.ofSeconds(5))
+			.until(Objects.requireNonNull(this.clientContext).getBean(TunnelClient.class)::isConnected);
 		assertThat(roundTrip()).contains("it-ok");
 
 		// restart the server; the client must re-register on its own

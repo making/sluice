@@ -162,11 +162,14 @@ class RoundRobinE2ETest {
 		this.clients.computeIfAbsent("client-b", id -> {
 			TunnelClient client = startClient(id, httpUpstream(httpUpstreamB), tcpUpstream(tcpUpstreamB));
 			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> this.sessions.count() >= 1);
+			// its routes are registered once it handled the advertise acknowledgement
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(client::isConnected);
 			return client;
 		});
 		this.clients.computeIfAbsent("client-a", id -> {
 			TunnelClient client = startClient(id, httpUpstream(httpUpstreamA), tcpUpstream(tcpUpstreamA));
 			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> this.sessions.count() >= 2);
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(client::isConnected);
 			return client;
 		});
 		// both listen ports bound (client-a took over from client-b)

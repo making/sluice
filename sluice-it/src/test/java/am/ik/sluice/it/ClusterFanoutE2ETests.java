@@ -187,6 +187,20 @@ class ClusterFanoutE2ETests {
 		return server == null ? -1 : server.getBean(SessionRegistry.class).count();
 	}
 
+	/**
+	 * The sessions of the node whose advertised routes are registered: a session is
+	 * registered before its routes, and a request in between finds no route.
+	 */
+	private long routedSessions(int index) {
+		ConfigurableApplicationContext server = this.servers[index];
+		return server == null ? -1
+				: server.getBean(SessionRegistry.class)
+					.all()
+					.stream()
+					.filter(session -> !session.upstreams().isEmpty())
+					.count();
+	}
+
 	private TunnelClient tunnelClient() {
 		return Objects.requireNonNull(this.clientContext).getBean(TunnelClient.class);
 	}
@@ -221,7 +235,7 @@ class ClusterFanoutE2ETests {
 	private void awaitSessionOnAllNodes(int nodes, Duration timeout) {
 		Awaitility.await().atMost(timeout).until(() -> {
 			for (int i = 0; i < nodes; i++) {
-				if (this.servers[i] == null || sessionCount(i) != 1) {
+				if (this.servers[i] == null || routedSessions(i) != 1) {
 					return false;
 				}
 			}
@@ -269,7 +283,7 @@ class ClusterFanoutE2ETests {
 
 		// the third node was in the membership from the start but only now appears
 		startServer(2);
-		Awaitility.await().atMost(Duration.ofSeconds(30)).until(() -> sessionCount(2) == 1);
+		Awaitility.await().atMost(Duration.ofSeconds(30)).until(() -> routedSessions(2) == 1);
 		assertThat(this.tunnelClient().isConnected()).isTrue();
 		assertThat(this.httpRoundTrip(2)).contains("cluster-ok");
 	}

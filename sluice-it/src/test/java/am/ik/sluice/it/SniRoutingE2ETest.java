@@ -242,7 +242,9 @@ class SniRoutingE2ETest {
 			.build();
 		started.start();
 		this.client = started;
-		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> this.sessions.count() > 0);
+		// the advertise acknowledgement turns isConnected() true, and the server sends it
+		// once the routes are registered; the session is registered before that
+		Awaitility.await().atMost(Duration.ofSeconds(5)).until(started::isConnected);
 	}
 
 	/** A fresh context per connection: the JSSE session cache must not span rounds. */

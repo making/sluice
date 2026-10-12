@@ -419,6 +419,20 @@ class ClusterGrpcMutualTlsE2ETests {
 		return server == null ? -1 : server.getBean(SessionRegistry.class).count();
 	}
 
+	/**
+	 * The sessions of the node whose advertised routes are registered: a session is
+	 * registered before its routes, and a request in between finds no route.
+	 */
+	private long routedSessions(int index) {
+		ConfigurableApplicationContext server = this.servers[index];
+		return server == null ? -1
+				: server.getBean(SessionRegistry.class)
+					.all()
+					.stream()
+					.filter(session -> !session.upstreams().isEmpty())
+					.count();
+	}
+
 	private TunnelClient tunnelClient(int identity) {
 		return Objects.requireNonNull(this.clients[identity - 1]).getBean(TunnelClient.class);
 	}
@@ -438,7 +452,7 @@ class ClusterGrpcMutualTlsE2ETests {
 	private void awaitSessionOnAllNodes(int nodes, Duration timeout) {
 		Awaitility.await().atMost(timeout).until(() -> {
 			for (int i = 0; i < nodes; i++) {
-				if (this.servers[i] == null || sessionCount(i) != 1) {
+				if (this.servers[i] == null || routedSessions(i) != 1) {
 					return false;
 				}
 			}
@@ -479,13 +493,13 @@ class ClusterGrpcMutualTlsE2ETests {
 				"--sluice.client.upstream[0].target=http://127.0.0.1:" + upstream1);
 		this.startClient(2, "--sluice.client.upstream[0].host=client2." + HOST,
 				"--sluice.client.upstream[0].target=http://127.0.0.1:" + upstream2);
-		Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> sessionCount(0) == 2);
+		Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> routedSessions(0) == 2);
 		assertThat(this.httpRoundTrip(0, "client1." + HOST)).contains("mtls-client1-ok");
 		assertThat(this.httpRoundTrip(0, "client2." + HOST)).contains("mtls-client2-ok");
 		// one client leaving does not disturb the other
 		closeContext(this.clients[0]);
 		this.clients[0] = null;
-		Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> sessionCount(0) == 1);
+		Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> routedSessions(0) == 1);
 		assertThat(this.tunnelClient(2).isConnected()).isTrue();
 		assertThat(this.httpRoundTrip(0, "client2." + HOST)).contains("mtls-client2-ok");
 	}
@@ -519,7 +533,7 @@ class ClusterGrpcMutualTlsE2ETests {
 		this.startClientWith(1, pemFile("console-issued-client.crt.pem", archive),
 				pemFile("console-issued-client.key.pem", archive), "--sluice.client.upstream[0].host=" + HOST,
 				"--sluice.client.upstream[0].target=http://127.0.0.1:" + upstreamPort);
-		Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> sessionCount(0) == 1);
+		Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> routedSessions(0) == 1);
 		assertThat(this.httpRoundTrip(0, HOST)).contains("console-issued-ok");
 	}
 
@@ -594,7 +608,7 @@ class ClusterGrpcMutualTlsE2ETests {
 				"--spring.ssl.bundle.pem." + DATA_BUNDLE + ".keystore.private-key=file:" + serverKeyPemPath);
 		this.startClient(2, "--sluice.client.upstream[0].host=localhost",
 				"--sluice.client.upstream[0].target=http://127.0.0.1:" + upstreamPort);
-		Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> sessionCount(0) == 1);
+		Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> routedSessions(0) == 1);
 		javax.net.ssl.SSLSocketFactory socketFactory = sslContext(null, trustManagerFactory(caStore))
 			.getSocketFactory();
 		try (SSLSocket socket = (SSLSocket) socketFactory.createSocket("127.0.0.1", this.dataPorts[0])) {
@@ -618,7 +632,7 @@ class ClusterGrpcMutualTlsE2ETests {
 		this.startClient(1, "--sluice.client.upstream[0].host=" + PASSTHRU_HOST,
 				"--sluice.client.upstream[0].target=tcp://127.0.0.1:" + this.tlsUpstreamPort,
 				"--sluice.client.upstream[0].tls-passthrough=true");
-		Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> sessionCount(0) == 1);
+		Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> routedSessions(0) == 1);
 		// TLS is terminated by the upstream; the data plane only relays bytes. The
 		// upstream certificate is validated, SNI selects the passthrough route.
 		javax.net.ssl.SSLSocketFactory socketFactory = sslContext(null, trustManagerFactory(upstreamStore))
