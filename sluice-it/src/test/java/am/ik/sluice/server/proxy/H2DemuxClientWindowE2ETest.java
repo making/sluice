@@ -187,37 +187,46 @@ class H2DemuxClientWindowE2ETest {
 		startClient(first, upstream(new AtomicReference<>(), upstream -> respondToEach(upstream, length)));
 		startClient(second, upstream(new AtomicReference<>(), upstream -> respondToEach(upstream, length)));
 		EventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
-		this.closeables.add(group::shutdownGracefully);
-		AtomicReference<@Nullable Long> goAway = new AtomicReference<>();
-		Channel channel = new Bootstrap().group(group)
-			.channel(NioSocketChannel.class)
-			.handler(new ChannelInitializer<SocketChannel>() {
-				@Override
-				protected void initChannel(SocketChannel ch) {
-					ch.pipeline()
-						.addLast(Http2FrameCodecBuilder.forClient().build(),
-								new Http2MultiplexHandler(new ChannelInboundHandlerAdapter()),
-								new ChannelInboundHandlerAdapter() {
-									@Override
-									public void channelRead(ChannelHandlerContext ctx, Object msg) {
-										if (msg instanceof Http2GoAwayFrame frame) {
-											goAway.set(frame.errorCode());
+		try {
+			AtomicReference<@Nullable Long> goAway = new AtomicReference<>();
+			Channel channel = new Bootstrap().group(group)
+				.channel(NioSocketChannel.class)
+				.handler(new ChannelInitializer<SocketChannel>() {
+					@Override
+					protected void initChannel(SocketChannel ch) {
+						ch.pipeline()
+							.addLast(Http2FrameCodecBuilder.forClient().build(),
+									new Http2MultiplexHandler(new ChannelInboundHandlerAdapter()),
+									new ChannelInboundHandlerAdapter() {
+										@Override
+										public void channelRead(ChannelHandlerContext ctx, Object msg) {
+											if (msg instanceof Http2GoAwayFrame frame) {
+												goAway.set(frame.errorCode());
+											}
+											ReferenceCountUtil.release(msg);
 										}
-										ReferenceCountUtil.release(msg);
-									}
-								});
-				}
-			})
-			.connect("127.0.0.1", dataPort)
-			.sync()
-			.channel();
-		this.closeables.add(channel::close);
-		CompletableFuture<Long> firstBody = nettyGet(channel, first);
-		CompletableFuture<Long> secondBody = nettyGet(channel, second);
-		assertThat(firstBody.get(30, TimeUnit.SECONDS)).isEqualTo(length);
-		assertThat(secondBody.get(30, TimeUnit.SECONDS)).isEqualTo(length);
-		assertThat(goAway.get()).as("the client's GOAWAY").isNull();
-		channel.close().sync();
+									});
+					}
+				})
+				.connect("127.0.0.1", dataPort)
+				.sync()
+				.channel();
+			// closed even when the test fails: the class's later tests count the
+			// relay's connections
+			try {
+				CompletableFuture<Long> firstBody = nettyGet(channel, first);
+				CompletableFuture<Long> secondBody = nettyGet(channel, second);
+				assertThat(firstBody.get(30, TimeUnit.SECONDS)).isEqualTo(length);
+				assertThat(secondBody.get(30, TimeUnit.SECONDS)).isEqualTo(length);
+				assertThat(goAway.get()).as("the client's GOAWAY").isNull();
+			}
+			finally {
+				channel.close().sync();
+			}
+		}
+		finally {
+			group.shutdownGracefully();
+		}
 	}
 
 	/**
@@ -918,8 +927,7 @@ class H2DemuxClientWindowE2ETest {
 		CompletableFuture<Long> body = new CompletableFuture<>();
 		AtomicLong received = new AtomicLong();
 		// an application reading one frame per 5ms: the connection window comes back as
-		// it
-		// reads
+		// it reads
 		Http2StreamChannel stream = new Http2StreamChannelBootstrap(channel).option(ChannelOption.AUTO_READ, false)
 			.option(ChannelOption.RCVBUF_ALLOCATOR, new AdaptiveRecvByteBufAllocator().maxMessagesPerRead(1))
 			.handler(new ChannelInboundHandlerAdapter() {
@@ -953,7 +961,13 @@ class H2DemuxClientWindowE2ETest {
 			.getNow();
 		stream.writeAndFlush(new DefaultHttp2HeadersFrame(
 				new DefaultHttp2Headers().method("GET").scheme("http").path("/").authority(route), true));
-		ScheduledFuture<?> reads = stream.eventLoop().scheduleAtFixedRate(stream::read, 5, 5, TimeUnit.MILLISECONDS);
+		// the flush: netty before 4.2.19 leaves the WINDOW_UPDATE a read() writes for
+		// the bytes read before unflushed while an earlier read() still waits for a
+		// frame, so the client withholds window it granted (netty/netty#17600)
+		ScheduledFuture<?> reads = stream.eventLoop().scheduleAtFixedRate(() -> {
+			stream.read();
+			stream.flush();
+		}, 5, 5, TimeUnit.MILLISECONDS);
 		body.whenComplete((length, failure) -> reads.cancel(false));
 		return body;
 	}
