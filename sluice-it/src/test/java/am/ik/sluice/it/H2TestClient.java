@@ -225,12 +225,15 @@ public final class H2TestClient implements AutoCloseable {
 	}
 
 	private void grantConnection(long increment) {
+		// counted before the frame leaves: the DATA it admits may be read before this
+		// thread runs again
+		this.receiveWindow.addAndGet(increment);
 		try {
 			frame(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32((int) increment));
-			this.receiveWindow.addAndGet(increment);
 		}
 		catch (IOException e) {
 			// the connection is gone, or half-closed: nothing was granted
+			this.receiveWindow.addAndGet(-increment);
 		}
 	}
 
