@@ -15,3 +15,8 @@ Step 6 of the netty h2 demux migration (context and user decisions: 098). Depend
 ## Tests
 
 - The stall / idle / keep-alive subsets pass on netty, with margins that hold on Linux CI.
+- Write progress towards a client taking bytes slowly: no test pins it for the legacy h2
+  relay's write pieces. `StallTimeoutE2ETest#aClientTakingOneWritePieceASecondIsNotCut`
+  pins it for HTTP/1.1 through `DataProxyServer#clientPipeSeam` (a client pipe accepting
+  16KiB per second); netty writes do not block, so the netty engine needs its own test of
+  what counts as progress while its outbound buffer drains slowly.
