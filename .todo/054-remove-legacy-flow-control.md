@@ -13,7 +13,11 @@ A connection is windowed only when both peers announce a window (`Advertise` /
 `Connect.connection_window > 0`). Otherwise it runs in legacy mode, which keeps the
 stream-wide stall of F1: `VirtualConnection#acceptData` blocks the gRPC receive callback
 while 128 frames are buffered, so one slow consumer stalls every connection of a legacy
-peer.
+peer. Since 074 the stream of such a peer stays not ready while its consumer blocks, so
+the tunnel stall watchdog (`sluice.limits.tunnel-stall-timeout`,
+`sluice.client.tunnel-stall-timeout`, wasmlet `--tunnel-stall-timeout`) is expected to
+fail the whole session once one consumer blocks past the timeout; no test covers the
+legacy path.
 
 ## Scope
 

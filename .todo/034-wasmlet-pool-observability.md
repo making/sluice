@@ -22,7 +22,13 @@ none within their budget are neither logged nor counted, so the limit cannot
 be sized from evidence either. The tests read only `Handler`'s gauge (live /
 peak / created stores) and `Instances::held`.
 
+The tunnel stall watchdog (074, `--tunnel-stall-timeout`) only logs each node stream
+it gives up: the wasmlet neither exports the time a stream has stalled nor counts the
+streams given up, which the Java client and server do (`sluice.tunnel.stall` /
+`sluice.tunnel.stall.failures`). Cover them with the rest.
+
 Decide with the user before implementing. Acceptance: the cold-fallback
 and recycle counts per route, and the instance-limit waits and 503s, are
 visible without a debugger; a test asserts them for exhaustion, for a
-recycle and for a 503.
+recycle and for a 503; the stall time and the streams given up are visible too, and a
+test asserts them for a stalled stream.

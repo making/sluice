@@ -30,5 +30,11 @@ The PoC was verified by hand only; nothing runs it in `./mvnw verify`.
   ack (`[<key>] server build: sluice-server ...`); both are untested against the
   real binary today
 
+- tunnel stall watchdog (074): `--tunnel-stall-timeout` against the real server is
+  untested; the Rust test (`a_server_that_stops_reading_has_the_stream_given_up_at_the_stall_timeout`)
+  drives the binary's node task against a raw h2 server that stops reading. Against the
+  real server: a wasmlet whose stream the server stops reading gives it up and
+  reconnects
+
 Acceptance: `./mvnw verify` covers the wasm path; CI without rust still passes
 (skipped, not failed).

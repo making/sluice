@@ -184,8 +184,10 @@ What 043-048 still leave open, by design or elsewhere. Do not report the parent 
   connections idle between requests are closed at `sluice.limits.idle-timeout`; since
   061 (done) a slot is held until the frames its connection queued left the Java sender.
   Slots held where no deadline reaches: verbatim relays gone quiet (070), exchanges
-  stalled mid-flight (071), a tunnel stream that stays not ready (074); since 072 (done)
-  h1 input the parser cannot follow is answered 400 and closed. (ADVERTISE
+  stalled mid-flight (071); since 072 (done) h1 input the parser cannot follow is
+  answered 400 and closed; since 074 (done) a tunnel stream that holds frames queued,
+  not ready, with none taken is failed at the tunnel stall timeout (server, client and
+  wasmlet), which frees the slots of its queued frames. (ADVERTISE
   off the receive path and the credit-lock pitfall are done in 046.)
 
 ## Follow-up
