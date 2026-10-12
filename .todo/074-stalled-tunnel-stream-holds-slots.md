@@ -30,3 +30,16 @@ User decision: the policy and the timeout default. A metric for the stalled time
   connections of other clients; a stream that is slow but keeps taking frames is not cut.
 - The same on the client side with a server that stops reading
   (`ClientQueuedFramesHoldSlotsE2ETest`).
+
+## Decision (2026-10-12)
+
+- A per-session progress watchdog on both sides: frames queued, the stream not ready and
+  no frame handed to it for the timeout -> fail the session (the teardown drops the
+  frames and runs the held releases, which also ends `Leg#awaitQueued`). A stream that
+  is slow but keeps taking frames is never cut.
+- Default 60s, configurable on the server (`sluice.limits.*`) and the client
+  (`sluice.client.*`); a metric for the stalled time and a counter of sessions failed by
+  the watchdog.
+- No per-client share of the server's slots: tunnel clients are authenticated, and the
+  watchdog bounds how long one can hold slots. File it separately only if a test or an
+  incident shows the need.

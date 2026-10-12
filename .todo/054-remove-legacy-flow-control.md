@@ -44,3 +44,14 @@ peer.
 - A client advertising no window is rejected as decided, with the log line.
 - A CONNECT without a window is answered as decided.
 - Everything in `sluice-it` stays green with only windowed connections.
+
+## Decision (2026-10-12)
+
+- A peer announcing no window is rejected, not given the default window (a legacy peer
+  never sends WindowUpdate, so a window would stall it): the server fails the stream with
+  `FAILED_PRECONDITION` and a message naming the minimum version; the client and the
+  wasmlet answer such a CONNECT with ERROR. Each logs one line per rejection.
+- Do it last in the queue. Before starting, check that the deployed server includes 046
+  and 047 (`curl https://console.sluice.ik.am/actuator/info | jq .git.commit`; on
+  2026-10-12 it was 18a4ff4, after both). Clients and wasmlets of older versions are
+  then rejected with that message and need an upgrade.

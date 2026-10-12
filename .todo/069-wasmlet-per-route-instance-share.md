@@ -19,3 +19,9 @@ taken at startup like `pool=N` is. Decide with the user which one, and how it re
   a request on the other route is served at once.
 - The route's cap and the pool: a route with `pool=1` and a cap of 1 never creates a
   per-request store.
+
+## Decision (2026-10-12)
+
+(a) A per-route cap `instances=N` (a ceiling on the route's slots, counting its pooled
+units). No separate reservation: `pool=N` already reserves slots for a route. A cap below
+the route's `pool` is a startup error. Unset = no per-route cap (today's behavior).

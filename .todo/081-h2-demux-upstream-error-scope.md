@@ -44,3 +44,14 @@ the relay while the client has nothing else open.
   with the code, the client gets the leg's streams reset and no GOAWAY, and a stream of
   another route completes. Update `H2DemuxUpstreamFlowControlE2ETest` /
   `H2DemuxFrameLimitsE2ETest`, which pin the current end-the-relay behavior.
+
+## Decision (2026-10-12)
+
+- Stream lost to its upstream's error, response head not yet relayed: the relay answers
+  it with a 502 response (as it answers unrouted streams), so the client sees an HTTP
+  error rather than a reset. Head already relayed: RST_STREAM `INTERNAL_ERROR`
+  (`CANCEL` would read as a deliberate cancellation). Streams the upstream never saw
+  (waiting for its concurrency limit): `REFUSED_STREAM`, retryable (RFC 9113 8.7).
+- A connection error ends only the failing leg, also when the client has nothing else
+  open; the keep-alive idle timeout closes an idle client connection afterwards. One
+  rule, no special case.

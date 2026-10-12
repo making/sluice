@@ -24,3 +24,9 @@ protocol errors.
   settings.
 - An upstream sending PUSH_PROMISE anyway: the client never receives it, and the relay
   ends as for other upstream protocol errors.
+
+## Decision (2026-10-12)
+
+Follows 081's decision: a PUSH_PROMISE from an upstream is a connection error on that
+leg only (GOAWAY `PROTOCOL_ERROR` to the upstream, its streams handled as 081 decided);
+the relay and the other legs go on. Do this after 081.

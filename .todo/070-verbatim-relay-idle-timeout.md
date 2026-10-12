@@ -25,3 +25,13 @@ exposure. The user decides before implementation.
   is closed and its slot released (gauge); one echoing every second stays open.
 - The same for a TLS passthrough connection.
 - With the timeout unset (or off for the route), an idle connection stays open.
+
+## Decision (2026-10-12)
+
+- A byte-level idle timeout for verbatim relays (nothing relayed in either direction for
+  N): off by default, so pools that idle legitimately are not cut.
+- Per route, set by the client on the upstream it advertises (the client operator knows
+  the protocol), carried in the advertise (proto field; 0 / absent = server default).
+- A server-wide default (`sluice.limits.*`, default off) applies to routes that set
+  none, so a server operator can bound anonymous exposure for every route.
+- README states the exposure while both are off.
