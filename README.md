@@ -571,9 +571,12 @@ filled segment, and the overhead of at most 80 segments.
 h2 (plaintext and TLS-terminated) relays each stream to a virtual connection of its
 route, one per route the connection reaches: every one beyond the first takes a slot of
 `sluice.limits.max-connections`, and a stream whose route needs one while none is free is
-refused with `REFUSED_STREAM`. What the relay queues towards the upstreams is bounded
-across connections: each connection may queue 128KiB, and the bytes beyond it are charged
-to `sluice.limits.h2-queue-budget`, shared by every h2 connection. While a connection is
+refused with `REFUSED_STREAM`. A stream beyond the upstream's
+`SETTINGS_MAX_CONCURRENT_STREAMS` (one until the upstream's first SETTINGS) waits in the
+relay, for the same virtual connection, until one of the streams there closes. What the
+relay queues towards the upstreams is bounded across connections: each connection may
+queue 128KiB, and the bytes beyond it are charged to `sluice.limits.h2-queue-budget`,
+shared by every h2 connection. While a connection is
 past its 128KiB and the budget is exhausted, the relay withholds its connection window
 (the client stops sending once the at most 64KiB it holds are spent) until the
 connection's own queue drains below 128KiB or the budget has room again; a new stream

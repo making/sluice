@@ -1,6 +1,7 @@
 package am.ik.sluice.it;
 
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -190,8 +191,15 @@ class H2ReroutingE2ETest {
 		RECEIVED.clear();
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.setSoTimeout(10_000);
-			TestH2.writeClientHead(socket.getOutputStream(), 1, ":authority=rst.a.test", ":method=POST", ":path=/x");
-			TestH2.writeFrame(socket.getOutputStream(), TestH2.RST_STREAM, 0, 1, new byte[] { 0, 0, 0, 8 });
+			OutputStream out = socket.getOutputStream();
+			out.write(TestH2.PREFACE);
+			TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
+			// the request unfinished, so no response closes the stream first
+			TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS, 1,
+					TestH2.headerBlock(":authority=rst.a.test", ":method=POST", ":path=/x"));
+			// a stream reset before its head left the relay never reaches the upstream
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> RECEIVED.contains("alpha:1:1"));
+			TestH2.writeFrame(out, TestH2.RST_STREAM, 0, 1, new byte[] { 0, 0, 0, 8 });
 			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> RECEIVED.contains("alpha:3:1")); // RST_STREAM
 																											// relayed
 		}

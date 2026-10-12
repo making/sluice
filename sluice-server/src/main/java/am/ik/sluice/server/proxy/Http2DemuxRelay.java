@@ -82,6 +82,15 @@ import io.micrometer.core.instrument.MeterRegistry;
  * streams, and the stream's trailers wait behind its data while the client's window
  * updates do not. An upstream pushing a window past 2^31-1 ends the relay.
  * <p>
+ * The relay also keeps to the upstream's SETTINGS_MAX_CONCURRENT_STREAMS (RFC 9113 5.1.2)
+ * -- one stream until the upstream's first SETTINGS arrived, then as announced, unlimited
+ * when not: a stream beyond it waits in the relay, its head and whatever the client sends
+ * on it queued on the route's leg, until a stream of the leg closed on the upstream; no
+ * further leg is opened for it. A lowered limit applies to the streams opened after it. A
+ * waiting stream counts against the relay's own limit and its queue as any other, but its
+ * client is granted no stream window beyond the initial one; reset by either side, it is
+ * dropped without a frame to the upstream.
+ * <p>
  * Towards the client the relay is a sender bound by the client's connection window (65535
  * plus the client's connection-level WINDOW_UPDATEs; one past 2^31-1 ends the connection
  * with GOAWAY {@code FLOW_CONTROL_ERROR}); the client's stream windows bind each
@@ -113,7 +122,9 @@ import io.micrometer.core.instrument.MeterRegistry;
  * write and ends the relay. An upstream ending its side -- or its connection failing --
  * with no response owed retires its leg: the leg takes no new stream, its responses
  * waiting for the client's window are written first, then the data still queued for it is
- * dropped, and a stream the client still sends on is reset with {@code NO_ERROR}.
+ * dropped, a stream waiting for the upstream's concurrency limit is refused
+ * ({@code REFUSED_STREAM}), and a stream the client still sends on is reset with
+ * {@code NO_ERROR}.
  * <p>
  * While no stream is open the connection lives under the idle timeout of its
  * {@link ConnectionLimits.KeepAliveDeadline}, from the connection head on unless its
@@ -791,13 +802,16 @@ final class Http2DemuxRelay {
 
 	/**
 	 * Grants the client stream window as far as the stream's queued payload plus its
-	 * window stay within the budget. A stream the client ended gets nothing more.
+	 * window stay within the budget -- within the initial window while the stream waits
+	 * for the upstream's concurrency limit, as none of it drains meanwhile. A stream the
+	 * client ended gets nothing more.
 	 */
 	private int releaseLocked(Stream stream) {
 		if (stream.clientEnded) {
 			return 0;
 		}
-		long room = STREAM_BUDGET - stream.queuedPayload - stream.clientWindow;
+		long budget = stream.upstreamOpened ? STREAM_BUDGET : STREAM_WINDOW;
+		long room = budget - stream.queuedPayload - stream.clientWindow;
 		if (room <= 0) {
 			return 0;
 		}
@@ -828,8 +842,8 @@ final class Http2DemuxRelay {
 				return;
 			}
 			dropped = resetLocked(stream);
-			stream.leg.queueBlock(stream, frame(FRAME_RST_STREAM, frame.flags(), frame.streamId(), frame.bytes(),
-					frame.payload(), frame.length()), false);
+			stream.leg.queueReset(stream, frame(FRAME_RST_STREAM, frame.flags(), frame.streamId(), frame.bytes(),
+					frame.payload(), frame.length()));
 			updateActiveLocked(stream);
 		}
 		finally {
@@ -847,9 +861,10 @@ final class Http2DemuxRelay {
 	 * the latter's window granted back to the upstream. The stream owes no response any
 	 * more, and whatever the upstream or the client still sends on it is dropped. It
 	 * stays counted against the advertised limit until its reset is written to the
-	 * upstream. Called by the outbound parse; a stream already reset by either side, or
-	 * closed both ways (END_STREAM received from the client and written to it), is left
-	 * alone, and {@code false} returned.
+	 * upstream -- a stream still waiting for the upstream's limit gets no reset there and
+	 * is uncounted at once. Called by the outbound parse; a stream already reset by
+	 * either side, or closed both ways (END_STREAM received from the client and written
+	 * to it), is left alone, and {@code false} returned.
 	 */
 	private boolean resetStream(Stream stream, int errorCode) {
 		int dropped;
@@ -861,7 +876,7 @@ final class Http2DemuxRelay {
 					return false;
 				}
 				dropped = resetLocked(stream);
-				stream.leg.queueBlock(stream, rstStream(stream.id, ERROR_CANCEL), false);
+				stream.leg.queueReset(stream, rstStream(stream.id, ERROR_CANCEL));
 				updateActiveLocked(stream);
 			}
 			finally {
@@ -1090,7 +1105,7 @@ final class Http2DemuxRelay {
 			else {
 				stream.trailers = true;
 				stream.clientEnded = endStream;
-				stream.leg.queueBlock(stream, frames, true);
+				stream.leg.queueBlock(new LegEntry.Block(stream, frames, BlockKind.TRAILERS, endStream));
 				settleBudgetLocked();
 			}
 		}
@@ -1234,7 +1249,7 @@ final class Http2DemuxRelay {
 				stream.clientEnded = endStream;
 				stream.upstreamWindow = leg.initialWindow;
 				leg.streamOpened(streamId);
-				leg.queueBlock(stream, frames, false);
+				leg.queueBlock(new LegEntry.Block(stream, frames, BlockKind.HEAD, endStream));
 				settleBudgetLocked();
 			}
 		}
@@ -1639,6 +1654,19 @@ final class Http2DemuxRelay {
 		/** Counted against the advertised limit. */
 		boolean active;
 
+		/**
+		 * The leg writer took the stream's head: the stream exists on the upstream. Until
+		 * then it waits for the upstream's concurrency limit, and nothing else of it is
+		 * written.
+		 */
+		boolean upstreamOpened;
+
+		/** The leg writer took the request's END_STREAM. */
+		boolean requestSent;
+
+		/** The upstream ended its response (END_STREAM received). */
+		boolean responseReceived;
+
 		/** Response DATA payload waiting for the client's connection window. */
 		final PendingPayload response = new PendingPayload();
 
@@ -1738,6 +1766,23 @@ final class Http2DemuxRelay {
 		private long initialWindow = STREAM_WINDOW;
 
 		/**
+		 * The streams the upstream admits at once (SETTINGS_MAX_CONCURRENT_STREAMS): one
+		 * until its first SETTINGS arrived, then as announced, unlimited until it is (RFC
+		 * 9113 6.5.2); guarded by the lock.
+		 */
+		private long maxStreams = 1;
+
+		/** The upstream's first SETTINGS arrived; guarded by the lock. */
+		private boolean settingsReceived;
+
+		/**
+		 * The streams open on the upstream as the relay counts them against
+		 * {@link #maxStreams} (RFC 9113 5.1.2): head taken by the writer, and neither
+		 * reset by either side nor ended both ways; guarded by the lock.
+		 */
+		private final Map<Integer, Stream> upstreamStreams = new HashMap<>();
+
+		/**
 		 * The relay's receive window towards the upstream: 65535 less the DATA received
 		 * and not granted back yet; guarded by the lock.
 		 */
@@ -1812,15 +1857,20 @@ final class Http2DemuxRelay {
 		}
 
 		/**
-		 * The upstream ended its side: the leg takes no new stream nor frame, and its
-		 * writer exits.
+		 * The upstream ended its side: unless a response is owed, the leg takes no new
+		 * stream nor frame -- no waiting head goes any more --, its writer exits, and
+		 * {@code true} is returned.
 		 */
-		void upstreamGone() {
+		boolean upstreamGoneUnlessOwed() {
 			Http2DemuxRelay.this.lock.lock();
 			try {
+				if (responseOwedLocked()) {
+					return false;
+				}
 				this.gone = true;
 				this.ended = true;
 				this.wake.signalAll();
+				return true;
 			}
 			finally {
 				Http2DemuxRelay.this.lock.unlock();
@@ -1856,18 +1906,44 @@ final class Http2DemuxRelay {
 			this.wake.signal();
 		}
 
-		/**
-		 * Queues a relayed block -- a whole header block, or a reset; with the lock.
-		 * {@code followsData}: written only after the stream's data queued before it
-		 * (trailers).
-		 */
-		void queueBlock(Stream stream, byte[] bytes, boolean followsData) {
+		/** Queues a relayed block -- a whole header block, or a reset; with the lock. */
+		void queueBlock(LegEntry.Block block) {
 			if (!acceptingLocked()) {
 				return;
 			}
-			this.entries.addLast(new LegEntry.Block(stream, bytes, followsData));
-			addQueuedLocked(stream, bytes.length);
+			this.entries.addLast(block);
+			addQueuedLocked(block.stream(), block.bytes().length);
 			signalLocked();
+		}
+
+		/**
+		 * Queues the relay's reset of the stream towards the upstream; with the lock. A
+		 * stream not opened on the upstream yet gets no reset -- RFC 9113 5.1 forbids one
+		 * on an idle stream --: what is queued for it is dropped instead, so nothing of
+		 * it reaches the upstream.
+		 */
+		void queueReset(Stream stream, byte[] frame) {
+			if (stream.upstreamOpened) {
+				queueBlock(new LegEntry.Block(stream, frame, BlockKind.RESET, false));
+				return;
+			}
+			long dropped = 0;
+			Iterator<LegEntry> iterator = this.entries.iterator();
+			while (iterator.hasNext()) {
+				LegEntry entry = iterator.next();
+				if (entry.stream() != stream) {
+					continue;
+				}
+				iterator.remove();
+				dropped += switch (entry) {
+					case LegEntry.Block block -> block.bytes().length;
+					case LegEntry.Data data -> FRAME_HEADER_LENGTH;
+					case LegEntry.WindowUpdate update -> FRAME_HEADER_LENGTH + 4;
+				};
+			}
+			stream.dataQueued = false;
+			stream.windowUpdate = null;
+			addQueuedLocked(stream, -dropped);
 		}
 
 		/**
@@ -2034,20 +2110,30 @@ final class Http2DemuxRelay {
 
 		/**
 		 * Applies the upstream's SETTINGS (RFC 9113 6.5.3, 6.9.2): a changed initial
-		 * window shifts the window of every stream of the leg by the difference.
-		 * {@code false} when a window would pass 2^31-1, a connection error.
+		 * window shifts the window of every stream of the leg by the difference; the
+		 * concurrency limit applies to the streams opened from then on, the streams open
+		 * beyond a lowered one go on. {@code false} when a window would pass 2^31-1, a
+		 * connection error.
 		 */
 		boolean applySettings(byte[] bytes, int payload, int length) {
 			Http2DemuxRelay.this.lock.lock();
 			try {
+				if (!this.settingsReceived) {
+					this.settingsReceived = true;
+					this.maxStreams = Long.MAX_VALUE;
+				}
 				for (int i = 0; i + 6 <= length; i += 6) {
 					int at = payload + i;
 					int id = (bytes[at] & 0xff) << 8 | (bytes[at + 1] & 0xff);
+					long value = (bytes[at + 2] & 0xffL) << 24 | (bytes[at + 3] & 0xff) << 16
+							| (bytes[at + 4] & 0xff) << 8 | (bytes[at + 5] & 0xff);
+					if (id == SETTINGS_MAX_CONCURRENT_STREAMS) {
+						this.maxStreams = value;
+						continue;
+					}
 					if (id != SETTINGS_INITIAL_WINDOW_SIZE) {
 						continue;
 					}
-					long value = (bytes[at + 2] & 0xffL) << 24 | (bytes[at + 3] & 0xff) << 16
-							| (bytes[at + 4] & 0xff) << 8 | (bytes[at + 5] & 0xff);
 					if (value > MAX_WINDOW) {
 						return false;
 					}
@@ -2176,24 +2262,46 @@ final class Http2DemuxRelay {
 		}
 
 		/**
-		 * Takes the first queued entry ready to go, in queue order: a stream's data as
-		 * far as the upstream's windows allow -- what is left goes to the back of the
-		 * queue, so the streams take turns -- and a stream's trailers only once its data
-		 * is out. Header blocks, resets and window updates never wait for window (RFC
-		 * 9113 5.2.1): a client's window update overtakes its stream's waiting data,
-		 * which the upstream may only accept once it could send.
+		 * Takes the first queued entry ready to go, in queue order: a stream's head only
+		 * while the upstream's concurrency limit admits one more stream -- heads go in
+		 * queue order, which is stream id order, as RFC 9113 5.1.1 requires --, nothing
+		 * else of a stream before its head; a stream's data as far as the upstream's
+		 * windows allow -- what is left goes to the back of the queue, so the streams
+		 * take turns -- and a stream's trailers only once its data is out. Header blocks,
+		 * resets and window updates never wait for window (RFC 9113 5.2.1): a client's
+		 * window update overtakes its stream's waiting data, which the upstream may only
+		 * accept once it could send. A reset taken, or the request's END_STREAM taken
+		 * after the response's arrived, frees the stream's place of the limit.
 		 */
 		private @Nullable Batch nextEntryLocked(byte[] control) {
 			Iterator<LegEntry> iterator = this.entries.iterator();
 			while (iterator.hasNext()) {
 				LegEntry entry = iterator.next();
+				Stream stream = entry.stream();
+				if (entry instanceof LegEntry.Block head && head.kind() == BlockKind.HEAD) {
+					if (!mayOpenLocked()) {
+						continue;
+					}
+					iterator.remove();
+					openedLocked(stream, head.endStream());
+					return new Batch(control, head.bytes(), stream, 0, head.bytes().length, false);
+				}
+				if (!stream.upstreamOpened) {
+					continue;
+				}
 				switch (entry) {
 					case LegEntry.Block block -> {
-						if (block.followsData() && block.stream().dataQueued) {
+						if (block.kind() == BlockKind.TRAILERS && stream.dataQueued) {
 							continue;
 						}
 						iterator.remove();
-						return new Batch(control, block.bytes(), block.stream(), 0, block.bytes().length, false);
+						if (block.kind() == BlockKind.RESET) {
+							closeUpstreamLocked(stream);
+						}
+						else if (block.endStream()) {
+							requestSentLocked(stream);
+						}
+						return new Batch(control, block.bytes(), stream, 0, block.bytes().length, false);
 					}
 					case LegEntry.WindowUpdate update -> {
 						iterator.remove();
@@ -2244,10 +2352,90 @@ final class Http2DemuxRelay {
 				stream.dataQueued = false;
 				stream.pendingEnd = false;
 			}
+			if (end) {
+				requestSentLocked(stream);
+			}
 			byte[] frames = length > 0 || end ? dataFrames(stream.id, payload, end) : EMPTY;
 			// the entry's frame header stays accounted while the entry is queued; the
 			// buffer released stays accounted until the payload is written
 			return new Batch(control, frames, stream, length, released + (whole ? FRAME_HEADER_LENGTH : 0L), false);
+		}
+
+		/** Whether the upstream's limit admits one more stream; with the lock. */
+		private boolean mayOpenLocked() {
+			return this.upstreamStreams.size() < this.maxStreams;
+		}
+
+		/** The writer took the stream's head: the stream opens on the upstream. */
+		private void openedLocked(Stream stream, boolean endStream) {
+			stream.upstreamOpened = true;
+			this.upstreamStreams.put(Integer.valueOf(stream.id), stream);
+			if (endStream) {
+				requestSentLocked(stream);
+			}
+		}
+
+		/** The writer took the request's END_STREAM; with the lock. */
+		private void requestSentLocked(Stream stream) {
+			stream.requestSent = true;
+			if (stream.responseReceived) {
+				closeUpstreamLocked(stream);
+			}
+		}
+
+		/**
+		 * The stream closed on the upstream, freeing its place of the limit for a waiting
+		 * head; with the lock.
+		 */
+		private void closeUpstreamLocked(Stream stream) {
+			if (this.upstreamStreams.remove(Integer.valueOf(stream.id), stream)) {
+				signalLocked();
+			}
+		}
+
+		/** The upstream ended the stream's response (END_STREAM). */
+		void upstreamEnded(int streamId) {
+			Http2DemuxRelay.this.lock.lock();
+			try {
+				Stream stream = this.upstreamStreams.get(Integer.valueOf(streamId));
+				if (stream != null) {
+					stream.responseReceived = true;
+					if (stream.requestSent) {
+						closeUpstreamLocked(stream);
+					}
+				}
+			}
+			finally {
+				Http2DemuxRelay.this.lock.unlock();
+			}
+		}
+
+		/** The upstream reset the stream. */
+		void upstreamReset(int streamId) {
+			Http2DemuxRelay.this.lock.lock();
+			try {
+				Stream stream = this.upstreamStreams.get(Integer.valueOf(streamId));
+				if (stream != null) {
+					closeUpstreamLocked(stream);
+				}
+			}
+			finally {
+				Http2DemuxRelay.this.lock.unlock();
+			}
+		}
+
+		/**
+		 * Whether a stream the upstream knows of still owes its response -- a stream
+		 * waiting for the upstream's limit owes none; with the lock.
+		 */
+		private boolean responseOwedLocked() {
+			for (Integer streamId : this.openStreams) {
+				Stream stream = Http2DemuxRelay.this.streams.get(streamId);
+				if (stream != null && stream.leg == this && stream.upstreamOpened) {
+					return true;
+				}
+			}
+			return false;
 		}
 
 		/**
@@ -2338,6 +2526,7 @@ final class Http2DemuxRelay {
 			}
 			byte[] frames = Http2DemuxRelay.encodedHead(streamId, endStream, headers, null, this.responseEncoder);
 			if (endStream) {
+				upstreamEnded(streamId);
 				forgetOpen(streamId);
 			}
 			relayHead(this, streamId, frames, endStream);
@@ -2369,22 +2558,31 @@ final class Http2DemuxRelay {
 
 		/**
 		 * The upstream ended its side: with no response owed the leg retires -- closed,
-		 * the data still queued for it dropped, and every stream the client still sends
-		 * on reset with {@code NO_ERROR}, its response being complete. {@code false} when
-		 * a response is owed, which the caller turns into the end of the relay.
+		 * the data still queued for it dropped, every stream waiting for the upstream's
+		 * limit refused ({@code REFUSED_STREAM}: the upstream never saw it, RFC 9113
+		 * 8.7), and every other stream the client still sends on reset with
+		 * {@code NO_ERROR}, its response being complete. {@code false} when a response is
+		 * owed, which the caller turns into the end of the relay.
 		 */
 		boolean retire() {
 			List<Integer> sending = new ArrayList<>();
+			List<Integer> waiting = new ArrayList<>();
 			Http2DemuxRelay.this.lock.lock();
 			try {
 				if (this.closed) {
 					return true;
 				}
-				if (!this.openStreams.isEmpty()) {
+				if (responseOwedLocked()) {
 					return false;
 				}
 				for (Stream stream : Http2DemuxRelay.this.streams.values()) {
-					if (stream.leg == this && !stream.clientEnded) {
+					if (stream.leg != this || stream.reset) {
+						continue;
+					}
+					if (!stream.upstreamOpened) {
+						waiting.add(Integer.valueOf(stream.id));
+					}
+					else if (!stream.clientEnded) {
 						sending.add(Integer.valueOf(stream.id));
 					}
 				}
@@ -2395,6 +2593,9 @@ final class Http2DemuxRelay {
 			}
 			this.connection.close();
 			releaseSlotAfterQueued();
+			for (Integer streamId : waiting) {
+				writeToClient(rstStream(streamId, ERROR_REFUSED_STREAM));
+			}
 			for (Integer streamId : sending) {
 				writeToClient(rstStream(streamId, ERROR_NO_ERROR));
 			}
@@ -2528,8 +2729,7 @@ final class Http2DemuxRelay {
 			}
 			// the upstream ended its side or failed: owed responses end the relay; an
 			// idle leg retires once its responses waiting for the client's window left
-			if (leg.openStreams.isEmpty()) {
-				leg.upstreamGone();
+			if (leg.upstreamGoneUnlessOwed()) {
 				awaitResponsesWritten(leg);
 			}
 			if (!leg.retire()) {
@@ -2665,6 +2865,7 @@ final class Http2DemuxRelay {
 			throw new IllegalStateException("upstream DATA past the relay's connection window");
 		}
 		if (frame.has(FLAG_END_STREAM)) {
+			leg.upstreamEnded(frame.streamId());
 			leg.forgetOpen(frame.streamId());
 		}
 		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
@@ -3038,6 +3239,7 @@ final class Http2DemuxRelay {
 	 * reset of a stream already reset by either side, or no longer tracked, is dropped.
 	 */
 	private void onUpstreamReset(Leg leg, Frame frame, int position) {
+		leg.upstreamReset(frame.streamId());
 		leg.streamClosed(frame.streamId());
 		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
 		int dropped = 0;
@@ -3145,11 +3347,15 @@ final class Http2DemuxRelay {
 	/** One entry of a leg's queue. */
 	private sealed interface LegEntry {
 
+		Stream stream();
+
 		/**
-		 * Relayed frames written as one: a whole header block, or a reset; trailers
-		 * ({@code followsData}) wait until the stream's queued data is out.
+		 * Relayed frames written as one: a whole header block -- the request head opening
+		 * the stream on the upstream, or trailers, which wait until the stream's queued
+		 * data is out -- or a reset. {@code endStream}: the block carries the request's
+		 * END_STREAM.
 		 */
-		record Block(Stream stream, byte[] bytes, boolean followsData) implements LegEntry {
+		record Block(Stream stream, byte[] bytes, BlockKind kind, boolean endStream) implements LegEntry {
 
 		}
 
@@ -3173,11 +3379,19 @@ final class Http2DemuxRelay {
 				this.increment = increment;
 			}
 
-			Stream stream() {
+			@Override
+			public Stream stream() {
 				return this.stream;
 			}
 
 		}
+
+	}
+
+	/** What a {@link LegEntry.Block} carries. */
+	private enum BlockKind {
+
+		HEAD, TRAILERS, RESET
 
 	}
 

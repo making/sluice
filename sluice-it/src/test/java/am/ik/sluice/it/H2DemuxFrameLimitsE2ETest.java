@@ -193,6 +193,8 @@ class H2DemuxFrameLimitsE2ETest {
 		AtomicBoolean answered = new AtomicBoolean();
 		startClient(route, stub((in, out) -> {
 			try {
+				// the server preface first: the relay opens one stream until it arrived
+				TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
 				int heads = 0;
 				TestH2.@Nullable Frame frame;
 				while (heads < 2 && (frame = TestH2.readFrame(in)) != null) {
@@ -200,7 +202,6 @@ class H2DemuxFrameLimitsE2ETest {
 						heads++;
 					}
 				}
-				TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
 				frames.write(out);
 				out.flush();
 				answered.set(true);
