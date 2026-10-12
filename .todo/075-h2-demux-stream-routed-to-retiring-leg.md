@@ -23,3 +23,8 @@ is not.
   answered with a `502` or refused when the leg fails, instead of being refused at once).
 - The same for a leg its upstream's GOAWAY marks between `legFor` and the admission
   (`Leg#goingAwayLocked`): refused at once, its head never queued on that leg.
+
+## Retargeted (2026-10-12)
+
+The h2 demux moves to netty (decision in `.todo/artefacts/096/FINDINGS.md`). Do not fix this
+in the legacy relay; it is done on the netty engine in 104.

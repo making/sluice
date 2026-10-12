@@ -1,0 +1,19 @@
+Difficulty: Medium
+
+# netty h2 demux, step 4: upstream concurrency waiting and its deadline
+
+Step 4 of the netty h2 demux migration (context and user decisions: 098). Depends on 100.
+
+## Scope
+
+- Streams beyond an upstream's MAX_CONCURRENT_STREAMS wait in `StreamBufferingEncoder`;
+  one stream until the upstream's SETTINGS, applied through `encoder.remoteSettings(...)`
+  (the encoder assumes 100 otherwise; see the spike).
+- 091 on the netty engine: its decision (`sluice.limits.h2-stream-wait-timeout`, 30s
+  default, 0 disables, metric reason `wait-timeout`) is implemented here by resetting the
+  buffered stream, then REFUSED_STREAM to the client. Close 091 with this step.
+
+## Tests
+
+- The concurrency-waiting subset passes on netty.
+- 091's tests on the netty engine (excluded for legacy, which never gets the deadline).

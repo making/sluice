@@ -50,3 +50,8 @@ its upstream sends a GOAWAY (`Http2DemuxRelay#onUpstreamGoAway`; a GOAWAY'd leg 
 waiting stream any more, `Leg#mayOpenLocked`). The deadline refusal follows the same
 pattern: marked reset (`resetLocked`), its entries dropped (`Leg#dropEntriesLocked`) and
 the RST_STREAM written as one step under the sink lock (`WriteSeam.Site.RESET`).
+
+## Retargeted (2026-10-12)
+
+The h2 demux moves to netty (decision in `.todo/artefacts/096/FINDINGS.md`). Do not implement
+this in the legacy relay; it is done on the netty engine in 101, with the decision above.

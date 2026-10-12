@@ -23,3 +23,8 @@ idempotent for legs already removed.
 - An upstream closing after every answer, a client sending 50 requests one after the
   other on one connection: the relay holds at most one leg and the session at most one
   connection for the route (test hooks), and every request is answered.
+
+## Retargeted (2026-10-12)
+
+The h2 demux moves to netty (decision in `.todo/artefacts/096/FINDINGS.md`). Do not fix this
+in the legacy relay; it is done on the netty engine in 104.

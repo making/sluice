@@ -338,3 +338,13 @@ lines in the spike without budget, timeouts or metrics.
    a netty event loop from the start.
 4. Which held todos to cancel now: subsumed 073, 080, 088, 089, 090, 092, 093. Hold or
    re-target 066, 075, 091 to the new engine. Unaffected: 078, 085 (head parser part).
+
+## Decision (2026-10-12, the user)
+
+1. Migrate, in steps behind an engine switch: todos 098 to 107.
+2. Per-hop semantics accepted: the upstream no longer sees the client's SETTINGS or stream
+   WINDOW_UPDATEs, padding is dropped, netty's error codes where they differ from 088 /
+   089, no half-close and grace after an error GOAWAY.
+3. I/O model: `EmbeddedChannel` plus one lock per relay.
+4. Subsumed todos cancelled now: 073, 080, 088, 089, 090, 092, 093. 066, 075 and 091 are
+   retargeted to the netty engine (104, 101); 078 and 085 proceed as they are.
