@@ -104,7 +104,8 @@ class TunnelBackpressureE2ETest {
 	/**
 	 * With the client stalled (its upstream never reads), the public peer pushing into
 	 * the tunnel must be backpressured by the bounded server -> client path instead of
-	 * being buffered without limit.
+	 * being buffered without limit: its writes stop being accepted, the connection still
+	 * open, well before 128MiB.
 	 */
 	@Test
 	void serverToClientDirectionIsBackpressured() throws Exception {
@@ -112,12 +113,30 @@ class TunnelBackpressureE2ETest {
 		startClient(List.of(route("sink.local", sink, sinkRoutePort)));
 		sunk.set(0);
 		try (Socket victim = new Socket("127.0.0.1", sinkRoutePort)) {
-			Thread.ofVirtual().name("e2e-bp-pusher").start(() -> push(victim));
-			Thread.sleep(10_000);
-			long pushed = sunk.get();
+			Thread pusher = Thread.ofVirtual().name("e2e-bp-pusher").start(() -> push(victim));
+			Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> sunk.get() > 1024L * 1024);
+			long pushed = awaitNoGrowth(sunk, Duration.ofSeconds(1), Duration.ofSeconds(10));
+			assertThat(pusher.isAlive()).as("the pusher is blocked in a write, not torn down").isTrue();
 			assertThat(pushed).as("bytes accepted from a peer whose upstream never reads")
 				.isLessThan(128L * 1024 * 1024);
 		}
+	}
+
+	/**
+	 * Waits until {@code counter} did not grow for {@code quiet}, failing after
+	 * {@code atMost}; its value then.
+	 */
+	private static long awaitNoGrowth(AtomicLong counter, Duration quiet, Duration atMost) {
+		AtomicLong last = new AtomicLong(counter.get());
+		AtomicLong changedAt = new AtomicLong(System.nanoTime());
+		Awaitility.await().pollInterval(Duration.ofMillis(50)).atMost(atMost).until(() -> {
+			long now = counter.get();
+			if (now != last.getAndSet(now)) {
+				changedAt.set(System.nanoTime());
+			}
+			return System.nanoTime() - changedAt.get() >= quiet.toNanos();
+		});
+		return last.get();
 	}
 
 	/**
@@ -151,10 +170,10 @@ class TunnelBackpressureE2ETest {
 					peerReleased.set(true); // reset counts as released
 				}
 			});
-			// prove the relay is flowing, then keep it under load for a while: the
-			// teardown below must work with frames in flight and queues full
+			// prove the relay is flowing, then let it fill up: the teardown below must
+			// work with frames in flight and queues full, which holds the pusher back
 			Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> sunk.get() > 1024L * 1024);
-			Thread.sleep(5000);
+			awaitNoGrowth(sunk, Duration.ofSeconds(1), Duration.ofSeconds(10));
 			// precondition: the relay waits for the credit the stalled client withholds
 			Awaitility.await()
 				.atMost(Duration.ofSeconds(10))

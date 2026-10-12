@@ -70,7 +70,10 @@ class ClientTeardownFullQueueE2ETest {
 		this.serverContext = new SpringApplicationBuilder(SluiceServerApplication.class).run("--server.port=0",
 				"--spring.grpc.server.port=" + grpcPort, "--sluice.data-port=" + dataPort,
 				"--sluice.tcp-port-range=" + listenPort, "--sluice.token=it-token",
-				"--spring.grpc.server.shutdown.grace-period=1s");
+				"--spring.grpc.server.shutdown.grace-period=1s",
+				// the server ends the stream at once rather than waiting out the drain
+				// for the connection held open
+				"--sluice.cluster.drain-grace=0s");
 		TunnelClient started = TunnelClient.builder()
 			.properties(SluiceClientProperties.builder()
 				.serverUrl("grpc://127.0.0.1:" + grpcPort)
