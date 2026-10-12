@@ -14,6 +14,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -116,6 +117,9 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	@Nullable
 	@Autowired
 	private MeterRegistry meterRegistry;
+
+	/** The registry of the client app started for each host: no registry is shared. */
+	private final Map<String, MeterRegistry> clientMeters = new ConcurrentHashMap<>();
 
 	@Nullable
 	@Autowired
@@ -854,6 +858,69 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	}
 
 	/**
+	 * The upstream answered in full and got the demux's half-close, but the response
+	 * waits for the client's window; the client then goes: the relay ends with an ERROR
+	 * after the CLOSE the client app already took, and the app must still release the
+	 * upstream connection (the CLOSE ended its reader, so only the remote-failure
+	 * registration of the relay can).
+	 */
+	@Test
+	void clientGoneAfterTheUpstreamsHalfCloseReleasesTheUpstreamConnection() throws Exception {
+		String route = "uf.gone.closed.test";
+		int length = 100 * KIB;
+		CountDownLatch eof = new CountDownLatch(1);
+		CountDownLatch held = new CountDownLatch(1);
+		this.closeables.add(held::countDown);
+		// answers in full regardless of windows, then holds the socket silently past the
+		// half-close: it writes nothing a relay writing to the remote would trip on
+		startClient(route, upstream(new AtomicReference<>(), upstream -> {
+			upstream.settings(null);
+			TestH2.@Nullable Frame frame;
+			while ((frame = upstream.next()) != null) {
+				if (frame.type() == TestH2.HEADERS) {
+					upstream.headers(frame.streamId(), false);
+					for (int sent = 0; sent < length; sent += 16 * KIB) {
+						int chunk = Math.min(16 * KIB, length - sent);
+						upstream.write(TestH2.DATA, sent + chunk == length ? TestH2.FLAG_END_STREAM : 0,
+								frame.streamId(), new byte[chunk]);
+					}
+				}
+			}
+			eof.countDown();
+			held.await();
+		}));
+		DataProxyServer proxy = Objects.requireNonNull(this.dataProxyServer);
+		Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> proxy.activeConnections() == 0);
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
+			client.withholdConnectionWindow();
+			// the stream window covers the response: only the connection window holds it
+			client.frame(TestH2.SETTINGS, 0, 0,
+					WindowedH2Upstream.setting(WindowedH2Upstream.SETTINGS_INITIAL_WINDOW_SIZE, 1024 * KIB));
+			client.headers(1, true, get(route));
+			// the demux half-closes the legs once the client is done sending
+			client.halfClose();
+			assertThat(client.awaitTrue(() -> client.dataReceived(1) == H2TestClient.INITIAL_WINDOW,
+					Duration.ofSeconds(10)))
+				.as("the client's window spent")
+				.isTrue();
+			assertThat(eof.await(10, TimeUnit.SECONDS)).as("the upstream got the half-close").isTrue();
+			assertThat(client.ended(1)).as("the rest of the response waits for the client").isFalse();
+			assertThat(proxy.activeConnections()).as("the relay is live").isEqualTo(1);
+			assertThat(clientActiveConnections(route)).as("the client holds the upstream connection").isEqualTo(1);
+		}
+		Awaitility.await()
+			.atMost(Duration.ofSeconds(10))
+			.untilAsserted(() -> assertThat(clientActiveConnections(route)).as("the client released the leg").isZero());
+	}
+
+	private int clientActiveConnections(String host) {
+		return (int) Objects.requireNonNull(this.clientMeters.get(host))
+			.get("sluice.connections.active")
+			.gauge()
+			.value();
+	}
+
+	/**
 	 * The upstream commits the offence on reading stream 1's head, before answering: it
 	 * gets a GOAWAY of the code, and the relay's EOF; the client gets a {@code 502} on
 	 * stream 1 and no GOAWAY, and a stream of another route completes after.
@@ -1203,6 +1270,8 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	}
 
 	private void startClient(String host, int port) {
+		MeterRegistry meters = new SimpleMeterRegistry();
+		this.clientMeters.put(host, meters);
 		TunnelClient client = TunnelClient.builder()
 			.properties(SluiceClientProperties.builder()
 				.serverUrl("grpc://127.0.0.1:" + grpcPort)
@@ -1210,7 +1279,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 				.token("it-token")
 				.build())
 			.taskExecutor(task -> Thread.ofVirtual().name("e2e-uf").start(task))
-			.meterRegistry(new SimpleMeterRegistry())
+			.meterRegistry(meters)
 			.build();
 		client.start();
 		this.clients.add(client);
