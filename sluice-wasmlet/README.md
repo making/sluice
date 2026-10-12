@@ -65,6 +65,13 @@ about N x 1.04MiB (265MiB by default), and its outbound queue at most 256KiB of
 response DATA (N x 256KiB in total; an ended connection keeps its slot until its
 queued frames left). Guest instances are bounded by `--max-instances` instead.
 
+`--tunnel-stall-timeout SECONDS` (default 60, `0` = off) gives a node stream up once
+connection frames waited that long with gRPC taking none of them (a server that stopped
+reading while it keeps the connection alive): the queued frames are dropped, which frees
+the slots of the ended connections they belong to, the stream's connections fail, and the
+session reconnects (`sluice.client.tunnel-stall-timeout` of the Java client). A frame taken
+restarts the wait; control frames do not count.
+
 `--max-instances N` (default 64) caps the guest instances alive at once over every route,
 so guest linear memory stays within N x the largest `memory-mib` (16GiB at the defaults).
 Every instance holds one of the N slots until it is gone: a request's, or a pooled unit's

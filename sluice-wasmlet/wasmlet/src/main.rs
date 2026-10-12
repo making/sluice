@@ -67,6 +67,7 @@ struct Config {
     routes: Vec<Route>,
     max_connections: usize,
     max_instances: usize,
+    stall_timeout: Duration,
 }
 
 /// Reconnect backoff: exponential seconds, as `NodeConnection`.
@@ -82,6 +83,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (plus at most two partly used 16KiB segments and 80 segments' overhead
 /// each) = about 265MiB of the server's payload buffered at most.
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
+
+/// Default of `--tunnel-stall-timeout`, the Java side's
+/// `sluice.client.tunnel-stall-timeout`.
+const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Default of `--max-instances`: 64 guest instances alive at once, i.e. at
 /// most 64 x the largest `memory-mib` of guest linear memory (16GiB at the
@@ -104,6 +109,9 @@ struct Shared {
     components: Arc<HashMap<String, Arc<Handler>>>,
     /// Connections open at once, over every node session.
     limit: Arc<tunnel::Limit>,
+    /// How long connection frames may wait with none taken before a stream
+    /// is given up; zero = never.
+    stall_timeout: Duration,
 }
 
 /// One tunnel stream toward one node. The supervisor's `Arc` identity survives
@@ -154,6 +162,7 @@ fn parse_args() -> Config {
         routes: Vec::new(),
         max_connections: DEFAULT_MAX_CONNECTIONS,
         max_instances: DEFAULT_MAX_INSTANCES,
+        stall_timeout: DEFAULT_STALL_TIMEOUT,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -185,6 +194,11 @@ fn parse_args() -> Config {
                     wasm_host::Instances::MAX,
                 )
                 .unwrap_or_else(|e| panic!("{e}"));
+            }
+            "--tunnel-stall-timeout" => {
+                config.stall_timeout =
+                    parse_seconds("tunnel-stall-timeout", &value("tunnel-stall-timeout"))
+                        .unwrap_or_else(|e| panic!("{e}"));
             }
             "--wasm" => {
                 let spec = value("wasm");
@@ -219,6 +233,14 @@ fn parse_limit(name: &str, value: &str, max: usize) -> Result<usize, String> {
             "--{name} must be a number from 1 to {max}, got '{value}'"
         )),
     }
+}
+
+/// The value of a duration flag in whole seconds; `0` turns it off.
+fn parse_seconds(name: &str, value: &str) -> Result<Duration, String> {
+    value
+        .parse()
+        .map(Duration::from_secs)
+        .map_err(|_| format!("--{name} must be a number of seconds (0 = off), got '{value}'"))
 }
 
 /// Splits `locator[?budget-ms=N&memory-mib=N&wasi=cap,...]` into the locator
@@ -271,6 +293,7 @@ async fn run(config: Config) -> Result<(), BoxError> {
         routes,
         max_connections,
         max_instances,
+        stall_timeout,
     } = config;
     println!("wasmlet build: {}", describe(&peer_build()));
     let instances = Instances::new(max_instances);
@@ -308,8 +331,13 @@ async fn run(config: Config) -> Result<(), BoxError> {
         advertised,
         components: Arc::new(components),
         limit: tunnel::Limit::new(max_connections),
+        stall_timeout,
     });
     println!("connection limit {max_connections}");
+    println!(
+        "tunnel stall timeout {}s (0 = off)",
+        stall_timeout.as_secs()
+    );
     println!(
         "instance limit {max_instances} ({} h2 streams per connection)",
         instances.streams_per_connection()
@@ -499,13 +527,16 @@ impl NodeTask {
             .await?
             .into_inner();
 
+        let watchdog = outbound.clone();
         let connections = Connections::new(
             self.key.clone(),
             outbound,
             self.shared.components.clone(),
             self.shared.limit.clone(),
         );
-        let established = self.stream(inbound, &connections, &channel).await;
+        let established = self
+            .stream(inbound, &connections, &channel, &watchdog)
+            .await;
 
         // Tear down this attempt's virtual connections: their tunnel side is
         // gone, and the next attempt carries fresh conn ids.
@@ -515,12 +546,16 @@ impl NodeTask {
     }
 
     /// Serves one established stream to the end; `Ok(true)` once the advertise
-    /// was acked.
+    /// was acked. The stream is given up once `outbound` stalled for the
+    /// stall timeout (a server that stopped reading, keeping the connection
+    /// alive): the caller's teardown then drops the queued frames and frees
+    /// their slots, and dropping the call resets the stream.
     async fn stream(
         &self,
         mut inbound: tonic::Streaming<Frame>,
         connections: &Connections,
         channel: &tonic::transport::Channel,
+        outbound: &Outbound,
     ) -> Result<bool, BoxError> {
         let mut established = false;
         loop {
@@ -531,6 +566,14 @@ impl NodeTask {
                     Err(e) => return Err(e.into()),
                 },
                 _ = self.session.token.cancelled() => return Ok(established),
+                stalled = outbound.stalled(self.shared.stall_timeout) => {
+                    eprintln!(
+                        "[{}] tunnel stream held frames queued with none taken for {}ms: giving it up",
+                        self.key,
+                        stalled.as_millis()
+                    );
+                    return Ok(established);
+                }
             };
             match frame.body {
                 Some(Body::AdvertiseAck(ack)) => {
@@ -720,6 +763,151 @@ mod tests {
             parse_limit("max-connections", "0", usize::MAX),
             Err("--max-connections must be a positive number, got '0'".to_string()),
         );
+    }
+
+    /// Frames of the server's stream, gRPC-framed (5-byte prefix + message).
+    fn grpc_frame(frame: &Frame) -> bytes::Bytes {
+        use prost::Message as _;
+        let message = frame.encode_to_vec();
+        let mut out = Vec::with_capacity(5 + message.len());
+        out.push(0);
+        out.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        out.extend_from_slice(&message);
+        out.into()
+    }
+
+    /// A tunnel server that stops reading: it reads the advertise, acks it,
+    /// asks for one connection to `target` carrying an http/1.1 request for
+    /// `/stream` (10MiB), and from then on never reads the request stream
+    /// nor grants window back, while it keeps the connection and its
+    /// response stream open.
+    async fn stalling_server(target: String) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("grpc://{}", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            let mut held = Vec::new();
+            while let Some(accepted) = connection.accept().await {
+                let (request, mut respond) = accepted.unwrap();
+                if request.uri().path() != "/sluice.v1.Tunnel/Connect" {
+                    continue; // ListNodes: reset by the drop
+                }
+                let mut body = request.into_body();
+                // the advertise: read it, and grant only what it took
+                let advertise = body.data().await.unwrap().unwrap();
+                body.flow_control()
+                    .release_capacity(advertise.len())
+                    .unwrap();
+                let response = http::Response::builder()
+                    .header("content-type", "application/grpc")
+                    .body(())
+                    .unwrap();
+                let mut send = respond.send_response(response, false).unwrap();
+                let frames = [
+                    Body::AdvertiseAck(pb::AdvertiseAck {
+                        node_id: "stalling".into(),
+                        ..Default::default()
+                    }),
+                    Body::Connect(pb::Connect {
+                        conn_id: 1,
+                        address: target.clone(),
+                        // credit past the response: only the stream holds it back
+                        connection_window: 64 << 20,
+                    }),
+                    Body::Data(pb::Data {
+                        conn_id: 1,
+                        payload: b"GET /stream HTTP/1.1\r\nhost: stall.local\r\n\r\n".to_vec(),
+                    }),
+                ];
+                for body in frames {
+                    send.send_data(grpc_frame(&Frame { body: Some(body) }), false)
+                        .unwrap();
+                }
+                held.push((body, send));
+            }
+            drop(held);
+        });
+        // drive the connection on: accept() above polls it
+        (url, served)
+    }
+
+    /// Against a server that stops reading, the node stream is given up at
+    /// the stall timeout: the attempt ends and the connection's slot is
+    /// freed, though the server keeps the connection alive.
+    #[tokio::test]
+    async fn a_server_that_stops_reading_has_the_stream_given_up_at_the_stall_timeout() {
+        let timeout = Duration::from_secs(2);
+        let locator =
+            Locator::parse(wasm_host::tests::guest_wasm("hello").to_str().unwrap()).unwrap();
+        let target = locator.target().await.unwrap();
+        let loaded = wasm_host::load(&locator, wasm_host::Caps::default())
+            .await
+            .unwrap();
+        let handler = Handler::new(loaded, Sandbox::default(), &Instances::new(4)).unwrap();
+        let limit = tunnel::Limit::new(4);
+        let shared = Arc::new(Shared {
+            token: String::new(),
+            id: "stall-test".into(),
+            insecure: false,
+            ca_pem: None,
+            advertised: Vec::new(),
+            components: Arc::new(HashMap::from([(target.clone(), handler)])),
+            limit: limit.clone(),
+            stall_timeout: timeout,
+        });
+        let (url, _server) = stalling_server(target).await;
+        let (events, _received) = mpsc::channel(32);
+        let task = NodeTask {
+            shared,
+            session: Arc::new(Session {
+                url,
+                token: CancellationToken::new(),
+            }),
+            key: "stalling".into(),
+            events,
+        };
+        let start = tokio::time::Instant::now();
+        let attempt = tokio::spawn(async move { task.attempt().await.map_err(|e| e.to_string()) });
+        let mut held = false;
+        while !attempt.is_finished() && start.elapsed() < timeout * 10 {
+            held |= limit.open() == 1;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(attempt.is_finished(), "the attempt ended");
+        let established = attempt.await.unwrap();
+
+        assert!(
+            held,
+            "precondition: the connection held its slot while stalled"
+        );
+        assert_eq!(established, Ok(true), "the stream had come up");
+        assert!(
+            start.elapsed() >= timeout,
+            "not before the timeout: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(limit.open(), 0, "the slot is freed");
+    }
+
+    #[test]
+    fn durations_take_whole_seconds_and_zero_turns_them_off() {
+        assert_eq!(
+            parse_seconds("tunnel-stall-timeout", "90"),
+            Ok(Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_seconds("tunnel-stall-timeout", "0"),
+            Ok(Duration::ZERO)
+        );
+        for bad in ["-1", "1.5", "60s", ""] {
+            assert_eq!(
+                parse_seconds("tunnel-stall-timeout", bad),
+                Err(format!(
+                    "--tunnel-stall-timeout must be a number of seconds (0 = off), got '{bad}'"
+                )),
+            );
+        }
     }
 
     #[test]

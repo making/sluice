@@ -1713,7 +1713,7 @@ where
 // Tests
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::pb::frame::Body;
     use crate::tunnel::testing::Peer;
@@ -1724,7 +1724,7 @@ mod tests {
     /// their own workspace with a pinned nightly toolchain (wasm32-wasip3), so
     /// the build goes through the rustup proxy from that directory -- not
     /// `$CARGO`, and without the `RUSTUP_TOOLCHAIN` the outer build exports.
-    fn guest_wasm(name: &str) -> std::path::PathBuf {
+    pub(crate) fn guest_wasm(name: &str) -> std::path::PathBuf {
         static BUILD: Mutex<()> = Mutex::new(());
         let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()

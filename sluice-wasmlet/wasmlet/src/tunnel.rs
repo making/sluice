@@ -31,10 +31,12 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use futures_util::stream::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::pb::frame::Body;
@@ -123,7 +125,12 @@ pub enum Ctrl {
 ///   nothing; a later frame starts a new one;
 /// - once the stream ends (the teardown, or gRPC dropping the request
 ///   stream), queued frames are dropped, later ones too, and writers waiting
-///   at the cap fail.
+///   at the cap fail;
+/// - the stall clock ([`Outbound::stalled`]) runs while connection frames
+///   wait and the stream takes none of them: the request stream is polled
+///   only while gRPC's flow control has room, so a server that stops
+///   reading stops the polls. Control frames are no progress; with no
+///   connection frame queued nothing is stalled.
 #[derive(Clone)]
 pub struct Outbound {
     queues: Arc<Mutex<Queues>>,
@@ -139,6 +146,10 @@ struct Queues {
     /// The request stream waiting for a frame.
     stream: Option<Waker>,
     closed: bool,
+    /// Since when connection frames wait with none taken: set when a frame
+    /// joins an empty ring, moved on by each connection frame taken while
+    /// others wait, cleared once none waits.
+    waiting_since: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -219,6 +230,9 @@ impl Outbound {
             if queues.closed {
                 return;
             }
+            if queues.ring.is_empty() {
+                queues.waiting_since = Some(Instant::now());
+            }
             let queue = queues.connections.entry(conn_id).or_default();
             let joins = queue.frames.is_empty();
             queue.frames.push_back(frame);
@@ -262,6 +276,7 @@ impl Outbound {
             queues.closed = true;
             queues.control.clear();
             queues.ring.clear();
+            queues.waiting_since = None;
             let writers: Vec<Waker> = queues
                 .connections
                 .drain()
@@ -304,10 +319,37 @@ impl Outbound {
             } else {
                 queues.ring.push_back(conn_id);
             }
+            // a frame taken is progress: the others wait from now on
+            queues.waiting_since = (!queues.ring.is_empty()).then(Instant::now);
             (frame, writer)
         };
         wake(writer);
         Poll::Ready(Some(frame))
+    }
+
+    /// Resolves once connection frames have waited `timeout` with none
+    /// taken by the request stream, with how long they waited; never with a
+    /// zero `timeout`. Every wake re-reads the clock, so a stall that ended
+    /// in between does not count.
+    pub async fn stalled(&self, timeout: Duration) -> Duration {
+        if timeout.is_zero() {
+            return std::future::pending().await;
+        }
+        loop {
+            let since = self.lock().waiting_since;
+            match since {
+                Some(since) => {
+                    let waited = since.elapsed();
+                    if waited >= timeout {
+                        return waited;
+                    }
+                    tokio::time::sleep_until(since + timeout).await;
+                }
+                // nothing waits: look again in a while, a stall needs the
+                // whole timeout anyway
+                None => tokio::time::sleep(timeout.min(Duration::from_secs(1))).await,
+            }
+        }
     }
 
     /// The live connection queues.
@@ -1679,6 +1721,112 @@ mod tests {
             matches!(first.body, Some(Body::Error(_))),
             "control first: {first:?}"
         );
+    }
+
+    const STALL: Duration = Duration::from_secs(60);
+
+    /// Takes one frame from the request stream, as gRPC does when its flow
+    /// control has room.
+    async fn take(frames: &mut Pin<Box<Frames>>) -> Frame {
+        use futures_util::StreamExt as _;
+        frames.next().await.expect("a frame")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_frames_not_taken_stall_past_the_timeout() {
+        let (outbound, _frames) = Outbound::new();
+        let start = Instant::now();
+        outbound.data(1, data_frame(1, 1));
+        outbound.marker(1, close_frame(1));
+        // frames queued later, none taken, do not move the clock on
+        let producer = outbound.clone();
+        let more = tokio::spawn(async move {
+            for conn_id in 2.. {
+                tokio::time::sleep(STALL / 10).await;
+                producer.data(conn_id, data_frame(conn_id, 1));
+            }
+        });
+
+        let waited = tokio::time::timeout(STALL * 2, outbound.stalled(STALL)).await;
+        more.abort();
+        let waited = waited.expect("stalled while frames kept being queued");
+
+        assert_eq!(
+            start.elapsed(),
+            STALL,
+            "resolved at the timeout, not before"
+        );
+        assert_eq!(waited, STALL);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_taking_frames_slower_than_they_queue_never_stalls() {
+        let (outbound, frames) = Outbound::new();
+        let mut frames = Box::pin(frames);
+        for _ in 0..DATA_QUEUE_CAPACITY {
+            outbound.data(1, data_frame(1, 1));
+        }
+        let watchdog = outbound.clone();
+        let stalled = tokio::spawn(async move { watchdog.stalled(STALL).await });
+        // one frame per half timeout, over eight timeouts; the queue never
+        // empties, so every step is a stall shorter than the timeout
+        for _ in 0..DATA_QUEUE_CAPACITY {
+            tokio::time::sleep(STALL / 2).await;
+            assert!(!stalled.is_finished(), "cut while frames were taken");
+            take(&mut frames).await;
+            outbound.data(1, data_frame(1, 1));
+        }
+        assert_eq!(
+            outbound.queued_data(1),
+            DATA_QUEUE_CAPACITY,
+            "precondition: frames kept waiting"
+        );
+        stalled.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_queued_never_stalls_and_control_frames_are_no_progress() {
+        let (outbound, frames) = Outbound::new();
+        let mut frames = Box::pin(frames);
+        // idle: no connection frame waits, however long nothing is taken
+        outbound.control(error_frame(2, "x"));
+        let idle = tokio::time::timeout(STALL * 3, outbound.stalled(STALL)).await;
+        assert!(idle.is_err(), "an idle stream is never stalled");
+
+        // control frames leaving do not move the stall clock on
+        let start = Instant::now();
+        outbound.data(1, data_frame(1, 1));
+        let watchdog = outbound.clone();
+        let stalled = tokio::spawn(async move { watchdog.stalled(STALL).await });
+        while !stalled.is_finished() && start.elapsed() < STALL * 2 {
+            outbound.control(error_frame(2, "x"));
+            assert!(matches!(take(&mut frames).await.body, Some(Body::Error(_))));
+            tokio::time::sleep(STALL / 10).await;
+        }
+        let waited = stalled.await.expect("the watchdog resolved");
+        assert!(waited >= STALL, "waited {waited:?}");
+        assert!(
+            start.elapsed() < STALL * 2,
+            "resolved while control frames kept leaving"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_timeout_never_stalls() {
+        let (outbound, _frames) = Outbound::new();
+        outbound.data(1, data_frame(1, 1));
+        let stalled = tokio::time::timeout(STALL * 10, outbound.stalled(Duration::ZERO)).await;
+        assert!(stalled.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_end_of_the_stream_ends_the_stall() {
+        let (outbound, _frames) = Outbound::new();
+        outbound.data(1, data_frame(1, 1));
+        tokio::time::sleep(STALL / 2).await;
+        outbound.shutdown();
+        let stalled = tokio::time::timeout(STALL * 3, outbound.stalled(STALL)).await;
+        assert!(stalled.is_err(), "nothing waits on an ended stream");
     }
 
     #[tokio::test]
