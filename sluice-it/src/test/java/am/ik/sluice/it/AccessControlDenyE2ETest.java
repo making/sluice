@@ -131,7 +131,8 @@ class AccessControlDenyE2ETest {
 	void theTunnelSessionSurvivesTheDeniedDataPlane() {
 		this.startClient();
 		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> this.sessions.count() == 1);
-		assertThat(Objects.requireNonNull(this.client).isConnected()).isTrue();
+		// the server registers the session before the client handles its acknowledgement
+		Awaitility.await().atMost(Duration.ofSeconds(5)).until(Objects.requireNonNull(this.client)::isConnected);
 	}
 
 	private static String raw(String request) throws Exception {

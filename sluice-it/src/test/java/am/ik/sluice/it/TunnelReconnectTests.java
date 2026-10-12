@@ -143,7 +143,8 @@ class TunnelReconnectTests {
 		awaitServerPortReleased();
 		startServer("it-token");
 		Awaitility.await().atMost(Duration.ofSeconds(30)).until(() -> serverRegistry().count() == 1);
-		assertThat(client.getBean(TunnelClient.class).isConnected()).isTrue();
+		// the server registers the session before the client handles its acknowledgement
+		Awaitility.await().atMost(Duration.ofSeconds(5)).until(client.getBean(TunnelClient.class)::isConnected);
 		assertThat(roundTrip()).contains("it-ok");
 	}
 
