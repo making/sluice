@@ -428,14 +428,19 @@ class KeepAliveIdleTimeoutE2ETest {
 		assertThat(idleClosed()).as("no timeout passed for the ended relay").isEqualTo(idle);
 	}
 
+	/**
+	 * A connection head whose request HEADERS is on stream 0 -- routed by its authority
+	 * all the same -- opens no stream: a connection error (RFC 9113 6.2), so the
+	 * connection is closed at once with GOAWAY {@code PROTOCOL_ERROR} rather than left to
+	 * the idle timeout, and no deadline is left behind.
+	 */
 	@Test
-	void anH2ConnectionWhoseHeadOpenedNoStreamIsClosedAtTheIdleTimeout() throws Exception {
+	void anH2ConnectionHeadOnStreamZeroIsClosedAtOnce() throws Exception {
 		double idle = idleClosed();
 		try (Socket socket = connect()) {
 			OutputStream out = socket.getOutputStream();
 			out.write(TestH2.PREFACE);
 			TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
-			// routed by its authority, yet on stream 0: no stream is opened
 			TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 0,
 					TestH2.headerBlock(":authority=" + H2_HOST, ":method=GET", ":path=/"));
 			long sent = System.nanoTime();
@@ -445,10 +450,12 @@ class KeepAliveIdleTimeoutE2ETest {
 			}
 			while (frame != null && frame.type() != TestH2.GOAWAY);
 			assertThat(frame).as("a GOAWAY").isNotNull();
-			assertThat(Duration.ofNanos(System.nanoTime() - sent)).isGreaterThan(NOT_BEFORE).isLessThan(WITHIN);
+			assertThat(TestH2.errorCode(Objects.requireNonNull(frame))).as("PROTOCOL_ERROR").isEqualTo(0x1);
+			assertThat(Duration.ofNanos(System.nanoTime() - sent)).isLessThan(NOT_BEFORE);
 		}
 		awaitAdmitted(0);
-		assertThat(idleClosed()).isEqualTo(idle + 1);
+		awaitNoDeadline();
+		assertThat(idleClosed()).isEqualTo(idle);
 	}
 
 	@Test

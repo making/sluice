@@ -53,11 +53,15 @@ import io.micrometer.core.instrument.MeterRegistry;
  * advertises {@link #MAX_CONCURRENT_STREAMS}, refuses a stream beyond it, and grants a
  * stream's window as far as the stream's queued payload and its window stay within
  * {@link #STREAM_BUDGET} -- the leg writer's drain makes room, padding never takes any. A
- * client sending past a stream window gets a GOAWAY {@code FLOW_CONTROL_ERROR}; a client
- * WINDOW_UPDATE RFC 9113 6.9 makes an error ends the connection or resets its stream
- * ({@link #onClientWindowUpdate}), one from an upstream ends the relay. A header block is
- * written whole in either direction, and the relay's own connection-level frames towards
- * an upstream are written ahead of the request frames queued for it.
+ * client sending past a stream window gets a GOAWAY {@code FLOW_CONTROL_ERROR}. A client
+ * frame RFC 9113 makes a connection error -- its framing ({@link #validate}), a setting
+ * out of range ({@link #onSettings}), a window update of 0 or past 2^31-1 on stream 0
+ * ({@link #onClientWindowUpdate}) -- ends the connection with a GOAWAY of the error's
+ * code before it has any effect; one making a stream error -- a stream window update of 0
+ * or past 2^31-1, a PRIORITY of a wrong length ({@link #onPriority}) -- resets a tracked
+ * stream. A WINDOW_UPDATE RFC 9113 6.9 makes an error from an upstream ends the relay. A
+ * header block is written whole in either direction, and the relay's own connection-level
+ * frames towards an upstream are written ahead of the request frames queued for it.
  * <p>
  * What the relay queues is bounded across connections too: each relay may queue
  * {@link #CONNECTION_ALLOWANCE}, and the bytes beyond it are charged to the
@@ -157,9 +161,13 @@ final class Http2DemuxRelay {
 
 	private static final int FRAME_HEADERS = 0x1;
 
+	private static final int FRAME_PRIORITY = 0x2;
+
 	private static final int FRAME_RST_STREAM = 0x3;
 
 	private static final int FRAME_SETTINGS = 0x4;
+
+	private static final int FRAME_PUSH_PROMISE = 0x5;
 
 	private static final int FRAME_PING = 0x6;
 
@@ -197,6 +205,8 @@ final class Http2DemuxRelay {
 
 	private static final int SETTINGS_HEADER_TABLE_SIZE = 0x1;
 
+	private static final int SETTINGS_ENABLE_PUSH = 0x2;
+
 	private static final int SETTINGS_MAX_CONCURRENT_STREAMS = 0x3;
 
 	private static final int SETTINGS_INITIAL_WINDOW_SIZE = 0x4;
@@ -204,6 +214,13 @@ final class Http2DemuxRelay {
 	private static final int SETTINGS_MAX_FRAME_SIZE = 0x5;
 
 	private static final int SETTINGS_MAX_HEADER_LIST_SIZE = 0x6;
+
+	private static final int SETTINGS_ENABLE_CONNECT_PROTOCOL = 0x8;
+
+	private static final int SETTINGS_NO_RFC7540_PRIORITIES = 0x9;
+
+	/** The largest SETTINGS_MAX_FRAME_SIZE a peer may announce (RFC 9113 6.5.2). */
+	private static final int MAX_FRAME_SIZE_LIMIT = (1 << 24) - 1;
 
 	/** The settings defined by RFC 9113, RFC 8441 and RFC 9218, the ones re-announced. */
 	private static final Set<Integer> KNOWN_SETTINGS = Set.of(0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x8, 0x9);
@@ -544,8 +561,8 @@ final class Http2DemuxRelay {
 			// the connection head ends with the magic; the frames follow it
 			int magic = ConnectionHeadParser.H2_MAGIC.length();
 			feed(this.seedHead, magic, this.seedHead.length - magic);
-			// a head whose stream was not admitted (or not even taken as a stream)
-			// leaves the connection idle
+			// a head whose stream was not admitted (its leg retired meanwhile) leaves
+			// the connection idle
 			this.lock.lock();
 			try {
 				idleIfQuietLocked();
@@ -630,8 +647,7 @@ final class Http2DemuxRelay {
 			int frameLength = unsigned24(header);
 			if (frameLength > MAX_FRAME_SIZE) {
 				// before its payload arrives: nothing of it is buffered
-				goAway(ERROR_FRAME_SIZE);
-				throw new IllegalStateException("client frame of %d bytes".formatted(frameLength));
+				throw connectionError(ERROR_FRAME_SIZE, "frame of %d bytes".formatted(frameLength));
 			}
 			if (all.length - position < FRAME_HEADER_LENGTH + frameLength) {
 				break;
@@ -662,11 +678,13 @@ final class Http2DemuxRelay {
 	}
 
 	private void onFrame(Frame frame) {
+		validate(frame);
 		switch (frame.type()) {
 			case FRAME_SETTINGS -> onSettings(frame);
 			case FRAME_HEADERS -> onHeaders(frame, true);
 			case FRAME_CONTINUATION -> onHeaders(frame, false);
 			case FRAME_DATA -> onData(frame);
+			case FRAME_PRIORITY -> onPriority(frame);
 			case FRAME_RST_STREAM -> onClientReset(frame);
 			case FRAME_WINDOW_UPDATE -> onClientWindowUpdate(frame);
 			case FRAME_PING -> {
@@ -675,10 +693,180 @@ final class Http2DemuxRelay {
 				}
 			}
 			default -> {
-				// priority (advisory, deprecated), push promise (never sent by a client),
-				// goaway, and unknown types (hop-by-hop extensions) end here
+				// goaway and unknown types (hop-by-hop extensions, RFC 9113 5.5) end here
 			}
 		}
+	}
+
+	/**
+	 * The connection errors RFC 9113 makes of a client frame's framing, checked before
+	 * the frame has any effect: the connection ends with a GOAWAY of the error's code,
+	 * and the frames after it are not parsed.
+	 * <ul>
+	 * <li>Inside a header block, any frame but a CONTINUATION of the block's stream --
+	 * one of an unknown type included -- is a {@code PROTOCOL_ERROR} (6.10, 5.5); a
+	 * CONTINUATION outside one is too (6.10).</li>
+	 * <li>A length its type does not allow is a {@code FRAME_SIZE_ERROR}: RST_STREAM
+	 * other than 4 (6.4), SETTINGS not a multiple of 6 or an ACK with a payload (6.5),
+	 * PING other than 8 (6.7), GOAWAY under 8 (6.8, 4.2), WINDOW_UPDATE other than 4
+	 * (6.9), DATA or HEADERS too short for the Pad Length or priority fields they flag
+	 * (4.2). Padding the payload cannot hold is a {@code PROTOCOL_ERROR} (6.1, 6.2).</li>
+	 * <li>DATA, HEADERS, PRIORITY, RST_STREAM or CONTINUATION on stream 0, and SETTINGS,
+	 * PING or GOAWAY on another, are a {@code PROTOCOL_ERROR} (6.1-6.8, 6.10); so is any
+	 * PUSH_PROMISE from a client (8.4).</li>
+	 * <li>DATA, RST_STREAM or WINDOW_UPDATE on an idle odd stream -- above the highest
+	 * the client opened -- are a {@code PROTOCOL_ERROR} (5.1); so are DATA on an even
+	 * stream (5.1) and a HEADERS opening one (5.1.1).</li>
+	 * </ul>
+	 * A PRIORITY of a length other than 5 is a stream error (6.3), see
+	 * {@link #onPriority}; the SETTINGS values are checked by {@link #onSettings}.
+	 */
+	private void validate(Frame frame) {
+		int type = frame.type();
+		int streamId = frame.streamId();
+		if (this.assemblingStream != -1) {
+			if (type != FRAME_CONTINUATION || streamId != this.assemblingStream) {
+				throw connectionError(ERROR_PROTOCOL, "frame type %d on stream %d inside the header block of stream %d"
+					.formatted(type, streamId, this.assemblingStream));
+			}
+			return;
+		}
+		switch (type) {
+			case FRAME_DATA -> {
+				requireStream(frame);
+				requireOdd(frame);
+				requireOpened(frame);
+				requirePadding(frame, 0);
+			}
+			case FRAME_HEADERS -> {
+				requireStream(frame);
+				requireOdd(frame);
+				requirePadding(frame, frame.has(FLAG_PRIORITY) ? 5 : 0);
+			}
+			case FRAME_PRIORITY -> requireStream(frame);
+			case FRAME_RST_STREAM -> {
+				requireLength(frame, 4);
+				requireStream(frame);
+				requireOpened(frame);
+			}
+			case FRAME_SETTINGS -> {
+				if (frame.length() % 6 != 0 || (frame.has(FLAG_ACK) && frame.length() != 0)) {
+					throw connectionError(ERROR_FRAME_SIZE, "SETTINGS of %d bytes".formatted(frame.length()));
+				}
+				requireConnection(frame);
+			}
+			case FRAME_PUSH_PROMISE -> throw connectionError(ERROR_PROTOCOL, "PUSH_PROMISE from the client");
+			case FRAME_PING -> {
+				requireLength(frame, 8);
+				requireConnection(frame);
+			}
+			case FRAME_GOAWAY -> {
+				if (frame.length() < 8) {
+					throw connectionError(ERROR_FRAME_SIZE, "GOAWAY of %d bytes".formatted(frame.length()));
+				}
+				requireConnection(frame);
+			}
+			case FRAME_WINDOW_UPDATE -> {
+				requireLength(frame, 4);
+				if (streamId != 0) {
+					requireOpened(frame);
+				}
+			}
+			case FRAME_CONTINUATION -> throw connectionError(ERROR_PROTOCOL,
+					"CONTINUATION on stream %d outside a header block".formatted(streamId));
+			default -> {
+				// unknown types are ignored outside a header block (RFC 9113 5.5)
+			}
+		}
+	}
+
+	private void requireLength(Frame frame, int length) {
+		if (frame.length() != length) {
+			throw connectionError(ERROR_FRAME_SIZE,
+					"frame type %d of %d bytes".formatted(frame.type(), frame.length()));
+		}
+	}
+
+	private void requireStream(Frame frame) {
+		if (frame.streamId() == 0) {
+			throw connectionError(ERROR_PROTOCOL, "frame type %d on stream 0".formatted(frame.type()));
+		}
+	}
+
+	private void requireConnection(Frame frame) {
+		if (frame.streamId() != 0) {
+			throw connectionError(ERROR_PROTOCOL,
+					"frame type %d on stream %d".formatted(frame.type(), frame.streamId()));
+		}
+	}
+
+	/**
+	 * The stream is one a client opens: odd. A client never sends DATA on a stream a
+	 * server opened (5.1: idle, or reserved for a push the client may not send on), nor
+	 * opens one with HEADERS (5.1.1).
+	 */
+	private void requireOdd(Frame frame) {
+		if (frame.streamId() % 2 == 0) {
+			throw connectionError(ERROR_PROTOCOL,
+					"frame type %d on the even stream %d".formatted(frame.type(), frame.streamId()));
+		}
+	}
+
+	/**
+	 * An odd stream is not idle: at most the highest the client opened. An even one may
+	 * be a stream an upstream promised, whose PUSH_PROMISE the relay passes to the
+	 * client, which may reset it or grant it window: not checked.
+	 */
+	private void requireOpened(Frame frame) {
+		int streamId = frame.streamId();
+		if (streamId % 2 == 1 && streamId > this.highestStreamId) {
+			throw connectionError(ERROR_PROTOCOL,
+					"frame type %d on the idle stream %d".formatted(frame.type(), streamId));
+		}
+	}
+
+	/**
+	 * The Pad Length and the {@code fields} bytes ahead of the content fit the frame, and
+	 * so does the padding.
+	 */
+	private void requirePadding(Frame frame, int fields) {
+		int required = (frame.has(FLAG_PADDED) ? 1 : 0) + fields;
+		if (frame.length() < required) {
+			throw connectionError(ERROR_FRAME_SIZE,
+					"frame type %d of %d bytes".formatted(frame.type(), frame.length()));
+		}
+		if (frame.has(FLAG_PADDED) && (frame.bytes()[frame.payload()] & 0xff) > frame.length() - required) {
+			throw connectionError(ERROR_PROTOCOL, "frame type %d padded past its payload".formatted(frame.type()));
+		}
+	}
+
+	/**
+	 * Tells the client the connection ends with the error and returns the exception for
+	 * the caller to throw, which ends the outbound parse and the relay.
+	 */
+	private IllegalStateException connectionError(int errorCode, String reason) {
+		goAway(errorCode);
+		return new IllegalStateException("client connection error 0x%x: %s".formatted(errorCode, reason));
+	}
+
+	/**
+	 * A client PRIORITY: advisory and deprecated (RFC 9113 5.3.2), so it is dropped, on
+	 * an idle stream as on any other. One of a length other than 5 is a stream error
+	 * {@code FRAME_SIZE_ERROR} (6.3): a tracked stream is reset with it, {@code CANCEL}
+	 * to the upstream; on a stream the relay cannot reset -- idle, where RFC 9113 5.1
+	 * allows no RST_STREAM, or no longer tracked, reset, or closed both ways -- it ends
+	 * the connection instead, which 5.4.1 allows.
+	 */
+	private void onPriority(Frame frame) {
+		if (frame.length() == 5) {
+			return;
+		}
+		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
+		if (stream != null && resetStream(stream, ERROR_FRAME_SIZE)) {
+			this.meters.resetForProtocol();
+			return;
+		}
+		throw connectionError(ERROR_FRAME_SIZE, "PRIORITY of %d bytes".formatted(frame.length()));
 	}
 
 	/**
@@ -690,9 +878,6 @@ final class Http2DemuxRelay {
 	 * already ended are dropped, their window granted back at once.
 	 */
 	private void onData(Frame frame) {
-		if (frame.streamId() == 0) {
-			return; // DATA is stream-scoped; an unexpected connection-level frame
-		}
 		this.deadline.progress(frame.length());
 		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
 		if (stream == null) {
@@ -737,9 +922,7 @@ final class Http2DemuxRelay {
 			return;
 		}
 		if (violation) {
-			goAway(ERROR_FLOW_CONTROL);
-			abort();
-			return;
+			throw connectionError(ERROR_FLOW_CONTROL, "DATA past the window of stream %d".formatted(stream.id));
 		}
 		grantClient(connectionGrant);
 		grantStream(stream, release, WriteSeam.Site.DATA_GRANT);
@@ -990,24 +1173,19 @@ final class Http2DemuxRelay {
 	/**
 	 * A client stream-level WINDOW_UPDATE: relayed to the stream's leg, coalesced into
 	 * the one still queued for the stream if any. A connection-level one credits the
-	 * relay's send window towards the client. RFC 9113 6.9: a length other than 4 ends
-	 * the connection with GOAWAY {@code FRAME_SIZE_ERROR} whatever the stream, an
-	 * increment of 0 with GOAWAY {@code PROTOCOL_ERROR} on stream 0, and resets the
-	 * stream with {@code PROTOCOL_ERROR} otherwise -- unless the stream is no longer
-	 * tracked, or closed both ways (RFC 9113 5.1 has such frames ignored).
+	 * relay's send window towards the client. Its length and its stream were validated
+	 * ({@link #validate}). RFC 9113 6.9: an increment of 0 ends the connection with
+	 * GOAWAY {@code PROTOCOL_ERROR} on stream 0, and resets the stream with
+	 * {@code PROTOCOL_ERROR} otherwise; an increment taking the stream's window -- as the
+	 * upstream bound by it sees it -- past 2^31-1 resets the stream with
+	 * {@code FLOW_CONTROL_ERROR} (6.9.1) and is not relayed. Neither applies to a stream
+	 * no longer tracked, or closed both ways (RFC 9113 5.1 has such frames ignored).
 	 */
 	private void onClientWindowUpdate(Frame frame) {
-		if (frame.length() != 4) {
-			goAway(ERROR_FRAME_SIZE);
-			abort();
-			return;
-		}
 		int increment = int31(frame.bytes(), frame.payload());
 		if (frame.streamId() == 0) {
 			if (increment == 0) {
-				goAway(ERROR_PROTOCOL);
-				abort();
-				return;
+				throw connectionError(ERROR_PROTOCOL, "connection WINDOW_UPDATE of 0");
 			}
 			creditClientWindow(increment);
 			return;
@@ -1022,15 +1200,25 @@ final class Http2DemuxRelay {
 			}
 			return;
 		}
+		boolean overflow = false;
 		this.lock.lock();
 		try {
 			if (!stream.reset) {
-				stream.leg.queueWindowUpdate(stream, increment);
-				stream.responseWindow += increment;
+				overflow = stream.responseWindow + increment > MAX_WINDOW;
+				if (!overflow) {
+					stream.leg.queueWindowUpdate(stream, increment);
+					stream.responseWindow += increment;
+				}
 			}
 		}
 		finally {
 			this.lock.unlock();
+		}
+		if (overflow) {
+			if (resetStream(stream, ERROR_FLOW_CONTROL)) {
+				this.meters.resetForProtocol();
+			}
+			return;
 		}
 		checkQueueBound();
 	}
@@ -1055,25 +1243,45 @@ final class Http2DemuxRelay {
 			this.lock.unlock();
 		}
 		if (overflow) {
-			goAway(ERROR_FLOW_CONTROL);
-			abort();
-			return;
+			throw connectionError(ERROR_FLOW_CONTROL, "connection window past 2^31-1");
 		}
 		if (write) {
 			startResponseWriter();
 		}
 	}
 
+	/**
+	 * A client SETTINGS: acked, and the settings the upstreams need re-announced to the
+	 * legs. Its framing was validated ({@link #validate}); RFC 9113 6.5.2 makes a value
+	 * out of its range a connection error, checked before any setting of the frame takes
+	 * effect or reaches a leg: {@code SETTINGS_ENABLE_PUSH} above 1, or
+	 * {@code SETTINGS_MAX_FRAME_SIZE} outside 2^14 to 2^24-1, a {@code PROTOCOL_ERROR};
+	 * {@code SETTINGS_INITIAL_WINDOW_SIZE} above 2^31-1 a {@code FLOW_CONTROL_ERROR}, as
+	 * is a change of it taking the window of a stream whose response goes on past 2^31-1
+	 * (6.9.2). So are {@code SETTINGS_ENABLE_CONNECT_PROTOCOL} (RFC 8441 3) and
+	 * {@code SETTINGS_NO_RFC7540_PRIORITIES} (RFC 9218 2.1) above 1.
+	 */
 	private void onSettings(Frame frame) {
 		if (frame.has(FLAG_ACK)) {
 			return; // the ack of the settings announced towards the client
 		}
-		Map<Integer, Long> changes = new LinkedHashMap<>();
+		Map<Integer, Long> values = new LinkedHashMap<>();
 		for (int i = 0; i + 6 <= frame.length(); i += 6) {
 			int at = frame.payload() + i;
 			int id = (frame.bytes()[at] & 0xff) << 8 | (frame.bytes()[at + 1] & 0xff);
 			long value = (frame.bytes()[at + 2] & 0xffL) << 24 | (frame.bytes()[at + 3] & 0xff) << 16
 					| (frame.bytes()[at + 4] & 0xff) << 8 | (frame.bytes()[at + 5] & 0xff);
+			requireSettingInRange(id, value);
+			values.put(id, value);
+		}
+		Long announcedWindow = values.get(SETTINGS_INITIAL_WINDOW_SIZE);
+		if (announcedWindow != null) {
+			requireWindowsWithinMaximum(announcedWindow - this.clientInitialWindow);
+		}
+		Map<Integer, Long> changes = new LinkedHashMap<>();
+		for (Map.Entry<Integer, Long> entry : values.entrySet()) {
+			int id = entry.getKey();
+			long value = entry.getValue();
 			if (id == SETTINGS_HEADER_TABLE_SIZE || id == SETTINGS_MAX_FRAME_SIZE || !KNOWN_SETTINGS.contains(id)) {
 				// the upstreams encode for the relay's decoders, which keep the default
 				// table, and frame for its parser, which takes the default frame size;
@@ -1110,21 +1318,50 @@ final class Http2DemuxRelay {
 		writeToClient(frame(FRAME_SETTINGS, FLAG_ACK, 0, null, 0, 0));
 	}
 
+	/** A client setting's value within the range RFC 9113 6.5.2 gives it. */
+	private void requireSettingInRange(int id, long value) {
+		boolean inRange = switch (id) {
+			case SETTINGS_ENABLE_PUSH, SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_NO_RFC7540_PRIORITIES -> value <= 1;
+			case SETTINGS_MAX_FRAME_SIZE -> value >= MAX_FRAME_SIZE && value <= MAX_FRAME_SIZE_LIMIT;
+			case SETTINGS_INITIAL_WINDOW_SIZE -> value <= MAX_WINDOW;
+			default -> true;
+		};
+		if (!inRange) {
+			throw connectionError(id == SETTINGS_INITIAL_WINDOW_SIZE ? ERROR_FLOW_CONTROL : ERROR_PROTOCOL,
+					"setting 0x%x of %d".formatted(id, value));
+		}
+	}
+
+	/**
+	 * No stream whose response goes on gets a window past 2^31-1 when shifted by the
+	 * change of the client's initial window (RFC 9113 6.9.2).
+	 */
+	private void requireWindowsWithinMaximum(long delta) {
+		boolean overflow;
+		this.lock.lock();
+		try {
+			overflow = this.streams.values()
+				.stream()
+				.anyMatch(
+						stream -> !stream.reset && !stream.responseEnded && stream.responseWindow + delta > MAX_WINDOW);
+		}
+		finally {
+			this.lock.unlock();
+		}
+		if (overflow) {
+			throw connectionError(ERROR_FLOW_CONTROL, "initial window change past 2^31-1");
+		}
+	}
+
 	/**
 	 * The head frame of a possibly split HEADERS; streams already routed receive their
 	 * block re-encoded (trailers), new streams are routed by the decoded
 	 * {@code :authority}.
 	 */
 	private void onHeaders(Frame frame, boolean head) {
-		int streamId = frame.streamId();
-		if (streamId == 0) {
-			return;
-		}
-		if (this.assemblingStream != -1 && streamId != this.assemblingStream) {
-			return; // a head is already being assembled; heads never interleave
-		}
-		if (this.assemblingStream == -1) {
-			this.assemblingStream = streamId;
+		if (head) {
+			// validated: no block is being assembled, and a CONTINUATION continues one
+			this.assemblingStream = frame.streamId();
 			this.assemblingEndStream = frame.has(FLAG_END_STREAM);
 			this.assembling.reset();
 		}
@@ -1132,8 +1369,8 @@ final class Http2DemuxRelay {
 		if (this.assembling.size() > MAX_HEADER_LIST_SIZE) {
 			// an encoded block never outgrows its decoded list, so this block is beyond
 			// the decoder's limit; dropping it would desynchronize the decoder
-			goAway(ERROR_ENHANCE_YOUR_CALM);
-			throw new IllegalStateException("client header block over %d bytes".formatted(MAX_HEADER_LIST_SIZE));
+			throw connectionError(ERROR_ENHANCE_YOUR_CALM,
+					"header block over %d bytes".formatted(MAX_HEADER_LIST_SIZE));
 		}
 		if (frame.has(FLAG_END_HEADERS)) {
 			onHeadBlock();
@@ -1143,7 +1380,8 @@ final class Http2DemuxRelay {
 	private static void appendFragmentTo(ByteArrayOutputStream out, Frame frame, boolean headers) {
 		int start = frame.payload();
 		int fragmentLength = frame.length();
-		if (frame.has(FLAG_PADDED) && frame.length() > 0) {
+		// on a CONTINUATION neither flag is defined: ignored (RFC 9113 4.1)
+		if (frame.has(FLAG_PADDED) && headers && frame.length() > 0) {
 			int padLength = frame.bytes()[start] & 0xff;
 			start += 1;
 			fragmentLength -= 1 + padLength;
