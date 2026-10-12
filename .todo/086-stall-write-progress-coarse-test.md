@@ -28,3 +28,5 @@ A relay-level test with a sink accepting bytes at a set rate (no kernel socket b
 between): one 16KiB read per second under a 2s stall timeout is not cut, and fails with the
 pieces removed (one write per 64KiB read). Possibly a small `SO_SNDBUF` on the relay side
 plus a small `SO_RCVBUF` on the client narrows the loopback gaps enough; untested.
+
+Done together with 108 (which replaces `StallTimeoutSlowReaderE2ETest` by this relay-level test).
