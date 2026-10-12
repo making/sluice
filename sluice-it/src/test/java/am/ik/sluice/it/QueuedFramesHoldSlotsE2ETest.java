@@ -79,6 +79,14 @@ class QueuedFramesHoldSlotsE2ETest {
 	/** Fillers queue more than the stream window and its buffers take. */
 	private static final int FILLERS = 3;
 
+	/**
+	 * The payload a relay sends before its peer's FIN while the stream holds its frames:
+	 * fewer bytes than the sender queues DATA frames per connection. Each read is one
+	 * frame of at least one byte, so the relay queues all of it and reaches the FIN
+	 * however its reads split it.
+	 */
+	private static final int SMALL_PAYLOAD = 8;
+
 	private static int grpcPort;
 
 	private static int dataPort;
@@ -155,29 +163,13 @@ class QueuedFramesHoldSlotsE2ETest {
 	}
 
 	/**
-	 * Ended tcp route connections whose DATA and CLOSE wait in the sender keep their
-	 * slots until the frames left.
+	 * Ended tcp route connections whose frames wait in the sender keep their slots until
+	 * the frames left.
 	 */
 	@Test
 	void endedConnectionsHoldTheirSlotsWhileTheirFramesAreQueued() throws Exception {
 		StallingClient client = client();
-		int connections = 6;
-		List<Socket> peers = new ArrayList<>();
-		for (int i = 0; i < connections; i++) {
-			peers.add(open(tcpRoutePort));
-		}
-		// the client answered every CONNECT with its CLOSE before it stalls: the relays
-		// can end while their frames are still queued
-		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> client.closedTcp.size() == connections);
-		client.stall.set(true);
-		for (Socket peer : peers) {
-			peer.getOutputStream().write(new byte[512 * 1024]);
-			peer.shutdownOutput();
-		}
-		Awaitility.await()
-			.atMost(Duration.ofSeconds(10))
-			.alias("every relay ended")
-			.until(() -> session().connectionCount() == 0);
+		endRelaysWithQueuedFrames(6, 512 * 1024);
 		int queued = settledQueues();
 		assertThat(queued).as("precondition: frames of ended connections are queued").isPositive();
 		assertThat(client.blocked.get()).as("precondition: the client stopped reading").isTrue();
@@ -192,21 +184,7 @@ class QueuedFramesHoldSlotsE2ETest {
 	/** The end of the tunnel session drops the queued frames and frees their slots. */
 	@Test
 	void theSessionEndFreesTheSlotsOfQueuedFrames() throws Exception {
-		StallingClient client = client();
-		List<Socket> peers = new ArrayList<>();
-		for (int i = 0; i < FILLERS; i++) {
-			peers.add(open(tcpRoutePort));
-		}
-		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> client.closedTcp.size() == FILLERS);
-		client.stall.set(true);
-		for (Socket peer : peers) {
-			peer.getOutputStream().write(new byte[VirtualConnection.DEFAULT_WINDOW]);
-			peer.shutdownOutput();
-		}
-		Awaitility.await()
-			.atMost(Duration.ofSeconds(10))
-			.alias("every relay ended")
-			.until(() -> session().connectionCount() == 0);
+		endRelaysWithQueuedFrames(FILLERS, VirtualConnection.DEFAULT_WINDOW);
 		int queued = settledQueues();
 		assertThat(queued).as("precondition: frames of ended connections are queued").isPositive();
 		assertThat(admitted()).as("precondition: their slots are held").isEqualTo(queued);
@@ -373,7 +351,7 @@ class QueuedFramesHoldSlotsE2ETest {
 		// the client answered the CONNECT with its CLOSE before it stalls
 		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> client.closedTcp.size() == 1);
 		int fillers = stallWithFillers();
-		tls.getOutputStream().write(new byte[256 * 1024]);
+		tls.getOutputStream().write(new byte[SMALL_PAYLOAD]);
 		tls.shutdownOutput();
 		Awaitility.await()
 			.atMost(Duration.ofSeconds(5))
@@ -410,6 +388,51 @@ class QueuedFramesHoldSlotsE2ETest {
 		byte[] bytes = new byte[hello.remaining()];
 		hello.get(bytes);
 		return bytes;
+	}
+
+	/**
+	 * Opens {@code connections} tcp route connections, which the client answers with its
+	 * CLOSE, stalls the client, writes {@code bytes} on each and ends every relay while
+	 * its frames are queued: once the stream stopped taking frames, the client fails each
+	 * connection with ERROR, which ends its relay wherever its writer waits. No peer
+	 * half-closes: a relay reaches its peer's FIN only after queueing every byte before
+	 * it, and the sender caps a connection's queue in DATA frames, one per read, so how
+	 * the reads split the bytes would decide whether the relay ends.
+	 */
+	private void endRelaysWithQueuedFrames(int connections, int bytes) throws IOException {
+		StallingClient client = client();
+		List<Socket> peers = new ArrayList<>();
+		for (int i = 0; i < connections; i++) {
+			peers.add(open(tcpRoutePort));
+		}
+		// the client answered every CONNECT with its CLOSE before it stalls
+		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> client.closedTcp.size() == connections);
+		client.stall.set(true);
+		for (Socket peer : peers) {
+			// on its own thread: what the relay does not read fills the socket buffers
+			// and may block the write until the relay ends
+			Thread.ofVirtual().start(() -> {
+				try {
+					peer.getOutputStream().write(new byte[bytes]);
+				}
+				catch (IOException e) {
+					// the relay ended and closed its socket
+				}
+			});
+		}
+		Awaitility.await()
+			.atMost(Duration.ofSeconds(10))
+			.alias("the stream stopped taking frames")
+			.until(() -> client.blocked.get() && sender().stalled().compareTo(Duration.ofMillis(300)) >= 0);
+		for (long id : client.closedTcp) {
+			client.sendFromTest(Frame.newBuilder()
+				.setError(am.ik.sluice.v1.proto.Error.newBuilder().setConnId(id).setMessage("upstream failed"))
+				.build());
+		}
+		Awaitility.await()
+			.atMost(Duration.ofSeconds(10))
+			.alias("every relay ended")
+			.until(() -> session().connectionCount() == 0);
 	}
 
 	/**
