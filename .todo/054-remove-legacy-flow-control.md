@@ -55,3 +55,5 @@ peer.
   and 047 (`curl https://console.sluice.ik.am/actuator/info | jq .git.commit`; on
   2026-10-12 it was 18a4ff4, after both). Clients and wasmlets of older versions are
   then rejected with that message and need an upgrade.
+- Depends on 084 (peer build reporting): deploy it first, then confirm the console shows
+  no legacy-window and no unknown-build sessions instead of assuming no old peer remains.
