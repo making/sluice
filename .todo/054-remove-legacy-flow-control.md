@@ -4,7 +4,8 @@ Difficulty: Medium
 
 Follow-up of `.todo/041-tunnel-head-of-line-blocking.md` (section "Follow-up"), filed when
 046 landed. Do it only once no pre-046 client or server and no pre-047 wasmlet is
-deployed: until then a legacy peer needs the old path. Depends on 047.
+deployed (checked through the console and gauges of 084, see "Decision"): until then a
+legacy peer needs the old path. Depends on 047.
 
 ## Problem
 
@@ -37,7 +38,12 @@ peer.
   the rejection; the legacy unit tests in `VirtualConnectionTest` go; tests that build
   `new VirtualConnection(id, writer)` switch to the builder. wasmlet: the `a_legacy_*`
   tests in `tunnel.rs` and `wasm_host.rs` and the `window = 0` cases go.
-- README: drop the sentence on legacy peers.
+- Console / metrics (084): a legacy peer no longer gets a session, so drop the
+  `Legacy flow control` tag (`clients.mustache`, `ConsoleView.Client#legacy`),
+  `TunnelSession#legacy` and the `sluice.tunnel.sessions.legacy` gauge, with their
+  assertions in `ConsolePeerBuildE2ETest`; keep the build display and the
+  `sluice.tunnel.sessions.build.unknown` gauge.
+- README: drop the sentence on legacy peers and the legacy tag / gauge of "Console".
 
 ## Tests (watch each fail first)
 
@@ -55,5 +61,9 @@ peer.
   and 047 (`curl https://console.sluice.ik.am/actuator/info | jq .git.commit`; on
   2026-10-12 it was 18a4ff4, after both). Clients and wasmlets of older versions are
   then rejected with that message and need an upgrade.
-- Depends on 084 (peer build reporting): deploy it first, then confirm the console shows
-  no legacy-window and no unknown-build sessions instead of assuming no old peer remains.
+- Precondition (084, peer build reporting, landed): deploy a server that includes it, let
+  the peers reconnect, then on every node confirm `sluice_tunnel_sessions_legacy` and
+  `sluice_tunnel_sessions_build_unknown` are 0 (`/actuator/prometheus`) and no client row
+  on `/console` shows `Legacy flow control` or `Unknown (older build)`; the row's build
+  names each peer's version and commit. Only then remove the legacy mode -- do not assume
+  no old peer remains.

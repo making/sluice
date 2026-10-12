@@ -24,6 +24,11 @@ The PoC was verified by hand only; nothing runs it in `./mvnw verify`.
   stalls) while a GET on another connection answers at once (before 047: only after
   the stalled request's budget). Also h2c over the windowed path (a 10MiB `/stream`
   arrives complete): 047 checked both by hand only, its Rust tests use http/1.1
+- build reporting (084): the wasmlet's row on `/console` shows the build its
+  `--version` prints (`ConsolePeerBuildE2ETest` covers the server side with a
+  wasmlet-shaped raw peer only), and the wasmlet logs the server's build from the
+  ack (`[<key>] server build: sluice-server ...`); both are untested against the
+  real binary today
 
 Acceptance: `./mvnw verify` covers the wasm path; CI without rust still passes
 (skipped, not failed).
