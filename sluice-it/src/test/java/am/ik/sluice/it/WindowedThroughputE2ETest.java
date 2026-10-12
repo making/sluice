@@ -36,6 +36,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * A large transfer over one windowed connection completes in either direction: the credit
  * keeps being granted back (a credit that got stuck would stall it).
+ * <p>
+ * The grant count is bounded, not exact: a reader grants what it consumed once that
+ * reaches half the window, so a grant overshoots half the window by up to one read, and
+ * the read sizes follow how the bytes arrived, which differs between platforms. A grant
+ * is never smaller than half the window and never larger than the window, and completing
+ * the transfer needs all but one window of it granted back.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -43,8 +49,12 @@ class WindowedThroughputE2ETest {
 
 	private static final long TRANSFER_BYTES = 256L * 1024 * 1024;
 
-	/** One grant per half window consumed. */
-	private static final long EXPECTED_GRANTS = TRANSFER_BYTES / (VirtualConnection.DEFAULT_WINDOW / 2);
+	/** Every grant covers at most the window. */
+	private static final long MIN_GRANTS = (TRANSFER_BYTES - VirtualConnection.DEFAULT_WINDOW)
+			/ VirtualConnection.DEFAULT_WINDOW;
+
+	/** Every grant covers at least half the window. */
+	private static final long MAX_GRANTS = TRANSFER_BYTES / (VirtualConnection.DEFAULT_WINDOW / 2);
 
 	private static int grpcPort;
 
@@ -102,10 +112,10 @@ class WindowedThroughputE2ETest {
 		}
 		report("upload", start);
 		assertThat(windowUpdates(this.clientMeters, "sent")).as("grants sent by the client")
-			.isGreaterThanOrEqualTo(EXPECTED_GRANTS - 1);
+			.isBetween(MIN_GRANTS, MAX_GRANTS);
 		assertThat(windowUpdates(this.serverMeters, "received") - serverReceivedBefore)
 			.as("grants received by the server")
-			.isGreaterThanOrEqualTo(EXPECTED_GRANTS - 1);
+			.isBetween(MIN_GRANTS, MAX_GRANTS);
 	}
 
 	/** Upstream -> client -> server -> public peer; the server grants. */
@@ -132,9 +142,9 @@ class WindowedThroughputE2ETest {
 		report("download", start);
 		assertThat(received).isEqualTo(TRANSFER_BYTES);
 		assertThat(windowUpdates(this.clientMeters, "received")).as("grants received by the client")
-			.isGreaterThanOrEqualTo(EXPECTED_GRANTS - 1);
+			.isBetween(MIN_GRANTS, MAX_GRANTS);
 		assertThat(windowUpdates(this.serverMeters, "sent") - serverSentBefore).as("grants sent by the server")
-			.isGreaterThanOrEqualTo(EXPECTED_GRANTS - 1);
+			.isBetween(MIN_GRANTS, MAX_GRANTS);
 	}
 
 	private static void report(String direction, long startNanos) {
