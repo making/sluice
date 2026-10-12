@@ -90,7 +90,7 @@ in the same investigation is todo 042.
 | 057-h2-demux-global-queue-budget | h2 memory outside the 048 bound; done | High | 048 |
 | 058-receive-buffer-per-frame-overhead | per-frame overhead outside the 048 bound; done | Medium | 048 |
 | 061-slot-released-before-queued-frames-left | Java send queues of ended connections outside the 048 bound (056 review); done | Medium | 048 |
-| 054-remove-legacy-flow-control | legacy removal (see "Follow-up"; not a child, the parent does not wait for it) | Medium | 047; no pre-046/047 peer deployed |
+| 054-remove-legacy-flow-control | legacy removal (see "Follow-up"; not a child, the parent does not wait for it); done | Medium | 047; no pre-046/047 peer deployed |
 
 Each child is one commit series with its own tests and docs. This parent is done when all
 children are, and the legacy-removal todo below is filed.
@@ -138,6 +138,7 @@ message Connect {
     credit starts at that value; its receive window is the one it advertised.
 - **Legacy**: an old peer sends 0, or omits the field; protobuf ignores unknown fields
   and oneof cases. The legacy mode keeps today's behavior, including the residual HOL.
+  Removed by 054: a peer announcing no window is now rejected.
 - **Window**: 1MiB on both sides, a shared constant. Because the value travels in the
   protocol, a later tuning needs no protocol change. Rationale: grpc-java's default HTTP/2
   stream window is 1MiB, so one connection can still fill the stream as today.
@@ -167,7 +168,7 @@ message Connect {
 What 043-048 still leave open, by design or elsewhere. Do not report the parent as
 "HOL solved" without these caveats.
 - Legacy peers keep the stream-wide stall on their connections until legacy removal
-  (follow-up below). This includes the wasmlet behind a pre-046 server (047 confirmed
+  (follow-up below; done by 054, such peers are now rejected). This includes the wasmlet behind a pre-046 server (047 confirmed
   the stall in a test: the receive loop waits on a connection whose guest stopped
   reading).
 - wasmlet: a CPU-bound guest stalls every connection by holding a tokio worker (042, not
@@ -194,4 +195,6 @@ What 043-048 still leave open, by design or elsewhere. Do not report the parent 
 
 Filed as `.todo/054-remove-legacy-flow-control.md`: remove legacy mode (the blocking
 `acceptData`, `connection_window == 0` paths in Java and wasmlet) once no pre-046 client
-or server is deployed.
+or server is deployed. Done (2026-10-13): the server fails the stream of a client
+announcing no window with `FAILED_PRECONDITION`; the client and the wasmlet answer a
+windowless CONNECT with ERROR.
