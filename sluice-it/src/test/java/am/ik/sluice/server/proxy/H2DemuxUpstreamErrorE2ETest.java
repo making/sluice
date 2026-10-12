@@ -362,15 +362,16 @@ class H2DemuxUpstreamErrorE2ETest {
 	void upstreamFrameOnAWaitingStreamEndsItsLegAndRefusesTheStream() throws Exception {
 		String route = "ue.idle-stream.test";
 		ScriptedH2Upstream upstream = upstream(TestH2Settings.of(MAX_CONCURRENT_STREAMS, 1), (connection, frame) -> {
-			if (frame.type() == TestH2.HEADERS && frame.streamId() == 1) {
-				connection.head(3, false);
-			}
 		});
 		startClient(route, upstream);
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.headers(1, true, get(route));
 			client.headers(3, true, get(route));
+			awaitHandled(client, 3);
 			ScriptedH2Upstream.Connection connection = upstream.awaitConnection(0, WITHIN);
+			assertThat(connection.await(frame -> frame.type() == TestH2.HEADERS && frame.streamId() == 1, WITHIN))
+				.isNotNull();
+			connection.head(3, false);
 			TestH2.Frame goAway = connection.await(frame -> frame.type() == TestH2.GOAWAY, WITHIN);
 			assertThat(goAway).as("the upstream got a GOAWAY").isNotNull();
 			assertThat(TestH2.errorCode(goAway)).isEqualTo(PROTOCOL_ERROR);
@@ -395,14 +396,9 @@ class H2DemuxUpstreamErrorE2ETest {
 		String route = "ue.close-before-head.test";
 		AtomicReference<@Nullable ScriptedH2Upstream> self = new AtomicReference<>();
 		ScriptedH2Upstream upstream = upstream(TestH2Settings.of(MAX_CONCURRENT_STREAMS, 1), (connection, frame) -> {
-			if (frame.type() != TestH2.HEADERS) {
-				return;
-			}
-			if (Objects.requireNonNull(self.get()).connections().indexOf(connection) > 0) {
+			if (frame.type() == TestH2.HEADERS
+					&& Objects.requireNonNull(self.get()).connections().indexOf(connection) > 0) {
 				connection.answer(frame.streamId(), "new-leg");
-			}
-			else {
-				connection.close();
 			}
 		});
 		self.set(upstream);
@@ -410,6 +406,11 @@ class H2DemuxUpstreamErrorE2ETest {
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5)) {
 			client.headers(1, true, get(route));
 			client.headers(3, true, get(route));
+			awaitHandled(client, 3);
+			ScriptedH2Upstream.Connection connection = upstream.awaitConnection(0, WITHIN);
+			assertThat(connection.await(frame -> frame.type() == TestH2.HEADERS && frame.streamId() == 1, WITHIN))
+				.isNotNull();
+			connection.close();
 			assertThat(client.awaitTrue(() -> client.ended(1) && client.reset(3) != null, WITHIN)).isTrue();
 			assertThat(TestH2.status(client.frames(1))).isEqualTo("502");
 			assertThat(client.reset(3)).isEqualTo(REFUSED_STREAM);
@@ -476,14 +477,7 @@ class H2DemuxUpstreamErrorE2ETest {
 			client.headers(1, true, get(route));
 			client.headers(3, true, get(route));
 			client.headers(5, true, get(route));
-			// the relay handles the client's frames in order: once it acked the PING,
-			// stream 5 waits for the concurrency limit
-			byte[] ping = Arrays.copyOf(TestH2.int32(5), 8);
-			client.frame(TestH2.PING, 0, 0, ping);
-			assertThat(client.awaitTrue(() -> client.pingAcks().stream().anyMatch(ack -> Arrays.equals(ack, ping)),
-					WITHIN))
-				.as("the relay acked the PING")
-				.isTrue();
+			awaitHandled(client, 5);
 			ScriptedH2Upstream.Connection connection = upstream.awaitConnection(0, WITHIN);
 			assertThat(connection.await(frame -> frame.type() == TestH2.HEADERS && frame.streamId() == 3, WITHIN))
 				.isNotNull();
@@ -699,6 +693,19 @@ class H2DemuxUpstreamErrorE2ETest {
 					(byte) (value >>> 8), (byte) value };
 		}
 
+	}
+
+	/**
+	 * Waits until the relay handled every frame the client sent so far, {@code stream}'s
+	 * HEADERS last: the relay handles a client's frames in order and acks its PING when
+	 * it gets to it. A stream beyond the upstream's concurrency limit waits from then on.
+	 */
+	private static void awaitHandled(H2TestClient client, int stream) throws Exception {
+		byte[] ping = Arrays.copyOf(TestH2.int32(stream), 8);
+		client.frame(TestH2.PING, 0, 0, ping);
+		assertThat(client.awaitTrue(() -> client.pingAcks().stream().anyMatch(ack -> Arrays.equals(ack, ping)), WITHIN))
+			.as("the relay acked the PING after stream %d", stream)
+			.isTrue();
 	}
 
 }
