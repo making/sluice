@@ -157,7 +157,7 @@ class H2DemuxStallE2ETest {
 			});
 			// the path saturates: the relayed bytes plateau above the per-connection
 			// bounds and the socket buffers, and stay there
-			awaitOutboundPlateau("h2d.stall.test");
+			awaitOutboundPlateau("h2d.stall.test", client);
 			long queued = queuedBytes("h2d.stall.test");
 			client.headers(3, true, TestH2.headerBlock(":authority=h2d.echo.test", ":method=GET", ":path=/fast"));
 			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).as("the second leg answers within 5s").isTrue();
@@ -201,7 +201,7 @@ class H2DemuxStallE2ETest {
 					// torn down
 				}
 			});
-			awaitOutboundPlateau(route);
+			awaitOutboundPlateau(route, client);
 			// the leg's writer is parked: the leg queue holds what it could not write
 			assertThat(queuedBytes(route)).as("the stall reached the leg queue").isGreaterThan(0);
 			assertThat(ThreadDumps.anyThreadWaitingForCredit()).as("the leg writer waits for credit").isTrue();
@@ -266,19 +266,24 @@ class H2DemuxStallE2ETest {
 
 	/**
 	 * Waits until the route's relayed bytes plateau: above the per-connection bounds and
-	 * unchanged for two seconds -- the whole relay path saturated.
+	 * unchanged for two seconds -- the whole relay path saturated. Fails at once when the
+	 * relay reset stream 1: no stall can build up on a refused or lost stream.
 	 */
-	private void awaitOutboundPlateau(String route) {
+	private void awaitOutboundPlateau(String route, H2TestClient client) {
 		AtomicReference<Double> last = new AtomicReference<>(Double.valueOf(-1));
 		AtomicLong stableSince = new AtomicLong(System.nanoTime());
-		Awaitility.await().atMost(Duration.ofSeconds(30)).until(() -> {
-			double count = relayedBytes(route);
-			if (Double.compare(count, last.get().doubleValue()) != 0) {
-				last.set(Double.valueOf(count));
-				stableSince.set(System.nanoTime());
-			}
-			return count > 256L * 1024 && TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - stableSince.get()) > 2000;
-		});
+		Awaitility.await()
+			.atMost(Duration.ofSeconds(30))
+			.failFast("stream 1 reset", () -> client.reset(1) != null)
+			.until(() -> {
+				double count = relayedBytes(route);
+				if (Double.compare(count, last.get().doubleValue()) != 0) {
+					last.set(Double.valueOf(count));
+					stableSince.set(System.nanoTime());
+				}
+				return count > 256L * 1024
+						&& TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - stableSince.get()) > 2000;
+			});
 	}
 
 	/**
@@ -356,15 +361,27 @@ class H2DemuxStallE2ETest {
 	}
 
 	/**
-	 * Grants the connection and stream 1 a huge window, then never reads, holding the
-	 * socket for the teardown.
+	 * Grants the connection a huge window, and stream 1 once its HEADERS arrived, then
+	 * never reads again, holding the socket for the teardown. Granting stream 1 before
+	 * its HEADERS would be a WINDOW_UPDATE on an idle stream, a connection error (RFC
+	 * 9113 5.1) that ends the leg -- and refuses the request when it arrives first.
 	 */
 	private static void grantThenHold(Socket socket) {
 		try {
+			InputStream in = socket.getInputStream();
 			OutputStream out = socket.getOutputStream();
+			if (in.readNBytes(TestH2.PREFACE.length).length < TestH2.PREFACE.length) {
+				return;
+			}
 			TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
 			TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(Integer.MAX_VALUE - 65535));
-			TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(Integer.MAX_VALUE - 65535));
+			TestH2.@Nullable Frame frame;
+			while ((frame = TestH2.readFrame(in)) != null) {
+				if (frame.type() == TestH2.HEADERS && frame.streamId() == 1) {
+					TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(Integer.MAX_VALUE - 65535));
+					break;
+				}
+			}
 		}
 		catch (IOException e) {
 			return;
