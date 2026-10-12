@@ -17,7 +17,9 @@ import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.tunnel.ConnectionLimit;
+import am.ik.sluice.tunnel.PeerBuilds;
 import am.ik.sluice.v1.proto.ListNodesResponse;
+import am.ik.sluice.v1.proto.PeerBuild;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -59,14 +61,19 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 	/** Upstream connections open at once, shared by every node stream. */
 	private final ConnectionLimit connectionLimit;
 
+	/** This client's build, announced on every stream. */
+	private final PeerBuild clientBuild;
+
 	private volatile boolean running;
 
 	TunnelClient(SluiceClientProperties properties, @Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor,
-			MeterRegistry meterRegistry, @Nullable SslBundles sslBundles) {
+			MeterRegistry meterRegistry, @Nullable SslBundles sslBundles, PeerBuild clientBuild) {
 		this.properties = properties;
 		this.taskExecutor = taskExecutor;
 		this.meterRegistry = meterRegistry;
 		this.sslBundles = sslBundles;
+		this.clientBuild = clientBuild;
+		log.info("client build: {}", PeerBuilds.describe(clientBuild));
 		String configured = clientid(properties);
 		this.clientId = configured == null || configured.isBlank() ? UUID.randomUUID().toString() : configured;
 		meterRegistry.gauge("sluice.connections.active", this.connectionsByNode,
@@ -103,6 +110,10 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 
 		private @Nullable SslBundles sslBundles;
 
+		private PeerBuild clientBuild = PeerBuild.newBuilder()
+			.setImplementation(ClientBuildConfiguration.IMPLEMENTATION)
+			.build();
+
 		private Builder() {
 		}
 
@@ -126,10 +137,19 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 			return this;
 		}
 
+		/**
+		 * The build announced to the servers; defaults to the implementation name alone.
+		 */
+		public Builder clientBuild(PeerBuild clientBuild) {
+			this.clientBuild = clientBuild;
+			return this;
+		}
+
 		public TunnelClient build() {
 			return new TunnelClient(Objects.requireNonNull(this.properties, "properties is required"),
 					Objects.requireNonNull(this.taskExecutor, "taskExecutor is required"),
-					Objects.requireNonNull(this.meterRegistry, "meterRegistry is required"), this.sslBundles);
+					Objects.requireNonNull(this.meterRegistry, "meterRegistry is required"), this.sslBundles,
+					this.clientBuild);
 		}
 
 	}
@@ -179,6 +199,7 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 			.listener(this)
 			.meterRegistry(this.meterRegistry)
 			.connectionLimit(this.connectionLimit)
+			.clientBuild(this.clientBuild)
 			.build();
 		this.connectionsByNode.put(nodeId.isBlank() ? url : nodeId, connection);
 		connection.start();

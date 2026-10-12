@@ -302,6 +302,20 @@ class ConsoleE2ETest {
 					""".formatted(tcpRoutePort, tcpPort));
 	}
 
+	/**
+	 * A client built without build metadata (as these, outside a Spring Boot application)
+	 * still names its implementation; the rest reads as unknown.
+	 */
+	@Test
+	void clientWithoutBuildMetadataShowsItsImplementation() {
+		Page page = page();
+		page.navigate("http://127.0.0.1:" + this.port + "/console");
+		Locator build = page.locator("[data-client='" + CLIENT_ID + "']").getByTestId("build");
+		assertThat(build.innerText())
+			.isEqualToNormalizingWhitespace("Build sluice-client version unknown commit unknown");
+		assertThat(build.locator(".mono").getAttribute("title")).isEqualTo("Build time unknown");
+	}
+
 	@Test
 	void drawingTellsWhichRoutesEachClientServes() {
 		Page page = page();

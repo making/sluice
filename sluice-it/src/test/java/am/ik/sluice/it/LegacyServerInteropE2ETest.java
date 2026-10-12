@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import com.google.protobuf.ByteString;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 
 import org.jspecify.annotations.Nullable;
 
@@ -37,13 +38,18 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import org.awaitility.Awaitility;
 
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * This client keeps working against a server without per-connection flow control (its
  * CONNECT carries no window, as every server before the window existed): the client still
- * advertises its window, but runs the connection in legacy mode.
+ * advertises its window, but runs the connection in legacy mode. A server that predates
+ * build reporting is logged as an older build.
  */
+@ExtendWith(OutputCaptureExtension.class)
 class LegacyServerInteropE2ETest {
 
 	/** Several windows, so a wrongly windowed connection would stall. */
@@ -75,7 +81,7 @@ class LegacyServerInteropE2ETest {
 	}
 
 	@Test
-	void clientRelaysForALegacyServer() throws Exception {
+	void clientRelaysForALegacyServer(CapturedOutput output) throws Exception {
 		int echoPort = startEchoUpstream();
 		this.legacy.dialAddress = "127.0.0.1:" + echoPort;
 		int grpcPort = TestPorts.freePort();
@@ -94,6 +100,9 @@ class LegacyServerInteropE2ETest {
 		Awaitility.await().atMost(Duration.ofSeconds(10)).until(started::isConnected);
 		assertThat(this.legacy.advertisedWindows).as("precondition: the client offers its window")
 			.containsExactly(VirtualConnection.DEFAULT_WINDOW);
+		assertThat(output.getAll().lines().filter(line -> line.contains("] server build: "))).singleElement()
+			.satisfies(line -> assertThat(line)
+				.endsWith("[grpc://127.0.0.1:" + grpcPort + "] server build: unknown (older build)"));
 
 		byte[] payload = new byte[PAYLOAD_BYTES];
 		for (int i = 0; i < payload.length; i++) {

@@ -6,14 +6,17 @@ import am.ik.sluice.server.auth.TokenValidator;
 import am.ik.sluice.server.cluster.NodeDirectory;
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.route.Router;
+import am.ik.sluice.tunnel.PeerBuilds;
 import am.ik.sluice.tunnel.SessionSender;
 import am.ik.sluice.v1.proto.Frame;
+import am.ik.sluice.v1.proto.PeerBuild;
 import am.ik.sluice.v1.proto.TunnelGrpc;
 import io.grpc.ServerInterceptors;
 import io.grpc.ServerServiceDefinition;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -48,9 +51,12 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	private final Counter windowUpdatesReceived;
 
+	private final PeerBuild serverBuild;
+
 	public TunnelService(Router router, TokenValidator tokenValidator, SessionRegistry sessions,
 			TcpRouteListener tcpRoutes, NodeDirectory nodeDirectory, MembershipBroadcaster membershipBroadcaster,
-			ClusterLifecycle clusterLifecycle, SluiceServerProperties properties, MeterRegistry meterRegistry) {
+			ClusterLifecycle clusterLifecycle, SluiceServerProperties properties, MeterRegistry meterRegistry,
+			PeerBuild serverBuild) {
 		this.router = router;
 		this.tokenValidator = tokenValidator;
 		this.sessions = sessions;
@@ -61,6 +67,21 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 		this.properties = properties;
 		this.windowUpdatesSent = windowUpdates(meterRegistry, "sent");
 		this.windowUpdatesReceived = windowUpdates(meterRegistry, "received");
+		this.serverBuild = serverBuild;
+		log.info("server build: {}", PeerBuilds.describe(serverBuild));
+		Gauge
+			.builder("sluice.tunnel.sessions.legacy", sessions,
+					registry -> registry.all().stream().filter(TunnelSession::legacy).count())
+			.description("Connected clients that advertised no per-connection receive window (legacy flow control)")
+			.register(meterRegistry);
+		Gauge
+			.builder("sluice.tunnel.sessions.build.unknown", sessions,
+					registry -> registry.all()
+						.stream()
+						.filter(session -> session.advertised() && session.clientBuild().isEmpty())
+						.count())
+			.description("Connected clients that advertised no build (they predate build reporting)")
+			.register(meterRegistry);
 	}
 
 	private static Counter windowUpdates(MeterRegistry meterRegistry, String direction) {
@@ -107,6 +128,7 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			.registry(this.sessions)
 			.tcpRoutes(this.tcpRoutes)
 			.windowUpdateReceived(this.windowUpdatesReceived::increment)
+			.serverBuild(this.serverBuild)
 			.build();
 		session.start();
 		this.membershipBroadcaster.onSessionCreated(session);

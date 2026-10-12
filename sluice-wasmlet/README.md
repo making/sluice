@@ -41,6 +41,12 @@ target/debug/sluice-wasmlet --server grpc://127.0.0.1:8001 --token SECRET \
 `cargo test -p sluice-wasmlet` builds the examples the same way (through the
 rustup `cargo` proxy, so rustup must be installed).
 
+`--version` prints the build: version, git commit (with `dirty` when tracked files had
+uncommitted changes) and build time, embedded by `build.rs` when the build script last
+ran. Without git the build still succeeds and
+reports `commit unknown`. The wasmlet logs the same line at startup and sends it in its
+`Advertise`, so the server console shows it on the wasmlet's row.
+
 `--server` also accepts `grpcs://` (TLS). Verification uses `--ca-cert <file>` (PEM, may
 hold a chain), the webPKI roots when omitted, or nothing at all with `--insecure`
 (self-signed setups; the `sluice.insecure` equivalent):

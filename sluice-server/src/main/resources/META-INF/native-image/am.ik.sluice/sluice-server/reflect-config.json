@@ -102,6 +102,12 @@
 		"allDeclaredFields": true
 	},
 	{
+		"name": "am.ik.sluice.server.console.web.ConsoleView$PeerBuildView",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
 		"name": "am.ik.sluice.server.console.web.ConsoleView$PortRow",
 		"allDeclaredConstructors": true,
 		"allDeclaredMethods": true,

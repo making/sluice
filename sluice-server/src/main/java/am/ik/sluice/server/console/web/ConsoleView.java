@@ -25,6 +25,7 @@ import org.springframework.boot.availability.ReadinessState;
 import org.springframework.boot.info.BuildProperties;
 import org.springframework.boot.info.GitProperties;
 import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
 
 import am.ik.sluice.server.cluster.NodeDirectory;
 import am.ik.sluice.server.config.SluiceServerProperties;
@@ -36,6 +37,8 @@ import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.ClusterLifecycle;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import am.ik.sluice.server.tunnel.TunnelSession;
+import am.ik.sluice.tunnel.PeerBuilds;
+import am.ik.sluice.v1.proto.PeerBuild;
 import am.ik.sluice.v1.proto.Upstream;
 
 /**
@@ -173,6 +176,8 @@ class ConsoleView {
 				.inbound(Humanize.bytes(session.bytesInbound()))
 				.outbound(Humanize.bytes(session.bytesOutbound()))
 				.draining(session.drained())
+				.peerBuild(session.advertised() ? peerBuild(session.clientBuild().orElse(null)) : null)
+				.legacy(session.legacy())
 				.upstreams(session.upstreams()
 					.stream()
 					.map(upstream -> upstreamRow(upstream, session.rejectedPorts().contains(upstream.getListenPort()))
@@ -181,6 +186,25 @@ class ConsoleView {
 					.toList())
 				.build())
 			.toList();
+	}
+
+	/**
+	 * The build a client announced, as display text; {@code null} = it announced none.
+	 */
+	private static PeerBuildView peerBuild(@Nullable PeerBuild build) {
+		if (build == null) {
+			return PeerBuildView.builder().known(false).build();
+		}
+		String time = build.getBuildTime().isEmpty() ? "build time unknown" : "built " + build.getBuildTime();
+		return PeerBuildView.builder()
+			.known(true)
+			.implementation(build.getImplementation().isEmpty() ? "Unknown implementation" : build.getImplementation())
+			.version(build.getVersion().isEmpty() ? "version unknown" : build.getVersion())
+			.commit(build.getCommit().isEmpty() ? "commit unknown" : PeerBuilds.shortCommit(build.getCommit()))
+			.dirty(build.getDirty())
+			.detail(build.getCommit().isEmpty() ? StringUtils.capitalize(time)
+					: "Commit " + build.getCommit() + ", " + time)
+			.build();
 	}
 
 	private static UpstreamRow.Builder upstreamRow(Upstream upstream, boolean rejected) {
@@ -479,7 +503,7 @@ class ConsoleView {
 	 */
 	public record Client(String clientId, String remoteAddress, String connectedFor, String connectedAt,
 			int openConnections, long connectionsOpened, String inbound, String outbound, boolean draining,
-			List<UpstreamRow> upstreams) {
+			@Nullable PeerBuildView peerBuild, boolean legacy, List<UpstreamRow> upstreams) {
 
 		public static Builder builder() {
 			return new Builder();
@@ -504,6 +528,10 @@ class ConsoleView {
 			private String outbound = "0 B";
 
 			private boolean draining;
+
+			private @Nullable PeerBuildView peerBuild;
+
+			private boolean legacy;
 
 			private List<UpstreamRow> upstreams = List.of();
 
@@ -555,6 +583,17 @@ class ConsoleView {
 				return this;
 			}
 
+			/** The client's build; {@code null} until it advertised. */
+			public Builder peerBuild(@Nullable PeerBuildView peerBuild) {
+				this.peerBuild = peerBuild;
+				return this;
+			}
+
+			public Builder legacy(boolean legacy) {
+				this.legacy = legacy;
+				return this;
+			}
+
 			public Builder upstreams(List<UpstreamRow> upstreams) {
 				this.upstreams = upstreams;
 				return this;
@@ -564,8 +603,81 @@ class ConsoleView {
 				return new Client(Objects.requireNonNull(this.clientId, "clientId is required"), this.remoteAddress,
 						Objects.requireNonNull(this.connectedFor, "connectedFor is required"),
 						Objects.requireNonNull(this.connectedAt, "connectedAt is required"), this.openConnections,
-						this.connectionsOpened, this.inbound, this.outbound, this.draining,
+						this.connectionsOpened, this.inbound, this.outbound, this.draining, this.peerBuild, this.legacy,
 						List.copyOf(this.upstreams));
+			}
+
+		}
+
+	}
+
+	/**
+	 * The build a client announced in its {@code Advertise}, as display text. The strings
+	 * come from the peer, bounded by {@link PeerBuilds#sanitize}; the template escapes
+	 * them.
+	 *
+	 * @param known whether the client announced a build at all; one that predates build
+	 * reporting announces none
+	 * @param commit the commit id, shortened when hexadecimal
+	 * @param detail the full commit id and the build time
+	 */
+	public record PeerBuildView(boolean known, String implementation, String version, String commit, boolean dirty,
+			String detail) {
+
+		public static Builder builder() {
+			return new Builder();
+		}
+
+		public static final class Builder {
+
+			private boolean known;
+
+			private String implementation = "";
+
+			private String version = "";
+
+			private String commit = "";
+
+			private boolean dirty;
+
+			private String detail = "";
+
+			private Builder() {
+			}
+
+			public Builder known(boolean known) {
+				this.known = known;
+				return this;
+			}
+
+			public Builder implementation(String implementation) {
+				this.implementation = implementation;
+				return this;
+			}
+
+			public Builder version(String version) {
+				this.version = version;
+				return this;
+			}
+
+			public Builder commit(String commit) {
+				this.commit = commit;
+				return this;
+			}
+
+			public Builder dirty(boolean dirty) {
+				this.dirty = dirty;
+				return this;
+			}
+
+			public Builder detail(String detail) {
+				this.detail = detail;
+				return this;
+			}
+
+			public PeerBuildView build() {
+				return new PeerBuildView(this.known, this.implementation, this.version, this.commit, this.dirty,
+						this.detail);
 			}
 
 		}

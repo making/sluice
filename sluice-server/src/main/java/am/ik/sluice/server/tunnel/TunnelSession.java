@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -22,13 +23,16 @@ import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.FrameWriter;
+import am.ik.sluice.tunnel.PeerBuilds;
 import am.ik.sluice.tunnel.SessionSender;
 import am.ik.sluice.tunnel.StreamRelay;
 import am.ik.sluice.tunnel.VirtualConnection;
 import am.ik.sluice.v1.proto.Advertise;
+import am.ik.sluice.v1.proto.AdvertiseAck;
 import am.ik.sluice.v1.proto.Connect;
 import am.ik.sluice.v1.proto.Frame;
 import am.ik.sluice.v1.proto.Node;
+import am.ik.sluice.v1.proto.PeerBuild;
 import am.ik.sluice.v1.proto.Upstream;
 import io.grpc.Status;
 
@@ -91,6 +95,18 @@ public final class TunnelSession implements AutoCloseable {
 	private volatile long clientWindow;
 
 	/**
+	 * The build the client announced in its latest {@code Advertise}, sanitized; null
+	 * when it announced none (it predates the field) or has not advertised yet.
+	 */
+	private volatile @Nullable PeerBuild clientBuild;
+
+	/** Whether an {@code Advertise} arrived; written after the fields it carries. */
+	private volatile boolean advertised;
+
+	/** This server's build, sent in every {@code AdvertiseAck}. */
+	private final PeerBuild serverBuild;
+
+	/**
 	 * Applies ADVERTISE off the receive path, in order; the route removal of
 	 * {@link #close()} runs here too, after the queued advertises.
 	 */
@@ -110,6 +126,7 @@ public final class TunnelSession implements AutoCloseable {
 		this.registry = Objects.requireNonNull(builder.registry, "registry is required");
 		this.closeTimeout = builder.closeTimeout;
 		this.windowUpdateReceived = builder.windowUpdateReceived;
+		this.serverBuild = builder.serverBuild;
 		this.advertiser = Executors.newSingleThreadExecutor(
 				task -> Thread.ofVirtual().name("sluice-advertise-" + this.clientId).unstarted(task));
 		this.registry.register(this);
@@ -139,6 +156,10 @@ public final class TunnelSession implements AutoCloseable {
 
 		private Runnable windowUpdateReceived = () -> {
 		};
+
+		private PeerBuild serverBuild = PeerBuild.newBuilder()
+			.setImplementation(ServerBuildConfiguration.IMPLEMENTATION)
+			.build();
 
 		private Builder() {
 		}
@@ -175,6 +196,12 @@ public final class TunnelSession implements AutoCloseable {
 
 		public Builder tcpRoutes(TcpRouteListener tcpRoutes) {
 			this.tcpRoutes = tcpRoutes;
+			return this;
+		}
+
+		/** This server's build, sent in every {@code AdvertiseAck}. */
+		public Builder serverBuild(PeerBuild serverBuild) {
+			this.serverBuild = serverBuild;
 			return this;
 		}
 
@@ -232,6 +259,31 @@ public final class TunnelSession implements AutoCloseable {
 		return this.rejectedPorts;
 	}
 
+	/**
+	 * Whether the client sent its {@code Advertise}; until then its build and window are
+	 * not known.
+	 */
+	public boolean advertised() {
+		return this.advertised;
+	}
+
+	/**
+	 * The build the client announced in its latest {@code Advertise}, with its strings
+	 * bounded ({@link PeerBuilds#sanitize}); empty when the client announced none (it
+	 * predates the field) or has not advertised yet ({@link #advertised()}).
+	 */
+	public Optional<PeerBuild> clientBuild() {
+		return Optional.ofNullable(this.clientBuild);
+	}
+
+	/**
+	 * Whether the client advertised without a per-connection receive window: every
+	 * connection of this session then runs without per-connection flow control.
+	 */
+	public boolean legacy() {
+		return this.advertised && this.clientWindow == 0;
+	}
+
 	void start() {
 		this.sender.start();
 	}
@@ -246,6 +298,15 @@ public final class TunnelSession implements AutoCloseable {
 				Advertise advertise = frame.getAdvertise();
 				// before the routes exist: every CONNECT they lead to sees the window
 				this.clientWindow = Integer.toUnsignedLong(advertise.getConnectionWindow());
+				PeerBuild build = advertise.hasBuild() ? PeerBuilds.sanitize(advertise.getBuild()) : null;
+				this.clientBuild = build;
+				boolean first = !this.advertised;
+				this.advertised = true;
+				if (first) {
+					log.info("client {} runs {}{}", this.clientId,
+							build == null ? PeerBuilds.UNKNOWN : PeerBuilds.describe(build),
+							this.clientWindow == 0 ? "; it announced no connection window (legacy flow control)" : "");
+				}
 				try {
 					this.advertiser.execute(() -> advertise(advertise.getUpstreamsList()));
 				}
@@ -303,7 +364,11 @@ public final class TunnelSession implements AutoCloseable {
 		Set<Integer> rejected = this.tcpRoutes.reconcile(this.clientId, listenPorts(advertised));
 		this.upstreams = List.copyOf(advertised);
 		this.rejectedPorts = Set.copyOf(rejected);
-		this.sender.sendAdvertiseAck(List.copyOf(rejected), this.nodeId);
+		this.sender.sendAdvertiseAck(AdvertiseAck.newBuilder()
+			.addAllRejectedPorts(rejected)
+			.setNodeId(this.nodeId)
+			.setBuild(this.serverBuild)
+			.build());
 		log.info("client {} advertised {} upstream(s), {} listen port(s) rejected", this.clientId, registered,
 				rejected.size());
 		for (Upstream upstream : advertised) {

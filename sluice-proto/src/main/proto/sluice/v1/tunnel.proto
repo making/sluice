@@ -91,6 +91,23 @@ message Advertise {
   // Client's receive window per connection, in bytes; 0 = the client has no
   // per-connection flow control (legacy).
   uint32 connection_window = 2;
+  // Build of the client; unset by clients that predate the field.
+  PeerBuild build = 3;
+}
+
+// Which build a peer runs. Each string may be empty when the peer could not tell
+// (e.g. no build metadata was packaged).
+message PeerBuild {
+  // Implementation: "sluice-client", "sluice-wasmlet" or "sluice-server".
+  string implementation = 1;
+  // Release version, e.g. "0.0.1-SNAPSHOT".
+  string version = 2;
+  // Git commit id the peer was built from (full id when known).
+  string commit = 3;
+  // Whether the working tree had uncommitted changes when the peer was built.
+  bool dirty = 4;
+  // Build time as an ISO-8601 instant, e.g. "2026-10-12T01:04:33Z".
+  string build_time = 5;
 }
 
 // Either direction: the sender consumed `increment` more payload bytes of
@@ -126,6 +143,8 @@ message AdvertiseAck {
   // Node id of the server that sent this ack; lets a client that reached the
   // same node through several addresses keep a single stream per node.
   string node_id = 2;
+  // Build of the server that sent this ack; unset by servers that predate the field.
+  PeerBuild build = 3;
 }
 
 message Upstream {

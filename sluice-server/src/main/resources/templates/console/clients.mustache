@@ -3,6 +3,7 @@
   <header class="client__head">
     <h3><span class="client__label">Client id</span> <span class="mono">{{clientId}}</span></h3>
     {{#draining}}<span class="tag tag--marker">Draining</span>{{/draining}}
+    {{#legacy}}<span class="tag tag--marker" data-testid="legacy" title="The client announced no per-connection receive window">Legacy flow control</span>{{/legacy}}
     <span class="client__from">{{#remoteAddress}}from <span class="mono">{{remoteAddress}}</span>, {{/remoteAddress}}connected <time datetime="{{connectedAt}}" title="{{connectedAt}}">{{connectedFor}}</time> ago</span>
   </header>
   <dl class="figures">
@@ -11,6 +12,12 @@
     <div><dt title="From visitors into the tunnel">Inbound</dt><dd class="num">{{inbound}}</dd></div>
     <div><dt title="From the tunnel back to visitors">Outbound</dt><dd class="num">{{outbound}}</dd></div>
   </dl>
+  {{#peerBuild}}
+  <p class="client__build" data-testid="build"><span class="client__label">Build</span>
+    {{#known}}<span class="mono" title="{{detail}}">{{implementation}} {{version}} {{commit}}</span>{{#dirty}} <span class="tag" title="Built from a working tree with uncommitted changes">dirty</span>{{/dirty}}{{/known}}
+    {{^known}}<span class="tag tag--marker" title="The client announced no build; it predates build reporting">Unknown (older build)</span>{{/known}}
+  </p>
+  {{/peerBuild}}
   <table class="grid upstreams">
     <caption class="visually-hidden">Upstreams of {{clientId}}</caption>
     <thead><tr><th scope="col">Kind</th><th scope="col">Host</th><th scope="col">Target</th><th scope="col">Role</th><th scope="col"><span class="visually-hidden">Note</span></th></tr></thead>

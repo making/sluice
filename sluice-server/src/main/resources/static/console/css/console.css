@@ -615,6 +615,13 @@ code {
 	border-color: var(--amber);
 }
 
+/* peer-supplied strings: wrap anywhere instead of widening the card */
+.client__build {
+	margin: 0 0 0.8rem;
+	font-size: var(--step--1);
+	overflow-wrap: anywhere;
+}
+
 .figures {
 	display: grid;
 	grid-template-columns: repeat(4, minmax(0, 1fr));

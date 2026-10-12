@@ -18,12 +18,16 @@ import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.tunnel.ConnectionLimit;
+import am.ik.sluice.tunnel.PeerBuilds;
 import am.ik.sluice.tunnel.SessionSender;
 import am.ik.sluice.tunnel.SocketRelay;
 import am.ik.sluice.tunnel.VirtualConnection;
+import am.ik.sluice.v1.proto.Advertise;
+import am.ik.sluice.v1.proto.AdvertiseAck;
 import am.ik.sluice.v1.proto.Frame;
 import am.ik.sluice.v1.proto.ListNodesRequest;
 import am.ik.sluice.v1.proto.ListNodesResponse;
+import am.ik.sluice.v1.proto.PeerBuild;
 import am.ik.sluice.v1.proto.TunnelGrpc;
 import io.grpc.Metadata;
 import io.grpc.ManagedChannel;
@@ -95,7 +99,8 @@ public final class NodeConnection implements AutoCloseable {
 
 	private final LocalConnector connector;
 
-	private final List<am.ik.sluice.v1.proto.Upstream> advertised;
+	/** The routes, the receive window and the build, sent on every stream. */
+	private final Advertise advertise;
 
 	private final ConcurrentHashMap<Long, VirtualConnection> connections = new ConcurrentHashMap<>();
 
@@ -143,7 +148,11 @@ public final class NodeConnection implements AutoCloseable {
 			.strict(builder.properties.strictForwarding())
 			.insecure(builder.properties.insecure())
 			.build();
-		this.advertised = builder.properties.toProtoUpstreams();
+		this.advertise = Advertise.newBuilder()
+			.addAllUpstreams(builder.properties.toProtoUpstreams())
+			.setConnectionWindow(VirtualConnection.DEFAULT_WINDOW)
+			.setBuild(builder.clientBuild)
+			.build();
 		String metricsTag = this.nodeId.isBlank() ? this.url : this.nodeId;
 		MeterRegistry meterRegistry = Objects.requireNonNull(builder.meterRegistry, "meterRegistry is required");
 		this.reconnects = Counter.builder("sluice.reconnect.total")
@@ -196,6 +205,10 @@ public final class NodeConnection implements AutoCloseable {
 		private @Nullable MeterRegistry meterRegistry;
 
 		private @Nullable ConnectionLimit connectionLimit;
+
+		private PeerBuild clientBuild = PeerBuild.newBuilder()
+			.setImplementation(ClientBuildConfiguration.IMPLEMENTATION)
+			.build();
 
 		private Builder() {
 		}
@@ -256,6 +269,15 @@ public final class NodeConnection implements AutoCloseable {
 		/** The limit shared by the connections of every node stream of the process. */
 		public Builder connectionLimit(ConnectionLimit connectionLimit) {
 			this.connectionLimit = connectionLimit;
+			return this;
+		}
+
+		/**
+		 * The client's build, announced in every {@code Advertise}; defaults to the
+		 * implementation name alone.
+		 */
+		public Builder clientBuild(PeerBuild clientBuild) {
+			this.clientBuild = clientBuild;
 			return this;
 		}
 
@@ -413,7 +435,7 @@ public final class NodeConnection implements AutoCloseable {
 			return; // stream failed before starting
 		}
 		this.readvertiseBackoff = BACKOFF_INITIAL_SECONDS;
-		sender.sendAdvertise(this.advertised, VirtualConnection.DEFAULT_WINDOW);
+		sender.sendAdvertise(this.advertise);
 		closed.await();
 		// the sender first, as in TunnelSession#close: a dead or stalled stream must not
 		// leave the connection teardown below waiting on a full send queue (closing the
@@ -552,8 +574,9 @@ public final class NodeConnection implements AutoCloseable {
 				}
 			}
 			case ADVERTISE_ACK -> {
-				List<Integer> rejected = frame.getAdvertiseAck().getRejectedPortsList();
-				String ackNodeId = frame.getAdvertiseAck().getNodeId();
+				AdvertiseAck ack = frame.getAdvertiseAck();
+				List<Integer> rejected = ack.getRejectedPortsList();
+				String ackNodeId = ack.getNodeId();
 				if (!ackNodeId.isBlank()) {
 					this.nodeId = ackNodeId;
 				}
@@ -569,10 +592,13 @@ public final class NodeConnection implements AutoCloseable {
 					readvertiseAfter(delay, closed);
 				}
 				if (!this.connected) {
-					// the first advertise is acknowledged: the tunnel is up for real
-					this.connected = true;
+					// the first advertise is acknowledged: the tunnel is up for real; the
+					// lines are logged before isConnected() turns true
 					log.info("[{}] tunnel established; advertising {} upstream(s)", this.key,
 							this.properties.upstreamTargets().size());
+					log.info("[{}] server build: {}", this.key, ack.hasBuild()
+							? PeerBuilds.describe(PeerBuilds.sanitize(ack.getBuild())) : PeerBuilds.UNKNOWN);
+					this.connected = true;
 					this.listener.onConnected(this, this.nodeId);
 				}
 			}
@@ -608,7 +634,7 @@ public final class NodeConnection implements AutoCloseable {
 			}
 			SessionSender sender = this.senderRef.get();
 			if (sender != null) {
-				sender.sendAdvertise(this.advertised, VirtualConnection.DEFAULT_WINDOW);
+				sender.sendAdvertise(this.advertise);
 			}
 		});
 	}

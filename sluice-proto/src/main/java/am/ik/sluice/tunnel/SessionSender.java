@@ -23,7 +23,6 @@ import am.ik.sluice.v1.proto.Frame;
 import am.ik.sluice.v1.proto.MembershipUpdate;
 import am.ik.sluice.v1.proto.Node;
 import am.ik.sluice.v1.proto.Drain;
-import am.ik.sluice.v1.proto.Upstream;
 import am.ik.sluice.v1.proto.WindowUpdate;
 import io.grpc.stub.CallStreamObserver;
 import io.grpc.stub.ServerCallStreamObserver;
@@ -447,26 +446,18 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	}
 
 	/**
-	 * Announces the upstreams and the client's per-connection receive window (0 = no
-	 * per-connection flow control) to the server (client -> server only).
+	 * Announces the upstreams, the client's per-connection receive window (0 = no
+	 * per-connection flow control) and its build to the server (client -> server only).
 	 */
-	public void sendAdvertise(List<Upstream> upstreams, int connectionWindow) {
-		Advertise advertise = Advertise.newBuilder()
-			.addAllUpstreams(upstreams)
-			.setConnectionWindow(connectionWindow)
-			.build();
+	public void sendAdvertise(Advertise advertise) {
 		enqueueControl(Frame.newBuilder().setAdvertise(advertise).build());
 	}
 
 	/**
-	 * Acknowledges an {@link Advertise} (server -> client only), listing the listen ports
-	 * that were not bound and this node's id.
+	 * Acknowledges an {@link Advertise} (server -> client only) with the listen ports
+	 * that were not bound, this node's id and the server's build.
 	 */
-	public void sendAdvertiseAck(List<Integer> rejectedPorts, String nodeId) {
-		AdvertiseAck ack = AdvertiseAck.newBuilder()
-			.addAllRejectedPorts(rejectedPorts)
-			.setNodeId(nodeId == null ? "" : nodeId)
-			.build();
+	public void sendAdvertiseAck(AdvertiseAck ack) {
 		enqueueControl(Frame.newBuilder().setAdvertiseAck(ack).build());
 	}
 

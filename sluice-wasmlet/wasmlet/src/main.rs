@@ -41,12 +41,14 @@ mod pb {
     include!(concat!(env!("OUT_DIR"), "/sluice.v1.rs"));
 }
 
+#[cfg(test)]
+mod build_info;
 mod tls;
 mod tunnel;
 mod wasm_host;
 
 use pb::frame::Body;
-use pb::{Advertise, Frame, Upstream};
+use pb::{Advertise, Frame, PeerBuild, Upstream};
 use tunnel::{Connections, Outbound};
 use wasm_host::{Handler, Instances, Locator, Sandbox};
 
@@ -162,6 +164,10 @@ fn parse_args() -> Config {
             }
         };
         match arg.as_str() {
+            "--version" => {
+                println!("{}", describe(&peer_build()));
+                std::process::exit(0);
+            }
             "--server" => config.server = value("server"),
             "--token" => config.token = value("token"),
             "--client-id" => config.id = value("client-id"),
@@ -266,6 +272,7 @@ async fn run(config: Config) -> Result<(), BoxError> {
         max_connections,
         max_instances,
     } = config;
+    println!("wasmlet build: {}", describe(&peer_build()));
     let instances = Instances::new(max_instances);
 
     // Fetch / prewarm every component (fail fast). The target is the component
@@ -533,6 +540,13 @@ impl NodeTask {
                     );
                     if !established {
                         established = true;
+                        println!(
+                            "[{}] server build: {}",
+                            self.key,
+                            ack.build
+                                .as_ref()
+                                .map_or_else(|| UNKNOWN_BUILD.to_string(), describe_peer)
+                        );
                         if !ack.node_id.is_empty() {
                             // the supervisor renames this session after the node
                             let _ = self
@@ -591,15 +605,84 @@ impl NodeTask {
     }
 }
 
-/// The Advertise opening every stream: the routes plus the receive window
-/// that makes the server open windowed connections.
+/// The Advertise opening every stream: the routes, the receive window that
+/// makes the server open windowed connections, and this binary's build.
 fn advertise(upstreams: Vec<Upstream>) -> Frame {
     Frame {
         body: Some(Body::Advertise(Advertise {
             upstreams,
             connection_window: tunnel::WINDOW,
+            build: Some(peer_build()),
         })),
     }
+}
+
+/// How a server that sent no build (it predates the field) is described.
+const UNKNOWN_BUILD: &str = "unknown (older build)";
+
+/// Longest value kept from each string of a server's build, in chars.
+const MAX_FIELD_CHARS: usize = 64;
+
+/// This binary's build, embedded by `build.rs`; an empty commit means git
+/// was unavailable when it was built.
+fn peer_build() -> PeerBuild {
+    PeerBuild {
+        implementation: "sluice-wasmlet".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        commit: env!("SLUICE_WASMLET_COMMIT").into(),
+        dirty: env!("SLUICE_WASMLET_DIRTY") == "true",
+        build_time: env!("SLUICE_WASMLET_BUILD_TIME").into(),
+    }
+}
+
+/// One line naming a build, e.g. `sluice-wasmlet 0.0.1-SNAPSHOT
+/// (<commit>, dirty, built 2026-10-12T01:04:33Z)`; an empty field reads as
+/// unknown.
+fn describe(build: &PeerBuild) -> String {
+    let or = |value: &str, unknown: &str| {
+        if value.is_empty() {
+            unknown.to_string()
+        } else {
+            value.to_string()
+        }
+    };
+    let mut details = vec![or(&build.commit, "commit unknown")];
+    if build.dirty {
+        details.push("dirty".into());
+    }
+    if !build.build_time.is_empty() {
+        details.push(format!("built {}", build.build_time));
+    }
+    format!(
+        "{} {} ({})",
+        or(&build.implementation, "unknown implementation"),
+        or(&build.version, "version unknown"),
+        details.join(", ")
+    )
+}
+
+/// [`describe`] of a build another peer sent: control characters become `?`
+/// and each string keeps at most [`MAX_FIELD_CHARS`] chars, so it cannot
+/// forge or flood log lines.
+fn describe_peer(build: &PeerBuild) -> String {
+    let bound = |value: &str| -> String {
+        let mut bounded: String = value
+            .chars()
+            .take(MAX_FIELD_CHARS)
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect();
+        if value.chars().count() > MAX_FIELD_CHARS {
+            bounded.push_str("...");
+        }
+        bounded
+    };
+    describe(&PeerBuild {
+        implementation: bound(&build.implementation),
+        version: bound(&build.version),
+        commit: bound(&build.commit),
+        dirty: build.dirty,
+        build_time: bound(&build.build_time),
+    })
 }
 
 /// Unary `ListNodes` over an established stream's channel
@@ -734,6 +817,92 @@ mod tests {
         };
         assert_eq!(advertise.connection_window, 1024 * 1024);
         assert_eq!(advertise.connection_window, tunnel::WINDOW);
+    }
+
+    /// Without the build the server shows this wasmlet as an older build.
+    #[test]
+    fn the_advertise_carries_the_embedded_build() {
+        let Some(Body::Advertise(advertise)) = advertise(Vec::new()).body else {
+            panic!("an Advertise");
+        };
+        let build = advertise.build.expect("a build");
+        assert_eq!(build.implementation, "sluice-wasmlet");
+        assert_eq!(build.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(build.commit, env!("SLUICE_WASMLET_COMMIT"));
+        assert_eq!(build.build_time, env!("SLUICE_WASMLET_BUILD_TIME"));
+    }
+
+    #[test]
+    fn describe_names_every_known_part_and_reads_empty_as_unknown() {
+        let build = PeerBuild {
+            implementation: "sluice-server".into(),
+            version: "0.0.1-SNAPSHOT".into(),
+            commit: "7312472".into(),
+            dirty: true,
+            build_time: "2026-10-12T01:04:33Z".into(),
+        };
+        assert_eq!(
+            describe(&build),
+            "sluice-server 0.0.1-SNAPSHOT (7312472, dirty, built 2026-10-12T01:04:33Z)"
+        );
+        assert_eq!(
+            describe(&PeerBuild::default()),
+            "unknown implementation version unknown (commit unknown)"
+        );
+    }
+
+    #[test]
+    fn describe_peer_bounds_what_the_server_sent() {
+        let build = PeerBuild {
+            implementation: "sluice-server\nforged".into(),
+            version: "9".repeat(MAX_FIELD_CHARS + 1),
+            ..Default::default()
+        };
+        assert_eq!(
+            describe_peer(&build),
+            format!(
+                "sluice-server?forged {}... (commit unknown)",
+                "9".repeat(MAX_FIELD_CHARS)
+            )
+        );
+    }
+
+    /// A build without git (missing program, or outside a work tree) still
+    /// gets an identification: an empty commit, reported as unknown.
+    #[test]
+    fn git_state_without_git_is_unknown() {
+        let dir = std::env::temp_dir();
+        let missing = build_info::git_state("sluice-no-such-git", &dir);
+        assert_eq!(
+            missing,
+            build_info::GitState {
+                commit: String::new(),
+                dirty: false
+            }
+        );
+        assert!(build_info::git_watch_paths("sluice-no-such-git", &dir).is_empty());
+    }
+
+    #[test]
+    fn git_state_reads_the_commit_of_the_work_tree() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let Some(head) = build_info::git("git", dir, &["rev-parse", "HEAD"]) else {
+            return; // no git on this machine: covered by git_state_without_git_is_unknown
+        };
+        assert_eq!(build_info::git_state("git", dir).commit, head);
+        assert!(
+            build_info::git_watch_paths("git", dir)
+                .iter()
+                .any(|path| path.ends_with("HEAD")),
+            "HEAD is watched"
+        );
+    }
+
+    #[test]
+    fn rfc3339_formats_utc_instants() {
+        assert_eq!(build_info::rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(build_info::rfc3339(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(build_info::rfc3339(1_760_000_000), "2025-10-09T08:53:20Z");
     }
 
     fn session(url: &str) -> Arc<Session> {
