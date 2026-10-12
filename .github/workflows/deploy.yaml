@@ -1,0 +1,223 @@
+name: Deploy
+# Builds and saves the images once CI succeeds on a push to main. This file only takes
+# effect from the default branch (workflow_run).
+on:
+  workflow_run:
+    workflows:
+    - CI
+    types:
+    - completed
+    branches:
+    - main
+# One deploy at a time, never cancelled midway (it may be pushing the images branch).
+# GitHub keeps one pending run per group and cancels the older pending one, so a run
+# does not deploy the commit that triggered it but the newest green CI push on main
+# (see the target job). Runs for a failed or non-push CI run stay out of the group, so
+# they cannot displace a pending one.
+concurrency:
+  group: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && 'deploy' || format('deploy-noop-{0}', github.run_id) }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+env:
+  REGISTRY: ghcr.io
+jobs:
+  target:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      revision: ${{ steps.target.outputs.revision }}
+    steps:
+    # Target: the newest successful CI push run on main. Skipped when the images branch
+    # already holds it or a newer commit, so an older commit never replaces a newer one.
+    - name: Pick the revision to deploy
+      id: target
+      env:
+        GH_TOKEN: ${{ github.token }}
+        CI_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+        TRIGGER_SHA: ${{ github.event.workflow_run.head_sha }}
+      run: |
+        TARGET=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${CI_WORKFLOW_ID}/runs?branch=main&event=push&status=success&per_page=1" --jq '.workflow_runs[0].head_sha')
+        test -n "${TARGET}"
+        DEPLOYED=""
+        for f in sluice-server_jvm sluice-server_native sluice-client_jvm sluice-client_native; do
+          CONTENT=$(gh api "repos/${GITHUB_REPOSITORY}/contents/${f}.yaml?ref=images" --jq .content)
+          DEPLOYED+="$(echo "${CONTENT}" | base64 -d | awk '/^git_revision:/{print $2}')"$'\n'
+        done
+        DEPLOYED=$(printf '%s' "${DEPLOYED}" | sort -u)
+        STATUS=none
+        if [ "$(echo "${DEPLOYED}" | wc -l)" -eq 1 ] && [ -n "${DEPLOYED}" ]; then
+          STATUS=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${DEPLOYED}...${TARGET}" --jq .status)
+        fi
+        echo "triggered by: ${TRIGGER_SHA}, newest green: ${TARGET}, deployed: ${DEPLOYED//$'\n'/ }, target vs deployed: ${STATUS}" | tee -a "${GITHUB_STEP_SUMMARY}"
+        case "${STATUS}" in
+          identical|behind) echo "Skipped: ${TARGET} is not newer than the deployed revision" | tee -a "${GITHUB_STEP_SUMMARY}" ;;
+          *) echo "revision=${TARGET}" >> "${GITHUB_OUTPUT}" ;;
+        esac
+  build-image:
+    needs: target
+    if: needs.target.outputs.revision != ''
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - { app: sluice-server, variant: jvm,    arch: amd64,   runs_on: ubuntu-latest }
+        - { app: sluice-server, variant: jvm,    arch: aarch64, runs_on: ubuntu-24.04-arm }
+        - { app: sluice-server, variant: native, arch: amd64,   runs_on: ubuntu-latest }
+        - { app: sluice-server, variant: native, arch: aarch64, runs_on: ubuntu-24.04-arm }
+        - { app: sluice-client, variant: jvm,    arch: amd64,    runs_on: ubuntu-latest }
+        - { app: sluice-client, variant: jvm,    arch: aarch64,  runs_on: ubuntu-24.04-arm }
+        - { app: sluice-client, variant: native, arch: amd64,    runs_on: ubuntu-latest }
+        - { app: sluice-client, variant: native, arch: aarch64,  runs_on: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runs_on }}
+    env:
+      REVISION: ${{ needs.target.outputs.revision }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ needs.target.outputs.revision }}
+    - uses: graalvm/setup-graalvm@v1
+      with:
+        java-version: '25'
+        distribution: graalvm
+        cache: 'maven'
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Prepare image name
+      id: image
+      env:
+        APP: ${{ matrix.app }}
+      run: echo "name=${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/${APP} | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+    - name: Set version
+      run: |
+        CURRENT_VERSION=$(./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout)
+        NEW_VERSION=$(echo $CURRENT_VERSION | sed "s/-SNAPSHOT/.${REVISION}/")
+        ./mvnw versions:set -DnewVersion=${NEW_VERSION} -DprocessAllModules -DgenerateBackupPoms=false -B --no-transfer-progress
+    - name: Build image (${{ matrix.app }} / ${{ matrix.variant }} / ${{ matrix.arch }})
+      env:
+        IMAGE: ${{ steps.image.outputs.name }}
+        VARIANT: ${{ matrix.variant }}
+        ARCH: ${{ matrix.arch }}
+        APP: ${{ matrix.app }}
+        NATIVE_FLAGS: ${{ matrix.variant == 'native' && '-Pnative' || '' }}
+      run: |
+        ./mvnw -B --no-transfer-progress -pl ${APP} -am install -DskipTests -Dcyclonedx.skip=true ${NATIVE_FLAGS}
+        ./mvnw -B --no-transfer-progress -pl ${APP} ${NATIVE_FLAGS} spring-boot:build-image -DskipTests \
+          -Dspring-boot.build-image.imageName=${IMAGE}:${VARIANT}_${ARCH}_${REVISION}
+    - name: Push image
+      env:
+        IMAGE: ${{ steps.image.outputs.name }}
+        VARIANT: ${{ matrix.variant }}
+        ARCH: ${{ matrix.arch }}
+      run: |
+        docker push ${IMAGE}:${VARIANT}_${ARCH}_${REVISION}
+        docker tag ${IMAGE}:${VARIANT}_${ARCH}_${REVISION} ${IMAGE}:${VARIANT}_${ARCH}
+        docker push ${IMAGE}:${VARIANT}_${ARCH}
+  push-manifest:
+    needs:
+    - target
+    - build-image
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        app:
+        - sluice-server
+        - sluice-client
+        variant:
+        - jvm
+        - native
+    runs-on: ubuntu-latest
+    env:
+      REVISION: ${{ needs.target.outputs.revision }}
+    steps:
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Create and push manifest
+      env:
+        APP: ${{ matrix.app }}
+        VARIANT: ${{ matrix.variant }}
+      run: |
+        IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/${APP} | tr '[:upper:]' '[:lower:]')"
+        docker manifest create ${IMAGE}:${VARIANT}_${REVISION} \
+          --amend ${IMAGE}:${VARIANT}_amd64_${REVISION} \
+          --amend ${IMAGE}:${VARIANT}_aarch64_${REVISION}
+        docker manifest push ${IMAGE}:${VARIANT}_${REVISION}
+        docker manifest create ${IMAGE}:${VARIANT} \
+          --amend ${IMAGE}:${VARIANT}_amd64_${REVISION} \
+          --amend ${IMAGE}:${VARIANT}_aarch64_${REVISION}
+        docker manifest push ${IMAGE}:${VARIANT}
+    - name: Generate image file
+      env:
+        APP: ${{ matrix.app }}
+        VARIANT: ${{ matrix.variant }}
+      run: |
+        IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/${APP} | tr '[:upper:]' '[:lower:]')"
+        DIGEST=$(docker buildx imagetools inspect ${IMAGE}:${VARIANT}_${REVISION} | awk '/^Digest:/{print $2}')
+        cat <<EOF > ${APP}_${VARIANT}.yaml
+        image: ${IMAGE}@${DIGEST}
+        git_revision: ${REVISION}
+        deployment:
+          image:
+            repository: ${IMAGE}
+            digest: ${DIGEST}
+          podLabels:
+            github.com/revision: ${REVISION}
+        EOF
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.app }}_${{ matrix.variant }}
+        path: ${{ matrix.app }}_${{ matrix.variant }}.yaml
+  # Same commits as categolj/workflows save-images.yaml (one per file), inlined because
+  # that workflow names GITHUB_SHA in the message, which under workflow_run is the head of
+  # main rather than the deployed revision. One push, so the four files move together.
+  save-image:
+    needs:
+    - target
+    - push-manifest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      REVISION: ${{ needs.target.outputs.revision }}
+    steps:
+    - name: Checkout images branch
+      uses: actions/checkout@v4
+      with:
+        ref: images
+    - name: Download image files
+      uses: actions/download-artifact@v4
+      with:
+        pattern: sluice-*
+        merge-multiple: true
+    - name: Commit and push
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        for f in sluice-server_jvm.yaml sluice-server_native.yaml sluice-client_jvm.yaml sluice-client_native.yaml; do
+          git add "${f}"
+          git diff --cached --quiet || git commit -m ":robot: Update ${f} for ${REVISION}"
+        done
+        git pull --rebase origin images
+        git push origin images

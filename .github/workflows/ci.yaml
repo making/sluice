@@ -17,22 +17,17 @@ on:
     branches:
     - main
     paths: *maven-paths
-# Pushes to main queue: one run at a time, so save-image never races on the images
-# branch and an older run cannot finish after (and overwrite) a newer one. A pending run
-# is replaced by the newest pending one; a running one is never cancelled (it may be
-# midway through save-image). Pull request runs cancel in progress per PR.
+# Every push to main gets its own run, so test feedback never waits behind another push
+# (images are built by deploy.yaml once a run here succeeds). Pull request runs cancel
+# in progress per PR.
 concurrency:
-  group: ci-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions:
   contents: read
-  packages: write
-env:
-  REGISTRY: ghcr.io
 jobs:
   test:
     runs-on: ubuntu-latest
-    # a hung test must not hold the main queue (see concurrency above)
     timeout-minutes: 30
     steps:
     - name: Checkout
@@ -49,137 +44,3 @@ jobs:
         key: playwright-${{ runner.os }}-${{ hashFiles('pom.xml') }}
     - name: Test
       run: ./mvnw -V -B --no-transfer-progress verify
-  build-image:
-    needs: test
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-        - { app: sluice-server, variant: jvm,    arch: amd64,   runs_on: ubuntu-latest }
-        - { app: sluice-server, variant: jvm,    arch: aarch64, runs_on: ubuntu-24.04-arm }
-        - { app: sluice-server, variant: native, arch: amd64,   runs_on: ubuntu-latest }
-        - { app: sluice-server, variant: native, arch: aarch64, runs_on: ubuntu-24.04-arm }
-        - { app: sluice-client, variant: jvm,    arch: amd64,    runs_on: ubuntu-latest }
-        - { app: sluice-client, variant: jvm,    arch: aarch64,  runs_on: ubuntu-24.04-arm }
-        - { app: sluice-client, variant: native, arch: amd64,    runs_on: ubuntu-latest }
-        - { app: sluice-client, variant: native, arch: aarch64,  runs_on: ubuntu-24.04-arm }
-    runs-on: ${{ matrix.runs_on }}
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-    - uses: graalvm/setup-graalvm@v1
-      with:
-        java-version: '25'
-        distribution: graalvm
-        cache: 'maven'
-    - name: Login to GitHub Container Registry
-      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-      uses: docker/login-action@v3
-      with:
-        registry: ${{ env.REGISTRY }}
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    - name: Prepare image name
-      id: image
-      env:
-        APP: ${{ matrix.app }}
-        VARIANT: ${{ matrix.variant }}
-        ARCH: ${{ matrix.arch }}
-      run: echo "name=${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/${APP} | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-    - name: Set version
-      run: |
-        CURRENT_VERSION=$(./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout)
-        NEW_VERSION=$(echo $CURRENT_VERSION | sed "s/-SNAPSHOT/.${GITHUB_SHA}/")
-        ./mvnw versions:set -DnewVersion=${NEW_VERSION} -DprocessAllModules -DgenerateBackupPoms=false -B --no-transfer-progress
-    - name: Build image (${{ matrix.app }} / ${{ matrix.variant }} / ${{ matrix.arch }})
-      env:
-        IMAGE: ${{ steps.image.outputs.name }}
-        VARIANT: ${{ matrix.variant }}
-        ARCH: ${{ matrix.arch }}
-        APP: ${{ matrix.app }}
-        NATIVE_FLAGS: ${{ matrix.variant == 'native' && '-Pnative' || '' }}
-      run: |
-        ./mvnw -B --no-transfer-progress -pl ${APP} -am install -DskipTests -Dcyclonedx.skip=true ${NATIVE_FLAGS}
-        ./mvnw -B --no-transfer-progress -pl ${APP} ${NATIVE_FLAGS} spring-boot:build-image -DskipTests \
-          -Dspring-boot.build-image.imageName=${IMAGE}:${VARIANT}_${ARCH}_${GITHUB_SHA}
-    - name: Push image
-      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-      env:
-        IMAGE: ${{ steps.image.outputs.name }}
-        VARIANT: ${{ matrix.variant }}
-        ARCH: ${{ matrix.arch }}
-      run: |
-        docker push ${IMAGE}:${VARIANT}_${ARCH}_${GITHUB_SHA}
-        docker tag ${IMAGE}:${VARIANT}_${ARCH}_${GITHUB_SHA} ${IMAGE}:${VARIANT}_${ARCH}
-        docker push ${IMAGE}:${VARIANT}_${ARCH}
-  push-manifest:
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    needs: build-image
-    strategy:
-      matrix:
-        app:
-        - sluice-server
-        - sluice-client
-        variant:
-        - jvm
-        - native
-    runs-on: ubuntu-latest
-    steps:
-    - name: Login to GitHub Container Registry
-      uses: docker/login-action@v3
-      with:
-        registry: ${{ env.REGISTRY }}
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    - name: Create and push manifest
-      env:
-        APP: ${{ matrix.app }}
-        VARIANT: ${{ matrix.variant }}
-      run: |
-        IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/${APP} | tr '[:upper:]' '[:lower:]')"
-        docker manifest create ${IMAGE}:${VARIANT}_${GITHUB_SHA} \
-          --amend ${IMAGE}:${VARIANT}_amd64_${GITHUB_SHA} \
-          --amend ${IMAGE}:${VARIANT}_aarch64_${GITHUB_SHA}
-        docker manifest push ${IMAGE}:${VARIANT}_${GITHUB_SHA}
-        docker manifest create ${IMAGE}:${VARIANT} \
-          --amend ${IMAGE}:${VARIANT}_amd64_${GITHUB_SHA} \
-          --amend ${IMAGE}:${VARIANT}_aarch64_${GITHUB_SHA}
-        docker manifest push ${IMAGE}:${VARIANT}
-    - name: Generate image file
-      env:
-        APP: ${{ matrix.app }}
-        VARIANT: ${{ matrix.variant }}
-      run: |
-        IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/${APP} | tr '[:upper:]' '[:lower:]')"
-        DIGEST=$(docker buildx imagetools inspect ${IMAGE}:${VARIANT}_${GITHUB_SHA} | awk '/^Digest:/{print $2}')
-        cat <<EOF > ${APP}_${VARIANT}.yaml
-        image: ${IMAGE}@${DIGEST}
-        git_revision: ${GITHUB_SHA}
-        deployment:
-          image:
-            repository: ${IMAGE}
-            digest: ${DIGEST}
-          podLabels:
-            github.com/revision: ${GITHUB_SHA}
-        EOF
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ matrix.app }}_${{ matrix.variant }}
-        path: ${{ matrix.app }}_${{ matrix.variant }}.yaml
-  save-image:
-    needs: push-manifest
-    permissions:
-      contents: write
-    strategy:
-      max-parallel: 1
-      matrix:
-        include:
-        - { app: sluice-server, variant: jvm }
-        - { app: sluice-server, variant: native }
-        - { app: sluice-client, variant: jvm }
-        - { app: sluice-client, variant: native }
-    uses: categolj/workflows/.github/workflows/save-images.yaml@main
-    with:
-      image_name: ${{ matrix.app }}_${{ matrix.variant }}
-      image_file: ${{ matrix.app }}_${{ matrix.variant }}.yaml
