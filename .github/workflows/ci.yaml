@@ -3,19 +3,20 @@ on:
   push:
     branches:
     - main
-    paths:
-    - '**/src/**'
-    - '**/pom.xml'
+    paths: &maven-paths
+    - 'pom.xml'
     - 'mvnw'
-    - '.github/workflows/*'
+    - '.mvn/**'
+    - 'sluice-proto/**'
+    - 'sluice-server/**'
+    - 'sluice-client/**'
+    - 'sluice-example-upstream/**'
+    - 'sluice-it/**'
+    - '.github/workflows/ci.yaml'
   pull_request:
     branches:
     - main
-    paths:
-    - '**/src/**'
-    - '**/pom.xml'
-    - 'mvnw'
-    - '.github/workflows/*'
+    paths: *maven-paths
 permissions:
   contents: read
   packages: write
