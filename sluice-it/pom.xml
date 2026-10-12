@@ -81,7 +81,7 @@
 			</plugin>
 			<plugin>
 				<!-- The classes run in parallel JVMs, a class at a time in each, so they share no
-					 JVM state; TestPorts gives each JVM its own slice of ports. The JVMs compile
+					 JVM state; TestPorts claims ports across JVMs. The JVMs compile
 					 with C1 only: C2 in six JVMs at once keeps the CPUs busy (on 1.8 CPUs the
 					 class times summed to 869s with C2, 720s with C1 only). -->
 				<groupId>org.apache.maven.plugins</groupId>
@@ -90,10 +90,6 @@
 					<forkCount>${sluice.it.forks}</forkCount>
 					<reuseForks>true</reuseForks>
 					<argLine>-XX:TieredStopAtLevel=1</argLine>
-					<systemPropertyVariables>
-						<sluice.test.fork>${surefire.forkNumber}</sluice.test.fork>
-						<sluice.test.forks>${sluice.it.forks}</sluice.test.forks>
-					</systemPropertyVariables>
 				</configuration>
 			</plugin>
 		</plugins>
