@@ -431,7 +431,10 @@ class VerbatimIdleTimeoutE2ETest {
 			socket.setSoTimeout(5000);
 			long start = System.nanoTime();
 			upgrade(socket);
-			assertThat(connectionLimits().scheduledDeadlines()).isEqualTo(1);
+			// the relay leaves the stall watch for the verbatim idle timeout as the
+			// client
+			// reads the 101: the queue is read without the deadline's lock
+			Awaitility.await().atMost(Duration.ofSeconds(1)).until(() -> connectionLimits().scheduledDeadlines() == 1);
 			TestSockets.awaitClosed(socket, WITHIN);
 			assertThat(since(start)).isGreaterThanOrEqualTo(TIMEOUT);
 			awaitReleased(closed);
