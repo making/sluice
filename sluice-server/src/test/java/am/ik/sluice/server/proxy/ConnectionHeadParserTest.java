@@ -93,6 +93,53 @@ class ConnectionHeadParserTest {
 	}
 
 	@Test
+	void http2ConnectTakesItsAuthorityAsThePath() {
+		ConnectionHeadParser.Head parsed = parseH2(literal(":method", "CONNECT"),
+				literal(":authority", "tunnel.local:443"));
+		assertThat(parsed.request())
+			.isEqualTo(new ConnectionHeadParser.Head.Request("CONNECT", "tunnel.local:443", "2"));
+		assertThat(parsed.host()).isEqualTo("tunnel.local:443");
+		assertThat(parsed.http2Connection()).isTrue();
+	}
+
+	@Test
+	void http2ExtendedConnectKeepsItsPath() {
+		ConnectionHeadParser.Head parsed = parseH2(literal(":method", "CONNECT"), literal(":protocol", "websocket"),
+				literal(":scheme", "http"), literal(":authority", "ws.local"), literal(":path", "/chat"));
+		assertThat(parsed.request()).isEqualTo(new ConnectionHeadParser.Head.Request("CONNECT", "/chat", "2"));
+	}
+
+	@Test
+	void http2HeadsThatAreNoRequestYieldNoneYetOpenAnHttp2Connection() {
+		byte[][][] blocks = { { literal(":method", "CONNECT"), literal("host", "tunnel.local") },
+				{ literal(":method", "CONNECT"), literal(":protocol", "websocket"), literal(":authority", "ws.local") },
+				{ literal(":authority", "demo.local"), literal(":path", "/") },
+				{ literal(":method", "GET"), literal(":authority", "demo.local") },
+				{ literal(":method", "GET"), literal(":authority", "demo.local"), literal(":path", "") } };
+		for (byte[][] block : blocks) {
+			ConnectionHeadParser.Head parsed = parseH2(block);
+			assertThat(parsed.request()).isNull();
+			assertThat(parsed.http2Connection()).isTrue();
+		}
+	}
+
+	@Test
+	void http1AndTlsHeadsOpenNoHttp2Connection() {
+		byte[] http1 = "GET / HTTP/1.1\r\nHost: demo.local\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
+		assertThat(PARSER.parse(new ByteArrayInputStream(http1)).orElseThrow().http2Connection()).isFalse();
+		assertThat(ConnectionHeadParser.Head.encrypted(new byte[] { 0x16, 0x03, 0x01 }, "tls.local").http2Connection())
+			.isFalse();
+	}
+
+	private static ConnectionHeadParser.Head parseH2(byte[]... literals) {
+		java.io.ByteArrayOutputStream block = new java.io.ByteArrayOutputStream();
+		for (byte[] literal : literals) {
+			block.writeBytes(literal);
+		}
+		return PARSER.parse(new ByteArrayInputStream(h2Head(block.toByteArray(), true))).orElseThrow();
+	}
+
+	@Test
 	void respHeadHasNoRequest() {
 		byte[] head = "*1\r\n$4\r\nPING\r\n".getBytes(StandardCharsets.US_ASCII);
 		assertThat(PARSER.parse(new ByteArrayInputStream(head)).orElseThrow().request()).isNull();

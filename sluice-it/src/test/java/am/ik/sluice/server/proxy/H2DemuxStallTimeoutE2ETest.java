@@ -370,8 +370,8 @@ class H2DemuxStallTimeoutE2ETest {
 
 	/**
 	 * A CONNECT stream waits for its upstream's answer with its request open, then rests
-	 * with its stream window exhausted: neither counts. Opened second: a connection whose
-	 * head is a CONNECT, which has no {@code :path}, is relayed verbatim, not demuxed.
+	 * with its stream window exhausted: neither counts. Opened second, behind a request
+	 * on another route.
 	 */
 	@Test
 	void aConnectTunnelRestingLongerThanTheStallTimeoutIsNotCut() throws Exception {

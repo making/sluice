@@ -316,8 +316,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		}
 		ConnectionHeadParser.Head head = new ConnectionHeadParser(HEAD_LIMIT).parse(in)
 			.orElseThrow(() -> new IllegalArgumentException("unrecognized connection head"));
-		boolean h2 = head.request() != null && "2".equals(head.request().version());
-		access.transport(h2 ? "h2" : "h1");
+		access.transport(head.http2Connection() ? "h2" : "h1");
 		// prefer the HTTP host; fall back to the SNI host name of the terminated
 		// handshake (hostless protocols such as RESP carry no Host header)
 		if (head.host() == null && sni.get() != null) {
@@ -361,11 +360,15 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		Router.Route route0 = route.get();
 		access.route(route0.routeTag());
 		ConnectionHeadParser.Head.Request request = conn.head().request();
-		if (request != null && !conn.head().encrypted()) {
+		boolean http2 = conn.head().http2Connection();
+		if ((request != null || http2) && !conn.head().encrypted()) {
 			// plaintext HTTP: every request head / stream is routed; successors may
-			// belong to another client's upstream (keep-alive, h2 multiplexing)
+			// belong to another client's upstream (keep-alive, h2 multiplexing). An h2
+			// connection is demultiplexed even when its first head is no request the
+			// relay can route -- the relay resets that stream: relayed verbatim, its
+			// later streams would bypass their own routing and access control
 			Runnable relayed = this.relayed(access);
-			if ("2".equals(request.version())) {
+			if (http2) {
 				Http2DemuxRelay demux = new Http2DemuxRelay(conn.pipe(), conn.head(), this.router, this.sessions,
 						this.accessControl, this.errorResponse, access, this.h2DemuxMeters, this.limits, route0,
 						session, peer, deadline, this.h2WriteSeam, relayed, release);

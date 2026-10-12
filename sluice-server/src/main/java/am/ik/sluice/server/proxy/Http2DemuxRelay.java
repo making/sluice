@@ -43,10 +43,13 @@ import io.micrometer.core.instrument.MeterRegistry;
  * {@code :authority} of every request HEADERS block is resolved through the router and
  * the stream is relayed, with its stream id unchanged, to a virtual connection of the
  * matching route -- concurrent streams of one connection (h2 multiplexing, connection
- * coalescing) each reach their own upstream. Streams sharing a route share the route's
- * leg. Every leg's writes are performed by the leg's own writer thread off the leg's
- * queue -- the outbound parse only enqueues, so one stalled leg never stops the frames of
- * the others.
+ * coalescing) each reach their own upstream. A CONNECT (RFC 9113 8.5) is routed by its
+ * {@code :authority} alike, and logged with it as its path; a head that is no request --
+ * no {@code :method}, no {@code :path} but for a CONNECT, a CONNECT without
+ * {@code :authority} -- is reset with {@code PROTOCOL_ERROR}, the connection's head
+ * included. Streams sharing a route share the route's leg. Every leg's writes are
+ * performed by the leg's own writer thread off the leg's queue -- the outbound parse only
+ * enqueues, so one stalled leg never stops the frames of the others.
  * <p>
  * The relay is the HTTP/2 endpoint of the client connection for everything
  * connection-level: settings are answered and re-announced to the legs, pings are
@@ -1705,6 +1708,16 @@ final class Http2DemuxRelay {
 		}
 		String host = hostOf(headers);
 		ConnectionHeadParser.Head.@Nullable Request request = requestOf(headers);
+		if (request == null) {
+			// malformed -- no :method, no :path but for a CONNECT, a CONNECT without
+			// :authority: a stream error, never forwarded (RFC 9113 8.1.1); the
+			// connection's own route, when this is its head, goes unused
+			this.firstHead = false;
+			CharSequence method = headers.method();
+			this.access.request("-", method == null ? "-" : method.toString(), "-", "2");
+			writeToClient(rstStream(streamId, ERROR_PROTOCOL));
+			return;
+		}
 		Resolved resolved;
 		if (this.firstHead) {
 			// resolved with the connection; the lookup must not run twice (it advances
@@ -1861,15 +1874,7 @@ final class Http2DemuxRelay {
 
 	private static ConnectionHeadParser.Head.@Nullable Request requestOf(
 			io.netty.handler.codec.http2.@Nullable Http2Headers headers) {
-		if (headers == null) {
-			return null;
-		}
-		CharSequence method = headers.method();
-		CharSequence path = headers.path();
-		if (method == null || path == null) {
-			return null;
-		}
-		return new ConnectionHeadParser.Head.Request(method.toString(), path.toString(), "2");
+		return headers == null ? null : ConnectionHeadParser.http2RequestOf(headers);
 	}
 
 	private static @Nullable String headerOf(io.netty.handler.codec.http2.Http2Headers headers, String name) {

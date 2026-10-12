@@ -30,6 +30,11 @@ public final class ConnectionHeadParser {
 	 */
 	static final byte RESP_ARRAY = '*';
 
+	private static final AsciiString CONNECT = AsciiString.cached("CONNECT");
+
+	/** The pseudo-header of an extended CONNECT (RFC 8441 4). */
+	private static final AsciiString PROTOCOL = AsciiString.cached(":protocol");
+
 	private static final int FRAME_HEADER_LENGTH = 9;
 
 	private static final int FRAME_HEADERS = 0x1;
@@ -75,9 +80,18 @@ public final class ConnectionHeadParser {
 
 		/**
 		 * The request of the head: the HTTP/1.1 request-line parts, or the method/path of
-		 * the first HEADERS block for HTTP/2 ({@code version} is {@code 2}).
+		 * the first HEADERS block for HTTP/2 ({@code version} is {@code 2}; a CONNECT's
+		 * path is its {@code :authority}).
 		 */
 		public record Request(String method, String path, String version) {
+		}
+
+		/**
+		 * Whether the head opens an HTTP/2 connection (the client preface), whether or
+		 * not its first HEADERS block is a well-formed request.
+		 */
+		public boolean http2Connection() {
+			return !this.encrypted && isHttp2(this.bytes);
 		}
 
 		/** A copy of this head with the route host replaced. */
@@ -292,10 +306,7 @@ public final class ConnectionHeadParser {
 		try {
 			Http2Headers headers = this.headersDecoder.decodeHeaders(streamId, Unpooled.wrappedBuffer(headerBlock));
 			String host = headerOf(headers.authority(), headers.get(AsciiString.cached("host")));
-			CharSequence method = headers.method();
-			CharSequence path = headers.path();
-			Head.Request request = method == null || path == null ? null
-					: new Head.Request(method.toString(), path.toString(), "2");
+			Head.Request request = http2RequestOf(headers);
 			String forwardedFor = headerOf(null, headers.get(AsciiString.of(Head.FORWARDED_FOR)));
 			String forwarded = headerOf(null, headers.get(AsciiString.of(Head.FORWARDED)));
 			return new Decoded(host, request, forwardedFor, forwarded);
@@ -304,6 +315,29 @@ public final class ConnectionHeadParser {
 			// fall through: unroutable head
 		}
 		return new Decoded(null, null, null, null);
+	}
+
+	/**
+	 * The request of an HTTP/2 request head: its {@code :method} and {@code :path}, or
+	 * for a CONNECT (RFC 9113 8.5) its {@code :authority} as the path, like the
+	 * authority-form target of an HTTP/1.1 CONNECT. {@code null} for a head that is no
+	 * well-formed request in these terms: no {@code :method}, no {@code :path} but for a
+	 * CONNECT, a CONNECT without {@code :authority}, or an extended CONNECT (RFC 8441,
+	 * {@code :protocol}) without {@code :path}.
+	 */
+	static Head.@Nullable Request http2RequestOf(Http2Headers headers) {
+		CharSequence method = headers.method();
+		if (method == null) {
+			return null;
+		}
+		CharSequence path = headers.path();
+		if (path == null && CONNECT.contentEquals(method) && !headers.contains(PROTOCOL)) {
+			path = headers.authority();
+		}
+		if (path == null || path.isEmpty()) {
+			return null;
+		}
+		return new Head.Request(method.toString(), path.toString(), "2");
 	}
 
 	private static @Nullable String headerOf(@Nullable CharSequence first, @Nullable CharSequence second) {
