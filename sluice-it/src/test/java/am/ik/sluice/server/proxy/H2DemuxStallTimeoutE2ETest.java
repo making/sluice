@@ -452,7 +452,9 @@ class H2DemuxStallTimeoutE2ETest {
 				.name("e2e-h2stall-uploader")
 				.start(() -> second.set(upload(client, 3, 512 * 1024)));
 			Thread.sleep(1500);
-			assertThat(windowWithheld()).as("the connection window was withheld").isEqualTo(withheld + 1);
+			// at least once: granted back while the queue drains, it may be withheld
+			// again
+			assertThat(windowWithheld()).as("the connection window was withheld").isGreaterThan(withheld);
 			assertThat(client.connectionWindow()).as("the connection window ran out").isLessThanOrEqualTo(0);
 			assertThat(Math.max(client.streamWindow(1), client.streamWindow(3))).as("a stream window did not")
 				.isPositive();
