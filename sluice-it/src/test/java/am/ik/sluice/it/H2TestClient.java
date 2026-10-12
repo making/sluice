@@ -532,6 +532,15 @@ public final class H2TestClient implements AutoCloseable {
 		}
 	}
 
+	/**
+	 * Closes the TCP connection with a reset (SO_LINGER 0) instead of a FIN, as a client
+	 * gone without a word: the peer's next write fails once the reset reached it.
+	 */
+	public void abort() throws IOException {
+		this.socket.setSoLinger(true, 0);
+		this.socket.close();
+	}
+
 	@Override
 	public void close() throws IOException {
 		this.socket.close();

@@ -332,7 +332,10 @@ final class Http2DemuxRelay {
 	private final ConnectionLimits.KeepAliveDeadline deadline;
 
 	/** Serializes the writes of the shared client stream. */
-	private final Object sinkLock = new Object();
+	private final ReentrantLock sinkLock = new ReentrantLock();
+
+	/** Runs between a write's decision and the write, with {@link #sinkLock} held. */
+	private final WriteSeam writeSeam;
 
 	/** Threads writing to the client, or waiting to; the stall watch reads it. */
 	private final AtomicInteger writers = new AtomicInteger();
@@ -481,8 +484,8 @@ final class Http2DemuxRelay {
 	Http2DemuxRelay(DuplexPipe pipe, ConnectionHeadParser.Head head, Router router, SessionRegistry sessions,
 			AccessControl accessControl, ErrorResponse errorResponse, AccessLogger.Connection access,
 			H2DemuxMeters meters, ConnectionLimits limits, Router.Route initialRoute, TunnelSession initialSession,
-			@Nullable InetAddress peer, ConnectionLimits.KeepAliveDeadline deadline, Runnable onFinish,
-			Runnable release) {
+			@Nullable InetAddress peer, ConnectionLimits.KeepAliveDeadline deadline, WriteSeam writeSeam,
+			Runnable onFinish, Runnable release) {
 		this.pipe = pipe;
 		this.seedHead = head.bytes();
 		this.router = router;
@@ -500,6 +503,7 @@ final class Http2DemuxRelay {
 		this.onFinish = onFinish;
 		this.release = release;
 		this.deadline = deadline;
+		this.writeSeam = writeSeam;
 		deadline.onExpiry(this::closeIdle);
 		deadline.watchStalls(this::waitsOnClient, this::closeStalled);
 		try {
@@ -516,6 +520,16 @@ final class Http2DemuxRelay {
 	 */
 	void start() {
 		Thread.ofVirtual().name("sluice-h2demux-out").start(this::pumpOutbound);
+	}
+
+	/** Whether a thread waits to write to the client; for tests. */
+	boolean sinkAwaited() {
+		return this.sinkLock.hasQueuedThreads();
+	}
+
+	/** Whether the relay ended; for tests. */
+	boolean finished() {
+		return this.finished.get();
 	}
 
 	/**
@@ -899,8 +913,11 @@ final class Http2DemuxRelay {
 	 */
 	private boolean resetStream(Stream stream, int errorCode) {
 		int dropped;
-		// under the sink lock, so no response frame of the stream follows the reset
-		synchronized (this.sinkLock) {
+		// marked reset and written as one step for the writers of response frames, each
+		// of which checks the stream and writes under the sink lock: a frame that passed
+		// its check is written before the RST_STREAM, one checked after it is dropped
+		this.sinkLock.lock();
+		try {
 			this.lock.lock();
 			try {
 				if (stream.reset || (stream.clientEnded && stream.responseEnded)) {
@@ -913,7 +930,11 @@ final class Http2DemuxRelay {
 			finally {
 				this.lock.unlock();
 			}
+			this.writeSeam.decided(this, new WriteSeam.Decision(WriteSeam.Site.RESET, stream.id));
 			writeToClient(rstStream(stream.id, errorCode));
+		}
+		finally {
+			this.sinkLock.unlock();
 		}
 		afterReset(stream);
 		stream.leg.queueConnectionGrant(dropped);
@@ -1706,23 +1727,23 @@ final class Http2DemuxRelay {
 	private void writePieces(byte[] bytes, int offset, int length, boolean progress) {
 		OutputStream sink = this.pipe.sink();
 		this.writers.incrementAndGet();
+		this.sinkLock.lock();
 		try {
-			synchronized (this.sinkLock) {
-				for (int written = 0; written < length;) {
-					int piece = Math.min(ConnectionLimits.KeepAliveDeadline.WRITE_PIECE, length - written);
-					sink.write(bytes, offset + written, piece);
-					written += piece;
-					if (progress) {
-						this.deadline.progress(piece);
-					}
+			for (int written = 0; written < length;) {
+				int piece = Math.min(ConnectionLimits.KeepAliveDeadline.WRITE_PIECE, length - written);
+				sink.write(bytes, offset + written, piece);
+				written += piece;
+				if (progress) {
+					this.deadline.progress(piece);
 				}
-				sink.flush();
 			}
+			sink.flush();
 		}
 		catch (Exception e) {
 			throw new IllegalStateException(e);
 		}
 		finally {
+			this.sinkLock.unlock();
 			this.writers.decrementAndGet();
 		}
 	}
@@ -2970,10 +2991,14 @@ final class Http2DemuxRelay {
 			case FRAME_RST_STREAM -> onUpstreamReset(leg, frame, position);
 			default -> {
 				Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
-				synchronized (this.sinkLock) {
+				this.sinkLock.lock();
+				try {
 					if (trackedUnreset(leg, stream)) {
 						writeToClient(frame.bytes(), position, frameBytes, leg);
 					}
+				}
+				finally {
+					this.sinkLock.unlock();
 				}
 			}
 		}
@@ -3018,7 +3043,8 @@ final class Http2DemuxRelay {
 		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
 		boolean queued = false;
 		boolean write = false;
-		synchronized (this.sinkLock) {
+		this.sinkLock.lock();
+		try {
 			boolean direct = false;
 			this.lock.lock();
 			try {
@@ -3044,8 +3070,12 @@ final class Http2DemuxRelay {
 				this.lock.unlock();
 			}
 			if (direct) {
+				this.writeSeam.decided(this, new WriteSeam.Decision(WriteSeam.Site.RESPONSE_DATA, frame.streamId()));
 				writeToClient(frame.bytes(), position, FRAME_HEADER_LENGTH + length, leg);
 			}
+		}
+		finally {
+			this.sinkLock.unlock();
 		}
 		if (!queued) {
 			// written or dropped: released upstream
@@ -3096,10 +3126,14 @@ final class Http2DemuxRelay {
 			return;
 		}
 		awaitBlockRoom(stream, frames.length);
-		synchronized (this.sinkLock) {
+		this.sinkLock.lock();
+		try {
 			if (relayHeadLocked(stream, frames, endStream, interim)) {
 				writeToClient(frames, 0, frames.length, leg);
 			}
+		}
+		finally {
+			this.sinkLock.unlock();
 		}
 	}
 
@@ -3245,7 +3279,8 @@ final class Http2DemuxRelay {
 		try {
 			while (true) {
 				ResponseFrame next;
-				synchronized (this.sinkLock) {
+				this.sinkLock.lock();
+				try {
 					this.lock.lock();
 					try {
 						next = nextResponseFrameLocked();
@@ -3258,6 +3293,9 @@ final class Http2DemuxRelay {
 						this.lock.unlock();
 					}
 					writeToClient(next.bytes(), 0, next.bytes().length, next.leg());
+				}
+				finally {
+					this.sinkLock.unlock();
 				}
 				next.leg().queueConnectionGrant(next.window());
 			}
@@ -3397,7 +3435,8 @@ final class Http2DemuxRelay {
 		leg.streamClosed(frame.streamId());
 		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
 		int dropped = 0;
-		synchronized (this.sinkLock) {
+		this.sinkLock.lock();
+		try {
 			boolean relay = false;
 			if (stream != null && stream.leg == leg) {
 				this.lock.lock();
@@ -3416,6 +3455,9 @@ final class Http2DemuxRelay {
 			if (relay) {
 				writeToClient(frame.bytes(), position, FRAME_HEADER_LENGTH + frame.length(), leg);
 			}
+		}
+		finally {
+			this.sinkLock.unlock();
 		}
 		leg.queueConnectionGrant(dropped);
 		grantOwed();
@@ -3483,6 +3525,41 @@ final class Http2DemuxRelay {
 		catch (Exception e) {
 			// ignore
 		}
+	}
+
+	/**
+	 * Runs on the writing thread between a write's decision and the write, with the
+	 * client stream's lock held; a seam for tests to hold one side of a race there.
+	 */
+	@FunctionalInterface
+	interface WriteSeam {
+
+		/** Does nothing. */
+		WriteSeam NONE = (relay, decision) -> {
+		};
+
+		void decided(Http2DemuxRelay relay, Decision decision);
+
+		/** The write decided on: where, and the stream it writes on. */
+		record Decision(Site site, int streamId) {
+		}
+
+		/** Where a write was decided on. */
+		enum Site {
+
+			/**
+			 * The relay's own reset of the stream: marked reset, RST_STREAM not written.
+			 */
+			RESET,
+
+			/**
+			 * A response DATA frame the leg's inbound side writes as it reads it: found
+			 * relayable and charged to the client's window, not written.
+			 */
+			RESPONSE_DATA
+
+		}
+
 	}
 
 	private static int unsigned24(ByteBuffer header) {
