@@ -25,8 +25,9 @@ import org.springframework.stereotype.Component;
 /**
  * The data plane's error answers, encoded in the protocol the request arrived in
  * (HTTP/1.1, or HTTP/2 for prior knowledge and ALPN h2), after which the connection
- * closes: the 503 no-route page for a request no tunnel session can serve, and the 403
- * forbidden page for a peer address the access control excludes.
+ * closes: the 503 no-route page for a request no tunnel session can serve, the 403
+ * forbidden page for a peer address the access control excludes, and a bare HTTP/1.1 400
+ * for a malformed request.
  */
 @Component
 public class ErrorResponse {
@@ -35,6 +36,9 @@ public class ErrorResponse {
 
 	/** The minimum SETTINGS_MAX_FRAME_SIZE every HTTP/2 peer accepts (RFC 9113 4.2). */
 	private static final int MAX_FRAME_SIZE = 16_384;
+
+	private static final byte[] BAD_REQUEST = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+		.getBytes(StandardCharsets.US_ASCII);
 
 	private final Page noRoute;
 
@@ -57,6 +61,13 @@ public class ErrorResponse {
 	 */
 	public byte[] forbidden(ConnectionHeadParser.Head head) {
 		return this.render(head, this.forbidden);
+	}
+
+	/**
+	 * The HTTP/1.1 response to a malformed request, after which the connection closes.
+	 */
+	public byte[] badRequest() {
+		return BAD_REQUEST.clone();
 	}
 
 	/**

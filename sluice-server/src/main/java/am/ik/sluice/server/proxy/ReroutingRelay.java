@@ -44,8 +44,16 @@ import io.micrometer.core.instrument.MeterRegistry;
  * A request asking for an upgrade, or a CONNECT, holds the parse -- the relay reads no
  * further client bytes -- until the leg's response to it: switched (101, a 2xx to
  * CONNECT), the connection is relayed verbatim on the leg in charge from then on;
- * declined, the parse resumes with the next request. Any structure the parser cannot
- * follow is relayed verbatim too.
+ * declined, the parse resumes with the next request.
+ * <p>
+ * A malformed request -- input the parser cannot follow, see {@link Http1RequestParser}
+ * -- ends the connection at a request boundary: nothing of it or after it is relayed, the
+ * responses to the requests before it are relayed in full, and then, unless a response to
+ * the malformed request itself has begun meanwhile (its head was relayed and the upstream
+ * answered early), a {@code 400} is written. The relay then half-closes the connection
+ * and reads what the client still sends for up to {@link #LINGER} (at most
+ * {@link #LINGER_LIMIT}) before closing, so the client reads the {@code 400} rather than
+ * a reset.
  * <p>
  * Between requests the connection lives under its
  * {@link ConnectionLimits.KeepAliveDeadline}: once every response owed is relayed and
@@ -59,8 +67,9 @@ import io.micrometer.core.instrument.MeterRegistry;
  * upstream's response does not count. Bytes read from the client and written to it count
  * as progress, a write as each of its pieces of
  * {@link ConnectionLimits.KeepAliveDeadline#WRITE_PIECE} completes. An upgrade disarms
- * the deadline for good, and a response whose framing the tracker cannot follow stays
- * owed, so such a connection keeps no deadline between requests either.
+ * the deadline for good. A response whose framing the tracker cannot follow is relayed as
+ * an unframed one: it stays owed until the upstream closes the connection, which ends the
+ * relay.
  * <p>
  * TCP tells a client that half-closed from one gone entirely only on a write: the second
  * write to a gone client fails, once its stack answered the first with a reset. So once
@@ -88,6 +97,12 @@ final class ReroutingRelay {
 	 * ninth), and the upstream may send its own.
 	 */
 	private static final int MAX_PROBES = 4;
+
+	/** How long the client of a malformed request is read after the 400, at most. */
+	static final Duration LINGER = Duration.ofSeconds(2);
+
+	/** The most read from the client of a malformed request after the 400. */
+	static final long LINGER_LIMIT = 1024 * 1024;
 
 	private final DuplexPipe pipe;
 
@@ -156,6 +171,12 @@ final class ReroutingRelay {
 
 	/** Serializes the writes of the shared client stream. */
 	private final Object sinkLock = new Object();
+
+	/**
+	 * A malformed request was rejected: the legs relay nothing more to the client, and
+	 * their end leaves the client connection to the linger; set with {@link #sinkLock}.
+	 */
+	private volatile boolean rejected;
 
 	private final List<Leg> legs = new CopyOnWriteArrayList<>();
 
@@ -229,6 +250,10 @@ final class ReroutingRelay {
 			});
 			parser.feed(this.seedHead, 0, this.seedHead.length);
 			awaitUpgradeAnswers(parser);
+			if (parser.position() == Http1RequestParser.Position.MALFORMED) {
+				rejectMalformed(parser);
+				return;
+			}
 			fed(parser.position());
 			InputStream in = this.pipe.source();
 			byte[] buffer = new byte[BUFFER_SIZE];
@@ -241,6 +266,10 @@ final class ReroutingRelay {
 				}
 				parser.feed(buffer, 0, n);
 				awaitUpgradeAnswers(parser);
+				if (parser.position() == Http1RequestParser.Position.MALFORMED) {
+					rejectMalformed(parser);
+					return;
+				}
 				fed(parser.position());
 			}
 			parser.finish();
@@ -373,7 +402,8 @@ final class ReroutingRelay {
 			return true;
 		}
 		ConnectionLimits.KeepAliveDeadline.Phase phase;
-		if (this.starting || this.owed > 0 || this.position == Http1RequestParser.Position.IN_BODY) {
+		if (this.starting || this.owed > 0 || this.position == Http1RequestParser.Position.IN_BODY
+				|| this.position == Http1RequestParser.Position.MALFORMED) {
 			phase = ConnectionLimits.KeepAliveDeadline.Phase.BUSY;
 		}
 		else if (this.position == Http1RequestParser.Position.IN_HEAD) {
@@ -383,6 +413,85 @@ final class ReroutingRelay {
 			phase = ConnectionLimits.KeepAliveDeadline.Phase.IDLE;
 		}
 		return this.deadline.enter(phase);
+	}
+
+	/**
+	 * Ends the connection at a malformed request: waits until the responses to the
+	 * requests before it are relayed, writes the 400 unless a response to the malformed
+	 * request has begun, closes the legs, and lingers.
+	 */
+	private void rejectMalformed(Http1RequestParser parser) {
+		fed(Http1RequestParser.Position.MALFORMED);
+		boolean inBody = parser.malformedInBody();
+		if (!inBody) {
+			ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser
+				.http1RequestOf(parser.malformedHead());
+			this.access.request("-", request == null ? "-" : request.method(), request == null ? "-" : request.path(),
+					request == null ? "-" : request.version());
+		}
+		Leg leg = this.current;
+		// the requests before the malformed one: every one relayed, but its own head
+		int before = leg == null ? 0 : leg.awaitAnswered(inBody);
+		synchronized (this.sinkLock) {
+			this.rejected = true;
+			if (leg == null || leg.atResponseStart(before)) {
+				byte[] response = this.errorResponse.badRequest();
+				writeToClient(response, 0, response.length);
+			}
+		}
+		for (Leg each : this.legs) {
+			each.close();
+		}
+		linger();
+	}
+
+	/**
+	 * Half-closes the client connection and reads what the client still sends, for up to
+	 * {@link #LINGER} and {@link #LINGER_LIMIT}, then closes it: closing with unread
+	 * bytes would reset the connection and discard the response before the client reads
+	 * it.
+	 */
+	private void linger() {
+		try {
+			this.pipe.shutdownOutput();
+		}
+		catch (Exception e) {
+			// a transport without half-close: the client closes after the response
+		}
+		Thread closer = Thread.ofVirtual().name("sluice-reroute-linger").start(() -> {
+			try {
+				Thread.sleep(LINGER);
+				closePipe();
+			}
+			catch (InterruptedException e) {
+				// the client closed first
+			}
+		});
+		try {
+			InputStream in = this.pipe.source();
+			byte[] buffer = new byte[BUFFER_SIZE];
+			long drained = 0;
+			int n;
+			while (drained < LINGER_LIMIT && (n = in.read(buffer)) > 0) {
+				drained += n;
+			}
+		}
+		catch (IOException e) {
+			// closed by the linger's end or the client
+		}
+		finally {
+			closer.interrupt();
+			closePipe();
+		}
+	}
+
+	private void closePipe() {
+		try {
+			this.pipe.close();
+		}
+		catch (Exception e) {
+			// ignore
+		}
 	}
 
 	private void onRequestHead(byte[] head, @Nullable String host) {
@@ -648,6 +757,37 @@ final class ReroutingRelay {
 			}
 		}
 
+		/**
+		 * Waits until the leg relayed the responses to the requests before a malformed
+		 * one, or ended; returns how many requests those are: every request relayed, but
+		 * the last one when the malformed request's head was relayed ({@code inBody}).
+		 */
+		int awaitAnswered(boolean inBody) {
+			synchronized (this) {
+				int before = inBody ? this.sent - 1 : this.sent;
+				while (!this.ended && this.completed < before) {
+					try {
+						this.wait(1000);
+					}
+					catch (InterruptedException e) {
+						Thread.currentThread().interrupt();
+						break;
+					}
+				}
+				return before;
+			}
+		}
+
+		/**
+		 * Whether exactly {@code before} responses completed and nothing of the next one
+		 * was relayed, the leg not ended. With the sink lock held.
+		 */
+		boolean atResponseStart(int before) {
+			synchronized (this) {
+				return !this.ended && this.completed == before && this.tracker.atResponseStart();
+			}
+		}
+
 		/** Reports the answer to the upgrade awaited, if one is. */
 		void upgradeAnswered(boolean switched) {
 			synchronized (this) {
@@ -728,6 +868,9 @@ final class ReroutingRelay {
 			int n;
 			while ((n = in.read(buffer)) > 0) {
 				synchronized (this.sinkLock) {
+					if (this.rejected) {
+						return; // a malformed request ended the connection
+					}
 					// written and tracked at once: a probe sees the tracker's state of
 					// the bytes written
 					this.writeToClient(buffer, 0, n);
@@ -740,13 +883,15 @@ final class ReroutingRelay {
 			synchronized (this.sinkLock) {
 				tracker.ended();
 			}
-			if (this.current == leg && !leg.replaced) {
+			if (this.current == leg && !leg.replaced && !this.rejected) {
 				// the upstream of the leg in charge is gone; the client reconnects
 				abort();
 			}
 		}
 		catch (Exception e) {
-			abort();
+			if (!this.rejected) {
+				abort();
+			}
 		}
 		finally {
 			leg.markEnded();
@@ -797,8 +942,12 @@ final class ReroutingRelay {
 	 * Tracks the response framing of one leg to mark its conversation drained: a response
 	 * is complete at the end of its body (Content-Length or last chunk), at its head when
 	 * it has no body (a response to HEAD, 204, 304), at the end of an unframed body, or
-	 * when it switches to a tunneled mode (101, a 2xx to CONNECT); anything unrecognized
-	 * drains too and ends the tracking. Exactly one completion is counted per response.
+	 * when it switches to a tunneled mode (101, a 2xx to CONNECT). Heads are read as
+	 * ISO-8859-1. A response the tracker cannot follow -- a head over 64KiB or without a
+	 * status code, an invalid Content-Length or chunk-size line, a chunk-size or trailer
+	 * line over 64KiB -- is taken as unframed: it ends when the upstream closes, and a
+	 * request awaiting an upgrade's answer is relayed verbatim. Exactly one completion is
+	 * counted per response.
 	 */
 	private final class ResponseTracker {
 
@@ -830,7 +979,11 @@ final class ReroutingRelay {
 						this.head.write(bytes[offset + i]);
 						boolean lineEnded = bytes[offset + i] == '\n';
 						i++;
-						if (lineEnded) {
+						if (this.head.size() > Http1RequestParser.MAX_HEAD) {
+							this.head.reset();
+							this.untracked();
+						}
+						else if (lineEnded) {
 							this.onHeadByte();
 						}
 					}
@@ -846,7 +999,11 @@ final class ReroutingRelay {
 						this.line.write(bytes[offset + i]);
 						boolean lineEnded = bytes[offset + i] == '\n';
 						i++;
-						if (lineEnded) {
+						if (this.line.size() > Http1RequestParser.MAX_HEAD) {
+							this.line.reset();
+							this.untracked();
+						}
+						else if (lineEnded) {
 							this.onChunkSize();
 						}
 					}
@@ -869,7 +1026,11 @@ final class ReroutingRelay {
 						this.line.write(bytes[offset + i]);
 						boolean lineEnded = bytes[offset + i] == '\n';
 						i++;
-						if (lineEnded && this.onTrailerLine()) {
+						if (this.line.size() > Http1RequestParser.MAX_HEAD) {
+							this.line.reset();
+							this.untracked();
+						}
+						else if (lineEnded && this.onTrailerLine()) {
 							this.drain(Mode.HEAD);
 						}
 					}
@@ -902,21 +1063,14 @@ final class ReroutingRelay {
 			byte[] bytes = this.head.toByteArray();
 			int end = ConnectionHeadParser.headerEnd(bytes);
 			if (end < 0) {
-				if (bytes.length > 64 * 1024 || !ConnectionHeadRewriter.isAscii(bytes)) {
-					this.drain(Mode.PASS);
-				}
 				return;
 			}
 			this.head.reset();
 			// a response head, interim or final: no 100 Continue is awaited any more
 			ReroutingRelay.this.continueAwaited = false;
-			if (!ConnectionHeadRewriter.isAscii(bytes)) {
-				this.drain(Mode.PASS);
-				return;
-			}
 			int status = statusOf(bytes);
 			if (status < 0) {
-				this.drain(Mode.PASS);
+				this.untracked();
 				return;
 			}
 			if (status >= 100 && status < 200 && status != 101) {
@@ -949,12 +1103,12 @@ final class ReroutingRelay {
 						this.mode = Mode.BODY;
 					}
 					else {
-						this.drain(Mode.PASS);
+						this.untracked();
 					}
 					return;
 				}
 				catch (NumberFormatException e) {
-					this.drain(Mode.PASS);
+					this.untracked();
 					return;
 				}
 			}
@@ -969,7 +1123,7 @@ final class ReroutingRelay {
 		private void onChunkSize() {
 			byte[] line = this.line.toByteArray();
 			this.line.reset();
-			String text = new String(line, StandardCharsets.US_ASCII);
+			String text = new String(line, StandardCharsets.ISO_8859_1);
 			if (text.endsWith("\r\n")) {
 				text = text.substring(0, text.length() - 2);
 			}
@@ -983,7 +1137,7 @@ final class ReroutingRelay {
 				size = -1;
 			}
 			if (size < 0) {
-				this.drain(Mode.PASS);
+				this.untracked();
 			}
 			else if (size == 0) {
 				this.mode = Mode.TRAILERS;
@@ -1000,6 +1154,15 @@ final class ReroutingRelay {
 			return line.length == 2 && line[0] == '\r' && line[1] == '\n';
 		}
 
+		/**
+		 * Takes the response in progress as unframed: it ends when the upstream closes;
+		 * an upgrade awaited is relayed verbatim.
+		 */
+		private void untracked() {
+			this.mode = Mode.UNFRAMED;
+			this.leg.upgradeAnswered(true);
+		}
+
 		private void drain(Mode next) {
 			this.mode = next;
 			if (next == Mode.PASS) {
@@ -1010,7 +1173,7 @@ final class ReroutingRelay {
 		}
 
 		private static int statusOf(byte[] head) {
-			String text = new String(head, StandardCharsets.US_ASCII);
+			String text = new String(head, StandardCharsets.ISO_8859_1);
 			int eol = text.indexOf("\r\n");
 			String line = eol < 0 ? text : text.substring(0, eol);
 			String[] parts = line.trim().split(" ");

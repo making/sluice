@@ -25,6 +25,16 @@ class ConnectionHeadRewriterTest {
 	}
 
 	@Test
+	void obsTextInAnotherFieldValueIsReproducedByteForByte() {
+		byte[] head = "GET /\u00e9 HTTP/1.1\r\nX-Name: \u00e9\u307b\r\nHost: demo.local\r\n\r\nbody"
+			.getBytes(StandardCharsets.UTF_8);
+		byte[] rewritten = ConnectionHeadRewriter.rewriteHttp1(head, AUTHORITY);
+		assertThat(rewritten)
+			.isEqualTo(("GET /\u00e9 HTTP/1.1\r\nX-Name: \u00e9\u307b\r\nHost: " + AUTHORITY + "\r\n\r\nbody")
+				.getBytes(StandardCharsets.UTF_8));
+	}
+
+	@Test
 	void http1HeadWithoutHostIsReturnedVerbatim() {
 		byte[] head = "GET / HTTP/1.1\r\nX-Any: 1\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
 		assertThat(ConnectionHeadRewriter.rewriteHttp1(head, AUTHORITY)).isEqualTo(head);

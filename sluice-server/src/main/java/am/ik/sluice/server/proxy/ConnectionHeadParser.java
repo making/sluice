@@ -171,7 +171,7 @@ public final class ConnectionHeadParser {
 	 * request-line.
 	 */
 	static Head.@Nullable Request http1RequestOf(byte[] head) {
-		String text = new String(head, StandardCharsets.US_ASCII);
+		String text = new String(head, StandardCharsets.ISO_8859_1);
 		int eol = text.indexOf("\r\n");
 		String line = eol < 0 ? text : text.substring(0, eol);
 		String[] parts = line.split(" ");
@@ -194,7 +194,7 @@ public final class ConnectionHeadParser {
 	 * head; {@code null} when absent or blank.
 	 */
 	static @Nullable String http1HeaderOf(byte[] head, String name) {
-		String text = new String(head, StandardCharsets.US_ASCII);
+		String text = new String(head, StandardCharsets.ISO_8859_1);
 		String[] lines = text.split("\r\n");
 		for (int i = 1; i < lines.length; i++) {
 			int colon = lines[i].indexOf(':');

@@ -330,6 +330,10 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	 */
 	private boolean relay(Connection conn, AccessLogger.Connection access, ConnectionLimits.KeepAliveDeadline deadline,
 			Runnable release) {
+		if (malformedHttp1(conn.head())) {
+			this.reject(conn, this.errorResponse.badRequest());
+			return false;
+		}
 		Optional<Router.Route> route = this.router.lookup(conn.head().host());
 		InetAddress peer = conn.peer() != null ? conn.peer() : peerOf(conn.socket());
 		// a trusted proxy's forwarded-for entry replaces the peer as the judged address
@@ -402,6 +406,19 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			throw e;
 		}
 		return true;
+	}
+
+	/**
+	 * Whether the head is an HTTP/1.1 request whose request line is malformed: a Host
+	 * header, yet no request line -- neither an h2 preface, a RESP array nor TLS
+	 * passthrough, which are routed without one. Answered 400 rather than relayed
+	 * verbatim, as the rerouting relay answers a malformed request.
+	 */
+	private static boolean malformedHttp1(ConnectionHeadParser.Head head) {
+		byte[] bytes = head.bytes();
+		return head.request() == null && !head.encrypted() && bytes.length > 0
+				&& bytes[0] != ConnectionHeadParser.RESP_ARRAY && !ConnectionHeadParser.isHttp2(bytes)
+				&& ConnectionHeadParser.http1HostOf(bytes) != null;
 	}
 
 	/**

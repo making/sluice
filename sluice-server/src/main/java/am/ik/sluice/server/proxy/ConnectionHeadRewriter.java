@@ -4,10 +4,11 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * Rewrites the HTTP/1.1 {@code Host} header line of a request head so the request reaches
- * the upstream with the target's authority. Rewriting is best-effort; any head the
- * rewriter cannot reproduce (non ASCII bytes, missing Host header) is returned verbatim.
- * On relayed plaintext connections the rerouting relay rewrites every head; the HTTP/2
- * demultiplexing relay re-encodes every request HEADERS block likewise.
+ * the upstream with the target's authority. The head is read as ISO-8859-1, so every
+ * other byte -- obs-text in a field value included -- is reproduced as is; a head without
+ * a Host header is returned verbatim. On relayed plaintext connections the rerouting
+ * relay rewrites every head; the HTTP/2 demultiplexing relay re-encodes every request
+ * HEADERS block likewise.
  */
 final class ConnectionHeadRewriter {
 
@@ -26,11 +27,7 @@ final class ConnectionHeadRewriter {
 		if (headerEnd < 0) {
 			headerEnd = head.length;
 		}
-		byte[] header = java.util.Arrays.copyOfRange(head, 0, headerEnd);
-		if (!isAscii(header)) {
-			return head;
-		}
-		String[] lines = new String(header, StandardCharsets.US_ASCII).split("\r\n", -1);
+		String[] lines = new String(head, 0, headerEnd, StandardCharsets.ISO_8859_1).split("\r\n", -1);
 		boolean replaced = false;
 		for (int i = 1; i < lines.length - 1; i++) {
 			int colon = lines[i].indexOf(':');
@@ -45,20 +42,11 @@ final class ConnectionHeadRewriter {
 		if (!replaced) {
 			return head;
 		}
-		byte[] rewrittenHeader = String.join("\r\n", lines).getBytes(StandardCharsets.US_ASCII);
+		byte[] rewrittenHeader = String.join("\r\n", lines).getBytes(StandardCharsets.ISO_8859_1);
 		byte[] rewritten = new byte[rewrittenHeader.length + head.length - headerEnd];
 		System.arraycopy(rewrittenHeader, 0, rewritten, 0, rewrittenHeader.length);
 		System.arraycopy(head, headerEnd, rewritten, rewrittenHeader.length, head.length - headerEnd);
 		return rewritten;
-	}
-
-	static boolean isAscii(byte[] bytes) {
-		for (byte b : bytes) {
-			if (b < 0) {
-				return false;
-			}
-		}
-		return true;
 	}
 
 }

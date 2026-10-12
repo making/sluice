@@ -536,10 +536,10 @@ and nothing of a next request has arrived (a next request head left incomplete i
 by `head-timeout`), h2 once no stream is open (with a GOAWAY `NO_ERROR`; PINGs do not count
 as activity). A response or h2 stream taking longer than the timeout is not cut, nor is an
 upgraded connection (WebSocket; a connection whose upgrade the upstream declines stays
-HTTP). Connections relayed verbatim (TLS passthrough, tcp routes, HTTP/1.1 input the
-parser cannot follow) keep no idle deadline. Behind a front end that reuses its
-connections to the data plane, set the timeout above the front end's idle timeout, so the
-front end closes an idle connection before sluice does. Connections closed so count as
+HTTP). Connections relayed verbatim (TLS passthrough, tcp routes) keep no idle deadline.
+Behind a front end that reuses its connections to the data plane, set the timeout above
+the front end's idle timeout, so the front end closes an idle connection before sluice
+does. Connections closed so count as
 `sluice.data.connections.idle.closed`.
 
 While a request or response is in flight on such a connection, `sluice.limits.stall-timeout`
@@ -561,8 +561,27 @@ reads slowly with a full receive buffer may reopen its window late
 (`StallTimeoutSlowReaderE2ETest` tells what was observed on macOS), so keep the timeout well
 above such gaps. A client streaming small h2 messages (a gRPC client stream) slower than the
 minimum is cut too: set `stall-min-bytes=1B` to count every byte, or raise the timeout.
-Connections relayed verbatim (TLS passthrough, tcp routes, upgraded connections, HTTP/1.1
-input the parser cannot follow) keep no stall timeout.
+Connections relayed verbatim (TLS passthrough, tcp routes, upgraded connections) keep no
+stall timeout.
+
+The plaintext and TLS-terminated HTTP/1.1 relay reads request and response heads as
+ISO-8859-1, so a field value carrying non-ASCII bytes (a UTF-8 header value, RFC 9110
+obs-text) is routed, rewritten and tracked like any other, its bytes relayed as is. A
+request it cannot follow is malformed: a head over 64KiB, a line not ended by CRLF, a bare
+CR, a NUL, a malformed request line, a field line folded, whose name is not a token
+(whitespace before the colon included) or whose value holds a control character other
+than HTAB, more than one `Host`, a `Content-Length` that
+is not one decimal number, a `Transfer-Encoding` whose final coding is not `chunked` or that
+comes with a `Content-Length`, and a chunk-size line, chunk terminator or trailer section
+out of the chunked syntax. Since the upstream might frame such bytes differently (request
+smuggling), nothing of the malformed request or after it is relayed: once the responses to
+the requests before it are relayed, the client gets `400 Bad Request` -- unless the
+upstream already began answering the malformed request on its head -- and the connection is
+closed, after reading what the client still sends for up to 2s, so the 400 is not lost to
+a reset. A first request head with a `Host` header but no valid request line is
+answered 400 too. A response whose framing the relay cannot follow (a head over 64KiB or
+without a status code, an invalid `Content-Length` or chunk-size line) is relayed as an
+unframed one: it ends, and the connection with it, when the upstream closes.
 
 A client's FIN does not tell whether it half-closed or left: HTTP/1.1 lets a half-closed
 client still wait for its response (RFC 9112 9.6), and only a write fails on a client gone.
@@ -745,7 +764,7 @@ docker run sluice-client --sluice.server-url=grpc://host.docker.internal:8001 \
 
 ## Constraints and notes
 
-- The data plane relays raw bytes. With `rewrite-host=true` the authority (`Host` / `:authority`) is rewritten on every request of the connection by a best-effort stream rewriter (both HTTP/1.1 and h2): upgraded connections (WebSocket, h2c upgrade, CONNECT) are rewritten up to the protocol switch, and any head or frame the rewriter cannot reproduce (non ASCII headers, HPACK failures) degrades that connection to verbatim passthrough.
+- The data plane relays raw bytes. With `rewrite-host=true` the authority (`Host` / `:authority`) is rewritten on every request of the connection by a best-effort stream rewriter (both HTTP/1.1 and h2): upgraded connections (WebSocket, h2c upgrade, CONNECT) are rewritten up to the protocol switch; an HTTP/1.1 head keeps every other byte (non-ASCII field values included), and any h2 frame the rewriter cannot reproduce (HPACK failures) degrades that connection to verbatim passthrough.
 - h2 specific: the rewriter assumes the upstream negotiates the spec-default frame and HPACK limits (16 KiB max frame size, 4096 header table size, 64 KiB header list) and does not track tighter upstream SETTINGS values.
 - h2 flow control (plaintext and TLS-terminated h2): request DATA towards an upstream stays within the upstream's stream and connection windows (its SETTINGS, mid-stream changes included, and its WINDOW_UPDATEs); a stream without window does not hold back the other streams to that upstream. A client that half-closes its TCP connection after its requests still gets the responses, within the windows it granted before (it can grant no more): each upstream connection is half-closed only once its responses ended. On the response path the relay honors the client's connection window: response DATA of every upstream stays within it, the streams taking turns, while the client's stream windows bind each upstream (its settings and stream window updates are relayed). An upstream whose data waits for the client's window is held back by its own connection window, and its connection keeps being read (pings, window updates, the heads of other streams), except past one header block of trailers waiting behind data. A client WINDOW_UPDATE taking the connection window past 2^31-1 ends the connection with GOAWAY `FLOW_CONTROL_ERROR`; an upstream sending past the window the relay granted it ends the relay. A client WINDOW_UPDATE of a length other than 4 ends the connection with GOAWAY `FRAME_SIZE_ERROR`, one with an increment of 0 with GOAWAY `PROTOCOL_ERROR` on stream 0 and resets its stream with `PROTOCOL_ERROR` (`CANCEL` to the upstream) otherwise; the same from an upstream ends the relay. A client that never grants window holds the waiting data, and the leg, with no deadline.
 - h2 framing limits (plaintext and TLS-terminated h2): the relay announces neither a larger frame size nor a larger header list to either side, so a client frame above 16KiB ends the connection with GOAWAY `FRAME_SIZE_ERROR`, a client header block above 64KiB (HEADERS plus its CONTINUATIONs) with GOAWAY `ENHANCE_YOUR_CALM`, and the same from an upstream (or interleaved header blocks) ends the relay. The client's `SETTINGS_MAX_FRAME_SIZE` is not relayed to the upstreams.
