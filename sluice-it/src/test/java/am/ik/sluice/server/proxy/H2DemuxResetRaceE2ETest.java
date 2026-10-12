@@ -1,5 +1,6 @@
 package am.ik.sluice.server.proxy;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -12,10 +13,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
@@ -61,6 +64,11 @@ class H2DemuxResetRaceE2ETest {
 	private static final int STREAM = 1;
 
 	private static final int PROTOCOL_ERROR = 0x1;
+
+	private static final int CANCEL = 0x8;
+
+	/** The stream window the relay extends a stream by once its head is written. */
+	private static final int HEAD_GRANT = Http2DemuxRelay.STREAM_BUDGET - H2TestClient.INITIAL_WINDOW;
 
 	private static final AtomicLong PINGS = new AtomicLong();
 
@@ -138,15 +146,15 @@ class H2DemuxResetRaceE2ETest {
 			Http2DemuxRelay relay = held.awaitDecided();
 			assertThat(types(client.frames(STREAM))).as("decided before the frame was written")
 				.containsExactly(TestH2.HEADERS);
-			assertThat(relay.sinkAwaited()).as("no other write waits for the client yet").isFalse();
+			assertThat(relay.sinkWaiters()).as("no other write waits for the client yet").isZero();
 			client.frame(TestH2.WINDOW_UPDATE, 0, STREAM, TestH2.int32(0));
 			// the outbound parse read the window update: it waits for the client stream
 			// behind the held frame, or it wrote its RST_STREAM past the frame
 			Awaitility.await()
 				.atMost(Duration.ofSeconds(5))
 				.pollInterval(Duration.ofMillis(1))
-				.until(() -> relay.sinkAwaited() || client.reset(STREAM) != null);
-			boolean waited = relay.sinkAwaited();
+				.until(() -> relay.sinkWaiters() > 0 || client.reset(STREAM) != null);
+			boolean waited = relay.sinkWaiters() > 0;
 			held.proceed();
 			assertThat(client.awaitTrue(() -> client.reset(STREAM) != null, Duration.ofSeconds(5))).isTrue();
 			assertThat(script.fenced.await(5, TimeUnit.SECONDS)).as("the inbound side wrote the frame").isTrue();
@@ -179,15 +187,15 @@ class H2DemuxResetRaceE2ETest {
 			client.frame(TestH2.WINDOW_UPDATE, 0, STREAM, TestH2.int32(0));
 			Http2DemuxRelay relay = held.awaitDecided();
 			assertThat(client.reset(STREAM)).as("decided before the RST_STREAM was written").isNull();
-			assertThat(relay.sinkAwaited()).as("no other write waits for the client yet").isFalse();
+			assertThat(relay.sinkWaiters()).as("no other write waits for the client yet").isZero();
 			script.sendData.countDown();
 			// the inbound side read the frame: it waits for the client stream behind the
 			// held reset, or it is past the frame (the PING behind it was acked)
 			Awaitility.await()
 				.atMost(Duration.ofSeconds(5))
 				.pollInterval(Duration.ofMillis(1))
-				.until(() -> relay.sinkAwaited() || script.fenced.getCount() == 0);
-			boolean waited = relay.sinkAwaited();
+				.until(() -> relay.sinkWaiters() > 0 || script.fenced.getCount() == 0);
+			boolean waited = relay.sinkWaiters() > 0;
 			held.proceed();
 			assertThat(script.fenced.await(5, TimeUnit.SECONDS)).as("the inbound side read past the frame").isTrue();
 			// whatever the relay wrote before acking the upstream's PING reached the
@@ -199,6 +207,148 @@ class H2DemuxResetRaceE2ETest {
 			assertThat(client.reset(STREAM)).isEqualTo(PROTOCOL_ERROR);
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 		}
+	}
+
+	/**
+	 * The leg writer wrote the stream's head and is held before writing the stream window
+	 * grant it computed when the client's WINDOW_UPDATE resets the stream: the reset
+	 * waits for the client stream behind the held grant, and the client reads the grant,
+	 * then the RST_STREAM.
+	 */
+	@Test
+	void aStreamGrantHeldPastItsCheckIsWrittenBeforeTheReset() throws Exception {
+		String route = "race.drain-grant.test";
+		GrantScript script = grantScript(route, false);
+		HeldWrite held = hold(Http2DemuxRelay.WriteSeam.Site.DRAIN_GRANT);
+		try (H2TestClient client = H2TestClient.connect(dataPort, STREAM)) {
+			client.headers(STREAM, false, post(route));
+			Http2DemuxRelay relay = held.awaitDecided();
+			assertThat(client.frames(STREAM)).as("decided before the grant was written").isEmpty();
+			assertThat(relay.sinkWaiters()).as("no other write waits for the client yet").isZero();
+			client.frame(TestH2.WINDOW_UPDATE, 0, STREAM, TestH2.int32(0));
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.pollInterval(Duration.ofMillis(1))
+				.until(() -> relay.sinkWaiters() > 0 || client.reset(STREAM) != null);
+			boolean waited = relay.sinkWaiters() > 0;
+			held.proceed();
+			// the leg writer writes the reset's CANCEL to the upstream after the grant
+			assertThat(script.cancelled.await(5, TimeUnit.SECONDS)).as("the upstream read the CANCEL").isTrue();
+			awaitPingAck(client);
+			assertThat(client.frames(STREAM)).extracting(TestH2.Frame::type)
+				.as("the grant, then the reset")
+				.containsExactly(TestH2.WINDOW_UPDATE, TestH2.RST_STREAM);
+			assertThat(client.streamGranted(STREAM)).isEqualTo(HEAD_GRANT);
+			assertThat(waited).as("the reset waited behind the held grant").isTrue();
+			assertThat(client.reset(STREAM)).isEqualTo(PROTOCOL_ERROR);
+		}
+	}
+
+	/**
+	 * A stream window grant the leg writer computed as it drained the stream's DATA waits
+	 * for the client stream behind the reset of the stream, itself waiting behind a write
+	 * held on another route's stream: once the held write goes on, the RST_STREAM is
+	 * written and the grant dropped -- no WINDOW_UPDATE follows the reset (RFC 9113 5.1).
+	 */
+	@Test
+	void aStreamGrantWaitingBehindTheResetIsDropped() throws Exception {
+		String route = "race.grant-dropped.test";
+		String otherRoute = "race.grant-holder.test";
+		int other = STREAM + 2;
+		GrantScript script = grantScript(route, true);
+		grantScript(otherRoute, false);
+		HeldWrite held = HeldWrite.install(dataProxyServer(),
+				new Http2DemuxRelay.WriteSeam.Decision(Http2DemuxRelay.WriteSeam.Site.DRAIN_GRANT, other));
+		this.held.add(held);
+		try (H2TestClient client = H2TestClient.connect(dataPort, STREAM)) {
+			client.headers(STREAM, false, post(route));
+			// the response head follows the upstream's SETTINGS: its window of 0 applied
+			assertThat(client.awaitTrue(() -> types(client.frames(STREAM)).equals(List.of(TestH2.HEADERS))
+					&& client.streamGranted(STREAM) == HEAD_GRANT, Duration.ofSeconds(5)))
+				.as("the response head and the grant for the written head arrived")
+				.isTrue();
+			long granted = client.connectionGranted();
+			client.sendData(STREAM, new byte[1000], 0);
+			assertThat(client.awaitTrue(() -> client.connectionGranted() >= granted + 1000, Duration.ofSeconds(5)))
+				.as("the outbound parse is done with the DATA")
+				.isTrue();
+			assertThat(script.dataReceived.get()).as("the DATA waits for the upstream's window").isZero();
+			client.headers(other, false, post(otherRoute));
+			Http2DemuxRelay relay = held.awaitDecided();
+			client.frame(TestH2.WINDOW_UPDATE, 0, STREAM, TestH2.int32(0));
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> relay.sinkWaiters() == 1);
+			// the upstream opens its window: the leg writer drains the DATA, computes the
+			// grant, and waits for the client stream behind the reset
+			script.send(TestH2.WINDOW_UPDATE, 0, STREAM, TestH2.int32(1000));
+			assertThat(script.awaitData(1000)).as("the DATA drained").isTrue();
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> relay.sinkWaiters() == 2);
+			List<TestH2.Frame> before = client.frames(STREAM);
+			assertThat(client.reset(STREAM)).as("the reset waits too").isNull();
+			held.proceed();
+			assertThat(script.cancelled.await(5, TimeUnit.SECONDS)).as("the upstream read the CANCEL").isTrue();
+			awaitPingAck(client);
+			List<TestH2.Frame> frames = client.frames(STREAM);
+			assertThat(frames.subList(before.size(), frames.size())).extracting(TestH2.Frame::type)
+				.as("the reset, no grant after it")
+				.containsExactly(TestH2.RST_STREAM);
+			assertThat(client.streamGranted(STREAM)).as("the drain's grant dropped").isEqualTo(HEAD_GRANT);
+			assertThat(client.reset(STREAM)).isEqualTo(PROTOCOL_ERROR);
+		}
+	}
+
+	/**
+	 * The outbound parse computed the stream window grant of the padding of a client DATA
+	 * frame and is held before writing it when the upstream resets the stream: the
+	 * relayed reset waits for the client stream behind the held grant, and the client
+	 * reads the grant, then the RST_STREAM. The upstream's window of 0 keeps the leg
+	 * writer from draining the DATA, and granting.
+	 */
+	@Test
+	void aStreamGrantHeldPastItsCheckIsWrittenBeforeAnUpstreamReset() throws Exception {
+		String route = "race.data-grant.test";
+		GrantScript script = grantScript(route, true);
+		HeldWrite held = hold(Http2DemuxRelay.WriteSeam.Site.DATA_GRANT);
+		try (H2TestClient client = H2TestClient.connect(dataPort, STREAM)) {
+			client.headers(STREAM, false, post(route));
+			// the response head follows the upstream's SETTINGS: its window of 0 applied
+			assertThat(client.awaitTrue(() -> types(client.frames(STREAM)).equals(List.of(TestH2.HEADERS))
+					&& client.streamGranted(STREAM) == HEAD_GRANT, Duration.ofSeconds(5)))
+				.as("the response head and the grant for the written head arrived")
+				.isTrue();
+			int padding = 100;
+			byte[] padded = new byte[1 + 10 + padding];
+			padded[0] = (byte) padding;
+			client.sendData(STREAM, padded, TestH2.FLAG_PADDED);
+			Http2DemuxRelay relay = held.awaitDecided();
+			List<TestH2.Frame> before = client.frames(STREAM);
+			assertThat(relay.sinkWaiters()).as("no other write waits for the client yet").isZero();
+			script.send(TestH2.RST_STREAM, 0, STREAM, TestH2.int32(CANCEL));
+			script.send(TestH2.PING, 0, 0, GrantScript.FENCE);
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.pollInterval(Duration.ofMillis(1))
+				.until(() -> relay.sinkWaiters() > 0 || client.reset(STREAM) != null);
+			boolean waited = relay.sinkWaiters() > 0;
+			held.proceed();
+			assertThat(script.fenced.await(5, TimeUnit.SECONDS)).as("the inbound side read past the reset").isTrue();
+			awaitPingAck(client);
+			List<TestH2.Frame> frames = client.frames(STREAM);
+			assertThat(frames.subList(before.size(), frames.size())).extracting(TestH2.Frame::type)
+				.as("the grant, then the reset")
+				.containsExactly(TestH2.WINDOW_UPDATE, TestH2.RST_STREAM);
+			assertThat(client.streamGranted(STREAM)).as("the padding given back").isEqualTo(HEAD_GRANT + 1 + padding);
+			assertThat(waited).as("the reset waited behind the held grant").isTrue();
+			assertThat(client.reset(STREAM)).isEqualTo(CANCEL);
+			assertThat(script.dataReceived.get()).as("the DATA never drained").isZero();
+		}
+	}
+
+	/** Starts a grant-scripted upstream for the route. */
+	private GrantScript grantScript(String route, boolean respond) {
+		GrantScript script = new GrantScript(respond);
+		this.releases.add(script.leave);
+		startClient(route, stub(script::serve));
+		return script;
 	}
 
 	/** Starts a scripted upstream for the route. */
@@ -268,6 +418,106 @@ class H2DemuxResetRaceE2ETest {
 				while ((frame = TestH2.readFrame(in)) != null) {
 					if (frame.type() == TestH2.HEADERS && frame.streamId() == STREAM) {
 						this.head.countDown();
+					}
+					else if (frame.type() == TestH2.PING && (frame.flags() & TestH2.FLAG_ACK) != 0
+							&& Arrays.equals(frame.payload(), FENCE)) {
+						this.fenced.countDown();
+					}
+				}
+			}
+			catch (IOException e) {
+				// connection ended
+			}
+		}
+
+	}
+
+	/**
+	 * An upstream announcing a stream window of 0, reading everything, and answering the
+	 * head of {@link #STREAM} with a response head when told to; it writes what the test
+	 * {@link #send sends}, and leaves once {@link #leave} opens. {@link #cancelled} opens
+	 * on the relay's RST_STREAM of {@link #STREAM}, {@link #fenced} on the ack of a PING
+	 * carrying {@link #FENCE}.
+	 */
+	private static final class GrantScript {
+
+		static final byte[] FENCE = "fence-02".getBytes(StandardCharsets.US_ASCII);
+
+		/** SETTINGS_INITIAL_WINDOW_SIZE of 0. */
+		private static final byte[] ZERO_WINDOW = { 0, 0x4, 0, 0, 0, 0 };
+
+		private final boolean respond;
+
+		private final BlockingQueue<byte[]> writes = new LinkedBlockingQueue<>();
+
+		private final AtomicLong dataReceived = new AtomicLong();
+
+		private final CountDownLatch cancelled = new CountDownLatch(1);
+
+		private final CountDownLatch fenced = new CountDownLatch(1);
+
+		private final CountDownLatch leave = new CountDownLatch(1);
+
+		GrantScript(boolean respond) {
+			this.respond = respond;
+		}
+
+		/** Has the upstream write the frame. */
+		void send(int type, int flags, int streamId, byte[] payload) throws IOException {
+			ByteArrayOutputStream frame = new ByteArrayOutputStream();
+			TestH2.writeFrame(frame, type, flags, streamId, payload);
+			this.writes.add(frame.toByteArray());
+		}
+
+		/** Waits until the upstream received the DATA payload bytes. */
+		boolean awaitData(long bytes) throws InterruptedException {
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+			while (this.dataReceived.get() < bytes) {
+				if (System.nanoTime() > deadline) {
+					return false;
+				}
+				Thread.sleep(1);
+			}
+			return true;
+		}
+
+		void serve(Socket socket) {
+			try (socket) {
+				InputStream in = socket.getInputStream();
+				OutputStream out = socket.getOutputStream();
+				if (in.readNBytes(TestH2.PREFACE.length).length < TestH2.PREFACE.length) {
+					return;
+				}
+				TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, ZERO_WINDOW);
+				Thread.ofVirtual().name("e2e-race-h2-reader").start(() -> read(in));
+				while (this.leave.getCount() > 0) {
+					byte[] bytes = this.writes.poll(10, TimeUnit.MILLISECONDS);
+					if (bytes != null) {
+						out.write(bytes);
+						out.flush();
+					}
+				}
+			}
+			catch (IOException e) {
+				// connection ended
+			}
+			catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+		}
+
+		private void read(InputStream in) {
+			try {
+				TestH2.@Nullable Frame frame;
+				while ((frame = TestH2.readFrame(in)) != null) {
+					if (frame.type() == TestH2.HEADERS && frame.streamId() == STREAM && this.respond) {
+						send(TestH2.HEADERS, TestH2.FLAG_END_HEADERS, STREAM, new byte[] { (byte) 0x88 });
+					}
+					else if (frame.type() == TestH2.DATA) {
+						this.dataReceived.addAndGet(frame.payload().length);
+					}
+					else if (frame.type() == TestH2.RST_STREAM && frame.streamId() == STREAM) {
+						this.cancelled.countDown();
 					}
 					else if (frame.type() == TestH2.PING && (frame.flags() & TestH2.FLAG_ACK) != 0
 							&& Arrays.equals(frame.payload(), FENCE)) {

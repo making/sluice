@@ -522,9 +522,9 @@ final class Http2DemuxRelay {
 		Thread.ofVirtual().name("sluice-h2demux-out").start(this::pumpOutbound);
 	}
 
-	/** Whether a thread waits to write to the client; for tests. */
-	boolean sinkAwaited() {
-		return this.sinkLock.hasQueuedThreads();
+	/** The threads waiting to write to the client; for tests. */
+	int sinkWaiters() {
+		return this.sinkLock.getQueueLength();
 	}
 
 	/** Whether the relay ended; for tests. */
@@ -742,7 +742,7 @@ final class Http2DemuxRelay {
 			return;
 		}
 		grantClient(connectionGrant);
-		grantStream(stream.id, release);
+		grantStream(stream, release, WriteSeam.Site.DATA_GRANT);
 		checkQueueBound();
 	}
 
@@ -864,9 +864,33 @@ final class Http2DemuxRelay {
 		return (int) room;
 	}
 
-	private void grantStream(int streamId, int increment) {
-		if (increment > 0) {
-			writeToClient(windowUpdate(streamId, increment));
+	/**
+	 * Grants the client stream window unless the stream was reset by either side since
+	 * the grant was computed: checked and written under the sink lock, under which the
+	 * resets are marked and written, so no WINDOW_UPDATE follows the stream's RST_STREAM
+	 * (RFC 9113 5.1: a closed stream takes no frame but PRIORITY).
+	 */
+	private void grantStream(Stream stream, int increment, WriteSeam.Site site) {
+		if (increment <= 0) {
+			return;
+		}
+		this.sinkLock.lock();
+		try {
+			boolean reset;
+			this.lock.lock();
+			try {
+				reset = stream.reset;
+			}
+			finally {
+				this.lock.unlock();
+			}
+			if (!reset) {
+				this.writeSeam.decided(this, new WriteSeam.Decision(site, stream.id));
+				writeToClient(windowUpdate(stream.id, increment));
+			}
+		}
+		finally {
+			this.sinkLock.unlock();
 		}
 	}
 
@@ -2838,7 +2862,7 @@ final class Http2DemuxRelay {
 				Stream stream = batch.stream();
 				int release = leg.written(batch);
 				if (stream != null) {
-					grantStream(stream.id, release);
+					grantStream(stream, release, WriteSeam.Site.DRAIN_GRANT);
 				}
 				grantOwed();
 				if (batch.halfClose()) {
@@ -3556,7 +3580,19 @@ final class Http2DemuxRelay {
 			 * A response DATA frame the leg's inbound side writes as it reads it: found
 			 * relayable and charged to the client's window, not written.
 			 */
-			RESPONSE_DATA
+			RESPONSE_DATA,
+
+			/**
+			 * A client stream window grant the leg writer computed as it wrote what was
+			 * queued for the stream: found due, not written.
+			 */
+			DRAIN_GRANT,
+
+			/**
+			 * A client stream window grant the outbound parse computed on a DATA frame of
+			 * the stream: found due, not written.
+			 */
+			DATA_GRANT
 
 		}
 
