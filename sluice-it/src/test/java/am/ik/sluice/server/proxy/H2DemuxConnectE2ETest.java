@@ -6,6 +6,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -61,8 +62,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * either way, every later stream is routed, access-checked and logged on its own, and the
  * connection keeps the idle and stall timeouts. A request head the relay cannot take for
  * a request -- a CONNECT without {@code :authority}, a head without {@code :method} -- is
- * reset with {@code PROTOCOL_ERROR} (RFC 9113 8.1.1), never relayed. In the relay's
- * package for its meters and the deadline queue of {@link ConnectionLimits}.
+ * reset with {@code PROTOCOL_ERROR} (RFC 9113 8.1.1), never relayed; a header block that
+ * does not decode ends the connection with {@code COMPRESSION_ERROR} (RFC 9113 4.3), the
+ * first head's as a later one's. In the relay's package for its meters and the deadline
+ * queue of {@link ConnectionLimits}.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -80,6 +83,8 @@ class H2DemuxConnectE2ETest {
 	private static final int PROTOCOL_ERROR = 0x1;
 
 	private static final int CANCEL = 0x8;
+
+	private static final int COMPRESSION_ERROR = 0x9;
 
 	private static final int ENHANCE_YOUR_CALM = 0xb;
 
@@ -327,7 +332,8 @@ class H2DemuxConnectE2ETest {
 
 	/**
 	 * A first head without {@code :method} is malformed too: reset, not relayed verbatim
-	 * to the route of its authority; so is a later one without {@code :path}.
+	 * to the route of its authority; so are later ones without {@code :path} or with a
+	 * field the decoder rejects.
 	 */
 	@Test
 	void headsWithoutAMethodOrAPathAreResetNotRelayed() throws Exception {
@@ -343,9 +349,89 @@ class H2DemuxConnectE2ETest {
 					TestH2.headerBlock(":authority=" + TUNNEL_HOST, ":method=GET", ":scheme=http", "x-case=1006"));
 			assertThat(client.awaitTrue(() -> client.reset(5) != null, TIMEOUT)).as("stream 5 reset").isTrue();
 			assertThat(client.reset(5)).isEqualTo(PROTOCOL_ERROR);
+			// a connection-specific field (RFC 9113 8.2.2) is a stream error, decoded in
+			// full: the connection goes on
+			client.headers(7, true, TestH2.headerBlock(":authority=" + TUNNEL_HOST, ":method=GET", ":scheme=http",
+					":path=/", "connection=close", "x-case=1006"));
+			assertThat(client.awaitTrue(() -> client.reset(7) != null, TIMEOUT)).as("stream 7 reset").isTrue();
+			assertThat(client.reset(7)).isEqualTo(PROTOCOL_ERROR);
+			client.headers(9, true, get(OTHER_HOST, "/after-connection-field"));
+			assertThat(client.awaitEnd(9, TIMEOUT)).isTrue();
+			assertThat(client.goAwayCode()).as("no GOAWAY").isEqualTo(-1);
 		}
 		assertThat(TUNNEL_HEADS).as("relayed to no upstream")
 			.noneMatch(head -> "1006".contentEquals(Objects.requireNonNullElse(head.get("x-case"), "")));
+	}
+
+	/**
+	 * A first header block that does not decode is a connection error (RFC 9113 4.3):
+	 * GOAWAY {@code COMPRESSION_ERROR} naming no stream, nothing relayed, the connection
+	 * closed and logged.
+	 */
+	@Test
+	void anUndecodableFirstHeadEndsTheConnectionWithACompressionError() throws Exception {
+		int heads = TUNNEL_HEADS.size();
+		int port;
+		try (H2TestClient client = H2TestClient.connect(dataPort)) {
+			port = client.localPort();
+			client.headers(1, true, undecodable(TUNNEL_HOST));
+			assertThat(client.awaitTrue(client::closed, TIMEOUT)).as("closed").isTrue();
+			assertThat(client.goAwayCode()).as("GOAWAY COMPRESSION_ERROR").isEqualTo(COMPRESSION_ERROR);
+			assertThat(client.goAwayLastStreamId()).isZero();
+		}
+		assertThat(TUNNEL_HEADS).as("relayed to no upstream").hasSize(heads);
+		assertCompressionErrorLogged(port);
+	}
+
+	/**
+	 * A later header block that does not decode ends the connection alike, the open
+	 * tunnel with it: the decoder's state is unknown from there on, so no later block
+	 * could be trusted.
+	 */
+	@Test
+	void anUndecodableLaterHeadEndsTheConnectionWithACompressionError() throws Exception {
+		int port;
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
+			port = client.localPort();
+			client.headers(1, false, connect(TUNNEL_HOST + ":1009"));
+			awaitTunnel(client, 1);
+			int heads = TUNNEL_HEADS.size();
+			client.headers(3, true, undecodable(TUNNEL_HOST));
+			assertThat(client.awaitTrue(client::closed, TIMEOUT)).as("closed").isTrue();
+			assertThat(client.goAwayCode()).as("GOAWAY COMPRESSION_ERROR").isEqualTo(COMPRESSION_ERROR);
+			assertThat(client.goAwayLastStreamId()).isEqualTo(1);
+			assertThat(client.resets()).as("no stream error instead").isEmpty();
+			assertThat(TUNNEL_HEADS).as("relayed to no upstream").hasSize(heads);
+		}
+		assertCompressionErrorLogged(port);
+	}
+
+	/**
+	 * The connection's request line names neither route, method nor path, and its close
+	 * line an h2 transport.
+	 */
+	private static void assertCompressionErrorLogged(int port) {
+		String suffix = " route=- method=- path=- http=2 remote=127.0.0.1:" + port;
+		Awaitility.await("the request line")
+			.atMost(Duration.ofSeconds(5))
+			.until(() -> accessLines().stream()
+				.anyMatch(line -> line.startsWith("type=req ") && line.endsWith(suffix)));
+		String line = accessLines().stream()
+			.filter(candidate -> candidate.startsWith("type=req ") && candidate.endsWith(suffix))
+			.findFirst()
+			.orElseThrow();
+		assertThat(awaitCloseLine(idOf(line))).contains(" transport=h2 ");
+	}
+
+	/**
+	 * A header block whose last field references index 0, which HPACK forbids (RFC 7541
+	 * 6.1): the decoder fails after the routable fields before it.
+	 */
+	private static byte[] undecodable(String authority) {
+		byte[] fields = TestH2.headerBlock(":authority=" + authority, ":method=GET", ":scheme=http", ":path=/");
+		byte[] block = Arrays.copyOf(fields, fields.length + 1);
+		block[fields.length] = (byte) 0x80;
+		return block;
 	}
 
 	/** A reset of the tunnel by either side reaches the other. */

@@ -38,6 +38,14 @@ Step 2 of the netty h2 demux migration (context and user decisions: 098). Depend
   `:path`). Differences: it also rejects a missing `:scheme`, which legacy forwards; neither
   rejects a CONNECT carrying `:scheme` / `:path` without `:protocol` (malformed per RFC 9113
   8.5). The seed head must go through the codec so the validation covers the first stream.
-- An undecodable header block: legacy resets the stream PROTOCOL_ERROR (its decoder
-  swallows every exception, untested); netty makes it the connection error
-  COMPRESSION_ERROR (RFC 9113 4.3), which is the correct answer.
+- A header block that does not decode is the connection error COMPRESSION_ERROR (RFC 9113
+  4.3) on both engines: legacy answers a first head so in `DataProxyServer`
+  (`Head#undecodable`, GOAWAY naming stream 0) and a later one in the relay (GOAWAY naming
+  the last stream processed); netty's HPACK decoder raises it natively. The two
+  `anUndecodable*` tests of `H2DemuxConnectE2ETest` pin it, including the
+  `route=- method=- path=-` request line; netty must log that line too.
+- A field the HPACK validation rejects (a connection-specific field) is a stream error
+  (netty defers it past the whole block, so the decoder state holds): a later head gets
+  RST_STREAM PROTOCOL_ERROR on legacy (pinned); a first head is left unroutable by
+  `ConnectionHeadParser` and answered 503 no-route with a GOAWAY unless a catch-all route
+  takes it to the relay, which resets it (read from the code, untested) -- netty's codec would reset it in either case.

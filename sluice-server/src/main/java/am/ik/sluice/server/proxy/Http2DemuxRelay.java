@@ -47,9 +47,11 @@ import io.micrometer.core.instrument.MeterRegistry;
  * {@code :authority} alike, and logged with it as its path; a head that is no request --
  * no {@code :method}, no {@code :path} but for a CONNECT, a CONNECT without
  * {@code :authority} -- is reset with {@code PROTOCOL_ERROR}, the connection's head
- * included. Streams sharing a route share the route's leg. Every leg's writes are
- * performed by the leg's own writer thread off the leg's queue -- the outbound parse only
- * enqueues, so one stalled leg never stops the frames of the others.
+ * included, and so is a later head carrying a field the decoder rejects; a header block
+ * that does not decode ends the connection with a GOAWAY {@code COMPRESSION_ERROR}
+ * ({@link #decode}). Streams sharing a route share the route's leg. Every leg's writes
+ * are performed by the leg's own writer thread off the leg's queue -- the outbound parse
+ * only enqueues, so one stalled leg never stops the frames of the others.
  * <p>
  * The relay is the HTTP/2 endpoint of the client connection for everything
  * connection-level: settings are answered and re-announced to the legs, pings are
@@ -221,6 +223,8 @@ final class Http2DemuxRelay {
 	private static final int ERROR_FRAME_SIZE = 0x6;
 
 	private static final int ERROR_REFUSED_STREAM = 0x7;
+
+	private static final int ERROR_COMPRESSION = 0x9;
 
 	private static final int ERROR_CANCEL = 0x8;
 
@@ -1850,13 +1854,23 @@ final class Http2DemuxRelay {
 		}
 	}
 
+	/**
+	 * Decodes a header block. A stream error -- a field the validation rejects -- yields
+	 * no headers, which makes a head no request; the decoder deferred it past the whole
+	 * block, so its state holds. A block that does not decode is a connection error
+	 * {@code COMPRESSION_ERROR} (RFC 9113 4.3): the HPACK state is unknown from there on,
+	 * so no later block could be trusted to route by.
+	 */
 	private io.netty.handler.codec.http2.Http2Headers decode(int streamId, byte[] block) {
 		try {
 			return this.headersDecoder.decodeHeaders(streamId, io.netty.buffer.Unpooled.wrappedBuffer(block));
 		}
-		catch (Exception e) {
-			// an undecodable block carries no routable authority
+		catch (io.netty.handler.codec.http2.Http2Exception.StreamException e) {
 			return new io.netty.handler.codec.http2.DefaultHttp2Headers();
+		}
+		catch (Exception e) {
+			this.access.request("-", "-", "-", "2");
+			throw connectionError(ERROR_COMPRESSION, "header block of stream %d: %s".formatted(streamId, e));
 		}
 	}
 

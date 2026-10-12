@@ -27,7 +27,8 @@ import org.springframework.stereotype.Component;
  * (HTTP/1.1, or HTTP/2 for prior knowledge and ALPN h2), after which the connection
  * closes: the 503 no-route page for a request no tunnel session can serve, the 403
  * forbidden page for a peer address the access control excludes, a bare HTTP/1.1 400 for
- * a malformed request, and a bodiless HTTP/2 502 for a stream its upstream lost.
+ * a malformed request, a bodiless HTTP/2 502 for a stream its upstream lost, and a GOAWAY
+ * {@code COMPRESSION_ERROR} for an HTTP/2 head whose header block does not decode.
  */
 @Component
 public class ErrorResponse {
@@ -36,6 +37,9 @@ public class ErrorResponse {
 
 	/** The minimum SETTINGS_MAX_FRAME_SIZE every HTTP/2 peer accepts (RFC 9113 4.2). */
 	private static final int MAX_FRAME_SIZE = 16_384;
+
+	/** The HTTP/2 error code of a header block that does not decode (RFC 9113 7). */
+	private static final int COMPRESSION_ERROR = 0x9;
 
 	private static final byte[] BAD_REQUEST = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 		.getBytes(StandardCharsets.US_ASCII);
@@ -68,6 +72,18 @@ public class ErrorResponse {
 	 */
 	public byte[] badRequest() {
 		return BAD_REQUEST.clone();
+	}
+
+	/**
+	 * The HTTP/2 answer to a connection head whose first header block does not decode:
+	 * the server preface (SETTINGS) and a GOAWAY {@code COMPRESSION_ERROR} (RFC 9113 4.3)
+	 * naming no stream as processed.
+	 */
+	public byte[] compressionError() {
+		Http2Frames frames = new Http2Frames(0);
+		frames.write(Http2Frame.SETTINGS, new byte[0]);
+		frames.write(Http2Frame.GOAWAY, ByteBuffer.allocate(8).putInt(0).putInt(COMPRESSION_ERROR).array());
+		return frames.toByteArray();
 	}
 
 	/**

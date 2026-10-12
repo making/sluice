@@ -340,6 +340,12 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	 */
 	private boolean relay(Connection conn, AccessLogger.Connection access, ConnectionLimits.KeepAliveDeadline deadline,
 			Runnable release) {
+		if (conn.head().undecodable()) {
+			// a connection error before any stream: nothing of it may be routed
+			access.request("-", "-", "2");
+			this.reject(conn, this.errorResponse.compressionError());
+			return false;
+		}
 		if (malformedHttp1(conn.head())) {
 			this.reject(conn, this.errorResponse.badRequest());
 			return false;

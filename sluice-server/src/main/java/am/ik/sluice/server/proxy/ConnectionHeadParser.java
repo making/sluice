@@ -11,6 +11,7 @@ import org.jspecify.annotations.Nullable;
 
 import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder;
+import io.netty.handler.codec.http2.Http2Exception;
 import io.netty.handler.codec.http2.Http2Headers;
 import io.netty.util.AsciiString;
 
@@ -67,8 +68,14 @@ public final class ConnectionHeadParser {
 	public record H2Head(byte[] prefix, byte[] headerBlock, byte[] suffix, int streamId) {
 	}
 
+	/**
+	 * A connection head. {@code undecodable} marks an HTTP/2 head whose first header
+	 * block failed to decode, a connection error {@code COMPRESSION_ERROR} (RFC 9113
+	 * 4.3): the HPACK state is unknown from there on, so nothing of the connection may be
+	 * routed.
+	 */
 	public record Head(@Nullable String host, byte[] bytes, @Nullable H2Head h2, boolean encrypted,
-			@Nullable Request request, @Nullable String forwardedFor, @Nullable String forwarded) {
+			@Nullable Request request, @Nullable String forwardedFor, @Nullable String forwarded, boolean undecodable) {
 
 		/** The forwarded-for header the access control trusts; literal addresses only. */
 		static final String FORWARDED_FOR = "x-forwarded-for";
@@ -96,17 +103,25 @@ public final class ConnectionHeadParser {
 
 		/** A copy of this head with the route host replaced. */
 		public Head withHost(@Nullable String host) {
-			return new Head(host, this.bytes, this.h2, this.encrypted, this.request, this.forwardedFor, this.forwarded);
+			return new Head(host, this.bytes, this.h2, this.encrypted, this.request, this.forwardedFor, this.forwarded,
+					this.undecodable);
 		}
 
 		public static Head http1(byte[] bytes, @Nullable String host) {
 			return new Head(host, bytes, null, false, http1RequestOf(bytes), http1HeaderOf(bytes, FORWARDED_FOR),
-					http1HeaderOf(bytes, FORWARDED));
+					http1HeaderOf(bytes, FORWARDED), false);
 		}
 
 		public static Head http2(byte[] bytes, @Nullable String host, @Nullable H2Head h2, @Nullable Request request,
 				@Nullable String forwardedFor, @Nullable String forwarded) {
-			return new Head(host, bytes, h2, false, request, forwardedFor, forwarded);
+			return new Head(host, bytes, h2, false, request, forwardedFor, forwarded, false);
+		}
+
+		/**
+		 * An HTTP/2 head whose first header block failed to decode: nothing to route by.
+		 */
+		public static Head undecodableHttp2(byte[] bytes) {
+			return new Head(null, bytes, null, false, null, null, null, true);
 		}
 
 		/**
@@ -114,7 +129,7 @@ public final class ConnectionHeadParser {
 		 * verbatim (the rewriter must not touch TLS records).
 		 */
 		public static Head encrypted(byte[] bytes, @Nullable String host) {
-			return new Head(host, bytes, null, true, null, null, null);
+			return new Head(host, bytes, null, true, null, null, null, false);
 		}
 
 		/**
@@ -122,7 +137,7 @@ public final class ConnectionHeadParser {
 		 * catch-all route, relayed verbatim.
 		 */
 		public static Head hostless(byte[] bytes) {
-			return new Head(null, bytes, null, false, null, null, null);
+			return new Head(null, bytes, null, false, null, null, null, false);
 		}
 
 	}
@@ -278,6 +293,9 @@ public final class ConnectionHeadParser {
 		}
 		byte[] block = headerBlock.toByteArray();
 		Decoded decoded = decode(block, headersStreamId);
+		if (decoded == null) {
+			return Optional.of(Head.undecodableHttp2(bytes));
+		}
 		if (continuationSeen || headersFrameStart < 0) {
 			return Optional.of(Head.http2(bytes, decoded.host(), null, decoded.request(), decoded.forwardedFor(),
 					decoded.forwarded()));
@@ -302,7 +320,12 @@ public final class ConnectionHeadParser {
 			@Nullable String forwarded) {
 	}
 
-	private Decoded decode(byte[] headerBlock, int streamId) {
+	/**
+	 * Decodes the first header block; {@code null} when it does not decode (a connection
+	 * error). A stream error -- a field the validation rejects, the block decoded in full
+	 * -- leaves the head unroutable instead.
+	 */
+	private @Nullable Decoded decode(byte[] headerBlock, int streamId) {
 		try {
 			Http2Headers headers = this.headersDecoder.decodeHeaders(streamId, Unpooled.wrappedBuffer(headerBlock));
 			String host = headerOf(headers.authority(), headers.get(AsciiString.cached("host")));
@@ -311,10 +334,13 @@ public final class ConnectionHeadParser {
 			String forwarded = headerOf(null, headers.get(AsciiString.of(Head.FORWARDED)));
 			return new Decoded(host, request, forwardedFor, forwarded);
 		}
-		catch (Exception e) {
-			// fall through: unroutable head
+		catch (Http2Exception.StreamException e) {
+			// the decoder defers field validation past the whole block: its state holds
+			return new Decoded(null, null, null, null);
 		}
-		return new Decoded(null, null, null, null);
+		catch (Exception e) {
+			return null;
+		}
 	}
 
 	/**

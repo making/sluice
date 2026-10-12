@@ -124,6 +124,25 @@ class ConnectionHeadParserTest {
 	}
 
 	@Test
+	void http2HeadWhoseBlockDoesNotDecodeIsUndecodable() {
+		// index 0 is no HPACK field (RFC 7541 6.1)
+		ConnectionHeadParser.Head parsed = parseH2(literal(":authority", "demo.local"), literal(":method", "GET"),
+				literal(":path", "/"), new byte[] { (byte) 0x80 });
+		assertThat(parsed.undecodable()).isTrue();
+		assertThat(parsed.host()).isNull();
+		assertThat(parsed.request()).isNull();
+		assertThat(parsed.http2Connection()).isTrue();
+	}
+
+	@Test
+	void http2HeadWithAFieldTheValidationRejectsIsDecodable() {
+		ConnectionHeadParser.Head parsed = parseH2(literal(":authority", "demo.local"), literal(":method", "GET"),
+				literal(":path", "/"), literal("connection", "close"));
+		assertThat(parsed.undecodable()).isFalse();
+		assertThat(parsed.request()).isNull();
+	}
+
+	@Test
 	void http1AndTlsHeadsOpenNoHttp2Connection() {
 		byte[] http1 = "GET / HTTP/1.1\r\nHost: demo.local\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
 		assertThat(PARSER.parse(new ByteArrayInputStream(http1)).orElseThrow().http2Connection()).isFalse();
