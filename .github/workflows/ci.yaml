@@ -33,6 +33,11 @@ jobs:
         java-version: '25'
         distribution: graalvm
         cache: 'maven'
+    # the browsers ConsoleE2ETest drives; the Playwright version is in pom.xml
+    - uses: actions/cache@v4
+      with:
+        path: ~/.cache/ms-playwright
+        key: playwright-${{ runner.os }}-${{ hashFiles('pom.xml') }}
     - name: Test
       run: ./mvnw -V -B --no-transfer-progress verify
   build-image:
