@@ -323,7 +323,8 @@ class H2DemuxBudgetE2ETest {
 	 * exhausted -- whose reset still waits for the stalled upstream, the stream still
 	 * tracked: a client WINDOW_UPDATE with an increment of 0 on it gets no second
 	 * RST_STREAM and counts no protocol reset, and what the upstream sends on it -- a
-	 * response head, DATA -- never reaches the client; the upstream gets the one CANCEL.
+	 * response head, DATA, an unknown frame, a reset -- never reaches the client; the
+	 * upstream gets the one CANCEL.
 	 */
 	@Test
 	void aStreamWhoseResetWaitsForTheUpstreamIsResetOnceAndRelaysNothing() throws Exception {
@@ -354,6 +355,8 @@ class H2DemuxBudgetE2ETest {
 			OutputStream upstream = log.awaitIdle();
 			TestH2.writeFrame(upstream, TestH2.HEADERS, TestH2.FLAG_END_HEADERS, reset, new byte[] { (byte) 0x88 });
 			TestH2.writeFrame(upstream, TestH2.DATA, 0, reset, new byte[16]);
+			TestH2.writeFrame(upstream, UNKNOWN_FRAME, 0, reset, new byte[4]);
+			TestH2.writeFrame(upstream, TestH2.RST_STREAM, 0, reset, TestH2.int32(NO_ERROR));
 			TestH2.writeFrame(upstream, UNKNOWN_FRAME, 0, probe, new byte[4]);
 			assertThat(
 					client.awaitTrue(() -> types(client.frames(probe)).contains(UNKNOWN_FRAME), Duration.ofSeconds(5)))

@@ -50,12 +50,13 @@ import org.springframework.test.context.DynamicPropertySource;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The h2 demux resetting a stream on its own account while a frame of the stream is on
- * its way to the client: one side is held between its decision and its write (the relay's
- * write seam), with the client stream's lock held, while the other side runs, and the
- * client sees the frame before the RST_STREAM or not at all, never after it. The reset is
- * a client WINDOW_UPDATE with an increment of 0 (RFC 9113 6.9). In the relay's package
- * for the package-private write seam.
+ * The h2 demux resetting a stream while a frame of the stream is on its way to the client
+ * -- a response DATA frame, or a stream window grant of the relay's own: one side is held
+ * between its decision and its write (the relay's write seam), with the client stream's
+ * lock held, while the other side runs, and the client sees the frame before the
+ * RST_STREAM or not at all, never after it (RFC 9113 5.1). The relay's own reset is a
+ * client WINDOW_UPDATE with an increment of 0 (RFC 9113 6.9). In the relay's package for
+ * the package-private write seam.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -175,6 +176,9 @@ class H2DemuxResetRaceE2ETest {
 	 * writing its RST_STREAM when the upstream's DATA frame on the stream arrives: the
 	 * leg's inbound side waits for the client stream behind the held reset, and drops the
 	 * frame once it is let go -- the client reads the RST_STREAM and nothing after it.
+	 * The leg writer writes the reset's CANCEL meanwhile, so the stream may no longer be
+	 * tracked when the frame is read; a frame read while it still is, its CANCEL held by
+	 * a stalled upstream, is {@code H2DemuxBudgetE2ETest}'s.
 	 */
 	@Test
 	void aResponseFrameReadWhileTheResetIsHeldNeverReachesTheClient() throws Exception {
