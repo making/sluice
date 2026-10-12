@@ -37,8 +37,8 @@ fire, so the budget must stay enforced by the epoch count / the outside watchdog
   elapsed time is within budget + one tick.
 - Needs a busy-loop example guest under `sluice-wasmlet/examples/` if none exists (the
   hello guest's `/spin` is one).
-- The epoch ticker lags the wall clock under load (068): the budget + one tick bound
-  holds only once 068 is done, or the assertion allows for the lag.
+- The ticker follows a fixed schedule now (tracks the wall clock; a stall beyond 100 ticks is
+  forgotten), so the budget + one tick bound holds except after such a stall.
 - `a_reset_stream_keeps_its_share_until_its_instance_is_gone` (059) relies on a
   spinning guest outliving its reset stream until the budget: the watchdog shares the
   guest's task and cannot stop it. Once the guest yields, the watchdog stops it at the
