@@ -13,10 +13,10 @@ import io.micrometer.core.instrument.MeterRegistry;
  * The meters shared by every h2 demux relay of one data proxy: per route, the bytes
  * queued for the leg writers of all live legs -- one gauge per route, so the series count
  * follows the routes, not the connections --, the streams refused for want of queue
- * budget or of a slot for a new leg, the streams a relay reset for want of queue budget
- * or for a client's protocol error, the times a relay withheld the client's connection
- * window, and, for tests, the number of times a leg writer woke up and the streams the
- * relays track.
+ * budget or of a slot for a new leg or while waiting for an upstream's concurrency limit,
+ * the streams a relay reset for want of queue budget or for a client's protocol error,
+ * the times a relay withheld the client's connection window, and, for tests, the number
+ * of times a leg writer woke up and the streams the relays track.
  */
 final class H2DemuxMeters {
 
@@ -31,6 +31,8 @@ final class H2DemuxMeters {
 
 	private final Counter refusedLegLimit;
 
+	private final Counter refusedWaiting;
+
 	private final Counter resetBudget;
 
 	private final Counter resetProtocol;
@@ -41,6 +43,7 @@ final class H2DemuxMeters {
 		this.registry = registry;
 		this.refusedBudget = refused(registry, "budget");
 		this.refusedLegLimit = refused(registry, "leg-limit");
+		this.refusedWaiting = refused(registry, "waiting");
 		this.resetBudget = reset(registry, "budget");
 		this.resetProtocol = reset(registry, "protocol");
 		this.windowWithheld = Counter.builder("sluice.h2demux.window.withheld")
@@ -52,7 +55,9 @@ final class H2DemuxMeters {
 	private static Counter refused(MeterRegistry registry, String reason) {
 		return Counter.builder("sluice.h2demux.streams.refused")
 			.tag("reason", reason)
-			.description("h2 streams refused (REFUSED_STREAM) for want of queue budget or of a slot for a new leg")
+			.description("h2 streams refused (REFUSED_STREAM) for want of queue budget or of a slot for a new leg, or"
+					+ " while waiting for an upstream's concurrency limit, to free the queue of a connection whose"
+					+ " window is withheld")
 			.register(registry);
 	}
 
@@ -73,6 +78,15 @@ final class H2DemuxMeters {
 	 */
 	void refusedForLegLimit() {
 		this.refusedLegLimit.increment();
+	}
+
+	/**
+	 * A stream refused while waiting for its upstream's concurrency limit: the client's
+	 * connection window was withheld and the waiting streams held more than the
+	 * connection's allowance.
+	 */
+	void refusedWaiting() {
+		this.refusedWaiting.increment();
 	}
 
 	/** A stream reset: its trailers did not fit the queue budget. */

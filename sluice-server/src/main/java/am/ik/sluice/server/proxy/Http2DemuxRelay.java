@@ -9,6 +9,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -93,7 +94,10 @@ import io.micrometer.core.instrument.MeterRegistry;
  * further leg is opened for it. A lowered limit applies to the streams opened after it. A
  * waiting stream counts against the relay's own limit and its queue as any other, but its
  * client is granted no stream window beyond the initial one; reset by either side, it is
- * dropped without a frame to the upstream.
+ * dropped without a frame to the upstream. While the client's connection window is
+ * withheld, the waiting streams hold at most {@link #CONNECTION_ALLOWANCE}: past it the
+ * most recent of them are refused ({@code REFUSED_STREAM}), so the open streams' drain
+ * alone brings the queue back within the allowance ({@link #refuseWaiting}).
  * <p>
  * Towards the client the relay is a sender bound by the client's connection window (65535
  * plus the client's connection-level WINDOW_UPDATEs; one past 2^31-1 ends the connection
@@ -888,6 +892,7 @@ final class Http2DemuxRelay {
 		int dataOffset = frame.payload() + (frame.has(FLAG_PADDED) ? 1 : 0);
 		boolean violation = false;
 		boolean dropped = false;
+		boolean withheld = false;
 		int release = 0;
 		int connectionGrant = 0;
 		this.lock.lock();
@@ -906,7 +911,8 @@ final class Http2DemuxRelay {
 				release = releaseLocked(stream);
 				boolean owing = this.owedGrant > 0;
 				connectionGrant = connectionGrantLocked(frame.length());
-				if (connectionGrant == 0 && this.owedGrant > 0) {
+				withheld = connectionGrant == 0 && this.owedGrant > 0;
+				if (withheld) {
 					if (!owing) {
 						this.meters.windowWithheld();
 					}
@@ -926,6 +932,10 @@ final class Http2DemuxRelay {
 		}
 		grantClient(connectionGrant);
 		grantStream(stream, release, WriteSeam.Site.DATA_GRANT);
+		if (withheld) {
+			// refuses the waiting streams the open streams' drain could not make up for
+			grantOwed();
+		}
 		checkQueueBound();
 	}
 
@@ -955,26 +965,35 @@ final class Http2DemuxRelay {
 		}
 	}
 
-	/** Grants the withheld window if allowed by now; called as queued bytes leave. */
+	/**
+	 * Grants the withheld window if allowed by now; called as queued bytes leave, and
+	 * whenever the window was withheld. Still withheld, the waiting streams past the
+	 * allowance are refused ({@link #refuseWaiting}) and the grant is tried again.
+	 */
 	private void grantOwed() {
-		int grant;
-		this.lock.lock();
-		try {
-			grant = this.owedGrant > 0 ? connectionGrantLocked(0) : 0;
+		while (true) {
+			int grant;
+			boolean withheld;
+			this.lock.lock();
+			try {
+				grant = this.owedGrant > 0 ? connectionGrantLocked(0) : 0;
+				withheld = grant == 0 && this.owedGrant > 0;
+			}
+			finally {
+				this.lock.unlock();
+			}
+			grantClient(grant);
+			if (!withheld || !refuseWaiting()) {
+				return;
+			}
 		}
-		finally {
-			this.lock.unlock();
-		}
-		grantClient(grant);
 	}
 
 	/** The budget has room: grants the withheld window, or waits again. */
 	private void retryOwedGrant() {
-		int grant;
 		this.lock.lock();
 		try {
-			grant = connectionGrantLocked(0);
-			if (grant == 0 && this.owedGrant > 0) {
+			if (this.owedGrant > 0 && !grantAllowedLocked()) {
 				awaitBudgetLocked();
 			}
 		}
@@ -982,11 +1001,98 @@ final class Http2DemuxRelay {
 			this.lock.unlock();
 		}
 		try {
-			grantClient(grant);
+			grantOwed();
 		}
 		catch (RuntimeException e) {
 			abort(); // the client is gone
 		}
+	}
+
+	/**
+	 * While the client's connection window is withheld, keeps the bytes queued for
+	 * streams waiting for an upstream's concurrency limit within the connection's
+	 * allowance: past it, the most recent waiting streams are refused
+	 * ({@code REFUSED_STREAM}: their upstream never saw them, RFC 9113 8.7) until the
+	 * rest fits. Their bytes drain only once a stream of their leg closed on the
+	 * upstream, which may need the very request body the withheld window holds back; the
+	 * bytes of the open streams drain on their own, so once they did the queue is within
+	 * the allowance and the window is granted. Returns whether a stream was refused.
+	 * Called with neither lock held.
+	 */
+	private boolean refuseWaiting() {
+		this.lock.lock();
+		try {
+			if (!overWaitingAllowanceLocked()) {
+				return false;
+			}
+		}
+		finally {
+			this.lock.unlock();
+		}
+		List<Stream> refused = new ArrayList<>();
+		// marked reset and written as one step, as for the relay's own resets: no stream
+		// window grant follows the RST_STREAM
+		this.sinkLock.lock();
+		try {
+			this.lock.lock();
+			try {
+				if (overWaitingAllowanceLocked()) {
+					List<Stream> waiting = waitingStreamsLocked();
+					long bytes = waiting.stream().mapToLong(stream -> stream.queuedBytes).sum();
+					for (int i = waiting.size() - 1; i >= 0 && bytes > CONNECTION_ALLOWANCE; i--) {
+						Stream stream = waiting.get(i);
+						bytes -= stream.queuedBytes;
+						resetLocked(stream);
+						stream.leg.dropUnopenedLocked(stream);
+						updateActiveLocked(stream);
+						refused.add(stream);
+					}
+				}
+			}
+			finally {
+				this.lock.unlock();
+			}
+			for (Stream stream : refused) {
+				this.writeSeam.decided(this, new WriteSeam.Decision(WriteSeam.Site.RESET, stream.id));
+				writeToClient(rstStream(stream.id, ERROR_REFUSED_STREAM));
+			}
+		}
+		finally {
+			this.sinkLock.unlock();
+		}
+		for (Stream stream : refused) {
+			stream.leg.streamClosed(stream.id);
+			this.meters.refusedWaiting();
+		}
+		return !refused.isEmpty();
+	}
+
+	/**
+	 * Whether the window is withheld while the waiting streams hold more than the
+	 * allowance; with {@link #lock}.
+	 */
+	private boolean overWaitingAllowanceLocked() {
+		if (this.grantsClosed || this.owedGrant == 0 || grantAllowedLocked()) {
+			return false;
+		}
+		long bytes = 0;
+		for (Stream stream : waitingStreamsLocked()) {
+			bytes += stream.queuedBytes;
+		}
+		return bytes > CONNECTION_ALLOWANCE;
+	}
+
+	/**
+	 * The streams waiting for their upstream's concurrency limit, of every leg, in stream
+	 * id order; with {@link #lock}.
+	 */
+	private List<Stream> waitingStreamsLocked() {
+		List<Stream> waiting = new ArrayList<>();
+		for (Leg leg : this.legs) {
+			waiting.addAll(leg.waitingLocked());
+		}
+		waiting.sort(Comparator.comparingInt(stream -> stream.id));
+		return waiting;
 	}
 
 	/** Moves {@link #queuedBytes} and settles the budget's share; with {@link #lock}. */
@@ -2355,6 +2461,14 @@ final class Http2DemuxRelay {
 				queueBlock(new LegEntry.Block(stream, frame, BlockKind.RESET, false));
 				return;
 			}
+			dropUnopenedLocked(stream);
+		}
+
+		/**
+		 * Drops what is queued for a stream not opened on the upstream yet, its head
+		 * included, so nothing of it reaches the upstream; with the lock.
+		 */
+		void dropUnopenedLocked(Stream stream) {
 			long dropped = 0;
 			Iterator<LegEntry> iterator = this.entries.iterator();
 			while (iterator.hasNext()) {
@@ -2792,6 +2906,24 @@ final class Http2DemuxRelay {
 		/** Whether the upstream's limit admits one more stream; with the lock. */
 		private boolean mayOpenLocked() {
 			return this.upstreamStreams.size() < this.maxStreams;
+		}
+
+		/**
+		 * The streams of the leg waiting for the upstream's concurrency limit, in stream
+		 * id order: of the streams whose head the writer has not taken, the ones beyond
+		 * the places the limit leaves free -- heads go in stream id order, so the first
+		 * of them go without anything else happening. With the lock.
+		 */
+		List<Stream> waitingLocked() {
+			List<Stream> unopened = new ArrayList<>();
+			for (Stream stream : Http2DemuxRelay.this.streams.values()) {
+				if (stream.leg == this && !stream.upstreamOpened && !stream.reset) {
+					unopened.add(stream);
+				}
+			}
+			unopened.sort(Comparator.comparingInt(stream -> stream.id));
+			long free = Math.max(0, this.maxStreams - this.upstreamStreams.size());
+			return unopened.subList((int) Math.min(free, unopened.size()), unopened.size());
 		}
 
 		/** The writer took the stream's head: the stream opens on the upstream. */
