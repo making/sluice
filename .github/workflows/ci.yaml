@@ -32,6 +32,8 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # a hung test must not hold the main queue (see concurrency above)
+    timeout-minutes: 30
     steps:
     - name: Checkout
       uses: actions/checkout@v4
