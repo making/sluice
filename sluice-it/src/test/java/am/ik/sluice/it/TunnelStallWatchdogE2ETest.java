@@ -162,8 +162,31 @@ class TunnelStallWatchdogE2ETest {
 		long stallStart = System.nanoTime();
 		stalling.stall.set(true);
 		for (Socket peer : peers) {
-			peer.getOutputStream().write(new byte[512 * 1024]);
-			peer.shutdownOutput();
+			// on its own thread: what the relay does not read fills the socket buffers
+			// and may block the write until the relay ends
+			Thread.ofVirtual().start(() -> {
+				try {
+					peer.getOutputStream().write(new byte[512 * 1024]);
+				}
+				catch (IOException e) {
+					// the relay ended and closed its socket
+				}
+			});
+		}
+		SessionSender stalledSender = (SessionSender) stalledSession.sender();
+		Awaitility.await()
+			.atMost(Duration.ofSeconds(5))
+			.alias("the stream stopped taking frames")
+			.until(() -> stalling.blocked.get() && stalledSender.stalled().compareTo(Duration.ofMillis(300)) >= 0);
+		// The client fails each connection with ERROR, which ends its relay wherever its
+		// writer waits. No peer half-closes: a relay reaches its peer's FIN only after
+		// queueing every byte before it, and the sender caps a connection's queue in
+		// DATA frames, one per read, so how the reads split the bytes would decide
+		// whether the relay ends.
+		for (long id : stalling.closed) {
+			stalling.send(Frame.newBuilder()
+				.setError(am.ik.sluice.v1.proto.Error.newBuilder().setConnId(id).setMessage("upstream failed"))
+				.build());
 		}
 		Awaitility.await()
 			.atMost(Duration.ofSeconds(5))
@@ -260,12 +283,21 @@ class TunnelStallWatchdogE2ETest {
 		double failuresBefore = stallFailures();
 		Socket peer = open(healthyPort);
 		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> healthy.connects.size() == 1);
+		// Writes until the socket is closed after the test: a fixed amount could be
+		// absorbed whole by the kernel buffers (autotuned, a few MiB), ending the writer
+		// without the window having held anything back.
+		AtomicLong written = new AtomicLong();
+		AtomicReference<@Nullable IOException> writeFailure = new AtomicReference<>();
 		Thread writer = Thread.ofVirtual().start(() -> {
+			byte[] chunk = new byte[64 * 1024];
 			try {
-				peer.getOutputStream().write(new byte[4 * VirtualConnection.DEFAULT_WINDOW]);
+				while (true) {
+					peer.getOutputStream().write(chunk);
+					written.addAndGet(chunk.length);
+				}
 			}
 			catch (IOException e) {
-				// the socket is closed after the test
+				writeFailure.set(e);
 			}
 		});
 		Awaitility.await()
@@ -278,7 +310,10 @@ class TunnelStallWatchdogE2ETest {
 			assertThat(sender.stalled()).as("nothing queued: no stall").isEqualTo(Duration.ZERO);
 			TimeUnit.MILLISECONDS.sleep(50);
 		}
-		assertThat(writer.isAlive()).as("precondition: the public peer is still held back").isTrue();
+		assertThat(writer.isAlive())
+			.as("precondition: the public peer is still held back (written %d bytes, failure %s)", written.get(),
+					writeFailure.get())
+			.isTrue();
 		assertThat(healthy.received.get()).as("nothing past the window").isEqualTo(VirtualConnection.DEFAULT_WINDOW);
 		assertThat(stallFailures() - failuresBefore).as("no session failed").isZero();
 		assertThat(registry().find(HEALTHY_ID)).as("the same session").contains(session);
