@@ -18,12 +18,21 @@ from what is replayed; a PUSH_PROMISE from an upstream is then a connection erro
 `PROTOCOL_ERROR` on the leg (RFC 9113 8.4), ending the relay like other upstream
 protocol errors.
 
+Once no push can reach the client, a client RST_STREAM or WINDOW_UPDATE on an even stream
+is a frame on an idle stream (RFC 9113 5.1): have `Http2DemuxRelay#requireOpened` treat
+even ids as idle. 082 left them unchecked (the counterpart cases "RST_STREAM / WINDOW_UPDATE
+on an even stream" of `H2DemuxClientFrameValidationE2ETest` pin that), since a relayed
+PUSH_PROMISE may have reserved one. A client `SETTINGS_ENABLE_PUSH` above 1 is a
+connection error since 082, before anything is replayed.
+
 ## Tests (`sluice-it`; watch each fail first)
 
 - A client announcing `SETTINGS_ENABLE_PUSH` 1: the upstream reads 0 in the leg's
   settings.
 - An upstream sending PUSH_PROMISE anyway: the client never receives it, and the relay
   ends as for other upstream protocol errors.
+- A client RST_STREAM or WINDOW_UPDATE on an even stream: GOAWAY `PROTOCOL_ERROR` (turn
+  the two counterpart cases above into violations).
 
 ## Decision (2026-10-12)
 
