@@ -1,5 +1,6 @@
 package am.ik.sluice.client.config;
 
+import java.time.Duration;
 import java.util.Map;
 
 import org.junit.jupiter.api.Test;
@@ -92,6 +93,23 @@ class SluiceClientPropertiesTest {
 		Map<String, Object> limited = new java.util.HashMap<>(source);
 		limited.put("sluice.client.max-connections", "16");
 		assertThat(bind(limited).maxConnections()).isEqualTo(16);
+	}
+
+	@Test
+	void tunnelStallTimeoutDefaultsTo60sBindsInKebabCaseAndZeroTurnsItOff() {
+		Map<String, Object> source = Map.of("sluice.server-url", "grpc://127.0.0.1:8001",
+				"sluice.client.upstream[0].host", "demo.local", "sluice.client.upstream[0].target", "127.0.0.1:8080");
+		assertThat(bind(source).tunnelStallTimeout()).isEqualTo(Duration.ofSeconds(60));
+		assertThat(bind(Map.of("sluice.server-url", "grpc://127.0.0.1:8001")).tunnelStallTimeout())
+			.as("without a client section")
+			.isEqualTo(Duration.ofSeconds(60));
+		Map<String, Object> configured = new java.util.HashMap<>(source);
+		configured.put("sluice.client.tunnel-stall-timeout", "90s");
+		assertThat(bind(configured).tunnelStallTimeout()).isEqualTo(Duration.ofSeconds(90));
+		configured.put("sluice.client.tunnel-stall-timeout", "0");
+		assertThat(bind(configured).tunnelStallTimeout()).isZero();
+		configured.put("sluice.client.tunnel-stall-timeout", "-1s");
+		assertThat(bind(configured).tunnelStallTimeout()).isEqualTo(Duration.ofSeconds(60));
 	}
 
 	private static SluiceClientProperties bind(Map<String, Object> source) {

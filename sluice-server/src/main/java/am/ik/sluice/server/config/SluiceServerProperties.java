@@ -392,11 +392,16 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * upstream does not count
 	 * @param stallMinBytes the bytes moved to or from the client that count as progress
 	 * against {@code stallTimeout}: less within it is a stall (a minimum rate)
+	 * @param tunnelStallTimeout how long a tunnel stream may hold frames queued for its
+	 * client while not ready, the client taking none of them, before the session is
+	 * failed -- its stream reset, its routes removed and the slots its connections hold
+	 * freed; {@code 0} = off
 	 */
 	public record Limits(@DefaultValue("0") int maxConnections, @DefaultValue("0") int maxConnectionsPerAddress,
 			@DefaultValue("10s") Duration headTimeout, @DefaultValue("60s") Duration idleTimeout,
 			@DefaultValue("0") DataSize h2QueueBudget, @DefaultValue("1s") Duration halfCloseProbeInterval,
-			@DefaultValue("60s") Duration stallTimeout, @DefaultValue("16KB") DataSize stallMinBytes) {
+			@DefaultValue("60s") Duration stallTimeout, @DefaultValue("16KB") DataSize stallMinBytes,
+			@DefaultValue("60s") Duration tunnelStallTimeout) {
 
 		public Limits {
 			maxConnections = Math.max(0, maxConnections);
@@ -412,6 +417,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 					? Duration.ofSeconds(60) : stallTimeout;
 			stallMinBytes = stallMinBytes == null || stallMinBytes.toBytes() <= 0 ? DataSize.ofKilobytes(16)
 					: stallMinBytes;
+			tunnelStallTimeout = tunnelStallTimeout == null || tunnelStallTimeout.isNegative() ? Duration.ofSeconds(60)
+					: tunnelStallTimeout;
 		}
 
 		public static Builder builder() {
@@ -435,6 +442,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			@Nullable private Duration stallTimeout;
 
 			@Nullable private DataSize stallMinBytes;
+
+			@Nullable private Duration tunnelStallTimeout;
 
 			private Builder() {
 			}
@@ -479,6 +488,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder tunnelStallTimeout(Duration tunnelStallTimeout) {
+				this.tunnelStallTimeout = tunnelStallTimeout;
+				return this;
+			}
+
 			public Limits build() {
 				return new Limits(this.maxConnections, this.maxConnectionsPerAddress,
 						this.headTimeout == null ? Duration.ofSeconds(10) : this.headTimeout,
@@ -486,7 +500,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 						this.h2QueueBudget == null ? DataSize.ofBytes(0) : this.h2QueueBudget,
 						this.halfCloseProbeInterval == null ? Duration.ofSeconds(1) : this.halfCloseProbeInterval,
 						this.stallTimeout == null ? Duration.ofSeconds(60) : this.stallTimeout,
-						this.stallMinBytes == null ? DataSize.ofKilobytes(16) : this.stallMinBytes);
+						this.stallMinBytes == null ? DataSize.ofKilobytes(16) : this.stallMinBytes,
+						this.tunnelStallTimeout == null ? Duration.ofSeconds(60) : this.tunnelStallTimeout);
 			}
 
 		}

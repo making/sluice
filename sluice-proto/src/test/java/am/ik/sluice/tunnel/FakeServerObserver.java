@@ -30,6 +30,9 @@ final class FakeServerObserver extends ServerCallStreamObserver<Frame> {
 
 	final CountDownLatch firstSent = new CountDownLatch(1);
 
+	/** Each frame recorded turns the stream not ready again: one frame per grant. */
+	final AtomicBoolean oneFramePerReady = new AtomicBoolean();
+
 	@Override
 	public boolean isReady() {
 		return this.ready.get();
@@ -62,6 +65,9 @@ final class FakeServerObserver extends ServerCallStreamObserver<Frame> {
 			throw new RuntimeException("stream died");
 		}
 		this.sent.add(frame);
+		if (this.oneFramePerReady.get()) {
+			this.ready.set(false);
+		}
 		this.firstSent.countDown();
 	}
 

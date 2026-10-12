@@ -1,6 +1,8 @@
 package am.ik.sluice.server.tunnel;
 
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import am.ik.sluice.server.auth.TokenValidator;
 import am.ik.sluice.server.cluster.NodeDirectory;
@@ -11,13 +13,12 @@ import am.ik.sluice.tunnel.SessionSender;
 import am.ik.sluice.v1.proto.Frame;
 import am.ik.sluice.v1.proto.PeerBuild;
 import am.ik.sluice.v1.proto.TunnelGrpc;
-import io.grpc.ServerInterceptors;
-import io.grpc.ServerServiceDefinition;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.grpc.server.service.GrpcService;
@@ -53,6 +54,8 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	private final PeerBuild serverBuild;
 
+	private final Counter stallFailures;
+
 	public TunnelService(Router router, TokenValidator tokenValidator, SessionRegistry sessions,
 			TcpRouteListener tcpRoutes, NodeDirectory nodeDirectory, MembershipBroadcaster membershipBroadcaster,
 			ClusterLifecycle clusterLifecycle, SluiceServerProperties properties, MeterRegistry meterRegistry,
@@ -68,6 +71,17 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 		this.windowUpdatesSent = windowUpdates(meterRegistry, "sent");
 		this.windowUpdatesReceived = windowUpdates(meterRegistry, "received");
 		this.serverBuild = serverBuild;
+		this.stallFailures = Counter.builder("sluice.tunnel.stall.failures")
+			.description("Tunnel sessions failed because their stream held frames queued for the client, "
+					+ "not ready, with none taken for the tunnel stall timeout")
+			.register(meterRegistry);
+		Gauge.builder("sluice.tunnel.stall", sessions,
+				registry -> registry.all().stream().mapToLong(session -> session.stalled().toNanos()).max().orElse(0)
+						/ (double) TimeUnit.SECONDS.toNanos(1))
+			.baseUnit("seconds")
+			.description("How long the most stalled tunnel stream has held frames queued for its client, "
+					+ "not ready, with none taken; 0 when none is stalled")
+			.register(meterRegistry);
 		log.info("server build: {}", PeerBuilds.describe(serverBuild));
 		Gauge
 			.builder("sluice.tunnel.sessions.legacy", sessions,
@@ -119,17 +133,35 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 		String clientId = TunnelAuthInterceptor.CLIENT_ID.get();
 		String finalClientId = clientId == null ? "" : clientId;
 		log.info("tunnel stream established for client {}", finalClientId);
+		@Nullable Runnable reset = TunnelStreamReset.current();
+		// set before the sender starts, so before the watchdog can fire
+		AtomicReference<@Nullable TunnelSession> stalledSession = new AtomicReference<>();
+		SessionSender sender = SessionSender.builder(responseObserver)
+			.windowUpdateSent(this.windowUpdatesSent::increment)
+			.stallTimeout(this.properties.limits().tunnelStallTimeout())
+			.stallAction(stalled -> {
+				this.stallFailures.increment();
+				log.warn("tunnel stream of client {} held frames queued, not ready, with none taken for {}ms: "
+						+ "failing the session", finalClientId, stalled.toMillis());
+				reset(reset, responseObserver);
+				TunnelSession failed = stalledSession.get();
+				if (failed != null) {
+					failed.close();
+				}
+			})
+			.build();
 		TunnelSession session = TunnelSession.builder()
 			.clientId(clientId == null ? "" : clientId)
 			.nodeId(this.properties.node().id())
 			.remoteAddress(Objects.requireNonNullElse(TunnelAuthInterceptor.REMOTE_ADDRESS.get(), ""))
 			.router(this.router)
-			.sender(new SessionSender(responseObserver, this.windowUpdatesSent::increment))
+			.sender(sender)
 			.registry(this.sessions)
 			.tcpRoutes(this.tcpRoutes)
 			.windowUpdateReceived(this.windowUpdatesReceived::increment)
 			.serverBuild(this.serverBuild)
 			.build();
+		stalledSession.set(session);
 		session.start();
 		this.membershipBroadcaster.onSessionCreated(session);
 		return new StreamObserver<>() {
@@ -152,6 +184,24 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			}
 
 		};
+	}
+
+	/**
+	 * Ends the tunnel stream of a stalled session: resets it ({@link TunnelStreamReset}),
+	 * or without a reset closes the call with a status, which reaches the client only
+	 * behind the frames already buffered for it.
+	 */
+	private static void reset(@Nullable Runnable reset, StreamObserver<Frame> responseObserver) {
+		if (reset != null) {
+			reset.run();
+			return;
+		}
+		try {
+			responseObserver.onError(Status.UNAVAILABLE.withDescription("tunnel stream stalled").asRuntimeException());
+		}
+		catch (RuntimeException e) {
+			// the call is already closed
+		}
 	}
 
 	private static StreamObserver<Frame> noopObserver() {

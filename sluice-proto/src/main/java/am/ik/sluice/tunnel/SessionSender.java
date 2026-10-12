@@ -2,6 +2,7 @@ package am.ik.sluice.tunnel;
 
 import org.jspecify.annotations.Nullable;
 
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -10,6 +11,7 @@ import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 
 import java.util.List;
 
@@ -61,6 +63,16 @@ import io.grpc.stub.StreamObserver;
  * {@link #sendData} call keeping the queue alive returned), and by the teardown -- the
  * stop, the end of the call or the death of the worker -- for the queues it drops. The
  * actions run outside the sender's lock; one that throws is ignored.
+ * <p>
+ * A progress watchdog bounds how long the stream may hold the queues back: while
+ * connection frames are queued, the stream is not ready and the worker hands it no
+ * connection frame, the time stalled grows ({@link #stalled()}); a connection frame
+ * handed to the stream resets it. Control frames, which bypass readiness, are no
+ * progress, and with no connection frame queued nothing is stalled, however long the
+ * stream stays not ready. Once the stall reaches the stall timeout the worker stops --
+ * the teardown drops the queues and runs the actions held on them -- and runs the stall
+ * action, which tells the owner to fail the call. A timeout of zero turns the watchdog
+ * off; the stall is still measured.
  */
 public final class SessionSender implements FrameWriter, AutoCloseable {
 
@@ -160,20 +172,102 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	/** Runs for every WINDOW_UPDATE queued; a metrics hook. */
 	private final Runnable windowUpdateSent;
 
+	/** How long a stall may last before the worker stops; zero = never. */
+	private final Duration stallTimeout;
+
+	/**
+	 * Runs once, on the worker, when the watchdog stopped it; gets the stall's length.
+	 */
+	private final Consumer<Duration> stallAction;
+
+	/**
+	 * When the current stall began ({@link System#nanoTime()}); meaningful while
+	 * {@link #stalling}. Guarded by {@link #lock}.
+	 */
+	private long stalledSince;
+
+	/**
+	 * Connection frames wait while the stream is not ready, and none was handed to it
+	 * since {@link #stalledSince}. Guarded by {@link #lock}.
+	 */
+	private boolean stalling;
+
+	/** The stall that stopped the worker; null while the watchdog has not fired. */
+	private volatile @Nullable Duration stallFailure;
+
 	public SessionSender(StreamObserver<Frame> outbound) {
-		this(outbound, () -> {
-		});
+		this(builder(outbound));
 	}
 
 	/**
 	 * A sender that runs {@code windowUpdateSent} for every WINDOW_UPDATE it queues.
 	 */
 	public SessionSender(StreamObserver<Frame> outbound, Runnable windowUpdateSent) {
-		this.outbound = Objects.requireNonNull(outbound, "outbound is required");
-		this.windowUpdateSent = Objects.requireNonNull(windowUpdateSent, "windowUpdateSent is required");
-		if (outbound instanceof CallStreamObserver<?> call) {
+		this(builder(outbound).windowUpdateSent(windowUpdateSent));
+	}
+
+	private SessionSender(Builder builder) {
+		this.outbound = Objects.requireNonNull(builder.outbound, "outbound is required");
+		this.windowUpdateSent = Objects.requireNonNull(builder.windowUpdateSent, "windowUpdateSent is required");
+		this.stallTimeout = Objects.requireNonNull(builder.stallTimeout, "stallTimeout is required");
+		this.stallAction = Objects.requireNonNull(builder.stallAction, "stallAction is required");
+		if (this.stallTimeout.isNegative()) {
+			throw new IllegalArgumentException("stallTimeout must not be negative: " + this.stallTimeout);
+		}
+		if (this.outbound instanceof CallStreamObserver<?> call) {
 			call.setOnReadyHandler(this::wakeWorker);
 		}
+	}
+
+	public static Builder builder(StreamObserver<Frame> outbound) {
+		return new Builder(outbound);
+	}
+
+	public static final class Builder {
+
+		private final StreamObserver<Frame> outbound;
+
+		private Runnable windowUpdateSent = () -> {
+		};
+
+		private Duration stallTimeout = Duration.ZERO;
+
+		private Consumer<Duration> stallAction = stalled -> {
+		};
+
+		private Builder(StreamObserver<Frame> outbound) {
+			this.outbound = Objects.requireNonNull(outbound, "outbound is required");
+		}
+
+		/** Runs for every WINDOW_UPDATE queued; a metrics hook. */
+		public Builder windowUpdateSent(Runnable windowUpdateSent) {
+			this.windowUpdateSent = windowUpdateSent;
+			return this;
+		}
+
+		/**
+		 * How long connection frames may wait on a stream that is not ready, no frame
+		 * handed to it, before the worker stops; zero (the default) = never.
+		 */
+		public Builder stallTimeout(Duration stallTimeout) {
+			this.stallTimeout = stallTimeout;
+			return this;
+		}
+
+		/**
+		 * Runs once, on the worker thread and outside the sender's lock, after the
+		 * watchdog stopped the worker; gets how long the stream stalled. The owner fails
+		 * the call here: the stopped sender sends nothing more.
+		 */
+		public Builder stallAction(Consumer<Duration> stallAction) {
+			this.stallAction = stallAction;
+			return this;
+		}
+
+		public SessionSender build() {
+			return new SessionSender(this);
+		}
+
 	}
 
 	/** Wakes the worker; a readiness change may let it pop a frame. */
@@ -262,6 +356,25 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		try {
 			ConnectionQueue queue = this.queues.get(connectionId);
 			return queue == null ? 0 : queue.wakes;
+		}
+		finally {
+			this.lock.unlock();
+		}
+	}
+
+	/** The configured stall timeout; zero = the watchdog is off. */
+	public Duration stallTimeout() {
+		return this.stallTimeout;
+	}
+
+	/**
+	 * How long the stream has stalled: connection frames queued, the stream not ready and
+	 * no connection frame handed to it. Zero while nothing is stalled.
+	 */
+	public Duration stalled() {
+		this.lock.lock();
+		try {
+			return this.stalling ? Duration.ofNanos(System.nanoTime() - this.stalledSince) : Duration.ZERO;
 		}
 		finally {
 			this.lock.unlock();
@@ -579,10 +692,14 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 				// unguarded races the delayed call's start, where grpc's isReady NPEs
 				ConnectionQueue head = this.ring.peekFirst();
 				if (head == null || outboundReady()) {
+					this.stalling = false;
 					ConnectionQueue queue = this.ring.pollFirst();
 					if (queue != null) {
 						return pop(queue);
 					}
+				}
+				else if (stalledPastTimeout()) {
+					return null;
 				}
 				try {
 					this.wakeWorker.awaitNanos(TimeUnit.MILLISECONDS.toNanos(100));
@@ -596,6 +713,26 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		finally {
 			this.lock.unlock();
 		}
+	}
+
+	/**
+	 * Accounts a wait for readiness with connection frames queued: starts the stall clock
+	 * if it is not running, and tells whether the stall reached the timeout -- then
+	 * records it as the failure that stops the worker. With the lock held.
+	 */
+	private boolean stalledPastTimeout() {
+		long now = System.nanoTime();
+		if (!this.stalling) {
+			this.stalling = true;
+			this.stalledSince = now;
+			return false;
+		}
+		long stalled = now - this.stalledSince;
+		if (this.stallTimeout.isZero() || stalled < this.stallTimeout.toNanos()) {
+			return false;
+		}
+		this.stallFailure = Duration.ofNanos(stalled);
+		return true;
 	}
 
 	/**
@@ -639,6 +776,10 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 			while (true) {
 				Next next = next();
 				if (next == null) {
+					Duration stalled = this.stallFailure;
+					if (stalled != null) {
+						failStalled(stalled);
+					}
 					return;
 				}
 				try {
@@ -655,6 +796,23 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		}
 		finally {
 			complete();
+		}
+	}
+
+	/**
+	 * The watchdog fired: stops the sender -- dropping the queues and running the actions
+	 * held on them, so the slots of ended connections free at once -- and hands the stall
+	 * to the owner, which fails the call.
+	 */
+	private void failStalled(Duration stalled) {
+		this.running = false;
+		releaseWaiters();
+		dropQueues();
+		try {
+			this.stallAction.accept(stalled);
+		}
+		catch (RuntimeException e) {
+			// the owner's failure; the worker's teardown goes on
 		}
 	}
 

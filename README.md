@@ -263,6 +263,7 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.limits.idle-timeout` | `60s` | how long a plaintext or TLS-terminated HTTP connection may idle between requests before it is closed; see "Connection limits" |
 | `sluice.limits.stall-timeout` | `60s` | how long a request or response in flight on a plaintext or TLS-terminated HTTP connection may wait on its client without progress before the connection is closed; see "Connection limits" |
 | `sluice.limits.stall-min-bytes` | `16KB` | the bytes moved to or from the client that count as progress against `stall-timeout` (`1B`: every byte counts) |
+| `sluice.limits.tunnel-stall-timeout` | `60s` | how long a tunnel stream may hold frames queued for its client while not ready, the client taking none of them, before the session is failed; `0` = off; see "Connection limits" |
 | `sluice.limits.half-close-probe-interval` | `1s` | quiet after which a plaintext or TLS-terminated HTTP/1.1 connection whose client ended its side, a response owed, gets a `100 Continue` to learn whether the client is gone; `0` = off; see "Connection limits" |
 | `sluice.limits.h2-queue-budget` | `0` = an eighth of half the max heap | bytes the h2 demux relays may queue towards upstreams beyond each connection's allowance, shared by all of them; see "Connection limits" |
 | `sluice.tcp-port-range` | (unset = any port) | listen ports a client may claim for tcp routes, comma separated single ports or `min-max` ranges (e.g. `9000-9010,8080`); a port outside the range is not bound |
@@ -293,6 +294,7 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.server-url` | - | tunnel server endpoint (`grpc://host:port` / `grpcs://host:port`) |
 | `sluice.client.id` | random, once per process | stable client identity sent as `x-sluice-id` on every stream; breaks route / listen-port ties in cluster mode |
 | `sluice.client.max-connections` | `0` = derived from the max heap | upstream connections open at once over every server node; a `CONNECT` beyond it is answered with an ERROR without dialing |
+| `sluice.client.tunnel-stall-timeout` | `60s` | how long a tunnel stream may hold frames queued for the server while not ready, the server taking none of them, before the stream is cancelled and reconnected; `0` = off; see "Connection limits" |
 | `sluice.client.upstream[n].host` | - | public domain routed by the server (empty = catch-all) |
 | `sluice.client.upstream[n].host-pattern` | - | regular expression the request host (without its port) is matched against, whole match; tried after the exact matches, before the catch-all, in natural order; overrides `host` when set |
 | `sluice.client.upstream[n].target` | - | upstream URL: `http://` (default when the scheme is omitted), `https://` (TLS terminated by the client), or `tcp://` (raw relay, e.g. a TLS endpoint in passthrough mode) |
@@ -658,6 +660,20 @@ the new route until the frames queued for the previous one left. So the send que
 ended connections stay within the bound; while a stream stays not ready, their slots stay
 taken until it drains or the session ends.
 
+A peer that stops reading the tunnel stream while it keeps the connection alive (it answers
+the keepalive pings) would hold those slots for good, so a progress watchdog bounds the
+wait on both sides: once connection frames waited `sluice.limits.tunnel-stall-timeout`
+(server) / `sluice.client.tunnel-stall-timeout` (client) with the stream not ready and none
+of them handed to it, the sender drops its queued frames, which frees their slots, and the
+stream is reset: the server fails the session (its routes are removed and its live
+connections fail with it, the client reconnects), the client cancels the stream and
+reconnects. A frame handed to the stream restarts the wait, so a peer that reads slowly but
+keeps taking frames is not cut; control frames, which bypass flow control, do not count, and
+with no connection frame queued nothing is stalled. The time stalled is exported as
+`sluice.tunnel.stall`, the streams failed as `sluice.tunnel.stall.failures`. No share of the
+server's slots is reserved per client: tunnel clients are authenticated, and the watchdog
+bounds how long one can hold slots.
+
 ## Health / metrics
 
 - server `GET /actuator/health` - liveness, UP while the process lives; details `clients`
@@ -665,7 +681,7 @@ taken until it drains or the session ends.
   cluster warmup window and while draining (see "Cluster (scale-out)")
 - client `GET /actuator/health` (port 9001) - UP while at least one per-node tunnel stream is
   established; the `tunnel` detail shows the connection state and `nodes` each node's stream state
-- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`, `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_tunnel_sessions_legacy` / `sluice_tunnel_sessions_build_unknown` (connected clients without a per-connection window / without a build, see "Console"), `sluice_h2demux_queued_bytes` (bytes the h2 demux holds queued towards upstreams, one series per route), `sluice_h2demux_budget_bytes` / `sluice_h2demux_budget_used_bytes` (the shared h2 queue budget and the bytes charged to it, which may pass the budget by what the relays cannot refuse), `sluice_h2demux_window_withheld_total` (times a connection window was withheld for want of budget), `sluice_h2demux_streams_refused_total` (`reason` = `budget` / `leg-limit` / `waiting`: a stream waiting for its upstream's concurrency limit refused to free a connection whose window is withheld), `sluice_h2demux_streams_reset_total` (streams the relay reset on its own account, `reason` = `budget` / `protocol`) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_rejected_total` (`reason` = `limit` / `address-limit` / `head-timeout`) / `sluice_data_connections_idle_closed_total` (connections closed for idling between requests) / `sluice_data_connections_stall_closed_total` (connections closed for an exchange stalled on its client)
+- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`, `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_tunnel_stall_seconds` (how long a tunnel stream has held frames queued for its peer, not ready, with none taken; on the server the most stalled session's, 0 when none) / `sluice_tunnel_stall_failures_total` (tunnel streams failed by the stall watchdog), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_tunnel_sessions_legacy` / `sluice_tunnel_sessions_build_unknown` (connected clients without a per-connection window / without a build, see "Console"), `sluice_h2demux_queued_bytes` (bytes the h2 demux holds queued towards upstreams, one series per route), `sluice_h2demux_budget_bytes` / `sluice_h2demux_budget_used_bytes` (the shared h2 queue budget and the bytes charged to it, which may pass the budget by what the relays cannot refuse), `sluice_h2demux_window_withheld_total` (times a connection window was withheld for want of budget), `sluice_h2demux_streams_refused_total` (`reason` = `budget` / `leg-limit` / `waiting`: a stream waiting for its upstream's concurrency limit refused to free a connection whose window is withheld), `sluice_h2demux_streams_reset_total` (streams the relay reset on its own account, `reason` = `budget` / `protocol`) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_rejected_total` (`reason` = `limit` / `address-limit` / `head-timeout`) / `sluice_data_connections_idle_closed_total` (connections closed for idling between requests) / `sluice_data_connections_stall_closed_total` (connections closed for an exchange stalled on its client)
 
 ## Console
 

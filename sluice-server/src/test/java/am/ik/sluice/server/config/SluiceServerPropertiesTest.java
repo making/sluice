@@ -86,6 +86,16 @@ class SluiceServerPropertiesTest {
 		assertThat(properties.limits().halfCloseProbeInterval()).isEqualTo(Duration.ofSeconds(1));
 		assertThat(properties.limits().stallTimeout()).isEqualTo(Duration.ofSeconds(60));
 		assertThat(properties.limits().stallMinBytes().toBytes()).isEqualTo(16 * 1024);
+		assertThat(properties.limits().tunnelStallTimeout()).isEqualTo(Duration.ofSeconds(60));
+	}
+
+	@Test
+	void aZeroTunnelStallTimeoutTurnsTheWatchdogOffAndANegativeOneFallsBackToTheDefault() {
+		assertThat(bind(Map.of("sluice.limits.tunnel-stall-timeout", "0")).limits().tunnelStallTimeout()).isZero();
+		assertThat(bind(Map.of("sluice.limits.tunnel-stall-timeout", "-1s")).limits().tunnelStallTimeout())
+			.isEqualTo(Duration.ofSeconds(60));
+		assertThat(bind(Map.of("sluice.limits.tunnel-stall-timeout", "90s")).limits().tunnelStallTimeout())
+			.isEqualTo(Duration.ofSeconds(90));
 	}
 
 	@Test

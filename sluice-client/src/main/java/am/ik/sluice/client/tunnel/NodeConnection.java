@@ -1,6 +1,7 @@
 package am.ik.sluice.client.tunnel;
 
 import java.net.Socket;
+import java.time.Duration;
 import javax.net.ssl.TrustManagerFactory;
 
 import java.util.List;
@@ -40,6 +41,7 @@ import io.grpc.stub.MetadataUtils;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.boot.ssl.SslBundle;
 import org.springframework.core.task.TaskExecutor;
@@ -122,6 +124,8 @@ public final class NodeConnection implements AutoCloseable {
 
 	private final Counter windowUpdatesReceived;
 
+	private final Counter stallFailures;
+
 	private final AtomicReference<SessionSender> senderRef = new AtomicReference<>();
 
 	private volatile boolean running;
@@ -170,6 +174,20 @@ public final class NodeConnection implements AutoCloseable {
 			.register(meterRegistry);
 		this.windowUpdatesSent = windowUpdates(meterRegistry, metricsTag, "sent");
 		this.windowUpdatesReceived = windowUpdates(meterRegistry, metricsTag, "received");
+		this.stallFailures = Counter.builder("sluice.tunnel.stall.failures")
+			.tag("node", metricsTag)
+			.description("Tunnel streams cancelled because they held frames queued for the server, "
+					+ "not ready, with none taken for the tunnel stall timeout")
+			.register(meterRegistry);
+		Gauge.builder("sluice.tunnel.stall", this.senderRef, senderRef -> {
+			SessionSender sender = senderRef.get();
+			return sender == null ? 0 : sender.stalled().toNanos() / (double) TimeUnit.SECONDS.toNanos(1);
+		})
+			.tag("node", metricsTag)
+			.baseUnit("seconds")
+			.description("How long the tunnel stream has held frames queued for the server, not ready, "
+					+ "with none taken; 0 when it is not stalled")
+			.register(meterRegistry);
 	}
 
 	private static Counter windowUpdates(MeterRegistry meterRegistry, String node, String direction) {
@@ -395,7 +413,11 @@ public final class NodeConnection implements AutoCloseable {
 			@Override
 			public void beforeStart(ClientCallStreamObserver<Frame> call) {
 				// the onReady handler may only be installed during beforeStart
-				SessionSender sender = new SessionSender(call, windowUpdatesSent::increment);
+				SessionSender sender = SessionSender.builder(call)
+					.windowUpdateSent(windowUpdatesSent::increment)
+					.stallTimeout(properties.tunnelStallTimeout())
+					.stallAction(stalled -> failStalled(call, stalled))
+					.build();
 				sender.start();
 				senderRef.set(sender);
 			}
@@ -443,6 +465,18 @@ public final class NodeConnection implements AutoCloseable {
 		// connections are dropped, the peer is gone anyway
 		sender.close();
 		this.closeConnections();
+	}
+
+	/**
+	 * The sender's watchdog fired: cancels the call, which resets the stream at once (a
+	 * half-close would wait behind the frames the server does not take); its end tears
+	 * the session down and the loop reconnects.
+	 */
+	private void failStalled(ClientCallStreamObserver<Frame> call, Duration stalled) {
+		this.stallFailures.increment();
+		log.warn("[{}] tunnel stream held frames queued, not ready, with none taken for {}ms: cancelling it", this.key,
+				stalled.toMillis());
+		call.cancel("tunnel stream stalled", null);
 	}
 
 	/**
@@ -691,6 +725,12 @@ public final class NodeConnection implements AutoCloseable {
 	int queuedConnectionsForTest() {
 		SessionSender sender = this.senderRef.get();
 		return sender == null ? 0 : sender.connectionQueues();
+	}
+
+	/** The stall timeout of the stream's sender; zero without a stream. For tests. */
+	Duration stallTimeoutForTest() {
+		SessionSender sender = this.senderRef.get();
+		return sender == null ? Duration.ZERO : sender.stallTimeout();
 	}
 
 	Map<Long, VirtualConnection> connectionsForTest() {

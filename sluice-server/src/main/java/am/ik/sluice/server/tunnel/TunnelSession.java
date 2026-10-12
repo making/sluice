@@ -235,6 +235,14 @@ public final class TunnelSession implements AutoCloseable {
 	}
 
 	/**
+	 * How long the session's stream has held frames queued for the client, not ready,
+	 * with none taken; zero while it is not stalled.
+	 */
+	public Duration stalled() {
+		return this.sender.stalled();
+	}
+
+	/**
 	 * Peer address ({@code host:port}) of the client's tunnel stream; empty when unknown.
 	 */
 	public String remoteAddress() {
