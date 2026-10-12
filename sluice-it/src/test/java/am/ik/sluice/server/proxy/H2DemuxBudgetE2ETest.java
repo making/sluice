@@ -507,20 +507,32 @@ class H2DemuxBudgetE2ETest {
 	/**
 	 * A connection whose window is withheld gets it once another connection frees budget
 	 * -- here by going away -- though none of its own queued bytes drained: its upstream
-	 * still does not read.
+	 * still does not read. Both connections are withheld, each on a route of its own so
+	 * its queue is its route's; the one left waiting is the one with the smaller share of
+	 * the budget, the only one whose share alone may leave the budget room: a relay
+	 * granted while the budget had room is charged the DATA that follows regardless, so
+	 * one share may pass the whole budget.
 	 */
 	@Test
 	void withheldWindowIsGrantedOnceAnotherConnectionFreesTheBudget() throws Exception {
-		String route = "bud.wake.test";
+		String firstRoute = "bud.wake.first.test";
+		String secondRoute = "bud.wake.second.test";
 		CountDownLatch gate = new CountDownLatch(1);
-		startClient(route, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
-		try (Stalled first = stall(route); Stalled second = stall(route)) {
-			awaitStable(() -> queuedBytes(route));
+		startClient(firstRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
+		startClient(secondRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
+		try (Stalled first = stall(firstRoute); Stalled second = stall(secondRoute)) {
+			awaitStable(() -> queuedBytes(firstRoute) + queuedBytes(secondRoute));
 			assertThat(budgetUsed()).as("exhausted").isGreaterThanOrEqualTo(BUDGET);
+			assertThat(first.client().connectionWindow()).as("the first connection's window withheld").isZero();
+			assertThat(second.client().connectionWindow()).as("the second connection's window withheld").isZero();
 			assertThat(Objects.requireNonNull(this.limits).h2Budget().waiting()).as("withheld windows wait")
-				.isPositive();
-			Stalled waiting = first.withheld() ? first : second;
+				.isEqualTo(2);
+			long firstShare = budgetShare(firstRoute);
+			long secondShare = budgetShare(secondRoute);
+			Stalled waiting = firstShare <= secondShare ? first : second;
 			Stalled leaving = waiting == first ? second : first;
+			assertThat(Math.min(firstShare, secondShare)).as("the waiting connection's share leaves room")
+				.isLessThan(BUDGET);
 			long granted = waiting.client().connectionGranted();
 			leaving.close();
 			assertThat(waiting.client()
@@ -531,7 +543,8 @@ class H2DemuxBudgetE2ETest {
 			gate.countDown();
 			waiting.awaitEnds();
 		}
-		awaitReleased(route);
+		awaitReleased(firstRoute);
+		awaitReleased(secondRoute);
 	}
 
 	/**
@@ -1132,6 +1145,11 @@ class H2DemuxBudgetE2ETest {
 	private long budgetGauge() {
 		return Math
 			.round(Objects.requireNonNull(this.meterRegistry).get("sluice.h2demux.budget.bytes").gauge().value());
+	}
+
+	/** The part of the route's queue charged to the budget: its relay's share. */
+	private long budgetShare(String route) {
+		return Math.max(0, queuedBytes(route) - Http2DemuxRelay.CONNECTION_ALLOWANCE);
 	}
 
 	private long budgetUsed() {
