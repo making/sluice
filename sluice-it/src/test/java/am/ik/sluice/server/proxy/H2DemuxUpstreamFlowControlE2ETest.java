@@ -384,6 +384,74 @@ class H2DemuxUpstreamFlowControlE2ETest {
 				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(Integer.MAX_VALUE)));
 	}
 
+	/**
+	 * An upstream connection-level WINDOW_UPDATE of a length other than 4 ends the relay
+	 * (a connection error {@code FRAME_SIZE_ERROR}, RFC 9113 6.9).
+	 */
+	@Test
+	void connectionWindowUpdateOfAWrongLengthEndsTheConnection() throws Exception {
+		assertOffenceEndsTheConnection("uf.length-connection.test",
+				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 0, new byte[] { 0, 0, 1 }));
+	}
+
+	/**
+	 * An upstream stream-level WINDOW_UPDATE of a length other than 4 ends the relay
+	 * whatever the stream.
+	 */
+	@Test
+	void streamWindowUpdateOfAWrongLengthEndsTheConnection() throws Exception {
+		assertOffenceEndsTheConnection("uf.length-stream.test",
+				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 1, new byte[] { 0, 0, 0, 1, 0 }));
+	}
+
+	/**
+	 * An upstream connection-level WINDOW_UPDATE with an increment of 0 ends the relay.
+	 */
+	@Test
+	void zeroConnectionWindowIncrementEndsTheConnection() throws Exception {
+		assertOffenceEndsTheConnection("uf.zero-connection.test",
+				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(0)));
+	}
+
+	/**
+	 * An upstream stream-level WINDOW_UPDATE with an increment of 0 on an open stream
+	 * ends the relay (a stream error, treated as a connection error).
+	 */
+	@Test
+	void zeroStreamWindowIncrementEndsTheConnection() throws Exception {
+		assertOffenceEndsTheConnection("uf.zero-stream.test",
+				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(0)));
+	}
+
+	/**
+	 * An upstream WINDOW_UPDATE with an increment of 0 on a stream the relay no longer
+	 * tracks -- its request and response ended -- is ignored: the connection serves the
+	 * next stream.
+	 */
+	@Test
+	void zeroIncrementOnAnUntrackedStreamKeepsTheConnection() throws Exception {
+		String route = "uf.zero-untracked.test";
+		startClient(route, upstream(new AtomicReference<>(), upstream -> {
+			TestH2.@Nullable Frame frame;
+			while ((frame = upstream.next()) != null) {
+				if (frame.type() == TestH2.HEADERS) {
+					answer(upstream, frame.streamId(), "ok");
+					// the relay reads the response's end, which untracks the stream,
+					// first
+					upstream.write(TestH2.WINDOW_UPDATE, 0, frame.streamId(), TestH2.int32(0));
+				}
+			}
+		}));
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
+			client.headers(1, true, get(route));
+			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
+			client.headers(3, true, get(route));
+			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).isTrue();
+			assertThat(TestH2.bodyOf(client.frames(3))).isEqualTo("ok");
+			assertThat(client.closed()).isFalse();
+		}
+	}
+
 	/** An upstream SETTINGS_INITIAL_WINDOW_SIZE above 2^31-1 ends the relay. */
 	@Test
 	void initialWindowAboveTheMaximumEndsTheConnection() throws Exception {

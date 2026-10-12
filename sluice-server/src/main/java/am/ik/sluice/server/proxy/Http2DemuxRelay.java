@@ -53,9 +53,11 @@ import io.micrometer.core.instrument.MeterRegistry;
  * advertises {@link #MAX_CONCURRENT_STREAMS}, refuses a stream beyond it, and grants a
  * stream's window as far as the stream's queued payload and its window stay within
  * {@link #STREAM_BUDGET} -- the leg writer's drain makes room, padding never takes any. A
- * client sending past a stream window gets a GOAWAY {@code FLOW_CONTROL_ERROR}. A header
- * block is written whole in either direction, and the relay's own connection-level frames
- * towards an upstream are written ahead of the request frames queued for it.
+ * client sending past a stream window gets a GOAWAY {@code FLOW_CONTROL_ERROR}; a client
+ * WINDOW_UPDATE RFC 9113 6.9 makes an error ends the connection or resets its stream
+ * ({@link #onClientWindowUpdate}), one from an upstream ends the relay. A header block is
+ * written whole in either direction, and the relay's own connection-level frames towards
+ * an upstream are written ahead of the request frames queued for it.
  * <p>
  * What the relay queues is bounded across connections too: each relay may queue
  * {@link #CONNECTION_ALLOWANCE}, and the bytes beyond it are charged to the
@@ -157,6 +159,8 @@ final class Http2DemuxRelay {
 	private static final int FRAME_HEADER_LENGTH = 9;
 
 	private static final int ERROR_NO_ERROR = 0x0;
+
+	private static final int ERROR_PROTOCOL = 0x1;
 
 	private static final int ERROR_FLOW_CONTROL = 0x3;
 
@@ -843,8 +847,9 @@ final class Http2DemuxRelay {
 	 * the latter's window granted back to the upstream. The stream owes no response any
 	 * more, and whatever the upstream or the client still sends on it is dropped. It
 	 * stays counted against the advertised limit until its reset is written to the
-	 * upstream. Called by the outbound parse; a stream already reset by either side is
-	 * left alone, and {@code false} returned.
+	 * upstream. Called by the outbound parse; a stream already reset by either side, or
+	 * closed both ways (END_STREAM received from the client and written to it), is left
+	 * alone, and {@code false} returned.
 	 */
 	private boolean resetStream(Stream stream, int errorCode) {
 		int dropped;
@@ -852,7 +857,7 @@ final class Http2DemuxRelay {
 		synchronized (this.sinkLock) {
 			this.lock.lock();
 			try {
-				if (stream.reset) {
+				if (stream.reset || (stream.clientEnded && stream.responseEnded)) {
 					return false;
 				}
 				dropped = resetLocked(stream);
@@ -894,19 +899,36 @@ final class Http2DemuxRelay {
 	/**
 	 * A client stream-level WINDOW_UPDATE: relayed to the stream's leg, coalesced into
 	 * the one still queued for the stream if any. A connection-level one credits the
-	 * relay's send window towards the client.
+	 * relay's send window towards the client. RFC 9113 6.9: a length other than 4 ends
+	 * the connection with GOAWAY {@code FRAME_SIZE_ERROR} whatever the stream, an
+	 * increment of 0 with GOAWAY {@code PROTOCOL_ERROR} on stream 0, and resets the
+	 * stream with {@code PROTOCOL_ERROR} otherwise -- unless the stream is no longer
+	 * tracked, or closed both ways (RFC 9113 5.1 has such frames ignored).
 	 */
 	private void onClientWindowUpdate(Frame frame) {
 		if (frame.length() != 4) {
+			goAway(ERROR_FRAME_SIZE);
+			abort();
 			return;
 		}
 		int increment = int31(frame.bytes(), frame.payload());
 		if (frame.streamId() == 0) {
+			if (increment == 0) {
+				goAway(ERROR_PROTOCOL);
+				abort();
+				return;
+			}
 			creditClientWindow(increment);
 			return;
 		}
 		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
-		if (stream == null || increment == 0) {
+		if (stream == null) {
+			return;
+		}
+		if (increment == 0) {
+			if (resetStream(stream, ERROR_PROTOCOL)) {
+				this.meters.resetForProtocol();
+			}
 			return;
 		}
 		this.lock.lock();
@@ -2049,10 +2071,13 @@ final class Http2DemuxRelay {
 		}
 
 		/**
-		 * The upstream's connection-level WINDOW_UPDATE; {@code false} when the window
-		 * would pass 2^31-1.
+		 * The upstream's connection-level WINDOW_UPDATE; {@code false} when the increment
+		 * is 0 or the window would pass 2^31-1.
 		 */
 		boolean creditConnection(int increment) {
+			if (increment == 0) {
+				return false;
+			}
 			Http2DemuxRelay.this.lock.lock();
 			try {
 				this.sendWindow += increment;
@@ -2069,13 +2094,17 @@ final class Http2DemuxRelay {
 
 		/**
 		 * The upstream's WINDOW_UPDATE of a stream of the leg; {@code false} when the
-		 * window would pass 2^31-1. Updates of streams the relay forgot are void.
+		 * increment is 0 or the window would pass 2^31-1. Updates of streams the relay
+		 * forgot are void.
 		 */
 		boolean creditStream(Stream stream, int increment) {
 			Http2DemuxRelay.this.lock.lock();
 			try {
 				if (!stream.active) {
 					return true;
+				}
+				if (increment == 0) {
+					return false;
 				}
 				stream.upstreamWindow += increment;
 				if (stream.upstreamWindow > MAX_WINDOW) {
@@ -2562,10 +2591,11 @@ final class Http2DemuxRelay {
 				}
 				leg.queueSettingsAck();
 			}
-			else if (type == FRAME_WINDOW_UPDATE && frameLength == 4) {
-				int increment = int31(all, payload);
-				if (increment > 0 && !leg.creditConnection(increment)) {
-					abort(); // a window past 2^31-1: a connection error
+			else if (type == FRAME_WINDOW_UPDATE) {
+				requireWindowUpdateLength(frameLength);
+				// an increment of 0, or a window past 2^31-1: a connection error
+				if (!leg.creditConnection(int31(all, payload))) {
+					abort();
 				}
 			}
 			else if (type == FRAME_PING && (flags & FLAG_ACK) == 0 && frameLength == 8) {
@@ -2977,17 +3007,27 @@ final class Http2DemuxRelay {
 
 	/**
 	 * The upstream's stream window grant, credited to the relay's send window of the
-	 * stream; one past 2^31-1 ends the relay (a stream error, which RFC 9113 5.4.1 lets
-	 * an endpoint treat as a connection error).
+	 * stream; an increment of 0 or a window past 2^31-1 ends the relay (stream errors,
+	 * which RFC 9113 5.4.2 lets an endpoint treat as connection errors).
 	 */
 	private void onUpstreamWindowUpdate(Leg leg, Frame frame) {
+		requireWindowUpdateLength(frame.length());
 		Stream stream = this.streams.get(Integer.valueOf(frame.streamId()));
-		if (stream == null || stream.leg != leg || frame.length() != 4) {
+		if (stream == null || stream.leg != leg) {
 			return;
 		}
-		int increment = int31(frame.bytes(), frame.payload());
-		if (increment > 0 && !leg.creditStream(stream, increment)) {
+		if (!leg.creditStream(stream, int31(frame.bytes(), frame.payload()))) {
 			abort();
+		}
+	}
+
+	/**
+	 * An upstream WINDOW_UPDATE of a length other than 4 is a connection error
+	 * {@code FRAME_SIZE_ERROR} whatever its stream (RFC 9113 6.9): it ends the relay.
+	 */
+	private static void requireWindowUpdateLength(int length) {
+		if (length != 4) {
+			throw new IllegalStateException("upstream WINDOW_UPDATE of %d bytes".formatted(length));
 		}
 	}
 

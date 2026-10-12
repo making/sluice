@@ -68,6 +68,8 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -82,7 +84,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * shared fairly by the streams of every route, and an upstream is held back by its own
  * connection window while its data waits. A leg whose data waits keeps reading its
  * upstream: pings are acked, window updates credited, heads of other streams relayed. In
- * the relay's package for the data proxy's connection count.
+ * the relay's package for the data proxy's connection count. A client WINDOW_UPDATE RFC
+ * 9113 6.9 makes an error ends the connection or resets its stream.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -92,9 +95,15 @@ class H2DemuxClientWindowE2ETest {
 
 	private static final int WINDOW = WindowedH2Upstream.DEFAULT_WINDOW;
 
+	private static final int PROTOCOL_ERROR = 0x1;
+
+	private static final int FRAME_SIZE_ERROR = 0x6;
+
 	private static final int CANCEL = 0x8;
 
 	private static final int SETTINGS_INITIAL_WINDOW_SIZE = 0x4;
+
+	private static final AtomicLong PINGS = new AtomicLong();
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
@@ -315,6 +324,163 @@ class H2DemuxClientWindowE2ETest {
 			client.frame(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(11));
 			assertThat(client.awaitTrue(client::closed, Duration.ofSeconds(5))).isTrue();
 			assertThat(client.goAwayCode()).isEqualTo(TestH2.FLOW_CONTROL_ERROR);
+		}
+	}
+
+	/**
+	 * A client WINDOW_UPDATE of a length other than 4 ends the connection with GOAWAY
+	 * {@code FRAME_SIZE_ERROR}, on stream 0 as on an open stream (RFC 9113 6.9).
+	 */
+	@ParameterizedTest
+	@CsvSource({ "0, 3", "0, 5", "1, 3", "1, 5" })
+	void windowUpdateOfAWrongLengthEndsTheConnection(int streamId, int length) throws Exception {
+		String route = "cw.wu-length-%d-%d.test".formatted(streamId, length);
+		try (H2TestClient client = openHeldStream(route)) {
+			byte[] payload = new byte[length];
+			payload[length - 1] = 1;
+			client.frame(TestH2.WINDOW_UPDATE, 0, streamId, payload);
+			assertThat(client.awaitTrue(client::closed, Duration.ofSeconds(5))).as("the relay closed the connection")
+				.isTrue();
+			assertThat(client.goAwayCode()).isEqualTo(FRAME_SIZE_ERROR);
+		}
+	}
+
+	/**
+	 * A client connection-level WINDOW_UPDATE with an increment of 0 ends the connection
+	 * with GOAWAY {@code PROTOCOL_ERROR} (RFC 9113 6.9).
+	 */
+	@Test
+	void zeroConnectionWindowIncrementEndsTheConnection() throws Exception {
+		try (H2TestClient client = openHeldStream("cw.wu-zero-connection.test")) {
+			client.frame(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(0));
+			assertThat(client.awaitTrue(client::closed, Duration.ofSeconds(5))).as("the relay closed the connection")
+				.isTrue();
+			assertThat(client.goAwayCode()).isEqualTo(PROTOCOL_ERROR);
+		}
+	}
+
+	/**
+	 * A client stream-level WINDOW_UPDATE with an increment of 0 on an open stream resets
+	 * that stream only (RFC 9113 6.9): RST_STREAM {@code PROTOCOL_ERROR} to the client,
+	 * {@code CANCEL} to the upstream, counted once with reason {@code protocol} -- a
+	 * second one, once the reset stream is no longer tracked, changes nothing --, and the
+	 * connection's other stream completes.
+	 */
+	@Test
+	void zeroStreamWindowIncrementResetsOnlyThatStream() throws Exception {
+		String route = "cw.wu-zero-stream.test";
+		List<TestH2.Frame> received = new CopyOnWriteArrayList<>();
+		startClient(route, upstream(new AtomicReference<>(), upstream -> {
+			upstream.settings(null);
+			TestH2.@Nullable Frame frame;
+			while ((frame = upstream.next()) != null) {
+				received.add(frame);
+				if (frame.type() == TestH2.DATA && (frame.flags() & TestH2.FLAG_END_STREAM) != 0) {
+					upstream.headers(frame.streamId(), false);
+					upstream.write(TestH2.DATA, TestH2.FLAG_END_STREAM, frame.streamId(),
+							"ok".getBytes(StandardCharsets.US_ASCII));
+				}
+			}
+		}));
+		double protocolResets = resets("protocol");
+		double budgetResets = resets("budget");
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
+			client.headers(1, false, post(route));
+			client.headers(3, false, post(route));
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.until(() -> received.stream().filter(frame -> frame.type() == TestH2.HEADERS).count() == 2);
+			assertThat(trackedStreams(route)).as("both streams open").isEqualTo(2);
+			client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(0));
+			assertThat(client.awaitTrue(() -> client.reset(1) != null, Duration.ofSeconds(5))).isTrue();
+			assertThat(client.reset(1)).isEqualTo(PROTOCOL_ERROR);
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.untilAsserted(() -> assertThat(upstreamResets(received)).containsExactly(List.of(1, CANCEL)));
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> trackedStreams(route) == 1);
+			client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(0));
+			awaitPingAck(client);
+			List<TestH2.Frame> frames = client.frames(1);
+			assertThat(frames).filteredOn(frame -> frame.type() == TestH2.RST_STREAM).as("one reset").hasSize(1);
+			assertThat(frames.get(frames.size() - 1).type()).as("nothing follows the reset")
+				.isEqualTo(TestH2.RST_STREAM);
+			assertThat(resets("protocol") - protocolResets).isEqualTo(1);
+			assertThat(resets("budget") - budgetResets).isZero();
+			client.sendData(3, "x".getBytes(StandardCharsets.US_ASCII), TestH2.FLAG_END_STREAM);
+			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).isTrue();
+			assertThat(TestH2.bodyOf(client.frames(3))).isEqualTo("ok");
+			assertThat(client.closed()).isFalse();
+			assertThat(client.goAwayCode()).isEqualTo(-1);
+			assertThat(upstreamResets(received)).as("the upstream got no more resets").hasSize(1);
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> trackedStreams(route) == 0);
+		}
+	}
+
+	/**
+	 * A client WINDOW_UPDATE with an increment of 0 on a stream the relay no longer
+	 * tracks -- its request and response ended -- is ignored (RFC 9113 5.1): no reset,
+	 * the connection serves the next stream.
+	 */
+	@Test
+	void zeroIncrementOnAnUntrackedStreamIsIgnored() throws Exception {
+		String route = "cw.wu-zero-untracked.test";
+		startClient(route, upstream(new AtomicReference<>(), upstream -> respondToEach(upstream, 10)));
+		double protocolResets = resets("protocol");
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
+			client.headers(1, true, get(route));
+			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> trackedStreams(route) == 0);
+			client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(0));
+			awaitPingAck(client);
+			client.headers(3, true, get(route));
+			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).isTrue();
+			assertThat(client.resets()).isEmpty();
+			assertThat(client.closed()).isFalse();
+			assertThat(resets("protocol") - protocolResets).isZero();
+		}
+	}
+
+	/**
+	 * A client WINDOW_UPDATE with an increment of 0 on a stream closed both ways -- the
+	 * client ended its request, the response ended -- but still tracked, its request DATA
+	 * held by the upstream's stream window of 0, is ignored (RFC 9113 5.1): no reset
+	 * either way, and the DATA reaches the upstream once it grants the window.
+	 */
+	@Test
+	void zeroIncrementOnAStreamClosedBothWaysIsIgnored() throws Exception {
+		String route = "cw.wu-zero-closed.test";
+		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
+		List<TestH2.Frame> received = new CopyOnWriteArrayList<>();
+		startClient(route, upstream(seen, upstream -> {
+			upstream.settings(0);
+			TestH2.@Nullable Frame frame;
+			while ((frame = upstream.next()) != null) {
+				received.add(frame);
+				if (frame.type() == TestH2.HEADERS) {
+					upstream.headers(frame.streamId(), true);
+				}
+			}
+		}));
+		double protocolResets = resets("protocol");
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
+			client.headers(1, false, post(route));
+			// the upstream's SETTINGS precede its response on the leg: applied by now
+			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
+			client.sendData(1, "abc".getBytes(StandardCharsets.US_ASCII), TestH2.FLAG_END_STREAM);
+			awaitPingAck(client);
+			assertThat(trackedStreams(route)).as("tracked while its DATA waits for the upstream's window").isEqualTo(1);
+			client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(0));
+			awaitPingAck(client);
+			assertThat(trackedStreams(route)).isEqualTo(1);
+			assertThat(client.resets()).isEmpty();
+			assertThat(resets("protocol") - protocolResets).isZero();
+			WindowedH2Upstream upstream = awaitUpstream(seen);
+			assertThat(upstream.received(1)).as("nothing reached the upstream yet").isZero();
+			upstream.grant(1, 3);
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> upstream.received(1) == 3);
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> trackedStreams(route) == 0);
+			assertThat(upstreamResets(received)).isEmpty();
+			assertThat(client.closed()).isFalse();
 		}
 	}
 
@@ -828,6 +994,59 @@ class H2DemuxClientWindowE2ETest {
 		Thread.sleep(200);
 		assertThat(client.dataReceived()).as("the client got no more than its window").isEqualTo(WINDOW);
 		assertThat(upstream.sent()).as("the upstream got no more window").isEqualTo(2L * WINDOW);
+	}
+
+	/**
+	 * Connects and opens stream 1 of the route with a request whose end never comes; the
+	 * upstream holds it. Returns once the relay tracks the stream.
+	 */
+	private H2TestClient openHeldStream(String route) throws IOException {
+		startClient(route, upstream(new AtomicReference<>(), upstream -> {
+			upstream.settings(null);
+			while (upstream.next() != null) {
+				// held
+			}
+		}));
+		H2TestClient client = H2TestClient.connect(dataPort, 1);
+		client.headers(1, false, post(route));
+		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> trackedStreams(route) == 1);
+		return client;
+	}
+
+	/**
+	 * Pings the relay and waits for the ack: the outbound parse handled every frame sent
+	 * before.
+	 */
+	private static void awaitPingAck(H2TestClient client) throws Exception {
+		byte[] payload = TestH2.int32((int) PINGS.incrementAndGet());
+		byte[] ping = Arrays.copyOf(payload, 8);
+		client.frame(TestH2.PING, 0, 0, ping);
+		assertThat(client.awaitTrue(() -> client.pingAcks().stream().anyMatch(ack -> Arrays.equals(ack, ping)),
+				Duration.ofSeconds(5)))
+			.as("the relay acked the PING")
+			.isTrue();
+	}
+
+	/** The RST_STREAM frames the upstream received: stream id and error code. */
+	private static List<List<Integer>> upstreamResets(List<TestH2.Frame> received) {
+		return received.stream()
+			.filter(frame -> frame.type() == TestH2.RST_STREAM)
+			.map(frame -> List.of(frame.streamId(), TestH2.errorCode(frame)))
+			.toList();
+	}
+
+	private double resets(String reason) {
+		return Objects.requireNonNull(this.dataProxyServer)
+			.h2DemuxMeters()
+			.registry()
+			.get("sluice.h2demux.streams.reset")
+			.tag("reason", reason)
+			.counter()
+			.count();
+	}
+
+	private long trackedStreams(String route) {
+		return Objects.requireNonNull(this.dataProxyServer).h2DemuxMeters().trackedStreams(route);
 	}
 
 	private static WindowedH2Upstream awaitUpstream(AtomicReference<WindowedH2Upstream> seen) {
