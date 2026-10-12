@@ -23,6 +23,14 @@ errors the relay treats as connection errors (RFC 9113 5.4.2): a stream window p
 
 080 (an upstream's PUSH_PROMISE as a protocol error) follows whichever rule this sets.
 
+Also unvalidated today: frames an upstream sends on a stream the relay has not opened on
+it -- a stream waiting for the upstream's SETTINGS_MAX_CONCURRENT_STREAMS (idle on the
+upstream, RFC 9113 5.1: a connection error `PROTOCOL_ERROR`) -- are handled as if the
+stream were open (a response head is relayed, an END_STREAM forgets the stream as owed).
+A leg retiring cleanly refuses its waiting streams with `REFUSED_STREAM` (the upstream
+never saw them, RFC 9113 8.7); a connection error ending only the leg should refuse them
+likewise rather than give them the code chosen for lost streams.
+
 **User decision needed**: the code the client gets for a stream lost to its upstream's
 error (`INTERNAL_ERROR`, `CANCEL`, ...), and whether a connection error should still end
 the relay while the client has nothing else open.

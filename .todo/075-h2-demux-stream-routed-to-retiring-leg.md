@@ -6,8 +6,8 @@ Left open by 053, carried over from 062. `Http2DemuxRelay#routeRequestHead` pick
 route's leg (`legFor`, which skips legs marked `ended`) and admits the stream under the
 lock only while `Leg#acceptingLocked` holds; a leg whose upstream ended its side or failed
 in between refuses it with `REFUSED_STREAM`. Since 062 a leg whose upstream left first
-writes its responses waiting for the client's connection window (`upstreamGone`, then
-`awaitResponsesWritten`, then `retire`), so the leg is `gone` (not accepting) for longer
+writes its responses waiting for the client's connection window (`upstreamGoneUnlessOwed`,
+then `awaitResponsesWritten`, then `retire`), so the leg is `gone` (not accepting) for longer
 before it closes. The deterministic part is tested
 (`H2DemuxClientWindowE2ETest.newStreamOfARouteWhoseLegDrainsGoesToANewLeg`: a stream
 opened once the leg is marked goes to a new leg); the race between `legFor` and the mark
