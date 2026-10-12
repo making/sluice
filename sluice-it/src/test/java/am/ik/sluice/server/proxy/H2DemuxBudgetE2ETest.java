@@ -6,6 +6,8 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -26,6 +28,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
+import java.util.stream.Stream;
 
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
@@ -96,6 +99,12 @@ class H2DemuxBudgetE2ETest {
 	private static final int RST_STREAM_BYTES = 9 + 4;
 
 	private static final AtomicLong PINGS = new AtomicLong();
+
+	/** The kernel's TCP connection tables, where readable (Linux). */
+	private static final List<Path> TCP_TABLES = Stream.of("/proc/net/tcp", "/proc/net/tcp6")
+		.map(Path::of)
+		.filter(Files::isReadable)
+		.toList();
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
@@ -414,10 +423,9 @@ class H2DemuxBudgetE2ETest {
 			client.headers(reset, true, TestH2.headerBlock("x-trailer=1"));
 			Http2DemuxRelay relay = held.awaitDecided();
 			assertThat(client.reset(reset)).as("decided before the RST_STREAM was written").isNull();
+			int clientPort = client.localPort();
 			client.abort();
-			// the loopback delivers in order: past a round trip, the reset reached the
-			// relay
-			loopbackRoundTrip();
+			awaitResetTaken(clientPort);
 			held.proceed();
 			Awaitility.await().atMost(Duration.ofSeconds(10)).until(relay::finished);
 			assertThat(resets("budget")).as("the RST_STREAM write failed: the reset was never counted")
@@ -1195,10 +1203,36 @@ class H2DemuxBudgetE2ETest {
 	}
 
 	/**
-	 * A byte each way over a fresh loopback connection: the loopback delivers in order,
-	 * so whatever the loopback carried before -- a reset -- was delivered by the time it
-	 * returns.
+	 * Waits until the server side of the connection from {@code clientPort} took the
+	 * client's reset. On Linux, until the kernel dropped the connection from
+	 * {@code /proc/net/tcp*}: a round trip on another loopback connection does not order
+	 * the two there (the connection was seen still listed past one). Elsewhere, past such
+	 * a round trip.
 	 */
+	private void awaitResetTaken(int clientPort) throws IOException {
+		if (TCP_TABLES.isEmpty()) {
+			loopbackRoundTrip();
+			return;
+		}
+		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> !connectionListed(clientPort));
+	}
+
+	/** Whether the kernel lists the data plane's connection from {@code clientPort}. */
+	private boolean connectionListed(int clientPort) throws IOException {
+		String local = ":%04X".formatted(dataPort);
+		String remote = ":%04X".formatted(clientPort);
+		for (Path table : TCP_TABLES) {
+			for (String line : Files.readAllLines(table)) {
+				String[] fields = line.trim().split("\\s+");
+				if (fields.length > 2 && fields[1].endsWith(local) && fields[2].endsWith(remote)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/** A byte each way over a fresh loopback connection. */
 	private static void loopbackRoundTrip() throws IOException {
 		try (ServerSocket server = new ServerSocket()) {
 			server.bind(new InetSocketAddress("127.0.0.1", 0));
