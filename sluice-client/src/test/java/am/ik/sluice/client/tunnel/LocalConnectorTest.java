@@ -1,5 +1,7 @@
 package am.ik.sluice.client.tunnel;
 
+import java.io.IOException;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.List;
@@ -64,7 +66,7 @@ class LocalConnectorTest {
 	@EnabledOnOs({ OS.LINUX, OS.MAC })
 	void dialsRegisteredUpstream() throws Exception {
 		int port;
-		try (ServerSocket server = new ServerSocket(0)) {
+		try (ServerSocket server = loopbackServer()) {
 			port = server.getLocalPort();
 			Thread acceptor = Thread.ofVirtual().start(() -> {
 				try (Socket ignored = server.accept()) {
@@ -90,7 +92,7 @@ class LocalConnectorTest {
 	void dialsSecondUpstreamOnSharedHost() throws Exception {
 		int httpPort;
 		int tcpPort;
-		try (ServerSocket httpServer = new ServerSocket(0); ServerSocket tcpServer = new ServerSocket(0)) {
+		try (ServerSocket httpServer = loopbackServer(); ServerSocket tcpServer = loopbackServer()) {
 			httpPort = httpServer.getLocalPort();
 			tcpPort = tcpServer.getLocalPort();
 			Thread httpAcceptor = Thread.ofVirtual().start(() -> acceptOnce(httpServer));
@@ -107,6 +109,17 @@ class LocalConnectorTest {
 			httpAcceptor.join(1000);
 			tcpAcceptor.join(1000);
 		}
+	}
+
+	/**
+	 * Listens on the loopback address the tests dial, so a listener of another process on
+	 * the same port number cannot take the connection, and bounds {@code accept} so a
+	 * stray connection ends the acceptor instead of parking it.
+	 */
+	private static ServerSocket loopbackServer() throws IOException {
+		ServerSocket server = new ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"));
+		server.setSoTimeout(5_000);
+		return server;
 	}
 
 	private static void acceptOnce(ServerSocket server) {

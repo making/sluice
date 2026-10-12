@@ -1,5 +1,6 @@
 package am.ik.sluice.server.proxy;
 
+import java.io.IOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -95,7 +96,7 @@ class ConnectionLimitsTest {
 
 	@Test
 	void aConnectionReleasedInItsHeadIsNotCutByTheDeadline() throws Exception {
-		try (ServerSocket server = new ServerSocket(0);
+		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits.Admission admission = admit();
@@ -110,7 +111,7 @@ class ConnectionLimitsTest {
 
 	@Test
 	void theDeadlineClosesTheSocketAndEndHeadReportsIt() throws Exception {
-		try (ServerSocket server = new ServerSocket(0);
+		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits.Admission admission = admit();
@@ -126,7 +127,7 @@ class ConnectionLimitsTest {
 
 	@Test
 	void aKeepAlivePhaseEnteredAnewStartsItsTimeoutOver() throws Exception {
-		try (ServerSocket server = new ServerSocket(0);
+		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(accepted);
@@ -151,7 +152,7 @@ class ConnectionLimitsTest {
 
 	@Test
 	void aKeepAlivePhaseEnteredAgainKeepsItsRunningTimeout() throws Exception {
-		try (ServerSocket server = new ServerSocket(0);
+		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(accepted);
@@ -172,7 +173,7 @@ class ConnectionLimitsTest {
 
 	@Test
 	void aDisarmedKeepAliveDeadlineNeverPasses() throws Exception {
-		try (ServerSocket server = new ServerSocket(0);
+		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(accepted);
@@ -210,7 +211,7 @@ class ConnectionLimitsTest {
 
 	@Test
 	void aVerbatimRelayReportingProgressIsKeptAndTornDownOnceItStops() throws Exception {
-		try (ServerSocket server = new ServerSocket(0);
+		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(accepted);
@@ -242,7 +243,7 @@ class ConnectionLimitsTest {
 	 */
 	@Test
 	void aVerbatimRelayWhoseTeardownBlocksHasItsTransportClosedAfterTheGrace() throws Exception {
-		try (ServerSocket server = new ServerSocket(0);
+		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(accepted);
@@ -276,7 +277,7 @@ class ConnectionLimitsTest {
 
 	@Test
 	void theVerbatimPhaseIsEnteredForGood() throws Exception {
-		try (ServerSocket server = new ServerSocket(0);
+		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(accepted);
@@ -300,7 +301,7 @@ class ConnectionLimitsTest {
 
 	@Test
 	void aVerbatimRelayWithoutATimeoutDisarmedOrWithTheLongestNeverPasses() throws Exception {
-		try (ServerSocket server = new ServerSocket(0);
+		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits.KeepAliveDeadline untimed = this.limits.keepAliveDeadline(accepted);
@@ -367,7 +368,7 @@ class ConnectionLimitsTest {
 
 	@Test
 	void aWatchedRelayWaitingOnItsClientIsTornDownAtTheStallTimeout() throws Exception {
-		try (ServerSocket server = new ServerSocket(0);
+		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits limits = stallLimits(DataSize.ofKilobytes(16));
@@ -404,7 +405,7 @@ class ConnectionLimitsTest {
 	 */
 	@Test
 	void aRelayFoundBetweenTwoWaitsAtEverySecondSampleIsTornDownAtTheStallTimeout() throws Exception {
-		try (ServerSocket server = new ServerSocket(0);
+		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits limits = stallLimits(DataSize.ofKilobytes(16));
@@ -450,7 +451,7 @@ class ConnectionLimitsTest {
 
 	@Test
 	void anotherPhaseStopsTheStallCountAndBusyAgainStartsItOver() throws Exception {
-		try (ServerSocket server = new ServerSocket(0);
+		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits limits = stallLimits(DataSize.ofKilobytes(16));
@@ -479,7 +480,7 @@ class ConnectionLimitsTest {
 
 	@Test
 	void aDisarmedWatchedDeadlineNeverStalls() throws Exception {
-		try (ServerSocket server = new ServerSocket(0);
+		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits limits = stallLimits(DataSize.ofKilobytes(16));
@@ -506,7 +507,7 @@ class ConnectionLimitsTest {
 	 */
 	private void assertStallsAfter(DataSize minBytes, BooleanSupplier waiting, int progress, boolean stalls)
 			throws Exception {
-		try (ServerSocket server = new ServerSocket(0);
+		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits limits = stallLimits(minBytes);
@@ -566,6 +567,17 @@ class ConnectionLimitsTest {
 
 	private double rejected(String reason) {
 		return this.meters.get("sluice.data.connections.rejected").tag("reason", reason).counter().count();
+	}
+
+	/**
+	 * Listens on the loopback address the tests dial, so a listener of another process on
+	 * the same port number cannot take the connection, and bounds {@code accept} so a
+	 * stray connection fails the test instead of hanging it.
+	 */
+	private static ServerSocket loopbackServer() throws IOException {
+		ServerSocket server = new ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"));
+		server.setSoTimeout(5_000);
+		return server;
 	}
 
 }

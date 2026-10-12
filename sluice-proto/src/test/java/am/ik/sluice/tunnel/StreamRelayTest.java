@@ -3,11 +3,16 @@ package am.ik.sluice.tunnel;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -16,6 +21,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class StreamRelayTest {
 
@@ -54,13 +60,39 @@ class StreamRelayTest {
 	private record SocketPair(Socket client, Socket serverSide) {
 
 		static SocketPair create() throws IOException {
-			ServerSocket server = new ServerSocket(0);
-			Socket client = new Socket("127.0.0.1", server.getLocalPort());
-			Socket serverSide = server.accept();
-			server.close();
-			return new SocketPair(client, serverSide);
+			return create(0);
 		}
 
+		/**
+		 * Listens on the loopback address the client dials, so a listener of another
+		 * process on the same port number cannot take the connection, and bounds
+		 * {@code accept} so a stray connection fails the test instead of hanging it.
+		 */
+		static SocketPair create(int port) throws IOException {
+			try (ServerSocket server = new ServerSocket(port, 1, InetAddress.getByName("127.0.0.1"))) {
+				server.setSoTimeout(5_000);
+				Socket client = new Socket("127.0.0.1", server.getLocalPort());
+				Socket serverSide = server.accept();
+				return new SocketPair(client, serverSide);
+			}
+		}
+
+	}
+
+	@Test
+	void aListenerOfAnotherProcessOnTheSamePortNumberFailsThePairInsteadOfHangingIt() throws Exception {
+		try (ServerSocket stray = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+			int port = stray.getLocalPort();
+			ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+			Future<SocketPair> created = executor.submit(() -> SocketPair.create(port));
+			try {
+				assertThatThrownBy(() -> created.get(15, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class)
+					.hasCauseInstanceOf(IOException.class);
+			}
+			finally {
+				executor.shutdownNow();
+			}
+		}
 	}
 
 	@Test

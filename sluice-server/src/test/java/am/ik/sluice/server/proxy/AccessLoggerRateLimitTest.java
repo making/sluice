@@ -1,5 +1,7 @@
 package am.ik.sluice.server.proxy;
 
+import java.io.IOException;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.Duration;
@@ -81,7 +83,7 @@ class AccessLoggerRateLimitTest {
 				.build())
 			.build();
 		AccessLogger accessLogger = new AccessLogger(properties, this.now::get);
-		try (ServerSocket serverSocket = new ServerSocket(0);
+		try (ServerSocket serverSocket = loopbackServer();
 				Socket socket = new Socket("127.0.0.1", serverSocket.getLocalPort());
 				Socket accepted = serverSocket.accept()) {
 			AccessLogger.Connection connection = accessLogger.accepted("test", socket);
@@ -109,7 +111,7 @@ class AccessLoggerRateLimitTest {
 				.build())
 			.build();
 		AccessLogger accessLogger = new AccessLogger(properties, this.now::get);
-		try (ServerSocket serverSocket = new ServerSocket(0);
+		try (ServerSocket serverSocket = loopbackServer();
 				Socket socket = new Socket("127.0.0.1", serverSocket.getLocalPort());
 				Socket accepted = serverSocket.accept()) {
 			AccessLogger.Connection first = accessLogger.accepted("data", socket);
@@ -148,6 +150,17 @@ class AccessLoggerRateLimitTest {
 
 	private static long countOf(List<String> messages, String fragment) {
 		return messages.stream().filter(message -> message.contains(fragment)).count();
+	}
+
+	/**
+	 * Listens on the loopback address the tests dial, so a listener of another process on
+	 * the same port number cannot take the connection, and bounds {@code accept} so a
+	 * stray connection fails the test instead of hanging it.
+	 */
+	private static ServerSocket loopbackServer() throws IOException {
+		ServerSocket server = new ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"));
+		server.setSoTimeout(5_000);
+		return server;
 	}
 
 }
