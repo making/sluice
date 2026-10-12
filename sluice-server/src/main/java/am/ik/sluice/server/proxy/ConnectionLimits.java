@@ -23,6 +23,7 @@ import org.springframework.beans.factory.DisposableBean;
 import org.springframework.stereotype.Component;
 
 import am.ik.sluice.server.config.SluiceServerProperties;
+import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.ConnectionLimit;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
@@ -32,8 +33,8 @@ import io.micrometer.core.instrument.MeterRegistry;
  * The limits every data plane connection lives under, shared by the data port and every
  * tcp route port: a cap on the connections open at once, a cap per source address, and
  * one deadline for the whole head phase; the deadlines between and during the requests of
- * a relayed HTTP connection ({@link KeepAliveDeadline}); plus the queue budget the h2
- * demux relays share.
+ * a relayed HTTP connection, and the idle deadline of a connection relayed verbatim
+ * ({@link KeepAliveDeadline}); plus the queue budget the h2 demux relays share.
  * <p>
  * The connection cap counts virtual connections: an h2 connection whose streams reach
  * several routes takes one more slot per further leg ({@link #tryAcquireLeg()}). An unset
@@ -52,7 +53,8 @@ import io.micrometer.core.instrument.MeterRegistry;
  * ({@code limit}, {@code address-limit}, {@code head-timeout}) and logged through the
  * access log's rate limit. Connections closed for idling between requests count as
  * {@code sluice.data.connections.idle.closed}, those closed for stalling an exchange as
- * {@code sluice.data.connections.stall.closed}.
+ * {@code sluice.data.connections.stall.closed}, connections relayed verbatim closed for
+ * relaying nothing as {@code sluice.data.connections.verbatim.idle.closed}.
  */
 @Component
 public class ConnectionLimits implements DisposableBean {
@@ -75,6 +77,9 @@ public class ConnectionLimits implements DisposableBean {
 
 	private final long stallMinBytes;
 
+	/** The verbatim idle timeout of the routes that set none; zero = off. */
+	private final Duration verbatimIdleTimeout;
+
 	/** Open connections per source address; an entry lives while its count is > 0. */
 	private final ConcurrentMap<InetAddress, Integer> perAddress = new ConcurrentHashMap<>();
 
@@ -90,6 +95,8 @@ public class ConnectionLimits implements DisposableBean {
 
 	private final Counter stallClosed;
 
+	private final Counter verbatimIdleClosed;
+
 	ConnectionLimits(SluiceServerProperties properties, MeterRegistry meterRegistry) {
 		SluiceServerProperties.Limits limits = properties.limits();
 		long maxHeap = Runtime.getRuntime().maxMemory();
@@ -103,6 +110,7 @@ public class ConnectionLimits implements DisposableBean {
 		this.idleTimeout = limits.idleTimeout();
 		this.stallTimeout = limits.stallTimeout();
 		this.stallMinBytes = limits.stallMinBytes().toBytes();
+		this.verbatimIdleTimeout = limits.verbatimIdleTimeout();
 		this.deadlines = new ScheduledThreadPoolExecutor(1,
 				Thread.ofPlatform().name("sluice-deadline").daemon().factory());
 		// a cancelled deadline leaves the queue at once instead of after the timeout
@@ -117,6 +125,10 @@ public class ConnectionLimits implements DisposableBean {
 			.description("Data plane connections closed after an exchange in flight waited on its client "
 					+ "for the stall timeout without progress")
 			.register(meterRegistry);
+		this.verbatimIdleClosed = Counter.builder("sluice.data.connections.verbatim.idle.closed")
+			.description("Data plane connections relayed verbatim closed after relaying no byte in either direction "
+					+ "for the verbatim idle timeout")
+			.register(meterRegistry);
 		Gauge.builder("sluice.data.connections.limit", this.global, ConnectionLimit::max)
 			.description("Data plane connections allowed open at once")
 			.register(meterRegistry);
@@ -130,12 +142,13 @@ public class ConnectionLimits implements DisposableBean {
 			.description("Bytes the h2 demux relays queue beyond their per-connection allowance")
 			.register(meterRegistry);
 		log.info(
-				"data plane connection limit {} ({}), per address {}, head timeout {}, idle timeout {}, stall timeout {} per {}B, h2 queue budget {}KiB ({})",
+				"data plane connection limit {} ({}), per address {}, head timeout {}, idle timeout {}, stall timeout {} per {}B, verbatim idle timeout {}, h2 queue budget {}KiB ({})",
 				this.global.max(),
 				limits.maxConnections() > 0 ? "configured"
 						: "derived: (half of max heap %dMiB - h2 queue budget) / %dKiB per connection"
 							.formatted(maxHeap >> 20, connectionBytes() >> 10),
 				this.maxPerAddress, this.headTimeout, this.idleTimeout, this.stallTimeout, this.stallMinBytes,
+				this.verbatimIdleTimeout.isZero() ? "off (unless a route sets one)" : this.verbatimIdleTimeout,
 				budget >> 10,
 				limits.h2QueueBudget().toBytes() > 0 ? "configured" : "derived: an eighth of half of max heap");
 	}
@@ -192,12 +205,22 @@ public class ConnectionLimits implements DisposableBean {
 	}
 
 	/**
-	 * The deadline for the requests after the head phase of a relayed HTTP connection,
-	 * busy and arming nothing until the relay watches it or enters another phase; its
-	 * expiry closes {@code socket}, the connection's transport.
+	 * The deadline of a connection after its head phase: between the requests of a
+	 * relayed HTTP connection, or while it is relayed verbatim; busy and arming nothing
+	 * until the relay watches it or enters another phase. Its expiry closes
+	 * {@code socket}, the connection's transport.
 	 */
 	KeepAliveDeadline keepAliveDeadline(Socket socket) {
 		return new KeepAliveDeadline(socket);
+	}
+
+	/**
+	 * The verbatim idle timeout of {@code route}: its own when it sets one, the server's
+	 * default otherwise; zero = none.
+	 */
+	Duration verbatimIdleTimeout(Router.Route route) {
+		Duration own = route.verbatimIdleTimeout();
+		return own.isZero() ? this.verbatimIdleTimeout : own;
 	}
 
 	/** Deadlines scheduled and not yet passed or cancelled; for tests. */
@@ -382,7 +405,13 @@ public class ConnectionLimits implements DisposableBean {
 	 * deadline thread, as it may write -- and the transport socket is closed after it, or
 	 * after {@link #TEARDOWN_GRACE} at the latest should the teardown block on a write
 	 * the peer does not read. {@link #disarm()} ends the deadline for good: the relay
-	 * ended, or left HTTP (an upgrade).
+	 * ended.
+	 * <p>
+	 * A connection relayed verbatim -- from its start, or once an HTTP/1.1 connection
+	 * left HTTP (an upgrade) -- enters {@link Phase#VERBATIM} for good through
+	 * {@link #relayVerbatim}: the verbatim idle timeout of its route runs from the last
+	 * {@link #progress(long)} reported, a byte read from or written to the client, and
+	 * its expiry tears the relay down as above.
 	 * <p>
 	 * The stall timeout counts only the time the relay waits on its client: busy, the
 	 * deadline reads the relay's clock of that time {@link #STALL_SAMPLES} times per
@@ -425,7 +454,13 @@ public class ConnectionLimits implements DisposableBean {
 			IDLE,
 
 			/** A later request head is incomplete: the head timeout. */
-			HEAD
+			HEAD,
+
+			/**
+			 * Relayed verbatim, for good: the verbatim idle timeout when the route has
+			 * one, none otherwise.
+			 */
+			VERBATIM
 
 		}
 
@@ -453,6 +488,12 @@ public class ConnectionLimits implements DisposableBean {
 		private volatile Runnable stallTeardown = () -> {
 		};
 
+		/** When progress was last reported; read by the verbatim idle timeout. */
+		private volatile long lastProgress = System.nanoTime();
+
+		/** The verbatim idle timeout running, in nanoseconds; with the lock. */
+		private long verbatimIdleNanos;
+
 		/** Bytes moved since the last progress counted. */
 		private final AtomicLong moved = new AtomicLong();
 
@@ -477,7 +518,9 @@ public class ConnectionLimits implements DisposableBean {
 			this.socket = socket;
 		}
 
-		/** The relay's teardown, run once the idle or head timeout passes. */
+		/**
+		 * The relay's teardown, run once the idle, head or verbatim idle timeout passes.
+		 */
 		void onExpiry(Runnable teardown) {
 			this.teardown = teardown;
 		}
@@ -512,11 +555,15 @@ public class ConnectionLimits implements DisposableBean {
 		}
 
 		/**
-		 * Reports {@code bytes} moved to or from the client; every stall minimum of them
-		 * starts the stall count over.
+		 * Reports {@code bytes} moved to or from the client: any starts the verbatim idle
+		 * timeout over, every stall minimum of them the stall count.
 		 */
 		void progress(long bytes) {
-			if (bytes > 0 && this.moved.addAndGet(bytes) >= ConnectionLimits.this.stallMinBytes) {
+			if (bytes <= 0) {
+				return;
+			}
+			this.lastProgress = System.nanoTime();
+			if (this.moved.addAndGet(bytes) >= ConnectionLimits.this.stallMinBytes) {
 				this.moved.set(0);
 				this.progresses.incrementAndGet();
 			}
@@ -531,7 +578,7 @@ public class ConnectionLimits implements DisposableBean {
 				if (this.expired) {
 					return false;
 				}
-				if (this.disarmed || next == this.phase) {
+				if (this.disarmed || next == this.phase || this.phase == Phase.VERBATIM) {
 					return true;
 				}
 				cancelLocked();
@@ -547,6 +594,69 @@ public class ConnectionLimits implements DisposableBean {
 							TimeUnit.NANOSECONDS);
 				}
 				return true;
+			}
+		}
+
+		/**
+		 * Enters {@link Phase#VERBATIM} for good: the connection is relayed verbatim on
+		 * {@code route} from now on, and torn down once no progress was reported for the
+		 * route's verbatim idle timeout ({@link ConnectionLimits#verbatimIdleTimeout});
+		 * nothing is armed when it has none. Entering it again keeps the running timeout.
+		 * {@code false} once a timeout passed, in which case the caller drops what it was
+		 * about to relay: the connection is being closed.
+		 */
+		boolean relayVerbatim(Router.Route route) {
+			synchronized (this.lock) {
+				if (this.expired) {
+					return false;
+				}
+				if (this.disarmed || this.phase == Phase.VERBATIM) {
+					return true;
+				}
+				cancelLocked();
+				this.phase = Phase.VERBATIM;
+				Duration timeout = ConnectionLimits.this.verbatimIdleTimeout(route);
+				if (!timeout.isZero()) {
+					this.verbatimIdleNanos = saturatedNanos(timeout);
+					this.lastProgress = System.nanoTime();
+					scheduleVerbatimCheckLocked(this.generation, this.verbatimIdleNanos);
+				}
+				return true;
+			}
+		}
+
+		private void scheduleVerbatimCheckLocked(long armed, long delayNanos) {
+			this.future = ConnectionLimits.this.deadlines.schedule(() -> checkVerbatim(armed), delayNanos,
+					TimeUnit.NANOSECONDS);
+		}
+
+		/**
+		 * Tears down once no progress was reported for the verbatim idle timeout; checks
+		 * again when it is due otherwise.
+		 */
+		private void checkVerbatim(long armed) {
+			synchronized (this.lock) {
+				if (this.expired || this.disarmed || armed != this.generation) {
+					return;
+				}
+				long idle = System.nanoTime() - this.lastProgress;
+				if (idle < this.verbatimIdleNanos) {
+					scheduleVerbatimCheckLocked(armed, this.verbatimIdleNanos - idle);
+					return;
+				}
+				this.expired = true;
+				this.future = null;
+			}
+			ConnectionLimits.this.verbatimIdleClosed.increment();
+			tearDown(this.teardown);
+		}
+
+		private static long saturatedNanos(Duration duration) {
+			try {
+				return duration.toNanos();
+			}
+			catch (ArithmeticException e) {
+				return Long.MAX_VALUE;
 			}
 		}
 

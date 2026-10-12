@@ -12,8 +12,8 @@ request and `DataProxyServer#relay` relays the whole connection verbatim on the 
 
 Consequences: every later stream of that connection goes to the CONNECT's route whatever its
 authority (no demux, no rerouting, no access control per stream), and the connection keeps
-none of the HTTP deadlines -- no idle timeout, no stall timeout (only the verbatim-relay idle
-timeout of 070, once done).
+none of the HTTP deadlines -- no idle timeout, no stall timeout (only the verbatim idle
+timeout of its route, when one is set).
 
 ## Direction
 

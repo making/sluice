@@ -87,6 +87,14 @@ class SluiceServerPropertiesTest {
 		assertThat(properties.limits().stallTimeout()).isEqualTo(Duration.ofSeconds(60));
 		assertThat(properties.limits().stallMinBytes().toBytes()).isEqualTo(16 * 1024);
 		assertThat(properties.limits().tunnelStallTimeout()).isEqualTo(Duration.ofSeconds(60));
+		assertThat(properties.limits().verbatimIdleTimeout()).isZero();
+	}
+
+	@Test
+	void aVerbatimIdleTimeoutBindsAndANegativeOneIsOff() {
+		assertThat(bind(Map.of("sluice.limits.verbatim-idle-timeout", "10m")).limits().verbatimIdleTimeout())
+			.isEqualTo(Duration.ofMinutes(10));
+		assertThat(bind(Map.of("sluice.limits.verbatim-idle-timeout", "-1s")).limits().verbatimIdleTimeout()).isZero();
 	}
 
 	@Test

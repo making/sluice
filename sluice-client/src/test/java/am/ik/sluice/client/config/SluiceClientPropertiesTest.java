@@ -184,4 +184,36 @@ class SluiceClientPropertiesTest {
 		assertThat(properties.toProtoUpstreams().get(0).getForceHttp1()).isTrue();
 	}
 
+	@Test
+	void verbatimIdleTimeoutBindsAndIsCarriedInMillisecondsZeroWhenUnset() {
+		Map<String, Object> source = Map.of("sluice.server-url", "grpc://127.0.0.1:8001",
+				"sluice.client.upstream[0].host", "redis.local", "sluice.client.upstream[0].target",
+				"tcp://192.0.2.1:6379", "sluice.client.upstream[0].verbatim-idle-timeout", "15m",
+				"sluice.client.upstream[1].host", "plain.local", "sluice.client.upstream[1].target",
+				"http://192.0.2.1:80");
+		StandardEnvironment environment = new StandardEnvironment();
+		environment.getPropertySources().addFirst(new MapPropertySource("test", source));
+		SluiceClientProperties properties = Binder.get(environment)
+			.bind("sluice", Bindable.of(SluiceClientProperties.class))
+			.get();
+		assertThat(properties.toProtoUpstreams()).satisfies(upstreams -> {
+			assertThat(upstreams.get(0).getVerbatimIdleTimeoutMillis()).isEqualTo(Duration.ofMinutes(15).toMillis());
+			assertThat(upstreams.get(1).getVerbatimIdleTimeoutMillis()).isZero();
+		});
+	}
+
+	@Test
+	void aVerbatimIdleTimeoutBelowAMillisecondIsCarriedAsOneAndANegativeOneAsUnset() {
+		assertThat(Upstream.builder()
+			.target("tcp://192.0.2.1:1")
+			.verbatimIdleTimeout(Duration.ofNanos(10))
+			.build()
+			.verbatimIdleTimeoutMillis()).isEqualTo(1);
+		assertThat(Upstream.builder()
+			.target("tcp://192.0.2.1:1")
+			.verbatimIdleTimeout(Duration.ofSeconds(-1))
+			.build()
+			.verbatimIdleTimeoutMillis()).isZero();
+	}
+
 }

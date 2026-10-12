@@ -230,7 +230,9 @@ class KeepAliveIdleTimeoutE2ETest {
 					("GET /ws HTTP/1.1\r\nHost: " + H1_HOST + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
 						.getBytes(StandardCharsets.US_ASCII),
 					SWITCHING);
-			// the upgrade disarmed the deadline: nothing is scheduled for the connection
+			// relayed verbatim from the upgrade on, with no verbatim idle timeout:
+			// nothing
+			// is scheduled for the connection
 			awaitNoDeadline();
 			Thread.sleep(IDLE_TIMEOUT.multipliedBy(2).plusSeconds(1).toMillis());
 			exchange(socket, "ping".getBytes(StandardCharsets.US_ASCII), "ping");

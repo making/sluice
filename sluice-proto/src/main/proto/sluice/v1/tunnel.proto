@@ -175,4 +175,9 @@ message Upstream {
   // this upstream (for upstreams without HTTP/2 support); plaintext and
   // tls-passthrough routes are unaffected.
   bool force_http1 = 8;
+  // How long, in milliseconds, a connection of this upstream relayed verbatim (TLS
+  // passthrough, a tcp route, a hostless connection, an upgraded HTTP/1.1
+  // connection) may relay no byte in either direction before the server closes it;
+  // 0 = the server's default applies.
+  uint64 verbatim_idle_timeout_millis = 9;
 }

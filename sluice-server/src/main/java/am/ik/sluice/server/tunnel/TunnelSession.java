@@ -380,9 +380,11 @@ public final class TunnelSession implements AutoCloseable {
 		log.info("client {} advertised {} upstream(s), {} listen port(s) rejected", this.clientId, registered,
 				rejected.size());
 		for (Upstream upstream : advertised) {
-			log.info("client {} upstream: host=[{}] target={} rewrite-host={} tls-passthrough={} listen-port={}",
+			log.info(
+					"client {} upstream: host=[{}] target={} rewrite-host={} tls-passthrough={} listen-port={} verbatim-idle-timeout={}",
 					this.clientId, upstream.getHost(), upstream.getTargetUrl(), upstream.getRewriteHost(),
-					upstream.getTlsPassthrough(), upstream.getListenPort());
+					upstream.getTlsPassthrough(), upstream.getListenPort(), upstream.getVerbatimIdleTimeoutMillis() == 0
+							? "server default" : Long.toUnsignedString(upstream.getVerbatimIdleTimeoutMillis()) + "ms");
 		}
 	}
 

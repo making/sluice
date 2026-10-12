@@ -67,10 +67,11 @@ import io.micrometer.core.instrument.MeterRegistry;
  * asked for one, and neither a response head nor a body byte came since). Waiting for an
  * upstream's response does not count. Bytes read from the client and written to it count
  * as progress, a write as each of its pieces of
- * {@link ConnectionLimits.KeepAliveDeadline#WRITE_PIECE} completes. An upgrade disarms
- * the deadline for good. A response whose framing the tracker cannot follow is relayed as
- * an unframed one: it stays owed until the upstream closes the connection, which ends the
- * relay.
+ * {@link ConnectionLimits.KeepAliveDeadline#WRITE_PIECE} completes. An upgrade puts the
+ * connection under the verbatim idle timeout of the leg's route for good: bytes read from
+ * the client and written to it count as activity. A response whose framing the tracker
+ * cannot follow is relayed as an unframed one: it stays owed until the upstream closes
+ * the connection, which ends the relay.
  * <p>
  * TCP tells a client that half-closed from one gone entirely only on a write: the second
  * write to a gone client fails, once its stack answered the first with a reset. So once
@@ -420,8 +421,9 @@ final class ReroutingRelay {
 	 */
 	private boolean updateDeadlineLocked() {
 		if (this.position == Http1RequestParser.Position.PASSTHROUGH) {
-			this.deadline.disarm();
-			return true;
+			// relayed verbatim on the leg in charge from now on
+			Leg leg = this.current;
+			return this.deadline.relayVerbatim(leg != null ? leg.route : this.initialRoute);
 		}
 		ConnectionLimits.KeepAliveDeadline.Phase phase;
 		if (this.starting || this.owed > 0 || this.position == Http1RequestParser.Position.IN_BODY

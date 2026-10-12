@@ -1,5 +1,6 @@
 package am.ik.sluice.server.route;
 
+import java.time.Duration;
 import java.util.List;
 
 import am.ik.sluice.v1.proto.Upstream;
@@ -52,6 +53,33 @@ class RouterTest {
 		router.register("c1", List.of(flagged, plain));
 		assertThat(router.lookup("legacy.local").orElseThrow().forceHttp1()).isTrue();
 		assertThat(router.lookup("demo.local").orElseThrow().forceHttp1()).isFalse();
+	}
+
+	@Test
+	void verbatimIdleTimeoutPropagatesToRouteZeroWhenUnset() {
+		Router router = new Router();
+		Upstream timed = Upstream.newBuilder()
+			.setHost("redis.local")
+			.setTargetUrl("tcp://127.0.0.1:6379")
+			.setVerbatimIdleTimeoutMillis(90_000)
+			.build();
+		Upstream tcp = Upstream.newBuilder()
+			.setTargetUrl("tcp://127.0.0.1:5432")
+			.setListenPort(15432)
+			.setVerbatimIdleTimeoutMillis(1500)
+			.build();
+		// past the signed range of the unsigned field: the longest timeout, not none
+		Upstream huge = Upstream.newBuilder()
+			.setHost("huge.local")
+			.setTargetUrl("tcp://127.0.0.1:1")
+			.setVerbatimIdleTimeoutMillis(-1)
+			.build();
+		router.register("c1", List.of(timed, tcp, huge, upstream("demo.local", "http://127.0.0.1:3001")));
+		assertThat(router.lookup("redis.local").orElseThrow().verbatimIdleTimeout()).isEqualTo(Duration.ofSeconds(90));
+		assertThat(router.lookupByPort(15432).orElseThrow().verbatimIdleTimeout()).isEqualTo(Duration.ofMillis(1500));
+		assertThat(router.lookup("huge.local").orElseThrow().verbatimIdleTimeout())
+			.isEqualTo(Duration.ofMillis(Long.MAX_VALUE));
+		assertThat(router.lookup("demo.local").orElseThrow().verbatimIdleTimeout()).isZero();
 	}
 
 	@Test

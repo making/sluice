@@ -263,6 +263,7 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.limits.idle-timeout` | `60s` | how long a plaintext or TLS-terminated HTTP connection may idle between requests before it is closed; see "Connection limits" |
 | `sluice.limits.stall-timeout` | `60s` | how long a request or response in flight on a plaintext or TLS-terminated HTTP connection may wait on its client without progress before the connection is closed; see "Connection limits" |
 | `sluice.limits.stall-min-bytes` | `16KB` | the bytes moved to or from the client that count as progress against `stall-timeout` (`1B`: every byte counts) |
+| `sluice.limits.verbatim-idle-timeout` | `0` = off | how long a connection relayed verbatim (TLS passthrough, tcp route, hostless, upgraded HTTP/1.1) may relay no byte in either direction before it is closed, for the routes whose upstream sets no `verbatim-idle-timeout`; see "Connection limits" |
 | `sluice.limits.tunnel-stall-timeout` | `60s` | how long a tunnel stream may hold frames queued for its client while not ready, the client taking none of them, before the session is failed; `0` = off; see "Connection limits" |
 | `sluice.limits.half-close-probe-interval` | `1s` | quiet after which a plaintext or TLS-terminated HTTP/1.1 connection whose client ended its side, a response owed, gets a `100 Continue` to learn whether the client is gone; `0` = off; see "Connection limits" |
 | `sluice.limits.h2-queue-budget` | `0` = an eighth of half the max heap | bytes the h2 demux relays may queue towards upstreams beyond each connection's allowance, shared by all of them; see "Connection limits" |
@@ -303,6 +304,7 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.client.upstream[n].force-http1` | `false` | the data plane's TLS termination prefers http/1.1 in ALPN for the route (for upstreams without HTTP/2 support); plaintext and `tls-passthrough` routes are unaffected |
 | `sluice.client.upstream[n].listen-port` | `0` | public port the server listens on for this upstream; connections are relayed as raw TCP routed by the listen port -- no head parsing, no rewriting -- so any protocol (ssh, postgres, redis, ...) tunnels through. The listener is bound on advertise and released on disconnect; bind it on the host (`docker -p`, firewall) to expose it |
 | `sluice.client.upstream[n].allowed-cidrs` | (empty = the server-wide `sluice.access-control.allow-cidrs` applies) | CIDRs / bare addresses allowed to connect to this upstream on the data plane; replaces the server-wide allow list for the route (the deny list still applies) |
+| `sluice.client.upstream[n].verbatim-idle-timeout` | `0` = the server's `sluice.limits.verbatim-idle-timeout` applies | how long a connection of this upstream relayed verbatim (TLS passthrough, tcp route, hostless, upgraded HTTP/1.1) may relay no byte in either direction before the server closes it; replaces the server's default for the route; see "Connection limits" |
 | `sluice.token` / `sluice.token-file` | - | authentication token |
 | `sluice.insecure` | `false` | skip TLS verification |
 | `sluice.tls-bundle` | - | SSL bundle for the `grpcs://` control plane connection: keystore = client certificate (mutual TLS), truststore = CAs to verify the server; takes precedence over `sluice.insecure` |
@@ -538,8 +540,7 @@ and nothing of a next request has arrived (a next request head left incomplete i
 by `head-timeout`), h2 once no stream is open (with a GOAWAY `NO_ERROR`; PINGs do not count
 as activity). A response or h2 stream taking longer than the timeout is not cut, nor is an
 upgraded connection (WebSocket; a connection whose upgrade the upstream declines stays
-HTTP). Connections relayed verbatim (TLS passthrough, tcp routes) keep no idle deadline.
-Behind a front end that reuses its connections to the data plane, set the timeout above
+HTTP). Behind a front end that reuses its connections to the data plane, set the timeout above
 the front end's idle timeout, so the front end closes an idle connection before sluice
 does. Connections closed so count as
 `sluice.data.connections.idle.closed`.
@@ -566,8 +567,27 @@ resumed reading (`StallTimeoutSlowReaderE2ETest` tells what was observed on macO
 loopback: on Linux, only once the client drained about 900KB), so keep the timeout well
 above such gaps. A client streaming small h2 messages (a gRPC client stream) slower than the
 minimum is cut too: set `stall-min-bytes=1B` to count every byte, or raise the timeout.
-Connections relayed verbatim (TLS passthrough, tcp routes, upgraded connections) keep no
-stall timeout.
+Connections relayed verbatim keep no stall timeout; see the verbatim idle timeout below.
+
+A connection relayed verbatim -- TLS passthrough, a tcp route, a hostless connection (a
+RESP head, plaintext or TLS-terminated), an upgraded HTTP/1.1 connection (a WebSocket,
+say) -- has no request boundaries, so neither `idle-timeout` nor `stall-timeout` applies
+to it. It is bounded by the verbatim idle timeout instead: once no byte was read from the
+client nor written to it for the timeout, the connection is closed, its slot released, and
+counted as `sluice.data.connections.verbatim.idle.closed`. Bytes flowing in one direction
+keep it open. A connection half-closed by its upstream stays under the timeout, as does
+one whose client stopped reading: the relay's write to it blocks, nothing more is written,
+and the timeout closes the connection under the blocked write (a TLS-terminated one after
+the one-second teardown grace, should the relay's teardown wait on that write). A write
+counts as each of its 16KiB pieces completes. What idles legitimately depends on the
+protocol (a Redis or database pool keeps connections idle for minutes), so the timeout is
+set per route by the client operator, `sluice.client.upstream[n].verbatim-idle-timeout`;
+`sluice.limits.verbatim-idle-timeout` applies to the routes that set none, so a server
+operator can bound every route. A route's own timeout replaces the server's, longer or
+shorter; a route cannot turn the server's off. Both are off by default: a peer that goes
+quiet on a connection relayed verbatim, or stops reading from it, then holds its slot of
+`max-connections` (and of `max-connections-per-address`) until it or the upstream closes
+the connection.
 
 The plaintext and TLS-terminated HTTP/1.1 relay reads request and response heads as
 ISO-8859-1, so a field value carrying non-ASCII bytes (a UTF-8 header value, RFC 9110

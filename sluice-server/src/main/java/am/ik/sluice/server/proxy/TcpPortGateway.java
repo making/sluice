@@ -42,9 +42,10 @@ import org.slf4j.LoggerFactory;
 /**
  * Data plane for tcp port routes: one TCP listener per port advertised by a client
  * ({@code listen-port} of an upstream), relaying every accepted connection verbatim -- no
- * head parsing, no rewriting -- over a virtual connection of the owning session.
- * Listeners are bound on advertise and released on session end; in-flight relays survive
- * an unbind because each runs on its own accepted socket.
+ * head parsing, no rewriting -- over a virtual connection of the owning session, under
+ * the verbatim idle timeout of the route. Listeners are bound on advertise and released
+ * on session end; in-flight relays survive an unbind because each runs on its own
+ * accepted socket.
  */
 @Component
 public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoCloseable, Drainable {
@@ -313,11 +314,15 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 			VirtualConnection connection = session.open(route0.address());
 			access.route(route0.routeTag()).connectionId(connection.connectionId());
 			AtomicInteger active = this.activeConnections.computeIfAbsent(port, p -> new AtomicInteger());
+			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(socket);
 			// reads continue from the proxy parser's position: past the consumed header,
 			// or (no header present) from the first byte the probe pushed back
-			StreamRelay relay = StreamRelay.builder(DuplexPipe.of(source, socket), connection, session.sender())
+			StreamRelay relay = StreamRelay
+				.builder(ProgressPipe.of(DuplexPipe.of(source, socket), deadline::progress), connection,
+						session.sender())
 				.listener(this.relayedBytes(route0, session, access))
 				.onComplete(() -> {
+					deadline.disarm();
 					active.decrementAndGet();
 					access.close();
 					session.remove(connection.connectionId());
@@ -325,12 +330,15 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 					connection.afterQueued(admission::release);
 				})
 				.build();
+			deadline.onExpiry(relay::abandon);
+			deadline.relayVerbatim(route0);
 			active.incrementAndGet();
 			try {
 				relay.start();
 				relaying = true;
 			}
 			catch (RuntimeException e) {
+				deadline.disarm();
 				active.decrementAndGet();
 				throw e;
 			}

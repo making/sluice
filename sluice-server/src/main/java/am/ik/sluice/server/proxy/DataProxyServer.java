@@ -332,7 +332,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	 * {@code release} runs once the relay completed and the frames its virtual
 	 * connections queued left the tunnel sender. False when the connection was answered
 	 * with an error response and closed. Plaintext and TLS-terminated HTTP relays drive
-	 * {@code deadline} between their requests; the verbatim relays leave it disarmed.
+	 * {@code deadline} between their requests; a verbatim relay puts it under the
+	 * verbatim idle timeout of its route.
 	 */
 	private boolean relay(Connection conn, AccessLogger.Connection access, ConnectionLimits.KeepAliveDeadline deadline,
 			Runnable release) {
@@ -392,10 +393,12 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		if (request != null) {
 			access.request(request.method(), request.path(), request.version());
 		}
-		StreamRelay relay = StreamRelay.builder(conn.pipe(), connection, session.sender())
+		StreamRelay relay = StreamRelay
+			.builder(ProgressPipe.of(conn.pipe(), deadline::progress), connection, session.sender())
 			.prefix(conn.head().bytes())
 			.listener(this.relayedBytes(route0, session, access))
 			.onComplete(() -> {
+				deadline.disarm();
 				this.activeConnections.decrementAndGet();
 				access.close();
 				session.remove(connection.connectionId());
@@ -403,11 +406,14 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				connection.afterQueued(release);
 			})
 			.build();
+		deadline.onExpiry(relay::abandon);
+		deadline.relayVerbatim(route0);
 		this.activeConnections.incrementAndGet();
 		try {
 			relay.start();
 		}
 		catch (RuntimeException e) {
+			deadline.disarm();
 			this.activeConnections.decrementAndGet();
 			throw e;
 		}

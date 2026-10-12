@@ -44,7 +44,7 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	 * @param id stable client identity sent as {@code x-sluice-id} on every tunnel
 	 * stream; blank = a random id is generated once per process
 	 * @param upstream upstream entries, bound from
-	 * {@code sluice.client.upstream[n].{host,host-pattern,target,rewrite-host,force-http1,listen-port,allowed-cidrs}}
+	 * {@code sluice.client.upstream[n].{host,host-pattern,target,rewrite-host,force-http1,listen-port,allowed-cidrs,verbatim-idle-timeout}}
 	 * @param maxConnections upstream connections open at once over every server node; a
 	 * CONNECT beyond it is answered with an ERROR without dialing. {@code 0} = derived
 	 * from the maximum heap so the worst-case buffering of every connection fits in half
@@ -167,6 +167,7 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 				.setForceHttp1(upstream.forceHttp1())
 				.setListenPort(upstream.listenPort())
 				.addAllAllowedCidrs(upstream.allowedCidrs())
+				.setVerbatimIdleTimeoutMillis(upstream.verbatimIdleTimeoutMillis())
 				.build())
 			.toList();
 	}

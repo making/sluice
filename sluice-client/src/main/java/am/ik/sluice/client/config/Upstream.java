@@ -1,5 +1,6 @@
 package am.ik.sluice.client.config;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 import java.util.regex.Pattern;
@@ -15,13 +16,16 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * connections are relayed untouched ({@code tls-passthrough}) instead of terminated on
  * the data plane, whether the data plane's TLS termination prefers http/1.1 in ALPN
  * ({@code force-http1}; for upstreams without HTTP/2 support), the public port for raw
- * TCP routing ({@code listen-port}; 0 disables it), and the CIDRs / bare addresses
- * allowed to connect on the data plane ({@code allowed-cidrs}; empty = the server-wide
- * allow list).
+ * TCP routing ({@code listen-port}; 0 disables it), the CIDRs / bare addresses allowed to
+ * connect on the data plane ({@code allowed-cidrs}; empty = the server-wide allow list),
+ * and how long a connection relayed verbatim -- TLS passthrough, a tcp route, a hostless
+ * connection, an upgraded HTTP/1.1 connection -- may relay no byte in either direction
+ * before the server closes it ({@code verbatim-idle-timeout}; {@code 0} = the server's
+ * default).
  */
 public record Upstream(String host, @DefaultValue("") String hostPattern, String target,
 		@DefaultValue("false") boolean rewriteHost, boolean tlsPassthrough, @DefaultValue("false") boolean forceHttp1,
-		int listenPort, @DefaultValue List<String> allowedCidrs) {
+		int listenPort, @DefaultValue List<String> allowedCidrs, @DefaultValue("0") Duration verbatimIdleTimeout) {
 
 	public Upstream {
 		host = host == null ? "" : host.trim();
@@ -37,6 +41,24 @@ public record Upstream(String host, @DefaultValue("") String hostPattern, String
 		target = normalizeTarget(target);
 		listenPort = Math.max(0, listenPort);
 		allowedCidrs = allowedCidrs == null ? List.of() : List.copyOf(allowedCidrs);
+		verbatimIdleTimeout = verbatimIdleTimeout == null || verbatimIdleTimeout.isNegative() ? Duration.ZERO
+				: verbatimIdleTimeout;
+	}
+
+	/**
+	 * The verbatim idle timeout as carried in the advertise: whole milliseconds, a
+	 * positive timeout below one rounded up to one so it does not read as unset.
+	 */
+	public long verbatimIdleTimeoutMillis() {
+		if (this.verbatimIdleTimeout.isZero()) {
+			return 0;
+		}
+		try {
+			return Math.max(1, this.verbatimIdleTimeout.toMillis());
+		}
+		catch (ArithmeticException e) {
+			return Long.MAX_VALUE;
+		}
 	}
 
 	private static String normalizeTarget(String target) {
@@ -66,6 +88,8 @@ public record Upstream(String host, @DefaultValue("") String hostPattern, String
 		private int listenPort;
 
 		private List<String> allowedCidrs = List.of();
+
+		private Duration verbatimIdleTimeout = Duration.ZERO;
 
 		private Builder() {
 		}
@@ -110,9 +134,15 @@ public record Upstream(String host, @DefaultValue("") String hostPattern, String
 			return this;
 		}
 
+		public Builder verbatimIdleTimeout(Duration verbatimIdleTimeout) {
+			this.verbatimIdleTimeout = verbatimIdleTimeout;
+			return this;
+		}
+
 		public Upstream build() {
 			return new Upstream(this.host, this.hostPattern, Objects.requireNonNull(this.target, "target is required"),
-					this.rewriteHost, this.tlsPassthrough, this.forceHttp1, this.listenPort, this.allowedCidrs);
+					this.rewriteHost, this.tlsPassthrough, this.forceHttp1, this.listenPort, this.allowedCidrs,
+					this.verbatimIdleTimeout);
 		}
 
 	}

@@ -8,6 +8,7 @@ import java.util.Optional;
 
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -41,14 +42,19 @@ public class Router {
 	 * under, its dial address, whether the request Host header is rewritten to the target
 	 * ({@code rewrite-host}), whether TLS connections are relayed untouched
 	 * ({@code tls-passthrough}) instead of terminated on the data plane, whether the data
-	 * plane's TLS termination prefers http/1.1 in ALPN ({@code force-http1}), and the IP
-	 * networks allowed to connect (empty = the server-wide allow list applies).
+	 * plane's TLS termination prefers http/1.1 in ALPN ({@code force-http1}), the IP
+	 * networks allowed to connect (empty = the server-wide allow list applies), and how
+	 * long a connection relayed verbatim may relay no byte either way before it is closed
+	 * ({@code verbatim-idle-timeout}; zero = the route sets none, the server's default
+	 * applies).
 	 */
 	public record Route(String clientId, String domain, String address, int listenPort, boolean rewriteHost,
-			boolean tlsPassthrough, boolean forceHttp1, List<String> allowedCidrs) {
+			boolean tlsPassthrough, boolean forceHttp1, List<String> allowedCidrs, Duration verbatimIdleTimeout) {
 
 		public Route {
 			allowedCidrs = allowedCidrs == null ? List.of() : List.copyOf(allowedCidrs);
+			verbatimIdleTimeout = verbatimIdleTimeout == null || verbatimIdleTimeout.isNegative() ? Duration.ZERO
+					: verbatimIdleTimeout;
 		}
 
 		/**
@@ -83,6 +89,8 @@ public class Router {
 			private boolean forceHttp1;
 
 			private List<String> allowedCidrs = List.of();
+
+			private Duration verbatimIdleTimeout = Duration.ZERO;
 
 			private Builder() {
 			}
@@ -127,11 +135,16 @@ public class Router {
 				return this;
 			}
 
+			public Builder verbatimIdleTimeout(Duration verbatimIdleTimeout) {
+				this.verbatimIdleTimeout = verbatimIdleTimeout;
+				return this;
+			}
+
 			public Route build() {
 				return new Route(Objects.requireNonNull(this.clientId, "clientId is required"),
 						Objects.requireNonNull(this.domain, "domain is required"),
 						Objects.requireNonNull(this.address, "address is required"), this.listenPort, this.rewriteHost,
-						this.tlsPassthrough, this.forceHttp1, this.allowedCidrs);
+						this.tlsPassthrough, this.forceHttp1, this.allowedCidrs, this.verbatimIdleTimeout);
 			}
 
 		}
@@ -192,7 +205,8 @@ public class Router {
 	}
 
 	record Target(String clientId, String domain, String address, boolean rewriteHost, boolean tlsPassthrough,
-			boolean forceHttp1, int listenPort, List<String> allowedCidrs, @Nullable Pattern hostPattern) {
+			boolean forceHttp1, int listenPort, List<String> allowedCidrs, Duration verbatimIdleTimeout,
+			@Nullable Pattern hostPattern) {
 
 		Target {
 			allowedCidrs = allowedCidrs == null ? List.of() : List.copyOf(allowedCidrs);
@@ -219,6 +233,8 @@ public class Router {
 			private int listenPort;
 
 			private List<String> allowedCidrs = List.of();
+
+			private Duration verbatimIdleTimeout = Duration.ZERO;
 
 			private @Nullable Pattern hostPattern;
 
@@ -265,6 +281,11 @@ public class Router {
 				return this;
 			}
 
+			Builder verbatimIdleTimeout(Duration verbatimIdleTimeout) {
+				this.verbatimIdleTimeout = verbatimIdleTimeout;
+				return this;
+			}
+
 			Builder hostPattern(@Nullable Pattern hostPattern) {
 				this.hostPattern = hostPattern;
 				return this;
@@ -274,7 +295,8 @@ public class Router {
 				return new Target(Objects.requireNonNull(this.clientId, "clientId is required"),
 						Objects.requireNonNull(this.domain, "domain is required"),
 						Objects.requireNonNull(this.address, "address is required"), this.rewriteHost,
-						this.tlsPassthrough, this.forceHttp1, this.listenPort, this.allowedCidrs, this.hostPattern);
+						this.tlsPassthrough, this.forceHttp1, this.listenPort, this.allowedCidrs,
+						this.verbatimIdleTimeout, this.hostPattern);
 			}
 
 		}
@@ -341,6 +363,7 @@ public class Router {
 				.forceHttp1(upstream.getForceHttp1())
 				.listenPort(upstream.getListenPort())
 				.allowedCidrs(upstream.getAllowedCidrsList())
+				.verbatimIdleTimeout(verbatimIdleTimeoutOf(upstream))
 				.hostPattern(hostPattern)
 				.build());
 		}
@@ -363,6 +386,15 @@ public class Router {
 			this.byClient.put(clientId, List.copyOf(targets));
 		}
 		return targets.size();
+	}
+
+	/**
+	 * The verbatim idle timeout an upstream declares; zero when it declares none. A value
+	 * past the signed range of the unsigned field is taken as the longest one.
+	 */
+	private static Duration verbatimIdleTimeoutOf(Upstream upstream) {
+		long millis = upstream.getVerbatimIdleTimeoutMillis();
+		return Duration.ofMillis(millis < 0 ? Long.MAX_VALUE : millis);
 	}
 
 	/**
@@ -568,6 +600,7 @@ public class Router {
 			.tlsPassthrough(target.tlsPassthrough())
 			.forceHttp1(target.forceHttp1())
 			.allowedCidrs(target.allowedCidrs())
+			.verbatimIdleTimeout(target.verbatimIdleTimeout())
 			.build();
 	}
 

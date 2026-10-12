@@ -18,6 +18,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.util.unit.DataSize;
 
 import am.ik.sluice.server.config.SluiceServerProperties;
+import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.ConnectionLimit;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -25,6 +26,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ConnectionLimitsTest {
 
 	private static final Duration STALL_TIMEOUT = Duration.ofMillis(400);
+
+	private static final Duration VERBATIM_IDLE_TIMEOUT = Duration.ofMillis(300);
 
 	private final SimpleMeterRegistry meters = new SimpleMeterRegistry();
 
@@ -183,6 +186,139 @@ class ConnectionLimitsTest {
 			assertThat(accepted.isClosed()).isFalse();
 			assertThat(deadline.expired()).isFalse();
 			assertThat(idleClosed()).isZero();
+		}
+	}
+
+	@Test
+	void aRouteVerbatimIdleTimeoutReplacesTheServerDefault() {
+		ConnectionLimits defaulted = new ConnectionLimits(SluiceServerProperties.builder()
+			.limits(SluiceServerProperties.Limits.builder().verbatimIdleTimeout(Duration.ofSeconds(30)).build())
+			.build(), new SimpleMeterRegistry());
+		try {
+			assertThat(defaulted.verbatimIdleTimeout(route(Duration.ofSeconds(90)))).isEqualTo(Duration.ofSeconds(90));
+			assertThat(defaulted.verbatimIdleTimeout(route(Duration.ofSeconds(5)))).isEqualTo(Duration.ofSeconds(5));
+			assertThat(defaulted.verbatimIdleTimeout(route(Duration.ZERO))).isEqualTo(Duration.ofSeconds(30));
+			// neither: off, the default of the server
+			assertThat(this.properties.limits().verbatimIdleTimeout()).isZero();
+			assertThat(this.limits.verbatimIdleTimeout(route(Duration.ZERO))).isZero();
+			assertThat(this.limits.verbatimIdleTimeout(route(Duration.ofSeconds(5)))).isEqualTo(Duration.ofSeconds(5));
+		}
+		finally {
+			defaulted.destroy();
+		}
+	}
+
+	@Test
+	void aVerbatimRelayReportingProgressIsKeptAndTornDownOnceItStops() throws Exception {
+		try (ServerSocket server = new ServerSocket(0);
+				Socket client = new Socket("127.0.0.1", server.getLocalPort());
+				Socket accepted = server.accept()) {
+			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(accepted);
+			CountDownLatch teardown = new CountDownLatch(1);
+			deadline.onExpiry(teardown::countDown);
+			assertThat(deadline.relayVerbatim(route(VERBATIM_IDLE_TIMEOUT))).isTrue();
+			assertThat(this.limits.scheduledDeadlines()).isEqualTo(1);
+			long end = System.nanoTime() + VERBATIM_IDLE_TIMEOUT.multipliedBy(3).toNanos();
+			long stopped = System.nanoTime();
+			while (System.nanoTime() < end) {
+				stopped = System.nanoTime();
+				deadline.progress(1);
+				Thread.sleep(VERBATIM_IDLE_TIMEOUT.toMillis() / 6);
+			}
+			assertThat(deadline.expired()).as("kept by its progress").isFalse();
+			assertThat(teardown.await(VERBATIM_IDLE_TIMEOUT.multipliedBy(4).toMillis(), TimeUnit.MILLISECONDS))
+				.isTrue();
+			assertThat(Duration.ofNanos(System.nanoTime() - stopped)).isGreaterThanOrEqualTo(VERBATIM_IDLE_TIMEOUT);
+			Awaitility.await().atMost(Duration.ofSeconds(1)).until(accepted::isClosed);
+			assertThat(verbatimIdleClosed()).isEqualTo(1);
+			assertThat(idleClosed()).isZero();
+			assertThat(deadline.relayVerbatim(route(VERBATIM_IDLE_TIMEOUT))).as("expired").isFalse();
+		}
+	}
+
+	/**
+	 * A teardown blocking -- a TLS socket's close waits for the write blocked on a client
+	 * that does not read -- has the transport closed under it after the grace.
+	 */
+	@Test
+	void aVerbatimRelayWhoseTeardownBlocksHasItsTransportClosedAfterTheGrace() throws Exception {
+		try (ServerSocket server = new ServerSocket(0);
+				Socket client = new Socket("127.0.0.1", server.getLocalPort());
+				Socket accepted = server.accept()) {
+			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(accepted);
+			CountDownLatch release = new CountDownLatch(1);
+			CountDownLatch tearingDown = new CountDownLatch(1);
+			deadline.onExpiry(() -> {
+				tearingDown.countDown();
+				try {
+					release.await();
+				}
+				catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+				}
+			});
+			try {
+				deadline.relayVerbatim(route(VERBATIM_IDLE_TIMEOUT));
+				assertThat(tearingDown.await(2, TimeUnit.SECONDS)).isTrue();
+				long start = System.nanoTime();
+				Awaitility.await()
+					.pollInterval(Duration.ofMillis(10))
+					.atMost(ConnectionLimits.KeepAliveDeadline.TEARDOWN_GRACE.plusSeconds(1))
+					.until(accepted::isClosed);
+				assertThat(Duration.ofNanos(System.nanoTime() - start))
+					.isGreaterThan(ConnectionLimits.KeepAliveDeadline.TEARDOWN_GRACE.minusMillis(200));
+			}
+			finally {
+				release.countDown();
+			}
+		}
+	}
+
+	@Test
+	void theVerbatimPhaseIsEnteredForGood() throws Exception {
+		try (ServerSocket server = new ServerSocket(0);
+				Socket client = new Socket("127.0.0.1", server.getLocalPort());
+				Socket accepted = server.accept()) {
+			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(accepted);
+			long start = System.nanoTime();
+			assertThat(deadline.relayVerbatim(route(VERBATIM_IDLE_TIMEOUT))).isTrue();
+			Thread.sleep(100);
+			// entered again: the running timeout stays; another phase arms nothing
+			assertThat(deadline.relayVerbatim(route(Duration.ofSeconds(30)))).isTrue();
+			assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.IDLE)).isTrue();
+			assertThat(this.limits.scheduledDeadlines()).isEqualTo(1);
+			Awaitility.await()
+				.pollInterval(Duration.ofMillis(5))
+				.atMost(Duration.ofSeconds(2))
+				.until(accepted::isClosed);
+			assertThat(Duration.ofNanos(System.nanoTime() - start)).as("the timeout of the first entry")
+				.isLessThan(Duration.ofSeconds(2));
+			assertThat(verbatimIdleClosed()).isEqualTo(1);
+			assertThat(idleClosed()).isZero();
+		}
+	}
+
+	@Test
+	void aVerbatimRelayWithoutATimeoutDisarmedOrWithTheLongestNeverPasses() throws Exception {
+		try (ServerSocket server = new ServerSocket(0);
+				Socket client = new Socket("127.0.0.1", server.getLocalPort());
+				Socket accepted = server.accept()) {
+			ConnectionLimits.KeepAliveDeadline untimed = this.limits.keepAliveDeadline(accepted);
+			assertThat(untimed.relayVerbatim(route(Duration.ZERO))).isTrue();
+			assertThat(this.limits.scheduledDeadlines()).as("no timeout: nothing armed").isZero();
+			ConnectionLimits.KeepAliveDeadline disarmed = this.limits.keepAliveDeadline(accepted);
+			assertThat(disarmed.relayVerbatim(route(VERBATIM_IDLE_TIMEOUT))).isTrue();
+			assertThat(this.limits.scheduledDeadlines()).isEqualTo(1);
+			disarmed.disarm();
+			assertThat(this.limits.scheduledDeadlines()).isZero();
+			// past what nanoseconds hold: armed, saturated, never due
+			ConnectionLimits.KeepAliveDeadline longest = this.limits.keepAliveDeadline(accepted);
+			assertThat(longest.relayVerbatim(route(Duration.ofMillis(Long.MAX_VALUE)))).isTrue();
+			assertThat(this.limits.scheduledDeadlines()).isEqualTo(1);
+			Thread.sleep(VERBATIM_IDLE_TIMEOUT.multipliedBy(2).toMillis());
+			assertThat(longest.expired()).isFalse();
+			assertThat(accepted.isClosed()).isFalse();
+			assertThat(verbatimIdleClosed()).isZero();
 		}
 	}
 
@@ -405,6 +541,19 @@ class ConnectionLimitsTest {
 
 	private double stallClosed() {
 		return this.stallMeters.get("sluice.data.connections.stall.closed").counter().count();
+	}
+
+	private static Router.Route route(Duration verbatimIdleTimeout) {
+		return Router.Route.builder()
+			.clientId("client")
+			.domain("verbatim.test")
+			.address("127.0.0.1:1")
+			.verbatimIdleTimeout(verbatimIdleTimeout)
+			.build();
+	}
+
+	private double verbatimIdleClosed() {
+		return this.meters.get("sluice.data.connections.verbatim.idle.closed").counter().count();
 	}
 
 	private ConnectionLimits.Admission admit() {

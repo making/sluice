@@ -376,7 +376,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * TLS-terminated HTTP/1.1 connection left incomplete between requests
 	 * @param idleTimeout how long a plaintext or TLS-terminated HTTP connection may idle
 	 * between requests -- h1: every response complete and no next request begun; h2: no
-	 * open stream -- before it is closed; an upgraded connection has none
+	 * open stream -- before it is closed; an upgraded connection has none (it is relayed
+	 * verbatim: see {@code verbatimIdleTimeout})
 	 * @param h2QueueBudget bytes the h2 demux relays may queue towards their upstreams
 	 * beyond each connection's own allowance, shared by all of them; {@code 0} = an
 	 * eighth of half the maximum heap
@@ -396,12 +397,16 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * client while not ready, the client taking none of them, before the session is
 	 * failed -- its stream reset, its routes removed and the slots its connections hold
 	 * freed; {@code 0} = off
+	 * @param verbatimIdleTimeout how long a connection relayed verbatim -- TLS
+	 * passthrough, a tcp route, a hostless connection, an upgraded HTTP/1.1 connection --
+	 * may relay no byte in either direction before it is closed, for the routes whose
+	 * upstream sets no {@code verbatim-idle-timeout} of its own; {@code 0} = off
 	 */
 	public record Limits(@DefaultValue("0") int maxConnections, @DefaultValue("0") int maxConnectionsPerAddress,
 			@DefaultValue("10s") Duration headTimeout, @DefaultValue("60s") Duration idleTimeout,
 			@DefaultValue("0") DataSize h2QueueBudget, @DefaultValue("1s") Duration halfCloseProbeInterval,
 			@DefaultValue("60s") Duration stallTimeout, @DefaultValue("16KB") DataSize stallMinBytes,
-			@DefaultValue("60s") Duration tunnelStallTimeout) {
+			@DefaultValue("60s") Duration tunnelStallTimeout, @DefaultValue("0") Duration verbatimIdleTimeout) {
 
 		public Limits {
 			maxConnections = Math.max(0, maxConnections);
@@ -419,6 +424,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 					: stallMinBytes;
 			tunnelStallTimeout = tunnelStallTimeout == null || tunnelStallTimeout.isNegative() ? Duration.ofSeconds(60)
 					: tunnelStallTimeout;
+			verbatimIdleTimeout = verbatimIdleTimeout == null || verbatimIdleTimeout.isNegative() ? Duration.ZERO
+					: verbatimIdleTimeout;
 		}
 
 		public static Builder builder() {
@@ -444,6 +451,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			@Nullable private DataSize stallMinBytes;
 
 			@Nullable private Duration tunnelStallTimeout;
+
+			private Duration verbatimIdleTimeout = Duration.ZERO;
 
 			private Builder() {
 			}
@@ -493,6 +502,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder verbatimIdleTimeout(Duration verbatimIdleTimeout) {
+				this.verbatimIdleTimeout = verbatimIdleTimeout;
+				return this;
+			}
+
 			public Limits build() {
 				return new Limits(this.maxConnections, this.maxConnectionsPerAddress,
 						this.headTimeout == null ? Duration.ofSeconds(10) : this.headTimeout,
@@ -501,7 +515,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 						this.halfCloseProbeInterval == null ? Duration.ofSeconds(1) : this.halfCloseProbeInterval,
 						this.stallTimeout == null ? Duration.ofSeconds(60) : this.stallTimeout,
 						this.stallMinBytes == null ? DataSize.ofKilobytes(16) : this.stallMinBytes,
-						this.tunnelStallTimeout == null ? Duration.ofSeconds(60) : this.tunnelStallTimeout);
+						this.tunnelStallTimeout == null ? Duration.ofSeconds(60) : this.tunnelStallTimeout,
+						this.verbatimIdleTimeout);
 			}
 
 		}
