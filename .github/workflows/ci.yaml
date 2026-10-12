@@ -17,6 +17,13 @@ on:
     branches:
     - main
     paths: *maven-paths
+# Pushes to main queue: one run at a time, so save-image never races on the images
+# branch and an older run cannot finish after (and overwrite) a newer one. A pending run
+# is replaced by the newest pending one; a running one is never cancelled (it may be
+# midway through save-image). Pull request runs cancel in progress per PR.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions:
   contents: read
   packages: write
