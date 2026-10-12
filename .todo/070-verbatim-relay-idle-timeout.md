@@ -10,6 +10,14 @@ deadline once its head phase is over, so a peer can hold a slot of
 `sluice.limits.max-connections` for good by going quiet (`StreamRelay` in
 `DataProxyServer#relay`, `TcpPortGateway`).
 
+The stall timeout (071, `sluice.limits.stall-timeout`) covers parsed HTTP only, so a
+verbatim relay whose client stops reading also holds its slot: the relay's write blocks
+and nothing moves either way. A byte-level idle timeout covers that case as well, provided
+its expiry closes the transport under the blocked write (a blocking socket write takes no
+timeout) -- as `ConnectionLimits.KeepAliveDeadline` does with its teardown grace. The same
+holds for an upgraded HTTP/1.1 connection (WebSocket) and for HTTP/1.1 input the parser
+cannot follow (072), both relayed verbatim with no deadline.
+
 ## Needs a decision
 
 A byte-level idle timeout (nothing relayed in either direction for N) would bound them,

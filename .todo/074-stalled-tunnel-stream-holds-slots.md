@@ -16,6 +16,11 @@ connections of a stalled stream already held their slots. Related: an HTTP/1.1
 connection switching routes waits for the previous leg's queued frames with no deadline
 (`ReroutingRelay.Leg#awaitQueued`), so its client gets no response meanwhile.
 
+The data plane's stall timeout (071, `sluice.limits.stall-timeout`) does not bound this: a
+relay held back by a stream not ready waits on the upstream side, which it never counts
+against the client (`StallTimeoutE2ETest#anUploadHeldBackByItsUpstreamIsNotCut` pins the
+same for an upstream that does not read).
+
 ## Direction
 
 A per-session progress watchdog: frames queued, the stream not ready and no frame handed

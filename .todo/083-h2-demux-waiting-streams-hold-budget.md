@@ -18,7 +18,10 @@ stream opens.
   them, and the relay dropped their data.
 - The wait itself is unbounded: as long as the upstream keeps its streams open (or keeps
   a limit of 0), the waiting streams and their bytes stay. Same class as an upstream that
-  never answers (no bound either; see 071 for the client side).
+  never answers (no bound either). The stall timeout (071) bounds the client side only:
+  it does not count a waiting stream whose client spent its window, nor the stalled
+  connection of the first point, whose withheld window leaves the client nothing to send;
+  a waiting stream whose client still holds window and sends nothing is cut by it.
 
 ## Direction
 

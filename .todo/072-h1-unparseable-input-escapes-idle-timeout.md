@@ -6,7 +6,7 @@ Found while working on 060. `Http1RequestParser` degrades the rest of a connecti
 verbatim passthrough when it meets input it cannot follow: a request head with a byte
 >= 0x80 (`ConnectionHeadRewriter.isAscii`), a head over 64KiB, an invalid chunk size.
 `ReroutingRelay` then treats the connection like an upgraded one: no further rerouting,
-and the keep-alive deadline disarmed for good. Any plaintext client can therefore hold a
+and the keep-alive deadline disarmed for good -- its stall timeout (071) with it. Any plaintext client can therefore hold a
 slot of `sluice.limits.max-connections` forever by putting one non-ASCII byte in a header
 and going quiet -- the bypass 060 closed for declined upgrades, open through this door.
 The response side is similar: a response head `ResponseTracker` cannot parse stops the
