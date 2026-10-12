@@ -38,13 +38,16 @@ import org.springframework.test.context.DynamicPropertySource;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * A client reading a large HTTP/1.1 response slowly but steadily -- one 64KiB read per
+ * A client reading a large HTTP/1.1 response slowly but steadily -- one 256KiB read per
  * second -- is not cut by the stall timeout, though the relay's writes to it block most
- * of the time. Its own class for a stall timeout of 10s: the relay sees a client's reads
- * only as its TCP window reopens, and a receiver whose buffer filled up may announce that
- * only to the sender's persist probes. Observed on macOS loopback: the relay's writes
- * resume 4 to 5s apart at 64KiB per second, and the gaps grow past 15s at 16KiB per
- * second.
+ * of the time. Its own class for a stall timeout of 10s: a blocked write to the client
+ * returns only once the kernel takes more of it, and when that happens depends on the
+ * platform, not on each read of the client. Observed on loopback with a writer of 16KiB
+ * pieces and a reader whose buffers filled up: on macOS the writes resume about 4s apart
+ * at 64KiB per second (the receiver reopens its window to the sender's persist probes)
+ * and 1 to 2s apart at 256KiB per second; on Linux they resume only once the reader
+ * drained about 900KB, 12 to 15s apart at 64KiB per second and 3 to 4s apart at 256KiB
+ * per second.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -54,7 +57,9 @@ class StallTimeoutSlowReaderE2ETest {
 
 	private static final String HOST = "stall-slow.test";
 
-	private static final int BIG = 64 * 1024 * 1024;
+	private static final int BIG = 256 * 1024 * 1024;
+
+	private static final int READ_PER_SECOND = 256 * 1024;
 
 	private static int grpcPort;
 
@@ -144,7 +149,7 @@ class StallTimeoutSlowReaderE2ETest {
 			socket.getOutputStream()
 				.write(("GET /big HTTP/1.1\r\nHost: " + HOST + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
 			InputStream in = socket.getInputStream();
-			byte[] buffer = new byte[64 * 1024];
+			byte[] buffer = new byte[READ_PER_SECOND];
 			long received = 0;
 			long end = System.nanoTime() + STALL_TIMEOUT.multipliedBy(5).dividedBy(2).toNanos();
 			Thread.sleep(1000);
