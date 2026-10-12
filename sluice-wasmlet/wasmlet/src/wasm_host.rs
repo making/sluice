@@ -145,7 +145,10 @@ impl EpochSchedule {
 
     /// When the next tick is due.
     fn next_due(&self) -> std::time::Instant {
-        self.start + self.tick * (self.done + 1) as u32
+        // In u128 nanoseconds: `Duration * u32` would wrap the tick count
+        // after 2^32 ticks and put the next tick in the past.
+        let nanos = self.tick.as_nanos() * u128::from(self.done + 1);
+        self.start + std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
     }
 }
 
@@ -1984,6 +1987,24 @@ pub(crate) mod tests {
         let mut s = EpochSchedule::new(start, T);
         assert_eq!(s.due(at(MAX_CATCH_UP_TICKS * 10)), MAX_CATCH_UP_TICKS);
         assert_eq!(s.due(at(MAX_CATCH_UP_TICKS * 10 + 10)), 1);
+    }
+
+    /// Past 2^32 ticks (about 497 days at 10ms) the next tick is still due one
+    /// tick ahead, not wrapped back into the past (which would spin the ticker).
+    #[test]
+    fn the_schedule_stays_ahead_past_two_to_the_32_ticks() {
+        let start = std::time::Instant::now();
+        let s = EpochSchedule {
+            start,
+            tick: T,
+            done: u64::from(u32::MAX),
+        };
+        let ticks = u64::from(u32::MAX) + 1;
+        assert_eq!(
+            s.next_due(),
+            start + Duration::from_millis(10 * ticks),
+            "tick 2^32 is due at start + 2^32 * tick"
+        );
     }
 
     /// A ticker thread that panics must not die silently: budgets would never
