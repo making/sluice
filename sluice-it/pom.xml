@@ -10,6 +10,9 @@
 	<artifactId>sluice-it</artifactId>
 	<properties>
 		<java.version>25</java.version>
+		<!-- the test JVMs running at once: the classes mostly wait on timeouts, so more
+			 than the 4 vCPUs of a CI runner -->
+		<sluice.it.forks>6</sluice.it.forks>
 	</properties>
 	<dependencies>
 		<dependency>
@@ -75,6 +78,20 @@
 			<plugin>
 				<groupId>am.ik.maven</groupId>
 				<artifactId>nullability-maven-plugin</artifactId>
+			</plugin>
+			<plugin>
+				<!-- The classes run in parallel JVMs, a class at a time in each, so they share no
+					 JVM state; TestPorts gives each JVM its own slice of ports. -->
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<configuration>
+					<forkCount>${sluice.it.forks}</forkCount>
+					<reuseForks>true</reuseForks>
+					<systemPropertyVariables>
+						<sluice.test.fork>${surefire.forkNumber}</sluice.test.fork>
+						<sluice.test.forks>${sluice.it.forks}</sluice.test.forks>
+					</systemPropertyVariables>
+				</configuration>
 			</plugin>
 		</plugins>
 	</build>

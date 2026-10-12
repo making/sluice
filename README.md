@@ -79,7 +79,8 @@ sequenceDiagram
 ./mvnw verify
 ```
 
-Requires JDK 25+.
+Requires JDK 25+. The `sluice-it` classes run in 6 JVMs at once (`-Dsluice.it.forks=N` to
+change), a class at a time in each.
 
 Build the executable jars first (the `-exec.jar` files below are produced by this):
 
