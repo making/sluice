@@ -27,6 +27,7 @@ The data plane relays raw bytes (the request head is inspected for routing; with
 - Console: Mustache + htmx 4 (same setup as blog-frontend-htmx: vendored `htmx.min.js`, `{{#src}}` content-hashed URLs from `WebConfig`, `compression-maven-plugin` .br/.gz). htmx 4 inherits nothing implicitly (`:inherited`). The drawing geometry lives in `FlowDrawing`; templates stay logic-less.
 - Native image (`-Pnative`, client/server): console view records are rendered via Mustache reflection -- when adding/renaming a record under `console/web`, register it in `sluice-server/src/main/resources/META-INF/native-image/am.ik.sluice/sluice-server/reflect-config.json`.
 - Tests that need a port before the server starts take it from `TestPorts.freePort()` (sluice-it), never by probing `new ServerSocket(0)` and closing it: the OS may hand that port out again.
+- `sluice-it` classes run in 6 surefire forks at once (`-Dsluice.it.forks=N`), one class at a time per fork: a test must not depend on a quiet machine or on state outside its JVM (ports only via `TestPorts`, which reserves them across JVMs).
 - Console E2E tests use Playwright (`ConsoleE2ETest`); the first run downloads Chromium.
 - `.todo` numbers come from `.todo/claim-number.sh`.
 
