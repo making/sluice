@@ -2,6 +2,14 @@ Difficulty: Medium
 
 # netty h2 demux, step 8: the remaining per-hop test rewrites and README
 
+## Plan change (2026-10-13, the user)
+
+Production is a test deployment; breaking changes are fine, and no code is written just to
+keep two engines side by side. New order: 102 -> 107 (remove the legacy relay now, netty
+only) -> 103, 104, 105 (in parallel, each re-enables its disabled tests on netty) -> 106.
+
+Depends on 107 (re-enable or delete the tests 107 disabled for per-hop rewrites; complete the README). Can run in parallel with 103 and 104.
+
 Step 8 of the netty h2 demux migration (context and user decisions: 098). Depends on 104.
 
 ## Scope

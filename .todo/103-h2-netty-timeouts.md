@@ -2,6 +2,14 @@ Difficulty: Medium
 
 # netty h2 demux, step 6: stall, idle and keep-alive timeouts
 
+## Plan change (2026-10-13, the user)
+
+Production is a test deployment; breaking changes are fine, and no code is written just to
+keep two engines side by side. New order: 102 -> 107 (remove the legacy relay now, netty
+only) -> 103, 104, 105 (in parallel, each re-enables its disabled tests on netty) -> 106.
+
+Depends on 107 (no engine switch; re-enable the tests 107 disabled for this behaviour). Can run in parallel with 104 and 105.
+
 Step 6 of the netty h2 demux migration (context and user decisions: 098). Depends on 102.
 
 ## Scope
