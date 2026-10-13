@@ -305,6 +305,8 @@ final class NettyHttp2DemuxRelay {
 
 	private final LegSlots legSlots;
 
+	private final LegSeam legSeam;
+
 	/**
 	 * A leg holds the connection's own slot: open, or closed with frames still queued for
 	 * the tunnel.
@@ -393,6 +395,7 @@ final class NettyHttp2DemuxRelay {
 		this.release = Objects.requireNonNull(builder.release, "release is required");
 		this.budget = Objects.requireNonNull(builder.budget, "budget is required");
 		this.legSlots = Objects.requireNonNull(builder.legSlots, "legSlots is required");
+		this.legSeam = builder.legSeam;
 		this.loop = new Loop("sluice-h2n",
 				(source, cause) -> log.warn("h2 demux {}: {}", source, cause.toString(), cause));
 		this.loop.afterSettle(this::reviewLocked);
@@ -736,7 +739,7 @@ final class NettyHttp2DemuxRelay {
 		}
 		VirtualConnection connection;
 		try {
-			connection = session.open(route.address());
+			connection = this.legSeam.open(session, route.address());
 		}
 		catch (RuntimeException e) {
 			releaseSlot.run();
@@ -765,6 +768,7 @@ final class NettyHttp2DemuxRelay {
 			hop.withholdConnectionWindowLocked(this.withheld);
 			hop.watchWrites(watchingWrites());
 			hop.addConnectionListener(new LegStreams(opening));
+			this.legSeam.built(hop);
 			// one stream until the upstream's SETTINGS tell its limit (RFC 9113 5.1.2
 			// leaves it open until then); through the encoder, as the buffering encoder
 			// keeps a limit of its own (100 until the peer's SETTINGS) and takes the
@@ -2091,6 +2095,27 @@ final class NettyHttp2DemuxRelay {
 
 	}
 
+	/**
+	 * Opens a leg's virtual connection and sees its hop built; a seam for tests to make a
+	 * leg fail to open.
+	 */
+	interface LegSeam {
+
+		/** Does nothing beyond what the session does. */
+		LegSeam NONE = new LegSeam() {
+		};
+
+		/** Opens the leg's connection; throwing fails the leg's opening. */
+		default VirtualConnection open(TunnelSession session, String address) {
+			return session.open(address);
+		}
+
+		/** Sees the leg's hop built; throwing fails the leg's configuration. */
+		default void built(Hop hop) {
+		}
+
+	}
+
 	static final class Builder {
 
 		private @Nullable DuplexPipe pipe;
@@ -2128,6 +2153,8 @@ final class NettyHttp2DemuxRelay {
 		private @Nullable H2DemuxBudget budget;
 
 		private @Nullable LegSlots legSlots;
+
+		private LegSeam legSeam = LegSeam.NONE;
 
 		private Builder() {
 		}
@@ -2235,6 +2262,12 @@ final class NettyHttp2DemuxRelay {
 		 */
 		Builder legSlots(LegSlots legSlots) {
 			this.legSlots = legSlots;
+			return this;
+		}
+
+		/** The seam of the legs' opening; the default does nothing beyond the session. */
+		Builder legSeam(LegSeam legSeam) {
+			this.legSeam = legSeam;
 			return this;
 		}
 

@@ -116,6 +116,9 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	 */
 	private volatile UnaryOperator<DuplexPipe> clientPipeSeam = UnaryOperator.identity();
 
+	/** Handed to every h2 demux relay started from now on. */
+	private volatile NettyHttp2DemuxRelay.LegSeam legSeam = NettyHttp2DemuxRelay.LegSeam.NONE;
+
 	private volatile boolean running;
 
 	private volatile @Nullable ServerSocket serverSocket;
@@ -397,6 +400,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 					.probeInterval(this.properties.limits().halfCloseProbeInterval())
 					.budget(this.limits.h2Budget())
 					.legSlots(this.limits::tryAcquireLeg)
+					.legSeam(this.legSeam)
 					.onFinish(relayed)
 					.release(release)
 					.build();
@@ -620,6 +624,11 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	 */
 	void clientPipeSeam(UnaryOperator<DuplexPipe> clientPipeSeam) {
 		this.clientPipeSeam = clientPipeSeam;
+	}
+
+	/** Sets the leg seam of the h2 demux relays started from now on; for tests. */
+	void legSeam(NettyHttp2DemuxRelay.LegSeam legSeam) {
+		this.legSeam = legSeam;
 	}
 
 	/**
