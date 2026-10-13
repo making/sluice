@@ -140,6 +140,128 @@ class H2DemuxBudgetE2ETest {
 		registry.add("server.port", () -> String.valueOf(TestPorts.freePort()));
 	}
 
+	// DIAG begin
+	private static final List<Stalled> DIAG_STALLED = new CopyOnWriteArrayList<>();
+
+	private static final Set<Integer> DIAG_PORTS = ConcurrentHashMap.newKeySet();
+
+	private final Set<String> diagRoutes = ConcurrentHashMap.newKeySet();
+
+	private volatile @Nullable Thread diagThread;
+
+	@org.junit.jupiter.api.BeforeEach
+	void diagStart(org.junit.jupiter.api.TestInfo info) {
+		String name = info.getTestMethod().map(java.lang.reflect.Method::getName).orElse("?");
+		DIAG_STALLED.clear();
+		this.diagRoutes.clear();
+		System.out.println("DIAG sysctl " + diagRead("/proc/sys/net/ipv4/tcp_rmem") + " | "
+				+ diagRead("/proc/sys/net/ipv4/tcp_wmem") + " | rmem_max " + diagRead("/proc/sys/net/core/rmem_max")
+				+ " | wmem_max " + diagRead("/proc/sys/net/core/wmem_max") + " | moderate "
+				+ diagRead("/proc/sys/net/ipv4/tcp_moderate_rcvbuf") + " cpus "
+				+ Runtime.getRuntime().availableProcessors());
+		long start = System.nanoTime();
+		this.diagThread = Thread.ofVirtual().name("e2e-bud-diag").start(() -> {
+			int tick = 0;
+			while (!Thread.currentThread().isInterrupted()) {
+				try {
+					Thread.sleep(500);
+				}
+				catch (InterruptedException e) {
+					return;
+				}
+				StringBuilder line = new StringBuilder("DIAG ").append(name)
+					.append(" t=")
+					.append((System.nanoTime() - start) / 1_000_000)
+					.append(" used=")
+					.append(budgetUsed())
+					.append(" waiting=")
+					.append(Objects.requireNonNull(this.limits).h2Budget().waiting())
+					.append(" held=")
+					.append(Math.round(Objects.requireNonNull(this.meterRegistry)
+						.find(H2DemuxMeters.HELD_GAUGE_NAME)
+						.gauges()
+						.stream()
+						.mapToDouble(Gauge::value)
+						.sum()))
+					.append(" withheldB=")
+					.append(withheld("budget"))
+					.append(" withheldS=")
+					.append(withheld("share"));
+				for (String route : this.diagRoutes) {
+					line.append(" q[").append(route).append("]=").append(queuedBytes(route));
+				}
+				int i = 0;
+				for (Stalled stalled : DIAG_STALLED) {
+					line.append(" p")
+						.append(i++)
+						.append("{sent=")
+						.append(stalled.sent.get())
+						.append(" cw=")
+						.append(stalled.client.connectionWindow())
+						.append(" granted=")
+						.append(stalled.client.connectionGranted())
+						.append(" idle=")
+						.append(stalled.withheld())
+						.append(" closed=")
+						.append(stalled.client.closed())
+						.append('}');
+				}
+				System.out.println(line);
+				if (tick++ % 4 == 0) {
+					diagSs();
+				}
+			}
+		});
+	}
+
+	@org.junit.jupiter.api.AfterEach
+	void diagStop() throws InterruptedException {
+		Thread thread = this.diagThread;
+		if (thread != null) {
+			thread.interrupt();
+			thread.join(1000);
+		}
+	}
+
+	private static String diagRead(String path) {
+		try {
+			return java.nio.file.Files.readString(java.nio.file.Path.of(path)).trim();
+		}
+		catch (IOException e) {
+			return "n/a";
+		}
+	}
+
+	private static void diagSs() {
+		try {
+			Process process = new ProcessBuilder("ss", "-tnmi").redirectErrorStream(true).start();
+			List<String> lines = new String(process.getInputStream().readAllBytes()).lines().toList();
+			process.waitFor(5, TimeUnit.SECONDS);
+			for (int i = 0; i < lines.size(); i++) {
+				String l = lines.get(i);
+				boolean match = DIAG_PORTS.stream().anyMatch(port -> l.contains(":" + port + " "));
+				if (match) {
+					StringBuilder sb = new StringBuilder("DIAG ss ").append(l.trim().replaceAll("\\s+", " "));
+					int j = i + 1;
+					while (j < lines.size() && (lines.get(j).startsWith("\t") || lines.get(j).startsWith(" "))) {
+						String extra = lines.get(j).trim();
+						int skmem = extra.indexOf("skmem:");
+						int rcv = extra.indexOf("rcv_space");
+						sb.append(" | ")
+							.append(skmem >= 0 ? extra.substring(skmem, Math.min(extra.length(), skmem + 120)) : "")
+							.append(rcv >= 0 ? " " + extra.substring(rcv, Math.min(extra.length(), rcv + 40)) : "");
+						j++;
+					}
+					System.out.println(sb);
+				}
+			}
+		}
+		catch (IOException | InterruptedException e) {
+			// no ss
+		}
+	}
+	// DIAG end
+
 	@AfterAll
 	void tearDown() {
 		this.clients.forEach(TunnelClient::stop);
@@ -459,6 +581,8 @@ class H2DemuxBudgetE2ETest {
 
 		private final AtomicLong idleSince = new AtomicLong();
 
+		final AtomicLong sent = new AtomicLong();
+
 		/** The connection window the pump leaves unspent. */
 		private final int reserve;
 
@@ -473,6 +597,7 @@ class H2DemuxBudgetE2ETest {
 			this.remaining = new long[streams];
 			this.reserve = reserve;
 			java.util.Arrays.fill(this.remaining, body);
+			DIAG_STALLED.add(this);
 		}
 
 		H2TestClient client() {
@@ -510,6 +635,7 @@ class H2DemuxBudgetE2ETest {
 						if (n > 0) {
 							this.remaining[i] -= n;
 							this.client.sendData(id, new byte[n], this.remaining[i] == 0 ? TestH2.FLAG_END_STREAM : 0);
+							this.sent.addAndGet(n);
 							progress = true;
 						}
 					}
@@ -1048,6 +1174,7 @@ class H2DemuxBudgetE2ETest {
 			.build();
 		client.start();
 		this.clients.add(client);
+		this.diagRoutes.add(host);
 		Awaitility.await()
 			.atMost(Duration.ofSeconds(10))
 			.until(() -> Objects.requireNonNull(this.router).lookup(host).isPresent());
@@ -1058,6 +1185,7 @@ class H2DemuxBudgetE2ETest {
 			ServerSocket server = new ServerSocket();
 			server.bind(new InetSocketAddress("127.0.0.1", 0), 128);
 			this.closeables.add(server);
+			DIAG_PORTS.add(server.getLocalPort());
 			Thread.ofVirtual().name("e2e-bud-accept").start(() -> {
 				while (!server.isClosed()) {
 					try {
