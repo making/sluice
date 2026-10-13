@@ -176,6 +176,7 @@ class H2DemuxBudgetE2ETest {
 		startClient(route, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
 		double withheldBefore = withheld();
 		try (Stalled first = stall(route); Stalled second = stall(route)) {
+			awaitExhausted();
 			long maxQueued = awaitStable(() -> queuedBytes(route));
 			assertThat(maxQueued).as("queued at most: the budget plus each connection's unbudgeted bound")
 				.isLessThanOrEqualTo(BUDGET + 2 * NettyHttp2DemuxRelay.UNBUDGETED_BYTES)
@@ -210,6 +211,7 @@ class H2DemuxBudgetE2ETest {
 		startClient(stalledRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
 		startClient(flowingRoute, stub(H2DemuxBudgetE2ETest::answerEndedRequestsSlowly));
 		try (Stalled first = stall(stalledRoute); Stalled second = stall(stalledRoute)) {
+			awaitExhausted();
 			awaitStable(() -> queuedBytes(stalledRoute));
 			assertThat(budgetUsed()).as("exhausted before").isGreaterThanOrEqualTo(BUDGET);
 			double withheldBefore = withheld();
@@ -245,6 +247,7 @@ class H2DemuxBudgetE2ETest {
 		startClient(route, stub(socket -> serveGated(socket, gate, heads)));
 		double refusedBefore = refused("budget");
 		try (Stalled first = stall(route); Stalled second = stall(route)) {
+			awaitExhausted();
 			awaitStable(() -> queuedBytes(route));
 			assertThat(budgetUsed()).as("exhausted").isGreaterThanOrEqualTo(BUDGET);
 			int extra = 1 + 2 * STREAMS;
@@ -541,6 +544,7 @@ class H2DemuxBudgetE2ETest {
 		startClient(firstRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
 		startClient(secondRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
 		try (Stalled first = stall(firstRoute); Stalled second = stall(secondRoute)) {
+			awaitExhausted();
 			awaitStable(() -> queuedBytes(firstRoute) + queuedBytes(secondRoute));
 			assertThat(budgetUsed()).as("exhausted").isGreaterThanOrEqualTo(BUDGET);
 			assertThat(first.client().connectionWindow()).as("the first connection's window withheld").isZero();
@@ -577,6 +581,7 @@ class H2DemuxBudgetE2ETest {
 		CountDownLatch gate = new CountDownLatch(1);
 		startClient(route, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
 		try (Stalled first = stall(route); Stalled second = stall(route)) {
+			awaitExhausted();
 			awaitStable(() -> queuedBytes(route));
 			assertThat(budgetUsed()).as("exhausted").isGreaterThanOrEqualTo(BUDGET);
 			assertThat(Objects.requireNonNull(this.limits).h2Budget().waiting()).isPositive();
@@ -757,6 +762,14 @@ class H2DemuxBudgetE2ETest {
 			this.client.close();
 		}
 
+	}
+
+	/**
+	 * Waits until the budget is exhausted: the stalled connections may take a while to
+	 * start (a loaded machine), and the queue's plateau only counts after that.
+	 */
+	private void awaitExhausted() {
+		Awaitility.await().atMost(Duration.ofSeconds(30)).until(() -> budgetUsed() >= BUDGET);
 	}
 
 	/** Waits until the value has not changed for a second; returns it. */
