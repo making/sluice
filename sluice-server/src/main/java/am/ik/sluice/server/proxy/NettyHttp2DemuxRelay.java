@@ -137,7 +137,8 @@ import io.netty.util.AsciiString;
  * tunnel bytes ({@code sluice.tunnel.bytes}), the session's traffic and the connection's
  * access log bytes. A stream netty's codec resets on a stream error of the client or of
  * an upstream, and a leg sending its upstream a GOAWAY with an error code, are counted
- * ({@link H2DemuxMeters}).
+ * ({@link H2DemuxMeters}); a client or an upstream going away mid-stream is neither
+ * ({@link HopHandler}).
  * <p>
  * netty's codec answers the client's protocol errors itself; a header block that does not
  * decode ends the connection with a GOAWAY {@code COMPRESSION_ERROR}, logged as a request
@@ -156,7 +157,8 @@ import io.netty.util.AsciiString;
  * <p>
  * The client's EOF with a request unfinished closes the client endpoint; otherwise the
  * relay drains and probes the client ({@link #clientEndedLocked}). The client endpoint's
- * end -- error, the codec closing it, a timeout -- closes every leg at once; the drain
+ * end -- the client gone, an error, the codec closing it, a timeout -- cancels every
+ * stream the legs still have ({@code CANCEL}) and closes every leg at once; the drain
  * closes each leg as it empties, and the client endpoint after the last. Once every hop's
  * threads ended, the relay finishes: the connection is logged closed and {@code onFinish}
  * runs; {@code release} follows once the frames the leg on the connection's own slot
@@ -875,14 +877,38 @@ final class NettyHttp2DemuxRelay {
 	}
 
 	/**
-	 * The client endpoint closed: so do the legs (closed already after a drain), and the
-	 * deadline ends: nothing is left to wait on the client for. With the loop's lock.
+	 * The client endpoint closed -- before netty closes its streams: nothing more of the
+	 * client's streams is relayed, each stream a leg still has is cancelled
+	 * ({@code CANCEL}; one waiting in the leg's buffer leaves it unseen), then the legs
+	 * close (closed already after a drain), and the deadline ends: nothing is left to
+	 * wait on the client for. With the loop's lock.
 	 */
 	private void clientClosedLocked() {
 		this.deadline.disarm();
-		for (Leg leg : this.opened) {
-			leg.hop().abortLocked();
+		for (Exchange exchange : List.copyOf(this.exchanges.values())) {
+			exchange.reset = true;
+			if (exchange.waiting) {
+				// first: closing a stream below would open a waiting one on its upstream
+				dropWaitingLocked(exchange, Http2Error.CANCEL.code());
+			}
 		}
+		for (Leg leg : this.opened) {
+			Hop hop = leg.hop();
+			for (Http2Stream stream : activeStreams(hop)) {
+				resetLocked(hop, stream.id(), Http2Error.CANCEL.code());
+			}
+			hop.abortLocked();
+		}
+	}
+
+	/** The hop's active streams, copied; with the loop's lock. */
+	private static List<Http2Stream> activeStreams(Hop hop) {
+		List<Http2Stream> streams = new ArrayList<>();
+		activeStream(hop, stream -> {
+			streams.add(stream);
+			return false;
+		});
+		return streams;
 	}
 
 	/**

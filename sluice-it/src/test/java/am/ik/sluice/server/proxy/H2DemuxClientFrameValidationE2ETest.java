@@ -161,9 +161,9 @@ class H2DemuxClientFrameValidationE2ETest {
 	 * Sent while stream 1 of the route is open (its request unfinished), the frame ends
 	 * the connection at once with a GOAWAY of the error's code naming stream 2^31-1 as
 	 * the last processed (netty's hard shutdown: the error may come before the frame's
-	 * stream was counted); the open stream is dropped, nothing more reaches the upstream,
-	 * whose connection is closed, and the relay tracks no stream and holds no connection
-	 * any more.
+	 * stream was counted); the open stream is cancelled on the upstream (RST_STREAM
+	 * {@code CANCEL}), nothing of the client's reaches it, its connection is closed, and
+	 * the relay tracks no stream and holds no connection any more.
 	 */
 	@ParameterizedTest(name = "{0}")
 	@MethodSource("violations")
@@ -178,8 +178,13 @@ class H2DemuxClientFrameValidationE2ETest {
 			assertThat(session.client().goAwayLastStreamId()).isEqualTo(Integer.MAX_VALUE);
 			assertThat(session.upstream().eof().await(5, TimeUnit.SECONDS)).as("the leg closed").isTrue();
 			assertThat(session.upstream().frames().subList(before, session.upstream().frames().size()))
-				.as("nothing reached the upstream")
-				.isEmpty();
+				.as("what reached the upstream: stream 1 cancelled")
+				.singleElement()
+				.satisfies(frame -> {
+					assertThat(frame.type()).isEqualTo(TestH2.RST_STREAM);
+					assertThat(frame.streamId()).isEqualTo(1);
+					assertThat(TestH2.errorCode(frame)).isEqualTo(CANCEL);
+				});
 			awaitReleased(ROUTE);
 		}
 	}

@@ -76,6 +76,9 @@ class H2DemuxUpstreamErrorE2ETest {
 	/** SETTINGS_MAX_CONCURRENT_STREAMS. */
 	private static final int MAX_CONCURRENT_STREAMS = 0x3;
 
+	/** SETTINGS_INITIAL_WINDOW_SIZE. */
+	private static final int SETTINGS_INITIAL_WINDOW_SIZE = 0x4;
+
 	private final List<AutoCloseable> closeables = new CopyOnWriteArrayList<>();
 
 	private final List<TunnelClient> clients = new ArrayList<>();
@@ -565,6 +568,50 @@ class H2DemuxUpstreamErrorE2ETest {
 			assertThat(TestH2.bodyOf(client.frames(5))).isEqualTo("new-leg");
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(client.closed()).isFalse();
+		}
+	}
+
+	/**
+	 * An upstream closing its connection while netty holds request DATA for the
+	 * upstream's stream window: the client gets a {@code 502}, then RST_STREAM
+	 * {@code NO_ERROR} (its request unfinished). The upstream going away is no stream
+	 * error of it and fails no leg: nothing counts.
+	 */
+	@Test
+	void upstreamClosingWithRequestDataHeldCountsNoError() throws Exception {
+		String route = "ue.close-data-held.test";
+		ScriptedH2Upstream upstream = upstream(TestH2Settings.of(SETTINGS_INITIAL_WINDOW_SIZE, 1024),
+				(connection, frame) -> {
+				});
+		startClient(route, upstream);
+		H2DemuxMeters meters = dataProxyServer().h2DemuxMeters();
+		double upstreamResets = counter("sluice.h2demux.streams.reset", "upstream");
+		double protocolResets = counter("sluice.h2demux.streams.reset", "protocol");
+		double failed = counter("sluice.h2demux.legs.failed", null);
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
+			client.headers(1, false, post(route));
+			ScriptedH2Upstream.Connection connection = upstream.awaitConnection(0, WITHIN);
+			assertThat(connection.await(f -> f.type() == TestH2.SETTINGS && (f.flags() & TestH2.FLAG_ACK) != 0, WITHIN))
+				.as("the leg applied the upstream's window")
+				.isNotNull();
+			client.sendData(1, new byte[4096], 0);
+			assertThat(connection.await(frame -> frame.type() == TestH2.DATA, WITHIN)).isNotNull();
+			Awaitility.await()
+				.atMost(WITHIN)
+				.alias("netty holds the rest for the upstream")
+				.until(() -> meters.writesHeld(route) == 1);
+			connection.close();
+			assertThat(client.awaitTrue(() -> client.reset(1) != null, WITHIN)).isTrue();
+			assertThat(types(client.frames(1))).as("the 502, then the reset").containsExactlyElementsOf(badGateway());
+			assertBadGateway(client.frames(1), route, "POST");
+			assertThat(client.reset(1)).isEqualTo(NO_ERROR);
+			Awaitility.await().atMost(WITHIN).until(() -> meters.trackedStreams(route) == 0 && meters.legs(route) == 0);
+			assertThat(connection.frames()).as("the upstream got no GOAWAY")
+				.noneMatch(frame -> frame.type() == TestH2.GOAWAY);
+			assertThat(counter("sluice.h2demux.streams.reset", "upstream") - upstreamResets).isZero();
+			assertThat(counter("sluice.h2demux.streams.reset", "protocol") - protocolResets).isZero();
+			assertThat(counter("sluice.h2demux.legs.failed", null) - failed).isZero();
+			assertThat(client.goAwayCode()).isEqualTo(-1);
 		}
 	}
 

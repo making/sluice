@@ -73,6 +73,15 @@ import org.jspecify.annotations.Nullable;
  * raising a stream error is the last one the hop's frame logger saw
  * ({@link InboundFrames}): netty's frame reader hands the logger each frame before the
  * decoder.
+ * <p>
+ * <b>Nothing is answered once the channel closed.</b> As the channel closes, netty fails
+ * what it holds: the DATA of each stream as a stream error {@code STREAM_CLOSED}, which
+ * it answers with a RST_STREAM, and a write failing on the closed channel -- that reset,
+ * or a frame the bridging code writes meanwhile -- as a connection error
+ * {@code INTERNAL_ERROR}, answered with a GOAWAY naming 2^31-1. Neither can be written,
+ * and neither is an error of the peer: the peer went away, or the hop was closed. So an
+ * outbound error on a closed channel is answered with neither: no stream counts as reset
+ * and no GOAWAY as sent ({@code HopClosedChannelTest}, {@code H2DemuxClientGoneE2ETest}).
  */
 public final class HopHandler extends Http2ConnectionHandler {
 
@@ -112,7 +121,8 @@ public final class HopHandler extends Http2ConnectionHandler {
 	}
 
 	/**
-	 * Ignores a frame the peer had in flight on a stream the hop reset (see the class
+	 * Answers nothing once the channel closed, when an outbound operation fails, and
+	 * ignores a frame the peer had in flight on a stream the hop reset (see the class
 	 * comment); else counts a stream error of the peer -- one netty's codec raised
 	 * reading the peer's frames, not one of a write -- once netty answered it; past the
 	 * limit, the connection ends with GOAWAY {@code ENHANCE_YOUR_CALM}.
@@ -120,6 +130,10 @@ public final class HopHandler extends Http2ConnectionHandler {
 	@Override
 	protected void onStreamError(ChannelHandlerContext ctx, boolean outbound, Throwable cause,
 			Http2Exception.StreamException http2Ex) {
+		if (outbound && !ctx.channel().isActive()) {
+			// the channel closed: netty fails what it held of the stream as it closes it
+			return;
+		}
 		if (!outbound && inFlight(http2Ex)) {
 			// RFC 9113 5.1: ignored
 			return;
@@ -138,6 +152,19 @@ public final class HopHandler extends Http2ConnectionHandler {
 		this.limitReached = true;
 		onError(ctx, false, Http2Exception.connectionError(Http2Error.ENHANCE_YOUR_CALM,
 				"Maximum number %d of stream errors reached within %s", limit.maxErrors(), limit.window()));
+	}
+
+	/**
+	 * Answers nothing once the channel closed, when an outbound operation fails (see the
+	 * class comment); else netty's GOAWAY of the error, then the close.
+	 */
+	@Override
+	protected void onConnectionError(ChannelHandlerContext ctx, boolean outbound, Throwable cause,
+			@Nullable Http2Exception http2Ex) {
+		if (outbound && !ctx.channel().isActive()) {
+			return;
+		}
+		super.onConnectionError(ctx, outbound, cause, http2Ex);
 	}
 
 	/**
