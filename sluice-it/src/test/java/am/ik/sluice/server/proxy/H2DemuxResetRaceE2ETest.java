@@ -64,7 +64,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
 @H2EngineTest
-@LegacyOnly("write-seam races, replaced by tests of the lock boundary: step 8 (105)")
+@LegacyOnly("write-seam races, replaced by tests of the lock boundary: not yet on the netty engine")
 class H2DemuxResetRaceE2ETest {
 
 	/** The engine of this invocation, selected by {@link H2EngineTest}. */

@@ -89,7 +89,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
 @H2EngineTest
-@LegacyOnly("upstream flow control: step 5 (102)")
+@LegacyOnly("upstream flow control: not yet on the netty engine")
 class H2DemuxUpstreamFlowControlE2ETest {
 
 	/** The engine of this invocation, selected by {@link H2EngineTest}. */

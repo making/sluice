@@ -235,7 +235,7 @@ class H2DemuxConnectE2ETest {
 	}
 
 	@Test
-	@LegacyOnly("the idle and stall timeouts: step 6 (103)")
+	@LegacyOnly("the idle and stall timeouts: not yet on the netty engine")
 	void aConnectionOpeningWithAConnectIdlesOutAtTheIdleTimeout() throws Exception {
 		double idle = counter("sluice.data.connections.idle.closed");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
@@ -260,7 +260,7 @@ class H2DemuxConnectE2ETest {
 	 * stall timeout cuts the connection, the tunnel at rest not counting.
 	 */
 	@Test
-	@LegacyOnly("the idle and stall timeouts: step 6 (103)")
+	@LegacyOnly("the idle and stall timeouts: not yet on the netty engine")
 	void aRequestStalledOnAConnectionOpeningWithAConnectIsCutAtTheStallTimeout() throws Exception {
 		double stalls = counter("sluice.data.connections.stall.closed");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {

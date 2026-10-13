@@ -477,7 +477,7 @@ class H2ReroutingE2ETest {
 	}
 
 	@Test
-	@LegacyOnly("a per-hop connection window grant: flow control, step 5 (102)")
+	@LegacyOnly("a per-hop connection window grant: flow control; not yet on the netty engine")
 	void grantsConnectionWindowWhileRelayingRequestData() throws Exception {
 		startClient("win.a.test", alphaUpstream, false);
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {

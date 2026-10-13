@@ -57,7 +57,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
 @H2EngineTest
-@LegacyOnly("settings replay and recording stubs without SETTINGS first: per-hop rewrite, step 8 (105)")
+@LegacyOnly("settings replay and recording stubs without SETTINGS first: per-hop rewrite; not yet on the netty engine")
 class H2DemuxFramingE2ETest {
 
 	/** The engine of this invocation, selected by {@link H2EngineTest}. */

@@ -92,7 +92,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
 @H2EngineTest
-@LegacyOnly("client windows and window withholding: step 5 (102)")
+@LegacyOnly("client windows and window withholding: not yet on the netty engine")
 class H2DemuxClientWindowE2ETest {
 
 	/** The engine of this invocation, selected by {@link H2EngineTest}. */

@@ -69,7 +69,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
 @H2EngineTest
-@LegacyOnly("client frame validation with netty's error codes: per-hop rewrite, step 8 (105)")
+@LegacyOnly("client frame validation with netty's error codes: per-hop rewrite; not yet on the netty engine")
 class H2DemuxClientFrameValidationE2ETest {
 
 	/** The engine of this invocation, selected by {@link H2EngineTest}. */

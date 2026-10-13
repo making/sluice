@@ -148,7 +148,7 @@ class H2DemuxFrameLimitsE2ETest {
 	 * header list limit (a CONTINUATION flood): GOAWAY ENHANCE_YOUR_CALM.
 	 */
 	@Test
-	@LegacyOnly("netty ends the connection past 80KiB of header block (its GOAWAY threshold over the 64KiB list limit): per-hop rewrite, step 8 (105)")
+	@LegacyOnly("netty ends the connection past 80KiB of header block (its GOAWAY threshold over the 64KiB list limit): per-hop rewrite; not yet on the netty engine")
 	void clientHeaderBlockAboveTheListLimitEndsTheConnection() throws Exception {
 		String route = route("lim.block");
 		AtomicBoolean routed = new AtomicBoolean();
