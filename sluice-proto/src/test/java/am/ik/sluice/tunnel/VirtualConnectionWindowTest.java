@@ -150,12 +150,15 @@ class VirtualConnectionWindowTest {
 			// the reader pauses: the remote fills the window
 			await(() -> link.a.creditWaits() > 0 && link.b.receiveCredit() == 0, "the window is full");
 			assertThat(link.b.charged()).isPositive();
-			// slower than the announced window per round trip
-			read(link.b, 2L * MIB, 4 * KIB, Duration.ofMillis(1));
+			// about 2MB/s: a window takes the reader several round trips, so it never
+			// finds the buffer empty; each halving takes two decisions (the remote, not
+			// granted more, says it is blocked only once it was granted again), 1.4MiB
+			// read from 1MiB down
+			read(link.b, 5L * MIB / 2, 2 * KIB, Duration.ofMillis(1));
 			assertThat(link.b.receiveWindow()).isEqualTo(INITIAL);
 			assertThat(link.b.charged()).isZero();
 			assertThat(budget.used()).isZero();
-			read(link.b, 2L * MIB);
+			read(link.b, 3L * MIB / 2);
 			written.get(20, TimeUnit.SECONDS);
 		}
 	}
