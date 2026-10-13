@@ -8,8 +8,20 @@ Requested by the user.
 
 - A Grafana dashboard (JSON, provisionable; e.g. `dashboards/sluice.json`) over what
   `/actuator/prometheus` exposes on the server (8081) and the client (9001), as listed in
-  README "Health / metrics". Template variables for the datasource, the instance / pod
-  and, where the metric has it, the route.
+  README "Health / metrics".
+- Parameterize it as the user's Spring Boot dashboard does (reference, requested by the
+  user): https://raw.githubusercontent.com/making/k8s-gitops/refs/heads/main/lemon/platform/grafana/dashboard/spring-boot.json
+  - Variables, chained: `datasource` (type datasource, prometheus); `app`
+    (`label_values(jvm_memory_used_bytes,app)`); `cluster`
+    (`label_values(jvm_memory_used_bytes{app="$app"},cluster)`); `instance`, `namespace`,
+    `pod` (multi, include all, each narrowed by the ones before it). Add `route` (multi,
+    include all) from the sluice meters that carry it.
+  - Every query selects `{app=~"$app", cluster=~"$cluster", instance=~"$instance",
+    namespace=~"$namespace", pod=~"$pod"}` and uses `"uid": "$datasource"`, so the same
+    JSON serves the server and the client (picked by `app`).
+  - Find where `app` / `cluster` come from in that setup (scrape relabeling or
+    `management.metrics.tags.*`) and state in README what labels the dashboard expects;
+    the local verification stack must attach them the same way.
 - Rows, at least:
   - Tunnel: connected sessions, `sluice_tunnel_bytes_total` rate per route and direction,
     window updates, stall seconds / stall failures, advertise timeouts, reconnects
