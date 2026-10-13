@@ -1068,12 +1068,21 @@ class H2DemuxClientWindowE2ETest {
 				Duration.ofSeconds(10)))
 			.as("received %d, the upstream sent %d", client.dataReceived(), upstream.sent())
 			.isTrue();
+		// the upstream sends on the relay's last grant on a thread of its own: wait until
+		// it stopped for half a second
 		long sent = upstream.sent();
-		Thread.sleep(200);
+		long since = System.nanoTime();
+		long deadline = since + TimeUnit.SECONDS.toNanos(10);
+		while (System.nanoTime() - since < TimeUnit.MILLISECONDS.toNanos(500)) {
+			assertThat(System.nanoTime()).as("the upstream stops").isLessThan(deadline);
+			Thread.sleep(20);
+			if (upstream.sent() != sent) {
+				sent = upstream.sent();
+				since = System.nanoTime();
+			}
+		}
 		assertThat(client.dataReceived()).as("the client got no more than its window").isEqualTo(WINDOW);
-		assertThat(upstream.sent()).as("the upstream got no more window")
-			.isEqualTo(sent)
-			.isLessThanOrEqualTo(2L * WINDOW);
+		assertThat(sent).as("the upstream got no more than the relay's window on top").isLessThanOrEqualTo(2L * WINDOW);
 	}
 
 	/**

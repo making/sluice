@@ -67,9 +67,6 @@ class H2DemuxFlowControlE2ETest {
 	/** The stream limit the relay advertises. */
 	private static final int MAX_CONCURRENT_STREAMS = 100;
 
-	/** The client window plus the queue allowance, per stream (legacy engine). */
-	private static final long STREAM_BUDGET = 65535 + 64 * 1024;
-
 	/** The stream window the netty engine announces on both of its faces. */
 	private static final int NETTY_STREAM_WINDOW = 65535;
 
@@ -198,10 +195,11 @@ class H2DemuxFlowControlE2ETest {
 	/**
 	 * A bulk upload the upstream granted a huge window, on a leg whose upstream reads
 	 * slower than the client sends, does not tear the connection down, and another stream
-	 * of the same leg completes: the relay queues at most the stream's budget for the
-	 * bulk stream.
+	 * of the same leg completes: the relay holds at most a stream window for the bulk
+	 * stream, plus what the leg's writer queue holds.
 	 */
 	@Test
+	@NettyOnly("per-hop windows: what the relay holds for the bulk stream")
 	void bulkUploadOnASlowLegLetsAnotherStreamOfTheLegComplete() throws Exception {
 		String route = route("fc.slow");
 		startClient(route, stub(H2DemuxFlowControlE2ETest::serveSlowlyGrantingStreamOne));
@@ -219,9 +217,13 @@ class H2DemuxFlowControlE2ETest {
 					// torn down
 				}
 			});
-			Awaitility.await()
-				.atMost(Duration.ofSeconds(30))
-				.until(() -> maxQueued.accumulateAndGet(queuedBytes(route), Math::max) > 0 || client.closed());
+			// past the tunnel connection's credit and both hops' windows: the slow
+			// upstream's reads pace the stream
+			long paced = 2L * VirtualConnection.DEFAULT_WINDOW + 2L * NETTY_STREAM_WINDOW;
+			Awaitility.await().atMost(Duration.ofSeconds(30)).until(() -> {
+				maxQueued.accumulateAndGet(queuedBytes(route), Math::max);
+				return client.streamSent(1) > paced || client.closed();
+			});
 			client.headers(3, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/fast"));
 			boolean answered = client.awaitTrue(() -> {
 				maxQueued.accumulateAndGet(queuedBytes(route), Math::max);
@@ -231,19 +233,11 @@ class H2DemuxFlowControlE2ETest {
 			assertThat(client.closed()).as("the connection stays up (sent %d)", client.streamSent(1)).isFalse();
 			assertThat(answered && client.ended(3)).as("the other stream of the leg completes").isTrue();
 			assertThat(client.maxOvershoot()).isLessThanOrEqualTo(0);
-			// past the initial window, the relay's budget and the tunnel connection's
-			// credit
-			// window: the slow upstream's reads pace the stream
-			assertThat(client.streamSent(1)).as("the bulk stream got past the initial window")
-				.isGreaterThan(STREAM_BUDGET + 2L * VirtualConnection.DEFAULT_WINDOW);
-			// the bulk stream's payload within its budget, accounted as the buffers that
-			// hold it -- the pending buffer rounds up to a 1KiB granule, and the buffer a
-			// batch in flight was taken from stays accounted until written, less than
-			// another granule -- plus its data entry's frame header, and under 1KiB for
-			// the other stream's head
+			// the bulk stream's window, a granule of backlog rounding, the leg's writer
+			// queue, and under 1KiB for the other stream's head
 			assertThat(maxQueued.get()).as("queued for the bulk stream, plus the other stream's head")
 				.isGreaterThan(0)
-				.isLessThanOrEqualTo(STREAM_BUDGET + 2 * 1024 + 9 + 1024);
+				.isLessThanOrEqualTo(NETTY_STREAM_WINDOW + GRANULE + NETTY_HOP_QUEUE_BYTES + 1024);
 			client.close();
 			pusher.join(TimeUnit.SECONDS.toMillis(5));
 		}
