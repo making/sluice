@@ -734,18 +734,32 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	}
 
 	/**
-	 * After an early response, the client ends its request and half-closes while its data
-	 * still waits in the leg queue: all of it, END_STREAM included, reaches the upstream
-	 * before the half-close.
+	 * After an early response, the client ends its request and half-closes while the
+	 * relay holds the rest of it for an upstream that granted nothing beyond its initial
+	 * windows: the upstream connection stays open, and once the upstream grants, all of
+	 * the request, END_STREAM included, reaches it before the half-close.
 	 */
 	@Test
 	void queuedRequestDataIsWrittenBeforeTheHalfClose() throws Exception {
 		String route = "uf.drain.test";
-		int length = 256 * KIB;
+		// past the upstream's initial windows, within them and what the relay grants the
+		// client back of a stream window (in halves: 32KiB of the 64KiB written)
+		int length = 90 * KIB;
 		AtomicLong receivedAtEof = new AtomicLong(-1);
 		AtomicBoolean endStream = new AtomicBoolean();
+		CountDownLatch release = new CountDownLatch(1);
 		startClient(route, upstream(new AtomicReference<>(), upstream -> {
 			upstream.settings(null);
+			Thread.ofVirtual().start(() -> {
+				try {
+					release.await();
+					upstream.grant(0, 1 << 20);
+					upstream.grant(1, 1 << 20);
+				}
+				catch (IOException | InterruptedException e) {
+					// the relay went away
+				}
+			});
 			TestH2.@Nullable Frame frame;
 			while ((frame = upstream.next()) != null) {
 				if (frame.type() == TestH2.HEADERS) {
@@ -753,11 +767,6 @@ class H2DemuxUpstreamFlowControlE2ETest {
 				}
 				if (frame.type() == TestH2.DATA) {
 					endStream.compareAndSet(false, (frame.flags() & TestH2.FLAG_END_STREAM) != 0);
-					if (frame.payload().length > 0) {
-						Thread.sleep(10); // a slow reader keeps the leg queue engaged
-						upstream.grant(0, frame.payload().length);
-						upstream.grant(frame.streamId(), frame.payload().length);
-					}
 				}
 			}
 			receivedAtEof.set(upstream.received(1));
@@ -766,10 +775,13 @@ class H2DemuxUpstreamFlowControlE2ETest {
 			client.headers(1, false, post(route));
 			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
 			assertThat(client.data(1, length, true, Duration.ofSeconds(10))).isTrue();
-			long queued = queuedBytes(route);
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> queuedBytes(route) > 0);
 			client.halfClose();
+			Thread.sleep(500);
+			assertThat(receivedAtEof.get()).as("the upstream connection open while the relay holds its bytes")
+				.isEqualTo(-1);
+			release.countDown();
 			Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> receivedAtEof.get() >= 0);
-			assertThat(queued).as("data queued when the client half-closed").isGreaterThan(0);
 			assertThat(receivedAtEof.get()).as("request bytes before the half-close").isEqualTo(length);
 			assertThat(endStream.get()).as("END_STREAM before the half-close").isTrue();
 		}
