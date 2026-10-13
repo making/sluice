@@ -27,7 +27,6 @@ import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.junit.jupiter.api.TestInstance;
@@ -269,7 +268,6 @@ class QueuedFramesHoldSlotsE2ETest {
 	 * leg while the legs' frames are queued.
 	 */
 	@Test
-	@Disabled("leg slots: not yet on the h2 demux (every leg opens on the connection's slot)")
 	void anEndedH2RelayHoldsItsLegSlotsWhileTheirFramesAreQueued() throws Exception {
 		StallingClient client = client();
 		int fillers = stallWithFillers();
@@ -305,7 +303,6 @@ class QueuedFramesHoldSlotsE2ETest {
 	 * opened next for another route takes a slot of its own.
 	 */
 	@Test
-	@Disabled("leg slots: not yet on the h2 demux (every leg opens on the connection's slot)")
 	void aRetiredLegKeepsTheConnectionsSlotWhileItsFramesAreQueued() throws Exception {
 		StallingClient client = client();
 		int fillers = stallWithFillers();

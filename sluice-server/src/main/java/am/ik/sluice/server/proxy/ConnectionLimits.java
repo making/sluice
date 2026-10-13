@@ -36,10 +36,10 @@ import io.micrometer.core.instrument.MeterRegistry;
  * a relayed HTTP connection, and the idle deadline of a connection relayed verbatim
  * ({@link KeepAliveDeadline}); plus the queue budget the h2 demux relays share.
  * <p>
- * The connection cap counts client connections: an h2 connection takes one slot whatever
- * routes its streams reach (a further leg takes none of its own yet;
- * {@link #tryAcquireLeg()} hands out such a slot). An unset cap is derived so that the
- * worst case of every slot -- the buffering of one virtual connection
+ * The connection cap counts virtual connections: an h2 connection whose streams reach
+ * several routes takes one more slot per further leg open at once
+ * ({@link #tryAcquireLeg()}). An unset cap is derived so that the worst case of every
+ * slot -- the buffering of one virtual connection
  * ({@link ConnectionLimit#CONNECTION_BYTES}) plus what an h2 demux relay holds outside
  * the budget ({@link NettyHttp2DemuxRelay#UNBUDGETED_BYTES}) and what one of its legs
  * adds ({@link NettyHttp2DemuxRelay#RESPONSE_QUEUE_BYTES}) -- and the budget fit in half

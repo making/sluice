@@ -378,14 +378,14 @@ class H2DemuxClientFrameValidationE2ETest {
 	 * A PRIORITY of a length other than 5 on an open stream is a stream error (RFC 9113
 	 * 6.3): RST_STREAM {@code FRAME_SIZE_ERROR} on that stream only, {@code CANCEL} to
 	 * the upstream, counted once with reason {@code protocol}; the other stream
-	 * completes. Once the relay forgot the reset stream, another such PRIORITY on it ends
-	 * the connection with GOAWAY {@code FRAME_SIZE_ERROR}.
+	 * completes. netty forgets the stream once its reset is written: its codec answers
+	 * another such PRIORITY on it with a reset of its own, not counted (the stream is no
+	 * longer known), and the connection goes on.
 	 */
 	@Test
-	@Disabled("counts the protocol reset meter (sluice.h2demux.streams.reset, reason protocol), "
-			+ "not yet on the h2 demux")
 	void priorityOfAWrongLengthResetsOnlyItsStream() throws Exception {
 		double protocolResets = resets("protocol");
+		double upstreamResets = resets("upstream");
 		try (Session session = open(ROUTE, "/")) {
 			H2TestClient client = session.client();
 			client.headers(3, false, post(ROUTE));
@@ -405,22 +405,48 @@ class H2DemuxClientFrameValidationE2ETest {
 			assertThat(client.closed()).isFalse();
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 			client.frame(PRIORITY, 0, 1, new byte[4]);
-			assertThat(client.awaitTrue(client::closed, Duration.ofSeconds(5))).isTrue();
-			assertThat(client.goAwayCode()).isEqualTo(FRAME_SIZE_ERROR);
+			assertThat(client.awaitTrue(() -> resetFrames(client, 1) == 2, Duration.ofSeconds(5)))
+				.as("the codec's second reset")
+				.isTrue();
+			assertThat(client.reset(1)).isEqualTo(FRAME_SIZE_ERROR);
+			awaitPingAck(client);
+			assertThat(client.closed()).isFalse();
+			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(resets("protocol") - protocolResets).isEqualTo(1);
+			assertThat(resets("upstream") - upstreamResets).as("the relay's CANCEL is its own").isZero();
+		}
+	}
+
+	/**
+	 * A stream the client resets is reset towards the upstream with the client's code;
+	 * neither reset counts as one the relay made on a stream error.
+	 */
+	@Test
+	void aResetOfTheClientIsRelayedUncounted() throws Exception {
+		double protocolResets = resets("protocol");
+		double upstreamResets = resets("upstream");
+		try (Session session = open(ROUTE, "/")) {
+			H2TestClient client = session.client();
+			client.frame(TestH2.RST_STREAM, 0, 1, TestH2.int32(CANCEL));
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.untilAsserted(() -> assertThat(session.upstream().resets()).containsExactly(List.of(1, CANCEL)));
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> trackedStreams(ROUTE) == 0);
+			awaitPingAck(client);
+			assertThat(client.resets()).isEmpty();
+			assertThat(resets("protocol") - protocolResets).isZero();
+			assertThat(resets("upstream") - upstreamResets).isZero();
 		}
 	}
 
 	/**
 	 * Two WINDOW_UPDATEs of one stream in one write, together taking its window past
-	 * 2^31-1 -- coalesced or not by the relay -- reset that stream with
-	 * {@code FLOW_CONTROL_ERROR} (RFC 9113 6.9.1), {@code CANCEL} to the upstream, whose
-	 * window never passes 2^31-1; counted once. Another stream granted exactly up to
-	 * 2^31-1 goes on and completes.
+	 * 2^31-1, reset that stream with {@code FLOW_CONTROL_ERROR} (RFC 9113 6.9.1),
+	 * {@code CANCEL} to the upstream; counted once. Another stream granted exactly up to
+	 * 2^31-1 goes on and completes. The windows are per hop: no grant of the client
+	 * reaches the upstream.
 	 */
 	@Test
-	@Disabled("counts the protocol reset meter (sluice.h2demux.streams.reset, reason protocol), "
-			+ "not yet on the h2 demux")
 	void streamWindowPastTheMaximumResetsOnlyItsStream() throws Exception {
 		double protocolResets = resets("protocol");
 		try (Session session = open(ROUTE, "/")) {
@@ -434,15 +460,14 @@ class H2DemuxClientFrameValidationE2ETest {
 			Awaitility.await()
 				.atMost(Duration.ofSeconds(5))
 				.untilAsserted(() -> assertThat(session.upstream().resets()).containsExactly(List.of(1, CANCEL)));
-			assertThat(WINDOW + session.upstream().windowGranted(1)).as("the upstream's window of stream 1")
-				.isLessThanOrEqualTo(MAX_WINDOW);
+			assertThat(session.upstream().windowGranted(1)).as("nothing relayed").isZero();
 			assertThat(resets("protocol") - protocolResets).isEqualTo(1);
 			client.frame(TestH2.WINDOW_UPDATE, 0, 3, TestH2.int32(MAX_WINDOW - WINDOW));
 			client.sendData(3, "x".getBytes(StandardCharsets.US_ASCII), TestH2.FLAG_END_STREAM);
 			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).isTrue();
 			assertThat(TestH2.bodyOf(client.frames(3))).isEqualTo("ok");
 			assertThat(client.reset(3)).isNull();
-			assertThat(session.upstream().windowGranted(3)).as("relayed").isEqualTo(MAX_WINDOW - WINDOW);
+			assertThat(session.upstream().windowGranted(3)).as("nothing relayed").isZero();
 			assertThat(client.closed()).isFalse();
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(resets("protocol") - protocolResets).isEqualTo(1);
@@ -450,15 +475,14 @@ class H2DemuxClientFrameValidationE2ETest {
 	}
 
 	/**
-	 * A stream the client ended, whose head-only response ended too, stays tracked while
-	 * its request DATA waits for the upstream's stream window of 0: closed both ways, it
-	 * is not reset by a WINDOW_UPDATE past 2^31-1, which is not relayed either, nor by a
-	 * PRIORITY of a wrong length, which ends the connection with GOAWAY
-	 * {@code FRAME_SIZE_ERROR} instead.
+	 * A stream the client ended, whose head-only response ended too, is closed both ways
+	 * while the relay holds its request DATA for the upstream's stream window of 0: a
+	 * WINDOW_UPDATE past 2^31-1 on it is ignored -- no reset, nothing relayed -- and a
+	 * PRIORITY of a wrong length on it is answered by netty's codec with RST_STREAM
+	 * {@code FRAME_SIZE_ERROR}, the stream no longer known; neither counts, nothing
+	 * reaches the upstream, and the connection goes on.
 	 */
 	@Test
-	@Disabled("counts the protocol reset meter (sluice.h2demux.streams.reset, reason protocol), "
-			+ "not yet on the h2 demux")
 	void streamClosedBothWaysIsNotReset() throws Exception {
 		double protocolResets = resets("protocol");
 		try (Session session = open(HELD_ROUTE, "/")) {
@@ -467,20 +491,22 @@ class H2DemuxClientFrameValidationE2ETest {
 			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
 			client.sendData(1, "abc".getBytes(StandardCharsets.US_ASCII), TestH2.FLAG_END_STREAM);
 			awaitPingAck(client);
-			assertThat(trackedStreams(HELD_ROUTE)).as("tracked while its DATA waits for the upstream's window")
-				.isEqualTo(1);
+			assertThat(trackedStreams(HELD_ROUTE)).as("closed both ways for the client").isZero();
+			assertThat(queuedBytes(HELD_ROUTE)).as("its DATA held for the upstream's window").isPositive();
 			client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(MAX_WINDOW));
 			awaitPingAck(client);
 			assertThat(client.resets()).isEmpty();
 			client.frame(PRIORITY, 0, 1, new byte[4]);
-			assertThat(client.awaitTrue(client::closed, Duration.ofSeconds(5))).isTrue();
-			assertThat(client.goAwayCode()).isEqualTo(FRAME_SIZE_ERROR);
-			assertThat(client.resets()).isEmpty();
+			assertThat(client.awaitTrue(() -> client.reset(1) != null, Duration.ofSeconds(5))).isTrue();
+			assertThat(client.reset(1)).isEqualTo(FRAME_SIZE_ERROR);
+			awaitPingAck(client);
+			assertThat(client.closed()).isFalse();
+			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(session.upstream().resets()).isEmpty();
 			assertThat(session.upstream().windowGranted(1)).as("nothing relayed").isZero();
 			assertThat(resets("protocol") - protocolResets).isZero();
-			awaitReleased(HELD_ROUTE);
 		}
+		awaitReleased(HELD_ROUTE);
 	}
 
 	/**
@@ -654,6 +680,22 @@ class H2DemuxClientFrameValidationE2ETest {
 
 	private static byte[] post(String route) {
 		return TestH2.headerBlock(":authority=" + route, ":method=POST", ":path=/");
+	}
+
+	/** The RST_STREAM frames the client got on the stream. */
+	private static long resetFrames(H2TestClient client, int streamId) {
+		return client.frames(streamId).stream().filter(frame -> frame.type() == TestH2.RST_STREAM).count();
+	}
+
+	/** The bytes the relays hold of the route's streams. */
+	private long queuedBytes(String route) {
+		return Math.round(Objects.requireNonNull(this.dataProxyServer)
+			.h2DemuxMeters()
+			.registry()
+			.get(H2DemuxMeters.QUEUED_GAUGE_NAME)
+			.tag("route", route)
+			.gauge()
+			.value());
 	}
 
 	private double resets(String reason) {

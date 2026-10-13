@@ -1,7 +1,10 @@
 package am.ik.sluice.server.proxy;
 
 import java.io.ByteArrayOutputStream;
+import java.io.FilterInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -16,11 +19,19 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
@@ -47,6 +58,10 @@ import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.it.WindowedH2Upstream;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.route.Router;
+import am.ik.sluice.server.tunnel.SessionRegistry;
+import am.ik.sluice.server.tunnel.TunnelSession;
+
+import org.slf4j.LoggerFactory;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -79,6 +94,17 @@ class H2DemuxRoutingE2ETest {
 	/** The connections the GOAWAY upstream accepted. */
 	private static final AtomicInteger GOAWAY_CONNECTIONS = new AtomicInteger();
 
+	/** Its upstream counts the bytes it reads and writes. */
+	private static final String BYTES_HOST = "bytes.h2routing.test";
+
+	/** The other route of the byte counting test, counted the same way. */
+	private static final String BYTES_OTHER_HOST = "bytes-other.h2routing.test";
+
+	/** What each byte counting upstream read and wrote, by host. */
+	private static final Map<String, CountedUpstream> COUNTED = new ConcurrentHashMap<>();
+
+	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ListAppender<>();
+
 	/** The connections each named upstream accepted. */
 	private static final Map<String, AtomicInteger> CONNECTIONS = new ConcurrentHashMap<>();
 
@@ -101,6 +127,14 @@ class H2DemuxRoutingE2ETest {
 	@Autowired
 	private Router router;
 
+	@Nullable
+	@Autowired
+	private MeterRegistry meterRegistry;
+
+	@Nullable
+	@Autowired
+	private SessionRegistry sessions;
+
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
 		grpcPort = TestPorts.freePort();
@@ -109,11 +143,16 @@ class H2DemuxRoutingE2ETest {
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.http-load-balance", () -> "round-robin");
 		registry.add("sluice.token", () -> "it-token");
+		registry.add("sluice.access-log.rate-limit.enabled", () -> "false");
 		registry.add("server.port", () -> String.valueOf(TestPorts.freePort()));
 	}
 
 	@BeforeAll
 	void startClients() {
+		ACCESS_EVENTS.start();
+		((Logger) LoggerFactory.getLogger("sluice.access")).addAppender(ACCESS_EVENTS);
+		startClient(BYTES_HOST, countingUpstream(BYTES_HOST));
+		startClient(BYTES_OTHER_HOST, countingUpstream(BYTES_OTHER_HOST));
 		startClient(SHARED_HOST, upstream("a"));
 		startClient(SHARED_HOST, upstream("b"));
 		startClient(FIRST_HOST, upstream("first"));
@@ -122,12 +161,14 @@ class H2DemuxRoutingE2ETest {
 		Awaitility.await()
 			.atMost(TIMEOUT)
 			.until(() -> router().lookup(FIRST_HOST).isPresent() && router().lookup(SECOND_HOST).isPresent()
-					&& router().lookup(GOAWAY_HOST).isPresent()
+					&& router().lookup(GOAWAY_HOST).isPresent() && router().lookup(BYTES_HOST).isPresent()
+					&& router().lookup(BYTES_OTHER_HOST).isPresent()
 					&& router().resolve(SHARED_HOST).map(group -> group.candidates().size()).orElse(0) == 2);
 	}
 
 	@AfterAll
 	void tearDown() {
+		((Logger) LoggerFactory.getLogger("sluice.access")).detachAppender(ACCESS_EVENTS);
 		this.clients.forEach(TunnelClient::stop);
 		this.closeables.forEach(H2DemuxRoutingE2ETest::close);
 		UPSTREAM_EXECUTOR.shutdown();
@@ -226,6 +267,56 @@ class H2DemuxRoutingE2ETest {
 		assertThat(GOAWAY_CONNECTIONS.get() - connections).as("upstream connections").isEqualTo(2);
 	}
 
+	/**
+	 * The bytes each leg writes and reads -- exactly what its upstream read and wrote --
+	 * count as its route's {@code sluice.tunnel.bytes} ({@code inbound} towards the
+	 * upstream, {@code outbound} back) and as its session's traffic, and the bytes of
+	 * both legs as the connection's access log {@code bytesIn} / {@code bytesOut}.
+	 */
+	@Test
+	void eachLegsBytesCountForItsRouteItsSessionAndItsConnection() throws Exception {
+		double inbound = tunnelBytes(BYTES_HOST, "inbound");
+		double outbound = tunnelBytes(BYTES_HOST, "outbound");
+		double otherInbound = tunnelBytes(BYTES_OTHER_HOST, "inbound");
+		double otherOutbound = tunnelBytes(BYTES_OTHER_HOST, "outbound");
+		TunnelSession session = sessionOf(BYTES_HOST);
+		TunnelSession otherSession = sessionOf(BYTES_OTHER_HOST);
+		long sessionInbound = session.bytesInbound();
+		long sessionOutbound = session.bytesOutbound();
+		long otherSessionInbound = otherSession.bytesInbound();
+		long otherSessionOutbound = otherSession.bytesOutbound();
+		ACCESS_EVENTS.list.clear();
+		try (H2TestClient h2 = H2TestClient.connect(dataPort, 1, 3)) {
+			h2.headers(1, true, get(BYTES_HOST, "/bytes-1"));
+			h2.headers(3, true, get(BYTES_OTHER_HOST, "/bytes-3"));
+			assertThat(h2.awaitEnd(1, TIMEOUT)).isTrue();
+			assertThat(h2.awaitEnd(3, TIMEOUT)).isTrue();
+			assertThat(TestH2.bodyOf(h2.frames(1))).isEqualTo(BYTES_HOST);
+			assertThat(TestH2.bodyOf(h2.frames(3))).isEqualTo(BYTES_OTHER_HOST);
+		}
+		CountedUpstream counted = Objects.requireNonNull(COUNTED.get(BYTES_HOST));
+		CountedUpstream otherCounted = Objects.requireNonNull(COUNTED.get(BYTES_OTHER_HOST));
+		assertThat(counted.eof().await(TIMEOUT.toSeconds(), TimeUnit.SECONDS)).as("the leg ended").isTrue();
+		assertThat(otherCounted.eof().await(TIMEOUT.toSeconds(), TimeUnit.SECONDS)).as("the other leg ended").isTrue();
+		String close = awaitAccessClose(BYTES_HOST);
+		long read = counted.read().get();
+		long written = counted.written().get();
+		long otherRead = otherCounted.read().get();
+		long otherWritten = otherCounted.written().get();
+		assertThat(read).as("precondition: the upstream read the preface and the head").isPositive();
+		assertThat(written).as("precondition: the upstream answered").isPositive();
+		assertThat(tunnelBytes(BYTES_HOST, "inbound") - inbound).isEqualTo(read);
+		assertThat(tunnelBytes(BYTES_HOST, "outbound") - outbound).isEqualTo(written);
+		assertThat(tunnelBytes(BYTES_OTHER_HOST, "inbound") - otherInbound).isEqualTo(otherRead);
+		assertThat(tunnelBytes(BYTES_OTHER_HOST, "outbound") - otherOutbound).isEqualTo(otherWritten);
+		assertThat(session.bytesInbound() - sessionInbound).isEqualTo(read);
+		assertThat(session.bytesOutbound() - sessionOutbound).isEqualTo(written);
+		assertThat(otherSession.bytesInbound() - otherSessionInbound).isEqualTo(otherRead);
+		assertThat(otherSession.bytesOutbound() - otherSessionOutbound).isEqualTo(otherWritten);
+		assertThat(Long.parseLong(field(close, "bytesIn"))).isEqualTo(read + otherRead);
+		assertThat(Long.parseLong(field(close, "bytesOut"))).isEqualTo(written + otherWritten);
+	}
+
 	/** Response trailers reach the client and end its stream. */
 	@Test
 	void responseTrailersEndTheClientsStream() throws Exception {
@@ -265,6 +356,46 @@ class H2DemuxRoutingE2ETest {
 			}
 		});
 		return paths;
+	}
+
+	private double tunnelBytes(String route, String direction) {
+		Counter counter = Objects.requireNonNull(this.meterRegistry)
+			.find("sluice.tunnel.bytes")
+			.tags("direction", direction, "route", route)
+			.counter();
+		return counter == null ? 0 : counter.count();
+	}
+
+	private TunnelSession sessionOf(String route) {
+		String clientId = router().lookup(route).orElseThrow().clientId();
+		return Objects.requireNonNull(this.sessions).find(clientId).orElseThrow();
+	}
+
+	/**
+	 * The access log's close line of the connection whose first stream took the route.
+	 */
+	private static String awaitAccessClose(String route) {
+		Awaitility.await().atMost(TIMEOUT).until(() -> accessClose(route) != null);
+		return Objects.requireNonNull(accessClose(route));
+	}
+
+	private static @Nullable String accessClose(String route) {
+		return List.copyOf(ACCESS_EVENTS.list)
+			.stream()
+			.map(ILoggingEvent::getFormattedMessage)
+			.filter(line -> line.contains("event=close") && line.contains(" route=" + route + " "))
+			.findFirst()
+			.orElse(null);
+	}
+
+	/** The value of a logfmt field of the line. */
+	private static String field(String line, String name) {
+		for (String part : line.split(" ")) {
+			if (part.startsWith(name + "=")) {
+				return part.substring(name.length() + 1);
+			}
+		}
+		throw new AssertionError("no field " + name + " in " + line);
 	}
 
 	private void startClient(String host, ServerSocket upstream) {
@@ -313,6 +444,65 @@ class H2DemuxRoutingE2ETest {
 				// connection ended
 			}
 		});
+	}
+
+	/**
+	 * An h2 upstream answering each ended request with its host as the body -- its
+	 * SETTINGS and the whole response in one write, nothing else, so the leg has read
+	 * everything it wrote once the response ended -- and counting the bytes it read until
+	 * the relay's EOF and the bytes it wrote ({@link #COUNTED}).
+	 */
+	private ServerSocket countingUpstream(String host) {
+		CountedUpstream counted = new CountedUpstream(new AtomicLong(), new AtomicLong(), new CountDownLatch(1));
+		COUNTED.put(host, counted);
+		return stub(socket -> {
+			try (socket) {
+				InputStream in = new FilterInputStream(socket.getInputStream()) {
+
+					@Override
+					public int read() throws IOException {
+						int b = super.read();
+						if (b >= 0) {
+							counted.read().incrementAndGet();
+						}
+						return b;
+					}
+
+					@Override
+					public int read(byte[] buffer, int offset, int length) throws IOException {
+						int n = super.read(buffer, offset, length);
+						if (n > 0) {
+							counted.read().addAndGet(n);
+						}
+						return n;
+					}
+
+				};
+				OutputStream out = socket.getOutputStream();
+				if (in.readNBytes(TestH2.PREFACE.length).length < TestH2.PREFACE.length) {
+					return;
+				}
+				TestH2.@Nullable Frame frame;
+				while ((frame = TestH2.readFrame(in)) != null) {
+					if (frame.type() == TestH2.HEADERS && (frame.flags() & TestH2.FLAG_END_STREAM) != 0) {
+						byte[] response = TestH2.cannedResponse(frame.streamId(), host);
+						out.write(response);
+						out.flush();
+						counted.written().addAndGet(response.length);
+					}
+				}
+			}
+			catch (IOException e) {
+				// connection ended
+			}
+			finally {
+				counted.eof().countDown();
+			}
+		});
+	}
+
+	/** What a byte counting upstream read and wrote, and its relay's EOF. */
+	private record CountedUpstream(AtomicLong read, AtomicLong written, CountDownLatch eof) {
 	}
 
 	private ServerSocket upstream(String name) {

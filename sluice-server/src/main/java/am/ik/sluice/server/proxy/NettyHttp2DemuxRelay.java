@@ -7,13 +7,16 @@ import java.io.SequenceInputStream;
 import java.net.InetAddress;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -29,8 +32,11 @@ import am.ik.sluice.server.proxy.hop.Loop;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import am.ik.sluice.server.tunnel.TunnelSession;
+import am.ik.sluice.tunnel.ConnectionLimit;
 import am.ik.sluice.tunnel.DuplexPipe;
+import am.ik.sluice.tunnel.StreamRelay;
 import am.ik.sluice.tunnel.VirtualConnection;
+import io.micrometer.core.instrument.Counter;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
@@ -117,12 +123,24 @@ import io.netty.util.AsciiString;
  * reaching the upstream. One the upstream's GOAWAY or the leg's end drops is refused
  * ({@code REFUSED_STREAM}), and so is one still waiting at the wait deadline.
  * <p>
+ * The first leg opens on the connection's own slot of the connection limit, each further
+ * leg open at once on a slot of its own ({@link LegSlots}): a stream whose route needs a
+ * new leg while the limit has no slot left is refused ({@code REFUSED_STREAM}). A leg
+ * retires once its channel closed and its threads ended: the relay lets go of it, its
+ * virtual connection leaves the session, and its slot comes back once the frames it
+ * queued left the tunnel sender. The bytes each leg reads and writes count as the route's
+ * tunnel bytes ({@code sluice.tunnel.bytes}), the session's traffic and the connection's
+ * access log bytes. A stream netty's codec resets on a stream error of the client or of
+ * an upstream, and a leg sending its upstream a GOAWAY with an error code, are counted
+ * ({@link H2DemuxMeters}).
+ * <p>
  * netty's codec answers the client's protocol errors itself; a header block that does not
  * decode ends the connection with a GOAWAY {@code COMPRESSION_ERROR}, logged as a request
  * line naming neither route, method nor path. The client endpoint's end -- EOF, error,
- * the codec closing it -- closes every leg. Once every hop's threads ended and the frames
- * the legs queued left the tunnel sender, the relay finishes: the connection is logged
- * closed, {@code onFinish} runs, then {@code release}.
+ * the codec closing it -- closes every leg. Once every hop's threads ended, the relay
+ * finishes: the connection is logged closed and {@code onFinish} runs; {@code release}
+ * follows once the frames the leg on the connection's own slot queued left the tunnel
+ * sender too.
  */
 final class NettyHttp2DemuxRelay {
 
@@ -197,6 +215,8 @@ final class NettyHttp2DemuxRelay {
 
 	private static final String HTTP_2 = "2";
 
+	private static final String TUNNEL_BYTES = "sluice.tunnel.bytes";
+
 	private final DuplexPipe pipe;
 
 	private final byte[] seed;
@@ -232,6 +252,20 @@ final class NettyHttp2DemuxRelay {
 	private final Runnable release;
 
 	private final H2DemuxBudget budget;
+
+	private final LegSlots legSlots;
+
+	/**
+	 * A leg holds the connection's own slot: open, or closed with frames still queued for
+	 * the tunnel.
+	 */
+	private final AtomicBoolean ownSlotTaken = new AtomicBoolean();
+
+	/**
+	 * What holds the connection's own slot: the relay until it finished, and the leg
+	 * holding it ({@link #ownSlotTaken}); zero = {@link #release} ran.
+	 */
+	private final AtomicInteger ownSlotHolders = new AtomicInteger(1);
 
 	private final Loop loop;
 
@@ -270,7 +304,14 @@ final class NettyHttp2DemuxRelay {
 	/** The highest stream id the client opened; with the loop's lock. */
 	private int highestStreamId;
 
-	/** The client hop, plus each leg until its queued frames left; zero = finished. */
+	/**
+	 * The streams of every hop the relay reset itself or whose peer reset them, until
+	 * they close: a stream closing with a reset sent and not in here was reset by netty's
+	 * codec, on a stream error. With the loop's lock.
+	 */
+	private final Set<Http2Stream> resetsNotByCodec = Collections.newSetFromMap(new IdentityHashMap<>());
+
+	/** The client hop, plus each leg until its threads ended; zero = finished. */
 	private final AtomicInteger pending = new AtomicInteger(1);
 
 	private final AtomicBoolean finished = new AtomicBoolean();
@@ -297,6 +338,7 @@ final class NettyHttp2DemuxRelay {
 		this.onFinish = Objects.requireNonNull(builder.onFinish, "onFinish is required");
 		this.release = Objects.requireNonNull(builder.release, "release is required");
 		this.budget = Objects.requireNonNull(builder.budget, "budget is required");
+		this.legSlots = Objects.requireNonNull(builder.legSlots, "legSlots is required");
 		this.loop = new Loop("sluice-h2n",
 				(source, cause) -> log.warn("h2 demux {}: {}", source, cause.toString(), cause));
 		this.loop.afterSettle(this::reviewLocked);
@@ -531,9 +573,14 @@ final class NettyHttp2DemuxRelay {
 	 * on a reset, completing its frames' promises and releasing its DATA, and writes
 	 * nothing. With the loop's lock.
 	 */
-	private static void dropWaitingLocked(Exchange exchange, long errorCode) {
+	private void dropWaitingLocked(Exchange exchange, long errorCode) {
 		stopWaitingLocked(exchange);
 		Hop leg = exchange.leg.hop();
+		Http2Stream stream = leg.connection().stream(exchange.id);
+		if (stream != null) {
+			// opened meanwhile: the buffering encoder resets it for real
+			this.resetsNotByCodec.add(stream);
+		}
 		leg.encoder().writeRstStream(leg.ctx(), exchange.id, errorCode, leg.ctx().newPromise());
 	}
 
@@ -546,7 +593,7 @@ final class NettyHttp2DemuxRelay {
 	private void resetForBudgetLocked(Exchange exchange) {
 		exchange.reset = true;
 		resetClientLocked(exchange.id, Http2Error.ENHANCE_YOUR_CALM);
-		reset(exchange.leg.hop(), exchange.id, Http2Error.CANCEL.code());
+		resetLocked(exchange.leg.hop(), exchange.id, Http2Error.CANCEL.code());
 		this.meters.resetForBudget();
 	}
 
@@ -598,15 +645,29 @@ final class NettyHttp2DemuxRelay {
 	}
 
 	/**
-	 * The leg taking the route's new streams: the open one, else a new one; null when
-	 * none could be opened. With the loop's lock.
+	 * The leg taking the route's new streams: the open one, else a new one on a slot of
+	 * the connection limit ({@link #acquireSlotLocked}); null when the limit has no slot
+	 * left or the leg could not be opened. With the loop's lock.
 	 */
 	private @Nullable Leg legLocked(Router.Route route, TunnelSession session) {
 		Leg leg = this.legs.get(route);
 		if (leg != null && leg.takesStreamsLocked()) {
 			return leg;
 		}
-		VirtualConnection connection = session.open(route.address());
+		Runnable releaseSlot = acquireSlotLocked();
+		if (releaseSlot == null) {
+			this.meters.refusedForLegLimit();
+			return null;
+		}
+		VirtualConnection connection;
+		try {
+			connection = session.open(route.address());
+		}
+		catch (RuntimeException e) {
+			releaseSlot.run();
+			log.warn("h2 demux: the leg of route {} did not open: {}", route.routeTag(), e.toString(), e);
+			return null;
+		}
 		Leg opening = new Leg(route.routeTag(), this.meters.route(route.routeTag()),
 				this.meters.writesHeldOf(route.routeTag()));
 		try {
@@ -623,6 +684,7 @@ final class NettyHttp2DemuxRelay {
 				})
 				.onInactive(() -> this.legs.remove(route, opening))
 				.onWritten(NettyHttp2DemuxRelay::reviewed)
+				.traffic(traffic(route, session))
 				.build();
 			opening.hop = hop;
 			hop.withholdConnectionWindowLocked(this.withheld);
@@ -642,25 +704,88 @@ final class NettyHttp2DemuxRelay {
 			log.warn("h2 demux: the leg of route {} did not open: {}", route.routeTag(), e.toString(), e);
 			connection.close();
 			session.remove(connection.connectionId());
+			connection.afterQueued(releaseSlot);
 			return null;
 		}
 		if (this.opened.isEmpty()) {
 			this.access.connectionId(connection.connectionId());
 		}
 		this.opened.add(opening);
+		opening.routeMeters.legs().increment();
 		this.legs.put(route, opening);
 		this.pending.incrementAndGet();
 		watch(opening.hop(), () -> {
 			try {
 				connection.close();
 				session.remove(connection.connectionId());
+				// a writer that ended on a failed write dropped its queue unreviewed: the
+				// review sees it gone and lets go of the leg once it holds nothing
+				this.loop.run(NettyHttp2DemuxRelay::reviewed);
 			}
 			finally {
-				// the connection's slot covers what the leg still queues for the tunnel
-				connection.afterQueued(this::settle);
+				try {
+					// the slot covers what the leg still queues for the tunnel
+					connection.afterQueued(releaseSlot);
+				}
+				finally {
+					settle();
+				}
 			}
 		});
 		return opening;
+	}
+
+	/**
+	 * A slot for a new leg: the connection's own while no leg holds it, else one of its
+	 * own; what frees it, or null when the connection limit has no slot left. With the
+	 * loop's lock.
+	 */
+	private @Nullable Runnable acquireSlotLocked() {
+		if (this.ownSlotTaken.compareAndSet(false, true)) {
+			this.ownSlotHolders.incrementAndGet();
+			return () -> {
+				this.ownSlotTaken.set(false);
+				releaseOwnSlot();
+			};
+		}
+		ConnectionLimit.Permit permit = this.legSlots.tryAcquire();
+		return permit == null ? null : permit::release;
+	}
+
+	/**
+	 * Counts the bytes the route's leg reads (towards the client, {@code outbound}) and
+	 * writes (towards the upstream, {@code inbound}) as the route's tunnel bytes, the
+	 * session's traffic and the connection's access log bytes.
+	 */
+	private Hop.Traffic traffic(Router.Route route, TunnelSession session) {
+		Counter inbound = this.meters.registry()
+			.counter(TUNNEL_BYTES, "direction", "inbound", "route", route.routeTag());
+		Counter outbound = this.meters.registry()
+			.counter(TUNNEL_BYTES, "direction", "outbound", "route", route.routeTag());
+		AccessLogger.Connection access = this.access;
+		return new Hop.Traffic() {
+
+			@Override
+			public void read(long bytes) {
+				outbound.increment(bytes);
+				session.recordRelayed(bytes, StreamRelay.Direction.TO_LOCAL);
+				access.bytes(bytes, StreamRelay.Direction.TO_LOCAL);
+			}
+
+			@Override
+			public void written(long bytes) {
+				inbound.increment(bytes);
+				session.recordRelayed(bytes, StreamRelay.Direction.TO_REMOTE);
+				access.bytes(bytes, StreamRelay.Direction.TO_REMOTE);
+			}
+
+		};
+	}
+
+	/** A leg left {@link #opened}: its route's meters stop counting it. */
+	private static void forgottenLocked(Leg leg) {
+		leg.gauge(0);
+		leg.routeMeters.legs().decrement();
 	}
 
 	/** The client endpoint closed: so do the legs; with the loop's lock. */
@@ -740,7 +865,7 @@ final class NettyHttp2DemuxRelay {
 	}
 
 	private void resetClientLocked(int streamId, Http2Error error) {
-		reset(client(), streamId, error.code());
+		resetLocked(client(), streamId, error.code());
 	}
 
 	/**
@@ -752,17 +877,19 @@ final class NettyHttp2DemuxRelay {
 		Hop hop = client();
 		Http2Stream stream = hop.connection().stream(streamId);
 		if (stream != null && stream.state().remoteSideOpen()) {
+			this.resetsNotByCodec.add(stream);
 			hop.encoder().writeRstStream(hop.ctx(), streamId, errorCode, hop.ctx().newPromise());
 		}
 	}
 
 	/** Resets the hop's stream unless it is closed or gone; with the loop's lock. */
-	private static void reset(Hop hop, int streamId, long errorCode) {
+	private void resetLocked(Hop hop, int streamId, long errorCode) {
 		Http2Stream stream = hop.connection().stream(streamId);
 		if (stream == null || stream.state() == Http2Stream.State.CLOSED) {
 			// netty would write a reset of an unknown stream all the same
 			return;
 		}
+		this.resetsNotByCodec.add(stream);
 		hop.encoder().writeRstStream(hop.ctx(), streamId, errorCode, hop.ctx().newPromise());
 	}
 
@@ -772,11 +899,21 @@ final class NettyHttp2DemuxRelay {
 	 * -- as it would with RST_STREAM {@code STREAM_CLOSED} when closing fails a write of
 	 * the stream still waiting for its window. With the loop's lock.
 	 */
-	private static void resetByPeer(Hop hop, int streamId) {
+	private void resetByPeerLocked(Hop hop, int streamId) {
 		Http2Stream stream = hop.connection().stream(streamId);
 		if (stream != null) {
+			this.resetsNotByCodec.add(stream);
 			stream.resetSent();
 		}
+	}
+
+	/**
+	 * Whether the stream, closing, was reset by netty's codec on a stream error: a reset
+	 * sent that neither the relay nor the peer made. Forgets the stream; with the loop's
+	 * lock.
+	 */
+	private boolean resetByCodecLocked(Http2Stream stream) {
+		return !this.resetsNotByCodec.remove(stream) && stream.isResetSent();
 	}
 
 	/** Returns DATA to the reading hop's window once the other hop wrote it. */
@@ -840,7 +977,7 @@ final class NettyHttp2DemuxRelay {
 	/**
 	 * The bytes the relay holds: every leg's backlog (what it read and has not written on
 	 * the other hop yet, both ways) and every hop's writer queue. Updates the route
-	 * gauges and forgets the legs that ended holding nothing; with the loop's lock.
+	 * gauges and lets go of the legs that closed holding nothing; with the loop's lock.
 	 */
 	private long queuedLocked() {
 		Hop client = this.client;
@@ -853,6 +990,7 @@ final class NettyHttp2DemuxRelay {
 			leg.gauge(held);
 			if (held == 0 && !hop.open()) {
 				legs.remove();
+				forgottenLocked(leg);
 			}
 		}
 		return queued;
@@ -982,8 +1120,9 @@ final class NettyHttp2DemuxRelay {
 			if (leg.backlog != 0) {
 				log.warn("h2 demux: a leg of route {} finished with {} bytes accounted", leg.routeTag, leg.backlog);
 			}
-			leg.gauge(0);
+			forgottenLocked(leg);
 		}
+		this.opened.clear();
 	}
 
 	/**
@@ -1006,7 +1145,11 @@ final class NettyHttp2DemuxRelay {
 		});
 	}
 
-	/** One of {@link #pending} settled; the last finishes the relay. */
+	/**
+	 * One of {@link #pending} settled; the last finishes the relay: the connection is
+	 * logged closed, {@code onFinish} runs, and the relay lets go of the connection's own
+	 * slot.
+	 */
 	private void settle() {
 		if (this.pending.decrementAndGet() == 0 && this.finished.compareAndSet(false, true)) {
 			this.deadline.disarm();
@@ -1017,8 +1160,18 @@ final class NettyHttp2DemuxRelay {
 				this.onFinish.run();
 			}
 			finally {
-				this.release.run();
+				releaseOwnSlot();
 			}
+		}
+	}
+
+	/**
+	 * One holder let go of the connection's own slot; the last runs {@link #release}: the
+	 * relay finished and no leg's frames hold it any more.
+	 */
+	private void releaseOwnSlot() {
+		if (this.ownSlotHolders.decrementAndGet() == 0) {
+			this.release.run();
 		}
 	}
 
@@ -1048,6 +1201,9 @@ final class NettyHttp2DemuxRelay {
 
 		/** The upstream's first SETTINGS has not arrived; with the loop's lock. */
 		boolean awaitingSettings = true;
+
+		/** A GOAWAY with an error code went to the upstream; with the loop's lock. */
+		boolean failed;
 
 		/**
 		 * What the relay holds of the leg's exchanges, both ways: DATA read and not yet
@@ -1403,13 +1559,13 @@ final class NettyHttp2DemuxRelay {
 
 		@Override
 		public void onRstStreamRead(ChannelHandlerContext ctx, int streamId, long errorCode) {
-			resetByPeer(this.hop, streamId);
+			resetByPeerLocked(this.hop, streamId);
 			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.get(streamId);
 			if (exchange != null && !exchange.reset) {
 				exchange.reset = true;
 				// a waiting stream leaves the leg's buffer as netty closes the client's
 				// stream right after this call (ClientStreams)
-				reset(exchange.leg.hop(), streamId, errorCode);
+				resetLocked(exchange.leg.hop(), streamId, errorCode);
 			}
 		}
 
@@ -1425,6 +1581,9 @@ final class NettyHttp2DemuxRelay {
 
 		@Override
 		public void onStreamClosed(Http2Stream stream) {
+			if (resetByCodecLocked(stream)) {
+				NettyHttp2DemuxRelay.this.meters.resetForProtocol();
+			}
 			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.remove(stream.id());
 			if (exchange == null) {
 				return;
@@ -1441,7 +1600,7 @@ final class NettyHttp2DemuxRelay {
 			}
 			else if (!exchange.reset && !(exchange.requestEnded && exchange.responseEnded)) {
 				exchange.reset = true;
-				reset(exchange.leg.hop(), exchange.id, Http2Error.CANCEL.code());
+				resetLocked(exchange.leg.hop(), exchange.id, Http2Error.CANCEL.code());
 			}
 		}
 
@@ -1514,7 +1673,7 @@ final class NettyHttp2DemuxRelay {
 				if (exchange.interimBytes > MAX_INTERIM_BYTES) {
 					exchange.requestFlow.drop();
 					loseLocked(exchange);
-					reset(this.leg.hop(), streamId, Http2Error.ENHANCE_YOUR_CALM.code());
+					resetLocked(this.leg.hop(), streamId, Http2Error.ENHANCE_YOUR_CALM.code());
 					NettyHttp2DemuxRelay.this.meters.resetForInterim();
 					return;
 				}
@@ -1541,7 +1700,7 @@ final class NettyHttp2DemuxRelay {
 
 		@Override
 		public void onRstStreamRead(ChannelHandlerContext ctx, int streamId, long errorCode) {
-			resetByPeer(this.leg.hop(), streamId);
+			resetByPeerLocked(this.leg.hop(), streamId);
 			Exchange exchange = exchange(streamId);
 			if (exchange == null) {
 				return;
@@ -1552,7 +1711,7 @@ final class NettyHttp2DemuxRelay {
 				return;
 			}
 			exchange.reset = true;
-			reset(client(), streamId, errorCode);
+			resetLocked(client(), streamId, errorCode);
 		}
 
 		/**
@@ -1577,7 +1736,7 @@ final class NettyHttp2DemuxRelay {
 	/**
 	 * A leg's stream lifecycle: a waiting stream the leg opens stops waiting; a stream
 	 * closed without the response's end -- the leg closed under it, say -- is lost for
-	 * the client.
+	 * the client; a GOAWAY with an error code to the upstream fails the leg.
 	 */
 	private final class LegStreams extends Http2ConnectionAdapter {
 
@@ -1597,6 +1756,9 @@ final class NettyHttp2DemuxRelay {
 
 		@Override
 		public void onStreamClosed(Http2Stream stream) {
+			if (resetByCodecLocked(stream)) {
+				NettyHttp2DemuxRelay.this.meters.resetForUpstream();
+			}
 			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.get(stream.id());
 			if (exchange != null && exchange.leg == this.leg) {
 				// nothing more reaches the upstream; what it sent goes on to the client
@@ -1604,6 +1766,28 @@ final class NettyHttp2DemuxRelay {
 				loseLocked(exchange);
 			}
 		}
+
+		/**
+		 * netty's codec sends the upstream a GOAWAY with the code of its connection
+		 * error, the relay a GOAWAY {@code NO_ERROR} once the upstream's GOAWAY came: the
+		 * former fails the leg, once.
+		 */
+		@Override
+		public void onGoAwaySent(int lastStreamId, long errorCode, ByteBuf debugData) {
+			if (errorCode != Http2Error.NO_ERROR.code() && !this.leg.failed) {
+				this.leg.failed = true;
+				NettyHttp2DemuxRelay.this.meters.legFailed();
+			}
+		}
+
+	}
+
+	/** Hands out the slots of the connection limit further legs open on. */
+	@FunctionalInterface
+	interface LegSlots {
+
+		/** A slot for one more leg, or null when the limit has none left. */
+		ConnectionLimit.@Nullable Permit tryAcquire();
 
 	}
 
@@ -1640,6 +1824,8 @@ final class NettyHttp2DemuxRelay {
 		private @Nullable Runnable release;
 
 		private @Nullable H2DemuxBudget budget;
+
+		private @Nullable LegSlots legSlots;
 
 		private Builder() {
 		}
@@ -1729,6 +1915,15 @@ final class NettyHttp2DemuxRelay {
 		/** The queue budget the h2 demux relays share. */
 		Builder budget(H2DemuxBudget budget) {
 			this.budget = budget;
+			return this;
+		}
+
+		/**
+		 * The slots of the connection limit for the legs beyond the one the connection's
+		 * own slot covers.
+		 */
+		Builder legSlots(LegSlots legSlots) {
+			this.legSlots = legSlots;
 			return this;
 		}
 

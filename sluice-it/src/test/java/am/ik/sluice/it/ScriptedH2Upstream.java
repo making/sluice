@@ -248,6 +248,19 @@ public final class ScriptedH2Upstream implements AutoCloseable {
 			return this.closed.await(timeout.toNanos(), TimeUnit.NANOSECONDS);
 		}
 
+		/**
+		 * Ends the upstream's side with a FIN, still reading what the relay sends until
+		 * its EOF.
+		 */
+		public void shutdownOutput() {
+			try {
+				this.socket.shutdownOutput();
+			}
+			catch (IOException e) {
+				// closed already
+			}
+		}
+
 		/** Closes the socket with a reset (SO_LINGER 0) instead of a FIN. */
 		public void abort() {
 			try {

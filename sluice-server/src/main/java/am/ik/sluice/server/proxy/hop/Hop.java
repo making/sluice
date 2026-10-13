@@ -152,6 +152,9 @@ public final class Hop {
 	/** Run with the loop's lock after the writer wrote a batch, while watched. */
 	private final @Nullable Runnable onWritten;
 
+	/** Told of the bytes read and written, on the reader's and the writer's thread. */
+	private final Traffic traffic;
+
 	/** The writer runs {@link #onWritten} after each batch. */
 	private volatile boolean watchingWrites;
 
@@ -232,6 +235,7 @@ public final class Hop {
 		this.in = this.pipe.source();
 		this.out = new BufferedOutputStream(this.pipe.sink(), WRITE_BUFFER);
 		this.onWritten = builder.onWritten;
+		this.traffic = builder.traffic;
 		DefaultHttp2Connection connection = new DefaultHttp2Connection(builder.server);
 		connection.local().flowController(new GatedLocalFlowController(connection, builder.autoRefillConnectionWindow));
 		Http2ConnectionHandlerBuilder handlerBuilder = new Http2ConnectionHandlerBuilder();
@@ -603,6 +607,7 @@ public final class Hop {
 					break;
 				}
 				this.bytesRead.addAndGet(n);
+				this.traffic.read(n);
 				// processed before the next read: the pipe's own flow control (TCP, the
 				// tunnel's credit) backs the peer up meanwhile
 				this.loop.run(() -> feedLocked(buffer, n));
@@ -655,6 +660,7 @@ public final class Hop {
 				out.flush();
 				batch.clear();
 				this.bytesWritten.addAndGet(written);
+				this.traffic.written(written);
 				boolean turnWritable = written(written);
 				Runnable onWritten = this.watchingWrites ? this.onWritten : null;
 				if (turnWritable || onWritten != null) {
@@ -956,6 +962,33 @@ public final class Hop {
 
 	}
 
+	/**
+	 * Told of the bytes a hop read from its pipe and wrote to it, as the reader and the
+	 * writer do, outside the loop's lock: for byte counters.
+	 */
+	public interface Traffic {
+
+		/** Nothing is told. */
+		Traffic NONE = new Traffic() {
+
+			@Override
+			public void read(long bytes) {
+			}
+
+			@Override
+			public void written(long bytes) {
+			}
+
+		};
+
+		/** The reader read {@code bytes} from the pipe; on the reader's thread. */
+		void read(long bytes);
+
+		/** The writer wrote {@code bytes} to the pipe; on the writer's thread. */
+		void written(long bytes);
+
+	}
+
 	public static final class Builder {
 
 		private @Nullable String name;
@@ -976,6 +1009,8 @@ public final class Hop {
 		private @Nullable Runnable onInactive;
 
 		private @Nullable Runnable onWritten;
+
+		private Traffic traffic = Traffic.NONE;
 
 		private int highWater = DEFAULT_HIGH_WATER;
 
@@ -1053,6 +1088,15 @@ public final class Hop {
 		 */
 		public Builder onWritten(Runnable onWritten) {
 			this.onWritten = onWritten;
+			return this;
+		}
+
+		/**
+		 * Told of the bytes the hop reads from its pipe and writes to it, outside the
+		 * loop's lock; nothing by default.
+		 */
+		public Builder traffic(Traffic traffic) {
+			this.traffic = traffic;
 			return this;
 		}
 

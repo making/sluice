@@ -956,6 +956,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 			upstream.settings(null);
 			grantAndAnswer(upstream, false);
 		}));
+		double failed = counter("sluice.h2demux.legs.failed", null);
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.headers(1, true, get(route));
 			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).as("stream 1 answered").isTrue();
@@ -969,7 +970,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 			assertThat(TestH2.bodyOf(client.frames(3))).isEqualTo("0");
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(client.closed()).isFalse();
-
+			assertThat(counter("sluice.h2demux.legs.failed", null) - failed).as("the leg failed").isEqualTo(1);
 		}
 	}
 
@@ -995,6 +996,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 				}
 			}
 		}));
+		double resets = counter("sluice.h2demux.streams.reset", "upstream");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.headers(1, true, get(route));
 			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).as("stream 1 answered").isTrue();
@@ -1014,7 +1016,14 @@ class H2DemuxUpstreamFlowControlE2ETest {
 			assertThat(connections.get()).as("over the same upstream connection").isEqualTo(1);
 			assertThat(received).noneMatch(frame -> frame.type() == TestH2.GOAWAY);
 			assertThat(client.goAwayCode()).isEqualTo(-1);
+			assertThat(counter("sluice.h2demux.streams.reset", "upstream") - resets).as("counted once").isEqualTo(1);
 		}
+	}
+
+	private double counter(String name, @Nullable String reason) {
+		MeterRegistry registry = Objects.requireNonNull(this.meterRegistry);
+		return reason == null ? registry.get(name).counter().count()
+				: registry.get(name).tag("reason", reason).counter().count();
 	}
 
 	/** What an upstream does wrong. */

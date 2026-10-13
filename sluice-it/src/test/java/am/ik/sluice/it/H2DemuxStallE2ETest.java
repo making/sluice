@@ -10,6 +10,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -25,7 +26,10 @@ import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.proxy.DataProxyServer;
+import am.ik.sluice.server.proxy.hop.Hop;
 import am.ik.sluice.server.route.Router;
+import am.ik.sluice.server.tunnel.SessionRegistry;
+import am.ik.sluice.server.tunnel.TunnelSession;
 import am.ik.sluice.tunnel.VirtualConnection;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
@@ -67,11 +71,17 @@ class H2DemuxStallE2ETest {
 
 	private static final int ENHANCE_YOUR_CALM = 0xb;
 
+	/** The stream window the relay announces to the client. */
+	private static final int STREAM_WINDOW = 65535;
+
 	/**
-	 * What the relay may queue for one stream: its payload budget (the client window plus
-	 * the queue allowance) and the framing of its entries.
+	 * What the relay may queue for one stream towards a leg whose writer is stalled: the
+	 * DATA it read and has not written on the leg -- within the stream window it
+	 * announced, its copy rounded up to the next 1KiB --, plus the leg's writer queue,
+	 * which netty stops writing DATA to past its high water mark, after the pass under
+	 * way (at most the stream's backlog), and the frame headers.
 	 */
-	private static final long STREAM_QUEUE_BOUND = 65535 + 64 * 1024 + 1024;
+	private static final long STREAM_QUEUE_BOUND = STREAM_WINDOW + 1024 + Hop.DEFAULT_HIGH_WATER + STREAM_WINDOW + 1024;
 
 	private static final String ECHO_BODY = "echo-h2d";
 
@@ -102,6 +112,10 @@ class H2DemuxStallE2ETest {
 	@Nullable
 	@Autowired
 	private DataProxyServer dataProxyServer;
+
+	@Nullable
+	@Autowired
+	private SessionRegistry sessions;
 
 	@BeforeAll
 	static void startUpstreams() {
@@ -141,8 +155,6 @@ class H2DemuxStallE2ETest {
 	 * connection.
 	 */
 	@Test
-	@Disabled("waits on the route's tunnel byte counter (sluice.tunnel.bytes), not yet on the "
-			+ "h2 demux, and asserts the hand-written relay's stream budget")
 	void stalledLegKeepsTheOtherLegsFlowing() throws Exception {
 		startClient("h2d.stall.test", stallUpstream);
 		startClient("h2d.echo.test", echoUpstream);
@@ -185,8 +197,6 @@ class H2DemuxStallE2ETest {
 	 * active-connection count drops while the stalled upstream still holds its socket.
 	 */
 	@Test
-	@Disabled("waits on the route's tunnel byte counter (sluice.tunnel.bytes), not yet on the "
-			+ "h2 demux, and looks for the hand-written relay's leg writer waiting for credit")
 	void closingTheClientReleasesTheStalledLeg() throws Exception {
 		String route = "h2d.release.test";
 		startClient(route, stallUpstream);
@@ -218,6 +228,58 @@ class H2DemuxStallE2ETest {
 		}
 		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> proxy.activeConnections() == 0);
 		assertThat(heldUpstreamSockets()).as("the stalled upstream still holds its socket").isEqualTo(heldBefore + 1);
+	}
+
+	/**
+	 * A stalled leg whose upstream then ends its side closes with its writer parked on
+	 * the tunnel connection's credit, until the close grace closes the pipe under it. The
+	 * relay lets go of what it held for the leg -- the route's queued bytes back to zero,
+	 * the virtual connection gone from the session -- while the client's connection stays
+	 * open and sends nothing more.
+	 */
+	@Test
+	void aStalledLegItsUpstreamEndsIsLetGoWhileTheClientIdles() throws Exception {
+		String route = "h2d.ended.test";
+		CountDownLatch end = new CountDownLatch(1);
+		ServerSocket upstream = stub(socket -> grantHoldThenEnd(socket, end));
+		try {
+			startClient(route, upstream);
+			TunnelSession session = Objects.requireNonNull(this.sessions)
+				.find(Objects.requireNonNull(this.router).lookup(route).orElseThrow().clientId())
+				.orElseThrow();
+			AtomicBoolean stop = new AtomicBoolean();
+			try (H2TestClient client = H2TestClient.connect(dataPort)) {
+				client.headers(1, false, TestH2.headerBlock(":authority=" + route, ":method=POST", ":path=/slow"));
+				Thread.ofVirtual().name("e2e-h2d-push-ended").start(() -> {
+					try {
+						while (!stop.get() && !client.closed()) {
+							client.fill(1, Duration.ofMillis(100));
+						}
+					}
+					catch (IOException | InterruptedException e) {
+						// torn down
+					}
+				});
+				awaitOutboundPlateau(route, client);
+				assertThat(queuedBytes(route)).as("precondition: the stall reached the leg queue").isGreaterThan(0);
+				assertThat(ThreadDumps.anyThreadWaitingForCredit()).as("precondition: the leg writer waits for credit")
+					.isTrue();
+				assertThat(session.connectionCount()).as("precondition: the leg's connection").isEqualTo(1);
+				stop.set(true);
+				end.countDown();
+				// the stream is lost with its leg: the relay answers it, and the client
+				// sends nothing more
+				assertThat(client.awaitTrue(() -> client.reset(1) != null, Duration.ofSeconds(5))).isTrue();
+				Awaitility.await()
+					.atMost(Duration.ofSeconds(5))
+					.alias("the leg let go")
+					.until(() -> queuedBytes(route) == 0 && session.connectionCount() == 0);
+				assertThat(client.closed()).isFalse();
+			}
+		}
+		finally {
+			close(upstream);
+		}
 	}
 
 	/**
@@ -406,6 +468,40 @@ class H2DemuxStallE2ETest {
 			return;
 		}
 		hold(socket);
+	}
+
+	/**
+	 * As {@link #grantThenHold}, then ends its side with a FIN once the latch opens,
+	 * still reading nothing.
+	 */
+	private static void grantHoldThenEnd(Socket socket, CountDownLatch end) {
+		synchronized (heldUpstreamSockets) {
+			heldUpstreamSockets.add(socket);
+		}
+		try {
+			InputStream in = socket.getInputStream();
+			OutputStream out = socket.getOutputStream();
+			if (in.readNBytes(TestH2.PREFACE.length).length < TestH2.PREFACE.length) {
+				return;
+			}
+			TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
+			TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(Integer.MAX_VALUE - 65535));
+			TestH2.@Nullable Frame frame;
+			while ((frame = TestH2.readFrame(in)) != null) {
+				if (frame.type() == TestH2.HEADERS && frame.streamId() == 1) {
+					TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(Integer.MAX_VALUE - 65535));
+					break;
+				}
+			}
+			end.await();
+			socket.shutdownOutput();
+		}
+		catch (IOException e) {
+			// torn down
+		}
+		catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
 	}
 
 	/** Accepts and never reads, holding the socket for the teardown. */

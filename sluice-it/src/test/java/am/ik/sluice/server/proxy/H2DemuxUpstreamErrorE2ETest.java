@@ -28,6 +28,8 @@ import am.ik.sluice.it.TestH2;
 import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.route.Router;
+import am.ik.sluice.server.tunnel.SessionRegistry;
+import am.ik.sluice.server.tunnel.TunnelSession;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -68,6 +70,8 @@ class H2DemuxUpstreamErrorE2ETest {
 
 	private static final int REFUSED_STREAM = 0x7;
 
+	private static final int CANCEL = 0x8;
+
 	/** SETTINGS_MAX_CONCURRENT_STREAMS. */
 	private static final int MAX_CONCURRENT_STREAMS = 0x3;
 
@@ -94,6 +98,10 @@ class H2DemuxUpstreamErrorE2ETest {
 	@Nullable
 	@Autowired
 	private ErrorResponse errorResponse;
+
+	@Nullable
+	@Autowired
+	private SessionRegistry sessions;
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
@@ -135,6 +143,8 @@ class H2DemuxUpstreamErrorE2ETest {
 		});
 		startClient(route, upstream);
 		startClient(otherRoute, upstream(new byte[0], ScriptedH2Upstream.answering("other")));
+		double resets = counter("sluice.h2demux.streams.reset", "upstream");
+		double protocolResets = counter("sluice.h2demux.streams.reset", "protocol");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5)) {
 			client.headers(1, true, get(route));
 			assertThat(client.awaitTrue(() -> client.reset(1) != null, WITHIN)).as("stream 1 reset").isTrue();
@@ -155,6 +165,37 @@ class H2DemuxUpstreamErrorE2ETest {
 			assertThat(connection.frames()).noneMatch(frame -> frame.type() == TestH2.GOAWAY);
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(client.closed()).isFalse();
+			assertThat(counter("sluice.h2demux.streams.reset", "upstream") - resets).as("counted once").isEqualTo(1);
+			assertThat(counter("sluice.h2demux.streams.reset", "protocol") - protocolResets)
+				.as("the relay's INTERNAL_ERROR to the client is its own")
+				.isZero();
+		}
+	}
+
+	/**
+	 * An upstream's reset of a stream reaches the client with its code; neither reset
+	 * counts as one the relay made on a stream error.
+	 */
+	@Test
+	void anUpstreamsResetIsRelayedUncounted() throws Exception {
+		String route = "ue.upstream-reset.test";
+		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {
+			if (frame.type() == TestH2.HEADERS) {
+				connection.write(TestH2.RST_STREAM, 0, frame.streamId(), TestH2.int32(CANCEL));
+			}
+		});
+		startClient(route, upstream);
+		double upstreamResets = counter("sluice.h2demux.streams.reset", "upstream");
+		double protocolResets = counter("sluice.h2demux.streams.reset", "protocol");
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
+			client.headers(1, true, get(route));
+			assertThat(client.awaitTrue(() -> client.reset(1) != null, WITHIN)).isTrue();
+			assertThat(client.reset(1)).isEqualTo(CANCEL);
+			Awaitility.await().atMost(WITHIN).until(() -> dataProxyServer().h2DemuxMeters().trackedStreams(route) == 0);
+			assertThat(upstream.awaitConnection(0, WITHIN).frames())
+				.noneMatch(frame -> frame.type() == TestH2.RST_STREAM);
+			assertThat(counter("sluice.h2demux.streams.reset", "upstream") - upstreamResets).isZero();
+			assertThat(counter("sluice.h2demux.streams.reset", "protocol") - protocolResets).isZero();
 		}
 	}
 
@@ -224,6 +265,7 @@ class H2DemuxUpstreamErrorE2ETest {
 			// answered by the test
 		});
 		startClient(otherRoute, other);
+		double failed = counter("sluice.h2demux.legs.failed", null);
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5, 7)) {
 			client.headers(1, true, get(route));
 			client.headers(3, true, get(route));
@@ -257,6 +299,7 @@ class H2DemuxUpstreamErrorE2ETest {
 			assertThat(upstream.connections()).as("over a new leg").hasSize(2);
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(client.closed()).isFalse();
+			assertThat(counter("sluice.h2demux.legs.failed", null) - failed).as("the leg failed").isEqualTo(1);
 			Awaitility.await()
 				.atMost(WITHIN)
 				.until(() -> dataProxyServer().h2DemuxMeters().trackedStreams(route) == 0 && queuedBytes(route) == 0);
@@ -524,6 +567,55 @@ class H2DemuxUpstreamErrorE2ETest {
 		}
 	}
 
+	/**
+	 * An upstream ending its connection after every answer -- a GOAWAY naming the stream,
+	 * then its FIN -- while one client connection sends 50 requests one after the other:
+	 * each leg is let go once it ended, before the next request, so the relay holds at
+	 * most the one leg of the route and the session at most its one connection; every
+	 * request is answered, each over a new leg, and no GOAWAY ending a leg cleanly counts
+	 * as a failed leg.
+	 */
+	@Test
+	void legsTheirUpstreamEndedAreLetGo() throws Exception {
+		String route = "ue.retire.test";
+		int requests = 50;
+		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {
+			if (frame.type() == TestH2.HEADERS && (frame.flags() & TestH2.FLAG_END_STREAM) != 0) {
+				connection.answer(frame.streamId(), "ok");
+				byte[] goAway = new byte[8];
+				System.arraycopy(TestH2.int32(frame.streamId()), 0, goAway, 0, 4);
+				connection.write(TestH2.GOAWAY, 0, 0, goAway);
+				connection.shutdownOutput();
+			}
+		});
+		startClient(route, upstream);
+		TunnelSession session = sessionOf(route);
+		H2DemuxMeters meters = dataProxyServer().h2DemuxMeters();
+		double failed = counter("sluice.h2demux.legs.failed", null);
+		Integer[] streamIds = new Integer[requests];
+		for (int i = 0; i < requests; i++) {
+			streamIds[i] = 1 + 2 * i;
+		}
+		try (H2TestClient client = H2TestClient.connect(dataPort, streamIds)) {
+			for (int streamId : streamIds) {
+				Awaitility.await()
+					.atMost(WITHIN)
+					.alias("the previous leg let go before stream " + streamId)
+					.until(() -> meters.legs(route) == 0 && session.connectionCount() == 0);
+				client.headers(streamId, true, get(route));
+				assertThat(client.awaitEnd(streamId, WITHIN)).as("stream %d answered", streamId).isTrue();
+				assertThat(TestH2.bodyOf(client.frames(streamId))).isEqualTo("ok");
+				assertThat(meters.legs(route)).as("legs held").isLessThanOrEqualTo(1);
+				assertThat(session.connectionCount()).as("connections of the session").isLessThanOrEqualTo(1);
+			}
+			assertThat(upstream.connections()).as("a leg per request").hasSize(requests);
+			assertThat(client.resets()).isEmpty();
+			assertThat(client.goAwayCode()).isEqualTo(-1);
+			assertThat(client.closed()).isFalse();
+		}
+		assertThat(counter("sluice.h2demux.legs.failed", null) - failed).isZero();
+	}
+
 	/** The frame types of the {@code 502} page followed by a reset. */
 	private static List<Integer> badGateway() {
 		return List.of(TestH2.HEADERS, TestH2.DATA, TestH2.RST_STREAM);
@@ -586,6 +678,12 @@ class H2DemuxUpstreamErrorE2ETest {
 			.mapToDouble(Gauge::value)
 			.max()
 			.orElse(0));
+	}
+
+	/** The tunnel session serving the route. */
+	private TunnelSession sessionOf(String route) {
+		String clientId = Objects.requireNonNull(this.router).lookup(route).orElseThrow().clientId();
+		return Objects.requireNonNull(this.sessions).find(clientId).orElseThrow();
 	}
 
 	private DataProxyServer dataProxyServer() {

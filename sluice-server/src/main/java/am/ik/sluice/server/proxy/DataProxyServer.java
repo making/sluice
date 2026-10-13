@@ -393,6 +393,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 					.deadline(deadline)
 					.streamWaitTimeout(this.h2StreamWaitTimeout)
 					.budget(this.limits.h2Budget())
+					.legSlots(this.limits::tryAcquireLeg)
 					.onFinish(relayed)
 					.release(release)
 					.build();
