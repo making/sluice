@@ -112,6 +112,10 @@ public final class Hop {
 
 	private final DuplexPipe pipe;
 
+	private final InputStream in;
+
+	private final OutputStream out;
+
 	private final int highWater;
 
 	private final int lowWater;
@@ -188,6 +192,10 @@ public final class Hop {
 		if (!this.loop.heldByCurrentThread()) {
 			throw new IllegalStateException("a hop is built inside Loop#run");
 		}
+		// taken now, while the pipe is open: a socket closed later (by the writer, say)
+		// refuses to hand out its streams, where a read only ends
+		this.in = this.pipe.source();
+		this.out = new BufferedOutputStream(this.pipe.sink(), WRITE_BUFFER);
 		DefaultHttp2Connection connection = new DefaultHttp2Connection(builder.server);
 		connection.local()
 			.flowController(new DefaultHttp2LocalFlowController(connection,
@@ -511,7 +519,7 @@ public final class Hop {
 
 	private void read() {
 		try {
-			InputStream in = this.pipe.source();
+			InputStream in = this.in;
 			byte[] buffer = new byte[READ_BUFFER];
 			while (awaitReadable()) {
 				int n = in.read(buffer);
@@ -560,7 +568,7 @@ public final class Hop {
 
 	private void write() {
 		try {
-			OutputStream out = new BufferedOutputStream(this.pipe.sink(), WRITE_BUFFER);
+			OutputStream out = this.out;
 			List<byte[]> batch = new ArrayList<>();
 			while (takeBatch(batch)) {
 				long written = 0;

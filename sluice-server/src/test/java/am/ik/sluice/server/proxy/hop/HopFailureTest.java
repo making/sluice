@@ -172,6 +172,21 @@ class HopFailureTest {
 	}
 
 	@Test
+	void aWriterFailingBeforeTheReaderStartedIsTheOnlyFailure() throws Exception {
+		Socket[] sockets = Endpoint.socketPair();
+		// the reader asks for the source only once the writer failed and closed the pipe
+		try (Socket peer = sockets[1];
+				Endpoint a = Endpoint.over("a", sockets[0], builder -> builder.server(true)
+					.pipe(new BrokenSinkPipe(new LateSourcePipe(DuplexPipe.of(sockets[0])))))) {
+
+			awaitTrue(() -> !a.hop.open(), () -> "a is still open");
+			assertThat(a.hop.awaitDone(Duration.ofSeconds(10))).isTrue();
+			assertThat(a.sink.failures()).extracting(failure -> failure.cause().getMessage())
+				.containsExactly("sink broke");
+		}
+	}
+
+	@Test
 	void whatTheChannelWroteBeforeClosingReachesThePeer() throws Exception {
 		int pings = 10_000;
 		Socket[] sockets = Endpoint.socketPair();
@@ -364,6 +379,37 @@ class HopFailureTest {
 				loop.close();
 			}
 		}
+	}
+
+	/** A pipe whose source is handed out late: a reader thread starting late. */
+	private record LateSourcePipe(DuplexPipe delegate) implements DuplexPipe {
+
+		@Override
+		public InputStream source() {
+			try {
+				Thread.sleep(200);
+			}
+			catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+			return this.delegate.source();
+		}
+
+		@Override
+		public OutputStream sink() {
+			return this.delegate.sink();
+		}
+
+		@Override
+		public void shutdownOutput() throws Exception {
+			this.delegate.shutdownOutput();
+		}
+
+		@Override
+		public void close() throws Exception {
+			this.delegate.close();
+		}
+
 	}
 
 	/** A pipe whose sink throws what no I/O failure throws: a bug in the transport. */
