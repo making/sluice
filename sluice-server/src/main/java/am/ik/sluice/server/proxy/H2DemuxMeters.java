@@ -19,9 +19,10 @@ import io.micrometer.core.instrument.MeterRegistry;
  * share of it, for an upstream's interim heads past their limit, or on a stream error of
  * the client or of an upstream, the streams answered 421 for a route reached over
  * HTTP/1.1 only, the legs ended by a connection error, the times a relay withheld its
- * connection windows (for want of budget, or past its share), the bytes every relay
- * holds, and, for tests, the DATA writes netty holds, the streams the relays track, the
- * legs they hold and the reviews they ran.
+ * connection windows (for want of budget, or past its share), the times a relay's peer
+ * was kept at RFC 9113's window for want of the charge of a larger one, the bytes every
+ * relay holds and the connection window their peers hold, and, for tests, the DATA writes
+ * netty holds, the streams the relays track, the legs they hold and the reviews they ran.
  */
 final class H2DemuxMeters {
 
@@ -30,6 +31,12 @@ final class H2DemuxMeters {
 
 	/** Name of the gauge of the bytes every relay holds, as of its last review. */
 	static final String HELD_GAUGE_NAME = "sluice.h2demux.held.bytes";
+
+	/**
+	 * Name of the gauge of the connection window the peers of every relay hold, as of its
+	 * last review.
+	 */
+	static final String CREDIT_GAUGE_NAME = "sluice.h2demux.credit.bytes";
 
 	private final MeterRegistry registry;
 
@@ -43,6 +50,9 @@ final class H2DemuxMeters {
 
 	/** The bytes every relay holds, as of its last review. */
 	private final AtomicLong held = new AtomicLong();
+
+	/** The connection window the peers of every relay hold, as of its last review. */
+	private final AtomicLong credit = new AtomicLong();
 
 	private final Counter refusedBudget;
 
@@ -72,11 +82,17 @@ final class H2DemuxMeters {
 
 	private final Counter windowWithheldShare;
 
+	private final Counter windowDeclined;
+
 	H2DemuxMeters(MeterRegistry registry) {
 		this.registry = registry;
 		Gauge.builder(HELD_GAUGE_NAME, this.held, AtomicLong::doubleValue)
 			.description("Bytes the h2 demux relays hold, both ways, the writer queues of their client and upstream "
 					+ "connections included, as of their last review")
+			.register(registry);
+		Gauge.builder(CREDIT_GAUGE_NAME, this.credit, AtomicLong::doubleValue)
+			.description("Connection window the clients and upstreams of the h2 demux relays hold: what they may "
+					+ "still send, as of each relay's last review")
 			.register(registry);
 		this.refusedBudget = refused(registry, "budget");
 		this.refusedShare = refused(registry, "share");
@@ -99,6 +115,10 @@ final class H2DemuxMeters {
 			.register(registry);
 		this.windowWithheldBudget = withheld(registry, "budget");
 		this.windowWithheldShare = withheld(registry, "share");
+		this.windowDeclined = Counter.builder("sluice.h2demux.window.declined")
+			.description("Times an h2 demux relay kept a peer's connection window at RFC 9113's 65535 bytes, or"
+					+ " at the size it had, for want of the queue budget or the share a larger one is charged to")
+			.register(registry);
 	}
 
 	private static Counter withheld(MeterRegistry registry, String reason) {
@@ -231,6 +251,14 @@ final class H2DemuxMeters {
 		this.windowWithheldShare.increment();
 	}
 
+	/**
+	 * A relay kept a peer's connection window from growing, or at RFC 9113's, for want of
+	 * the charge of a larger one.
+	 */
+	void windowDeclined() {
+		this.windowDeclined.increment();
+	}
+
 	MeterRegistry registry() {
 		return this.registry;
 	}
@@ -264,6 +292,14 @@ final class H2DemuxMeters {
 	/** A relay holds {@code delta} more bytes than at its previous review. */
 	void held(long delta) {
 		this.held.addAndGet(delta);
+	}
+
+	/**
+	 * A relay's peers hold {@code delta} more connection window than at its previous
+	 * review.
+	 */
+	void credit(long delta) {
+		this.credit.addAndGet(delta);
 	}
 
 	/** Counts a review of a relay's accounts. */

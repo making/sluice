@@ -66,6 +66,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * budget while the connection goes on; a response the upstream completed outlives its
  * leg, and the request's rest outlives a client stream an early response closed. The
  * relay logs no warning throughout (no listener failure, no bytes accounted at its end).
+ * The test client and upstreams answer no PING, so the relay's connection windows stay at
+ * RFC 9113's, charged to no budget: the budget charges what the relay holds alone.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -192,6 +194,7 @@ class NettyH2DemuxBudgetE2ETest {
 			}
 		}));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
+			client.ignorePings();
 			client.headers(1, false, post(route));
 			client.fill(1, QUIET);
 			WindowedH2Upstream upstream = awaitUpstream(seen);
@@ -235,6 +238,7 @@ class NettyH2DemuxBudgetE2ETest {
 			}
 		}));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
+			client.ignorePings();
 			client.headers(1, true, get(route));
 			WindowedH2Upstream upstream = awaitUpstream(seen);
 			Awaitility.await().atMost(TIMEOUT).until(() -> client.dataReceived(1) == PEER_WINDOW);
@@ -279,6 +283,7 @@ class NettyH2DemuxBudgetE2ETest {
 			}
 		}));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
+			client.ignorePings();
 			client.headers(1, false, post(route));
 			WindowedH2Upstream upstream = awaitUpstream(seen);
 			Awaitility.await().atMost(TIMEOUT).until(upstream::windowSettingAcked);
@@ -330,6 +335,7 @@ class NettyH2DemuxBudgetE2ETest {
 			ids[i] = 1 + 2 * i;
 		}
 		try (H2TestClient client = H2TestClient.connect(dataPort, ids)) {
+			client.ignorePings();
 			client.withholdConnectionWindow();
 			client.frame(TestH2.SETTINGS, 0, 0, WindowedH2Upstream.setting(SETTINGS_INITIAL_WINDOW_SIZE, 1024 * KIB));
 			for (int i = 0; i < streams; i++) {
@@ -370,6 +376,7 @@ class NettyH2DemuxBudgetE2ETest {
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		startClient(route, upstream(seen, NettyH2DemuxBudgetE2ETest::holdRequests));
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
+			client.ignorePings();
 			long held = holdThreeRequests(client, route, seen);
 			client.frame(TestH2.RST_STREAM, 0, 1, TestH2.int32(CANCEL));
 			Awaitility.await()
@@ -412,6 +419,7 @@ class NettyH2DemuxBudgetE2ETest {
 			reader.join();
 		}));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5)) {
+			client.ignorePings();
 			client.headers(1, true, get(route));
 			assertThat(responded.await(TIMEOUT.toSeconds(), TimeUnit.SECONDS)).as("the upstream answered").isTrue();
 			for (int streamId = 3; streamId <= 5; streamId += 2) {
@@ -472,6 +480,7 @@ class NettyH2DemuxBudgetE2ETest {
 		}));
 		double budgetResets = counter("sluice.h2demux.streams.reset", "budget");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
+			client.ignorePings();
 			client.headers(1, false, post(route));
 			for (int streamId = 3; streamId <= 17; streamId += 2) {
 				client.headers(streamId, false, post(route));
@@ -524,6 +533,7 @@ class NettyH2DemuxBudgetE2ETest {
 			reader.join();
 		}));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
+			client.ignorePings();
 			client.headers(1, false, post(route));
 			for (int streamId = 3; streamId <= 17; streamId += 2) {
 				client.headers(streamId, false, post(route));
@@ -565,6 +575,7 @@ class NettyH2DemuxBudgetE2ETest {
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		startClient(route, upstream(seen, NettyH2DemuxBudgetE2ETest::holdRequests));
 		H2TestClient client = H2TestClient.connect(dataPort);
+		client.ignorePings();
 		holdThreeRequests(client, route, seen);
 		client.abort();
 		Awaitility.await()
@@ -597,6 +608,7 @@ class NettyH2DemuxBudgetE2ETest {
 			}
 		}));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
+			client.ignorePings();
 			client.headers(1, false, post(route));
 			WindowedH2Upstream upstream = awaitUpstream(seen);
 			Awaitility.await().atMost(TIMEOUT).until(upstream::windowSettingAcked);
@@ -857,6 +869,7 @@ class NettyH2DemuxBudgetE2ETest {
 			if (upstream == null) {
 				return;
 			}
+			upstream.ignorePings();
 			synchronized (first) {
 				if (first.get() == null) {
 					first.set(upstream);

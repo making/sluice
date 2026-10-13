@@ -75,8 +75,10 @@ import org.jspecify.annotations.Nullable;
  * sets, granted with a WINDOW_UPDATE right after the preface. It refills to that size as
  * DATA arrives (netty's auto refill, unless the builder turns it off), so only the stream
  * windows bound what the hop holds; the bridging code may withhold it
- * ({@link #withholdConnectionWindowLocked}): the connection-level WINDOW_UPDATEs are held
- * back and the peer is held to the window it was granted.
+ * ({@link #withholdConnectionWindowLocked}), from the hop's start too: the
+ * connection-level WINDOW_UPDATEs, the grant behind the preface included, are held back
+ * and the peer is held to the window it was granted, until the bridging code grants what
+ * is owed, whole or in part ({@link #grantConnectionWindowLocked}).
  * <p>
  * <b>Reading pauses</b> while the queue holds more than the read pause bytes. What the
  * flow controller holds back is DATA only; the frames netty answers on its own (PING and
@@ -280,6 +282,8 @@ public final class Hop {
 		this.out = this.pipe.sink();
 		this.onWritten = builder.onWritten;
 		this.traffic = builder.traffic;
+		// before the channel registers: the grant behind the preface passes the gate
+		this.withholding = builder.withholdConnectionWindow;
 		DefaultHttp2Connection connection = new DefaultHttp2Connection(builder.server);
 		connection.local().flowController(new GatedLocalFlowController(connection, builder.autoRefillConnectionWindow));
 		HopHandler.Builder handlerBuilder = new HopHandler.Builder();
@@ -384,6 +388,31 @@ public final class Hop {
 	public int owedConnectionWindowLocked() {
 		requireLock();
 		return this.owedConnectionWindow;
+	}
+
+	/**
+	 * Grants the peer up to {@code bytes} of the connection window increments held back,
+	 * as one WINDOW_UPDATE, the rest staying held back; the bytes granted, 0 when nothing
+	 * is owed or the channel closed. With the loop's lock.
+	 */
+	public int grantConnectionWindowLocked(int bytes) {
+		requireLock();
+		int granted = Math.min(Math.max(0, bytes), this.owedConnectionWindow);
+		if (granted == 0 || !this.channel.isOpen()) {
+			return 0;
+		}
+		this.owedConnectionWindow -= granted;
+		this.handler.encoder().frameWriter().writeWindowUpdate(this.ctx, 0, granted, this.ctx.newPromise());
+		return granted;
+	}
+
+	/**
+	 * The connection window the peer holds: what it may still send, as netty's window
+	 * less the increments held back. With the loop's lock.
+	 */
+	public int connectionCreditLocked() {
+		requireLock();
+		return localFlow().windowSize(connection().connectionStream()) - this.owedConnectionWindow;
 	}
 
 	/**
@@ -1136,6 +1165,8 @@ public final class Hop {
 
 		private int connectionWindow = DEFAULT_CONNECTION_WINDOW;
 
+		private boolean withholdConnectionWindow;
+
 		private Consumer<HopHandler.Builder> codec = handlerBuilder -> {
 		};
 
@@ -1225,6 +1256,18 @@ public final class Hop {
 						"connectionWindow must be at least " + DEFAULT_CONNECTION_WINDOW + ": " + connectionWindow);
 			}
 			this.connectionWindow = connectionWindow;
+			return this;
+		}
+
+		/**
+		 * Withholds the connection window from the hop's start
+		 * ({@link Hop#withholdConnectionWindowLocked}): the peer holds RFC 9113's initial
+		 * window, and the larger one {@link #connectionWindow} sets is owed, granted as
+		 * the bridging code grants it ({@link Hop#grantConnectionWindowLocked}).
+		 * {@code false} by default.
+		 */
+		public Builder withholdConnectionWindow(boolean withholdConnectionWindow) {
+			this.withholdConnectionWindow = withholdConnectionWindow;
 			return this;
 		}
 

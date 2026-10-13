@@ -185,8 +185,8 @@ class H2DemuxFramingE2ETest {
 	 * leg opens -- push off, a 1MiB initial stream window, the 64KiB header list limit,
 	 * the RFC defaults else -- whatever the client announces, before the leg opened or
 	 * after; and the client gets the relay's: 100 concurrent streams, a 1MiB initial
-	 * stream window and the 64KiB header list limit. Each gets a 1MiB connection window:
-	 * one WINDOW_UPDATE raising RFC 9113's.
+	 * stream window and the 64KiB header list limit. Each keeps RFC 9113's connection
+	 * window until it sends DATA: no WINDOW_UPDATE raises it ahead.
 	 */
 	@Test
 	void eachHopGetsTheRelaysOwnSettings() throws Exception {
@@ -204,8 +204,7 @@ class H2DemuxFramingE2ETest {
 			assertThat(client.setting(0x6)).as("SETTINGS_MAX_HEADER_LIST_SIZE").isEqualTo(65536L);
 			assertThat(client.setting(0x4)).as("SETTINGS_INITIAL_WINDOW_SIZE").isEqualTo(1048576L);
 			assertThat(client.setting(0x5)).as("SETTINGS_MAX_FRAME_SIZE").isNull();
-			assertThat(client.connectionGranted()).as("the connection window granted, no DATA sent")
-				.isEqualTo(1048576 - 65535);
+			assertThat(client.connectionGranted()).as("no connection window granted, no DATA sent").isZero();
 		}
 		List<Integer> connectionGrants = new ArrayList<>();
 		List<String> announced = new ArrayList<>();
@@ -226,7 +225,7 @@ class H2DemuxFramingE2ETest {
 			}
 		}
 		assertThat(announced).as("the SETTINGS frames the upstream got").containsExactly("2=0,4=1048576,6=65536");
-		assertThat(connectionGrants).as("the connection window granted the upstream").containsExactly(1048576 - 65535);
+		assertThat(connectionGrants).as("no connection window granted the upstream ahead").isEmpty();
 	}
 
 	/**

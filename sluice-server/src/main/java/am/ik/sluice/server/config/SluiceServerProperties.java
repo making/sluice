@@ -381,8 +381,10 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * {@code NO_ERROR}); an upgraded connection has none (it is relayed verbatim: see
 	 * {@code verbatimIdleTimeout})
 	 * @param h2QueueBudget bytes the h2 demux relays may queue beyond each connection's
-	 * own allowance, both ways, shared by all of them, one connection taking at most 2MiB
-	 * before its windows are withheld; {@code 0} = an eighth of half the maximum heap
+	 * own allowance, both ways, plus the connection window their clients and upstreams
+	 * hold past 65535 bytes, shared by all of them, one connection taking at most 2MiB
+	 * before its windows are withheld; a window grows past 65535 bytes only as far as the
+	 * budget takes it; {@code 0} = an eighth of half the maximum heap
 	 * @param h2StreamWaitTimeout how long an h2 stream may wait for a place within its
 	 * upstream's {@code SETTINGS_MAX_CONCURRENT_STREAMS} before the relay refuses it
 	 * ({@code REFUSED_STREAM}); {@code 0} = off

@@ -250,15 +250,15 @@ class H2DemuxConnectionShareE2ETest {
 						.untilAsserted(() -> assertThat(budgetUsed()).as("the other connection charged the budget")
 							.isGreaterThan(used));
 					release.countDown();
-					Awaitility.await()
-						.atMost(TIMEOUT)
-						.untilAsserted(
-								() -> assertThat(budgetUsed()).as("the other connection released").isEqualTo(used));
-					assertThat(budget.waiting()).as("still no waiter").isZero();
 				}
 				finally {
 					release.countDown();
 				}
+				// closed: what it held and the window its client holds go back
+				Awaitility.await()
+					.atMost(TIMEOUT)
+					.untilAsserted(() -> assertThat(budgetUsed()).as("the other connection released").isEqualTo(used));
+				assertThat(budget.waiting()).as("still no waiter").isZero();
 			}
 			long afterBefore = meters.reviews();
 			Thread.sleep(IDLE.toMillis());

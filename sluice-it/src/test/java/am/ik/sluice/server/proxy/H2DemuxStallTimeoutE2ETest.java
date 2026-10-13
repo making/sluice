@@ -255,8 +255,8 @@ class H2DemuxStallTimeoutE2ETest {
 			client.headers(1, true, get(BIG_HOST));
 			assertGoAwayInTime(client, start);
 			assertThat(client.dataReceived(1)).as("the stream's initial window").isEqualTo(WINDOW);
-			assertThat(client.connectionWindow()).as("the connection window the relay granted, none of it spent")
-				.isEqualTo(NettyHttp2DemuxRelay.CONNECTION_WINDOW);
+			assertThat(client.connectionWindow()).as("RFC 9113's connection window, none of it spent")
+				.isEqualTo(HopWindow.FLOOR);
 		}
 		awaitReleased(stalls);
 	}

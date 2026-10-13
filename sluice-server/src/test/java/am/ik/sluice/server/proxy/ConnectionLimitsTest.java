@@ -375,21 +375,21 @@ class ConnectionLimitsTest {
 		// both windows are the tunnel's per-connection window
 		assertThat(NettyHttp2DemuxRelay.STREAM_WINDOW).isEqualTo(1024 * 1024);
 		assertThat(NettyHttp2DemuxRelay.CONNECTION_WINDOW).isEqualTo(1024 * 1024);
-		// the read under way, a connection window and a granule per stream once the
-		// windows are withheld; a hop's writer queue: the read pause plus 64KiB
-		assertThat(NettyHttp2DemuxRelay.WITHHELD_ARRIVALS).isEqualTo(16384 + 1024 * 1024 + 100 * 1024);
+		// what a peer still sends uncharged once nothing more is granted: the read under
+		// way, RFC 9113's window (the credit past it was charged when granted) and a
+		// granule per stream; a hop's writer queue: the read pause plus 64KiB
+		assertThat(NettyHttp2DemuxRelay.WITHHELD_ARRIVALS).isEqualTo(16384 + 65535 + 100 * 1024);
 		assertThat(NettyHttp2DemuxRelay.HOP_QUEUE_BYTES).isEqualTo(256 * 1024 + 64 * 1024);
 		assertThat(NettyHttp2DemuxRelay.UNBUDGETED_BYTES)
 			.isEqualTo(128 * 1024 + NettyHttp2DemuxRelay.WITHHELD_ARRIVALS + NettyHttp2DemuxRelay.HOP_QUEUE_BYTES);
 		assertThat(NettyHttp2DemuxRelay.RESPONSE_QUEUE_BYTES)
 			.isEqualTo(NettyHttp2DemuxRelay.WITHHELD_ARRIVALS + NettyHttp2DemuxRelay.HOP_QUEUE_BYTES);
 		// every connection: what its virtual connection buffers outside the tunnel
-		// budget,
-		// 293KiB; an h2 connection besides: its relay's 1588KiB and its first leg's
-		// 1460KiB; a further leg: both its own
+		// budget, 293KiB; an h2 connection besides: its relay's 628KiB and its first
+		// leg's 500KiB; a further leg: both its own
 		assertThat(ConnectionLimits.connectionBytes()).isEqualTo(ConnectionLimit.CONNECTION_BYTES).isEqualTo(300032);
-		assertThat(ConnectionLimits.h2RelayBytes()).isEqualTo(1626112 + 1495040);
-		assertThat(ConnectionLimits.legBytes()).isEqualTo(300032 + 1495040);
+		assertThat(ConnectionLimits.h2RelayBytes()).isEqualTo(643071 + 511999);
+		assertThat(ConnectionLimits.legBytes()).isEqualTo(300032 + 511999);
 		assertThat(ConnectionLimits.deriveBudget(400 * mib)).isEqualTo(25 * mib);
 		assertThat(TunnelBudget.derive(400 * mib)).isEqualTo(25 * mib);
 		// an overflow connection: its ClientHello and its head, each in a buffer of up to
@@ -406,8 +406,8 @@ class ConnectionLimitsTest {
 				ConnectionLimits.deriveBudget(409 * mib) + TunnelBudget.derive(409 * mib), 8);
 		assertThat(production).isEqualTo(409 * mib / 2 - 409 * mib / 16 - 409 * mib / 16 - 2 * mib);
 		assertThat(ConnectionLimits.deriveMaxConnections(production)).isEqualTo(529);
-		// of which h2 connections with one leg each: 151.4MiB / 3341KiB
-		assertThat(production / (ConnectionLimits.connectionBytes() + ConnectionLimits.h2RelayBytes())).isEqualTo(46);
+		// of which h2 connections with one leg each: 151.4MiB / 1421KiB
+		assertThat(production / (ConnectionLimits.connectionBytes() + ConnectionLimits.h2RelayBytes())).isEqualTo(109);
 		// (2048MiB - 256MiB - 256MiB - 2MiB) / 293KiB
 		assertThat(ConnectionLimits.deriveMaxConnections(ConnectionLimits.deriveMemory(4096 * mib, 512 * mib, 8)))
 			.isEqualTo(5361);
@@ -429,7 +429,7 @@ class ConnectionLimitsTest {
 			assertThat(reserving.memory()).isEqualTo(2 * connection + h2);
 			assertThat(reserving.max()).as("the connections reserving their virtual connection it holds")
 				.isEqualTo((int) ((2 * connection + h2) / connection))
-				.isEqualTo(12);
+				.isEqualTo(5);
 			assertThat(registry.get("sluice.data.connections.memory.bytes").gauge().value())
 				.isEqualTo(2 * connection + h2);
 			ConnectionLimits.Admission h2Connection = Objects.requireNonNull(reserving.admit(this.access));
@@ -546,7 +546,7 @@ class ConnectionLimitsTest {
 				.containsExactly(("data plane connection limit %d (derived: connection memory / 293KiB per "
 						+ "connection), connection memory %dKiB (derived: half of max heap %dMiB - h2 queue budget - "
 						+ "tunnel budget %dKiB - overflow 8 x 256KiB; a connection reserves 293KiB, an h2 connection "
-						+ "3048KiB more, a further upstream connection of it 1753KiB), overflow 8 answered 503 "
+						+ "1127KiB more, a further upstream connection of it 792KiB), overflow 8 answered 503 "
 						+ "within PT5S (Retry-After 5s), per address %d, head timeout PT10S, idle timeout PT1M, "
 						+ "stall timeout PT1M per 16384B, verbatim idle timeout off (unless a route sets one), h2 "
 						+ "queue budget 1024KiB (configured)")

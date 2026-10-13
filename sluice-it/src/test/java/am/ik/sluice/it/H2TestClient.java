@@ -59,6 +59,9 @@ public final class H2TestClient implements AutoCloseable {
 
 	private final AtomicLong connectionGranted = new AtomicLong();
 
+	/** The largest connection window the client held, as the relay granted it. */
+	private final AtomicLong maxConnectionWindow = new AtomicLong(INITIAL_WINDOW);
+
 	private final Map<Integer, AtomicLong> streamWindows = new ConcurrentHashMap<>();
 
 	/**
@@ -101,6 +104,11 @@ public final class H2TestClient implements AutoCloseable {
 	private final List<byte[]> pingAcks = new CopyOnWriteArrayList<>();
 
 	private final AtomicBoolean closed = new AtomicBoolean();
+
+	/**
+	 * The relay's PINGs go unanswered: its connection window for the client stays put.
+	 */
+	private volatile boolean ignoringPings;
 
 	/** The connection window the relay may still send into, as granted. */
 	private final AtomicLong receiveWindow = new AtomicLong(INITIAL_WINDOW);
@@ -210,7 +218,7 @@ public final class H2TestClient implements AutoCloseable {
 				int increment = TestH2.increment(frame);
 				if (streamId == 0) {
 					this.connectionGranted.addAndGet(increment);
-					this.connectionWindow.addAndGet(increment);
+					this.maxConnectionWindow.accumulateAndGet(this.connectionWindow.addAndGet(increment), Math::max);
 				}
 				else {
 					grantedOf(streamId).addAndGet(increment);
@@ -245,11 +253,36 @@ public final class H2TestClient implements AutoCloseable {
 				if ((frame.flags() & TestH2.FLAG_ACK) != 0) {
 					this.pingAcks.add(frame.payload());
 				}
+				else if (!this.ignoringPings) {
+					// acknowledged as RFC 9113 6.7 requires, off the reader: a write
+					// waiting for the relay to read must not stop this thread reading
+					ackPing(frame.payload());
+				}
 			}
 			default -> {
 				// not tracked
 			}
 		}
+	}
+
+	/**
+	 * Leaves the relay's PINGs unanswered from now on, against RFC 9113 6.7: the relay
+	 * measures no round trip of the client, so the connection window it grants the client
+	 * stays at RFC 9113's.
+	 */
+	public void ignorePings() {
+		this.ignoringPings = true;
+	}
+
+	private void ackPing(byte[] payload) {
+		Thread.ofVirtual().name("h2-test-client-ping-ack").start(() -> {
+			try {
+				frame(TestH2.PING, TestH2.FLAG_ACK, 0, payload);
+			}
+			catch (IOException e) {
+				// the connection ended
+			}
+		});
 	}
 
 	/** Charges the connection window and grants back as the policy says. */
@@ -531,6 +564,11 @@ public final class H2TestClient implements AutoCloseable {
 
 	public long connectionGranted() {
 		return this.connectionGranted.get();
+	}
+
+	/** The largest connection window the client held, as the relay granted it. */
+	public long maxConnectionWindow() {
+		return this.maxConnectionWindow.get();
 	}
 
 	public long streamGranted(int streamId) {

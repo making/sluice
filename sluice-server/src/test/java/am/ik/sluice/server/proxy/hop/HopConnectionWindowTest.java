@@ -26,9 +26,11 @@ import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException
  * netty's auto refill are held back -- the peer can spend no more than the connection
  * window it holds, though its stream windows are granted back -- and let go they reach
  * the peer as one WINDOW_UPDATE; a hop built with a larger connection window grants it
- * behind its preface, refills to it, and withheld holds the peer to it; a hop watching
- * its writes runs its action after the writer's batches; the loop's after-settle hook
- * runs after every action, again while it acts.
+ * behind its preface, refills to it, and withheld holds the peer to it; withheld from its
+ * start, it owes the larger window and grants what the bridging code grants of it, the
+ * peer's credit read as netty's window less what is owed; a hop watching its writes runs
+ * its action after the writer's batches; the loop's after-settle hook runs after every
+ * action, again while it acts.
  */
 @Tag("netty-hop")
 @ExtendWith(LeakCheck.class)
@@ -182,6 +184,57 @@ class HopConnectionWindowTest {
 			out.flush();
 			awaitTrue(() -> goAwayCode(updates) >= 0, () -> "updates=" + describe(updates) + " open=" + a.hop.open());
 			assertThat(goAwayCode(updates)).isEqualTo(Http2Error.FLOW_CONTROL_ERROR.code());
+			raw.close();
+			reader.join();
+		}
+	}
+
+	@Test
+	void aHopWithholdingFromItsStartGrantsItsWindowOnlyAsTheBridgingCodeGrantsIt() throws Exception {
+		Socket[] sockets = Endpoint.socketPair();
+		List<int[]> updates = new CopyOnWriteArrayList<>();
+		try (Socket raw = sockets[1];
+				Endpoint a = Endpoint.over("a", sockets[0],
+						builder -> builder.server(true)
+							.connectionWindow(LARGE_WINDOW)
+							.withholdConnectionWindow(true))) {
+			OutputStream out = raw.getOutputStream();
+			Thread reader = Thread.ofVirtual().start(() -> readWindowUpdates(raw, updates));
+			out.write(RawFrames.clientPreface());
+			out.write(RawFrames.frame(0x1, 0x4, 1, POST_HEAD));
+			out.flush();
+			awaitTrue(() -> a.loop.call(() -> a.hop.connection().numActiveStreams()) == 1, () -> "no stream");
+			settled(a.hop::bytesWritten);
+			assertThat(connectionUpdates(updates)).as("the larger window held back behind the preface").isEmpty();
+			assertThat(a.loop.call(a.hop::connectionCreditLocked)).as("RFC 9113's initial window").isEqualTo(WINDOW);
+			assertThat(a.loop.call(a.hop::owedConnectionWindowLocked)).isEqualTo(LARGE_WINDOW - WINDOW);
+
+			// a part of what is owed: one WINDOW_UPDATE of it
+			assertThat(a.loop.call(() -> a.hop.grantConnectionWindowLocked(2 * FRAME))).isEqualTo(2 * FRAME);
+			awaitTrue(() -> connectionUpdates(updates).size() == 1, () -> "updates=" + describe(updates));
+			assertThat(connectionUpdates(updates)).containsExactly(2 * FRAME);
+			assertThat(a.loop.call(a.hop::connectionCreditLocked)).isEqualTo(WINDOW + 2 * FRAME);
+			assertThat(a.loop.call(a.hop::owedConnectionWindowLocked)).isEqualTo(LARGE_WINDOW - WINDOW - 2 * FRAME);
+
+			// what the peer spends leaves its credit; below half of the larger window
+			// spent, the auto refill owes nothing more
+			for (int i = 0; i < 3; i++) {
+				out.write(RawFrames.frame(0x0, 0, 1, new byte[FRAME]));
+			}
+			out.flush();
+			awaitTrue(() -> a.loop.call(a.hop::connectionCreditLocked) == WINDOW - FRAME,
+					() -> "credit=" + a.loop.call(a.hop::connectionCreditLocked));
+			assertThat(connectionUpdates(updates)).as("nothing granted on its own").containsExactly(2 * FRAME);
+
+			// no more than what is owed
+			int owed = a.loop.call(a.hop::owedConnectionWindowLocked);
+			assertThat(owed).isEqualTo(LARGE_WINDOW - WINDOW - 2 * FRAME);
+			assertThat(a.loop.call(() -> a.hop.grantConnectionWindowLocked(Integer.MAX_VALUE))).isEqualTo(owed);
+			assertThat(a.loop.call(() -> a.hop.grantConnectionWindowLocked(1))).as("nothing left owed").isZero();
+			awaitTrue(() -> connectionUpdates(updates).size() == 2, () -> "updates=" + describe(updates));
+			assertThat(connectionUpdates(updates)).containsExactly(2 * FRAME, owed);
+			assertThat(a.loop.call(a.hop::connectionCreditLocked)).isEqualTo(LARGE_WINDOW - 3 * FRAME);
+			assertThat(a.sink.failures()).isEmpty();
 			raw.close();
 			reader.join();
 		}

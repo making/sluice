@@ -43,9 +43,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * body in a few round trips of the relay's windows. Each sender counts the times it ran
  * out of window and waited for a grant; with the hop's round trip far above the time it
  * takes to send a window, that is one per round trip. The windows' grants are each at
- * least half a window (netty's update ratio), stream and connection ones, so a body moves
- * in at most four waits per window of it, plus the grant raising the connection window; a
- * 64KiB window could not move it in fewer than one round trip per 64KiB.
+ * least half a window (netty's update ratio for the stream windows, the relay's refill
+ * for the connection windows), so a body moves in at most four waits per window of it,
+ * plus two per doubling of the connection window from RFC 9113's 65535 bytes, each
+ * doubling taking a round trip of the PING measuring the sender's; a 64KiB window could
+ * not move it in fewer than one round trip per 64KiB.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -55,8 +57,12 @@ class H2DemuxWindowRoundTripE2ETest {
 
 	private static final int BODY = 4 * MIB;
 
-	/** What the relay's windows allow: four grants per window of the body, plus one. */
-	private static final long MAX_WAITS = 4L * BODY / NettyHttp2DemuxRelay.STREAM_WINDOW + 1;
+	/**
+	 * What the relay's windows allow: four grants per window of the body, plus one, plus
+	 * two per doubling of the connection window from the floor.
+	 */
+	private static final long MAX_WAITS = 4L * BODY / NettyHttp2DemuxRelay.STREAM_WINDOW + 1
+			+ 2L * Integer.numberOfTrailingZeros(NettyHttp2DemuxRelay.CONNECTION_WINDOW / (HopWindow.FLOOR + 1));
 
 	/**
 	 * What the leg's virtual connection allows: a few waits per full window of the body,
@@ -149,6 +155,9 @@ class H2DemuxWindowRoundTripE2ETest {
 			assertThat(peer.sendInitialWindow()).as("the stream window the leg announced")
 				.isEqualTo(NettyHttp2DemuxRelay.STREAM_WINDOW);
 			assertThat(tunnel.relayed()).as("the tunnel went through the delay").isGreaterThan(BODY);
+			// past half the largest window: only a window grown to it grants that much
+			assertThat(peer.maxSendConnectionWindow()).as("the leg's connection window grown to its largest")
+				.isGreaterThan(NettyHttp2DemuxRelay.CONNECTION_WINDOW / 2);
 			assertThat(peer.windowWaits()).as("round trips of a %dMiB download in %s", BODY / MIB, took)
 				.isPositive()
 				.isLessThanOrEqualTo(MAX_WAITS)
@@ -205,6 +214,8 @@ class H2DemuxWindowRoundTripE2ETest {
 			assertThat(client.setting(SETTINGS_INITIAL_WINDOW_SIZE)).as("the stream window the relay announced")
 				.isEqualTo(NettyHttp2DemuxRelay.STREAM_WINDOW);
 			assertThat(link.relayed()).as("the client went through the delay").isGreaterThan(BODY);
+			assertThat(client.maxConnectionWindow()).as("the client's connection window grown to its largest")
+				.isGreaterThan(NettyHttp2DemuxRelay.CONNECTION_WINDOW / 2);
 			assertThat(client.windowWaits()).as("round trips of a %dMiB upload in %s", BODY / MIB, took)
 				.isPositive()
 				.isLessThanOrEqualTo(MAX_WAITS)

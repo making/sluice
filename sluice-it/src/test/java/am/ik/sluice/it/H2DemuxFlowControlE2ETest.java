@@ -58,17 +58,23 @@ class H2DemuxFlowControlE2ETest {
 	private static final int MAX_CONCURRENT_STREAMS = 100;
 
 	/**
-	 * The stream window the relay announces on both of its faces, and the connection
-	 * window it grants on both: {@code NettyHttp2DemuxRelay.STREAM_WINDOW} and
+	 * The stream window the relay announces on both of its faces, and the largest
+	 * connection window it grants on both: {@code NettyHttp2DemuxRelay.STREAM_WINDOW} and
 	 * {@code CONNECTION_WINDOW}.
 	 */
 	private static final int NETTY_STREAM_WINDOW = 1024 * 1024;
 
-	/** The connection window the relay grants on both faces. */
+	/** The largest connection window the relay grants on both faces. */
 	private static final int NETTY_CONNECTION_WINDOW = 1024 * 1024;
 
-	/** What the relay grants its client's connection window behind its preface. */
-	private static final int CONNECTION_WINDOW_RAISE = NETTY_CONNECTION_WINDOW - H2TestClient.INITIAL_WINDOW;
+	/**
+	 * The connection window a hop's peer starts with, RFC 9113's, uncharged:
+	 * {@code HopWindow.FLOOR}.
+	 */
+	private static final int NETTY_FLOOR = 65535;
+
+	/** The window a hop's peer grows to first, from the floor: 128KiB. */
+	private static final int NETTY_FIRST_GROWTH = 128 * 1024;
 
 	/** The backlog rounding of a stream's buffer, less than one granule. */
 	private static final int GRANULE = 1024;
@@ -84,11 +90,11 @@ class H2DemuxFlowControlE2ETest {
 	private static final long NETTY_SHARE_BYTES = 128 * 1024 + 2L * NETTY_CONNECTION_WINDOW;
 
 	/**
-	 * What a client still sends once its connection window is withheld: the read under
-	 * way, the connection window, a granule of rounding per stream;
-	 * {@code NettyHttp2DemuxRelay.WITHHELD_ARRIVALS}.
+	 * What a client still sends uncharged once it is granted no more connection window:
+	 * the read under way, the floor (its window past it was charged), a granule of
+	 * rounding per stream; {@code NettyHttp2DemuxRelay.WITHHELD_ARRIVALS}.
 	 */
-	private static final long NETTY_WITHHELD_ARRIVALS = 16 * 1024 + NETTY_CONNECTION_WINDOW
+	private static final long NETTY_WITHHELD_ARRIVALS = 16 * 1024 + NETTY_FLOOR
 			+ MAX_CONCURRENT_STREAMS * (long) GRANULE;
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
@@ -294,9 +300,12 @@ class H2DemuxFlowControlE2ETest {
 	/**
 	 * Padding counts against both windows (RFC 9113 6.9.1): the relay releases the whole
 	 * frames at connection level, gives the padding back at stream level since it never
-	 * queues it, and relays the payload unpadded. Just past half of the window, so
-	 * netty's auto refill grants the connection window once, exactly what was spent, and
-	 * the stream window once half of it was written or padding.
+	 * queues it, and relays the payload unpadded. First just past half of RFC 9113's
+	 * connection window, so the relay refills the connection window once, to its target
+	 * -- the floor, or its first growth if the PING measuring the client saw that much
+	 * sent in its round trip --; then on, within the connection windows granted, past
+	 * half of the stream window, which netty grants back once half of it was written or
+	 * padding.
 	 */
 	@Test
 	void paddedDataIsReleasedInFullAndRelayedUnpadded() throws Exception {
@@ -309,7 +318,7 @@ class H2DemuxFlowControlE2ETest {
 			int padding = 200;
 			byte[] payload = new byte[1 + data + padding];
 			// the last frame takes the spent bytes past half of the window
-			int frames = NETTY_CONNECTION_WINDOW / 2 / payload.length + 1;
+			int frames = NETTY_FLOOR / 2 / payload.length + 1;
 			// the relay's stream window applies once it read the ack of its SETTINGS,
 			// which goes before the PING
 			assertThat(client.awaitSettings(Duration.ofSeconds(5))).isTrue();
@@ -321,58 +330,70 @@ class H2DemuxFlowControlE2ETest {
 				client.sendData(1, payload, TestH2.FLAG_PADDED);
 			}
 			long spent = (long) frames * payload.length;
-			assertThat(spent).as("past half of the window").isGreaterThan(NETTY_CONNECTION_WINDOW / 2);
-			assertThat(client.awaitTrue(() -> client.connectionGranted() >= CONNECTION_WINDOW_RAISE + spent,
-					Duration.ofSeconds(5)))
+			assertThat(spent).as("past half of the window").isGreaterThan(NETTY_FLOOR / 2);
+			assertThat(client.awaitTrue(() -> client.connectionGranted() >= spent, Duration.ofSeconds(5)))
 				.as("connection grant %d", client.connectionGranted())
 				.isTrue();
-			Awaitility.await()
-				.atMost(Duration.ofSeconds(5))
-				.untilAsserted(() -> assertThat(upstreamData.stream().mapToInt(frame -> frame.payload().length).sum())
-					.as("relayed payload")
-					.isEqualTo(frames * data));
+			awaitRelayed(upstreamData, (long) frames * data);
+			Thread.sleep(200); // a surplus grant would follow the exact one
+			// refilled to the target exactly: the padding counted as spent
+			assertThat(client.connectionWindow()).as("the window refilled, granted %d", client.connectionGranted())
+				.isIn((long) NETTY_FLOOR, (long) NETTY_FIRST_GROWTH);
+
+			int sent = frames;
+			while ((long) sent * payload.length <= NETTY_STREAM_WINDOW / 2) {
+				assertThat(client.awaitTrue(() -> client.connectionWindow() >= payload.length, Duration.ofSeconds(5)))
+					.as("connection window for frame %d", sent)
+					.isTrue();
+				client.sendData(1, payload, TestH2.FLAG_PADDED);
+				sent++;
+			}
+			long streamSpent = (long) sent * payload.length;
+			awaitRelayed(upstreamData, (long) sent * data);
 			assertThat(upstreamData).as("relayed unpadded")
 				.allSatisfy(frame -> assertThat(frame.flags() & TestH2.FLAG_PADDED).isZero());
 			assertThat(client.awaitTrue(() -> client.streamGranted(1) > NETTY_STREAM_WINDOW / 2, Duration.ofSeconds(5)))
 				.as("stream grant %d", client.streamGranted(1))
 				.isTrue();
 			Thread.sleep(200); // a surplus grant would follow the exact one
-			assertThat(client.connectionGranted()).isEqualTo(CONNECTION_WINDOW_RAISE + spent);
-			assertThat(client.streamGranted(1)).isLessThanOrEqualTo(spent);
+			assertThat(client.streamGranted(1)).isLessThanOrEqualTo(streamSpent);
 		}
+	}
+
+	private static void awaitRelayed(List<TestH2.Frame> upstreamData, long payload) {
+		Awaitility.await()
+			.atMost(Duration.ofSeconds(5))
+			.untilAsserted(() -> assertThat(upstreamData.stream().mapToLong(frame -> frame.payload().length).sum())
+				.as("relayed payload")
+				.isEqualTo(payload));
 	}
 
 	/**
 	 * The upstream's connection window is released for the DATA payload relayed to the
 	 * client, not for frame headers or other frames: an over-grant accumulates until the
-	 * upstream's window passes 2^31-1, a connection error. Past half of the window, so
-	 * netty's auto refill grants: once, what was written to the client when half of the
-	 * window was spent, never more than the DATA.
+	 * upstream's window passes 2^31-1, a connection error. Past half of RFC 9113's window
+	 * the upstream starts with, so the relay refills it once, what was spent when half of
+	 * it was, never more than the DATA (the upstream answers no PING: its window does not
+	 * grow).
 	 */
 	@Test
 	void upstreamConnectionWindowIsReleasedForDataOnly() throws Exception {
 		String route = "fc.grant.test";
 		AtomicLong granted = new AtomicLong();
-		// frames of odd sizes, just past half of the window
-		int[] pattern = { 10000, 16000, 14000, 7 };
-		int[] chunks = new int[14 * pattern.length];
-		for (int i = 0; i < chunks.length; i++) {
-			chunks[i] = pattern[i % pattern.length];
-		}
+		// frames of odd sizes, just past half of the window, within it
+		int[] chunks = { 10000, 16000, 14000, 7 };
 		long data = java.util.Arrays.stream(chunks).asLongStream().sum();
-		long half = (NETTY_CONNECTION_WINDOW + 1) / 2;
-		assertThat(data).as("past half of the window").isGreaterThanOrEqualTo(half);
+		long half = (NETTY_FLOOR + 1) / 2;
+		assertThat(data).as("past half of the window").isGreaterThanOrEqualTo(half).isLessThanOrEqualTo(NETTY_FLOOR);
 		startClient(route, stub(socket -> respondCountingGrants(socket, chunks, granted)));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
 			client.frame(TestH2.SETTINGS, 0, 0, settingInitialWindow(NETTY_STREAM_WINDOW));
 			client.headers(1, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/"));
 			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
-			// the raise behind the preface, then the auto refill's grant
-			Awaitility.await()
-				.atMost(Duration.ofSeconds(5))
-				.until(() -> granted.get() >= CONNECTION_WINDOW_RAISE + half);
+			// the refill
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> granted.get() >= half);
 			Thread.sleep(300); // a surplus grant would follow the exact one
-			assertThat(granted.get() - CONNECTION_WINDOW_RAISE).isBetween(half, data);
+			assertThat(granted.get()).isBetween(half, data);
 		}
 	}
 

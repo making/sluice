@@ -590,11 +590,9 @@ class H2DemuxClientFrameValidationE2ETest {
 				frames.add(frame);
 			}
 		}
-		assertThat(frames).extracting(TestH2.Frame::type)
-			.containsExactly(TestH2.SETTINGS, TestH2.WINDOW_UPDATE, TestH2.GOAWAY);
-		assertThat(frames.get(1).streamId()).isZero();
-		assertThat(TestH2.increment(frames.get(1))).isEqualTo(NettyHttp2DemuxRelay.CONNECTION_WINDOW - 65535);
-		TestH2.Frame goAway = frames.get(2);
+		// RFC 9113's connection window: no WINDOW_UPDATE behind the preface
+		assertThat(frames).extracting(TestH2.Frame::type).containsExactly(TestH2.SETTINGS, TestH2.GOAWAY);
+		TestH2.Frame goAway = frames.get(1);
 		assertThat(TestH2.errorCode(goAway)).isEqualTo(PROTOCOL_ERROR);
 		assertThat(TestH2.increment(goAway)).as("last stream id").isEqualTo(Integer.MAX_VALUE);
 		awaitReleased(ROUTE);

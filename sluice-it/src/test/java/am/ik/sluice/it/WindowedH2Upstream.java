@@ -68,6 +68,11 @@ public final class WindowedH2Upstream implements AutoCloseable {
 
 	private long connectionGrantsReceived;
 
+	private long maxSendConnectionWindow = DEFAULT_WINDOW;
+
+	/** The relay's PINGs go unanswered. */
+	private volatile boolean ignoringPings;
+
 	private final Map<Integer, Long> sendStreamWindows = new HashMap<>();
 
 	private boolean eof;
@@ -135,6 +140,7 @@ public final class WindowedH2Upstream implements AutoCloseable {
 			frame = null;
 		}
 		boolean ack = false;
+		boolean pingAck = false;
 		synchronized (this) {
 			if (frame == null) {
 				this.eof = true;
@@ -149,6 +155,7 @@ public final class WindowedH2Upstream implements AutoCloseable {
 				}
 				case TestH2.DATA -> onData(streamId, frame.payload().length);
 				case TestH2.RST_STREAM -> this.resetStreams.add(streamId);
+				case TestH2.PING -> pingAck = (frame.flags() & TestH2.FLAG_ACK) == 0 && !this.ignoringPings;
 				case TestH2.SETTINGS -> {
 					if ((frame.flags() & TestH2.FLAG_ACK) != 0) {
 						onSettingsAck();
@@ -163,6 +170,8 @@ public final class WindowedH2Upstream implements AutoCloseable {
 					if (streamId == 0) {
 						this.sendConnectionWindow += increment;
 						this.connectionGrantsReceived += increment;
+						this.maxSendConnectionWindow = Math.max(this.maxSendConnectionWindow,
+								this.sendConnectionWindow);
 					}
 					else {
 						this.sendStreamWindows.merge(streamId, this.sendInitialWindow + increment,
@@ -174,6 +183,10 @@ public final class WindowedH2Upstream implements AutoCloseable {
 				}
 			}
 			notifyAll();
+		}
+		if (pingAck) {
+			// RFC 9113 6.7: every PING is acknowledged with its payload
+			write(TestH2.PING, TestH2.FLAG_ACK, 0, frame.payload());
 		}
 		if (ack) {
 			synchronized (this.writeLock) {
@@ -423,6 +436,20 @@ public final class WindowedH2Upstream implements AutoCloseable {
 	/** The connection-level grants the relay sent for this upstream's DATA. */
 	public synchronized long connectionGrantsReceived() {
 		return this.connectionGrantsReceived;
+	}
+
+	/**
+	 * Leaves the relay's PINGs unanswered from now on, against RFC 9113 6.7: the relay
+	 * measures no round trip of the upstream, so the connection window it grants the
+	 * upstream stays at RFC 9113's.
+	 */
+	public void ignorePings() {
+		this.ignoringPings = true;
+	}
+
+	/** The largest connection window the relay granted this upstream to send into. */
+	public synchronized long maxSendConnectionWindow() {
+		return this.maxSendConnectionWindow;
 	}
 
 	/** Closes the connection with a TCP reset (SO_LINGER 0). */

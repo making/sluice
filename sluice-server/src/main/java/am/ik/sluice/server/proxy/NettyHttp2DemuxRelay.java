@@ -81,34 +81,42 @@ import io.netty.util.AsciiString;
  * are per hop: DATA read on one hop is written on the other ({@link Flow}: a copy, small
  * frames coalesced) and consumed -- its stream window granted back -- once written, so
  * what the relay holds per stream and direction stays within the stream window it
- * announced ({@link #STREAM_WINDOW}); the connection windows ({@link #CONNECTION_WINDOW})
- * refill as DATA arrives (netty's auto refill), so a stream held by its upstream or its
- * client holds back no other stream. Resets pass either way with their code; an
+ * announced ({@link #STREAM_WINDOW}); the connection windows refill as DATA arrives, not
+ * as it is written, so a stream held by its upstream or its client holds back no other
+ * stream. Each hop's connection window starts at RFC 9113's 65535 bytes and grows with
+ * what its peer sends per round trip up to {@link #CONNECTION_WINDOW}
+ * ({@link HopWindow}): the hop holds back netty's connection-level WINDOW_UPDATEs and the
+ * review grants them ({@link #grantLocked}). Resets pass either way with their code; an
  * upstream's reset after the response's end follows that end to the client. A stream the
  * client ends without its request's end resets its upstream stream with {@code CANCEL};
  * one an early response closed for the client still delivers the request's rest.
  * <p>
  * What the relay holds -- DATA and header blocks not yet written, both ways, and every
- * hop's writer queue -- is accounted after each action of its loop: the part past
- * {@link #CONNECTION_ALLOWANCE}, its share, is charged to the {@link H2DemuxBudget} every
- * relay shares. Past the allowance with the budget exhausted, or with its share at
- * {@link #CONNECTION_SHARE}, the relay withholds the connection window of every hop (each
- * peer stops once the window it holds is spent) and refuses the most recent waiting
- * streams past the allowance ({@link #refuseWaitingLocked}), until its hops drained below
- * the allowance, or below the share with the budget's room back. A header block that does
- * not fit -- one the budget has no room for, or taking the share past
- * {@link #BLOCK_SHARE} -- refuses its new stream ({@code REFUSED_STREAM}), or resets its
- * stream when a later block -- the client's trailers, the upstream's interim (1xx) heads,
- * final head and trailers, these once what heads for the client passed the client hop's
- * read pause ({@link #admitResponseBlockLocked}) -- ({@code ENHANCE_YOUR_CALM} to the
- * client, {@code CANCEL} to the upstream). A header block is admitted at its size as
- * HPACK counts it ({@link #headerBytes}), whatever it took on the wire: one referring to
- * the peer's dynamic table, a few bytes read, is admitted at about what the relay writes
- * for it. The interim heads of one response may sum to {@link #MAX_INTERIM_BYTES}: the
- * one past it is not written, the upstream's stream is reset ({@code ENHANCE_YOUR_CALM})
- * and the stream is lost for the client (the bad-gateway page). The bounds outside the
- * budget: {@link #UNBUDGETED_BYTES} per connection, {@link #RESPONSE_QUEUE_BYTES} per
- * leg.
+ * hop's writer queue -- and the connection window its peers hold -- what they may still
+ * send -- are accounted after each action of its loop: the part of the former past
+ * {@link #CONNECTION_ALLOWANCE} plus the part of the latter past RFC 9113's window per
+ * hop, its share, is charged to the {@link H2DemuxBudget} every relay shares. A grant
+ * raising a peer's window past RFC 9113's is charged before it leaves, within the
+ * budget's room and below {@link #CONNECTION_SHARE} ({@link #chargeCreditLocked}): what a
+ * peer sends was charged before it could arrive, but for RFC 9113's window. A grant the
+ * charge does not take leaves the peer at a smaller window, at worst RFC 9113's. Past the
+ * allowance with the budget exhausted, or with its share at {@link #CONNECTION_SHARE},
+ * the relay grants no connection window at all (each peer stops once the window it holds
+ * is spent) and refuses the most recent waiting streams past the allowance
+ * ({@link #refuseWaitingLocked}), until its hops drained below the allowance, or below
+ * the share with the budget's room back. A header block that does not fit -- one the
+ * budget has no room for, or taking the share past {@link #BLOCK_SHARE} -- refuses its
+ * new stream ({@code REFUSED_STREAM}), or resets its stream when a later block -- the
+ * client's trailers, the upstream's interim (1xx) heads, final head and trailers, these
+ * once what heads for the client passed the client hop's read pause
+ * ({@link #admitResponseBlockLocked}) -- ({@code ENHANCE_YOUR_CALM} to the client,
+ * {@code CANCEL} to the upstream). A header block is admitted at its size as HPACK counts
+ * it ({@link #headerBytes}), whatever it took on the wire: one referring to the peer's
+ * dynamic table, a few bytes read, is admitted at about what the relay writes for it. The
+ * interim heads of one response may sum to {@link #MAX_INTERIM_BYTES}: the one past it is
+ * not written, the upstream's stream is reset ({@code ENHANCE_YOUR_CALM}) and the stream
+ * is lost for the client (the bad-gateway page). The bounds outside the budget:
+ * {@link #UNBUDGETED_BYTES} per connection, {@link #RESPONSE_QUEUE_BYTES} per leg.
  * <p>
  * An upstream's failure ends no more than it covers. netty's codec answers the upstream's
  * protocol errors itself: a stream error resets that stream towards the upstream, a
@@ -195,11 +203,11 @@ final class NettyHttp2DemuxRelay {
 	static final int STREAM_WINDOW = VirtualConnection.DEFAULT_WINDOW;
 
 	/**
-	 * The connection window the relay grants on both faces, refilled as DATA arrives: the
-	 * most a connection's streams together move per round trip of the hop, the same bound
-	 * as one stream's ({@link #STREAM_WINDOW}) for the same reason. It bounds no memory
-	 * while granted; withheld, it is what a peer can still send
-	 * ({@link #WITHHELD_ARRIVALS}).
+	 * The largest connection window the relay grants on both faces, refilled as DATA
+	 * arrives: the most a connection's streams together move per round trip of the hop,
+	 * the same bound as one stream's ({@link #STREAM_WINDOW}) for the same reason. A
+	 * hop's window grows to it from RFC 9113's as its peer sends ({@link HopWindow}), the
+	 * part past RFC 9113's charged to the budget.
 	 */
 	static final int CONNECTION_WINDOW = VirtualConnection.DEFAULT_WINDOW;
 
@@ -211,20 +219,22 @@ final class NettyHttp2DemuxRelay {
 	static final int CONNECTION_ALLOWANCE = 128 * 1024;
 
 	/**
-	 * The most of the shared budget one relay takes before it withholds its hops'
-	 * connection windows though the budget has room: one connection window each way, so
-	 * no connection holds the budget the others share. Once the windows are withheld, its
-	 * peers can still send what windows they hold ({@link #WITHHELD_ARRIVALS} each).
+	 * The most of the shared budget one relay takes -- what it queues past its allowance
+	 * and the window its peers hold past RFC 9113's -- before it grants its hops no more
+	 * connection window though the budget has room: one connection window each way, so no
+	 * connection holds the budget the others share. A grant takes the share no further
+	 * than below it. Once nothing is granted, its peers can still send what windows they
+	 * hold, charged but for RFC 9113's ({@link #WITHHELD_ARRIVALS} each).
 	 */
 	static final long CONNECTION_SHARE = 2L * CONNECTION_WINDOW;
 
 	/**
 	 * The most of the shared budget one relay takes for a header block -- a new stream's
 	 * head, trailers, an upstream's head past the client hop's read pause --: twice its
-	 * {@link #CONNECTION_SHARE}, which a relay whose windows are withheld passes by what
-	 * one of its peers still sends, so a client reading slower than its upstream sends
-	 * still gets its new streams relayed. Bounds what header blocks held for a peer that
-	 * does not read take beyond the share.
+	 * {@link #CONNECTION_SHARE}, which a relay granting nothing passes by what its peers
+	 * still send uncharged, so a client reading slower than its upstream sends still gets
+	 * its new streams relayed. Bounds what header blocks held for a peer that does not
+	 * read take beyond the share.
 	 */
 	static final long BLOCK_SHARE = 2 * CONNECTION_SHARE;
 
@@ -239,29 +249,29 @@ final class NettyHttp2DemuxRelay {
 	static final long HOP_QUEUE_BYTES = Hop.DEFAULT_READ_PAUSE_BYTES + 64 * 1024;
 
 	/**
-	 * What a peer can still make the relay hold once the relay decided to withhold its
-	 * connection window: the read under way when the budget ran out (the decision follows
-	 * each read), then the connection window the peer holds -- at most
-	 * {@link #CONNECTION_WINDOW}: netty's auto refill grants it back to that size, never
-	 * more --, copied into the streams' backlogs, which round up by less than one
-	 * {@link PendingPayload#GRANULE} each.
+	 * What a peer can still make the relay hold uncharged once the relay grants it
+	 * nothing more: the read under way when the budget ran out (the decision follows each
+	 * read), then the connection window the peer holds up to RFC 9113's -- what it holds
+	 * past that was charged when granted ({@link HopWindow#charged}) --, copied into the
+	 * streams' backlogs, which round up by less than one {@link PendingPayload#GRANULE}
+	 * each.
 	 */
-	static final long WITHHELD_ARRIVALS = Hop.MAX_READ_BYTES + CONNECTION_WINDOW
+	static final long WITHHELD_ARRIVALS = Hop.MAX_READ_BYTES + HopWindow.FLOOR
 			+ (long) MAX_CONCURRENT_STREAMS * PendingPayload.GRANULE;
 
 	/**
 	 * The most one relay queues outside the shared budget: its allowance, what the client
-	 * can still send once its connection window is withheld, and the client hop's writer
-	 * queue -- what netty answers the client and the responses written but not yet sent.
-	 * The responses' DATA reaches the queue within its writability; their header blocks
-	 * within the hop's read pause, past it only within the allowance and the budget
-	 * ({@link #admitResponseBlockLocked}).
+	 * can still send uncharged once it is granted nothing more, and the client hop's
+	 * writer queue -- what netty answers the client and the responses written but not yet
+	 * sent. The responses' DATA reaches the queue within its writability; their header
+	 * blocks within the hop's read pause, past it only within the allowance and the
+	 * budget ({@link #admitResponseBlockLocked}).
 	 */
 	static final long UNBUDGETED_BYTES = CONNECTION_ALLOWANCE + WITHHELD_ARRIVALS + HOP_QUEUE_BYTES;
 
 	/**
 	 * The most one leg adds outside the shared budget: what its upstream can still send
-	 * once the leg's connection window is withheld, and the leg hop's writer queue.
+	 * uncharged once it is granted nothing more, and the leg hop's writer queue.
 	 */
 	static final long RESPONSE_QUEUE_BYTES = WITHHELD_ARRIVALS + HOP_QUEUE_BYTES;
 
@@ -280,6 +290,9 @@ final class NettyHttp2DemuxRelay {
 
 	/** The payload of the PINGs probing a half-closed client: "sluice-p". */
 	private static final long PROBE_PAYLOAD = 0x736c756963652d70L;
+
+	/** The payload of the PINGs measuring a peer's round trip: "sluice-b". */
+	private static final long ROUND_TRIP_PAYLOAD = 0x736c756963652d62L;
 
 	private final DuplexPipe pipe;
 
@@ -362,11 +375,23 @@ final class NettyHttp2DemuxRelay {
 	 */
 	private long pooled;
 
-	/** The hops' connection windows are withheld; with the loop's lock. */
+	/** No connection window is granted on any hop; with the loop's lock. */
 	private boolean withheld;
 
 	/** The bytes the relay queued at the last review; with the loop's lock. */
 	private long queued;
+
+	/** The connection window its peers held at the last review; with the loop's lock. */
+	private long credit;
+
+	/**
+	 * The part of {@link #credit} past the floors, charged to the budget with the bytes
+	 * queued past the allowance ({@link #pooled}); with the loop's lock.
+	 */
+	private long chargedCredit;
+
+	/** The connection window granted the client; with the loop's lock. */
+	private final HopWindow clientWindow = new HopWindow(CONNECTION_WINDOW);
 
 	/** The accounts are closed: the relay finished; with the loop's lock. */
 	private boolean accountsClosed;
@@ -460,6 +485,8 @@ final class NettyHttp2DemuxRelay {
 					// each reset the client has not read yet is of a stream it still
 					// counts against the concurrency limit
 					.rememberedResets(MAX_CONCURRENT_STREAMS)
+					// granted as the review charges it
+					.withholdConnectionWindow(true)
 					.connectionWindow(CONNECTION_WINDOW)
 					.onInactive(this::clientClosedLocked)
 					.onEof(this::clientEndedLocked)
@@ -814,13 +841,14 @@ final class NettyHttp2DemuxRelay {
 				})
 				// a leg's streams relay the client's
 				.rememberedResets(MAX_CONCURRENT_STREAMS)
+				// granted as the review charges it
+				.withholdConnectionWindow(true)
 				.connectionWindow(CONNECTION_WINDOW)
 				.onInactive(() -> this.legs.remove(route, opening))
 				.onWritten(NettyHttp2DemuxRelay::reviewed)
 				.traffic(traffic(route, session))
 				.build();
 			opening.hop = hop;
-			hop.withholdConnectionWindowLocked(this.withheld);
 			hop.watchWrites(watchingWrites());
 			hop.addConnectionListener(new LegStreams(opening));
 			this.legSeam.built(hop);
@@ -1210,6 +1238,18 @@ final class NettyHttp2DemuxRelay {
 		return !this.resetsNotByCodec.remove(stream) && stream.isResetSent();
 	}
 
+	/**
+	 * Counts DATA read from the hop's peer in its window, and sends the peer the PING
+	 * measuring its round trip when the window wants one ({@link HopWindow#wantsPing}).
+	 * With the loop's lock.
+	 */
+	private static void measureLocked(Hop hop, HopWindow window, int bytes) {
+		if (window.wantsPing(bytes) && hop.open()) {
+			hop.encoder().writePing(hop.ctx(), false, ROUND_TRIP_PAYLOAD, hop.ctx().newPromise());
+			window.pinged();
+		}
+	}
+
 	/** Returns DATA to the reading hop's window once the other hop wrote it. */
 	private static void consume(Hop hop, int streamId, int bytes) {
 		Http2Stream stream = hop.connection().stream(streamId);
@@ -1243,7 +1283,7 @@ final class NettyHttp2DemuxRelay {
 	 * when admitted; with the loop's lock.
 	 */
 	private @Nullable Shortfall admitLocked(long bytes) {
-		long share = Math.max(0, queuedLocked() + bytes - CONNECTION_ALLOWANCE);
+		long share = Math.max(0, queuedLocked() + bytes - CONNECTION_ALLOWANCE) + this.chargedCredit;
 		long change = share - this.pooled;
 		if (change <= 0) {
 			return null;
@@ -1298,16 +1338,16 @@ final class NettyHttp2DemuxRelay {
 	}
 
 	/**
-	 * Reviews the accounts once the channels settled (the loop's hook): the share of the
-	 * queued bytes beyond the allowance is charged to the budget or released; past the
-	 * allowance with the budget exhausted, or with the share at
-	 * {@link #CONNECTION_SHARE}, every hop's connection window is withheld -- the peers
-	 * stop sending DATA once the windows they hold are spent -- and the waiting streams
-	 * past the allowance are refused ({@link #refuseWaitingLocked}); within the allowance
-	 * again, or below the share with the budget's room back, the windows withheld are
-	 * granted. Only a relay held back by the budget waits for its room; one held back by
-	 * its share is reviewed again as its own hops drain. Whether it wrote anything; with
-	 * the loop's lock.
+	 * Reviews the accounts once the channels settled (the loop's hook): the share -- the
+	 * queued bytes beyond the allowance and the open hops' peers' connection window past
+	 * RFC 9113's -- is charged to the budget or released; past the allowance with the
+	 * budget exhausted, or with the share at {@link #CONNECTION_SHARE}, no hop's
+	 * connection window is granted -- the peers stop sending DATA once the windows they
+	 * hold are spent -- and the waiting streams past the allowance are refused
+	 * ({@link #refuseWaitingLocked}); otherwise each hop is granted what its window
+	 * decides ({@link #grantLocked}). Only a relay held back by the budget waits for its
+	 * room; one held back by its share is reviewed again as its own hops drain. Whether
+	 * it wrote anything; with the loop's lock.
 	 */
 	private boolean reviewLocked() {
 		if (this.accountsClosed || this.client == null) {
@@ -1320,7 +1360,10 @@ final class NettyHttp2DemuxRelay {
 		long queued = queuedLocked();
 		this.meters.held(queued - this.queued);
 		this.queued = queued;
-		settleShareLocked(queued);
+		long credit = creditLocked();
+		this.meters.credit(credit - this.credit);
+		this.credit = credit;
+		settleShareLocked(queued, chargedCreditLocked());
 		boolean wrote = false;
 		boolean exhausted = queued > CONNECTION_ALLOWANCE && !this.budget.hasRoom();
 		if (exhausted || this.pooled >= CONNECTION_SHARE) {
@@ -1332,7 +1375,6 @@ final class NettyHttp2DemuxRelay {
 				else {
 					this.meters.windowWithheldForShare();
 				}
-				wrote |= withholdLocked(true);
 			}
 			if (exhausted) {
 				this.budget.awaitRoom(this.budgetRoom);
@@ -1343,14 +1385,83 @@ final class NettyHttp2DemuxRelay {
 			}
 			wrote |= refuseWaitingLocked();
 		}
-		else if (this.withheld) {
-			this.withheld = false;
-			this.budget.cancel(this.budgetRoom);
-			wrote |= withholdLocked(false);
+		else {
+			if (this.withheld) {
+				this.withheld = false;
+				this.budget.cancel(this.budgetRoom);
+			}
+			wrote |= grantLocked(client(), this.clientWindow, queued);
+			for (Leg leg : this.opened) {
+				wrote |= grantLocked(leg.hop(), leg.window, queued);
+			}
 		}
 		watchWritesLocked(watchingWrites());
 		wrote |= reviewDeadlineLocked();
 		return wrote;
+	}
+
+	/**
+	 * Grants the hop's peer what its window decides ({@link HopWindow#grant}), the part
+	 * of its credit past the floor charged first ({@link #chargeCreditLocked}); whether
+	 * it wrote. With the loop's lock.
+	 */
+	private boolean grantLocked(Hop hop, HopWindow window, long queued) {
+		if (!hop.open()) {
+			return false;
+		}
+		HopWindow.Grant grant = window.grant(hop.connectionCreditLocked(), hop.owedConnectionWindowLocked(),
+				cost -> chargeCreditLocked(queued, cost));
+		if (grant.declined()) {
+			this.meters.windowDeclined();
+		}
+		return grant.bytes() > 0 && hop.grantConnectionWindowLocked(grant.bytes()) > 0;
+	}
+
+	/**
+	 * Charges {@code cost} more credit past the floors if the share it makes stays below
+	 * {@link #CONNECTION_SHARE} -- credit alone never makes the review withhold the
+	 * windows, which would keep a peer at the floor from its refill while the others sit
+	 * on theirs -- and the budget has room for it; whether it did. With the loop's lock.
+	 */
+	private boolean chargeCreditLocked(long queued, long cost) {
+		long share = Math.max(0, queued - CONNECTION_ALLOWANCE) + this.chargedCredit + cost;
+		long change = share - this.pooled;
+		if (change > 0) {
+			if (share >= CONNECTION_SHARE || !this.budget.tryCharge(change)) {
+				return false;
+			}
+			this.pooled = share;
+		}
+		this.chargedCredit += cost;
+		return true;
+	}
+
+	/**
+	 * The part of the credit the peers of the open hops hold past the floors
+	 * ({@link HopWindow#charged}); with the loop's lock.
+	 */
+	private long chargedCreditLocked() {
+		Hop client = client();
+		long charged = client.open() ? HopWindow.charged(client.connectionCreditLocked()) : 0;
+		for (Leg leg : this.opened) {
+			Hop hop = leg.hop();
+			charged += hop.open() ? HopWindow.charged(hop.connectionCreditLocked()) : 0;
+		}
+		return charged;
+	}
+
+	/**
+	 * The connection window the peers of the open hops hold: what they may still send.
+	 * With the loop's lock.
+	 */
+	private long creditLocked() {
+		Hop client = client();
+		long credit = client.open() ? client.connectionCreditLocked() : 0;
+		for (Leg leg : this.opened) {
+			Hop hop = leg.hop();
+			credit += hop.open() ? hop.connectionCreditLocked() : 0;
+		}
+		return credit;
 	}
 
 	private void watchWritesLocked(boolean watch) {
@@ -1441,9 +1552,13 @@ final class NettyHttp2DemuxRelay {
 		this.loop.run(NettyHttp2DemuxRelay::reviewed);
 	}
 
-	/** Charges or releases what makes the share the part beyond the allowance. */
-	private void settleShareLocked(long queued) {
-		long share = Math.max(0, queued - CONNECTION_ALLOWANCE);
+	/**
+	 * Charges or releases what makes the share the part of the queued bytes beyond the
+	 * allowance plus the credit past the floors.
+	 */
+	private void settleShareLocked(long queued, long chargedCredit) {
+		this.chargedCredit = chargedCredit;
+		long share = Math.max(0, queued - CONNECTION_ALLOWANCE) + chargedCredit;
 		long change = share - this.pooled;
 		this.pooled = share;
 		if (change > 0) {
@@ -1452,15 +1567,6 @@ final class NettyHttp2DemuxRelay {
 		else if (change < 0) {
 			this.budget.release(-change);
 		}
-	}
-
-	/** Withholds or grants every hop's connection window; whether it wrote. */
-	private boolean withholdLocked(boolean withhold) {
-		boolean wrote = client().withholdConnectionWindowLocked(withhold);
-		for (Leg leg : this.opened) {
-			wrote |= leg.hop().withholdConnectionWindowLocked(withhold);
-		}
-		return wrote;
 	}
 
 	/**
@@ -1505,8 +1611,10 @@ final class NettyHttp2DemuxRelay {
 		this.accountsClosed = true;
 		this.meters.held(-this.queued);
 		this.queued = 0;
+		this.meters.credit(-this.credit);
+		this.credit = 0;
 		this.budget.cancel(this.budgetRoom);
-		settleShareLocked(0);
+		settleShareLocked(0, 0);
 		for (Leg leg : this.opened) {
 			if (leg.backlog != 0) {
 				log.warn("h2 demux: a leg of route {} finished with {} bytes accounted", leg.routeTag, leg.backlog);
@@ -1601,6 +1709,9 @@ final class NettyHttp2DemuxRelay {
 
 		/** Set once the hop is built. */
 		@Nullable Hop hop;
+
+		/** The connection window granted the upstream; with the loop's lock. */
+		final HopWindow window = new HopWindow(CONNECTION_WINDOW);
 
 		/** The upstream's first SETTINGS has not arrived; with the loop's lock. */
 		boolean awaitingSettings = true;
@@ -1966,6 +2077,7 @@ final class NettyHttp2DemuxRelay {
 		@Override
 		public int onDataRead(ChannelHandlerContext ctx, int streamId, ByteBuf data, int padding, boolean endStream) {
 			NettyHttp2DemuxRelay.this.deadline.progress(data.readableBytes() + padding);
+			measureLocked(this.hop, NettyHttp2DemuxRelay.this.clientWindow, data.readableBytes() + padding);
 			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.get(streamId);
 			if (exchange == null || exchange.reset) {
 				return data.readableBytes() + padding;
@@ -1975,6 +2087,13 @@ final class NettyHttp2DemuxRelay {
 			exchange.requestFlow.data(data, endStream);
 			// padding is consumed at once
 			return padding;
+		}
+
+		@Override
+		public void onPingAckRead(ChannelHandlerContext ctx, long data) {
+			if (data == ROUND_TRIP_PAYLOAD) {
+				NettyHttp2DemuxRelay.this.clientWindow.acked();
+			}
 		}
 
 		@Override
@@ -2110,6 +2229,7 @@ final class NettyHttp2DemuxRelay {
 
 		@Override
 		public int onDataRead(ChannelHandlerContext ctx, int streamId, ByteBuf data, int padding, boolean endStream) {
+			measureLocked(this.leg.hop(), this.leg.window, data.readableBytes() + padding);
 			Exchange exchange = exchange(streamId);
 			if (exchange == null) {
 				return data.readableBytes() + padding;
@@ -2118,6 +2238,13 @@ final class NettyHttp2DemuxRelay {
 			exchange.responseFlow.data(data, endStream);
 			// padding is consumed at once
 			return padding;
+		}
+
+		@Override
+		public void onPingAckRead(ChannelHandlerContext ctx, long data) {
+			if (data == ROUND_TRIP_PAYLOAD) {
+				this.leg.window.acked();
+			}
 		}
 
 		@Override
