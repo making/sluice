@@ -63,3 +63,29 @@ Step 2 of the netty h2 demux migration (context and user decisions: 098). Depend
 - The netty engine must do the same: log `type=req ... status=421 reason=force-http1`
   (`AccessLogger.Connection#misdirected`) and count
   `sluice.h2demux.streams.misdirected{reason=force-http1}` (`H2DemuxMeters`).
+
+## Notes from 098 (the hop infrastructure, 2026-10-13)
+
+- `am.ik.sluice.server.proxy.hop`: `Hop` (one netty HTTP/2 endpoint in an
+  `EmbeddedChannel` over a `DuplexPipe`, own reader / writer virtual threads, started by
+  `build()`) and `Loop` (the lock, the settle after each action, the ticker, the exception
+  sink). The netty relay goes in `proxy` and depends on `hop`, never the reverse.
+  `TestBridge` (sluice-server tests, same package) is the smallest relay on it: legs
+  dialed inside the client listener, DATA forwarded as `retainedSlice` and consumed with
+  `hop.newPromise(...)` once written, `addConnectionListener` for stream close.
+- A leg's pipe: `DuplexPipe.of(VirtualConnection)` (added in sluice-proto). The seed head
+  needs no hop API: `DuplexPipe.of(SequenceInputStream(seed, socketIn), socket)`.
+- Settings, header list size (64KiB), validation, `encoderEnforceMaxConcurrentStreams`:
+  through `Hop.Builder#codec`; auto refill of the connection window is on by default.
+- Close a hop with `closeLocked()` (netty's graceful close: GOAWAY, then close when the
+  streams ended or the handler's graceful timeout ran) or `abortLocked()` (now). Never
+  `EmbeddedChannel#close`: it cancels every scheduled task of the channel, and keeps
+  cancelling later ones (LoopTest pins the graceful timer).
+- TLS: `SSLSocket#shutdownOutput` throws; the hop's writer then closes the pipe at the
+  close grace instead of half-closing. Untested.
+- The sink is called with the loop's lock held: log or count, never block.
+- Hop tests run in the surefire execution `hop` (`@Tag("netty-hop")`, paranoid leak
+  detector, `LeakCheck`); run them through the reactor, e.g.
+  `./mvnw test -pl sluice-proto,sluice-server -Dtest=Hop* -Dsurefire.failIfNoSpecifiedTests=false`.
+- netty is pinned to 4.2.19.Final in the root `pom.xml` (4.2.18 turned HTTP/2 header
+  value validation on by default).

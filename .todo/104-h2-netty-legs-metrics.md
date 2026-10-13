@@ -15,3 +15,8 @@ Step 7 of the netty h2 demux migration (context and user decisions: 098). Depend
 ## Tests
 
 - The leg-limit, metrics and access-log subsets pass on netty; 066's and 075's tests.
+
+## Notes from 098
+
+- `Hop.Builder#onInactive` runs under the lock when a leg's channel closes (leg
+  retirement); `Hop#bytesRead()` / `bytesWritten()` count the pipe bytes for metrics.

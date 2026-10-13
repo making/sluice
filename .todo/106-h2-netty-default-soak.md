@@ -13,3 +13,9 @@ Step 9 of the netty h2 demux migration (context and user decisions: 098). Depend
   metrics, logs) for a soak period agreed with the user.
 - If lock contention or misuse shows, file the hardening step (a custom `Channel` on a
   netty event loop, option 2 of the I/O model in `.todo/artefacts/096/FINDINGS.md`).
+
+## Notes from 098
+
+- Cost per hop: a reader and a writer virtual thread (plus a short-lived closer at close),
+  one ticker thread per loop (it sleeps until a timer is due), and one heap copy of every
+  byte written (the ByteBuf confinement). Measure these.

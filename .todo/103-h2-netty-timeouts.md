@@ -20,3 +20,13 @@ Step 6 of the netty h2 demux migration (context and user decisions: 098). Depend
   pins it for HTTP/1.1 through `DataProxyServer#clientPipeSeam` (a client pipe accepting
   16KiB per second); netty writes do not block, so the netty engine needs its own test of
   what counts as progress while its outbound buffer drains slowly.
+
+## Notes from 098
+
+- Timers: `hop.ctx().executor().schedule(...)`; the loop's ticker sleeps until the earliest
+  task of its hops and runs it under the lock. Never call `EmbeddedChannel#close` (it
+  cancels every scheduled task of the channel); use `Hop#closeLocked` / `abortLocked`.
+- Nothing in the hop cuts a writer blocked on a peer that does not read while the channel
+  is open; only after the channel closed does the close grace (1s default) close the pipe.
+  The stall timeout has to abort the hop. Progress: `Hop#bytesWritten()`, `queuedBytes()`,
+  `writable()`.

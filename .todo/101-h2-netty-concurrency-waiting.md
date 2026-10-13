@@ -17,3 +17,9 @@ Step 4 of the netty h2 demux migration (context and user decisions: 098). Depend
 
 - The concurrency-waiting subset passes on netty.
 - 091's tests on the netty engine (excluded for legacy, which never gets the deadline).
+
+## Notes from 098
+
+- `StreamBufferingEncoder`: `Hop.Builder#codec(c -> c.encoderEnforceMaxConcurrentStreams(true))`.
+- The 091 deadline: schedule on `hop.ctx().executor()`; the loop's ticker runs it under the
+  lock when due (no I/O needed, `LoopTest`).
