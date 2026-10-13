@@ -15,6 +15,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 
 import org.awaitility.Awaitility;
@@ -189,11 +190,23 @@ class H2DemuxFlowControlE2ETest {
 	@Test
 	void bulkUploadOnASlowLegLetsAnotherStreamOfTheLegComplete() throws Exception {
 		String route = "fc.slow.test";
-		startClient(route, stub(H2DemuxFlowControlE2ETest::serveSlowlyGrantingStreamOne));
+		AtomicLong upstreamReceived = new AtomicLong();
+		startClient(route, stub(socket -> serveSlowlyGrantingStreamOne(socket, upstreamReceived)));
 		AtomicBoolean stop = new AtomicBoolean();
 		AtomicLong maxQueued = new AtomicLong();
+		AtomicLong maxLag = new AtomicLong();
 		try (H2TestClient client = H2TestClient.connect(dataPort, 3)) {
 			client.headers(1, false, TestH2.headerBlock(":authority=" + route, ":method=POST", ":path=/bulk"));
+			// a dedicated fast sampler: the relay's queue swings between empty and full
+			// as
+			// the slow upstream drains it, so a sample taken at a poll point may read 0
+			Thread sampler = Thread.ofPlatform().name("e2e-fc-sampler").daemon().start(() -> {
+				while (!stop.get()) {
+					maxQueued.accumulateAndGet(queuedBytes(route), Math::max);
+					maxLag.accumulateAndGet(client.streamSent(1) - upstreamReceived.get(), Math::max);
+					LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+				}
+			});
 			Thread pusher = Thread.ofVirtual().name("e2e-fc-bulk").start(() -> {
 				try {
 					while (!stop.get() && client.data(1, 1024 * 1024, false, Duration.ofSeconds(30))) {
@@ -208,18 +221,17 @@ class H2DemuxFlowControlE2ETest {
 			// upstream's reads pace the stream
 			long paced = 2L * VirtualConnection.DEFAULT_WINDOW + 2L * NETTY_STREAM_WINDOW;
 			Awaitility.await().atMost(Duration.ofSeconds(30)).until(() -> {
-				maxQueued.accumulateAndGet(queuedBytes(route), Math::max);
 				return client.streamSent(1) > paced || client.closed();
 			});
 			client.headers(3, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/fast"));
-			boolean answered = client.awaitTrue(() -> {
-				maxQueued.accumulateAndGet(queuedBytes(route), Math::max);
-				return client.ended(3) || client.closed();
-			}, Duration.ofSeconds(20));
+			boolean answered = client.awaitTrue(() -> client.ended(3) || client.closed(), Duration.ofSeconds(20));
 			stop.set(true);
+			sampler.join(TimeUnit.SECONDS.toMillis(5));
 			assertThat(client.closed()).as("the connection stays up (sent %d)", client.streamSent(1)).isFalse();
 			assertThat(answered && client.ended(3)).as("the other stream of the leg completes").isTrue();
 			assertThat(client.maxOvershoot()).isLessThanOrEqualTo(0);
+			assertThat(maxLag.get()).as("the slow upstream held the bulk stream: sent ahead of what it read")
+				.isGreaterThan(NETTY_STREAM_WINDOW);
 			// the bulk stream's window, a granule of backlog rounding, the leg's writer
 			// queue, and under 1KiB for the other stream's head
 			assertThat(maxQueued.get()).as("queued for the bulk stream, plus the other stream's head")
@@ -377,9 +389,9 @@ class H2DemuxFlowControlE2ETest {
 	 * Grants stream 1 a huge window on its HEADERS, answers ended requests, and reads at
 	 * about 4MiB/s.
 	 */
-	private static void serveSlowlyGrantingStreamOne(Socket socket) {
+	private static void serveSlowlyGrantingStreamOne(Socket socket, AtomicLong received) {
 		try (socket) {
-			InputStream in = new ThrottledInputStream(socket.getInputStream());
+			InputStream in = new ThrottledInputStream(socket.getInputStream(), received);
 			OutputStream out = socket.getOutputStream();
 			if (in.readNBytes(TestH2.PREFACE.length).length < TestH2.PREFACE.length) {
 				return;
@@ -528,10 +540,13 @@ class H2DemuxFlowControlE2ETest {
 
 		private final InputStream in;
 
+		private final AtomicLong received;
+
 		private int budget = SLICE;
 
-		ThrottledInputStream(InputStream in) {
+		ThrottledInputStream(InputStream in, AtomicLong received) {
 			this.in = in;
+			this.received = received;
 		}
 
 		@Override
@@ -559,6 +574,7 @@ class H2DemuxFlowControlE2ETest {
 			int n = this.in.read(b, off, Math.min(len, this.budget));
 			if (n > 0) {
 				this.budget -= n;
+				this.received.addAndGet(n);
 			}
 			return n;
 		}
