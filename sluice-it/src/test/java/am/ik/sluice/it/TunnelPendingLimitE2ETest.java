@@ -199,7 +199,7 @@ class TunnelPendingLimitE2ETest {
 	private double refused() {
 		return Objects.requireNonNull(this.meterRegistry, "meterRegistry")
 			.get("sluice.tunnel.streams.refused")
-			.tag("reason", "limit")
+			.tag("reason", "pending-limit")
 			.counter()
 			.count();
 	}

@@ -21,6 +21,7 @@ import org.jspecify.annotations.Nullable;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
 
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.FrameWriter;
@@ -52,6 +53,16 @@ import io.grpc.Status;
  * binding can take a while), and connections accept DATA without blocking. Every
  * connection runs per-connection flow control: a client whose {@code Advertise} announces
  * no receive window is rejected ({@link #WINDOW_REQUIRED}).
+ * <p>
+ * The first advertise registers the session unless that would pass a bound on the
+ * registered sessions ({@link SessionRegistry#register}): then the stream is failed with
+ * the refusal's status.
+ * <p>
+ * The session's own log lines (established, build, advertised routes, closing, and its
+ * warnings) are logged at info / warn when the stream took a permit of the stream log at
+ * its start, at debug otherwise, so streams opened and closed quickly cannot flood the
+ * log; an advertise repeating the stream's routes and their outcome is logged at debug,
+ * one changing them takes a permit of its own.
  */
 public final class TunnelSession implements AutoCloseable {
 
@@ -158,6 +169,16 @@ public final class TunnelSession implements AutoCloseable {
 
 	private final Consumer<TunnelSession> registered;
 
+	private final Consumer<SessionRegistry.Refusal> refused;
+
+	private final LogThrottle streamLog;
+
+	/**
+	 * Whether the stream took a permit of {@link #streamLog} at its start: its lines are
+	 * logged at info / warn, else at debug.
+	 */
+	private volatile boolean logged = true;
+
 	private TunnelSession(Builder builder) {
 		this.clientId = Objects.requireNonNull(builder.clientId, "clientId is required");
 		this.nodeId = builder.nodeId;
@@ -172,6 +193,8 @@ public final class TunnelSession implements AutoCloseable {
 		this.advertiseTimeout = builder.advertiseTimeout;
 		this.advertiseTimedOut = builder.advertiseTimedOut;
 		this.registered = builder.registered;
+		this.refused = builder.refused;
+		this.streamLog = builder.streamLog;
 		this.serverBuild = builder.serverBuild;
 		this.advertiser = Executors.newSingleThreadExecutor(
 				task -> Thread.ofVirtual().name("sluice-advertise-" + this.clientId).unstarted(task));
@@ -208,6 +231,11 @@ public final class TunnelSession implements AutoCloseable {
 
 		private Consumer<TunnelSession> registered = session -> {
 		};
+
+		private Consumer<SessionRegistry.Refusal> refused = refusal -> {
+		};
+
+		private LogThrottle streamLog = LogThrottle.unlimited();
 
 		private Runnable windowUpdateReceived = () -> {
 		};
@@ -293,6 +321,25 @@ public final class TunnelSession implements AutoCloseable {
 		 */
 		public Builder registered(Consumer<TunnelSession> registered) {
 			this.registered = registered;
+			return this;
+		}
+
+		/**
+		 * Runs when the first advertise is refused registration, before the stream is
+		 * failed with the refusal's status; on the session's advertise thread. A metrics
+		 * and log hook.
+		 */
+		public Builder refused(Consumer<SessionRegistry.Refusal> refused) {
+			this.refused = refused;
+			return this;
+		}
+
+		/**
+		 * The permits for the session's own log lines, shared by the sessions of a
+		 * server; every line is logged by default.
+		 */
+		Builder streamLog(LogThrottle streamLog) {
+			this.streamLog = streamLog;
 			return this;
 		}
 
@@ -395,14 +442,18 @@ public final class TunnelSession implements AutoCloseable {
 
 	/**
 	 * Admits the session as pending ({@link SessionRegistry#admit}), then starts the
-	 * sender and the advertise deadline. A refused session starts nothing and holds no
-	 * thread; the caller fails its stream with the refusal's status.
+	 * sender and the advertise deadline. A refused session starts nothing, holds no
+	 * thread and logs nothing; the caller fails its stream with the refusal's status.
 	 */
 	Optional<SessionRegistry.Refusal> start() {
 		Optional<SessionRegistry.Refusal> refusal = this.registry.admit(this);
 		if (refusal.isPresent()) {
 			return refusal;
 		}
+		long unreported = this.streamLog.tryAcquire();
+		this.logged = unreported >= 0;
+		log.atLevel(level(Level.INFO))
+			.log("tunnel stream established for client {}{}", this.clientId, demoted(unreported));
 		this.sender.start();
 		this.advertiseDeadline = Thread.ofVirtual()
 			.name("sluice-advertise-deadline-" + this.clientId)
@@ -425,7 +476,8 @@ public final class TunnelSession implements AutoCloseable {
 			return;
 		}
 		String description = advertiseTimeoutDescription(this.advertiseTimeout);
-		log.warn("client {} ({}): {}; failing its tunnel stream", this.clientId, this.remoteAddress, description);
+		log.atLevel(level(Level.WARN))
+			.log("client {} ({}): {}; failing its tunnel stream", this.clientId, this.remoteAddress, description);
 		this.advertiseTimedOut.run();
 		this.sender.fail(Status.DEADLINE_EXCEEDED.withDescription(description).asRuntimeException());
 		close();
@@ -498,7 +550,8 @@ public final class TunnelSession implements AutoCloseable {
 		PeerBuild build = advertise.hasBuild() ? PeerBuilds.sanitize(advertise.getBuild()) : null;
 		String described = build == null ? PeerBuilds.UNKNOWN : PeerBuilds.describe(build);
 		if (advertise.getConnectionWindow() == 0) {
-			log.warn("client {} runs {}; rejecting its tunnel stream: {}", this.clientId, described, WINDOW_REQUIRED);
+			log.atLevel(level(Level.WARN))
+				.log("client {} runs {}; rejecting its tunnel stream: {}", this.clientId, described, WINDOW_REQUIRED);
 			this.sender.fail(Status.FAILED_PRECONDITION.withDescription(WINDOW_REQUIRED).asRuntimeException());
 			close();
 			return;
@@ -509,7 +562,7 @@ public final class TunnelSession implements AutoCloseable {
 		boolean first = !this.advertised;
 		this.advertised = true;
 		if (first) {
-			log.info("client {} runs {}", this.clientId, described);
+			log.atLevel(level(Level.INFO)).log("client {} runs {}", this.clientId, described);
 		}
 		try {
 			this.advertiser.execute(() -> advertise(advertise.getUpstreamsList()));
@@ -529,22 +582,38 @@ public final class TunnelSession implements AutoCloseable {
 
 	/**
 	 * On the first advertise registers the session, replacing the client id's previous
-	 * one; then registers the advertised routes and binds their ports, and acknowledges.
-	 * Runs on {@link #advertiser}. Skipped once the session is closed: the route removal
-	 * of {@link #close()} runs after every advertise started before it.
+	 * one, unless the registry refuses it: then the stream is failed with the refusal's
+	 * status and the session closed. Then registers the advertised routes and binds their
+	 * ports, and acknowledges. Runs on {@link #advertiser}. Skipped once the session is
+	 * closed: the route removal of {@link #close()} runs after every advertise started
+	 * before it.
 	 */
 	private void advertise(List<Upstream> advertised) {
 		boolean first = false;
 		TunnelSession replaced = null;
+		SessionRegistry.Refusal refusal = null;
 		synchronized (this.registration) {
 			if (this.closed.get()) {
 				return;
 			}
 			if (!this.inRegistry) {
-				this.inRegistry = true;
-				first = true;
-				replaced = this.registry.register(this).orElse(null);
+				switch (this.registry.register(this)) {
+					case SessionRegistry.Registration.Registered registration -> {
+						this.inRegistry = true;
+						first = true;
+						replaced = registration.replaced().orElse(null);
+					}
+					case SessionRegistry.Registration.Refused refused -> refusal = refused.refusal();
+				}
 			}
+		}
+		if (refusal != null) {
+			this.refused.accept(refusal);
+			this.sender.fail(refusal.status().asRuntimeException());
+			// on the advertiser: the advertises queued behind this one find the session
+			// closed, and the route removal runs once this one returns
+			close(false);
+			return;
 		}
 		if (replaced != null) {
 			// the routes are keyed by client id: the replaced session's removal spares
@@ -555,22 +624,47 @@ public final class TunnelSession implements AutoCloseable {
 			this.registered.accept(this);
 		}
 		int registered = this.router.register(this.clientId, advertised);
-		Set<Integer> rejected = this.tcpRoutes.reconcile(this.clientId, listenPorts(advertised));
-		this.upstreams = List.copyOf(advertised);
-		this.rejectedPorts = Set.copyOf(rejected);
+		Set<Integer> rejected = Set.copyOf(this.tcpRoutes.reconcile(this.clientId, listenPorts(advertised)));
+		List<Upstream> upstreams = List.copyOf(advertised);
+		logAdvertise(first, upstreams, registered, rejected);
+		this.upstreams = upstreams;
+		this.rejectedPorts = rejected;
+		// after the lines: once acknowledged, the advertise is logged
 		this.sender.sendAdvertiseAck(AdvertiseAck.newBuilder()
 			.addAllRejectedPorts(rejected)
 			.setNodeId(this.nodeId)
 			.setBuild(this.serverBuild)
 			.build());
-		log.info("client {} advertised {} upstream(s), {} listen port(s) rejected", this.clientId, registered,
-				rejected.size());
+	}
+
+	/**
+	 * Logs an advertise: the first at the stream's level, a later one repeating the
+	 * previous routes and outcome at debug, a later one changing them at info when it
+	 * takes a permit of the stream log.
+	 */
+	private void logAdvertise(boolean first, List<Upstream> advertised, int registered, Set<Integer> rejected) {
+		Level level;
+		long unreported = 0;
+		if (first) {
+			level = level(Level.INFO);
+		}
+		else if (advertised.equals(this.upstreams) && rejected.equals(this.rejectedPorts)) {
+			level = Level.DEBUG;
+		}
+		else {
+			unreported = this.streamLog.tryAcquire();
+			level = unreported >= 0 ? Level.INFO : Level.DEBUG;
+		}
+		log.atLevel(level)
+			.log("client {} advertised {} upstream(s), {} listen port(s) rejected{}", this.clientId, registered,
+					rejected.size(), first ? "" : demoted(unreported));
 		for (Upstream upstream : advertised) {
-			log.info(
-					"client {} upstream: host=[{}] target={} rewrite-host={} tls-passthrough={} listen-port={} verbatim-idle-timeout={}",
-					this.clientId, upstream.getHost(), upstream.getTargetUrl(), upstream.getRewriteHost(),
-					upstream.getTlsPassthrough(), upstream.getListenPort(), upstream.getVerbatimIdleTimeoutMillis() == 0
-							? "server default" : Long.toUnsignedString(upstream.getVerbatimIdleTimeoutMillis()) + "ms");
+			log.atLevel(level)
+				.log("client {} upstream: host=[{}] target={} rewrite-host={} tls-passthrough={} listen-port={} verbatim-idle-timeout={}",
+						this.clientId, upstream.getHost(), upstream.getTargetUrl(), upstream.getRewriteHost(),
+						upstream.getTlsPassthrough(), upstream.getListenPort(),
+						upstream.getVerbatimIdleTimeoutMillis() == 0 ? "server default"
+								: Long.toUnsignedString(upstream.getVerbatimIdleTimeoutMillis()) + "ms");
 		}
 	}
 
@@ -671,6 +765,15 @@ public final class TunnelSession implements AutoCloseable {
 	 */
 	@Override
 	public void close() {
+		close(true);
+	}
+
+	/**
+	 * {@link #close()}; on the {@link #advertiser} itself it must not wait for it
+	 * ({@code awaitAdvertiser} false): the route removal then runs once the current
+	 * advertise returns.
+	 */
+	private void close(boolean awaitAdvertiser) {
 		synchronized (this.registration) {
 			if (!this.closed.compareAndSet(false, true)) {
 				return;
@@ -681,17 +784,19 @@ public final class TunnelSession implements AutoCloseable {
 		if (deadline != null && deadline != Thread.currentThread()) {
 			deadline.interrupt();
 		}
-		log.info("closing session for client {}", this.clientId);
+		log.atLevel(level(Level.INFO)).log("closing session for client {}", this.clientId);
 		this.advertiser.execute(this::removeRoutes);
 		this.advertiser.shutdown();
-		try {
-			if (!this.advertiser.awaitTermination(this.closeTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
-				log.warn("client {}: advertise still running after {}; its routes are removed once it ends",
-						this.clientId, this.closeTimeout);
+		if (awaitAdvertiser) {
+			try {
+				if (!this.advertiser.awaitTermination(this.closeTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
+					log.warn("client {}: advertise still running after {}; its routes are removed once it ends",
+							this.clientId, this.closeTimeout);
+				}
 			}
-		}
-		catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
+			catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
 		}
 		// the sender first: a dead or stalled stream must not leave the connection
 		// teardown below waiting on a full send queue (the worker stops and releases
@@ -703,6 +808,23 @@ public final class TunnelSession implements AutoCloseable {
 			connection.close();
 		}
 		this.connections.clear();
+	}
+
+	/**
+	 * The level of one of the stream's own lines: {@code level} when the stream took a
+	 * permit of the stream log at its start, debug otherwise.
+	 */
+	Level level(Level level) {
+		return this.logged ? level : Level.DEBUG;
+	}
+
+	/**
+	 * The suffix of a line that took a permit of the stream log, reporting the streams
+	 * and route changes logged at debug since the previous one.
+	 */
+	private static String demoted(long unreported) {
+		return unreported > 0 ? " (%d more tunnel streams or route changes logged at debug since the last report)"
+			.formatted(unreported) : "";
 	}
 
 	/**

@@ -40,6 +40,16 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 	/** The period of {@link #refusalLog}. */
 	static final Duration REFUSAL_LOG_PERIOD = Duration.ofSeconds(10);
 
+	/** The period of {@link #streamLog}. */
+	public static final Duration STREAM_LOG_PERIOD = Duration.ofSeconds(10);
+
+	/**
+	 * The tunnel streams per {@link #STREAM_LOG_PERIOD} whose own lines are logged at
+	 * info (and the route changes, which take a permit each); the others log them at
+	 * debug.
+	 */
+	public static final int STREAM_LOG_PERMITS = 32;
+
 	private final Router router;
 
 	private final TokenValidator tokenValidator;
@@ -68,6 +78,11 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	/** At most one refusal line per period, so refused streams cannot flood the log. */
 	private final LogThrottle refusalLog = new LogThrottle(REFUSAL_LOG_PERIOD, System::nanoTime);
+
+	/**
+	 * The permits for the streams' own lines, so churning streams cannot flood the log.
+	 */
+	private final LogThrottle streamLog = new LogThrottle(STREAM_LOG_PERIOD, STREAM_LOG_PERMITS, System::nanoTime);
 
 	public TunnelService(Router router, TokenValidator tokenValidator, SessionRegistry sessions,
 			TcpRouteListener tcpRoutes, NodeDirectory nodeDirectory, MembershipBroadcaster membershipBroadcaster,
@@ -100,7 +115,8 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			this.refusals.put(refusal,
 					Counter.builder("sluice.tunnel.streams.refused")
 						.tag("reason", refusal.reason())
-						.description("Tunnel streams refused at once: past a bound on the streams waiting for "
+						.description("Tunnel streams refused: past a bound on the registered sessions (at once, "
+								+ "or at the client's first Advertise), past a bound on the streams waiting for "
 								+ "their client's first Advertise, or while the node drains")
 						.register(meterRegistry));
 		}
@@ -142,6 +158,7 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 	public StreamObserver<Frame> connect(StreamObserver<Frame> responseObserver) {
 		String clientId = TunnelAuthInterceptor.CLIENT_ID.get();
 		String finalClientId = clientId == null ? "" : clientId;
+		String remoteAddress = Objects.requireNonNullElse(TunnelAuthInterceptor.REMOTE_ADDRESS.get(), "");
 		@Nullable Runnable reset = TunnelStreamReset.current();
 		// set before the sender starts, so before the watchdog can fire
 		AtomicReference<@Nullable TunnelSession> stalledSession = new AtomicReference<>();
@@ -162,7 +179,7 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 		TunnelSession session = TunnelSession.builder()
 			.clientId(clientId == null ? "" : clientId)
 			.nodeId(this.properties.node().id())
-			.remoteAddress(Objects.requireNonNullElse(TunnelAuthInterceptor.REMOTE_ADDRESS.get(), ""))
+			.remoteAddress(remoteAddress)
 			.sourceAddress(Objects.requireNonNullElse(TunnelAuthInterceptor.SOURCE_ADDRESS.get(), ""))
 			.router(this.router)
 			.sender(sender)
@@ -173,16 +190,16 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			.advertiseTimeout(this.properties.limits().advertiseTimeout())
 			.advertiseTimedOut(this.advertiseTimeouts::increment)
 			.registered(this.membershipBroadcaster::onSessionRegistered)
+			.refused(refusal -> refuse(refusal, finalClientId, remoteAddress))
+			.streamLog(this.streamLog)
 			.build();
 		stalledSession.set(session);
 		Optional<SessionRegistry.Refusal> refused = session.start();
 		if (refused.isPresent()) {
-			refuse(refused.get(), session);
+			refuse(refused.get(), finalClientId, remoteAddress);
 			responseObserver.onError(refused.get().status().asRuntimeException());
 			return noopObserver();
 		}
-		// logged once admitted: a refused stream is logged by the throttled refusal line
-		log.info("tunnel stream established for client {}", finalClientId);
 		return new StreamObserver<>() {
 
 			@Override
@@ -192,13 +209,14 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 			@Override
 			public void onError(Throwable t) {
-				log.info("tunnel stream failed for client {}: {}", finalClientId, t.toString());
+				log.atLevel(session.level(Level.INFO))
+					.log("tunnel stream failed for client {}: {}", finalClientId, t.toString());
 				session.close();
 			}
 
 			@Override
 			public void onCompleted() {
-				log.info("tunnel stream closed by client {}", finalClientId);
+				log.atLevel(session.level(Level.INFO)).log("tunnel stream closed by client {}", finalClientId);
 				session.close();
 			}
 
@@ -208,7 +226,7 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 	/**
 	 * Counts a refused stream and logs it, at most once per {@link #REFUSAL_LOG_PERIOD}.
 	 */
-	private void refuse(SessionRegistry.Refusal refusal, TunnelSession session) {
+	private void refuse(SessionRegistry.Refusal refusal, String clientId, String remoteAddress) {
 		Objects.requireNonNull(this.refusals.get(refusal), "refusal counter").increment();
 		long suppressed = this.refusalLog.tryAcquire();
 		if (suppressed < 0) {
@@ -216,7 +234,7 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 		}
 		// a drain refusing the clients reconnecting to it is expected
 		log.atLevel(refusal == SessionRegistry.Refusal.DRAINING ? Level.INFO : Level.WARN)
-			.log("refusing tunnel stream of client {} ({}): {}{}", session.clientId(), session.remoteAddress(),
+			.log("refusing tunnel stream of client {} ({}): {}{}", clientId, remoteAddress,
 					refusal.status().getDescription(),
 					suppressed == 0 ? "" : " (%d more refused since the last report)".formatted(suppressed));
 	}

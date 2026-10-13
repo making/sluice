@@ -103,7 +103,7 @@ class TunnelSessionPendingLimitTest {
 		RecordingStream refusedStream = new RecordingStream();
 		TunnelSession refused = session(registry, "c", "10.0.0.2", refusedStream);
 
-		assertThat(refused.start()).contains(SessionRegistry.Refusal.LIMIT);
+		assertThat(refused.start()).contains(SessionRegistry.Refusal.PENDING_LIMIT);
 
 		assertThat(registry.pending()).as("not tracked").hasSize(2).doesNotContain(refused);
 		TimeUnit.MILLISECONDS.sleep(TIMEOUT.toMillis() * 2);
@@ -119,7 +119,7 @@ class TunnelSessionPendingLimitTest {
 		TunnelSession first = started(registry, "a", "10.0.0.1", stream);
 		assertThat(session(registry, "b", "10.0.0.1", new RecordingStream()).start())
 			.as("precondition: the cap is reached")
-			.contains(SessionRegistry.Refusal.LIMIT);
+			.contains(SessionRegistry.Refusal.PENDING_LIMIT);
 
 		first.handle(advertise());
 		stream.await(Frame.BodyCase.ADVERTISE_ACK, 1);
@@ -137,7 +137,7 @@ class TunnelSessionPendingLimitTest {
 		started(registry, "a", "10.0.0.1", stream);
 		assertThat(session(registry, "b", "10.0.0.1", new RecordingStream()).start())
 			.as("precondition: the cap is reached")
-			.contains(SessionRegistry.Refusal.LIMIT);
+			.contains(SessionRegistry.Refusal.PENDING_LIMIT);
 
 		stream.awaitFailure();
 		awaitPending(registry, 0);
@@ -153,7 +153,7 @@ class TunnelSessionPendingLimitTest {
 		TunnelSession first = started(registry, "a");
 		assertThat(session(registry, "b", "10.0.0.9", new RecordingStream()).start())
 			.as("precondition: the cap is reached")
-			.contains(SessionRegistry.Refusal.LIMIT);
+			.contains(SessionRegistry.Refusal.PENDING_LIMIT);
 
 		first.close();
 
@@ -171,7 +171,7 @@ class TunnelSessionPendingLimitTest {
 		RecordingStream refusedStream = new RecordingStream();
 
 		assertThat(session(registry, "a3", "10.0.0.1", refusedStream).start())
-			.contains(SessionRegistry.Refusal.ADDRESS_LIMIT);
+			.contains(SessionRegistry.Refusal.PENDING_ADDRESS_LIMIT);
 		assertThat(registry.pending("10.0.0.1")).isEqualTo(2);
 		assertThat(session(registry, "b1", "10.0.0.2", new RecordingStream()).start()).as("another address is admitted")
 			.isEmpty();

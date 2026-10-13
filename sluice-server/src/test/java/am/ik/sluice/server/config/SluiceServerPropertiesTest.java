@@ -92,6 +92,21 @@ class SluiceServerPropertiesTest {
 		assertThat(properties.limits().advertiseTimeout()).isEqualTo(Duration.ofSeconds(10));
 		assertThat(properties.limits().maxPendingTunnelStreams()).isEqualTo(256);
 		assertThat(properties.limits().maxPendingTunnelStreamsPerAddress()).isZero();
+		assertThat(properties.limits().maxTunnelSessions()).isEqualTo(1024);
+		assertThat(properties.limits().maxTunnelSessionsPerAddress()).isZero();
+	}
+
+	@Test
+	void tunnelSessionLimitsBindAndANonPositiveGlobalOneFallsBackToTheDefault() {
+		SluiceServerProperties bound = bind(
+				Map.of("sluice.limits.max-tunnel-sessions", "8", "sluice.limits.max-tunnel-sessions-per-address", "2"));
+		assertThat(bound.limits().maxTunnelSessions()).isEqualTo(8);
+		assertThat(bound.limits().maxTunnelSessionsPerAddress()).isEqualTo(2);
+		assertThat(bind(Map.of("sluice.limits.max-tunnel-sessions", "0")).limits().maxTunnelSessions()).isEqualTo(1024);
+		assertThat(bind(Map.of("sluice.limits.max-tunnel-sessions-per-address", "-1")).limits()
+			.maxTunnelSessionsPerAddress()).isZero();
+		assertThat(SluiceServerProperties.Limits.builder().build().maxTunnelSessions()).as("the builder's default")
+			.isEqualTo(1024);
 	}
 
 	@Test

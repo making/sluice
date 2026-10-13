@@ -160,7 +160,7 @@ class TunnelPendingPerAddressLimitE2ETest {
 	private double refused() {
 		return Objects.requireNonNull(this.meterRegistry, "meterRegistry")
 			.get("sluice.tunnel.streams.refused")
-			.tag("reason", "address-limit")
+			.tag("reason", "pending-address-limit")
 			.counter()
 			.count();
 	}

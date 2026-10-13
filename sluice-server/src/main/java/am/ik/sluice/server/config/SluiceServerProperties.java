@@ -420,11 +420,14 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			@DefaultValue("1s") Duration halfCloseProbeInterval, @DefaultValue("60s") Duration stallTimeout,
 			@DefaultValue("16KB") DataSize stallMinBytes, @DefaultValue("60s") Duration tunnelStallTimeout,
 			@DefaultValue("0") Duration verbatimIdleTimeout, @DefaultValue("10s") Duration advertiseTimeout,
-			@DefaultValue("256") int maxPendingTunnelStreams,
-			@DefaultValue("0") int maxPendingTunnelStreamsPerAddress) {
+			@DefaultValue("256") int maxPendingTunnelStreams, @DefaultValue("0") int maxPendingTunnelStreamsPerAddress,
+			@DefaultValue("1024") int maxTunnelSessions, @DefaultValue("0") int maxTunnelSessionsPerAddress) {
 
 		/** The default of {@code maxPendingTunnelStreams}. */
 		public static final int DEFAULT_MAX_PENDING_TUNNEL_STREAMS = 256;
+
+		/** The default of {@code maxTunnelSessions}. */
+		public static final int DEFAULT_MAX_TUNNEL_SESSIONS = 1024;
 
 		public Limits {
 			maxConnections = Math.max(0, maxConnections);
@@ -451,6 +454,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			maxPendingTunnelStreams = maxPendingTunnelStreams > 0 ? maxPendingTunnelStreams
 					: DEFAULT_MAX_PENDING_TUNNEL_STREAMS;
 			maxPendingTunnelStreamsPerAddress = Math.max(0, maxPendingTunnelStreamsPerAddress);
+			maxTunnelSessions = maxTunnelSessions > 0 ? maxTunnelSessions : DEFAULT_MAX_TUNNEL_SESSIONS;
+			maxTunnelSessionsPerAddress = Math.max(0, maxTunnelSessionsPerAddress);
 		}
 
 		public static Builder builder() {
@@ -486,6 +491,10 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			private int maxPendingTunnelStreams = DEFAULT_MAX_PENDING_TUNNEL_STREAMS;
 
 			private int maxPendingTunnelStreamsPerAddress;
+
+			private int maxTunnelSessions = DEFAULT_MAX_TUNNEL_SESSIONS;
+
+			private int maxTunnelSessionsPerAddress;
 
 			private Builder() {
 			}
@@ -560,6 +569,16 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder maxTunnelSessions(int maxTunnelSessions) {
+				this.maxTunnelSessions = maxTunnelSessions;
+				return this;
+			}
+
+			public Builder maxTunnelSessionsPerAddress(int maxTunnelSessionsPerAddress) {
+				this.maxTunnelSessionsPerAddress = maxTunnelSessionsPerAddress;
+				return this;
+			}
+
 			public Limits build() {
 				return new Limits(this.maxConnections, this.maxConnectionsPerAddress,
 						this.headTimeout == null ? Duration.ofSeconds(10) : this.headTimeout,
@@ -572,7 +591,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 						this.tunnelStallTimeout == null ? Duration.ofSeconds(60) : this.tunnelStallTimeout,
 						this.verbatimIdleTimeout,
 						this.advertiseTimeout == null ? Duration.ofSeconds(10) : this.advertiseTimeout,
-						this.maxPendingTunnelStreams, this.maxPendingTunnelStreamsPerAddress);
+						this.maxPendingTunnelStreams, this.maxPendingTunnelStreamsPerAddress, this.maxTunnelSessions,
+						this.maxTunnelSessionsPerAddress);
 			}
 
 		}

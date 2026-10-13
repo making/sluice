@@ -4,19 +4,25 @@ import java.time.Duration;
 import java.util.function.LongSupplier;
 
 /**
- * Lets at most one log line per period through: the first event of a period is logged,
- * the others of that period are counted, and the next line logged reports that count.
+ * Lets at most a number of log lines per period through: a period starts with the first
+ * event after the previous one ended, its first {@code permits} events are logged, the
+ * others counted, and the next line logged reports that count.
  */
 final class LogThrottle {
 
 	private final long periodNanos;
 
+	private final int permits;
+
 	private final LongSupplier clock;
 
-	/** When the line last let through was; meaningful once {@link #started}. */
-	private long lastLogged;
+	/** When the current period started; meaningful once {@link #started}. */
+	private long periodStart;
 
 	private boolean started;
+
+	/** Events let through in the current period. */
+	private int granted;
 
 	private long suppressed;
 
@@ -25,8 +31,22 @@ final class LogThrottle {
 	 * {@link System#nanoTime()}).
 	 */
 	LogThrottle(Duration period, LongSupplier clock) {
+		this(period, 1, clock);
+	}
+
+	/** A throttle of {@code permits} lines per {@code period}, timed by {@code clock}. */
+	LogThrottle(Duration period, int permits, LongSupplier clock) {
+		if (permits < 1) {
+			throw new IllegalArgumentException("permits must be positive: " + permits);
+		}
 		this.periodNanos = period.toNanos();
+		this.permits = permits;
 		this.clock = clock;
+	}
+
+	/** A throttle that lets every line through. */
+	static LogThrottle unlimited() {
+		return new LogThrottle(Duration.ofSeconds(1), Integer.MAX_VALUE, System::nanoTime);
 	}
 
 	/**
@@ -35,12 +55,16 @@ final class LogThrottle {
 	 */
 	synchronized long tryAcquire() {
 		long now = this.clock.getAsLong();
-		if (this.started && now - this.lastLogged < this.periodNanos) {
+		if (!this.started || now - this.periodStart >= this.periodNanos) {
+			this.started = true;
+			this.periodStart = now;
+			this.granted = 0;
+		}
+		if (this.granted >= this.permits) {
 			this.suppressed++;
 			return -1;
 		}
-		this.started = true;
-		this.lastLogged = now;
+		this.granted++;
 		long reported = this.suppressed;
 		this.suppressed = 0;
 		return reported;

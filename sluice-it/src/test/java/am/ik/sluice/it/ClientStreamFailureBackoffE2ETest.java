@@ -68,7 +68,7 @@ class ClientStreamFailureBackoffE2ETest {
 
 	static Stream<Arguments> failures() {
 		return Stream.of(Arguments.of(SERVER_TIMEOUT, ADVERTISE_TIMEOUT),
-				Arguments.of(Duration.ZERO, SessionRegistry.Refusal.LIMIT.status()));
+				Arguments.of(Duration.ZERO, SessionRegistry.Refusal.PENDING_LIMIT.status()));
 	}
 
 	/**
@@ -124,7 +124,7 @@ class ClientStreamFailureBackoffE2ETest {
 
 	@Test
 	void theJitterShortensTheWaitsWithinTheirCeilings() throws Exception {
-		FailingServer fake = new FailingServer(Duration.ZERO, SessionRegistry.Refusal.LIMIT.status());
+		FailingServer fake = new FailingServer(Duration.ZERO, SessionRegistry.Refusal.PENDING_LIMIT.status());
 		int grpcPort = TestPorts.freePort();
 		this.server = ServerBuilder.forPort(grpcPort).addService(fake).build().start();
 		TunnelClient started = TunnelClient.builder()

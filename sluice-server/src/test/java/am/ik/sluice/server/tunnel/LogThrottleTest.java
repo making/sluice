@@ -36,4 +36,24 @@ class LogThrottleTest {
 		}
 	}
 
+	@Test
+	void withPermitsTheFirstLinesOfAPeriodPassAndTheNextPeriodsFirstReportsTheRest() {
+		LogThrottle permits = new LogThrottle(PERIOD, 3, this.now::get);
+		assertThat(permits.tryAcquire()).isZero();
+		this.now.addAndGet(Duration.ofSeconds(1).toNanos());
+		assertThat(permits.tryAcquire()).isZero();
+		assertThat(permits.tryAcquire()).isZero();
+		for (int i = 0; i < 4; i++) {
+			this.now.addAndGet(Duration.ofSeconds(1).toNanos());
+			assertThat(permits.tryAcquire()).as("past the permits of the period").isEqualTo(-1);
+		}
+		this.now.addAndGet(Duration.ofSeconds(5).toNanos());
+
+		assertThat(permits.tryAcquire()).as("the period, counted from its first line, ended: reports the four")
+			.isEqualTo(4);
+		assertThat(permits.tryAcquire()).isZero();
+		assertThat(permits.tryAcquire()).isZero();
+		assertThat(permits.tryAcquire()).isEqualTo(-1);
+	}
+
 }
