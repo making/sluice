@@ -17,7 +17,8 @@ import java.lang.annotation.Target;
 public @interface LegacyOnly {
 
 	/**
-	 * Why: the behaviour the netty engine does not have yet, or why the engine does not matter.
+	 * Why: the behaviour the netty engine does not have yet, or why the engine does not
+	 * matter.
 	 */
 	String value();
 
