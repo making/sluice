@@ -503,6 +503,50 @@ class H2DemuxUpstreamErrorE2ETest {
 	}
 
 	/**
+	 * A stream opened after an upstream's GOAWAY, while the leg still carries the stream
+	 * the upstream named as processed, goes to a new leg and is answered there: the leg
+	 * its upstream retires takes no new stream, and nothing of the new stream reaches the
+	 * upstream that went away. The old leg completes its stream, then closes.
+	 */
+	@Test
+	void aStreamAfterAnUpstreamsGoAwayOpensANewLegWhileTheOldOneDrains() throws Exception {
+		String route = "ue.goaway-drain.test";
+		AtomicReference<@Nullable ScriptedH2Upstream> self = new AtomicReference<>();
+		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {
+			if (frame.type() == TestH2.HEADERS
+					&& Objects.requireNonNull(self.get()).connections().indexOf(connection) > 0) {
+				connection.answer(frame.streamId(), "new-leg");
+			}
+		});
+		self.set(upstream);
+		startClient(route, upstream);
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
+			client.headers(1, true, get(route));
+			ScriptedH2Upstream.Connection connection = upstream.awaitConnection(0, WITHIN);
+			assertThat(connection.await(frame -> frame.type() == TestH2.HEADERS && frame.streamId() == 1, WITHIN))
+				.isNotNull();
+			byte[] goAway = new byte[8];
+			System.arraycopy(TestH2.int32(1), 0, goAway, 0, 4);
+			connection.write(TestH2.GOAWAY, 0, 0, goAway);
+			assertThat(connection.await(frame -> frame.type() == TestH2.GOAWAY, WITHIN))
+				.as("precondition: the relay answered the GOAWAY, its leg draining")
+				.isNotNull();
+			client.headers(3, true, get(route));
+			assertThat(client.awaitEnd(3, WITHIN)).as("stream 3 answered").isTrue();
+			assertThat(TestH2.bodyOf(client.frames(3))).isEqualTo("new-leg");
+			assertThat(client.reset(3)).isNull();
+			assertThat(upstream.connections()).as("over a new leg").hasSize(2);
+			assertThat(connection.frames()).noneMatch(frame -> frame.streamId() == 3);
+			assertThat(client.ended(1)).as("stream 1 still open on the old leg").isFalse();
+			connection.answer(1, "processed");
+			assertThat(client.awaitEnd(1, WITHIN)).isTrue();
+			assertThat(TestH2.bodyOf(client.frames(1))).isEqualTo("processed");
+			assertThat(connection.awaitEof(WITHIN)).as("the old leg closed").isTrue();
+			assertThat(client.goAwayCode()).isEqualTo(-1);
+		}
+	}
+
+	/**
 	 * An upstream connection error while its stream is the only one the client has open
 	 * still ends only the leg: the client gets the {@code 502} and no GOAWAY, and its
 	 * connection idles until the idle timeout closes it with a GOAWAY {@code NO_ERROR}
