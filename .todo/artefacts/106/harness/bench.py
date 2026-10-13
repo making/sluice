@@ -94,7 +94,7 @@ def wait_ready(timeout=90):
 
 
 def start_stack(repo, delay=0, jfr=None, server_opts=(), server_args=(), client_opts=(), upstream_window=65535,
-                tag=''):
+                tag='', client_args=()):
     os.makedirs(OUT, exist_ok=True)
     ports_free()
     start('upstream', ['java', '-Xmx1g', '-cp', CP, 'Upstream', str(UP_H1), str(UP_H2), str(UP_CTL),
@@ -127,7 +127,7 @@ def start_stack(repo, delay=0, jfr=None, server_opts=(), server_args=(), client_
                      '--sluice.client.upstream[0].host=h2.local',
                      f'--sluice.client.upstream[0].target=http://127.0.0.1:{UP_H2}',
                      '--sluice.client.upstream[1].host=h1.local',
-                     f'--sluice.client.upstream[1].target=http://127.0.0.1:{UP_H1}'], f'client{tag}.log')
+                     f'--sluice.client.upstream[1].target=http://127.0.0.1:{UP_H1}', *client_args], f'client{tag}.log')
     wait_ready()
     log('stack ready', 'delay', delay)
 
@@ -575,6 +575,55 @@ def suite_budget(results, tag):
              results)
 
 
+def suite_tl(results, tag):
+    """One h1 download then one h1 upload at the tunnel RTT, three times each, short."""
+    GAUGES[0] = True
+    for i in range(3):
+        run_load(f'{tag}tl download h1 c1 #{i}', lg('h1', 1, 1, f'/bytes?n={64 * MiB}', dur=6), results)
+    for i in range(2):
+        run_load(f'{tag}tl upload h1 c1 #{i}', lg('h1', 1, 1, '/sink', dur=6, extra=('--upload', str(16 * MiB))),
+                 results)
+
+
+def histo_kb(pid, label):
+    """Live heap from one class histogram (a full GC and the count in one safepoint), KiB;
+    the top classes go to out/histo-<label>.txt."""
+    out = subprocess.run(['jcmd', str(pid), 'GC.class_histogram'], capture_output=True, text=True).stdout
+    with open(os.path.join(OUT, f'histo-{label}.txt'), 'w') as f:
+        f.write('\n'.join(out.splitlines()[:25]))
+    m = re.search(r'Total\s+\d+\s+(\d+)', out)
+    return int(m.group(1)) // 1024 if m else -1
+
+
+def nmt_other_kb(pid):
+    """NMT's 'Other' committed KiB (direct buffers among it); -1 without NMT."""
+    out = subprocess.run(['jcmd', str(pid), 'VM.native_memory', 'summary'], capture_output=True, text=True).stdout
+    m = re.search(r'-\s+Other \(reserved=\d+KB, committed=(\d+)KB\)', out)
+    return int(m.group(1)) if m else -1
+
+
+def suite_live(results, tag):
+    """Live heap (after full GCs) of server and client in the middle of 32 h1 downloads and
+    of 32 h1 uploads at full speed, against idle."""
+    idle = {n: histo_kb(procs[n].pid, f'{tag}idle-{n}') for n in ('server', 'client')}
+    idle.update({n + '_nmt_other_kb': nmt_other_kb(procs[n].pid) for n in ('server', 'client')})
+    log(tag, 'live idle', idle)
+    for what, path, extra in [('download', f'/bytes?n={64 * MiB}', ()),
+                              ('upload', '/sink', ('--upload', str(16 * MiB)))]:
+        cmd = ['java', '-Xmx4g', '-cp', CP, 'Load', '--port', str(DATA), *lg('h1', 32, 1, path, dur=12, extra=extra)]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        time.sleep(9)
+        live = {n: histo_kb(procs[n].pid, f'{tag}{what}-{n}') for n in ('server', 'client')}
+        live.update({n + '_nmt_other_kb': nmt_other_kb(procs[n].pid) for n in ('server', 'client')})
+        out = p.communicate()[0]
+        line = [l for l in out.splitlines() if 'MiB/s' in l or 'in_MBps' in l or l.startswith('RESULT')]
+        log(tag, 'live', what, 'c32', live, line[-1][:200] if line else '')
+        results.append({'name': f'{tag}live {what} h1 c32', 'idle_kb': idle, 'live_kb': live})
+        with open(os.path.join(OUT, 'results.jsonl'), 'a') as f:
+            f.write(json.dumps(results[-1]) + '\n')
+        time.sleep(3)
+
+
 def suite_budgetone(results, tag):
     """One h1 connection each way at the tunnel RTT, three times (run with --delay)."""
     GAUGES[0] = True
@@ -677,13 +726,15 @@ def main():
     ap.add_argument('--window-patch', action='store_true')
     ap.add_argument('--server-opt', action='append', default=[])
     ap.add_argument('--server-arg', action='append', default=[])
+    ap.add_argument('--client-arg', action='append', default=[])
+    ap.add_argument('--client-opt', action='append', default=[])
     a = ap.parse_args()
     results = []
     PATCHED[0] = a.patched or a.window_patch
     WINDOW_PATCH[0] = a.window_patch
     try:
         start_stack(a.repo, delay=a.delay, jfr=a.jfr, upstream_window=a.upstream_window, tag=a.tag,
-                    server_opts=a.server_opt, server_args=a.server_arg)
+                    server_opts=a.server_opt, server_args=a.server_arg, client_args=a.client_arg, client_opts=a.client_opt)
         prefix = (a.tag + ' ') if a.tag else ''
         for s in a.suite.split(','):
             globals()['suite_' + s](results, prefix)

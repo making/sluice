@@ -402,3 +402,114 @@ Held connections (live heap after full GC, per connection): unchanged within noi
   and windows held, up to 16 frames and 1MiB each on base). The server's heap
   does not change here because the load client reads everything (the server buffers at
   most 144KiB); what slow readers make it hold is `TunnelBudgetE2ETest`'s case.
+
+## After todo 138: the gRPC transport window fixed at twice the tunnel budget
+
+### Cause (timeline)
+
+Neither side configured the gRPC transport, so both ran grpc-netty 1.83's defaults: a 1MiB
+HTTP/2 window (connection and stream) with BDP auto-tuning on (`NettyServerBuilder` and
+`NettyChannelBuilder` alike). A frame log of one h1 download at a 20ms tunnel RTT
+(`Http2FrameLogger` at DEBUG on both ends, base build) shows the 20.5 MiB/s mode exactly:
+
+```
+06:31:03.015 INBOUND  DATA 262 bytes          <- first bytes of a burst
+06:31:03.015 OUTBOUND WINDOW_UPDATE 0 +524419 / stream 3 +524419
+06:31:03.015 INBOUND  DATA 46 frames 524157 bytes
+06:31:03.040 INBOUND  DATA 262 bytes          <- 25ms later, the next burst
+06:31:03.040 OUTBOUND WINDOW_UPDATE 0 +524419 / stream 3 +524419
+06:31:03.040 INBOUND  DATA 46 frames 508020 bytes ...
+```
+
+(`bench.py <build> tl --delay 10 --server-arg=--logging.level.io.grpc.netty.NettyServerHandler=DEBUG
+--client-arg=--logging.level.io.grpc.netty.NettyClientHandler=DEBUG`, condensed with
+`harness/frametimeline.py out/servertl1.log 06:31:03.000 06:31:03.200`;
+`harness/framesummary.py` counts the SETTINGS, PINGs and WINDOW_UPDATEs of a log.)
+
+netty's local flow controller (window update ratio 0.5, fixed by grpc) grants back once half
+the window was consumed. Each 25ms round trip delivered 512KiB; the receiver consumed it all
+but stayed 131 bytes short of the half-window threshold, so the grant went out only with the
+first bytes of the next burst. Half the window sat consumed and not granted back, the other
+half was in flight: 512KiB per round trip = 20.5 MiB/s, for the whole tunnel stream (the c8 /
+c32 / c100 stacks at 21 MiB/s). The BDP pinger cannot leave this state: it sets the window to
+twice the bytes received during one PING round trip, which is 2 x 512KiB = the window itself,
+so it never grows it (the log shows one PING per 250ms and no SETTINGS after the start in
+the first download of this stack; the client end's tuning, receiving the uploads later in
+the same stack, grew to 1.5 to 2MiB only). When a stack starts in the other state (a burst
+crossing the threshold mid-way), the full 1MiB is in flight (about 39 MiB/s) and the pinger
+can grow the window, up to its 8MiB maximum (it reached about 5MiB in a run without the fixed client window
+of `TunnelTransportWindowE2ETest`); presumably that is the fast stacks' 60 to 166 MiB/s (no
+frame log of a fast stack was taken). Which state a stack lands in depends on the burst phase at
+the start, hence bimodal per run and per stack.
+
+Ruled out: `DelayProxy` reads continuously into an unbounded queue and writes each chunk at
+its due time, so it adds the fixed delay and no window of its own (the 25ms PING round trip
+in the log is the 20ms delay plus processing). `SessionSender` waits on `isReady` (grpc's
+32KiB on-ready threshold), which only bounds what waits in the transport; it never ran dry
+while the window was open (each burst left the sender within 1ms).
+
+### Change
+
+The server (`ServerBuilderCustomizer<NettyServerBuilder>`) and sluice-client
+(`NettyChannelBuilder`) fix `flowControlWindow` at `TunnelBudget#transportWindow()`: twice
+the node's tunnel budget, at least 1MiB, at most 2^31-1; this turns the BDP tuning off. The
+connections' windows already bound what may be in flight; twice the budget keeps the
+budget's worth in flight even with half the window consumed and not granted back.
+`TunnelTransportWindowE2ETest` counts round trips with a proxy that holds the receiver's
+answers back until the sender went quiet: 48 transfers of 4MiB each way, budget 48MiB. Base:
+133 / 142 round trips, at most 1815 / 1927 KiB in one (gRPC's tuning stalled at about 1.5MiB);
+after: 7 / 9 round trips, 49205 KiB in the largest (every connection's full window).
+
+### Numbers
+
+Series `harness/series-138.sh` (rows in `results-138.jsonl`): builds alternated on fresh
+stacks, the budget suite three times each, then the budgetone suite (three single h1
+downloads and uploads per stack) twice each; 20ms tunnel RTT, no surefire JVM running when a
+stack started, load 2.7 to 6.3. `base` is `d84483c`, `after` the change. MiB/s, one value per
+stack (budgetone stacks: three runs each):
+
+| | base | after |
+|---|---|---|
+| download h1 c1 | 20.5 / 20.4 / 20.5 / 20.5 20.7 20.7 / 23.1 36.0 39.2 | 39.2 / 39.1 / 39.7 / 39.2 38.1 38.0 / 39.0 39.0 38.8 |
+| download h2 c1 s1 | 20.6 / 20.5 / 20.7 | 20.7 / 20.7 / 21.0 |
+| download h1 c8 | 79.1 / 21.7 / 25.0 | 320.5 / 293.9 / 328.8 |
+| download h1 c32 | 165.0 / 69.5 / 40.6 | 1399.7 / 1394.0 / 1388.1 |
+| download h1 c100 | 166.3 / 134.1 / 40.6 | 1223.5 / 1224.5 / 1137.2 |
+| upload h1 c1 | 36.9 / 37.0 / 38.0 / 26.4 36.8 37.2 / 20.6 32.0 37.3 | 36.9 / 36.1 / 37.1 / 37.5 36.3 37.8 / 37.8 37.4 36.7 |
+| upload h2 c1 s1 | 1.6 / 1.6 / 1.6 | 1.7 / 1.7 / 1.7 |
+| upload h1 c32 | 52.2 / 133.8 / 61.8 | 1362.1 / 1364.8 / 1342.2 |
+
+- One connection: every after run moved 38.0 to 39.7 MiB/s down and 36.1 to 37.8 up (9
+  runs each over 5 stacks); base moved 20.4 to 20.7 down in 6 of 9 runs (the others 23.1 to
+  39.2) and 20.6 to 38.0 up. So the single
+  connection's two modes were the transport's too; its own 1MiB window now bounds it (about
+  1MiB per 25ms round trip including processing).
+- Many connections: c8 294 to 329 MiB/s (8 x 37 to 41), c32 about 1390 MiB/s down and 1342 to
+  1365 up, where base ranged 21.7 to 166 by stack. c100 (1137 to 1225) is below c32 because
+  the 64MiB budget holds no 100 full windows (a share is about 650KiB; 63.4MiB used).
+  The CPU per process rose with the bytes (about 2.3 server cores at c32, where base used
+  0.3 to 0.5).
+- h2 c1 s1 is unchanged at 20.5 to 21.0 down and 1.6 to 1.7 up in both builds, so the
+  transport does not bound it. The download sits at 512KiB per round trip in every stack,
+  the same figure as the transport's stuck state, here on some 1MiB window of the h2 path
+  (todo 140); the upload is the relay's 64KiB client-facing windows (127).
+- Memory, live heap (class histogram, one full GC and the count in one safepoint) and NMT
+  "Other" (netty's direct buffers) of each process 9s into 32 h1 transfers, against idle
+  (`harness/bench.py live`, run `live3`; load 5.9 when it started, a sibling build had just
+  ended):
+
+| | base | after |
+|---|---|---|
+| idle: server / client heap, direct | 24.6 / 19.9 MiB, 6.3 / 8.4 MiB | 24.5 / 19.9 MiB, 6.3 / 8.4 MiB |
+| 32 downloads: server / client heap | 29.2 / 49.0 MiB (21.6 MiB/s) | 29.3 / 34.0 MiB (994 MiB/s) |
+| 32 downloads: server / client direct | 7.0 / 8.9 MiB | 14.9 / 9.0 MiB |
+| 32 uploads: server / client heap | 55.2 / 24.3 MiB (21.5 MiB/s) | 33.3 / 24.5 MiB (1335 MiB/s) |
+| 32 uploads: server / client direct | 7.2 / 9.2 MiB | 7.2 / 17.1 MiB |
+
+  The receiver now holds about 9MiB more direct memory in flight (frames read off the socket
+  and not yet taken by the connections), within the 30MiB the 32 windows charged to the
+  budget: what it holds was sent against those windows. The sender holds less heap: base's
+  stuck transport left about 30MiB in the sender's queues (the client's on downloads, the
+  server's on uploads). Used heap sampled every 250ms (the series' gauges) reads about
+  450MiB on both processes at the after rates, which is garbage from 1.4GB/s of relaying, not
+  retention (the histogram above).
