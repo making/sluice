@@ -24,3 +24,21 @@ Step 3 of the netty h2 demux migration (context and user decisions: 098). Depend
   SETTINGS_INITIAL_WINDOW_SIZE 0 receives no DATA past its window.
 - An upstream protocol error (e.g. SETTINGS on a stream) gives 502 and the connection
   survives.
+
+## Notes from 099 (engine switch and routing, 2026-10-13)
+
+- What the netty relay (`NettyHttp2DemuxRelay`) does now, pinned by
+  `NettyH2DemuxRelayE2ETest` (netty only): a stream lost to its leg is reset
+  `INTERNAL_ERROR` whether or not a response head was relayed
+  (`aStreamLostWithItsLegIsResetAndTheConnectionGoesOn`: unreachable upstream, no head;
+  `anUpstreamEndingMidResponseResetsItsStream`); a head the leg's encoder refuses is reset
+  `REFUSED_STREAM` (`aHeadTheLegCannotTakeIsRefused`). Rewrite them to this step's 502 /
+  `INTERNAL_ERROR` split. The loss is decided in `LegStreams#onStreamClosed` (`loseLocked`).
+- An upstream GOAWAY: netty closes the leg's streams above its last-stream-id, which today
+  reaches the client as `INTERNAL_ERROR`; map them to `REFUSED_STREAM` in `onGoAwayRead`.
+  A leg that received or sent a GOAWAY already takes no new stream (`takesStreamsLocked`).
+- The 093 test is done: `aRelayAnsweredPageIsHeldToTheClientsStreamWindow` (a no-route
+  page held to a 100-byte stream window); a 502 page written through `refuseLocked` would
+  be held alike.
+- Excluded for netty naming this step: `H2DemuxUpstreamErrorE2ETest` (class) and the three
+  `upstream*` tests of `H2DemuxFrameLimitsE2ETest`.

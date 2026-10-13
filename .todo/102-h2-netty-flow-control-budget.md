@@ -35,3 +35,13 @@ Step 5 of the netty h2 demux migration (context and user decisions: 098). Depend
   sides queue past their pause bytes at once (only frames netty sends on its own count:
   DATA stops at the high water mark). HTTP/2 peers read independently; the stall timeout
   (103) is the backstop. Untested.
+
+## Notes from 099 (engine switch and routing, 2026-10-13)
+
+- The relay forwards DATA as `TestBridge` does (retained slice, consumed on the other
+  hop's write); nothing else of flow control is in yet.
+- Excluded for netty naming this step: `H2DemuxFlowControlE2ETest`, `H2DemuxBudgetE2ETest`,
+  `H2DemuxClientWindowE2ETest`, `H2DemuxLegWriterE2ETest`,
+  `H2DemuxUpstreamFlowControlE2ETest`, `H2DemuxWaitingStreamBudgetE2ETest` (classes) and
+  `H2ReroutingE2ETest#grantsConnectionWindowWhileRelayingRequestData` (netty's auto refill
+  grants the connection window only past half of it).

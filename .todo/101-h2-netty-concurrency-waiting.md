@@ -23,3 +23,12 @@ Step 4 of the netty h2 demux migration (context and user decisions: 098). Depend
 - `StreamBufferingEncoder`: `Hop.Builder#codec(c -> c.encoderEnforceMaxConcurrentStreams(true))`.
 - The 091 deadline: schedule on `hop.ctx().executor()`; the loop's ticker runs it under the
   lock when due (no I/O needed, `LoopTest`).
+
+## Notes from 099 (engine switch and routing, 2026-10-13)
+
+- Today a head past the upstream's `MAX_CONCURRENT_STREAMS` fails the leg encoder's
+  `writeHeaders` promise and the client gets `REFUSED_STREAM`
+  (`NettyH2DemuxRelayE2ETest#aHeadTheLegCannotTakeIsRefused`); this step replaces it with
+  waiting, so rewrite that test.
+- `H2DemuxUpstreamStreamLimitE2ETest` is excluded for netty at class level naming this
+  step.

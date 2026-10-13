@@ -20,3 +20,18 @@ Step 7 of the netty h2 demux migration (context and user decisions: 098). Depend
 
 - `Hop.Builder#onInactive` runs under the lock when a leg's channel closes (leg
   retirement); `Hop#bytesRead()` / `bytesWritten()` count the pipe bytes for metrics.
+
+## Notes from 099 (engine switch and routing, 2026-10-13)
+
+- Done already: per-stream request lines (with the route, `-` for refused and malformed
+  heads, the 421 line, the `COMPRESSION_ERROR` line), the first leg's connection id, the
+  `trackedStreams` meter (`H2DemuxConnectE2ETest` needs it), `misdirectedForHttp1`, and
+  `sluice_h2demux_connections_total{engine}`. A leg leaves the route's map when its channel
+  closes and a closed or GOAWAY'd leg takes no new stream (`takesStreamsLocked`).
+- Missing: leg slots (`ConnectionLimits#tryAcquireLeg`; every leg opens on the
+  connection's slot today), the byte counters (`sluice.tunnel.bytes`, `access.bytes`), the
+  reset / refused / legs-failed meters. The admission is released once every leg's
+  `VirtualConnection#afterQueued` ran (`settle`).
+- Excluded for netty naming this step: `H2DemuxLegLimitE2ETest`. Not parameterized (mixed
+  classes): `QueuedFramesHoldSlotsE2ETest`, `ConnectionReleaseE2ETest` (its
+  `theEndOfAnH2RelayReleasesItsSlot`).
