@@ -39,3 +39,8 @@ So `UNBUDGETED_BYTES` / `RESPONSE_QUEUE_BYTES` do not hold against an upstream s
 - An upstream flooding 1xx heads at a client that does not read: what the relay holds
   stays within the derived bounds (and a negative control without the fix passes them).
 - Table-referencing request and response heads: the bytes queued per read stay bounded.
+
+## Notes from 107 (legacy relay removed, 2026-10-13)
+
+No test was disabled for this item; README's "never refused" sentence ("Connection
+limits") stays until it is done.

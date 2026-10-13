@@ -100,3 +100,56 @@ Step 8 of the netty h2 demux migration (context and user decisions: 098). Depend
   of `H2DemuxUpstreamFlowControlE2ETest` now call `settings(null)` first; a request with
   a body must not set END_STREAM on its head (`H2ReroutingE2ETest` had, the legacy relay
   ignored the DATA after it).
+
+## Notes from 107 (legacy relay removed, 2026-10-13)
+
+Every h2 connection runs on netty now; no engine switch. Disabled (`@Disabled`, reason
+naming what is to be rewritten) until this step -- rewrite for netty's semantics or delete
+where the behaviour is intentionally gone:
+
+- `H2DemuxFrameLimitsE2ETest#clientHeaderBlockAboveTheListLimitEndsTheConnection`.
+- `H2DemuxFramingE2ETest#requestHeaderBlocksReachTheUpstreamContiguous` (fails on netty:
+  stream 1's endless response is reset `INTERNAL_ERROR`; its stub sends SETTINGS only once
+  stream 1 arrived), `#clientSettingsReachTheUpstreamWithoutTheHeaderTableSize` (settings
+  replay), `#framesAfterTheClientEndedTheStreamAreDropped` (stub without SETTINGS first).
+  The class's other three tests run on netty.
+- `H2DemuxStallE2ETest#streamOverItsWindowClosesTheConnection` (netty answers
+  `ENHANCE_YOUR_CALM`, the test expects `FLOW_CONTROL_ERROR`).
+- `H2DemuxClientFrameValidationE2ETest#violationTheCodecAnswersOtherwiseEndsTheConnection`
+  (rows moved out of `violations()`: PRIORITY of 4 / 6 on an idle stream, padded DATA of 0,
+  `SETTINGS_NO_RFC7540_PRIORITIES` of 2: netty does not end the connection),
+  `#counterpartTheCodecAnswersOtherwiseKeepsTheConnection` (rows moved out of
+  `counterparts()`: RST_STREAM / WINDOW_UPDATE on an even stream: netty ends the
+  connection), `#initialWindowChangePastTheMaximumEndsTheConnection`,
+  `#initialWindowChangeToTheMaximumKeepsTheConnection`,
+  `#initialWindowChangeSparesAStreamWhoseResponseEnded`. The other violation and
+  counterpart rows run on netty.
+- `H2DemuxClientWindowE2ETest#zeroStreamWindowIncrementResetsOnlyThatStream`,
+  `#zeroIncrementOnAnUntrackedStreamIsIgnored`, `#zeroIncrementOnAStreamClosedBothWaysIsIgnored`
+  and `H2DemuxBudgetE2ETest#aStreamWhoseResetWaitsForTheUpstreamIsResetOnceAndRelaysNothing`
+  (all also count the protocol reset meter, 104).
+- `H2DemuxLegWriterE2ETest#upstreamPingFloodEndsItsLeg` (netty pauses reading instead; also
+  the tunnel byte counter, 104).
+
+Deleted with the legacy relay (netty counterpart in parentheses, or gone on purpose):
+`H2DemuxResetRaceE2ETest` (class, write-seam races; the lock-boundary tests of this step's
+scope replace it), `H2DemuxEngineE2ETest` (engine switch), `Http2HeaderBlockEncodingTest`
+(legacy encoder), `H2DemuxUpstreamErrorE2ETest#aConnectionErrorStillDeliversTheResponsesTheUpstreamCompleted`
+(`NettyH2DemuxRelayE2ETest#aResponseTheUpstreamCompletedOutlivesItsConnectionError`),
+`#upstreamIgnoringTheGoAwayIsClosedAfterTheGrace`
+(`NettyH2DemuxRelayE2ETest#anUpstreamIgnoringTheErrorGoAwayIsClosedAfterTheHopsCloseGrace`),
+`#clientGoneWhileTheLegFailsReleasesEverything`
+(`NettyH2DemuxRelayE2ETest#theClientGoingAwayWhileItsLegFailsEndsTheRelay`),
+`H2DemuxBudgetE2ETest#clientGoneAsTheRelayWritesItsResetReleasesWhatTheRelayHeld`
+(`NettyH2DemuxBudgetE2ETest#aClientGoneWithItsBytesChargedReleasesThem`),
+`#upstreamFramesOnAStreamTheRelayResetNeverReachTheClient`
+(`NettyH2DemuxBudgetE2ETest#aResponseHeldForAStreamTheRelayResetsIsReleased`),
+`H2DemuxClientWindowE2ETest#trailersPastTheAllowancePauseTheLegUntilTheClientGrants`
+(`#trailersFollowTheWaitingData`, `H2DemuxBudgetE2ETest#trailersPastTheAllowanceWithTheBudgetExhaustedResetOnlyTheirStream`),
+`H2DemuxLegWriterE2ETest#idleLegWriterSleeps` (leg writer thread and its wakeup counter,
+gone), `#clientWindowUpdatesCoalesceWhileQueued` (no relayed window updates).
+
+README after 107: the h2 sections describe the netty relay; "h2 framing limits" says
+netty's codec answers the client's other protocol errors without listing them, and the
+connection-specific-field sentence of "h2 request heads" was dropped (no test pinned it
+on netty). Complete both with this step's rewrites.

@@ -88,3 +88,35 @@ Step 6 of the netty h2 demux migration (context and user decisions: 098). Depend
 - The relay reviews its accounts after each action of its loop (`Loop#afterSettle`),
   and its hops run a loop action after each writer batch while it queues anything
   (`Hop#watchWrites`): a timer that reads `Hop#queuedBytes()` sees fresh numbers there.
+
+## Notes from 107 (legacy relay removed, 2026-10-13)
+
+Every h2 connection runs on netty now; no engine switch. Disabled (`@Disabled`, reason
+naming the missing behaviour) until this step; re-enable each, then drop the "none yet" /
+"not yet" wording below:
+
+- Idle timeout: `KeepAliveIdleTimeoutE2ETest#aTlsTerminatedH2ConnectionWithNoOpenStreamIsClosedAtTheIdleTimeout`,
+  `#anH2ConnectionWithNoOpenStreamIsClosedWithAGoAwayAtTheIdleTimeout`,
+  `#anH2ConnectionClosedByItsClientLeavesNoDeadlineBehind`, `#pingsDoNotKeepAnIdleH2ConnectionOpen`,
+  `#anH2StreamOpenLongerThanTheIdleTimeoutIsRelayed`, `#aStreamTheRelayAnswersItselfStartsTheIdleTimeoutOver`,
+  `#anIdleH2ConnectionWhoseClientStoppedReadingIsClosedAfterTheTeardownGrace`,
+  `#anH2ConnectionOpeningAStreamEverySecondStaysOpen` (passes on netty, vacuously: nothing
+  closes an idle h2 connection); `H2DemuxConnectE2ETest#aConnectionOpeningWithAConnectIdlesOutAtTheIdleTimeout`;
+  `H2DemuxUpstreamErrorE2ETest#aConnectionErrorWithNothingElseOpenLeavesTheConnectionToTheIdleTimeout`.
+- Stall timeout: `H2DemuxStallTimeoutE2ETest` (class; its "not cut" tests pass on netty
+  vacuously, the "closed at the stall timeout" ones fail);
+  `H2DemuxConnectE2ETest#aRequestStalledOnAConnectionOpeningWithAConnectIsCutAtTheStallTimeout`.
+- Half-close drain: `H2DemuxUpstreamFlowControlE2ETest#largeResponseReachesAHalfClosedClient`,
+  `#nettyUpstreamAnswersAHalfClosedClient`, `#queuedRequestDataIsWrittenBeforeTheHalfClose`,
+  `#clientGoneAfterTheUpstreamsHalfCloseReleasesTheUpstreamConnection`;
+  `H2DemuxUpstreamStreamLimitE2ETest#halfClosedClientGetsTheResponseOfItsWaitingStream`;
+  `H2DemuxStallE2ETest#halfCloseAfterAFinishedRequestStillGetsTheResponse`.
+- PING ordering: `H2DemuxLegWriterE2ETest#upstreamPingIsAckedAheadOfQueuedData` (also waits
+  on the tunnel byte counter, 104).
+- Docs saying "none yet" for h2 that this step corrects: README (`idle-timeout` /
+  `stall-timeout` rows, "Connection limits" idle / stall / half-close probe paragraphs, the
+  "h2 demux ..., not yet there" and "h2 flow control" bullets, the h2 upstream errors
+  bullet's idle sentence), `SluiceServerProperties.Limits` javadoc (`idleTimeout`,
+  `stallTimeout`), `application.properties` (`idle-timeout`, `stall-timeout`).
+- `ConnectionLimits.KeepAliveDeadline#watchStalls` (the sampled stall clock, unit-tested in
+  `ConnectionLimitsTest`) was kept for this step although nothing calls it now.

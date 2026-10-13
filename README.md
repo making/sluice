@@ -258,18 +258,17 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.data-tls-bundle` | - | SSL bundle name for data plane TLS termination (h2 / http/1.1 via ALPN, `force-http1` flips the preference); unset = plaintext only (TLS connections are served by upstreams with `tls-passthrough=true`) |
 | `sluice.ca-bundle` | - | SSL bundle whose keystore holds the CA private key + certificate; enables client certificate issuance in the console (the signed certificates authenticate against the gRPC `client-auth=REQUIRE` truststore, no restart) |
 | `sluice.proxy-protocol` | `false` | parse the PROXY protocol (v1 / v2) header an SNAT front end prepends on the data plane: the header is consumed before routing / relay (never forwarded) and its source address becomes the connection peer for access control and the access log; headerless connections are unaffected, a malformed header fails the connection |
-| `sluice.limits.max-connections` | `0` = derived from the max heap | connections open at once over the data port and every tcp route port, an h2 connection counting once more per further route it reaches; see "Connection limits" |
+| `sluice.limits.max-connections` | `0` = derived from the max heap | connections open at once over the data port and every tcp route port (an h2 connection counts once, whatever routes it reaches); see "Connection limits" |
 | `sluice.limits.max-connections-per-address` | `0` = no limit beyond `max-connections` | connections open at once from one source address (the PROXY protocol source with `proxy-protocol=true`, the socket peer otherwise) |
 | `sluice.limits.head-timeout` | `10s` | one deadline for the whole head phase of a data plane connection (PROXY header, TLS handshake, request head); on plaintext and TLS-terminated HTTP/1.1 it also bounds a later request head left incomplete between requests |
-| `sluice.limits.idle-timeout` | `60s` | how long a plaintext or TLS-terminated HTTP connection may idle between requests before it is closed; see "Connection limits" |
-| `sluice.limits.stall-timeout` | `60s` | how long a request or response in flight on a plaintext or TLS-terminated HTTP connection may wait on its client without progress before the connection is closed; see "Connection limits" |
+| `sluice.limits.idle-timeout` | `60s` | how long a plaintext or TLS-terminated HTTP/1.1 connection may idle between requests before it is closed (h2: none yet); see "Connection limits" |
+| `sluice.limits.stall-timeout` | `60s` | how long a request or response in flight on a plaintext or TLS-terminated HTTP/1.1 connection may wait on its client without progress before the connection is closed (h2: none yet); see "Connection limits" |
 | `sluice.limits.stall-min-bytes` | `16KB` | the bytes moved to or from the client that count as progress against `stall-timeout` (`1B`: every byte counts) |
 | `sluice.limits.verbatim-idle-timeout` | `0` = off | how long a connection relayed verbatim (TLS passthrough, tcp route, hostless, upgraded HTTP/1.1) may relay no byte in either direction before it is closed, for the routes whose upstream sets no `verbatim-idle-timeout`; see "Connection limits" |
 | `sluice.limits.tunnel-stall-timeout` | `60s` | how long a tunnel stream may hold frames queued for its client while not ready, the client taking none of them, before the session is failed; `0` = off; see "Connection limits" |
 | `sluice.limits.half-close-probe-interval` | `1s` | quiet after which a plaintext or TLS-terminated HTTP/1.1 connection whose client ended its side, a response owed, gets a `100 Continue` to learn whether the client is gone; `0` = off; see "Connection limits" |
-| `sluice.limits.h2-queue-budget` | `0` = an eighth of half the max heap | bytes the h2 demux relays may queue towards upstreams beyond each connection's allowance, shared by all of them; see "Connection limits" |
-| `sluice.limits.h2-stream-wait-timeout` | `30s` | how long an h2 stream may wait for a place within its upstream's `SETTINGS_MAX_CONCURRENT_STREAMS` before it is refused with `REFUSED_STREAM`; `0` = off; `sluice.h2-demux-engine=netty` only; see "Connection limits" |
-| `sluice.h2-demux-engine` | `legacy` | the relay demultiplexing plaintext and TLS-terminated h2 connections: `legacy` / `netty` (netty's HTTP/2 codec, under migration and not for production yet: it routes each stream by its `:authority`, rewrites hosts, answers the no-route / forbidden / `421` pages through the client's flow control, keeps an upstream's errors to its stream or upstream connection (see the h2 upstream errors below) holds streams for an upstream's concurrency limit and keeps to the queue budget with per-hop windows (see "Connection limits"), but has no idle / stall timeouts or leg limits so far); `sluice_h2demux_connections_total` counts the connections each engine got |
+| `sluice.limits.h2-queue-budget` | `0` = an eighth of half the max heap | bytes the h2 demux relays may hold, both ways, beyond each connection's allowance, shared by all of them; see "Connection limits" |
+| `sluice.limits.h2-stream-wait-timeout` | `30s` | how long an h2 stream may wait for a place within its upstream's `SETTINGS_MAX_CONCURRENT_STREAMS` before it is refused with `REFUSED_STREAM`; `0` = off; see "Connection limits" |
 | `sluice.tcp-port-range` | (unset = any port) | listen ports a client may claim for tcp routes, comma separated single ports or `min-max` ranges (e.g. `9000-9010,8080`); a port outside the range is not bound |
 | `sluice.http-load-balance` | `smallest-client-id` | target picked when several clients serve the same domain: `smallest-client-id` (deterministic across nodes) / `round-robin` (per node) / `random` |
 | `sluice.tcp-load-balance` | `smallest-client-id` | target picked for tcp routes when several clients serve the same listen port (same values); the listen port bind itself always follows the smallest client id |
@@ -537,41 +536,36 @@ peer dripping its head is cut as well. Rejected connections are logged as rate-l
 every node (`sluice.client.max-connections`): a `CONNECT` beyond it gets an ERROR without a
 dial, and the server closes the public connection.
 
-A plaintext or TLS-terminated HTTP connection idle between requests is closed after
-`sluice.limits.idle-timeout`, releasing its slot: HTTP/1.1 once every response is relayed
-and nothing of a next request has arrived (a next request head left incomplete is then cut
-by `head-timeout`), h2 once no stream is open (with a GOAWAY `NO_ERROR`; PINGs do not count
-as activity). A response or h2 stream taking longer than the timeout is not cut, nor is an
-upgraded connection (WebSocket; a connection whose upgrade the upstream declines stays
-HTTP). Behind a front end that reuses its connections to the data plane, set the timeout above
+A plaintext or TLS-terminated HTTP/1.1 connection idle between requests is closed after
+`sluice.limits.idle-timeout`, releasing its slot: once every response is relayed and
+nothing of a next request has arrived (a next request head left incomplete is then cut by
+`head-timeout`). A response taking longer than the timeout is not cut, nor is an upgraded
+connection (WebSocket; a connection whose upgrade the upstream declines stays HTTP). An h2
+connection has no idle timeout yet: a client may hold an idle h2 connection, and its
+slot, open for good. Behind a front end that reuses its connections to the data plane, set the timeout above
 the front end's idle timeout, so the front end closes an idle connection before sluice
 does. Connections closed so count as
 `sluice.data.connections.idle.closed`.
 
-While a request or response is in flight on such a connection, `sluice.limits.stall-timeout`
-bounds the time the relay waits on the client without `sluice.limits.stall-min-bytes`
-moving to or from it (the counterpart of nginx `send_timeout` / `client_body_timeout`, with a
-minimum rate): a write to the client not completing (it does not read), a response waiting
-for the client's h2 connection window, an h2 response begun whose stream window the client
-leaves exhausted, or a request body that is due and not sent -- an HTTP/1.1 body announced
-by `Content-Length` or chunked, an h2 stream not ended by the client. A client dripping
-bytes below the minimum is cut as if it sent none. The connection is closed (h2: GOAWAY
-`ENHANCE_YOUR_CALM` first) and counted as `sluice.data.connections.stall.closed`. Waiting
-for an upstream does not count: a slow or long-polling response, an upload the upstream does
-not read yet, an h2 request whose window the relay withholds. Nor does a client awaiting a
-`100 Continue` it asked for (until a response head or a byte of its body), an h2 request
-while its response is in progress (a streaming exchange), or an h2 CONNECT stream (a
-tunnel). The time waited is checked eight times per timeout, so a stall is cut up to a
-quarter of the timeout past it. The HTTP/1.1 relay measures the time it waits; the h2 relay
-is sampled at each check instead, and a check finding it not waiting voids the intervals on
-both sides. Write progress is what the client's TCP stack accepts: once the buffers towards
-a client that reads slowly have filled up, a blocked write may return long after the client
-resumed reading (observed on Linux loopback: only once the client drained about 900KB), so
-keep the timeout well above such gaps.
-The HTTP/1.1 relay writes in 16KiB pieces, each counted as progress once it completes. A
-client streaming small h2 messages (a gRPC client stream) slower than the minimum is cut too:
-set `stall-min-bytes=1B` to count every byte, or raise the timeout. Connections relayed
-verbatim keep no stall timeout; see the verbatim idle timeout below.
+While a request or response is in flight on such an HTTP/1.1 connection,
+`sluice.limits.stall-timeout` bounds the time the relay waits on the client without
+`sluice.limits.stall-min-bytes` moving to or from it (the counterpart of nginx
+`send_timeout` / `client_body_timeout`, with a minimum rate): a write to the client not
+completing (it does not read), or a request body announced by `Content-Length` or chunked
+that is due and not sent. A client dripping bytes below the minimum is cut as if it sent
+none. The connection is closed and counted as `sluice.data.connections.stall.closed`.
+Waiting for an upstream does not count: a slow or long-polling response, an upload the
+upstream does not read yet. Nor does a client awaiting a `100 Continue` it asked for (until
+a response head or a byte of its body). The time waited is checked eight times per
+timeout, so a stall is cut up to a quarter of the timeout past it. Write progress is what
+the client's TCP stack accepts: once the buffers towards a client that reads slowly have
+filled up, a blocked write may return long after the client resumed reading (observed on
+Linux loopback: only once the client drained about 900KB), so keep the timeout well above
+such gaps. The relay writes in 16KiB pieces, each counted as progress once it completes. A
+client streaming small pieces slower than the minimum is cut too: set
+`stall-min-bytes=1B` to count every byte, or raise the timeout. h2 connections have no
+stall timeout yet, and connections relayed verbatim keep none; see the verbatim idle
+timeout below.
 
 A connection relayed verbatim -- TLS passthrough, a tcp route, a hostless connection (a
 RESP head, plaintext or TLS-terminated), an upgraded HTTP/1.1 connection (a WebSocket,
@@ -623,8 +617,8 @@ only half-closed reads the 100s, then its response. A gone client is not noticed
 held until the upstream answers or closes (for a wasmlet route, its request budget), once
 a response has begun (nothing can be added to it), towards an HTTP/1.0 request (which must
 not get a 1xx), while a request asking for an upgrade awaits its answer (the relay reads
-nothing from the client meanwhile), and after the four probes. `0` turns the probe off. h2
-relays probe with PINGs instead.
+nothing from the client meanwhile), and after the four probes. `0` turns the probe off. The h2
+demux has no such probe yet.
 
 The clients measured (curl, wget, Go, the JDK `HttpClient` and `HttpURLConnection`,
 Python's `http.client`, Node's `http` and `fetch`) do not half-close after a request, so a
@@ -640,78 +634,62 @@ The receive buffer holds at most the 1MiB window of unread payload, coalesced in
 segments whatever the size of the DATA frames, plus 37KiB: a partly read and a partly
 filled segment, and the overhead of at most 80 segments.
 
-h2 (plaintext and TLS-terminated) relays each stream to a virtual connection of its
-route, one per route the connection reaches: every one beyond the first takes a slot of
-`sluice.limits.max-connections`, and a stream whose route needs one while none is free is
-refused with `REFUSED_STREAM`. A stream beyond the upstream's
+h2 (plaintext and TLS-terminated) is demultiplexed on netty's HTTP/2 codec: the relay
+is the HTTP/2 endpoint of the client connection and a client of one upstream connection
+-- a virtual connection -- per route the connection reaches, all of them on the
+connection's own slot of `sluice.limits.max-connections` (a further upstream connection
+takes no slot of its own yet). A stream beyond the upstream's
 `SETTINGS_MAX_CONCURRENT_STREAMS` (one until the upstream's first SETTINGS) waits in the
-relay, for the same virtual connection, until one of the streams there closes. With
-`sluice.h2-demux-engine=netty` a stream still waiting after
-`sluice.limits.h2-stream-wait-timeout` (30s; `0` = off) is refused with `REFUSED_STREAM`,
-its upstream never having seen it, so an upstream that keeps its streams open or announces
-a limit of 0 does not hold it for good; the legacy engine has no such deadline. What the
-relay queues towards the upstreams is bounded across connections: each connection may
-queue 128KiB, and the bytes beyond it are charged to `sluice.limits.h2-queue-budget`,
-shared by every h2 connection. While a connection is
-past its 128KiB and the budget is exhausted, the relay withholds its connection window
-(the client stops sending once the at most 64KiB it holds are spent) until the
-connection's own queue drains below 128KiB or the budget has room again; a new stream
-whose head fits neither is refused with `REFUSED_STREAM`, and trailers that fit neither
-reset their stream (`RST_STREAM` `ENHANCE_YOUR_CALM` to the client, `CANCEL` to the
-upstream, the stream's queued data and waiting response dropped) while the connection's
-other streams go on; what the upstream still sends on that stream is dropped. While the
-window is withheld, the streams waiting for an upstream's concurrency limit hold at most
-128KiB of the connection's queue: past it the most recent of them are refused with
-`REFUSED_STREAM` (their upstream never saw them; the client may retry them), since their
-bytes drain only once a stream ahead of them closes, which may need the very request body
-the withheld window holds back. So a connection whose upstreams read keeps flowing however exhausted the budget is, while
-connections whose upstreams do not read stop at the budget plus what each queues outside
-it: its 128KiB, the 64KiB of connection window it still holds, and per stream a buffer
-rounding (under 1KiB), a reset and a window update, about 295KiB
-(`Http2DemuxRelay.UNBUDGETED_BYTES`).
+relay, for the same upstream connection, until one of the streams there closes; a stream
+still waiting after `sluice.limits.h2-stream-wait-timeout` (30s; `0` = off) is refused
+with `REFUSED_STREAM`, its upstream never having seen it, so an upstream that keeps its
+streams open or announces a limit of 0 does not hold it for good.
 
-With `sluice.h2-demux-engine=netty` the windows are per hop. The relay announces a
-64KiB stream window to the client and to each upstream, grants a stream's window back
-only for what it wrote on the other hop, and refills its connection windows as DATA
-arrives: a stream held by its upstream or by its client holds at most one stream window
-in the relay, and the connection's other streams go on, on the same upstream
-connection too. DATA held for a stream is copied into one buffer rounded up to 1KiB,
-however small the frames. What the relay holds -- that DATA and the header blocks not
-yet written, both ways, plus the writer queue of the client connection and of each
-upstream connection -- is charged to the same budget past the same 128KiB. Past it with
-the budget exhausted, the relay withholds the connection window of the client and of
-every upstream connection (a peer stops once the at most 64KiB it holds are spent; DATA
-past them ends its connection with GOAWAY `FLOW_CONTROL_ERROR`), refuses new streams,
-resets trailers and refuses waiting streams as above. A connection then holds outside
-the budget its 128KiB, what its client still sends (the 16KiB read under way, 64KiB of
-window, under 1KiB of rounding per stream: 180KiB) and its client connection's writer
-queue (a connection is no longer read past 256KiB queued, plus at most 64KiB: 320KiB),
-about 628KiB (`NettyHttp2DemuxRelay.UNBUDGETED_BYTES`); each upstream connection adds
-its upstream's 180KiB and its own 320KiB writer queue, about 500KiB
-(`NettyHttp2DemuxRelay.RESPONSE_QUEUE_BYTES`). Not covered yet: the netty engine opens
-every upstream connection of an h2 connection on the connection's own slot, so one
-reaching several routes holds 500KiB per further route beyond its slot's worst case;
-and header blocks an upstream sends (response heads, 1xx, trailers) are charged to the
-budget but never refused.
-
-Towards the client, each leg holds what the client's connection window does not admit
-yet: at most the 64KiB of connection window the relay granted its upstream (granted back
-only as that data is written to the client), plus trailers waiting behind it up to one
-header block (about 64KiB; past it the leg stops reading its upstream until the client
-grants) and per stream a buffer rounding, about 228KiB (`Http2DemuxRelay.RESPONSE_QUEUE_BYTES`).
+The windows are per hop. The relay announces a 64KiB stream window to the client and to
+each upstream, grants a stream's window back only for what it wrote on the other hop, and
+refills its connection windows as DATA arrives (a connection window is granted back once
+half of it is spent, exactly what was spent): a stream held by its upstream or by its
+client holds at most one stream window in the relay, and the connection's other streams
+go on, on the same upstream connection too. DATA held for a stream is copied into one
+buffer rounded up to 1KiB, however small the frames. What the relay holds -- that DATA
+and the header blocks not yet written, both ways, plus the writer queue of the client
+connection and of each upstream connection -- is bounded across connections: each
+connection may hold 128KiB, and the bytes beyond it are charged to
+`sluice.limits.h2-queue-budget`, shared by every h2 connection. Past its 128KiB with the
+budget exhausted, the relay withholds the connection window of the client and of every
+upstream connection (a peer stops once the at most 64KiB it holds are spent) until the
+connection drains below 128KiB or the budget has room again; a new stream whose head
+does not fit is refused with `REFUSED_STREAM`, and trailers that do not fit reset their
+stream (`RST_STREAM` `ENHANCE_YOUR_CALM` to the client, `CANCEL` to the upstream) while
+the connection's other streams go on. While the window is withheld, the streams waiting
+for an upstream's concurrency limit hold at most 128KiB of the connection: past it the
+most recent of them are refused with `REFUSED_STREAM` (their upstream never saw them; the
+client may retry them), since their bytes drain only once a stream ahead of them closes,
+which may need the very request body the withheld window holds back. So a connection
+whose peers read keeps flowing however exhausted the budget is. A connection then holds
+outside the budget its 128KiB, what its client still sends (the 16KiB read under way,
+64KiB of window, under 1KiB of rounding per stream: 180KiB) and its client connection's
+writer queue (a connection is no longer read past 256KiB queued, plus at most 64KiB:
+320KiB), about 628KiB (`NettyHttp2DemuxRelay.UNBUDGETED_BYTES`); each upstream connection
+adds its upstream's 180KiB and its own 320KiB writer queue, about 500KiB
+(`NettyHttp2DemuxRelay.RESPONSE_QUEUE_BYTES`). Not covered yet: every upstream connection
+of an h2 connection opens on the connection's own slot, so one reaching several routes
+holds 500KiB per further route beyond its slot's worst case; and header blocks an
+upstream sends (response heads, 1xx, trailers) are charged to the budget but never
+refused.
 
 An unset (`0`) budget is an eighth of half the max heap, and an unset (`0`) connection
-limit is derived so that the worst case of every slot (2.16MiB + 628KiB + 500KiB, the
-netty engine's bounds; the legacy engine's are lower) and the budget fit in half the max
-heap: `max(1, (max heap / 2 - budget) / 3.26MiB)`, e.g. 53 for a 400MiB heap, 549 for
+limit is derived so that the worst case of every slot (2.16MiB + 628KiB + 500KiB) and the
+budget fit in half the max heap: `max(1, (max heap / 2 - budget) / 3.26MiB)`, e.g. 53 for a 400MiB heap, 549 for
 4GiB. The effective values are logged at startup (`data plane
 connection limit` / `upstream connection limit`) and exported as gauges; with the 512Mi
 container of `k8s.md` they follow the heap the server gets there.
 
 A slot is released only once its connection ended and the frames it queued for the tunnel
 stream left the sender, on the server as on the client (`sluice.client.max-connections`);
-the end of the tunnel session drops the frames and releases their slots. A closed h2 leg
-keeps its slot the same way, and an HTTP/1.1 connection switching routes sends nothing to
+the end of the tunnel session drops the frames and releases their slots. An h2
+connection keeps its slot until the frames each of its upstream connections queued left
+the same way, and an HTTP/1.1 connection switching routes sends nothing to
 the new route until the frames queued for the previous one left. So the send queues of
 ended connections stay within the bound; while a stream stays not ready, their slots stay
 taken until it drains or the session ends.
@@ -737,7 +715,7 @@ bounds how long one can hold slots.
   cluster warmup window and while draining (see "Cluster (scale-out)")
 - client `GET /actuator/health` (port 9001) - UP while at least one per-node tunnel stream is
   established; the `tunnel` detail shows the connection state and `nodes` each node's stream state
-- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`, `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_tunnel_stall_seconds` (how long a tunnel stream has held frames queued for its peer, not ready, with none taken; on the server the most stalled session's, 0 when none) / `sluice_tunnel_stall_failures_total` (tunnel streams failed by the stall watchdog), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_tunnel_sessions_build_unknown` (connected clients without a build, see "Console"), `sluice_h2demux_queued_bytes` (bytes the h2 demux holds queued towards upstreams, one series per route; with the netty engine what it holds of a route's streams both ways plus the upstream connections' writer queues), `sluice_h2demux_budget_bytes` / `sluice_h2demux_budget_used_bytes` (the shared h2 queue budget and the bytes charged to it, which may pass the budget by what the relays cannot refuse), `sluice_h2demux_window_withheld_total` (times a connection window was withheld for want of budget), `sluice_h2demux_streams_refused_total` (`reason` = `budget` / `leg-limit` / `waiting`: a stream waiting for its upstream's concurrency limit refused to free a connection whose window is withheld / `wait-timeout`: one refused past `sluice.limits.h2-stream-wait-timeout`), `sluice_h2demux_streams_reset_total` (streams the relay reset on its own account, `reason` = `budget` / `protocol` (the client's stream error) / `upstream` (an upstream's stream error)), `sluice_h2demux_streams_misdirected_total` (streams answered `421`, `reason` = `force-http1`), `sluice_h2demux_legs_failed_total` (upstream connections ended by the upstream's connection error, with a GOAWAY to it), `sluice_h2demux_connections_total` (h2 connections demultiplexed, `engine` = `legacy` / `netty`, see `sluice.h2-demux-engine`) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_rejected_total` (`reason` = `limit` / `address-limit` / `head-timeout`) / `sluice_data_connections_idle_closed_total` (connections closed for idling between requests) / `sluice_data_connections_stall_closed_total` (connections closed for an exchange stalled on its client)
+- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`, `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_tunnel_stall_seconds` (how long a tunnel stream has held frames queued for its peer, not ready, with none taken; on the server the most stalled session's, 0 when none) / `sluice_tunnel_stall_failures_total` (tunnel streams failed by the stall watchdog), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_tunnel_sessions_build_unknown` (connected clients without a build, see "Console"), `sluice_h2demux_queued_bytes` (bytes the h2 demux holds of a route's streams, both ways, plus the upstream connections' writer queues, one series per route), `sluice_h2demux_budget_bytes` / `sluice_h2demux_budget_used_bytes` (the shared h2 queue budget and the bytes charged to it, which may pass the budget by what the relays cannot refuse), `sluice_h2demux_window_withheld_total` (times a connection window was withheld for want of budget), `sluice_h2demux_streams_refused_total` (`reason` = `budget` / `waiting`: a stream waiting for its upstream's concurrency limit refused to free a connection whose window is withheld / `wait-timeout`: one refused past `sluice.limits.h2-stream-wait-timeout`), `sluice_h2demux_streams_reset_total` (streams the relay reset on its own account, `reason` = `budget`), `sluice_h2demux_streams_misdirected_total` (streams answered `421`, `reason` = `force-http1`) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_rejected_total` (`reason` = `limit` / `address-limit` / `head-timeout`) / `sluice_data_connections_idle_closed_total` (connections closed for idling between requests) / `sluice_data_connections_stall_closed_total` (connections closed for an exchange stalled on its client)
 
 ## Console
 
@@ -840,10 +818,9 @@ docker run sluice-client --sluice.server-url=grpc://host.docker.internal:8001 \
 ## Constraints and notes
 
 - The data plane relays raw bytes. With `rewrite-host=true` the authority (`Host` / `:authority`) is rewritten on every request of the connection by a best-effort stream rewriter (both HTTP/1.1 and h2): upgraded connections (WebSocket, h2c upgrade, CONNECT) are rewritten up to the protocol switch; an HTTP/1.1 head keeps every other byte (non-ASCII field values included); an h2 connection is never relayed verbatim (see the h2 request heads below).
-- h2 specific: the rewriter assumes the upstream negotiates the spec-default frame and HPACK limits (16 KiB max frame size, 4096 header table size, 64 KiB header list) and does not track tighter upstream SETTINGS values.
-- h2 flow control (plaintext and TLS-terminated h2): request DATA towards an upstream stays within the upstream's stream and connection windows (its SETTINGS, mid-stream changes included, and its WINDOW_UPDATEs); a stream without window does not hold back the other streams to that upstream. A client that half-closes its TCP connection after its requests still gets the responses, within the windows it granted before (it can grant no more): each upstream connection is half-closed only once its responses ended. On the response path the relay honors the client's connection window: response DATA of every upstream stays within it, the streams taking turns, while the client's stream windows bind each upstream (its settings and stream window updates are relayed). An upstream whose data waits for the client's window is held back by its own connection window, and its connection keeps being read (pings, window updates, the heads of other streams), except past one header block of trailers waiting behind data. A client WINDOW_UPDATE taking the connection window past 2^31-1 ends the connection with GOAWAY `FLOW_CONTROL_ERROR`; an upstream sending past the window the relay granted it ends its leg (see the upstream errors below). A client WINDOW_UPDATE of a length other than 4 ends the connection with GOAWAY `FRAME_SIZE_ERROR`, one with an increment of 0 with GOAWAY `PROTOCOL_ERROR` on stream 0 and resets its stream with `PROTOCOL_ERROR` (`CANCEL` to the upstream) otherwise; the same from an upstream ends its leg, or loses its stream. A client stream WINDOW_UPDATE taking the stream's window past 2^31-1 resets the stream with `FLOW_CONTROL_ERROR` (`CANCEL` to the upstream) and is not relayed; a `SETTINGS_INITIAL_WINDOW_SIZE` change doing so to a stream whose response goes on ends the connection with GOAWAY `FLOW_CONTROL_ERROR`. A client that never grants window holds the waiting data, and the leg, with no deadline.
-- h2 request heads (plaintext and TLS-terminated h2): every stream, the connection's first included, is routed by its `:authority`, access-checked and logged (`type=req`) on its own; a later stream the relay refuses is answered on its own stream (`403`, `503`, `421` for a `force-http1` route, see below), the connection going on. A CONNECT (RFC 9113 8.5: `:authority`, no `:path`) is a tunnel to the upstream of its `:authority`, its data, end and reset relayed either way, logged with the authority as its path; a connection opening with one is demultiplexed like any other, under the idle and stall timeouts. A head that is no request -- no `:method`, no `:path` (but for a CONNECT), a CONNECT without `:authority` -- is reset with `PROTOCOL_ERROR` and reaches no upstream, the connection going on; so is a later head carrying a field the HPACK decoder rejects (a connection-specific field such as `connection`). A header block that does not decode at all, the connection's first or a later one, ends the connection with GOAWAY `COMPRESSION_ERROR` (RFC 9113 4.3) and reaches no upstream: the decoder state is unknown from there on, so no later head could be trusted to route by. A reset head logs a `type=req` line with `route=- path=-` (its method, if any), a compression error one with `route=- method=- path=-`.
-- h2 framing limits (plaintext and TLS-terminated h2): the relay announces neither a larger frame size nor a larger header list to either side, so a client frame above 16KiB ends the connection with GOAWAY `FRAME_SIZE_ERROR`, a client header block above 64KiB (HEADERS plus its CONTINUATIONs) with GOAWAY `ENHANCE_YOUR_CALM`, and the same from an upstream (or interleaved header blocks) ends that upstream's leg. The client's `SETTINGS_MAX_FRAME_SIZE` is not relayed to the upstreams. Any other client frame RFC 9113 makes a connection error of -- a length its type does not allow, a stream its type does not allow (stream 0 for a stream frame, another for a connection frame, an idle stream, DATA or HEADERS on an even stream), padding past the payload, a frame other than a CONTINUATION of the same stream inside a header block, a PUSH_PROMISE, a setting out of its range -- ends the connection with a GOAWAY of the RFC's error code before it takes effect. A PRIORITY of a length other than 5 resets its stream with `FRAME_SIZE_ERROR` (`CANCEL` to the upstream), or ends the connection when the stream is idle or already closed.
-- h2 upstream errors (plaintext and TLS-terminated h2): an upstream's failure ends only what it covers, never the client's connection nor the streams of other upstreams. A stream lost to its upstream is answered by the relay with a bodiless `502` while no response frame but interim (1xx) heads was relayed on it (then `RST_STREAM NO_ERROR` if the client was still sending its request), and reset with `INTERNAL_ERROR` once its response began; a stream the upstream never saw (waiting for its `SETTINGS_MAX_CONCURRENT_STREAMS`) is refused with `REFUSED_STREAM`, which the client may retry. A stream error of an upstream (a stream WINDOW_UPDATE of 0 or past 2^31-1) loses that stream alone, reset towards the upstream with the error's code. An upstream's connection error (a frame above 16KiB, a header block too large or interleaved, a WINDOW_UPDATE of a wrong length or of 0 on stream 0, a window past 2^31-1, DATA past the relay's window, a frame on a stream the relay has not opened on it, a ping flood) ends its connection alone: the upstream gets a GOAWAY with the error's code and a half-close, and is closed after 1s if it does not close first; the connection closing or failing ends it the same way without the GOAWAY. Responses the upstream completed are still delivered; the route's next stream opens a new upstream connection, and a client connection left with nothing open idles under `idle-timeout`. An upstream's GOAWAY stops new streams on its connection: the streams above its last stream id, and those waiting for its concurrency limit, are refused with `REFUSED_STREAM`, the others complete before the relay half-closes it.
-  With `sluice.h2-demux-engine=netty` the scope is the same, with these differences: the `502` carries an error page like the `403` / `503` ones, held to the client's stream window like them (and the `RST_STREAM NO_ERROR` only follows the page's end); netty's codec validates the upstream's framing, so any frame RFC 9113 makes a connection error of (SETTINGS, PING or GOAWAY on a stream, a frame of a length its type does not allow, DATA or HEADERS on stream 0, a CONTINUATION without a header block, an undecodable header block, padding past the payload, a PUSH_PROMISE) ends the upstream connection with a GOAWAY of the RFC's code, naming stream 2^31-1 as the last processed, and netty's codes apply (a header block past 80KiB is `PROTOCOL_ERROR`); the upstream connection is closed right after the GOAWAY, half-closed first and closed after 1s if the upstream does not close it; after an upstream's GOAWAY the relay sends it a GOAWAY `NO_ERROR` of its own and closes the connection once the other streams completed. A client connection left with nothing open does not idle out there yet.
+- h2 demux (plaintext and TLS-terminated h2), not yet there: the idle, stall and keep-alive timeouts, the half-close drain and its probe, slots for further upstream connections, the byte counts of h2 connections (`sluice_tunnel_bytes_total`, the console's session traffic, the access log's `bytes`), and the `sluice_h2demux_streams_reset_total` reasons `protocol` / `upstream` and `sluice_h2demux_legs_failed_total`.
+- h2 flow control (plaintext and TLS-terminated h2): the windows are per hop (see "Connection limits"). Request DATA towards an upstream stays within the upstream's windows, response DATA towards the client within the client's; a stream without window holds back neither the other streams to its upstream nor the other streams of the client. DATA is relayed without its padding. An upstream sending past the stream window the relay granted it gets its stream reset with `FLOW_CONTROL_ERROR`, its connection going on. A client that half-closes its TCP connection is not promised its responses: the h2 demux has no half-close drain yet. A client that never grants window holds what the relay holds for it, with no deadline.
+- h2 request heads (plaintext and TLS-terminated h2): every stream, the connection's first included, is routed by its `:authority`, access-checked and logged (`type=req`) on its own; a later stream the relay refuses is answered on its own stream (`403`, `503`, `421` for a `force-http1` route, see below), the connection going on. A CONNECT (RFC 9113 8.5: `:authority`, no `:path`) is a tunnel to the upstream of its `:authority`, its data, end and reset relayed either way, logged with the authority as its path; a connection opening with one is demultiplexed like any other. A head that is no request -- no `:method`, no `:path` (but for a CONNECT), a CONNECT without `:authority` -- is reset with `PROTOCOL_ERROR` and reaches no upstream, the connection going on. A header block that does not decode at all, the connection's first or a later one, ends the connection with GOAWAY `COMPRESSION_ERROR` (RFC 9113 4.3; a later one names stream 2^31-1 as the last processed) and reaches no upstream: the decoder state is unknown from there on, so no later head could be trusted to route by. A header list past 64KiB is answered `431` on its stream, the connection going on. A reset head logs a `type=req` line with `route=- path=-` (its method, if any), a compression error one with `route=- method=- path=-`.
+- h2 framing limits (plaintext and TLS-terminated h2): the relay announces no larger frame size to either side and a 64KiB header list limit, so a client frame above 16KiB ends the connection with GOAWAY `FRAME_SIZE_ERROR`; an upstream's frame above 16KiB ends that upstream's connection with GOAWAY `FRAME_SIZE_ERROR`, and its header block past 80KiB (netty's threshold over the list limit) or interleaved with another with GOAWAY `PROTOCOL_ERROR`. netty's codec answers the client's other protocol errors itself.
+- h2 upstream errors (plaintext and TLS-terminated h2): an upstream's failure ends only what it covers, never the client's connection nor the streams of other upstreams. A stream lost to its upstream is answered by the relay with the bad-gateway page (`502`, held to the client's stream window like the `403` / `503` pages) while no response frame but interim (1xx) heads was relayed on it (then `RST_STREAM NO_ERROR` after the page if the client was still sending its request), and reset with `INTERNAL_ERROR` once its response began; a stream the upstream never saw (waiting for its `SETTINGS_MAX_CONCURRENT_STREAMS`) is refused with `REFUSED_STREAM`, which the client may retry. A stream error of an upstream (a stream WINDOW_UPDATE of 0 or past 2^31-1, DATA past the stream window) loses that stream alone, reset towards the upstream with the error's code. netty's codec validates the upstream's framing: a connection error (a frame above 16KiB, a header block too large or interleaved, a WINDOW_UPDATE of a wrong length or of 0 on stream 0, a window past 2^31-1, a frame on a stream the relay has not opened on it; SETTINGS, PING or GOAWAY on a stream, a frame of a length its type does not allow, DATA or HEADERS on stream 0, a CONTINUATION without a header block, an undecodable header block, padding past the payload, a PUSH_PROMISE) ends its connection alone with a GOAWAY of the RFC's code, naming stream 2^31-1 as the last processed; the upstream connection is half-closed right after the GOAWAY and closed after 1s if the upstream does not close it, and the connection closing or failing ends it the same way without the GOAWAY. Responses the upstream completed are still delivered; the route's next stream opens a new upstream connection. A client connection left with nothing open does not idle out (no idle timeout yet). An upstream's GOAWAY stops new streams on its connection: the streams above its last stream id, and those waiting for its concurrency limit, are refused with `REFUSED_STREAM`; the relay sends it a GOAWAY `NO_ERROR` of its own and closes the connection once the other streams completed.
 - Upstream without HTTP/2 support: set `force-http1=true` on the upstream so the data plane's TLS termination offers http/1.1 first in ALPN and ingress falls back to HTTP/1.1. The preference applies to the route resolved from the ClientHello SNI (ingress by bare IP sends no SNI and resolves via the catch-all route). An h2 stream whose route is `force-http1` is never relayed: the relay answers it with a bodiless `421 Misdirected Request` (RFC 9110 15.5.20; a request still being sent is then reset with `NO_ERROR`) and opens no upstream connection, the h2 connection going on. This covers a browser coalescing the host onto an h2 connection it opened for another host of the same certificate (RFC 9113 9.1.1) -- Chrome and Firefox retry a 421 on a new connection, whose SNI makes ALPN pick http/1.1 -- as well as a TLS client offering only h2 (the handshake still settles on h2) and plaintext h2c with prior knowledge, which have no HTTP/1.1 to fall back to. Each is logged as `type=req ... status=421 reason=force-http1`.

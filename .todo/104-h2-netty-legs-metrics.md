@@ -76,3 +76,29 @@ Step 7 of the netty h2 demux migration (context and user decisions: 098). Depend
 - `sluice.h2demux.queued.bytes` is fed on the netty engine now (both ways plus the legs'
   writer queues, per route) and `sluice.h2demux.window.withheld`,
   `streams.refused{reason=budget|waiting}`, `streams.reset{reason=budget}` are counted.
+
+## Notes from 107 (legacy relay removed, 2026-10-13)
+
+Every h2 connection runs on netty now; no engine switch. Removed with the legacy relay
+(re-add with the same names and tags when the netty relay counts them):
+`sluice.h2demux.streams.refused{reason=leg-limit}`, `sluice.h2demux.streams.reset{reason=protocol}`
+and `{reason=upstream}`, `sluice.h2demux.legs.failed` (and their `H2DemuxMeters` methods);
+`sluice.h2demux.connections{engine}` is gone for good. The two meter assertions of
+`H2DemuxUpstreamErrorE2ETest` noted under 100 were removed with the engine branches; put
+them back. README lists what is missing in the "h2 demux ..., not yet there" bullet and the
+`max-connections` row / "Connection limits" (an h2 connection counts once); update both.
+`ConnectionLimits#tryAcquireLeg` (unit-tested) was kept for the leg slots although nothing
+calls it now.
+
+Disabled (`@Disabled`, reason naming the missing behaviour) until this step:
+
+- Leg limits and slots: `H2DemuxLegLimitE2ETest` (class);
+  `QueuedFramesHoldSlotsE2ETest#aRetiredLegKeepsTheConnectionsSlotWhileItsFramesAreQueued`,
+  `#anEndedH2RelayHoldsItsLegSlotsWhileTheirFramesAreQueued`.
+- Tunnel byte counter (`sluice.tunnel.bytes`): `H2DemuxStallE2ETest#stalledLegKeepsTheOtherLegsFlowing`
+  (also asserts the hand-written relay's stream budget) and `#closingTheClientReleasesTheStalledLeg`
+  (also looks for the hand-written relay's leg writer waiting for credit): rewrite those
+  parts for the netty bounds.
+- Protocol reset meter: `H2DemuxClientFrameValidationE2ETest#priorityOfAWrongLengthResetsOnlyItsStream`,
+  `#streamWindowPastTheMaximumResetsOnlyItsStream`, `#streamClosedBothWaysIsNotReset` (they
+  fail at the meter lookup first; netty's answers behind it are unchecked, see 105).

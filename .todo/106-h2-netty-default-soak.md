@@ -53,3 +53,8 @@ Step 9 of the netty h2 demux migration (context and user decisions: 098). Depend
   `ConnectionLimitsTest`); the read pause (256KiB) and the per-hop stream window are the
   levers if that is too few.
 - 114 (header blocks across hops are not refused) should be done before the switch.
+
+## Notes from 107 (legacy relay removed, 2026-10-13)
+
+`sluice_h2demux_connections_total{engine}` is gone with the engine switch (the 099 note
+above no longer applies).
