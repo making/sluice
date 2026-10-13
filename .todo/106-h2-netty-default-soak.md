@@ -39,3 +39,17 @@ Step 9 of the netty h2 demux migration (context and user decisions: 098). Depend
   a decoder per connection first).
 - `sluice_h2demux_connections_total{engine}` tells which engine served the connections
   during the soak.
+
+## Notes from 102 (flow control and budget, 2026-10-13)
+
+- Copies per forwarded DATA byte now: the reader's copy into the channel, the relay's
+  copy at the bridge (`Flow`: the first write a copy, later ones appended to the stream's
+  backlog buffer), the writer queue's heap copy. Measure their cost.
+- While a relay queues anything, each writer batch of its hops takes the loop's lock once
+  more (`Hop#watchWrites`, for the budget review and the route gauge); and the review
+  runs after every loop action. Measure the contention with many streams.
+- The derived connection limit follows the netty bounds now, whatever the engine (3.26MiB
+  per slot against the legacy 2.67MiB: 53 instead of 65 connections for a 400MiB heap,
+  `ConnectionLimitsTest`); the read pause (256KiB) and the per-hop stream window are the
+  levers if that is too few.
+- 114 (header blocks across hops are not refused) should be done before the switch.

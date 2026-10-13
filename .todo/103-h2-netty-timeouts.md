@@ -71,3 +71,20 @@ Step 6 of the netty h2 demux migration (context and user decisions: 098). Depend
   send its request (`requestDueLocked`); `Exchange#waiting` gives the netty engine the same
   test. The wait deadline (`sluice.limits.h2-stream-wait-timeout`) is a client-hop timer
   (`waitLocked`), cancelled when the stream opens, leaves the buffer or is reset.
+
+## Notes from 102 (flow control and budget, 2026-10-13)
+
+- `@LegacyOnly` naming the half-close drain: `H2DemuxUpstreamFlowControlE2ETest`
+  `#largeResponseReachesAHalfClosedClient`, `#nettyUpstreamAnswersAHalfClosedClient`,
+  `#queuedRequestDataIsWrittenBeforeTheHalfClose`,
+  `#clientGoneAfterTheUpstreamsHalfCloseReleasesTheUpstreamConnection`. Naming PING
+  ordering: `H2DemuxLegWriterE2ETest#upstreamPingIsAckedAheadOfQueuedData` (it also needs
+  the tunnel byte counter, 104).
+- The stall timer must not count a stream whose window the relay withholds (README:
+  "an h2 request whose window the relay withholds" does not count): the relay's
+  `withheld` flag tells it. With per-hop windows a request waits on the client only while
+  the client holds window on the client hop; what the relay holds for the upstream is not
+  the client's stall.
+- The relay reviews its accounts after each action of its loop (`Loop#afterSettle`),
+  and its hops run a loop action after each writer batch while it queues anything
+  (`Hop#watchWrites`): a timer that reads `Hop#queuedBytes()` sees fresh numbers there.

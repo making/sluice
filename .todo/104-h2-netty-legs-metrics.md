@@ -59,3 +59,20 @@ Step 7 of the netty h2 demux migration (context and user decisions: 098). Depend
 
 - `sluice.h2demux.streams.refused{reason=wait-timeout}` is counted on the netty engine
   already (`H2DemuxMeters#refusedForWaitTimeout`, asserted in `NettyH2DemuxRelayE2ETest`).
+
+## Notes from 102 (flow control and budget, 2026-10-13)
+
+- The slot derivation (`ConnectionLimits#connectionBytes`, the netty bounds) counts one leg
+  per slot (`NettyHttp2DemuxRelay.RESPONSE_QUEUE_BYTES`); until legs beyond the first
+  take slots of their own, a connection reaching several routes exceeds its slot by that
+  per further leg (README says so; drop that sentence with the leg slots).
+- Meter assertions dropped: `sluice.h2demux.legs.failed` in
+  `H2DemuxUpstreamFlowControlE2ETest#assertOffenceEndsTheLeg` (put it back with the
+  meter); the protocol reset meter
+  is part of the reason `H2DemuxClientWindowE2ETest#zeroStreamWindowIncrementResetsOnlyThatStream`
+  is `@LegacyOnly`. The tunnel byte counter (`sluice.tunnel.bytes`) is part of why
+  `H2DemuxLegWriterE2ETest#upstreamPingIsAckedAheadOfQueuedData` and
+  `#upstreamPingFloodEndsItsLeg` are `@LegacyOnly`.
+- `sluice.h2demux.queued.bytes` is fed on the netty engine now (both ways plus the legs'
+  writer queues, per route) and `sluice.h2demux.window.withheld`,
+  `streams.refused{reason=budget|waiting}`, `streams.reset{reason=budget}` are counted.

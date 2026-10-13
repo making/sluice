@@ -47,3 +47,14 @@ now right after 102 (see above).
   `sluice.limits.h2-stream-wait-timeout` (README table and "Connection limits",
   `application.properties`, the `Limits` javadoc) and `queuedBytesGauged()` in
   `H2DemuxUpstreamStreamLimitE2ETest`.
+
+## Notes from 102 (flow control and budget, 2026-10-13)
+
+- `queuedBytesGauged()` is gone from `H2DemuxUpstreamStreamLimitE2ETest` already.
+- `@NettyOnly` (sluice-it, `am.ik.sluice.server.proxy`, read by `H2Engines`) goes with
+  the parameterization; the tests carrying it stay. Also: `H2DemuxWaitingStreamBudgetE2ETest`'s
+  comment, the README's legacy budget paragraphs, the `sluice.limits.h2-queue-budget`
+  wording ("the legacy engine towards the upstreams") and the "the legacy engine's are
+  lower" note of the slot derivation (README, `ConnectionLimits#connectionBytes`).
+- `PendingPayload#take` is legacy-only; the netty relay uses `append(ByteBuf)` /
+  `takeAll()`.
