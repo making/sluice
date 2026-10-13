@@ -672,51 +672,60 @@ still waiting after `sluice.limits.h2-stream-wait-timeout` (30s; `0` = off) is r
 with `REFUSED_STREAM`, its upstream never having seen it, so an upstream that keeps its
 streams open or announces a limit of 0 does not hold it for good.
 
-The windows are per hop. The relay announces a 64KiB stream window to the client and to
-each upstream, grants a stream's window back only for what it wrote on the other hop, and
-refills its connection windows as DATA arrives (a connection window is granted back once
-half of it is spent, exactly what was spent): a stream held by its upstream or by its
-client holds at most one stream window in the relay, and the connection's other streams
-go on, on the same upstream connection too. DATA held for a stream is copied into one
-buffer rounded up to 1KiB, however small the frames. What the relay holds -- that DATA
-and the header blocks not yet written, both ways, plus the writer queue of the client
-connection and of each upstream connection -- is bounded across connections: each
-connection may hold 128KiB, and the bytes beyond it are charged to
-`sluice.limits.h2-queue-budget`, shared by every h2 connection. Past its 128KiB with the
-budget exhausted, the relay withholds the connection window of the client and of every
-upstream connection (a peer stops once the at most 64KiB it holds are spent) until the
-connection drains below 128KiB or the budget has room again; a new stream whose head
-does not fit is refused with `REFUSED_STREAM`, and a later header block that does not fit
-resets its stream (`RST_STREAM` `ENHANCE_YOUR_CALM` to the client, `CANCEL` to the
-upstream) while the connection's other streams go on: the client's trailers, and an
-upstream's interim (1xx) head, final head or trailers once the client connection's writer
-queue, with the upstreams' header blocks waiting for it, holds 256KiB (so a response is
-not held back for bytes queued towards the upstreams). A header block counts at its size
-as HPACK counts it (RFC 7541 4.1), not at the bytes it took on the wire: one referring to
-the peer's dynamic table, a few bytes on the wire, counts about what the relay writes for
-it, up to 64KiB. The interim heads of one response may sum to 64KiB counted so (the header
-list limit); the one past it is not relayed: the upstream's stream is reset with
-`ENHANCE_YOUR_CALM` and the client gets the bad-gateway page (`502`). While the window is
-withheld, the streams waiting for an upstream's concurrency limit hold at most 128KiB of
-the connection: past it the
-most recent of them are refused with `REFUSED_STREAM` (their upstream never saw them; the
-client may retry them), since their bytes drain only once a stream ahead of them closes,
-which may need the very request body the withheld window holds back. So a connection
-whose peers read keeps flowing however exhausted the budget is. A connection then holds
-outside the budget its 128KiB, what its client still sends (the 16KiB read under way,
-64KiB of window, under 1KiB of rounding per stream: 180KiB) and its client connection's
-writer queue (a connection is no longer read past 256KiB queued, plus at most 64KiB:
-320KiB), about 628KiB (`NettyHttp2DemuxRelay.UNBUDGETED_BYTES`); each upstream connection
-adds its upstream's 180KiB and its own 320KiB writer queue, about 500KiB
+The windows are per hop. The relay announces a 1MiB stream window to the client and to
+each upstream and grants each of them a 1MiB connection window right after its preface,
+grants a stream's window back only for what it wrote on the other hop, and refills its
+connection windows as DATA arrives (a connection window is granted back once half of it
+is spent, exactly what was spent): a stream held by its upstream or by its client holds
+at most one stream window in the relay, and the connection's other streams go on, on the
+same upstream connection too. So an h2 connection moves at most 1MiB per round trip of a
+hop, all its streams together: a download at most 1MiB per tunnel round trip, an upload
+at most 1MiB per round trip of the client and at most the upstream's own windows per
+tunnel round trip. 1MiB is the tunnel's per-connection window: an upstream connection,
+one virtual connection, has no more than that in flight per tunnel round trip whatever
+the relay announces, the same bound as an HTTP/1.1 connection's. DATA held for a stream
+is copied once, into buffers holding it in order and rounded up to 1KiB in all, however
+small the frames. What the relay holds -- that DATA and the header blocks not yet
+written, both ways, plus the writer queue of the client connection and of each upstream
+connection -- is bounded across connections: each connection may hold 128KiB, and the
+bytes beyond it are charged to `sluice.limits.h2-queue-budget`, shared by every h2
+connection. Past its 128KiB with the budget exhausted, the relay withholds the connection
+window of the client and of every upstream connection (a peer stops once the at most 1MiB
+it holds are spent) until the connection drains below 128KiB or the budget has room
+again; a new stream whose head does not fit is refused with `REFUSED_STREAM`, and a later
+header block that does not fit resets its stream (`RST_STREAM` `ENHANCE_YOUR_CALM` to the
+client, `CANCEL` to the upstream) while the connection's other streams go on: the
+client's trailers, and an upstream's interim (1xx) head, final head or trailers once the
+client connection's writer queue, with the upstreams' header blocks waiting for it, holds
+256KiB (so a response is not held back for bytes queued towards the upstreams). A header
+block counts at its size as HPACK counts it (RFC 7541 4.1), not at the bytes it took on
+the wire: one referring to the peer's dynamic table, a few bytes on the wire, counts
+about what the relay writes for it, up to 64KiB. The interim heads of one response may
+sum to 64KiB counted so (the header list limit); the one past it is not relayed: the
+upstream's stream is reset with `ENHANCE_YOUR_CALM` and the client gets the bad-gateway
+page (`502`). While the window is withheld, the streams waiting for an upstream's
+concurrency limit hold at most 128KiB of the connection: past it the most recent of them
+are refused with `REFUSED_STREAM` (their upstream never saw them; the client may retry
+them), since their bytes drain only once a stream ahead of them closes, which may need
+the very request body the withheld window holds back. So a connection whose peers read
+keeps flowing however exhausted the budget is. A connection then holds outside the budget
+its 128KiB, what its client still sends (the 16KiB read under way, 1MiB of window, under
+1KiB of rounding per stream: 1140KiB) and its client connection's writer queue (a
+connection is no longer read past 256KiB queued, plus at most 64KiB: 320KiB), about
+1588KiB (`NettyHttp2DemuxRelay.UNBUDGETED_BYTES`); each upstream connection adds its
+upstream's 1140KiB and its own 320KiB writer queue, about 1460KiB
 (`NettyHttp2DemuxRelay.RESPONSE_QUEUE_BYTES`), within the worst case of the slot it
 takes.
 
 An unset (`0`) budget is an eighth of half the max heap, and an unset (`0`) connection
-limit is derived so that the worst case of every slot (2.16MiB + 628KiB + 500KiB) and the
-budget fit in half the max heap: `max(1, (max heap / 2 - budget) / 3.26MiB)`, e.g. 53 for a 400MiB heap, 549 for
-4GiB. The effective values are logged at startup (`data plane
-connection limit` / `upstream connection limit`) and exported as gauges; with the 512Mi
-container of `k8s.md` they follow the heap the server gets there.
+limit is derived so that the worst case of every slot (2.16MiB + 1588KiB + 1460KiB) and
+the budget fit in half the max heap: `max(1, (max heap / 2 - budget) / 5.14MiB)`, e.g. 34
+for a 400MiB heap and for the 409MiB a 512Mi container gave the server in production, 348
+for 4GiB. The windows set most of it: each connection window adds 1MiB to a slot's worst
+case, once on the client's side and once per upstream connection. The effective values
+are logged at startup (`data plane connection limit` / `upstream connection limit`) and
+exported as gauges; with the 512Mi container of `k8s.md` they follow the heap the server
+gets there.
 
 A slot is released only once its connection ended and the frames it queued for the tunnel
 stream left the sender, on the server as on the client (`sluice.client.max-connections`);
@@ -930,7 +939,7 @@ docker run sluice-client --sluice.server-url=grpc://host.docker.internal:8001 \
 ## Constraints and notes
 
 - The data plane relays raw bytes. With `rewrite-host=true` the authority (`Host` / `:authority`) is rewritten on every request of the connection by a best-effort stream rewriter (both HTTP/1.1 and h2): upgraded connections (WebSocket, h2c upgrade, CONNECT) are rewritten up to the protocol switch; an HTTP/1.1 head keeps every other byte (non-ASCII field values included); an h2 connection is never relayed verbatim (see the h2 request heads below).
-- h2 flow control (plaintext and TLS-terminated h2): the windows are per hop (see "Connection limits"). Request DATA towards an upstream stays within the upstream's windows, response DATA towards the client within the client's; a stream without window holds back neither the other streams to its upstream nor the other streams of the client. DATA is relayed without its padding. The settings are per hop too: the client gets the relay's SETTINGS (100 concurrent streams, the 64KiB header list limit), each upstream the relay's own (push off, the 64KiB header list limit) once as its connection opens, whatever the client announces. A reset the relay writes -- one relayed from one side to the other, one netty's codec answers a frame with, or the relay's own (a header block past the budget, interim heads past 64KiB) -- is never followed by DATA of its stream, even when the read that caused it also opened the stream's window: what the relay held of it for the peer goes out before the `RST_STREAM` or is dropped. An upstream sending past the stream window the relay granted it gets its stream reset with `FLOW_CONTROL_ERROR`, its connection going on. A client that half-closes its TCP connection after its requests still gets the responses, within the windows it granted before (see the half-close drain under "Connection limits"). A client that never grants window is cut by the stall timeout.
+- h2 flow control (plaintext and TLS-terminated h2): the windows are per hop (see "Connection limits"). Request DATA towards an upstream stays within the upstream's windows, response DATA towards the client within the client's; a stream without window holds back neither the other streams to its upstream nor the other streams of the client. DATA is relayed without its padding. The settings are per hop too: the client gets the relay's SETTINGS (100 concurrent streams, a 1MiB initial stream window, the 64KiB header list limit), each upstream the relay's own (push off, a 1MiB initial stream window, the 64KiB header list limit) once as its connection opens, whatever the client announces, and each a 1MiB connection window. A reset the relay writes -- one relayed from one side to the other, one netty's codec answers a frame with, or the relay's own (a header block past the budget, interim heads past 64KiB) -- is never followed by DATA of its stream, even when the read that caused it also opened the stream's window: what the relay held of it for the peer goes out before the `RST_STREAM` or is dropped. An upstream sending past the stream window the relay granted it gets its stream reset with `FLOW_CONTROL_ERROR`, its connection going on. A client that half-closes its TCP connection after its requests still gets the responses, within the windows it granted before (see the half-close drain under "Connection limits"). A client that never grants window is cut by the stall timeout.
 - h2 request heads (plaintext and TLS-terminated h2): every stream, the connection's first included, is routed by its `:authority`, access-checked and logged (`type=req`) on its own; a later stream the relay refuses is answered on its own stream (`403`, `503`, `421` for a `force-http1` route, see below), the connection going on. A CONNECT (RFC 9113 8.5: `:authority`, no `:path`) is a tunnel to the upstream of its `:authority`, its data, end and reset relayed either way, logged with the authority as its path; a connection opening with one is demultiplexed like any other. A head that is no request -- no `:method`, no `:path` (but for a CONNECT), a CONNECT without `:authority` -- is reset with `PROTOCOL_ERROR` and reaches no upstream, the connection going on; so is a head carrying the connection-specific `connection` field (RFC 9113 8.2.2). A header block that does not decode at all, the connection's first or a later one, ends the connection with GOAWAY `COMPRESSION_ERROR` (RFC 9113 4.3; a later one names stream 2^31-1 as the last processed) and reaches no upstream: the decoder state is unknown from there on, so no later head could be trusted to route by. A header list past 64KiB is answered `431` on its stream, the connection going on. A reset head logs a `type=req` line with `route=- path=-` (its method, if any), a compression error one with `route=- method=- path=-`.
 - h2 framing limits (plaintext and TLS-terminated h2): the relay announces no larger frame size to either side and a 64KiB header list limit, so a client frame above 16KiB ends the connection with GOAWAY `FRAME_SIZE_ERROR`, and a client header block past 80KiB (netty's threshold over the list limit; a list past 64KiB within it is answered `431`, see above) with GOAWAY `PROTOCOL_ERROR`; an upstream's frame above 16KiB ends that upstream's connection with GOAWAY `FRAME_SIZE_ERROR`, and its header block past 80KiB or interleaved with another with GOAWAY `PROTOCOL_ERROR`.
 - h2 client errors (plaintext and TLS-terminated h2): netty's codec answers the client's protocol errors. A connection error -- a PING, SETTINGS, GOAWAY, RST_STREAM or HEADERS frame of a length its type does not allow, a frame on stream 0 that belongs on a stream or the reverse, a frame on an idle stream other than a HEADERS opening it or a PRIORITY (an even stream included), a CONTINUATION out of place or another frame inside a header block, padding past the payload, a PUSH_PROMISE, an invalid SETTINGS value or a `SETTINGS_INITIAL_WINDOW_SIZE` change taking a stream window past 2^31-1 (a stream whose response ended included), a client preface not followed by SETTINGS -- ends the connection at once with a GOAWAY of the RFC's code naming stream 2^31-1 as the last processed: the open streams are dropped and the upstream connection is closed, with no grace for the streams in flight. A stream error resets that stream alone, `CANCEL` to its upstream: a PRIORITY of a length other than 5 (on an idle stream too) or a padded DATA frame too short for its pad length with `FRAME_SIZE_ERROR`; a stream WINDOW_UPDATE of 0 with `PROTOCOL_ERROR`, on a closed stream too; after the client ended a stream, DATA on it with `STREAM_CLOSED`, a further header block with `PROTOCOL_ERROR` while netty holds the stream (RFC 9113 5.1 names `STREAM_CLOSED`), and a DATA or HEADERS frame with `STREAM_CLOSED` once netty forgot the stream -- but the frames the client had in flight on a stream the relay reset while the client was still sending on it, which are ignored (RFC 9113 5.1): up to the DATA the stream window held at the reset (an empty frame not ending the stream counting one byte) and one header list (64KiB) of header blocks, until one ends the stream, for the last 100 streams the relay reset; past that they are answered as before. A request the client ended whose response ended still reaches its upstream when netty resets the client's stream after that (a WINDOW_UPDATE of 0). A client sending past a stream window gets that stream reset with `FLOW_CONTROL_ERROR`. After the 201st stream error of the client within 30s, answered with its reset, the relay ends the connection with GOAWAY `ENHANCE_YOUR_CALM` (a client streaming DATA on a stream reset for its window, say); the resets the relay decides itself or relays from an upstream do not count (more than 200 within 30s end neither the client's connection nor the upstream's), nor do the frames the client had in flight on those streams (the rest of the request bodies and their trailers). A client resetting more than 200 streams within 30s gets GOAWAY `ENHANCE_YOUR_CALM` too (netty's limit against rapid resets). Settings netty does not know are ignored whatever their value (RFC 9218's `SETTINGS_NO_RFC7540_PRIORITIES` too).

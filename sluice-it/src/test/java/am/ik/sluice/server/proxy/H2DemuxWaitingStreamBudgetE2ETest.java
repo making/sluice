@@ -59,7 +59,13 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 	private static final long BUDGET = 256 * 1024;
 
 	/** Stream 1's request body: several times the client's connection window. */
-	private static final int BODY = 256 * 1024;
+	private static final int BODY = 4 * NettyHttp2DemuxRelay.CONNECTION_WINDOW;
+
+	/**
+	 * What each waiting POST sends: two of them fill the allowance, so the waiting
+	 * streams past it are the third and later.
+	 */
+	private static final int WAITING_BODY = H2TestClient.INITIAL_WINDOW;
 
 	/** How long the client sends on a waiting stream after its last grant. */
 	private static final Duration QUIET = Duration.ofMillis(300);
@@ -111,10 +117,10 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 
 	/**
 	 * Upstream limit 1: stream 1 open with an unfinished POST; stream 3 a GET and streams
-	 * 5 to 15 POSTs filling their initial windows wait behind it until they exhaust the
-	 * budget. The window is withheld, and the waiting streams past the allowance -- all
-	 * but 3 and 5 -- are refused; stream 1's body completes, then 3 and 5 go, one at a
-	 * time, and nothing of the refused streams reached the upstream.
+	 * 5 to 15 POSTs sending 64KiB each wait behind it until they exhaust the budget. The
+	 * window is withheld, and the waiting streams past the allowance -- all but 3 and 5
+	 * -- are refused; stream 1's body completes, then 3 and 5 go, one at a time, and
+	 * nothing of the refused streams reached the upstream.
 	 */
 	@Test
 	void waitingStreamsExhaustingTheBudgetLeaveTheOpenStreamCompleting() throws Exception {
@@ -182,8 +188,8 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 
 	/**
 	 * Opens stream 1 with an unfinished POST, then queues stream 3, a GET, and streams 5
-	 * to {@code last}, POSTs each filling the windows it gets, behind the upstream's
-	 * limit of 1.
+	 * to {@code last}, POSTs each sending what the windows admit of 64KiB, behind the
+	 * upstream's limit of 1.
 	 */
 	private TestUpstream openOneAndQueueBehindIt(H2TestClient client, List<TestUpstream> upstreams, String route,
 			int last) throws Exception {
@@ -193,7 +199,9 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 		client.headers(3, true, get(route));
 		for (int streamId = 5; streamId <= last; streamId += 2) {
 			client.headers(streamId, false, post(route));
-			client.fill(streamId, QUIET);
+			client.fill(streamId, WAITING_BODY, QUIET);
+			// the relay reads and accounts it, and withholds past the budget
+			Thread.sleep(QUIET.toMillis());
 		}
 		assertThat(upstream.seenStreams()).as("the streams after stream 1 wait for the limit of 1").containsExactly(1);
 		return upstream;
@@ -213,7 +221,7 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 			.as("the waiting streams kept then go")
 			.isTrue();
 		assertThat(TestH2.bodyOf(client.frames(5))).isEqualTo("ok5");
-		assertThat(upstream.upstream().received(5)).isEqualTo(H2TestClient.INITIAL_WINDOW);
+		assertThat(upstream.upstream().received(5)).isEqualTo(WAITING_BODY);
 		assertThat(upstream.seenStreams()).as("nothing of the refused streams reached the upstream")
 			.containsExactly(1, 3, 5);
 		assertThat(upstream.peak()).as("streams open at once on the upstream").isEqualTo(1);

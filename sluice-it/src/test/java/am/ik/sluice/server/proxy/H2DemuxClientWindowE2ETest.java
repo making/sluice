@@ -91,14 +91,23 @@ class H2DemuxClientWindowE2ETest {
 
 	private static final int KIB = 1024;
 
+	/** The client's connection window, RFC 9113's. */
 	private static final int WINDOW = WindowedH2Upstream.DEFAULT_WINDOW;
+
+	/** The stream window the relay announces its upstreams. */
+	private static final int RELAY_WINDOW = NettyHttp2DemuxRelay.STREAM_WINDOW;
 
 	/**
 	 * A response the relay holds whole while the client grants no connection window:
-	 * within the client's window plus what the relay holds -- one stream window, half of
-	 * it granted back once the client took the rest (netty's window update ratio).
+	 * within the client's window plus the relay's stream window.
 	 */
 	private static final int HELD_RESPONSE = 90 * KIB;
+
+	/**
+	 * A response the upstream is held back from: past the client's window plus the
+	 * relay's stream window.
+	 */
+	private static final int HELD_BACK_RESPONSE = 2 * RELAY_WINDOW;
 
 	private static final int PROTOCOL_ERROR = 0x1;
 
@@ -240,7 +249,7 @@ class H2DemuxClientWindowE2ETest {
 	@Test
 	void upstreamPingIsAckedWhileItsLegWaitsForTheClientWindow() throws Exception {
 		String route = "cw.ping.test";
-		int length = 256 * KIB;
+		int length = HELD_BACK_RESPONSE;
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		CountDownLatch acked = new CountDownLatch(1);
 		startClient(route, upstream(seen, upstream -> {
@@ -257,7 +266,7 @@ class H2DemuxClientWindowE2ETest {
 		}));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
 			client.withholdConnectionWindow();
-			streamWindow(client, 1024 * KIB);
+			streamWindow(client, 2 * HELD_BACK_RESPONSE);
 			client.headers(1, true, get(route));
 			WindowedH2Upstream upstream = awaitUpstream(seen);
 			awaitWaiting(client, upstream);
@@ -278,7 +287,7 @@ class H2DemuxClientWindowE2ETest {
 	@Test
 	void legKeepsRelayingWhileAResponseWaitsForTheClientWindow() throws Exception {
 		String route = "cw.upload.test";
-		int length = 256 * KIB;
+		int length = HELD_BACK_RESPONSE;
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		startClient(route, upstream(seen, upstream -> {
 			upstream.settings(null);
@@ -301,7 +310,7 @@ class H2DemuxClientWindowE2ETest {
 		}));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.withholdConnectionWindow();
-			streamWindow(client, 1024 * KIB);
+			streamWindow(client, 2 * HELD_BACK_RESPONSE);
 			client.headers(1, true, get(route));
 			WindowedH2Upstream upstream = awaitUpstream(seen);
 			awaitWaiting(client, upstream);
@@ -507,13 +516,13 @@ class H2DemuxClientWindowE2ETest {
 			TestH2.@Nullable Frame frame;
 			while ((frame = upstream.next()) != null) {
 				if (frame.type() == TestH2.HEADERS) {
-					respondAsync(upstream, frame.streamId(), frame.streamId() == 1 ? 256 * KIB : 128 * KIB);
+					respondAsync(upstream, frame.streamId(), frame.streamId() == 1 ? HELD_BACK_RESPONSE : 128 * KIB);
 				}
 			}
 		}));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.withholdConnectionWindow();
-			streamWindow(client, 1024 * KIB);
+			streamWindow(client, 2 * HELD_BACK_RESPONSE);
 			client.headers(1, true, get(route));
 			WindowedH2Upstream upstream = awaitUpstream(seen);
 			awaitWaiting(client, upstream);
@@ -540,13 +549,13 @@ class H2DemuxClientWindowE2ETest {
 			TestH2.@Nullable Frame frame;
 			while ((frame = upstream.next()) != null) {
 				if (frame.type() == TestH2.HEADERS) {
-					respondAsync(upstream, frame.streamId(), frame.streamId() == 1 ? 256 * KIB : 128 * KIB);
+					respondAsync(upstream, frame.streamId(), frame.streamId() == 1 ? HELD_BACK_RESPONSE : 128 * KIB);
 				}
 			}
 		}));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.withholdConnectionWindow();
-			streamWindow(client, 1024 * KIB);
+			streamWindow(client, 2 * HELD_BACK_RESPONSE);
 			client.headers(1, true, get(route));
 			WindowedH2Upstream upstream = awaitUpstream(seen);
 			awaitWaiting(client, upstream);
@@ -922,12 +931,13 @@ class H2DemuxClientWindowE2ETest {
 
 	/**
 	 * Waits until the client received its whole connection window and the upstream sent
-	 * what the relay holds on top: half a stream window or more, at most one, whose
-	 * consumed bytes it grants back only once half of it was.
+	 * what the relay holds on top: half the relay's stream window or more, at most one,
+	 * whose consumed bytes it grants back only once half of it was.
 	 */
 	private static void awaitWaiting(H2TestClient client, WindowedH2Upstream upstream) throws InterruptedException {
-		assertThat(client.awaitTrue(() -> client.dataReceived() == WINDOW && upstream.sent() > WINDOW + WINDOW / 2,
-				Duration.ofSeconds(10)))
+		assertThat(
+				client.awaitTrue(() -> client.dataReceived() == WINDOW && upstream.sent() > WINDOW + RELAY_WINDOW / 2,
+						Duration.ofSeconds(10)))
 			.as("received %d, the upstream sent %d", client.dataReceived(), upstream.sent())
 			.isTrue();
 		// the upstream sends on the relay's last grant on a thread of its own: wait until
@@ -944,7 +954,8 @@ class H2DemuxClientWindowE2ETest {
 			}
 		}
 		assertThat(client.dataReceived()).as("the client got no more than its window").isEqualTo(WINDOW);
-		assertThat(sent).as("the upstream got no more than the relay's window on top").isLessThanOrEqualTo(2L * WINDOW);
+		assertThat(sent).as("the upstream got no more than the relay's window on top")
+			.isLessThanOrEqualTo((long) WINDOW + RELAY_WINDOW);
 	}
 
 	/**

@@ -182,9 +182,11 @@ class H2DemuxFramingE2ETest {
 
 	/**
 	 * The settings are per hop: the upstream gets the relay's own SETTINGS once, as its
-	 * leg opens -- push off, the 64KiB header list limit, the RFC defaults else --
-	 * whatever the client announces, before the leg opened or after; and the client gets
-	 * the relay's: 100 concurrent streams and the 64KiB header list limit.
+	 * leg opens -- push off, a 1MiB initial stream window, the 64KiB header list limit,
+	 * the RFC defaults else -- whatever the client announces, before the leg opened or
+	 * after; and the client gets the relay's: 100 concurrent streams, a 1MiB initial
+	 * stream window and the 64KiB header list limit. Each gets a 1MiB connection window:
+	 * one WINDOW_UPDATE raising RFC 9113's.
 	 */
 	@Test
 	void eachHopGetsTheRelaysOwnSettings() throws Exception {
@@ -200,9 +202,12 @@ class H2DemuxFramingE2ETest {
 			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).isTrue();
 			assertThat(client.setting(0x3)).as("SETTINGS_MAX_CONCURRENT_STREAMS").isEqualTo(100L);
 			assertThat(client.setting(0x6)).as("SETTINGS_MAX_HEADER_LIST_SIZE").isEqualTo(65536L);
-			assertThat(client.setting(0x4)).as("SETTINGS_INITIAL_WINDOW_SIZE").isNull();
+			assertThat(client.setting(0x4)).as("SETTINGS_INITIAL_WINDOW_SIZE").isEqualTo(1048576L);
 			assertThat(client.setting(0x5)).as("SETTINGS_MAX_FRAME_SIZE").isNull();
+			assertThat(client.connectionGranted()).as("the connection window granted, no DATA sent")
+				.isEqualTo(1048576 - 65535);
 		}
+		List<Integer> connectionGrants = new ArrayList<>();
 		List<String> announced = new ArrayList<>();
 		for (TestH2.Frame frame : received) {
 			if (frame.type() == TestH2.SETTINGS && (frame.flags() & TestH2.FLAG_ACK) == 0) {
@@ -216,8 +221,12 @@ class H2DemuxFramingE2ETest {
 				}
 				announced.add(String.join(",", entries));
 			}
+			if (frame.type() == TestH2.WINDOW_UPDATE && frame.streamId() == 0) {
+				connectionGrants.add(TestH2.increment(frame));
+			}
 		}
-		assertThat(announced).as("the SETTINGS frames the upstream got").containsExactly("2=0,6=65536");
+		assertThat(announced).as("the SETTINGS frames the upstream got").containsExactly("2=0,4=1048576,6=65536");
+		assertThat(connectionGrants).as("the connection window granted the upstream").containsExactly(1048576 - 65535);
 	}
 
 	/**

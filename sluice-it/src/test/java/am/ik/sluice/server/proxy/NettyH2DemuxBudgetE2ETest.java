@@ -74,9 +74,13 @@ class NettyH2DemuxBudgetE2ETest {
 	private static final int KIB = 1024;
 
 	/** The netty relay's stream window, on both faces. */
-	private static final int WINDOW = NettyHttp2DemuxRelay.STREAM_WINDOW;
+	private static final int RELAY_WINDOW = NettyHttp2DemuxRelay.STREAM_WINDOW;
 
-	private static final long BUDGET = 256 * KIB;
+	/** The windows of the test client and upstreams: RFC 9113's. */
+	private static final int PEER_WINDOW = WindowedH2Upstream.DEFAULT_WINDOW;
+
+	/** A few of the relay's stream windows: room for a stream window held, or three. */
+	private static final long BUDGET = 4L * RELAY_WINDOW;
 
 	private static final int CANCEL = 0x8;
 
@@ -185,15 +189,15 @@ class NettyH2DemuxBudgetE2ETest {
 			client.headers(1, false, post(route));
 			client.fill(1, QUIET);
 			WindowedH2Upstream upstream = awaitUpstream(seen);
-			Awaitility.await().atMost(TIMEOUT).until(() -> upstream.received(1) == WINDOW);
+			Awaitility.await().atMost(TIMEOUT).until(() -> upstream.received(1) == PEER_WINDOW);
 			long held = settled(() -> queuedBytes(route), () -> client.streamSent(1));
-			assertThat(upstream.received(1)).as("the upstream got its window").isEqualTo(WINDOW);
+			assertThat(upstream.received(1)).as("the upstream got its window").isEqualTo(PEER_WINDOW);
 			assertThat(held).as("held for the stream: within the relay's window, a granule of rounding")
 				.isGreaterThan(0)
-				.isLessThanOrEqualTo(WINDOW + PendingPayload.GRANULE);
+				.isLessThanOrEqualTo(RELAY_WINDOW + PendingPayload.GRANULE);
 			assertThat(client.streamSent(1)).as("what the client got out: the upstream's window and the relay's")
 				.isGreaterThan(upstream.received(1))
-				.isLessThanOrEqualTo(2L * WINDOW);
+				.isLessThanOrEqualTo((long) PEER_WINDOW + RELAY_WINDOW);
 			assertThat(held).as("what the relay read and did not write")
 				.isGreaterThanOrEqualTo(client.streamSent(1) - upstream.received(1));
 
@@ -201,15 +205,15 @@ class NettyH2DemuxBudgetE2ETest {
 			assertThat(client.data(3, 200 * KIB, true, TIMEOUT)).as("the other stream gets the windows").isTrue();
 			assertThat(client.awaitEnd(3, TIMEOUT)).as("the other stream completes").isTrue();
 			assertThat(upstream.received(3)).isEqualTo(200 * KIB);
-			assertThat(upstream.received(1)).as("stream 1 still held").isEqualTo(WINDOW);
+			assertThat(upstream.received(1)).as("stream 1 still held").isEqualTo(PEER_WINDOW);
 		}
 	}
 
 	/**
-	 * A client granting stream 1 no window gets that window of a 512KiB response; the
-	 * relay holds at most its own stream window on top, so the upstream got at most two
-	 * windows out. Meanwhile a 60KiB response on the leg's other stream completes: the
-	 * leg's connection window refills as DATA arrives.
+	 * A client granting stream 1 no window gets that window of a response of two relay
+	 * windows; the relay holds at most its own stream window on top, so the upstream got
+	 * at most the two windows out. Meanwhile a 60KiB response on the leg's other stream
+	 * completes: the leg's connection window refills as DATA arrives.
 	 */
 	@Test
 	void aResponseHeldForItsClientStaysWithinTheStreamWindowWhileTheLegsOtherStreamFlows() throws Exception {
@@ -220,26 +224,26 @@ class NettyH2DemuxBudgetE2ETest {
 			TestH2.@Nullable Frame frame;
 			while ((frame = upstream.next()) != null) {
 				if (frame.type() == TestH2.HEADERS) {
-					respondAsync(upstream, frame.streamId(), frame.streamId() == 1 ? 512 * KIB : 60 * KIB);
+					respondAsync(upstream, frame.streamId(), frame.streamId() == 1 ? 2 * RELAY_WINDOW : 60 * KIB);
 				}
 			}
 		}));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.headers(1, true, get(route));
 			WindowedH2Upstream upstream = awaitUpstream(seen);
-			Awaitility.await().atMost(TIMEOUT).until(() -> client.dataReceived(1) == WINDOW);
+			Awaitility.await().atMost(TIMEOUT).until(() -> client.dataReceived(1) == PEER_WINDOW);
 			long held = settled(() -> queuedBytes(route), upstream::sent, () -> client.dataReceived(1));
-			assertThat(client.dataReceived(1)).as("the client got its stream window").isEqualTo(WINDOW);
+			assertThat(client.dataReceived(1)).as("the client got its stream window").isEqualTo(PEER_WINDOW);
 			assertThat(held).as("held for the stream: within the relay's window, a granule of rounding")
 				.isGreaterThan(0)
-				.isLessThanOrEqualTo(WINDOW + PendingPayload.GRANULE);
+				.isLessThanOrEqualTo(RELAY_WINDOW + PendingPayload.GRANULE);
 			assertThat(upstream.sent()).as("what the upstream got out: the client's window and the relay's")
-				.isLessThanOrEqualTo(2L * WINDOW);
+				.isLessThanOrEqualTo((long) PEER_WINDOW + RELAY_WINDOW);
 
 			client.headers(3, true, get(route));
 			assertThat(client.awaitEnd(3, TIMEOUT)).as("the other stream completes").isTrue();
 			assertThat(TestH2.contentOf(client.frames(3))).isEqualTo(pattern(60 * KIB));
-			assertThat(client.dataReceived(1)).as("stream 1 still held").isEqualTo(WINDOW);
+			assertThat(client.dataReceived(1)).as("stream 1 still held").isEqualTo(PEER_WINDOW);
 		}
 	}
 
@@ -283,7 +287,7 @@ class NettyH2DemuxBudgetE2ETest {
 				.isEqualTo(1);
 			assertThat(upstream.received(1)).isZero();
 
-			upstream.grant(1, WINDOW);
+			upstream.grant(1, PEER_WINDOW);
 			Awaitility.await().atMost(TIMEOUT).until(() -> upstream.received(1) == frames && ended.get());
 			assertThat(dataFrames.get()).as("DATA frames carrying the 4000 bytes").isLessThanOrEqualTo(3);
 			Awaitility.await()
@@ -294,17 +298,17 @@ class NettyH2DemuxBudgetE2ETest {
 
 	/**
 	 * A client granting 24 streams 1MiB each but no connection window, an upstream
-	 * answering each with 128KiB: without the budget the relay would hold a stream window
-	 * of each, about 1.5MiB. Once its queue passes its allowance with the budget
-	 * exhausted, it withholds the leg's connection window too: the upstream stops at the
-	 * window it holds, within the allowance, the budget and what a leg adds outside it.
-	 * Once the client grants, every response completes and the budget is released.
+	 * answering each with 384KiB: without the budget the relay would hold all of it,
+	 * 9MiB. Once its queue passes its allowance with the budget exhausted, it withholds
+	 * the leg's connection window too: the upstream stops at the window it holds, within
+	 * the allowance, the budget and what a leg adds outside it. Once the client grants,
+	 * every response completes and the budget is released.
 	 */
 	@Test
 	void responsesHeldPastTheBudgetStopTheLegAtItsWithheldWindow() throws Exception {
 		String route = route("held-responses");
 		int streams = 24;
-		int length = 128 * KIB;
+		int length = 384 * KIB;
 		startClient(route, upstream(new AtomicReference<>(), upstream -> {
 			upstream.settings(null);
 			TestH2.@Nullable Frame frame;
@@ -325,9 +329,11 @@ class NettyH2DemuxBudgetE2ETest {
 			for (int i = 0; i < streams; i++) {
 				client.headers(1 + 2 * i, true, get(route));
 			}
-			Awaitility.await().atMost(TIMEOUT).until(() -> client.dataReceived() == WINDOW && budgetUsed() >= BUDGET);
+			Awaitility.await()
+				.atMost(TIMEOUT)
+				.until(() -> client.dataReceived() == PEER_WINDOW && budgetUsed() >= BUDGET);
 			long held = settled(() -> queuedBytes(route), client::dataReceived);
-			assertThat(client.dataReceived()).as("the client got its connection window").isEqualTo(WINDOW);
+			assertThat(client.dataReceived()).as("the client got its connection window").isEqualTo(PEER_WINDOW);
 			assertThat(budgetUsed()).as("the budget is exhausted").isGreaterThanOrEqualTo(BUDGET);
 			assertThat(withheld()).as("the windows were withheld").isGreaterThan(withheldBefore);
 			assertThat(held).as("held: past the allowance and the budget, within what a leg adds outside them")
@@ -362,7 +368,7 @@ class NettyH2DemuxBudgetE2ETest {
 			Awaitility.await()
 				.atMost(TIMEOUT)
 				.untilAsserted(() -> assertThat(queuedBytes(route)).as("stream 1's bytes released")
-					.isLessThanOrEqualTo(held - WINDOW));
+					.isLessThanOrEqualTo(held - RELAY_WINDOW));
 			client.frame(TestH2.RST_STREAM, 0, 3, TestH2.int32(CANCEL));
 			client.frame(TestH2.RST_STREAM, 0, 5, TestH2.int32(CANCEL));
 			Awaitility.await().atMost(TIMEOUT).until(() -> queuedBytes(route) == 0 && budgetUsed() == 0);
@@ -403,14 +409,14 @@ class NettyH2DemuxBudgetE2ETest {
 			assertThat(responded.await(TIMEOUT.toSeconds(), TimeUnit.SECONDS)).as("the upstream answered").isTrue();
 			for (int streamId = 3; streamId <= 5; streamId += 2) {
 				client.headers(streamId, false, post(route));
-				assertThat(client.data(streamId, WINDOW, false, TIMEOUT)).isTrue();
+				assertThat(client.data(streamId, RELAY_WINDOW, false, TIMEOUT)).isTrue();
 			}
-			Awaitility.await().atMost(TIMEOUT).until(() -> client.dataReceived(1) == WINDOW);
+			Awaitility.await().atMost(TIMEOUT).until(() -> client.dataReceived(1) == PEER_WINDOW);
 			long held = settled(() -> queuedBytes(route), () -> client.dataReceived(1));
-			assertThat(client.dataReceived(1)).isEqualTo(WINDOW);
+			assertThat(client.dataReceived(1)).isEqualTo(PEER_WINDOW);
 			assertThat(budgetUsed()).as("charged").isPositive();
-			long response = length - WINDOW;
-			assertThat(held).as("the response's rest and two requests").isGreaterThan(response + WINDOW);
+			long response = length - PEER_WINDOW;
+			assertThat(held).as("the response's rest and two requests").isGreaterThan(response + RELAY_WINDOW);
 
 			leave.countDown();
 			for (int streamId = 3; streamId <= 5; streamId += 2) {
@@ -419,11 +425,15 @@ class NettyH2DemuxBudgetE2ETest {
 			}
 			Awaitility.await()
 				.atMost(TIMEOUT)
-				.untilAsserted(() -> assertThat(queuedBytes(route)).as("the response's rest, its leg gone")
-					.isBetween(response, response + PendingPayload.GRANULE));
+				.untilAsserted(() -> assertThat(queuedBytes(route))
+					// the write netty holds counts whole until it completed, the part
+					// the client took of it too: within the response and the rounding
+					// of the write and the backlog
+					.as("the response's rest, its leg gone")
+					.isBetween(response, (long) length + 2 * PendingPayload.GRANULE));
 			Awaitility.await().atMost(TIMEOUT).until(() -> budgetUsed() == 0);
 
-			client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(WINDOW));
+			client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(PEER_WINDOW));
 			assertThat(client.awaitEnd(1, TIMEOUT)).as("the response completes").isTrue();
 			assertThat(TestH2.contentOf(client.frames(1))).isEqualTo(pattern(length));
 			Awaitility.await().atMost(TIMEOUT).until(() -> queuedBytes(route) == 0);
@@ -460,7 +470,9 @@ class NettyH2DemuxBudgetE2ETest {
 				client.headers(streamId, false, post(route));
 				client.fill(streamId, QUIET);
 			}
-			Awaitility.await().atMost(TIMEOUT).until(() -> client.dataReceived(1) == WINDOW && budgetUsed() >= BUDGET);
+			Awaitility.await()
+				.atMost(TIMEOUT)
+				.until(() -> client.dataReceived(1) == PEER_WINDOW && budgetUsed() >= BUDGET);
 			long held = settled(() -> queuedBytes(route), () -> client.dataReceived(1));
 
 			client.headers(1, true, TestH2.headerBlock("x-trailer=1"));
@@ -473,7 +485,7 @@ class NettyH2DemuxBudgetE2ETest {
 			Awaitility.await()
 				.atMost(TIMEOUT)
 				.untilAsserted(() -> assertThat(queuedBytes(route)).as("stream 1's response released")
-					.isLessThanOrEqualTo(held - (length - WINDOW)));
+					.isLessThanOrEqualTo(held - (length - PEER_WINDOW)));
 			for (int streamId = 3; streamId <= 17; streamId += 2) {
 				client.frame(TestH2.RST_STREAM, 0, streamId, TestH2.int32(CANCEL));
 			}
@@ -510,11 +522,13 @@ class NettyH2DemuxBudgetE2ETest {
 				client.headers(streamId, false, post(route));
 				client.fill(streamId, QUIET);
 			}
-			Awaitility.await().atMost(TIMEOUT).until(() -> client.dataReceived(1) == WINDOW && budgetUsed() >= BUDGET);
+			Awaitility.await()
+				.atMost(TIMEOUT)
+				.until(() -> client.dataReceived(1) == PEER_WINDOW && budgetUsed() >= BUDGET);
 			settled(() -> queuedBytes(route), () -> client.dataReceived(1));
 
 			ByteArrayOutputStream write = new ByteArrayOutputStream();
-			TestH2.writeFrame(write, TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(WINDOW));
+			TestH2.writeFrame(write, TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(PEER_WINDOW));
 			TestH2.writeFrame(write, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 1,
 					TestH2.headerBlock("x-trailer=1"));
 			client.raw(write.toByteArray());
@@ -585,7 +599,7 @@ class NettyH2DemuxBudgetE2ETest {
 			assertThat(settled(() -> queuedBytes(route))).as("the body held, its client stream closed")
 				.isBetween((long) body, (long) body + PendingPayload.GRANULE);
 
-			upstream.grant(1, WINDOW);
+			upstream.grant(1, PEER_WINDOW);
 			Awaitility.await().atMost(TIMEOUT).until(() -> upstream.received(1) == body && ended.get());
 			Awaitility.await().atMost(TIMEOUT).until(() -> queuedBytes(route) == 0);
 			assertThat(client.resets()).isEmpty();
@@ -637,11 +651,11 @@ class NettyH2DemuxBudgetE2ETest {
 			if (streamId > 1) {
 				client.headers(streamId, false, post(route));
 			}
-			assertThat(client.data(streamId, WINDOW, false, TIMEOUT)).isTrue();
+			assertThat(client.data(streamId, RELAY_WINDOW, false, TIMEOUT)).isTrue();
 		}
-		Awaitility.await().atMost(TIMEOUT).until(() -> queuedBytes(route) >= 3L * WINDOW);
+		Awaitility.await().atMost(TIMEOUT).until(() -> queuedBytes(route) >= 3L * RELAY_WINDOW);
 		long held = settled(() -> queuedBytes(route));
-		assertThat(held).as("three stream windows held").isGreaterThanOrEqualTo(3L * WINDOW);
+		assertThat(held).as("three stream windows held").isGreaterThanOrEqualTo(3L * RELAY_WINDOW);
 		// the client hop's writer queue counts too, nothing at rest
 		assertThat(budgetUsed()).as("charged past the allowance")
 			.isBetween(held - NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE,

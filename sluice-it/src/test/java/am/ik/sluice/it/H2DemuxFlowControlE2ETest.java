@@ -57,8 +57,18 @@ class H2DemuxFlowControlE2ETest {
 	/** The stream limit the relay advertises. */
 	private static final int MAX_CONCURRENT_STREAMS = 100;
 
-	/** The stream window the relay announces on both of its faces. */
-	private static final int NETTY_STREAM_WINDOW = 65535;
+	/**
+	 * The stream window the relay announces on both of its faces, and the connection
+	 * window it grants on both: {@code NettyHttp2DemuxRelay.STREAM_WINDOW} and
+	 * {@code CONNECTION_WINDOW}.
+	 */
+	private static final int NETTY_STREAM_WINDOW = 1024 * 1024;
+
+	/** The connection window the relay grants on both faces. */
+	private static final int NETTY_CONNECTION_WINDOW = 1024 * 1024;
+
+	/** What the relay grants its client's connection window behind its preface. */
+	private static final int CONNECTION_WINDOW_RAISE = NETTY_CONNECTION_WINDOW - H2TestClient.INITIAL_WINDOW;
 
 	/** The backlog rounding of a stream's buffer, less than one granule. */
 	private static final int GRANULE = 1024;
@@ -267,9 +277,9 @@ class H2DemuxFlowControlE2ETest {
 	/**
 	 * Padding counts against both windows (RFC 9113 6.9.1): the relay releases the whole
 	 * frames at connection level, gives the padding back at stream level since it never
-	 * queues it, and relays the payload unpadded. Past half of the window, so netty's
-	 * auto refill grants the connection window once, exactly what was spent, and the
-	 * stream window once half of it was written or padding.
+	 * queues it, and relays the payload unpadded. Just past half of the window, so
+	 * netty's auto refill grants the connection window once, exactly what was spent, and
+	 * the stream window once half of it was written or padding.
 	 */
 	@Test
 	void paddedDataIsReleasedInFullAndRelayedUnpadded() throws Exception {
@@ -280,16 +290,23 @@ class H2DemuxFlowControlE2ETest {
 			client.headers(1, false, TestH2.headerBlock(":authority=" + route, ":method=POST", ":path=/"));
 			int data = 1000;
 			int padding = 200;
-			int frames = 28;
 			byte[] payload = new byte[1 + data + padding];
+			// the last frame takes the spent bytes past half of the window
+			int frames = NETTY_CONNECTION_WINDOW / 2 / payload.length + 1;
+			// the relay's stream window applies once it read the ack of its SETTINGS,
+			// which goes before the PING
+			assertThat(client.awaitSettings(Duration.ofSeconds(5))).isTrue();
+			client.frame(TestH2.PING, 0, 0, new byte[8]);
+			assertThat(client.awaitTrue(() -> !client.pingAcks().isEmpty(), Duration.ofSeconds(5))).isTrue();
 			payload[0] = (byte) padding;
 			java.util.Arrays.fill(payload, 1, 1 + data, (byte) 'x');
 			for (int i = 0; i < frames; i++) {
 				client.sendData(1, payload, TestH2.FLAG_PADDED);
 			}
 			long spent = (long) frames * payload.length;
-			assertThat(spent).as("past half of the window").isGreaterThan(H2TestClient.INITIAL_WINDOW / 2);
-			assertThat(client.awaitTrue(() -> client.connectionGranted() >= spent, Duration.ofSeconds(5)))
+			assertThat(spent).as("past half of the window").isGreaterThan(NETTY_CONNECTION_WINDOW / 2);
+			assertThat(client.awaitTrue(() -> client.connectionGranted() >= CONNECTION_WINDOW_RAISE + spent,
+					Duration.ofSeconds(5)))
 				.as("connection grant %d", client.connectionGranted())
 				.isTrue();
 			Awaitility.await()
@@ -299,12 +316,11 @@ class H2DemuxFlowControlE2ETest {
 					.isEqualTo(frames * data));
 			assertThat(upstreamData).as("relayed unpadded")
 				.allSatisfy(frame -> assertThat(frame.flags() & TestH2.FLAG_PADDED).isZero());
-			assertThat(client.awaitTrue(() -> client.streamGranted(1) > H2TestClient.INITIAL_WINDOW / 2,
-					Duration.ofSeconds(5)))
+			assertThat(client.awaitTrue(() -> client.streamGranted(1) > NETTY_STREAM_WINDOW / 2, Duration.ofSeconds(5)))
 				.as("stream grant %d", client.streamGranted(1))
 				.isTrue();
 			Thread.sleep(200); // a surplus grant would follow the exact one
-			assertThat(client.connectionGranted()).isEqualTo(spent);
+			assertThat(client.connectionGranted()).isEqualTo(CONNECTION_WINDOW_RAISE + spent);
 			assertThat(client.streamGranted(1)).isLessThanOrEqualTo(spent);
 		}
 	}
@@ -320,16 +336,26 @@ class H2DemuxFlowControlE2ETest {
 	void upstreamConnectionWindowIsReleasedForDataOnly() throws Exception {
 		String route = "fc.grant.test";
 		AtomicLong granted = new AtomicLong();
-		int[] chunks = { 10000, 16000, 14000, 7 };
+		// frames of odd sizes, just past half of the window
+		int[] pattern = { 10000, 16000, 14000, 7 };
+		int[] chunks = new int[14 * pattern.length];
+		for (int i = 0; i < chunks.length; i++) {
+			chunks[i] = pattern[i % pattern.length];
+		}
+		long data = java.util.Arrays.stream(chunks).asLongStream().sum();
+		long half = (NETTY_CONNECTION_WINDOW + 1) / 2;
+		assertThat(data).as("past half of the window").isGreaterThanOrEqualTo(half);
 		startClient(route, stub(socket -> respondCountingGrants(socket, chunks, granted)));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
+			client.frame(TestH2.SETTINGS, 0, 0, settingInitialWindow(NETTY_STREAM_WINDOW));
 			client.headers(1, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/"));
 			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
-			long data = 10000 + 16000 + 14000 + 7;
-			long half = H2TestClient.INITIAL_WINDOW / 2 + 1;
-			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> granted.get() >= half);
+			// the raise behind the preface, then the auto refill's grant
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.until(() -> granted.get() >= CONNECTION_WINDOW_RAISE + half);
 			Thread.sleep(300); // a surplus grant would follow the exact one
-			assertThat(granted.get()).isBetween(half, data);
+			assertThat(granted.get() - CONNECTION_WINDOW_RAISE).isBetween(half, data);
 		}
 	}
 
@@ -416,13 +442,19 @@ class H2DemuxFlowControlE2ETest {
 		}
 	}
 
-	/** Records the DATA frames received; grants nothing, answers nothing. */
+	/**
+	 * Records the DATA frames received; grants a window for them at once, answers
+	 * nothing.
+	 */
 	private static void recordData(Socket socket, List<TestH2.Frame> data) {
 		try (socket) {
 			InputStream in = socket.getInputStream();
+			OutputStream out = socket.getOutputStream();
 			if (in.readNBytes(TestH2.PREFACE.length).length < TestH2.PREFACE.length) {
 				return;
 			}
+			TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, settingInitialWindow(Integer.MAX_VALUE));
+			TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(Integer.MAX_VALUE - 65535));
 			TestH2.@Nullable Frame frame;
 			while ((frame = TestH2.readFrame(in)) != null) {
 				if (frame.type() == TestH2.DATA) {
@@ -450,6 +482,9 @@ class H2DemuxFlowControlE2ETest {
 			while ((frame = TestH2.readFrame(in)) != null) {
 				if (frame.type() == TestH2.HEADERS && frame.streamId() == 1) {
 					TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
+					// the relay's SETTINGS came before the head: its stream window
+					// applies once acknowledged
+					TestH2.writeFrame(out, TestH2.SETTINGS, TestH2.FLAG_ACK, 0, new byte[0]);
 					TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS, 1, new byte[] { (byte) 0x88 });
 					for (int i = 0; i < chunks.length; i++) {
 						int flags = i == chunks.length - 1 ? TestH2.FLAG_END_STREAM : 0;
@@ -464,6 +499,11 @@ class H2DemuxFlowControlE2ETest {
 		catch (IOException e) {
 			// connection ended
 		}
+	}
+
+	private static byte[] settingInitialWindow(int window) {
+		return new byte[] { 0, 0x4, (byte) (window >>> 24), (byte) (window >>> 16), (byte) (window >>> 8),
+				(byte) window };
 	}
 
 	/** The route's leg queue gauge; zero before it exists. */

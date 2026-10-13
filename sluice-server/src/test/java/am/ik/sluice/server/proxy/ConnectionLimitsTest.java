@@ -330,21 +330,27 @@ class ConnectionLimitsTest {
 	@Test
 	void anUnsetLimitFitsEverySlotsWorstCaseAndTheBudgetInHalfTheHeap() {
 		long mib = 1024 * 1024;
+		// both windows are the tunnel's per-connection window
+		assertThat(NettyHttp2DemuxRelay.STREAM_WINDOW).isEqualTo(1024 * 1024);
+		assertThat(NettyHttp2DemuxRelay.CONNECTION_WINDOW).isEqualTo(1024 * 1024);
 		// the read under way, a connection window and a granule per stream once the
 		// windows are withheld; a hop's writer queue: the read pause plus 64KiB
-		assertThat(NettyHttp2DemuxRelay.WITHHELD_ARRIVALS).isEqualTo(16384 + 65535 + 100 * 1024);
+		assertThat(NettyHttp2DemuxRelay.WITHHELD_ARRIVALS).isEqualTo(16384 + 1024 * 1024 + 100 * 1024);
 		assertThat(NettyHttp2DemuxRelay.HOP_QUEUE_BYTES).isEqualTo(256 * 1024 + 64 * 1024);
 		assertThat(NettyHttp2DemuxRelay.UNBUDGETED_BYTES)
 			.isEqualTo(128 * 1024 + NettyHttp2DemuxRelay.WITHHELD_ARRIVALS + NettyHttp2DemuxRelay.HOP_QUEUE_BYTES);
 		assertThat(NettyHttp2DemuxRelay.RESPONSE_QUEUE_BYTES)
 			.isEqualTo(NettyHttp2DemuxRelay.WITHHELD_ARRIVALS + NettyHttp2DemuxRelay.HOP_QUEUE_BYTES);
-		// a virtual connection's 2.16MiB plus an h2 relay's 628KiB and a leg's 500KiB
-		assertThat(ConnectionLimits.connectionBytes()).isEqualTo(2266112 + 643071 + 511999);
+		// a virtual connection's 2.16MiB plus an h2 relay's 1588KiB and a leg's 1460KiB
+		assertThat(ConnectionLimits.connectionBytes()).isEqualTo(2266112 + 1626112 + 1495040);
 		assertThat(ConnectionLimits.deriveBudget(400 * mib)).isEqualTo(25 * mib);
-		// (200MiB - 25MiB) / 3.26MiB
-		assertThat(ConnectionLimits.deriveMaxConnections(400 * mib, 25 * mib)).isEqualTo(53);
-		// (2048MiB - 256MiB) / 3.26MiB
-		assertThat(ConnectionLimits.deriveMaxConnections(4096 * mib, 256 * mib)).isEqualTo(549);
+		// (200MiB - 25MiB) / 5.14MiB
+		assertThat(ConnectionLimits.deriveMaxConnections(400 * mib, 25 * mib)).isEqualTo(34);
+		// the 409MiB heap a 512Mi container gave the server in production
+		assertThat(ConnectionLimits.deriveMaxConnections(409 * mib, ConnectionLimits.deriveBudget(409 * mib)))
+			.isEqualTo(34);
+		// (2048MiB - 256MiB) / 5.14MiB
+		assertThat(ConnectionLimits.deriveMaxConnections(4096 * mib, 256 * mib)).isEqualTo(348);
 		assertThat(ConnectionLimits.deriveMaxConnections(400 * mib, 400 * mib)).isEqualTo(1);
 	}
 
@@ -370,7 +376,7 @@ class ConnectionLimitsTest {
 			assertThat(derived.max()).isEqualTo(max);
 			assertThat(events.list).extracting(ILoggingEvent::getFormattedMessage)
 				.containsExactly(("data plane connection limit %d (derived: (half of max heap %dMiB - h2 queue budget) "
-						+ "/ 3340KiB per connection), per address %d, head timeout PT10S, idle timeout PT1M, stall "
+						+ "/ 5261KiB per connection), per address %d, head timeout PT10S, idle timeout PT1M, stall "
 						+ "timeout PT1M per 16384B, verbatim idle timeout off (unless a route sets one), h2 queue "
 						+ "budget 1024KiB (configured)")
 					.formatted(max, maxHeap >> 20, max));

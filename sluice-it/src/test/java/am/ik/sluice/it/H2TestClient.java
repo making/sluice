@@ -31,12 +31,19 @@ import org.jspecify.annotations.Nullable;
  * it, padding included, and the largest excess over what it granted is kept. By default
  * it grants back every frame's bytes on receipt; {@link #paceConnectionGrants} and
  * {@link #withholdConnectionWindow} make it sparser. Stream windows are never granted:
- * the initial stream window it announces bounds each stream.
+ * the initial stream window it announces bounds each stream. As a sender it starts each
+ * stream at the initial window of the relay's SETTINGS (RFC 9113 6.9.2), and counts the
+ * times {@link #data} ran out of window. It acknowledges the relay's SETTINGS.
  */
 public final class H2TestClient implements AutoCloseable {
 
-	/** The spec initial window; the relay announces no other. */
+	/**
+	 * The spec initial window, of streams until the relay's SETTINGS and of the
+	 * connection.
+	 */
 	public static final int INITIAL_WINDOW = 65535;
+
+	private static final int SETTINGS_INITIAL_WINDOW_SIZE = 0x4;
 
 	private static final int MAX_FRAME_SIZE = 16 * 1024;
 
@@ -53,6 +60,15 @@ public final class H2TestClient implements AutoCloseable {
 	private final AtomicLong connectionGranted = new AtomicLong();
 
 	private final Map<Integer, AtomicLong> streamWindows = new ConcurrentHashMap<>();
+
+	/**
+	 * The initial stream window the relay's SETTINGS announced; guarded by
+	 * {@link #streamWindows} together with the stream windows it changes.
+	 */
+	private long initialWindow = INITIAL_WINDOW;
+
+	/** The times {@link #data} had payload left and no window to send it in. */
+	private final AtomicLong windowWaits = new AtomicLong();
 
 	private final Map<Integer, AtomicLong> streamGranted = new ConcurrentHashMap<>();
 
@@ -165,12 +181,24 @@ public final class H2TestClient implements AutoCloseable {
 		switch (frame.type()) {
 			case TestH2.SETTINGS -> {
 				if ((frame.flags() & TestH2.FLAG_ACK) == 0) {
+					// acknowledged at once (RFC 9113 6.5.3), before a sender may use the
+					// new windows: the relay applies its own initial stream window to
+					// the streams only once it read the ack
+					try {
+						frame(TestH2.SETTINGS, TestH2.FLAG_ACK, 0, new byte[0]);
+					}
+					catch (IOException e) {
+						// the connection is gone, or half-closed
+					}
 					byte[] p = frame.payload();
 					for (int i = 0; i + 6 <= p.length; i += 6) {
 						int id = (p[i] & 0xff) << 8 | (p[i + 1] & 0xff);
 						long value = (p[i + 2] & 0xffL) << 24 | (p[i + 3] & 0xff) << 16 | (p[i + 4] & 0xff) << 8
 								| (p[i + 5] & 0xff);
 						this.settings.put(id, value);
+						if (id == SETTINGS_INITIAL_WINDOW_SIZE) {
+							applyInitialWindow(value);
+						}
 					}
 					this.settingsReceived.set(true);
 				}
@@ -308,7 +336,22 @@ public final class H2TestClient implements AutoCloseable {
 	}
 
 	private AtomicLong windowOf(int streamId) {
-		return this.streamWindows.computeIfAbsent(streamId, id -> new AtomicLong(INITIAL_WINDOW));
+		AtomicLong window = this.streamWindows.get(streamId);
+		if (window != null) {
+			return window;
+		}
+		synchronized (this.streamWindows) {
+			return this.streamWindows.computeIfAbsent(streamId, id -> new AtomicLong(this.initialWindow));
+		}
+	}
+
+	/** Moves every stream window by the change of the initial window (RFC 9113 6.9.2). */
+	private void applyInitialWindow(long value) {
+		synchronized (this.streamWindows) {
+			long delta = value - this.initialWindow;
+			this.initialWindow = value;
+			this.streamWindows.values().forEach(window -> window.addAndGet(delta));
+		}
 	}
 
 	private AtomicLong grantedOf(int streamId) {
@@ -346,6 +389,7 @@ public final class H2TestClient implements AutoCloseable {
 		do {
 			long deadline = System.nanoTime() + timeout.toNanos();
 			int n;
+			boolean waited = false;
 			while (true) {
 				long available = Math.min(this.connectionWindow.get(), windowOf(streamId).get());
 				n = (int) Math.min(Math.min(left, MAX_FRAME_SIZE), available);
@@ -354,6 +398,10 @@ public final class H2TestClient implements AutoCloseable {
 				}
 				if (this.closed.get() || System.nanoTime() > deadline) {
 					return false;
+				}
+				if (!waited) {
+					waited = true;
+					this.windowWaits.incrementAndGet();
 				}
 				Thread.sleep(1);
 			}
@@ -370,10 +418,19 @@ public final class H2TestClient implements AutoCloseable {
 	 * {@code quiet} or the connection closed; returns the payload bytes sent.
 	 */
 	public long fill(int streamId, Duration quiet) throws IOException, InterruptedException {
+		return fill(streamId, Long.MAX_VALUE, quiet);
+	}
+
+	/**
+	 * Sends on the stream whatever both windows admit, at most {@code max} bytes, until
+	 * they went out, no grant came for {@code quiet} or the connection closed; returns
+	 * the payload bytes sent.
+	 */
+	public long fill(int streamId, long max, Duration quiet) throws IOException, InterruptedException {
 		long sent = 0;
 		long deadline = System.nanoTime() + quiet.toNanos();
-		while (!this.closed.get() && System.nanoTime() < deadline) {
-			long available = Math.min(this.connectionWindow.get(), windowOf(streamId).get());
+		while (sent < max && !this.closed.get() && System.nanoTime() < deadline) {
+			long available = Math.min(Math.min(this.connectionWindow.get(), windowOf(streamId).get()), max - sent);
 			if (available <= 0) {
 				Thread.sleep(1);
 				continue;
@@ -438,6 +495,14 @@ public final class H2TestClient implements AutoCloseable {
 
 	public @Nullable Long setting(int id) {
 		return this.settings.get(id);
+	}
+
+	/**
+	 * The times {@link #data} had payload left and no window to send it in, so it waited
+	 * for the relay's grant: one per round trip a window-bound upload takes.
+	 */
+	public long windowWaits() {
+		return this.windowWaits.get();
 	}
 
 	/** The payload both the stream's and the connection's windows admit now. */

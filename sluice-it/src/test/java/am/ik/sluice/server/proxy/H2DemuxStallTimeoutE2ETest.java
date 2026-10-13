@@ -80,6 +80,8 @@ class H2DemuxStallTimeoutE2ETest {
 
 	private static final int WINDOW = H2TestClient.INITIAL_WINDOW;
 
+	private static final long BUDGET = 2L * NettyHttp2DemuxRelay.STREAM_WINDOW;
+
 	private static final int BIG = 16 * 1024 * 1024;
 
 	/**
@@ -143,8 +145,10 @@ class H2DemuxStallTimeoutE2ETest {
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.limits.stall-timeout", () -> STALL_TIMEOUT.toSeconds() + "s");
 		registry.add("sluice.limits.idle-timeout", () -> "30s");
-		// a connection past its own allowance has its connection window withheld
-		registry.add("sluice.limits.h2-queue-budget", () -> "4KB");
+		// above what one stream window holds, below what six do: a connection holding
+		// six streams' windows has its connection window withheld, one holding one
+		// stream's does not
+		registry.add("sluice.limits.h2-queue-budget", () -> BUDGET + "B");
 		registry.add("sluice.token", () -> "it-token");
 		registry.add("server.port", () -> String.valueOf(TestPorts.freePort()));
 	}
@@ -251,7 +255,8 @@ class H2DemuxStallTimeoutE2ETest {
 			client.headers(1, true, get(BIG_HOST));
 			assertGoAwayInTime(client, start);
 			assertThat(client.dataReceived(1)).as("the stream's initial window").isEqualTo(WINDOW);
-			assertThat(client.connectionWindow()).as("the connection window granted back").isEqualTo(WINDOW);
+			assertThat(client.connectionWindow()).as("the connection window the relay granted, none of it spent")
+				.isEqualTo(NettyHttp2DemuxRelay.CONNECTION_WINDOW);
 		}
 		awaitReleased(stalls);
 	}
@@ -459,7 +464,7 @@ class H2DemuxStallTimeoutE2ETest {
 			AtomicBoolean sent = new AtomicBoolean();
 			Thread uploader = Thread.ofVirtual()
 				.name("e2e-h2stall-uploader")
-				.start(() -> sent.set(upload(client, 1, 1024 * 1024)));
+				.start(() -> sent.set(upload(client, 1, 2 * NettyHttp2DemuxRelay.STREAM_WINDOW)));
 			Thread.sleep(1500);
 			assertThat(client.streamWindow(1)).as("the stream window ran out").isLessThanOrEqualTo(0);
 			assertThat(client.connectionWindow()).as("the connection window did not").isPositive();
@@ -472,10 +477,10 @@ class H2DemuxStallTimeoutE2ETest {
 
 	/**
 	 * Six uploads take their connection past its allowance with the budget exhausted (the
-	 * relay holds up to a stream window of each, the 128KiB allowance is two): the relay
-	 * withholds the connection window while the streams still hold stream window, which
-	 * is not the client's stall either. One thread sends them, so the streams never spend
-	 * the same connection window twice.
+	 * relay holds up to a stream window of each, the budget two): the relay withholds the
+	 * connection window while the streams still hold stream window, which is not the
+	 * client's stall either. One thread sends them, so the streams never spend the same
+	 * connection window twice.
 	 */
 	@Test
 	void uploadsHeldBackByAWithheldConnectionWindowAreNotCut() throws Exception {
@@ -489,7 +494,7 @@ class H2DemuxStallTimeoutE2ETest {
 			AtomicBoolean sent = new AtomicBoolean();
 			Thread uploader = Thread.ofVirtual()
 				.name("e2e-h2stall-uploader")
-				.start(() -> sent.set(uploadAll(client, streams, 256 * 1024)));
+				.start(() -> sent.set(uploadAll(client, streams, NettyHttp2DemuxRelay.STREAM_WINDOW + 64 * 1024)));
 			Thread.sleep(1500);
 			// at least once: granted back while the queue drains, it may be withheld
 			// again

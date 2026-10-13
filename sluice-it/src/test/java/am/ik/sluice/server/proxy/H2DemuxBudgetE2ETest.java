@@ -71,7 +71,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 @TestInstance(Lifecycle.PER_CLASS)
 class H2DemuxBudgetE2ETest {
 
-	private static final long BUDGET = 512 * 1024;
+	/**
+	 * Past a relay's connection window: a relay granted while the budget had room is
+	 * charged what its client then sends within that window, so a smaller budget would
+	 * let one share alone pass it.
+	 */
+	private static final long BUDGET = 4 * NettyHttp2DemuxRelay.CONNECTION_WINDOW;
 
 	/**
 	 * Streams per stalled connection: their stream budgets add up far past the budget.
@@ -139,10 +144,10 @@ class H2DemuxBudgetE2ETest {
 
 	/**
 	 * Two connections whose upstream does not read, twenty streams each: together they
-	 * stop at the budget plus what each queues outside it -- far below the 5MiB their
-	 * stream budgets allow -- with the budget exhausted and their windows withheld, yet
-	 * no stream is reset and no connection torn down; once the upstream reads, every
-	 * stream completes and the budget is released.
+	 * stop at the budget plus what each queues outside it -- far below the 20MiB of their
+	 * bodies, which their stream windows allow -- with the budget exhausted and their
+	 * windows withheld, yet no stream is reset and no connection torn down; once the
+	 * upstream reads, every stream completes and the budget is released.
 	 */
 	@Test
 	void stalledConnectionsStopAtTheBudgetAndCompleteOnceTheUpstreamReads() throws Exception {
@@ -190,8 +195,17 @@ class H2DemuxBudgetE2ETest {
 			awaitStable(() -> queuedBytes(stalledRoute));
 			assertThat(budgetUsed()).as("exhausted before").isGreaterThanOrEqualTo(BUDGET);
 			double withheldBefore = withheld();
-			// the relay holds a stream window per stream: four take it past its allowance
-			try (Stalled flowing = open(flowingRoute, 4, 512 * 1024)) {
+			// the relay holds a stream window per stream: four take it past its
+			// allowance.
+			// A first exchange opens the leg and takes the upstream's SETTINGS, so the
+			// uploads' streams open at once instead of waiting for the leg's concurrency
+			// limit (waiting streams past the allowance are refused while withheld)
+			H2TestClient client = H2TestClient.connect(dataPort);
+			client.headers(1, true, TestH2.headerBlock(":authority=" + flowingRoute, ":method=GET", ":path=/warm"));
+			assertThat(client.awaitEnd(1, Duration.ofSeconds(10))).as("the leg opened").isTrue();
+			try (Stalled flowing = new Stalled(client, 1, 4, 512 * 1024, 0)) {
+				flowing.open(flowingRoute);
+				flowing.start();
 				flowing.awaitEnds();
 				assertThat(flowing.client().connectionGranted())
 					.isGreaterThan(NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE);

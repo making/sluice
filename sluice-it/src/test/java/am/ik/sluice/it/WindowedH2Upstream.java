@@ -75,6 +75,9 @@ public final class WindowedH2Upstream implements AutoCloseable {
 	/** The flow-controlled bytes of every DATA frame sent, padding included. */
 	private long sent;
 
+	/** The times {@link #sendData} ran out of window and waited for a grant. */
+	private long windowWaits;
+
 	/**
 	 * The upstream wrote its own SETTINGS: the server preface (RFC 9113 3.4) is out, and
 	 * a SETTINGS ack may follow it. With {@link #writeLock}.
@@ -255,6 +258,7 @@ public final class WindowedH2Upstream implements AutoCloseable {
 		do {
 			int n;
 			synchronized (this) {
+				boolean waited = false;
 				while (true) {
 					if (this.eof) {
 						throw new IOException("the relay went away");
@@ -267,6 +271,10 @@ public final class WindowedH2Upstream implements AutoCloseable {
 					n = (int) Math.min(Math.min(payload.length - offset, MAX_FRAME_SIZE), Math.max(0, available));
 					if (n > 0 || offset == payload.length) {
 						break;
+					}
+					if (!waited) {
+						waited = true;
+						this.windowWaits++;
 					}
 					wait();
 				}
@@ -321,6 +329,19 @@ public final class WindowedH2Upstream implements AutoCloseable {
 	/** The flow-controlled bytes of the DATA sent so far, padding included. */
 	public synchronized long sent() {
 		return this.sent;
+	}
+
+	/**
+	 * The times {@link #sendData} had payload left and no window to send it in, so it
+	 * waited for the relay's grant: one per round trip a window-bound transfer takes.
+	 */
+	public synchronized long windowWaits() {
+		return this.windowWaits;
+	}
+
+	/** The initial stream window the relay announced, RFC 9113's until its SETTINGS. */
+	public synchronized long sendInitialWindow() {
+		return this.sendInitialWindow;
 	}
 
 	/** Writes the bytes as they are, in one write. */

@@ -308,3 +308,41 @@ Columns: `server ms/MiB` CPU per relayed MiB, `server us/req` CPU per request,
 | base small h2 c50 s1 | 20.1 | 455.0 | 56.8 | 205.0 |
 | base small h2 c50 s10 | 20.1 | 455.0 | 56.8 | 205.0 |
 | base small h2 c50 s100 | 20.0 | 455.0 | 56.8 | 205.0 |
+
+## After todo 127: 1MiB windows on both faces
+
+The relay announces a 1MiB stream window and grants a 1MiB connection window on both faces
+(the tunnel's per-connection window), and `PendingPayload` holds its backlog in arrays
+filled in order instead of growing one array by copying. Series `harness/series-127.sh`
+(rows in `results-127.jsonl`), run back to back on one machine with no surefire JVM running
+(load 3 to 5): `after` is the build of this change, `base2` the main it is based on
+(`2f7d457`). Same harness and settings as above.
+
+| | base2 | after |
+|---|---|---|
+| download h2, loopback, 1 stream | 260 MiB/s, 6.9 B alloc/B | 754 MiB/s, 6.3 B alloc/B |
+| download h2, loopback, 8 streams | 205 MiB/s | 529 MiB/s |
+| upload h2, loopback | 291 MiB/s | 291 MiB/s |
+| small h2, loopback, 100 streams | 148k req/s | 148k req/s |
+| download h2, tunnel RTT 20 ms, 1 stream | 1.5 MiB/s | 20.5 MiB/s |
+| download h2, tunnel RTT 20 ms, 8 streams | 1.3 MiB/s | 20.6 MiB/s |
+| download h1, tunnel RTT 20 ms (same runs) | 20.5 MiB/s | 25.0 MiB/s |
+| upload h2, tunnel RTT 20 ms, upstream window 64KiB | 1.6 MiB/s | 1.6 MiB/s |
+| upload h2, tunnel RTT 20 ms, upstream window 1MiB | 21.1 MiB/s | 20.9 MiB/s |
+| upload h2, client RTT 20 ms, 1 stream | 1.6 MiB/s | 29.7 MiB/s |
+| upload h2, client RTT 20 ms, 8 streams | 1.3 MiB/s | 20.7 MiB/s |
+| download h2, client RTT 20 ms, client windows 6/15MiB | 136 MiB/s | 232 MiB/s |
+
+- At a 20 ms tunnel RTT an h2 connection now moves what an h1 connection does over the
+  same tunnel: 20.5 MiB/s for one stream and for eight (h1: 20.5 to 25.0 MiB/s in these
+  runs; 40.8 to 43.0 MiB/s in other runs of the same suite above, so h1 at a delayed
+  tunnel varies between runs). Eight streams add nothing over one, which fits the bound
+  being the upstream connection's own: one virtual connection, whose 1MiB credit window
+  (granted back at half) bounds an h1 connection the same way. So a relay window past
+  1MiB would not raise a download through one upstream connection.
+- Uploads with the upstream's window at 64KiB stay at 1.6 MiB/s: the upstream's own
+  window over the tunnel RTT bounds them, which the relay cannot change.
+- The server allocates 6.3 bytes per relayed byte on a loopback download instead of
+  18.4 with the 1MiB windows of the experiment above (6.9 on main with 64KiB windows).
+- The derived connection limit follows the windows: 5261KiB per slot instead of 3340KiB,
+  34 connections from production's 409MiB heap instead of 54.

@@ -261,19 +261,25 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 
 	/**
 	 * A waiting stream's client gets no window beyond the initial one: payload that
-	 * cannot drain is not invited. Once the stream opens, the window is granted.
+	 * cannot drain is not invited. Once the stream opens, the window is granted: the
+	 * upstream takes the whole window, and the relay grants it back once half of it was
+	 * written.
 	 */
 	@Test
 	void waitingStreamIsGrantedNoWindowBeyondTheInitialOne() throws Exception {
 		String route = "sl.window.test";
-		List<UpstreamConnection> connections = start(route, connection -> connection.settings(1L));
+		int window = NettyHttp2DemuxRelay.STREAM_WINDOW;
+		List<UpstreamConnection> connections = start(route, connection -> {
+			connection.settings(1L, (long) window);
+			connection.upstream().grant(0, window);
+		});
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.headers(1, true, get(route));
 			UpstreamConnection upstream = first(connections);
 			awaitOpen(upstream, 1);
 			Awaitility.await().atMost(TIMEOUT).until(() -> upstream.settingsAcks() >= 1);
 			client.headers(3, false, post(route));
-			assertThat(client.data(3, H2TestClient.INITIAL_WINDOW, false, TIMEOUT)).isTrue();
+			assertThat(client.data(3, window, false, TIMEOUT)).isTrue();
 			Thread.sleep(HELD.toMillis());
 			assertThat(upstream.seen(3)).as("stream 3 waits").isFalse();
 			assertThat(client.streamGranted(3)).as("window granted to the waiting stream").isZero();
@@ -283,7 +289,7 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 			client.sendData(3, new byte[0], TestH2.FLAG_END_STREAM);
 			upstream.release(3);
 			assertThat(client.awaitTrue(() -> client.ended(1) && client.ended(3), TIMEOUT)).isTrue();
-			assertThat(upstream.upstream().received(3)).isEqualTo(H2TestClient.INITIAL_WINDOW);
+			assertThat(upstream.upstream().received(3)).isEqualTo(window);
 		}
 	}
 
@@ -678,6 +684,19 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 		void settings(@Nullable Long maxConcurrentStreams) throws IOException {
 			byte[] payload = maxConcurrentStreams == null ? new byte[0]
 					: WindowedH2Upstream.setting(SETTINGS_MAX_CONCURRENT_STREAMS, maxConcurrentStreams.longValue());
+			this.upstream.write(TestH2.SETTINGS, 0, 0, payload);
+		}
+
+		/**
+		 * Announces SETTINGS with SETTINGS_MAX_CONCURRENT_STREAMS and
+		 * SETTINGS_INITIAL_WINDOW_SIZE.
+		 */
+		void settings(long maxConcurrentStreams, long initialWindow) throws IOException {
+			byte[] limit = WindowedH2Upstream.setting(SETTINGS_MAX_CONCURRENT_STREAMS, maxConcurrentStreams);
+			byte[] window = WindowedH2Upstream.setting(WindowedH2Upstream.SETTINGS_INITIAL_WINDOW_SIZE, initialWindow);
+			byte[] payload = new byte[limit.length + window.length];
+			System.arraycopy(limit, 0, payload, 0, limit.length);
+			System.arraycopy(window, 0, payload, limit.length, window.length);
 			this.upstream.write(TestH2.SETTINGS, 0, 0, payload);
 		}
 

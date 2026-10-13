@@ -82,12 +82,12 @@ import io.netty.util.AsciiString;
  * are per hop: DATA read on one hop is written on the other ({@link Flow}: a copy, small
  * frames coalesced) and consumed -- its stream window granted back -- once written, so
  * what the relay holds per stream and direction stays within the stream window it
- * announced ({@link #STREAM_WINDOW}); the connection windows refill as DATA arrives
- * (netty's auto refill), so a stream held by its upstream or its client holds back no
- * other stream. Resets pass either way with their code; an upstream's reset after the
- * response's end follows that end to the client. A stream the client ends without its
- * request's end resets its upstream stream with {@code CANCEL}; one an early response
- * closed for the client still delivers the request's rest.
+ * announced ({@link #STREAM_WINDOW}); the connection windows ({@link #CONNECTION_WINDOW})
+ * refill as DATA arrives (netty's auto refill), so a stream held by its upstream or its
+ * client holds back no other stream. Resets pass either way with their code; an
+ * upstream's reset after the response's end follows that end to the client. A stream the
+ * client ends without its request's end resets its upstream stream with {@code CANCEL};
+ * one an early response closed for the client still delivers the request's rest.
  * <p>
  * What the relay holds -- DATA and header blocks not yet written, both ways, and every
  * hop's writer queue -- is accounted after each action of its loop: the part past
@@ -182,11 +182,24 @@ final class NettyHttp2DemuxRelay {
 	static final int MAX_INTERIM_BYTES = MAX_HEADER_LIST_SIZE;
 
 	/**
-	 * The initial stream window the relay announces on both faces (netty's default, the
-	 * RFC 9113 one): what it reads of a stream and has not written on the other hop yet,
-	 * its consumed bytes not granted back, stays within it.
+	 * The initial stream window the relay announces on both faces: what it reads of a
+	 * stream and has not written on the other hop yet, its consumed bytes not granted
+	 * back, stays within it. A stream moves at most this much per round trip of its hop,
+	 * so it is the tunnel's own per-connection window
+	 * ({@link VirtualConnection#DEFAULT_WINDOW}): a leg -- one virtual connection -- has
+	 * no more than that in flight per tunnel round trip whatever the relay announces, and
+	 * one stream can use all of it.
 	 */
-	static final int STREAM_WINDOW = 65535;
+	static final int STREAM_WINDOW = VirtualConnection.DEFAULT_WINDOW;
+
+	/**
+	 * The connection window the relay grants on both faces, refilled as DATA arrives: the
+	 * most a connection's streams together move per round trip of the hop, the same bound
+	 * as one stream's ({@link #STREAM_WINDOW}) for the same reason. It bounds no memory
+	 * while granted; withheld, it is what a peer can still send
+	 * ({@link #WITHHELD_ARRIVALS}).
+	 */
+	static final int CONNECTION_WINDOW = VirtualConnection.DEFAULT_WINDOW;
 
 	/**
 	 * The bytes a relay may queue without charging the shared budget: what it always
@@ -209,11 +222,11 @@ final class NettyHttp2DemuxRelay {
 	 * What a peer can still make the relay hold once the relay decided to withhold its
 	 * connection window: the read under way when the budget ran out (the decision follows
 	 * each read), then the connection window the peer holds -- at most
-	 * {@link #STREAM_WINDOW}: netty's auto refill grants it back to its initial size,
-	 * never more --, copied into the streams' backlogs, which round up by less than one
+	 * {@link #CONNECTION_WINDOW}: netty's auto refill grants it back to that size, never
+	 * more --, copied into the streams' backlogs, which round up by less than one
 	 * {@link PendingPayload#GRANULE} each.
 	 */
-	static final long WITHHELD_ARRIVALS = Hop.MAX_READ_BYTES + STREAM_WINDOW
+	static final long WITHHELD_ARRIVALS = Hop.MAX_READ_BYTES + CONNECTION_WINDOW
 			+ (long) MAX_CONCURRENT_STREAMS * PendingPayload.GRANULE;
 
 	/**
@@ -427,6 +440,7 @@ final class NettyHttp2DemuxRelay {
 					// each reset the client has not read yet is of a stream it still
 					// counts against the concurrency limit
 					.rememberedResets(MAX_CONCURRENT_STREAMS)
+					.connectionWindow(CONNECTION_WINDOW)
 					.onInactive(this::clientClosedLocked)
 					.onEof(this::clientEndedLocked)
 					.onWritten(NettyHttp2DemuxRelay::reviewed)
@@ -450,11 +464,12 @@ final class NettyHttp2DemuxRelay {
 
 	/**
 	 * Both faces' codec: the settings plus the header list limit (netty's default is
-	 * 8KiB), and header blocks encoded as never-indexed literals, so every block the
-	 * relay writes decodes on its own whatever the peer's decoder saw before.
+	 * 8KiB) and the initial stream window ({@link #STREAM_WINDOW}), and header blocks
+	 * encoded as never-indexed literals, so every block the relay writes decodes on its
+	 * own whatever the peer's decoder saw before.
 	 */
 	private static void configure(HopHandler.Builder codec, Http2Settings settings) {
-		codec.initialSettings(settings.maxHeaderListSize(MAX_HEADER_LIST_SIZE))
+		codec.initialSettings(settings.maxHeaderListSize(MAX_HEADER_LIST_SIZE).initialWindowSize(STREAM_WINDOW))
 			.headerSensitivityDetector((name, value) -> true);
 	}
 
@@ -769,6 +784,7 @@ final class NettyHttp2DemuxRelay {
 				})
 				// a leg's streams relay the client's
 				.rememberedResets(MAX_CONCURRENT_STREAMS)
+				.connectionWindow(CONNECTION_WINDOW)
 				.onInactive(() -> this.legs.remove(route, opening))
 				.onWritten(NettyHttp2DemuxRelay::reviewed)
 				.traffic(traffic(route, session))
@@ -1790,12 +1806,11 @@ final class NettyHttp2DemuxRelay {
 			if (this.backlog.size() > 0 || this.backlogEnds) {
 				int size = this.backlog.size();
 				int capacity = this.backlog.capacity();
-				byte[] bytes = this.backlog.takeAll();
+				ByteBuf bytes = this.backlog.takeAll();
 				boolean ends = this.backlogEnds;
 				this.backlogEnds = false;
 				account(-capacity);
-				writeData(size == 0 ? Unpooled.EMPTY_BUFFER : Unpooled.wrappedBuffer(bytes, 0, size), size, capacity,
-						ends);
+				writeData(bytes, size, capacity, ends);
 			}
 			Http2Headers held = this.trailers;
 			if (held != null) {

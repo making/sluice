@@ -519,7 +519,7 @@ class H2DemuxClientFrameValidationE2ETest {
 	 * stream past 2^31-1 ends the connection with GOAWAY {@code FLOW_CONTROL_ERROR} (RFC
 	 * 9113 6.9.2) -- a stream whose response ended too ({@code /early}: its request goes
 	 * on, its window is still the stream's) --; the windows are per hop, so the setting
-	 * never reaches the upstream.
+	 * never reaches the upstream, which got the relay's own initial window only.
 	 */
 	@ParameterizedTest(name = "{0}")
 	@ValueSource(strings = { "/", "/early" })
@@ -537,14 +537,16 @@ class H2DemuxClientFrameValidationE2ETest {
 			assertThat(client.awaitTrue(client::closed, Duration.ofSeconds(5))).isTrue();
 			assertThat(client.goAwayCode()).isEqualTo(FLOW_CONTROL_ERROR);
 			assertThat(session.upstream().eof().await(5, TimeUnit.SECONDS)).isTrue();
-			assertThat(session.upstream().settings(SETTINGS_INITIAL_WINDOW_SIZE)).isEmpty();
+			assertThat(session.upstream().settings(SETTINGS_INITIAL_WINDOW_SIZE))
+				.containsExactly((long) NettyHttp2DemuxRelay.STREAM_WINDOW);
 			awaitReleased(ROUTE);
 		}
 	}
 
 	/**
 	 * A change of SETTINGS_INITIAL_WINDOW_SIZE taking a stream's window to 2^31-1 exactly
-	 * keeps the connection; the setting does not reach the upstream.
+	 * keeps the connection; the setting does not reach the upstream, which got the
+	 * relay's own initial window only.
 	 */
 	@Test
 	void initialWindowChangeToTheMaximumKeepsTheConnection() throws Exception {
@@ -558,14 +560,16 @@ class H2DemuxClientFrameValidationE2ETest {
 			assertThat(TestH2.bodyOf(client.frames(1))).isEqualTo("ok");
 			assertThat(client.closed()).isFalse();
 			assertThat(client.goAwayCode()).isEqualTo(-1);
-			assertThat(session.upstream().settings(SETTINGS_INITIAL_WINDOW_SIZE)).isEmpty();
+			assertThat(session.upstream().settings(SETTINGS_INITIAL_WINDOW_SIZE))
+				.containsExactly((long) NettyHttp2DemuxRelay.STREAM_WINDOW);
 		}
 	}
 
 	/**
 	 * A client preface not followed by a SETTINGS frame (RFC 9113 3.4) -- a request head
 	 * right after the magic -- ends the connection with GOAWAY {@code PROTOCOL_ERROR}
-	 * behind the relay's SETTINGS; the head reaches no upstream.
+	 * behind the relay's SETTINGS and connection window grant; the head reaches no
+	 * upstream.
 	 */
 	@Test
 	void aPrefaceNotFollowedBySettingsEndsTheConnection() throws Exception {
@@ -586,8 +590,11 @@ class H2DemuxClientFrameValidationE2ETest {
 				frames.add(frame);
 			}
 		}
-		assertThat(frames).extracting(TestH2.Frame::type).containsExactly(TestH2.SETTINGS, TestH2.GOAWAY);
-		TestH2.Frame goAway = frames.get(1);
+		assertThat(frames).extracting(TestH2.Frame::type)
+			.containsExactly(TestH2.SETTINGS, TestH2.WINDOW_UPDATE, TestH2.GOAWAY);
+		assertThat(frames.get(1).streamId()).isZero();
+		assertThat(TestH2.increment(frames.get(1))).isEqualTo(NettyHttp2DemuxRelay.CONNECTION_WINDOW - 65535);
+		TestH2.Frame goAway = frames.get(2);
 		assertThat(TestH2.errorCode(goAway)).isEqualTo(PROTOCOL_ERROR);
 		assertThat(TestH2.increment(goAway)).as("last stream id").isEqualTo(Integer.MAX_VALUE);
 		awaitReleased(ROUTE);

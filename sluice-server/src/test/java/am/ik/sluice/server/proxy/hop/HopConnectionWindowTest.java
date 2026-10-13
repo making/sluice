@@ -19,14 +19,16 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import static am.ik.sluice.server.proxy.hop.Fixture.awaitTrue;
 import static am.ik.sluice.server.proxy.hop.Fixture.settled;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 
 /**
  * A hop's connection window gate: while withheld, the connection-level WINDOW_UPDATEs of
  * netty's auto refill are held back -- the peer can spend no more than the connection
  * window it holds, though its stream windows are granted back -- and let go they reach
- * the peer as one WINDOW_UPDATE; a hop watching its writes runs its action after the
- * writer's batches; the loop's after-settle hook runs after every action, again while it
- * acts.
+ * the peer as one WINDOW_UPDATE; a hop built with a larger connection window grants it
+ * behind its preface, refills to it, and withheld holds the peer to it; a hop watching
+ * its writes runs its action after the writer's batches; the loop's after-settle hook
+ * runs after every action, again while it acts.
  */
 @Tag("netty-hop")
 @ExtendWith(LeakCheck.class)
@@ -34,6 +36,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 class HopConnectionWindowTest {
 
 	private static final int WINDOW = 65535;
+
+	private static final int LARGE_WINDOW = 1024 * 1024;
 
 	private static final int FRAME = 16 * 1024;
 
@@ -119,6 +123,76 @@ class HopConnectionWindowTest {
 	}
 
 	@Test
+	void aLargerConnectionWindowIsGrantedBehindThePrefaceAndRefilledToItsSize() throws Exception {
+		Socket[] sockets = Endpoint.socketPair();
+		List<int[]> updates = new CopyOnWriteArrayList<>();
+		try (Socket raw = sockets[1];
+				Endpoint a = Endpoint.over("a", sockets[0],
+						builder -> builder.server(true).connectionWindow(LARGE_WINDOW))) {
+			OutputStream out = raw.getOutputStream();
+			Thread reader = Thread.ofVirtual().start(() -> readWindowUpdates(raw, updates));
+			out.write(RawFrames.clientPreface());
+			out.write(RawFrames.frame(0x1, 0x4, 1, POST_HEAD));
+			out.flush();
+			awaitTrue(() -> increments(updates, 0) > 0, () -> "updates=" + describe(updates));
+			assertThat(connectionUpdates(updates)).as("the grant behind the preface")
+				.containsExactly(LARGE_WINDOW - WINDOW);
+
+			// half the window, consumed on arrival: the auto refill grants it back
+			for (int i = 0; i < LARGE_WINDOW / 2 / FRAME; i++) {
+				out.write(RawFrames.frame(0x0, 0, 1, new byte[FRAME]));
+			}
+			out.flush();
+			awaitTrue(() -> connectionUpdates(updates).size() == 2, () -> "updates=" + describe(updates));
+			assertThat(connectionUpdates(updates)).as("refilled to its size, not to RFC 9113's")
+				.containsExactly(LARGE_WINDOW - WINDOW, LARGE_WINDOW / 2);
+			assertThat(a.sink.failures()).isEmpty();
+			raw.close();
+			reader.join();
+		}
+	}
+
+	@Test
+	void aWithheldLargerConnectionWindowHoldsThePeerToItsSize() throws Exception {
+		Socket[] sockets = Endpoint.socketPair();
+		List<int[]> updates = new CopyOnWriteArrayList<>();
+		try (Socket raw = sockets[1];
+				Endpoint a = Endpoint.over("a", sockets[0],
+						builder -> builder.server(true).connectionWindow(LARGE_WINDOW))) {
+			OutputStream out = raw.getOutputStream();
+			Thread reader = Thread.ofVirtual().start(() -> readWindowUpdates(raw, updates));
+			out.write(RawFrames.clientPreface());
+			out.write(RawFrames.frame(0x1, 0x4, 1, POST_HEAD));
+			out.flush();
+			awaitTrue(() -> increments(updates, 0) > 0, () -> "updates=" + describe(updates));
+			a.loop.run(() -> a.hop.withholdConnectionWindowLocked(true));
+
+			// the whole window the peer holds, the stream's refilled on arrival
+			for (int i = 0; i < LARGE_WINDOW / FRAME; i++) {
+				out.write(RawFrames.frame(0x0, 0, 1, new byte[FRAME]));
+			}
+			out.flush();
+			settled(a.hop::bytesRead, () -> updates.size());
+			assertThat(a.hop.open()).as("within the window the peer holds").isTrue();
+			assertThat(connectionUpdates(updates)).as("nothing granted while withheld")
+				.containsExactly(LARGE_WINDOW - WINDOW);
+			assertThat(a.loop.call(a.hop::owedConnectionWindowLocked)).isEqualTo(LARGE_WINDOW);
+
+			out.write(RawFrames.frame(0x0, 0, 1, new byte[1]));
+			out.flush();
+			awaitTrue(() -> goAwayCode(updates) >= 0, () -> "updates=" + describe(updates) + " open=" + a.hop.open());
+			assertThat(goAwayCode(updates)).isEqualTo(Http2Error.FLOW_CONTROL_ERROR.code());
+			raw.close();
+			reader.join();
+		}
+	}
+
+	@Test
+	void aConnectionWindowBelowTheSpecsIsRefused() {
+		assertThatIllegalArgumentException().isThrownBy(() -> Hop.builder().connectionWindow(WINDOW - 1));
+	}
+
+	@Test
 	void aHopWatchingItsWritesRunsItsActionAfterTheWritersBatches() throws Exception {
 		Socket[] sockets = Endpoint.socketPair();
 		AtomicInteger runs = new AtomicInteger();
@@ -171,6 +245,10 @@ class HopConnectionWindowTest {
 		finally {
 			loop.close();
 		}
+	}
+
+	private static List<Integer> connectionUpdates(List<int[]> updates) {
+		return updates.stream().filter(update -> update[0] == 0).map(update -> update[1]).toList();
 	}
 
 	private static long increments(List<int[]> updates, int streamId) {

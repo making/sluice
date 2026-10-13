@@ -71,11 +71,12 @@ import org.jspecify.annotations.Nullable;
  * written ({@link HopHandler}): no DATA of a stream follows its reset, on the hop being
  * read ({@code HopResetOrderTest}) or another ({@code H2DemuxResetOrderE2ETest}).
  * <p>
- * <b>The connection window</b> refills as DATA arrives (netty's auto refill, unless the
- * builder turns it off), so only the stream windows bound what the hop holds; the
- * bridging code may withhold it ({@link #withholdConnectionWindowLocked}): the
- * connection-level WINDOW_UPDATEs are held back and the peer is held to the window it was
- * granted.
+ * <b>The connection window</b> is netty's default (65535) or the larger one the builder
+ * sets, granted with a WINDOW_UPDATE right after the preface. It refills to that size as
+ * DATA arrives (netty's auto refill, unless the builder turns it off), so only the stream
+ * windows bound what the hop holds; the bridging code may withhold it
+ * ({@link #withholdConnectionWindowLocked}): the connection-level WINDOW_UPDATEs are held
+ * back and the peer is held to the window it was granted.
  * <p>
  * <b>Reading pauses</b> while the queue holds more than the read pause bytes. What the
  * flow controller holds back is DATA only; the frames netty answers on its own (PING and
@@ -147,6 +148,9 @@ public final class Hop {
 
 	/** The default most the writer writes to the pipe at once. */
 	public static final int DEFAULT_WRITE_PIECE = 64 * 1024;
+
+	/** The connection window of RFC 9113, and netty's default for a hop. */
+	public static final int DEFAULT_CONNECTION_WINDOW = 65535;
 
 	/** The user-defined writability bit the writer queue drives. */
 	private static final int QUEUE_WRITABILITY = 1;
@@ -292,6 +296,7 @@ public final class Hop {
 			throw new IllegalStateException(this.name + ": the channel did not register", e);
 		}
 		this.ctx = Objects.requireNonNull(this.channel.pipeline().context(this.handler));
+		growConnectionWindow(connection, builder.connectionWindow);
 		this.guardCtx = Objects.requireNonNull(this.channel.pipeline().context(guard));
 		this.loop.registerLocked(this);
 		Thread.ofVirtual().name(this.name + "-read").start(this::read);
@@ -300,6 +305,24 @@ public final class Hop {
 
 	public static Builder builder() {
 		return new Builder();
+	}
+
+	/**
+	 * Grants the peer the connection window past RFC 9113's initial one: the local flow
+	 * controller raises its target, so the auto refill keeps the window at that size, and
+	 * writes the WINDOW_UPDATE behind the preface.
+	 */
+	private void growConnectionWindow(Http2Connection connection, int window) {
+		int delta = window - DEFAULT_CONNECTION_WINDOW;
+		if (delta == 0) {
+			return;
+		}
+		try {
+			connection.local().flowController().incrementWindowSize(connection.connectionStream(), delta);
+		}
+		catch (Http2Exception e) {
+			throw new IllegalStateException(this.name + ": the connection window did not grow", e);
+		}
 	}
 
 	public String name() {
@@ -1097,6 +1120,8 @@ public final class Hop {
 
 		private boolean autoRefillConnectionWindow = true;
 
+		private int connectionWindow = DEFAULT_CONNECTION_WINDOW;
+
 		private Consumer<HopHandler.Builder> codec = handlerBuilder -> {
 		};
 
@@ -1170,6 +1195,22 @@ public final class Hop {
 		 */
 		public Builder autoRefillConnectionWindow(boolean autoRefillConnectionWindow) {
 			this.autoRefillConnectionWindow = autoRefillConnectionWindow;
+			return this;
+		}
+
+		/**
+		 * The connection window the hop grants its peer, at least RFC 9113's initial
+		 * {@link #DEFAULT_CONNECTION_WINDOW} (the default): a larger one is granted with
+		 * a WINDOW_UPDATE right after the preface, and the auto refill keeps it at that
+		 * size. Withheld ({@link Hop#withholdConnectionWindowLocked}), it is what the
+		 * peer can still send at most.
+		 */
+		public Builder connectionWindow(int connectionWindow) {
+			if (connectionWindow < DEFAULT_CONNECTION_WINDOW) {
+				throw new IllegalArgumentException(
+						"connectionWindow must be at least " + DEFAULT_CONNECTION_WINDOW + ": " + connectionWindow);
+			}
+			this.connectionWindow = connectionWindow;
 			return this;
 		}
 

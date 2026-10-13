@@ -71,8 +71,11 @@ class H2DemuxStallE2ETest {
 
 	private static final int ENHANCE_YOUR_CALM = 0xb;
 
-	/** The stream window the relay announces to the client. */
-	private static final int STREAM_WINDOW = 65535;
+	/**
+	 * The stream window the relay announces to the client:
+	 * {@code NettyHttp2DemuxRelay.STREAM_WINDOW}.
+	 */
+	private static final int STREAM_WINDOW = 1024 * 1024;
 
 	/**
 	 * What the relay may queue for one stream towards a leg whose writer is stalled: the
@@ -182,11 +185,11 @@ class H2DemuxStallE2ETest {
 			assertThat(queued).as("the stall reached the leg queue when the second request was sent")
 				.isGreaterThan(0)
 				.isLessThanOrEqualTo(STREAM_QUEUE_BOUND);
-			// past the relay's budget and the tunnel connection's credit window: the
-			// stall
-			// holds the tunnel path too, not only the relay
+			// past what the relay queued, by most of the tunnel connection's credit
+			// window (frame headers spend some of it): the stall holds the tunnel path
+			// too, not only the relay
 			assertThat(client.streamSent(1)).as("bytes pushed on the stalled leg")
-				.isGreaterThan(STREAM_QUEUE_BOUND + VirtualConnection.DEFAULT_WINDOW);
+				.isGreaterThan(queued + VirtualConnection.DEFAULT_WINDOW / 2);
 			assertThat(client.maxOvershoot()).isLessThanOrEqualTo(0);
 		}
 	}
