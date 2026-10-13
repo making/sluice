@@ -1,0 +1,55 @@
+--- a/sluice-server/src/main/java/am/ik/sluice/server/proxy/hop/Loop.java	2026-10-13
++++ b/sluice-server/src/main/java/am/ik/sluice/server/proxy/hop/Loop.java	2026-10-13 21:46:59
+@@ -109,7 +109,15 @@
+ 		if (this.lock.isHeldByCurrentThread()) {
+ 			return action.get();
+ 		}
+-		this.lock.lock();
++		// measurement build: contention counters (not product code)
++		if (!this.lock.tryLock()) {
++			CONTENDED.increment();
++			long w0 = System.nanoTime();
++			this.lock.lock();
++			WAIT_NANOS.add(System.nanoTime() - w0);
++		}
++		ACQUIRED.increment();
++		long h0 = System.nanoTime();
+ 		try {
+ 			T result;
+ 			try {
+@@ -128,10 +136,35 @@
+ 			return result;
+ 		}
+ 		finally {
++			HOLD_NANOS.add(System.nanoTime() - h0);
+ 			this.lock.unlock();
+ 		}
+ 	}
+ 
++	static final java.util.concurrent.atomic.LongAdder ACQUIRED = new java.util.concurrent.atomic.LongAdder();
++
++	static final java.util.concurrent.atomic.LongAdder CONTENDED = new java.util.concurrent.atomic.LongAdder();
++
++	static final java.util.concurrent.atomic.LongAdder WAIT_NANOS = new java.util.concurrent.atomic.LongAdder();
++
++	static final java.util.concurrent.atomic.LongAdder HOLD_NANOS = new java.util.concurrent.atomic.LongAdder();
++
++	static {
++		Thread.ofPlatform().daemon().name("loop-stats").start(() -> {
++			try (java.io.PrintStream out = new java.io.PrintStream(
++					new java.io.FileOutputStream(System.getProperty("loop.stats", "loop-stats.log"), true), true)) {
++				while (true) {
++					out.println(System.nanoTime() + " " + ACQUIRED.sum() + " " + CONTENDED.sum() + " "
++							+ WAIT_NANOS.sum() + " " + HOLD_NANOS.sum());
++					Thread.sleep(200);
++				}
++			}
++			catch (Exception e) {
++				// ends
++			}
++		});
++	}
++
+ 	/**
+ 	 * Whether the current thread holds the lock: inside {@link #run} or {@link #call}.
+ 	 */

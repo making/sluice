@@ -1,0 +1,32 @@
+--- a/sluice-server/src/main/java/am/ik/sluice/server/proxy/hop/Hop.java	2026-10-13
++++ b/sluice-server/src/main/java/am/ik/sluice/server/proxy/hop/Hop.java	2026-10-13 21:50:55
+@@ -292,6 +292,18 @@
+ 			throw new IllegalStateException(this.name + ": the channel did not register", e);
+ 		}
+ 		this.ctx = Objects.requireNonNull(this.channel.pipeline().context(this.handler));
++		// window experiment (not product code): a larger connection window
++		int extraConnWindow = Integer.getInteger("hop.connWindow", 65535) - 65535;
++		if (extraConnWindow > 0) {
++			try {
++				connection.local()
++					.flowController()
++					.incrementWindowSize(connection.connectionStream(), extraConnWindow);
++			}
++			catch (Http2Exception e) {
++				throw new IllegalStateException(e);
++			}
++		}
+ 		this.guardCtx = Objects.requireNonNull(this.channel.pipeline().context(guard));
+ 		this.loop.registerLocked(this);
+ 		Thread.ofVirtual().name(this.name + "-read").start(this::read);
+--- a/sluice-server/src/main/java/am/ik/sluice/server/proxy/Ne
++++ b/sluice-server/src/main/java/am/ik/sluice/server/proxy/NettyHttp2DemuxRelay.java	2026-10-13 21:50:59
+@@ -452,7 +452,7 @@
+ 	 * relay writes decodes on its own whatever the peer's decoder saw before.
+ 	 */
+ 	private static void configure(HopHandler.Builder codec, Http2Settings settings) {
+-		codec.initialSettings(settings.maxHeaderListSize(MAX_HEADER_LIST_SIZE))
++		codec.initialSettings(settings.maxHeaderListSize(MAX_HEADER_LIST_SIZE).initialWindowSize(Integer.getInteger("relay.streamWindow", 65535)))
+ 			.headerSensitivityDetector((name, value) -> true);
+ 	}
+ 
