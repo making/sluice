@@ -105,6 +105,9 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 						.register(meterRegistry));
 		}
 		log.info("server build: {}", PeerBuilds.describe(serverBuild));
+		Gauge.builder("sluice.tunnel.sessions", sessions, SessionRegistry::count)
+			.description("Connected tunnel clients (sessions registered by their first Advertise)")
+			.register(meterRegistry);
 		Gauge
 			.builder("sluice.tunnel.sessions.build.unknown", sessions,
 					registry -> registry.all().stream().filter(session -> session.clientBuild().isEmpty()).count())

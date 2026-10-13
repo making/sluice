@@ -78,6 +78,11 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 		this.clientId = configured == null || configured.isBlank() ? UUID.randomUUID().toString() : configured;
 		meterRegistry.gauge("sluice.connections.active", this.connectionsByNode,
 				map -> map.values().stream().mapToInt(NodeConnection::activeConnections).sum());
+		Gauge
+			.builder("sluice.tunnel.sessions", this.connectionsByNode,
+					map -> map.values().stream().filter(NodeConnection::isConnected).count())
+			.description("Tunnel streams established, one per server node")
+			.register(meterRegistry);
 		this.connectionLimit = new ConnectionLimit(ConnectionLimit.resolve(properties.maxConnections()));
 		Gauge.builder("sluice.connections.limit", this.connectionLimit, ConnectionLimit::max)
 			.description("Upstream connections allowed open at once")

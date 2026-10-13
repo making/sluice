@@ -21,9 +21,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Full stack integration test: the client exposes the actuator on its HTTP port -- health
  * reporting the tunnel state (UP while a node stream lives, the per-node states as
- * details) and prometheus metrics. The security auto-configuration is excluded on the
- * client: it lands on the shared classpath through the server dependency, while the
- * standalone client deliberately ships none.
+ * details) and prometheus metrics, among them the established tunnel streams. The
+ * security auto-configuration is excluded on the client: it lands on the shared classpath
+ * through the server dependency, while the standalone client deliberately ships none.
  */
 @TestInstance(Lifecycle.PER_CLASS)
 class ClientActuatorE2ETest {
@@ -98,7 +98,8 @@ class ClientActuatorE2ETest {
 			.expectStatus()
 			.isOk()
 			.expectBody(String.class)
-			.consumeWith(result -> assertThat(result.getResponseBody()).contains("sluice_reconnect_total"));
+			.consumeWith(result -> assertThat(result.getResponseBody()).contains("sluice_reconnect_total")
+				.containsPattern("(?m)^sluice_tunnel_sessions 1\\.0$"));
 
 		// server gone: the tunnel health goes DOWN (503)
 		Objects.requireNonNull(this.serverContext).close();
@@ -119,6 +120,7 @@ class ClientActuatorE2ETest {
 			.isEqualTo("not connected")
 			.jsonPath("$.components.tunnel.details.nodes")
 			.value(nodes -> assertThat(String.valueOf(nodes)).contains(":down"));
+		assertThat(body(rest, "/actuator/prometheus")).containsPattern("(?m)^sluice_tunnel_sessions 0\\.0$");
 	}
 
 }
