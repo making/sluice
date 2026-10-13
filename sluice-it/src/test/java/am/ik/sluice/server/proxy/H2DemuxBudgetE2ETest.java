@@ -282,8 +282,14 @@ class H2DemuxBudgetE2ETest {
 			assertThat(client.awaitTrue(() -> client.reset(reset) != null, Duration.ofSeconds(5))).isTrue();
 			assertThat(client.reset(reset)).isEqualTo(ENHANCE_YOUR_CALM);
 			assertThat(resets("budget")).isEqualTo(resetsBefore + 1);
-			assertThat(queuedBytes(route)).as("the stream's queued data dropped, a reset queued")
-				.isLessThanOrEqualTo(queued - body + RST_STREAM_BYTES);
+			// the client reset goes out at once, before the relay's action ends: the
+			// leg's
+			// reset and the accounting follow
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.untilAsserted(
+						() -> assertThat(queuedBytes(route)).as("the stream's queued data dropped, a reset queued")
+							.isLessThanOrEqualTo(queued - body + RST_STREAM_BYTES));
 			assertThat(trackedStreams(route)).as("forgotten once its client stream closed").isEqualTo(2 * STREAMS);
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(client.closed()).isFalse();

@@ -556,9 +556,10 @@ final class NettyHttp2DemuxRelay {
 		}
 		int headBytes = headerBytes(headers);
 		if (!admitLocked(headBytes)) {
-			// past the allowance with the budget exhausted: safe for the client to retry
-			resetClientLocked(streamId, Http2Error.REFUSED_STREAM);
+			// past the allowance with the budget exhausted: safe for the client to retry;
+			// counted first, as the reset goes out at once
 			this.meters.refusedForBudget();
+			resetClientLocked(streamId, Http2Error.REFUSED_STREAM);
 			return;
 		}
 		Leg leg = legLocked(route, session);
@@ -644,9 +645,9 @@ final class NettyHttp2DemuxRelay {
 		}
 		exchange.reset = true;
 		exchange.refused = true;
+		this.meters.refusedForWaitTimeout();
 		dropWaitingLocked(exchange, Http2Error.CANCEL.code());
 		resetClientLocked(exchange.id, Http2Error.REFUSED_STREAM);
-		this.meters.refusedForWaitTimeout();
 	}
 
 	/**
@@ -673,9 +674,10 @@ final class NettyHttp2DemuxRelay {
 	 */
 	private void resetForBudgetLocked(Exchange exchange) {
 		exchange.reset = true;
+		// counted first: the resets go out at once
+		this.meters.resetForBudget();
 		resetClientLocked(exchange.id, Http2Error.ENHANCE_YOUR_CALM);
 		resetLocked(exchange.leg.hop(), exchange.id, Http2Error.CANCEL.code());
-		this.meters.resetForBudget();
 	}
 
 	/** Whether a response header block is an interim (1xx) head. */
@@ -1392,9 +1394,9 @@ final class NettyHttp2DemuxRelay {
 			bytes -= exchange.waitingBytes();
 			exchange.reset = true;
 			exchange.refused = true;
+			this.meters.refusedWaiting();
 			dropWaitingLocked(exchange, Http2Error.CANCEL.code());
 			resetClientLocked(exchange.id, Http2Error.REFUSED_STREAM);
-			this.meters.refusedWaiting();
 		}
 		return true;
 	}
@@ -1979,10 +1981,10 @@ final class NettyHttp2DemuxRelay {
 			if (interim(headers)) {
 				exchange.interimBytes += bytes;
 				if (exchange.interimBytes > MAX_INTERIM_BYTES) {
+					NettyHttp2DemuxRelay.this.meters.resetForInterim();
 					exchange.requestFlow.drop();
 					loseLocked(exchange);
 					resetLocked(this.leg.hop(), streamId, Http2Error.ENHANCE_YOUR_CALM.code());
-					NettyHttp2DemuxRelay.this.meters.resetForInterim();
 					return;
 				}
 			}
