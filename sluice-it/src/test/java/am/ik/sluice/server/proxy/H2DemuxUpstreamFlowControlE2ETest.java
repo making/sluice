@@ -719,8 +719,8 @@ class H2DemuxUpstreamFlowControlE2ETest {
 			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
 			assertThat(client.awaitTrue(() -> client.reset(1) != null, Duration.ofSeconds(5))).as("stream 1 reset")
 				.isTrue();
-			// the first reset: netty's codec answers what the client still sends after it
-			// with resets of its own (STREAM_CLOSED)
+			// the relay's reset first: what the client still sends after it is ignored
+			// within the window it held, answered with STREAM_CLOSED past it
 			assertThat(client.frames(1).stream().filter(frame -> frame.type() == TestH2.RST_STREAM).findFirst())
 				.hasValueSatisfying(reset -> assertThat(TestH2.errorCode(reset)).isEqualTo(NO_ERROR));
 			Awaitility.await()

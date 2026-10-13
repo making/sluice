@@ -422,6 +422,9 @@ final class NettyHttp2DemuxRelay {
 					.server(true)
 					.listener(ClientListener::new)
 					.codec(codec -> configure(codec, new Http2Settings().maxConcurrentStreams(MAX_CONCURRENT_STREAMS)))
+					// each reset the client has not read yet is of a stream it still
+					// counts against the concurrency limit
+					.rememberedResets(MAX_CONCURRENT_STREAMS)
 					.onInactive(this::clientClosedLocked)
 					.onEof(this::clientEndedLocked)
 					.onWritten(NettyHttp2DemuxRelay::reviewed)
@@ -760,6 +763,8 @@ final class NettyHttp2DemuxRelay {
 					// StreamBufferingEncoder
 					codec.encoderEnforceMaxConcurrentStreams(true);
 				})
+				// a leg's streams relay the client's
+				.rememberedResets(MAX_CONCURRENT_STREAMS)
 				.onInactive(() -> this.legs.remove(route, opening))
 				.onWritten(NettyHttp2DemuxRelay::reviewed)
 				.traffic(traffic(route, session))

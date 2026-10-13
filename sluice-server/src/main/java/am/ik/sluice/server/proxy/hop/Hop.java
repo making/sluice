@@ -132,6 +132,13 @@ public final class Hop {
 	/** The default window of {@link #DEFAULT_MAX_STREAM_ERRORS}. */
 	public static final Duration DEFAULT_STREAM_ERROR_WINDOW = Duration.ofSeconds(30);
 
+	/**
+	 * The default streams a hop remembers it reset, to ignore the frames its peer had in
+	 * flight on them ({@link HopHandler}): RFC 9113's recommended least
+	 * {@code SETTINGS_MAX_CONCURRENT_STREAMS}.
+	 */
+	public static final int DEFAULT_REMEMBERED_RESETS = 100;
+
 	/** The default time the pipe stays open after the channel closed. */
 	public static final Duration DEFAULT_CLOSE_GRACE = Duration.ofSeconds(1);
 
@@ -273,6 +280,7 @@ public final class Hop {
 		this.handler = handlerBuilder.hopConnection(connection)
 			.hopListener(new ReportingFrameListener(listener.apply(this), this::fail))
 			.streamErrorLimit(builder.streamErrorLimit())
+			.rememberedResets(builder.rememberedResets)
 			.buildHandler();
 		LockGuard guard = new LockGuard();
 		this.channel = new HopChannel(guard, this.handler, new Tail());
@@ -1097,6 +1105,8 @@ public final class Hop {
 
 		private Duration streamErrorWindow = DEFAULT_STREAM_ERROR_WINDOW;
 
+		private int rememberedResets = DEFAULT_REMEMBERED_RESETS;
+
 		private @Nullable Runnable onInactive;
 
 		private @Nullable Runnable onEof;
@@ -1187,6 +1197,21 @@ public final class Hop {
 			}
 			this.maxStreamErrors = maxStreamErrors;
 			this.streamErrorWindow = Objects.requireNonNull(window, "window is required");
+			return this;
+		}
+
+		/**
+		 * The streams the hop remembers it reset while its peer could still send on them,
+		 * to ignore the frames the peer had in flight on them ({@link HopHandler});
+		 * {@link #DEFAULT_REMEMBERED_RESETS} by default, 0 = none. Meant to be at least
+		 * the concurrent streams the peer may hold open: each reset the peer has not read
+		 * yet is of a stream it still counts as open.
+		 */
+		public Builder rememberedResets(int rememberedResets) {
+			if (rememberedResets < 0) {
+				throw new IllegalArgumentException("rememberedResets must not be negative");
+			}
+			this.rememberedResets = rememberedResets;
 			return this;
 		}
 

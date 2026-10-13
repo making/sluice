@@ -10,6 +10,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
+import java.util.stream.IntStream;
 
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
@@ -162,6 +163,112 @@ class H2DemuxUpstreamErrorE2ETest {
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(upstream.connections()).as("the leg went on").hasSize(1);
 			assertThat(upstream.awaitConnection(0, WITHIN).frames()).noneMatch(frame -> frame.type() == TestH2.GOAWAY);
+		}
+	}
+
+	/**
+	 * A client still sending its request bodies on more streams than the limit on its
+	 * stream errors allows, each reset by its upstream: the relay relays each reset
+	 * ({@code INTERNAL_ERROR}), and the DATA and trailers the client sends on the stream
+	 * once it read that reset -- frames in flight, as the relay sees them -- are ignored
+	 * (RFC 9113 5.1): no RST_STREAM {@code STREAM_CLOSED} answers them and the connection
+	 * goes on.
+	 */
+	@Test
+	void requestFramesInFlightOnStreamsTheUpstreamResetAreIgnored() throws Exception {
+		String route = "ue.in-flight.test";
+		int streams = Hop.DEFAULT_MAX_STREAM_ERRORS + 10;
+		int lastStream = 2 * streams + 1;
+		int dataFrames = 3;
+		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {
+			if (frame.type() == TestH2.HEADERS && frame.streamId() == lastStream) {
+				connection.answer(lastStream, "after");
+			}
+			else if (frame.type() == TestH2.HEADERS) {
+				connection.head(frame.streamId(), false);
+				connection.write(TestH2.RST_STREAM, 0, frame.streamId(), TestH2.int32(INTERNAL_ERROR));
+			}
+		});
+		startClient(route, upstream);
+		Integer[] collected = IntStream.rangeClosed(0, streams).map(i -> 2 * i + 1).boxed().toArray(Integer[]::new);
+		try (H2TestClient client = H2TestClient.connect(dataPort, collected)) {
+			// in batches within the relay's concurrency limit
+			for (int batch = 0; batch < streams; batch += 50) {
+				int end = Math.min(batch + 50, streams);
+				for (int i = batch; i < end; i++) {
+					client.headers(2 * i + 1, false, post(route));
+				}
+				assertThat(client.awaitTrue(() -> client.resets().size() >= end || client.closed(), WITHIN))
+					.as("resets of the first %d streams", end)
+					.isTrue();
+				for (int i = batch; i < end; i++) {
+					for (int frame = 0; frame < dataFrames; frame++) {
+						client.sendData(2 * i + 1, new byte[100], 0);
+					}
+					client.headers(2 * i + 1, true, TestH2.headerBlock("x-t=1"));
+				}
+				awaitHandled(client, 2 * end - 1);
+				assertThat(client.closed()).as("closed after %d streams", end).isFalse();
+			}
+			assertThat(streams * (dataFrames + 1)).as("the frames sent after the resets, past the limit")
+				.isGreaterThan(Hop.DEFAULT_MAX_STREAM_ERRORS);
+			for (int i = 0; i < streams; i++) {
+				assertThat(client.frames(2 * i + 1)
+					.stream()
+					.filter(frame -> frame.type() == TestH2.RST_STREAM)
+					.map(TestH2::errorCode)
+					.toList()).as("the resets of stream %d", 2 * i + 1).containsExactly(INTERNAL_ERROR);
+			}
+			client.headers(lastStream, true, get(route));
+			assertThat(client.awaitEnd(lastStream, WITHIN)).isTrue();
+			assertThat(TestH2.bodyOf(client.frames(lastStream))).isEqualTo("after");
+			assertThat(client.goAwayCode()).isEqualTo(-1);
+		}
+	}
+
+	/**
+	 * The client resetting its stream while the upstream sends the response: the relay
+	 * resets the upstream's stream ({@code CANCEL}), and the response DATA and trailers
+	 * the upstream sends once it read that reset -- in flight, as the relay sees them --
+	 * are ignored (RFC 9113 5.1): no RST_STREAM {@code STREAM_CLOSED} answers them.
+	 */
+	@Test
+	void responseFramesInFlightOnAStreamTheRelayResetAreIgnored() throws Exception {
+		String route = "ue.leg-in-flight.test";
+		byte[] ping = Arrays.copyOf(TestH2.int32(0x5eed), 8);
+		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {
+			if (frame.type() == TestH2.HEADERS) {
+				connection.head(frame.streamId(), false);
+			}
+			else if (frame.type() == TestH2.RST_STREAM) {
+				for (int i = 0; i < 3; i++) {
+					connection.write(TestH2.DATA, 0, frame.streamId(), new byte[100]);
+				}
+				connection.write(TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, frame.streamId(),
+						TestH2.headerBlock("x-t=1"));
+				connection.write(TestH2.PING, 0, 0, ping);
+			}
+		});
+		startClient(route, upstream);
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
+			client.headers(1, true, get(route));
+			assertThat(client
+				.awaitTrue(() -> client.frames(1).stream().anyMatch(frame -> frame.type() == TestH2.HEADERS), WITHIN))
+				.as("the response head")
+				.isTrue();
+			client.frame(TestH2.RST_STREAM, 0, 1, TestH2.int32(CANCEL));
+
+			ScriptedH2Upstream.Connection connection = upstream.awaitConnection(0, WITHIN);
+			assertThat(connection.await(frame -> frame.type() == TestH2.PING && (frame.flags() & TestH2.FLAG_ACK) != 0
+					&& Arrays.equals(frame.payload(), ping), WITHIN))
+				.as("the relay read the frames sent after its reset")
+				.isNotNull();
+			assertThat(connection.frames()
+				.stream()
+				.filter(frame -> frame.type() == TestH2.RST_STREAM && frame.streamId() == 1)
+				.map(TestH2::errorCode)
+				.toList()).as("the resets of the upstream's stream").containsExactly(CANCEL);
+			assertThat(client.goAwayCode()).isEqualTo(-1);
 		}
 	}
 

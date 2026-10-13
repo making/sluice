@@ -294,11 +294,11 @@ class H2DemuxFramingE2ETest {
 		assertThat(received).filteredOn(frame -> frame.streamId() == 5 && frame.type() != TestH2.RST_STREAM)
 			.extracting(TestH2.Frame::type)
 			.containsExactly(TestH2.HEADERS, TestH2.HEADERS);
-		// netty answers the upstream's response on a stream it cancelled with
-		// STREAM_CLOSED
+		// the upstream's response in flight on a stream the relay cancelled is ignored
+		// (RFC 9113 5.1)
 		assertThat(received).filteredOn(frame -> frame.type() == TestH2.RST_STREAM)
 			.extracting(TestH2::errorCode)
-			.containsOnly(CANCEL, STREAM_CLOSED);
+			.containsOnly(CANCEL);
 		assertThat(received).filteredOn(frame -> frame.streamId() == 7).isEmpty();
 	}
 

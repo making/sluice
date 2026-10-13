@@ -225,7 +225,8 @@ class H2DemuxResetOrderE2ETest {
 				assertThat(client.awaitTrue(() -> client.reset(streamId) != null, Duration.ofSeconds(5)))
 					.as("stream %d reset", streamId)
 					.isTrue();
-				// netty answers the DATA the upstream sends after it with STREAM_CLOSED
+				// the relay's CANCEL first: the upstream's DATA in flight after it is
+				// ignored
 				Awaitility.await()
 					.atMost(Duration.ofSeconds(5))
 					.untilAsserted(() -> assertThat(resetsOf(received, streamId)).as("stream %d", streamId)
