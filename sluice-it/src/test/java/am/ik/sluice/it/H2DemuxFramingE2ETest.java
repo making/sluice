@@ -28,6 +28,9 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
+import am.ik.sluice.server.proxy.H2EngineTest;
+import am.ik.sluice.server.proxy.LegacyOnly;
 import am.ik.sluice.server.route.Router;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder;
@@ -37,6 +40,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
+import org.junit.jupiter.params.Parameter;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -52,7 +56,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
+@H2EngineTest
+@LegacyOnly("settings replay and recording stubs without SETTINGS first: per-hop rewrite, step 8 (105)")
 class H2DemuxFramingE2ETest {
+
+	/** The engine of this invocation, selected by {@link H2EngineTest}. */
+	@Nullable
+	@Parameter
+	private H2DemuxEngine engine;
 
 	private static final int REQUESTS = 1500;
 

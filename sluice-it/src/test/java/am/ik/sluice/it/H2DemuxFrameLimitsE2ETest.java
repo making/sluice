@@ -9,6 +9,7 @@ import java.net.Socket;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
@@ -24,6 +25,9 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
+import am.ik.sluice.server.proxy.H2EngineTest;
+import am.ik.sluice.server.proxy.LegacyOnly;
 import am.ik.sluice.server.route.Router;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
@@ -31,6 +35,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
+import org.junit.jupiter.params.Parameter;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -48,7 +53,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
+@H2EngineTest
 class H2DemuxFrameLimitsE2ETest {
+
+	/** The engine of this invocation, selected by {@link H2EngineTest}. */
+	@Nullable
+	@Parameter
+	private H2DemuxEngine engine;
 
 	private static final int PROTOCOL_ERROR = 0x1;
 
@@ -96,7 +107,7 @@ class H2DemuxFrameLimitsE2ETest {
 	 */
 	@Test
 	void clientFrameAboveTheMaxFrameSizeEndsTheConnection() throws Exception {
-		String route = "lim.frame.test";
+		String route = route("lim.frame");
 		AtomicBoolean routed = new AtomicBoolean();
 		startClient(route, stub((in, out) -> routed.set(true)));
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
@@ -115,7 +126,7 @@ class H2DemuxFrameLimitsE2ETest {
 	 */
 	@Test
 	void clientFrameOfTheMaxFrameSizeIsRelayed() throws Exception {
-		String route = "lim.exact.test";
+		String route = route("lim.exact");
 		List<TestH2.Frame> received = new CopyOnWriteArrayList<>();
 		startClient(route, stub((in, out) -> recordFrames(in, received)));
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
@@ -137,8 +148,9 @@ class H2DemuxFrameLimitsE2ETest {
 	 * header list limit (a CONTINUATION flood): GOAWAY ENHANCE_YOUR_CALM.
 	 */
 	@Test
+	@LegacyOnly("netty ends the connection past 80KiB of header block (its GOAWAY threshold over the 64KiB list limit): per-hop rewrite, step 8 (105)")
 	void clientHeaderBlockAboveTheListLimitEndsTheConnection() throws Exception {
-		String route = "lim.block.test";
+		String route = route("lim.block");
 		AtomicBoolean routed = new AtomicBoolean();
 		startClient(route, stub((in, out) -> routed.set(true)));
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
@@ -159,8 +171,9 @@ class H2DemuxFrameLimitsE2ETest {
 	 * a GOAWAY {@code FRAME_SIZE_ERROR} (RFC 9113 4.2).
 	 */
 	@Test
+	@LegacyOnly("an upstream connection error: 502 and the error scope, step 3 (100)")
 	void upstreamFrameAboveTheMaxFrameSizeEndsItsLeg() throws Exception {
-		assertUpstreamEndsItsLeg("lim.up-frame.test", FRAME_SIZE_ERROR, out -> {
+		assertUpstreamEndsItsLeg(route("lim.up-frame"), FRAME_SIZE_ERROR, out -> {
 			out.write(frameHeader(MAX_FRAME_SIZE + 1, TestH2.DATA, 0, 1));
 			out.write(new byte[100]);
 		});
@@ -171,8 +184,9 @@ class H2DemuxFrameLimitsE2ETest {
 	 * {@code ENHANCE_YOUR_CALM}.
 	 */
 	@Test
+	@LegacyOnly("an upstream connection error: 502 and the error scope, step 3 (100)")
 	void upstreamHeaderBlockAboveTheListLimitEndsItsLeg() throws Exception {
-		assertUpstreamEndsItsLeg("lim.up-block.test", ENHANCE_YOUR_CALM, out -> {
+		assertUpstreamEndsItsLeg(route("lim.up-block"), ENHANCE_YOUR_CALM, out -> {
 			TestH2.writeFrame(out, TestH2.HEADERS, 0, 1, new byte[MAX_FRAME_SIZE]);
 			for (int i = 0; i < 4; i++) {
 				TestH2.writeFrame(out, TestH2.CONTINUATION, 0, 1, new byte[MAX_FRAME_SIZE]);
@@ -186,8 +200,9 @@ class H2DemuxFrameLimitsE2ETest {
 	 * the relay holds.
 	 */
 	@Test
+	@LegacyOnly("an upstream connection error: 502 and the error scope, step 3 (100)")
 	void upstreamInterleavingHeaderBlocksEndsItsLeg() throws Exception {
-		assertUpstreamEndsItsLeg("lim.up-interleave.test", PROTOCOL_ERROR, out -> {
+		assertUpstreamEndsItsLeg(route("lim.up-interleave"), PROTOCOL_ERROR, out -> {
 			TestH2.writeFrame(out, TestH2.HEADERS, 0, 1, new byte[] { (byte) 0x88 });
 			TestH2.writeFrame(out, TestH2.HEADERS, 0, 3, new byte[] { (byte) 0x88 });
 		});
@@ -274,6 +289,14 @@ class H2DemuxFrameLimitsE2ETest {
 	private static byte[] frameHeader(int length, int type, int flags, int streamId) {
 		return new byte[] { (byte) (length >>> 16), (byte) (length >>> 8), (byte) length, (byte) type, (byte) flags,
 				(byte) (streamId >>> 24 & 0x7f), (byte) (streamId >>> 16), (byte) (streamId >>> 8), (byte) streamId };
+	}
+
+	/**
+	 * The route {@code name} of this invocation: the runs on both engines share the
+	 * router, and a route registered by the other run's client would take the stream.
+	 */
+	private String route(String name) {
+		return name + "." + String.valueOf(this.engine).toLowerCase(Locale.ROOT) + ".test";
 	}
 
 	private void startClient(String host, ServerSocket upstream) {

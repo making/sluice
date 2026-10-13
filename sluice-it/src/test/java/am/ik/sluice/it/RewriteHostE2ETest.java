@@ -18,12 +18,16 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
+import org.junit.jupiter.params.Parameter;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
 import am.ik.sluice.server.proxy.ConnectionHeadParser;
+import am.ik.sluice.server.proxy.H2EngineTest;
+import am.ik.sluice.server.proxy.LegacyOnly;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
@@ -43,7 +47,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
+@H2EngineTest
 class RewriteHostE2ETest {
+
+	/** The engine of this invocation, selected by {@link H2EngineTest}. */
+	@Nullable
+	@Parameter
+	private H2DemuxEngine engine;
 
 	private static final TaskExecutor TASK_EXECUTOR = task -> Thread.ofVirtual().name("e2e-rewrite-host").start(task);
 
@@ -213,6 +223,7 @@ class RewriteHostE2ETest {
 	}
 
 	@Test
+	@LegacyOnly("HTTP/1.1: no h2 demux")
 	void defaultKeepsThePublicHost() throws Exception {
 		String host = "keep.local";
 		startClient(host, "http://127.0.0.1:" + http1Upstream.getAddress().getPort(), false);
@@ -220,6 +231,7 @@ class RewriteHostE2ETest {
 	}
 
 	@Test
+	@LegacyOnly("HTTP/1.1: no h2 demux")
 	void rewriteHostRewritesHttp1Host() throws Exception {
 		int port = http1Upstream.getAddress().getPort();
 		String host = "rewrite.local";
@@ -241,6 +253,7 @@ class RewriteHostE2ETest {
 	}
 
 	@Test
+	@LegacyOnly("HTTP/1.1: no h2 demux")
 	void rewriteHostRewritesHttp1HostOnKeepAliveConnection() throws Exception {
 		int port = http1Upstream.getAddress().getPort();
 		String host = "keepalive.rewrite.local";

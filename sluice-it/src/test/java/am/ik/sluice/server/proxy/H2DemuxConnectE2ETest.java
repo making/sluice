@@ -36,6 +36,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
+import org.junit.jupiter.params.Parameter;
 import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
@@ -46,6 +47,7 @@ import am.ik.sluice.it.TestH2;
 import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.it.WindowedH2Upstream;
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
 import am.ik.sluice.server.route.Router;
 
 import org.springframework.beans.factory.annotation.Autowired;
@@ -69,7 +71,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
+@H2EngineTest
 class H2DemuxConnectE2ETest {
+
+	/** The engine of this invocation, selected by {@link H2EngineTest}. */
+	@Nullable
+	@Parameter
+	private H2DemuxEngine engine;
 
 	private static final Duration IDLE_TIMEOUT = Duration.ofSeconds(2);
 
@@ -227,6 +235,7 @@ class H2DemuxConnectE2ETest {
 	}
 
 	@Test
+	@LegacyOnly("the idle and stall timeouts: step 6 (103)")
 	void aConnectionOpeningWithAConnectIdlesOutAtTheIdleTimeout() throws Exception {
 		double idle = counter("sluice.data.connections.idle.closed");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
@@ -251,6 +260,7 @@ class H2DemuxConnectE2ETest {
 	 * stall timeout cuts the connection, the tunnel at rest not counting.
 	 */
 	@Test
+	@LegacyOnly("the idle and stall timeouts: step 6 (103)")
 	void aRequestStalledOnAConnectionOpeningWithAConnectIsCutAtTheStallTimeout() throws Exception {
 		double stalls = counter("sluice.data.connections.stall.closed");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
@@ -399,7 +409,11 @@ class H2DemuxConnectE2ETest {
 			client.headers(3, true, undecodable(TUNNEL_HOST));
 			assertThat(client.awaitTrue(client::closed, TIMEOUT)).as("closed").isTrue();
 			assertThat(client.goAwayCode()).as("GOAWAY COMPRESSION_ERROR").isEqualTo(COMPRESSION_ERROR);
-			assertThat(client.goAwayLastStreamId()).isEqualTo(1);
+			// the legacy relay names the last stream it routed; netty's codec, failing
+			// before it knows the block's stream, names every stream as possibly
+			// processed
+			assertThat(client.goAwayLastStreamId())
+				.isEqualTo(this.engine == H2DemuxEngine.NETTY ? Integer.MAX_VALUE : 1);
 			assertThat(client.resets()).as("no stream error instead").isEmpty();
 			assertThat(TUNNEL_HEADS).as("relayed to no upstream").hasSize(heads);
 		}

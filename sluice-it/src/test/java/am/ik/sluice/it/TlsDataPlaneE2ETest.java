@@ -17,7 +17,9 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+import javax.net.ssl.SNIHostName;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManagerFactory;
 
@@ -28,11 +30,16 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
+import org.junit.jupiter.params.Parameter;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
+import am.ik.sluice.server.proxy.DataProxyServer;
+import am.ik.sluice.server.proxy.H2EngineTest;
+import am.ik.sluice.server.proxy.LegacyOnly;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
@@ -56,7 +63,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
+@H2EngineTest
 class TlsDataPlaneE2ETest {
+
+	/** The engine of this invocation, selected by {@link H2EngineTest}. */
+	@Nullable
+	@Parameter
+	private H2DemuxEngine engine;
 
 	private static final TaskExecutor TASK_EXECUTOR = task -> Thread.ofVirtual().name("e2e-tls-worker").start(task);
 
@@ -167,6 +180,10 @@ class TlsDataPlaneE2ETest {
 	@Autowired
 	SessionRegistry sessions;
 
+	@Nullable
+	@Autowired
+	private DataProxyServer dataProxyServer;
+
 	@AfterAll
 	void tearDown() {
 		if (this.tlsClient != null) {
@@ -218,6 +235,39 @@ class TlsDataPlaneE2ETest {
 		Awaitility.await().atMost(Duration.ofSeconds(5)).until(started::isConnected);
 	}
 
+	/**
+	 * A TLS-terminated h2 connection's relay ends once the client closed the connection,
+	 * though a TLS socket cannot half-close.
+	 */
+	@Test
+	void aTlsH2RelayEndsOnceTheClientClosed() throws Exception {
+		this.startClient();
+		DataProxyServer proxy = requireNonNull(this.dataProxyServer);
+		int before = proxy.activeConnections();
+		try (H2TestClient h2 = H2TestClient.over(tls("tls.local", "h2"), 1)) {
+			h2.headers(1, true,
+					TestH2.headerBlock(":authority=tls.local", ":method=GET", ":scheme=https", ":path=/close"));
+			assertThat(h2.awaitEnd(1, Duration.ofSeconds(10))).as("answered").isTrue();
+			assertThat(TestH2.bodyOf(h2.frames(1))).isEqualTo(H2_BODY);
+			assertThat(proxy.activeConnections()).isEqualTo(before + 1);
+		}
+		// pooled connections of the other tests may end meanwhile, never begin
+		Awaitility.await("the relay ended")
+			.atMost(Duration.ofSeconds(5))
+			.until(() -> proxy.activeConnections() <= before);
+	}
+
+	private static SSLSocket tls(String sni, String... protocols) throws Exception {
+		SSLSocket socket = (SSLSocket) clientSslContext().getSocketFactory().createSocket("127.0.0.1", dataPort);
+		socket.setSoTimeout(10_000);
+		SSLParameters parameters = socket.getSSLParameters();
+		parameters.setServerNames(List.of(new SNIHostName(sni)));
+		parameters.setApplicationProtocols(protocols);
+		socket.setSSLParameters(parameters);
+		socket.startHandshake();
+		return socket;
+	}
+
 	@Test
 	void httpsH2ViaAlpn() throws Exception {
 		this.startClient();
@@ -241,6 +291,7 @@ class TlsDataPlaneE2ETest {
 	}
 
 	@Test
+	@LegacyOnly("HTTP/1.1: no h2 demux")
 	void httpsHttp1_1Fallback() throws Exception {
 		this.startClient();
 		tlsRestClient(HttpClient.Version.HTTP_1_1).get()
@@ -253,6 +304,7 @@ class TlsDataPlaneE2ETest {
 	}
 
 	@Test
+	@LegacyOnly("answered before the h2 demux: the connection's head has no route")
 	void unroutedHostGetsTheNoRoutePageOverH2() throws Exception {
 		this.startClient();
 		tlsRestClient(HttpClient.Version.HTTP_2).get()
@@ -267,6 +319,7 @@ class TlsDataPlaneE2ETest {
 	}
 
 	@Test
+	@LegacyOnly("HTTP/1.1: no h2 demux")
 	void plaintextHttp1_1StillWorksOnTheSamePort() throws Exception {
 		this.startClient();
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
@@ -286,6 +339,7 @@ class TlsDataPlaneE2ETest {
 	 * offers h2, so h1-only upstreams are reached over HTTP/1.1.
 	 */
 	@Test
+	@LegacyOnly("HTTP/1.1: no h2 demux")
 	void forceHttp1RouteNegotiatesHttp1_1OverAlpn() throws Exception {
 		this.startClient();
 		try (SSLSocket socket = (SSLSocket) clientSslContext().getSocketFactory().createSocket("127.0.0.1", dataPort)) {

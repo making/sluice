@@ -24,7 +24,10 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
 import am.ik.sluice.server.proxy.DataProxyServer;
+import am.ik.sluice.server.proxy.H2EngineTest;
+import am.ik.sluice.server.proxy.LegacyOnly;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import ch.qos.logback.classic.Logger;
@@ -37,6 +40,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
+import org.junit.jupiter.params.Parameter;
 
 import org.slf4j.LoggerFactory;
 
@@ -56,6 +60,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
+@H2EngineTest
 class H2ReroutingE2ETest {
 
 	private static final TaskExecutor TASK_EXECUTOR = task -> Thread.ofVirtual().name("e2e-h2r").start(task);
@@ -76,6 +81,11 @@ class H2ReroutingE2ETest {
 	private static ServerSocket betaUpstream;
 
 	private final Map<String, TunnelClient> clients = new ConcurrentHashMap<>();
+
+	/** The engine of this invocation, selected by {@link H2EngineTest}. */
+	@Nullable
+	@Parameter
+	private H2DemuxEngine engine;
 
 	@Nullable
 	@Autowired
@@ -467,6 +477,7 @@ class H2ReroutingE2ETest {
 	}
 
 	@Test
+	@LegacyOnly("a per-hop connection window grant: flow control, step 5 (102)")
 	void grantsConnectionWindowWhileRelayingRequestData() throws Exception {
 		startClient("win.a.test", alphaUpstream, false);
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
