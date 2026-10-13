@@ -168,5 +168,9 @@
 	{
 		"name": "am.ik.sluice.server.proxy.hop.Hop$Tail",
 		"queryAllPublicMethods": true
+	},
+	{
+		"name": "am.ik.sluice.server.proxy.hop.HopHandler",
+		"queryAllPublicMethods": true
 	}
 ]

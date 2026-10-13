@@ -35,7 +35,6 @@ import io.netty.handler.codec.http2.DefaultHttp2LocalFlowController;
 import io.netty.handler.codec.http2.Http2Connection;
 import io.netty.handler.codec.http2.Http2ConnectionEncoder;
 import io.netty.handler.codec.http2.Http2ConnectionHandler;
-import io.netty.handler.codec.http2.Http2ConnectionHandlerBuilder;
 import io.netty.handler.codec.http2.Http2Error;
 import io.netty.handler.codec.http2.Http2Exception;
 import io.netty.handler.codec.http2.Http2FrameListener;
@@ -122,6 +121,16 @@ public final class Hop {
 	 * bridging code writes past the flow controller, to make it pause.
 	 */
 	public static final int DEFAULT_READ_PAUSE_BYTES = 256 * 1024;
+
+	/**
+	 * The default stream errors of the peer a server hop answers within
+	 * {@link #DEFAULT_STREAM_ERROR_WINDOW} before it ends the connection: netty's limit
+	 * on the resets a server endpoint sends.
+	 */
+	public static final int DEFAULT_MAX_STREAM_ERRORS = 200;
+
+	/** The default window of {@link #DEFAULT_MAX_STREAM_ERRORS}. */
+	public static final Duration DEFAULT_STREAM_ERROR_WINDOW = Duration.ofSeconds(30);
 
 	/** The default time the pipe stays open after the channel closed. */
 	public static final Duration DEFAULT_CLOSE_GRACE = Duration.ofSeconds(1);
@@ -259,11 +268,12 @@ public final class Hop {
 		this.traffic = builder.traffic;
 		DefaultHttp2Connection connection = new DefaultHttp2Connection(builder.server);
 		connection.local().flowController(new GatedLocalFlowController(connection, builder.autoRefillConnectionWindow));
-		Http2ConnectionHandlerBuilder handlerBuilder = new Http2ConnectionHandlerBuilder();
+		HopHandler.Builder handlerBuilder = new HopHandler.Builder();
 		builder.codec.accept(handlerBuilder);
-		this.handler = handlerBuilder.connection(connection)
-			.frameListener(new ReportingFrameListener(listener.apply(this), this::fail))
-			.build();
+		this.handler = handlerBuilder.hopConnection(connection)
+			.hopListener(new ReportingFrameListener(listener.apply(this), this::fail))
+			.streamErrorLimit(builder.streamErrorLimit())
+			.buildHandler();
 		LockGuard guard = new LockGuard();
 		this.channel = new HopChannel(guard, this.handler, new Tail());
 		try {
@@ -1084,8 +1094,13 @@ public final class Hop {
 
 		private boolean autoRefillConnectionWindow = true;
 
-		private Consumer<Http2ConnectionHandlerBuilder> codec = handlerBuilder -> {
+		private Consumer<HopHandler.Builder> codec = handlerBuilder -> {
 		};
+
+		/** The peer's stream errors allowed per window; -1 = the role's default. */
+		private int maxStreamErrors = -1;
+
+		private Duration streamErrorWindow = DEFAULT_STREAM_ERROR_WINDOW;
 
 		private @Nullable Runnable onInactive;
 
@@ -1154,14 +1169,36 @@ public final class Hop {
 		}
 
 		/**
-		 * Configures netty's handler builder: initial settings, frame logger, header
-		 * validation, stream buffering, the graceful shutdown timeout. The hop sets the
-		 * connection and the frame listener after it, so it must not set them, nor the
-		 * role or {@code codec(...)}.
+		 * Configures the handler's builder: initial settings, frame logger, header
+		 * validation, header sensitivity, stream buffering, the graceful shutdown
+		 * timeout. The connection, the frame listener and the reset limits are the hop's
+		 * ({@link HopHandler}).
 		 */
-		public Builder codec(Consumer<Http2ConnectionHandlerBuilder> codec) {
+		public Builder codec(Consumer<HopHandler.Builder> codec) {
 			this.codec = codec;
 			return this;
+		}
+
+		/**
+		 * Limits the stream errors netty's codec answers the peer's frames with: past
+		 * {@code maxStreamErrors} within the window, the connection ends with GOAWAY
+		 * {@code ENHANCE_YOUR_CALM} ({@link HopHandler}); 0 = no limit. By default
+		 * {@link #DEFAULT_MAX_STREAM_ERRORS} per {@link #DEFAULT_STREAM_ERROR_WINDOW} in
+		 * the server role, no limit in the client role.
+		 */
+		public Builder streamErrorLimit(int maxStreamErrors, Duration window) {
+			if (maxStreamErrors < 0) {
+				throw new IllegalArgumentException("maxStreamErrors must not be negative");
+			}
+			this.maxStreamErrors = maxStreamErrors;
+			this.streamErrorWindow = Objects.requireNonNull(window, "window is required");
+			return this;
+		}
+
+		private @Nullable StreamErrorLimit streamErrorLimit() {
+			int maxErrors = this.maxStreamErrors < 0 ? (this.server ? DEFAULT_MAX_STREAM_ERRORS : 0)
+					: this.maxStreamErrors;
+			return maxErrors == 0 ? null : new StreamErrorLimit(maxErrors, this.streamErrorWindow);
 		}
 
 		/** Runs with the loop's lock once the channel closed. */

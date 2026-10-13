@@ -26,6 +26,7 @@ import am.ik.sluice.it.ScriptedH2Upstream;
 import am.ik.sluice.it.TestH2;
 import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.server.proxy.hop.Hop;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import am.ik.sluice.server.tunnel.TunnelSession;
@@ -118,6 +119,50 @@ class H2DemuxUpstreamErrorE2ETest {
 	void tearDown() {
 		this.clients.forEach(TunnelClient::stop);
 		this.closeables.forEach(H2DemuxUpstreamErrorE2ETest::close);
+	}
+
+	/**
+	 * An upstream resetting its streams with {@code INTERNAL_ERROR} past netty's limit on
+	 * the resets an endpoint sends and receives (200 within 30s): the relay relays every
+	 * reset to the client, and neither the client's connection nor the leg ends -- a
+	 * further stream completes over both.
+	 */
+	@Test
+	void upstreamResetsPastNettysResetLimitLeaveTheConnections() throws Exception {
+		String route = "ue.reset-flood.test";
+		int streams = Hop.DEFAULT_MAX_STREAM_ERRORS + 10;
+		int lastStream = 2 * streams + 1;
+		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {
+			if (frame.type() == TestH2.HEADERS && frame.streamId() == lastStream) {
+				connection.answer(lastStream, "after");
+			}
+			else if (frame.type() == TestH2.HEADERS) {
+				connection.head(frame.streamId(), false);
+				connection.write(TestH2.RST_STREAM, 0, frame.streamId(), TestH2.int32(INTERNAL_ERROR));
+			}
+		});
+		startClient(route, upstream);
+		try (H2TestClient client = H2TestClient.connect(dataPort, lastStream)) {
+			// in batches within the relay's concurrency limit
+			for (int batch = 0; batch < streams; batch += 50) {
+				int end = Math.min(batch + 50, streams);
+				for (int i = batch; i < end; i++) {
+					client.headers(2 * i + 1, true, get(route));
+				}
+				assertThat(client.awaitTrue(() -> client.resets().size() >= end || client.closed(), WITHIN))
+					.as("resets of the first %d streams", end)
+					.isTrue();
+				assertThat(client.closed()).as("closed after %d resets", client.resets().size()).isFalse();
+			}
+			assertThat(client.resets()).hasSize(streams);
+			assertThat(client.resets().values()).containsOnly(INTERNAL_ERROR);
+			client.headers(lastStream, true, get(route));
+			assertThat(client.awaitEnd(lastStream, WITHIN)).isTrue();
+			assertThat(TestH2.bodyOf(client.frames(lastStream))).isEqualTo("after");
+			assertThat(client.goAwayCode()).isEqualTo(-1);
+			assertThat(upstream.connections()).as("the leg went on").hasSize(1);
+			assertThat(upstream.awaitConnection(0, WITHIN).frames()).noneMatch(frame -> frame.type() == TestH2.GOAWAY);
+		}
 	}
 
 	/**

@@ -306,8 +306,8 @@ class H2DemuxStallE2ETest {
 	 * A client sending past the stream window gets the stream reset with
 	 * {@code FLOW_CONTROL_ERROR} (a stream error, RFC 9113 6.9.1); netty's codec answers
 	 * each DATA frame it sends on the forgotten stream after that with RST_STREAM
-	 * {@code STREAM_CLOSED}, and its 201st reset within 30s (netty's limit on the resets
-	 * a server sends, 200 per 30s) ends the connection with GOAWAY
+	 * {@code STREAM_CLOSED}, and after its 201st reset within 30s (the limit on the
+	 * client's stream errors, 200 per 30s) ends the connection with GOAWAY
 	 * {@code ENHANCE_YOUR_CALM}. The leg queue never held more than the stream's budget.
 	 */
 	@Test

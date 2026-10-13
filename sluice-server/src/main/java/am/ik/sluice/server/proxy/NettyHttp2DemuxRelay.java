@@ -30,6 +30,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.server.proxy.hop.Hop;
+import am.ik.sluice.server.proxy.hop.HopHandler;
 import am.ik.sluice.server.proxy.hop.Loop;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.SessionRegistry;
@@ -46,7 +47,6 @@ import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.http.HttpStatusClass;
 import io.netty.handler.codec.http2.Http2Connection;
 import io.netty.handler.codec.http2.Http2ConnectionAdapter;
-import io.netty.handler.codec.http2.Http2ConnectionHandlerBuilder;
 import io.netty.handler.codec.http2.Http2Error;
 import io.netty.handler.codec.http2.Http2Exception;
 import io.netty.handler.codec.http2.Http2FrameAdapter;
@@ -445,7 +445,7 @@ final class NettyHttp2DemuxRelay {
 	 * 8KiB), and header blocks encoded as never-indexed literals, so every block the
 	 * relay writes decodes on its own whatever the peer's decoder saw before.
 	 */
-	private static void configure(Http2ConnectionHandlerBuilder codec, Http2Settings settings) {
+	private static void configure(HopHandler.Builder codec, Http2Settings settings) {
 		codec.initialSettings(settings.maxHeaderListSize(MAX_HEADER_LIST_SIZE))
 			.headerSensitivityDetector((name, value) -> true);
 	}

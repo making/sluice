@@ -704,6 +704,35 @@ class NettyH2DemuxRelayE2ETest {
 	}
 
 	/**
+	 * The relay's own resets do not count towards the limit on the client's stream
+	 * errors: past it -- methodless heads, each reset with {@code PROTOCOL_ERROR} by the
+	 * relay -- the connection goes on.
+	 */
+	@Test
+	void theRelaysResetsPastTheStreamErrorLimitKeepTheConnection() throws Exception {
+		int streams = Hop.DEFAULT_MAX_STREAM_ERRORS + 10;
+		int lastStream = 2 * streams + 1;
+		try (H2TestClient h2 = H2TestClient.connect(dataPort, lastStream)) {
+			// in batches within the relay's concurrency limit
+			for (int batch = 0; batch < streams; batch += 50) {
+				int end = Math.min(batch + 50, streams);
+				for (int i = batch; i < end; i++) {
+					h2.headers(2 * i + 1, true, TestH2.headerBlock(":authority=" + OK_HOST, ":scheme=http", ":path=/"));
+				}
+				assertThat(h2.awaitTrue(() -> h2.resets().size() >= end || h2.closed(), TIMEOUT))
+					.as("resets of the first %d streams", end)
+					.isTrue();
+				assertThat(h2.closed()).as("closed after %d resets", h2.resets().size()).isFalse();
+			}
+			assertThat(h2.resets()).hasSize(streams);
+			assertThat(h2.resets().values()).containsOnly(PROTOCOL_ERROR);
+			h2.headers(lastStream, true, get(OK_HOST, "/after"));
+			assertThat(h2.awaitEnd(lastStream, TIMEOUT)).isTrue();
+			assertThat(h2.goAwayCode()).isEqualTo(-1);
+		}
+	}
+
+	/**
 	 * A stream lost before its response head, its request still being sent, to a client
 	 * whose initial stream window is 0: the {@code 502} head comes alone, the page's DATA
 	 * only as the client grants it, and RST_STREAM {@code NO_ERROR} only after the page's
