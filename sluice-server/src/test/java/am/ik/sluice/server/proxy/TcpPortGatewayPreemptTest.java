@@ -26,7 +26,7 @@ class TcpPortGatewayPreemptTest {
 
 	private final TaskExecutor directExecutor = Runnable::run;
 
-	private final SessionRegistry sessions = new SessionRegistry();
+	private final SessionRegistry sessions = new SessionRegistry(SluiceServerProperties.builder().build());
 
 	private final Router router = new Router();
 

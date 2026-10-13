@@ -71,6 +71,8 @@ public final class TunnelSession implements AutoCloseable {
 
 	private final String remoteAddress;
 
+	private final String sourceAddress;
+
 	private final Instant connectedAt = Instant.now();
 
 	private final AtomicLong bytesInbound = new AtomicLong();
@@ -160,6 +162,7 @@ public final class TunnelSession implements AutoCloseable {
 		this.clientId = Objects.requireNonNull(builder.clientId, "clientId is required");
 		this.nodeId = builder.nodeId;
 		this.remoteAddress = builder.remoteAddress;
+		this.sourceAddress = builder.sourceAddress;
 		this.router = Objects.requireNonNull(builder.router, "router is required");
 		this.sender = Objects.requireNonNull(builder.sender, "sender is required");
 		this.tcpRoutes = Objects.requireNonNull(builder.tcpRoutes, "tcpRoutes is required");
@@ -172,7 +175,6 @@ public final class TunnelSession implements AutoCloseable {
 		this.serverBuild = builder.serverBuild;
 		this.advertiser = Executors.newSingleThreadExecutor(
 				task -> Thread.ofVirtual().name("sluice-advertise-" + this.clientId).unstarted(task));
-		this.registry.admit(this);
 	}
 
 	public static Builder builder() {
@@ -186,6 +188,8 @@ public final class TunnelSession implements AutoCloseable {
 		private String nodeId = "";
 
 		private String remoteAddress = "";
+
+		private String sourceAddress = "";
 
 		private @Nullable Router router;
 
@@ -227,6 +231,16 @@ public final class TunnelSession implements AutoCloseable {
 
 		public Builder remoteAddress(String remoteAddress) {
 			this.remoteAddress = remoteAddress;
+			return this;
+		}
+
+		/**
+		 * The client's source address (its IP address, no port), under which the registry
+		 * bounds the pending streams per address; empty = unknown, bounded only by the
+		 * global limit.
+		 */
+		public Builder sourceAddress(String sourceAddress) {
+			this.sourceAddress = sourceAddress;
 			return this;
 		}
 
@@ -339,6 +353,11 @@ public final class TunnelSession implements AutoCloseable {
 		return this.remoteAddress;
 	}
 
+	/** Source address (IP, no port) of the client; empty when unknown. */
+	public String sourceAddress() {
+		return this.sourceAddress;
+	}
+
 	public Instant connectedAt() {
 		return this.connectedAt;
 	}
@@ -374,12 +393,21 @@ public final class TunnelSession implements AutoCloseable {
 		return Optional.ofNullable(this.clientBuild);
 	}
 
-	/** Starts the sender and the advertise deadline. */
-	void start() {
+	/**
+	 * Admits the session as pending ({@link SessionRegistry#admit}), then starts the
+	 * sender and the advertise deadline. A refused session starts nothing and holds no
+	 * thread; the caller fails its stream with the refusal's status.
+	 */
+	Optional<SessionRegistry.Refusal> start() {
+		Optional<SessionRegistry.Refusal> refusal = this.registry.admit(this);
+		if (refusal.isPresent()) {
+			return refusal;
+		}
 		this.sender.start();
 		this.advertiseDeadline = Thread.ofVirtual()
 			.name("sluice-advertise-deadline-" + this.clientId)
 			.start(this::awaitAdvertise);
+		return Optional.empty();
 	}
 
 	/**

@@ -2,6 +2,7 @@ package am.ik.sluice.server.tunnel;
 
 import java.util.Set;
 
+import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.route.Router;
 import org.junit.jupiter.api.Test;
 
@@ -13,7 +14,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class TunnelSessionRegistryRemovalTest {
 
-	private final SessionRegistry registry = new SessionRegistry();
+	private final SessionRegistry registry = new SessionRegistry(SluiceServerProperties.builder().build());
 
 	private final Router router = new Router();
 

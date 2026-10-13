@@ -408,13 +408,23 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * @param advertiseTimeout how long a tunnel stream may go without the client's first
 	 * {@code Advertise} before it is failed ({@code DEADLINE_EXCEEDED}); until then the
 	 * stream serves no connection and leaves the client id's live session in place
+	 * @param maxPendingTunnelStreams tunnel streams whose client has not sent its first
+	 * {@code Advertise} yet, at once; a stream beyond it is failed at once
+	 * ({@code RESOURCE_EXHAUSTED}); a non-positive value falls back to the default
+	 * @param maxPendingTunnelStreamsPerAddress the same from one source address (the gRPC
+	 * peer); {@code 0} = no limit beyond {@code maxPendingTunnelStreams}
 	 */
 	public record Limits(@DefaultValue("0") int maxConnections, @DefaultValue("0") int maxConnectionsPerAddress,
 			@DefaultValue("10s") Duration headTimeout, @DefaultValue("60s") Duration idleTimeout,
 			@DefaultValue("0") DataSize h2QueueBudget, @DefaultValue("30s") Duration h2StreamWaitTimeout,
 			@DefaultValue("1s") Duration halfCloseProbeInterval, @DefaultValue("60s") Duration stallTimeout,
 			@DefaultValue("16KB") DataSize stallMinBytes, @DefaultValue("60s") Duration tunnelStallTimeout,
-			@DefaultValue("0") Duration verbatimIdleTimeout, @DefaultValue("10s") Duration advertiseTimeout) {
+			@DefaultValue("0") Duration verbatimIdleTimeout, @DefaultValue("10s") Duration advertiseTimeout,
+			@DefaultValue("256") int maxPendingTunnelStreams,
+			@DefaultValue("0") int maxPendingTunnelStreamsPerAddress) {
+
+		/** The default of {@code maxPendingTunnelStreams}. */
+		public static final int DEFAULT_MAX_PENDING_TUNNEL_STREAMS = 256;
 
 		public Limits {
 			maxConnections = Math.max(0, maxConnections);
@@ -438,6 +448,9 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 					: verbatimIdleTimeout;
 			advertiseTimeout = advertiseTimeout == null || advertiseTimeout.isNegative() || advertiseTimeout.isZero()
 					? Duration.ofSeconds(10) : advertiseTimeout;
+			maxPendingTunnelStreams = maxPendingTunnelStreams > 0 ? maxPendingTunnelStreams
+					: DEFAULT_MAX_PENDING_TUNNEL_STREAMS;
+			maxPendingTunnelStreamsPerAddress = Math.max(0, maxPendingTunnelStreamsPerAddress);
 		}
 
 		public static Builder builder() {
@@ -469,6 +482,10 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			private Duration verbatimIdleTimeout = Duration.ZERO;
 
 			@Nullable private Duration advertiseTimeout;
+
+			private int maxPendingTunnelStreams = DEFAULT_MAX_PENDING_TUNNEL_STREAMS;
+
+			private int maxPendingTunnelStreamsPerAddress;
 
 			private Builder() {
 			}
@@ -533,6 +550,16 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder maxPendingTunnelStreams(int maxPendingTunnelStreams) {
+				this.maxPendingTunnelStreams = maxPendingTunnelStreams;
+				return this;
+			}
+
+			public Builder maxPendingTunnelStreamsPerAddress(int maxPendingTunnelStreamsPerAddress) {
+				this.maxPendingTunnelStreamsPerAddress = maxPendingTunnelStreamsPerAddress;
+				return this;
+			}
+
 			public Limits build() {
 				return new Limits(this.maxConnections, this.maxConnectionsPerAddress,
 						this.headTimeout == null ? Duration.ofSeconds(10) : this.headTimeout,
@@ -544,7 +571,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 						this.stallMinBytes == null ? DataSize.ofKilobytes(16) : this.stallMinBytes,
 						this.tunnelStallTimeout == null ? Duration.ofSeconds(60) : this.tunnelStallTimeout,
 						this.verbatimIdleTimeout,
-						this.advertiseTimeout == null ? Duration.ofSeconds(10) : this.advertiseTimeout);
+						this.advertiseTimeout == null ? Duration.ofSeconds(10) : this.advertiseTimeout,
+						this.maxPendingTunnelStreams, this.maxPendingTunnelStreamsPerAddress);
 			}
 
 		}

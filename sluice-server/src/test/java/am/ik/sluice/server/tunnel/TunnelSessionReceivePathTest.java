@@ -20,6 +20,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 
+import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.SessionSender;
 import am.ik.sluice.tunnel.VirtualConnection;
@@ -45,7 +46,7 @@ class TunnelSessionReceivePathTest {
 
 	private static final int LISTEN_PORT = 19123;
 
-	private final SessionRegistry registry = new SessionRegistry();
+	private final SessionRegistry registry = new SessionRegistry(SluiceServerProperties.builder().build());
 
 	private final Router router = new Router();
 

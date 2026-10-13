@@ -90,6 +90,23 @@ class SluiceServerPropertiesTest {
 		assertThat(properties.limits().tunnelStallTimeout()).isEqualTo(Duration.ofSeconds(60));
 		assertThat(properties.limits().verbatimIdleTimeout()).isZero();
 		assertThat(properties.limits().advertiseTimeout()).isEqualTo(Duration.ofSeconds(10));
+		assertThat(properties.limits().maxPendingTunnelStreams()).isEqualTo(256);
+		assertThat(properties.limits().maxPendingTunnelStreamsPerAddress()).isZero();
+	}
+
+	@Test
+	void pendingTunnelStreamLimitsBindAndANonPositiveGlobalOneFallsBackToTheDefault() {
+		SluiceServerProperties bound = bind(Map.of("sluice.limits.max-pending-tunnel-streams", "8",
+				"sluice.limits.max-pending-tunnel-streams-per-address", "2"));
+		assertThat(bound.limits().maxPendingTunnelStreams()).isEqualTo(8);
+		assertThat(bound.limits().maxPendingTunnelStreamsPerAddress()).isEqualTo(2);
+		assertThat(bind(Map.of("sluice.limits.max-pending-tunnel-streams", "0")).limits().maxPendingTunnelStreams())
+			.isEqualTo(256);
+		assertThat(bind(Map.of("sluice.limits.max-pending-tunnel-streams-per-address", "-1")).limits()
+			.maxPendingTunnelStreamsPerAddress()).isZero();
+		assertThat(SluiceServerProperties.Limits.builder().build().maxPendingTunnelStreams())
+			.as("the builder's default")
+			.isEqualTo(256);
 	}
 
 	@Test

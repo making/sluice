@@ -41,6 +41,12 @@ public class TunnelAuthInterceptor implements ServerInterceptor {
 	/** Context key carrying the peer address ({@code host:port}) of the client. */
 	public static final Context.Key<String> REMOTE_ADDRESS = Context.key("sluice-remote-address");
 
+	/**
+	 * Context key carrying the source address of the client: the peer's IP address,
+	 * without the port; empty when the transport has none.
+	 */
+	public static final Context.Key<String> SOURCE_ADDRESS = Context.key("sluice-source-address");
+
 	private final TokenValidator tokenValidator;
 
 	public TunnelAuthInterceptor(TokenValidator tokenValidator) {
@@ -60,9 +66,11 @@ public class TunnelAuthInterceptor implements ServerInterceptor {
 		if (clientId == null || clientId.isBlank()) {
 			clientId = UUID.randomUUID().toString();
 		}
+		SocketAddress peer = call.getAttributes().get(Grpc.TRANSPORT_ATTR_REMOTE_ADDR);
 		Context context = Context.current()
 			.withValue(CLIENT_ID, clientId)
-			.withValue(REMOTE_ADDRESS, remoteAddress(call.getAttributes().get(Grpc.TRANSPORT_ATTR_REMOTE_ADDR)));
+			.withValue(REMOTE_ADDRESS, remoteAddress(peer))
+			.withValue(SOURCE_ADDRESS, sourceAddress(peer));
 		return Contexts.interceptCall(context, call, headers, next);
 	}
 
@@ -71,6 +79,13 @@ public class TunnelAuthInterceptor implements ServerInterceptor {
 			return inet.getHostString() + ":" + inet.getPort();
 		}
 		return address == null ? "" : address.toString();
+	}
+
+	private static String sourceAddress(@Nullable SocketAddress address) {
+		if (address instanceof InetSocketAddress inet) {
+			return inet.getAddress() != null ? inet.getAddress().getHostAddress() : inet.getHostString();
+		}
+		return "";
 	}
 
 }

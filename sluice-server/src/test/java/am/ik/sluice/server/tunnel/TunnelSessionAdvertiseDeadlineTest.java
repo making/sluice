@@ -14,6 +14,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.SessionSender;
 import am.ik.sluice.tunnel.VirtualConnection;
@@ -41,7 +42,7 @@ class TunnelSessionAdvertiseDeadlineTest {
 
 	private static final Duration TIMEOUT = Duration.ofMillis(300);
 
-	private final SessionRegistry registry = new SessionRegistry();
+	private final SessionRegistry registry = new SessionRegistry(SluiceServerProperties.builder().build());
 
 	private final Router router = new Router();
 

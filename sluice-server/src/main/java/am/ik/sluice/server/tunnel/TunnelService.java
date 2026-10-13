@@ -1,6 +1,10 @@
 package am.ik.sluice.server.tunnel;
 
+import java.time.Duration;
+import java.util.EnumMap;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -32,6 +36,9 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	private static final Logger log = LoggerFactory.getLogger(TunnelService.class);
 
+	/** The period of {@link #refusalLog}. */
+	static final Duration REFUSAL_LOG_PERIOD = Duration.ofSeconds(10);
+
 	private final Router router;
 
 	private final TokenValidator tokenValidator;
@@ -57,6 +64,11 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 	private final Counter stallFailures;
 
 	private final Counter advertiseTimeouts;
+
+	private final Map<SessionRegistry.Refusal, Counter> refusals = new EnumMap<>(SessionRegistry.Refusal.class);
+
+	/** At most one refusal line per period, so refused streams cannot flood the log. */
+	private final LogThrottle refusalLog = new LogThrottle(REFUSAL_LOG_PERIOD, System::nanoTime);
 
 	public TunnelService(Router router, TokenValidator tokenValidator, SessionRegistry sessions,
 			TcpRouteListener tcpRoutes, NodeDirectory nodeDirectory, MembershipBroadcaster membershipBroadcaster,
@@ -87,6 +99,14 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 		this.advertiseTimeouts = Counter.builder("sluice.tunnel.advertise.timeouts")
 			.description("Tunnel streams failed because the client sent no Advertise within the advertise timeout")
 			.register(meterRegistry);
+		for (SessionRegistry.Refusal refusal : SessionRegistry.Refusal.values()) {
+			this.refusals.put(refusal,
+					Counter.builder("sluice.tunnel.streams.refused")
+						.tag("reason", refusal.reason())
+						.description("Tunnel streams refused at once by a bound on the streams waiting for "
+								+ "their client's first Advertise")
+						.register(meterRegistry));
+		}
 		log.info("server build: {}", PeerBuilds.describe(serverBuild));
 		Gauge
 			.builder("sluice.tunnel.sessions.build.unknown", sessions,
@@ -129,7 +149,6 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 		}
 		String clientId = TunnelAuthInterceptor.CLIENT_ID.get();
 		String finalClientId = clientId == null ? "" : clientId;
-		log.info("tunnel stream established for client {}", finalClientId);
 		@Nullable Runnable reset = TunnelStreamReset.current();
 		// set before the sender starts, so before the watchdog can fire
 		AtomicReference<@Nullable TunnelSession> stalledSession = new AtomicReference<>();
@@ -151,6 +170,7 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			.clientId(clientId == null ? "" : clientId)
 			.nodeId(this.properties.node().id())
 			.remoteAddress(Objects.requireNonNullElse(TunnelAuthInterceptor.REMOTE_ADDRESS.get(), ""))
+			.sourceAddress(Objects.requireNonNullElse(TunnelAuthInterceptor.SOURCE_ADDRESS.get(), ""))
 			.router(this.router)
 			.sender(sender)
 			.registry(this.sessions)
@@ -162,7 +182,14 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			.registered(this.membershipBroadcaster::onSessionRegistered)
 			.build();
 		stalledSession.set(session);
-		session.start();
+		Optional<SessionRegistry.Refusal> refused = session.start();
+		if (refused.isPresent()) {
+			refuse(refused.get(), session);
+			responseObserver.onError(refused.get().status().asRuntimeException());
+			return noopObserver();
+		}
+		// logged once admitted: a refused stream is logged by the throttled refusal line
+		log.info("tunnel stream established for client {}", finalClientId);
 		return new StreamObserver<>() {
 
 			@Override
@@ -183,6 +210,20 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			}
 
 		};
+	}
+
+	/**
+	 * Counts a refused stream and logs it, at most once per {@link #REFUSAL_LOG_PERIOD}.
+	 */
+	private void refuse(SessionRegistry.Refusal refusal, TunnelSession session) {
+		Objects.requireNonNull(this.refusals.get(refusal), "refusal counter").increment();
+		long suppressed = this.refusalLog.tryAcquire();
+		if (suppressed < 0) {
+			return;
+		}
+		log.warn("refusing tunnel stream of client {} ({}): {}{}", session.clientId(), session.remoteAddress(),
+				refusal.status().getDescription(),
+				suppressed == 0 ? "" : " (%d more refused since the last report)".formatted(suppressed));
 	}
 
 	/**
