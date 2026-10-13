@@ -160,5 +160,13 @@
 		"allDeclaredConstructors": true,
 		"allDeclaredMethods": true,
 		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.proxy.hop.Hop$LockGuard",
+		"queryAllPublicMethods": true
+	},
+	{
+		"name": "am.ik.sluice.server.proxy.hop.Hop$Tail",
+		"queryAllPublicMethods": true
 	}
 ]

@@ -148,6 +148,29 @@
 				<artifactId>nullability-maven-plugin</artifactId>
 			</plugin>
 			<plugin>
+				<!-- The netty hop tests run in a JVM of their own with netty's paranoid leak
+					 detector recording every leak (LeakCheck fails a class on one); the
+					 detector must be in place before any ByteBuf class loads. -->
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<configuration>
+					<excludedGroups>netty-hop</excludedGroups>
+				</configuration>
+				<executions>
+					<execution>
+						<id>hop</id>
+						<goals>
+							<goal>test</goal>
+						</goals>
+						<configuration>
+							<excludedGroups combine.self="override"/>
+							<groups>netty-hop</groups>
+							<argLine>-Dio.netty.leakDetection.level=paranoid -Dio.netty.customResourceLeakDetector=am.ik.sluice.server.proxy.hop.RecordingLeakDetector</argLine>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
 				<groupId>com.github.blutorange</groupId>
 				<artifactId>closure-compiler-maven-plugin</artifactId>
 				<executions>

@@ -102,4 +102,36 @@ public interface DuplexPipe extends AutoCloseable {
 		};
 	}
 
+	/**
+	 * Adapts a {@link VirtualConnection} into a {@link DuplexPipe}: half-close closes its
+	 * sink (a CLOSE to the remote), close ends the connection
+	 * ({@link VirtualConnection#close()}).
+	 */
+	static DuplexPipe of(VirtualConnection connection) {
+		Objects.requireNonNull(connection, "connection is required");
+		return new DuplexPipe() {
+
+			@Override
+			public InputStream source() {
+				return connection.source();
+			}
+
+			@Override
+			public OutputStream sink() {
+				return connection.sink();
+			}
+
+			@Override
+			public void shutdownOutput() throws Exception {
+				connection.sink().close();
+			}
+
+			@Override
+			public void close() {
+				connection.close();
+			}
+
+		};
+	}
+
 }
