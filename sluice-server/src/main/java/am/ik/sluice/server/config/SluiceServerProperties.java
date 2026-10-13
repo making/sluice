@@ -395,9 +395,9 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * between requests -- h1: every response complete and no next request begun; h2: no
 	 * open stream -- before it is closed; an upgraded connection has none (it is relayed
 	 * verbatim: see {@code verbatimIdleTimeout})
-	 * @param h2QueueBudget bytes the h2 demux relays may queue towards their upstreams
-	 * beyond each connection's own allowance, shared by all of them; {@code 0} = an
-	 * eighth of half the maximum heap
+	 * @param h2QueueBudget bytes the h2 demux relays may queue beyond each connection's
+	 * own allowance -- the legacy engine towards their upstreams, the netty engine both
+	 * ways --, shared by all of them; {@code 0} = an eighth of half the maximum heap
 	 * @param h2StreamWaitTimeout how long an h2 stream may wait for a place within its
 	 * upstream's {@code SETTINGS_MAX_CONCURRENT_STREAMS} before the relay refuses it
 	 * ({@code REFUSED_STREAM}); the netty engine only; {@code 0} = off

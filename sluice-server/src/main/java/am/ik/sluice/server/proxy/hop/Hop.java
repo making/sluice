@@ -22,20 +22,26 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelDuplexHandler;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelOutboundBuffer;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.http2.DecoratingHttp2FrameWriter;
 import io.netty.handler.codec.http2.DefaultHttp2Connection;
 import io.netty.handler.codec.http2.DefaultHttp2LocalFlowController;
 import io.netty.handler.codec.http2.Http2Connection;
 import io.netty.handler.codec.http2.Http2ConnectionEncoder;
 import io.netty.handler.codec.http2.Http2ConnectionHandler;
 import io.netty.handler.codec.http2.Http2ConnectionHandlerBuilder;
+import io.netty.handler.codec.http2.Http2Error;
+import io.netty.handler.codec.http2.Http2Exception;
 import io.netty.handler.codec.http2.Http2FrameListener;
+import io.netty.handler.codec.http2.Http2FrameWriter;
 import io.netty.handler.codec.http2.Http2LocalFlowController;
+import io.netty.handler.codec.http2.Http2Stream;
 import io.netty.util.ReferenceCountUtil;
 import org.jspecify.annotations.Nullable;
 
@@ -60,6 +66,12 @@ import org.jspecify.annotations.Nullable;
  * unwritable, so the remote flow controller stops writing DATA; at the low water mark it
  * turns writable again. Without it the channel drains to the queue at every flush and
  * stays writable, so everything the peer's windows allow piles up in the queue.
+ * <p>
+ * <b>The connection window</b> refills as DATA arrives (netty's auto refill, unless the
+ * builder turns it off), so only the stream windows bound what the hop holds; the
+ * bridging code may withhold it ({@link #withholdConnectionWindowLocked}): the
+ * connection-level WINDOW_UPDATEs are held back and the peer is held to the window it was
+ * granted.
  * <p>
  * <b>Reading pauses</b> while the queue holds more than the read pause bytes. What the
  * flow controller holds back is DATA only; the frames netty answers on its own (PING and
@@ -93,13 +105,19 @@ public final class Hop {
 	/** The default low water mark of the writer queue. */
 	public static final int DEFAULT_LOW_WATER = 32 * 1024;
 
-	/** The default queued bytes past which the reader pauses. */
-	public static final int DEFAULT_READ_PAUSE_BYTES = 1024 * 1024;
+	/**
+	 * The default queued bytes past which the reader pauses: above what DATA alone queues
+	 * (the flow controller stops at the high water mark plus one pass, under 256KiB in
+	 * {@code HopWritabilityTest}), so it takes frames netty answers on its own, or the
+	 * bridging code writes past the flow controller, to make it pause.
+	 */
+	public static final int DEFAULT_READ_PAUSE_BYTES = 256 * 1024;
 
 	/** The default time the pipe stays open after the channel closed. */
 	public static final Duration DEFAULT_CLOSE_GRACE = Duration.ofSeconds(1);
 
-	private static final int READ_BUFFER = 16 * 1024;
+	/** The most the reader reads from the pipe, and feeds into the channel, at once. */
+	public static final int MAX_READ_BYTES = 16 * 1024;
 
 	private static final int WRITE_BUFFER = 64 * 1024;
 
@@ -125,6 +143,18 @@ public final class Hop {
 	private final Duration closeGrace;
 
 	private final @Nullable Runnable onInactive;
+
+	/** Run with the loop's lock after the writer wrote a batch, while watched. */
+	private final @Nullable Runnable onWritten;
+
+	/** The writer runs {@link #onWritten} after each batch. */
+	private volatile boolean watchingWrites;
+
+	/** Connection-level WINDOW_UPDATEs are held back; with the loop's lock. */
+	private boolean withholding;
+
+	/** The connection window increments held back; with the loop's lock. */
+	private int owedConnectionWindow;
 
 	private final ReentrantLock queueLock = new ReentrantLock();
 
@@ -196,10 +226,9 @@ public final class Hop {
 		// refuses to hand out its streams, where a read only ends
 		this.in = this.pipe.source();
 		this.out = new BufferedOutputStream(this.pipe.sink(), WRITE_BUFFER);
+		this.onWritten = builder.onWritten;
 		DefaultHttp2Connection connection = new DefaultHttp2Connection(builder.server);
-		connection.local()
-			.flowController(new DefaultHttp2LocalFlowController(connection,
-					DefaultHttp2LocalFlowController.DEFAULT_WINDOW_UPDATE_RATIO, builder.autoRefillConnectionWindow));
+		connection.local().flowController(new GatedLocalFlowController(connection, builder.autoRefillConnectionWindow));
 		Http2ConnectionHandlerBuilder handlerBuilder = new Http2ConnectionHandlerBuilder();
 		builder.codec.accept(handlerBuilder);
 		this.handler = handlerBuilder.connection(connection)
@@ -252,6 +281,43 @@ public final class Hop {
 
 	public Http2LocalFlowController localFlow() {
 		return this.handler.connection().local().flowController();
+	}
+
+	/**
+	 * Holds back, or lets go, the connection-level WINDOW_UPDATEs the local flow
+	 * controller writes -- with the auto refill, as DATA arrives: held back, the peer can
+	 * send no more than the connection window it holds; let go, the increments held back
+	 * are written as one WINDOW_UPDATE. netty's own view of the window stays at least the
+	 * peer's, so the peer never seems to pass it. Whether a WINDOW_UPDATE was written;
+	 * with the loop's lock.
+	 */
+	public boolean withholdConnectionWindowLocked(boolean withhold) {
+		requireLock();
+		this.withholding = withhold;
+		if (withhold || this.owedConnectionWindow == 0) {
+			return false;
+		}
+		int owed = this.owedConnectionWindow;
+		this.owedConnectionWindow = 0;
+		if (!this.channel.isOpen()) {
+			return false;
+		}
+		this.handler.encoder().frameWriter().writeWindowUpdate(this.ctx, 0, owed, this.ctx.newPromise());
+		return true;
+	}
+
+	/** The connection window increments held back; with the loop's lock. */
+	public int owedConnectionWindowLocked() {
+		requireLock();
+		return this.owedConnectionWindow;
+	}
+
+	/**
+	 * Has the writer run the hop's {@code onWritten} action with the loop's lock after
+	 * each batch it wrote, or stop doing so.
+	 */
+	public void watchWrites(boolean watch) {
+		this.watchingWrites = watch;
 	}
 
 	/**
@@ -520,7 +586,7 @@ public final class Hop {
 	private void read() {
 		try {
 			InputStream in = this.in;
-			byte[] buffer = new byte[READ_BUFFER];
+			byte[] buffer = new byte[MAX_READ_BYTES];
 			while (awaitReadable()) {
 				int n = in.read(buffer);
 				if (n < 0) {
@@ -579,9 +645,18 @@ public final class Hop {
 				out.flush();
 				batch.clear();
 				this.bytesWritten.addAndGet(written);
-				if (written(written)) {
-					// the controller resumes on the writability change
-					this.loop.run(this::updateWritabilityLocked);
+				boolean turnWritable = written(written);
+				Runnable onWritten = this.watchingWrites ? this.onWritten : null;
+				if (turnWritable || onWritten != null) {
+					this.loop.run(() -> {
+						if (turnWritable) {
+							// the controller resumes on the writability change
+							updateWritabilityLocked();
+						}
+						if (onWritten != null) {
+							onWritten.run();
+						}
+					});
 				}
 			}
 			// the channel closed and everything it wrote is out: half-close, then give
@@ -658,6 +733,68 @@ public final class Hop {
 		catch (Exception e) {
 			// closed already
 		}
+	}
+
+	/**
+	 * netty's local flow controller, its connection-level WINDOW_UPDATEs passing the
+	 * hop's gate ({@link #withholdConnectionWindowLocked}). The decoder hands the
+	 * controller the frame writer it writes them with; nothing else writes through it.
+	 * netty counts a WINDOW_UPDATE held back as granted, so the controller holds the peer
+	 * to the window it was granted itself: DATA past it is a connection error
+	 * {@code FLOW_CONTROL_ERROR} (RFC 9113 6.9.1), as netty's own check would make it.
+	 */
+	private final class GatedLocalFlowController extends DefaultHttp2LocalFlowController {
+
+		private final Http2Connection connection;
+
+		/** The peer sent past the window granted: the connection is ending. */
+		private boolean violated;
+
+		GatedLocalFlowController(Http2Connection connection, boolean autoRefillConnectionWindow) {
+			super(connection, DEFAULT_WINDOW_UPDATE_RATIO, autoRefillConnectionWindow);
+			this.connection = connection;
+		}
+
+		@Override
+		public DefaultHttp2LocalFlowController frameWriter(Http2FrameWriter frameWriter) {
+			return super.frameWriter(new DecoratingHttp2FrameWriter(frameWriter) {
+
+				@Override
+				public ChannelFuture writeWindowUpdate(ChannelHandlerContext ctx, int streamId, int windowSizeIncrement,
+						ChannelPromise promise) {
+					if (streamId != 0 || !Hop.this.withholding) {
+						return super.writeWindowUpdate(ctx, streamId, windowSizeIncrement, promise);
+					}
+					Hop.this.owedConnectionWindow += windowSizeIncrement;
+					return promise.setSuccess();
+				}
+
+			});
+		}
+
+		@Override
+		public void receiveFlowControlledFrame(@Nullable Http2Stream stream, ByteBuf data, int padding,
+				boolean endOfStream) throws Http2Exception {
+			int owed = Hop.this.owedConnectionWindow;
+			if (owed > 0) {
+				int granted = windowSize(this.connection.connectionStream()) - owed;
+				if (data.readableBytes() + padding > granted) {
+					// the decoder returns the frame's bytes as it unwinds, which netty
+					// never took in: that would end the stream instead of the connection
+					this.violated = true;
+					throw Http2Exception.connectionError(Http2Error.FLOW_CONTROL_ERROR,
+							"DATA past the connection window granted: %d", granted);
+				}
+			}
+			super.receiveFlowControlledFrame(stream, data, padding, endOfStream);
+		}
+
+		@Override
+		public boolean consumeBytes(@Nullable Http2Stream stream, int numBytes) throws Http2Exception {
+			// the connection is ending: nothing more is granted
+			return !this.violated && super.consumeBytes(stream, numBytes);
+		}
+
 	}
 
 	/**
@@ -828,6 +965,8 @@ public final class Hop {
 
 		private @Nullable Runnable onInactive;
 
+		private @Nullable Runnable onWritten;
+
 		private int highWater = DEFAULT_HIGH_WATER;
 
 		private int lowWater = DEFAULT_LOW_WATER;
@@ -895,6 +1034,15 @@ public final class Hop {
 		/** Runs with the loop's lock once the channel closed. */
 		public Builder onInactive(Runnable onInactive) {
 			this.onInactive = onInactive;
+			return this;
+		}
+
+		/**
+		 * Runs with the loop's lock after the writer wrote a batch, while the hop
+		 * {@linkplain Hop#watchWrites watches} its writes.
+		 */
+		public Builder onWritten(Runnable onWritten) {
+			this.onWritten = onWritten;
 			return this;
 		}
 

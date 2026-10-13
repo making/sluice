@@ -11,10 +11,14 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 
 import org.springframework.util.unit.DataSize;
 
@@ -326,16 +330,54 @@ class ConnectionLimitsTest {
 	@Test
 	void anUnsetLimitFitsEverySlotsWorstCaseAndTheBudgetInHalfTheHeap() {
 		long mib = 1024 * 1024;
-		// a virtual connection's 2.16MiB plus an h2 relay's own queue and a leg's
-		// response queue
-		assertThat(ConnectionLimits.connectionBytes())
-			.isEqualTo(2266112 + Http2DemuxRelay.UNBUDGETED_BYTES + Http2DemuxRelay.RESPONSE_QUEUE_BYTES);
+		// the read under way, a connection window and a granule per stream once the
+		// windows are withheld; a hop's writer queue: the read pause plus 64KiB
+		assertThat(NettyHttp2DemuxRelay.WITHHELD_ARRIVALS).isEqualTo(16384 + 65535 + 100 * 1024);
+		assertThat(NettyHttp2DemuxRelay.HOP_QUEUE_BYTES).isEqualTo(256 * 1024 + 64 * 1024);
+		assertThat(NettyHttp2DemuxRelay.UNBUDGETED_BYTES)
+			.isEqualTo(128 * 1024 + NettyHttp2DemuxRelay.WITHHELD_ARRIVALS + NettyHttp2DemuxRelay.HOP_QUEUE_BYTES);
+		assertThat(NettyHttp2DemuxRelay.RESPONSE_QUEUE_BYTES)
+			.isEqualTo(NettyHttp2DemuxRelay.WITHHELD_ARRIVALS + NettyHttp2DemuxRelay.HOP_QUEUE_BYTES);
+		// a virtual connection's 2.16MiB plus an h2 relay's 628KiB and a leg's 500KiB
+		assertThat(ConnectionLimits.connectionBytes()).isEqualTo(2266112 + 643071 + 511999);
 		assertThat(ConnectionLimits.deriveBudget(400 * mib)).isEqualTo(25 * mib);
-		// (200MiB - 25MiB) / 2.67MiB
-		assertThat(ConnectionLimits.deriveMaxConnections(400 * mib, 25 * mib)).isEqualTo(65);
-		// (2048MiB - 256MiB) / 2.67MiB
-		assertThat(ConnectionLimits.deriveMaxConnections(4096 * mib, 256 * mib)).isEqualTo(670);
+		// (200MiB - 25MiB) / 3.26MiB
+		assertThat(ConnectionLimits.deriveMaxConnections(400 * mib, 25 * mib)).isEqualTo(53);
+		// (2048MiB - 256MiB) / 3.26MiB
+		assertThat(ConnectionLimits.deriveMaxConnections(4096 * mib, 256 * mib)).isEqualTo(549);
 		assertThat(ConnectionLimits.deriveMaxConnections(400 * mib, 400 * mib)).isEqualTo(1);
+	}
+
+	@Test
+	void theStartupLogTellsTheDerivation() {
+		DataSize budget = DataSize.ofMegabytes(1);
+		long maxHeap = Runtime.getRuntime().maxMemory();
+		Logger logger = (Logger) LoggerFactory.getLogger(ConnectionLimits.class);
+		ListAppender<ILoggingEvent> events = new ListAppender<>();
+		events.start();
+		logger.addAppender(events);
+		ConnectionLimits derived;
+		try {
+			derived = new ConnectionLimits(SluiceServerProperties.builder()
+				.limits(SluiceServerProperties.Limits.builder().h2QueueBudget(budget).build())
+				.build(), new SimpleMeterRegistry());
+		}
+		finally {
+			logger.detachAppender(events);
+		}
+		try {
+			int max = ConnectionLimits.deriveMaxConnections(maxHeap, budget.toBytes());
+			assertThat(derived.max()).isEqualTo(max);
+			assertThat(events.list).extracting(ILoggingEvent::getFormattedMessage)
+				.containsExactly(("data plane connection limit %d (derived: (half of max heap %dMiB - h2 queue budget) "
+						+ "/ 3340KiB per connection), per address %d, head timeout PT10S, idle timeout PT1M, stall "
+						+ "timeout PT1M per 16384B, verbatim idle timeout off (unless a route sets one), h2 queue "
+						+ "budget 1024KiB (configured)")
+					.formatted(max, maxHeap >> 20, max));
+		}
+		finally {
+			derived.destroy();
+		}
 	}
 
 	@Test

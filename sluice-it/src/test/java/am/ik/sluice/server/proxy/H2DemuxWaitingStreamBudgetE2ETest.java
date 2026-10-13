@@ -9,6 +9,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -53,7 +54,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
 @H2EngineTest
-@LegacyOnly("the queue budget of waiting streams: not yet on the netty engine")
 class H2DemuxWaitingStreamBudgetE2ETest {
 
 	/** The engine of this invocation, selected by {@link H2EngineTest}. */
@@ -128,7 +128,7 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 	@Test
 	void waitingStreamsExhaustingTheBudgetLeaveTheOpenStreamCompleting() throws Exception {
 		assertThat(budgetGauge()).as("the configured budget took effect").isEqualTo(BUDGET);
-		String route = "ws.own.test";
+		String route = route("ws.own");
 		List<TestUpstream> upstreams = start(route, LIMIT_ONE);
 		double withheldBefore = withheld();
 		double refusedBefore = refused("waiting");
@@ -154,8 +154,8 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 	 */
 	@Test
 	void waitingStreamsAreRefusedOnceAnotherConnectionExhaustsTheBudget() throws Exception {
-		String route = "ws.shared.test";
-		String stalledRoute = "ws.stalled.test";
+		String route = route("ws.shared");
+		String stalledRoute = route("ws.stalled");
 		List<TestUpstream> upstreams = start(route, LIMIT_ONE);
 		start(stalledRoute, NOT_READING);
 		double refusedBefore = refused("waiting");
@@ -167,7 +167,10 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 			assertThat(client.resets()).as("nothing refused while the budget has room").isEmpty();
 			double withheldBefore = withheld();
 			try (H2TestClient stalled = H2TestClient.connect(dataPort)) {
-				for (int streamId = 1; streamId <= 7; streamId += 2) {
+				// eight streams: the netty engine holds a stream's window per stream (the
+				// legacy engine its window and a stream budget), and these hold past the
+				// budget either way
+				for (int streamId = 1; streamId <= 15; streamId += 2) {
 					stalled.headers(streamId, false, post(stalledRoute));
 					stalled.fill(streamId, QUIET);
 				}
@@ -331,6 +334,14 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 			.atMost(Duration.ofSeconds(10))
 			.until(() -> Objects.requireNonNull(this.router).lookup(route).isPresent());
 		return upstreams;
+	}
+
+	/**
+	 * The route's host for this engine's invocation: both run on one router, where the
+	 * other invocation's tunnel client may still serve a host of the same name.
+	 */
+	private String route(String name) {
+		return name + "." + String.valueOf(this.engine).toLowerCase(Locale.ROOT) + ".test";
 	}
 
 	private static void close(AutoCloseable closeable) {

@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -75,7 +76,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
 @H2EngineTest
-@LegacyOnly("the queue budget: not yet on the netty engine")
 class H2DemuxBudgetE2ETest {
 
 	/** The engine of this invocation, selected by {@link H2EngineTest}. */
@@ -168,16 +168,17 @@ class H2DemuxBudgetE2ETest {
 	 * stream completes and the budget is released.
 	 */
 	@Test
+	@NettyOnly("the netty relay's bound outside the budget")
 	void stalledConnectionsStopAtTheBudgetAndCompleteOnceTheUpstreamReads() throws Exception {
 		assertThat(budgetGauge()).as("the configured budget took effect").isEqualTo(BUDGET);
-		String route = "bud.stall.test";
+		String route = route("bud.stall");
 		CountDownLatch gate = new CountDownLatch(1);
 		startClient(route, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
 		double withheldBefore = withheld();
 		try (Stalled first = stall(route); Stalled second = stall(route)) {
 			long maxQueued = awaitStable(() -> queuedBytes(route));
 			assertThat(maxQueued).as("queued at most: the budget plus each connection's unbudgeted bound")
-				.isLessThanOrEqualTo(BUDGET + 2 * Http2DemuxRelay.UNBUDGETED_BYTES)
+				.isLessThanOrEqualTo(BUDGET + 2 * NettyHttp2DemuxRelay.UNBUDGETED_BYTES)
 				.isGreaterThanOrEqualTo(BUDGET);
 			assertThat(budgetUsed()).as("the budget is exhausted").isGreaterThanOrEqualTo(BUDGET);
 			assertThat(withheld()).as("windows were withheld").isGreaterThan(withheldBefore);
@@ -195,15 +196,16 @@ class H2DemuxBudgetE2ETest {
 
 	/**
 	 * While two stalled connections hold the budget exhausted, a connection on another
-	 * route uploads 1MiB on each of two streams to an upstream reading at about 4MiB/s,
-	 * and gets both responses: its queue passes its allowance -- its window is withheld
-	 * -- and drains below it again and again, its own drain granting the window back, so
-	 * a connection whose legs drain keeps flowing.
+	 * route uploads 512KiB on each of four streams to an upstream reading at about
+	 * 4MiB/s, and gets every response: its queue passes its allowance -- its window is
+	 * withheld -- and drains below it again and again, its own drain granting the window
+	 * back, so a connection whose legs drain keeps flowing.
 	 */
 	@Test
+	@NettyOnly("per-hop windows: four streams take the netty relay past its allowance")
 	void connectionOnAnotherRouteKeepsFlowingWhileTheBudgetIsExhausted() throws Exception {
-		String stalledRoute = "bud.held.test";
-		String flowingRoute = "bud.flowing.test";
+		String stalledRoute = route("bud.held");
+		String flowingRoute = route("bud.flowing");
 		CountDownLatch gate = new CountDownLatch(1);
 		startClient(stalledRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
 		startClient(flowingRoute, stub(H2DemuxBudgetE2ETest::answerEndedRequestsSlowly));
@@ -211,9 +213,11 @@ class H2DemuxBudgetE2ETest {
 			awaitStable(() -> queuedBytes(stalledRoute));
 			assertThat(budgetUsed()).as("exhausted before").isGreaterThanOrEqualTo(BUDGET);
 			double withheldBefore = withheld();
-			try (Stalled flowing = open(flowingRoute, 2, 1024 * 1024)) {
+			// the relay holds a stream window per stream: four take it past its allowance
+			try (Stalled flowing = open(flowingRoute, 4, 512 * 1024)) {
 				flowing.awaitEnds();
-				assertThat(flowing.client().connectionGranted()).isGreaterThan(Http2DemuxRelay.CONNECTION_ALLOWANCE);
+				assertThat(flowing.client().connectionGranted())
+					.isGreaterThan(NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE);
 			}
 			// the stalled connections' shares never shrink while their upstream does not
 			// read, so the budget stays exhausted, their windows stay withheld, and only
@@ -235,7 +239,7 @@ class H2DemuxBudgetE2ETest {
 	 */
 	@Test
 	void newStreamIsRefusedOnlyOnAConnectionPastItsAllowance() throws Exception {
-		String route = "bud.refuse.test";
+		String route = route("bud.refuse");
 		CountDownLatch gate = new CountDownLatch(1);
 		AtomicInteger heads = new AtomicInteger();
 		startClient(route, stub(socket -> serveGated(socket, gate, heads)));
@@ -274,8 +278,9 @@ class H2DemuxBudgetE2ETest {
 	 * its reset is written to the upstream.
 	 */
 	@Test
+	@NettyOnly("netty forgets a stream once its client stream closed, and answers its later frames itself")
 	void trailersPastTheAllowanceWithTheBudgetExhaustedResetOnlyTheirStream() throws Exception {
-		String route = "bud.trailers.test";
+		String route = route("bud.trailers");
 		CountDownLatch gate = new CountDownLatch(1);
 		UpstreamLog log = new UpstreamLog();
 		startClient(route, stub(socket -> serveGatedLogging(socket, gate, log)));
@@ -302,26 +307,17 @@ class H2DemuxBudgetE2ETest {
 			assertThat(resets("budget")).isEqualTo(resetsBefore + 1);
 			assertThat(queuedBytes(route)).as("the stream's queued data dropped, a reset queued")
 				.isLessThanOrEqualTo(queued - body + RST_STREAM_BYTES);
-			assertThat(trackedStreams(route)).as("counted until its reset is written to the stalled upstream")
-				.isEqualTo(2 * STREAMS + 1);
+			assertThat(trackedStreams(route)).as("forgotten once its client stream closed").isEqualTo(2 * STREAMS);
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(client.closed()).isFalse();
-			// sent before the reset arrived, as far as the relay can tell
-			long granted = awaitStable(client::connectionGranted);
-			client.sendData(reset, new byte[late], 0);
-			client.headers(reset, true, TestH2.appendLiteralIncremental(new byte[0], "x-late", "1"));
-			assertThat(client.awaitTrue(() -> client.connectionGranted() >= granted + late, Duration.ofSeconds(5)))
-				.as("the DATA dropped is granted back")
-				.isTrue();
 			gate.countDown();
 			first.resume();
 			first.awaitEnds();
 			second.awaitEnds();
-			client.headers(after, true, TestH2
-				.appendIndexedDynamic(TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/after"), 62));
+			client.headers(after, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/after"));
 			assertThat(client.awaitEnd(after, Duration.ofSeconds(10))).isTrue();
-			assertThat(log.heads.get(after)).as("decoded with the entry of the trailers dropped")
-				.isEqualTo(List.of(":authority: " + route, ":method: GET", ":path: /after", "x-late: 1"));
+			assertThat(log.heads.get(after)).as("the next stream's head")
+				.isEqualTo(List.of(":authority: " + route, ":method: GET", ":path: /after"));
 			Awaitility.await()
 				.atMost(Duration.ofSeconds(5))
 				.untilAsserted(() -> assertThat(trackedStreams(route)).as("the reset stream no longer tracked either")
@@ -345,9 +341,11 @@ class H2DemuxBudgetE2ETest {
 	 * upstream gets the one CANCEL.
 	 */
 	@Test
+	@LegacyOnly("frames on a stream the relay reset: netty forgets the stream once its reset is written and answers "
+			+ "later frames itself, and relays no unknown frame; a per-hop rewrite")
 	void aStreamWhoseResetWaitsForTheUpstreamIsResetOnceAndRelaysNothing() throws Exception {
-		String route = "bud.zero.test";
-		String stalledRoute = "bud.zero.held.test";
+		String route = route("bud.zero");
+		String stalledRoute = route("bud.zero.held");
 		CountDownLatch gate = new CountDownLatch(1);
 		UpstreamLog log = new UpstreamLog();
 		startClient(route, stub(socket -> serveGatedLogging(socket, gate, log)));
@@ -411,8 +409,10 @@ class H2DemuxBudgetE2ETest {
 	 * them), its share of the budget, and its tracked streams.
 	 */
 	@Test
+	@LegacyOnly("the legacy relay's write seam; the netty engine's counterpart is "
+			+ "NettyH2DemuxBudgetE2ETest#aClientGoneWithItsBytesChargedReleasesThem")
 	void clientGoneAsTheRelayWritesItsResetReleasesWhatTheRelayHeld() throws Exception {
-		String route = "bud.gone-reset.test";
+		String route = route("bud.gone-reset");
 		CountDownLatch gate = new CountDownLatch(1);
 		startClient(route, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
 		int reset = streamId(0);
@@ -460,9 +460,12 @@ class H2DemuxBudgetE2ETest {
 	 * upstream leaving retires the leg without ending the connection.
 	 */
 	@Test
+	@LegacyOnly("end-to-end windows: the upstream's window follows the client's, and a PING fence orders the "
+			+ "upstream's frames; the netty engine's counterpart is "
+			+ "NettyH2DemuxBudgetE2ETest#aResponseHeldForAStreamTheRelayResetsIsReleased")
 	void upstreamFramesOnAStreamTheRelayResetNeverReachTheClient() throws Exception {
-		String stalledRoute = "bud.cancel.held.test";
-		String route = "bud.cancel.test";
+		String stalledRoute = route("bud.cancel.held");
+		String route = route("bud.cancel");
 		CountDownLatch gate = new CountDownLatch(1);
 		int reset = streamId(0);
 		int probe = streamId(1);
@@ -532,8 +535,8 @@ class H2DemuxBudgetE2ETest {
 	 */
 	@Test
 	void withheldWindowIsGrantedOnceAnotherConnectionFreesTheBudget() throws Exception {
-		String firstRoute = "bud.wake.first.test";
-		String secondRoute = "bud.wake.second.test";
+		String firstRoute = route("bud.wake.first");
+		String secondRoute = route("bud.wake.second");
 		CountDownLatch gate = new CountDownLatch(1);
 		startClient(firstRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
 		startClient(secondRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
@@ -570,7 +573,7 @@ class H2DemuxBudgetE2ETest {
 	 */
 	@Test
 	void clientsGoneWhileWithheldReleaseTheBudget() throws Exception {
-		String route = "bud.gone.test";
+		String route = route("bud.gone");
 		CountDownLatch gate = new CountDownLatch(1);
 		startClient(route, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
 		try (Stalled first = stall(route); Stalled second = stall(route)) {
@@ -1166,7 +1169,7 @@ class H2DemuxBudgetE2ETest {
 
 	/** The part of the route's queue charged to the budget: its relay's share. */
 	private long budgetShare(String route) {
-		return Math.max(0, queuedBytes(route) - Http2DemuxRelay.CONNECTION_ALLOWANCE);
+		return Math.max(0, queuedBytes(route) - NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE);
 	}
 
 	private long budgetUsed() {
@@ -1293,6 +1296,14 @@ class H2DemuxBudgetE2ETest {
 		catch (IOException e) {
 			throw new IllegalStateException(e);
 		}
+	}
+
+	/**
+	 * The route's host for this engine's invocation: both run on one router, where the
+	 * other invocation's tunnel client may still serve a host of the same name.
+	 */
+	private String route(String name) {
+		return name + "." + String.valueOf(this.engine).toLowerCase(Locale.ROOT) + ".test";
 	}
 
 	private static void close(AutoCloseable closeable) {

@@ -27,7 +27,6 @@ import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
 import am.ik.sluice.server.proxy.DataProxyServer;
 import am.ik.sluice.server.proxy.H2EngineTest;
-import am.ik.sluice.server.proxy.LegacyOnly;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import ch.qos.logback.classic.Logger;
@@ -476,17 +475,27 @@ class H2ReroutingE2ETest {
 				&& m.contains("path=/one") && m.contains("http=2"));
 	}
 
+	/**
+	 * The relay releases the connection-level window the request body consumed with a
+	 * WINDOW_UPDATE on stream 0. The body passes half of the window: the netty engine's
+	 * auto refill grants once half of it is spent, the legacy engine as DATA arrives.
+	 */
 	@Test
-	@LegacyOnly("a per-hop connection window grant: flow control; not yet on the netty engine")
 	void grantsConnectionWindowWhileRelayingRequestData() throws Exception {
 		startClient("win.a.test", alphaUpstream, false);
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.setSoTimeout(10_000);
-			TestH2.writeClientHead(socket.getOutputStream(), 1, ":authority=win.a.test", ":method=POST", ":path=/x");
-			byte[] body = "request-body".getBytes(java.nio.charset.StandardCharsets.UTF_8);
-			TestH2.writeFrame(socket.getOutputStream(), TestH2.DATA, TestH2.FLAG_END_STREAM, 1, body);
-			// the relay must release the connection-level window it consumed by granting
-			// the client's WINDOW_UPDATE stream 0 (a request-direction window grant)
+			// a head that leaves the stream open for its body
+			socket.getOutputStream().write(TestH2.PREFACE);
+			TestH2.writeFrame(socket.getOutputStream(), TestH2.SETTINGS, 0, 0, new byte[0]);
+			TestH2.writeFrame(socket.getOutputStream(), TestH2.HEADERS, TestH2.FLAG_END_HEADERS, 1,
+					TestH2.headerBlock(":authority=win.a.test", ":method=POST", ":path=/x"));
+			int body = 40_000;
+			for (int sent = 0; sent < body; sent += 16 * 1024) {
+				int length = Math.min(16 * 1024, body - sent);
+				TestH2.writeFrame(socket.getOutputStream(), TestH2.DATA,
+						sent + length == body ? TestH2.FLAG_END_STREAM : 0, 1, new byte[length]);
+			}
 			boolean granted = false;
 			List<TestH2.Frame> frames = new ArrayList<>();
 			TestH2.@Nullable Frame frame;

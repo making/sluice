@@ -35,6 +35,11 @@ final class H2DemuxMeters {
 
 	private final Map<String, Route> routes = new ConcurrentHashMap<>();
 
+	/**
+	 * Per route, the DATA writes netty holds for the netty engine's relays; for tests.
+	 */
+	private final Map<String, LongAdder> writesHeld = new ConcurrentHashMap<>();
+
 	private final Counter refusedBudget;
 
 	private final Counter refusedLegLimit;
@@ -199,6 +204,20 @@ final class H2DemuxMeters {
 	long writerWakeups(String routeTag) {
 		Route route = this.routes.get(routeTag);
 		return route == null ? 0 : route.writerWakeups().sum();
+	}
+
+	/**
+	 * The counter of the DATA writes the netty engine's relays hand netty for the route
+	 * and netty has not completed yet.
+	 */
+	LongAdder writesHeldOf(String routeTag) {
+		return this.writesHeld.computeIfAbsent(routeTag, tag -> new LongAdder());
+	}
+
+	/** The DATA writes netty holds for the route; for tests. */
+	long writesHeld(String routeTag) {
+		LongAdder held = this.writesHeld.get(routeTag);
+		return held == null ? 0 : held.sum();
 	}
 
 	/** The streams of the route the live relays still track; for tests. */

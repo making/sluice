@@ -2,6 +2,8 @@ package am.ik.sluice.server.proxy;
 
 import java.util.Arrays;
 
+import io.netty.buffer.ByteBuf;
+
 /**
  * The DATA payload of one h2 stream queued for its leg writer: appended at the back,
  * taken from the front. Its array holds what is pending rounded up to {@link #GRANULE},
@@ -35,6 +37,27 @@ final class PendingPayload {
 		}
 		System.arraycopy(source, offset, this.bytes, this.size, length);
 		this.size += length;
+	}
+
+	/** Appends the readable bytes of {@code source}, leaving its indexes as they are. */
+	void append(ByteBuf source) {
+		int length = source.readableBytes();
+		if (this.size + length > this.bytes.length) {
+			this.bytes = Arrays.copyOf(this.bytes, roundUp(this.size + length));
+		}
+		source.getBytes(source.readerIndex(), this.bytes, this.size, length);
+		this.size += length;
+	}
+
+	/**
+	 * Takes the whole buffer, uncopied: the payload is the first {@link #size()} bytes of
+	 * the array returned, read before the call; leaves this empty.
+	 */
+	byte[] takeAll() {
+		byte[] taken = this.bytes;
+		this.bytes = EMPTY;
+		this.size = 0;
+		return taken;
 	}
 
 	/** Takes the first {@code length} bytes; the rest moves to an array sized to it. */

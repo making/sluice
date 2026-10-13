@@ -21,9 +21,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * The extension of {@link H2EngineTest}: skips a {@link LegacyOnly} test on the netty
- * engine, switches the data proxy to the invocation's engine before each test and back to
- * the configured one after it, and fails a test that handed an h2 connection to the other
- * engine -- the switch did not take.
+ * engine and a {@link NettyOnly} test on the legacy one, switches the data proxy to the
+ * invocation's engine before each test and back to the configured one after it, and fails
+ * a test that handed an h2 connection to the other engine -- the switch did not take.
  */
 public final class H2Engines implements ExecutionCondition, BeforeEachCallback, AfterEachCallback {
 
@@ -34,8 +34,15 @@ public final class H2Engines implements ExecutionCondition, BeforeEachCallback, 
 	@Override
 	public ConditionEvaluationResult evaluateExecutionCondition(ExtensionContext context) {
 		Optional<H2DemuxEngine> engine = engine(context);
-		if (engine.isEmpty() || engine.get() != H2DemuxEngine.NETTY) {
-			return ConditionEvaluationResult.enabled("not the netty engine");
+		if (engine.isEmpty()) {
+			return ConditionEvaluationResult.enabled("not an engine invocation");
+		}
+		if (engine.get() != H2DemuxEngine.NETTY) {
+			Optional<NettyOnly> nettyOnly = context.getElement()
+				.flatMap(element -> AnnotationSupport.findAnnotation(element, NettyOnly.class));
+			return nettyOnly
+				.map(annotation -> ConditionEvaluationResult.disabled("legacy engine: " + annotation.value()))
+				.orElseGet(() -> ConditionEvaluationResult.enabled("not the netty engine"));
 		}
 		Optional<LegacyOnly> legacyOnly = context.getElement().flatMap(element -> legacyOnly(element, context));
 		return legacyOnly.map(annotation -> ConditionEvaluationResult.disabled("netty engine: " + annotation.value()))

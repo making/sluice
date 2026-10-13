@@ -11,6 +11,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -59,7 +60,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
 @H2EngineTest
-@LegacyOnly("leg writer queueing and flow control: not yet on the netty engine")
 class H2DemuxLegWriterE2ETest {
 
 	/** The engine of this invocation, selected by {@link H2EngineTest}. */
@@ -113,8 +113,10 @@ class H2DemuxLegWriterE2ETest {
 
 	/** An idle leg's writer is not woken while nothing is queued for it. */
 	@Test
+	@LegacyOnly("the legacy relay's leg writer thread and its wakeup counter: a netty hop's writer waits on its "
+			+ "queue")
 	void idleLegWriterSleeps() throws Exception {
-		String route = "lw.idle.test";
+		String route = route("lw.idle");
 		startClient(route, stub(H2DemuxLegWriterE2ETest::answerEndedRequests));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
 			client.headers(1, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/"));
@@ -134,8 +136,10 @@ class H2DemuxLegWriterE2ETest {
 	 * acknowledged before that data is written.
 	 */
 	@Test
+	@LegacyOnly("PING ordering and the tunnel byte counter: netty acks a PING as it reads it, behind what its "
+			+ "writer queue holds; a later migration step")
 	void upstreamPingIsAckedAheadOfQueuedData() throws Exception {
-		String route = "lw.ping.test";
+		String route = route("lw.ping");
 		CountDownLatch ping = new CountDownLatch(1);
 		CountDownLatch read = new CountDownLatch(1);
 		AtomicLong beforeAck = new AtomicLong(-1);
@@ -164,9 +168,11 @@ class H2DemuxLegWriterE2ETest {
 	 * a stream of another route completes.
 	 */
 	@Test
+	@LegacyOnly("netty pauses reading an upstream that floods PINGs without reading (the hop's read pause) instead "
+			+ "of ending its leg, and the tunnel byte counter is not yet on the netty engine; a per-hop rewrite")
 	void upstreamPingFloodEndsItsLeg() throws Exception {
-		String route = "lw.flood.test";
-		String otherRoute = "lw.flood-other.test";
+		String route = route("lw.flood");
+		String otherRoute = route("lw.flood-other");
 		CountDownLatch ping = new CountDownLatch(1);
 		startClient(route, stub(socket -> stallThenFlood(socket, ping)));
 		startClient(otherRoute, stub(H2DemuxLegWriterE2ETest::answerEndedRequests));
@@ -200,8 +206,9 @@ class H2DemuxLegWriterE2ETest {
 	 * carrying their sum.
 	 */
 	@Test
+	@LegacyOnly("per-hop windows: the netty engine relays no client WINDOW_UPDATE to an upstream")
 	void clientWindowUpdatesCoalesceWhileQueued() throws Exception {
-		String route = "lw.window.test";
+		String route = route("lw.window");
 		CountDownLatch read = new CountDownLatch(1);
 		AtomicLong frames = new AtomicLong();
 		AtomicLong sum = new AtomicLong();
@@ -225,7 +232,7 @@ class H2DemuxLegWriterE2ETest {
 	 */
 	@Test
 	void finishedStreamsAreForgotten() throws Exception {
-		String route = "lw.forget.test";
+		String route = route("lw.forget");
 		startClient(route, stub(H2DemuxLegWriterE2ETest::answerEndedRequests));
 		DataProxyServer proxy = Objects.requireNonNull(this.dataProxyServer);
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
@@ -249,7 +256,7 @@ class H2DemuxLegWriterE2ETest {
 	 */
 	@Test
 	void queueGaugeIsOnePerRoute() throws Exception {
-		String route = "lw.gauge.test";
+		String route = route("lw.gauge");
 		startClient(route, stub(H2DemuxLegWriterE2ETest::answerEndedRequests));
 		try (H2TestClient first = H2TestClient.connect(dataPort);
 				H2TestClient second = H2TestClient.connect(dataPort)) {
@@ -480,6 +487,14 @@ class H2DemuxLegWriterE2ETest {
 		catch (IOException e) {
 			throw new IllegalStateException(e);
 		}
+	}
+
+	/**
+	 * The route's host for this engine's invocation: both run on one router, where the
+	 * other invocation's tunnel client may still serve a host of the same name.
+	 */
+	private String route(String name) {
+		return name + "." + String.valueOf(this.engine).toLowerCase(Locale.ROOT) + ".test";
 	}
 
 	private static void close(AutoCloseable closeable) {

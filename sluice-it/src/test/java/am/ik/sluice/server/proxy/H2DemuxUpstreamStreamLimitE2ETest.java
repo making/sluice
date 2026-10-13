@@ -482,14 +482,10 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 		client.headers(3, false, post(route));
 		assertThat(client.data(3, 1000, false, TIMEOUT)).isTrue();
 		client.frame(TestH2.WINDOW_UPDATE, 0, 3, TestH2.int32(1000));
-		Awaitility.await()
-			.atMost(TIMEOUT)
-			.until(() -> trackedStreams(route) == 2 && (!queuedBytesGauged() || queuedBytes(route) > 0));
+		Awaitility.await().atMost(TIMEOUT).until(() -> trackedStreams(route) == 2 && queuedBytes(route) > 0);
 		Thread.sleep(HELD.toMillis());
 		assertThat(upstream.seen(3)).as("stream 3 waits").isFalse();
-		if (queuedBytesGauged()) {
-			assertThat(queuedBytes(route)).as("stream 3's frames queued").isGreaterThan(1000);
-		}
+		assertThat(queuedBytes(route)).as("stream 3's frames queued").isGreaterThan(1000);
 		return upstream;
 	}
 
@@ -518,17 +514,9 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 		return TestH2.headerBlock(":authority=" + route, ":method=POST", ":path=/");
 	}
 
-	/**
-	 * Whether the engine feeds the queued-bytes gauge: the netty engine's queue
-	 * accounting comes with the queue budget.
-	 */
-	private boolean queuedBytesGauged() {
-		return this.engine == H2DemuxEngine.LEGACY;
-	}
-
-	/** Whether the route's queue drained, as far as the engine gauges it. */
+	/** Whether the route's queue drained. */
 	private boolean queuedBytesDrained(String route) {
-		return !queuedBytesGauged() || queuedBytes(route) == 0;
+		return queuedBytes(route) == 0;
 	}
 
 	/** The route's leg queue gauge; zero before it exists. */

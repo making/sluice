@@ -9,6 +9,7 @@ import java.net.Socket;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -26,7 +27,7 @@ import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
 import am.ik.sluice.server.proxy.H2EngineTest;
-import am.ik.sluice.server.proxy.LegacyOnly;
+import am.ik.sluice.server.proxy.NettyOnly;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.VirtualConnection;
 import io.micrometer.core.instrument.Gauge;
@@ -56,7 +57,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
 @H2EngineTest
-@LegacyOnly("flow-control isolation and bounds: not yet on the netty engine")
 class H2DemuxFlowControlE2ETest {
 
 	/** The engine of this invocation, selected by {@link H2EngineTest}. */
@@ -67,8 +67,17 @@ class H2DemuxFlowControlE2ETest {
 	/** The stream limit the relay advertises. */
 	private static final int MAX_CONCURRENT_STREAMS = 100;
 
-	/** The client window plus the queue allowance, per stream. */
+	/** The client window plus the queue allowance, per stream (legacy engine). */
 	private static final long STREAM_BUDGET = 65535 + 64 * 1024;
+
+	/** The stream window the netty engine announces on both of its faces. */
+	private static final int NETTY_STREAM_WINDOW = 65535;
+
+	/** The backlog rounding of a stream's buffer, less than one granule. */
+	private static final int GRANULE = 1024;
+
+	/** The most a hop's writer queue holds on the netty engine. */
+	private static final long NETTY_HOP_QUEUE_BYTES = 256 * 1024 + 64 * 1024;
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
@@ -118,8 +127,9 @@ class H2DemuxFlowControlE2ETest {
 	 * up and the queue stays below the bound the stream limit and budget derive.
 	 */
 	@Test
+	@NettyOnly("per-hop windows: the relay holds a stream window per stream")
 	void compliantClientWithManyStreamsIsNotTornDown() throws Exception {
-		String route = "fc.many.test";
+		String route = route("fc.many");
 		startClient(route, stub(socket -> grantHeadsThenStall(socket, MAX_CONCURRENT_STREAMS)));
 		AtomicLong maxQueued = new AtomicLong();
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
@@ -146,9 +156,14 @@ class H2DemuxFlowControlE2ETest {
 			assertThat(client.closed()).as("a compliant client is not torn down").isFalse();
 			assertThat(advertised).as("the advertised stream limit").isEqualTo(MAX_CONCURRENT_STREAMS);
 			assertThat(client.maxOvershoot()).as("the client stayed within every stream window").isLessThanOrEqualTo(0);
-			assertThat(maxQueued.get()).as("queued high-water mark: past the old leg cap, below the derived bound")
-				.isGreaterThan(4L * 1024 * 1024)
-				.isLessThanOrEqualTo(MAX_CONCURRENT_STREAMS * (STREAM_BUDGET + 1024));
+			// per stream, the window the relay announced, read and not yet written to the
+			// leg, plus less than a granule of backlog rounding; and the leg's writer
+			// queue. What the streams' windows allow beyond the tunnel connection's
+			// buffers (2.16MiB) and a small socket buffer reaches the relay
+			assertThat(maxQueued.get()).as("queued high-water mark: what the windows allow, within the bound")
+				.isGreaterThan(MAX_CONCURRENT_STREAMS * (long) NETTY_STREAM_WINDOW - 3L * 1024 * 1024)
+				.isLessThanOrEqualTo(
+						MAX_CONCURRENT_STREAMS * (long) (NETTY_STREAM_WINDOW + GRANULE) + NETTY_HOP_QUEUE_BYTES);
 		}
 	}
 
@@ -158,7 +173,7 @@ class H2DemuxFlowControlE2ETest {
 	 */
 	@Test
 	void streamBeyondTheConcurrencyLimitIsRefused() throws Exception {
-		String route = "fc.limit.test";
+		String route = route("fc.limit");
 		startClient(route, stub(H2DemuxFlowControlE2ETest::answerEndedRequests));
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
 			for (int i = 0; i < MAX_CONCURRENT_STREAMS; i++) {
@@ -188,7 +203,7 @@ class H2DemuxFlowControlE2ETest {
 	 */
 	@Test
 	void bulkUploadOnASlowLegLetsAnotherStreamOfTheLegComplete() throws Exception {
-		String route = "fc.slow.test";
+		String route = route("fc.slow");
 		startClient(route, stub(H2DemuxFlowControlE2ETest::serveSlowlyGrantingStreamOne));
 		AtomicBoolean stop = new AtomicBoolean();
 		AtomicLong maxQueued = new AtomicLong();
@@ -236,78 +251,95 @@ class H2DemuxFlowControlE2ETest {
 
 	/**
 	 * DATA of a stream the relay refused (no route) still consumed the client's
-	 * connection window, which the relay must release, or the connection starves.
+	 * connection window, which the relay must release, or the connection starves: netty's
+	 * auto refill grants it back once half of the window is spent.
 	 */
 	@Test
+	@NettyOnly("netty's auto refill of the connection window")
 	void dataOnARefusedStreamReleasesTheConnectionWindow() throws Exception {
-		String route = "fc.refused.test";
+		String route = route("fc.refused");
 		startClient(route, stub(H2DemuxFlowControlE2ETest::answerEndedRequests));
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
 			client.headers(1, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/"));
 			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
 			client.headers(3, false, TestH2.headerBlock(":authority=nowhere.test", ":method=POST", ":path=/"));
 			assertThat(client.data(3, 40_000, true, Duration.ofSeconds(5))).isTrue();
-			assertThat(client.awaitTrue(() -> client.connectionGranted() >= 40_000, Duration.ofSeconds(5)))
+			assertThat(client.awaitTrue(() -> client.connectionGranted() >= 32_768, Duration.ofSeconds(5)))
 				.as("connection window granted for the refused stream's DATA: %d", client.connectionGranted())
 				.isTrue();
+			assertThat(client.connectionWindow()).as("the window back above half")
+				.isGreaterThan(H2TestClient.INITIAL_WINDOW / 2);
 		}
 	}
 
 	/**
 	 * Padding counts against both windows (RFC 9113 6.9.1): the relay releases the whole
-	 * frame at connection level, gives the padding back at stream level since it never
-	 * queues it, and relays the payload unpadded.
+	 * frames at connection level, gives the padding back at stream level since it never
+	 * queues it, and relays the payload unpadded. Past half of the window, so netty's
+	 * auto refill grants the connection window once, exactly what was spent, and the
+	 * stream window once half of it was written or padding.
 	 */
 	@Test
+	@NettyOnly("netty's window update ratio")
 	void paddedDataIsReleasedInFullAndRelayedUnpadded() throws Exception {
-		String route = "fc.padded.test";
+		String route = route("fc.padded");
 		List<TestH2.Frame> upstreamData = new java.util.concurrent.CopyOnWriteArrayList<>();
 		startClient(route, stub(socket -> recordData(socket, upstreamData)));
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
 			client.headers(1, false, TestH2.headerBlock(":authority=" + route, ":method=POST", ":path=/"));
 			int data = 1000;
 			int padding = 200;
+			int frames = 28;
 			byte[] payload = new byte[1 + data + padding];
 			payload[0] = (byte) padding;
 			java.util.Arrays.fill(payload, 1, 1 + data, (byte) 'x');
-			client.sendData(1, payload, TestH2.FLAG_PADDED);
-			assertThat(client.awaitTrue(() -> client.connectionGranted() >= payload.length, Duration.ofSeconds(5)))
+			for (int i = 0; i < frames; i++) {
+				client.sendData(1, payload, TestH2.FLAG_PADDED);
+			}
+			long spent = (long) frames * payload.length;
+			assertThat(spent).as("past half of the window").isGreaterThan(H2TestClient.INITIAL_WINDOW / 2);
+			assertThat(client.awaitTrue(() -> client.connectionGranted() >= spent, Duration.ofSeconds(5)))
 				.as("connection grant %d", client.connectionGranted())
 				.isTrue();
-			// once the payload is written nothing stays queued: the stream's window is
-			// back at the budget, the padding included
-			long streamGrant = STREAM_BUDGET - H2TestClient.INITIAL_WINDOW + payload.length;
-			assertThat(client.awaitTrue(() -> client.streamGranted(1) >= streamGrant, Duration.ofSeconds(5)))
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.untilAsserted(() -> assertThat(upstreamData.stream().mapToInt(frame -> frame.payload().length).sum())
+					.as("relayed payload")
+					.isEqualTo(frames * data));
+			assertThat(upstreamData).as("relayed unpadded")
+				.allSatisfy(frame -> assertThat(frame.flags() & TestH2.FLAG_PADDED).isZero());
+			assertThat(client.awaitTrue(() -> client.streamGranted(1) > H2TestClient.INITIAL_WINDOW / 2,
+					Duration.ofSeconds(5)))
 				.as("stream grant %d", client.streamGranted(1))
 				.isTrue();
-			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> !upstreamData.isEmpty());
-			TestH2.Frame relayed = upstreamData.get(0);
-			assertThat(relayed.flags() & TestH2.FLAG_PADDED).as("relayed unpadded").isZero();
-			assertThat(relayed.payload()).hasSize(data);
 			Thread.sleep(200); // a surplus grant would follow the exact one
-			assertThat(client.connectionGranted()).isEqualTo(payload.length);
-			assertThat(client.streamGranted(1)).isEqualTo(streamGrant);
+			assertThat(client.connectionGranted()).isEqualTo(spent);
+			assertThat(client.streamGranted(1)).isLessThanOrEqualTo(spent);
 		}
 	}
 
 	/**
 	 * The upstream's connection window is released for the DATA payload relayed to the
 	 * client, not for frame headers or other frames: an over-grant accumulates until the
-	 * upstream's window passes 2^31-1, a connection error.
+	 * upstream's window passes 2^31-1, a connection error. Past half of the window, so
+	 * netty's auto refill grants: once, what was written to the client when half of the
+	 * window was spent, never more than the DATA.
 	 */
 	@Test
+	@NettyOnly("netty's window update ratio")
 	void upstreamConnectionWindowIsReleasedForDataOnly() throws Exception {
-		String route = "fc.grant.test";
+		String route = route("fc.grant");
 		AtomicLong granted = new AtomicLong();
-		int[] chunks = { 1000, 3000, 7 };
+		int[] chunks = { 10000, 16000, 14000, 7 };
 		startClient(route, stub(socket -> respondCountingGrants(socket, chunks, granted)));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
 			client.headers(1, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/"));
 			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
-			long expected = 1000 + 3000 + 7;
-			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> granted.get() >= expected);
+			long data = 10000 + 16000 + 14000 + 7;
+			long half = H2TestClient.INITIAL_WINDOW / 2 + 1;
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> granted.get() >= half);
 			Thread.sleep(300); // a surplus grant would follow the exact one
-			assertThat(granted.get()).isEqualTo(expected);
+			assertThat(granted.get()).isBetween(half, data);
 		}
 	}
 
@@ -477,6 +509,8 @@ class H2DemuxFlowControlE2ETest {
 	private ServerSocket stub(Consumer<Socket> handler) {
 		try {
 			ServerSocket server = new ServerSocket();
+			// small, so the upstream's socket absorbs little of what the relay holds back
+			server.setReceiveBufferSize(16 * 1024);
 			server.bind(new InetSocketAddress("127.0.0.1", 0), 128);
 			this.closeables.add(server);
 			Thread.ofVirtual().name("e2e-fc-accept").start(() -> {
@@ -498,6 +532,14 @@ class H2DemuxFlowControlE2ETest {
 		catch (IOException e) {
 			throw new IllegalStateException(e);
 		}
+	}
+
+	/**
+	 * The route's host for this engine's invocation: both run on one router, where the
+	 * other invocation's tunnel client may still serve a host of the same name.
+	 */
+	private String route(String name) {
+		return name + "." + String.valueOf(this.engine).toLowerCase(Locale.ROOT) + ".test";
 	}
 
 	private static void close(AutoCloseable closeable) {

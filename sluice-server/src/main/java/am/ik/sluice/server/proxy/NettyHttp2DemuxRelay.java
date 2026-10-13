@@ -7,7 +7,9 @@ import java.io.SequenceInputStream;
 import java.net.InetAddress;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -16,6 +18,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
 
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -63,12 +66,28 @@ import io.netty.util.AsciiString;
  * its {@code :authority} and logged with it as its path.
  * <p>
  * Streams of one route share the route's leg and keep their stream ids on it; with
- * {@code rewrite-host} the head's {@code :authority} becomes the route's address. DATA
- * read on one hop is written on the other as a retained slice and consumed (its window
- * granted back) once written, so what the relay holds per stream is bounded by the window
- * it announced. Resets pass either way with their code; an upstream's reset after the
+ * {@code rewrite-host} the head's {@code :authority} becomes the route's address. Windows
+ * are per hop: DATA read on one hop is written on the other ({@link Flow}: a copy, small
+ * frames coalesced) and consumed -- its stream window granted back -- once written, so
+ * what the relay holds per stream and direction stays within the stream window it
+ * announced ({@link #STREAM_WINDOW}); the connection windows refill as DATA arrives
+ * (netty's auto refill), so a stream held by its upstream or its client holds back no
+ * other stream. Resets pass either way with their code; an upstream's reset after the
  * response's end follows that end to the client. A stream the client ends without its
- * request's end resets its upstream stream with {@code CANCEL}.
+ * request's end resets its upstream stream with {@code CANCEL}; one an early response
+ * closed for the client still delivers the request's rest.
+ * <p>
+ * What the relay holds -- DATA and header blocks not yet written, both ways, and every
+ * hop's writer queue -- is accounted after each action of its loop: the part past
+ * {@link #CONNECTION_ALLOWANCE} is charged to the {@link H2DemuxBudget} every relay
+ * shares, and past it with the budget exhausted the relay withholds the connection window
+ * of every hop (each peer stops once the window it holds is spent), refuses a new stream
+ * whose head does not fit ({@code REFUSED_STREAM}), resets a stream whose trailers do not
+ * ({@code ENHANCE_YOUR_CALM} to the client, {@code CANCEL} to the upstream), and refuses
+ * the most recent waiting streams past the allowance ({@link #refuseWaitingLocked}),
+ * until its hops drained below the allowance or the budget has room. The bounds outside
+ * the budget: {@link #UNBUDGETED_BYTES} per connection, {@link #RESPONSE_QUEUE_BYTES} per
+ * leg. Header blocks an upstream sends are charged, never refused.
  * <p>
  * An upstream's failure ends no more than it covers. netty's codec answers the upstream's
  * protocol errors itself: a stream error resets that stream towards the upstream, a
@@ -106,6 +125,53 @@ final class NettyHttp2DemuxRelay {
 
 	/** The header list size limit of both faces, mirroring the connection head's. */
 	static final int MAX_HEADER_LIST_SIZE = 64 * 1024;
+
+	/**
+	 * The initial stream window the relay announces on both faces (netty's default, the
+	 * RFC 9113 one): what it reads of a stream and has not written on the other hop yet,
+	 * its consumed bytes not granted back, stays within it.
+	 */
+	static final int STREAM_WINDOW = 65535;
+
+	/**
+	 * The bytes a relay may queue without charging the shared budget: what it always
+	 * admits, so a connection whose hops drain keeps flowing however exhausted the budget
+	 * is.
+	 */
+	static final int CONNECTION_ALLOWANCE = 128 * 1024;
+
+	/**
+	 * The most one hop's writer queue holds of what the hop's own peer makes it write:
+	 * the reader pauses past {@link Hop#DEFAULT_READ_PAUSE_BYTES} queued, by then
+	 * unwritable for DATA (its high water mark is lower), so the queue passes the read
+	 * pause by what netty answers to one read at most (acks, resets; under 32KiB in
+	 * {@code HopFailureTest}), 64KiB here.
+	 */
+	static final long HOP_QUEUE_BYTES = Hop.DEFAULT_READ_PAUSE_BYTES + 64 * 1024;
+
+	/**
+	 * What a peer can still make the relay hold once the relay decided to withhold its
+	 * connection window: the read under way when the budget ran out (the decision follows
+	 * each read), then the connection window the peer holds -- at most
+	 * {@link #STREAM_WINDOW}: netty's auto refill grants it back to its initial size,
+	 * never more --, copied into the streams' backlogs, which round up by less than one
+	 * {@link PendingPayload#GRANULE} each.
+	 */
+	static final long WITHHELD_ARRIVALS = Hop.MAX_READ_BYTES + STREAM_WINDOW
+			+ (long) MAX_CONCURRENT_STREAMS * PendingPayload.GRANULE;
+
+	/**
+	 * The most one relay queues outside the shared budget: its allowance, what the client
+	 * can still send once its connection window is withheld, and the client hop's writer
+	 * queue -- what netty answers the client and the responses written but not yet sent.
+	 */
+	static final long UNBUDGETED_BYTES = CONNECTION_ALLOWANCE + WITHHELD_ARRIVALS + HOP_QUEUE_BYTES;
+
+	/**
+	 * The most one leg adds outside the shared budget: what its upstream can still send
+	 * once the leg's connection window is withheld, and the leg hop's writer queue.
+	 */
+	static final long RESPONSE_QUEUE_BYTES = WITHHELD_ARRIVALS + HOP_QUEUE_BYTES;
 
 	/** How long a hop's threads may take to end once its channel closed. */
 	private static final Duration HOP_DONE_TIMEOUT = Duration.ofSeconds(30);
@@ -146,7 +212,27 @@ final class NettyHttp2DemuxRelay {
 
 	private final Runnable release;
 
+	private final H2DemuxBudget budget;
+
 	private final Loop loop;
+
+	/**
+	 * The part of the relay's queued bytes beyond its allowance, charged to the budget;
+	 * with the loop's lock.
+	 */
+	private long pooled;
+
+	/** The hops' connection windows are withheld; with the loop's lock. */
+	private boolean withheld;
+
+	/** The bytes the relay queued at the last review; with the loop's lock. */
+	private long queued;
+
+	/** The accounts are closed: the relay finished; with the loop's lock. */
+	private boolean accountsClosed;
+
+	/** Reviews the accounts once the budget has room; one instance, to dedupe. */
+	private final Runnable budgetRoom = this::reviewSoon;
 
 	/** The client endpoint; set once in {@link #start()}. */
 	private @Nullable Hop client;
@@ -191,8 +277,10 @@ final class NettyHttp2DemuxRelay {
 		}
 		this.onFinish = Objects.requireNonNull(builder.onFinish, "onFinish is required");
 		this.release = Objects.requireNonNull(builder.release, "release is required");
+		this.budget = Objects.requireNonNull(builder.budget, "budget is required");
 		this.loop = new Loop("sluice-h2n",
 				(source, cause) -> log.warn("h2 demux {}: {}", source, cause.toString(), cause));
+		this.loop.afterSettle(this::reviewLocked);
 	}
 
 	static Builder builder() {
@@ -215,6 +303,7 @@ final class NettyHttp2DemuxRelay {
 					.listener(ClientListener::new)
 					.codec(codec -> configure(codec, new Http2Settings().maxConcurrentStreams(MAX_CONCURRENT_STREAMS)))
 					.onInactive(this::clientClosedLocked)
+					.onWritten(NettyHttp2DemuxRelay::reviewed)
 					.build();
 				this.client = hop;
 				hop.addConnectionListener(new ClientStreams());
@@ -327,6 +416,13 @@ final class NettyHttp2DemuxRelay {
 			misdirectLocked(streamId, route, request, endStream);
 			return;
 		}
+		int headBytes = headerBytes(headers);
+		if (!admitLocked(headBytes)) {
+			// past the allowance with the budget exhausted: safe for the client to retry
+			resetClientLocked(streamId, Http2Error.REFUSED_STREAM);
+			this.meters.refusedForBudget();
+			return;
+		}
 		Leg leg = legLocked(route, session);
 		if (leg == null) {
 			resetClientLocked(streamId, Http2Error.REFUSED_STREAM);
@@ -335,14 +431,20 @@ final class NettyHttp2DemuxRelay {
 		if (route.rewriteHost()) {
 			headers.authority(AsciiString.of(route.address()));
 		}
-		Exchange exchange = new Exchange(streamId, leg);
+		Exchange exchange = new Exchange(streamId, leg, client());
 		exchange.host = host;
 		exchange.request = request;
 		exchange.requestEnded = endStream;
+		exchange.responseFlow.onEndWritten(() -> responseWrittenLocked(exchange));
 		this.exchanges.put(streamId, exchange);
 		leg.routeMeters.trackedStreams().increment();
 		Hop hop = leg.hop();
+		// the head is held until written: in the leg's buffer while the stream waits
+		exchange.headBytes = headBytes;
+		leg.backlog += headBytes;
 		ChannelPromise written = hop.newPromise(future -> {
+			leg.backlog -= exchange.headBytes;
+			exchange.headBytes = 0;
 			if (!future.isSuccess()) {
 				// the leg never took the stream -- it failed it, or dropped it from its
 				// buffer on the upstream's GOAWAY or its close: safe for the client to
@@ -468,7 +570,8 @@ final class NettyHttp2DemuxRelay {
 			return leg;
 		}
 		VirtualConnection connection = session.open(route.address());
-		Leg opening = new Leg(this.meters.route(route.routeTag()));
+		Leg opening = new Leg(route.routeTag(), this.meters.route(route.routeTag()),
+				this.meters.writesHeldOf(route.routeTag()));
 		try {
 			Hop hop = Hop.builder()
 				.name("sluice-h2n-leg-" + connection.connectionId())
@@ -482,8 +585,11 @@ final class NettyHttp2DemuxRelay {
 					codec.encoderEnforceMaxConcurrentStreams(true);
 				})
 				.onInactive(() -> this.legs.remove(route, opening))
+				.onWritten(NettyHttp2DemuxRelay::reviewed)
 				.build();
 			opening.hop = hop;
+			hop.withholdConnectionWindowLocked(this.withheld);
+			hop.watchWrites(watchingWrites());
 			hop.addConnectionListener(new LegStreams(opening));
 			// one stream until the upstream's SETTINGS tell its limit (RFC 9113 5.1.2
 			// leaves it open until then); through the encoder, as the buffering encoder
@@ -650,13 +756,181 @@ final class NettyHttp2DemuxRelay {
 		}
 	}
 
-	/** Writes DATA read on one hop to the other; the bytes consumed at once (padding). */
-	private static int forward(Hop from, Hop to, int streamId, ByteBuf data, int padding, boolean endStream) {
-		int length = data.readableBytes();
-		to.encoder()
-			.writeData(to.ctx(), streamId, data.retainedSlice(), 0, endStream,
-					to.newPromise(future -> consume(from, streamId, length)));
-		return padding;
+	/**
+	 * The size of a header list as HPACK counts it (RFC 7541 4.1): what the relay
+	 * accounts for a header block it holds.
+	 */
+	static int headerBytes(Http2Headers headers) {
+		long bytes = 0;
+		for (Map.Entry<CharSequence, CharSequence> header : headers) {
+			bytes += header.getKey().length() + header.getValue().length() + 32;
+		}
+		return (int) Math.min(bytes, Integer.MAX_VALUE);
+	}
+
+	/**
+	 * Whether {@code bytes} more may be held: within the allowance, or charged to the
+	 * budget now if it has room for the part beyond; with the loop's lock.
+	 */
+	private boolean admitLocked(long bytes) {
+		long change = Math.max(0, queuedLocked() + bytes - CONNECTION_ALLOWANCE) - this.pooled;
+		if (change <= 0) {
+			return true;
+		}
+		if (!this.budget.tryCharge(change)) {
+			return false;
+		}
+		this.pooled += change;
+		return true;
+	}
+
+	/**
+	 * The bytes the relay holds: every leg's backlog (what it read and has not written on
+	 * the other hop yet, both ways) and every hop's writer queue. Updates the route
+	 * gauges and forgets the legs that ended holding nothing; with the loop's lock.
+	 */
+	private long queuedLocked() {
+		Hop client = this.client;
+		long queued = client == null ? 0 : client.queuedBytes();
+		for (Iterator<Leg> legs = this.opened.iterator(); legs.hasNext();) {
+			Leg leg = legs.next();
+			Hop hop = leg.hop();
+			long held = leg.backlog + hop.queuedBytes();
+			queued += held;
+			leg.gauge(held);
+			if (held == 0 && !hop.open()) {
+				legs.remove();
+			}
+		}
+		return queued;
+	}
+
+	/**
+	 * Reviews the accounts once the channels settled (the loop's hook): the share of the
+	 * queued bytes beyond the allowance is charged to the budget or released; past the
+	 * allowance with the budget exhausted, every hop's connection window is withheld --
+	 * the peers stop sending DATA once the windows they hold are spent -- and the waiting
+	 * streams past the allowance are refused ({@link #refuseWaitingLocked}); within the
+	 * allowance again, or with the budget's room back, the windows withheld are granted.
+	 * Whether it wrote anything; with the loop's lock.
+	 */
+	private boolean reviewLocked() {
+		if (this.accountsClosed || this.client == null) {
+			return false;
+		}
+		long queued = queuedLocked();
+		this.queued = queued;
+		settleShareLocked(queued);
+		boolean wrote = false;
+		if (queued > CONNECTION_ALLOWANCE && !this.budget.hasRoom()) {
+			if (!this.withheld) {
+				this.withheld = true;
+				this.meters.windowWithheld();
+				wrote |= withholdLocked(true);
+			}
+			this.budget.awaitRoom(this.budgetRoom);
+			wrote |= refuseWaitingLocked();
+		}
+		else if (this.withheld) {
+			this.withheld = false;
+			this.budget.cancel(this.budgetRoom);
+			wrote |= withholdLocked(false);
+		}
+		boolean watch = watchingWrites();
+		client().watchWrites(watch);
+		for (Leg leg : this.opened) {
+			leg.hop().watchWrites(watch);
+		}
+		return wrote;
+	}
+
+	/**
+	 * Whether a writer's progress may change what the review decides or what the route
+	 * gauges show: while the relay queues anything; with the loop's lock.
+	 */
+	private boolean watchingWrites() {
+		return this.queued > 0;
+	}
+
+	/** Runs nothing: the settle after a writer's batch runs the review. */
+	private static void reviewed() {
+	}
+
+	/** Has the loop review the accounts; on the budget's thread once it has room. */
+	private void reviewSoon() {
+		this.loop.run(NettyHttp2DemuxRelay::reviewed);
+	}
+
+	/** Charges or releases what makes the share the part beyond the allowance. */
+	private void settleShareLocked(long queued) {
+		long share = Math.max(0, queued - CONNECTION_ALLOWANCE);
+		long change = share - this.pooled;
+		this.pooled = share;
+		if (change > 0) {
+			this.budget.charge(change);
+		}
+		else if (change < 0) {
+			this.budget.release(-change);
+		}
+	}
+
+	/** Withholds or grants every hop's connection window; whether it wrote. */
+	private boolean withholdLocked(boolean withhold) {
+		boolean wrote = client().withholdConnectionWindowLocked(withhold);
+		for (Leg leg : this.opened) {
+			wrote |= leg.hop().withholdConnectionWindowLocked(withhold);
+		}
+		return wrote;
+	}
+
+	/**
+	 * While the windows are withheld, keeps the bytes held for streams waiting for an
+	 * upstream's concurrency limit within the allowance: past it, the most recent waiting
+	 * streams leave their leg's buffer and are refused ({@code REFUSED_STREAM}: their
+	 * upstream never saw them, RFC 9113 8.7) until the rest fits. Their bytes drain only
+	 * once a stream of their leg closed on the upstream, which may need the very request
+	 * body the withheld window holds back; the open streams' bytes drain on their own.
+	 * Whether a stream was refused; with the loop's lock.
+	 */
+	private boolean refuseWaitingLocked() {
+		List<Exchange> waiting = new ArrayList<>();
+		long bytes = 0;
+		for (Exchange exchange : this.exchanges.values()) {
+			if (exchange.waiting && !exchange.reset) {
+				waiting.add(exchange);
+				bytes += exchange.waitingBytes();
+			}
+		}
+		if (bytes <= CONNECTION_ALLOWANCE) {
+			return false;
+		}
+		waiting.sort(Comparator.comparingInt(exchange -> exchange.id));
+		for (int i = waiting.size() - 1; i >= 0 && bytes > CONNECTION_ALLOWANCE; i--) {
+			Exchange exchange = waiting.get(i);
+			bytes -= exchange.waitingBytes();
+			exchange.reset = true;
+			exchange.refused = true;
+			dropWaitingLocked(exchange, Http2Error.CANCEL.code());
+			resetClientLocked(exchange.id, Http2Error.REFUSED_STREAM);
+			this.meters.refusedWaiting();
+		}
+		return true;
+	}
+
+	/**
+	 * Closes the accounts once the relay finished: its share of the budget goes back, its
+	 * route gauges drop what it still counted, and no review runs any more.
+	 */
+	private void closeAccountsLocked() {
+		this.accountsClosed = true;
+		this.budget.cancel(this.budgetRoom);
+		settleShareLocked(0);
+		for (Leg leg : this.opened) {
+			if (leg.backlog != 0) {
+				log.warn("h2 demux: a leg of route {} finished with {} bytes accounted", leg.routeTag, leg.backlog);
+			}
+			leg.gauge(0);
+		}
 	}
 
 	/**
@@ -683,6 +957,7 @@ final class NettyHttp2DemuxRelay {
 	private void settle() {
 		if (this.pending.decrementAndGet() == 0 && this.finished.compareAndSet(false, true)) {
 			this.deadline.disarm();
+			this.loop.run(this::closeAccountsLocked);
 			this.loop.close();
 			this.access.close();
 			try {
@@ -711,6 +986,8 @@ final class NettyHttp2DemuxRelay {
 	/** One route's leg: the hop over its virtual connection. */
 	private static final class Leg {
 
+		final String routeTag;
+
 		final H2DemuxMeters.Route routeMeters;
 
 		/** Set once the hop is built. */
@@ -719,8 +996,30 @@ final class NettyHttp2DemuxRelay {
 		/** The upstream's first SETTINGS has not arrived; with the loop's lock. */
 		boolean awaitingSettings = true;
 
-		Leg(H2DemuxMeters.Route routeMeters) {
+		/**
+		 * What the relay holds of the leg's exchanges, both ways: DATA read and not yet
+		 * written on the other hop, and header blocks not yet written; with the lock.
+		 */
+		long backlog;
+
+		/** The DATA writes netty holds for the route's exchanges. */
+		final LongAdder writesHeld;
+
+		/** What the route's gauge counts of the leg; with the loop's lock. */
+		private long gauged;
+
+		Leg(String routeTag, H2DemuxMeters.Route routeMeters, LongAdder writesHeld) {
+			this.routeTag = routeTag;
 			this.routeMeters = routeMeters;
+			this.writesHeld = writesHeld;
+		}
+
+		/** Sets what the route's gauge counts of the leg; with the loop's lock. */
+		void gauge(long bytes) {
+			if (bytes != this.gauged) {
+				this.routeMeters.queuedBytes().addAndGet(bytes - this.gauged);
+				this.gauged = bytes;
+			}
 		}
 
 		Hop hop() {
@@ -775,9 +1074,220 @@ final class NettyHttp2DemuxRelay {
 		/** The request, for the bad-gateway page. */
 		ConnectionHeadParser.Head.@Nullable Request request;
 
-		Exchange(int id, Leg leg) {
+		/** The request head's bytes while the leg has not written it. */
+		int headBytes;
+
+		/** The client's DATA and trailers towards the leg. */
+		final Flow requestFlow;
+
+		/** The upstream's DATA and trailers towards the client. */
+		final Flow responseFlow;
+
+		Exchange(int id, Leg leg, Hop client) {
 			this.id = id;
 			this.leg = leg;
+			this.requestFlow = new Flow(this, client, leg.hop());
+			this.responseFlow = new Flow(this, leg.hop(), client);
+		}
+
+		/** What the relay holds for the stream while it waits in its leg's buffer. */
+		long waitingBytes() {
+			return this.headBytes + this.requestFlow.held();
+		}
+
+	}
+
+	/**
+	 * One direction of an exchange: the DATA and trailers read on one hop, written on the
+	 * other. One DATA write at a time is in netty's hands (its flow controller, or the
+	 * leg's buffer while the stream waits): it is a copy, so it pins none of the reading
+	 * hop's inbound buffers, and what arrives meanwhile is appended to one backlog buffer
+	 * (a {@link PendingPayload}), written whole once the write before completed -- so
+	 * small frames cost no object each, and the bytes held are the bytes accounted. The
+	 * reading hop consumes a write's bytes (grants its window back) once the other hop
+	 * wrote them, so what a flow holds stays within the window the relay announced
+	 * ({@link #STREAM_WINDOW}), plus less than a granule of rounding. Trailers follow the
+	 * DATA held before them. Everything the flow holds counts in its leg's backlog. With
+	 * the loop's lock.
+	 */
+	private static final class Flow {
+
+		private final Exchange exchange;
+
+		private final Hop from;
+
+		private final Hop to;
+
+		/** The bytes of the DATA write netty holds; -1 = none. */
+		private int writing = -1;
+
+		/** The buffer bytes of that write. */
+		private int writingBytes;
+
+		private final PendingPayload backlog = new PendingPayload();
+
+		/** The backlog ends the stream. */
+		private boolean backlogEnds;
+
+		/** Trailers held behind the backlog. */
+		private @Nullable Http2Headers trailers;
+
+		private boolean trailersEnd;
+
+		/** The bytes of the trailers and other blocks held, until netty wrote them. */
+		private int blockBytes;
+
+		/** Nothing more of the stream is written: reset, or a hop closed it. */
+		private boolean dropped;
+
+		/** Runs once the write carrying the stream's end completed, either way. */
+		private @Nullable Runnable endWritten;
+
+		Flow(Exchange exchange, Hop from, Hop to) {
+			this.exchange = exchange;
+			this.from = from;
+			this.to = to;
+		}
+
+		void onEndWritten(Runnable endWritten) {
+			this.endWritten = endWritten;
+		}
+
+		/** What the flow holds: the write in netty's hands, the backlog, the trailers. */
+		long held() {
+			return this.writingBytes + this.backlog.capacity() + this.blockBytes;
+		}
+
+		/** Whether DATA waits in netty's hands or the backlog. */
+		boolean busy() {
+			return this.writing >= 0 || this.backlog.size() > 0 || this.backlogEnds;
+		}
+
+		/** DATA read on the stream; its padding is the caller's to consume. */
+		void data(ByteBuf data, boolean endStream) {
+			if (this.dropped) {
+				return;
+			}
+			if (this.writing < 0) {
+				int length = data.readableBytes();
+				writeData(length == 0 ? Unpooled.EMPTY_BUFFER : Unpooled.copiedBuffer(data), length, length, endStream);
+				return;
+			}
+			int before = this.backlog.capacity();
+			this.backlog.append(data);
+			this.backlogEnds |= endStream;
+			account(this.backlog.capacity() - before);
+		}
+
+		/**
+		 * A header block after the head: after the DATA held before it. netty takes no
+		 * more than one after DATA -- trailers, which end the stream.
+		 */
+		void block(Http2Headers headers, boolean endStream) {
+			if (this.dropped) {
+				return;
+			}
+			int bytes = headerBytes(headers);
+			if (busy()) {
+				this.trailers = headers;
+				this.trailersEnd = endStream;
+				this.blockBytes += bytes;
+				account(bytes);
+				return;
+			}
+			writeBlock(headers, bytes, endStream);
+		}
+
+		/**
+		 * Nothing more of the stream is written: the backlog and trailers go; the write
+		 * netty holds completes as netty fails or finishes it.
+		 */
+		void drop() {
+			if (this.dropped) {
+				return;
+			}
+			this.dropped = true;
+			int held = this.backlog.capacity();
+			this.backlog.clear();
+			this.backlogEnds = false;
+			if (this.trailers != null) {
+				held += headerBytes(this.trailers);
+				this.blockBytes -= headerBytes(this.trailers);
+				this.trailers = null;
+			}
+			account(-held);
+		}
+
+		private void writeData(ByteBuf data, int length, int bytes, boolean endStream) {
+			this.writing = length;
+			this.writingBytes = bytes;
+			account(bytes);
+			this.exchange.leg.writesHeld.increment();
+			int streamId = this.exchange.id;
+			this.to.encoder()
+				.writeData(this.to.ctx(), streamId, data, 0, endStream,
+						this.to.newPromise(future -> dataWritten(future.isSuccess(), endStream)));
+		}
+
+		private void dataWritten(boolean success, boolean endStream) {
+			int length = this.writing;
+			account(-this.writingBytes);
+			this.exchange.leg.writesHeld.decrement();
+			this.writing = -1;
+			this.writingBytes = 0;
+			if (success) {
+				consume(this.from, this.exchange.id, length);
+			}
+			if (endStream) {
+				ended();
+			}
+			if (!success) {
+				drop();
+				return;
+			}
+			if (this.backlog.size() > 0 || this.backlogEnds) {
+				int size = this.backlog.size();
+				int capacity = this.backlog.capacity();
+				byte[] bytes = this.backlog.takeAll();
+				boolean ends = this.backlogEnds;
+				this.backlogEnds = false;
+				account(-capacity);
+				writeData(size == 0 ? Unpooled.EMPTY_BUFFER : Unpooled.wrappedBuffer(bytes, 0, size), size, capacity,
+						ends);
+			}
+			Http2Headers held = this.trailers;
+			if (held != null) {
+				int bytes = headerBytes(held);
+				this.trailers = null;
+				this.blockBytes -= bytes;
+				account(-bytes);
+				// netty writes it behind the DATA it holds
+				writeBlock(held, bytes, this.trailersEnd);
+			}
+		}
+
+		private void writeBlock(Http2Headers headers, int bytes, boolean endStream) {
+			this.blockBytes += bytes;
+			account(bytes);
+			this.to.encoder()
+				.writeHeaders(this.to.ctx(), this.exchange.id, headers, 0, endStream, this.to.newPromise(future -> {
+					this.blockBytes -= bytes;
+					account(-bytes);
+					if (endStream) {
+						ended();
+					}
+				}));
+		}
+
+		private void ended() {
+			Runnable endWritten = this.endWritten;
+			if (endWritten != null) {
+				endWritten.run();
+			}
+		}
+
+		private void account(long bytes) {
+			this.exchange.leg.backlog += bytes;
 		}
 
 	}
@@ -803,11 +1313,22 @@ final class NettyHttp2DemuxRelay {
 			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.get(streamId);
 			if (exchange != null) {
 				// trailers
-				if (!exchange.reset) {
-					exchange.requestEnded |= endStream;
-					Hop leg = exchange.leg.hop();
-					leg.encoder().writeHeaders(leg.ctx(), streamId, headers, 0, endStream, leg.ctx().newPromise());
+				if (exchange.reset) {
+					return;
 				}
+				if (!admitLocked(headerBytes(headers))) {
+					// trailers cannot be refused without leaving the stream unfinished:
+					// the
+					// stream, its connection past its allowance with the budget
+					// exhausted, is reset instead
+					exchange.reset = true;
+					resetClientLocked(streamId, Http2Error.ENHANCE_YOUR_CALM);
+					reset(exchange.leg.hop(), streamId, Http2Error.CANCEL.code());
+					NettyHttp2DemuxRelay.this.meters.resetForBudget();
+					return;
+				}
+				exchange.requestEnded |= endStream;
+				exchange.requestFlow.block(headers, endStream);
 				return;
 			}
 			if (streamId <= NettyHttp2DemuxRelay.this.highestStreamId) {
@@ -824,7 +1345,9 @@ final class NettyHttp2DemuxRelay {
 				return data.readableBytes() + padding;
 			}
 			exchange.requestEnded |= endStream;
-			return forward(this.hop, exchange.leg.hop(), streamId, data, padding, endStream);
+			exchange.requestFlow.data(data, endStream);
+			// padding is consumed at once
+			return padding;
 		}
 
 		@Override
@@ -856,6 +1379,11 @@ final class NettyHttp2DemuxRelay {
 				return;
 			}
 			exchange.leg.routeMeters.trackedStreams().decrement();
+			exchange.responseFlow.drop();
+			if (exchange.reset || !(exchange.requestEnded && exchange.responseEnded)) {
+				exchange.requestFlow.drop();
+			}
+			// else: the request's rest, its end included, still goes to the upstream
 			if (exchange.waiting) {
 				exchange.reset = true;
 				dropWaitingLocked(exchange, Http2Error.CANCEL.code());
@@ -920,10 +1448,7 @@ final class NettyHttp2DemuxRelay {
 				return;
 			}
 			exchange.responseEnded |= endStream;
-			Hop client = client();
-			client.encoder()
-				.writeHeaders(client.ctx(), streamId, headers, 0, endStream, endStream
-						? client.newPromise(future -> responseWrittenLocked(exchange)) : client.ctx().newPromise());
+			exchange.responseFlow.block(headers, endStream);
 		}
 
 		@Override
@@ -933,16 +1458,7 @@ final class NettyHttp2DemuxRelay {
 				return data.readableBytes() + padding;
 			}
 			exchange.responseEnded |= endStream;
-			Hop from = this.leg.hop();
-			Hop client = client();
-			int length = data.readableBytes();
-			client.encoder()
-				.writeData(client.ctx(), streamId, data.retainedSlice(), 0, endStream, client.newPromise(future -> {
-					consume(from, streamId, length);
-					if (endStream) {
-						responseWrittenLocked(exchange);
-					}
-				}));
+			exchange.responseFlow.data(data, endStream);
 			// padding is consumed at once
 			return padding;
 		}
@@ -1007,6 +1523,8 @@ final class NettyHttp2DemuxRelay {
 		public void onStreamClosed(Http2Stream stream) {
 			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.get(stream.id());
 			if (exchange != null && exchange.leg == this.leg) {
+				// nothing more reaches the upstream; what it sent goes on to the client
+				exchange.requestFlow.drop();
 				loseLocked(exchange);
 			}
 		}
@@ -1044,6 +1562,8 @@ final class NettyHttp2DemuxRelay {
 		private @Nullable Runnable onFinish;
 
 		private @Nullable Runnable release;
+
+		private @Nullable H2DemuxBudget budget;
 
 		private Builder() {
 		}
@@ -1127,6 +1647,12 @@ final class NettyHttp2DemuxRelay {
 		/** Frees the connection's slot; runs after {@code onFinish}. */
 		Builder release(Runnable release) {
 			this.release = release;
+			return this;
+		}
+
+		/** The queue budget the h2 demux relays share. */
+		Builder budget(H2DemuxBudget budget) {
+			this.budget = budget;
 			return this;
 		}
 

@@ -8,6 +8,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 import org.jspecify.annotations.Nullable;
@@ -28,7 +29,8 @@ import org.slf4j.LoggerFactory;
  * After each action the channels are settled: pending tasks run, every channel is flushed
  * and what it wrote moves to its hop's writer queue -- until no channel has anything more
  * to do, since a write on one hop can complete a promise whose listener writes on
- * another.
+ * another. Then the after-settle hook runs ({@link #afterSettle}), and again after a
+ * further settle for as long as it acts.
  * <p>
  * Netty schedules timers (the close after a GOAWAY, say) on the channel's executor, which
  * an {@code EmbeddedChannel} runs only when told to. A ticker thread sleeps until the
@@ -61,6 +63,9 @@ public final class Loop implements AutoCloseable {
 	private final Thread ticker;
 
 	private volatile boolean closed;
+
+	/** Run once the channels settled, until it reports nothing done; with the lock. */
+	private volatile @Nullable BooleanSupplier afterSettle;
 
 	/** Failures reported without the lock, for the next settle. */
 	private final Queue<Failure> pendingFailures = new ConcurrentLinkedQueue<>();
@@ -157,6 +162,15 @@ public final class Loop implements AutoCloseable {
 		}
 	}
 
+	/**
+	 * Has {@code hook} run with the lock each time the channels settled: what bridges the
+	 * hops reviews their state there. It returns whether it did anything to the channels
+	 * (a write, say); if so, the channels settle and the hook runs again.
+	 */
+	public void afterSettle(BooleanSupplier hook) {
+		this.afterSettle = hook;
+	}
+
 	/** Whether the ticker thread is alive; for tests. */
 	boolean tickerAlive() {
 		return this.ticker.isAlive();
@@ -185,18 +199,13 @@ public final class Loop implements AutoCloseable {
 		for (Failure failure = this.pendingFailures.poll(); failure != null; failure = this.pendingFailures.poll()) {
 			report(failure.source(), failure.cause());
 		}
-		for (int round = 0;; round++) {
-			boolean moved = false;
-			for (Hop hop : List.copyOf(this.hops)) {
-				moved |= hop.settleLocked();
-			}
-			if (!moved) {
-				break;
-			}
-			if (round == MAX_SETTLE_ROUNDS) {
-				// the channels keep writing to each other: a bug in the bridging code
-				report(this.name, new IllegalStateException(
-						"the channels did not settle within " + MAX_SETTLE_ROUNDS + " rounds; closing them"));
+		settleChannelsLocked();
+		BooleanSupplier hook = this.afterSettle;
+		for (int pass = 0; hook != null && runHook(hook); pass++) {
+			settleChannelsLocked();
+			if (pass == MAX_SETTLE_ROUNDS) {
+				report(this.name, new IllegalStateException("the after-settle hook kept acting for " + MAX_SETTLE_ROUNDS
+						+ " passes; closing the channels"));
 				List.copyOf(this.hops).forEach(hop -> {
 					hop.abortLocked();
 					hop.settleLocked();
@@ -215,6 +224,39 @@ public final class Loop implements AutoCloseable {
 		}
 		if (next != Long.MAX_VALUE) {
 			wakeTickerAt(next);
+		}
+	}
+
+	/** Runs the hook; what it throws is reported, and counts as nothing done. */
+	private boolean runHook(BooleanSupplier hook) {
+		try {
+			return hook.getAsBoolean();
+		}
+		catch (RuntimeException | Error e) {
+			report(this.name, e);
+			return false;
+		}
+	}
+
+	private void settleChannelsLocked() {
+		for (int round = 0;; round++) {
+			boolean moved = false;
+			for (Hop hop : List.copyOf(this.hops)) {
+				moved |= hop.settleLocked();
+			}
+			if (!moved) {
+				break;
+			}
+			if (round == MAX_SETTLE_ROUNDS) {
+				// the channels keep writing to each other: a bug in the bridging code
+				report(this.name, new IllegalStateException(
+						"the channels did not settle within " + MAX_SETTLE_ROUNDS + " rounds; closing them"));
+				List.copyOf(this.hops).forEach(hop -> {
+					hop.abortLocked();
+					hop.settleLocked();
+				});
+				break;
+			}
 		}
 	}
 
