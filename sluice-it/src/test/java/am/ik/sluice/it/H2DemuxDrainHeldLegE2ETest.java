@@ -108,16 +108,15 @@ class H2DemuxDrainHeldLegE2ETest {
 			h2.halfClose();
 			long ended = System.nanoTime();
 			ScriptedH2Upstream.Connection leg = upstream.awaitConnection(0, Duration.ofSeconds(5));
-			long delivered = leg.frames()
-				.stream()
-				.filter(frame -> frame.type() == TestH2.DATA)
-				.mapToLong(frame -> frame.payload().length)
-				.sum();
-			assertThat(delivered).as("request bytes the upstream got: its window, not the body")
-				.isLessThanOrEqualTo(UPSTREAM_WINDOW)
-				.isGreaterThan(0);
+			// the request DATA crosses the tunnel after the response came back
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.alias("the upstream got its window of the body")
+				.until(() -> delivered(leg) == UPSTREAM_WINDOW);
 			// the drain waits on the leg: past the half-close the leg is still there
 			assertThat(h2.awaitTrue(h2::closed, Duration.ofMillis(1000))).as("the drain is waiting").isFalse();
+			assertThat(delivered(leg)).as("request bytes the upstream got: its window, not the body")
+				.isEqualTo(UPSTREAM_WINDOW);
 			assertThat(leg.awaitEof(Duration.ofMillis(10))).as("the leg is held").isFalse();
 			assertThat(admitted()).isEqualTo(1);
 			assertThat(h2.awaitTrue(h2::closed, Duration.ofSeconds(5))).as("closed at the idle timeout").isTrue();
@@ -129,6 +128,15 @@ class H2DemuxDrainHeldLegE2ETest {
 		}
 		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> admitted() == 0);
 		assertThat(idleClosed()).isEqualTo(idle + 1);
+	}
+
+	/** The request bytes the upstream got. */
+	private static long delivered(ScriptedH2Upstream.Connection leg) {
+		return leg.frames()
+			.stream()
+			.filter(frame -> frame.type() == TestH2.DATA)
+			.mapToLong(frame -> frame.payload().length)
+			.sum();
 	}
 
 	private void startClient(ScriptedH2Upstream upstream) {
