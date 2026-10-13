@@ -131,10 +131,17 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 		double refusedBefore = refused("waiting");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5, 7, 9, 11, 13, 15)) {
 			TestUpstream upstream = openOneAndQueueBehindIt(client, upstreams, route, 15);
-			assertThat(withheld()).as("the window was withheld: the queue past the allowance, the budget exhausted")
-				.isGreaterThan(withheldBefore);
-			assertThat(queuedBytes(route)).as("the waiting streams hold at most the allowance")
-				.isLessThanOrEqualTo(NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE);
+			// the relay's action counts the withheld window, then refuses the waiting
+			// streams, and the leg gauge follows once the action ends
+			Awaitility.await()
+				.atMost(TIMEOUT)
+				.untilAsserted(() -> assertThat(withheld())
+					.as("the window was withheld: the queue past the allowance, the budget exhausted")
+					.isGreaterThan(withheldBefore));
+			Awaitility.await()
+				.atMost(TIMEOUT)
+				.untilAsserted(() -> assertThat(queuedBytes(route)).as("the waiting streams hold at most the allowance")
+					.isLessThanOrEqualTo(NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE));
 			completeAndDrain(client, upstream, route);
 			assertThat(client.resets()).as("the waiting streams past the allowance were refused")
 				.containsOnlyKeys(7, 9, 11, 13, 15)
@@ -172,7 +179,11 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 				}
 				assertThat(budgetUsed()).as("the stalled connection exhausted the budget")
 					.isGreaterThanOrEqualTo(BUDGET);
-				assertThat(withheld()).as("the stalled connection's window was withheld").isGreaterThan(withheldBefore);
+				// counted by the relay's action after it charged the budget
+				Awaitility.await()
+					.atMost(TIMEOUT)
+					.untilAsserted(() -> assertThat(withheld()).as("the stalled connection's window was withheld")
+						.isGreaterThan(withheldBefore));
 				assertThat(client.resets()).as("nothing refused before the open stream sends").isEmpty();
 				completeAndDrain(client, upstream, route);
 				assertThat(client.resets()).as("the waiting streams past the allowance were refused")
