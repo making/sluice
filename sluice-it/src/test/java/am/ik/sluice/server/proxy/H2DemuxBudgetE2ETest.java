@@ -81,15 +81,16 @@ class H2DemuxBudgetE2ETest {
 	private static final long BUDGET = 3 * NettyHttp2DemuxRelay.CONNECTION_WINDOW;
 
 	/**
-	 * Streams per stalled connection: their stream budgets add up far past the budget.
+	 * Streams per stalled connection: their stream windows add up far past the budget.
 	 */
 	private static final int STREAMS = 20;
 
 	/**
-	 * Request body per stream, a stream window: the streams' bodies pass by far what the
-	 * tunnel and the upstream's socket absorb.
+	 * The request body of a stalled stream: no end until the test ends it, so its
+	 * connection sends until its window is withheld, whatever the tunnel and the
+	 * upstream's socket absorb before the relay holds anything.
 	 */
-	private static final int BODY = NettyHttp2DemuxRelay.STREAM_WINDOW;
+	private static final long UNBOUNDED = Long.MAX_VALUE;
 
 	private static final int MAX_FRAME_SIZE = 16 * 1024;
 
@@ -148,20 +149,21 @@ class H2DemuxBudgetE2ETest {
 	}
 
 	/**
-	 * Two connections whose upstream does not read, twenty streams each: together they
-	 * stop at the budget plus what each queues outside it -- far below the 40MiB of their
-	 * bodies, which their stream windows allow -- with the budget exhausted and their
-	 * windows withheld, yet no stream is reset and no connection torn down; once the
-	 * upstream reads, every stream completes and the budget is released.
+	 * Two connections whose upstream does not read, twenty streams each sending without
+	 * end: together they stop at the budget plus what each queues outside it -- far below
+	 * what their stream windows allow -- with the budget exhausted and their windows
+	 * withheld, yet no stream is reset and no connection torn down; once the upstream
+	 * reads, every stream completes and the budget is released.
 	 */
 	@Test
 	void stalledConnectionsStopAtTheBudgetAndCompleteOnceTheUpstreamReads() throws Exception {
 		assertThat(budgetGauge()).as("the configured budget took effect").isEqualTo(BUDGET);
 		String route = "bud.stall.test";
 		CountDownLatch gate = new CountDownLatch(1);
-		startClient(route, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
+		AtomicInteger heads = new AtomicInteger();
+		startClient(route, stub(socket -> serveGated(socket, gate, heads)));
 		double withheldBefore = withheld();
-		try (Stalled first = stall(route); Stalled second = stall(route)) {
+		try (Stalled first = stall(route, heads); Stalled second = stall(route, heads)) {
 			awaitExhausted();
 			long maxQueued = awaitStable(() -> queuedBytes(route));
 			assertThat(maxQueued).as("queued at most: the budget plus each connection's unbudgeted bound")
@@ -173,6 +175,8 @@ class H2DemuxBudgetE2ETest {
 			assertThat(first.client().resets()).isEmpty();
 			assertThat(second.client().resets()).isEmpty();
 			gate.countDown();
+			first.end();
+			second.end();
 			first.awaitEnds();
 			second.awaitEnds();
 			assertThat(first.client().goAwayCode()).isEqualTo(-1);
@@ -193,9 +197,10 @@ class H2DemuxBudgetE2ETest {
 		String stalledRoute = "bud.held.test";
 		String flowingRoute = "bud.flowing.test";
 		CountDownLatch gate = new CountDownLatch(1);
-		startClient(stalledRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
+		AtomicInteger heads = new AtomicInteger();
+		startClient(stalledRoute, stub(socket -> serveGated(socket, gate, heads)));
 		startClient(flowingRoute, stub(H2DemuxBudgetE2ETest::answerEndedRequestsSlowly));
-		try (Stalled first = stall(stalledRoute); Stalled second = stall(stalledRoute)) {
+		try (Stalled first = stall(stalledRoute, heads); Stalled second = stall(stalledRoute, heads)) {
 			awaitExhausted();
 			awaitStable(() -> queuedBytes(stalledRoute));
 			assertThat(budgetUsed()).as("exhausted before").isGreaterThanOrEqualTo(BUDGET);
@@ -222,6 +227,8 @@ class H2DemuxBudgetE2ETest {
 				.isGreaterThan(withheldBefore);
 			assertThat(budgetUsed()).as("still exhausted after").isGreaterThanOrEqualTo(BUDGET);
 			gate.countDown();
+			first.end();
+			second.end();
 			first.awaitEnds();
 			second.awaitEnds();
 		}
@@ -241,7 +248,7 @@ class H2DemuxBudgetE2ETest {
 		AtomicInteger heads = new AtomicInteger();
 		startClient(route, stub(socket -> serveGated(socket, gate, heads)));
 		double refusedBefore = refused("budget");
-		try (Stalled first = stall(route); Stalled second = stall(route)) {
+		try (Stalled first = stall(route, heads); Stalled second = stall(route, heads)) {
 			awaitExhausted();
 			awaitStable(() -> queuedBytes(route));
 			assertThat(budgetUsed()).as("exhausted").isGreaterThanOrEqualTo(BUDGET);
@@ -260,6 +267,8 @@ class H2DemuxBudgetE2ETest {
 				assertThat(fresh.reset(1)).isNull();
 			}
 			gate.countDown();
+			first.end();
+			second.end();
 			first.awaitEnds();
 			second.awaitEnds();
 		}
@@ -287,7 +296,8 @@ class H2DemuxBudgetE2ETest {
 		int late = 1024;
 		H2TestClient client = H2TestClient.connect(dataPort, reset);
 		client.headers(reset, false, head(route, "/reset"));
-		try (Stalled first = open(client, route, 1, BODY, body + late); Stalled second = stall(route)) {
+		try (Stalled first = open(client, route, 1, UNBOUNDED, body + late, log.heads());
+				Stalled second = stall(route, log.heads())) {
 			// the first connection may stop at its share before the second exhausts the
 			// budget
 			first.awaitWithheld();
@@ -316,12 +326,13 @@ class H2DemuxBudgetE2ETest {
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(client.closed()).isFalse();
 			gate.countDown();
-			first.resume();
+			first.end();
+			second.end();
 			first.awaitEnds();
 			second.awaitEnds();
 			client.headers(after, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/after"));
 			assertThat(client.awaitEnd(after, Duration.ofSeconds(10))).isTrue();
-			assertThat(log.heads.get(after)).as("the next stream's head")
+			assertThat(log.requestHeads.get(after)).as("the next stream's head")
 				.isEqualTo(List.of(":authority: " + route, ":method: GET", ":path: /after"));
 			Awaitility.await()
 				.atMost(Duration.ofSeconds(5))
@@ -352,12 +363,14 @@ class H2DemuxBudgetE2ETest {
 		String heldRoute = "bud.wake.held.test";
 		String waitingRoute = "bud.wake.waiting.test";
 		CountDownLatch gate = new CountDownLatch(1);
-		startClient(heldRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
-		startClient(waitingRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
-		try (Stalled first = stall(heldRoute); Stalled second = stall(heldRoute)) {
+		AtomicInteger heldHeads = new AtomicInteger();
+		AtomicInteger waitingHeads = new AtomicInteger();
+		startClient(heldRoute, stub(socket -> serveGated(socket, gate, heldHeads)));
+		startClient(waitingRoute, stub(socket -> serveGated(socket, gate, waitingHeads)));
+		try (Stalled first = stall(heldRoute, heldHeads); Stalled second = stall(heldRoute, heldHeads)) {
 			awaitExhausted();
 			awaitStable(() -> queuedBytes(heldRoute));
-			try (Stalled waiting = stall(waitingRoute)) {
+			try (Stalled waiting = stall(waitingRoute, waitingHeads)) {
 				waiting.awaitWithheld();
 				awaitStable(() -> queuedBytes(waitingRoute));
 				assertThat(budgetUsed()).as("exhausted").isGreaterThanOrEqualTo(BUDGET);
@@ -376,6 +389,7 @@ class H2DemuxBudgetE2ETest {
 					.isTrue();
 				assertThat(waiting.client().closed()).isFalse();
 				gate.countDown();
+				waiting.end();
 				waiting.awaitEnds();
 			}
 		}
@@ -394,8 +408,9 @@ class H2DemuxBudgetE2ETest {
 	void clientsGoneWhileWithheldReleaseTheBudget() throws Exception {
 		String route = "bud.gone.test";
 		CountDownLatch gate = new CountDownLatch(1);
-		startClient(route, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
-		try (Stalled first = stall(route); Stalled second = stall(route)) {
+		AtomicInteger heads = new AtomicInteger();
+		startClient(route, stub(socket -> serveGated(socket, gate, heads)));
+		try (Stalled first = stall(route, heads); Stalled second = stall(route, heads)) {
 			awaitExhausted();
 			awaitStable(() -> queuedBytes(route));
 			assertThat(budgetUsed()).as("exhausted").isGreaterThanOrEqualTo(BUDGET);
@@ -410,32 +425,30 @@ class H2DemuxBudgetE2ETest {
 	}
 
 	/**
-	 * A connection opening {@link #STREAMS} streams on the route, each sending
-	 * {@link #BODY} bytes as fast as its windows admit.
+	 * A connection opening {@link #STREAMS} streams on the route, each sending without
+	 * end as fast as its windows admit once the route's upstream counted their heads in
+	 * {@code heads}.
 	 */
-	private Stalled stall(String route) throws Exception {
-		return open(route, STREAMS, BODY);
-	}
-
-	/**
-	 * A connection opening {@code streams} streams on the route, each sending
-	 * {@code body} bytes as fast as its windows admit.
-	 */
-	private Stalled open(String route, int streams, int body) throws Exception {
-		Stalled stalled = new Stalled(H2TestClient.connect(dataPort), 0, streams, body, 0);
-		stalled.open(route);
-		stalled.start();
-		return stalled;
+	private Stalled stall(String route, AtomicInteger heads) throws Exception {
+		return open(H2TestClient.connect(dataPort), route, 0, UNBOUNDED, 0, heads);
 	}
 
 	/**
 	 * Opens {@link #STREAMS} streams on the route over the client, the first one at the
-	 * stream index {@code first}, each sending {@code body} bytes as fast as its windows
-	 * admit, while leaving {@code reserve} bytes of the connection window unspent.
+	 * stream index {@code first}, and waits until the route's upstream counted their
+	 * heads in {@code heads}; then each sends {@code body} bytes as fast as its windows
+	 * admit, while leaving {@code reserve} bytes of the connection window unspent. A
+	 * stream whose head has not reached the upstream may wait for the leg's first
+	 * SETTINGS (concurrency one until then); waiting streams past the allowance are
+	 * refused once the windows are withheld, their DATA void, so the relay would hold
+	 * less than the connection sent.
 	 */
-	private static Stalled open(H2TestClient client, String route, int first, int body, int reserve) throws Exception {
+	private static Stalled open(H2TestClient client, String route, int first, long body, int reserve,
+			AtomicInteger heads) throws Exception {
+		int before = heads.get();
 		Stalled stalled = new Stalled(client, first, STREAMS, body, reserve);
 		stalled.open(route);
+		Awaitility.await().atMost(Duration.ofSeconds(30)).until(() -> heads.get() >= before + STREAMS);
 		stalled.start();
 		return stalled;
 	}
@@ -467,7 +480,7 @@ class H2DemuxBudgetE2ETest {
 		/** The stream index of the first stream. */
 		private final int first;
 
-		Stalled(H2TestClient client, int first, int streams, int body, int reserve) {
+		Stalled(H2TestClient client, int first, int streams, long body, int reserve) {
 			this.client = client;
 			this.first = first;
 			this.remaining = new long[streams];
@@ -505,6 +518,11 @@ class H2DemuxBudgetE2ETest {
 						}
 						done = false;
 						int id = id(i);
+						if (this.client.reset(id) != null) {
+							// nothing more to send on a stream the relay reset
+							this.remaining[i] = 0;
+							continue;
+						}
 						long window = Math.min(this.client.sendable(id), this.client.connectionWindow() - this.reserve);
 						int n = (int) Math.min(Math.min(this.remaining[i], window), MAX_FRAME_SIZE);
 						if (n > 0) {
@@ -555,10 +573,19 @@ class H2DemuxBudgetE2ETest {
 			}
 		}
 
-		/** Starts the pump again after {@link #stop()}. */
-		void resume() {
-			this.stop.set(false);
-			start();
+		/**
+		 * Stops the pump and ends every stream still sending with an empty DATA frame
+		 * carrying END_STREAM, which takes no window.
+		 */
+		void end() throws IOException, InterruptedException {
+			stop();
+			for (int i = 0; i < this.remaining.length; i++) {
+				int id = id(i);
+				if (this.remaining[i] != 0 && this.client.reset(id) == null) {
+					this.remaining[i] = 0;
+					this.client.sendData(id, new byte[0], TestH2.FLAG_END_STREAM);
+				}
+			}
 		}
 
 		/** Waits until every stream sent its body and got its response. */
@@ -695,6 +722,7 @@ class H2DemuxBudgetE2ETest {
 			while (gate.getCount() > 0 && seen < STREAMS && (frame = TestH2.readFrame(in)) != null) {
 				if (frame.type() == TestH2.HEADERS) {
 					decoder.decodeHeaders(frame.streamId(), Unpooled.wrappedBuffer(frame.payload()));
+					log.heads.incrementAndGet();
 					seen++;
 					TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, frame.streamId(),
 							TestH2.int32(Integer.MAX_VALUE - 65535));
@@ -708,7 +736,7 @@ class H2DemuxBudgetE2ETest {
 					log.afterReset.add("type=%d stream=%d".formatted(frame.type(), streamId));
 				}
 				if (frame.type() == TestH2.HEADERS) {
-					log.heads.put(streamId,
+					log.requestHeads.put(streamId,
 							lines(decoder.decodeHeaders(streamId, Unpooled.wrappedBuffer(frame.payload()))));
 					TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, streamId, TestH2.int32(Integer.MAX_VALUE - 65535));
 				}
@@ -735,13 +763,16 @@ class H2DemuxBudgetE2ETest {
 	}
 
 	/**
-	 * What the gated upstreams of a route saw once their gate opened, across their
-	 * connections: request heads (decoded, by stream), resets (error code by stream), and
-	 * frames on a stream after its reset.
+	 * What the gated upstreams of a route saw, across their connections: the request
+	 * heads read before the gate opened (counted), and once it opened, request heads
+	 * (decoded, by stream), resets (error code by stream), and frames on a stream after
+	 * its reset.
 	 */
 	private static final class UpstreamLog {
 
-		private final Map<Integer, List<String>> heads = new ConcurrentHashMap<>();
+		private final AtomicInteger heads = new AtomicInteger();
+
+		private final Map<Integer, List<String>> requestHeads = new ConcurrentHashMap<>();
 
 		private final Map<Integer, Integer> resets = new ConcurrentHashMap<>();
 
@@ -752,6 +783,11 @@ class H2DemuxBudgetE2ETest {
 		 * connection per route.
 		 */
 		private final AtomicReference<@Nullable OutputStream> idle = new AtomicReference<>();
+
+		/** The request heads read before the gate opened. */
+		AtomicInteger heads() {
+			return this.heads;
+		}
 
 		/** Waits until the route's upstream stopped reading for the gate. */
 		OutputStream awaitIdle() {
