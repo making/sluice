@@ -35,7 +35,6 @@ import am.ik.sluice.server.proxy.hop.Loop;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import am.ik.sluice.server.tunnel.TunnelSession;
-import am.ik.sluice.tunnel.ConnectionLimit;
 import am.ik.sluice.tunnel.DuplexPipe;
 import am.ik.sluice.tunnel.StreamRelay;
 import am.ik.sluice.tunnel.VirtualConnection;
@@ -883,8 +882,8 @@ final class NettyHttp2DemuxRelay {
 				releaseOwnSlot();
 			};
 		}
-		ConnectionLimit.Permit permit = this.legSlots.tryAcquire();
-		return permit == null ? null : permit::release;
+		ConnectionReserve.Reservation reservation = this.legSlots.tryAcquire();
+		return reservation == null ? null : reservation::release;
 	}
 
 	/**
@@ -1319,6 +1318,7 @@ final class NettyHttp2DemuxRelay {
 		this.meters.reviewed();
 		watchWritesLocked(true);
 		long queued = queuedLocked();
+		this.meters.held(queued - this.queued);
 		this.queued = queued;
 		settleShareLocked(queued);
 		boolean wrote = false;
@@ -1503,6 +1503,8 @@ final class NettyHttp2DemuxRelay {
 	 */
 	private void closeAccountsLocked() {
 		this.accountsClosed = true;
+		this.meters.held(-this.queued);
+		this.queued = 0;
 		this.budget.cancel(this.budgetRoom);
 		settleShareLocked(0);
 		for (Leg leg : this.opened) {
@@ -2201,12 +2203,15 @@ final class NettyHttp2DemuxRelay {
 
 	}
 
-	/** Hands out the slots of the connection limit further legs open on. */
+	/**
+	 * Hands out the slots of the connection limit further legs open on, with the bytes
+	 * they reserve.
+	 */
 	@FunctionalInterface
 	interface LegSlots {
 
-		/** A slot for one more leg, or null when the limit has none left. */
-		ConnectionLimit.@Nullable Permit tryAcquire();
+		/** A slot and the bytes for one more leg, or null when they do not fit. */
+		ConnectionReserve.@Nullable Reservation tryAcquire();
 
 	}
 

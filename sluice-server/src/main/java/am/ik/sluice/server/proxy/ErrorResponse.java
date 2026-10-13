@@ -28,8 +28,9 @@ import org.springframework.stereotype.Component;
  * closes: the 503 no-route page for a request no tunnel session can serve, the 403
  * forbidden page for a peer address the access control excludes, a bare HTTP/1.1 400 for
  * a malformed request, the HTTP/2 502 page for a stream its upstream lost, a bodiless
- * HTTP/2 421 for a stream of a route reached over HTTP/1.1 only, and a GOAWAY
- * {@code COMPRESSION_ERROR} for an HTTP/2 head whose header block does not decode.
+ * HTTP/2 421 for a stream of a route reached over HTTP/1.1 only, a GOAWAY
+ * {@code COMPRESSION_ERROR} for an HTTP/2 head whose header block does not decode, and a
+ * GOAWAY processing no stream for an HTTP/2 connection past the connection limit.
  */
 @Component
 public class ErrorResponse {
@@ -41,6 +42,9 @@ public class ErrorResponse {
 
 	/** The HTTP/2 error code of a header block that does not decode (RFC 9113 7). */
 	private static final int COMPRESSION_ERROR = 0x9;
+
+	/** The debug data of the GOAWAY of {@link #connectionLimit()}. */
+	static final String CONNECTION_LIMIT = "connection limit";
 
 	private static final byte[] BAD_REQUEST = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 		.getBytes(StandardCharsets.US_ASCII);
@@ -87,6 +91,21 @@ public class ErrorResponse {
 		Http2Frames frames = new Http2Frames(0);
 		frames.write(Http2Frame.SETTINGS, new byte[0]);
 		frames.write(Http2Frame.GOAWAY, ByteBuffer.allocate(8).putInt(0).putInt(COMPRESSION_ERROR).array());
+		return frames.toByteArray();
+	}
+
+	/**
+	 * The HTTP/2 answer to a connection the server cannot relay as h2 for want of the
+	 * bytes its relay reserves: the server preface (SETTINGS) and a GOAWAY
+	 * {@code NO_ERROR} naming no stream as processed, so the client may retry its
+	 * requests on another connection (RFC 9113 6.8), with {@code connection limit} as its
+	 * debug data.
+	 */
+	public byte[] connectionLimit() {
+		Http2Frames frames = new Http2Frames(0);
+		frames.write(Http2Frame.SETTINGS, new byte[0]);
+		byte[] debug = CONNECTION_LIMIT.getBytes(StandardCharsets.US_ASCII);
+		frames.write(Http2Frame.GOAWAY, ByteBuffer.allocate(8 + debug.length).putInt(0).putInt(0).put(debug).array());
 		return frames.toByteArray();
 	}
 

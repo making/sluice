@@ -366,8 +366,9 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	/**
 	 * Data plane connection limits, shared by the data port and every tcp route port.
 	 *
-	 * @param maxConnections connections open at once; {@code 0} = derived from the
-	 * maximum heap so the worst-case buffering of every connection fits in half of it
+	 * @param maxConnections connections open at once (an h2 connection counts once per
+	 * upstream connection open at once); {@code 0} = derived: {@code connectionMemory}
+	 * over what one connection reserves at accept
 	 * @param maxConnectionsPerAddress connections open at once from one source address
 	 * (the PROXY protocol source when {@code proxy-protocol} is on, the socket peer
 	 * otherwise); {@code 0} = no limit beyond {@code maxConnections}
@@ -413,6 +414,12 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * ({@code RESOURCE_EXHAUSTED}); a non-positive value falls back to the default
 	 * @param maxPendingTunnelStreamsPerAddress the same from one source address (the gRPC
 	 * peer); {@code 0} = no limit beyond {@code maxPendingTunnelStreams}
+	 * @param connectionMemory bytes the data plane's connections may reserve for their
+	 * worst-case buffering at once, the h2 queue budget aside: each connection reserves
+	 * what its tunnel connection buffers at accept, an h2 connection what its relay holds
+	 * outside the budget too, each further upstream connection of an h2 connection both;
+	 * {@code 0} = half the maximum heap less the h2 queue budget, or no bound with
+	 * {@code maxConnections} configured
 	 */
 	public record Limits(@DefaultValue("0") int maxConnections, @DefaultValue("0") int maxConnectionsPerAddress,
 			@DefaultValue("10s") Duration headTimeout, @DefaultValue("60s") Duration idleTimeout,
@@ -421,7 +428,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			@DefaultValue("16KB") DataSize stallMinBytes, @DefaultValue("60s") Duration tunnelStallTimeout,
 			@DefaultValue("0") Duration verbatimIdleTimeout, @DefaultValue("10s") Duration advertiseTimeout,
 			@DefaultValue("256") int maxPendingTunnelStreams, @DefaultValue("0") int maxPendingTunnelStreamsPerAddress,
-			@DefaultValue("1024") int maxTunnelSessions, @DefaultValue("0") int maxTunnelSessionsPerAddress) {
+			@DefaultValue("1024") int maxTunnelSessions, @DefaultValue("0") int maxTunnelSessionsPerAddress,
+			@DefaultValue("0") DataSize connectionMemory) {
 
 		/** The default of {@code maxPendingTunnelStreams}. */
 		public static final int DEFAULT_MAX_PENDING_TUNNEL_STREAMS = 256;
@@ -456,6 +464,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			maxPendingTunnelStreamsPerAddress = Math.max(0, maxPendingTunnelStreamsPerAddress);
 			maxTunnelSessions = maxTunnelSessions > 0 ? maxTunnelSessions : DEFAULT_MAX_TUNNEL_SESSIONS;
 			maxTunnelSessionsPerAddress = Math.max(0, maxTunnelSessionsPerAddress);
+			connectionMemory = connectionMemory == null || connectionMemory.isNegative() ? DataSize.ofBytes(0)
+					: connectionMemory;
 		}
 
 		public static Builder builder() {
@@ -495,6 +505,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			private int maxTunnelSessions = DEFAULT_MAX_TUNNEL_SESSIONS;
 
 			private int maxTunnelSessionsPerAddress;
+
+			@Nullable private DataSize connectionMemory;
 
 			private Builder() {
 			}
@@ -579,6 +591,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder connectionMemory(DataSize connectionMemory) {
+				this.connectionMemory = connectionMemory;
+				return this;
+			}
+
 			public Limits build() {
 				return new Limits(this.maxConnections, this.maxConnectionsPerAddress,
 						this.headTimeout == null ? Duration.ofSeconds(10) : this.headTimeout,
@@ -592,7 +609,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 						this.verbatimIdleTimeout,
 						this.advertiseTimeout == null ? Duration.ofSeconds(10) : this.advertiseTimeout,
 						this.maxPendingTunnelStreams, this.maxPendingTunnelStreamsPerAddress, this.maxTunnelSessions,
-						this.maxTunnelSessionsPerAddress);
+						this.maxTunnelSessionsPerAddress,
+						this.connectionMemory == null ? DataSize.ofBytes(0) : this.connectionMemory);
 			}
 
 		}

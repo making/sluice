@@ -30,31 +30,41 @@ import io.micrometer.core.instrument.MeterRegistry;
 
 /**
  * The limits every data plane connection lives under, shared by the data port and every
- * tcp route port: a cap on the connections open at once, a cap per source address, and
- * one deadline for the whole head phase; the deadlines between and during the requests of
- * a relayed HTTP connection, and the idle deadline of a connection relayed verbatim
- * ({@link KeepAliveDeadline}); plus the queue budget the h2 demux relays share.
+ * tcp route port: a cap on the connections open at once and on the bytes they reserve, a
+ * cap per source address, and one deadline for the whole head phase; the deadlines
+ * between and during the requests of a relayed HTTP connection, and the idle deadline of
+ * a connection relayed verbatim ({@link KeepAliveDeadline}); plus the queue budget the h2
+ * demux relays share.
  * <p>
- * The connection cap counts virtual connections: an h2 connection whose streams reach
- * several routes takes one more slot per further leg open at once
- * ({@link #tryAcquireLeg()}). An unset cap is derived so that the worst case of every
- * slot -- the buffering of one virtual connection
- * ({@link ConnectionLimit#CONNECTION_BYTES}) plus what an h2 demux relay holds outside
- * the budget ({@link NettyHttp2DemuxRelay#UNBUDGETED_BYTES}) and what one of its legs
- * adds ({@link NettyHttp2DemuxRelay#RESPONSE_QUEUE_BYTES}) -- and the budget fit in half
- * the maximum heap.
+ * Each connection reserves the worst case of what it buffers once its protocol tells what
+ * that is ({@link ConnectionReserve}): at accept the buffering of the virtual connection
+ * every connection is relayed over ({@link #connectionBytes()}); an h2 connection, once
+ * its protocol is chosen, also what its demux relay holds outside the queue budget
+ * ({@link #h2RelayBytes()}, {@link Admission#reserveH2Relay()}); each further leg of an
+ * h2 connection open at once a slot of its own with its virtual connection and its part
+ * outside the budget ({@link #legBytes()}, {@link #tryAcquireLeg()}). So the bytes
+ * reserved and the budget bound the buffering of every connection open, whatever its
+ * protocol, and an HTTP/1.1, passthrough or tcp connection reserves no h2 relay's worst
+ * case. The reservable bytes default to half the maximum heap less the budget, and the
+ * cap on connections to the connections reserving {@link #connectionBytes()} each that
+ * they hold; a configured cap with no configured bytes leaves the bytes unbounded, the
+ * cap alone counting.
  * <p>
  * A connection is admitted at accept ({@link #admit}) and holds its {@link Admission}
  * until it ended and the frames its virtual connections queued left the tunnel sender (a
  * stream that stays not ready keeps them, and the slots, until the session ends);
- * {@link Admission#release()} frees its slots and may be called on every exit path, only
- * the first call counts. A connection over a limit is closed without being read.
- * Rejections are counted as {@code sluice.data.connections.rejected} by {@code reason}
- * ({@code limit}, {@code address-limit}, {@code head-timeout}) and logged through the
- * access log's rate limit. Connections closed for idling between requests count as
- * {@code sluice.data.connections.idle.closed}, those closed for stalling an exchange as
- * {@code sluice.data.connections.stall.closed}, connections relayed verbatim closed for
- * relaying nothing as {@code sluice.data.connections.verbatim.idle.closed}.
+ * {@link Admission#release()} frees its slot and bytes and may be called on every exit
+ * path, only the first call counts. A connection over a limit is closed without being
+ * read. Rejections are counted as {@code sluice.data.connections.rejected} by
+ * {@code reason} ({@code limit}, {@code address-limit}, {@code head-timeout};
+ * {@code h2-limit}: an h2 connection whose relay did not fit, answered with a GOAWAY) and
+ * logged through the access log's rate limit; a TLS connection offering h2 and HTTP/1.1
+ * whose relay does not fit is given HTTP/1.1, counted as
+ * {@code sluice.data.connections.h2.declined}. Connections closed for idling between
+ * requests count as {@code sluice.data.connections.idle.closed}, those closed for
+ * stalling an exchange as {@code sluice.data.connections.stall.closed}, connections
+ * relayed verbatim closed for relaying nothing as
+ * {@code sluice.data.connections.verbatim.idle.closed}.
  */
 @Component
 public class ConnectionLimits implements DisposableBean {
@@ -63,7 +73,7 @@ public class ConnectionLimits implements DisposableBean {
 
 	private static final String REJECTED = "sluice.data.connections.rejected";
 
-	private final ConnectionLimit global;
+	private final ConnectionReserve reserve;
 
 	private final H2DemuxBudget h2Budget;
 
@@ -91,6 +101,10 @@ public class ConnectionLimits implements DisposableBean {
 
 	private final Counter rejectedHeadTimeout;
 
+	private final Counter rejectedH2Limit;
+
+	private final Counter h2Declined;
+
 	private final Counter idleClosed;
 
 	private final Counter stallClosed;
@@ -102,10 +116,13 @@ public class ConnectionLimits implements DisposableBean {
 		long maxHeap = Runtime.getRuntime().maxMemory();
 		long budget = limits.h2QueueBudget().toBytes() > 0 ? limits.h2QueueBudget().toBytes() : deriveBudget(maxHeap);
 		this.h2Budget = new H2DemuxBudget(budget);
-		this.global = new ConnectionLimit(
-				limits.maxConnections() > 0 ? limits.maxConnections() : deriveMaxConnections(maxHeap, budget));
+		long configuredMemory = limits.connectionMemory().toBytes();
+		long memory = configuredMemory > 0 ? configuredMemory
+				: limits.maxConnections() > 0 ? ConnectionReserve.UNBOUNDED : deriveMemory(maxHeap, budget);
+		this.reserve = new ConnectionReserve(
+				limits.maxConnections() > 0 ? limits.maxConnections() : deriveMaxConnections(memory), memory);
 		int perAddress = limits.maxConnectionsPerAddress();
-		this.maxPerAddress = perAddress > 0 ? Math.min(perAddress, this.global.max()) : this.global.max();
+		this.maxPerAddress = perAddress > 0 ? Math.min(perAddress, this.reserve.maxSlots()) : this.reserve.maxSlots();
 		this.headTimeout = limits.headTimeout();
 		this.idleTimeout = limits.idleTimeout();
 		this.stallTimeout = limits.stallTimeout();
@@ -118,6 +135,11 @@ public class ConnectionLimits implements DisposableBean {
 		this.rejectedLimit = rejected(meterRegistry, "limit");
 		this.rejectedAddressLimit = rejected(meterRegistry, "address-limit");
 		this.rejectedHeadTimeout = rejected(meterRegistry, "head-timeout");
+		this.rejectedH2Limit = rejected(meterRegistry, "h2-limit");
+		this.h2Declined = Counter.builder("sluice.data.connections.h2.declined")
+			.description("TLS connections offering h2 and HTTP/1.1 given HTTP/1.1, the bytes an h2 relay reserves "
+					+ "not fitting")
+			.register(meterRegistry);
 		this.idleClosed = Counter.builder("sluice.data.connections.idle.closed")
 			.description("Data plane connections closed after idling between requests for the idle timeout")
 			.register(meterRegistry);
@@ -129,11 +151,19 @@ public class ConnectionLimits implements DisposableBean {
 			.description("Data plane connections relayed verbatim closed after relaying no byte in either direction "
 					+ "for the verbatim idle timeout")
 			.register(meterRegistry);
-		Gauge.builder("sluice.data.connections.limit", this.global, ConnectionLimit::max)
+		Gauge.builder("sluice.data.connections.limit", this.reserve, ConnectionReserve::maxSlots)
 			.description("Data plane connections allowed open at once")
 			.register(meterRegistry);
-		Gauge.builder("sluice.data.connections.admitted", this.global, ConnectionLimit::open)
+		Gauge.builder("sluice.data.connections.admitted", this.reserve, ConnectionReserve::slots)
 			.description("Data plane connections and further h2 demux legs holding a slot of the connection limit")
+			.register(meterRegistry);
+		if (memory != ConnectionReserve.UNBOUNDED) {
+			Gauge.builder("sluice.data.connections.memory.bytes", this.reserve, ConnectionReserve::maxBytes)
+				.description("Bytes the data plane connections may reserve for their worst-case buffering")
+				.register(meterRegistry);
+		}
+		Gauge.builder("sluice.data.connections.memory.reserved.bytes", this.reserve, ConnectionReserve::bytes)
+			.description("Bytes the data plane connections reserve for their worst-case buffering")
 			.register(meterRegistry);
 		Gauge.builder("sluice.h2demux.budget.bytes", this.h2Budget, H2DemuxBudget::max)
 			.description("Bytes the h2 demux relays may queue beyond their per-connection allowance, shared")
@@ -142,24 +172,43 @@ public class ConnectionLimits implements DisposableBean {
 			.description("Bytes the h2 demux relays queue beyond their per-connection allowance")
 			.register(meterRegistry);
 		log.info(
-				"data plane connection limit {} ({}), per address {}, head timeout {}, idle timeout {}, stall timeout {} per {}B, verbatim idle timeout {}, h2 queue budget {}KiB ({})",
-				this.global.max(),
+				"data plane connection limit {} ({}), connection memory {} ({}; a connection reserves {}KiB, an h2 connection {}KiB more, a further upstream connection of it {}KiB), per address {}, head timeout {}, idle timeout {}, stall timeout {} per {}B, verbatim idle timeout {}, h2 queue budget {}KiB ({})",
+				this.reserve.maxSlots(),
 				limits.maxConnections() > 0 ? "configured"
-						: "derived: (half of max heap %dMiB - h2 queue budget) / %dKiB per connection"
-							.formatted(maxHeap >> 20, connectionBytes() >> 10),
-				this.maxPerAddress, this.headTimeout, this.idleTimeout, this.stallTimeout, this.stallMinBytes,
+						: "derived: connection memory / %dKiB per connection".formatted(connectionBytes() >> 10),
+				memory == ConnectionReserve.UNBOUNDED ? "unbounded" : (memory >> 10) + "KiB",
+				configuredMemory > 0 ? "configured"
+						: limits.maxConnections() > 0 ? "the configured connection limit alone counts"
+								: "derived: half of max heap %dMiB - h2 queue budget".formatted(maxHeap >> 20),
+				connectionBytes() >> 10, h2RelayBytes() >> 10, legBytes() >> 10, this.maxPerAddress, this.headTimeout,
+				this.idleTimeout, this.stallTimeout, this.stallMinBytes,
 				this.verbatimIdleTimeout.isZero() ? "off (unless a route sets one)" : this.verbatimIdleTimeout,
 				budget >> 10,
 				limits.h2QueueBudget().toBytes() > 0 ? "configured" : "derived: an eighth of half of max heap");
 	}
 
 	/**
-	 * The worst case of one slot: a virtual connection plus what an h2 demux relay holds
-	 * outside the budget and what one leg adds, by the relay's per-hop bounds.
+	 * What every connection reserves at accept: the buffering of the virtual connection
+	 * it is relayed over, all an HTTP/1.1, passthrough or tcp connection buffers.
 	 */
 	static long connectionBytes() {
-		return ConnectionLimit.CONNECTION_BYTES + NettyHttp2DemuxRelay.UNBUDGETED_BYTES
-				+ NettyHttp2DemuxRelay.RESPONSE_QUEUE_BYTES;
+		return ConnectionLimit.CONNECTION_BYTES;
+	}
+
+	/**
+	 * What an h2 connection reserves besides: what its demux relay holds outside the
+	 * queue budget, and what its first leg adds, by the relay's per-hop bounds.
+	 */
+	static long h2RelayBytes() {
+		return NettyHttp2DemuxRelay.UNBUDGETED_BYTES + NettyHttp2DemuxRelay.RESPONSE_QUEUE_BYTES;
+	}
+
+	/**
+	 * What a further leg of an h2 connection reserves: its virtual connection and what it
+	 * adds outside the queue budget.
+	 */
+	static long legBytes() {
+		return ConnectionLimit.CONNECTION_BYTES + NettyHttp2DemuxRelay.RESPONSE_QUEUE_BYTES;
 	}
 
 	/** The h2 queue budget an unset value derives: an eighth of half the heap. */
@@ -168,11 +217,19 @@ public class ConnectionLimits implements DisposableBean {
 	}
 
 	/**
-	 * The connections whose worst case ({@link #connectionBytes()}) fits in half the heap
-	 * besides the h2 queue budget; at least 1.
+	 * The bytes the connections may reserve an unset value derives: half the heap less
+	 * the h2 queue budget.
 	 */
-	static int deriveMaxConnections(long maxHeap, long budget) {
-		return ConnectionLimit.derive(maxHeap / 2 - budget, connectionBytes());
+	static long deriveMemory(long maxHeap, long budget) {
+		return Math.max(0, maxHeap / 2 - budget);
+	}
+
+	/**
+	 * The connections reserving {@link #connectionBytes()} each that {@code memory}
+	 * holds; at least 1.
+	 */
+	static int deriveMaxConnections(long memory) {
+		return ConnectionLimit.derive(memory, connectionBytes());
 	}
 
 	private static Counter rejected(MeterRegistry meterRegistry, String reason) {
@@ -187,21 +244,22 @@ public class ConnectionLimits implements DisposableBean {
 	 * caller closes the socket without reading it.
 	 */
 	@Nullable Admission admit(AccessLogger.Connection access) {
-		ConnectionLimit.Permit permit = this.global.tryAcquire();
-		if (permit == null) {
+		ConnectionReserve.Reservation reservation = this.reserve.tryReserve(connectionBytes());
+		if (reservation == null) {
 			this.rejectedLimit.increment();
 			access.reject("limit");
 			return null;
 		}
-		return new Admission(permit, access);
+		return new Admission(reservation, access);
 	}
 
 	/**
-	 * A slot for one more leg of an h2 demux relay beyond the one its connection's own
-	 * slot covers, or null when the limit is reached: the stream needing it is refused.
+	 * A slot and the bytes of one more leg of an h2 demux relay beyond the one its
+	 * connection's own reservation covers ({@link #legBytes()}), or null when they do not
+	 * fit: the stream needing it is refused.
 	 */
-	ConnectionLimit.@Nullable Permit tryAcquireLeg() {
-		return this.global.tryAcquire();
+	ConnectionReserve.@Nullable Reservation tryAcquireLeg() {
+		return this.reserve.tryReserve(legBytes());
 	}
 
 	/**
@@ -235,7 +293,20 @@ public class ConnectionLimits implements DisposableBean {
 
 	/** Connections open at once, at most. */
 	int max() {
-		return this.global.max();
+		return this.reserve.maxSlots();
+	}
+
+	/**
+	 * The bytes the connections may reserve; {@link ConnectionReserve#UNBOUNDED} = no
+	 * bound.
+	 */
+	long memory() {
+		return this.reserve.maxBytes();
+	}
+
+	/** The bytes the connections reserve. */
+	long reserved() {
+		return this.reserve.bytes();
 	}
 
 	/** Connections from one source address open at once, at most. */
@@ -245,7 +316,7 @@ public class ConnectionLimits implements DisposableBean {
 
 	/** Connections holding a slot. */
 	int admitted() {
-		return this.global.open();
+		return this.reserve.slots();
 	}
 
 	/** Connections from {@code address} holding a slot. */
@@ -263,7 +334,7 @@ public class ConnectionLimits implements DisposableBean {
 		this.deadlines.shutdownNow();
 	}
 
-	/** The slots and the head deadline of one admitted connection. */
+	/** The slot, the bytes and the head deadline of one admitted connection. */
 	final class Admission {
 
 		private static final int HEAD = 0;
@@ -274,7 +345,10 @@ public class ConnectionLimits implements DisposableBean {
 		/** The deadline passed first and closed the socket. */
 		private static final int EXPIRED = 2;
 
-		private final ConnectionLimit.Permit permit;
+		private final ConnectionReserve.Reservation reservation;
+
+		/** The bytes of an h2 relay are reserved; guarded by the admission. */
+		private boolean h2Relay;
 
 		private final AccessLogger.Connection access;
 
@@ -288,9 +362,42 @@ public class ConnectionLimits implements DisposableBean {
 		/** {@link #HEAD}, then {@link #SERVED} or {@link #EXPIRED}; changes once. */
 		private final AtomicInteger phase = new AtomicInteger(HEAD);
 
-		private Admission(ConnectionLimit.Permit permit, AccessLogger.Connection access) {
-			this.permit = permit;
+		private Admission(ConnectionReserve.Reservation reservation, AccessLogger.Connection access) {
+			this.reservation = reservation;
 			this.access = access;
+		}
+
+		/**
+		 * Reserves what the connection's h2 demux relay holds outside the queue budget
+		 * ({@link #h2RelayBytes()}) besides the connection's own bytes, released with
+		 * them; true once reserved, at once when reserved already. False when the bytes
+		 * do not fit, or the admission was released: the connection is not relayed as h2.
+		 */
+		synchronized boolean reserveH2Relay() {
+			if (this.released.get()) {
+				return false;
+			}
+			if (!this.h2Relay) {
+				this.h2Relay = this.reservation.tryGrow(h2RelayBytes());
+			}
+			return this.h2Relay;
+		}
+
+		/**
+		 * A TLS connection offering HTTP/1.1 besides h2 was given HTTP/1.1, the bytes of
+		 * an h2 relay not fitting: counted.
+		 */
+		void declineH2() {
+			ConnectionLimits.this.h2Declined.increment();
+		}
+
+		/**
+		 * An h2 connection whose relay did not fit ({@link #reserveH2Relay()}) is
+		 * answered with a GOAWAY and closed: counted and logged as rejected.
+		 */
+		void rejectH2() {
+			ConnectionLimits.this.rejectedH2Limit.increment();
+			this.access.reject("h2-limit");
 		}
 
 		/**
@@ -384,7 +491,7 @@ public class ConnectionLimits implements DisposableBean {
 			if (source != null) {
 				unclaim(source);
 			}
-			this.permit.release();
+			this.reservation.release();
 		}
 
 		private void unclaim(InetAddress source) {

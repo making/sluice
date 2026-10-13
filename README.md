@@ -258,7 +258,8 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.data-tls-bundle` | - | SSL bundle name for data plane TLS termination (h2 / http/1.1 via ALPN, `force-http1` flips the preference); unset = plaintext only (TLS connections are served by upstreams with `tls-passthrough=true`) |
 | `sluice.ca-bundle` | - | SSL bundle whose keystore holds the CA private key + certificate; enables client certificate issuance in the console (the signed certificates authenticate against the gRPC `client-auth=REQUIRE` truststore, no restart) |
 | `sluice.proxy-protocol` | `false` | parse the PROXY protocol (v1 / v2) header an SNAT front end prepends on the data plane: the header is consumed before routing / relay (never forwarded) and its source address becomes the connection peer for access control and the access log; headerless connections are unaffected, a malformed header fails the connection |
-| `sluice.limits.max-connections` | `0` = derived from the max heap | connections open at once over the data port and every tcp route port (an h2 connection takes one more slot per further upstream connection open at once); see "Connection limits" |
+| `sluice.limits.max-connections` | `0` = `connection-memory` / 2213KiB | connections open at once over the data port and every tcp route port (an h2 connection takes one more slot per further upstream connection open at once); see "Connection limits" |
+| `sluice.limits.connection-memory` | `0` = half the max heap less the h2 queue budget; unbounded when `max-connections` is set | bytes the data plane's connections may reserve for their worst-case buffering: 2213KiB per connection, 3048KiB more per h2 connection, 3673KiB per further upstream connection of an h2 connection; see "Connection limits" |
 | `sluice.limits.max-connections-per-address` | `0` = no limit beyond `max-connections` | connections open at once from one source address (the PROXY protocol source with `proxy-protocol=true`, the socket peer otherwise) |
 | `sluice.limits.head-timeout` | `10s` | one deadline for the whole head phase of a data plane connection (PROXY header, TLS handshake, request head); on plaintext and TLS-terminated HTTP/1.1 it also bounds a later request head left incomplete between requests |
 | `sluice.limits.idle-timeout` | `60s` | how long a plaintext or TLS-terminated HTTP connection may idle between requests (h2: with no stream open) before it is closed; see "Connection limits" |
@@ -531,8 +532,10 @@ tunnel.
 ## Connection limits
 
 The data port and every tcp route port share one limit on the connections open at once
-(`sluice.limits.max-connections`), taken at accept: a connection beyond it is closed
-unread. `sluice.limits.max-connections-per-address` caps one source address; it is off by
+(`sluice.limits.max-connections`) and on the bytes they reserve for their worst-case
+buffering (`sluice.limits.connection-memory`), taken at accept: a connection beyond either
+is closed unread. An h2 connection reserves more once its protocol is chosen (see below).
+`sluice.limits.max-connections-per-address` caps one source address; it is off by
 default because behind an SNAT front end without the PROXY protocol every connection
 carries the front end's address. `sluice.limits.head-timeout` is one deadline for the
 whole head phase (PROXY header, TLS handshake, request head), not a timeout per read, so a
@@ -661,9 +664,9 @@ h2 (plaintext and TLS-terminated) is demultiplexed on netty's HTTP/2 codec: the 
 is the HTTP/2 endpoint of the client connection and a client of one upstream connection
 -- a virtual connection -- per route the connection reaches: the first on the
 connection's own slot of `sluice.limits.max-connections`, each further one open at once on
-a slot of its own. A stream whose route needs a new upstream connection while the limit
-has no slot left is refused with `REFUSED_STREAM` (the client may retry it), the
-connection going on. An upstream connection that closed is let go by the relay and the
+a slot of its own, reserving its bytes (see below). A stream whose route needs a new
+upstream connection while the limit has no slot or bytes left is refused with
+`REFUSED_STREAM` (the client may retry it), the connection going on. An upstream connection that closed is let go by the relay and the
 tunnel session, and its slot comes back once the frames it queued for the tunnel stream
 left the sender. A stream beyond the upstream's
 `SETTINGS_MAX_CONCURRENT_STREAMS` (one until the upstream's first SETTINGS) waits in the
@@ -725,18 +728,42 @@ its 128KiB, what its client still sends (the 16KiB read under way, 1MiB of windo
 connection is no longer read past 256KiB queued, plus at most 64KiB: 320KiB), about
 1588KiB (`NettyHttp2DemuxRelay.UNBUDGETED_BYTES`); each upstream connection adds its
 upstream's 1140KiB and its own 320KiB writer queue, about 1460KiB
-(`NettyHttp2DemuxRelay.RESPONSE_QUEUE_BYTES`), within the worst case of the slot it
-takes.
+(`NettyHttp2DemuxRelay.RESPONSE_QUEUE_BYTES`), covered by what the connection reserves.
 
-An unset (`0`) budget is an eighth of half the max heap, and an unset (`0`) connection
-limit is derived so that the worst case of every slot (2.16MiB + 1588KiB + 1460KiB) and
-the budget fit in half the max heap: `max(1, (max heap / 2 - budget) / 5.14MiB)`, e.g. 34
-for a 400MiB heap and for the 409MiB a 512Mi container gave the server in production, 348
-for 4GiB. The windows set most of it: each connection window adds 1MiB to a slot's worst
-case, once on the client's side and once per upstream connection. The effective values
-are logged at startup (`data plane connection limit` / `upstream connection limit`) and
-exported as gauges; with the 512Mi container of `k8s.md` they follow the heap the server
-gets there.
+Each connection reserves the worst case of what it buffers, from
+`sluice.limits.connection-memory`, once its protocol tells what that is. At accept every
+connection reserves its virtual connection's 2213KiB (2.16MiB, above), all an HTTP/1.1,
+TLS passthrough or tcp connection buffers. An h2 connection reserves 3048KiB more, its
+relay's 1588KiB and its first upstream connection's 1460KiB, when its protocol is chosen:
+in the ALPN of a TLS handshake that offers h2, otherwise once its connection head is read;
+each further upstream connection of it reserves 3673KiB (its virtual connection and its
+1460KiB) with its slot. All of it comes back when the slot does. A TLS client offering h2
+and HTTP/1.1 whose h2 bytes do not fit is given HTTP/1.1 (counted as
+`sluice.data.connections.h2.declined`); an h2 connection whose bytes do not fit otherwise
+(plaintext prior knowledge, or TLS offering h2 alone) gets the server preface and a GOAWAY
+`NO_ERROR` naming no stream processed (debug data `connection limit`), so its client may
+retry the request on another connection, and is closed (`rejected` with `reason=h2-limit`).
+So the reservations and the budget bound what every open connection buffers, whatever its
+protocol, without an HTTP/1.1 or passthrough connection reserving an h2 relay's worst
+case: in `H2DemuxConnectionMemoryE2ETest` four h2 connections fill the reservable bytes,
+two downloading and two uploading eight stream windows each (32MiB in all) to a peer that
+does not read, and what their relays hold settles past the 2MiB budget and within it plus
+the 4 x 3048KiB they reserve.
+
+An unset (`0`) budget is an eighth of half the max heap, and unset (`0`) connection memory
+is half the max heap less the budget; with `max-connections` set and no
+`connection-memory`, the bytes are not bounded and the configured count alone limits. An
+unset (`0`) connection limit is what the memory holds of connections reserving 2213KiB:
+`max(1, (max heap / 2 - budget) / 2213KiB)`. For the 409MiB heap a 512Mi container gives
+the server in production that is 178.9MiB of connection memory and a limit of 82
+connections, of which 34 h2 connections with one upstream connection each (5261KiB
+apiece); 80 for a 400MiB heap, 829 for 4GiB. Before the reservation was split by protocol,
+every slot reserved the 5261KiB of an h2 connection, and the 409MiB heap admitted 34
+connections of any kind. The windows set most of what an h2 connection reserves: each
+connection window adds 1MiB, once on the client's side and once per upstream connection.
+The effective values are logged at startup (`data plane connection limit` / `upstream
+connection limit`) and exported as gauges; with the 512Mi container of `k8s.md` they
+follow the heap the server gets there.
 
 A slot is released only once its connection ended and the frames it queued for the tunnel
 stream left the sender, on the server as on the client (`sluice.client.max-connections`);
@@ -816,7 +843,7 @@ debug, and the next line logged reports how many were demoted.
   cluster warmup window and while draining (see "Cluster (scale-out)")
 - client `GET /actuator/health` (port 9001) - UP while at least one per-node tunnel stream is
   established; the `tunnel` detail shows the connection state and `nodes` each node's stream state
-- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total` (for an h2 connection, what each of its upstream connections writes and reads on the tunnel, HTTP/2 framing included, by its route; the same bytes make the console's session traffic and the access log's `bytesIn` / `bytesOut`), `sluice_tunnel_sessions` (server: connected tunnel clients, the health detail `clients`; client: its tunnel streams established, one per server node), `sluice_connections_active`, `sluice_reconnect_total`, `sluice_advertise_rejected_total` (advertised listen ports the server rejected, client), `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_tunnel_stall_seconds` (how long a tunnel stream has held frames queued for its peer, not ready, with none taken; on the server the most stalled session's, 0 when none) / `sluice_tunnel_stall_failures_total` (tunnel streams failed by the stall watchdog), `sluice_tunnel_advertise_timeouts_total` (tunnel streams failed for a missing `Advertise`, server), `sluice_tunnel_streams_refused_total` (tunnel streams refused: past a bound on the registered sessions, at once or at the client's first `Advertise`, `reason` = `session-limit` / `session-address-limit`; past a bound on the streams waiting for their `Advertise`, `pending-limit` / `pending-address-limit`; or `draining`: one opened while the node drains, server), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_tunnel_sessions_build_unknown` (connected clients without a build, see "Console"), `sluice_h2demux_queued_bytes` (bytes the h2 demux holds of a route's streams, both ways, plus the upstream connections' writer queues, one series per route), `sluice_h2demux_budget_bytes` / `sluice_h2demux_budget_used_bytes` (the shared h2 queue budget and the bytes charged to it, which may pass the budget by what the relays cannot refuse), `sluice_h2demux_window_withheld_total` (times a connection's windows were withheld, `reason` = `budget`: past its 128KiB with the budget exhausted / `share`: its share of the budget at 2MiB), `sluice_h2demux_streams_refused_total` (`reason` = `budget`: a head the budget had no room for / `share`: one taking its connection's share past 4MiB / `leg-limit`: a stream whose route needed a new upstream connection with no slot left / `waiting`: a stream waiting for its upstream's concurrency limit refused to free a connection whose window is withheld / `wait-timeout`: one refused past `sluice.limits.h2-stream-wait-timeout`), `sluice_h2demux_streams_reset_total` (streams the relay reset on its own account, `reason` = `budget`: a header block that did not fit the budget / `share`: one taking its connection's share past 4MiB / `interim`: an upstream's interim heads past 64KiB / `protocol`: netty's codec reset a client stream on its stream error / `upstream`: the same on an upstream's stream; a frame on a stream no longer known is answered with a reset that does not count), `sluice_h2demux_legs_failed_total` (upstream connections of an h2 connection ended by a connection error, with a GOAWAY of its code; a client or an upstream connection closing mid-stream counts in neither), `sluice_h2demux_streams_misdirected_total` (streams answered `421`, `reason` = `force-http1`) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_rejected_total` (`reason` = `limit` / `address-limit` / `head-timeout`) / `sluice_data_connections_idle_closed_total` (connections closed for idling between requests) / `sluice_data_connections_stall_closed_total` (connections closed for an exchange stalled on its client) / `sluice_data_connections_verbatim_idle_closed_total` (connections relayed verbatim closed by the verbatim idle timeout)
+- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total` (for an h2 connection, what each of its upstream connections writes and reads on the tunnel, HTTP/2 framing included, by its route; the same bytes make the console's session traffic and the access log's `bytesIn` / `bytesOut`), `sluice_tunnel_sessions` (server: connected tunnel clients, the health detail `clients`; client: its tunnel streams established, one per server node), `sluice_connections_active`, `sluice_reconnect_total`, `sluice_advertise_rejected_total` (advertised listen ports the server rejected, client), `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_tunnel_stall_seconds` (how long a tunnel stream has held frames queued for its peer, not ready, with none taken; on the server the most stalled session's, 0 when none) / `sluice_tunnel_stall_failures_total` (tunnel streams failed by the stall watchdog), `sluice_tunnel_advertise_timeouts_total` (tunnel streams failed for a missing `Advertise`, server), `sluice_tunnel_streams_refused_total` (tunnel streams refused: past a bound on the registered sessions, at once or at the client's first `Advertise`, `reason` = `session-limit` / `session-address-limit`; past a bound on the streams waiting for their `Advertise`, `pending-limit` / `pending-address-limit`; or `draining`: one opened while the node drains, server), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_tunnel_sessions_build_unknown` (connected clients without a build, see "Console"), `sluice_h2demux_queued_bytes` (bytes the h2 demux holds of a route's streams, both ways, plus the upstream connections' writer queues, one series per route), `sluice_h2demux_held_bytes` (bytes every h2 demux relay holds, both ways, the client and upstream connections' writer queues included, as of each relay's last review), `sluice_h2demux_budget_bytes` / `sluice_h2demux_budget_used_bytes` (the shared h2 queue budget and the bytes charged to it, which may pass the budget by what the relays cannot refuse), `sluice_h2demux_window_withheld_total` (times a connection's windows were withheld, `reason` = `budget`: past its 128KiB with the budget exhausted / `share`: its share of the budget at 2MiB), `sluice_h2demux_streams_refused_total` (`reason` = `budget`: a head the budget had no room for / `share`: one taking its connection's share past 4MiB / `leg-limit`: a stream whose route needed a new upstream connection with no slot left / `waiting`: a stream waiting for its upstream's concurrency limit refused to free a connection whose window is withheld / `wait-timeout`: one refused past `sluice.limits.h2-stream-wait-timeout`), `sluice_h2demux_streams_reset_total` (streams the relay reset on its own account, `reason` = `budget`: a header block that did not fit the budget / `share`: one taking its connection's share past 4MiB / `interim`: an upstream's interim heads past 64KiB / `protocol`: netty's codec reset a client stream on its stream error / `upstream`: the same on an upstream's stream; a frame on a stream no longer known is answered with a reset that does not count), `sluice_h2demux_legs_failed_total` (upstream connections of an h2 connection ended by a connection error, with a GOAWAY of its code; a client or an upstream connection closing mid-stream counts in neither), `sluice_h2demux_streams_misdirected_total` (streams answered `421`, `reason` = `force-http1`) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_memory_bytes` (absent when unbounded) / `sluice_data_connections_memory_reserved_bytes` / `sluice_data_connections_rejected_total` (`reason` = `limit` / `address-limit` / `head-timeout` / `h2-limit`: an h2 connection whose relay's bytes did not fit) / `sluice_data_connections_h2_declined_total` (TLS connections offering h2 and HTTP/1.1 given HTTP/1.1, the h2 bytes not fitting) / `sluice_data_connections_idle_closed_total` (connections closed for idling between requests) / `sluice_data_connections_stall_closed_total` (connections closed for an exchange stalled on its client) / `sluice_data_connections_verbatim_idle_closed_total` (connections relayed verbatim closed by the verbatim idle timeout)
 
 ### Grafana dashboard
 

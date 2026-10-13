@@ -19,14 +19,17 @@ import io.micrometer.core.instrument.MeterRegistry;
  * share of it, for an upstream's interim heads past their limit, or on a stream error of
  * the client or of an upstream, the streams answered 421 for a route reached over
  * HTTP/1.1 only, the legs ended by a connection error, the times a relay withheld its
- * connection windows (for want of budget, or past its share), and, for tests, the DATA
- * writes netty holds, the streams the relays track, the legs they hold and the reviews
- * they ran.
+ * connection windows (for want of budget, or past its share), the bytes every relay
+ * holds, and, for tests, the DATA writes netty holds, the streams the relays track, the
+ * legs they hold and the reviews they ran.
  */
 final class H2DemuxMeters {
 
 	/** Name of the per-route gauge of the bytes the relays hold of a route's streams. */
 	static final String QUEUED_GAUGE_NAME = "sluice.h2demux.queued.bytes";
+
+	/** Name of the gauge of the bytes every relay holds, as of its last review. */
+	static final String HELD_GAUGE_NAME = "sluice.h2demux.held.bytes";
 
 	private final MeterRegistry registry;
 
@@ -37,6 +40,9 @@ final class H2DemuxMeters {
 
 	/** The reviews the relays ran; for tests. */
 	private final LongAdder reviews = new LongAdder();
+
+	/** The bytes every relay holds, as of its last review. */
+	private final AtomicLong held = new AtomicLong();
 
 	private final Counter refusedBudget;
 
@@ -68,6 +74,10 @@ final class H2DemuxMeters {
 
 	H2DemuxMeters(MeterRegistry registry) {
 		this.registry = registry;
+		Gauge.builder(HELD_GAUGE_NAME, this.held, AtomicLong::doubleValue)
+			.description("Bytes the h2 demux relays hold, both ways, the writer queues of their client and upstream "
+					+ "connections included, as of their last review")
+			.register(registry);
 		this.refusedBudget = refused(registry, "budget");
 		this.refusedShare = refused(registry, "share");
 		this.refusedLegLimit = refused(registry, "leg-limit");
@@ -249,6 +259,11 @@ final class H2DemuxMeters {
 	long writesHeld(String routeTag) {
 		LongAdder held = this.writesHeld.get(routeTag);
 		return held == null ? 0 : held.sum();
+	}
+
+	/** A relay holds {@code delta} more bytes than at its previous review. */
+	void held(long delta) {
+		this.held.addAndGet(delta);
 	}
 
 	/** Counts a review of a relay's accounts. */

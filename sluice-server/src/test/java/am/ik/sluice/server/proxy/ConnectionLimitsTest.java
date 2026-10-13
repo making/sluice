@@ -328,7 +328,7 @@ class ConnectionLimitsTest {
 	}
 
 	@Test
-	void anUnsetLimitFitsEverySlotsWorstCaseAndTheBudgetInHalfTheHeap() {
+	void anUnsetLimitIsWhatHalfTheHeapLessTheBudgetHoldsOfConnections() {
 		long mib = 1024 * 1024;
 		// both windows are the tunnel's per-connection window
 		assertThat(NettyHttp2DemuxRelay.STREAM_WINDOW).isEqualTo(1024 * 1024);
@@ -341,17 +341,128 @@ class ConnectionLimitsTest {
 			.isEqualTo(128 * 1024 + NettyHttp2DemuxRelay.WITHHELD_ARRIVALS + NettyHttp2DemuxRelay.HOP_QUEUE_BYTES);
 		assertThat(NettyHttp2DemuxRelay.RESPONSE_QUEUE_BYTES)
 			.isEqualTo(NettyHttp2DemuxRelay.WITHHELD_ARRIVALS + NettyHttp2DemuxRelay.HOP_QUEUE_BYTES);
-		// a virtual connection's 2.16MiB plus an h2 relay's 1588KiB and a leg's 1460KiB
-		assertThat(ConnectionLimits.connectionBytes()).isEqualTo(2266112 + 1626112 + 1495040);
+		// every connection: its virtual connection's 2213KiB; an h2 connection besides:
+		// its relay's 1588KiB and its first leg's 1460KiB; a further leg: both its own
+		assertThat(ConnectionLimits.connectionBytes()).isEqualTo(ConnectionLimit.CONNECTION_BYTES).isEqualTo(2266112);
+		assertThat(ConnectionLimits.h2RelayBytes()).isEqualTo(1626112 + 1495040);
+		assertThat(ConnectionLimits.legBytes()).isEqualTo(2266112 + 1495040);
 		assertThat(ConnectionLimits.deriveBudget(400 * mib)).isEqualTo(25 * mib);
-		// (200MiB - 25MiB) / 5.14MiB
-		assertThat(ConnectionLimits.deriveMaxConnections(400 * mib, 25 * mib)).isEqualTo(34);
-		// the 409MiB heap a 512Mi container gave the server in production
-		assertThat(ConnectionLimits.deriveMaxConnections(409 * mib, ConnectionLimits.deriveBudget(409 * mib)))
-			.isEqualTo(34);
-		// (2048MiB - 256MiB) / 5.14MiB
-		assertThat(ConnectionLimits.deriveMaxConnections(4096 * mib, 256 * mib)).isEqualTo(348);
-		assertThat(ConnectionLimits.deriveMaxConnections(400 * mib, 400 * mib)).isEqualTo(1);
+		assertThat(ConnectionLimits.deriveMemory(400 * mib, 25 * mib)).isEqualTo(175 * mib);
+		// 175MiB / 2213KiB
+		assertThat(ConnectionLimits.deriveMaxConnections(175 * mib)).isEqualTo(80);
+		// the 409MiB heap a 512Mi container gave the server in production: 178.9MiB
+		long production = ConnectionLimits.deriveMemory(409 * mib, ConnectionLimits.deriveBudget(409 * mib));
+		assertThat(production).isEqualTo(409 * mib / 2 - 409 * mib / 16);
+		assertThat(ConnectionLimits.deriveMaxConnections(production)).isEqualTo(82);
+		// of which h2 connections with one leg each: 178.9MiB / 5261KiB
+		assertThat(production / (ConnectionLimits.connectionBytes() + ConnectionLimits.h2RelayBytes())).isEqualTo(34);
+		// (2048MiB - 256MiB) / 2213KiB
+		assertThat(ConnectionLimits.deriveMaxConnections(ConnectionLimits.deriveMemory(4096 * mib, 256 * mib)))
+			.isEqualTo(829);
+		assertThat(ConnectionLimits.deriveMemory(400 * mib, 400 * mib)).isZero();
+		assertThat(ConnectionLimits.deriveMaxConnections(0)).isEqualTo(1);
+	}
+
+	@Test
+	void aConnectionReservesItsVirtualConnectionAndAnH2ConnectionItsRelayToo() {
+		long connection = ConnectionLimits.connectionBytes();
+		long h2 = ConnectionLimits.h2RelayBytes();
+		SimpleMeterRegistry registry = new SimpleMeterRegistry();
+		ConnectionLimits reserving = new ConnectionLimits(SluiceServerProperties.builder()
+			.limits(SluiceServerProperties.Limits.builder()
+				.connectionMemory(DataSize.ofBytes(2 * connection + h2))
+				.build())
+			.build(), registry);
+		try {
+			assertThat(reserving.memory()).isEqualTo(2 * connection + h2);
+			assertThat(reserving.max()).as("the connections reserving their virtual connection it holds").isEqualTo(3);
+			assertThat(registry.get("sluice.data.connections.memory.bytes").gauge().value())
+				.isEqualTo(2 * connection + h2);
+			ConnectionLimits.Admission h2Connection = Objects.requireNonNull(reserving.admit(this.access));
+			assertThat(reserving.reserved()).isEqualTo(connection);
+			assertThat(h2Connection.reserveH2Relay()).isTrue();
+			assertThat(h2Connection.reserveH2Relay()).as("reserved once").isTrue();
+			assertThat(reserving.reserved()).isEqualTo(connection + h2);
+			ConnectionLimits.Admission other = Objects.requireNonNull(reserving.admit(this.access));
+			assertThat(reserving.reserved()).isEqualTo(2 * connection + h2);
+			assertThat(registry.get("sluice.data.connections.memory.reserved.bytes").gauge().value())
+				.isEqualTo(2 * connection + h2);
+			assertThat(reserving.admit(this.access)).as("a slot is left, its bytes are not").isNull();
+			assertThat(registry.get("sluice.data.connections.rejected").tag("reason", "limit").counter().count())
+				.isEqualTo(1);
+			assertThat(other.reserveH2Relay()).as("the bytes of a second relay do not fit").isFalse();
+			assertThat(reserving.reserved()).isEqualTo(2 * connection + h2);
+			h2Connection.release();
+			assertThat(reserving.reserved()).as("the relay's bytes go with the connection's").isEqualTo(connection);
+			assertThat(h2Connection.reserveH2Relay()).as("a released admission reserves nothing").isFalse();
+			assertThat(other.reserveH2Relay()).isTrue();
+			other.release();
+			other.release();
+			assertThat(reserving.reserved()).isZero();
+			assertThat(reserving.admitted()).isZero();
+		}
+		finally {
+			reserving.destroy();
+		}
+	}
+
+	@Test
+	void aFurtherLegReservesItsVirtualConnectionAndItsPartOutsideTheBudget() {
+		ConnectionLimits reserving = new ConnectionLimits(SluiceServerProperties.builder()
+			.limits(SluiceServerProperties.Limits.builder()
+				.connectionMemory(DataSize.ofBytes(ConnectionLimits.connectionBytes() + ConnectionLimits.legBytes()))
+				.build())
+			.build(), new SimpleMeterRegistry());
+		try {
+			admit(reserving);
+			ConnectionReserve.Reservation leg = Objects.requireNonNull(reserving.tryAcquireLeg());
+			assertThat(reserving.reserved())
+				.isEqualTo(ConnectionLimits.connectionBytes() + ConnectionLimits.legBytes());
+			assertThat(reserving.admitted()).isEqualTo(2);
+			assertThat(reserving.tryAcquireLeg()).isNull();
+			leg.release();
+			assertThat(reserving.reserved()).isEqualTo(ConnectionLimits.connectionBytes());
+			assertThat(reserving.admitted()).isEqualTo(1);
+		}
+		finally {
+			reserving.destroy();
+		}
+	}
+
+	@Test
+	void aConfiguredLimitWithoutConfiguredMemoryLeavesTheBytesUnbounded() {
+		SimpleMeterRegistry registry = new SimpleMeterRegistry();
+		ConnectionLimits counting = new ConnectionLimits(SluiceServerProperties.builder()
+			.limits(SluiceServerProperties.Limits.builder().maxConnections(3).build())
+			.build(), registry);
+		try {
+			assertThat(counting.memory()).isEqualTo(ConnectionReserve.UNBOUNDED);
+			assertThat(registry.find("sluice.data.connections.memory.bytes").gauge()).isNull();
+			for (int i = 0; i < 3; i++) {
+				assertThat(admit(counting).reserveH2Relay()).isTrue();
+			}
+			assertThat(counting.reserved())
+				.isEqualTo(3 * (ConnectionLimits.connectionBytes() + ConnectionLimits.h2RelayBytes()));
+			assertThat(counting.admit(this.access)).as("the configured limit counts").isNull();
+		}
+		finally {
+			counting.destroy();
+		}
+	}
+
+	@Test
+	void aConfiguredMemoryDerivesTheLimit() {
+		ConnectionLimits configured = new ConnectionLimits(SluiceServerProperties.builder()
+			.limits(SluiceServerProperties.Limits.builder()
+				.connectionMemory(DataSize.ofBytes(10 * ConnectionLimits.connectionBytes() - 1))
+				.build())
+			.build(), new SimpleMeterRegistry());
+		try {
+			assertThat(configured.max()).isEqualTo(9);
+		}
+		finally {
+			configured.destroy();
+		}
 	}
 
 	@Test
@@ -372,14 +483,18 @@ class ConnectionLimitsTest {
 			logger.detachAppender(events);
 		}
 		try {
-			int max = ConnectionLimits.deriveMaxConnections(maxHeap, budget.toBytes());
+			long memory = ConnectionLimits.deriveMemory(maxHeap, budget.toBytes());
+			int max = ConnectionLimits.deriveMaxConnections(memory);
+			assertThat(derived.memory()).isEqualTo(memory);
 			assertThat(derived.max()).isEqualTo(max);
 			assertThat(events.list).extracting(ILoggingEvent::getFormattedMessage)
-				.containsExactly(("data plane connection limit %d (derived: (half of max heap %dMiB - h2 queue budget) "
-						+ "/ 5261KiB per connection), per address %d, head timeout PT10S, idle timeout PT1M, stall "
+				.containsExactly(("data plane connection limit %d (derived: connection memory / 2213KiB per "
+						+ "connection), connection memory %dKiB (derived: half of max heap %dMiB - h2 queue budget; "
+						+ "a connection reserves 2213KiB, an h2 connection 3048KiB more, a further upstream "
+						+ "connection of it 3673KiB), per address %d, head timeout PT10S, idle timeout PT1M, stall "
 						+ "timeout PT1M per 16384B, verbatim idle timeout off (unless a route sets one), h2 queue "
 						+ "budget 1024KiB (configured)")
-					.formatted(max, maxHeap >> 20, max));
+					.formatted(max, memory >> 10, maxHeap >> 20, max));
 		}
 		finally {
 			derived.destroy();
@@ -407,7 +522,7 @@ class ConnectionLimitsTest {
 	void aLegTakesASlotOfTheGlobalLimit() {
 		admit();
 		admit();
-		ConnectionLimit.Permit leg = Objects.requireNonNull(this.limits.tryAcquireLeg());
+		ConnectionReserve.Reservation leg = Objects.requireNonNull(this.limits.tryAcquireLeg());
 		assertThat(this.limits.tryAcquireLeg()).isNull();
 		assertThat(this.limits.admit(this.access)).as("the leg holds the last slot").isNull();
 		leg.release();
@@ -612,7 +727,11 @@ class ConnectionLimitsTest {
 	}
 
 	private ConnectionLimits.Admission admit() {
-		return Objects.requireNonNull(this.limits.admit(this.access));
+		return admit(this.limits);
+	}
+
+	private ConnectionLimits.Admission admit(ConnectionLimits limits) {
+		return Objects.requireNonNull(limits.admit(this.access));
 	}
 
 	private double idleClosed() {

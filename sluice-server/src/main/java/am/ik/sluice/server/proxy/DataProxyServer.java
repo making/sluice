@@ -56,9 +56,11 @@ import org.slf4j.LoggerFactory;
  * {@link NettyHttp2DemuxRelay}); TLS-terminated, encrypted-passthrough, and hostless
  * connections relay verbatim over the virtual connection of the resolved route. A TLS
  * handshake (first byte {@code 0x16}) is either terminated locally when an SSL bundle is
- * configured (ALPN: h2 preferred over http/1.1), or relayed untouched in passthrough mode
- * otherwise, routed by the SNI host name of the ClientHello (the backend terminates TLS
- * and presents its own certificate).
+ * configured (ALPN: h2 preferred over http/1.1 while the bytes an h2 relay reserves fit,
+ * see {@link ConnectionLimits}), or relayed untouched in passthrough mode otherwise,
+ * routed by the SNI host name of the ClientHello (the backend terminates TLS and presents
+ * its own certificate). An h2 connection whose relay does not fit is answered with a
+ * GOAWAY naming no stream processed.
  */
 @Component
 public class DataProxyServer implements SmartLifecycle, Drainable {
@@ -217,7 +219,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				this.close(socket);
 				return;
 			}
-			relaying = this.relay(connection, access, this.limits.keepAliveDeadline(socket), admission::release);
+			relaying = this.relay(connection, access, this.limits.keepAliveDeadline(socket), admission);
 			if (!relaying) {
 				// access denied or no session: relay() answered with the error response
 				// and closed the socket
@@ -310,8 +312,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			// relaying them
 			boolean forceHttp1 = resolved.map(Router.Route::forceHttp1).orElse(false);
 			ssl.setHandshakeApplicationProtocolSelector(
-					(s, protocols) -> forceHttp1 ? protocols.contains(ALPN_HTTP_1_1) ? ALPN_HTTP_1_1 : ALPN_H2
-							: protocols.contains(ALPN_H2) ? ALPN_H2 : ALPN_HTTP_1_1);
+					(s, protocols) -> selectProtocol(protocols, forceHttp1, admission));
 			ssl.startHandshake();
 			log.debug("tls handshake done; protocol={} sni={}", ssl.getApplicationProtocol(), sni.get());
 			access.transport(ALPN_H2.equals(ssl.getApplicationProtocol()) ? "h2" : "h1");
@@ -334,21 +335,46 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		return Connection.of(socket, head, peer);
 	}
 
+	/**
+	 * The ALPN protocol of a terminated handshake: http/1.1 for a force-http1 route when
+	 * offered; else h2 when offered and the bytes of its relay fit -- reserved here, so
+	 * the connection is relayed as h2 with them --, http/1.1 when offered besides,
+	 * declining h2; else h2, whose relay is refused once the head is read if its bytes
+	 * still do not fit.
+	 */
+	private static String selectProtocol(List<String> protocols, boolean forceHttp1,
+			ConnectionLimits.Admission admission) {
+		boolean h1 = protocols.contains(ALPN_HTTP_1_1);
+		if (forceHttp1) {
+			return h1 ? ALPN_HTTP_1_1 : ALPN_H2;
+		}
+		if (!protocols.contains(ALPN_H2)) {
+			return ALPN_HTTP_1_1;
+		}
+		if (admission.reserveH2Relay() || !h1) {
+			return ALPN_H2;
+		}
+		admission.declineH2();
+		return ALPN_HTTP_1_1;
+	}
+
 	private @Nullable SSLSocketFactory tlsFactory() {
 		SSLContext context = this.sslContext.getIfAvailable();
 		return context == null ? null : context.getSocketFactory();
 	}
 
 	/**
-	 * Routes and relays the connection; true once a relay owns it, in which case
-	 * {@code release} runs once the relay completed and the frames its virtual
+	 * Routes and relays the connection; true once a relay owns it, in which case the
+	 * admission is released once the relay completed and the frames its virtual
 	 * connections queued left the tunnel sender. False when the connection was answered
 	 * with an error response and closed. Plaintext and TLS-terminated HTTP relays drive
 	 * {@code deadline} between their requests; a verbatim relay puts it under the
-	 * verbatim idle timeout of its route.
+	 * verbatim idle timeout of its route. An h2 connection is relayed only once the bytes
+	 * of its relay are reserved.
 	 */
 	private boolean relay(Connection conn, AccessLogger.Connection access, ConnectionLimits.KeepAliveDeadline deadline,
-			Runnable release) {
+			ConnectionLimits.Admission admission) {
+		Runnable release = admission::release;
 		if (conn.head().undecodable()) {
 			// a connection error before any stream: nothing of it may be routed
 			access.request("-", "-", "2");
@@ -382,6 +408,11 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			// connection is demultiplexed even when its first head is no request the
 			// relay can route -- the relay resets that stream: relayed verbatim, its
 			// later streams would bypass their own routing and access control
+			if (http2 && !admission.reserveH2Relay()) {
+				admission.rejectH2();
+				this.reject(conn, this.errorResponse.connectionLimit());
+				return false;
+			}
 			Runnable relayed = this.relayed(access);
 			if (http2) {
 				NettyHttp2DemuxRelay demux = NettyHttp2DemuxRelay.builder()
