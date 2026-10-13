@@ -66,10 +66,10 @@ import org.jspecify.annotations.Nullable;
  * turns writable again. Without it the channel drains to the queue at every flush and
  * stays writable, so everything the peer's windows allow piles up in the queue.
  * <p>
- * <b>Flush order.</b> A settle flushes what was written before the flow controller writes
- * the DATA it holds: netty closes a reset stream, and drops its held DATA, only once the
- * RST_STREAM is written, so DATA held for a stream reset in the same action would
- * otherwise follow the reset ({@code H2DemuxResetOrderE2ETest}).
+ * <b>Resets.</b> The handler writes each RST_STREAM out at once, so its stream closes,
+ * and drops the DATA netty's flow controller holds for it, before anything else is
+ * written ({@link HopHandler}): no DATA of a stream follows its reset, on the hop being
+ * read ({@code HopResetOrderTest}) or another ({@code H2DemuxResetOrderE2ETest}).
  * <p>
  * <b>The connection window</b> refills as DATA arrives (netty's auto refill, unless the
  * builder turns it off), so only the stream windows bound what the hop holds; the
@@ -471,11 +471,6 @@ public final class Hop {
 			// what the tasks threw, recorded by the channel
 			this.channel.checkException();
 			if (this.channel.isOpen()) {
-				// what was written goes out first, past the handler, whose flush has the
-				// flow controller write the DATA it holds: a reset among it closes its
-				// stream once written, which drops that stream's held DATA rather than
-				// writing it behind the reset (RFC 9113 5.1)
-				this.guardCtx.flush();
 				this.channel.flush();
 			}
 		}

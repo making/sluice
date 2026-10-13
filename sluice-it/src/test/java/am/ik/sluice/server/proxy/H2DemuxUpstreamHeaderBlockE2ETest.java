@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.LongSupplier;
@@ -281,6 +282,102 @@ class H2DemuxUpstreamHeaderBlockE2ETest {
 			assertThat(statuses(client.frames(3))).containsExactly("200");
 			assertThat(client.closed()).isFalse();
 		}
+	}
+
+	/**
+	 * Request DATA held for an upstream announcing a stream window of 0 on streams 1 and
+	 * 3, then the 64 interim heads that fit on stream 1, then one upstream write granting
+	 * both streams a window and carrying stream 1's interim head past the limit: the
+	 * relay resets the upstream's stream 1 ({@code ENHANCE_YOUR_CALM}) in the read whose
+	 * grant made its held request writable, and the upstream reads no DATA of the stream
+	 * after its RST_STREAM (RFC 9113 5.1); stream 3's DATA, granted in the same write,
+	 * arrives.
+	 */
+	@Test
+	void aGrantReadWithAnInterimHeadPastTheLimitSendsNoDataAfterTheReset() throws Exception {
+		String route = route("interim-grant");
+		int body = 1000;
+		List<TestH2.Frame> received = new CopyOnWriteArrayList<>();
+		CountDownLatch interims = new CountDownLatch(1);
+		CountDownLatch pastTheLimit = new CountDownLatch(1);
+		CountDownLatch ping = new CountDownLatch(1);
+		startClient(route, upstream(upstream -> {
+			upstream.settings(0);
+			Thread reader = Thread.ofVirtual().start(() -> {
+				try {
+					TestH2.@Nullable Frame frame;
+					while ((frame = upstream.next()) != null) {
+						received.add(frame);
+					}
+				}
+				catch (IOException e) {
+					// the relay went away
+				}
+			});
+			interims.await();
+			for (int i = 0; i < INTERIMS_FIT; i++) {
+				upstream.write(TestH2.HEADERS, TestH2.FLAG_END_HEADERS, 1, interimBlock());
+			}
+			pastTheLimit.await();
+			ByteArrayOutputStream write = new ByteArrayOutputStream();
+			TestH2.writeFrame(write, TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(body));
+			TestH2.writeFrame(write, TestH2.WINDOW_UPDATE, 0, 3, TestH2.int32(body));
+			TestH2.writeFrame(write, TestH2.HEADERS, TestH2.FLAG_END_HEADERS, 1, interimBlock());
+			upstream.raw(write.toByteArray());
+			ping.await();
+			upstream.write(TestH2.PING, 0, 0, new byte[8]);
+			reader.join();
+		}));
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
+			client.headers(1, false, post(route));
+			// the leg applied the upstream's window of 0 once it acked the SETTINGS
+			Awaitility.await()
+				.atMost(TIMEOUT)
+				.until(() -> received.stream()
+					.anyMatch(frame -> frame.type() == TestH2.SETTINGS && (frame.flags() & TestH2.FLAG_ACK) != 0));
+			client.sendData(1, new byte[body], 0);
+			client.headers(3, false, post(route));
+			client.sendData(3, new byte[body], 0);
+			Awaitility.await()
+				.atMost(TIMEOUT)
+				.until(() -> server().h2DemuxMeters().writesHeld(route) == 2
+						&& framesOf(received, 3).contains(TestH2.HEADERS));
+			assertThat(framesOf(received, 1)).as("stream 1's request DATA held").doesNotContain(TestH2.DATA);
+
+			interims.countDown();
+			Awaitility.await().atMost(TIMEOUT).until(() -> statuses(client.frames(1)).size() == INTERIMS_FIT);
+			pastTheLimit.countDown();
+
+			assertThat(client.awaitEnd(1, TIMEOUT)).as("stream 1 answered").isTrue();
+			assertThat(statuses(client.frames(1))).as("the interim heads that fit, then the 502")
+				.hasSize(INTERIMS_FIT + 1)
+				.endsWith("502");
+			Awaitility.await()
+				.atMost(TIMEOUT)
+				.until(() -> framesOf(received, 3).contains(TestH2.DATA)
+						&& framesOf(received, 1).contains(TestH2.RST_STREAM));
+			// acked in a later read of the leg: behind whatever the read above wrote
+			ping.countDown();
+			Awaitility.await()
+				.atMost(TIMEOUT)
+				.until(() -> received.stream()
+					.anyMatch(frame -> frame.type() == TestH2.PING && (frame.flags() & TestH2.FLAG_ACK) != 0));
+			assertThat(framesOf(received, 1)).as("stream 1's frames at the upstream")
+				.containsExactly(TestH2.HEADERS, TestH2.RST_STREAM);
+			assertThat(received).filteredOn(frame -> frame.type() == TestH2.RST_STREAM && frame.streamId() == 1)
+				.extracting(TestH2::errorCode)
+				.containsExactly(ENHANCE_YOUR_CALM);
+			assertThat(client.closed()).isFalse();
+		}
+	}
+
+	/** The types of the frames of the stream, in arrival order. */
+	private static List<Integer> framesOf(List<TestH2.Frame> frames, int streamId) {
+		return frames.stream().filter(frame -> frame.streamId() == streamId).map(TestH2.Frame::type).toList();
+	}
+
+	private static byte[] post(String route) {
+		return TestH2.headerBlock(":authority=" + route, ":method=POST", ":path=/", ":scheme=http");
 	}
 
 	/**

@@ -1,11 +1,14 @@
 package am.ik.sluice.server.proxy;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -480,6 +483,58 @@ class NettyH2DemuxBudgetE2ETest {
 	}
 
 	/**
+	 * Stream 1's response held for the client's stream window, past the allowance with
+	 * the budget exhausted, and one client write granting stream 1 a window and carrying
+	 * its trailers: the relay resets the stream ({@code ENHANCE_YOUR_CALM}) in the read
+	 * whose grant made the held response writable, and the client reads no DATA of the
+	 * stream after its RST_STREAM (RFC 9113 5.1).
+	 */
+	@Test
+	void aGrantReadWithTrailersPastTheBudgetSendsNoDataAfterTheReset() throws Exception {
+		String route = route("grant-reset");
+		int length = 200 * KIB;
+		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
+		List<List<Integer>> resets = new CopyOnWriteArrayList<>();
+		startClient(route, upstream(seen, upstream -> {
+			upstream.settings(0);
+			CountDownLatch head = new CountDownLatch(1);
+			Thread reader = Thread.ofVirtual().start(() -> read(upstream, head, resets));
+			assertThat(head.await(TIMEOUT.toSeconds(), TimeUnit.SECONDS)).isTrue();
+			upstream.headers(1, false);
+			upstream.sendData(1, pattern(length), false);
+			reader.join();
+		}));
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
+			client.headers(1, false, post(route));
+			for (int streamId = 3; streamId <= 17; streamId += 2) {
+				client.headers(streamId, false, post(route));
+				client.fill(streamId, QUIET);
+			}
+			Awaitility.await().atMost(TIMEOUT).until(() -> client.dataReceived(1) == WINDOW && budgetUsed() >= BUDGET);
+			settled(() -> queuedBytes(route), () -> client.dataReceived(1));
+
+			ByteArrayOutputStream write = new ByteArrayOutputStream();
+			TestH2.writeFrame(write, TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(WINDOW));
+			TestH2.writeFrame(write, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 1,
+					TestH2.headerBlock("x-trailer=1"));
+			client.raw(write.toByteArray());
+			assertThat(client.awaitTrue(() -> client.reset(1) != null, TIMEOUT)).isTrue();
+			assertThat(client.reset(1)).isEqualTo(ENHANCE_YOUR_CALM);
+			awaitPingAck(client);
+
+			assertThat(typesAfterTheReset(client.frames(1))).as("frames of stream 1 after its reset").isEmpty();
+			Awaitility.await()
+				.atMost(TIMEOUT)
+				.untilAsserted(() -> assertThat(resets).as("the upstream was told").contains(List.of(1, CANCEL)));
+			for (int streamId = 3; streamId <= 17; streamId += 2) {
+				client.frame(TestH2.RST_STREAM, 0, streamId, TestH2.int32(CANCEL));
+			}
+			Awaitility.await().atMost(TIMEOUT).until(() -> queuedBytes(route) == 0 && budgetUsed() == 0);
+			assertThat(client.closed()).isFalse();
+		}
+	}
+
+	/**
 	 * A client gone without a word while three streams' requests are held and charged:
 	 * the relay ends and releases what it held and its share of the budget.
 	 */
@@ -535,6 +590,31 @@ class NettyH2DemuxBudgetE2ETest {
 			Awaitility.await().atMost(TIMEOUT).until(() -> queuedBytes(route) == 0);
 			assertThat(client.resets()).isEmpty();
 		}
+	}
+
+	/** The types of the frames after the first RST_STREAM, further resets aside. */
+	private static List<Integer> typesAfterTheReset(List<TestH2.Frame> frames) {
+		List<Integer> types = new ArrayList<>();
+		boolean reset = false;
+		for (TestH2.Frame frame : frames) {
+			if (reset && frame.type() != TestH2.RST_STREAM) {
+				types.add(frame.type());
+			}
+			reset |= frame.type() == TestH2.RST_STREAM;
+		}
+		return types;
+	}
+
+	/**
+	 * Pings the relay and waits for the ack: the relay handled every frame sent before.
+	 */
+	private static void awaitPingAck(H2TestClient client) throws Exception {
+		byte[] ping = "pingpong".getBytes(StandardCharsets.US_ASCII);
+		client.frame(TestH2.PING, 0, 0, ping);
+		assertThat(
+				client.awaitTrue(() -> client.pingAcks().stream().anyMatch(ack -> Arrays.equals(ack, ping)), TIMEOUT))
+			.as("the relay acked the PING")
+			.isTrue();
 	}
 
 	/** Holds every request body: a stream window of 0, read and never granted. */

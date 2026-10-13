@@ -603,8 +603,8 @@ final class NettyHttp2DemuxRelay {
 
 	/**
 	 * The exchange's stream waits in its leg's buffer; past the wait deadline it is
-	 * refused. The deadline runs on the client hop's executor: its settle runs the task
-	 * and then flushes the client's reset. With the loop's lock.
+	 * refused. The deadline runs on the client hop's executor, whose settle runs the
+	 * task. With the loop's lock.
 	 */
 	private void waitLocked(Exchange exchange) {
 		exchange.waiting = true;
