@@ -40,6 +40,12 @@ no longer trigger. Revisit this todo only if coalesced no-route requests reappea
    server-side concept, but no client dependency and no tunnel hop. Needs a config key
    for the console host name.
 3. **Accept the 503** and document it; the console recovers on any fresh connection.
+4. **Answer 421 Misdirected Request** for a coalesced stream whose host has no route,
+   as the relay already does for force-http1 routes (commit 419c0bc,
+   `ForceHttp1MisdirectedE2ETest`): Chrome and Firefox retry on a fresh connection,
+   which the front proxy sends to the console by SNI. Zero config; only for a stream
+   whose host differs from the connection's own (a fresh connection for an unknown host
+   still gets 503).
 
 Preference leans 2 (the data plane and the console are the same process; a coalesced
 request for the server's own vhost is best answered by it), but 1 is zero-code.
