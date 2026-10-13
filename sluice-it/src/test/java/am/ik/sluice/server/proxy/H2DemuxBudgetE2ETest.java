@@ -72,19 +72,24 @@ import static org.assertj.core.api.Assertions.assertThat;
 class H2DemuxBudgetE2ETest {
 
 	/**
-	 * Past a relay's connection window: a relay granted while the budget had room is
-	 * charged what its client then sends within that window, so a smaller budget would
-	 * let one share alone pass it.
+	 * Past one connection's share, below two: two stalled connections, each stopping at
+	 * its share at the latest, exhaust it whatever the tunnel absorbs. Past a relay's
+	 * connection window too: a relay granted while the budget had room is charged what
+	 * its client then sends within that window, so a smaller budget would let one share
+	 * alone pass it sooner.
 	 */
-	private static final long BUDGET = 4 * NettyHttp2DemuxRelay.CONNECTION_WINDOW;
+	private static final long BUDGET = 3 * NettyHttp2DemuxRelay.CONNECTION_WINDOW;
 
 	/**
 	 * Streams per stalled connection: their stream budgets add up far past the budget.
 	 */
 	private static final int STREAMS = 20;
 
-	/** Request body per stream, past what the tunnel and the upstream's socket absorb. */
-	private static final int BODY = 512 * 1024;
+	/**
+	 * Request body per stream, a stream window: the streams' bodies pass by far what the
+	 * tunnel and the upstream's socket absorb.
+	 */
+	private static final int BODY = NettyHttp2DemuxRelay.STREAM_WINDOW;
 
 	private static final int MAX_FRAME_SIZE = 16 * 1024;
 
@@ -144,7 +149,7 @@ class H2DemuxBudgetE2ETest {
 
 	/**
 	 * Two connections whose upstream does not read, twenty streams each: together they
-	 * stop at the budget plus what each queues outside it -- far below the 20MiB of their
+	 * stop at the budget plus what each queues outside it -- far below the 40MiB of their
 	 * bodies, which their stream windows allow -- with the budget exhausted and their
 	 * windows withheld, yet no stream is reset and no connection torn down; once the
 	 * upstream reads, every stream completes and the budget is released.
@@ -283,8 +288,10 @@ class H2DemuxBudgetE2ETest {
 		H2TestClient client = H2TestClient.connect(dataPort, reset);
 		client.headers(reset, false, head(route, "/reset"));
 		try (Stalled first = open(client, route, 1, BODY, body + late); Stalled second = stall(route)) {
+			// the first connection may stop at its share before the second exhausts the
+			// budget
 			first.awaitWithheld();
-			assertThat(budgetUsed()).as("exhausted").isGreaterThanOrEqualTo(BUDGET);
+			awaitExhausted();
 			first.stop();
 			long before = awaitSteady(() -> queuedBytes(route));
 			assertThat(client.connectionWindow()).as("the window kept for the stream to reset")
