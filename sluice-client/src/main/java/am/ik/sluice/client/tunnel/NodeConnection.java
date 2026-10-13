@@ -36,7 +36,6 @@ import am.ik.sluice.v1.proto.PeerBuild;
 import am.ik.sluice.v1.proto.TunnelGrpc;
 import io.grpc.Metadata;
 import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
 import io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.NettyChannelBuilder;
 import io.grpc.stub.ClientCallStreamObserver;
@@ -415,10 +414,12 @@ public final class NodeConnection implements AutoCloseable {
 		int portSeparator = authority.lastIndexOf(':');
 		String host = portSeparator > 0 ? authority.substring(0, portSeparator) : authority;
 		int port = portSeparator > 0 ? Integer.parseInt(authority.substring(portSeparator + 1)) : 443;
-		ManagedChannelBuilder<?> builder = ManagedChannelBuilder.forAddress(host, port)
+		// a fixed window, gRPC's own tuning off (see TunnelBudget#transportWindow)
+		NettyChannelBuilder builder = NettyChannelBuilder.forAddress(host, port)
 			.enableRetry()
 			.keepAliveTime(this.properties.keepAliveTime().toSeconds(), TimeUnit.SECONDS)
-			.keepAliveTimeout(this.properties.keepAliveTimeout().toSeconds(), TimeUnit.SECONDS);
+			.keepAliveTimeout(this.properties.keepAliveTimeout().toSeconds(), TimeUnit.SECONDS)
+			.flowControlWindow(this.budget.transportWindow());
 		if (!secure) {
 			builder.usePlaintext();
 		}
@@ -430,7 +431,7 @@ public final class NodeConnection implements AutoCloseable {
 				if (trustManagerFactory != null) {
 					ssl.trustManager(trustManagerFactory);
 				}
-				((NettyChannelBuilder) builder).sslContext(ssl.build());
+				builder.sslContext(ssl.build());
 			}
 			catch (Exception e) {
 				throw new IllegalStateException("failed to build SSL context from bundle " + this.sslBundle, e);
@@ -438,7 +439,7 @@ public final class NodeConnection implements AutoCloseable {
 		}
 		else if (this.properties.insecure()) {
 			try {
-				((NettyChannelBuilder) builder)
+				builder
 					.sslContext(GrpcSslContexts.forClient().trustManager(InsecureTrustManagerFactory.INSTANCE).build());
 			}
 			catch (Exception e) {

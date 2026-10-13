@@ -126,14 +126,15 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 			.register(meterRegistry);
 		log.info(
 				"upstream connection limit {} ({}), tunnel budget {}KiB ({}; a connection's window grows from {}KiB "
-						+ "to {}KiB against it)",
+						+ "to {}KiB against it), gRPC flow control window {}KiB",
 				this.connectionLimit.max(),
 				properties.maxConnections() > 0 ? "configured"
 						: "derived: (half of max heap %dMiB - tunnel budget) / %dKiB per connection"
 							.formatted(maxHeap >> 20, ConnectionLimit.CONNECTION_BYTES >> 10),
 				this.budget.max() >> 10,
 				properties.tunnelBudget().toBytes() > 0 ? "configured" : "derived: an eighth of half of max heap",
-				VirtualConnection.INITIAL_WINDOW >> 10, VirtualConnection.DEFAULT_WINDOW >> 10);
+				VirtualConnection.INITIAL_WINDOW >> 10, VirtualConnection.DEFAULT_WINDOW >> 10,
+				this.budget.transportWindow() >> 10);
 	}
 
 	private static @Nullable String clientid(SluiceClientProperties properties) {

@@ -83,4 +83,15 @@ class TunnelBudgetTest {
 		assertThatIllegalArgumentException().isThrownBy(() -> new TunnelBudget(-1));
 	}
 
+	@Test
+	void theTransportWindowIsTwiceTheBudgetWithinTheHttp2Bounds() {
+		assertThat(new TunnelBudget(25 * MIB).transportWindow()).isEqualTo(50 * MIB);
+		assertThat(new TunnelBudget(MIB / 2).transportWindow()).as("gRPC's default at least").isEqualTo(MIB);
+		assertThat(new TunnelBudget(0).transportWindow()).isEqualTo(MIB);
+		assertThat(new TunnelBudget(Integer.MAX_VALUE / 2).transportWindow()).isEqualTo(Integer.MAX_VALUE - 1);
+		assertThat(new TunnelBudget(Integer.MAX_VALUE / 2 + 1).transportWindow()).as("the largest HTTP/2 window")
+			.isEqualTo(Integer.MAX_VALUE);
+		assertThat(TunnelBudget.unlimited().transportWindow()).isEqualTo(Integer.MAX_VALUE);
+	}
+
 }

@@ -20,6 +20,9 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class TunnelBudget {
 
+	/** The smallest {@link #transportWindow()}: gRPC's default window, 1MiB. */
+	public static final int MIN_TRANSPORT_WINDOW = 1024 * 1024;
+
 	private final long max;
 
 	private final AtomicLong used = new AtomicLong();
@@ -59,6 +62,22 @@ public final class TunnelBudget {
 	/** The budget, in bytes. */
 	public long max() {
 		return this.max;
+	}
+
+	/**
+	 * The HTTP/2 flow control window, of the connection and of each stream alike, the
+	 * gRPC transport carrying this process's tunnels announces: twice the budget, at
+	 * least {@link #MIN_TRANSPORT_WINDOW}, at most the largest HTTP/2 window. What the
+	 * remote may send over a tunnel is bounded by the windows of its connections already,
+	 * so the transport window only has to stay out of their way. It does not widen what a
+	 * receiver may hold: what gRPC buffers before the connections take it was sent
+	 * against their windows, which the budget charges from the grant on. Twice, because
+	 * gRPC's netty transport grants a window back only once half of it was read: up to
+	 * half of it can sit read and not granted back for as long as the transfer lasts.
+	 */
+	public int transportWindow() {
+		long doubled = (this.max > Integer.MAX_VALUE / 2) ? Integer.MAX_VALUE : 2 * this.max;
+		return (int) Math.max(MIN_TRANSPORT_WINDOW, doubled);
 	}
 
 	/** The bytes charged; never above {@link #max()}. */

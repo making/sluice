@@ -136,11 +136,14 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 		this.creditWaits = Counter.builder("sluice.tunnel.credit.waits")
 			.description("Times a tunnel connection had payload for its client and waited for the client's credit")
 			.register(meterRegistry);
-		log.info("tunnel budget {}KiB ({}; a connection's window grows from {}KiB to {}KiB against it)",
+		log.info(
+				"tunnel budget {}KiB ({}; a connection's window grows from {}KiB to {}KiB against it), gRPC flow "
+						+ "control window {}KiB",
 				this.budget.max() >> 10,
 				properties.limits().tunnelBudget().toBytes() > 0 ? "configured"
 						: "derived: an eighth of half of max heap",
-				VirtualConnection.INITIAL_WINDOW >> 10, VirtualConnection.DEFAULT_WINDOW >> 10);
+				VirtualConnection.INITIAL_WINDOW >> 10, VirtualConnection.DEFAULT_WINDOW >> 10,
+				this.budget.transportWindow() >> 10);
 		this.advertiseTimeouts = Counter.builder("sluice.tunnel.advertise.timeouts")
 			.description("Tunnel streams failed because the client sent no Advertise within the advertise timeout")
 			.register(meterRegistry);
@@ -162,6 +165,14 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 					registry -> registry.all().stream().filter(session -> session.clientBuild().isEmpty()).count())
 			.description("Connected clients that advertised no build (they predate build reporting)")
 			.register(meterRegistry);
+	}
+
+	/**
+	 * The HTTP/2 flow control window the gRPC server announces for its connections:
+	 * {@link TunnelBudget#transportWindow()} of the tunnel budget.
+	 */
+	int transportWindow() {
+		return this.budget.transportWindow();
 	}
 
 	private static Counter windowUpdates(MeterRegistry meterRegistry, String direction) {
