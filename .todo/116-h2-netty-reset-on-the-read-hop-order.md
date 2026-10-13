@@ -35,3 +35,17 @@ same read.
 - First, failing: the budget trailers reset with the stream's response DATA held for a
   client stream window of 0, and one client write carrying a WINDOW_UPDATE of the stream
   and the trailers: the client must read no DATA of the stream after its RST_STREAM.
+
+## Notes (from 115)
+
+- Seen at the hop level: a server hop whose frame listener answered each stream with a
+  head and DATA (window open) and reset it in the same call sent the DATA behind the
+  RST_STREAM -- its client-role peer answered `Received DATA frame for an unknown stream`.
+  No WINDOW_UPDATE was needed: DATA written in the same read waits in the flow controller
+  until the handler's flush.
+- More resets on the hop being read than the trailers one: `LegListener#onHeadersRead`
+  resets the leg's stream on the leg being read (interim heads past `MAX_INTERIM_BYTES`:
+  `ENHANCE_YOUR_CALM`; a response block over the budget: `CANCEL`), with request DATA
+  possibly held for the upstream's window.
+- `HopHandler` (115) now subclasses netty's handler: overriding its `flush` to flush past
+  the handler before `writePendingBytes` is another place for the fix.
