@@ -1,6 +1,9 @@
 package am.ik.sluice.server.proxy;
 
+import java.util.EnumMap;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
@@ -8,6 +11,8 @@ import java.util.concurrent.atomic.LongAdder;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+
+import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
 
 /**
  * The meters shared by every h2 demux relay of one data proxy: per route, the bytes
@@ -17,8 +22,8 @@ import io.micrometer.core.instrument.MeterRegistry;
  * the streams a relay reset for want of queue budget or for a client's or an upstream's
  * stream error, the streams answered 421 for a route reached over HTTP/1.1 only, the legs
  * ended by their upstream's connection error, the times a relay withheld the client's
- * connection window, and, for tests, the number of times a leg writer woke up and the
- * streams the relays track.
+ * connection window, the connections demultiplexed by each engine, and, for tests, the
+ * number of times a leg writer woke up and the streams the relays track.
  */
 final class H2DemuxMeters {
 
@@ -47,6 +52,8 @@ final class H2DemuxMeters {
 
 	private final Counter windowWithheld;
 
+	private final Map<H2DemuxEngine, Counter> connections = new EnumMap<>(H2DemuxEngine.class);
+
 	H2DemuxMeters(MeterRegistry registry) {
 		this.registry = registry;
 		this.refusedBudget = refused(registry, "budget");
@@ -68,6 +75,13 @@ final class H2DemuxMeters {
 			.description("Times an h2 demux relay withheld the client's connection window: its queue was past its"
 					+ " allowance and the shared budget exhausted")
 			.register(registry);
+		for (H2DemuxEngine engine : H2DemuxEngine.values()) {
+			this.connections.put(engine,
+					Counter.builder("sluice.h2demux.connections")
+						.tag("engine", engine.name().toLowerCase(Locale.ROOT))
+						.description("h2 connections demultiplexed, by the engine relaying them")
+						.register(registry));
+		}
 	}
 
 	private static Counter refused(MeterRegistry registry, String reason) {
@@ -132,6 +146,20 @@ final class H2DemuxMeters {
 	/** A leg ended: its upstream made a connection error (RFC 9113 5.4.1). */
 	void legFailed() {
 		this.legsFailed.increment();
+	}
+
+	/** A connection was handed to a relay of the engine. */
+	void demuxed(H2DemuxEngine engine) {
+		connection(engine).increment();
+	}
+
+	/** The connections handed to relays of the engine so far. */
+	double demuxedBy(H2DemuxEngine engine) {
+		return connection(engine).count();
+	}
+
+	private Counter connection(H2DemuxEngine engine) {
+		return Objects.requireNonNull(this.connections.get(engine), "every engine has a counter");
 	}
 
 	/** A relay withheld the client's connection window. */

@@ -125,15 +125,48 @@ public class ErrorResponse {
 	 * client may retry the request on another connection.
 	 */
 	public byte[] misdirectedStream(int streamId) {
-		Http2Headers headers = new DefaultHttp2Headers().status("421")
-			.set("content-length", "0")
-			.set("cache-control", "no-store");
 		Http2Frames frames = new Http2Frames(streamId);
-		frames.write(Http2Frame.HEADERS_END_STREAM, headerBlock(streamId, headers));
+		frames.write(Http2Frame.HEADERS_END_STREAM, headerBlock(streamId, misdirectedHeaders()));
 		return frames.toByteArray();
 	}
 
+	/**
+	 * The head of {@link #misdirectedStream}, for a relay whose HTTP/2 codec frames it.
+	 */
+	public Http2Headers misdirectedHeaders() {
+		return new DefaultHttp2Headers().status("421").set("content-length", "0").set("cache-control", "no-store");
+	}
+
+	/**
+	 * The no-route page on a single stream, for a relay whose HTTP/2 codec frames it.
+	 */
+	public StreamPage noRoutePage(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request) {
+		return this.streamPage(this.noRoute, host, request);
+	}
+
+	/**
+	 * The forbidden page on a single stream, for a relay whose HTTP/2 codec frames it.
+	 */
+	public StreamPage forbiddenPage(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request) {
+		return this.streamPage(this.forbidden, host, request);
+	}
+
 	private byte[] streamResponse(int streamId, Page page, @Nullable String host,
+			ConnectionHeadParser.Head.@Nullable Request request) {
+		StreamPage response = this.streamPage(page, host, request);
+		byte[] body = response.body();
+		Http2Frames frames = new Http2Frames(streamId);
+		frames.write(body.length > 0 ? Http2Frame.HEADERS : Http2Frame.HEADERS_END_STREAM,
+				headerBlock(streamId, response.headers()));
+		for (int offset = 0; offset < body.length; offset += MAX_FRAME_SIZE) {
+			int end = Math.min(offset + MAX_FRAME_SIZE, body.length);
+			frames.write(end == body.length ? Http2Frame.DATA_END_STREAM : Http2Frame.DATA,
+					Arrays.copyOfRange(body, offset, end));
+		}
+		return frames.toByteArray();
+	}
+
+	private StreamPage streamPage(Page page, @Nullable String host,
 			ConnectionHeadParser.Head.@Nullable Request request) {
 		boolean withBody = request != null && !isHead(request);
 		byte[] body = this.page(host, request, page);
@@ -141,16 +174,15 @@ public class ErrorResponse {
 			.set("content-type", CONTENT_TYPE)
 			.set("content-length", String.valueOf(body.length))
 			.set("cache-control", "no-store");
-		Http2Frames frames = new Http2Frames(streamId);
-		frames.write(withBody ? Http2Frame.HEADERS : Http2Frame.HEADERS_END_STREAM, headerBlock(streamId, headers));
-		if (withBody) {
-			for (int offset = 0; offset < body.length; offset += MAX_FRAME_SIZE) {
-				int end = Math.min(offset + MAX_FRAME_SIZE, body.length);
-				frames.write(end == body.length ? Http2Frame.DATA_END_STREAM : Http2Frame.DATA,
-						Arrays.copyOfRange(body, offset, end));
-			}
-		}
-		return frames.toByteArray();
+		return new StreamPage(headers, withBody ? body : new byte[0]);
+	}
+
+	/**
+	 * An error page on a single HTTP/2 stream: its head and the body sent after it, empty
+	 * when none is (a {@code HEAD} request, or no request), the head's
+	 * {@code content-length} naming the page's length all the same.
+	 */
+	public record StreamPage(Http2Headers headers, byte[] body) {
 	}
 
 	private byte[] page(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request, Page page) {

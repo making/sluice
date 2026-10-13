@@ -28,6 +28,8 @@ import am.ik.sluice.server.route.LoadBalance;
  * @param tcpLoadBalance load balancing applied when several clients serve the same listen
  * port (tcp routes)
  * @param limits data plane connection limits and the head deadline
+ * @param h2DemuxEngine the relay demultiplexing plaintext and TLS-terminated h2
+ * connections
  */
 @ConfigurationProperties("sluice")
 public record SluiceServerProperties(String token, @Nullable String tokenFile, @DefaultValue("0.0.0.0") String dataHost,
@@ -35,7 +37,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		@DefaultValue("false") boolean proxyProtocol, @DefaultValue("") String tcpPortRange, AccessLog accessLog,
 		AccessControl accessControl, Node node, Cluster cluster, Console console,
 		@DefaultValue("smallest-client-id") LoadBalance httpLoadBalance,
-		@DefaultValue("smallest-client-id") LoadBalance tcpLoadBalance, Limits limits) {
+		@DefaultValue("smallest-client-id") LoadBalance tcpLoadBalance, Limits limits,
+		@DefaultValue("legacy") H2DemuxEngine h2DemuxEngine) {
 
 	public SluiceServerProperties {
 		dataHost = dataHost == null || dataHost.isBlank() ? "0.0.0.0" : dataHost;
@@ -45,6 +48,20 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		cluster = cluster == null ? Cluster.builder().build() : cluster;
 		console = console == null ? Console.builder().build() : console;
 		limits = limits == null ? Limits.builder().build() : limits;
+		h2DemuxEngine = h2DemuxEngine == null ? H2DemuxEngine.LEGACY : h2DemuxEngine;
+	}
+
+	/**
+	 * The relay demultiplexing an h2 connection's streams over per-route legs.
+	 */
+	public enum H2DemuxEngine {
+
+		/** The hand-written HTTP/2 relay. */
+		LEGACY,
+
+		/** netty's HTTP/2 codec, one endpoint per hop (being migrated to). */
+		NETTY
+
 	}
 
 	public boolean clusterEnabled() {
@@ -619,6 +636,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 		@Nullable private Limits limits;
 
+		private H2DemuxEngine h2DemuxEngine = H2DemuxEngine.LEGACY;
+
 		private Builder() {
 		}
 
@@ -702,6 +721,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			return this;
 		}
 
+		public Builder h2DemuxEngine(H2DemuxEngine h2DemuxEngine) {
+			this.h2DemuxEngine = h2DemuxEngine;
+			return this;
+		}
+
 		public SluiceServerProperties build() {
 			return new SluiceServerProperties(this.token == null ? "" : this.token, this.tokenFile,
 					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort, this.dataTlsBundle, this.caBundle,
@@ -710,7 +734,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 					this.node == null ? Node.builder().build() : this.node,
 					this.cluster == null ? Cluster.builder().build() : this.cluster,
 					this.console == null ? Console.builder().build() : this.console, this.httpLoadBalance,
-					this.tcpLoadBalance, this.limits == null ? Limits.builder().build() : this.limits);
+					this.tcpLoadBalance, this.limits == null ? Limits.builder().build() : this.limits,
+					this.h2DemuxEngine);
 		}
 
 	}

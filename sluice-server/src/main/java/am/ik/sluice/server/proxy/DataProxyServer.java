@@ -110,6 +110,9 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	/** Handed to every h2 demux relay started from now on. */
 	private volatile Http2DemuxRelay.WriteSeam h2WriteSeam = Http2DemuxRelay.WriteSeam.NONE;
 
+	/** The relay every h2 connection demultiplexed from now on gets. */
+	private volatile SluiceServerProperties.H2DemuxEngine h2DemuxEngine;
+
 	/** Wraps the client pipe of every HTTP/1.1 relay started from now on. */
 	private volatile UnaryOperator<DuplexPipe> clientPipeSeam = UnaryOperator.identity();
 
@@ -132,6 +135,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		this.sslContext = sslContext;
 		this.errorResponse = errorResponse;
 		this.limits = limits;
+		this.h2DemuxEngine = properties.h2DemuxEngine();
 	}
 
 	/**
@@ -377,17 +381,36 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			// later streams would bypass their own routing and access control
 			Runnable relayed = this.relayed(access);
 			if (http2) {
-				Http2DemuxRelay demux = new Http2DemuxRelay(conn.pipe(), conn.head(), this.router, this.sessions,
-						this.accessControl, this.errorResponse, access, this.h2DemuxMeters, this.limits, route0,
-						session, peer, deadline, this.h2WriteSeam, relayed, release);
+				SluiceServerProperties.H2DemuxEngine engine = this.h2DemuxEngine;
+				Runnable demux = switch (engine) {
+					case LEGACY -> new Http2DemuxRelay(conn.pipe(), conn.head(), this.router, this.sessions,
+							this.accessControl, this.errorResponse, access, this.h2DemuxMeters, this.limits, route0,
+							session, peer, deadline, this.h2WriteSeam, relayed, release)::start;
+					case NETTY -> NettyHttp2DemuxRelay.builder()
+						.pipe(conn.pipe())
+						.head(conn.head())
+						.router(this.router)
+						.sessions(this.sessions)
+						.accessControl(this.accessControl)
+						.errorResponse(this.errorResponse)
+						.access(access)
+						.meters(this.h2DemuxMeters)
+						.initialRoute(route0, session)
+						.peer(peer)
+						.deadline(deadline)
+						.onFinish(relayed)
+						.release(release)
+						.build()::start;
+				};
 				this.activeConnections.incrementAndGet();
 				try {
-					demux.start();
+					demux.run();
 				}
 				catch (RuntimeException e) {
 					this.activeConnections.decrementAndGet();
 					throw e;
 				}
+				this.h2DemuxMeters.demuxed(engine);
 				return true;
 			}
 			ReroutingRelay rerouting = new ReroutingRelay(this.clientPipeSeam.apply(conn.pipe()), conn.head(),
@@ -584,6 +607,14 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	/** Sets the probe seam of the HTTP/1.1 relays started from now on; for tests. */
 	void probeSeam(ReroutingRelay.ProbeSeam probeSeam) {
 		this.probeSeam = probeSeam;
+	}
+
+	/**
+	 * Sets the engine of the h2 demux relays started from now on, in place of
+	 * {@code sluice.h2-demux-engine}; for tests.
+	 */
+	void h2DemuxEngine(SluiceServerProperties.H2DemuxEngine h2DemuxEngine) {
+		this.h2DemuxEngine = h2DemuxEngine;
 	}
 
 	/** Sets the write seam of the h2 demux relays started from now on; for tests. */
