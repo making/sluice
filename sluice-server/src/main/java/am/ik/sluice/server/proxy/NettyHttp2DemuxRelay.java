@@ -266,7 +266,7 @@ final class NettyHttp2DemuxRelay {
 	static final long RESPONSE_QUEUE_BYTES = WITHHELD_ARRIVALS + HOP_QUEUE_BYTES;
 
 	/** How long a hop's threads may take to end once its channel closed. */
-	private static final Duration HOP_DONE_TIMEOUT = Duration.ofSeconds(30);
+	static final Duration HOP_DONE_TIMEOUT = Duration.ofSeconds(30);
 
 	private static final String HTTP_2 = "2";
 
@@ -1517,13 +1517,14 @@ final class NettyHttp2DemuxRelay {
 	}
 
 	/**
-	 * Waits on a virtual thread until the hop's threads ended, then runs {@code done},
-	 * which settles the hop's share of {@link #pending}.
+	 * Waits on a virtual thread until the hop's channel closed and its threads ended --
+	 * at most {@link #HOP_DONE_TIMEOUT} after the close --, then runs {@code done}, which
+	 * settles the hop's share of {@link #pending}.
 	 */
 	private void watch(Hop hop, Runnable done) {
 		Thread.ofVirtual().name(hop.name() + "-done").start(() -> {
 			try {
-				if (!hop.awaitDone(HOP_DONE_TIMEOUT)) {
+				if (!hop.awaitEnded(HOP_DONE_TIMEOUT)) {
 					log.warn("h2 demux: {} did not end within {}", hop.name(), HOP_DONE_TIMEOUT);
 				}
 			}

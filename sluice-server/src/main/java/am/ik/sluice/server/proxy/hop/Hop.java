@@ -241,6 +241,9 @@ public final class Hop {
 
 	private final CountDownLatch writerDone = new CountDownLatch(1);
 
+	/** Counted down once the channel closed and the close grace started. */
+	private final CountDownLatch closed = new CountDownLatch(1);
+
 	private final Http2ConnectionHandler handler;
 
 	private final HopChannel channel;
@@ -471,6 +474,16 @@ public final class Hop {
 		}
 	}
 
+	/**
+	 * Waits, however long the hop stays open, until its channel closed, then up to
+	 * {@code timeout} until the reader and the writer ended and the pipe is closed;
+	 * whether they did.
+	 */
+	public boolean awaitEnded(Duration timeout) throws InterruptedException {
+		this.closed.await();
+		return awaitDone(timeout);
+	}
+
 	/** Waits until the reader and the writer ended and the pipe is closed. */
 	public boolean awaitDone(Duration timeout) throws InterruptedException {
 		long deadline = System.nanoTime() + timeout.toNanos();
@@ -623,6 +636,7 @@ public final class Hop {
 		}
 		this.finished = true;
 		this.closeDeadline = System.nanoTime() + this.closeGrace.toNanos();
+		this.closed.countDown();
 		this.queueLock.lock();
 		try {
 			this.finishing = true;
