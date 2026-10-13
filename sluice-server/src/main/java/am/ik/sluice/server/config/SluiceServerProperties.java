@@ -374,26 +374,27 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * @param headTimeout deadline for the whole head phase of a connection (PROXY header,
 	 * TLS handshake, request head), and for a later request head of a plaintext or
 	 * TLS-terminated HTTP/1.1 connection left incomplete between requests
-	 * @param idleTimeout how long a plaintext or TLS-terminated HTTP/1.1 connection may
-	 * idle between requests -- every response complete and no next request begun --
-	 * before it is closed; an upgraded connection has none (it is relayed verbatim: see
-	 * {@code verbatimIdleTimeout}), and neither has an h2 connection yet
+	 * @param idleTimeout how long a plaintext or TLS-terminated HTTP connection may idle
+	 * between requests -- HTTP/1.1 with every response complete and no next request
+	 * begun, h2 with no stream open -- before it is closed (h2: with a GOAWAY
+	 * {@code NO_ERROR}); an upgraded connection has none (it is relayed verbatim: see
+	 * {@code verbatimIdleTimeout})
 	 * @param h2QueueBudget bytes the h2 demux relays may queue beyond each connection's
 	 * own allowance, both ways, shared by all of them; {@code 0} = an eighth of half the
 	 * maximum heap
 	 * @param h2StreamWaitTimeout how long an h2 stream may wait for a place within its
 	 * upstream's {@code SETTINGS_MAX_CONCURRENT_STREAMS} before the relay refuses it
 	 * ({@code REFUSED_STREAM}); {@code 0} = off
-	 * @param halfCloseProbeInterval how long a plaintext or TLS-terminated HTTP/1.1
-	 * connection whose client ended its side stays quiet, a response owed and none of it
-	 * relayed, before the relay writes a {@code 100 Continue} to learn whether the client
-	 * is still there; at most four per response, never to an HTTP/1.0 request; {@code 0}
-	 * = off
+	 * @param halfCloseProbeInterval how long a plaintext or TLS-terminated HTTP
+	 * connection whose client ended its side stays quiet, a response owed, before the
+	 * relay probes whether the client is still there: an HTTP/1.1 one, none of the
+	 * response relayed, with a {@code 100 Continue} (at most four per response, never to
+	 * an HTTP/1.0 request), an h2 one with a PING; {@code 0} = off
 	 * @param stallTimeout how long a request or response in flight on a plaintext or
-	 * TLS-terminated HTTP/1.1 connection may wait on its client -- to accept the relay's
-	 * writes, or to send request bytes due -- without {@code stallMinBytes} moving before
-	 * the connection is closed; waiting for an upstream does not count; an h2 connection
-	 * has none yet
+	 * TLS-terminated HTTP connection may wait on its client -- to accept the relay's
+	 * writes, to grant h2 window for them, or to send request bytes due -- without
+	 * {@code stallMinBytes} moving before the connection is closed (h2: with a GOAWAY
+	 * {@code ENHANCE_YOUR_CALM}); waiting for an upstream does not count
 	 * @param stallMinBytes the bytes moved to or from the client that count as progress
 	 * against {@code stallTimeout}: less within it is a stall (a minimum rate)
 	 * @param tunnelStallTimeout how long a tunnel stream may hold frames queued for its

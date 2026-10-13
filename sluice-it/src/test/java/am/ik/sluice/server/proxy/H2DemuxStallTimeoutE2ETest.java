@@ -7,6 +7,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -17,13 +18,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.function.UnaryOperator;
 
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.junit.jupiter.api.TestInstance;
@@ -56,13 +57,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  * GOAWAY {@code ENHANCE_YOUR_CALM} at the stall timeout, releasing its slot. An upstream
  * slower than the timeout, a streaming exchange resting, a CONNECT tunnel, a client
  * awaiting a {@code 100 Continue}, an upload held back by its upstream (no stream window,
- * or no connection window for want of budget), and a client granting its window slowly
- * but steadily are not cut. In the relay's package for the deadline queue of
+ * or no connection window for want of budget), a client granting its window slowly but
+ * steadily, one taking the bytes slowly but steadily, and one sending its request body
+ * slowly but steadily are not cut. In the relay's package for the deadline queue of
  * {@link ConnectionLimits}.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
-@Disabled("the stall timeout: not yet on the h2 demux")
 class H2DemuxStallTimeoutE2ETest {
 
 	private static final Duration STALL_TIMEOUT = Duration.ofSeconds(2);
@@ -81,6 +82,12 @@ class H2DemuxStallTimeoutE2ETest {
 
 	private static final int BIG = 16 * 1024 * 1024;
 
+	/**
+	 * The bytes per second the slow client takes: one write piece, and the stall minimum
+	 * (16KiB by default).
+	 */
+	private static final int SLOW_CLIENT_RATE = ConnectionLimits.KeepAliveDeadline.WRITE_PIECE;
+
 	private static final String BIG_HOST = "big.h2stall.test";
 
 	private static final String HOLD_HOST = "hold.h2stall.test";
@@ -96,6 +103,8 @@ class H2DemuxStallTimeoutE2ETest {
 	private static final String UPLOAD_HOST = "upload.h2stall.test";
 
 	private static final String PAUSE_HOST = "pause.h2stall.test";
+
+	private static final String DRAIN_HOST = "drain.h2stall.test";
 
 	/** HPACK: {@code :status 100}, a literal with the static table's name. */
 	private static final byte[] STATUS_100 = { 0x08, 0x03, '1', '0', '0' };
@@ -149,7 +158,8 @@ class H2DemuxStallTimeoutE2ETest {
 				upstream(H2DemuxStallTimeoutE2ETest::serveTunnel), CONTINUE_HOST,
 				upstream(H2DemuxStallTimeoutE2ETest::serveContinue), UPLOAD_HOST,
 				upstream(H2DemuxStallTimeoutE2ETest::serveUpload), PAUSE_HOST,
-				upstream(H2DemuxStallTimeoutE2ETest::servePausing));
+				upstream(H2DemuxStallTimeoutE2ETest::servePausing), DRAIN_HOST,
+				upstream(H2DemuxStallTimeoutE2ETest::serveDraining));
 		SluiceClientProperties.Builder properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
 			.token("it-token");
@@ -246,6 +256,27 @@ class H2DemuxStallTimeoutE2ETest {
 		awaitReleased(stalls);
 	}
 
+	/**
+	 * A page the relay answers itself (the no-route {@code 503}) whose body waits for a
+	 * stream window the client never grants: the relay waits on the client as for a
+	 * response. Opened second: an unrouted first head is answered before any relay.
+	 */
+	@Test
+	void aRelayAnsweredPageWaitingForAWindowNeverGrantedIsClosedAtTheStallTimeout() throws Exception {
+		double stalls = stallClosed();
+		try (H2TestClient client = H2TestClient.connect(dataPort, 3)) {
+			streamWindow(client, 0);
+			// a request the upstream holds: waiting on it does not count
+			client.headers(1, true, get(HOLD_HOST));
+			long start = System.nanoTime();
+			client.headers(3, true, get("unrouted.h2stall.test"));
+			assertGoAwayInTime(client, start);
+			assertThat(TestH2.status(client.frames(3))).as("the page's head came").isEqualTo("503");
+			assertThat(client.dataReceived(3)).as("its body did not").isZero();
+		}
+		awaitReleased(stalls);
+	}
+
 	@Test
 	void aStreamOpenedWithoutEndAndNeverContinuedIsClosedAtTheStallTimeout() throws Exception {
 		double stalls = stallClosed();
@@ -306,8 +337,9 @@ class H2DemuxStallTimeoutE2ETest {
 	}
 
 	/**
-	 * Also with a client announcing a stream window of 0: an exhausted window counts only
-	 * once a response began.
+	 * Also with a client announcing a stream window of 0, which it extends once the
+	 * response head came: an exhausted window counts only once a response began (the
+	 * windows are per hop, so the relay holds the body until then).
 	 */
 	@ParameterizedTest
 	@ValueSource(ints = { WINDOW, 0 })
@@ -317,9 +349,14 @@ class H2DemuxStallTimeoutE2ETest {
 			streamWindow(client, initialWindow);
 			long start = System.nanoTime();
 			client.headers(1, true, get(SLOW_HOST));
-			assertThat(client.awaitEnd(1, REST.plusSeconds(3))).isTrue();
+			assertThat(client.awaitTrue(() -> client.headerBlocks() == 1, REST.plusSeconds(3))).as("the response head")
+				.isTrue();
 			assertThat(Duration.ofNanos(System.nanoTime() - start)).as("the upstream held the response")
 				.isGreaterThanOrEqualTo(REST.minusMillis(100));
+			if (initialWindow == 0) {
+				client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(WINDOW));
+			}
+			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
 			assertThat(TestH2.bodyOf(client.frames(1))).isEqualTo("ok");
 			assertNotCut(client, stalls);
 		}
@@ -434,36 +471,37 @@ class H2DemuxStallTimeoutE2ETest {
 	}
 
 	/**
-	 * Two uploads take their connection past its allowance with the budget exhausted: the
-	 * relay withholds the connection window while the streams still hold stream window,
-	 * which is not the client's stall either.
+	 * Six uploads take their connection past its allowance with the budget exhausted (the
+	 * relay holds up to a stream window of each, the 128KiB allowance is two): the relay
+	 * withholds the connection window while the streams still hold stream window, which
+	 * is not the client's stall either. One thread sends them, so the streams never spend
+	 * the same connection window twice.
 	 */
 	@Test
 	void uploadsHeldBackByAWithheldConnectionWindowAreNotCut() throws Exception {
 		double stalls = stallClosed();
 		double withheld = windowWithheld();
-		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
-			client.headers(1, false, post(UPLOAD_HOST));
-			client.headers(3, false, post(UPLOAD_HOST));
-			AtomicBoolean first = new AtomicBoolean();
-			AtomicBoolean second = new AtomicBoolean();
-			Thread one = Thread.ofVirtual()
+		int[] streams = { 1, 3, 5, 7, 9, 11 };
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5, 7, 9, 11)) {
+			for (int streamId : streams) {
+				client.headers(streamId, false, post(UPLOAD_HOST));
+			}
+			AtomicBoolean sent = new AtomicBoolean();
+			Thread uploader = Thread.ofVirtual()
 				.name("e2e-h2stall-uploader")
-				.start(() -> first.set(upload(client, 1, 512 * 1024)));
-			Thread three = Thread.ofVirtual()
-				.name("e2e-h2stall-uploader")
-				.start(() -> second.set(upload(client, 3, 512 * 1024)));
+				.start(() -> sent.set(uploadAll(client, streams, 256 * 1024)));
 			Thread.sleep(1500);
 			// at least once: granted back while the queue drains, it may be withheld
 			// again
 			assertThat(windowWithheld()).as("the connection window was withheld").isGreaterThan(withheld);
 			assertThat(client.connectionWindow()).as("the connection window ran out").isLessThanOrEqualTo(0);
-			assertThat(Math.max(client.streamWindow(1), client.streamWindow(3))).as("a stream window did not")
+			assertThat(Arrays.stream(streams).mapToLong(client::streamWindow).max().orElseThrow())
+				.as("a stream window did not")
 				.isPositive();
-			assertThat(client.awaitTrue(() -> client.ended(1) && client.ended(3), REST.plusSeconds(10))).isTrue();
-			one.join();
-			three.join();
-			assertThat(first.get() && second.get()).isTrue();
+			assertThat(client.awaitTrue(() -> Arrays.stream(streams).allMatch(client::ended), REST.plusSeconds(10)))
+				.isTrue();
+			uploader.join();
+			assertThat(sent.get()).isTrue();
 			assertNotCut(client, stalls);
 		}
 	}
@@ -485,6 +523,94 @@ class H2DemuxStallTimeoutE2ETest {
 				.isLessThanOrEqualTo(WINDOW + 8 * 16 * 1024);
 			assertThat(client.maxReceiveExcess()).as("DATA beyond the window granted").isLessThanOrEqualTo(0);
 			assertNotCut(client, stalls);
+		}
+	}
+
+	/**
+	 * A request body sent 16KiB per second -- the stall minimum -- keeps its exchange
+	 * moving, though the request is due and not sent most of the time: each DATA read is
+	 * progress.
+	 */
+	@Test
+	void aClientUploadingSlowlyButSteadilyIsNotCut() throws Exception {
+		double stalls = stallClosed();
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
+			client.headers(1, false, post(DRAIN_HOST));
+			long start = System.nanoTime();
+			while (System.nanoTime() - start < STALL_TIMEOUT.multipliedBy(3).toNanos()) {
+				assertThat(client.data(1, SLOW_CLIENT_RATE, false, Duration.ofSeconds(1))).as("window to send")
+					.isTrue();
+				Thread.sleep(1000);
+			}
+			client.sendData(1, new byte[0], TestH2.FLAG_END_STREAM);
+			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
+			assertNotCut(client, stalls);
+		}
+	}
+
+	/**
+	 * A client taking 16KiB per second -- one write piece, and the stall minimum -- of a
+	 * large response whose windows it grants is not cut, though the relay waits on it
+	 * nearly all the time: each piece the client took is progress. Counted per batch of
+	 * the client hop's writer (64KiB and more, what the hop queued), the relay would wait
+	 * 4s and more between two progresses, past the stall timeout.
+	 */
+	@Test
+	void aClientTakingOneWritePieceASecondIsNotCut() throws Exception {
+		double stalls = stallClosed();
+		DataProxyServer proxy = Objects.requireNonNull(this.dataProxyServer);
+		proxy.clientPipeSeam(pipe -> new RateLimitedPipe(pipe, SLOW_CLIENT_RATE));
+		try (H2TestClient client = H2TestClient.connect(dataPort)) {
+			streamWindow(client, Integer.MAX_VALUE);
+			client.headers(1, true, get(BIG_HOST));
+			long start = System.nanoTime();
+			Duration watched = STALL_TIMEOUT.multipliedBy(3);
+			Thread.sleep(watched.toMillis());
+			Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
+			assertThat(client.dataReceived()).as("the client pipe held the response back to its rate")
+				.isLessThanOrEqualTo(SLOW_CLIENT_RATE * (elapsed.toSeconds() + 1))
+				// less a second: a frame straddling two pieces counts once whole
+				.isGreaterThanOrEqualTo(SLOW_CLIENT_RATE * (watched.toSeconds() - 3));
+			assertNotCut(client, stalls);
+		}
+		finally {
+			proxy.clientPipeSeam(UnaryOperator.identity());
+		}
+	}
+
+	/**
+	 * Sends {@code length} bytes on each stream, ending it, as the windows admit, the
+	 * streams taking turns; whether it did before the windows stayed shut for
+	 * {@link #REST} and 10s.
+	 */
+	private static boolean uploadAll(H2TestClient client, int[] streams, int length) {
+		int[] left = new int[streams.length];
+		Arrays.fill(left, length);
+		long deadline = System.nanoTime() + REST.plusSeconds(10).toNanos();
+		try {
+			while (Arrays.stream(left).anyMatch(bytes -> bytes > 0)) {
+				boolean sent = false;
+				for (int i = 0; i < streams.length; i++) {
+					long available = Math.min(client.connectionWindow(), client.streamWindow(streams[i]));
+					int n = (int) Math.min(Math.min(left[i], 16 * 1024), available);
+					if (n > 0) {
+						left[i] -= n;
+						client.sendData(streams[i], new byte[n], left[i] == 0 ? TestH2.FLAG_END_STREAM : 0);
+						sent = true;
+						deadline = System.nanoTime() + REST.plusSeconds(10).toNanos();
+					}
+				}
+				if (!sent) {
+					if (client.closed() || System.nanoTime() > deadline) {
+						return false;
+					}
+					Thread.sleep(1);
+				}
+			}
+			return true;
+		}
+		catch (IOException | InterruptedException e) {
+			return false;
 		}
 	}
 
@@ -565,6 +691,21 @@ class H2DemuxStallTimeoutE2ETest {
 					Thread.sleep(REST.toMillis());
 					upstream.write(TestH2.DATA, TestH2.FLAG_END_STREAM, streamId, new byte[0]);
 				});
+			}
+		}
+	}
+
+	/** Grants every window as the DATA arrives; answers every ended request. */
+	private static void serveDraining(WindowedH2Upstream upstream) throws Exception {
+		upstream.settings(null);
+		TestH2.@Nullable Frame frame;
+		while ((frame = upstream.next()) != null) {
+			if (frame.type() == TestH2.DATA && frame.payload().length > 0) {
+				upstream.grant(0, frame.payload().length);
+				upstream.grant(frame.streamId(), frame.payload().length);
+			}
+			if (ends(frame)) {
+				answer(upstream, frame.streamId());
 			}
 		}
 	}

@@ -34,7 +34,6 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.junit.jupiter.api.TestInstance;
@@ -330,7 +329,6 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 	 * stream's response: the leg half-closes only once the waiting stream went and ended.
 	 */
 	@Test
-	@Disabled("the half-close drain: the client's EOF ends the h2 demux at once")
 	void halfClosedClientGetsTheResponseOfItsWaitingStream() throws Exception {
 		String route = "sl.halfclose.test";
 		List<UpstreamConnection> connections = start(route, connection -> connection.settings(1L));
@@ -348,6 +346,35 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 			upstream.release(3);
 			assertThat(client.awaitTrue(() -> client.ended(1) && client.ended(3), TIMEOUT)).isTrue();
 			assertThat(upstream.peak()).isEqualTo(1);
+			Awaitility.await().atMost(TIMEOUT).until(upstream::eof);
+		}
+	}
+
+	/**
+	 * A client that half-closed while a stream waits on an upstream connection with no
+	 * stream open (a limit of 0) still gets that stream's response: the upstream
+	 * connection is not closed as one with no stream left.
+	 */
+	@Test
+	void halfClosedClientGetsTheResponseOfAStreamWaitingWithNothingOpen() throws Exception {
+		String route = "sl.halfclose-zero.test";
+		List<UpstreamConnection> connections = start(route, connection -> connection.settings(0L));
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
+			client.headers(1, true, get(route));
+			UpstreamConnection upstream = first(connections);
+			awaitOpen(upstream, 1);
+			upstream.release(1);
+			assertThat(client.awaitEnd(1, TIMEOUT)).isTrue();
+			Awaitility.await().atMost(TIMEOUT).until(() -> upstream.settingsAcks() >= 1);
+			client.headers(3, true, get(route));
+			client.halfClose();
+			Thread.sleep(HELD.toMillis());
+			assertThat(upstream.seen(3)).as("stream 3 waits").isFalse();
+			upstream.settings(1L);
+			awaitOpen(upstream, 3);
+			upstream.release(3);
+			assertThat(client.awaitEnd(3, TIMEOUT)).isTrue();
+			assertThat(client.reset(3)).isNull();
 			Awaitility.await().atMost(TIMEOUT).until(upstream::eof);
 		}
 	}

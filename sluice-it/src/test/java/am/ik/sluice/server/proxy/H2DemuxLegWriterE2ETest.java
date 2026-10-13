@@ -40,7 +40,6 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.junit.jupiter.api.TestInstance;
@@ -111,12 +110,12 @@ class H2DemuxLegWriterE2ETest {
 	}
 
 	/**
-	 * An upstream PING sent while the leg queue holds more than 1MiB of request data is
-	 * acknowledged before that data is written.
+	 * An upstream PING sent while the relay holds more than 1MiB of request data for the
+	 * leg's streams is acknowledged ahead of that data: netty acks it as it reads it,
+	 * behind no more than what the leg hop's writer queue holds then (at most
+	 * {@link NettyHttp2DemuxRelay#HOP_QUEUE_BYTES}).
 	 */
 	@Test
-	@Disabled("PING ordering: netty acks a PING as it reads it, behind what the hop's writer "
-			+ "queue holds, and the tunnel byte counter is not yet on the h2 demux; to be rewritten for it")
 	void upstreamPingIsAckedAheadOfQueuedData() throws Exception {
 		String route = "lw.ping.test";
 		CountDownLatch ping = new CountDownLatch(1);
@@ -128,9 +127,10 @@ class H2DemuxLegWriterE2ETest {
 			long queued = queuedBytes(route);
 			long relayed = relayedBytes(route);
 			ping.countDown();
-			Thread.sleep(500); // the PING reaches the relay while the leg is still
-								// stalled
-			assertThat(queuedBytes(route)).as("still stalled").isEqualTo(queued);
+			// the PING reaches the relay while the leg is still stalled
+			Thread.sleep(500);
+			assertThat(queuedBytes(route)).as("still stalled: netty's ack (a 17-byte frame) queued, nothing written")
+				.isEqualTo(queued + 17);
 			read.countDown();
 			Awaitility.await().atMost(Duration.ofSeconds(30)).until(() -> beforeAck.get() >= 0);
 			assertThat(queued).as("queued when the PING was sent").isGreaterThan(1024 * 1024);

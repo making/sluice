@@ -63,7 +63,6 @@ import io.netty.handler.codec.http2.Http2StreamChannel;
 import io.netty.util.ReferenceCountUtil;
 
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.junit.jupiter.api.TestInstance;
@@ -535,7 +534,6 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 * ends once the upstream closes.
 	 */
 	@Test
-	@Disabled("the half-close drain: the client's EOF ends the h2 demux at once")
 	void largeResponseReachesAHalfClosedClient() throws Exception {
 		String route = "uf.halfclose.test";
 		int length = 1024 * KIB;
@@ -595,7 +593,6 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 * client half-closing after its request still gets a response sent 500ms later.
 	 */
 	@Test
-	@Disabled("the half-close drain: the client's EOF ends the h2 demux at once")
 	void nettyUpstreamAnswersAHalfClosedClient() throws Exception {
 		String route = "uf.netty.test";
 		AtomicReference<@Nullable Boolean> halfClosure = new AtomicReference<>();
@@ -618,6 +615,75 @@ class H2DemuxUpstreamFlowControlE2ETest {
 			}
 			assertThat(halfClosure.get()).as("the Netty upstream closes on EOF").isFalse();
 			assertThat(TestH2.bodyOf(frames)).isEqualTo("late");
+		}
+	}
+
+	/**
+	 * A client gone after half-closing while its response is owed: the relay probes it
+	 * with a PING once a second passed without a write to it, the write fails on the
+	 * client's reset, and the relay ends, closing the upstream connection -- which never
+	 * answers.
+	 */
+	@Test
+	void aHalfClosedClientGoneIsNoticedByTheProbe() throws Exception {
+		String route = "uf.probe.test";
+		CountDownLatch eof = new CountDownLatch(1);
+		CountDownLatch head = new CountDownLatch(1);
+		startClient(route, upstream(new AtomicReference<>(), upstream -> {
+			upstream.settings(null);
+			TestH2.@Nullable Frame frame;
+			while ((frame = upstream.next()) != null) {
+				if (frame.type() == TestH2.HEADERS) {
+					head.countDown();
+				}
+			}
+			eof.countDown();
+		}));
+		DataProxyServer proxy = Objects.requireNonNull(this.dataProxyServer);
+		Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> proxy.activeConnections() == 0);
+		long gone;
+		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+			TestH2.writeClientHead(socket.getOutputStream(), 1, ":authority=" + route, ":method=GET", ":scheme=http",
+					":path=/");
+			socket.shutdownOutput();
+			assertThat(head.await(5, TimeUnit.SECONDS)).as("the request reached the upstream").isTrue();
+			gone = System.nanoTime();
+		}
+		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> proxy.activeConnections() == 0);
+		assertThat(Duration.ofNanos(System.nanoTime() - gone)).as("at a probe: a second without a write, or two")
+			.isGreaterThan(Duration.ofMillis(800))
+			.isLessThan(Duration.ofMillis(3500));
+		assertThat(eof.await(5, TimeUnit.SECONDS)).as("the upstream connection was closed").isTrue();
+	}
+
+	/**
+	 * A client ending its side while a request of its is unfinished -- it can never
+	 * complete now -- ends the relay at once, the upstream connection with it.
+	 */
+	@Test
+	void aClientEndingItsSideWithARequestUnfinishedEndsTheRelayAtOnce() throws Exception {
+		String route = "uf.unfinished.test";
+		CountDownLatch eof = new CountDownLatch(1);
+		CountDownLatch head = new CountDownLatch(1);
+		startClient(route, upstream(new AtomicReference<>(), upstream -> {
+			upstream.settings(null);
+			TestH2.@Nullable Frame frame;
+			while ((frame = upstream.next()) != null) {
+				if (frame.type() == TestH2.HEADERS) {
+					head.countDown();
+				}
+			}
+			eof.countDown();
+		}));
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
+			client.headers(1, false, post(route));
+			assertThat(head.await(5, TimeUnit.SECONDS)).as("the request reached the upstream").isTrue();
+			long ended = System.nanoTime();
+			client.halfClose();
+			assertThat(client.awaitTrue(client::closed, Duration.ofSeconds(5))).as("the relay ended").isTrue();
+			assertThat(Duration.ofNanos(System.nanoTime() - ended)).as("before any probe")
+				.isLessThan(Duration.ofMillis(800));
+			assertThat(eof.await(5, TimeUnit.SECONDS)).as("the upstream connection was closed").isTrue();
 		}
 	}
 
@@ -673,7 +739,6 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 * before the half-close.
 	 */
 	@Test
-	@Disabled("the half-close drain: the client's EOF ends the h2 demux at once")
 	void queuedRequestDataIsWrittenBeforeTheHalfClose() throws Exception {
 		String route = "uf.drain.test";
 		int length = 256 * KIB;
@@ -867,33 +932,39 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	}
 
 	/**
-	 * The upstream answered in full and got the demux's half-close, but the response
-	 * waits for the client's window; the client then goes: the relay ends with an ERROR
-	 * after the CLOSE the client app already took, and the app must still release the
-	 * upstream connection (the CLOSE ended its reader, so only the remote-failure
-	 * registration of the relay can).
+	 * The upstream answered in full -- the relay holds what the client's withheld window
+	 * keeps back -- and, the client having half-closed, got the demux's half-close at
+	 * once, its connection having no stream left; the client then goes: the relay ends
+	 * with an ERROR after the CLOSE the client app already took, and the app must still
+	 * release the upstream connection (the CLOSE ended its reader, so only the
+	 * remote-failure registration of the relay can).
 	 */
 	@Test
-	@Disabled("the half-close drain: the client's EOF ends the h2 demux at once")
 	void clientGoneAfterTheUpstreamsHalfCloseReleasesTheUpstreamConnection() throws Exception {
 		String route = "uf.gone.closed.test";
-		int length = 100 * KIB;
+		// past the client's window by less than the relay holds of a stream for it (the
+		// relay grants a stream window back in halves)
+		int length = 80 * KIB;
 		CountDownLatch eof = new CountDownLatch(1);
 		CountDownLatch held = new CountDownLatch(1);
 		this.closeables.add(held::countDown);
-		// answers in full regardless of windows, then holds the socket silently past the
-		// half-close: it writes nothing a relay writing to the remote would trip on
+		// answers in full within the relay's windows, then holds the socket silently past
+		// the half-close: it writes nothing a relay writing to the remote would trip on
 		startClient(route, upstream(new AtomicReference<>(), upstream -> {
 			upstream.settings(null);
 			TestH2.@Nullable Frame frame;
 			while ((frame = upstream.next()) != null) {
 				if (frame.type() == TestH2.HEADERS) {
-					upstream.headers(frame.streamId(), false);
-					for (int sent = 0; sent < length; sent += 16 * KIB) {
-						int chunk = Math.min(16 * KIB, length - sent);
-						upstream.write(TestH2.DATA, sent + chunk == length ? TestH2.FLAG_END_STREAM : 0,
-								frame.streamId(), new byte[chunk]);
-					}
+					int streamId = frame.streamId();
+					upstream.headers(streamId, false);
+					Thread.ofVirtual().start(() -> {
+						try {
+							upstream.sendData(streamId, new byte[length], true);
+						}
+						catch (IOException | InterruptedException e) {
+							// the relay went away
+						}
+					});
 				}
 			}
 			eof.countDown();

@@ -12,7 +12,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 
 import org.jspecify.annotations.Nullable;
@@ -400,8 +399,8 @@ public class ConnectionLimits implements DisposableBean {
 	 * requests ({@link Phase#IDLE}), the head timeout while a later request head is
 	 * incomplete ({@link Phase#HEAD}), and while a request or response is in flight
 	 * ({@link Phase#BUSY}) the stall timeout of a relay watched through
-	 * {@link #watchStalls}, none otherwise. A phase entered anew starts its timeout over;
-	 * entering the current phase keeps the running one. Once a timeout passes, the
+	 * {@link #watchStallClock}, none otherwise. A phase entered anew starts its timeout
+	 * over; entering the current phase keeps the running one. Once a timeout passes, the
 	 * relay's teardown runs on a virtual thread of its own -- never on the shared
 	 * deadline thread, as it may write -- and the transport socket is closed after it, or
 	 * after {@link #TEARDOWN_GRACE} at the latest should the teardown block on a write
@@ -417,16 +416,12 @@ public class ConnectionLimits implements DisposableBean {
 	 * The stall timeout counts only the time the relay waits on its client: busy, the
 	 * deadline reads the relay's clock of that time {@link #STALL_SAMPLES} times per
 	 * stall timeout ({@link #watchStallClock}) and adds what it advanced since the
-	 * previous reading. A relay that can only tell whether it waits right now
-	 * ({@link #watchStalls}) is sampled instead: the time between two samples counts when
-	 * both found it waiting, so a wait shorter than a sample interval may go unseen, a
-	 * wait spanning two samples counts whole, and a sample that finds the relay between
-	 * two waits loses both intervals around it. Progress -- the stall minimum of bytes
-	 * moved to or from the client, reported through {@link #progress(long)} -- starts the
-	 * count over, and so does the busy phase entered anew. Once the count reaches the
-	 * stall timeout the relay's stall teardown runs as above. The first reading after the
-	 * count starts only sets where it counts from, so a stall is cut between the stall
-	 * timeout and two sample intervals past it.
+	 * previous reading. Progress -- the stall minimum of bytes moved to or from the
+	 * client, reported through {@link #progress(long)} -- starts the count over, and so
+	 * does the busy phase entered anew. Once the count reaches the stall timeout the
+	 * relay's stall teardown runs as above. The first reading after the count starts only
+	 * sets where it counts from, so a stall is cut between the stall timeout and two
+	 * sample intervals past it.
 	 */
 	final class KeepAliveDeadline {
 
@@ -524,17 +519,6 @@ public class ConnectionLimits implements DisposableBean {
 		 */
 		void onExpiry(Runnable teardown) {
 			this.teardown = teardown;
-		}
-
-		/**
-		 * Subjects the busy phase to the stall timeout, sampling the relay:
-		 * {@code waitsOnClient} tells whether the relay waits on its client right now --
-		 * asked on the shared deadline thread, it must not block --, and {@code teardown}
-		 * runs once the stall timeout passed. Starts the count when the connection is
-		 * busy already.
-		 */
-		void watchStalls(BooleanSupplier waitsOnClient, Runnable teardown) {
-			watchStallClock(sampled(waitsOnClient), teardown);
 		}
 
 		/**
@@ -735,34 +719,6 @@ public class ConnectionLimits implements DisposableBean {
 			}
 			ConnectionLimits.this.stallClosed.increment();
 			tearDown(this.stallTeardown);
-		}
-
-		/**
-		 * The clock of a relay sampled through {@code waitsOnClient}: advances by the
-		 * time between two readings that both found the relay waiting.
-		 */
-		private static LongSupplier sampled(BooleanSupplier waitsOnClient) {
-			return new LongSupplier() {
-
-				private long waited;
-
-				private long lastReading;
-
-				private boolean waitingAtLastReading;
-
-				@Override
-				public synchronized long getAsLong() {
-					boolean waiting = waitsOnClient.getAsBoolean();
-					long now = System.nanoTime();
-					if (waiting && this.waitingAtLastReading) {
-						this.waited += now - this.lastReading;
-					}
-					this.waitingAtLastReading = waiting;
-					this.lastReading = now;
-					return this.waited;
-				}
-
-			};
 		}
 
 		private void expire(long armed) {

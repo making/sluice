@@ -541,9 +541,9 @@ class NettyH2DemuxRelayE2ETest {
 	}
 
 	/**
-	 * The client going away while a stream waits ends the relay -- the upstream's
-	 * connection, the hop threads, the slot -- and the wait deadline refuses nothing
-	 * after it.
+	 * The client going away (a reset: a FIN would be a half-close, which the relay
+	 * drains) while a stream waits ends the relay -- the upstream's connection, the hop
+	 * threads, the slot -- and the wait deadline refuses nothing after it.
 	 */
 	@Test
 	void theClientGoingAwayWhileAStreamWaitsEndsTheRelay() throws Exception {
@@ -557,6 +557,7 @@ class NettyH2DemuxRelayE2ETest {
 			sent = System.nanoTime();
 			h2.headers(3, true, get(host, "/waiting"));
 			assertWaits(connection, 3);
+			h2.abort();
 		}
 		assertThat(connection.awaitEof(TIMEOUT)).as("the upstream's connection ended").isTrue();
 		Thread.sleep(Math.max(0, WAIT_TIMEOUT.plusMillis(500).toNanos() - (System.nanoTime() - sent)) / 1_000_000);

@@ -287,7 +287,6 @@ class H2DemuxStallE2ETest {
 	 * after its request ended still gets the response.
 	 */
 	@Test
-	@Disabled("the half-close drain: the client's EOF ends the h2 demux at once")
 	void halfCloseAfterAFinishedRequestStillGetsTheResponse() throws Exception {
 		startClient("h2d.halfclose.test", echoUpstream);
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {

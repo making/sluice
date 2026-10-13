@@ -111,7 +111,9 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	/** The wait deadline every h2 demux relay started from now on gets. */
 	private volatile Duration h2StreamWaitTimeout;
 
-	/** Wraps the client pipe of every HTTP/1.1 relay started from now on. */
+	/**
+	 * Wraps the client pipe of every HTTP relay (HTTP/1.1 and h2) started from now on.
+	 */
 	private volatile UnaryOperator<DuplexPipe> clientPipeSeam = UnaryOperator.identity();
 
 	private volatile boolean running;
@@ -380,7 +382,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			Runnable relayed = this.relayed(access);
 			if (http2) {
 				NettyHttp2DemuxRelay demux = NettyHttp2DemuxRelay.builder()
-					.pipe(conn.pipe())
+					.pipe(this.clientPipeSeam.apply(conn.pipe()))
 					.head(conn.head())
 					.router(this.router)
 					.sessions(this.sessions)
@@ -392,6 +394,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 					.peer(peer)
 					.deadline(deadline)
 					.streamWaitTimeout(this.h2StreamWaitTimeout)
+					.probeInterval(this.properties.limits().halfCloseProbeInterval())
 					.budget(this.limits.h2Budget())
 					.legSlots(this.limits::tryAcquireLeg)
 					.onFinish(relayed)
@@ -612,7 +615,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	}
 
 	/**
-	 * Wraps the client pipe of the HTTP/1.1 relays started from now on in
+	 * Wraps the client pipe of the HTTP relays (HTTP/1.1 and h2) started from now on in
 	 * {@code clientPipeSeam}; for tests.
 	 */
 	void clientPipeSeam(UnaryOperator<DuplexPipe> clientPipeSeam) {

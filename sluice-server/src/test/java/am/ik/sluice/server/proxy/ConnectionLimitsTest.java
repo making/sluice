@@ -9,7 +9,7 @@ import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.BooleanSupplier;
+import java.util.function.LongSupplier;
 
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -421,7 +421,7 @@ class ConnectionLimitsTest {
 				deadline.onExpiry(idle::countDown);
 				long start = System.nanoTime();
 				// busy from the start: watching arms the stall count at once
-				deadline.watchStalls(() -> true, stalled::countDown);
+				deadline.watchStallClock(waitingFromNow(), stalled::countDown);
 				assertThat(limits.scheduledDeadlines()).isEqualTo(1);
 				assertThat(stalled.await(2, TimeUnit.SECONDS)).isTrue();
 				Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
@@ -473,22 +473,22 @@ class ConnectionLimitsTest {
 
 	@Test
 	void aWatchedRelayWaitingOnItsUpstreamIsNeverTornDown() throws Exception {
-		assertStallsAfter(DataSize.ofKilobytes(16), () -> false, 0, false);
+		assertStallsAfter(DataSize.ofKilobytes(16), () -> 0, 0, false);
 	}
 
 	@Test
 	void progressOfTheStallMinimumPerSampleKeepsAWaitingRelay() throws Exception {
-		assertStallsAfter(DataSize.ofKilobytes(16), () -> true, 16 * 1024, false);
+		assertStallsAfter(DataSize.ofKilobytes(16), waitingFromNow(), 16 * 1024, false);
 	}
 
 	@Test
 	void progressBelowTheStallMinimumDoesNotKeepAWaitingRelay() throws Exception {
-		assertStallsAfter(DataSize.ofKilobytes(16), () -> true, 1, true);
+		assertStallsAfter(DataSize.ofKilobytes(16), waitingFromNow(), 1, true);
 	}
 
 	@Test
 	void aStallMinimumOfOneByteCountsEveryByte() throws Exception {
-		assertStallsAfter(DataSize.ofBytes(1), () -> true, 1, false);
+		assertStallsAfter(DataSize.ofBytes(1), waitingFromNow(), 1, false);
 	}
 
 	@Test
@@ -500,7 +500,7 @@ class ConnectionLimitsTest {
 			try {
 				ConnectionLimits.KeepAliveDeadline deadline = limits.keepAliveDeadline(accepted);
 				CountDownLatch stalled = new CountDownLatch(1);
-				deadline.watchStalls(() -> true, stalled::countDown);
+				deadline.watchStallClock(waitingFromNow(), stalled::countDown);
 				Thread.sleep(STALL_TIMEOUT.multipliedBy(3).dividedBy(4).toMillis());
 				assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.HEAD)).isTrue();
 				long busy = System.nanoTime();
@@ -528,7 +528,7 @@ class ConnectionLimitsTest {
 			ConnectionLimits limits = stallLimits(DataSize.ofKilobytes(16));
 			try {
 				ConnectionLimits.KeepAliveDeadline deadline = limits.keepAliveDeadline(accepted);
-				deadline.watchStalls(() -> true, () -> {
+				deadline.watchStallClock(waitingFromNow(), () -> {
 				});
 				deadline.disarm();
 				assertThat(limits.scheduledDeadlines()).isZero();
@@ -542,12 +542,18 @@ class ConnectionLimitsTest {
 		}
 	}
 
+	/** The clock of a relay waiting on its client from now on, without a break. */
+	private static LongSupplier waitingFromNow() {
+		long start = System.nanoTime();
+		return () -> System.nanoTime() - start;
+	}
+
 	/**
-	 * Watches a busy deadline whose relay answers {@code waiting}, reporting
-	 * {@code progress} bytes every quarter of a sample interval for three stall timeouts;
-	 * asserts whether it stalled.
+	 * Watches a busy deadline whose relay's clock of its wait is {@code waited},
+	 * reporting {@code progress} bytes every quarter of a sample interval for three stall
+	 * timeouts; asserts whether it stalled.
 	 */
-	private void assertStallsAfter(DataSize minBytes, BooleanSupplier waiting, int progress, boolean stalls)
+	private void assertStallsAfter(DataSize minBytes, LongSupplier waited, int progress, boolean stalls)
 			throws Exception {
 		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
@@ -556,7 +562,7 @@ class ConnectionLimitsTest {
 			try {
 				ConnectionLimits.KeepAliveDeadline deadline = limits.keepAliveDeadline(accepted);
 				CountDownLatch stalled = new CountDownLatch(1);
-				deadline.watchStalls(waiting, stalled::countDown);
+				deadline.watchStallClock(waited, stalled::countDown);
 				long end = System.nanoTime() + STALL_TIMEOUT.multipliedBy(3).toNanos();
 				long step = STALL_TIMEOUT.dividedBy(ConnectionLimits.KeepAliveDeadline.STALL_SAMPLES * 4).toMillis();
 				while (System.nanoTime() < end && stalled.getCount() > 0) {

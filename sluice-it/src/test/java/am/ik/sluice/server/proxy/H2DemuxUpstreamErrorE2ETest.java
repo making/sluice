@@ -14,7 +14,6 @@ import java.util.function.BiConsumer;
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.junit.jupiter.api.TestInstance;
@@ -553,7 +552,6 @@ class H2DemuxUpstreamErrorE2ETest {
 	 * naming stream 1.
 	 */
 	@Test
-	@Disabled("the idle timeout: not yet on the h2 demux")
 	void aConnectionErrorWithNothingElseOpenLeavesTheConnectionToTheIdleTimeout() throws Exception {
 		String route = "ue.idle.test";
 		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {

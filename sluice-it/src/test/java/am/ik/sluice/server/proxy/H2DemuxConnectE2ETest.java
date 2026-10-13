@@ -33,7 +33,6 @@ import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.junit.jupiter.api.TestInstance;
@@ -228,7 +227,6 @@ class H2DemuxConnectE2ETest {
 	}
 
 	@Test
-	@Disabled("the idle timeout: not yet on the h2 demux")
 	void aConnectionOpeningWithAConnectIdlesOutAtTheIdleTimeout() throws Exception {
 		double idle = counter("sluice.data.connections.idle.closed");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
@@ -253,7 +251,6 @@ class H2DemuxConnectE2ETest {
 	 * stall timeout cuts the connection, the tunnel at rest not counting.
 	 */
 	@Test
-	@Disabled("the stall timeout: not yet on the h2 demux")
 	void aRequestStalledOnAConnectionOpeningWithAConnectIsCutAtTheStallTimeout() throws Exception {
 		double stalls = counter("sluice.data.connections.stall.closed");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {

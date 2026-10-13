@@ -1,6 +1,5 @@
 package am.ik.sluice.server.proxy.hop;
 
-import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -16,6 +15,7 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.LongConsumer;
 
 import am.ik.sluice.tunnel.DuplexPipe;
 import io.netty.buffer.ByteBuf;
@@ -91,10 +91,15 @@ import org.jspecify.annotations.Nullable;
  * without the loop's lock all go to the loop's exception sink, and the hop closes. A
  * write without the lock is dropped: released, its promise failed.
  * <p>
- * <b>Closing.</b> The peer's EOF, a broken pipe and {@link #abortLocked()} close the
- * channel at once; {@link #closeLocked()} is netty's graceful close (GOAWAY, then close
- * once the streams ended or the handler's graceful shutdown timeout ran out). Once the
- * channel closed, the writer writes what the channel wrote, half-closes the pipe and
+ * <b>Writing</b> goes to the pipe in pieces of at most the write piece bytes (small
+ * writes of the channel coalesced into one), each reported to the progress listener once
+ * the pipe took it: a peer taking the bytes slowly shows progress piece by piece.
+ * <p>
+ * <b>Closing.</b> The peer's EOF (unless the builder hands it to an EOF action, which
+ * leaves the channel open for writing), a broken pipe and {@link #abortLocked()} close
+ * the channel at once; {@link #closeLocked()} is netty's graceful close (GOAWAY, then
+ * close once the streams ended or the handler's graceful shutdown timeout ran out). Once
+ * the channel closed, the writer writes what the channel wrote, half-closes the pipe and
  * waits for the peer's EOF; at the close grace after the channel closed the pipe is
  * closed whatever the writer does (a peer not reading).
  * <p>
@@ -124,7 +129,8 @@ public final class Hop {
 	/** The most the reader reads from the pipe, and feeds into the channel, at once. */
 	public static final int MAX_READ_BYTES = 16 * 1024;
 
-	private static final int WRITE_BUFFER = 64 * 1024;
+	/** The default most the writer writes to the pipe at once. */
+	public static final int DEFAULT_WRITE_PIECE = 64 * 1024;
 
 	/** The user-defined writability bit the writer queue drives. */
 	private static final int QUEUE_WRITABILITY = 1;
@@ -148,6 +154,15 @@ public final class Hop {
 	private final Duration closeGrace;
 
 	private final @Nullable Runnable onInactive;
+
+	/** Run with the loop's lock at the peer's EOF in place of closing the channel. */
+	private final @Nullable Runnable onEof;
+
+	/** The most the writer writes to the pipe at once. */
+	private final int writePiece;
+
+	/** Told each piece the pipe took, on the writer thread without the lock. */
+	private final LongConsumer progress;
 
 	/** Run with the loop's lock after the writer wrote a batch, while watched. */
 	private final @Nullable Runnable onWritten;
@@ -224,8 +239,14 @@ public final class Hop {
 		this.readPauseBytes = builder.readPauseBytes;
 		this.closeGrace = builder.closeGrace;
 		this.onInactive = builder.onInactive;
+		this.onEof = builder.onEof;
+		this.writePiece = builder.writePiece;
+		this.progress = builder.progress;
 		if (this.lowWater < 0 || this.lowWater > this.highWater) {
 			throw new IllegalArgumentException("0 <= lowWater <= highWater is required");
+		}
+		if (this.writePiece <= 0) {
+			throw new IllegalArgumentException("writePiece must be positive");
 		}
 		if (!this.loop.heldByCurrentThread()) {
 			throw new IllegalStateException("a hop is built inside Loop#run");
@@ -233,7 +254,7 @@ public final class Hop {
 		// taken now, while the pipe is open: a socket closed later (by the writer, say)
 		// refuses to hand out its streams, where a read only ends
 		this.in = this.pipe.source();
-		this.out = new BufferedOutputStream(this.pipe.sink(), WRITE_BUFFER);
+		this.out = this.pipe.sink();
 		this.onWritten = builder.onWritten;
 		this.traffic = builder.traffic;
 		DefaultHttp2Connection connection = new DefaultHttp2Connection(builder.server);
@@ -598,12 +619,14 @@ public final class Hop {
 	}
 
 	private void read() {
+		boolean eof = false;
 		try {
 			InputStream in = this.in;
 			byte[] buffer = new byte[MAX_READ_BYTES];
 			while (awaitReadable()) {
 				int n = in.read(buffer);
 				if (n < 0) {
+					eof = true;
 					break;
 				}
 				this.bytesRead.addAndGet(n);
@@ -624,12 +647,34 @@ public final class Hop {
 		}
 		finally {
 			try {
-				// HTTP/2 has no half-closed connection: the peer's EOF ends it
-				this.loop.run(this::abortLocked);
+				Runnable onEof = this.onEof;
+				if (eof && onEof != null) {
+					this.loop.run(() -> peerEndedLocked(onEof));
+				}
+				else {
+					// HTTP/2 has no half-closed connection: the peer's EOF ends it
+					this.loop.run(this::abortLocked);
+				}
 			}
 			finally {
 				this.readerDone.countDown();
 			}
+		}
+	}
+
+	/**
+	 * The peer ended its side: the EOF action runs while the channel is open, the channel
+	 * staying open for writing; what it throws closes the channel. With the loop's lock.
+	 */
+	private void peerEndedLocked(Runnable onEof) {
+		if (!this.channel.isOpen()) {
+			return;
+		}
+		try {
+			onEof.run();
+		}
+		catch (RuntimeException | Error e) {
+			fail(e);
 		}
 	}
 
@@ -649,19 +694,11 @@ public final class Hop {
 
 	private void write() {
 		try {
-			OutputStream out = this.out;
 			List<byte[]> batch = new ArrayList<>();
+			byte[] piece = new byte[this.writePiece];
 			while (takeBatch(batch)) {
-				long written = 0;
-				for (byte[] bytes : batch) {
-					out.write(bytes);
-					written += bytes.length;
-				}
-				out.flush();
+				boolean turnWritable = writeBatch(batch, piece);
 				batch.clear();
-				this.bytesWritten.addAndGet(written);
-				this.traffic.written(written);
-				boolean turnWritable = written(written);
 				Runnable onWritten = this.watchingWrites ? this.onWritten : null;
 				if (turnWritable || onWritten != null) {
 					this.loop.run(() -> {
@@ -711,6 +748,50 @@ public final class Hop {
 			closePipe();
 			this.writerDone.countDown();
 		}
+	}
+
+	/**
+	 * Writes the batch in pieces of at most the write piece bytes: small arrays coalesced
+	 * in {@code piece}, large ones written in slices. Each piece taken counts as written
+	 * and is reported as progress. Whether the channel should turn writable.
+	 */
+	private boolean writeBatch(List<byte[]> batch, byte[] piece) throws IOException {
+		boolean turnWritable = false;
+		int filled = 0;
+		for (byte[] bytes : batch) {
+			int offset = 0;
+			while (offset < bytes.length) {
+				int remaining = bytes.length - offset;
+				if (filled == 0 && remaining >= piece.length) {
+					turnWritable |= writePiece(bytes, offset, piece.length);
+					offset += piece.length;
+					continue;
+				}
+				int n = Math.min(remaining, piece.length - filled);
+				System.arraycopy(bytes, offset, piece, filled, n);
+				filled += n;
+				offset += n;
+				if (filled == piece.length) {
+					turnWritable |= writePiece(piece, 0, filled);
+					filled = 0;
+				}
+			}
+		}
+		if (filled > 0) {
+			turnWritable |= writePiece(piece, 0, filled);
+		}
+		return turnWritable;
+	}
+
+	/** Writes one piece and accounts it; whether the channel should turn writable. */
+	private boolean writePiece(byte[] bytes, int offset, int length) throws IOException {
+		this.out.write(bytes, offset, length);
+		this.out.flush();
+		this.bytesWritten.addAndGet(length);
+		this.traffic.written(length);
+		boolean turnWritable = written(length);
+		this.progress.accept(length);
+		return turnWritable;
 	}
 
 	/** Moves the queue to the batch; {@code false} once the queue ended. */
@@ -1008,9 +1089,16 @@ public final class Hop {
 
 		private @Nullable Runnable onInactive;
 
+		private @Nullable Runnable onEof;
+
 		private @Nullable Runnable onWritten;
 
 		private Traffic traffic = Traffic.NONE;
+
+		private int writePiece = DEFAULT_WRITE_PIECE;
+
+		private LongConsumer progress = bytes -> {
+		};
 
 		private int highWater = DEFAULT_HIGH_WATER;
 
@@ -1079,6 +1167,35 @@ public final class Hop {
 		/** Runs with the loop's lock once the channel closed. */
 		public Builder onInactive(Runnable onInactive) {
 			this.onInactive = onInactive;
+			return this;
+		}
+
+		/**
+		 * Runs with the loop's lock at the peer's EOF, while the channel is open, in
+		 * place of closing it: the channel stays open for writing (the peer half-closed),
+		 * and the action decides when it closes. Unset, the EOF closes the channel at
+		 * once.
+		 */
+		public Builder onEof(Runnable onEof) {
+			this.onEof = onEof;
+			return this;
+		}
+
+		/**
+		 * The most the writer writes to the pipe at once, {@link #DEFAULT_WRITE_PIECE} by
+		 * default: each piece is reported to the progress listener once the pipe took it.
+		 */
+		public Builder writePiece(int writePiece) {
+			this.writePiece = writePiece;
+			return this;
+		}
+
+		/**
+		 * Told the bytes of each piece the pipe took, on the writer thread and without
+		 * the loop's lock: it must not block.
+		 */
+		public Builder progress(LongConsumer progress) {
+			this.progress = progress;
 			return this;
 		}
 

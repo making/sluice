@@ -1,6 +1,7 @@
 package am.ik.sluice.server.proxy;
 
 import java.io.ByteArrayInputStream;
+import java.io.FilterInputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.SequenceInputStream;
@@ -22,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.Predicate;
 
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -42,12 +44,15 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.http.HttpStatusClass;
+import io.netty.handler.codec.http2.Http2Connection;
 import io.netty.handler.codec.http2.Http2ConnectionAdapter;
 import io.netty.handler.codec.http2.Http2ConnectionHandlerBuilder;
 import io.netty.handler.codec.http2.Http2Error;
 import io.netty.handler.codec.http2.Http2Exception;
 import io.netty.handler.codec.http2.Http2FrameAdapter;
 import io.netty.handler.codec.http2.Http2Headers;
+import io.netty.handler.codec.http2.Http2LocalFlowController;
+import io.netty.handler.codec.http2.Http2RemoteFlowController;
 import io.netty.handler.codec.http2.Http2Settings;
 import io.netty.handler.codec.http2.Http2Stream;
 import io.netty.util.AsciiString;
@@ -136,11 +141,26 @@ import io.netty.util.AsciiString;
  * <p>
  * netty's codec answers the client's protocol errors itself; a header block that does not
  * decode ends the connection with a GOAWAY {@code COMPRESSION_ERROR}, logged as a request
- * line naming neither route, method nor path. The client endpoint's end -- EOF, error,
- * the codec closing it -- closes every leg. Once every hop's threads ended, the relay
- * finishes: the connection is logged closed and {@code onFinish} runs; {@code release}
- * follows once the frames the leg on the connection's own slot queued left the tunnel
- * sender too.
+ * line naming neither route, method nor path.
+ * <p>
+ * While the client has no stream open, the connection lives under the idle timeout of its
+ * {@link ConnectionLimits.KeepAliveDeadline}: a new stream stops it -- a PING does not --
+ * and a stream the relay answers itself starts it over. While a stream is open, the
+ * deadline's stall timeout counts the time the relay waits on the client
+ * ({@link #waitsOnClientLocked}); DATA read from the client, and each piece the client
+ * took of what the relay wrote ({@link ConnectionLimits.KeepAliveDeadline#WRITE_PIECE}),
+ * are progress. Either expiry sends the client a GOAWAY -- {@code NO_ERROR} for the idle
+ * timeout, {@code ENHANCE_YOUR_CALM} for the stall timeout -- naming the highest stream
+ * it opened, and closes the client endpoint; the transport is closed under a write the
+ * client does not read after the teardown grace.
+ * <p>
+ * The client's EOF with a request unfinished closes the client endpoint; otherwise the
+ * relay drains and probes the client ({@link #clientEndedLocked}). The client endpoint's
+ * end -- error, the codec closing it, a timeout -- closes every leg at once; the drain
+ * closes each leg as it empties, and the client endpoint after the last. Once every hop's
+ * threads ended, the relay finishes: the connection is logged closed and {@code onFinish}
+ * runs; {@code release} follows once the frames the leg on the connection's own slot
+ * queued left the tunnel sender too.
  */
 final class NettyHttp2DemuxRelay {
 
@@ -217,6 +237,15 @@ final class NettyHttp2DemuxRelay {
 
 	private static final String TUNNEL_BYTES = "sluice.tunnel.bytes";
 
+	private static final String CONNECT = "CONNECT";
+
+	private static final AsciiString EXPECT = AsciiString.cached("expect");
+
+	private static final AsciiString CONTINUE = AsciiString.cached("100-continue");
+
+	/** The payload of the PINGs probing a half-closed client: "sluice-p". */
+	private static final long PROBE_PAYLOAD = 0x736c756963652d70L;
+
 	private final DuplexPipe pipe;
 
 	private final byte[] seed;
@@ -246,6 +275,27 @@ final class NettyHttp2DemuxRelay {
 
 	/** How long a stream may wait for its upstream's concurrency limit; zero = no end. */
 	private final Duration streamWaitTimeout;
+
+	/** The quiet after which a half-closed client is probed with a PING; zero = never. */
+	private final Duration probeInterval;
+
+	/** The time the relay waited on its client, read by the deadline's stall watch. */
+	private final WaitClock clientWait = new WaitClock(() -> this.waitingOnClient);
+
+	/** When the client last took a piece of what the relay wrote, in nanoTime. */
+	private volatile long lastClientWrite = System.nanoTime();
+
+	/** The relay waits on its client right now; with the loop's lock. */
+	private boolean waitingOnClient;
+
+	/** The client ended its side (EOF) with every request ended; with the loop's lock. */
+	private boolean clientEnded;
+
+	/**
+	 * The client's side ended, every stream completed and every leg closed: the client
+	 * hop closes; with the loop's lock.
+	 */
+	private boolean drained;
 
 	private final Runnable onFinish;
 
@@ -335,6 +385,10 @@ final class NettyHttp2DemuxRelay {
 		if (this.streamWaitTimeout.isNegative()) {
 			throw new IllegalArgumentException("streamWaitTimeout must not be negative");
 		}
+		this.probeInterval = builder.probeInterval;
+		if (this.probeInterval.isNegative()) {
+			throw new IllegalArgumentException("probeInterval must not be negative");
+		}
 		this.onFinish = Objects.requireNonNull(builder.onFinish, "onFinish is required");
 		this.release = Objects.requireNonNull(builder.release, "release is required");
 		this.budget = Objects.requireNonNull(builder.budget, "budget is required");
@@ -342,6 +396,8 @@ final class NettyHttp2DemuxRelay {
 		this.loop = new Loop("sluice-h2n",
 				(source, cause) -> log.warn("h2 demux {}: {}", source, cause.toString(), cause));
 		this.loop.afterSettle(this::reviewLocked);
+		this.deadline.onExpiry(() -> tearDown(Http2Error.NO_ERROR));
+		this.deadline.watchStallClock(this.clientWait::nanos, () -> tearDown(Http2Error.ENHANCE_YOUR_CALM));
 	}
 
 	static Builder builder() {
@@ -364,7 +420,11 @@ final class NettyHttp2DemuxRelay {
 					.listener(ClientListener::new)
 					.codec(codec -> configure(codec, new Http2Settings().maxConcurrentStreams(MAX_CONCURRENT_STREAMS)))
 					.onInactive(this::clientClosedLocked)
+					.onEof(this::clientEndedLocked)
 					.onWritten(NettyHttp2DemuxRelay::reviewed)
+					// each piece the client takes is progress against the stall timeout
+					.writePiece(ConnectionLimits.KeepAliveDeadline.WRITE_PIECE)
+					.progress(this::clientTook)
 					.build();
 				this.client = hop;
 				hop.addConnectionListener(new ClientStreams());
@@ -372,6 +432,8 @@ final class NettyHttp2DemuxRelay {
 			});
 		}
 		catch (RuntimeException | Error e) {
+			// the deadline watches the relay from its construction on
+			this.deadline.disarm();
 			this.loop.close();
 			throw e;
 		}
@@ -407,10 +469,20 @@ final class NettyHttp2DemuxRelay {
 
 	/**
 	 * The client pipe reading the connection head first, then the socket; writes,
-	 * half-close and close stay the pipe's.
+	 * half-close and close stay the pipe's. The socket's EOF leaves the pipe open: a
+	 * {@code SequenceInputStream} closes each stream it read to the end, which would
+	 * close the socket under the responses a half-closed client still reads.
 	 */
 	private static DuplexPipe seeded(DuplexPipe pipe, byte[] seed) {
-		InputStream source = new SequenceInputStream(new ByteArrayInputStream(seed), pipe.source());
+		InputStream socket = new FilterInputStream(pipe.source()) {
+
+			@Override
+			public void close() {
+				// the pipe's close closes it
+			}
+
+		};
+		InputStream source = new SequenceInputStream(new ByteArrayInputStream(seed), socket);
 		return new DuplexPipe() {
 
 			@Override
@@ -495,6 +567,9 @@ final class NettyHttp2DemuxRelay {
 		exchange.host = host;
 		exchange.request = request;
 		exchange.requestEnded = endStream;
+		exchange.tunnel = CONNECT.equals(request.method());
+		CharSequence expect = headers.get(EXPECT);
+		exchange.continueAwaited = expect != null && AsciiString.contentEqualsIgnoreCase(expect, CONTINUE);
 		exchange.responseFlow.onEndWritten(() -> responseWrittenLocked(exchange));
 		this.exchanges.put(streamId, exchange);
 		leg.routeMeters.trackedStreams().increment();
@@ -788,10 +863,146 @@ final class NettyHttp2DemuxRelay {
 		leg.routeMeters.legs().decrement();
 	}
 
-	/** The client endpoint closed: so do the legs; with the loop's lock. */
+	/**
+	 * The client endpoint closed: so do the legs (closed already after a drain), and the
+	 * deadline ends: nothing is left to wait on the client for. With the loop's lock.
+	 */
 	private void clientClosedLocked() {
+		this.deadline.disarm();
 		for (Leg leg : this.opened) {
 			leg.hop().abortLocked();
+		}
+	}
+
+	/**
+	 * The client ended its side of the connection (EOF). HTTP/2 has no half-closed
+	 * connection, yet a client may half-close its socket and still read: with a request
+	 * unfinished -- a stream whose client side is still open, which can never complete
+	 * now -- the client endpoint closes at once; otherwise the relay drains: the
+	 * responses owed are written ({@link #drainLocked}), and the client is probed with a
+	 * PING after each probe interval without a write to it, so a client gone fails a
+	 * write and ends the relay. With the loop's lock.
+	 */
+	private void clientEndedLocked() {
+		Hop client = client();
+		if (activeStream(client, stream -> stream.state().remoteSideOpen()) != null) {
+			client.abortLocked();
+			return;
+		}
+		this.clientEnded = true;
+		probeLaterLocked(this.probeInterval.toNanos());
+	}
+
+	/** The client took a piece of what the relay wrote; on the client hop's writer. */
+	private void clientTook(long bytes) {
+		this.lastClientWrite = System.nanoTime();
+		this.deadline.progress(bytes);
+	}
+
+	/**
+	 * After the client's EOF: each leg with no stream left -- none open on its upstream
+	 * (its request bytes written), none waiting for one -- closes (its upstream sees the
+	 * end once the frames queued for it are out), and once the client has no stream open
+	 * and every leg closed, the client endpoint closes too. Until then the client stays
+	 * probed, and with no stream of its own open it idles under the idle timeout. Whether
+	 * it closed anything; with the loop's lock.
+	 */
+	private boolean drainLocked(Hop client) {
+		boolean acted = false;
+		boolean legsOpen = false;
+		for (Leg leg : this.opened) {
+			Hop hop = leg.hop();
+			if (hop.open() && hop.connection().numActiveStreams() == 0 && !waitsInLocked(leg)) {
+				hop.closeLocked();
+				acted = true;
+			}
+			legsOpen |= hop.open();
+		}
+		if (!legsOpen && client.connection().numActiveStreams() == 0) {
+			this.drained = true;
+			client.closeLocked();
+			acted = true;
+		}
+		return acted;
+	}
+
+	/** Whether a stream waits in the leg's buffer; with the loop's lock. */
+	private boolean waitsInLocked(Leg leg) {
+		for (Exchange exchange : this.exchanges.values()) {
+			if (exchange.leg == leg && exchange.waiting) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Schedules the next probe of a half-closed client; with the loop's lock. */
+	private void probeLaterLocked(long delayNanos) {
+		if (this.probeInterval.isZero()) {
+			return;
+		}
+		client().ctx().executor().schedule(this::probeLocked, delayNanos, TimeUnit.NANOSECONDS);
+	}
+
+	/**
+	 * Probes the half-closed client with a PING once nothing was written to it for the
+	 * probe interval and nothing waits to be (a write blocked on the client is the stall
+	 * timeout's): a client gone answers with a reset, failing the next write. With the
+	 * loop's lock.
+	 */
+	private void probeLocked() {
+		Hop client = client();
+		if (!client.open() || this.drained) {
+			return;
+		}
+		long interval = this.probeInterval.toNanos();
+		long quiet = System.nanoTime() - this.lastClientWrite;
+		if (quiet < interval || client.queuedBytes() > 0) {
+			probeLaterLocked(Math.max(interval - quiet, TimeUnit.MILLISECONDS.toNanos(1)));
+			return;
+		}
+		client.encoder().writePing(client.ctx(), false, PROBE_PAYLOAD, client.ctx().newPromise());
+		probeLaterLocked(interval);
+	}
+
+	/**
+	 * The idle or the stall timeout passed (on a thread of the deadline's): the client
+	 * gets a GOAWAY of {@code error} naming the highest stream it opened, and the client
+	 * endpoint closes, ending the relay. Returns once the client hop's threads ended, or
+	 * after the teardown grace -- a write the client does not read holds its writer --,
+	 * whereupon the deadline closes the transport under it.
+	 */
+	private void tearDown(Http2Error error) {
+		Hop client = this.client;
+		if (client == null) {
+			return;
+		}
+		this.loop.run(() -> {
+			if (!client.open()) {
+				return;
+			}
+			client.handler()
+				.goAway(client.ctx(), this.highestStreamId, error.code(), Unpooled.EMPTY_BUFFER,
+						client.ctx().newPromise());
+			// out before the close, which drops what the channel did not flush
+			client.ctx().flush();
+			client.abortLocked();
+		});
+		try {
+			client.awaitDone(ConnectionLimits.KeepAliveDeadline.TEARDOWN_GRACE);
+		}
+		catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
+	}
+
+	/** The first active stream of the hop matching the test, or null; with the lock. */
+	private static @Nullable Http2Stream activeStream(Hop hop, Predicate<Http2Stream> test) {
+		try {
+			return hop.connection().forEachActiveStream(stream -> !test.test(stream));
+		}
+		catch (Http2Exception e) {
+			throw new IllegalStateException(e);
 		}
 	}
 
@@ -1009,6 +1220,9 @@ final class NettyHttp2DemuxRelay {
 		if (this.accountsClosed || this.client == null) {
 			return false;
 		}
+		// watched before the queues are read: a writer emptying its queue after the
+		// reading below runs the review again
+		watchWritesLocked(true);
 		long queued = queuedLocked();
 		this.queued = queued;
 		settleShareLocked(queued);
@@ -1027,12 +1241,80 @@ final class NettyHttp2DemuxRelay {
 			this.budget.cancel(this.budgetRoom);
 			wrote |= withholdLocked(false);
 		}
-		boolean watch = watchingWrites();
+		watchWritesLocked(watchingWrites());
+		wrote |= reviewDeadlineLocked();
+		return wrote;
+	}
+
+	private void watchWritesLocked(boolean watch) {
 		client().watchWrites(watch);
 		for (Leg leg : this.opened) {
 			leg.hop().watchWrites(watch);
 		}
-		return wrote;
+	}
+
+	/**
+	 * Drives the connection's deadline: the idle timeout while the client has no stream
+	 * open, else the busy phase, whose stall timeout reads the time the relay waited on
+	 * the client ({@link #waitsOnClientLocked}); after the client's EOF, drains
+	 * ({@link #drainLocked}). Whether it closed anything; with the loop's lock.
+	 */
+	private boolean reviewDeadlineLocked() {
+		Hop client = client();
+		boolean acted = false;
+		if (client.open() && this.clientEnded && !this.drained) {
+			acted = drainLocked(client);
+		}
+		boolean busy = false;
+		if (client.open()) {
+			busy = client.connection().numActiveStreams() > 0;
+			this.deadline.enter(busy ? ConnectionLimits.KeepAliveDeadline.Phase.BUSY
+					: ConnectionLimits.KeepAliveDeadline.Phase.IDLE);
+		}
+		this.waitingOnClient = busy && waitsOnClientLocked(client);
+		this.clientWait.update();
+		return acted;
+	}
+
+	/**
+	 * Whether the relay waits on its client: what it wrote waits in the client hop's
+	 * writer queue (the client is not reading it, or has not yet), DATA towards the
+	 * client waits for a window the client has not granted (a stream's, or the
+	 * connection's), or a request is due from the client ({@link #requestDueLocked})
+	 * while it holds connection window to send it -- a window the relay withholds and the
+	 * client spent is not the client's stall. With the loop's lock.
+	 */
+	private boolean waitsOnClientLocked(Hop client) {
+		if (client.queuedBytes() > 0) {
+			return true;
+		}
+		Http2Connection connection = client.connection();
+		Http2RemoteFlowController remote = connection.remote().flowController();
+		Http2LocalFlowController local = connection.local().flowController();
+		Http2Stream connectionStream = connection.connectionStream();
+		boolean sendable = remote.windowSize(connectionStream) > 0;
+		// netty counts the connection window the hop holds back as granted
+		boolean clientMaySend = local.windowSize(connectionStream) - client.owedConnectionWindowLocked() > 0;
+		return activeStream(client, stream -> {
+			if (remote.hasFlowControlled(stream) && (!sendable || remote.windowSize(stream) <= 0)) {
+				return true;
+			}
+			Exchange exchange = this.exchanges.get(stream.id());
+			return clientMaySend && exchange != null && requestDueLocked(exchange, stream, local);
+		}) != null;
+	}
+
+	/**
+	 * Whether the exchange waits for request bytes its client may send: the request not
+	 * ended, the client holding stream window, no {@code 100 Continue} awaited, no
+	 * response in progress -- a final response head relayed and not ended makes it a
+	 * streaming exchange, whose request may rest -- and no CONNECT tunnel. With the
+	 * loop's lock.
+	 */
+	private static boolean requestDueLocked(Exchange exchange, Http2Stream stream, Http2LocalFlowController local) {
+		return !exchange.reset && !exchange.requestEnded && !exchange.tunnel && !exchange.continueAwaited
+				&& stream.state().remoteSideOpen() && (!stream.isHeadersSent() || exchange.responseEnded)
+				&& local.windowSize(stream) > 0;
 	}
 
 	/**
@@ -1270,6 +1552,15 @@ final class NettyHttp2DemuxRelay {
 
 		/** The upstream never saw the stream: the leg did not take it, or a GOAWAY. */
 		boolean refused;
+
+		/** A CONNECT stream: a tunnel, whose request may rest. */
+		boolean tunnel;
+
+		/**
+		 * The request asked for {@code 100 Continue} and neither a response head nor a
+		 * byte of its body passed yet: the client may hold its body back.
+		 */
+		boolean continueAwaited;
 
 		/** The stream waits in the leg's buffer for the upstream's concurrency limit. */
 		boolean waiting;
@@ -1541,16 +1832,24 @@ final class NettyHttp2DemuxRelay {
 			if (streamId <= NettyHttp2DemuxRelay.this.highestStreamId) {
 				return; // a later block of a stream the relay answered itself
 			}
+			// a new stream: the idle timeout, if it runs, starts over once the stream
+			// closed
+			if (!NettyHttp2DemuxRelay.this.deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.BUSY)) {
+				return; // a timeout passed: the connection is closing, the stream
+						// unprocessed
+			}
 			NettyHttp2DemuxRelay.this.highestStreamId = streamId;
 			routeLocked(streamId, headers, endStream);
 		}
 
 		@Override
 		public int onDataRead(ChannelHandlerContext ctx, int streamId, ByteBuf data, int padding, boolean endStream) {
+			NettyHttp2DemuxRelay.this.deadline.progress(data.readableBytes() + padding);
 			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.get(streamId);
 			if (exchange == null || exchange.reset) {
 				return data.readableBytes() + padding;
 			}
+			exchange.continueAwaited = false;
 			exchange.requestEnded |= endStream;
 			exchange.requestFlow.data(data, endStream);
 			// padding is consumed at once
@@ -1682,6 +1981,7 @@ final class NettyHttp2DemuxRelay {
 				resetForBudgetLocked(exchange);
 				return;
 			}
+			exchange.continueAwaited = false;
 			exchange.responseEnded |= endStream;
 			exchange.responseFlow.block(headers, endStream);
 		}
@@ -1819,6 +2119,8 @@ final class NettyHttp2DemuxRelay {
 
 		private Duration streamWaitTimeout = Duration.ZERO;
 
+		private Duration probeInterval = Duration.ZERO;
+
 		private @Nullable Runnable onFinish;
 
 		private @Nullable Runnable release;
@@ -1897,6 +2199,15 @@ final class NettyHttp2DemuxRelay {
 		 */
 		Builder streamWaitTimeout(Duration streamWaitTimeout) {
 			this.streamWaitTimeout = streamWaitTimeout;
+			return this;
+		}
+
+		/**
+		 * The quiet after which a client that ended its side, responses owed, is probed
+		 * with a PING; zero (the default) = never.
+		 */
+		Builder probeInterval(Duration probeInterval) {
+			this.probeInterval = probeInterval;
 			return this;
 		}
 
