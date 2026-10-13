@@ -12,6 +12,7 @@ import org.jspecify.annotations.Nullable;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
+import org.springframework.util.unit.DataSize;
 
 /**
  * Configuration of the sluice client.
@@ -47,15 +48,20 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	 * {@code sluice.client.upstream[n].{host,host-pattern,target,rewrite-host,force-http1,listen-port,allowed-cidrs,verbatim-idle-timeout}}
 	 * @param maxConnections upstream connections open at once over every server node; a
 	 * CONNECT beyond it is answered with an ERROR without dialing. {@code 0} = derived
-	 * from the maximum heap so the worst-case buffering of every connection fits in half
-	 * of it
+	 * from the maximum heap so what every connection buffers outside the tunnel budget,
+	 * and the budget, fit in half of it
+	 * @param tunnelBudget bytes the connections may buffer beyond each connection's
+	 * allowance, shared by all of them: the receive windows grown past the initial 64KiB,
+	 * and the frames a connection queues for the tunnel stream past one; {@code 0} = an
+	 * eighth of half the maximum heap
 	 * @param tunnelStallTimeout how long a tunnel stream may hold frames queued for the
 	 * server while not ready, the server taking none of them, before the stream is
 	 * cancelled -- its connections failed, the slots they hold freed -- and reconnected;
 	 * {@code 0} = off
 	 */
 	public record Client(@DefaultValue("") String id, @DefaultValue List<Upstream> upstream,
-			@DefaultValue("0") int maxConnections, @DefaultValue("60s") Duration tunnelStallTimeout) {
+			@DefaultValue("0") int maxConnections, @DefaultValue("60s") Duration tunnelStallTimeout,
+			@DefaultValue("0") DataSize tunnelBudget) {
 
 		public Client {
 			id = id == null ? "" : id;
@@ -63,6 +69,7 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 			maxConnections = Math.max(0, maxConnections);
 			tunnelStallTimeout = tunnelStallTimeout == null || tunnelStallTimeout.isNegative() ? DEFAULT_STALL_TIMEOUT
 					: tunnelStallTimeout;
+			tunnelBudget = tunnelBudget == null || tunnelBudget.isNegative() ? DataSize.ofBytes(0) : tunnelBudget;
 		}
 
 		public static Builder builder() {
@@ -78,6 +85,8 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 			private int maxConnections;
 
 			private Duration tunnelStallTimeout = DEFAULT_STALL_TIMEOUT;
+
+			private DataSize tunnelBudget = DataSize.ofBytes(0);
 
 			private Builder() {
 			}
@@ -102,8 +111,14 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 				return this;
 			}
 
+			public Builder tunnelBudget(DataSize tunnelBudget) {
+				this.tunnelBudget = tunnelBudget;
+				return this;
+			}
+
 			public Client build() {
-				return new Client(this.id, this.upstream, this.maxConnections, this.tunnelStallTimeout);
+				return new Client(this.id, this.upstream, this.maxConnections, this.tunnelStallTimeout,
+						this.tunnelBudget);
 			}
 
 		}
@@ -113,6 +128,11 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	/** The configured connection limit; {@code 0} = derived. */
 	public int maxConnections() {
 		return this.client == null ? 0 : this.client.maxConnections();
+	}
+
+	/** The configured tunnel budget; {@code 0} = derived. */
+	public DataSize tunnelBudget() {
+		return this.client == null ? DataSize.ofBytes(0) : this.client.tunnelBudget();
 	}
 
 	/** The configured tunnel stall timeout; {@code 0} = off. */
@@ -188,6 +208,8 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 
 		private Duration tunnelStallTimeout = DEFAULT_STALL_TIMEOUT;
 
+		private DataSize tunnelBudget = DataSize.ofBytes(0);
+
 		@Nullable private String token;
 
 		@Nullable private String tokenFile;
@@ -227,6 +249,11 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 
 		public Builder tunnelStallTimeout(Duration tunnelStallTimeout) {
 			this.tunnelStallTimeout = tunnelStallTimeout;
+			return this;
+		}
+
+		public Builder tunnelBudget(DataSize tunnelBudget) {
+			this.tunnelBudget = tunnelBudget;
 			return this;
 		}
 
@@ -272,6 +299,7 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 						.upstream(List.copyOf(this.upstreams))
 						.maxConnections(this.maxConnections)
 						.tunnelStallTimeout(this.tunnelStallTimeout)
+						.tunnelBudget(this.tunnelBudget)
 						.build(),
 					this.token == null ? "" : this.token, this.tokenFile, this.insecure, this.tlsBundle,
 					this.strictForwarding, this.keepAliveTime, this.keepAliveTimeout);

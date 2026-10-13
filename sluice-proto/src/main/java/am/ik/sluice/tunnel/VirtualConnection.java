@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -15,9 +16,10 @@ import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+
+import am.ik.sluice.v1.proto.WindowUpdate;
 
 /**
  * One multiplexed virtual TCP connection over the tunnel stream (the port of
@@ -29,25 +31,56 @@ import java.util.concurrent.locks.ReentrantLock;
  * half-close so the opposite direction may keep flowing (required for HTTP keep-alive and
  * half-duplex protocols).
  * <p>
- * Credit-based per-connection flow control: the remote may have at most the receive
- * window of DATA payload in flight beyond what this side granted back;
- * {@link #acceptData(byte[])} never blocks, and payload past the window fails only this
+ * Credit-based per-connection flow control: the remote may send at most the credit this
+ * side granted it, the initial window it announced and the increments since;
+ * {@link #acceptData(byte[])} never blocks, and payload past it fails only this
  * connection ({@code flow control window exceeded}). The payload is coalesced into
- * segments of at most {@link #SEGMENT_SIZE}, so the buffer stays within
- * {@link #MAX_RECEIVE_BUFFER} for the default window whatever the size of the frames. The
- * reader grants the bytes it consumed once they reach half the window. The writer sends
- * only against the credit the remote granted and waits for more on its own thread; the
- * credit lock is never held while the frame writer is called, so a grant on the receive
- * path never waits for a blocked writer. Closing while the remote may still send tells it
- * to stop with an ERROR, since a remote waiting for credit would otherwise wait forever.
+ * segments of at most {@link #SEGMENT_SIZE}, so the buffer stays within the window plus
+ * {@link #receiveBufferSlack} whatever the size of the frames. The writer sends only
+ * against the credit the remote granted and waits for more on its own thread; the credit
+ * lock is never held while the frame writer is called, so a grant on the receive path
+ * never waits for a blocked writer. Closing while the remote may still send tells it to
+ * stop with an ERROR, since a remote waiting for credit would otherwise wait forever.
+ * <p>
+ * The window -- what the remote may still send plus what it sent and the reader did not
+ * take, or took and was not granted back yet -- starts at the announced window and moves
+ * between it and the maximum window ({@link Builder#growWindow}). The reader decides at
+ * every half window it took, by what happened since the previous decision: when the
+ * remote said it was blocked -- it had DATA and no credit ({@code blocked}) -- it halves
+ * the window, granting back less than it took, if the reader never found its buffer empty
+ * meanwhile and is a quarter of the window behind (the reader was the bound), and doubles
+ * it if not (the window was); it halves it when the remote was not blocked for two
+ * decisions in a row (it left the window unused), and keeps it otherwise. A writer of
+ * this class tells the remote each time it starts waiting for credit. What the window
+ * holds past the announced one is charged to the {@link TunnelBudget} before the grant
+ * raising it leaves, within the account's share, and released as the window shrinks; a
+ * window the budget has no room for grows by what fits, or not at all, and the connection
+ * goes on within what it holds. A reader that waited {@code reclaimAfter} for payload
+ * with the window past the announced one asks the remote to give back the credit it holds
+ * past it ({@code reclaim_above}); a remote answering ({@code released}) lowers the
+ * window by what it gave up. Once the remote ended its direction, what the window holds
+ * past what is buffered is released, and on close everything.
  */
 public final class VirtualConnection implements AutoCloseable {
 
 	/**
-	 * The per-connection receive window both sides announce: 1MiB, grpc-java's default
-	 * HTTP/2 stream window.
+	 * The most a connection's receive window grows to: 1MiB, grpc-java's default HTTP/2
+	 * stream window; a connection built without a window announces it.
 	 */
 	public static final int DEFAULT_WINDOW = 1024 * 1024;
+
+	/**
+	 * The receive window a connection announces and holds outside the
+	 * {@link TunnelBudget}: 64KiB, the initial window of RFC 9113; what a connection
+	 * moves per round trip of the tunnel while the budget has no room.
+	 */
+	public static final int INITIAL_WINDOW = 64 * 1024;
+
+	/**
+	 * How long a reader waits for payload before it reclaims the credit the remote holds
+	 * past the announced window.
+	 */
+	public static final Duration RECLAIM_AFTER = Duration.ofSeconds(1);
 
 	/** The ERROR message sent for payload beyond the granted window. */
 	public static final String WINDOW_EXCEEDED = "flow control window exceeded";
@@ -72,8 +105,15 @@ public final class VirtualConnection implements AutoCloseable {
 	 * of the tail segment (under one segment each), and the overhead of
 	 * {@link #maxSegments} segments.
 	 */
-	static final long MAX_RECEIVE_BUFFER = DEFAULT_WINDOW + 2L * SEGMENT_SIZE
-			+ (long) maxSegments(DEFAULT_WINDOW) * SEGMENT_OVERHEAD;
+	static final long MAX_RECEIVE_BUFFER = DEFAULT_WINDOW + receiveBufferSlack(DEFAULT_WINDOW);
+
+	/**
+	 * The most heap the receive buffer of a connection holds outside the
+	 * {@link TunnelBudget}: the {@link #INITIAL_WINDOW} it announces and the slack of a
+	 * window grown to the {@link #DEFAULT_WINDOW}; the budget covers the window past the
+	 * announced one.
+	 */
+	public static final long RECEIVE_ALLOWANCE = INITIAL_WINDOW + receiveBufferSlack(DEFAULT_WINDOW);
 
 	/** A receive segment: the payload is {@code data[0, length)}. */
 	private static final class Segment {
@@ -98,8 +138,22 @@ public final class VirtualConnection implements AutoCloseable {
 
 	private final FrameWriter frameWriter;
 
-	/** The receive window announced to the remote. */
-	private final int receiveWindow;
+	/** The receive window announced to the remote; the window never shrinks below it. */
+	private final int initialWindow;
+
+	/** The most the receive window grows to. */
+	private final int maxWindow;
+
+	/** Charges the window past {@link #initialWindow}. */
+	private final TunnelBudget budget;
+
+	private final TunnelBudget.Account account;
+
+	/** How long the reader waits for payload before it reclaims the remote's credit. */
+	private final long reclaimAfterNanos;
+
+	/** Runs whenever the writer starts waiting for credit; a metrics hook. */
+	private final Runnable creditWaited;
 
 	/**
 	 * Guards the receive buffer and its end. Held for O(1) work and the copy of one frame
@@ -123,15 +177,45 @@ public final class VirtualConnection implements AutoCloseable {
 	private long readerWaits;
 
 	/**
+	 * The receive window: {@link #credit} + {@link #buffered} + {@link #pending}. Guarded
+	 * by {@link #inboundLock}, as are the fields below.
+	 */
+	private long window;
+
+	/** What the remote may still send: granted minus received minus released. */
+	private long credit;
+
+	/** The payload received and not yet read. */
+	private long buffered;
+
+	/** The payload read and not granted back yet. */
+	private long pending;
+
+	/** The remote said it was blocked since the latest decision. */
+	private boolean remoteBlocked;
+
+	/** The decisions in a row the remote was not blocked. */
+	private int unblocked;
+
+	/** The reader found the buffer empty since the latest decision. */
+	private boolean waited;
+
+	/** Test hook: the largest window granted. */
+	private long peakWindow;
+
+	/** A reclaim was asked since payload last arrived; not asked again until then. */
+	private boolean reclaimAsked;
+
+	/** Test hook: the reclaims asked. */
+	private long reclaims;
+
+	/**
 	 * How the inbound stream ends once the segments are read; null while open. The first
 	 * end the remote sends stays, and payload after it is dropped; {@link #close()} and a
 	 * window violation replace it, dropping the segments. Guarded by
 	 * {@link #inboundLock}.
 	 */
 	private @Nullable End end;
-
-	/** Payload received minus payload granted back. */
-	private final AtomicLong outstanding = new AtomicLong();
 
 	private final Source source = new Source();
 
@@ -144,6 +228,11 @@ public final class VirtualConnection implements AutoCloseable {
 
 	/** Payload the remote still accepts; guarded by {@link #writeLock}. */
 	private long sendCredit;
+
+	/**
+	 * Test hook: the times the writer waited for credit; guarded by {@link #writeLock}.
+	 */
+	private long creditWaits;
 
 	private volatile boolean closed;
 
@@ -185,14 +274,24 @@ public final class VirtualConnection implements AutoCloseable {
 	 */
 	private @Nullable Runnable onRemoteFailure;
 
-	private VirtualConnection(long connectionId, FrameWriter frameWriter, int receiveWindow, long sendCredit) {
-		this.connectionId = connectionId;
-		this.frameWriter = Objects.requireNonNull(frameWriter, "frameWriter is required");
-		this.receiveWindow = receiveWindow;
-		this.sendCredit = sendCredit;
+	private VirtualConnection(Builder builder) {
+		this.connectionId = builder.connectionId;
+		this.frameWriter = builder.frameWriter;
+		this.initialWindow = builder.receiveWindow;
+		this.maxWindow = Math.max(builder.receiveWindow, builder.maxWindow);
+		this.budget = builder.budget == null ? TunnelBudget.unlimited() : builder.budget;
+		this.account = this.budget.account();
+		this.reclaimAfterNanos = builder.reclaimAfter.toNanos();
+		this.creditWaited = builder.creditWaited;
+		this.sendCredit = builder.sendCredit;
+		this.window = this.initialWindow;
+		this.credit = this.initialWindow;
 	}
 
-	/** Builds a connection; both windows default to {@link #DEFAULT_WINDOW}. */
+	/**
+	 * Builds a connection; both windows default to {@link #DEFAULT_WINDOW}, and the
+	 * receive window grows no further.
+	 */
 	public static Builder builder(long connectionId, FrameWriter frameWriter) {
 		return new Builder(connectionId, frameWriter);
 	}
@@ -207,9 +306,50 @@ public final class VirtualConnection implements AutoCloseable {
 
 		private long sendCredit = DEFAULT_WINDOW;
 
+		/** 0 = the announced window. */
+		private int maxWindow;
+
+		private @Nullable TunnelBudget budget;
+
+		private Duration reclaimAfter = RECLAIM_AFTER;
+
+		private Runnable creditWaited = () -> {
+		};
+
 		private Builder(long connectionId, FrameWriter frameWriter) {
 			this.connectionId = connectionId;
 			this.frameWriter = Objects.requireNonNull(frameWriter, "frameWriter is required");
+		}
+
+		/**
+		 * Lets the receive window grow up to {@code maxWindow}, past the announced window
+		 * against {@code budget}; without it the window stays at the announced one.
+		 */
+		public Builder growWindow(int maxWindow, TunnelBudget budget) {
+			if (maxWindow <= 0) {
+				throw new IllegalArgumentException("maxWindow must be positive: " + maxWindow);
+			}
+			this.maxWindow = maxWindow;
+			this.budget = Objects.requireNonNull(budget, "budget is required");
+			return this;
+		}
+
+		/**
+		 * How long the reader waits for payload before it reclaims the credit the remote
+		 * holds past the announced window; {@link #RECLAIM_AFTER} by default.
+		 */
+		public Builder reclaimAfter(Duration reclaimAfter) {
+			if (reclaimAfter.isNegative() || reclaimAfter.isZero()) {
+				throw new IllegalArgumentException("reclaimAfter must be positive: " + reclaimAfter);
+			}
+			this.reclaimAfter = reclaimAfter;
+			return this;
+		}
+
+		/** Runs whenever the writer starts waiting for the remote's credit. */
+		public Builder creditWaited(Runnable creditWaited) {
+			this.creditWaited = Objects.requireNonNull(creditWaited, "creditWaited is required");
+			return this;
 		}
 
 		/**
@@ -228,7 +368,7 @@ public final class VirtualConnection implements AutoCloseable {
 		}
 
 		public VirtualConnection build() {
-			return new VirtualConnection(this.connectionId, this.frameWriter, this.receiveWindow, this.sendCredit);
+			return new VirtualConnection(this);
 		}
 
 	}
@@ -261,25 +401,35 @@ public final class VirtualConnection implements AutoCloseable {
 			endWith(EOF);
 			return;
 		}
-		if (this.outstanding.addAndGet(data.length) > this.receiveWindow) {
+		if (!append(data)) {
 			failWindowExceeded();
-			return;
 		}
-		append(data);
 	}
 
 	/**
-	 * Appends a copy of the payload, coalesced into the tail segment's room first, unless
-	 * the stream already ended.
+	 * Takes the payload from the remote's credit and appends a copy, coalesced into the
+	 * tail segment's room first, unless the stream already ended; false when it passes
+	 * the credit.
 	 */
-	private void append(byte[] data) {
+	private boolean append(byte[] data) {
 		this.inboundLock.lock();
 		try {
+			if (data.length > this.credit) {
+				return false;
+			}
+			this.credit -= data.length;
+			this.reclaimAsked = false;
 			if (this.end != null) {
-				return;
+				// dropped: it no longer counts against the window
+				this.window -= data.length;
+				settleLocked();
+				return true;
 			}
 			appendCoalesced(data);
+			this.buffered += data.length;
+			this.budget.addBuffered(data.length);
 			this.inboundChanged.signalAll();
+			return true;
 		}
 		finally {
 			this.inboundLock.unlock();
@@ -322,7 +472,10 @@ public final class VirtualConnection implements AutoCloseable {
 		return receiveWindow / SEGMENT_SIZE + Integer.numberOfTrailingZeros(SEGMENT_SIZE) + 2;
 	}
 
-	/** Ends the inbound stream after the buffered payload, unless it already ended. */
+	/**
+	 * Ends the inbound stream after the buffered payload, unless it already ended; the
+	 * window's charge past what is buffered is released.
+	 */
 	private void endWith(End end) {
 		this.inboundLock.lock();
 		try {
@@ -330,6 +483,7 @@ public final class VirtualConnection implements AutoCloseable {
 				this.end = end;
 				this.inboundChanged.signalAll();
 			}
+			settleLocked();
 		}
 		finally {
 			this.inboundLock.unlock();
@@ -337,19 +491,43 @@ public final class VirtualConnection implements AutoCloseable {
 	}
 
 	/**
-	 * Drops the buffered payload and ends the inbound stream at once with {@code end}.
+	 * Drops the buffered payload and ends the inbound stream at once with {@code end};
+	 * the window's charge is released for good.
 	 */
 	private void dropInbound(End end) {
 		this.inboundLock.lock();
 		try {
 			this.segments.clear();
 			this.headPosition = 0;
+			this.budget.addBuffered(-this.buffered);
+			this.buffered = 0;
 			this.end = end;
 			this.inboundChanged.signalAll();
+			this.account.close();
 		}
 		finally {
 			this.inboundLock.unlock();
 		}
+	}
+
+	/**
+	 * Once no more payload arrives -- the inbound stream ended -- the window holds only
+	 * what is buffered: the charge past it is released. With the inbound lock.
+	 */
+	private void settleLocked() {
+		if (this.end != null) {
+			this.account.resize(Math.max(0, this.buffered - this.initialWindow));
+		}
+	}
+
+	/**
+	 * The heap the receive buffer of a connection holds past its unread payload for a
+	 * window of {@code window}: the read part of the head segment and the room of the
+	 * tail segment (under one segment each), and the overhead of {@link #maxSegments}
+	 * segments.
+	 */
+	static long receiveBufferSlack(int window) {
+		return 2L * SEGMENT_SIZE + (long) maxSegments(window) * SEGMENT_OVERHEAD;
 	}
 
 	/**
@@ -380,6 +558,99 @@ public final class VirtualConnection implements AutoCloseable {
 	}
 
 	/**
+	 * Applies the remote's WINDOW_UPDATE: its grant, its request to give back the credit
+	 * past {@code reclaim_above}, the credit it released. Never blocks.
+	 */
+	public void windowUpdate(WindowUpdate update) {
+		if (update.getIncrement() != 0) {
+			grant(update.getIncrement());
+		}
+		if (update.getReclaimAbove() != 0) {
+			reclaim(update.getReclaimAbove());
+		}
+		if (update.getReleased() != 0) {
+			released(update.getReleased());
+		}
+		if (update.getBlocked()) {
+			remoteBlocked();
+		}
+	}
+
+	/**
+	 * The remote has DATA and no credit left: the reader's next decision may grow the
+	 * window.
+	 */
+	void remoteBlocked() {
+		this.inboundLock.lock();
+		try {
+			this.remoteBlocked = true;
+		}
+		finally {
+			this.inboundLock.unlock();
+		}
+	}
+
+	/**
+	 * The remote asks for the credit this side holds past {@code keep} (unsigned): it is
+	 * given up and announced as released, so the writer never sends those bytes.
+	 */
+	void reclaim(int keep) {
+		long kept = Integer.toUnsignedLong(keep);
+		long released;
+		this.writeLock.lock();
+		try {
+			released = Math.clamp(this.sendCredit - kept, 0, 0xFFFF_FFFFL);
+			this.sendCredit -= released;
+		}
+		finally {
+			this.writeLock.unlock();
+		}
+		if (released > 0) {
+			this.frameWriter.sendWindowReleased(this.connectionId, (int) released);
+		}
+	}
+
+	/**
+	 * The remote gave up {@code released} (unsigned) of its credit: the window drops by
+	 * it, and so does its charge. More than the remote may hold fails the connection like
+	 * payload past the window. A window left below the announced one is granted back up
+	 * to it.
+	 */
+	void released(int released) {
+		long amount = Integer.toUnsignedLong(released);
+		long increment = 0;
+		boolean exceeded = false;
+		this.inboundLock.lock();
+		try {
+			if (this.end != null) {
+				return;
+			}
+			if (amount > this.credit) {
+				exceeded = true;
+			}
+			else {
+				this.credit -= amount;
+				this.window -= amount;
+				if (this.window < this.initialWindow) {
+					increment = this.initialWindow - this.window;
+					this.credit += increment;
+					this.window = this.initialWindow;
+				}
+				this.account.resize(this.window - this.initialWindow);
+			}
+		}
+		finally {
+			this.inboundLock.unlock();
+		}
+		if (exceeded) {
+			failWindowExceeded();
+		}
+		else if (increment > 0) {
+			this.frameWriter.sendWindowUpdate(this.connectionId, (int) increment);
+		}
+	}
+
+	/**
 	 * The remote granted {@code increment} (unsigned) more payload bytes; wakes the
 	 * writer waiting for credit. Never blocks beyond the brief credit lock, which no
 	 * writer holds across a send.
@@ -403,6 +674,66 @@ public final class VirtualConnection implements AutoCloseable {
 	public void remoteClosed() {
 		this.remoteDone = true;
 		endWith(EOF);
+	}
+
+	/** Test hook: the receive window. */
+	long receiveWindow() {
+		this.inboundLock.lock();
+		try {
+			return this.window;
+		}
+		finally {
+			this.inboundLock.unlock();
+		}
+	}
+
+	/** Test hook: what the remote may still send. */
+	long receiveCredit() {
+		this.inboundLock.lock();
+		try {
+			return this.credit;
+		}
+		finally {
+			this.inboundLock.unlock();
+		}
+	}
+
+	/** Test hook: the largest window granted. */
+	long peakWindow() {
+		this.inboundLock.lock();
+		try {
+			return this.peakWindow;
+		}
+		finally {
+			this.inboundLock.unlock();
+		}
+	}
+
+	/** Test hook: the reclaims asked. */
+	long reclaims() {
+		this.inboundLock.lock();
+		try {
+			return this.reclaims;
+		}
+		finally {
+			this.inboundLock.unlock();
+		}
+	}
+
+	/** The bytes the connection charges to its {@link TunnelBudget}. */
+	public long charged() {
+		return this.account.charged();
+	}
+
+	/** Test hook: the times the writer waited for credit. */
+	long creditWaits() {
+		this.writeLock.lock();
+		try {
+			return this.creditWaits;
+		}
+		finally {
+			this.writeLock.unlock();
+		}
 	}
 
 	/** The remote terminated the connection abnormally. */
@@ -566,6 +897,7 @@ public final class VirtualConnection implements AutoCloseable {
 	 * caller sends.
 	 */
 	private int awaitCredit(int wanted) throws IOException {
+		boolean waiting = false;
 		this.writeLock.lock();
 		try {
 			while (true) {
@@ -583,6 +915,20 @@ public final class VirtualConnection implements AutoCloseable {
 					int granted = (int) Math.min(Math.min(this.sendCredit, wanted), SessionSender.MAX_CHUNK);
 					this.sendCredit -= granted;
 					return granted;
+				}
+				if (!waiting) {
+					// tells the remote once per wait, outside the credit lock
+					waiting = true;
+					this.creditWaits++;
+					this.writeLock.unlock();
+					try {
+						this.creditWaited.run();
+						this.frameWriter.sendWindowBlocked(this.connectionId);
+					}
+					finally {
+						this.writeLock.lock();
+					}
+					continue;
 				}
 				try {
 					// timed: the stream ending has no signal of its own here
@@ -691,11 +1037,17 @@ public final class VirtualConnection implements AutoCloseable {
 
 	private final class Source extends InputStream {
 
+		/** What {@link #take} returns when frames are due before it may go on. */
+		private static final int RETRY = -2;
+
 		/** The end was returned (EOF or the failure); later reads return EOF. */
 		private boolean endSeen;
 
-		/** Bytes handed to the reader and not yet granted back. */
-		private long consumed;
+		/** The grant to send once the reader left the lock; 0 = none. */
+		private long grantDue;
+
+		/** A reclaim to ask once the reader left the lock. */
+		private boolean reclaimDue;
 
 		@Override
 		public int read() throws IOException {
@@ -716,41 +1068,57 @@ public final class VirtualConnection implements AutoCloseable {
 			if (this.endSeen) {
 				return -1;
 			}
-			int n = take(b, off, len);
-			if (n < 0) {
-				return -1;
+			while (true) {
+				int n;
+				try {
+					n = take(b, off, len);
+				}
+				finally {
+					sendDue();
+				}
+				if (n != RETRY) {
+					return n;
+				}
 			}
-			consumed(n);
-			return n;
 		}
 
 		/**
 		 * Copies up to {@code len} buffered bytes, across segments, waiting while the
-		 * buffer is empty and the stream has not ended; -1 at the end.
+		 * buffer is empty and the stream has not ended; -1 at the end. Decides the window
+		 * at every half window taken ({@link #decideLocked}). Waits at most
+		 * {@code reclaimAfter} while the window is past the announced one and the remote
+		 * was not asked to give back its credit since payload last arrived: then reclaims
+		 * ({@link #reclaimLocked}) and returns {@link #RETRY}.
 		 */
 		private int take(byte[] b, int off, int len) throws IOException {
-			VirtualConnection.this.inboundLock.lock();
+			VirtualConnection outer = VirtualConnection.this;
+			outer.inboundLock.lock();
 			try {
+				long deadline = 0;
 				while (true) {
 					int n = 0;
 					Segment head;
-					while (n < len && (head = VirtualConnection.this.segments.peekFirst()) != null) {
-						int position = VirtualConnection.this.headPosition;
+					while (n < len && (head = outer.segments.peekFirst()) != null) {
+						int position = outer.headPosition;
 						int copied = Math.min(len - n, head.length - position);
 						System.arraycopy(head.data, position, b, off + n, copied);
 						n += copied;
 						if (position + copied == head.length) {
-							VirtualConnection.this.segments.pollFirst();
-							VirtualConnection.this.headPosition = 0;
+							outer.segments.pollFirst();
+							outer.headPosition = 0;
 						}
 						else {
-							VirtualConnection.this.headPosition = position + copied;
+							outer.headPosition = position + copied;
 						}
 					}
 					if (n > 0) {
+						outer.buffered -= n;
+						outer.budget.addBuffered(-n);
+						outer.pending += n;
+						decideLocked();
 						return n;
 					}
-					End end = VirtualConnection.this.end;
+					End end = outer.end;
 					if (end != null) {
 						this.endSeen = true;
 						String failure = end.failure();
@@ -759,9 +1127,27 @@ public final class VirtualConnection implements AutoCloseable {
 						}
 						return -1;
 					}
+					outer.waited = true;
 					try {
-						VirtualConnection.this.readerWaits++;
-						VirtualConnection.this.inboundChanged.await();
+						if (outer.window > outer.initialWindow && !outer.reclaimAsked) {
+							long now = System.nanoTime();
+							if (deadline == 0) {
+								outer.readerWaits++;
+								deadline = now + outer.reclaimAfterNanos;
+							}
+							else if (now - deadline >= 0) {
+								reclaimLocked();
+								return RETRY;
+							}
+							outer.inboundChanged.awaitNanos(deadline - now);
+						}
+						else {
+							if (deadline == 0) {
+								outer.readerWaits++;
+								deadline = System.nanoTime();
+							}
+							outer.inboundChanged.await();
+						}
 					}
 					catch (InterruptedException e) {
 						Thread.currentThread().interrupt();
@@ -770,25 +1156,108 @@ public final class VirtualConnection implements AutoCloseable {
 				}
 			}
 			finally {
-				VirtualConnection.this.inboundLock.unlock();
+				outer.inboundLock.unlock();
 			}
 		}
 
 		/**
-		 * Grants the consumed bytes back once they reach half the window; runs on the
-		 * reader's thread, never on the receive path.
+		 * At every half window the reader took, moves the window and grants what makes it
+		 * the new window: when the remote was blocked since the previous decision, halves
+		 * it (not below the announced window) if the reader never found the buffer empty
+		 * meanwhile and is a quarter of the window behind, and doubles it (within the
+		 * maximum, the share and what the budget has left) if not; halves it when the
+		 * remote was not blocked for two decisions in a row; keeps it otherwise. A window
+		 * shrinking below what is outstanding shrinks to that, granting nothing. Never on
+		 * a closed or ended connection: what an ended one holds is settled as it drains.
+		 * With the inbound lock.
 		 */
-		private void consumed(int n) {
-			this.consumed += n;
-			if (this.consumed < VirtualConnection.this.receiveWindow / 2 || VirtualConnection.this.closed) {
+		private void decideLocked() {
+			VirtualConnection outer = VirtualConnection.this;
+			if (outer.closed || outer.end != null) {
+				outer.pending = 0;
+				settleLocked();
 				return;
 			}
-			int increment = (int) this.consumed;
-			this.consumed = 0;
-			// lower the count before the grant leaves: the remote's next payload must
-			// never be measured against a stale count
-			VirtualConnection.this.outstanding.addAndGet(-increment);
-			VirtualConnection.this.frameWriter.sendWindowUpdate(VirtualConnection.this.connectionId, increment);
+			long window = outer.window;
+			if (outer.pending < window / 2) {
+				return;
+			}
+			long target;
+			if (outer.remoteBlocked && !outer.waited && outer.buffered >= window / 4) {
+				outer.unblocked = 0;
+				target = window / 2;
+			}
+			else if (outer.remoteBlocked) {
+				outer.unblocked = 0;
+				target = Math.min(outer.maxWindow, 2 * window);
+			}
+			else if (++outer.unblocked >= 2) {
+				outer.unblocked = 0;
+				target = window / 2;
+			}
+			else {
+				target = window;
+			}
+			outer.remoteBlocked = false;
+			outer.waited = false;
+			long initial = outer.initialWindow;
+			if (target > window) {
+				target = initial + outer.account.resize(target - initial);
+			}
+			// over its share, the window gives back what it can
+			long share = outer.account.share();
+			if (share < outer.maxWindow - initial) {
+				target = Math.min(target, initial + share);
+			}
+			grantLocked(Math.max(target, initial));
+		}
+
+		/**
+		 * The reader waited {@code reclaimAfter} for payload with the window past the
+		 * announced one: grants what it read up to the announced window and asks the
+		 * remote to give back the credit it holds past it. With the inbound lock.
+		 */
+		private void reclaimLocked() {
+			VirtualConnection outer = VirtualConnection.this;
+			grantLocked(outer.initialWindow);
+			outer.reclaimAsked = true;
+			if (outer.credit > outer.initialWindow) {
+				this.reclaimDue = true;
+				outer.reclaims++;
+			}
+		}
+
+		/**
+		 * Makes the window {@code target}, or what is outstanding when that is more:
+		 * grants the difference, credited before the grant leaves (the remote's next
+		 * payload must never be measured against a stale credit), and resizes the charge
+		 * to the window. With the inbound lock.
+		 */
+		private void grantLocked(long target) {
+			VirtualConnection outer = VirtualConnection.this;
+			long outstanding = outer.credit + outer.buffered;
+			long window = Math.max(target, outstanding);
+			long increment = window - outstanding;
+			outer.credit += increment;
+			outer.pending = 0;
+			outer.window = window;
+			outer.peakWindow = Math.max(outer.peakWindow, window);
+			outer.account.resize(window - outer.initialWindow);
+			this.grantDue += increment;
+		}
+
+		/** Sends the grant and the reclaim due, outside the lock. */
+		private void sendDue() {
+			VirtualConnection outer = VirtualConnection.this;
+			if (this.grantDue > 0) {
+				int increment = (int) this.grantDue;
+				this.grantDue = 0;
+				outer.frameWriter.sendWindowUpdate(outer.connectionId, increment);
+			}
+			if (this.reclaimDue) {
+				this.reclaimDue = false;
+				outer.frameWriter.sendWindowReclaim(outer.connectionId, outer.initialWindow);
+			}
 		}
 
 	}

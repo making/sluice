@@ -37,11 +37,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  * A large transfer over one windowed connection completes in either direction: the credit
  * keeps being granted back (a credit that got stuck would stall it).
  * <p>
- * The grant count is bounded, not exact: a reader grants what it consumed once that
- * reaches half the window, so a grant overshoots half the window by up to one read, and
- * the read sizes follow how the bytes arrived, which differs between platforms. A grant
- * is never smaller than half the window and never larger than the window, and completing
- * the transfer needs all but one window of it granted back.
+ * The grant count is bounded, not exact: a reader decides its window once it consumed
+ * half of it, so a grant overshoots half the window by up to one read, and the read sizes
+ * follow how the bytes arrived, which differs between platforms. The window starts at the
+ * initial 64KiB and grows to 1MiB while it bounds the transfer: a grant is never larger
+ * than the largest window, and completing the transfer needs all but one window of it
+ * granted back. A grant is at least half the initial window, and most are far larger: the
+ * transfer takes under a quarter of the grants the initial window would.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -53,8 +55,10 @@ class WindowedThroughputE2ETest {
 	private static final long MIN_GRANTS = (TRANSFER_BYTES - VirtualConnection.DEFAULT_WINDOW)
 			/ VirtualConnection.DEFAULT_WINDOW;
 
-	/** Every grant covers at least half the window. */
-	private static final long MAX_GRANTS = TRANSFER_BYTES / (VirtualConnection.DEFAULT_WINDOW / 2);
+	/**
+	 * A quarter of what grants of half the initial window would take: the window grew.
+	 */
+	private static final long MAX_GRANTS = TRANSFER_BYTES / (VirtualConnection.INITIAL_WINDOW / 2) / 4;
 
 	private static int grpcPort;
 

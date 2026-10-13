@@ -2384,6 +2384,7 @@ pub(crate) mod tests {
         peer.send(Body::WindowUpdate(crate::pb::WindowUpdate {
             conn_id: 1,
             increment: 100_000,
+            ..Default::default()
         }));
         let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
         assert_eq!(data_bytes(&frames, 1).len(), 100_000, "exactly the grant");

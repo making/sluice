@@ -185,11 +185,10 @@ class H2DemuxStallE2ETest {
 			assertThat(queued).as("the stall reached the leg queue when the second request was sent")
 				.isGreaterThan(0)
 				.isLessThanOrEqualTo(STREAM_QUEUE_BOUND);
-			// past what the relay queued, by most of the tunnel connection's credit
-			// window (frame headers spend some of it): the stall holds the tunnel path
-			// too, not only the relay
-			assertThat(client.streamSent(1)).as("bytes pushed on the stalled leg")
-				.isGreaterThan(queued + VirtualConnection.DEFAULT_WINDOW / 2);
+			// the relay handed the tunnel connection more than its initial window: the
+			// stall holds the tunnel path too, not only the relay
+			assertThat(relayedBytes("h2d.stall.test")).as("bytes relayed into the tunnel on the stalled leg")
+				.isGreaterThan(VirtualConnection.INITIAL_WINDOW);
 			assertThat(client.maxOvershoot()).isLessThanOrEqualTo(0);
 		}
 	}

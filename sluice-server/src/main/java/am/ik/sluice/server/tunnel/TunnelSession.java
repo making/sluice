@@ -28,6 +28,7 @@ import am.ik.sluice.tunnel.FrameWriter;
 import am.ik.sluice.tunnel.PeerBuilds;
 import am.ik.sluice.tunnel.SessionSender;
 import am.ik.sluice.tunnel.StreamRelay;
+import am.ik.sluice.tunnel.TunnelBudget;
 import am.ik.sluice.tunnel.VirtualConnection;
 import am.ik.sluice.v1.proto.Advertise;
 import am.ik.sluice.v1.proto.AdvertiseAck;
@@ -163,6 +164,12 @@ public final class TunnelSession implements AutoCloseable {
 
 	private final Runnable windowUpdateReceived;
 
+	/** What the connections' windows past the initial one are charged to. */
+	private final TunnelBudget budget;
+
+	/** Runs whenever a connection's writer starts waiting for the client's credit. */
+	private final Runnable creditWaited;
+
 	private final Duration advertiseTimeout;
 
 	private final Runnable advertiseTimedOut;
@@ -190,6 +197,8 @@ public final class TunnelSession implements AutoCloseable {
 		this.registry = Objects.requireNonNull(builder.registry, "registry is required");
 		this.closeTimeout = builder.closeTimeout;
 		this.windowUpdateReceived = builder.windowUpdateReceived;
+		this.budget = builder.budget == null ? TunnelBudget.unlimited() : builder.budget;
+		this.creditWaited = builder.creditWaited;
 		this.advertiseTimeout = builder.advertiseTimeout;
 		this.advertiseTimedOut = builder.advertiseTimedOut;
 		this.registered = builder.registered;
@@ -238,6 +247,11 @@ public final class TunnelSession implements AutoCloseable {
 		private LogThrottle streamLog = LogThrottle.unlimited();
 
 		private Runnable windowUpdateReceived = () -> {
+		};
+
+		private @Nullable TunnelBudget budget;
+
+		private Runnable creditWaited = () -> {
 		};
 
 		private PeerBuild serverBuild = PeerBuild.newBuilder()
@@ -346,6 +360,21 @@ public final class TunnelSession implements AutoCloseable {
 		/** Runs for every WINDOW_UPDATE received; a metrics hook. */
 		public Builder windowUpdateReceived(Runnable windowUpdateReceived) {
 			this.windowUpdateReceived = windowUpdateReceived;
+			return this;
+		}
+
+		/**
+		 * What the connections' receive windows past the initial one are charged to;
+		 * unlimited by default.
+		 */
+		public Builder budget(TunnelBudget budget) {
+			this.budget = budget;
+			return this;
+		}
+
+		/** Runs whenever a connection's writer starts waiting for the client's credit. */
+		public Builder creditWaited(Runnable creditWaited) {
+			this.creditWaited = creditWaited;
 			return this;
 		}
 
@@ -500,7 +529,7 @@ public final class TunnelSession implements AutoCloseable {
 				this.windowUpdateReceived.run();
 				VirtualConnection connection = this.connections.get(frame.getWindowUpdate().getConnId());
 				if (connection != null) {
-					connection.grant(frame.getWindowUpdate().getIncrement());
+					connection.windowUpdate(frame.getWindowUpdate());
 				}
 			}
 			case CLOSE -> {
@@ -670,9 +699,11 @@ public final class TunnelSession implements AutoCloseable {
 
 	/**
 	 * Opens a virtual connection to the given dial address and sends the CONNECT request
-	 * to the client, announcing this side's window. Its send credit is the client's
-	 * window, known once the client advertised: a session is found for routing only from
-	 * then on.
+	 * to the client, announcing this side's initial window
+	 * ({@link VirtualConnection#INITIAL_WINDOW}), which grows up to
+	 * {@link VirtualConnection#DEFAULT_WINDOW} against the budget. Its send credit is the
+	 * client's window, known once the client advertised: a session is found for routing
+	 * only from then on.
 	 * @throws IllegalStateException when the client has not advertised yet
 	 */
 	public VirtualConnection open(String address) {
@@ -682,13 +713,15 @@ public final class TunnelSession implements AutoCloseable {
 		}
 		long connectionId = this.sequence.getAndIncrement();
 		VirtualConnection connection = VirtualConnection.builder(connectionId, this.sender)
-			.window(VirtualConnection.DEFAULT_WINDOW, clientWindow)
+			.window(VirtualConnection.INITIAL_WINDOW, clientWindow)
+			.growWindow(VirtualConnection.DEFAULT_WINDOW, this.budget)
+			.creditWaited(this.creditWaited)
 			.build();
 		this.connections.put(connectionId, connection);
 		this.sender.sendConnect(Connect.newBuilder()
 			.setConnId(connectionId)
 			.setAddress(address)
-			.setConnectionWindow(VirtualConnection.DEFAULT_WINDOW)
+			.setConnectionWindow(VirtualConnection.INITIAL_WINDOW)
 			.build());
 		return connection;
 	}

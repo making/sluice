@@ -418,8 +418,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * worst-case buffering at once, the h2 queue budget aside: each connection reserves
 	 * what its tunnel connection buffers at accept, an h2 connection what its relay holds
 	 * outside the budget too, each further upstream connection of an h2 connection both;
-	 * {@code 0} = half the maximum heap less the h2 queue budget, or no bound with
-	 * {@code maxConnections} configured
+	 * {@code 0} = half the maximum heap less the h2 queue budget and the tunnel budget,
+	 * or no bound with {@code maxConnections} configured
 	 * @param overflowConnections connections past the connection limit served at once far
 	 * enough to be answered {@code 503} with {@code Retry-After} (on the data port: the
 	 * TLS handshake of a terminated route, the head), then closed; a connection past them
@@ -429,6 +429,10 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * header, TLS handshake, head, answer -- after which it is closed whatever it reached
 	 * @param overflowRetryAfter the {@code Retry-After} of the {@code 503} answering an
 	 * overflow connection, in whole seconds
+	 * @param tunnelBudget bytes the tunnel connections may buffer beyond each
+	 * connection's allowance, shared by all of them: the receive windows grown past the
+	 * initial 64KiB, and the frames a connection queues for the tunnel stream past one;
+	 * {@code 0} = an eighth of half the maximum heap
 	 */
 	public record Limits(@DefaultValue("0") int maxConnections, @DefaultValue("0") int maxConnectionsPerAddress,
 			@DefaultValue("10s") Duration headTimeout, @DefaultValue("60s") Duration idleTimeout,
@@ -439,7 +443,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			@DefaultValue("256") int maxPendingTunnelStreams, @DefaultValue("0") int maxPendingTunnelStreamsPerAddress,
 			@DefaultValue("1024") int maxTunnelSessions, @DefaultValue("0") int maxTunnelSessionsPerAddress,
 			@DefaultValue("0") DataSize connectionMemory, @DefaultValue("8") int overflowConnections,
-			@DefaultValue("5s") Duration overflowTimeout, @DefaultValue("5s") Duration overflowRetryAfter) {
+			@DefaultValue("5s") Duration overflowTimeout, @DefaultValue("5s") Duration overflowRetryAfter,
+			@DefaultValue("0") DataSize tunnelBudget) {
 
 		/** The default of {@code maxPendingTunnelStreams}. */
 		public static final int DEFAULT_MAX_PENDING_TUNNEL_STREAMS = 256;
@@ -484,6 +489,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 					? Duration.ofSeconds(5) : overflowTimeout;
 			overflowRetryAfter = overflowRetryAfter == null || overflowRetryAfter.isNegative() ? Duration.ofSeconds(5)
 					: overflowRetryAfter;
+			tunnelBudget = tunnelBudget == null || tunnelBudget.isNegative() ? DataSize.ofBytes(0) : tunnelBudget;
 		}
 
 		public static Builder builder() {
@@ -531,6 +537,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			@Nullable private Duration overflowTimeout;
 
 			@Nullable private Duration overflowRetryAfter;
+
+			@Nullable private DataSize tunnelBudget;
 
 			private Builder() {
 			}
@@ -635,6 +643,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder tunnelBudget(DataSize tunnelBudget) {
+				this.tunnelBudget = tunnelBudget;
+				return this;
+			}
+
 			public Limits build() {
 				return new Limits(this.maxConnections, this.maxConnectionsPerAddress,
 						this.headTimeout == null ? Duration.ofSeconds(10) : this.headTimeout,
@@ -652,7 +665,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 						this.connectionMemory == null ? DataSize.ofBytes(0) : this.connectionMemory,
 						this.overflowConnections,
 						this.overflowTimeout == null ? Duration.ofSeconds(5) : this.overflowTimeout,
-						this.overflowRetryAfter == null ? Duration.ofSeconds(5) : this.overflowRetryAfter);
+						this.overflowRetryAfter == null ? Duration.ofSeconds(5) : this.overflowRetryAfter,
+						this.tunnelBudget == null ? DataSize.ofBytes(0) : this.tunnelBudget);
 			}
 
 		}

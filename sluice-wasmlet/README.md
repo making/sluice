@@ -145,8 +145,13 @@ lines, prefixed with the component and a request id
   first bytes) through an `AsyncRead`/`AsyncWrite` adapter over the frame
   channels; no loopback sockets
 - per-connection flow control as in the root README: the wasmlet announces a
-  1MiB receive window per connection and grants back what hyper read; its
-  writes send only against the server's grants. A guest slow to read a
+  1MiB receive window per connection (fixed: it does not grow or shrink it)
+  and grants back what hyper read; its writes send only against the server's
+  grants, the server's initial window (64KiB) and what it grants beyond. A
+  write without credit tells the server once per wait (WindowUpdate
+  `blocked`), so the server grows its window up to 1MiB, and a server
+  reclaiming the credit past its initial window (`reclaim_above`) gets it
+  back (`released`). A guest slow to read a
   request body holds back only its own connection, and frames for the other
   connections keep flowing. A server without the window gets the old behavior
   (a connection whose guest does not read stalls the whole stream)

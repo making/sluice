@@ -2,7 +2,7 @@
 
 HTTP tunnel over a gRPC bidirectional stream, built on Spring Boot 4.1 and Spring gRPC.
 
-A single gRPC bidi stream multiplexes virtual TCP connections (`conn_id`). The data plane is a raw TCP proxy: the request head is inspected for routing (Host / :authority), so WebSocket upgrades and HTTP keep-alive pass through transparently. All blocking I/O runs on virtual threads; outbound frames are scheduled, not merely queued: control frames go first, connection frames wait on a per-connection bounded queue drained round-robin, and gRPC flow control is honored. Each virtual connection has its own credit window (1MiB per direction), so a connection whose reader stalls holds back only its own writer, never the stream.
+A single gRPC bidi stream multiplexes virtual TCP connections (`conn_id`). The data plane is a raw TCP proxy: the request head is inspected for routing (Host / :authority), so WebSocket upgrades and HTTP keep-alive pass through transparently. All blocking I/O runs on virtual threads; outbound frames are scheduled, not merely queued: control frames go first, connection frames wait on a per-connection bounded queue drained round-robin, and gRPC flow control is honored. Each virtual connection has its own credit window per direction (64KiB, grown up to 1MiB against a node-wide budget), so a connection whose reader stalls holds back only its own writer, never the stream.
 
 ## Architecture
 
@@ -48,11 +48,11 @@ sequenceDiagram
     B ->> S: TCP connect + HTTP request
     S ->> C: CONNECT(conn_id) via gRPC bidi stream
     C ->> U: dial Socket(address)
-    Note over S,C: VirtualConnection (1MiB credit window per direction, half-close)
+    Note over S,C: VirtualConnection (credit window per direction: 64KiB growing to 1MiB, half-close)
     loop raw relay (one virtual thread per direction)
         S ->> C: DATA(conn_id, 64K)
         C ->> U: bytes
-        C -->> S: WINDOW_UPDATE(conn_id) per 512K consumed
+        C -->> S: WINDOW_UPDATE(conn_id) per half window consumed
         U -->> C: bytes
         C ->> S: DATA(conn_id) / CLOSE
     end
@@ -63,7 +63,7 @@ sequenceDiagram
 - server: accept, route by `Host`, `VirtualConnection` + `CONNECT`, then raw relay (`SocketRelay`, one virtual thread per direction)
 - client: `CONNECT`, dial the local upstream (strict forwarding), same raw relay; upstream URLs with `https://` are dialed with TLS (trust-all)
 - flow control: bounded queues end to end; the gRPC send path honors `isReady()` on a dedicated sender thread, sends control frames before connection frames, and drains the per-connection queues round-robin so one busy connection cannot starve the others
-- per-connection flow control (credit windows, as in HTTP/2 streams): each side announces a 1MiB receive window per connection (`Advertise` / `Connect`), and a writer sends only against the credit its peer granted back with `WINDOW_UPDATE`. The receive path never blocks, so one stalled connection does not stall the others on the stream; a peer sending past its window fails only that connection. Bounds: a receiver buffers at most one window per connection, window x connections in total (the number of connections is capped, see "Connection limits"); and one connection has at most one window in flight, so its throughput is at most window / RTT (about 20MiB/s at 50ms). A peer without the window is refused: the server fails the tunnel stream of a client announcing none with `FAILED_PRECONDITION` (sluice-client 046cd21 / sluice-wasmlet f76388d or later required), and the client and the wasmlet answer a CONNECT without one with an ERROR for that connection (sluice-server 046cd21 or later required); each rejection is logged once
+- per-connection flow control (credit windows, as in HTTP/2 streams): the server and sluice-client announce a 64KiB receive window per connection (`Advertise` / `Connect`; sluice-wasmlet a fixed 1MiB), and a writer sends only against the credit its peer granted with `WINDOW_UPDATE`. The receive path never blocks, so one stalled connection does not stall the others on the stream; a peer sending past its credit fails only that connection. A receiver decides its window at every half window its reader took: a writer that runs out of credit says so (`WINDOW_UPDATE` with `blocked`), and the window doubles, up to 1MiB, when that happened while the reader kept up; it halves, granting back less than was read, when the writer was blocked but the reader never found its buffer empty and is a quarter of the window behind, or when the writer was not blocked for two decisions in a row. The part of a window past 64KiB is charged to the node's tunnel budget (`sluice.limits.tunnel-budget` / `sluice.client.tunnel-budget`) before the grant raising it leaves, within a share of the budget, and released as the window shrinks; a reader idle for 1s asks its peer to give back the credit past 64KiB (`reclaim_above`, answered with `released`), and the remote's end releases all but what is buffered. Bounds: a receiver buffers at most 64KiB per connection plus the budget in total (the number of connections is capped, see "Connection limits"); and one connection has at most one window in flight, so its throughput is at most window / RTT: about 50MiB/s at a 20ms tunnel round trip at the full 1MiB, about 3MiB/s at 64KiB. A peer without the window is refused: the server fails the tunnel stream of a client announcing none with `FAILED_PRECONDITION` (sluice-client 046cd21 / sluice-wasmlet f76388d or later required), and the client and the wasmlet answer a CONNECT without one with an ERROR for that connection (sluice-server 046cd21 or later required); each rejection is logged once
 
 ## Modules
 
@@ -258,8 +258,9 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.data-tls-bundle` | - | SSL bundle name for data plane TLS termination (h2 / http/1.1 via ALPN, `force-http1` flips the preference); unset = plaintext only (TLS connections are served by upstreams with `tls-passthrough=true`) |
 | `sluice.ca-bundle` | - | SSL bundle whose keystore holds the CA private key + certificate; enables client certificate issuance in the console (the signed certificates authenticate against the gRPC `client-auth=REQUIRE` truststore, no restart) |
 | `sluice.proxy-protocol` | `false` | parse the PROXY protocol (v1 / v2) header an SNAT front end prepends on the data plane: the header is consumed before routing / relay (never forwarded) and its source address becomes the connection peer for access control and the access log; headerless connections are unaffected, a malformed header fails the connection |
-| `sluice.limits.max-connections` | `0` = `connection-memory` / 2213KiB | connections open at once over the data port and every tcp route port (an h2 connection takes one more slot per further upstream connection open at once); see "Connection limits" |
-| `sluice.limits.connection-memory` | `0` = half the max heap less the h2 queue budget and 256KiB per overflow connection; unbounded when `max-connections` is set | bytes the data plane's connections may reserve for their worst-case buffering: 2213KiB per connection, 3048KiB more per h2 connection, 3673KiB per further upstream connection of an h2 connection; see "Connection limits" |
+| `sluice.limits.max-connections` | `0` = `connection-memory` / 293KiB | connections open at once over the data port and every tcp route port (an h2 connection takes one more slot per further upstream connection open at once); see "Connection limits" |
+| `sluice.limits.connection-memory` | `0` = half the max heap less the h2 queue budget, the tunnel budget and 256KiB per overflow connection; unbounded when `max-connections` is set | bytes the data plane's connections may reserve for their worst-case buffering outside the budgets: 293KiB per connection, 3048KiB more per h2 connection, 1753KiB per further upstream connection of an h2 connection; see "Connection limits" |
+| `sluice.limits.tunnel-budget` | `0` = an eighth of half the max heap | bytes the tunnel connections may buffer beyond each connection's allowance, shared by all of them: the receive windows grown past 64KiB (up to 1MiB each) and the frames a connection queues for the tunnel stream past one; see "Connection limits" |
 | `sluice.limits.overflow-connections` | `8` | data port connections past the connection limit answered `503` at once instead of closed at accept; `0` = every one closed at accept; see "Connection limits" |
 | `sluice.limits.overflow-timeout` | `5s` | one deadline from accept for all of an overflow connection (TLS handshake, request head, answer); see "Connection limits" |
 | `sluice.limits.overflow-retry-after` | `5s` | the `Retry-After` of the `503` answering an overflow connection, in whole seconds |
@@ -305,7 +306,8 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 |---|---|---|
 | `sluice.server-url` | - | tunnel server endpoint (`grpc://host:port` / `grpcs://host:port`) |
 | `sluice.client.id` | random, once per process | stable client identity sent as `x-sluice-id` on every stream; breaks route / listen-port ties in cluster mode |
-| `sluice.client.max-connections` | `0` = derived from the max heap | upstream connections open at once over every server node; a `CONNECT` beyond it is answered with an ERROR without dialing |
+| `sluice.client.max-connections` | `0` = (half the max heap - `tunnel-budget`) / 293KiB | upstream connections open at once over every server node; a `CONNECT` beyond it is answered with an ERROR without dialing |
+| `sluice.client.tunnel-budget` | `0` = an eighth of half the max heap | bytes the client's connections may buffer beyond each connection's allowance, shared by all of them, as `sluice.limits.tunnel-budget` on the server |
 | `sluice.client.tunnel-stall-timeout` | `60s` | how long a tunnel stream may hold frames queued for the server while not ready, the server taking none of them, before the stream is cancelled and reconnected; `0` = off; see "Connection limits" |
 | `sluice.client.upstream[n].host` | - | public domain routed by the server (empty = catch-all) |
 | `sluice.client.upstream[n].host-pattern` | - | regular expression the request host (without its port) is matched against, whole match; tried after the exact matches, before the catch-all, in natural order; overrides `host` when set |
@@ -683,11 +685,33 @@ client: Node's `fetch` (undici 7.28) fails on an unsolicited 100, while Python's
 response; the others skip a 100 too. Go before 1.24 fails a response at its sixth 1xx and
 the JDK `HttpClient` at its ninth, hence four.
 
-The most one relayed connection buffers on each side of the tunnel is its receive buffer
-+ its send queue cap (16 x 64KiB = 1MiB) + the two relay buffers (2 x 64KiB) = 2.16MiB.
-The receive buffer holds at most the 1MiB window of unread payload, coalesced into 16KiB
-segments whatever the size of the DATA frames, plus 37KiB: a partly read and a partly
-filled segment, and the overhead of at most 80 segments.
+What one relayed connection buffers on each side of the tunnel outside the tunnel budget
+is its receive buffer at the initial 64KiB window + one frame of its send queue (64KiB) +
+the two relay buffers (2 x 64KiB) = 293KiB. The receive buffer holds at most the window of
+unread payload, coalesced into 16KiB segments whatever the size of the DATA frames, plus
+37KiB: a partly read and a partly filled segment, and the overhead of at most 80 segments
+(a 1MiB window's). Past that, a connection's window grown beyond 64KiB (up to 960KiB more)
+and its send queue past one frame (up to 15 frames more, 960KiB) take from the tunnel
+budget (`sluice.limits.tunnel-budget`, an eighth of half the max heap; the client's
+`sluice.client.tunnel-budget` likewise), shared by every connection of the node: a
+connection grows only within its share -- the budget over the connections holding part of
+it plus one, so they leave room for one more -- and by what the budget has left, and a
+send queue past its frame waits for room, its own frames leaving letting it go on. A
+connection whose reader stops holds its window but grows no further; one whose budget
+share is cut gives back what it can as it drains. So a node's connections buffer at most
+293KiB each plus the budget: in `TunnelBudgetE2ETest` eight downloads whose clients stop
+reading, and eight uploads to upstreams that stop reading, stay within 8 x 64KiB plus a
+2MiB budget at every sample on the server and on the client (not 8 x 1MiB), and the public
+client going away, the upstream's reset and the verbatim idle timeout each release what
+the window took. The budget's size decides how many connections move at the full window
+at once: at a 20ms tunnel round trip a connection at 1MiB moves up to about 50MiB/s, one
+at 64KiB about 3MiB/s. The 25.6MiB budget of production's 409MiB heap holds the full
+receive window of 26 connections at once (each share above 960KiB), and every other
+connection keeps flowing at 64KiB; each MiB of budget costs 3.5 connections of the derived
+limit. With room, one connection grows to the full window: an 8MiB download or upload
+through a 20ms tunnel round trip takes about 18 waits for credit in
+`TunnelBudgetE2ETest`, where 64KiB alone would take 256, and an h2 connection's upstream
+connection grows the same way (`H2DemuxWindowRoundTripE2ETest`).
 
 h2 (plaintext and TLS-terminated) is demultiplexed on netty's HTTP/2 codec: the relay
 is the HTTP/2 endpoint of the client connection and a client of one upstream connection
@@ -713,9 +737,10 @@ at most one stream window in the relay, and the connection's other streams go on
 same upstream connection too. So an h2 connection moves at most 1MiB per round trip of a
 hop, all its streams together: a download at most 1MiB per tunnel round trip, an upload
 at most 1MiB per round trip of the client and at most the upstream's own windows per
-tunnel round trip. 1MiB is the tunnel's per-connection window: an upstream connection,
-one virtual connection, has no more than that in flight per tunnel round trip whatever
-the relay announces, the same bound as an HTTP/1.1 connection's. DATA held for a stream
+tunnel round trip. 1MiB is the most the tunnel's per-connection window grows to: an
+upstream connection, one virtual connection, has no more than its window in flight per
+tunnel round trip whatever the relay announces, the same bound as an HTTP/1.1
+connection's. DATA held for a stream
 is copied once, into buffers holding it in order and rounded up to 1KiB in all, however
 small the frames. What the relay holds -- that DATA and the header blocks not yet
 written, both ways, plus the writer queue of the client connection and of each upstream
@@ -761,11 +786,11 @@ upstream's 1140KiB and its own 320KiB writer queue, about 1460KiB
 
 Each connection reserves the worst case of what it buffers, from
 `sluice.limits.connection-memory`, once its protocol tells what that is. At accept every
-connection reserves its virtual connection's 2213KiB (2.16MiB, above), all an HTTP/1.1,
-TLS passthrough or tcp connection buffers. An h2 connection reserves 3048KiB more, its
+connection reserves its virtual connection's 293KiB (above), all an HTTP/1.1, TLS
+passthrough or tcp connection buffers outside the tunnel budget. An h2 connection reserves 3048KiB more, its
 relay's 1588KiB and its first upstream connection's 1460KiB, when its protocol is chosen:
 in the ALPN of a TLS handshake that offers h2, otherwise once its connection head is read;
-each further upstream connection of it reserves 3673KiB (its virtual connection and its
+each further upstream connection of it reserves 1753KiB (its virtual connection and its
 1460KiB) with its slot. All of it comes back when the slot does. A TLS client offering h2
 and HTTP/1.1 whose h2 bytes do not fit is given HTTP/1.1 (counted as
 `sluice.data.connections.h2.declined`); an h2 connection whose bytes do not fit otherwise
@@ -779,18 +804,21 @@ two downloading and two uploading eight stream windows each (32MiB in all) to a 
 does not read, and what their relays hold settles past the 2MiB budget and within it plus
 the 4 x 3048KiB they reserve.
 
-An unset (`0`) budget is an eighth of half the max heap, and unset (`0`) connection memory
-is half the max heap less the budget and the overflow's 256KiB per place; with
-`max-connections` set and no `connection-memory`, the bytes are not bounded and the
-configured count alone limits. An unset (`0`) connection limit is what the memory holds of
-connections reserving 2213KiB:
-`max(1, (max heap / 2 - budget - overflow x 256KiB) / 2213KiB)`. For the 409MiB heap a
-512Mi container gives the server in production that is 176.9MiB of connection memory and a
-limit of 81 connections, of which 34 h2 connections with one upstream connection each
-(5261KiB apiece); 80 for a 400MiB heap, 828 for 4GiB. Before the reservation was split by protocol,
-every slot reserved the 5261KiB of an h2 connection, and the 409MiB heap admitted 34
-connections of any kind. The windows set most of what an h2 connection reserves: each
-connection window adds 1MiB, once on the client's side and once per upstream connection.
+An unset (`0`) h2 queue budget and an unset tunnel budget are each an eighth of half the
+max heap, and unset (`0`) connection memory is half the max heap less both budgets and the
+overflow's 256KiB per place; with `max-connections` set and no `connection-memory`, the
+bytes are not bounded and the configured count alone limits. An unset (`0`) connection
+limit is what the memory holds of connections reserving 293KiB:
+`max(1, (max heap / 2 - h2 queue budget - tunnel budget - overflow x 256KiB) / 293KiB)`.
+For the 409MiB heap a 512Mi container gives the server in production that is 151.4MiB of
+connection memory and a limit of 529 connections, of which 46 h2 connections with one
+upstream connection each (3341KiB apiece); 517 for a 400MiB heap, 5361 for 4GiB. Before
+the tunnel budget, every connection reserved its full windows (2213KiB) and the 409MiB heap
+admitted 81 connections; before the reservation was split by protocol, every slot reserved
+an h2 connection's, and it admitted 34. The client derives its limit the same way:
+`max(1, (max heap / 2 - tunnel budget) / 293KiB)`. The relay's windows set most of what an
+h2 connection reserves: each connection window adds 1MiB, once on the client's side and
+once per upstream connection.
 The effective values are logged at startup (`data plane connection limit` / `upstream
 connection limit`) and exported as gauges; with the 512Mi container of `k8s.md` they
 follow the heap the server gets there.
@@ -873,7 +901,7 @@ debug, and the next line logged reports how many were demoted.
   cluster warmup window and while draining (see "Cluster (scale-out)")
 - client `GET /actuator/health` (port 9001) - UP while at least one per-node tunnel stream is
   established; the `tunnel` detail shows the connection state and `nodes` each node's stream state
-- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total` (for an h2 connection, what each of its upstream connections writes and reads on the tunnel, HTTP/2 framing included, by its route; the same bytes make the console's session traffic and the access log's `bytesIn` / `bytesOut`), `sluice_tunnel_sessions` (server: connected tunnel clients, the health detail `clients`; client: its tunnel streams established, one per server node), `sluice_connections_active`, `sluice_reconnect_total`, `sluice_advertise_rejected_total` (advertised listen ports the server rejected, client), `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_tunnel_stall_seconds` (how long a tunnel stream has held frames queued for its peer, not ready, with none taken; on the server the most stalled session's, 0 when none) / `sluice_tunnel_stall_failures_total` (tunnel streams failed by the stall watchdog), `sluice_tunnel_advertise_timeouts_total` (tunnel streams failed for a missing `Advertise`, server), `sluice_tunnel_streams_refused_total` (tunnel streams refused: past a bound on the registered sessions, at once or at the client's first `Advertise`, `reason` = `session-limit` / `session-address-limit`; past a bound on the streams waiting for their `Advertise`, `pending-limit` / `pending-address-limit`; or `draining`: one opened while the node drains, server), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_tunnel_sessions_build_unknown` (connected clients without a build, see "Console"), `sluice_h2demux_queued_bytes` (bytes the h2 demux holds of a route's streams, both ways, plus the upstream connections' writer queues, one series per route), `sluice_h2demux_held_bytes` (bytes every h2 demux relay holds, both ways, the client and upstream connections' writer queues included, as of each relay's last review), `sluice_h2demux_budget_bytes` / `sluice_h2demux_budget_used_bytes` (the shared h2 queue budget and the bytes charged to it, which may pass the budget by what the relays cannot refuse), `sluice_h2demux_window_withheld_total` (times a connection's windows were withheld, `reason` = `budget`: past its 128KiB with the budget exhausted / `share`: its share of the budget at 2MiB), `sluice_h2demux_streams_refused_total` (`reason` = `budget`: a head the budget had no room for / `share`: one taking its connection's share past 4MiB / `leg-limit`: a stream whose route needed a new upstream connection with no slot left / `waiting`: a stream waiting for its upstream's concurrency limit refused to free a connection whose window is withheld / `wait-timeout`: one refused past `sluice.limits.h2-stream-wait-timeout`), `sluice_h2demux_streams_reset_total` (streams the relay reset on its own account, `reason` = `budget`: a header block that did not fit the budget / `share`: one taking its connection's share past 4MiB / `interim`: an upstream's interim heads past 64KiB / `protocol`: netty's codec reset a client stream on its stream error / `upstream`: the same on an upstream's stream; a frame on a stream no longer known is answered with a reset that does not count), `sluice_h2demux_legs_failed_total` (upstream connections of an h2 connection ended by a connection error, with a GOAWAY of its code; a client or an upstream connection closing mid-stream counts in neither), `sluice_h2demux_streams_misdirected_total` (streams answered `421`, `reason` = `force-http1`) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_memory_bytes` (absent when unbounded) / `sluice_data_connections_memory_reserved_bytes` / `sluice_data_connections_rejected_total` (`reason` = `limit`: past the connection limit, the overflow's connections included / `address-limit` / `head-timeout` / `h2-limit`: an h2 connection whose relay's bytes did not fit) / `sluice_data_connections_overflow` (places of the overflow taken) / `sluice_data_connections_overflow_answered_total` (connections past the limit answered `503`, `protocol` = `h1` / `h2`) / `sluice_data_connections_h2_declined_total` (TLS connections offering h2 and HTTP/1.1 given HTTP/1.1, the h2 bytes not fitting) / `sluice_data_connections_idle_closed_total` (connections closed for idling between requests) / `sluice_data_connections_stall_closed_total` (connections closed for an exchange stalled on its client) / `sluice_data_connections_verbatim_idle_closed_total` (connections relayed verbatim closed by the verbatim idle timeout)
+- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total` (for an h2 connection, what each of its upstream connections writes and reads on the tunnel, HTTP/2 framing included, by its route; the same bytes make the console's session traffic and the access log's `bytesIn` / `bytesOut`), `sluice_tunnel_sessions` (server: connected tunnel clients, the health detail `clients`; client: its tunnel streams established, one per server node), `sluice_connections_active`, `sluice_reconnect_total`, `sluice_advertise_rejected_total` (advertised listen ports the server rejected, client), `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_tunnel_credit_waits_total` (times a connection had payload for its peer and waited for its credit), `sluice_tunnel_budget_bytes` / `sluice_tunnel_budget_used_bytes` (the tunnel budget and what the windows past 64KiB and the send queues past one frame take of it), `sluice_tunnel_buffered_bytes` (payload the peer sent that the relays have not read yet), `sluice_tunnel_stall_seconds` (how long a tunnel stream has held frames queued for its peer, not ready, with none taken; on the server the most stalled session's, 0 when none) / `sluice_tunnel_stall_failures_total` (tunnel streams failed by the stall watchdog), `sluice_tunnel_advertise_timeouts_total` (tunnel streams failed for a missing `Advertise`, server), `sluice_tunnel_streams_refused_total` (tunnel streams refused: past a bound on the registered sessions, at once or at the client's first `Advertise`, `reason` = `session-limit` / `session-address-limit`; past a bound on the streams waiting for their `Advertise`, `pending-limit` / `pending-address-limit`; or `draining`: one opened while the node drains, server), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_tunnel_sessions_build_unknown` (connected clients without a build, see "Console"), `sluice_h2demux_queued_bytes` (bytes the h2 demux holds of a route's streams, both ways, plus the upstream connections' writer queues, one series per route), `sluice_h2demux_held_bytes` (bytes every h2 demux relay holds, both ways, the client and upstream connections' writer queues included, as of each relay's last review), `sluice_h2demux_budget_bytes` / `sluice_h2demux_budget_used_bytes` (the shared h2 queue budget and the bytes charged to it, which may pass the budget by what the relays cannot refuse), `sluice_h2demux_window_withheld_total` (times a connection's windows were withheld, `reason` = `budget`: past its 128KiB with the budget exhausted / `share`: its share of the budget at 2MiB), `sluice_h2demux_streams_refused_total` (`reason` = `budget`: a head the budget had no room for / `share`: one taking its connection's share past 4MiB / `leg-limit`: a stream whose route needed a new upstream connection with no slot left / `waiting`: a stream waiting for its upstream's concurrency limit refused to free a connection whose window is withheld / `wait-timeout`: one refused past `sluice.limits.h2-stream-wait-timeout`), `sluice_h2demux_streams_reset_total` (streams the relay reset on its own account, `reason` = `budget`: a header block that did not fit the budget / `share`: one taking its connection's share past 4MiB / `interim`: an upstream's interim heads past 64KiB / `protocol`: netty's codec reset a client stream on its stream error / `upstream`: the same on an upstream's stream; a frame on a stream no longer known is answered with a reset that does not count), `sluice_h2demux_legs_failed_total` (upstream connections of an h2 connection ended by a connection error, with a GOAWAY of its code; a client or an upstream connection closing mid-stream counts in neither), `sluice_h2demux_streams_misdirected_total` (streams answered `421`, `reason` = `force-http1`) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_memory_bytes` (absent when unbounded) / `sluice_data_connections_memory_reserved_bytes` / `sluice_data_connections_rejected_total` (`reason` = `limit`: past the connection limit, the overflow's connections included / `address-limit` / `head-timeout` / `h2-limit`: an h2 connection whose relay's bytes did not fit) / `sluice_data_connections_overflow` (places of the overflow taken) / `sluice_data_connections_overflow_answered_total` (connections past the limit answered `503`, `protocol` = `h1` / `h2`) / `sluice_data_connections_h2_declined_total` (TLS connections offering h2 and HTTP/1.1 given HTTP/1.1, the h2 bytes not fitting) / `sluice_data_connections_idle_closed_total` (connections closed for idling between requests) / `sluice_data_connections_stall_closed_total` (connections closed for an exchange stalled on its client) / `sluice_data_connections_verbatim_idle_closed_total` (connections relayed verbatim closed by the verbatim idle timeout)
 
 ### Grafana dashboard
 

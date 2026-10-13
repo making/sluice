@@ -13,7 +13,9 @@ import am.ik.sluice.server.cluster.NodeDirectory;
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.PeerBuilds;
+import am.ik.sluice.tunnel.VirtualConnection;
 import am.ik.sluice.tunnel.SessionSender;
+import am.ik.sluice.tunnel.TunnelBudget;
 import am.ik.sluice.v1.proto.Frame;
 import am.ik.sluice.v1.proto.PeerBuild;
 import am.ik.sluice.v1.proto.TunnelGrpc;
@@ -74,6 +76,14 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	private final Counter advertiseTimeouts;
 
+	/**
+	 * What the connections of every session buffer beyond their allowance: the receive
+	 * windows grown past the initial window, the send queues past one frame.
+	 */
+	private final TunnelBudget budget;
+
+	private final Counter creditWaits;
+
 	private final Map<SessionRegistry.Refusal, Counter> refusals = new EnumMap<>(SessionRegistry.Refusal.class);
 
 	/** At most one refusal line per period, so refused streams cannot flood the log. */
@@ -108,6 +118,29 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			.description("How long the most stalled tunnel stream has held frames queued for its client, "
 					+ "not ready, with none taken; 0 when none is stalled")
 			.register(meterRegistry);
+		this.budget = new TunnelBudget(
+				TunnelBudget.resolve(properties.limits().tunnelBudget().toBytes(), Runtime.getRuntime().maxMemory()));
+		Gauge.builder("sluice.tunnel.budget.bytes", this.budget, TunnelBudget::max)
+			.baseUnit("bytes")
+			.description("Bytes the tunnel connections may buffer beyond each connection's allowance, shared")
+			.register(meterRegistry);
+		Gauge.builder("sluice.tunnel.budget.used.bytes", this.budget, TunnelBudget::used)
+			.baseUnit("bytes")
+			.description("Bytes the tunnel connections buffer, or granted their clients to send, beyond each "
+					+ "connection's allowance")
+			.register(meterRegistry);
+		Gauge.builder("sluice.tunnel.buffered.bytes", this.budget, TunnelBudget::buffered)
+			.baseUnit("bytes")
+			.description("Payload the tunnel clients sent that the relays have not read yet")
+			.register(meterRegistry);
+		this.creditWaits = Counter.builder("sluice.tunnel.credit.waits")
+			.description("Times a tunnel connection had payload for its client and waited for the client's credit")
+			.register(meterRegistry);
+		log.info("tunnel budget {}KiB ({}; a connection's window grows from {}KiB to {}KiB against it)",
+				this.budget.max() >> 10,
+				properties.limits().tunnelBudget().toBytes() > 0 ? "configured"
+						: "derived: an eighth of half of max heap",
+				VirtualConnection.INITIAL_WINDOW >> 10, VirtualConnection.DEFAULT_WINDOW >> 10);
 		this.advertiseTimeouts = Counter.builder("sluice.tunnel.advertise.timeouts")
 			.description("Tunnel streams failed because the client sent no Advertise within the advertise timeout")
 			.register(meterRegistry);
@@ -165,6 +198,7 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 		SessionSender sender = SessionSender.builder(responseObserver)
 			.windowUpdateSent(this.windowUpdatesSent::increment)
 			.stallTimeout(this.properties.limits().tunnelStallTimeout())
+			.budget(this.budget)
 			.stallAction(stalled -> {
 				this.stallFailures.increment();
 				log.warn("tunnel stream of client {} held frames queued, not ready, with none taken for {}ms: "
@@ -186,6 +220,8 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			.registry(this.sessions)
 			.tcpRoutes(this.tcpRoutes)
 			.windowUpdateReceived(this.windowUpdatesReceived::increment)
+			.budget(this.budget)
+			.creditWaited(this.creditWaits::increment)
 			.serverBuild(this.serverBuild)
 			.advertiseTimeout(this.properties.limits().advertiseTimeout())
 			.advertiseTimedOut(this.advertiseTimeouts::increment)

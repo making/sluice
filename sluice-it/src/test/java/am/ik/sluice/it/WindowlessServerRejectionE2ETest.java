@@ -108,7 +108,7 @@ class WindowlessServerRejectionE2ETest {
 		assertThat(this.clientMeters.get("sluice.connections.limit").gauge().value()).as("precondition: one slot")
 			.isEqualTo(1.0);
 		assertThat(this.fake.advertisedWindows).as("precondition: the client offers its window")
-			.containsExactly(VirtualConnection.DEFAULT_WINDOW);
+			.containsExactly(VirtualConnection.INITIAL_WINDOW);
 		assertThat(output.getAll().lines().filter(line -> line.contains("] server build: "))).singleElement()
 			.satisfies(line -> assertThat(line)
 				.endsWith("[grpc://127.0.0.1:" + grpcPort + "] server build: unknown (older build)"));

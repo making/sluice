@@ -25,6 +25,7 @@ import org.springframework.stereotype.Component;
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.ConnectionLimit;
+import am.ik.sluice.tunnel.TunnelBudget;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -38,18 +39,21 @@ import io.micrometer.core.instrument.MeterRegistry;
  * demux relays share.
  * <p>
  * Each connection reserves the worst case of what it buffers once its protocol tells what
- * that is ({@link ConnectionReserve}): at accept the buffering of the virtual connection
- * every connection is relayed over ({@link #connectionBytes()}); an h2 connection, once
- * its protocol is chosen, also what its demux relay holds outside the queue budget
- * ({@link #h2RelayBytes()}, {@link Admission#reserveH2Relay()}); each further leg of an
- * h2 connection open at once a slot of its own with its virtual connection and its part
- * outside the budget ({@link #legBytes()}, {@link #tryAcquireLeg()}). So the bytes
- * reserved and the budget bound the buffering of every connection open, whatever its
- * protocol, and an HTTP/1.1, passthrough or tcp connection reserves no h2 relay's worst
- * case. The reservable bytes default to half the maximum heap less the budget, and the
- * cap on connections to the connections reserving {@link #connectionBytes()} each that
- * they hold; a configured cap with no configured bytes leaves the bytes unbounded, the
- * cap alone counting.
+ * that is ({@link ConnectionReserve}): at accept what the virtual connection every
+ * connection is relayed over buffers outside the tunnel budget
+ * ({@link #connectionBytes()}; the tunnel budget, {@link TunnelBudget}, covers its
+ * windows grown past the initial one and its send queue past one frame); an h2
+ * connection, once its protocol is chosen, also what its demux relay holds outside the
+ * queue budget ({@link #h2RelayBytes()}, {@link Admission#reserveH2Relay()}); each
+ * further leg of an h2 connection open at once a slot of its own with its virtual
+ * connection and its part outside the budget ({@link #legBytes()},
+ * {@link #tryAcquireLeg()}). So the bytes reserved and the budget bound the buffering of
+ * every connection open, whatever its protocol, and an HTTP/1.1, passthrough or tcp
+ * connection reserves no h2 relay's worst case. The reservable bytes default to half the
+ * maximum heap less the h2 queue budget and the tunnel budget, and the cap on connections
+ * to the connections reserving {@link #connectionBytes()} each that they hold; a
+ * configured cap with no configured bytes leaves the bytes unbounded, the cap alone
+ * counting.
  * <p>
  * A connection is admitted at accept ({@link #admit}) and holds its {@link Admission}
  * until it ended and the frames its virtual connections queued left the tunnel sender (a
@@ -150,8 +154,9 @@ public class ConnectionLimits implements DisposableBean {
 		this.overflow = new Semaphore(this.maxOverflow);
 		this.overflowTimeout = limits.overflowTimeout();
 		this.overflowRetryAfter = limits.overflowRetryAfter();
+		long tunnelBudget = TunnelBudget.resolve(limits.tunnelBudget().toBytes(), maxHeap);
 		long memory = configuredMemory > 0 ? configuredMemory : limits.maxConnections() > 0
-				? ConnectionReserve.UNBOUNDED : deriveMemory(maxHeap, budget, this.maxOverflow);
+				? ConnectionReserve.UNBOUNDED : deriveMemory(maxHeap, budget + tunnelBudget, this.maxOverflow);
 		this.reserve = new ConnectionReserve(
 				limits.maxConnections() > 0 ? limits.maxConnections() : deriveMaxConnections(memory), memory);
 		int perAddress = limits.maxConnectionsPerAddress();
@@ -215,10 +220,10 @@ public class ConnectionLimits implements DisposableBean {
 				limits.maxConnections() > 0 ? "configured"
 						: "derived: connection memory / %dKiB per connection".formatted(connectionBytes() >> 10),
 				memory == ConnectionReserve.UNBOUNDED ? "unbounded" : (memory >> 10) + "KiB",
-				configuredMemory > 0 ? "configured"
-						: limits.maxConnections() > 0 ? "the configured connection limit alone counts"
-								: "derived: half of max heap %dMiB - h2 queue budget - overflow %d x %dKiB"
-									.formatted(maxHeap >> 20, this.maxOverflow, OVERFLOW_BYTES >> 10),
+				configuredMemory > 0 ? "configured" : limits.maxConnections() > 0
+						? "the configured connection limit alone counts"
+						: "derived: half of max heap %dMiB - h2 queue budget - tunnel budget %dKiB - overflow %d x %dKiB"
+							.formatted(maxHeap >> 20, tunnelBudget >> 10, this.maxOverflow, OVERFLOW_BYTES >> 10),
 				connectionBytes() >> 10, h2RelayBytes() >> 10, legBytes() >> 10, this.maxOverflow, this.overflowTimeout,
 				this.overflowRetryAfter.toSeconds(), this.maxPerAddress, this.headTimeout, this.idleTimeout,
 				this.stallTimeout, this.stallMinBytes,
@@ -228,8 +233,9 @@ public class ConnectionLimits implements DisposableBean {
 	}
 
 	/**
-	 * What every connection reserves at accept: the buffering of the virtual connection
-	 * it is relayed over, all an HTTP/1.1, passthrough or tcp connection buffers.
+	 * What every connection reserves at accept: what the virtual connection it is relayed
+	 * over buffers outside the tunnel budget, all an HTTP/1.1, passthrough or tcp
+	 * connection buffers besides.
 	 */
 	static long connectionBytes() {
 		return ConnectionLimit.CONNECTION_BYTES;
@@ -258,11 +264,11 @@ public class ConnectionLimits implements DisposableBean {
 
 	/**
 	 * The bytes the connections may reserve an unset value derives: half the heap less
-	 * the h2 queue budget and what {@code overflow} overflow connections hold
-	 * ({@link #OVERFLOW_BYTES} each).
+	 * {@code budgets} (the h2 queue budget and the tunnel budget) and what
+	 * {@code overflow} overflow connections hold ({@link #OVERFLOW_BYTES} each).
 	 */
-	static long deriveMemory(long maxHeap, long budget, int overflow) {
-		return Math.max(0, maxHeap / 2 - budget - overflow * OVERFLOW_BYTES);
+	static long deriveMemory(long maxHeap, long budgets, int overflow) {
+		return Math.max(0, maxHeap / 2 - budgets - overflow * OVERFLOW_BYTES);
 	}
 
 	/**

@@ -70,7 +70,8 @@ message Connect {
   int64 conn_id = 1;
   // Dial target ("host:port").
   string address = 2;
-  // Server's receive window for this connection, in bytes. 0 (a server
+  // Server's initial receive window for this connection, in bytes; it may
+  // grant more (WindowUpdate) and reclaim what was left unused. 0 (a server
   // without per-connection flow control, before 046cd21) is answered with an
   // Error for the connection.
   uint32 connection_window = 3;
@@ -89,7 +90,8 @@ message Error {
 message Advertise {
   // Upstream services exposed by the client.
   repeated Upstream upstreams = 1;
-  // Client's receive window per connection, in bytes. 0 (a client without
+  // Client's initial receive window per connection, in bytes; it may grant
+  // more (WindowUpdate) and reclaim what was left unused. 0 (a client without
   // per-connection flow control: sluice-client before 046cd21, sluice-wasmlet
   // before f76388d) fails the tunnel stream with FAILED_PRECONDITION.
   uint32 connection_window = 2;
@@ -113,12 +115,26 @@ message PeerBuild {
 }
 
 // Either direction: the sender consumed `increment` more payload bytes of
-// `conn_id`; the receiver may send that many more. A peer sending DATA beyond
-// the window it was granted fails that connection with an Error ("flow control
-// window exceeded"); the stream stays up.
+// `conn_id`, or grants that many beyond them; the receiver may send that many
+// more. A peer sending DATA beyond the window it was granted fails that
+// connection with an Error ("flow control window exceeded"); the stream stays
+// up. A peer predating `reclaim_above`, `released` and `blocked` ignores
+// them.
 message WindowUpdate {
   int64 conn_id = 1;
   uint32 increment = 2;
+  // Non-zero: the sender of this update asks the receiver to give back the
+  // credit it holds for `conn_id` beyond this many bytes (the receiver of the
+  // DATA reclaims a window its peer leaves unused). 0 = no request.
+  uint32 reclaim_above = 3;
+  // Non-zero: the sender of this update gave up this much of the credit it
+  // held for `conn_id`, answering a `reclaim_above`; it never sends those
+  // bytes. 0 = none.
+  uint32 released = 4;
+  // True: the sender of this update has DATA for `conn_id` and no credit left
+  // to send it; sent once each time it starts waiting for credit. The receiver
+  // may take it as its window being the bound and grant more.
+  bool blocked = 5;
 }
 
 message KeepAlive {

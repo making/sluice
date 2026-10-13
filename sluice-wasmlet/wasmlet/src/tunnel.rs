@@ -18,7 +18,10 @@
 //!   half the window;
 //! - hyper's writes send only against the server's credit; a write without
 //!   credit waits on its own task until a grant, the server's ERROR or the
-//!   stream's end;
+//!   stream's end, and tells the server once per wait (WindowUpdate
+//!   `blocked`), so that the server may grow its window;
+//! - the server's request to give back the credit past `reclaim_above` is
+//!   answered by giving it up and announcing it (WindowUpdate `released`);
 //! - a connection ending before the server's CLOSE / ERROR arrived sends ERROR
 //!   ("connection closed"), since the payload the server still sends would be
 //!   dropped and never granted.
@@ -474,6 +477,8 @@ struct FlowState {
     error_sent: bool,
     /// The writer waiting for credit.
     writer: Option<Waker>,
+    /// The server was told the writer waits for credit; cleared by a grant.
+    blocked_sent: bool,
     /// The server's payload not yet read.
     inbox: Inbox,
     /// How the inbound stream ends once the inbox is read: the server's first
@@ -646,11 +651,24 @@ impl Flow {
         let waker = {
             let mut state = self.lock();
             state.credit = state.credit.saturating_add(u64::from(increment));
+            state.blocked_sent = false;
             state.writer.take()
         };
         if let Some(waker) = waker {
             waker.wake();
         }
+    }
+
+    /// The server asks for the credit past `keep`: gives it up; what was given
+    /// up, to announce as released.
+    fn reclaim(&self, keep: u32) -> u32 {
+        let mut state = self.lock();
+        let released = state
+            .credit
+            .saturating_sub(u64::from(keep))
+            .min(u64::from(u32::MAX));
+        state.credit -= released;
+        released as u32
     }
 
     /// The server's CLOSE: the reader ends after the inbox. True the first
@@ -776,7 +794,21 @@ impl Connections {
             Body::WindowUpdate(update) => {
                 // ignored for unknown connections, as on the Java side
                 if let Some(flow) = self.lookup(update.conn_id) {
-                    flow.grant(update.increment);
+                    if update.increment != 0 {
+                        flow.grant(update.increment);
+                    }
+                    if update.reclaim_above != 0 {
+                        let released = flow.reclaim(update.reclaim_above);
+                        if released > 0 {
+                            self.outbound.control(Frame {
+                                body: Some(Body::WindowUpdate(WindowUpdate {
+                                    conn_id: update.conn_id,
+                                    released,
+                                    ..Default::default()
+                                })),
+                            });
+                        }
+                    }
                 }
             }
             // session frames are the receive loop's; KeepAlive is a no-op
@@ -1023,6 +1055,7 @@ impl TunnelIo {
             body: Some(Body::WindowUpdate(WindowUpdate {
                 conn_id: self.conn_id,
                 increment: increment as u32,
+                ..Default::default()
             })),
         });
     }
@@ -1069,6 +1102,17 @@ impl AsyncWrite for TunnelIo {
             if state.credit == 0 {
                 // a grant, the server's ERROR or the teardown wakes it
                 state.writer = Some(cx.waker().clone());
+                let tell = !std::mem::replace(&mut state.blocked_sent, true);
+                drop(state);
+                if tell {
+                    this.outbound.control(Frame {
+                        body: Some(Body::WindowUpdate(WindowUpdate {
+                            conn_id: this.conn_id,
+                            blocked: true,
+                            ..Default::default()
+                        })),
+                    });
+                }
                 return Poll::Pending;
             }
         }
@@ -1231,6 +1275,7 @@ pub(crate) mod testing {
                 self.connections.dispatch(Body::WindowUpdate(WindowUpdate {
                     conn_id: data.conn_id,
                     increment: data.payload.len() as u32,
+                    ..Default::default()
                 }));
             }
             Some(frame)
@@ -1393,6 +1438,7 @@ mod tests {
         peer.send(Body::WindowUpdate(WindowUpdate {
             conn_id: 1,
             increment: 4,
+            ..Default::default()
         }));
         assert_eq!(
             wakes.0.load(Ordering::SeqCst),
@@ -1404,15 +1450,96 @@ mod tests {
         };
         assert_eq!(n, 4);
 
-        let sizes: Vec<usize> = drain_frames(&mut peer)
-            .await
-            .into_iter()
-            .map(|body| match body {
-                Body::Data(data) => data.payload.len(),
-                other => panic!("only DATA: {other:?}"),
+        let frames = drain_frames(&mut peer).await;
+        let sizes: Vec<usize> = frames
+            .iter()
+            .filter_map(|body| match body {
+                Body::Data(data) => Some(data.payload.len()),
+                _ => None,
             })
             .collect();
         assert_eq!(sizes, vec![10, 4], "never more than the credit on the wire");
+        assert_eq!(blocked(&frames), 1, "the server was told of the wait");
+    }
+
+    /// The WindowUpdates telling the server the writer of conn 1 waits.
+    fn blocked(frames: &[Body]) -> usize {
+        frames
+            .iter()
+            .filter(|body| {
+                matches!(body, Body::WindowUpdate(update)
+                    if update.conn_id == 1 && update.blocked && update.increment == 0)
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_writer_tells_the_server_once_per_wait() {
+        let mut peer = peer();
+        let mut io = peer.connections.register(1, 4);
+        let (_, waker) = counting_waker();
+        assert!(matches!(
+            poll_write(&mut io, &waker, &[1; 4]),
+            Poll::Ready(Ok(4))
+        ));
+        assert!(poll_write(&mut io, &waker, &[1; 4]).is_pending());
+        assert!(poll_write(&mut io, &waker, &[1; 4]).is_pending());
+
+        peer.send(Body::WindowUpdate(WindowUpdate {
+            conn_id: 1,
+            increment: 4,
+            ..Default::default()
+        }));
+        assert!(matches!(
+            poll_write(&mut io, &waker, &[1; 4]),
+            Poll::Ready(Ok(4))
+        ));
+        assert!(poll_write(&mut io, &waker, &[1; 4]).is_pending());
+        // drained at the end: the test peer grants the DATA it takes
+        assert_eq!(
+            blocked(&drain_frames(&mut peer).await),
+            2,
+            "once per wait, and the next wait tells again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reclaim_gives_up_the_credit_past_what_the_server_keeps() {
+        let mut peer = peer();
+        let mut io = peer.connections.register(1, 1000);
+        let (_, waker) = counting_waker();
+        peer.send(Body::WindowUpdate(WindowUpdate {
+            conn_id: 1,
+            reclaim_above: 300,
+            ..Default::default()
+        }));
+        let released: Vec<u32> = drain_frames(&mut peer)
+            .await
+            .iter()
+            .filter_map(|body| match body {
+                Body::WindowUpdate(update) if update.released > 0 => Some(update.released),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(released, vec![700], "what it gave up, announced");
+        let Poll::Ready(Ok(n)) = poll_write(&mut io, &waker, &[1; 1000]) else {
+            panic!("the kept credit is sendable");
+        };
+        assert_eq!(n, 300, "never the released credit");
+        assert!(poll_write(&mut io, &waker, &[1; 1]).is_pending());
+
+        // nothing past what the server keeps: nothing released
+        peer.send(Body::WindowUpdate(WindowUpdate {
+            conn_id: 1,
+            reclaim_above: 300,
+            ..Default::default()
+        }));
+        assert!(
+            drain_frames(&mut peer)
+                .await
+                .iter()
+                .all(|body| !matches!(body, Body::WindowUpdate(update) if update.released > 0))
+        );
     }
 
     #[tokio::test]

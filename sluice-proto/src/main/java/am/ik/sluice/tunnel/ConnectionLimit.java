@@ -10,23 +10,23 @@ import org.jspecify.annotations.Nullable;
  * that frees its slot when released; releasing is idempotent, so every exit path of a
  * connection may release without counting twice.
  * <p>
- * The buffering of one relayed virtual connection is bounded ({@link #CONNECTION_BYTES}),
- * so a cap on connections bounds the total -- provided a slot is held for as long as the
- * connection's frames wait in the {@link SessionSender}, which
- * {@link VirtualConnection#afterQueued(Runnable)} lets its owner wait for. When no cap is
- * configured, {@link #resolve} derives one that keeps the worst case within half the
- * maximum heap.
+ * What one relayed virtual connection buffers outside the {@link TunnelBudget} is bounded
+ * ({@link #CONNECTION_BYTES}), so a cap on connections and the budget bound the total --
+ * provided a slot is held for as long as the connection's frames wait in the
+ * {@link SessionSender}, which {@link VirtualConnection#afterQueued(Runnable)} lets its
+ * owner wait for. When no cap is configured, {@link #resolve} derives one that keeps the
+ * worst case and the budget within half the maximum heap.
  */
 public final class ConnectionLimit {
 
 	/**
-	 * The most one relayed virtual connection buffers on one side of the tunnel: its
-	 * receive buffer ({@link VirtualConnection#MAX_RECEIVE_BUFFER}: the window plus the
-	 * segments' slack and overhead), the cap of its send queue
-	 * ({@link SessionSender#MAX_QUEUED_PAYLOAD}) and the buffers of the relay's two
-	 * pumps.
+	 * The most one relayed virtual connection buffers on one side of the tunnel outside
+	 * the {@link TunnelBudget}: its receive buffer at the announced window
+	 * ({@link VirtualConnection#RECEIVE_ALLOWANCE}: the initial window plus the segments'
+	 * slack and overhead), its send queue's allowance
+	 * ({@link SessionSender#SEND_ALLOWANCE}) and the buffers of the relay's two pumps.
 	 */
-	public static final long CONNECTION_BYTES = VirtualConnection.MAX_RECEIVE_BUFFER + SessionSender.MAX_QUEUED_PAYLOAD
+	public static final long CONNECTION_BYTES = VirtualConnection.RECEIVE_ALLOWANCE + SessionSender.SEND_ALLOWANCE
 			+ 2L * StreamRelay.BUFFER_SIZE;
 
 	/** The ERROR message a CONNECT beyond the limit is answered with. */
@@ -49,18 +49,19 @@ public final class ConnectionLimit {
 
 	/**
 	 * The configured limit when positive, else the one derived from this JVM's maximum
-	 * heap ({@link #derive}).
+	 * heap and {@code budget} ({@link #deriveFromHeap}).
 	 */
-	public static int resolve(int configured) {
-		return configured > 0 ? configured : derive(Runtime.getRuntime().maxMemory());
+	public static int resolve(int configured, long budget) {
+		return configured > 0 ? configured : deriveFromHeap(Runtime.getRuntime().maxMemory(), budget);
 	}
 
 	/**
-	 * The connections whose worst-case buffering ({@link #CONNECTION_BYTES} each) fits in
-	 * half of {@code maxHeap}, the rest left to everything else; at least 1.
+	 * The connections whose buffering outside the budget ({@link #CONNECTION_BYTES} each)
+	 * fits in half of {@code maxHeap} less the {@link TunnelBudget} of {@code budget}
+	 * bytes, the rest left to everything else; at least 1.
 	 */
-	public static int derive(long maxHeap) {
-		return derive(maxHeap / 2, CONNECTION_BYTES);
+	public static int deriveFromHeap(long maxHeap, long budget) {
+		return derive(maxHeap / 2 - budget, CONNECTION_BYTES);
 	}
 
 	/**

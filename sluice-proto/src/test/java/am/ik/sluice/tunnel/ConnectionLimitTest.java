@@ -33,20 +33,25 @@ class ConnectionLimitTest {
 	}
 
 	@Test
-	void theConnectionBytesAddUpTheReceiveBufferTheSendQueueAndTheRelayBuffers() {
+	void theConnectionBytesAddUpTheReceiveAllowanceTheSendAllowanceAndTheRelayBuffers() {
 		// the window, two 16KiB segments of slack, 80 segments of 64 bytes overhead
 		assertThat(VirtualConnection.MAX_RECEIVE_BUFFER).isEqualTo(MIB + 2 * 16 * 1024 + 80 * 64);
+		// the initial window and the slack of a window grown to 1MiB
+		assertThat(VirtualConnection.RECEIVE_ALLOWANCE).isEqualTo(64 * 1024 + 2 * 16 * 1024 + 80 * 64);
+		assertThat(SessionSender.SEND_ALLOWANCE).isEqualTo(64 * 1024);
 		assertThat(ConnectionLimit.CONNECTION_BYTES)
-			.isEqualTo(VirtualConnection.MAX_RECEIVE_BUFFER + MIB + 2 * 64 * 1024);
+			.isEqualTo(VirtualConnection.RECEIVE_ALLOWANCE + 64 * 1024 + 2 * 64 * 1024)
+			.isEqualTo(293 * 1024);
 	}
 
 	@Test
-	void deriveFitsTheWorstCaseInHalfTheHeap() {
-		// 200MiB / 2.16MiB
-		assertThat(ConnectionLimit.derive(400 * MIB)).isEqualTo(92);
-		assertThat(ConnectionLimit.derive(4096 * MIB)).isEqualTo(947);
-		assertThat(ConnectionLimit.derive(MIB)).isEqualTo(1);
-		assertThat(ConnectionLimit.derive(Long.MAX_VALUE)).isEqualTo(Integer.MAX_VALUE);
+	void deriveFitsTheAllowancesInHalfTheHeapLessTheBudget() {
+		// (200MiB - 25MiB) / 293KiB
+		assertThat(ConnectionLimit.deriveFromHeap(400 * MIB, TunnelBudget.derive(400 * MIB))).isEqualTo(611);
+		assertThat(ConnectionLimit.deriveFromHeap(4096 * MIB, TunnelBudget.derive(4096 * MIB))).isEqualTo(6262);
+		assertThat(ConnectionLimit.deriveFromHeap(MIB, 0)).isEqualTo(1);
+		assertThat(ConnectionLimit.deriveFromHeap(400 * MIB, 400 * MIB)).isEqualTo(1);
+		assertThat(ConnectionLimit.deriveFromHeap(Long.MAX_VALUE, 0)).isEqualTo(Integer.MAX_VALUE);
 	}
 
 	@Test
@@ -58,8 +63,9 @@ class ConnectionLimitTest {
 
 	@Test
 	void resolvePrefersTheConfiguredLimit() {
-		assertThat(ConnectionLimit.resolve(7)).isEqualTo(7);
-		assertThat(ConnectionLimit.resolve(0)).isEqualTo(ConnectionLimit.derive(Runtime.getRuntime().maxMemory()));
+		assertThat(ConnectionLimit.resolve(7, MIB)).isEqualTo(7);
+		assertThat(ConnectionLimit.resolve(0, MIB))
+			.isEqualTo(ConnectionLimit.deriveFromHeap(Runtime.getRuntime().maxMemory(), MIB));
 	}
 
 	@Test

@@ -37,6 +37,27 @@ public interface FrameWriter {
 	void sendWindowUpdate(long connectionId, int increment);
 
 	/**
+	 * Asks the remote to give back the credit it holds for the connection past
+	 * {@code keep} bytes. Never blocks.
+	 */
+	default void sendWindowReclaim(long connectionId, int keep) {
+	}
+
+	/**
+	 * Tells the remote this side gave up {@code released} bytes of the credit it held for
+	 * the connection, answering its reclaim. Never blocks.
+	 */
+	default void sendWindowReleased(long connectionId, int released) {
+	}
+
+	/**
+	 * Tells the remote this side has DATA for the connection and no credit left to send
+	 * it. Never blocks.
+	 */
+	default void sendWindowBlocked(long connectionId) {
+	}
+
+	/**
 	 * Runs {@code action} once none of the frames queued for the connection so far waits
 	 * any more: at once when none is queued, else once the last one was handed to the
 	 * stream, or when the writer stops and drops them. Runs it exactly once, never on the

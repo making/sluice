@@ -230,8 +230,8 @@ class TunnelSessionReceivePathTest {
 			.stream()
 			.map(frame -> frame.getConnect().getConnectionWindow())
 			.toList();
-		assertThat(windows).as("every CONNECT announces the server's window")
-			.containsExactly(VirtualConnection.DEFAULT_WINDOW, VirtualConnection.DEFAULT_WINDOW);
+		assertThat(windows).as("every CONNECT announces the server's initial window")
+			.containsExactly(VirtualConnection.INITIAL_WINDOW, VirtualConnection.INITIAL_WINDOW);
 	}
 
 	private static CompletableFuture<Void> write(VirtualConnection connection, int length) {

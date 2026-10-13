@@ -25,6 +25,7 @@ import org.springframework.util.unit.DataSize;
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.ConnectionLimit;
+import am.ik.sluice.tunnel.TunnelBudget;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -382,29 +383,34 @@ class ConnectionLimitsTest {
 			.isEqualTo(128 * 1024 + NettyHttp2DemuxRelay.WITHHELD_ARRIVALS + NettyHttp2DemuxRelay.HOP_QUEUE_BYTES);
 		assertThat(NettyHttp2DemuxRelay.RESPONSE_QUEUE_BYTES)
 			.isEqualTo(NettyHttp2DemuxRelay.WITHHELD_ARRIVALS + NettyHttp2DemuxRelay.HOP_QUEUE_BYTES);
-		// every connection: its virtual connection's 2213KiB; an h2 connection besides:
-		// its relay's 1588KiB and its first leg's 1460KiB; a further leg: both its own
-		assertThat(ConnectionLimits.connectionBytes()).isEqualTo(ConnectionLimit.CONNECTION_BYTES).isEqualTo(2266112);
+		// every connection: what its virtual connection buffers outside the tunnel
+		// budget,
+		// 293KiB; an h2 connection besides: its relay's 1588KiB and its first leg's
+		// 1460KiB; a further leg: both its own
+		assertThat(ConnectionLimits.connectionBytes()).isEqualTo(ConnectionLimit.CONNECTION_BYTES).isEqualTo(300032);
 		assertThat(ConnectionLimits.h2RelayBytes()).isEqualTo(1626112 + 1495040);
-		assertThat(ConnectionLimits.legBytes()).isEqualTo(2266112 + 1495040);
+		assertThat(ConnectionLimits.legBytes()).isEqualTo(300032 + 1495040);
 		assertThat(ConnectionLimits.deriveBudget(400 * mib)).isEqualTo(25 * mib);
+		assertThat(TunnelBudget.derive(400 * mib)).isEqualTo(25 * mib);
 		// an overflow connection: its ClientHello and its head, each in a buffer of up to
 		// 128KiB
 		assertThat(ConnectionLimits.OVERFLOW_BYTES).isEqualTo(256 * 1024);
 		assertThat(ConnectionLimits.deriveMemory(400 * mib, 25 * mib, 0)).isEqualTo(175 * mib);
 		// the default overflow of 8 takes 2MiB off
 		assertThat(ConnectionLimits.deriveMemory(400 * mib, 25 * mib, 8)).isEqualTo(173 * mib);
-		// 173MiB / 2213KiB
-		assertThat(ConnectionLimits.deriveMaxConnections(173 * mib)).isEqualTo(80);
-		// the 409MiB heap a 512Mi container gave the server in production: 176.9MiB
-		long production = ConnectionLimits.deriveMemory(409 * mib, ConnectionLimits.deriveBudget(409 * mib), 8);
-		assertThat(production).isEqualTo(409 * mib / 2 - 409 * mib / 16 - 2 * mib);
-		assertThat(ConnectionLimits.deriveMaxConnections(production)).isEqualTo(81);
-		// of which h2 connections with one leg each: 176.9MiB / 5261KiB
-		assertThat(production / (ConnectionLimits.connectionBytes() + ConnectionLimits.h2RelayBytes())).isEqualTo(34);
-		// (2048MiB - 256MiB - 2MiB) / 2213KiB
-		assertThat(ConnectionLimits.deriveMaxConnections(ConnectionLimits.deriveMemory(4096 * mib, 256 * mib, 8)))
-			.isEqualTo(828);
+		// both budgets: (200MiB - 25MiB - 25MiB - 2MiB) / 293KiB
+		assertThat(ConnectionLimits.deriveMaxConnections(ConnectionLimits.deriveMemory(400 * mib, 50 * mib, 8)))
+			.isEqualTo(517);
+		// the 409MiB heap a 512Mi container gave the server in production: 151.4MiB
+		long production = ConnectionLimits.deriveMemory(409 * mib,
+				ConnectionLimits.deriveBudget(409 * mib) + TunnelBudget.derive(409 * mib), 8);
+		assertThat(production).isEqualTo(409 * mib / 2 - 409 * mib / 16 - 409 * mib / 16 - 2 * mib);
+		assertThat(ConnectionLimits.deriveMaxConnections(production)).isEqualTo(529);
+		// of which h2 connections with one leg each: 151.4MiB / 3341KiB
+		assertThat(production / (ConnectionLimits.connectionBytes() + ConnectionLimits.h2RelayBytes())).isEqualTo(46);
+		// (2048MiB - 256MiB - 256MiB - 2MiB) / 293KiB
+		assertThat(ConnectionLimits.deriveMaxConnections(ConnectionLimits.deriveMemory(4096 * mib, 512 * mib, 8)))
+			.isEqualTo(5361);
 		assertThat(ConnectionLimits.deriveMemory(400 * mib, 400 * mib, 8)).isZero();
 		assertThat(ConnectionLimits.deriveMaxConnections(0)).isEqualTo(1);
 	}
@@ -421,7 +427,9 @@ class ConnectionLimitsTest {
 			.build(), registry);
 		try {
 			assertThat(reserving.memory()).isEqualTo(2 * connection + h2);
-			assertThat(reserving.max()).as("the connections reserving their virtual connection it holds").isEqualTo(3);
+			assertThat(reserving.max()).as("the connections reserving their virtual connection it holds")
+				.isEqualTo((int) ((2 * connection + h2) / connection))
+				.isEqualTo(12);
 			assertThat(registry.get("sluice.data.connections.memory.bytes").gauge().value())
 				.isEqualTo(2 * connection + h2);
 			ConnectionLimits.Admission h2Connection = Objects.requireNonNull(reserving.admit(this.access));
@@ -529,19 +537,20 @@ class ConnectionLimitsTest {
 			logger.detachAppender(events);
 		}
 		try {
-			long memory = ConnectionLimits.deriveMemory(maxHeap, budget.toBytes(), 8);
+			long tunnelBudget = TunnelBudget.derive(maxHeap);
+			long memory = ConnectionLimits.deriveMemory(maxHeap, budget.toBytes() + tunnelBudget, 8);
 			int max = ConnectionLimits.deriveMaxConnections(memory);
 			assertThat(derived.memory()).isEqualTo(memory);
 			assertThat(derived.max()).isEqualTo(max);
 			assertThat(events.list).extracting(ILoggingEvent::getFormattedMessage)
-				.containsExactly(("data plane connection limit %d (derived: connection memory / 2213KiB per "
+				.containsExactly(("data plane connection limit %d (derived: connection memory / 293KiB per "
 						+ "connection), connection memory %dKiB (derived: half of max heap %dMiB - h2 queue budget - "
-						+ "overflow 8 x 256KiB; a connection reserves 2213KiB, an h2 connection 3048KiB more, a "
-						+ "further upstream connection of it 3673KiB), overflow 8 answered 503 within PT5S "
-						+ "(Retry-After 5s), per address %d, head timeout PT10S, idle timeout PT1M, stall "
-						+ "timeout PT1M per 16384B, verbatim idle timeout off (unless a route sets one), h2 queue "
-						+ "budget 1024KiB (configured)")
-					.formatted(max, memory >> 10, maxHeap >> 20, max));
+						+ "tunnel budget %dKiB - overflow 8 x 256KiB; a connection reserves 293KiB, an h2 connection "
+						+ "3048KiB more, a further upstream connection of it 1753KiB), overflow 8 answered 503 "
+						+ "within PT5S (Retry-After 5s), per address %d, head timeout PT10S, idle timeout PT1M, "
+						+ "stall timeout PT1M per 16384B, verbatim idle timeout off (unless a route sets one), h2 "
+						+ "queue budget 1024KiB (configured)")
+					.formatted(max, memory >> 10, maxHeap >> 20, tunnelBudget >> 10, max));
 		}
 		finally {
 			derived.destroy();

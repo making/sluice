@@ -22,6 +22,7 @@ import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.tunnel.ConnectionLimit;
+import am.ik.sluice.tunnel.TunnelBudget;
 import am.ik.sluice.tunnel.PeerBuilds;
 import am.ik.sluice.tunnel.SessionSender;
 import am.ik.sluice.tunnel.SocketRelay;
@@ -121,6 +122,11 @@ public final class NodeConnection implements AutoCloseable {
 
 	private final ConnectionLimit connectionLimit;
 
+	/** What the connections' windows and send queues past their allowance charge. */
+	private final TunnelBudget budget;
+
+	private final Counter creditWaits;
+
 	private final Counter rejectedConnections;
 
 	private final Counter reconnects;
@@ -165,7 +171,7 @@ public final class NodeConnection implements AutoCloseable {
 			.build();
 		this.advertise = Advertise.newBuilder()
 			.addAllUpstreams(builder.properties.toProtoUpstreams())
-			.setConnectionWindow(VirtualConnection.DEFAULT_WINDOW)
+			.setConnectionWindow(VirtualConnection.INITIAL_WINDOW)
 			.setBuild(builder.clientBuild)
 			.build();
 		String metricsTag = this.nodeId.isBlank() ? this.url : this.nodeId;
@@ -179,6 +185,11 @@ public final class NodeConnection implements AutoCloseable {
 			.description("Advertised listen ports rejected by the server")
 			.register(meterRegistry);
 		this.connectionLimit = Objects.requireNonNull(builder.connectionLimit, "connectionLimit is required");
+		this.budget = builder.budget == null ? TunnelBudget.unlimited() : builder.budget;
+		this.creditWaits = Counter.builder("sluice.tunnel.credit.waits")
+			.tag("node", metricsTag)
+			.description("Times an upstream connection had payload for the server and waited for its credit")
+			.register(meterRegistry);
 		this.rejectedConnections = Counter.builder("sluice.connections.rejected")
 			.tag("reason", "limit")
 			.description("CONNECTs answered with an ERROR because the connection limit was reached")
@@ -234,6 +245,8 @@ public final class NodeConnection implements AutoCloseable {
 		private @Nullable MeterRegistry meterRegistry;
 
 		private @Nullable ConnectionLimit connectionLimit;
+
+		private @Nullable TunnelBudget budget;
 
 		private Supplier<RandomGenerator> randomFactory = SplittableRandom::new;
 
@@ -300,6 +313,15 @@ public final class NodeConnection implements AutoCloseable {
 		/** The limit shared by the connections of every node stream of the process. */
 		public Builder connectionLimit(ConnectionLimit connectionLimit) {
 			this.connectionLimit = connectionLimit;
+			return this;
+		}
+
+		/**
+		 * What the connections of every node stream of the process charge past their
+		 * allowance; unlimited by default.
+		 */
+		public Builder budget(TunnelBudget budget) {
+			this.budget = budget;
 			return this;
 		}
 
@@ -436,6 +458,7 @@ public final class NodeConnection implements AutoCloseable {
 				SessionSender sender = SessionSender.builder(call)
 					.windowUpdateSent(windowUpdatesSent::increment)
 					.stallTimeout(properties.tunnelStallTimeout())
+					.budget(budget)
 					.stallAction(stalled -> failStalled(call, stalled))
 					.build();
 				sender.start();
@@ -593,7 +616,9 @@ public final class NodeConnection implements AutoCloseable {
 					return;
 				}
 				VirtualConnection connection = VirtualConnection.builder(request.getConnId(), sender)
-					.window(VirtualConnection.DEFAULT_WINDOW, Integer.toUnsignedLong(request.getConnectionWindow()))
+					.window(VirtualConnection.INITIAL_WINDOW, Integer.toUnsignedLong(request.getConnectionWindow()))
+					.growWindow(VirtualConnection.DEFAULT_WINDOW, this.budget)
+					.creditWaited(this.creditWaits::increment)
 					.build();
 				this.permits.put(request.getConnId(), permit);
 				this.connections.put(request.getConnId(), connection);
@@ -616,7 +641,7 @@ public final class NodeConnection implements AutoCloseable {
 				this.windowUpdatesReceived.increment();
 				VirtualConnection connection = this.connections.get(frame.getWindowUpdate().getConnId());
 				if (connection != null) {
-					connection.grant(frame.getWindowUpdate().getIncrement());
+					connection.windowUpdate(frame.getWindowUpdate());
 				}
 			}
 			case CLOSE -> {

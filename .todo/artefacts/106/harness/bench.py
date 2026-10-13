@@ -274,6 +274,41 @@ class DumpSampler(threading.Thread):
                 'max_threads_by_kind': dict(sorted(self.kinds_max.items(), key=lambda kv: -kv[1])[:30])}
 
 
+class GaugeSampler(threading.Thread):
+    """The largest value of the server's and the client's memory gauges over the measured
+    window (tunnel budget used, tunnel payload buffered, heap used), every 250ms."""
+
+    PATTERN = r'^(sluice_tunnel_budget_used_bytes|sluice_tunnel_buffered_bytes|jvm_memory_used_bytes\{.*heap)'
+
+    def __init__(self, period=0.25):
+        super().__init__(daemon=True)
+        self.period = period
+        self.stop_flag = threading.Event()
+        self.maxima = {}
+
+    def run(self):
+        while not self.stop_flag.is_set():
+            for name, port in (('server', MGMT), ('client', CMGMT)):
+                try:
+                    values = prom(port, self.PATTERN)
+                except Exception:
+                    continue
+                heap = sum(v for k, v in values.items() if k.startswith('jvm_memory_used_bytes'))
+                sample = {'heap_MiB': heap / MiB}
+                for k, v in values.items():
+                    if k.startswith('sluice_tunnel_budget_used_bytes'):
+                        sample['budget_used_KiB'] = v / 1024
+                    elif k.startswith('sluice_tunnel_buffered_bytes'):
+                        sample['buffered_KiB'] = v / 1024
+                for k, v in sample.items():
+                    key = f'{name}_max_{k}'
+                    self.maxima[key] = round(max(self.maxima.get(key, 0), v), 1)
+            self.stop_flag.wait(self.period)
+
+
+GAUGES = [False]
+
+
 def h2counters():
     try:
         d = prom(pattern=r'^sluice_(h2demux|data_connections)\w*_total')
@@ -310,6 +345,12 @@ def run_load(name, args, results, extra=None, port=DATA, jfr=None, dumps=False):
             if dumps and line == 'MARK start':
                 sampler = DumpSampler(pids['server'])
                 sampler.start()
+            if GAUGES[0] and line == 'MARK start':
+                gauges = GaugeSampler()
+                gauges.start()
+            if GAUGES[0] and line == 'MARK stop':
+                gauges.stop_flag.set()
+                gauges.join()
             if dumps and line == 'MARK stop':
                 sampler.stop_flag.set()
                 sampler.join()
@@ -350,6 +391,9 @@ def run_load(name, args, results, extra=None, port=DATA, jfr=None, dumps=False):
                                'avg_hold_us': round((b[4] - a[4]) / 1e3 / max(acq, 1), 2),
                                'acq_per_req': round(acq / max(result['requests'], 1), 1)}
         log('loop lock', json.dumps(result['loop_lock']))
+    if GAUGES[0]:
+        result['gauges'] = gauges.maxima
+        log('gauges', json.dumps(gauges.maxima))
     if dumps:
         result['server_threads'] = sampler.summary()
         log('threads', json.dumps(result['server_threads']['avg_threads_in']))
@@ -511,6 +555,33 @@ def suite_winexp(results, tag):
     run_load(f'{tag}winexp upload h2 c1 s1', lg('h2', 1, 1, '/sink', dur=12, extra=('--upload', str(16 * MiB))),
              results)
     run_load(f'{tag}winexp small h2 c1 s100', lg('h2', 1, 100, '/small', dur=8), results)
+
+
+def suite_budget(results, tag):
+    """Throughput against the tunnel RTT (run with --delay) with one and many connections,
+    and the largest heap, tunnel budget use and buffered payload of the server and the
+    client over each measured window (todo 134: windows budgeted instead of reserved)."""
+    GAUGES[0] = True
+    big = f'/bytes?n={64 * MiB}'
+    run_load(f'{tag}budget download h1 c1', lg('h1', 1, 1, big, dur=12), results)
+    run_load(f'{tag}budget download h2 c1 s1', lg('h2', 1, 1, big, dur=12), results)
+    for c in [8, 32, 100]:
+        run_load(f'{tag}budget download h1 c{c}', lg('h1', c, 1, big, dur=12), results)
+    run_load(f'{tag}budget upload h1 c1', lg('h1', 1, 1, '/sink', dur=12, extra=('--upload', str(16 * MiB))),
+             results)
+    run_load(f'{tag}budget upload h2 c1 s1', lg('h2', 1, 1, '/sink', dur=12, extra=('--upload', str(16 * MiB))),
+             results)
+    run_load(f'{tag}budget upload h1 c32', lg('h1', 32, 1, '/sink', dur=12, extra=('--upload', str(16 * MiB))),
+             results)
+
+
+def suite_budgetone(results, tag):
+    """One h1 connection each way at the tunnel RTT, three times (run with --delay)."""
+    GAUGES[0] = True
+    for i in range(3):
+        run_load(f'{tag}budget download h1 c1 #{i}', lg('h1', 1, 1, f'/bytes?n={64 * MiB}', dur=12), results)
+        run_load(f'{tag}budget upload h1 c1 #{i}', lg('h1', 1, 1, '/sink', dur=12, extra=('--upload', str(16 * MiB))),
+                 results)
 
 
 def live_heap_kb(pid):

@@ -20,6 +20,8 @@ import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.tunnel.ConnectionLimit;
+import am.ik.sluice.tunnel.TunnelBudget;
+import am.ik.sluice.tunnel.VirtualConnection;
 import am.ik.sluice.tunnel.PeerBuilds;
 import am.ik.sluice.v1.proto.ListNodesResponse;
 import am.ik.sluice.v1.proto.PeerBuild;
@@ -65,6 +67,9 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 	/** Upstream connections open at once, shared by every node stream. */
 	private final ConnectionLimit connectionLimit;
 
+	/** What the connections of every node stream buffer beyond their allowance. */
+	private final TunnelBudget budget;
+
 	/** This client's build, announced on every stream. */
 	private final PeerBuild clientBuild;
 
@@ -96,17 +101,39 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 					map -> map.values().stream().filter(NodeConnection::isConnected).count())
 			.description("Tunnel streams established, one per server node")
 			.register(meterRegistry);
-		this.connectionLimit = new ConnectionLimit(ConnectionLimit.resolve(properties.maxConnections()));
+		long maxHeap = Runtime.getRuntime().maxMemory();
+		this.budget = new TunnelBudget(TunnelBudget.resolve(properties.tunnelBudget().toBytes(), maxHeap));
+		Gauge.builder("sluice.tunnel.budget.bytes", this.budget, TunnelBudget::max)
+			.baseUnit("bytes")
+			.description("Bytes the tunnel connections may buffer beyond each connection's allowance, shared")
+			.register(meterRegistry);
+		Gauge.builder("sluice.tunnel.budget.used.bytes", this.budget, TunnelBudget::used)
+			.baseUnit("bytes")
+			.description("Bytes the tunnel connections buffer, or granted the server to send, beyond each "
+					+ "connection's allowance")
+			.register(meterRegistry);
+		Gauge.builder("sluice.tunnel.buffered.bytes", this.budget, TunnelBudget::buffered)
+			.baseUnit("bytes")
+			.description("Payload the server sent that the upstream connections have not taken yet")
+			.register(meterRegistry);
+		this.connectionLimit = new ConnectionLimit(
+				ConnectionLimit.resolve(properties.maxConnections(), this.budget.max()));
 		Gauge.builder("sluice.connections.limit", this.connectionLimit, ConnectionLimit::max)
 			.description("Upstream connections allowed open at once")
 			.register(meterRegistry);
 		Gauge.builder("sluice.connections.admitted", this.connectionLimit, ConnectionLimit::open)
 			.description("Upstream connections holding a slot of the connection limit")
 			.register(meterRegistry);
-		log.info("upstream connection limit {} ({})", this.connectionLimit.max(),
+		log.info(
+				"upstream connection limit {} ({}), tunnel budget {}KiB ({}; a connection's window grows from {}KiB "
+						+ "to {}KiB against it)",
+				this.connectionLimit.max(),
 				properties.maxConnections() > 0 ? "configured"
-						: "derived: half of max heap %dMiB / %dKiB per connection"
-							.formatted(Runtime.getRuntime().maxMemory() >> 20, ConnectionLimit.CONNECTION_BYTES >> 10));
+						: "derived: (half of max heap %dMiB - tunnel budget) / %dKiB per connection"
+							.formatted(maxHeap >> 20, ConnectionLimit.CONNECTION_BYTES >> 10),
+				this.budget.max() >> 10,
+				properties.tunnelBudget().toBytes() > 0 ? "configured" : "derived: an eighth of half of max heap",
+				VirtualConnection.INITIAL_WINDOW >> 10, VirtualConnection.DEFAULT_WINDOW >> 10);
 	}
 
 	private static @Nullable String clientid(SluiceClientProperties properties) {
@@ -225,6 +252,7 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 			.listener(this)
 			.meterRegistry(this.meterRegistry)
 			.connectionLimit(this.connectionLimit)
+			.budget(this.budget)
 			.clientBuild(this.clientBuild)
 			.randomFactory(this.randomFactory)
 			.build();

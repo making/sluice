@@ -836,6 +836,94 @@ class SessionSenderTest {
 		}
 	}
 
+	/**
+	 * A queue holds its first frame outside the budget and charges every frame past it,
+	 * releasing as the frames leave.
+	 */
+	@Test
+	void aQueuePastTheAllowanceChargesTheBudgetAndReleasesAsItsFramesLeave() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.gate.countDown();
+		observer.oneFramePerReady.set(true);
+		TunnelBudget budget = new TunnelBudget(10L * SessionSender.MAX_CHUNK);
+		SessionSender sender = SessionSender.builder(observer).budget(budget).build();
+		try {
+			sender.start();
+			assertThat(sender.sendData(1, new byte[4 * SessionSender.MAX_CHUNK])).isTrue();
+			assertThat(budget.used()).isEqualTo(3L * SessionSender.MAX_CHUNK);
+			assertThat(sender.sendData(2, new byte[SessionSender.MAX_CHUNK])).isTrue();
+			assertThat(budget.used()).as("within the allowance").isEqualTo(3L * SessionSender.MAX_CHUNK);
+			// one frame per turn: 1, 2, 1, 1, 1; what connection 1 holds past one frame
+			long[] charged = { 2, 2, 1, 0, 0 };
+			for (int sent = 1; sent <= 5; sent++) {
+				observer.becomeReady();
+				awaitSentFrames(observer, sent);
+				assertThat(budget.used()).as("charged after %d frames left", sent)
+					.isEqualTo(charged[sent - 1] * SessionSender.MAX_CHUNK);
+			}
+			awaitConnectionQueues(sender, 0);
+			assertThat(budget.used()).isZero();
+			assertThat(budget.holders()).isZero();
+		}
+		finally {
+			sender.close();
+		}
+	}
+
+	/**
+	 * Past its allowance with no room in the budget, a producer waits, while another
+	 * connection still queues within its own; the producer's frames leaving let it go on,
+	 * a frame at a time, and every charge is released.
+	 */
+	@Test
+	void aProducerWithoutRoomWaitsAndGoesOnAsItsFramesLeave() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.gate.countDown();
+		observer.oneFramePerReady.set(true);
+		// a lone queue's share is half: one frame past the allowance
+		TunnelBudget budget = new TunnelBudget(2L * SessionSender.MAX_CHUNK);
+		SessionSender sender = SessionSender.builder(observer).budget(budget).build();
+		try {
+			sender.start();
+			AtomicBoolean result = new AtomicBoolean();
+			Thread producer = Thread.ofVirtual()
+				.start(() -> result.set(sender.sendData(1, new byte[4 * SessionSender.MAX_CHUNK])));
+			observeBlocked(producer);
+			assertThat(budget.used()).isEqualTo(SessionSender.MAX_CHUNK);
+			Thread other = Thread.ofVirtual().start(() -> sender.sendData(2, new byte[SessionSender.MAX_CHUNK]));
+			other.join(TimeUnit.SECONDS.toMillis(5));
+			assertThat(other.isAlive()).as("the other connection's allowance").isFalse();
+			for (int sent = 1; sent <= 5; sent++) {
+				observer.becomeReady();
+				awaitSentFrames(observer, sent);
+				assertThat(budget.used()).isLessThanOrEqualTo(budget.max());
+			}
+			producer.join(TimeUnit.SECONDS.toMillis(5));
+			assertThat(producer.isAlive()).isFalse();
+			assertThat(result).isTrue();
+			awaitConnectionQueues(sender, 0);
+			assertThat(budget.used()).isZero();
+		}
+		finally {
+			sender.close();
+		}
+	}
+
+	/** The teardown drops the queued frames and releases their charge. */
+	@Test
+	void theTeardownReleasesTheCharge() throws Exception {
+		FakeServerObserver observer = new FakeServerObserver();
+		observer.gate.countDown();
+		TunnelBudget budget = new TunnelBudget(10L * SessionSender.MAX_CHUNK);
+		SessionSender sender = SessionSender.builder(observer).budget(budget).build();
+		sender.start();
+		assertThat(sender.sendData(1, new byte[3 * SessionSender.MAX_CHUNK])).isTrue();
+		assertThat(budget.used()).isEqualTo(2L * SessionSender.MAX_CHUNK);
+		sender.close();
+		assertThat(budget.used()).isZero();
+		assertThat(budget.holders()).isZero();
+	}
+
 	private static void awaitCount(AtomicInteger count, int expected) throws InterruptedException {
 		long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(5);
 		while (count.get() < expected && System.currentTimeMillis() < deadline) {

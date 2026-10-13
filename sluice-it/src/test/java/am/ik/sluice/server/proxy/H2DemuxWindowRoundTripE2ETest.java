@@ -27,6 +27,7 @@ import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.it.WindowedH2Upstream;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.route.Router;
+import am.ik.sluice.tunnel.VirtualConnection;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import org.springframework.beans.factory.annotation.Autowired;
@@ -57,6 +58,13 @@ class H2DemuxWindowRoundTripE2ETest {
 	/** What the relay's windows allow: four grants per window of the body, plus one. */
 	private static final long MAX_WAITS = 4L * BODY / NettyHttp2DemuxRelay.STREAM_WINDOW + 1;
 
+	/**
+	 * What the leg's virtual connection allows: a few waits per full window of the body,
+	 * and one per doubling from the initial window.
+	 */
+	private static final long MAX_CREDIT_WAITS = 4L * BODY / VirtualConnection.DEFAULT_WINDOW
+			+ 2L * Integer.numberOfTrailingZeros(VirtualConnection.DEFAULT_WINDOW / VirtualConnection.INITIAL_WINDOW);
+
 	/** The round trips a body takes at least with the 64KiB windows of RFC 9113. */
 	private static final long SPEC_WINDOW_ROUND_TRIPS = BODY / 65535;
 
@@ -75,6 +83,8 @@ class H2DemuxWindowRoundTripE2ETest {
 	private static int dataPort;
 
 	private final List<AutoCloseable> closeables = new CopyOnWriteArrayList<>();
+
+	private final SimpleMeterRegistry clientMeters = new SimpleMeterRegistry();
 
 	@Nullable
 	@Autowired
@@ -143,6 +153,16 @@ class H2DemuxWindowRoundTripE2ETest {
 				.isPositive()
 				.isLessThanOrEqualTo(MAX_WAITS)
 				.isLessThan(SPEC_WINDOW_ROUND_TRIPS);
+			// the leg's virtual connection grew from its initial window to the full one:
+			// its writer, the client, waited a few times per full window and once per
+			// doubling
+			long creditWaits = (long) this.clientMeters.get("sluice.tunnel.credit.waits")
+				.tag("node", "grpc://127.0.0.1:" + tunnel.port())
+				.counter()
+				.count();
+			System.out.printf("window round trips: the leg's tunnel connection waited for credit %d times%n",
+					creditWaits);
+			assertThat(creditWaits).as("the leg's credit waits").isLessThanOrEqualTo(MAX_CREDIT_WAITS);
 		}
 	}
 
@@ -210,7 +230,7 @@ class H2DemuxWindowRoundTripE2ETest {
 				.token("it-token")
 				.build())
 			.taskExecutor(task -> Thread.ofVirtual().name("e2e-window-round-trip").start(task))
-			.meterRegistry(new SimpleMeterRegistry())
+			.meterRegistry(this.clientMeters)
 			.build();
 		client.start();
 		remember(client::stop);

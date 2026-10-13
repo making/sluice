@@ -40,10 +40,14 @@ import io.grpc.stub.StreamObserver;
  * not just queued: control frames (CONNECT, ADVERTISE, ADVERTISE_ACK, MEMBERSHIP_UPDATE,
  * DRAIN, WINDOW_UPDATE) wait on an unbounded queue that is always sent first, so
  * enqueueing one never blocks. Connection frames (DATA, CLOSE, ERROR) wait on a
- * per-connection queue holding at most {@link #DATA_QUEUE_CAPACITY} DATA frames; only
- * that connection's producer blocks once the cap is reached, and CLOSE / ERROR bypass it.
- * Queueing CLOSE / ERROR closes the queue to DATA: the producers parked on its cap fail
- * at once, and so does every later chunk while the queue lives.
+ * per-connection queue holding at most {@link #DATA_QUEUE_CAPACITY} DATA frames, and past
+ * {@link #SEND_ALLOWANCE} of payload only what the queue's account of the
+ * {@link TunnelBudget} holds (charged frame by frame, within the account's share, and
+ * released as the frames leave); only that connection's producer blocks once the cap or
+ * the budget is reached -- its own frames leaving wake it, and its allowance always lets
+ * it go on -- and CLOSE / ERROR bypass both. Queueing CLOSE / ERROR closes the queue to
+ * DATA: the producers parked on its cap fail at once, and so does every later chunk while
+ * the queue lives.
  * <p>
  * Per-frame work is O(1) in the number of connections: the worker pops the head of a ring
  * of the connections with pending frames, sends one frame, and re-appends the queue while
@@ -87,6 +91,12 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	static final int MAX_QUEUED_PAYLOAD = DATA_QUEUE_CAPACITY * MAX_CHUNK;
 
 	/**
+	 * The DATA payload one connection's queue holds outside the {@link TunnelBudget}: one
+	 * frame.
+	 */
+	static final int SEND_ALLOWANCE = MAX_CHUNK;
+
+	/**
 	 * The connection frames of one connection; guarded by {@link #lock}. A queue lives
 	 * only while it holds frames or a {@link #sendData} call runs in it: it is dropped as
 	 * soon as neither holds, so a late frame for the id starts a new queue.
@@ -99,6 +109,15 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 		/** DATA frames within {@code #frames}; the per-connection producer bound. */
 		int dataFrames;
+
+		/** The payload of the DATA frames within {@code #frames}. */
+		long dataBytes;
+
+		/**
+		 * Charges the payload past {@link #SEND_ALLOWANCE}; null until the queue first
+		 * passes it.
+		 */
+		TunnelBudget.@Nullable Account account;
 
 		/** The queue is in the active ring; a fresh one joins with its first frame. */
 		boolean queued;
@@ -173,6 +192,9 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	/** Runs for every WINDOW_UPDATE queued; a metrics hook. */
 	private final Runnable windowUpdateSent;
 
+	/** Charges the queues' payload past {@link #SEND_ALLOWANCE}. */
+	private final TunnelBudget budget;
+
 	/** How long a stall may last before the worker stops; zero = never. */
 	private final Duration stallTimeout;
 
@@ -215,6 +237,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		this.windowUpdateSent = Objects.requireNonNull(builder.windowUpdateSent, "windowUpdateSent is required");
 		this.stallTimeout = Objects.requireNonNull(builder.stallTimeout, "stallTimeout is required");
 		this.stallAction = Objects.requireNonNull(builder.stallAction, "stallAction is required");
+		this.budget = builder.budget == null ? TunnelBudget.unlimited() : builder.budget;
 		if (this.stallTimeout.isNegative()) {
 			throw new IllegalArgumentException("stallTimeout must not be negative: " + this.stallTimeout);
 		}
@@ -238,6 +261,8 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 
 		private Consumer<Duration> stallAction = stalled -> {
 		};
+
+		private @Nullable TunnelBudget budget;
 
 		private Builder(StreamObserver<Frame> outbound) {
 			this.outbound = Objects.requireNonNull(outbound, "outbound is required");
@@ -265,6 +290,15 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		 */
 		public Builder stallAction(Consumer<Duration> stallAction) {
 			this.stallAction = stallAction;
+			return this;
+		}
+
+		/**
+		 * Charges what a connection's queue holds past {@link #SEND_ALLOWANCE}; unlimited
+		 * by default.
+		 */
+		public Builder budget(TunnelBudget budget) {
+			this.budget = Objects.requireNonNull(budget, "budget is required");
 			return this;
 		}
 
@@ -445,6 +479,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 			if (queue.writers == 0 && queue.frames.isEmpty() && this.queues.remove(queue.id, queue)) {
 				held = queue.held;
 				queue.held = null;
+				closeAccount(queue);
 			}
 		}
 		finally {
@@ -454,21 +489,24 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	}
 
 	/**
-	 * Queues a DATA frame, blocking while this connection's queue is at
-	 * {@link #DATA_QUEUE_CAPACITY} -- only this connection's producer waits, and only
-	 * this connection's pops and markers wake it. Returns false when the sender is gone
-	 * or CLOSE / ERROR was queued for the connection.
+	 * Queues a DATA frame of {@code length} payload bytes, blocking while this
+	 * connection's queue is at {@link #DATA_QUEUE_CAPACITY}, or past
+	 * {@link #SEND_ALLOWANCE} with no room in its account -- only this connection's
+	 * producer waits, and only this connection's pops and markers wake it. A queue past
+	 * the allowance holds a frame, whose pop wakes the producer. Returns false when the
+	 * sender is gone or CLOSE / ERROR was queued for the connection.
 	 */
-	private boolean enqueueData(ConnectionQueue queue, Frame frame) {
+	private boolean enqueueData(ConnectionQueue queue, Frame frame, int length) {
 		this.lock.lock();
 		try {
 			while (true) {
 				if (!this.running || callClosed() || queue.closed) {
 					return false;
 				}
-				if (queue.dataFrames < DATA_QUEUE_CAPACITY) {
+				if (queue.dataFrames < DATA_QUEUE_CAPACITY && charge(queue, queue.dataBytes + length)) {
 					queue.frames.addLast(frame);
 					queue.dataFrames++;
+					queue.dataBytes += length;
 					if (!queue.queued) {
 						queue.queued = true;
 						this.ring.addLast(queue);
@@ -488,6 +526,39 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		}
 		finally {
 			this.lock.unlock();
+		}
+	}
+
+	/**
+	 * Charges what a queue holding {@code dataBytes} holds past the allowance, all of it
+	 * or nothing; true when it is charged. With the lock.
+	 */
+	private boolean charge(ConnectionQueue queue, long dataBytes) {
+		long wanted = dataBytes - SEND_ALLOWANCE;
+		if (wanted <= 0) {
+			return true;
+		}
+		TunnelBudget.Account account = queue.account;
+		if (account == null) {
+			account = this.budget.account();
+			queue.account = account;
+		}
+		return account.tryGrow(wanted);
+	}
+
+	/** Releases what the queue no longer holds past the allowance. With the lock. */
+	private static void release(ConnectionQueue queue) {
+		TunnelBudget.Account account = queue.account;
+		if (account != null) {
+			account.resize(queue.dataBytes - SEND_ALLOWANCE);
+		}
+	}
+
+	/** Releases a dropped queue's charge for good. With the lock. */
+	private static void closeAccount(ConnectionQueue queue) {
+		TunnelBudget.Account account = queue.account;
+		if (account != null) {
+			account.close();
 		}
 	}
 
@@ -551,7 +622,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 					.setConnId(connectionId)
 					.setPayload(com.google.protobuf.UnsafeByteOperations.unsafeWrap(chunk))
 					.build();
-				if (!enqueueData(queue, Frame.newBuilder().setData(data).build())) {
+				if (!enqueueData(queue, Frame.newBuilder().setData(data).build(), length)) {
 					return false;
 				}
 			}
@@ -595,6 +666,33 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 	public void sendDrain(String reason) {
 		Drain drain = Drain.newBuilder().setReason(reason == null ? "" : reason).build();
 		enqueueControl(Frame.newBuilder().setDrain(drain).build());
+	}
+
+	/**
+	 * Queues the reclaim on the control queue, like a grant; never blocks.
+	 */
+	@Override
+	public void sendWindowReclaim(long connectionId, int keep) {
+		WindowUpdate update = WindowUpdate.newBuilder().setConnId(connectionId).setReclaimAbove(keep).build();
+		enqueueControl(Frame.newBuilder().setWindowUpdate(update).build());
+	}
+
+	/**
+	 * Queues the release on the control queue, like a grant; never blocks. It may pass
+	 * the connection's DATA queued before it: the remote counts what it was sent and what
+	 * was released against the credit alike.
+	 */
+	@Override
+	public void sendWindowReleased(long connectionId, int released) {
+		WindowUpdate update = WindowUpdate.newBuilder().setConnId(connectionId).setReleased(released).build();
+		enqueueControl(Frame.newBuilder().setWindowUpdate(update).build());
+	}
+
+	/** Queues the blocked signal on the control queue, like a grant; never blocks. */
+	@Override
+	public void sendWindowBlocked(long connectionId) {
+		WindowUpdate update = WindowUpdate.newBuilder().setConnId(connectionId).setBlocked(true).build();
+		enqueueControl(Frame.newBuilder().setWindowUpdate(update).build());
 	}
 
 	@Override
@@ -661,6 +759,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 					held.addAll(queue.held);
 					queue.held = null;
 				}
+				closeAccount(queue);
 			}
 			// producers parked on a cap hold their queue and fail on the stop
 			this.queues.clear();
@@ -748,6 +847,8 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		Frame frame = Objects.requireNonNull(queue.frames.pollFirst(), "a ringed queue holds frames");
 		if (frame.getBodyCase() == Frame.BodyCase.DATA) {
 			queue.dataFrames--;
+			queue.dataBytes -= frame.getData().getPayload().size();
+			release(queue);
 			// a producer parked on the cap of this connection may continue
 			queue.capWaiters.signal();
 		}
@@ -757,6 +858,7 @@ public final class SessionSender implements FrameWriter, AutoCloseable {
 		}
 		else if (queue.writers == 0) {
 			this.queues.remove(queue.id);
+			closeAccount(queue);
 			List<Runnable> held = queue.held;
 			queue.held = null;
 			return new Next(frame, held);
