@@ -398,6 +398,9 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * @param h2QueueBudget bytes the h2 demux relays may queue towards their upstreams
 	 * beyond each connection's own allowance, shared by all of them; {@code 0} = an
 	 * eighth of half the maximum heap
+	 * @param h2StreamWaitTimeout how long an h2 stream may wait for a place within its
+	 * upstream's {@code SETTINGS_MAX_CONCURRENT_STREAMS} before the relay refuses it
+	 * ({@code REFUSED_STREAM}); the netty engine only; {@code 0} = off
 	 * @param halfCloseProbeInterval how long a plaintext or TLS-terminated HTTP/1.1
 	 * connection whose client ended its side stays quiet, a response owed and none of it
 	 * relayed, before the relay writes a {@code 100 Continue} to learn whether the client
@@ -421,9 +424,10 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 */
 	public record Limits(@DefaultValue("0") int maxConnections, @DefaultValue("0") int maxConnectionsPerAddress,
 			@DefaultValue("10s") Duration headTimeout, @DefaultValue("60s") Duration idleTimeout,
-			@DefaultValue("0") DataSize h2QueueBudget, @DefaultValue("1s") Duration halfCloseProbeInterval,
-			@DefaultValue("60s") Duration stallTimeout, @DefaultValue("16KB") DataSize stallMinBytes,
-			@DefaultValue("60s") Duration tunnelStallTimeout, @DefaultValue("0") Duration verbatimIdleTimeout) {
+			@DefaultValue("0") DataSize h2QueueBudget, @DefaultValue("30s") Duration h2StreamWaitTimeout,
+			@DefaultValue("1s") Duration halfCloseProbeInterval, @DefaultValue("60s") Duration stallTimeout,
+			@DefaultValue("16KB") DataSize stallMinBytes, @DefaultValue("60s") Duration tunnelStallTimeout,
+			@DefaultValue("0") Duration verbatimIdleTimeout) {
 
 		public Limits {
 			maxConnections = Math.max(0, maxConnections);
@@ -433,6 +437,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			idleTimeout = idleTimeout == null || idleTimeout.isNegative() || idleTimeout.isZero()
 					? Duration.ofSeconds(60) : idleTimeout;
 			h2QueueBudget = h2QueueBudget == null || h2QueueBudget.isNegative() ? DataSize.ofBytes(0) : h2QueueBudget;
+			h2StreamWaitTimeout = h2StreamWaitTimeout == null || h2StreamWaitTimeout.isNegative()
+					? Duration.ofSeconds(30) : h2StreamWaitTimeout;
 			halfCloseProbeInterval = halfCloseProbeInterval == null || halfCloseProbeInterval.isNegative()
 					? Duration.ofSeconds(1) : halfCloseProbeInterval;
 			stallTimeout = stallTimeout == null || stallTimeout.isNegative() || stallTimeout.isZero()
@@ -460,6 +466,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			@Nullable private Duration idleTimeout;
 
 			@Nullable private DataSize h2QueueBudget;
+
+			@Nullable private Duration h2StreamWaitTimeout;
 
 			@Nullable private Duration halfCloseProbeInterval;
 
@@ -499,6 +507,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder h2StreamWaitTimeout(Duration h2StreamWaitTimeout) {
+				this.h2StreamWaitTimeout = h2StreamWaitTimeout;
+				return this;
+			}
+
 			public Builder halfCloseProbeInterval(Duration halfCloseProbeInterval) {
 				this.halfCloseProbeInterval = halfCloseProbeInterval;
 				return this;
@@ -529,6 +542,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 						this.headTimeout == null ? Duration.ofSeconds(10) : this.headTimeout,
 						this.idleTimeout == null ? Duration.ofSeconds(60) : this.idleTimeout,
 						this.h2QueueBudget == null ? DataSize.ofBytes(0) : this.h2QueueBudget,
+						this.h2StreamWaitTimeout == null ? Duration.ofSeconds(30) : this.h2StreamWaitTimeout,
 						this.halfCloseProbeInterval == null ? Duration.ofSeconds(1) : this.halfCloseProbeInterval,
 						this.stallTimeout == null ? Duration.ofSeconds(60) : this.stallTimeout,
 						this.stallMinBytes == null ? DataSize.ofKilobytes(16) : this.stallMinBytes,

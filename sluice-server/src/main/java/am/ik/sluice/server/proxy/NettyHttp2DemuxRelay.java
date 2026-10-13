@@ -12,6 +12,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -80,6 +82,14 @@ import io.netty.util.AsciiString;
  * closed or that received or sent a GOAWAY takes no new stream: the route's next stream
  * opens a new leg. The client's connection goes on throughout.
  * <p>
+ * A leg opens at most as many streams on its upstream as the upstream's
+ * {@code SETTINGS_MAX_CONCURRENT_STREAMS} allows, one until the upstream's first
+ * SETTINGS; a stream past it waits, its head and DATA buffered in the leg's encoder
+ * (netty's {@code StreamBufferingEncoder}), until a stream of the leg closes. A waiting
+ * stream the client resets, or whose client stream closes, leaves the buffer without
+ * reaching the upstream. One the upstream's GOAWAY or the leg's end drops is refused
+ * ({@code REFUSED_STREAM}), and so is one still waiting at the wait deadline.
+ * <p>
  * netty's codec answers the client's protocol errors itself; a header block that does not
  * decode ends the connection with a GOAWAY {@code COMPRESSION_ERROR}, logged as a request
  * line naming neither route, method nor path. The client endpoint's end -- EOF, error,
@@ -129,6 +139,9 @@ final class NettyHttp2DemuxRelay {
 
 	private final ConnectionLimits.KeepAliveDeadline deadline;
 
+	/** How long a stream may wait for its upstream's concurrency limit; zero = no end. */
+	private final Duration streamWaitTimeout;
+
 	private final Runnable onFinish;
 
 	private final Runnable release;
@@ -172,6 +185,10 @@ final class NettyHttp2DemuxRelay {
 		this.initialSession = Objects.requireNonNull(builder.initialSession, "initialSession is required");
 		this.peer = builder.peer;
 		this.deadline = Objects.requireNonNull(builder.deadline, "deadline is required");
+		this.streamWaitTimeout = builder.streamWaitTimeout;
+		if (this.streamWaitTimeout.isNegative()) {
+			throw new IllegalArgumentException("streamWaitTimeout must not be negative");
+		}
 		this.onFinish = Objects.requireNonNull(builder.onFinish, "onFinish is required");
 		this.release = Objects.requireNonNull(builder.release, "release is required");
 		this.loop = new Loop("sluice-h2n",
@@ -220,6 +237,19 @@ final class NettyHttp2DemuxRelay {
 	private static void configure(Http2ConnectionHandlerBuilder codec, Http2Settings settings) {
 		codec.initialSettings(settings.maxHeaderListSize(MAX_HEADER_LIST_SIZE))
 			.headerSensitivityDetector((name, value) -> true);
+	}
+
+	/**
+	 * Sets the streams the leg opens at once on its upstream, the rest buffered in the
+	 * leg's encoder; with the loop's lock.
+	 */
+	private static void limitStreams(Hop leg, long maxConcurrentStreams) {
+		try {
+			leg.encoder().remoteSettings(new Http2Settings().maxConcurrentStreams(maxConcurrentStreams));
+		}
+		catch (Http2Exception e) {
+			throw new IllegalStateException(leg.name() + ": the stream limit did not apply", e);
+		}
 	}
 
 	private Hop client() {
@@ -312,14 +342,79 @@ final class NettyHttp2DemuxRelay {
 		this.exchanges.put(streamId, exchange);
 		leg.routeMeters.trackedStreams().increment();
 		Hop hop = leg.hop();
-		hop.encoder().writeHeaders(hop.ctx(), streamId, headers, 0, endStream, hop.newPromise(future -> {
+		ChannelPromise written = hop.newPromise(future -> {
 			if (!future.isSuccess()) {
-				// the leg never took the stream: safe for the client to retry
+				// the leg never took the stream -- it failed it, or dropped it from its
+				// buffer on the upstream's GOAWAY or its close: safe for the client to
+				// retry
+				stopWaitingLocked(exchange);
 				exchange.refused = true;
 				loseLocked(exchange);
 			}
-		}));
+		});
+		hop.encoder().writeHeaders(hop.ctx(), streamId, headers, 0, endStream, written);
+		if (!written.isDone() && hop.connection().stream(streamId) == null) {
+			// past the upstream's concurrency limit: buffered until a stream of the leg
+			// closes
+			waitLocked(exchange);
+		}
 		this.access.request(route.routeTag(), request.method(), request.path(), HTTP_2);
+	}
+
+	/**
+	 * The exchange's stream waits in its leg's buffer; past the wait deadline it is
+	 * refused. The deadline runs on the client hop's executor: its settle runs the task
+	 * and then flushes the client's reset. With the loop's lock.
+	 */
+	private void waitLocked(Exchange exchange) {
+		exchange.waiting = true;
+		if (this.streamWaitTimeout.isZero()) {
+			return;
+		}
+		exchange.waitDeadline = client().ctx()
+			.executor()
+			.schedule(() -> waitTimedOutLocked(exchange), this.streamWaitTimeout.toNanos(), TimeUnit.NANOSECONDS);
+	}
+
+	/**
+	 * The exchange's stream no longer waits -- the leg opened it, dropped it, or the
+	 * relay reset it: its deadline is cancelled. With the loop's lock.
+	 */
+	private static void stopWaitingLocked(Exchange exchange) {
+		exchange.waiting = false;
+		ScheduledFuture<?> deadline = exchange.waitDeadline;
+		if (deadline != null) {
+			exchange.waitDeadline = null;
+			deadline.cancel(false);
+		}
+	}
+
+	/**
+	 * The wait deadline of a stream still waiting: the stream leaves the leg's buffer
+	 * unseen by the upstream, its queued DATA released, and the client gets RST_STREAM
+	 * {@code REFUSED_STREAM}, safe to retry (RFC 9113 8.7). With the loop's lock.
+	 */
+	private void waitTimedOutLocked(Exchange exchange) {
+		exchange.waitDeadline = null;
+		if (!exchange.waiting || exchange.reset) {
+			return;
+		}
+		exchange.reset = true;
+		exchange.refused = true;
+		dropWaitingLocked(exchange, Http2Error.CANCEL.code());
+		resetClientLocked(exchange.id, Http2Error.REFUSED_STREAM);
+		this.meters.refusedForWaitTimeout();
+	}
+
+	/**
+	 * Drops a waiting stream from its leg's buffer: netty's buffering encoder removes it
+	 * on a reset, completing its frames' promises and releasing its DATA, and writes
+	 * nothing. With the loop's lock.
+	 */
+	private static void dropWaitingLocked(Exchange exchange, long errorCode) {
+		stopWaitingLocked(exchange);
+		Hop leg = exchange.leg.hop();
+		leg.encoder().writeRstStream(leg.ctx(), exchange.id, errorCode, leg.ctx().newPromise());
 	}
 
 	/** Answers a refused stream with the page; with the loop's lock. */
@@ -380,13 +475,27 @@ final class NettyHttp2DemuxRelay {
 				.loop(this.loop)
 				.pipe(DuplexPipe.of(connection))
 				.listener(built -> new LegListener(opening))
-				.codec(codec -> configure(codec, new Http2Settings().pushEnabled(false)))
+				.codec(codec -> {
+					configure(codec, new Http2Settings().pushEnabled(false));
+					// streams past the upstream's concurrency limit wait in netty's
+					// StreamBufferingEncoder
+					codec.encoderEnforceMaxConcurrentStreams(true);
+				})
 				.onInactive(() -> this.legs.remove(route, opening))
 				.build();
 			opening.hop = hop;
 			hop.addConnectionListener(new LegStreams(opening));
+			// one stream until the upstream's SETTINGS tell its limit (RFC 9113 5.1.2
+			// leaves it open until then); through the encoder, as the buffering encoder
+			// keeps a limit of its own (100 until the peer's SETTINGS) and takes the
+			// connection's only in remoteSettings
+			limitStreams(hop, 1);
 		}
 		catch (RuntimeException e) {
+			Hop built = opening.hop;
+			if (built != null) {
+				built.abortLocked();
+			}
 			log.warn("h2 demux: the leg of route {} did not open: {}", route.routeTag(), e.toString(), e);
 			connection.close();
 			session.remove(connection.connectionId());
@@ -607,6 +716,9 @@ final class NettyHttp2DemuxRelay {
 		/** Set once the hop is built. */
 		@Nullable Hop hop;
 
+		/** The upstream's first SETTINGS has not arrived; with the loop's lock. */
+		boolean awaitingSettings = true;
+
 		Leg(H2DemuxMeters.Route routeMeters) {
 			this.routeMeters = routeMeters;
 		}
@@ -650,6 +762,12 @@ final class NettyHttp2DemuxRelay {
 
 		/** The upstream never saw the stream: the leg did not take it, or a GOAWAY. */
 		boolean refused;
+
+		/** The stream waits in the leg's buffer for the upstream's concurrency limit. */
+		boolean waiting;
+
+		/** The wait deadline while waiting, unless the deadline is off. */
+		@Nullable ScheduledFuture<?> waitDeadline;
 
 		/** The request's host, for the bad-gateway page. */
 		@Nullable String host;
@@ -715,6 +833,8 @@ final class NettyHttp2DemuxRelay {
 			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.get(streamId);
 			if (exchange != null && !exchange.reset) {
 				exchange.reset = true;
+				// a waiting stream leaves the leg's buffer as netty closes the client's
+				// stream right after this call (ClientStreams)
 				reset(exchange.leg.hop(), streamId, errorCode);
 			}
 		}
@@ -722,8 +842,10 @@ final class NettyHttp2DemuxRelay {
 	}
 
 	/**
-	 * The client's stream lifecycle: a stream closed without its request's end cancels
-	 * its upstream stream; a GOAWAY {@code COMPRESSION_ERROR} is logged.
+	 * The client's stream lifecycle: a stream closed before both its request and its
+	 * response ended -- reset by netty's codec, say -- cancels its upstream stream, and a
+	 * stream still waiting for its leg leaves the leg's buffer; a GOAWAY
+	 * {@code COMPRESSION_ERROR} is logged.
 	 */
 	private final class ClientStreams extends Http2ConnectionAdapter {
 
@@ -734,7 +856,11 @@ final class NettyHttp2DemuxRelay {
 				return;
 			}
 			exchange.leg.routeMeters.trackedStreams().decrement();
-			if (!exchange.requestEnded && !exchange.reset) {
+			if (exchange.waiting) {
+				exchange.reset = true;
+				dropWaitingLocked(exchange, Http2Error.CANCEL.code());
+			}
+			else if (!exchange.reset && !(exchange.requestEnded && exchange.responseEnded)) {
 				exchange.reset = true;
 				reset(exchange.leg.hop(), exchange.id, Http2Error.CANCEL.code());
 			}
@@ -762,6 +888,22 @@ final class NettyHttp2DemuxRelay {
 		private @Nullable Exchange exchange(int streamId) {
 			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.get(streamId);
 			return exchange == null || exchange.leg != this.leg || exchange.reset ? null : exchange;
+		}
+
+		/**
+		 * The upstream's first SETTINGS without a concurrency limit lifts the relay's one
+		 * stream: no limit announced is no limit (RFC 9113 6.5.2). netty applied the
+		 * SETTINGS before this call, a limit announced included.
+		 */
+		@Override
+		public void onSettingsRead(ChannelHandlerContext ctx, Http2Settings settings) {
+			if (!this.leg.awaitingSettings) {
+				return;
+			}
+			this.leg.awaitingSettings = false;
+			if (settings.maxConcurrentStreams() == null) {
+				limitStreams(this.leg.hop(), Integer.MAX_VALUE);
+			}
 		}
 
 		@Override
@@ -841,8 +983,9 @@ final class NettyHttp2DemuxRelay {
 	}
 
 	/**
-	 * A leg's stream lifecycle: a stream closed without the response's end -- the leg
-	 * closed under it, say -- is lost for the client.
+	 * A leg's stream lifecycle: a waiting stream the leg opens stops waiting; a stream
+	 * closed without the response's end -- the leg closed under it, say -- is lost for
+	 * the client.
 	 */
 	private final class LegStreams extends Http2ConnectionAdapter {
 
@@ -850,6 +993,14 @@ final class NettyHttp2DemuxRelay {
 
 		LegStreams(Leg leg) {
 			this.leg = leg;
+		}
+
+		@Override
+		public void onStreamAdded(Http2Stream stream) {
+			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.get(stream.id());
+			if (exchange != null && exchange.leg == this.leg) {
+				stopWaitingLocked(exchange);
+			}
 		}
 
 		@Override
@@ -887,6 +1038,8 @@ final class NettyHttp2DemuxRelay {
 		private @Nullable InetAddress peer;
 
 		private ConnectionLimits.@Nullable KeepAliveDeadline deadline;
+
+		private Duration streamWaitTimeout = Duration.ZERO;
 
 		private @Nullable Runnable onFinish;
 
@@ -953,6 +1106,15 @@ final class NettyHttp2DemuxRelay {
 		/** The connection's deadline, disarmed once the relay finished. */
 		Builder deadline(ConnectionLimits.KeepAliveDeadline deadline) {
 			this.deadline = deadline;
+			return this;
+		}
+
+		/**
+		 * How long a stream may wait for its upstream's concurrency limit before it is
+		 * refused; zero (the default) = as long as it takes.
+		 */
+		Builder streamWaitTimeout(Duration streamWaitTimeout) {
+			this.streamWaitTimeout = streamWaitTimeout;
 			return this;
 		}
 

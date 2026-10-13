@@ -81,11 +81,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  * no-route page, the bad-gateway page of a stream its leg lost before a response head --
  * is held to the client's stream window; an upstream's malformed frame ends its leg with
  * netty's GOAWAY while the client's connection goes on; a response the upstream completed
- * outlives the upstream's reset and its connection's end; the client going away
- * mid-stream cancels the upstream's stream and ends the relay -- connection count,
- * admission slot, hop threads, the legs' virtual connections. The relay's exception sink
- * stays silent throughout (no listener failure, no channel operation without the loop's
- * lock), and with netty's paranoid leak detection on no buffer leaks.
+ * outlives the upstream's reset and its connection's end; a stream past its upstream's
+ * concurrency limit waits, and is refused at the wait deadline unless it opened or left
+ * before (the legacy engine has no wait deadline); the client going away mid-stream
+ * cancels the upstream's stream and ends the relay -- connection count, admission slot,
+ * hop threads, the legs' virtual connections. The relay's exception sink stays silent
+ * throughout (no listener failure, no channel operation without the loop's lock), and
+ * with netty's paranoid leak detection on no buffer leaks.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -103,9 +105,6 @@ class NettyH2DemuxRelayE2ETest {
 	private static final String HOLD_HOST = "hold.netty-h2demux.test";
 
 	private static final String UNROUTED_HOST = "nowhere.netty-h2demux.test";
-
-	/** A route whose upstream admits one stream at a time and holds it. */
-	private static final String LIMITED_HOST = "limited.netty-h2demux.test";
 
 	/** A route whose upstream answers every head with a connection error. */
 	private static final String FAIL_HOST = "fail.netty-h2demux.test";
@@ -132,6 +131,12 @@ class NettyH2DemuxRelayE2ETest {
 	private static final int INTERNAL_ERROR = 0x2;
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(10);
+
+	/** {@code sluice.limits.h2-stream-wait-timeout} of this class. */
+	private static final Duration WAIT_TIMEOUT = Duration.ofSeconds(2);
+
+	/** How long a stream that must wait is watched not reaching the upstream. */
+	private static final Duration HELD = Duration.ofMillis(200);
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
@@ -186,6 +191,7 @@ class NettyH2DemuxRelayE2ETest {
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.h2-demux-engine", () -> "netty");
+		registry.add("sluice.limits.h2-stream-wait-timeout", () -> WAIT_TIMEOUT.toMillis() + "ms");
 		registry.add("sluice.access-log.rate-limit.enabled", () -> "false");
 		registry.add("sluice.token", () -> "it-token");
 		registry.add("server.port", () -> String.valueOf(TestPorts.freePort()));
@@ -206,12 +212,11 @@ class NettyH2DemuxRelayE2ETest {
 		startClient(GONE_HOST, refusedPort);
 		startClient(CUT_HOST, upstream(NettyH2DemuxRelayE2ETest::serveCut).getLocalPort());
 		startClient(HOLD_HOST, upstream(NettyH2DemuxRelayE2ETest::serveHold).getLocalPort());
-		startClient(LIMITED_HOST, upstream(NettyH2DemuxRelayE2ETest::serveLimited).getLocalPort());
 		startClient(FAIL_HOST, upstream(NettyH2DemuxRelayE2ETest::serveFailing).getLocalPort());
 		startClient(MALFORMED_HOST, upstream(NettyH2DemuxRelayE2ETest::serveMalformed).getLocalPort());
 		Awaitility.await()
 			.atMost(TIMEOUT)
-			.until(() -> List.of(OK_HOST, GONE_HOST, CUT_HOST, HOLD_HOST, LIMITED_HOST, FAIL_HOST, MALFORMED_HOST)
+			.until(() -> List.of(OK_HOST, GONE_HOST, CUT_HOST, HOLD_HOST, FAIL_HOST, MALFORMED_HOST)
 				.stream()
 				.allMatch(host -> router().lookup(host).isPresent()));
 	}
@@ -425,20 +430,261 @@ class NettyH2DemuxRelayE2ETest {
 	}
 
 	/**
-	 * A head the leg cannot take -- past the concurrency limit its upstream announced --
-	 * is refused ({@code REFUSED_STREAM}): the upstream never saw it.
+	 * A head past the concurrency limit its upstream announced waits, its DATA with it,
+	 * and is refused ({@code REFUSED_STREAM}) once it waited the wait deadline, not
+	 * before: the client got nothing else of it, the relay tracks it no more, the
+	 * upstream never saw it -- not when the stream ahead of it completed either -- and
+	 * the refusal is counted.
 	 */
 	@Test
-	void aHeadTheLegCannotTakeIsRefused() throws Exception {
+	void aHeadPastTheUpstreamsLimitWaitsAndIsRefusedAtTheDeadline() throws Exception {
+		String host = "deadline.netty-h2demux.test";
+		ScriptedH2Upstream upstream = limited(host);
+		double refusedBefore = waitTimeouts();
 		try (H2TestClient h2 = H2TestClient.connect(dataPort, 1, 3, 5)) {
-			h2.headers(1, false, post(LIMITED_HOST, "/held"));
-			// the upstream's SETTINGS came before its response head
-			assertThat(h2.awaitTrue(() -> !h2.frames(1).isEmpty(), TIMEOUT)).as("the response head").isTrue();
-			h2.headers(3, true, get(LIMITED_HOST, "/second"));
+			ScriptedH2Upstream.Connection connection = holdFirstStream(h2, upstream, host);
+			long sent = System.nanoTime();
+			h2.headers(3, false, post(host, "/waiting"));
+			h2.sendData(3, new byte[1000], 0);
 			assertThat(h2.awaitTrue(() -> h2.reset(3) != null, TIMEOUT)).as("stream 3 reset").isTrue();
+			long elapsed = System.nanoTime() - sent;
 			assertThat(h2.reset(3)).isEqualTo(REFUSED_STREAM);
-			h2.headers(5, true, get(OK_HOST, "/after"));
-			assertThat(h2.awaitEnd(5, TIMEOUT)).as("the connection goes on").isTrue();
+			assertThat(h2.frames(3)).extracting(TestH2.Frame::type)
+				.as("nothing but the refusal")
+				.containsExactly(TestH2.RST_STREAM);
+			assertThat(elapsed).as("refused at the deadline")
+				.isGreaterThanOrEqualTo(WAIT_TIMEOUT.toNanos())
+				.isLessThan(WAIT_TIMEOUT.plusSeconds(5).toNanos());
+			assertThat(waitTimeouts()).as("refusals counted").isEqualTo(refusedBefore + 1);
+			Awaitility.await("stream 3 untracked").atMost(TIMEOUT).until(() -> trackedStreams(host) == 1);
+			connection.answer(1, "first");
+			assertThat(h2.awaitEnd(1, TIMEOUT)).as("stream 1 completes").isTrue();
+			assertThat(TestH2.bodyOf(h2.frames(1))).isEqualTo("first");
+			assertThatOnlyTheNextStreamReachesTheUpstream(h2, connection, host);
+		}
+	}
+
+	/**
+	 * A waiting stream that opens before the wait deadline is not refused: it stays open
+	 * on the upstream past the deadline and completes.
+	 */
+	@Test
+	void aWaitingStreamThatOpensBeforeTheDeadlineIsNotRefused() throws Exception {
+		String host = "opens.netty-h2demux.test";
+		ScriptedH2Upstream upstream = limited(host);
+		double refusedBefore = waitTimeouts();
+		try (H2TestClient h2 = H2TestClient.connect(dataPort, 1, 3)) {
+			ScriptedH2Upstream.Connection connection = holdFirstStream(h2, upstream, host);
+			h2.headers(3, true, get(host, "/waiting"));
+			assertWaits(connection, 3);
+			connection.answer(1, "first");
+			assertThat(h2.awaitEnd(1, TIMEOUT)).isTrue();
+			assertThat(connection.await(frame -> frame.type() == TestH2.HEADERS && frame.streamId() == 3, TIMEOUT))
+				.as("stream 3 opened")
+				.isNotNull();
+			Thread.sleep(WAIT_TIMEOUT.plusSeconds(1).toMillis());
+			assertThat(h2.reset(3)).as("stream 3 kept past the deadline").isNull();
+			assertThat(connection.frames())
+				.noneMatch(frame -> frame.streamId() == 3 && frame.type() == TestH2.RST_STREAM);
+			assertThat(waitTimeouts()).isEqualTo(refusedBefore);
+			connection.answer(3, "second");
+			assertThat(h2.awaitEnd(3, TIMEOUT)).isTrue();
+			assertThat(TestH2.bodyOf(h2.frames(3))).isEqualTo("second");
+		}
+	}
+
+	/**
+	 * A waiting stream the client resets leaves the leg -- nothing of it reaches the
+	 * upstream -- and its wait deadline with it: nothing more reaches the client of it.
+	 */
+	@Test
+	void aWaitingStreamTheClientResetsLeavesTheLegAndItsDeadline() throws Exception {
+		String host = "client-reset.netty-h2demux.test";
+		ScriptedH2Upstream upstream = limited(host);
+		double refusedBefore = waitTimeouts();
+		try (H2TestClient h2 = H2TestClient.connect(dataPort, 1, 3, 5)) {
+			ScriptedH2Upstream.Connection connection = holdFirstStream(h2, upstream, host);
+			h2.headers(3, false, post(host, "/waiting"));
+			h2.sendData(3, new byte[1000], 0);
+			assertWaits(connection, 3);
+			h2.frame(TestH2.RST_STREAM, 0, 3, TestH2.int32(CANCEL));
+			Awaitility.await("stream 3 untracked").atMost(TIMEOUT).until(() -> trackedStreams(host) == 1);
+			Thread.sleep(WAIT_TIMEOUT.plusMillis(500).toMillis());
+			assertThat(h2.frames(3)).as("nothing of stream 3 from the relay").isEmpty();
+			assertThat(waitTimeouts()).isEqualTo(refusedBefore);
+			connection.answer(1, "first");
+			assertThat(h2.awaitEnd(1, TIMEOUT)).isTrue();
+			assertThatOnlyTheNextStreamReachesTheUpstream(h2, connection, host);
+		}
+	}
+
+	/**
+	 * A waiting stream whose request ended and that netty's codec resets (a WINDOW_UPDATE
+	 * of 0) leaves the leg: the stream ahead of it completes, and nothing of it reaches
+	 * the upstream.
+	 */
+	@Test
+	void aWaitingStreamTheCodecResetsAfterItsRequestEndedLeavesTheLeg() throws Exception {
+		String host = "codec-reset.netty-h2demux.test";
+		ScriptedH2Upstream upstream = limited(host);
+		try (H2TestClient h2 = H2TestClient.connect(dataPort, 1, 3, 5)) {
+			ScriptedH2Upstream.Connection connection = holdFirstStream(h2, upstream, host);
+			h2.headers(3, true, get(host, "/waiting"));
+			assertWaits(connection, 3);
+			h2.frame(TestH2.WINDOW_UPDATE, 0, 3, TestH2.int32(0));
+			assertThat(h2.awaitTrue(() -> h2.reset(3) != null, TIMEOUT)).as("stream 3 reset").isTrue();
+			assertThat(h2.reset(3)).isEqualTo(PROTOCOL_ERROR);
+			Awaitility.await("stream 3 untracked").atMost(TIMEOUT).until(() -> trackedStreams(host) == 1);
+			connection.answer(1, "first");
+			assertThat(h2.awaitEnd(1, TIMEOUT)).isTrue();
+			assertThatOnlyTheNextStreamReachesTheUpstream(h2, connection, host);
+		}
+	}
+
+	/**
+	 * The client going away while a stream waits ends the relay -- the upstream's
+	 * connection, the hop threads, the slot -- and the wait deadline refuses nothing
+	 * after it.
+	 */
+	@Test
+	void theClientGoingAwayWhileAStreamWaitsEndsTheRelay() throws Exception {
+		String host = "client-gone.netty-h2demux.test";
+		ScriptedH2Upstream upstream = limited(host);
+		double refusedBefore = waitTimeouts();
+		ScriptedH2Upstream.Connection connection;
+		long sent;
+		try (H2TestClient h2 = H2TestClient.connect(dataPort, 1, 3)) {
+			connection = holdFirstStream(h2, upstream, host);
+			sent = System.nanoTime();
+			h2.headers(3, true, get(host, "/waiting"));
+			assertWaits(connection, 3);
+		}
+		assertThat(connection.awaitEof(TIMEOUT)).as("the upstream's connection ended").isTrue();
+		Thread.sleep(Math.max(0, WAIT_TIMEOUT.plusMillis(500).toNanos() - (System.nanoTime() - sent)) / 1_000_000);
+		assertThat(waitTimeouts()).isEqualTo(refusedBefore);
+		assertThat(connection.frames()).noneMatch(frame -> frame.streamId() == 3);
+	}
+
+	/**
+	 * An upstream that never sends its SETTINGS: the leg opens one stream, the next waits
+	 * and is refused at the wait deadline, the upstream never seeing it.
+	 */
+	@Test
+	void aStreamWaitingForSettingsThatNeverComeIsRefusedAtTheDeadline() throws Exception {
+		String host = "no-settings.netty-h2demux.test";
+		List<Integer> heads = new CopyOnWriteArrayList<>();
+		// reads only: not even a SETTINGS ack, which netty's endpoint would take for a
+		// broken preface
+		startClient(host, stub(socket -> {
+			try (socket) {
+				InputStream in = socket.getInputStream();
+				if (in.readNBytes(TestH2.PREFACE.length).length < TestH2.PREFACE.length) {
+					return;
+				}
+				TestH2.@Nullable Frame frame;
+				while ((frame = TestH2.readFrame(in)) != null) {
+					if (frame.type() == TestH2.HEADERS) {
+						heads.add(frame.streamId());
+					}
+				}
+			}
+			catch (IOException e) {
+				// connection ended
+			}
+		}).getLocalPort());
+		Awaitility.await().atMost(TIMEOUT).until(() -> router().lookup(host).isPresent());
+		double refusedBefore = waitTimeouts();
+		try (H2TestClient h2 = H2TestClient.connect(dataPort, 1, 3)) {
+			h2.headers(1, true, get(host, "/first"));
+			Awaitility.await("stream 1 on the upstream").atMost(TIMEOUT).until(() -> heads.contains(1));
+			long sent = System.nanoTime();
+			h2.headers(3, true, get(host, "/waiting"));
+			assertThat(h2.awaitTrue(() -> h2.reset(3) != null, TIMEOUT)).as("stream 3 reset").isTrue();
+			long elapsed = System.nanoTime() - sent;
+			assertThat(h2.reset(3)).isEqualTo(REFUSED_STREAM);
+			assertThat(elapsed).as("refused at the deadline").isGreaterThanOrEqualTo(WAIT_TIMEOUT.toNanos());
+			assertThat(waitTimeouts()).isEqualTo(refusedBefore + 1);
+			assertThat(heads).as("the heads the upstream got").containsExactly(1);
+		}
+	}
+
+	/**
+	 * An upstream announcing a concurrency limit of 0: a stream after its SETTINGS waits
+	 * and is refused at the wait deadline, the upstream never seeing it.
+	 */
+	@Test
+	void aStreamHeldByALimitOfZeroIsRefusedAtTheDeadline() throws Exception {
+		String host = "zero-limit.netty-h2demux.test";
+		ScriptedH2Upstream upstream = scripted(host, ScriptedH2Upstream.start(
+				WindowedH2Upstream.setting(SETTINGS_MAX_CONCURRENT_STREAMS, 0), ScriptedH2Upstream.answering("first")));
+		double refusedBefore = waitTimeouts();
+		try (H2TestClient h2 = H2TestClient.connect(dataPort, 1, 3)) {
+			// stream 1 opens with the leg, ahead of the upstream's SETTINGS
+			h2.headers(1, true, get(host, "/first"));
+			assertThat(h2.awaitEnd(1, TIMEOUT)).isTrue();
+			ScriptedH2Upstream.Connection connection = upstream.awaitConnection(0, TIMEOUT);
+			assertThat(connection
+				.await(frame -> frame.type() == TestH2.SETTINGS && (frame.flags() & TestH2.FLAG_ACK) != 0, TIMEOUT))
+				.as("the upstream's limit acknowledged")
+				.isNotNull();
+			long sent = System.nanoTime();
+			h2.headers(3, true, get(host, "/waiting"));
+			assertThat(h2.awaitTrue(() -> h2.reset(3) != null, TIMEOUT)).as("stream 3 reset").isTrue();
+			long elapsed = System.nanoTime() - sent;
+			assertThat(h2.reset(3)).isEqualTo(REFUSED_STREAM);
+			assertThat(elapsed).as("refused at the deadline").isGreaterThanOrEqualTo(WAIT_TIMEOUT.toNanos());
+			assertThat(waitTimeouts()).isEqualTo(refusedBefore + 1);
+			assertThat(connection.frames()).noneMatch(frame -> frame.streamId() == 3);
+		}
+	}
+
+	/**
+	 * A wait timeout of 0 sets no deadline: a stream waits past what the deadline would
+	 * be, then opens and completes.
+	 */
+	@Test
+	void aZeroWaitTimeoutLetsAStreamWait() throws Exception {
+		String host = "untimed.netty-h2demux.test";
+		ScriptedH2Upstream upstream = limited(host);
+		double refusedBefore = waitTimeouts();
+		server().h2StreamWaitTimeout(Duration.ZERO);
+		try (H2TestClient h2 = H2TestClient.connect(dataPort, 1, 3)) {
+			ScriptedH2Upstream.Connection connection = holdFirstStream(h2, upstream, host);
+			h2.headers(3, true, get(host, "/waiting"));
+			Thread.sleep(WAIT_TIMEOUT.multipliedBy(2).toMillis());
+			assertThat(h2.reset(3)).as("stream 3 still waits").isNull();
+			assertThat(connection.frames()).noneMatch(frame -> frame.streamId() == 3);
+			connection.answer(1, "first");
+			assertThat(h2.awaitEnd(1, TIMEOUT)).isTrue();
+			assertThat(connection.await(frame -> frame.type() == TestH2.HEADERS && frame.streamId() == 3, TIMEOUT))
+				.as("stream 3 opened")
+				.isNotNull();
+			connection.answer(3, "second");
+			assertThat(h2.awaitEnd(3, TIMEOUT)).isTrue();
+			assertThat(waitTimeouts()).isEqualTo(refusedBefore);
+		}
+		finally {
+			server().h2StreamWaitTimeout(WAIT_TIMEOUT);
+		}
+	}
+
+	/**
+	 * A stream netty's codec resets (a WINDOW_UPDATE of 0) after its request ended, its
+	 * response begun, cancels its upstream stream; the connection goes on.
+	 */
+	@Test
+	void aStreamTheCodecResetsAfterItsRequestEndedCancelsItsUpstreamStream() throws Exception {
+		try (H2TestClient h2 = H2TestClient.connect(dataPort, 1, 3)) {
+			h2.headers(1, true, get(HOLD_HOST, "/ended"));
+			assertThat(h2.awaitTrue(() -> !h2.frames(1).isEmpty(), TIMEOUT)).as("the response head").isTrue();
+			h2.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(0));
+			assertThat(h2.awaitTrue(() -> h2.reset(1) != null, TIMEOUT)).as("stream 1 reset").isTrue();
+			assertThat(h2.reset(1)).isEqualTo(PROTOCOL_ERROR);
+			Awaitility.await("the upstream's stream cancelled")
+				.atMost(TIMEOUT)
+				.until(() -> HOLD_RESETS.contains("/ended:" + CANCEL));
+			h2.headers(3, true, get(OK_HOST, "/after"));
+			assertThat(h2.awaitEnd(3, TIMEOUT)).as("the connection goes on").isTrue();
 		}
 	}
 
@@ -770,15 +1016,69 @@ class NettyH2DemuxRelayE2ETest {
 		return out.toByteArray();
 	}
 
-	/** Admits one stream at a time; answers every head with a 200 head, never ends. */
-	private static void serveLimited(WindowedH2Upstream upstream) throws Exception {
-		upstream.write(TestH2.SETTINGS, 0, 0, WindowedH2Upstream.setting(SETTINGS_MAX_CONCURRENT_STREAMS, 1));
-		TestH2.@Nullable Frame frame;
-		while ((frame = upstream.next()) != null) {
-			if (frame.type() == TestH2.HEADERS) {
-				upstream.headers(frame.streamId(), false);
-			}
-		}
+	/**
+	 * Starts a tunnel client serving the host from a scripted upstream announcing a
+	 * concurrency limit of 1 and answering only what the test answers.
+	 */
+	private ScriptedH2Upstream limited(String host) throws IOException {
+		return scripted(host, ScriptedH2Upstream.start(WindowedH2Upstream.setting(SETTINGS_MAX_CONCURRENT_STREAMS, 1),
+				(connection, frame) -> {
+				}));
+	}
+
+	/**
+	 * Opens stream 1 to the limited upstream, held there, and waits until the relay
+	 * acknowledged the upstream's limit: the next stream of the host waits.
+	 */
+	private static ScriptedH2Upstream.Connection holdFirstStream(H2TestClient h2, ScriptedH2Upstream upstream,
+			String host) throws Exception {
+		h2.headers(1, true, get(host, "/held"));
+		ScriptedH2Upstream.Connection connection = upstream.awaitConnection(0, TIMEOUT);
+		assertThat(connection.await(frame -> frame.type() == TestH2.HEADERS && frame.streamId() == 1, TIMEOUT))
+			.as("stream 1 on the upstream")
+			.isNotNull();
+		assertThat(connection.await(frame -> frame.type() == TestH2.SETTINGS && (frame.flags() & TestH2.FLAG_ACK) != 0,
+				TIMEOUT))
+			.as("the upstream's limit acknowledged")
+			.isNotNull();
+		return connection;
+	}
+
+	/** Asserts that nothing of the stream reaches the upstream for a while. */
+	private static void assertWaits(ScriptedH2Upstream.Connection connection, int streamId)
+			throws InterruptedException {
+		Thread.sleep(HELD.toMillis());
+		assertThat(connection.frames()).as("stream %d waits", streamId)
+			.noneMatch(frame -> frame.streamId() == streamId);
+	}
+
+	/**
+	 * Opens stream 5 of the host once stream 1 completed: it reaches the upstream, and
+	 * stream 3 did not before it (frames arrive in order).
+	 */
+	private static void assertThatOnlyTheNextStreamReachesTheUpstream(H2TestClient h2,
+			ScriptedH2Upstream.Connection connection, String host) throws Exception {
+		h2.headers(5, true, get(host, "/next"));
+		assertThat(connection.await(frame -> frame.type() == TestH2.HEADERS && frame.streamId() == 5, TIMEOUT))
+			.as("stream 5 on the upstream")
+			.isNotNull();
+		assertThat(connection.frames()).as("nothing of stream 3 reached the upstream")
+			.noneMatch(frame -> frame.streamId() == 3);
+		connection.answer(5, "next");
+		assertThat(h2.awaitEnd(5, TIMEOUT)).isTrue();
+	}
+
+	/** Streams refused at the wait deadline so far. */
+	private double waitTimeouts() {
+		return Objects.requireNonNull(this.meterRegistry)
+			.get("sluice.h2demux.streams.refused")
+			.tag("reason", "wait-timeout")
+			.counter()
+			.count();
+	}
+
+	private long trackedStreams(String host) {
+		return server().h2DemuxMeters().trackedStreams(host);
 	}
 
 	private static String pathOf(TestH2.Frame frame) throws Http2Exception {

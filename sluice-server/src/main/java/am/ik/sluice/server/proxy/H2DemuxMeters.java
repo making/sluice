@@ -18,12 +18,13 @@ import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
  * The meters shared by every h2 demux relay of one data proxy: per route, the bytes
  * queued for the leg writers of all live legs -- one gauge per route, so the series count
  * follows the routes, not the connections --, the streams refused for want of queue
- * budget or of a slot for a new leg or while waiting for an upstream's concurrency limit,
- * the streams a relay reset for want of queue budget or for a client's or an upstream's
- * stream error, the streams answered 421 for a route reached over HTTP/1.1 only, the legs
- * ended by their upstream's connection error, the times a relay withheld the client's
- * connection window, the connections demultiplexed by each engine, and, for tests, the
- * number of times a leg writer woke up and the streams the relays track.
+ * budget or of a slot for a new leg, or while waiting for an upstream's concurrency limit
+ * (to free a connection whose window is withheld, or past the wait deadline), the streams
+ * a relay reset for want of queue budget or for a client's or an upstream's stream error,
+ * the streams answered 421 for a route reached over HTTP/1.1 only, the legs ended by
+ * their upstream's connection error, the times a relay withheld the client's connection
+ * window, the connections demultiplexed by each engine, and, for tests, the number of
+ * times a leg writer woke up and the streams the relays track.
  */
 final class H2DemuxMeters {
 
@@ -39,6 +40,8 @@ final class H2DemuxMeters {
 	private final Counter refusedLegLimit;
 
 	private final Counter refusedWaiting;
+
+	private final Counter refusedWaitTimeout;
 
 	private final Counter resetBudget;
 
@@ -59,6 +62,7 @@ final class H2DemuxMeters {
 		this.refusedBudget = refused(registry, "budget");
 		this.refusedLegLimit = refused(registry, "leg-limit");
 		this.refusedWaiting = refused(registry, "waiting");
+		this.refusedWaitTimeout = refused(registry, "wait-timeout");
 		this.resetBudget = reset(registry, "budget");
 		this.resetProtocol = reset(registry, "protocol");
 		this.resetUpstream = reset(registry, "upstream");
@@ -89,7 +93,7 @@ final class H2DemuxMeters {
 			.tag("reason", reason)
 			.description("h2 streams refused (REFUSED_STREAM) for want of queue budget or of a slot for a new leg, or"
 					+ " while waiting for an upstream's concurrency limit, to free the queue of a connection whose"
-					+ " window is withheld")
+					+ " window is withheld or past the wait deadline")
 			.register(registry);
 	}
 
@@ -119,6 +123,14 @@ final class H2DemuxMeters {
 	 */
 	void refusedWaiting() {
 		this.refusedWaiting.increment();
+	}
+
+	/**
+	 * A stream refused: it waited for its upstream's concurrency limit past
+	 * {@code sluice.limits.h2-stream-wait-timeout}.
+	 */
+	void refusedForWaitTimeout() {
+		this.refusedWaitTimeout.increment();
 	}
 
 	/** A stream reset: its trailers did not fit the queue budget. */

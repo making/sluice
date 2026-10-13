@@ -95,6 +95,7 @@ class SluiceServerPropertiesTest {
 		assertThat(properties.limits().headTimeout()).isEqualTo(Duration.ofSeconds(10));
 		assertThat(properties.limits().idleTimeout()).isEqualTo(Duration.ofSeconds(60));
 		assertThat(properties.limits().h2QueueBudget().toBytes()).isZero();
+		assertThat(properties.limits().h2StreamWaitTimeout()).isEqualTo(Duration.ofSeconds(30));
 		assertThat(properties.limits().halfCloseProbeInterval()).isEqualTo(Duration.ofSeconds(1));
 		assertThat(properties.limits().stallTimeout()).isEqualTo(Duration.ofSeconds(60));
 		assertThat(properties.limits().stallMinBytes().toBytes()).isEqualTo(16 * 1024);
@@ -116,6 +117,15 @@ class SluiceServerPropertiesTest {
 			.isEqualTo(Duration.ofSeconds(60));
 		assertThat(bind(Map.of("sluice.limits.tunnel-stall-timeout", "90s")).limits().tunnelStallTimeout())
 			.isEqualTo(Duration.ofSeconds(90));
+	}
+
+	@Test
+	void aZeroH2StreamWaitTimeoutTurnsTheDeadlineOffAndANegativeOneFallsBackToTheDefault() {
+		assertThat(bind(Map.of("sluice.limits.h2-stream-wait-timeout", "0")).limits().h2StreamWaitTimeout()).isZero();
+		assertThat(bind(Map.of("sluice.limits.h2-stream-wait-timeout", "-1s")).limits().h2StreamWaitTimeout())
+			.isEqualTo(Duration.ofSeconds(30));
+		assertThat(bind(Map.of("sluice.limits.h2-stream-wait-timeout", "5s")).limits().h2StreamWaitTimeout())
+			.isEqualTo(Duration.ofSeconds(5));
 	}
 
 	@Test

@@ -387,7 +387,6 @@ class H2DemuxUpstreamErrorE2ETest {
 	 * upstream never saw it), and none of the waiting stream's frames reach the upstream.
 	 */
 	@Test
-	@LegacyOnly("a stream waiting for the upstream's concurrency limit: a later migration step")
 	void upstreamFrameOnAWaitingStreamEndsItsLegAndRefusesTheStream() throws Exception {
 		String route = route("ue.idle-stream");
 		ScriptedH2Upstream upstream = upstream(TestH2Settings.of(MAX_CONCURRENT_STREAMS, 1), (connection, frame) -> {
@@ -432,25 +431,20 @@ class H2DemuxUpstreamErrorE2ETest {
 		});
 		self.set(upstream);
 		startClient(route, upstream);
-		// the netty engine does not hold a stream for the upstream's concurrency limit
-		// yet
-		// (a later migration step): its stream 3 would race the upstream's SETTINGS
-		boolean waits = this.engine == H2DemuxEngine.LEGACY;
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5)) {
 			client.headers(1, true, get(route));
-			if (waits) {
-				client.headers(3, true, get(route));
-				awaitHandled(client, 3);
-			}
+			client.headers(3, true, get(route));
+			awaitHandled(client, 3);
 			ScriptedH2Upstream.Connection connection = upstream.awaitConnection(0, WITHIN);
 			assertThat(connection.await(frame -> frame.type() == TestH2.HEADERS && frame.streamId() == 1, WITHIN))
 				.isNotNull();
 			connection.close();
-			assertThat(client.awaitTrue(() -> client.ended(1) && (!waits || client.reset(3) != null), WITHIN)).isTrue();
+			assertThat(client.awaitTrue(() -> client.ended(1) && client.reset(3) != null, WITHIN)).isTrue();
 			assertBadGateway(client.frames(1), route, "GET");
-			if (waits) {
-				assertThat(client.reset(3)).isEqualTo(REFUSED_STREAM);
-			}
+			assertThat(client.reset(3)).isEqualTo(REFUSED_STREAM);
+			assertThat(types(client.frames(3))).as("nothing but the refusal").containsExactly(TestH2.RST_STREAM);
+			assertThat(connection.frames()).as("nothing of stream 3 reached the upstream")
+				.noneMatch(frame -> frame.streamId() == 3);
 			client.headers(5, true, get(route));
 			assertThat(client.awaitEnd(5, WITHIN)).isTrue();
 			assertThat(TestH2.bodyOf(client.frames(5))).isEqualTo("new-leg");
@@ -539,12 +533,8 @@ class H2DemuxUpstreamErrorE2ETest {
 			assertThat(client.awaitEnd(7, WITHIN)).isTrue();
 			assertThat(TestH2.bodyOf(client.frames(7))).isEqualTo("new-leg");
 			assertThat(upstream.connections()).hasSize(2);
-			if (this.engine == H2DemuxEngine.LEGACY) {
-				// the netty engine does not hold stream 5 for the upstream's concurrency
-				// limit yet (a later migration step): it may reach the upstream before
-				// the upstream's SETTINGS do
-				assertThat(connection.frames()).noneMatch(frame -> frame.streamId() == 5);
-			}
+			assertThat(connection.frames()).noneMatch(frame -> frame.streamId() == 5);
+			assertThat(types(client.frames(5))).as("nothing but the refusal").containsExactly(TestH2.RST_STREAM);
 			assertThat(connection.frames()).noneMatch(frame -> frame.streamId() == 7);
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 		}

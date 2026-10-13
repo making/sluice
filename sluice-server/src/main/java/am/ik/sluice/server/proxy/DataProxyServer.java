@@ -113,6 +113,9 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	/** The relay every h2 connection demultiplexed from now on gets. */
 	private volatile SluiceServerProperties.H2DemuxEngine h2DemuxEngine;
 
+	/** The wait deadline every netty h2 demux relay started from now on gets. */
+	private volatile Duration h2StreamWaitTimeout;
+
 	/** Wraps the client pipe of every HTTP/1.1 relay started from now on. */
 	private volatile UnaryOperator<DuplexPipe> clientPipeSeam = UnaryOperator.identity();
 
@@ -136,6 +139,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		this.errorResponse = errorResponse;
 		this.limits = limits;
 		this.h2DemuxEngine = properties.h2DemuxEngine();
+		this.h2StreamWaitTimeout = properties.limits().h2StreamWaitTimeout();
 	}
 
 	/**
@@ -398,6 +402,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 						.initialRoute(route0, session)
 						.peer(peer)
 						.deadline(deadline)
+						.streamWaitTimeout(this.h2StreamWaitTimeout)
 						.onFinish(relayed)
 						.release(release)
 						.build()::start;
@@ -615,6 +620,14 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	 */
 	void h2DemuxEngine(SluiceServerProperties.H2DemuxEngine h2DemuxEngine) {
 		this.h2DemuxEngine = h2DemuxEngine;
+	}
+
+	/**
+	 * Sets the wait deadline of the netty h2 demux relays started from now on, in place
+	 * of {@code sluice.limits.h2-stream-wait-timeout}; for tests.
+	 */
+	void h2StreamWaitTimeout(Duration h2StreamWaitTimeout) {
+		this.h2StreamWaitTimeout = h2StreamWaitTimeout;
 	}
 
 	/** Sets the write seam of the h2 demux relays started from now on; for tests. */
