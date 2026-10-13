@@ -7,10 +7,13 @@ import javax.net.ssl.TrustManagerFactory;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.SplittableRandom;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+import java.util.random.RandomGenerator;
 
 import org.jspecify.annotations.Nullable;
 
@@ -48,11 +51,12 @@ import org.springframework.core.task.TaskExecutor;
 
 /**
  * One tunnel stream toward one server node: connects, advertises the upstream map, dials
- * local upstreams on CONNECT, and reconnects with exponential backoff (1s..30s) when the
- * stream drops. Listen ports the server rejects (taken, or outside its range) are
- * re-advertised on the same stream with the same backoff, so the other routes stay up.
- * The lifecycle of the per-node virtual connections lives here; the fan-out across nodes
- * is the supervisor's ({@link TunnelClient}) concern.
+ * local upstreams on CONNECT, and reconnects with jittered exponential backoff when the
+ * stream drops: the ceiling doubles from 1s to 30s and each wait is drawn from its upper
+ * half ({@link ReconnectBackoff}). Listen ports the server rejects (taken, or outside its
+ * range) are re-advertised on the same stream with the same backoff, so the other routes
+ * stay up. The lifecycle of the per-node virtual connections lives here; the fan-out
+ * across nodes is the supervisor's ({@link TunnelClient}) concern.
  */
 public final class NodeConnection implements AutoCloseable {
 
@@ -64,10 +68,6 @@ public final class NodeConnection implements AutoCloseable {
 	 */
 	public static final String SERVER_WINDOW_REQUIRED = "the server announced no per-connection receive window "
 			+ "(Connect.connection_window); this client requires sluice-server 046cd21 (2026-10-12) or later";
-
-	private static final long BACKOFF_INITIAL_SECONDS = 1;
-
-	private static final long BACKOFF_MAX_SECONDS = 30;
 
 	private static final Metadata.Key<String> TOKEN_HEADER = Metadata.Key.of("authorization",
 			Metadata.ASCII_STRING_MARSHALLER);
@@ -139,7 +139,9 @@ public final class NodeConnection implements AutoCloseable {
 
 	private volatile boolean connected;
 
-	private volatile long readvertiseBackoff = BACKOFF_INITIAL_SECONDS;
+	private final ReconnectBackoff readvertiseBackoff;
+
+	private final ReconnectBackoff reconnectBackoff;
 
 	private volatile @Nullable ManagedChannel channel;
 
@@ -147,6 +149,8 @@ public final class NodeConnection implements AutoCloseable {
 
 	private NodeConnection(Builder builder) {
 		this.key = Objects.requireNonNull(builder.key, "key is required");
+		this.readvertiseBackoff = new ReconnectBackoff(builder.randomFactory.get());
+		this.reconnectBackoff = new ReconnectBackoff(builder.randomFactory.get());
 		this.nodeId = builder.nodeId == null ? "" : builder.nodeId;
 		this.url = Objects.requireNonNull(builder.url, "url is required");
 		this.properties = Objects.requireNonNull(builder.properties, "properties is required");
@@ -231,6 +235,8 @@ public final class NodeConnection implements AutoCloseable {
 
 		private @Nullable ConnectionLimit connectionLimit;
 
+		private Supplier<RandomGenerator> randomFactory = SplittableRandom::new;
+
 		private PeerBuild clientBuild = PeerBuild.newBuilder()
 			.setImplementation(ClientBuildConfiguration.IMPLEMENTATION)
 			.build();
@@ -306,6 +312,15 @@ public final class NodeConnection implements AutoCloseable {
 			return this;
 		}
 
+		/**
+		 * Supplies the randomness of the backoff jitter, one generator per backoff; tests
+		 * seed it.
+		 */
+		public Builder randomFactory(Supplier<RandomGenerator> randomFactory) {
+			this.randomFactory = randomFactory;
+			return this;
+		}
+
 		public NodeConnection build() {
 			return new NodeConnection(this);
 		}
@@ -335,13 +350,12 @@ public final class NodeConnection implements AutoCloseable {
 	}
 
 	private void runLoop() {
-		long backoff = BACKOFF_INITIAL_SECONDS;
 		while (this.running) {
 			try {
 				this.channel = buildChannel();
 				runSession(this.channel);
 				if (this.connected) {
-					backoff = BACKOFF_INITIAL_SECONDS;
+					this.reconnectBackoff.reset();
 				}
 			}
 			catch (InterruptedException e) {
@@ -363,13 +377,12 @@ public final class NodeConnection implements AutoCloseable {
 			// the next loop iteration is the reconnection attempt
 			this.reconnects.increment();
 			try {
-				TimeUnit.SECONDS.sleep(backoff);
+				TimeUnit.MILLISECONDS.sleep(this.reconnectBackoff.next().toMillis());
 			}
 			catch (InterruptedException e) {
 				Thread.currentThread().interrupt();
 				return;
 			}
-			backoff = Math.min(BACKOFF_MAX_SECONDS, backoff * 2);
 		}
 	}
 
@@ -463,7 +476,7 @@ public final class NodeConnection implements AutoCloseable {
 		if (sender == null) {
 			return; // stream failed before starting
 		}
-		this.readvertiseBackoff = BACKOFF_INITIAL_SECONDS;
+		this.readvertiseBackoff.reset();
 		sender.sendAdvertise(this.advertise);
 		closed.await();
 		// the sender first, as in TunnelSession#close: a dead or stalled stream must not
@@ -627,13 +640,13 @@ public final class NodeConnection implements AutoCloseable {
 					this.nodeId = ackNodeId;
 				}
 				if (rejected.isEmpty()) {
-					this.readvertiseBackoff = BACKOFF_INITIAL_SECONDS;
+					this.readvertiseBackoff.reset();
 				}
 				else {
 					// the other routes are up; only the rejected ports are retried
-					long delay = this.readvertiseBackoff;
-					this.readvertiseBackoff = Math.min(BACKOFF_MAX_SECONDS, delay * 2);
-					log.warn("[{}] server rejected listen ports {}; re-advertising in {}s", this.key, rejected, delay);
+					Duration delay = this.readvertiseBackoff.next();
+					log.warn("[{}] server rejected listen ports {}; re-advertising in {}ms", this.key, rejected,
+							delay.toMillis());
 					this.rejectedAdvertises.increment();
 					readvertiseAfter(delay, closed);
 				}
@@ -667,10 +680,10 @@ public final class NodeConnection implements AutoCloseable {
 	}
 
 	/** Re-sends the advertise on this stream after the delay unless it closes first. */
-	private void readvertiseAfter(long delaySeconds, CountDownLatch closed) {
+	private void readvertiseAfter(Duration delay, CountDownLatch closed) {
 		Thread.ofVirtual().name("sluice-readvertise-" + this.key).start(() -> {
 			try {
-				if (closed.await(delaySeconds, TimeUnit.SECONDS)) {
+				if (closed.await(delay.toMillis(), TimeUnit.MILLISECONDS)) {
 					return;
 				}
 			}

@@ -69,7 +69,7 @@ sequenceDiagram
 
 - `sluice-proto` - `.proto` contract, generated stubs, and the shared tunnel primitives (`VirtualConnection`, `SessionSender`, `SocketRelay`)
 - `sluice-server` - exit node: gRPC control plane (`spring.grpc.server.port`, default 8001) + raw TCP data plane (`sluice.data-port`, default 8000) + actuator and management console (`server.port`, default 8081)
-- `sluice-client` - tunnel client: connects to the server, advertises upstreams, dials local upstreams on CONNECT, reconnects with exponential backoff (1s..30s), actuator on `server.port` (default 9001)
+- `sluice-client` - tunnel client: connects to the server, advertises upstreams, dials local upstreams on CONNECT, reconnects with jittered exponential backoff (ceiling 1s..30s, each wait drawn from its upper half), actuator on `server.port` (default 9001)
 - `sluice-it` - full stack integration tests running the real server and client applications in one JVM (proxying, reconnect after server restart, wrong-token rejection)
 - `sluice-example-upstream` - minimal sample upstream for manual checks (`It works` over http/1.1 and h2c)
 
@@ -202,7 +202,7 @@ The listener is bound when the client advertises and released on disconnect; the
 server acknowledges the advertisement and reports back the listen ports it could
 not bind (outside `sluice.tcp-port-range`, held by another connected client, or
 already taken) -- the client keeps the stream (its other routes stay up) and
-re-advertises on it with backoff (1s..30s) until the ports bind. The listen ports
+re-advertises on it with the same jittered backoff (ceiling 1s..30s) until the ports bind. The listen ports
 must be exposed on the host (`docker -p`, firewall) -- the deployment delta against
 the single data port.
 
@@ -328,7 +328,7 @@ set explicitly in `sluice-server/src/main/resources/application.properties`:
 |---|---|---|
 | server `spring.grpc.server.keepalive.time` / `spring.grpc.server.keepalive.timeout` | `30s` / `10s` | the server pings clients and reaps dead ones (session and routes released ~40s after silent death) |
 | server `spring.grpc.server.keepalive.permit.time` / `spring.grpc.server.keepalive.permit.without-calls` | `10s` / `true` | client pings every 30s; grpc's default permit (5m) risks `GOAWAY TOO_MANY_PINGS` |
-| client `sluice.keep-alive-time` / `sluice.keep-alive-timeout` | `30s` / `10s` | pings keep NAT mappings alive; an unanswered ping tears the channel down and the reconnect backoff (1s..30s) takes over |
+| client `sluice.keep-alive-time` / `sluice.keep-alive-timeout` | `30s` / `10s` | pings keep NAT mappings alive; an unanswered ping tears the channel down and the reconnect backoff (ceiling 1s..30s, jittered) takes over |
 
 Application-level `KEEPALIVE` frames are not sent: the gRPC (HTTP/2) ping already
 provides liveness. The frame type stays in the proto for future use and is handled as a

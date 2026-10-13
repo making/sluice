@@ -4,11 +4,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.SplittableRandom;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
+import java.util.random.RandomGenerator;
 
 import org.jspecify.annotations.Nullable;
 
@@ -22,6 +25,7 @@ import am.ik.sluice.v1.proto.ListNodesResponse;
 import am.ik.sluice.v1.proto.PeerBuild;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.ssl.SslBundle;
 import org.springframework.boot.ssl.SslBundles;
@@ -64,15 +68,24 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 	/** This client's build, announced on every stream. */
 	private final PeerBuild clientBuild;
 
+	private final Supplier<RandomGenerator> randomFactory;
+
 	private volatile boolean running;
 
+	@Autowired
 	TunnelClient(SluiceClientProperties properties, @Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor,
 			MeterRegistry meterRegistry, @Nullable SslBundles sslBundles, PeerBuild clientBuild) {
+		this(properties, taskExecutor, meterRegistry, sslBundles, clientBuild, SplittableRandom::new);
+	}
+
+	private TunnelClient(SluiceClientProperties properties, TaskExecutor taskExecutor, MeterRegistry meterRegistry,
+			@Nullable SslBundles sslBundles, PeerBuild clientBuild, Supplier<RandomGenerator> randomFactory) {
 		this.properties = properties;
 		this.taskExecutor = taskExecutor;
 		this.meterRegistry = meterRegistry;
 		this.sslBundles = sslBundles;
 		this.clientBuild = clientBuild;
+		this.randomFactory = randomFactory;
 		log.info("client build: {}", PeerBuilds.describe(clientBuild));
 		String configured = clientid(properties);
 		this.clientId = configured == null || configured.isBlank() ? UUID.randomUUID().toString() : configured;
@@ -115,6 +128,8 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 
 		private @Nullable SslBundles sslBundles;
 
+		private Supplier<RandomGenerator> randomFactory = SplittableRandom::new;
+
 		private PeerBuild clientBuild = PeerBuild.newBuilder()
 			.setImplementation(ClientBuildConfiguration.IMPLEMENTATION)
 			.build();
@@ -150,11 +165,17 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 			return this;
 		}
 
+		/** Supplies the randomness of the reconnect jitter; tests seed it. */
+		public Builder randomFactory(Supplier<RandomGenerator> randomFactory) {
+			this.randomFactory = randomFactory;
+			return this;
+		}
+
 		public TunnelClient build() {
 			return new TunnelClient(Objects.requireNonNull(this.properties, "properties is required"),
 					Objects.requireNonNull(this.taskExecutor, "taskExecutor is required"),
 					Objects.requireNonNull(this.meterRegistry, "meterRegistry is required"), this.sslBundles,
-					this.clientBuild);
+					this.clientBuild, this.randomFactory);
 		}
 
 	}
@@ -205,6 +226,7 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 			.meterRegistry(this.meterRegistry)
 			.connectionLimit(this.connectionLimit)
 			.clientBuild(this.clientBuild)
+			.randomFactory(this.randomFactory)
 			.build();
 		this.connectionsByNode.put(nodeId.isBlank() ? url : nodeId, connection);
 		connection.start();

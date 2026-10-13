@@ -8,8 +8,8 @@
 //! The supervisor (`supervise`) ports the Java client's fan-out semantics
 //! (`TunnelClient` / `NodeConnection`): the `--server` endpoint is only the
 //! bootstrap; the node list learned via `ListNodes` / `MembershipUpdate` keeps
-//! one tunnel stream per node, a dropped stream reconnects with exponential
-//! backoff (1s..30s), and the `AdvertiseAck` renames the session after its
+//! one tunnel stream per node, a dropped stream reconnects with jittered
+//! exponential backoff (ceiling 1s..30s, each wait drawn from its upper half), and the `AdvertiseAck` renames the session after its
 //! node. Exactly one stream per node is kept: the server closes the older
 //! registration when a client id re-registers.
 //!
@@ -71,10 +71,43 @@ struct Config {
     stall_timeout: Duration,
 }
 
-/// Reconnect backoff: exponential seconds, as `NodeConnection`.
+/// Reconnect backoff: the ceiling doubles from 1s to 30s and each wait is
+/// drawn from its upper half (equal jitter), as `ReconnectBackoff` of the Java
+/// client, so clients that failed together do not retry together.
 const BACKOFF_INITIAL_SECS: u64 = 1;
 
 const BACKOFF_MAX_SECS: u64 = 30;
+
+struct Backoff {
+    ceiling_secs: u64,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Self {
+            ceiling_secs: BACKOFF_INITIAL_SECS,
+        }
+    }
+
+    /// The wait before the next attempt, `unit` in `[0, 1)` picking the point
+    /// in the upper half of the ceiling; the ceiling of the one after doubles.
+    fn next(&mut self, unit: f64) -> Duration {
+        let ceiling = Duration::from_secs(self.ceiling_secs);
+        self.ceiling_secs = (self.ceiling_secs * 2).min(BACKOFF_MAX_SECS);
+        ceiling / 2 + (ceiling / 2).mul_f64(unit)
+    }
+
+    /// Back to the initial ceiling, after the tunnel came up.
+    fn reset(&mut self) {
+        self.ceiling_secs = BACKOFF_INITIAL_SECS;
+    }
+}
+
+/// A uniform random number in `[0, 1)` from the 53 high bits of a random
+/// (v4) uuid.
+fn jitter_unit() -> f64 {
+    (uuid::Uuid::new_v4().as_u128() >> 75) as f64 / (1u64 << 53) as f64
+}
 
 /// Bound on one connect attempt, so a black-holed node cannot park the
 /// reconnect loop.
@@ -493,22 +526,21 @@ fn spawn_session(
 }
 
 impl NodeTask {
-    /// Connect / serve / reconnect loop with exponential backoff
+    /// Connect / serve / reconnect loop with jittered exponential backoff
     /// (`NodeConnection#runLoop`); exits once the supervisor cancels the token.
     async fn run(self) {
-        let mut backoff = BACKOFF_INITIAL_SECS;
+        let mut backoff = Backoff::new();
         loop {
             match self.attempt().await {
-                Ok(true) => backoff = BACKOFF_INITIAL_SECS,
+                Ok(true) => backoff.reset(),
                 Ok(false) => {}
                 Err(e) => eprintln!("[{}] tunnel stream ended: {e}", self.key),
             }
             let token = self.session.token.clone();
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+                _ = tokio::time::sleep(backoff.next(jitter_unit())) => {}
                 _ = token.cancelled() => return,
             }
-            backoff = (backoff * 2).min(BACKOFF_MAX_SECS);
         }
     }
 
@@ -765,6 +797,58 @@ async fn list_nodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backoff_waits_in_the_upper_half_of_a_doubling_capped_ceiling() {
+        let ceilings = [1, 2, 4, 8, 16, 30, 30, 30];
+        for unit in [0.0, 0.25, 0.5, 0.999_999] {
+            let mut backoff = Backoff::new();
+            for ceiling in ceilings {
+                let wait = backoff.next(unit);
+                let ceiling = Duration::from_secs(ceiling);
+                assert!(
+                    wait >= ceiling / 2 && wait <= ceiling,
+                    "{wait:?} of {ceiling:?}"
+                );
+            }
+        }
+        // the extremes are the half and (nearly) the whole ceiling
+        assert_eq!(Backoff::new().next(0.0), Duration::from_millis(500));
+        let mut backoff = Backoff::new();
+        backoff.next(0.0);
+        assert_eq!(backoff.next(0.0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backoff_resets_to_the_initial_ceiling() {
+        let mut backoff = Backoff::new();
+        for _ in 0..6 {
+            backoff.next(0.0);
+        }
+        backoff.reset();
+        assert_eq!(backoff.next(0.0), Duration::from_millis(500));
+        assert_eq!(backoff.next(0.0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_jitter_source_varies_within_the_unit_interval() {
+        let units: std::collections::HashSet<u64> = (0..100)
+            .map(|_| {
+                let unit = jitter_unit();
+                assert!((0.0..1.0).contains(&unit), "{unit}");
+                unit.to_bits()
+            })
+            .collect();
+        assert!(units.len() > 90, "{} distinct of 100", units.len());
+    }
+
+    #[test]
+    fn clients_with_different_draws_do_not_wait_alike() {
+        let waits: std::collections::HashSet<Duration> = (0..20)
+            .map(|_| Backoff::new().next(jitter_unit()))
+            .collect();
+        assert!(waits.len() > 10, "{} distinct of 20", waits.len());
+    }
 
     #[test]
     fn limits_take_a_number_from_one_to_their_max() {

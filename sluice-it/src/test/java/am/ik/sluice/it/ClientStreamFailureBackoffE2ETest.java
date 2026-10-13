@@ -4,11 +4,13 @@ import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.random.RandomGenerator;
 import java.util.stream.Stream;
 
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -69,6 +71,15 @@ class ClientStreamFailureBackoffE2ETest {
 				Arguments.of(Duration.ZERO, SessionRegistry.Refusal.LIMIT.status()));
 	}
 
+	/**
+	 * A jitter source drawing the top of every range: each wait is its full ceiling (1s,
+	 * 2s, ...), which shows the backoff growing.
+	 */
+	private static final RandomGenerator HIGHEST = new FixedRandom(true);
+
+	/** The bottom of every range: each wait is half its ceiling. */
+	private static final RandomGenerator LOWEST = new FixedRandom(false);
+
 	@ParameterizedTest
 	@MethodSource("failures")
 	void theClientLogsTheStatusAndReconnectsWithAGrowingBackoff(Duration failAfter, Status failure,
@@ -84,6 +95,7 @@ class ClientStreamFailureBackoffE2ETest {
 				.build())
 			.taskExecutor(task -> Thread.ofVirtual().name("e2e-advertise-timeout-worker").start(task))
 			.meterRegistry(this.clientMeters)
+			.randomFactory(() -> HIGHEST)
 			.build();
 		started.start();
 		this.client = started;
@@ -108,6 +120,56 @@ class ClientStreamFailureBackoffE2ETest {
 				+ failure.getCode() + ": " + failure.getDescription();
 		assertThat(output.getAll().lines().filter(line -> line.endsWith(expected))).as("one line per failed stream")
 			.hasSizeGreaterThanOrEqualTo(2);
+	}
+
+	@Test
+	void theJitterShortensTheWaitsWithinTheirCeilings() throws Exception {
+		FailingServer fake = new FailingServer(Duration.ZERO, SessionRegistry.Refusal.LIMIT.status());
+		int grpcPort = TestPorts.freePort();
+		this.server = ServerBuilder.forPort(grpcPort).addService(fake).build().start();
+		TunnelClient started = TunnelClient.builder()
+			.properties(SluiceClientProperties.builder()
+				.serverUrl("grpc://127.0.0.1:" + grpcPort)
+				.upstream(Upstream.builder().host("late.local").target("http://127.0.0.1:1").build())
+				.token("it-token")
+				.build())
+			.taskExecutor(task -> Thread.ofVirtual().name("e2e-jitter-worker").start(task))
+			.meterRegistry(this.clientMeters)
+			.randomFactory(() -> LOWEST)
+			.build();
+		started.start();
+		this.client = started;
+
+		Awaitility.await()
+			.atMost(Duration.ofSeconds(15))
+			.until(() -> fake.failedAt.size() >= 2 && fake.openedAt.size() >= 3);
+
+		Duration first = Duration.ofNanos(fake.openedAt.get(1) - fake.failedAt.get(0));
+		Duration second = Duration.ofNanos(fake.openedAt.get(2) - fake.failedAt.get(1));
+		assertThat(first).as("half of the 1s ceiling").isBetween(Duration.ofMillis(450), Duration.ofMillis(900));
+		assertThat(second).as("half of the 2s ceiling, not the full 2s")
+			.isBetween(Duration.ofMillis(950), Duration.ofMillis(1700));
+	}
+
+	/** A jitter source that always draws the top or the bottom of the range asked. */
+	private static final class FixedRandom implements RandomGenerator {
+
+		private final boolean highest;
+
+		FixedRandom(boolean highest) {
+			this.highest = highest;
+		}
+
+		@Override
+		public long nextLong() {
+			return this.highest ? Long.MAX_VALUE : 0;
+		}
+
+		@Override
+		public long nextLong(long bound) {
+			return this.highest ? bound - 1 : 0;
+		}
+
 	}
 
 	/**

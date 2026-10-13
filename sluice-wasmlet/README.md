@@ -220,7 +220,8 @@ Same semantics as the Java client (see "Cluster (scale-out)" in the root
 README): `--server` is only the bootstrap -- the node list is learned via
 `ListNodes` / `MembershipUpdate` and one tunnel stream is kept per node
 (`grpc://` / `grpcs://` addresses). A dropped stream reconnects with
-exponential backoff (1s..30s); exactly one stream per node is kept, so a
+jittered exponential backoff (ceiling 1s..30s, each wait drawn from
+its upper half); exactly one stream per node is kept, so a
 duplicate is closed on the client side before the server drops it.
 
 ## Known limitations (PoC scope)
