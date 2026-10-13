@@ -58,3 +58,11 @@ Step 9 of the netty h2 demux migration (context and user decisions: 098). Depend
 
 `sluice_h2demux_connections_total{engine}` is gone with the engine switch (the 099 note
 above no longer applies).
+
+## Notes from 103 (timeouts, half-close drain, probe, 2026-10-13)
+
+- The h2 demux now has the idle and stall timeouts, the half-close drain and its PING
+  probe (`half-close-probe-interval`). Watch in the deployment: `sluice_data_connections_idle_closed_total`
+  and `_stall_closed_total` for h2 connections, and half-closed clients held by an
+  upstream that does not take the request rest after its response ended (the drain waits
+  for it; the client connection idles under `idle-timeout` meanwhile, untested).
