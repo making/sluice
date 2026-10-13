@@ -15,9 +15,10 @@ import io.micrometer.core.instrument.MeterRegistry;
  * the routes, not the connections --, the streams refused for want of queue budget, or
  * while waiting for an upstream's concurrency limit (to free a connection whose window is
  * withheld, or past the wait deadline), the streams a relay reset for want of queue
- * budget, the streams answered 421 for a route reached over HTTP/1.1 only, the times a
- * relay withheld the client's connection window, and, for tests, the DATA writes netty
- * holds and the streams the relays track.
+ * budget or for an upstream's interim heads past their limit, the streams answered 421
+ * for a route reached over HTTP/1.1 only, the times a relay withheld the client's
+ * connection window, and, for tests, the DATA writes netty holds and the streams the
+ * relays track.
  */
 final class H2DemuxMeters {
 
@@ -39,6 +40,8 @@ final class H2DemuxMeters {
 
 	private final Counter resetBudget;
 
+	private final Counter resetInterim;
+
 	private final Counter misdirectedHttp1;
 
 	private final Counter windowWithheld;
@@ -49,6 +52,7 @@ final class H2DemuxMeters {
 		this.refusedWaiting = refused(registry, "waiting");
 		this.refusedWaitTimeout = refused(registry, "wait-timeout");
 		this.resetBudget = reset(registry, "budget");
+		this.resetInterim = reset(registry, "interim");
 		this.misdirectedHttp1 = Counter.builder("sluice.h2demux.streams.misdirected")
 			.tag("reason", "force-http1")
 			.description("h2 streams answered 421 Misdirected Request: their route's upstream is reached over"
@@ -98,9 +102,17 @@ final class H2DemuxMeters {
 		this.refusedWaitTimeout.increment();
 	}
 
-	/** A stream reset: its trailers did not fit the queue budget. */
+	/** A stream reset: a header block of it did not fit the queue budget. */
 	void resetForBudget() {
 		this.resetBudget.increment();
+	}
+
+	/**
+	 * A stream reset towards its upstream: the upstream's interim (1xx) heads passed the
+	 * limit of one response's.
+	 */
+	void resetForInterim() {
+		this.resetInterim.increment();
 	}
 
 	/**

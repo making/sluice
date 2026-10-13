@@ -659,10 +659,19 @@ connection may hold 128KiB, and the bytes beyond it are charged to
 budget exhausted, the relay withholds the connection window of the client and of every
 upstream connection (a peer stops once the at most 64KiB it holds are spent) until the
 connection drains below 128KiB or the budget has room again; a new stream whose head
-does not fit is refused with `REFUSED_STREAM`, and trailers that do not fit reset their
-stream (`RST_STREAM` `ENHANCE_YOUR_CALM` to the client, `CANCEL` to the upstream) while
-the connection's other streams go on. While the window is withheld, the streams waiting
-for an upstream's concurrency limit hold at most 128KiB of the connection: past it the
+does not fit is refused with `REFUSED_STREAM`, and a later header block that does not fit
+resets its stream (`RST_STREAM` `ENHANCE_YOUR_CALM` to the client, `CANCEL` to the
+upstream) while the connection's other streams go on: the client's trailers, and an
+upstream's interim (1xx) head, final head or trailers once the client connection's writer
+queue, with the upstreams' header blocks waiting for it, holds 256KiB (so a response is
+not held back for bytes queued towards the upstreams). A header block counts at its size
+as HPACK counts it (RFC 7541 4.1), not at the bytes it took on the wire: one referring to
+the peer's dynamic table, a few bytes on the wire, counts about what the relay writes for
+it, up to 64KiB. The interim heads of one response may sum to 64KiB counted so (the header
+list limit); the one past it is not relayed: the upstream's stream is reset with
+`ENHANCE_YOUR_CALM` and the client gets the bad-gateway page (`502`). While the window is
+withheld, the streams waiting for an upstream's concurrency limit hold at most 128KiB of
+the connection: past it the
 most recent of them are refused with `REFUSED_STREAM` (their upstream never saw them; the
 client may retry them), since their bytes drain only once a stream ahead of them closes,
 which may need the very request body the withheld window holds back. So a connection
@@ -674,9 +683,7 @@ writer queue (a connection is no longer read past 256KiB queued, plus at most 64
 adds its upstream's 180KiB and its own 320KiB writer queue, about 500KiB
 (`NettyHttp2DemuxRelay.RESPONSE_QUEUE_BYTES`). Not covered yet: every upstream connection
 of an h2 connection opens on the connection's own slot, so one reaching several routes
-holds 500KiB per further route beyond its slot's worst case; and header blocks an
-upstream sends (response heads, 1xx, trailers) are charged to the budget but never
-refused.
+holds 500KiB per further route beyond its slot's worst case.
 
 An unset (`0`) budget is an eighth of half the max heap, and an unset (`0`) connection
 limit is derived so that the worst case of every slot (2.16MiB + 628KiB + 500KiB) and the
@@ -715,7 +722,7 @@ bounds how long one can hold slots.
   cluster warmup window and while draining (see "Cluster (scale-out)")
 - client `GET /actuator/health` (port 9001) - UP while at least one per-node tunnel stream is
   established; the `tunnel` detail shows the connection state and `nodes` each node's stream state
-- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`, `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_tunnel_stall_seconds` (how long a tunnel stream has held frames queued for its peer, not ready, with none taken; on the server the most stalled session's, 0 when none) / `sluice_tunnel_stall_failures_total` (tunnel streams failed by the stall watchdog), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_tunnel_sessions_build_unknown` (connected clients without a build, see "Console"), `sluice_h2demux_queued_bytes` (bytes the h2 demux holds of a route's streams, both ways, plus the upstream connections' writer queues, one series per route), `sluice_h2demux_budget_bytes` / `sluice_h2demux_budget_used_bytes` (the shared h2 queue budget and the bytes charged to it, which may pass the budget by what the relays cannot refuse), `sluice_h2demux_window_withheld_total` (times a connection window was withheld for want of budget), `sluice_h2demux_streams_refused_total` (`reason` = `budget` / `waiting`: a stream waiting for its upstream's concurrency limit refused to free a connection whose window is withheld / `wait-timeout`: one refused past `sluice.limits.h2-stream-wait-timeout`), `sluice_h2demux_streams_reset_total` (streams the relay reset on its own account, `reason` = `budget`), `sluice_h2demux_streams_misdirected_total` (streams answered `421`, `reason` = `force-http1`) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_rejected_total` (`reason` = `limit` / `address-limit` / `head-timeout`) / `sluice_data_connections_idle_closed_total` (connections closed for idling between requests) / `sluice_data_connections_stall_closed_total` (connections closed for an exchange stalled on its client)
+- `GET /actuator/prometheus` - JVM metrics plus `sluice_tunnel_bytes_total`, `sluice_connections_active`, `sluice_reconnect_total`, `sluice_tunnel_window_updates_total` (per-connection credit grants, `direction` = `sent` / `received`), `sluice_tunnel_stall_seconds` (how long a tunnel stream has held frames queued for its peer, not ready, with none taken; on the server the most stalled session's, 0 when none) / `sluice_tunnel_stall_failures_total` (tunnel streams failed by the stall watchdog), `sluice_connections_limit` / `sluice_connections_admitted` / `sluice_connections_rejected_total` (client connection limit), and on the server `sluice_tunnel_sessions_build_unknown` (connected clients without a build, see "Console"), `sluice_h2demux_queued_bytes` (bytes the h2 demux holds of a route's streams, both ways, plus the upstream connections' writer queues, one series per route), `sluice_h2demux_budget_bytes` / `sluice_h2demux_budget_used_bytes` (the shared h2 queue budget and the bytes charged to it, which may pass the budget by what the relays cannot refuse), `sluice_h2demux_window_withheld_total` (times a connection window was withheld for want of budget), `sluice_h2demux_streams_refused_total` (`reason` = `budget` / `waiting`: a stream waiting for its upstream's concurrency limit refused to free a connection whose window is withheld / `wait-timeout`: one refused past `sluice.limits.h2-stream-wait-timeout`), `sluice_h2demux_streams_reset_total` (streams the relay reset on its own account, `reason` = `budget`: a header block that did not fit the budget / `interim`: an upstream's interim heads past 64KiB), `sluice_h2demux_streams_misdirected_total` (streams answered `421`, `reason` = `force-http1`) and `sluice_data_connections_limit` / `sluice_data_connections_admitted` / `sluice_data_connections_rejected_total` (`reason` = `limit` / `address-limit` / `head-timeout`) / `sluice_data_connections_idle_closed_total` (connections closed for idling between requests) / `sluice_data_connections_stall_closed_total` (connections closed for an exchange stalled on its client)
 
 ## Console
 
