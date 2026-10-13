@@ -346,3 +346,59 @@ filled in order instead of growing one array by copying. Series `harness/series-
   18.4 with the 1MiB windows of the experiment above (6.9 on main with 64KiB windows).
 - The derived connection limit follows the windows: 5261KiB per slot instead of 3340KiB,
   34 connections from production's 409MiB heap instead of 54.
+
+## After todo 134: tunnel windows budgeted instead of reserved
+
+Each virtual connection announces 64KiB and grows to 1MiB against a node-wide tunnel budget
+(an eighth of half the heap: 64MiB for the harness's `-Xmx1g`, server and client alike).
+Series `harness/series-134.sh` and two follow-ups alternating the builds on fresh stacks
+(`run-budgetone-r1`, `run-budget-r2`; rows in `results-134.jsonl`), no surefire JVM running,
+load 2 to 3. `base` is `9a90751` (main before the change), `after` the change; the first
+`after` series ran an earlier cut of the window rule (a reader without a wait halved the
+window even when it kept up), r1 and r2 the committed one. `max-connections=4000` as before
+(the reservations unbounded); suite `budget`: 64MiB bodies, 16MiB uploads, tunnel RTT 20ms.
+
+MiB/s, one value per stack (download/upload h1 c1 in r1: three runs per stack):
+
+| | base | after |
+|---|---|---|
+| download h1 c1 | 32.8 / 29.9 / 21.3; r1: 21.8 21.5 22.3, 37.7 39.2 39.2 | 20.5 / 20.4 / 20.5; r1: 23.8 38.9 39.1, 20.5 32.9 39.6 |
+| download h2 c1 s1 | 20.8 / 20.5 / 20.7 | 20.5 / 20.4 / 20.6 |
+| download h1 c8 | 59.7 / 128.9 / 21.9 | 55.0 / 20.8 / 65.5 |
+| download h1 c32 | 120.6 / 135.2 / 21.7 | 112.6 / 20.9 / 68.0 |
+| download h1 c100 | 166.2 / 166.2 / 21.9 | 126.4 / 27.1 / 67.5 |
+| upload h1 c1 | 38.3 / 37.9 / 37.2; r1: 27.7 36.1 36.9, 32.8 36.1 35.8 | 33.9 / 36.4 / 36.3; r1: 20.5 37.5 37.0, 20.6 26.4 34.8 |
+| upload h1 c32 | 104.3 / 147.3 / 93.9 | 170.7 / 49.0 / 62.7 |
+
+Largest over each measured window (gauges sampled every 250ms; heap = used heap, all pools):
+
+| | base | after |
+|---|---|---|
+| client heap, download h1 c100 | 521 / 476 / 551 MiB | 264 / 242 / 268 MiB |
+| client heap, download h1 c8 / c32 | 437 / 433, 152 / 179, 430 / 446 MiB | 148 / 176, 155 / 169, 174 / 176 MiB |
+| server heap, download h1 c100 | 185 / 188 / 164 MiB | 187 / 164 / 165 MiB |
+| server tunnel budget used, c1 / c8 / c32 / c100 | - | 960KiB / 7.5MiB / 30MiB / 63.4MiB (of 64MiB) |
+| client tunnel budget used, upload h1 c1 / c32 | - | 960KiB / 30MiB |
+| server buffered payload, any download | - | at most 144KiB |
+
+Held connections (live heap after full GC, per connection): unchanged within noise, h1
+143 to 152 KiB on the server in both builds, h2 162 to 183 KiB (one stream), client 137 to
+140 KiB.
+
+- A single connection reaches the full window: 960KiB of budget per download or upload.
+  Its throughput at a 20ms tunnel RTT is bimodal in both builds, about 20.5 or about 39
+  MiB/s per run (maxima 39.2 base, 39.6 after; medians of the r1 runs 30.0 and 35.9), so
+  the difference between single values is not the change. `TunnelBudgetE2ETest` counts the
+  credit waits instead: an 8MiB transfer through a 20ms round trip in about 18 waits.
+- Aggregate throughput over one tunnel is bimodal per stack, in both builds alike: one
+  stack of each ran every download at about 21 MiB/s whatever the connection count (base
+  r2 #2: 21.9 at c8 and c100; after r2 #1: 20.8 to 27.1). That cap is the tunnel's, not
+  the windows' (new todo). Within the fast stacks, 100 downloads move 166 MiB/s on base and
+  126 MiB/s on the first after series, with the 64MiB budget saturated (63.4MiB used):
+  each connection past the budget's room moves at 64KiB per round trip, which is the
+  trade the budget size sets.
+- Memory: the client's largest used heap at 100 downloads was 242 to 268 MiB instead of
+  476 to 551 MiB (used heap counts garbage too, so it only indicates what its send queues
+  and windows held, up to 16 frames and 1MiB each on base). The server's heap
+  does not change here because the load client reads everything (the server buffers at
+  most 144KiB); what slow readers make it hold is `TunnelBudgetE2ETest`'s case.
