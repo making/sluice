@@ -211,7 +211,7 @@ class ConsoleView {
 		String kind = listenPort > 0 ? "TCP :" + listenPort : upstream.getTlsPassthrough() ? "TLS passthrough" : "HTTP";
 		String note = rejected ? "Port not bound" : listenPort > 0 || upstream.getTlsPassthrough() ? ""
 				: upstream.getRewriteHost() ? "Rewrites Host" : "Keeps Host";
-		// force-http1 only takes effect on the TLS-terminated HTTP path
+		// force-http1 only takes effect on HTTP routes (ALPN preference, 421 for h2)
 		if (!rejected && listenPort == 0 && !upstream.getTlsPassthrough() && upstream.getForceHttp1()) {
 			note = note.isEmpty() ? "HTTP/1.1 only" : note + ", HTTP/1.1 only";
 		}

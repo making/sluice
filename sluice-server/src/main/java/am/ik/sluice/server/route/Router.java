@@ -42,9 +42,10 @@ public class Router {
 	 * under, its dial address, whether the request Host header is rewritten to the target
 	 * ({@code rewrite-host}), whether TLS connections are relayed untouched
 	 * ({@code tls-passthrough}) instead of terminated on the data plane, whether the data
-	 * plane's TLS termination prefers http/1.1 in ALPN ({@code force-http1}), the IP
-	 * networks allowed to connect (empty = the server-wide allow list applies), and how
-	 * long a connection relayed verbatim may relay no byte either way before it is closed
+	 * plane's TLS termination prefers http/1.1 in ALPN and answers an h2 stream 421
+	 * ({@code force-http1}: the upstream speaks HTTP/1.1 only), the IP networks allowed
+	 * to connect (empty = the server-wide allow list applies), and how long a connection
+	 * relayed verbatim may relay no byte either way before it is closed
 	 * ({@code verbatim-idle-timeout}; zero = the route sets none, the server's default
 	 * applies).
 	 */

@@ -14,14 +14,14 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * ({@code host-pattern}; whole match, without the port), the target URL to dial, whether
  * the request Host header is rewritten to the target ({@code rewrite-host}), whether TLS
  * connections are relayed untouched ({@code tls-passthrough}) instead of terminated on
- * the data plane, whether the data plane's TLS termination prefers http/1.1 in ALPN
- * ({@code force-http1}; for upstreams without HTTP/2 support), the public port for raw
- * TCP routing ({@code listen-port}; 0 disables it), the CIDRs / bare addresses allowed to
- * connect on the data plane ({@code allowed-cidrs}; empty = the server-wide allow list),
- * and how long a connection relayed verbatim -- TLS passthrough, a tcp route, a hostless
- * connection, an upgraded HTTP/1.1 connection -- may relay no byte in either direction
- * before the server closes it ({@code verbatim-idle-timeout}; {@code 0} = the server's
- * default).
+ * the data plane, whether the upstream speaks HTTP/1.1 only ({@code force-http1}: the
+ * data plane's TLS termination prefers http/1.1 in ALPN, an h2 stream gets 421), the
+ * public port for raw TCP routing ({@code listen-port}; 0 disables it), the CIDRs / bare
+ * addresses allowed to connect on the data plane ({@code allowed-cidrs}; empty = the
+ * server-wide allow list), and how long a connection relayed verbatim -- TLS passthrough,
+ * a tcp route, a hostless connection, an upgraded HTTP/1.1 connection -- may relay no
+ * byte in either direction before the server closes it ({@code verbatim-idle-timeout};
+ * {@code 0} = the server's default).
  */
 public record Upstream(String host, @DefaultValue("") String hostPattern, String target,
 		@DefaultValue("false") boolean rewriteHost, boolean tlsPassthrough, @DefaultValue("false") boolean forceHttp1,

@@ -49,3 +49,17 @@ Step 2 of the netty h2 demux migration (context and user decisions: 098). Depend
   RST_STREAM PROTOCOL_ERROR on legacy (pinned); a first head is left unroutable by
   `ConnectionHeadParser` and answered 503 no-route with a GOAWAY unless a catch-all route
   takes it to the relay, which resets it (read from the code, untested) -- netty's codec would reset it in either case.
+
+## Note: force-http1 routes answer 421 (from the legacy fix, 2026-10-13)
+
+- `ForceHttp1MisdirectedE2ETest` (sluice-it) joins the routing subset. An h2 stream whose
+  route is `force-http1` (upstream reached over HTTP/1.1 only) is never relayed: a bodiless
+  `421` (HEADERS END_STREAM, `content-length: 0`), then RST_STREAM NO_ERROR if the request
+  is still being sent; no leg is opened, the connection goes on. Checked after the
+  no-route / access-control refusals, for every stream including the connection's first
+  (TLS SNI route with h2-only ALPN, h2c prior knowledge). Production cause: browsers
+  coalesce a force-http1 host onto an h2 connection of another `*.apps` host; relayed as
+  h2 it got 502 and the browser kept reusing the connection.
+- The netty engine must do the same: log `type=req ... status=421 reason=force-http1`
+  (`AccessLogger.Connection#misdirected`) and count
+  `sluice.h2demux.streams.misdirected{reason=force-http1}` (`H2DemuxMeters`).

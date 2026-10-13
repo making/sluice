@@ -1736,6 +1736,12 @@ final class Http2DemuxRelay {
 			}
 		}
 		Router.Route route = resolved.route();
+		if (route.forceHttp1()) {
+			this.meters.misdirectedForHttp1();
+			this.access.misdirected(route.routeTag(), request);
+			writeToClient(misdirectedFrames(streamId, endStream));
+			return;
+		}
 		// always re-encoded: the client's blocks reference its dynamic table, whose
 		// state a leg joining later (tunnel recovery, a second upstream of a coalesced
 		// connection) does not have -- the table-less encoder keeps every block
@@ -1807,6 +1813,27 @@ final class Http2DemuxRelay {
 			this.access.request(route.routeTag(), request.method(), request.path(), "2");
 		}
 		checkQueueBound();
+	}
+
+	/**
+	 * What a stream of a force-http1 route gets instead of a leg: {@code 421 Misdirected
+	 * Request} (RFC 9110 15.5.20), as its upstream is reached over HTTP/1.1 only and its
+	 * h2 frames would fail there. A browser coalescing the request onto this connection
+	 * (opened for another host of the same certificate, RFC 9113 9.1.1) retries it on a
+	 * new connection with the host's SNI, where ALPN picks http/1.1. Bodiless, so it
+	 * takes no flow-control window; a request still being sent is reset with
+	 * {@code NO_ERROR} after it (RFC 9113 8.1), its later DATA dropped as of any stream
+	 * never routed.
+	 */
+	private byte[] misdirectedFrames(int streamId, boolean endStream) {
+		byte[] response = this.errorResponse.misdirectedStream(streamId);
+		if (endStream) {
+			return response;
+		}
+		byte[] reset = rstStream(streamId, ERROR_NO_ERROR);
+		byte[] frames = Arrays.copyOf(response, response.length + reset.length);
+		System.arraycopy(reset, 0, frames, response.length, reset.length);
+		return frames;
 	}
 
 	private int activeStreams() {

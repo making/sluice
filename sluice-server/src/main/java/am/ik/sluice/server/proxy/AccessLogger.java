@@ -245,6 +245,18 @@ public class AccessLogger {
 					version, this.remote);
 		}
 
+		/**
+		 * Logs an h2 request head the relay answered {@code 421 Misdirected Request}
+		 * itself: its route's upstream is reached over HTTP/1.1 only.
+		 */
+		void misdirected(String routeTag, ConnectionHeadParser.Head.Request request) {
+			if (!this.requestEnabled || this.noop || this.closed || this.owner == null || !this.owner.allowRequest()) {
+				return;
+			}
+			log.info("type=req id={} route={} method={} path={} http={} remote={} status=421 reason=force-http1",
+					this.id, routeTag, request.method(), request.path(), request.version(), this.remote);
+		}
+
 		/** Logs the connection acceptance, before route and transport are known. */
 		public void accept() {
 			if (!this.connEnabled || this.noop || this.owner == null || !this.owner.allowAccept()) {

@@ -114,7 +114,15 @@ public final class H2TestClient implements AutoCloseable {
 	 * the {@code collected} streams are kept; the others are only counted.
 	 */
 	public static H2TestClient connect(int port, Integer... collected) throws IOException {
-		H2TestClient client = new H2TestClient(new Socket("127.0.0.1", port), Set.of(collected));
+		return over(new Socket("127.0.0.1", port), collected);
+	}
+
+	/**
+	 * Speaks h2 over a connected socket -- a TLS socket whose handshake negotiated h2,
+	 * say: sends the preface and an empty SETTINGS, and starts the reader.
+	 */
+	public static H2TestClient over(Socket socket, Integer... collected) throws IOException {
+		H2TestClient client = new H2TestClient(socket, Set.of(collected));
 		Thread.ofVirtual().name("e2e-h2-client-reader").start(client::read);
 		synchronized (client.out) {
 			client.out.write(TestH2.PREFACE);

@@ -173,9 +173,9 @@ message Upstream {
   // the data plane; empty = the server-wide allow list applies. Literal
   // addresses only.
   repeated string allowed_cidrs = 7;
-  // When true the data plane's TLS termination prefers http/1.1 in ALPN for
-  // this upstream (for upstreams without HTTP/2 support); plaintext and
-  // tls-passthrough routes are unaffected.
+  // When true the upstream speaks HTTP/1.1 only: the data plane's TLS
+  // termination prefers http/1.1 in ALPN for it, and an h2 stream for it is
+  // answered 421 Misdirected Request; tls-passthrough routes are unaffected.
   bool force_http1 = 8;
   // How long, in milliseconds, a connection of this upstream relayed verbatim (TLS
   // passthrough, a tcp route, a hostless connection, an upgraded HTTP/1.1

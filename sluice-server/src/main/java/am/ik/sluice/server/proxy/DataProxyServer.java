@@ -298,7 +298,9 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			}));
 			ssl.setSSLParameters(parameters);
 			// force-http1 routes prefer http/1.1 in ALPN so h1-only upstreams are reached
-			// over h1 (the route is the SNI-resolved one above)
+			// over h1 (the route is the SNI-resolved one above); a client offering only
+			// h2 still gets h2, and the demux answers its streams 421 instead of
+			// relaying them
 			boolean forceHttp1 = resolved.map(Router.Route::forceHttp1).orElse(false);
 			ssl.setHandshakeApplicationProtocolSelector(
 					(s, protocols) -> forceHttp1 ? protocols.contains(ALPN_HTTP_1_1) ? ALPN_HTTP_1_1 : ALPN_H2

@@ -15,9 +15,10 @@ import io.micrometer.core.instrument.MeterRegistry;
  * follows the routes, not the connections --, the streams refused for want of queue
  * budget or of a slot for a new leg or while waiting for an upstream's concurrency limit,
  * the streams a relay reset for want of queue budget or for a client's or an upstream's
- * stream error, the legs ended by their upstream's connection error, the times a relay
- * withheld the client's connection window, and, for tests, the number of times a leg
- * writer woke up and the streams the relays track.
+ * stream error, the streams answered 421 for a route reached over HTTP/1.1 only, the legs
+ * ended by their upstream's connection error, the times a relay withheld the client's
+ * connection window, and, for tests, the number of times a leg writer woke up and the
+ * streams the relays track.
  */
 final class H2DemuxMeters {
 
@@ -40,6 +41,8 @@ final class H2DemuxMeters {
 
 	private final Counter resetUpstream;
 
+	private final Counter misdirectedHttp1;
+
 	private final Counter legsFailed;
 
 	private final Counter windowWithheld;
@@ -52,6 +55,11 @@ final class H2DemuxMeters {
 		this.resetBudget = reset(registry, "budget");
 		this.resetProtocol = reset(registry, "protocol");
 		this.resetUpstream = reset(registry, "upstream");
+		this.misdirectedHttp1 = Counter.builder("sluice.h2demux.streams.misdirected")
+			.tag("reason", "force-http1")
+			.description("h2 streams answered 421 Misdirected Request: their route's upstream is reached over"
+					+ " HTTP/1.1 only (force-http1)")
+			.register(registry);
 		this.legsFailed = Counter.builder("sluice.h2demux.legs.failed")
 			.description("h2 demux legs ended by their upstream's connection error, with a GOAWAY to the upstream;"
 					+ " the other legs of the connection go on")
@@ -112,6 +120,13 @@ final class H2DemuxMeters {
 	/** A stream reset: its upstream sent a stream error on it (RFC 9113 5.4.2). */
 	void resetForUpstream() {
 		this.resetUpstream.increment();
+	}
+
+	/**
+	 * A stream answered 421: its route's upstream is reached over HTTP/1.1 only.
+	 */
+	void misdirectedForHttp1() {
+		this.misdirectedHttp1.increment();
 	}
 
 	/** A leg ended: its upstream made a connection error (RFC 9113 5.4.1). */

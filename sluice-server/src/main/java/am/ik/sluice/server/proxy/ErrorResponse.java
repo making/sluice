@@ -27,7 +27,8 @@ import org.springframework.stereotype.Component;
  * (HTTP/1.1, or HTTP/2 for prior knowledge and ALPN h2), after which the connection
  * closes: the 503 no-route page for a request no tunnel session can serve, the 403
  * forbidden page for a peer address the access control excludes, a bare HTTP/1.1 400 for
- * a malformed request, a bodiless HTTP/2 502 for a stream its upstream lost, and a GOAWAY
+ * a malformed request, a bodiless HTTP/2 502 for a stream its upstream lost, a bodiless
+ * HTTP/2 421 for a stream of a route reached over HTTP/1.1 only, and a GOAWAY
  * {@code COMPRESSION_ERROR} for an HTTP/2 head whose header block does not decode.
  */
 @Component
@@ -110,6 +111,21 @@ public class ErrorResponse {
 	 */
 	public byte[] badGatewayStream(int streamId) {
 		Http2Headers headers = new DefaultHttp2Headers().status("502")
+			.set("content-length", "0")
+			.set("cache-control", "no-store");
+		Http2Frames frames = new Http2Frames(streamId);
+		frames.write(Http2Frame.HEADERS_END_STREAM, headerBlock(streamId, headers));
+		return frames.toByteArray();
+	}
+
+	/**
+	 * The response on a single stream of a living HTTP/2 connection that this connection
+	 * cannot serve -- its route's upstream is reached over HTTP/1.1 only: {@code 421}
+	 * without a body (RFC 9110 15.5.20), so it takes no flow-control window, and the
+	 * client may retry the request on another connection.
+	 */
+	public byte[] misdirectedStream(int streamId) {
+		Http2Headers headers = new DefaultHttp2Headers().status("421")
 			.set("content-length", "0")
 			.set("cache-control", "no-store");
 		Http2Frames frames = new Http2Frames(streamId);
