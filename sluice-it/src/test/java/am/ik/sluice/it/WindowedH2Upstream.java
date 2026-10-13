@@ -75,6 +75,15 @@ public final class WindowedH2Upstream implements AutoCloseable {
 	/** The flow-controlled bytes of every DATA frame sent, padding included. */
 	private long sent;
 
+	/**
+	 * The upstream wrote its own SETTINGS: the server preface (RFC 9113 3.4) is out, and
+	 * a SETTINGS ack may follow it. With {@link #writeLock}.
+	 */
+	private boolean prefaceSent;
+
+	/** An ack of the relay's SETTINGS held until the preface is out; with writeLock. */
+	private int acksHeld;
+
 	/** The streams either side reset; {@link #sendData} stops on them. */
 	private final Set<Integer> resetStreams = new HashSet<>();
 
@@ -110,7 +119,8 @@ public final class WindowedH2Upstream implements AutoCloseable {
 	}
 
 	/**
-	 * Reads the next frame and accounts it; acknowledges the relay's SETTINGS. Returns
+	 * Reads the next frame and accounts it; acknowledges the relay's SETTINGS -- once the
+	 * upstream wrote its own SETTINGS, its preface, which must come first. Returns
 	 * {@code null} at EOF.
 	 */
 	public TestH2.@Nullable Frame next() throws IOException {
@@ -163,7 +173,14 @@ public final class WindowedH2Upstream implements AutoCloseable {
 			notifyAll();
 		}
 		if (ack) {
-			write(TestH2.SETTINGS, TestH2.FLAG_ACK, 0, new byte[0]);
+			synchronized (this.writeLock) {
+				if (this.prefaceSent) {
+					TestH2.writeFrame(this.out, TestH2.SETTINGS, TestH2.FLAG_ACK, 0, new byte[0]);
+				}
+				else {
+					this.acksHeld++;
+				}
+			}
 		}
 		return frame;
 	}
@@ -321,10 +338,19 @@ public final class WindowedH2Upstream implements AutoCloseable {
 		}
 	}
 
-	/** Writes a frame as given. */
+	/**
+	 * Writes a frame as given; the first SETTINGS without the ack flag is the preface,
+	 * and the acks held for it follow it.
+	 */
 	public void write(int type, int flags, int streamId, byte[] payload) throws IOException {
 		synchronized (this.writeLock) {
 			TestH2.writeFrame(this.out, type, flags, streamId, payload);
+			if (!this.prefaceSent && type == TestH2.SETTINGS && (flags & TestH2.FLAG_ACK) == 0) {
+				this.prefaceSent = true;
+				for (; this.acksHeld > 0; this.acksHeld--) {
+					TestH2.writeFrame(this.out, TestH2.SETTINGS, TestH2.FLAG_ACK, 0, new byte[0]);
+				}
+			}
 		}
 	}
 
