@@ -25,6 +25,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
 import org.springframework.grpc.server.service.GrpcService;
 
 /**
@@ -51,8 +52,6 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	private final MembershipBroadcaster membershipBroadcaster;
 
-	private final ClusterLifecycle clusterLifecycle;
-
 	private final SluiceServerProperties properties;
 
 	private final Counter windowUpdatesSent;
@@ -72,15 +71,13 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	public TunnelService(Router router, TokenValidator tokenValidator, SessionRegistry sessions,
 			TcpRouteListener tcpRoutes, NodeDirectory nodeDirectory, MembershipBroadcaster membershipBroadcaster,
-			ClusterLifecycle clusterLifecycle, SluiceServerProperties properties, MeterRegistry meterRegistry,
-			PeerBuild serverBuild) {
+			SluiceServerProperties properties, MeterRegistry meterRegistry, PeerBuild serverBuild) {
 		this.router = router;
 		this.tokenValidator = tokenValidator;
 		this.sessions = sessions;
 		this.tcpRoutes = tcpRoutes;
 		this.nodeDirectory = nodeDirectory;
 		this.membershipBroadcaster = membershipBroadcaster;
-		this.clusterLifecycle = clusterLifecycle;
 		this.properties = properties;
 		this.windowUpdatesSent = windowUpdates(meterRegistry, "sent");
 		this.windowUpdatesReceived = windowUpdates(meterRegistry, "received");
@@ -103,8 +100,8 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			this.refusals.put(refusal,
 					Counter.builder("sluice.tunnel.streams.refused")
 						.tag("reason", refusal.reason())
-						.description("Tunnel streams refused at once by a bound on the streams waiting for "
-								+ "their client's first Advertise")
+						.description("Tunnel streams refused at once: past a bound on the streams waiting for "
+								+ "their client's first Advertise, or while the node drains")
 						.register(meterRegistry));
 		}
 		log.info("server build: {}", PeerBuilds.describe(serverBuild));
@@ -140,13 +137,6 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	@Override
 	public StreamObserver<Frame> connect(StreamObserver<Frame> responseObserver) {
-		if (this.clusterLifecycle.isDraining()) {
-			// the node is going away; a stream accepted here would stall the graceful
-			// shutdown until the client gives up
-			log.info("rejecting tunnel stream: node is draining");
-			responseObserver.onError(Status.UNAVAILABLE.withDescription("node is draining").asException());
-			return noopObserver();
-		}
 		String clientId = TunnelAuthInterceptor.CLIENT_ID.get();
 		String finalClientId = clientId == null ? "" : clientId;
 		@Nullable Runnable reset = TunnelStreamReset.current();
@@ -221,9 +211,11 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 		if (suppressed < 0) {
 			return;
 		}
-		log.warn("refusing tunnel stream of client {} ({}): {}{}", session.clientId(), session.remoteAddress(),
-				refusal.status().getDescription(),
-				suppressed == 0 ? "" : " (%d more refused since the last report)".formatted(suppressed));
+		// a drain refusing the clients reconnecting to it is expected
+		log.atLevel(refusal == SessionRegistry.Refusal.DRAINING ? Level.INFO : Level.WARN)
+			.log("refusing tunnel stream of client {} ({}): {}{}", session.clientId(), session.remoteAddress(),
+					refusal.status().getDescription(),
+					suppressed == 0 ? "" : " (%d more refused since the last report)".formatted(suppressed));
 	}
 
 	/**

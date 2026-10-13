@@ -22,13 +22,18 @@ import io.grpc.Status;
  * {@code sluice.limits.max-pending-tunnel-streams} at once, and at most
  * {@code sluice.limits.max-pending-tunnel-streams-per-address} from one source address
  * when that is set. A stream beyond a bound is refused at {@link #admit}; a pending
- * stream frees its place once it is registered or removed.
+ * stream frees its place once it is registered or removed. Once the drain began
+ * ({@link #beginDrain()}) every stream is refused, so no session appears after the drain
+ * took the pending ones.
  */
 @Component
 public class SessionRegistry {
 
 	/** Why {@link #admit} refused a session; the stream is failed with its status. */
 	public enum Refusal {
+
+		/** The node is draining: no session appears after the drain began. */
+		DRAINING("draining", Status.UNAVAILABLE.withDescription("node is draining")),
 
 		/** {@code sluice.limits.max-pending-tunnel-streams} streams are pending. */
 		LIMIT("limit",
@@ -70,8 +75,11 @@ public class SessionRegistry {
 	/** {@code 0} = no limit per address beyond {@link #maxPending}. */
 	private final int maxPendingPerAddress;
 
-	/** Guards {@link #pending} and {@link #pendingPerAddress}. */
+	/** Guards {@link #pending}, {@link #pendingPerAddress} and {@link #draining}. */
 	private final Object pendingLock = new Object();
+
+	/** Set by {@link #beginDrain()}; no session is admitted once it is. */
+	private boolean draining;
 
 	private final Set<TunnelSession> pending = new LinkedHashSet<>();
 
@@ -89,13 +97,17 @@ public class SessionRegistry {
 	}
 
 	/**
-	 * Tracks a session whose client has not advertised yet, unless a bound on the pending
-	 * streams is reached: then the session is not tracked and the refusal is returned. A
-	 * session without a source address is bounded only by the global limit.
+	 * Tracks a session whose client has not advertised yet, unless the drain began or a
+	 * bound on the pending streams is reached: then the session is not tracked and the
+	 * refusal is returned. A session without a source address is bounded only by the
+	 * global limit.
 	 */
 	Optional<Refusal> admit(TunnelSession session) {
 		String source = session.sourceAddress();
 		synchronized (this.pendingLock) {
+			if (this.draining) {
+				return Optional.of(Refusal.DRAINING);
+			}
 			if (this.pending.size() >= this.maxPending) {
 				return Optional.of(Refusal.LIMIT);
 			}
@@ -148,6 +160,19 @@ public class SessionRegistry {
 	/** Sessions whose client has not advertised yet; they serve no connection. */
 	public List<TunnelSession> pending() {
 		synchronized (this.pendingLock) {
+			return List.copyOf(this.pending);
+		}
+	}
+
+	/**
+	 * Begins the drain: from now on {@link #admit} refuses every session
+	 * ({@link Refusal#DRAINING}). Returns the pending sessions, which the caller closes;
+	 * since the refusal and the snapshot are one step with the admission, every session
+	 * ever admitted is among them or registered before. Idempotent.
+	 */
+	List<TunnelSession> beginDrain() {
+		synchronized (this.pendingLock) {
+			this.draining = true;
 			return List.copyOf(this.pending);
 		}
 	}
