@@ -420,6 +420,15 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * outside the budget too, each further upstream connection of an h2 connection both;
 	 * {@code 0} = half the maximum heap less the h2 queue budget, or no bound with
 	 * {@code maxConnections} configured
+	 * @param overflowConnections connections past the connection limit served at once far
+	 * enough to be answered {@code 503} with {@code Retry-After} (on the data port: the
+	 * TLS handshake of a terminated route, the head), then closed; a connection past them
+	 * is closed at accept; {@code 0} = every connection past the limit is closed at
+	 * accept
+	 * @param overflowTimeout one deadline for all of an overflow connection -- PROXY
+	 * header, TLS handshake, head, answer -- after which it is closed whatever it reached
+	 * @param overflowRetryAfter the {@code Retry-After} of the {@code 503} answering an
+	 * overflow connection, in whole seconds
 	 */
 	public record Limits(@DefaultValue("0") int maxConnections, @DefaultValue("0") int maxConnectionsPerAddress,
 			@DefaultValue("10s") Duration headTimeout, @DefaultValue("60s") Duration idleTimeout,
@@ -429,13 +438,17 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			@DefaultValue("0") Duration verbatimIdleTimeout, @DefaultValue("10s") Duration advertiseTimeout,
 			@DefaultValue("256") int maxPendingTunnelStreams, @DefaultValue("0") int maxPendingTunnelStreamsPerAddress,
 			@DefaultValue("1024") int maxTunnelSessions, @DefaultValue("0") int maxTunnelSessionsPerAddress,
-			@DefaultValue("0") DataSize connectionMemory) {
+			@DefaultValue("0") DataSize connectionMemory, @DefaultValue("8") int overflowConnections,
+			@DefaultValue("5s") Duration overflowTimeout, @DefaultValue("5s") Duration overflowRetryAfter) {
 
 		/** The default of {@code maxPendingTunnelStreams}. */
 		public static final int DEFAULT_MAX_PENDING_TUNNEL_STREAMS = 256;
 
 		/** The default of {@code maxTunnelSessions}. */
 		public static final int DEFAULT_MAX_TUNNEL_SESSIONS = 1024;
+
+		/** The default of {@code overflowConnections}. */
+		public static final int DEFAULT_OVERFLOW_CONNECTIONS = 8;
 
 		public Limits {
 			maxConnections = Math.max(0, maxConnections);
@@ -466,6 +479,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			maxTunnelSessionsPerAddress = Math.max(0, maxTunnelSessionsPerAddress);
 			connectionMemory = connectionMemory == null || connectionMemory.isNegative() ? DataSize.ofBytes(0)
 					: connectionMemory;
+			overflowConnections = Math.max(0, overflowConnections);
+			overflowTimeout = overflowTimeout == null || overflowTimeout.isNegative() || overflowTimeout.isZero()
+					? Duration.ofSeconds(5) : overflowTimeout;
+			overflowRetryAfter = overflowRetryAfter == null || overflowRetryAfter.isNegative() ? Duration.ofSeconds(5)
+					: overflowRetryAfter;
 		}
 
 		public static Builder builder() {
@@ -507,6 +525,12 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			private int maxTunnelSessionsPerAddress;
 
 			@Nullable private DataSize connectionMemory;
+
+			private int overflowConnections = DEFAULT_OVERFLOW_CONNECTIONS;
+
+			@Nullable private Duration overflowTimeout;
+
+			@Nullable private Duration overflowRetryAfter;
 
 			private Builder() {
 			}
@@ -596,6 +620,21 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder overflowConnections(int overflowConnections) {
+				this.overflowConnections = overflowConnections;
+				return this;
+			}
+
+			public Builder overflowTimeout(Duration overflowTimeout) {
+				this.overflowTimeout = overflowTimeout;
+				return this;
+			}
+
+			public Builder overflowRetryAfter(Duration overflowRetryAfter) {
+				this.overflowRetryAfter = overflowRetryAfter;
+				return this;
+			}
+
 			public Limits build() {
 				return new Limits(this.maxConnections, this.maxConnectionsPerAddress,
 						this.headTimeout == null ? Duration.ofSeconds(10) : this.headTimeout,
@@ -610,7 +649,10 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 						this.advertiseTimeout == null ? Duration.ofSeconds(10) : this.advertiseTimeout,
 						this.maxPendingTunnelStreams, this.maxPendingTunnelStreamsPerAddress, this.maxTunnelSessions,
 						this.maxTunnelSessionsPerAddress,
-						this.connectionMemory == null ? DataSize.ofBytes(0) : this.connectionMemory);
+						this.connectionMemory == null ? DataSize.ofBytes(0) : this.connectionMemory,
+						this.overflowConnections,
+						this.overflowTimeout == null ? Duration.ofSeconds(5) : this.overflowTimeout,
+						this.overflowRetryAfter == null ? Duration.ofSeconds(5) : this.overflowRetryAfter);
 			}
 
 		}

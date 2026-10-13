@@ -6,6 +6,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -42,8 +43,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * An h2 connection takes a slot of the connection limit for every leg beyond the first: a
  * stream whose route needs a leg while no slot is free is refused (REFUSED_STREAM), a
- * plain connection meanwhile is closed unread, and every slot comes back -- when a leg
- * retires, and when the connection ends.
+ * plain connection meanwhile is past the limit (answered 503), and every slot comes back
+ * -- when a leg retires, and when the connection ends.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -110,8 +111,10 @@ class H2DemuxLegLimitE2ETest {
 			assertThat(get(client, 9, "leg1.test")).as("a route with a leg is still served").isTrue();
 
 			try (Socket plain = new Socket("127.0.0.1", dataPort)) {
-				assertThat(TestSockets.awaitClosed(plain, Duration.ofSeconds(5))).as("closed unread")
-					.isLessThan(Duration.ofSeconds(5));
+				plain.setSoTimeout(5000);
+				plain.getOutputStream().write(TestSockets.get("leg1.test"));
+				String answer = new String(plain.getInputStream().readNBytes(32), StandardCharsets.US_ASCII);
+				assertThat(answer).as("past the limit").startsWith("HTTP/1.1 503 Service Unavailable");
 			}
 			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> rejected() == rejectedBefore + 1);
 

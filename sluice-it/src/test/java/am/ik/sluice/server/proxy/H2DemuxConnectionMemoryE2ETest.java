@@ -65,8 +65,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * outside it, though without the windows withheld they would hold far more. A fifth h2
  * connection is admitted but not relayed as h2: in plaintext, or over TLS offering h2
  * alone, it gets a GOAWAY processing no stream; over TLS offering HTTP/1.1 too it gets
- * HTTP/1.1 and is served; a connection past what is left is closed at accept. In the
- * relay's package for the relay's constants and the limits' accounts.
+ * HTTP/1.1 and is served; a connection past what is left is answered 503. In the relay's
+ * package for the relay's constants and the limits' accounts.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -172,8 +172,8 @@ class H2DemuxConnectionMemoryE2ETest {
 	 * budget, so the reservations are what bounds it. The connections past them: a fifth
 	 * h2 one in plaintext and one over TLS offering h2 alone are refused with a GOAWAY
 	 * naming no stream, one over TLS offering HTTP/1.1 too is served over HTTP/1.1 and,
-	 * while it is open, one more is closed at accept. Every byte is released once they
-	 * closed.
+	 * while it is open, one more is answered 503 by the overflow. Every byte is released
+	 * once they closed.
 	 */
 	@Test
 	void connectionsAtTheMemoryHoldNoMoreThanTheBudgetAndWhatTheyReserve() throws Exception {
@@ -229,7 +229,10 @@ class H2DemuxConnectionMemoryE2ETest {
 					.untilAsserted(() -> assertThat(limits().reserved()).as("the memory is full").isEqualTo(MEMORY));
 				try (Socket past = new Socket("127.0.0.1", dataPort)) {
 					past.setSoTimeout((int) TIMEOUT.toMillis());
-					assertThat(past.getInputStream().read()).as("closed at accept").isEqualTo(-1);
+					past.getOutputStream()
+						.write(("GET / HTTP/1.1\r\nHost: " + H1_HOST + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+					String answer = new String(past.getInputStream().readNBytes(32), StandardCharsets.US_ASCII);
+					assertThat(answer).as("answered by the overflow").startsWith("HTTP/1.1 503 Service Unavailable");
 				}
 				assertThat(rejected("limit")).isEqualTo(rejectedLimit + 1);
 				OutputStream out = socket.getOutputStream();

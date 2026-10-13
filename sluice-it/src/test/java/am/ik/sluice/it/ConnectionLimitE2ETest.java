@@ -31,7 +31,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * The global data plane connection limit: one count shared by the data port and every tcp
  * route port, taken at accept and released exactly once on every path a connection ends
- * by. A connection beyond the limit is closed unread.
+ * by. A connection beyond the limit is closed unread, the overflow being off.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -66,6 +66,10 @@ class ConnectionLimitE2ETest {
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.tcp-port-range", () -> String.valueOf(tcpRoutePort));
 		registry.add("sluice.limits.max-connections", () -> "2");
+		// past the limit every connection is closed at accept; the overflow answering a
+		// few
+		// of them is ConnectionLimitOverflowE2ETest's
+		registry.add("sluice.limits.overflow-connections", () -> "0");
 		registry.add("sluice.token", () -> "it-token");
 		registry.add("server.port", () -> 0);
 	}

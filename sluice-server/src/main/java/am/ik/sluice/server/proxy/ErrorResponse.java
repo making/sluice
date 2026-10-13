@@ -3,6 +3,7 @@ package am.ik.sluice.server.proxy;
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Map;
 
@@ -29,8 +30,9 @@ import org.springframework.stereotype.Component;
  * forbidden page for a peer address the access control excludes, a bare HTTP/1.1 400 for
  * a malformed request, the HTTP/2 502 page for a stream its upstream lost, a bodiless
  * HTTP/2 421 for a stream of a route reached over HTTP/1.1 only, a GOAWAY
- * {@code COMPRESSION_ERROR} for an HTTP/2 head whose header block does not decode, and a
- * GOAWAY processing no stream for an HTTP/2 connection past the connection limit.
+ * {@code COMPRESSION_ERROR} for an HTTP/2 head whose header block does not decode, a
+ * GOAWAY processing no stream for an HTTP/2 connection whose relay does not fit, and the
+ * 503 busy page with {@code Retry-After} for a request past the connection limit.
  */
 @Component
 public class ErrorResponse {
@@ -55,10 +57,26 @@ public class ErrorResponse {
 
 	private final Page badGateway;
 
+	private final Page busy;
+
 	ErrorResponse(Mustache.Compiler compiler) {
 		this.noRoute = new Page(compiler.loadTemplate("proxy/no-route"), "503 Service Unavailable");
 		this.forbidden = new Page(compiler.loadTemplate("proxy/forbidden"), "403 Forbidden");
 		this.badGateway = new Page(compiler.loadTemplate("proxy/bad-gateway"), "502 Bad Gateway");
+		this.busy = new Page(compiler.loadTemplate("proxy/busy"), "503 Service Unavailable");
+	}
+
+	/**
+	 * The answer to a request past the connection limit: the busy page, a {@code 503}
+	 * with a {@code Retry-After} of {@code retryAfter} in whole seconds, in the protocol
+	 * of {@code head} (HTTP/2: on the request's stream, a GOAWAY naming it as the last
+	 * processed after it); empty for a head that is no HTTP request.
+	 */
+	public byte[] busy(ConnectionHeadParser.Head head, Duration retryAfter) {
+		if (head.request() == null && !head.http2Connection()) {
+			return new byte[0];
+		}
+		return this.render(head, this.busy.retryingAfter(retryAfter.toSeconds()));
 	}
 
 	/**
@@ -183,9 +201,10 @@ public class ErrorResponse {
 
 	private byte[] http1(ConnectionHeadParser.Head head, ConnectionHeadParser.Head.Request request, Page page) {
 		byte[] body = this.page(head, page);
+		Long retryAfter = page.retryAfter();
 		String responseHead = "HTTP/1.1 " + page.reason() + "\r\n" + "Content-Type: " + CONTENT_TYPE + "\r\n"
 				+ "Content-Length: " + body.length + "\r\n" + "Cache-Control: no-store\r\n"
-				+ "Connection: close\r\n\r\n";
+				+ (retryAfter == null ? "" : "Retry-After: " + retryAfter + "\r\n") + "Connection: close\r\n\r\n";
 		ByteArrayOutputStream out = new ByteArrayOutputStream(responseHead.length() + body.length);
 		out.writeBytes(responseHead.getBytes(StandardCharsets.US_ASCII));
 		if (!isHead(request)) {
@@ -208,6 +227,10 @@ public class ErrorResponse {
 			.set("content-type", CONTENT_TYPE)
 			.set("content-length", String.valueOf(body.length))
 			.set("cache-control", "no-store");
+		Long retryAfter = page.retryAfter();
+		if (retryAfter != null) {
+			headers.set("retry-after", String.valueOf(retryAfter));
+		}
 		Http2Frames frames = new Http2Frames(streamId);
 		frames.write(Http2Frame.SETTINGS, new byte[0]);
 		frames.write(Http2Frame.SETTINGS_ACK, new byte[0]);
@@ -241,17 +264,40 @@ public class ErrorResponse {
 		return "HEAD".equals(request.method());
 	}
 
-	/**
-	 * An error page: its template and its HTTP status line (the bare status code is the
-	 * leading token of the reason).
-	 */
-	private record Page(Template page, String reason) {
+	/** An error page: its template and its status. */
+	private record Page(Template page, Status line) {
 
-		private String status() {
-			int end = this.reason.indexOf(' ');
-			return end < 0 ? this.reason : this.reason.substring(0, end);
+		private Page(Template page, String reason) {
+			this(page, new Status(reason, null));
 		}
 
+		/** The same page with a {@code Retry-After} of {@code seconds}. */
+		private Page retryingAfter(long seconds) {
+			return new Page(this.page, new Status(this.line.reason(), seconds));
+		}
+
+		private String reason() {
+			return this.line.reason();
+		}
+
+		/** The bare status code: the leading token of the reason. */
+		private String status() {
+			String reason = this.line.reason();
+			int end = reason.indexOf(' ');
+			return end < 0 ? reason : reason.substring(0, end);
+		}
+
+		private @Nullable Long retryAfter() {
+			return this.line.retryAfter();
+		}
+
+	}
+
+	/**
+	 * An HTTP status line, and the {@code Retry-After} in seconds the response carries;
+	 * null = none.
+	 */
+	private record Status(String reason, @Nullable Long retryAfter) {
 	}
 
 	/**

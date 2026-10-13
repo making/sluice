@@ -85,6 +85,47 @@ class ConnectionLimitsTest {
 	}
 
 	@Test
+	void pastTheLimitAFewConnectionsTakeAPlaceOfTheOverflowAndTheNextNone() throws Exception {
+		SimpleMeterRegistry registry = new SimpleMeterRegistry();
+		ConnectionLimits overflowing = new ConnectionLimits(SluiceServerProperties.builder()
+			.limits(SluiceServerProperties.Limits.builder()
+				.maxConnections(1)
+				.overflowConnections(2)
+				.overflowTimeout(Duration.ofMillis(200))
+				.build())
+			.build(), registry);
+		try (ServerSocket server = loopbackServer();
+				Socket client = new Socket("127.0.0.1", server.getLocalPort());
+				Socket accepted = server.accept()) {
+			assertThat(overflowing.enter(this.access)).isInstanceOf(ConnectionLimits.Admission.class);
+			ConnectionLimits.Entry first = overflowing.enter(this.access);
+			ConnectionLimits.Entry second = overflowing.enter(this.access);
+			assertThat(first).isInstanceOf(ConnectionLimits.Overflow.class);
+			assertThat(second).isInstanceOf(ConnectionLimits.Overflow.class);
+			assertThat(overflowing.enter(this.access)).isNull();
+			assertThat(overflowing.overflowing()).isEqualTo(2);
+			assertThat(overflowing.admitted()).isEqualTo(1);
+			// every connection past the limit is rejected for it, answered or not
+			assertThat(registry.get("sluice.data.connections.rejected").tag("reason", "limit").counter().count())
+				.isEqualTo(3);
+			// the deadline closes the socket
+			ConnectionLimits.Overflow overflow = (ConnectionLimits.Overflow) Objects.requireNonNull(first);
+			overflow.start(accepted);
+			Awaitility.await().atMost(Duration.ofSeconds(2)).until(accepted::isClosed);
+			assertThat(overflow.expired()).isTrue();
+			overflow.release();
+			overflow.release();
+			assertThat(overflowing.overflowing()).isEqualTo(1);
+			assertThat(overflowing.enter(this.access)).isInstanceOf(ConnectionLimits.Overflow.class);
+			Objects.requireNonNull(second).release();
+			assertThat(overflowing.overflowing()).isEqualTo(1);
+		}
+		finally {
+			overflowing.destroy();
+		}
+	}
+
+	@Test
 	void aPerAddressLimitAboveTheGlobalOneIsCappedByIt() {
 		SluiceServerProperties loose = SluiceServerProperties.builder()
 			.limits(SluiceServerProperties.Limits.builder().maxConnections(3).maxConnectionsPerAddress(10).build())
@@ -347,19 +388,24 @@ class ConnectionLimitsTest {
 		assertThat(ConnectionLimits.h2RelayBytes()).isEqualTo(1626112 + 1495040);
 		assertThat(ConnectionLimits.legBytes()).isEqualTo(2266112 + 1495040);
 		assertThat(ConnectionLimits.deriveBudget(400 * mib)).isEqualTo(25 * mib);
-		assertThat(ConnectionLimits.deriveMemory(400 * mib, 25 * mib)).isEqualTo(175 * mib);
-		// 175MiB / 2213KiB
-		assertThat(ConnectionLimits.deriveMaxConnections(175 * mib)).isEqualTo(80);
-		// the 409MiB heap a 512Mi container gave the server in production: 178.9MiB
-		long production = ConnectionLimits.deriveMemory(409 * mib, ConnectionLimits.deriveBudget(409 * mib));
-		assertThat(production).isEqualTo(409 * mib / 2 - 409 * mib / 16);
-		assertThat(ConnectionLimits.deriveMaxConnections(production)).isEqualTo(82);
-		// of which h2 connections with one leg each: 178.9MiB / 5261KiB
+		// an overflow connection: its ClientHello and its head, each in a buffer of up to
+		// 128KiB
+		assertThat(ConnectionLimits.OVERFLOW_BYTES).isEqualTo(256 * 1024);
+		assertThat(ConnectionLimits.deriveMemory(400 * mib, 25 * mib, 0)).isEqualTo(175 * mib);
+		// the default overflow of 8 takes 2MiB off
+		assertThat(ConnectionLimits.deriveMemory(400 * mib, 25 * mib, 8)).isEqualTo(173 * mib);
+		// 173MiB / 2213KiB
+		assertThat(ConnectionLimits.deriveMaxConnections(173 * mib)).isEqualTo(80);
+		// the 409MiB heap a 512Mi container gave the server in production: 176.9MiB
+		long production = ConnectionLimits.deriveMemory(409 * mib, ConnectionLimits.deriveBudget(409 * mib), 8);
+		assertThat(production).isEqualTo(409 * mib / 2 - 409 * mib / 16 - 2 * mib);
+		assertThat(ConnectionLimits.deriveMaxConnections(production)).isEqualTo(81);
+		// of which h2 connections with one leg each: 176.9MiB / 5261KiB
 		assertThat(production / (ConnectionLimits.connectionBytes() + ConnectionLimits.h2RelayBytes())).isEqualTo(34);
-		// (2048MiB - 256MiB) / 2213KiB
-		assertThat(ConnectionLimits.deriveMaxConnections(ConnectionLimits.deriveMemory(4096 * mib, 256 * mib)))
-			.isEqualTo(829);
-		assertThat(ConnectionLimits.deriveMemory(400 * mib, 400 * mib)).isZero();
+		// (2048MiB - 256MiB - 2MiB) / 2213KiB
+		assertThat(ConnectionLimits.deriveMaxConnections(ConnectionLimits.deriveMemory(4096 * mib, 256 * mib, 8)))
+			.isEqualTo(828);
+		assertThat(ConnectionLimits.deriveMemory(400 * mib, 400 * mib, 8)).isZero();
 		assertThat(ConnectionLimits.deriveMaxConnections(0)).isEqualTo(1);
 	}
 
@@ -483,15 +529,16 @@ class ConnectionLimitsTest {
 			logger.detachAppender(events);
 		}
 		try {
-			long memory = ConnectionLimits.deriveMemory(maxHeap, budget.toBytes());
+			long memory = ConnectionLimits.deriveMemory(maxHeap, budget.toBytes(), 8);
 			int max = ConnectionLimits.deriveMaxConnections(memory);
 			assertThat(derived.memory()).isEqualTo(memory);
 			assertThat(derived.max()).isEqualTo(max);
 			assertThat(events.list).extracting(ILoggingEvent::getFormattedMessage)
 				.containsExactly(("data plane connection limit %d (derived: connection memory / 2213KiB per "
-						+ "connection), connection memory %dKiB (derived: half of max heap %dMiB - h2 queue budget; "
-						+ "a connection reserves 2213KiB, an h2 connection 3048KiB more, a further upstream "
-						+ "connection of it 3673KiB), per address %d, head timeout PT10S, idle timeout PT1M, stall "
+						+ "connection), connection memory %dKiB (derived: half of max heap %dMiB - h2 queue budget - "
+						+ "overflow 8 x 256KiB; a connection reserves 2213KiB, an h2 connection 3048KiB more, a "
+						+ "further upstream connection of it 3673KiB), overflow 8 answered 503 within PT5S "
+						+ "(Retry-After 5s), per address %d, head timeout PT10S, idle timeout PT1M, stall "
 						+ "timeout PT1M per 16384B, verbatim idle timeout off (unless a route sets one), h2 queue "
 						+ "budget 1024KiB (configured)")
 					.formatted(max, memory >> 10, maxHeap >> 20, max));

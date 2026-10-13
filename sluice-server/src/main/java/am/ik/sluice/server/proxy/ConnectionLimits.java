@@ -7,6 +7,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -55,8 +56,13 @@ import io.micrometer.core.instrument.MeterRegistry;
  * stream that stays not ready keeps them, and the slots, until the session ends);
  * {@link Admission#release()} frees its slot and bytes and may be called on every exit
  * path, only the first call counts. A connection over a limit is closed without being
- * read. Rejections are counted as {@code sluice.data.connections.rejected} by
- * {@code reason} ({@code limit}, {@code address-limit}, {@code head-timeout};
+ * read -- except, on the data port, a few past the connection limit at once
+ * ({@link #enter}): each takes a place of the overflow instead, a fixed number of them
+ * outside the reservable bytes (the derived bytes leave {@link #OVERFLOW_BYTES} for
+ * each), and is served under one short deadline ({@link Overflow}) far enough to be
+ * answered {@code 503}. Rejections are counted as
+ * {@code sluice.data.connections.rejected} by {@code reason} ({@code limit}, the
+ * overflow's connections included; {@code address-limit}, {@code head-timeout};
  * {@code h2-limit}: an h2 connection whose relay did not fit, answered with a GOAWAY) and
  * logged through the access log's rate limit; a TLS connection offering h2 and HTTP/1.1
  * whose relay does not fit is given HTTP/1.1, counted as
@@ -64,7 +70,8 @@ import io.micrometer.core.instrument.MeterRegistry;
  * requests count as {@code sluice.data.connections.idle.closed}, those closed for
  * stalling an exchange as {@code sluice.data.connections.stall.closed}, connections
  * relayed verbatim closed for relaying nothing as
- * {@code sluice.data.connections.verbatim.idle.closed}.
+ * {@code sluice.data.connections.verbatim.idle.closed}; overflow connections answered
+ * {@code 503} as {@code sluice.data.connections.overflow.answered} by {@code protocol}.
  */
 @Component
 public class ConnectionLimits implements DisposableBean {
@@ -72,6 +79,15 @@ public class ConnectionLimits implements DisposableBean {
 	private static final Logger log = LoggerFactory.getLogger(ConnectionLimits.class);
 
 	private static final String REJECTED = "sluice.data.connections.rejected";
+
+	private static final String OVERFLOW_ANSWERED = "sluice.data.connections.overflow.answered";
+
+	/**
+	 * What one overflow connection is taken to hold, the TLS engine's records aside: its
+	 * ClientHello and its head, each read up to 64KiB into a buffer that may double to
+	 * 128KiB.
+	 */
+	static final long OVERFLOW_BYTES = 2 * 128 * 1024;
 
 	private final ConnectionReserve reserve;
 
@@ -95,6 +111,19 @@ public class ConnectionLimits implements DisposableBean {
 
 	private final ScheduledThreadPoolExecutor deadlines;
 
+	/** Places of the overflow: connections past the connection limit being answered. */
+	private final Semaphore overflow;
+
+	private final int maxOverflow;
+
+	private final Duration overflowTimeout;
+
+	private final Duration overflowRetryAfter;
+
+	private final Counter overflowAnsweredH1;
+
+	private final Counter overflowAnsweredH2;
+
 	private final Counter rejectedLimit;
 
 	private final Counter rejectedAddressLimit;
@@ -117,8 +146,12 @@ public class ConnectionLimits implements DisposableBean {
 		long budget = limits.h2QueueBudget().toBytes() > 0 ? limits.h2QueueBudget().toBytes() : deriveBudget(maxHeap);
 		this.h2Budget = new H2DemuxBudget(budget);
 		long configuredMemory = limits.connectionMemory().toBytes();
-		long memory = configuredMemory > 0 ? configuredMemory
-				: limits.maxConnections() > 0 ? ConnectionReserve.UNBOUNDED : deriveMemory(maxHeap, budget);
+		this.maxOverflow = limits.overflowConnections();
+		this.overflow = new Semaphore(this.maxOverflow);
+		this.overflowTimeout = limits.overflowTimeout();
+		this.overflowRetryAfter = limits.overflowRetryAfter();
+		long memory = configuredMemory > 0 ? configuredMemory : limits.maxConnections() > 0
+				? ConnectionReserve.UNBOUNDED : deriveMemory(maxHeap, budget, this.maxOverflow);
 		this.reserve = new ConnectionReserve(
 				limits.maxConnections() > 0 ? limits.maxConnections() : deriveMaxConnections(memory), memory);
 		int perAddress = limits.maxConnectionsPerAddress();
@@ -136,6 +169,8 @@ public class ConnectionLimits implements DisposableBean {
 		this.rejectedAddressLimit = rejected(meterRegistry, "address-limit");
 		this.rejectedHeadTimeout = rejected(meterRegistry, "head-timeout");
 		this.rejectedH2Limit = rejected(meterRegistry, "h2-limit");
+		this.overflowAnsweredH1 = overflowAnswered(meterRegistry, "h1");
+		this.overflowAnsweredH2 = overflowAnswered(meterRegistry, "h2");
 		this.h2Declined = Counter.builder("sluice.data.connections.h2.declined")
 			.description("TLS connections offering h2 and HTTP/1.1 given HTTP/1.1, the bytes an h2 relay reserves "
 					+ "not fitting")
@@ -153,6 +188,9 @@ public class ConnectionLimits implements DisposableBean {
 			.register(meterRegistry);
 		Gauge.builder("sluice.data.connections.limit", this.reserve, ConnectionReserve::maxSlots)
 			.description("Data plane connections allowed open at once")
+			.register(meterRegistry);
+		Gauge.builder("sluice.data.connections.overflow", this, ConnectionLimits::overflowing)
+			.description("Data plane connections past the connection limit being answered 503")
 			.register(meterRegistry);
 		Gauge.builder("sluice.data.connections.admitted", this.reserve, ConnectionReserve::slots)
 			.description("Data plane connections and further h2 demux legs holding a slot of the connection limit")
@@ -172,16 +210,18 @@ public class ConnectionLimits implements DisposableBean {
 			.description("Bytes the h2 demux relays queue beyond their per-connection allowance")
 			.register(meterRegistry);
 		log.info(
-				"data plane connection limit {} ({}), connection memory {} ({}; a connection reserves {}KiB, an h2 connection {}KiB more, a further upstream connection of it {}KiB), per address {}, head timeout {}, idle timeout {}, stall timeout {} per {}B, verbatim idle timeout {}, h2 queue budget {}KiB ({})",
+				"data plane connection limit {} ({}), connection memory {} ({}; a connection reserves {}KiB, an h2 connection {}KiB more, a further upstream connection of it {}KiB), overflow {} answered 503 within {} (Retry-After {}s), per address {}, head timeout {}, idle timeout {}, stall timeout {} per {}B, verbatim idle timeout {}, h2 queue budget {}KiB ({})",
 				this.reserve.maxSlots(),
 				limits.maxConnections() > 0 ? "configured"
 						: "derived: connection memory / %dKiB per connection".formatted(connectionBytes() >> 10),
 				memory == ConnectionReserve.UNBOUNDED ? "unbounded" : (memory >> 10) + "KiB",
 				configuredMemory > 0 ? "configured"
 						: limits.maxConnections() > 0 ? "the configured connection limit alone counts"
-								: "derived: half of max heap %dMiB - h2 queue budget".formatted(maxHeap >> 20),
-				connectionBytes() >> 10, h2RelayBytes() >> 10, legBytes() >> 10, this.maxPerAddress, this.headTimeout,
-				this.idleTimeout, this.stallTimeout, this.stallMinBytes,
+								: "derived: half of max heap %dMiB - h2 queue budget - overflow %d x %dKiB"
+									.formatted(maxHeap >> 20, this.maxOverflow, OVERFLOW_BYTES >> 10),
+				connectionBytes() >> 10, h2RelayBytes() >> 10, legBytes() >> 10, this.maxOverflow, this.overflowTimeout,
+				this.overflowRetryAfter.toSeconds(), this.maxPerAddress, this.headTimeout, this.idleTimeout,
+				this.stallTimeout, this.stallMinBytes,
 				this.verbatimIdleTimeout.isZero() ? "off (unless a route sets one)" : this.verbatimIdleTimeout,
 				budget >> 10,
 				limits.h2QueueBudget().toBytes() > 0 ? "configured" : "derived: an eighth of half of max heap");
@@ -218,10 +258,11 @@ public class ConnectionLimits implements DisposableBean {
 
 	/**
 	 * The bytes the connections may reserve an unset value derives: half the heap less
-	 * the h2 queue budget.
+	 * the h2 queue budget and what {@code overflow} overflow connections hold
+	 * ({@link #OVERFLOW_BYTES} each).
 	 */
-	static long deriveMemory(long maxHeap, long budget) {
-		return Math.max(0, maxHeap / 2 - budget);
+	static long deriveMemory(long maxHeap, long budget, int overflow) {
+		return Math.max(0, maxHeap / 2 - budget - overflow * OVERFLOW_BYTES);
 	}
 
 	/**
@@ -251,6 +292,42 @@ public class ConnectionLimits implements DisposableBean {
 			return null;
 		}
 		return new Admission(reservation, access);
+	}
+
+	/**
+	 * Admits an accepted connection of the data port; past the limit, gives it a place of
+	 * the overflow, rejected all the same ({@code reason=limit}) but to be answered
+	 * {@code 503}; null when the overflow is full too: the caller closes the socket
+	 * without reading it.
+	 */
+	@Nullable Entry enter(AccessLogger.Connection access) {
+		ConnectionReserve.Reservation reservation = this.reserve.tryReserve(connectionBytes());
+		if (reservation != null) {
+			return new Admission(reservation, access);
+		}
+		this.rejectedLimit.increment();
+		if (this.overflow.tryAcquire()) {
+			return new Overflow(access);
+		}
+		access.reject("limit");
+		return null;
+	}
+
+	private static Counter overflowAnswered(MeterRegistry meterRegistry, String protocol) {
+		return Counter.builder(OVERFLOW_ANSWERED)
+			.tag("protocol", protocol)
+			.description("Data plane connections past the connection limit answered 503 by the overflow")
+			.register(meterRegistry);
+	}
+
+	/** The {@code Retry-After} of the 503 answering an overflow connection. */
+	Duration overflowRetryAfter() {
+		return this.overflowRetryAfter;
+	}
+
+	/** Places of the overflow taken. */
+	int overflowing() {
+		return this.maxOverflow - this.overflow.availablePermits();
 	}
 
 	/**
@@ -334,8 +411,91 @@ public class ConnectionLimits implements DisposableBean {
 		this.deadlines.shutdownNow();
 	}
 
+	/**
+	 * What {@link #enter} gives an accepted connection: an {@link Admission}, or a place
+	 * of the overflow.
+	 */
+	sealed interface Entry permits Admission, Overflow {
+
+		/**
+		 * Frees what the entry holds and cancels its deadline; only the first call
+		 * counts.
+		 */
+		void release();
+
+	}
+
+	/**
+	 * The place and the deadline of one connection past the connection limit, served far
+	 * enough to be answered {@code 503}: once {@link #start started}, the deadline closes
+	 * the socket after the overflow timeout wherever the connection is. Logged once, as
+	 * rejected for the limit: answered ({@link #answered}), or else on release.
+	 */
+	final class Overflow implements Entry {
+
+		private final AccessLogger.Connection access;
+
+		private final AtomicBoolean released = new AtomicBoolean();
+
+		private final AtomicReference<@Nullable ScheduledFuture<?>> deadline = new AtomicReference<>();
+
+		private volatile boolean expired;
+
+		private Overflow(AccessLogger.Connection access) {
+			this.access = access;
+		}
+
+		/** Starts the deadline, which closes {@code socket} once it passes. */
+		void start(Socket socket) {
+			this.deadline.set(ConnectionLimits.this.deadlines.schedule(() -> expire(socket),
+					ConnectionLimits.this.overflowTimeout.toNanos(), TimeUnit.NANOSECONDS));
+		}
+
+		private void expire(Socket socket) {
+			if (this.released.get()) {
+				return;
+			}
+			this.expired = true;
+			try {
+				socket.close();
+			}
+			catch (Exception e) {
+				// ignore
+			}
+		}
+
+		/** Whether the deadline closed the connection. */
+		boolean expired() {
+			return this.expired;
+		}
+
+		/** The {@code 503} went out in {@code protocol} ({@code h1} or {@code h2}). */
+		void answered(String protocol) {
+			("h2".equals(protocol) ? ConnectionLimits.this.overflowAnsweredH2
+					: ConnectionLimits.this.overflowAnsweredH1)
+				.increment();
+			this.access.transport(protocol);
+			this.access.rejectAnswered("limit", 503);
+		}
+
+		@Override
+		public void release() {
+			if (!this.released.compareAndSet(false, true)) {
+				return;
+			}
+			ScheduledFuture<?> future = this.deadline.getAndSet(null);
+			if (future != null) {
+				future.cancel(false);
+			}
+			// a no-op once answered() logged the connection
+			this.access.reject("limit");
+			ConnectionLimits.this.overflow.release();
+		}
+
+	}
+
 	/** The slot, the bytes and the head deadline of one admitted connection. */
-	final class Admission {
+	final class Admission implements Entry {
 
 		private static final int HEAD = 0;
 
@@ -480,7 +640,8 @@ public class ConnectionLimits implements DisposableBean {
 		}
 
 		/** Frees the slots and cancels the deadline; only the first call counts. */
-		void release() {
+		@Override
+		public void release() {
 			if (!this.released.compareAndSet(false, true)) {
 				return;
 			}

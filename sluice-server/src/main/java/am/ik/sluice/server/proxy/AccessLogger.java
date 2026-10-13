@@ -281,6 +281,25 @@ public class AccessLogger {
 					this.listener, this.remote, reason, (System.nanoTime() - this.startNanos) / 1_000_000);
 		}
 
+		/**
+		 * Logs the connection as rejected, as {@link #reject(String)} does, yet answered
+		 * with an HTTP {@code status} in its transport (a connection past the connection
+		 * limit answered 503).
+		 */
+		void rejectAnswered(String reason, int status) {
+			if (!this.connEnabled || this.noop || this.closed || this.owner == null) {
+				return;
+			}
+			this.closed = true;
+			if (!this.owner.allowReject()) {
+				return;
+			}
+			log.info(
+					"type=conn id={} event=reject listener={} remote={} reason={} transport={} status={} durationMs={}",
+					this.id, this.listener, this.remote, reason, this.transport, status,
+					(System.nanoTime() - this.startNanos) / 1_000_000);
+		}
+
 		public void close() {
 			if (!this.connEnabled || this.noop || this.closed || this.owner == null || !this.owner.allowClose()) {
 				return;

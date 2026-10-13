@@ -60,7 +60,9 @@ import org.slf4j.LoggerFactory;
  * see {@link ConnectionLimits}), or relayed untouched in passthrough mode otherwise,
  * routed by the SNI host name of the ClientHello (the backend terminates TLS and presents
  * its own certificate). An h2 connection whose relay does not fit is answered with a
- * GOAWAY naming no stream processed.
+ * GOAWAY naming no stream processed. A connection past the connection limit given a place
+ * of the overflow ({@link ConnectionLimits#enter}) is answered 503 with
+ * {@code Retry-After} once its head is read, then closed.
  */
 @Component
 public class DataProxyServer implements SmartLifecycle, Drainable {
@@ -180,18 +182,24 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			try {
 				Socket socket = serverSocket.accept();
 				AccessLogger.Connection access = this.accessLogger.accepted("data", socket);
-				ConnectionLimits.Admission admission = this.limits.admit(access);
-				if (admission == null) {
-					// at the limit: closed unread, before any thread is spent on it
+				ConnectionLimits.Entry entry = this.limits.enter(access);
+				if (entry == null) {
+					// past the limit and its overflow: closed unread, before any thread
+					// is spent on it
 					this.close(socket);
 					continue;
 				}
 				try {
 					socket.setTcpNoDelay(true);
-					this.taskExecutor.execute(() -> this.handle(socket, access, admission));
+					switch (entry) {
+						case ConnectionLimits.Admission admission ->
+							this.taskExecutor.execute(() -> this.handle(socket, access, admission));
+						case ConnectionLimits.Overflow overflow ->
+							this.taskExecutor.execute(() -> this.answerOverflow(socket, access, overflow));
+					}
 				}
 				catch (RuntimeException e) {
-					admission.release();
+					entry.release();
 					this.close(socket);
 					throw e;
 				}
@@ -239,14 +247,59 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	}
 
 	/**
+	 * Answers a connection past the connection limit with the busy page -- once its TLS
+	 * handshake (on a route the server terminates) and its head are read, in the protocol
+	 * of the head -- and closes it; everything under the overflow deadline, which closes
+	 * the socket wherever the connection is. A head that is no HTTP request -- a TLS
+	 * passthrough ClientHello (the handshake is the upstream's, nothing the server could
+	 * answer in), a RESP array -- is closed unanswered. The place is released on every
+	 * path.
+	 */
+	private void answerOverflow(Socket socket, AccessLogger.Connection access, ConnectionLimits.Overflow overflow) {
+		try {
+			overflow.start(socket);
+			Connection connection = this.transport(socket, access, overflow);
+			if (connection == null || connection.head().undecodable()) {
+				return;
+			}
+			byte[] response = this.errorResponse.busy(connection.head(), this.limits.overflowRetryAfter());
+			if (response.length == 0) {
+				return;
+			}
+			try {
+				OutputStream out = connection.pipe().sink();
+				out.write(response);
+				out.flush();
+				overflow.answered(connection.head().http2Connection() ? ALPN_H2 : "h1");
+				// unread request bytes would reset the connection and discard the answer
+				this.linger(connection);
+			}
+			finally {
+				this.close(connection.socket());
+			}
+		}
+		catch (Exception e) {
+			log.debug("overflow connection failed: {}", overflow.expired() ? "overflow timeout" : e.toString());
+		}
+		finally {
+			this.close(socket);
+			overflow.release();
+		}
+	}
+
+	/**
 	 * Consumes the PROXY protocol header when enabled, peeks the first byte to detect a
 	 * TLS handshake, terminates TLS when an SSL bundle is configured, routes by SNI in
 	 * passthrough mode otherwise, and parses the connection head for routing. Claims the
 	 * slot of the source address first -- the PROXY protocol source is known only once
-	 * the header is parsed -- and returns null when the address is at its limit.
+	 * the header is parsed -- and returns null when the address is at its limit. A
+	 * connection of the overflow ({@code entry} no {@link ConnectionLimits.Admission})
+	 * claims nothing and is given http/1.1 in ALPN when it offers it.
 	 */
-	private @Nullable Connection transport(Socket socket, AccessLogger.Connection access,
-			ConnectionLimits.Admission admission) throws Exception {
+	private @Nullable Connection transport(Socket socket, AccessLogger.Connection access, ConnectionLimits.Entry entry)
+			throws Exception {
+		ConnectionLimits.@Nullable Admission admission = entry instanceof ConnectionLimits.Admission admitted ? admitted
+				: null;
 		InputStream in = socket.getInputStream();
 		InetAddress peer = null;
 		if (this.properties.proxyProtocol()) {
@@ -261,10 +314,12 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				access.remote(peer.getHostAddress() + ":" + header.sourcePort());
 			}
 		}
-		if (!admission.claim(peer != null ? peer : peerOf(socket))) {
-			return null;
+		if (admission != null) {
+			if (!admission.claim(peer != null ? peer : peerOf(socket))) {
+				return null;
+			}
+			access.accept();
 		}
-		access.accept();
 		int first = in.read();
 		if (first < 0) {
 			return null;
@@ -311,8 +366,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			// h2 still gets h2, and the demux answers its streams 421 instead of
 			// relaying them
 			boolean forceHttp1 = resolved.map(Router.Route::forceHttp1).orElse(false);
-			ssl.setHandshakeApplicationProtocolSelector(
-					(s, protocols) -> selectProtocol(protocols, forceHttp1, admission));
+			ssl.setHandshakeApplicationProtocolSelector((s, protocols) -> admission == null
+					? overflowProtocol(protocols) : selectProtocol(protocols, forceHttp1, admission));
 			ssl.startHandshake();
 			log.debug("tls handshake done; protocol={} sni={}", ssl.getApplicationProtocol(), sni.get());
 			access.transport(ALPN_H2.equals(ssl.getApplicationProtocol()) ? "h2" : "h1");
@@ -356,6 +411,14 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		}
 		admission.declineH2();
 		return ALPN_HTTP_1_1;
+	}
+
+	/**
+	 * The ALPN protocol of an overflow connection, only answered: http/1.1 when offered,
+	 * else h2 when offered, else http/1.1.
+	 */
+	private static String overflowProtocol(List<String> protocols) {
+		return !protocols.contains(ALPN_HTTP_1_1) && protocols.contains(ALPN_H2) ? ALPN_H2 : ALPN_HTTP_1_1;
 	}
 
 	private @Nullable SSLSocketFactory tlsFactory() {
