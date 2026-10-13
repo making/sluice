@@ -1,6 +1,7 @@
 package am.ik.sluice.server.proxy;
 
 import java.io.InputStream;
+import java.time.Duration;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -19,6 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.jspecify.annotations.Nullable;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.core.task.TaskExecutor;
@@ -27,6 +29,7 @@ import org.springframework.stereotype.Component;
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.config.TcpPortRange;
 import am.ik.sluice.server.route.Router;
+import am.ik.sluice.server.tunnel.LogThrottle;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import am.ik.sluice.server.tunnel.TcpRouteListener;
 import am.ik.sluice.server.tunnel.Drainable;
@@ -38,6 +41,7 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
 
 /**
  * Data plane for tcp port routes: one TCP listener per port advertised by a client
@@ -70,6 +74,17 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 
 	private final ConnectionLimits limits;
 
+	/** The period of {@link #portLog}. */
+	static final Duration PORT_LOG_PERIOD = Duration.ofSeconds(10);
+
+	/**
+	 * The port lines (bind, unbind, takeover, rejection, bind failure) per
+	 * {@link #PORT_LOG_PERIOD} logged at info / warn; the others log at debug.
+	 */
+	static final int PORT_LOG_PERMITS = 32;
+
+	private final LogThrottle portLog;
+
 	private final ConcurrentMap<Integer, BoundListener> listeners = new ConcurrentHashMap<>();
 
 	private final ConcurrentMap<Integer, AtomicInteger> activeConnections = new ConcurrentHashMap<>();
@@ -88,9 +103,18 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 
 	private volatile boolean running;
 
+	@Autowired
 	TcpPortGateway(Router router, SessionRegistry sessions, SluiceServerProperties properties,
 			AccessControl accessControl, @Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor,
 			MeterRegistry meterRegistry, AccessLogger accessLogger, ConnectionLimits limits) {
+		this(router, sessions, properties, accessControl, taskExecutor, meterRegistry, accessLogger, limits,
+				new LogThrottle(PORT_LOG_PERIOD, PORT_LOG_PERMITS, System::nanoTime));
+	}
+
+	TcpPortGateway(Router router, SessionRegistry sessions, SluiceServerProperties properties,
+			AccessControl accessControl, TaskExecutor taskExecutor, MeterRegistry meterRegistry,
+			AccessLogger accessLogger, ConnectionLimits limits, LogThrottle portLog) {
+		this.portLog = portLog;
 		this.router = router;
 		this.sessions = sessions;
 		this.properties = properties;
@@ -164,13 +188,13 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 				int port = entry.getKey();
 				this.listeners.remove(port, entry.getValue());
 				entry.getValue().close();
-				log.info("unbound tcp route port {} (client {})", port, clientId);
+				portLog(Level.INFO, "unbound tcp route port {} (client {})", port, clientId);
 			}
 		}
 		Set<Integer> rejected = new TreeSet<>();
 		for (Integer port : listenPorts) {
 			if (!this.tcpPortRange.contains(port)) {
-				log.warn("tcp route port {} is outside tcp-port-range ({}); rejecting for client {}", port,
+				portLog(Level.WARN, "tcp route port {} is outside tcp-port-range ({}); rejecting for client {}", port,
 						this.properties.tcpPortRange(), clientId);
 				rejected.add(port);
 				continue;
@@ -185,13 +209,13 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 				// race the advertise of the reconnected one)
 				if (this.sessions.find(existing.clientId()).isPresent()
 						&& existing.clientId().compareTo(clientId) < 0) {
-					log.warn("tcp route port {} is owned by client {}; rejecting for client {}", port,
+					portLog(Level.WARN, "tcp route port {} is owned by client {}; rejecting for client {}", port,
 							existing.clientId(), clientId);
 					rejected.add(port);
 					continue;
 				}
-				log.info("tcp route port {} taken over from client {} by client {}", port, existing.clientId(),
-						clientId);
+				portLog(Level.INFO, "tcp route port {} taken over from client {} by client {}", port,
+						existing.clientId(), clientId);
 				this.listeners.remove(port, existing);
 				existing.close();
 			}
@@ -200,6 +224,17 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 			}
 		}
 		return Collections.unmodifiableSet(rejected);
+	}
+
+	/**
+	 * Logs one port line at {@code level} while the period's permits last, at debug
+	 * after; the next line let through reports how many were demoted.
+	 */
+	private void portLog(Level level, String format, Object... args) {
+		long unreported = this.portLog.tryAcquire();
+		String note = unreported > 0
+				? " (%d more tcp route port lines logged at debug since the last report)".formatted(unreported) : "";
+		log.atLevel(unreported >= 0 ? level : Level.DEBUG).log(format + note, args);
 	}
 
 	private boolean bind(String clientId, int port) {
@@ -216,14 +251,15 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 					.build();
 				this.listeners.put(port, listener);
 				Thread.ofVirtual().name("sluice-tcp-accept-" + port).start(() -> this.acceptLoop(port, listener));
-				log.info("bound tcp route port {} for client {}", port, clientId);
+				portLog(Level.INFO, "bound tcp route port {} for client {}", port, clientId);
 				return true;
 			}
 			catch (Exception e) {
 				if (attempt >= 2) {
 					// a bind failure must not tear down the session; the port is reported
 					// back
-					log.warn("failed to bind tcp route port {} for client {}: {}", port, clientId, e.toString());
+					portLog(Level.WARN, "failed to bind tcp route port {} for client {}: {}", port, clientId,
+							e.toString());
 					return false;
 				}
 				try {

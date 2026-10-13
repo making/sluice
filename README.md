@@ -785,6 +785,10 @@ each stream all or nothing, and the next stream logged reports how many were dem
 repeating the stream's routes and their outcome logs at debug; one changing them takes one
 of the 32 as well.
 
+The tcp route port lines (bound, unbound, taken over, rejected, failed to bind) are
+bounded the same way, by a throttle of their own: 32 per 10s at info / warn, the others at
+debug, and the next line logged reports how many were demoted.
+
 ## Health / metrics
 
 - server `GET /actuator/health` - liveness, UP while the process lives; details `clients`
