@@ -20,7 +20,8 @@ import io.micrometer.core.instrument.MeterRegistry;
  * the client or of an upstream, the streams answered 421 for a route reached over
  * HTTP/1.1 only, the legs ended by a connection error, the times a relay withheld its
  * connection windows (for want of budget, or past its share), and, for tests, the DATA
- * writes netty holds, the streams the relays track and the legs they hold.
+ * writes netty holds, the streams the relays track, the legs they hold and the reviews
+ * they ran.
  */
 final class H2DemuxMeters {
 
@@ -33,6 +34,9 @@ final class H2DemuxMeters {
 
 	/** Per route, the DATA writes netty holds for the relays; for tests. */
 	private final Map<String, LongAdder> writesHeld = new ConcurrentHashMap<>();
+
+	/** The reviews the relays ran; for tests. */
+	private final LongAdder reviews = new LongAdder();
 
 	private final Counter refusedBudget;
 
@@ -245,6 +249,16 @@ final class H2DemuxMeters {
 	long writesHeld(String routeTag) {
 		LongAdder held = this.writesHeld.get(routeTag);
 		return held == null ? 0 : held.sum();
+	}
+
+	/** Counts a review of a relay's accounts. */
+	void reviewed() {
+		this.reviews.increment();
+	}
+
+	/** The reviews the relays ran; for tests. */
+	long reviews() {
+		return this.reviews.sum();
 	}
 
 	/** The streams of the route the live relays still track; for tests. */

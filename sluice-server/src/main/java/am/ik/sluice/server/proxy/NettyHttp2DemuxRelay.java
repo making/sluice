@@ -1316,6 +1316,7 @@ final class NettyHttp2DemuxRelay {
 		}
 		// watched before the queues are read: a writer emptying its queue after the
 		// reading below runs the review again
+		this.meters.reviewed();
 		watchWritesLocked(true);
 		long queued = queuedLocked();
 		this.queued = queued;

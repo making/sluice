@@ -89,6 +89,17 @@ class H2DemuxConnectionShareE2ETest {
 	/** What a client reading slowly takes at a time. */
 	private static final int GRANT_STEP = 256 * 1024;
 
+	/** How long a relay held at its share is watched for reviews. */
+	private static final Duration IDLE = Duration.ofMillis(500);
+
+	/**
+	 * Reviews an idle relay may still run in {@link #IDLE}: a busy loop runs thousands.
+	 */
+	private static final long MAX_IDLE_REVIEWS = 20;
+
+	/** Times another connection charges the budget and releases it. */
+	private static final int CYCLES = 5;
+
 	private static final int ENHANCE_YOUR_CALM = 0xb;
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(10);
@@ -191,6 +202,70 @@ class H2DemuxConnectionShareE2ETest {
 				gate.countDown();
 				held.awaitEnds();
 			}
+		}
+		finally {
+			gate.countDown();
+		}
+		awaitReleased(heldRoute);
+		awaitReleased(otherRoute);
+	}
+
+	/**
+	 * A connection held at its share does not register as a budget waiter: while another
+	 * connection charges the budget and releases it again, over and over, the held
+	 * connection is not reviewed again on each release -- it would find itself still past
+	 * its share and wait again, a busy loop of reviews while the budget has room. It is
+	 * reviewed as its own hops drain.
+	 */
+	@Test
+	void aConnectionHeldAtItsShareIsNotReviewedOnTheBudgetReleasesOfOthers() throws Exception {
+		String heldRoute = "share.idle.test";
+		String otherRoute = "share.cycle.test";
+		CountDownLatch gate = new CountDownLatch(1);
+		startClient(heldRoute, stub(socket -> serveGated(socket, gate, STREAMS, 0)));
+		AtomicReference<CountDownLatch> otherGate = new AtomicReference<>();
+		startClient(otherRoute, stub(socket -> holdRequestsUntil(socket, otherGate.get())));
+		H2DemuxBudget budget = Objects.requireNonNull(this.limits).h2Budget();
+		H2DemuxMeters meters = Objects.requireNonNull(this.dataProxyServer).h2DemuxMeters();
+		try (Pump held = pump(heldRoute, 0, STREAMS)) {
+			held.awaitWithheld();
+			awaitStable(() -> queuedBytes(heldRoute));
+			long heldUsed = budgetUsed();
+			assertThat(withheld("share")).as("held at its share").isPositive();
+			assertThat(heldUsed).as("the budget has room").isLessThan(BUDGET);
+			assertThat(budget.waiting()).as("the held connection waits for no room").isZero();
+			long idleBefore = meters.reviews();
+			Thread.sleep(IDLE.toMillis());
+			long idle = meters.reviews() - idleBefore;
+			assertThat(idle).as("reviews of a relay held at its share, nothing else going on")
+				.isLessThanOrEqualTo(MAX_IDLE_REVIEWS);
+			for (int cycle = 0; cycle < CYCLES; cycle++) {
+				long used = budgetUsed();
+				CountDownLatch release = new CountDownLatch(1);
+				otherGate.set(release);
+				try (Pump other = pump(otherRoute, 0, 2, OTHER_BODY)) {
+					other.awaitSent();
+					Awaitility.await()
+						.atMost(TIMEOUT)
+						.untilAsserted(() -> assertThat(budgetUsed()).as("the other connection charged the budget")
+							.isGreaterThan(used));
+					release.countDown();
+					Awaitility.await()
+						.atMost(TIMEOUT)
+						.untilAsserted(
+								() -> assertThat(budgetUsed()).as("the other connection released").isEqualTo(used));
+					assertThat(budget.waiting()).as("still no waiter").isZero();
+				}
+				finally {
+					release.countDown();
+				}
+			}
+			long afterBefore = meters.reviews();
+			Thread.sleep(IDLE.toMillis());
+			long after = meters.reviews() - afterBefore;
+			assertThat(after).as("reviews of the relay once the others released").isLessThanOrEqualTo(MAX_IDLE_REVIEWS);
+			gate.countDown();
+			held.awaitEnds();
 		}
 		finally {
 			gate.countDown();
@@ -633,6 +708,42 @@ class H2DemuxConnectionShareE2ETest {
 							// the relay went away
 						}
 					});
+				}
+			}
+		}
+		catch (IOException e) {
+			// connection ended
+		}
+	}
+
+	/**
+	 * Holds every request body, a stream window of 0, until the gate opens; then grants
+	 * the connection and every stream a window for the bodies and reads it.
+	 */
+	private static void holdRequestsUntil(Socket socket, CountDownLatch gate) {
+		try (socket) {
+			WindowedH2Upstream upstream = WindowedH2Upstream.accept(socket);
+			if (upstream == null) {
+				return;
+			}
+			upstream.settings(0);
+			List<Integer> streams = new CopyOnWriteArrayList<>();
+			Thread.ofVirtual().name("e2e-share-release").start(() -> {
+				try {
+					gate.await();
+					upstream.grant(0, streams.size() * OTHER_BODY);
+					for (int id : streams) {
+						upstream.grant(id, OTHER_BODY);
+					}
+				}
+				catch (IOException | InterruptedException e) {
+					// connection ended
+				}
+			});
+			TestH2.@Nullable Frame frame;
+			while ((frame = upstream.next()) != null) {
+				if (frame.type() == TestH2.HEADERS) {
+					streams.add(frame.streamId());
 				}
 			}
 		}
