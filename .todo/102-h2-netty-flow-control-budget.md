@@ -52,3 +52,15 @@ Step 5 of the netty h2 demux migration (context and user decisions: 098). Depend
   of the closed leg's inbound buffer) waits in the client's flow controller until the
   client grants (`NettyH2DemuxRelayE2ETest#aResponseTheUpstreamCompletedOutlivesItsConnectionError`).
   The budget must count those bytes though their leg is gone.
+
+## Notes from 101 (concurrency waiting, 2026-10-13)
+
+- A waiting stream's head and DATA sit in the leg's `StreamBufferingEncoder` as retained
+  slices of the client hop's inbound buffer, unconsumed (no window granted back), so up to
+  the relay's initial stream window (65535) per waiting stream, times up to 100 streams per
+  connection. They are outside any accounting today: `refuseWaiting` must count them and
+  drop the most recent (`dropWaitingLocked`: `writeRstStream` on a buffered stream removes
+  it, completes its frames' promises, releases its DATA, writes nothing), counted as
+  `reason=waiting`. `Exchange#waiting` tells which streams wait.
+- `H2DemuxUpstreamStreamLimitE2ETest` runs on netty with its queued-bytes assertions kept
+  legacy only (`queuedBytesGauged()`); put them on netty with the budget's queued bytes.

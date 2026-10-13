@@ -48,3 +48,13 @@ Step 8 of the netty h2 demux migration (context and user decisions: 098). Depend
   `#upstreamIgnoringTheGoAwayIsClosedAfterTheGrace` (the legacy close grace),
   `#clientGoneWhileTheLegFailsReleasesEverything` (`WriteSeam`). Remove them with the
   legacy relay.
+
+## Notes from 101 (concurrency waiting, 2026-10-13)
+
+- netty's client endpoint rejects a server whose first frame is not a SETTINGS without the
+  ack flag. `WindowedH2Upstream` now holds its ack of the relay's SETTINGS until it wrote
+  its own SETTINGS (its preface); a test peer writing the ack first (a raw stub) breaks the
+  netty leg at once (`PROTOCOL_ERROR`; seen, not pinned by a test: the route's next stream
+  then opened a new leg).
+- README: the netty waiting paragraph says no more than the tests show (refusal at the wait
+  deadline, the buffer left on a client reset or the leg's end); fold it into this pass.

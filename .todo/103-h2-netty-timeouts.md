@@ -54,3 +54,12 @@ Step 6 of the netty h2 demux migration (context and user decisions: 098). Depend
   finishes holds the leg until then; the stall timeout should bound it.
 - A relay-answered page (`502`, `503`, `403`) waiting for a client window of 0 keeps the
   client stream and its exchange with no deadline.
+
+## Notes from 101 (concurrency waiting, 2026-10-13)
+
+- `H2DemuxUpstreamStreamLimitE2ETest#halfClosedClientGetsTheResponseOfItsWaitingStream` is
+  `@LegacyOnly` naming the half-close drain (the client's EOF ends the netty relay at once).
+- The legacy stall timeout counts a waiting stream only while its client holds window to
+  send its request (`requestDueLocked`); `Exchange#waiting` gives the netty engine the same
+  test. The wait deadline (`sluice.limits.h2-stream-wait-timeout`) is a client-hop timer
+  (`waitLocked`), cancelled when the stream opens, leaves the buffer or is reset.

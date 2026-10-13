@@ -46,3 +46,8 @@ Step 7 of the netty h2 demux migration (context and user decisions: 098). Depend
   resets on a stream error closes with `isResetSent()` and no reset read from the peer.
 - The `legLocked` catch (the leg did not open: `REFUSED_STREAM`) has no test; leg slots
   (`ConnectionLimits#tryAcquireLeg`) refusing a leg take that path, so test it there.
+
+## Notes from 101 (concurrency waiting, 2026-10-13)
+
+- `sluice.h2demux.streams.refused{reason=wait-timeout}` is counted on the netty engine
+  already (`H2DemuxMeters#refusedForWaitTimeout`, asserted in `NettyH2DemuxRelayE2ETest`).

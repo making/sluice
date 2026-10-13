@@ -21,3 +21,10 @@ Last step of the netty h2 demux migration (context and user decisions: 098). Dep
   `H2DemuxConnectE2ETest#anUndecodableLaterHeadEndsTheConnectionWithACompressionError`),
   `H2DemuxEngineE2ETest`, the `DataProxyServer#h2DemuxEngine` seam, and the `engine` tag of
   `sluice_h2demux_connections_total` (or the meter).
+
+## Notes from 101 (concurrency waiting, 2026-10-13)
+
+- Drop "netty engine only" / "the legacy engine has no such deadline" for
+  `sluice.limits.h2-stream-wait-timeout` (README table and "Connection limits",
+  `application.properties`, the `Limits` javadoc) and `queuedBytesGauged()` in
+  `H2DemuxUpstreamStreamLimitE2ETest`.
