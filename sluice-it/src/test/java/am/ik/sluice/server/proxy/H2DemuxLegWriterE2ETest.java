@@ -219,8 +219,9 @@ class H2DemuxLegWriterE2ETest {
 	}
 
 	/**
-	 * Opens {@code #BULK_STREAMS} streams on the route, whose upstream grants each 1MiB
-	 * and stops reading, and fills them until the relay path saturates.
+	 * Opens {@code #BULK_STREAMS} streams on the route, whose upstream grants each all
+	 * the window there is and stops reading, and fills them until the relay path
+	 * saturates.
 	 */
 	private void fillStalledLeg(H2TestClient client, String route) throws Exception {
 		for (int i = 0; i < BULK_STREAMS; i++) {
@@ -234,8 +235,10 @@ class H2DemuxLegWriterE2ETest {
 	}
 
 	/**
-	 * Grants the connection and each of the first {@code #BULK_STREAMS} streams 1MiB as
-	 * their HEADERS arrive, then stops reading.
+	 * Grants the connection and each of the first {@code #BULK_STREAMS} streams all the
+	 * window there is as their HEADERS arrive, then stops reading: what the relay holds
+	 * for the leg waits for the tunnel, not for a stream window, however much the tunnel
+	 * and the sockets absorb before the relay withholds its client's window at its share.
 	 */
 	private static void grantThenStall(InputStream in, OutputStream out) throws IOException {
 		if (in.readNBytes(TestH2.PREFACE.length).length < TestH2.PREFACE.length) {
@@ -247,7 +250,8 @@ class H2DemuxLegWriterE2ETest {
 		TestH2.@Nullable Frame frame;
 		while (seen < BULK_STREAMS && (frame = TestH2.readFrame(in)) != null) {
 			if (frame.type() == TestH2.HEADERS) {
-				TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, frame.streamId(), TestH2.int32(1024 * 1024));
+				TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, frame.streamId(),
+						TestH2.int32(Integer.MAX_VALUE - 65535));
 				seen++;
 			}
 		}

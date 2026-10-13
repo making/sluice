@@ -166,8 +166,11 @@ class H2DemuxConnectionShareE2ETest {
 			long heldQueued = awaitStable(() -> queuedBytes(heldRoute));
 			assertThat(budgetUsed()).as("the budget has room").isLessThan(BUDGET);
 			assertThat(held.client().connectionWindow()).as("its window withheld").isZero();
-			assertThat(withheld("share")).as("withheld for its share").isEqualTo(shareBefore + 1);
+			// once at least: what the tunnel absorbs after the windows were withheld may
+			// take the connection below its share again
+			assertThat(withheld("share")).as("withheld for its share").isGreaterThan(shareBefore);
 			assertThat(withheld("budget")).as("not for the budget").isEqualTo(budgetBefore);
+			double shareHeld = withheld("share");
 			assertThat(heldQueued).as("held: its allowance and share, plus what its client still sent")
 				.isGreaterThanOrEqualTo(
 						NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE + NettyHttp2DemuxRelay.CONNECTION_SHARE)
@@ -183,7 +186,7 @@ class H2DemuxConnectionShareE2ETest {
 					.isGreaterThanOrEqualTo(2L * (OTHER_BODY - WindowedH2Upstream.DEFAULT_WINDOW))
 					.isLessThan(NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE + NettyHttp2DemuxRelay.CONNECTION_SHARE);
 				assertThat(budgetUsed()).as("the budget still has room").isLessThan(BUDGET);
-				assertThat(withheld("share")).as("the other connection kept its windows").isEqualTo(shareBefore + 1);
+				assertThat(withheld("share")).as("the other connection kept its windows").isEqualTo(shareHeld);
 				assertThat(withheld("budget")).isEqualTo(budgetBefore);
 				gate.countDown();
 				held.awaitEnds();
@@ -229,7 +232,7 @@ class H2DemuxConnectionShareE2ETest {
 			assertThat(client.dataReceived()).as("the client got its connection window only")
 				.isEqualTo(WindowedH2Upstream.DEFAULT_WINDOW);
 			assertThat(budgetUsed()).as("the budget has room").isLessThan(BUDGET);
-			assertThat(withheld("share")).as("withheld for its share").isEqualTo(shareBefore + 1);
+			assertThat(withheld("share")).as("withheld for its share").isGreaterThan(shareBefore);
 			assertThat(held).as("held: its allowance and share, plus what the upstream connection still sent")
 				.isGreaterThanOrEqualTo(
 						NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE + NettyHttp2DemuxRelay.CONNECTION_SHARE)
