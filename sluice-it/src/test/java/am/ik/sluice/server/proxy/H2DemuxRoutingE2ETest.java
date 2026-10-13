@@ -82,6 +82,9 @@ class H2DemuxRoutingE2ETest {
 	/** The connections the GOAWAY upstream accepted. */
 	private static final AtomicInteger GOAWAY_CONNECTIONS = new AtomicInteger();
 
+	/** The connections each named upstream accepted. */
+	private static final Map<String, AtomicInteger> CONNECTIONS = new ConcurrentHashMap<>();
+
 	private static final Duration TIMEOUT = Duration.ofSeconds(10);
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
@@ -155,9 +158,14 @@ class H2DemuxRoutingE2ETest {
 		assertThat(answered).containsExactlyInAnyOrder("a", "b");
 	}
 
-	/** Streams keep their ids on the leg of their route, each leg a subsequence. */
+	/**
+	 * Streams keep their ids on the leg of their route, each leg a subsequence; one leg
+	 * per route.
+	 */
 	@Test
 	void streamsKeepTheirIdsOnTheirLegs() throws Exception {
+		int first = connections("first");
+		int second = connections("second");
 		try (H2TestClient h2 = H2TestClient.connect(dataPort, 1, 3, 5, 7)) {
 			h2.headers(1, true, get(FIRST_HOST, "/ids-1"));
 			h2.headers(3, true, get(SECOND_HOST, "/ids-3"));
@@ -171,6 +179,13 @@ class H2DemuxRoutingE2ETest {
 		}
 		assertThat(pathsOf("first")).containsEntry(1, "/ids-1").containsEntry(7, "/ids-7");
 		assertThat(pathsOf("second")).containsEntry(3, "/ids-3").containsEntry(5, "/ids-5");
+		assertThat(connections("first") - first).as("legs of the first route").isEqualTo(1);
+		assertThat(connections("second") - second).as("legs of the second route").isEqualTo(1);
+	}
+
+	private static int connections(String upstream) {
+		AtomicInteger count = CONNECTIONS.get(upstream);
+		return count == null ? 0 : count.get();
 	}
 
 	/**
@@ -315,6 +330,7 @@ class H2DemuxRoutingE2ETest {
 				if (upstream == null) {
 					return;
 				}
+				CONNECTIONS.computeIfAbsent(name, key -> new AtomicInteger()).incrementAndGet();
 				upstream.settings(null);
 				DefaultHttp2HeadersDecoder decoder = new DefaultHttp2HeadersDecoder(true, 256 * 1024);
 				ByteArrayOutputStream block = new ByteArrayOutputStream();
