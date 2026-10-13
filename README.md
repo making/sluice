@@ -559,7 +559,10 @@ connection is closed once the client closed it, at the deadline at the latest. C
 unanswered instead: a connection the deadline reaches first, one whose handshake fails or
 whose client goes away (its place freed at once), a TLS passthrough connection (the
 handshake is the upstream's, nothing the server could answer in) and a head that is no
-HTTP request. Past the overflow, a connection is closed at accept as before, and tcp
+HTTP request, an h2 head that cannot be decoded included. With `sluice.proxy-protocol=true`
+the PROXY header (v1 or v2) comes first on an overflow connection too: the answer follows
+it, its access log reject line carries the PROXY source address, and a malformed header
+closes the connection unanswered. Past the overflow, a connection is closed at accept as before, and tcp
 route ports have no overflow. An overflow connection holds no slot and no virtual
 connection; the derived connection memory leaves 256KiB for each, its ClientHello and its
 head each read into a buffer of up to 128KiB (the TLS engine's records are not counted).

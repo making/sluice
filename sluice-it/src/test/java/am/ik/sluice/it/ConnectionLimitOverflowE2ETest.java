@@ -319,6 +319,29 @@ class ConnectionLimitOverflowE2ETest {
 	}
 
 	@Test
+	void anH2HeadThatCannotBeDecodedIsClosedUnanswered() throws Exception {
+		try (Socket held = holdTheLimit()) {
+			double rejected = rejected();
+			double answered = answered("h1") + answered("h2");
+			try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+				socket.setSoTimeout((int) WITHIN.toMillis());
+				OutputStream out = socket.getOutputStream();
+				out.write(TestH2.PREFACE);
+				TestH2.writeFrame(out, TestH2.SETTINGS, 0x0, 0, NONE);
+				// an HPACK indexed field far past the static table, no dynamic entry
+				TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 3,
+						new byte[] { (byte) 0xff, (byte) 0xff, (byte) 0xff, 0x7f });
+				// closed without a byte: no answer, not even a GOAWAY
+				assertThat(TestSockets.awaitClosed(socket, WITHIN)).isLessThan(AT_ONCE);
+			}
+			assertThat(rejected()).isEqualTo(rejected + 1);
+			awaitOverflow(0);
+			assertThat(answered("h1") + answered("h2")).isEqualTo(answered);
+			assertThat(answeredLines()).isEmpty();
+		}
+	}
+
+	@Test
 	void aClientGoneBeforeItsAnswerFreesItsPlaceAtOnce() throws Exception {
 		try (Socket held = holdTheLimit()) {
 			// gone before its first byte

@@ -406,7 +406,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Connections and further h2 demux legs holding a slot of the connection limit, and the limit.",
+      "description": "Connections and further h2 demux legs holding a slot of the connection limit, and the limit; and the places of the overflow taken by connections past the limit being answered 503.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -463,6 +463,17 @@
           "legendFormat": "{{pod}} limit",
           "range": true,
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (pod) (sluice_data_connections_overflow{app=~\"$app\", cluster=~\"$cluster\", instance=~\"$instance\", namespace=~\"$namespace\", pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} overflow places",
+          "range": true,
+          "refId": "C"
         }
       ],
       "title": "Data plane connections",
@@ -480,7 +491,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Connections closed by a connection limit (`limit` / `address-limit`) or the head deadline (`head-timeout`). Events per $__rate_interval (increase of the counter).",
+      "description": "Connections closed by a connection limit (`limit` / `address-limit` / `h2-limit`) or the head deadline (`head-timeout`). Events per $__rate_interval (increase of the counter). Those past `limit` that were answered 503 are also counted in the answered panel.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -622,6 +633,79 @@
       "id": 10
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Connections past the connection limit answered with a 503 (`h1` / `h2`), and TLS connections offering h2 given HTTP/1.1 because the bytes an h2 relay reserves did not fit. Events per $__rate_interval (increase of the counter).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (protocol) (increase(sluice_data_connections_overflow_answered_total{app=~\"$app\", cluster=~\"$cluster\", instance=~\"$instance\", namespace=~\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "overflow answered {{protocol}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum (increase(sluice_data_connections_h2_declined_total{app=~\"$app\", cluster=~\"$cluster\", instance=~\"$instance\", namespace=~\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "h2 declined",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Data plane connections answered 503 / h2 declined",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 26
+      },
+      "id": 25
+    },
+    {
       "collapsed": false,
       "panels": [],
       "title": "h2 demux (server)",
@@ -630,7 +714,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 26
+        "y": 34
       },
       "id": 11
     },
@@ -692,7 +776,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 27
+        "y": 35
       },
       "id": 12
     },
@@ -765,7 +849,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 27
+        "y": 35
       },
       "id": 13
     },
@@ -849,7 +933,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 27
+        "y": 35
       },
       "id": 14
     },
@@ -911,7 +995,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 35
+        "y": 43
       },
       "id": 15
     },
@@ -973,7 +1057,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 35
+        "y": 43
       },
       "id": 16
     },
@@ -986,7 +1070,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 43
+        "y": 51
       },
       "id": 17
     },
@@ -1071,7 +1155,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 44
+        "y": 52
       },
       "id": 18
     },
@@ -1144,7 +1228,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 44
+        "y": 52
       },
       "id": 19
     },
@@ -1157,7 +1241,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 52
+        "y": 60
       },
       "id": 20
     },
@@ -1241,7 +1325,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 53
+        "y": 61
       },
       "id": 21
     },
@@ -1314,7 +1398,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 53
+        "y": 61
       },
       "id": 22
     },
@@ -1388,7 +1472,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 53
+        "y": 61
       },
       "id": 23
     },
@@ -1461,7 +1545,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 53
+        "y": 61
       },
       "id": 24
     }
