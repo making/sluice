@@ -31,16 +31,19 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.junit.jupiter.params.Parameter;
+import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
-import am.ik.sluice.server.proxy.DataProxyServer;
 import am.ik.sluice.server.proxy.H2EngineTest;
 import am.ik.sluice.server.proxy.LegacyOnly;
 import am.ik.sluice.server.tunnel.SessionRegistry;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import org.springframework.beans.factory.annotation.Autowired;
@@ -87,6 +90,8 @@ class TlsDataPlaneE2ETest {
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
+	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ListAppender<>();
+
 	private static java.net.InetSocketAddress h1UpstreamAddress;
 
 	private static HttpServer h1Upstream;
@@ -95,6 +100,8 @@ class TlsDataPlaneE2ETest {
 
 	@BeforeAll
 	static void startUpstreams() throws Exception {
+		ACCESS_EVENTS.start();
+		((Logger) LoggerFactory.getLogger("sluice.access")).addAppender(ACCESS_EVENTS);
 		// stub h2 upstream: see H2cDataPlaneE2ETest
 		h2Upstream = new ServerSocket();
 		h2Upstream.bind(new InetSocketAddress("127.0.0.1", 0));
@@ -139,6 +146,7 @@ class TlsDataPlaneE2ETest {
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.token", () -> "it-token");
+		registry.add("sluice.access-log.rate-limit.enabled", () -> "false");
 		registry.add("server.port", () -> String.valueOf(TestPorts.freePort()));
 		registry.add("spring.ssl.bundle.jks.data-plane.keystore.location",
 				() -> "file:" + requireNonNull(keystorePath).toAbsolutePath());
@@ -180,10 +188,6 @@ class TlsDataPlaneE2ETest {
 	@Autowired
 	SessionRegistry sessions;
 
-	@Nullable
-	@Autowired
-	private DataProxyServer dataProxyServer;
-
 	@AfterAll
 	void tearDown() {
 		if (this.tlsClient != null) {
@@ -199,6 +203,7 @@ class TlsDataPlaneE2ETest {
 			h1Upstream.stop(0);
 		}
 		UPSTREAM_EXECUTOR.shutdown();
+		((Logger) LoggerFactory.getLogger("sluice.access")).detachAppender(ACCESS_EVENTS);
 	}
 
 	private void startClient() {
@@ -242,19 +247,32 @@ class TlsDataPlaneE2ETest {
 	@Test
 	void aTlsH2RelayEndsOnceTheClientClosed() throws Exception {
 		this.startClient();
-		DataProxyServer proxy = requireNonNull(this.dataProxyServer);
-		int before = proxy.activeConnections();
+		// the connections of the other tests' pooled clients stay open: told apart by
+		// path
+		String path = "/close-" + this.engine;
+		String id;
 		try (H2TestClient h2 = H2TestClient.over(tls("tls.local", "h2"), 1)) {
 			h2.headers(1, true,
-					TestH2.headerBlock(":authority=tls.local", ":method=GET", ":scheme=https", ":path=/close"));
+					TestH2.headerBlock(":authority=tls.local", ":method=GET", ":scheme=https", ":path=" + path));
 			assertThat(h2.awaitEnd(1, Duration.ofSeconds(10))).as("answered").isTrue();
 			assertThat(TestH2.bodyOf(h2.frames(1))).isEqualTo(H2_BODY);
-			assertThat(proxy.activeConnections()).isEqualTo(before + 1);
+			String request = accessLines().stream()
+				.filter(line -> line.startsWith("type=req ") && line.contains(" path=" + path + " "))
+				.findFirst()
+				.orElseThrow(() -> new AssertionError("no request line of " + path));
+			int start = request.indexOf(" id=") + " id=".length();
+			id = request.substring(start, request.indexOf(' ', start));
+			assertThat(accessLines()).as("open while the client is")
+				.noneMatch(line -> line.startsWith("type=conn id=" + id + " event=close "));
 		}
-		// pooled connections of the other tests may end meanwhile, never begin
 		Awaitility.await("the relay ended")
 			.atMost(Duration.ofSeconds(5))
-			.until(() -> proxy.activeConnections() <= before);
+			.until(() -> accessLines().stream()
+				.anyMatch(line -> line.startsWith("type=conn id=" + id + " event=close ")));
+	}
+
+	private static List<String> accessLines() {
+		return List.copyOf(ACCESS_EVENTS.list).stream().map(ILoggingEvent::getFormattedMessage).toList();
 	}
 
 	private static SSLSocket tls(String sni, String... protocols) throws Exception {
