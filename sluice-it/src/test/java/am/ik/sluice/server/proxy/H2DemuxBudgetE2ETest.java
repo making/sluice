@@ -145,6 +145,10 @@ class H2DemuxBudgetE2ETest {
 
 	private static final Set<Integer> DIAG_PORTS = ConcurrentHashMap.newKeySet();
 
+	private static final Map<Integer, AtomicLong> DIAG_PREGATE = new ConcurrentHashMap<>();
+
+	private static final Map<Integer, AtomicLong> DIAG_HEADS_AT = new ConcurrentHashMap<>();
+
 	private final Set<String> diagRoutes = ConcurrentHashMap.newKeySet();
 
 	private volatile @Nullable Thread diagThread;
@@ -153,6 +157,8 @@ class H2DemuxBudgetE2ETest {
 	void diagStart(org.junit.jupiter.api.TestInfo info) {
 		String name = info.getTestMethod().map(java.lang.reflect.Method::getName).orElse("?");
 		DIAG_STALLED.clear();
+		DIAG_PREGATE.clear();
+		DIAG_HEADS_AT.clear();
 		this.diagRoutes.clear();
 		System.out.println("DIAG sysctl " + diagRead("/proc/sys/net/ipv4/tcp_rmem") + " | "
 				+ diagRead("/proc/sys/net/ipv4/tcp_wmem") + " | rmem_max " + diagRead("/proc/sys/net/core/rmem_max")
@@ -189,7 +195,22 @@ class H2DemuxBudgetE2ETest {
 					.append(withheld("share"));
 				for (String route : this.diagRoutes) {
 					line.append(" q[").append(route).append("]=").append(queuedBytes(route));
+					for (Counter counter : Objects.requireNonNull(this.meterRegistry)
+						.find("sluice.tunnel.bytes")
+						.tag("route", route)
+						.counters()) {
+						line.append(" tun[")
+							.append(counter.getId().getTag("direction"))
+							.append("]=")
+							.append(Math.round(counter.count()));
+					}
 				}
+				DIAG_PREGATE.forEach((port, bytes) -> line.append(" pre[")
+					.append(port)
+					.append("]=")
+					.append(bytes.get())
+					.append("/heads-done-at=")
+					.append(DIAG_HEADS_AT.getOrDefault(port, new AtomicLong(-1)).get()));
 				int i = 0;
 				for (Stalled stalled : DIAG_STALLED) {
 					line.append(" p")
@@ -774,8 +795,14 @@ class H2DemuxBudgetE2ETest {
 			TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(Integer.MAX_VALUE - 65535));
 			int seen = 0;
 			TestH2.@Nullable Frame frame;
+			AtomicLong pre = new AtomicLong();
+			DIAG_PREGATE.put(socket.getPort(), pre);
 			while (gate.getCount() > 0 && seen < STREAMS && (frame = TestH2.readFrame(in)) != null) {
+				pre.addAndGet(9 + frame.payload().length);
 				if (frame.type() == TestH2.HEADERS) {
+					if (seen == STREAMS - 1) {
+						DIAG_HEADS_AT.put(socket.getPort(), new AtomicLong(pre.get()));
+					}
 					heads.incrementAndGet();
 					seen++;
 					TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, frame.streamId(),
