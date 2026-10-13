@@ -76,18 +76,6 @@ class SluiceServerPropertiesTest {
 	}
 
 	@Test
-	void h2DemuxEngineDefaultsToLegacy() {
-		SluiceServerProperties properties = bind(Map.of("sluice.data-port", "8000"));
-		assertThat(properties.h2DemuxEngine()).isEqualTo(SluiceServerProperties.H2DemuxEngine.LEGACY);
-	}
-
-	@Test
-	void h2DemuxEngineIsBoundInKebabCase() {
-		SluiceServerProperties properties = bind(Map.of("sluice.h2-demux-engine", "netty"));
-		assertThat(properties.h2DemuxEngine()).isEqualTo(SluiceServerProperties.H2DemuxEngine.NETTY);
-	}
-
-	@Test
 	void limitsDefaultToDerivedConnectionLimitsATenSecondHeadDeadlineAndAMinuteOfIdleAndOfStall() {
 		SluiceServerProperties properties = bind(Map.of("sluice.data-port", "8000"));
 		assertThat(properties.limits().maxConnections()).isZero();

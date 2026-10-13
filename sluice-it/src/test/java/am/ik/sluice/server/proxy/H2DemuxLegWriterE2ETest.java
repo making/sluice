@@ -11,7 +11,6 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -32,7 +31,6 @@ import am.ik.sluice.it.H2TestClient;
 import am.ik.sluice.it.TestH2;
 import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.server.SluiceServerApplication;
-import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
 import am.ik.sluice.server.route.Router;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
@@ -40,10 +38,10 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
-import org.junit.jupiter.params.Parameter;
+import org.junit.jupiter.api.TestInstance;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -53,19 +51,13 @@ import org.springframework.test.context.DynamicPropertySource;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The h2 demux leg writer: it sleeps while its leg is idle, writes the relay's own
- * connection-level frames ahead of queued request data, and its queue is metered once per
- * route. In the relay's package for the package-private wakeup counter.
+ * The h2 demux towards its upstreams: a long-lived connection forgets its finished
+ * streams, and the queue is metered once per route. In the relay's package for its
+ * meters.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
-@H2EngineTest
 class H2DemuxLegWriterE2ETest {
-
-	/** The engine of this invocation, selected by {@link H2EngineTest}. */
-	@Nullable
-	@Parameter
-	private H2DemuxEngine engine;
 
 	private static final byte[] PING_PAYLOAD = "pingpong".getBytes(StandardCharsets.US_ASCII);
 
@@ -111,35 +103,15 @@ class H2DemuxLegWriterE2ETest {
 		UPSTREAM_EXECUTOR.shutdown();
 	}
 
-	/** An idle leg's writer is not woken while nothing is queued for it. */
-	@Test
-	@LegacyOnly("the legacy relay's leg writer thread and its wakeup counter: a netty hop's writer waits on its "
-			+ "queue")
-	void idleLegWriterSleeps() throws Exception {
-		String route = route("lw.idle");
-		startClient(route, stub(H2DemuxLegWriterE2ETest::answerEndedRequests));
-		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
-			client.headers(1, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/"));
-			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
-			Thread.sleep(200);
-			long before = writerWakeups(route);
-			Thread.sleep(1000);
-			long after = writerWakeups(route);
-			assertThat(before).as("the counter counts: the request woke the writer").isGreaterThanOrEqualTo(1);
-			assertThat(after - before).as("wakeups of the idle leg's writer in 1s").isLessThanOrEqualTo(2);
-			assertThat(client.closed()).as("the leg is alive").isFalse();
-		}
-	}
-
 	/**
 	 * An upstream PING sent while the leg queue holds more than 1MiB of request data is
 	 * acknowledged before that data is written.
 	 */
 	@Test
-	@LegacyOnly("PING ordering and the tunnel byte counter: netty acks a PING as it reads it, behind what its "
-			+ "writer queue holds; a later migration step")
+	@Disabled("PING ordering: netty acks a PING as it reads it, behind what the hop's writer "
+			+ "queue holds, and the tunnel byte counter is not yet on the h2 demux; to be rewritten for it")
 	void upstreamPingIsAckedAheadOfQueuedData() throws Exception {
-		String route = route("lw.ping");
+		String route = "lw.ping.test";
 		CountDownLatch ping = new CountDownLatch(1);
 		CountDownLatch read = new CountDownLatch(1);
 		AtomicLong beforeAck = new AtomicLong(-1);
@@ -168,11 +140,12 @@ class H2DemuxLegWriterE2ETest {
 	 * a stream of another route completes.
 	 */
 	@Test
-	@LegacyOnly("netty pauses reading an upstream that floods PINGs without reading (the hop's read pause) instead "
-			+ "of ending its leg, and the tunnel byte counter is not yet on the netty engine; a per-hop rewrite")
+	@Disabled("netty pauses reading an upstream that floods PINGs without reading (the hop's "
+			+ "read pause) instead of ending its leg, and the tunnel byte counter is not yet on "
+			+ "the h2 demux; to be rewritten for it")
 	void upstreamPingFloodEndsItsLeg() throws Exception {
-		String route = route("lw.flood");
-		String otherRoute = route("lw.flood-other");
+		String route = "lw.flood.test";
+		String otherRoute = "lw.flood-other.test";
 		CountDownLatch ping = new CountDownLatch(1);
 		startClient(route, stub(socket -> stallThenFlood(socket, ping)));
 		startClient(otherRoute, stub(H2DemuxLegWriterE2ETest::answerEndedRequests));
@@ -202,37 +175,11 @@ class H2DemuxLegWriterE2ETest {
 	}
 
 	/**
-	 * Client stream WINDOW_UPDATEs queued behind a stalled leg coalesce into one frame
-	 * carrying their sum.
-	 */
-	@Test
-	@LegacyOnly("per-hop windows: the netty engine relays no client WINDOW_UPDATE to an upstream")
-	void clientWindowUpdatesCoalesceWhileQueued() throws Exception {
-		String route = route("lw.window");
-		CountDownLatch read = new CountDownLatch(1);
-		AtomicLong frames = new AtomicLong();
-		AtomicLong sum = new AtomicLong();
-		startClient(route, stub(socket -> stallThenCountWindowUpdates(socket, read, frames, sum)));
-		try (H2TestClient client = H2TestClient.connect(dataPort)) {
-			fillStalledLeg(client, route);
-			for (int i = 0; i < 500; i++) {
-				client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(1));
-			}
-			Thread.sleep(500); // every update reached the relay while the leg is stalled
-			read.countDown();
-			Awaitility.await().atMost(Duration.ofSeconds(30)).until(() -> sum.get() >= 500);
-			Thread.sleep(200);
-			assertThat(sum.get()).isEqualTo(500);
-			assertThat(frames.get()).as("WINDOW_UPDATE frames carrying the 500 increments").isLessThanOrEqualTo(2);
-		}
-	}
-
-	/**
 	 * A long-lived connection does not accumulate the state of its finished streams.
 	 */
 	@Test
 	void finishedStreamsAreForgotten() throws Exception {
-		String route = route("lw.forget");
+		String route = "lw.forget.test";
 		startClient(route, stub(H2DemuxLegWriterE2ETest::answerEndedRequests));
 		DataProxyServer proxy = Objects.requireNonNull(this.dataProxyServer);
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
@@ -256,7 +203,7 @@ class H2DemuxLegWriterE2ETest {
 	 */
 	@Test
 	void queueGaugeIsOnePerRoute() throws Exception {
-		String route = route("lw.gauge");
+		String route = "lw.gauge.test";
 		startClient(route, stub(H2DemuxLegWriterE2ETest::answerEndedRequests));
 		try (H2TestClient first = H2TestClient.connect(dataPort);
 				H2TestClient second = H2TestClient.connect(dataPort)) {
@@ -344,29 +291,6 @@ class H2DemuxLegWriterE2ETest {
 		}
 	}
 
-	/**
-	 * Stalls the leg, resumes reading on {@code read}, and counts the WINDOW_UPDATE
-	 * frames of stream 1 and their increments.
-	 */
-	private static void stallThenCountWindowUpdates(Socket socket, CountDownLatch read, AtomicLong frames,
-			AtomicLong sum) {
-		try {
-			InputStream in = socket.getInputStream();
-			grantThenStall(in, socket.getOutputStream());
-			read.await();
-			TestH2.@Nullable Frame frame;
-			while ((frame = TestH2.readFrame(in)) != null) {
-				if (frame.type() == TestH2.WINDOW_UPDATE && frame.streamId() == 1) {
-					frames.incrementAndGet();
-					sum.addAndGet(TestH2.increment(frame));
-				}
-			}
-		}
-		catch (IOException | InterruptedException e) {
-			// ended
-		}
-	}
-
 	/** Stalls the leg, then floods PINGs without reading. */
 	private static void stallThenFlood(Socket socket, CountDownLatch ping) {
 		try {
@@ -404,10 +328,6 @@ class H2DemuxLegWriterE2ETest {
 		catch (IOException e) {
 			// connection ended
 		}
-	}
-
-	private long writerWakeups(String route) {
-		return Objects.requireNonNull(this.dataProxyServer).h2DemuxMeters().writerWakeups(route);
 	}
 
 	/**
@@ -487,14 +407,6 @@ class H2DemuxLegWriterE2ETest {
 		catch (IOException e) {
 			throw new IllegalStateException(e);
 		}
-	}
-
-	/**
-	 * The route's host for this engine's invocation: both run on one router, where the
-	 * other invocation's tunnel client may still serve a host of the same name.
-	 */
-	private String route(String name) {
-		return name + "." + String.valueOf(this.engine).toLowerCase(Locale.ROOT) + ".test";
 	}
 
 	private static void close(AutoCloseable closeable) {

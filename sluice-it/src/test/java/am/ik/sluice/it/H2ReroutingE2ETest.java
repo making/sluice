@@ -24,9 +24,7 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
-import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
 import am.ik.sluice.server.proxy.DataProxyServer;
-import am.ik.sluice.server.proxy.H2EngineTest;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import ch.qos.logback.classic.Logger;
@@ -39,7 +37,6 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
-import org.junit.jupiter.params.Parameter;
 
 import org.slf4j.LoggerFactory;
 
@@ -59,7 +56,6 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
-@H2EngineTest
 class H2ReroutingE2ETest {
 
 	private static final TaskExecutor TASK_EXECUTOR = task -> Thread.ofVirtual().name("e2e-h2r").start(task);
@@ -80,11 +76,6 @@ class H2ReroutingE2ETest {
 	private static ServerSocket betaUpstream;
 
 	private final Map<String, TunnelClient> clients = new ConcurrentHashMap<>();
-
-	/** The engine of this invocation, selected by {@link H2EngineTest}. */
-	@Nullable
-	@Parameter
-	private H2DemuxEngine engine;
 
 	@Nullable
 	@Autowired
@@ -477,8 +468,8 @@ class H2ReroutingE2ETest {
 
 	/**
 	 * The relay releases the connection-level window the request body consumed with a
-	 * WINDOW_UPDATE on stream 0. The body passes half of the window: the netty engine's
-	 * auto refill grants once half of it is spent, the legacy engine as DATA arrives.
+	 * WINDOW_UPDATE on stream 0. The body passes half of the window: netty's auto refill
+	 * grants once half of it is spent.
 	 */
 	@Test
 	void grantsConnectionWindowWhileRelayingRequestData() throws Exception {

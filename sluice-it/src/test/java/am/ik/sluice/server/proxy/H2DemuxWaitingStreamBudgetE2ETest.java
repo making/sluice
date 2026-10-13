@@ -9,7 +9,6 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -25,7 +24,6 @@ import am.ik.sluice.it.TestH2;
 import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.it.WindowedH2Upstream;
 import am.ik.sluice.server.SluiceServerApplication;
-import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
 import am.ik.sluice.server.route.Router;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -34,7 +32,6 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
-import org.junit.jupiter.params.Parameter;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -53,13 +50,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
-@H2EngineTest
 class H2DemuxWaitingStreamBudgetE2ETest {
-
-	/** The engine of this invocation, selected by {@link H2EngineTest}. */
-	@Nullable
-	@Parameter
-	private H2DemuxEngine engine;
 
 	/**
 	 * Room for some of what one connection's waiting streams queue past its allowance,
@@ -128,7 +119,7 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 	@Test
 	void waitingStreamsExhaustingTheBudgetLeaveTheOpenStreamCompleting() throws Exception {
 		assertThat(budgetGauge()).as("the configured budget took effect").isEqualTo(BUDGET);
-		String route = route("ws.own");
+		String route = "ws.own.test";
 		List<TestUpstream> upstreams = start(route, LIMIT_ONE);
 		double withheldBefore = withheld();
 		double refusedBefore = refused("waiting");
@@ -137,7 +128,7 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 			assertThat(withheld()).as("the window was withheld: the queue past the allowance, the budget exhausted")
 				.isGreaterThan(withheldBefore);
 			assertThat(queuedBytes(route)).as("the waiting streams hold at most the allowance")
-				.isLessThanOrEqualTo(Http2DemuxRelay.CONNECTION_ALLOWANCE);
+				.isLessThanOrEqualTo(NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE);
 			completeAndDrain(client, upstream, route);
 			assertThat(client.resets()).as("the waiting streams past the allowance were refused")
 				.containsOnlyKeys(7, 9, 11, 13, 15)
@@ -154,22 +145,21 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 	 */
 	@Test
 	void waitingStreamsAreRefusedOnceAnotherConnectionExhaustsTheBudget() throws Exception {
-		String route = route("ws.shared");
-		String stalledRoute = route("ws.stalled");
+		String route = "ws.shared.test";
+		String stalledRoute = "ws.stalled.test";
 		List<TestUpstream> upstreams = start(route, LIMIT_ONE);
 		start(stalledRoute, NOT_READING);
 		double refusedBefore = refused("waiting");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5, 7, 9)) {
 			TestUpstream upstream = openOneAndQueueBehindIt(client, upstreams, route, 9);
 			assertThat(queuedBytes(route)).as("the waiting streams hold past the allowance")
-				.isGreaterThan(Http2DemuxRelay.CONNECTION_ALLOWANCE);
+				.isGreaterThan(NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE);
 			assertThat(budgetUsed()).as("the budget has room").isLessThan(BUDGET);
 			assertThat(client.resets()).as("nothing refused while the budget has room").isEmpty();
 			double withheldBefore = withheld();
 			try (H2TestClient stalled = H2TestClient.connect(dataPort)) {
-				// eight streams: the netty engine holds a stream's window per stream (the
-				// legacy engine its window and a stream budget), and these hold past the
-				// budget either way
+				// eight streams: the relay holds a stream's window per stream, and these
+				// hold past the budget
 				for (int streamId = 1; streamId <= 15; streamId += 2) {
 					stalled.headers(streamId, false, post(stalledRoute));
 					stalled.fill(streamId, QUIET);
@@ -334,14 +324,6 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 			.atMost(Duration.ofSeconds(10))
 			.until(() -> Objects.requireNonNull(this.router).lookup(route).isPresent());
 		return upstreams;
-	}
-
-	/**
-	 * The route's host for this engine's invocation: both run on one router, where the
-	 * other invocation's tunnel client may still serve a host of the same name.
-	 */
-	private String route(String name) {
-		return name + "." + String.valueOf(this.engine).toLowerCase(Locale.ROOT) + ".test";
 	}
 
 	private static void close(AutoCloseable closeable) {

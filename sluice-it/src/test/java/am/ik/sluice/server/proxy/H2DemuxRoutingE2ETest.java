@@ -37,7 +37,6 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
-import org.junit.jupiter.params.Parameter;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
@@ -47,7 +46,6 @@ import am.ik.sluice.it.TestH2;
 import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.it.WindowedH2Upstream;
 import am.ik.sluice.server.SluiceServerApplication;
-import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
 import am.ik.sluice.server.route.Router;
 
 import org.springframework.beans.factory.annotation.Autowired;
@@ -58,15 +56,14 @@ import org.springframework.test.context.DynamicPropertySource;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Routing of an h2 connection's streams, on both engines: the connection's first stream
- * takes the route resolved with the connection head without a second lookup (with
- * round-robin load balancing a second lookup would move every first stream to the other
- * upstream), streams keep their ids on their leg, and a head up to the 64KiB header list
- * limit is relayed whole.
+ * Routing of an h2 connection's streams: the connection's first stream takes the route
+ * resolved with the connection head without a second lookup (with round-robin load
+ * balancing a second lookup would move every first stream to the other upstream), streams
+ * keep their ids on their leg, and a head up to the 64KiB header list limit is relayed
+ * whole.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
-@H2EngineTest
 class H2DemuxRoutingE2ETest {
 
 	/** Served by two clients, round-robin. */
@@ -95,11 +92,6 @@ class H2DemuxRoutingE2ETest {
 	private static int grpcPort;
 
 	private static int dataPort;
-
-	/** The engine of this invocation, selected by {@link H2EngineTest}. */
-	@Nullable
-	@Parameter
-	private H2DemuxEngine engine;
 
 	private final List<AutoCloseable> closeables = new CopyOnWriteArrayList<>();
 

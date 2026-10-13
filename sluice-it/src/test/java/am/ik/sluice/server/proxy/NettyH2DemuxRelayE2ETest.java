@@ -76,18 +76,18 @@ import org.springframework.test.context.DynamicPropertySource;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * What only the netty engine does, and how its relay ends: a header list past the 64KiB
- * limit is answered {@code 431} by netty's codec; a page the relay answers itself -- the
+ * What the netty codec brings, and how the relay ends: a header list past the 64KiB limit
+ * is answered {@code 431} by netty's codec; a page the relay answers itself -- the
  * no-route page, the bad-gateway page of a stream its leg lost before a response head --
  * is held to the client's stream window; an upstream's malformed frame ends its leg with
  * netty's GOAWAY while the client's connection goes on; a response the upstream completed
  * outlives the upstream's reset and its connection's end; a stream past its upstream's
  * concurrency limit waits, and is refused at the wait deadline unless it opened or left
- * before (the legacy engine has no wait deadline); the client going away mid-stream
- * cancels the upstream's stream and ends the relay -- connection count, admission slot,
- * hop threads, the legs' virtual connections. The relay's exception sink stays silent
- * throughout (no listener failure, no channel operation without the loop's lock), and
- * with netty's paranoid leak detection on no buffer leaks.
+ * before; the client going away mid-stream cancels the upstream's stream and ends the
+ * relay -- connection count, admission slot, hop threads, the legs' virtual connections.
+ * The relay's exception sink stays silent throughout (no listener failure, no channel
+ * operation without the loop's lock), and with netty's paranoid leak detection on no
+ * buffer leaks.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -190,7 +190,6 @@ class NettyH2DemuxRelayE2ETest {
 		dataPort = TestPorts.freePort();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
-		registry.add("sluice.h2-demux-engine", () -> "netty");
 		registry.add("sluice.limits.h2-stream-wait-timeout", () -> WAIT_TIMEOUT.toMillis() + "ms");
 		registry.add("sluice.access-log.rate-limit.enabled", () -> "false");
 		registry.add("sluice.token", () -> "it-token");

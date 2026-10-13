@@ -99,39 +99,42 @@ class HttpPostE2ETest {
 			while (!h2Upstream.isClosed()) {
 				try {
 					Socket socket = h2Upstream.accept();
-					UPSTREAM_EXECUTOR.execute(() -> {
-						try (socket) {
-							InputStream in = socket.getInputStream();
-							in.readNBytes(TestH2.PREFACE.length + 9); // magic + client
-																		// SETTINGS
-							ByteArrayOutputStream body = new ByteArrayOutputStream();
-							int endStream = -1;
-							TestH2.Frame frame;
-							while (endStream < 0 && (frame = TestH2.readFrame(in)) != null) {
-								if (frame.type() == TestH2.DATA) {
-									body.writeBytes(frame.payload());
-									if (frame.endStream()) {
-										endStream = frame.streamId();
-									}
-								}
-							}
-							socket.getOutputStream()
-								.write(TestH2.cannedResponse(Math.max(endStream, 1),
-										body.toString(StandardCharsets.UTF_8)));
-							socket.getOutputStream().flush();
-							in.read(new byte[1]); // keep the relay open until the client
-													// hangs up
-						}
-						catch (Exception e) {
-							// connection ended
-						}
-					});
+					UPSTREAM_EXECUTOR.execute(() -> echo(socket));
 				}
 				catch (Exception e) {
 					return;
 				}
 			}
 		});
+	}
+
+	/**
+	 * Echoes the DATA of each request stream back once the stream ended, until the relay
+	 * closes the connection.
+	 */
+	private static void echo(Socket socket) {
+		try (socket) {
+			WindowedH2Upstream upstream = WindowedH2Upstream.accept(socket);
+			if (upstream == null) {
+				return;
+			}
+			upstream.settings(null);
+			ByteArrayOutputStream body = new ByteArrayOutputStream();
+			TestH2.@Nullable Frame frame;
+			while ((frame = upstream.next()) != null) {
+				if (frame.type() == TestH2.DATA) {
+					body.writeBytes(frame.payload());
+					if (frame.endStream()) {
+						upstream.headers(frame.streamId(), false);
+						upstream.sendData(frame.streamId(), body.toByteArray(), true);
+						body.reset();
+					}
+				}
+			}
+		}
+		catch (Exception e) {
+			// connection ended
+		}
 	}
 
 	@DynamicPropertySource

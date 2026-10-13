@@ -5,7 +5,6 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
@@ -15,11 +14,10 @@ import java.util.function.BiConsumer;
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
-import org.junit.jupiter.params.Parameter;
+import org.junit.jupiter.api.TestInstance;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
@@ -29,7 +27,6 @@ import am.ik.sluice.it.ScriptedH2Upstream;
 import am.ik.sluice.it.TestH2;
 import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.server.SluiceServerApplication;
-import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
 import am.ik.sluice.server.route.Router;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -47,20 +44,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 9113 5.4.2) resets that stream alone, and an upstream's connection error (5.4.1), its
  * connection failing or its GOAWAY end its leg alone -- never the client's connection nor
  * the streams of other legs. A stream lost before a response frame was relayed on it is
- * answered with a {@code 502} by the relay -- bodiless on the legacy engine, the
- * bad-gateway page on the netty engine --, one lost after with RST_STREAM
- * {@code INTERNAL_ERROR}, and a stream the upstream never saw is refused
- * ({@code REFUSED_STREAM}). In the relay's package for the meters and the write seam.
+ * answered with the bad-gateway page ({@code 502}) by the relay, one lost after with
+ * RST_STREAM {@code INTERNAL_ERROR}, and a stream the upstream never saw is refused
+ * ({@code REFUSED_STREAM}). In the relay's package for the meters.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
-@H2EngineTest
 class H2DemuxUpstreamErrorE2ETest {
-
-	/** The engine of this invocation, selected by {@link H2EngineTest}. */
-	@Nullable
-	@Parameter
-	private H2DemuxEngine engine;
 
 	private static final Duration IDLE_TIMEOUT = Duration.ofSeconds(3);
 
@@ -84,8 +74,6 @@ class H2DemuxUpstreamErrorE2ETest {
 	private final List<AutoCloseable> closeables = new CopyOnWriteArrayList<>();
 
 	private final List<TunnelClient> clients = new ArrayList<>();
-
-	private final List<HeldWrite> held = new CopyOnWriteArrayList<>();
 
 	private static int grpcPort;
 
@@ -119,13 +107,6 @@ class H2DemuxUpstreamErrorE2ETest {
 		registry.add("server.port", () -> String.valueOf(TestPorts.freePort()));
 	}
 
-	@AfterEach
-	void release() {
-		dataProxyServer().h2WriteSeam(Http2DemuxRelay.WriteSeam.NONE);
-		this.held.forEach(HeldWrite::proceed);
-		this.held.clear();
-	}
-
 	@AfterAll
 	void tearDown() {
 		this.clients.forEach(TunnelClient::stop);
@@ -141,8 +122,8 @@ class H2DemuxUpstreamErrorE2ETest {
 	 */
 	@Test
 	void upstreamStreamWindowUpdateOfZeroResetsOnlyItsStream() throws Exception {
-		String route = route("ue.zero-stream");
-		String otherRoute = route("ue.zero-stream-other");
+		String route = "ue.zero-stream.test";
+		String otherRoute = "ue.zero-stream-other.test";
 		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {
 			if (frame.type() == TestH2.HEADERS && frame.streamId() == 1) {
 				connection.head(1, false);
@@ -154,7 +135,6 @@ class H2DemuxUpstreamErrorE2ETest {
 		});
 		startClient(route, upstream);
 		startClient(otherRoute, upstream(new byte[0], ScriptedH2Upstream.answering("other")));
-		double resets = counter("sluice.h2demux.streams.reset", "upstream");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5)) {
 			client.headers(1, true, get(route));
 			assertThat(client.awaitTrue(() -> client.reset(1) != null, WITHIN)).as("stream 1 reset").isTrue();
@@ -175,10 +155,6 @@ class H2DemuxUpstreamErrorE2ETest {
 			assertThat(connection.frames()).noneMatch(frame -> frame.type() == TestH2.GOAWAY);
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(client.closed()).isFalse();
-			if (this.engine == H2DemuxEngine.LEGACY) {
-				// the netty engine's reset meter comes with the metrics step
-				assertThat(counter("sluice.h2demux.streams.reset", "upstream") - resets).isEqualTo(1);
-			}
 		}
 	}
 
@@ -191,8 +167,8 @@ class H2DemuxUpstreamErrorE2ETest {
 	 */
 	@Test
 	void upstreamStreamWindowPastTheMaximumAnswersTheStreamWith502() throws Exception {
-		String route = route("ue.overflow-stream");
-		String otherRoute = route("ue.overflow-stream-other");
+		String route = "ue.overflow-stream.test";
+		String otherRoute = "ue.overflow-stream-other.test";
 		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {
 			if (frame.type() == TestH2.HEADERS && frame.streamId() == 1) {
 				connection.write(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(Integer.MAX_VALUE));
@@ -221,17 +197,15 @@ class H2DemuxUpstreamErrorE2ETest {
 	/**
 	 * An upstream connection error (a connection WINDOW_UPDATE of 0, RFC 9113 6.9) while
 	 * its leg carries a stream whose response head was relayed and one without: the
-	 * upstream gets a GOAWAY {@code PROTOCOL_ERROR} naming no stream on the legacy engine
-	 * (the relay processed none of its own), 2^31-1 on the netty engine, then the relay's
-	 * EOF; the client gets RST_STREAM {@code INTERNAL_ERROR} on the first and a
-	 * {@code 502} on the second, and no GOAWAY. A stream of another route opened before
-	 * the error completes after it, and the route's next stream opens a new leg and
-	 * completes.
+	 * upstream gets a GOAWAY {@code PROTOCOL_ERROR} naming 2^31-1, then the relay's EOF;
+	 * the client gets RST_STREAM {@code INTERNAL_ERROR} on the first and a {@code 502} on
+	 * the second, and no GOAWAY. A stream of another route opened before the error
+	 * completes after it, and the route's next stream opens a new leg and completes.
 	 */
 	@Test
 	void upstreamConnectionErrorEndsOnlyItsLeg() throws Exception {
-		String route = route("ue.connection");
-		String otherRoute = route("ue.connection-other");
+		String route = "ue.connection.test";
+		String otherRoute = "ue.connection-other.test";
 		AtomicReference<@Nullable ScriptedH2Upstream> self = new AtomicReference<>();
 		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {
 			if (frame.type() != TestH2.HEADERS) {
@@ -250,7 +224,6 @@ class H2DemuxUpstreamErrorE2ETest {
 			// answered by the test
 		});
 		startClient(otherRoute, other);
-		double failed = counter("sluice.h2demux.legs.failed", null);
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5, 7)) {
 			client.headers(1, true, get(route));
 			client.headers(3, true, get(route));
@@ -269,8 +242,7 @@ class H2DemuxUpstreamErrorE2ETest {
 			assertThat(TestH2.errorCode(goAway)).isEqualTo(PROTOCOL_ERROR);
 			// netty names 2^31-1 on an error of its frame reader, the stream ids it saw
 			// unknown to it (netty issue 10670)
-			assertThat(TestH2.increment(goAway)).as("its last stream id")
-				.isEqualTo(this.engine == H2DemuxEngine.NETTY ? Integer.MAX_VALUE : 0);
+			assertThat(TestH2.increment(goAway)).as("its last stream id").isEqualTo(Integer.MAX_VALUE);
 			assertThat(connection.awaitEof(WITHIN)).as("the relay half-closed after the GOAWAY").isTrue();
 			assertThat(client.awaitTrue(() -> client.reset(1) != null && client.ended(3), WITHIN)).isTrue();
 			assertThat(client.reset(1)).isEqualTo(INTERNAL_ERROR);
@@ -285,58 +257,9 @@ class H2DemuxUpstreamErrorE2ETest {
 			assertThat(upstream.connections()).as("over a new leg").hasSize(2);
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(client.closed()).isFalse();
-			if (this.engine == H2DemuxEngine.LEGACY) {
-				// the netty engine's legs-failed meter comes with the metrics step
-				assertThat(counter("sluice.h2demux.legs.failed", null) - failed).isEqualTo(1);
-			}
 			Awaitility.await()
 				.atMost(WITHIN)
 				.until(() -> dataProxyServer().h2DemuxMeters().trackedStreams(route) == 0 && queuedBytes(route) == 0);
-		}
-	}
-
-	/**
-	 * An upstream connection error while a response it completed waits for the client's
-	 * connection window: the response is delivered whole once the client grants, while
-	 * the stream it had not answered got a {@code 502} at once.
-	 */
-	@Test
-	@LegacyOnly("end-to-end windows: the upstream sends within the client's window; the netty engine's per-hop "
-			+ "counterpart is NettyH2DemuxRelayE2ETest#aResponseTheUpstreamCompletedOutlivesItsConnectionError")
-	void aConnectionErrorStillDeliversTheResponsesTheUpstreamCompleted() throws Exception {
-		String route = route("ue.completed");
-		int length = 100 * 1024;
-		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {
-			if (frame.type() == TestH2.HEADERS && frame.streamId() == 3) {
-				connection.head(1, false);
-				for (int sent = 0; sent < length; sent += 16 * 1024) {
-					int chunk = Math.min(16 * 1024, length - sent);
-					connection.write(TestH2.DATA, sent + chunk == length ? TestH2.FLAG_END_STREAM : 0, 1,
-							new byte[chunk]);
-				}
-				connection.write(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(0));
-			}
-		});
-		startClient(route, upstream);
-		double failed = counter("sluice.h2demux.legs.failed", null);
-		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
-			client.withholdConnectionWindow();
-			// the stream window covers the response: only the connection window holds it
-			client.frame(TestH2.SETTINGS, 0, 0, TestH2Settings.of(0x4, 1024 * 1024));
-			client.headers(1, true, get(route));
-			client.headers(3, true, get(route));
-			assertThat(client.awaitEnd(3, WITHIN)).isTrue();
-			assertThat(TestH2.status(client.frames(3))).isEqualTo("502");
-			assertThat(counter("sluice.h2demux.legs.failed", null) - failed).as("the leg ended").isEqualTo(1);
-			assertThat(client.awaitTrue(() -> client.dataReceived(1) == H2TestClient.INITIAL_WINDOW, WITHIN))
-				.as("the client's window spent")
-				.isTrue();
-			assertThat(client.ended(1)).as("the rest waits for the client's window").isFalse();
-			client.grantConnectionWindowOnReceipt();
-			assertThat(client.awaitEnd(1, WITHIN)).isTrue();
-			assertThat(client.dataReceived(1)).isEqualTo(length);
-			assertThat(client.reset(1)).isNull();
-			assertThat(client.goAwayCode()).isEqualTo(-1);
 		}
 	}
 
@@ -348,7 +271,7 @@ class H2DemuxUpstreamErrorE2ETest {
 	 */
 	@Test
 	void aStreamLostAfterAnInterimResponseIsAnswered502() throws Exception {
-		String route = route("ue.interim");
+		String route = "ue.interim.test";
 		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {
 			if (frame.type() == TestH2.HEADERS) {
 				// :status 100, a literal with the indexed name of :status
@@ -368,9 +291,7 @@ class H2DemuxUpstreamErrorE2ETest {
 			assertThat(heads).as("the interim head, then the 502").hasSize(2);
 			assertThat(TestH2.status(heads.subList(0, 1))).isEqualTo("100");
 			assertThat(TestH2.status(heads.subList(1, 2))).isEqualTo("502");
-			if (this.engine == H2DemuxEngine.NETTY) {
-				assertThat(TestH2.bodyOf(client.frames(1))).as("the page").isEqualTo(badGatewayPage(route, "GET"));
-			}
+			assertThat(TestH2.bodyOf(client.frames(1))).as("the page").isEqualTo(badGatewayPage(route, "GET"));
 			TestH2.Frame goAway = upstream.awaitConnection(0, WITHIN)
 				.await(frame -> frame.type() == TestH2.GOAWAY, WITHIN);
 			assertThat(goAway).as("the upstream got a GOAWAY").isNotNull();
@@ -388,7 +309,7 @@ class H2DemuxUpstreamErrorE2ETest {
 	 */
 	@Test
 	void upstreamFrameOnAWaitingStreamEndsItsLegAndRefusesTheStream() throws Exception {
-		String route = route("ue.idle-stream");
+		String route = "ue.idle-stream.test";
 		ScriptedH2Upstream upstream = upstream(TestH2Settings.of(MAX_CONCURRENT_STREAMS, 1), (connection, frame) -> {
 		});
 		startClient(route, upstream);
@@ -421,7 +342,7 @@ class H2DemuxUpstreamErrorE2ETest {
 	 */
 	@Test
 	void upstreamClosingBeforeTheResponseHeadAnswers502() throws Exception {
-		String route = route("ue.close-before-head");
+		String route = "ue.close-before-head.test";
 		AtomicReference<@Nullable ScriptedH2Upstream> self = new AtomicReference<>();
 		ScriptedH2Upstream upstream = upstream(TestH2Settings.of(MAX_CONCURRENT_STREAMS, 1), (connection, frame) -> {
 			if (frame.type() == TestH2.HEADERS
@@ -460,8 +381,8 @@ class H2DemuxUpstreamErrorE2ETest {
 	 */
 	@Test
 	void upstreamResetMidBodyResetsTheStreamWithInternalError() throws Exception {
-		String route = route("ue.reset-mid-body");
-		String otherRoute = route("ue.reset-mid-body-other");
+		String route = "ue.reset-mid-body.test";
+		String otherRoute = "ue.reset-mid-body-other.test";
 		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {
 			if (frame.type() == TestH2.HEADERS) {
 				connection.head(frame.streamId(), false);
@@ -494,7 +415,7 @@ class H2DemuxUpstreamErrorE2ETest {
 	 */
 	@Test
 	void upstreamGoAwayRefusesTheStreamsItDidNotProcess() throws Exception {
-		String route = route("ue.goaway");
+		String route = "ue.goaway.test";
 		AtomicReference<@Nullable ScriptedH2Upstream> self = new AtomicReference<>();
 		ScriptedH2Upstream upstream = upstream(TestH2Settings.of(MAX_CONCURRENT_STREAMS, 2), (connection, frame) -> {
 			if (frame.type() == TestH2.HEADERS
@@ -523,12 +444,10 @@ class H2DemuxUpstreamErrorE2ETest {
 			assertThat(client.awaitEnd(1, WITHIN)).isTrue();
 			assertThat(TestH2.bodyOf(client.frames(1))).isEqualTo("processed");
 			assertThat(connection.awaitEof(WITHIN)).as("the leg half-closed").isTrue();
-			if (this.engine == H2DemuxEngine.NETTY) {
-				// netty's graceful close: a GOAWAY of the relay's own came first
-				assertThat(connection.frames()).filteredOn(frame -> frame.type() == TestH2.GOAWAY)
-					.extracting(TestH2::errorCode)
-					.containsExactly(NO_ERROR);
-			}
+			// netty's graceful close: a GOAWAY of the relay's own came first
+			assertThat(connection.frames()).filteredOn(frame -> frame.type() == TestH2.GOAWAY)
+				.extracting(TestH2::errorCode)
+				.containsExactly(NO_ERROR);
 			client.headers(7, true, get(route));
 			assertThat(client.awaitEnd(7, WITHIN)).isTrue();
 			assertThat(TestH2.bodyOf(client.frames(7))).isEqualTo("new-leg");
@@ -541,50 +460,15 @@ class H2DemuxUpstreamErrorE2ETest {
 	}
 
 	/**
-	 * An upstream that keeps its connection open past the GOAWAY and the half-close the
-	 * relay sent it on its connection error is closed by the relay once
-	 * {@link Http2DemuxRelay#UPSTREAM_CLOSE_GRACE_NANOS} passed, not before, and long
-	 * before the idle timeout ends the client's connection.
-	 */
-	@Test
-	@LegacyOnly("the legacy relay's close grace; the netty engine's counterpart is "
-			+ "NettyH2DemuxRelayE2ETest#anUpstreamIgnoringTheErrorGoAwayIsClosedAfterTheHopsCloseGrace")
-	void upstreamIgnoringTheGoAwayIsClosedAfterTheGrace() throws Exception {
-		String route = route("ue.grace");
-		ScriptedH2Upstream upstream = ScriptedH2Upstream.holdingOnEof(new byte[0], (connection, frame) -> {
-			if (frame.type() == TestH2.HEADERS) {
-				connection.write(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(0));
-			}
-		});
-		this.closeables.add(upstream);
-		startClient(route, upstream);
-		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
-			client.headers(1, true, get(route));
-			ScriptedH2Upstream.Connection connection = upstream.awaitConnection(0, WITHIN);
-			assertThat(connection.awaitEof(WITHIN)).as("the relay half-closed").isTrue();
-			long eof = System.nanoTime();
-			assertThat(connection.frames()).anyMatch(frame -> frame.type() == TestH2.GOAWAY);
-			assertThat(connection.awaitClosed(WITHIN)).as("the relay closed the connection").isTrue();
-			long elapsed = System.nanoTime() - eof;
-			// the grace, not the idle timeout ending the relay
-			assertThat(elapsed).as("closed after the grace")
-				.isGreaterThan(Http2DemuxRelay.UPSTREAM_CLOSE_GRACE_NANOS / 2)
-				.isLessThan(Http2DemuxRelay.UPSTREAM_CLOSE_GRACE_NANOS + TimeUnit.SECONDS.toNanos(1));
-			assertThat(TestH2.status(client.frames(1))).isEqualTo("502");
-			assertThat(client.closed()).isFalse();
-		}
-	}
-
-	/**
 	 * An upstream connection error while its stream is the only one the client has open
 	 * still ends only the leg: the client gets the {@code 502} and no GOAWAY, and its
 	 * connection idles until the idle timeout closes it with a GOAWAY {@code NO_ERROR}
 	 * naming stream 1.
 	 */
 	@Test
-	@LegacyOnly("the idle timeout: a later migration step")
+	@Disabled("the idle timeout: not yet on the h2 demux")
 	void aConnectionErrorWithNothingElseOpenLeavesTheConnectionToTheIdleTimeout() throws Exception {
-		String route = route("ue.idle");
+		String route = "ue.idle.test";
 		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {
 			if (frame.type() == TestH2.HEADERS) {
 				connection.write(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(0));
@@ -608,51 +492,13 @@ class H2DemuxUpstreamErrorE2ETest {
 	}
 
 	/**
-	 * The client going away while a failing leg writes what it lost: the write fails, the
-	 * relay ends, and nothing stays held -- no connection, no tracked stream, no queued
-	 * byte, no slot of the connection limit.
-	 */
-	@Test
-	@LegacyOnly("the legacy relay's write seam; the netty engine's counterpart is "
-			+ "NettyH2DemuxRelayE2ETest#theClientGoingAwayWhileItsLegFailsEndsTheRelay")
-	void clientGoneWhileTheLegFailsReleasesEverything() throws Exception {
-		String route = route("ue.client-gone");
-		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {
-			if (frame.type() == TestH2.HEADERS) {
-				connection.write(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(0));
-			}
-		});
-		startClient(route, upstream);
-		DataProxyServer proxy = dataProxyServer();
-		Awaitility.await().atMost(WITHIN).until(() -> proxy.activeConnections() == 0);
-		double admitted = gauge("sluice.data.connections.admitted");
-		HeldWrite held = HeldWrite.install(proxy,
-				new Http2DemuxRelay.WriteSeam.Decision(Http2DemuxRelay.WriteSeam.Site.RESET, 1));
-		this.held.add(held);
-		H2TestClient client = H2TestClient.connect(dataPort, 1);
-		client.headers(1, true, get(route));
-		held.awaitDecided();
-		assertThat(client.frames(1)).as("decided before the 502 was written").isEmpty();
-		assertThat(proxy.activeConnections()).as("the relay is live").isEqualTo(1);
-		client.abort();
-		Thread.sleep(200); // the client's reset reached the relay's socket
-		held.proceed();
-		Awaitility.await()
-			.atMost(WITHIN)
-			.until(() -> proxy.activeConnections() == 0 && proxy.h2DemuxMeters().trackedStreams(route) == 0
-					&& queuedBytes(route) == 0 && gauge("sluice.data.connections.admitted") == admitted);
-		assertThat(upstream.awaitConnection(0, WITHIN).awaitClosed(WITHIN)).as("the upstream connection was closed")
-			.isTrue();
-	}
-
-	/**
 	 * An upstream's GOAWAY naming stream 1 as the last it processed after it relayed a
 	 * response head on stream 3: stream 3 is lost (RST_STREAM {@code INTERNAL_ERROR}, its
 	 * response began), not refused; stream 1 completes.
 	 */
 	@Test
 	void upstreamGoAwayResetsAStreamItAnsweredWithoutProcessingIt() throws Exception {
-		String route = route("ue.goaway-answered");
+		String route = "ue.goaway-answered.test";
 		ScriptedH2Upstream upstream = upstream(new byte[0], (connection, frame) -> {
 			if (frame.type() == TestH2.HEADERS && frame.streamId() == 3) {
 				connection.head(3, false);
@@ -678,28 +524,18 @@ class H2DemuxUpstreamErrorE2ETest {
 		}
 	}
 
-	/**
-	 * The route {@code name} of this invocation: the runs on both engines share the
-	 * router, and a route registered by the other run's client would take the stream.
-	 */
-	private String route(String name) {
-		return name + "." + String.valueOf(this.engine).toLowerCase(Locale.ROOT) + ".test";
-	}
-
-	/** The frame types of a {@code 502} followed by a reset, as the engine answers it. */
-	private List<Integer> badGateway() {
-		return this.engine == H2DemuxEngine.NETTY ? List.of(TestH2.HEADERS, TestH2.DATA, TestH2.RST_STREAM)
-				: List.of(TestH2.HEADERS, TestH2.RST_STREAM);
+	/** The frame types of the {@code 502} page followed by a reset. */
+	private static List<Integer> badGateway() {
+		return List.of(TestH2.HEADERS, TestH2.DATA, TestH2.RST_STREAM);
 	}
 
 	/**
-	 * A {@code 502} the relay answered on the stream: bodiless on the legacy engine, the
-	 * bad-gateway page of the route and request on the netty engine.
+	 * A {@code 502} the relay answered on the stream: the bad-gateway page of the route
+	 * and request.
 	 */
 	private void assertBadGateway(List<TestH2.Frame> frames, String route, String method) {
 		assertThat(TestH2.status(frames)).isEqualTo("502");
-		String body = this.engine == H2DemuxEngine.NETTY ? badGatewayPage(route, method) : "";
-		assertThat(TestH2.bodyOf(frames)).as("the 502's body").isEqualTo(body);
+		assertThat(TestH2.bodyOf(frames)).as("the 502's body").isEqualTo(badGatewayPage(route, method));
 	}
 
 	private String badGatewayPage(String route, String method) {

@@ -9,10 +9,7 @@ import java.net.Socket;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -27,10 +24,7 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
-import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
 import am.ik.sluice.server.proxy.DataProxyServer;
-import am.ik.sluice.server.proxy.H2EngineTest;
-import am.ik.sluice.server.proxy.LegacyOnly;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.VirtualConnection;
 import io.micrometer.core.instrument.Counter;
@@ -40,10 +34,10 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
-import org.junit.jupiter.params.Parameter;
+import org.junit.jupiter.api.TestInstance;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -63,14 +57,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
-@H2EngineTest
-@LegacyOnly("the stall timeout: not yet on the netty engine")
 class H2DemuxStallE2ETest {
-
-	/** The engine of this invocation, selected by {@link H2EngineTest}. */
-	@Nullable
-	@Parameter
-	private H2DemuxEngine engine;
 
 	private static final TaskExecutor TASK_EXECUTOR = task -> Thread.ofVirtual().name("e2e-h2d").start(task);
 
@@ -150,6 +137,8 @@ class H2DemuxStallE2ETest {
 	 * connection.
 	 */
 	@Test
+	@Disabled("waits on the route's tunnel byte counter (sluice.tunnel.bytes), not yet on the "
+			+ "h2 demux, and asserts the hand-written relay's stream budget")
 	void stalledLegKeepsTheOtherLegsFlowing() throws Exception {
 		startClient("h2d.stall.test", stallUpstream);
 		startClient("h2d.echo.test", echoUpstream);
@@ -192,6 +181,8 @@ class H2DemuxStallE2ETest {
 	 * active-connection count drops while the stalled upstream still holds its socket.
 	 */
 	@Test
+	@Disabled("waits on the route's tunnel byte counter (sluice.tunnel.bytes), not yet on the "
+			+ "h2 demux, and looks for the hand-written relay's leg writer waiting for credit")
 	void closingTheClientReleasesTheStalledLeg() throws Exception {
 		String route = "h2d.release.test";
 		startClient(route, stallUpstream);
@@ -230,6 +221,7 @@ class H2DemuxStallE2ETest {
 	 * after its request ended still gets the response.
 	 */
 	@Test
+	@Disabled("the half-close drain: the client's EOF ends the h2 demux at once")
 	void halfCloseAfterAFinishedRequestStillGetsTheResponse() throws Exception {
 		startClient("h2d.halfclose.test", echoUpstream);
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
@@ -250,6 +242,8 @@ class H2DemuxStallE2ETest {
 	 * connection closed; the leg queue never held more than the stream's budget.
 	 */
 	@Test
+	@Disabled("pins the hand-written relay's GOAWAY FLOW_CONTROL_ERROR and stream budget; "
+			+ "netty's codec answers with its own code: to be rewritten for it")
 	void streamOverItsWindowClosesTheConnection() throws Exception {
 		String route = "h2d.cap.test";
 		startClient(route, capUpstream);

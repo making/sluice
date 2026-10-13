@@ -52,13 +52,13 @@ import org.springframework.test.context.DynamicPropertySource;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Per-hop flow control and the queue budget on the netty engine. What the relay reads of
- * a stream on one hop and has not written on the other stays within the stream window it
- * announced, both ways, while the leg's other streams flow (the connection windows refill
- * as DATA arrives); small frames held for a stream are coalesced, so the bytes held are
- * the bytes accounted. Past its allowance with the budget exhausted, the relay withholds
- * the connection windows of its legs as of its client, so an upstream stops at the window
- * it holds. Whatever path a stream leaves by -- the client's reset, the leg's end, the
+ * Per-hop flow control and the queue budget. What the relay reads of a stream on one hop
+ * and has not written on the other stays within the stream window it announced, both
+ * ways, while the leg's other streams flow (the connection windows refill as DATA
+ * arrives); small frames held for a stream are coalesced, so the bytes held are the bytes
+ * accounted. Past its allowance with the budget exhausted, the relay withholds the
+ * connection windows of its legs as of its client, so an upstream stops at the window it
+ * holds. Whatever path a stream leaves by -- the client's reset, the leg's end, the
  * relay's own reset, the client gone -- what it held leaves the route's gauge and the
  * budget while the connection goes on; a response the upstream completed outlives its
  * leg, and the request's rest outlives a client stream an early response closed. The
@@ -113,7 +113,6 @@ class NettyH2DemuxBudgetE2ETest {
 		dataPort = TestPorts.freePort();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
-		registry.add("sluice.h2-demux-engine", () -> "netty");
 		registry.add("sluice.limits.h2-queue-budget", () -> BUDGET + "B");
 		registry.add("sluice.access-log.rate-limit.enabled", () -> "false");
 		registry.add("sluice.token", () -> "it-token");

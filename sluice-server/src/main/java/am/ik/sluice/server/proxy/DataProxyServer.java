@@ -52,12 +52,13 @@ import org.slf4j.LoggerFactory;
  * header (HTTP/1.1) or {@code :authority} (HTTP/2 prior knowledge) of the request head.
  * Plaintext HTTP relays per request -- every HTTP/1.1 request head and every HTTP/2
  * stream is routed anew, so keep-alive successors and coalesced streams reach the
- * upstream of their own route (see {@link ReroutingRelay} and {@link Http2DemuxRelay});
- * TLS-terminated, encrypted-passthrough, and hostless connections relay verbatim over the
- * virtual connection of the resolved route. A TLS handshake (first byte {@code 0x16}) is
- * either terminated locally when an SSL bundle is configured (ALPN: h2 preferred over
- * http/1.1), or relayed untouched in passthrough mode otherwise, routed by the SNI host
- * name of the ClientHello (the backend terminates TLS and presents its own certificate).
+ * upstream of their own route (see {@link ReroutingRelay} and
+ * {@link NettyHttp2DemuxRelay}); TLS-terminated, encrypted-passthrough, and hostless
+ * connections relay verbatim over the virtual connection of the resolved route. A TLS
+ * handshake (first byte {@code 0x16}) is either terminated locally when an SSL bundle is
+ * configured (ALPN: h2 preferred over http/1.1), or relayed untouched in passthrough mode
+ * otherwise, routed by the SNI host name of the ClientHello (the backend terminates TLS
+ * and presents its own certificate).
  */
 @Component
 public class DataProxyServer implements SmartLifecycle, Drainable {
@@ -107,13 +108,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	/** Handed to every HTTP/1.1 relay started from now on. */
 	private volatile ReroutingRelay.ProbeSeam probeSeam = ReroutingRelay.ProbeSeam.NONE;
 
-	/** Handed to every h2 demux relay started from now on. */
-	private volatile Http2DemuxRelay.WriteSeam h2WriteSeam = Http2DemuxRelay.WriteSeam.NONE;
-
-	/** The relay every h2 connection demultiplexed from now on gets. */
-	private volatile SluiceServerProperties.H2DemuxEngine h2DemuxEngine;
-
-	/** The wait deadline every netty h2 demux relay started from now on gets. */
+	/** The wait deadline every h2 demux relay started from now on gets. */
 	private volatile Duration h2StreamWaitTimeout;
 
 	/** Wraps the client pipe of every HTTP/1.1 relay started from now on. */
@@ -138,7 +133,6 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		this.sslContext = sslContext;
 		this.errorResponse = errorResponse;
 		this.limits = limits;
-		this.h2DemuxEngine = properties.h2DemuxEngine();
 		this.h2StreamWaitTimeout = properties.limits().h2StreamWaitTimeout();
 	}
 
@@ -385,38 +379,31 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			// later streams would bypass their own routing and access control
 			Runnable relayed = this.relayed(access);
 			if (http2) {
-				SluiceServerProperties.H2DemuxEngine engine = this.h2DemuxEngine;
-				Runnable demux = switch (engine) {
-					case LEGACY -> new Http2DemuxRelay(conn.pipe(), conn.head(), this.router, this.sessions,
-							this.accessControl, this.errorResponse, access, this.h2DemuxMeters, this.limits, route0,
-							session, peer, deadline, this.h2WriteSeam, relayed, release)::start;
-					case NETTY -> NettyHttp2DemuxRelay.builder()
-						.pipe(conn.pipe())
-						.head(conn.head())
-						.router(this.router)
-						.sessions(this.sessions)
-						.accessControl(this.accessControl)
-						.errorResponse(this.errorResponse)
-						.access(access)
-						.meters(this.h2DemuxMeters)
-						.initialRoute(route0, session)
-						.peer(peer)
-						.deadline(deadline)
-						.streamWaitTimeout(this.h2StreamWaitTimeout)
-						.budget(this.limits.h2Budget())
-						.onFinish(relayed)
-						.release(release)
-						.build()::start;
-				};
+				NettyHttp2DemuxRelay demux = NettyHttp2DemuxRelay.builder()
+					.pipe(conn.pipe())
+					.head(conn.head())
+					.router(this.router)
+					.sessions(this.sessions)
+					.accessControl(this.accessControl)
+					.errorResponse(this.errorResponse)
+					.access(access)
+					.meters(this.h2DemuxMeters)
+					.initialRoute(route0, session)
+					.peer(peer)
+					.deadline(deadline)
+					.streamWaitTimeout(this.h2StreamWaitTimeout)
+					.budget(this.limits.h2Budget())
+					.onFinish(relayed)
+					.release(release)
+					.build();
 				this.activeConnections.incrementAndGet();
 				try {
-					demux.run();
+					demux.start();
 				}
 				catch (RuntimeException e) {
 					this.activeConnections.decrementAndGet();
 					throw e;
 				}
-				this.h2DemuxMeters.demuxed(engine);
 				return true;
 			}
 			ReroutingRelay rerouting = new ReroutingRelay(this.clientPipeSeam.apply(conn.pipe()), conn.head(),
@@ -616,24 +603,11 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	}
 
 	/**
-	 * Sets the engine of the h2 demux relays started from now on, in place of
-	 * {@code sluice.h2-demux-engine}; for tests.
-	 */
-	void h2DemuxEngine(SluiceServerProperties.H2DemuxEngine h2DemuxEngine) {
-		this.h2DemuxEngine = h2DemuxEngine;
-	}
-
-	/**
-	 * Sets the wait deadline of the netty h2 demux relays started from now on, in place
-	 * of {@code sluice.limits.h2-stream-wait-timeout}; for tests.
+	 * Sets the wait deadline of the h2 demux relays started from now on, in place of
+	 * {@code sluice.limits.h2-stream-wait-timeout}; for tests.
 	 */
 	void h2StreamWaitTimeout(Duration h2StreamWaitTimeout) {
 		this.h2StreamWaitTimeout = h2StreamWaitTimeout;
-	}
-
-	/** Sets the write seam of the h2 demux relays started from now on; for tests. */
-	void h2WriteSeam(Http2DemuxRelay.WriteSeam h2WriteSeam) {
-		this.h2WriteSeam = h2WriteSeam;
 	}
 
 	/**

@@ -27,10 +27,9 @@ import org.springframework.stereotype.Component;
  * (HTTP/1.1, or HTTP/2 for prior knowledge and ALPN h2), after which the connection
  * closes: the 503 no-route page for a request no tunnel session can serve, the 403
  * forbidden page for a peer address the access control excludes, a bare HTTP/1.1 400 for
- * a malformed request, the HTTP/2 502 for a stream its upstream lost (a page for a relay
- * whose codec holds it to the client's window, else bodiless), a bodiless HTTP/2 421 for
- * a stream of a route reached over HTTP/1.1 only, and a GOAWAY {@code COMPRESSION_ERROR}
- * for an HTTP/2 head whose header block does not decode.
+ * a malformed request, the HTTP/2 502 page for a stream its upstream lost, a bodiless
+ * HTTP/2 421 for a stream of a route reached over HTTP/1.1 only, and a GOAWAY
+ * {@code COMPRESSION_ERROR} for an HTTP/2 head whose header block does not decode.
  */
 @Component
 public class ErrorResponse {
@@ -92,50 +91,11 @@ public class ErrorResponse {
 	}
 
 	/**
-	 * The no-route response on a single stream of a living HTTP/2 connection: a later
-	 * stream of a demultiplexed connection is answered without touching its siblings.
-	 */
-	public byte[] noRouteStream(int streamId, @Nullable String host,
-			ConnectionHeadParser.Head.@Nullable Request request) {
-		return this.streamResponse(streamId, this.noRoute, host, request);
-	}
-
-	/**
-	 * The forbidden response on a single stream of a living HTTP/2 connection.
-	 */
-	public byte[] forbiddenStream(int streamId, @Nullable String host,
-			ConnectionHeadParser.Head.@Nullable Request request) {
-		return this.streamResponse(streamId, this.forbidden, host, request);
-	}
-
-	/**
-	 * The response on a single stream of a living HTTP/2 connection whose upstream lost
-	 * it before answering: {@code 502} without a body, so it takes no flow-control
-	 * window.
-	 */
-	public byte[] badGatewayStream(int streamId) {
-		Http2Headers headers = new DefaultHttp2Headers().status("502")
-			.set("content-length", "0")
-			.set("cache-control", "no-store");
-		Http2Frames frames = new Http2Frames(streamId);
-		frames.write(Http2Frame.HEADERS_END_STREAM, headerBlock(streamId, headers));
-		return frames.toByteArray();
-	}
-
-	/**
 	 * The response on a single stream of a living HTTP/2 connection that this connection
-	 * cannot serve -- its route's upstream is reached over HTTP/1.1 only: {@code 421}
-	 * without a body (RFC 9110 15.5.20), so it takes no flow-control window, and the
-	 * client may retry the request on another connection.
-	 */
-	public byte[] misdirectedStream(int streamId) {
-		Http2Frames frames = new Http2Frames(streamId);
-		frames.write(Http2Frame.HEADERS_END_STREAM, headerBlock(streamId, misdirectedHeaders()));
-		return frames.toByteArray();
-	}
-
-	/**
-	 * The head of {@link #misdirectedStream}, for a relay whose HTTP/2 codec frames it.
+	 * cannot serve -- its route's upstream is reached over HTTP/1.1 only: the head of a
+	 * {@code 421} without a body (RFC 9110 15.5.20), so it takes no flow-control window,
+	 * and the client may retry the request on another connection; for a relay whose
+	 * HTTP/2 codec frames it.
 	 */
 	public Http2Headers misdirectedHeaders() {
 		return new DefaultHttp2Headers().status("421").set("content-length", "0").set("cache-control", "no-store");
@@ -161,21 +121,6 @@ public class ErrorResponse {
 	 */
 	public StreamPage badGatewayPage(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request) {
 		return this.streamPage(this.badGateway, host, request);
-	}
-
-	private byte[] streamResponse(int streamId, Page page, @Nullable String host,
-			ConnectionHeadParser.Head.@Nullable Request request) {
-		StreamPage response = this.streamPage(page, host, request);
-		byte[] body = response.body();
-		Http2Frames frames = new Http2Frames(streamId);
-		frames.write(body.length > 0 ? Http2Frame.HEADERS : Http2Frame.HEADERS_END_STREAM,
-				headerBlock(streamId, response.headers()));
-		for (int offset = 0; offset < body.length; offset += MAX_FRAME_SIZE) {
-			int end = Math.min(offset + MAX_FRAME_SIZE, body.length);
-			frames.write(end == body.length ? Http2Frame.DATA_END_STREAM : Http2Frame.DATA,
-					Arrays.copyOfRange(body, offset, end));
-		}
-		return frames.toByteArray();
 	}
 
 	private StreamPage streamPage(Page page, @Nullable String host,

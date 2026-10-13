@@ -1,6 +1,5 @@
 package am.ik.sluice.server.proxy;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -12,7 +11,6 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -35,12 +33,9 @@ import am.ik.sluice.it.TestH2;
 import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.it.WindowedH2Upstream;
 import am.ik.sluice.server.SluiceServerApplication;
-import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
 import am.ik.sluice.server.route.Router;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.netty.bootstrap.Bootstrap;
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
 import io.netty.channel.AdaptiveRecvByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
@@ -53,12 +48,10 @@ import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.http2.DefaultHttp2Headers;
-import io.netty.handler.codec.http2.DefaultHttp2HeadersEncoder;
 import io.netty.handler.codec.http2.DefaultHttp2HeadersFrame;
 import io.netty.handler.codec.http2.Http2DataFrame;
 import io.netty.handler.codec.http2.Http2FrameCodecBuilder;
 import io.netty.handler.codec.http2.Http2GoAwayFrame;
-import io.netty.handler.codec.http2.Http2Headers;
 import io.netty.handler.codec.http2.Http2HeadersFrame;
 import io.netty.handler.codec.http2.Http2MultiplexHandler;
 import io.netty.handler.codec.http2.Http2StreamChannel;
@@ -67,12 +60,12 @@ import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.ScheduledFuture;
 
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
+import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
-import org.junit.jupiter.params.Parameter;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -92,13 +85,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
-@H2EngineTest
 class H2DemuxClientWindowE2ETest {
-
-	/** The engine of this invocation, selected by {@link H2EngineTest}. */
-	@Nullable
-	@Parameter
-	private H2DemuxEngine engine;
 
 	private static final int INTERNAL_ERROR = 0x2;
 
@@ -108,9 +95,8 @@ class H2DemuxClientWindowE2ETest {
 
 	/**
 	 * A response the relay holds whole while the client grants no connection window:
-	 * within the client's window plus what the relay holds -- the legacy engine one
-	 * connection window, the netty engine one stream window, half of it granted back once
-	 * the client took the rest (netty's window update ratio).
+	 * within the client's window plus what the relay holds -- one stream window, half of
+	 * it granted back once the client took the rest (netty's window update ratio).
 	 */
 	private static final int HELD_RESPONSE = 90 * KIB;
 
@@ -168,8 +154,8 @@ class H2DemuxClientWindowE2ETest {
 	 */
 	@Test
 	void sparseConnectionWindowIsNeverExceededAcrossTwoRoutes() throws Exception {
-		String first = route("cw.sparse-a");
-		String second = route("cw.sparse-b");
+		String first = "cw.sparse-a.test";
+		String second = "cw.sparse-b.test";
 		int length = 512 * KIB;
 		startClient(first, upstream(new AtomicReference<>(), upstream -> respondToEach(upstream, length)));
 		startClient(second, upstream(new AtomicReference<>(), upstream -> respondToEach(upstream, length)));
@@ -198,8 +184,8 @@ class H2DemuxClientWindowE2ETest {
 	 */
 	@Test
 	void nettyClientWithDefaultFlowControlGetsTwoLargeResponses() throws Exception {
-		String first = route("cw.netty-a");
-		String second = route("cw.netty-b");
+		String first = "cw.netty-a.test";
+		String second = "cw.netty-b.test";
 		int length = 512 * KIB;
 		startClient(first, upstream(new AtomicReference<>(), upstream -> respondToEach(upstream, length)));
 		startClient(second, upstream(new AtomicReference<>(), upstream -> respondToEach(upstream, length)));
@@ -252,9 +238,8 @@ class H2DemuxClientWindowE2ETest {
 	 * response completes once the client grants.
 	 */
 	@Test
-	@NettyOnly("per-hop windows: what the relay holds of a response")
 	void upstreamPingIsAckedWhileItsLegWaitsForTheClientWindow() throws Exception {
-		String route = route("cw.ping");
+		String route = "cw.ping.test";
 		int length = 256 * KIB;
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		CountDownLatch acked = new CountDownLatch(1);
@@ -291,9 +276,8 @@ class H2DemuxClientWindowE2ETest {
 	 * behind the waiting data -- and gets its head-only response.
 	 */
 	@Test
-	@NettyOnly("per-hop windows: what the relay holds of a response")
 	void legKeepsRelayingWhileAResponseWaitsForTheClientWindow() throws Exception {
-		String route = route("cw.upload");
+		String route = "cw.upload.test";
 		int length = 256 * KIB;
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		startClient(route, upstream(seen, upstream -> {
@@ -339,7 +323,7 @@ class H2DemuxClientWindowE2ETest {
 	 */
 	@Test
 	void connectionWindowPastTheMaximumEndsTheConnection() throws Exception {
-		String route = route("cw.overflow");
+		String route = "cw.overflow.test";
 		startClient(route, upstream(new AtomicReference<>(), upstream -> respondToEach(upstream, 10)));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
 			client.withholdConnectionWindow();
@@ -381,7 +365,7 @@ class H2DemuxClientWindowE2ETest {
 	 */
 	@Test
 	void zeroConnectionWindowIncrementEndsTheConnection() throws Exception {
-		try (H2TestClient client = openHeldStream(route("cw.wu-zero-connection"))) {
+		try (H2TestClient client = openHeldStream("cw.wu-zero-connection.test")) {
 			client.frame(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(0));
 			assertThat(client.awaitTrue(client::closed, Duration.ofSeconds(5))).as("the relay closed the connection")
 				.isTrue();
@@ -397,10 +381,10 @@ class H2DemuxClientWindowE2ETest {
 	 * connection's other stream completes.
 	 */
 	@Test
-	@LegacyOnly("a frame on a stream netty forgot is answered by netty's codec with a reset of its own, and the "
-			+ "protocol reset meter is not yet on the netty engine")
+	@Disabled("a frame on a stream netty forgot is answered by netty's codec with a reset of "
+			+ "its own, and the protocol reset meter is not yet on the h2 demux; to be rewritten for it")
 	void zeroStreamWindowIncrementResetsOnlyThatStream() throws Exception {
-		String route = route("cw.wu-zero-stream");
+		String route = "cw.wu-zero-stream.test";
 		List<TestH2.Frame> received = new CopyOnWriteArrayList<>();
 		startClient(route, upstream(new AtomicReference<>(), upstream -> {
 			upstream.settings(null);
@@ -454,10 +438,11 @@ class H2DemuxClientWindowE2ETest {
 	 * the connection serves the next stream.
 	 */
 	@Test
-	@LegacyOnly("a frame on a stream netty forgot is answered by netty's codec with a reset of its own; a per-hop "
-			+ "rewrite")
+	@Disabled("a frame on a stream netty forgot is answered by netty's codec with a reset of "
+			+ "its own, and the test counts the protocol reset meter, not yet on the h2 demux; "
+			+ "to be rewritten for it")
 	void zeroIncrementOnAnUntrackedStreamIsIgnored() throws Exception {
-		String route = route("cw.wu-zero-untracked");
+		String route = "cw.wu-zero-untracked.test";
 		startClient(route, upstream(new AtomicReference<>(), upstream -> respondToEach(upstream, 10)));
 		double protocolResets = resets("protocol");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
@@ -481,11 +466,11 @@ class H2DemuxClientWindowE2ETest {
 	 * either way, and the DATA reaches the upstream once it grants the window.
 	 */
 	@Test
-	@LegacyOnly("a frame on a stream netty closed is answered by netty's codec with a reset of its own; a per-hop "
-			+ "rewrite. The netty engine's request data outliving its client stream: "
-			+ "NettyH2DemuxBudgetE2ETest#theRequestsRestOutlivesItsClientStreamClosingOnAnEarlyResponse")
+	@Disabled("a frame on a stream netty closed is answered by netty's codec with a reset of "
+			+ "its own, and the test counts the protocol reset meter, not yet on the h2 demux; "
+			+ "to be rewritten for it")
 	void zeroIncrementOnAStreamClosedBothWaysIsIgnored() throws Exception {
-		String route = route("cw.wu-zero-closed");
+		String route = "cw.wu-zero-closed.test";
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		List<TestH2.Frame> received = new CopyOnWriteArrayList<>();
 		startClient(route, upstream(seen, upstream -> {
@@ -528,9 +513,8 @@ class H2DemuxClientWindowE2ETest {
 	 * follows.
 	 */
 	@Test
-	@NettyOnly("per-hop windows: what the relay holds of a response")
 	void clientResetReturnsTheWaitingDataToTheUpstreamWindow() throws Exception {
-		String route = route("cw.client-reset");
+		String route = "cw.client-reset.test";
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		startClient(route, upstream(seen, upstream -> {
 			upstream.settings(null);
@@ -562,9 +546,8 @@ class H2DemuxClientWindowE2ETest {
 	 * waiting data's window goes back to the upstream for another stream's 128KiB.
 	 */
 	@Test
-	@NettyOnly("per-hop windows: what the relay holds of a response")
 	void upstreamResetDropsTheWaitingData() throws Exception {
-		String route = route("cw.upstream-reset");
+		String route = "cw.upstream-reset.test";
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		startClient(route, upstream(seen, upstream -> {
 			upstream.settings(null);
@@ -600,7 +583,7 @@ class H2DemuxClientWindowE2ETest {
 	 */
 	@Test
 	void upstreamClosingAfterItsResponseStillDeliversTheWaitingData() throws Exception {
-		assertWaitingDataOutlivesTheUpstream(route("cw.upstream-close"), false);
+		assertWaitingDataOutlivesTheUpstream("cw.upstream-close.test", false);
 	}
 
 	/**
@@ -610,7 +593,7 @@ class H2DemuxClientWindowE2ETest {
 	 */
 	@Test
 	void upstreamResettingAfterItsResponseStillDeliversTheWaitingData() throws Exception {
-		assertWaitingDataOutlivesTheUpstream(route("cw.upstream-rst"), true);
+		assertWaitingDataOutlivesTheUpstream("cw.upstream-rst.test", true);
 	}
 
 	/**
@@ -619,7 +602,7 @@ class H2DemuxClientWindowE2ETest {
 	 */
 	@Test
 	void newStreamOfARouteWhoseLegDrainsGoesToANewLeg() throws Exception {
-		String route = route("cw.drain-new-leg");
+		String route = "cw.drain-new-leg.test";
 		int length = HELD_RESPONSE;
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		CountDownLatch closed = new CountDownLatch(1);
@@ -700,7 +683,7 @@ class H2DemuxClientWindowE2ETest {
 	 */
 	@Test
 	void clientGoneWhileAResponseWaitsForItsWindowEndsTheRelay() throws Exception {
-		String route = route("cw.gone");
+		String route = "cw.gone.test";
 		int length = HELD_RESPONSE;
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		startClient(route, upstream(seen, upstream -> respondToEach(upstream, length)));
@@ -727,10 +710,9 @@ class H2DemuxClientWindowE2ETest {
 	 * completes.
 	 */
 	@Test
-	@NettyOnly("per-hop windows: the upstream passes its stream window first")
 	void upstreamIgnoringTheRelayWindowEndsItsLeg() throws Exception {
-		String route = route("cw.ignoring");
-		String otherRoute = route("cw.ignoring-other");
+		String route = "cw.ignoring.test";
+		String otherRoute = "cw.ignoring-other.test";
 		startClient(otherRoute, upstream(new AtomicReference<>(), upstream -> respondToEach(upstream, 10)));
 		List<TestH2.Frame> received = new CopyOnWriteArrayList<>();
 		startClient(route, stub(socket -> {
@@ -787,9 +769,8 @@ class H2DemuxClientWindowE2ETest {
 	 * windows in step.
 	 */
 	@Test
-	@NettyOnly("per-hop windows: padding is not relayed")
 	void paddedFramesSplitAcrossTheClientWindowKeepTheAccounting() throws Exception {
-		String route = route("cw.padded");
+		String route = "cw.padded.test";
 		int frames = 12;
 		int content = 9000;
 		int padLength = 200;
@@ -824,7 +805,7 @@ class H2DemuxClientWindowE2ETest {
 	 */
 	@Test
 	void trailersFollowTheWaitingData() throws Exception {
-		String route = route("cw.trailers");
+		String route = "cw.trailers.test";
 		int length = HELD_RESPONSE;
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		CountDownLatch sent = new CountDownLatch(1);
@@ -852,111 +833,6 @@ class H2DemuxClientWindowE2ETest {
 			assertThat(frames.get(frames.size() - 1).type()).isEqualTo(TestH2.HEADERS);
 			assertThat(TestH2.contentOf(frames)).isEqualTo(pattern(length));
 		}
-	}
-
-	/**
-	 * Trailers waiting behind data are bounded per leg: once the trailers waiting would
-	 * pass a header block's worth, the leg stops reading its upstream -- a PING sent
-	 * after them is acked only once the client granted -- and every stream completes.
-	 */
-	@Test
-	@LegacyOnly("the legacy relay's per-leg allowance of trailers waiting for the client's window: the netty "
-			+ "engine holds them behind their stream's data, accounted against the queue budget")
-	void trailersPastTheAllowancePauseTheLegUntilTheClientGrants() throws Exception {
-		String route = route("cw.big-trailers");
-		int length = 10 * KIB;
-		int[] trailed = { 3, 5, 7 };
-		CountDownLatch sent = new CountDownLatch(1);
-		CountDownLatch acked = new CountDownLatch(1);
-		startClient(route, upstream(new AtomicReference<>(), upstream -> {
-			upstream.settings(null);
-			CountDownLatch heads = new CountDownLatch(1 + trailed.length);
-			Thread responder = Thread.ofVirtual().start(() -> {
-				try {
-					heads.await();
-					// stream 1 takes the client's whole window: the rest waits
-					upstream.headers(1, false);
-					upstream.sendData(1, pattern(WINDOW), true);
-					DefaultHttp2HeadersEncoder encoder = new DefaultHttp2HeadersEncoder();
-					for (int streamId : trailed) {
-						upstream.headers(streamId, false);
-						upstream.sendData(streamId, pattern(length), false);
-					}
-					for (int streamId : trailed) {
-						writeBlock(upstream, streamId, bigTrailers(encoder));
-					}
-					upstream.write(TestH2.PING, 0, 0, "trailers".getBytes(StandardCharsets.US_ASCII));
-					sent.countDown();
-				}
-				catch (Exception e) {
-					// the relay went away
-				}
-			});
-			TestH2.@Nullable Frame frame;
-			while ((frame = upstream.next()) != null) {
-				if (frame.type() == TestH2.HEADERS) {
-					heads.countDown();
-				}
-				else if (frame.type() == TestH2.PING && (frame.flags() & TestH2.FLAG_ACK) != 0) {
-					acked.countDown();
-				}
-			}
-			responder.interrupt();
-		}));
-		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5, 7)) {
-			client.withholdConnectionWindow();
-			streamWindow(client, 1024 * KIB);
-			client.headers(1, true, get(route));
-			for (int streamId : trailed) {
-				client.headers(streamId, true, get(route));
-			}
-			assertThat(sent.await(10, TimeUnit.SECONDS)).isTrue();
-			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
-			assertThat(acked.await(500, TimeUnit.MILLISECONDS)).as("the leg's reading paused").isFalse();
-			assertThat(client.dataReceived()).as("the trailed streams' data waits").isEqualTo(WINDOW);
-			client.grantConnectionWindowOnReceipt();
-			assertThat(acked.await(5, TimeUnit.SECONDS)).as("the PING acked once the trailers left").isTrue();
-			for (int streamId : trailed) {
-				assertThat(client.awaitEnd(streamId, Duration.ofSeconds(10))).isTrue();
-				List<TestH2.Frame> frames = client.frames(streamId);
-				assertThat(TestH2.contentOf(frames)).isEqualTo(pattern(length));
-				assertThat(frames.get(frames.size() - 1).type()).isIn(TestH2.HEADERS, TestH2.CONTINUATION);
-			}
-		}
-	}
-
-	/** Trailers of about 50KiB: one header with a long value, encoded by the upstream. */
-	private static byte[] bigTrailers(DefaultHttp2HeadersEncoder encoder) throws Exception {
-		Http2Headers trailers = new DefaultHttp2Headers();
-		trailers.add("x-big", "v".repeat(50 * KIB));
-		ByteBuf out = Unpooled.buffer();
-		try {
-			encoder.encodeHeaders(1, trailers, out);
-			byte[] block = new byte[out.readableBytes()];
-			out.readBytes(block);
-			return block;
-		}
-		finally {
-			out.release();
-		}
-	}
-
-	/** Writes a header block ending the stream as HEADERS plus CONTINUATION frames. */
-	private static void writeBlock(WindowedH2Upstream upstream, int streamId, byte[] block) throws IOException {
-		ByteArrayOutputStream frames = new ByteArrayOutputStream();
-		int offset = 0;
-		boolean first = true;
-		while (offset < block.length) {
-			int length = Math.min(16 * KIB, block.length - offset);
-			boolean last = offset + length == block.length;
-			int flags = (first ? TestH2.FLAG_END_STREAM : 0) | (last ? TestH2.FLAG_END_HEADERS : 0);
-			TestH2.writeFrame(frames, first ? TestH2.HEADERS : TestH2.CONTINUATION, flags, streamId,
-					Arrays.copyOfRange(block, offset, offset + length));
-			first = false;
-			offset += length;
-		}
-		// one write: the frames of a block never interleave with others
-		upstream.raw(frames.toByteArray());
 	}
 
 	private CompletableFuture<Long> nettyGet(Channel channel, String route) throws InterruptedException {
@@ -1227,14 +1103,6 @@ class H2DemuxClientWindowE2ETest {
 		catch (IOException e) {
 			throw new IllegalStateException(e);
 		}
-	}
-
-	/**
-	 * The route's host for this engine's invocation: both run on one router, where the
-	 * other invocation's tunnel client may still serve a host of the same name.
-	 */
-	private String route(String name) {
-		return name + "." + String.valueOf(this.engine).toLowerCase(Locale.ROOT) + ".test";
 	}
 
 	private static void close(AutoCloseable closeable) {

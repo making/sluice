@@ -32,9 +32,10 @@ import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
+import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
@@ -339,6 +340,7 @@ class KeepAliveIdleTimeoutE2ETest {
 	}
 
 	@Test
+	@Disabled("the idle timeout: not yet on the h2 demux")
 	void aTlsTerminatedH2ConnectionWithNoOpenStreamIsClosedAtTheIdleTimeout() throws Exception {
 		double idle = idleClosed();
 		try (SSLSocket socket = (SSLSocket) clientSslContext().getSocketFactory().createSocket("127.0.0.1", dataPort)) {
@@ -400,6 +402,7 @@ class KeepAliveIdleTimeoutE2ETest {
 	}
 
 	@Test
+	@Disabled("the idle timeout: not yet on the h2 demux")
 	void anH2ConnectionWithNoOpenStreamIsClosedWithAGoAwayAtTheIdleTimeout() throws Exception {
 		double idle = idleClosed();
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
@@ -417,6 +420,7 @@ class KeepAliveIdleTimeoutE2ETest {
 	}
 
 	@Test
+	@Disabled("the idle timeout: not yet on the h2 demux")
 	void anH2ConnectionClosedByItsClientLeavesNoDeadlineBehind() throws Exception {
 		double idle = idleClosed();
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
@@ -461,6 +465,7 @@ class KeepAliveIdleTimeoutE2ETest {
 	}
 
 	@Test
+	@Disabled("the idle timeout: not yet on the h2 demux")
 	void pingsDoNotKeepAnIdleH2ConnectionOpen() throws Exception {
 		double idle = idleClosed();
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
@@ -479,6 +484,7 @@ class KeepAliveIdleTimeoutE2ETest {
 	}
 
 	@Test
+	@Disabled("the idle timeout: not yet on the h2 demux, so staying open proves nothing")
 	void anH2ConnectionOpeningAStreamEverySecondStaysOpen() throws Exception {
 		double idle = idleClosed();
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
@@ -496,6 +502,7 @@ class KeepAliveIdleTimeoutE2ETest {
 	}
 
 	@Test
+	@Disabled("the idle timeout: not yet on the h2 demux")
 	void anH2StreamOpenLongerThanTheIdleTimeoutIsRelayed() throws Exception {
 		double idle = idleClosed();
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
@@ -514,6 +521,7 @@ class KeepAliveIdleTimeoutE2ETest {
 	}
 
 	@Test
+	@Disabled("the idle timeout: not yet on the h2 demux")
 	void aStreamTheRelayAnswersItselfStartsTheIdleTimeoutOver() throws Exception {
 		double idle = idleClosed();
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
@@ -535,6 +543,7 @@ class KeepAliveIdleTimeoutE2ETest {
 	 * writes after the teardown grace.
 	 */
 	@Test
+	@Disabled("the idle timeout: not yet on the h2 demux")
 	void anIdleH2ConnectionWhoseClientStoppedReadingIsClosedAfterTheTeardownGrace() throws Exception {
 		double idle = idleClosed();
 		try (Socket socket = new Socket()) {

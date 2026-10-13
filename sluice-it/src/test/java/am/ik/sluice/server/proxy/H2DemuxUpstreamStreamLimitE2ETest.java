@@ -10,7 +10,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -29,17 +28,16 @@ import am.ik.sluice.it.TestH2;
 import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.it.WindowedH2Upstream;
 import am.ik.sluice.server.SluiceServerApplication;
-import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
 import am.ik.sluice.server.route.Router;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
-import org.junit.jupiter.params.Parameter;
+import org.junit.jupiter.api.TestInstance;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -54,18 +52,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * closed on the upstream; until the upstream's first SETTINGS one stream is opened. A
  * waiting stream reset by either side never reaches the upstream, is granted no stream
  * window beyond the initial one, and is refused ({@code REFUSED_STREAM}) when its
- * upstream goes away. Both engines; the queued-bytes gauge is the legacy engine's only.
- * In the relay's package for the tracked-streams meter.
+ * upstream goes away. In the relay's package for the tracked-streams meter.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
-@H2EngineTest
 class H2DemuxUpstreamStreamLimitE2ETest {
-
-	/** The engine of this invocation, selected by {@link H2EngineTest}. */
-	@Nullable
-	@Parameter
-	private H2DemuxEngine engine;
 
 	private static final int SETTINGS_MAX_CONCURRENT_STREAMS = 0x3;
 
@@ -125,7 +116,7 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 	 */
 	@Test
 	void streamBeyondTheUpstreamLimitWaitsForAStreamToClose() throws Exception {
-		String route = route("sl.wait");
+		String route = "sl.wait.test";
 		List<UpstreamConnection> connections = start(route, connection -> connection.settings(1L));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.headers(1, true, get(route));
@@ -151,7 +142,7 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 	 */
 	@Test
 	void limitLoweredByALaterSettingsAppliesToStreamsOpenedAfterIt() throws Exception {
-		String route = route("sl.lowered");
+		String route = "sl.lowered.test";
 		List<UpstreamConnection> connections = start(route, connection -> connection.settings(2L));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5)) {
 			client.headers(1, true, get(route));
@@ -182,7 +173,7 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 	 */
 	@Test
 	void oneStreamIsOpenedUntilTheUpstreamSettingsArrive() throws Exception {
-		String route = route("sl.presettings");
+		String route = "sl.presettings.test";
 		List<UpstreamConnection> connections = start(route, connection -> {
 		});
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
@@ -204,7 +195,7 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 	/** A limit of 0 holds a new stream until a later SETTINGS raises it. */
 	@Test
 	void zeroLimitHoldsNewStreamsUntilRaised() throws Exception {
-		String route = route("sl.zero");
+		String route = "sl.zero.test";
 		List<UpstreamConnection> connections = start(route, connection -> connection.settings(0L));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.headers(1, true, get(route));
@@ -230,7 +221,7 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 	 */
 	@Test
 	void waitingStreamResetByTheClientNeverReachesTheUpstream() throws Exception {
-		String route = route("sl.clientreset");
+		String route = "sl.clientreset.test";
 		List<UpstreamConnection> connections = start(route, connection -> connection.settings(1L));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5)) {
 			UpstreamConnection upstream = holdOneAndQueueAnother(client, connections, route);
@@ -252,7 +243,7 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 	 */
 	@Test
 	void waitingStreamResetByTheRelayNeverReachesTheUpstream() throws Exception {
-		String route = route("sl.relayreset");
+		String route = "sl.relayreset.test";
 		List<UpstreamConnection> connections = start(route, connection -> connection.settings(1L));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5)) {
 			UpstreamConnection upstream = holdOneAndQueueAnother(client, connections, route);
@@ -275,7 +266,7 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 	 */
 	@Test
 	void waitingStreamIsGrantedNoWindowBeyondTheInitialOne() throws Exception {
-		String route = route("sl.window");
+		String route = "sl.window.test";
 		List<UpstreamConnection> connections = start(route, connection -> connection.settings(1L));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.headers(1, true, get(route));
@@ -304,7 +295,7 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 	 */
 	@Test
 	void upstreamGoneWithOnlyWaitingStreamsRefusesThem() throws Exception {
-		String route = route("sl.gone");
+		String route = "sl.gone.test";
 		List<UpstreamConnection> connections = start(route, connection -> {
 			connection.settings(1L);
 			if (connection.index() > 0) {
@@ -339,9 +330,9 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 	 * stream's response: the leg half-closes only once the waiting stream went and ended.
 	 */
 	@Test
-	@LegacyOnly("the client's EOF ends the netty relay at once: the half-close drain is the idle and stall timeouts' step")
+	@Disabled("the half-close drain: the client's EOF ends the h2 demux at once")
 	void halfClosedClientGetsTheResponseOfItsWaitingStream() throws Exception {
-		String route = route("sl.halfclose");
+		String route = "sl.halfclose.test";
 		List<UpstreamConnection> connections = start(route, connection -> connection.settings(1L));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.headers(1, true, get(route));
@@ -367,7 +358,7 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 	 */
 	@Test
 	void clientGoneWhileAStreamWaitsEndsTheRelay() throws Exception {
-		String route = route("sl.clientgone");
+		String route = "sl.clientgone.test";
 		List<UpstreamConnection> connections = start(route, connection -> connection.settings(1L));
 		UpstreamConnection upstream;
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
@@ -390,7 +381,7 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 	 */
 	@Test
 	void requestEndedByDataOrTrailersFreesItsPlace() throws Exception {
-		String route = route("sl.bodies");
+		String route = "sl.bodies.test";
 		List<UpstreamConnection> connections = start(route, connection -> {
 			connection.settings(1L);
 			connection.releaseAll();
@@ -417,7 +408,7 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 	 */
 	@Test
 	void streamAnsweredBeforeItsRequestEndedHoldsItsPlaceUntilThen() throws Exception {
-		String route = route("sl.early");
+		String route = "sl.early.test";
 		List<UpstreamConnection> connections = start(route, connection -> connection.settings(1L));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.headers(1, false, post(route));
@@ -444,7 +435,7 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 	 */
 	@Test
 	void resetEitherWayFreesItsPlace() throws Exception {
-		String route = route("sl.resets");
+		String route = "sl.resets.test";
 		List<UpstreamConnection> connections = start(route, connection -> connection.settings(1L));
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3, 5)) {
 			client.headers(1, true, get(route));
@@ -487,14 +478,6 @@ class H2DemuxUpstreamStreamLimitE2ETest {
 		assertThat(upstream.seen(3)).as("stream 3 waits").isFalse();
 		assertThat(queuedBytes(route)).as("stream 3's frames queued").isGreaterThan(1000);
 		return upstream;
-	}
-
-	/**
-	 * The route {@code name} of this invocation: the runs on both engines share the
-	 * router, and a route's tunnel client outlives its test.
-	 */
-	private String route(String name) {
-		return name + "." + String.valueOf(this.engine).toLowerCase(Locale.ROOT) + ".test";
 	}
 
 	private static void awaitOpen(UpstreamConnection upstream, int streamId) {

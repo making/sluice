@@ -30,16 +30,12 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
-import org.junit.jupiter.params.Parameter;
 import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
-import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
-import am.ik.sluice.server.proxy.H2EngineTest;
-import am.ik.sluice.server.proxy.LegacyOnly;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -66,13 +62,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
-@H2EngineTest
 class TlsDataPlaneE2ETest {
-
-	/** The engine of this invocation, selected by {@link H2EngineTest}. */
-	@Nullable
-	@Parameter
-	private H2DemuxEngine engine;
 
 	private static final TaskExecutor TASK_EXECUTOR = task -> Thread.ofVirtual().name("e2e-tls-worker").start(task);
 
@@ -249,7 +239,7 @@ class TlsDataPlaneE2ETest {
 		this.startClient();
 		// the connections of the other tests' pooled clients stay open: told apart by
 		// path
-		String path = "/close-" + this.engine;
+		String path = "/close";
 		String id;
 		try (H2TestClient h2 = H2TestClient.over(tls("tls.local", "h2"), 1)) {
 			h2.headers(1, true,
@@ -309,7 +299,6 @@ class TlsDataPlaneE2ETest {
 	}
 
 	@Test
-	@LegacyOnly("HTTP/1.1: no h2 demux")
 	void httpsHttp1_1Fallback() throws Exception {
 		this.startClient();
 		tlsRestClient(HttpClient.Version.HTTP_1_1).get()
@@ -322,7 +311,6 @@ class TlsDataPlaneE2ETest {
 	}
 
 	@Test
-	@LegacyOnly("answered before the h2 demux: the connection's head has no route")
 	void unroutedHostGetsTheNoRoutePageOverH2() throws Exception {
 		this.startClient();
 		tlsRestClient(HttpClient.Version.HTTP_2).get()
@@ -337,7 +325,6 @@ class TlsDataPlaneE2ETest {
 	}
 
 	@Test
-	@LegacyOnly("HTTP/1.1: no h2 demux")
 	void plaintextHttp1_1StillWorksOnTheSamePort() throws Exception {
 		this.startClient();
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
@@ -357,7 +344,6 @@ class TlsDataPlaneE2ETest {
 	 * offers h2, so h1-only upstreams are reached over HTTP/1.1.
 	 */
 	@Test
-	@LegacyOnly("HTTP/1.1: no h2 demux")
 	void forceHttp1RouteNegotiatesHttp1_1OverAlpn() throws Exception {
 		this.startClient();
 		try (SSLSocket socket = (SSLSocket) clientSslContext().getSocketFactory().createSocket("127.0.0.1", dataPort)) {

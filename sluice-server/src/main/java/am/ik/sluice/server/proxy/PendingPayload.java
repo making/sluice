@@ -5,10 +5,11 @@ import java.util.Arrays;
 import io.netty.buffer.ByteBuf;
 
 /**
- * The DATA payload of one h2 stream queued for its leg writer: appended at the back,
- * taken from the front. Its array holds what is pending rounded up to {@link #GRANULE},
- * and is dropped once empty, so a drained stream keeps no buffer and the capacity -- the
- * bytes the relay accounts -- exceeds the payload by less than one granule.
+ * The DATA payload of one h2 stream waiting to be written on the other hop: appended at
+ * the back, taken whole. Its array holds what is pending rounded up to {@link #GRANULE},
+ * and is handed over or dropped once taken, so a drained stream keeps no buffer and the
+ * capacity -- the bytes the relay accounts -- exceeds the payload by less than one
+ * granule.
  */
 final class PendingPayload {
 
@@ -31,14 +32,6 @@ final class PendingPayload {
 		return this.bytes.length;
 	}
 
-	void append(byte[] source, int offset, int length) {
-		if (this.size + length > this.bytes.length) {
-			this.bytes = Arrays.copyOf(this.bytes, roundUp(this.size + length));
-		}
-		System.arraycopy(source, offset, this.bytes, this.size, length);
-		this.size += length;
-	}
-
 	/** Appends the readable bytes of {@code source}, leaving its indexes as they are. */
 	void append(ByteBuf source) {
 		int length = source.readableBytes();
@@ -57,18 +50,6 @@ final class PendingPayload {
 		byte[] taken = this.bytes;
 		this.bytes = EMPTY;
 		this.size = 0;
-		return taken;
-	}
-
-	/** Takes the first {@code length} bytes; the rest moves to an array sized to it. */
-	byte[] take(int length) {
-		if (length == 0) {
-			return EMPTY;
-		}
-		byte[] taken = Arrays.copyOf(this.bytes, length);
-		int rest = this.size - length;
-		this.bytes = rest == 0 ? EMPTY : Arrays.copyOfRange(this.bytes, length, length + roundUp(rest));
-		this.size = rest;
 		return taken;
 	}
 

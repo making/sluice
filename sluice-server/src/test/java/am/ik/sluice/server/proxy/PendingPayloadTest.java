@@ -1,5 +1,9 @@
 package am.ik.sluice.server.proxy;
 
+import java.util.Arrays;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -9,41 +13,44 @@ class PendingPayloadTest {
 	@Test
 	void capacityFollowsThePayloadInGranules() {
 		PendingPayload pending = new PendingPayload();
-		pending.append(bytes(1, 0), 0, 1);
+		pending.append(Unpooled.wrappedBuffer(bytes(1, 0)));
 		assertThat(pending.capacity()).isEqualTo(PendingPayload.GRANULE);
-		pending.append(bytes(PendingPayload.GRANULE, 1), 0, PendingPayload.GRANULE);
+		pending.append(Unpooled.wrappedBuffer(bytes(PendingPayload.GRANULE, 1)));
 		assertThat(pending.size()).isEqualTo(PendingPayload.GRANULE + 1);
 		assertThat(pending.capacity()).isEqualTo(2 * PendingPayload.GRANULE);
 	}
 
 	@Test
-	void takeReturnsTheFrontAndShrinksTheArrayToTheRest() {
+	void appendCopiesTheReadableBytesAndLeavesTheSourceIndexes() {
 		PendingPayload pending = new PendingPayload();
-		byte[] payload = bytes(5000, 0);
-		pending.append(payload, 0, payload.length);
-		assertThat(pending.capacity()).isEqualTo(5 * PendingPayload.GRANULE);
-		byte[] front = pending.take(3000);
-		assertThat(front).isEqualTo(java.util.Arrays.copyOf(payload, 3000));
-		assertThat(pending.size()).isEqualTo(2000);
-		assertThat(pending.capacity()).isEqualTo(2 * PendingPayload.GRANULE);
-		assertThat(pending.take(2000)).isEqualTo(java.util.Arrays.copyOfRange(payload, 3000, 5000));
-		assertThat(pending.capacity()).as("a drained buffer keeps no array").isZero();
+		byte[] payload = bytes(3000, 0);
+		ByteBuf first = Unpooled.wrappedBuffer(payload, 0, 1500);
+		ByteBuf second = Unpooled.wrappedBuffer(payload);
+		second.readerIndex(1500);
+		pending.append(first);
+		pending.append(second);
+		assertThat(first.readerIndex()).isZero();
+		assertThat(second.readerIndex()).isEqualTo(1500);
+		assertThat(pending.size()).isEqualTo(3000);
+		assertThat(Arrays.copyOf(pending.takeAll(), 3000)).isEqualTo(payload);
 	}
 
 	@Test
-	void appendAfterAPartialTakeKeepsTheOrder() {
+	void takeAllHandsTheWholeArrayOverAndLeavesItEmpty() {
 		PendingPayload pending = new PendingPayload();
-		byte[] payload = bytes(3000, 0);
-		pending.append(payload, 0, 1500);
-		pending.take(1000);
-		pending.append(payload, 1500, 1500);
-		assertThat(pending.take(2000)).isEqualTo(java.util.Arrays.copyOfRange(payload, 1000, 3000));
+		byte[] payload = bytes(5000, 0);
+		pending.append(Unpooled.wrappedBuffer(payload));
+		byte[] taken = pending.takeAll();
+		assertThat(taken).hasSize(5 * PendingPayload.GRANULE);
+		assertThat(Arrays.copyOf(taken, payload.length)).isEqualTo(payload);
+		assertThat(pending.size()).isZero();
+		assertThat(pending.capacity()).as("a drained buffer keeps no array").isZero();
 	}
 
 	@Test
 	void clearDropsTheArray() {
 		PendingPayload pending = new PendingPayload();
-		pending.append(bytes(100, 0), 0, 100);
+		pending.append(Unpooled.wrappedBuffer(bytes(100, 0)));
 		pending.clear();
 		assertThat(pending.size()).isZero();
 		assertThat(pending.capacity()).isZero();

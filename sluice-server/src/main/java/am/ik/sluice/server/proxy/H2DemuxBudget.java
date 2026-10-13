@@ -5,12 +5,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * The bytes the h2 demux relays of a node may queue towards their upstreams beyond each
- * connection's own allowance, shared by all of them. A relay charges what it queues past
- * its allowance and releases it as its leg writers drain. What a relay may refuse -- a
- * new stream, the client's connection window -- it takes only while the budget has room
- * ({@link #tryCharge}, {@link #hasRoom}); what it may not refuse is charged regardless
- * ({@link #charge}).
+ * The bytes the h2 demux relays of a node may hold, both ways, beyond each connection's
+ * own allowance, shared by all of them. A relay charges what it holds past its allowance
+ * and releases it as its hops drain. What a relay may refuse -- a new stream, the
+ * connection windows -- it takes only while the budget has room ({@link #tryCharge},
+ * {@link #hasRoom}); what it may not refuse is charged regardless ({@link #charge}).
  * <p>
  * A relay that withheld the client's connection window waits for room with
  * {@link #awaitRoom}: once a release leaves the budget below its limit, every waiter runs

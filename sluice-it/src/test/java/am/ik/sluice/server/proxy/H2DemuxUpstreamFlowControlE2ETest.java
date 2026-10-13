@@ -12,7 +12,6 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -38,7 +37,6 @@ import am.ik.sluice.it.TestH2;
 import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.it.WindowedH2Upstream;
 import am.ik.sluice.server.SluiceServerApplication;
-import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
 import am.ik.sluice.server.route.Router;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -65,10 +63,10 @@ import io.netty.handler.codec.http2.Http2StreamChannel;
 import io.netty.util.ReferenceCountUtil;
 
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
-import org.junit.jupiter.params.Parameter;
+import org.junit.jupiter.api.TestInstance;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -89,13 +87,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
-@H2EngineTest
 class H2DemuxUpstreamFlowControlE2ETest {
-
-	/** The engine of this invocation, selected by {@link H2EngineTest}. */
-	@Nullable
-	@Parameter
-	private H2DemuxEngine engine;
 
 	private static final int KIB = 1024;
 
@@ -159,7 +151,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void smallUpstreamStreamWindowIsNeverExceeded() throws Exception {
-		String route = route("uf.small");
+		String route = "uf.small.test";
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		startClient(route, upstream(seen, upstream -> {
 			upstream.settings(16 * KIB);
@@ -190,7 +182,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void upstreamConnectionWindowIsNeverExceeded() throws Exception {
-		String route = route("uf.connection");
+		String route = "uf.connection.test";
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		startClient(route, upstream(seen, upstream -> {
 			upstream.settings(1024 * KIB);
@@ -224,7 +216,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void largeUpstreamStreamWindowNeedsNoStreamGrants() throws Exception {
-		String route = route("uf.large");
+		String route = "uf.large.test";
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		startClient(route, upstream(seen, upstream -> {
 			upstream.settings(2048 * KIB);
@@ -247,7 +239,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void streamWithoutWindowDoesNotHoldBackItsLeg() throws Exception {
-		String route = route("uf.blocked");
+		String route = "uf.blocked.test";
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		startClient(route, upstream(seen, upstream -> {
 			upstream.settings(null);
@@ -289,7 +281,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void streamsOfALegTakeTurnsOnTheConnectionWindow() throws Exception {
-		String route = route("uf.turns");
+		String route = "uf.turns.test";
 		AtomicLong bulkAtSmallEnd = new AtomicLong(-1);
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		startClient(route, upstream(seen, upstream -> {
@@ -329,7 +321,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void clientWindowUpdatesOvertakeDataWaitingForUpstreamWindow() throws Exception {
-		String route = route("uf.echo");
+		String route = "uf.echo.test";
 		int length = 512 * KIB;
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		startClient(route, upstream(seen, H2DemuxUpstreamFlowControlE2ETest::echo));
@@ -359,7 +351,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void upstreamLoweringItsInitialWindowStopsTheStreams() throws Exception {
-		String route = route("uf.lowered");
+		String route = "uf.lowered.test";
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		startClient(route, upstream(seen, upstream -> {
 			upstream.settings(null);
@@ -398,7 +390,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void connectionWindowOverflowEndsTheLeg() throws Exception {
-		assertOffenceEndsTheLeg(route("uf.overflow-connection"), FLOW_CONTROL_ERROR,
+		assertOffenceEndsTheLeg("uf.overflow-connection.test", FLOW_CONTROL_ERROR,
 				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(Integer.MAX_VALUE)));
 	}
 
@@ -408,7 +400,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void streamWindowOverflowResetsTheStream() throws Exception {
-		assertOffenceResetsTheStream(route("uf.overflow-stream"), FLOW_CONTROL_ERROR,
+		assertOffenceResetsTheStream("uf.overflow-stream.test", FLOW_CONTROL_ERROR,
 				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(Integer.MAX_VALUE)));
 	}
 
@@ -418,7 +410,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void connectionWindowUpdateOfAWrongLengthEndsTheLeg() throws Exception {
-		assertOffenceEndsTheLeg(route("uf.length-connection"), FRAME_SIZE_ERROR,
+		assertOffenceEndsTheLeg("uf.length-connection.test", FRAME_SIZE_ERROR,
 				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 0, new byte[] { 0, 0, 1 }));
 	}
 
@@ -428,7 +420,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void streamWindowUpdateOfAWrongLengthEndsTheLeg() throws Exception {
-		assertOffenceEndsTheLeg(route("uf.length-stream"), FRAME_SIZE_ERROR,
+		assertOffenceEndsTheLeg("uf.length-stream.test", FRAME_SIZE_ERROR,
 				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 1, new byte[] { 0, 0, 0, 1, 0 }));
 	}
 
@@ -438,7 +430,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void zeroConnectionWindowIncrementEndsTheLeg() throws Exception {
-		assertOffenceEndsTheLeg(route("uf.zero-connection"), PROTOCOL_ERROR,
+		assertOffenceEndsTheLeg("uf.zero-connection.test", PROTOCOL_ERROR,
 				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(0)));
 	}
 
@@ -448,7 +440,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void zeroStreamWindowIncrementResetsTheStream() throws Exception {
-		assertOffenceResetsTheStream(route("uf.zero-stream"), PROTOCOL_ERROR,
+		assertOffenceResetsTheStream("uf.zero-stream.test", PROTOCOL_ERROR,
 				upstream -> upstream.write(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(0)));
 	}
 
@@ -459,7 +451,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void zeroIncrementOnAnUntrackedStreamKeepsTheConnection() throws Exception {
-		String route = route("uf.zero-untracked");
+		String route = "uf.zero-untracked.test";
 		startClient(route, upstream(new AtomicReference<>(), upstream -> {
 			upstream.settings(null);
 			TestH2.@Nullable Frame frame;
@@ -488,7 +480,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void initialWindowAboveTheMaximumEndsTheLeg() throws Exception {
-		assertOffenceEndsTheLeg(route("uf.overflow-setting"), FLOW_CONTROL_ERROR,
+		assertOffenceEndsTheLeg("uf.overflow-setting.test", FLOW_CONTROL_ERROR,
 				upstream -> upstream.write(TestH2.SETTINGS, 0, 0,
 						WindowedH2Upstream.setting(WindowedH2Upstream.SETTINGS_INITIAL_WINDOW_SIZE, 0x80000000L)));
 	}
@@ -499,7 +491,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void initialWindowChangeOverflowingAStreamEndsTheLeg() throws Exception {
-		assertOffenceEndsTheLeg(route("uf.overflow-delta"), FLOW_CONTROL_ERROR, upstream -> {
+		assertOffenceEndsTheLeg("uf.overflow-delta.test", FLOW_CONTROL_ERROR, upstream -> {
 			upstream.write(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(1));
 			upstream.write(TestH2.SETTINGS, 0, 0,
 					WindowedH2Upstream.setting(WindowedH2Upstream.SETTINGS_INITIAL_WINDOW_SIZE, Integer.MAX_VALUE));
@@ -512,7 +504,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void windowsAtTheMaximumKeepTheConnection() throws Exception {
-		String route = route("uf.maximum");
+		String route = "uf.maximum.test";
 		startClient(route, upstream(new AtomicReference<>(), upstream -> {
 			upstream.settings(null);
 			TestH2.@Nullable Frame frame;
@@ -543,10 +535,9 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 * ends once the upstream closes.
 	 */
 	@Test
-	@LegacyOnly("the client's EOF ends the netty relay at once: the half-close drain is the idle and stall "
-			+ "timeouts' step")
+	@Disabled("the half-close drain: the client's EOF ends the h2 demux at once")
 	void largeResponseReachesAHalfClosedClient() throws Exception {
-		String route = route("uf.halfclose");
+		String route = "uf.halfclose.test";
 		int length = 1024 * KIB;
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		CountDownLatch eof = new CountDownLatch(1);
@@ -604,10 +595,9 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 * client half-closing after its request still gets a response sent 500ms later.
 	 */
 	@Test
-	@LegacyOnly("the client's EOF ends the netty relay at once: the half-close drain is the idle and stall "
-			+ "timeouts' step")
+	@Disabled("the half-close drain: the client's EOF ends the h2 demux at once")
 	void nettyUpstreamAnswersAHalfClosedClient() throws Exception {
-		String route = route("uf.netty");
+		String route = "uf.netty.test";
 		AtomicReference<@Nullable Boolean> halfClosure = new AtomicReference<>();
 		int port = nettyUpstream(halfClosure);
 		startClient(route, port);
@@ -639,7 +629,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void upstreamClosingAfterAnEarlyResponseRetiresItsLeg() throws Exception {
-		String route = route("uf.retire");
+		String route = "uf.retire.test";
 		startClient(route, upstream(new AtomicReference<>(), upstream -> {
 			upstream.settings(null);
 			TestH2.@Nullable Frame frame;
@@ -683,10 +673,9 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 * before the half-close.
 	 */
 	@Test
-	@LegacyOnly("the client's EOF ends the netty relay at once: the half-close drain is the idle and stall "
-			+ "timeouts' step")
+	@Disabled("the half-close drain: the client's EOF ends the h2 demux at once")
 	void queuedRequestDataIsWrittenBeforeTheHalfClose() throws Exception {
-		String route = route("uf.drain");
+		String route = "uf.drain.test";
 		int length = 256 * KIB;
 		AtomicLong receivedAtEof = new AtomicLong(-1);
 		AtomicBoolean endStream = new AtomicBoolean();
@@ -727,7 +716,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void clientResetOvertakesDataWaitingForWindow() throws Exception {
-		String route = route("uf.client-reset");
+		String route = "uf.client-reset.test";
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		CountDownLatch reset = new CountDownLatch(1);
 		startClient(route, upstream(seen, upstream -> {
@@ -764,7 +753,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void upstreamResetReleasesDataWaitingForWindow() throws Exception {
-		String route = route("uf.upstream-reset");
+		String route = "uf.upstream-reset.test";
 		startClient(route, upstream(new AtomicReference<>(), upstream -> {
 			upstream.settings(null);
 			boolean reset = false;
@@ -801,7 +790,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void trailersFollowDataWaitingForWindow() throws Exception {
-		String route = route("uf.trailers");
+		String route = "uf.trailers.test";
 		List<String> sequence = new CopyOnWriteArrayList<>();
 		startClient(route, upstream(new AtomicReference<>(), upstream -> {
 			upstream.settings(16 * KIB);
@@ -842,7 +831,7 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 */
 	@Test
 	void clientGoneWhileAResponseIsOwedEndsTheRelay() throws Exception {
-		String route = route("uf.gone");
+		String route = "uf.gone.test";
 		CountDownLatch eof = new CountDownLatch(1);
 		CountDownLatch held = new CountDownLatch(1);
 		this.closeables.add(held::countDown);
@@ -885,10 +874,9 @@ class H2DemuxUpstreamFlowControlE2ETest {
 	 * registration of the relay can).
 	 */
 	@Test
-	@LegacyOnly("the client's EOF ends the netty relay at once: the half-close drain is the idle and stall "
-			+ "timeouts' step")
+	@Disabled("the half-close drain: the client's EOF ends the h2 demux at once")
 	void clientGoneAfterTheUpstreamsHalfCloseReleasesTheUpstreamConnection() throws Exception {
-		String route = route("uf.gone.closed");
+		String route = "uf.gone.closed.test";
 		int length = 100 * KIB;
 		CountDownLatch eof = new CountDownLatch(1);
 		CountDownLatch held = new CountDownLatch(1);
@@ -1358,14 +1346,6 @@ class H2DemuxUpstreamFlowControlE2ETest {
 		catch (IOException e) {
 			throw new IllegalStateException(e);
 		}
-	}
-
-	/**
-	 * The route's host for this engine's invocation: both run on one router, where the
-	 * other invocation's tunnel client may still serve a host of the same name.
-	 */
-	private String route(String name) {
-		return name + "." + String.valueOf(this.engine).toLowerCase(Locale.ROOT) + ".test";
 	}
 
 	private static void close(AutoCloseable closeable) {

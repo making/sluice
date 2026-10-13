@@ -9,7 +9,6 @@ import java.net.Socket;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -25,9 +24,6 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
-import am.ik.sluice.server.config.SluiceServerProperties.H2DemuxEngine;
-import am.ik.sluice.server.proxy.H2EngineTest;
-import am.ik.sluice.server.proxy.NettyOnly;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.VirtualConnection;
 import io.micrometer.core.instrument.Gauge;
@@ -38,7 +34,6 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
-import org.junit.jupiter.params.Parameter;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -56,24 +51,18 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
-@H2EngineTest
 class H2DemuxFlowControlE2ETest {
-
-	/** The engine of this invocation, selected by {@link H2EngineTest}. */
-	@Nullable
-	@Parameter
-	private H2DemuxEngine engine;
 
 	/** The stream limit the relay advertises. */
 	private static final int MAX_CONCURRENT_STREAMS = 100;
 
-	/** The stream window the netty engine announces on both of its faces. */
+	/** The stream window the relay announces on both of its faces. */
 	private static final int NETTY_STREAM_WINDOW = 65535;
 
 	/** The backlog rounding of a stream's buffer, less than one granule. */
 	private static final int GRANULE = 1024;
 
-	/** The most a hop's writer queue holds on the netty engine. */
+	/** The most a hop's writer queue holds. */
 	private static final long NETTY_HOP_QUEUE_BYTES = 256 * 1024 + 64 * 1024;
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
@@ -124,9 +113,8 @@ class H2DemuxFlowControlE2ETest {
 	 * up and the queue stays below the bound the stream limit and budget derive.
 	 */
 	@Test
-	@NettyOnly("per-hop windows: the relay holds a stream window per stream")
 	void compliantClientWithManyStreamsIsNotTornDown() throws Exception {
-		String route = route("fc.many");
+		String route = "fc.many.test";
 		startClient(route, stub(socket -> grantHeadsThenStall(socket, MAX_CONCURRENT_STREAMS)));
 		AtomicLong maxQueued = new AtomicLong();
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
@@ -170,7 +158,7 @@ class H2DemuxFlowControlE2ETest {
 	 */
 	@Test
 	void streamBeyondTheConcurrencyLimitIsRefused() throws Exception {
-		String route = route("fc.limit");
+		String route = "fc.limit.test";
 		startClient(route, stub(H2DemuxFlowControlE2ETest::answerEndedRequests));
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
 			for (int i = 0; i < MAX_CONCURRENT_STREAMS; i++) {
@@ -199,9 +187,8 @@ class H2DemuxFlowControlE2ETest {
 	 * stream, plus what the leg's writer queue holds.
 	 */
 	@Test
-	@NettyOnly("per-hop windows: what the relay holds for the bulk stream")
 	void bulkUploadOnASlowLegLetsAnotherStreamOfTheLegComplete() throws Exception {
-		String route = route("fc.slow");
+		String route = "fc.slow.test";
 		startClient(route, stub(H2DemuxFlowControlE2ETest::serveSlowlyGrantingStreamOne));
 		AtomicBoolean stop = new AtomicBoolean();
 		AtomicLong maxQueued = new AtomicLong();
@@ -249,9 +236,8 @@ class H2DemuxFlowControlE2ETest {
 	 * auto refill grants it back once half of the window is spent.
 	 */
 	@Test
-	@NettyOnly("netty's auto refill of the connection window")
 	void dataOnARefusedStreamReleasesTheConnectionWindow() throws Exception {
-		String route = route("fc.refused");
+		String route = "fc.refused.test";
 		startClient(route, stub(H2DemuxFlowControlE2ETest::answerEndedRequests));
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
 			client.headers(1, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/"));
@@ -274,9 +260,8 @@ class H2DemuxFlowControlE2ETest {
 	 * stream window once half of it was written or padding.
 	 */
 	@Test
-	@NettyOnly("netty's window update ratio")
 	void paddedDataIsReleasedInFullAndRelayedUnpadded() throws Exception {
-		String route = route("fc.padded");
+		String route = "fc.padded.test";
 		List<TestH2.Frame> upstreamData = new java.util.concurrent.CopyOnWriteArrayList<>();
 		startClient(route, stub(socket -> recordData(socket, upstreamData)));
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
@@ -320,9 +305,8 @@ class H2DemuxFlowControlE2ETest {
 	 * window was spent, never more than the DATA.
 	 */
 	@Test
-	@NettyOnly("netty's window update ratio")
 	void upstreamConnectionWindowIsReleasedForDataOnly() throws Exception {
-		String route = route("fc.grant");
+		String route = "fc.grant.test";
 		AtomicLong granted = new AtomicLong();
 		int[] chunks = { 10000, 16000, 14000, 7 };
 		startClient(route, stub(socket -> respondCountingGrants(socket, chunks, granted)));
@@ -526,14 +510,6 @@ class H2DemuxFlowControlE2ETest {
 		catch (IOException e) {
 			throw new IllegalStateException(e);
 		}
-	}
-
-	/**
-	 * The route's host for this engine's invocation: both run on one router, where the
-	 * other invocation's tunnel client may still serve a host of the same name.
-	 */
-	private String route(String name) {
-		return name + "." + String.valueOf(this.engine).toLowerCase(Locale.ROOT) + ".test";
 	}
 
 	private static void close(AutoCloseable closeable) {

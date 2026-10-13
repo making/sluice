@@ -320,8 +320,7 @@ final class NettyHttp2DemuxRelay {
 	/**
 	 * Both faces' codec: the settings plus the header list limit (netty's default is
 	 * 8KiB), and header blocks encoded as never-indexed literals, so every block the
-	 * relay writes decodes on its own whatever the peer's decoder saw before -- as the
-	 * legacy relay's table-less encoding does.
+	 * relay writes decodes on its own whatever the peer's decoder saw before.
 	 */
 	private static void configure(Http2ConnectionHandlerBuilder codec, Http2Settings settings) {
 		codec.initialSettings(settings.maxHeaderListSize(MAX_HEADER_LIST_SIZE))

@@ -28,8 +28,6 @@ import am.ik.sluice.server.route.LoadBalance;
  * @param tcpLoadBalance load balancing applied when several clients serve the same listen
  * port (tcp routes)
  * @param limits data plane connection limits and the head deadline
- * @param h2DemuxEngine the relay demultiplexing plaintext and TLS-terminated h2
- * connections
  */
 @ConfigurationProperties("sluice")
 public record SluiceServerProperties(String token, @Nullable String tokenFile, @DefaultValue("0.0.0.0") String dataHost,
@@ -37,8 +35,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		@DefaultValue("false") boolean proxyProtocol, @DefaultValue("") String tcpPortRange, AccessLog accessLog,
 		AccessControl accessControl, Node node, Cluster cluster, Console console,
 		@DefaultValue("smallest-client-id") LoadBalance httpLoadBalance,
-		@DefaultValue("smallest-client-id") LoadBalance tcpLoadBalance, Limits limits,
-		@DefaultValue("legacy") H2DemuxEngine h2DemuxEngine) {
+		@DefaultValue("smallest-client-id") LoadBalance tcpLoadBalance, Limits limits) {
 
 	public SluiceServerProperties {
 		dataHost = dataHost == null || dataHost.isBlank() ? "0.0.0.0" : dataHost;
@@ -48,20 +45,6 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		cluster = cluster == null ? Cluster.builder().build() : cluster;
 		console = console == null ? Console.builder().build() : console;
 		limits = limits == null ? Limits.builder().build() : limits;
-		h2DemuxEngine = h2DemuxEngine == null ? H2DemuxEngine.LEGACY : h2DemuxEngine;
-	}
-
-	/**
-	 * The relay demultiplexing an h2 connection's streams over per-route legs.
-	 */
-	public enum H2DemuxEngine {
-
-		/** The hand-written HTTP/2 relay. */
-		LEGACY,
-
-		/** netty's HTTP/2 codec, one endpoint per hop (being migrated to). */
-		NETTY
-
 	}
 
 	public boolean clusterEnabled() {
@@ -391,26 +374,26 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * @param headTimeout deadline for the whole head phase of a connection (PROXY header,
 	 * TLS handshake, request head), and for a later request head of a plaintext or
 	 * TLS-terminated HTTP/1.1 connection left incomplete between requests
-	 * @param idleTimeout how long a plaintext or TLS-terminated HTTP connection may idle
-	 * between requests -- h1: every response complete and no next request begun; h2: no
-	 * open stream -- before it is closed; an upgraded connection has none (it is relayed
-	 * verbatim: see {@code verbatimIdleTimeout})
+	 * @param idleTimeout how long a plaintext or TLS-terminated HTTP/1.1 connection may
+	 * idle between requests -- every response complete and no next request begun --
+	 * before it is closed; an upgraded connection has none (it is relayed verbatim: see
+	 * {@code verbatimIdleTimeout}), and neither has an h2 connection yet
 	 * @param h2QueueBudget bytes the h2 demux relays may queue beyond each connection's
-	 * own allowance -- the legacy engine towards their upstreams, the netty engine both
-	 * ways --, shared by all of them; {@code 0} = an eighth of half the maximum heap
+	 * own allowance, both ways, shared by all of them; {@code 0} = an eighth of half the
+	 * maximum heap
 	 * @param h2StreamWaitTimeout how long an h2 stream may wait for a place within its
 	 * upstream's {@code SETTINGS_MAX_CONCURRENT_STREAMS} before the relay refuses it
-	 * ({@code REFUSED_STREAM}); the netty engine only; {@code 0} = off
+	 * ({@code REFUSED_STREAM}); {@code 0} = off
 	 * @param halfCloseProbeInterval how long a plaintext or TLS-terminated HTTP/1.1
 	 * connection whose client ended its side stays quiet, a response owed and none of it
 	 * relayed, before the relay writes a {@code 100 Continue} to learn whether the client
 	 * is still there; at most four per response, never to an HTTP/1.0 request; {@code 0}
 	 * = off
 	 * @param stallTimeout how long a request or response in flight on a plaintext or
-	 * TLS-terminated HTTP connection may wait on its client -- to accept the relay's
-	 * writes or grant h2 flow-control window, or to send request bytes due -- without
-	 * {@code stallMinBytes} moving before the connection is closed; waiting for an
-	 * upstream does not count
+	 * TLS-terminated HTTP/1.1 connection may wait on its client -- to accept the relay's
+	 * writes, or to send request bytes due -- without {@code stallMinBytes} moving before
+	 * the connection is closed; waiting for an upstream does not count; an h2 connection
+	 * has none yet
 	 * @param stallMinBytes the bytes moved to or from the client that count as progress
 	 * against {@code stallTimeout}: less within it is a stall (a minimum rate)
 	 * @param tunnelStallTimeout how long a tunnel stream may hold frames queued for its
@@ -650,8 +633,6 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 		@Nullable private Limits limits;
 
-		private H2DemuxEngine h2DemuxEngine = H2DemuxEngine.LEGACY;
-
 		private Builder() {
 		}
 
@@ -735,11 +716,6 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			return this;
 		}
 
-		public Builder h2DemuxEngine(H2DemuxEngine h2DemuxEngine) {
-			this.h2DemuxEngine = h2DemuxEngine;
-			return this;
-		}
-
 		public SluiceServerProperties build() {
 			return new SluiceServerProperties(this.token == null ? "" : this.token, this.tokenFile,
 					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort, this.dataTlsBundle, this.caBundle,
@@ -748,8 +724,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 					this.node == null ? Node.builder().build() : this.node,
 					this.cluster == null ? Cluster.builder().build() : this.cluster,
 					this.console == null ? Console.builder().build() : this.console, this.httpLoadBalance,
-					this.tcpLoadBalance, this.limits == null ? Limits.builder().build() : this.limits,
-					this.h2DemuxEngine);
+					this.tcpLoadBalance, this.limits == null ? Limits.builder().build() : this.limits);
 		}
 
 	}
