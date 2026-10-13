@@ -29,6 +29,7 @@ import am.ik.sluice.tunnel.VirtualConnection;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.http2.Http2ConnectionAdapter;
 import io.netty.handler.codec.http2.Http2ConnectionHandlerBuilder;
 import io.netty.handler.codec.http2.Http2Error;
@@ -63,19 +64,28 @@ import io.netty.util.AsciiString;
  * {@code rewrite-host} the head's {@code :authority} becomes the route's address. DATA
  * read on one hop is written on the other as a retained slice and consumed (its window
  * granted back) once written, so what the relay holds per stream is bounded by the window
- * it announced. Resets pass either way with their code. A stream lost to its leg -- the
- * leg closed, or its stream closed without the response's end -- is reset with
- * {@code INTERNAL_ERROR}, one the leg never took ({@code REFUSED_STREAM}); a stream the
- * client ends without its request's end resets its upstream stream with {@code CANCEL}. A
- * leg whose channel closed or that received a GOAWAY takes no new stream: the route's
- * next stream opens a new leg.
+ * it announced. Resets pass either way with their code; an upstream's reset after the
+ * response's end follows that end to the client. A stream the client ends without its
+ * request's end resets its upstream stream with {@code CANCEL}.
  * <p>
- * netty's codec answers protocol errors itself; a header block that does not decode ends
- * the connection with a GOAWAY {@code COMPRESSION_ERROR}, logged as a request line naming
- * neither route, method nor path. The client endpoint's end -- EOF, error, the codec
- * closing it -- closes every leg. Once every hop's threads ended and the frames the legs
- * queued left the tunnel sender, the relay finishes: the connection is logged closed,
- * {@code onFinish} runs, then {@code release}.
+ * An upstream's failure ends no more than it covers. netty's codec answers the upstream's
+ * protocol errors itself: a stream error resets that stream towards the upstream, a
+ * connection error sends the upstream a GOAWAY and closes the leg at once. A stream lost
+ * to its leg that way, or to the leg closing or failing, is answered by the relay with
+ * the bad-gateway page ({@code 502}) while no final response head was relayed on it, and
+ * reset with {@code INTERNAL_ERROR} once one was (see {@link #loseLocked}); a stream the
+ * leg never took, or above the last stream id of the upstream's GOAWAY, is refused
+ * ({@code REFUSED_STREAM}); a response the upstream ended is still delivered. A leg that
+ * received a GOAWAY closes gracefully once its other streams ended. A leg whose channel
+ * closed or that received or sent a GOAWAY takes no new stream: the route's next stream
+ * opens a new leg. The client's connection goes on throughout.
+ * <p>
+ * netty's codec answers the client's protocol errors itself; a header block that does not
+ * decode ends the connection with a GOAWAY {@code COMPRESSION_ERROR}, logged as a request
+ * line naming neither route, method nor path. The client endpoint's end -- EOF, error,
+ * the codec closing it -- closes every leg. Once every hop's threads ended and the frames
+ * the legs queued left the tunnel sender, the relay finishes: the connection is logged
+ * closed, {@code onFinish} runs, then {@code release}.
  */
 final class NettyHttp2DemuxRelay {
 
@@ -261,13 +271,13 @@ final class NettyHttp2DemuxRelay {
 		}
 		Router.Route route;
 		TunnelSession session;
+		String host = hostOf(headers);
 		if (seedStream) {
 			// resolved with the connection; the lookup must not run twice
 			route = this.initialRoute;
 			session = this.initialSession;
 		}
 		else {
-			String host = hostOf(headers);
 			Optional<Router.Route> found = this.router.lookup(host);
 			TunnelSession serving = found.flatMap(candidate -> this.sessions.find(candidate.clientId())).orElse(null);
 			if (found.isEmpty() || serving == null) {
@@ -296,6 +306,8 @@ final class NettyHttp2DemuxRelay {
 			headers.authority(AsciiString.of(route.address()));
 		}
 		Exchange exchange = new Exchange(streamId, leg);
+		exchange.host = host;
+		exchange.request = request;
 		exchange.requestEnded = endStream;
 		this.exchanges.put(streamId, exchange);
 		leg.routeMeters.trackedStreams().increment();
@@ -303,7 +315,8 @@ final class NettyHttp2DemuxRelay {
 		hop.encoder().writeHeaders(hop.ctx(), streamId, headers, 0, endStream, hop.newPromise(future -> {
 			if (!future.isSuccess()) {
 				// the leg never took the stream: safe for the client to retry
-				loseLocked(exchange, Http2Error.REFUSED_STREAM);
+				exchange.refused = true;
+				loseLocked(exchange);
 			}
 		}));
 		this.access.request(route.routeTag(), request.method(), request.path(), HTTP_2);
@@ -312,13 +325,7 @@ final class NettyHttp2DemuxRelay {
 	/** Answers a refused stream with the page; with the loop's lock. */
 	private void refuseLocked(int streamId, ConnectionHeadParser.Head.Request request, ErrorResponse.StreamPage page) {
 		this.access.request("-", request.method(), request.path(), HTTP_2);
-		Hop hop = client();
-		byte[] body = page.body();
-		hop.encoder().writeHeaders(hop.ctx(), streamId, page.headers(), 0, body.length == 0, hop.ctx().newPromise());
-		if (body.length > 0) {
-			// through the flow controller: held to the client's windows
-			hop.encoder().writeData(hop.ctx(), streamId, Unpooled.wrappedBuffer(body), 0, true, hop.ctx().newPromise());
-		}
+		answerLocked(streamId, page, false);
 	}
 
 	/**
@@ -330,14 +337,30 @@ final class NettyHttp2DemuxRelay {
 			boolean endStream) {
 		this.meters.misdirectedForHttp1();
 		this.access.misdirected(route.routeTag(), request);
+		answerLocked(streamId, new ErrorResponse.StreamPage(this.errorResponse.misdirectedHeaders(), new byte[0]),
+				!endStream);
+	}
+
+	/**
+	 * Answers the client's stream with the page, its body through the flow controller --
+	 * held to the client's windows; with {@code endsRequest}, a request still being sent
+	 * is then reset with {@code NO_ERROR} once the page's end is written (RFC 9113 8.1:
+	 * no more of it is wanted). With the loop's lock.
+	 */
+	private void answerLocked(int streamId, ErrorResponse.StreamPage page, boolean endsRequest) {
 		Hop hop = client();
+		byte[] body = page.body();
+		ChannelPromise end = endsRequest ? hop.newPromise(future -> {
+			if (future.isSuccess()) {
+				resetRequestLocked(streamId, Http2Error.NO_ERROR.code());
+			}
+		}) : hop.ctx().newPromise();
 		hop.encoder()
-			.writeHeaders(hop.ctx(), streamId, this.errorResponse.misdirectedHeaders(), 0, true,
-					endStream ? hop.ctx().newPromise() : hop.newPromise(future -> {
-						if (future.isSuccess()) {
-							resetClientLocked(streamId, Http2Error.NO_ERROR);
-						}
-					}));
+			.writeHeaders(hop.ctx(), streamId, page.headers(), 0, body.length == 0,
+					body.length == 0 ? end : hop.ctx().newPromise());
+		if (body.length > 0) {
+			hop.encoder().writeData(hop.ctx(), streamId, Unpooled.wrappedBuffer(body), 0, true, end);
+		}
 	}
 
 	/**
@@ -396,19 +419,89 @@ final class NettyHttp2DemuxRelay {
 	}
 
 	/**
-	 * Resets the exchange's client stream with the code unless it was reset or answered
-	 * already: the leg lost it. With the loop's lock.
+	 * The exchange's leg stream ended without the exchange's end: the leg closed under
+	 * it, the upstream or netty reset it, a GOAWAY dropped it, or the leg never took it.
+	 * Unless the exchange was reset already, the client gets: for a response the upstream
+	 * ended, its end first, then RST_STREAM {@code NO_ERROR} if the client still sends
+	 * its request; for a response whose (final) head was relayed, RST_STREAM
+	 * {@code INTERNAL_ERROR}; for a stream the upstream never saw
+	 * ({@link Exchange#refused}), RST_STREAM {@code REFUSED_STREAM}, safe to retry (RFC
+	 * 9113 8.7); else the bad-gateway page, then RST_STREAM {@code NO_ERROR} if the
+	 * client still sends its request. With the loop's lock.
 	 */
-	private void loseLocked(Exchange exchange, Http2Error error) {
-		if (exchange.reset || exchange.responseEnded) {
+	private void loseLocked(Exchange exchange) {
+		if (exchange.reset) {
+			return;
+		}
+		if (exchange.responseEnded) {
+			resetAfterResponseLocked(exchange, Http2Error.NO_ERROR.code());
 			return;
 		}
 		exchange.reset = true;
-		resetClientLocked(exchange.id, error);
+		Http2Stream stream = client().connection().stream(exchange.id);
+		if (stream == null || stream.state() == Http2Stream.State.CLOSED) {
+			return;
+		}
+		if (stream.isHeadersSent()) {
+			// a final head: interim (1xx) ones leave the response to come
+			resetClientLocked(exchange.id, Http2Error.INTERNAL_ERROR);
+		}
+		else if (exchange.refused) {
+			resetClientLocked(exchange.id, Http2Error.REFUSED_STREAM);
+		}
+		else {
+			answerLocked(exchange.id, this.errorResponse.badGatewayPage(exchange.host, exchange.request), true);
+		}
+	}
+
+	/**
+	 * Resets the client's stream of an exchange whose response the upstream ended with
+	 * the code once that end is written -- a reset written before would drop what of the
+	 * response waits for the client's window -- unless the client ended its request (its
+	 * stream closes with the response's end). The exchange takes no more of either side.
+	 * With the loop's lock.
+	 */
+	private void resetAfterResponseLocked(Exchange exchange, long errorCode) {
+		exchange.reset = true;
+		if (exchange.requestEnded) {
+			return;
+		}
+		if (exchange.responseWritten) {
+			resetRequestLocked(exchange.id, errorCode);
+		}
+		else {
+			exchange.resetAfterResponse = errorCode;
+		}
+	}
+
+	/**
+	 * The client write carrying the response's end completed (or failed): a reset held
+	 * for it goes out now. With the loop's lock.
+	 */
+	private void responseWrittenLocked(Exchange exchange) {
+		exchange.responseWritten = true;
+		Long errorCode = exchange.resetAfterResponse;
+		if (errorCode != null) {
+			exchange.resetAfterResponse = null;
+			resetRequestLocked(exchange.id, errorCode);
+		}
 	}
 
 	private void resetClientLocked(int streamId, Http2Error error) {
 		reset(client(), streamId, error.code());
+	}
+
+	/**
+	 * Resets the client's stream while the client still sends its request -- a stream the
+	 * client ended closes with the response's end (netty closes it right after the
+	 * write's listeners ran). With the loop's lock.
+	 */
+	private void resetRequestLocked(int streamId, long errorCode) {
+		Hop hop = client();
+		Http2Stream stream = hop.connection().stream(streamId);
+		if (stream != null && stream.state().remoteSideOpen()) {
+			hop.encoder().writeRstStream(hop.ctx(), streamId, errorCode, hop.ctx().newPromise());
+		}
 	}
 
 	/** Resets the hop's stream unless it is closed or gone; with the loop's lock. */
@@ -419,6 +512,19 @@ final class NettyHttp2DemuxRelay {
 			return;
 		}
 		hop.encoder().writeRstStream(hop.ctx(), streamId, errorCode, hop.ctx().newPromise());
+	}
+
+	/**
+	 * The peer reset the hop's stream, which netty closes right after the listener: marks
+	 * the reset as sent, so netty does not answer it with one of its own (RFC 9113 5.4.2)
+	 * -- as it would with RST_STREAM {@code STREAM_CLOSED} when closing fails a write of
+	 * the stream still waiting for its window. With the loop's lock.
+	 */
+	private static void resetByPeer(Hop hop, int streamId) {
+		Http2Stream stream = hop.connection().stream(streamId);
+		if (stream != null) {
+			stream.resetSent();
+		}
 	}
 
 	/** Returns DATA to the reading hop's window once the other hop wrote it. */
@@ -530,8 +636,26 @@ final class NettyHttp2DemuxRelay {
 		/** The upstream's END_STREAM was forwarded to the client. */
 		boolean responseEnded;
 
-		/** A reset was sent or relayed on either side. */
+		/**
+		 * A reset was sent or relayed on either side, or the stream was answered or is to
+		 * be reset for the client: the exchange takes no more frames of either side.
+		 */
 		boolean reset;
+
+		/** The client write carrying the response's end completed. */
+		boolean responseWritten;
+
+		/** The code to reset the client's stream with once the response is written. */
+		@Nullable Long resetAfterResponse;
+
+		/** The upstream never saw the stream: the leg did not take it, or a GOAWAY. */
+		boolean refused;
+
+		/** The request's host, for the bad-gateway page. */
+		@Nullable String host;
+
+		/** The request, for the bad-gateway page. */
+		ConnectionHeadParser.Head.@Nullable Request request;
 
 		Exchange(int id, Leg leg) {
 			this.id = id;
@@ -587,6 +711,7 @@ final class NettyHttp2DemuxRelay {
 
 		@Override
 		public void onRstStreamRead(ChannelHandlerContext ctx, int streamId, long errorCode) {
+			resetByPeer(this.hop, streamId);
 			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.get(streamId);
 			if (exchange != null && !exchange.reset) {
 				exchange.reset = true;
@@ -654,7 +779,9 @@ final class NettyHttp2DemuxRelay {
 			}
 			exchange.responseEnded |= endStream;
 			Hop client = client();
-			client.encoder().writeHeaders(client.ctx(), streamId, headers, 0, endStream, client.ctx().newPromise());
+			client.encoder()
+				.writeHeaders(client.ctx(), streamId, headers, 0, endStream, endStream
+						? client.newPromise(future -> responseWrittenLocked(exchange)) : client.ctx().newPromise());
 		}
 
 		@Override
@@ -664,20 +791,51 @@ final class NettyHttp2DemuxRelay {
 				return data.readableBytes() + padding;
 			}
 			exchange.responseEnded |= endStream;
-			return forward(this.leg.hop(), client(), streamId, data, padding, endStream);
+			Hop from = this.leg.hop();
+			Hop client = client();
+			int length = data.readableBytes();
+			client.encoder()
+				.writeData(client.ctx(), streamId, data.retainedSlice(), 0, endStream, client.newPromise(future -> {
+					consume(from, streamId, length);
+					if (endStream) {
+						responseWrittenLocked(exchange);
+					}
+				}));
+			// padding is consumed at once
+			return padding;
 		}
 
 		@Override
 		public void onRstStreamRead(ChannelHandlerContext ctx, int streamId, long errorCode) {
+			resetByPeer(this.leg.hop(), streamId);
 			Exchange exchange = exchange(streamId);
-			if (exchange != null) {
-				exchange.reset = true;
-				resetClientLocked(streamId, errorCode);
+			if (exchange == null) {
+				return;
 			}
+			if (exchange.responseEnded) {
+				// after the response, the reset tells the request's rest is not wanted
+				resetAfterResponseLocked(exchange, errorCode);
+				return;
+			}
+			exchange.reset = true;
+			reset(client(), streamId, errorCode);
 		}
 
-		private void resetClientLocked(int streamId, long errorCode) {
-			reset(client(), streamId, errorCode);
+		/**
+		 * The upstream's GOAWAY: the streams above its last stream id are refused once
+		 * netty dropped them (it does right after this call), and the leg closes
+		 * gracefully -- a GOAWAY of its own, then the close once the other streams ended
+		 * -- as a task, run when netty is done with the GOAWAY.
+		 */
+		@Override
+		public void onGoAwayRead(ChannelHandlerContext ctx, int lastStreamId, long errorCode, ByteBuf debugData) {
+			for (Exchange exchange : NettyHttp2DemuxRelay.this.exchanges.values()) {
+				if (exchange.leg == this.leg && exchange.id > lastStreamId) {
+					exchange.refused = true;
+				}
+			}
+			Hop hop = this.leg.hop();
+			ctx.executor().execute(hop::closeLocked);
 		}
 
 	}
@@ -698,7 +856,7 @@ final class NettyHttp2DemuxRelay {
 		public void onStreamClosed(Http2Stream stream) {
 			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.get(stream.id());
 			if (exchange != null && exchange.leg == this.leg) {
-				loseLocked(exchange, Http2Error.INTERNAL_ERROR);
+				loseLocked(exchange);
 			}
 		}
 

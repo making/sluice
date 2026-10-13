@@ -171,7 +171,6 @@ class H2DemuxFrameLimitsE2ETest {
 	 * a GOAWAY {@code FRAME_SIZE_ERROR} (RFC 9113 4.2).
 	 */
 	@Test
-	@LegacyOnly("an upstream connection error: 502 and the error scope, step 3 (100)")
 	void upstreamFrameAboveTheMaxFrameSizeEndsItsLeg() throws Exception {
 		assertUpstreamEndsItsLeg(route("lim.up-frame"), FRAME_SIZE_ERROR, out -> {
 			out.write(frameHeader(MAX_FRAME_SIZE + 1, TestH2.DATA, 0, 1));
@@ -180,18 +179,19 @@ class H2DemuxFrameLimitsE2ETest {
 	}
 
 	/**
-	 * An upstream header block past the header list limit ends its leg with a GOAWAY
-	 * {@code ENHANCE_YOUR_CALM}.
+	 * An upstream header block past the header list limit ends its leg with a GOAWAY: the
+	 * legacy relay's {@code ENHANCE_YOUR_CALM} past 64KiB, netty's {@code PROTOCOL_ERROR}
+	 * past 80KiB (its GOAWAY threshold over the list limit), so the upstream sends 96KiB.
 	 */
 	@Test
-	@LegacyOnly("an upstream connection error: 502 and the error scope, step 3 (100)")
 	void upstreamHeaderBlockAboveTheListLimitEndsItsLeg() throws Exception {
-		assertUpstreamEndsItsLeg(route("lim.up-block"), ENHANCE_YOUR_CALM, out -> {
-			TestH2.writeFrame(out, TestH2.HEADERS, 0, 1, new byte[MAX_FRAME_SIZE]);
-			for (int i = 0; i < 4; i++) {
-				TestH2.writeFrame(out, TestH2.CONTINUATION, 0, 1, new byte[MAX_FRAME_SIZE]);
-			}
-		});
+		assertUpstreamEndsItsLeg(route("lim.up-block"),
+				this.engine == H2DemuxEngine.NETTY ? PROTOCOL_ERROR : ENHANCE_YOUR_CALM, out -> {
+					TestH2.writeFrame(out, TestH2.HEADERS, 0, 1, new byte[MAX_FRAME_SIZE]);
+					for (int i = 0; i < 5; i++) {
+						TestH2.writeFrame(out, TestH2.CONTINUATION, 0, 1, new byte[MAX_FRAME_SIZE]);
+					}
+				});
 	}
 
 	/**
@@ -200,7 +200,6 @@ class H2DemuxFrameLimitsE2ETest {
 	 * the relay holds.
 	 */
 	@Test
-	@LegacyOnly("an upstream connection error: 502 and the error scope, step 3 (100)")
 	void upstreamInterleavingHeaderBlocksEndsItsLeg() throws Exception {
 		assertUpstreamEndsItsLeg(route("lim.up-interleave"), PROTOCOL_ERROR, out -> {
 			TestH2.writeFrame(out, TestH2.HEADERS, 0, 1, new byte[] { (byte) 0x88 });

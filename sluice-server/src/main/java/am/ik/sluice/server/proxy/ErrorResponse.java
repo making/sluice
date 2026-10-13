@@ -27,9 +27,10 @@ import org.springframework.stereotype.Component;
  * (HTTP/1.1, or HTTP/2 for prior knowledge and ALPN h2), after which the connection
  * closes: the 503 no-route page for a request no tunnel session can serve, the 403
  * forbidden page for a peer address the access control excludes, a bare HTTP/1.1 400 for
- * a malformed request, a bodiless HTTP/2 502 for a stream its upstream lost, a bodiless
- * HTTP/2 421 for a stream of a route reached over HTTP/1.1 only, and a GOAWAY
- * {@code COMPRESSION_ERROR} for an HTTP/2 head whose header block does not decode.
+ * a malformed request, the HTTP/2 502 for a stream its upstream lost (a page for a relay
+ * whose codec holds it to the client's window, else bodiless), a bodiless HTTP/2 421 for
+ * a stream of a route reached over HTTP/1.1 only, and a GOAWAY {@code COMPRESSION_ERROR}
+ * for an HTTP/2 head whose header block does not decode.
  */
 @Component
 public class ErrorResponse {
@@ -49,9 +50,12 @@ public class ErrorResponse {
 
 	private final Page forbidden;
 
+	private final Page badGateway;
+
 	ErrorResponse(Mustache.Compiler compiler) {
 		this.noRoute = new Page(compiler.loadTemplate("proxy/no-route"), "503 Service Unavailable");
 		this.forbidden = new Page(compiler.loadTemplate("proxy/forbidden"), "403 Forbidden");
+		this.badGateway = new Page(compiler.loadTemplate("proxy/bad-gateway"), "502 Bad Gateway");
 	}
 
 	/**
@@ -149,6 +153,14 @@ public class ErrorResponse {
 	 */
 	public StreamPage forbiddenPage(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request) {
 		return this.streamPage(this.forbidden, host, request);
+	}
+
+	/**
+	 * The bad-gateway page on a single stream its upstream lost before answering, for a
+	 * relay whose HTTP/2 codec frames it and holds its body to the client's windows.
+	 */
+	public StreamPage badGatewayPage(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request) {
+		return this.streamPage(this.badGateway, host, request);
 	}
 
 	private byte[] streamResponse(int streamId, Page page, @Nullable String host,
