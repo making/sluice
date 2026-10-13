@@ -32,3 +32,19 @@ Step 4 of the netty h2 demux migration (context and user decisions: 098). Depend
   waiting, so rewrite that test.
 - `H2DemuxUpstreamStreamLimitE2ETest` is excluded for netty at class level naming this
   step.
+
+## Notes from 100 (upstream error scope, 2026-10-13)
+
+- A stream the leg never takes reaches `loseLocked` through the leg `writeHeaders`
+  promise failure with `exchange.refused` set: `REFUSED_STREAM`. `StreamBufferingEncoder`
+  fails a buffered stream's promise on the upstream's GOAWAY and on close, so waiting
+  streams should be refused that way; check that a buffered stream never exists on the
+  leg's connection (else `LegStreams#onStreamClosed` answers it `502` first).
+- The upstream's GOAWAY marks the exchanges above its last stream id `refused` in
+  `LegListener#onGoAwayRead` (netty closes them right after) and closes the leg
+  gracefully as a task.
+- Waiting for the upstream's concurrency limit, to put on netty here:
+  `H2DemuxUpstreamErrorE2ETest#upstreamFrameOnAWaitingStreamEndsItsLegAndRefusesTheStream`
+  (`@LegacyOnly`), the `waits` branch of `#upstreamClosingBeforeTheResponseHeadAnswers502`
+  and the stream 5 assertion of `#upstreamGoAwayRefusesTheStreamsItDidNotProcess`
+  (legacy only: today netty sends stream 5 before the upstream's SETTINGS arrive).

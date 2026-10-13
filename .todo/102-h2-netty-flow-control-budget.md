@@ -45,3 +45,10 @@ Step 5 of the netty h2 demux migration (context and user decisions: 098). Depend
   `H2DemuxUpstreamFlowControlE2ETest`, `H2DemuxWaitingStreamBudgetE2ETest` (classes) and
   `H2ReroutingE2ETest#grantsConnectionWindowWhileRelayingRequestData` (netty's auto refill
   grants the connection window only past half of it).
+
+## Notes from 100 (upstream error scope, 2026-10-13)
+
+- A response the upstream completed outlives its leg: the forwarded DATA (retained slices
+  of the closed leg's inbound buffer) waits in the client's flow controller until the
+  client grants (`NettyH2DemuxRelayE2ETest#aResponseTheUpstreamCompletedOutlivesItsConnectionError`).
+  The budget must count those bytes though their leg is gone.

@@ -43,3 +43,14 @@ Step 6 of the netty h2 demux migration (context and user decisions: 098). Depend
   (classes), the idle and stall tests of `H2DemuxConnectE2ETest`. Not parameterized at all
   (mixed h1 / h2 classes): `KeepAliveIdleTimeoutE2ETest`, `StallTimeoutE2ETest` -- put
   their h2 tests on both engines here (`@H2EngineTest`, `@LegacyOnly` for the h1 ones).
+
+## Notes from 100 (upstream error scope, 2026-10-13)
+
+- `H2DemuxUpstreamErrorE2ETest#aConnectionErrorWithNothingElseOpenLeavesTheConnectionToTheIdleTimeout`
+  is `@LegacyOnly` naming the idle timeout.
+- A leg that received a GOAWAY closes through netty's graceful close
+  (`Hop#closeLocked`): it waits for its other streams up to the handler's graceful
+  shutdown timeout, netty's default 30s (not configured). A stream the upstream never
+  finishes holds the leg until then; the stall timeout should bound it.
+- A relay-answered page (`502`, `503`, `403`) waiting for a client window of 0 keeps the
+  client stream and its exchange with no deadline.

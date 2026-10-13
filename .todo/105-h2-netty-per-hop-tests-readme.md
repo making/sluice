@@ -31,3 +31,20 @@ Step 8 of the netty h2 demux migration (context and user decisions: 098). Depend
 - A parameterized class runs both engines on one context and one router: a test that
   registers a route under a fixed host per invocation collides with the other run's client
   (`H2DemuxFrameLimitsE2ETest` needed per-engine route names, `route(...)`).
+
+## Notes from 100 (upstream error scope, 2026-10-13)
+
+- netty's frame reader ends a header block past 80KiB with `PROTOCOL_ERROR`
+  (`Http2CodecUtil#headerListSizeExceeded`), shown for an upstream by
+  `H2DemuxFrameLimitsE2ETest#upstreamHeaderBlockAboveTheListLimitEndsItsLeg`; the 099 note
+  above says `ENHANCE_YOUR_CALM` for the client, check it when rewriting
+  `clientHeaderBlockAboveTheListLimitEndsTheConnection`.
+- README: this step added a netty paragraph to "h2 upstream errors" (the `502` page, netty's
+  frame validation and GOAWAY last stream id 2^31-1, the close right after its GOAWAY, the
+  relay's own GOAWAY after an upstream's); fold it into this step's pass.
+- Tests kept legacy only in `H2DemuxUpstreamErrorE2ETest` because they encode legacy
+  behaviour, each with a netty counterpart in `NettyH2DemuxRelayE2ETest`:
+  `#aConnectionErrorStillDeliversTheResponsesTheUpstreamCompleted` (end-to-end windows),
+  `#upstreamIgnoringTheGoAwayIsClosedAfterTheGrace` (the legacy close grace),
+  `#clientGoneWhileTheLegFailsReleasesEverything` (`WriteSeam`). Remove them with the
+  legacy relay.

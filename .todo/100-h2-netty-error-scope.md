@@ -42,3 +42,12 @@ Step 3 of the netty h2 demux migration (context and user decisions: 098). Depend
   be held alike.
 - Excluded for netty naming this step: `H2DemuxUpstreamErrorE2ETest` (class) and the three
   `upstream*` tests of `H2DemuxFrameLimitsE2ETest`.
+
+## Decision: the 502 page (2026-10-13)
+
+The netty engine answers a stream lost before its final response head with a
+bad-gateway page (`templates/proxy/bad-gateway.mustache`, `ErrorResponse#badGatewayPage`),
+like the 503 / 403 ones: the page goes through netty's flow controller, held to the
+client's stream window, and the `RST_STREAM NO_ERROR` for a request still being sent
+follows the page's end. The legacy relay keeps its bodiless 502 (its writes bypass the
+client's window).

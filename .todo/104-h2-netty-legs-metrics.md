@@ -35,3 +35,14 @@ Step 7 of the netty h2 demux migration (context and user decisions: 098). Depend
 - Excluded for netty naming this step: `H2DemuxLegLimitE2ETest`. Not parameterized (mixed
   classes): `QueuedFramesHoldSlotsE2ETest`, `ConnectionReleaseE2ETest` (its
   `theEndOfAnH2RelayReleasesItsSlot`).
+
+## Notes from 100 (upstream error scope, 2026-10-13)
+
+- Meter assertions kept legacy only in `H2DemuxUpstreamErrorE2ETest`:
+  `sluice.h2demux.streams.reset{reason=upstream}` in
+  `#upstreamStreamWindowUpdateOfZeroResetsOnlyItsStream` and `sluice.h2demux.legs.failed`
+  in `#upstreamConnectionErrorEndsOnlyItsLeg`. Hooks: a leg GOAWAY sent with an error code
+  (`Http2Connection.Listener#onGoAwaySent` on the leg) is a failed leg; a leg stream netty
+  resets on a stream error closes with `isResetSent()` and no reset read from the peer.
+- The `legLocked` catch (the leg did not open: `REFUSED_STREAM`) has no test; leg slots
+  (`ConnectionLimits#tryAcquireLeg`) refusing a leg take that path, so test it there.
