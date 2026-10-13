@@ -34,7 +34,6 @@ import io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder;
 import io.netty.handler.codec.http2.Http2Headers;
 
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.junit.jupiter.api.TestInstance;
@@ -61,6 +60,12 @@ class H2DemuxFramingE2ETest {
 	private static final int IN_FLIGHT = 90;
 
 	private static final int FRAME_SIZE = 16 * 1024;
+
+	private static final int PROTOCOL_ERROR = 0x1;
+
+	private static final int STREAM_CLOSED = 0x5;
+
+	private static final int CANCEL = 0x8;
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
@@ -96,19 +101,17 @@ class H2DemuxFramingE2ETest {
 
 	/**
 	 * Large request heads (HEADERS + CONTINUATION after re-encoding) towards an upstream
-	 * streaming an endless response on the same leg, whose every relayed chunk makes the
-	 * relay emit a connection-level WINDOW_UPDATE towards it.
+	 * streaming an endless response on the same leg, whose relayed chunks make the relay
+	 * grant it window (connection and stream WINDOW_UPDATEs) meanwhile.
 	 */
 	@Test
-	@Disabled("fails on netty: stream 1's endless response is reset INTERNAL_ERROR; the stub, "
-			+ "written for the hand-written relay, sends its SETTINGS only once stream 1 "
-			+ "arrived: to be rewritten for netty's leg")
 	void requestHeaderBlocksReachTheUpstreamContiguous() throws Exception {
 		String route = "frm.up.test";
 		AtomicReference<String> violation = new AtomicReference<>("");
 		AtomicInteger heads = new AtomicInteger();
 		AtomicInteger continuations = new AtomicInteger();
-		startClient(route, stub(socket -> checkRequestBlocks(socket, violation, heads, continuations)));
+		AtomicInteger grants = new AtomicInteger();
+		startClient(route, stub(socket -> checkRequestBlocks(socket, violation, heads, continuations, grants)));
 		byte[] bigBlock = bigRequestHead(route);
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
 			unboundedStreamWindows(client);
@@ -121,6 +124,8 @@ class H2DemuxFramingE2ETest {
 			assertThat(heads.get()).isEqualTo(REQUESTS + 1);
 			assertThat(continuations.get()).as("the heads spanned CONTINUATION frames")
 				.isGreaterThanOrEqualTo(REQUESTS);
+			assertThat(grants.get()).as("window granted while the heads went by").isGreaterThan(10);
+			assertThat(client.resets()).as("the endless response goes on").isEmpty();
 			assertThat(client.closed()).isFalse();
 		}
 	}
@@ -150,6 +155,7 @@ class H2DemuxFramingE2ETest {
 			assertThat(client.headerBlocks()).isGreaterThanOrEqualTo(REQUESTS + 1);
 			assertThat(client.frames(3)).as("the response head spans CONTINUATION frames")
 				.anyMatch(frame -> frame.type() == TestH2.CONTINUATION);
+			assertThat(client.resets()).as("the endless response goes on").doesNotContainKey(1);
 			assertThat(client.closed()).isFalse();
 		}
 	}
@@ -175,15 +181,13 @@ class H2DemuxFramingE2ETest {
 	}
 
 	/**
-	 * The client's settings reach the upstream, except the header table size -- the
-	 * upstream encodes for the relay's decoder, which keeps the default table --, the max
-	 * frame size -- the upstream frames for the relay's parser, which takes the default
-	 * -- and settings unknown to the relay; later ones too, once the leg is open.
+	 * The settings are per hop: the upstream gets the relay's own SETTINGS once, as its
+	 * leg opens -- push off, the 64KiB header list limit, the RFC defaults else --
+	 * whatever the client announces, before the leg opened or after; and the client gets
+	 * the relay's: 100 concurrent streams and the 64KiB header list limit.
 	 */
 	@Test
-	@Disabled("pins the hand-written relay's replay of the client's SETTINGS to the upstream; "
-			+ "the relay announces its own SETTINGS per hop: to be rewritten for it")
-	void clientSettingsReachTheUpstreamWithoutTheHeaderTableSize() throws Exception {
+	void eachHopGetsTheRelaysOwnSettings() throws Exception {
 		String route = "frm.settings.test";
 		Queue<TestH2.Frame> received = new ConcurrentLinkedQueue<>();
 		startClient(route, stub(socket -> recordAndAnswer(socket, received)));
@@ -194,21 +198,26 @@ class H2DemuxFramingE2ETest {
 			client.frame(TestH2.SETTINGS, 0, 0, settings(0x1, 4096, 0x4, 1048576, 0x5, 1048576, 0x6, 1048576));
 			client.headers(3, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/"));
 			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).isTrue();
+			assertThat(client.setting(0x3)).as("SETTINGS_MAX_CONCURRENT_STREAMS").isEqualTo(100L);
+			assertThat(client.setting(0x6)).as("SETTINGS_MAX_HEADER_LIST_SIZE").isEqualTo(65536L);
+			assertThat(client.setting(0x4)).as("SETTINGS_INITIAL_WINDOW_SIZE").isNull();
+			assertThat(client.setting(0x5)).as("SETTINGS_MAX_FRAME_SIZE").isNull();
 		}
-		List<String> forwarded = new ArrayList<>();
+		List<String> announced = new ArrayList<>();
 		for (TestH2.Frame frame : received) {
 			if (frame.type() == TestH2.SETTINGS && (frame.flags() & TestH2.FLAG_ACK) == 0) {
 				byte[] p = frame.payload();
+				List<String> entries = new ArrayList<>();
 				for (int i = 0; i + 6 <= p.length; i += 6) {
 					int id = (p[i] & 0xff) << 8 | (p[i + 1] & 0xff);
 					long value = (p[i + 2] & 0xffL) << 24 | (p[i + 3] & 0xff) << 16 | (p[i + 4] & 0xff) << 8
 							| (p[i + 5] & 0xff);
-					forwarded.add(id + "=" + value);
+					entries.add(id + "=" + value);
 				}
+				announced.add(String.join(",", entries));
 			}
 		}
-		// the header list size is capped at the relay's decoder limit
-		assertThat(forwarded).containsExactly("2=0", "4=1048576", "6=65536");
+		assertThat(announced).as("the SETTINGS frames the upstream got").containsExactly("2=0,6=65536");
 	}
 
 	/**
@@ -231,40 +240,66 @@ class H2DemuxFramingE2ETest {
 	}
 
 	/**
-	 * Once the client ended a stream, its further frames are not relayed; a later block
-	 * on a stream the relay answered itself is not taken for a new request.
+	 * Once the client ended a stream, its further frames are not relayed: netty's codec
+	 * resets the stream -- {@code STREAM_CLOSED} for DATA (RFC 9113 5.1), and for any
+	 * frame on a stream it forgot; {@code PROTOCOL_ERROR} for a header block on a stream
+	 * it still holds -- and the relay cancels the upstream stream if its response is
+	 * unfinished; a later block on a stream the relay answered itself is not taken for a
+	 * new request. The connection goes on.
 	 */
 	@Test
-	@Disabled("its recording stub sends no SETTINGS first, which netty's client endpoint "
-			+ "requires, and netty answers frames after the stream's end itself: to be rewritten for it")
-	void framesAfterTheClientEndedTheStreamAreDropped() throws Exception {
+	void framesAfterTheClientEndedTheStreamAreResetNotRelayed() throws Exception {
 		String route = "frm.ended.test";
 		Queue<TestH2.Frame> received = new ConcurrentLinkedQueue<>();
 		startClient(route, stub(socket -> recordAndAnswer(socket, received)));
-		try (H2TestClient client = H2TestClient.connect(dataPort, 5)) {
+		try (H2TestClient client = H2TestClient.connect(dataPort, 7)) {
+			// the leg's first stream: its SETTINGS lift the one-stream limit, so the
+			// streams below reach the upstream at once rather than wait in the relay
 			client.headers(1, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/"));
-			client.sendData(1, new byte[] { 'x' }, 0);
-			client.headers(1, true, TestH2.headerBlock("x-trailer=1"));
-			client.headers(3, false, TestH2.headerBlock(":authority=" + route, ":method=POST", ":path=/"));
+			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
+			client.headers(3, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/"));
+			client.sendData(3, new byte[] { 'x' }, 0);
 			client.headers(3, true, TestH2.headerBlock("x-trailer=1"));
-			client.headers(3, true, TestH2.headerBlock("x-trailer=2"));
-			client.headers(5, true, TestH2.headerBlock(":authority=nowhere.test", ":method=GET", ":path=/"));
+			client.headers(5, false, TestH2.headerBlock(":authority=" + route, ":method=POST", ":path=/"));
 			client.headers(5, true, TestH2.headerBlock("x-trailer=1"));
+			client.headers(5, true, TestH2.headerBlock("x-trailer=2"));
+			client.headers(7, true, TestH2.headerBlock(":authority=nowhere.test", ":method=GET", ":path=/"));
+			client.headers(7, true, TestH2.headerBlock("x-trailer=1"));
 			// a sentinel: the upstream sees it after everything relayed before it
-			client.headers(7, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/"));
-			assertThat(client.awaitEnd(7, Duration.ofSeconds(5))).isTrue();
-			assertThat(client.awaitEnd(5, Duration.ofSeconds(5))).isTrue();
-			Thread.sleep(200); // a second answer on stream 5 would follow the first
-			assertThat(client.frames(5)).filteredOn(frame -> frame.type() == TestH2.HEADERS)
+			client.headers(9, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/"));
+			assertThat(client.awaitEnd(9, Duration.ofSeconds(5))).isTrue();
+			// the page's body, if still held for the stream when the late block came, is
+			// dropped with the reset
+			assertThat(client.awaitTrue(() -> client.reset(7) != null, Duration.ofSeconds(5))).isTrue();
+			Thread.sleep(200); // a second answer on stream 7 would follow the first
+			assertThat(client.frames(7)).filteredOn(frame -> frame.type() == TestH2.HEADERS)
 				.as("one response on the stream the relay answered")
 				.hasSize(1);
+			// DATA after the stream's end is STREAM_CLOSED (RFC 9113 5.1), and so is any
+			// frame on a stream netty forgot; a header block on a stream netty still
+			// holds
+			// is PROTOCOL_ERROR -- stream 7 is forgotten once its page is out
+			assertThat(client.resets()).as("the streams the late frames came on").containsOnlyKeys(3, 5, 7);
+			assertThat(client.reset(3)).isEqualTo(STREAM_CLOSED);
+			assertThat(client.reset(5)).isEqualTo(PROTOCOL_ERROR);
+			assertThat(client.reset(7)).isIn(PROTOCOL_ERROR, STREAM_CLOSED);
+			assertThat(client.closed()).isFalse();
+			assertThat(client.goAwayCode()).isEqualTo(-1);
 		}
-		assertThat(received).filteredOn(frame -> frame.streamId() == 1)
+		// the relay's CANCEL may follow, the response being unfinished when the late
+		// frame came
+		assertThat(received).filteredOn(frame -> frame.streamId() == 3 && frame.type() != TestH2.RST_STREAM)
 			.extracting(TestH2.Frame::type)
 			.containsExactly(TestH2.HEADERS);
-		assertThat(received).filteredOn(frame -> frame.streamId() == 3)
+		assertThat(received).filteredOn(frame -> frame.streamId() == 5 && frame.type() != TestH2.RST_STREAM)
 			.extracting(TestH2.Frame::type)
 			.containsExactly(TestH2.HEADERS, TestH2.HEADERS);
+		// netty answers the upstream's response on a stream it cancelled with
+		// STREAM_CLOSED
+		assertThat(received).filteredOn(frame -> frame.type() == TestH2.RST_STREAM)
+			.extracting(TestH2::errorCode)
+			.containsOnly(CANCEL, STREAM_CLOSED);
+		assertThat(received).filteredOn(frame -> frame.streamId() == 7).isEmpty();
 	}
 
 	private static byte[] settings(long... pairs) {
@@ -280,12 +315,16 @@ class H2DemuxFramingE2ETest {
 		return payload.toByteArray();
 	}
 
-	/** Records every frame received and answers every ended request. */
+	/**
+	 * Sends its SETTINGS first (the server preface netty's leg requires), records every
+	 * frame received and answers every ended request.
+	 */
 	private static void recordAndAnswer(Socket socket, Queue<TestH2.Frame> received) {
 		try (socket) {
 			InputStream in = socket.getInputStream();
 			OutputStream out = socket.getOutputStream();
 			in.readNBytes(TestH2.PREFACE.length);
+			TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
 			TestH2.@Nullable Frame frame;
 			while ((frame = TestH2.readFrame(in)) != null) {
 				received.add(frame);
@@ -356,7 +395,7 @@ class H2DemuxFramingE2ETest {
 	 * stream-wide backpressure stalls the writer in turn.
 	 */
 	private static void checkRequestBlocks(Socket socket, AtomicReference<String> violation, AtomicInteger heads,
-			AtomicInteger continuations) {
+			AtomicInteger continuations, AtomicInteger grants) {
 		try (socket) {
 			InputStream in = socket.getInputStream();
 			OutputStream out = socket.getOutputStream();
@@ -368,6 +407,9 @@ class H2DemuxFramingE2ETest {
 			TestH2.@Nullable Frame frame;
 			while ((frame = TestH2.readFrame(in)) != null) {
 				window.credit(frame);
+				if (frame.type() == TestH2.WINDOW_UPDATE && heads.get() > 1) {
+					grants.incrementAndGet();
+				}
 				if (blockOf != -1 && (frame.type() != TestH2.CONTINUATION || frame.streamId() != blockOf)) {
 					violation.compareAndSet("", "type=%d stream=%d inside the header block of stream %d"
 						.formatted(frame.type(), frame.streamId(), blockOf));
@@ -432,8 +474,9 @@ class H2DemuxFramingE2ETest {
 	}
 
 	/**
-	 * Announces stream windows of 2^31-1, relayed to the upstreams: a stub streaming
-	 * endlessly is bound by the connection window the relay grants it alone.
+	 * Announces stream windows of 2^31-1 to the relay: it writes a stub's endless
+	 * response to the client within the connection window alone, which the client grants
+	 * back on receipt, so the relay keeps granting the stub window.
 	 */
 	private static void unboundedStreamWindows(H2TestClient client) throws IOException {
 		client.frame(TestH2.SETTINGS, 0, 0,
@@ -441,33 +484,42 @@ class H2DemuxFramingE2ETest {
 	}
 
 	/**
-	 * The connection window the relay granted a stub upstream: its reader credits the
-	 * relay's grants, its writer takes from it before every DATA frame.
+	 * The windows the relay granted a stub upstream for its response on stream 1, the
+	 * connection's and the stream's: its reader credits the relay's grants, its writer
+	 * takes from both before every DATA frame.
 	 */
 	private static final class SendWindow {
 
-		private long window = WindowedH2Upstream.DEFAULT_WINDOW;
+		private long connection = WindowedH2Upstream.DEFAULT_WINDOW;
+
+		private long stream = WindowedH2Upstream.DEFAULT_WINDOW;
 
 		synchronized void credit(TestH2.Frame frame) {
-			if (frame.type() == TestH2.WINDOW_UPDATE && frame.streamId() == 0) {
-				this.window += TestH2.increment(frame);
-				notifyAll();
+			if (frame.type() != TestH2.WINDOW_UPDATE) {
+				return;
 			}
+			if (frame.streamId() == 0) {
+				this.connection += TestH2.increment(frame);
+			}
+			else if (frame.streamId() == 1) {
+				this.stream += TestH2.increment(frame);
+			}
+			notifyAll();
 		}
 
 		synchronized void take(int length) throws InterruptedException {
-			while (this.window < length) {
+			while (Math.min(this.connection, this.stream) < length) {
 				wait();
 			}
-			this.window -= length;
+			this.connection -= length;
+			this.stream -= length;
 		}
 
 	}
 
 	/**
 	 * The stub's only writer: an endless response on stream 1 at about 16MiB/s within the
-	 * connection window the relay granted, the queued responses written between its
-	 * frames.
+	 * windows the relay granted, the queued responses written between its frames.
 	 */
 	private static void writeEndlessly(OutputStream out, Queue<byte[]> responses, SendWindow window) {
 		try {

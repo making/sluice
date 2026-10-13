@@ -28,7 +28,6 @@ import am.ik.sluice.server.route.Router;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.junit.jupiter.api.TestInstance;
@@ -41,11 +40,11 @@ import org.springframework.test.context.DynamicPropertySource;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The h2 demux buffers at most one default-sized frame and one header block of the
- * decoder's limit per peer: a larger frame or block from the client ends the connection
- * with a GOAWAY, one from an upstream ends its leg with a GOAWAY to the upstream, the
- * client's connection going on -- before the rest arrives, so nothing beyond the limit is
- * ever buffered.
+ * The h2 demux buffers at most one default-sized frame and one header block of netty's
+ * GOAWAY threshold (80KiB, over the 64KiB header list limit) per peer: a larger frame or
+ * block from the client ends the connection with a GOAWAY, one from an upstream ends its
+ * leg with a GOAWAY to the upstream, the client's connection going on -- before the rest
+ * arrives, so nothing beyond the limit is ever buffered.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -54,8 +53,6 @@ class H2DemuxFrameLimitsE2ETest {
 	private static final int PROTOCOL_ERROR = 0x1;
 
 	private static final int FRAME_SIZE_ERROR = 0x6;
-
-	private static final int ENHANCE_YOUR_CALM = 0xb;
 
 	private static final int MAX_FRAME_SIZE = 16 * 1024;
 
@@ -134,14 +131,13 @@ class H2DemuxFrameLimitsE2ETest {
 	}
 
 	/**
-	 * HEADERS without END_HEADERS followed by CONTINUATION frames past the decoder's
-	 * header list limit (a CONTINUATION flood): GOAWAY ENHANCE_YOUR_CALM.
+	 * HEADERS without END_HEADERS followed by CONTINUATION frames (a CONTINUATION flood):
+	 * netty buffers an unfinished block up to 80KiB, its GOAWAY threshold over the 64KiB
+	 * header list limit; the byte past it ends the connection with GOAWAY
+	 * {@code PROTOCOL_ERROR}, naming stream 2^31-1 as the last processed.
 	 */
 	@Test
-	@Disabled("pins the hand-written relay's connection error past the 64KiB list limit; netty "
-			+ "ends the connection only past 80KiB of header block (its GOAWAY threshold over "
-			+ "the list limit): to be rewritten for it")
-	void clientHeaderBlockAboveTheListLimitEndsTheConnection() throws Exception {
+	void clientHeaderBlockPastTheGoAwayThresholdEndsTheConnection() throws Exception {
 		String route = "lim.block.test";
 		AtomicBoolean routed = new AtomicBoolean();
 		startClient(route, stub((in, out) -> routed.set(true)));
@@ -149,12 +145,18 @@ class H2DemuxFrameLimitsE2ETest {
 			client.headers(1, false, TestH2.headerBlock(":authority=" + route, ":method=POST", ":path=/"));
 			Awaitility.await().atMost(Duration.ofSeconds(5)).untilTrue(routed);
 			client.frame(TestH2.HEADERS, 0, 3, new byte[MAX_FRAME_SIZE]);
-			for (int i = 0; i < 4 && !client.closed(); i++) {
+			for (int i = 0; i < 4; i++) {
 				client.frame(TestH2.CONTINUATION, 0, 3, new byte[MAX_FRAME_SIZE]);
 			}
+			// nothing to fence on inside a header block: a GOAWAY at 80KiB would come now
+			Thread.sleep(500);
+			assertThat(client.closed()).as("80KiB of block taken").isFalse();
+			assertThat(client.goAwayCode()).isEqualTo(-1);
+			client.frame(TestH2.CONTINUATION, 0, 3, new byte[1]);
 			assertThat(client.awaitTrue(client::closed, Duration.ofSeconds(5))).as("the relay closed the connection")
 				.isTrue();
-			assertThat(client.goAwayCode()).isEqualTo(ENHANCE_YOUR_CALM);
+			assertThat(client.goAwayCode()).isEqualTo(PROTOCOL_ERROR);
+			assertThat(client.goAwayLastStreamId()).isEqualTo(Integer.MAX_VALUE);
 		}
 	}
 

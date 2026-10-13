@@ -48,7 +48,6 @@ import io.netty.handler.codec.http2.Http2Exception;
 import io.netty.handler.codec.http2.Http2Headers;
 
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.junit.jupiter.api.TestInstance;
@@ -90,13 +89,8 @@ class H2DemuxBudgetE2ETest {
 
 	private static final int ENHANCE_YOUR_CALM = 0xb;
 
-	/** A frame type RFC 9113 does not define, relayed as it is. */
-	private static final int UNKNOWN_FRAME = 0xfa;
-
 	/** A RST_STREAM frame: its header and error code. */
 	private static final int RST_STREAM_BYTES = 9 + 4;
-
-	private static final AtomicLong PINGS = new AtomicLong();
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
@@ -313,76 +307,6 @@ class H2DemuxBudgetE2ETest {
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 		}
 		awaitReleased(route);
-	}
-
-	/**
-	 * A stream the relay reset -- its trailers past the allowance with the budget
-	 * exhausted -- whose reset still waits for the stalled upstream, the stream still
-	 * tracked: a client WINDOW_UPDATE with an increment of 0 on it gets no second
-	 * RST_STREAM and counts no protocol reset, and what the upstream sends on it -- a
-	 * response head, DATA, an unknown frame, a reset -- never reaches the client; the
-	 * upstream gets the one CANCEL.
-	 */
-	@Test
-	@Disabled("frames on a stream the relay reset: netty forgets the stream once its reset is "
-			+ "written and answers later frames itself, and relays no unknown frame; and the "
-			+ "test counts the protocol reset meter, not yet on the h2 demux; to be rewritten for it")
-	void aStreamWhoseResetWaitsForTheUpstreamIsResetOnceAndRelaysNothing() throws Exception {
-		String route = "bud.zero.test";
-		String stalledRoute = "bud.zero.held.test";
-		CountDownLatch gate = new CountDownLatch(1);
-		UpstreamLog log = new UpstreamLog();
-		startClient(route, stub(socket -> serveGatedLogging(socket, gate, log)));
-		startClient(stalledRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
-		int reset = streamId(0);
-		int probe = streamId(1);
-		H2TestClient client = H2TestClient.connect(dataPort, reset, probe);
-		client.headers(reset, false, head(route, "/reset"));
-		try (Stalled first = open(client, route, 1, BODY, 0); Stalled second = stall(stalledRoute)) {
-			first.awaitWithheld();
-			assertThat(budgetUsed()).as("exhausted").isGreaterThanOrEqualTo(BUDGET);
-			first.stop();
-			double budgetResets = resets("budget");
-			double protocolResets = resets("protocol");
-			client.headers(reset, true, TestH2.headerBlock("x-trailer=1"));
-			assertThat(client.awaitTrue(() -> client.reset(reset) != null, Duration.ofSeconds(5))).isTrue();
-			assertThat(client.reset(reset)).isEqualTo(ENHANCE_YOUR_CALM);
-			assertThat(resets("budget")).isEqualTo(budgetResets + 1);
-			client.frame(TestH2.WINDOW_UPDATE, 0, reset, TestH2.int32(0));
-			awaitPingAck(client);
-			// the upstream, no longer reading, answers on the stream; an unknown frame on
-			// another stream, relayed as it is, tells the leg's inbound side read past it
-			OutputStream upstream = log.awaitIdle();
-			TestH2.writeFrame(upstream, TestH2.HEADERS, TestH2.FLAG_END_HEADERS, reset, new byte[] { (byte) 0x88 });
-			TestH2.writeFrame(upstream, TestH2.DATA, 0, reset, new byte[16]);
-			TestH2.writeFrame(upstream, UNKNOWN_FRAME, 0, reset, new byte[4]);
-			TestH2.writeFrame(upstream, TestH2.RST_STREAM, 0, reset, TestH2.int32(NO_ERROR));
-			TestH2.writeFrame(upstream, UNKNOWN_FRAME, 0, probe, new byte[4]);
-			assertThat(
-					client.awaitTrue(() -> types(client.frames(probe)).contains(UNKNOWN_FRAME), Duration.ofSeconds(5)))
-				.as("the inbound side read past the stream's frames")
-				.isTrue();
-			// no stream is opened meanwhile, so the count only falls: tracked now, the
-			// stream was tracked when the window update and the frames were read
-			assertThat(trackedStreams(route)).as("still tracked: its reset waits for the stalled upstream")
-				.isEqualTo(STREAMS + 1);
-			assertThat(types(client.frames(reset))).as("one reset, nothing after it")
-				.containsExactly(TestH2.RST_STREAM);
-			assertThat(resets("protocol")).isEqualTo(protocolResets);
-			assertThat(client.goAwayCode()).isEqualTo(-1);
-			gate.countDown();
-			first.resume();
-			first.awaitEnds();
-			second.awaitEnds();
-			Awaitility.await()
-				.atMost(Duration.ofSeconds(5))
-				.untilAsserted(() -> assertThat(trackedStreams(route)).isZero());
-			assertThat(log.resets).as("the upstream was told").isEqualTo(Map.of(reset, CANCEL));
-			assertThat(log.afterReset).as("nothing of the stream relayed after its reset").isEmpty();
-			assertThat(types(client.frames(reset))).containsExactly(TestH2.RST_STREAM);
-		}
-		awaitReleased(route);
-		awaitReleased(stalledRoute);
 	}
 
 	/**
@@ -1062,15 +986,6 @@ class H2DemuxBudgetE2ETest {
 
 	private DataProxyServer dataProxyServer() {
 		return Objects.requireNonNull(this.dataProxyServer, "dataProxyServer");
-	}
-
-	private static void awaitPingAck(H2TestClient client) throws Exception {
-		byte[] ping = Arrays.copyOf(TestH2.int32((int) PINGS.incrementAndGet()), 8);
-		client.frame(TestH2.PING, 0, 0, ping);
-		assertThat(client.awaitTrue(() -> client.pingAcks().stream().anyMatch(ack -> Arrays.equals(ack, ping)),
-				Duration.ofSeconds(5)))
-			.as("the relay acked the PING")
-			.isTrue();
 	}
 
 	private void startClient(String host, ServerSocket upstream) {

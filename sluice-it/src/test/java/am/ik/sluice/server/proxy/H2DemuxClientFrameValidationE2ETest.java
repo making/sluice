@@ -50,6 +50,7 @@ import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -59,11 +60,12 @@ import org.springframework.test.context.DynamicPropertySource;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The h2 demux checks every client frame RFC 9113 makes a connection error of before the
- * frame has any effect: the connection ends with a GOAWAY of the error's code, nothing of
- * the frame reaches the upstream, and the relay lets go of the connection, its leg and
- * its streams. The well-formed counterpart of each keeps the connection. A frame making a
- * stream error resets only its stream. In the relay's package for its meters.
+ * The h2 demux -- netty's codec -- checks the client frames RFC 9113 makes a connection
+ * error of before the frame has any effect: the connection ends with a GOAWAY of the
+ * error's code, nothing of the frame reaches the upstream, and the relay lets go of the
+ * connection, its leg and its streams. The well-formed counterpart of each keeps the
+ * connection. A frame making a stream error resets only its stream. In the relay's
+ * package for its meters.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -157,9 +159,11 @@ class H2DemuxClientFrameValidationE2ETest {
 
 	/**
 	 * Sent while stream 1 of the route is open (its request unfinished), the frame ends
-	 * the connection with a GOAWAY of the error's code; nothing more reaches the
-	 * upstream, whose connection is closed, and the relay tracks no stream and holds no
-	 * connection any more.
+	 * the connection at once with a GOAWAY of the error's code naming stream 2^31-1 as
+	 * the last processed (netty's hard shutdown: the error may come before the frame's
+	 * stream was counted); the open stream is dropped, nothing more reaches the upstream,
+	 * whose connection is closed, and the relay tracks no stream and holds no connection
+	 * any more.
 	 */
 	@ParameterizedTest(name = "{0}")
 	@MethodSource("violations")
@@ -171,6 +175,7 @@ class H2DemuxClientFrameValidationE2ETest {
 				.as("the relay closed the connection")
 				.isTrue();
 			assertThat(session.client().goAwayCode()).isEqualTo(violation.code());
+			assertThat(session.client().goAwayLastStreamId()).isEqualTo(Integer.MAX_VALUE);
 			assertThat(session.upstream().eof().await(5, TimeUnit.SECONDS)).as("the leg closed").isTrue();
 			assertThat(session.upstream().frames().subList(before, session.upstream().frames().size()))
 				.as("nothing reached the upstream")
@@ -233,6 +238,10 @@ class H2DemuxClientFrameValidationE2ETest {
 				new Violation("WINDOW_UPDATE on an idle stream", PROTOCOL_ERROR,
 						frame(TestH2.WINDOW_UPDATE, 0, 3, TestH2.int32(1))),
 				new Violation("DATA on an even stream", PROTOCOL_ERROR, frame(TestH2.DATA, 0, 2, new byte[1])),
+				new Violation("RST_STREAM on an even stream", PROTOCOL_ERROR,
+						frame(TestH2.RST_STREAM, 0, 2, TestH2.int32(CANCEL))),
+				new Violation("WINDOW_UPDATE on an even stream", PROTOCOL_ERROR,
+						frame(TestH2.WINDOW_UPDATE, 0, 2, TestH2.int32(1))),
 				new Violation("HEADERS on an even stream", PROTOCOL_ERROR,
 						frame(TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 2, get3)),
 				new Violation("CONTINUATION outside a header block", PROTOCOL_ERROR,
@@ -264,20 +273,38 @@ class H2DemuxClientFrameValidationE2ETest {
 										WindowedH2Upstream.setting(SETTINGS_ENABLE_PUSH, 2)))));
 	}
 
+	/**
+	 * Sent while stream 1 of the route is open, a frame too short or too long for its
+	 * type on a stream (RFC 9113 4.2, 6.1, 6.3) resets that stream with
+	 * {@code FRAME_SIZE_ERROR} -- an idle one too -- and keeps the connection: the
+	 * upstream gets {@code CANCEL} for a stream it had, nothing for an idle one, and a
+	 * later stream completes.
+	 */
 	@ParameterizedTest(name = "{0}")
-	@MethodSource("violationsTheCodecAnswersOtherwise")
-	@Disabled("netty's codec does not end the connection on these frames: to be rewritten for its answers")
-	void violationTheCodecAnswersOtherwiseEndsTheConnection(Violation violation) throws Exception {
-		violationEndsTheConnection(violation);
+	@MethodSource("streamErrors")
+	void streamErrorResetsOnlyItsStream(StreamError error) throws Exception {
+		try (Session session = open(ROUTE, "/")) {
+			H2TestClient client = session.client();
+			client.raw(error.bytes());
+			assertThat(client.awaitTrue(() -> client.reset(error.streamId()) != null, Duration.ofSeconds(5)))
+				.as("stream %d reset", error.streamId())
+				.isTrue();
+			assertThat(client.reset(error.streamId())).isEqualTo(FRAME_SIZE_ERROR);
+			client.headers(5, true, get(ROUTE));
+			assertThat(client.awaitEnd(5, Duration.ofSeconds(5))).as("a later stream completes").isTrue();
+			assertThat(TestH2.bodyOf(client.frames(5))).isEqualTo("ok");
+			assertThat(session.upstream().resets())
+				.isEqualTo(error.streamId() == 1 ? List.of(List.of(1, CANCEL)) : List.of());
+			assertThat(client.resets()).containsOnlyKeys(error.streamId());
+			assertThat(client.closed()).isFalse();
+			assertThat(client.goAwayCode()).isEqualTo(-1);
+		}
 	}
 
-	static Stream<Violation> violationsTheCodecAnswersOtherwise() {
-		return Stream.of(
-				new Violation("PRIORITY of 4 on an idle stream", FRAME_SIZE_ERROR, frame(PRIORITY, 0, 3, new byte[4])),
-				new Violation("PRIORITY of 6 on an idle stream", FRAME_SIZE_ERROR, frame(PRIORITY, 0, 3, new byte[6])),
-				new Violation("padded DATA of 0", FRAME_SIZE_ERROR,
-						frame(TestH2.DATA, TestH2.FLAG_PADDED, 1, new byte[0])),
-				setting(SETTINGS_NO_RFC7540_PRIORITIES, 2, PROTOCOL_ERROR));
+	static Stream<StreamError> streamErrors() {
+		return Stream.of(new StreamError("PRIORITY of 4 on an idle stream", 3, frame(PRIORITY, 0, 3, new byte[4])),
+				new StreamError("PRIORITY of 6 on an idle stream", 3, frame(PRIORITY, 0, 3, new byte[6])),
+				new StreamError("padded DATA of 0", 1, frame(TestH2.DATA, TestH2.FLAG_PADDED, 1, new byte[0])));
 	}
 
 	/**
@@ -341,22 +368,10 @@ class H2DemuxClientFrameValidationE2ETest {
 				counterpartSetting(SETTINGS_MAX_FRAME_SIZE, 16 * 1024),
 				counterpartSetting(SETTINGS_MAX_FRAME_SIZE, (1 << 24) - 1),
 				counterpartSetting(SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
-				counterpartSetting(SETTINGS_NO_RFC7540_PRIORITIES, 1), counterpartSetting(0xff, 0xffffffffL));
-	}
-
-	@ParameterizedTest(name = "{0}")
-	@MethodSource("counterpartsTheCodecAnswersOtherwise")
-	@Disabled("netty's codec ends the connection on these frames: to be rewritten for its answers")
-	void counterpartTheCodecAnswersOtherwiseKeepsTheConnection(Counterpart counterpart) throws Exception {
-		counterpartKeepsTheConnection(counterpart);
-	}
-
-	static Stream<Counterpart> counterpartsTheCodecAnswersOtherwise() {
-		return Stream.of(
-				new Counterpart("RST_STREAM on an even stream", 0,
-						frame(TestH2.RST_STREAM, 0, 2, TestH2.int32(CANCEL))),
-				new Counterpart("WINDOW_UPDATE on an even stream", 0,
-						frame(TestH2.WINDOW_UPDATE, 0, 2, TestH2.int32(1))));
+				counterpartSetting(SETTINGS_NO_RFC7540_PRIORITIES, 1),
+				// netty does not know RFC 9218's setting: an unknown setting, ignored
+				// whatever its value (RFC 9113 6.5.2)
+				counterpartSetting(SETTINGS_NO_RFC7540_PRIORITIES, 2), counterpartSetting(0xff, 0xffffffffL));
 	}
 
 	/**
@@ -469,22 +484,24 @@ class H2DemuxClientFrameValidationE2ETest {
 	}
 
 	/**
-	 * A change of SETTINGS_INITIAL_WINDOW_SIZE taking the window of a stream whose
-	 * response goes on past 2^31-1 ends the connection with GOAWAY
-	 * {@code FLOW_CONTROL_ERROR} (RFC 9113 6.9.2); the setting never reaches the
-	 * upstream.
+	 * A change of SETTINGS_INITIAL_WINDOW_SIZE taking the relay's window of an open
+	 * stream past 2^31-1 ends the connection with GOAWAY {@code FLOW_CONTROL_ERROR} (RFC
+	 * 9113 6.9.2) -- a stream whose response ended too ({@code /early}: its request goes
+	 * on, its window is still the stream's) --; the windows are per hop, so the setting
+	 * never reaches the upstream.
 	 */
-	@Test
-	@Disabled("pins the hand-written relay's handling of the client's "
-			+ "SETTINGS_INITIAL_WINDOW_SIZE against the upstream's stream windows; the relay "
-			+ "keeps windows per hop: to be rewritten for it")
-	void initialWindowChangePastTheMaximumEndsTheConnection() throws Exception {
-		try (Session session = open(ROUTE, "/")) {
+	@ParameterizedTest(name = "{0}")
+	@ValueSource(strings = { "/", "/early" })
+	void initialWindowChangePastTheMaximumEndsTheConnection(String path) throws Exception {
+		try (Session session = open(ROUTE, path)) {
 			H2TestClient client = session.client();
-			client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(MAX_WINDOW - WINDOW));
-			Awaitility.await()
-				.atMost(Duration.ofSeconds(5))
-				.until(() -> session.upstream().windowGranted(1) == MAX_WINDOW - WINDOW);
+			// the window, less the early response's two bytes, at the maximum
+			int spent = 0;
+			if ("/early".equals(path)) {
+				assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).as("the response ended").isTrue();
+				spent = 2;
+			}
+			client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(MAX_WINDOW - WINDOW + spent));
 			client.frame(TestH2.SETTINGS, 0, 0, WindowedH2Upstream.setting(SETTINGS_INITIAL_WINDOW_SIZE, WINDOW + 1));
 			assertThat(client.awaitTrue(client::closed, Duration.ofSeconds(5))).isTrue();
 			assertThat(client.goAwayCode()).isEqualTo(FLOW_CONTROL_ERROR);
@@ -496,51 +513,54 @@ class H2DemuxClientFrameValidationE2ETest {
 
 	/**
 	 * A change of SETTINGS_INITIAL_WINDOW_SIZE taking a stream's window to 2^31-1 exactly
-	 * keeps the connection, and the upstream gets the setting.
+	 * keeps the connection; the setting does not reach the upstream.
 	 */
 	@Test
-	@Disabled("pins the hand-written relay's handling of the client's "
-			+ "SETTINGS_INITIAL_WINDOW_SIZE against the upstream's stream windows; the relay "
-			+ "keeps windows per hop: to be rewritten for it")
 	void initialWindowChangeToTheMaximumKeepsTheConnection() throws Exception {
 		try (Session session = open(ROUTE, "/")) {
 			H2TestClient client = session.client();
 			client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(MAX_WINDOW - WINDOW - 1));
 			client.frame(TestH2.SETTINGS, 0, 0, WindowedH2Upstream.setting(SETTINGS_INITIAL_WINDOW_SIZE, WINDOW + 1));
-			Awaitility.await()
-				.atMost(Duration.ofSeconds(5))
-				.until(() -> session.upstream().settings(SETTINGS_INITIAL_WINDOW_SIZE).equals(List.of(WINDOW + 1L)));
+			awaitPingAck(client);
 			client.sendData(1, "x".getBytes(StandardCharsets.US_ASCII), TestH2.FLAG_END_STREAM);
 			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
+			assertThat(TestH2.bodyOf(client.frames(1))).isEqualTo("ok");
 			assertThat(client.closed()).isFalse();
 			assertThat(client.goAwayCode()).isEqualTo(-1);
+			assertThat(session.upstream().settings(SETTINGS_INITIAL_WINDOW_SIZE)).isEmpty();
 		}
 	}
 
 	/**
-	 * A stream whose response ended, its request still going on, has no window the
-	 * relay's peer sends into any more: a change of SETTINGS_INITIAL_WINDOW_SIZE that
-	 * would take its window past 2^31-1 keeps the connection.
+	 * A client preface not followed by a SETTINGS frame (RFC 9113 3.4) -- a request head
+	 * right after the magic -- ends the connection with GOAWAY {@code PROTOCOL_ERROR}
+	 * behind the relay's SETTINGS; the head reaches no upstream.
 	 */
 	@Test
-	@Disabled("pins the hand-written relay's handling of the client's "
-			+ "SETTINGS_INITIAL_WINDOW_SIZE against the upstream's stream windows; the relay "
-			+ "keeps windows per hop: to be rewritten for it")
-	void initialWindowChangeSparesAStreamWhoseResponseEnded() throws Exception {
-		try (Session session = open(ROUTE, "/early")) {
-			H2TestClient client = session.client();
-			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).as("the response ended").isTrue();
-			// the window, less the response's two bytes, at the maximum
-			client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(MAX_WINDOW - WINDOW + 2));
-			client.frame(TestH2.SETTINGS, 0, 0, WindowedH2Upstream.setting(SETTINGS_INITIAL_WINDOW_SIZE, WINDOW + 1));
-			awaitPingAck(client);
-			assertThat(trackedStreams(ROUTE)).as("stream 1 still tracked: its request goes on").isEqualTo(1);
-			client.headers(3, true, get(ROUTE));
-			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).isTrue();
-			assertThat(client.closed()).isFalse();
-			assertThat(client.goAwayCode()).isEqualTo(-1);
-			assertThat(client.resets()).isEmpty();
+	void aPrefaceNotFollowedBySettingsEndsTheConnection() throws Exception {
+		DataProxyServer proxy = Objects.requireNonNull(this.dataProxyServer);
+		Awaitility.await()
+			.atMost(Duration.ofSeconds(10))
+			.until(() -> proxy.activeConnections() == 0 && trackedStreams(ROUTE) == 0);
+		this.upstreams.clear();
+		List<TestH2.Frame> frames = new ArrayList<>();
+		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+			socket.setSoTimeout(5000);
+			OutputStream out = socket.getOutputStream();
+			out.write(TestH2.PREFACE);
+			TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 1, get(ROUTE));
+			InputStream in = socket.getInputStream();
+			TestH2.@Nullable Frame frame;
+			while ((frame = TestH2.readFrame(in)) != null) {
+				frames.add(frame);
+			}
 		}
+		assertThat(frames).extracting(TestH2.Frame::type).containsExactly(TestH2.SETTINGS, TestH2.GOAWAY);
+		TestH2.Frame goAway = frames.get(1);
+		assertThat(TestH2.errorCode(goAway)).isEqualTo(PROTOCOL_ERROR);
+		assertThat(TestH2.increment(goAway)).as("last stream id").isEqualTo(Integer.MAX_VALUE);
+		awaitReleased(ROUTE);
+		assertThat(this.upstreams).as("no leg opened").isEmpty();
 	}
 
 	private static Violation insideBlock(String name, byte[] offending) {
@@ -770,6 +790,16 @@ class H2DemuxClientFrameValidationE2ETest {
 	 * ending the request, or 0.
 	 */
 	record Counterpart(String name, int opened, byte[] bytes) {
+
+		@Override
+		public String toString() {
+			return this.name;
+		}
+
+	}
+
+	/** A client frame RFC 9113 makes a stream error of, and its stream. */
+	record StreamError(String name, int streamId, byte[] bytes) {
 
 		@Override
 		public String toString() {

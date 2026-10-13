@@ -1,5 +1,6 @@
 package am.ik.sluice.server.proxy;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -31,6 +32,7 @@ import am.ik.sluice.it.H2TestClient;
 import am.ik.sluice.it.TestH2;
 import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.server.proxy.hop.Hop;
 import am.ik.sluice.server.route.Router;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
@@ -62,6 +64,11 @@ class H2DemuxLegWriterE2ETest {
 	private static final byte[] PING_PAYLOAD = "pingpong".getBytes(StandardCharsets.US_ASCII);
 
 	private static final int BULK_STREAMS = 20;
+
+	/** The PINGs a flooding upstream writes at most: 17MiB, past every buffer between. */
+	private static final long FLOOD_PINGS = 1024 * 1024;
+
+	private static final int PINGS_PER_WRITE = 64;
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
@@ -134,41 +141,31 @@ class H2DemuxLegWriterE2ETest {
 	}
 
 	/**
-	 * An upstream flooding PINGs while its leg is stalled ends its leg (a connection
-	 * error {@code ENHANCE_YOUR_CALM}; the stalled upstream cannot read the GOAWAY): the
-	 * client's streams on it are answered with a {@code 502}, and its connection goes on:
-	 * a stream of another route completes.
+	 * An upstream flooding PINGs without reading: netty acks each as it reads it, the
+	 * acks pile up in the leg's writer queue towards the upstream that does not read, and
+	 * past the hop's read pause the leg's reader stops reading; the flood backs up into
+	 * the upstream, and the relay holds no more than the bound of one hop's writer queue
+	 * for the leg. The leg is not ended (no answer on its stream), and the client's
+	 * connection goes on: a stream of another route completes.
 	 */
 	@Test
-	@Disabled("netty pauses reading an upstream that floods PINGs without reading (the hop's "
-			+ "read pause) instead of ending its leg, and the tunnel byte counter is not yet on "
-			+ "the h2 demux; to be rewritten for it")
-	void upstreamPingFloodEndsItsLeg() throws Exception {
+	void upstreamPingFloodPausesItsLegsReader() throws Exception {
 		String route = "lw.flood.test";
 		String otherRoute = "lw.flood-other.test";
-		CountDownLatch ping = new CountDownLatch(1);
-		startClient(route, stub(socket -> stallThenFlood(socket, ping)));
+		AtomicLong written = new AtomicLong();
+		startClient(route, stub(socket -> readHeadThenFlood(socket, written)));
 		startClient(otherRoute, stub(H2DemuxLegWriterE2ETest::answerEndedRequests));
-		double failed = Objects.requireNonNull(this.meterRegistry).get("sluice.h2demux.legs.failed").counter().count();
-		Integer[] streams = new Integer[BULK_STREAMS];
-		for (int i = 0; i < BULK_STREAMS; i++) {
-			streams[i] = 1 + 2 * i;
-		}
-		int other = 1 + 2 * BULK_STREAMS;
-		try (H2TestClient client = H2TestClient.connect(dataPort, streams)) {
-			fillStalledLeg(client, route);
-			ping.countDown();
-			for (Integer streamId : streams) {
-				assertThat(client.awaitEnd(streamId, Duration.ofSeconds(10))).as("stream %d answered", streamId)
-					.isTrue();
-				assertThat(TestH2.status(client.frames(streamId))).isEqualTo("502");
-			}
-			assertThat(Objects.requireNonNull(this.meterRegistry).get("sluice.h2demux.legs.failed").counter().count()
-					- failed)
-				.as("the leg ended on the flood")
-				.isEqualTo(1);
-			client.headers(other, true, TestH2.headerBlock(":authority=" + otherRoute, ":method=GET", ":path=/"));
-			assertThat(client.awaitEnd(other, Duration.ofSeconds(5))).as("another route's stream completes").isTrue();
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
+			client.headers(1, false, TestH2.headerBlock(":authority=" + route, ":method=POST", ":path=/"));
+			awaitSteady(written);
+			assertThat(written.get()).as("PINGs written before the flood backed up").isLessThan(FLOOD_PINGS);
+			assertThat(queuedBytes(route)).as("the leg's writer queue")
+				.isGreaterThan(Hop.DEFAULT_READ_PAUSE_BYTES)
+				.isLessThanOrEqualTo(NettyHttp2DemuxRelay.HOP_QUEUE_BYTES);
+			client.headers(3, true, TestH2.headerBlock(":authority=" + otherRoute, ":method=GET", ":path=/"));
+			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).as("another route's stream completes").isTrue();
+			assertThat(TestH2.bodyOf(client.frames(3))).isEqualTo("ok");
+			assertThat(client.frames(1)).as("the flooding upstream's stream").isEmpty();
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(client.closed()).isFalse();
 		}
@@ -291,23 +288,57 @@ class H2DemuxLegWriterE2ETest {
 		}
 	}
 
-	/** Stalls the leg, then floods PINGs without reading. */
-	private static void stallThenFlood(Socket socket, CountDownLatch ping) {
+	/**
+	 * Sends its SETTINGS, reads until a request head arrives, then stops reading and
+	 * writes up to {@link #FLOOD_PINGS} PINGs, counting those written, until the relay
+	 * goes away.
+	 */
+	private static void readHeadThenFlood(Socket socket, AtomicLong written) {
 		try {
 			InputStream in = socket.getInputStream();
 			OutputStream out = socket.getOutputStream();
-			grantThenStall(in, out);
-			ping.await();
-			for (int i = 0; i < 5000; i++) {
-				TestH2.writeFrame(out, TestH2.PING, 0, 0, PING_PAYLOAD);
+			if (in.readNBytes(TestH2.PREFACE.length).length < TestH2.PREFACE.length) {
+				return;
+			}
+			TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
+			TestH2.@Nullable Frame frame;
+			do {
+				frame = TestH2.readFrame(in);
+			}
+			while (frame != null && frame.type() != TestH2.HEADERS);
+			ByteArrayOutputStream batch = new ByteArrayOutputStream();
+			for (int i = 0; i < PINGS_PER_WRITE; i++) {
+				TestH2.writeFrame(batch, TestH2.PING, 0, 0, PING_PAYLOAD);
+			}
+			byte[] pings = batch.toByteArray();
+			for (long i = 0; i < FLOOD_PINGS; i += PINGS_PER_WRITE) {
+				out.write(pings);
+				written.addAndGet(PINGS_PER_WRITE);
 			}
 		}
-		catch (IOException | InterruptedException e) {
+		catch (IOException e) {
 			// ended
 		}
 	}
 
-	/** An h2 stub answering every request once it ended (END_STREAM). */
+	/** Waits until the count is above 0 and unchanged for two seconds. */
+	private static void awaitSteady(AtomicLong count) {
+		AtomicLong last = new AtomicLong(-1);
+		AtomicLong stableSince = new AtomicLong(System.nanoTime());
+		Awaitility.await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(100)).until(() -> {
+			long now = count.get();
+			if (now != last.get()) {
+				last.set(now);
+				stableSince.set(System.nanoTime());
+			}
+			return now > 0 && TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - stableSince.get()) > 2000;
+		});
+	}
+
+	/**
+	 * An h2 stub sending its SETTINGS first (the server preface netty's leg requires) and
+	 * answering every request once it ended (END_STREAM).
+	 */
 	private static void answerEndedRequests(Socket socket) {
 		try (socket) {
 			InputStream in = socket.getInputStream();
@@ -315,6 +346,7 @@ class H2DemuxLegWriterE2ETest {
 			if (in.readNBytes(TestH2.PREFACE.length).length < TestH2.PREFACE.length) {
 				return;
 			}
+			TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
 			TestH2.@Nullable Frame frame;
 			while ((frame = TestH2.readFrame(in)) != null) {
 				boolean ended = frame.streamId() != 0 && (frame.type() == TestH2.HEADERS || frame.type() == TestH2.DATA)

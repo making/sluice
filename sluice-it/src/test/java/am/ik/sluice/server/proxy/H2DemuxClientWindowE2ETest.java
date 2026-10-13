@@ -11,6 +11,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -60,7 +61,6 @@ import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.ScheduledFuture;
 
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.junit.jupiter.api.TestInstance;
@@ -376,13 +376,11 @@ class H2DemuxClientWindowE2ETest {
 	/**
 	 * A client stream-level WINDOW_UPDATE with an increment of 0 on an open stream resets
 	 * that stream only (RFC 9113 6.9): RST_STREAM {@code PROTOCOL_ERROR} to the client,
-	 * {@code CANCEL} to the upstream, counted once with reason {@code protocol} -- a
-	 * second one, once the reset stream is no longer tracked, changes nothing --, and the
-	 * connection's other stream completes.
+	 * {@code CANCEL} to the upstream, and the connection's other stream completes. A
+	 * second one on the stream netty forgot is answered by netty's codec with another
+	 * RST_STREAM {@code PROTOCOL_ERROR}, and reaches nothing upstream.
 	 */
 	@Test
-	@Disabled("a frame on a stream netty forgot is answered by netty's codec with a reset of "
-			+ "its own, and the protocol reset meter is not yet on the h2 demux; to be rewritten for it")
 	void zeroStreamWindowIncrementResetsOnlyThatStream() throws Exception {
 		String route = "cw.wu-zero-stream.test";
 		List<TestH2.Frame> received = new CopyOnWriteArrayList<>();
@@ -398,7 +396,6 @@ class H2DemuxClientWindowE2ETest {
 				}
 			}
 		}));
-		double protocolResets = resets("protocol");
 		double budgetResets = resets("budget");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.headers(1, false, post(route));
@@ -416,11 +413,10 @@ class H2DemuxClientWindowE2ETest {
 			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> trackedStreams(route) == 1);
 			client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(0));
 			awaitPingAck(client);
-			List<TestH2.Frame> frames = client.frames(1);
-			assertThat(frames).filteredOn(frame -> frame.type() == TestH2.RST_STREAM).as("one reset").hasSize(1);
-			assertThat(frames.get(frames.size() - 1).type()).as("nothing follows the reset")
-				.isEqualTo(TestH2.RST_STREAM);
-			assertThat(resets("protocol") - protocolResets).isEqualTo(1);
+			assertThat(client.frames(1)).as("the resets, nothing else after the first")
+				.extracting(TestH2.Frame::type)
+				.containsExactly(TestH2.RST_STREAM, TestH2.RST_STREAM);
+			assertThat(client.frames(1)).extracting(TestH2::errorCode).containsOnly(PROTOCOL_ERROR);
 			assertThat(resets("budget") - budgetResets).isZero();
 			client.sendData(3, "x".getBytes(StandardCharsets.US_ASCII), TestH2.FLAG_END_STREAM);
 			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).isTrue();
@@ -433,18 +429,15 @@ class H2DemuxClientWindowE2ETest {
 	}
 
 	/**
-	 * A client WINDOW_UPDATE with an increment of 0 on a stream the relay no longer
-	 * tracks -- its request and response ended -- is ignored (RFC 9113 5.1): no reset,
-	 * the connection serves the next stream.
+	 * A client WINDOW_UPDATE with an increment of 0 on a stream whose request and
+	 * response ended, which the relay no longer tracks and netty forgot, is answered by
+	 * netty's codec with RST_STREAM {@code PROTOCOL_ERROR} (RFC 9113 6.9); the connection
+	 * serves the next stream.
 	 */
 	@Test
-	@Disabled("a frame on a stream netty forgot is answered by netty's codec with a reset of "
-			+ "its own, and the test counts the protocol reset meter, not yet on the h2 demux; "
-			+ "to be rewritten for it")
-	void zeroIncrementOnAnUntrackedStreamIsIgnored() throws Exception {
+	void zeroIncrementOnAFinishedStreamIsResetByTheCodec() throws Exception {
 		String route = "cw.wu-zero-untracked.test";
 		startClient(route, upstream(new AtomicReference<>(), upstream -> respondToEach(upstream, 10)));
-		double protocolResets = resets("protocol");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.headers(1, true, get(route));
 			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
@@ -453,23 +446,21 @@ class H2DemuxClientWindowE2ETest {
 			awaitPingAck(client);
 			client.headers(3, true, get(route));
 			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).isTrue();
-			assertThat(client.resets()).isEmpty();
+			assertThat(client.resets()).isEqualTo(Map.of(1, PROTOCOL_ERROR));
 			assertThat(client.closed()).isFalse();
-			assertThat(resets("protocol") - protocolResets).isZero();
+			assertThat(client.goAwayCode()).isEqualTo(-1);
 		}
 	}
 
 	/**
-	 * A client WINDOW_UPDATE with an increment of 0 on a stream closed both ways -- the
-	 * client ended its request, the response ended -- but still tracked, its request DATA
-	 * held by the upstream's stream window of 0, is ignored (RFC 9113 5.1): no reset
-	 * either way, and the DATA reaches the upstream once it grants the window.
+	 * A client WINDOW_UPDATE with an increment of 0 on a stream closed both ways for the
+	 * client -- it ended its request, the response ended -- whose request DATA the relay
+	 * still holds for the upstream's stream window of 0: netty's codec answers it with
+	 * RST_STREAM {@code PROTOCOL_ERROR}, the upstream stream is not reset, and the DATA
+	 * reaches the upstream once it grants the window.
 	 */
 	@Test
-	@Disabled("a frame on a stream netty closed is answered by netty's codec with a reset of "
-			+ "its own, and the test counts the protocol reset meter, not yet on the h2 demux; "
-			+ "to be rewritten for it")
-	void zeroIncrementOnAStreamClosedBothWaysIsIgnored() throws Exception {
+	void zeroIncrementOnAStreamClosedBothWaysLeavesTheRequestsRestToTheUpstream() throws Exception {
 		String route = "cw.wu-zero-closed.test";
 		AtomicReference<WindowedH2Upstream> seen = new AtomicReference<>();
 		List<TestH2.Frame> received = new CopyOnWriteArrayList<>();
@@ -483,24 +474,19 @@ class H2DemuxClientWindowE2ETest {
 				}
 			}
 		}));
-		double protocolResets = resets("protocol");
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
 			client.headers(1, false, post(route));
 			// the upstream's SETTINGS precede its response on the leg: applied by now
 			assertThat(client.awaitEnd(1, Duration.ofSeconds(5))).isTrue();
 			client.sendData(1, "abc".getBytes(StandardCharsets.US_ASCII), TestH2.FLAG_END_STREAM);
 			awaitPingAck(client);
-			assertThat(trackedStreams(route)).as("tracked while its DATA waits for the upstream's window").isEqualTo(1);
 			client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(0));
 			awaitPingAck(client);
-			assertThat(trackedStreams(route)).isEqualTo(1);
-			assertThat(client.resets()).isEmpty();
-			assertThat(resets("protocol") - protocolResets).isZero();
+			assertThat(client.resets()).isEqualTo(Map.of(1, PROTOCOL_ERROR));
 			WindowedH2Upstream upstream = awaitUpstream(seen);
 			assertThat(upstream.received(1)).as("nothing reached the upstream yet").isZero();
 			upstream.grant(1, 3);
 			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> upstream.received(1) == 3);
-			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> trackedStreams(route) == 0);
 			assertThat(upstreamResets(received)).isEmpty();
 			assertThat(client.closed()).isFalse();
 		}

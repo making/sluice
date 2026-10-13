@@ -63,6 +63,10 @@ class H2DemuxStallE2ETest {
 
 	private static final int CHUNK = 16 * 1024;
 
+	private static final int STREAM_CLOSED = 0x5;
+
+	private static final int ENHANCE_YOUR_CALM = 0xb;
+
 	/**
 	 * What the relay may queue for one stream: its payload budget (the client window plus
 	 * the queue allowance) and the framing of its entries.
@@ -238,17 +242,19 @@ class H2DemuxStallE2ETest {
 	}
 
 	/**
-	 * A client sending past the stream window gets a GOAWAY FLOW_CONTROL_ERROR and the
-	 * connection closed; the leg queue never held more than the stream's budget.
+	 * A client sending past the stream window gets the stream reset with
+	 * {@code FLOW_CONTROL_ERROR} (a stream error, RFC 9113 6.9.1); netty's codec answers
+	 * each DATA frame it sends on the forgotten stream after that with RST_STREAM
+	 * {@code STREAM_CLOSED}, and its 201st reset within 30s (netty's limit on the resets
+	 * a server sends, 200 per 30s) ends the connection with GOAWAY
+	 * {@code ENHANCE_YOUR_CALM}. The leg queue never held more than the stream's budget.
 	 */
 	@Test
-	@Disabled("pins the hand-written relay's GOAWAY FLOW_CONTROL_ERROR and stream budget; "
-			+ "netty's codec answers with its own code: to be rewritten for it")
-	void streamOverItsWindowClosesTheConnection() throws Exception {
+	void streamOverItsWindowIsResetAndTheFloodPastItEndsTheConnection() throws Exception {
 		String route = "h2d.cap.test";
 		startClient(route, capUpstream);
 		AtomicLong maxQueued = new AtomicLong();
-		try (H2TestClient client = H2TestClient.connect(dataPort)) {
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
 			client.headers(1, false, TestH2.headerBlock(":authority=h2d.cap.test", ":method=POST", ":path=/flood"));
 			byte[] chunk = new byte[CHUNK];
 			long pushed = 0;
@@ -263,7 +269,15 @@ class H2DemuxStallE2ETest {
 				// the server closed the connection
 			}
 			Awaitility.await().atMost(Duration.ofSeconds(10)).until(client::closed);
-			assertThat(client.goAwayCode()).as("GOAWAY error code").isEqualTo(TestH2.FLOW_CONTROL_ERROR);
+			List<Integer> resets = client.frames(1)
+				.stream()
+				.filter(frame -> frame.type() == TestH2.RST_STREAM)
+				.map(TestH2::errorCode)
+				.toList();
+			assertThat(resets).as("the resets of stream 1").hasSize(201);
+			assertThat(resets.get(0)).isEqualTo(TestH2.FLOW_CONTROL_ERROR);
+			assertThat(resets.subList(1, resets.size())).containsOnly(STREAM_CLOSED);
+			assertThat(client.goAwayCode()).as("GOAWAY error code").isEqualTo(ENHANCE_YOUR_CALM);
 			assertThat(client.maxOvershoot()).as("the client did exceed the window").isGreaterThan(0);
 			assertThat(maxQueued.get()).as("queued-bytes high-water mark").isLessThanOrEqualTo(STREAM_QUEUE_BOUND);
 		}
