@@ -46,9 +46,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * The h2 demux owns the stream windows towards the client: a client honoring every window
  * and the advertised stream limit is never torn down, however many streams it fills, and
- * what the relay queues for it stays below the bound those limits derive. The connection
- * window is released for every DATA byte the relay consumes, padding and refused streams
- * included.
+ * what the relay queues for it stops at the connection's share of the queue budget. The
+ * connection window is released for every DATA byte the relay consumes, padding and
+ * refused streams included.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -75,6 +75,21 @@ class H2DemuxFlowControlE2ETest {
 
 	/** The most a hop's writer queue holds. */
 	private static final long NETTY_HOP_QUEUE_BYTES = 256 * 1024 + 64 * 1024;
+
+	/**
+	 * What a connection holds before the relay withholds its windows while the budget has
+	 * room: its allowance and its share of the budget,
+	 * {@code NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE + CONNECTION_SHARE}.
+	 */
+	private static final long NETTY_SHARE_BYTES = 128 * 1024 + 2L * NETTY_CONNECTION_WINDOW;
+
+	/**
+	 * What a client still sends once its connection window is withheld: the read under
+	 * way, the connection window, a granule of rounding per stream;
+	 * {@code NettyHttp2DemuxRelay.WITHHELD_ARRIVALS}.
+	 */
+	private static final long NETTY_WITHHELD_ARRIVALS = 16 * 1024 + NETTY_CONNECTION_WINDOW
+			+ MAX_CONCURRENT_STREAMS * (long) GRANULE;
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
@@ -120,8 +135,10 @@ class H2DemuxFlowControlE2ETest {
 	/**
 	 * As many streams as the relay admits, each granted 1MiB by an upstream that then
 	 * stops reading, each filled to whatever window the client holds, the connection
-	 * window honored: the queue grows past the old 4MiB leg cap, yet the connection stays
-	 * up and the queue stays below the bound the stream limit and budget derive.
+	 * window honored: their stream windows would let the relay hold 100MiB, yet the queue
+	 * stops at the connection's share of the budget -- the test JVM's budget, far larger,
+	 * having room -- plus what the client still sent once its window was withheld, and
+	 * the connection stays up.
 	 */
 	@Test
 	void compliantClientWithManyStreamsIsNotTornDown() throws Exception {
@@ -140,9 +157,13 @@ class H2DemuxFlowControlE2ETest {
 			Long advertised = client.setting(TestH2.SETTINGS_MAX_CONCURRENT_STREAMS);
 			// the upstream's grants precede the data: every stream sees its 1MiB
 			Thread.sleep(500);
-			for (int i = 0; i < MAX_CONCURRENT_STREAMS && !client.closed(); i++) {
-				client.fill(1 + 2 * i, Duration.ofMillis(100));
+			// three streams in a row sending nothing for want of connection window: it is
+			// withheld, and the streams left could not send either
+			int starved = 0;
+			for (int i = 0; i < MAX_CONCURRENT_STREAMS && !client.closed() && starved < 3; i++) {
+				long sent = client.fill(1 + 2 * i, Duration.ofMillis(100));
 				maxQueued.accumulateAndGet(queuedBytes(route), Math::max);
+				starved = sent == 0 && client.connectionWindow() <= 0 ? starved + 1 : 0;
 			}
 			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
 			while (System.nanoTime() < deadline) {
@@ -152,14 +173,10 @@ class H2DemuxFlowControlE2ETest {
 			assertThat(client.closed()).as("a compliant client is not torn down").isFalse();
 			assertThat(advertised).as("the advertised stream limit").isEqualTo(MAX_CONCURRENT_STREAMS);
 			assertThat(client.maxOvershoot()).as("the client stayed within every stream window").isLessThanOrEqualTo(0);
-			// per stream, the window the relay announced, read and not yet written to the
-			// leg, plus less than a granule of backlog rounding; and the leg's writer
-			// queue. What the streams' windows allow beyond the tunnel connection's
-			// buffers (2.16MiB) and a small socket buffer reaches the relay
-			assertThat(maxQueued.get()).as("queued high-water mark: what the windows allow, within the bound")
-				.isGreaterThan(MAX_CONCURRENT_STREAMS * (long) NETTY_STREAM_WINDOW - 3L * 1024 * 1024)
-				.isLessThanOrEqualTo(
-						MAX_CONCURRENT_STREAMS * (long) (NETTY_STREAM_WINDOW + GRANULE) + NETTY_HOP_QUEUE_BYTES);
+			assertThat(budgetUsed()).as("the budget has room").isLessThan(budget());
+			assertThat(maxQueued.get()).as("queued high-water mark: the share, plus what the client still sent")
+				.isGreaterThanOrEqualTo(NETTY_SHARE_BYTES)
+				.isLessThanOrEqualTo(NETTY_SHARE_BYTES + NETTY_WITHHELD_ARRIVALS);
 		}
 	}
 
@@ -516,6 +533,16 @@ class H2DemuxFlowControlE2ETest {
 			.mapToDouble(Gauge::value)
 			.max()
 			.orElse(0));
+	}
+
+	private long budget() {
+		return Math
+			.round(Objects.requireNonNull(this.meterRegistry).get("sluice.h2demux.budget.bytes").gauge().value());
+	}
+
+	private long budgetUsed() {
+		return Math
+			.round(Objects.requireNonNull(this.meterRegistry).get("sluice.h2demux.budget.used.bytes").gauge().value());
 	}
 
 	private void startClient(String host, ServerSocket upstream) {

@@ -12,14 +12,15 @@ import io.micrometer.core.instrument.MeterRegistry;
 /**
  * The meters shared by every h2 demux relay of one data proxy: per route, the bytes the
  * relays hold of the route's streams -- one gauge per route, so the series count follows
- * the routes, not the connections --, the streams refused for want of queue budget or of
- * a slot for a new leg, or while waiting for an upstream's concurrency limit (to free a
- * connection whose window is withheld, or past the wait deadline), the streams reset for
- * want of queue budget, for an upstream's interim heads past their limit, or on a stream
- * error of the client or of an upstream, the streams answered 421 for a route reached
- * over HTTP/1.1 only, the legs ended by a connection error, the times a relay withheld
- * the client's connection window, and, for tests, the DATA writes netty holds, the
- * streams the relays track and the legs they hold.
+ * the routes, not the connections --, the streams refused for want of queue budget, past
+ * their connection's share of it, for want of a slot for a new leg, or while waiting for
+ * an upstream's concurrency limit (to free a connection whose window is withheld, or past
+ * the wait deadline), the streams reset for want of queue budget, past their connection's
+ * share of it, for an upstream's interim heads past their limit, or on a stream error of
+ * the client or of an upstream, the streams answered 421 for a route reached over
+ * HTTP/1.1 only, the legs ended by a connection error, the times a relay withheld its
+ * connection windows (for want of budget, or past its share), and, for tests, the DATA
+ * writes netty holds, the streams the relays track and the legs they hold.
  */
 final class H2DemuxMeters {
 
@@ -35,6 +36,8 @@ final class H2DemuxMeters {
 
 	private final Counter refusedBudget;
 
+	private final Counter refusedShare;
+
 	private final Counter refusedLegLimit;
 
 	private final Counter refusedWaiting;
@@ -42,6 +45,8 @@ final class H2DemuxMeters {
 	private final Counter refusedWaitTimeout;
 
 	private final Counter resetBudget;
+
+	private final Counter resetShare;
 
 	private final Counter resetInterim;
 
@@ -53,15 +58,19 @@ final class H2DemuxMeters {
 
 	private final Counter misdirectedHttp1;
 
-	private final Counter windowWithheld;
+	private final Counter windowWithheldBudget;
+
+	private final Counter windowWithheldShare;
 
 	H2DemuxMeters(MeterRegistry registry) {
 		this.registry = registry;
 		this.refusedBudget = refused(registry, "budget");
+		this.refusedShare = refused(registry, "share");
 		this.refusedLegLimit = refused(registry, "leg-limit");
 		this.refusedWaiting = refused(registry, "waiting");
 		this.refusedWaitTimeout = refused(registry, "wait-timeout");
 		this.resetBudget = reset(registry, "budget");
+		this.resetShare = reset(registry, "share");
 		this.resetInterim = reset(registry, "interim");
 		this.resetProtocol = reset(registry, "protocol");
 		this.resetUpstream = reset(registry, "upstream");
@@ -74,25 +83,34 @@ final class H2DemuxMeters {
 			.description("h2 streams answered 421 Misdirected Request: their route's upstream is reached over"
 					+ " HTTP/1.1 only (force-http1)")
 			.register(registry);
-		this.windowWithheld = Counter.builder("sluice.h2demux.window.withheld")
-			.description("Times an h2 demux relay withheld the client's connection window: its queue was past its"
-					+ " allowance and the shared budget exhausted")
+		this.windowWithheldBudget = withheld(registry, "budget");
+		this.windowWithheldShare = withheld(registry, "share");
+	}
+
+	private static Counter withheld(MeterRegistry registry, String reason) {
+		return Counter.builder("sluice.h2demux.window.withheld")
+			.tag("reason", reason)
+			.description("Times an h2 demux relay withheld its connection windows: its queue was past its allowance"
+					+ " with the shared budget exhausted, or its share of the budget reached a connection's")
 			.register(registry);
 	}
 
 	private static Counter refused(MeterRegistry registry, String reason) {
 		return Counter.builder("sluice.h2demux.streams.refused")
 			.tag("reason", reason)
-			.description("h2 streams refused (REFUSED_STREAM) for want of queue budget or of a slot for a new leg, or"
-					+ " while waiting for an upstream's concurrency limit, to free the queue of a connection whose"
-					+ " window is withheld or past the wait deadline")
+			.description(
+					"h2 streams refused (REFUSED_STREAM) for want of queue budget, past a connection's share of it,"
+							+ " for want of a slot for a new leg, or"
+							+ " while waiting for an upstream's concurrency limit, to free the queue of a connection whose"
+							+ " window is withheld or past the wait deadline")
 			.register(registry);
 	}
 
 	private static Counter reset(MeterRegistry registry, String reason) {
 		return Counter.builder("sluice.h2demux.streams.reset")
 			.tag("reason", reason)
-			.description("h2 streams an h2 demux relay reset on its own account: for want of queue budget, for an"
+			.description("h2 streams an h2 demux relay reset on its own account: for want of queue budget, past a"
+					+ " connection's share of it, for an"
 					+ " upstream's interim heads past their limit, or on a stream error of the client or of an upstream")
 			.register(registry);
 	}
@@ -100,6 +118,14 @@ final class H2DemuxMeters {
 	/** A stream refused: its head did not fit the queue budget. */
 	void refusedForBudget() {
 		this.refusedBudget.increment();
+	}
+
+	/**
+	 * A stream refused: its head took its connection's share of the queue budget past
+	 * what header blocks may take.
+	 */
+	void refusedForShare() {
+		this.refusedShare.increment();
 	}
 
 	/**
@@ -129,6 +155,14 @@ final class H2DemuxMeters {
 	/** A stream reset: a header block of it did not fit the queue budget. */
 	void resetForBudget() {
 		this.resetBudget.increment();
+	}
+
+	/**
+	 * A stream reset: a header block of it took its connection's share of the queue
+	 * budget past what header blocks may take.
+	 */
+	void resetForShare() {
+		this.resetShare.increment();
 	}
 
 	/**
@@ -167,9 +201,20 @@ final class H2DemuxMeters {
 		this.misdirectedHttp1.increment();
 	}
 
-	/** A relay withheld the client's connection window. */
-	void windowWithheld() {
-		this.windowWithheld.increment();
+	/**
+	 * A relay withheld its connection windows: its queue was past its allowance with the
+	 * queue budget exhausted.
+	 */
+	void windowWithheldForBudget() {
+		this.windowWithheldBudget.increment();
+	}
+
+	/**
+	 * A relay withheld its connection windows: its share of the queue budget reached a
+	 * connection's, the budget having room.
+	 */
+	void windowWithheldForShare() {
+		this.windowWithheldShare.increment();
 	}
 
 	MeterRegistry registry() {

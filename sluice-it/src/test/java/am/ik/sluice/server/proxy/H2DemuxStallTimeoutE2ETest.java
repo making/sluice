@@ -899,13 +899,16 @@ class H2DemuxStallTimeoutE2ETest {
 		return Objects.requireNonNull(this.dataProxyServer).h2DemuxMeters().trackedStreams(route);
 	}
 
+	/** The times a relay withheld its windows, for its share or for the budget. */
 	private double windowWithheld() {
 		return Objects.requireNonNull(this.dataProxyServer)
 			.h2DemuxMeters()
 			.registry()
-			.get("sluice.h2demux.window.withheld")
-			.counter()
-			.count();
+			.find("sluice.h2demux.window.withheld")
+			.counters()
+			.stream()
+			.mapToDouble(counter -> counter.count())
+			.sum();
 	}
 
 	private MeterRegistry meterRegistry() {

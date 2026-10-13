@@ -284,7 +284,11 @@ class H2DemuxWaitingStreamBudgetE2ETest {
 	}
 
 	private double withheld() {
-		return Objects.requireNonNull(this.meterRegistry).get("sluice.h2demux.window.withheld").counter().count();
+		return Objects.requireNonNull(this.meterRegistry)
+			.get("sluice.h2demux.window.withheld")
+			.tag("reason", "budget")
+			.counter()
+			.count();
 	}
 
 	private double refused(String reason) {

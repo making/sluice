@@ -194,7 +194,7 @@ class H2DemuxBudgetE2ETest {
 			awaitExhausted();
 			awaitStable(() -> queuedBytes(stalledRoute));
 			assertThat(budgetUsed()).as("exhausted before").isGreaterThanOrEqualTo(BUDGET);
-			double withheldBefore = withheld();
+			double withheldBefore = withheld("budget");
 			// the relay holds a stream window per stream: four take it past its
 			// allowance.
 			// A first exchange opens the leg and takes the upstream's SETTINGS, so the
@@ -213,7 +213,8 @@ class H2DemuxBudgetE2ETest {
 			// the stalled connections' shares never shrink while their upstream does not
 			// read, so the budget stays exhausted, their windows stay withheld, and only
 			// the flowing connection can have counted
-			assertThat(withheld()).as("the flowing connection passed its allowance").isGreaterThan(withheldBefore);
+			assertThat(withheld("budget")).as("the flowing connection passed its allowance")
+				.isGreaterThan(withheldBefore);
 			assertThat(budgetUsed()).as("still exhausted after").isGreaterThanOrEqualTo(BUDGET);
 			gate.countDown();
 			first.awaitEnds();
@@ -330,47 +331,52 @@ class H2DemuxBudgetE2ETest {
 	}
 
 	/**
-	 * A connection whose window is withheld gets it once another connection frees budget
-	 * -- here by going away -- though none of its own queued bytes drained: its upstream
-	 * still does not read. Both connections are withheld, each on a route of its own so
-	 * its queue is its route's; the one left waiting is the one with the smaller share of
-	 * the budget, the only one whose share alone may leave the budget room: a relay
-	 * granted while the budget had room is charged the DATA that follows regardless, so
-	 * one share may pass the whole budget.
+	 * A connection whose window is withheld gets it once other connections free budget --
+	 * here by going away -- though none of its own queued bytes drained: its upstream
+	 * still does not read. Two connections on a route whose upstream does not read
+	 * exhaust the budget, each stopping at its share or at the budget; the connection on
+	 * a route of its own (its queue is its route's) is withheld as soon as it passes its
+	 * allowance, so its share stays below a connection's -- what the DATA following the
+	 * withholding adds included -- and below the budget: once the others left, nothing of
+	 * its own holds its window back.
 	 */
 	@Test
-	void withheldWindowIsGrantedOnceAnotherConnectionFreesTheBudget() throws Exception {
-		String firstRoute = "bud.wake.first.test";
-		String secondRoute = "bud.wake.second.test";
+	void withheldWindowIsGrantedOnceOtherConnectionsFreeTheBudget() throws Exception {
+		String heldRoute = "bud.wake.held.test";
+		String waitingRoute = "bud.wake.waiting.test";
 		CountDownLatch gate = new CountDownLatch(1);
-		startClient(firstRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
-		startClient(secondRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
-		try (Stalled first = stall(firstRoute); Stalled second = stall(secondRoute)) {
+		startClient(heldRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
+		startClient(waitingRoute, stub(socket -> serveGated(socket, gate, new AtomicInteger())));
+		try (Stalled first = stall(heldRoute); Stalled second = stall(heldRoute)) {
 			awaitExhausted();
-			awaitStable(() -> queuedBytes(firstRoute) + queuedBytes(secondRoute));
-			assertThat(budgetUsed()).as("exhausted").isGreaterThanOrEqualTo(BUDGET);
-			assertThat(first.client().connectionWindow()).as("the first connection's window withheld").isZero();
-			assertThat(second.client().connectionWindow()).as("the second connection's window withheld").isZero();
-			assertThat(Objects.requireNonNull(this.limits).h2Budget().waiting()).as("withheld windows wait")
-				.isEqualTo(2);
-			long firstShare = budgetShare(firstRoute);
-			long secondShare = budgetShare(secondRoute);
-			Stalled waiting = firstShare <= secondShare ? first : second;
-			Stalled leaving = waiting == first ? second : first;
-			assertThat(Math.min(firstShare, secondShare)).as("the waiting connection's share leaves room")
-				.isLessThan(BUDGET);
-			long granted = waiting.client().connectionGranted();
-			leaving.close();
-			assertThat(waiting.client()
-				.awaitTrue(() -> waiting.client().connectionGranted() > granted, Duration.ofSeconds(5)))
-				.as("the withheld window was granted")
-				.isTrue();
-			assertThat(waiting.client().closed()).isFalse();
-			gate.countDown();
-			waiting.awaitEnds();
+			awaitStable(() -> queuedBytes(heldRoute));
+			try (Stalled waiting = stall(waitingRoute)) {
+				waiting.awaitWithheld();
+				awaitStable(() -> queuedBytes(waitingRoute));
+				assertThat(budgetUsed()).as("exhausted").isGreaterThanOrEqualTo(BUDGET);
+				assertThat(waiting.client().connectionWindow()).as("the waiting connection's window withheld").isZero();
+				assertThat(Objects.requireNonNull(this.limits).h2Budget().waiting()).as("withheld for the budget")
+					.isPositive();
+				assertThat(budgetShare(waitingRoute))
+					.as("the waiting connection's share: below its own, below the budget")
+					.isLessThan(Math.min(NettyHttp2DemuxRelay.CONNECTION_SHARE, BUDGET));
+				long granted = waiting.client().connectionGranted();
+				first.close();
+				second.close();
+				assertThat(waiting.client()
+					.awaitTrue(() -> waiting.client().connectionGranted() > granted, Duration.ofSeconds(5)))
+					.as("the withheld window was granted")
+					.isTrue();
+				assertThat(waiting.client().closed()).isFalse();
+				gate.countDown();
+				waiting.awaitEnds();
+			}
 		}
-		awaitReleased(firstRoute);
-		awaitReleased(secondRoute);
+		finally {
+			gate.countDown();
+		}
+		awaitReleased(heldRoute);
+		awaitReleased(waitingRoute);
 	}
 
 	/**
@@ -980,8 +986,23 @@ class H2DemuxBudgetE2ETest {
 			.round(Objects.requireNonNull(this.meterRegistry).get("sluice.h2demux.budget.used.bytes").gauge().value());
 	}
 
+	/** The times a relay withheld its windows, for its share or for the budget. */
 	private double withheld() {
-		return Objects.requireNonNull(this.meterRegistry).get("sluice.h2demux.window.withheld").counter().count();
+		return Objects.requireNonNull(this.meterRegistry)
+			.find("sluice.h2demux.window.withheld")
+			.counters()
+			.stream()
+			.mapToDouble(Counter::count)
+			.sum();
+	}
+
+	/** The times a relay withheld its windows for the reason. */
+	private double withheld(String reason) {
+		return Objects.requireNonNull(this.meterRegistry)
+			.get("sluice.h2demux.window.withheld")
+			.tag("reason", reason)
+			.counter()
+			.count();
 	}
 
 	private double refused(String reason) {

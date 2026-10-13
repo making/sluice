@@ -79,8 +79,14 @@ class NettyH2DemuxBudgetE2ETest {
 	/** The windows of the test client and upstreams: RFC 9113's. */
 	private static final int PEER_WINDOW = WindowedH2Upstream.DEFAULT_WINDOW;
 
-	/** A few of the relay's stream windows: room for a stream window held, or three. */
-	private static final long BUDGET = 4L * RELAY_WINDOW;
+	/**
+	 * A connection's share of the budget: room for a stream window held, and one
+	 * connection runs the budget out as its share runs out, the budget taking effect.
+	 */
+	private static final long BUDGET = NettyHttp2DemuxRelay.CONNECTION_SHARE;
+
+	/** A request held by {@link #holdThreeRequests}: three fit within the share. */
+	private static final int HELD_REQUEST = RELAY_WINDOW / 2;
 
 	private static final int CANCEL = 0x8;
 
@@ -353,9 +359,10 @@ class NettyH2DemuxBudgetE2ETest {
 	}
 
 	/**
-	 * Three streams' requests held by an upstream announcing a stream window of 0 charge
-	 * the budget; each stream the client resets releases what it held, and with the last
-	 * one the route's gauge and the budget are back to 0 while the connection goes on.
+	 * Three streams' requests of {@link #HELD_REQUEST} held by an upstream announcing a
+	 * stream window of 0 charge the budget; each stream the client resets releases what
+	 * it held, and with the last one the route's gauge and the budget are back to 0 while
+	 * the connection goes on.
 	 */
 	@Test
 	void aClientResetReleasesTheBytesItsStreamHeld() throws Exception {
@@ -368,7 +375,7 @@ class NettyH2DemuxBudgetE2ETest {
 			Awaitility.await()
 				.atMost(TIMEOUT)
 				.untilAsserted(() -> assertThat(queuedBytes(route)).as("stream 1's bytes released")
-					.isLessThanOrEqualTo(held - RELAY_WINDOW));
+					.isLessThanOrEqualTo(held - HELD_REQUEST));
 			client.frame(TestH2.RST_STREAM, 0, 3, TestH2.int32(CANCEL));
 			client.frame(TestH2.RST_STREAM, 0, 5, TestH2.int32(CANCEL));
 			Awaitility.await().atMost(TIMEOUT).until(() -> queuedBytes(route) == 0 && budgetUsed() == 0);
@@ -638,7 +645,7 @@ class NettyH2DemuxBudgetE2ETest {
 	}
 
 	/**
-	 * Opens streams 1, 3 and 5, each sending what the relay's windows admit, held by the
+	 * Opens streams 1, 3 and 5, each sending {@link #HELD_REQUEST} bytes, held by the
 	 * upstream: past the allowance, so the budget is charged. Returns what the route's
 	 * gauge holds.
 	 */
@@ -651,11 +658,11 @@ class NettyH2DemuxBudgetE2ETest {
 			if (streamId > 1) {
 				client.headers(streamId, false, post(route));
 			}
-			assertThat(client.data(streamId, RELAY_WINDOW, false, TIMEOUT)).isTrue();
+			assertThat(client.data(streamId, HELD_REQUEST, false, TIMEOUT)).isTrue();
 		}
-		Awaitility.await().atMost(TIMEOUT).until(() -> queuedBytes(route) >= 3L * RELAY_WINDOW);
+		Awaitility.await().atMost(TIMEOUT).until(() -> queuedBytes(route) >= 3L * HELD_REQUEST);
 		long held = settled(() -> queuedBytes(route));
-		assertThat(held).as("three stream windows held").isGreaterThanOrEqualTo(3L * RELAY_WINDOW);
+		assertThat(held).as("three requests held").isGreaterThanOrEqualTo(3L * HELD_REQUEST);
 		// the client hop's writer queue counts too, nothing at rest
 		assertThat(budgetUsed()).as("charged past the allowance")
 			.isBetween(held - NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE,
@@ -782,7 +789,7 @@ class NettyH2DemuxBudgetE2ETest {
 	}
 
 	private double withheld() {
-		return meters().get("sluice.h2demux.window.withheld").counter().count();
+		return meters().get("sluice.h2demux.window.withheld").tag("reason", "budget").counter().count();
 	}
 
 	private double counter(String name, String reason) {
