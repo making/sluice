@@ -2,7 +2,6 @@ package am.ik.sluice.server.tunnel;
 
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -15,6 +14,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import org.jspecify.annotations.Nullable;
@@ -41,11 +41,17 @@ import io.grpc.Status;
  * State of one connected tunnel client: the multiplexed virtual connections and the
  * router registration.
  * <p>
+ * A session becomes its client id's session ({@link SessionRegistry#find}) only with the
+ * client's first {@code Advertise}, replacing the previous one then; until that it is
+ * pending ({@link SessionRegistry#pending()}): it serves no connection and leaves the
+ * previous session and its routes in place. A stream whose first {@code Advertise} does
+ * not arrive within the advertise timeout is failed with {@code DEADLINE_EXCEEDED}.
+ * <p>
  * The receive path ({@link #handle(Frame)}) never waits on anything slow: ADVERTISE is
- * applied on the session's own serial executor (route registration and port binding can
- * take a while), and connections accept DATA without blocking. Every connection runs
- * per-connection flow control: a client whose {@code Advertise} announces no receive
- * window is rejected ({@link #WINDOW_REQUIRED}).
+ * applied on the session's own serial executor (registration, route registration and port
+ * binding can take a while), and connections accept DATA without blocking. Every
+ * connection runs per-connection flow control: a client whose {@code Advertise} announces
+ * no receive window is rejected ({@link #WINDOW_REQUIRED}).
  */
 public final class TunnelSession implements AutoCloseable {
 
@@ -96,22 +102,31 @@ public final class TunnelSession implements AutoCloseable {
 
 	private final AtomicBoolean closed = new AtomicBoolean();
 
-	private volatile boolean drained;
+	/**
+	 * Makes the closed check and the registration of the first advertise one step, so a
+	 * session closing meanwhile is never registered after its removal.
+	 */
+	private final Object registration = new Object();
 
-	/** Guards {@link #clientWindow} and {@link #awaitingWindow}. */
-	private final Object windowLock = new Object();
+	/** Whether the session is registered; touched on {@link #advertiser} only. */
+	private boolean inRegistry;
+
+	/**
+	 * True until the first {@code Advertise} or the advertise deadline, whichever comes
+	 * first: the one that flips it decides the stream's fate.
+	 */
+	private final AtomicBoolean awaitingAdvertise = new AtomicBoolean(true);
+
+	/** Fails the stream at the advertise timeout; interrupted by the first advertise. */
+	private volatile @Nullable Thread advertiseDeadline;
+
+	private volatile boolean drained;
 
 	/**
 	 * The client's per-connection receive window from its latest {@code Advertise}; 0
-	 * until the first one. Guarded by {@link #windowLock}.
+	 * until the first one, and a session serves no connection before that.
 	 */
-	private long clientWindow;
-
-	/**
-	 * Connections opened before the first {@code Advertise}, with no send credit: they
-	 * get the client's window from it. Guarded by {@link #windowLock}.
-	 */
-	private final List<VirtualConnection> awaitingWindow = new ArrayList<>();
+	private volatile long clientWindow;
 
 	/**
 	 * The build the client announced in its latest {@code Advertise}, sanitized; null
@@ -135,6 +150,12 @@ public final class TunnelSession implements AutoCloseable {
 
 	private final Runnable windowUpdateReceived;
 
+	private final Duration advertiseTimeout;
+
+	private final Runnable advertiseTimedOut;
+
+	private final Consumer<TunnelSession> registered;
+
 	private TunnelSession(Builder builder) {
 		this.clientId = Objects.requireNonNull(builder.clientId, "clientId is required");
 		this.nodeId = builder.nodeId;
@@ -145,10 +166,13 @@ public final class TunnelSession implements AutoCloseable {
 		this.registry = Objects.requireNonNull(builder.registry, "registry is required");
 		this.closeTimeout = builder.closeTimeout;
 		this.windowUpdateReceived = builder.windowUpdateReceived;
+		this.advertiseTimeout = builder.advertiseTimeout;
+		this.advertiseTimedOut = builder.advertiseTimedOut;
+		this.registered = builder.registered;
 		this.serverBuild = builder.serverBuild;
 		this.advertiser = Executors.newSingleThreadExecutor(
 				task -> Thread.ofVirtual().name("sluice-advertise-" + this.clientId).unstarted(task));
-		this.registry.register(this);
+		this.registry.admit(this);
 	}
 
 	public static Builder builder() {
@@ -172,6 +196,14 @@ public final class TunnelSession implements AutoCloseable {
 		private @Nullable TcpRouteListener tcpRoutes;
 
 		private Duration closeTimeout = Duration.ofSeconds(5);
+
+		private Duration advertiseTimeout = Duration.ofSeconds(10);
+
+		private Runnable advertiseTimedOut = () -> {
+		};
+
+		private Consumer<TunnelSession> registered = session -> {
+		};
 
 		private Runnable windowUpdateReceived = () -> {
 		};
@@ -224,6 +256,32 @@ public final class TunnelSession implements AutoCloseable {
 			return this;
 		}
 
+		/**
+		 * How long the stream may go without the client's first {@code Advertise} before
+		 * it is failed; counted from {@link TunnelSession#start()}.
+		 */
+		public Builder advertiseTimeout(Duration advertiseTimeout) {
+			this.advertiseTimeout = advertiseTimeout;
+			return this;
+		}
+
+		/**
+		 * Runs when the stream is failed for a missing {@code Advertise}; a metrics hook.
+		 */
+		public Builder advertiseTimedOut(Runnable advertiseTimedOut) {
+			this.advertiseTimedOut = advertiseTimedOut;
+			return this;
+		}
+
+		/**
+		 * Runs once the session is registered (its first advertise), before its routes
+		 * are; on the session's advertise thread.
+		 */
+		public Builder registered(Consumer<TunnelSession> registered) {
+			this.registered = registered;
+			return this;
+		}
+
 		/** Runs for every WINDOW_UPDATE received; a metrics hook. */
 		public Builder windowUpdateReceived(Runnable windowUpdateReceived) {
 			this.windowUpdateReceived = windowUpdateReceived;
@@ -243,6 +301,19 @@ public final class TunnelSession implements AutoCloseable {
 			return new TunnelSession(this);
 		}
 
+	}
+
+	/**
+	 * The status description of a tunnel stream failed because the client sent no
+	 * {@code Advertise} within {@code timeout}.
+	 */
+	public static String advertiseTimeoutDescription(Duration timeout) {
+		return "the client sent no Advertise within " + timeout.toMillis() + "ms";
+	}
+
+	/** How long the stream may go without the client's first {@code Advertise}. */
+	public Duration advertiseTimeout() {
+		return this.advertiseTimeout;
 	}
 
 	public String clientId() {
@@ -303,8 +374,33 @@ public final class TunnelSession implements AutoCloseable {
 		return Optional.ofNullable(this.clientBuild);
 	}
 
+	/** Starts the sender and the advertise deadline. */
 	void start() {
 		this.sender.start();
+		this.advertiseDeadline = Thread.ofVirtual()
+			.name("sluice-advertise-deadline-" + this.clientId)
+			.start(this::awaitAdvertise);
+	}
+
+	/**
+	 * Fails the stream unless the first {@code Advertise} arrived within the timeout; an
+	 * interrupt (the advertise, or close) ends the wait.
+	 */
+	private void awaitAdvertise() {
+		try {
+			TimeUnit.NANOSECONDS.sleep(this.advertiseTimeout.toNanos());
+		}
+		catch (InterruptedException e) {
+			return;
+		}
+		if (!this.awaitingAdvertise.compareAndSet(true, false) || this.closed.get()) {
+			return;
+		}
+		String description = advertiseTimeoutDescription(this.advertiseTimeout);
+		log.warn("client {} ({}): {}; failing its tunnel stream", this.clientId, this.remoteAddress, description);
+		this.advertiseTimedOut.run();
+		this.sender.fail(Status.DEADLINE_EXCEEDED.withDescription(description).asRuntimeException());
+		close();
 	}
 
 	/**
@@ -351,13 +447,24 @@ public final class TunnelSession implements AutoCloseable {
 	}
 
 	/**
-	 * Applies the client's window and build, then registers its routes off the receive
-	 * path; rejects a client announcing no window. Ignored once the session is closed:
-	 * after a rejection, so a client sending its advertise again before it sees the
-	 * failure is rejected once.
+	 * Applies the client's window and build, then registers the session and its routes
+	 * off the receive path; rejects a client announcing no window. Ignored once the
+	 * session is closed -- after a rejection, so a client sending its advertise again
+	 * before it sees the failure is rejected once -- or once the advertise deadline
+	 * passed.
 	 */
 	private void handleAdvertise(Advertise advertise) {
 		if (this.closed.get()) {
+			return;
+		}
+		if (this.awaitingAdvertise.compareAndSet(true, false)) {
+			Thread deadline = this.advertiseDeadline;
+			if (deadline != null) {
+				deadline.interrupt();
+			}
+		}
+		else if (!this.advertised) {
+			// the deadline passed first: the stream is being failed
 			return;
 		}
 		PeerBuild build = advertise.hasBuild() ? PeerBuilds.sanitize(advertise.getBuild()) : null;
@@ -368,7 +475,7 @@ public final class TunnelSession implements AutoCloseable {
 			close();
 			return;
 		}
-		// before the routes exist: every CONNECT they lead to sees the window
+		// before the session is registered: every connection opened on it has the window
 		applyWindow(advertise.getConnectionWindow());
 		this.clientBuild = build;
 		boolean first = !this.advertised;
@@ -386,28 +493,38 @@ public final class TunnelSession implements AutoCloseable {
 
 	/**
 	 * Records the client's window (unsigned, non-zero) for the connections opened from
-	 * now on and grants it to those opened before the first advertise.
+	 * now on.
 	 */
 	private void applyWindow(int window) {
-		List<VirtualConnection> waiting;
-		synchronized (this.windowLock) {
-			this.clientWindow = Integer.toUnsignedLong(window);
-			waiting = List.copyOf(this.awaitingWindow);
-			this.awaitingWindow.clear();
-		}
-		for (VirtualConnection connection : waiting) {
-			connection.grant(window);
-		}
+		this.clientWindow = Integer.toUnsignedLong(window);
 	}
 
 	/**
-	 * Registers the advertised routes and binds their ports, then acknowledges; runs on
-	 * {@link #advertiser}. Skipped once the session is closed: the route removal of
-	 * {@link #close()} runs after every advertise started before it.
+	 * On the first advertise registers the session, replacing the client id's previous
+	 * one; then registers the advertised routes and binds their ports, and acknowledges.
+	 * Runs on {@link #advertiser}. Skipped once the session is closed: the route removal
+	 * of {@link #close()} runs after every advertise started before it.
 	 */
 	private void advertise(List<Upstream> advertised) {
-		if (this.closed.get()) {
-			return;
+		boolean first = false;
+		TunnelSession replaced = null;
+		synchronized (this.registration) {
+			if (this.closed.get()) {
+				return;
+			}
+			if (!this.inRegistry) {
+				this.inRegistry = true;
+				first = true;
+				replaced = this.registry.register(this).orElse(null);
+			}
+		}
+		if (replaced != null) {
+			// the routes are keyed by client id: the replaced session's removal spares
+			// them, since this session is registered now
+			replaced.close();
+		}
+		if (first) {
+			this.registered.accept(this);
 		}
 		int registered = this.router.register(this.clientId, advertised);
 		Set<Integer> rejected = this.tcpRoutes.reconcile(this.clientId, listenPorts(advertised));
@@ -432,21 +549,19 @@ public final class TunnelSession implements AutoCloseable {
 	/**
 	 * Opens a virtual connection to the given dial address and sends the CONNECT request
 	 * to the client, announcing this side's window. Its send credit is the client's
-	 * window; before the client's first {@code Advertise} it has none and waits for the
-	 * window that advertise brings (a reconnecting client's routes lead here before it).
+	 * window, known once the client advertised: a session is found for routing only from
+	 * then on.
+	 * @throws IllegalStateException when the client has not advertised yet
 	 */
 	public VirtualConnection open(String address) {
-		long connectionId = this.sequence.getAndIncrement();
-		VirtualConnection connection;
-		synchronized (this.windowLock) {
-			long clientWindow = this.clientWindow;
-			connection = VirtualConnection.builder(connectionId, this.sender)
-				.window(VirtualConnection.DEFAULT_WINDOW, clientWindow)
-				.build();
-			if (clientWindow == 0) {
-				this.awaitingWindow.add(connection);
-			}
+		long clientWindow = this.clientWindow;
+		if (clientWindow == 0) {
+			throw new IllegalStateException("client " + this.clientId + " has not advertised yet");
 		}
+		long connectionId = this.sequence.getAndIncrement();
+		VirtualConnection connection = VirtualConnection.builder(connectionId, this.sender)
+			.window(VirtualConnection.DEFAULT_WINDOW, clientWindow)
+			.build();
 		this.connections.put(connectionId, connection);
 		this.sender.sendConnect(Connect.newBuilder()
 			.setConnId(connectionId)
@@ -458,11 +573,6 @@ public final class TunnelSession implements AutoCloseable {
 
 	public void remove(long connectionId) {
 		this.connections.remove(connectionId);
-		synchronized (this.windowLock) {
-			if (!this.awaitingWindow.isEmpty()) {
-				this.awaitingWindow.removeIf(connection -> connection.connectionId() == connectionId);
-			}
-		}
 	}
 
 	/**
@@ -533,10 +643,16 @@ public final class TunnelSession implements AutoCloseable {
 	 */
 	@Override
 	public void close() {
-		if (!this.closed.compareAndSet(false, true)) {
-			return;
+		synchronized (this.registration) {
+			if (!this.closed.compareAndSet(false, true)) {
+				return;
+			}
+			this.registry.remove(this);
 		}
-		this.registry.remove(this);
+		Thread deadline = this.advertiseDeadline;
+		if (deadline != null && deadline != Thread.currentThread()) {
+			deadline.interrupt();
+		}
 		log.info("closing session for client {}", this.clientId);
 		this.advertiser.execute(this::removeRoutes);
 		this.advertiser.shutdown();
@@ -559,9 +675,6 @@ public final class TunnelSession implements AutoCloseable {
 			connection.close();
 		}
 		this.connections.clear();
-		synchronized (this.windowLock) {
-			this.awaitingWindow.clear();
-		}
 	}
 
 	/**

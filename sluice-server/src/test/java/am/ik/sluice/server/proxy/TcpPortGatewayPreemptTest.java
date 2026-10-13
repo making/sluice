@@ -4,10 +4,9 @@ import java.util.Set;
 
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.route.Router;
+import am.ik.sluice.server.tunnel.AdvertisedSessions;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import am.ik.sluice.server.tunnel.TunnelSession;
-import am.ik.sluice.tunnel.SessionSender;
-import am.ik.sluice.v1.proto.Frame;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -38,13 +37,11 @@ class TcpPortGatewayPreemptTest {
 			new ConnectionLimits(SluiceServerProperties.builder().build(), this.meters));
 
 	private TunnelSession session(String clientId) {
-		return TunnelSession.builder()
+		return AdvertisedSessions.advertised(TunnelSession.builder()
 			.clientId(clientId)
 			.router(this.router)
-			.sender(new SessionSender(new NoopStream()))
 			.registry(this.sessions)
-			.tcpRoutes(this.gateway)
-			.build();
+			.tcpRoutes(this.gateway));
 	}
 
 	@AfterEach
@@ -90,22 +87,6 @@ class TcpPortGatewayPreemptTest {
 		assertThat(this.gateway.isBound(19000)).isTrue();
 		newcomer.close();
 		owner.close();
-	}
-
-	private static final class NoopStream implements io.grpc.stub.StreamObserver<Frame> {
-
-		@Override
-		public void onNext(Frame value) {
-		}
-
-		@Override
-		public void onError(Throwable t) {
-		}
-
-		@Override
-		public void onCompleted() {
-		}
-
 	}
 
 }

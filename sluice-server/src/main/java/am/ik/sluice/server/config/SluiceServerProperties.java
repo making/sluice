@@ -405,13 +405,16 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * passthrough, a tcp route, a hostless connection, an upgraded HTTP/1.1 connection --
 	 * may relay no byte in either direction before it is closed, for the routes whose
 	 * upstream sets no {@code verbatim-idle-timeout} of its own; {@code 0} = off
+	 * @param advertiseTimeout how long a tunnel stream may go without the client's first
+	 * {@code Advertise} before it is failed ({@code DEADLINE_EXCEEDED}); until then the
+	 * stream serves no connection and leaves the client id's live session in place
 	 */
 	public record Limits(@DefaultValue("0") int maxConnections, @DefaultValue("0") int maxConnectionsPerAddress,
 			@DefaultValue("10s") Duration headTimeout, @DefaultValue("60s") Duration idleTimeout,
 			@DefaultValue("0") DataSize h2QueueBudget, @DefaultValue("30s") Duration h2StreamWaitTimeout,
 			@DefaultValue("1s") Duration halfCloseProbeInterval, @DefaultValue("60s") Duration stallTimeout,
 			@DefaultValue("16KB") DataSize stallMinBytes, @DefaultValue("60s") Duration tunnelStallTimeout,
-			@DefaultValue("0") Duration verbatimIdleTimeout) {
+			@DefaultValue("0") Duration verbatimIdleTimeout, @DefaultValue("10s") Duration advertiseTimeout) {
 
 		public Limits {
 			maxConnections = Math.max(0, maxConnections);
@@ -433,6 +436,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 					: tunnelStallTimeout;
 			verbatimIdleTimeout = verbatimIdleTimeout == null || verbatimIdleTimeout.isNegative() ? Duration.ZERO
 					: verbatimIdleTimeout;
+			advertiseTimeout = advertiseTimeout == null || advertiseTimeout.isNegative() || advertiseTimeout.isZero()
+					? Duration.ofSeconds(10) : advertiseTimeout;
 		}
 
 		public static Builder builder() {
@@ -462,6 +467,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			@Nullable private Duration tunnelStallTimeout;
 
 			private Duration verbatimIdleTimeout = Duration.ZERO;
+
+			@Nullable private Duration advertiseTimeout;
 
 			private Builder() {
 			}
@@ -521,6 +528,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder advertiseTimeout(Duration advertiseTimeout) {
+				this.advertiseTimeout = advertiseTimeout;
+				return this;
+			}
+
 			public Limits build() {
 				return new Limits(this.maxConnections, this.maxConnectionsPerAddress,
 						this.headTimeout == null ? Duration.ofSeconds(10) : this.headTimeout,
@@ -531,7 +543,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 						this.stallTimeout == null ? Duration.ofSeconds(60) : this.stallTimeout,
 						this.stallMinBytes == null ? DataSize.ofKilobytes(16) : this.stallMinBytes,
 						this.tunnelStallTimeout == null ? Duration.ofSeconds(60) : this.tunnelStallTimeout,
-						this.verbatimIdleTimeout);
+						this.verbatimIdleTimeout,
+						this.advertiseTimeout == null ? Duration.ofSeconds(10) : this.advertiseTimeout);
 			}
 
 		}

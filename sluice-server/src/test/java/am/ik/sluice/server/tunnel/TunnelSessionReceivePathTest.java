@@ -29,7 +29,6 @@ import am.ik.sluice.v1.proto.Frame;
 import am.ik.sluice.v1.proto.Upstream;
 import am.ik.sluice.v1.proto.WindowUpdate;
 import io.grpc.Status;
-import io.grpc.stub.StreamObserver;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -215,73 +214,23 @@ class TunnelSessionReceivePathTest {
 	}
 
 	@Test
-	void connectBeforeTheAdvertiseWaitsForTheClientsWindow() throws Exception {
+	void connectionsSendWithinTheClientsWindowAndAnnounceTheServers() throws Exception {
 		TunnelSession session = session(Duration.ofSeconds(5));
 		this.tcpRoutes.release.countDown();
-		VirtualConnection early = session.open("127.0.0.1:1");
-		CompletableFuture<Void> parked = write(early, 1);
-		TimeUnit.MILLISECONDS.sleep(200);
-		assertThat(parked).as("no credit before the client announced its window").isNotDone();
-		assertThat(this.stream.frames.stream().filter(Frame::hasData)).as("nothing sent before the window").isEmpty();
 		session.handle(advertise(10));
-		parked.get(1, TimeUnit.SECONDS);
-		write(early, 9).get(1, TimeUnit.SECONDS);
-		CompletableFuture<Void> beyond = write(early, 1);
+		VirtualConnection first = session.open("127.0.0.1:1");
+		write(first, 10).get(1, TimeUnit.SECONDS);
+		CompletableFuture<Void> beyond = write(first, 1);
 		TimeUnit.MILLISECONDS.sleep(200);
 		assertThat(beyond).as("the client's 10-byte window is used up").isNotDone();
-		VirtualConnection late = session.open("127.0.0.1:1");
-		write(late, 10).get(1, TimeUnit.SECONDS);
+		VirtualConnection second = session.open("127.0.0.1:1");
+		write(second, 10).get(1, TimeUnit.SECONDS);
 		List<Integer> windows = this.stream.awaitConnects(2)
 			.stream()
 			.map(frame -> frame.getConnect().getConnectionWindow())
 			.toList();
 		assertThat(windows).as("every CONNECT announces the server's window")
 			.containsExactly(VirtualConnection.DEFAULT_WINDOW, VirtualConnection.DEFAULT_WINDOW);
-	}
-
-	/**
-	 * A connection opened while the first advertise arrives gets the window either way:
-	 * at open, or from the advertise.
-	 */
-	@Test
-	void connectRacingTheAdvertiseGetsTheWindow() throws Exception {
-		for (int i = 0; i < 200; i++) {
-			SessionRegistry registry = new SessionRegistry();
-			TunnelSession session = TunnelSession.builder()
-				.clientId(CLIENT_ID + i)
-				.router(new Router())
-				.sender(new SessionSender(new RecordingStream()))
-				.registry(registry)
-				.tcpRoutes((clientId, listenPorts) -> Set.of())
-				.build();
-			session.start();
-			try {
-				CountDownLatch go = new CountDownLatch(1);
-				CompletableFuture<VirtualConnection> opened = CompletableFuture.supplyAsync(() -> {
-					awaitQuietly(go);
-					return session.open("127.0.0.1:1");
-				}, task -> Thread.ofVirtual().start(task));
-				CompletableFuture<Void> advertised = CompletableFuture.runAsync(() -> {
-					awaitQuietly(go);
-					session.handle(advertise(10));
-				}, task -> Thread.ofVirtual().start(task));
-				go.countDown();
-				advertised.get(5, TimeUnit.SECONDS);
-				write(opened.get(5, TimeUnit.SECONDS), 10).get(5, TimeUnit.SECONDS);
-			}
-			finally {
-				session.close();
-			}
-		}
-	}
-
-	private static void awaitQuietly(CountDownLatch latch) {
-		try {
-			latch.await();
-		}
-		catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-		}
 	}
 
 	private static CompletableFuture<Void> write(VirtualConnection connection, int length) {
@@ -379,57 +328,6 @@ class TunnelSessionReceivePathTest {
 				}
 			}
 			return Set.of();
-		}
-
-	}
-
-	/** An always-ready stream recording the frames the session sends. */
-	private static final class RecordingStream implements StreamObserver<Frame> {
-
-		final List<Frame> frames = new CopyOnWriteArrayList<>();
-
-		final List<Throwable> failures = new CopyOnWriteArrayList<>();
-
-		final AtomicInteger completions = new AtomicInteger();
-
-		List<Frame> awaitConnects(int count) throws InterruptedException {
-			return await(Frame.BodyCase.CONNECT, count);
-		}
-
-		List<Frame> await(Frame.BodyCase bodyCase, int count) throws InterruptedException {
-			long deadline = System.currentTimeMillis() + 5000;
-			while (System.currentTimeMillis() < deadline) {
-				List<Frame> matching = this.frames.stream().filter(frame -> frame.getBodyCase() == bodyCase).toList();
-				if (matching.size() >= count) {
-					return matching;
-				}
-				TimeUnit.MILLISECONDS.sleep(10);
-			}
-			throw new AssertionError("fewer than %d %s frames: %s".formatted(count, bodyCase, this.frames));
-		}
-
-		@Override
-		public void onNext(Frame value) {
-			this.frames.add(value);
-		}
-
-		@Override
-		public void onError(Throwable t) {
-			this.failures.add(t);
-		}
-
-		@Override
-		public void onCompleted() {
-			this.completions.incrementAndGet();
-		}
-
-		Throwable awaitFailure() throws InterruptedException {
-			long deadline = System.currentTimeMillis() + 5000;
-			while (this.failures.isEmpty() && System.currentTimeMillis() < deadline) {
-				TimeUnit.MILLISECONDS.sleep(10);
-			}
-			assertThat(this.failures).as("the stream failed").isNotEmpty();
-			return this.failures.getFirst();
 		}
 
 	}

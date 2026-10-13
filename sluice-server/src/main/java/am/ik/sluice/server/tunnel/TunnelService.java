@@ -56,6 +56,8 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	private final Counter stallFailures;
 
+	private final Counter advertiseTimeouts;
+
 	public TunnelService(Router router, TokenValidator tokenValidator, SessionRegistry sessions,
 			TcpRouteListener tcpRoutes, NodeDirectory nodeDirectory, MembershipBroadcaster membershipBroadcaster,
 			ClusterLifecycle clusterLifecycle, SluiceServerProperties properties, MeterRegistry meterRegistry,
@@ -82,13 +84,13 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			.description("How long the most stalled tunnel stream has held frames queued for its client, "
 					+ "not ready, with none taken; 0 when none is stalled")
 			.register(meterRegistry);
+		this.advertiseTimeouts = Counter.builder("sluice.tunnel.advertise.timeouts")
+			.description("Tunnel streams failed because the client sent no Advertise within the advertise timeout")
+			.register(meterRegistry);
 		log.info("server build: {}", PeerBuilds.describe(serverBuild));
 		Gauge
 			.builder("sluice.tunnel.sessions.build.unknown", sessions,
-					registry -> registry.all()
-						.stream()
-						.filter(session -> session.advertised() && session.clientBuild().isEmpty())
-						.count())
+					registry -> registry.all().stream().filter(session -> session.clientBuild().isEmpty()).count())
 			.description("Connected clients that advertised no build (they predate build reporting)")
 			.register(meterRegistry);
 	}
@@ -155,10 +157,12 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			.tcpRoutes(this.tcpRoutes)
 			.windowUpdateReceived(this.windowUpdatesReceived::increment)
 			.serverBuild(this.serverBuild)
+			.advertiseTimeout(this.properties.limits().advertiseTimeout())
+			.advertiseTimedOut(this.advertiseTimeouts::increment)
+			.registered(this.membershipBroadcaster::onSessionRegistered)
 			.build();
 		stalledSession.set(session);
 		session.start();
-		this.membershipBroadcaster.onSessionCreated(session);
 		return new StreamObserver<>() {
 
 			@Override

@@ -89,6 +89,17 @@ class SluiceServerPropertiesTest {
 		assertThat(properties.limits().stallMinBytes().toBytes()).isEqualTo(16 * 1024);
 		assertThat(properties.limits().tunnelStallTimeout()).isEqualTo(Duration.ofSeconds(60));
 		assertThat(properties.limits().verbatimIdleTimeout()).isZero();
+		assertThat(properties.limits().advertiseTimeout()).isEqualTo(Duration.ofSeconds(10));
+	}
+
+	@Test
+	void anAdvertiseTimeoutBindsAndANonPositiveOneFallsBackToTheDefault() {
+		assertThat(bind(Map.of("sluice.limits.advertise-timeout", "3s")).limits().advertiseTimeout())
+			.isEqualTo(Duration.ofSeconds(3));
+		assertThat(bind(Map.of("sluice.limits.advertise-timeout", "0")).limits().advertiseTimeout())
+			.isEqualTo(Duration.ofSeconds(10));
+		assertThat(bind(Map.of("sluice.limits.advertise-timeout", "-1s")).limits().advertiseTimeout())
+			.isEqualTo(Duration.ofSeconds(10));
 	}
 
 	@Test

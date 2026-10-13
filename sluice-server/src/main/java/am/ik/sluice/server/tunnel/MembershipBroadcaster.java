@@ -64,9 +64,10 @@ public class MembershipBroadcaster implements SmartLifecycle {
 	}
 
 	/**
-	 * Pushes the current membership to a newly connected session.
+	 * Pushes the current membership to a session that just became its client's session
+	 * (its first advertise); from then on the broadcasts reach it.
 	 */
-	public void onSessionCreated(TunnelSession session) {
+	public void onSessionRegistered(TunnelSession session) {
 		this.push(session);
 	}
 

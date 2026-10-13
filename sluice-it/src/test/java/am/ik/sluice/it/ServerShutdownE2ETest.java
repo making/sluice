@@ -7,6 +7,8 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import com.sun.net.httpserver.HttpServer;
 import org.awaitility.Awaitility;
@@ -21,6 +23,13 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.tunnel.SessionRegistry;
+import am.ik.sluice.v1.proto.Frame;
+import am.ik.sluice.v1.proto.TunnelGrpc;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.Metadata;
+import io.grpc.stub.MetadataUtils;
+import io.grpc.stub.StreamObserver;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import org.springframework.boot.builder.SpringApplicationBuilder;
@@ -32,7 +41,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * End to end: with a connected client, closing the server context must not wait out the
  * gRPC shutdown grace; the server completes the tunnel streams itself after the drain
- * wait, so the shutdown takes drain-grace plus seconds, not the 30s gRPC grace.
+ * wait, so the shutdown takes drain-grace plus seconds, not the 30s gRPC grace. A stream
+ * whose client has not advertised yet is ended at the drain start, well before its
+ * advertise timeout.
  */
 @TestInstance(Lifecycle.PER_CLASS)
 class ServerShutdownE2ETest {
@@ -44,6 +55,8 @@ class ServerShutdownE2ETest {
 	private static final Duration DRAIN_GRACE = Duration.ofSeconds(2);
 
 	private static final long CLOSE_BUDGET_SECONDS = 15;
+
+	private static final Duration ADVERTISE_TIMEOUT = Duration.ofSeconds(60);
 
 	private static @Nullable HttpServer upstream;
 
@@ -84,7 +97,8 @@ class ServerShutdownE2ETest {
 		this.dataPort = TestPorts.freePort();
 		this.serverContext = new SpringApplicationBuilder(SluiceServerApplication.class).run("--server.port=0",
 				"--spring.grpc.server.port=" + this.grpcPort, "--sluice.data-port=" + this.dataPort,
-				"--sluice.token=it-token", "--sluice.cluster.drain-grace=" + DRAIN_GRACE.getSeconds() + "s");
+				"--sluice.token=it-token", "--sluice.cluster.drain-grace=" + DRAIN_GRACE.getSeconds() + "s",
+				"--sluice.limits.advertise-timeout=" + ADVERTISE_TIMEOUT.getSeconds() + "s");
 	}
 
 	private void startClient() {
@@ -139,6 +153,52 @@ class ServerShutdownE2ETest {
 		serverContext().close();
 		Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
 		assertThat(elapsed).isLessThan(Duration.ofSeconds(CLOSE_BUDGET_SECONDS));
+	}
+
+	@Test
+	void contextCloseEndsAStreamThatHasNotAdvertised() throws Exception {
+		startServer();
+		ManagedChannel channel = ManagedChannelBuilder.forAddress("127.0.0.1", this.grpcPort).usePlaintext().build();
+		try {
+			CountDownLatch ended = new CountDownLatch(1);
+			Metadata metadata = new Metadata();
+			metadata.put(Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER), "Bearer it-token");
+			metadata.put(Metadata.Key.of("x-sluice-id", Metadata.ASCII_STRING_MARSHALLER), "silent-client");
+			TunnelGrpc.newStub(channel)
+				.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(metadata))
+				.connect(new StreamObserver<>() {
+
+					@Override
+					public void onNext(Frame frame) {
+					}
+
+					@Override
+					public void onError(Throwable t) {
+						ended.countDown();
+					}
+
+					@Override
+					public void onCompleted() {
+						ended.countDown();
+					}
+
+				});
+			SessionRegistry registry = serverContext().getBean(SessionRegistry.class);
+			Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> registry.pending().size() == 1);
+			assertThat(registry.pending().getFirst().advertiseTimeout())
+				.as("precondition: the advertise timeout outlasts the close budget")
+				.isEqualTo(ADVERTISE_TIMEOUT);
+
+			long start = System.nanoTime();
+			serverContext().close();
+			Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
+
+			assertThat(elapsed).isLessThan(Duration.ofSeconds(CLOSE_BUDGET_SECONDS));
+			assertThat(ended.await(5, TimeUnit.SECONDS)).as("the stream ended").isTrue();
+		}
+		finally {
+			channel.shutdownNow();
+		}
 	}
 
 }

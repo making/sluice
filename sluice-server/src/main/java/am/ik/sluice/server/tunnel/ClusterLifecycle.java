@@ -102,6 +102,9 @@ public class ClusterLifecycle implements SmartLifecycle, ApplicationListener<Con
 		for (Drainable dataPlane : this.dataPlanes) {
 			dataPlane.beginDrain();
 		}
+		// a stream whose client has not advertised serves nothing yet: end it now rather
+		// than let it register into a node that is going away
+		this.sessions.pending().forEach(TunnelSession::close);
 		List<TunnelSession> live = this.sessions.all();
 		if (live.isEmpty()) {
 			return;

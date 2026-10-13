@@ -176,7 +176,7 @@ class ConsoleView {
 				.inbound(Humanize.bytes(session.bytesInbound()))
 				.outbound(Humanize.bytes(session.bytesOutbound()))
 				.draining(session.drained())
-				.peerBuild(session.advertised() ? peerBuild(session.clientBuild().orElse(null)) : null)
+				.peerBuild(peerBuild(session.clientBuild().orElse(null)))
 				.upstreams(session.upstreams()
 					.stream()
 					.map(upstream -> upstreamRow(upstream, session.rejectedPorts().contains(upstream.getListenPort()))

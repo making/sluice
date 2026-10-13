@@ -3,8 +3,6 @@ package am.ik.sluice.server.tunnel;
 import java.util.Set;
 
 import am.ik.sluice.server.route.Router;
-import am.ik.sluice.tunnel.SessionSender;
-import am.ik.sluice.v1.proto.Frame;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -20,13 +18,11 @@ class TunnelSessionRegistryRemovalTest {
 	private final Router router = new Router();
 
 	private TunnelSession session(String clientId) {
-		return TunnelSession.builder()
+		return AdvertisedSessions.advertised(TunnelSession.builder()
 			.clientId(clientId)
 			.router(this.router)
-			.sender(new SessionSender(new NoopStream()))
 			.registry(this.registry)
-			.tcpRoutes(new NoopTcpRouteListener())
-			.build();
+			.tcpRoutes(new NoopTcpRouteListener()));
 	}
 
 	@Test
@@ -51,22 +47,6 @@ class TunnelSessionRegistryRemovalTest {
 		@Override
 		public Set<Integer> reconcile(String clientId, Set<Integer> listenPorts) {
 			return Set.of();
-		}
-
-	}
-
-	private static final class NoopStream implements io.grpc.stub.StreamObserver<Frame> {
-
-		@Override
-		public void onNext(Frame value) {
-		}
-
-		@Override
-		public void onError(Throwable t) {
-		}
-
-		@Override
-		public void onCompleted() {
 		}
 
 	}
