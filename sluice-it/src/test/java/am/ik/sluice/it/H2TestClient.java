@@ -81,6 +81,9 @@ public final class H2TestClient implements AutoCloseable {
 
 	private final Set<Integer> ended = ConcurrentHashMap.newKeySet();
 
+	/** The stream whose header block under way ends it; -1 = none. The reader's own. */
+	private int endedByBlock = -1;
+
 	private final Set<Integer> collected;
 
 	private final Map<Integer, List<TestH2.Frame>> frames = new ConcurrentHashMap<>();
@@ -222,8 +225,14 @@ public final class H2TestClient implements AutoCloseable {
 				}
 				onDataReceived(frame.payload().length);
 			}
-			case TestH2.HEADERS -> {
-				if ((frame.flags() & TestH2.FLAG_END_STREAM) != 0) {
+			case TestH2.HEADERS, TestH2.CONTINUATION -> {
+				// a block ending its stream ends it with its last frame, so the whole
+				// block is collected once the stream ended
+				if (frame.type() == TestH2.HEADERS && (frame.flags() & TestH2.FLAG_END_STREAM) != 0) {
+					this.endedByBlock = streamId;
+				}
+				if ((frame.flags() & TestH2.FLAG_END_HEADERS) != 0 && this.endedByBlock == streamId) {
+					this.endedByBlock = -1;
 					this.ended.add(streamId);
 				}
 			}
