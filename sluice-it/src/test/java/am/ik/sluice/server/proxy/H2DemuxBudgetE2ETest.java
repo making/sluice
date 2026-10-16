@@ -187,10 +187,12 @@ class H2DemuxBudgetE2ETest {
 
 	/**
 	 * While two stalled connections hold the budget exhausted, a connection on another
-	 * route uploads 512KiB on each of four streams to an upstream reading at about
-	 * 4MiB/s, and gets every response: its queue passes its allowance -- its window is
+	 * route uploads 128KiB on each of four streams to an upstream reading at about
+	 * 512KiB/s, and gets every response: its queue passes its allowance -- its window is
 	 * withheld -- and drains below it again and again, its own drain granting the window
-	 * back, so a connection whose legs drain keeps flowing.
+	 * back, so a connection whose legs drain keeps flowing. Its client's window stays at
+	 * RFC 9113's (the budget has no room to grow it), which still sends faster than the
+	 * upstream reads.
 	 */
 	@Test
 	void connectionOnAnotherRouteKeepsFlowingWhileTheBudgetIsExhausted() throws Exception {
@@ -205,20 +207,22 @@ class H2DemuxBudgetE2ETest {
 			awaitStable(() -> queuedBytes(stalledRoute));
 			assertThat(budgetUsed()).as("exhausted before").isGreaterThanOrEqualTo(BUDGET);
 			double withheldBefore = withheld("budget");
-			// the relay holds a stream window per stream: four take it past its
-			// allowance.
-			// A first exchange opens the leg and takes the upstream's SETTINGS, so the
-			// uploads' streams open at once instead of waiting for the leg's concurrency
-			// limit (waiting streams past the allowance are refused while withheld)
+			// what the client sends faster than the upstream reads takes the relay past
+			// its allowance. A first exchange opens the leg and takes the upstream's
+			// SETTINGS, so the uploads' streams open at once instead of waiting for the
+			// leg's concurrency limit (waiting streams past the allowance are refused
+			// while withheld)
 			H2TestClient client = H2TestClient.connect(dataPort);
 			client.headers(1, true, TestH2.headerBlock(":authority=" + flowingRoute, ":method=GET", ":path=/warm"));
 			assertThat(client.awaitEnd(1, Duration.ofSeconds(10))).as("the leg opened").isTrue();
-			try (Stalled flowing = new Stalled(client, 1, 4, 512 * 1024, 0)) {
+			try (Stalled flowing = new Stalled(client, 1, 4, 128 * 1024, 0)) {
 				flowing.open(flowingRoute);
 				flowing.start();
 				flowing.awaitEnds();
 				assertThat(flowing.client().connectionGranted())
 					.isGreaterThan(NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE);
+				assertThat(flowing.client().maxConnectionWindow()).as("the client's window kept at RFC 9113's")
+					.isEqualTo(HopWindow.FLOOR);
 			}
 			// the stalled connections' shares never shrink while their upstream does not
 			// read, so the budget stays exhausted, their windows stay withheld, and only
@@ -960,10 +964,10 @@ class H2DemuxBudgetE2ETest {
 		}
 	}
 
-	/** Reads at most 64KiB per 16ms: about 4MiB/s. */
+	/** Reads at most 8KiB per 16ms: about 512KiB/s. */
 	private static final class ThrottledInputStream extends InputStream {
 
-		private static final int SLICE = 64 * 1024;
+		private static final int SLICE = 8 * 1024;
 
 		private final InputStream in;
 
