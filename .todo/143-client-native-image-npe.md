@@ -16,9 +16,8 @@ not captured yet.
    since the native client last worked: new config properties records, the tunnel budget,
    `TunnelTransportWindowConfiguration`, `NettyChannelBuilder.flowControlWindow`, the
    reconnect backoff.
-3. Fix it, with a test that fails without the fix where possible (e.g. a check that the
-   metadata covers the classes, or a native smoke run in CI if feasible; if a native test
-   is not practical in CI, record why).
+3. Fix it. No failing test first is required for this item: the native run in step 4 is
+   the verification.
 4. Verify locally: the native client connects to a local server, advertises, and relays
    h1.1 and h2 requests to a local upstream (`sluice-example-upstream`); reconnects after a
    server restart.
@@ -26,4 +25,4 @@ not captured yet.
 ## Done when
 
 - The native client runs the scenarios in step 4 without exceptions.
-- The cause and the guard against its recurrence are recorded in the commit.
+- The cause is recorded in the commit.
