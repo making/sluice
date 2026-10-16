@@ -1283,12 +1283,12 @@ final class NettyHttp2DemuxRelay {
 	 * when admitted; with the loop's lock.
 	 */
 	private @Nullable Shortfall admitLocked(long bytes) {
-		long share = Math.max(0, queuedLocked() + bytes - CONNECTION_ALLOWANCE) + this.chargedCredit;
+		long share = share(queuedLocked() + bytes, this.chargedCredit);
 		long change = share - this.pooled;
 		if (change <= 0) {
 			return null;
 		}
-		if (share > BLOCK_SHARE) {
+		if (pastBlockShare(share)) {
 			return Shortfall.SHARE;
 		}
 		if (!this.budget.tryCharge(change)) {
@@ -1366,7 +1366,7 @@ final class NettyHttp2DemuxRelay {
 		settleShareLocked(queued, chargedCreditLocked());
 		boolean wrote = false;
 		boolean exhausted = queued > CONNECTION_ALLOWANCE && !this.budget.hasRoom();
-		if (exhausted || this.pooled >= CONNECTION_SHARE) {
+		if (exhausted || atShare(this.pooled)) {
 			if (!this.withheld) {
 				this.withheld = true;
 				if (exhausted) {
@@ -1418,16 +1418,42 @@ final class NettyHttp2DemuxRelay {
 	}
 
 	/**
+	 * A connection's share of the budget: the {@code queued} bytes beyond
+	 * {@link #CONNECTION_ALLOWANCE} plus the {@code chargedCredit} (the window its peers
+	 * hold past the floors).
+	 */
+	static long share(long queued, long chargedCredit) {
+		return Math.max(0, queued - CONNECTION_ALLOWANCE) + chargedCredit;
+	}
+
+	/**
+	 * Whether a header block making the connection's {@code share} is refused: past
+	 * {@link #BLOCK_SHARE}, exactly at it is still admitted.
+	 */
+	static boolean pastBlockShare(long share) {
+		return share > BLOCK_SHARE;
+	}
+
+	/**
+	 * Whether a connection's {@code share} of the budget (the queued bytes beyond the
+	 * allowance plus the charged window) has reached {@link #CONNECTION_SHARE}: exactly
+	 * at it counts, one byte under it does not.
+	 */
+	static boolean atShare(long share) {
+		return share >= CONNECTION_SHARE;
+	}
+
+	/**
 	 * Charges {@code cost} more credit past the floors if the share it makes stays below
 	 * {@link #CONNECTION_SHARE} -- credit alone never makes the review withhold the
 	 * windows, which would keep a peer at the floor from its refill while the others sit
 	 * on theirs -- and the budget has room for it; whether it did. With the loop's lock.
 	 */
 	private boolean chargeCreditLocked(long queued, long cost) {
-		long share = Math.max(0, queued - CONNECTION_ALLOWANCE) + this.chargedCredit + cost;
+		long share = share(queued, this.chargedCredit + cost);
 		long change = share - this.pooled;
 		if (change > 0) {
-			if (share >= CONNECTION_SHARE || !this.budget.tryCharge(change)) {
+			if (atShare(share) || !this.budget.tryCharge(change)) {
 				return false;
 			}
 			this.pooled = share;
@@ -1558,7 +1584,7 @@ final class NettyHttp2DemuxRelay {
 	 */
 	private void settleShareLocked(long queued, long chargedCredit) {
 		this.chargedCredit = chargedCredit;
-		long share = Math.max(0, queued - CONNECTION_ALLOWANCE) + chargedCredit;
+		long share = share(queued, chargedCredit);
 		long change = share - this.pooled;
 		this.pooled = share;
 		if (change > 0) {
