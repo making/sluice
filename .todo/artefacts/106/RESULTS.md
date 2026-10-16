@@ -513,3 +513,44 @@ stack (budgetone stacks: three runs each):
   server's on uploads). Used heap sampled every 250ms (the series' gauges) reads about
   450MiB on both processes at the after rates, which is garbage from 1.4GB/s of relaying, not
   retention (the histogram above).
+
+## After todo 135: h2 connection windows charged to the h2 queue budget
+
+Each hop's connection window starts at 65535 bytes and grows to 1MiB with what its peer sends
+per round trip (PING-measured), the part past 65535 bytes charged to the h2 queue budget (an
+eighth of half the heap: 64MiB for the harness's `-Xmx1g`). Suite `h2credit`
+(`harness/series-135.sh`): 64MiB downloads at c1/c8/c32/c100, one stream each, a 16MiB upload
+(upstream window 64KiB), small requests c10 s10; tunnel RTT 20ms; rows in
+`results-135.jsonl`; gauges = the server's largest h2 budget use / peer credit over each
+window.
+
+Series on main after 138 (load 1.7 at start, 6 at the end: a sibling build began): `base` is
+origin/main `1b76d23` with 8cd142c's main sources reverted, `after` origin/main; base, after
+alternated three times on fresh stacks (tags base-5..7, after-5..7). MiB/s:
+
+| | base | after |
+|---|---|---|
+| download h2 c1 s1 | 20.5 / 20.6 / 22.3 | 20.7 / 20.7 / 22.2 |
+| download h2 c8 s1 | 165.9 / 165.3 / 179.8 | 166.2 / 166.3 / 181.3 |
+| download h2 c32 s1 | 802.6 / 806.8 / 821.3 | 802.6 / 834.3 / 823.2 |
+| download h2 c100 s1 | 1103.3 / 1106.5 / 1108.9 | 1082.8 / 1078.5 / 1072.2 |
+| upload h2 c1 s1 | 1.7 / 1.7 / 1.7 | 1.7 / 1.7 / 1.7 |
+| small h2 c10 s10 (req/s) | 4059 / 4070 / 4397 | 4082 / 4148 / 4423 |
+| h2 budget used, c1 / c8 / c32 / c100 | 0.1-0.5 / 1.6-1.8 / 0.3-0.4 / 0.2-0.5 MiB | 0.6-1.0 / 6.7-7.2 / 20-22 / 65 MiB |
+| peer credit, c1 / c8 / c32 / c100 | - | 0.6-1.1 / 6.9-7.9 / 24-26 / 78 MiB |
+
+- One to 32 connections move what they moved before: their windows grow to 1MiB within the
+  budget (c1: 1088KiB of credit, the leg's 1MiB and the client's 65535 bytes; c32: about
+  25MiB). One stream stays at 20.5 to 22.3 MiB/s in both builds (todo 140's bound).
+- c100 moved 2 to 3% less (1072 to 1083 against 1103 to 1109 MiB/s): the budget was saturated
+  (65MiB charged of 64MiB, 78MiB of credit), so about 30 connections ran at smaller windows;
+  that is the trade the budget size sets, as with the tunnel budget (134).
+- The budget holds what the peers may still send now, not only what the relay held: base
+  charged at most 1.8MiB (held bytes) where the peers' 1MiB windows, unreserved by the budget,
+  could have sent 200MiB at c100.
+
+An earlier series ran before 138 (base = `d84483c`, after = this change on it; tags base-1..4,
+after-1..4): c1 20.2 to 20.8 in both; the many-connection rows were bimodal by stack as 138
+found (base 22 to 61 MiB/s at c32, after 22 to 26 in all four of its stacks). Whether the
+change made the slow mode likelier there was not determined; with 138's fixed transport window
+the two builds match as above.

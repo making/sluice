@@ -278,7 +278,8 @@ class GaugeSampler(threading.Thread):
     """The largest value of the server's and the client's memory gauges over the measured
     window (tunnel budget used, tunnel payload buffered, heap used), every 250ms."""
 
-    PATTERN = r'^(sluice_tunnel_budget_used_bytes|sluice_tunnel_buffered_bytes|jvm_memory_used_bytes\{.*heap)'
+    PATTERN = (r'^(sluice_tunnel_budget_used_bytes|sluice_tunnel_buffered_bytes|sluice_h2demux_budget_used_bytes'
+               r'|sluice_h2demux_credit_bytes|sluice_h2demux_held_bytes|jvm_memory_used_bytes\{.*heap)')
 
     def __init__(self, period=0.25):
         super().__init__(daemon=True)
@@ -300,6 +301,12 @@ class GaugeSampler(threading.Thread):
                         sample['budget_used_KiB'] = v / 1024
                     elif k.startswith('sluice_tunnel_buffered_bytes'):
                         sample['buffered_KiB'] = v / 1024
+                    elif k.startswith('sluice_h2demux_budget_used_bytes'):
+                        sample['h2_budget_used_KiB'] = v / 1024
+                    elif k.startswith('sluice_h2demux_credit_bytes'):
+                        sample['h2_credit_KiB'] = v / 1024
+                    elif k.startswith('sluice_h2demux_held_bytes'):
+                        sample['h2_held_KiB'] = v / 1024
                 for k, v in sample.items():
                     key = f'{name}_max_{k}'
                     self.maxima[key] = round(max(self.maxima.get(key, 0), v), 1)
@@ -631,6 +638,21 @@ def suite_budgetone(results, tag):
         run_load(f'{tag}budget download h1 c1 #{i}', lg('h1', 1, 1, f'/bytes?n={64 * MiB}', dur=12), results)
         run_load(f'{tag}budget upload h1 c1 #{i}', lg('h1', 1, 1, '/sink', dur=12, extra=('--upload', str(16 * MiB))),
                  results)
+
+
+def suite_h2credit(results, tag):
+    """h2 throughput against the tunnel RTT (run with --delay) with one and many h2
+    connections, and the largest h2 queue budget use, peer credit and held bytes of the
+    server over each measured window (todo 135: connection windows charged to the h2
+    queue budget instead of reserved per connection)."""
+    GAUGES[0] = True
+    big = f'/bytes?n={64 * MiB}'
+    run_load(f'{tag}h2credit download h2 c1 s1', lg('h2', 1, 1, big, dur=12), results)
+    for c in [8, 32, 100]:
+        run_load(f'{tag}h2credit download h2 c{c} s1', lg('h2', c, 1, big, dur=12), results)
+    run_load(f'{tag}h2credit upload h2 c1 s1', lg('h2', 1, 1, '/sink', dur=12, extra=('--upload', str(16 * MiB))),
+             results)
+    run_load(f'{tag}h2credit small h2 c10 s10', lg('h2', 10, 10, '/small', dur=8), results)
 
 
 def live_heap_kb(pid):
