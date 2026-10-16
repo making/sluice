@@ -45,6 +45,8 @@ mod pb {
 #[cfg(test)]
 mod build_info;
 mod tls;
+#[cfg(test)]
+mod transport_window_test;
 mod tunnel;
 mod wasm_host;
 
@@ -127,6 +129,40 @@ const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// default 256MiB).
 const DEFAULT_MAX_INSTANCES: usize = 64;
 
+/// The HTTP/2 window announced for the gRPC connection carrying the tunnel
+/// (stream and connection alike, the tunnel being one stream): twice what the
+/// connections may have in flight, `max_connections` x [`tunnel::WINDOW`],
+/// capped at the largest HTTP/2 window.
+///
+/// The connections' windows bound what the server may send; the transport
+/// window only has to stay out of their way. h2 grants a window back once
+/// half of it was read, so a transfer can settle with half of it in flight:
+/// twice the budget keeps the budget's worth in flight even then. It is a
+/// ceiling on what the server may send, not a buffer: the receive loop takes
+/// frames off the stream as they arrive and hands them to the connections,
+/// whose own windows (the budget) bound what they hold.
+pub fn transport_window(max_connections: usize) -> u32 {
+    let budget = (max_connections as u64).saturating_mul(u64::from(tunnel::WINDOW));
+    budget
+        .saturating_mul(2)
+        .clamp(u64::from(tunnel::WINDOW), u64::from(i32::MAX as u32)) as u32
+}
+
+/// Fixes the HTTP/2 stream and connection windows of `endpoint` at `window`
+/// and turns the adaptive window off. Left at hyper's defaults (2MiB per
+/// stream, 5MiB per connection) the tunnel stream, shared by every virtual
+/// connection, would cap the whole tunnel at a fraction of one round trip's
+/// worth of the connections' windows.
+fn with_transport_window(
+    endpoint: tonic::transport::Endpoint,
+    window: u32,
+) -> tonic::transport::Endpoint {
+    endpoint
+        .initial_stream_window_size(window)
+        .initial_connection_window_size(window)
+        .http2_adaptive_window(false)
+}
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// State shared by every node session.
@@ -146,6 +182,9 @@ struct Shared {
     /// How long connection frames may wait with none taken before a stream
     /// is given up; zero = never.
     stall_timeout: Duration,
+    /// HTTP/2 window (stream and connection) the gRPC connection announces,
+    /// see [`transport_window`].
+    transport_window: u32,
 }
 
 /// One tunnel stream toward one node. The supervisor's `Arc` identity survives
@@ -383,8 +422,13 @@ async fn run(config: Config) -> Result<(), BoxError> {
         components: Arc::new(components),
         limit: tunnel::Limit::new(max_connections),
         stall_timeout,
+        transport_window: transport_window(max_connections),
     });
     println!("connection limit {max_connections}");
+    println!(
+        "gRPC flow control window {} bytes",
+        transport_window(max_connections)
+    );
     println!(
         "tunnel stall timeout {}s (0 = off)",
         stall_timeout.as_secs()
@@ -557,6 +601,7 @@ impl NodeTask {
         .http2_keep_alive_interval(Duration::from_secs(30))
         .keep_alive_timeout(Duration::from_secs(10))
         .keep_alive_while_idle(true);
+        endpoint = with_transport_window(endpoint, self.shared.transport_window);
         if secure {
             endpoint = tls::configure(
                 endpoint,
@@ -958,6 +1003,7 @@ mod tests {
             components: Arc::new(HashMap::from([(target.clone(), handler)])),
             limit: limit.clone(),
             stall_timeout: timeout,
+            transport_window: transport_window(4),
         });
         let (url, _server) = stalling_server(target).await;
         let (events, _received) = mpsc::channel(32);

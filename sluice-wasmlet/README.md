@@ -155,6 +155,16 @@ lines, prefixed with the component and a request id
   request body holds back only its own connection, and frames for the other
   connections keep flowing. A server without the window gets the old behavior
   (a connection whose guest does not read stalls the whole stream)
+- transport flow control: the gRPC connection announces a fixed HTTP/2 window
+  (stream and connection alike, adaptive window off) of twice what the
+  connections may have in flight, `--max-connections` x 1MiB, capped at the
+  HTTP/2 maximum (512MiB by default; logged at startup as `gRPC flow control
+  window`). The tunnel is one stream, so at hyper's defaults (2MiB per stream)
+  everything the server sends for every connection shared 2MiB per round trip.
+  The window is a ceiling on what the server may send, not a buffer: the
+  connections' windows bound what is held. A unit test sends 32MiB through a
+  proxy that holds the wasmlet's answers back one round trip at a time: 17
+  round trips at hyper's defaults, at most 3 with the window
 - outbound frames are scheduled as by the Java sender: control frames
   (Advertise, WindowUpdate) first, then one frame per turn from each
   connection with frames queued: another connection's DATA, CLOSE or ERROR
