@@ -1,5 +1,6 @@
 package am.ik.sluice.server.proxy.hop;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
@@ -30,7 +31,7 @@ class HopStressTest {
 
 	private static final int BODY = 512 * 1024;
 
-	@Test
+	@org.junit.jupiter.api.RepeatedTest(value = 150, failureThreshold = 1)
 	void concurrentUploadsAndDownloadsOverTwoLegsArriveIntact() throws Exception {
 		try (Fixture fixture = Fixture.twoRoutes()) {
 			long seed = 1;
@@ -67,6 +68,15 @@ class HopStressTest {
 			return sent.response().get(20, TimeUnit.SECONDS);
 		}
 		catch (TimeoutException | ExecutionException e) {
+			// temporary: the kernel's view of the loopback sockets
+			try {
+				Process ss = new ProcessBuilder("sh", "-c", "ss -tnmie state established 2>&1")
+					.redirectErrorStream(true)
+					.start();
+				System.out.println("=== ss\n" + new String(ss.getInputStream().readAllBytes()));
+			}
+			catch (IOException ignored) {
+			}
 			throw new AssertionError(
 					"stream %d got no response (%s): %s".formatted(sent.streamId(), e, fixture.describe()), e);
 		}
