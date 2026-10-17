@@ -16,3 +16,11 @@ and bring the total down.
 - Keep every behavior covered: for each removed test, name the test that still fails
   without that behavior. Do not weaken a test's preconditions pinning.
 - Report the count of test classes / methods and the CI test job time before and after.
+
+## Also (folded in from a cancelled follow-up of the h2 credit work)
+
+A mutation passing 0 instead of the connection's charged credit where `NettyHttp2DemuxRelay`
+calls `admitLocked` survives the tests (`NettyHttp2DemuxRelayShareTest` pins only the pure
+`share` / `atShare` / `pastBlockShare`). While merging the `H2DemuxConnectionShareE2ETest` /
+`H2DemuxBudgetE2ETest` cases, vary the conditions of one (smaller socket buffers, stalled
+upstream) so a connection's credit decides the admission and the mutation fails it.
