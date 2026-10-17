@@ -1,10 +1,5 @@
 package am.ik.sluice.server.proxy.hop;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -24,13 +19,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * A {@link TestBridge} with its upstreams and one {@link TestClient} connected to it over
- * loopback TCP; each leg reaches its upstream over a {@link TunnelPair}. Closing it
- * closes every hop and waits until all their threads ended.
+ * loopback TCP ({@link Endpoint#socketPair}); each leg reaches its upstream over a
+ * {@link TunnelPair}. Closing it closes every hop and waits until all their threads
+ * ended.
  */
 final class Fixture implements AutoCloseable {
-
-	/** The socket buffers of the client connection, to keep their slack small. */
-	static final int SOCKET_BUFFER = 16 * 1024;
 
 	private static final Duration DONE_TIMEOUT = Duration.ofSeconds(10);
 
@@ -42,21 +35,12 @@ final class Fixture implements AutoCloseable {
 
 	private Fixture(Map<String, TestUpstream> upstreams, Http2Settings clientSettings) {
 		this.upstreams = Map.copyOf(upstreams);
-		try (ServerSocket server = new ServerSocket()) {
-			server.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
-			Socket socket = new Socket();
-			socket.setReceiveBufferSize(SOCKET_BUFFER);
-			socket.connect(server.getLocalSocketAddress());
-			Socket accepted = server.accept();
-			accepted.setSendBufferSize(SOCKET_BUFFER);
-			this.relay = new TestBridge(DuplexPipe.of(accepted),
-					authority -> Objects.requireNonNull(this.upstreams.get(authority), authority)
-						.accept(TunnelPair.open()));
-			this.client = new TestClient(socket, clientSettings);
-		}
-		catch (IOException e) {
-			throw new UncheckedIOException(e);
-		}
+		// the relay's end accepted, its send buffer small (Endpoint#socketPair)
+		Socket[] sockets = Endpoint.socketPair();
+		this.relay = new TestBridge(DuplexPipe.of(sockets[0]),
+				authority -> Objects.requireNonNull(this.upstreams.get(authority), authority)
+					.accept(TunnelPair.open()));
+		this.client = new TestClient(sockets[1], clientSettings);
 	}
 
 	/**

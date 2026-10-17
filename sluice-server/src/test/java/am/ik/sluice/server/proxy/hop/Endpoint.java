@@ -18,6 +18,16 @@ import io.netty.handler.codec.http2.Http2FrameAdapter;
  */
 final class Endpoint implements AutoCloseable {
 
+	/**
+	 * The send buffer of the accepted socket, to keep the slack of what a hop writes to
+	 * its peer small. The connecting socket keeps the system's receive buffer: one this
+	 * small on loopback (MSS near 64KiB) lets Linux stall the connection with the
+	 * receiver's buffer empty -- its window stays below the sender's MSS, the sender
+	 * waits for a larger one, and the receiver, reading nothing, announces none (seen on
+	 * CI: 20s rwnd-limited, 20-33KiB not sent).
+	 */
+	static final int SEND_BUFFER = 16 * 1024;
+
 	final RecordingSink sink = new RecordingSink();
 
 	final Loop loop;
@@ -46,10 +56,9 @@ final class Endpoint implements AutoCloseable {
 		try (ServerSocket server = new ServerSocket()) {
 			server.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
 			Socket socket = new Socket();
-			socket.setReceiveBufferSize(Fixture.SOCKET_BUFFER);
 			socket.connect(server.getLocalSocketAddress());
 			Socket accepted = server.accept();
-			accepted.setSendBufferSize(Fixture.SOCKET_BUFFER);
+			accepted.setSendBufferSize(SEND_BUFFER);
 			return new Socket[] { accepted, socket };
 		}
 		catch (IOException e) {
