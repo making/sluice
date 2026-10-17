@@ -31,10 +31,33 @@ java.lang.NullPointerException
   untrusted cert) connect / fail cleanly; the f83806a notes in 143 list the rest. The amd64
   image cannot run here (AVX).
 
+## Cause (from the user's log, 2026-10-17)
+
+The first error, at the very first connect (Channel<1>), on the user's host (Docker
+Compose, `memory: 1g`, `grpcs://control.sluice.ik.am`; the JVM image of the same commit
+works):
+
+```
+java.lang.RuntimeException: ChannelOption(TCP_USER_TIMEOUT) is not available
+  at io.grpc.netty.Utils.getEpollChannelOption(Utils.java:482)
+  at io.grpc.netty.Utils.maybeGetTcpUserTimeoutOption(Utils.java:469)
+  at io.grpc.netty.NettyClientTransport.start(NettyClientTransport.java:312)
+Caused by: java.lang.NoSuchFieldException: TCP_USER_TIMEOUT
+  at java.lang.Class.getField(DynamicHub.java:1285)
+  at io.grpc.netty.Utils.getEpollChannelOption(Utils.java:479)
+```
+
+On that host the transport channel is an epoll channel (`Utils.isEpollAvailable()` true),
+and with keep-alive on, grpc reads `EpollChannelOption.TCP_USER_TIMEOUT` reflectively; the
+native image has no reflection registration for that field. Every channel fails the same
+way (Channel<13> later), so the client never connects. Locally (Docker Desktop arm64)
+epoll is not available, so NIO is used and the path is never taken. The native binaries
+of both arches contain `EpollEventLoopGroup` although `dependency:list` of sluice-client
+shows no netty epoll artifact: find where the epoll classes come from.
+
 ## Work
 
-1. Get the first `ERROR` / `Panic!` of the failing run, the `docker run` command (memory
-   limit?), and the host OS / arch from the user.
-2. Reproduce that cause locally, fix it, and make the client survive a transport whose
+1. (done) The user's log.
+2. Reproduce that cause locally (make epoll available to the native client), fix it, and make the client survive a transport whose
    start failed (the run loop must keep reconnecting).
 3. Verify with the Docker native image against a local server.
