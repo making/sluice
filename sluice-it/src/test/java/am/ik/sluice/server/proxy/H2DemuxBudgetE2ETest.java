@@ -8,7 +8,6 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -242,8 +241,10 @@ class H2DemuxBudgetE2ETest {
 
 	/**
 	 * With the budget exhausted, a new stream on a connection past its allowance is
-	 * refused (REFUSED_STREAM, safe to retry) and the connection stays up; the same
-	 * request on a connection within its allowance reaches the upstream.
+	 * refused (REFUSED_STREAM, safe to retry) and the connection stays up -- though its
+	 * client holds a window past RFC 9113's, charged to its share, larger than the head:
+	 * the head is charged on top of that credit, not taken out of it. The same request on
+	 * a connection within its allowance reaches the upstream.
 	 */
 	@Test
 	void newStreamIsRefusedOnlyOnAConnectionPastItsAllowance() throws Exception {
@@ -252,10 +253,15 @@ class H2DemuxBudgetE2ETest {
 		AtomicInteger heads = new AtomicInteger();
 		startClient(route, stub(socket -> serveGated(socket, gate, heads)));
 		double refusedBefore = refused("budget");
-		try (Stalled first = stall(route, heads); Stalled second = stall(route, heads)) {
+		int credit = HopWindow.FLOOR + 4096;
+		try (Stalled first = open(H2TestClient.connect(dataPort), route, 0, UNBOUNDED, credit, heads);
+				Stalled second = stall(route, heads)) {
 			awaitExhausted();
 			awaitStable(() -> queuedBytes(route));
 			assertThat(budgetUsed()).as("exhausted").isGreaterThanOrEqualTo(BUDGET);
+			assertThat(first.client().connectionWindow())
+				.as("its client holds a window past RFC 9113's: credit charged to its share")
+				.isGreaterThanOrEqualTo(credit);
 			int extra = 1 + 2 * STREAMS;
 			first.client()
 				.headers(extra, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/extra"));
@@ -441,9 +447,11 @@ class H2DemuxBudgetE2ETest {
 	 * Opens {@link #STREAMS} streams on the route over the client, the first one at the
 	 * stream index {@code first}, and waits until the route's upstream counted their
 	 * heads in {@code heads}; then each sends {@code body} bytes as fast as its windows
-	 * admit, while leaving {@code reserve} bytes of the connection window unspent. A
-	 * stream whose head has not reached the upstream may wait for the leg's first
-	 * SETTINGS (concurrency one until then); waiting streams past the allowance are
+	 * admit, while leaving {@code reserve} bytes of the connection window unspent once
+	 * the relay granted a window of twice that (a reserve past RFC 9113's window needs a
+	 * grown window to send at all, the relay refilling a window spent to half its
+	 * target). A stream whose head has not reached the upstream may wait for the leg's
+	 * first SETTINGS (concurrency one until then); waiting streams past the allowance are
 	 * refused once the windows are withheld, their DATA void, so the relay would hold
 	 * less than the connection sent.
 	 */
@@ -527,7 +535,8 @@ class H2DemuxBudgetE2ETest {
 							this.remaining[i] = 0;
 							continue;
 						}
-						long window = Math.min(this.client.sendable(id), this.client.connectionWindow() - this.reserve);
+						long reserved = this.client.maxConnectionWindow() >= 2L * this.reserve ? this.reserve : 0;
+						long window = Math.min(this.client.sendable(id), this.client.connectionWindow() - reserved);
 						int n = (int) Math.min(Math.min(this.remaining[i], window), MAX_FRAME_SIZE);
 						if (n > 0) {
 							this.remaining[i] -= n;
@@ -801,125 +810,6 @@ class H2DemuxBudgetE2ETest {
 
 	}
 
-	/**
-	 * An upstream scripted around a stream the relay resets: once both request heads
-	 * arrived and {@link #respond} opened, it answers the probe stream with a head and a
-	 * whole connection window of DATA, then -- granted that back -- answers the stream to
-	 * reset with a head and {@link #WAITING} bytes of DATA, followed by a PING whose ack
-	 * ({@link #queued}) tells the relay processed them. On the relay's reset it writes
-	 * what it might have had in flight on the stream ({@link #IN_FLIGHT} bytes of DATA, a
-	 * header block adding a dynamic table entry, an unknown frame), none of it ending the
-	 * stream, then the probe's trailers referring to that entry ({@link #answered}); it
-	 * leaves once {@link #leave} opens.
-	 */
-	private static final class CancelScript {
-
-		static final int WAITING = 1000;
-
-		static final int IN_FLIGHT = 500;
-
-		private static final byte[] FENCE = "fence-01".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
-
-		private final int reset;
-
-		private final int probe;
-
-		private final CountDownLatch heads = new CountDownLatch(2);
-
-		private final CountDownLatch respond = new CountDownLatch(1);
-
-		private final CountDownLatch queued = new CountDownLatch(1);
-
-		private final CountDownLatch cancelled = new CountDownLatch(1);
-
-		private final CountDownLatch answered = new CountDownLatch(1);
-
-		private final CountDownLatch leave = new CountDownLatch(1);
-
-		/** The connection window the relay granted back. */
-		private final AtomicLong granted = new AtomicLong();
-
-		private final AtomicInteger resetCode = new AtomicInteger(-1);
-
-		CancelScript(int reset, int probe) {
-			this.reset = reset;
-			this.probe = probe;
-		}
-
-		void serve(Socket socket) {
-			try (socket) {
-				InputStream in = socket.getInputStream();
-				OutputStream out = socket.getOutputStream();
-				if (in.readNBytes(TestH2.PREFACE.length).length < TestH2.PREFACE.length) {
-					return;
-				}
-				TestH2.writeFrame(out, TestH2.SETTINGS, 0, 0, new byte[0]);
-				Thread.ofVirtual().name("e2e-bud-cancel-reader").start(() -> read(in));
-				this.heads.await();
-				this.respond.await();
-				TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS, this.probe, new byte[] { (byte) 0x88 });
-				for (int left = H2TestClient.INITIAL_WINDOW; left > 0; left -= MAX_FRAME_SIZE) {
-					TestH2.writeFrame(out, TestH2.DATA, 0, this.probe, new byte[Math.min(left, MAX_FRAME_SIZE)]);
-				}
-				Awaitility.await()
-					.atMost(Duration.ofSeconds(10))
-					.until(() -> this.granted.get() >= H2TestClient.INITIAL_WINDOW);
-				TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS, this.reset, new byte[] { (byte) 0x88 });
-				TestH2.writeFrame(out, TestH2.DATA, 0, this.reset, new byte[WAITING]);
-				TestH2.writeFrame(out, TestH2.PING, 0, 0, FENCE);
-				this.cancelled.await();
-				TestH2.writeFrame(out, TestH2.DATA, 0, this.reset, new byte[IN_FLIGHT]);
-				TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS, this.reset,
-						TestH2.appendLiteralIncremental(new byte[0], "x-dropped", "1"));
-				TestH2.writeFrame(out, 0xfa, 0, this.reset, new byte[4]);
-				TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, this.probe,
-						TestH2.appendIndexedDynamic(new byte[0], 62));
-				this.answered.countDown();
-				this.leave.await();
-			}
-			catch (IOException e) {
-				// connection ended
-			}
-			catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-			}
-		}
-
-		private void read(InputStream in) {
-			try {
-				TestH2.@Nullable Frame frame;
-				while ((frame = TestH2.readFrame(in)) != null) {
-					switch (frame.type()) {
-						case TestH2.HEADERS -> this.heads.countDown();
-						case TestH2.WINDOW_UPDATE -> {
-							if (frame.streamId() == 0) {
-								this.granted.addAndGet(TestH2.increment(frame));
-							}
-						}
-						case TestH2.PING -> {
-							if ((frame.flags() & TestH2.FLAG_ACK) != 0 && Arrays.equals(frame.payload(), FENCE)) {
-								this.queued.countDown();
-							}
-						}
-						case TestH2.RST_STREAM -> {
-							if (frame.streamId() == this.reset) {
-								this.resetCode.set(TestH2.errorCode(frame));
-								this.cancelled.countDown();
-							}
-						}
-						default -> {
-							// not tracked
-						}
-					}
-				}
-			}
-			catch (IOException e) {
-				// connection ended
-			}
-		}
-
-	}
-
 	/** The decoded headers as {@code name: value} lines, in order. */
 	private static List<String> lines(Http2Headers headers) {
 		List<String> lines = new ArrayList<>();
@@ -933,7 +823,7 @@ class H2DemuxBudgetE2ETest {
 	}
 
 	/**
-	 * Reads everything at about 4MiB/s, granting it back, and answers every ended
+	 * Reads everything at about 512KiB/s, granting it back, and answers every ended
 	 * request.
 	 */
 	private static void answerEndedRequestsSlowly(Socket socket) {
