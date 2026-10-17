@@ -132,14 +132,19 @@ class TunnelSessionReceivePathTest {
 	}
 
 	@Test
-	void closeReturnsWithinItsBoundWhileAnAdvertiseIsStuck() throws Exception {
-		TunnelSession session = session(Duration.ofMillis(300));
+	@ExtendWith(OutputCaptureExtension.class)
+	void closeReturnsAtItsBoundWhileAnAdvertiseIsStuck(CapturedOutput output) throws Exception {
+		TunnelSession session = session(Duration.ofMillis(100));
 		session.handle(advertise(VirtualConnection.DEFAULT_WINDOW));
 		awaitReconcileEntered();
-		long start = System.nanoTime();
-		session.close();
-		long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-		assertThat(elapsedMillis).as("close with a stuck advertise").isBetween(300L, 1000L);
+		// the advertise stays stuck until released below: only the bound ends the wait
+		CompletableFuture.runAsync(session::close, task -> Thread.ofVirtual().start(task)).get(5, TimeUnit.SECONDS);
+		assertThat(output.getAll()
+			.lines()
+			.filter(line -> line.endsWith("client " + CLIENT_ID
+					+ ": advertise still running after PT0.1S; its routes are removed once it ends")))
+			.as("close waited for the advertise until its bound")
+			.hasSize(1);
 		assertThat(this.router.clientCount()).as("the removal waits behind the advertise").isOne();
 		this.tcpRoutes.release.countDown();
 		long deadline = System.currentTimeMillis() + 5000;

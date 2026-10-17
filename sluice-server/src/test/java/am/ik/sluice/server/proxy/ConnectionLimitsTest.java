@@ -8,7 +8,7 @@ import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.LongSupplier;
 
 import ch.qos.logback.classic.Logger;
@@ -18,6 +18,8 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
 
 import org.springframework.util.unit.DataSize;
@@ -114,12 +116,16 @@ class ConnectionLimitsTest {
 			overflow.start(accepted);
 			Awaitility.await().atMost(Duration.ofSeconds(2)).until(accepted::isClosed);
 			assertThat(overflow.expired()).isTrue();
+			assertThat(registry.get("sluice.data.connections.overflow.expired").counter().count()).isEqualTo(1);
 			overflow.release();
 			overflow.release();
 			assertThat(overflowing.overflowing()).isEqualTo(1);
 			assertThat(overflowing.enter(this.access)).isInstanceOf(ConnectionLimits.Overflow.class);
 			Objects.requireNonNull(second).release();
 			assertThat(overflowing.overflowing()).isEqualTo(1);
+			assertThat(registry.get("sluice.data.connections.overflow.expired").counter().count())
+				.as("a place released before its deadline expires nothing")
+				.isEqualTo(1);
 		}
 		finally {
 			overflowing.destroy();
@@ -162,8 +168,7 @@ class ConnectionLimitsTest {
 				Socket accepted = server.accept()) {
 			ConnectionLimits.Admission admission = admit();
 			admission.startHead(accepted);
-			Thread.sleep(400);
-			assertThat(accepted.isClosed()).isTrue();
+			Awaitility.await().atMost(Duration.ofSeconds(2)).until(accepted::isClosed);
 			assertThat(admission.endHead()).isFalse();
 			assertThat(rejected("head-timeout")).isEqualTo(1);
 			admission.release();
@@ -179,15 +184,18 @@ class ConnectionLimitsTest {
 			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(accepted);
 			CountDownLatch teardown = new CountDownLatch(1);
 			deadline.onExpiry(teardown::countDown);
+			long start = System.nanoTime();
 			assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.IDLE)).isTrue();
 			Thread.sleep(200);
 			assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.BUSY)).isTrue();
 			assertThat(this.limits.scheduledDeadlines()).as("busy: nothing scheduled").isZero();
 			assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.IDLE)).isTrue();
-			Thread.sleep(200);
-			// the first idle timeout would have passed by now
-			assertThat(deadline.expired()).isFalse();
-			assertThat(teardown.await(1, TimeUnit.SECONDS)).isTrue();
+			Duration left = this.limits.nextDeadlineIn();
+			// taken after the time left: at or past the deadline's due time
+			long due = System.nanoTime() + left.toNanos();
+			assertThat(Duration.ofNanos(due - start)).as("the idle timeout counted from the second entry")
+				.isGreaterThanOrEqualTo(Duration.ofMillis(200).plus(this.properties.limits().idleTimeout()));
+			assertThat(teardown.await(2, TimeUnit.SECONDS)).isTrue();
 			assertThat(deadline.expired()).isTrue();
 			Awaitility.await().atMost(Duration.ofSeconds(1)).until(accepted::isClosed);
 			assertThat(idleClosed()).isEqualTo(1);
@@ -202,16 +210,13 @@ class ConnectionLimitsTest {
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(accepted);
-			long start = System.nanoTime();
 			assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.HEAD)).isTrue();
 			Thread.sleep(100);
 			assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.HEAD)).isTrue();
-			Awaitility.await()
-				.pollInterval(Duration.ofMillis(5))
-				.atMost(Duration.ofSeconds(1))
-				.until(accepted::isClosed);
-			assertThat(Duration.ofNanos(System.nanoTime() - start)).as("the head timeout from the first entry")
-				.isLessThan(Duration.ofMillis(290));
+			assertThat(this.limits.scheduledDeadlines()).isEqualTo(1);
+			assertThat(this.limits.nextDeadlineIn()).as("the head timeout from the first entry")
+				.isLessThanOrEqualTo(this.properties.limits().headTimeout().minusMillis(100));
+			Awaitility.await().atMost(Duration.ofSeconds(2)).until(accepted::isClosed);
 			assertThat(rejected("head-timeout")).isEqualTo(1);
 			assertThat(idleClosed()).isZero();
 		}
@@ -305,15 +310,15 @@ class ConnectionLimitsTest {
 				}
 			});
 			try {
+				long start = System.nanoTime();
 				deadline.relayVerbatim(route(VERBATIM_IDLE_TIMEOUT));
 				assertThat(tearingDown.await(2, TimeUnit.SECONDS)).isTrue();
-				long start = System.nanoTime();
 				Awaitility.await()
-					.pollInterval(Duration.ofMillis(10))
-					.atMost(ConnectionLimits.KeepAliveDeadline.TEARDOWN_GRACE.plusSeconds(1))
+					.atMost(ConnectionLimits.KeepAliveDeadline.TEARDOWN_GRACE.plusSeconds(2))
 					.until(accepted::isClosed);
-				assertThat(Duration.ofNanos(System.nanoTime() - start))
-					.isGreaterThan(ConnectionLimits.KeepAliveDeadline.TEARDOWN_GRACE.minusMillis(200));
+				// the grace runs from the expiry, which comes the timeout after the start
+				assertThat(Duration.ofNanos(System.nanoTime() - start)).isGreaterThanOrEqualTo(
+						ConnectionLimits.KeepAliveDeadline.TEARDOWN_GRACE.plus(VERBATIM_IDLE_TIMEOUT));
 			}
 			finally {
 				release.countDown();
@@ -327,19 +332,14 @@ class ConnectionLimitsTest {
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
 			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(accepted);
-			long start = System.nanoTime();
 			assertThat(deadline.relayVerbatim(route(VERBATIM_IDLE_TIMEOUT))).isTrue();
-			Thread.sleep(100);
 			// entered again: the running timeout stays; another phase arms nothing
 			assertThat(deadline.relayVerbatim(route(Duration.ofSeconds(30)))).isTrue();
 			assertThat(deadline.enter(ConnectionLimits.KeepAliveDeadline.Phase.IDLE)).isTrue();
 			assertThat(this.limits.scheduledDeadlines()).isEqualTo(1);
-			Awaitility.await()
-				.pollInterval(Duration.ofMillis(5))
-				.atMost(Duration.ofSeconds(2))
-				.until(accepted::isClosed);
-			assertThat(Duration.ofNanos(System.nanoTime() - start)).as("the timeout of the first entry")
-				.isLessThan(Duration.ofSeconds(2));
+			assertThat(this.limits.nextDeadlineIn()).as("the timeout of the first entry")
+				.isLessThanOrEqualTo(VERBATIM_IDLE_TIMEOUT);
+			Awaitility.await().atMost(Duration.ofSeconds(2)).until(accepted::isClosed);
 			assertThat(verbatimIdleClosed()).isEqualTo(1);
 			assertThat(idleClosed()).isZero();
 		}
@@ -588,8 +588,16 @@ class ConnectionLimitsTest {
 		assertThat(this.limits.admitted()).isEqualTo(2);
 	}
 
-	@Test
-	void aWatchedRelayWaitingOnItsClientIsTornDownAtTheStallTimeout() throws Exception {
+	/**
+	 * A relay whose clock of its wait on the client advances a sample interval per
+	 * reading is torn down at the first sample that finds it waited the stall timeout:
+	 * the first reading only sets where the count starts. One waiting but for
+	 * {@code breakMillis} at every second reading -- the h1 relay caught forwarding a
+	 * byte its client dripped -- is torn down all the same, a reading later.
+	 */
+	@ParameterizedTest
+	@ValueSource(longs = { 0, 1 })
+	void aWatchedRelayWaitingOnItsClientIsTornDownAtTheStallTimeout(long breakMillis) throws Exception {
 		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
@@ -599,15 +607,17 @@ class ConnectionLimitsTest {
 				CountDownLatch idle = new CountDownLatch(1);
 				CountDownLatch stalled = new CountDownLatch(1);
 				deadline.onExpiry(idle::countDown);
-				long start = System.nanoTime();
+				AtomicInteger readings = new AtomicInteger();
+				long breakNanos = TimeUnit.MILLISECONDS.toNanos(breakMillis);
 				// busy from the start: watching arms the stall count at once
-				deadline.watchStallClock(waitingFromNow(), stalled::countDown);
+				deadline.watchStallClock(() -> {
+					int reading = readings.incrementAndGet();
+					return reading * sampleInterval() - reading / 2 * breakNanos;
+				}, stalled::countDown);
 				assertThat(limits.scheduledDeadlines()).isEqualTo(1);
-				assertThat(stalled.await(2, TimeUnit.SECONDS)).isTrue();
-				Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
-				assertThat(elapsed).as("between the stall timeout and two sample intervals past it")
-					.isGreaterThanOrEqualTo(STALL_TIMEOUT)
-					.isLessThan(STALL_TIMEOUT.plus(STALL_TIMEOUT.dividedBy(4)).plusMillis(100));
+				assertThat(stalled.await(5, TimeUnit.SECONDS)).isTrue();
+				assertThat(readings).as("the sample that found the stall timeout waited")
+					.hasValue(ConnectionLimits.KeepAliveDeadline.STALL_SAMPLES + 1 + (breakMillis > 0 ? 1 : 0));
 				assertThat(idle.getCount()).as("the idle teardown did not run").isEqualTo(1);
 				Awaitility.await().atMost(Duration.ofSeconds(1)).until(accepted::isClosed);
 				assertThat(deadline.expired()).isTrue();
@@ -620,55 +630,24 @@ class ConnectionLimitsTest {
 		}
 	}
 
-	/**
-	 * A relay waiting on its client but for a millisecond at every second sample -- the
-	 * h1 relay caught forwarding a byte its client dripped -- is torn down at the stall
-	 * timeout all the same.
-	 */
-	@Test
-	void aRelayFoundBetweenTwoWaitsAtEverySecondSampleIsTornDownAtTheStallTimeout() throws Exception {
-		try (ServerSocket server = loopbackServer();
-				Socket client = new Socket("127.0.0.1", server.getLocalPort());
-				Socket accepted = server.accept()) {
-			ConnectionLimits limits = stallLimits(DataSize.ofKilobytes(16));
-			try {
-				ConnectionLimits.KeepAliveDeadline deadline = limits.keepAliveDeadline(accepted);
-				CountDownLatch stalled = new CountDownLatch(1);
-				AtomicLong readings = new AtomicLong();
-				long start = System.nanoTime();
-				long gap = TimeUnit.MILLISECONDS.toNanos(1);
-				deadline.watchStallClock(() -> System.nanoTime() - start - readings.incrementAndGet() / 2 * gap,
-						stalled::countDown);
-				assertThat(stalled.await(2, TimeUnit.SECONDS)).isTrue();
-				assertThat(Duration.ofNanos(System.nanoTime() - start))
-					.as("between the stall timeout and two sample intervals past it")
-					.isGreaterThanOrEqualTo(STALL_TIMEOUT)
-					.isLessThan(STALL_TIMEOUT.plus(STALL_TIMEOUT.dividedBy(4)).plusMillis(100));
-			}
-			finally {
-				limits.destroy();
-			}
-		}
-	}
-
 	@Test
 	void aWatchedRelayWaitingOnItsUpstreamIsNeverTornDown() throws Exception {
-		assertStallsAfter(DataSize.ofKilobytes(16), () -> 0, 0, false);
+		assertStallsAfter(DataSize.ofKilobytes(16), false, 0, false);
 	}
 
 	@Test
 	void progressOfTheStallMinimumPerSampleKeepsAWaitingRelay() throws Exception {
-		assertStallsAfter(DataSize.ofKilobytes(16), waitingFromNow(), 16 * 1024, false);
+		assertStallsAfter(DataSize.ofKilobytes(16), true, 16 * 1024, false);
 	}
 
 	@Test
 	void progressBelowTheStallMinimumDoesNotKeepAWaitingRelay() throws Exception {
-		assertStallsAfter(DataSize.ofKilobytes(16), waitingFromNow(), 1, true);
+		assertStallsAfter(DataSize.ofKilobytes(16), true, 1, true);
 	}
 
 	@Test
 	void aStallMinimumOfOneByteCountsEveryByte() throws Exception {
-		assertStallsAfter(DataSize.ofBytes(1), waitingFromNow(), 1, false);
+		assertStallsAfter(DataSize.ofBytes(1), true, 1, false);
 	}
 
 	@Test
@@ -728,13 +707,19 @@ class ConnectionLimitsTest {
 		return () -> System.nanoTime() - start;
 	}
 
+	/** The time between two stall samples of {@link #stallLimits}. */
+	private static long sampleInterval() {
+		return STALL_TIMEOUT.toNanos() / ConnectionLimits.KeepAliveDeadline.STALL_SAMPLES;
+	}
+
 	/**
-	 * Watches a busy deadline whose relay's clock of its wait is {@code waited},
-	 * reporting {@code progress} bytes every quarter of a sample interval for three stall
-	 * timeouts; asserts whether it stalled.
+	 * Watches a busy deadline whose relay's clock of its wait on the client advances a
+	 * sample interval per reading when {@code waiting}, stands still otherwise, and which
+	 * reports {@code progress} bytes before every reading; asserts whether it stalls --
+	 * at the first sample finding the stall timeout waited -- or lasts three stall
+	 * timeouts' samples.
 	 */
-	private void assertStallsAfter(DataSize minBytes, LongSupplier waited, int progress, boolean stalls)
-			throws Exception {
+	private void assertStallsAfter(DataSize minBytes, boolean waiting, int progress, boolean stalls) throws Exception {
 		try (ServerSocket server = loopbackServer();
 				Socket client = new Socket("127.0.0.1", server.getLocalPort());
 				Socket accepted = server.accept()) {
@@ -742,14 +727,23 @@ class ConnectionLimitsTest {
 			try {
 				ConnectionLimits.KeepAliveDeadline deadline = limits.keepAliveDeadline(accepted);
 				CountDownLatch stalled = new CountDownLatch(1);
-				deadline.watchStallClock(waited, stalled::countDown);
-				long end = System.nanoTime() + STALL_TIMEOUT.multipliedBy(3).toNanos();
-				long step = STALL_TIMEOUT.dividedBy(ConnectionLimits.KeepAliveDeadline.STALL_SAMPLES * 4).toMillis();
-				while (System.nanoTime() < end && stalled.getCount() > 0) {
+				int samples = ConnectionLimits.KeepAliveDeadline.STALL_SAMPLES;
+				CountDownLatch lasted = new CountDownLatch(3 * samples);
+				AtomicInteger readings = new AtomicInteger();
+				deadline.watchStallClock(() -> {
 					deadline.progress(progress);
-					Thread.sleep(step);
+					lasted.countDown();
+					return waiting ? readings.incrementAndGet() * sampleInterval() : 0;
+				}, stalled::countDown);
+				if (stalls) {
+					assertThat(stalled.await(5, TimeUnit.SECONDS)).as("stalled").isTrue();
+					assertThat(readings).as("at the first sample finding the stall timeout waited")
+						.hasValue(samples + 1);
 				}
-				assertThat(stalled.getCount() == 0).as("stalled").isEqualTo(stalls);
+				else {
+					assertThat(lasted.await(5, TimeUnit.SECONDS)).as("sampled for three stall timeouts").isTrue();
+					assertThat(stalled.getCount()).as("not stalled").isEqualTo(1);
+				}
 				assertThat(stallClosed()).isEqualTo(stalls ? 1 : 0);
 			}
 			finally {

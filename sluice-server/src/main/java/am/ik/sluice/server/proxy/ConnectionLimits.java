@@ -3,8 +3,10 @@ package am.ik.sluice.server.proxy;
 import java.net.InetAddress;
 import java.net.Socket;
 import java.time.Duration;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Delayed;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.Semaphore;
@@ -75,7 +77,8 @@ import io.micrometer.core.instrument.MeterRegistry;
  * stalling an exchange as {@code sluice.data.connections.stall.closed}, connections
  * relayed verbatim closed for relaying nothing as
  * {@code sluice.data.connections.verbatim.idle.closed}; overflow connections answered
- * {@code 503} as {@code sluice.data.connections.overflow.answered} by {@code protocol}.
+ * {@code 503} as {@code sluice.data.connections.overflow.answered} by {@code protocol},
+ * those the overflow timeout closed as {@code sluice.data.connections.overflow.expired}.
  */
 @Component
 public class ConnectionLimits implements DisposableBean {
@@ -128,6 +131,8 @@ public class ConnectionLimits implements DisposableBean {
 
 	private final Counter overflowAnsweredH2;
 
+	private final Counter overflowExpired;
+
 	private final Counter rejectedLimit;
 
 	private final Counter rejectedAddressLimit;
@@ -176,6 +181,9 @@ public class ConnectionLimits implements DisposableBean {
 		this.rejectedH2Limit = rejected(meterRegistry, "h2-limit");
 		this.overflowAnsweredH1 = overflowAnswered(meterRegistry, "h1");
 		this.overflowAnsweredH2 = overflowAnswered(meterRegistry, "h2");
+		this.overflowExpired = Counter.builder("sluice.data.connections.overflow.expired")
+			.description("Data plane connections past the connection limit closed by the overflow timeout")
+			.register(meterRegistry);
 		this.h2Declined = Counter.builder("sluice.data.connections.h2.declined")
 			.description("TLS connections offering h2 and HTTP/1.1 given HTTP/1.1, the bytes an h2 relay reserves "
 					+ "not fitting")
@@ -369,6 +377,12 @@ public class ConnectionLimits implements DisposableBean {
 		return this.deadlines.getQueue().size();
 	}
 
+	/** The time left until the deadline due first; for tests. */
+	Duration nextDeadlineIn() {
+		Delayed next = (Delayed) Objects.requireNonNull(this.deadlines.getQueue().peek(), "no deadline scheduled");
+		return Duration.ofNanos(next.getDelay(TimeUnit.NANOSECONDS));
+	}
+
 	/** The queue budget shared by the h2 demux relays. */
 	H2DemuxBudget h2Budget() {
 		return this.h2Budget;
@@ -462,6 +476,7 @@ public class ConnectionLimits implements DisposableBean {
 				return;
 			}
 			this.expired = true;
+			ConnectionLimits.this.overflowExpired.increment();
 			try {
 				socket.close();
 			}
