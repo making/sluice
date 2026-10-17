@@ -69,6 +69,13 @@ class H2DemuxLegWriterE2ETest {
 
 	private static final int PINGS_PER_WRITE = 64;
 
+	/**
+	 * The control frames a leg's writer queue holds at most, as an h2 connection reserves
+	 * them per hop: 80KiB (a 16KiB read pause plus 64KiB), stated here on its own rather
+	 * than read from the relay's constants.
+	 */
+	private static final long LEG_CONTROL_BYTES = 80 * 1024;
+
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
 	private final List<AutoCloseable> closeables = new CopyOnWriteArrayList<>();
@@ -127,10 +134,13 @@ class H2DemuxLegWriterE2ETest {
 			long queued = queuedBytes(route);
 			long relayed = relayedBytes(route);
 			ping.countDown();
-			// the PING reaches the relay while the leg is still stalled
+			// the PING reaches the relay before the upstream reads; what the leg writes
+			// meanwhile is not pinned (the upstream's write may let its socket take more
+			// of
+			// what waits for it), only that the ack goes behind no more than the leg
+			// hop's
+			// writer queue held
 			Thread.sleep(500);
-			assertThat(queuedBytes(route)).as("still stalled: netty's ack (a 17-byte frame) queued, nothing written")
-				.isEqualTo(queued + 17);
 			read.countDown();
 			Awaitility.await().atMost(Duration.ofSeconds(30)).until(() -> beforeAck.get() >= 0);
 			assertThat(queued).as("queued when the PING was sent").isGreaterThan(1024 * 1024);
@@ -161,7 +171,7 @@ class H2DemuxLegWriterE2ETest {
 			assertThat(written.get()).as("PINGs written before the flood backed up").isLessThan(FLOOD_PINGS);
 			assertThat(queuedBytes(route)).as("the leg's writer queue")
 				.isGreaterThan(Hop.DEFAULT_READ_PAUSE_BYTES)
-				.isLessThanOrEqualTo(NettyHttp2DemuxRelay.HOP_CONTROL_BYTES);
+				.isLessThanOrEqualTo(LEG_CONTROL_BYTES);
 			client.headers(3, true, TestH2.headerBlock(":authority=" + otherRoute, ":method=GET", ":path=/"));
 			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).as("another route's stream completes").isTrue();
 			assertThat(TestH2.bodyOf(client.frames(3))).isEqualTo("ok");

@@ -127,6 +127,10 @@ class H2DemuxUpstreamHeaderBlockE2ETest {
 
 	@Nullable
 	@Autowired
+	private ConnectionLimits limits;
+
+	@Nullable
+	@Autowired
 	private MeterRegistry meterRegistry;
 
 	@Nullable
@@ -384,10 +388,13 @@ class H2DemuxUpstreamHeaderBlockE2ETest {
 
 	/**
 	 * Interim heads summing exactly to the header list limit (64 of 1KiB) all reach the
-	 * client, then the final head; nothing is reset.
+	 * client, then the final head; nothing is reset. And a head within the response
+	 * blocks the relay takes unadmitted passes with the budget exhausted, though DATA
+	 * fills the client hop's writer queue (a client not reading its download): that room
+	 * counts header blocks alone.
 	 */
 	@Test
-	void interimHeadsWithinTheHeaderListLimitPass() throws Exception {
+	void headsWithinTheirLimitsPass() throws Exception {
 		String route = route("interim-fit");
 		List<List<Integer>> resetsSeen = new CopyOnWriteArrayList<>();
 		startClient(route, upstream(upstream -> serveInterims(upstream, INTERIMS_FIT, resetsSeen)));
@@ -401,6 +408,95 @@ class H2DemuxUpstreamHeaderBlockE2ETest {
 			assertThat(statuses.subList(0, INTERIMS_FIT)).containsOnly("103");
 			assertThat(client.resets()).isEmpty();
 			assertThat(resetsSeen).isEmpty();
+		}
+		headWithinTheResponseBlocksPassesBehindQueuedDataWithTheBudgetExhausted();
+	}
+
+	private void headWithinTheResponseBlocksPassesBehindQueuedDataWithTheBudgetExhausted() throws Exception {
+		String route = route("behind-data");
+		CountDownLatch answer = new CountDownLatch(1);
+		CountDownLatch pingAcked = new CountDownLatch(1);
+		List<Integer> cancelled = new CopyOnWriteArrayList<>();
+		byte[] ping = "behind!!".getBytes(StandardCharsets.US_ASCII);
+		startClient(route, upstream(upstream -> {
+			upstream.settings(null);
+			TestH2.@Nullable Frame frame;
+			while ((frame = upstream.next()) != null) {
+				int streamId = frame.streamId();
+				if (frame.type() == TestH2.HEADERS && streamId == 1) {
+					Thread.ofVirtual().start(() -> {
+						try {
+							upstream.headers(1, false);
+							upstream.sendData(1, new byte[4 * 1024 * KIB], true);
+						}
+						catch (IOException | InterruptedException e) {
+							// the relay went away
+						}
+					});
+				}
+				else if (frame.type() == TestH2.HEADERS && streamId == 3) {
+					Thread.ofVirtual().start(() -> {
+						try {
+							answer.await();
+							// the head, then a PING the relay acks once it took the head
+							upstream.headers(3, true);
+							upstream.write(TestH2.PING, 0, 0, ping);
+						}
+						catch (IOException | InterruptedException e) {
+							// the relay went away
+						}
+					});
+				}
+				else if (frame.type() == TestH2.PING && (frame.flags() & TestH2.FLAG_ACK) != 0
+						&& java.util.Arrays.equals(frame.payload(), ping)) {
+					pingAcked.countDown();
+				}
+				else if (frame.type() == TestH2.RST_STREAM && TestH2.errorCode(frame) == CANCEL) {
+					cancelled.add(streamId);
+				}
+			}
+		}));
+		H2DemuxBudget budget = Objects.requireNonNull(this.limits).h2Budget();
+		long exhausting = budget.max();
+		try (Socket socket = new Socket()) {
+			socket.setReceiveBufferSize(16 * KIB);
+			socket.connect(new InetSocketAddress("127.0.0.1", dataPort));
+			ByteArrayOutputStream start = new ByteArrayOutputStream();
+			start.write(TestH2.PREFACE);
+			TestH2.writeFrame(start, TestH2.SETTINGS, 0, 0,
+					WindowedH2Upstream.setting(WindowedH2Upstream.SETTINGS_INITIAL_WINDOW_SIZE, 16 * 1024 * KIB));
+			TestH2.writeFrame(start, TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(16 * 1024 * KIB));
+			TestH2.writeFrame(start, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 1, get(route));
+			TestH2.writeFrame(start, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 3, get(route));
+			socket.getOutputStream().write(start.toByteArray());
+			socket.getOutputStream().flush();
+			// the client reads nothing: the download fills the client hop's writer queue
+			// and the relay holds past its allowance
+			long held = settled(this::held);
+			assertThat(held).as("held for the client not reading")
+				.isGreaterThan(NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE + Hop.DEFAULT_HIGH_WATER);
+			budget.charge(exhausting);
+			try {
+				assertThat(budget.hasRoom()).as("the budget exhausted").isFalse();
+				double resetsBefore = resets("budget");
+				answer.countDown();
+				assertThat(pingAcked.await(TIMEOUT.toSeconds(), TimeUnit.SECONDS)).as("the relay took the head")
+					.isTrue();
+				assertThat(resets("budget")).as("the head not reset for the budget").isEqualTo(resetsBefore);
+				assertThat(cancelled).isEmpty();
+			}
+			finally {
+				budget.release(exhausting);
+			}
+			TestH2.@Nullable Frame frame;
+			String status = null;
+			while (status == null && (frame = TestH2.readFrame(socket.getInputStream())) != null) {
+				assertThat(frame.type() == TestH2.RST_STREAM && frame.streamId() == 3).as("stream 3 reset").isFalse();
+				if (frame.type() == TestH2.HEADERS && frame.streamId() == 3) {
+					status = String.valueOf(decode(3, frame.payload()).status());
+				}
+			}
+			assertThat(status).as("stream 3's head").isEqualTo("200");
 		}
 	}
 
@@ -657,6 +753,10 @@ class H2DemuxUpstreamHeaderBlockE2ETest {
 
 	private static String route(String name) {
 		return name + ".header-blocks.test";
+	}
+
+	private long held() {
+		return Math.round(meters().get(H2DemuxMeters.HELD_GAUGE_NAME).gauge().value());
 	}
 
 	private long budgetUsed() {
