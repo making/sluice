@@ -41,6 +41,7 @@ import am.ik.sluice.tunnel.VirtualConnection;
 import io.micrometer.core.instrument.Counter;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.http.HttpStatusClass;
@@ -93,9 +94,9 @@ import io.netty.util.AsciiString;
  * without its request's end resets its upstream stream with {@code CANCEL}; one an early
  * response closed for the client still delivers the request's rest.
  * <p>
- * What the relay holds -- DATA and header blocks not yet written, both ways, and every
- * hop's writer queue -- and the connection window its peers hold -- what they may still
- * send -- are accounted after each action of its loop: the part of the former past
+ * What the relay holds -- DATA, header blocks and pages not yet written, and every hop's
+ * writer queue -- and the connection window its peers hold -- what they may still send --
+ * are accounted after each action of its loop: the part of the former past
  * {@link #CONNECTION_ALLOWANCE} plus the part of the latter past RFC 9113's window per
  * hop, its share, is charged to the {@link H2DemuxBudget} every relay shares. A grant
  * raising a peer's window past RFC 9113's is charged before it leaves, within the
@@ -110,15 +111,18 @@ import io.netty.util.AsciiString;
  * budget has no room for, or taking the share past {@link #BLOCK_SHARE} -- refuses its
  * new stream ({@code REFUSED_STREAM}), or resets its stream when a later block -- the
  * client's trailers, the upstream's interim (1xx) heads, final head and trailers, these
- * once what heads for the client passed the client hop's read pause
+ * once the header blocks heading for the client passed {@link #RESPONSE_BLOCK_ALLOWANCE}
  * ({@link #admitResponseBlockLocked}) -- ({@code ENHANCE_YOUR_CALM} to the client,
- * {@code CANCEL} to the upstream). A header block is admitted at its size as HPACK counts
- * it ({@link #headerBytes}), whatever it took on the wire: one referring to the peer's
- * dynamic table, a few bytes read, is admitted at about what the relay writes for it. The
- * interim heads of one response may sum to {@link #MAX_INTERIM_BYTES}: the one past it is
- * not written, the upstream's stream is reset ({@code ENHANCE_YOUR_CALM}) and the stream
- * is lost for the client (the bad-gateway page). The bounds outside the budget:
- * {@link #UNBUDGETED_BYTES} per connection, {@link #RESPONSE_QUEUE_BYTES} per leg.
+ * {@code CANCEL} to the upstream). A page the relay answers a stream with is admitted the
+ * same way: one that does not fit refuses its stream ({@code REFUSED_STREAM}), or resets
+ * it ({@code ENHANCE_YOUR_CALM}) in place of the bad-gateway page. A header block is
+ * admitted at its size as HPACK counts it ({@link #headerBytes}), whatever it took on the
+ * wire: one referring to the peer's dynamic table, a few bytes read, is admitted at about
+ * what the relay writes for it. The interim heads of one response may sum to
+ * {@link #MAX_INTERIM_BYTES}: the one past it is not written, the upstream's stream is
+ * reset ({@code ENHANCE_YOUR_CALM}) and the stream is lost for the client (the
+ * bad-gateway page). The bounds outside the budget: {@link #UNBUDGETED_BYTES} per
+ * connection, {@link #RESPONSE_QUEUE_BYTES} per leg.
  * <p>
  * An upstream's failure ends no more than it covers. netty's codec answers the upstream's
  * protocol errors itself: a stream error resets that stream towards the upstream, a
@@ -250,23 +254,34 @@ final class NettyHttp2DemuxRelay {
 
 	/**
 	 * The most of the shared budget one relay takes for a header block -- a new stream's
-	 * head, trailers, an upstream's head past the client hop's read pause --: twice its
-	 * {@link #CONNECTION_SHARE}, which a relay granting nothing passes by what its peers
-	 * still send uncharged, so a client reading slower than its upstream sends still gets
-	 * its new streams relayed. Bounds what header blocks held for a peer that does not
-	 * read take beyond the share.
+	 * head, trailers, an upstream's head past {@link #RESPONSE_BLOCK_ALLOWANCE}, a page
+	 * --: twice its {@link #CONNECTION_SHARE}, which a relay granting nothing passes by
+	 * what its peers still send uncharged, so a client reading slower than its upstream
+	 * sends still gets its new streams relayed. Bounds what header blocks held for a peer
+	 * that does not read take beyond the share.
 	 */
 	static final long BLOCK_SHARE = 2 * CONNECTION_SHARE;
 
 	/**
-	 * The most one hop's writer queue holds outside the budget: the reader pauses past
-	 * {@link Hop#DEFAULT_READ_PAUSE_BYTES} queued, by then unwritable for DATA (its high
-	 * water mark is lower), and the upstreams' header blocks for the client hop are taken
-	 * outside the budget only up to it ({@link #admitResponseBlockLocked}), so the queue
-	 * passes the read pause by what netty answers to one read of the hop's own peer at
-	 * most (acks, resets; under 32KiB in {@code HopFailureTest}), 64KiB here.
+	 * The most one hop's writer queue holds of control bytes ({@link Hop#controlBytes}:
+	 * frame headers, acks, resets, window updates), which reach it uncharged: the reader
+	 * pauses past {@link Hop#DEFAULT_READ_PAUSE_BYTES} of them, so the queue passes it by
+	 * what one read makes netty and the relay answer at most (under 32KiB in
+	 * {@code HopFailureTest}) and the relay's own frames (window updates, PINGs, a reset
+	 * per open stream), 64KiB here. The rest of a queue was charged before it got there:
+	 * DATA and header blocks move into it from what the relay holds ({@link Flow}, a
+	 * stream's head, a page), each admitted or charged as window first, but for the
+	 * response header blocks within {@link #RESPONSE_BLOCK_ALLOWANCE}.
 	 */
-	static final long HOP_QUEUE_BYTES = Hop.DEFAULT_READ_PAUSE_BYTES + 64 * 1024;
+	static final long HOP_CONTROL_BYTES = Hop.DEFAULT_READ_PAUSE_BYTES + 64 * 1024;
+
+	/**
+	 * The upstreams' header blocks the relay writes on the client hop without admitting
+	 * them ({@link #admitResponseBlockLocked}): while the blocks the client hop queues
+	 * and the responses' blocks not yet in it stay within one header list's limit, so a
+	 * response is not held back for bytes queued towards the upstreams.
+	 */
+	static final long RESPONSE_BLOCK_ALLOWANCE = MAX_HEADER_LIST_SIZE;
 
 	/**
 	 * What a peer can still make the relay hold uncharged once the relay grants it
@@ -281,19 +296,18 @@ final class NettyHttp2DemuxRelay {
 
 	/**
 	 * The most one relay queues outside the shared budget: its allowance, what the client
-	 * can still send uncharged once it is granted nothing more, and the client hop's
-	 * writer queue -- what netty answers the client and the responses written but not yet
-	 * sent. The responses' DATA reaches the queue within its writability; their header
-	 * blocks within the hop's read pause, past it only within the allowance and the
-	 * budget ({@link #admitResponseBlockLocked}).
+	 * can still send uncharged once it is granted nothing more, the control bytes of the
+	 * client hop's writer queue and the response header blocks written unadmitted.
 	 */
-	static final long UNBUDGETED_BYTES = CONNECTION_ALLOWANCE + WITHHELD_ARRIVALS + HOP_QUEUE_BYTES;
+	static final long UNBUDGETED_BYTES = CONNECTION_ALLOWANCE + WITHHELD_ARRIVALS + HOP_CONTROL_BYTES
+			+ RESPONSE_BLOCK_ALLOWANCE;
 
 	/**
 	 * The most one leg adds outside the shared budget: what its upstream can still send
-	 * uncharged once it is granted nothing more, and the leg hop's writer queue.
+	 * uncharged once it is granted nothing more, and the control bytes of the leg hop's
+	 * writer queue.
 	 */
-	static final long RESPONSE_QUEUE_BYTES = WITHHELD_ARRIVALS + HOP_QUEUE_BYTES;
+	static final long RESPONSE_QUEUE_BYTES = WITHHELD_ARRIVALS + HOP_CONTROL_BYTES;
 
 	/** How long a hop's threads may take to end once its channel closed. */
 	static final Duration HOP_DONE_TIMEOUT = Duration.ofSeconds(30);
@@ -400,6 +414,12 @@ final class NettyHttp2DemuxRelay {
 
 	/** The bytes the relay queued at the last review; with the loop's lock. */
 	private long queued;
+
+	/**
+	 * The bytes of the pages the relay answers streams with, until netty wrote them to
+	 * the client hop's writer queue; with the loop's lock.
+	 */
+	private long pageBytes;
 
 	/** The connection window its peers held at the last review; with the loop's lock. */
 	private long credit;
@@ -643,14 +663,7 @@ final class NettyHttp2DemuxRelay {
 		int headBytes = headerBytes(headers);
 		Shortfall shortfall = admitLocked(headBytes);
 		if (shortfall != null) {
-			// safe for the client to retry; counted first, as the reset goes out at once
-			if (shortfall == Shortfall.SHARE) {
-				this.meters.refusedForShare();
-			}
-			else {
-				this.meters.refusedForBudget();
-			}
-			resetClientLocked(streamId, Http2Error.REFUSED_STREAM);
+			refuseForBudgetLocked(streamId, shortfall);
 			return;
 		}
 		Leg leg = legLocked(route, session);
@@ -782,10 +795,32 @@ final class NettyHttp2DemuxRelay {
 		return status != null && HttpStatusClass.valueOf(status) == HttpStatusClass.INFORMATIONAL;
 	}
 
-	/** Answers a refused stream with the page; with the loop's lock. */
+	/**
+	 * Refuses a new stream whose head or page does not fit ({@link #admitLocked}) with
+	 * {@code REFUSED_STREAM}: no upstream saw it, safe for the client to retry. With the
+	 * loop's lock.
+	 */
+	private void refuseForBudgetLocked(int streamId, Shortfall shortfall) {
+		// counted first, as the reset goes out at once
+		if (shortfall == Shortfall.SHARE) {
+			this.meters.refusedForShare();
+		}
+		else {
+			this.meters.refusedForBudget();
+		}
+		resetClientLocked(streamId, Http2Error.REFUSED_STREAM);
+	}
+
+	/**
+	 * Answers a refused stream with the page, or refuses it with {@code REFUSED_STREAM}
+	 * when the page does not fit; with the loop's lock.
+	 */
 	private void refuseLocked(int streamId, ConnectionHeadParser.Head.Request request, ErrorResponse.StreamPage page) {
 		this.access.request("-", request.method(), request.path(), HTTP_2);
-		answerLocked(streamId, page, false);
+		Shortfall shortfall = answerLocked(streamId, page, false);
+		if (shortfall != null) {
+			refuseForBudgetLocked(streamId, shortfall);
+		}
 	}
 
 	/**
@@ -797,30 +832,50 @@ final class NettyHttp2DemuxRelay {
 			boolean endStream) {
 		this.meters.misdirectedForHttp1();
 		this.access.misdirected(route.routeTag(), request);
-		answerLocked(streamId, new ErrorResponse.StreamPage(this.errorResponse.misdirectedHeaders(), new byte[0]),
-				!endStream);
+		Shortfall shortfall = answerLocked(streamId,
+				new ErrorResponse.StreamPage(this.errorResponse.misdirectedHeaders(), new byte[0]), !endStream);
+		if (shortfall != null) {
+			refuseForBudgetLocked(streamId, shortfall);
+		}
 	}
 
 	/**
 	 * Answers the client's stream with the page, its body through the flow controller --
 	 * held to the client's windows; with {@code endsRequest}, a request still being sent
 	 * is then reset with {@code NO_ERROR} once the page's end is written (RFC 9113 8.1:
-	 * no more of it is wanted). With the loop's lock.
+	 * no more of it is wanted). The page -- its head as HPACK counts it, and its body --
+	 * is admitted first ({@link #admitLocked}) and held until netty wrote it to the
+	 * client hop's writer queue ({@link #pageBytes}). What fell short, {@code null} when
+	 * answered; with the loop's lock.
 	 */
-	private void answerLocked(int streamId, ErrorResponse.StreamPage page, boolean endsRequest) {
-		Hop hop = client();
+	private @Nullable Shortfall answerLocked(int streamId, ErrorResponse.StreamPage page, boolean endsRequest) {
 		byte[] body = page.body();
-		ChannelPromise end = endsRequest ? hop.newPromise(future -> {
-			if (future.isSuccess()) {
+		int headBytes = headerBytes(page.headers());
+		Shortfall shortfall = admitLocked((long) headBytes + body.length);
+		if (shortfall != null) {
+			return shortfall;
+		}
+		this.pageBytes += (long) headBytes + body.length;
+		Hop hop = client();
+		ChannelFutureListener ended = future -> {
+			if (endsRequest && future.isSuccess()) {
 				resetRequestLocked(streamId, Http2Error.NO_ERROR.code());
 			}
-		}) : hop.ctx().newPromise();
-		hop.encoder()
-			.writeHeaders(hop.ctx(), streamId, page.headers(), 0, body.length == 0,
-					body.length == 0 ? end : hop.ctx().newPromise());
+		};
+		hop.encoder().writeHeaders(hop.ctx(), streamId, page.headers(), 0, body.length == 0, hop.newPromise(future -> {
+			this.pageBytes -= headBytes;
+			if (body.length == 0) {
+				ended.operationComplete(future);
+			}
+		}));
 		if (body.length > 0) {
-			hop.encoder().writeData(hop.ctx(), streamId, Unpooled.wrappedBuffer(body), 0, true, end);
+			hop.encoder()
+				.writeData(hop.ctx(), streamId, Unpooled.wrappedBuffer(body), 0, true, hop.newPromise(future -> {
+					this.pageBytes -= body.length;
+					ended.operationComplete(future);
+				}));
 		}
+		return null;
 	}
 
 	/**
@@ -1171,7 +1226,18 @@ final class NettyHttp2DemuxRelay {
 			resetClientLocked(exchange.id, Http2Error.REFUSED_STREAM);
 		}
 		else {
-			answerLocked(exchange.id, this.errorResponse.badGatewayPage(exchange.host, exchange.request), true);
+			Shortfall shortfall = answerLocked(exchange.id,
+					this.errorResponse.badGatewayPage(exchange.host, exchange.request), true);
+			if (shortfall != null) {
+				// counted first: the reset goes out at once
+				if (shortfall == Shortfall.SHARE) {
+					this.meters.resetForShare();
+				}
+				else {
+					this.meters.resetForBudget();
+				}
+				resetClientLocked(exchange.id, Http2Error.ENHANCE_YOUR_CALM);
+			}
 		}
 	}
 
@@ -1322,29 +1388,29 @@ final class NettyHttp2DemuxRelay {
 
 	/**
 	 * Whether an upstream's header block of {@code bytes} may be written on the client
-	 * hop: while what heads for the client -- the hop's writer queue and the header
-	 * blocks of the responses not yet in it -- stays within the hop's read pause, the
-	 * bound that queue keeps outside the budget anyway ({@link #HOP_QUEUE_BYTES}), so a
-	 * response is not held back for bytes queued the other way; past it, when
-	 * {@link #admitLocked} admits it. What fell short, {@code null} when admitted; with
-	 * the loop's lock.
+	 * hop: while the header blocks heading for the client -- those the hop queues and
+	 * those of the responses not yet in it -- stay within
+	 * {@link #RESPONSE_BLOCK_ALLOWANCE}, so a response is not held back for bytes queued
+	 * the other way; past it, when {@link #admitLocked} admits it. What fell short,
+	 * {@code null} when admitted; with the loop's lock.
 	 */
 	private @Nullable Shortfall admitResponseBlockLocked(long bytes) {
-		long towardsClient = client().queuedBytes();
+		long towardsClient = client().blockBytes();
 		for (Exchange exchange : this.exchanges.values()) {
 			towardsClient += exchange.responseFlow.blockBytes;
 		}
-		return towardsClient + bytes <= Hop.DEFAULT_READ_PAUSE_BYTES ? null : admitLocked(bytes);
+		return towardsClient + bytes <= RESPONSE_BLOCK_ALLOWANCE ? null : admitLocked(bytes);
 	}
 
 	/**
 	 * The bytes the relay holds: every leg's backlog (what it read and has not written on
-	 * the other hop yet, both ways) and every hop's writer queue. Updates the route
-	 * gauges and lets go of the legs that closed holding nothing; with the loop's lock.
+	 * the other hop yet, both ways), the pages not yet written and every hop's writer
+	 * queue. Updates the route gauges and lets go of the legs that closed holding
+	 * nothing; with the loop's lock.
 	 */
 	private long queuedLocked() {
 		Hop client = this.client;
-		long queued = client == null ? 0 : client.queuedBytes();
+		long queued = this.pageBytes + (client == null ? 0 : client.queuedBytes());
 		for (Iterator<Leg> legs = this.opened.iterator(); legs.hasNext();) {
 			Leg leg = legs.next();
 			Hop hop = leg.hop();
@@ -2240,8 +2306,8 @@ final class NettyHttp2DemuxRelay {
 		/**
 		 * A header block of the upstream -- an interim (1xx) head, the final head, the
 		 * trailers -- goes to the client once admitted
-		 * ({@link #admitResponseBlockLocked}): past the client hop's read pause, one that
-		 * does not fit ({@link #admitLocked}) resets the stream instead
+		 * ({@link #admitResponseBlockLocked}): past {@link #RESPONSE_BLOCK_ALLOWANCE},
+		 * one that does not fit ({@link #admitLocked}) resets the stream instead
 		 * ({@link #resetForBudgetLocked}). An interim head taking the response's interim
 		 * heads past {@link #MAX_INTERIM_BYTES} is not written: the upstream's stream is
 		 * reset with {@code ENHANCE_YOUR_CALM}, and the stream is lost for the client

@@ -149,14 +149,16 @@ final class H2DemuxMeters {
 			.register(registry);
 	}
 
-	/** A stream refused: its head did not fit the queue budget. */
+	/**
+	 * A stream refused: its head, or the page answering it, did not fit the queue budget.
+	 */
 	void refusedForBudget() {
 		this.refusedBudget.increment();
 	}
 
 	/**
-	 * A stream refused: its head took its connection's share of the queue budget past
-	 * what header blocks may take.
+	 * A stream refused: its head, or the page answering it, took its connection's share
+	 * of the queue budget past what header blocks may take.
 	 */
 	void refusedForShare() {
 		this.refusedShare.increment();
@@ -186,14 +188,17 @@ final class H2DemuxMeters {
 		this.refusedWaitTimeout.increment();
 	}
 
-	/** A stream reset: a header block of it did not fit the queue budget. */
+	/**
+	 * A stream reset: a header block of it, or the bad-gateway page answering it, did not
+	 * fit the queue budget.
+	 */
 	void resetForBudget() {
 		this.resetBudget.increment();
 	}
 
 	/**
-	 * A stream reset: a header block of it took its connection's share of the queue
-	 * budget past what header blocks may take.
+	 * A stream reset: a header block of it, or the bad-gateway page answering it, took
+	 * its connection's share of the queue budget past what header blocks may take.
 	 */
 	void resetForShare() {
 		this.resetShare.increment();

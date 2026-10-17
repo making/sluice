@@ -17,6 +17,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 
 import ch.qos.logback.classic.Level;
@@ -65,15 +66,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * The header blocks an upstream sends -- interim (1xx) heads, final heads, trailers --
  * are bounded like the client's. Each is admitted before the relay writes it on the
- * client hop: past the hop's read pause and the connection's allowance with the budget
- * exhausted it resets its stream ({@code ENHANCE_YOUR_CALM} to the client, {@code CANCEL}
- * to the upstream), so a client that does not read holds the relay to its bounds however
- * much the upstream sends, and however little: a block referring to the upstream's
- * dynamic table costs a few bytes on the tunnel and 60KiB on the client hop. The interim
- * heads of one response are capped at the header list limit: past it the upstream's
- * stream is reset ({@code ENHANCE_YOUR_CALM}) and the client gets the bad-gateway page.
- * The client's table-referencing request heads, read at once, are admitted only as far as
- * they fit.
+ * client hop: past the response blocks taken unadmitted and the connection's allowance
+ * with the budget exhausted it resets its stream ({@code ENHANCE_YOUR_CALM} to the
+ * client, {@code CANCEL} to the upstream), so a client that does not read holds the relay
+ * to its bounds however much the upstream sends, and however little: a block referring to
+ * the upstream's dynamic table costs a few bytes on the tunnel and 60KiB on the client
+ * hop. The interim heads of one response are capped at the header list limit: past it the
+ * upstream's stream is reset ({@code ENHANCE_YOUR_CALM}) and the client gets the
+ * bad-gateway page. The client's table-referencing request heads, read at once, are
+ * admitted only as far as they fit.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -180,10 +181,11 @@ class H2DemuxUpstreamHeaderBlockE2ETest {
 	 * with a header block of the kind referring to its dynamic table: about 20 bytes on
 	 * the tunnel, 60KiB as the relay writes it -- 2.9MiB in all, without the bound held
 	 * (and charged) in the client hop's writer queue but for what the sockets buffer. The
-	 * relay admits blocks while they fit the client hop's read pause, then its allowance
-	 * and the budget, and resets the rest's streams, so what it charges stays within the
-	 * budget (nothing else is held here). Once the client reads, each stream has its
-	 * block, intact, or the reset, and the connection goes on.
+	 * relay admits blocks while they fit the response blocks it takes unadmitted
+	 * ({@link NettyHttp2DemuxRelay#RESPONSE_BLOCK_ALLOWANCE}), then its allowance and the
+	 * budget, and resets the rest's streams, so what it charges stays within the budget
+	 * (nothing else is held here). Once the client reads, each stream has its block,
+	 * intact, or the reset, and the connection goes on.
 	 */
 	@ParameterizedTest
 	@EnumSource(BlockKind.class)
@@ -406,13 +408,20 @@ class H2DemuxUpstreamHeaderBlockE2ETest {
 	 * 98 request heads read at once, each referring to the client's dynamic table: a few
 	 * bytes each, 60KiB as the relay writes them to the leg -- 5.8MiB in all. The relay
 	 * admits those its allowance and the budget hold and refuses the rest
-	 * ({@code REFUSED_STREAM}); the upstream gets just the admitted ones.
+	 * ({@code REFUSED_STREAM}); the upstream gets just the admitted ones. Heads of a host
+	 * no route serves, from a client granting no stream window, are answered with the
+	 * no-route page as far as the pages, held for the window, fit, and refused past it;
+	 * the upstream going away then loses the stream it has, whose bad-gateway page does
+	 * not fit either: the stream is reset ({@code ENHANCE_YOUR_CALM}).
 	 */
-	@Test
-	void tableReferencingRequestHeadsReadAtOnceAreAdmittedAsFarAsTheyFit() throws Exception {
-		String route = route("request-amplified");
+	@ParameterizedTest
+	@EnumSource(Target.class)
+	void tableReferencingRequestHeadsReadAtOnceAreAdmittedAsFarAsTheyFit(Target target) throws Exception {
+		String route = route("request-amplified-" + target.name().toLowerCase());
 		AtomicInteger heads = new AtomicInteger();
+		AtomicReference<@Nullable WindowedH2Upstream> leg = new AtomicReference<>();
 		startClient(route, upstream(upstream -> {
+			leg.set(upstream);
 			upstream.settings(null);
 			TestH2.@Nullable Frame frame;
 			while ((frame = upstream.next()) != null) {
@@ -422,33 +431,49 @@ class H2DemuxUpstreamHeaderBlockE2ETest {
 			}
 		}));
 		double refusedBefore = refused("budget");
-		try (H2TestClient client = H2TestClient.connect(dataPort)) {
+		try (H2TestClient client = H2TestClient.connect(dataPort, 3)) {
 			client.headers(1, false, get(route));
 			Awaitility.await().atMost(TIMEOUT).until(() -> heads.get() == 1);
+			String host = target == Target.ROUTED ? route : route("unrouted");
+			if (target == Target.UNROUTED) {
+				client.frame(TestH2.SETTINGS, 0, 0,
+						WindowedH2Upstream.setting(WindowedH2Upstream.SETTINGS_INITIAL_WINDOW_SIZE, 0));
+			}
 			int streams = 98;
 			AmplifyingEncoder encoder = new AmplifyingEncoder();
 			ByteArrayOutputStream burst = new ByteArrayOutputStream();
 			for (int i = 0; i < streams; i++) {
-				byte[] block = encoder.amplified(get(route));
+				byte[] block = encoder.amplified(get(host));
 				TestH2.writeFrame(burst, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 3 + 2 * i,
 						block);
 			}
 			assertThat(burst.size()).as("one read takes the burst").isLessThan(Hop.MAX_READ_BYTES);
 			client.raw(burst.toByteArray());
 
+			// the pages' heads are the only header blocks the client gets
+			LongSupplier admittedNow = target == Target.ROUTED ? () -> heads.get() - 1 : client::headerBlocks;
 			Awaitility.await()
 				.atMost(TIMEOUT)
-				.until(() -> refused("budget") - refusedBefore + heads.get() - 1 == streams);
-			long admitted = heads.get() - 1;
-			long fit = (NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE + BUDGET) / AMPLIFIED_BYTES;
+				.until(() -> refused("budget") - refusedBefore + admittedNow.getAsLong() == streams);
+			long admitted = admittedNow.getAsLong();
+			long fit = (NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE + BUDGET)
+					/ (target == Target.ROUTED ? AMPLIFIED_BYTES : pageLength(client));
 			assertThat(admitted).as("admitted: what the allowance and the budget hold")
 				.isPositive()
 				.isLessThanOrEqualTo(fit);
+			assertThat(heads.get() - 1).as("heads the upstream got").isEqualTo(target == Target.ROUTED ? admitted : 0);
 			Awaitility.await()
 				.atMost(TIMEOUT)
 				.untilAsserted(() -> assertThat(
 						client.resets().values().stream().filter(code -> code == TestH2.REFUSED_STREAM).count())
 					.isEqualTo(streams - admitted));
+			if (target == Target.UNROUTED) {
+				double resetsBefore = resets("budget");
+				Objects.requireNonNull(leg.get()).abort();
+				assertThat(client.awaitTrue(() -> client.reset(1) != null, TIMEOUT)).as("stream 1 lost").isTrue();
+				assertThat(client.reset(1)).isEqualTo(ENHANCE_YOUR_CALM);
+				assertThat(resets("budget")).isEqualTo(resetsBefore + 1);
+			}
 			assertThat(client.closed()).isFalse();
 		}
 	}
@@ -722,6 +747,28 @@ class H2DemuxUpstreamHeaderBlockE2ETest {
 		catch (Exception e) {
 			// ignore
 		}
+	}
+
+	/** The length of the page answering stream 3, the first head the client got. */
+	private static long pageLength(H2TestClient client) {
+		TestH2.Frame head = client.frames(3)
+			.stream()
+			.filter(frame -> frame.type() == TestH2.HEADERS)
+			.findFirst()
+			.orElseThrow();
+		CharSequence length = Objects.requireNonNull(decode(3, head.payload()).get("content-length"));
+		return Long.parseLong(length.toString());
+	}
+
+	/** Where the burst's request heads go. */
+	enum Target {
+
+		/** The route: each head is admitted, then written to its leg. */
+		ROUTED,
+
+		/** A host no route serves: each is answered with the no-route page. */
+		UNROUTED
+
 	}
 
 	/** The upstream header blocks the bound is shown for. */

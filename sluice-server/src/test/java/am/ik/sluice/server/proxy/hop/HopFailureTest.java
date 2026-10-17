@@ -297,6 +297,14 @@ class HopFailureTest {
 			// the peer reads nothing: the writer blocks and the queue fills
 			awaitTrue(() -> !a.hop.writable(), () -> "queued=" + a.hop.queuedBytes());
 			long written = settled(a.hop::bytesWritten);
+			// a head queued behind the DATA: the queue by kind -- the head's block, frame
+			// headers, the rest DATA
+			a.loop
+				.run(() -> a.hop.encoder().writeHeaders(a.hop.ctx(), 3, request(), 0, true, a.hop.ctx().newPromise()));
+			assertThat(a.hop.blockBytes()).isPositive().isLessThan(1024);
+			assertThat(a.hop.controlBytes()).isPositive().isLessThan(1024);
+			assertThat(a.hop.queuedBytes() - a.hop.blockBytes() - a.hop.controlBytes())
+				.isGreaterThan(Hop.DEFAULT_HIGH_WATER);
 
 			long start = System.nanoTime();
 			a.loop.run(a.hop::abortLocked);
@@ -310,12 +318,10 @@ class HopFailureTest {
 
 	@Test
 	void aPeerSendingWithoutReadingPausesTheReader() throws Exception {
-		int readPause = 256 * 1024;
+		int readPause = Hop.DEFAULT_READ_PAUSE_BYTES;
 		Socket[] sockets = Endpoint.socketPair();
 		AtomicLong flooded = new AtomicLong();
-		try (Socket raw = sockets[1];
-				Endpoint a = Endpoint.over("a", sockets[0],
-						builder -> builder.server(true).readPauseBytes(readPause))) {
+		try (Socket raw = sockets[1]; Endpoint a = Endpoint.over("a", sockets[0], builder -> builder.server(true))) {
 			// PINGs as fast as the socket takes them, reading nothing: every one makes
 			// the hop queue an ack
 			Thread flooder = Thread.ofVirtual().start(() -> {
@@ -338,8 +344,11 @@ class HopFailureTest {
 
 			long read = settled(a.hop::bytesRead, a.hop::queuedBytes, flooded::get);
 
-			// paused past the read pause bytes, by at most one read's acks
-			assertThat(a.hop.queuedBytes()).isGreaterThan(readPause).isLessThanOrEqualTo(readPause + 32 * 1024);
+			// paused past the read pause bytes, by at most one read's acks: control
+			// bytes, all of what the queue holds
+			assertThat(a.hop.controlBytes()).isGreaterThan(readPause).isLessThanOrEqualTo(readPause + 32 * 1024);
+			assertThat(a.hop.queuedBytes()).isEqualTo(a.hop.controlBytes());
+			assertThat(a.hop.blockBytes()).isZero();
 			assertThat(read).isLessThan(4L * MIB);
 			assertThat(flooded.get()).isLessThan(64L * MIB);
 			assertThat(a.hop.open()).isTrue();

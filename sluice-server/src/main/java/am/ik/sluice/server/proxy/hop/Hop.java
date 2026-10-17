@@ -80,11 +80,15 @@ import org.jspecify.annotations.Nullable;
  * and the peer is held to the window it was granted, until the bridging code grants what
  * is owed, whole or in part ({@link #grantConnectionWindowLocked}).
  * <p>
- * <b>Reading pauses</b> while the queue holds more than the read pause bytes. What the
- * flow controller holds back is DATA only; the frames netty answers on its own (PING and
- * SETTINGS acks, resets) would otherwise grow the queue without bound towards a peer that
- * sends without reading. Netty's own limit on queued control frames counts unfinished
- * writes, and here every write finishes once copied to the queue.
+ * <b>Reading pauses</b> while the queue holds more control bytes than the read pause
+ * bytes: what is neither DATA payload nor a header block fragment ({@link FrameSplitter})
+ * -- frame headers, the frames netty answers on its own (PING and SETTINGS acks, resets),
+ * the preface. What the flow controller holds back is DATA only; the frames netty answers
+ * would otherwise grow the queue without bound towards a peer that sends without reading.
+ * Netty's own limit on queued control frames counts unfinished writes, and here every
+ * write finishes once copied to the queue. DATA, held back by writability, and header
+ * blocks, which the bridging code writes, do not pause the reader: a peer's frames are
+ * read while the queue towards it is full of DATA.
  * <p>
  * <b>Failures.</b> Exceptions reaching the end of the pipeline, exceptions of the frame
  * listener, of connection listeners added through {@link #addConnectionListener} and of
@@ -118,12 +122,11 @@ public final class Hop {
 	public static final int DEFAULT_LOW_WATER = 32 * 1024;
 
 	/**
-	 * The default queued bytes past which the reader pauses: above what DATA alone queues
-	 * (the flow controller stops at the high water mark plus one pass, under 256KiB in
-	 * {@code HopWritabilityTest}), so it takes frames netty answers on its own, or the
-	 * bridging code writes past the flow controller, to make it pause.
+	 * The default queued control bytes past which the reader pauses (see the class
+	 * comment): one read's worth, a few times what the queue holds of them while its peer
+	 * reads (frame headers, acks, window updates).
 	 */
-	public static final int DEFAULT_READ_PAUSE_BYTES = 256 * 1024;
+	public static final int DEFAULT_READ_PAUSE_BYTES = 16 * 1024;
 
 	/**
 	 * The default stream errors of the peer a server hop answers within
@@ -206,10 +209,33 @@ public final class Hop {
 	private final Condition queueChanged = this.queueLock.newCondition();
 
 	/** What the channel wrote and the writer has not written yet; with queueLock. */
-	private final ArrayDeque<byte[]> queue = new ArrayDeque<>();
+	private final ArrayDeque<Queued> queue = new ArrayDeque<>();
 
-	/** The bytes of {@link #queue}; with queueLock. */
+	/**
+	 * The bytes the channel wrote and the writer has not written yet: the queue and the
+	 * batch the writer writes; with queueLock.
+	 */
 	private long queuedBytes;
+
+	/**
+	 * The control bytes among {@link #queuedBytes} ({@link FrameSplitter}); with
+	 * queueLock.
+	 */
+	private long controlBytes;
+
+	/** The header block bytes among {@link #queuedBytes}; with queueLock. */
+	private long blockBytes;
+
+	/** Splits what the channel writes by kind; with the loop's lock. */
+	private final FrameSplitter splitter;
+
+	/** The control bytes of the arrays the writer's next piece completes; its own. */
+	private int pieceControl;
+
+	/**
+	 * The header block bytes of the arrays the writer's next piece completes; its own.
+	 */
+	private int pieceBlock;
 
 	/** The writability bit is cleared; written with queueLock (and the loop's lock). */
 	private volatile boolean unwritable;
@@ -284,6 +310,7 @@ public final class Hop {
 		this.traffic = builder.traffic;
 		// before the channel registers: the grant behind the preface passes the gate
 		this.withholding = builder.withholdConnectionWindow;
+		this.splitter = new FrameSplitter(!builder.server);
 		DefaultHttp2Connection connection = new DefaultHttp2Connection(builder.server);
 		connection.local().flowController(new GatedLocalFlowController(connection, builder.autoRefillConnectionWindow));
 		HopHandler.Builder handlerBuilder = new HopHandler.Builder();
@@ -473,6 +500,35 @@ public final class Hop {
 		}
 	}
 
+	/**
+	 * The control bytes among {@link #queuedBytes()}: neither DATA payload nor header
+	 * block fragments -- frame headers, control frames, the preface (see the class
+	 * comment).
+	 */
+	public long controlBytes() {
+		this.queueLock.lock();
+		try {
+			return this.controlBytes;
+		}
+		finally {
+			this.queueLock.unlock();
+		}
+	}
+
+	/**
+	 * The header block bytes among {@link #queuedBytes()}: the payload of HEADERS and
+	 * CONTINUATION frames.
+	 */
+	public long blockBytes() {
+		this.queueLock.lock();
+		try {
+			return this.blockBytes;
+		}
+		finally {
+			this.queueLock.unlock();
+		}
+	}
+
 	/** The bytes read from the pipe. */
 	public long bytesRead() {
 		return this.bytesRead.get();
@@ -611,14 +667,17 @@ public final class Hop {
 		if (bytes.length == 0) {
 			return;
 		}
+		FrameSplitter.Kinds kinds = this.splitter.split(bytes);
 		boolean turnUnwritable = false;
 		this.queueLock.lock();
 		try {
 			if (this.writerGone) {
 				return;
 			}
-			this.queue.addLast(bytes);
+			this.queue.addLast(new Queued(bytes, kinds));
 			this.queuedBytes += bytes.length;
+			this.controlBytes += kinds.control();
+			this.blockBytes += kinds.block();
 			if (!this.unwritable && this.queuedBytes > this.highWater) {
 				this.unwritable = true;
 				turnUnwritable = true;
@@ -757,11 +816,11 @@ public final class Hop {
 		}
 	}
 
-	/** Waits while the queue holds more than the read pause bytes. */
+	/** Waits while the queue holds more control bytes than the read pause bytes. */
 	private boolean awaitReadable() throws InterruptedException {
 		this.queueLock.lock();
 		try {
-			while (this.queuedBytes > this.readPauseBytes && !this.finishing && !this.writerGone) {
+			while (this.controlBytes > this.readPauseBytes && !this.finishing && !this.writerGone) {
 				this.queueChanged.await();
 			}
 			return true;
@@ -773,7 +832,7 @@ public final class Hop {
 
 	private void write() {
 		try {
-			List<byte[]> batch = new ArrayList<>();
+			List<Queued> batch = new ArrayList<>();
 			byte[] piece = new byte[this.writePiece];
 			while (takeBatch(batch)) {
 				boolean turnWritable = writeBatch(batch, piece);
@@ -819,6 +878,8 @@ public final class Hop {
 				this.writerGone = true;
 				this.queue.clear();
 				this.queuedBytes = 0;
+				this.controlBytes = 0;
+				this.blockBytes = 0;
 				this.queueChanged.signalAll();
 			}
 			finally {
@@ -832,16 +893,21 @@ public final class Hop {
 	/**
 	 * Writes the batch in pieces of at most the write piece bytes: small arrays coalesced
 	 * in {@code piece}, large ones written in slices. Each piece taken counts as written
-	 * and is reported as progress. Whether the channel should turn writable.
+	 * and is reported as progress; the kinds of an array count once the piece holding its
+	 * last byte was taken. Whether the channel should turn writable.
 	 */
-	private boolean writeBatch(List<byte[]> batch, byte[] piece) throws IOException {
+	private boolean writeBatch(List<Queued> batch, byte[] piece) throws IOException {
 		boolean turnWritable = false;
 		int filled = 0;
-		for (byte[] bytes : batch) {
+		for (Queued queued : batch) {
+			byte[] bytes = queued.bytes();
 			int offset = 0;
 			while (offset < bytes.length) {
 				int remaining = bytes.length - offset;
 				if (filled == 0 && remaining >= piece.length) {
+					if (remaining == piece.length) {
+						completed(queued);
+					}
 					turnWritable |= writePiece(bytes, offset, piece.length);
 					offset += piece.length;
 					continue;
@@ -850,6 +916,9 @@ public final class Hop {
 				System.arraycopy(bytes, offset, piece, filled, n);
 				filled += n;
 				offset += n;
+				if (offset == bytes.length) {
+					completed(queued);
+				}
 				if (filled == piece.length) {
 					turnWritable |= writePiece(piece, 0, filled);
 					filled = 0;
@@ -873,8 +942,14 @@ public final class Hop {
 		return turnWritable;
 	}
 
+	/** The array's last byte is in the next piece: its kinds count once it was taken. */
+	private void completed(Queued queued) {
+		this.pieceControl += queued.kinds().control();
+		this.pieceBlock += queued.kinds().block();
+	}
+
 	/** Moves the queue to the batch; {@code false} once the queue ended. */
-	private boolean takeBatch(List<byte[]> batch) throws InterruptedException {
+	private boolean takeBatch(List<Queued> batch) throws InterruptedException {
 		this.queueLock.lock();
 		try {
 			while (this.queue.isEmpty() && !this.finishing) {
@@ -889,11 +964,20 @@ public final class Hop {
 		}
 	}
 
-	/** Accounts written bytes; whether the channel should turn writable. */
+	/**
+	 * Accounts written bytes, and the kinds of the arrays they completed; whether the
+	 * channel should turn writable.
+	 */
 	private boolean written(long bytes) {
+		int control = this.pieceControl;
+		int block = this.pieceBlock;
+		this.pieceControl = 0;
+		this.pieceBlock = 0;
 		this.queueLock.lock();
 		try {
 			this.queuedBytes -= bytes;
+			this.controlBytes -= control;
+			this.blockBytes -= block;
 			this.queueChanged.signalAll();
 			return this.unwritable && this.queuedBytes <= this.lowWater;
 		}
@@ -1120,6 +1204,10 @@ public final class Hop {
 			}
 		}
 
+	}
+
+	/** Bytes the channel wrote, waiting for the writer, and their kinds. */
+	private record Queued(byte[] bytes, FrameSplitter.Kinds kinds) {
 	}
 
 	/**
@@ -1379,7 +1467,7 @@ public final class Hop {
 			return this;
 		}
 
-		/** Queued bytes past which the reader pauses. */
+		/** Queued control bytes past which the reader pauses (see the class comment). */
 		public Builder readPauseBytes(int readPauseBytes) {
 			this.readPauseBytes = readPauseBytes;
 			return this;

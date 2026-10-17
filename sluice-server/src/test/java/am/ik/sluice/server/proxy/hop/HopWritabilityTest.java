@@ -16,7 +16,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * A client that stops reading its socket stops its upstream through the client hop's
  * writability, although its HTTP/2 windows allow far more; the other leg meanwhile goes
- * on, and no thread holds the relay's lock while the client hop's writer blocks.
+ * on -- the DATA queued towards the client, past the read pause bytes, does not pause the
+ * client hop's reader --, and no thread holds the relay's lock while the client hop's
+ * writer blocks.
  */
 @Tag("netty-hop")
 @ExtendWith(LeakCheck.class)
@@ -49,7 +51,10 @@ class HopWritabilityTest {
 			// far below the 16MiB the windows allow
 			assertThat(relayed).as(fixture.describe()).isLessThan(2L * MIB);
 			assertThat(clientHop.writable()).isFalse();
-			assertThat(clientHop.queuedBytes()).as(fixture.describe()).isLessThan(256 * 1024);
+			assertThat(clientHop.queuedBytes()).as(fixture.describe())
+				.isGreaterThan(Hop.DEFAULT_READ_PAUSE_BYTES)
+				.isLessThan(256 * 1024);
+			assertThat(clientHop.controlBytes()).as("frame headers alone").isLessThan(Hop.DEFAULT_READ_PAUSE_BYTES);
 
 			// the client hop's writer blocks on the socket, holding no lock: the relay
 			// goes on, and the other leg takes a whole upload meanwhile (within the

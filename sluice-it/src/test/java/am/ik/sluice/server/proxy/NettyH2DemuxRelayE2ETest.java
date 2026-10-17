@@ -284,7 +284,7 @@ class NettyH2DemuxRelayE2ETest {
 	/**
 	 * A client announcing a 100-byte initial stream window gets no more of a no-route
 	 * page than that until it grants more, then the rest: the page goes through netty's
-	 * flow controller.
+	 * flow controller. The relay counts the page it holds as held until it is written.
 	 */
 	@Test
 	void aRelayAnsweredPageIsHeldToTheClientsStreamWindow() throws Exception {
@@ -321,6 +321,7 @@ class NettyH2DemuxRelayE2ETest {
 			}
 			assertThat(contentLength).as("the page's length").isGreaterThan(100);
 			assertThat(received).as("DATA within the stream window").isEqualTo(100);
+			assertThat(held()).as("the page's rest held").isGreaterThanOrEqualTo(contentLength - 100);
 			socket.setSoTimeout((int) TIMEOUT.toMillis());
 			TestH2.writeFrame(out, TestH2.WINDOW_UPDATE, 0, 3, TestH2.int32((int) contentLength));
 			TestH2.@Nullable Frame frame;
@@ -330,7 +331,13 @@ class NettyH2DemuxRelayE2ETest {
 				}
 			}
 			assertThat(received).as("the rest once granted").isEqualTo(contentLength);
+			Awaitility.await("the page no longer held").atMost(TIMEOUT).until(() -> held() == 0);
 		}
+	}
+
+	private long held() {
+		return Math
+			.round(Objects.requireNonNull(this.meterRegistry).get(H2DemuxMeters.HELD_GAUGE_NAME).gauge().value());
 	}
 
 	/**
@@ -764,7 +771,7 @@ class NettyH2DemuxRelayE2ETest {
 
 	/**
 	 * The client resetting a stream whose bad-gateway page waits for its window drops the
-	 * page; the connection goes on.
+	 * page, no longer held; the connection goes on.
 	 */
 	@Test
 	void aClientResettingAWaitingBadGatewayPageDropsItAndTheConnectionGoesOn() throws Exception {
@@ -774,6 +781,7 @@ class NettyH2DemuxRelayE2ETest {
 			TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS, 1, post(FAIL_HOST, "/dropped-page"));
 			TestH2.Frame head = readUntil(in, frame -> frame.streamId() == 1).getLast();
 			assertThat(TestH2.status(List.of(head))).isEqualTo("502");
+			Awaitility.await("the page held").atMost(TIMEOUT).until(() -> held() > 0);
 			TestH2.writeFrame(out, TestH2.RST_STREAM, 0, 1, TestH2.int32(CANCEL));
 			TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 3,
 					get(OK_HOST, "/after-reset"));
@@ -785,6 +793,7 @@ class NettyH2DemuxRelayE2ETest {
 				.map(frame -> frame.type() + ":" + (frame.type() == TestH2.RST_STREAM ? TestH2.errorCode(frame) : -1))
 				.toList()).as("nothing more of stream 1").isEmpty();
 			assertThat(TestH2.bodyOf(frames.stream().filter(frame -> frame.streamId() == 3).toList())).isEqualTo("ok");
+			Awaitility.await("the page no longer held").atMost(TIMEOUT).until(() -> held() == 0);
 		}
 	}
 

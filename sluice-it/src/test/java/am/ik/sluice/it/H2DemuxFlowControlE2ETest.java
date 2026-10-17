@@ -85,8 +85,12 @@ class H2DemuxFlowControlE2ETest {
 	/** The backlog rounding of a stream's buffer, less than one granule. */
 	private static final int GRANULE = 1024;
 
-	/** The most a hop's writer queue holds. */
-	private static final long NETTY_HOP_QUEUE_BYTES = 256 * 1024 + 64 * 1024;
+	/**
+	 * The most a hop's writer queue holds: DATA up to its high water mark plus one pass
+	 * of netty's flow controller (64KiB each), and its control bytes (the 16KiB read
+	 * pause plus 64KiB).
+	 */
+	private static final long NETTY_HOP_QUEUE_BYTES = 2 * 64 * 1024 + 16 * 1024 + 64 * 1024;
 
 	/**
 	 * What a connection holds before the relay withholds its windows while the budget has

@@ -641,3 +641,57 @@ other builds during the runs, so a few percent are noise. MiB/s unless noted:
   pursued.
 - The client face (uploads from a distant client) keeps 1MiB windows granted back at
   half; whether they hold back part of an upload's window was not measured.
+
+## After todo 141: a hop's writer queue split by kind, its control frames alone outside the budget
+
+### Measured (temporary instrumentation, not committed)
+
+Each hop's writer queue split as netty wrote it (DATA payload, header block fragments, the
+rest: frame headers and control frames), the largest seen per role:
+
+| run | client hop: total / non-DATA / DATA | leg hop: total / non-DATA / DATA |
+|---|---|---|
+| harness `h2credit,budget,one` at a 20ms tunnel RTT (`qmax141` rows) | 65571 / 2050 / 65535 | 64931 / 4104 / 64895 |
+| `H2DemuxWindowCreditE2ETest` | 65580 / 0 / 65535 | - |
+| `H2DemuxConnectionMemoryE2ETest` | 49239 / 0 / 49151 | - |
+| `H2DemuxFlowControlE2ETest` | 16009 / 0 / 16000 | 114751 / 3135 / 114688 |
+| `H2DemuxLegWriterE2ETest` (PING flood) | - | 261324 / 261324 / 0 |
+
+- DATA reaches a queue only while it is under its 64KiB high water mark (one pass of
+  netty's flow controller past it: 112KiB at most here), and it was charged before: it
+  moves from the relay's backlog (charged as window when granted) into the queue. Only the
+  PING flood came near the 320KiB bound (`HOP_QUEUE_BYTES`), all of it acks.
+- So the 320KiB per hop reserved a worst case of control frames that the read pause, which
+  counted DATA too, let grow to 256KiB plus one read's answers.
+- Gap found on the way: the pages the relay answers streams with (503/403/421/502) were held
+  uncharged and unaccounted in netty's flow controller for a client granting no stream
+  window (about 10KiB each, more with a long path; up to 100 streams per connection).
+
+### Change
+
+- `Hop` splits what it writes by kind (`FrameSplitter`) and pauses its reader past 16KiB of
+  control bytes (was 256KiB of anything): DATA and header blocks no longer pause it.
+- The relay takes response header blocks unadmitted only while the header blocks queued or
+  waiting for the client stay within 64KiB (was: the client queue's total within 256KiB).
+- Pages are admitted like header blocks and held as the relay holds DATA until written;
+  one that does not fit refuses its stream (`REFUSED_STREAM`), or resets it
+  (`ENHANCE_YOUR_CALM`) in place of the bad-gateway page.
+- Per hop outside the budget: 80KiB of control frames (16KiB + 64KiB), plus 64KiB of
+  response blocks on the client hop. An h2 connection reserves 711KiB (was 1127KiB), a
+  further leg 552KiB (was 792KiB); the 409MiB production heap admits 154 h2 connections
+  with one leg each (was 109).
+
+### Numbers
+
+One run each at a 20ms tunnel RTT (`results-141.jsonl`, tags base141 = `e9a9266`,
+final141), load 2.6 to 5.1, MiB/s unless noted:
+
+| | base | final |
+|---|---|---|
+| one: download h2 c1 s1 | 34.5 35.3 35.4 | 35.1 34.9 35.1 |
+| one: download h1 c1 | 33.0 31.7 31.7 | 33.5 32.0 31.1 |
+| h2credit: download h2 c1 / c8 / c32 / c100 | 34.6 / 231 / 1104 / 981 | 34.6 / 231 / 1108 / 989 |
+| h2credit: upload h2 c1 s1 | 1.6 | 1.6 |
+| h2credit: small h2 c10 s10 (req/s) | 4059 | 4083 |
+
+No difference beyond noise.

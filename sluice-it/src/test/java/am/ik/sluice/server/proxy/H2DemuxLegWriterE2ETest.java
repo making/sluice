@@ -112,8 +112,8 @@ class H2DemuxLegWriterE2ETest {
 	/**
 	 * An upstream PING sent while the relay holds more than 1MiB of request data for the
 	 * leg's streams is acknowledged ahead of that data: netty acks it as it reads it,
-	 * behind no more than what the leg hop's writer queue holds then (at most
-	 * {@link NettyHttp2DemuxRelay#HOP_QUEUE_BYTES}).
+	 * behind no more than what the leg hop's writer queue holds then (DATA within its
+	 * writability).
 	 */
 	@Test
 	void upstreamPingIsAckedAheadOfQueuedData() throws Exception {
@@ -144,9 +144,9 @@ class H2DemuxLegWriterE2ETest {
 	 * An upstream flooding PINGs without reading: netty acks each as it reads it, the
 	 * acks pile up in the leg's writer queue towards the upstream that does not read, and
 	 * past the hop's read pause the leg's reader stops reading; the flood backs up into
-	 * the upstream, and the relay holds no more than the bound of one hop's writer queue
-	 * for the leg. The leg is not ended (no answer on its stream), and the client's
-	 * connection goes on: a stream of another route completes.
+	 * the upstream, and the relay holds no more than the control bytes one hop's writer
+	 * queue holds at most for the leg. The leg is not ended (no answer on its stream),
+	 * and the client's connection goes on: a stream of another route completes.
 	 */
 	@Test
 	void upstreamPingFloodPausesItsLegsReader() throws Exception {
@@ -161,7 +161,7 @@ class H2DemuxLegWriterE2ETest {
 			assertThat(written.get()).as("PINGs written before the flood backed up").isLessThan(FLOOD_PINGS);
 			assertThat(queuedBytes(route)).as("the leg's writer queue")
 				.isGreaterThan(Hop.DEFAULT_READ_PAUSE_BYTES)
-				.isLessThanOrEqualTo(NettyHttp2DemuxRelay.HOP_QUEUE_BYTES);
+				.isLessThanOrEqualTo(NettyHttp2DemuxRelay.HOP_CONTROL_BYTES);
 			client.headers(3, true, TestH2.headerBlock(":authority=" + otherRoute, ":method=GET", ":path=/"));
 			assertThat(client.awaitEnd(3, Duration.ofSeconds(5))).as("another route's stream completes").isTrue();
 			assertThat(TestH2.bodyOf(client.frames(3))).isEqualTo("ok");
