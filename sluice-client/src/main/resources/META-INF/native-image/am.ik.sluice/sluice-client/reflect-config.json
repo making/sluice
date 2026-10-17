@@ -7,5 +7,91 @@
         "parameterTypes": []
       }
     ]
+  },
+  {
+    "name": "io.netty.channel.epoll.AbstractEpollChannel"
+  },
+  {
+    "name": "io.netty.channel.epoll.Epoll",
+    "methods": [
+      {
+        "name": "isAvailable",
+        "parameterTypes": []
+      },
+      {
+        "name": "unavailabilityCause",
+        "parameterTypes": []
+      }
+    ]
+  },
+  {
+    "name": "io.netty.channel.epoll.EpollChannelOption",
+    "allPublicFields": true
+  },
+  {
+    "name": "io.netty.channel.epoll.EpollDomainSocketChannel",
+    "methods": [
+      {
+        "name": "<init>",
+        "parameterTypes": []
+      }
+    ]
+  },
+  {
+    "name": "io.netty.channel.epoll.EpollEventLoopGroup",
+    "methods": [
+      {
+        "name": "<init>",
+        "parameterTypes": [
+          "int",
+          "java.util.concurrent.ThreadFactory"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "io.netty.channel.epoll.EpollServerSocketChannel",
+    "methods": [
+      {
+        "name": "<init>",
+        "parameterTypes": []
+      }
+    ]
+  },
+  {
+    "name": "io.netty.channel.epoll.EpollSocketChannel",
+    "methods": [
+      {
+        "name": "<init>",
+        "parameterTypes": []
+      },
+      {
+        "name": "tcpInfo",
+        "parameterTypes": [
+          "io.netty.channel.epoll.EpollTcpInfo"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "io.netty.channel.epoll.EpollTcpInfo",
+    "methods": [
+      {
+        "name": "<init>",
+        "parameterTypes": []
+      },
+      {
+        "name": "retrans",
+        "parameterTypes": []
+      },
+      {
+        "name": "rtt",
+        "parameterTypes": []
+      },
+      {
+        "name": "totalRetrans",
+        "parameterTypes": []
+      }
+    ]
   }
 ]
