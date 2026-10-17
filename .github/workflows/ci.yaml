@@ -30,6 +30,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -44,4 +48,4 @@ jobs:
         path: ~/.cache/ms-playwright
         key: playwright-${{ runner.os }}-${{ hashFiles('pom.xml') }}
     - name: Test
-      run: ./mvnw -V -B --no-transfer-progress verify
+      run: ./mvnw -V -B --no-transfer-progress -pl sluice-proto,sluice-server test -Dtest=HopStressTest -Dsurefire.failIfNoSpecifiedTests=false -Dspring-javaformat.skip=true

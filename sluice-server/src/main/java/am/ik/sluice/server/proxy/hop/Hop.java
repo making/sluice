@@ -263,6 +263,28 @@ public final class Hop {
 
 	private final AtomicLong bytesRead = new AtomicLong();
 
+	public volatile String readerAt = "start";
+
+	public final java.util.concurrent.ConcurrentLinkedDeque<String> events = new java.util.concurrent.ConcurrentLinkedDeque<>();
+
+	public void ev(String event) {
+		this.events.addLast(String.format("%.3f %s %s", System.nanoTime() / 1e6, Thread.currentThread().getName(), event));
+		while (this.events.size() > 400) {
+			this.events.pollFirst();
+		}
+	}
+
+	public String debugState() {
+		this.queueLock.lock();
+		try {
+			return "control=" + this.controlBytes + " block=" + this.blockBytes + " queueLen=" + this.queue.size()
+					+ " unwritable=" + this.unwritable + " reader=" + this.readerAt;
+		}
+		finally {
+			this.queueLock.unlock();
+		}
+	}
+
 	private final AtomicLong bytesWritten = new AtomicLong();
 
 	private final CountDownLatch readerDone = new CountDownLatch(1);
@@ -678,6 +700,8 @@ public final class Hop {
 			this.queuedBytes += bytes.length;
 			this.controlBytes += kinds.control();
 			this.blockBytes += kinds.block();
+			ev("enq " + bytes.length + " c=" + kinds.control() + " b=" + kinds.block() + " -> queued=" + this.queuedBytes
+					+ " control=" + this.controlBytes);
 			if (!this.unwritable && this.queuedBytes > this.highWater) {
 				this.unwritable = true;
 				turnUnwritable = true;
@@ -688,6 +712,7 @@ public final class Hop {
 			this.queueLock.unlock();
 		}
 		if (turnUnwritable) {
+			ev("unwritable");
 			// fires channelWritabilityChanged later, as a task of the channel
 			setQueueWritability(false);
 		}
@@ -707,6 +732,7 @@ public final class Hop {
 			this.queueLock.unlock();
 		}
 		if (turnWritable) {
+			ev("writable");
 			setQueueWritability(true);
 		}
 	}
@@ -762,7 +788,10 @@ public final class Hop {
 			InputStream in = this.in;
 			byte[] buffer = new byte[MAX_READ_BYTES];
 			while (awaitReadable()) {
+				this.readerAt = "read";
 				int n = in.read(buffer);
+				this.readerAt = "feed " + n;
+				ev("read " + n);
 				if (n < 0) {
 					eof = true;
 					break;
@@ -795,6 +824,7 @@ public final class Hop {
 				}
 			}
 			finally {
+				this.readerAt = "done eof=" + eof;
 				this.readerDone.countDown();
 			}
 		}
@@ -821,7 +851,10 @@ public final class Hop {
 		this.queueLock.lock();
 		try {
 			while (this.controlBytes > this.readPauseBytes && !this.finishing && !this.writerGone) {
+				this.readerAt = "paused control=" + this.controlBytes;
+				ev("pause control=" + this.controlBytes + " queued=" + this.queuedBytes + " block=" + this.blockBytes);
 				this.queueChanged.await();
+				ev("wake control=" + this.controlBytes + " queued=" + this.queuedBytes);
 			}
 			return true;
 		}
@@ -933,6 +966,7 @@ public final class Hop {
 
 	/** Writes one piece and accounts it; whether the channel should turn writable. */
 	private boolean writePiece(byte[] bytes, int offset, int length) throws IOException {
+		ev("w> " + length);
 		this.out.write(bytes, offset, length);
 		this.out.flush();
 		this.bytesWritten.addAndGet(length);
@@ -978,6 +1012,7 @@ public final class Hop {
 			this.queuedBytes -= bytes;
 			this.controlBytes -= control;
 			this.blockBytes -= block;
+			ev("written " + bytes + " c=" + control + " -> queued=" + this.queuedBytes + " control=" + this.controlBytes);
 			this.queueChanged.signalAll();
 			return this.unwritable && this.queuedBytes <= this.lowWater;
 		}

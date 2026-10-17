@@ -21,7 +21,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @Tag("netty-hop")
 @ExtendWith(LeakCheck.class)
-@Timeout(value = 60, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+@Timeout(value = 6000, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
 class HopStressTest {
 
 	private static final int ROUNDS = 3;
@@ -30,7 +30,7 @@ class HopStressTest {
 
 	private static final int BODY = 512 * 1024;
 
-	@Test
+	@org.junit.jupiter.api.RepeatedTest(value = 200, failureThreshold = 1)
 	void concurrentUploadsAndDownloadsOverTwoLegsArriveIntact() throws Exception {
 		try (Fixture fixture = Fixture.twoRoutes()) {
 			long seed = 1;
@@ -64,9 +64,51 @@ class HopStressTest {
 
 	private static TestClient.Response await(Fixture fixture, TestClient.Sent sent) throws Exception {
 		try {
-			return sent.response().get(20, TimeUnit.SECONDS);
+			return sent.response().get(Long.getLong("stress.timeoutMs", 20000), TimeUnit.MILLISECONDS);
 		}
 		catch (TimeoutException | ExecutionException e) {
+			try {
+				String file = System.getProperty("java.io.tmpdir") + "/151-threads-" + System.nanoTime() + ".txt";
+				java.lang.management.ManagementFactory.getPlatformMXBean(com.sun.management.HotSpotDiagnosticMXBean.class)
+					.dumpThreads(file, com.sun.management.HotSpotDiagnosticMXBean.ThreadDumpFormat.TEXT_PLAIN);
+				String dump = java.nio.file.Files.readString(java.nio.file.Path.of(file));
+				StringBuilder relevant = new StringBuilder();
+				for (String block : dump.split("\n\n")) {
+					if (block.contains("relay") || block.contains("client") || block.contains("upstream")) {
+						relevant.append(block).append("\n\n");
+					}
+				}
+				System.out.println("=== threads\n" + relevant);
+			}
+			catch (Exception dumpFailure) {
+				dumpFailure.printStackTrace(System.out);
+			}
+			try {
+				Process ss = new ProcessBuilder("sh", "-c", "ss -tnmie state established 2>&1 || netstat -an -p tcp 2>&1 | head -60")
+					.redirectErrorStream(true)
+					.start();
+				System.out.println("=== ss\n" + new String(ss.getInputStream().readAllBytes()));
+			}
+			catch (Exception ignored) {
+			}
+			System.out.println("=== describe" + fixture.describe());
+			for (Hop hop : java.util.List.of(fixture.relay.client(), fixture.client.hop())) {
+				System.out.println("=== events " + hop);
+				hop.events.forEach(System.out::println);
+			}
+			for (Hop hop : fixture.relay.hops()) {
+				if (hop != fixture.relay.client()) {
+					System.out.println("=== events " + hop);
+					java.util.List<String> evs = new java.util.ArrayList<>(hop.events);
+					evs.subList(Math.max(0, evs.size() - 60), evs.size()).forEach(System.out::println);
+				}
+			}
+			try {
+				Thread.sleep(3000);
+				System.out.println("=== describe after 3s" + fixture.describe());
+			}
+			catch (InterruptedException ignored) {
+			}
 			throw new AssertionError(
 					"stream %d got no response (%s): %s".formatted(sent.streamId(), e, fixture.describe()), e);
 		}

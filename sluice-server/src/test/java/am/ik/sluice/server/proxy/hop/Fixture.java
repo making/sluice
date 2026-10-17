@@ -95,6 +95,26 @@ final class Fixture implements AutoCloseable {
 		for (Hop hop : hops) {
 			state.append("%n%s open=%b writable=%b queued=%d read=%d written=%d".formatted(hop, hop.open(),
 					hop.writable(), hop.queuedBytes(), hop.bytesRead(), hop.bytesWritten()));
+			state.append(" ").append(hop.debugState());
+			state.append(hop.loop().call(() -> {
+				StringBuilder flow = new StringBuilder();
+				io.netty.handler.codec.http2.Http2Connection c = hop.connection();
+				flow.append("%n   conn local=%d remote=%d active=%d".formatted(
+						hop.localFlow().windowSize(c.connectionStream()),
+						hop.encoder().flowController().windowSize(c.connectionStream()), c.numActiveStreams()));
+				try {
+					c.forEachActiveStream(st -> {
+						flow.append("%n   s%d %s local=%d unconsumed=%d remote=%d".formatted(st.id(), st.state(),
+								hop.localFlow().windowSize(st), hop.localFlow().unconsumedBytes(st),
+								hop.encoder().flowController().windowSize(st)));
+						return true;
+					});
+				}
+				catch (io.netty.handler.codec.http2.Http2Exception e) {
+					throw new IllegalStateException(e);
+				}
+				return flow.toString();
+			}));
 		}
 		state.append("%nfailures=%s".formatted(failures()));
 		return state.toString();
