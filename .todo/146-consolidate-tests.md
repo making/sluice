@@ -24,3 +24,12 @@ calls `admitLocked` survives the tests (`NettyHttp2DemuxRelayShareTest` pins onl
 `share` / `atShare` / `pastBlockShare`). While merging the `H2DemuxConnectionShareE2ETest` /
 `H2DemuxBudgetE2ETest` cases, vary the conditions of one (smaller socket buffers, stalled
 upstream) so a connection's credit decides the admission and the mutation fails it.
+
+## Also: remove benchmark-type assertions
+
+Tests must not assert throughput, latency, elapsed time or relative speed (they depend on
+the machine). Find such assertions (round trips counted against wall-clock delays as in
+`TunnelTransportWindowE2ETest` / `H2DemuxWindowRoundTripE2ETest`, MiB/s or "within N ms"
+checks, throttled-upstream rate expectations) and replace each with a deterministic
+counter / protocol-state assertion (window granted, bytes in flight, grants per window), or
+delete it and keep the evidence in the `.todo/artefacts/106` harness.
