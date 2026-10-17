@@ -8,13 +8,13 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.TestInstance;
-import org.junit.jupiter.api.TestInstance.Lifecycle;
 
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
@@ -31,89 +31,45 @@ import org.jspecify.annotations.Nullable;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * When the tunnel stream ends, the client must close its relayed virtual connections: the
- * upstream socket sees EOF instead of being held open by a leaked relay.
+ * When the tunnel stream ends -- the server vanishes -- the client must close its relayed
+ * virtual connections: the upstream socket sees EOF instead of being held open by a
+ * leaked relay, whether the relay idles or waits for send credit with its queue full.
  */
-@TestInstance(Lifecycle.PER_CLASS)
 class ClientStreamEndCleanupE2ETest {
 
-	private static final String HOST = "eof.local";
+	private final CountDownLatch upstreamClosed = new CountDownLatch(1);
 
-	private int grpcPort;
+	private final List<AutoCloseable> held = new CopyOnWriteArrayList<>();
 
-	private int dataPort;
+	private final int grpcPort = TestPorts.freePort();
 
-	private int listenPort;
-
-	private int upstreamPort;
-
-	private final CountDownLatch upstreamSawEof = new CountDownLatch(1);
-
-	private @Nullable ServerSocket upstreamServer;
+	private final int listenPort = TestPorts.freePort();
 
 	private @Nullable ConfigurableApplicationContext serverContext;
 
 	private @Nullable TunnelClient client;
 
 	@AfterEach
-	void tearDown() {
+	void tearDown() throws Exception {
 		TunnelClient client = this.client;
 		if (client != null) {
-			client.stop();
-			this.client = null;
+			// a client whose relay is parked must not hold up the teardown
+			Thread.ofVirtual().start(client::stop);
 		}
-		ConfigurableApplicationContext serverContext = this.serverContext;
-		if (serverContext != null) {
-			serverContext.close();
-			this.serverContext = null;
+		if (this.serverContext != null) {
+			this.serverContext.close();
 		}
-		ServerSocket upstreamServer = this.upstreamServer;
-		if (upstreamServer != null) {
-			try {
-				upstreamServer.close();
-			}
-			catch (Exception e) {
-				// already closed
-			}
-			this.upstreamServer = null;
+		for (AutoCloseable closeable : this.held) {
+			closeable.close();
 		}
 	}
 
 	@Test
 	void upstreamSeesEofWhenServerVanishes() throws Exception {
-		startUpstream();
-		this.grpcPort = TestPorts.freePort();
-		this.dataPort = TestPorts.freePort();
-		this.listenPort = TestPorts.freePort();
-		this.serverContext = new SpringApplicationBuilder(SluiceServerApplication.class).run("--server.port=0",
-				"--spring.grpc.server.port=" + this.grpcPort, "--sluice.data-port=" + this.dataPort,
-				"--sluice.tcp-port-range=" + this.listenPort, "--sluice.token=it-token",
-				"--spring.grpc.server.shutdown.grace-period=1s",
-				// the server ends the stream at once rather than waiting out the drain
-				// for the connection held open
-				"--sluice.cluster.drain-grace=0s");
-		SluiceClientProperties properties = SluiceClientProperties.builder()
-			.serverUrl("grpc://127.0.0.1:" + this.grpcPort)
-			.upstream(Upstream.builder()
-				.host(HOST)
-				.target("tcp://127.0.0.1:" + this.upstreamPort)
-				.listenPort(this.listenPort)
-				.build())
-			.token("it-token")
-			.build();
-		TunnelClient started = TunnelClient.builder()
-			.properties(properties)
-			.taskExecutor(task -> Thread.ofVirtual().name("e2e-eof-worker").start(task))
-			.meterRegistry(new SimpleMeterRegistry())
-			.build();
-		started.start();
-		this.client = started;
-		Awaitility.await().atMost(Duration.ofSeconds(10)).until(started::isConnected);
-
+		startClient(upstream(this::echoUntilEof));
 		// relay one round trip so the end-to-end path is up, keep the peer open, then
-		// kill
-		// the server: the only remaining EOF source for the upstream is the client-side
-		// cleanup of the relayed connection
+		// kill the server: the only remaining EOF source for the upstream is the
+		// client-side cleanup of the relayed connection
 		try (Socket peer = new Socket("127.0.0.1", this.listenPort)) {
 			peer.setSoTimeout(10_000);
 			OutputStream out = peer.getOutputStream();
@@ -122,37 +78,100 @@ class ClientStreamEndCleanupE2ETest {
 			byte[] echoed = peer.getInputStream().readNBytes(5);
 			assertThat(new String(echoed, StandardCharsets.US_ASCII)).isEqualTo("hello");
 
-			this.serverContext.close();
-			this.serverContext = null;
+			stopServer();
 
-			// the client-side relay of the connection must end and close the upstream
-			// socket
-			assertThat(this.upstreamSawEof.await(5, TimeUnit.SECONDS))
+			assertThat(this.upstreamClosed.await(5, TimeUnit.SECONDS))
 				.as("upstream socket closed after the tunnel stream ended")
 				.isTrue();
 		}
 	}
 
-	/** Single-connection echo upstream; latches when the peer disappears. */
-	private void startUpstream() throws Exception {
+	/**
+	 * The client -> server direction is stalled (the public peer never reads), so the
+	 * client relay waits for send credit; the teardown must still complete and release
+	 * the upstream socket instead of leaving the relay parked.
+	 */
+	@Test
+	void clientTeardownCompletesWithFullSenderQueue() throws Exception {
+		startClient(upstream(this::flood));
+		Socket peer = new Socket("127.0.0.1", this.listenPort);
+		this.held.add(peer);
+		peer.getOutputStream().write("hello".getBytes(StandardCharsets.US_ASCII));
+		peer.getOutputStream().flush();
+		// precondition: the client relay waits for the credit the stalled server
+		// withholds
+		Awaitility.await()
+			.atMost(Duration.ofSeconds(30))
+			.alias("client relay parked in VirtualConnection.awaitCredit")
+			.until(ThreadDumps::anyThreadWaitingForCredit);
+
+		stopServer();
+
+		boolean closed = this.upstreamClosed.await(10, TimeUnit.SECONDS);
+		boolean stuck = ThreadDumps.anyThreadIn("am.ik.sluice.client.tunnel.NodeConnection", "closeConnections");
+		assertThat(stuck).as("no thread stuck in NodeConnection.closeConnections").isFalse();
+		assertThat(closed).as("upstream socket closed after the tunnel stream ended").isTrue();
+	}
+
+	/**
+	 * Starts the server and a client with a tcp route on the listen port to the upstream.
+	 */
+	private void startClient(int upstreamPort) {
+		this.serverContext = new SpringApplicationBuilder(SluiceServerApplication.class).run("--server.port=0",
+				"--spring.grpc.server.port=" + this.grpcPort, "--sluice.data-port=" + TestPorts.freePort(),
+				"--sluice.tcp-port-range=" + this.listenPort, "--sluice.token=it-token",
+				"--spring.grpc.server.shutdown.grace-period=1s",
+				// the server ends the stream at once rather than waiting out the drain
+				// for the connection held open
+				"--sluice.cluster.drain-grace=0s");
+		TunnelClient started = TunnelClient.builder()
+			.properties(SluiceClientProperties.builder()
+				.serverUrl("grpc://127.0.0.1:" + this.grpcPort)
+				.upstream(Upstream.builder()
+					.host("eof.local")
+					.target("tcp://127.0.0.1:" + upstreamPort)
+					.listenPort(this.listenPort)
+					.build())
+				.token("it-token")
+				.build())
+			.taskExecutor(task -> Thread.ofVirtual().name("e2e-eof-worker").start(task))
+			.meterRegistry(new SimpleMeterRegistry())
+			.build();
+		started.start();
+		this.client = started;
+		Awaitility.await().atMost(Duration.ofSeconds(10)).until(started::isConnected);
+	}
+
+	private void stopServer() {
+		ConfigurableApplicationContext context = this.serverContext;
+		if (context != null) {
+			context.close();
+			this.serverContext = null;
+		}
+	}
+
+	/** An upstream serving every accepted connection with {@code handler}. */
+	private int upstream(Consumer<Socket> handler) throws Exception {
 		ServerSocket server = new ServerSocket();
 		server.setReuseAddress(true);
-		server.bind(new InetSocketAddress("127.0.0.1", 0), 1);
-		this.upstreamServer = server;
-		this.upstreamPort = server.getLocalPort();
+		server.bind(new InetSocketAddress("127.0.0.1", 0), 16);
+		this.held.add(server);
 		Thread.ofVirtual().name("e2e-eof-accept").start(() -> {
 			while (!server.isClosed()) {
 				try {
 					Socket socket = server.accept();
-					Thread.ofVirtual().name("e2e-eof-conn").start(() -> echoUntilEof(socket));
+					this.held.add(socket);
+					Thread.ofVirtual().name("e2e-eof-conn").start(() -> handler.accept(socket));
 				}
 				catch (Exception e) {
 					return;
 				}
 			}
 		});
+		return server.getLocalPort();
 	}
 
+	/** Echoes until EOF; latches when the peer disappears. */
 	private void echoUntilEof(Socket socket) {
 		try (socket; InputStream in = socket.getInputStream(); OutputStream out = socket.getOutputStream()) {
 			byte[] buffer = new byte[1024];
@@ -161,10 +180,24 @@ class ClientStreamEndCleanupE2ETest {
 				out.write(buffer, 0, n);
 				out.flush();
 			}
-			this.upstreamSawEof.countDown();
 		}
 		catch (Exception e) {
-			this.upstreamSawEof.countDown();
+			// the peer went away
+		}
+		this.upstreamClosed.countDown();
+	}
+
+	/** Writes as fast as it can; latches when the write fails. */
+	private void flood(Socket socket) {
+		byte[] chunk = new byte[64 * 1024];
+		try {
+			OutputStream out = socket.getOutputStream();
+			while (true) {
+				out.write(chunk);
+			}
+		}
+		catch (Exception e) {
+			this.upstreamClosed.countDown();
 		}
 	}
 

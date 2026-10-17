@@ -1,11 +1,17 @@
 package am.ik.sluice.it;
 
 import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
+import java.io.IOException;
 import java.io.InputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Duration;
+import java.util.Base64;
 
 import com.sun.net.httpserver.HttpServer;
 import io.micrometer.core.instrument.Counter;
@@ -38,7 +44,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * End to end: the real {@link TunnelClient} connects to the running server, advertises an
  * upstream backed by a local HttpServer, and HTTP requests through the data plane must
- * round trip. The second request on the same connection verifies keep-alive reuse.
+ * round trip. The second request on the same connection verifies keep-alive reuse; a
+ * WebSocket upgrade and its frames pass through to a second upstream.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -50,7 +57,12 @@ class TunnelEndToEndTest {
 
 	private static int dataPort;
 
+	private static final String WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
 	private static HttpServer upstream;
+
+	/** A minimal RFC 6455 echo upstream. */
+	private static ServerSocket webSocketUpstream;
 
 	private @Nullable TunnelClient client;
 
@@ -66,6 +78,62 @@ class TunnelEndToEndTest {
 			}
 		});
 		upstream.start();
+		webSocketUpstream = new ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"));
+		Thread.ofVirtual().name("ws-echo-acceptor").start(() -> {
+			while (!webSocketUpstream.isClosed()) {
+				try {
+					Socket socket = webSocketUpstream.accept();
+					Thread.ofVirtual().start(() -> echoWebSocket(socket));
+				}
+				catch (IOException e) {
+					return; // closed
+				}
+			}
+		});
+	}
+
+	/** Minimal RFC 6455 echo: 101 handshake, then echo each masked frame unmasked. */
+	private static void echoWebSocket(Socket socket) {
+		try (socket) {
+			InputStream in = socket.getInputStream();
+			var out = socket.getOutputStream();
+			String head = readHead(in);
+			String key = webSocketHeader(head, "Sec-WebSocket-Key");
+			String accept = Base64.getEncoder()
+				.encodeToString(MessageDigest.getInstance("SHA-1").digest((key + WS_MAGIC).getBytes()));
+			out.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+					+ "Sec-WebSocket-Accept: " + accept + "\r\n\r\n")
+				.getBytes(StandardCharsets.US_ASCII));
+			out.flush();
+			while (true) {
+				int b0 = in.read();
+				int b1 = in.read();
+				if (b0 < 0 || b1 < 0) {
+					return;
+				}
+				int opcode = b0 & 0x0f;
+				int length = b1 & 0x7f;
+				if (length == 126) {
+					length = (in.read() << 8) | in.read();
+				}
+				byte[] mask = readFully(in, 4);
+				byte[] payload = readFully(in, length);
+				for (int i = 0; i < length; i++) {
+					payload[i] ^= mask[i % 4];
+				}
+				if (opcode == 8) { // close
+					out.write(new byte[] { (byte) 0x88, 0 });
+					out.flush();
+					return;
+				}
+				out.write(new byte[] { (byte) (0x80 | opcode), (byte) length });
+				out.write(payload);
+				out.flush();
+			}
+		}
+		catch (Exception e) {
+			// connection dropped; the echo server is best effort
+		}
 	}
 
 	@DynamicPropertySource
@@ -90,6 +158,10 @@ class TunnelEndToEndTest {
 				.host("demo.local")
 				.target("http://127.0.0.1:" + upstream.getAddress().getPort())
 				.build())
+			.upstream(Upstream.builder()
+				.host("ws.local")
+				.target("http://127.0.0.1:" + webSocketUpstream.getLocalPort())
+				.build())
 			.token("it-token")
 			.build();
 		TunnelClient started = TunnelClient.builder()
@@ -112,6 +184,14 @@ class TunnelEndToEndTest {
 		}
 		if (upstream != null) {
 			upstream.stop(0);
+		}
+		if (webSocketUpstream != null) {
+			try {
+				webSocketUpstream.close();
+			}
+			catch (IOException e) {
+				// ignore
+			}
 		}
 	}
 
@@ -174,6 +254,81 @@ class TunnelEndToEndTest {
 				assertThat(response.body).isEqualTo("hello-from-upstream");
 			}
 		}
+	}
+
+	@Test
+	void webSocketHandshakeAndEchoPassThroughTunnel() throws Exception {
+		startClient();
+		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+			socket.setSoTimeout(10_000);
+			byte[] keyBytes = new byte[16];
+			for (int i = 0; i < keyBytes.length; i++) {
+				keyBytes[i] = (byte) i;
+			}
+			String key = Base64.getEncoder().encodeToString(keyBytes);
+			socket.getOutputStream()
+				.write(("GET / HTTP/1.1\r\nHost: ws.local\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+						+ "Sec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n")
+					.getBytes(StandardCharsets.US_ASCII));
+			String handshake = readHead(socket.getInputStream());
+			assertThat(handshake).startsWith("HTTP/1.1 101");
+			assertThat(handshake).containsIgnoringCase("upgrade");
+
+			// masked text frame -> echoed unmasked
+			byte[] message = "hello-ws-through-tunnel".getBytes(StandardCharsets.UTF_8);
+			byte[] mask = { 0x11, 0x22, 0x33, 0x44 };
+			byte[] frame = new byte[6 + message.length];
+			frame[0] = (byte) 0x81;
+			frame[1] = (byte) (0x80 | message.length);
+			System.arraycopy(mask, 0, frame, 2, 4);
+			for (int i = 0; i < message.length; i++) {
+				frame[6 + i] = (byte) (message[i] ^ mask[i % 4]);
+			}
+			socket.getOutputStream().write(frame);
+			byte[] header = readFully(socket.getInputStream(), 2);
+			assertThat(header[0] & 0x0f).isEqualTo(0x1); // text frame
+			byte[] echo = readFully(socket.getInputStream(), header[1] & 0x7f);
+			assertThat(new String(echo, StandardCharsets.UTF_8)).isEqualTo("hello-ws-through-tunnel");
+		}
+	}
+
+	private static String readHead(InputStream in) throws IOException {
+		StringBuilder head = new StringBuilder();
+		while (true) {
+			int b = in.read();
+			if (b < 0) {
+				throw new EOFException();
+			}
+			head.append((char) b);
+			int length = head.length();
+			if (length >= 4 && head.charAt(length - 4) == '\r' && head.charAt(length - 3) == '\n'
+					&& head.charAt(length - 2) == '\r' && head.charAt(length - 1) == '\n') {
+				return head.toString();
+			}
+		}
+	}
+
+	private static String webSocketHeader(String head, String name) {
+		for (String line : head.split("\r\n")) {
+			int colon = line.indexOf(':');
+			if (colon > 0 && name.equalsIgnoreCase(line.substring(0, colon).trim())) {
+				return line.substring(colon + 1).trim();
+			}
+		}
+		throw new IllegalStateException("header not found: " + name);
+	}
+
+	private static byte[] readFully(InputStream in, int length) throws IOException {
+		byte[] data = new byte[length];
+		int read = 0;
+		while (read < length) {
+			int n = in.read(data, read, length - read);
+			if (n < 0) {
+				throw new EOFException();
+			}
+			read += n;
+		}
+		return data;
 	}
 
 	private Response exchange(boolean keepAlive) throws Exception {
