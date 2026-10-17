@@ -1,6 +1,5 @@
 package am.ik.sluice.server.proxy.hop;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
@@ -31,9 +30,8 @@ class HopStressTest {
 
 	private static final int BODY = 512 * 1024;
 
-	@org.junit.jupiter.api.RepeatedTest(value = 30, failureThreshold = 1)
+	@Test
 	void concurrentUploadsAndDownloadsOverTwoLegsArriveIntact() throws Exception {
-		long started = System.nanoTime();
 		try (Fixture fixture = Fixture.twoRoutes()) {
 			long seed = 1;
 			for (int round = 0; round < ROUNDS; round++) {
@@ -61,38 +59,16 @@ class HopStressTest {
 				}
 			}
 			assertThat(fixture.failures()).isEmpty();
-			System.out.println("=== repetition took " + (System.nanoTime() - started) / 1_000_000 + "ms");
 		}
-		System.out.println("=== closed after " + (System.nanoTime() - started) / 1_000_000 + "ms");
 	}
 
 	private static TestClient.Response await(Fixture fixture, TestClient.Sent sent) throws Exception {
 		try {
-			try {
-				return sent.response().get(2, TimeUnit.SECONDS);
-			}
-			catch (TimeoutException slow) {
-				System.out.println("=== slow stream " + sent.streamId() + ss() + fixture.describe());
-			}
-			return sent.response().get(18, TimeUnit.SECONDS);
+			return sent.response().get(20, TimeUnit.SECONDS);
 		}
 		catch (TimeoutException | ExecutionException e) {
-			System.out.println("=== stalled" + ss());
 			throw new AssertionError(
 					"stream %d got no response (%s): %s".formatted(sent.streamId(), e, fixture.describe()), e);
-		}
-	}
-
-	/** Temporary: the kernel's view of the loopback sockets. */
-	private static String ss() {
-		try {
-			Process ss = new ProcessBuilder("sh", "-c", "ss -tnmie state established 2>&1 | grep -A1 127.0.0.1")
-				.redirectErrorStream(true)
-				.start();
-			return "\n" + new String(ss.getInputStream().readAllBytes());
-		}
-		catch (IOException e) {
-			return e.toString();
 		}
 	}
 
