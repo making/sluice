@@ -26,3 +26,28 @@ not captured yet.
 
 - The native client runs the scenarios in step 4 without exceptions.
 - The cause is recorded in the commit.
+
+## Not reproduced locally (2026-10-17, at 40db6f6)
+
+The native client (`-Pnative`, GraalVM 25.0.3, macOS aarch64) ran every scenario below
+without an exception; so did the published arm64 images `sluice-client:native` (800d093)
+and `native_12f5a3c…` (the image current when this was reported) in Docker, also with
+`-m 128m`. Server: JVM, and the native server for the plaintext runs.
+
+- connect + advertise, h1.1 and h2 (prior knowledge) through `sluice-example-upstream`
+- reconnect after a server restart; start with the server down, then up
+- `grpcs://` with `insecure`, with a `tls-bundle` truststore, with mTLS (keystore +
+  `client-auth=REQUIRE`), with the default trust path (`-Djavax.net.ssl.trustStore`);
+  RSA and EC P-384 server certificates
+- configuration from env vars only (`SLUICE_*`), structured logging (`ecs`)
+- two-node cluster (`sluice.cluster.nodes`): the second stream via membership, both nodes
+  restarted
+- 50MiB downloads and uploads over one keep-alive connection with idle gaps (window growth
+  and reclaim), an `https://` upstream, a tcp `listen-port` route, TLS passthrough
+- `/actuator/health`, `/actuator/prometheus`, SIGTERM shutdown
+
+The amd64 image cannot run here (Rosetta lacks AVX/AVX2, which `-march` of the CI build
+requires), so a Linux amd64 host remains untested.
+
+Needed to go on: the stack trace, the exact command / env (image tag or build commit,
+`sluice.*` settings, server URL scheme), and the host (OS / arch).
