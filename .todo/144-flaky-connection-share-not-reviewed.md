@@ -12,5 +12,5 @@ value captured before.
 - Dump the timeline of the failing run (budget meter, per-connection queued and charged
   credit, when the other connection's release lands) before probing.
 - Decide whether the assertion races a release still in flight (test bug) or the budget
-  really keeps bytes it should have returned (production bug). Fix accordingly; if the
-  test is redundant with other coverage it may be removed.
+  really keeps bytes it should have returned (production bug). Fix accordingly; prefer
+  removing the test if other tests already cover its behavior.

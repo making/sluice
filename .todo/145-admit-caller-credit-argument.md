@@ -11,7 +11,8 @@ first).
 
 ## Work
 
-- Pin the call site: a test, at whatever level reaches it (a relay-level unit test with an
-  embedded channel, or an E2E with smaller socket buffers / a stalled upstream), where a
-  connection's credit makes the admission decision. It must fail with the credit argument
-  replaced by 0.
+- Pin the call site by changing the conditions of an existing test (e.g. one of the
+  `H2DemuxConnectionShareE2ETest` / `H2DemuxBudgetE2ETest` cases, with smaller socket buffers or
+  a stalled upstream) so that a connection's credit makes the admission decision. It must
+  fail with the credit argument replaced by 0. Add a new test only if no existing one can
+  reach it; if the cost outweighs the gap, close this item as cancelled with the reason.
