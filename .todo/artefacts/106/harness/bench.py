@@ -592,6 +592,27 @@ def suite_tl(results, tag):
                  results)
 
 
+def suite_one(results, tag):
+    """One h1 and one h2 download at the tunnel RTT, three times each (run with --delay;
+    todo 140: one h2 stream against one h1 connection)."""
+    big = f'/bytes?n={64 * MiB}'
+    for i in range(3):
+        run_load(f'{tag}one download h1 c1 #{i}', lg('h1', 1, 1, big, dur=8), results)
+        run_load(f'{tag}one download h2 c1 s1 #{i}', lg('h2', 1, 1, big, dur=8), results)
+
+
+def suite_ovh(results, tag):
+    """Loopback (no delay): what more frequent grants would cost (todo 140)."""
+    big = f'/bytes?n={256 * MiB}'
+    run_load(f'{tag}ovh download h2 c1 s1', lg('h2', 1, 1, big, dur=8), results)
+    run_load(f'{tag}ovh download h2 c10 s1', lg('h2', 10, 1, big, dur=8), results)
+    run_load(f'{tag}ovh download h1 c1', lg('h1', 1, 1, big, dur=8), results)
+    run_load(f'{tag}ovh upload h2 c1 s1', lg('h2', 1, 1, '/sink', dur=8, extra=('--upload', str(64 * MiB))), results)
+    run_load(f'{tag}ovh small h2 c10 s10', lg('h2', 10, 10, '/small', dur=8), results)
+    run_load(f'{tag}ovh small h2 c50 s100', lg('h2', 50, 100, '/small', dur=8), results)
+    run_load(f'{tag}ovh small h1 c10', lg('h1', 10, 1, '/small', dur=8), results)
+
+
 def histo_kb(pid, label):
     """Live heap from one class histogram (a full GC and the count in one safepoint), KiB;
     the top classes go to out/histo-<label>.txt."""

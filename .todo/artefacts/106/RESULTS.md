@@ -554,3 +554,90 @@ after-1..4): c1 20.2 to 20.8 in both; the many-connection rows were bimodal by s
 found (base 22 to 61 MiB/s at c32, after 22 to 26 in all four of its stacks). Whether the
 change made the slow mode likelier there was not determined; with 138's fixed transport window
 the two builds match as above.
+
+## After todo 140: one h2 stream moves the tunnel window per round trip
+
+### Cause (timeline)
+
+One h2 download at a 20ms tunnel RTT on origin/main (`59575ee`), 22.2 MiB/s, traced with
+temporary instrumentation (not committed): the server's virtual connection of the leg
+(arrivals, reads, grants, `blocked`), the leg hop's frames (netty `Http2FrameLogger`), the
+leg's connection credit and stream window per DATA frame, and the client's writer
+(credit received, waits). Every round carried exactly 32 DATA frames, 524288 bytes of
+payload. One steady round (ms, server S, client K):
+
+```
+953155.473 S vc  ARRIVE 576               first bytes of the burst
+953155.512 S vc  GRANT +524576            pending crossed 524288, half the 1MiB window
+953155.634 S leg CONNGRANT +524288        connection credit 524288 of the 1MiB target
+953155.7-959.2   31 more DATA frames
+953159.238 S vc  READER-WAIT pending=524000 window=1048576     288 bytes short of half
+953159.896 S leg WINDOW_UPDATE stream +524288
+953166.631 K vc  GRANT-RECV +524576 sendCredit=524576
+953170.845 K vc  WRITER-BLOCKED           credit spent, `blocked` sent
+953178.008 S vc  GRANT +524576            ... at the next burst's first bytes
+```
+
+The leg's virtual connection grants back at every half window its reader took. A burst
+of 32 DATA frames is 524576 bytes on the tunnel (9-byte frame headers); the grant crossing
+the half window goes out with the first bytes of a burst, the rest of the burst (524000)
+leaves the reader 288 bytes short of the next half, so that grant waits a round trip for
+the next burst: the client's writer gets 524576 per round trip, half the window, the
+transport's stuck state of todo 138 on a smaller window. The leg's own windows sit in the
+same state (the connection refill at the burst's first frame, the stream window granted
+at its end), so granting the virtual connection's rest at once was not enough: with that
+alone the leg's windows bound (rounds of 512KiB to 1MiB, 25 to 27 MiB/s), and the virtual
+connection, its writer no longer blocked, halved its unused window. With 1MiB windows
+granted back at every half, an upstream sending in bursts can find half of each held back
+for a round trip.
+
+### Change
+
+- `VirtualConnection`: once the writer said it was blocked and the reader emptied the
+  buffer, what the reader took since its latest grant goes back if it is a quarter of the
+  window (`VirtualConnectionTest.windowedReaderGrantsOnceHalfTheWindowIsConsumed`). The
+  quarter keeps small grants away: granting any rest at an empty buffer (an earlier cut)
+  cost a loopback h2 c10 download 1199 -> 268 MiB/s and an h1 download 1642 -> 1295 MiB/s
+  (writer and reader trading small grants). A 1ms wait for the burst's end instead of the
+  quarter worked as well but put a wall-clock delay into the grants.
+- The relay's windows towards an upstream are twice the tunnel window: 2MiB stream window
+  (`LEG_STREAM_WINDOW`), connection window up to 2MiB (`LEG_CONNECTION_WINDOW`), so half of
+  each held back still leaves the tunnel's full window to send and the virtual connection
+  binds the leg. A relay's share is one window each way, 1MiB + 2MiB = 3MiB (was 2MiB);
+  header blocks up to twice that. With production's 25.6MiB h2 budget about 13 upstream
+  windows grown to 2MiB fit at once (27 at 1MiB).
+- Rejected: granting the leg's windows on every consumption / arrival (one stream at
+  40.6-41.6 MiB/s, but loopback h2 c10 1203 -> 447 MiB/s, small h2 c50 s100 122k -> 35k
+  req/s).
+
+### Numbers
+
+`harness/series-140.sh` (rows in `results-140.jsonl`, tags base-1/2): base `59575ee`, two
+stacks; `final-1` is the committed build, one stack (the series' after-1/2 rows are an
+earlier cut that granted after a 1ms wait instead of at a quarter). Load 3 to 12 from
+other builds during the runs, so a few percent are noise. MiB/s unless noted:
+
+| | base | final |
+|---|---|---|
+| one: download h2 c1 s1, 20ms tunnel RTT | 22.1 22.2 22.2 / 20.5 20.7 20.7 | 37.6 37.5 37.2 |
+| one: download h1 c1 (same stacks) | 41.4 40.0 40.1 / 38.8 38.1 37.6 | 36.1 34.2 33.8 |
+| h2credit: download h2 c8 s1 | 183 / 167 | 276 |
+| h2credit: download h2 c32 s1 | 828 / 828 | 1104 |
+| h2credit: download h2 c100 s1 | 1045 / 1034 | 984 |
+| h2credit: small h2 c10 s10 (req/s) | 4386 / 4057 | 4388 |
+| ovh (loopback): download h2 c1 / c10 | 738 / 1171, 743 / 1164 | 735 / 1169 |
+| ovh: download h1 c1 | 1648 / 1628 | 1629 |
+| ovh: upload h2 c1 | 277 / 277 | 278 |
+| ovh: small h2 c10 s10, c50 s100 (req/s) | 37.8k 122.5k / 38.0k 118.3k | 37.7k 116.9k |
+
+- One h2 stream moves what one h1 connection moves (the h1 rows of the final stack ran at
+  a load of about 9). The earlier cut showed the same in two stacks: h2 39.6 to 43.1 against
+  h1 38.3 to 42.2.
+- c8 and c32 gain with the single streams (each 1MiB per round trip instead of 512KiB);
+  c100 moves 5% less: the 64MiB budget holds fewer 2MiB upstream windows, the trade the
+  budget size sets.
+- While the windows grow from 65535 bytes an h2 download still takes a few round trips more
+  than an h1 one (two windows growing on different signals take turns binding); not
+  pursued.
+- The client face (uploads from a distant client) keeps 1MiB windows granted back at
+  half; whether they hold back part of an upload's window was not measured.
