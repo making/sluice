@@ -240,7 +240,9 @@ class H2DemuxConnectionShareE2ETest {
 			assertThat(idle).as("reviews of a relay held at its share, nothing else going on")
 				.isLessThanOrEqualTo(MAX_IDLE_REVIEWS);
 			for (int cycle = 0; cycle < CYCLES; cycle++) {
-				long used = budgetUsed();
+				// the held relay's own writer queue may gain a control frame meanwhile,
+				// and its share moves with it: compare what the budget holds beyond it
+				long others = budgetUsed() - queuedBytes(heldRoute);
 				CountDownLatch release = new CountDownLatch(1);
 				otherGate.set(release);
 				try (Pump other = pump(otherRoute, 0, 2, OTHER_BODY)) {
@@ -248,7 +250,7 @@ class H2DemuxConnectionShareE2ETest {
 					Awaitility.await()
 						.atMost(TIMEOUT)
 						.untilAsserted(() -> assertThat(budgetUsed()).as("the other connection charged the budget")
-							.isGreaterThan(used));
+							.isGreaterThan(others + queuedBytes(heldRoute)));
 					release.countDown();
 				}
 				finally {
@@ -257,7 +259,9 @@ class H2DemuxConnectionShareE2ETest {
 				// closed: what it held and the window its client holds go back
 				Awaitility.await()
 					.atMost(TIMEOUT)
-					.untilAsserted(() -> assertThat(budgetUsed()).as("the other connection released").isEqualTo(used));
+					.untilAsserted(
+							() -> assertThat(budgetUsed() - queuedBytes(heldRoute)).as("the other connection released")
+								.isEqualTo(others));
 				assertThat(budget.waiting()).as("still no waiter").isZero();
 			}
 			long afterBefore = meters.reviews();
