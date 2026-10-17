@@ -61,3 +61,5 @@ shows no netty epoll artifact: find where the epoll classes come from.
 2. Reproduce that cause locally (make epoll available to the native client), fix it, and make the client survive a transport whose
    start failed (the run loop must keep reconnecting).
 3. Verify with the Docker native image against a local server.
+
+Status (2026-10-17): epoll reflection metadata for grpc-netty (EpollChannelOption fields, Epoll, EpollEventLoopGroup, Epoll channel types, EpollTcpInfo) is pushed in the client and server `reflect-config.json`; awaits the user's verification of the image. Epoll comes from the OS-activated `linux` profile of spring-grpc-core 1.1.1 (netty-transport-native-epoll `linux-x86_64`, runtime), so Linux builds of both arches ship it and only amd64 can load the library.
