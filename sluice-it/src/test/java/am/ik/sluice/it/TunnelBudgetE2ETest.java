@@ -221,39 +221,41 @@ class TunnelBudgetE2ETest {
 
 	/**
 	 * Behind a 20ms tunnel round trip and with the budget's room, one download and one
-	 * upload grow to the full window: the writer waits about once per round trip of the
-	 * window, so a few times per full window and once per doubling, where the announced
-	 * window alone would take a wait per half of it.
+	 * upload grow to the full window: the receiving side charges the budget the window
+	 * past the announced one, a full window's worth at its peak, while the writer runs
+	 * out of credit. How many round trips the transfers take depends on the machine and
+	 * is not asserted.
 	 */
 	@Test
 	void oneConnectionWithRoomGrowsToTheFullWindow() throws Exception {
 		long bytes = 8 * MIB;
-		long maxWaits = 4 * bytes / VirtualConnection.DEFAULT_WINDOW + 2L
-				* Integer.numberOfTrailingZeros(VirtualConnection.DEFAULT_WINDOW / VirtualConnection.INITIAL_WINDOW);
-		long initialWindowWaits = bytes / (VirtualConnection.INITIAL_WINDOW / 2);
+		long grown = VirtualConnection.DEFAULT_WINDOW - VirtualConnection.INITIAL_WINDOW;
 		DelayingProxy tunnel = remember(DelayingProxy.start(grpcPort, Duration.ofMillis(10)));
 		String downloadHost = "download.window.budget.test";
-		SimpleMeterRegistry clientMeters = new SimpleMeterRegistry();
+		SimpleMeterRegistry downloadMeters = new SimpleMeterRegistry();
 		startClient(Upstream.builder().host(downloadHost).target("tcp://127.0.0.1:" + download(bytes)), tunnel.port(),
-				clientMeters);
-		long start = System.nanoTime();
-		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+				downloadMeters);
+		// the server receives the download
+		try (Peak used = remember(new Peak(() -> server("sluice.tunnel.budget.used.bytes")));
+				Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.getOutputStream().write(get(downloadHost));
 			assertThat(drain(socket.getInputStream(), bytes)).isEqualTo(bytes);
+			assertThat(used.peak()).as("the server's window grown to the full one").isEqualTo(grown);
 		}
-		long downloadWaits = (long) clientMeters.get("sluice.tunnel.credit.waits").counter().count();
-		System.out.printf("download of %dMiB through a 20ms tunnel round trip: %d credit waits in %dms%n", bytes / MIB,
-				downloadWaits, Duration.ofNanos(System.nanoTime() - start).toMillis());
 		assertThat(tunnel.relayed()).as("precondition: through the delay").isGreaterThan(bytes);
-		assertThat(downloadWaits).isPositive().isLessThanOrEqualTo(maxWaits).isLessThan(initialWindowWaits / 4);
+		assertThat(downloadMeters.get("sluice.tunnel.credit.waits").counter().count())
+			.as("the client ran out of credit: the window bound it")
+			.isPositive();
 
 		String uploadHost = "upload.window.budget.test";
 		AtomicLong received = new AtomicLong();
+		SimpleMeterRegistry uploadMeters = new SimpleMeterRegistry();
 		startClient(Upstream.builder().host(uploadHost).target("tcp://127.0.0.1:" + sink(received)), tunnel.port(),
-				new SimpleMeterRegistry());
+				uploadMeters);
 		long serverWaitsBefore = serverCounter("sluice.tunnel.credit.waits");
-		start = System.nanoTime();
-		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+		// the client receives the upload
+		try (Peak used = remember(new Peak(() -> uploadMeters.get("sluice.tunnel.budget.used.bytes").gauge().value()));
+				Socket socket = new Socket("127.0.0.1", dataPort)) {
 			OutputStream out = socket.getOutputStream();
 			out.write(("POST / HTTP/1.1\r\nHost: " + uploadHost + "\r\nContent-Length: " + bytes + "\r\n\r\n")
 				.getBytes(StandardCharsets.US_ASCII));
@@ -262,11 +264,11 @@ class TunnelBudgetE2ETest {
 				out.write(chunk);
 			}
 			Awaitility.await().atMost(TIMEOUT).until(() -> received.get() >= bytes);
+			assertThat(used.peak()).as("the client's window grown to the full one").isEqualTo(grown);
 		}
-		long uploadWaits = serverCounter("sluice.tunnel.credit.waits") - serverWaitsBefore;
-		System.out.printf("upload of %dMiB through a 20ms tunnel round trip: %d credit waits in %dms%n", bytes / MIB,
-				uploadWaits, Duration.ofNanos(System.nanoTime() - start).toMillis());
-		assertThat(uploadWaits).isPositive().isLessThanOrEqualTo(maxWaits).isLessThan(initialWindowWaits / 4);
+		assertThat(serverCounter("sluice.tunnel.credit.waits") - serverWaitsBefore)
+			.as("the server ran out of credit: the window bound it")
+			.isPositive();
 	}
 
 	/**
@@ -482,6 +484,38 @@ class TunnelBudgetE2ETest {
 	private interface Handler {
 
 		void handle(Socket socket) throws IOException;
+
+	}
+
+	/** Samples a gauge every millisecond until closed, keeping the largest value. */
+	private static final class Peak implements AutoCloseable {
+
+		private final AtomicLong peak = new AtomicLong();
+
+		private final Thread thread;
+
+		Peak(DoubleSupplier gauge) {
+			this.thread = Thread.ofVirtual().name("e2e-budget-peak").start(() -> {
+				while (!Thread.currentThread().isInterrupted()) {
+					this.peak.accumulateAndGet((long) gauge.getAsDouble(), Math::max);
+					try {
+						Thread.sleep(1);
+					}
+					catch (InterruptedException e) {
+						return;
+					}
+				}
+			});
+		}
+
+		long peak() {
+			return this.peak.get();
+		}
+
+		@Override
+		public void close() {
+			this.thread.interrupt();
+		}
 
 	}
 

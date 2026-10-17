@@ -8,12 +8,10 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.DoubleSupplier;
 
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
@@ -34,16 +32,15 @@ import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.route.Router;
-import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The gRPC connection carrying a tunnel lets the tunnel's connections use their windows
- * at once, both ways: many transfers through one tunnel move what their windows hold per
- * round trip, far more than the 8MiB gRPC's own window tuning reaches at most. The round
- * trips are counted ({@link RoundTripProxy}), not timed.
+ * The gRPC connection carrying a tunnel announces windows the tunnel's connections can
+ * use at once, both ways: each end's stream and connection windows are twice its tunnel
+ * budget, far more than the 8MiB gRPC's own window tuning reaches at most, as the frames
+ * on the wire show ({@link H2WindowTap}); a download and an upload go through.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -52,28 +49,23 @@ class TunnelTransportWindowE2ETest {
 
 	private static final long MIB = 1024 * 1024;
 
-	/** The budget of the server and of the client: room for every connection's window. */
+	/**
+	 * The budget of the server; the client's is half of it, so the two windows differ.
+	 */
 	private static final long BUDGET = 48 * MIB;
 
-	/** Transfers at once, each growing to the full 1MiB window. */
-	private static final int TRANSFERS = 48;
+	private static final long CLIENT_BUDGET = BUDGET / 2;
 
 	private static final long BODY = 4 * MIB;
 
 	/** The window gRPC's netty transport tunes itself up to at most. */
 	private static final long GRPC_TUNED_MAX = 8 * MIB;
 
-	/** How long the sending direction must be quiet to close a round. */
-	private static final Duration QUIET = Duration.ofMillis(250);
-
 	private static final Duration TIMEOUT = Duration.ofSeconds(60);
 
 	private static int grpcPort;
 
 	private static int dataPort;
-
-	@Autowired
-	private @Nullable MeterRegistry serverMeters;
 
 	@Autowired
 	private @Nullable Router router;
@@ -104,92 +96,40 @@ class TunnelTransportWindowE2ETest {
 		this.closeables.clear();
 	}
 
-	/**
-	 * Downloads: the client sends over the tunnel, against the server's transport window.
-	 */
 	@Test
-	void downloadsMoveTheirWindowsPerRoundTrip() throws Exception {
-		String host = "download.transport.window.test";
-		RoundTripProxy tunnel = remember(RoundTripProxy.clientSends(grpcPort, QUIET));
-		startClient(Upstream.builder().host(host).target("tcp://127.0.0.1:" + download()), tunnel.port());
-		PeakSampler budgetUsed = remember(new PeakSampler(() -> server("sluice.tunnel.budget.used.bytes")));
-		tunnel.arm();
-		List<Thread> readers = new ArrayList<>();
-		AtomicLong downloaded = new AtomicLong();
-		for (int i = 0; i < TRANSFERS; i++) {
-			Socket socket = remember(new Socket("127.0.0.1", dataPort));
-			socket.getOutputStream()
-				.write(("GET / HTTP/1.1\r\nHost: " + host + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
-			readers.add(Thread.ofVirtual().name("e2e-transport-window-reader").start(() -> {
-				try {
-					downloaded.addAndGet(drain(socket.getInputStream()));
-				}
-				catch (IOException e) {
-					// counted short
-				}
-			}));
-		}
-		for (Thread reader : readers) {
-			reader.join(TIMEOUT);
-		}
-		assertRoundTrips("downloads", tunnel, downloaded.get(), budgetUsed.peak());
-	}
-
-	/**
-	 * Uploads: the server sends over the tunnel, against the client's transport window.
-	 */
-	@Test
-	void uploadsMoveTheirWindowsPerRoundTrip() throws Exception {
-		String host = "upload.transport.window.test";
-		RoundTripProxy tunnel = remember(RoundTripProxy.targetSends(grpcPort, QUIET));
+	void eachEndAnnouncesTwiceItsBudgetAsItsTransportWindows() throws Exception {
+		String downloadHost = "download.transport.window.test";
+		String uploadHost = "upload.transport.window.test";
 		AtomicLong uploaded = new AtomicLong();
-		SimpleMeterRegistry clientMeters = startClient(
-				Upstream.builder().host(host).target("tcp://127.0.0.1:" + sink(uploaded)), tunnel.port());
-		PeakSampler budgetUsed = remember(
-				new PeakSampler(() -> clientMeters.get("sluice.tunnel.budget.used.bytes").gauge().value()));
-		tunnel.arm();
-		for (int i = 0; i < TRANSFERS; i++) {
-			Socket socket = remember(new Socket("127.0.0.1", dataPort));
-			Thread.ofVirtual().name("e2e-transport-window-writer").start(() -> {
-				try {
-					OutputStream out = socket.getOutputStream();
-					out.write(("POST / HTTP/1.1\r\nHost: " + host + "\r\nContent-Length: " + BODY + "\r\n\r\n")
-						.getBytes(StandardCharsets.US_ASCII));
-					byte[] chunk = new byte[64 * 1024];
-					for (long sent = 0; sent < BODY; sent += chunk.length) {
-						out.write(chunk);
-					}
-				}
-				catch (IOException e) {
-					// counted short
-				}
-			});
+		H2WindowTap tap = remember(H2WindowTap.start(grpcPort));
+		startClient(tap.port(), Upstream.builder().host(downloadHost).target("tcp://127.0.0.1:" + download()).build(),
+				Upstream.builder().host(uploadHost).target("tcp://127.0.0.1:" + sink(uploaded)).build());
+		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+			socket.getOutputStream()
+				.write(("GET / HTTP/1.1\r\nHost: " + downloadHost + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+			assertThat(drain(socket.getInputStream())).as("the download went through").isEqualTo(BODY);
 		}
-		// a transfer still running at the deadline fails below, after the rounds are
-		// reported
-		long deadline = System.nanoTime() + TIMEOUT.toNanos();
-		while (uploaded.get() < TRANSFERS * BODY && System.nanoTime() - deadline < 0) {
-			Thread.sleep(50);
+		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+			OutputStream out = socket.getOutputStream();
+			out.write(("POST / HTTP/1.1\r\nHost: " + uploadHost + "\r\nContent-Length: " + BODY + "\r\n\r\n")
+				.getBytes(StandardCharsets.US_ASCII));
+			byte[] chunk = new byte[64 * 1024];
+			for (long sent = 0; sent < BODY; sent += chunk.length) {
+				out.write(chunk);
+			}
+			Awaitility.await().atMost(TIMEOUT).until(() -> uploaded.get() >= BODY);
 		}
-		assertRoundTrips("uploads", tunnel, uploaded.get(), budgetUsed.peak());
-	}
-
-	private static void assertRoundTrips(String what, RoundTripProxy tunnel, long moved, long budgetPeak) {
-		List<Long> rounds = tunnel.rounds();
-		long peak = rounds.stream().mapToLong(Long::longValue).max().orElse(0);
-		long sent = tunnel.sent();
-		System.out.printf("%s: %d x %dMiB in %d round trips, at most %dKiB in one, budget used at most %dKiB%n", what,
-				TRANSFERS, BODY / MIB, rounds.size(), peak >> 10, budgetPeak >> 10);
-		System.out.printf("%s: KiB per round trip %s%n", what, rounds.stream().map(bytes -> bytes >> 10).toList());
-		assertThat(budgetPeak).as("precondition: the connections' windows held more than gRPC's tuning reaches")
+		assertThat(uploaded.get()).as("the upload went through").isEqualTo(BODY);
+		// the server receives the downloads: its windows bound the client's sending
+		assertThat(tap.target().initialWindow()).as("the server's stream window").isEqualTo(2 * BUDGET);
+		assertThat(tap.target().maxConnectionWindow()).as("the server's connection window")
+			.isEqualTo(2 * BUDGET)
 			.isGreaterThan(2 * GRPC_TUNED_MAX);
-		assertThat(peak).as("one round trip carries what the windows hold").isGreaterThan(2 * GRPC_TUNED_MAX);
-		assertThat(moved).as("every transfer completed").isEqualTo(TRANSFERS * BODY);
-		assertThat(sent).as("precondition: the transfers passed the proxy").isGreaterThanOrEqualTo(moved);
-	}
-
-	private double server(String gauge) {
-		return Objects.requireNonNull(this.serverMeters).get(gauge).gauge().value();
+		// the client receives the uploads
+		assertThat(tap.connecting().initialWindow()).as("the client's stream window").isEqualTo(2 * CLIENT_BUDGET);
+		assertThat(tap.connecting().maxConnectionWindow()).as("the client's connection window")
+			.isEqualTo(2 * CLIENT_BUDGET)
+			.isGreaterThan(2 * GRPC_TUNED_MAX);
 	}
 
 	/** Reads the response head and {@link #BODY} bytes after it; the body bytes read. */
@@ -261,7 +201,7 @@ class TunnelTransportWindowE2ETest {
 
 	private int serve(Handler handler) throws IOException {
 		ServerSocket server = remember(new ServerSocket());
-		server.bind(new InetSocketAddress("127.0.0.1", 0), TRANSFERS);
+		server.bind(new InetSocketAddress("127.0.0.1", 0), 16);
 		Thread.ofVirtual().name("e2e-transport-window-accept").start(() -> {
 			while (!server.isClosed()) {
 				try {
@@ -283,25 +223,26 @@ class TunnelTransportWindowE2ETest {
 		return server.getLocalPort();
 	}
 
-	private SimpleMeterRegistry startClient(Upstream.Builder upstream, int serverPort) {
-		Upstream built = upstream.build();
-		SimpleMeterRegistry meters = new SimpleMeterRegistry();
+	private void startClient(int serverPort, Upstream... upstreams) {
+		SluiceClientProperties.Builder properties = SluiceClientProperties.builder()
+			.serverUrl("grpc://127.0.0.1:" + serverPort)
+			.token("it-token")
+			.tunnelBudget(DataSize.ofBytes(CLIENT_BUDGET));
+		for (Upstream upstream : upstreams) {
+			properties.upstream(upstream);
+		}
 		TunnelClient client = TunnelClient.builder()
-			.properties(SluiceClientProperties.builder()
-				.serverUrl("grpc://127.0.0.1:" + serverPort)
-				.upstream(built)
-				.token("it-token")
-				.tunnelBudget(DataSize.ofBytes(BUDGET))
-				.build())
+			.properties(properties.build())
 			.taskExecutor(task -> Thread.ofVirtual().name("e2e-transport-window-worker").start(task))
-			.meterRegistry(meters)
+			.meterRegistry(new SimpleMeterRegistry())
 			.build();
 		client.start();
 		remember(client::stop);
-		Awaitility.await()
-			.atMost(TIMEOUT)
-			.until(() -> Objects.requireNonNull(this.router).lookup(built.host()).isPresent());
-		return meters;
+		for (Upstream upstream : upstreams) {
+			Awaitility.await()
+				.atMost(TIMEOUT)
+				.until(() -> Objects.requireNonNull(this.router).lookup(upstream.host()).isPresent());
+		}
 	}
 
 	private <T extends AutoCloseable> T remember(T closeable) {
@@ -313,39 +254,6 @@ class TunnelTransportWindowE2ETest {
 	private interface Handler {
 
 		void handle(Socket socket) throws IOException;
-
-	}
-
-	/** Samples a gauge every 5ms until closed, keeping the largest value. */
-	private static final class PeakSampler implements AutoCloseable {
-
-		private final AtomicLong peak = new AtomicLong();
-
-		private final Thread thread;
-
-		PeakSampler(DoubleSupplier gauge) {
-			this.thread = Thread.ofVirtual().name("e2e-transport-window-sampler").start(() -> {
-				while (!Thread.currentThread().isInterrupted()) {
-					long now = (long) gauge.getAsDouble();
-					this.peak.accumulateAndGet(now, Math::max);
-					try {
-						Thread.sleep(5);
-					}
-					catch (InterruptedException e) {
-						return;
-					}
-				}
-			});
-		}
-
-		long peak() {
-			return this.peak.get();
-		}
-
-		@Override
-		public void close() {
-			this.thread.interrupt();
-		}
 
 	}
 

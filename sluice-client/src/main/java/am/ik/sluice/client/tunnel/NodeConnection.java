@@ -397,8 +397,10 @@ public final class NodeConnection implements AutoCloseable {
 			}
 			// the next loop iteration is the reconnection attempt
 			this.reconnects.increment();
+			long backoff = this.reconnectBackoff.next().toMillis();
+			log.info("[{}] reconnecting in {}ms", this.key, backoff);
 			try {
-				TimeUnit.MILLISECONDS.sleep(this.reconnectBackoff.next().toMillis());
+				TimeUnit.MILLISECONDS.sleep(backoff);
 			}
 			catch (InterruptedException e) {
 				Thread.currentThread().interrupt();

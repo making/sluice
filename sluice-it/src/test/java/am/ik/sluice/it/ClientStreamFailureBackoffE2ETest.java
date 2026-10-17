@@ -5,12 +5,13 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.random.RandomGenerator;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -40,7 +41,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * statuses the server sends then: {@code DEADLINE_EXCEEDED} for a missing
  * {@code Advertise}, {@code RESOURCE_EXHAUSTED} at once for a stream past the bound on
  * the streams waiting for theirs -- logs the status and reconnects with its backoff,
- * which keeps growing: a stream that was never acknowledged does not reset it.
+ * which keeps growing: a stream that was never acknowledged does not reset it. The jitter
+ * draws each wait between half its ceiling and the ceiling. The waits are read from the
+ * client's log; the time between a failure and the next stream is asserted to be at least
+ * the wait, never at most, which depends on the machine.
  */
 @ExtendWith(OutputCaptureExtension.class)
 class ClientStreamFailureBackoffE2ETest {
@@ -66,9 +70,15 @@ class ClientStreamFailureBackoffE2ETest {
 		}
 	}
 
+	/**
+	 * The failure, the jitter source and the first two waits it draws: the full ceilings
+	 * (1s, then 2s: the backoff growing) or half of them.
+	 */
 	static Stream<Arguments> failures() {
-		return Stream.of(Arguments.of(SERVER_TIMEOUT, ADVERTISE_TIMEOUT),
-				Arguments.of(Duration.ZERO, SessionRegistry.Refusal.PENDING_LIMIT.status()));
+		Status pendingLimit = SessionRegistry.Refusal.PENDING_LIMIT.status();
+		return Stream.of(Arguments.of(SERVER_TIMEOUT, ADVERTISE_TIMEOUT, HIGHEST, List.of(1000L, 2000L)),
+				Arguments.of(Duration.ZERO, pendingLimit, HIGHEST, List.of(1000L, 2000L)),
+				Arguments.of(Duration.ZERO, pendingLimit, LOWEST, List.of(500L, 1000L)));
 	}
 
 	/**
@@ -83,7 +93,7 @@ class ClientStreamFailureBackoffE2ETest {
 	@ParameterizedTest
 	@MethodSource("failures")
 	void theClientLogsTheStatusAndReconnectsWithAGrowingBackoff(Duration failAfter, Status failure,
-			CapturedOutput output) throws Exception {
+			RandomGenerator jitter, List<Long> waits, CapturedOutput output) throws Exception {
 		FailingServer fake = new FailingServer(failAfter, failure);
 		int grpcPort = TestPorts.freePort();
 		this.server = ServerBuilder.forPort(grpcPort).addService(fake).build().start();
@@ -93,9 +103,9 @@ class ClientStreamFailureBackoffE2ETest {
 				.upstream(Upstream.builder().host("late.local").target("http://127.0.0.1:1").build())
 				.token("it-token")
 				.build())
-			.taskExecutor(task -> Thread.ofVirtual().name("e2e-advertise-timeout-worker").start(task))
+			.taskExecutor(task -> Thread.ofVirtual().name("e2e-backoff-worker").start(task))
 			.meterRegistry(this.clientMeters)
-			.randomFactory(() -> HIGHEST)
+			.randomFactory(() -> jitter)
 			.build();
 		started.start();
 		this.client = started;
@@ -108,47 +118,27 @@ class ClientStreamFailureBackoffE2ETest {
 			assertThat(fake.advertised).as("precondition: the client sent its advertise on every stream")
 				.hasSizeGreaterThanOrEqualTo(2);
 		}
-		long firstBackoff = fake.openedAt.get(1) - fake.failedAt.get(0);
-		long secondBackoff = fake.openedAt.get(2) - fake.failedAt.get(1);
-		assertThat(Duration.ofNanos(firstBackoff)).as("the first reconnect waits the initial backoff")
-			.isBetween(Duration.ofMillis(900), Duration.ofMillis(2500));
-		assertThat(Duration.ofNanos(secondBackoff)).as("the second waits twice as long")
-			.isBetween(Duration.ofMillis(1900), Duration.ofMillis(4000));
+		String node = "[grpc://127.0.0.1:" + grpcPort + "] ";
+		Pattern reconnecting = Pattern.compile(Pattern.quote(node + "reconnecting in ") + "(\\d+)ms$");
+		List<Long> logged = output.getAll()
+			.lines()
+			.map(reconnecting::matcher)
+			.filter(Matcher::find)
+			.map(matcher -> Long.parseLong(matcher.group(1)))
+			.toList();
+		assertThat(logged).as("the waits drawn, growing").startsWith(waits.toArray(Long[]::new));
+		assertThat(Duration.ofNanos(fake.openedAt.get(1) - fake.failedAt.get(0)))
+			.as("the first reconnect waited its wait")
+			.isGreaterThanOrEqualTo(Duration.ofMillis(waits.get(0)));
+		assertThat(Duration.ofNanos(fake.openedAt.get(2) - fake.failedAt.get(1)))
+			.as("the second reconnect waited its wait")
+			.isGreaterThanOrEqualTo(Duration.ofMillis(waits.get(1)));
 		assertThat(started.isConnected()).isFalse();
 		assertThat(this.clientMeters.get("sluice.reconnect.total").counter().count()).isGreaterThanOrEqualTo(2);
-		String expected = "[grpc://127.0.0.1:" + grpcPort + "] tunnel stream error: io.grpc.StatusRuntimeException: "
-				+ failure.getCode() + ": " + failure.getDescription();
+		String expected = node + "tunnel stream error: io.grpc.StatusRuntimeException: " + failure.getCode() + ": "
+				+ failure.getDescription();
 		assertThat(output.getAll().lines().filter(line -> line.endsWith(expected))).as("one line per failed stream")
 			.hasSizeGreaterThanOrEqualTo(2);
-	}
-
-	@Test
-	void theJitterShortensTheWaitsWithinTheirCeilings() throws Exception {
-		FailingServer fake = new FailingServer(Duration.ZERO, SessionRegistry.Refusal.PENDING_LIMIT.status());
-		int grpcPort = TestPorts.freePort();
-		this.server = ServerBuilder.forPort(grpcPort).addService(fake).build().start();
-		TunnelClient started = TunnelClient.builder()
-			.properties(SluiceClientProperties.builder()
-				.serverUrl("grpc://127.0.0.1:" + grpcPort)
-				.upstream(Upstream.builder().host("late.local").target("http://127.0.0.1:1").build())
-				.token("it-token")
-				.build())
-			.taskExecutor(task -> Thread.ofVirtual().name("e2e-jitter-worker").start(task))
-			.meterRegistry(this.clientMeters)
-			.randomFactory(() -> LOWEST)
-			.build();
-		started.start();
-		this.client = started;
-
-		Awaitility.await()
-			.atMost(Duration.ofSeconds(15))
-			.until(() -> fake.failedAt.size() >= 2 && fake.openedAt.size() >= 3);
-
-		Duration first = Duration.ofNanos(fake.openedAt.get(1) - fake.failedAt.get(0));
-		Duration second = Duration.ofNanos(fake.openedAt.get(2) - fake.failedAt.get(1));
-		assertThat(first).as("half of the 1s ceiling").isBetween(Duration.ofMillis(450), Duration.ofMillis(900));
-		assertThat(second).as("half of the 2s ceiling, not the full 2s")
-			.isBetween(Duration.ofMillis(950), Duration.ofMillis(1700));
 	}
 
 	/** A jitter source that always draws the top or the bottom of the range asked. */

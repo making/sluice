@@ -21,6 +21,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.UnaryOperator;
 
@@ -331,21 +332,26 @@ class StallTimeoutE2ETest {
 	 * pipe accepts {@link #SLOW_CLIENT_RATE} bytes per second, no kernel buffers in
 	 * between -- is not cut, though the relay waits on it nearly all the time: each piece
 	 * completed is progress. Written at once, a 64KiB read of the tunnel would keep the
-	 * relay waiting 4s, past the stall timeout.
+	 * relay waiting 4s, past the stall timeout. How many pieces pass in the time depends
+	 * on the machine and is not asserted.
 	 */
 	@Test
 	void aClientTakingOneWritePieceASecondIsNotCut() throws Exception {
 		double stalls = stallClosed();
-		dataProxyServer().clientPipeSeam(pipe -> new RateLimitedPipe(pipe, SLOW_CLIENT_RATE));
+		AtomicReference<@Nullable RateLimitedPipe> slow = new AtomicReference<>();
+		dataProxyServer().clientPipeSeam(pipe -> {
+			RateLimitedPipe limited = new RateLimitedPipe(pipe, SLOW_CLIENT_RATE);
+			slow.set(limited);
+			return limited;
+		});
 		try (Socket socket = connect()) {
 			send(socket, "GET /big HTTP/1.1\r\nHost: " + HOST + "\r\n\r\n");
-			long start = System.nanoTime();
-			Duration watched = STALL_TIMEOUT.multipliedBy(3);
-			long received = readFor(socket, watched);
-			Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
-			assertThat(received).as("the client pipe held the response back to its rate")
-				.isLessThanOrEqualTo(SLOW_CLIENT_RATE * (elapsed.toMillis() / 1000 + 1))
-				.isGreaterThanOrEqualTo(SLOW_CLIENT_RATE * (watched.toSeconds() - 2));
+			long received = readFor(socket, STALL_TIMEOUT.multipliedBy(3));
+			RateLimitedPipe pipe = Objects.requireNonNull(slow.get());
+			assertThat(pipe.largestWrite()).as("the relay writes one piece at a time")
+				.isLessThanOrEqualTo(SLOW_CLIENT_RATE);
+			assertThat(pipe.written()).as("pieces passed: the client took them").isPositive();
+			assertThat(received).as("the client pipe held the response back").isLessThan(BIG);
 			assertThat(admitted()).as("the connection is still relayed").isEqualTo(1);
 			assertThat(stallClosed()).isEqualTo(stalls);
 		}

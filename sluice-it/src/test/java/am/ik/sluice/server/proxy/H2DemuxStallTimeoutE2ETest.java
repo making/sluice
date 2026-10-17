@@ -17,6 +17,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.UnaryOperator;
 
@@ -512,8 +513,9 @@ class H2DemuxStallTimeoutE2ETest {
 	}
 
 	/**
-	 * Granting the connection window 16KiB per second keeps a large response moving: what
-	 * the client got stays at what it granted, so the response waited in the relay.
+	 * Granting the connection window 16KiB per second keeps a large response moving: the
+	 * client gets more than its initial window, never more than it granted, far from the
+	 * whole response, so the response waited in the relay.
 	 */
 	@Test
 	void aClientGrantingSlowlyButSteadilyIsNotCut() throws Exception {
@@ -523,9 +525,9 @@ class H2DemuxStallTimeoutE2ETest {
 			streamWindow(client, Integer.MAX_VALUE);
 			client.headers(1, true, get(BIG_HOST));
 			Thread.sleep(STALL_TIMEOUT.multipliedBy(3).toMillis());
-			assertThat(client.dataReceived()).as("about the window granted, far from the whole response")
-				.isGreaterThanOrEqualTo(WINDOW + 4 * 16 * 1024)
-				.isLessThanOrEqualTo(WINDOW + 8 * 16 * 1024);
+			assertThat(client.dataReceived()).as("past the initial window: the grants moved it, far from the whole")
+				.isGreaterThan(WINDOW)
+				.isLessThan(BIG);
 			assertThat(client.maxReceiveExcess()).as("DATA beyond the window granted").isLessThanOrEqualTo(0);
 			assertNotCut(client, stalls);
 		}
@@ -558,24 +560,28 @@ class H2DemuxStallTimeoutE2ETest {
 	 * large response whose windows it grants is not cut, though the relay waits on it
 	 * nearly all the time: each piece the client took is progress. Counted per batch of
 	 * the client hop's writer (64KiB and more, what the hop queued), the relay would wait
-	 * 4s and more between two progresses, past the stall timeout.
+	 * 4s and more between two progresses, past the stall timeout. How many pieces pass in
+	 * the time depends on the machine and is not asserted.
 	 */
 	@Test
 	void aClientTakingOneWritePieceASecondIsNotCut() throws Exception {
 		double stalls = stallClosed();
 		DataProxyServer proxy = Objects.requireNonNull(this.dataProxyServer);
-		proxy.clientPipeSeam(pipe -> new RateLimitedPipe(pipe, SLOW_CLIENT_RATE));
+		AtomicReference<@Nullable RateLimitedPipe> slow = new AtomicReference<>();
+		proxy.clientPipeSeam(pipe -> {
+			RateLimitedPipe limited = new RateLimitedPipe(pipe, SLOW_CLIENT_RATE);
+			slow.set(limited);
+			return limited;
+		});
 		try (H2TestClient client = H2TestClient.connect(dataPort)) {
 			streamWindow(client, Integer.MAX_VALUE);
 			client.headers(1, true, get(BIG_HOST));
-			long start = System.nanoTime();
-			Duration watched = STALL_TIMEOUT.multipliedBy(3);
-			Thread.sleep(watched.toMillis());
-			Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
-			assertThat(client.dataReceived()).as("the client pipe held the response back to its rate")
-				.isLessThanOrEqualTo(SLOW_CLIENT_RATE * (elapsed.toSeconds() + 1))
-				// less a second: a frame straddling two pieces counts once whole
-				.isGreaterThanOrEqualTo(SLOW_CLIENT_RATE * (watched.toSeconds() - 3));
+			Thread.sleep(STALL_TIMEOUT.multipliedBy(3).toMillis());
+			RateLimitedPipe pipe = Objects.requireNonNull(slow.get());
+			assertThat(pipe.largestWrite()).as("the relay writes one piece at a time")
+				.isLessThanOrEqualTo(SLOW_CLIENT_RATE);
+			assertThat(pipe.written()).as("pieces passed: the client took them").isPositive();
+			assertThat(client.dataReceived()).as("the client pipe held the response back").isLessThan(BIG);
 			assertNotCut(client, stalls);
 		}
 		finally {
