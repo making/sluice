@@ -135,11 +135,8 @@ class H2DemuxLegWriterE2ETest {
 			long relayed = relayedBytes(route);
 			ping.countDown();
 			// the PING reaches the relay before the upstream reads; what the leg writes
-			// meanwhile is not pinned (the upstream's write may let its socket take more
-			// of
-			// what waits for it), only that the ack goes behind no more than the leg
-			// hop's
-			// writer queue held
+			// meanwhile is not pinned (the upstream's write may let its socket take
+			// more), only that the ack goes behind no more than the writer queue held
 			Thread.sleep(500);
 			read.countDown();
 			Awaitility.await().atMost(Duration.ofSeconds(30)).until(() -> beforeAck.get() >= 0);
