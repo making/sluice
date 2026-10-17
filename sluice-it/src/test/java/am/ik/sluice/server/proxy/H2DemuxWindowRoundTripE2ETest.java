@@ -52,6 +52,12 @@ class H2DemuxWindowRoundTripE2ETest {
 
 	private static final int BODY = 4 * MIB;
 
+	/**
+	 * The download: long enough that the leg's window, doubling once per sampled round
+	 * trip from RFC 9113's, reaches its largest before the body ends on a loaded machine.
+	 */
+	private static final int DOWNLOAD = 16 * MIB;
+
 	/** Each way: a 20ms round trip, far above the time to send a window on loopback. */
 	private static final Duration DELAY = Duration.ofMillis(10);
 
@@ -110,7 +116,7 @@ class H2DemuxWindowRoundTripE2ETest {
 					Thread.ofVirtual().start(() -> {
 						try {
 							peer.headers(streamId, false);
-							peer.sendData(streamId, new byte[BODY], true);
+							peer.sendData(streamId, new byte[DOWNLOAD], true);
 						}
 						catch (IOException | InterruptedException e) {
 							// the relay went away
@@ -126,10 +132,10 @@ class H2DemuxWindowRoundTripE2ETest {
 			client.headers(1, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/"));
 			assertThat(client.awaitEnd(1, TIMEOUT)).as("the response ended").isTrue();
 			WindowedH2Upstream peer = Objects.requireNonNull(seen.get());
-			assertThat(client.dataReceived(1)).isEqualTo(BODY);
+			assertThat(client.dataReceived(1)).isEqualTo(DOWNLOAD);
 			assertThat(peer.sendInitialWindow()).as("the stream window the leg announced")
 				.isEqualTo(NettyHttp2DemuxRelay.LEG_STREAM_WINDOW);
-			assertThat(tunnel.relayed()).as("the tunnel went through the delay").isGreaterThan(BODY);
+			assertThat(tunnel.relayed()).as("the tunnel went through the delay").isGreaterThan(DOWNLOAD);
 			// past the client's largest window, half the leg's: only a window grown to
 			// the
 			// leg's largest grants that much
