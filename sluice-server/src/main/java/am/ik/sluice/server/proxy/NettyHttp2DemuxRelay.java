@@ -81,15 +81,17 @@ import io.netty.util.AsciiString;
  * are per hop: DATA read on one hop is written on the other ({@link Flow}: a copy, small
  * frames coalesced) and consumed -- its stream window granted back -- once written, so
  * what the relay holds per stream and direction stays within the stream window it
- * announced ({@link #STREAM_WINDOW}); the connection windows refill as DATA arrives, not
- * as it is written, so a stream held by its upstream or its client holds back no other
- * stream. Each hop's connection window starts at RFC 9113's 65535 bytes and grows with
- * what its peer sends per round trip up to {@link #CONNECTION_WINDOW}
- * ({@link HopWindow}): the hop holds back netty's connection-level WINDOW_UPDATEs and the
- * review grants them ({@link #grantLocked}). Resets pass either way with their code; an
- * upstream's reset after the response's end follows that end to the client. A stream the
- * client ends without its request's end resets its upstream stream with {@code CANCEL};
- * one an early response closed for the client still delivers the request's rest.
+ * announced ({@link #STREAM_WINDOW} to the client, {@link #LEG_STREAM_WINDOW} to an
+ * upstream); the connection windows refill as DATA arrives, not as it is written, so a
+ * stream held by its upstream or its client holds back no other stream. Each hop's
+ * connection window starts at RFC 9113's 65535 bytes and grows with what its peer sends
+ * per round trip up to {@link #CONNECTION_WINDOW} (the client's) or
+ * {@link #LEG_CONNECTION_WINDOW} (an upstream's) ({@link HopWindow}): the hop holds back
+ * netty's connection-level WINDOW_UPDATEs and the review grants them
+ * ({@link #grantLocked}). Resets pass either way with their code; an upstream's reset
+ * after the response's end follows that end to the client. A stream the client ends
+ * without its request's end resets its upstream stream with {@code CANCEL}; one an early
+ * response closed for the client still delivers the request's rest.
  * <p>
  * What the relay holds -- DATA and header blocks not yet written, both ways, and every
  * hop's writer queue -- and the connection window its peers hold -- what they may still
@@ -192,24 +194,42 @@ final class NettyHttp2DemuxRelay {
 	static final int MAX_INTERIM_BYTES = MAX_HEADER_LIST_SIZE;
 
 	/**
-	 * The initial stream window the relay announces on both faces: what it reads of a
-	 * stream and has not written on the other hop yet, its consumed bytes not granted
-	 * back, stays within it. A stream moves at most this much per round trip of its hop,
-	 * so it is the tunnel's own per-connection window
-	 * ({@link VirtualConnection#DEFAULT_WINDOW}): a leg -- one virtual connection -- has
-	 * no more than that in flight per tunnel round trip whatever the relay announces, and
-	 * one stream can use all of it.
+	 * The initial stream window the relay announces to the client: what it reads of a
+	 * stream from the client and has not written to the upstream yet, its consumed bytes
+	 * not granted back, stays within it. A stream moves at most this much per round trip
+	 * of the client's hop: the tunnel's own per-connection window
+	 * ({@link VirtualConnection#DEFAULT_WINDOW}), what a leg carries towards its
+	 * upstream.
 	 */
 	static final int STREAM_WINDOW = VirtualConnection.DEFAULT_WINDOW;
 
 	/**
-	 * The largest connection window the relay grants on both faces, refilled as DATA
+	 * The largest connection window the relay grants the client, refilled as DATA
 	 * arrives: the most a connection's streams together move per round trip of the hop,
 	 * the same bound as one stream's ({@link #STREAM_WINDOW}) for the same reason. A
 	 * hop's window grows to it from RFC 9113's as its peer sends ({@link HopWindow}), the
 	 * part past RFC 9113's charged to the budget.
 	 */
 	static final int CONNECTION_WINDOW = VirtualConnection.DEFAULT_WINDOW;
+
+	/**
+	 * The initial stream window the relay announces to an upstream: twice the leg's
+	 * tunnel window ({@link VirtualConnection#DEFAULT_WINDOW}). netty grants a stream's
+	 * window back once half of it was consumed, so an upstream spending it in bursts, one
+	 * per tunnel round trip, finds up to half of it held back for a round trip; at twice
+	 * the tunnel window it still has the tunnel's full window to send, and the leg's
+	 * virtual connection, whose own grants hold back nothing from a blocked writer,
+	 * bounds it.
+	 */
+	static final int LEG_STREAM_WINDOW = 2 * VirtualConnection.DEFAULT_WINDOW;
+
+	/**
+	 * The largest connection window the relay grants an upstream: twice the leg's tunnel
+	 * window, as {@link #LEG_STREAM_WINDOW} and for the same reason -- the window is
+	 * refilled once its peer spent half of it ({@link HopWindow}). It grows to it from
+	 * RFC 9113's as the upstream sends, the part past RFC 9113's charged to the budget.
+	 */
+	static final int LEG_CONNECTION_WINDOW = 2 * VirtualConnection.DEFAULT_WINDOW;
 
 	/**
 	 * The bytes a relay may queue without charging the shared budget: what it always
@@ -226,7 +246,7 @@ final class NettyHttp2DemuxRelay {
 	 * than below it. Once nothing is granted, its peers can still send what windows they
 	 * hold, charged but for RFC 9113's ({@link #WITHHELD_ARRIVALS} each).
 	 */
-	static final long CONNECTION_SHARE = 2L * CONNECTION_WINDOW;
+	static final long CONNECTION_SHARE = (long) CONNECTION_WINDOW + LEG_CONNECTION_WINDOW;
 
 	/**
 	 * The most of the shared budget one relay takes for a header block -- a new stream's
@@ -481,7 +501,8 @@ final class NettyHttp2DemuxRelay {
 					.pipe(seeded(this.pipe, this.seed))
 					.server(true)
 					.listener(ClientListener::new)
-					.codec(codec -> configure(codec, new Http2Settings().maxConcurrentStreams(MAX_CONCURRENT_STREAMS)))
+					.codec(codec -> configure(codec, new Http2Settings().maxConcurrentStreams(MAX_CONCURRENT_STREAMS),
+							STREAM_WINDOW))
 					// each reset the client has not read yet is of a stream it still
 					// counts against the concurrency limit
 					.rememberedResets(MAX_CONCURRENT_STREAMS)
@@ -511,12 +532,13 @@ final class NettyHttp2DemuxRelay {
 
 	/**
 	 * Both faces' codec: the settings plus the header list limit (netty's default is
-	 * 8KiB) and the initial stream window ({@link #STREAM_WINDOW}), and header blocks
-	 * encoded as never-indexed literals, so every block the relay writes decodes on its
-	 * own whatever the peer's decoder saw before.
+	 * 8KiB) and the initial stream window ({@link #STREAM_WINDOW} to the client,
+	 * {@link #LEG_STREAM_WINDOW} to an upstream), and header blocks encoded as
+	 * never-indexed literals, so every block the relay writes decodes on its own whatever
+	 * the peer's decoder saw before.
 	 */
-	private static void configure(HopHandler.Builder codec, Http2Settings settings) {
-		codec.initialSettings(settings.maxHeaderListSize(MAX_HEADER_LIST_SIZE).initialWindowSize(STREAM_WINDOW))
+	private static void configure(HopHandler.Builder codec, Http2Settings settings, int streamWindow) {
+		codec.initialSettings(settings.maxHeaderListSize(MAX_HEADER_LIST_SIZE).initialWindowSize(streamWindow))
 			.headerSensitivityDetector((name, value) -> true);
 	}
 
@@ -834,7 +856,7 @@ final class NettyHttp2DemuxRelay {
 				.pipe(DuplexPipe.of(connection))
 				.listener(built -> new LegListener(opening))
 				.codec(codec -> {
-					configure(codec, new Http2Settings().pushEnabled(false));
+					configure(codec, new Http2Settings().pushEnabled(false), LEG_STREAM_WINDOW);
 					// streams past the upstream's concurrency limit wait in netty's
 					// StreamBufferingEncoder
 					codec.encoderEnforceMaxConcurrentStreams(true);
@@ -843,7 +865,7 @@ final class NettyHttp2DemuxRelay {
 				.rememberedResets(MAX_CONCURRENT_STREAMS)
 				// granted as the review charges it
 				.withholdConnectionWindow(true)
-				.connectionWindow(CONNECTION_WINDOW)
+				.connectionWindow(LEG_CONNECTION_WINDOW)
 				.onInactive(() -> this.legs.remove(route, opening))
 				.onWritten(NettyHttp2DemuxRelay::reviewed)
 				.traffic(traffic(route, session))
@@ -1737,7 +1759,7 @@ final class NettyHttp2DemuxRelay {
 		@Nullable Hop hop;
 
 		/** The connection window granted the upstream; with the loop's lock. */
-		final HopWindow window = new HopWindow(CONNECTION_WINDOW);
+		final HopWindow window = new HopWindow(LEG_CONNECTION_WINDOW);
 
 		/** The upstream's first SETTINGS has not arrived; with the loop's lock. */
 		boolean awaitingSettings = true;

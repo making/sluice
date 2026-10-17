@@ -538,7 +538,7 @@ class H2DemuxClientFrameValidationE2ETest {
 			assertThat(client.goAwayCode()).isEqualTo(FLOW_CONTROL_ERROR);
 			assertThat(session.upstream().eof().await(5, TimeUnit.SECONDS)).isTrue();
 			assertThat(session.upstream().settings(SETTINGS_INITIAL_WINDOW_SIZE))
-				.containsExactly((long) NettyHttp2DemuxRelay.STREAM_WINDOW);
+				.containsExactly((long) NettyHttp2DemuxRelay.LEG_STREAM_WINDOW);
 			awaitReleased(ROUTE);
 		}
 	}
@@ -561,7 +561,7 @@ class H2DemuxClientFrameValidationE2ETest {
 			assertThat(client.closed()).isFalse();
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(session.upstream().settings(SETTINGS_INITIAL_WINDOW_SIZE))
-				.containsExactly((long) NettyHttp2DemuxRelay.STREAM_WINDOW);
+				.containsExactly((long) NettyHttp2DemuxRelay.LEG_STREAM_WINDOW);
 		}
 	}
 

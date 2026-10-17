@@ -182,7 +182,7 @@ class H2DemuxFramingE2ETest {
 
 	/**
 	 * The settings are per hop: the upstream gets the relay's own SETTINGS once, as its
-	 * leg opens -- push off, a 1MiB initial stream window, the 64KiB header list limit,
+	 * leg opens -- push off, a 2MiB initial stream window, the 64KiB header list limit,
 	 * the RFC defaults else -- whatever the client announces, before the leg opened or
 	 * after; and the client gets the relay's: 100 concurrent streams, a 1MiB initial
 	 * stream window and the 64KiB header list limit. Each keeps RFC 9113's connection
@@ -224,7 +224,7 @@ class H2DemuxFramingE2ETest {
 				connectionGrants.add(TestH2.increment(frame));
 			}
 		}
-		assertThat(announced).as("the SETTINGS frames the upstream got").containsExactly("2=0,4=1048576,6=65536");
+		assertThat(announced).as("the SETTINGS frames the upstream got").containsExactly("2=0,4=2097152,6=65536");
 		assertThat(connectionGrants).as("no connection window granted the upstream ahead").isEmpty();
 	}
 

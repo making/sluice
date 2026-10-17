@@ -52,7 +52,7 @@ sequenceDiagram
     loop raw relay (one virtual thread per direction)
         S ->> C: DATA(conn_id, 64K)
         C ->> U: bytes
-        C -->> S: WINDOW_UPDATE(conn_id) per half window consumed
+        C -->> S: WINDOW_UPDATE(conn_id) per half window consumed, or once a blocked writer's bytes are read
         U -->> C: bytes
         C ->> S: DATA(conn_id) / CLOSE
     end
@@ -63,7 +63,7 @@ sequenceDiagram
 - server: accept, route by `Host`, `VirtualConnection` + `CONNECT`, then raw relay (`SocketRelay`, one virtual thread per direction)
 - client: `CONNECT`, dial the local upstream (strict forwarding), same raw relay; upstream URLs with `https://` are dialed with TLS (trust-all)
 - flow control: bounded queues end to end; the gRPC send path honors `isReady()` on a dedicated sender thread, sends control frames before connection frames, and drains the per-connection queues round-robin so one busy connection cannot starve the others
-- per-connection flow control (credit windows, as in HTTP/2 streams): the server and sluice-client announce a 64KiB receive window per connection (`Advertise` / `Connect`; sluice-wasmlet a fixed 1MiB), and a writer sends only against the credit its peer granted with `WINDOW_UPDATE`. The receive path never blocks, so one stalled connection does not stall the others on the stream; a peer sending past its credit fails only that connection. A receiver decides its window at every half window its reader took: a writer that runs out of credit says so (`WINDOW_UPDATE` with `blocked`), and the window doubles, up to 1MiB, when that happened while the reader kept up; it halves, granting back less than was read, when the writer was blocked but the reader never found its buffer empty and is a quarter of the window behind, or when the writer was not blocked for two decisions in a row. The part of a window past 64KiB is charged to the node's tunnel budget (`sluice.limits.tunnel-budget` / `sluice.client.tunnel-budget`) before the grant raising it leaves, within a share of the budget, and released as the window shrinks; a reader idle for 1s asks its peer to give back the credit past 64KiB (`reclaim_above`, answered with `released`), and the remote's end releases all but what is buffered. Bounds: a receiver buffers at most 64KiB per connection plus the budget in total (the number of connections is capped, see "Connection limits"); and one connection has at most one window in flight, so its throughput is at most window / RTT: about 50MiB/s at a 20ms tunnel round trip at the full 1MiB, about 3MiB/s at 64KiB. A peer without the window is refused: the server fails the tunnel stream of a client announcing none with `FAILED_PRECONDITION` (sluice-client 046cd21 / sluice-wasmlet f76388d or later required), and the client and the wasmlet answer a CONNECT without one with an ERROR for that connection (sluice-server 046cd21 or later required); each rejection is logged once
+- per-connection flow control (credit windows, as in HTTP/2 streams): the server and sluice-client announce a 64KiB receive window per connection (`Advertise` / `Connect`; sluice-wasmlet a fixed 1MiB), and a writer sends only against the credit its peer granted with `WINDOW_UPDATE`. The receive path never blocks, so one stalled connection does not stall the others on the stream; a peer sending past its credit fails only that connection. A receiver grants back what its reader took at every half window, and once a writer that ran out of credit said so (`WINDOW_UPDATE` with `blocked`) and the reader emptied its buffer, if it took a quarter of the window since its latest grant: a writer spending its credit in bursts, one per round trip, otherwise finds up to half the window held back for a round trip (an h2 download through one virtual connection moved 512KiB per 20ms tunnel round trip so, half its 1MiB window); the quarter keeps a writer sending as fast as the reader takes from getting its credit back in many small grants. It decides its window at every half window its reader took: the window doubles, up to 1MiB, when that happened while the reader kept up; it halves, granting back less than was read, when the writer was blocked but the reader never found its buffer empty and is a quarter of the window behind, or when the writer was not blocked for two decisions in a row. The part of a window past 64KiB is charged to the node's tunnel budget (`sluice.limits.tunnel-budget` / `sluice.client.tunnel-budget`) before the grant raising it leaves, within a share of the budget, and released as the window shrinks; a reader idle for 1s asks its peer to give back the credit past 64KiB (`reclaim_above`, answered with `released`), and the remote's end releases all but what is buffered. Bounds: a receiver buffers at most 64KiB per connection plus the budget in total (the number of connections is capped, see "Connection limits"); and one connection has at most one window in flight, so its throughput is at most window / RTT: about 50MiB/s at a 20ms tunnel round trip at the full 1MiB, about 3MiB/s at 64KiB. A peer without the window is refused: the server fails the tunnel stream of a client announcing none with `FAILED_PRECONDITION` (sluice-client 046cd21 / sluice-wasmlet f76388d or later required), and the client and the wasmlet answer a CONNECT without one with an ERROR for that connection (sluice-server 046cd21 or later required); each rejection is logged once
 - transport flow control: the server and sluice-client announce a fixed HTTP/2 window (connection and stream alike) for the gRPC connection carrying the tunnel, twice the node's tunnel budget and at least 1MiB, which turns gRPC's own window tuning off; both log it at startup (`gRPC flow control window`). The connections' windows bound what may be in flight, so the transport window only stays out of their way. It does not widen what a receiver may hold: what gRPC buffers before the connections take it was sent against their windows, which the budget charges from the grant on (measured mid-transfer: 32 downloads at about 1GB/s held about 9MiB more direct memory on the receiving server than idle, with 30MiB of windows charged). Left to gRPC, the window started at 1MiB and grew only when one round trip carried more than half of it; as gRPC grants a window back only at every half of it read, a transfer could settle with half the window in flight and half read but not granted back, and the tuning never grew it: in a frame log of such a stack, the whole tunnel moved 512KiB per round trip, about 20MiB/s at a 20ms tunnel round trip, however many connections shared it. Twice the budget leaves the budget's worth in flight even then. In `TunnelTransportWindowE2ETest` 48 downloads, and 48 uploads, through one tunnel move 48MiB per round trip (round trips counted by a proxy holding the receiver's answers back, not timed), where gRPC's tuning moved at most 1.9MiB. sluice-wasmlet announces the same (twice `--max-connections` x 1MiB, adaptive window off; 32MiB sent to it take at most 3 round trips against 17 at hyper's defaults of 2MiB per stream, in a unit test with the same round-counting proxy idea)
 
 ## Modules
@@ -278,7 +278,7 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.limits.max-pending-tunnel-streams-per-address` | `0` = no limit beyond `max-pending-tunnel-streams` | the same from one source address (the gRPC peer) |
 | `sluice.limits.max-tunnel-sessions` | `1024` | tunnel clients registered at once on the node (sessions whose client advertised); a stream of a new client id beyond it is failed with `RESOURCE_EXHAUSTED`; see "Connection limits" |
 | `sluice.limits.max-tunnel-sessions-per-address` | `0` = no limit beyond `max-tunnel-sessions` | the same from one source address (the gRPC peer) |
-| `sluice.limits.h2-queue-budget` | `0` = an eighth of half the max heap | bytes the h2 demux relays may hold, both ways, beyond each connection's allowance, plus the connection window their clients and upstreams hold past 65535 bytes, shared by all of them; a window grows past 65535 bytes only as far as this takes it, and a connection whose share of it reaches 2MiB is granted no more window; see "Connection limits" |
+| `sluice.limits.h2-queue-budget` | `0` = an eighth of half the max heap | bytes the h2 demux relays may hold, both ways, beyond each connection's allowance, plus the connection window their clients and upstreams hold past 65535 bytes, shared by all of them; a window grows past 65535 bytes only as far as this takes it, and a connection whose share of it reaches 3MiB is granted no more window; see "Connection limits" |
 | `sluice.limits.h2-stream-wait-timeout` | `30s` | how long an h2 stream may wait for a place within its upstream's `SETTINGS_MAX_CONCURRENT_STREAMS` before it is refused with `REFUSED_STREAM`; `0` = off; see "Connection limits" |
 | `sluice.tcp-port-range` | (unset = any port) | listen ports a client may claim for tcp routes, comma separated single ports or `min-max` ranges (e.g. `9000-9010,8080`); a port outside the range is not bound |
 | `sluice.http-load-balance` | `smallest-client-id` | target picked when several clients serve the same domain: `smallest-client-id` (deterministic across nodes) / `round-robin` (per node) / `random` |
@@ -729,24 +729,31 @@ still waiting after `sluice.limits.h2-stream-wait-timeout` (30s; `0` = off) is r
 with `REFUSED_STREAM`, its upstream never having seen it, so an upstream that keeps its
 streams open or announces a limit of 0 does not hold it for good.
 
-The windows are per hop. The relay announces a 1MiB stream window to the client and to
-each upstream, grants a stream's window back only for what it wrote on the other hop, and
+The windows are per hop. The relay announces a 1MiB stream window to the client and a
+2MiB one to each upstream, grants a stream's window back only for what it wrote on the other hop, and
 refills its connection windows as DATA arrives, not as it is written (a connection window
 is refilled once half of it is spent): a stream held by its upstream or by its client
 holds at most one stream window in the relay, and the connection's other streams go on,
 on the same upstream connection too. A connection window starts at RFC 9113's 65535 bytes
-and grows with what its peer sends per round trip, up to 1MiB: the relay sends a PING with
+and grows with what its peer sends per round trip, up to 1MiB for the client and 2MiB for
+an upstream: the relay sends a PING with
 the DATA a peer sends and counts the DATA read until the PING's ack (as gRPC's HTTP/2
 transport sizes its window), and once a peer sent half its window within that round trip,
-the window doubles (128KiB, 256KiB, 512KiB, 1MiB) at its next refill; a client sending
+the window doubles (128KiB, 256KiB, 512KiB, 1MiB, 2MiB) at its next refill; a client sending
 small request bodies, or an upstream a slow stream, keeps 65535 bytes. A peer that does
-not answer PINGs keeps 65535 bytes too. So an h2 connection moves at most 1MiB per round
-trip of a hop, all its streams together: a download at most 1MiB per tunnel round trip, an upload
-at most 1MiB per round trip of the client and at most the upstream's own windows per
-tunnel round trip. 1MiB is the most the tunnel's per-connection window grows to: an
-upstream connection, one virtual connection, has no more than its window in flight per
-tunnel round trip whatever the relay announces, the same bound as an HTTP/1.1
-connection's. DATA held for a stream
+not answer PINGs keeps 65535 bytes too. So an upload moves at most 1MiB per round trip of
+the client, all the connection's streams together, and at most the upstream's own windows
+per tunnel round trip. A download moves at most the tunnel's per-connection window, 1MiB,
+per tunnel round trip, the same bound as an HTTP/1.1 connection's: an upstream
+connection, one virtual connection, has no more than that in flight per round trip. The
+upstream's windows are twice that because both are granted back only at every half of
+them (netty's update ratio for a stream, the refill for the connection): an upstream
+sending in bursts, one per round trip, finds up to half of each held back for a round
+trip, and at 1MiB they bound a download to 512KiB per tunnel round trip (20.5MiB/s at
+20ms, where an HTTP/1.1 connection moved about 40MiB/s; with the windows at 2MiB one h2
+stream moved 37 to 43MiB/s in the harness of `.todo/artefacts/106`). While its windows
+grow from 65535 bytes an h2 download takes a few round trips more than an HTTP/1.1 one.
+DATA held for a stream
 is copied once, into buffers holding it in order and rounded up to 1KiB in all, however
 small the frames. What the relay holds -- that DATA and the header blocks not yet
 written, both ways, plus the writer queue of the client connection and of each upstream
@@ -755,7 +762,7 @@ hold, which they may still send: each connection may hold 128KiB, and the bytes 
 it plus the window each of its peers holds past 65535 bytes, its share, are charged to
 `sluice.limits.h2-queue-budget`, shared by every h2 connection. A window grows, and is
 refilled, past 65535 bytes only once its part past them is charged, within the budget's
-room and below the connection's 2MiB share: what a peer sends was charged before it could
+room and below the connection's 3MiB share: what a peer sends was charged before it could
 arrive, but for 65535 bytes. A window whose growth or refill does not fit stays smaller,
 at worst 65535 bytes, at which its streams still go on: through a 20ms round trip a
 4MiB download and a 4MiB upload each took about 2.5s at 65535 bytes in
@@ -765,14 +772,15 @@ window granted cannot be taken back (HTTP/2 has no negative WINDOW_UPDATE): it s
 charged until its peer sends it or its connection, or upstream connection, closes -- an
 h2 connection with no stream open is closed after `sluice.limits.idle-timeout` --, so a
 connection that moved a large body holds its grown window's part of the budget, up to
-960KiB per peer, while it stays open; with production's 25.6MiB budget about 27 windows
-grown to 1MiB fit at once, and the windows past them stay smaller. Past its 128KiB with
-the budget exhausted, or with its share at 2MiB (one connection window each way) while
+960KiB for its client and 1984KiB per upstream connection, while it stays open; with
+production's 25.6MiB budget about 13 upstream windows grown to 2MiB fit at once (27 at
+1MiB), and the windows past them stay smaller. Past its 128KiB with
+the budget exhausted, or with its share at 3MiB (one connection window each way) while
 the budget has room, the relay grants the client and every upstream connection no more
 connection window (a peer stops once the window it holds is spent) until the connection
 drains below 128KiB, or below its share with the budget's room back. A header block does
 not fit when the budget has no room for it or when it takes the connection's share past
-4MiB (twice the share: a connection granting no window passes its share by what its
+6MiB (twice the share: a connection granting no window passes its share by what its
 peers still send uncharged, and its new streams are still relayed): a new stream
 whose head does not fit is refused with `REFUSED_STREAM`, and a later header block that
 does not fit resets its stream (`RST_STREAM` `ENHANCE_YOUR_CALM` to the
@@ -791,11 +799,11 @@ are refused with `REFUSED_STREAM` (their upstream never saw them; the client may
 them), since their bytes drain only once a stream ahead of them closes, which may need
 the very request body the withheld window holds back. So a connection whose peers read
 keeps flowing however exhausted the budget is. And one connection takes no more of the
-budget than its 2MiB share, what its peers still send uncharged once nothing more is
-granted (180KiB each, see below) and header blocks up to 4MiB: a client that stops
+budget than its 3MiB share, what its peers still send uncharged once nothing more is
+granted (180KiB each, see below) and header blocks up to 6MiB: a client that stops
 reading its responses, or an upstream that stops reading its uploads, holds that much,
 while the other connections keep their windows. With the 409MiB heap of production (a
-25.6MiB budget), 13 connections held at their share exhaust the budget. A connection then
+25.6MiB budget), 9 connections held at their share exhaust the budget. A connection then
 holds outside the budget its 128KiB, what its client still sends uncharged (the 16KiB
 read under way, 65535 bytes of window, under 1KiB of rounding per stream: 180KiB) and its
 client connection's writer queue (a connection is no longer read past 256KiB queued, plus

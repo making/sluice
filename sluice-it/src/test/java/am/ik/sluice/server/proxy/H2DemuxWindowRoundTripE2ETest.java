@@ -153,11 +153,13 @@ class H2DemuxWindowRoundTripE2ETest {
 			report("download", peer.windowWaits(), took);
 			assertThat(client.dataReceived(1)).isEqualTo(BODY);
 			assertThat(peer.sendInitialWindow()).as("the stream window the leg announced")
-				.isEqualTo(NettyHttp2DemuxRelay.STREAM_WINDOW);
+				.isEqualTo(NettyHttp2DemuxRelay.LEG_STREAM_WINDOW);
 			assertThat(tunnel.relayed()).as("the tunnel went through the delay").isGreaterThan(BODY);
-			// past half the largest window: only a window grown to it grants that much
+			// past the client's largest window, half the leg's: only a window grown to
+			// the
+			// leg's largest grants that much
 			assertThat(peer.maxSendConnectionWindow()).as("the leg's connection window grown to its largest")
-				.isGreaterThan(NettyHttp2DemuxRelay.CONNECTION_WINDOW / 2);
+				.isGreaterThan(NettyHttp2DemuxRelay.CONNECTION_WINDOW);
 			assertThat(peer.windowWaits()).as("round trips of a %dMiB download in %s", BODY / MIB, took)
 				.isPositive()
 				.isLessThanOrEqualTo(MAX_WAITS)

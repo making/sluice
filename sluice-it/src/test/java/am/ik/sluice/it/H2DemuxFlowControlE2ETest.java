@@ -58,14 +58,20 @@ class H2DemuxFlowControlE2ETest {
 	private static final int MAX_CONCURRENT_STREAMS = 100;
 
 	/**
-	 * The stream window the relay announces on both of its faces, and the largest
-	 * connection window it grants on both: {@code NettyHttp2DemuxRelay.STREAM_WINDOW} and
+	 * The stream window the relay announces the client, and the largest connection window
+	 * it grants it: {@code NettyHttp2DemuxRelay.STREAM_WINDOW} and
 	 * {@code CONNECTION_WINDOW}.
 	 */
 	private static final int NETTY_STREAM_WINDOW = 1024 * 1024;
 
-	/** The largest connection window the relay grants on both faces. */
+	/** The largest connection window the relay grants the client. */
 	private static final int NETTY_CONNECTION_WINDOW = 1024 * 1024;
+
+	/**
+	 * The largest connection window the relay grants an upstream:
+	 * {@code NettyHttp2DemuxRelay.LEG_CONNECTION_WINDOW}.
+	 */
+	private static final int NETTY_LEG_CONNECTION_WINDOW = 2 * 1024 * 1024;
 
 	/**
 	 * The connection window a hop's peer starts with, RFC 9113's, uncharged:
@@ -87,7 +93,8 @@ class H2DemuxFlowControlE2ETest {
 	 * room: its allowance and its share of the budget,
 	 * {@code NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE + CONNECTION_SHARE}.
 	 */
-	private static final long NETTY_SHARE_BYTES = 128 * 1024 + 2L * NETTY_CONNECTION_WINDOW;
+	private static final long NETTY_SHARE_BYTES = 128 * 1024 + (long) NETTY_CONNECTION_WINDOW
+			+ NETTY_LEG_CONNECTION_WINDOW;
 
 	/**
 	 * What a client still sends uncharged once it is granted no more connection window:

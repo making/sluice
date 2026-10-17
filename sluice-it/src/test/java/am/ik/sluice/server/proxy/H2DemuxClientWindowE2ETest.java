@@ -95,7 +95,7 @@ class H2DemuxClientWindowE2ETest {
 	private static final int WINDOW = WindowedH2Upstream.DEFAULT_WINDOW;
 
 	/** The stream window the relay announces its upstreams. */
-	private static final int RELAY_WINDOW = NettyHttp2DemuxRelay.STREAM_WINDOW;
+	private static final int RELAY_WINDOW = NettyHttp2DemuxRelay.LEG_STREAM_WINDOW;
 
 	/**
 	 * A response the relay holds whole while the client grants no connection window:

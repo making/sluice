@@ -382,7 +382,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * {@code verbatimIdleTimeout})
 	 * @param h2QueueBudget bytes the h2 demux relays may queue beyond each connection's
 	 * own allowance, both ways, plus the connection window their clients and upstreams
-	 * hold past 65535 bytes, shared by all of them, one connection taking at most 2MiB
+	 * hold past 65535 bytes, shared by all of them, one connection taking at most 3MiB
 	 * before its windows are withheld; a window grows past 65535 bytes only as far as the
 	 * budget takes it; {@code 0} = an eighth of half the maximum heap
 	 * @param h2StreamWaitTimeout how long an h2 stream may wait for a place within its

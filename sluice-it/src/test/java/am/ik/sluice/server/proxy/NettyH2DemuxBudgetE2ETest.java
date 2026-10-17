@@ -75,8 +75,11 @@ class NettyH2DemuxBudgetE2ETest {
 
 	private static final int KIB = 1024;
 
-	/** The netty relay's stream window, on both faces. */
+	/** The netty relay's stream window towards the client. */
 	private static final int RELAY_WINDOW = NettyHttp2DemuxRelay.STREAM_WINDOW;
+
+	/** The netty relay's stream window towards an upstream. */
+	private static final int LEG_WINDOW = NettyHttp2DemuxRelay.LEG_STREAM_WINDOW;
 
 	/** The windows of the test client and upstreams: RFC 9113's. */
 	private static final int PEER_WINDOW = WindowedH2Upstream.DEFAULT_WINDOW;
@@ -233,7 +236,7 @@ class NettyH2DemuxBudgetE2ETest {
 			TestH2.@Nullable Frame frame;
 			while ((frame = upstream.next()) != null) {
 				if (frame.type() == TestH2.HEADERS) {
-					respondAsync(upstream, frame.streamId(), frame.streamId() == 1 ? 2 * RELAY_WINDOW : 60 * KIB);
+					respondAsync(upstream, frame.streamId(), frame.streamId() == 1 ? 2 * LEG_WINDOW : 60 * KIB);
 				}
 			}
 		}));
@@ -246,9 +249,9 @@ class NettyH2DemuxBudgetE2ETest {
 			assertThat(client.dataReceived(1)).as("the client got its stream window").isEqualTo(PEER_WINDOW);
 			assertThat(held).as("held for the stream: within the relay's window, a granule of rounding")
 				.isGreaterThan(0)
-				.isLessThanOrEqualTo(RELAY_WINDOW + PendingPayload.GRANULE);
+				.isLessThanOrEqualTo(LEG_WINDOW + PendingPayload.GRANULE);
 			assertThat(upstream.sent()).as("what the upstream got out: the client's window and the relay's")
-				.isLessThanOrEqualTo((long) PEER_WINDOW + RELAY_WINDOW);
+				.isLessThanOrEqualTo((long) PEER_WINDOW + LEG_WINDOW);
 
 			client.headers(3, true, get(route));
 			assertThat(client.awaitEnd(3, TIMEOUT)).as("the other stream completes").isTrue();

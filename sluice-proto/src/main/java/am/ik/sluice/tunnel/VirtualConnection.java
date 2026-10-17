@@ -44,22 +44,28 @@ import am.ik.sluice.v1.proto.WindowUpdate;
  * <p>
  * The window -- what the remote may still send plus what it sent and the reader did not
  * take, or took and was not granted back yet -- starts at the announced window and moves
- * between it and the maximum window ({@link Builder#growWindow}). The reader decides at
- * every half window it took, by what happened since the previous decision: when the
- * remote said it was blocked -- it had DATA and no credit ({@code blocked}) -- it halves
- * the window, granting back less than it took, if the reader never found its buffer empty
- * meanwhile and is a quarter of the window behind (the reader was the bound), and doubles
- * it if not (the window was); it halves it when the remote was not blocked for two
- * decisions in a row (it left the window unused), and keeps it otherwise. A writer of
- * this class tells the remote each time it starts waiting for credit. What the window
- * holds past the announced one is charged to the {@link TunnelBudget} before the grant
- * raising it leaves, within the account's share, and released as the window shrinks; a
- * window the budget has no room for grows by what fits, or not at all, and the connection
- * goes on within what it holds. A reader that waited {@code reclaimAfter} for payload
- * with the window past the announced one asks the remote to give back the credit it holds
- * past it ({@code reclaim_above}); a remote answering ({@code released}) lowers the
- * window by what it gave up. Once the remote ended its direction, what the window holds
- * past what is buffered is released, and on close everything.
+ * between it and the maximum window ({@link Builder#growWindow}). The reader grants what
+ * it took back at every half window it took, and once the remote said it was blocked and
+ * the buffer is empty, if it took a quarter of the window since its latest grant: a
+ * remote spending its credit in bursts, one per round trip, would otherwise find up to
+ * half the window held back for a round trip, a burst ending short of the half window;
+ * the quarter keeps a remote that sends as fast as the reader takes from getting its
+ * credit back in many small grants. The reader decides at every half window it took, by
+ * what happened since the previous decision: when the remote said it was blocked -- it
+ * had DATA and no credit ({@code blocked}) -- it halves the window, granting back less
+ * than it took, if the reader never found its buffer empty meanwhile and is a quarter of
+ * the window behind (the reader was the bound), and doubles it if not (the window was);
+ * it halves it when the remote was not blocked for two decisions in a row (it left the
+ * window unused), and keeps it otherwise. A writer of this class tells the remote each
+ * time it starts waiting for credit. What the window holds past the announced one is
+ * charged to the {@link TunnelBudget} before the grant raising it leaves, within the
+ * account's share, and released as the window shrinks; a window the budget has no room
+ * for grows by what fits, or not at all, and the connection goes on within what it holds.
+ * A reader that waited {@code reclaimAfter} for payload with the window past the
+ * announced one asks the remote to give back the credit it holds past it
+ * ({@code reclaim_above}); a remote answering ({@code released}) lowers the window by
+ * what it gave up. Once the remote ended its direction, what the window holds past what
+ * is buffered is released, and on close everything.
  */
 public final class VirtualConnection implements AutoCloseable {
 
@@ -193,6 +199,12 @@ public final class VirtualConnection implements AutoCloseable {
 
 	/** The remote said it was blocked since the latest decision. */
 	private boolean remoteBlocked;
+
+	/**
+	 * The remote said it was blocked and has not been granted at an empty buffer since:
+	 * it waits for what the reader took, whatever the decisions granted meanwhile.
+	 */
+	private boolean remoteWaiting;
 
 	/** The decisions in a row the remote was not blocked. */
 	private int unblocked;
@@ -578,16 +590,41 @@ public final class VirtualConnection implements AutoCloseable {
 
 	/**
 	 * The remote has DATA and no credit left: the reader's next decision may grow the
-	 * window.
+	 * window, and what the reader took goes back once the buffer is empty
+	 * ({@link #grantToWaitingRemoteLocked}), at once if it is.
 	 */
 	void remoteBlocked() {
+		long increment;
 		this.inboundLock.lock();
 		try {
 			this.remoteBlocked = true;
+			this.remoteWaiting = true;
+			increment = grantToWaitingRemoteLocked();
 		}
 		finally {
 			this.inboundLock.unlock();
 		}
+		if (increment > 0) {
+			this.frameWriter.sendWindowUpdate(this.connectionId, (int) increment);
+		}
+	}
+
+	/**
+	 * With the remote waiting and the buffer empty, the remote sent everything it could
+	 * before it said it was blocked: grants what the reader took since the latest grant,
+	 * if a quarter of the window, keeping the window. The increment to send; with the
+	 * inbound lock.
+	 */
+	private long grantToWaitingRemoteLocked() {
+		if (!this.remoteWaiting || this.buffered > 0 || this.pending < this.window / 4 || this.closed
+				|| this.end != null) {
+			return 0;
+		}
+		this.remoteWaiting = false;
+		long increment = this.window - this.credit;
+		this.credit = this.window;
+		this.pending = 0;
+		return increment;
 	}
 
 	/**
@@ -1116,6 +1153,7 @@ public final class VirtualConnection implements AutoCloseable {
 						outer.budget.addBuffered(-n);
 						outer.pending += n;
 						decideLocked();
+						this.grantDue += outer.grantToWaitingRemoteLocked();
 						return n;
 					}
 					End end = outer.end;
