@@ -323,7 +323,7 @@ final class NettyHttp2DemuxRelay {
 	private static final AsciiString CONTINUE = AsciiString.cached("100-continue");
 
 	/** The payload of the PINGs probing a half-closed client: "sluice-p". */
-	private static final long PROBE_PAYLOAD = 0x736c756963652d70L;
+	static final long PROBE_PAYLOAD = 0x736c756963652d70L;
 
 	/** The payload of the PINGs measuring a peer's round trip: "sluice-b". */
 	private static final long ROUND_TRIP_PAYLOAD = 0x736c756963652d62L;

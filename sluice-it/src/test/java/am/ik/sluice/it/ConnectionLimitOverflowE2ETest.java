@@ -77,13 +77,7 @@ class ConnectionLimitOverflowE2ETest {
 
 	private static final Duration OVERFLOW_TIMEOUT = Duration.ofSeconds(2);
 
-	/** The earliest the overflow deadline may cut; well past any gap of the tests. */
-	private static final Duration NOT_BEFORE = Duration.ofMillis(1500);
-
 	private static final Duration WITHIN = Duration.ofSeconds(4);
-
-	/** Well before the overflow deadline: a connection closed without waiting for it. */
-	private static final Duration AT_ONCE = Duration.ofSeconds(1);
 
 	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ListAppender<>();
 
@@ -306,14 +300,16 @@ class ConnectionLimitOverflowE2ETest {
 	void aHeadThatIsNoHttpRequestIsClosedUnanswered() throws Exception {
 		try (Socket held = holdTheLimit()) {
 			double answered = answered("h1") + answered("h2");
+			double expired = expired();
 			try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 				// in the overflow, not closed at accept
 				awaitOverflow(1);
 				socket.getOutputStream().write("*1\r\n$4\r\nPING\r\n".getBytes(StandardCharsets.US_ASCII));
 				socket.getOutputStream().flush();
-				assertThat(TestSockets.awaitClosed(socket, WITHIN)).isLessThan(AT_ONCE);
+				TestSockets.awaitClosed(socket, WITHIN);
 			}
 			awaitOverflow(0);
+			assertThat(expired()).as("closed without its deadline").isEqualTo(expired);
 			assertThat(answered("h1") + answered("h2")).isEqualTo(answered);
 		}
 	}
@@ -323,6 +319,7 @@ class ConnectionLimitOverflowE2ETest {
 		try (Socket held = holdTheLimit()) {
 			double rejected = rejected();
 			double answered = answered("h1") + answered("h2");
+			double expired = expired();
 			try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 				socket.setSoTimeout((int) WITHIN.toMillis());
 				OutputStream out = socket.getOutputStream();
@@ -332,10 +329,11 @@ class ConnectionLimitOverflowE2ETest {
 				TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 3,
 						new byte[] { (byte) 0xff, (byte) 0xff, (byte) 0xff, 0x7f });
 				// closed without a byte: no answer, not even a GOAWAY
-				assertThat(TestSockets.awaitClosed(socket, WITHIN)).isLessThan(AT_ONCE);
+				TestSockets.awaitClosed(socket, WITHIN);
 			}
 			assertThat(rejected()).isEqualTo(rejected + 1);
 			awaitOverflow(0);
+			assertThat(expired()).as("closed without its deadline").isEqualTo(expired);
 			assertThat(answered("h1") + answered("h2")).isEqualTo(answered);
 			assertThat(answeredLines()).isEmpty();
 		}
@@ -344,22 +342,21 @@ class ConnectionLimitOverflowE2ETest {
 	@Test
 	void aClientGoneBeforeItsAnswerFreesItsPlaceAtOnce() throws Exception {
 		try (Socket held = holdTheLimit()) {
+			double expired = expired();
 			// gone before its first byte
 			try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 				awaitOverflow(1);
 			}
-			long start = System.nanoTime();
 			awaitOverflow(0);
-			assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(AT_ONCE);
+			assertThat(expired()).as("released without its deadline").isEqualTo(expired);
 			// gone in its TLS handshake
 			try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 				socket.getOutputStream().write(clientHello(null));
 				socket.getOutputStream().flush();
 				awaitOverflow(1);
 			}
-			start = System.nanoTime();
 			awaitOverflow(0);
-			assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(AT_ONCE);
+			assertThat(expired()).isEqualTo(expired);
 			// gone in its head
 			try (SSLSocket socket = tlsSocket("http/1.1")) {
 				socket.startHandshake();
@@ -367,9 +364,8 @@ class ConnectionLimitOverflowE2ETest {
 				socket.getOutputStream().flush();
 				assertThat(overflow()).isEqualTo(1);
 			}
-			start = System.nanoTime();
 			awaitOverflow(0);
-			assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(AT_ONCE);
+			assertThat(expired()).isEqualTo(expired);
 		}
 	}
 
@@ -411,6 +407,7 @@ class ConnectionLimitOverflowE2ETest {
 	void pastTheOverflowConnectionsAreClosedAtAccept() throws Exception {
 		try (Socket held = holdTheLimit()) {
 			double rejected = rejected();
+			double expired = expired();
 			List<Socket> silent = new ArrayList<>();
 			try {
 				for (int i = 0; i < OVERFLOW; i++) {
@@ -419,7 +416,7 @@ class ConnectionLimitOverflowE2ETest {
 				awaitOverflow(OVERFLOW);
 				try (Socket past = new Socket("127.0.0.1", dataPort)) {
 					past.getOutputStream().write(TestSockets.get("held.local"));
-					assertThat(TestSockets.awaitClosed(past, WITHIN)).isLessThan(AT_ONCE);
+					TestSockets.awaitClosed(past, WITHIN);
 				}
 				assertThat(overflow()).isEqualTo(OVERFLOW);
 				// the silent ones are cut by the overflow deadline, answered nothing
@@ -434,6 +431,7 @@ class ConnectionLimitOverflowE2ETest {
 			}
 			assertThat(rejected()).isEqualTo(rejected + OVERFLOW + 1);
 			awaitOverflow(0);
+			assertThat(expired()).as("the deadlines of the silent ones alone").isEqualTo(expired + OVERFLOW);
 			assertThat(answeredLines()).isEmpty();
 		}
 	}
@@ -442,14 +440,19 @@ class ConnectionLimitOverflowE2ETest {
 	void aClientStallingItsHandshakeInTheOverflowIsCutAtTheDeadline() throws Exception {
 		try (Socket held = holdTheLimit()) {
 			double answered = answered("h1") + answered("h2");
+			double expired = expired();
+			long start = System.nanoTime();
 			try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 				// the ClientHello and nothing after
 				socket.getOutputStream().write(clientHello(null));
 				socket.getOutputStream().flush();
 				awaitOverflow(1);
-				assertThat(awaitClosedReadingAll(socket)).isGreaterThan(NOT_BEFORE).isLessThan(WITHIN);
+				awaitClosedReadingAll(socket);
+				// the deadline starts at the accept, after the start
+				assertThat(Duration.ofNanos(System.nanoTime() - start)).isGreaterThanOrEqualTo(OVERFLOW_TIMEOUT);
 			}
 			awaitOverflow(0);
+			assertThat(expired()).as("cut by its deadline").isEqualTo(expired + 1);
 			assertThat(answered("h1") + answered("h2")).isEqualTo(answered);
 		}
 	}
@@ -457,6 +460,7 @@ class ConnectionLimitOverflowE2ETest {
 	@Test
 	void aClientStallingItsHeadAfterTheHandshakeIsCutAtTheDeadline() throws Exception {
 		try (Socket held = holdTheLimit()) {
+			double expired = expired();
 			long start = System.nanoTime();
 			try (SSLSocket socket = tlsSocket("http/1.1")) {
 				socket.startHandshake();
@@ -466,24 +470,25 @@ class ConnectionLimitOverflowE2ETest {
 				assertThat(overflow()).isEqualTo(1);
 				TestSockets.awaitClosed(socket, WITHIN);
 				// one deadline for the handshake and the head, counted from the accept
-				assertThat(Duration.ofNanos(System.nanoTime() - start)).isGreaterThan(NOT_BEFORE).isLessThan(WITHIN);
+				assertThat(Duration.ofNanos(System.nanoTime() - start)).isGreaterThanOrEqualTo(OVERFLOW_TIMEOUT);
 			}
 			awaitOverflow(0);
+			assertThat(expired()).as("cut by its deadline").isEqualTo(expired + 1);
 		}
 	}
 
 	@Test
 	void aFailedHandshakeReleasesItsPlaceAtOnce() throws Exception {
 		try (Socket held = holdTheLimit()) {
+			double expired = expired();
 			// the default trust store does not trust the self-signed certificate
 			SSLContext untrusting = SSLContext.getInstance("TLS");
 			untrusting.init(null, null, null);
 			try (SSLSocket socket = (SSLSocket) untrusting.getSocketFactory().createSocket("127.0.0.1", dataPort)) {
 				assertThatThrownBy(socket::startHandshake).isInstanceOf(SSLHandshakeException.class);
 			}
-			long start = System.nanoTime();
 			awaitOverflow(0);
-			assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(AT_ONCE);
+			assertThat(expired()).as("released without its deadline").isEqualTo(expired);
 		}
 	}
 
@@ -491,6 +496,7 @@ class ConnectionLimitOverflowE2ETest {
 	void tlsPassthroughAndTcpRouteConnectionsPastTheLimitAreClosedUnanswered() throws Exception {
 		try (Socket held = holdTheLimit()) {
 			double rejected = rejected();
+			double expired = expired();
 			try (Socket passthrough = new Socket("127.0.0.1", dataPort)) {
 				// in the overflow, not closed at accept
 				awaitOverflow(1);
@@ -498,13 +504,14 @@ class ConnectionLimitOverflowE2ETest {
 				passthrough.getOutputStream().flush();
 				// nothing to answer in: the server has no say in the passthrough
 				// handshake
-				assertThat(TestSockets.awaitClosed(passthrough, WITHIN)).isLessThan(AT_ONCE);
+				TestSockets.awaitClosed(passthrough, WITHIN);
 			}
 			try (Socket tcp = new Socket("127.0.0.1", tcpRoutePort)) {
-				assertThat(TestSockets.awaitClosed(tcp, WITHIN)).isLessThan(AT_ONCE);
+				TestSockets.awaitClosed(tcp, WITHIN);
 			}
 			assertThat(rejected()).isEqualTo(rejected + 2);
 			awaitOverflow(0);
+			assertThat(expired()).as("closed without a deadline").isEqualTo(expired);
 			assertThat(answeredLines()).isEmpty();
 		}
 	}
@@ -577,9 +584,8 @@ class ConnectionLimitOverflowE2ETest {
 		return frames;
 	}
 
-	/** Reads (and drops) what the server sends until it closes; the time it took. */
-	private static Duration awaitClosedReadingAll(Socket socket) throws IOException {
-		long start = System.nanoTime();
+	/** Reads (and drops) what the server sends until it closes. */
+	private static void awaitClosedReadingAll(Socket socket) throws IOException {
 		socket.setSoTimeout((int) WITHIN.toMillis());
 		try {
 			socket.getInputStream().transferTo(OutputStream.nullOutputStream());
@@ -587,7 +593,6 @@ class ConnectionLimitOverflowE2ETest {
 		catch (SocketException e) {
 			// reset
 		}
-		return Duration.ofNanos(System.nanoTime() - start);
 	}
 
 	private List<String> answeredLines() {
@@ -626,6 +631,10 @@ class ConnectionLimitOverflowE2ETest {
 
 	private double rejected() {
 		return meterRegistry().get("sluice.data.connections.rejected").tag("reason", "limit").counter().count();
+	}
+
+	private double expired() {
+		return meterRegistry().get("sluice.data.connections.overflow.expired").counter().count();
 	}
 
 	private double answered(String protocol) {

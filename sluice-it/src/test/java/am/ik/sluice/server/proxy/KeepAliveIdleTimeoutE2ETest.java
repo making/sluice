@@ -573,9 +573,8 @@ class KeepAliveIdleTimeoutE2ETest {
 			Awaitility.await()
 				.atMost(Duration.ofSeconds(5))
 				.until(() -> System.nanoTime() - progress.get() > Duration.ofMillis(300).toNanos());
-			assertThat(Duration.ofNanos(progress.get() - ended))
-				.as("the relay stopped reading, blocked on a write, before the idle timeout")
-				.isLessThan(IDLE_TIMEOUT.minusMillis(500));
+			assertThat(idleClosed()).as("the relay stopped reading, blocked on a write, before the idle timeout")
+				.isEqualTo(idle);
 			assertThat(admitted()).isEqualTo(1);
 			Awaitility.await()
 				.atMost(IDLE_TIMEOUT.plus(ConnectionLimits.KeepAliveDeadline.TEARDOWN_GRACE).plusSeconds(2))

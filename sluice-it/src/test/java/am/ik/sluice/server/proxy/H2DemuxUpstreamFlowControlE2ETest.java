@@ -1,11 +1,14 @@
 package am.ik.sluice.server.proxy;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayDeque;
@@ -25,6 +28,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.UnaryOperator;
 
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
@@ -641,19 +645,80 @@ class H2DemuxUpstreamFlowControlE2ETest {
 		}));
 		DataProxyServer proxy = Objects.requireNonNull(this.dataProxyServer);
 		Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> proxy.activeConnections() == 0);
-		long gone;
-		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
-			TestH2.writeClientHead(socket.getOutputStream(), 1, ":authority=" + route, ":method=GET", ":scheme=http",
-					":path=/");
-			socket.shutdownOutput();
-			assertThat(head.await(5, TimeUnit.SECONDS)).as("the request reached the upstream").isTrue();
-			gone = System.nanoTime();
+		AtomicReference<@Nullable RecordingPipe> pipe = recordClientPipe(proxy);
+		try {
+			try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+				TestH2.writeClientHead(socket.getOutputStream(), 1, ":authority=" + route, ":method=GET",
+						":scheme=http", ":path=/");
+				socket.shutdownOutput();
+				assertThat(head.await(5, TimeUnit.SECONDS)).as("the request reached the upstream").isTrue();
+			}
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> proxy.activeConnections() == 0);
 		}
-		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> proxy.activeConnections() == 0);
-		assertThat(Duration.ofNanos(System.nanoTime() - gone)).as("at a probe: a second without a write, or two")
-			.isGreaterThan(Duration.ofMillis(800))
-			.isLessThan(Duration.ofMillis(3500));
+		finally {
+			proxy.clientPipeSeam(UnaryOperator.identity());
+		}
+		List<WrittenFrame> written = framesWritten(pipe);
+		List<WrittenFrame> probes = written.stream().filter(WrittenFrame::probe).toList();
+		// the first write fails on the client's reset, or the second
+		assertThat(probes).as("ended at a probe").hasSizeBetween(1, 2);
+		assertThat(written.subList(written.indexOf(probes.getFirst()), written.size())).as("nothing but probes after")
+			.allMatch(WrittenFrame::probe);
+		WrittenFrame before = written.get(written.indexOf(probes.getFirst()) - 1);
+		assertThat(Duration.ofNanos(probes.getFirst().nanoTime() - before.nanoTime()))
+			.as("after the probe interval without a write")
+			.isGreaterThanOrEqualTo(Duration.ofSeconds(1));
 		assertThat(eof.await(5, TimeUnit.SECONDS)).as("the upstream connection was closed").isTrue();
+	}
+
+	/** A frame the relay wrote to its client, when the write carrying its start began. */
+	private record WrittenFrame(TestH2.Frame frame, long nanoTime) {
+
+		boolean probe() {
+			return this.frame.type() == TestH2.PING && (this.frame.flags() & TestH2.FLAG_ACK) == 0
+					&& ByteBuffer.wrap(this.frame.payload()).getLong() == NettyHttp2DemuxRelay.PROBE_PAYLOAD;
+		}
+
+	}
+
+	/**
+	 * Records the client pipe of the relays started from now on, the latest in the
+	 * reference; the caller resets the seam.
+	 */
+	private static AtomicReference<@Nullable RecordingPipe> recordClientPipe(DataProxyServer proxy) {
+		AtomicReference<@Nullable RecordingPipe> recorded = new AtomicReference<>();
+		proxy.clientPipeSeam(pipe -> {
+			RecordingPipe recording = new RecordingPipe(pipe);
+			recorded.set(recording);
+			return recording;
+		});
+		return recorded;
+	}
+
+	/** The frames the relay wrote to its client, in order. */
+	private static List<WrittenFrame> framesWritten(AtomicReference<@Nullable RecordingPipe> recorded)
+			throws IOException {
+		List<RecordingPipe.Write> writes = Objects.requireNonNull(recorded.get(), "no relay started").writes();
+		ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+		List<Long> ends = new ArrayList<>();
+		for (RecordingPipe.Write write : writes) {
+			bytes.writeBytes(write.bytes());
+			ends.add((long) bytes.size());
+		}
+		ByteArrayInputStream in = new ByteArrayInputStream(bytes.toByteArray());
+		List<WrittenFrame> frames = new ArrayList<>();
+		while (true) {
+			long start = bytes.size() - in.available();
+			TestH2.@Nullable Frame frame = TestH2.readFrame(in);
+			if (frame == null) {
+				return frames;
+			}
+			int write = 0;
+			while (ends.get(write) <= start) {
+				write++;
+			}
+			frames.add(new WrittenFrame(frame, writes.get(write).nanoTime()));
+		}
 	}
 
 	/**
@@ -675,16 +740,19 @@ class H2DemuxUpstreamFlowControlE2ETest {
 			}
 			eof.countDown();
 		}));
+		DataProxyServer proxy = Objects.requireNonNull(this.dataProxyServer);
+		AtomicReference<@Nullable RecordingPipe> pipe = recordClientPipe(proxy);
 		try (H2TestClient client = H2TestClient.connect(dataPort, 1)) {
 			client.headers(1, false, post(route));
 			assertThat(head.await(5, TimeUnit.SECONDS)).as("the request reached the upstream").isTrue();
-			long ended = System.nanoTime();
 			client.halfClose();
 			assertThat(client.awaitTrue(client::closed, Duration.ofSeconds(5))).as("the relay ended").isTrue();
-			assertThat(Duration.ofNanos(System.nanoTime() - ended)).as("before any probe")
-				.isLessThan(Duration.ofMillis(800));
 			assertThat(eof.await(5, TimeUnit.SECONDS)).as("the upstream connection was closed").isTrue();
 		}
+		finally {
+			proxy.clientPipeSeam(UnaryOperator.identity());
+		}
+		assertThat(framesWritten(pipe)).as("ended without a probe").noneMatch(WrittenFrame::probe);
 	}
 
 	/**

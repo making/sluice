@@ -21,7 +21,9 @@ import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.UnaryOperator;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocket;
@@ -138,6 +140,10 @@ class MalformedRequestE2ETest {
 
 	@Nullable
 	@Autowired
+	private DataProxyServer dataProxyServer;
+
+	@Nullable
+	@Autowired
 	private Router router;
 
 	@DynamicPropertySource
@@ -250,24 +256,38 @@ class MalformedRequestE2ETest {
 
 	@Test
 	void aLaterRequestWithAnInvalidChunkSizeIsAnswered400AndClosed() throws Exception {
+		AtomicReference<@Nullable RecordingPipe> recorded = new AtomicReference<>();
+		dataProxyServer().clientPipeSeam(pipe -> {
+			RecordingPipe recording = new RecordingPipe(pipe);
+			recorded.set(recording);
+			return recording;
+		});
 		try (Socket socket = connect()) {
 			byte[] first = get(ECHO_HOST);
 			assertThat(exchange(socket, first)).isEqualTo(echoed("", first));
 			byte[] head = ascii(
 					"POST /upload HTTP/1.1\r\nHost: " + ECHO_HOST + "\r\nTransfer-Encoding: chunked\r\n\r\n");
+			long sent = System.nanoTime();
 			write(socket, concat(head, ascii("zz\r\n")));
 			// more of the body after the relay answered: had it closed with these bytes
 			// unread, its reset would discard the 400 before it is read
 			Thread.sleep(300);
 			write(socket, new byte[256 * 1024]);
 			assertThat(TestSockets.readUntil(socket.getInputStream(), BAD_REQUEST.length())).isEqualTo(BAD_REQUEST);
-			long answered = System.nanoTime();
-			assertThat(TestSockets.awaitClosed(socket, CLOSED_WITHIN)).as("half-closed after the 400")
-				.isLessThan(Duration.ofMillis(500));
+			TestSockets.awaitClosed(socket, CLOSED_WITHIN);
+			RecordingPipe pipe = Objects.requireNonNull(recorded.get());
+			assertThat(pipe.calls()).as("half-closed after the 400, not closed")
+				.endsWith(RecordingPipe.Call.WRITE, RecordingPipe.Call.SHUTDOWN_OUTPUT)
+				.doesNotContain(RecordingPipe.Call.CLOSE);
+			assertThat(new String(pipe.writes().getLast().bytes(), StandardCharsets.US_ASCII)).isEqualTo(BAD_REQUEST);
 			// the client keeps its side open: the relay reads it until its linger is over
 			assertThat(admitted()).isEqualTo(1);
 			Awaitility.await().atMost(CLOSED_WITHIN).until(() -> admitted() == 0);
-			assertThat(Duration.ofNanos(System.nanoTime() - answered)).isGreaterThan(Duration.ofMillis(1500));
+			assertThat(Duration.ofNanos(System.nanoTime() - sent)).isGreaterThanOrEqualTo(ReroutingRelay.LINGER);
+			assertThat(pipe.calls()).last().isEqualTo(RecordingPipe.Call.CLOSE);
+		}
+		finally {
+			dataProxyServer().clientPipeSeam(UnaryOperator.identity());
 		}
 		byte[] relayed = concat(get(ECHO_HOST),
 				ascii("POST /upload HTTP/1.1\r\nHost: " + ECHO_HOST + "\r\nTransfer-Encoding: chunked\r\n\r\n"));
@@ -726,6 +746,10 @@ class MalformedRequestE2ETest {
 
 	private ConnectionLimits connectionLimits() {
 		return Objects.requireNonNull(this.connectionLimits, "connectionLimits");
+	}
+
+	private DataProxyServer dataProxyServer() {
+		return Objects.requireNonNull(this.dataProxyServer, "dataProxyServer");
 	}
 
 	private Router router() {

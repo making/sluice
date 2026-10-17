@@ -1,4 +1,4 @@
-package am.ik.sluice.it;
+package am.ik.sluice.server.proxy;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -22,7 +22,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.UnaryOperator;
 
 import javax.net.ssl.SNIHostName;
 import javax.net.ssl.SSLContext;
@@ -45,9 +47,10 @@ import org.junit.jupiter.params.provider.CsvSource;
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
+import am.ik.sluice.it.TestPorts;
+import am.ik.sluice.it.TestSockets;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.config.SluiceServerProperties;
-import am.ik.sluice.server.proxy.DataProxyServer;
 import am.ik.sluice.server.route.Router;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -189,6 +192,7 @@ class HalfCloseProbeE2ETest {
 		// a test failing midway leaves no upstream waiting
 		this.gate.release(100);
 		this.release.release(100);
+		dataProxyServer().clientPipeSeam(UnaryOperator.identity());
 	}
 
 	@AfterAll
@@ -212,6 +216,7 @@ class HalfCloseProbeE2ETest {
 	 */
 	@Test
 	void aClientGoneAfterItsHalfCloseIsNoticedByTheProbe() throws Exception {
+		AtomicReference<@Nullable RecordingPipe> pipe = recordClientPipe();
 		Socket socket = new Socket("127.0.0.1", dataPort);
 		try (socket) {
 			socket.getOutputStream().write(get("/", HOLD_HOST, "1.1"));
@@ -222,18 +227,13 @@ class HalfCloseProbeE2ETest {
 			assertThat(dataProxyServer().activeConnections()).as("the relay is live").isEqualTo(1);
 			assertThat(upstreamConnections()).as("so is the upstream connection").isEqualTo(1);
 		}
-		long closed = System.nanoTime();
-		Awaitility.await()
-			.atMost(INTERVAL.multipliedBy(4))
-			.pollInterval(Duration.ofMillis(10))
-			.until(() -> dataProxyServer().activeConnections() == 0 && upstreamConnections() == 0);
-		assertThat(Duration.ofNanos(System.nanoTime() - closed)).as("released within two intervals and a margin")
-			.isLessThan(INTERVAL.multipliedBy(3));
+		awaitEndedAtAProbe(pipe);
 	}
 
 	/** The same over TLS: the client's close_notify reads as the end of its side. */
 	@Test
 	void aTlsClientGoneAfterItsRequestIsNoticedByTheProbe() throws Exception {
+		AtomicReference<@Nullable RecordingPipe> pipe = recordClientPipe();
 		SSLSocket socket = (SSLSocket) clientSslContext().getSocketFactory().createSocket("127.0.0.1", dataPort);
 		try (socket) {
 			SSLParameters parameters = socket.getSSLParameters();
@@ -246,12 +246,36 @@ class HalfCloseProbeE2ETest {
 			assertThat(this.held.await(5, TimeUnit.SECONDS)).as("the upstream read the request").isTrue();
 		}
 		assertThat(this.ended.await(5, TimeUnit.SECONDS)).as("the close reached the upstream as a half-close").isTrue();
-		long closed = System.nanoTime();
+		awaitEndedAtAProbe(pipe);
+	}
+
+	/**
+	 * Records the client pipe of the relays started from now on, the latest in the
+	 * reference; {@link #openGates} resets the seam.
+	 */
+	private AtomicReference<@Nullable RecordingPipe> recordClientPipe() {
+		AtomicReference<@Nullable RecordingPipe> recorded = new AtomicReference<>();
+		dataProxyServer().clientPipeSeam(pipe -> {
+			RecordingPipe recording = new RecordingPipe(pipe);
+			recorded.set(recording);
+			return recording;
+		});
+		return recorded;
+	}
+
+	/**
+	 * Awaits the end of the relay and its upstream connection, and asserts the relay
+	 * wrote nothing but probes to its gone client, the second write failing at the
+	 * latest.
+	 */
+	private void awaitEndedAtAProbe(AtomicReference<@Nullable RecordingPipe> pipe) {
 		Awaitility.await()
-			.atMost(INTERVAL.multipliedBy(4))
-			.pollInterval(Duration.ofMillis(10))
+			.atMost(Duration.ofSeconds(5))
 			.until(() -> dataProxyServer().activeConnections() == 0 && upstreamConnections() == 0);
-		assertThat(Duration.ofNanos(System.nanoTime() - closed)).isLessThan(INTERVAL.multipliedBy(3));
+		assertThat(Objects.requireNonNull(pipe.get()).writes()).as("ended at the first probe or the second")
+			.extracting(write -> new String(write.bytes(), StandardCharsets.US_ASCII))
+			.hasSizeBetween(1, 2)
+			.containsOnly(PROBE);
 	}
 
 	/**
