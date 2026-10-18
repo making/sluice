@@ -56,9 +56,12 @@ class ConsoleAuthE2ETest {
 		this.client = newClient();
 	}
 
-	/** A client with its own cookie jar, so tests start anonymous. */
+	/**
+	 * A client with its own cookie jar, so tests start anonymous; HTTP/1.1 like a browser
+	 * on plaintext HTTP (no h2c upgrade).
+	 */
 	private static HttpClient newClient() {
-		return HttpClient.newBuilder().cookieHandler(new CookieManager()).build();
+		return HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).cookieHandler(new CookieManager()).build();
 	}
 
 	private String base() {

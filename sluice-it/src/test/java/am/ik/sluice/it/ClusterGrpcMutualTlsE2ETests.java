@@ -543,7 +543,10 @@ class ClusterGrpcMutualTlsE2ETests {
 	 * separate PEM files.
 	 */
 	private static Map<String, String> issueThroughTheConsole(int consolePort, String commonName) throws Exception {
-		HttpClient console = HttpClient.newBuilder().cookieHandler(new CookieManager()).build();
+		HttpClient console = HttpClient.newBuilder()
+			.version(HttpClient.Version.HTTP_1_1)
+			.cookieHandler(new CookieManager())
+			.build();
 		String base = "http://127.0.0.1:" + consolePort;
 		String csrf = csrfOf(get(console, base + "/login").body());
 		postForm(console, base + "/login", "username=admin&password=admin&_csrf=" + urlEncode(csrf));

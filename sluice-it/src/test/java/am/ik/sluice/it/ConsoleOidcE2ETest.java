@@ -69,10 +69,13 @@ class ConsoleOidcE2ETest {
 
 	/**
 	 * A browser-like client: a cookie jar, and redirects followed across the console and
-	 * the mock IdP (the IdP consent is instant).
+	 * the mock IdP (the IdP consent is instant). HTTP/1.1 like a browser on plaintext
+	 * HTTP: the JDK client's default h2c upgrade is a path no browser takes (on CI the
+	 * upgraded connection to the console once ended in an EOF).
 	 */
 	private static HttpClient browser() {
 		return HttpClient.newBuilder()
+			.version(HttpClient.Version.HTTP_1_1)
 			.cookieHandler(new CookieManager())
 			.followRedirects(HttpClient.Redirect.ALWAYS)
 			.build();
@@ -124,7 +127,7 @@ class ConsoleOidcE2ETest {
 
 	@Test
 	void loginPageListsProvidersByName() throws Exception {
-		try (HttpClient client = HttpClient.newHttpClient()) {
+		try (HttpClient client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build()) {
 			HttpResponse<String> response = client.send(
 					HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + this.port + "/login")).build(),
 					HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
@@ -143,6 +146,7 @@ class ConsoleOidcE2ETest {
 		CookieManager cookies = new CookieManager();
 		String base = "http://127.0.0.1:" + this.port;
 		try (HttpClient client = HttpClient.newBuilder()
+			.version(HttpClient.Version.HTTP_1_1)
 			.cookieHandler(cookies)
 			.followRedirects(HttpClient.Redirect.ALWAYS)
 			.build()) {

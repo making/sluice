@@ -66,7 +66,8 @@ class GrafanaDashboardE2ETest {
 			"org.springframework.boot.security.autoconfigure.web.servlet.ServletWebSecurityAutoConfiguration",
 			"org.springframework.boot.security.autoconfigure.web.servlet.SecurityFilterAutoConfiguration");
 
-	private final HttpClient http = HttpClient.newHttpClient();
+	/** HTTP/1.1, as Prometheus scrapes: no h2c upgrade to the actuator. */
+	private final HttpClient http = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
 
 	private final ExecutorService upstreamExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
