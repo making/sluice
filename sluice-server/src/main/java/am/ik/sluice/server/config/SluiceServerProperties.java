@@ -408,6 +408,10 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * passthrough, a tcp route, a hostless connection, an upgraded HTTP/1.1 connection --
 	 * may relay no byte in either direction before it is closed, for the routes whose
 	 * upstream sets no {@code verbatim-idle-timeout} of its own; {@code 0} = off
+	 * @param tcpKeepAlive the TCP keepalive idle time of every accepted data plane
+	 * connection: once it carried nothing for so long, the kernel probes the client every
+	 * 10s and fails the connection after 3 probes unanswered; whole seconds, rounded up;
+	 * {@code 0} = off
 	 * @param advertiseTimeout how long a tunnel stream may go without the client's first
 	 * {@code Advertise} before it is failed ({@code DEADLINE_EXCEEDED}); until then the
 	 * stream serves no connection and leaves the client id's live session in place
@@ -441,12 +445,12 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			@DefaultValue("0") DataSize h2QueueBudget, @DefaultValue("30s") Duration h2StreamWaitTimeout,
 			@DefaultValue("1s") Duration halfCloseProbeInterval, @DefaultValue("60s") Duration stallTimeout,
 			@DefaultValue("16KB") DataSize stallMinBytes, @DefaultValue("60s") Duration tunnelStallTimeout,
-			@DefaultValue("0") Duration verbatimIdleTimeout, @DefaultValue("10s") Duration advertiseTimeout,
-			@DefaultValue("256") int maxPendingTunnelStreams, @DefaultValue("0") int maxPendingTunnelStreamsPerAddress,
-			@DefaultValue("1024") int maxTunnelSessions, @DefaultValue("0") int maxTunnelSessionsPerAddress,
-			@DefaultValue("0") DataSize connectionMemory, @DefaultValue("8") int overflowConnections,
-			@DefaultValue("5s") Duration overflowTimeout, @DefaultValue("5s") Duration overflowRetryAfter,
-			@DefaultValue("0") DataSize tunnelBudget) {
+			@DefaultValue("0") Duration verbatimIdleTimeout, @DefaultValue("60s") Duration tcpKeepAlive,
+			@DefaultValue("10s") Duration advertiseTimeout, @DefaultValue("256") int maxPendingTunnelStreams,
+			@DefaultValue("0") int maxPendingTunnelStreamsPerAddress, @DefaultValue("1024") int maxTunnelSessions,
+			@DefaultValue("0") int maxTunnelSessionsPerAddress, @DefaultValue("0") DataSize connectionMemory,
+			@DefaultValue("8") int overflowConnections, @DefaultValue("5s") Duration overflowTimeout,
+			@DefaultValue("5s") Duration overflowRetryAfter, @DefaultValue("0") DataSize tunnelBudget) {
 
 		/** The default of {@code maxPendingTunnelStreams}. */
 		public static final int DEFAULT_MAX_PENDING_TUNNEL_STREAMS = 256;
@@ -456,6 +460,9 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 		/** The default of {@code overflowConnections}. */
 		public static final int DEFAULT_OVERFLOW_CONNECTIONS = 8;
+
+		/** The default of {@code tcpKeepAlive}. */
+		public static final Duration DEFAULT_TCP_KEEP_ALIVE = Duration.ofSeconds(60);
 
 		public Limits {
 			maxConnections = Math.max(0, maxConnections);
@@ -477,6 +484,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 					: tunnelStallTimeout;
 			verbatimIdleTimeout = verbatimIdleTimeout == null || verbatimIdleTimeout.isNegative() ? Duration.ZERO
 					: verbatimIdleTimeout;
+			tcpKeepAlive = tcpKeepAlive == null || tcpKeepAlive.isNegative() ? DEFAULT_TCP_KEEP_ALIVE : tcpKeepAlive;
 			advertiseTimeout = advertiseTimeout == null || advertiseTimeout.isNegative() || advertiseTimeout.isZero()
 					? Duration.ofSeconds(10) : advertiseTimeout;
 			maxPendingTunnelStreams = maxPendingTunnelStreams > 0 ? maxPendingTunnelStreams
@@ -521,6 +529,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			@Nullable private Duration tunnelStallTimeout;
 
 			private Duration verbatimIdleTimeout = Duration.ZERO;
+
+			private Duration tcpKeepAlive = DEFAULT_TCP_KEEP_ALIVE;
 
 			@Nullable private Duration advertiseTimeout;
 
@@ -600,6 +610,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder tcpKeepAlive(Duration tcpKeepAlive) {
+				this.tcpKeepAlive = tcpKeepAlive;
+				return this;
+			}
+
 			public Builder advertiseTimeout(Duration advertiseTimeout) {
 				this.advertiseTimeout = advertiseTimeout;
 				return this;
@@ -660,7 +675,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 						this.stallTimeout == null ? Duration.ofSeconds(60) : this.stallTimeout,
 						this.stallMinBytes == null ? DataSize.ofKilobytes(16) : this.stallMinBytes,
 						this.tunnelStallTimeout == null ? Duration.ofSeconds(60) : this.tunnelStallTimeout,
-						this.verbatimIdleTimeout,
+						this.verbatimIdleTimeout, this.tcpKeepAlive,
 						this.advertiseTimeout == null ? Duration.ofSeconds(10) : this.advertiseTimeout,
 						this.maxPendingTunnelStreams, this.maxPendingTunnelStreamsPerAddress, this.maxTunnelSessions,
 						this.maxTunnelSessionsPerAddress,

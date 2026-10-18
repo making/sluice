@@ -2,8 +2,10 @@ package am.ik.sluice.client.tunnel;
 
 import org.jspecify.annotations.Nullable;
 
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.URI;
+import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -15,6 +17,9 @@ import javax.net.ssl.X509TrustManager;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import am.ik.sluice.client.config.SluiceClientProperties;
+import am.ik.sluice.tunnel.TcpKeepAlive;
 
 /**
  * Dials the local upstream for a tunnel CONNECT request. In strict mode only addresses
@@ -33,10 +38,16 @@ public class LocalConnector {
 
 	private final boolean insecure;
 
-	private LocalConnector(List<String> upstreams, boolean strict, boolean insecure) {
-		this.upstreams = upstreams;
-		this.strict = strict;
-		this.insecure = insecure;
+	private final Duration tcpKeepAlive;
+
+	private final Duration connectTimeout;
+
+	private LocalConnector(Builder builder) {
+		this.upstreams = Objects.requireNonNull(builder.upstreams, "upstreams is required");
+		this.strict = builder.strict;
+		this.insecure = builder.insecure;
+		this.tcpKeepAlive = builder.tcpKeepAlive;
+		this.connectTimeout = builder.connectTimeout;
 	}
 
 	public static Builder builder() {
@@ -53,6 +64,10 @@ public class LocalConnector {
 		private boolean strict;
 
 		private boolean insecure;
+
+		private Duration tcpKeepAlive = SluiceClientProperties.DEFAULT_TCP_KEEP_ALIVE;
+
+		private Duration connectTimeout = SluiceClientProperties.DEFAULT_CONNECT_TIMEOUT;
 
 		private Builder() {
 		}
@@ -72,9 +87,23 @@ public class LocalConnector {
 			return this;
 		}
 
+		/** The TCP keepalive idle time of the upstream connections; zero = off. */
+		public Builder tcpKeepAlive(Duration tcpKeepAlive) {
+			this.tcpKeepAlive = tcpKeepAlive;
+			return this;
+		}
+
+		/**
+		 * How long the TCP connect may take, and then each wait of the TLS handshake of
+		 * an {@code https} upstream.
+		 */
+		public Builder connectTimeout(Duration connectTimeout) {
+			this.connectTimeout = connectTimeout;
+			return this;
+		}
+
 		public LocalConnector build() {
-			return new LocalConnector(Objects.requireNonNull(this.upstreams, "upstreams is required"), this.strict,
-					this.insecure);
+			return new LocalConnector(this);
 		}
 
 	}
@@ -111,7 +140,8 @@ public class LocalConnector {
 	}
 
 	/**
-	 * Opens a plain or TLS socket to the upstream addressed by a CONNECT frame.
+	 * Opens a plain or TLS socket to the upstream addressed by a CONNECT frame, under the
+	 * connect timeout; on failure nothing opened stays open.
 	 */
 	public Socket dial(String address) throws Exception {
 		Optional<UpstreamEndpoint> endpoint = resolve(address);
@@ -133,15 +163,26 @@ public class LocalConnector {
 		if (this.strict && endpoint.isEmpty()) {
 			throw new IllegalArgumentException("upstream not permitted: " + address);
 		}
-		Socket socket = new Socket(host, port);
-		socket.setTcpNoDelay(true);
-		if ("https".equals(scheme)) {
-			SSLSocketFactory factory = sslFactory();
-			SSLSocket sslSocket = (SSLSocket) factory.createSocket(socket, host, port, true);
+		int timeout = (int) Math.clamp(this.connectTimeout.toMillis(), 1, Integer.MAX_VALUE);
+		Socket socket = new Socket();
+		try {
+			socket.connect(new InetSocketAddress(host, port), timeout);
+			socket.setTcpNoDelay(true);
+			TcpKeepAlive.enable(socket, this.tcpKeepAlive);
+			if (!"https".equals(scheme)) {
+				return socket;
+			}
+			SSLSocket sslSocket = (SSLSocket) sslFactory().createSocket(socket, host, port, true);
+			sslSocket.setSoTimeout(timeout);
 			sslSocket.startHandshake();
+			// the relay waits on its upstream for as long as the connection lives
+			sslSocket.setSoTimeout(0);
 			return sslSocket;
 		}
-		return socket;
+		catch (Exception e) {
+			socket.close();
+			throw e;
+		}
 	}
 
 	private SSLSocketFactory sslFactory() throws Exception {

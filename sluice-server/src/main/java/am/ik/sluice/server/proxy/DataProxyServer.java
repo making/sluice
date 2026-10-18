@@ -1,6 +1,7 @@
 package am.ik.sluice.server.proxy;
 
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PushbackInputStream;
@@ -41,6 +42,7 @@ import am.ik.sluice.server.tunnel.SessionRegistry;
 import am.ik.sluice.server.tunnel.TunnelSession;
 import am.ik.sluice.tunnel.DuplexPipe;
 import am.ik.sluice.tunnel.StreamRelay;
+import am.ik.sluice.tunnel.TcpKeepAlive;
 import am.ik.sluice.tunnel.VirtualConnection;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -191,6 +193,17 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				}
 				try {
 					socket.setTcpNoDelay(true);
+					TcpKeepAlive.enable(socket, this.properties.limits().tcpKeepAlive());
+				}
+				catch (IOException e) {
+					// the client reset the connection before it was taken up (on macOS
+					// the options fail on such a socket)
+					log.debug("dropped an accepted connection: {}", e.toString());
+					entry.release();
+					this.close(socket);
+					continue;
+				}
+				try {
 					switch (entry) {
 						case ConnectionLimits.Admission admission ->
 							this.taskExecutor.execute(() -> this.handle(socket, access, admission));

@@ -167,6 +167,8 @@ public final class NodeConnection implements AutoCloseable {
 			.upstreams(builder.properties.upstreamTargets())
 			.strict(builder.properties.strictForwarding())
 			.insecure(builder.properties.insecure())
+			.tcpKeepAlive(builder.properties.tcpKeepAlive())
+			.connectTimeout(builder.properties.connectTimeout())
 			.build();
 		this.advertise = Advertise.newBuilder()
 			.addAllUpstreams(builder.properties.toProtoUpstreams())

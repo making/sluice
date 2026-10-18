@@ -4,7 +4,12 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.net.StandardSocketOptions;
+import java.time.Duration;
 import java.util.List;
+
+import jdk.net.ExtendedSocketOptions;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledOnOs;
@@ -12,6 +17,7 @@ import org.junit.jupiter.api.condition.OS;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 class LocalConnectorTest {
 
@@ -79,9 +85,12 @@ class LocalConnectorTest {
 			LocalConnector connector = LocalConnector.builder()
 				.upstreams(List.of("http://127.0.0.1:" + port))
 				.strict(true)
+				.tcpKeepAlive(Duration.ofSeconds(45))
 				.build();
 			try (Socket socket = connector.dial("127.0.0.1:" + port)) {
 				assertThat(socket.isConnected()).isTrue();
+				assertThat(socket.getOption(StandardSocketOptions.SO_KEEPALIVE)).isTrue();
+				assertThat(socket.getOption(ExtendedSocketOptions.TCP_KEEPIDLE)).isEqualTo(45);
 			}
 			acceptor.join(1000);
 		}
@@ -108,6 +117,35 @@ class LocalConnectorTest {
 			}
 			httpAcceptor.join(1000);
 			tcpAcceptor.join(1000);
+		}
+	}
+
+	/**
+	 * An https upstream that accepts and never answers the ClientHello: the dial fails at
+	 * the connect timeout instead of waiting for good, and closes what it opened.
+	 */
+	@Test
+	@EnabledOnOs({ OS.LINUX, OS.MAC })
+	void aTlsUpstreamNeverAnsweringFailsTheDialAtTheConnectTimeout() throws Exception {
+		try (ServerSocket server = loopbackServer()) {
+			int port = server.getLocalPort();
+			LocalConnector connector = LocalConnector.builder()
+				.upstreams(List.of("https://127.0.0.1:" + port))
+				.strict(true)
+				.connectTimeout(Duration.ofMillis(500))
+				.build();
+			long start = System.nanoTime();
+			assertTimeoutPreemptively(Duration.ofSeconds(10),
+					() -> assertThatThrownBy(() -> connector.dial("127.0.0.1:" + port))
+						.isInstanceOf(SocketTimeoutException.class));
+			assertThat(Duration.ofNanos(System.nanoTime() - start)).isGreaterThanOrEqualTo(Duration.ofMillis(500));
+			try (Socket accepted = server.accept()) {
+				accepted.setSoTimeout(5_000);
+				// the ClientHello, then the end of the stream: the dial closed its socket
+				while (accepted.getInputStream().read() >= 0) {
+					// drain
+				}
+			}
 		}
 	}
 

@@ -39,6 +39,12 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	/** Default of {@code sluice.client.tunnel-stall-timeout}. */
 	static final Duration DEFAULT_STALL_TIMEOUT = Duration.ofSeconds(60);
 
+	/** Default of {@code sluice.client.tcp-keep-alive}. */
+	public static final Duration DEFAULT_TCP_KEEP_ALIVE = Duration.ofSeconds(60);
+
+	/** Default of {@code sluice.client.connect-timeout}. */
+	public static final Duration DEFAULT_CONNECT_TIMEOUT = Duration.ofSeconds(10);
+
 	/**
 	 * Tunnel settings configured under {@code sluice.client}.
 	 *
@@ -58,10 +64,18 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	 * server while not ready, the server taking none of them, before the stream is
 	 * cancelled -- its connections failed, the slots they hold freed -- and reconnected;
 	 * {@code 0} = off
+	 * @param tcpKeepAlive the TCP keepalive idle time of every upstream connection: once
+	 * it carried nothing for so long, the kernel probes the upstream every 10s and fails
+	 * the connection after 3 probes unanswered; whole seconds, rounded up; {@code 0} =
+	 * off
+	 * @param connectTimeout how long dialing an upstream may wait: for the TCP connect,
+	 * and then for each read of the TLS handshake of an {@code https} upstream; the
+	 * CONNECT is answered with an ERROR past it
 	 */
 	public record Client(@DefaultValue("") String id, @DefaultValue List<Upstream> upstream,
 			@DefaultValue("0") int maxConnections, @DefaultValue("60s") Duration tunnelStallTimeout,
-			@DefaultValue("0") DataSize tunnelBudget) {
+			@DefaultValue("0") DataSize tunnelBudget, @DefaultValue("60s") Duration tcpKeepAlive,
+			@DefaultValue("10s") Duration connectTimeout) {
 
 		public Client {
 			id = id == null ? "" : id;
@@ -70,6 +84,9 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 			tunnelStallTimeout = tunnelStallTimeout == null || tunnelStallTimeout.isNegative() ? DEFAULT_STALL_TIMEOUT
 					: tunnelStallTimeout;
 			tunnelBudget = tunnelBudget == null || tunnelBudget.isNegative() ? DataSize.ofBytes(0) : tunnelBudget;
+			tcpKeepAlive = tcpKeepAlive == null || tcpKeepAlive.isNegative() ? DEFAULT_TCP_KEEP_ALIVE : tcpKeepAlive;
+			connectTimeout = connectTimeout == null || connectTimeout.isNegative() || connectTimeout.isZero()
+					? DEFAULT_CONNECT_TIMEOUT : connectTimeout;
 		}
 
 		public static Builder builder() {
@@ -87,6 +104,10 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 			private Duration tunnelStallTimeout = DEFAULT_STALL_TIMEOUT;
 
 			private DataSize tunnelBudget = DataSize.ofBytes(0);
+
+			private Duration tcpKeepAlive = DEFAULT_TCP_KEEP_ALIVE;
+
+			private Duration connectTimeout = DEFAULT_CONNECT_TIMEOUT;
 
 			private Builder() {
 			}
@@ -116,9 +137,19 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 				return this;
 			}
 
+			public Builder tcpKeepAlive(Duration tcpKeepAlive) {
+				this.tcpKeepAlive = tcpKeepAlive;
+				return this;
+			}
+
+			public Builder connectTimeout(Duration connectTimeout) {
+				this.connectTimeout = connectTimeout;
+				return this;
+			}
+
 			public Client build() {
 				return new Client(this.id, this.upstream, this.maxConnections, this.tunnelStallTimeout,
-						this.tunnelBudget);
+						this.tunnelBudget, this.tcpKeepAlive, this.connectTimeout);
 			}
 
 		}
@@ -138,6 +169,19 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	/** The configured tunnel stall timeout; {@code 0} = off. */
 	public Duration tunnelStallTimeout() {
 		return this.client == null ? DEFAULT_STALL_TIMEOUT : this.client.tunnelStallTimeout();
+	}
+
+	/**
+	 * The configured TCP keepalive idle time of the upstream connections; {@code 0} =
+	 * off.
+	 */
+	public Duration tcpKeepAlive() {
+		return this.client == null ? DEFAULT_TCP_KEEP_ALIVE : this.client.tcpKeepAlive();
+	}
+
+	/** The configured upstream connect timeout. */
+	public Duration connectTimeout() {
+		return this.client == null ? DEFAULT_CONNECT_TIMEOUT : this.client.connectTimeout();
 	}
 
 	/**
@@ -210,6 +254,10 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 
 		private DataSize tunnelBudget = DataSize.ofBytes(0);
 
+		private Duration tcpKeepAlive = DEFAULT_TCP_KEEP_ALIVE;
+
+		private Duration connectTimeout = DEFAULT_CONNECT_TIMEOUT;
+
 		@Nullable private String token;
 
 		@Nullable private String tokenFile;
@@ -257,6 +305,16 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 			return this;
 		}
 
+		public Builder tcpKeepAlive(Duration tcpKeepAlive) {
+			this.tcpKeepAlive = tcpKeepAlive;
+			return this;
+		}
+
+		public Builder connectTimeout(Duration connectTimeout) {
+			this.connectTimeout = connectTimeout;
+			return this;
+		}
+
 		public Builder token(String token) {
 			this.token = token;
 			return this;
@@ -300,6 +358,8 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 						.maxConnections(this.maxConnections)
 						.tunnelStallTimeout(this.tunnelStallTimeout)
 						.tunnelBudget(this.tunnelBudget)
+						.tcpKeepAlive(this.tcpKeepAlive)
+						.connectTimeout(this.connectTimeout)
 						.build(),
 					this.token == null ? "" : this.token, this.tokenFile, this.insecure, this.tlsBundle,
 					this.strictForwarding, this.keepAliveTime, this.keepAliveTimeout);

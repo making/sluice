@@ -271,6 +271,7 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.limits.stall-timeout` | `60s` | how long a request or response in flight on a plaintext or TLS-terminated HTTP connection (HTTP/1.1 or h2) may wait on its client without progress before the connection is closed; see "Connection limits" |
 | `sluice.limits.stall-min-bytes` | `16KB` | the bytes moved to or from the client that count as progress against `stall-timeout` (`1B`: every byte counts) |
 | `sluice.limits.verbatim-idle-timeout` | `0` = off | how long a connection relayed verbatim (TLS passthrough, tcp route, hostless, upgraded HTTP/1.1) may relay no byte in either direction before it is closed, for the routes whose upstream sets no `verbatim-idle-timeout`; see "Connection limits" |
+| `sluice.limits.tcp-keep-alive` | `60s` | TCP keepalive idle time of every accepted data plane connection: once it carried nothing for so long, the kernel probes the client every 10s and fails the connection after 3 probes unanswered; whole seconds; `0` = off; see "Connection limits" |
 | `sluice.limits.tunnel-stall-timeout` | `60s` | how long a tunnel stream may hold frames queued for its client while not ready, the client taking none of them, before the session is failed; `0` = off; see "Connection limits" |
 | `sluice.limits.half-close-probe-interval` | `1s` | quiet after which a plaintext or TLS-terminated HTTP connection whose client ended its side, a response owed, gets a probe to learn whether the client is gone: HTTP/1.1 a `100 Continue`, h2 a PING; `0` = off; see "Connection limits" |
 | `sluice.limits.advertise-timeout` | `10s` | how long a tunnel stream may go without the client's first `Advertise` before it is failed with `DEADLINE_EXCEEDED`; see "Connection limits" |
@@ -307,8 +308,10 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 |---|---|---|
 | `sluice.server-url` | - | tunnel server endpoint (`grpc://host:port` / `grpcs://host:port`) |
 | `sluice.client.id` | random, once per process | stable client identity sent as `x-sluice-id` on every stream; breaks route / listen-port ties in cluster mode |
+| `sluice.client.connect-timeout` | `10s` | how long dialing an upstream may wait: for the TCP connect, then for each read of the TLS handshake of an `https` upstream; the `CONNECT` is answered with an ERROR past it |
 | `sluice.client.max-connections` | `0` = (half the max heap - `tunnel-budget`) / 293KiB | upstream connections open at once over every server node; a `CONNECT` beyond it is answered with an ERROR without dialing |
 | `sluice.client.tunnel-budget` | `0` = an eighth of half the max heap | bytes the client's connections may buffer beyond each connection's allowance, shared by all of them, as `sluice.limits.tunnel-budget` on the server (twice it, at least 1MiB, is the gRPC flow control window) |
+| `sluice.client.tcp-keep-alive` | `60s` | TCP keepalive idle time of every upstream connection, as `sluice.limits.tcp-keep-alive` on the server; `0` = off |
 | `sluice.client.tunnel-stall-timeout` | `60s` | how long a tunnel stream may hold frames queued for the server while not ready, the server taking none of them, before the stream is cancelled and reconnected; `0` = off; see "Connection limits" |
 | `sluice.client.upstream[n].host` | - | public domain routed by the server (empty = catch-all) |
 | `sluice.client.upstream[n].host-pattern` | - | regular expression the request host (without its port) is matched against, whole match; tried after the exact matches, before the catch-all, in natural order; overrides `host` when set |
@@ -637,6 +640,16 @@ shorter; a route cannot turn the server's off. Both are off by default: a peer t
 quiet on a connection relayed verbatim, or stops reading from it, then holds its slot of
 `max-connections` (and of `max-connections-per-address`) until it or the upstream closes
 the connection.
+
+A peer that is gone without its FIN or reset reaching the relay -- a pod or host removed,
+a NAT or conntrack entry dropped while the connection idled -- never closes the
+connection, and the kernel reclaims a half-closed socket only once the relay closed it. So
+every accepted data plane socket (`sluice.limits.tcp-keep-alive`) and every upstream
+socket of the client (`sluice.client.tcp-keep-alive`) carries TCP keepalive: after 60s
+without a byte the kernel probes the peer every 10s, and fails the socket's reads and
+writes once 3 probes went unanswered or one was answered with a reset, which ends the
+relay and releases its slot. A peer that is there answers the probes; only the verbatim
+idle timeout closes a live connection for idling.
 
 The plaintext and TLS-terminated HTTP/1.1 relay reads request and response heads as
 ISO-8859-1, so a field value carrying non-ASCII bytes (a UTF-8 header value, RFC 9110

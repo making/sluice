@@ -89,6 +89,7 @@ class SluiceServerPropertiesTest {
 		assertThat(properties.limits().stallMinBytes().toBytes()).isEqualTo(16 * 1024);
 		assertThat(properties.limits().tunnelStallTimeout()).isEqualTo(Duration.ofSeconds(60));
 		assertThat(properties.limits().verbatimIdleTimeout()).isZero();
+		assertThat(properties.limits().tcpKeepAlive()).isEqualTo(Duration.ofSeconds(60));
 		assertThat(properties.limits().advertiseTimeout()).isEqualTo(Duration.ofSeconds(10));
 		assertThat(properties.limits().maxPendingTunnelStreams()).isEqualTo(256);
 		assertThat(properties.limits().maxPendingTunnelStreamsPerAddress()).isZero();
@@ -168,11 +169,14 @@ class SluiceServerPropertiesTest {
 	}
 
 	@Test
-	void aZeroHalfCloseProbeIntervalTurnsTheProbeOffAndANegativeOneFallsBackToTheDefault() {
+	void aZeroHalfCloseProbeIntervalOrTcpKeepAliveTurnsItOffAndANegativeOneFallsBackToTheDefault() {
 		assertThat(bind(Map.of("sluice.limits.half-close-probe-interval", "0")).limits().halfCloseProbeInterval())
 			.isZero();
 		assertThat(bind(Map.of("sluice.limits.half-close-probe-interval", "-1s")).limits().halfCloseProbeInterval())
 			.isEqualTo(Duration.ofSeconds(1));
+		assertThat(bind(Map.of("sluice.limits.tcp-keep-alive", "0")).limits().tcpKeepAlive()).isZero();
+		assertThat(bind(Map.of("sluice.limits.tcp-keep-alive", "-1s")).limits().tcpKeepAlive())
+			.isEqualTo(Duration.ofSeconds(60));
 	}
 
 	@Test

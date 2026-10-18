@@ -2,7 +2,10 @@ package am.ik.sluice.it;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.StandardSocketOptions;
 import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
@@ -12,6 +15,7 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 
+import jdk.net.ExtendedSocketOptions;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.awaitility.Awaitility;
@@ -27,9 +31,15 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.server.config.SluiceServerProperties;
+import am.ik.sluice.server.proxy.HookedAccessLogger;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.Primary;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -39,13 +49,20 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /**
  * The global data plane connection limit: one count shared by the data port and every tcp
  * route port, taken at accept and released exactly once on every path a connection ends
- * by. A connection beyond the limit is closed unread.
+ * by. A connection beyond the limit is closed unread. Every accepted socket probes its
+ * client with TCP keepalive after the configured idle time.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
+@Import(ConnectionReleaseE2ETest.AcceptHook.class)
 class ConnectionReleaseE2ETest {
 
 	private static final byte[] NONE = new byte[0];
+
+	private static final Duration TCP_KEEP_ALIVE = Duration.ofSeconds(7);
+
+	/** The client's connect timeout, far below its default. */
+	private static final Duration CONNECT_TIMEOUT = Duration.ofMillis(500);
 
 	private static int grpcPort;
 
@@ -57,14 +74,35 @@ class ConnectionReleaseE2ETest {
 
 	private static @Nullable HoldingUpstream upstream;
 
+	/** Never accepts: its backlog completes the TCP connect, nothing answers after. */
+	private static @Nullable ServerSocket silentUpstream;
+
 	private @Nullable TunnelClient client;
 
 	@Autowired
 	private @Nullable MeterRegistry meterRegistry;
 
+	@Autowired
+	private @Nullable HookedAccessLogger accessLogger;
+
+	@Autowired
+	private @Nullable SluiceServerProperties properties;
+
+	@TestConfiguration
+	static class AcceptHook {
+
+		@Bean
+		@Primary
+		HookedAccessLogger hookedAccessLogger(SluiceServerProperties properties) {
+			return new HookedAccessLogger(properties);
+		}
+
+	}
+
 	@BeforeAll
 	static void startUpstream() throws IOException {
 		upstream = HoldingUpstream.start();
+		silentUpstream = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
 	}
 
 	@DynamicPropertySource
@@ -77,6 +115,7 @@ class ConnectionReleaseE2ETest {
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.tcp-port-range", () -> tcpRoutePort + "," + deniedTcpRoutePort);
 		registry.add("sluice.limits.max-connections", () -> "64");
+		registry.add("sluice.limits.tcp-keep-alive", () -> TCP_KEEP_ALIVE.toSeconds() + "s");
 		registry.add("sluice.token", () -> "it-token");
 		registry.add("server.port", () -> 0);
 	}
@@ -97,6 +136,10 @@ class ConnectionReleaseE2ETest {
 				.build())
 			.upstream(
 					Upstream.builder().host("passthrough.local").target("tcp://" + target).tlsPassthrough(true).build())
+			.upstream(Upstream.builder()
+				.host("tls-held.local")
+				.target("https://127.0.0.1:" + Objects.requireNonNull(silentUpstream).getLocalPort())
+				.build())
 			.upstream(Upstream.builder().host("held.tcp").target("tcp://" + target).listenPort(tcpRoutePort).build())
 			.upstream(Upstream.builder()
 				.host("denied.tcp")
@@ -105,6 +148,7 @@ class ConnectionReleaseE2ETest {
 				.allowedCidrs(List.of("203.0.113.0/24"))
 				.build())
 			.token("it-token")
+			.connectTimeout(CONNECT_TIMEOUT)
 			.build();
 		TunnelClient started = TunnelClient.builder()
 			.properties(properties)
@@ -127,6 +171,7 @@ class ConnectionReleaseE2ETest {
 			this.client.stop();
 		}
 		upstream().close();
+		Objects.requireNonNull(silentUpstream).close();
 	}
 
 	@Test
@@ -220,6 +265,67 @@ class ConnectionReleaseE2ETest {
 		awaitReleased(before);
 	}
 
+	@Test
+	void acceptedSocketsProbeTheirClientsAfterTheConfiguredIdleTime() throws Exception {
+		assertThat(Objects.requireNonNull(this.properties).limits().tcpKeepAlive()).isEqualTo(TCP_KEEP_ALIVE);
+		assertKeepAlive(dataPort, "held.local");
+		assertKeepAlive(tcpRoutePort, "held.tcp");
+	}
+
+	private void assertKeepAlive(int port, String host) throws Exception {
+		try (Socket socket = TestSockets.establish(port, NONE, host)) {
+			Socket accepted = accessLogger().last();
+			// the server's end of this very connection
+			assertThat(accepted.getLocalPort()).isEqualTo(port);
+			assertThat(accepted.getPort()).isEqualTo(socket.getLocalPort());
+			assertThat(accepted.getOption(StandardSocketOptions.SO_KEEPALIVE)).isTrue();
+			assertThat(accepted.getOption(ExtendedSocketOptions.TCP_KEEPIDLE))
+				.isEqualTo((int) TCP_KEEP_ALIVE.toSeconds());
+		}
+	}
+
+	/**
+	 * The accepted socket fails as its options are set (a client that reset the
+	 * connection does that on macOS; here the server's end is closed under the accept
+	 * loop): the slot it was admitted with is released.
+	 */
+	@Test
+	void aSocketFailingAsItIsTakenUpReleasesItsSlot() throws Exception {
+		assertFailingSocketReleased(dataPort, "held.local");
+		assertFailingSocketReleased(tcpRoutePort, "held.tcp");
+	}
+
+	private void assertFailingSocketReleased(int port, String host) throws Exception {
+		int before = baseline();
+		accessLogger().closeNext();
+		try (Socket socket = new Socket("127.0.0.1", port)) {
+			TestSockets.awaitClosed(socket, Duration.ofSeconds(5));
+		}
+		// the accept loop takes the connections in turn: one relayed after it is past
+		// the failed one
+		try (Socket later = TestSockets.establish(port, NONE, host)) {
+			assertThat(accessLogger().last().isClosed()).isFalse();
+		}
+		awaitReleased(before);
+	}
+
+	/**
+	 * The client's dial of an https upstream that never answers the TLS handshake fails
+	 * at the client's connect timeout: the connection ends and releases its slot.
+	 */
+	@Test
+	void aTlsUpstreamNeverAnsweringReleasesTheSlotAtTheClientsConnectTimeout() throws Exception {
+		int before = baseline();
+		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+			socket.getOutputStream().write(TestSockets.get("tls-held.local"));
+			long start = System.nanoTime();
+			// well inside the default connect timeout of 10s
+			TestSockets.awaitClosed(socket, Duration.ofSeconds(5));
+			assertThat(Duration.ofNanos(System.nanoTime() - start)).isGreaterThanOrEqualTo(CONNECT_TIMEOUT);
+		}
+		awaitReleased(before);
+	}
+
 	private void assertAnsweredAndReleased(String host, String status) throws Exception {
 		int before = baseline();
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
@@ -250,6 +356,10 @@ class ConnectionReleaseE2ETest {
 
 	private int admitted() {
 		return (int) meterRegistry().get("sluice.data.connections.admitted").gauge().value();
+	}
+
+	private HookedAccessLogger accessLogger() {
+		return Objects.requireNonNull(this.accessLogger, "accessLogger");
 	}
 
 	private MeterRegistry meterRegistry() {

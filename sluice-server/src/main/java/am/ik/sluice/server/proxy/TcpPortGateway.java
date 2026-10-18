@@ -1,5 +1,6 @@
 package am.ik.sluice.server.proxy;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.time.Duration;
 import java.net.InetAddress;
@@ -36,6 +37,7 @@ import am.ik.sluice.server.tunnel.Drainable;
 import am.ik.sluice.server.tunnel.TunnelSession;
 import am.ik.sluice.tunnel.DuplexPipe;
 import am.ik.sluice.tunnel.StreamRelay;
+import am.ik.sluice.tunnel.TcpKeepAlive;
 import am.ik.sluice.tunnel.VirtualConnection;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -286,6 +288,17 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 				}
 				try {
 					socket.setTcpNoDelay(true);
+					TcpKeepAlive.enable(socket, this.properties.limits().tcpKeepAlive());
+				}
+				catch (IOException e) {
+					// the client reset the connection before it was taken up (on macOS
+					// the options fail on such a socket)
+					log.debug("dropped an accepted connection on tcp route port {}: {}", port, e.toString());
+					admission.release();
+					this.close(socket);
+					continue;
+				}
+				try {
 					this.taskExecutor.execute(() -> this.relay(socket, port, access, admission));
 				}
 				catch (RuntimeException e) {

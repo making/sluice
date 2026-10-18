@@ -112,6 +112,29 @@ class SluiceClientPropertiesTest {
 		assertThat(bind(configured).tunnelStallTimeout()).isEqualTo(Duration.ofSeconds(60));
 	}
 
+	@Test
+	void tcpKeepAliveAndConnectTimeoutDefaultBindInKebabCaseAndFallBack() {
+		Map<String, Object> source = Map.of("sluice.server-url", "grpc://127.0.0.1:8001",
+				"sluice.client.upstream[0].host", "demo.local", "sluice.client.upstream[0].target", "127.0.0.1:8080");
+		assertThat(bind(source).tcpKeepAlive()).isEqualTo(Duration.ofSeconds(60));
+		assertThat(bind(source).connectTimeout()).isEqualTo(Duration.ofSeconds(10));
+		SluiceClientProperties sectionless = bind(Map.of("sluice.server-url", "grpc://127.0.0.1:8001"));
+		assertThat(sectionless.tcpKeepAlive()).as("without a client section").isEqualTo(Duration.ofSeconds(60));
+		assertThat(sectionless.connectTimeout()).as("without a client section").isEqualTo(Duration.ofSeconds(10));
+		Map<String, Object> configured = new java.util.HashMap<>(source);
+		configured.put("sluice.client.tcp-keep-alive", "30s");
+		configured.put("sluice.client.connect-timeout", "3s");
+		assertThat(bind(configured).tcpKeepAlive()).isEqualTo(Duration.ofSeconds(30));
+		assertThat(bind(configured).connectTimeout()).isEqualTo(Duration.ofSeconds(3));
+		// zero turns keepalive off; a connect without a timeout is not offered
+		configured.put("sluice.client.tcp-keep-alive", "0");
+		configured.put("sluice.client.connect-timeout", "0");
+		assertThat(bind(configured).tcpKeepAlive()).isZero();
+		assertThat(bind(configured).connectTimeout()).isEqualTo(Duration.ofSeconds(10));
+		configured.put("sluice.client.tcp-keep-alive", "-1s");
+		assertThat(bind(configured).tcpKeepAlive()).isEqualTo(Duration.ofSeconds(60));
+	}
+
 	private static SluiceClientProperties bind(Map<String, Object> source) {
 		StandardEnvironment environment = new StandardEnvironment();
 		environment.getPropertySources().addFirst(new MapPropertySource("test", source));
