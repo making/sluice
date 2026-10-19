@@ -7,7 +7,7 @@ never built or tested there.
 
 - `cargo test -p sluice-wicket-wasi` builds the example guests through the rustup
   `cargo` proxy inside `sluice-wicket-wasi/examples`, which pins
-  `nightly-2026-10-09` + `wasm32-wasip3` (`rust-toolchain.toml`): the job needs
+  `nightly-2026-10-18` + `wasm32-wasip3` (`rust-toolchain.toml`): the job needs
   rustup with that toolchain installable (auto-install from the toml), plus the
   stable host toolchain for the wicket itself
 - cache `~/.cargo/registry`, `sluice-wicket-wasi/target`, `sluice-wicket-wasi/examples/target`
