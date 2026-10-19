@@ -96,7 +96,7 @@ class ConnectionLimitOverflowProxyProtocolE2ETest {
 		keystorePath = createKeystore();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
-		registry.add("sluice.proxy-protocol", () -> "true");
+		registry.add("sluice.data-proxy-protocol", () -> "true");
 		registry.add("sluice.limits.max-connections", () -> "1");
 		registry.add("sluice.limits.overflow-connections", () -> "2");
 		registry.add("sluice.limits.overflow-timeout", () -> "2s");

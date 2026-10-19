@@ -124,7 +124,7 @@ class ProxyProtocolE2ETest {
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.tcp-port-range", () -> tcpRoutePort + "," + openTcpRoutePort);
-		registry.add("sluice.proxy-protocol", () -> "true");
+		registry.add("sluice.data-proxy-protocol", () -> "true");
 		registry.add("sluice.control-proxy-protocol", () -> "true");
 		registry.add("sluice.limits.head-timeout", () -> HEAD_TIMEOUT.toMillis() + "ms");
 		Path keystore = selfSignedKeystore();

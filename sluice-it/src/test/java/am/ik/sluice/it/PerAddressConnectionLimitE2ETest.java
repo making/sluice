@@ -71,7 +71,7 @@ class PerAddressConnectionLimitE2ETest {
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.tcp-port-range", () -> String.valueOf(tcpRoutePort));
-		registry.add("sluice.proxy-protocol", () -> "true");
+		registry.add("sluice.data-proxy-protocol", () -> "true");
 		registry.add("sluice.limits.max-connections-per-address", () -> "1");
 		registry.add("sluice.limits.head-timeout", () -> "2s");
 		registry.add("sluice.token", () -> "it-token");

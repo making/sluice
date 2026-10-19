@@ -316,7 +316,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				: null;
 		InputStream in = socket.getInputStream();
 		InetAddress peer = null;
-		if (this.properties.proxyProtocol()) {
+		if (this.properties.dataProxyProtocol()) {
 			// the header is consumed here and never relayed: the remainder is parsed
 			// exactly
 			// as on a plain connection, and headerless connections pass untouched

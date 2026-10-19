@@ -326,7 +326,7 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 		try {
 			InputStream source = socket.getInputStream();
 			InetAddress peer = peerOf(socket);
-			if (this.properties.proxyProtocol()) {
+			if (this.properties.dataProxyProtocol()) {
 				// the header is consumed here and never relayed: the relay starts past
 				// it, and headerless connections pass untouched. The parse is the only
 				// head phase of a tcp route connection, so it alone has the deadline
