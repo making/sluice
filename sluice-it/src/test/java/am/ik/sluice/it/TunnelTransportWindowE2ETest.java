@@ -122,13 +122,17 @@ class TunnelTransportWindowE2ETest {
 		assertThat(uploaded.get()).as("the upload went through").isEqualTo(BODY);
 		// the server receives the downloads: its windows bound the client's sending
 		assertThat(tap.target().initialWindow()).as("the server's stream window").isEqualTo(2 * BUDGET);
+		// the single top-up grant pins the configured window; the sampled peak misses it
+		// when the peer's first DATA precedes the grant (the grant does not re-credit it)
+		assertThat(tap.target().largestGrant()).as("the server's connection window top-up")
+			.isEqualTo(2 * BUDGET - H2WindowTap.INITIAL_CONNECTION_WINDOW);
 		assertThat(tap.target().maxConnectionWindow()).as("the server's connection window")
-			.isEqualTo(2 * BUDGET)
 			.isGreaterThan(2 * GRPC_TUNED_MAX);
 		// the client receives the uploads
 		assertThat(tap.connecting().initialWindow()).as("the client's stream window").isEqualTo(2 * CLIENT_BUDGET);
+		assertThat(tap.connecting().largestGrant()).as("the client's connection window top-up")
+			.isEqualTo(2 * CLIENT_BUDGET - H2WindowTap.INITIAL_CONNECTION_WINDOW);
 		assertThat(tap.connecting().maxConnectionWindow()).as("the client's connection window")
-			.isEqualTo(2 * CLIENT_BUDGET)
 			.isGreaterThan(2 * GRPC_TUNED_MAX);
 	}
 

@@ -23,7 +23,7 @@ import org.jspecify.annotations.Nullable;
 public final class H2WindowTap implements AutoCloseable {
 
 	/** RFC 9113's initial connection window. */
-	private static final int INITIAL_CONNECTION_WINDOW = 65535;
+	public static final int INITIAL_CONNECTION_WINDOW = 65535;
 
 	private static final int SETTINGS_INITIAL_WINDOW_SIZE = 0x4;
 
@@ -150,7 +150,10 @@ public final class H2WindowTap implements AutoCloseable {
 
 		private final AtomicLong maxConnectionWindow = new AtomicLong(INITIAL_CONNECTION_WINDOW);
 
+		private final AtomicLong largestGrant = new AtomicLong(0);
+
 		private void grant(long increment) {
+			this.largestGrant.accumulateAndGet(increment, Math::max);
 			this.maxConnectionWindow.accumulateAndGet(this.connectionWindow.addAndGet(increment), Math::max);
 		}
 
@@ -162,6 +165,11 @@ public final class H2WindowTap implements AutoCloseable {
 		/** The largest connection window the side granted. */
 		public long maxConnectionWindow() {
 			return this.maxConnectionWindow.get();
+		}
+
+		/** The largest single connection-window grant the side sent. */
+		public long largestGrant() {
+			return this.largestGrant.get();
 		}
 
 	}
