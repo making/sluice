@@ -11,6 +11,9 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.sun.net.httpserver.HttpServer;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.awaitility.Awaitility;
@@ -20,6 +23,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
+import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
@@ -37,7 +41,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * End to end: an SNAT front end (a local proxy, here) speaks the PROXY protocol to the
  * data plane. The header is consumed before routing / relay -- never forwarded -- and its
  * source address becomes the connection peer, admitting it to routes whose
- * {@code allowed-cidrs} list no socket address would match.
+ * {@code allowed-cidrs} list no socket address would match and standing as the
+ * {@code remote} of the access log lines.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -57,6 +62,8 @@ class ProxyProtocolE2ETest {
 
 	private static final TaskExecutor TASK_EXECUTOR = task -> Thread.ofVirtual().name("e2e-proxy-worker").start(task);
 
+	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ListAppender<>();
+
 	private static int grpcPort;
 
 	private static int dataPort;
@@ -71,6 +78,8 @@ class ProxyProtocolE2ETest {
 
 	@BeforeAll
 	static void startUpstreams() throws Exception {
+		ACCESS_EVENTS.start();
+		((Logger) LoggerFactory.getLogger("sluice.access")).addAppender(ACCESS_EVENTS);
 		httpUpstream = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
 		httpUpstream.createContext("/", exchange -> {
 			byte[] body = "hello-from-upstream".getBytes(StandardCharsets.UTF_8);
@@ -97,6 +106,7 @@ class ProxyProtocolE2ETest {
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.tcp-port-range", () -> String.valueOf(tcpRoutePort));
 		registry.add("sluice.proxy-protocol", () -> "true");
+		registry.add("sluice.access-log.rate-limit.enabled", () -> "false");
 		registry.add("sluice.token", () -> "it-token");
 		registry.add("server.port", () -> 0);
 	}
@@ -171,6 +181,7 @@ class ProxyProtocolE2ETest {
 			this.client.stop();
 		}
 		httpUpstream.stop(0);
+		((Logger) LoggerFactory.getLogger("sluice.access")).detachAppender(ACCESS_EVENTS);
 		try {
 			echoServer().close();
 		}
@@ -186,15 +197,23 @@ class ProxyProtocolE2ETest {
 		String response = raw(header, "GET / HTTP/1.1\r\nHost: proxied.local\r\nConnection: close\r\n\r\n");
 		assertThat(response.lines().findFirst()).hasValue("HTTP/1.1 200 OK");
 		assertThat(bodyOf(response)).isEqualTo("hello-from-upstream");
+		// both lines are written before the request is relayed
+		assertThat(accessLines())
+			.anySatisfy(line -> assertThat(line)
+				.matches("type=conn id=\\d+ event=accept listener=data remote=203\\.0\\.113\\.7:32100"))
+			.anySatisfy(line -> assertThat(line).matches(
+					"type=req id=\\d+ route=proxied\\.local method=GET path=/ http=1\\.1 remote=203\\.0\\.113\\.7:32100"));
 	}
 
 	@Test
 	void v1HeaderPeerAdmitsTheConnectionToHttpRoutes() throws Exception {
 		this.startClient();
-		byte[] header = "PROXY TCP4 203.0.113.7 198.51.100.7 32100 80\r\n".getBytes(StandardCharsets.US_ASCII);
+		byte[] header = "PROXY TCP4 203.0.113.7 198.51.100.7 32101 80\r\n".getBytes(StandardCharsets.US_ASCII);
 		String response = raw(header, "GET / HTTP/1.1\r\nHost: proxied.local\r\nConnection: close\r\n\r\n");
 		assertThat(response.lines().findFirst()).hasValue("HTTP/1.1 200 OK");
 		assertThat(bodyOf(response)).isEqualTo("hello-from-upstream");
+		assertThat(accessLines()).anySatisfy(line -> assertThat(line).matches(
+				"type=req id=\\d+ route=proxied\\.local method=GET path=/ http=1\\.1 remote=203\\.0\\.113\\.7:32101"));
 	}
 
 	@Test
@@ -218,6 +237,9 @@ class ProxyProtocolE2ETest {
 			InputStream in = socket.getInputStream();
 			// the echo starts at the first byte behind the header
 			assertThat(new String(in.readNBytes(4), StandardCharsets.US_ASCII)).isEqualTo("ping");
+			// written before the relay starts
+			assertThat(accessLines()).anySatisfy(line -> assertThat(line).matches(
+					"type=conn id=\\d+ event=accept listener=tcp:" + tcpRoutePort + " remote=203\\.0\\.113\\.7:32100"));
 			socket.shutdownOutput();
 			assertThat(in.readAllBytes()).isEmpty();
 		}
@@ -282,6 +304,13 @@ class ProxyProtocolE2ETest {
 				bytes.write(buffer, 0, n);
 			}
 			return bytes.toString(StandardCharsets.UTF_8);
+		}
+	}
+
+	private static List<String> accessLines() {
+		// the appender appends under its own monitor
+		synchronized (ACCESS_EVENTS) {
+			return ACCESS_EVENTS.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
 		}
 	}
 
