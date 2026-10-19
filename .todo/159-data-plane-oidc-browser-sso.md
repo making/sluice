@@ -11,6 +11,13 @@ h2 demux must not do it under its lock).
 
 ## Pieces
 
+- The route is an OIDC client (confidential, authorization code + PKCE): per route under
+  `sluice.route.auth.[<key>].oidc` -- issuer (discovery), client id, client secret, scopes
+  (`openid` at least). Or name a registration of `spring.security.oauth2.client.*`, which the
+  console already uses, so one provider config serves both; decide. The ID token from the code
+  exchange is validated with 157's JWKS / claim checks (issuer, audience = client id, nonce, `exp`).
+- Authorization past sign-in: who may pass (allowed emails / email domains / groups claim) per
+  route; a signed-in user outside it gets `403`, not another redirect.
 - `Verdict` gains a response other than a refusal: a `302` to the provider (`Location`, state /
   nonce / PKCE cookie). `ErrorResponse` already carries arbitrary headers (`Status#headers`).
 - Callback: a reserved path per route host (e.g. `/.sluice/oauth2/callback`) answered by the data
