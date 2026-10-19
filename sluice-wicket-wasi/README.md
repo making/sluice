@@ -244,6 +244,27 @@ jittered exponential backoff (ceiling 1s..30s, each wait drawn from
 its upper half); exactly one stream per node is kept, so a
 duplicate is closed on the client side before the server drops it.
 
+## Shutdown (drain)
+
+On SIGTERM / SIGINT the wicket drains as the Java client does (see "Client shutdown
+(drain)" in the root README for what the server does meanwhile):
+
+- every node stream withdraws the routes (`Advertise.withdraw`, the routes repeated);
+  no stream reconnects from then on
+- the connections open keep being served; once the server acknowledged the withdrawal
+  (`AdvertiseAck.withdrawn`) and no connection is left on a stream, the wicket ends it.
+  The process exits with 0 once every stream ended
+- `--drain-grace SECONDS` (default 20) bounds the wait: the connections still open are
+  then closed (`drain grace 20s expired; closing N open connection(s)`). `0` turns the
+  drain off: no signal handler is installed, a signal ends the process at once
+- a second SIGTERM / SIGINT ends the drain at once
+- a server predating the drain acknowledges the withdrawal without `withdrawn` and keeps
+  routing to the wicket: the wicket closes that stream at once
+
+`docker compose stop` (and `up -d` replacing a container) sends SIGKILL 10s after
+SIGTERM: set `stop_grace_period` above `--drain-grace`, e.g. `30s` for the default. On
+Kubernetes, `terminationGracePeriodSeconds` (30s by default) bounds it the same way.
+
 ## Known limitations (PoC scope)
 
 - no mTLS (client certificates) yet

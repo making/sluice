@@ -18,6 +18,7 @@ token: SECRET            # ${ENV} expansion for secrets; decide scope
 id: wicket-1
 # insecure: true
 # ca-cert: ca.pem
+# drain-grace: 20s       # every flag has its key (max-connections, tunnel-stall-timeout, ...)
 
 routes:
   - host: demo.local

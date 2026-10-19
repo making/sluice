@@ -13,6 +13,11 @@
 //! node. Exactly one stream per node is kept: the server closes the older
 //! registration when a client id re-registers.
 //!
+//! On SIGTERM / SIGINT the wicket drains ([`drain`], the Java client's
+//! `TunnelClient#drain`): every node stream withdraws the routes and ends
+//! once the server acknowledged it and no connection is left on it, within
+//! `--drain-grace`.
+//!
 //! Scope (deliberately minimal):
 //!
 //! - `grpc://` / `grpcs://` control plane (`--ca-cert` pins the CA,
@@ -37,6 +42,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 mod pb {
     include!(concat!(env!("OUT_DIR"), "/sluice.v1.rs"));
@@ -71,6 +77,7 @@ struct Config {
     max_connections: usize,
     max_instances: usize,
     stall_timeout: Duration,
+    drain_grace: Duration,
 }
 
 /// Reconnect backoff: the ceiling doubles from 1s to 30s and each wait is
@@ -123,6 +130,9 @@ const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// Default of `--tunnel-stall-timeout`, the Java side's
 /// `sluice.client.tunnel-stall-timeout`.
 const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default of `--drain-grace`, the Java side's `sluice.client.drain-grace`.
+const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(20);
 
 /// Default of `--max-instances`: 64 guest instances alive at once, i.e. at
 /// most 64 x the largest `memory-mib` of guest linear memory (16GiB at the
@@ -185,6 +195,22 @@ struct Shared {
     /// HTTP/2 window (stream and connection) the gRPC connection announces,
     /// see [`transport_window`].
     transport_window: u32,
+    /// The shutdown's drain, seen by every session.
+    drain: Drain,
+    /// The session tasks, the detached ones included: the drain waits for
+    /// them.
+    tasks: TaskTracker,
+}
+
+/// The shutdown's drain ([`drain`]).
+#[derive(Default)]
+struct Drain {
+    /// Cancelled once the drain began: every live stream withdraws the
+    /// routes, no stream is opened or reconnected.
+    begin: CancellationToken,
+    /// Cancelled once the drain is over (the grace ran out, a second signal):
+    /// every stream ends at once, failing its connections.
+    abort: CancellationToken,
 }
 
 /// One tunnel stream toward one node. The supervisor's `Arc` identity survives
@@ -218,9 +244,13 @@ struct NodeTask {
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = run(parse_args()).await {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+    match run(parse_args()).await {
+        // drained: the tasks left (guest instances among them) are not waited for
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -236,6 +266,7 @@ fn parse_args() -> Config {
         max_connections: DEFAULT_MAX_CONNECTIONS,
         max_instances: DEFAULT_MAX_INSTANCES,
         stall_timeout: DEFAULT_STALL_TIMEOUT,
+        drain_grace: DEFAULT_DRAIN_GRACE,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -272,6 +303,10 @@ fn parse_args() -> Config {
                 config.stall_timeout =
                     parse_seconds("tunnel-stall-timeout", &value("tunnel-stall-timeout"))
                         .unwrap_or_else(|e| panic!("{e}"));
+            }
+            "--drain-grace" => {
+                config.drain_grace = parse_seconds("drain-grace", &value("drain-grace"))
+                    .unwrap_or_else(|e| panic!("{e}"));
             }
             "--wasm" => {
                 let spec = value("wasm");
@@ -404,6 +439,7 @@ async fn run(config: Config) -> Result<(), BoxError> {
         max_connections,
         max_instances,
         stall_timeout,
+        drain_grace,
     } = config;
     println!("wicket build: {}", describe(&peer_build()));
     let instances = Instances::new(max_instances);
@@ -423,6 +459,8 @@ async fn run(config: Config) -> Result<(), BoxError> {
         limit: tunnel::Limit::new(max_connections),
         stall_timeout,
         transport_window: transport_window(max_connections),
+        drain: Drain::default(),
+        tasks: TaskTracker::new(),
     });
     println!("connection limit {max_connections}");
     println!(
@@ -438,8 +476,119 @@ async fn run(config: Config) -> Result<(), BoxError> {
         instances.streams_per_connection()
     );
 
+    println!("drain grace {}s (0 = off)", drain_grace.as_secs());
+
     let (tx, rx) = mpsc::channel::<Event>(32);
-    supervise(rx, tx, shared, server).await
+    let supervisor = supervise(rx, tx, shared.clone(), server);
+    if drain_grace.is_zero() {
+        // no handler: a signal ends the process at once
+        return supervisor.await;
+    }
+    let mut signals = Signals::install()?;
+    tokio::select! {
+        result = supervisor => return result,
+        // dropping the supervisor: no membership change opens a stream from now on
+        name = signals.recv() => println!("{name}: draining"),
+    }
+    let interrupt = async {
+        let name = signals.recv().await;
+        eprintln!("{name} during the drain: ending it at once");
+    };
+    drain(&shared, drain_grace, interrupt).await;
+    Ok(())
+}
+
+/// SIGTERM and SIGINT. Once installed, neither ends the process by itself.
+#[cfg(unix)]
+struct Signals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl Signals {
+    fn install() -> std::io::Result<Signals> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Signals {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// The next one received.
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.term.recv() => "SIGTERM",
+            _ = self.int.recv() => "SIGINT",
+        }
+    }
+}
+
+/// Ctrl-C where there are no unix signals.
+#[cfg(not(unix))]
+struct Signals;
+
+#[cfg(not(unix))]
+impl Signals {
+    fn install() -> std::io::Result<Signals> {
+        Ok(Signals)
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl-C"
+    }
+}
+
+/// How a drain ended.
+#[derive(Debug, PartialEq, Eq)]
+enum DrainEnd {
+    /// Every stream ended: drained, closed for a server predating the drain,
+    /// or failed.
+    Drained,
+    /// The grace ran out first.
+    GraceExpired,
+    /// `interrupt` came first.
+    Interrupted,
+}
+
+/// Drains the sessions (`TunnelClient#drain`): every live stream withdraws
+/// the routes and keeps serving its connections until the server
+/// acknowledged the withdrawal and none is left, then ends; a session not
+/// connected just stops. After `grace`, or once `interrupt` resolves, the
+/// streams left end at once, failing their connections. Returns once every
+/// session task ended (at most a few seconds after that).
+async fn drain(shared: &Shared, grace: Duration, interrupt: impl Future<Output = ()>) -> DrainEnd {
+    shared.drain.begin.cancel();
+    shared.tasks.close();
+    println!(
+        "draining: withdrawing the routes; waiting up to {}s for {} open connection(s)",
+        grace.as_secs(),
+        shared.limit.open()
+    );
+    let end = tokio::select! {
+        () = shared.tasks.wait() => DrainEnd::Drained,
+        () = tokio::time::sleep(grace) => DrainEnd::GraceExpired,
+        () = interrupt => DrainEnd::Interrupted,
+    };
+    let open = shared.limit.open();
+    match end {
+        DrainEnd::Drained => println!("drain ended with {open} open connection(s)"),
+        DrainEnd::GraceExpired => eprintln!(
+            "drain grace {}s expired; closing {open} open connection(s)",
+            grace.as_secs()
+        ),
+        DrainEnd::Interrupted => eprintln!("drain aborted; closing {open} open connection(s)"),
+    }
+    shared.drain.abort.cancel();
+    // the streams end on the abort without waiting on the server
+    if tokio::time::timeout(Duration::from_secs(5), shared.tasks.wait())
+        .await
+        .is_err()
+    {
+        eprintln!("drain: a session did not end within 5s of the abort");
+    }
+    end
 }
 
 /// The fan-out supervisor: one session per known node, keyed by node id (the
@@ -565,13 +714,14 @@ fn spawn_session(
         key,
         events,
     };
-    tokio::spawn(task.run());
+    shared.tasks.spawn(task.run());
     session
 }
 
 impl NodeTask {
     /// Connect / serve / reconnect loop with jittered exponential backoff
-    /// (`NodeConnection#runLoop`); exits once the supervisor cancels the token.
+    /// (`NodeConnection#runLoop`); exits once the supervisor cancels the token
+    /// or the drain began, after the stream's end.
     async fn run(self) {
         let mut backoff = Backoff::new();
         loop {
@@ -581,9 +731,11 @@ impl NodeTask {
                 Err(e) => eprintln!("[{}] tunnel stream ended: {e}", self.key),
             }
             let token = self.session.token.clone();
+            let draining = self.shared.drain.begin.clone();
             tokio::select! {
                 _ = tokio::time::sleep(backoff.next(jitter_unit())) => {}
                 _ = token.cancelled() => return,
+                _ = draining.cancelled() => return,
             }
         }
     }
@@ -609,18 +761,25 @@ impl NodeTask {
                 self.shared.ca_pem.as_deref(),
             )?;
         }
-        let channel = endpoint.connect().await?;
+        let draining = self.shared.drain.begin.clone();
+        let channel = tokio::select! {
+            channel = endpoint.connect() => channel?,
+            // nothing is served here yet: no stream to drain
+            _ = draining.cancelled() => return Ok(false),
+        };
 
         // The bidi stream: outbound frames are scheduled by `outbound`,
         // inbound arrive via `inbound`.
         let (outbound, frames) = Outbound::new();
-        outbound.control(advertise(self.shared.advertised.clone()));
+        outbound.control(advertise(self.shared.advertised.clone(), false));
         let mut request = tonic::Request::new(frames);
         identify(&mut request, &self.shared.token, &self.shared.id)?;
-        let inbound = <pb::tunnel_client::TunnelClient<_>>::new(channel.clone())
-            .connect(request)
-            .await?
-            .into_inner();
+        let mut client = <pb::tunnel_client::TunnelClient<_>>::new(channel.clone());
+        let inbound = tokio::select! {
+            response = client.connect(request) => response?.into_inner(),
+            // no frame of the server was taken: dropping the call cancels it
+            _ = draining.cancelled() => return Ok(false),
+        };
 
         let watchdog = outbound.clone();
         let connections = Connections::new(
@@ -645,6 +804,15 @@ impl NodeTask {
     /// stall timeout (a server that stopped reading, keeping the connection
     /// alive): the caller's teardown then drops the queued frames and frees
     /// their slots, and dropping the call resets the stream.
+    ///
+    /// Once the drain began, the routes are withdrawn (`Advertise.withdraw`)
+    /// and the connections keep being served. The server's
+    /// `AdvertiseAck.withdrawn` tells that no CONNECT follows: once no
+    /// connection holds a slot any more, the request stream is ended, which
+    /// the server answers by ending its side. An ack to the withdrawing
+    /// advertise without `withdrawn` comes from a server predating the drain,
+    /// which keeps routing here: the stream ends at once. The drain's abort
+    /// ends it at once too.
     async fn stream(
         &self,
         mut inbound: tonic::Streaming<Frame>,
@@ -653,14 +821,31 @@ impl NodeTask {
         outbound: &Outbound,
     ) -> Result<bool, BoxError> {
         let mut established = false;
+        // the advertise opening the stream
+        let mut advertises_sent = 1;
+        let mut acks_received = 0;
+        // the ordinal of the withdrawing advertise among the stream's; 0 = not sent
+        let mut withdrawal = 0;
+        let mut withdrawn = false;
+        let mut ending = false;
+        let mut held = connections.held();
+        let drain = &self.shared.drain;
+        enum Step {
+            Frame(Frame),
+            Withdraw,
+            Drained,
+        }
         loop {
-            let frame = tokio::select! {
+            let step = tokio::select! {
                 frame = inbound.message() => match frame {
-                    Ok(Some(frame)) => frame,
+                    Ok(Some(frame)) => Step::Frame(frame),
                     Ok(None) => return Ok(established),
                     Err(e) => return Err(e.into()),
                 },
                 _ = self.session.token.cancelled() => return Ok(established),
+                _ = drain.abort.cancelled() => return Ok(established),
+                _ = drain.begin.cancelled(), if withdrawal == 0 => Step::Withdraw,
+                _ = held.wait_for(|held| *held == 0), if withdrawn && !ending => Step::Drained,
                 stalled = outbound.stalled(self.shared.stall_timeout) => {
                     eprintln!(
                         "[{}] tunnel stream held frames queued with none taken for {}ms: giving it up",
@@ -670,8 +855,49 @@ impl NodeTask {
                     return Ok(established);
                 }
             };
+            let frame = match step {
+                Step::Frame(frame) => frame,
+                Step::Withdraw => {
+                    advertises_sent += 1;
+                    withdrawal = advertises_sent;
+                    outbound.control(advertise(self.shared.advertised.clone(), true));
+                    println!(
+                        "[{}] withdrawing the routes; {} connection(s) open",
+                        self.key,
+                        *held.borrow()
+                    );
+                    continue;
+                }
+                Step::Drained => {
+                    ending = true;
+                    println!("[{}] drained; ending the tunnel stream", self.key);
+                    // no frame is left to send: the request stream ends
+                    outbound.shutdown();
+                    continue;
+                }
+            };
             match frame.body {
                 Some(Body::AdvertiseAck(ack)) => {
+                    acks_received += 1;
+                    if ack.withdrawn {
+                        if !withdrawn {
+                            withdrawn = true;
+                            println!(
+                                "[{}] server acknowledged the withdrawal; {} connection(s) left",
+                                self.key,
+                                *held.borrow()
+                            );
+                        }
+                        continue;
+                    }
+                    if withdrawal > 0 && acks_received >= withdrawal {
+                        eprintln!(
+                            "[{}] the server predates the client drain (Advertise.withdraw) and \
+                             keeps routing to this client; closing the tunnel stream at once",
+                            self.key
+                        );
+                        return Ok(established);
+                    }
                     println!(
                         "[{}] advertise acked by {} (rejected ports: {:?})",
                         self.key, ack.node_id, ack.rejected_ports
@@ -745,13 +971,16 @@ impl NodeTask {
 
 /// The Advertise opening every stream: the routes, the receive window the
 /// server requires (it fails the stream of a peer announcing none), and this
-/// binary's build.
-fn advertise(upstreams: Vec<Upstream>) -> Frame {
+/// binary's build. With `withdraw`, the drain's: the routes are repeated, so
+/// a server predating the field registers them unchanged and acknowledges it
+/// without `withdrawn`.
+fn advertise(upstreams: Vec<Upstream>, withdraw: bool) -> Frame {
     Frame {
         body: Some(Body::Advertise(Advertise {
             upstreams,
             connection_window: tunnel::WINDOW,
             build: Some(peer_build()),
+            withdraw,
         })),
     }
 }
@@ -987,25 +1216,7 @@ mod tests {
     #[tokio::test]
     async fn a_server_that_stops_reading_has_the_stream_given_up_at_the_stall_timeout() {
         let timeout = Duration::from_secs(2);
-        let locator =
-            Locator::parse(wasm_host::tests::guest_wasm("hello").to_str().unwrap()).unwrap();
-        let target = locator.target().await.unwrap();
-        let loaded = wasm_host::load(&locator, wasm_host::Caps::default())
-            .await
-            .unwrap();
-        let handler = Handler::new(loaded, Sandbox::default(), &Instances::new(4)).unwrap();
-        let limit = tunnel::Limit::new(4);
-        let shared = Arc::new(Shared {
-            token: String::new(),
-            id: "stall-test".into(),
-            insecure: false,
-            ca_pem: None,
-            advertised: Vec::new(),
-            components: Arc::new(HashMap::from([(target.clone(), handler)])),
-            limit: limit.clone(),
-            stall_timeout: timeout,
-            transport_window: transport_window(4),
-        });
+        let (shared, limit, target) = hello_shared(timeout).await;
         let (url, _server) = stalling_server(target).await;
         let (events, _received) = mpsc::channel(32);
         let task = NodeTask {
@@ -1038,6 +1249,318 @@ mod tests {
             start.elapsed()
         );
         assert_eq!(limit.open(), 0, "the slot is freed");
+    }
+
+    /// The state of a wicket serving the hello guest for `hello.local`, its
+    /// connection limit and the route's target.
+    async fn hello_shared(stall_timeout: Duration) -> (Arc<Shared>, Arc<tunnel::Limit>, String) {
+        let locator =
+            Locator::parse(wasm_host::tests::guest_wasm("hello").to_str().unwrap()).unwrap();
+        let target = locator.target().await.unwrap();
+        let loaded = wasm_host::load(&locator, wasm_host::Caps::default())
+            .await
+            .unwrap();
+        let handler = Handler::new(loaded, Sandbox::default(), &Instances::new(4)).unwrap();
+        let limit = tunnel::Limit::new(4);
+        let shared = Arc::new(Shared {
+            token: String::new(),
+            id: "test".into(),
+            insecure: false,
+            ca_pem: None,
+            advertised: vec![Upstream {
+                host: "hello.local".into(),
+                target_url: target.clone(),
+                ..Default::default()
+            }],
+            components: Arc::new(HashMap::from([(target.clone(), handler)])),
+            limit: limit.clone(),
+            stall_timeout,
+            transport_window: transport_window(4),
+            drain: Drain::default(),
+            tasks: TaskTracker::new(),
+        });
+        (shared, limit, target)
+    }
+
+    /// Hang guard of the drain tests' waits.
+    const HANG: Duration = Duration::from_secs(10);
+
+    /// One tunnel stream as the server sees it, over raw h2: the wicket's
+    /// frames in, the server's out.
+    struct ServerStream {
+        body: h2::RecvStream,
+        send: h2::SendStream<bytes::Bytes>,
+        buf: Vec<u8>,
+    }
+
+    impl ServerStream {
+        /// The wicket's next frame; `Ok(None)` once it ended its request
+        /// stream, an error once it reset it.
+        async fn recv(&mut self) -> Result<Option<Frame>, h2::Error> {
+            use prost::Message as _;
+            loop {
+                if self.buf.len() >= 5 {
+                    let len = u32::from_be_bytes(self.buf[1..5].try_into().unwrap()) as usize;
+                    if self.buf.len() >= 5 + len {
+                        let frame = Frame::decode(&self.buf[5..5 + len]).unwrap();
+                        self.buf.drain(..5 + len);
+                        return Ok(Some(frame));
+                    }
+                }
+                let Some(chunk) = self.body.data().await else {
+                    return Ok(None);
+                };
+                let chunk = chunk?;
+                let _ = self.body.flow_control().release_capacity(chunk.len());
+                self.buf.extend_from_slice(&chunk);
+            }
+        }
+
+        /// The next frame `pick` takes, skipping the others (window updates).
+        async fn next<T>(&mut self, mut pick: impl FnMut(Body) -> Option<T>) -> T {
+            loop {
+                let frame = tokio::time::timeout(HANG, self.recv())
+                    .await
+                    .expect("hang guard")
+                    .expect("the stream is open")
+                    .expect("the stream is open");
+                if let Some(picked) = frame.body.and_then(&mut pick) {
+                    return picked;
+                }
+            }
+        }
+
+        /// The wicket's next Advertise.
+        async fn advertise(&mut self) -> Advertise {
+            self.next(|body| match body {
+                Body::Advertise(advertise) => Some(advertise),
+                _ => None,
+            })
+            .await
+        }
+
+        /// Reads to the end of the wicket's request stream, ended or reset;
+        /// whether it was ended.
+        async fn ended(&mut self) -> bool {
+            loop {
+                match tokio::time::timeout(HANG, self.recv())
+                    .await
+                    .expect("hang guard")
+                {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return true,
+                    Err(_) => return false,
+                }
+            }
+        }
+
+        fn send(&mut self, body: Body) {
+            self.send
+                .send_data(grpc_frame(&Frame { body: Some(body) }), false)
+                .unwrap();
+        }
+
+        fn ack(&mut self, withdrawn: bool) {
+            self.send(Body::AdvertiseAck(pb::AdvertiseAck {
+                node_id: "node".into(),
+                withdrawn,
+                ..Default::default()
+            }));
+        }
+
+        fn connect(&mut self, conn_id: i64, target: &str) {
+            self.send(Body::Connect(pb::Connect {
+                conn_id,
+                address: target.into(),
+                connection_window: tunnel::WINDOW,
+                ..Default::default()
+            }));
+        }
+
+        /// An http/1.1 request for `path` on `conn_id`; the status line of
+        /// its response, read to its end.
+        async fn exchange(&mut self, conn_id: i64, path: &str) -> String {
+            self.send(Body::Data(pb::Data {
+                conn_id,
+                payload: format!("GET {path} HTTP/1.1\r\nhost: hello.local\r\n\r\n").into_bytes(),
+            }));
+            let body = format!("path={path}\n");
+            let mut response = String::new();
+            while !(response.contains(&body) && response.ends_with("0\r\n\r\n")) {
+                let payload = self
+                    .next(|body| match body {
+                        Body::Data(data) if data.conn_id == conn_id => Some(data.payload),
+                        _ => None,
+                    })
+                    .await;
+                response.push_str(std::str::from_utf8(&payload).unwrap());
+            }
+            response.lines().next().unwrap_or_default().to_string()
+        }
+
+        /// Ends the server's side with an OK status.
+        fn end(&mut self) {
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("grpc-status", "0".parse().unwrap());
+            self.send.send_trailers(trailers).unwrap();
+        }
+    }
+
+    /// A tunnel server handing each Connect stream to the test; ListNodes is
+    /// reset.
+    async fn tunnel_server() -> (String, mpsc::Receiver<ServerStream>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("grpc://{}", listener.local_addr().unwrap());
+        let (streams, received) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            // accept() drives the connection on
+            while let Some(Ok((request, mut respond))) = connection.accept().await {
+                if request.uri().path() != "/sluice.v1.Tunnel/Connect" {
+                    continue;
+                }
+                let response = http::Response::builder()
+                    .header("content-type", "application/grpc")
+                    .body(())
+                    .unwrap();
+                let send = respond.send_response(response, false).unwrap();
+                let stream = ServerStream {
+                    body: request.into_body(),
+                    send,
+                    buf: Vec::new(),
+                };
+                if streams.send(stream).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (url, received)
+    }
+
+    /// A session of `shared` on a [`tunnel_server`], its stream as the server
+    /// sees it, and the session's event receiver (kept: the stream reports
+    /// to it).
+    async fn served_session(shared: &Arc<Shared>) -> (ServerStream, mpsc::Receiver<Event>) {
+        let (url, mut streams) = tunnel_server().await;
+        let (events, received) = mpsc::channel(32);
+        spawn_session(shared, url.clone(), url, events);
+        let stream = tokio::time::timeout(HANG, streams.recv())
+            .await
+            .expect("hang guard")
+            .expect("a stream");
+        (stream, received)
+    }
+
+    fn start_drain(shared: &Arc<Shared>, grace: Duration) -> tokio::task::JoinHandle<DrainEnd> {
+        let shared = shared.clone();
+        tokio::spawn(async move { drain(&shared, grace, std::future::pending()).await })
+    }
+
+    /// Waits until no connection holds a slot of `limit`, at most [`HANG`].
+    async fn all_closed(limit: &tunnel::Limit) -> bool {
+        let start = tokio::time::Instant::now();
+        while limit.open() != 0 && start.elapsed() < HANG {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        limit.open() == 0
+    }
+
+    /// Against a server supporting the drain: the routes are withdrawn on
+    /// the stream, the connection open keeps being served after the server
+    /// acknowledged the withdrawal, and the stream is ended once it closed;
+    /// the server's end of the stream ends the drain.
+    #[tokio::test]
+    async fn a_drain_ends_the_stream_after_the_withdrawn_ack_once_the_last_connection_closed() {
+        let (shared, limit, target) = hello_shared(Duration::ZERO).await;
+        let (mut stream, _events) = served_session(&shared).await;
+        assert!(!stream.advertise().await.withdraw);
+        stream.ack(false);
+        stream.connect(1, &target);
+        assert_eq!(stream.exchange(1, "/before").await, "HTTP/1.1 200 OK");
+
+        let drained = start_drain(&shared, HANG * 6);
+        let withdrawal = stream.advertise().await;
+        assert!(withdrawal.withdraw);
+        assert_eq!(
+            withdrawal.upstreams, shared.advertised,
+            "the routes repeated"
+        );
+        assert_eq!(withdrawal.connection_window, tunnel::WINDOW);
+        assert_eq!(limit.open(), 1, "precondition: the connection is open");
+        stream.ack(true);
+        assert_eq!(
+            stream.exchange(1, "/after").await,
+            "HTTP/1.1 200 OK",
+            "served after the withdrawn ack"
+        );
+        stream.send(Body::Close(pb::Close { conn_id: 1 }));
+        stream
+            .next(|body| matches!(body, Body::Close(close) if close.conn_id == 1).then_some(()))
+            .await;
+        assert!(
+            stream.ended().await,
+            "the request stream is ended, not reset"
+        );
+        stream.end();
+
+        let end = tokio::time::timeout(HANG * 7, drained)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(end, DrainEnd::Drained);
+        assert_eq!(limit.open(), 0);
+    }
+
+    /// A connection still open when the grace runs out is closed with its
+    /// stream.
+    #[tokio::test]
+    async fn the_drain_grace_closes_the_connections_still_open() {
+        let (shared, limit, target) = hello_shared(Duration::ZERO).await;
+        let (mut stream, _events) = served_session(&shared).await;
+        stream.advertise().await;
+        stream.ack(false);
+        stream.connect(1, &target);
+        assert_eq!(stream.exchange(1, "/before").await, "HTTP/1.1 200 OK");
+
+        let drained = start_drain(&shared, Duration::from_secs(1));
+        assert!(stream.advertise().await.withdraw);
+        stream.ack(true);
+        assert_eq!(limit.open(), 1, "precondition: the connection is open");
+
+        let end = tokio::time::timeout(HANG, drained).await.unwrap().unwrap();
+        assert_eq!(end, DrainEnd::GraceExpired);
+        assert!(!stream.ended().await, "the stream is reset");
+        assert!(all_closed(&limit).await, "the connection is closed");
+    }
+
+    /// Against a server predating the drain: its ack to the opening
+    /// advertise, arriving after the withdrawal was sent, ends nothing (the
+    /// acks are counted); its ack to the withdrawing advertise, without
+    /// `withdrawn`, ends the stream and with it the drain at once.
+    #[tokio::test]
+    async fn a_plain_ack_to_the_withdrawal_ends_the_stream_at_once() {
+        let (shared, limit, target) = hello_shared(Duration::ZERO).await;
+        let (mut stream, _events) = served_session(&shared).await;
+        assert!(!stream.advertise().await.withdraw);
+        // a connection served before any ack: the stream is up
+        stream.connect(1, &target);
+        assert_eq!(stream.exchange(1, "/before").await, "HTTP/1.1 200 OK");
+
+        let drained = start_drain(&shared, HANG * 6);
+        assert!(stream.advertise().await.withdraw);
+        stream.ack(false);
+        assert_eq!(
+            stream.exchange(1, "/between").await,
+            "HTTP/1.1 200 OK",
+            "the ack to the opening advertise ended nothing"
+        );
+        stream.ack(false);
+
+        let end = tokio::time::timeout(HANG, drained).await.unwrap().unwrap();
+        assert_eq!(end, DrainEnd::Drained);
+        assert!(!stream.ended().await, "the stream is reset");
+        assert!(all_closed(&limit).await, "the connection is closed");
     }
 
     #[test]
@@ -1217,7 +1740,7 @@ mod tests {
     /// and no other test here would notice.
     #[test]
     fn the_advertise_announces_the_connection_window() {
-        let Some(Body::Advertise(advertise)) = advertise(Vec::new()).body else {
+        let Some(Body::Advertise(advertise)) = advertise(Vec::new(), false).body else {
             panic!("an Advertise");
         };
         assert_eq!(advertise.connection_window, 1024 * 1024);
@@ -1227,7 +1750,7 @@ mod tests {
     /// Without the build the server shows this wicket as an older build.
     #[test]
     fn the_advertise_carries_the_embedded_build() {
-        let Some(Body::Advertise(advertise)) = advertise(Vec::new()).body else {
+        let Some(Body::Advertise(advertise)) = advertise(Vec::new(), false).body else {
             panic!("an Advertise");
         };
         let build = advertise.build.expect("a build");

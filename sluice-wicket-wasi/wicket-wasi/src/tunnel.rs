@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use futures_util::stream::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
@@ -424,11 +425,13 @@ impl Limit {
                 (open < self.max).then_some(open + 1)
             })
             .ok()
-            .map(|_| Permit(self.clone()))
+            .map(|_| Permit {
+                limit: self.clone(),
+                stream: None,
+            })
     }
 
     /// The permits currently held.
-    #[cfg(test)]
     pub fn open(&self) -> usize {
         self.open.load(Ordering::Acquire)
     }
@@ -437,11 +440,27 @@ impl Limit {
 /// The slot of one connection, freed when dropped: held by its byte stream,
 /// which owns its buffered payload, then by its end, then by its outbound
 /// queue until the last queued frame left ([`Outbound::hold`]).
-pub struct Permit(Arc<Limit>);
+pub struct Permit {
+    limit: Arc<Limit>,
+    /// The count of the stream's slots ([`Connections::held`]), when counted.
+    stream: Option<Arc<watch::Sender<usize>>>,
+}
+
+impl Permit {
+    /// Counts the slot among `stream`'s until it is freed.
+    fn counted(mut self, stream: &Arc<watch::Sender<usize>>) -> Permit {
+        stream.send_modify(|held| *held += 1);
+        self.stream = Some(stream.clone());
+        self
+    }
+}
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        self.0.open.fetch_sub(1, Ordering::AcqRel);
+        self.limit.open.fetch_sub(1, Ordering::AcqRel);
+        if let Some(stream) = &self.stream {
+            stream.send_modify(|held| *held -= 1);
+        }
     }
 }
 
@@ -745,6 +764,9 @@ pub struct Connections {
     routes: Arc<HashMap<String, Arc<Handler>>>,
     registry: Registry,
     limit: Arc<Limit>,
+    /// The slots this stream's connections hold: an accepted connection's
+    /// until its last frame left the outbound queue, or the stream ended.
+    held: Arc<watch::Sender<usize>>,
     /// Test hook: the CONNECTs rejected for announcing no window.
     #[cfg(test)]
     windowless_rejections: AtomicUsize,
@@ -763,6 +785,7 @@ impl Connections {
             routes,
             registry: Registry::default(),
             limit,
+            held: Arc::new(watch::Sender::new(0)),
             #[cfg(test)]
             windowless_rejections: AtomicUsize::new(0),
         }
@@ -847,7 +870,7 @@ impl Connections {
             return;
         };
         let mut io = self.register(connect.conn_id, connect.connection_window);
-        io.permit = Some(permit);
+        io.permit = Some(permit.counted(&self.held));
         tokio::spawn(wasm_host::serve(io, handler.clone()));
     }
 
@@ -880,6 +903,13 @@ impl Connections {
             consumed: 0,
             permit: None,
         }
+    }
+
+    /// Watches the slots this stream's connections hold: an accepted
+    /// connection holds one until its last frame left the outbound queue (its
+    /// CLOSE / ERROR included) or the stream ended.
+    pub fn held(&self) -> watch::Receiver<usize> {
+        self.held.subscribe()
     }
 
     /// Test hook: the CONNECTs rejected for announcing no window.

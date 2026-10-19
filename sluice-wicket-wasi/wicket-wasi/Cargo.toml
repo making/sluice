@@ -8,10 +8,11 @@ publish = false
 tonic = { version = "0.14", features = ["tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14"
 prost = "0.14"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs", "signal"] }
 http = "1"
 tokio-stream = "0.1"
-tokio-util = "0.7"
+# rt: the TaskTracker the drain waits on
+tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = "0.3"
 # random default client id, same policy as the Java client
 uuid = { version = "1", features = ["v4"] }
