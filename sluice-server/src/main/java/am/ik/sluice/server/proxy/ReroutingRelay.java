@@ -18,6 +18,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.SessionRegistry;
@@ -99,6 +101,8 @@ final class ReroutingRelay {
 	 * ninth), and the upstream may send its own.
 	 */
 	private static final int MAX_PROBES = 4;
+
+	private static final Logger log = LoggerFactory.getLogger(ReroutingRelay.class);
 
 	/** How long the client of a malformed request is read after the 400, at most. */
 	static final Duration LINGER = Duration.ofSeconds(2);
@@ -296,6 +300,7 @@ final class ReroutingRelay {
 			}
 		}
 		catch (Exception e) {
+			log.debug("rerouting relay: relaying the client's requests failed; aborting", e);
 			abort();
 		}
 		finally {
@@ -940,11 +945,16 @@ final class ReroutingRelay {
 			}
 			if (this.current == leg && !leg.replaced && !this.rejected) {
 				// the upstream of the leg in charge is gone; the client reconnects
+				log.debug(
+						"rerouting relay: the upstream of connection {} (route {}) in charge ended it; ending the relay",
+						leg.connection.connectionId(), leg.route.routeTag());
 				abort();
 			}
 		}
 		catch (Exception e) {
 			if (!this.rejected) {
+				log.debug("rerouting relay: relaying the responses of connection {} (route {}) failed; aborting",
+						leg.connection.connectionId(), leg.route.routeTag(), e);
 				abort();
 			}
 		}

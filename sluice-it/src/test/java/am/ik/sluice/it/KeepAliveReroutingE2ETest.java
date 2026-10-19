@@ -48,7 +48,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  * be answered by that upstream (and, with {@code rewrite-host}, by the host of its own
  * route), with a {@code type=req} access log line per request head.
  */
-@SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+// the relay logs why it ended and the client why a dial failed at debug, should a
+// rerouting fail on CI again (a logging level must be set before the context starts: a
+// dynamic property comes too late)
+@SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+		properties = { "logging.level.am.ik.sluice.server.proxy.ReroutingRelay=debug",
+				"logging.level.am.ik.sluice.client.tunnel.NodeConnection=debug" })
 @TestInstance(Lifecycle.PER_CLASS)
 class KeepAliveReroutingE2ETest {
 
