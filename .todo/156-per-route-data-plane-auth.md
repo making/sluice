@@ -37,8 +37,27 @@ goes on).
 2. Forward or strip the credential header to the upstream. Per-route option; default strip (the
    credential is for the data plane, and an upstream with its own `Authorization` would collide).
    h1: rewrite the head (`ConnectionHeadRewriter`, as `rewrite-host`); h2: remove from the headers.
-3. Storage: per-request bcrypt is too costly on the data plane. Store SHA-256 digests, compare with
-   `MessageDigest.isEqual`; state in the docs that this assumes high-entropy secrets.
+3. Storage (decided): Spring Security `DelegatingPasswordEncoder`; each configured secret (basic
+   password, bearer token, API token) carries its algorithm prefix (`{noop}...`, `{bcrypt}...`,
+   ...), chosen per route.
+   - Move `ConsoleSecurityConfiguration#passwordEncoder` to a shared definition (e.g. under
+     `am.ik.sluice.server.auth`) that both the console and the data plane auth use; the console
+     keeps accepting what it accepts today (pin it in `ConsoleAuthE2ETest`).
+   - Register the encoders explicitly (bcrypt, noop, pbkdf2, ...). scrypt / argon2 need Bouncy
+     Castle: add it, or leave them out and document so. Check each registered encoder in the
+     native image.
+   - Add a SHA-based encoder (e.g. `{sha256}<hex>`, unsalted, constant-time compare): cheap per
+     request and fit for high-entropy tokens; the docs say it is not for human-chosen passwords.
+     Spring Security's `MessageDigestPasswordEncoder` is deprecated -- prefer an own small encoder.
+   - Validate at startup: a value without a prefix or with an unknown id fails the start, not the
+     first request.
+   - Cost: bcrypt runs per request (every h1 request head, every h2 stream). Cache successful
+     verifications keyed by (route, SHA-256 of the presented credential), bounded size and TTL, so
+     a client's repeated requests skip the encoder; never cache failures. Bearer / API token
+     values are salted, so a presented token is matched against every configured token of the
+     route: the cache keeps that to the first request.
+   - Unauthenticated requests with random credentials make the server run the encoder each
+     time: bound the concurrent verifications (refuse past the bound) and state it in the docs.
 4. CORS preflight: an option to exempt `OPTIONS` (browsers send no credentials on it).
 5. Plain HTTP route with auth: warn (credentials in cleartext) or refuse.
 
@@ -47,7 +66,10 @@ Out of scope for the first step: brute-force rate limiting, console display beyo
 ## Acceptance
 
 - Unit test of the checker: each scheme accepts the right credential, rejects wrong / missing /
-  malformed (`Basic` without colon, bad base64, wrong scheme, empty token).
+  malformed (`Basic` without colon, bad base64, wrong scheme, empty token), with `{noop}` and
+  `{bcrypt}` secrets; a missing / unknown prefix fails the start; a cached success skips the
+  encoder (assert the encoder's call count), a failure is not cached; past the verification bound
+  a request is refused.
 - E2E (extend `AccessControlE2ETest`, do not add a class): per scheme, 401 without and 200 with the
   credential, over h1 and h2c; a keep-alive h1 connection whose second request goes to an
   authenticated route is refused (pins the `ReroutingRelay` check); an h2 connection whose second
