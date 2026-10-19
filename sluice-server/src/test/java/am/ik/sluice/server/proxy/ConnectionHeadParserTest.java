@@ -95,6 +95,27 @@ class ConnectionHeadParserTest {
 	}
 
 	@Test
+	void aRequestTargetsAJsonApiByItsContentTypeOrAnAcceptWithoutHtml() {
+		String[][] h1 = { { "Content-Type: application/json", "true" },
+				{ "Content-Type: application/merge+json", "true" }, { "Accept: application/problem+json", "true" },
+				{ "Accept: text/plain, application/json;q=0.9", "true" },
+				{ "Accept: text/html,application/json", "false" }, { "Accept: */*", "false" },
+				{ "Content-Type: text/plain", "false" } };
+		for (String[] header : h1) {
+			ConnectionHeadParser.Head parsed = PARSER
+				.parse(new ByteArrayInputStream(("GET / HTTP/1.1\r\nHost: a.local\r\n" + header[0] + "\r\n\r\n")
+					.getBytes(java.nio.charset.StandardCharsets.US_ASCII)))
+				.orElseThrow();
+			assertThat(json(parsed)).as(header[0]).isEqualTo(Boolean.parseBoolean(header[1]));
+		}
+		assertThat(json(parseH2(literal(":method", "GET"), literal(":path", "/"), literal(":authority", "a.local"),
+				literal("accept", "application/json"))))
+			.isTrue();
+		assertThat(json(parseH2(literal(":method", "GET"), literal(":path", "/"), literal(":authority", "a.local"))))
+			.isFalse();
+	}
+
+	@Test
 	void http2ConnectTakesItsAuthorityAsThePath() {
 		ConnectionHeadParser.Head parsed = parseH2(literal(":method", "CONNECT"),
 				literal(":authority", "tunnel.local:443"));
@@ -150,6 +171,12 @@ class ConnectionHeadParserTest {
 		assertThat(PARSER.parse(new ByteArrayInputStream(http1)).orElseThrow().http2Connection()).isFalse();
 		assertThat(ConnectionHeadParser.Head.encrypted(new byte[] { 0x16, 0x03, 0x01 }, "tls.local").http2Connection())
 			.isFalse();
+	}
+
+	private static boolean json(ConnectionHeadParser.Head head) {
+		ConnectionHeadParser.Head.Request request = head.request();
+		assertThat(request).isNotNull();
+		return request != null && request.json();
 	}
 
 	private static ConnectionHeadParser.Head parseH2(byte[]... literals) {

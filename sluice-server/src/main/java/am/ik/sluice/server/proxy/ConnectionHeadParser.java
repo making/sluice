@@ -7,6 +7,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 
 import org.jspecify.annotations.Nullable;
@@ -92,9 +93,16 @@ public final class ConnectionHeadParser {
 		/**
 		 * The request of the head: the HTTP/1.1 request-line parts, or the method/path of
 		 * the first HEADERS block for HTTP/2 ({@code version} is {@code 2}; a CONNECT's
-		 * path is its {@code :authority}).
+		 * path is its {@code :authority}). {@code json} tells that the request targets a
+		 * JSON API, see {@link ConnectionHeadParser#prefersJson}: its error answers are
+		 * problem details instead of pages.
 		 */
-		public record Request(String method, String path, String version) {
+		public record Request(String method, String path, String version, boolean json) {
+
+			public Request(String method, String path, String version) {
+				this(method, path, version, false);
+			}
+
 		}
 
 		/**
@@ -211,7 +219,8 @@ public final class ConnectionHeadParser {
 		if (parts.length != 3 || !parts[2].startsWith("HTTP/")) {
 			return null;
 		}
-		return new Head.Request(parts[0], parts[1], parts[2].substring("HTTP/".length()));
+		return new Head.Request(parts[0], parts[1], parts[2].substring("HTTP/".length()),
+				prefersJson(http1HeaderValues(head, "content-type"), http1HeaderValues(head, "accept")));
 	}
 
 	/**
@@ -424,7 +433,34 @@ public final class ConnectionHeadParser {
 		if (path == null || path.isEmpty()) {
 			return null;
 		}
-		return new Head.Request(method.toString(), path.toString(), "2");
+		return new Head.Request(method.toString(), path.toString(), "2",
+				prefersJson(values(headers, "content-type"), values(headers, "accept")));
+	}
+
+	private static List<String> values(Http2Headers headers, String name) {
+		return headers.getAll(AsciiString.of(name)).stream().map(CharSequence::toString).toList();
+	}
+
+	/**
+	 * Whether a request targets a JSON API: its {@code Content-Type} is JSON
+	 * ({@code application/json} or a {@code +json} type), or its {@code Accept} lists a
+	 * JSON type and no {@code text/html} (a browser's navigation, which lists both, gets
+	 * the page).
+	 */
+	static boolean prefersJson(List<String> contentTypes, List<String> accepts) {
+		if (contentTypes.stream().anyMatch(ConnectionHeadParser::isJsonType)) {
+			return true;
+		}
+		List<String> types = accepts.stream()
+			.flatMap(accept -> Arrays.stream(accept.split(",")))
+			.map(type -> type.split(";")[0].trim().toLowerCase(Locale.ROOT))
+			.toList();
+		return !types.contains("text/html") && types.stream().anyMatch(ConnectionHeadParser::isJsonType);
+	}
+
+	private static boolean isJsonType(String mediaType) {
+		String type = mediaType.split(";")[0].trim().toLowerCase(Locale.ROOT);
+		return type.equals("application/json") || type.startsWith("application/") && type.endsWith("+json");
 	}
 
 	private static @Nullable String headerOf(@Nullable CharSequence first, @Nullable CharSequence second) {

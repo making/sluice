@@ -188,6 +188,26 @@ class NoRouteE2ETest {
 		}
 	}
 
+	@Test
+	void jsonRequestGetsAProblemDetailsDocumentInBothProtocols() throws Exception {
+		String json = "{\"type\":\"about:blank\",\"title\":\"Service Unavailable\",\"status\":503,"
+				+ "\"detail\":\"No tunnel is connected for this host.\"}";
+		String response = exchange(
+				"GET / HTTP/1.1\r\nHost: nothing.local\r\nAccept: application/json\r\nConnection: close\r\n\r\n");
+		assertThat(response).contains("Content-Type: application/problem+json\r\n").endsWith("\r\n\r\n" + json);
+
+		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+			socket.setSoTimeout(10_000);
+			TestH2.writeClientHead(socket.getOutputStream(), 1, ":method=POST", ":scheme=http", ":path=/",
+					":authority=nothing.local", "content-type=application/json");
+			List<TestH2.Frame> frames = TestH2.readResponseFrames(socket.getInputStream());
+			Http2Headers headers = new DefaultHttp2HeadersDecoder(true).decodeHeaders(1,
+					Unpooled.wrappedBuffer(frames.getFirst().payload()));
+			assertThat(headers.get("content-type")).hasToString("application/problem+json");
+			assertThat(TestH2.bodyOf(frames)).isEqualTo(json);
+		}
+	}
+
 	private static String exchange(String request) throws Exception {
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.setSoTimeout(10_000);

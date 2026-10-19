@@ -63,6 +63,36 @@ class ErrorResponseTest {
 	}
 
 	@Test
+	void aJsonRequestGetsAProblemDetailsDocumentWithTheHeadersOfThePage() {
+		ConnectionHeadParser.Head head = head("GET / HTTP/1.1\r\nHost: a.local\r\nAccept: application/json\r\n\r\n");
+		String json = "{\"type\":\"about:blank\",\"title\":\"Unauthorized\",\"status\":401,"
+				+ "\"detail\":\"Credentials are required.\"}";
+		assertThat(new String(this.errorResponse.unauthorized(head, List.of("Bearer realm=\"a\"")),
+				StandardCharsets.US_ASCII))
+			.isEqualTo("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/problem+json\r\n" + "Content-Length: "
+					+ json.length() + "\r\nCache-Control: no-store\r\n"
+					+ "WWW-Authenticate: Bearer realm=\"a\"\r\nConnection: close\r\n\r\n" + json);
+		assertThat(new String(this.errorResponse.busy(head, Duration.ofSeconds(7)), StandardCharsets.US_ASCII))
+			.contains("Content-Type: application/problem+json\r\n", "Retry-After: 7\r\n",
+					"\"status\":503,\"detail\":\"The server is at its connection limit.\"}");
+		// a browser listing text/html as well gets the page
+		assertThat(new String(
+				this.errorResponse.noRoute(
+						head("GET / HTTP/1.1\r\nHost: a.local\r\n" + "Accept: text/html, application/json\r\n\r\n")),
+				StandardCharsets.US_ASCII))
+			.contains("Content-Type: text/html; charset=utf-8");
+
+		ErrorResponse.StreamPage page = this.errorResponse.refusalPage("a.local",
+				new ConnectionHeadParser.Head.Request("POST", "/", "2", true), new Verdict.Busy(Duration.ofSeconds(3)));
+		assertThat(page.headers().get("content-type")).hasToString("application/problem+json");
+		assertThat(page.headers().get("retry-after")).hasToString("3");
+		assertThat(new String(page.body(), StandardCharsets.UTF_8))
+			.isEqualTo("{\"type\":\"about:blank\",\"title\":\"Service Unavailable\",\"status\":503,"
+					+ "\"detail\":\"The server is checking as many credentials as it may at once.\"}");
+		assertThat(page.headers().get("content-length")).hasToString(String.valueOf(page.body().length));
+	}
+
+	@Test
 	void aHeadThatIsNoHttpRequestGetsNoBusyAnswer() {
 		ConnectionHeadParser.Head head = head("*1\r\n$4\r\nPING\r\n");
 		assertThat(this.errorResponse.busy(head, Duration.ofSeconds(7))).isEmpty();

@@ -331,6 +331,11 @@ docker run --rm --pull always --name sluice-server -p 8000:8000 -p 8001:8001 -p 
 | `forward-credentials` | `false` | relay the credential headers to the upstream; by default they are removed |
 | `allow-preflight` | `false` | let a CORS preflight (`OPTIONS` with `Access-Control-Request-Method`) pass without credentials: browsers send none on it |
 
+- The data plane's error answers (`401`, `403`, `502`, `503`) are HTML pages. A request whose
+  `Content-Type` is JSON, or whose `Accept` lists a JSON type and no `text/html`, gets a
+  `application/problem+json` document (RFC 9457) instead; `WWW-Authenticate` and `Retry-After`
+  stay headers.
+
 - A request passes with any one credential of its route. Otherwise it is answered `401` with a
   `WWW-Authenticate` challenge per scheme of the route (`Basic realm="<realm>", charset="UTF-8"`,
   `Bearer realm="<realm>"`, `<api-token-header> realm="<realm>"`) and never reaches the upstream.

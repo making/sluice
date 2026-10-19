@@ -40,12 +40,18 @@ import am.ik.sluice.server.auth.Verdict;
  * a stream of a route reached over HTTP/1.1 only, a GOAWAY {@code COMPRESSION_ERROR} for
  * an HTTP/2 head whose header block does not decode, a GOAWAY processing no stream for an
  * HTTP/2 connection whose relay does not fit, and the 503 busy page with
- * {@code Retry-After} for a request past the connection limit.
+ * {@code Retry-After} for a request past the connection limit. A request that targets a
+ * JSON API ({@link ConnectionHeadParser.Head.Request#json}) gets a problem details
+ * document (RFC 9457, {@code application/problem+json}) in place of the page; the headers
+ * stay headers.
  */
 @Component
 public class ErrorResponse {
 
 	private static final String CONTENT_TYPE = "text/html; charset=utf-8";
+
+	/** The media type of a problem details answer (RFC 9457). */
+	private static final String PROBLEM_CONTENT_TYPE = "application/problem+json";
 
 	/** The minimum SETTINGS_MAX_FRAME_SIZE every HTTP/2 peer accepts (RFC 9113 4.2). */
 	private static final int MAX_FRAME_SIZE = 16_384;
@@ -70,11 +76,16 @@ public class ErrorResponse {
 	private final Page unauthorized;
 
 	ErrorResponse(Mustache.Compiler compiler) {
-		this.noRoute = new Page(compiler.loadTemplate("proxy/no-route"), "503 Service Unavailable");
-		this.forbidden = new Page(compiler.loadTemplate("proxy/forbidden"), "403 Forbidden");
-		this.badGateway = new Page(compiler.loadTemplate("proxy/bad-gateway"), "502 Bad Gateway");
-		this.busy = new Page(compiler.loadTemplate("proxy/busy"), "503 Service Unavailable");
-		this.unauthorized = new Page(compiler.loadTemplate("proxy/unauthorized"), "401 Unauthorized");
+		this.noRoute = new Page(compiler.loadTemplate("proxy/no-route"), "503 Service Unavailable",
+				"No tunnel is connected for this host.");
+		this.forbidden = new Page(compiler.loadTemplate("proxy/forbidden"), "403 Forbidden",
+				"This address is not allowed to access this host.");
+		this.badGateway = new Page(compiler.loadTemplate("proxy/bad-gateway"), "502 Bad Gateway",
+				"The upstream closed the connection before answering.");
+		this.busy = new Page(compiler.loadTemplate("proxy/busy"), "503 Service Unavailable",
+				"The server is at its connection limit.");
+		this.unauthorized = new Page(compiler.loadTemplate("proxy/unauthorized"), "401 Unauthorized",
+				"Credentials are required.");
 	}
 
 	/**
@@ -238,7 +249,7 @@ public class ErrorResponse {
 		boolean withBody = request != null && !isHead(request);
 		byte[] body = this.page(host, request, page);
 		Http2Headers headers = new DefaultHttp2Headers().status(page.status())
-			.set("content-type", CONTENT_TYPE)
+			.set("content-type", contentType(request))
 			.set("content-length", String.valueOf(body.length))
 			.set("cache-control", "no-store");
 		page.addHeaders(headers);
@@ -253,7 +264,14 @@ public class ErrorResponse {
 	public record StreamPage(Http2Headers headers, byte[] body) {
 	}
 
+	private static String contentType(ConnectionHeadParser.Head.@Nullable Request request) {
+		return request != null && request.json() ? PROBLEM_CONTENT_TYPE : CONTENT_TYPE;
+	}
+
 	private byte[] page(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request, Page page) {
+		if (request != null && request.json()) {
+			return page.problem().getBytes(StandardCharsets.UTF_8);
+		}
 		// an empty value skips its section (emptyStringIsFalse)
 		Map<String, String> context = Map.of("host", host == null ? "" : host, "method",
 				request == null ? "" : request.method(), "path", request == null ? "" : request.path(), "verifying",
@@ -280,7 +298,7 @@ public class ErrorResponse {
 		for (Header header : page.line().headers()) {
 			headers.append(header.name()).append(": ").append(header.value()).append("\r\n");
 		}
-		String responseHead = "HTTP/1.1 " + page.reason() + "\r\n" + "Content-Type: " + CONTENT_TYPE + "\r\n"
+		String responseHead = "HTTP/1.1 " + page.reason() + "\r\n" + "Content-Type: " + contentType(request) + "\r\n"
 				+ "Content-Length: " + body.length + "\r\n" + "Cache-Control: no-store\r\n" + headers
 				+ "Connection: close\r\n\r\n";
 		ByteArrayOutputStream out = new ByteArrayOutputStream(responseHead.length() + body.length);
@@ -302,7 +320,7 @@ public class ErrorResponse {
 		boolean withBody = request != null && !isHead(request);
 		byte[] body = request == null ? new byte[0] : this.page(head, page);
 		Http2Headers headers = new DefaultHttp2Headers().status(page.status())
-			.set("content-type", CONTENT_TYPE)
+			.set("content-type", contentType(request))
 			.set("content-length", String.valueOf(body.length))
 			.set("cache-control", "no-store");
 		page.addHeaders(headers);
@@ -336,10 +354,20 @@ public class ErrorResponse {
 	}
 
 	/** An error page: its template and its status. */
-	private record Page(Template page, Status line) {
+	private record Page(Template page, Status line, String detail) {
 
-		private Page(Template page, String reason) {
-			this(page, new Status(reason, List.of(), false));
+		private Page(Template page, String reason, String detail) {
+			this(page, new Status(reason, List.of(), false), detail);
+		}
+
+		/**
+		 * The page as a problem details document (RFC 9457); every value is fixed text,
+		 * so none needs escaping.
+		 */
+		private String problem() {
+			String reason = this.line.reason();
+			return "{\"type\":\"about:blank\",\"title\":\"" + reason.substring(this.status().length() + 1)
+					+ "\",\"status\":" + this.status() + ",\"detail\":\"" + this.detail + "\"}";
 		}
 
 		/** The same page with a {@code Retry-After} of {@code seconds}. */
@@ -354,13 +382,14 @@ public class ErrorResponse {
 
 		/** The same page telling that the request's credentials could not be checked. */
 		private Page verifying() {
-			return new Page(this.page, new Status(this.line.reason(), this.line.headers(), true));
+			return new Page(this.page, new Status(this.line.reason(), this.line.headers(), true),
+					"The server is checking as many credentials as it may at once.");
 		}
 
 		private Page with(List<Header> headers) {
 			List<Header> all = new ArrayList<>(this.line.headers());
 			all.addAll(headers);
-			return new Page(this.page, new Status(this.line.reason(), all, this.line.verifying()));
+			return new Page(this.page, new Status(this.line.reason(), all, this.line.verifying()), this.detail);
 		}
 
 		/** Adds the page's headers to an h2 header block, names in lowercase. */
