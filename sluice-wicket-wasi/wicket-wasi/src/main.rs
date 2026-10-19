@@ -64,7 +64,7 @@ struct Route {
 struct Config {
     server: String,
     token: String,
-    id: String,
+    client_id: String,
     insecure: bool,
     ca_cert: Option<String>,
     routes: Vec<Route>,
@@ -229,7 +229,7 @@ fn parse_args() -> Config {
         server: String::new(),
         token: String::new(),
         // same default policy as the Java client: random id unless --client-id is given
-        id: uuid::Uuid::new_v4().to_string(),
+        client_id: uuid::Uuid::new_v4().to_string(),
         insecure: false,
         ca_cert: None,
         routes: Vec::new(),
@@ -252,7 +252,7 @@ fn parse_args() -> Config {
             }
             "--server" => config.server = value("server"),
             "--token" => config.token = value("token"),
-            "--client-id" => config.id = value("client-id"),
+            "--client-id" => config.client_id = value("client-id"),
             "--insecure" => config.insecure = true,
             "--ca-cert" => config.ca_cert = Some(value("ca-cert")),
             "--max-connections" => {
@@ -397,7 +397,7 @@ async fn run(config: Config) -> Result<(), BoxError> {
     let Config {
         server,
         token,
-        id,
+        client_id,
         insecure,
         ca_cert,
         routes,
@@ -415,7 +415,7 @@ async fn run(config: Config) -> Result<(), BoxError> {
     };
     let shared = Arc::new(Shared {
         token,
-        id,
+        id: client_id,
         insecure,
         ca_pem,
         advertised,

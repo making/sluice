@@ -56,6 +56,11 @@ target/debug/sluice-wicket-wasi --server grpcs://127.0.0.1:8001 --ca-cert ca.pem
 target/debug/sluice-wicket-wasi --server grpcs://127.0.0.1:8001 --insecure ...
 ```
 
+`--client-id <id>` pins the client identity sent as `x-sluice-id` on every tunnel
+stream; when omitted a random UUID is used, matching the Java client's
+`sluice.client.id`. Re-registering with the same id replaces the previous
+registration on the server.
+
 `--max-connections N` (default 256) caps the connections open at once over every
 node stream; a CONNECT beyond it is answered with the ERROR `connection limit reached`
 and not served. A windowed connection buffers at most its 1MiB receive window of
