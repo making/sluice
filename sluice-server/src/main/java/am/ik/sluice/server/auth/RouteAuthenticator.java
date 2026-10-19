@@ -5,18 +5,18 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.Semaphore;
 import java.util.function.LongSupplier;
-import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -37,6 +37,9 @@ import am.ik.sluice.server.route.Router;
  * headers more than once is unauthorized whatever the values. With
  * {@code allow-preflight} a CORS preflight passes without credentials. Unless the route
  * forwards them, the headers of its schemes are removed from every request that passes.
+ * Each scheme is a {@link CredentialScheme} ({@link BasicScheme}, {@link BearerScheme},
+ * {@link ApiTokenScheme}); a header's value goes to the scheme of the header whose
+ * auth-scheme token it carries.
  * <p>
  * Every secret is matched by the server's {@link PasswordEncoder} by its {@code {id}}
  * prefix; a secret without one, with an unknown id or malformed for its encoder fails the
@@ -68,9 +71,6 @@ public class RouteAuthenticator {
 	static final String AUTHORIZATION = "authorization";
 
 	private static final String PREFLIGHT_METHOD = "access-control-request-method";
-
-	/** An RFC 9110 token: a header name, an auth scheme. */
-	private static final Pattern TOKEN = Pattern.compile("[!#$%&'*+.^_`|~0-9A-Za-z-]+");
 
 	private final Map<String, Policy> policies;
 
@@ -110,7 +110,7 @@ public class RouteAuthenticator {
 		Map<String, Policy> policies = new TreeMap<>();
 		properties.route().auth().forEach((key, auth) -> {
 			String normalized = normalize(key);
-			policies.put(normalized, policy(normalized, auth));
+			policies.put(normalized, this.policy(normalized, auth));
 		});
 		this.policies = Map.copyOf(policies);
 		if (!policies.isEmpty() && properties.dataTlsBundle() == null) {
@@ -135,14 +135,13 @@ public class RouteAuthenticator {
 			return policy.pass();
 		}
 		List<Presented> presented = new ArrayList<>(2);
-		for (String header : policy.strip()) {
+		for (String header : policy.headers()) {
 			List<String> values = headers.values(header);
 			if (values.size() > 1) {
 				return policy.unauthorized("invalid");
 			}
 			if (values.size() == 1) {
-				presented.add(header.equals(AUTHORIZATION) ? policy.authorization(values.get(0))
-						: new Presented("token", values.get(0).strip(), policy.apiToken(), false));
+				presented.add(policy.credential(header, values.get(0)));
 			}
 		}
 		if (presented.isEmpty()) {
@@ -182,39 +181,33 @@ public class RouteAuthenticator {
 	 */
 	public List<String> schemes(String routeKey) {
 		Policy policy = this.policies.get(normalize(routeKey));
-		return policy == null ? List.of() : policy.schemes();
+		return policy == null ? List.of() : policy.names();
 	}
 
 	/**
 	 * The verdict on the credential: a pass when it matched, busy when checking it would
 	 * take a verification past the bound; null when it did not match.
 	 */
-	private @Nullable Verdict check(Policy policy, Presented credential) {
-		if (credential.value().isEmpty() || credential.secrets().isEmpty()) {
+	private @Nullable Verdict check(Policy policy, Presented presented) {
+		CredentialScheme.Credential credential = presented.credential();
+		if (credential.id().isEmpty()) {
 			return null;
 		}
-		String cacheKey = policy.key() + '\n' + credential.scheme() + '\n' + sha256(credential.value());
+		String cacheKey = policy.key() + '\n' + presented.scheme() + '\n' + sha256(credential.id());
 		if (this.remembered(cacheKey)) {
 			return policy.pass();
 		}
-		boolean slow = credential.secrets().stream().anyMatch(secret -> !PasswordEncoders.cheap(secret));
-		if (slow && !this.verifications.tryAcquire()) {
+		boolean bounded = credential.bounded();
+		if (bounded && !this.verifications.tryAcquire()) {
 			return new Verdict.Busy(BUSY_RETRY_AFTER);
 		}
 		try {
-			boolean matched = false;
-			for (String secret : credential.secrets()) {
-				if (this.matches(credential.raw(), secret)) {
-					matched = true;
-					break;
-				}
-			}
-			if (!matched || credential.decoy()) {
+			if (!credential.matches()) {
 				return null;
 			}
 		}
 		finally {
-			if (slow) {
+			if (bounded) {
 				this.verifications.release();
 			}
 		}
@@ -264,7 +257,7 @@ public class RouteAuthenticator {
 		return key == null || key.isBlank() ? "*" : key.strip();
 	}
 
-	private static Policy policy(String key, SluiceServerProperties.Route.Auth auth) {
+	private Policy policy(String key, SluiceServerProperties.Route.Auth auth) {
 		String property = "sluice.route.auth.[" + key + "]";
 		if (key.startsWith("tcp:")) {
 			throw new IllegalStateException(property + ": a tcp route carries no request whose credentials "
@@ -273,57 +266,23 @@ public class RouteAuthenticator {
 		if (auth.basic().isEmpty() && auth.bearer().isEmpty() && auth.apiToken().isEmpty()) {
 			throw new IllegalStateException(property + " configures no credential (basic, bearer or api-token)");
 		}
-		auth.basic().forEach((user, password) -> {
-			if (user.isEmpty() || user.indexOf(':') >= 0) {
-				throw new IllegalStateException(property + ".basic: a user name is empty or holds a colon");
-			}
-			validate(property + ".basic." + user, password);
-		});
-		for (int i = 0; i < auth.bearer().size(); i++) {
-			validate(property + ".bearer[" + i + "]", auth.bearer().get(i));
-		}
-		for (int i = 0; i < auth.apiToken().size(); i++) {
-			validate(property + ".api-token[" + i + "]", auth.apiToken().get(i));
-		}
-		String apiTokenHeader = auth.apiTokenHeader().toLowerCase(Locale.ROOT);
-		if (!TOKEN.matcher(apiTokenHeader).matches() || apiTokenHeader.equals(AUTHORIZATION)) {
-			throw new IllegalStateException(property + ".api-token-header is no header name besides Authorization");
-		}
+		List<CredentialScheme> schemes = new ArrayList<>(3);
+		Stream
+			.of(BasicScheme.of(property, auth.basic(), this::matches),
+					BearerScheme.of(property, auth.bearer(), this::matches),
+					ApiTokenScheme.of(property, auth.apiTokenHeader(), auth.apiToken(), this::matches))
+			.filter(Objects::nonNull)
+			.forEach(schemes::add);
 		String realm = auth.realm().isEmpty() ? key : auth.realm();
 		if (realm.chars().anyMatch(c -> c < 0x20 || c == 0x7f)) {
 			throw new IllegalStateException(property + ".realm holds a control character");
 		}
 		String quotedRealm = "realm=\"" + realm.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
-		List<String> schemes = new ArrayList<>();
-		List<String> challenges = new ArrayList<>();
 		Set<String> headers = new LinkedHashSet<>();
-		if (!auth.basic().isEmpty()) {
-			schemes.add("basic");
-			challenges.add("Basic " + quotedRealm + ", charset=\"UTF-8\"");
-			headers.add(AUTHORIZATION);
-		}
-		if (!auth.bearer().isEmpty()) {
-			schemes.add("bearer");
-			challenges.add("Bearer " + quotedRealm);
-			headers.add(AUTHORIZATION);
-		}
-		if (!auth.apiToken().isEmpty()) {
-			schemes.add(auth.apiTokenHeader());
-			challenges.add(auth.apiTokenHeader() + " " + quotedRealm);
-			headers.add(apiTokenHeader);
-		}
-		return new Policy(key, new TreeMap<>(auth.basic()), auth.bearer(), auth.apiToken(), Set.copyOf(headers),
+		schemes.forEach(scheme -> headers.add(scheme.header()));
+		return new Policy(key, List.copyOf(schemes), List.copyOf(headers),
 				auth.forwardCredentials() ? Verdict.OPEN : new Verdict.Pass(headers), auth.allowPreflight(),
-				List.copyOf(schemes), List.copyOf(challenges));
-	}
-
-	private static void validate(String property, String secret) {
-		try {
-			PasswordEncoders.validate(secret);
-		}
-		catch (IllegalArgumentException e) {
-			throw new IllegalStateException(property + " " + e.getMessage(), e);
-		}
+				schemes.stream().map(scheme -> scheme.challenge(quotedRealm)).toList());
 	}
 
 	private static String sha256(String value) {
@@ -339,72 +298,53 @@ public class RouteAuthenticator {
 	/**
 	 * The credentials of one route.
 	 *
-	 * @param strip the lowercase names of the headers carrying them
+	 * @param schemes the schemes it accepts, in the order its challenges are listed
+	 * @param headers the lowercase names of the headers carrying them, each once
 	 * @param pass the verdict on a request that passes
 	 */
-	private record Policy(String key, Map<String, String> basic, List<String> bearer, List<String> apiToken,
-			Set<String> strip, Verdict pass, boolean allowPreflight, List<String> schemes, List<String> challenges) {
+	private record Policy(String key, List<CredentialScheme> schemes, List<String> headers, Verdict pass,
+			boolean allowPreflight, List<String> challenges) {
 
 		Verdict unauthorized(String reason) {
 			return new Verdict.Unauthorized(reason, this.challenges);
 		}
 
+		List<String> names() {
+			return this.schemes.stream().map(CredentialScheme::name).toList();
+		}
+
 		/**
-		 * The credential of an {@code Authorization} value: Basic or Bearer, as the route
-		 * accepts it; one matching no secret otherwise (a scheme the route does not
-		 * accept, a Basic value that does not decode or holds no colon, an empty token).
+		 * The credential of the header's value, taken by the scheme of the header whose
+		 * auth-scheme token it carries, or whose whole value it is;
+		 * {@link CredentialScheme.Credential#NONE} when no scheme of the route takes it.
 		 */
-		Presented authorization(String value) {
+		Presented credential(String header, String value) {
 			String trimmed = value.strip();
 			int space = trimmed.indexOf(' ');
-			String scheme = (space < 0 ? trimmed : trimmed.substring(0, space)).toLowerCase(Locale.ROOT);
-			String credential = space < 0 ? "" : trimmed.substring(space + 1).strip();
-			if (scheme.equals("bearer") && !this.bearer.isEmpty()) {
-				return new Presented(scheme, credential, this.bearer, false);
+			String token = (space < 0 ? trimmed : trimmed.substring(0, space)).toLowerCase(Locale.ROOT);
+			for (CredentialScheme scheme : this.schemes) {
+				if (!scheme.header().equals(header)) {
+					continue;
+				}
+				String authScheme = scheme.authScheme();
+				if (authScheme == null) {
+					return new Presented(scheme.name(), scheme.credential(trimmed));
+				}
+				if (authScheme.equals(token)) {
+					return new Presented(scheme.name(),
+							scheme.credential(space < 0 ? "" : trimmed.substring(space + 1).strip()));
+				}
 			}
-			if (!scheme.equals("basic") || this.basic.isEmpty()) {
-				return Presented.NONE;
-			}
-			String decoded;
-			try {
-				decoded = new String(Base64.getDecoder().decode(credential), StandardCharsets.UTF_8);
-			}
-			catch (IllegalArgumentException e) {
-				return Presented.NONE;
-			}
-			int colon = decoded.indexOf(':');
-			if (colon < 0) {
-				return Presented.NONE;
-			}
-			String user = decoded.substring(0, colon);
-			String password = decoded.substring(colon + 1);
-			String secret = this.basic.get(user);
-			if (secret == null) {
-				// checked against another user's password, the outcome discarded
-				return new Presented(scheme, decoded, List.of(this.basic.values().iterator().next()), true, password);
-			}
-			return new Presented(scheme, decoded, List.of(secret), false, password);
+			return new Presented("", CredentialScheme.Credential.NONE);
 		}
 
 	}
 
 	/**
-	 * A credential a request presented.
-	 *
-	 * @param scheme what it was presented as
-	 * @param value what identifies it in the cache: the token, or {@code user:password}
-	 * @param secrets the secrets it may match
-	 * @param decoy whether it fails whatever it matches (an unknown Basic user)
-	 * @param raw what is matched against the secrets: the token, or the password
+	 * A credential a request presented, with the name of the scheme that took it: a value
+	 * remembered for one scheme passes no other.
 	 */
-	private record Presented(String scheme, String value, List<String> secrets, boolean decoy, String raw) {
-
-		static final Presented NONE = new Presented("none", "", List.of(), true, "");
-
-		Presented(String scheme, String value, List<String> secrets, boolean decoy) {
-			this(scheme, value, secrets, decoy, value);
-		}
-
+	private record Presented(String scheme, CredentialScheme.Credential credential) {
 	}
 
 }

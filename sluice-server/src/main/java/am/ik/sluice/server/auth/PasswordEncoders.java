@@ -95,6 +95,21 @@ public final class PasswordEncoders {
 	}
 
 	/**
+	 * Checks a configured secret as {@link #validate(String)} does.
+	 * @param property the property holding it, named in the failure
+	 * @throws IllegalStateException naming the property and what is wrong, never the
+	 * secret
+	 */
+	static void validate(String property, String secret) {
+		try {
+			validate(secret);
+		}
+		catch (IllegalArgumentException e) {
+			throw new IllegalStateException(property + " " + e.getMessage(), e);
+		}
+	}
+
+	/**
 	 * Whether matching against the secret is cheap -- {@code noop}, {@code sha256} --
 	 * rather than a deliberately slow hash.
 	 */
