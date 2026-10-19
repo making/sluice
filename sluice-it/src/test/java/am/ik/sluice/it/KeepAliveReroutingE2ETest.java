@@ -46,7 +46,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * End to end for per-request re-routing on keep-alive connections: the second request of
  * an HTTP/1.1 keep-alive connection whose Host resolves to another client's upstream must
  * be answered by that upstream (and, with {@code rewrite-host}, by the host of its own
- * route), with a {@code type=req} access log line per request head.
+ * route), with a {@code type=req} access log line per request head; the virtual
+ * connection switched from leaves its tunnel session at once.
  */
 // the relay logs why it ended and the client why a dial failed at debug, should a
 // rerouting fail on CI again (a logging level must be set before the context starts: a
@@ -185,10 +186,15 @@ class KeepAliveReroutingE2ETest {
 	void reroutesTheSecondKeepAliveRequestToTheOtherUpstream() throws Exception {
 		startClient("reroute.a.test", alphaUpstream, false);
 		startClient("reroute.b.test", betaUpstream, false);
+		String alpha = Objects.requireNonNull(this.router).lookup("reroute.a.test").orElseThrow().clientId();
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.setSoTimeout(10_000);
 			assertThat(exchange(socket, "reroute.a.test", "/one")).startsWith("HTTP/1.1 200 OK|alpha:reroute.a.test");
+			assertThat(this.sessions.find(alpha).orElseThrow().connectionCount()).isOne();
 			assertThat(exchange(socket, "reroute.b.test", "/one")).startsWith("HTTP/1.1 200 OK|beta:reroute.b.test");
+			Awaitility.await()
+				.atMost(Duration.ofSeconds(5))
+				.until(() -> this.sessions.find(alpha).orElseThrow().connectionCount() == 0);
 		}
 	}
 

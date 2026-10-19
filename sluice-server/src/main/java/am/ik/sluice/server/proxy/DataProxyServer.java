@@ -120,6 +120,9 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	/** Handed to every HTTP/1.1 relay started from now on. */
 	private volatile ReroutingRelay.ProbeSeam probeSeam = ReroutingRelay.ProbeSeam.NONE;
 
+	/** Handed to every HTTP/1.1 relay started from now on. */
+	private volatile ReroutingRelay.HeadSeam headSeam = ReroutingRelay.HeadSeam.NONE;
+
 	/** The wait deadline every h2 demux relay started from now on gets. */
 	private volatile Duration h2StreamWaitTimeout;
 
@@ -589,7 +592,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			ReroutingRelay rerouting = new ReroutingRelay(this.clientPipeSeam.apply(conn.pipe()), conn.head(),
 					this.router, this.sessions, this.accessControl, this.routeAuth, this.errorResponse, access,
 					this.meterRegistry, route0, session, peer, deadline,
-					this.properties.limits().halfCloseProbeInterval(), this.probeSeam, relayed, release);
+					this.properties.limits().halfCloseProbeInterval(), this.probeSeam, this.headSeam, relayed, release);
 			this.activeConnections.incrementAndGet();
 			try {
 				rerouting.start();
@@ -787,6 +790,11 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	/** Sets the probe seam of the HTTP/1.1 relays started from now on; for tests. */
 	void probeSeam(ReroutingRelay.ProbeSeam probeSeam) {
 		this.probeSeam = probeSeam;
+	}
+
+	/** Sets the head seam of the HTTP/1.1 relays started from now on; for tests. */
+	void headSeam(ReroutingRelay.HeadSeam headSeam) {
+		this.headSeam = headSeam;
 	}
 
 	/**

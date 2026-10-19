@@ -55,6 +55,8 @@ import am.ik.sluice.it.WindowedH2Upstream;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.auth.PasswordEncoders;
 import am.ik.sluice.server.route.Router;
+import am.ik.sluice.server.tunnel.SessionRegistry;
+import am.ik.sluice.server.tunnel.TunnelSession;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -77,10 +79,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  * answered once it failed. A parked stream the client resets, or whose connection goes
  * away, is dropped: the check's end finds nothing to resume. A check that throws resets
  * its stream; one that does not end by the wait deadline is refused; parked streams past
- * the connection's allowance are refused while the budget is exhausted. The checks are
- * held by the server's password encoder, replaced here by one holding a credential's
- * check until the test lets it go. The relay's exception sink stays silent but for the
- * check that throws, and with netty's paranoid leak detection on no buffer leaks.
+ * the connection's allowance are refused while the budget is exhausted. A stream parked
+ * while its route's client withdraws keeps that client's leg open, is relayed there, and
+ * then the leg closes, ending the client's drain. The checks are held by the server's
+ * password encoder, replaced here by one holding a credential's check until the test lets
+ * it go. The relay's exception sink stays silent but for the check that throws, and with
+ * netty's paranoid leak detection on no buffer leaks.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -93,6 +97,9 @@ class H2DemuxCredentialCheckE2ETest {
 	private static final String GATED = "gated.check.test";
 
 	private static final String OPEN = "open.check.test";
+
+	/** A route requiring credentials, served by a client that withdraws. */
+	private static final String WITHDRAWING = "withdrawing.check.test";
 
 	private static final String FAST_TOKEN = "fast-token";
 
@@ -152,6 +159,10 @@ class H2DemuxCredentialCheckE2ETest {
 	@Autowired
 	private Router router;
 
+	@Nullable
+	@Autowired
+	private SessionRegistry sessions;
+
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
 		grpcPort = TestPorts.freePort();
@@ -165,6 +176,9 @@ class H2DemuxCredentialCheckE2ETest {
 		registry.add("sluice.route.auth.[" + GATED + "].bearer[0]",
 				() -> "{bcrypt}" + new BCryptPasswordEncoder(4).encode("unused"));
 		registry.add("sluice.route.auth.[" + GATED + "].api-token[0]", () -> "{sha256}" + sha256Hex(FAST_TOKEN));
+		registry.add("sluice.route.auth.[" + WITHDRAWING + "].bearer[0]",
+				() -> "{bcrypt}" + new BCryptPasswordEncoder(4).encode("unused"));
+		registry.add("sluice.route.auth.[" + WITHDRAWING + "].api-token[0]", () -> "{sha256}" + sha256Hex(FAST_TOKEN));
 	}
 
 	/**
@@ -321,6 +335,57 @@ class H2DemuxCredentialCheckE2ETest {
 			assertThat(TestH2.status(h2.frames(3))).isEqualTo("401");
 			assertThat(paths()).doesNotContain("/wrong");
 		}
+		assertThat(warnings()).as("the relay's exception sink").isEmpty();
+	}
+
+	/**
+	 * A stream parked on a route whose client withdraws meanwhile: the client's leg on
+	 * the connection, idle, stays open for it -- the client's session keeps the leg's
+	 * connection --, the stream is relayed there once its check passes, and then the leg
+	 * closes, ending the client's drain well before its grace.
+	 */
+	@Test
+	void aStreamParkedWhileItsClientWithdrawsIsRelayedOnTheClientsLeg() throws Exception {
+		String clientId = "check-withdrawing";
+		ServerSocket server = (ServerSocket) this.closeables.get(0);
+		TunnelClient client = TunnelClient.builder()
+			.properties(SluiceClientProperties.builder()
+				.serverUrl("grpc://127.0.0.1:" + grpcPort)
+				.clientId(clientId)
+				.token("it-token")
+				.drainGrace(Duration.ofMinutes(1))
+				.upstream(
+						Upstream.builder().host(WITHDRAWING).target("tcp://127.0.0.1:" + server.getLocalPort()).build())
+				.build())
+			.taskExecutor(task -> Thread.ofVirtual().name("e2e-check-withdrawing").start(task))
+			.meterRegistry(new SimpleMeterRegistry())
+			.build();
+		client.start();
+		this.clients.add(client);
+		Awaitility.await().atMost(TIMEOUT).until(() -> router().lookup(WITHDRAWING).isPresent());
+		TunnelSession session = sessions().find(clientId).orElseThrow();
+		String token = "gated-withdrawing";
+		try (H2TestClient h2 = H2TestClient.connect(dataPort, 1, 3)) {
+			// the leg opens for a stream checked at once
+			h2.headers(1, true, get(WITHDRAWING, "/first", "x-api-token=" + FAST_TOKEN));
+			assertThat(h2.awaitEnd(1, TIMEOUT)).isTrue();
+			h2.headers(3, true, get(WITHDRAWING, "/parked", "authorization=Bearer " + token));
+			awaitEntered(token);
+			CountDownLatch stopped = new CountDownLatch(1);
+			Thread.ofVirtual().start(() -> client.stop(stopped::countDown));
+			Awaitility.await().atMost(TIMEOUT).until(session::withdrawn);
+			Awaitility.await("the leg is kept for the parked stream")
+				.during(Duration.ofMillis(500))
+				.atMost(TIMEOUT)
+				.until(() -> session.connectionCount() == 1);
+
+			open(token);
+			assertThat(h2.awaitEnd(3, TIMEOUT)).as("the parked stream completes").isTrue();
+			assertThat(TestH2.status(h2.frames(3))).isEqualTo("200");
+			assertThat(TestH2.bodyOf(h2.frames(3))).as("on the leg of stream 1").isEqualTo("ok3 0");
+			assertThat(stopped.await(TIMEOUT.toSeconds(), TimeUnit.SECONDS)).as("the client's drain ended").isTrue();
+		}
+		assertThat(paths()).contains("/first", "/parked");
 		assertThat(warnings()).as("the relay's exception sink").isEmpty();
 	}
 
@@ -665,6 +730,10 @@ class H2DemuxCredentialCheckE2ETest {
 
 	private Router router() {
 		return Objects.requireNonNull(this.router, "router");
+	}
+
+	private SessionRegistry sessions() {
+		return Objects.requireNonNull(this.sessions, "sessions");
 	}
 
 	private static void close(AutoCloseable closeable) {

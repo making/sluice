@@ -166,12 +166,16 @@ import io.netty.util.AsciiString;
  * new leg while the limit has no slot left is refused ({@code REFUSED_STREAM}). A leg
  * retires once its channel closed and its threads ended: the relay lets go of it, its
  * virtual connection leaves the session, and its slot comes back once the frames it
- * queued left the tunnel sender. The bytes each leg reads and writes count as the route's
- * tunnel bytes ({@code sluice.tunnel.bytes}), the session's traffic and the connection's
- * access log bytes. A stream netty's codec resets on a stream error of the client or of
- * an upstream, and a leg sending its upstream a GOAWAY with an error code, are counted
- * ({@link H2DemuxMeters}); a client or an upstream going away mid-stream is neither
- * ({@link HopHandler}).
+ * queued left the tunnel sender. A leg whose client withdrew
+ * ({@link TunnelSession#withdrawn()}) closes as soon as it has no stream left -- none
+ * open on its upstream, none waiting for one, none parked for its route
+ * ({@link #retireWithdrawnLocked}) --, so the client's drain does not wait on an idle
+ * connection; the route's next stream is resolved anew. The bytes each leg reads and
+ * writes count as the route's tunnel bytes ({@code sluice.tunnel.bytes}), the session's
+ * traffic and the connection's access log bytes. A stream netty's codec resets on a
+ * stream error of the client or of an upstream, and a leg sending its upstream a GOAWAY
+ * with an error code, are counted ({@link H2DemuxMeters}); a client or an upstream going
+ * away mid-stream is neither ({@link HopHandler}).
  * <p>
  * netty's codec answers the client's protocol errors itself; a header block that does not
  * decode ends the connection with a GOAWAY {@code COMPRESSION_ERROR}, logged as a request
@@ -1155,7 +1159,7 @@ final class NettyHttp2DemuxRelay {
 			log.warn("h2 demux: the leg of route {} did not open: {}", route.routeTag(), e.toString(), e);
 			return null;
 		}
-		Leg opening = new Leg(route.routeTag(), this.meters.route(route.routeTag()),
+		Leg opening = new Leg(route.routeTag(), session, this.meters.route(route.routeTag()),
 				this.meters.writesHeldOf(route.routeTag()));
 		try {
 			Hop hop = Hop.builder()
@@ -1206,6 +1210,7 @@ final class NettyHttp2DemuxRelay {
 		opening.routeMeters.legs().increment();
 		this.legs.put(route, opening);
 		this.pending.incrementAndGet();
+		session.onWithdrawn(connection.connectionId(), this::reviewSoon);
 		watch(opening.hop(), () -> {
 			try {
 				connection.close();
@@ -1369,6 +1374,36 @@ final class NettyHttp2DemuxRelay {
 			acted = true;
 		}
 		return acted;
+	}
+
+	/**
+	 * Closes each leg whose client withdrew and that has no stream left: none open on its
+	 * upstream, none waiting in its buffer, none parked for its route (a parked stream
+	 * goes to the route's leg once its check ended). Its upstream sees the end once the
+	 * frames queued for it are out. Whether it closed anything; with the loop's lock.
+	 */
+	private boolean retireWithdrawnLocked() {
+		boolean acted = false;
+		for (Leg leg : this.opened) {
+			Hop hop = leg.hop();
+			if (leg.session.withdrawn() && hop.open() && hop.connection().numActiveStreams() == 0 && !waitsInLocked(leg)
+					&& !parkedForLocked(leg)) {
+				log.debug("h2 demux: the client of route {} withdrew; closing its idle leg", leg.routeTag);
+				hop.closeLocked();
+				acted = true;
+			}
+		}
+		return acted;
+	}
+
+	/** Whether a parked stream is bound for the leg; with the loop's lock. */
+	private boolean parkedForLocked(Leg leg) {
+		for (NewStream stream : this.parked.values()) {
+			if (this.legs.get(stream.route) == leg) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/** Whether a stream waits in the leg's buffer; with the loop's lock. */
@@ -1741,6 +1776,7 @@ final class NettyHttp2DemuxRelay {
 			}
 		}
 		watchWritesLocked(watchingWrites());
+		wrote |= retireWithdrawnLocked();
 		wrote |= reviewDeadlineLocked();
 		return wrote;
 	}
@@ -2091,6 +2127,9 @@ final class NettyHttp2DemuxRelay {
 
 		final String routeTag;
 
+		/** The session the leg's virtual connection is on. */
+		final TunnelSession session;
+
 		final H2DemuxMeters.Route routeMeters;
 
 		/** Set once the hop is built. */
@@ -2126,8 +2165,9 @@ final class NettyHttp2DemuxRelay {
 		/** The lowest stream id the leg may open next; with the loop's lock. */
 		private long nextStreamId = 1;
 
-		Leg(String routeTag, H2DemuxMeters.Route routeMeters, LongAdder writesHeld) {
+		Leg(String routeTag, TunnelSession session, H2DemuxMeters.Route routeMeters, LongAdder writesHeld) {
 			this.routeTag = routeTag;
+			this.session = session;
 			this.routeMeters = routeMeters;
 			this.writesHeld = writesHeld;
 		}

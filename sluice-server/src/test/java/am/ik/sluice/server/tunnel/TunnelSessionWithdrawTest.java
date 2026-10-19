@@ -3,6 +3,9 @@ package am.ik.sluice.server.tunnel;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.route.Router;
@@ -20,8 +23,9 @@ import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
 
 /**
  * A withdrawing advertise removes the client's routes and releases its ports at once,
- * keeps the session opening connections, and is acknowledged only once no connection is
- * left; from that ack on the session opens none.
+ * keeps the session opening connections, tells the relays of the connections open on it,
+ * and is acknowledged only once no connection is left; from that ack on the session opens
+ * none.
  */
 class TunnelSessionWithdrawTest {
 
@@ -50,8 +54,22 @@ class TunnelSessionWithdrawTest {
 		stream.await(Frame.BodyCase.ADVERTISE_ACK, 1);
 		assertThat(this.router.lookup(HOST)).isPresent();
 		VirtualConnection inFlight = session.open("127.0.0.1:8080");
+		CountDownLatch heard = new CountDownLatch(1);
+		AtomicBoolean routeGoneFirst = new AtomicBoolean();
+		session.onWithdrawn(inFlight.connectionId(), () -> {
+			routeGoneFirst.set(this.router.lookup(HOST).isEmpty());
+			heard.countDown();
+		});
+		// a listener leaves with its connection
+		VirtualConnection ended = session.open("127.0.0.1:8080");
+		CountDownLatch endedHeard = new CountDownLatch(1);
+		session.onWithdrawn(ended.connectionId(), endedHeard::countDown);
+		session.remove(ended.connectionId());
 
 		session.handle(advertise(upstream, true));
+		assertThat(heard.await(5, TimeUnit.SECONDS)).as("the relay of the open connection hears of it").isTrue();
+		assertThat(routeGoneFirst).as("after the routes were removed").isTrue();
+		assertThat(endedHeard.await(200, TimeUnit.MILLISECONDS)).as("the ended connection's listener").isFalse();
 		Awaitility.await().until(() -> session.upstreams().isEmpty());
 		assertThat(session.withdrawn()).isTrue();
 		assertThat(this.router.lookup(HOST)).isEmpty();
@@ -66,13 +84,13 @@ class TunnelSessionWithdrawTest {
 		assertThat(withdrawn.getWithdrawn()).isTrue();
 		assertThatIllegalStateException().isThrownBy(() -> session.open("127.0.0.1:8080"))
 			.withMessageContaining("withdrew");
-		// the CONNECTs of both connections precede the ack on the stream
+		// the CONNECTs of the connections precede the ack on the stream
 		List<Frame.BodyCase> order = stream.frames.stream()
 			.map(Frame::getBodyCase)
 			.filter(body -> body == Frame.BodyCase.CONNECT || body == Frame.BodyCase.ADVERTISE_ACK)
 			.toList();
 		assertThat(order).containsExactly(Frame.BodyCase.ADVERTISE_ACK, Frame.BodyCase.CONNECT, Frame.BodyCase.CONNECT,
-				Frame.BodyCase.ADVERTISE_ACK);
+				Frame.BodyCase.CONNECT, Frame.BodyCase.ADVERTISE_ACK);
 
 		// an advertise after the withdrawal registers nothing and is answered as
 		// withdrawn

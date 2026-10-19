@@ -625,17 +625,18 @@ Details (overflow handling, reservations, probes, slot release, log throttles):
 On SIGTERM / SIGINT the client drains before it closes:
 
 - It withdraws its routes on every server node. From then on the server sends new
-  connections, the next request of an HTTP/1.1 keep-alive connection and new tcp route
-  connections to the other clients serving the route; a listen port it owned is bound
-  for the next smallest id serving it. The console shows the client as `Draining`.
+  connections, the next request of an HTTP/1.1 keep-alive connection, the next stream of
+  an h2 connection and new tcp route connections to the other clients serving the route;
+  a listen port it owned is bound for the next smallest id serving it. The console shows
+  the client as `Draining`.
 - The connections open on it keep relaying until they end. Once none is left on a node,
   the node acknowledges the withdrawal and the client ends that stream.
 - After `sluice.client.drain-grace` (20s) the connections still open are closed and logged
   (`drain grace PT20S expired; closing N open connection(s)`). `0` closes at once.
-- Connections that hold the drain: in-flight requests, WebSocket / TLS passthrough / tcp
-  route connections, and idle keep-alive or h2 connections whose last request went
-  through this client (until their next request, the server's `idle-timeout`, or the
-  grace).
+- Connections that hold the drain: in-flight requests and WebSocket / TLS passthrough / tcp
+  route connections. An idle keep-alive or h2 connection whose last request went through
+  this client does not: the server closes its upstream connection on this client once no
+  request is in flight on it, and keeps the client's connection open.
 - A route served by this client alone answers `503` from the withdrawal on, rather than
   accepting requests the grace may cut.
 - A second SIGTERM / SIGINT during the drain closes at once.

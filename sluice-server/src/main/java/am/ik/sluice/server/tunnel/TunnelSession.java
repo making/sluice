@@ -71,7 +71,9 @@ import io.grpc.Status;
  * them, while the connections open on the session keep relaying. Once none is left the
  * session is sealed -- {@link #open} refuses from then on -- and the withdrawal is
  * acknowledged ({@code AdvertiseAck.withdrawn}): no {@code Connect} follows that ack, and
- * the client may end the stream.
+ * the client may end the stream. The relays holding a connection on the session hear of
+ * the withdrawal ({@link #onWithdrawn}) and close the connections no request is in flight
+ * on.
  */
 public final class TunnelSession implements AutoCloseable {
 
@@ -114,6 +116,12 @@ public final class TunnelSession implements AutoCloseable {
 	private final AtomicLong sequence = new AtomicLong(1);
 
 	private final ConcurrentMap<Long, VirtualConnection> connections = new ConcurrentHashMap<>();
+
+	/**
+	 * What runs when the client withdraws, by the connection it was registered with
+	 * ({@link #onWithdrawn}); removed with the connection.
+	 */
+	private final ConcurrentMap<Long, Runnable> withdrawnListeners = new ConcurrentHashMap<>();
 
 	private static Set<Integer> listenPorts(List<Upstream> upstreams) {
 		return upstreams.stream()
@@ -728,6 +736,11 @@ public final class TunnelSession implements AutoCloseable {
 			log.atLevel(level(Level.INFO))
 				.log("client {} withdrew its routes; draining {} connection(s)", this.clientId,
 						this.connections.size());
+			// after the route removal: a request the listeners' relays read from now on
+			// resolves to another client
+			for (Runnable listener : List.copyOf(this.withdrawnListeners.values())) {
+				Thread.ofVirtual().name("sluice-withdrawn-" + this.clientId).start(listener);
+			}
 		}
 		if (sealedBefore) {
 			sendWithdrawnAck();
@@ -863,8 +876,28 @@ public final class TunnelSession implements AutoCloseable {
 	}
 
 	public void remove(long connectionId) {
+		this.withdrawnListeners.remove(connectionId);
 		if (this.connections.remove(connectionId) != null) {
 			sealIfIdle();
+		}
+	}
+
+	/**
+	 * Has {@code listener} run once the client withdraws its routes
+	 * ({@link #withdrawn()}), on a virtual thread of its own, while the connection is
+	 * open on the session: the listener is removed with the connection ({@link #remove}),
+	 * and one registered once the client withdrew may not run -- the relay checks
+	 * {@link #withdrawn()} where it decides.
+	 */
+	public void onWithdrawn(long connectionId, Runnable listener) {
+		Objects.requireNonNull(listener, "listener is required");
+		if (!this.connections.containsKey(connectionId)) {
+			return;
+		}
+		this.withdrawnListeners.put(connectionId, listener);
+		if (!this.connections.containsKey(connectionId)) {
+			// removed meanwhile: nothing removes the listener any more
+			this.withdrawnListeners.remove(connectionId);
 		}
 	}
 
@@ -979,6 +1012,7 @@ public final class TunnelSession implements AutoCloseable {
 			connection.close();
 		}
 		this.connections.clear();
+		this.withdrawnListeners.clear();
 	}
 
 	/**

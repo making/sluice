@@ -44,7 +44,17 @@ import io.micrometer.core.instrument.MeterRegistry;
  * the connection limit never covers the send queues of two legs. The closure of the leg
  * in charge by its upstream ends the whole relay, as does any failure; the slot is
  * released once the relay ended and every leg's queued frames left. Each leg pumps its
- * inbound side on its own virtual thread for the lifetime of its virtual connection.
+ * inbound side on its own virtual thread for the lifetime of its virtual connection; a
+ * leg closed by the relay leaves its tunnel session at once.
+ * <p>
+ * A leg in charge whose client withdrew ({@link TunnelSession#withdrawn()}) is retired at
+ * the first request boundary -- no response owed, nothing of a next request read, the
+ * connection not relayed verbatim, no request or response on it asked to close the
+ * connection (that close ends the relay, as before) -- so the client's drain does not
+ * wait on an idle connection: the relay closes the leg, and the next request opens a leg
+ * on the route resolved anew. The decision is taken under the same lock as the start of a
+ * request: a request head read after it goes to a new leg, one read before it holds the
+ * leg.
  * <p>
  * A request asking for an upgrade, or a CONNECT, holds the parse -- the relay reads no
  * further client bytes -- until the leg's response to it: switched (101, a 2xx to
@@ -195,6 +205,9 @@ final class ReroutingRelay {
 	/** Runs between a probe's decision and its write. */
 	private final ProbeSeam probeSeam;
 
+	/** Runs between the choice of a request head's leg and the head's relaying. */
+	private final HeadSeam headSeam;
+
 	/**
 	 * A malformed request was rejected: the legs relay nothing more to the client, and
 	 * their end leaves the client connection to the linger; set with {@link #sinkLock}.
@@ -222,7 +235,7 @@ final class ReroutingRelay {
 			AccessControl accessControl, RouteAuthenticator routeAuth, ErrorResponse errorResponse,
 			AccessLogger.Connection access, MeterRegistry meterRegistry, Router.Route initialRoute,
 			TunnelSession initialSession, @Nullable InetAddress peer, ConnectionLimits.KeepAliveDeadline deadline,
-			Duration probeInterval, ProbeSeam probeSeam, Runnable onFinish, Runnable release) {
+			Duration probeInterval, ProbeSeam probeSeam, HeadSeam headSeam, Runnable onFinish, Runnable release) {
 		this.pipe = pipe;
 		this.seedHead = head.bytes();
 		this.router = router;
@@ -240,6 +253,7 @@ final class ReroutingRelay {
 		this.deadline = deadline;
 		this.probeIntervalNanos = probeInterval.toNanos();
 		this.probeSeam = probeSeam;
+		this.headSeam = headSeam;
 		deadline.onExpiry(this::abort);
 		deadline.watchStallClock(this.clientWaits::nanos, this::abort);
 	}
@@ -425,7 +439,10 @@ final class ReroutingRelay {
 		}
 	}
 
-	/** The bytes read were parsed; the parser now stands at {@code position}. */
+	/**
+	 * The bytes read were parsed; the parser now stands at {@code position}. A request
+	 * body ending after its response retires a leg whose client withdrew.
+	 */
 	private void fed(Http1RequestParser.Position position) {
 		synchronized (this.deadlineLock) {
 			this.starting = false;
@@ -433,6 +450,36 @@ final class ReroutingRelay {
 			this.clientWaits.update();
 			updateDeadlineLocked();
 		}
+		Leg leg = this.current;
+		if (leg != null) {
+			retireIfWithdrawn(leg);
+		}
+	}
+
+	/**
+	 * Retires the leg in charge once its client withdrew, at a request boundary: no
+	 * response owed, nothing of a next request read ({@link #starting}, set under the
+	 * same lock before a request head is parsed), not relayed verbatim, no exchange on it
+	 * closing the connection ({@link Leg#closing}). The leg stops being in charge -- the
+	 * next request head opens a leg on the route resolved anew -- and is closed, its EOF
+	 * not ending the relay. Runs on the leg's withdrawal, as a response of the leg
+	 * completes, and as the parser reaches a boundary.
+	 */
+	private void retireIfWithdrawn(Leg leg) {
+		if (!leg.session.withdrawn()) {
+			return;
+		}
+		synchronized (this.deadlineLock) {
+			if (this.current != leg || this.starting || this.owed > 0
+					|| this.position != Http1RequestParser.Position.BETWEEN_REQUESTS || leg.closing) {
+				return;
+			}
+			leg.replaced = true; // its EOF is the retirement, not the end
+			this.current = null;
+		}
+		log.debug("rerouting relay: the client of connection {} (route {}) withdrew; retiring the leg",
+				leg.connection.connectionId(), leg.route.routeTag());
+		leg.retire();
 	}
 
 	/** A leg's responses owed changed by {@code delta}. */
@@ -629,14 +676,18 @@ final class ReroutingRelay {
 			}
 			this.current = leg; // visible to the old pump before its close below
 			if (old != null && !old.ended) {
-				old.close(); // the switch ends the previous conversation
+				old.retire(); // the switch ends the previous conversation
 				old.awaitQueued();
 			}
 		}
+		this.headSeam.routed(this);
 		ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser.http1RequestOf(head);
 		String expect = ConnectionHeadParser.http1HeaderOf(head, "expect");
 		this.continueAwaited = expect != null && expect.toLowerCase(java.util.Locale.ROOT).contains("100-continue");
 		this.clientWaits.update();
+		if (closesConnection(head)) {
+			leg.closing = true;
+		}
 		leg.requestSent(request, Http1RequestParser.isUpgrade(head));
 		this.lastRequest = System.nanoTime();
 		byte[] stripped = ConnectionHeadRewriter.withoutHeaders(head, pass.strip());
@@ -765,6 +816,12 @@ final class ReroutingRelay {
 
 		private volatile boolean replaced;
 
+		/**
+		 * A request or response relayed on the leg asked to close the connection after
+		 * its exchange: the upstream's close ends the relay, the leg is not retired.
+		 */
+		private volatile boolean closing;
+
 		/** The requests whose final response has not begun, in order. */
 		private final ArrayDeque<Sent> unanswered = new ArrayDeque<>();
 
@@ -785,6 +842,7 @@ final class ReroutingRelay {
 			this.inbound = meterRegistry.counter(METRIC_NAME, "direction", "inbound", "route", route.routeTag());
 			this.outbound = meterRegistry.counter(METRIC_NAME, "direction", "outbound", "route", route.routeTag());
 			this.tracker = new ResponseTracker(this);
+			session.onWithdrawn(this.connection.connectionId(), () -> retireIfWithdrawn(this));
 			pending.incrementAndGet();
 			Thread.ofVirtual()
 				.name("sluice-reroute-in-" + this.connection.connectionId())
@@ -817,6 +875,15 @@ final class ReroutingRelay {
 		/** Closes the virtual connection, releasing the upstream. */
 		void close() {
 			this.connection.close();
+		}
+
+		/**
+		 * Closes the virtual connection and lets it leave the session: the relay is done
+		 * with the leg, though not with the client connection.
+		 */
+		void retire() {
+			close();
+			this.session.remove(this.connection.connectionId());
 		}
 
 		/**
@@ -973,6 +1040,46 @@ final class ReroutingRelay {
 	}
 
 	/**
+	 * Whether a request or response head ends its connection after its exchange (RFC 9112
+	 * 9.3): a {@code close} connection option, or HTTP/1.0 without {@code keep-alive}.
+	 */
+	static boolean closesConnection(byte[] head) {
+		boolean keepAlive = false;
+		for (String value : ConnectionHeadParser.http1HeaderValues(head, "connection")) {
+			for (String option : value.split(",")) {
+				String token = option.trim();
+				if (token.equalsIgnoreCase("close")) {
+					return true;
+				}
+				keepAlive |= token.equalsIgnoreCase("keep-alive");
+			}
+		}
+		int eol = 0;
+		while (eol < head.length && head[eol] != '\r' && head[eol] != '\n') {
+			eol++;
+		}
+		String line = new String(head, 0, eol, StandardCharsets.ISO_8859_1);
+		boolean http10 = line.startsWith("HTTP/1.0 ") || line.endsWith(" HTTP/1.0");
+		return http10 && !keepAlive;
+	}
+
+	/**
+	 * Runs on the outbound side between the choice of a request head's leg and the head's
+	 * relaying, the request already started ({@link #starting}); a seam for tests to hold
+	 * a head there.
+	 */
+	@FunctionalInterface
+	interface HeadSeam {
+
+		/** Does nothing. */
+		HeadSeam NONE = relay -> {
+		};
+
+		void routed(ReroutingRelay relay);
+
+	}
+
+	/**
 	 * A request relayed on a leg: its method, its HTTP version, and whether it asked for
 	 * an upgrade.
 	 */
@@ -1006,6 +1113,8 @@ final class ReroutingRelay {
 				leg.outbound.increment(n);
 				leg.session.recordRelayed(n, StreamRelay.Direction.TO_LOCAL);
 				this.access.bytes(n, StreamRelay.Direction.TO_LOCAL);
+				// a response completed: the leg may be idle now
+				retireIfWithdrawn(leg);
 			}
 			this.sinkLock.lock();
 			try {
@@ -1212,6 +1321,9 @@ final class ReroutingRelay {
 			}
 			if (status >= 100 && status < 200 && status != 101) {
 				return; // interim: the final response follows on the same stream
+			}
+			if (closesConnection(bytes)) {
+				this.leg.closing = true;
 			}
 			Sent request = this.leg.nextRequest();
 			@Nullable String method = request == null ? null : request.method();

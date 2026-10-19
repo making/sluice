@@ -22,6 +22,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -43,6 +44,8 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.server.proxy.DataProxyServer;
+import am.ik.sluice.server.proxy.HeadSeams;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import am.ik.sluice.server.tunnel.TunnelSession;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -59,14 +62,18 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * End to end: a client stopped by its application context ({@code stop(Runnable)})
  * withdraws its routes and keeps relaying the connections open on it. Two clients serve
- * one host and one listen port; the smaller id (A) serves both. A slow request, a
- * keep-alive connection and a tcp connection are open on A when A is stopped: the slow
- * request completes on A, every request made after the withdrawal -- on new connections
- * and on the keep-alive one -- and every new tcp connection is served by B, the tcp
- * connection open keeps relaying on A, and A's drain ends once they ended, well before
- * its grace. A pipelined request resolved to A before the withdrawal, but relayed after
- * it, goes to B too. The console shows A as draining. A drain whose connections outlast
- * the grace, or that is aborted, closes them.
+ * one host, one h2 host and one listen port; the smaller id (A) serves them. A slow
+ * request (closing its connection), an idle keep-alive connection, an idle h2 connection
+ * and a tcp connection are open on A when A is stopped: the idle legs on A are closed at
+ * once, the slow request completes on A, every request made after the withdrawal -- on
+ * new connections, on the keep-alive one and on the h2 one -- and every new tcp
+ * connection is served by B, the tcp connection open keeps relaying on A, and A's drain
+ * ends once the slow request and the tcp connection ended, well before its grace: the
+ * idle connections stay open and hold it no longer. A request head on a keep-alive
+ * connection, routed to its leg on A before the withdrawal and held there across it,
+ * keeps that leg and is served by A. A pipelined request resolved to A before the
+ * withdrawal, but relayed after it, goes to B. The console shows A as draining. A drain
+ * whose connections outlast the grace, or that is aborted, closes them.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -79,6 +86,8 @@ class ClientDrainE2ETest {
 	private static final String HELD_HOST = "held.test";
 
 	private static final String B_ONLY_HOST = "b-only.test";
+
+	private static final String H2_HOST = "drain-h2.test";
 
 	private static final String CONSOLE_USER = "drain-e2e";
 
@@ -100,14 +109,18 @@ class ClientDrainE2ETest {
 
 	private final SessionRegistry sessions;
 
+	private final DataProxyServer dataProxyServer;
+
 	private final List<AutoCloseable> resources = new CopyOnWriteArrayList<>();
 
 	private final List<TunnelClient> clients = new CopyOnWriteArrayList<>();
 
 	private final int consolePort;
 
-	ClientDrainE2ETest(@Autowired SessionRegistry sessions, @LocalServerPort int consolePort) {
+	ClientDrainE2ETest(@Autowired SessionRegistry sessions, @Autowired DataProxyServer dataProxyServer,
+			@LocalServerPort int consolePort) {
 		this.sessions = sessions;
+		this.dataProxyServer = dataProxyServer;
 		this.consolePort = consolePort;
 	}
 
@@ -158,16 +171,34 @@ class ClientDrainE2ETest {
 		HttpServer upstreamB = httpUpstream("B", servedByB, slowEnteredB, releaseSlowB);
 		ServerSocket tcpA = tcpUpstream("A");
 		ServerSocket tcpB = tcpUpstream("B");
+		ScriptedH2Upstream h2A = h2Upstream("A");
+		ScriptedH2Upstream h2B = h2Upstream("B");
 		// B binds the listen port first; A, the smaller id, takes it over
-		startClient("drain-b", Duration.ofSeconds(60), http(HOST, upstreamB), http(B_ONLY_HOST, upstreamB), tcp(tcpB));
-		TunnelClient clientA = startClient("drain-a", Duration.ofSeconds(60), http(HOST, upstreamA), tcp(tcpA));
+		startClient("drain-b", Duration.ofSeconds(60), http(HOST, upstreamB), http(B_ONLY_HOST, upstreamB), tcp(tcpB),
+				h2(h2B));
+		TunnelClient clientA = startClient("drain-a", Duration.ofSeconds(60), http(HOST, upstreamA), tcp(tcpA),
+				h2(h2A));
 		Awaitility.await().atMost(HANG_GUARD).until(() -> "A:0".equals(tcpLine("0")));
+		// holds the request head relayed while it is armed after the choice of its leg
+		AtomicBoolean armed = new AtomicBoolean();
+		CountDownLatch headHeld = new CountDownLatch(1);
+		CountDownLatch releaseHead = new CountDownLatch(1);
+		HeadSeams.set(this.dataProxyServer, () -> {
+			if (armed.compareAndSet(true, false)) {
+				headHeld.countDown();
+				await(releaseHead);
+			}
+		});
 
 		try (Socket keepAlive = dataPlane();
+				Socket racing = dataPlane();
 				Socket held = new Socket("127.0.0.1", tcpRoutePort);
 				Socket slow = dataPlane();
-				Socket pipelined = dataPlane()) {
+				Socket pipelined = dataPlane();
+				H2TestClient h2 = H2TestClient.connect(dataPort, 1, 3)) {
 			assertThat(get(keepAlive, "/", true)).isEqualTo("200 A");
+			assertThat(get(racing, "/", true)).isEqualTo("200 A");
+			assertThat(h2Get(h2, 1)).isEqualTo("A");
 			held.setSoTimeout((int) HANG_GUARD.toMillis());
 			BufferedReader heldIn = reader(held);
 			PrintWriter heldOut = writer(held);
@@ -184,6 +215,10 @@ class ClientDrainE2ETest {
 				.atMost(HANG_GUARD)
 				.until(() -> ThreadDumps.anyThreadIn("am.ik.sluice.server.proxy.ReroutingRelay", "awaitDrained"));
 			int servedBeforeStop = servedByA.get();
+			// a request resolved to A, on A's leg, is held before its head is relayed
+			armed.set(true);
+			sendGet(racing, "/", true);
+			assertThat(headHeld.await(HANG_GUARD.toSeconds(), TimeUnit.SECONDS)).isTrue();
 
 			CountDownLatch stopped = new CountDownLatch(1);
 			Thread.ofVirtual().start(() -> clientA.stop(stopped::countDown));
@@ -191,6 +226,13 @@ class ClientDrainE2ETest {
 			Awaitility.await().atMost(HANG_GUARD).until(sessionA::withdrawn);
 			assertThat(console()).contains("<article class=\"client client--draining\" data-client=\"drain-a\">")
 				.contains("<article class=\"client\" data-client=\"drain-b\">");
+			// the idle legs on A -- the keep-alive connection's, the h2 connection's --
+			// are
+			// closed; the held request's, the slow request's and the tcp connection are
+			// left
+			Awaitility.await().atMost(HANG_GUARD).until(() -> sessionA.connectionCount() == 3);
+			releaseHead.countDown();
+			assertThat(readOne(racing.getInputStream())).as("the request on the leg kept for it").isEqualTo("200 A");
 			releaseSlowB.countDown();
 			assertThat(readOne(pipelined.getInputStream())).isEqualTo("200 B-slow");
 			assertThat(readOne(pipelined.getInputStream())).as("resolved to A before the withdrawal")
@@ -201,7 +243,6 @@ class ClientDrainE2ETest {
 					assertThat(get(fresh, "/", false)).isEqualTo("200 B");
 				}
 			}
-			assertThat(get(keepAlive, "/", true)).as("the next request of a keep-alive connection").isEqualTo("200 B");
 			// the port is handed over to B; the connection open on A keeps relaying
 			assertThat(tcpLine("2")).isEqualTo("B:2");
 			heldOut.println("3");
@@ -209,12 +250,21 @@ class ClientDrainE2ETest {
 			assertThat(stopped.getCount()).as("A drains while connections are open").isOne();
 
 			releaseSlow.countDown();
-			assertThat(read(slow)).isEqualTo("200 A-slow");
+			assertThat(read(slow)).as("the response closing its connection").isEqualTo("200 A-slow");
 			held.close();
-			keepAlive.close();
+			// the keep-alive, the h2 and the racing connection stay open, idle
 			assertThat(stopped.await(HANG_GUARD.toSeconds(), TimeUnit.SECONDS)).isTrue();
-			assertThat(servedByA).as("no request reached A after the withdrawal").hasValue(servedBeforeStop);
+			assertThat(get(keepAlive, "/", true)).as("the next request of a keep-alive connection").isEqualTo("200 B");
+			assertThat(h2Get(h2, 3)).as("the next stream of the h2 connection").isEqualTo("B");
+			assertThat(h2A.connections()).hasSize(1);
+			assertThat(h2A.connections().get(0).awaitClosed(HANG_GUARD)).as("A's h2 leg is closed").isTrue();
+			assertThat(servedByA).as("no request reached A after the withdrawal but the one held")
+				.hasValue(servedBeforeStop + 1);
 			assertThat(servedByB).hasValue(6);
+		}
+		finally {
+			HeadSeams.clear(this.dataProxyServer);
+			releaseHead.countDown();
 		}
 		assertThat(messages()).contains("drain ended with 0 open connection(s)")
 			.noneMatch(message -> message.contains("expired"));
@@ -286,6 +336,10 @@ class ClientDrainE2ETest {
 		return Upstream.builder().host(host).target("http://127.0.0.1:" + server.getAddress().getPort()).build();
 	}
 
+	private static Upstream h2(ScriptedH2Upstream server) {
+		return Upstream.builder().host(H2_HOST).target("tcp://127.0.0.1:" + server.port()).build();
+	}
+
 	private static Upstream tcp(ServerSocket server) {
 		return Upstream.builder()
 			.host(TCP_HOST)
@@ -327,6 +381,33 @@ class ClientDrainE2ETest {
 			server.stop(0);
 		});
 		return server;
+	}
+
+	/** An h2 upstream answering every request with {@code tag}. */
+	private ScriptedH2Upstream h2Upstream(String tag) throws Exception {
+		ScriptedH2Upstream server = ScriptedH2Upstream.start(new byte[0], ScriptedH2Upstream.answering(tag));
+		this.resources.add(server);
+		return server;
+	}
+
+	/** A GET on a new stream of the h2 connection; the body of its response. */
+	private static String h2Get(H2TestClient h2, int streamId) throws Exception {
+		h2.headers(streamId, true, TestH2.headerBlock(":authority=" + H2_HOST, ":method=GET", ":path=/"));
+		assertThat(h2.awaitEnd(streamId, HANG_GUARD)).as("stream %d ended", streamId).isTrue();
+		return TestH2.bodyOf(h2.frames(streamId));
+	}
+
+	/**
+	 * Waits for the latch; past the test's own waits, so a held relay is let go by the
+	 * test, not by this guard.
+	 */
+	private static void await(CountDownLatch latch) {
+		try {
+			latch.await(HANG_GUARD.toSeconds() * 2, TimeUnit.SECONDS);
+		}
+		catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
 	}
 
 	/** A tcp upstream answering every line with {@code <tag>:<line>}. */

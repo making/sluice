@@ -13,7 +13,10 @@ a slot of its own, reserving its bytes (see "Reservations and the derived limit"
 upstream connection while the limit has no slot or bytes left is refused with
 `REFUSED_STREAM` (the client may retry it), the connection going on. An upstream connection that closed is let go by the relay and the
 tunnel session, and its slot comes back once the frames it queued for the tunnel stream
-left the sender. A stream beyond the upstream's
+left the sender. An upstream connection on a tunnel client that is shutting down
+(withdrew its routes) is closed as soon as no stream is open on it, waiting for it or
+parked for its route's credential check, so it does not hold the client's drain; the
+route's next stream is resolved anew. A stream beyond the upstream's
 `SETTINGS_MAX_CONCURRENT_STREAMS` (one until the upstream's first SETTINGS) waits in the
 relay, for the same upstream connection, until one of the streams there closes; a stream
 still waiting after `sluice.limits.h2-stream-wait-timeout` (30s; `0` = off) is refused
