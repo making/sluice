@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.UnaryOperator;
@@ -150,14 +151,21 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	/**
 	 * A routed connection: the transport socket, its {@link DuplexPipe} view, the parsed
-	 * connection head (verbatim bytes plus the resolved route host), and the connection
-	 * peer -- the source of a parsed PROXY protocol header when one was present, the
-	 * socket peer otherwise.
+	 * connection head (verbatim bytes plus the resolved route host), the connection peer
+	 * -- the source of a parsed PROXY protocol header when one was present, the socket
+	 * peer otherwise --, and the handshake the data plane terminated (null for plaintext
+	 * and passthrough).
 	 */
-	record Connection(Socket socket, DuplexPipe pipe, ConnectionHeadParser.Head head, @Nullable InetAddress peer) {
+	record Connection(Socket socket, DuplexPipe pipe, ConnectionHeadParser.Head head, @Nullable InetAddress peer,
+			@Nullable TlsHandshake handshake) {
 
 		static Connection of(Socket socket, ConnectionHeadParser.Head head, @Nullable InetAddress peer) {
-			return new Connection(socket, DuplexPipe.of(socket), head, peer);
+			return of(socket, head, peer, null);
+		}
+
+		static Connection of(Socket socket, ConnectionHeadParser.Head head, @Nullable InetAddress peer,
+				@Nullable TlsHandshake handshake) {
+			return new Connection(socket, DuplexPipe.of(socket), head, peer, handshake);
 		}
 
 	}
@@ -340,6 +348,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		}
 		// captured from the ClientHello server_name extension
 		AtomicReference<String> sni = new AtomicReference<>();
+		TlsHandshake handshake = null;
 		if (first == TLS_HANDSHAKE) {
 			// parse the ClientHello first: the route (resolved by SNI) decides between
 			// termination and passthrough
@@ -380,9 +389,14 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			// h2 still gets h2, and the demux answers its streams 421 instead of
 			// relaying them
 			boolean forceHttp1 = resolved.map(Router.Route::forceHttp1).orElse(false);
-			ssl.setHandshakeApplicationProtocolSelector((s, protocols) -> admission == null
-					? overflowProtocol(protocols) : selectProtocol(protocols, forceHttp1, admission));
+			AtomicBoolean http1Offered = new AtomicBoolean();
+			ssl.setHandshakeApplicationProtocolSelector((s, protocols) -> {
+				http1Offered.set(protocols.contains(ALPN_HTTP_1_1));
+				return admission == null ? overflowProtocol(protocols)
+						: selectProtocol(protocols, forceHttp1, admission);
+			});
 			ssl.startHandshake();
+			handshake = new TlsHandshake(hello.sni(), http1Offered.get());
 			log.debug("tls handshake done; protocol={} sni={}", ssl.getApplicationProtocol(), sni.get());
 			access.transport(ALPN_H2.equals(ssl.getApplicationProtocol()) ? "h2" : "h1");
 			in = ssl.getInputStream();
@@ -401,7 +415,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		if (head.host() == null && sni.get() != null) {
 			head = head.withHost(sni.get());
 		}
-		return Connection.of(socket, head, peer);
+		return Connection.of(socket, head, peer, handshake);
 	}
 
 	/**
@@ -502,6 +516,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 					.access(access)
 					.meters(this.h2DemuxMeters)
 					.initialRoute(route0, session)
+					.handshake(conn.handshake())
 					.peer(peer)
 					.deadline(deadline)
 					.streamWaitTimeout(this.h2StreamWaitTimeout)

@@ -72,8 +72,12 @@ import io.netty.util.AsciiString;
  * gets the no-route ({@code 503}) or forbidden ({@code 403}) page written through the
  * client endpoint's flow controller, and the connection goes on. A stream of a
  * {@code force-http1} route is answered {@code 421} without a body, then reset with
- * {@code NO_ERROR} while its request is still being sent; it opens no leg. A head that is
- * no request (no {@code :method}, no {@code :path} but for a CONNECT, a CONNECT without
+ * {@code NO_ERROR} while its request is still being sent; it opens no leg. When the
+ * connection's handshake was the stream's host's own and offered http/1.1 -- h2 was
+ * picked as the handshake resolved no force-http1 route, say while the route was gated
+ * shut --, the {@code 421} comes with a GOAWAY {@code NO_ERROR}: Chromium retries a 421
+ * on a new connection only past one it coalesced the host onto. A head that is no request
+ * (no {@code :method}, no {@code :path} but for a CONNECT, a CONNECT without
  * {@code :authority}) is reset with {@code PROTOCOL_ERROR}. A CONNECT stream is routed by
  * its {@code :authority} and logged with it as its path.
  * <p>
@@ -353,6 +357,9 @@ final class NettyHttp2DemuxRelay {
 
 	private final @Nullable InetAddress peer;
 
+	/** The handshake the data plane terminated; null for plaintext h2. */
+	private final @Nullable TlsHandshake handshake;
+
 	private final ConnectionLimits.KeepAliveDeadline deadline;
 
 	/** How long a stream may wait for its upstream's concurrency limit; zero = no end. */
@@ -482,6 +489,7 @@ final class NettyHttp2DemuxRelay {
 		this.initialRoute = Objects.requireNonNull(builder.initialRoute, "initialRoute is required");
 		this.initialSession = Objects.requireNonNull(builder.initialSession, "initialSession is required");
 		this.peer = builder.peer;
+		this.handshake = builder.handshake;
 		this.deadline = Objects.requireNonNull(builder.deadline, "deadline is required");
 		this.streamWaitTimeout = builder.streamWaitTimeout;
 		if (this.streamWaitTimeout.isNegative()) {
@@ -657,7 +665,7 @@ final class NettyHttp2DemuxRelay {
 			session = serving;
 		}
 		if (route.forceHttp1()) {
-			misdirectLocked(streamId, route, request, endStream);
+			misdirectLocked(streamId, host, route, request, endStream);
 			return;
 		}
 		int headBytes = headerBytes(headers);
@@ -826,12 +834,23 @@ final class NettyHttp2DemuxRelay {
 	/**
 	 * Answers a stream of a route reached over HTTP/1.1 only {@code 421}; a request still
 	 * being sent is reset with {@code NO_ERROR} once the answer is written (RFC 9113
-	 * 8.1). With the loop's lock.
+	 * 8.1). A connection whose handshake was the host's own and offered http/1.1 also
+	 * gets a GOAWAY {@code NO_ERROR}: a new connection for the host would be given
+	 * http/1.1, and Chromium's retry of the 421 passes over coalesced connections only,
+	 * so it would come back here. With the loop's lock.
 	 */
-	private void misdirectLocked(int streamId, Router.Route route, ConnectionHeadParser.Head.Request request,
-			boolean endStream) {
+	private void misdirectLocked(int streamId, @Nullable String host, Router.Route route,
+			ConnectionHeadParser.Head.Request request, boolean endStream) {
 		this.meters.misdirectedForHttp1();
 		this.access.misdirected(route.routeTag(), request);
+		TlsHandshake handshake = this.handshake;
+		Hop client = client();
+		if (handshake != null && handshake.http1Offered() && handshake.isFor(host)
+				&& !client.connection().goAwaySent()) {
+			client.handler()
+				.goAway(client.ctx(), this.highestStreamId, Http2Error.NO_ERROR.code(), Unpooled.EMPTY_BUFFER,
+						client.ctx().newPromise());
+		}
 		Shortfall shortfall = answerLocked(streamId,
 				new ErrorResponse.StreamPage(this.errorResponse.misdirectedHeaders(), new byte[0]), !endStream);
 		if (shortfall != null) {
@@ -2502,6 +2521,8 @@ final class NettyHttp2DemuxRelay {
 
 		private @Nullable InetAddress peer;
 
+		private @Nullable TlsHandshake handshake;
+
 		private ConnectionLimits.@Nullable KeepAliveDeadline deadline;
 
 		private Duration streamWaitTimeout = Duration.ZERO;
@@ -2573,6 +2594,14 @@ final class NettyHttp2DemuxRelay {
 		/** The address judged by the access control; null when unknown. */
 		Builder peer(@Nullable InetAddress peer) {
 			this.peer = peer;
+			return this;
+		}
+
+		/**
+		 * The handshake the data plane terminated; null (the default) for plaintext h2.
+		 */
+		Builder handshake(@Nullable TlsHandshake handshake) {
+			this.handshake = handshake;
 			return this;
 		}
 

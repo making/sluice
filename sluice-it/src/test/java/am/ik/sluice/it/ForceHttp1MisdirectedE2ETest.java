@@ -33,16 +33,25 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.server.route.GateState;
 import am.ik.sluice.server.route.Router;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import com.microsoft.playwright.Browser;
+import com.microsoft.playwright.BrowserContext;
+import com.microsoft.playwright.BrowserType;
+import com.microsoft.playwright.Page;
+import com.microsoft.playwright.Playwright;
+import com.microsoft.playwright.Response;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -63,7 +72,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * the relay (RFC 9110 15.5.20) and reaches no upstream, the connection going on -- so a
  * browser that coalesced the request onto an h2 connection opened for another host of the
  * same certificate retries it on a new connection carrying the host's own SNI, where ALPN
- * picks http/1.1.
+ * picks http/1.1. A connection whose handshake picked h2 for the host itself -- no
+ * force-http1 route resolved then -- also gets a GOAWAY, which sends the retry to a new
+ * connection too.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -78,6 +89,11 @@ class ForceHttp1MisdirectedE2ETest {
 	private static final String H2_HOST = "h2.local";
 
 	private static final String H1_HOST = "h1only.local";
+
+	/**
+	 * Served by the h2 upstream: where the force-http1 host falls through to when shut.
+	 */
+	private static final String FALLBACK_PATTERN = ".*\\.local";
 
 	private static final String H1_BODY = "hello-from-h1-upstream";
 
@@ -251,6 +267,10 @@ class ForceHttp1MisdirectedE2ETest {
 				.target("http://127.0.0.1:" + h1Upstream.getLocalPort())
 				.forceHttp1(true)
 				.build())
+			.upstream(Upstream.builder()
+				.hostPattern(FALLBACK_PATTERN)
+				.target("http://127.0.0.1:" + h2Upstream.getLocalPort())
+				.build())
 			.token("it-token")
 			.build();
 		TunnelClient started = TunnelClient.builder()
@@ -262,7 +282,8 @@ class ForceHttp1MisdirectedE2ETest {
 		this.client = started;
 		Awaitility.await()
 			.atMost(TIMEOUT)
-			.until(() -> this.router.lookup(H2_HOST).isPresent() && this.router.lookup(H1_HOST).isPresent());
+			.until(() -> this.router.lookup(H2_HOST).isPresent() && this.router.lookup(H1_HOST).isPresent()
+					&& this.router.lookup("fallback.local").isPresent());
 		// the precondition the tests rely on: the route is force-http1
 		assertThat(this.router.lookup(H1_HOST).orElseThrow().forceHttp1()).isTrue();
 	}
@@ -315,6 +336,82 @@ class ForceHttp1MisdirectedE2ETest {
 	}
 
 	/**
+	 * A connection whose handshake offered http/1.1 but picked h2 -- it resolved no
+	 * force-http1 route: the route was gated shut (its host fell through to the pattern
+	 * route), or the handshake carried no SNI -- asks for a force-http1 route of its own
+	 * host: the stream gets its 421 and the connection a GOAWAY {@code NO_ERROR} naming
+	 * it, so the client takes a new connection, where ALPN picks http/1.1.
+	 */
+	@ParameterizedTest
+	@ValueSource(booleans = { true, false })
+	void aMisdirectedStreamOfTheConnectionsOwnHostEndsTheConnection(boolean sni) throws Exception {
+		SSLSocket socket;
+		if (sni) {
+			this.router.gate().set(H1_HOST, GateState.SHUT);
+			try {
+				socket = tls(H1_HOST, "h2", "http/1.1");
+			}
+			finally {
+				this.router.gate().set(H1_HOST, GateState.OPEN);
+			}
+		}
+		else {
+			socket = tls(null, "h2", "http/1.1");
+		}
+		// the precondition: the handshake settled on h2 although http/1.1 was offered
+		assertThat(socket.getApplicationProtocol()).isEqualTo("h2");
+		try (H2TestClient h2 = H2TestClient.over(socket, 1)) {
+			h2.headers(1, true, TestH2.headerBlock(":authority=" + H1_HOST, ":method=GET", ":scheme=https", ":path=/"));
+			assertThat(h2.awaitEnd(1, TIMEOUT)).isTrue();
+			assertThat(TestH2.status(h2.frames(1))).isEqualTo("421");
+			assertThat(h2.awaitTrue(() -> h2.goAwayCode() != -1, TIMEOUT)).isTrue();
+			assertThat(h2.goAwayCode()).isEqualTo(0);
+			assertThat(h2.goAwayLastStreamId()).isEqualTo(1);
+		}
+		assertThat(H1_ACCEPTED).hasValue(0);
+
+		try (SSLSocket retry = tls(H1_HOST, "h2", "http/1.1")) {
+			assertThat(retry.getApplicationProtocol()).isEqualTo("http/1.1");
+		}
+	}
+
+	/**
+	 * The browser case: Chromium loads a force-http1 host while its route is gated shut
+	 * -- the pattern route serves it, over h2 -- and reloads it once the gate opened. Its
+	 * retry of a 421 bypasses only coalesced connections, so the GOAWAY is what lets the
+	 * reload reach the upstream, over http/1.1.
+	 */
+	@Test
+	void aBrowserReachesAForceHttp1RouteOnceItsGateOpened() {
+		try (Playwright playwright = Playwright.create();
+				Browser browser = playwright.chromium()
+					.launch(new BrowserType.LaunchOptions()
+						.setArgs(List.of("--host-resolver-rules=MAP " + H1_HOST + " 127.0.0.1")));
+				BrowserContext context = browser.newContext(new Browser.NewContextOptions().setIgnoreHTTPSErrors(true));
+				Page page = context.newPage()) {
+			String url = "https://" + H1_HOST + ":" + dataPort + "/";
+			this.router.gate().set(H1_HOST, GateState.SHUT);
+			try {
+				Response shut = requireNonNull(page.navigate(url));
+				assertThat(shut.status()).isEqualTo(200);
+			}
+			finally {
+				this.router.gate().set(H1_HOST, GateState.OPEN);
+			}
+			// the precondition: the page came over h2, from the pattern route
+			assertThat(accessLines()).anyMatch(line -> line.startsWith("type=req ")
+					&& line.contains(" route=" + FALLBACK_PATTERN + " method=GET path=/ http=2 "));
+			Response opened = requireNonNull(page.reload());
+			assertThat(opened.status()).isEqualTo(200);
+			assertThat(page.content()).contains(H1_BODY);
+		}
+		assertThat(misdirectedLines()).first()
+			.isEqualTo("type=req id=N route=h1only.local method=GET path=/ http=2 remote=127.0.0.1:P"
+					+ " status=421 reason=force-http1");
+		assertThat(H1_RECEIVED).contains("GET / HTTP/1.1");
+	}
+
+	/**
 	 * A stream still sending its request body when misdirected is answered 421 and reset
 	 * with {@code NO_ERROR} (RFC 9113 8.1: no more of the request is wanted); its later
 	 * DATA is dropped and the connection goes on.
@@ -348,13 +445,18 @@ class ForceHttp1MisdirectedE2ETest {
 		double before = misdirected();
 		SSLSocket socket = tls(H1_HOST, "h2");
 		assertThat(socket.getApplicationProtocol()).isEqualTo("h2");
-		try (H2TestClient h2 = H2TestClient.over(socket, 1)) {
+		try (H2TestClient h2 = H2TestClient.over(socket, 1, 3)) {
 			h2.headers(1, true, TestH2.headerBlock(":authority=" + H1_HOST, ":method=GET", ":scheme=https", ":path=/"));
 			assertThat(h2.awaitEnd(1, TIMEOUT)).isTrue();
 			assertThat(TestH2.status(h2.frames(1))).isEqualTo("421");
+			// a new connection would settle on h2 again: this one goes on
+			h2.headers(3, true, TestH2.headerBlock(":authority=" + H1_HOST, ":method=GET", ":scheme=https", ":path=/"));
+			assertThat(h2.awaitEnd(3, TIMEOUT)).isTrue();
+			assertThat(TestH2.status(h2.frames(3))).isEqualTo("421");
+			assertThat(h2.goAwayCode()).isEqualTo(-1);
 		}
 		assertThat(H1_ACCEPTED).hasValue(0);
-		assertThat(misdirected() - before).isEqualTo(1.0);
+		assertThat(misdirected() - before).isEqualTo(2.0);
 	}
 
 	/**
@@ -374,12 +476,17 @@ class ForceHttp1MisdirectedE2ETest {
 					+ " status=421 reason=force-http1");
 	}
 
-	/** A TLS connection to the data plane with the given SNI and ALPN offer. */
-	private static SSLSocket tls(String sni, String... protocols) throws Exception {
+	/**
+	 * A TLS connection to the data plane with the given SNI (none when null: the socket
+	 * dials an IP literal) and ALPN offer.
+	 */
+	private static SSLSocket tls(@Nullable String sni, String... protocols) throws Exception {
 		SSLSocket socket = (SSLSocket) clientSslContext().getSocketFactory().createSocket("127.0.0.1", dataPort);
 		socket.setSoTimeout((int) TIMEOUT.toMillis());
 		SSLParameters parameters = socket.getSSLParameters();
-		parameters.setServerNames(List.of(new SNIHostName(sni)));
+		if (sni != null) {
+			parameters.setServerNames(List.of(new SNIHostName(sni)));
+		}
 		parameters.setApplicationProtocols(protocols);
 		socket.setSSLParameters(parameters);
 		socket.startHandshake();
