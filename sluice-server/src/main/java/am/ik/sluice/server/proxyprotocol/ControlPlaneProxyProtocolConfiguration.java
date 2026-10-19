@@ -10,7 +10,6 @@ import io.netty.channel.nio.NioIoHandler;
 import io.netty.util.concurrent.DefaultThreadFactory;
 
 import org.springframework.beans.factory.DisposableBean;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnBooleanProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.grpc.server.ServerBuilderCustomizer;
@@ -29,11 +28,20 @@ import am.ik.sluice.server.config.SluiceServerProperties;
  * NIO, also where gRPC would pick epoll.
  */
 @Configuration(proxyBeanMethods = false)
-@ConditionalOnBooleanProperty("sluice.control-proxy-protocol")
 class ControlPlaneProxyProtocolConfiguration {
 
+	/**
+	 * The switch is read in this bean body instead of a conditional bean: conditions are
+	 * evaluated at build time in the native image, which would pin the feature to the
+	 * properties of the build machine. Disabled, the customizer leaves the builder (and
+	 * gRPC's own channels and event loops) untouched.
+	 */
 	@Bean
-	ProxiedControlPlane proxiedControlPlane(SluiceServerProperties properties) {
+	ServerBuilderCustomizer<NettyServerBuilder> controlPlaneProxyProtocol(SluiceServerProperties properties) {
+		if (!properties.controlProxyProtocol()) {
+			return builder -> {
+			};
+		}
 		return new ProxiedControlPlane(properties.limits().headTimeout());
 	}
 
