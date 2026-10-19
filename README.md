@@ -305,6 +305,22 @@ sluice.route.auth.[api.example.com].bearer[0]={sha256}9f86d081884c7d65...
 sluice.route.auth.[api.example.com].api-token[0]={sha256}...
 ```
 
+The credentials can live in a file of their own, imported at startup
+(`spring.config.additional-location` or `spring.config.import`):
+
+```properties
+# /etc/sluice/route-auth.properties
+sluice.route.auth.[admin.example.com].basic.alice={bcrypt}$2a$10$...
+```
+
+```console
+docker run --rm --pull always --name sluice-server -p 8000:8000 -p 8001:8001 -p 8081:8081 \
+  -v /etc/sluice:/etc/sluice:ro \
+  -e sluice.token=SECRET \
+  -e spring.config.additional-location=optional:file:/etc/sluice/route-auth.properties \
+  ghcr.io/making/sluice/sluice-server:native
+```
+
 | Property (under `sluice.route.auth.[<route key>]`) | Default | Description |
 |---|---|---|
 | `basic.<user>` | - | HTTP Basic users and their passwords |
