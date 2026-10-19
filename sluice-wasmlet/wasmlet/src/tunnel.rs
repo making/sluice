@@ -1240,6 +1240,7 @@ pub(crate) mod testing {
                 conn_id,
                 address: address.into(),
                 connection_window: window,
+                ..Default::default()
             }));
         }
 
@@ -1771,6 +1772,7 @@ mod tests {
             conn_id: 7,
             address: "wasm:missing".into(),
             connection_window: WINDOW,
+            ..Default::default()
         }));
         use futures_util::StreamExt as _;
         let first = frames.next().await.unwrap();

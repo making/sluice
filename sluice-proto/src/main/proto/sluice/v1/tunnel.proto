@@ -93,6 +93,11 @@ message Connect {
   // without per-connection flow control, before 046cd21) is answered with an
   // Error for the connection.
   uint32 connection_window = 3;
+  // The protocol the server speaks on this connection, by its ALPN id ("h2",
+  // "http/1.1"); empty for bytes the server relays without interpreting them,
+  // and from a server before this field. A client dialing a TLS upstream
+  // negotiates it over ALPN.
+  string application_protocol = 4;
 }
 
 message Close {

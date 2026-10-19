@@ -703,10 +703,20 @@ public final class TunnelSession implements AutoCloseable {
 	 * ({@link VirtualConnection#INITIAL_WINDOW}), which grows up to
 	 * {@link VirtualConnection#DEFAULT_WINDOW} against the budget. Its send credit is the
 	 * client's window, known once the client advertised: a session is found for routing
-	 * only from then on.
+	 * only from then on. The connection carries bytes relayed without interpreting them.
 	 * @throws IllegalStateException when the client has not advertised yet
 	 */
 	public VirtualConnection open(String address) {
+		return this.open(address, "");
+	}
+
+	/**
+	 * Opens a virtual connection as {@link #open(String)} does, on which this side speaks
+	 * the given protocol (an ALPN id, {@code h2} or {@code http/1.1}): the client
+	 * negotiates it with a TLS upstream.
+	 * @throws IllegalStateException when the client has not advertised yet
+	 */
+	public VirtualConnection open(String address, String applicationProtocol) {
 		long clientWindow = this.clientWindow;
 		if (clientWindow == 0) {
 			throw new IllegalStateException("client " + this.clientId + " has not advertised yet");
@@ -722,6 +732,7 @@ public final class TunnelSession implements AutoCloseable {
 			.setConnId(connectionId)
 			.setAddress(address)
 			.setConnectionWindow(VirtualConnection.INITIAL_WINDOW)
+			.setApplicationProtocol(applicationProtocol)
 			.build());
 		return connection;
 	}

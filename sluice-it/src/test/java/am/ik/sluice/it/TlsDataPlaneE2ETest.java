@@ -14,12 +14,15 @@ import java.nio.file.Path;
 import java.security.KeyStore;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SNIHostName;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLServerSocket;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManagerFactory;
 
@@ -34,9 +37,11 @@ import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
+import am.ik.sluice.client.tunnel.LocalConnector;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.tunnel.SessionRegistry;
+import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
@@ -70,6 +75,8 @@ class TlsDataPlaneE2ETest {
 
 	private static final String H1_BODY = "hello-from-tls-upstream";
 
+	private static final String HTTPS_H1_BODY = "hello-from-https-h1-upstream";
+
 	private static int grpcPort;
 
 	private static int dataPort;
@@ -87,6 +94,21 @@ class TlsDataPlaneE2ETest {
 	private static HttpServer h1Upstream;
 
 	private @Nullable TunnelClient tlsClient;
+
+	/** An https upstream speaking h2 and http/1.1, picked over ALPN. */
+	private @Nullable SSLServerSocket httpsUpstream;
+
+	/** An https upstream without ALPN: http/1.1 only. */
+	private @Nullable SSLServerSocket noAlpnUpstream;
+
+	/** An https upstream offering http/1.1 only over ALPN. */
+	private @Nullable SSLServerSocket h1AlpnUpstream;
+
+	/** The ALPN protocol each connection to an https upstream negotiated. */
+	private final List<String> httpsNegotiated = new CopyOnWriteArrayList<>();
+
+	/** The first line each connection to an https upstream sent after the handshake. */
+	private final List<String> httpsFirstLines = new CopyOnWriteArrayList<>();
 
 	@BeforeAll
 	static void startUpstreams() throws Exception {
@@ -175,6 +197,96 @@ class TlsDataPlaneE2ETest {
 		return sslContext;
 	}
 
+	private static SSLContext serverSslContext() throws Exception {
+		KeyStore keyStore = KeyStore.getInstance("PKCS12");
+		try (InputStream in = Files.newInputStream(requireNonNull(keystorePath))) {
+			keyStore.load(in, "changeit".toCharArray());
+		}
+		KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+		keyManagerFactory.init(keyStore, "changeit".toCharArray());
+		SSLContext sslContext = SSLContext.getInstance("TLS");
+		sslContext.init(keyManagerFactory.getKeyManagers(), null, null);
+		return sslContext;
+	}
+
+	/**
+	 * Starts an https upstream offering the given ALPN protocols (none: it ignores ALPN):
+	 * a connection that negotiated h2 gets the canned h2 response, any other one is
+	 * answered as HTTP/1.1 -- {@code 400} for the h2 preface, as an HTTP/1.1 server does.
+	 */
+	private SSLServerSocket startHttpsUpstream(String... protocols) throws Exception {
+		SSLServerSocket server = (SSLServerSocket) serverSslContext().getServerSocketFactory()
+			.createServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1"));
+		if (protocols.length > 0) {
+			SSLParameters parameters = server.getSSLParameters();
+			parameters.setApplicationProtocols(protocols);
+			server.setSSLParameters(parameters);
+		}
+		UPSTREAM_EXECUTOR.execute(() -> {
+			while (!server.isClosed()) {
+				try {
+					SSLSocket socket = (SSLSocket) server.accept();
+					UPSTREAM_EXECUTOR.execute(() -> this.serveHttps(socket));
+				}
+				catch (Exception e) {
+					return;
+				}
+			}
+		});
+		return server;
+	}
+
+	private void serveHttps(SSLSocket socket) {
+		try (socket) {
+			socket.setSoTimeout(10_000);
+			socket.startHandshake();
+			String negotiated = socket.getApplicationProtocol();
+			this.httpsNegotiated.add(negotiated);
+			InputStream in = socket.getInputStream();
+			if ("h2".equals(negotiated)) {
+				this.httpsFirstLines.add(readLine(in));
+				in.readNBytes(TestH2.PREFACE.length - "PRI * HTTP/2.0\r\n".length());
+				TestH2.Frame frame;
+				while ((frame = TestH2.readFrame(in)) != null && frame.type() != TestH2.HEADERS) {
+					// up to the request head
+				}
+				socket.getOutputStream().write(TestH2.cannedResponse(1, H2_BODY));
+				socket.getOutputStream().flush();
+				in.read(new byte[1]);
+				return;
+			}
+			String line = readLine(in);
+			if (line.isEmpty()) {
+				return; // closed without a request
+			}
+			this.httpsFirstLines.add(line);
+			while (!readLine(in).isEmpty()) {
+				// the rest of the head
+			}
+			String response = line.startsWith("PRI ")
+					? "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+					: "HTTP/1.1 200 OK\r\nContent-Length: " + HTTPS_H1_BODY.length() + "\r\nConnection: close\r\n\r\n"
+							+ HTTPS_H1_BODY;
+			socket.getOutputStream().write(response.getBytes(StandardCharsets.US_ASCII));
+			socket.getOutputStream().flush();
+		}
+		catch (Exception e) {
+			// connection ended
+		}
+	}
+
+	/** One CRLF-terminated line, without the CRLF; what was read at the end of input. */
+	private static String readLine(InputStream in) throws java.io.IOException {
+		ByteArrayOutputStream line = new ByteArrayOutputStream();
+		int b;
+		while ((b = in.read()) >= 0 && b != '\n') {
+			if (b != '\r') {
+				line.write(b);
+			}
+		}
+		return line.toString(StandardCharsets.US_ASCII);
+	}
+
 	@Autowired
 	SessionRegistry sessions;
 
@@ -185,6 +297,15 @@ class TlsDataPlaneE2ETest {
 		}
 		try {
 			h2Upstream.close();
+			if (this.httpsUpstream != null) {
+				this.httpsUpstream.close();
+			}
+			if (this.noAlpnUpstream != null) {
+				this.noAlpnUpstream.close();
+			}
+			if (this.h1AlpnUpstream != null) {
+				this.h1AlpnUpstream.close();
+			}
 		}
 		catch (Exception e) {
 			// ignore
@@ -196,12 +317,30 @@ class TlsDataPlaneE2ETest {
 		((Logger) LoggerFactory.getLogger("sluice.access")).detachAppender(ACCESS_EVENTS);
 	}
 
-	private void startClient() {
+	private void startClient() throws Exception {
 		if (this.tlsClient != null) {
 			return;
 		}
+		SSLServerSocket https = this.startHttpsUpstream("h2", "http/1.1");
+		this.httpsUpstream = https;
+		SSLServerSocket noAlpn = this.startHttpsUpstream();
+		this.noAlpnUpstream = noAlpn;
+		SSLServerSocket h1Alpn = this.startHttpsUpstream("http/1.1");
+		this.h1AlpnUpstream = h1Alpn;
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
+			// the https upstreams present the data plane's self-signed certificate
+			.insecure(true)
+			.upstream(
+					Upstream.builder().host("https.local").target("https://127.0.0.1:" + https.getLocalPort()).build())
+			.upstream(Upstream.builder()
+				.host("noalpn.local")
+				.target("https://127.0.0.1:" + noAlpn.getLocalPort())
+				.build())
+			.upstream(Upstream.builder()
+				.host("h1alpn.local")
+				.target("https://127.0.0.1:" + h1Alpn.getLocalPort())
+				.build())
 			// the h2 stub doubles as the target for both the h2 and the h1-over-TLS path
 			.upstream(Upstream.builder()
 				.host("tls.local")
@@ -259,6 +398,67 @@ class TlsDataPlaneE2ETest {
 			.atMost(Duration.ofSeconds(5))
 			.until(() -> accessLines().stream()
 				.anyMatch(line -> line.startsWith("type=conn id=" + id + " event=close ")));
+	}
+
+	/**
+	 * An https target is dialed offering the protocol the leg speaks over ALPN: an h2
+	 * stream reaches the upstream over h2, an HTTP/1.1 request over http/1.1, and an
+	 * upstream negotiating no h2 -- no protocol, or http/1.1 with the handshake completed
+	 * -- fails the h2 leg -- the stream gets the 502 page -- before a byte of h2 reached
+	 * it.
+	 */
+	@Test
+	void httpsUpstreamIsDialedWithTheLegsProtocolOverAlpn() throws Exception {
+		this.startClient();
+		try (H2TestClient h2 = H2TestClient.over(tls("https.local", "h2"), 1)) {
+			h2.headers(1, true,
+					TestH2.headerBlock(":authority=https.local", ":method=GET", ":scheme=https", ":path=/h2"));
+			assertThat(h2.awaitEnd(1, Duration.ofSeconds(10))).as("answered").isTrue();
+			assertThat(TestH2.status(h2.frames(1))).isEqualTo("200");
+			assertThat(TestH2.bodyOf(h2.frames(1))).isEqualTo(H2_BODY);
+		}
+		try (SSLSocket socket = tls("https.local", "http/1.1")) {
+			assertThat(socket.getApplicationProtocol()).isEqualTo("http/1.1");
+			socket.getOutputStream()
+				.write("GET /h1 HTTP/1.1\r\nHost: https.local\r\nConnection: close\r\n\r\n"
+					.getBytes(StandardCharsets.US_ASCII));
+			socket.getOutputStream().flush();
+			assertThat(new String(socket.getInputStream().readAllBytes(), StandardCharsets.UTF_8))
+				.startsWith("HTTP/1.1 200")
+				.endsWith(HTTPS_H1_BODY);
+		}
+		assertThat(this.httpsNegotiated).containsExactly("h2", "http/1.1");
+		assertThat(this.httpsFirstLines).containsExactly("PRI * HTTP/2.0", "GET /h1 HTTP/1.1");
+		// an upstream negotiating no protocol, and one negotiating http/1.1
+		for (String[] mismatch : List.of(new String[] { "noalpn.local", "", "no protocol" },
+				new String[] { "h1alpn.local", "http/1.1", "http/1.1" })) {
+			String host = mismatch[0];
+			this.httpsNegotiated.clear();
+			this.httpsFirstLines.clear();
+			ListAppender<ILoggingEvent> connectorEvents = new ListAppender<>();
+			connectorEvents.start();
+			Logger connectorLogger = (Logger) LoggerFactory.getLogger(LocalConnector.class);
+			connectorLogger.addAppender(connectorEvents);
+			try (H2TestClient h2 = H2TestClient.over(tls(host, "h2"), 1)) {
+				h2.headers(1, true,
+						TestH2.headerBlock(":authority=" + host, ":method=GET", ":scheme=https", ":path=/"));
+				assertThat(h2.awaitEnd(1, Duration.ofSeconds(10))).as("answered").isTrue();
+				assertThat(TestH2.status(h2.frames(1))).as(host).isEqualTo("502");
+			}
+			finally {
+				connectorLogger.detachAppender(connectorEvents);
+			}
+			Awaitility.await("the upstream saw the handshake")
+				.atMost(Duration.ofSeconds(5))
+				.until(() -> this.httpsNegotiated.size() == 1);
+			assertThat(this.httpsNegotiated).as(host).containsExactly(mismatch[1]);
+			assertThat(this.httpsFirstLines).as("nothing of h2 reached " + host).isEmpty();
+			assertThat(connectorEvents.list).as(host).anySatisfy(event -> {
+				assertThat(event.getLevel()).isEqualTo(Level.WARN);
+				assertThat(event.getFormattedMessage()).contains("negotiated " + mismatch[2] + " over ALPN, not h2",
+						"force-http1");
+			});
+		}
 	}
 
 	private static List<String> accessLines() {

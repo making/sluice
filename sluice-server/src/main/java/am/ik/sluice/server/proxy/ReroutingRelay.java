@@ -710,7 +710,7 @@ final class ReroutingRelay {
 		Leg(Router.Route route, TunnelSession session) {
 			this.route = route;
 			this.session = session;
-			this.connection = session.open(route.address());
+			this.connection = session.open(route.address(), DataProxyServer.ALPN_HTTP_1_1);
 			this.inbound = meterRegistry.counter(METRIC_NAME, "direction", "inbound", "route", route.routeTag());
 			this.outbound = meterRegistry.counter(METRIC_NAME, "direction", "outbound", "route", route.routeTag());
 			this.tracker = new ResponseTracker(this);

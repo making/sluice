@@ -119,7 +119,7 @@ class H2DemuxLegOpenFailureE2ETest {
 				if (fail.get()) {
 					throw new IllegalStateException("the session cannot open");
 				}
-				return session.open(address);
+				return NettyHttp2DemuxRelay.LegSeam.NONE.open(session, address);
 			}
 		});
 		assertFailedLegsAreGivenBack(fail, "open");

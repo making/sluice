@@ -2486,9 +2486,9 @@ final class NettyHttp2DemuxRelay {
 		LegSeam NONE = new LegSeam() {
 		};
 
-		/** Opens the leg's connection; throwing fails the leg's opening. */
+		/** Opens the leg's h2 connection; throwing fails the leg's opening. */
 		default VirtualConnection open(TunnelSession session, String address) {
-			return session.open(address);
+			return session.open(address, DataProxyServer.ALPN_H2);
 		}
 
 		/** Sees the leg's hop built; throwing fails the leg's configuration. */

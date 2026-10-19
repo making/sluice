@@ -962,6 +962,7 @@ mod tests {
                         address: target.clone(),
                         // credit past the response: only the stream holds it back
                         connection_window: 64 << 20,
+                        ..Default::default()
                     }),
                     Body::Data(pb::Data {
                         conn_id: 1,

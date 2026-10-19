@@ -77,9 +77,9 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	private static final int TLS_HANDSHAKE = 0x16;
 
-	private static final String ALPN_H2 = "h2";
+	static final String ALPN_H2 = "h2";
 
-	private static final String ALPN_HTTP_1_1 = "http/1.1";
+	static final String ALPN_HTTP_1_1 = "http/1.1";
 
 	/** How long a rejected connection is drained for its peer to read the response. */
 	private static final Duration LINGER = Duration.ofSeconds(2);

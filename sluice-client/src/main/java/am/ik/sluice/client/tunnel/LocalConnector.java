@@ -3,6 +3,7 @@ package am.ik.sluice.client.tunnel;
 import org.jspecify.annotations.Nullable;
 
 import java.net.InetSocketAddress;
+import java.net.ProtocolException;
 import java.net.Socket;
 import java.net.URI;
 import java.time.Duration;
@@ -10,6 +11,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
+import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.TrustManager;
@@ -24,13 +26,19 @@ import am.ik.sluice.tunnel.TcpKeepAlive;
 /**
  * Dials the local upstream for a tunnel CONNECT request. In strict mode only addresses
  * matching a declared upstream are dialable (the port of makeFilter); upstream URLs with
- * the {@code https://} scheme are wrapped in a trust-on-first-use style TLS socket
- * mirroring the original's InsecureSkipVerify transport; every other scheme ({@code
- * http://}, {@code tcp://}, ...) is a raw dial whose bytes are relayed untouched.
+ * the {@code https://} scheme are wrapped in a TLS socket -- verified against the JDK's
+ * default trust store, or trusting any certificate when {@code insecure} -- that
+ * negotiates the protocol the server speaks on the connection over ALPN; every other
+ * scheme ({@code http://}, {@code tcp://}, ...) is a raw dial whose bytes are relayed
+ * untouched.
  */
 public class LocalConnector {
 
 	private static final Logger log = LoggerFactory.getLogger(LocalConnector.class);
+
+	private static final String ALPN_H2 = "h2";
+
+	private static final String ALPN_HTTP_1_1 = "http/1.1";
 
 	private final List<String> upstreams;
 
@@ -141,9 +149,21 @@ public class LocalConnector {
 
 	/**
 	 * Opens a plain or TLS socket to the upstream addressed by a CONNECT frame, under the
-	 * connect timeout; on failure nothing opened stays open.
+	 * connect timeout; on failure nothing opened stays open. The connection carries bytes
+	 * the server does not interpret: a TLS upstream is offered no ALPN protocol.
 	 */
 	public Socket dial(String address) throws Exception {
+		return this.dial(address, "");
+	}
+
+	/**
+	 * Opens a socket as {@link #dial(String)} does, for a connection on which the server
+	 * speaks the given protocol (an ALPN id; empty = none). A TLS upstream must negotiate
+	 * it: {@code h2} is offered along with {@code http/1.1} so that an upstream without
+	 * h2 answers rather than failing the handshake, and the dial fails unless it picked
+	 * {@code h2}; an upstream negotiating no protocol speaks {@code http/1.1}.
+	 */
+	public Socket dial(String address, String applicationProtocol) throws Exception {
 		Optional<UpstreamEndpoint> endpoint = resolve(address);
 		String scheme = endpoint.map(UpstreamEndpoint::scheme).orElse("http");
 		String host;
@@ -173,8 +193,23 @@ public class LocalConnector {
 				return socket;
 			}
 			SSLSocket sslSocket = (SSLSocket) sslFactory().createSocket(socket, host, port, true);
+			if (!applicationProtocol.isEmpty()) {
+				SSLParameters parameters = sslSocket.getSSLParameters();
+				parameters.setApplicationProtocols(ALPN_H2.equals(applicationProtocol)
+						? new String[] { ALPN_H2, ALPN_HTTP_1_1 } : new String[] { applicationProtocol });
+				sslSocket.setSSLParameters(parameters);
+			}
 			sslSocket.setSoTimeout(timeout);
 			sslSocket.startHandshake();
+			if (!applicationProtocol.isEmpty()) {
+				String negotiated = Objects.requireNonNullElse(sslSocket.getApplicationProtocol(), "");
+				if (!(negotiated.isEmpty() ? ALPN_HTTP_1_1 : negotiated).equals(applicationProtocol)) {
+					String mismatch = "upstream %s negotiated %s over ALPN, not %s".formatted(address,
+							negotiated.isEmpty() ? "no protocol" : negotiated, applicationProtocol);
+					log.warn("{}; an upstream without h2 over TLS needs force-http1 on its route", mismatch);
+					throw new ProtocolException(mismatch);
+				}
+			}
 			// the relay waits on its upstream for as long as the connection lives
 			sslSocket.setSoTimeout(0);
 			return sslSocket;

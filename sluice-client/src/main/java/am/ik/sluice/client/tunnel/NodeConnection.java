@@ -735,7 +735,7 @@ public final class NodeConnection implements AutoCloseable {
 			if (!this.connector.permits(address)) {
 				throw new IllegalArgumentException("upstream not permitted: " + address);
 			}
-			Socket socket = this.connector.dial(address);
+			Socket socket = this.connector.dial(address, request.getApplicationProtocol());
 			SessionSender sender = this.senderRef.get();
 			if (sender == null) {
 				socket.close();
