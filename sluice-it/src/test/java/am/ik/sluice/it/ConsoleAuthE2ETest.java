@@ -162,6 +162,29 @@ class ConsoleAuthE2ETest {
 		}
 	}
 
+	/**
+	 * A login posted with a stale CSRF token (e.g. the page predates a server deploy that
+	 * dropped the session) renders the console error page, not the whitelabel fallback.
+	 */
+	@Test
+	void staleLoginCsrfRendersTheConsoleErrorPage() throws Exception {
+		try (HttpClient client = newClient()) {
+			client.send(HttpRequest.newBuilder(URI.create(base() + "/login")).build(),
+					HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+			HttpResponse<String> rejected = client.send(HttpRequest.newBuilder(URI.create(base() + "/login"))
+				.header("Content-Type", "application/x-www-form-urlencoded")
+				.header("Accept", "text/html")
+				.POST(HttpRequest.BodyPublishers
+					.ofString("username=%s&password=%s&_csrf=stale".formatted(urlEncode(USER), urlEncode(PASSWORD))))
+				.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+			assertThat(rejected.statusCode()).isEqualTo(403);
+			assertThat(rejected.body()).contains("Sign in again")
+				.doesNotContain("Whitelabel")
+				// the content-hashed stylesheet link resolves on the error dispatch too
+				.containsPattern("/console/css/console-\\w+\\.css");
+		}
+	}
+
 	@Test
 	void actuatorStaysOpenWithoutLogin() {
 		assertThat(get("/actuator/health").statusCode()).isEqualTo(200);
