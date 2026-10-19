@@ -21,6 +21,8 @@ import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import am.ik.sluice.server.auth.RouteAuthenticator;
+import am.ik.sluice.server.auth.Verdict;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import am.ik.sluice.server.tunnel.TunnelSession;
@@ -49,14 +51,19 @@ import io.micrometer.core.instrument.MeterRegistry;
  * CONNECT), the connection is relayed verbatim on the leg in charge from then on;
  * declined, the parse resumes with the next request.
  * <p>
+ * Every request head is checked against its route's credentials
+ * ({@link RouteAuthenticator}), the first one included; the headers of the route's
+ * credentials are removed from a head that passes unless the route forwards them.
+ * <p>
  * A malformed request -- input the parser cannot follow, see {@link Http1RequestParser}
  * -- ends the connection at a request boundary: nothing of it or after it is relayed, the
  * responses to the requests before it are relayed in full, and then, unless a response to
  * the malformed request itself has begun meanwhile (its head was relayed and the upstream
- * answered early), a {@code 400} is written. The relay then half-closes the connection
- * and reads what the client still sends for up to {@link #LINGER} (at most
- * {@link #LINGER_LIMIT}) before closing, so the client reads the {@code 400} rather than
- * a reset.
+ * answered early), a {@code 400} is written. A request refused -- no route, no session,
+ * the access control, its route's credentials -- ends it the same way with its error
+ * response. The relay then half-closes the connection and reads what the client still
+ * sends for up to {@link #LINGER} (at most {@link #LINGER_LIMIT}) before closing, so the
+ * client reads the answer rather than a reset.
  * <p>
  * Between requests the connection lives under its
  * {@link ConnectionLimits.KeepAliveDeadline}: once every response owed is relayed and
@@ -119,6 +126,8 @@ final class ReroutingRelay {
 	private final SessionRegistry sessions;
 
 	private final AccessControl accessControl;
+
+	private final RouteAuthenticator routeAuth;
 
 	private final ErrorResponse errorResponse;
 
@@ -199,18 +208,25 @@ final class ReroutingRelay {
 
 	private boolean firstHead = true;
 
+	/**
+	 * The answer to a refused request head, written at the request boundary; nothing
+	 * after the head is relayed. Outbound side only.
+	 */
+	private byte @Nullable [] refusal;
+
 	@Nullable private volatile Leg current;
 
 	ReroutingRelay(DuplexPipe pipe, ConnectionHeadParser.Head head, Router router, SessionRegistry sessions,
-			AccessControl accessControl, ErrorResponse errorResponse, AccessLogger.Connection access,
-			MeterRegistry meterRegistry, Router.Route initialRoute, TunnelSession initialSession,
-			@Nullable InetAddress peer, ConnectionLimits.KeepAliveDeadline deadline, Duration probeInterval,
-			ProbeSeam probeSeam, Runnable onFinish, Runnable release) {
+			AccessControl accessControl, RouteAuthenticator routeAuth, ErrorResponse errorResponse,
+			AccessLogger.Connection access, MeterRegistry meterRegistry, Router.Route initialRoute,
+			TunnelSession initialSession, @Nullable InetAddress peer, ConnectionLimits.KeepAliveDeadline deadline,
+			Duration probeInterval, ProbeSeam probeSeam, Runnable onFinish, Runnable release) {
 		this.pipe = pipe;
 		this.seedHead = head.bytes();
 		this.router = router;
 		this.sessions = sessions;
 		this.accessControl = accessControl;
+		this.routeAuth = routeAuth;
 		this.errorResponse = errorResponse;
 		this.access = access;
 		this.meterRegistry = meterRegistry;
@@ -268,6 +284,10 @@ final class ReroutingRelay {
 				}
 			});
 			parser.feed(this.seedHead, 0, this.seedHead.length);
+			if (this.refusal != null) {
+				rejectRefused(this.refusal);
+				return;
+			}
 			awaitUpgradeAnswers(parser);
 			if (parser.position() == Http1RequestParser.Position.MALFORMED) {
 				rejectMalformed(parser);
@@ -284,6 +304,10 @@ final class ReroutingRelay {
 					return;
 				}
 				parser.feed(buffer, 0, n);
+				if (this.refusal != null) {
+					rejectRefused(this.refusal);
+					return;
+				}
 				awaitUpgradeAnswers(parser);
 				if (parser.position() == Http1RequestParser.Position.MALFORMED) {
 					rejectMalformed(parser);
@@ -458,14 +482,33 @@ final class ReroutingRelay {
 			this.access.request("-", request == null ? "-" : request.method(), request == null ? "-" : request.path(),
 					request == null ? "-" : request.version());
 		}
-		Leg leg = this.current;
 		// the requests before the malformed one: every one relayed, but its own head
-		int before = leg == null ? 0 : leg.awaitAnswered(inBody);
+		rejectAtBoundary(this.errorResponse.badRequest(), inBody);
+	}
+
+	/**
+	 * Ends the connection at a refused request head: waits until the responses to the
+	 * requests before it are relayed, writes the refusal, closes the legs, and lingers.
+	 */
+	private void rejectRefused(byte[] response) {
+		// nothing more is parsed or relayed, as after a malformed request
+		fed(Http1RequestParser.Position.MALFORMED);
+		rejectAtBoundary(response, false);
+	}
+
+	/**
+	 * Waits until the leg answered the requests before the rejected one -- every request
+	 * it was sent, or all but the last when that is the rejected one ({@code sent}: its
+	 * head was relayed, its body is malformed) --, writes the response unless a response
+	 * to the rejected request has begun, closes the legs, and lingers.
+	 */
+	private void rejectAtBoundary(byte[] response, boolean sent) {
+		Leg leg = this.current;
+		int before = leg == null ? 0 : leg.awaitAnswered(sent);
 		this.sinkLock.lock();
 		try {
 			this.rejected = true;
 			if (leg == null || leg.atResponseStart(before)) {
-				byte[] response = this.errorResponse.badRequest();
 				writeToClient(response, 0, response.length);
 			}
 		}
@@ -528,6 +571,9 @@ final class ReroutingRelay {
 	}
 
 	private void onRequestHead(byte[] head, @Nullable String host) {
+		if (this.refusal != null) {
+			return; // a request refused before: nothing after it is relayed
+		}
 		Resolved resolved;
 		if (this.firstHead) {
 			// resolved with the connection; the lookup must not run twice (it advances
@@ -538,10 +584,16 @@ final class ReroutingRelay {
 		else {
 			resolved = resolveOrRespond(head, host);
 			if (resolved == null) {
-				return; // the error response was written and the relay aborted
+				return; // refused: the answer waits for the request boundary
 			}
 		}
 		Router.Route route = resolved.route();
+		Verdict verdict = this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head));
+		if (!(verdict instanceof Verdict.Pass pass)) {
+			this.access.refused(route.routeTag(), ConnectionHeadParser.http1RequestOf(head), verdict);
+			this.refusal = this.errorResponse.refusal(ConnectionHeadParser.Head.http1(head, host), verdict);
+			return;
+		}
 		Leg old = this.current;
 		Leg leg;
 		if (old != null && !old.ended && old.route.equals(route)) {
@@ -569,7 +621,9 @@ final class ReroutingRelay {
 		this.clientWaits.update();
 		leg.requestSent(request, Http1RequestParser.isUpgrade(head));
 		this.lastRequest = System.nanoTime();
-		byte[] relayed = route.rewriteHost() ? ConnectionHeadRewriter.rewriteHttp1(head, route.address()) : head;
+		byte[] stripped = ConnectionHeadRewriter.withoutHeaders(head, pass.strip());
+		byte[] relayed = route.rewriteHost() ? ConnectionHeadRewriter.rewriteHttp1(stripped, route.address())
+				: stripped;
 		leg.toUpstream(relayed, 0, relayed.length);
 		if (request != null) {
 			this.access.request(route.routeTag(), request.method(), request.path(), request.version());
@@ -578,8 +632,8 @@ final class ReroutingRelay {
 
 	private void onRequestData(byte[] bytes, int offset, int length) {
 		Leg leg = this.current;
-		if (leg == null) {
-			return; // unreachable: a head always precedes the body
+		if (leg == null || this.refusal != null) {
+			return; // no head relayed yet, or the request refused: its body stays here
 		}
 		if (length > 0) {
 			this.continueAwaited = false; // the client sends its body without the 100
@@ -596,7 +650,7 @@ final class ReroutingRelay {
 
 	/**
 	 * Resolves the route of a later request head; on any refusal the error response is
-	 * written to the client and the relay aborted, mirroring the connection-level
+	 * kept for the request boundary ({@link #refusal}), mirroring the connection-level
 	 * refusals.
 	 */
 	private @Nullable Resolved resolveOrRespond(byte[] head, @Nullable String host) {
@@ -620,8 +674,7 @@ final class ReroutingRelay {
 		ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser.http1RequestOf(head);
 		this.access.request("-", request == null ? "-" : request.method(), request == null ? "-" : request.path(),
 				request == null ? "-" : request.version());
-		this.writeToClient(response, 0, response.length);
-		abort();
+		this.refusal = response;
 		return null;
 	}
 

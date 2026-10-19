@@ -5,9 +5,12 @@ import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HexFormat;
+import java.util.List;
 
 import com.samskivert.mustache.Mustache;
 import org.junit.jupiter.api.Test;
+
+import am.ik.sluice.server.auth.Verdict;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -35,6 +38,28 @@ class ErrorResponseTest {
 		assertThat(new String(this.errorResponse.busy(head, Duration.ofMillis(7900)), StandardCharsets.US_ASCII))
 			.isEqualTo("HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html; charset=utf-8\r\n"
 					+ "Content-Length: 0\r\nCache-Control: no-store\r\nRetry-After: 7\r\nConnection: close\r\n\r\n");
+	}
+
+	@Test
+	void anUnauthorizedRequestGetsA401WithEveryChallengeAndABusyCheckA503() {
+		ConnectionHeadParser.Head head = head("GET / HTTP/1.1\r\nHost: a.local\r\n\r\n");
+		List<String> challenges = List.of("Basic realm=\"a\", charset=\"UTF-8\"", "Bearer realm=\"a\"");
+		assertThat(new String(this.errorResponse.refusal(head, new Verdict.Unauthorized("missing", challenges)),
+				StandardCharsets.US_ASCII))
+			.isEqualTo("HTTP/1.1 401 Unauthorized\r\nContent-Type: text/html; charset=utf-8\r\n"
+					+ "Content-Length: 0\r\nCache-Control: no-store\r\nWWW-Authenticate: Basic realm=\"a\", "
+					+ "charset=\"UTF-8\"\r\nWWW-Authenticate: Bearer realm=\"a\"\r\nConnection: close\r\n\r\n");
+		assertThat(new String(this.errorResponse.refusal(head, new Verdict.Busy(Duration.ofSeconds(1))),
+				StandardCharsets.US_ASCII))
+			.isEqualTo("HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html; charset=utf-8\r\n"
+					+ "Content-Length: 0\r\nCache-Control: no-store\r\nRetry-After: 1\r\nConnection: close\r\n\r\n");
+
+		ErrorResponse.StreamPage page = this.errorResponse.refusalPage("a.local",
+				new ConnectionHeadParser.Head.Request("GET", "/", "2"),
+				new Verdict.Unauthorized("invalid", challenges));
+		assertThat(page.headers().status()).hasToString("401");
+		assertThat(page.headers().getAll("www-authenticate")).map(CharSequence::toString)
+			.containsExactlyElementsOf(challenges);
 	}
 
 	@Test

@@ -29,6 +29,8 @@ import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import am.ik.sluice.server.auth.RouteAuthenticator;
+import am.ik.sluice.server.auth.Verdict;
 import am.ik.sluice.server.proxy.hop.Hop;
 import am.ik.sluice.server.proxy.hop.HopHandler;
 import am.ik.sluice.server.proxy.hop.Loop;
@@ -70,16 +72,20 @@ import io.netty.util.AsciiString;
  * advances the load balancing state). Every later request head is routed by its
  * {@code :authority} (else {@code host}) and access-checked on its own: a refused stream
  * gets the no-route ({@code 503}) or forbidden ({@code 403}) page written through the
- * client endpoint's flow controller, and the connection goes on. A stream of a
- * {@code force-http1} route is answered {@code 421} without a body, then reset with
- * {@code NO_ERROR} while its request is still being sent; it opens no leg. When the
- * connection's handshake was the stream's host's own and offered http/1.1 -- h2 was
- * picked as the handshake resolved no force-http1 route, say while the route was gated
- * shut --, the {@code 421} comes with a GOAWAY {@code NO_ERROR}: Chromium retries a 421
- * on a new connection only past one it coalesced the host onto. A head that is no request
- * (no {@code :method}, no {@code :path} but for a CONNECT, a CONNECT without
- * {@code :authority}) is reset with {@code PROTOCOL_ERROR}. A CONNECT stream is routed by
- * its {@code :authority} and logged with it as its path.
+ * client endpoint's flow controller, and the connection goes on. Every stream, the first
+ * one included, is then checked against its route's credentials
+ * ({@link RouteAuthenticator}): a refused one gets the unauthorized ({@code 401}) or, its
+ * credential not checked for the checks in flight, the busy ({@code 503}) page the same
+ * way; the headers of the route's credentials are removed from a head that passes unless
+ * the route forwards them. A stream of a {@code force-http1} route is answered
+ * {@code 421} without a body, then reset with {@code NO_ERROR} while its request is still
+ * being sent; it opens no leg. When the connection's handshake was the stream's host's
+ * own and offered http/1.1 -- h2 was picked as the handshake resolved no force-http1
+ * route, say while the route was gated shut --, the {@code 421} comes with a GOAWAY
+ * {@code NO_ERROR}: Chromium retries a 421 on a new connection only past one it coalesced
+ * the host onto. A head that is no request (no {@code :method}, no {@code :path} but for
+ * a CONNECT, a CONNECT without {@code :authority}) is reset with {@code PROTOCOL_ERROR}.
+ * A CONNECT stream is routed by its {@code :authority} and logged with it as its path.
  * <p>
  * Streams of one route share the route's leg and keep their stream ids on it; with
  * {@code rewrite-host} the head's {@code :authority} becomes the route's address. Windows
@@ -345,6 +351,8 @@ final class NettyHttp2DemuxRelay {
 
 	private final AccessControl accessControl;
 
+	private final RouteAuthenticator routeAuth;
+
 	private final ErrorResponse errorResponse;
 
 	private final AccessLogger.Connection access;
@@ -483,6 +491,7 @@ final class NettyHttp2DemuxRelay {
 		this.router = Objects.requireNonNull(builder.router, "router is required");
 		this.sessions = Objects.requireNonNull(builder.sessions, "sessions is required");
 		this.accessControl = Objects.requireNonNull(builder.accessControl, "accessControl is required");
+		this.routeAuth = Objects.requireNonNull(builder.routeAuth, "routeAuth is required");
 		this.errorResponse = Objects.requireNonNull(builder.errorResponse, "errorResponse is required");
 		this.access = Objects.requireNonNull(builder.access, "access is required");
 		this.meters = Objects.requireNonNull(builder.meters, "meters is required");
@@ -663,6 +672,18 @@ final class NettyHttp2DemuxRelay {
 			}
 			route = found.get();
 			session = serving;
+		}
+		Verdict verdict = this.routeAuth.verify(route, ConnectionHeadParser.http2Headers(headers));
+		if (!(verdict instanceof Verdict.Pass pass)) {
+			this.access.refused(route.routeTag(), request, verdict);
+			Shortfall shortfall = answerLocked(streamId, this.errorResponse.refusalPage(host, request, verdict), false);
+			if (shortfall != null) {
+				refuseForBudgetLocked(streamId, shortfall);
+			}
+			return;
+		}
+		for (String name : pass.strip()) {
+			headers.remove(AsciiString.of(name));
 		}
 		if (route.forceHttp1()) {
 			misdirectLocked(streamId, host, route, request, endStream);
@@ -2509,6 +2530,8 @@ final class NettyHttp2DemuxRelay {
 
 		private @Nullable AccessControl accessControl;
 
+		private @Nullable RouteAuthenticator routeAuth;
+
 		private @Nullable ErrorResponse errorResponse;
 
 		private AccessLogger.@Nullable Connection access;
@@ -2566,6 +2589,11 @@ final class NettyHttp2DemuxRelay {
 
 		Builder accessControl(AccessControl accessControl) {
 			this.accessControl = accessControl;
+			return this;
+		}
+
+		Builder routeAuth(RouteAuthenticator routeAuth) {
+			this.routeAuth = routeAuth;
 			return this;
 		}
 

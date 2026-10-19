@@ -27,6 +27,7 @@ import org.springframework.boot.info.GitProperties;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
+import am.ik.sluice.server.auth.RouteAuthenticator;
 import am.ik.sluice.server.cluster.NodeDirectory;
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.console.ControlPlanePort;
@@ -55,6 +56,8 @@ class ConsoleView {
 
 	private final Router router;
 
+	private final RouteAuthenticator routeAuth;
+
 	private final TcpPortGateway tcpPortGateway;
 
 	private final DataProxyServer dataProxyServer;
@@ -75,9 +78,10 @@ class ConsoleView {
 
 	ConsoleView(SessionRegistry sessions, Router router, TcpPortGateway tcpPortGateway, DataProxyServer dataProxyServer,
 			NodeDirectory nodeDirectory, ClusterLifecycle clusterLifecycle, ApplicationAvailability availability,
-			SluiceServerProperties properties, ControlPlanePort controlPlanePort,
+			SluiceServerProperties properties, ControlPlanePort controlPlanePort, RouteAuthenticator routeAuth,
 			ObjectProvider<BuildProperties> buildProperties, ObjectProvider<GitProperties> gitProperties) {
 		this.sessions = sessions;
+		this.routeAuth = routeAuth;
 		this.router = router;
 		this.tcpPortGateway = tcpPortGateway;
 		this.dataProxyServer = dataProxyServer;
@@ -304,7 +308,8 @@ class ConsoleView {
 		return this.router.httpRoutes().stream().map(group -> {
 			String tag = group.key().isEmpty() ? "*" : group.key();
 			GateState state = this.router.gate().stateOf(tag);
-			return new RouteRow(group.key(), candidates(group, loadBalance), state == GateState.OPEN, tag);
+			return new RouteRow(group.key(), candidates(group, loadBalance), state == GateState.OPEN, tag,
+					String.join(", ", this.routeAuth.schemes(tag)));
 		}).toList();
 	}
 
@@ -770,8 +775,10 @@ class ConsoleView {
 	 * @param domain the domain ({@code ""} = catch-all)
 	 * @param open whether the route's gate is open (the console may have shut it)
 	 * @param gateKey the route key the gate is toggled under
+	 * @param auth the credential schemes the route requires, comma separated; empty when
+	 * none
 	 */
-	public record RouteRow(String domain, List<Candidate> candidates, boolean open, String gateKey) {
+	public record RouteRow(String domain, List<Candidate> candidates, boolean open, String gateKey, String auth) {
 
 		public boolean catchAll() {
 			return this.domain.isEmpty();

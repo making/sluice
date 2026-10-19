@@ -4,7 +4,10 @@ import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 import com.samskivert.mustache.Mustache;
@@ -23,16 +26,21 @@ import io.netty.handler.codec.http2.Http2Headers;
 
 import org.springframework.stereotype.Component;
 
+import am.ik.sluice.server.auth.Verdict;
+
 /**
  * The data plane's error answers, encoded in the protocol the request arrived in
  * (HTTP/1.1, or HTTP/2 for prior knowledge and ALPN h2), after which the connection
  * closes: the 503 no-route page for a request no tunnel session can serve, the 403
- * forbidden page for a peer address the access control excludes, a bare HTTP/1.1 400 for
- * a malformed request, the HTTP/2 502 page for a stream its upstream lost, a bodiless
- * HTTP/2 421 for a stream of a route reached over HTTP/1.1 only, a GOAWAY
- * {@code COMPRESSION_ERROR} for an HTTP/2 head whose header block does not decode, a
- * GOAWAY processing no stream for an HTTP/2 connection whose relay does not fit, and the
- * 503 busy page with {@code Retry-After} for a request past the connection limit.
+ * forbidden page for a peer address the access control excludes, the 401 unauthorized
+ * page with the route's {@code WWW-Authenticate} challenges for a request without its
+ * credentials, the 503 busy page with {@code Retry-After} for a request whose credentials
+ * could not be checked for the checks in flight, a bare HTTP/1.1 400 for a malformed
+ * request, the HTTP/2 502 page for a stream its upstream lost, a bodiless HTTP/2 421 for
+ * a stream of a route reached over HTTP/1.1 only, a GOAWAY {@code COMPRESSION_ERROR} for
+ * an HTTP/2 head whose header block does not decode, a GOAWAY processing no stream for an
+ * HTTP/2 connection whose relay does not fit, and the 503 busy page with
+ * {@code Retry-After} for a request past the connection limit.
  */
 @Component
 public class ErrorResponse {
@@ -59,11 +67,14 @@ public class ErrorResponse {
 
 	private final Page busy;
 
+	private final Page unauthorized;
+
 	ErrorResponse(Mustache.Compiler compiler) {
 		this.noRoute = new Page(compiler.loadTemplate("proxy/no-route"), "503 Service Unavailable");
 		this.forbidden = new Page(compiler.loadTemplate("proxy/forbidden"), "403 Forbidden");
 		this.badGateway = new Page(compiler.loadTemplate("proxy/bad-gateway"), "502 Bad Gateway");
 		this.busy = new Page(compiler.loadTemplate("proxy/busy"), "503 Service Unavailable");
+		this.unauthorized = new Page(compiler.loadTemplate("proxy/unauthorized"), "401 Unauthorized");
 	}
 
 	/**
@@ -77,6 +88,50 @@ public class ErrorResponse {
 			return new byte[0];
 		}
 		return this.render(head, this.busy.retryingAfter(retryAfter.toSeconds()));
+	}
+
+	/**
+	 * The answer to a request without the credentials of its route: the unauthorized
+	 * page, a {@code 401} with a {@code WWW-Authenticate} per challenge, in the protocol
+	 * of {@code head}.
+	 */
+	public byte[] unauthorized(ConnectionHeadParser.Head head, List<String> challenges) {
+		return this.render(head, this.unauthorized.challenging(challenges));
+	}
+
+	/**
+	 * The answer to a request its route's credential check refused: {@link #unauthorized}
+	 * or {@link #verificationBusy}; empty for a verdict that passes.
+	 */
+	public byte[] refusal(ConnectionHeadParser.Head head, Verdict verdict) {
+		return switch (verdict) {
+			case Verdict.Unauthorized unauthorized -> this.unauthorized(head, unauthorized.challenges());
+			case Verdict.Busy busy -> this.verificationBusy(head, busy.retryAfter());
+			case Verdict.Pass pass -> new byte[0];
+		};
+	}
+
+	/**
+	 * The page on a single stream its route's credential check refused, for a relay whose
+	 * HTTP/2 codec frames it: {@link #unauthorizedPage} or {@link #verificationBusyPage}.
+	 * @throws IllegalArgumentException for a verdict that passes
+	 */
+	public StreamPage refusalPage(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request,
+			Verdict verdict) {
+		return switch (verdict) {
+			case Verdict.Unauthorized unauthorized -> this.unauthorizedPage(host, request, unauthorized.challenges());
+			case Verdict.Busy busy -> this.verificationBusyPage(host, request, busy.retryAfter());
+			case Verdict.Pass pass -> throw new IllegalArgumentException("the request passed");
+		};
+	}
+
+	/**
+	 * The answer to a request whose credentials could not be checked for the checks in
+	 * flight: the busy page saying so, a {@code 503} with a {@code Retry-After} of
+	 * {@code retryAfter} in whole seconds, in the protocol of {@code head}.
+	 */
+	public byte[] verificationBusy(ConnectionHeadParser.Head head, Duration retryAfter) {
+		return this.render(head, this.busy.verifying().retryingAfter(retryAfter.toSeconds()));
 	}
 
 	/**
@@ -153,6 +208,24 @@ public class ErrorResponse {
 	}
 
 	/**
+	 * The unauthorized page with the challenges on a single stream, for a relay whose
+	 * HTTP/2 codec frames it.
+	 */
+	public StreamPage unauthorizedPage(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request,
+			List<String> challenges) {
+		return this.streamPage(this.unauthorized.challenging(challenges), host, request);
+	}
+
+	/**
+	 * The busy page of a request whose credentials could not be checked, on a single
+	 * stream, for a relay whose HTTP/2 codec frames it.
+	 */
+	public StreamPage verificationBusyPage(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request,
+			Duration retryAfter) {
+		return this.streamPage(this.busy.verifying().retryingAfter(retryAfter.toSeconds()), host, request);
+	}
+
+	/**
 	 * The bad-gateway page on a single stream its upstream lost before answering, for a
 	 * relay whose HTTP/2 codec frames it and holds its body to the client's windows.
 	 */
@@ -168,6 +241,7 @@ public class ErrorResponse {
 			.set("content-type", CONTENT_TYPE)
 			.set("content-length", String.valueOf(body.length))
 			.set("cache-control", "no-store");
+		page.addHeaders(headers);
 		return new StreamPage(headers, withBody ? body : new byte[0]);
 	}
 
@@ -182,7 +256,8 @@ public class ErrorResponse {
 	private byte[] page(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request, Page page) {
 		// an empty value skips its section (emptyStringIsFalse)
 		Map<String, String> context = Map.of("host", host == null ? "" : host, "method",
-				request == null ? "" : request.method(), "path", request == null ? "" : request.path());
+				request == null ? "" : request.method(), "path", request == null ? "" : request.path(), "verifying",
+				page.line().verifying() ? "true" : "");
 		return page.page().execute(context).getBytes(StandardCharsets.UTF_8);
 	}
 
@@ -201,10 +276,13 @@ public class ErrorResponse {
 
 	private byte[] http1(ConnectionHeadParser.Head head, ConnectionHeadParser.Head.Request request, Page page) {
 		byte[] body = this.page(head, page);
-		Long retryAfter = page.retryAfter();
+		StringBuilder headers = new StringBuilder();
+		for (Header header : page.line().headers()) {
+			headers.append(header.name()).append(": ").append(header.value()).append("\r\n");
+		}
 		String responseHead = "HTTP/1.1 " + page.reason() + "\r\n" + "Content-Type: " + CONTENT_TYPE + "\r\n"
-				+ "Content-Length: " + body.length + "\r\n" + "Cache-Control: no-store\r\n"
-				+ (retryAfter == null ? "" : "Retry-After: " + retryAfter + "\r\n") + "Connection: close\r\n\r\n";
+				+ "Content-Length: " + body.length + "\r\n" + "Cache-Control: no-store\r\n" + headers
+				+ "Connection: close\r\n\r\n";
 		ByteArrayOutputStream out = new ByteArrayOutputStream(responseHead.length() + body.length);
 		out.writeBytes(responseHead.getBytes(StandardCharsets.US_ASCII));
 		if (!isHead(request)) {
@@ -227,10 +305,7 @@ public class ErrorResponse {
 			.set("content-type", CONTENT_TYPE)
 			.set("content-length", String.valueOf(body.length))
 			.set("cache-control", "no-store");
-		Long retryAfter = page.retryAfter();
-		if (retryAfter != null) {
-			headers.set("retry-after", String.valueOf(retryAfter));
-		}
+		page.addHeaders(headers);
 		Http2Frames frames = new Http2Frames(streamId);
 		frames.write(Http2Frame.SETTINGS, new byte[0]);
 		frames.write(Http2Frame.SETTINGS_ACK, new byte[0]);
@@ -248,11 +323,7 @@ public class ErrorResponse {
 	}
 
 	private byte[] page(ConnectionHeadParser.Head head, Page page) {
-		ConnectionHeadParser.Head.Request request = head.request();
-		// an empty value skips its section (emptyStringIsFalse)
-		Map<String, String> context = Map.of("host", head.host() == null ? "" : head.host(), "method",
-				request == null ? "" : request.method(), "path", request == null ? "" : request.path());
-		return page.page().execute(context).getBytes(StandardCharsets.UTF_8);
+		return this.page(head.host(), head.request(), page);
 	}
 
 	private static byte[] bare(Page page) {
@@ -268,12 +339,35 @@ public class ErrorResponse {
 	private record Page(Template page, Status line) {
 
 		private Page(Template page, String reason) {
-			this(page, new Status(reason, null));
+			this(page, new Status(reason, List.of(), false));
 		}
 
 		/** The same page with a {@code Retry-After} of {@code seconds}. */
 		private Page retryingAfter(long seconds) {
-			return new Page(this.page, new Status(this.line.reason(), seconds));
+			return this.with(List.of(new Header("Retry-After", String.valueOf(seconds))));
+		}
+
+		/** The same page with a {@code WWW-Authenticate} per challenge. */
+		private Page challenging(List<String> challenges) {
+			return this.with(challenges.stream().map(challenge -> new Header("WWW-Authenticate", challenge)).toList());
+		}
+
+		/** The same page telling that the request's credentials could not be checked. */
+		private Page verifying() {
+			return new Page(this.page, new Status(this.line.reason(), this.line.headers(), true));
+		}
+
+		private Page with(List<Header> headers) {
+			List<Header> all = new ArrayList<>(this.line.headers());
+			all.addAll(headers);
+			return new Page(this.page, new Status(this.line.reason(), all, this.line.verifying()));
+		}
+
+		/** Adds the page's headers to an h2 header block, names in lowercase. */
+		private void addHeaders(Http2Headers headers) {
+			for (Header header : this.line.headers()) {
+				headers.add(header.name().toLowerCase(Locale.ROOT), header.value());
+			}
 		}
 
 		private String reason() {
@@ -287,17 +381,22 @@ public class ErrorResponse {
 			return end < 0 ? reason : reason.substring(0, end);
 		}
 
-		private @Nullable Long retryAfter() {
-			return this.line.retryAfter();
+	}
+
+	/**
+	 * An HTTP status line, the headers the response carries besides the page's own, and
+	 * whether the page tells that the request's credentials could not be checked.
+	 */
+	private record Status(String reason, List<Header> headers, boolean verifying) {
+
+		private Status {
+			headers = List.copyOf(headers);
 		}
 
 	}
 
-	/**
-	 * An HTTP status line, and the {@code Retry-After} in seconds the response carries;
-	 * null = none.
-	 */
-	private record Status(String reason, @Nullable Long retryAfter) {
+	/** A response header. */
+	private record Header(String name, String value) {
 	}
 
 	/**

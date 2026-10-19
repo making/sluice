@@ -8,6 +8,7 @@ import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
+import am.ik.sluice.server.auth.RouteAuthenticator;
 import am.ik.sluice.server.auth.TokenValidator;
 import am.ik.sluice.server.cluster.NodeDirectory;
 import am.ik.sluice.server.config.SluiceServerProperties;
@@ -55,6 +56,8 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	private final Router router;
 
+	private final RouteAuthenticator routeAuth;
+
 	private final TokenValidator tokenValidator;
 
 	private final SessionRegistry sessions;
@@ -97,8 +100,10 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 
 	public TunnelService(Router router, TokenValidator tokenValidator, SessionRegistry sessions,
 			TcpRouteListener tcpRoutes, NodeDirectory nodeDirectory, MembershipBroadcaster membershipBroadcaster,
-			SluiceServerProperties properties, MeterRegistry meterRegistry, PeerBuild serverBuild) {
+			SluiceServerProperties properties, MeterRegistry meterRegistry, PeerBuild serverBuild,
+			RouteAuthenticator routeAuth) {
 		this.router = router;
+		this.routeAuth = routeAuth;
 		this.tokenValidator = tokenValidator;
 		this.sessions = sessions;
 		this.tcpRoutes = tcpRoutes;
@@ -255,6 +260,7 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			.registered(this.membershipBroadcaster::onSessionRegistered)
 			.refused(refusal -> refuse(refusal, finalClientId, remoteAddress))
 			.streamLog(this.streamLog)
+			.requiresCredentials(this.routeAuth::protects)
 			.build();
 		stalledSession.set(session);
 		Optional<SessionRegistry.Refusal> refused = session.start();

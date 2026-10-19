@@ -164,6 +164,7 @@ class TlsDataPlaneE2ETest {
 				() -> "file:" + requireNonNull(keystorePath).toAbsolutePath());
 		registry.add("spring.ssl.bundle.jks.data-plane.keystore.password", () -> "changeit");
 		registry.add("sluice.data-tls-bundle", () -> "data-plane");
+		registry.add("sluice.route.auth.[auth.local].bearer[0]", () -> "{noop}tls-token");
 	}
 
 	/** Generates a self-signed keystore with SANs for localhost via keytool. */
@@ -355,6 +356,10 @@ class TlsDataPlaneE2ETest {
 				.target("http://127.0.0.1:" + h1UpstreamAddress.getPort())
 				.forceHttp1(true)
 				.build())
+			.upstream(Upstream.builder()
+				.host("auth.local")
+				.target("http://127.0.0.1:" + h1UpstreamAddress.getPort())
+				.build())
 			.token("it-token")
 			.build();
 		TunnelClient started = TunnelClient.builder()
@@ -536,6 +541,51 @@ class TlsDataPlaneE2ETest {
 			InputStream in = socket.getInputStream();
 			String head = new String(in.readNBytes(12), StandardCharsets.US_ASCII);
 			assertThat(head).startsWith("HTTP/1.1 200");
+		}
+	}
+
+	/**
+	 * A route with credentials checks the requests of TLS-terminated connections as it
+	 * does plaintext ones: HTTP/1.1 and h2.
+	 */
+	@Test
+	void aRouteWithCredentialsChecksTlsTerminatedRequests() throws Exception {
+		this.startClient();
+		assertThat(tlsHttp1("GET / HTTP/1.1\r\nHost: auth.local\r\nConnection: close\r\n\r\n"))
+			.startsWith("HTTP/1.1 401 Unauthorized\r\n");
+		assertThat(tlsHttp1(
+				"GET / HTTP/1.1\r\nHost: auth.local\r\nAuthorization: Bearer tls-token\r\nConnection: close\r\n\r\n"))
+			.startsWith("HTTP/1.1 200")
+			.endsWith(H1_BODY);
+		try (SSLSocket socket = (SSLSocket) clientSslContext().getSocketFactory().createSocket("127.0.0.1", dataPort)) {
+			socket.setSoTimeout(10_000);
+			javax.net.ssl.SSLParameters parameters = socket.getSSLParameters();
+			parameters.setApplicationProtocols(new String[] { "h2" });
+			socket.setSSLParameters(parameters);
+			socket.startHandshake();
+			assertThat(socket.getApplicationProtocol()).as("precondition: h2").isEqualTo("h2");
+			TestH2.writeClientHead(socket.getOutputStream(), 1, ":authority=auth.local", ":method=GET", ":path=/");
+			assertThat(TestH2.status(TestH2.readResponseFrames(socket.getInputStream()))).isEqualTo("401");
+		}
+	}
+
+	/** Sends the request over a TLS-terminated HTTP/1.1 connection; what came back. */
+	private static String tlsHttp1(String request) throws Exception {
+		try (SSLSocket socket = (SSLSocket) clientSslContext().getSocketFactory().createSocket("127.0.0.1", dataPort)) {
+			socket.setSoTimeout(10_000);
+			javax.net.ssl.SSLParameters parameters = socket.getSSLParameters();
+			parameters.setApplicationProtocols(new String[] { "http/1.1" });
+			socket.setSSLParameters(parameters);
+			socket.getOutputStream().write(request.getBytes(StandardCharsets.US_ASCII));
+			socket.getOutputStream().flush();
+			ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+			try {
+				socket.getInputStream().transferTo(bytes);
+			}
+			catch (javax.net.ssl.SSLException e) {
+				// the peer closed without close_notify after the response
+			}
+			return bytes.toString(StandardCharsets.UTF_8);
 		}
 	}
 

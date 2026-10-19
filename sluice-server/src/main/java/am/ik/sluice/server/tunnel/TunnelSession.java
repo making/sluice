@@ -15,6 +15,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 import org.jspecify.annotations.Nullable;
@@ -180,6 +181,9 @@ public final class TunnelSession implements AutoCloseable {
 
 	private final LogThrottle streamLog;
 
+	/** Whether a route key requires credentials on the data plane. */
+	private final Predicate<String> requiresCredentials;
+
 	/**
 	 * Whether the stream took a permit of {@link #streamLog} at its start: its lines are
 	 * logged at info / warn, else at debug.
@@ -204,6 +208,7 @@ public final class TunnelSession implements AutoCloseable {
 		this.registered = builder.registered;
 		this.refused = builder.refused;
 		this.streamLog = builder.streamLog;
+		this.requiresCredentials = builder.requiresCredentials;
 		this.serverBuild = builder.serverBuild;
 		this.advertiser = Executors.newSingleThreadExecutor(
 				task -> Thread.ofVirtual().name("sluice-advertise-" + this.clientId).unstarted(task));
@@ -245,6 +250,8 @@ public final class TunnelSession implements AutoCloseable {
 		};
 
 		private LogThrottle streamLog = LogThrottle.unlimited();
+
+		private Predicate<String> requiresCredentials = routeKey -> false;
 
 		private Runnable windowUpdateReceived = () -> {
 		};
@@ -354,6 +361,15 @@ public final class TunnelSession implements AutoCloseable {
 		 */
 		Builder streamLog(LogThrottle streamLog) {
 			this.streamLog = streamLog;
+			return this;
+		}
+
+		/**
+		 * Whether a route key requires credentials on the data plane: a TLS passthrough
+		 * upstream under one is warned about at its advertise. None does by default.
+		 */
+		Builder requiresCredentials(Predicate<String> requiresCredentials) {
+			this.requiresCredentials = requiresCredentials;
 			return this;
 		}
 
@@ -694,6 +710,14 @@ public final class TunnelSession implements AutoCloseable {
 						upstream.getTlsPassthrough(), upstream.getListenPort(),
 						upstream.getVerbatimIdleTimeoutMillis() == 0 ? "server default"
 								: Long.toUnsignedString(upstream.getVerbatimIdleTimeoutMillis()) + "ms");
+			String routeKey = upstream.getHostPattern().isEmpty() ? upstream.getHost() : upstream.getHostPattern();
+			if (upstream.getTlsPassthrough() && upstream.getListenPort() == 0
+					&& this.requiresCredentials.test(routeKey)) {
+				log.atLevel(level == Level.DEBUG ? Level.DEBUG : Level.WARN)
+					.log("client {} upstream: host=[{}] is TLS passthrough on a route requiring credentials, "
+							+ "which the data plane cannot check on it: its connections are refused", this.clientId,
+							routeKey);
+			}
 		}
 	}
 

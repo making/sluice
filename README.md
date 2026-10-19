@@ -248,6 +248,62 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 # -> it-works-sni
 ```
 
+## Route authentication
+
+A route can require credentials on the data plane, configured on the server under its route
+key -- the key the console shows: the domain, the host pattern as written, `*` for the
+catch-all:
+
+```properties
+# HTTP Basic: user name = password
+sluice.route.auth.[admin.example.com].basic.alice={bcrypt}$2a$10$...
+# Authorization: Bearer <token>
+sluice.route.auth.[api.example.com].bearer[0]={sha256}9f86d081884c7d65...
+# an API token header
+sluice.route.auth.[api.example.com].api-token[0]={sha256}...
+```
+
+| Property (under `sluice.route.auth.[<route key>]`) | Default | Description |
+|---|---|---|
+| `basic.<user>` | - | HTTP Basic users and their passwords |
+| `bearer[n]` | - | tokens accepted as `Authorization: Bearer <token>` |
+| `api-token[n]` | - | tokens accepted in the API token header |
+| `api-token-header` | `X-API-Token` | the header carrying an API token |
+| `realm` | the route key | the realm of the challenges |
+| `forward-credentials` | `false` | relay the credential headers to the upstream; by default they are removed |
+| `allow-preflight` | `false` | let a CORS preflight (`OPTIONS` with `Access-Control-Request-Method`) pass without credentials: browsers send none on it |
+
+- A request passes with any one credential of its route. Otherwise it is answered `401` with a
+  `WWW-Authenticate` challenge per scheme of the route (`Basic realm="<realm>", charset="UTF-8"`,
+  `Bearer realm="<realm>"`, `<api-token-header> realm="<realm>"`) and never reaches the upstream.
+  A request carrying a credential header of the route twice is refused whatever the values.
+- Every HTTP/1.1 request head and every h2 stream is checked, plaintext or TLS-terminated, after
+  `allowed-cidrs` (`403` before `401`). On HTTP/1.1 a refused request is answered once the
+  responses to the requests before it are relayed, then the connection closes; on h2 the
+  connection goes on. A WebSocket is checked on its upgrade request only: browsers cannot add
+  headers to it, so bearer / API tokens there serve non-browser clients.
+- Unless `forward-credentials=true`, `Authorization` (Basic, Bearer) and the API token header
+  are removed from every request of the route before it is relayed.
+- Only a request the data plane reads can be checked: a TLS passthrough or non-HTTP connection
+  to such a route is closed unrelayed, and the server warns at the advertise of a TLS passthrough
+  upstream under such a key; a `tcp:<port>` key fails the start.
+- Each secret carries the `{id}` of its encoder: `bcrypt`, `pbkdf2`,
+  `pbkdf2@SpringSecurity_v5_8`, `noop` (the value itself), `sha256` (the hex SHA-256 of the
+  UTF-8 value, unsalted: for high-entropy tokens, never for passwords people choose; e.g.
+  `printf %s "$TOKEN" | sha256sum`). scrypt and argon2 are not supported (they need Bouncy
+  Castle). A secret without a prefix, with an unknown id or malformed for its encoder fails the
+  start, as does a route with no credential.
+- A credential that matched is remembered per route by its SHA-256 for 10 minutes (up to 10000
+  of them), so a client's later requests skip the encoder; one that did not match is never
+  remembered. At most as many checks against `bcrypt` / `pbkdf2` as CPUs (at least 2) run at
+  once; a request whose check would take one more is answered `503` with `Retry-After: 1`.
+  bcrypt and pbkdf2 cost milliseconds per check by design: prefer `sha256` for tokens.
+- Without `sluice.data-tls-bundle` the server warns at startup that the credentials cross the
+  data plane in cleartext unless a front end terminates TLS.
+- Refusals are logged as `type=req ... status=401 reason=auth-missing` (no credential),
+  `reason=auth-invalid`, `reason=auth-unreadable` (passthrough / non-HTTP), and `status=503
+  reason=auth-busy`. The console tags such a route `Auth: <schemes>`.
+
 ## Configuration (server)
 
 | Property | Default | Description |
@@ -299,6 +355,7 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 | `sluice.access-control.allow-cidrs` | (empty = every address) | data plane IP allow list, literal IPv4/IPv6 CIDRs or bare addresses; denied connections get 403 (http routes) or a plain close (tcp routes / TLS passthrough) |
 | `sluice.access-control.deny-cidrs` | (empty) | data plane IP deny list, evaluated before any allow list and never overridden |
 | `sluice.access-control.trusted-proxy-cidrs` | (empty = the peer address is judged) | peers trusted as proxying load balancers: when the connection peer matches, the rightmost `X-Forwarded-For` entry (the one the proxy appended) is judged instead of the peer address; the LB must be configured to append to the header, client-sent entries stay part of the chain |
+| `sluice.route.auth.[<route key>].*` | (none) | credentials the requests of a route must carry; see "Route authentication" |
 | `spring.grpc.server.port` | `8001` | gRPC control plane port |
 | `server.port` | `8081` | actuator (health / info / prometheus) and the management console (`/console`) |
 | `sluice.console.auth.type` | `simple` | console authentication: `simple` (form login with `spring.security.user.name` / `spring.security.user.password`) / `oidc` (OpenID Connect via `spring.security.oauth2.client.*`; see "Console authentication") |
@@ -1029,7 +1086,8 @@ The console requires a signed-in user; the actuator endpoints and the console st
 assets stay open. The mechanism is `sluice.console.auth.type`:
 
 - `simple` (default): form login with `spring.security.user.name` /
-  `spring.security.user.password` (`{noop}` / `{bcrypt}` prefixed values supported), e.g.
+  `spring.security.user.password` (prefixed with the `{id}` of its encoder, e.g. `{noop}` /
+  `{bcrypt}`; see "Route authentication" for the ids), e.g.
   `docker run ... -e SPRING_SECURITY_USER_NAME=admin -e SPRING_SECURITY_USER_PASSWORD='{noop}secret'`
 - `oidc`: sign in through an OpenID Provider, configured with the standard
   `spring.security.oauth2.client.*` properties

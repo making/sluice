@@ -18,12 +18,15 @@ import org.junit.jupiter.api.Test;
 
 import org.slf4j.LoggerFactory;
 
+import am.ik.sluice.server.auth.Verdict;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Rate limiting of the access log: at most {@code maxRate} lines per kind within a period
  * are emitted, and the suppressed count is reported by a {@code type=ratelimit} line when
- * the period rolls over.
+ * the period rolls over. A request refused for its route's credentials is a request line
+ * naming the status and the reason.
  */
 class AccessLoggerRateLimitTest {
 
@@ -98,6 +101,39 @@ class AccessLoggerRateLimitTest {
 			assertThat(messages).contains("type=ratelimit kind=conn-accept suppressed=1 periodMs=50");
 			assertThat(countOf(messages, "event=accept")).isEqualTo(2);
 		}
+	}
+
+	@Test
+	void credentialRefusalsAreRequestLinesWithTheirStatusAndReason() throws Exception {
+		SluiceServerProperties properties = SluiceServerProperties.builder()
+			.accessLog(SluiceServerProperties.AccessLog.builder()
+				.rateLimit(SluiceServerProperties.AccessLog.RateLimit.builder()
+					.maxRate(2)
+					.period(Duration.ofMillis(50))
+					.build())
+				.build())
+			.build();
+		AccessLogger accessLogger = new AccessLogger(properties, this.now::get);
+		try (ServerSocket serverSocket = loopbackServer();
+				Socket socket = new Socket("127.0.0.1", serverSocket.getLocalPort());
+				Socket accepted = serverSocket.accept()) {
+			AccessLogger.Connection connection = accessLogger.accepted("test", socket);
+			ConnectionHeadParser.Head.Request request = new ConnectionHeadParser.Head.Request("GET", "/x", "1.1");
+			connection.refused("a.local", request, new Verdict.Unauthorized("missing", List.of()));
+			connection.refused("a.local", request, new Verdict.Busy(Duration.ofSeconds(1)));
+			connection.refused("a.local", request, new Verdict.Unauthorized("invalid", List.of()));
+			assertThat(this.messages()).as("the third past the request lines' rate")
+				.containsExactly(
+						"type=req id=1 route=a.local method=GET path=/x http=1.1 remote=" + remoteOf(socket)
+								+ " status=401 reason=auth-missing",
+						"type=req id=1 route=a.local method=GET path=/x http=1.1 remote=" + remoteOf(socket)
+								+ " status=503 reason=auth-busy");
+		}
+	}
+
+	private static String remoteOf(Socket socket) {
+		java.net.InetSocketAddress remote = (java.net.InetSocketAddress) socket.getRemoteSocketAddress();
+		return remote.getHostString() + ":" + remote.getPort();
 	}
 
 	@Test

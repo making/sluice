@@ -34,7 +34,8 @@ import am.ik.sluice.server.route.LoadBalance;
  * @param console management console settings (authentication)
  * @param tcpLoadBalance load balancing applied when several clients serve the same listen
  * port (tcp routes)
- * @param route per-route settings: the gate each route starts from
+ * @param route per-route settings: the gate each route starts from, the credentials its
+ * requests must carry
  * @param limits data plane connection limits and the head deadline
  */
 @ConfigurationProperties("sluice")
@@ -780,18 +781,121 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	}
 
 	/**
-	 * Route settings.
+	 * Route settings, keyed by the route key shown in the console -- the domain, the host
+	 * pattern as written, {@code tcp:<port>} for tcp routes, {@code *} (or empty) for the
+	 * catch-all.
 	 *
 	 * @param gate the gate each route starts from: the console opens and shuts route
-	 * gates in memory, on restart every route comes back to this. The key is the route
-	 * key shown in the console -- the domain, the host pattern as written,
-	 * {@code tcp:<port>} for tcp routes, {@code *} (or empty) for the catch-all; absent =
-	 * open
+	 * gates in memory, on restart every route comes back to this; absent = open
+	 * @param auth the credentials the requests of a route must carry; absent = none. Only
+	 * a request the data plane reads can be checked: a tcp route's key fails the start, a
+	 * TLS passthrough or non-HTTP connection to the route is refused
 	 */
-	public record Route(@DefaultValue Map<String, GateState> gate) {
+	public record Route(@DefaultValue Map<String, GateState> gate, @DefaultValue Map<String, Auth> auth) {
 
 		public Route {
 			gate = gate == null ? Map.of() : Map.copyOf(gate);
+			auth = auth == null ? Map.of() : Map.copyOf(auth);
+		}
+
+		/**
+		 * The credentials of one route; a request passes with any one of them. Every
+		 * secret carries the {@code {id}} prefix of its encoder (see
+		 * {@code PasswordEncoders}).
+		 *
+		 * @param basic HTTP Basic users: the user name to its password
+		 * @param bearer the tokens accepted as {@code Authorization: Bearer <token>}
+		 * @param apiToken the tokens accepted in the {@code apiTokenHeader}
+		 * @param apiTokenHeader the header carrying an API token
+		 * @param realm the realm the challenges name; empty = the route key
+		 * @param forwardCredentials whether the headers carrying the route's credentials
+		 * reach the upstream; by default they are removed from every request of the route
+		 * @param allowPreflight whether a CORS preflight ({@code OPTIONS} with
+		 * {@code Access-Control-Request-Method}) passes without credentials: browsers
+		 * send none on it
+		 */
+		public record Auth(@DefaultValue Map<String, String> basic, @DefaultValue List<String> bearer,
+				@DefaultValue List<String> apiToken, @DefaultValue("X-API-Token") String apiTokenHeader,
+				@DefaultValue("") String realm, @DefaultValue("false") boolean forwardCredentials,
+				@DefaultValue("false") boolean allowPreflight) {
+
+			/** The default of {@code apiTokenHeader}. */
+			public static final String DEFAULT_API_TOKEN_HEADER = "X-API-Token";
+
+			public Auth {
+				basic = basic == null ? Map.of() : Map.copyOf(basic);
+				bearer = bearer == null ? List.of() : List.copyOf(bearer);
+				apiToken = apiToken == null ? List.of() : List.copyOf(apiToken);
+				apiTokenHeader = apiTokenHeader == null || apiTokenHeader.isBlank() ? DEFAULT_API_TOKEN_HEADER
+						: apiTokenHeader.strip();
+				realm = realm == null ? "" : realm;
+			}
+
+			public static Builder builder() {
+				return new Builder();
+			}
+
+			public static final class Builder {
+
+				private Map<String, String> basic = Map.of();
+
+				private List<String> bearer = List.of();
+
+				private List<String> apiToken = List.of();
+
+				private String apiTokenHeader = DEFAULT_API_TOKEN_HEADER;
+
+				private String realm = "";
+
+				private boolean forwardCredentials;
+
+				private boolean allowPreflight;
+
+				private Builder() {
+				}
+
+				public Builder basic(Map<String, String> basic) {
+					this.basic = basic;
+					return this;
+				}
+
+				public Builder bearer(List<String> bearer) {
+					this.bearer = bearer;
+					return this;
+				}
+
+				public Builder apiToken(List<String> apiToken) {
+					this.apiToken = apiToken;
+					return this;
+				}
+
+				public Builder apiTokenHeader(String apiTokenHeader) {
+					this.apiTokenHeader = apiTokenHeader;
+					return this;
+				}
+
+				public Builder realm(String realm) {
+					this.realm = realm;
+					return this;
+				}
+
+				public Builder forwardCredentials(boolean forwardCredentials) {
+					this.forwardCredentials = forwardCredentials;
+					return this;
+				}
+
+				public Builder allowPreflight(boolean allowPreflight) {
+					this.allowPreflight = allowPreflight;
+					return this;
+				}
+
+				public Auth build() {
+					return new Auth(this.basic, this.bearer, this.apiToken, this.apiTokenHeader, this.realm,
+							this.forwardCredentials, this.allowPreflight);
+				}
+
+			}
+
 		}
 
 		public static Builder builder() {
@@ -802,6 +906,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 			@Nullable private Map<String, GateState> gate;
 
+			private Map<String, Auth> auth = Map.of();
+
 			private Builder() {
 			}
 
@@ -810,8 +916,13 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder auth(Map<String, Auth> auth) {
+				this.auth = auth;
+				return this;
+			}
+
 			public Route build() {
-				return new Route(this.gate == null ? Map.of() : this.gate);
+				return new Route(this.gate == null ? Map.of() : this.gate, this.auth);
 			}
 
 		}

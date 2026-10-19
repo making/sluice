@@ -18,6 +18,7 @@ import org.junit.jupiter.api.TestInstance.Lifecycle;
 
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -46,7 +47,8 @@ class ConsoleAuthE2ETest {
 		registry.add("sluice.data-port", () -> 0);
 		registry.add("sluice.token", () -> "it-token");
 		registry.add("spring.security.user.name", () -> USER);
-		registry.add("spring.security.user.password", () -> "{noop}" + PASSWORD);
+		// a {bcrypt} password; the other console tests sign in with a {noop} one
+		registry.add("spring.security.user.password", () -> "{bcrypt}" + new BCryptPasswordEncoder(4).encode(PASSWORD));
 	}
 
 	private HttpClient client;

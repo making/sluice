@@ -115,6 +115,7 @@ class ConsoleE2ETest {
 		registry.add("server.port", () -> 0);
 		registry.add("spring.security.user.name", () -> CONSOLE_USER);
 		registry.add("spring.security.user.password", () -> "{noop}" + CONSOLE_PASSWORD);
+		registry.add("sluice.route.auth.[h1only.local].bearer[0]", () -> "{noop}console-token");
 	}
 
 	@BeforeAll
@@ -300,6 +301,8 @@ class ConsoleE2ETest {
 				console-client 127.0.0.1:%d Serving
 				console-z 127.0.0.1:%d Standby
 				""".formatted(httpPort, httpPort));
+		assertThat(page.locator("tbody[data-route='h1only.local'] [data-testid=route-auth]").innerText())
+			.isEqualTo("Auth: bearer");
 		assertThat(page.locator("tbody[data-port='" + tcpRoutePort + "']").innerText())
 			.isEqualToNormalizingWhitespace("""
 					:%d listening, owned by console-client Open Shut

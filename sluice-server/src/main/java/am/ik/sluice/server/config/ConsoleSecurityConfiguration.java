@@ -24,10 +24,6 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.core.userdetails.User;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.security.core.userdetails.UserDetailsService;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
-import org.springframework.security.crypto.password.DelegatingPasswordEncoder;
-import org.springframework.security.crypto.password.NoOpPasswordEncoder;
-import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.provisioning.InMemoryUserDetailsManager;
 import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
@@ -118,8 +114,10 @@ class ConsoleSecurityConfiguration {
 	}
 
 	/**
-	 * The user store behind form login. Only registered for the {@code simple} mechanism
-	 * so that an OIDC-only deployment does not need {@code spring.security.user.*}.
+	 * The user store behind form login, its password matched by the server's password
+	 * encoder by its {@code {id}} prefix. Only registered for the {@code simple}
+	 * mechanism so that an OIDC-only deployment does not need
+	 * {@code spring.security.user.*}.
 	 */
 	@Bean
 	@ConditionalOnProperty(name = "sluice.console.auth.type", havingValue = "simple", matchIfMissing = true)
@@ -127,16 +125,6 @@ class ConsoleSecurityConfiguration {
 		SecurityProperties.User user = properties.getUser();
 		UserDetails userDetails = User.withUsername(user.getName()).password(user.getPassword()).build();
 		return new InMemoryUserDetailsManager(userDetails);
-	}
-
-	/**
-	 * Accepts the {@code {noop}} / {@code {bcrypt}} prefixed passwords that
-	 * {@code spring.security.user.password} documents, plus bare (noop) passwords.
-	 */
-	@Bean
-	PasswordEncoder passwordEncoder() {
-		return new DelegatingPasswordEncoder("bcrypt",
-				Map.of("bcrypt", new BCryptPasswordEncoder(), "noop", NoOpPasswordEncoder.getInstance()));
 	}
 
 	/**

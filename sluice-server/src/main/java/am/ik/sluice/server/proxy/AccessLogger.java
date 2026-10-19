@@ -9,6 +9,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 
+import am.ik.sluice.server.auth.Verdict;
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.tunnel.StreamRelay;
 import org.jspecify.annotations.Nullable;
@@ -250,11 +251,35 @@ public class AccessLogger {
 		 * itself: its route's upstream is reached over HTTP/1.1 only.
 		 */
 		void misdirected(String routeTag, ConnectionHeadParser.Head.Request request) {
+			this.refused(routeTag, request, 421, "force-http1");
+		}
+
+		/**
+		 * Logs a request head refused for its route's credentials: {@code 401} with
+		 * {@code reason=auth-missing} / {@code auth-invalid}, {@code 503} with
+		 * {@code reason=auth-busy}; nothing for a verdict that passes.
+		 */
+		void refused(String routeTag, ConnectionHeadParser.Head.@Nullable Request request, Verdict verdict) {
+			switch (verdict) {
+				case Verdict.Unauthorized unauthorized ->
+					this.refused(routeTag, request, 401, "auth-" + unauthorized.reason());
+				case Verdict.Busy busy -> this.refused(routeTag, request, 503, "auth-busy");
+				case Verdict.Pass pass -> {
+				}
+			}
+		}
+
+		/**
+		 * Logs a request head the relay answered itself with {@code status} instead of
+		 * relaying it, for {@code reason}.
+		 */
+		void refused(String routeTag, ConnectionHeadParser.Head.@Nullable Request request, int status, String reason) {
 			if (!this.requestEnabled || this.noop || this.closed || this.owner == null || !this.owner.allowRequest()) {
 				return;
 			}
-			log.info("type=req id={} route={} method={} path={} http={} remote={} status=421 reason=force-http1",
-					this.id, routeTag, request.method(), request.path(), request.version(), this.remote);
+			log.info("type=req id={} route={} method={} path={} http={} remote={} status={} reason={}", this.id,
+					routeTag, request == null ? "-" : request.method(), request == null ? "-" : request.path(),
+					request == null ? "-" : request.version(), this.remote, status, reason);
 		}
 
 		/** Logs the connection acceptance, before route and transport are known. */

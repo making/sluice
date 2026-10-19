@@ -4,7 +4,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
 
 import org.jspecify.annotations.Nullable;
@@ -14,6 +16,8 @@ import io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder;
 import io.netty.handler.codec.http2.Http2Exception;
 import io.netty.handler.codec.http2.Http2Headers;
 import io.netty.util.AsciiString;
+
+import am.ik.sluice.server.auth.RequestHeaders;
 
 /**
  * Reads the head of an incoming connection far enough to route it: the HTTP/1.1 request
@@ -223,19 +227,76 @@ public final class ConnectionHeadParser {
 	 * head; {@code null} when absent or blank.
 	 */
 	static @Nullable String http1HeaderOf(byte[] head, String name) {
-		String text = new String(head, StandardCharsets.ISO_8859_1);
+		List<String> values = http1HeaderValues(head, name);
+		if (values.isEmpty()) {
+			return null;
+		}
+		String value = values.get(0);
+		return value.isBlank() ? null : value;
+	}
+
+	/**
+	 * Every value of the headers with the given name of an HTTP/1.1 request head,
+	 * trimmed, in order; the bytes past the head's blank line (a body, a pipelined
+	 * request) are not read.
+	 */
+	static List<String> http1HeaderValues(byte[] head, String name) {
+		int end = headerEnd(head);
+		String text = new String(head, 0, end < 0 ? head.length : end, StandardCharsets.ISO_8859_1);
 		String[] lines = text.split("\r\n");
+		List<String> values = new ArrayList<>(1);
 		for (int i = 1; i < lines.length; i++) {
 			int colon = lines[i].indexOf(':');
 			if (colon <= 0) {
 				continue;
 			}
 			if (name.equalsIgnoreCase(lines[i].substring(0, colon))) {
-				String value = lines[i].substring(colon + 1).trim();
-				return value.isBlank() ? null : value;
+				values.add(lines[i].substring(colon + 1).trim());
 			}
 		}
-		return null;
+		return values;
+	}
+
+	/**
+	 * The method and headers of an HTTP/1.1 request head, as the route's credential check
+	 * reads them.
+	 */
+	static RequestHeaders http1Headers(byte[] head) {
+		return new RequestHeaders() {
+
+			@Override
+			public String method() {
+				Head.Request request = http1RequestOf(head);
+				return request == null ? "" : request.method();
+			}
+
+			@Override
+			public List<String> values(String name) {
+				return http1HeaderValues(head, name);
+			}
+
+		};
+	}
+
+	/**
+	 * The method and headers of an HTTP/2 request header block, as the route's credential
+	 * check reads them.
+	 */
+	static RequestHeaders http2Headers(Http2Headers headers) {
+		CharSequence method = headers.method();
+		return new RequestHeaders() {
+
+			@Override
+			public String method() {
+				return method == null ? "" : method.toString();
+			}
+
+			@Override
+			public List<String> values(String name) {
+				return headers.getAll(AsciiString.of(name)).stream().map(CharSequence::toString).toList();
+			}
+
+		};
 	}
 
 	/**

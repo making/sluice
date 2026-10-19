@@ -184,14 +184,15 @@
       <g class="outlet">
         <path class="dry" d="M660 74H952M660 126H952"/>
         <text x="680" y="58">outlet full</text>
-        <text x="680" y="152">every connection is taken</text>
+        <text x="680" y="152">{{#verifying}}credential checks are all taken{{/verifying}}{{^verifying}}every connection is taken{{/verifying}}</text>
       </g>
     </svg>
 
     <div class="notice">
       <p class="status">503 Service Unavailable</p>
       <h1>Server busy</h1>
-      <p class="lede">The server is at its connection limit and cannot take this request right now.</p>
+      {{#verifying}}<p class="lede">The server is checking as many credentials as it may at once and cannot check this request's right now.</p>{{/verifying}}
+      {{^verifying}}<p class="lede">The server is at its connection limit and cannot take this request right now.</p>{{/verifying}}
       <p class="hint">Retry in a few seconds.</p>
     </div>
   </div>

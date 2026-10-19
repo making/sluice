@@ -36,6 +36,7 @@ import org.springframework.context.SmartLifecycle;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.stereotype.Component;
 
+import am.ik.sluice.server.auth.RouteAuthenticator;
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.proxyprotocol.ProxyProtocolParser;
 import am.ik.sluice.server.route.Router;
@@ -54,11 +55,12 @@ import org.slf4j.LoggerFactory;
 /**
  * Data plane: a TCP listener on the data port that routes each connection by the Host
  * header (HTTP/1.1) or {@code :authority} (HTTP/2 prior knowledge) of the request head.
- * Plaintext HTTP relays per request -- every HTTP/1.1 request head and every HTTP/2
- * stream is routed anew, so keep-alive successors and coalesced streams reach the
- * upstream of their own route (see {@link ReroutingRelay} and
- * {@link NettyHttp2DemuxRelay}); TLS-terminated, encrypted-passthrough, and hostless
- * connections relay verbatim over the virtual connection of the resolved route. A TLS
+ * Plaintext and TLS-terminated HTTP relays per request -- every HTTP/1.1 request head and
+ * every HTTP/2 stream is routed anew, access-checked and checked against its route's
+ * credentials, so keep-alive successors and coalesced streams reach the upstream of their
+ * own route (see {@link ReroutingRelay} and {@link NettyHttp2DemuxRelay});
+ * encrypted-passthrough and hostless connections relay verbatim over the virtual
+ * connection of the resolved route, refused when the route requires credentials. A TLS
  * handshake (first byte {@code 0x16}) is either terminated locally when an SSL bundle is
  * configured (ALPN: h2 preferred over http/1.1 while the bytes an h2 relay reserves fit,
  * see {@link ConnectionLimits}), or relayed untouched in passthrough mode otherwise,
@@ -111,6 +113,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	private final AccessControl accessControl;
 
+	private final RouteAuthenticator routeAuth;
+
 	private final ConnectionLimits limits;
 
 	/** Handed to every HTTP/1.1 relay started from now on. */
@@ -133,8 +137,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 
 	DataProxyServer(Router router, SessionRegistry sessions, SluiceServerProperties properties,
 			MeterRegistry meterRegistry, AccessLogger accessLogger, AccessControl accessControl,
-			@Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor, ObjectProvider<SSLContext> sslContext,
-			ErrorResponse errorResponse, ConnectionLimits limits) {
+			RouteAuthenticator routeAuth, @Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor,
+			ObjectProvider<SSLContext> sslContext, ErrorResponse errorResponse, ConnectionLimits limits) {
 		this.router = router;
 		this.sessions = sessions;
 		this.properties = properties;
@@ -142,6 +146,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		this.h2DemuxMeters = new H2DemuxMeters(meterRegistry);
 		this.accessLogger = accessLogger;
 		this.accessControl = accessControl;
+		this.routeAuth = routeAuth;
 		this.taskExecutor = taskExecutor;
 		this.sslContext = sslContext;
 		this.errorResponse = errorResponse;
@@ -555,6 +560,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 					.router(this.router)
 					.sessions(this.sessions)
 					.accessControl(this.accessControl)
+					.routeAuth(this.routeAuth)
 					.errorResponse(this.errorResponse)
 					.access(access)
 					.meters(this.h2DemuxMeters)
@@ -581,9 +587,9 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				return true;
 			}
 			ReroutingRelay rerouting = new ReroutingRelay(this.clientPipeSeam.apply(conn.pipe()), conn.head(),
-					this.router, this.sessions, this.accessControl, this.errorResponse, access, this.meterRegistry,
-					route0, session, peer, deadline, this.properties.limits().halfCloseProbeInterval(), this.probeSeam,
-					relayed, release);
+					this.router, this.sessions, this.accessControl, this.routeAuth, this.errorResponse, access,
+					this.meterRegistry, route0, session, peer, deadline,
+					this.properties.limits().halfCloseProbeInterval(), this.probeSeam, relayed, release);
 			this.activeConnections.incrementAndGet();
 			try {
 				rerouting.start();
@@ -593,6 +599,13 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				throw e;
 			}
 			return true;
+		}
+		if (this.routeAuth.protects(route0)) {
+			// relayed verbatim, no request of it could be checked: refused rather than
+			// passed unchecked (a TLS passthrough connection gets no answer)
+			access.refused(route0.routeTag(), request, 401, "auth-unreadable");
+			this.reject(conn, this.errorResponse.unauthorized(conn.head(), List.of()));
+			return false;
 		}
 		VirtualConnection connection = session.open(route0.address());
 		access.connectionId(connection.connectionId());

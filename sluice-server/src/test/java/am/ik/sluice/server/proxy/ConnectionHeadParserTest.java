@@ -6,6 +6,8 @@ import java.nio.charset.StandardCharsets;
 
 import org.junit.jupiter.api.Test;
 
+import am.ik.sluice.server.auth.RequestHeaders;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 class ConnectionHeadParserTest {
@@ -184,9 +186,22 @@ class ConnectionHeadParserTest {
 	}
 
 	@Test
-	void http1WithoutForwardedForYieldsNull() throws IOException {
-		byte[] head = "GET / HTTP/1.1\r\nHost: demo.local\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
-		assertThat(PARSER.parse(new ByteArrayInputStream(head)).orElseThrow().forwardedFor()).isNull();
+	void http1WithoutForwardedForYieldsNullWhateverTheBodyHolds() throws IOException {
+		byte[] head = "POST / HTTP/1.1\r\nHost: demo.local\r\nContent-Length: 31\r\n\r\nX-Forwarded-For: 198.51.100.7\r\n"
+			.getBytes(StandardCharsets.US_ASCII);
+		ConnectionHeadParser.Head parsed = PARSER.parse(new ByteArrayInputStream(head)).orElseThrow();
+		assertThat(parsed.bytes()).as("precondition: the body was read with the head").isEqualTo(head);
+		assertThat(parsed.forwardedFor()).isNull();
+	}
+
+	@Test
+	void http1HeadersAreReadWithEveryValueInOrder() {
+		byte[] head = "GET / HTTP/1.1\r\nAuthorization: Bearer a\r\nHost: demo.local\r\nauthorization:Bearer b \r\n\r\n"
+			.getBytes(StandardCharsets.US_ASCII);
+		RequestHeaders headers = ConnectionHeadParser.http1Headers(head);
+		assertThat(headers.method()).isEqualTo("GET");
+		assertThat(headers.values("authorization")).containsExactly("Bearer a", "Bearer b");
+		assertThat(headers.values("x-api-token")).isEmpty();
 	}
 
 	@Test
