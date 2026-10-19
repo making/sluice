@@ -455,7 +455,8 @@ Behavior:
 - routing: a domain (or listen port) claimed by several clients is served by the one with
   the smallest `sluice.client.id` -- deterministically on every node, since every node sees
   every client. A smaller id takes over a bound listen port on advertise; a larger id gets
-  the port rejected and retries on the same stream
+  the port rejected and retries on the same stream. A port whose owner leaves is bound
+  for the next smallest id serving it
 - lifecycle: readiness (`/actuator/health/readiness`) is DOWN for `sluice.cluster.warmup`
   after start (clients connect first) and while draining. On shutdown the node sends a
   `DRAIN` frame, waits up to `sluice.cluster.drain-grace` for in-flight virtual connections
@@ -614,6 +615,39 @@ Properties are listed under "Configuration (server)" / "Configuration (client)".
 Details (overflow handling, reservations, probes, slot release, log throttles):
 [.kb/connection-limits.md](.kb/connection-limits.md). Tunnel and h2 buffering:
 [.kb/tunnel-flow-control.md](.kb/tunnel-flow-control.md), [.kb/h2-demux.md](.kb/h2-demux.md).
+
+### Client shutdown (drain)
+
+On SIGTERM / SIGINT the client drains before it closes:
+
+- It withdraws its routes on every server node. From then on the server sends new
+  connections, the next request of an HTTP/1.1 keep-alive connection and new tcp route
+  connections to the other clients serving the route; a listen port it owned is bound
+  for the next smallest id serving it. The console shows the client as `Draining`.
+- The connections open on it keep relaying until they end. Once none is left on a node,
+  the node acknowledges the withdrawal and the client ends that stream.
+- After `sluice.client.drain-grace` (20s) the connections still open are closed and logged
+  (`drain grace PT20S expired; closing N open connection(s)`). `0` closes at once.
+- Connections that hold the drain: in-flight requests, WebSocket / TLS passthrough / tcp
+  route connections, and idle keep-alive or h2 connections whose last request went
+  through this client (until their next request, the server's `idle-timeout`, or the
+  grace).
+- A route served by this client alone answers `503` from the withdrawal on, rather than
+  accepting requests the grace may cut.
+- A second SIGTERM / SIGINT during the drain closes at once.
+- A server predating the drain keeps routing to the client; the client then closes that
+  node's stream at once, as before.
+
+`docker compose stop` (and `up -d` replacing a container) sends SIGKILL 10s after SIGTERM:
+set `stop_grace_period` above `drain-grace`, e.g. `30s` for the default. On Kubernetes,
+`terminationGracePeriodSeconds` (30s by default) bounds it the same way.
+
+```yaml
+services:
+  sluice-client:
+    image: ghcr.io/making/sluice/sluice-client:native
+    stop_grace_period: 30s
+```
 
 ### gRPC keepalive
 
@@ -854,6 +888,7 @@ its discovery document advertises an `end_session_endpoint`; register
 | `sluice.client.id` | random, once per process | stable client identity sent as `x-sluice-id` on every stream; breaks route / listen-port ties in cluster mode |
 | `sluice.keep-alive-time` | `30s` | interval of the gRPC keepalive ping towards the server |
 | `sluice.keep-alive-timeout` | `10s` | how long a keepalive ping answer may take before the channel is torn down |
+| `sluice.client.drain-grace` | `20s` | on shutdown, how long the connections open keep relaying after the routes were withdrawn; the ones left are closed; `0` = no drain; see "Client shutdown (drain)" |
 
 ### Upstreams
 
@@ -865,7 +900,7 @@ its discovery document advertises an `end_session_endpoint`; register
 | `sluice.client.upstream[n].rewrite-host` | `false` | rewrites the request Host / `:authority` to the target's `host[:port]` |
 | `sluice.client.upstream[n].tls-passthrough` | `false` | TLS connections for the upstream are relayed untouched (routed by ClientHello SNI, the upstream terminates TLS) instead of terminated on the data plane |
 | `sluice.client.upstream[n].force-http1` | `false` | the upstream speaks HTTP/1.1 only: the data plane's TLS termination prefers http/1.1 in ALPN for the route, and an h2 stream for it (a browser coalescing the host onto an h2 connection of another host, an h2-only or h2c client) gets `421 Misdirected Request`; `tls-passthrough` routes are unaffected |
-| `sluice.client.upstream[n].listen-port` | `0` | public port the server listens on for this upstream; connections are relayed as raw TCP routed by the listen port -- no head parsing, no rewriting -- so any protocol (ssh, postgres, redis, ...) tunnels through. The listener is bound on advertise and released on disconnect; bind it on the host (`docker -p`, firewall) to expose it |
+| `sluice.client.upstream[n].listen-port` | `0` | public port the server listens on for this upstream; connections are relayed as raw TCP routed by the listen port -- no head parsing, no rewriting -- so any protocol (ssh, postgres, redis, ...) tunnels through. The listener is bound on advertise and released on disconnect or drain (then bound for another client serving the port); bind it on the host (`docker -p`, firewall) to expose it |
 | `sluice.client.upstream[n].allowed-cidrs` | (empty = the server-wide `sluice.access-control.allow-cidrs` applies) | CIDRs / bare addresses allowed to connect to this upstream on the data plane; replaces the server-wide allow list for the route (the deny list still applies) |
 | `sluice.client.upstream[n].verbatim-idle-timeout` | `0` = the server's `sluice.limits.verbatim-idle-timeout` applies | how long a connection of this upstream relayed verbatim (TLS passthrough, tcp route, hostless, upgraded HTTP/1.1) may relay no byte in either direction before the server closes it; replaces the server's default for the route; see "Connection limits" |
 | `sluice.strict-forwarding` | `true` | only dial upstreams present in the map |

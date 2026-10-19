@@ -48,7 +48,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * server before 046cd21) gets each such CONNECT answered with an ERROR naming the server
  * build required: nothing is dialed, no connection slot is taken, and one line is logged
  * per rejection. A windowed CONNECT on the same stream is still served. A server that
- * predates build reporting is logged as an older build.
+ * predates build reporting is logged as an older build. A server that predates the client
+ * drain acknowledges the withdrawing advertise as any other: the client closes the stream
+ * at once instead of waiting out its grace.
  */
 @ExtendWith(OutputCaptureExtension.class)
 class WindowlessServerRejectionE2ETest {
@@ -98,6 +100,7 @@ class WindowlessServerRejectionE2ETest {
 				// one slot: a slot leaked by the rejection would refuse the windowed
 				// CONNECT
 				.maxConnections(1)
+				.drainGrace(Duration.ofMinutes(10))
 				.build())
 			.taskExecutor(task -> Thread.ofVirtual().name("e2e-windowless-server-worker").start(task))
 			.meterRegistry(this.clientMeters)
@@ -133,6 +136,20 @@ class WindowlessServerRejectionE2ETest {
 			.singleElement()
 			.satisfies(line -> assertThat(line).endsWith("[grpc://127.0.0.1:" + grpcPort + "] "
 					+ NodeConnection.SERVER_WINDOW_REQUIRED + "; rejecting conn " + WINDOWLESS_ID));
+
+		// the windowed connection is still open: an ack without withdrawn ends the drain
+		CountDownLatch drained = new CountDownLatch(1);
+		Thread.ofVirtual().start(() -> {
+			started.drain();
+			drained.countDown();
+		});
+		assertThat(drained.await(30, TimeUnit.SECONDS)).as("the drain ends before its grace").isTrue();
+		assertThat(this.fake.frames.stream()
+			.filter(frame -> frame.getBodyCase() == Frame.BodyCase.ADVERTISE)
+			.map(frame -> frame.getAdvertise().getWithdraw())).containsExactly(false, true);
+		assertThat(output.getAll()).contains("[grpc://127.0.0.1:" + grpcPort
+				+ "] the server predates the client drain (Advertise.withdraw) and keeps routing to this client; "
+				+ "closing the tunnel stream at once");
 	}
 
 	private int startEchoUpstream() throws Exception {
@@ -213,10 +230,13 @@ class WindowlessServerRejectionE2ETest {
 					FakeServer.this.frames.add(frame);
 					switch (frame.getBodyCase()) {
 						case ADVERTISE -> {
-							FakeServer.this.advertisedWindows.add(frame.getAdvertise().getConnectionWindow());
 							send(Frame.newBuilder()
 								.setAdvertiseAck(AdvertiseAck.newBuilder().setNodeId("windowless-server"))
 								.build());
+							if (frame.getAdvertise().getWithdraw()) {
+								return; // a server predating the field keeps the routes
+							}
+							FakeServer.this.advertisedWindows.add(frame.getAdvertise().getConnectionWindow());
 							send(Frame.newBuilder()
 								.setConnect(Connect.newBuilder()
 									.setConnId(WINDOWLESS_ID)

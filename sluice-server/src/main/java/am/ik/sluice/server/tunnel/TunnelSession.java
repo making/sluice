@@ -65,6 +65,13 @@ import io.grpc.Status;
  * its start, at debug otherwise, so streams opened and closed quickly cannot flood the
  * log; an advertise repeating the stream's routes and their outcome is logged at debug,
  * one changing them takes a permit of its own.
+ * <p>
+ * A client shutting down withdraws ({@code Advertise.withdraw}): its routes are removed
+ * and its ports released at once, so new connections go to the other clients serving
+ * them, while the connections open on the session keep relaying. Once none is left the
+ * session is sealed -- {@link #open} refuses from then on -- and the withdrawal is
+ * acknowledged ({@code AdvertiseAck.withdrawn}): no {@code Connect} follows that ack, and
+ * the client may end the stream.
  */
 public final class TunnelSession implements AutoCloseable {
 
@@ -136,6 +143,20 @@ public final class TunnelSession implements AutoCloseable {
 	private volatile @Nullable Thread advertiseDeadline;
 
 	private volatile boolean drained;
+
+	/**
+	 * Set by the client's withdrawing advertise, on {@link #advertiser}; never cleared.
+	 */
+	private volatile boolean withdrawn;
+
+	/**
+	 * Makes the seal and the registration of a connection by {@link #open} one step: no
+	 * connection is opened once the withdrawal was acknowledged.
+	 */
+	private final Object sealing = new Object();
+
+	/** Whether the withdrawal was acknowledged; guarded by {@link #sealing}. */
+	private boolean sealed;
 
 	/**
 	 * The client's per-connection receive window from its latest {@code Advertise}; 0
@@ -610,7 +631,7 @@ public final class TunnelSession implements AutoCloseable {
 			log.atLevel(level(Level.INFO)).log("client {} runs {}", this.clientId, described);
 		}
 		try {
-			this.advertiser.execute(() -> advertise(advertise.getUpstreamsList()));
+			this.advertiser.execute(() -> advertise(advertise));
 		}
 		catch (RejectedExecutionException e) {
 			// closed: the routes of a closed session are not registered again
@@ -629,11 +650,12 @@ public final class TunnelSession implements AutoCloseable {
 	 * On the first advertise registers the session, replacing the client id's previous
 	 * one, unless the registry refuses it: then the stream is failed with the refusal's
 	 * status and the session closed. Then registers the advertised routes and binds their
-	 * ports, and acknowledges. Runs on {@link #advertiser}. Skipped once the session is
-	 * closed: the route removal of {@link #close()} runs after every advertise started
+	 * ports, and acknowledges. A withdrawing advertise, and any after it, registers
+	 * nothing ({@link #withdraw}). Runs on {@link #advertiser}. Skipped once the session
+	 * is closed: the route removal of {@link #close()} runs after every advertise started
 	 * before it.
 	 */
-	private void advertise(List<Upstream> advertised) {
+	private void advertise(Advertise advertise) {
 		boolean first = false;
 		TunnelSession replaced = null;
 		SessionRegistry.Refusal refusal = null;
@@ -668,6 +690,11 @@ public final class TunnelSession implements AutoCloseable {
 		if (first) {
 			this.registered.accept(this);
 		}
+		if (advertise.getWithdraw() || this.withdrawn) {
+			withdraw();
+			return;
+		}
+		List<Upstream> advertised = advertise.getUpstreamsList();
 		int registered = this.router.register(this.clientId, advertised);
 		Set<Integer> rejected = Set.copyOf(this.tcpRoutes.reconcile(this.clientId, listenPorts(advertised)));
 		List<Upstream> upstreams = List.copyOf(advertised);
@@ -680,6 +707,70 @@ public final class TunnelSession implements AutoCloseable {
 			.setNodeId(this.nodeId)
 			.setBuild(this.serverBuild)
 			.build());
+	}
+
+	/**
+	 * Removes the client's routes and releases its ports on its first withdrawing
+	 * advertise, then acknowledges the withdrawal once no connection is left
+	 * ({@link #sealIfIdle}); an advertise after the seal is acknowledged at once, one
+	 * before it by the seal's ack. Runs on {@link #advertiser}.
+	 */
+	private void withdraw() {
+		boolean first = !this.withdrawn;
+		boolean sealedBefore;
+		synchronized (this.sealing) {
+			sealedBefore = this.sealed;
+		}
+		if (first) {
+			this.withdrawn = true;
+			this.router.remove(this.clientId);
+			this.tcpRoutes.reconcile(this.clientId, Set.of());
+			log.atLevel(level(Level.INFO))
+				.log("client {} withdrew its routes; draining {} connection(s)", this.clientId,
+						this.connections.size());
+		}
+		if (sealedBefore) {
+			sendWithdrawnAck();
+		}
+		else {
+			sealIfIdle();
+		}
+		if (first) {
+			// last: an empty route list tells the withdrawal was applied
+			this.upstreams = List.of();
+			this.rejectedPorts = Set.of();
+		}
+	}
+
+	/**
+	 * Seals a withdrawn session once no connection is left on it and acknowledges the
+	 * withdrawal; once only.
+	 */
+	private void sealIfIdle() {
+		if (!this.withdrawn) {
+			return;
+		}
+		synchronized (this.sealing) {
+			if (this.sealed || !this.connections.isEmpty()) {
+				return;
+			}
+			this.sealed = true;
+		}
+		log.atLevel(level(Level.INFO)).log("client {} drained; acknowledging its withdrawal", this.clientId);
+		sendWithdrawnAck();
+	}
+
+	private void sendWithdrawnAck() {
+		this.sender.sendAdvertiseAck(
+				AdvertiseAck.newBuilder().setNodeId(this.nodeId).setBuild(this.serverBuild).setWithdrawn(true).build());
+	}
+
+	/**
+	 * Whether the client withdrew its routes: it is shutting down, and the connections
+	 * open on the session are its last.
+	 */
+	public boolean withdrawn() {
+		return this.withdrawn;
 	}
 
 	/**
@@ -728,7 +819,9 @@ public final class TunnelSession implements AutoCloseable {
 	 * {@link VirtualConnection#DEFAULT_WINDOW} against the budget. Its send credit is the
 	 * client's window, known once the client advertised: a session is found for routing
 	 * only from then on. The connection carries bytes relayed without interpreting them.
-	 * @throws IllegalStateException when the client has not advertised yet
+	 * A withdrawn session still opens connections until it is sealed.
+	 * @throws IllegalStateException when the client has not advertised yet, or withdrew
+	 * and its withdrawal was acknowledged
 	 */
 	public VirtualConnection open(String address) {
 		return this.open(address, "");
@@ -738,20 +831,28 @@ public final class TunnelSession implements AutoCloseable {
 	 * Opens a virtual connection as {@link #open(String)} does, on which this side speaks
 	 * the given protocol (an ALPN id, {@code h2} or {@code http/1.1}): the client
 	 * negotiates it with a TLS upstream.
-	 * @throws IllegalStateException when the client has not advertised yet
+	 * @throws IllegalStateException when the client has not advertised yet, or withdrew
+	 * and its withdrawal was acknowledged
 	 */
 	public VirtualConnection open(String address, String applicationProtocol) {
 		long clientWindow = this.clientWindow;
 		if (clientWindow == 0) {
 			throw new IllegalStateException("client " + this.clientId + " has not advertised yet");
 		}
-		long connectionId = this.sequence.getAndIncrement();
-		VirtualConnection connection = VirtualConnection.builder(connectionId, this.sender)
-			.window(VirtualConnection.INITIAL_WINDOW, clientWindow)
-			.growWindow(VirtualConnection.DEFAULT_WINDOW, this.budget)
-			.creditWaited(this.creditWaited)
-			.build();
-		this.connections.put(connectionId, connection);
+		VirtualConnection connection;
+		long connectionId;
+		synchronized (this.sealing) {
+			if (this.sealed) {
+				throw new IllegalStateException("client " + this.clientId + " withdrew its routes");
+			}
+			connectionId = this.sequence.getAndIncrement();
+			connection = VirtualConnection.builder(connectionId, this.sender)
+				.window(VirtualConnection.INITIAL_WINDOW, clientWindow)
+				.growWindow(VirtualConnection.DEFAULT_WINDOW, this.budget)
+				.creditWaited(this.creditWaited)
+				.build();
+			this.connections.put(connectionId, connection);
+		}
 		this.sender.sendConnect(Connect.newBuilder()
 			.setConnId(connectionId)
 			.setAddress(address)
@@ -762,7 +863,9 @@ public final class TunnelSession implements AutoCloseable {
 	}
 
 	public void remove(long connectionId) {
-		this.connections.remove(connectionId);
+		if (this.connections.remove(connectionId) != null) {
+			sealIfIdle();
+		}
 	}
 
 	/**
@@ -904,8 +1007,9 @@ public final class TunnelSession implements AutoCloseable {
 		if (this.registry.find(this.clientId).isPresent()) {
 			return;
 		}
-		this.tcpRoutes.reconcile(this.clientId, Set.of());
+		// the routes first: a port released below is handed to another client serving it
 		this.router.remove(this.clientId);
+		this.tcpRoutes.reconcile(this.clientId, Set.of());
 	}
 
 }

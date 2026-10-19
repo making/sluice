@@ -45,6 +45,9 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	/** Default of {@code sluice.client.connect-timeout}. */
 	public static final Duration DEFAULT_CONNECT_TIMEOUT = Duration.ofSeconds(10);
 
+	/** Default of {@code sluice.client.drain-grace}. */
+	public static final Duration DEFAULT_DRAIN_GRACE = Duration.ofSeconds(20);
+
 	/**
 	 * Tunnel settings configured under {@code sluice.client}.
 	 *
@@ -71,11 +74,14 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	 * @param connectTimeout how long dialing an upstream may wait: for the TCP connect,
 	 * and then for each read of the TLS handshake of an {@code https} upstream; the
 	 * CONNECT is answered with an ERROR past it
+	 * @param drainGrace how long a stopping client keeps relaying the connections open
+	 * after it withdrew its routes from every server node; the ones left past it are
+	 * closed. {@code 0} = no drain, the connections are closed at once
 	 */
 	public record Client(@DefaultValue("") String id, @DefaultValue List<Upstream> upstream,
 			@DefaultValue("0") int maxConnections, @DefaultValue("60s") Duration tunnelStallTimeout,
 			@DefaultValue("0") DataSize tunnelBudget, @DefaultValue("60s") Duration tcpKeepAlive,
-			@DefaultValue("10s") Duration connectTimeout) {
+			@DefaultValue("10s") Duration connectTimeout, @DefaultValue("20s") Duration drainGrace) {
 
 		public Client {
 			id = id == null ? "" : id;
@@ -87,6 +93,7 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 			tcpKeepAlive = tcpKeepAlive == null || tcpKeepAlive.isNegative() ? DEFAULT_TCP_KEEP_ALIVE : tcpKeepAlive;
 			connectTimeout = connectTimeout == null || connectTimeout.isNegative() || connectTimeout.isZero()
 					? DEFAULT_CONNECT_TIMEOUT : connectTimeout;
+			drainGrace = drainGrace == null || drainGrace.isNegative() ? DEFAULT_DRAIN_GRACE : drainGrace;
 		}
 
 		public static Builder builder() {
@@ -108,6 +115,8 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 			private Duration tcpKeepAlive = DEFAULT_TCP_KEEP_ALIVE;
 
 			private Duration connectTimeout = DEFAULT_CONNECT_TIMEOUT;
+
+			private Duration drainGrace = DEFAULT_DRAIN_GRACE;
 
 			private Builder() {
 			}
@@ -147,9 +156,14 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 				return this;
 			}
 
+			public Builder drainGrace(Duration drainGrace) {
+				this.drainGrace = drainGrace;
+				return this;
+			}
+
 			public Client build() {
 				return new Client(this.id, this.upstream, this.maxConnections, this.tunnelStallTimeout,
-						this.tunnelBudget, this.tcpKeepAlive, this.connectTimeout);
+						this.tunnelBudget, this.tcpKeepAlive, this.connectTimeout, this.drainGrace);
 			}
 
 		}
@@ -182,6 +196,11 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	/** The configured upstream connect timeout. */
 	public Duration connectTimeout() {
 		return this.client == null ? DEFAULT_CONNECT_TIMEOUT : this.client.connectTimeout();
+	}
+
+	/** The configured drain grace; {@code 0} = no drain. */
+	public Duration drainGrace() {
+		return this.client == null ? DEFAULT_DRAIN_GRACE : this.client.drainGrace();
 	}
 
 	/**
@@ -258,6 +277,8 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 
 		private Duration connectTimeout = DEFAULT_CONNECT_TIMEOUT;
 
+		private Duration drainGrace = DEFAULT_DRAIN_GRACE;
+
 		@Nullable private String token;
 
 		@Nullable private String tokenFile;
@@ -315,6 +336,11 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 			return this;
 		}
 
+		public Builder drainGrace(Duration drainGrace) {
+			this.drainGrace = drainGrace;
+			return this;
+		}
+
 		public Builder token(String token) {
 			this.token = token;
 			return this;
@@ -360,6 +386,7 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 						.tunnelBudget(this.tunnelBudget)
 						.tcpKeepAlive(this.tcpKeepAlive)
 						.connectTimeout(this.connectTimeout)
+						.drainGrace(this.drainGrace)
 						.build(),
 					this.token == null ? "" : this.token, this.tokenFile, this.insecure, this.tlsBundle,
 					this.strictForwarding, this.keepAliveTime, this.keepAliveTimeout);

@@ -63,7 +63,8 @@ message Frame {
     Close close = 3;
     // Abnormal termination of `conn_id`.
     Error error = 4;
-    // client -> server: upstream announcement, sent once after connecting.
+    // client -> server: upstream announcement, sent after connecting, again
+    // when listen ports were rejected, and once with `withdraw` set on shutdown.
     Advertise advertise = 5;
     // Either direction: no-op liveness signal.
     KeepAlive keep_alive = 6;
@@ -120,6 +121,14 @@ message Advertise {
   uint32 connection_window = 2;
   // Build of the client; unset by clients that predate the field.
   PeerBuild build = 3;
+  // The client is shutting down: the server removes every route of the client
+  // and routes it no new connection, keeps relaying the ones open, and answers
+  // with an AdvertiseAck carrying `withdrawn` once none is left: no Connect
+  // follows that ack on the stream. Advertises after this one register nothing.
+  // `upstreams` is ignored; the client repeats its routes there, so a server
+  // predating the field registers them unchanged and acknowledges the advertise
+  // without `withdrawn`.
+  bool withdraw = 4;
 }
 
 // Which build a peer runs. Each string may be empty when the peer could not tell
@@ -186,6 +195,10 @@ message AdvertiseAck {
   string node_id = 2;
   // Build of the server that sent this ack; unset by servers that predate the field.
   PeerBuild build = 3;
+  // The answer to an Advertise with `withdraw`: the client's routes are removed
+  // and no connection is open or will be opened on the stream. Every ack the
+  // server sends after it carries it too.
+  bool withdrawn = 4;
 }
 
 message Upstream {

@@ -8,6 +8,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeSet;
@@ -51,8 +52,8 @@ import org.slf4j.event.Level;
  * ({@code listen-port} of an upstream), relaying every accepted connection verbatim -- no
  * head parsing, no rewriting -- over a virtual connection of the owning session, under
  * the verbatim idle timeout of the route. Listeners are bound on advertise and released
- * on session end; in-flight relays survive an unbind because each runs on its own
- * accepted socket.
+ * on session end or withdrawal, then bound again for another client serving the port;
+ * in-flight relays survive an unbind because each runs on its own accepted socket.
  */
 @Component
 public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoCloseable, Drainable {
@@ -192,6 +193,7 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 				this.listeners.remove(port, entry.getValue());
 				entry.getValue().close();
 				portLog(Level.INFO, "unbound tcp route port {} (client {})", port, clientId);
+				this.handOver(port, clientId);
 			}
 		}
 		Set<Integer> rejected = new TreeSet<>();
@@ -227,6 +229,27 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 			}
 		}
 		return Collections.unmodifiableSet(rejected);
+	}
+
+	/**
+	 * Binds a port just released by {@code from} for the client with the smallest id
+	 * among the others whose route on it is registered and whose session is live -- the
+	 * owner the advertises would have chosen -- so a port served by several clients stays
+	 * bound when its owner leaves. Without one the port stays unbound.
+	 */
+	private void handOver(int port, String from) {
+		String key = Integer.toString(port);
+		this.router.tcpRoutes()
+			.stream()
+			.filter(group -> group.key().equals(key))
+			.flatMap(group -> group.candidates().stream())
+			.map(Router.Route::clientId)
+			.filter(clientId -> !clientId.equals(from) && this.sessions.find(clientId).isPresent())
+			.min(Comparator.naturalOrder())
+			.ifPresent(clientId -> {
+				portLog(Level.INFO, "tcp route port {} handed over from client {} to client {}", port, from, clientId);
+				this.bind(clientId, port);
+			});
 	}
 
 	/**

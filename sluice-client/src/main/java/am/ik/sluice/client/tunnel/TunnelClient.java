@@ -1,14 +1,20 @@
 package am.ik.sluice.client.tunnel;
 
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.SplittableRandom;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import java.util.random.RandomGenerator;
@@ -40,6 +46,11 @@ import org.springframework.stereotype.Component;
  * {@code sluice.server-url} is the bootstrap; the node list learned via {@code ListNodes}
  * and membership updates opens one stream per node (keyed by node id) and closes streams
  * of nodes that left. All membership transitions run on a single-threaded executor.
+ * <p>
+ * Stopped by the application context ({@link #stop(Runnable)}), it drains first
+ * ({@link #drain()}): the routes are withdrawn from every node and the connections open
+ * keep relaying until they end or {@code sluice.client.drain-grace} runs out.
+ * {@link #stop()} closes at once.
  */
 @Component
 public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
@@ -76,6 +87,12 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 	private final Supplier<RandomGenerator> randomFactory;
 
 	private volatile boolean running;
+
+	/** Set once the drain began: no stream is opened from then on. */
+	private volatile boolean draining;
+
+	/** Completed to end a drain at once ({@link #abortDrain()}). */
+	private final CompletableFuture<Void> abort = new CompletableFuture<>();
 
 	@Autowired
 	TunnelClient(SluiceClientProperties properties, @Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor,
@@ -263,7 +280,7 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 
 	@Override
 	public void onConnected(NodeConnection connection, String nodeId) {
-		this.supervisor.execute(() -> {
+		this.supervise(() -> {
 			// rename the connection after the node id is known, so the bootstrap
 			// connection becomes the stream of that node instead of a duplicate
 			if (!nodeId.isBlank()) {
@@ -302,7 +319,20 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 
 	@Override
 	public void onMembership(List<am.ik.sluice.v1.proto.Node> nodes, long membershipVersion) {
-		this.supervisor.execute(() -> this.reconcile(nodes));
+		this.supervise(() -> this.reconcile(nodes));
+	}
+
+	/**
+	 * Runs a membership transition on the supervisor; dropped once stopping or draining,
+	 * when the supervisor is shut down.
+	 */
+	private void supervise(Runnable transition) {
+		try {
+			this.supervisor.execute(transition);
+		}
+		catch (RejectedExecutionException e) {
+			// stopping: no stream is opened any more
+		}
 	}
 
 	private @org.jspecify.annotations.Nullable NodeConnection byEndpoint(String url) {
@@ -326,7 +356,7 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 	 * listed node without a public url.
 	 */
 	private void reconcile(List<am.ik.sluice.v1.proto.Node> nodes) {
-		if (!this.running || nodes.isEmpty()) {
+		if (!this.running || this.draining || nodes.isEmpty()) {
 			return;
 		}
 		for (am.ik.sluice.v1.proto.Node node : nodes) {
@@ -353,6 +383,79 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 		// close streams of nodes that left the membership
 		java.util.List<String> nodeIds = nodes.stream().map(am.ik.sluice.v1.proto.Node::getNodeId).toList();
 		this.connectionsByNode.keySet().retainAll(nodeIds);
+	}
+
+	/**
+	 * Drains, then closes: the application context's stop, which waits for it.
+	 */
+	@Override
+	public void stop(Runnable callback) {
+		try {
+			drain();
+		}
+		finally {
+			stop();
+			callback.run();
+		}
+	}
+
+	/**
+	 * Withdraws the routes from every node and waits until each node acknowledged the
+	 * withdrawal and the connections open on it ended, at most
+	 * {@code sluice.client.drain-grace} or until {@link #abortDrain()}; no stream is
+	 * opened or reconnected meanwhile. Returns at once with a zero grace or when not
+	 * running. The connections still open afterwards are left to {@link #stop()}.
+	 */
+	public void drain() {
+		Duration grace = this.properties.drainGrace();
+		if (!this.running || this.draining || grace.isZero()) {
+			return;
+		}
+		this.draining = true;
+		// no membership change opens a stream behind the snapshot below
+		this.supervisor.shutdownNow();
+		try {
+			this.supervisor.awaitTermination(5, TimeUnit.SECONDS);
+		}
+		catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			return;
+		}
+		List<NodeConnection> connections = List.copyOf(this.connectionsByNode.values());
+		log.info("draining: withdrawing the routes from {} server node(s); waiting up to {} for {} open connection(s)",
+				connections.size(), grace, openConnections());
+		CompletableFuture<?>[] drains = connections.stream()
+			.map(NodeConnection::beginDrain)
+			.toArray(CompletableFuture<?>[]::new);
+		try {
+			CompletableFuture.anyOf(CompletableFuture.allOf(drains), this.abort)
+				.get(grace.toNanos(), TimeUnit.NANOSECONDS);
+			if (this.abort.isDone()) {
+				log.warn("drain aborted; closing {} open connection(s)", openConnections());
+			}
+			else {
+				log.info("drain ended with {} open connection(s)", openConnections());
+			}
+		}
+		catch (TimeoutException e) {
+			log.warn("drain grace {} expired; closing {} open connection(s)", grace, openConnections());
+		}
+		catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
+		catch (ExecutionException e) {
+			// the futures complete normally only
+			log.warn("drain failed; closing {} open connection(s)", openConnections(), e);
+		}
+	}
+
+	/** Ends a drain in progress at once, and any drain begun later. */
+	public void abortDrain() {
+		this.abort.complete(null);
+	}
+
+	private int openConnections() {
+		return this.connectionsByNode.values().stream().mapToInt(NodeConnection::activeConnections).sum();
 	}
 
 	@Override

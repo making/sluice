@@ -605,6 +605,22 @@ final class ReroutingRelay {
 			if (old != null && !old.ended) {
 				old.replaced = true; // its EOF from now on is the switch, not the end
 				this.awaitDrained(old);
+				if (resolved.session().withdrawn()) {
+					// its client began shutting down while the old leg finished: the
+					// request goes to a client staying
+					resolved = resolveOrRespond(head, host);
+					if (resolved == null) {
+						return;
+					}
+					route = resolved.route();
+					verdict = this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head));
+					if (!(verdict instanceof Verdict.Pass passed)) {
+						this.access.refused(route.routeTag(), ConnectionHeadParser.http1RequestOf(head), verdict);
+						this.refusal = this.errorResponse.refusal(ConnectionHeadParser.Head.http1(head, host), verdict);
+						return;
+					}
+					pass = passed;
+				}
 			}
 			leg = new Leg(route, resolved.session());
 			this.legs.add(leg);

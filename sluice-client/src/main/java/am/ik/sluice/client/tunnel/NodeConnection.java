@@ -8,9 +8,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.SplittableRandom;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.random.RandomGenerator;
@@ -57,6 +60,13 @@ import org.springframework.core.task.TaskExecutor;
  * range) are re-advertised on the same stream with the same backoff, so the other routes
  * stay up. The lifecycle of the per-node virtual connections lives here; the fan-out
  * across nodes is the supervisor's ({@link TunnelClient}) concern.
+ * <p>
+ * {@link #beginDrain()} withdraws the routes ({@code Advertise.withdraw}) and stops
+ * reconnecting; the connections open keep relaying. Once the server acknowledged the
+ * withdrawal ({@code AdvertiseAck.withdrawn}: no {@code Connect} follows) and the last
+ * connection's frames left the sender, the stream is ended. A server acknowledging the
+ * withdrawing advertise without {@code withdrawn} predates it and keeps routing here: the
+ * stream is closed at once.
  */
 public final class NodeConnection implements AutoCloseable {
 
@@ -110,6 +120,46 @@ public final class NodeConnection implements AutoCloseable {
 
 	/** The routes, the receive window and the build, sent on every stream. */
 	private final Advertise advertise;
+
+	/** {@link #advertise} withdrawing the routes, sent once by {@link #beginDrain()}. */
+	private final Advertise withdrawal;
+
+	/**
+	 * Makes the stream's advertises, the count of its acks and the start of the drain one
+	 * order.
+	 */
+	private final Object drainLock = new Object();
+
+	/**
+	 * Whether the stream is up with its advertise sent; guarded by {@link #drainLock}.
+	 */
+	private boolean live;
+
+	/** Advertises sent on the current stream; guarded by {@link #drainLock}. */
+	private int advertisesSent;
+
+	/** Acks received on the current stream; guarded by {@link #drainLock}. */
+	private int acksReceived;
+
+	/**
+	 * The ordinal of the withdrawing advertise among the stream's advertises; 0 = not
+	 * sent. Guarded by {@link #drainLock}.
+	 */
+	private int withdrawalOrdinal;
+
+	private volatile boolean draining;
+
+	/** The server acknowledged the withdrawal: no CONNECT follows on the stream. */
+	private volatile boolean withdrawn;
+
+	/** Accepted connections whose slot is not released yet. */
+	private final AtomicInteger held = new AtomicInteger();
+
+	/** Whether the drained stream is being ended. */
+	private final AtomicBoolean ending = new AtomicBoolean();
+
+	/** Completes once the connect/reconnect loop ended. */
+	private final CompletableFuture<Void> ended = new CompletableFuture<>();
 
 	private final ConcurrentHashMap<Long, VirtualConnection> connections = new ConcurrentHashMap<>();
 
@@ -175,6 +225,7 @@ public final class NodeConnection implements AutoCloseable {
 			.setConnectionWindow(VirtualConnection.INITIAL_WINDOW)
 			.setBuild(builder.clientBuild)
 			.build();
+		this.withdrawal = this.advertise.toBuilder().setWithdraw(true).build();
 		String metricsTag = this.nodeId.isBlank() ? this.url : this.nodeId;
 		MeterRegistry meterRegistry = Objects.requireNonNull(builder.meterRegistry, "meterRegistry is required");
 		this.reconnects = Counter.builder("sluice.reconnect.total")
@@ -373,6 +424,15 @@ public final class NodeConnection implements AutoCloseable {
 	}
 
 	private void runLoop() {
+		try {
+			loop();
+		}
+		finally {
+			this.ended.complete(null);
+		}
+	}
+
+	private void loop() {
 		while (this.running) {
 			try {
 				this.channel = buildChannel();
@@ -394,7 +454,7 @@ public final class NodeConnection implements AutoCloseable {
 				shutdownChannel();
 				this.connected = false;
 			}
-			if (!this.running) {
+			if (!this.running || this.draining) {
 				return;
 			}
 			// the next loop iteration is the reconnection attempt
@@ -505,8 +565,27 @@ public final class NodeConnection implements AutoCloseable {
 			return; // stream failed before starting
 		}
 		this.readvertiseBackoff.reset();
-		sender.sendAdvertise(this.advertise);
-		closed.await();
+		synchronized (this.drainLock) {
+			if (this.draining) {
+				// the drain began while connecting: nothing is routed here, nothing is
+				// advertised; the loop's teardown cancels the call
+				sender.close();
+				return;
+			}
+			this.advertisesSent = 0;
+			this.acksReceived = 0;
+			this.withdrawalOrdinal = 0;
+			sendAdvertiseLocked(sender, this.advertise);
+			this.live = true;
+		}
+		try {
+			closed.await();
+		}
+		finally {
+			synchronized (this.drainLock) {
+				this.live = false;
+			}
+		}
 		// the sender first, as in TunnelSession#close: a dead or stalled stream must not
 		// leave the connection teardown below waiting on a full send queue (closing the
 		// sender releases every producer); from here on the frames of the closing
@@ -563,14 +642,69 @@ public final class NodeConnection implements AutoCloseable {
 		VirtualConnection connection = this.connections.remove(connectionId);
 		ConnectionLimit.Permit permit = this.permits.remove(connectionId);
 		if (permit != null) {
+			Runnable release = () -> {
+				permit.release();
+				if (this.held.decrementAndGet() == 0) {
+					endIfDrained();
+				}
+			};
 			if (connection != null) {
-				connection.afterQueued(permit::release);
+				connection.afterQueued(release);
 			}
 			else {
-				permit.release();
+				release.run();
 			}
 		}
 		return connection;
+	}
+
+	/** Counts the advertise sent on the stream; with {@link #drainLock}. */
+	private int sendAdvertiseLocked(SessionSender sender, Advertise advertise) {
+		this.advertisesSent++;
+		sender.sendAdvertise(advertise);
+		return this.advertisesSent;
+	}
+
+	/**
+	 * Withdraws the routes on the stream and stops reconnecting; the connections open
+	 * keep relaying. Without a stream up the loop just ends: no route of this client is
+	 * served through it. Idempotent.
+	 * @return completes once the loop ended: the stream drained and ended, failed, or was
+	 * closed
+	 */
+	CompletableFuture<Void> beginDrain() {
+		synchronized (this.drainLock) {
+			if (this.draining) {
+				return this.ended;
+			}
+			this.draining = true;
+			SessionSender sender = this.senderRef.get();
+			if (this.live && sender != null) {
+				this.withdrawalOrdinal = sendAdvertiseLocked(sender, this.withdrawal);
+				log.info("[{}] withdrawing the routes; {} connection(s) open", this.key, this.connections.size());
+				return this.ended;
+			}
+		}
+		close();
+		// a loop sleeping before its next attempt ends only when it wakes
+		this.ended.complete(null);
+		return this.ended;
+	}
+
+	/**
+	 * Ends the stream of a withdrawn client once no connection holds a slot: a half-close
+	 * the server answers by ending its side, which ends the loop. Once only.
+	 */
+	private void endIfDrained() {
+		if (!this.withdrawn || this.held.get() != 0 || !this.ending.compareAndSet(false, true)) {
+			return;
+		}
+		log.info("[{}] drained; ending the tunnel stream", this.key);
+		SessionSender sender = this.senderRef.get();
+		if (sender != null) {
+			// off the caller: the sender's own worker may be releasing the last slot
+			Thread.ofVirtual().name("sluice-drained-" + this.key).start(sender::close);
+		}
 	}
 
 	/**
@@ -626,6 +760,7 @@ public final class NodeConnection implements AutoCloseable {
 					.creditWaited(this.creditWaits::increment)
 					.build();
 				this.permits.put(request.getConnId(), permit);
+				this.held.incrementAndGet();
 				this.connections.put(request.getConnId(), connection);
 				try {
 					this.taskExecutor.execute(() -> dial(request, connection));
@@ -664,6 +799,28 @@ public final class NodeConnection implements AutoCloseable {
 			}
 			case ADVERTISE_ACK -> {
 				AdvertiseAck ack = frame.getAdvertiseAck();
+				boolean answersWithdrawal;
+				synchronized (this.drainLock) {
+					this.acksReceived++;
+					answersWithdrawal = this.withdrawalOrdinal > 0 && this.acksReceived >= this.withdrawalOrdinal;
+				}
+				if (ack.getWithdrawn()) {
+					if (!this.withdrawn) {
+						// before the flag: a slot released once it is set may end the
+						// stream
+						log.info("[{}] server acknowledged the withdrawal; {} connection(s) left", this.key,
+								this.held.get());
+						this.withdrawn = true;
+					}
+					endIfDrained();
+					return;
+				}
+				if (answersWithdrawal) {
+					log.warn("[{}] the server predates the client drain (Advertise.withdraw) and keeps routing to "
+							+ "this client; closing the tunnel stream at once", this.key);
+					close();
+					return;
+				}
 				List<Integer> rejected = ack.getRejectedPortsList();
 				String ackNodeId = ack.getNodeId();
 				if (!ackNodeId.isBlank()) {
@@ -678,7 +835,9 @@ public final class NodeConnection implements AutoCloseable {
 					log.warn("[{}] server rejected listen ports {}; re-advertising in {}ms", this.key, rejected,
 							delay.toMillis());
 					this.rejectedAdvertises.increment();
-					readvertiseAfter(delay, closed);
+					if (!this.draining) {
+						readvertiseAfter(delay, closed);
+					}
 				}
 				if (!this.connected) {
 					// the first advertise is acknowledged: the tunnel is up for real; the
@@ -722,8 +881,11 @@ public final class NodeConnection implements AutoCloseable {
 				return;
 			}
 			SessionSender sender = this.senderRef.get();
-			if (sender != null) {
-				sender.sendAdvertise(this.advertise);
+			synchronized (this.drainLock) {
+				// a withdrawal sent meanwhile stays the last word
+				if (sender != null && this.live && !this.draining) {
+					sendAdvertiseLocked(sender, this.advertise);
+				}
 			}
 		});
 	}

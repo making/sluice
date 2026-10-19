@@ -188,7 +188,7 @@ class ConsoleView {
 				.connectionsOpened(session.connectionsOpened())
 				.inbound(Humanize.bytes(session.bytesInbound()))
 				.outbound(Humanize.bytes(session.bytesOutbound()))
-				.draining(session.drained())
+				.draining(session.drained() || session.withdrawn())
 				.peerBuild(peerBuild(session.clientBuild().orElse(null)))
 				.upstreams(session.upstreams()
 					.stream()
