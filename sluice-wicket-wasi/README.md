@@ -144,7 +144,7 @@ lines, prefixed with the component and a request id
 - the tunnel stream is served by `hyper` (http/1.1 and h2c, sniffed from the
   first bytes) through an `AsyncRead`/`AsyncWrite` adapter over the frame
   channels; no loopback sockets
-- per-connection flow control as in the root README: the wicket announces a
+- per-connection flow control as in `.kb/tunnel-flow-control.md`: the wicket announces a
   1MiB receive window per connection (fixed: it does not grow or shrink it)
   and grants back what hyper read; its writes send only against the server's
   grants, the server's initial window (64KiB) and what it grants beyond. A

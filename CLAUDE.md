@@ -31,6 +31,10 @@ The data plane relays raw bytes (the request head is inspected for routing; with
 - Console E2E tests use Playwright (`ConsoleE2ETest`); the first run downloads Chromium.
 - `.todo` numbers come from `.todo/claim-number.sh`.
 
+## Knowledge base
+
+README.md is for users; detailed behavior (flow control, connection limits, h2 demux, metrics) lives in `.kb/<topic>.md`. Keep the README summary in sync when a `.kb` file changes.
+
 ## Manual E2E check
 
 See "Run" in README.md.

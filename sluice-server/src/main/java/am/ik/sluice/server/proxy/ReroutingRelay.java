@@ -99,7 +99,9 @@ final class ReroutingRelay {
 
 	private static final String METRIC_NAME = "sluice.tunnel.bytes";
 
-	/** What a probe writes; README "Connection limits" tells why a 100. */
+	/**
+	 * What a probe writes; .kb/connection-limits.md "Half-close probes" tells why a 100.
+	 */
 	private static final byte[] PROBE = "HTTP/1.1 100 Continue\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
 
 	/**
