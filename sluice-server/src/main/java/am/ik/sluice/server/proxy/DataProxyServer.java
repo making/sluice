@@ -159,13 +159,52 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	record Connection(Socket socket, DuplexPipe pipe, ConnectionHeadParser.Head head, @Nullable InetAddress peer,
 			@Nullable TlsHandshake handshake) {
 
-		static Connection of(Socket socket, ConnectionHeadParser.Head head, @Nullable InetAddress peer) {
-			return of(socket, head, peer, null);
+		static Builder builder() {
+			return new Builder();
 		}
 
-		static Connection of(Socket socket, ConnectionHeadParser.Head head, @Nullable InetAddress peer,
-				@Nullable TlsHandshake handshake) {
-			return new Connection(socket, DuplexPipe.of(socket), head, peer, handshake);
+		static final class Builder {
+
+			private @Nullable Socket socket;
+
+			private ConnectionHeadParser.@Nullable Head head;
+
+			private @Nullable InetAddress peer;
+
+			private @Nullable TlsHandshake handshake;
+
+			private Builder() {
+			}
+
+			/** The transport socket; the pipe is its view. */
+			Builder socket(Socket socket) {
+				this.socket = socket;
+				return this;
+			}
+
+			Builder head(ConnectionHeadParser.Head head) {
+				this.head = head;
+				return this;
+			}
+
+			/** The connection peer; null (the default) = the socket peer. */
+			Builder peer(@Nullable InetAddress peer) {
+				this.peer = peer;
+				return this;
+			}
+
+			/** The handshake the data plane terminated; null (the default) when none. */
+			Builder handshake(@Nullable TlsHandshake handshake) {
+				this.handshake = handshake;
+				return this;
+			}
+
+			Connection build() {
+				Socket socket = Objects.requireNonNull(this.socket, "socket is required");
+				return new Connection(socket, DuplexPipe.of(socket),
+						Objects.requireNonNull(this.head, "head is required"), this.peer, this.handshake);
+			}
+
 		}
 
 	}
@@ -364,7 +403,11 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				// relay the TLS records untouched; the upstream terminates TLS
 				log.debug("tls passthrough; sni={}", hello.sni());
 				access.transport("tls-passthrough");
-				return Connection.of(socket, ConnectionHeadParser.Head.encrypted(hello.bytes(), hello.sni()), peer);
+				return Connection.builder()
+					.socket(socket)
+					.head(ConnectionHeadParser.Head.encrypted(hello.bytes(), hello.sni()))
+					.peer(peer)
+					.build();
 			}
 			SSLSocketFactory factory = this.tlsFactory();
 			if (factory == null) {
@@ -415,7 +458,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		if (head.host() == null && sni.get() != null) {
 			head = head.withHost(sni.get());
 		}
-		return Connection.of(socket, head, peer, handshake);
+		return Connection.builder().socket(socket).head(head).peer(peer).handshake(handshake).build();
 	}
 
 	/**
