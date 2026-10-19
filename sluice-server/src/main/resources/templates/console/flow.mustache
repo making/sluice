@@ -11,14 +11,22 @@
 
   <g class="intakes">
     {{#intakes}}
-    <g id="intake{{port}}" class="lane{{#active}} is-active{{/active}}{{#gated}} is-gated{{/gated}}">
+    <g id="intake{{port}}" class="lane{{#active}} is-active{{/active}}">
       <path class="bank ink" pathLength="1" d="{{path}}"/>
       <path class="bed" d="{{path}}"/>
       <path class="water" d="{{path}}" style="--w: {{strokeWidth}}px"/>
       <path class="stream" d="{{path}}" style="--dur: {{duration}}"/>
-      {{#gated}}<g class="gate-shut" data-gate="shut"><line x1="352" y1="{{leafTop}}" x2="362" y2="{{lane.y}}"/><line x1="352" y1="{{leafBottom}}" x2="362" y2="{{lane.y}}"/></g>{{/gated}}
+      {{#gated}}
+      <g class="headgate" data-testid="headgate" data-closed="{{closed}}">
+        <title>{{shutLabel}}</title>
+        <rect class="pier" x="{{pierX}}" y="{{pierTop}}" width="{{pierWidth}}" height="{{pierHeight}}"/>
+        <rect class="pier" x="{{pierX}}" y="{{pierBottom}}" width="{{pierWidth}}" height="{{pierHeight}}"/>
+        <path class="headgate__leaf" d="{{leaf}}"/>
+      </g>
+      {{/gated}}
       <text class="label" x="40" y="{{lane.labelY}}"><tspan class="mono strong">{{port}}</tspan> {{protocol}}</text>
-      <text class="detail" x="40" y="{{lane.detailY}}">{{detail}}{{#active}}, {{open}} open{{/active}}{{#gated}}, {{shutLabel}}{{/gated}}</text>
+      <text class="detail" x="40" y="{{lane.detailY}}">{{detail}}{{#active}}, {{open}} open{{/active}}</text>
+      {{#gated}}<text class="detail detail--shut" x="40" y="{{shutY}}">{{shutLabel}}</text>{{/gated}}
     </g>
     {{/intakes}}
   </g>

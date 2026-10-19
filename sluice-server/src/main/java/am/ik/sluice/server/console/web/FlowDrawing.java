@@ -29,6 +29,24 @@ public record FlowDrawing(List<Intake> intakes, List<Outlet> outlets, int openCo
 
 	static final int INTAKE_START = 300;
 
+	/** End of the straight lead-in of an intake channel, where it starts to bend. */
+	static final int INTAKE_BEND = 330;
+
+	/** Centre line of an intake's headgate, on the straight lead-in. */
+	static final int HEADGATE = 315;
+
+	/** Depth of a headgate pier beyond its bank. */
+	static final int PIER = 6;
+
+	static final int PIER_WIDTH = 8;
+
+	/**
+	 * Tip of an ajar headgate leaf from its hinge: a channel-long leaf swung 40 degrees.
+	 */
+	static final int LEAF_AJAR_DX = 9;
+
+	static final int LEAF_AJAR_DY = 11;
+
 	static final int CONDUIT_IN = 470;
 
 	static final int GATE = 600;
@@ -244,12 +262,16 @@ public record FlowDrawing(List<Intake> intakes, List<Outlet> outlets, int openCo
 	}
 
 	/**
-	 * A public listener feeding the lock.
+	 * A public listener feeding the lock. While the console has shut routes behind it, a
+	 * headgate stands on the straight lead-in of its channel: its leaf, hinged on the
+	 * upper bank, closes across the channel when every route is shut and stands ajar
+	 * downstream otherwise.
 	 *
 	 * @param open connections currently relayed from the listener
+	 * @param routes routes behind the listener
 	 * @param shutRoutes routes behind the listener whose gate the console shut
 	 */
-	public record Intake(String port, String protocol, String detail, int open, int shutRoutes, Lane lane) {
+	public record Intake(String port, String protocol, String detail, int open, int routes, int shutRoutes, Lane lane) {
 
 		public boolean active() {
 			return this.open > 0;
@@ -260,24 +282,65 @@ public record FlowDrawing(List<Intake> intakes, List<Outlet> outlets, int openCo
 			return this.shutRoutes > 0;
 		}
 
-		/** The gate note appended to the detail line. */
+		/** Whether every route behind the listener is gated shut. */
+		public boolean closed() {
+			return this.gated() && this.shutRoutes >= this.routes;
+		}
+
+		/** The gate note on the line below the detail. */
 		public String shutLabel() {
-			return this.shutRoutes + (this.shutRoutes == 1 ? " route shut" : " routes shut");
+			if (this.routes <= 1) {
+				return "Route shut";
+			}
+			return this.closed() ? "All " + this.routes + " routes shut"
+					: this.shutRoutes + " of " + this.routes + " routes shut";
 		}
 
-		/** The closed mitre leaves: hinge points on the banks, meeting downstream. */
-		public int leafTop() {
-			return this.lane.y() - 7;
+		/** Baseline of the gate note. */
+		public int shutY() {
+			return this.lane.detailY() + 16;
 		}
 
-		public int leafBottom() {
-			return this.lane.y() + 7;
+		/** Left edge of the headgate piers. */
+		public int pierX() {
+			return HEADGATE - PIER_WIDTH / 2;
+		}
+
+		public int pierWidth() {
+			return PIER_WIDTH;
+		}
+
+		/** Top edge of the pier on the upper bank. */
+		public int pierTop() {
+			return this.lane.y() - CHANNEL / 2 - PIER;
+		}
+
+		/** Top edge of the pier on the lower bank. */
+		public int pierBottom() {
+			return this.lane.y() + CHANNEL / 2;
+		}
+
+		public int pierHeight() {
+			return PIER;
+		}
+
+		/**
+		 * The headgate leaf, hinged on the upper bank: across the channel when closed,
+		 * swung downstream otherwise.
+		 */
+		public String leaf() {
+			int hinge = this.lane.y() - CHANNEL / 2;
+			if (this.closed()) {
+				return "M " + HEADGATE + " " + hinge + " V " + (hinge + CHANNEL);
+			}
+			return "M " + HEADGATE + " " + hinge + " L " + (HEADGATE + LEAF_AJAR_DX) + " " + (hinge + LEAF_AJAR_DY);
 		}
 
 		public String path() {
 			int y = this.lane.y();
 			int cy = this.lane.cy();
-			return "M " + INTAKE_START + " " + y + " C 400 " + y + " 380 " + cy + " " + CONDUIT_IN + " " + cy;
+			return "M " + INTAKE_START + " " + y + " H " + INTAKE_BEND + " C 412 " + y + " 396 " + cy + " " + CONDUIT_IN
+					+ " " + cy;
 		}
 
 		public String duration() {
@@ -301,6 +364,8 @@ public record FlowDrawing(List<Intake> intakes, List<Outlet> outlets, int openCo
 			private String detail = "";
 
 			private int open;
+
+			private int routes;
 
 			private int shutRoutes;
 
@@ -327,6 +392,11 @@ public record FlowDrawing(List<Intake> intakes, List<Outlet> outlets, int openCo
 				return this;
 			}
 
+			public Builder routes(int routes) {
+				this.routes = routes;
+				return this;
+			}
+
 			public Builder shutRoutes(int shutRoutes) {
 				this.shutRoutes = shutRoutes;
 				return this;
@@ -335,7 +405,7 @@ public record FlowDrawing(List<Intake> intakes, List<Outlet> outlets, int openCo
 			Intake build(Lane lane) {
 				return new Intake(Objects.requireNonNull(this.port, "port is required"),
 						Objects.requireNonNull(this.protocol, "protocol is required"), this.detail, this.open,
-						this.shutRoutes, lane);
+						this.routes, this.shutRoutes, lane);
 			}
 
 		}

@@ -127,8 +127,8 @@ class ConsoleView {
 
 	FlowDrawing flow() {
 		List<TunnelSession> live = this.liveSessions();
-		long shutHttp = this.router.httpRoutes()
-			.stream()
+		List<Router.RouteGroup> httpRoutes = this.router.httpRoutes();
+		long shutHttp = httpRoutes.stream()
 			.filter(group -> !this.router.gate().isOpen(group.key().isEmpty() ? "*" : group.key()))
 			.count();
 		FlowDrawing.Builder drawing = FlowDrawing.builder()
@@ -137,6 +137,7 @@ class ConsoleView {
 				.protocol(this.properties.dataTlsBundle() == null ? "HTTP" : "HTTP + TLS")
 				.detail("Routed by Host header or SNI")
 				.open(this.dataProxyServer.activeConnections())
+				.routes(httpRoutes.size())
 				.shutRoutes((int) shutHttp));
 		this.tcpPortGateway.bindings()
 			.forEach((port,
@@ -145,6 +146,7 @@ class ConsoleView {
 						.protocol("TCP")
 						.detail("Relayed to " + FlowDrawing.truncate(binding.clientId(), 18))
 						.open(binding.activeConnections())
+						.routes(1)
 						.shutRoutes(this.router.gate().isOpen("tcp:" + port) ? 0 : 1)));
 		Map<String, Duties> duties = this.duties();
 		live.forEach(session -> {

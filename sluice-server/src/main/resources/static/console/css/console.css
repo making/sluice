@@ -818,10 +818,21 @@ code {
 	border-color: var(--ink);
 }
 
-.gate-shut line {
+/* a headgate on an intake's lead-in: its leaf closes across the channel when every route
+   behind the listener is shut and stands ajar when some are */
+.pier {
+	fill: var(--ink-soft);
+	stroke: var(--ink);
+	stroke-width: 1;
+}
+
+.headgate__leaf {
 	stroke: var(--amber);
 	stroke-width: 3;
-	stroke-linecap: round;
+}
+
+.drawing .detail--shut {
+	fill: var(--amber);
 }
 
 /* ------------------------------------------------------------------- aside */

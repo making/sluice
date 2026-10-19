@@ -1,5 +1,7 @@
 package am.ik.sluice.server.console.web;
 
+import java.util.List;
+
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -25,8 +27,8 @@ class FlowDrawingTest {
 		assertThat(drawing.intakes()).extracting(intake -> intake.lane().y())
 			.containsExactly(cy - FlowDrawing.ROW, cy, cy + FlowDrawing.ROW);
 		assertThat(drawing.outlets()).extracting(outlet -> outlet.lane().y()).containsExactly(cy);
-		assertThat(drawing.intakes().get(0).path()).isEqualTo(
-				"M 300 " + (cy - FlowDrawing.ROW) + " C 400 " + (cy - FlowDrawing.ROW) + " 380 " + cy + " 470 " + cy);
+		assertThat(drawing.intakes().get(0).path()).isEqualTo("M 300 " + (cy - FlowDrawing.ROW) + " H 330 C 412 "
+				+ (cy - FlowDrawing.ROW) + " 396 " + cy + " 470 " + cy);
 	}
 
 	@Test
@@ -70,17 +72,36 @@ class FlowDrawingTest {
 	}
 
 	@Test
-	void shutRoutesMarkTheIntakeWithALoweredGate() {
+	void shutRoutesRaiseAHeadgateOnTheIntakeLeadIn() {
 		FlowDrawing drawing = FlowDrawing.builder()
-			.intake(FlowDrawing.Intake.builder().port(":8000").protocol("HTTP").open(0).shutRoutes(2))
-			.intake(FlowDrawing.Intake.builder().port(":9100").protocol("TCP").open(0))
+			.intake(FlowDrawing.Intake.builder().port(":8000").protocol("HTTP").routes(3).shutRoutes(1))
+			.intake(FlowDrawing.Intake.builder().port(":8443").protocol("HTTP").routes(2).shutRoutes(2))
+			.intake(intake(":9100", 0).routes(1).shutRoutes(1))
+			.intake(intake(":9101", 0).routes(1))
 			.build();
-		FlowDrawing.Intake gated = drawing.intakes().get(0);
-		assertThat(gated.gated()).isTrue();
-		assertThat(gated.shutLabel()).isEqualTo("2 routes shut");
-		assertThat(gated.leafTop()).isEqualTo(gated.lane().y() - 7);
-		assertThat(gated.leafBottom()).isEqualTo(gated.lane().y() + 7);
-		assertThat(drawing.intakes().get(1).gated()).isFalse();
+		FlowDrawing.Intake partial = drawing.intakes().get(0);
+		FlowDrawing.Intake closed = drawing.intakes().get(1);
+		FlowDrawing.Intake tcp = drawing.intakes().get(2);
+		assertThat(partial.shutLabel()).isEqualTo("1 of 3 routes shut");
+		assertThat(closed.shutLabel()).isEqualTo("All 2 routes shut");
+		assertThat(tcp.shutLabel()).isEqualTo("Route shut");
+		assertThat(drawing.intakes().get(3).gated()).isFalse();
+		// the outer lanes bend furthest; their gates still stand on the straight lead-in,
+		// piers on the banks
+		for (FlowDrawing.Intake intake : List.of(partial, tcp)) {
+			int y = intake.lane().y();
+			assertThat(y).isNotEqualTo(drawing.cy());
+			assertThat(intake.path()).startsWith("M 300 " + y + " H 330 ");
+			assertThat(intake.pierX()).isGreaterThan(300);
+			assertThat(intake.pierX() + intake.pierWidth()).isLessThan(330);
+			assertThat(intake.pierTop() + intake.pierHeight()).isEqualTo(y - FlowDrawing.CHANNEL / 2);
+			assertThat(intake.pierBottom()).isEqualTo(y + FlowDrawing.CHANNEL / 2);
+		}
+		// a closed leaf spans the channel; an ajar one swings downstream within the
+		// lead-in
+		assertThat(closed.leaf()).isEqualTo("M 315 " + (closed.lane().y() - 7) + " V " + (closed.lane().y() + 7));
+		assertThat(partial.leaf())
+			.isEqualTo("M 315 " + (partial.lane().y() - 7) + " L 324 " + (partial.lane().y() + 4));
 	}
 
 }

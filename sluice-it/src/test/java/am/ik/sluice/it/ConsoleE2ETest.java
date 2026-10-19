@@ -36,6 +36,8 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.server.route.GateState;
+import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.SessionRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
@@ -96,6 +98,9 @@ class ConsoleE2ETest {
 
 	@Autowired
 	SessionRegistry sessions;
+
+	@Autowired
+	Router router;
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
@@ -304,25 +309,42 @@ class ConsoleE2ETest {
 
 	/**
 	 * The gate toggle shuts a route from the browser and reopens it; the state survives
-	 * the polled refresh of the routes region.
+	 * the polled refresh of the routes region, and the flow drawing raises a headgate on
+	 * the data port's intake meanwhile.
 	 */
 	@Test
 	void gateToggleShutsAndReopensARoute() {
-		Page page = page();
-		page.navigate("http://127.0.0.1:" + this.port + "/console");
-		Locator route = page.locator("tbody[data-route='demo.local']");
-		Locator gate = route.getByTestId("route-gate");
-		assertThat(gate.innerText()).isEqualTo("Open");
-		route.getByRole(AriaRole.BUTTON).click();
-		PlaywrightAssertions.assertThat(gate).hasText("Shut", new LocatorAssertions.HasTextOptions());
-		assertThat(route.getAttribute("data-gate")).isEqualTo("Shut");
-		// the polled regions keep the state
-		page.waitForTimeout(2500);
-		PlaywrightAssertions.assertThat(page.locator("tbody[data-route='demo.local'] [data-testid=route-gate]"))
-			.hasText("Shut", new LocatorAssertions.HasTextOptions());
-		page.locator("tbody[data-route='demo.local']").getByRole(AriaRole.BUTTON).click();
-		PlaywrightAssertions.assertThat(page.locator("tbody[data-route='demo.local'] [data-testid=route-gate]"))
-			.hasText("Open", new LocatorAssertions.HasTextOptions());
+		try {
+			Page page = page();
+			page.navigate("http://127.0.0.1:" + this.port + "/console");
+			Locator route = page.locator("tbody[data-route='demo.local']");
+			Locator gate = route.getByTestId("route-gate");
+			Locator headgate = page.locator("#intake\\:" + dataPort + " [data-testid=headgate]");
+			assertThat(gate.innerText()).isEqualTo("Open");
+			assertThat(headgate.count()).isZero();
+			route.getByRole(AriaRole.BUTTON).click();
+			PlaywrightAssertions.assertThat(gate).hasText("Shut", new LocatorAssertions.HasTextOptions());
+			assertThat(route.getAttribute("data-gate")).isEqualTo("Shut");
+			// the other http routes keep serving: the headgate on the data port's intake
+			// stands ajar
+			int httpRoutes = page.locator("tbody[data-route]").count();
+			assertThat(httpRoutes).isGreaterThan(1);
+			PlaywrightAssertions.assertThat(headgate).hasAttribute("data-closed", "false");
+			PlaywrightAssertions.assertThat(page.locator("#intake\\:" + dataPort + " .detail--shut"))
+				.hasText("1 of " + httpRoutes + " routes shut", new LocatorAssertions.HasTextOptions());
+			// the polled regions keep the state
+			page.waitForTimeout(2500);
+			PlaywrightAssertions.assertThat(page.locator("tbody[data-route='demo.local'] [data-testid=route-gate]"))
+				.hasText("Shut", new LocatorAssertions.HasTextOptions());
+			page.locator("tbody[data-route='demo.local']").getByRole(AriaRole.BUTTON).click();
+			PlaywrightAssertions.assertThat(page.locator("tbody[data-route='demo.local'] [data-testid=route-gate]"))
+				.hasText("Open", new LocatorAssertions.HasTextOptions());
+			PlaywrightAssertions.assertThat(headgate).hasCount(0);
+		}
+		finally {
+			// a failure above must not leave the route shut for the other tests
+			this.router.gate().set("demo.local", GateState.OPEN);
+		}
 	}
 
 	/**
