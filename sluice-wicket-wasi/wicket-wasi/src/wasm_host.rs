@@ -2073,7 +2073,7 @@ pub(crate) mod tests {
 
     /// Reference latencies for the instantiation paths, backing the decision
     /// recorded on `Loaded`. Run with:
-    /// `cargo test -p sluice-wasmlet --bin sluice-wasmlet instantiation_latency -- --ignored --nocapture`
+    /// `cargo test -p sluice-wicket-wasi --bin sluice-wicket-wasi instantiation_latency -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "reference numbers; run manually with --nocapture"]
     async fn instantiation_latency_reference() {
@@ -2129,7 +2129,7 @@ pub(crate) mod tests {
     /// Reference latency for the cold vs pooled request path, backing the
     /// numbers recorded on `Pool`. End-to-end over the in-process tunnel on
     /// the hello guest, sequential requests. Run with:
-    /// `cargo test -p sluice-wasmlet --bin sluice-wasmlet load_comparison -- --ignored --nocapture`
+    /// `cargo test -p sluice-wicket-wasi --bin sluice-wicket-wasi load_comparison -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "reference numbers; run manually with --nocapture"]
     async fn load_comparison_reference() {
@@ -2224,7 +2224,7 @@ pub(crate) mod tests {
         String::from_utf8(exchange_raw(handler, request).await).expect("utf8 response")
     }
 
-    /// The frames the wasmlet sends until none arrives for `quiet`.
+    /// The frames the wicket sends until none arrives for `quiet`.
     async fn frames_until_quiet(peer: &mut Peer, quiet: Duration) -> Vec<Body> {
         let mut frames = Vec::new();
         while let Ok(Some(frame)) = tokio::time::timeout(quiet, peer.recv()).await {
@@ -2466,8 +2466,8 @@ pub(crate) mod tests {
     }
 
     /// Uploads `head` plus `body_len` bytes to conn 1 as a server would:
-    /// within the credit, which the wasmlet's grants refill. Stops once
-    /// everything is sent, the wasmlet fails the connection, or nothing
+    /// within the credit, which the wicket's grants refill. Stops once
+    /// everything is sent, the wicket fails the connection, or nothing
     /// arrives for `quiet` while the credit is exhausted.
     async fn upload(peer: &mut Peer, head: &str, body_len: usize, quiet: Duration) -> Upload {
         let total = head.len() + body_len;

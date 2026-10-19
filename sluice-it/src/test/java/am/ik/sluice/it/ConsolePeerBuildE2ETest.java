@@ -59,7 +59,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * The build each peer announces reaches the server's console: a real client application
- * reports the build packaged with it, a wasmlet-shaped peer its own, and a peer that
+ * reports the build packaged with it, a wicket-shaped peer its own, and a peer that
  * predates build reporting shows as unknown and is counted.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
@@ -69,7 +69,7 @@ class ConsolePeerBuildE2ETest {
 
 	private static final String CLIENT_ID = "build-client";
 
-	private static final String WASMLET_ID = "build-wasmlet";
+	private static final String WICKET_ID = "build-wicket";
 
 	private static final String UNKNOWN_ID = "build-unknown";
 
@@ -79,7 +79,7 @@ class ConsolePeerBuildE2ETest {
 
 	private static final String CONSOLE_PASSWORD = "build-pass";
 
-	private static final String WASMLET_COMMIT = "0123456789abcdef0123456789abcdef01234567";
+	private static final String WICKET_COMMIT = "0123456789abcdef0123456789abcdef01234567";
 
 	/**
 	 * Security lands on the shared classpath through the server; the client ships none.
@@ -138,13 +138,13 @@ class ConsolePeerBuildE2ETest {
 		TunnelClient tunnelClient = this.clientContext.getBean(TunnelClient.class);
 		// connected = the ack, and the server build line, arrived
 		Awaitility.await().atMost(Duration.ofSeconds(15)).until(tunnelClient::isConnected);
-		advertise(WASMLET_ID,
+		advertise(WICKET_ID,
 				Advertise.newBuilder()
 					.setConnectionWindow(VirtualConnection.DEFAULT_WINDOW)
 					.setBuild(PeerBuild.newBuilder()
-						.setImplementation("sluice-wasmlet")
+						.setImplementation("sluice-wicket-wasi")
 						.setVersion("0.0.1-SNAPSHOT")
-						.setCommit(WASMLET_COMMIT)
+						.setCommit(WICKET_COMMIT)
 						.setBuildTime("2026-10-12T00:00:00Z")));
 		// a client from before build reporting
 		advertise(UNKNOWN_ID, Advertise.newBuilder().setConnectionWindow(VirtualConnection.DEFAULT_WINDOW));
@@ -158,7 +158,7 @@ class ConsolePeerBuildE2ETest {
 						.setBuildTime("<b>now</b>")));
 		Awaitility.await()
 			.atMost(Duration.ofSeconds(15))
-			.until(() -> List.of(CLIENT_ID, WASMLET_ID, UNKNOWN_ID, HOSTILE_ID)
+			.until(() -> List.of(CLIENT_ID, WICKET_ID, UNKNOWN_ID, HOSTILE_ID)
 				.stream()
 				.allMatch(id -> this.sessions.find(id).map(TunnelSession::advertised).orElse(false)));
 		this.playwright = Playwright.create();
@@ -261,11 +261,12 @@ class ConsolePeerBuildE2ETest {
 	}
 
 	@Test
-	void wasmletRowShowsItsBuild() {
-		Locator buildLine = row(WASMLET_ID).getByTestId("build");
-		assertThat(buildLine.innerText()).isEqualToNormalizingWhitespace("Build sluice-wasmlet 0.0.1-SNAPSHOT 0123456");
+	void wicketRowShowsItsBuild() {
+		Locator buildLine = row(WICKET_ID).getByTestId("build");
+		assertThat(buildLine.innerText())
+			.isEqualToNormalizingWhitespace("Build sluice-wicket-wasi 0.0.1-SNAPSHOT 0123456");
 		assertThat(buildLine.locator(".mono").getAttribute("title"))
-			.isEqualTo("Commit " + WASMLET_COMMIT + ", built 2026-10-12T00:00:00Z");
+			.isEqualTo("Commit " + WICKET_COMMIT + ", built 2026-10-12T00:00:00Z");
 	}
 
 	@Test
@@ -278,7 +279,7 @@ class ConsolePeerBuildE2ETest {
 	void gaugeCountsUnknownBuildSessions() {
 		// precondition: the peer without a build is live; the others announce one
 		assertThat(this.sessions.find(UNKNOWN_ID).flatMap(TunnelSession::clientBuild)).isEmpty();
-		assertThat(List.of(CLIENT_ID, WASMLET_ID, HOSTILE_ID)).allSatisfy(id -> assertThat(this.sessions.find(id))
+		assertThat(List.of(CLIENT_ID, WICKET_ID, HOSTILE_ID)).allSatisfy(id -> assertThat(this.sessions.find(id))
 			.hasValueSatisfying(session -> assertThat(session.clientBuild()).isPresent()));
 		assertThat(this.meterRegistry.get("sluice.tunnel.sessions.build.unknown").gauge().value()).isEqualTo(1.0);
 	}
@@ -318,8 +319,8 @@ class ConsolePeerBuildE2ETest {
 		assertThat(
 				output.getAll().lines().filter(line -> line.contains(" runs ")).map(ConsolePeerBuildE2ETest::message))
 			.containsOnlyOnce(
-					"client " + WASMLET_ID
-							+ " runs sluice-wasmlet 0.0.1-SNAPSHOT (0123456, built 2026-10-12T00:00:00Z)",
+					"client " + WICKET_ID
+							+ " runs sluice-wicket-wasi 0.0.1-SNAPSHOT (0123456, built 2026-10-12T00:00:00Z)",
 					"client " + UNKNOWN_ID + " runs " + PeerBuilds.UNKNOWN,
 					"client " + HOSTILE_ID + " runs <img src=x onerror=\"window.pwned=1\"> " + "9".repeat(64)
 							+ "... (abc?def, built <b>now</b>)");

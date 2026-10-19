@@ -1,6 +1,6 @@
 Difficulty: Medium
 
-# wasmlet: a CPU-bound guest must yield its tokio worker
+# wicket: a CPU-bound guest must yield its tokio worker
 
 Found during the 041 investigation (by reading, not tested).
 
@@ -35,7 +35,7 @@ fire, so the budget must stay enforced by the epoch count / the outside watchdog
   it fail before the fix.
 - Test: a busy guest still traps at its budget (the yield must not extend it); assert the
   elapsed time is within budget + one tick.
-- Needs a busy-loop example guest under `sluice-wasmlet/examples/` if none exists (the
+- Needs a busy-loop example guest under `sluice-wicket-wasi/examples/` if none exists (the
   hello guest's `/spin` is one).
 - The ticker follows a fixed schedule now (tracks the wall clock; a stall beyond 100 ticks is
   forgotten), so the budget + one tick bound holds except after such a stall.

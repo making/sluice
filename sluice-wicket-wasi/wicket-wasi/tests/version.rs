@@ -4,10 +4,10 @@ use std::process::Command;
 
 #[test]
 fn version_prints_the_embedded_commit() {
-    let output = Command::new(env!("CARGO_BIN_EXE_sluice-wasmlet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-wasi"))
         .arg("--version")
         .output()
-        .expect("run sluice-wasmlet --version");
+        .expect("run sluice-wicket-wasi --version");
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("utf-8");
     let head = Command::new("git")
@@ -23,7 +23,7 @@ fn version_prints_the_embedded_commit() {
                 .to_string()
         });
     let commit = head.unwrap_or_else(|| "commit unknown".to_string());
-    let expected = format!("sluice-wasmlet {} ({commit}", env!("CARGO_PKG_VERSION"));
+    let expected = format!("sluice-wicket-wasi {} ({commit}", env!("CARGO_PKG_VERSION"));
     assert!(
         stdout.starts_with(&expected) && stdout.contains(", built "),
         "expected '{expected}..., built ...', got '{stdout}'"
@@ -34,26 +34,26 @@ fn version_prints_the_embedded_commit() {
 /// fail (here: a component that does not exist).
 #[test]
 fn startup_logs_the_build_first() {
-    let version = Command::new(env!("CARGO_BIN_EXE_sluice-wasmlet"))
+    let version = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-wasi"))
         .arg("--version")
         .output()
-        .expect("run sluice-wasmlet --version");
-    let startup = Command::new(env!("CARGO_BIN_EXE_sluice-wasmlet"))
+        .expect("run sluice-wicket-wasi --version");
+    let startup = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-wasi"))
         .args([
             "--server",
             "grpc://127.0.0.1:1",
             "--wasm",
-            "demo.local=/nonexistent/sluice-wasmlet-test.wasm",
+            "demo.local=/nonexistent/sluice-wicket-wasi-test.wasm",
         ])
         .output()
-        .expect("run sluice-wasmlet");
+        .expect("run sluice-wicket-wasi");
     assert!(!startup.status.success(), "{startup:?}");
     let stdout = String::from_utf8(startup.stdout).expect("utf-8");
     assert_eq!(
         stdout.lines().next(),
         Some(
             format!(
-                "wasmlet build: {}",
+                "wicket build: {}",
                 String::from_utf8(version.stdout).expect("utf-8").trim()
             )
             .as_str()

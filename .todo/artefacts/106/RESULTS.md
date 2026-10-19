@@ -124,7 +124,7 @@ Upload h2 1.7 MiB/s (1 stream), 1.4 MiB/s (8 streams); h1 477 MiB/s.
   WARN or ERROR from sluice; one Micrometer WARN at startup says the native image gives no GC
   notifications. Before the probes, every `sluice_h2demux_*` and
   `sluice_data_connections_*_closed` counter read 0. Two tunnel clients were connected: a
-  sluice-client and a sluice-wasmlet.
+  sluice-client and a sluice-wicket-wasi.
 - Probes (`harness/prod-probe.sh`: 12 requests to the httpbin route, plus 3 by hand to the
   wasm demo and synology routes): the httpbin and synology routes negotiate http/1.1 even
   when h2 is offered, and the wasm demo route gets h2 (200, 68 to 138 ms).

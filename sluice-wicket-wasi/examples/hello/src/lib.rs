@@ -48,7 +48,7 @@ impl Guest for Component {
         drop(result_tx);
 
         if path == "/log" {
-            // Guest stdio demo: both lines land in the wasmlet log, prefixed.
+            // Guest stdio demo: both lines land in the wicket log, prefixed.
             println!("hello stdout: {method:?} {path} body_bytes={body_len}");
             eprintln!("hello stderr: {method:?} {path}");
         }

@@ -1,6 +1,6 @@
 Difficulty: Medium
 
-# sluice-wasmlet: make the instance pool observable
+# sluice-wicket-wasi: make the instance pool observable
 
 The pool counters (`units` / `idle` / `spawned` / `served` on `Pool` in
 `wasm_host.rs`) are read only in tests. In production an exhausted pool
@@ -14,7 +14,7 @@ Options:
   recycled by reason), only while it changes
 - report the counters to the server over the tunnel and show them on the
   console's wasm route (proto change)
-- a local metrics endpoint (wasmlet has no HTTP listener today)
+- a local metrics endpoint (wicket has no HTTP listener today)
 
 The instance limit (`--max-instances`, `Instances` in `wasm_host.rs`) is
 silent too: requests that waited for a slot (the process-wide one or their
@@ -24,7 +24,7 @@ be sized from evidence either. The tests read only `Handler`'s gauge (live /
 peak / created stores) and `Instances::held`.
 
 The tunnel stall watchdog (074, `--tunnel-stall-timeout`) only logs each node stream
-it gives up: the wasmlet neither exports the time a stream has stalled nor counts the
+it gives up: the wicket neither exports the time a stream has stalled nor counts the
 streams given up, which the Java client and server do (`sluice.tunnel.stall` /
 `sluice.tunnel.stall.failures`). Cover them with the rest.
 

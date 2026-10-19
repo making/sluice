@@ -1,4 +1,4 @@
-//! The HTTP/2 window the wasmlet announces for the tunnel's gRPC connection,
+//! The HTTP/2 window the wicket announces for the tunnel's gRPC connection,
 //! measured in round trips: a proxy turns the receiver's answers (its flow
 //! control credit among them) into discrete rounds, so the bytes that passed
 //! between two releases are what the sender could send on one round trip's
@@ -178,7 +178,7 @@ async fn sending_server(total: usize) -> std::net::SocketAddr {
 }
 
 /// Downloads `total` payload bytes over a gRPC connection configured as the
-/// wasmlet configures it, behind the proxy; returns the bytes each round trip
+/// wicket configures it, behind the proxy; returns the bytes each round trip
 /// carried.
 async fn download(total: usize, window: u32) -> Vec<u64> {
     let server = sending_server(total).await;
@@ -223,7 +223,7 @@ fn the_window_is_twice_what_the_connections_may_have_in_flight() {
     assert_eq!(transport_window(usize::MAX), i32::MAX as u32);
 }
 
-/// 32MiB sent to the wasmlet's gRPC connection, the answers held back and
+/// 32MiB sent to the wicket's gRPC connection, the answers held back and
 /// released once the sender was quiet: with the window fixed at twice the
 /// default connection budget the transfer takes a few round trips at most;
 /// at hyper's defaults (2MiB per stream) it takes at least sixteen.

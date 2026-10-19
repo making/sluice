@@ -18,7 +18,7 @@ exposed the same way (chart default `enableServiceLinks: true`, release/service 
   service-link var can produce, e.g. `sluice.data.listen-port` -- breaking change, so
   cover the alias/compat question explicitly (Boot 4 has no deprecated property
   reporting by default; decide: clean break vs `@DeprecatedConfigurationProperty`)
-- Update README, `k8s.md`, and the wasmlet flags if they mirror the names
+- Update README, `k8s.md`, and the wicket flags if they mirror the names
 - Add a test binding the properties from an env-style map containing realistic
   service-link vars (`SLUICE_DATA_PORT=tcp://...`) so the collision stays covered
 - Revisit `k8s.md`: if the rename removes the clash, the `enableServiceLinks: false`

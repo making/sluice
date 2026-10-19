@@ -1,6 +1,6 @@
 //! Build identification, computed by `build.rs` (which includes this file)
-//! and embedded as `SLUICE_WASMLET_COMMIT` / `SLUICE_WASMLET_DIRTY` /
-//! `SLUICE_WASMLET_BUILD_TIME`. Nothing here may fail the build: without git
+//! and embedded as `SLUICE_WICKET_COMMIT` / `SLUICE_WICKET_DIRTY` /
+//! `SLUICE_WICKET_BUILD_TIME`. Nothing here may fail the build: without git
 //! (or outside a work tree) the commit is empty and the tree counts as clean.
 
 use std::path::{Path, PathBuf};

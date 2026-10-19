@@ -1,21 +1,21 @@
 Difficulty: Medium
 
-# sluice-wasmlet: YAML config file
+# sluice-wicket-wasi: YAML config file
 
 The `--wasm host=locator?query` flag packs the sandbox into a URL query
-(`wasmlet/src/main.rs` `parse_route_target` / `Sandbox::parse`): literal `?` in
+(`wicket-wasi/src/main.rs` `parse_route_target` / `Sandbox::parse`): literal `?` in
 paths needs escaping, the flag grows unreadable, comments and env references are
 impossible. Move the whole configuration to a YAML file.
 
 ## Shape
 
-`--config wasmlet.yaml` (new flag) plus a default `wasmlet.yaml` lookup? Decide
+`--config wicket-wasi.yaml` (new flag) plus a default `wicket-wasi.yaml` lookup? Decide
 the lookup rule; at minimum `--config <path>`.
 
 ```yaml
 server: grpc://127.0.0.1:8001
 token: SECRET            # ${ENV} expansion for secrets; decide scope
-id: wasmlet-1
+id: wicket-1
 # insecure: true
 # ca-cert: ca.pem
 

@@ -39,7 +39,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * A client without per-connection flow control (it advertises no window, as every client
- * before 046cd21 and every wasmlet before f76388d) is rejected: its tunnel stream fails
+ * before 046cd21 and every wicket before f76388d) is rejected: its tunnel stream fails
  * with {@code FAILED_PRECONDITION} naming the builds required, before any route is
  * registered or acknowledged, no session is left behind, and one line is logged per
  * rejected stream.

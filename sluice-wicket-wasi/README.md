@@ -1,4 +1,4 @@
-# sluice-wasmlet
+# sluice-wicket-wasi
 
 > **Experimental / proof of concept.** The API, layout, and behavior are
 > unstable and may change or disappear; the limitations listed at the bottom
@@ -11,14 +11,14 @@ the tunnel and hands every request to a **wasi:http 0.3 component**
 from `sluice-proto` — a single source of truth with the Java modules.
 
 ```
-sluice server --tunnel--> sluice-wasmlet --hyper(h1/h2c)--> wasi:http handler component
+sluice server --tunnel--> sluice-wicket-wasi --hyper(h1/h2c)--> wasi:http handler component
 ```
 
 ## Layout
 
 Two Cargo workspaces:
 
-- `wasmlet/` — `sluice-wasmlet`, the tunnel-side wasm host (wasmtime + hyper)
+- `wicket-wasi/` — `sluice-wicket-wasi`, the tunnel-side wasm host (wasmtime + hyper)
 - `examples/` — sample handler components (`wasm32-wasip3`), a separate
   workspace pinned to a nightly toolchain by `rust-toolchain.toml`
   (wasm32-wasip3 ships rust-std on nightly only; rustup installs it on the
@@ -30,30 +30,30 @@ Two Cargo workspaces:
 ## Run
 
 ```text
-cargo build -p sluice-wasmlet
+cargo build -p sluice-wicket-wasi
 (cd examples && cargo build --release)   # -> examples/target/wasm32-wasip3/release/<example>.wasm
 
 # sluice server as in the root README, then:
-target/debug/sluice-wasmlet --server grpc://127.0.0.1:8001 --token SECRET \
+target/debug/sluice-wicket-wasi --server grpc://127.0.0.1:8001 --token SECRET \
     --wasm demo.local=examples/target/wasm32-wasip3/release/hello.wasm
 ```
 
-`cargo test -p sluice-wasmlet` builds the examples the same way (through the
+`cargo test -p sluice-wicket-wasi` builds the examples the same way (through the
 rustup `cargo` proxy, so rustup must be installed).
 
 `--version` prints the build: version, git commit (with `dirty` when tracked files had
 uncommitted changes) and build time, embedded by `build.rs` when the build script last
 ran. Without git the build still succeeds and
-reports `commit unknown`. The wasmlet logs the same line at startup and sends it in its
-`Advertise`, so the server console shows it on the wasmlet's row.
+reports `commit unknown`. The wicket logs the same line at startup and sends it in its
+`Advertise`, so the server console shows it on the wicket's row.
 
 `--server` also accepts `grpcs://` (TLS). Verification uses `--ca-cert <file>` (PEM, may
 hold a chain), the webPKI roots when omitted, or nothing at all with `--insecure`
 (self-signed setups; the `sluice.insecure` equivalent):
 
 ```text
-target/debug/sluice-wasmlet --server grpcs://127.0.0.1:8001 --ca-cert ca.pem ...
-target/debug/sluice-wasmlet --server grpcs://127.0.0.1:8001 --insecure ...
+target/debug/sluice-wicket-wasi --server grpcs://127.0.0.1:8001 --ca-cert ca.pem ...
+target/debug/sluice-wicket-wasi --server grpcs://127.0.0.1:8001 --insecure ...
 ```
 
 `--max-connections N` (default 256) caps the connections open at once over every
@@ -121,7 +121,7 @@ importing anything else fails at startup.
 
 | `wasi=` | `wasmtime serve` | effect |
 |---|---|---|
-| `http` | `-Shttp` | outgoing requests via `wasi:http/client`; always linked as in serve, so accepted but no effect. Ungated: a guest reaches any address the wasmlet host can, internal networks included |
+| `http` | `-Shttp` | outgoing requests via `wasi:http/client`; always linked as in serve, so accepted but no effect. Ungated: a guest reaches any address the wicket host can, internal networks included |
 | `cli` | `-Scli` | links the full wasi p3 set (sockets, filesystem, ...) |
 | `inherit-network` | `-Sinherit-network` | sockets may use every address; implies `tcp` + `udp` |
 | `tcp` / `udp` | `-Stcp` / `-Sudp` | allows the protocol (every address stays denied without `inherit-network`) |
@@ -135,7 +135,7 @@ are enforced by `wasmtime-wasi` on every socket call: a denied call returns
 --wasm 'api.local=app.wasm?wasi=cli,inherit-network'
 ```
 
-Guest stdout / stderr always go to the wasmlet's stdout / stderr as whole
+Guest stdout / stderr always go to the wicket's stdout / stderr as whole
 lines, prefixed with the component and a request id
 (`stdout [app.wasm#12] :: ...`), as `wasmtime serve` does.
 
@@ -144,7 +144,7 @@ lines, prefixed with the component and a request id
 - the tunnel stream is served by `hyper` (http/1.1 and h2c, sniffed from the
   first bytes) through an `AsyncRead`/`AsyncWrite` adapter over the frame
   channels; no loopback sockets
-- per-connection flow control as in the root README: the wasmlet announces a
+- per-connection flow control as in the root README: the wicket announces a
   1MiB receive window per connection (fixed: it does not grow or shrink it)
   and grants back what hyper read; its writes send only against the server's
   grants, the server's initial window (64KiB) and what it grants beyond. A
@@ -163,7 +163,7 @@ lines, prefixed with the component and a request id
   everything the server sends for every connection shared 2MiB per round trip.
   The window is a ceiling on what the server may send, not a buffer: the
   connections' windows bound what is held. A unit test sends 32MiB through a
-  proxy that holds the wasmlet's answers back one round trip at a time: 17
+  proxy that holds the wicket's answers back one round trip at a time: 17
   round trips at hyper's defaults, at most 3 with the window
 - outbound frames are scheduled as by the Java sender: control frames
   (Advertise, WindowUpdate) first, then one frame per turn from each

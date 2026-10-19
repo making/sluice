@@ -269,7 +269,7 @@
           <text class="note" x="757" y="395">actuator :9001</text>
           <text class="note" x="757" y="410">health: per-node stream state</text>
           <rect class="bnd" x="230" y="520" width="450" height="240" rx="3"/>
-          <text class="bt" x="245" y="545">sluice-wasmlet &#8212; Rust (experimental)</text>
+          <text class="bt" x="245" y="545">sluice-wicket-wasi &#8212; Rust (experimental)</text>
           <g class="k k-cnt">
             <rect class="cnt" x="255" y="570" width="190" height="110" rx="3"/>
             <text class="name" x="350" y="596" text-anchor="middle" font-size="12">wasm host</text>
@@ -320,7 +320,7 @@
           <div><span class="l">Date</span><span class="v">2026-10-10</span></div>
         </div>
       </div>
-      <figcaption><b>Containers.</b> Deployable units and the ports they listen on. Server, client and wasmlet speak the same Frame protocol; the relay machinery lives in <code>sluice-proto</code>.</figcaption>
+      <figcaption><b>Containers.</b> Deployable units and the ports they listen on. Server, client and wicket speak the same Frame protocol; the relay machinery lives in <code>sluice-proto</code>.</figcaption>
     </figure>
 
     <table class="sched">
@@ -334,7 +334,7 @@
           <td><code>/console</code> (self-refresh 2s), <code>/actuator/*</code>, client-certificate issuance. Authenticated.</td></tr>
       <tr><td>sluice-client</td><td><code>TunnelClient</code> / <code>NodeConnection</code> / <code>LocalConnector</code></td><td>9001 (actuator)</td>
           <td>One bidi stream per node (learns nodes via ListNodes + MembershipUpdate). Reconnects with exponential backoff 1&ndash;30s. Advertises upstreams (<code>ADVERTISE</code>), dials on <code>CONNECT</code>.</td></tr>
-      <tr><td>sluice-wasmlet</td><td>Rust wasm host (wasmtime + hyper)</td><td>&ndash;</td>
+      <tr><td>sluice-wicket-wasi</td><td>Rust wasm host (wasmtime + hyper)</td><td>&ndash;</td>
           <td>PoC. Terminates HTTP on the tunnel into a wasi:http 0.3 component instead of relaying to TCP upstreams.</td></tr>
     </table>
   </section>
@@ -480,7 +480,7 @@
       <li>All blocking I/O runs on virtual threads; the sender side propagates backpressure into gRPC flow control via bounded queues + <code>isReady()</code>.</li>
       <li>Level 4 (Code) is omitted on purpose: class-level diagrams would duplicate the source and go stale. For the code level, start from the relay core in <code>sluice-proto</code> &mdash; <code>am.ik.sluice.tunnel</code> (<code>VirtualConnection</code> / <code>SessionSender</code> / <code>SocketRelay</code> / <code>StreamRelay</code> / <code>DuplexPipe</code> / <code>FrameWriter</code>).</li>
     </ol>
-    <p class="colophon">Sources: README.md / sluice-proto/src/main/proto/sluice/v1/tunnel.proto / module sources. sluice-wasmlet is experimental (PoC).</p>
+    <p class="colophon">Sources: README.md / sluice-proto/src/main/proto/sluice/v1/tunnel.proto / module sources. sluice-wicket-wasi is experimental (PoC).</p>
   </section>
 
   <div class="legend" role="group" aria-label="Highlight element kind">

@@ -115,7 +115,7 @@ message Advertise {
   repeated Upstream upstreams = 1;
   // Client's initial receive window per connection, in bytes; it may grant
   // more (WindowUpdate) and reclaim what was left unused. 0 (a client without
-  // per-connection flow control: sluice-client before 046cd21, sluice-wasmlet
+  // per-connection flow control: sluice-client before 046cd21, sluice-wicket-wasi
   // before f76388d) fails the tunnel stream with FAILED_PRECONDITION.
   uint32 connection_window = 2;
   // Build of the client; unset by clients that predate the field.
@@ -125,7 +125,7 @@ message Advertise {
 // Which build a peer runs. Each string may be empty when the peer could not tell
 // (e.g. no build metadata was packaged).
 message PeerBuild {
-  // Implementation: "sluice-client", "sluice-wasmlet" or "sluice-server".
+  // Implementation: "sluice-client", "sluice-wicket-wasi" or "sluice-server".
   string implementation = 1;
   // Release version, e.g. "0.0.1-SNAPSHOT".
   string version = 2;

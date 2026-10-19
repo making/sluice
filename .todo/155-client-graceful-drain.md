@@ -40,7 +40,7 @@ second client serving the same host, `docker compose up -d` of a new client buil
   them; state the choice in the README.
 - Long-lived connections (WebSocket, tcp routes) hold the drain for the whole grace.
 - Second SIGTERM / SIGINT during the drain: stop at once.
-- sluice-wasmlet is a client too: decide whether it follows here or in its own todo.
+- sluice-wicket-wasi is a client too: decide whether it follows here or in its own todo.
 
 ## Acceptance
 

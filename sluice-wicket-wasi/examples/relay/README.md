@@ -6,7 +6,7 @@ raw reply. Needs `wasi=cli,inherit-network`.
 
 ```text
 cargo build --release -p relay   # from examples/
-sluice-wasmlet ... \
+sluice-wicket-wasi ... \
     --wasm 'relay.local=examples/target/wasm32-wasip3/release/relay.wasm?wasi=cli,inherit-network' \
     --wasm 'denied.local=examples/target/wasm32-wasip3/release/relay.wasm?wasi=cli'
 ```

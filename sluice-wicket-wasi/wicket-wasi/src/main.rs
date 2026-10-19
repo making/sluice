@@ -1,4 +1,4 @@
-//! sluice-wasmlet: a wasm platform on the sluice tunnel.
+//! sluice-wicket-wasi: a wasm platform on the sluice tunnel.
 //!
 //! Connectes to a sluice server with the same `sluice.v1.Tunnel` gRPC API as
 //! the Java client, but instead of relaying to TCP upstreams it terminates
@@ -26,7 +26,7 @@
 //! Usage:
 //!
 //! ```text
-//! sluice-wasmlet --server grpc://127.0.0.1:8001 --token SECRET \
+//! sluice-wicket-wasi --server grpc://127.0.0.1:8001 --token SECRET \
 //!     --wasm demo.local=./hello.wasm \
 //!     --wasm relay.local='./relay.wasm?wasi=cli,inherit-network'
 //! ```
@@ -363,7 +363,7 @@ type Handlers = HashMap<String, Arc<Handler>>;
 /// handler on `instances`, returning the handlers by target and the upstreams
 /// to advertise. The target is the component locator (`wasm:<url>`) plus the
 /// sandbox query; the server passes it through verbatim as the dial address
-/// and the wasmlet resolves it back.
+/// and the wicket resolves it back.
 async fn handlers(
     routes: &[Route],
     instances: &Arc<Instances>,
@@ -405,7 +405,7 @@ async fn run(config: Config) -> Result<(), BoxError> {
         max_instances,
         stall_timeout,
     } = config;
-    println!("wasmlet build: {}", describe(&peer_build()));
+    println!("wicket build: {}", describe(&peer_build()));
     let instances = Instances::new(max_instances);
 
     let (components, advertised) = handlers(&routes, &instances).await?;
@@ -766,15 +766,15 @@ const MAX_FIELD_CHARS: usize = 64;
 /// was unavailable when it was built.
 fn peer_build() -> PeerBuild {
     PeerBuild {
-        implementation: "sluice-wasmlet".into(),
+        implementation: "sluice-wicket-wasi".into(),
         version: env!("CARGO_PKG_VERSION").into(),
-        commit: env!("SLUICE_WASMLET_COMMIT").into(),
-        dirty: env!("SLUICE_WASMLET_DIRTY") == "true",
-        build_time: env!("SLUICE_WASMLET_BUILD_TIME").into(),
+        commit: env!("SLUICE_WICKET_COMMIT").into(),
+        dirty: env!("SLUICE_WICKET_DIRTY") == "true",
+        build_time: env!("SLUICE_WICKET_BUILD_TIME").into(),
     }
 }
 
-/// One line naming a build, e.g. `sluice-wasmlet 0.0.1-SNAPSHOT
+/// One line naming a build, e.g. `sluice-wicket-wasi 0.0.1-SNAPSHOT
 /// (<commit>, dirty, built 2026-10-12T01:04:33Z)`; an empty field reads as
 /// unknown.
 fn describe(build: &PeerBuild) -> String {
@@ -1224,17 +1224,17 @@ mod tests {
         assert_eq!(advertise.connection_window, tunnel::WINDOW);
     }
 
-    /// Without the build the server shows this wasmlet as an older build.
+    /// Without the build the server shows this wicket as an older build.
     #[test]
     fn the_advertise_carries_the_embedded_build() {
         let Some(Body::Advertise(advertise)) = advertise(Vec::new()).body else {
             panic!("an Advertise");
         };
         let build = advertise.build.expect("a build");
-        assert_eq!(build.implementation, "sluice-wasmlet");
+        assert_eq!(build.implementation, "sluice-wicket-wasi");
         assert_eq!(build.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(build.commit, env!("SLUICE_WASMLET_COMMIT"));
-        assert_eq!(build.build_time, env!("SLUICE_WASMLET_BUILD_TIME"));
+        assert_eq!(build.commit, env!("SLUICE_WICKET_COMMIT"));
+        assert_eq!(build.build_time, env!("SLUICE_WICKET_BUILD_TIME"));
     }
 
     #[test]

@@ -1202,7 +1202,7 @@ impl Ending {
 // Test support
 
 /// A stand-in for the server side of the stream: feeds frames through the
-/// dispatch as the receive loop does and reads what the wasmlet sends.
+/// dispatch as the receive loop does and reads what the wicket sends.
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
@@ -1268,7 +1268,7 @@ pub(crate) mod testing {
             self.connections.lookup(conn_id).is_some()
         }
 
-        /// The next frame the wasmlet sent; None once the stream ended.
+        /// The next frame the wicket sent; None once the stream ended.
         pub(crate) async fn recv(&mut self) -> Option<Frame> {
             use futures_util::StreamExt as _;
             let frame = self.frames.next().await?;

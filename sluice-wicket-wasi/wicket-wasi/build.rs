@@ -13,7 +13,7 @@ fn main() {
     let root = manifest_dir
         .parent()
         .and_then(|p| p.parent())
-        .expect("crate below <repo>/sluice-wasmlet/wasmlet")
+        .expect("crate below <repo>/sluice-wicket-wasi/wicket-wasi")
         .to_path_buf();
     let proto = root.join("sluice-proto/src/main/proto/sluice/v1/tunnel.proto");
     tonic_prost_build::configure()
@@ -50,10 +50,10 @@ fn embed_build_info(manifest_dir: &std::path::Path) {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
-    println!("cargo:rustc-env=SLUICE_WASMLET_COMMIT={}", git.commit);
-    println!("cargo:rustc-env=SLUICE_WASMLET_DIRTY={}", git.dirty);
+    println!("cargo:rustc-env=SLUICE_WICKET_COMMIT={}", git.commit);
+    println!("cargo:rustc-env=SLUICE_WICKET_DIRTY={}", git.dirty);
     println!(
-        "cargo:rustc-env=SLUICE_WASMLET_BUILD_TIME={}",
+        "cargo:rustc-env=SLUICE_WICKET_BUILD_TIME={}",
         build_info::rfc3339(secs)
     );
 }

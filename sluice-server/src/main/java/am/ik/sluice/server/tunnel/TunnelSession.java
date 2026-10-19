@@ -75,7 +75,7 @@ public final class TunnelSession implements AutoCloseable {
 	 */
 	public static final String WINDOW_REQUIRED = "the client announced no per-connection receive window "
 			+ "(Advertise.connection_window); this server requires sluice-client 046cd21 "
-			+ "or sluice-wasmlet f76388d (2026-10-12) or later";
+			+ "or sluice-wicket-wasi f76388d (2026-10-12) or later";
 
 	private final String clientId;
 
