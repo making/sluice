@@ -36,6 +36,7 @@ import org.springframework.core.task.TaskExecutor;
 import org.springframework.stereotype.Component;
 
 import am.ik.sluice.server.config.SluiceServerProperties;
+import am.ik.sluice.server.proxyprotocol.ProxyProtocolParser;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.Drainable;
 import am.ik.sluice.server.tunnel.SessionRegistry;

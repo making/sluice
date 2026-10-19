@@ -8,8 +8,12 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -29,7 +33,9 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.server.tunnel.SessionRegistry;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -42,7 +48,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * data plane. The header is consumed before routing / relay -- never forwarded -- and its
  * source address becomes the connection peer, admitting it to routes whose
  * {@code allowed-cidrs} list no socket address would match and standing as the
- * {@code remote} of the access log lines.
+ * {@code remote} of the access log lines. The gRPC control plane (TLS) takes the header
+ * too: its source becomes the tunnel session's remote address.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -64,17 +71,28 @@ class ProxyProtocolE2ETest {
 
 	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ListAppender<>();
 
+	private static final Duration HEAD_TIMEOUT = Duration.ofSeconds(2);
+
+	/** Connections the echo upstream accepted: the tcp route's dials. */
+	private static final AtomicInteger echoAccepts = new AtomicInteger();
+
 	private static int grpcPort;
 
 	private static int dataPort;
 
 	private static int tcpRoutePort;
 
+	/** A tcp route open to any peer, the loopback included. */
+	private static int openTcpRoutePort;
+
 	private static HttpServer httpUpstream;
 
 	private static @Nullable ServerSocket echoServer;
 
 	private @Nullable TunnelClient client;
+
+	@Autowired
+	SessionRegistry sessions;
 
 	@BeforeAll
 	static void startUpstreams() throws Exception {
@@ -102,10 +120,18 @@ class ProxyProtocolE2ETest {
 		grpcPort = TestPorts.freePort();
 		dataPort = TestPorts.freePort();
 		tcpRoutePort = TestPorts.freePort();
+		openTcpRoutePort = TestPorts.freePort();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
-		registry.add("sluice.tcp-port-range", () -> String.valueOf(tcpRoutePort));
+		registry.add("sluice.tcp-port-range", () -> tcpRoutePort + "," + openTcpRoutePort);
 		registry.add("sluice.proxy-protocol", () -> "true");
+		registry.add("sluice.control-proxy-protocol", () -> "true");
+		registry.add("sluice.limits.head-timeout", () -> HEAD_TIMEOUT.toMillis() + "ms");
+		Path keystore = selfSignedKeystore();
+		registry.add("spring.grpc.server.ssl.bundle", () -> "grpc-control");
+		registry.add("spring.ssl.bundle.jks.grpc-control.keystore.location", () -> "file:" + keystore);
+		registry.add("spring.ssl.bundle.jks.grpc-control.keystore.password", () -> "changeit");
+		registry.add("spring.ssl.bundle.jks.grpc-control.keystore.type", () -> "PKCS12");
 		registry.add("sluice.access-log.rate-limit.enabled", () -> "false");
 		registry.add("sluice.token", () -> "it-token");
 		registry.add("server.port", () -> 0);
@@ -119,6 +145,7 @@ class ProxyProtocolE2ETest {
 		while (!echoServer().isClosed()) {
 			try {
 				Socket socket = echoServer().accept();
+				echoAccepts.incrementAndGet();
 				Thread.ofVirtual().name("e2e-proxy-echo-conn").start(() -> echo(socket));
 			}
 			catch (Exception e) {
@@ -147,7 +174,9 @@ class ProxyProtocolE2ETest {
 			return;
 		}
 		SluiceClientProperties properties = SluiceClientProperties.builder()
-			.serverUrl("grpc://127.0.0.1:" + grpcPort)
+			.serverUrl("grpcs://127.0.0.1:" + grpcPort)
+			.insecure(true)
+			.clientId("direct")
 			.upstream(Upstream.builder()
 				.host("proxied.local")
 				.target("http://127.0.0.1:" + httpUpstream.getAddress().getPort())
@@ -162,6 +191,11 @@ class ProxyProtocolE2ETest {
 				.target("tcp://127.0.0.1:" + echoServer().getLocalPort())
 				.listenPort(tcpRoutePort)
 				.allowedCidrs(List.of(PROXIED_SOURCE_HOST + "/24"))
+				.build())
+			.upstream(Upstream.builder()
+				.host("open.tcp")
+				.target("tcp://127.0.0.1:" + echoServer().getLocalPort())
+				.listenPort(openTcpRoutePort)
 				.build())
 			.token("it-token")
 			.build();
@@ -193,7 +227,7 @@ class ProxyProtocolE2ETest {
 	@Test
 	void v2HeaderPeerAdmitsTheConnectionToHttpRoutes() throws Exception {
 		this.startClient();
-		byte[] header = proxyV2();
+		byte[] header = proxyV2(32100);
 		String response = raw(header, "GET / HTTP/1.1\r\nHost: proxied.local\r\nConnection: close\r\n\r\n");
 		assertThat(response.lines().findFirst()).hasValue("HTTP/1.1 200 OK");
 		assertThat(bodyOf(response)).isEqualTo("hello-from-upstream");
@@ -227,7 +261,7 @@ class ProxyProtocolE2ETest {
 	@Test
 	void v2HeaderIsStrippedFromTcpRoutes() throws Exception {
 		this.startClient();
-		byte[] header = proxyV2();
+		byte[] header = proxyV2(32100);
 		try (Socket socket = new Socket("127.0.0.1", tcpRoutePort)) {
 			socket.setSoTimeout(10_000);
 			OutputStream out = socket.getOutputStream();
@@ -243,6 +277,26 @@ class ProxyProtocolE2ETest {
 			socket.shutdownOutput();
 			assertThat(in.readAllBytes()).isEmpty();
 		}
+	}
+
+	/**
+	 * Detecting the header takes the connection's first byte, and a tcp route's upstream
+	 * is dialed only after it: a headerless connection whose server would speak first is
+	 * closed at the head deadline, never dialed. A control plane connection waits for its
+	 * first byte under the same deadline, ahead of gRPC's TLS handshake timeout (10s).
+	 */
+	@Test
+	void aSilentConnectionIsClosedAtTheHeadDeadline() throws Exception {
+		this.startClient();
+		int dials = echoAccepts.get();
+		try (Socket route = new Socket("127.0.0.1", openTcpRoutePort);
+				Socket control = new Socket("127.0.0.1", grpcPort)) {
+			assertThat(TestSockets.awaitClosed(route, HEAD_TIMEOUT.multipliedBy(3)))
+				.isGreaterThan(HEAD_TIMEOUT.multipliedBy(3).dividedBy(4));
+			// gRPC alone would hold it until its TLS handshake timeout
+			TestSockets.awaitClosed(control, HEAD_TIMEOUT.multipliedBy(3));
+		}
+		assertThat(echoAccepts.get()).isEqualTo(dials);
 	}
 
 	@Test
@@ -264,8 +318,72 @@ class ProxyProtocolE2ETest {
 		}
 	}
 
-	/** A v2 PROXY header for the TCP4 proxied connection. */
-	private static byte[] proxyV2() {
+	@Test
+	void controlPlaneHeaderSourceBecomesTheTunnelSessionsRemoteAddress() throws Exception {
+		this.startClient();
+		try (DelayingProxy frontEnd = DelayingProxy.prefixing(grpcPort, proxyV2(32200))) {
+			TunnelClient proxied = TunnelClient.builder()
+				.properties(SluiceClientProperties.builder()
+					.serverUrl("grpcs://127.0.0.1:" + frontEnd.port())
+					.insecure(true)
+					.clientId("proxied")
+					.upstream(Upstream.builder()
+						.host("control.local")
+						.target("http://127.0.0.1:" + httpUpstream.getAddress().getPort())
+						.build())
+					.token("it-token")
+					.build())
+				.taskExecutor(TASK_EXECUTOR)
+				.meterRegistry(new SimpleMeterRegistry())
+				.build();
+			proxied.start();
+			try {
+				Awaitility.await()
+					.atMost(Duration.ofSeconds(10))
+					.until(() -> proxied.isConnected() && this.sessions.find("proxied").isPresent());
+				assertThat(this.sessions.find("proxied").orElseThrow().remoteAddress()).isEqualTo("203.0.113.7:32200");
+				// the key of the per-address tunnel limits
+				assertThat(this.sessions.find("proxied").orElseThrow().sourceAddress()).isEqualTo("203.0.113.7");
+				// a headerless connection on the same listener keeps its socket peer
+				assertThat(this.sessions.find("direct").orElseThrow().remoteAddress()).matches("127\\.0\\.0\\.1:\\d+");
+				// the TLS stream behind the header carries the tunnel
+				String response = raw(new byte[0],
+						"GET / HTTP/1.1\r\nHost: control.local\r\nConnection: close\r\n\r\n");
+				assertThat(response.lines().findFirst()).hasValue("HTTP/1.1 200 OK");
+				assertThat(bodyOf(response)).isEqualTo("hello-from-upstream");
+			}
+			finally {
+				proxied.stop();
+			}
+		}
+	}
+
+	/** A self-signed localhost key pair for the control plane's TLS. */
+	private static Path selfSignedKeystore() {
+		try {
+			Path keystore = Files.createTempFile("sluice-proxy-protocol", ".p12");
+			Files.delete(keystore);
+			keystore.toFile().deleteOnExit();
+			String keytool = Path.of(System.getProperty("java.home"), "bin", "keytool").toString();
+			Process process = new ProcessBuilder(keytool, "-genkeypair", "-alias", "grpc", "-keyalg", "RSA", "-keysize",
+					"2048", "-storetype", "PKCS12", "-storepass", "changeit", "-dname", "CN=localhost", "-ext",
+					"san=dns:localhost,ip:127.0.0.1", "-validity", "1", "-keystore",
+					keystore.toAbsolutePath().toString())
+				.redirectErrorStream(true)
+				.start();
+			if (!process.waitFor(60, TimeUnit.SECONDS) || process.exitValue() != 0) {
+				throw new IllegalStateException("keytool failed: "
+						+ new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8));
+			}
+			return keystore.toAbsolutePath();
+		}
+		catch (Exception e) {
+			throw new IllegalStateException(e);
+		}
+	}
+
+	/** A v2 PROXY header for a TCP4 connection from 203.0.113.7 at the source port. */
+	private static byte[] proxyV2(int sourcePort) {
 		return ByteBuffer.allocate(V2_SIGNATURE.length + 4 + 12)
 			.put(V2_SIGNATURE)
 			.put((byte) 0x21) // version 2, command PROXY
@@ -273,7 +391,7 @@ class ProxyProtocolE2ETest {
 			.putShort((short) 12)
 			.put(PROXIED_SOURCE)
 			.put(PROXIED_DEST)
-			.putShort((short) 32100)
+			.putShort((short) sourcePort)
 			.putShort((short) 80)
 			.array();
 	}

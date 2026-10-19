@@ -1,4 +1,4 @@
-package am.ik.sluice.server.proxy;
+package am.ik.sluice.server.proxyprotocol;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;

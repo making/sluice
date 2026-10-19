@@ -20,7 +20,8 @@ import org.jspecify.annotations.Nullable;
  * A loopback TCP proxy delaying every chunk it relays by a fixed time, in both
  * directions, so a connection through it has a round trip of twice the delay; bandwidth
  * is not limited. Each accepted connection is relayed to the target over a connection of
- * its own; an EOF passes on as a half-close once its delay passed.
+ * its own; an EOF passes on as a half-close once its delay passed. A prefixing proxy
+ * writes its prefix (a PROXY protocol header, say) to each target connection first.
  */
 public final class DelayingProxy implements AutoCloseable {
 
@@ -30,13 +31,16 @@ public final class DelayingProxy implements AutoCloseable {
 
 	private final long delayNanos;
 
+	private final byte[] prefix;
+
 	private final AtomicLong relayed = new AtomicLong();
 
 	private final List<Socket> sockets = new CopyOnWriteArrayList<>();
 
-	private DelayingProxy(int targetPort, Duration delay) throws IOException {
+	private DelayingProxy(int targetPort, Duration delay, byte[] prefix) throws IOException {
 		this.targetPort = targetPort;
 		this.delayNanos = delay.toNanos();
+		this.prefix = prefix.clone();
 		this.server = new ServerSocket();
 		this.server.bind(new InetSocketAddress("127.0.0.1", 0), 16);
 		Thread.ofVirtual().name("e2e-delaying-proxy-accept").start(this::accept);
@@ -46,7 +50,15 @@ public final class DelayingProxy implements AutoCloseable {
 	 * Starts a proxy to {@code 127.0.0.1:targetPort} delaying each way by {@code delay}.
 	 */
 	public static DelayingProxy start(int targetPort, Duration delay) throws IOException {
-		return new DelayingProxy(targetPort, delay);
+		return new DelayingProxy(targetPort, delay, new byte[0]);
+	}
+
+	/**
+	 * Starts an undelayed proxy to {@code 127.0.0.1:targetPort} writing {@code prefix} to
+	 * each target connection before the bytes it relays.
+	 */
+	public static DelayingProxy prefixing(int targetPort, byte[] prefix) throws IOException {
+		return new DelayingProxy(targetPort, Duration.ZERO, prefix);
 	}
 
 	/** The port the proxy listens on. */
@@ -68,6 +80,7 @@ public final class DelayingProxy implements AutoCloseable {
 				to.setTcpNoDelay(true);
 				this.sockets.add(from);
 				this.sockets.add(to);
+				to.getOutputStream().write(this.prefix);
 				relay(from, to);
 				relay(to, from);
 			}

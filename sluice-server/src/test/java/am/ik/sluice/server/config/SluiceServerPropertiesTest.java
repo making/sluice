@@ -67,12 +67,17 @@ class SluiceServerPropertiesTest {
 	void proxyProtocolDefaultsToDisabled() {
 		SluiceServerProperties properties = bind(Map.of("sluice.data-port", "8000"));
 		assertThat(properties.proxyProtocol()).isFalse();
+		assertThat(properties.controlProxyProtocol()).isFalse();
 	}
 
 	@Test
 	void proxyProtocolIsBoundInKebabCase() {
 		SluiceServerProperties properties = bind(Map.of("sluice.proxy-protocol", "true"));
 		assertThat(properties.proxyProtocol()).isTrue();
+		assertThat(properties.controlProxyProtocol()).isFalse();
+		properties = bind(Map.of("sluice.control-proxy-protocol", "true"));
+		assertThat(properties.proxyProtocol()).isFalse();
+		assertThat(properties.controlProxyProtocol()).isTrue();
 	}
 
 	@Test
