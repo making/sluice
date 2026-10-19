@@ -327,6 +327,8 @@ public class Router {
 
 	private final LoadBalanceStrategy tcpStrategy;
 
+	private final RouteGate gate;
+
 	/**
 	 * The load balancing strategies default to {@link LoadBalance#SMALLEST_CLIENT_ID}
 	 * (deterministic across nodes).
@@ -336,8 +338,17 @@ public class Router {
 	}
 
 	public Router(LoadBalance httpLoadBalance, LoadBalance tcpLoadBalance) {
+		this(httpLoadBalance, tcpLoadBalance, RouteGate.alwaysOpen());
+	}
+
+	/**
+	 * @param gate per-route gates; a shut route stops resolving and its requests fall
+	 * through to the next candidate
+	 */
+	public Router(LoadBalance httpLoadBalance, LoadBalance tcpLoadBalance, RouteGate gate) {
 		this.httpLoadBalance = httpLoadBalance;
 		this.tcpLoadBalance = tcpLoadBalance;
+		this.gate = Objects.requireNonNull(gate, "gate is required");
 		this.httpStrategy = httpLoadBalance.instance();
 		this.tcpStrategy = tcpLoadBalance.instance();
 	}
@@ -483,7 +494,7 @@ public class Router {
 	 */
 	public Optional<Route> lookupByPort(int port) {
 		List<Target> targets = this.byPort.get(port);
-		if (targets == null || targets.isEmpty()) {
+		if (targets == null || targets.isEmpty() || !this.gate.isOpen("tcp:" + port)) {
 			return Optional.empty();
 		}
 		return Optional.of(toRoute(this.tcpStrategy.pick(Integer.toString(port), targets)));
@@ -510,23 +521,35 @@ public class Router {
 			boolean hasPort = portSeparator > host.lastIndexOf(']'); // not an IPv6 suffix
 			String bareHost = hasPort ? host.substring(0, portSeparator) : host;
 			for (String candidate : hasPort ? List.of(host, bareHost) : List.of(host)) {
-				List<Target> targets = this.byDomain.get(candidate);
-				if (targets != null && !targets.isEmpty()) {
+				List<Target> targets = this.opened(candidate, this.byDomain.get(candidate));
+				if (targets != null) {
 					return Optional.of(new Match(candidate, targets));
 				}
 			}
 			for (Map.Entry<String, List<Target>> entry : this.byPattern.entrySet()) {
+				List<Target> targets = this.opened(entry.getKey(), entry.getValue());
 				Pattern pattern = entry.getValue().get(0).hostPattern();
-				if (pattern != null && pattern.matcher(bareHost).matches()) {
-					return Optional.of(new Match(entry.getKey(), entry.getValue()));
+				if (targets != null && pattern != null && pattern.matcher(bareHost).matches()) {
+					return Optional.of(new Match(entry.getKey(), targets));
 				}
 			}
 		}
-		List<Target> catchAll = this.byDomain.get("");
-		if (catchAll == null || catchAll.isEmpty()) {
+		List<Target> catchAll = this.opened("*", this.byDomain.get(""));
+		if (catchAll == null) {
 			return Optional.empty();
 		}
 		return Optional.of(new Match("", catchAll));
+	}
+
+	/**
+	 * The candidates when the key's gate is open; {@code null} when the key is unknown or
+	 * gated shut, so the lookup falls through to the next candidate.
+	 */
+	private @Nullable List<Target> opened(@Nullable String key, @Nullable List<Target> targets) {
+		if (targets == null || targets.isEmpty() || !this.gate.isOpen(key == null || key.isEmpty() ? "*" : key)) {
+			return null;
+		}
+		return targets;
 	}
 
 	private record Match(String key, List<Target> targets) {
@@ -578,6 +601,11 @@ public class Router {
 
 	public LoadBalance tcpLoadBalance() {
 		return this.tcpLoadBalance;
+	}
+
+	/** The route gates; the console shuts and reopens them. */
+	public RouteGate gate() {
+		return this.gate;
 	}
 
 	private static RouteGroup group(String key, List<Target> targets, LoadBalance loadBalance) {

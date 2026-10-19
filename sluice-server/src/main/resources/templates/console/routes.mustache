@@ -2,8 +2,14 @@
 <table class="grid routes">
   <thead><tr><th scope="col">Client id</th><th scope="col">Target</th><th scope="col">Role</th><th scope="col"><span class="visually-hidden">Note</span></th></tr></thead>
   {{#httpRoutes}}
-  <tbody data-route="{{domain}}">
-    <tr class="routes__key"><th colspan="4" scope="rowgroup" class="mono">{{#catchAll}}<span class="catch-all">any host</span> (catch-all){{/catchAll}}{{^catchAll}}{{domain}}{{/catchAll}}{{#decision}} <span class="decision">{{decision}}</span>{{/decision}}</th></tr>
+  <tbody data-route="{{domain}}" data-gate="{{gateLabel}}">
+    <tr class="routes__key"><th colspan="4" scope="rowgroup" class="mono">{{#catchAll}}<span class="catch-all">any host</span> (catch-all){{/catchAll}}{{^catchAll}}{{domain}}{{/catchAll}}{{#decision}} <span class="decision">{{decision}}</span>{{/decision}} <span class="tag route-gate{{^open}} route-gate--shut{{/open}}" data-testid="route-gate">{{gateLabel}}</span>
+      <form class="route-gate__form" method="post" action="/console/routes/gate">
+        {{#_csrf}}<input type="hidden" name="{{_csrf.parameterName}}" value="{{_csrf.token}}">{{/_csrf}}
+        <input type="hidden" name="key" value="{{gateKey}}">
+        <input type="hidden" name="open" value="{{#open}}false{{/open}}{{^open}}true{{/open}}">
+        <button class="route-gate__toggle" type="submit" title="in memory, until restart">{{gateAction}}</button>
+      </form></th></tr>
     {{#candidates}}
     <tr{{#serving}} class="is-serving"{{/serving}}>
       <td class="mono">{{clientId}}</td>
@@ -23,8 +29,14 @@
 <table class="grid routes">
   <thead><tr><th scope="col">Client id</th><th scope="col">Target</th><th scope="col">Role</th><th scope="col"><span class="visually-hidden">Note</span></th></tr></thead>
   {{#tcpRoutes}}
-  <tbody data-port="{{port}}">
-    <tr class="routes__key"><th colspan="4" scope="rowgroup"><span class="mono">:{{port}}</span> {{#bound}}<span class="bound">listening, owned by <span class="mono">{{owner}}</span></span>{{/bound}}{{^bound}}<span class="tag tag--fault">Not listening</span>{{/bound}}{{#decision}} <span class="decision">{{decision}}</span>{{/decision}}</th></tr>
+  <tbody data-port="{{port}}" data-gate="{{gateLabel}}">
+    <tr class="routes__key"><th colspan="4" scope="rowgroup"><span class="mono">:{{port}}</span> {{#bound}}<span class="bound">listening, owned by <span class="mono">{{owner}}</span></span>{{/bound}}{{^bound}}<span class="tag tag--fault">Not listening</span>{{/bound}}{{#decision}} <span class="decision">{{decision}}</span>{{/decision}} <span class="tag route-gate{{^open}} route-gate--shut{{/open}}" data-testid="route-gate">{{gateLabel}}</span>
+      <form class="route-gate__form" method="post" action="/console/routes/gate">
+        {{#_csrf}}<input type="hidden" name="{{_csrf.parameterName}}" value="{{_csrf.token}}">{{/_csrf}}
+        <input type="hidden" name="key" value="{{gateKey}}">
+        <input type="hidden" name="open" value="{{#open}}false{{/open}}{{^open}}true{{/open}}">
+        <button class="route-gate__toggle" type="submit" title="in memory, until restart">{{gateAction}}</button>
+      </form></th></tr>
     {{#candidates}}
     <tr{{#serving}} class="is-serving"{{/serving}}>
       <td class="mono">{{clientId}}</td>

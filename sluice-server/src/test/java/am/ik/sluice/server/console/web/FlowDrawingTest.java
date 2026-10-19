@@ -69,4 +69,18 @@ class FlowDrawingTest {
 		assertThat(FlowDrawing.builder().openConnections(60).build().conduitStreams()).hasSize(5);
 	}
 
+	@Test
+	void shutRoutesMarkTheIntakeWithALoweredGate() {
+		FlowDrawing drawing = FlowDrawing.builder()
+			.intake(FlowDrawing.Intake.builder().port(":8000").protocol("HTTP").open(0).shutRoutes(2))
+			.intake(FlowDrawing.Intake.builder().port(":9100").protocol("TCP").open(0))
+			.build();
+		FlowDrawing.Intake gated = drawing.intakes().get(0);
+		assertThat(gated.gated()).isTrue();
+		assertThat(gated.shutLabel()).isEqualTo("2 routes shut");
+		assertThat(gated.leafTop()).isEqualTo(gated.lane().y() - 7);
+		assertThat(gated.leafBottom()).isEqualTo(gated.lane().y() + 7);
+		assertThat(drawing.intakes().get(1).gated()).isFalse();
+	}
+
 }

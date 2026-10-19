@@ -32,6 +32,7 @@ import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.console.ControlPlanePort;
 import am.ik.sluice.server.proxy.DataProxyServer;
 import am.ik.sluice.server.proxy.TcpPortGateway;
+import am.ik.sluice.server.route.GateState;
 import am.ik.sluice.server.route.LoadBalance;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.ClusterLifecycle;
@@ -126,19 +127,25 @@ class ConsoleView {
 
 	FlowDrawing flow() {
 		List<TunnelSession> live = this.liveSessions();
+		long shutHttp = this.router.httpRoutes()
+			.stream()
+			.filter(group -> !this.router.gate().isOpen(group.key().isEmpty() ? "*" : group.key()))
+			.count();
 		FlowDrawing.Builder drawing = FlowDrawing.builder()
 			.intake(FlowDrawing.Intake.builder()
 				.port(":" + this.dataProxyServer.boundPort())
 				.protocol(this.properties.dataTlsBundle() == null ? "HTTP" : "HTTP + TLS")
 				.detail("Routed by Host header or SNI")
-				.open(this.dataProxyServer.activeConnections()));
+				.open(this.dataProxyServer.activeConnections())
+				.shutRoutes((int) shutHttp));
 		this.tcpPortGateway.bindings()
 			.forEach((port,
 					binding) -> drawing.intake(FlowDrawing.Intake.builder()
 						.port(":" + port)
 						.protocol("TCP")
 						.detail("Relayed to " + FlowDrawing.truncate(binding.clientId(), 18))
-						.open(binding.activeConnections())));
+						.open(binding.activeConnections())
+						.shutRoutes(this.router.gate().isOpen("tcp:" + port) ? 0 : 1)));
 		Map<String, Duties> duties = this.duties();
 		live.forEach(session -> {
 			Duties duty = duties.getOrDefault(session.clientId(), Duties.NONE);
@@ -292,25 +299,27 @@ class ConsoleView {
 
 	List<RouteRow> httpRoutes() {
 		LoadBalance loadBalance = this.router.httpLoadBalance();
-		return this.router.httpRoutes()
-			.stream()
-			.map(group -> new RouteRow(group.key(), candidates(group, loadBalance)))
-			.toList();
+		return this.router.httpRoutes().stream().map(group -> {
+			String tag = group.key().isEmpty() ? "*" : group.key();
+			GateState state = this.router.gate().stateOf(tag);
+			return new RouteRow(group.key(), candidates(group, loadBalance), state == GateState.OPEN, tag);
+		}).toList();
 	}
 
 	List<PortRow> tcpRoutes() {
 		LoadBalance loadBalance = this.router.tcpLoadBalance();
 		SortedMap<Integer, TcpPortGateway.Binding> bindings = this.tcpPortGateway.bindings();
-		return this.router.tcpRoutes()
-			.stream()
-			.map(group -> PortRow.builder()
+		return this.router.tcpRoutes().stream().map(group -> {
+			GateState state = this.router.gate().stateOf("tcp:" + group.key());
+			return PortRow.builder()
 				.port(group.key())
 				.owner(Optional.ofNullable(bindings.get(Integer.parseInt(group.key())))
 					.map(TcpPortGateway.Binding::clientId)
 					.orElse(""))
 				.candidates(candidates(group, loadBalance))
-				.build())
-			.toList();
+				.open(state == GateState.OPEN)
+				.build();
+		}).toList();
 	}
 
 	Optional<Lookup> lookup(String host) {
@@ -757,11 +766,23 @@ class ConsoleView {
 	 * The http routes registered under one domain.
 	 *
 	 * @param domain the domain ({@code ""} = catch-all)
+	 * @param open whether the route's gate is open (the console may have shut it)
+	 * @param gateKey the route key the gate is toggled under
 	 */
-	public record RouteRow(String domain, List<Candidate> candidates) {
+	public record RouteRow(String domain, List<Candidate> candidates, boolean open, String gateKey) {
 
 		public boolean catchAll() {
 			return this.domain.isEmpty();
+		}
+
+		/** The gate state as display text. */
+		public String gateLabel() {
+			return this.open ? "Open" : "Shut";
+		}
+
+		/** The gate toggle button label: the state to switch to. */
+		public String gateAction() {
+			return this.open ? "Shut" : "Open";
 		}
 
 		public String decision() {
@@ -774,11 +795,27 @@ class ConsoleView {
 	 * The tcp routes registered under one listen port.
 	 *
 	 * @param owner client whose listener is bound; empty when nothing is bound
+	 * @param open whether the route's gate is open (the console may have shut it)
 	 */
-	public record PortRow(String port, String owner, List<Candidate> candidates) {
+	public record PortRow(String port, String owner, List<Candidate> candidates, boolean open) {
 
 		public boolean bound() {
 			return !this.owner.isEmpty();
+		}
+
+		/** The gate state as display text. */
+		public String gateLabel() {
+			return this.open ? "Open" : "Shut";
+		}
+
+		/** The gate toggle button label: the state to switch to. */
+		public String gateAction() {
+			return this.open ? "Shut" : "Open";
+		}
+
+		/** The route key the gate is toggled under. */
+		public String gateKey() {
+			return "tcp:" + this.port;
 		}
 
 		public String decision() {
@@ -796,6 +833,8 @@ class ConsoleView {
 			private String owner = "";
 
 			private List<Candidate> candidates = List.of();
+
+			private boolean open = true;
 
 			private Builder() {
 			}
@@ -815,9 +854,14 @@ class ConsoleView {
 				return this;
 			}
 
+			public Builder open(boolean open) {
+				this.open = open;
+				return this;
+			}
+
 			public PortRow build() {
 				return new PortRow(Objects.requireNonNull(this.port, "port is required"), this.owner,
-						List.copyOf(this.candidates));
+						List.copyOf(this.candidates), this.open);
 			}
 
 		}

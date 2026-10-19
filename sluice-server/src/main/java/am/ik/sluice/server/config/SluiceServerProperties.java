@@ -3,6 +3,7 @@ package am.ik.sluice.server.config;
 import java.time.Duration;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import org.jspecify.annotations.Nullable;
@@ -11,6 +12,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.util.unit.DataSize;
 
+import am.ik.sluice.server.route.GateState;
 import am.ik.sluice.server.route.LoadBalance;
 
 /**
@@ -32,6 +34,7 @@ import am.ik.sluice.server.route.LoadBalance;
  * @param console management console settings (authentication)
  * @param tcpLoadBalance load balancing applied when several clients serve the same listen
  * port (tcp routes)
+ * @param route per-route settings: the gate each route starts from
  * @param limits data plane connection limits and the head deadline
  */
 @ConfigurationProperties("sluice")
@@ -39,7 +42,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		@DefaultValue("8000") int dataPort, @Nullable String dataTlsBundle, @Nullable String caBundle,
 		@DefaultValue("false") boolean dataProxyProtocol, @DefaultValue("false") boolean controlProxyProtocol,
 		@DefaultValue("") String tcpPortRange, AccessLog accessLog, AccessControl accessControl, Node node,
-		Cluster cluster, Console console, @DefaultValue("smallest-client-id") LoadBalance httpLoadBalance,
+		Cluster cluster, Console console, Route route, @DefaultValue("smallest-client-id") LoadBalance httpLoadBalance,
 		@DefaultValue("smallest-client-id") LoadBalance tcpLoadBalance, Limits limits) {
 
 	public SluiceServerProperties {
@@ -49,6 +52,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		node = node == null ? Node.builder().build() : node;
 		cluster = cluster == null ? Cluster.builder().build() : cluster;
 		console = console == null ? Console.builder().build() : console;
+		route = route == null ? Route.builder().build() : route;
 		limits = limits == null ? Limits.builder().build() : limits;
 	}
 
@@ -125,9 +129,15 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * during drain before closing the tunnel streams
 	 * @param membershipPoll how often the membership is re-read from the
 	 * {@code NodeDirectory} and pushed to connected clients on change
+	 * @param tlsBundle SSL bundle used to dial the other nodes' control planes (peer to
+	 * peer, e.g. for the route gate propagation); mTLS peers need a keystore, self signed
+	 * certificates a truststore
+	 * @param insecure whether the peer to peer connections skip TLS verification (self
+	 * signed certificates); {@code tls-bundle} takes precedence
 	 */
 	public record Cluster(@DefaultValue("") List<String> nodes, @DefaultValue("10s") Duration warmup,
-			@DefaultValue("10s") Duration drainGrace, @DefaultValue("10s") Duration membershipPoll) {
+			@DefaultValue("10s") Duration drainGrace, @DefaultValue("10s") Duration membershipPoll,
+			@DefaultValue("") String tlsBundle, @DefaultValue("false") boolean insecure) {
 
 		public Cluster {
 			nodes = nodes == null ? List.of() : List.copyOf(nodes);
@@ -135,6 +145,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			drainGrace = drainGrace == null || drainGrace.isNegative() ? Duration.ofSeconds(10) : drainGrace;
 			membershipPoll = membershipPoll == null || membershipPoll.isNegative() ? Duration.ofSeconds(10)
 					: membershipPoll;
+			tlsBundle = tlsBundle == null ? "" : tlsBundle;
 		}
 
 		public static Builder builder() {
@@ -150,6 +161,10 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			@Nullable private Duration drainGrace;
 
 			@Nullable private Duration membershipPoll;
+
+			private String tlsBundle = "";
+
+			private boolean insecure;
 
 			private Builder() {
 			}
@@ -174,10 +189,21 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder tlsBundle(String tlsBundle) {
+				this.tlsBundle = tlsBundle;
+				return this;
+			}
+
+			public Builder insecure(boolean insecure) {
+				this.insecure = insecure;
+				return this;
+			}
+
 			public Cluster build() {
 				return new Cluster(this.nodes, this.warmup == null ? Duration.ofSeconds(10) : this.warmup,
 						this.drainGrace == null ? Duration.ofSeconds(10) : this.drainGrace,
-						this.membershipPoll == null ? Duration.ofSeconds(10) : this.membershipPoll);
+						this.membershipPoll == null ? Duration.ofSeconds(10) : this.membershipPoll, this.tlsBundle,
+						this.insecure);
 			}
 
 		}
@@ -753,6 +779,45 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 	}
 
+	/**
+	 * Route settings.
+	 *
+	 * @param gate the gate each route starts from: the console opens and shuts route
+	 * gates in memory, on restart every route comes back to this. The key is the route
+	 * key shown in the console -- the domain, the host pattern as written,
+	 * {@code tcp:<port>} for tcp routes, {@code *} (or empty) for the catch-all; absent =
+	 * open
+	 */
+	public record Route(@DefaultValue Map<String, GateState> gate) {
+
+		public Route {
+			gate = gate == null ? Map.of() : Map.copyOf(gate);
+		}
+
+		public static Builder builder() {
+			return new Builder();
+		}
+
+		public static final class Builder {
+
+			@Nullable private Map<String, GateState> gate;
+
+			private Builder() {
+			}
+
+			public Builder gate(Map<String, GateState> gate) {
+				this.gate = gate;
+				return this;
+			}
+
+			public Route build() {
+				return new Route(this.gate == null ? Map.of() : this.gate);
+			}
+
+		}
+
+	}
+
 	public static Builder builder() {
 		return new Builder();
 	}
@@ -786,6 +851,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		@Nullable private Cluster cluster;
 
 		@Nullable private Console console;
+
+		private Route route = Route.builder().build();
 
 		private LoadBalance httpLoadBalance = LoadBalance.SMALLEST_CLIENT_ID;
 
@@ -866,6 +933,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			return this;
 		}
 
+		public Builder route(Route route) {
+			this.route = route;
+			return this;
+		}
+
 		public Builder httpLoadBalance(LoadBalance httpLoadBalance) {
 			this.httpLoadBalance = httpLoadBalance;
 			return this;
@@ -888,7 +960,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 					this.accessLog == null ? AccessLog.builder().build() : this.accessLog, this.accessControl,
 					this.node == null ? Node.builder().build() : this.node,
 					this.cluster == null ? Cluster.builder().build() : this.cluster,
-					this.console == null ? Console.builder().build() : this.console, this.httpLoadBalance,
+					this.console == null ? Console.builder().build() : this.console, this.route, this.httpLoadBalance,
 					this.tcpLoadBalance, this.limits == null ? Limits.builder().build() : this.limits);
 		}
 

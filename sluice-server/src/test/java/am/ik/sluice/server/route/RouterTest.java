@@ -2,6 +2,7 @@ package am.ik.sluice.server.route;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 
 import am.ik.sluice.v1.proto.Upstream;
 import org.junit.jupiter.api.Test;
@@ -102,6 +103,71 @@ class RouterTest {
 		Router router = new Router();
 		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3000")));
 		assertThat(router.lookup("other.local")).isEmpty();
+	}
+
+	@Test
+	void shutGateStopsTheRouteResolvingAndReopeningRestoresIt() {
+		Router router = new Router();
+		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3000")));
+		router.register("c2", List.of(upstream("other.local", "http://127.0.0.1:3001")));
+		router.gate().set("demo.local", GateState.SHUT);
+		assertThat(router.lookup("demo.local")).isEmpty();
+		// the other route is unaffected
+		assertThat(router.lookup("other.local")).isPresent();
+		router.gate().set("demo.local", GateState.OPEN);
+		assertThat(router.lookup("demo.local")).isPresent();
+	}
+
+	@Test
+	void shutExactRouteFallsThroughToTheCatchAll() {
+		Router router = new Router();
+		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3000")));
+		router.register("c2", List.of(upstream("", "http://127.0.0.1:3001")));
+		router.gate().set("demo.local", GateState.SHUT);
+		Router.Route route = router.lookup("demo.local").orElseThrow();
+		assertThat(route.clientId()).isEqualTo("c2");
+	}
+
+	@Test
+	void shutCatchAllStopsTheFallback() {
+		Router router = new Router();
+		router.register("c1", List.of(upstream("", "http://127.0.0.1:3000")));
+		router.gate().set("*", GateState.SHUT);
+		assertThat(router.lookup("anything.example")).isEmpty();
+	}
+
+	@Test
+	void shutGateStopsThePortResolving() {
+		Router router = new Router();
+		router.register("c1", List
+			.of(Upstream.newBuilder().setHost("").setTargetUrl("http://127.0.0.1:3000").setListenPort(9000).build()));
+		router.gate().set("tcp:9000", GateState.SHUT);
+		assertThat(router.lookupByPort(9000)).isEmpty();
+		router.gate().set("tcp:9000", GateState.OPEN);
+		assertThat(router.lookupByPort(9000)).isPresent();
+	}
+
+	@Test
+	void gateDefaultsDecideTheInitialState() {
+		RouteGate gate = new RouteGate(Map.of("demo.local", GateState.SHUT, "*", GateState.SHUT),
+				new InMemoryRouteGateStore());
+		Router router = new Router(LoadBalance.SMALLEST_CLIENT_ID, LoadBalance.SMALLEST_CLIENT_ID, gate);
+		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3000")));
+		router.register("c2", List.of(upstream("", "http://127.0.0.1:3001")));
+		assertThat(router.lookup("demo.local")).isEmpty();
+		assertThat(router.lookup("anything.example")).isEmpty();
+		assertThat(router.gate().stateOf("demo.local")).isEqualTo(GateState.SHUT);
+	}
+
+	@Test
+	void gateOverrideBeatsTheDefaultAndAnEmptyKeyMeansTheCatchAll() {
+		RouteGate gate = new RouteGate(Map.of("*", GateState.SHUT), new InMemoryRouteGateStore());
+		assertThat(gate.stateOf("")).isEqualTo(GateState.SHUT);
+		gate.set("", GateState.OPEN);
+		assertThat(gate.stateOf("*")).isEqualTo(GateState.OPEN);
+		assertThat(gate.stateOf("demo.local")).isEqualTo(GateState.OPEN); // no default =
+																			// open
+		assertThat(gate.defaultOf("demo.local")).isEqualTo(GateState.OPEN);
 	}
 
 	@Test

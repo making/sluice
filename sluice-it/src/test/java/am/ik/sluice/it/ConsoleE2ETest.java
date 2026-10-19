@@ -291,15 +291,38 @@ class ConsoleE2ETest {
 					HTTP demo.local http://127.0.0.1:%d Standby, console-client serves Keeps Host
 					""".formatted(httpPort));
 		assertThat(page.locator("tbody[data-route='demo.local']").innerText()).isEqualToNormalizingWhitespace("""
-				demo.local Smallest client id wins
+				demo.local Smallest client id wins Open Shut
 				console-client 127.0.0.1:%d Serving
 				console-z 127.0.0.1:%d Standby
 				""".formatted(httpPort, httpPort));
 		assertThat(page.locator("tbody[data-port='" + tcpRoutePort + "']").innerText())
 			.isEqualToNormalizingWhitespace("""
-					:%d listening, owned by console-client
+					:%d listening, owned by console-client Open Shut
 					console-client 127.0.0.1:%d Serving
 					""".formatted(tcpRoutePort, tcpPort));
+	}
+
+	/**
+	 * The gate toggle shuts a route from the browser and reopens it; the state survives
+	 * the polled refresh of the routes region.
+	 */
+	@Test
+	void gateToggleShutsAndReopensARoute() {
+		Page page = page();
+		page.navigate("http://127.0.0.1:" + this.port + "/console");
+		Locator route = page.locator("tbody[data-route='demo.local']");
+		Locator gate = route.getByTestId("route-gate");
+		assertThat(gate.innerText()).isEqualTo("Open");
+		route.getByRole(AriaRole.BUTTON).click();
+		PlaywrightAssertions.assertThat(gate).hasText("Shut", new LocatorAssertions.HasTextOptions());
+		assertThat(route.getAttribute("data-gate")).isEqualTo("Shut");
+		// the polled regions keep the state
+		page.waitForTimeout(2500);
+		PlaywrightAssertions.assertThat(page.locator("tbody[data-route='demo.local'] [data-testid=route-gate]"))
+			.hasText("Shut", new LocatorAssertions.HasTextOptions());
+		page.locator("tbody[data-route='demo.local']").getByRole(AriaRole.BUTTON).click();
+		PlaywrightAssertions.assertThat(page.locator("tbody[data-route='demo.local'] [data-testid=route-gate]"))
+			.hasText("Open", new LocatorAssertions.HasTextOptions());
 	}
 
 	/**

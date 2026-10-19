@@ -14,9 +14,27 @@ service Tunnel {
   // Returns the cluster membership (authenticated like Connect). Single-node
   // servers return only themselves with an empty `public_url`.
   rpc ListNodes (ListNodesRequest) returns (ListNodesResponse);
+  // Sets the gate state of a route (open / shut) on this node. Used by a peer
+  // node to propagate a gate toggle made through its console (authenticated
+  // like Connect).
+  rpc SetRouteGate (SetRouteGateRequest) returns (SetRouteGateResponse);
 }
 
 message ListNodesRequest {
+}
+
+// Gate toggle of one route, propagated between nodes.
+message SetRouteGateRequest {
+  // Route key as shown in the console: the domain, the host pattern, `tcp:<port>`
+  // for tcp routes, `*` for the catch-all.
+  string key = 1;
+  // true = open the gate, false = shut it.
+  bool open = 2;
+  // Node id of the node that took the toggle, for the receiver's logs.
+  string origin = 3;
+}
+
+message SetRouteGateResponse {
 }
 
 // One cluster node.

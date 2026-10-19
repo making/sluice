@@ -1,13 +1,19 @@
 package am.ik.sluice.server.console.web;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 import java.util.List;
 
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.server.cert.ClientCertificateIssuer;
 import am.ik.sluice.server.cert.ClientCertificateIssuers;
 import am.ik.sluice.server.cert.IssuedClientCertificate;
+import am.ik.sluice.server.cluster.RouteGatePropagator;
+import am.ik.sluice.server.route.GateState;
+import am.ik.sluice.server.route.Router;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -27,16 +33,25 @@ import org.springframework.web.bind.annotation.RequestParam;
 @Controller
 class ConsoleController {
 
+	private static final Logger log = LoggerFactory.getLogger(ConsoleController.class);
+
 	private final ConsoleView view;
 
 	private final ActuatorView actuatorView;
 
 	private final ClientCertificateIssuers clientCertificateIssuers;
 
-	ConsoleController(ConsoleView view, ActuatorView actuatorView, ClientCertificateIssuers clientCertificateIssuers) {
+	private final Router router;
+
+	private final RouteGatePropagator routeGatePropagator;
+
+	ConsoleController(ConsoleView view, ActuatorView actuatorView, ClientCertificateIssuers clientCertificateIssuers,
+			Router router, RouteGatePropagator routeGatePropagator) {
 		this.view = view;
 		this.actuatorView = actuatorView;
 		this.clientCertificateIssuers = clientCertificateIssuers;
+		this.router = router;
+		this.routeGatePropagator = routeGatePropagator;
 	}
 
 	@GetMapping("/")
@@ -92,6 +107,21 @@ class ConsoleController {
 	String live(Model model) {
 		this.addLive(model);
 		return "console/live";
+	}
+
+	/**
+	 * Opens or shuts the gate of one route, in memory on this node and every peer (until
+	 * restart: the gate comes back to its configured default).
+	 * @param key the route key as shown in the routes table
+	 * @param open {@code true} to open the gate, {@code false} to shut it
+	 */
+	@PostMapping("/console/routes/gate")
+	String routeGate(@RequestParam String key, @RequestParam boolean open) {
+		GateState state = open ? GateState.OPEN : GateState.SHUT;
+		this.router.gate().set(key, state);
+		log.debug("gate of route [{}] set {} from the console", key, state.name().toLowerCase(Locale.ROOT));
+		this.routeGatePropagator.propagate(key, open);
+		return "redirect:/console#routes";
 	}
 
 	/** The health of this node as reported by the actuator, indicator by indicator. */

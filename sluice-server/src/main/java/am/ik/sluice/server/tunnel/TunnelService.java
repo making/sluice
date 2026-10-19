@@ -11,6 +11,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import am.ik.sluice.server.auth.TokenValidator;
 import am.ik.sluice.server.cluster.NodeDirectory;
 import am.ik.sluice.server.config.SluiceServerProperties;
+import am.ik.sluice.server.route.GateState;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.PeerBuilds;
 import am.ik.sluice.tunnel.VirtualConnection;
@@ -195,6 +196,21 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 				.toList())
 			.setMembershipVersion(this.nodeDirectory.version())
 			.build());
+		responseObserver.onCompleted();
+	}
+
+	@Override
+	public void setRouteGate(am.ik.sluice.v1.proto.SetRouteGateRequest request,
+			StreamObserver<am.ik.sluice.v1.proto.SetRouteGateResponse> responseObserver) {
+		String key = request.getKey();
+		if (key.isBlank()) {
+			responseObserver.onError(Status.INVALID_ARGUMENT.withDescription("empty route key").asException());
+			return;
+		}
+		this.router.gate().set(key, request.getOpen() ? GateState.OPEN : GateState.SHUT);
+		log.debug("gate of route [{}] set {} by node {}", key, request.getOpen() ? "open" : "shut",
+				request.getOrigin());
+		responseObserver.onNext(am.ik.sluice.v1.proto.SetRouteGateResponse.getDefaultInstance());
 		responseObserver.onCompleted();
 	}
 

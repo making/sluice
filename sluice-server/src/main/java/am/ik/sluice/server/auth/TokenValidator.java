@@ -88,4 +88,12 @@ public class TokenValidator {
 		return MessageDigest.isEqual(this.token, given);
 	}
 
+	/**
+	 * The {@code authorization} header value that passes {@link #isValid}: the shared
+	 * token, for peer to peer calls (the route gate propagation).
+	 */
+	public String authorizationHeader() {
+		return new String(this.token, StandardCharsets.UTF_8);
+	}
+
 }

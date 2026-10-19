@@ -247,11 +247,31 @@ public record FlowDrawing(List<Intake> intakes, List<Outlet> outlets, int openCo
 	 * A public listener feeding the lock.
 	 *
 	 * @param open connections currently relayed from the listener
+	 * @param shutRoutes routes behind the listener whose gate the console shut
 	 */
-	public record Intake(String port, String protocol, String detail, int open, Lane lane) {
+	public record Intake(String port, String protocol, String detail, int open, int shutRoutes, Lane lane) {
 
 		public boolean active() {
 			return this.open > 0;
+		}
+
+		/** Whether any route behind the listener is gated shut. */
+		public boolean gated() {
+			return this.shutRoutes > 0;
+		}
+
+		/** The gate note appended to the detail line. */
+		public String shutLabel() {
+			return this.shutRoutes + (this.shutRoutes == 1 ? " route shut" : " routes shut");
+		}
+
+		/** The closed mitre leaves: hinge points on the banks, meeting downstream. */
+		public int leafTop() {
+			return this.lane.y() - 7;
+		}
+
+		public int leafBottom() {
+			return this.lane.y() + 7;
 		}
 
 		public String path() {
@@ -282,6 +302,8 @@ public record FlowDrawing(List<Intake> intakes, List<Outlet> outlets, int openCo
 
 			private int open;
 
+			private int shutRoutes;
+
 			private Builder() {
 			}
 
@@ -305,9 +327,15 @@ public record FlowDrawing(List<Intake> intakes, List<Outlet> outlets, int openCo
 				return this;
 			}
 
+			public Builder shutRoutes(int shutRoutes) {
+				this.shutRoutes = shutRoutes;
+				return this;
+			}
+
 			Intake build(Lane lane) {
 				return new Intake(Objects.requireNonNull(this.port, "port is required"),
-						Objects.requireNonNull(this.protocol, "protocol is required"), this.detail, this.open, lane);
+						Objects.requireNonNull(this.protocol, "protocol is required"), this.detail, this.open,
+						this.shutRoutes, lane);
 			}
 
 		}

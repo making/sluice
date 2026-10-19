@@ -788,6 +788,42 @@ code {
 	color: var(--fault);
 }
 
+/* route gates: the console can shut a route in memory, until restart */
+.route-gate {
+	margin-left: 0.75rem;
+}
+
+.route-gate--shut {
+	color: var(--amber);
+}
+
+.route-gate__form {
+	display: inline-block;
+	margin-left: 0.4rem;
+}
+
+.route-gate__toggle {
+	font: inherit;
+	font-size: 0.75rem;
+	font-weight: 600;
+	color: var(--ink);
+	background: none;
+	border: 1px solid var(--hair);
+	border-radius: 2px;
+	padding: 0 0.45rem;
+	cursor: pointer;
+}
+
+.route-gate__toggle:hover {
+	border-color: var(--ink);
+}
+
+.gate-shut line {
+	stroke: var(--amber);
+	stroke-width: 3;
+	stroke-linecap: round;
+}
+
 /* ------------------------------------------------------------------- aside */
 
 .lookup {
