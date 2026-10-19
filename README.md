@@ -74,6 +74,13 @@ sequenceDiagram
 
 Details: [.kb/tunnel-flow-control.md](.kb/tunnel-flow-control.md).
 
+## Constraints and notes
+
+- The data plane relays raw bytes. With `rewrite-host=true` the authority (`Host` / `:authority`) is rewritten on every request of the connection, both HTTP/1.1 and h2; upgraded connections (WebSocket, h2c upgrade, CONNECT) are rewritten up to the protocol switch.
+- h2 (plaintext and TLS-terminated) is demultiplexed, not relayed verbatim: every stream is routed by its own `:authority`, access-checked and logged, and flow control, settings and errors are per hop. An upstream's failure ends only the streams it covers, never the client's connection. Details: [.kb/h2-demux.md](.kb/h2-demux.md).
+- Malformed HTTP/1.1 requests (request smuggling vectors such as a duplicated `Host`, an invalid `Content-Length` or chunked framing) are not relayed: nothing from the malformed bytes on reaches the upstream, the client gets `400` (unless the upstream already began answering) and the connection is closed. Details: [.kb/http1-relay.md](.kb/http1-relay.md).
+- Upstream without HTTP/2 support: set `force-http1=true` on the upstream. The data plane's TLS termination then prefers http/1.1 in ALPN for the route, and an h2 stream that still reaches it (a browser coalescing the host onto another host's h2 connection, an h2-only or h2c client) is answered `421 Misdirected Request`, which Chrome and Firefox retry on a new connection. Without it, an `https://` upstream that does not negotiate h2 fails the route's h2 streams with `502` and the client logs a warning naming `force-http1`.
+
 ## Modules
 
 - `sluice-proto` - `.proto` contract, generated stubs, and the shared tunnel primitives (`VirtualConnection`, `SessionSender`, `SocketRelay`)
@@ -119,10 +126,9 @@ modules. Append `-Pnative` for GraalVM native images:
 ./mvnw -pl sluice-server -am package spring-boot:build-image -DskipTests
 ./mvnw -pl sluice-client -am package spring-boot:build-image -DskipTests
 
-./mvnw -pl sluice-server -am -Pnative -DskipTests package
-./mvnw -pl sluice-server -Pnative -DskipTests spring-boot:build-image   # native image
-./mvnw -pl sluice-client -am -Pnative -DskipTests package
-./mvnw -pl sluice-client -Pnative -DskipTests spring-boot:build-image   # native image
+# native image: package with -Pnative first (as in "Native image"), then
+./mvnw -pl sluice-server -Pnative -DskipTests spring-boot:build-image
+./mvnw -pl sluice-client -Pnative -DskipTests spring-boot:build-image
 ```
 
 This produces `sluice-server:latest` and `sluice-client:latest`. Run:
@@ -158,7 +164,7 @@ curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:8000/
 `sluice.server-url` schemes: `grpc://` (plaintext) / `grpcs://` (TLS; `--sluice.insecure=true` skips
 verification). For mutual TLS see "Mutual TLS (server <-> client)".
 
-### Pre-built Docker images
+### Published Docker images
 
 Multi-arch (amd64 / aarch64) JVM and native images are published to ghcr.io on every push to
 `main`: `ghcr.io/making/sluice/sluice-server:{jvm,native}` and
@@ -182,7 +188,9 @@ Relaxed binding maps `SLUICE_SERVER_URL` / `SLUICE_TOKEN` /
 `SLUICE_CLIENT_UPSTREAM_0_HOST` / `SLUICE_CLIENT_UPSTREAM_0_TARGET` to the properties above
 (`host.docker.internal` reaches ports published on the host).
 
-## TLS termination
+## Data plane features
+
+### TLS termination
 
 The data port terminates TLS when `sluice.data-tls-bundle` names an SSL bundle: h2 and
 http/1.1 are negotiated via ALPN, and plaintext is still served on the same port. With the
@@ -202,7 +210,7 @@ curl --http1.1 -k -H 'Host: demo.local' https://127.0.0.1:8000/
 
 TLS passthrough routed by SNI: see "SNI routing".
 
-## TCP port routing
+### TCP port routing
 
 Upstreams with `listen-port` are routed by the listen port instead of the connection
 head: the server opens one listener per advertised port and relays every accepted
@@ -240,7 +248,7 @@ re-advertises on it with the same jittered backoff (ceiling 1s..30s) until the p
 must be exposed on the host (`docker -p`, firewall) -- the deployment delta against
 the single data port.
 
-## SNI routing
+### SNI routing
 
 Where TCP port routing keys on the listen port, these two variants route a TLS
 connection by the server name of its ClientHello:
@@ -281,7 +289,7 @@ curl -k --resolve demo.local:8000:127.0.0.1 https://demo.local:8000/index.html
 # -> it-works-sni
 ```
 
-## Route authentication
+### Route authentication
 
 A route can require credentials on the data plane, configured on the server under its route
 key -- the key the console shows: the domain, the host pattern as written, `*` for the
@@ -337,7 +345,9 @@ sluice.route.auth.[api.example.com].api-token[0]={sha256}...
   `reason=auth-invalid`, `reason=auth-unreadable` (passthrough / non-HTTP), and `status=503
   reason=auth-busy`. The console tags such a route `Auth: <schemes>`.
 
-## Cluster (scale-out)
+## Cluster
+
+### Scale-out
 
 Run N server nodes: every client keeps one tunnel stream to every node, so each node holds
 the full route table locally -- no shared store, no inter-node hop.
@@ -437,7 +447,7 @@ Behavior:
 Without `sluice.cluster.nodes` the server runs single-node and nothing above applies
 (`ListNodes` returns just the node itself).
 
-## Cluster (TLS)
+### TLS control plane
 
 The control plane can serve TLS (`spring.grpc.server.ssl.bundle`), so a front end routes
 per node by SNI without terminating TLS. Verified end to end with a self-signed certificate;
@@ -482,10 +492,11 @@ echo | openssl s_client -connect 127.0.0.1:8101 -alpn h2 2>/dev/null | grep 'ALP
 E2E coverage: `ClusterGrpcTlsE2ETests` (sluice-it) -- both nodes serve, failover after a
 node stops, and h2 negotiation on the TLS endpoint.
 
-## Mutual TLS (server <-> client)
+### Mutual TLS (server <-> client)
 
 The server requires a client certificate (`client-auth=REQUIRE`) and the client presents one
-from an SSL bundle (`sluice.tls-bundle`); no `sluice.insecure` needed. Example with a local CA:
+from an SSL bundle (`sluice.tls-bundle`); no `sluice.insecure` needed. Client certificates can
+also be issued from the console; see "Client certificate issuance". Example with a local CA:
 
 ```sh
 # a private CA and two leaf certificates signed by it
@@ -528,24 +539,9 @@ rejection of a certificate-less client, a certificate issued through the console
 (`sluice.ca-bundle`), and TLS termination / passthrough on the data plane over the mTLS
 tunnel.
 
-## gRPC keepalive
+## Operations
 
-The tunnel is one long-lived gRPC stream; NAT / load balancers silently drop idle
-connections, so both sides keep it warm with HTTP/2 pings and the server-side values are
-set explicitly in `sluice-server/src/main/resources/application.properties`:
-
-| Setting | Value | Reason |
-|---|---|---|
-| server `spring.grpc.server.keepalive.time` / `spring.grpc.server.keepalive.timeout` | `30s` / `10s` | the server pings clients and reaps dead ones (session and routes released ~40s after silent death) |
-| server `spring.grpc.server.keepalive.permit.time` / `spring.grpc.server.keepalive.permit.without-calls` | `10s` / `true` | client pings every 30s; grpc's default permit (5m) risks `GOAWAY TOO_MANY_PINGS` |
-| client `sluice.keep-alive-time` / `sluice.keep-alive-timeout` | `30s` / `10s` | pings keep NAT mappings alive; an unanswered ping tears the channel down and the reconnect backoff (ceiling 1s..30s, jittered) takes over |
-
-Application-level `KEEPALIVE` frames are not sent: the gRPC (HTTP/2) ping already
-provides liveness. The frame type stays in the proto for future use and is handled as a
-no-op on both sides. `GrpcKeepAliveTest` (sluice-it) guards the behavior with a 1s-ping
-channel.
-
-## Connection limits
+### Connection limits
 
 Everything a peer can hold on the server or the client is bounded. Defaults are derived
 from the max heap or fixed; the effective connection limits are logged at startup
@@ -597,11 +593,28 @@ Details (overflow handling, reservations, probes, slot release, log throttles):
 [.kb/connection-limits.md](.kb/connection-limits.md). Tunnel and h2 buffering:
 [.kb/tunnel-flow-control.md](.kb/tunnel-flow-control.md), [.kb/h2-demux.md](.kb/h2-demux.md).
 
-## Health / metrics
+### gRPC keepalive
+
+The tunnel is one long-lived gRPC stream; NAT / load balancers silently drop idle
+connections, so both sides keep it warm with HTTP/2 pings and the server-side values are
+set explicitly in `sluice-server/src/main/resources/application.properties`:
+
+| Setting | Value | Reason |
+|---|---|---|
+| server `spring.grpc.server.keepalive.time` / `spring.grpc.server.keepalive.timeout` | `30s` / `10s` | the server pings clients and reaps dead ones (session and routes released ~40s after silent death) |
+| server `spring.grpc.server.keepalive.permit.time` / `spring.grpc.server.keepalive.permit.without-calls` | `10s` / `true` | client pings every 30s; grpc's default permit (5m) risks `GOAWAY TOO_MANY_PINGS` |
+| client `sluice.keep-alive-time` / `sluice.keep-alive-timeout` | `30s` / `10s` | pings keep NAT mappings alive; an unanswered ping tears the channel down and the reconnect backoff (ceiling 1s..30s, jittered) takes over |
+
+Application-level `KEEPALIVE` frames are not sent: the gRPC (HTTP/2) ping already
+provides liveness. The frame type stays in the proto for future use and is handled as a
+no-op on both sides. `GrpcKeepAliveTest` (sluice-it) guards the behavior with a 1s-ping
+channel.
+
+### Health / metrics
 
 - server `GET /actuator/health` - liveness, UP while the process lives; details `clients`
   (connected tunnel clients) and `draining`. `/actuator/health/readiness` is DOWN during the
-  cluster warmup window and while draining (see "Cluster (scale-out)")
+  cluster warmup window and while draining (see "Cluster")
 - client `GET /actuator/health` (port 9001) - UP while at least one per-node tunnel stream is
   established; the `tunnel` detail shows the connection state and `nodes` each node's stream state
 - `GET /actuator/prometheus` - JVM metrics plus the `sluice_*` meters (the server's tagged with `node`):
@@ -612,7 +625,7 @@ Details (overflow handling, reservations, probes, slot release, log throttles):
 
   Every meter with its tags: [.kb/metrics.md](.kb/metrics.md).
 
-### Grafana dashboard
+#### Grafana dashboard
 
 `dashboards/sluice.json` is a Grafana dashboard over these metrics, one JSON for the
 server and the clients: rows for the tunnel, the data plane and the h2 demux (server), the
@@ -643,7 +656,7 @@ exported no GC pause timer, so its GC panel shows only the overhead.
 neither the server's nor the client's scrape, or a query does not select the label
 variables.
 
-## Console
+### Console
 
 `http://<server>:8081/console` (the actuator port) shows the live state of one node: the
 public listeners, connected clients with their build, upstreams and traffic, the http / tcp route
@@ -658,7 +671,7 @@ hover. A client that predates build reporting shows `Unknown (older build)`; the
 The server logs each client's build at its first `Advertise`; the Java client logs the server's
 build when its stream comes up.
 
-### Client certificate issuance
+#### Client certificate issuance
 
 With a CA configured, the console issues client certificates for the mTLS control plane:
 the `Client certificate` panel links to `/console/certificates`, where a common name and
@@ -676,7 +689,7 @@ needed -- the control plane truststore already pins the CA:
 The panel and the page are read-only until `sluice.ca-bundle` is set. Keys are created on
 the server at issuance time (no CSR handling); revocation and renewal are out of scope.
 
-### Console authentication
+#### Console authentication
 
 The console requires a signed-in user; the actuator endpoints and the console static
 assets stay open. The mechanism is `sluice.console.auth.type`:
@@ -795,7 +808,7 @@ its discovery document advertises an `end_session_endpoint`; register
 |---|---|---|
 | `sluice.node.id` | hostname | cluster node id (logs, metrics, membership) |
 | `sluice.node.public-url` | - | control plane address clients use for this node (e.g. `grpcs://sluice-0.example.com`); empty = reachable at the bootstrap address only |
-| `sluice.cluster.nodes` | (empty = single-node) | cluster members, `nodeId=publicUrl` entries; see "Cluster (scale-out)" |
+| `sluice.cluster.nodes` | (empty = single-node) | cluster members, `nodeId=publicUrl` entries; see "Cluster" |
 | `sluice.cluster.warmup` | `10s` | readiness stays down this long after start |
 | `sluice.cluster.drain-grace` | `10s` | wait for in-flight virtual connections during drain |
 | `sluice.cluster.membership-poll` | `10s` | membership re-read interval (pushed to clients on change) |
@@ -850,10 +863,3 @@ its discovery document advertises an `end_session_endpoint`; register
 | Property | Default | Description |
 |---|---|---|
 | `server.port` | `9001` | actuator (health / info / prometheus) |
-
-## Constraints and notes
-
-- The data plane relays raw bytes. With `rewrite-host=true` the authority (`Host` / `:authority`) is rewritten on every request of the connection, both HTTP/1.1 and h2; upgraded connections (WebSocket, h2c upgrade, CONNECT) are rewritten up to the protocol switch.
-- h2 (plaintext and TLS-terminated) is demultiplexed, not relayed verbatim: every stream is routed by its own `:authority`, access-checked and logged, and flow control, settings and errors are per hop. An upstream's failure ends only the streams it covers, never the client's connection. Details: [.kb/h2-demux.md](.kb/h2-demux.md).
-- Malformed HTTP/1.1 requests (request smuggling vectors such as a duplicated `Host`, an invalid `Content-Length` or chunked framing) are not relayed: nothing from the malformed bytes on reaches the upstream, the client gets `400` (unless the upstream already began answering) and the connection is closed. Details: [.kb/http1-relay.md](.kb/http1-relay.md).
-- Upstream without HTTP/2 support: set `force-http1=true` on the upstream. The data plane's TLS termination then prefers http/1.1 in ALPN for the route, and an h2 stream that still reaches it (a browser coalescing the host onto another host's h2 connection, an h2-only or h2c client) is answered `421 Misdirected Request`, which Chrome and Firefox retry on a new connection. Without it, an `https://` upstream that does not negotiate h2 fails the route's h2 streams with `502` and the client logs a warning naming `force-http1`.
