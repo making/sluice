@@ -417,8 +417,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * before its windows are withheld; a window grows past 65535 bytes only as far as the
 	 * budget takes it; {@code 0} = an eighth of half the maximum heap
 	 * @param h2StreamWaitTimeout how long an h2 stream may wait for a place within its
-	 * upstream's {@code SETTINGS_MAX_CONCURRENT_STREAMS} before the relay refuses it
-	 * ({@code REFUSED_STREAM}); {@code 0} = off
+	 * upstream's {@code SETTINGS_MAX_CONCURRENT_STREAMS}, or for its route's credential
+	 * check, before the relay refuses it ({@code REFUSED_STREAM}); {@code 0} = off
 	 * @param halfCloseProbeInterval how long a plaintext or TLS-terminated HTTP
 	 * connection whose client ended its side stays quiet, a response owed, before the
 	 * relay probes whether the client is still there: an HTTP/1.1 one, none of the

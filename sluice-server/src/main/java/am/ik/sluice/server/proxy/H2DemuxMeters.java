@@ -135,8 +135,8 @@ final class H2DemuxMeters {
 			.description(
 					"h2 streams refused (REFUSED_STREAM) for want of queue budget, past a connection's share of it,"
 							+ " for want of a slot for a new leg, or"
-							+ " while waiting for an upstream's concurrency limit, to free the queue of a connection whose"
-							+ " window is withheld or past the wait deadline")
+							+ " while waiting for an upstream's concurrency limit or a credential check, to free the queue"
+							+ " of a connection whose window is withheld or past the wait deadline")
 			.register(registry);
 	}
 
@@ -172,17 +172,17 @@ final class H2DemuxMeters {
 	}
 
 	/**
-	 * A stream refused while waiting for its upstream's concurrency limit: the client's
-	 * connection window was withheld and the waiting streams held more than the
-	 * connection's allowance.
+	 * A stream refused while waiting for its upstream's concurrency limit or its
+	 * credential check: the client's connection window was withheld and the waiting
+	 * streams held more than the connection's allowance.
 	 */
 	void refusedWaiting() {
 		this.refusedWaiting.increment();
 	}
 
 	/**
-	 * A stream refused: it waited for its upstream's concurrency limit past
-	 * {@code sluice.limits.h2-stream-wait-timeout}.
+	 * A stream refused: it waited for its upstream's concurrency limit or its credential
+	 * check past {@code sluice.limits.h2-stream-wait-timeout}.
 	 */
 	void refusedForWaitTimeout() {
 		this.refusedWaitTimeout.increment();

@@ -19,8 +19,10 @@ dispatch must tell a JWT from a static token (or the combination is refused, see
 - Config under `sluice.route.auth.[<key>].oidc`: issuer (discovery), audience, allowed algorithms,
   optional required claims (e.g. groups / email domain), clock skew.
 - Verification is CPU only on the request path: the JWKS is fetched at startup and refreshed in the
-  background (and on an unknown `kid`, rate limited, off the request thread). The h2 demux verifies
-  under its loop lock (see 158), so no network I/O may happen in `verify`.
+  background (and on an unknown `kid`, rate limited, off the request thread). Only a `Credential`
+  whose `bounded()` is true is checked off the h2 demux's loop (`RouteAuthenticator#verifyAsync`:
+  a virtual thread, one check per credential in flight, at most `maxVerifications`); an unbounded
+  one is checked inline under the loop lock, so it must stay cheap and do no I/O.
 - Startup with an unreachable issuer: decide (fail the start vs. refuse the route's requests until
   the JWKS loads); never pass unchecked.
 - Cache: today a success is remembered a fixed `CACHE_TTL`. A JWT must not outlive its `exp`: make

@@ -359,8 +359,12 @@ docker run --rm --pull always --name sluice-server -p 8000:8000 -p 8001:8001 -p 
 - A credential that matched is remembered per route by its SHA-256 for 10 minutes (up to 10000
   of them), so a client's later requests skip the encoder; one that did not match is never
   remembered. At most as many checks against `bcrypt` / `pbkdf2` as CPUs (at least 2) run at
-  once; a request whose check would take one more is answered `503` with `Retry-After: 1`.
-  bcrypt and pbkdf2 cost milliseconds per check by design: prefer `sha256` for tokens.
+  once; a request whose check would take one more is answered `503` with `Retry-After: 1`, and
+  requests presenting the credential of a check under way wait for that check. bcrypt and
+  pbkdf2 cost milliseconds per check by design: prefer `sha256` for tokens.
+- On h2 such a check holds its own stream only: the connection's other streams go on
+  meanwhile. A stream whose check has not ended after `sluice.limits.h2-stream-wait-timeout`
+  is refused with `REFUSED_STREAM`. Details: [.kb/h2-demux.md](.kb/h2-demux.md).
 - Without `sluice.data-tls-bundle` the server warns at startup that the credentials cross the
   data plane in cleartext unless a front end terminates TLS.
 - Refusals are logged as `type=req ... status=401 reason=auth-missing` (no credential),
@@ -839,7 +843,7 @@ its discovery document advertises an `end_session_endpoint`; register
 | `sluice.limits.tcp-keep-alive` | `60s` | TCP keepalive idle time of every accepted data plane connection: once it carried nothing for so long, the kernel probes the client every 10s and fails the connection after 3 probes unanswered; whole seconds; `0` = off; see "Connection limits" |
 | `sluice.limits.half-close-probe-interval` | `1s` | quiet after which a plaintext or TLS-terminated HTTP connection whose client ended its side, a response owed, gets a probe to learn whether the client is gone: HTTP/1.1 a `100 Continue`, h2 a PING; `0` = off; see "Connection limits" |
 | `sluice.limits.h2-queue-budget` | `0` = an eighth of half the max heap | bytes the h2 demux relays may hold, and grant as window, beyond each connection's allowance, shared by all of them; see [.kb/h2-demux.md](.kb/h2-demux.md) |
-| `sluice.limits.h2-stream-wait-timeout` | `30s` | how long an h2 stream may wait for a place within its upstream's `SETTINGS_MAX_CONCURRENT_STREAMS` before it is refused with `REFUSED_STREAM`; `0` = off; see "Connection limits" |
+| `sluice.limits.h2-stream-wait-timeout` | `30s` | how long an h2 stream may wait for a place within its upstream's `SETTINGS_MAX_CONCURRENT_STREAMS`, or for its route's credential check, before it is refused with `REFUSED_STREAM`; `0` = off; see "Connection limits" |
 | `sluice.limits.tunnel-budget` | `0` = an eighth of half the max heap | bytes the tunnel connections may buffer past 64KiB each (grown receive windows, queued frames), shared by all of them; twice it (at least 1MiB) is the gRPC flow control window |
 | `sluice.limits.tunnel-stall-timeout` | `60s` | how long a tunnel stream may hold frames queued for its client while not ready, the client taking none of them, before the session is failed; `0` = off; see "Connection limits" |
 | `sluice.limits.advertise-timeout` | `10s` | how long a tunnel stream may go without the client's first `Advertise` before it is failed with `DEADLINE_EXCEEDED`; see "Connection limits" |

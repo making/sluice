@@ -5,6 +5,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -14,6 +15,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.function.LongSupplier;
 import java.util.stream.Stream;
@@ -48,11 +51,13 @@ import am.ik.sluice.server.route.Router;
  * <p>
  * A credential that matched is remembered per route, by its SHA-256, for
  * {@link #CACHE_TTL} among the {@link #CACHE_SIZE} most recent ones: the client's later
- * requests skip the encoder. A credential that did not match is never remembered. Checks
- * against a deliberately slow hash (bcrypt, pbkdf2) run at most {@code maxVerifications}
- * at once; a request whose check would take one more is refused ({@link Verdict.Busy}). A
- * Basic user name the route does not know is checked against another user's password all
- * the same, so it takes the time a known one does.
+ * requests skip the encoder. A credential that did not match is never remembered. A check
+ * against a deliberately slow hash (bcrypt, pbkdf2) runs on a virtual thread of its own
+ * ({@link #verifyAsync}), at most {@code maxVerifications} of them at once: a request
+ * whose check would take one more is refused ({@link Verdict.Busy}), and a request
+ * presenting a credential under check already waits for that check instead of starting
+ * one. A Basic user name the route does not know is checked against another user's
+ * password all the same, so it takes the time a known one does.
  */
 @Component
 public class RouteAuthenticator {
@@ -82,6 +87,12 @@ public class RouteAuthenticator {
 
 	/** Matched credentials to the time they expire, least recently used first. */
 	private final Map<String, Long> verified;
+
+	/**
+	 * The slow checks in flight, by the key their credential is remembered under: whether
+	 * it matched. With its own lock.
+	 */
+	private final Map<String, CompletableFuture<Boolean>> inFlight = new HashMap<>();
 
 	@Autowired
 	RouteAuthenticator(SluiceServerProperties properties, PasswordEncoder encoder) {
@@ -123,37 +134,80 @@ public class RouteAuthenticator {
 
 	/**
 	 * Checks the request of the route against the route's credentials;
-	 * {@link Verdict#OPEN} for a route without any.
+	 * {@link Verdict#OPEN} for a route without any. Blocks while a slow check runs
+	 * ({@link #verifyAsync}): for a caller on a thread of its own.
+	 * @throws IllegalStateException interrupted while waiting for a slow check (the
+	 * thread's interrupt status set again), or the check failed
 	 */
 	public Verdict verify(Router.Route route, RequestHeaders headers) {
+		try {
+			return verifyAsync(route, headers).get();
+		}
+		catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new IllegalStateException("interrupted while checking a credential", e);
+		}
+		catch (ExecutionException e) {
+			if (e.getCause() instanceof Error error) {
+				throw error;
+			}
+			throw new IllegalStateException("the credential check failed", e.getCause());
+		}
+	}
+
+	/**
+	 * Checks the request of the route against the route's credentials without blocking:
+	 * the verdict is complete at once unless a credential is to be checked against a slow
+	 * hash and is not remembered; that check runs on a virtual thread of its own -- or is
+	 * the one in flight for the same credential --, and the verdict completes with it, on
+	 * that thread, or exceptionally with what the check threw. Cancelling the verdict
+	 * leaves the check running to its end. {@link Verdict#OPEN} for a route without
+	 * credentials.
+	 */
+	public CompletableFuture<Verdict> verifyAsync(Router.Route route, RequestHeaders headers) {
 		Policy policy = this.policies.get(keyOf(route));
 		if (policy == null) {
-			return Verdict.OPEN;
+			return CompletableFuture.completedFuture(Verdict.OPEN);
 		}
 		if (policy.allowPreflight() && "OPTIONS".equals(headers.method())
 				&& !headers.values(PREFLIGHT_METHOD).isEmpty()) {
-			return policy.pass();
+			return CompletableFuture.completedFuture(policy.pass());
 		}
 		List<Presented> presented = new ArrayList<>(2);
 		for (String header : policy.headers()) {
 			List<String> values = headers.values(header);
 			if (values.size() > 1) {
-				return policy.unauthorized("invalid");
+				return CompletableFuture.completedFuture(policy.unauthorized("invalid"));
 			}
 			if (values.size() == 1) {
 				presented.add(policy.credential(header, values.get(0)));
 			}
 		}
 		if (presented.isEmpty()) {
-			return policy.unauthorized("missing");
+			return CompletableFuture.completedFuture(policy.unauthorized("missing"));
 		}
-		for (Presented credential : presented) {
-			Verdict verdict = this.check(policy, credential);
-			if (verdict != null) {
-				return verdict;
+		return this.decide(policy, presented, 0);
+	}
+
+	/**
+	 * The verdict on the presented credentials from {@code from} on, in order: the first
+	 * that matches passes, a check past the bound is busy, and none matching is
+	 * unauthorized.
+	 */
+	private CompletableFuture<Verdict> decide(Policy policy, List<Presented> presented, int from) {
+		for (int i = from; i < presented.size(); i++) {
+			CompletableFuture<@Nullable Verdict> verdict = this.check(policy, presented.get(i));
+			if (!verdict.isDone() || verdict.isCompletedExceptionally()) {
+				int next = i + 1;
+				return verdict.thenCompose(checked -> checked != null ? CompletableFuture.completedFuture(checked)
+						: this.decide(policy, presented, next));
+			}
+			Verdict checked = verdict.join();
+			if (checked != null) {
+				return CompletableFuture.completedFuture(checked);
 			}
 		}
-		return policy.unauthorized("invalid");
+		return CompletableFuture.completedFuture(policy.unauthorized("invalid"));
 	}
 
 	/**
@@ -186,35 +240,97 @@ public class RouteAuthenticator {
 
 	/**
 	 * The verdict on the credential: a pass when it matched, busy when checking it would
-	 * take a verification past the bound; null when it did not match.
+	 * take a verification past the bound; null when it did not match. Complete at once
+	 * but for a credential checked against a slow hash and not remembered
+	 * ({@link #slowMatch}).
 	 */
-	private @Nullable Verdict check(Policy policy, Presented presented) {
+	private CompletableFuture<@Nullable Verdict> check(Policy policy, Presented presented) {
 		CredentialScheme.Credential credential = presented.credential();
 		if (credential.id().isEmpty()) {
-			return null;
+			return CompletableFuture.completedFuture(null);
 		}
 		String cacheKey = policy.key() + '\n' + presented.scheme() + '\n' + sha256(credential.id());
 		if (this.remembered(cacheKey)) {
-			return policy.pass();
+			return CompletableFuture.completedFuture(policy.pass());
 		}
-		boolean bounded = credential.bounded();
-		if (bounded && !this.verifications.tryAcquire()) {
-			return new Verdict.Busy(BUSY_RETRY_AFTER);
-		}
-		try {
+		if (!credential.bounded()) {
 			if (!credential.matches()) {
+				return CompletableFuture.completedFuture(null);
+			}
+			this.remember(cacheKey);
+			return CompletableFuture.completedFuture(policy.pass());
+		}
+		CompletableFuture<Boolean> matched = this.slowMatch(cacheKey, credential);
+		if (matched == null) {
+			return CompletableFuture.completedFuture(new Verdict.Busy(BUSY_RETRY_AFTER));
+		}
+		return matched.thenApply(match -> match ? policy.pass() : null);
+	}
+
+	/**
+	 * Whether a credential checked against a slow hash matched: the check in flight for
+	 * it, else a new one on a virtual thread of its own, holding one of the verifications
+	 * until it ended -- null when none is left. A credential that matched is remembered
+	 * before its check leaves the flight, so a request after it finds either.
+	 */
+	private @Nullable CompletableFuture<Boolean> slowMatch(String cacheKey, CredentialScheme.Credential credential) {
+		CompletableFuture<Boolean> matched;
+		synchronized (this.inFlight) {
+			CompletableFuture<Boolean> running = this.inFlight.get(cacheKey);
+			if (running != null) {
+				return running;
+			}
+			if (!this.verifications.tryAcquire()) {
 				return null;
 			}
+			matched = new CompletableFuture<>();
+			this.inFlight.put(cacheKey, matched);
 		}
-		finally {
-			if (bounded) {
-				this.verifications.release();
+		Runnable check = () -> {
+			boolean match = false;
+			Throwable failure = null;
+			try {
+				match = credential.matches();
+				if (match) {
+					this.remember(cacheKey);
+				}
 			}
+			catch (Throwable e) {
+				// delivered to every request waiting for the check
+				failure = e;
+			}
+			finally {
+				this.landed(cacheKey);
+			}
+			if (failure != null) {
+				matched.completeExceptionally(failure);
+			}
+			else {
+				matched.complete(match);
+			}
+		};
+		try {
+			Thread.ofVirtual().name("sluice-route-auth").start(check);
 		}
+		catch (RuntimeException | Error e) {
+			this.landed(cacheKey);
+			matched.completeExceptionally(e);
+		}
+		return matched;
+	}
+
+	/** A slow check ended: it leaves the flight and frees its verification. */
+	private void landed(String cacheKey) {
+		synchronized (this.inFlight) {
+			this.inFlight.remove(cacheKey);
+		}
+		this.verifications.release();
+	}
+
+	private void remember(String cacheKey) {
 		synchronized (this.verified) {
 			this.verified.put(cacheKey, this.clock.getAsLong() + CACHE_TTL.toNanos());
 		}
-		return policy.pass();
 	}
 
 	private boolean remembered(String cacheKey) {

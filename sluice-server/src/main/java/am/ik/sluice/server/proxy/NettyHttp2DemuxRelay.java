@@ -18,6 +18,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -77,17 +80,21 @@ import io.netty.util.AsciiString;
  * ({@link RouteAuthenticator}): a refused one gets the unauthorized ({@code 401}) or, its
  * credential not checked for the checks in flight, the busy ({@code 503}) page the same
  * way; the headers of the route's credentials are removed from a head that passes unless
- * the route forwards them. A stream of a {@code force-http1} route is answered
- * {@code 421} without a body, then reset with {@code NO_ERROR} while its request is still
- * being sent; it opens no leg. When the connection's handshake was the stream's host's
- * own and offered http/1.1 -- h2 was picked as the handshake resolved no force-http1
- * route, say while the route was gated shut --, the {@code 421} comes with a GOAWAY
+ * the route forwards them. A check against a slow hash runs off the loop, its stream
+ * parked meanwhile ({@link #parkLocked}): the connection's other streams go on, and the
+ * parked stream resumes once the check ended -- to a stream id on its leg above those the
+ * leg opened meanwhile. A stream of a {@code force-http1} route is answered {@code 421}
+ * without a body, then reset with {@code NO_ERROR} while its request is still being sent;
+ * it opens no leg. When the connection's handshake was the stream's host's own and
+ * offered http/1.1 -- h2 was picked as the handshake resolved no force-http1 route, say
+ * while the route was gated shut --, the {@code 421} comes with a GOAWAY
  * {@code NO_ERROR}: Chromium retries a 421 on a new connection only past one it coalesced
  * the host onto. A head that is no request (no {@code :method}, no {@code :path} but for
  * a CONNECT, a CONNECT without {@code :authority}) is reset with {@code PROTOCOL_ERROR}.
  * A CONNECT stream is routed by its {@code :authority} and logged with it as its path.
  * <p>
- * Streams of one route share the route's leg and keep their stream ids on it; with
+ * Streams of one route share the route's leg and keep their stream ids on it, but for a
+ * parked stream a later one overtook ({@link Leg#streamIdLocked}); with
  * {@code rewrite-host} the head's {@code :authority} becomes the route's address. Windows
  * are per hop: DATA read on one hop is written on the other ({@link Flow}: a copy, small
  * frames coalesced) and consumed -- its stream window granted back -- once written, so
@@ -436,6 +443,17 @@ final class NettyHttp2DemuxRelay {
 	 */
 	private long pageBytes;
 
+	/**
+	 * The streams whose credential check runs ({@link #parkLocked}), by id; with the
+	 * loop's lock.
+	 */
+	private final Map<Integer, NewStream> parked = new HashMap<>();
+
+	/**
+	 * What the parked streams hold -- heads, DATA, trailers --; with the loop's lock.
+	 */
+	private long parkedBytes;
+
 	/** The connection window its peers held at the last review; with the loop's lock. */
 	private long credit;
 
@@ -673,10 +691,46 @@ final class NettyHttp2DemuxRelay {
 			route = found.get();
 			session = serving;
 		}
-		Verdict verdict = this.routeAuth.verify(route, ConnectionHeadParser.http2Headers(headers));
+		NewStream stream = new NewStream(streamId, route, session, host, request, headers, endStream);
+		CompletableFuture<Verdict> verdict = this.routeAuth.verifyAsync(route,
+				ConnectionHeadParser.http2Headers(headers));
+		if (verdict.isDone()) {
+			verifiedLocked(stream, verdict);
+		}
+		else {
+			parkLocked(stream, verdict);
+		}
+	}
+
+	/**
+	 * Goes on with a new stream once its credential check ended: a refused one is
+	 * answered ({@code 401}, {@code 503}), one that passes loses the headers of its
+	 * route's credentials and goes to its route's leg -- with what the client sent while
+	 * it was parked --, or is answered {@code 421} for a {@code force-http1} route; a
+	 * check that failed resets it ({@code INTERNAL_ERROR}). With the loop's lock.
+	 */
+	private void verifiedLocked(NewStream stream, CompletableFuture<Verdict> checked) {
+		int streamId = stream.id;
+		Router.Route route = stream.route;
+		ConnectionHeadParser.Head.Request request = stream.request;
+		Http2Headers headers = stream.headers;
+		Verdict verdict;
+		try {
+			verdict = checked.join();
+		}
+		catch (CompletionException | CancellationException e) {
+			Throwable cause = e.getCause() == null ? e : e.getCause();
+			log.warn("h2 demux: the credential check of a stream of route {} failed: {}", route.routeTag(),
+					cause.toString(), cause);
+			releaseParkedDataLocked(stream);
+			resetClientLocked(streamId, Http2Error.INTERNAL_ERROR);
+			return;
+		}
 		if (!(verdict instanceof Verdict.Pass pass)) {
 			this.access.refused(route.routeTag(), request, verdict);
-			Shortfall shortfall = answerLocked(streamId, this.errorResponse.refusalPage(host, request, verdict), false);
+			releaseParkedDataLocked(stream);
+			Shortfall shortfall = answerLocked(streamId, this.errorResponse.refusalPage(stream.host, request, verdict),
+					false);
 			if (shortfall != null) {
 				refuseForBudgetLocked(streamId, shortfall);
 			}
@@ -686,32 +740,38 @@ final class NettyHttp2DemuxRelay {
 			headers.remove(AsciiString.of(name));
 		}
 		if (route.forceHttp1()) {
-			misdirectLocked(streamId, host, route, request, endStream);
+			releaseParkedDataLocked(stream);
+			misdirectLocked(streamId, stream.host, route, request, stream.requestEnded);
 			return;
 		}
 		int headBytes = headerBytes(headers);
 		Shortfall shortfall = admitLocked(headBytes);
 		if (shortfall != null) {
+			releaseParkedDataLocked(stream);
 			refuseForBudgetLocked(streamId, shortfall);
 			return;
 		}
-		Leg leg = legLocked(route, session);
+		Leg leg = legLocked(route, stream.session, streamId);
 		if (leg == null) {
+			releaseParkedDataLocked(stream);
 			resetClientLocked(streamId, Http2Error.REFUSED_STREAM);
 			return;
 		}
 		if (route.rewriteHost()) {
 			headers.authority(AsciiString.of(route.address()));
 		}
-		Exchange exchange = new Exchange(streamId, leg, client());
-		exchange.host = host;
+		int legId = leg.streamIdLocked(streamId);
+		Exchange exchange = new Exchange(streamId, legId, leg, client());
+		exchange.host = stream.host;
 		exchange.request = request;
-		exchange.requestEnded = endStream;
+		exchange.requestEnded = stream.requestEnded;
 		exchange.tunnel = CONNECT.equals(request.method());
 		CharSequence expect = headers.get(EXPECT);
-		exchange.continueAwaited = expect != null && AsciiString.contentEqualsIgnoreCase(expect, CONTINUE);
+		exchange.continueAwaited = !stream.dataRead && expect != null
+				&& AsciiString.contentEqualsIgnoreCase(expect, CONTINUE);
 		exchange.responseFlow.onEndWritten(() -> responseWrittenLocked(exchange));
 		this.exchanges.put(streamId, exchange);
+		leg.streams.put(legId, exchange);
 		leg.routeMeters.trackedStreams().increment();
 		Hop hop = leg.hop();
 		// the head is held until written: in the leg's buffer while the stream waits
@@ -729,13 +789,166 @@ final class NettyHttp2DemuxRelay {
 				loseLocked(exchange);
 			}
 		});
-		hop.encoder().writeHeaders(hop.ctx(), streamId, headers, 0, endStream, written);
-		if (!written.isDone() && hop.connection().stream(streamId) == null) {
+		hop.encoder().writeHeaders(hop.ctx(), legId, headers, 0, stream.headEnds, written);
+		if (!written.isDone() && hop.connection().stream(legId) == null) {
 			// past the upstream's concurrency limit: buffered until a stream of the leg
 			// closes
 			waitLocked(exchange);
 		}
+		if (exchange.reset) {
+			releaseParkedDataLocked(stream);
+		}
+		else {
+			// what the client sent while the stream was parked follows its head
+			if (stream.dataRead) {
+				exchange.requestFlow.parked(stream.data, stream.dataEnds);
+			}
+			Http2Headers trailers = stream.trailers;
+			if (trailers != null) {
+				exchange.requestFlow.block(trailers, stream.trailersEnd);
+			}
+		}
 		this.access.request(route.routeTag(), request.method(), request.path(), HTTP_2);
+	}
+
+	/**
+	 * Parks a new stream while its credential check runs off the loop: its head is
+	 * admitted like a new stream's -- one that does not fit is refused
+	 * ({@code REFUSED_STREAM}) --, and what the client sends on it meanwhile is held in
+	 * the relay's account (its DATA not consumed, so within the stream window the relay
+	 * announced). The check's end resumes it on the loop ({@link #verifiedLocked}); it is
+	 * refused ({@code REFUSED_STREAM}) at the wait deadline, or like a stream waiting for
+	 * its upstream's concurrency limit while the windows are withheld
+	 * ({@link #refuseWaitingLocked}). A parked stream the client resets or that closes
+	 * otherwise, or the client endpoint closing, drops it: the check's end then finds
+	 * nothing to resume. With the loop's lock.
+	 */
+	private void parkLocked(NewStream stream, CompletableFuture<Verdict> verdict) {
+		Shortfall shortfall = admitLocked(stream.headBytes);
+		if (shortfall != null) {
+			verdict.cancel(false);
+			refuseForBudgetLocked(stream.id, shortfall);
+			return;
+		}
+		stream.verdict = verdict;
+		this.parked.put(stream.id, stream);
+		this.parkedBytes += stream.headBytes;
+		if (!this.streamWaitTimeout.isZero()) {
+			// on the client hop's executor, whose settle runs the task
+			stream.deadline = client().ctx()
+				.executor()
+				.schedule(() -> parkTimedOutLocked(stream), this.streamWaitTimeout.toNanos(), TimeUnit.NANOSECONDS);
+		}
+		// last: a check ending meanwhile resumes the stream at once
+		verdict.whenComplete((result, failure) -> {
+			try {
+				this.loop.run(() -> {
+					if (unparkLocked(stream)) {
+						verifiedLocked(stream, verdict);
+					}
+				});
+			}
+			catch (RuntimeException e) {
+				// on the check's thread, which has no one to tell
+				log.warn("h2 demux: resuming a parked stream failed: {}", e.toString(), e);
+			}
+		});
+	}
+
+	/**
+	 * DATA read on a parked stream: held, not consumed -- its stream window is not
+	 * granted back while the stream is parked. With the loop's lock.
+	 */
+	private void parkDataLocked(NewStream stream, ByteBuf data, boolean endStream) {
+		int before = stream.data.capacity();
+		stream.data.append(data);
+		this.parkedBytes += stream.data.capacity() - before;
+		stream.dataRead = true;
+		stream.dataEnds |= endStream;
+		stream.requestEnded |= endStream;
+	}
+
+	/**
+	 * The trailers of a parked stream: held once admitted, like an exchange's; ones that
+	 * do not fit reset the stream ({@code ENHANCE_YOUR_CALM}). With the loop's lock.
+	 */
+	private void parkTrailersLocked(NewStream stream, Http2Headers trailers, boolean endStream) {
+		int bytes = headerBytes(trailers);
+		Shortfall shortfall = admitLocked(bytes);
+		if (shortfall != null) {
+			dropParkedLocked(stream);
+			// counted first: the reset goes out at once
+			if (shortfall == Shortfall.SHARE) {
+				this.meters.resetForShare();
+			}
+			else {
+				this.meters.resetForBudget();
+			}
+			resetClientLocked(stream.id, Http2Error.ENHANCE_YOUR_CALM);
+			return;
+		}
+		stream.trailers = trailers;
+		stream.trailersEnd = endStream;
+		stream.trailerBytes = bytes;
+		this.parkedBytes += bytes;
+		stream.requestEnded |= endStream;
+	}
+
+	/**
+	 * The wait deadline of a parked stream whose check has not ended: it is refused
+	 * ({@code REFUSED_STREAM}: no upstream saw it), the check left to run to its end.
+	 * With the loop's lock.
+	 */
+	private void parkTimedOutLocked(NewStream stream) {
+		stream.deadline = null;
+		if (this.parked.get(stream.id) != stream) {
+			return;
+		}
+		this.meters.refusedForWaitTimeout();
+		dropParkedLocked(stream);
+		resetClientLocked(stream.id, Http2Error.REFUSED_STREAM);
+	}
+
+	/**
+	 * The stream leaves the parked ones: its deadline is cancelled and what it holds
+	 * leaves the account (its DATA stays with it). Whether it was parked; with the loop's
+	 * lock.
+	 */
+	private boolean unparkLocked(NewStream stream) {
+		if (!this.parked.remove(stream.id, stream)) {
+			return false;
+		}
+		this.parkedBytes -= stream.heldBytes();
+		ScheduledFuture<?> deadline = stream.deadline;
+		if (deadline != null) {
+			stream.deadline = null;
+			deadline.cancel(false);
+		}
+		return true;
+	}
+
+	/**
+	 * Drops a parked stream: it leaves the parked ones and its check's verdict is
+	 * cancelled (the check itself runs to its end). With the loop's lock.
+	 */
+	private void dropParkedLocked(NewStream stream) {
+		if (!unparkLocked(stream)) {
+			return;
+		}
+		stream.data.clear();
+		CompletableFuture<Verdict> verdict = stream.verdict;
+		if (verdict != null) {
+			verdict.cancel(false);
+		}
+	}
+
+	/**
+	 * Returns the DATA the client sent while the stream was parked to the client's
+	 * windows: the stream is not relayed. With the loop's lock.
+	 */
+	private void releaseParkedDataLocked(NewStream stream) {
+		consume(client(), stream.id, stream.data.size());
+		stream.data.clear();
 	}
 
 	/**
@@ -791,12 +1004,12 @@ final class NettyHttp2DemuxRelay {
 	private void dropWaitingLocked(Exchange exchange, long errorCode) {
 		stopWaitingLocked(exchange);
 		Hop leg = exchange.leg.hop();
-		Http2Stream stream = leg.connection().stream(exchange.id);
+		Http2Stream stream = leg.connection().stream(exchange.legId);
 		if (stream != null) {
 			// opened meanwhile: the buffering encoder resets it for real
 			this.resetsNotByCodec.add(stream);
 		}
-		leg.encoder().writeRstStream(leg.ctx(), exchange.id, errorCode, leg.ctx().newPromise());
+		leg.encoder().writeRstStream(leg.ctx(), exchange.legId, errorCode, leg.ctx().newPromise());
 	}
 
 	/**
@@ -815,7 +1028,7 @@ final class NettyHttp2DemuxRelay {
 			this.meters.resetForBudget();
 		}
 		resetClientLocked(exchange.id, Http2Error.ENHANCE_YOUR_CALM);
-		resetLocked(exchange.leg.hop(), exchange.id, Http2Error.CANCEL.code());
+		resetLocked(exchange.leg.hop(), exchange.legId, Http2Error.CANCEL.code());
 	}
 
 	/** Whether a response header block is an interim (1xx) head. */
@@ -923,9 +1136,9 @@ final class NettyHttp2DemuxRelay {
 	 * the connection limit ({@link #acquireSlotLocked}); null when the limit has no slot
 	 * left or the leg could not be opened. With the loop's lock.
 	 */
-	private @Nullable Leg legLocked(Router.Route route, TunnelSession session) {
+	private @Nullable Leg legLocked(Router.Route route, TunnelSession session, int clientStreamId) {
 		Leg leg = this.legs.get(route);
-		if (leg != null && leg.takesStreamsLocked()) {
+		if (leg != null && leg.takesStreamsLocked(clientStreamId)) {
 			return leg;
 		}
 		Runnable releaseSlot = acquireSlotLocked();
@@ -1069,13 +1282,17 @@ final class NettyHttp2DemuxRelay {
 
 	/**
 	 * The client endpoint closed -- before netty closes its streams: nothing more of the
-	 * client's streams is relayed, each stream a leg still has is cancelled
-	 * ({@code CANCEL}; one waiting in the leg's buffer leaves it unseen), then the legs
-	 * close (closed already after a drain), and the deadline ends: nothing is left to
-	 * wait on the client for. With the loop's lock.
+	 * client's streams is relayed, the parked streams are dropped (their checks' ends
+	 * resume nothing), each stream a leg still has is cancelled ({@code CANCEL}; one
+	 * waiting in the leg's buffer leaves it unseen), then the legs close (closed already
+	 * after a drain), and the deadline ends: nothing is left to wait on the client for.
+	 * With the loop's lock.
 	 */
 	private void clientClosedLocked() {
 		this.deadline.disarm();
+		for (NewStream parked : List.copyOf(this.parked.values())) {
+			dropParkedLocked(parked);
+		}
 		for (Exchange exchange : List.copyOf(this.exchanges.values())) {
 			exchange.reset = true;
 			if (exchange.waiting) {
@@ -1444,13 +1661,13 @@ final class NettyHttp2DemuxRelay {
 
 	/**
 	 * The bytes the relay holds: every leg's backlog (what it read and has not written on
-	 * the other hop yet, both ways), the pages not yet written and every hop's writer
-	 * queue. Updates the route gauges and lets go of the legs that closed holding
-	 * nothing; with the loop's lock.
+	 * the other hop yet, both ways), the parked streams, the pages not yet written and
+	 * every hop's writer queue. Updates the route gauges and lets go of the legs that
+	 * closed holding nothing; with the loop's lock.
 	 */
 	private long queuedLocked() {
 		Hop client = this.client;
-		long queued = this.pageBytes + (client == null ? 0 : client.queuedBytes());
+		long queued = this.pageBytes + this.parkedBytes + (client == null ? 0 : client.queuedBytes());
 		for (Iterator<Leg> legs = this.opened.iterator(); legs.hasNext();) {
 			Leg leg = legs.next();
 			Hop hop = leg.hop();
@@ -1730,31 +1947,46 @@ final class NettyHttp2DemuxRelay {
 	 * upstream never saw them, RFC 9113 8.7) until the rest fits. Their bytes drain only
 	 * once a stream of their leg closed on the upstream, which may need the very request
 	 * body the withheld window holds back; the open streams' bytes drain on their own.
-	 * Whether a stream was refused; with the loop's lock.
+	 * The parked streams ({@link #parkLocked}) count as waiting ones: their check's end
+	 * alone moves their bytes on, to a leg where they may wait again. Whether a stream
+	 * was refused; with the loop's lock.
 	 */
 	private boolean refuseWaitingLocked() {
-		List<Exchange> waiting = new ArrayList<>();
+		List<Waiter> waiting = new ArrayList<>();
 		long bytes = 0;
 		for (Exchange exchange : this.exchanges.values()) {
 			if (exchange.waiting && !exchange.reset) {
-				waiting.add(exchange);
+				waiting.add(new Waiter(exchange.id, exchange.waitingBytes(), () -> {
+					exchange.reset = true;
+					exchange.refused = true;
+					dropWaitingLocked(exchange, Http2Error.CANCEL.code());
+				}));
 				bytes += exchange.waitingBytes();
 			}
+		}
+		for (NewStream parked : this.parked.values()) {
+			waiting.add(new Waiter(parked.id, parked.heldBytes(), () -> dropParkedLocked(parked)));
+			bytes += parked.heldBytes();
 		}
 		if (bytes <= CONNECTION_ALLOWANCE) {
 			return false;
 		}
-		waiting.sort(Comparator.comparingInt(exchange -> exchange.id));
+		waiting.sort(Comparator.comparingInt(Waiter::streamId));
 		for (int i = waiting.size() - 1; i >= 0 && bytes > CONNECTION_ALLOWANCE; i--) {
-			Exchange exchange = waiting.get(i);
-			bytes -= exchange.waitingBytes();
-			exchange.reset = true;
-			exchange.refused = true;
+			Waiter waiter = waiting.get(i);
+			bytes -= waiter.bytes();
 			this.meters.refusedWaiting();
-			dropWaitingLocked(exchange, Http2Error.CANCEL.code());
-			resetClientLocked(exchange.id, Http2Error.REFUSED_STREAM);
+			waiter.leave().run();
+			resetClientLocked(waiter.streamId(), Http2Error.REFUSED_STREAM);
 		}
 		return true;
+	}
+
+	/**
+	 * A stream {@link #refuseWaitingLocked} may refuse: the bytes it holds, and what lets
+	 * go of it.
+	 */
+	private record Waiter(int streamId, long bytes, Runnable leave) {
 	}
 
 	/**
@@ -1885,6 +2117,15 @@ final class NettyHttp2DemuxRelay {
 		/** What the route's gauge counts of the leg; with the loop's lock. */
 		private long gauged;
 
+		/**
+		 * The exchanges on the leg, by their stream id on it, until closed for the
+		 * client; with the loop's lock.
+		 */
+		final Map<Integer, Exchange> streams = new HashMap<>();
+
+		/** The lowest stream id the leg may open next; with the loop's lock. */
+		private long nextStreamId = 1;
+
 		Leg(String routeTag, H2DemuxMeters.Route routeMeters, LongAdder writesHeld) {
 			this.routeTag = routeTag;
 			this.routeMeters = routeMeters;
@@ -1903,10 +2144,96 @@ final class NettyHttp2DemuxRelay {
 			return Objects.requireNonNull(this.hop, "the leg's hop is not built");
 		}
 
-		/** Whether a new stream may go to the leg; with the loop's lock. */
-		boolean takesStreamsLocked() {
+		/**
+		 * Whether the client's new stream may go to the leg: open, no GOAWAY either way,
+		 * a stream id left for it ({@link #streamIdLocked}); with the loop's lock.
+		 */
+		boolean takesStreamsLocked(int clientStreamId) {
 			Hop hop = hop();
-			return hop.open() && !hop.connection().goAwayReceived() && !hop.connection().goAwaySent();
+			return hop.open() && !hop.connection().goAwayReceived() && !hop.connection().goAwaySent()
+					&& Math.max(clientStreamId, this.nextStreamId) <= Integer.MAX_VALUE;
+		}
+
+		/**
+		 * The stream id on the leg of the client's new stream: the client's own, unless a
+		 * stream the client opened after it went to the leg first (its credential check
+		 * took longer), then the lowest the leg may still open -- a leg opens its streams
+		 * in ascending order (RFC 9113 5.1.1). With the loop's lock.
+		 */
+		int streamIdLocked(int clientStreamId) {
+			long id = Math.max(clientStreamId, this.nextStreamId);
+			this.nextStreamId = id + 2;
+			return (int) id;
+		}
+
+	}
+
+	/**
+	 * A new client stream, routed, on its way to its leg while its credentials are
+	 * checked; while the check runs it is parked ({@link #parkLocked}), and holds what
+	 * the client sends on it. With the loop's lock.
+	 */
+	private static final class NewStream {
+
+		final int id;
+
+		final Router.Route route;
+
+		final TunnelSession session;
+
+		final @Nullable String host;
+
+		final ConnectionHeadParser.Head.Request request;
+
+		final Http2Headers headers;
+
+		/** The head ended the request. */
+		final boolean headEnds;
+
+		/** The head's bytes as HPACK counts them, held while parked. */
+		final int headBytes;
+
+		/** The client ended the request: with the head, DATA or trailers. */
+		boolean requestEnded;
+
+		/** DATA read while parked, not consumed. */
+		final PendingPayload data = new PendingPayload();
+
+		/** A DATA frame was read while parked. */
+		boolean dataRead;
+
+		/** A DATA frame read while parked ended the request. */
+		boolean dataEnds;
+
+		/** The trailers read while parked. */
+		@Nullable Http2Headers trailers;
+
+		boolean trailersEnd;
+
+		int trailerBytes;
+
+		/** The verdict of the check while parked. */
+		@Nullable CompletableFuture<Verdict> verdict;
+
+		/** The wait deadline while parked, unless the deadline is off. */
+		@Nullable ScheduledFuture<?> deadline;
+
+		NewStream(int id, Router.Route route, TunnelSession session, @Nullable String host,
+				ConnectionHeadParser.Head.Request request, Http2Headers headers, boolean headEnds) {
+			this.id = id;
+			this.route = route;
+			this.session = session;
+			this.host = host;
+			this.request = request;
+			this.headers = headers;
+			this.headEnds = headEnds;
+			this.requestEnded = headEnds;
+			this.headBytes = headerBytes(headers);
+		}
+
+		/** What the stream holds while parked: its head, DATA and trailers. */
+		long heldBytes() {
+			return this.headBytes + this.data.capacity() + this.trailerBytes;
 		}
 
 	}
@@ -1914,7 +2241,11 @@ final class NettyHttp2DemuxRelay {
 	/** A client stream relayed to a leg; with the loop's lock. */
 	private static final class Exchange {
 
+		/** The stream's id on the client connection. */
 		final int id;
+
+		/** The stream's id on the leg ({@link Leg#streamIdLocked}). */
+		final int legId;
 
 		final Leg leg;
 
@@ -1974,11 +2305,12 @@ final class NettyHttp2DemuxRelay {
 		/** The upstream's DATA and trailers towards the client. */
 		final Flow responseFlow;
 
-		Exchange(int id, Leg leg, Hop client) {
+		Exchange(int id, int legId, Leg leg, Hop client) {
 			this.id = id;
+			this.legId = legId;
 			this.leg = leg;
-			this.requestFlow = new Flow(this, client, leg.hop());
-			this.responseFlow = new Flow(this, leg.hop(), client);
+			this.requestFlow = new Flow(this, client, id, leg.hop(), legId);
+			this.responseFlow = new Flow(this, leg.hop(), legId, client, id);
 		}
 
 		/** What the relay holds for the stream while it waits in its leg's buffer. */
@@ -2007,7 +2339,13 @@ final class NettyHttp2DemuxRelay {
 
 		private final Hop from;
 
+		/** The stream's id on {@link #from}. */
+		private final int fromId;
+
 		private final Hop to;
+
+		/** The stream's id on {@link #to}. */
+		private final int toId;
 
 		/** The bytes of the DATA write netty holds; -1 = none. */
 		private int writing = -1;
@@ -2034,10 +2372,12 @@ final class NettyHttp2DemuxRelay {
 		/** Runs once the write carrying the stream's end completed, either way. */
 		private @Nullable Runnable endWritten;
 
-		Flow(Exchange exchange, Hop from, Hop to) {
+		Flow(Exchange exchange, Hop from, int fromId, Hop to, int toId) {
 			this.exchange = exchange;
 			this.from = from;
+			this.fromId = fromId;
 			this.to = to;
+			this.toId = toId;
 		}
 
 		void onEndWritten(Runnable endWritten) {
@@ -2068,6 +2408,16 @@ final class NettyHttp2DemuxRelay {
 			this.backlog.append(data);
 			this.backlogEnds |= endStream;
 			account(this.backlog.capacity() - before);
+		}
+
+		/**
+		 * The DATA read on the stream while it was parked ({@link NewStream}), taken as
+		 * one write: the first of the flow.
+		 */
+		void parked(PendingPayload held, boolean endStream) {
+			int size = held.size();
+			int capacity = held.capacity();
+			writeData(held.takeAll(), size, capacity, endStream);
 		}
 
 		/**
@@ -2114,9 +2464,8 @@ final class NettyHttp2DemuxRelay {
 			this.writingBytes = bytes;
 			account(bytes);
 			this.exchange.leg.writesHeld.increment();
-			int streamId = this.exchange.id;
 			this.to.encoder()
-				.writeData(this.to.ctx(), streamId, data, 0, endStream,
+				.writeData(this.to.ctx(), this.toId, data, 0, endStream,
 						this.to.newPromise(future -> dataWritten(future.isSuccess(), endStream)));
 		}
 
@@ -2127,7 +2476,7 @@ final class NettyHttp2DemuxRelay {
 			this.writing = -1;
 			this.writingBytes = 0;
 			if (success) {
-				consume(this.from, this.exchange.id, length);
+				consume(this.from, this.fromId, length);
 			}
 			if (endStream) {
 				ended();
@@ -2160,7 +2509,7 @@ final class NettyHttp2DemuxRelay {
 			this.blockBytes += bytes;
 			account(bytes);
 			this.to.encoder()
-				.writeHeaders(this.to.ctx(), this.exchange.id, headers, 0, endStream, this.to.newPromise(future -> {
+				.writeHeaders(this.to.ctx(), this.toId, headers, 0, endStream, this.to.newPromise(future -> {
 					this.blockBytes -= bytes;
 					account(-bytes);
 					if (endStream) {
@@ -2215,6 +2564,11 @@ final class NettyHttp2DemuxRelay {
 				exchange.requestFlow.block(headers, endStream);
 				return;
 			}
+			NewStream parked = NettyHttp2DemuxRelay.this.parked.get(streamId);
+			if (parked != null) {
+				parkTrailersLocked(parked, headers, endStream);
+				return;
+			}
 			if (streamId <= NettyHttp2DemuxRelay.this.highestStreamId) {
 				return; // a later block of a stream the relay answered itself
 			}
@@ -2233,6 +2587,14 @@ final class NettyHttp2DemuxRelay {
 			NettyHttp2DemuxRelay.this.deadline.progress(data.readableBytes() + padding);
 			measureLocked(this.hop, NettyHttp2DemuxRelay.this.clientWindow, data.readableBytes() + padding);
 			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.get(streamId);
+			if (exchange == null) {
+				NewStream parked = NettyHttp2DemuxRelay.this.parked.get(streamId);
+				if (parked != null) {
+					parkDataLocked(parked, data, endStream);
+					// padding is consumed at once
+					return padding;
+				}
+			}
 			if (exchange == null || exchange.reset) {
 				return data.readableBytes() + padding;
 			}
@@ -2258,7 +2620,7 @@ final class NettyHttp2DemuxRelay {
 				exchange.reset = true;
 				// a waiting stream leaves the leg's buffer as netty closes the client's
 				// stream right after this call (ClientStreams)
-				resetLocked(exchange.leg.hop(), streamId, errorCode);
+				resetLocked(exchange.leg.hop(), exchange.legId, errorCode);
 			}
 		}
 
@@ -2277,10 +2639,15 @@ final class NettyHttp2DemuxRelay {
 			if (resetByCodecLocked(stream)) {
 				NettyHttp2DemuxRelay.this.meters.resetForProtocol();
 			}
+			NewStream parked = NettyHttp2DemuxRelay.this.parked.get(stream.id());
+			if (parked != null) {
+				dropParkedLocked(parked);
+			}
 			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.remove(stream.id());
 			if (exchange == null) {
 				return;
 			}
+			exchange.leg.streams.remove(exchange.legId);
 			exchange.leg.routeMeters.trackedStreams().decrement();
 			exchange.responseFlow.drop();
 			if (exchange.reset || !(exchange.requestEnded && exchange.responseEnded)) {
@@ -2293,7 +2660,7 @@ final class NettyHttp2DemuxRelay {
 			}
 			else if (!exchange.reset && !(exchange.requestEnded && exchange.responseEnded)) {
 				exchange.reset = true;
-				resetLocked(exchange.leg.hop(), exchange.id, Http2Error.CANCEL.code());
+				resetLocked(exchange.leg.hop(), exchange.legId, Http2Error.CANCEL.code());
 			}
 		}
 
@@ -2316,9 +2683,10 @@ final class NettyHttp2DemuxRelay {
 			this.leg = leg;
 		}
 
+		/** The exchange of the leg's stream, unless reset. */
 		private @Nullable Exchange exchange(int streamId) {
-			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.get(streamId);
-			return exchange == null || exchange.leg != this.leg || exchange.reset ? null : exchange;
+			Exchange exchange = this.leg.streams.get(streamId);
+			return exchange == null || exchange.reset ? null : exchange;
 		}
 
 		/**
@@ -2414,7 +2782,7 @@ final class NettyHttp2DemuxRelay {
 				return;
 			}
 			exchange.reset = true;
-			resetLocked(client(), streamId, errorCode);
+			resetLocked(client(), exchange.id, errorCode);
 		}
 
 		/**
@@ -2425,8 +2793,8 @@ final class NettyHttp2DemuxRelay {
 		 */
 		@Override
 		public void onGoAwayRead(ChannelHandlerContext ctx, int lastStreamId, long errorCode, ByteBuf debugData) {
-			for (Exchange exchange : NettyHttp2DemuxRelay.this.exchanges.values()) {
-				if (exchange.leg == this.leg && exchange.id > lastStreamId) {
+			for (Exchange exchange : this.leg.streams.values()) {
+				if (exchange.legId > lastStreamId) {
 					exchange.refused = true;
 				}
 			}
@@ -2451,8 +2819,8 @@ final class NettyHttp2DemuxRelay {
 
 		@Override
 		public void onStreamAdded(Http2Stream stream) {
-			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.get(stream.id());
-			if (exchange != null && exchange.leg == this.leg) {
+			Exchange exchange = this.leg.streams.get(stream.id());
+			if (exchange != null) {
 				stopWaitingLocked(exchange);
 			}
 		}
@@ -2462,8 +2830,8 @@ final class NettyHttp2DemuxRelay {
 			if (resetByCodecLocked(stream)) {
 				NettyHttp2DemuxRelay.this.meters.resetForUpstream();
 			}
-			Exchange exchange = NettyHttp2DemuxRelay.this.exchanges.get(stream.id());
-			if (exchange != null && exchange.leg == this.leg) {
+			Exchange exchange = this.leg.streams.get(stream.id());
+			if (exchange != null) {
 				// nothing more reaches the upstream; what it sent goes on to the client
 				exchange.requestFlow.drop();
 				loseLocked(exchange);

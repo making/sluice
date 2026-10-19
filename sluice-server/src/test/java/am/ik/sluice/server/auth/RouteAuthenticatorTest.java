@@ -1,6 +1,7 @@
 package am.ik.sluice.server.auth;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Base64;
 import java.util.HexFormat;
 import java.util.List;
@@ -9,6 +10,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -138,11 +140,18 @@ class RouteAuthenticatorTest {
 		assertThat(this.matches).as("bob crowded out").hasValue(8);
 	}
 
+	/**
+	 * A slow check runs off the caller, the verdict completing with it; a request
+	 * presenting the credential under check waits for that check, one presenting another
+	 * slow credential past the bound is busy, a cheap one is not bounded. A check that
+	 * throws completes its verdict with the failure and frees its verification.
+	 */
 	@Test
 	@Timeout(10)
-	void aCheckPastTheBoundOfSlowChecksInFlightIsBusy() throws Exception {
+	void aSlowCheckRunsOffTheCallerSharedByItsCredentialAndBoundedByTheChecksInFlight() throws Exception {
 		CountDownLatch entered = new CountDownLatch(1);
 		CountDownLatch release = new CountDownLatch(1);
+		AtomicInteger slowChecks = new AtomicInteger();
 		PasswordEncoder holding = new PasswordEncoder() {
 
 			@Override
@@ -153,12 +162,16 @@ class RouteAuthenticatorTest {
 			@Override
 			public boolean matches(@Nullable CharSequence rawPassword, @Nullable String encodedPassword) {
 				if (encodedPassword != null && encodedPassword.startsWith("{bcrypt}")) {
+					slowChecks.incrementAndGet();
 					entered.countDown();
 					try {
 						release.await();
 					}
 					catch (InterruptedException e) {
 						Thread.currentThread().interrupt();
+					}
+					if ("failing-token".contentEquals(String.valueOf(rawPassword))) {
+						throw new AssertionError("the encoder failed");
 					}
 				}
 				return RouteAuthenticatorTest.this.encoder.matches(rawPassword, encodedPassword);
@@ -170,19 +183,31 @@ class RouteAuthenticatorTest {
 			.apiToken(List.of(secret("sha256", "fast-token")))
 			.build()), holding, 1, RouteAuthenticator.CACHE_SIZE, this.now::get);
 
-		CompletableFuture<Verdict> inFlight = CompletableFuture
-			.supplyAsync(() -> verify(authenticator, "authorization", "Bearer slow-token"));
+		CompletableFuture<Verdict> inFlight = verifyAsync(authenticator, "authorization", "Bearer slow-token");
 		assertThat(entered.await(5, TimeUnit.SECONDS)).as("precondition: a slow check in flight").isTrue();
+		assertThat(inFlight).as("the check runs off the caller").isNotDone();
 
-		assertThat(verify(authenticator, "authorization", "Bearer slow-token"))
+		CompletableFuture<Verdict> joining = verifyAsync(authenticator, "authorization", "Bearer slow-token");
+		assertThat(verify(authenticator, "authorization", "Bearer other-token")).as("another slow credential")
 			.isEqualTo(new Verdict.Busy(RouteAuthenticator.BUSY_RETRY_AFTER));
 		assertThat(verify(authenticator, "x-api-token", "fast-token")).as("a cheap check is not bounded")
 			.isInstanceOf(Verdict.Pass.class);
+		assertThat(joining).as("the same credential waits for the check in flight").isNotDone();
 
 		release.countDown();
 		assertThat(inFlight.get(5, TimeUnit.SECONDS)).isInstanceOf(Verdict.Pass.class);
-		assertThat(verify(authenticator, "authorization", "Bearer slow-token")).as("the bound frees up")
-			.isInstanceOf(Verdict.Pass.class);
+		assertThat(joining.get(5, TimeUnit.SECONDS)).isInstanceOf(Verdict.Pass.class);
+		assertThat(slowChecks).as("one check for both").hasValue(1);
+
+		assertThat(verifyAsync(authenticator, "authorization", "Bearer failing-token"))
+			.failsWithin(Duration.ofSeconds(5))
+			.withThrowableOfType(ExecutionException.class)
+			.havingCause()
+			.isInstanceOf(AssertionError.class)
+			.withMessage("the encoder failed");
+		assertThat(verify(authenticator, "authorization", "Bearer other-token")).as("the bound frees up")
+			.isInstanceOf(Verdict.Unauthorized.class);
+		assertThat(slowChecks).hasValue(3);
 	}
 
 	@Test
@@ -324,6 +349,10 @@ class RouteAuthenticatorTest {
 
 	private static Verdict verify(RouteAuthenticator authenticator, String... headers) {
 		return authenticator.verify(route(ROUTE), headers("GET", headers));
+	}
+
+	private static CompletableFuture<Verdict> verifyAsync(RouteAuthenticator authenticator, String... headers) {
+		return authenticator.verifyAsync(route(ROUTE), headers("GET", headers));
 	}
 
 	private static Router.Route route(String domain) {

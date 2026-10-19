@@ -6,8 +6,8 @@ Route auth (156) and OIDC bearer (157) answer a request without credentials `401
 add the authorization code flow (oauth2-proxy style): an unauthenticated request is redirected to
 the provider, the callback sets a session cookie, later requests pass with it.
 
-Depends on 157 (scheme SPI, provider config, JWKS) and 158 (the code exchange is network I/O; the
-h2 demux must not do it under its lock).
+Depends on 157 (scheme SPI, provider config, JWKS). The code exchange is network I/O: do it in a
+`bounded()` credential check, which the h2 demux runs off its loop (158).
 
 ## Pieces
 

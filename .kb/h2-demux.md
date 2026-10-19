@@ -127,6 +127,24 @@ h2 flow control (plaintext and TLS-terminated h2): the windows are per hop (see 
 
 h2 request heads (plaintext and TLS-terminated h2): every stream, the connection's first included, is routed by its `:authority`, access-checked and logged (`type=req`) on its own; a later stream the relay refuses is answered on its own stream (`403`, `503`, `421` for a `force-http1` route, see below), the connection going on. A CONNECT (RFC 9113 8.5: `:authority`, no `:path`) is a tunnel to the upstream of its `:authority`, its data, end and reset relayed either way, logged with the authority as its path; a connection opening with one is demultiplexed like any other. A head that is no request -- no `:method`, no `:path` (but for a CONNECT), a CONNECT without `:authority` -- is reset with `PROTOCOL_ERROR` and reaches no upstream, the connection going on; so is a head carrying the connection-specific `connection` field (RFC 9113 8.2.2). A header block that does not decode at all, the connection's first or a later one, ends the connection with GOAWAY `COMPRESSION_ERROR` (RFC 9113 4.3; a later one names stream 2^31-1 as the last processed) and reaches no upstream: the decoder state is unknown from there on, so no later head could be trusted to route by. A header list past 64KiB is answered `431` on its stream, the connection going on. A reset head logs a `type=req` line with `route=- path=-` (its method, if any), a compression error one with `route=- method=- path=-`.
 
+## Credential checks
+
+A stream of a route with credentials (README "Route authentication") whose credential is
+checked against `bcrypt` / `pbkdf2` and not remembered is parked while the check runs on a
+virtual thread of its own: the connection's other streams, of its route too, go on
+meanwhile. Streams presenting the credential of a check under way wait for that check. A
+parked stream holds its head and what the client sends on it, counted in the h2 queue
+budget as a stream waiting for its upstream's concurrency limit: while the windows
+are withheld the most recent parked and waiting streams past the connection's 128KiB are
+refused with `REFUSED_STREAM`, and so is a parked stream whose check has not ended after
+`sluice.limits.h2-stream-wait-timeout` (`0` = off). Once the check ended the stream goes on
+as an unparked one does: answered `401` / `503`, or relayed with what the client sent
+meanwhile; a check that throws resets the stream with `INTERNAL_ERROR` and logs a warning. A
+stream the client resets, or whose connection ends, while parked is dropped; its check runs
+to its end and resumes nothing. Streams of one route keep their stream ids on its upstream
+connection, but a parked stream that a later stream of its route overtook takes the next id
+the upstream connection may open.
+
 ## Framing limits
 
 h2 framing limits (plaintext and TLS-terminated h2): the relay announces no larger frame size to either side and a 64KiB header list limit, so a client frame above 16KiB ends the connection with GOAWAY `FRAME_SIZE_ERROR`, and a client header block past 80KiB (netty's threshold over the list limit; a list past 64KiB within it is answered `431`, see "Request heads") with GOAWAY `PROTOCOL_ERROR`; an upstream's frame above 16KiB ends that upstream's connection with GOAWAY `FRAME_SIZE_ERROR`, and its header block past 80KiB or interleaved with another with GOAWAY `PROTOCOL_ERROR`.
