@@ -4,7 +4,7 @@ Full behavior of the two server properties; README "Configuration (server)" has 
 
 ## `sluice.data-proxy-protocol`
 
-Parses the PROXY protocol (v1 / v2) header an SNAT front end prepends on the data plane (data port and tcp route ports): the header is consumed before routing / relay (never forwarded) and its source address becomes the connection peer for access control and the access log; a malformed header fails the connection. Headerless connections are served, but detecting the header takes a connection's first byte and a tcp route dials its upstream only after it: a protocol whose server speaks first needs the header (a silent connection is closed at `head-timeout`). The header is taken from any peer: expose the ports only to the front end. Formerly `sluice.proxy-protocol`, still read (with a deprecation warning at startup) while `data-proxy-protocol` is unset.
+Parses the PROXY protocol (v1 / v2) header an SNAT front end prepends on the data plane (data port and tcp route ports): the header is consumed before routing / relay (never forwarded) and its source address becomes the connection peer for access control and the access log; a malformed header fails the connection. Headerless connections are served, but detecting the header takes a connection's first byte and a tcp route dials its upstream only after it: a protocol whose server speaks first needs the header (a silent connection is closed at `head-timeout`). The header is taken from any peer: expose the ports only to the front end.
 
 ## `sluice.control-proxy-protocol`
 

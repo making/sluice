@@ -24,8 +24,7 @@ import am.ik.sluice.server.route.LoadBalance;
  * @param dataProxyProtocol whether a PROXY protocol (v1 / v2) header an SNAT front end
  * prepends is parsed on the data plane: the header is stripped before routing / relay and
  * its source address becomes the connection peer (access control, access log); a
- * malformed one fails the connection. Formerly {@code sluice.proxy-protocol}, carried
- * over by {@link RenamedPropertiesEnvironmentPostProcessor}
+ * malformed one fails the connection
  * @param controlProxyProtocol whether such a header is parsed on the gRPC control plane:
  * its source address becomes the tunnel session's remote address (console, logs,
  * per-address tunnel limits)
@@ -402,7 +401,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * upstream connection open at once); {@code 0} = derived: {@code connectionMemory}
 	 * over what one connection reserves at accept
 	 * @param maxConnectionsPerAddress connections open at once from one source address
-	 * (the PROXY protocol source when {@code proxy-protocol} is on, the socket peer
+	 * (the PROXY protocol source when {@code data-proxy-protocol} is on, the socket peer
 	 * otherwise); {@code 0} = no limit beyond {@code maxConnections}
 	 * @param headTimeout deadline for the whole head phase of a connection (PROXY header,
 	 * TLS handshake, request head), and for a later request head of a plaintext or

@@ -772,7 +772,7 @@ its discovery document advertises an `end_session_endpoint`; register
 |---|---|---|
 | `sluice.data-tls-bundle` | - | SSL bundle name for data plane TLS termination (h2 / http/1.1 via ALPN, `force-http1` flips the preference); unset = plaintext only (TLS connections are served by upstreams with `tls-passthrough=true`) |
 | `sluice.ca-bundle` | - | SSL bundle whose keystore holds the CA private key + certificate; enables client certificate issuance in the console (the signed certificates authenticate against the gRPC `client-auth=REQUIRE` truststore, no restart) |
-| `sluice.data-proxy-protocol` | `false` | parse the PROXY protocol (v1 / v2) header an SNAT front end prepends on the data port and tcp route ports; its source address is used for access control and the access log. Headerless connections are served, but a tcp route whose server speaks first needs the header. The header is taken from any peer: expose the ports only to the front end. Formerly `sluice.proxy-protocol` (still read, deprecated); details: [.kb/proxy-protocol.md](.kb/proxy-protocol.md) |
+| `sluice.data-proxy-protocol` | `false` | parse the PROXY protocol (v1 / v2) header an SNAT front end prepends on the data port and tcp route ports; its source address is used for access control and the access log. Headerless connections are served, but a tcp route whose server speaks first needs the header. The header is taken from any peer: expose the ports only to the front end. Details: [.kb/proxy-protocol.md](.kb/proxy-protocol.md) |
 | `sluice.control-proxy-protocol` | `false` | the same on the gRPC control plane, ahead of its TLS: the source becomes the tunnel session's remote address and the address of the per-address tunnel limits |
 
 ### Routing and access control
