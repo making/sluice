@@ -230,7 +230,7 @@ fn the_window_is_twice_what_the_connections_may_have_in_flight() {
 #[tokio::test]
 async fn a_large_download_takes_few_round_trips() {
     const TOTAL: usize = 32 * 1024 * 1024;
-    let window = transport_window(crate::DEFAULT_MAX_CONNECTIONS);
+    let window = transport_window(crate::config::DEFAULT_MAX_CONNECTIONS);
     assert!(window as usize >= 2 * TOTAL, "the precondition: {window}");
     let rounds = download(TOTAL, window).await;
     let sent: u64 = rounds.iter().sum();

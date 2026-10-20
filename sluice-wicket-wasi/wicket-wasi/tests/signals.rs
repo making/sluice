@@ -1,6 +1,6 @@
-//! The shutdown signals of the process: SIGTERM starts the drain and a second
-//! one ends it at once; with `--drain-grace 0` SIGTERM ends the process as
-//! the default action does.
+//! The signals of the process: SIGHUP reloads the routes; SIGTERM starts the
+//! drain and a second one ends it at once; with `--drain-grace 0` SIGTERM ends
+//! the process as the default action does.
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader};
@@ -12,14 +12,15 @@ use std::time::{Duration, Instant};
 /// Hang guard of every wait; the first one covers the component's load.
 const HANG: Duration = Duration::from_secs(60);
 
-/// The hello guest, built as the unit tests build it.
+/// The hello guest, built as the unit tests build it (the fetch guest beside
+/// it).
 fn hello_wasm() -> std::path::PathBuf {
     let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
         .join("examples");
     let output = Command::new("cargo")
-        .args(["build", "--release", "-p", "hello"])
+        .args(["build", "--release", "-p", "hello", "-p", "fetch"])
         .env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("CARGO")
         .current_dir(&examples)
@@ -67,11 +68,17 @@ async fn acking_server() -> String {
     url
 }
 
-/// The wicket on `server`, its stdout lines on the receiver.
-fn wicket(server: &str, drain_grace: &str) -> (Child, mpsc::Receiver<String>) {
+/// The wicket on `server` serving `component` for `hello.local`, polling
+/// nothing (SIGHUP alone reloads), its stdout lines on the receiver.
+fn wicket(
+    server: &str,
+    drain_grace: &str,
+    component: &std::path::Path,
+) -> (Child, mpsc::Receiver<String>) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-wasi"))
-        .args(["--server", server, "--drain-grace", drain_grace, "--wasm"])
-        .arg(format!("hello.local={}", hello_wasm().display()))
+        .args(["--server", server, "--drain-grace", drain_grace])
+        .args(["--watch-interval", "0", "--wasm"])
+        .arg(format!("hello.local={}", component.display()))
         .stdout(Stdio::piped())
         .spawn()
         .expect("run sluice-wicket-wasi");
@@ -102,8 +109,12 @@ fn await_line(lines: &mpsc::Receiver<String>, text: &str) {
 }
 
 fn sigterm(child: &Child) {
+    signal(child, "-TERM");
+}
+
+fn signal(child: &Child, signal: &str) {
     let status = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
+        .args([signal, &child.id().to_string()])
         .status()
         .unwrap();
     assert!(status.success());
@@ -126,10 +137,25 @@ fn exit_within(child: &mut Child, within: Duration) -> std::process::ExitStatus 
 async fn sigterm_drains_and_a_second_one_ends_the_drain() {
     let server = acking_server().await;
 
+    // a copy of the guest, replaced below
+    let hello = hello_wasm();
+    let component =
+        std::env::temp_dir().join(format!("sluice-signals-{}.wasm", std::process::id()));
+    std::fs::copy(&hello, &component).unwrap();
+
     // the server never acknowledges the withdrawal: only the second signal
     // ends the drain before its 60s grace
-    let (mut child, lines) = wicket(&server, "60");
+    let (mut child, lines) = wicket(&server, "60", &component);
     await_line(&lines, "advertise acked by");
+    // SIGHUP reloads the routes, and ends nothing
+    signal(&child, "-HUP");
+    await_line(&lines, "routes reload (SIGHUP): no change");
+    std::fs::copy(hello.with_file_name("fetch.wasm"), &component).unwrap();
+    signal(&child, "-HUP");
+    await_line(
+        &lines,
+        "routes reloaded (SIGHUP), generation 2: updated hello.local",
+    );
     sigterm(&child);
     await_line(&lines, "withdrawing the routes");
     sigterm(&child);
@@ -137,9 +163,10 @@ async fn sigterm_drains_and_a_second_one_ends_the_drain() {
     assert!(status.success(), "{status:?}");
 
     // no drain: the default action ends the process
-    let (mut child, lines) = wicket(&server, "0");
+    let (mut child, lines) = wicket(&server, "0", &hello);
     await_line(&lines, "advertise acked by");
     sigterm(&child);
     let status = exit_within(&mut child, Duration::from_secs(15));
     assert_eq!(status.signal(), Some(15), "{status:?}");
+    let _ = std::fs::remove_file(&component);
 }

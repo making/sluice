@@ -36,6 +36,8 @@ cargo build -p sluice-wicket-wasi
 # sluice server as in the root README, then:
 target/debug/sluice-wicket-wasi --server grpc://127.0.0.1:8001 --token SECRET \
     --wasm demo.local=examples/target/wasm32-wasip3/release/hello.wasm
+# or with the routes in a file, reloaded on change (see Configuration file)
+target/debug/sluice-wicket-wasi --config wicket-wasi.yaml
 ```
 
 `cargo test -p sluice-wicket-wasi` builds the examples the same way (through the
@@ -89,7 +91,8 @@ guest still runs keeps its slot until the instance is gone, so the connection's 
 stream waits for it.
 
 Multiple `--wasm host=<locator>` routes per process. The locator is a bare
-path, `file://<path>`, or `http(s)://<url>` (fetched once at startup); the
+path, `file://<path>`, or `http(s)://<url>` (fetched when its route is new, and on
+SIGHUP; see [Reloading routes](#reloading-routes)); the
 advertised target is `wasm:<locator>` (plus the non-default options) and
 further schemes slot into the same resolver. A `?query` suffix sets the
 route's resource limits and WASI capabilities (`wasi`, see [Capabilities](#capabilities)), applied to every
@@ -115,6 +118,86 @@ request. A literal `?` in a file path needs URL-escaping.
 --wasm batch.local=batch.wasm?instances=4
 curl -H 'Host: demo.local' http://127.0.0.1:8000/hello
 ```
+
+A host may be routed once, over `--wasm` and the config file together (a startup or
+reload error otherwise).
+
+### Configuration file
+
+`--config <file>` reads the settings from a YAML file. Every flag has its key; a flag
+overrides the file, the file a default. Without `--config` the flags alone apply, as
+before. With it, `server` is the one setting required: the routes may be empty at
+startup and added by a reload.
+
+```yaml
+server: grpc://127.0.0.1:8001
+token: ${SLUICE_TOKEN}          # an environment variable
+client-id: ${HOSTNAME:-wicket}  # with a default
+# insecure: true
+# ca-cert: ca.pem               # relative to this file
+max-connections: 256
+max-instances: 64
+tunnel-stall-timeout: 60s
+drain-grace: 20s
+watch-interval: 1s              # 0 = no polling, SIGHUP only
+
+routes:
+  - host: demo.local
+    component: hello.wasm       # a path relative to this file, file:// or http(s)://
+  - host: relay.local
+    component: relay.wasm
+    sandbox:                    # the --wasm query options; unset keys keep their defaults
+      wasi: [cli, inherit-network]
+      budget: 250ms             # budget-ms
+      memory: 64Mi              # memory-mib: a whole number of MiB (Ki/Mi/Gi, K/M/G)
+      pool: 2
+      instances: 4
+```
+
+- durations take `ms`, `s`, `m` or `h` (`tunnel-stall-timeout`, `drain-grace` and
+  `watch-interval` also a bare `0` = off); the flags keep whole seconds
+- `${NAME}` in a plain (unquoted) scalar is the environment variable `NAME`, with the
+  docker compose forms (`${NAME:-default}`, `${NAME?message}`, ...); an unset `${NAME}`
+  without a default is an error, `$${` a literal `${`, and a quoted scalar is never
+  expanded
+- an unknown key or a value that does not parse fails, naming the line, or the route and
+  key (`routes[1]: sandbox.memory: ...`)
+- the `--wasm` routes follow the file's
+
+### Reloading routes
+
+The routes are reloaded without a restart: their files are polled every
+`--watch-interval` (`watch-interval`, default 1s) -- the config file and every
+component file the routes read -- and SIGHUP reloads at once. A change is reloaded once
+a poll found it unchanged since the previous one, so a file still being written is not
+read half way. Without `--config`, the `--wasm` routes stay as given and their
+component files are reloaded.
+
+A reload reads the routes again and loads every component before it changes anything:
+an invalid config, a component that does not compile, a missing file, a failed fetch,
+pools past `--max-instances` or a host routed twice reject the whole reload, logged
+(`routes reload (file change) failed; keeping generation N: ...`), and the routes
+stay as they were until a file changes again or SIGHUP. Otherwise
+(`routes reloaded (file change), generation N: added ...; removed ...; retargeted
+...; updated ...`):
+
+- a route whose component (by sha256) and sandbox did not change keeps its handler
+  and its warm pool. An `http(s)` component is fetched again only on SIGHUP
+- a component changed on disk serves the next request, of a connection already open
+  too; a request in flight finishes on the one it started with. Its target is
+  unchanged, so nothing is advertised again
+- an added or removed host, or a changed sandbox (a new target), is advertised again
+  on every node stream. A removed target keeps being served -- a connection the server
+  routed before it took the new routes included -- until every stream acknowledged
+  them; then its connections shut down gracefully (http/1.1 once the request in flight
+  is answered, h2 with GOAWAY after its streams) and a CONNECT to it fails
+- the replaced handlers' pools close: idle units end at once, busy ones after their
+  request, and a new pool's units take the slots as they free (requests take the
+  per-request path meanwhile)
+
+Only the routes are reloaded: another setting changed in the file is logged as such and
+applies on a restart. Removing every route needs a server from this version on (an
+older one ignores an advertise without routes and keeps the old ones).
 
 ### Capabilities
 
@@ -198,7 +281,7 @@ lines, prefixed with the component and a request id
   the linked wasi surface follows `wasmtime serve` (see `wasi` above) for
   p3 only. wasi p2 is unsupported and never linked (unlike serve's `-Scli`):
   a component importing any p2 interface is rejected at startup
-- `--wasm` routes advertise the component locator plus its canonical
+- routes advertise the component locator plus its canonical
   non-default options (`wasm:file://...?wasi=cli,inherit-network`; the server
   passes `wasm:` targets through verbatim as the dial address — oci / s3
   resolvers slot into the same form), so routes sharing a component with
@@ -218,8 +301,8 @@ pool only ever improves the warm latency (hello guest, dev profile: ~380us
 cold vs ~120us pooled per request). Each unit holds an instance slot of
 `--max-instances`, and one of its route's cap, for its lifetime (a retired
 unit's replacement takes them over); the pools of all routes together may not
-exceed the limit, which is checked at startup. With no slot free, a request
-waits for whichever comes first, an idle unit or a free slot.
+exceed the limit, which is checked at startup and on every reload. With no slot
+free, a request waits for whichever comes first, an idle unit or a free slot.
 
 Reuse assumes stateless / reentrant-safe guests: module state legitimately
 persists across a unit's requests, so a misbehaving guest poisons its own
@@ -279,6 +362,12 @@ Kubernetes, `terminationGracePeriodSeconds` (30s by default) bounds it the same 
   `--max-instances` together
 - guest async tasks live within `wit-bindgen`'s runtime; the `spawn`
   caveats about task lifetime apply
+- a reload changing a route's sandbox gives it a new target with its own `instances`
+  cap: until the old target's requests ended, both caps count, so the route may hold
+  up to twice its cap
+- file changes are seen by modification time, size and inode: a component rewritten
+  in place with the same size within the file system's time granularity is missed
+  until SIGHUP
 
 ## Build note
 

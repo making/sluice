@@ -18,6 +18,11 @@
 //! once the server acknowledged it and no connection is left on it, within
 //! `--drain-grace`.
 //!
+//! The routes come from `--wasm` flags and / or a `--config` YAML file
+//! (`config`) and are reloaded without a restart (`routes::Reloader`): on a
+//! change of their files, or on SIGHUP. Every node stream advertises the
+//! reloaded routes again.
+//!
 //! Scope (deliberately minimal):
 //!
 //! - `grpc://` / `grpcs://` control plane (`--ca-cert` pins the CA,
@@ -34,13 +39,14 @@
 //! sluice-wicket-wasi --server grpc://127.0.0.1:8001 --token SECRET \
 //!     --wasm demo.local=./hello.wasm \
 //!     --wasm relay.local='./relay.wasm?wasi=cli,inherit-network'
+//! sluice-wicket-wasi --config wicket-wasi.yaml
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -50,6 +56,8 @@ mod pb {
 
 #[cfg(test)]
 mod build_info;
+mod config;
+mod routes;
 mod tls;
 #[cfg(test)]
 mod transport_window_test;
@@ -58,27 +66,9 @@ mod wasm_host;
 
 use pb::frame::Body;
 use pb::{Advertise, Frame, PeerBuild, Upstream};
+use routes::{Reloader, Routes};
 use tunnel::{Connections, Outbound};
-use wasm_host::{Handler, Instances, Locator, Sandbox};
-
-struct Route {
-    host: String,
-    component: Locator,
-    sandbox: Sandbox,
-}
-
-struct Config {
-    server: String,
-    token: String,
-    client_id: String,
-    insecure: bool,
-    ca_cert: Option<String>,
-    routes: Vec<Route>,
-    max_connections: usize,
-    max_instances: usize,
-    stall_timeout: Duration,
-    drain_grace: Duration,
-}
+use wasm_host::Instances;
 
 /// Reconnect backoff: the ceiling doubles from 1s to 30s and each wait is
 /// drawn from its upper half (equal jitter), as `ReconnectBackoff` of the Java
@@ -122,23 +112,6 @@ fn jitter_unit() -> f64 {
 /// reconnect loop.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Default of `--max-connections`: 256 connections x one 1MiB receive window
-/// (plus at most two partly used 16KiB segments and 80 segments' overhead
-/// each) = about 265MiB of the server's payload buffered at most.
-const DEFAULT_MAX_CONNECTIONS: usize = 256;
-
-/// Default of `--tunnel-stall-timeout`, the Java side's
-/// `sluice.client.tunnel-stall-timeout`.
-const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Default of `--drain-grace`, the Java side's `sluice.client.drain-grace`.
-const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(20);
-
-/// Default of `--max-instances`: 64 guest instances alive at once, i.e. at
-/// most 64 x the largest `memory-mib` of guest linear memory (16GiB at the
-/// default 256MiB).
-const DEFAULT_MAX_INSTANCES: usize = 64;
-
 /// The HTTP/2 window announced for the gRPC connection carrying the tunnel
 /// (stream and connection alike, the tunnel being one stream): twice what the
 /// connections may have in flight, `max_connections` x [`tunnel::WINDOW`],
@@ -181,12 +154,9 @@ struct Shared {
     id: String,
     insecure: bool,
     ca_pem: Option<Vec<u8>>,
-    /// Upstreams advertised on every stream.
-    advertised: Vec<Upstream>,
-    /// Target (`wasm:<locator>[?<sandbox>]`) -> its handler; the dial address
-    /// key. The target carries the sandbox, so routes sharing a component
-    /// with different sandboxes stay distinct.
-    components: Arc<HashMap<String, Arc<Handler>>>,
+    /// The routes every stream advertises and its connections are served
+    /// by; replaced by a reload.
+    routes: Arc<Routes>,
     /// Connections open at once, over every node session.
     limit: Arc<tunnel::Limit>,
     /// How long connection frames may wait with none taken before a stream
@@ -244,129 +214,24 @@ struct NodeTask {
 
 #[tokio::main]
 async fn main() {
-    match run(parse_args()).await {
+    let settings = match config::parse(std::env::args().skip(1)) {
+        Ok(config::Parsed::Run(settings)) => *settings,
+        Ok(config::Parsed::Version) => {
+            println!("{}", describe(&peer_build()));
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+    match run(settings).await {
         // drained: the tasks left (guest instances among them) are not waited for
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("error: {e}");
             std::process::exit(1);
         }
-    }
-}
-
-fn parse_args() -> Config {
-    let mut config = Config {
-        server: String::new(),
-        token: String::new(),
-        // same default policy as the Java client: random id unless --client-id is given
-        client_id: uuid::Uuid::new_v4().to_string(),
-        insecure: false,
-        ca_cert: None,
-        routes: Vec::new(),
-        max_connections: DEFAULT_MAX_CONNECTIONS,
-        max_instances: DEFAULT_MAX_INSTANCES,
-        stall_timeout: DEFAULT_STALL_TIMEOUT,
-        drain_grace: DEFAULT_DRAIN_GRACE,
-    };
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        let mut value = |name: &str| -> String {
-            match args.next() {
-                Some(v) => v,
-                None => panic!("missing value for {name}"),
-            }
-        };
-        match arg.as_str() {
-            "--version" => {
-                println!("{}", describe(&peer_build()));
-                std::process::exit(0);
-            }
-            "--server" => config.server = value("server"),
-            "--token" => config.token = value("token"),
-            "--client-id" => config.client_id = value("client-id"),
-            "--insecure" => config.insecure = true,
-            "--ca-cert" => config.ca_cert = Some(value("ca-cert")),
-            "--max-connections" => {
-                config.max_connections =
-                    parse_limit("max-connections", &value("max-connections"), usize::MAX)
-                        .unwrap_or_else(|e| panic!("{e}"));
-            }
-            "--max-instances" => {
-                config.max_instances = parse_limit(
-                    "max-instances",
-                    &value("max-instances"),
-                    wasm_host::Instances::MAX,
-                )
-                .unwrap_or_else(|e| panic!("{e}"));
-            }
-            "--tunnel-stall-timeout" => {
-                config.stall_timeout =
-                    parse_seconds("tunnel-stall-timeout", &value("tunnel-stall-timeout"))
-                        .unwrap_or_else(|e| panic!("{e}"));
-            }
-            "--drain-grace" => {
-                config.drain_grace = parse_seconds("drain-grace", &value("drain-grace"))
-                    .unwrap_or_else(|e| panic!("{e}"));
-            }
-            "--wasm" => {
-                let spec = value("wasm");
-                let (host, target) = spec.split_once('=').unwrap_or_else(|| {
-                    panic!("--wasm must be host=component-locator, got '{spec}'")
-                });
-                let (target, sandbox) =
-                    parse_route_target(target).unwrap_or_else(|e| panic!("--wasm {spec}: {e}"));
-                let component =
-                    Locator::parse(&target).unwrap_or_else(|e| panic!("--wasm {spec}: {e}"));
-                config.routes.push(Route {
-                    host: host.to_string(),
-                    component,
-                    sandbox,
-                });
-            }
-            other => panic!("unknown argument '{other}'"),
-        }
-    }
-    if config.server.is_empty() || config.routes.is_empty() {
-        panic!("--server and at least one --wasm host=locator are required");
-    }
-    config
-}
-
-/// The value of a `--max-*` limit: a number from 1 to `max`.
-fn parse_limit(name: &str, value: &str, max: usize) -> Result<usize, String> {
-    match value.parse() {
-        Ok(limit) if limit > 0 && limit <= max => Ok(limit),
-        _ if max == usize::MAX => Err(format!("--{name} must be a positive number, got '{value}'")),
-        _ => Err(format!(
-            "--{name} must be a number from 1 to {max}, got '{value}'"
-        )),
-    }
-}
-
-/// The value of a duration flag in whole seconds; `0` turns it off.
-fn parse_seconds(name: &str, value: &str) -> Result<Duration, String> {
-    value
-        .parse()
-        .map(Duration::from_secs)
-        .map_err(|_| format!("--{name} must be a number of seconds (0 = off), got '{value}'"))
-}
-
-/// Splits `locator[?budget-ms=N&instances=N&memory-mib=N&pool=N&wasi=cap,...]`
-/// into the locator and the per-route sandbox. The `?` separator means literal `?` in file
-/// paths needs URL-escaping (`file://...%3F...`).
-fn parse_route_target(spec: &str) -> Result<(String, Sandbox), String> {
-    match spec.split_once('?') {
-        Some((target, query)) => Ok((target.to_string(), Sandbox::parse(query)?)),
-        None => Ok((spec.to_string(), Sandbox::default())),
-    }
-}
-
-/// The advertised target of a route: the component locator plus its
-/// canonical sandbox query (omitted when all defaults).
-fn route_target(locator: &str, sandbox: &Sandbox) -> String {
-    match sandbox.query() {
-        query if query.is_empty() => locator.to_string(),
-        query => format!("{locator}?{query}"),
     }
 }
 
@@ -391,62 +256,30 @@ fn identify<T>(request: &mut tonic::Request<T>, token: &str, id: &str) -> Result
     Ok(())
 }
 
-/// Target (`wasm:<locator>[?<sandbox>]`) -> its route handler.
-type Handlers = HashMap<String, Arc<Handler>>;
-
-/// Fetches / prewarms every route's component (fail fast) and builds its
-/// handler on `instances`, returning the handlers by target and the upstreams
-/// to advertise. The target is the component locator (`wasm:<url>`) plus the
-/// sandbox query; the server passes it through verbatim as the dial address
-/// and the wicket resolves it back.
-async fn handlers(
-    routes: &[Route],
-    instances: &Arc<Instances>,
-) -> Result<(Handlers, Vec<Upstream>), BoxError> {
-    let mut components = Handlers::new();
-    let mut advertised = Vec::with_capacity(routes.len());
-    for route in routes {
-        let target = route_target(&route.component.target().await?, &route.sandbox);
-        if !components.contains_key(&target) {
-            let component = match wasm_host::load(&route.component, route.sandbox.caps).await {
-                Ok(component) => component,
-                Err(e) => return Err(format!("wasm route '{}': {e}", route.host).into()),
-            };
-            // A second handler on the target would never serve, its pool's
-            // units holding their slots for good.
-            let handler = Handler::new(component, route.sandbox, instances)
-                .map_err(|e| format!("wasm route '{}': {e}", route.host))?;
-            components.insert(target.clone(), handler);
-        }
-        advertised.push(Upstream {
-            host: route.host.clone(),
-            target_url: target,
-            rewrite_host: false,
-            ..Default::default()
-        });
-    }
-    Ok((components, advertised))
-}
-
-async fn run(config: Config) -> Result<(), BoxError> {
-    let Config {
+async fn run(settings: config::Settings) -> Result<(), BoxError> {
+    let config::Settings {
         server,
         token,
         client_id,
         insecure,
         ca_cert,
-        routes,
         max_connections,
         max_instances,
         stall_timeout,
         drain_grace,
-    } = config;
+        watch_interval,
+        routes,
+    } = settings;
     println!("wicket build: {}", describe(&peer_build()));
     let instances = Instances::new(max_instances);
 
-    let (components, advertised) = handlers(&routes, &instances).await?;
+    // Fetches / prewarms every route's component (fail fast) and builds its
+    // handler on `instances`.
+    let reloader = Reloader::start(routes, instances.clone()).await?;
     let ca_pem = match ca_cert {
-        Some(path) => Some(std::fs::read(&path).map_err(|e| format!("--ca-cert {path}: {e}"))?),
+        Some(path) => {
+            Some(std::fs::read(&path).map_err(|e| format!("--ca-cert {}: {e}", path.display()))?)
+        }
         None => None,
     };
     let shared = Arc::new(Shared {
@@ -454,8 +287,7 @@ async fn run(config: Config) -> Result<(), BoxError> {
         id: client_id,
         insecure,
         ca_pem,
-        advertised,
-        components: Arc::new(components),
+        routes: reloader.routes().clone(),
         limit: tunnel::Limit::new(max_connections),
         stall_timeout,
         transport_window: transport_window(max_connections),
@@ -477,6 +309,17 @@ async fn run(config: Config) -> Result<(), BoxError> {
     );
 
     println!("drain grace {}s (0 = off)", drain_grace.as_secs());
+    println!(
+        "routes: {} (generation {}); watching their files every {}ms (0 = off), SIGHUP reloads",
+        shared.routes.current().advertised.len(),
+        shared.routes.current().generation,
+        watch_interval.as_millis()
+    );
+
+    // the drain stops the reloads: the routes are withdrawn
+    let (hangups, hangups_received) = mpsc::channel(1);
+    forward_hangups(hangups)?;
+    tokio::spawn(reloader.run(watch_interval, hangups_received, shared.drain.begin.clone()));
 
     let (tx, rx) = mpsc::channel::<Event>(32);
     let supervisor = supervise(rx, tx, shared.clone(), server);
@@ -495,6 +338,26 @@ async fn run(config: Config) -> Result<(), BoxError> {
         eprintln!("{name} during the drain: ending it at once");
     };
     drain(&shared, drain_grace, interrupt).await;
+    Ok(())
+}
+
+/// Sends a message to `hangups` on every SIGHUP (which no longer ends the
+/// process); a reload is pending at most once.
+#[cfg(unix)]
+fn forward_hangups(hangups: mpsc::Sender<()>) -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut hangup = signal(SignalKind::hangup())?;
+    tokio::spawn(async move {
+        while hangup.recv().await.is_some() {
+            let _ = hangups.try_send(());
+        }
+    });
+    Ok(())
+}
+
+/// No SIGHUP where there are no unix signals: the files are still polled.
+#[cfg(not(unix))]
+fn forward_hangups(_hangups: mpsc::Sender<()>) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -771,7 +634,17 @@ impl NodeTask {
         // The bidi stream: outbound frames are scheduled by `outbound`,
         // inbound arrive via `inbound`.
         let (outbound, frames) = Outbound::new();
-        outbound.control(advertise(self.shared.advertised.clone(), false));
+        // registered before the routes are read: a reload from now on is
+        // seen by `table` and waits for this stream's acknowledgement
+        let acks = self.shared.routes.stream();
+        let mut table = self.shared.routes.subscribe();
+        let routes = table.borrow_and_update().clone();
+        outbound.control(advertise(routes.advertised.clone(), false));
+        let advertised = Advertised {
+            upstreams: routes.advertised.clone(),
+            unacked: VecDeque::from([routes.generation]),
+            acks,
+        };
         let mut request = tonic::Request::new(frames);
         identify(&mut request, &self.shared.token, &self.shared.id)?;
         let mut client = <pb::tunnel_client::TunnelClient<_>>::new(channel.clone());
@@ -785,11 +658,18 @@ impl NodeTask {
         let connections = Connections::new(
             self.key.clone(),
             outbound,
-            self.shared.components.clone(),
+            self.shared.routes.clone(),
             self.shared.limit.clone(),
         );
         let established = self
-            .stream(inbound, &connections, &channel, &watchdog)
+            .stream(
+                inbound,
+                &connections,
+                &channel,
+                &watchdog,
+                table,
+                advertised,
+            )
             .await;
 
         // Tear down this attempt's virtual connections: their tunnel side is
@@ -813,12 +693,18 @@ impl NodeTask {
     /// advertise without `withdrawn` comes from a server predating the drain,
     /// which keeps routing here: the stream ends at once. The drain's abort
     /// ends it at once too.
+    ///
+    /// Until the drain, a reload that changed the routes (`table`) is
+    /// advertised again; each acknowledgement tells the routes which
+    /// generation the server took on this stream.
     async fn stream(
         &self,
         mut inbound: tonic::Streaming<Frame>,
         connections: &Connections,
         channel: &tonic::transport::Channel,
         outbound: &Outbound,
+        mut table: watch::Receiver<Arc<routes::Table>>,
+        mut advertised: Advertised,
     ) -> Result<bool, BoxError> {
         let mut established = false;
         // the advertise opening the stream
@@ -834,6 +720,7 @@ impl NodeTask {
             Frame(Frame),
             Withdraw,
             Drained,
+            Reloaded,
         }
         loop {
             let step = tokio::select! {
@@ -845,6 +732,8 @@ impl NodeTask {
                 _ = self.session.token.cancelled() => return Ok(established),
                 _ = drain.abort.cancelled() => return Ok(established),
                 _ = drain.begin.cancelled(), if withdrawal == 0 => Step::Withdraw,
+                // the reloader outlives every stream: the table never closes
+                Ok(()) = table.changed(), if withdrawal == 0 => Step::Reloaded,
                 _ = held.wait_for(|held| *held == 0), if withdrawn && !ending => Step::Drained,
                 stalled = outbound.stalled(self.shared.stall_timeout) => {
                     eprintln!(
@@ -857,10 +746,24 @@ impl NodeTask {
             };
             let frame = match step {
                 Step::Frame(frame) => frame,
+                Step::Reloaded => {
+                    let routes = table.borrow_and_update().clone();
+                    if advertised.update(&routes) {
+                        advertises_sent += 1;
+                        outbound.control(advertise(advertised.upstreams.clone(), false));
+                        println!(
+                            "[{}] advertising the reloaded routes ({} upstream(s), generation {})",
+                            self.key,
+                            advertised.upstreams.len(),
+                            routes.generation
+                        );
+                    }
+                    continue;
+                }
                 Step::Withdraw => {
                     advertises_sent += 1;
                     withdrawal = advertises_sent;
-                    outbound.control(advertise(self.shared.advertised.clone(), true));
+                    outbound.control(advertise(advertised.upstreams.clone(), true));
                     println!(
                         "[{}] withdrawing the routes; {} connection(s) open",
                         self.key,
@@ -898,6 +801,7 @@ impl NodeTask {
                         );
                         return Ok(established);
                     }
+                    advertised.acked();
                     println!(
                         "[{}] advertise acked by {} (rejected ports: {:?})",
                         self.key, ack.node_id, ack.rejected_ports
@@ -965,6 +869,41 @@ impl NodeTask {
                 Some(body) => connections.dispatch(body),
                 None => {}
             }
+        }
+    }
+}
+
+/// The routes a stream advertised, and the generations its advertises carried
+/// that the server has not acknowledged yet.
+struct Advertised {
+    upstreams: Vec<Upstream>,
+    /// Oldest first: acknowledgements come in the order of the advertises.
+    unacked: VecDeque<u64>,
+    acks: routes::StreamAcks,
+}
+
+impl Advertised {
+    /// Takes the reloaded `routes`; true when their upstreams changed and
+    /// are to be advertised. Unchanged, the server already has them: the
+    /// generation counts as acknowledged with the advertise still pending,
+    /// or at once.
+    fn update(&mut self, routes: &routes::Table) -> bool {
+        if routes.advertised != self.upstreams {
+            self.upstreams = routes.advertised.clone();
+            self.unacked.push_back(routes.generation);
+            return true;
+        }
+        match self.unacked.back_mut() {
+            Some(pending) => *pending = routes.generation,
+            None => self.acks.acked(routes.generation),
+        }
+        false
+    }
+
+    /// The server acknowledged the oldest advertise.
+    fn acked(&mut self) {
+        if let Some(generation) = self.unacked.pop_front() {
+            self.acks.acked(generation);
         }
     }
 }
@@ -1124,24 +1063,6 @@ mod tests {
         assert!(waits.len() > 10, "{} distinct of 20", waits.len());
     }
 
-    #[test]
-    fn limits_take_a_number_from_one_to_their_max() {
-        assert_eq!(parse_limit("max-instances", "8", 64), Ok(8));
-        assert_eq!(parse_limit("max-instances", "64", 64), Ok(64));
-        for bad in ["0", "65", "-1", "x", ""] {
-            assert_eq!(
-                parse_limit("max-instances", bad, 64),
-                Err(format!(
-                    "--max-instances must be a number from 1 to 64, got '{bad}'"
-                )),
-            );
-        }
-        assert_eq!(
-            parse_limit("max-connections", "0", usize::MAX),
-            Err("--max-connections must be a positive number, got '0'".to_string()),
-        );
-    }
-
     /// Frames of the server's stream, gRPC-framed (5-byte prefix + message).
     fn grpc_frame(frame: &Frame) -> bytes::Bytes {
         use prost::Message as _;
@@ -1254,32 +1175,37 @@ mod tests {
     /// The state of a wicket serving the hello guest for `hello.local`, its
     /// connection limit and the route's target.
     async fn hello_shared(stall_timeout: Duration) -> (Arc<Shared>, Arc<tunnel::Limit>, String) {
-        let locator =
-            Locator::parse(wasm_host::tests::guest_wasm("hello").to_str().unwrap()).unwrap();
-        let target = locator.target().await.unwrap();
-        let loaded = wasm_host::load(&locator, wasm_host::Caps::default())
-            .await
-            .unwrap();
-        let handler = Handler::new(loaded, Sandbox::default(), &Instances::new(4)).unwrap();
+        let hello = wasm_host::tests::guest_wasm("hello");
+        let source = config::RouteSource::flags(vec![routes::Spec {
+            host: "hello.local".into(),
+            component: wasm_host::Locator::parse(hello.to_str().unwrap()).unwrap(),
+            sandbox: wasm_host::Sandbox::default(),
+        }]);
+        let reloader = Reloader::start(source, Instances::new(4)).await.unwrap();
+        let (shared, limit) = shared_on(reloader.routes(), stall_timeout);
+        let target = shared.routes.current().advertised[0].target_url.clone();
+        (shared, limit, target)
+    }
+
+    /// The state of a wicket serving `routes`, and its connection limit.
+    fn shared_on(
+        routes: &Arc<Routes>,
+        stall_timeout: Duration,
+    ) -> (Arc<Shared>, Arc<tunnel::Limit>) {
         let limit = tunnel::Limit::new(4);
         let shared = Arc::new(Shared {
             token: String::new(),
             id: "test".into(),
             insecure: false,
             ca_pem: None,
-            advertised: vec![Upstream {
-                host: "hello.local".into(),
-                target_url: target.clone(),
-                ..Default::default()
-            }],
-            components: Arc::new(HashMap::from([(target.clone(), handler)])),
+            routes: routes.clone(),
             limit: limit.clone(),
             stall_timeout,
             transport_window: transport_window(4),
             drain: Drain::default(),
             tasks: TaskTracker::new(),
         });
-        (shared, limit, target)
+        (shared, limit)
     }
 
     /// Hang guard of the drain tests' waits.
@@ -1398,6 +1324,29 @@ mod tests {
             response.lines().next().unwrap_or_default().to_string()
         }
 
+        /// Sends `bytes` on `conn_id`.
+        fn data(&mut self, conn_id: i64, bytes: &str) {
+            self.send(Body::Data(pb::Data {
+                conn_id,
+                payload: bytes.as_bytes().to_vec(),
+            }));
+        }
+
+        /// The chunked response on `conn_id`, read to its end.
+        async fn response(&mut self, conn_id: i64) -> String {
+            let mut response = String::new();
+            while !response.ends_with("\r\n0\r\n\r\n") {
+                let payload = self
+                    .next(|body| match body {
+                        Body::Data(data) if data.conn_id == conn_id => Some(data.payload),
+                        _ => None,
+                    })
+                    .await;
+                response.push_str(std::str::from_utf8(&payload).unwrap());
+            }
+            response
+        }
+
         /// Ends the server's side with an OK status.
         fn end(&mut self) {
             let mut trailers = http::HeaderMap::new();
@@ -1483,7 +1432,8 @@ mod tests {
         let withdrawal = stream.advertise().await;
         assert!(withdrawal.withdraw);
         assert_eq!(
-            withdrawal.upstreams, shared.advertised,
+            withdrawal.upstreams,
+            shared.routes.current().advertised,
             "the routes repeated"
         );
         assert_eq!(withdrawal.connection_window, tunnel::WINDOW);
@@ -1563,177 +1513,133 @@ mod tests {
         assert!(all_closed(&limit).await, "the connection is closed");
     }
 
-    #[test]
-    fn durations_take_whole_seconds_and_zero_turns_them_off() {
-        assert_eq!(
-            parse_seconds("tunnel-stall-timeout", "90"),
-            Ok(Duration::from_secs(90))
+    /// A reload is advertised on the live stream. A component changed on
+    /// disk serves the next request of a connection already open, after the
+    /// request in flight finished on the old one; a removed target keeps
+    /// being served -- a CONNECT the server routed before it took the new
+    /// routes included -- until the stream acknowledged them, then its
+    /// connections close and a CONNECT to it fails.
+    #[tokio::test]
+    async fn a_reload_is_advertised_and_a_removed_target_serves_until_acknowledged() {
+        let dir = routes::tests::Scratch::new("advertise");
+        dir.guest("a.wasm", "hello");
+        dir.guest("b.wasm", "hello");
+        let path = dir.write(
+            "wicket.yaml",
+            "routes:\n  - {host: a.local, component: a.wasm}\n  - {host: b.local, component: b.wasm}\n",
         );
-        assert_eq!(
-            parse_seconds("tunnel-stall-timeout", "0"),
-            Ok(Duration::ZERO)
+        let reloader =
+            Reloader::start(config::RouteSource::file(&path).unwrap(), Instances::new(8))
+                .await
+                .unwrap();
+        let (shared, limit) = shared_on(reloader.routes(), Duration::ZERO);
+        let (a, b) = {
+            let table = shared.routes.current();
+            (table.target("a.local"), table.target("b.local"))
+        };
+        let (hangups, hangups_received) = mpsc::channel(1);
+        let stop = CancellationToken::new();
+        tokio::spawn(reloader.run(Duration::ZERO, hangups_received, stop.clone()));
+        let (mut stream, _events) = served_session(&shared).await;
+        assert_eq!(stream.advertise().await.upstreams.len(), 2);
+        stream.ack(false);
+        stream.connect(1, &a);
+        stream.connect(2, &b);
+        assert_eq!(stream.exchange(2, "/b").await, "HTTP/1.1 200 OK");
+        // in flight across the reload: the body is half sent
+        stream.data(
+            1,
+            "POST / HTTP/1.1\r\nhost: a.local\r\ncontent-length: 4\r\n\r\nab",
         );
-        for bad in ["-1", "1.5", "60s", ""] {
-            assert_eq!(
-                parse_seconds("tunnel-stall-timeout", bad),
-                Err(format!(
-                    "--tunnel-stall-timeout must be a number of seconds (0 = off), got '{bad}'"
-                )),
+
+        dir.guest("a.wasm", "fetch");
+        dir.write(
+            "wicket.yaml",
+            "routes:\n  - {host: a.local, component: a.wasm}\n",
+        );
+        hangups.send(()).await.unwrap();
+        let readvertised = stream.advertise().await;
+        let hosts: Vec<_> = readvertised.upstreams.iter().map(|up| &up.host).collect();
+        assert_eq!(hosts, ["a.local"]);
+        assert!(!readvertised.withdraw);
+        assert_eq!(
+            readvertised.upstreams[0].target_url, a,
+            "a keeps its target"
+        );
+
+        stream.data(1, "cd");
+        let in_flight = stream.response(1).await;
+        assert!(in_flight.contains("body_bytes=4"), "the old a: {in_flight}");
+        stream.data(1, "GET / HTTP/1.1\r\nhost: a.local\r\n\r\n");
+        let next = stream.response(1).await;
+        assert!(next.starts_with("HTTP/1.1 400"), "the new a: {next}");
+        // routed by the server before it took the new routes
+        stream.connect(3, &b);
+        assert_eq!(stream.exchange(3, "/late").await, "HTTP/1.1 200 OK");
+        assert_eq!(stream.exchange(2, "/again").await, "HTTP/1.1 200 OK");
+
+        stream.ack(false);
+        let mut closed = Vec::new();
+        while closed.len() < 2 {
+            closed.push(
+                stream
+                    .next(|body| match body {
+                        Body::Close(close) => Some(close.conn_id),
+                        _ => None,
+                    })
+                    .await,
             );
         }
+        closed.sort();
+        assert_eq!(closed, [2, 3], "b's connections close, a's stays");
+        stream.connect(4, &b);
+        let error = stream
+            .next(|body| match body {
+                Body::Error(error) if error.conn_id == 4 => Some(error.message),
+                _ => None,
+            })
+            .await;
+        assert!(error.contains("no wasm route"), "{error}");
+        assert_eq!(limit.open(), 1, "a's connection only");
+        stop.cancel();
     }
 
+    /// Each acknowledgement tells which generation the server took: the one
+    /// of its advertise, or a later one reloaded to the same routes while it
+    /// was pending; a reload to the same routes with none pending counts at
+    /// once.
     #[test]
-    fn route_target_without_options_keeps_defaults() {
-        let (target, sandbox) =
-            parse_route_target("target/wasm32-wasip3/release/hello.wasm").unwrap();
-        assert_eq!(target, "target/wasm32-wasip3/release/hello.wasm");
-        assert_eq!(sandbox, Sandbox::default());
-        assert_eq!(
-            route_target("wasm:file:///hello.wasm", &sandbox),
-            "wasm:file:///hello.wasm"
-        );
-    }
-
-    #[test]
-    fn route_target_options_override_limits() {
-        let (target, sandbox) = parse_route_target("./a.wasm?budget-ms=250&memory-mib=64").unwrap();
-        assert_eq!(target, "./a.wasm");
-        assert_eq!(sandbox.limits.budget, Duration::from_millis(250));
-        assert_eq!(sandbox.limits.memory, 64 << 20);
-        assert_eq!(sandbox.caps, wasm_host::Caps::default());
-    }
-
-    #[test]
-    fn route_target_grants_wasi_capabilities() {
-        let (_, sandbox) = parse_route_target("./a.wasm?wasi=inherit-network,cli").unwrap();
-        assert_eq!(
-            sandbox.caps,
-            wasm_host::Caps {
-                cli: true,
-                inherit_network: true,
-                ..Default::default()
-            }
-        );
-    }
-
-    #[test]
-    fn route_target_rejects_unknown_capabilities_and_options() {
-        let error = parse_route_target("./a.wasm?wasi=cli,fs").unwrap_err();
-        assert!(error.contains("unknown wasi capability 'fs'"), "{error}");
-        let error = parse_route_target("./a.wasm?fuel=1").unwrap_err();
-        assert!(error.contains("unknown option 'fuel'"), "{error}");
-    }
-
-    /// `http` is accepted for flag parity with `-S http` but changes nothing:
-    /// outgoing http is always linked, as under `wasmtime serve`, so it does
-    /// not split the advertised target either.
-    #[test]
-    fn route_target_accepts_http_as_always_granted() {
-        let (_, sandbox) = parse_route_target("./a.wasm?wasi=http").unwrap();
-        assert_eq!(sandbox, Sandbox::default());
-        let (_, sandbox) = parse_route_target("./a.wasm?wasi=http,cli").unwrap();
-        assert_eq!(
-            route_target("wasm:file:///a.wasm", &sandbox),
-            "wasm:file:///a.wasm?wasi=cli"
-        );
-    }
-
-    /// `instances=N` caps the route's slots and is part of the advertised
-    /// target; a cap equal to the pool is accepted.
-    #[test]
-    fn route_target_caps_the_routes_instances() {
-        let (_, sandbox) = parse_route_target("./a.wasm?pool=2&instances=4").unwrap();
-        assert_eq!(sandbox.instances, Some(4));
-        assert_eq!(sandbox.pool, 2);
-        assert_eq!(
-            route_target("wasm:file:///a.wasm", &sandbox),
-            "wasm:file:///a.wasm?instances=4&pool=2"
-        );
-        let (_, sandbox) = parse_route_target("./a.wasm?instances=2&pool=2").unwrap();
-        assert_eq!(sandbox.instances, Some(2));
-        let (_, sandbox) = parse_route_target("./a.wasm").unwrap();
-        assert_eq!(sandbox.instances, None, "no cap unless set");
-    }
-
-    /// Routes naming one component with the same options share a dial
-    /// address, so they share one handler: its pool starts once (no unit
-    /// orphaned on a slot), and its cap bounds the routes together.
-    #[tokio::test]
-    async fn routes_sharing_a_target_share_one_handler() {
-        let path = wasm_host::tests::guest_wasm("hello");
-        let route = |host: &str| Route {
+    fn an_advertise_acknowledges_the_generations_carrying_its_routes() {
+        use futures_util::FutureExt as _;
+        let routes = Routes::fixed(HashMap::new());
+        let acknowledged = |generation| routes.acknowledged(generation).now_or_never().is_some();
+        let upstream = |host: &str| Upstream {
             host: host.into(),
-            component: Locator::parse(path.to_str().unwrap()).unwrap(),
-            sandbox: Sandbox {
-                pool: 1,
-                instances: Some(1),
-                ..Sandbox::default()
-            },
+            ..Default::default()
         };
-        let instances = Instances::new(4);
-        let (handlers, advertised) = handlers(&[route("a.local"), route("b.local")], &instances)
-            .await
-            .unwrap();
-        let hosts: Vec<_> = advertised.iter().map(|up| up.host.as_str()).collect();
-        assert_eq!(hosts, ["a.local", "b.local"], "both hosts advertised");
-        assert_eq!(advertised[0].target_url, advertised[1].target_url);
-        assert_eq!(handlers.len(), 1);
-        assert_eq!(instances.held(), 1, "one pool started");
-    }
-
-    /// A zero cap, a cap below the pool (in either order) and a non-number
-    /// are startup errors.
-    #[test]
-    fn route_target_rejects_a_cap_below_one_or_the_pool() {
-        assert_eq!(
-            parse_route_target("./a.wasm?instances=0").unwrap_err(),
-            "instances: must be at least 1"
-        );
-        let below = "instances=1 is below pool=2: every pooled unit holds one of the route's \
-                     instance slots";
-        assert_eq!(
-            parse_route_target("./a.wasm?instances=1&pool=2").unwrap_err(),
-            below
-        );
-        assert_eq!(
-            parse_route_target("./a.wasm?pool=2&instances=1").unwrap_err(),
-            below
-        );
-        assert_eq!(
-            parse_route_target("./a.wasm?instances=many").unwrap_err(),
-            "instances: not a number 'many'"
-        );
-    }
-
-    #[test]
-    fn network_capabilities_require_cli() {
-        let error = parse_route_target("./a.wasm?wasi=inherit-network").unwrap_err();
-        assert!(error.contains("need 'cli'"), "{error}");
-    }
-
-    /// The advertised target carries the canonical sandbox query, so two
-    /// routes on one component with different sandboxes get distinct dial
-    /// addresses, and equal sandboxes share one regardless of spelling.
-    #[test]
-    fn route_target_canonicalizes_the_sandbox_query() {
-        let (_, a) =
-            parse_route_target("a.wasm?wasi=tcp,cli,inherit-network&memory-mib=64").unwrap();
-        let (_, b) =
-            parse_route_target("a.wasm?memory-mib=64&wasi=cli,inherit-network,tcp").unwrap();
-        let (_, c) = parse_route_target("a.wasm?budget-ms=10000&wasi=cli").unwrap();
-        assert_eq!(
-            route_target("wasm:file:///a.wasm", &a),
-            "wasm:file:///a.wasm?memory-mib=64&wasi=cli,inherit-network,tcp"
-        );
-        assert_eq!(
-            route_target("wasm:file:///a.wasm", &a),
-            route_target("wasm:file:///a.wasm", &b)
-        );
-        assert_eq!(
-            route_target("wasm:file:///a.wasm", &c),
-            "wasm:file:///a.wasm?wasi=cli"
-        );
+        let mut advertised = Advertised {
+            upstreams: vec![upstream("a")],
+            unacked: VecDeque::from([1]),
+            acks: routes.stream(),
+        };
+        let table = |generation, hosts: &[&str]| {
+            routes::Table::advertising(
+                generation,
+                hosts.iter().map(|host| upstream(host)).collect(),
+            )
+        };
+        assert!(!advertised.update(&table(2, &["a"])), "the same routes");
+        assert!(!acknowledged(1));
+        advertised.acked();
+        assert!(acknowledged(2), "the pending advertise carried 2");
+        assert!(!advertised.update(&table(3, &["a"])));
+        assert!(acknowledged(3), "none pending: at once");
+        assert!(advertised.update(&table(4, &["a", "b"])), "new routes");
+        assert!(!acknowledged(4));
+        advertised.acked();
+        assert!(acknowledged(4));
+        drop(advertised);
+        assert!(acknowledged(99), "no live stream holds anything back");
     }
 
     /// Without the window the server fails the stream (FAILED_PRECONDITION),

@@ -178,8 +178,10 @@ fn run_guarded(body: impl FnOnce(), on_death: impl FnOnce()) {
 // Component locators
 
 /// Where a component comes from: the `wasm:` address form minus the prefix.
-/// Bare paths and `file://` read from disk; `http://` / `https://` are
-/// fetched once at startup. Further schemes slot in here.
+/// Bare paths and `file://` read from disk on every load; `http://` /
+/// `https://` are fetched when their route is new, or on a SIGHUP reload.
+/// Further schemes slot in here.
+#[derive(Clone, PartialEq, Debug)]
 pub enum Locator {
     File(PathBuf),
     Http(http::Uri),
@@ -198,6 +200,14 @@ impl Locator {
                 .map(Locator::Http)
                 .map_err(|e| format!("bad url '{spec}': {e}")),
             other => Err(format!("unsupported wasm locator scheme '{other}://'")),
+        }
+    }
+
+    /// The file a `File` locator reads; None for a remote one.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        match self {
+            Locator::File(path) => Some(path),
+            Locator::Http(_) => None,
         }
     }
 
@@ -220,18 +230,40 @@ impl Locator {
                 .await
                 .map_err(|e| format!("read {}: {e}", path.display())),
             Locator::Http(uri) => {
-                let response = reqwest::get(uri.to_string())
+                static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+                let client = CLIENT.get_or_init(|| {
+                    reqwest::Client::builder()
+                        .timeout(FETCH_TIMEOUT)
+                        .build()
+                        .expect("a plain client builds")
+                });
+                let response = client
+                    .get(uri.to_string())
+                    .send()
                     .await
-                    .map_err(|e| format!("GET {uri}: {e}"))?
+                    .map_err(|e| fetch_failed(uri, e))?
                     .error_for_status()
-                    .map_err(|e| format!("GET {uri}: {e}"))?;
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|e| format!("GET {uri}: {e}"))?;
+                    .map_err(|e| fetch_failed(uri, e))?;
+                let bytes = response.bytes().await.map_err(|e| fetch_failed(uri, e))?;
                 Ok(bytes.to_vec())
             }
         }
+    }
+}
+
+/// Bound on fetching a remote component, so a server that never answers
+/// fails the startup or the reload instead of stalling it.
+#[cfg(not(test))]
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(test)]
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn fetch_failed(uri: &http::Uri, e: reqwest::Error) -> String {
+    if e.is_timeout() {
+        format!("GET {uri}: no answer within {}s", FETCH_TIMEOUT.as_secs())
+    } else {
+        format!("GET {uri}: {e}")
     }
 }
 
@@ -264,6 +296,34 @@ pub struct Loaded {
     service_pre: wasmtime_wasi_http::p3::bindings::ServicePre<Ctx>,
     /// Short component name (the locator's last path segment) for log prefixes.
     label: String,
+    /// sha256 of the component's bytes, hex: a reload keeps the handler of a
+    /// component whose digest did not change.
+    digest: String,
+}
+
+impl Loaded {
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+}
+
+/// A component's bytes as fetched, not compiled yet.
+pub struct Fetched {
+    /// The locator's `wasm:` target.
+    target: String,
+    bytes: Vec<u8>,
+    /// sha256 of `bytes`, hex.
+    digest: String,
+}
+
+impl Fetched {
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
 }
 
 /// Per-route resource limits, applied to every request's instance.
@@ -460,7 +520,7 @@ impl Sandbox {
 
     /// Rejects a cap below the route's pool: every pooled unit holds one of
     /// the route's slots for its lifetime.
-    fn check(&self) -> Result<(), String> {
+    pub fn check(&self) -> Result<(), String> {
         match self.instances {
             Some(cap) if cap < self.pool => Err(format!(
                 "instances={cap} is below pool={}: every pooled unit holds one of the \
@@ -497,23 +557,69 @@ impl Sandbox {
     }
 }
 
-/// Loads (or fetches from cache) the component behind `locator`, linked for
-/// the `caps` it runs with (only `cli` changes the linker).
-pub async fn load(locator: &Locator, caps: Caps) -> Result<Arc<Loaded>, String> {
-    // (target, cli) -> component: `cli` selects the linker
-    type Cache = Mutex<HashMap<(String, bool), Arc<Loaded>>>;
+/// Fetches the component behind `locator`: reads the file, or GETs the url.
+pub async fn fetch(locator: &Locator) -> Result<Fetched, String> {
+    use sha2::Digest as _;
+    let target = locator.target().await?;
+    let bytes = locator.fetch().await?;
+    let digest = sha2::Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(Fetched {
+        target,
+        bytes,
+        digest,
+    })
+}
+
+/// Compiles `fetched`, linked for the `caps` it runs with (only `cli` changes
+/// the linker), unless a component of the same target, digest and linker is
+/// still alive: then that one is shared. Only live components are kept, so a
+/// replaced one is freed with its last handler. The compilation runs on the
+/// blocking pool: a reload compiles while the wicket serves.
+pub async fn compile(fetched: Fetched, caps: Caps) -> Result<Arc<Loaded>, String> {
+    // (target, cli, digest) -> component: `cli` selects the linker
+    type Cache = Mutex<HashMap<(String, bool, String), std::sync::Weak<Loaded>>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let target = locator.target().await?;
-    let key = (target, caps.cli);
-    if let Some(loaded) = cache.lock().unwrap().get(&key) {
-        return Ok(loaded.clone());
+    let Fetched {
+        target,
+        bytes,
+        digest,
+    } = fetched;
+    let key = (target, caps.cli, digest);
+    if let Some(loaded) = cache
+        .lock()
+        .unwrap()
+        .get(&key)
+        .and_then(|weak| weak.upgrade())
+    {
+        return Ok(loaded);
     }
-    let label = key.0.rsplit('/').next().unwrap_or(&key.0).to_string();
-    let bytes = locator.fetch().await?;
+    let (target, _, digest) = key.clone();
+    let loaded = tokio::task::spawn_blocking(move || link(&target, &bytes, digest, caps))
+        .await
+        .map_err(|e| format!("compile {}: {e}", key.0))??;
+    let loaded = Arc::new(loaded);
+    let mut cache = cache.lock().unwrap();
+    cache.retain(|_, weak| weak.strong_count() > 0);
+    cache.insert(key, Arc::downgrade(&loaded));
+    Ok(loaded)
+}
+
+/// Fetches and compiles the component behind `locator` ([`fetch`], [`compile`]).
+#[cfg(test)]
+pub async fn load(locator: &Locator, caps: Caps) -> Result<Arc<Loaded>, String> {
+    compile(fetch(locator).await?, caps).await
+}
+
+/// Compiles and pre-links `bytes` of the component at `target`.
+fn link(target: &str, bytes: &[u8], digest: String, caps: Caps) -> Result<Loaded, String> {
+    let label = target.rsplit('/').next().unwrap_or(target).to_string();
     let engine = engine().clone();
-    let name = key.0.strip_prefix("wasm:").unwrap_or(&key.0);
-    let component = wasmtime::component::Component::new(&engine, &bytes)
+    let name = target.strip_prefix("wasm:").unwrap_or(target);
+    let component = wasmtime::component::Component::new(&engine, bytes)
         .map_err(|e| format!("component {name}: {e}"))?;
     if let Some(p2) = component
         .component_type()
@@ -536,9 +642,11 @@ pub async fn load(locator: &Locator, caps: Caps) -> Result<Arc<Loaded>, String> 
     })?;
     let service_pre =
         wasmtime_wasi_http::p3::bindings::ServicePre::new(pre).map_err(|e| format!("bind: {e}"))?;
-    let loaded = Arc::new(Loaded { service_pre, label });
-    cache.lock().unwrap().insert(key, loaded.clone());
-    Ok(loaded)
+    Ok(Loaded {
+        service_pre,
+        label,
+        digest,
+    })
 }
 
 /// The interfaces a route links, as `wasmtime serve` does for p3: http plus
@@ -1274,11 +1382,52 @@ impl Instances {
         u32::try_from((self.max / 2).max(1)).unwrap_or(u32::MAX)
     }
 
+    /// The limit: the slots there are.
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
     /// A new connection's share of the slots.
     fn share(&self) -> Arc<tokio::sync::Semaphore> {
         Arc::new(tokio::sync::Semaphore::new(
             self.streams_per_connection() as usize
         ))
+    }
+
+    /// Waits for an instance slot: one of the route's under its cap
+    /// (`route`) first, then a process-wide one. In this order a request held
+    /// back by its route's cap waits outside the process-wide queue, holding
+    /// no slot another route could use; the route's own slot it may hold
+    /// meanwhile only delays the route's later requests, which queue behind
+    /// it anyway.
+    async fn slot(&self, route: Option<&Arc<tokio::sync::Semaphore>>) -> Slot {
+        let route = match route {
+            Some(route) => Some(route.clone().acquire_owned().await.expect("never closed")),
+            None => None,
+        };
+        let global = self
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("never closed");
+        Slot {
+            _route: route,
+            _global: global,
+        }
+    }
+
+    /// An instance slot if one is free at once, as [`Instances::slot`].
+    fn try_slot(&self, route: Option<&Arc<tokio::sync::Semaphore>>) -> Option<Slot> {
+        let route = match route {
+            Some(route) => Some(route.clone().try_acquire_owned().ok()?),
+            None => None,
+        };
+        let global = self.slots.clone().try_acquire_owned().ok()?;
+        Some(Slot {
+            _route: route,
+            _global: global,
+        })
     }
 
     /// Slots currently held.
@@ -1396,10 +1545,12 @@ pub struct Handler {
 }
 
 impl Handler {
-    /// Starts the route's pool when its sandbox names one; its units take
-    /// their slots of `instances` (and of the route's cap) for good, so a
-    /// pool larger than the slots left, or than the cap, fails here (at
-    /// startup).
+    /// Starts the route's pool when its sandbox names one. Its units take
+    /// their slots of `instances` (and of the route's cap) for good: at once
+    /// while slots are free, as at startup, where the pools of all routes
+    /// were checked to fit the limit; else -- the units of a replaced pool
+    /// still finishing their requests on a reload -- each unit waits for its
+    /// slot, and requests take the per-request path meanwhile.
     pub fn new(
         loaded: Arc<Loaded>,
         sandbox: Sandbox,
@@ -1412,32 +1563,13 @@ impl Handler {
             .map(|cap| Arc::new(tokio::sync::Semaphore::new(cap)));
         let pool = match sandbox.pool {
             0 => None,
-            units => {
-                let free = instances.slots.available_permits();
-                let globals = (0..units)
-                    .map(|_| instances.slots.clone().try_acquire_owned().ok())
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| {
-                        format!(
-                            "pool={units} needs {units} instance slots, {free} left of \
-                             --max-instances {}",
-                            instances.max
-                        )
-                    })?;
-                let slots = globals
-                    .into_iter()
-                    .map(|global| Slot {
-                        _route: route.as_ref().map(|route| {
-                            route
-                                .clone()
-                                .try_acquire_owned()
-                                .expect("checked: the cap covers the pool")
-                        }),
-                        _global: global,
-                    })
-                    .collect();
-                Some(Pool::new(loaded.clone(), sandbox, live.clone(), slots))
-            }
+            _ => Some(Pool::new(
+                loaded.clone(),
+                sandbox,
+                live.clone(),
+                instances.clone(),
+                route.clone(),
+            )),
         };
         Ok(Arc::new(Handler {
             live,
@@ -1449,27 +1581,23 @@ impl Handler {
         }))
     }
 
-    /// Waits for an instance slot: one of the route's under its cap first,
-    /// then a process-wide one. In this order a request held back by its
-    /// route's cap waits outside the process-wide queue, holding no slot
-    /// another route could use; the route's own slot it may hold meanwhile
-    /// only delays the route's later requests, which queue behind it anyway.
-    async fn slot(&self) -> Slot {
-        let route = match &self.route {
-            Some(route) => Some(route.clone().acquire_owned().await.expect("never closed")),
-            None => None,
-        };
-        let global = self
-            .instances
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("never closed");
-        Slot {
-            _route: route,
-            _global: global,
+    pub fn loaded(&self) -> &Arc<Loaded> {
+        &self.loaded
+    }
+
+    /// Takes the handler out of service: its pool closes (idle units end at
+    /// once, busy ones after their request, none is replaced) and frees its
+    /// slots. Requests still routed here -- in flight, or on a connection
+    /// opened before -- are served on the per-request path.
+    pub fn retire(&self) {
+        if let Some(pool) = &self.pool {
+            pool.close();
         }
+    }
+
+    /// Waits for an instance slot (`Instances::slot`) under the route's cap.
+    async fn slot(&self) -> Slot {
+        self.instances.slot(self.route.as_ref()).await
     }
 
     /// The route's slots held under its cap: its pooled units' and its
@@ -1561,6 +1689,15 @@ impl Handler {
     }
 }
 
+/// The pool's units hold the pool, not the handler: without this a handler
+/// dropped without [`Handler::retire`] would leave its units running on
+/// their slots.
+impl Drop for Handler {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
 /// Whether a unit's store came out of a request reusable.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Outcome {
@@ -1599,63 +1736,130 @@ struct Job {
 /// unit only: a trap, a failed conversion, an interrupted relay, an overrun
 /// budget, a departed client or a spent store (`Ctx::spent`) retires it, and a
 /// retired unit is replaced.
+///
+/// A closed pool (`close`, its handler retired on a reload) replaces no unit:
+/// its idle units end at once, busy ones after their request, and units still
+/// waiting for a slot give up.
 struct Pool {
     loaded: Arc<Loaded>,
     sandbox: Sandbox,
     /// The handler's gauge: every unit marks its store on it.
     live: Arc<Gauge>,
+    /// The handler's slots: the process-wide ones and the route's cap.
+    instances: Arc<Instances>,
+    route: Option<Arc<tokio::sync::Semaphore>>,
     state: Mutex<PoolState>,
     /// Signalled whenever a unit is offered, for requests waiting on an
     /// instance (`Handler::admit`).
     offered: tokio::sync::Notify,
+    /// Cancelled once the pool closed: units waiting for a slot give up.
+    closed: CancellationToken,
 }
+
+/// What an idle unit receives: a request to serve, or None once its pool
+/// closed.
+type UnitMessage = Option<Job>;
 
 struct PoolState {
     /// Senders to idle units; one entry per instantiated unit between
     /// requests.
-    idle: Vec<mpsc::Sender<Job>>,
-    /// Live unit tasks.
+    idle: Vec<mpsc::Sender<UnitMessage>>,
+    /// Live unit tasks, the ones waiting for a slot included.
     units: usize,
     /// Units ever spawned; growth beyond the target signals recycling
     /// (diagnostics, and asserted in tests).
     spawned: usize,
     /// Requests served by a pooled unit instead of the per-request path.
     served: usize,
+    /// No unit is offered or replaced any more.
+    closed: bool,
 }
 
 impl Pool {
-    /// Spawns one unit per slot (`sandbox.pool` of them). Each instantiates
-    /// asynchronously and is offered once ready; until then requests take
-    /// the per-request path.
-    fn new(loaded: Arc<Loaded>, sandbox: Sandbox, live: Arc<Gauge>, slots: Vec<Slot>) -> Arc<Self> {
+    /// Spawns `sandbox.pool` units, each on a slot taken at once when one is
+    /// free, else waiting for one. Each instantiates asynchronously and is
+    /// offered once ready; until then requests take the per-request path.
+    fn new(
+        loaded: Arc<Loaded>,
+        sandbox: Sandbox,
+        live: Arc<Gauge>,
+        instances: Arc<Instances>,
+        route: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> Arc<Self> {
         let pool = Arc::new(Self {
             state: Mutex::new(PoolState {
                 idle: Vec::new(),
-                units: slots.len(),
+                units: sandbox.pool,
                 spawned: 0,
                 served: 0,
+                closed: false,
             }),
             live,
             loaded,
             sandbox,
+            instances,
+            route,
             offered: tokio::sync::Notify::new(),
+            closed: CancellationToken::new(),
         });
-        for slot in slots {
+        for _ in 0..sandbox.pool {
+            let slot = pool.instances.try_slot(pool.route.as_ref());
             Self::spawn_unit(pool.clone(), slot);
         }
         pool
     }
 
-    /// Starts one unit on `slot`, already counted in `units`.
-    fn spawn_unit(pool: Arc<Pool>, slot: Slot) {
+    /// Starts one unit, already counted in `units`, on `slot` or, without
+    /// one, on the next slot freed.
+    fn spawn_unit(pool: Arc<Pool>, slot: Option<Slot>) {
         pool.state.lock().unwrap().spawned += 1;
-        tokio::spawn(run_unit(pool, slot));
+        tokio::spawn(async move {
+            let slot = match slot {
+                Some(slot) => slot,
+                None => tokio::select! {
+                    slot = pool.instances.slot(pool.route.as_ref()) => slot,
+                    () = pool.closed.cancelled() => {
+                        // gives its place up: the pool is closed, nothing respawns
+                        drop(Retire {
+                            pool,
+                            replace: false,
+                            slot: None,
+                        });
+                        return;
+                    }
+                },
+            };
+            run_unit(pool, slot).await;
+        });
     }
 
-    /// Offers an idle unit and wakes a request waiting for an instance.
-    fn offer(&self, unit: mpsc::Sender<Job>) {
-        self.state.lock().unwrap().idle.push(unit);
+    /// Offers an idle unit and wakes a request waiting for an instance;
+    /// false once the pool closed: the unit ends.
+    fn offer(&self, unit: mpsc::Sender<UnitMessage>) -> bool {
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.closed {
+                return false;
+            }
+            state.idle.push(unit);
+        }
         self.offered.notify_one();
+        true
+    }
+
+    /// Closes the pool: no unit is offered or replaced from now on, and the
+    /// idle ones end.
+    fn close(&self) {
+        let idle = {
+            let mut state = self.state.lock().unwrap();
+            state.closed = true;
+            std::mem::take(&mut state.idle)
+        };
+        self.closed.cancel();
+        for unit in idle {
+            // an idle unit's channel is empty; a stale entry's unit is gone
+            let _ = unit.try_send(None);
+        }
     }
 
     /// Hands the job to an idle unit. `Err(job)` when none accepted it (no
@@ -1669,14 +1873,16 @@ impl Pool {
             let Some(tx) = self.state.lock().unwrap().idle.pop() else {
                 return Err(job);
             };
-            job = match tx.try_send(job) {
+            job = match tx.try_send(Some(job)) {
                 Ok(()) => {
                     self.state.lock().unwrap().served += 1;
                     return Ok(());
                 }
                 // A unit died since it went idle; its entry is stale.
                 Err(tokio::sync::mpsc::error::TrySendError::Full(job))
-                | Err(tokio::sync::mpsc::error::TrySendError::Closed(job)) => job,
+                | Err(tokio::sync::mpsc::error::TrySendError::Closed(job)) => {
+                    job.expect("a job was sent")
+                }
             };
         }
     }
@@ -1707,9 +1913,9 @@ impl Pool {
 }
 
 /// Runs at unit exit, however it exits, after the unit's store is gone:
-/// frees the unit's place and, unless the unit never got viable, spawns a
-/// replacement on its instance slot while the pool is below target; else the
-/// slot frees.
+/// frees the unit's place and, unless the unit never got viable or the pool
+/// closed, spawns a replacement on its instance slot while the pool is below
+/// target; else the slot frees.
 struct Retire {
     pool: Arc<Pool>,
     /// False when the unit never served (e.g. its instantiate failed): the
@@ -1724,7 +1930,7 @@ impl Drop for Retire {
         let respawn = {
             let mut state = self.pool.state.lock().unwrap();
             state.units -= 1;
-            let respawn = self.replace && state.units < self.pool.sandbox.pool;
+            let respawn = self.replace && !state.closed && state.units < self.pool.sandbox.pool;
             if respawn {
                 state.units += 1;
             }
@@ -1732,7 +1938,7 @@ impl Drop for Retire {
         };
         if respawn {
             let slot = self.slot.take().expect("a unit holds its slot");
-            Pool::spawn_unit(self.pool.clone(), slot);
+            Pool::spawn_unit(self.pool.clone(), Some(slot));
         }
     }
 }
@@ -1763,12 +1969,15 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot) {
 
     // Offered only now: a request never queues behind an instantiate that
     // may fail.
-    let (tx, mut rx) = mpsc::channel::<Job>(1);
-    pool.offer(tx.clone());
+    let (tx, mut rx) = mpsc::channel::<UnitMessage>(1);
+    if !pool.offer(tx.clone()) {
+        return;
+    }
 
     let (watch, watched) = watch::channel(None);
     let driven = store.run_concurrent(async move |accessor| {
-        while let Some(job) = rx.recv().await {
+        // None: the pool closed while this unit was idle
+        while let Some(Some(job)) = rx.recv().await {
             // The request's budget, from its arrival, covers handler,
             // request body drain and response relay alike; re-armed per
             // request on both clocks. A unit idle past a budget just
@@ -1804,7 +2013,9 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot) {
                 eprintln!("[wasm] recycling {} pool unit: {reason}", pool.loaded.label);
                 break;
             }
-            pool.offer(tx.clone());
+            if !pool.offer(tx.clone()) {
+                break;
+            }
         }
     });
 
@@ -1827,7 +2038,15 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot) {
 /// response's end, so the connection's failure (the server's ERROR, payload
 /// past the window, the stream's end) is watched beside hyper and drops it
 /// with the request in flight.
-pub async fn serve(mut io: TunnelIo, handler: Arc<Handler>) {
+///
+/// Every request is served by the handler its connection's target has at
+/// its arrival (`Binding::current`), so a reloaded component serves the next
+/// request of a connection already open. Once the target left the routes
+/// (`Binding::gone`), the connection shuts down gracefully: http/1.1 closes
+/// once the request in flight was answered, h2 sends GOAWAY and finishes its
+/// streams; its requests until then are served by the handler it was opened
+/// on.
+pub async fn serve(mut io: TunnelIo, binding: Binding) {
     let conn_id = io.conn_id();
     let ending = io.ending();
     let failed = io.failed();
@@ -1845,23 +2064,31 @@ pub async fn serve(mut io: TunnelIo, handler: Arc<Handler>) {
         io.peek_prefix(b"PRI")
     };
 
-    let streams = handler.instances.streams_per_connection();
-    let share = handler.instances.share();
+    let streams = binding.opened.instances.streams_per_connection();
+    let share = binding.opened.instances.share();
+    let gone = binding.gone.clone();
+    let binding = Arc::new(binding);
     let service = hyper::service::service_fn(move |req| {
-        let (handler, share) = (handler.clone(), share.clone());
+        let (handler, share) = (binding.handler(), share.clone());
         async move { Ok::<_, std::convert::Infallible>(respond(&handler, &share, req).await) }
     });
     let served = async {
         if h2 {
-            hyper::server::conn::http2::Builder::new(TokioExecutor)
+            let connection = hyper::server::conn::http2::Builder::new(TokioExecutor)
                 .max_concurrent_streams(streams)
-                .serve_connection(hyper_util::rt::TokioIo::new(io), service)
-                .await
+                .serve_connection(hyper_util::rt::TokioIo::new(io), service);
+            until_gone(connection, gone, |connection| {
+                connection.graceful_shutdown()
+            })
+            .await
         } else {
-            hyper::server::conn::http1::Builder::new()
+            let connection = hyper::server::conn::http1::Builder::new()
                 .half_close(true)
-                .serve_connection(hyper_util::rt::TokioIo::new(io), service)
-                .await
+                .serve_connection(hyper_util::rt::TokioIo::new(io), service);
+            until_gone(connection, gone, |connection| {
+                connection.graceful_shutdown()
+            })
+            .await
         }
     };
     tokio::select! {
@@ -1875,6 +2102,43 @@ pub async fn serve(mut io: TunnelIo, handler: Arc<Handler>) {
         () = failed => {}
     }
     ending.finish();
+}
+
+/// Drives `connection` to its end, shutting it down gracefully once `gone`
+/// is cancelled.
+async fn until_gone<C>(
+    connection: C,
+    gone: CancellationToken,
+    shutdown: impl FnOnce(Pin<&mut C>),
+) -> Result<(), hyper::Error>
+where
+    C: Future<Output = Result<(), hyper::Error>>,
+{
+    tokio::pin!(connection);
+    tokio::select! {
+        served = connection.as_mut() => return served,
+        () = gone.cancelled() => shutdown(connection.as_mut()),
+    }
+    connection.await
+}
+
+/// What a connection serves: the handler of the target it was opened on, and
+/// how to find the target's handler of the moment.
+pub struct Binding {
+    /// The target's handler when the connection was opened; serves the
+    /// connection's requests once the target is gone from the routes.
+    pub opened: Arc<Handler>,
+    /// The target's current handler, None once the target is gone.
+    pub current: Box<dyn Fn() -> Option<Arc<Handler>> + Send + Sync>,
+    /// Cancelled once the target left the routes.
+    pub gone: CancellationToken,
+}
+
+impl Binding {
+    /// The handler serving the next request.
+    fn handler(&self) -> Arc<Handler> {
+        (self.current)().unwrap_or_else(|| self.opened.clone())
+    }
 }
 
 #[derive(Clone)]
@@ -3254,7 +3518,7 @@ pub(crate) mod tests {
         let handler = pooled(&hello().await, Sandbox::default(), 1);
         restocked(&handler, 1).await;
         // a unit that takes the job and dies with it
-        let (tx, mut rx) = mpsc::channel::<Job>(1);
+        let (tx, mut rx) = mpsc::channel::<UnitMessage>(1);
         pool(&handler).state.lock().unwrap().idle.push(tx);
         tokio::spawn(async move { drop(rx.recv().await) });
 
@@ -4215,10 +4479,12 @@ pub(crate) mod tests {
         assert_slot_freed(&instances, &hello().await, "unviable unit").await;
     }
 
-    /// Pools are carved out of the limit at startup: one larger than the
-    /// slots left fails, and takes none.
+    /// A pool finding too few slots free -- a reload's, while the pool it
+    /// replaces still holds them -- takes the free ones at once and its other
+    /// units wait for the slots the retired pool frees; a handler dropped
+    /// retires its pool.
     #[tokio::test]
-    async fn a_pool_larger_than_the_slots_left_fails_at_startup() {
+    async fn a_pool_waits_for_the_slots_a_retired_pool_frees() {
         let loaded = hello().await;
         let instances = Instances::new(3);
         let sandbox = Sandbox {
@@ -4227,24 +4493,80 @@ pub(crate) mod tests {
         };
         let first = Handler::new(loaded.clone(), sandbox, &instances).unwrap();
         assert_eq!(instances.held(), 2);
-        let error = match Handler::new(loaded.clone(), sandbox, &instances) {
-            Ok(_) => panic!("a second pool=2 fit in 1 slot"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error,
-            "pool=2 needs 2 instance slots, 1 left of --max-instances 3"
-        );
-        assert_eq!(instances.held(), 2, "the failed pool took no slot");
+        let second = Handler::new(loaded.clone(), sandbox, &instances).unwrap();
+        assert_eq!(instances.held(), 3, "the free slot is taken at once");
+        assert_eq!(pool(&second).units(), 2, "the other unit waits");
+        restocked(&second, 1).await;
+
+        // dropped, the handler retires its pool
         drop(first);
+        restocked(&second, 2).await;
+        assert_eq!(instances.held(), 2, "the second pool's units alone");
+    }
+
+    /// A retired pool ends its idle units at once and a busy one after its
+    /// request, replaces none, and frees their slots; the handler serves on
+    /// the per-request path.
+    #[tokio::test]
+    async fn a_retired_pool_ends_its_units_and_its_handler_serves_cold() {
+        let instances = Instances::new(4);
+        let handler = Handler::new(
+            hello().await,
+            Sandbox {
+                pool: 2,
+                ..Sandbox::default()
+            },
+            &instances,
+        )
+        .unwrap();
+        restocked(&handler, 2).await;
+        // the unit waits for the rest of the body
+        let mut peer = open(
+            &handler,
+            "POST / HTTP/1.1\r\nhost: t\r\ncontent-length: 4\r\nconnection: close\r\n\r\nab",
+        );
+        restocked(&handler, 1).await;
+
+        handler.retire();
+        eventually("the idle unit ends", Duration::from_secs(5), || {
+            pool(&handler).units() == 1
+        })
+        .await;
+        assert_eq!(instances.held(), 1, "the busy unit keeps its slot");
+        peer.data(1, b"cd");
+        let body = String::from_utf8(response_raw(&mut peer).await).unwrap();
+        assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+        assert!(body.contains("body_bytes=4"), "{body}");
+        eventually(
+            "the busy unit ends after it",
+            Duration::from_secs(5),
+            || pool(&handler).units() == 0 && instances.held() == 0,
+        )
+        .await;
+        assert_eq!(pool(&handler).spawned(), 2, "none replaced");
+
+        let body = exchange(&handler, &get("/")).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+        assert_eq!(pool(&handler).served(), 1, "the follow-up ran cold");
+        assert_eq!(pool(&handler).units(), 0);
     }
 
     /// An h2 client on conn 1 of a peer of its own, its bytes pumped
     /// through the peer.
     async fn h2_client(handler: &Arc<Handler>) -> h2::client::SendRequest<bytes::Bytes> {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let mut peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
+        let peer = Peer::new(HashMap::from([(ROUTE.to_string(), handler.clone())]));
         peer.connect(1, ROUTE, crate::tunnel::WINDOW);
+        h2_client_on(peer).await.0
+    }
+
+    /// An h2 client on conn 1 of `peer`, and its connection task.
+    async fn h2_client_on(
+        mut peer: Peer,
+    ) -> (
+        h2::client::SendRequest<bytes::Bytes>,
+        tokio::task::JoinHandle<Result<(), h2::Error>>,
+    ) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let (io, mut pumped) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             let mut buf = vec![0u8; 16 * 1024];
@@ -4267,8 +4589,115 @@ pub(crate) mod tests {
             }
         });
         let (client, connection) = h2::client::handshake(io).await.expect("h2 handshake");
-        tokio::spawn(connection);
-        client
+        (client, tokio::spawn(connection))
+    }
+
+    /// A connection serves each request with its target's current handler,
+    /// with the one it was opened on once the target has none; once the
+    /// target is gone it shuts down gracefully: an idle http/1.1 connection
+    /// closes, an h2 one refuses new streams and ends after its request in
+    /// flight.
+    #[tokio::test]
+    async fn a_connection_follows_its_targets_handler_and_ends_once_it_is_gone() {
+        let hello = route(hello().await, Sandbox::default());
+        let fetch = route(
+            load(&Locator::File(guest_wasm("fetch")), Caps::default())
+                .await
+                .unwrap(),
+            Sandbox::default(),
+        );
+        let current = Arc::new(Mutex::new(Some(fetch)));
+        let binding = |gone: &CancellationToken| {
+            let current = current.clone();
+            Binding {
+                opened: hello.clone(),
+                current: Box::new(move || current.lock().unwrap().clone()),
+                gone: gone.clone(),
+            }
+        };
+
+        let gone = CancellationToken::new();
+        let mut peer = Peer::new(HashMap::new());
+        peer.serve(1, binding(&gone));
+        /// A keep-alive request on conn 1, its chunked response.
+        async fn response(peer: &mut Peer) -> String {
+            peer.data(1, b"GET / HTTP/1.1\r\nhost: t\r\n\r\n");
+            let mut raw = String::new();
+            while !raw.ends_with("\r\n0\r\n\r\n") {
+                let frame = tokio::time::timeout(Duration::from_secs(10), peer.recv())
+                    .await
+                    .expect("hang guard")
+                    .expect("the stream is open");
+                if let Some(Body::Data(data)) = frame.body {
+                    raw.push_str(std::str::from_utf8(&data.payload).unwrap());
+                }
+            }
+            raw
+        }
+        let fetched = response(&mut peer).await;
+        assert!(
+            fetched.starts_with("HTTP/1.1 400"),
+            "the current one: {fetched}"
+        );
+        *current.lock().unwrap() = None;
+        let opened = response(&mut peer).await;
+        assert!(
+            opened.contains("hello from wasm"),
+            "the opened one: {opened}"
+        );
+        gone.cancel();
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match peer.recv().await.and_then(|frame| frame.body) {
+                    Some(Body::Close(close)) => return close.conn_id,
+                    Some(_) => {}
+                    None => panic!("the stream ended"),
+                }
+            }
+        })
+        .await
+        .expect("the idle connection closes");
+        assert_eq!(closed, 1);
+
+        let gone = CancellationToken::new();
+        let peer = Peer::new(HashMap::new());
+        peer.serve(1, binding(&gone));
+        let (client, connection) = h2_client_on(peer).await;
+        let mut client = client.ready().await.unwrap();
+        let (in_flight, mut body) = client
+            .send_request(
+                http::Request::post("http://t/")
+                    .header("content-length", "4")
+                    .body(())
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        body.send_data(bytes::Bytes::from_static(b"ab"), false)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        gone.cancel();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let refused = match client.ready().await {
+            Ok(mut client) => match client.send_request(h2_get("/"), true) {
+                Ok((response, _)) => response.await.is_err(),
+                Err(_) => true,
+            },
+            Err(_) => true,
+        };
+        assert!(refused, "no new stream after the GOAWAY");
+        body.send_data(bytes::Bytes::from_static(b"cd"), true)
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(10), in_flight)
+            .await
+            .expect("hang guard")
+            .expect("the request in flight is answered");
+        assert_eq!(response.status(), 200, "by the opened one: no current");
+        tokio::time::timeout(Duration::from_secs(10), connection)
+            .await
+            .expect("the connection ends")
+            .unwrap()
+            .expect("cleanly");
     }
 
     fn h2_get(path: &str) -> http::Request<()> {

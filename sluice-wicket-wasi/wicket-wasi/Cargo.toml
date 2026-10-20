@@ -31,6 +31,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # wasmtime's ResourceLimiterAsync is #[async_trait]; the impl must match
 async-trait = "0.1"
+# the --config file: YAML with ${NAME} interpolation from the environment
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = { version = "2", default-features = false, features = ["deserialize", "properties"] }
+# component digests: a reload keeps the handler of an unchanged component
+sha2 = "0.10"
 
 [dev-dependencies]
 # paused time for the stall watchdog tests

@@ -112,7 +112,9 @@ message Error {
 }
 
 message Advertise {
-  // Upstream services exposed by the client.
+  // Upstream services exposed by the client. Every advertise on a stream
+  // replaces the client's routes on the node (sluice-wicket-wasi re-advertises
+  // on a route reload); one without upstreams removes them.
   repeated Upstream upstreams = 1;
   // Client's initial receive window per connection, in bytes; it may grant
   // more (WindowUpdate) and reclaim what was left unused. 0 (a client without

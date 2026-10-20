@@ -202,6 +202,10 @@ class RouterTest {
 		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.9:3000")));
 		assertThat(router.lookup("demo.local").orElseThrow().address()).isEqualTo("127.0.0.9:3000");
 		assertThat(router.clientCount()).isEqualTo(1);
+		// a client re-advertising no routes (a wicket reloaded to none) keeps none
+		assertThat(router.register("c1", List.of())).isZero();
+		assertThat(router.lookup("demo.local")).isEmpty();
+		assertThat(router.clientCount()).isZero();
 	}
 
 	@Test

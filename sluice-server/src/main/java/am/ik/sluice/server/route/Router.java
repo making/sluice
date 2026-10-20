@@ -355,7 +355,8 @@ public class Router {
 
 	/**
 	 * (Re-)registers the upstreams announced by a client. Any previous entry for the
-	 * client is replaced, so re-announcement after reconnect is idempotent.
+	 * client is replaced, so re-announcement after reconnect is idempotent, and an
+	 * announcement without a target removes the client's routes.
 	 * @return the number of registered targets, {@code 0} when nothing was registered
 	 */
 	public int register(String clientId, List<Upstream> upstreams) {
@@ -379,11 +380,14 @@ public class Router {
 				.hostPattern(hostPattern)
 				.build());
 		}
-		if (clientId == null || clientId.isBlank() || targets.isEmpty()) {
+		if (clientId == null || clientId.isBlank()) {
 			return 0;
 		}
 		synchronized (this.lock) {
 			removeLocked(clientId);
+			if (targets.isEmpty()) {
+				return 0;
+			}
 			for (Target target : targets) {
 				if (target.listenPort() > 0) {
 					this.byPort.compute(target.listenPort(), (k, existing) -> append(existing, target));

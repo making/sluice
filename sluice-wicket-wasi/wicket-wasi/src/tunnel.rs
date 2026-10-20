@@ -41,7 +41,10 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::pb::frame::Body;
 use crate::pb::{Close, Connect, Data, Error, Frame, WindowUpdate};
-use crate::wasm_host::{self, Handler};
+use crate::routes::Routes;
+use crate::wasm_host;
+#[cfg(test)]
+use crate::wasm_host::Handler;
 
 /// Receive window of every connection, announced in `Advertise`;
 /// the Java side's `VirtualConnection.DEFAULT_WINDOW`.
@@ -761,7 +764,7 @@ pub struct Connections {
     key: String,
     outbound: Outbound,
     /// Dial address (the advertised target) -> its handler.
-    routes: Arc<HashMap<String, Arc<Handler>>>,
+    routes: Arc<Routes>,
     registry: Registry,
     limit: Arc<Limit>,
     /// The slots this stream's connections hold: an accepted connection's
@@ -773,12 +776,7 @@ pub struct Connections {
 }
 
 impl Connections {
-    pub fn new(
-        key: String,
-        outbound: Outbound,
-        routes: Arc<HashMap<String, Arc<Handler>>>,
-        limit: Arc<Limit>,
-    ) -> Self {
+    pub fn new(key: String, outbound: Outbound, routes: Arc<Routes>, limit: Arc<Limit>) -> Self {
         Connections {
             key,
             outbound,
@@ -856,7 +854,7 @@ impl Connections {
                 .control(error_frame(connect.conn_id, SERVER_WINDOW_REQUIRED));
             return;
         }
-        let Some(handler) = self.routes.get(&connect.address) else {
+        let Some(binding) = self.routes.bind(&connect.address) else {
             self.outbound.control(error_frame(
                 connect.conn_id,
                 &format!("no wasm route for '{}'", connect.address),
@@ -871,7 +869,7 @@ impl Connections {
         };
         let mut io = self.register(connect.conn_id, connect.connection_window);
         io.permit = Some(permit.counted(&self.held));
-        tokio::spawn(wasm_host::serve(io, handler.clone()));
+        tokio::spawn(wasm_host::serve(io, binding));
     }
 
     fn data(&self, data: Data) {
@@ -1254,7 +1252,12 @@ pub(crate) mod testing {
         pub(crate) fn limited(routes: HashMap<String, Arc<Handler>>, limit: Arc<Limit>) -> Peer {
             let (outbound, frames) = Outbound::new();
             Peer {
-                connections: Connections::new("test".into(), outbound, Arc::new(routes), limit),
+                connections: Connections::new(
+                    "test".into(),
+                    outbound,
+                    Routes::fixed(routes),
+                    limit,
+                ),
                 frames: Box::pin(frames),
                 auto_grant: true,
             }
@@ -1286,6 +1289,13 @@ pub(crate) mod testing {
                 conn_id,
                 message: message.into(),
             }));
+        }
+
+        /// Opens `conn_id` on `binding` directly, as a CONNECT resolved to
+        /// it would.
+        pub(crate) fn serve(&self, conn_id: i64, binding: wasm_host::Binding) {
+            let io = self.connections.register(conn_id, WINDOW);
+            tokio::spawn(wasm_host::serve(io, binding));
         }
 
         /// The DATA frames queued for `conn_id`.
@@ -1795,7 +1805,7 @@ mod tests {
         let connections = Connections::new(
             "test".into(),
             outbound,
-            Arc::default(),
+            Routes::fixed(HashMap::new()),
             Limit::new(usize::MAX),
         );
         connections.dispatch(Body::Connect(Connect {
@@ -2217,7 +2227,7 @@ mod tests {
         let connections = Connections::new(
             "test".into(),
             outbound.clone(),
-            Arc::default(),
+            Routes::fixed(HashMap::new()),
             Limit::new(usize::MAX),
         );
         let mut io = connections.register(1, WINDOW);
@@ -2249,7 +2259,7 @@ mod tests {
         let connections = Connections::new(
             "test".into(),
             outbound.clone(),
-            Arc::default(),
+            Routes::fixed(HashMap::new()),
             Limit::new(usize::MAX),
         );
         let mut frames = Box::pin(frames);
