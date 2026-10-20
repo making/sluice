@@ -40,10 +40,10 @@ import am.ik.sluice.server.auth.Verdict;
  * a stream of a route reached over HTTP/1.1 only, a GOAWAY {@code COMPRESSION_ERROR} for
  * an HTTP/2 head whose header block does not decode, a GOAWAY processing no stream for an
  * HTTP/2 connection whose relay does not fit, and the 503 busy page with
- * {@code Retry-After} for a request past the connection limit. A request that targets a
- * JSON API ({@link ConnectionHeadParser.Head.Request#json}) gets a problem details
- * document (RFC 9457, {@code application/problem+json}) in place of the page; the headers
- * stay headers.
+ * {@code Retry-After} for a request past the connection limit. The default error is a
+ * problem details document (RFC 9457, {@code application/problem+json})
+ * ({@link ConnectionHeadParser.Head.Request#json}); only a request whose {@code Accept}
+ * names {@code text/html} gets the page in place of it; the headers stay headers.
  */
 @Component
 public class ErrorResponse {

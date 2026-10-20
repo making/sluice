@@ -124,7 +124,7 @@ class AccessControlDenyE2ETest {
 	@Test
 	void denyListWinsOverTheRouteAllowedCidrs() throws Exception {
 		this.startClient();
-		String response = raw("GET / HTTP/1.1\r\nHost: denied.local\r\nConnection: close\r\n\r\n");
+		String response = raw("GET / HTTP/1.1\r\nHost: denied.local\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
 		assertThat(response.lines().findFirst()).hasValue("HTTP/1.1 403 Forbidden");
 		assertThat(response).endsWith("</html>\n");
 	}

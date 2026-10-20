@@ -95,15 +95,17 @@ public final class ConnectionHeadParser {
 		/**
 		 * The request of the head: the HTTP/1.1 request-line parts, or the method/path of
 		 * the first HEADERS block for HTTP/2 ({@code version} is {@code 2}; a CONNECT's
-		 * path is its {@code :authority}). {@code json} tells that the request targets a
-		 * JSON API, see {@link ConnectionHeadParser#prefersJson}: its error answers are
-		 * problem details instead of pages. {@code userAgent} is the first
-		 * {@code User-Agent} value for the access log; {@code null} when absent or blank.
+		 * path is its {@code :authority}). {@code json} tells that the request takes the
+		 * JSON default error answer (problem details), the case unless its {@code Accept}
+		 * names {@code text/html}, see {@link ConnectionHeadParser#htmlAccepted}.
+		 * {@code userAgent} is the first {@code User-Agent} value for the access log;
+		 * {@code null} when absent or blank.
 		 */
 		public record Request(String method, String path, String version, boolean json, @Nullable String userAgent) {
 
+			/** The request taking the default (JSON) error answer. */
 			public Request(String method, String path, String version) {
-				this(method, path, version, false);
+				this(method, path, version, true);
 			}
 
 			public Request(String method, String path, String version, boolean json) {
@@ -227,8 +229,7 @@ public final class ConnectionHeadParser {
 			return null;
 		}
 		return new Head.Request(parts[0], parts[1], parts[2].substring("HTTP/".length()),
-				prefersJson(http1HeaderValues(head, "content-type"), http1HeaderValues(head, "accept")),
-				http1HeaderOf(head, USER_AGENT));
+				!htmlAccepted(http1HeaderValues(head, "accept")), http1HeaderOf(head, USER_AGENT));
 	}
 
 	/**
@@ -441,8 +442,8 @@ public final class ConnectionHeadParser {
 		if (path == null || path.isEmpty()) {
 			return null;
 		}
-		return new Head.Request(method.toString(), path.toString(), "2",
-				prefersJson(values(headers, "content-type"), values(headers, "accept")), http2UserAgentOf(headers));
+		return new Head.Request(method.toString(), path.toString(), "2", !htmlAccepted(values(headers, "accept")),
+				http2UserAgentOf(headers));
 	}
 
 	/**
@@ -459,25 +460,14 @@ public final class ConnectionHeadParser {
 	}
 
 	/**
-	 * Whether a request targets a JSON API: its {@code Content-Type} is JSON
-	 * ({@code application/json} or a {@code +json} type), or its {@code Accept} lists a
-	 * JSON type and no {@code text/html} (a browser's navigation, which lists both, gets
-	 * the page).
+	 * Whether the request's {@code Accept} names {@code text/html}: only then the error
+	 * answers are pages. Every other head -- no {@code Accept} at all included -- takes
+	 * the JSON default, problem details.
 	 */
-	static boolean prefersJson(List<String> contentTypes, List<String> accepts) {
-		if (contentTypes.stream().anyMatch(ConnectionHeadParser::isJsonType)) {
-			return true;
-		}
-		List<String> types = accepts.stream()
+	static boolean htmlAccepted(List<String> accepts) {
+		return accepts.stream()
 			.flatMap(accept -> Arrays.stream(accept.split(",")))
-			.map(type -> type.split(";")[0].trim().toLowerCase(Locale.ROOT))
-			.toList();
-		return !types.contains("text/html") && types.stream().anyMatch(ConnectionHeadParser::isJsonType);
-	}
-
-	private static boolean isJsonType(String mediaType) {
-		String type = mediaType.split(";")[0].trim().toLowerCase(Locale.ROOT);
-		return type.equals("application/json") || type.startsWith("application/") && type.endsWith("+json");
+			.anyMatch(type -> type.split(";")[0].trim().toLowerCase(Locale.ROOT).equals("text/html"));
 	}
 
 	private static @Nullable String headerOf(@Nullable CharSequence first, @Nullable CharSequence second) {

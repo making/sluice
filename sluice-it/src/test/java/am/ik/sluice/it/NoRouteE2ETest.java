@@ -104,7 +104,8 @@ class NoRouteE2ETest {
 
 	@Test
 	void requestValuesAreEscaped() throws Exception {
-		String response = exchange("GET /<b>path</b> HTTP/1.1\r\nHost: <i>host</i>\r\nConnection: close\r\n\r\n");
+		String response = exchange(
+				"GET /<b>path</b> HTTP/1.1\r\nHost: <i>host</i>\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
 		try (Page page = Objects.requireNonNull(this.browser).newPage()) {
 			page.setContent(response.substring(response.indexOf("\r\n\r\n") + 4));
 
@@ -116,7 +117,7 @@ class NoRouteE2ETest {
 
 	@Test
 	void requestWithoutHostSaysSo() throws Exception {
-		String response = exchange("GET / HTTP/1.0\r\n\r\n");
+		String response = exchange("GET / HTTP/1.0\r\nAccept: text/html\r\n\r\n");
 		try (Page page = Objects.requireNonNull(this.browser).newPage()) {
 			page.setContent(response.substring(response.indexOf("\r\n\r\n") + 4));
 
@@ -128,7 +129,8 @@ class NoRouteE2ETest {
 
 	@Test
 	void headRequestCarriesTheHeadOnly() throws Exception {
-		String response = exchange("HEAD / HTTP/1.1\r\nHost: nothing.local\r\nConnection: close\r\n\r\n");
+		String response = exchange(
+				"HEAD / HTTP/1.1\r\nHost: nothing.local\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
 
 		assertThat(response.replaceFirst("Content-Length: \\d+", "Content-Length: N"))
 			.isEqualToNormalizingWhitespace("""
@@ -146,7 +148,8 @@ class NoRouteE2ETest {
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.setSoTimeout(10_000);
 			OutputStream out = socket.getOutputStream();
-			out.write(("POST /upload HTTP/1.1\r\nHost: nothing.local\r\nContent-Length: " + body.length + "\r\n\r\n")
+			out.write(("POST /upload HTTP/1.1\r\nHost: nothing.local\r\nAccept: text/html\r\nContent-Length: "
+					+ body.length + "\r\n\r\n")
 				.getBytes(StandardCharsets.US_ASCII));
 			out.flush();
 			Future<?> upload = WRITER.submit(() -> {
@@ -167,7 +170,7 @@ class NoRouteE2ETest {
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.setSoTimeout(10_000);
 			TestH2.writeClientHead(socket.getOutputStream(), 1, ":method=GET", ":scheme=http", ":path=/",
-					":authority=nothing.local");
+					":authority=nothing.local", "accept=text/html");
 			InputStream in = socket.getInputStream();
 			List<TestH2.Frame> frames = TestH2.readResponseFrames(in);
 			TestH2.Frame goaway = Objects.requireNonNull(TestH2.readFrame(in));
@@ -192,14 +195,14 @@ class NoRouteE2ETest {
 	void jsonRequestGetsAProblemDetailsDocumentInBothProtocols() throws Exception {
 		String json = "{\"type\":\"about:blank\",\"title\":\"Service Unavailable\",\"status\":503,"
 				+ "\"detail\":\"No tunnel is connected for this host.\"}";
-		String response = exchange(
-				"GET / HTTP/1.1\r\nHost: nothing.local\r\nAccept: application/json\r\nConnection: close\r\n\r\n");
+		// no Accept header: the default error is problem details, not the page
+		String response = exchange("GET / HTTP/1.1\r\nHost: nothing.local\r\nConnection: close\r\n\r\n");
 		assertThat(response).contains("Content-Type: application/problem+json\r\n").endsWith("\r\n\r\n" + json);
 
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.setSoTimeout(10_000);
 			TestH2.writeClientHead(socket.getOutputStream(), 1, ":method=POST", ":scheme=http", ":path=/",
-					":authority=nothing.local", "content-type=application/json");
+					":authority=nothing.local", "accept=application/json");
 			List<TestH2.Frame> frames = TestH2.readResponseFrames(socket.getInputStream());
 			Http2Headers headers = new DefaultHttp2HeadersDecoder(true).decodeHeaders(1,
 					Unpooled.wrappedBuffer(frames.getFirst().payload()));

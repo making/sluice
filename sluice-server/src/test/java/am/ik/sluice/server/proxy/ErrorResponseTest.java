@@ -34,7 +34,7 @@ class ErrorResponseTest {
 
 	@Test
 	void theBusyAnswerIsA503WithRetryAfterInWholeSeconds() {
-		ConnectionHeadParser.Head head = head("GET / HTTP/1.1\r\nHost: a.local\r\n\r\n");
+		ConnectionHeadParser.Head head = head("GET / HTTP/1.1\r\nHost: a.local\r\nAccept: text/html\r\n\r\n");
 		assertThat(new String(this.errorResponse.busy(head, Duration.ofMillis(7900)), StandardCharsets.US_ASCII))
 			.isEqualTo("HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html; charset=utf-8\r\n"
 					+ "Content-Length: 0\r\nCache-Control: no-store\r\nRetry-After: 7\r\nConnection: close\r\n\r\n");
@@ -42,7 +42,7 @@ class ErrorResponseTest {
 
 	@Test
 	void anUnauthorizedRequestGetsA401WithEveryChallengeAndABusyCheckA503() {
-		ConnectionHeadParser.Head head = head("GET / HTTP/1.1\r\nHost: a.local\r\n\r\n");
+		ConnectionHeadParser.Head head = head("GET / HTTP/1.1\r\nHost: a.local\r\nAccept: text/html\r\n\r\n");
 		List<String> challenges = List.of("Basic realm=\"a\", charset=\"UTF-8\"", "Bearer realm=\"a\"");
 		assertThat(new String(this.errorResponse.refusal(head, new Verdict.Unauthorized("missing", challenges)),
 				StandardCharsets.US_ASCII))
@@ -63,8 +63,9 @@ class ErrorResponseTest {
 	}
 
 	@Test
-	void aJsonRequestGetsAProblemDetailsDocumentWithTheHeadersOfThePage() {
-		ConnectionHeadParser.Head head = head("GET / HTTP/1.1\r\nHost: a.local\r\nAccept: application/json\r\n\r\n");
+	void theDefaultErrorIsAProblemDetailsDocumentWithTheHeadersOfThePage() {
+		// no Accept header: the default error is problem details, not the page
+		ConnectionHeadParser.Head head = head("GET / HTTP/1.1\r\nHost: a.local\r\n\r\n");
 		String json = "{\"type\":\"about:blank\",\"title\":\"Unauthorized\",\"status\":401,"
 				+ "\"detail\":\"Credentials are required.\"}";
 		assertThat(new String(this.errorResponse.unauthorized(head, List.of("Bearer realm=\"a\"")),

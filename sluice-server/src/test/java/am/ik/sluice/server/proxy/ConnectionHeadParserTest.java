@@ -95,24 +95,28 @@ class ConnectionHeadParserTest {
 	}
 
 	@Test
-	void aRequestTargetsAJsonApiByItsContentTypeOrAnAcceptWithoutHtml() {
-		String[][] h1 = { { "Content-Type: application/json", "true" },
-				{ "Content-Type: application/merge+json", "true" }, { "Accept: application/problem+json", "true" },
-				{ "Accept: text/plain, application/json;q=0.9", "true" },
-				{ "Accept: text/html,application/json", "false" }, { "Accept: */*", "false" },
-				{ "Content-Type: text/plain", "false" } };
+	void anErrorIsProblemDetailsUnlessTheAcceptNamesTextHtml() {
+		String[][] h1 = { { "Accept: text/html", "false" }, { "Accept: text/html,application/json", "false" },
+				{ "Accept: text/html;q=0.9,*/*;q=0.8", "false" }, { "Accept: application/json", "true" },
+				{ "Accept: text/plain, application/json;q=0.9", "true" }, { "Accept: */*", "true" },
+				{ "Content-Type: application/json", "true" }, { "Content-Type: text/html", "true" }, {}, };
 		for (String[] header : h1) {
 			ConnectionHeadParser.Head parsed = PARSER
-				.parse(new ByteArrayInputStream(("GET / HTTP/1.1\r\nHost: a.local\r\n" + header[0] + "\r\n\r\n")
+				.parse(new ByteArrayInputStream(("GET / HTTP/1.1\r\nHost: a.local\r\n" + String.join("\r\n", header)
+						+ (header.length > 0 ? "\r\n" : "") + "\r\n")
 					.getBytes(java.nio.charset.StandardCharsets.US_ASCII)))
 				.orElseThrow();
-			assertThat(json(parsed)).as(header[0]).isEqualTo(Boolean.parseBoolean(header[1]));
+			String name = header.length > 0 ? header[0] : "no headers";
+			assertThat(json(parsed)).as(name).isEqualTo(header.length == 0 || Boolean.parseBoolean(header[1]));
 		}
+		assertThat(json(parseH2(literal(":method", "GET"), literal(":path", "/"), literal(":authority", "a.local"),
+				literal("accept", "text/html"))))
+			.isFalse();
 		assertThat(json(parseH2(literal(":method", "GET"), literal(":path", "/"), literal(":authority", "a.local"),
 				literal("accept", "application/json"))))
 			.isTrue();
 		assertThat(json(parseH2(literal(":method", "GET"), literal(":path", "/"), literal(":authority", "a.local"))))
-			.isFalse();
+			.isTrue();
 	}
 
 	@Test

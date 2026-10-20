@@ -242,7 +242,7 @@ class AccessControlE2ETest {
 	void routeAllowedCidrsReplaceTheGlobalAllowList() throws Exception {
 		this.startClient();
 		// the loopback is in the global allow list, but the route admits 10/8 only
-		String response = raw("GET / HTTP/1.1\r\nHost: locked.local\r\nConnection: close\r\n\r\n");
+		String response = raw("GET / HTTP/1.1\r\nHost: locked.local\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
 		assertThat(response.lines().findFirst()).hasValue("HTTP/1.1 403 Forbidden");
 		assertThat(response).startsWith("HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\n");
 		assertThat(response).endsWith("</html>\n");
@@ -254,7 +254,7 @@ class AccessControlE2ETest {
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.setSoTimeout(10_000);
 			TestH2.writeClientHead(socket.getOutputStream(), 1, ":method=GET", ":scheme=http", ":path=/",
-					":authority=locked.local");
+					":authority=locked.local", "accept=text/html");
 			InputStream in = socket.getInputStream();
 			List<TestH2.Frame> frames = TestH2.readResponseFrames(in);
 			TestH2.Frame goaway = java.util.Objects.requireNonNull(TestH2.readFrame(in));
@@ -326,7 +326,7 @@ class AccessControlE2ETest {
 		this.startClient();
 		ACCESS_EVENTS.list.clear();
 
-		String refused = raw("GET /first HTTP/1.1\r\nHost: " + scheme.host() + "\r\n\r\n");
+		String refused = raw("GET /first HTTP/1.1\r\nHost: " + scheme.host() + "\r\nAccept: text/html\r\n\r\n");
 		assertThat(refused).as("the first request").startsWith("HTTP/1.1 401 Unauthorized\r\n");
 		assertThat(refused).contains("\r\nWWW-Authenticate: " + scheme.challenge() + "\r\n").endsWith("</html>\n");
 

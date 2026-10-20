@@ -208,7 +208,9 @@ class ConnectionLimitOverflowE2ETest {
 			try (SSLSocket socket = tlsSocket("h2", "http/1.1")) {
 				socket.startHandshake();
 				assertThat(socket.getApplicationProtocol()).isEqualTo("http/1.1");
-				socket.getOutputStream().write(TestSockets.get("held.local"));
+				socket.getOutputStream()
+					.write("GET / HTTP/1.1\r\nHost: held.local\r\nAccept: text/html\r\n\r\n"
+						.getBytes(StandardCharsets.US_ASCII));
 				socket.getOutputStream().flush();
 				Response response = readHttp1Response(socket);
 				assertThat(response.head()).isEqualToNormalizingWhitespace("""
@@ -254,7 +256,8 @@ class ConnectionLimitOverflowE2ETest {
 			try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 				socket.setSoTimeout((int) WITHIN.toMillis());
 				OutputStream out = socket.getOutputStream();
-				out.write(("POST / HTTP/1.1\r\nHost: held.local\r\nContent-Length: " + body.length + "\r\n\r\n")
+				out.write(("POST / HTTP/1.1\r\nHost: held.local\r\nAccept: text/html\r\nContent-Length: " + body.length
+						+ "\r\n\r\n")
 					.getBytes(StandardCharsets.US_ASCII));
 				out.flush();
 				// the body is not read for the answer: closed with it unread, the
@@ -283,7 +286,7 @@ class ConnectionLimitOverflowE2ETest {
 			try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 				socket.setSoTimeout((int) WITHIN.toMillis());
 				TestH2.writeClientHead(socket.getOutputStream(), 3, ":method=GET", ":scheme=http",
-						":authority=held.local", ":path=/");
+						":authority=held.local", ":path=/", "accept=text/html");
 				List<TestH2.Frame> frames = readFramesUntilGoaway(socket);
 				assertThat(TestH2.status(frames)).isEqualTo("503");
 				assertThat(frames.getFirst().streamId()).isEqualTo(3);
@@ -378,7 +381,8 @@ class ConnectionLimitOverflowE2ETest {
 				socket.startHandshake();
 				assertThat(socket.getApplicationProtocol()).isEqualTo("h2");
 				OutputStream out = socket.getOutputStream();
-				TestH2.writeClientHead(out, 1, ":method=GET", ":scheme=https", ":authority=held.local", ":path=/");
+				TestH2.writeClientHead(out, 1, ":method=GET", ":scheme=https", ":authority=held.local", ":path=/",
+						"accept=text/html");
 				List<TestH2.Frame> frames = readFramesUntilGoaway(socket);
 				TestH2.Frame headers = frames.stream()
 					.filter(frame -> frame.type() == TestH2.HEADERS)

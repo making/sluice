@@ -520,6 +520,7 @@ class TlsDataPlaneE2ETest {
 		this.startClient();
 		tlsRestClient(HttpClient.Version.HTTP_2).get()
 			.uri("https://localhost:" + dataPort + "/")
+			.header("Accept", "text/html")
 			.exchange()
 			.expectStatus()
 			.isEqualTo(HttpStatus.SERVICE_UNAVAILABLE)
