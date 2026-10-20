@@ -528,8 +528,7 @@ final class ReroutingRelay {
 		if (!inBody) {
 			ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser
 				.http1RequestOf(parser.malformedHead());
-			this.access.request("-", request == null ? "-" : request.method(), request == null ? "-" : request.path(),
-					request == null ? "-" : request.version());
+			this.access.request("-", request);
 		}
 		// the requests before the malformed one: every one relayed, but its own head
 		rejectAtBoundary(this.errorResponse.badRequest(), inBody);
@@ -695,7 +694,7 @@ final class ReroutingRelay {
 				: stripped;
 		leg.toUpstream(relayed, 0, relayed.length);
 		if (request != null) {
-			this.access.request(route.routeTag(), request.method(), request.path(), request.version());
+			this.access.request(route.routeTag(), request);
 		}
 	}
 
@@ -741,8 +740,7 @@ final class ReroutingRelay {
 
 	private @Nullable Resolved refuse(byte[] head, @Nullable String host, byte[] response) {
 		ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser.http1RequestOf(head);
-		this.access.request("-", request == null ? "-" : request.method(), request == null ? "-" : request.path(),
-				request == null ? "-" : request.version());
+		this.access.request("-", request);
 		this.refusal = response;
 		return null;
 	}

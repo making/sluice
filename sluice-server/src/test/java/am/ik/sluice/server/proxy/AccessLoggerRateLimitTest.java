@@ -118,16 +118,16 @@ class AccessLoggerRateLimitTest {
 				Socket socket = new Socket("127.0.0.1", serverSocket.getLocalPort());
 				Socket accepted = serverSocket.accept()) {
 			AccessLogger.Connection connection = accessLogger.accepted("test", socket);
-			ConnectionHeadParser.Head.Request request = new ConnectionHeadParser.Head.Request("GET", "/x", "1.1");
+			ConnectionHeadParser.Head.Request request = new ConnectionHeadParser.Head.Request("GET", "/x", "1.1", false,
+					"agent/1 \"q\" \\ \n\u007f\u009b");
 			connection.refused("a.local", request, new Verdict.Unauthorized("missing", List.of()));
 			connection.refused("a.local", request, new Verdict.Busy(Duration.ofSeconds(1)));
 			connection.refused("a.local", request, new Verdict.Unauthorized("invalid", List.of()));
 			assertThat(this.messages()).as("the third past the request lines' rate")
-				.containsExactly(
+				.containsExactly("type=req id=1 route=a.local method=GET path=/x http=1.1 remote=" + remoteOf(socket)
+						+ " status=401 reason=auth-missing userAgent=\"agent/1 \\\"q\\\" \\\\ \\u000a\\u007f\\u009b\"",
 						"type=req id=1 route=a.local method=GET path=/x http=1.1 remote=" + remoteOf(socket)
-								+ " status=401 reason=auth-missing",
-						"type=req id=1 route=a.local method=GET path=/x http=1.1 remote=" + remoteOf(socket)
-								+ " status=503 reason=auth-busy");
+								+ " status=503 reason=auth-busy userAgent=\"agent/1 \\\"q\\\" \\\\ \\u000a\\u007f\\u009b\"");
 		}
 	}
 

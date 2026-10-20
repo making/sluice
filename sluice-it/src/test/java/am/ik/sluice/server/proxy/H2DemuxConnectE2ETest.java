@@ -312,10 +312,11 @@ class H2DemuxConnectE2ETest {
 			client.headers(1, false, TestH2.headerBlock(":method=CONNECT", "host=" + TUNNEL_HOST, "x-case=1005"));
 			assertThat(client.awaitTrue(() -> client.reset(1) != null, TIMEOUT)).as("stream 1 reset").isTrue();
 			assertThat(client.reset(1)).isEqualTo(PROTOCOL_ERROR);
-			client.headers(3, true, get(OTHER_HOST, "/after-malformed-connect"));
+			client.headers(3, true, TestH2.headerBlock(":authority=" + OTHER_HOST, ":method=GET", ":scheme=http",
+					":path=/after-malformed-connect", "user-agent=h2-agent/1 (test)"));
 			assertThat(client.awaitEnd(3, TIMEOUT)).isTrue();
 			assertThat(TestH2.bodyOf(client.frames(3))).isEqualTo("other");
-			client.headers(5, false, TestH2.headerBlock(":method=CONNECT", "x-case=1005"));
+			client.headers(5, false, TestH2.headerBlock(":method=CONNECT", "x-case=1005", "user-agent=probe/1"));
 			assertThat(client.awaitTrue(() -> client.reset(5) != null, TIMEOUT)).as("stream 5 reset").isTrue();
 			assertThat(client.reset(5)).isEqualTo(PROTOCOL_ERROR);
 			assertThat(client.goAwayCode()).as("no GOAWAY").isEqualTo(-1);
@@ -323,11 +324,13 @@ class H2DemuxConnectE2ETest {
 		assertThat(TUNNEL_HEADS).as("relayed to no upstream")
 			.noneMatch(head -> "1005".contentEquals(Objects.requireNonNullElse(head.get("x-case"), "")));
 		String later = awaitRequestLine("route=" + OTHER_HOST + " method=GET path=/after-malformed-connect http=2 ");
+		assertThat(later).endsWith(" userAgent=\"h2-agent/1 (test)\"");
 		assertThat(awaitCloseLine(idOf(later))).contains(" transport=h2 ");
 		assertThat(accessLines()).as("each reset stream logged")
 			.filteredOn(line -> line.startsWith("type=req id=" + idOf(later) + " "))
 			.filteredOn(line -> line.contains(" route=- method=CONNECT path=- http=2 "))
-			.hasSize(2);
+			.map(line -> line.substring(line.indexOf(" userAgent=") + 1))
+			.containsExactlyInAnyOrder("userAgent=-", "userAgent=\"probe/1\"");
 	}
 
 	/**
@@ -413,7 +416,7 @@ class H2DemuxConnectE2ETest {
 	 * line an h2 transport.
 	 */
 	private static void assertCompressionErrorLogged(int port) {
-		String suffix = " route=- method=- path=- http=2 remote=127.0.0.1:" + port;
+		String suffix = " route=- method=- path=- http=2 remote=127.0.0.1:" + port + " userAgent=-";
 		Awaitility.await("the request line")
 			.atMost(Duration.ofSeconds(5))
 			.until(() -> accessLines().stream()

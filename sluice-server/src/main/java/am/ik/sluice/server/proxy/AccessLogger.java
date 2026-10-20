@@ -230,20 +230,34 @@ public class AccessLogger {
 		 * Logs the head request of the connection; later requests on a keep-alive
 		 * connection are logged by the rerouting relay with their own route.
 		 */
-		public void request(String method, String path, String version) {
-			this.request(this.route, method, path, version);
+		void request(ConnectionHeadParser.Head.Request request) {
+			this.request(this.route, request);
 		}
 
 		/**
 		 * Logs a request head with the route it resolved to, which differs from the
-		 * connection's when the request is rerouted.
+		 * connection's when the request is rerouted; a {@code null} request (a head that
+		 * is no well-formed request) is logged with {@code -} for each of its parts.
 		 */
-		public void request(String routeTag, String method, String path, String version) {
+		void request(String routeTag, ConnectionHeadParser.Head.@Nullable Request request) {
+			if (request == null) {
+				this.request(routeTag, "-", "-", "-", null);
+			}
+			else {
+				this.request(routeTag, request.method(), request.path(), request.version(), request.userAgent());
+			}
+		}
+
+		/**
+		 * Logs a request head from its parts, for a head that is no well-formed request
+		 * yet has some of them (an h2 head without {@code :path}, say).
+		 */
+		void request(String routeTag, String method, String path, String version, @Nullable String userAgent) {
 			if (!this.requestEnabled || this.noop || this.closed || this.owner == null || !this.owner.allowRequest()) {
 				return;
 			}
-			log.info("type=req id={} route={} method={} path={} http={} remote={}", this.id, routeTag, method, path,
-					version, this.remote);
+			log.info("type=req id={} route={} method={} path={} http={} remote={} userAgent={}", this.id, routeTag,
+					method, path, version, this.remote, quoted(userAgent));
 		}
 
 		/**
@@ -277,9 +291,35 @@ public class AccessLogger {
 			if (!this.requestEnabled || this.noop || this.closed || this.owner == null || !this.owner.allowRequest()) {
 				return;
 			}
-			log.info("type=req id={} route={} method={} path={} http={} remote={} status={} reason={}", this.id,
-					routeTag, request == null ? "-" : request.method(), request == null ? "-" : request.path(),
-					request == null ? "-" : request.version(), this.remote, status, reason);
+			log.info("type=req id={} route={} method={} path={} http={} remote={} status={} reason={} userAgent={}",
+					this.id, routeTag, request == null ? "-" : request.method(), request == null ? "-" : request.path(),
+					request == null ? "-" : request.version(), this.remote, status, reason,
+					quoted(request == null ? null : request.userAgent()));
+		}
+
+		/**
+		 * A free-text value as a logfmt value: {@code -} when absent, else in double
+		 * quotes with quotes and backslashes backslash-escaped and control characters as
+		 * Java unicode escapes, so it stays one field on one line.
+		 */
+		static String quoted(@Nullable String value) {
+			if (value == null) {
+				return "-";
+			}
+			StringBuilder quoted = new StringBuilder(value.length() + 2).append('"');
+			for (int i = 0; i < value.length(); i++) {
+				char c = value.charAt(i);
+				if (c == '"' || c == '\\') {
+					quoted.append('\\').append(c);
+				}
+				else if (Character.isISOControl(c)) {
+					quoted.append(String.format("\\u%04x", (int) c));
+				}
+				else {
+					quoted.append(c);
+				}
+			}
+			return quoted.append('"').toString();
 		}
 
 		/** Logs the connection acceptance, before route and transport are known. */

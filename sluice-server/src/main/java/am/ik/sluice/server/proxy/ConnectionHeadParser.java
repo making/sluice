@@ -38,6 +38,8 @@ public final class ConnectionHeadParser {
 
 	private static final AsciiString CONNECT = AsciiString.cached("CONNECT");
 
+	private static final String USER_AGENT = "user-agent";
+
 	/** The pseudo-header of an extended CONNECT (RFC 8441 4). */
 	private static final AsciiString PROTOCOL = AsciiString.cached(":protocol");
 
@@ -95,12 +97,17 @@ public final class ConnectionHeadParser {
 		 * the first HEADERS block for HTTP/2 ({@code version} is {@code 2}; a CONNECT's
 		 * path is its {@code :authority}). {@code json} tells that the request targets a
 		 * JSON API, see {@link ConnectionHeadParser#prefersJson}: its error answers are
-		 * problem details instead of pages.
+		 * problem details instead of pages. {@code userAgent} is the first
+		 * {@code User-Agent} value for the access log; {@code null} when absent or blank.
 		 */
-		public record Request(String method, String path, String version, boolean json) {
+		public record Request(String method, String path, String version, boolean json, @Nullable String userAgent) {
 
 			public Request(String method, String path, String version) {
 				this(method, path, version, false);
+			}
+
+			public Request(String method, String path, String version, boolean json) {
+				this(method, path, version, json, null);
 			}
 
 		}
@@ -220,7 +227,8 @@ public final class ConnectionHeadParser {
 			return null;
 		}
 		return new Head.Request(parts[0], parts[1], parts[2].substring("HTTP/".length()),
-				prefersJson(http1HeaderValues(head, "content-type"), http1HeaderValues(head, "accept")));
+				prefersJson(http1HeaderValues(head, "content-type"), http1HeaderValues(head, "accept")),
+				http1HeaderOf(head, USER_AGENT));
 	}
 
 	/**
@@ -434,7 +442,16 @@ public final class ConnectionHeadParser {
 			return null;
 		}
 		return new Head.Request(method.toString(), path.toString(), "2",
-				prefersJson(values(headers, "content-type"), values(headers, "accept")));
+				prefersJson(values(headers, "content-type"), values(headers, "accept")), http2UserAgentOf(headers));
+	}
+
+	/**
+	 * The first {@code User-Agent} value of an HTTP/2 header block; {@code null} when
+	 * absent or blank.
+	 */
+	static @Nullable String http2UserAgentOf(Http2Headers headers) {
+		CharSequence value = headers.get(AsciiString.of(USER_AGENT));
+		return value == null || value.toString().isBlank() ? null : value.toString();
 	}
 
 	private static List<String> values(Http2Headers headers, String name) {

@@ -667,7 +667,8 @@ final class NettyHttp2DemuxRelay {
 		if (request == null) {
 			// malformed: a stream error, never forwarded (RFC 9113 8.1.1)
 			CharSequence method = headers.method();
-			this.access.request("-", method == null ? "-" : method.toString(), "-", HTTP_2);
+			this.access.request("-", method == null ? "-" : method.toString(), "-", HTTP_2,
+					ConnectionHeadParser.http2UserAgentOf(headers));
 			resetClientLocked(streamId, Http2Error.PROTOCOL_ERROR);
 			return;
 		}
@@ -812,7 +813,7 @@ final class NettyHttp2DemuxRelay {
 				exchange.requestFlow.block(trailers, stream.trailersEnd);
 			}
 		}
-		this.access.request(route.routeTag(), request.method(), request.path(), HTTP_2);
+		this.access.request(route.routeTag(), request);
 	}
 
 	/**
@@ -1062,7 +1063,7 @@ final class NettyHttp2DemuxRelay {
 	 * when the page does not fit; with the loop's lock.
 	 */
 	private void refuseLocked(int streamId, ConnectionHeadParser.Head.Request request, ErrorResponse.StreamPage page) {
-		this.access.request("-", request.method(), request.path(), HTTP_2);
+		this.access.request("-", request);
 		Shortfall shortfall = answerLocked(streamId, page, false);
 		if (shortfall != null) {
 			refuseForBudgetLocked(streamId, shortfall);
@@ -2708,7 +2709,7 @@ final class NettyHttp2DemuxRelay {
 		public void onGoAwaySent(int lastStreamId, long errorCode, ByteBuf debugData) {
 			if (errorCode == Http2Error.COMPRESSION_ERROR.code()) {
 				// a header block that did not decode: nothing of it is known
-				NettyHttp2DemuxRelay.this.access.request("-", "-", "-", HTTP_2);
+				NettyHttp2DemuxRelay.this.access.request("-", "-", "-", HTTP_2, null);
 			}
 		}
 

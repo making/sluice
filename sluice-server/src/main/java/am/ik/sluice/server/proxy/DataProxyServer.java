@@ -519,7 +519,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		Runnable release = admission::release;
 		if (conn.head().undecodable()) {
 			// a connection error before any stream: nothing of it may be routed
-			access.request("-", "-", "2");
+			access.request("-", "-", "-", "2", null);
 			this.reject(conn, this.errorResponse.compressionError());
 			return false;
 		}
@@ -613,7 +613,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		VirtualConnection connection = session.open(route0.address());
 		access.connectionId(connection.connectionId());
 		if (request != null) {
-			access.request(request.method(), request.path(), request.version());
+			access.request(request);
 		}
 		StreamRelay relay = StreamRelay
 			.builder(ProgressPipe.of(conn.pipe(), deadline::progress), connection, session.sender())

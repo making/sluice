@@ -38,8 +38,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * End to end for the access log: an HTTP request through the data plane must emit one
  * {@code request} line per request head (keep-alive successors included, each with its
- * own route) and one {@code conn ... event=close} line with the final byte counts, in
- * logfmt.
+ * own route and user agent) and one {@code conn ... event=close} line with the final byte
+ * counts, in logfmt.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -143,7 +143,7 @@ class AccessLogE2ETest {
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.setSoTimeout(10_000);
 			socket.getOutputStream()
-				.write("GET /index.html HTTP/1.1\r\nHost: log.local\r\nConnection: close\r\n\r\n"
+				.write("GET /index.html HTTP/1.1\r\nHost: log.local\r\nUser-Agent: curl/8.4.0 (e2e)\r\nConnection: close\r\n\r\n"
 					.getBytes(StandardCharsets.US_ASCII));
 			socket.getInputStream().readAllBytes();
 		}
@@ -160,7 +160,8 @@ class AccessLogE2ETest {
 				.contains("method=GET")
 				.contains("path=/index.html")
 				.contains("http=1.1")
-				.contains("remote=127.0.0.1:");
+				.contains("remote=127.0.0.1:")
+				.endsWith(" userAgent=\"curl/8.4.0 (e2e)\"");
 		});
 		assertThat(events).anySatisfy(e -> {
 			assertThat(e).startsWith("type=conn id=")
@@ -187,8 +188,8 @@ class AccessLogE2ETest {
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.setSoTimeout(10_000);
 			var out = socket.getOutputStream();
-			for (int i = 0; i < 2; i++) {
-				out.write("GET / HTTP/1.1\r\nHost: log.local\r\nConnection: keep-alive\r\n\r\n"
+			for (String userAgent : List.of("User-Agent: first/1\r\n", "")) {
+				out.write(("GET / HTTP/1.1\r\nHost: log.local\r\n" + userAgent + "Connection: keep-alive\r\n\r\n")
 					.getBytes(StandardCharsets.US_ASCII));
 				out.flush();
 				socket.getInputStream().readNBytes(64);
@@ -197,8 +198,10 @@ class AccessLogE2ETest {
 			socket.getInputStream().readAllBytes();
 		}
 		List<String> events = this.awaitCloseEvent("log.local");
-		long requests = events.stream().filter(e -> e.startsWith("type=req id=")).count();
-		assertThat(requests).isEqualTo(2);
+		assertThat(events).filteredOn(e -> e.startsWith("type=req id="))
+			.as("each request line with its own user agent")
+			.map(e -> e.substring(e.indexOf(" userAgent=") + 1))
+			.containsExactly("userAgent=\"first/1\"", "userAgent=-");
 	}
 
 	private static String field(String line, String key) {

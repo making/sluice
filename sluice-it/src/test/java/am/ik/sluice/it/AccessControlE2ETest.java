@@ -359,10 +359,10 @@ class AccessControlE2ETest {
 		assertThat(accessLines())
 			.anySatisfy(line -> assertThat(line).contains("route=" + scheme.host())
 				.contains("path=/first")
-				.endsWith("status=401 reason=auth-missing"))
+				.endsWith("status=401 reason=auth-missing userAgent=-"))
 			.anySatisfy(line -> assertThat(line).contains("route=" + scheme.host())
 				.contains("path=/later")
-				.endsWith("status=401 reason=auth-invalid"));
+				.endsWith("status=401 reason=auth-invalid userAgent=-"));
 	}
 
 	@ParameterizedTest
@@ -429,7 +429,7 @@ class AccessControlE2ETest {
 			assertThat(socket.getInputStream().readAllBytes()).isEmpty();
 		}
 		assertThat(accessLines()).anySatisfy(line -> assertThat(line).contains("route=passthrough.local")
-			.endsWith("status=401 reason=auth-unreadable"));
+			.endsWith("status=401 reason=auth-unreadable userAgent=-"));
 	}
 
 	/** A TLS ClientHello naming {@code host}. */

@@ -320,7 +320,7 @@ class ForceHttp1MisdirectedE2ETest {
 		assertThat(misdirected() - before).isEqualTo(1.0);
 		assertThat(misdirectedLines()).singleElement()
 			.isEqualTo("type=req id=N route=h1only.local method=GET path=/coalesced http=2 remote=127.0.0.1:P"
-					+ " status=421 reason=force-http1");
+					+ " status=421 reason=force-http1 userAgent=-");
 
 		// the retry on a connection of its own: SNI h1only.local, ALPN picks http/1.1
 		try (SSLSocket socket = tls(H1_HOST, "h2", "http/1.1")) {
@@ -406,8 +406,10 @@ class ForceHttp1MisdirectedE2ETest {
 			assertThat(page.content()).contains(H1_BODY);
 		}
 		assertThat(misdirectedLines()).first()
-			.isEqualTo("type=req id=N route=h1only.local method=GET path=/ http=2 remote=127.0.0.1:P"
-					+ " status=421 reason=force-http1");
+			.asString()
+			.startsWith("type=req id=N route=h1only.local method=GET path=/ http=2 remote=127.0.0.1:P"
+					+ " status=421 reason=force-http1 userAgent=\"Mozilla/5.0 ")
+			.contains("HeadlessChrome/");
 		assertThat(H1_RECEIVED).contains("GET / HTTP/1.1");
 	}
 
@@ -473,7 +475,7 @@ class ForceHttp1MisdirectedE2ETest {
 		assertThat(H1_ACCEPTED).hasValue(0);
 		assertThat(misdirectedLines()).singleElement()
 			.isEqualTo("type=req id=N route=h1only.local method=GET path=/ http=2 remote=127.0.0.1:P"
-					+ " status=421 reason=force-http1");
+					+ " status=421 reason=force-http1 userAgent=-");
 	}
 
 	/**

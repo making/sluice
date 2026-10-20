@@ -236,7 +236,7 @@ class ProxyProtocolE2ETest {
 			.anySatisfy(line -> assertThat(line)
 				.matches("type=conn id=\\d+ event=accept listener=data remote=203\\.0\\.113\\.7:32100"))
 			.anySatisfy(line -> assertThat(line).matches(
-					"type=req id=\\d+ route=proxied\\.local method=GET path=/ http=1\\.1 remote=203\\.0\\.113\\.7:32100"));
+					"type=req id=\\d+ route=proxied\\.local method=GET path=/ http=1\\.1 remote=203\\.0\\.113\\.7:32100 userAgent=-"));
 	}
 
 	@Test
@@ -247,7 +247,7 @@ class ProxyProtocolE2ETest {
 		assertThat(response.lines().findFirst()).hasValue("HTTP/1.1 200 OK");
 		assertThat(bodyOf(response)).isEqualTo("hello-from-upstream");
 		assertThat(accessLines()).anySatisfy(line -> assertThat(line).matches(
-				"type=req id=\\d+ route=proxied\\.local method=GET path=/ http=1\\.1 remote=203\\.0\\.113\\.7:32101"));
+				"type=req id=\\d+ route=proxied\\.local method=GET path=/ http=1\\.1 remote=203\\.0\\.113\\.7:32101 userAgent=-"));
 	}
 
 	@Test
