@@ -565,10 +565,20 @@ class H2DemuxUpstreamHeaderBlockE2ETest {
 					.isEqualTo(streams - admitted));
 			if (target == Target.UNROUTED) {
 				double resetsBefore = resets("budget");
-				Objects.requireNonNull(leg.get()).abort();
-				assertThat(client.awaitTrue(() -> client.reset(1) != null, TIMEOUT)).as("stream 1 lost").isTrue();
-				assertThat(client.reset(1)).isEqualTo(ENHANCE_YOUR_CALM);
-				assertThat(resets("budget")).isEqualTo(resetsBefore + 1);
+				// the bad-gateway page for the leg's stream must not be admitted: the
+				// budget spent, the page is refused with the stream
+				H2DemuxBudget budget = Objects.requireNonNull(this.limits).h2Budget();
+				long exhausting = budget.max();
+				budget.charge(exhausting);
+				try {
+					Objects.requireNonNull(leg.get()).abort();
+					assertThat(client.awaitTrue(() -> client.reset(1) != null, TIMEOUT)).as("stream 1 lost").isTrue();
+					assertThat(client.reset(1)).isEqualTo(ENHANCE_YOUR_CALM);
+					assertThat(resets("budget")).isEqualTo(resetsBefore + 1);
+				}
+				finally {
+					budget.release(exhausting);
+				}
 			}
 			assertThat(client.closed()).isFalse();
 		}
