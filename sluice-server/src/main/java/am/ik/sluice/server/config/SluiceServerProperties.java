@@ -812,11 +812,13 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		 * @param allowPreflight whether a CORS preflight ({@code OPTIONS} with
 		 * {@code Access-Control-Request-Method}) passes without credentials: browsers
 		 * send none on it
+		 * @param oidc the provider whose access tokens are accepted as
+		 * {@code Authorization: Bearer <JWT>}; absent = none
 		 */
 		public record Auth(@DefaultValue Map<String, String> basic, @DefaultValue List<String> bearer,
 				@DefaultValue List<String> apiToken, @DefaultValue("X-API-Token") String apiTokenHeader,
 				@DefaultValue("") String realm, @DefaultValue("false") boolean forwardCredentials,
-				@DefaultValue("false") boolean allowPreflight) {
+				@DefaultValue("false") boolean allowPreflight, @Nullable Oidc oidc) {
 
 			/** The default of {@code apiTokenHeader}. */
 			public static final String DEFAULT_API_TOKEN_HEADER = "X-API-Token";
@@ -849,6 +851,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				private boolean forwardCredentials;
 
 				private boolean allowPreflight;
+
+				@Nullable private Oidc oidc;
 
 				private Builder() {
 				}
@@ -888,9 +892,95 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 					return this;
 				}
 
+				public Builder oidc(Oidc oidc) {
+					this.oidc = oidc;
+					return this;
+				}
+
 				public Auth build() {
 					return new Auth(this.basic, this.bearer, this.apiToken, this.apiTokenHeader, this.realm,
-							this.forwardCredentials, this.allowPreflight);
+							this.forwardCredentials, this.allowPreflight, this.oidc);
+				}
+
+			}
+
+			/**
+			 * An OpenID Provider whose signed JWT access tokens a route accepts
+			 * (resource-server style). Its keys are discovered from the issuer and
+			 * refreshed in the background.
+			 *
+			 * @param issuerUri the issuer: its discovery document is
+			 * {@code <issuer-uri>/.well-known/openid-configuration}, and a token's
+			 * {@code iss} must equal it
+			 * @param audiences a token's {@code aud} must hold one of them
+			 * @param jwsAlgorithms the signature algorithms accepted (RS, ES, PS)
+			 * @param claims further claims a token must carry: the claim name to the
+			 * values accepted, {@code *} matching any run of characters; a list claim
+			 * must hold one of them
+			 * @param clockSkew the leeway of {@code exp} / {@code nbf}
+			 */
+			public record Oidc(String issuerUri, @DefaultValue List<String> audiences,
+					@DefaultValue("RS256") List<String> jwsAlgorithms, @DefaultValue Map<String, List<String>> claims,
+					@DefaultValue("60s") Duration clockSkew) {
+
+				public Oidc {
+					issuerUri = issuerUri == null ? "" : issuerUri.strip();
+					audiences = audiences == null ? List.of() : List.copyOf(audiences);
+					jwsAlgorithms = jwsAlgorithms == null || jwsAlgorithms.isEmpty() ? List.of("RS256")
+							: List.copyOf(jwsAlgorithms);
+					claims = claims == null ? Map.of() : Map.copyOf(claims);
+					clockSkew = clockSkew == null ? Duration.ofSeconds(60) : clockSkew;
+				}
+
+				public static Builder builder() {
+					return new Builder();
+				}
+
+				public static final class Builder {
+
+					private String issuerUri = "";
+
+					private List<String> audiences = List.of();
+
+					private List<String> jwsAlgorithms = List.of("RS256");
+
+					private Map<String, List<String>> claims = Map.of();
+
+					private Duration clockSkew = Duration.ofSeconds(60);
+
+					private Builder() {
+					}
+
+					public Builder issuerUri(String issuerUri) {
+						this.issuerUri = issuerUri;
+						return this;
+					}
+
+					public Builder audiences(List<String> audiences) {
+						this.audiences = audiences;
+						return this;
+					}
+
+					public Builder jwsAlgorithms(List<String> jwsAlgorithms) {
+						this.jwsAlgorithms = jwsAlgorithms;
+						return this;
+					}
+
+					public Builder claims(Map<String, List<String>> claims) {
+						this.claims = claims;
+						return this;
+					}
+
+					public Builder clockSkew(Duration clockSkew) {
+						this.clockSkew = clockSkew;
+						return this;
+					}
+
+					public Oidc build() {
+						return new Oidc(this.issuerUri, this.audiences, this.jwsAlgorithms, this.claims,
+								this.clockSkew);
+					}
+
 				}
 
 			}

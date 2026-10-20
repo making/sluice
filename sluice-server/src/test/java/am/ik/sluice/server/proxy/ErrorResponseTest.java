@@ -91,6 +91,36 @@ class ErrorResponseTest {
 			.isEqualTo("{\"type\":\"about:blank\",\"title\":\"Service Unavailable\",\"status\":503,"
 					+ "\"detail\":\"The server is checking as many credentials as it may at once.\"}");
 		assertThat(page.headers().get("content-length")).hasToString(String.valueOf(page.body().length));
+		assertThat(new String(this.errorResponse.refusal(head, new Verdict.Unavailable(Duration.ofSeconds(10))),
+				StandardCharsets.US_ASCII))
+			.contains("HTTP/1.1 503 Service Unavailable\r\n", "Retry-After: 10\r\n",
+					"\"detail\":\"The keys of the identity provider are not loaded yet.\"}");
+		ErrorResponse.StreamPage unavailable = this.errorResponse.refusalPage("a.local",
+				new ConnectionHeadParser.Head.Request("GET", "/", "2", true),
+				new Verdict.Unavailable(Duration.ofSeconds(10)));
+		assertThat(unavailable.headers().status()).hasToString("503");
+		assertThat(unavailable.headers().get("retry-after")).hasToString("10");
+	}
+
+	/** The busy page tells which of its causes refused the request. */
+	@Test
+	void theBusyPageTellsItsCause() {
+		ErrorResponse pages = new ErrorResponse(Mustache.compiler().emptyStringIsFalse(true).withLoader(name -> {
+			java.io.InputStream template = getClass().getResourceAsStream("/templates/" + name + ".mustache");
+			return new java.io.InputStreamReader(java.util.Objects.requireNonNull(template), StandardCharsets.UTF_8);
+		}));
+		ConnectionHeadParser.Head head = head("GET / HTTP/1.1\r\nHost: a.local\r\nAccept: text/html\r\n\r\n");
+		String limit = new String(pages.busy(head, Duration.ofSeconds(1)), StandardCharsets.UTF_8);
+		String verifying = new String(pages.refusal(head, new Verdict.Busy(Duration.ofSeconds(1))),
+				StandardCharsets.UTF_8);
+		String keys = new String(pages.refusal(head, new Verdict.Unavailable(Duration.ofSeconds(1))),
+				StandardCharsets.UTF_8);
+		assertThat(limit).contains("at its connection limit", "every connection is taken")
+			.doesNotContain("credential", "keys");
+		assertThat(verifying).contains("checking as many credentials", "credential checks are all taken")
+			.doesNotContain("connection limit", "keys");
+		assertThat(keys).contains("has not loaded the keys", "provider keys not loaded")
+			.doesNotContain("connection limit", "credential checks");
 	}
 
 	@Test

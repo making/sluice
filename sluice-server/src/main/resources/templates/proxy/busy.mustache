@@ -184,7 +184,7 @@
       <g class="outlet">
         <path class="dry" d="M660 74H952M660 126H952"/>
         <text x="680" y="58">outlet full</text>
-        <text x="680" y="152">{{#verifying}}credential checks are all taken{{/verifying}}{{^verifying}}every connection is taken{{/verifying}}</text>
+        <text x="680" y="152">{{#verifying}}credential checks are all taken{{/verifying}}{{#keys}}provider keys not loaded{{/keys}}{{^verifying}}{{^keys}}every connection is taken{{/keys}}{{/verifying}}</text>
       </g>
     </svg>
 
@@ -192,7 +192,8 @@
       <p class="status">503 Service Unavailable</p>
       <h1>Server busy</h1>
       {{#verifying}}<p class="lede">The server is checking as many credentials as it may at once and cannot check this request's right now.</p>{{/verifying}}
-      {{^verifying}}<p class="lede">The server is at its connection limit and cannot take this request right now.</p>{{/verifying}}
+      {{#keys}}<p class="lede">The server has not loaded the keys of the identity provider yet and cannot check this request's token right now.</p>{{/keys}}
+      {{^verifying}}{{^keys}}<p class="lede">The server is at its connection limit and cannot take this request right now.</p>{{/keys}}{{/verifying}}
       <p class="hint">Retry in a few seconds.</p>
     </div>
   </div>

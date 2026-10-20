@@ -6,7 +6,11 @@ Route auth (156) and OIDC bearer (157) answer a request without credentials `401
 add the authorization code flow (oauth2-proxy style): an unauthenticated request is redirected to
 the provider, the callback sets a session cookie, later requests pass with it.
 
-Depends on 157 (scheme SPI, provider config, JWKS). The code exchange is network I/O: do it in a
+Depends on 157 (scheme SPI, provider config, JWKS). 157 provides: `OidcScheme` (bearer JWTs via
+`NimbusJwtDecoder` + Spring validators), `IssuerKeys` / `OidcIssuers` (discovery, JWKS held in
+memory, refreshed on the `applicationTaskExecutor`), `sluice.route.auth.[<key>].oidc.*`
+(issuer-uri, audiences, jws-algorithms, claims, clock-skew), `Verdict.Unavailable` (`503` while
+the keys have not loaded). The code exchange is network I/O: do it in a
 `bounded()` credential check, which the h2 demux runs off its loop (158).
 
 ## Pieces

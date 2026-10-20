@@ -175,6 +175,21 @@ class MockOidcServer implements AutoCloseable {
 		json(exchange, toJson(response));
 	}
 
+	/**
+	 * An access token of the provider for the audience (resource-server style): signed
+	 * like its id tokens, issued now, expiring in five minutes.
+	 */
+	String accessToken(String audience) {
+		Map<String, Object> claims = new LinkedHashMap<>();
+		claims.put("iss", issuer());
+		claims.put("sub", "api-client");
+		claims.put("aud", List.of(audience));
+		long now = System.currentTimeMillis() / 1000;
+		claims.put("iat", now);
+		claims.put("exp", now + 300);
+		return idToken(claims);
+	}
+
 	private String idToken(Map<String, Object> claims) {
 		String header = URL_ENCODER.encodeToString(
 				toJson(Map.of("alg", "RS256", "kid", this.keyId, "typ", "JWT")).getBytes(StandardCharsets.UTF_8));

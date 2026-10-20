@@ -60,8 +60,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * open routes serve. A route with credentials ({@code sluice.route.auth}) answers a
  * request without them 401 with its challenge, over HTTP/1.1 and h2c, on the connection's
  * first request as on a later one, and relays one with them, the credential header
- * removed unless the route forwards it; a TLS passthrough connection to such a route is
- * closed unrelayed.
+ * removed unless the route forwards it -- static secrets and the access tokens of an OIDC
+ * provider ({@link MockOidcServer}) alike; a TLS passthrough connection to such a route
+ * is closed unrelayed.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -83,7 +84,12 @@ class AccessControlE2ETest {
 
 	private static final ListAppender<ILoggingEvent> SESSION_EVENTS = new ListAppender<>();
 
+	private static final String OIDC_AUDIENCE = "api://oidc.local";
+
 	private static HeaderEchoUpstream httpUpstream;
+
+	/** The provider of the {@code oidc.local} route, up before the server starts. */
+	private static @Nullable MockOidcServer oidcProvider;
 
 	private static @Nullable ServerSocket echoServer;
 
@@ -126,12 +132,21 @@ class AccessControlE2ETest {
 		registry.add("sluice.route.auth.[forward.local].bearer[0]", () -> "{noop}forward-token");
 		registry.add("sluice.route.auth.[forward.local].forward-credentials", () -> "true");
 		registry.add("sluice.route.auth.[passthrough.local].bearer[0]", () -> "{noop}passthrough-token");
+		MockOidcServer provider = new MockOidcServer("console-client");
+		oidcProvider = provider;
+		registry.add("sluice.route.auth.[oidc.local].oidc.issuer-uri", provider::issuer);
+		registry.add("sluice.route.auth.[oidc.local].oidc.audiences[0]", () -> OIDC_AUDIENCE);
+	}
+
+	private static MockOidcServer oidcProvider() {
+		return java.util.Objects.requireNonNull(oidcProvider, "oidc provider not started");
 	}
 
 	@AfterAll
 	static void detachAppenders() {
 		((Logger) LoggerFactory.getLogger("sluice.access")).detachAppender(ACCESS_EVENTS);
 		((Logger) LoggerFactory.getLogger(TunnelSession.class)).detachAppender(SESSION_EVENTS);
+		oidcProvider().close();
 	}
 
 	private static String sha256Hex(String value) {
@@ -184,7 +199,7 @@ class AccessControlE2ETest {
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
 			.upstream(Upstream.builder().host("open.local").target(http).build())
 			.upstream(Upstream.builder().host("locked.local").target(http).allowedCidrs(List.of("10.0.0.0/8")).build());
-		for (String host : List.of("basic.local", "bearer.local", "token.local", "forward.local")) {
+		for (String host : List.of("basic.local", "bearer.local", "token.local", "forward.local", "oidc.local")) {
 			builder.upstream(Upstream.builder().host(host).target(http).build());
 		}
 		SluiceClientProperties properties = builder
@@ -295,9 +310,10 @@ class AccessControlE2ETest {
 
 	/**
 	 * A route with credentials: its scheme's name, the header carrying a good and a wrong
-	 * credential, and the challenge of its 401.
+	 * credential, and the challenge of its 401 without a credential and with the wrong
+	 * one.
 	 */
-	record Scheme(String host, String header, String good, String wrong, String challenge) {
+	record Scheme(String host, String header, String good, String wrong, String challenge, String refusal) {
 
 		@Override
 		public String toString() {
@@ -307,13 +323,17 @@ class AccessControlE2ETest {
 	}
 
 	static List<Scheme> schemes() {
+		String basic = "Basic realm=\"basic.local\", charset=\"UTF-8\"";
 		return List.of(
 				new Scheme("basic.local", "authorization", "Basic " + base64("alice:wonderland"),
-						"Basic " + base64("alice:mad-hatter"), "Basic realm=\"basic.local\", charset=\"UTF-8\""),
+						"Basic " + base64("alice:mad-hatter"), basic, basic),
 				new Scheme("bearer.local", "authorization", "Bearer bearer-token", "Bearer other-token",
-						"Bearer realm=\"bearer.local\""),
+						"Bearer realm=\"bearer.local\"", "Bearer realm=\"bearer.local\", error=\"invalid_token\""),
 				new Scheme("token.local", "x-api-token", "api-token", "other-token",
-						"X-API-Token realm=\"token.local\""));
+						"X-API-Token realm=\"token.local\"", "X-API-Token realm=\"token.local\""),
+				new Scheme("oidc.local", "authorization", "Bearer " + oidcProvider().accessToken(OIDC_AUDIENCE),
+						"Bearer " + oidcProvider().accessToken("api://elsewhere"), "Bearer realm=\"oidc.local\"",
+						"Bearer realm=\"oidc.local\", error=\"invalid_token\""));
 	}
 
 	private static String base64(String value) {
@@ -353,7 +373,7 @@ class AccessControlE2ETest {
 				.endsWith(HeaderEchoUpstream.GREETING);
 			assertThat(new String(in.readAllBytes(), StandardCharsets.UTF_8)).as("the later request's, then closed")
 				.startsWith("HTTP/1.1 401 Unauthorized\r\n")
-				.contains("\r\nWWW-Authenticate: " + scheme.challenge() + "\r\n");
+				.contains("\r\nWWW-Authenticate: " + scheme.refusal() + "\r\n");
 		}
 
 		assertThat(accessLines())
@@ -394,7 +414,10 @@ class AccessControlE2ETest {
 			TestH2.writeFrame(out, TestH2.HEADERS, TestH2.FLAG_END_HEADERS | TestH2.FLAG_END_STREAM, 7,
 					TestH2.headerBlock(":method=GET", ":scheme=http", ":path=/", ":authority=" + scheme.host(),
 							scheme.header() + "=" + scheme.wrong()));
-			assertThat(headersOf(drainStream(in, 7)).status()).as("a later stream").hasToString("401");
+			Http2Headers refused = headersOf(drainStream(in, 7));
+			assertThat(refused.status()).as("a later stream").hasToString("401");
+			assertThat(refused.getAll("www-authenticate")).map(CharSequence::toString)
+				.containsExactly(scheme.refusal());
 		}
 	}
 

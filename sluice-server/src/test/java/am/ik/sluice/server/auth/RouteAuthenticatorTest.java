@@ -1,6 +1,7 @@
 package am.ik.sluice.server.auth;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.HexFormat;
@@ -11,6 +12,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -28,6 +30,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.crypto.password.Pbkdf2PasswordEncoder;
+import org.springframework.web.client.RestClient;
 
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.route.Router;
@@ -43,6 +46,12 @@ class RouteAuthenticatorTest {
 
 	private static final List<String> CHALLENGES = List.of("Basic realm=\"api.local\", charset=\"UTF-8\"",
 			"Bearer realm=\"api.local\"", "X-API-Token realm=\"api.local\"");
+
+	/** {@link #CHALLENGES} answering a bearer token refused. */
+	private static final List<String> BEARER_REFUSED = List.of("Basic realm=\"api.local\", charset=\"UTF-8\"",
+			"Bearer realm=\"api.local\", error=\"invalid_token\"", "X-API-Token realm=\"api.local\"");
+
+	static final Executor VIRTUAL = task -> Thread.ofVirtual().name("test-route-auth").start(task);
 
 	/** bcrypt at the lowest cost: the tests check the matching, not the cost. */
 	private static final BCryptPasswordEncoder BCRYPT = new BCryptPasswordEncoder(4);
@@ -92,8 +101,10 @@ class RouteAuthenticatorTest {
 				{ "authorization", "Bearer " }, { "authorization", "Bearer" }, { "authorization", "Token api-token" },
 				{ "authorization", "Bearer api-token" }, { "x-api-token", "wrong-token" }, { "x-api-token", " " },
 				{ "x-api-token", "bearer-token" } }) {
+			boolean bearer = refused[0].equals("authorization")
+					&& refused[1].toLowerCase(Locale.ROOT).startsWith("bearer");
 			assertThat(verify(authenticator, refused)).as("%s: %s", refused[0], refused[1])
-				.isEqualTo(new Verdict.Unauthorized("invalid", CHALLENGES));
+				.isEqualTo(new Verdict.Unauthorized("invalid", bearer ? BEARER_REFUSED : CHALLENGES));
 		}
 		assertThat(verify(authenticator, "authorization", "Bearer bearer-token", "authorization", "Bearer x"))
 			.as("a credential header twice is refused whatever the values")
@@ -181,7 +192,7 @@ class RouteAuthenticatorTest {
 		RouteAuthenticator authenticator = new RouteAuthenticator(properties(SluiceServerProperties.Route.Auth.builder()
 			.bearer(List.of(secret("bcrypt", "slow-token")))
 			.apiToken(List.of(secret("sha256", "fast-token")))
-			.build()), holding, 1, RouteAuthenticator.CACHE_SIZE, this.now::get);
+			.build()), holding, 1, RouteAuthenticator.CACHE_SIZE, this.now::get, VIRTUAL, this.issuers());
 
 		CompletableFuture<Verdict> inFlight = verifyAsync(authenticator, "authorization", "Bearer slow-token");
 		assertThat(entered.await(5, TimeUnit.SECONDS)).as("precondition: a slow check in flight").isTrue();
@@ -239,7 +250,8 @@ class RouteAuthenticatorTest {
 			}
 
 		};
-		assertThat(new RouteAuthenticator(properties(auth), failing, 2, RouteAuthenticator.CACHE_SIZE, this.now::get)
+		assertThat(new RouteAuthenticator(properties(auth), failing, 2, RouteAuthenticator.CACHE_SIZE, this.now::get,
+				VIRTUAL, this.issuers())
 			.verify(route(ROUTE), headers("GET", "authorization", "Bearer sha-token")))
 			.isInstanceOf(Verdict.Unauthorized.class);
 	}
@@ -301,11 +313,11 @@ class RouteAuthenticatorTest {
 					.auth(Map.of("tcp:9000",
 							SluiceServerProperties.Route.Auth.builder().bearer(List.of("{noop}token")).build()))
 					.build())
-				.build(), this.encoder))
+				.build(), this.encoder, VIRTUAL::execute, RestClient.builder()))
 			.withMessageStartingWith("sluice.route.auth.[tcp:9000]: a tcp route");
 		assertThatIllegalStateException()
 			.isThrownBy(() -> authenticator(SluiceServerProperties.Route.Auth.builder().build()))
-			.withMessage("sluice.route.auth.[api.local] configures no credential (basic, bearer or api-token)");
+			.withMessage("sluice.route.auth.[api.local] configures no credential (basic, bearer, api-token or oidc)");
 		assertThatIllegalStateException()
 			.isThrownBy(() -> authenticator(
 					SluiceServerProperties.Route.Auth.builder().basic(Map.of("a:b", "{noop}secret")).build()))
@@ -326,7 +338,7 @@ class RouteAuthenticatorTest {
 					.auth(Map.of(ROUTE,
 							SluiceServerProperties.Route.Auth.builder().bearer(List.of("{noop}token")).build()))
 					.build())
-				.build(), this.encoder);
+				.build(), this.encoder, VIRTUAL::execute, RestClient.builder());
 		}
 		finally {
 			logger.detachAppender(events);
@@ -338,7 +350,12 @@ class RouteAuthenticatorTest {
 	}
 
 	private RouteAuthenticator authenticator(SluiceServerProperties.Route.Auth auth) {
-		return new RouteAuthenticator(properties(auth), this.encoder, 2, 2, this.now::get);
+		return new RouteAuthenticator(properties(auth), this.encoder, 2, 2, this.now::get, VIRTUAL, this.issuers());
+	}
+
+	private OidcIssuers issuers() {
+		return new OidcIssuers(OidcIssuers.Timing.DEFAULT, Clock.systemUTC(), this.now::get, VIRTUAL,
+				RestClient.builder());
 	}
 
 	private static SluiceServerProperties properties(SluiceServerProperties.Route.Auth auth) {

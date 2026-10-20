@@ -271,13 +271,15 @@ public class AccessLogger {
 		/**
 		 * Logs a request head refused for its route's credentials: {@code 401} with
 		 * {@code reason=auth-missing} / {@code auth-invalid}, {@code 503} with
-		 * {@code reason=auth-busy}; nothing for a verdict that passes.
+		 * {@code reason=auth-busy} / {@code auth-unavailable}; nothing for a verdict that
+		 * passes.
 		 */
 		void refused(String routeTag, ConnectionHeadParser.Head.@Nullable Request request, Verdict verdict) {
 			switch (verdict) {
 				case Verdict.Unauthorized unauthorized ->
 					this.refused(routeTag, request, 401, "auth-" + unauthorized.reason());
 				case Verdict.Busy busy -> this.refused(routeTag, request, 503, "auth-busy");
+				case Verdict.Unavailable unavailable -> this.refused(routeTag, request, 503, "auth-unavailable");
 				case Verdict.Pass pass -> {
 				}
 			}

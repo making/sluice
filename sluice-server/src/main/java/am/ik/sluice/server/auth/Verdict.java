@@ -7,7 +7,7 @@ import java.util.Set;
 /**
  * What {@link RouteAuthenticator} made of a request: it passes -- the headers to remove
  * before it is relayed with it --, it is unauthorized, or its credential could not be
- * checked for the verifications in flight.
+ * checked: for the verifications in flight, or for the keys of its provider not loaded.
  */
 public sealed interface Verdict {
 
@@ -48,6 +48,15 @@ public sealed interface Verdict {
 	 * @param retryAfter the {@code Retry-After} of the answer
 	 */
 	record Busy(Duration retryAfter) implements Verdict {
+	}
+
+	/**
+	 * The request is refused {@code 503}: its credential is a token of an OIDC provider
+	 * whose keys have not loaded.
+	 *
+	 * @param retryAfter the {@code Retry-After} of the answer
+	 */
+	record Unavailable(Duration retryAfter) implements Verdict {
 	}
 
 }

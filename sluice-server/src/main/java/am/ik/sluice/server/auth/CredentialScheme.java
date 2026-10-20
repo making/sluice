@@ -1,5 +1,6 @@
 package am.ik.sluice.server.auth;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.function.BiPredicate;
 
@@ -8,7 +9,8 @@ import org.jspecify.annotations.Nullable;
 /**
  * One way a route takes credentials ({@link RouteAuthenticator}): the header carrying
  * them, its challenge, and how a presented value is checked. Schemes sharing
- * {@code Authorization} are told apart by their {@link #authScheme()} token.
+ * {@code Authorization} are told apart by their {@link #authScheme()} token, and schemes
+ * sharing that token by which credential each {@link #takes}.
  */
 interface CredentialScheme {
 
@@ -30,6 +32,24 @@ interface CredentialScheme {
 	 * @param realm the quoted realm parameter, {@code realm="..."}
 	 */
 	String challenge(String realm);
+
+	/**
+	 * The {@code WWW-Authenticate} challenge of the scheme answering a credential it took
+	 * that did not match; {@link #challenge} unless the scheme names the error.
+	 * @param realm the quoted realm parameter, {@code realm="..."}
+	 */
+	default String refusal(String realm) {
+		return challenge(realm);
+	}
+
+	/**
+	 * Whether the scheme takes the credential, as {@link #credential} would get it: a
+	 * scheme sharing its header and auth-scheme token with another takes only its own
+	 * kind.
+	 */
+	default boolean takes(String credential) {
+		return true;
+	}
 
 	/**
 	 * The credential of a presented value: the header's value past the auth-scheme token
@@ -54,8 +74,8 @@ interface CredentialScheme {
 			}
 
 			@Override
-			public boolean matches() {
-				return false;
+			public Check check() {
+				return new Check.Mismatch("malformed");
 			}
 
 		};
@@ -72,8 +92,44 @@ interface CredentialScheme {
 		 */
 		boolean bounded();
 
-		/** Checks the credential. */
-		boolean matches();
+		/**
+		 * Checks the credential. An unbounded one is checked on the request's own thread
+		 * (the h2 demux's loop among them): it stays cheap and does no I/O.
+		 */
+		Check check();
+
+	}
+
+	/** What checking a credential found. */
+	sealed interface Check {
+
+		/** A match the cache may remember as long as it likes. */
+		Check MATCH = new Match(null);
+
+		/**
+		 * The credential matched.
+		 *
+		 * @param ttl how long the match may be remembered at most; null for no bound
+		 * besides the cache's
+		 */
+		record Match(@Nullable Duration ttl) implements Check {
+		}
+
+		/**
+		 * The credential did not match.
+		 *
+		 * @param why what failed, for the debug log; never the credential
+		 */
+		record Mismatch(String why) implements Check {
+		}
+
+		/**
+		 * The credential could not be checked: what it is checked against is not loaded.
+		 *
+		 * @param why what is missing, for the debug log
+		 */
+		record Unavailable(String why) implements Check {
+		}
 
 	}
 
@@ -97,13 +153,13 @@ interface CredentialScheme {
 		}
 
 		@Override
-		public boolean matches() {
+		public Check check() {
 			for (String secret : this.secrets) {
 				if (this.matcher.test(this.raw, secret)) {
-					return !this.decoy;
+					return this.decoy ? new Check.Mismatch("unknown user") : Check.MATCH;
 				}
 			}
-			return false;
+			return new Check.Mismatch("no secret matched");
 		}
 
 	}

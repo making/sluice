@@ -101,10 +101,27 @@ public final class TestH2 {
 		byte[] nameBytes = name.getBytes(StandardCharsets.US_ASCII);
 		byte[] valueBytes = value.getBytes(StandardCharsets.US_ASCII);
 		out.write(0x00);
-		out.write(nameBytes.length);
+		writeLength(out, nameBytes.length);
 		out.writeBytes(nameBytes);
-		out.write(valueBytes.length);
+		writeLength(out, valueBytes.length);
 		out.writeBytes(valueBytes);
+	}
+
+	/**
+	 * An HPACK string length: an integer of a 7-bit prefix, no huffman (RFC 7541 5.1).
+	 */
+	private static void writeLength(ByteArrayOutputStream out, int length) {
+		if (length < 0x7f) {
+			out.write(length);
+			return;
+		}
+		out.write(0x7f);
+		int rest = length - 0x7f;
+		while (rest >= 0x80) {
+			out.write(rest & 0x7f | 0x80);
+			rest >>>= 7;
+		}
+		out.write(rest);
 	}
 
 	/** Reads frames until the next frame; returns it, or null on EOF. */

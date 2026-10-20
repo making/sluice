@@ -108,7 +108,7 @@ class AccessLoggerRateLimitTest {
 		SluiceServerProperties properties = SluiceServerProperties.builder()
 			.accessLog(SluiceServerProperties.AccessLog.builder()
 				.rateLimit(SluiceServerProperties.AccessLog.RateLimit.builder()
-					.maxRate(2)
+					.maxRate(3)
 					.period(Duration.ofMillis(50))
 					.build())
 				.build())
@@ -122,12 +122,15 @@ class AccessLoggerRateLimitTest {
 					"agent/1 \"q\" \\ \n\u007f\u009b");
 			connection.refused("a.local", request, new Verdict.Unauthorized("missing", List.of()));
 			connection.refused("a.local", request, new Verdict.Busy(Duration.ofSeconds(1)));
+			connection.refused("a.local", request, new Verdict.Unavailable(Duration.ofSeconds(10)));
 			connection.refused("a.local", request, new Verdict.Unauthorized("invalid", List.of()));
-			assertThat(this.messages()).as("the third past the request lines' rate")
+			assertThat(this.messages()).as("the fourth past the request lines' rate")
 				.containsExactly("type=req id=1 route=a.local method=GET path=/x http=1.1 remote=" + remoteOf(socket)
 						+ " status=401 reason=auth-missing userAgent=\"agent/1 \\\"q\\\" \\\\ \\u000a\\u007f\\u009b\"",
 						"type=req id=1 route=a.local method=GET path=/x http=1.1 remote=" + remoteOf(socket)
-								+ " status=503 reason=auth-busy userAgent=\"agent/1 \\\"q\\\" \\\\ \\u000a\\u007f\\u009b\"");
+								+ " status=503 reason=auth-busy userAgent=\"agent/1 \\\"q\\\" \\\\ \\u000a\\u007f\\u009b\"",
+						"type=req id=1 route=a.local method=GET path=/x http=1.1 remote=" + remoteOf(socket)
+								+ " status=503 reason=auth-unavailable userAgent=\"agent/1 \\\"q\\\" \\\\ \\u000a\\u007f\\u009b\"");
 		}
 	}
 

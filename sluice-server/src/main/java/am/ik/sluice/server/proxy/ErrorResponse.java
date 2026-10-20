@@ -35,13 +35,14 @@ import am.ik.sluice.server.auth.Verdict;
  * forbidden page for a peer address the access control excludes, the 401 unauthorized
  * page with the route's {@code WWW-Authenticate} challenges for a request without its
  * credentials, the 503 busy page with {@code Retry-After} for a request whose credentials
- * could not be checked for the checks in flight, a bare HTTP/1.1 400 for a malformed
- * request, the 502 page for a request its upstream lost before answering (HTTP/1.1: on
- * its connection; HTTP/2: on its stream), a bodiless HTTP/2 421 for a stream of a route
- * reached over HTTP/1.1 only, a GOAWAY {@code COMPRESSION_ERROR} for an HTTP/2 head whose
- * header block does not decode, a GOAWAY processing no stream for an HTTP/2 connection
- * whose relay does not fit, and the 503 busy page with {@code Retry-After} for a request
- * past the connection limit. The default error is a problem details document (RFC 9457,
+ * could not be checked for the checks in flight or for its OIDC provider's keys not
+ * loaded, a bare HTTP/1.1 400 for a malformed request, the 502 page for a request its
+ * upstream lost before answering (HTTP/1.1: on its connection; HTTP/2: on its stream), a
+ * bodiless HTTP/2 421 for a stream of a route reached over HTTP/1.1 only, a GOAWAY
+ * {@code COMPRESSION_ERROR} for an HTTP/2 head whose header block does not decode, a
+ * GOAWAY processing no stream for an HTTP/2 connection whose relay does not fit, and the
+ * 503 busy page with {@code Retry-After} for a request past the connection limit. The
+ * default error is a problem details document (RFC 9457,
  * {@code application/problem+json}) ({@link ConnectionHeadParser.Head.Request#json});
  * only a request whose {@code Accept} names {@code text/html} gets the page in place of
  * it; the headers stay headers.
@@ -113,19 +114,23 @@ public class ErrorResponse {
 
 	/**
 	 * The answer to a request its route's credential check refused: {@link #unauthorized}
-	 * or {@link #verificationBusy}; empty for a verdict that passes.
+	 * or the busy page of {@link #verificationBusy} / {@link Verdict.Unavailable}; empty
+	 * for a verdict that passes.
 	 */
 	public byte[] refusal(ConnectionHeadParser.Head head, Verdict verdict) {
 		return switch (verdict) {
 			case Verdict.Unauthorized unauthorized -> this.unauthorized(head, unauthorized.challenges());
 			case Verdict.Busy busy -> this.verificationBusy(head, busy.retryAfter());
+			case Verdict.Unavailable unavailable ->
+				this.render(head, this.busy.keysUnloaded().retryingAfter(unavailable.retryAfter().toSeconds()));
 			case Verdict.Pass pass -> new byte[0];
 		};
 	}
 
 	/**
 	 * The page on a single stream its route's credential check refused, for a relay whose
-	 * HTTP/2 codec frames it: {@link #unauthorizedPage} or {@link #verificationBusyPage}.
+	 * HTTP/2 codec frames it: {@link #unauthorizedPage}, {@link #verificationBusyPage} or
+	 * the busy page of {@link Verdict.Unavailable}.
 	 * @throws IllegalArgumentException for a verdict that passes
 	 */
 	public StreamPage refusalPage(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request,
@@ -133,6 +138,8 @@ public class ErrorResponse {
 		return switch (verdict) {
 			case Verdict.Unauthorized unauthorized -> this.unauthorizedPage(host, request, unauthorized.challenges());
 			case Verdict.Busy busy -> this.verificationBusyPage(host, request, busy.retryAfter());
+			case Verdict.Unavailable unavailable -> this.streamPage(
+					this.busy.keysUnloaded().retryingAfter(unavailable.retryAfter().toSeconds()), host, request);
 			case Verdict.Pass pass -> throw new IllegalArgumentException("the request passed");
 		};
 	}
@@ -285,7 +292,8 @@ public class ErrorResponse {
 		// an empty value skips its section (emptyStringIsFalse)
 		Map<String, String> context = Map.of("host", host == null ? "" : host, "method",
 				request == null ? "" : request.method(), "path", request == null ? "" : request.path(), "verifying",
-				page.line().verifying() ? "true" : "");
+				page.line().cause() == Cause.VERIFYING ? "true" : "", "keys",
+				page.line().cause() == Cause.KEYS ? "true" : "");
 		return page.page().execute(context).getBytes(StandardCharsets.UTF_8);
 	}
 
@@ -367,7 +375,7 @@ public class ErrorResponse {
 	private record Page(Template page, Status line, String detail) {
 
 		private Page(Template page, String reason, String detail) {
-			this(page, new Status(reason, List.of(), false), detail);
+			this(page, new Status(reason, List.of(), Cause.NONE), detail);
 		}
 
 		/**
@@ -390,16 +398,28 @@ public class ErrorResponse {
 			return this.with(challenges.stream().map(challenge -> new Header("WWW-Authenticate", challenge)).toList());
 		}
 
-		/** The same page telling that the request's credentials could not be checked. */
+		/**
+		 * The same page telling that the request's credentials could not be checked for
+		 * the checks in flight.
+		 */
 		private Page verifying() {
-			return new Page(this.page, new Status(this.line.reason(), this.line.headers(), true),
+			return new Page(this.page, new Status(this.line.reason(), this.line.headers(), Cause.VERIFYING),
 					"The server is checking as many credentials as it may at once.");
+		}
+
+		/**
+		 * The same page telling that the request's token could not be checked for its
+		 * provider's keys not loaded.
+		 */
+		private Page keysUnloaded() {
+			return new Page(this.page, new Status(this.line.reason(), this.line.headers(), Cause.KEYS),
+					"The keys of the identity provider are not loaded yet.");
 		}
 
 		private Page with(List<Header> headers) {
 			List<Header> all = new ArrayList<>(this.line.headers());
 			all.addAll(headers);
-			return new Page(this.page, new Status(this.line.reason(), all, this.line.verifying()), this.detail);
+			return new Page(this.page, new Status(this.line.reason(), all, this.line.cause()), this.detail);
 		}
 
 		/** Adds the page's headers to an h2 header block, names in lowercase. */
@@ -424,9 +444,9 @@ public class ErrorResponse {
 
 	/**
 	 * An HTTP status line, the headers the response carries besides the page's own, and
-	 * whether the page tells that the request's credentials could not be checked.
+	 * why the page tells the request's credentials could not be checked, if it does.
 	 */
-	private record Status(String reason, List<Header> headers, boolean verifying) {
+	private record Status(String reason, List<Header> headers, Cause cause) {
 
 		private Status {
 			headers = List.copyOf(headers);
@@ -436,6 +456,20 @@ public class ErrorResponse {
 
 	/** A response header. */
 	private record Header(String name, String value) {
+	}
+
+	/** Why a busy page could not check the request's credentials. */
+	private enum Cause {
+
+		/** It does not tell: the connection limit. */
+		NONE,
+
+		/** The checks in flight. */
+		VERIFYING,
+
+		/** The OIDC provider's keys are not loaded. */
+		KEYS
+
 	}
 
 	/**

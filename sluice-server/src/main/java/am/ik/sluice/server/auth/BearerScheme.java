@@ -7,7 +7,8 @@ import org.jspecify.annotations.Nullable;
 
 /**
  * {@code Authorization: Bearer <token>} (RFC 6750) with static tokens: the token is
- * matched against each of the route's.
+ * matched against each of the route's. A refused token is answered
+ * {@code error="invalid_token"}.
  */
 final class BearerScheme implements CredentialScheme {
 
@@ -52,6 +53,11 @@ final class BearerScheme implements CredentialScheme {
 	@Override
 	public String challenge(String realm) {
 		return "Bearer " + realm;
+	}
+
+	@Override
+	public String refusal(String realm) {
+		return challenge(realm) + ", error=\"invalid_token\"";
 	}
 
 	@Override
