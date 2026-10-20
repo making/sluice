@@ -362,7 +362,9 @@ class TunnelStallWatchdogE2ETest {
 		assertThat(Duration.ofNanos(System.nanoTime() - stallStart)).as("held until the watchdog fired")
 			.isGreaterThanOrEqualTo(TIMEOUT);
 		assertThat(waited).as("answered within the timeout and its check").isLessThan(TIMEOUT.plusSeconds(4));
-		assertThat(answer).as("route b's leg failed with the session: the connection is closed").isEmpty();
+		assertThat(new String(answer, StandardCharsets.US_ASCII))
+			.as("route b's leg failed with the session before answering: a 502, then the connection's end")
+			.startsWith("HTTP/1.1 502 Bad Gateway\r\n");
 		Awaitility.await()
 			.atMost(Duration.ofSeconds(5))
 			.alias("the watchdog failed the session")

@@ -381,12 +381,16 @@ class MalformedRequestE2ETest {
 	}
 
 	@Test
-	void anUpstreamGoneWhileAnEarlierResponseIsAwaitedClosesTheConnectionWithNo400() throws Exception {
+	void anUpstreamGoneWhileAnEarlierResponseIsAwaitedAnswersItWith502AndNo400() throws Exception {
 		try (Socket socket = connect()) {
 			byte[] close = ascii("GET /close HTTP/1.1\r\nHost: " + ECHO_HOST + "\r\n\r\n");
 			byte[] malformed = ascii("GET / HTTP/1.1\r\nHost: " + ECHO_HOST + "\r\nContent-Length: -1\r\n\r\n");
 			write(socket, concat(close, malformed));
-			TestSockets.awaitClosed(socket, CLOSED_WITHIN);
+			socket.setSoTimeout((int) CLOSED_WITHIN.toMillis());
+			String answer = new String(socket.getInputStream().readAllBytes(), StandardCharsets.US_ASCII);
+			assertThat(answer).as("the 502 for the lost request, then the connection's end")
+				.startsWith("HTTP/1.1 502 Bad Gateway\r\n")
+				.doesNotContain("400");
 		}
 		awaitAdmitted(0);
 	}

@@ -21,3 +21,12 @@ a reset. A first request head with a `Host` header but no valid request line is
 answered 400 too. A response whose framing the relay cannot follow (a head over 64KiB or
 without a status code, an invalid `Content-Length` or chunk-size line) is relayed as an
 unframed one: it ends, and the connection with it, when the upstream closes.
+
+A request whose upstream connection ends before any of its response was relayed -- the
+client's dial failed (refused, timed out, the TLS handshake failed), or the upstream closed
+or failed the connection -- is answered `502 Bad Gateway` with `Connection: close`, and the
+connection ends as after a malformed request, lingering so the 502 is not lost to a reset.
+Only the first request of an upstream connection gets the 502: a later one, on the
+connection reused, may have met the upstream closing it as idle, so the client connection
+ends unanswered as the upstream's did, and the client may retry the request (RFC 9112
+9.3.1). A response begun is never followed by a 502; the connection just ends.

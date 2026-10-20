@@ -36,14 +36,15 @@ import am.ik.sluice.server.auth.Verdict;
  * page with the route's {@code WWW-Authenticate} challenges for a request without its
  * credentials, the 503 busy page with {@code Retry-After} for a request whose credentials
  * could not be checked for the checks in flight, a bare HTTP/1.1 400 for a malformed
- * request, the HTTP/2 502 page for a stream its upstream lost, a bodiless HTTP/2 421 for
- * a stream of a route reached over HTTP/1.1 only, a GOAWAY {@code COMPRESSION_ERROR} for
- * an HTTP/2 head whose header block does not decode, a GOAWAY processing no stream for an
- * HTTP/2 connection whose relay does not fit, and the 503 busy page with
- * {@code Retry-After} for a request past the connection limit. The default error is a
- * problem details document (RFC 9457, {@code application/problem+json})
- * ({@link ConnectionHeadParser.Head.Request#json}); only a request whose {@code Accept}
- * names {@code text/html} gets the page in place of it; the headers stay headers.
+ * request, the 502 page for a request its upstream lost before answering (HTTP/1.1: on
+ * its connection; HTTP/2: on its stream), a bodiless HTTP/2 421 for a stream of a route
+ * reached over HTTP/1.1 only, a GOAWAY {@code COMPRESSION_ERROR} for an HTTP/2 head whose
+ * header block does not decode, a GOAWAY processing no stream for an HTTP/2 connection
+ * whose relay does not fit, and the 503 busy page with {@code Retry-After} for a request
+ * past the connection limit. The default error is a problem details document (RFC 9457,
+ * {@code application/problem+json}) ({@link ConnectionHeadParser.Head.Request#json});
+ * only a request whose {@code Accept} names {@code text/html} gets the page in place of
+ * it; the headers stay headers.
  */
 @Component
 public class ErrorResponse {
@@ -81,7 +82,7 @@ public class ErrorResponse {
 		this.forbidden = new Page(compiler.loadTemplate("proxy/forbidden"), "403 Forbidden",
 				"This address is not allowed to access this host.");
 		this.badGateway = new Page(compiler.loadTemplate("proxy/bad-gateway"), "502 Bad Gateway",
-				"The upstream closed the connection before answering.");
+				"The upstream ended before answering.");
 		this.busy = new Page(compiler.loadTemplate("proxy/busy"), "503 Service Unavailable",
 				"The server is at its connection limit.");
 		this.unauthorized = new Page(compiler.loadTemplate("proxy/unauthorized"), "401 Unauthorized",
@@ -157,6 +158,15 @@ public class ErrorResponse {
 	 */
 	public byte[] forbidden(ConnectionHeadParser.Head head) {
 		return this.render(head, this.forbidden);
+	}
+
+	/**
+	 * The HTTP/1.1 answer to a request its upstream lost before answering -- the dial
+	 * failed, or the upstream connection ended or failed first: the bad-gateway page, a
+	 * {@code 502}; bare for a request whose request line did not parse.
+	 */
+	public byte[] badGateway(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request) {
+		return request == null ? bare(this.badGateway) : this.http1(host, request, this.badGateway);
 	}
 
 	/**
@@ -289,11 +299,11 @@ public class ErrorResponse {
 		if (head.request() == null) {
 			return bare(page);
 		}
-		return this.http1(head, head.request(), page);
+		return this.http1(head.host(), head.request(), page);
 	}
 
-	private byte[] http1(ConnectionHeadParser.Head head, ConnectionHeadParser.Head.Request request, Page page) {
-		byte[] body = this.page(head, page);
+	private byte[] http1(@Nullable String host, ConnectionHeadParser.Head.Request request, Page page) {
+		byte[] body = this.page(host, request, page);
 		StringBuilder headers = new StringBuilder();
 		for (Header header : page.line().headers()) {
 			headers.append(header.name()).append(": ").append(header.value()).append("\r\n");

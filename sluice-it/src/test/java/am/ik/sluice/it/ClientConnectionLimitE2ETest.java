@@ -2,6 +2,7 @@ package am.ik.sluice.it;
 
 import java.io.IOException;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Objects;
 
@@ -91,8 +92,11 @@ class ClientConnectionLimitE2ETest {
 			assertThat(gauge("sluice.connections.admitted")).isEqualTo(1);
 			int accepted = upstream().accepted();
 			try (Socket second = new Socket("127.0.0.1", dataPort)) {
+				second.setSoTimeout(5000);
 				second.getOutputStream().write(TestSockets.get("held.local"));
-				TestSockets.awaitClosed(second, Duration.ofSeconds(5));
+				// the refused connect loses the request: a 502, then the connection's end
+				assertThat(new String(second.getInputStream().readAllBytes(), StandardCharsets.US_ASCII))
+					.startsWith("HTTP/1.1 502 Bad Gateway\r\n");
 			}
 			assertThat(rejected()).isEqualTo(1);
 			assertThat(upstream().accepted()).as("not dialed").isEqualTo(accepted);

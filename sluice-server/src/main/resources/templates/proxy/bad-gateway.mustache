@@ -193,7 +193,7 @@
       <h1>The upstream lost this request</h1>
       {{#host}}<p class="lede">The upstream of <span class="mono">{{host}}</span> ended before it answered.</p>{{/host}}
       {{^host}}<p class="lede">The upstream ended before it answered.</p>{{/host}}
-      <p class="hint">Its connection closed, failed or broke the HTTP/2 protocol; the request may have reached it.</p>
+      <p class="hint">It could not be reached, or its connection closed, failed or broke the protocol; the request may have reached it.</p>
     </div>
   </div>
 

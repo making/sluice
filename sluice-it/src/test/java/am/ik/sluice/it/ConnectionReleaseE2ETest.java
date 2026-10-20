@@ -2,10 +2,12 @@ package am.ik.sluice.it;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.StandardSocketOptions;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
@@ -72,6 +74,9 @@ class ConnectionReleaseE2ETest {
 
 	private static int deniedTcpRoutePort;
 
+	/** Reserved and never bound: a dial to it is refused. */
+	private static int refusingPort;
+
 	private static @Nullable HoldingUpstream upstream;
 
 	/** Never accepts: its backlog completes the TCP connect, nothing answers after. */
@@ -111,6 +116,7 @@ class ConnectionReleaseE2ETest {
 		dataPort = TestPorts.freePort();
 		tcpRoutePort = TestPorts.freePort();
 		deniedTcpRoutePort = TestPorts.freePort();
+		refusingPort = TestPorts.freePort();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.tcp-port-range", () -> tcpRoutePort + "," + deniedTcpRoutePort);
@@ -140,6 +146,7 @@ class ConnectionReleaseE2ETest {
 				.host("tls-held.local")
 				.target("https://127.0.0.1:" + Objects.requireNonNull(silentUpstream).getLocalPort())
 				.build())
+			.upstream(Upstream.builder().host("refused.local").target("http://127.0.0.1:" + refusingPort).build())
 			.upstream(Upstream.builder().host("held.tcp").target("tcp://" + target).listenPort(tcpRoutePort).build())
 			.upstream(Upstream.builder()
 				.host("denied.tcp")
@@ -311,19 +318,83 @@ class ConnectionReleaseE2ETest {
 
 	/**
 	 * The client's dial of an https upstream that never answers the TLS handshake fails
-	 * at the client's connect timeout: the connection ends and releases its slot.
+	 * at the client's connect timeout: the request is answered 502, the connection ends
+	 * and releases its slot.
 	 */
 	@Test
-	void aTlsUpstreamNeverAnsweringReleasesTheSlotAtTheClientsConnectTimeout() throws Exception {
+	void aTlsUpstreamNeverAnsweringIsAnswered502AtTheClientsConnectTimeout() throws Exception {
+		// well inside the default connect timeout of 10s
+		assertThat(assertAnswered502AndReleased("tls-held.local", 0, false)).isGreaterThanOrEqualTo(CONNECT_TIMEOUT);
+	}
+
+	/**
+	 * The client's dial of an upstream that refuses the connection fails while the client
+	 * still uploads its request body: the request is answered 502, and the body's rest is
+	 * read, not left to reset the answer.
+	 */
+	@Test
+	void aRefusedUpstreamIsAnswered502() throws Exception {
+		assertAnswered502AndReleased("refused.local", 512 * 1024, false);
+	}
+
+	/**
+	 * The upstream reads the whole request, then closes without answering: the first
+	 * request of the upstream connection is answered 502; a later one ends the connection
+	 * unanswered, as the reused upstream connection did, so the client may retry it.
+	 */
+	@Test
+	void anUpstreamClosingUnansweredIsAnswered502OnItsFirstRequestOnly() throws Exception {
+		// the holding upstream takes a request other than GET to its end, then closes
+		assertAnswered502AndReleased("held.local", 16, true);
+
 		int before = baseline();
-		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
-			socket.getOutputStream().write(TestSockets.get("tls-held.local"));
-			long start = System.nanoTime();
-			// well inside the default connect timeout of 10s
-			TestSockets.awaitClosed(socket, Duration.ofSeconds(5));
-			assertThat(Duration.ofNanos(System.nanoTime() - start)).isGreaterThanOrEqualTo(CONNECT_TIMEOUT);
+		try (Socket socket = TestSockets.establish(dataPort, NONE, "held.local")) {
+			socket.getOutputStream()
+				.write("POST / HTTP/1.1\r\nHost: held.local\r\nContent-Length: 0\r\n\r\n"
+					.getBytes(StandardCharsets.US_ASCII));
+			socket.shutdownOutput();
+			assertThat(socket.getInputStream().readAllBytes()).as("after the GET's 200").isEmpty();
 		}
 		awaitReleased(before);
+	}
+
+	/**
+	 * Sends a request to {@code host} -- a POST of {@code bodyLength} bytes, written
+	 * while the answer is read, or a GET without one -- and half-closes the connection
+	 * after it when {@code endRequest}; asserts the whole 502 arrives, then the
+	 * connection's end. Returns how long the 502 took.
+	 */
+	private Duration assertAnswered502AndReleased(String host, int bodyLength, boolean endRequest) throws Exception {
+		int before = baseline();
+		Duration took;
+		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+			socket.setSoTimeout(5000);
+			OutputStream out = socket.getOutputStream();
+			long start = System.nanoTime();
+			out.write((bodyLength == 0 ? new String(TestSockets.get(host), StandardCharsets.US_ASCII)
+					: "POST / HTTP/1.1\r\nHost: " + host + "\r\nContent-Length: " + bodyLength + "\r\n\r\n")
+				.getBytes(StandardCharsets.US_ASCII));
+			Thread upload = Thread.ofVirtual().start(() -> {
+				try {
+					out.write(new byte[bodyLength]);
+					if (endRequest) {
+						socket.shutdownOutput();
+					}
+				}
+				catch (IOException e) {
+					throw new UncheckedIOException(e);
+				}
+			});
+			// the whole answer, then the end of the connection
+			String response = new String(socket.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+			took = Duration.ofNanos(System.nanoTime() - start);
+			assertThat(response).startsWith("HTTP/1.1 502 Bad Gateway\r\n")
+				.contains("Content-Type: application/problem+json\r\n", "Connection: close\r\n")
+				.endsWith("\"status\":502,\"detail\":\"The upstream ended before answering.\"}");
+			assertThat(upload.join(Duration.ofSeconds(5))).as("the upload ended").isTrue();
+		}
+		awaitReleased(before);
+		return took;
 	}
 
 	private void assertAnsweredAndReleased(String host, String status) throws Exception {

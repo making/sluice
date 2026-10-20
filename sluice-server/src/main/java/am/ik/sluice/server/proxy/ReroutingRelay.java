@@ -43,9 +43,14 @@ import io.micrometer.core.instrument.MeterRegistry;
  * frames still queued for the old one left the tunnel sender, so the connection's slot of
  * the connection limit never covers the send queues of two legs. The closure of the leg
  * in charge by its upstream ends the whole relay, as does any failure; the slot is
- * released once the relay ended and every leg's queued frames left. Each leg pumps its
- * inbound side on its own virtual thread for the lifetime of its virtual connection; a
- * leg closed by the relay leaves its tunnel session at once.
+ * released once the relay ended and every leg's queued frames left. A leg in charge that
+ * ends -- its dial failed, or its upstream closed or failed -- before any of a response
+ * to its first request was relayed gets the client the bad-gateway page ({@code 502}) in
+ * place of it; the connection then ends as after a refused request. A later request of
+ * the leg lost the same way is not answered: the client sees its connection end, as it
+ * would see the upstream's, and may retry the request. Each leg pumps its inbound side on
+ * its own virtual thread for the lifetime of its virtual connection; a leg closed by the
+ * relay leaves its tunnel session at once.
  * <p>
  * A leg in charge whose client withdrew ({@link TunnelSession#withdrawn()}) is retired at
  * the first request boundary -- no response owed, nothing of a next request read, the
@@ -209,8 +214,10 @@ final class ReroutingRelay {
 	private final HeadSeam headSeam;
 
 	/**
-	 * A malformed request was rejected: the legs relay nothing more to the client, and
-	 * their end leaves the client connection to the linger; set with {@link #sinkLock}.
+	 * A malformed request was rejected, or the leg in charge lost a request and the 502
+	 * answered it: the legs relay nothing more to the client, nothing more is relayed to
+	 * them, and their end leaves the client connection to the linger; set with
+	 * {@link #sinkLock}.
 	 */
 	private volatile boolean rejected;
 
@@ -220,6 +227,9 @@ final class ReroutingRelay {
 	private final AtomicInteger pending = new AtomicInteger(1);
 
 	private final AtomicBoolean finished = new AtomicBoolean();
+
+	/** The relay was torn down ({@link #abort}): a leg's end is not answered. */
+	private volatile boolean aborted;
 
 	private boolean firstHead = true;
 
@@ -314,6 +324,11 @@ final class ReroutingRelay {
 			byte[] buffer = new byte[BUFFER_SIZE];
 			int n;
 			while ((n = readClient(in, buffer)) > 0) {
+				if (this.rejected) {
+					// a lost request was answered: nothing more is relayed
+					linger();
+					return;
+				}
 				if (!feeding()) {
 					// the deadline passed before these bytes arrived: the connection is
 					// being closed, and its request must not reach an upstream
@@ -340,8 +355,16 @@ final class ReroutingRelay {
 			}
 		}
 		catch (Exception e) {
-			log.debug("rerouting relay: relaying the client's requests failed; aborting", e);
-			abort();
+			if (this.rejected) {
+				// answered already: what the client still sends must not reset the answer
+				log.debug("rerouting relay: relaying the client's requests failed after the answer; lingering", e);
+				closeLegs();
+				linger();
+			}
+			else {
+				log.debug("rerouting relay: relaying the client's requests failed; aborting", e);
+				abort();
+			}
 		}
 		finally {
 			settle();
@@ -402,7 +425,7 @@ final class ReroutingRelay {
 			try {
 				// the inbound side writes and tracks under this lock: the decision holds
 				// until the probe is written
-				if (leg.probeable()) {
+				if (!this.rejected && leg.probeable()) {
 					this.probeSeam.decided(this);
 					writeToClient(PROBE, 0, PROBE.length);
 					probes++;
@@ -563,9 +586,7 @@ final class ReroutingRelay {
 		finally {
 			this.sinkLock.unlock();
 		}
-		for (Leg each : this.legs) {
-			each.close();
-		}
+		closeLegs();
 		linger();
 	}
 
@@ -573,14 +594,19 @@ final class ReroutingRelay {
 	 * Half-closes the client connection and reads what the client still sends, for up to
 	 * {@link #LINGER} and {@link #LINGER_LIMIT}, then closes it: closing with unread
 	 * bytes would reset the connection and discard the response before the client reads
-	 * it.
+	 * it. The half-close waits for a write to the client in progress: the 502 for a lost
+	 * request is written on a leg's inbound side.
 	 */
 	private void linger() {
+		this.sinkLock.lock();
 		try {
 			this.pipe.shutdownOutput();
 		}
 		catch (Exception e) {
 			// a transport without half-close: the client closes after the response
+		}
+		finally {
+			this.sinkLock.unlock();
 		}
 		Thread closer = Thread.ofVirtual().name("sluice-reroute-linger").start(() -> {
 			try {
@@ -600,8 +626,8 @@ final class ReroutingRelay {
 				drained += n;
 			}
 		}
-		catch (IOException e) {
-			// closed by the linger's end or the client
+		catch (IOException | RuntimeException e) {
+			// closed by the linger's end, the client, or a lost request's closer
 		}
 		finally {
 			closer.interrupt();
@@ -619,8 +645,8 @@ final class ReroutingRelay {
 	}
 
 	private void onRequestHead(byte[] head, @Nullable String host) {
-		if (this.refusal != null) {
-			return; // a request refused before: nothing after it is relayed
+		if (this.refusal != null || this.rejected) {
+			return; // a request refused or lost before: nothing after it is relayed
 		}
 		Resolved resolved;
 		if (this.firstHead) {
@@ -651,6 +677,9 @@ final class ReroutingRelay {
 			if (old != null && !old.ended) {
 				old.replaced = true; // its EOF from now on is the switch, not the end
 				this.awaitDrained(old);
+				if (this.rejected) {
+					return; // it lost a request, answered 502: the connection ends
+				}
 				if (resolved.session().withdrawn()) {
 					// its client began shutting down while the old leg finished: the
 					// request goes to a client staying
@@ -687,7 +716,7 @@ final class ReroutingRelay {
 		if (closesConnection(head)) {
 			leg.closing = true;
 		}
-		leg.requestSent(request, Http1RequestParser.isUpgrade(head));
+		leg.requestSent(host, request, Http1RequestParser.isUpgrade(head));
 		this.lastRequest = System.nanoTime();
 		byte[] stripped = ConnectionHeadRewriter.withoutHeaders(head, pass.strip());
 		byte[] relayed = route.rewriteHost() ? ConnectionHeadRewriter.rewriteHttp1(stripped, route.address())
@@ -700,8 +729,9 @@ final class ReroutingRelay {
 
 	private void onRequestData(byte[] bytes, int offset, int length) {
 		Leg leg = this.current;
-		if (leg == null || this.refusal != null) {
-			return; // no head relayed yet, or the request refused: its body stays here
+		if (leg == null || this.refusal != null || this.rejected) {
+			// no head relayed yet, or the request refused or lost: its body stays here
+			return;
 		}
 		if (length > 0) {
 			this.continueAwaited = false; // the client sends its body without the 100
@@ -814,6 +844,9 @@ final class ReroutingRelay {
 
 		private volatile boolean replaced;
 
+		/** A write towards the upstream failed; outbound side only. */
+		private boolean sinkFailed;
+
 		/**
 		 * A request or response relayed on the leg asked to close the connection after
 		 * its exchange: the upstream's close ends the relay, the leg is not retired.
@@ -847,13 +880,24 @@ final class ReroutingRelay {
 				.start(() -> pumpInbound(this));
 		}
 
-		/** Relays request bytes towards the upstream. */
+		/**
+		 * Relays request bytes towards the upstream. Once a write failed -- the virtual
+		 * connection was closed or failed, or the tunnel stream ended, each of which ends
+		 * its inbound side too -- the bytes are dropped: the leg's end is told by its
+		 * inbound side ({@link #lose}), which may still owe the client a response.
+		 */
 		void toUpstream(byte[] bytes, int offset, int length) {
+			if (this.sinkFailed) {
+				return;
+			}
 			try {
 				this.connection.sink().write(bytes, offset, length);
 			}
 			catch (Exception e) {
-				throw new IllegalStateException(e);
+				this.sinkFailed = true;
+				log.debug("rerouting relay: relaying a request to connection {} (route {}) failed; dropping its rest",
+						this.connection.connectionId(), this.route.routeTag(), e);
+				return;
 			}
 			this.inbound.increment(length);
 			this.session.recordRelayed(length, StreamRelay.Direction.TO_REMOTE);
@@ -899,11 +943,10 @@ final class ReroutingRelay {
 			}
 		}
 
-		void requestSent(ConnectionHeadParser.Head.@Nullable Request request, boolean upgrade) {
+		void requestSent(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request, boolean upgrade) {
 			synchronized (this) {
 				this.sent++;
-				this.unanswered.addLast(new Sent(request == null ? "" : request.method(),
-						request == null ? "" : request.version(), upgrade));
+				this.unanswered.addLast(new Sent(host, request, upgrade));
 				if (upgrade) {
 					this.upgradeAwaited = true;
 					this.upgradeAnswer = null;
@@ -920,6 +963,19 @@ final class ReroutingRelay {
 			synchronized (this) {
 				Sent next = this.unanswered.peekFirst();
 				return !this.ended && next != null && "1.1".equals(next.version()) && this.tracker.atResponseStart();
+			}
+		}
+
+		/**
+		 * The leg's first request while none of a response to it was relayed; null once a
+		 * response has begun or completed. A request after it found the upstream
+		 * connection reused, which its upstream may have closed as idle as the request
+		 * came. With the sink lock held.
+		 */
+		@Nullable Sent firstUnanswered() {
+			synchronized (this) {
+				Sent first = this.unanswered.peekFirst();
+				return first != null && this.completed == 0 && this.tracker.atResponseStart() ? first : null;
 			}
 		}
 
@@ -1078,10 +1134,19 @@ final class ReroutingRelay {
 	}
 
 	/**
-	 * A request relayed on a leg: its method, its HTTP version, and whether it asked for
-	 * an upgrade.
+	 * A request relayed on a leg: its host, its request line (null for one that does not
+	 * parse), and whether it asked for an upgrade.
 	 */
-	private record Sent(String method, String version, boolean upgrade) {
+	private record Sent(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request, boolean upgrade) {
+
+		String method() {
+			return this.request == null ? "" : this.request.method();
+		}
+
+		String version() {
+			return this.request == null ? "" : this.request.version();
+		}
+
 	}
 
 	/**
@@ -1126,19 +1191,85 @@ final class ReroutingRelay {
 				log.debug(
 						"rerouting relay: the upstream of connection {} (route {}) in charge ended it; ending the relay",
 						leg.connection.connectionId(), leg.route.routeTag());
-				abort();
+				lose(leg);
 			}
 		}
 		catch (Exception e) {
 			if (!this.rejected) {
 				log.debug("rerouting relay: relaying the responses of connection {} (route {}) failed; aborting",
 						leg.connection.connectionId(), leg.route.routeTag(), e);
-				abort();
+				if (this.current == leg && !leg.replaced) {
+					lose(leg);
+				}
+				else {
+					abort();
+				}
 			}
 		}
 		finally {
 			leg.markEnded();
 			settle();
+		}
+	}
+
+	/**
+	 * The leg in charge ended: its first request, when none of a response to it was
+	 * relayed, is answered with the bad-gateway page, the legs are closed, and the client
+	 * connection is half-closed and closed after {@link #LINGER} unless the outbound
+	 * side's linger or the relay's end closes it first, so the client reads the answer
+	 * rather than a reset. Otherwise, or should the answer fail, the relay is aborted: a
+	 * later request lost unanswered ends the client connection unanswered, as its reused
+	 * upstream connection did, so the client may retry it (RFC 9112 9.3.1). Nothing is
+	 * done once a refusal was answered or the relay was aborted.
+	 */
+	private void lose(Leg leg) {
+		this.sinkLock.lock();
+		try {
+			if (this.rejected || this.aborted) {
+				// a refusal was answered meanwhile, and the linger ends the connection;
+				// or
+				// the relay was torn down, the leg with it
+				return;
+			}
+			Sent lost = leg.firstUnanswered();
+			if (lost == null) {
+				abort();
+				return;
+			}
+			this.rejected = true;
+			byte[] answer = this.errorResponse.badGateway(lost.host(), lost.request());
+			writeToClient(answer, 0, answer.length);
+		}
+		catch (Exception e) {
+			log.debug("rerouting relay: answering the request connection {} (route {}) lost failed; aborting",
+					leg.connection.connectionId(), leg.route.routeTag(), e);
+			abort();
+			return;
+		}
+		finally {
+			this.sinkLock.unlock();
+		}
+		closeLegs();
+		try {
+			this.pipe.shutdownOutput();
+		}
+		catch (Exception e) {
+			// a transport without half-close: the client closes after the response
+		}
+		Thread.ofVirtual().name("sluice-reroute-linger").start(() -> {
+			try {
+				Thread.sleep(LINGER);
+			}
+			catch (InterruptedException e) {
+				// closed now
+			}
+			closePipe();
+		});
+	}
+
+	private void closeLegs() {
+		for (Leg leg : this.legs) {
+			leg.close();
 		}
 	}
 
@@ -1170,9 +1301,8 @@ final class ReroutingRelay {
 
 	/** Tears the relay down after a failure or a final error response. */
 	private void abort() {
-		for (Leg leg : this.legs) {
-			leg.close();
-		}
+		this.aborted = true; // before the legs' close wakes their inbound sides
+		closeLegs();
 		try {
 			this.pipe.close();
 		}
@@ -1294,12 +1424,16 @@ final class ReroutingRelay {
 			return this.mode == Mode.HEAD && this.head.size() == 0;
 		}
 
-		/** The upstream half-closed: an unframed or truncated response ends here. */
+		/**
+		 * The upstream half-closed: an unframed or truncated response ends here; at a
+		 * response start the tracker stays there, for the request owed to be answered 502
+		 * ({@link #lose}).
+		 */
 		void ended() {
-			if (this.mode != Mode.PASS && !(this.mode == Mode.HEAD && this.head.size() == 0)) {
+			if (this.mode != Mode.PASS && !this.atResponseStart()) {
 				this.leg.responseCompleted();
+				this.mode = Mode.PASS;
 			}
-			this.mode = Mode.PASS;
 		}
 
 		private void onHeadByte() {
