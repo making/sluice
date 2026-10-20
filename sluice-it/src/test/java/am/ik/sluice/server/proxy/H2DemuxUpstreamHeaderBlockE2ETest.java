@@ -507,8 +507,9 @@ class H2DemuxUpstreamHeaderBlockE2ETest {
 	 * ({@code REFUSED_STREAM}); the upstream gets just the admitted ones. Heads of a host
 	 * no route serves, from a client granting no stream window, are answered with the
 	 * no-route page as far as the pages, held for the window, fit, and refused past it;
-	 * the upstream going away then loses the stream it has, whose bad-gateway page does
-	 * not fit either: the stream is reset ({@code ENHANCE_YOUR_CALM}).
+	 * the upstream going away then loses the stream it has: its bad-gateway page beyond
+	 * the budget, the stream is reset ({@code ENHANCE_YOUR_CALM}); a page within it waits
+	 * for the client's window, and arrives once the client grants one.
 	 */
 	@ParameterizedTest
 	@EnumSource(Target.class)
@@ -527,7 +528,7 @@ class H2DemuxUpstreamHeaderBlockE2ETest {
 			}
 		}));
 		double refusedBefore = refused("budget");
-		try (H2TestClient client = H2TestClient.connect(dataPort, 3)) {
+		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
 			client.headers(1, false, get(route));
 			Awaitility.await().atMost(TIMEOUT).until(() -> heads.get() == 1);
 			String host = target == Target.ROUTED ? route : route("unrouted");
@@ -564,20 +565,38 @@ class H2DemuxUpstreamHeaderBlockE2ETest {
 						client.resets().values().stream().filter(code -> code == TestH2.REFUSED_STREAM).count())
 					.isEqualTo(streams - admitted));
 			if (target == Target.UNROUTED) {
-				double resetsBefore = resets("budget");
-				// the bad-gateway page for the leg's stream must not be admitted: the
-				// budget spent, the page is refused with the stream
+				// the budget spent, the leg's stream is lost with its bad-gateway page
+				// refused for the budget's want (ENHANCE_YOUR_CALM), or admitted to the
+				// client's queue, waiting for its window: opened, the page arrives
 				H2DemuxBudget budget = Objects.requireNonNull(this.limits).h2Budget();
 				long exhausting = budget.max();
 				budget.charge(exhausting);
+				IOException failure = null;
 				try {
 					Objects.requireNonNull(leg.get()).abort();
-					assertThat(client.awaitTrue(() -> client.reset(1) != null, TIMEOUT)).as("stream 1 lost").isTrue();
-					assertThat(client.reset(1)).isEqualTo(ENHANCE_YOUR_CALM);
-					assertThat(resets("budget")).isEqualTo(resetsBefore + 1);
+					client.frame(TestH2.WINDOW_UPDATE, 0, 0, TestH2.int32(2 * KIB));
+					client.frame(TestH2.WINDOW_UPDATE, 0, 1, TestH2.int32(2 * KIB));
+					Awaitility.await()
+						.atMost(TIMEOUT)
+						.until(() -> client.ended(1) || Objects.equals(client.reset(1), ENHANCE_YOUR_CALM));
+				}
+				catch (IOException e) {
+					failure = e;
 				}
 				finally {
 					budget.release(exhausting);
+				}
+				if (failure != null) {
+					throw failure;
+				}
+				if (!Objects.equals(client.reset(1), ENHANCE_YOUR_CALM)) {
+					TestH2.Frame head = client.frames(1)
+						.stream()
+						.filter(frame -> frame.type() == TestH2.HEADERS)
+						.findFirst()
+						.orElseThrow();
+					assertThat(String.valueOf(decode(1, head.payload()).status())).as("the page instead")
+						.isEqualTo("502");
 				}
 			}
 			assertThat(client.closed()).isFalse();
