@@ -1,7 +1,7 @@
 # sluice-flume as a static musl binary on distroless static. The proto lives in
 # sluice-proto, so the build context is the repository root:
 #   docker build -f sluice-flume/Dockerfile .
-FROM rust:1.96-alpine AS build
+FROM rust:1.99-alpine AS build
 RUN apk add --no-cache musl-dev protoc
 WORKDIR /src
 COPY sluice-proto/src/main/proto sluice-proto/src/main/proto

@@ -1,0 +1,6 @@
+# Pinned so CI lints and builds with the toolchain used locally (the guests in
+# examples/ pin their own nightly);
+# a newer clippy brings new findings with each release.
+[toolchain]
+channel = "1.99"
+components = ["rustfmt", "clippy"]

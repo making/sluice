@@ -96,6 +96,8 @@
 						</goals>
 						<configuration>
 							<skip>${skipTests}</skip>
+							<!-- in the crate, so rustup picks its rust-toolchain.toml -->
+							<workingDirectory>${sluice.flume.dir}</workingDirectory>
 							<executable>cargo</executable>
 							<arguments>
 								<argument>build</argument>

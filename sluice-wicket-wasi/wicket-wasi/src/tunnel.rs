@@ -424,7 +424,7 @@ impl Limit {
     /// A slot for one more connection, or None when `max` are open.
     pub fn try_acquire(self: &Arc<Self>) -> Option<Permit> {
         self.open
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |open| {
                 (open < self.max).then_some(open + 1)
             })
             .ok()
@@ -1704,8 +1704,9 @@ mod tests {
         outbound.marker(1, close_frame(1));
         // frames queued later, none taken, do not move the clock on
         let producer = outbound.clone();
+        // aborted after the STALL * 2 wait below, some 20 frames in
         let more = tokio::spawn(async move {
-            for conn_id in 2.. {
+            for conn_id in 2..100 {
                 tokio::time::sleep(STALL / 10).await;
                 producer.data(conn_id, data_frame(conn_id, 1));
             }

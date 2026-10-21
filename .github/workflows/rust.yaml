@@ -1,7 +1,8 @@
 name: Rust
 # The Rust crates' own gates, apart from CI: a Java-only change runs none of them, and
 # each crate's job runs only when its paths changed. CI still builds sluice-flume for the
-# sluice-it tests; deploy.yaml follows CI only.
+# sluice-it tests. A run with the sluice-flume job passed deploys its image
+# (deploy-flume.yaml).
 on:
   push:
     branches:
@@ -11,6 +12,7 @@ on:
     - 'sluice-wicket-wasi/**'
     - 'sluice-proto/src/main/proto/**'
     - '.github/workflows/rust.yaml'
+    - '.github/workflows/deploy-flume.yaml'
   pull_request:
     branches:
     - main
@@ -41,6 +43,7 @@ jobs:
           - 'sluice-flume/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
+          - '.github/workflows/deploy-flume.yaml'
           wicket:
           - 'sluice-wicket-wasi/**'
           - 'sluice-proto/src/main/proto/**'
@@ -58,22 +61,23 @@ jobs:
       uses: actions/checkout@v4
     - name: Install protoc
       run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends protobuf-compiler
+    # the toolchain rust-toolchain.toml pins
     - name: Toolchain
-      run: rustup component add rustfmt clippy
+      run: rustup toolchain install
     - uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
           sluice-flume/target
-        key: cargo-flume-${{ runner.os }}-${{ hashFiles('sluice-flume/Cargo.lock') }}
+        key: cargo-flume-${{ runner.os }}-${{ hashFiles('sluice-flume/Cargo.lock', 'sluice-flume/rust-toolchain.toml') }}
     - name: Format
       run: cargo fmt --check
     - name: Clippy
       run: cargo clippy --all-targets --locked -- -D warnings
     - name: Test
       run: cargo test --locked
-  # The wicket builds on the stable toolchain; its tests build the example guests through
+  # The wicket builds on its pinned stable toolchain; its tests build the example guests through
   # the rustup cargo proxy in examples/, pinned to a nightly with wasm32-wasip3
   # (examples/rust-toolchain.toml).
   sluice-wicket-wasi:
@@ -93,14 +97,15 @@ jobs:
       with:
         path: |
           ~/.rustup/toolchains/nightly-*
+          ~/.rustup/toolchains/1.*
           ~/.cargo/registry
           ~/.cargo/git
           sluice-wicket-wasi/target
           sluice-wicket-wasi/examples/target
-        key: cargo-wicket-${{ runner.os }}-${{ hashFiles('sluice-wicket-wasi/Cargo.lock', 'sluice-wicket-wasi/examples/Cargo.lock', 'sluice-wicket-wasi/examples/rust-toolchain.toml') }}
+        key: cargo-wicket-${{ runner.os }}-${{ hashFiles('sluice-wicket-wasi/Cargo.lock', 'sluice-wicket-wasi/examples/Cargo.lock', 'sluice-wicket-wasi/rust-toolchain.toml', 'sluice-wicket-wasi/examples/rust-toolchain.toml') }}
     - name: Toolchains
       run: |
-        rustup component add rustfmt clippy
+        rustup toolchain install
         (cd examples && rustup toolchain install)
     - name: Format
       run: |

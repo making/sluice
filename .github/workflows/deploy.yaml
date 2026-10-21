@@ -33,7 +33,9 @@ jobs:
       revision: ${{ steps.target.outputs.revision }}
     steps:
     # Target: the newest successful CI push run on main. Skipped when the images branch
-    # already holds it or a newer commit, so an older commit never replaces a newer one.
+    # already holds it or a newer commit, so an older commit never replaces a newer one,
+    # and when nothing the images are built from changed since the deployed revision (CI
+    # also runs for sluice-flume, which deploy-flume.yaml deploys).
     - name: Pick the revision to deploy
       id: target
       env:
@@ -56,6 +58,14 @@ jobs:
         echo "triggered by: ${TRIGGER_SHA}, newest green: ${TARGET}, deployed: ${DEPLOYED//$'\n'/ }, target vs deployed: ${STATUS}" | tee -a "${GITHUB_STEP_SUMMARY}"
         case "${STATUS}" in
           identical|behind) echo "Skipped: ${TARGET} is not newer than the deployed revision" | tee -a "${GITHUB_STEP_SUMMARY}" ;;
+          ahead)
+            # the compare lists at most 300 files: a longer list counts as an image change
+            FILES=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${DEPLOYED}...${TARGET}" --jq 'if (.files | length) >= 300 then "TRUNCATED" else .files[].filename end')
+            if echo "${FILES}" | grep -qE '^(TRUNCATED$|pom\.xml$|mvnw|\.mvn/|sluice-proto/|sluice-server/|sluice-client/|\.github/workflows/deploy\.yaml$)'; then
+              echo "revision=${TARGET}" >> "${GITHUB_OUTPUT}"
+            else
+              echo "Skipped: nothing the images are built from changed since ${DEPLOYED}" | tee -a "${GITHUB_STEP_SUMMARY}"
+            fi ;;
           *) echo "revision=${TARGET}" >> "${GITHUB_OUTPUT}" ;;
         esac
   build-image:
@@ -188,99 +198,13 @@ jobs:
       with:
         name: ${{ matrix.app }}_${{ matrix.variant }}
         path: ${{ matrix.app }}_${{ matrix.variant }}.yaml
-  # sluice-flume: a Dockerfile build (a static Rust binary), not a buildpack one
-  build-flume-image:
-    needs: target
-    if: needs.target.outputs.revision != ''
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-        - { arch: amd64,   runs_on: ubuntu-latest }
-        - { arch: aarch64, runs_on: ubuntu-24.04-arm }
-    runs-on: ${{ matrix.runs_on }}
-    env:
-      REVISION: ${{ needs.target.outputs.revision }}
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      with:
-        ref: ${{ needs.target.outputs.revision }}
-    - name: Login to GitHub Container Registry
-      uses: docker/login-action@v3
-      with:
-        registry: ${{ env.REGISTRY }}
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    - name: Build and push image (sluice-flume / ${{ matrix.arch }})
-      env:
-        ARCH: ${{ matrix.arch }}
-      run: |
-        IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/sluice-flume | tr '[:upper:]' '[:lower:]')"
-        docker build -f sluice-flume/Dockerfile -t ${IMAGE}:${ARCH}_${REVISION} .
-        docker push ${IMAGE}:${ARCH}_${REVISION}
-        docker tag ${IMAGE}:${ARCH}_${REVISION} ${IMAGE}:${ARCH}
-        docker push ${IMAGE}:${ARCH}
-  push-flume-manifest:
-    needs:
-    - target
-    - build-flume-image
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      packages: write
-    runs-on: ubuntu-latest
-    env:
-      REVISION: ${{ needs.target.outputs.revision }}
-    steps:
-    - name: Login to GitHub Container Registry
-      uses: docker/login-action@v3
-      with:
-        registry: ${{ env.REGISTRY }}
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    - name: Create and push manifest
-      run: |
-        IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/sluice-flume | tr '[:upper:]' '[:lower:]')"
-        docker manifest create ${IMAGE}:${REVISION} \
-          --amend ${IMAGE}:amd64_${REVISION} \
-          --amend ${IMAGE}:aarch64_${REVISION}
-        docker manifest push ${IMAGE}:${REVISION}
-        docker manifest create ${IMAGE}:latest \
-          --amend ${IMAGE}:amd64_${REVISION} \
-          --amend ${IMAGE}:aarch64_${REVISION}
-        docker manifest push ${IMAGE}:latest
-    - name: Generate image file
-      run: |
-        IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/sluice-flume | tr '[:upper:]' '[:lower:]')"
-        DIGEST=$(docker buildx imagetools inspect ${IMAGE}:${REVISION} | awk '/^Digest:/{print $2}')
-        cat <<EOF > sluice-flume.yaml
-        image: ${IMAGE}@${DIGEST}
-        git_revision: ${REVISION}
-        deployment:
-          image:
-            repository: ${IMAGE}
-            digest: ${DIGEST}
-          podLabels:
-            github.com/revision: ${REVISION}
-        EOF
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: sluice-flume
-        path: sluice-flume.yaml
   # Same commits as categolj/workflows save-images.yaml (one per file), inlined because
   # that workflow names GITHUB_SHA in the message, which under workflow_run is the head of
-  # main rather than the deployed revision. One push, so the files move together.
+  # main rather than the deployed revision. One push, so the four files move together.
   save-image:
     needs:
     - target
     - push-manifest
-    - push-flume-manifest
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -301,7 +225,7 @@ jobs:
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
-        for f in sluice-server_jvm.yaml sluice-server_native.yaml sluice-client_jvm.yaml sluice-client_native.yaml sluice-flume.yaml; do
+        for f in sluice-server_jvm.yaml sluice-server_native.yaml sluice-client_jvm.yaml sluice-client_native.yaml; do
           git add "${f}"
           git diff --cached --quiet || git commit -m ":robot: Update ${f} for ${REVISION}"
         done

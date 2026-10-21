@@ -1,0 +1,5 @@
+# Pinned so CI lints and builds with the toolchain used locally and in the Dockerfile;
+# a newer clippy brings new findings with each release.
+[toolchain]
+channel = "1.99"
+components = ["rustfmt", "clippy"]
