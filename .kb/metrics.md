@@ -62,3 +62,9 @@ carry a `node` common tag. User-facing summary: README "Health / metrics".
 | `sluice_h2demux_streams_reset_total` | streams the relay reset on its own account, `reason` = `budget` (a header block that did not fit the budget) / `share` (one taking its connection's share past 6MiB) / `interim` (an upstream's interim heads past 64KiB) / `protocol` (netty's codec reset a client stream on its stream error) / `upstream` (the same on an upstream's stream); a frame on a stream no longer known is answered with a reset that does not count |
 | `sluice_h2demux_legs_failed_total` | upstream connections of an h2 connection ended by a connection error, with a GOAWAY of its code; a client or an upstream connection closing mid-stream counts in neither |
 | `sluice_h2demux_streams_misdirected_total` | streams answered `421`, `reason` = `force-http1` |
+
+## Grafana dashboard
+
+`GrafanaDashboardE2ETest` fails the build when a metric the dashboard (`dashboards/sluice.json`)
+queries is in neither the server's nor the client's scrape, or when a query does not select the
+label variables.

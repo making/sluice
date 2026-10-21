@@ -2,9 +2,72 @@
 
 HTTP tunnel over a gRPC bidirectional stream, built on Spring Boot 4.1 and Spring gRPC.
 
-A single gRPC bidi stream multiplexes virtual TCP connections (`conn_id`). The data plane is a raw TCP proxy: the request head is inspected for routing (Host / :authority), so WebSocket upgrades and HTTP keep-alive pass through transparently. Each virtual connection has its own flow control window, so a slow connection does not hold back the others on the stream.
+A tunnel client runs next to your services, behind NAT or a firewall, and connects out to the
+server. The server accepts the public traffic and routes it to the client's upstreams by Host
+header, TLS SNI or listen port. An upstream is a local service the client forwards to, such as a
+web app on `http://127.0.0.1:3000`.
+
+- HTTP/1.1 and h2 routed by `Host` / `:authority` on one port, with WebSocket and keep-alive passthrough
+- TLS termination, or TLS passthrough routed by SNI
+- raw TCP routes on their own listen ports (ssh, postgres, redis, ...)
+- route credentials (Basic, Bearer, API token, OIDC JWT) checked on the data plane
+- clustered servers, each with a full copy of the route table
+- a management console, and Prometheus metrics
+
+Setup: [Run](#run). How it works: [Architecture](#architecture). Options: [Configuration](#configuration-server).
+
+## Run
+
+```
+# terminal 1: upstream (sample server speaking http/1.1 and h2c on one port)
+java -jar sluice-example-upstream/target/sluice-example-upstream-0.0.1-SNAPSHOT-exec.jar 31080
+
+# terminal 2: server
+java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.token=SECRET
+
+# terminal 3: client
+java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
+  --sluice.server-url=grpc://127.0.0.1:8001 \
+  '--sluice.client.upstream[0]'.host=demo.local \
+  '--sluice.client.upstream[0]'.target=http://127.0.0.1:31080 \
+  --sluice.token=SECRET
+
+# terminal 4: request through the tunnel (routed by the Host header / :authority)
+curl -H 'Host: demo.local' http://127.0.0.1:8000/
+curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:8000/
+```
+
+`sluice.server-url` schemes: `grpc://` (plaintext) / `grpcs://` (TLS; `--sluice.insecure=true` skips
+verification). For mutual TLS see "Mutual TLS (server <-> client)".
+
+### Published Docker images
+
+Multi-arch (amd64 / aarch64) JVM and native images are published to ghcr.io on every push to
+`main`: `ghcr.io/making/sluice/sluice-server:{jvm,native}` and
+`ghcr.io/making/sluice/sluice-client:{jvm,native}` (immutable `jvm_<sha>` / `native_<sha>` tags too).
+
+```
+docker run --rm --pull always --name sluice-server -p 8000:8000 -p 8001:8001 -p 8081:8081 \
+  ghcr.io/making/sluice/sluice-server:native --sluice.token=SECRET
+
+docker run --rm --pull always --name sluice-client \
+  -e SLUICE_SERVER_URL=grpc://host.docker.internal:8001 \
+  -e SLUICE_TOKEN=SECRET \
+  -e SLUICE_CLIENT_UPSTREAM_0_HOST=demo.local \
+  -e SLUICE_CLIENT_UPSTREAM_0_TARGET=http://host.docker.internal:31080 \
+  ghcr.io/making/sluice/sluice-client:native
+
+curl -H 'Host: demo.local' http://127.0.0.1:8000/
+```
+
+Relaxed binding maps `SLUICE_SERVER_URL` / `SLUICE_TOKEN` /
+`SLUICE_CLIENT_UPSTREAM_0_HOST` / `SLUICE_CLIENT_UPSTREAM_0_TARGET` to the properties above
+(`host.docker.internal` reaches ports published on the host).
 
 ## Architecture
+
+A single gRPC bidi stream multiplexes virtual TCP connections (`conn_id`). The data plane is a raw TCP proxy: the request head is inspected for routing (Host / :authority), so WebSocket upgrades and HTTP keep-alive pass through transparently. Each virtual connection has its own flow control window, so a slow connection does not hold back the others on the stream.
 
 ```mermaid
 flowchart LR
@@ -69,126 +132,9 @@ sequenceDiagram
   growing to 1MiB within the node's `tunnel-budget`), so a stalled reader holds back only
   its own connection. One connection moves at most a window per tunnel round trip: about
   50MiB/s at a 20ms round trip at 1MiB, about 3MiB/s at 64KiB
-- compatibility: both ends must announce a per-connection window (sluice-server /
-  sluice-client 046cd21, sluice-wicket-wasi f76388d or later); an older peer is refused
+- compatibility: both ends must announce a per-connection window; an older peer is refused
 
 Details: [.kb/tunnel-flow-control.md](.kb/tunnel-flow-control.md).
-
-## Constraints and notes
-
-- The data plane relays raw bytes. With `rewrite-host=true` the authority (`Host` / `:authority`) is rewritten on every request of the connection, both HTTP/1.1 and h2; upgraded connections (WebSocket, h2c upgrade, CONNECT) are rewritten up to the protocol switch.
-- h2 (plaintext and TLS-terminated) is demultiplexed, not relayed verbatim: every stream is routed by its own `:authority`, access-checked and logged, and flow control, settings and errors are per hop. An upstream's failure ends only the streams it covers, never the client's connection. Details: [.kb/h2-demux.md](.kb/h2-demux.md).
-- Malformed HTTP/1.1 requests (request smuggling vectors such as a duplicated `Host`, an invalid `Content-Length` or chunked framing) are not relayed: nothing from the malformed bytes on reaches the upstream, the client gets `400` (unless the upstream already began answering) and the connection is closed. Details: [.kb/http1-relay.md](.kb/http1-relay.md).
-- An HTTP/1.1 request whose upstream cannot be reached, or closes the connection before answering, gets `502 Bad Gateway` -- on the first request of an upstream connection; a later one ends the connection unanswered, as the reused upstream connection did, so the client may retry it. Details: [.kb/http1-relay.md](.kb/http1-relay.md).
-- Upstream without HTTP/2 support: set `force-http1=true` on the upstream. The data plane's TLS termination then prefers http/1.1 in ALPN for the route, and an h2 stream that still reaches it (a browser coalescing the host onto another host's h2 connection, an h2-only or h2c client) is answered `421 Misdirected Request`, which Chrome and Firefox retry on a new connection. Without it, an `https://` upstream that does not negotiate h2 fails the route's h2 streams with `502` and the client logs a warning naming `force-http1`.
-
-## Modules
-
-- `sluice-proto` - `.proto` contract, generated stubs, and the shared tunnel primitives (`VirtualConnection`, `SessionSender`, `SocketRelay`)
-- `sluice-server` - exit node: gRPC control plane (`spring.grpc.server.port`, default 8001) + raw TCP data plane (`sluice.data-port`, default 8000) + actuator and management console (`server.port`, default 8081)
-- `sluice-client` - tunnel client: connects to the server, advertises upstreams, dials local upstreams on CONNECT, reconnects with jittered exponential backoff (ceiling 1s..30s, each wait drawn from its upper half), actuator on `server.port` (default 9001)
-- `sluice-wicket-wasi` - experimental Rust client: like `sluice-client` on the tunnel side, but terminates HTTP and hands each request to a `wasi:http` component (wasmtime) instead of dialing a TCP upstream; see its README
-- `sluice-it` - full stack integration tests running the real server and client applications in one JVM (proxying, reconnect after server restart, wrong-token rejection)
-- `sluice-example-upstream` - minimal sample upstream for manual checks (`It works` over http/1.1 and h2c)
-
-## Build
-
-```
-./mvnw verify
-```
-
-Requires JDK 25+. The `sluice-it` classes run in 6 JVMs at once (`-Dsluice.it.forks=N` to
-change), a class at a time in each.
-
-Build the executable jars (the `-exec.jar` files used in "Run"):
-
-```
-./mvnw -DskipTests package
-```
-
-### Native image (client / server)
-
-GraalVM native images (require a GraalVM JDK; AOT processing and `native-image` run in
-the `package` phase):
-
-```
-./mvnw -pl sluice-client -am -Pnative -DskipTests package
-./mvnw -pl sluice-server -am -Pnative -DskipTests package
-sluice-client/target/sluice-client --sluice.server-url=grpc://127.0.0.1:8001 ...
-sluice-server/target/sluice-server --sluice.token=SECRET ...
-```
-
-### Docker images
-
-Images are built with Cloud Native Buildpacks (Spring Boot plugin, no Dockerfile). Build deps
-first, then the app module only -- running `build-image` on the reactor also hits the library
-modules. Append `-Pnative` for GraalVM native images:
-
-```
-./mvnw -pl sluice-server -am package spring-boot:build-image -DskipTests
-./mvnw -pl sluice-client -am package spring-boot:build-image -DskipTests
-
-# native image: package with -Pnative first (as in "Native image"), then
-./mvnw -pl sluice-server -Pnative -DskipTests spring-boot:build-image
-./mvnw -pl sluice-client -Pnative -DskipTests spring-boot:build-image
-```
-
-This produces `sluice-server:latest` and `sluice-client:latest`. Run:
-
-```
-docker run -p 8000:8000 -p 8001:8001 sluice-server --sluice.token=SECRET
-docker run sluice-client --sluice.server-url=grpc://host.docker.internal:8001 \
-  '--sluice.client.upstream[0]'.host=demo.local '--sluice.client.upstream[0]'.target=http://host.docker.internal:31080 --sluice.token=SECRET
-```
-
-## Run
-
-```
-# terminal 1: upstream (sample server speaking http/1.1 and h2c on one port)
-java -jar sluice-example-upstream/target/sluice-example-upstream-0.0.1-SNAPSHOT-exec.jar 31080
-
-# terminal 2: server
-java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar \
-  --sluice.token=SECRET
-
-# terminal 3: client
-java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
-  --sluice.server-url=grpc://127.0.0.1:8001 \
-  '--sluice.client.upstream[0]'.host=demo.local \
-  '--sluice.client.upstream[0]'.target=http://127.0.0.1:31080 \
-  --sluice.token=SECRET
-
-# terminal 4: request through the tunnel (routed by the Host header / :authority)
-curl -H 'Host: demo.local' http://127.0.0.1:8000/
-curl --http2-prior-knowledge -H 'Host: demo.local' http://127.0.0.1:8000/
-```
-
-`sluice.server-url` schemes: `grpc://` (plaintext) / `grpcs://` (TLS; `--sluice.insecure=true` skips
-verification). For mutual TLS see "Mutual TLS (server <-> client)".
-
-### Published Docker images
-
-Multi-arch (amd64 / aarch64) JVM and native images are published to ghcr.io on every push to
-`main`: `ghcr.io/making/sluice/sluice-server:{jvm,native}` and
-`ghcr.io/making/sluice/sluice-client:{jvm,native}` (immutable `jvm_<sha>` / `native_<sha>` tags too).
-
-```
-docker run --rm --pull always --name sluice-server -p 8000:8000 -p 8001:8001 -p 8081:8081 \
-  ghcr.io/making/sluice/sluice-server:native --sluice.token=SECRET
-
-docker run --rm --pull always --name sluice-client \
-  -e SLUICE_SERVER_URL=grpc://host.docker.internal:8001 \
-  -e SLUICE_TOKEN=SECRET \
-  -e SLUICE_CLIENT_UPSTREAM_0_HOST=demo.local \
-  -e SLUICE_CLIENT_UPSTREAM_0_TARGET=http://host.docker.internal:31080 \
-  ghcr.io/making/sluice/sluice-client:native
-
-curl -H 'Host: demo.local' http://127.0.0.1:8000/
-```
-
-Relaxed binding maps `SLUICE_SERVER_URL` / `SLUICE_TOKEN` /
-`SLUICE_CLIENT_UPSTREAM_0_HOST` / `SLUICE_CLIENT_UPSTREAM_0_TARGET` to the properties above
-(`host.docker.internal` reaches ports published on the host).
 
 ## Data plane features
 
@@ -340,62 +286,17 @@ docker run --rm --pull always --name sluice-server -p 8000:8000 -p 8001:8001 -p 
 | `oidc.claims.<claim>[n]` | - | further claims a token must carry: one of the values, `*` matching any run of characters (e.g. `oidc.claims.email[0]=*@example.com`); a list claim (`groups`) must hold one of them |
 | `oidc.clock-skew` | `60s` | leeway of `exp` / `nbf` |
 
-- The data plane's error answers (`401`, `403`, `502`, `503`) are `application/problem+json`
-  documents (RFC 9457); `WWW-Authenticate` and `Retry-After` stay headers. Only a request
-  whose `Accept` lists `text/html` gets the HTML page instead.
-
-- A request passes with any one credential of its route. Otherwise it is answered `401` with a
-  `WWW-Authenticate` challenge per scheme of the route (`Basic realm="<realm>", charset="UTF-8"`,
-  `Bearer realm="<realm>"`, `<api-token-header> realm="<realm>"`) and never reaches the upstream.
-  A request carrying a credential header of the route twice is refused whatever the values.
-- OIDC tokens (resource-server style, for API and machine clients): a signed JWT passes when its
-  signature verifies against the provider's keys with an allowed algorithm, it carries `exp`,
-  `exp` / `nbf` hold within `clock-skew`, and `iss`, `aud` and the `claims` match. Unsigned
-  (`alg=none`) and HMAC tokens are refused. With static `bearer` tokens on the same route, a
-  token in JWS compact form (three base64url parts joined by two dots) goes to OIDC, any other
-  to the static tokens: a static token must not have that form.
-- The provider's keys (JWKS) are loaded at startup and every 5 minutes in the background; a
-  token naming a key not loaded loads them anew, at most once per 10 seconds, its check held off
-  the request thread meanwhile. Each document is fetched within 5 seconds and 512KiB. A failed
-  load keeps the keys loaded before. When the provider is unreachable at startup the server
-  starts all the same (after waiting about 10 seconds for it): the route's JWTs are answered
-  `503` with `Retry-After: 10` until the keys load, retried every 10 seconds; they never pass
-  unchecked.
-- Every HTTP/1.1 request head and every h2 stream is checked, plaintext or TLS-terminated, after
-  `allowed-cidrs` (`403` before `401`). On HTTP/1.1 a refused request is answered once the
-  responses to the requests before it are relayed, then the connection closes; on h2 the
-  connection goes on. A WebSocket is checked on its upgrade request only: browsers cannot add
-  headers to it, so bearer / API tokens there serve non-browser clients.
-- A request presenting a bearer token (static or OIDC) that is refused gets
-  `Bearer realm="<realm>", error="invalid_token"` (RFC 6750).
-- Unless `forward-credentials=true`, `Authorization` (Basic, Bearer) and the API token header
-  are removed from every request of the route before it is relayed.
-- Only a request the data plane reads can be checked: a TLS passthrough or non-HTTP connection
-  to such a route is closed unrelayed, and the server warns at the advertise of a TLS passthrough
-  upstream under such a key; a `tcp:<port>` key fails the start.
-- Each secret carries the `{id}` of its encoder: `bcrypt`, `pbkdf2`,
-  `pbkdf2@SpringSecurity_v5_8`, `noop` (the value itself), `sha256` (the hex SHA-256 of the
-  UTF-8 value, unsalted: for high-entropy tokens, never for passwords people choose; e.g.
-  `printf %s "$TOKEN" | sha256sum`). scrypt and argon2 are not supported (they need Bouncy
-  Castle). A secret without a prefix, with an unknown id or malformed for its encoder fails the
-  start, as does a route with no credential.
-- A credential that matched is remembered per route by its SHA-256 for 10 minutes -- a JWT until
-  its `exp` at most -- (up to 10000 of them), so a client's later requests skip the encoder; one that did not match is never
-  remembered. At most as many checks against `bcrypt` / `pbkdf2` as CPUs (at least 2) run at
-  once; a request whose check would take one more is answered `503` with `Retry-After: 1`, and
-  requests presenting the credential of a check under way wait for that check. bcrypt and
-  pbkdf2 cost milliseconds per check by design: prefer `sha256` for tokens.
-- On h2 such a check holds its own stream only: the connection's other streams go on
-  meanwhile. A stream whose check has not ended after `sluice.limits.h2-stream-wait-timeout`
-  is refused with `REFUSED_STREAM`. Details: [.kb/h2-demux.md](.kb/h2-demux.md).
-- Without `sluice.data-tls-bundle` the server warns at startup that the credentials cross the
-  data plane in cleartext unless a front end terminates TLS.
-- Refusals are logged as `type=req ... status=401 reason=auth-missing` (no credential),
-  `reason=auth-invalid`, `reason=auth-unreadable` (passthrough / non-HTTP), `status=503
-  reason=auth-busy` and `reason=auth-unavailable` (the OIDC keys not loaded). Why a credential
-  was refused (e.g. `Jwt expired at ...`, `The aud claim is not valid`, `Invalid signature`) is
-  logged at debug by `am.ik.sluice.server.auth.RouteAuthenticator`, never the credential. The
-  console tags such a route `Auth: <schemes>` (`oidc` for the provider's tokens).
+- A route can require HTTP Basic, `Bearer` (a static token or an OIDC JWT) or an API token header.
+  A request passes with any one credential of its route; otherwise it is answered
+  `401` with a `WWW-Authenticate` challenge and never reaches the upstream.
+- `Authorization` and the API token header are removed before relay unless `forward-credentials=true`.
+- Secrets carry the id of their encoder (`{bcrypt}`, `{pbkdf2}`, `{noop}`, `{sha256}`). Use `sha256`
+  for high-entropy tokens; bcrypt and pbkdf2 are slow by design.
+- OIDC keys are loaded from the provider and refreshed in the background. While they are not loaded,
+  JWTs are answered `503` and never pass unchecked.
+- Only requests the data plane reads are checked: a TLS passthrough or non-HTTP connection to such a
+  route is closed unrelayed.
+- Refusals are logged with their reason. Full behavior, limits and the logs: [.kb/route-auth.md](.kb/route-auth.md).
 
 ## Cluster
 
@@ -503,8 +404,8 @@ Without `sluice.cluster.nodes` the server runs single-node and nothing above app
 ### TLS control plane
 
 The control plane can serve TLS (`spring.grpc.server.ssl.bundle`), so a front end routes
-per node by SNI without terminating TLS. Verified end to end with a self-signed certificate;
-no code difference from the plaintext cluster, only configuration:
+per node by SNI without terminating TLS. Compared with the plaintext cluster above, only the
+configuration differs:
 
 ```
 # self-signed cert for the gRPC control plane
@@ -541,9 +442,6 @@ curl -H 'Host: demo.local' http://127.0.0.1:8200/
 # the control plane negotiates h2 via ALPN
 echo | openssl s_client -connect 127.0.0.1:8101 -alpn h2 2>/dev/null | grep 'ALPN protocol'
 ```
-
-E2E coverage: `ClusterGrpcTlsE2ETests` (sluice-it) -- both nodes serve, failover after a
-node stops, and h2 negotiation on the TLS endpoint.
 
 ### Mutual TLS (server <-> client)
 
@@ -587,10 +485,6 @@ java -jar sluice-client/target/sluice-client-0.0.1-SNAPSHOT-exec.jar \
 The client bundle is applied to every node connection (the bootstrap and the membership
 `grpcs://` URLs alike). `client-auth` also accepts `OPTIONAL` / `WANT` / `NONE`.
 
-E2E coverage: `ClusterGrpcMutualTlsE2ETests` (sluice-it) -- mTLS to both nodes with failover,
-rejection of a certificate-less client, a certificate issued through the console
-(`sluice.ca-bundle`), and TLS termination / passthrough on the data plane over the mTLS
-tunnel.
 
 ## Operations
 
@@ -694,8 +588,7 @@ set explicitly in `sluice-server/src/main/resources/application.properties`:
 
 Application-level `KEEPALIVE` frames are not sent: the gRPC (HTTP/2) ping already
 provides liveness. The frame type stays in the proto for future use and is handled as a
-no-op on both sides. `GrpcKeepAliveTest` (sluice-it) guards the behavior with a 1s-ping
-channel.
+no-op on both sides.
 
 ### Health / metrics
 
@@ -737,11 +630,8 @@ scrape_configs:
 ```
 
 Import it from the Grafana UI (Dashboards > New > Import), or provision it with a file
-provider pointing at a directory holding the JSON. The native server image checked
-exported no GC pause timer, so its GC panel shows only the overhead.
-`GrafanaDashboardE2ETest` fails the build when a metric the dashboard queries is in
-neither the server's nor the client's scrape, or a query does not select the label
-variables.
+provider pointing at a directory holding the JSON. The native server image
+exports no GC pause timer, so its GC panel shows only the overhead.
 
 ### Console
 
@@ -817,6 +707,14 @@ Signing out of the console also ends the session at the provider (RP-initiated l
 its discovery document advertises an `end_session_endpoint`; register
 `http://<server>:8081/login?logout` as the post-logout redirect URI. Providers without one
 (e.g. Google) end only the console session.
+
+## Behavior notes
+
+- The data plane relays raw bytes. With `rewrite-host=true` (a client upstream option, see [Configuration (client)](#configuration-client)) the authority (`Host` / `:authority`) is rewritten on every request of the connection, both HTTP/1.1 and h2; upgraded connections (WebSocket, h2c upgrade, CONNECT) are rewritten up to the protocol switch.
+- h2 (plaintext and TLS-terminated) is demultiplexed, not relayed verbatim: every stream is routed by its own `:authority`, access-checked and logged, and flow control, settings and errors are per hop. An upstream's failure ends only the streams it covers, never the client's connection. Details: [.kb/h2-demux.md](.kb/h2-demux.md).
+- Malformed HTTP/1.1 requests (request smuggling vectors such as a duplicated `Host`, an invalid `Content-Length` or chunked framing) are not relayed: nothing from the malformed bytes on reaches the upstream, the client gets `400` (unless the upstream already began answering) and the connection is closed. Details: [.kb/http1-relay.md](.kb/http1-relay.md).
+- An HTTP/1.1 request whose upstream cannot be reached, or closes the connection before answering, gets `502 Bad Gateway` -- on the first request of an upstream connection; a later one ends the connection unanswered, as the reused upstream connection did, so the client may retry it. Details: [.kb/http1-relay.md](.kb/http1-relay.md).
+- Upstream without HTTP/2 support: set `force-http1=true` on the upstream. The data plane's TLS termination then prefers http/1.1 in ALPN for the route, and an h2 stream that still reaches it (a browser coalescing the host onto another host's h2 connection, an h2-only or h2c client) is answered `421 Misdirected Request`, which Chrome and Firefox retry on a new connection. Without it, an `https://` upstream that does not negotiate h2 fails the route's h2 streams with `502` and the client logs a warning naming `force-http1`.
 
 ## Configuration (server)
 
@@ -951,3 +849,64 @@ its discovery document advertises an `end_session_endpoint`; register
 | Property | Default | Description |
 |---|---|---|
 | `server.port` | `9001` | actuator (health / info / prometheus) |
+
+## Development
+
+### Modules
+
+- `sluice-proto` - `.proto` contract, generated stubs, and the shared tunnel primitives (`VirtualConnection`, `SessionSender`, `SocketRelay`)
+- `sluice-server` - exit node: gRPC control plane (`spring.grpc.server.port`, default 8001) + raw TCP data plane (`sluice.data-port`, default 8000) + actuator and management console (`server.port`, default 8081)
+- `sluice-client` - tunnel client: connects to the server, advertises upstreams, dials local upstreams on CONNECT, reconnects with jittered exponential backoff (ceiling 1s..30s, each wait drawn from its upper half), actuator on `server.port` (default 9001)
+- `sluice-wicket-wasi` - experimental Rust client: like `sluice-client` on the tunnel side, but terminates HTTP and hands each request to a `wasi:http` component (wasmtime) instead of dialing a TCP upstream; see its README
+- `sluice-it` - full stack integration tests running the real server and client applications in one JVM (proxying, reconnect after server restart, wrong-token rejection)
+- `sluice-example-upstream` - minimal sample upstream for manual checks (`It works` over http/1.1 and h2c)
+
+### Build
+
+```
+./mvnw verify
+```
+
+Requires JDK 25+. The `sluice-it` classes run in 6 JVMs at once (`-Dsluice.it.forks=N` to
+change), a class at a time in each.
+
+Build the executable jars (the `-exec.jar` files used in "Run"):
+
+```
+./mvnw -DskipTests package
+```
+
+#### Native image (client / server)
+
+GraalVM native images (require a GraalVM JDK; AOT processing and `native-image` run in
+the `package` phase):
+
+```
+./mvnw -pl sluice-client -am -Pnative -DskipTests package
+./mvnw -pl sluice-server -am -Pnative -DskipTests package
+sluice-client/target/sluice-client --sluice.server-url=grpc://127.0.0.1:8001 ...
+sluice-server/target/sluice-server --sluice.token=SECRET ...
+```
+
+#### Docker images
+
+Images are built with Cloud Native Buildpacks (Spring Boot plugin, no Dockerfile). Build deps
+first, then the app module only -- running `build-image` on the reactor also hits the library
+modules. Append `-Pnative` for GraalVM native images:
+
+```
+./mvnw -pl sluice-server -am package spring-boot:build-image -DskipTests
+./mvnw -pl sluice-client -am package spring-boot:build-image -DskipTests
+
+# native image: package with -Pnative first (as in "Native image"), then
+./mvnw -pl sluice-server -Pnative -DskipTests spring-boot:build-image
+./mvnw -pl sluice-client -Pnative -DskipTests spring-boot:build-image
+```
+
+This produces `sluice-server:latest` and `sluice-client:latest`. Run:
+
+```
+docker run -p 8000:8000 -p 8001:8001 sluice-server --sluice.token=SECRET
+docker run sluice-client --sluice.server-url=grpc://host.docker.internal:8001 \
+  '--sluice.client.upstream[0]'.host=demo.local '--sluice.client.upstream[0]'.target=http://host.docker.internal:31080 --sluice.token=SECRET
+```

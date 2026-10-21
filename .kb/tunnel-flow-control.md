@@ -49,3 +49,8 @@ limit. With room, one connection grows to the full window: an 8MiB download or u
 through a 20ms tunnel round trip takes about 18 waits for credit in
 `TunnelBudgetE2ETest`, where 64KiB alone would take 256, and an h2 connection's upstream
 connection grows the same way (`H2DemuxWindowRoundTripE2ETest`).
+
+## Compatibility
+
+Both ends announce a per-connection window; a peer that does not is refused. Builds with it:
+sluice-server and sluice-client 046cd21, sluice-wicket-wasi f76388d and later.
