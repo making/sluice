@@ -13,8 +13,8 @@ never built or tested there.
 - cache `~/.cargo/registry`, `sluice-wicket-wasi/target`, `sluice-wicket-wasi/examples/target`
 - a separate job (path filter `sluice-wicket-wasi/**`, `sluice-proto/**`) so pure
   Java changes are unaffected
-- `ci.yaml` already has a `rust` job for `sluice-flume` (protoc, cargo cache,
-  fmt / clippy / test): extending it with the wicket is fine
+- `rust.yaml` (its own path filter) already runs `sluice-flume`'s gates (protoc,
+  cargo cache, fmt / clippy / test): add the wicket there as a job with its paths
 - gate on `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`
   as well, for the wicket and the examples. The examples' toolchain
   (`profile = "minimal"`) lacks rustfmt / clippy: add

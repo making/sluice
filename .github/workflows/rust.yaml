@@ -1,0 +1,114 @@
+name: Rust
+# The Rust crates' own gates, apart from CI: a Java-only change runs none of them, and
+# each crate's job runs only when its paths changed. CI still builds sluice-flume for the
+# sluice-it tests; deploy.yaml follows CI only.
+on:
+  push:
+    branches:
+    - main
+    paths: &rust-paths
+    - 'sluice-flume/**'
+    - 'sluice-wicket-wasi/**'
+    - 'sluice-proto/src/main/proto/**'
+    - '.github/workflows/rust.yaml'
+  pull_request:
+    branches:
+    - main
+    paths: *rust-paths
+concurrency:
+  group: rust-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions:
+  contents: read
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      flume: ${{ steps.filter.outputs.flume }}
+      wicket: ${{ steps.filter.outputs.wicket }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - uses: dorny/paths-filter@v3
+      id: filter
+      with:
+        filters: |
+          flume:
+          - 'sluice-flume/**'
+          - 'sluice-proto/src/main/proto/**'
+          - '.github/workflows/rust.yaml'
+          wicket:
+          - 'sluice-wicket-wasi/**'
+          - 'sluice-proto/src/main/proto/**'
+          - '.github/workflows/rust.yaml'
+  sluice-flume:
+    needs: changes
+    if: needs.changes.outputs.flume == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: sluice-flume
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Install protoc
+      run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends protobuf-compiler
+    - name: Toolchain
+      run: rustup component add rustfmt clippy
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          sluice-flume/target
+        key: cargo-flume-${{ runner.os }}-${{ hashFiles('sluice-flume/Cargo.lock') }}
+    - name: Format
+      run: cargo fmt --check
+    - name: Clippy
+      run: cargo clippy --all-targets --locked -- -D warnings
+    - name: Test
+      run: cargo test --locked
+  # The wicket builds on the stable toolchain; its tests build the example guests through
+  # the rustup cargo proxy in examples/, pinned to a nightly with wasm32-wasip3
+  # (examples/rust-toolchain.toml).
+  sluice-wicket-wasi:
+    needs: changes
+    if: needs.changes.outputs.wicket == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: sluice-wicket-wasi
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Install protoc
+      run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends protobuf-compiler
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.rustup/toolchains/nightly-*
+          ~/.cargo/registry
+          ~/.cargo/git
+          sluice-wicket-wasi/target
+          sluice-wicket-wasi/examples/target
+        key: cargo-wicket-${{ runner.os }}-${{ hashFiles('sluice-wicket-wasi/Cargo.lock', 'sluice-wicket-wasi/examples/Cargo.lock', 'sluice-wicket-wasi/examples/rust-toolchain.toml') }}
+    - name: Toolchains
+      run: |
+        rustup component add rustfmt clippy
+        (cd examples && rustup toolchain install)
+    - name: Format
+      run: |
+        cargo fmt --check
+        (cd examples && cargo fmt --check)
+    - name: Clippy
+      run: |
+        cargo clippy --all-targets --locked -- -D warnings
+        (cd examples && cargo clippy --all-targets --locked -- -D warnings)
+    - name: Test
+      run: cargo test --locked -p sluice-wicket-wasi

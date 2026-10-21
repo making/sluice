@@ -495,11 +495,11 @@ fn rekey(sessions: &mut HashMap<String, Arc<Session>>, session: Arc<Session>, no
     if current.as_deref() == Some(node_id.as_str()) {
         return; // already known under this name
     }
-    if let Some(known) = sessions.get(&node_id) {
-        if !Arc::ptr_eq(known, &session) {
-            println!("duplicate stream for node {node_id}; closing the older one");
-            known.token.cancel();
-        }
+    if let Some(known) = sessions.get(&node_id)
+        && !Arc::ptr_eq(known, &session)
+    {
+        println!("duplicate stream for node {node_id}; closing the older one");
+        known.token.cancel();
     }
     if let Some(key) = current {
         sessions.remove(&key);

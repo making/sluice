@@ -37,7 +37,10 @@ impl Guest for Component {
             .map(|(_, rest)| rest.split('&').next().unwrap_or_default().to_string());
         let (status, payload) = match addr.as_deref().map(str::parse::<SocketAddr>) {
             Some(Ok(addr)) => match relay(addr).await {
-                Ok(raw) => (200, [format!("relayed from {addr}\n").into_bytes(), raw].concat()),
+                Ok(raw) => (
+                    200,
+                    [format!("relayed from {addr}\n").into_bytes(), raw].concat(),
+                ),
                 Err(e) => (502, format!("relay {addr} failed: {e}\n").into_bytes()),
             },
             _ => (400, b"expected ?addr=<ip>:<port>\n".to_vec()),

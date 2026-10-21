@@ -2959,10 +2959,10 @@ pub(crate) mod tests {
                                 .position(|w| w == b"\r\n\r\n")
                                 .map(|pos| pos + 4);
                         }
-                        if let (Some(end), None) = (head_end, first_body_at) {
-                            if raw.len() > end {
-                                first_body_at = Some(Instant::now() - started);
-                            }
+                        if let (Some(end), None) = (head_end, first_body_at)
+                            && raw.len() > end
+                        {
+                            first_body_at = Some(Instant::now() - started);
                         }
                     }
                     Body::Close(..) => closed_at = Some(Instant::now() - started),

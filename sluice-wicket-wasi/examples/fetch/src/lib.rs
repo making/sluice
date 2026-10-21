@@ -69,7 +69,9 @@ fn outgoing(url: &str) -> Result<Request, String> {
     drop(trailers_tx);
     let (request, _transmit) = Request::new(Headers::new(), None, trailers_rx, None);
     let invalid = |part: &str| format!("invalid {part} in '{url}'");
-    request.set_scheme(Some(&scheme)).map_err(|()| invalid("scheme"))?;
+    request
+        .set_scheme(Some(&scheme))
+        .map_err(|()| invalid("scheme"))?;
     request
         .set_authority(Some(authority))
         .map_err(|()| invalid("authority"))?;

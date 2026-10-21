@@ -3,3 +3,4 @@
 channel = "nightly-2026-10-18"
 profile = "minimal"
 targets = ["wasm32-wasip3"]
+components = ["rustfmt", "clippy"]
