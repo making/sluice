@@ -15,7 +15,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import java.util.random.RandomGenerator;
 
@@ -29,8 +28,10 @@ import am.ik.sluice.tunnel.ConnectionLimit;
 import am.ik.sluice.tunnel.TunnelBudget;
 import am.ik.sluice.tunnel.VirtualConnection;
 import am.ik.sluice.tunnel.PeerBuilds;
-import am.ik.sluice.v1.proto.ListNodesResponse;
 import am.ik.sluice.v1.proto.PeerBuild;
+import io.grpc.ManagedChannel;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -43,9 +44,14 @@ import org.springframework.stereotype.Component;
 
 /**
  * Fan-out supervisor: keeps one {@link NodeConnection} tunnel stream per server node. The
- * {@code sluice.server-url} is the bootstrap; the node list learned via {@code ListNodes}
- * and membership updates opens one stream per node (keyed by node id) and closes streams
- * of nodes that left. All membership transitions run on a single-threaded executor.
+ * {@code sluice.server-url} is the bootstrap, asked for the node list ({@code ListNodes})
+ * only: it may be a load balancer reaching a different node on every connection, so no
+ * stream runs through it unless a node has no public url of its own. The node list opens
+ * one stream per node at its public url (keyed by that url) and closes the streams of
+ * nodes that left; membership updates pushed on any stream do the same. The bootstrap is
+ * asked again whenever no stream is up, in case the whole membership moved. A server
+ * without {@code ListNodes} is served by one stream to the bootstrap. All membership
+ * transitions run on a single-threaded executor.
  * <p>
  * Stopped by the application context ({@link #stop(Runnable)}), it drains first
  * ({@link #drain()}): the routes are withdrawn from every node and the connections open
@@ -68,12 +74,19 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 	/** Process-stable client identity sent on every stream. */
 	private final String clientId;
 
-	private final ConcurrentHashMap<String, NodeConnection> connectionsByNode = new ConcurrentHashMap<>();
+	/** The stream of each node, by the url it connects to. */
+	private final ConcurrentHashMap<String, NodeConnection> connectionsByUrl = new ConcurrentHashMap<>();
+
+	/**
+	 * The node each url of the membership leads to, as the membership names it; written
+	 * on the supervisor.
+	 */
+	private volatile Map<String, String> membership = Map.of();
 
 	private final ExecutorService supervisor = Executors
 		.newSingleThreadExecutor(r -> Thread.ofVirtual().name("sluice-supervisor").unstarted(r));
 
-	private final AtomicBoolean membershipLearned = new AtomicBoolean();
+	private volatile @Nullable Thread discovery;
 
 	/** Upstream connections open at once, shared by every node stream. */
 	private final ConnectionLimit connectionLimit;
@@ -111,10 +124,10 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 		log.info("client build: {}", PeerBuilds.describe(clientBuild));
 		String configured = clientid(properties);
 		this.clientId = configured == null || configured.isBlank() ? UUID.randomUUID().toString() : configured;
-		meterRegistry.gauge("sluice.connections.active", this.connectionsByNode,
+		meterRegistry.gauge("sluice.connections.active", this.connectionsByUrl,
 				map -> map.values().stream().mapToInt(NodeConnection::activeConnections).sum());
 		Gauge
-			.builder("sluice.tunnel.sessions", this.connectionsByNode,
+			.builder("sluice.tunnel.sessions", this.connectionsByUrl,
 					map -> map.values().stream().filter(NodeConnection::isConnected).count())
 			.description("Tunnel streams established, one per server node")
 			.register(meterRegistry);
@@ -226,7 +239,7 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 	}
 
 	public boolean isConnected() {
-		for (NodeConnection connection : this.connectionsByNode.values()) {
+		for (NodeConnection connection : this.connectionsByUrl.values()) {
 			if (connection.isConnected()) {
 				return true;
 			}
@@ -235,11 +248,13 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 	}
 
 	/**
-	 * Connection state per node id (or the bootstrap url before the node id is known).
+	 * Connection state per node id (or the url of a stream that has not reached its node
+	 * yet).
 	 */
 	public Map<String, Boolean> nodeStates() {
 		Map<String, Boolean> states = new LinkedHashMap<>();
-		this.connectionsByNode.forEach((key, connection) -> states.put(key, connection.isConnected()));
+		this.connectionsByUrl.forEach((url, connection) -> states
+			.put(connection.nodeId().isBlank() ? url : connection.nodeId(), connection.isConnected()));
 		return states;
 	}
 
@@ -252,19 +267,89 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 			throw new IllegalStateException("sluice.client.upstream is required");
 		}
 		this.running = true;
-		this.startConnection("", this.properties.serverUrl());
+		this.discovery = Thread.ofVirtual().name("sluice-discovery").start(this::discoverLoop);
+	}
+
+	/**
+	 * Asks the bootstrap for the node list until a stream is up, and again whenever none
+	 * is; with the backoff of the streams between attempts.
+	 */
+	private void discoverLoop() {
+		ReconnectBackoff backoff = new ReconnectBackoff(this.randomFactory.get());
+		while (this.running && !this.draining) {
+			if (this.isConnected()) {
+				backoff.reset();
+			}
+			else {
+				Map<String, String> discovered = this.discover();
+				if (!discovered.isEmpty()) {
+					this.supervise(() -> this.reconcile(discovered));
+				}
+			}
+			try {
+				Thread.sleep(backoff.next());
+			}
+			catch (InterruptedException e) {
+				return;
+			}
+		}
+	}
+
+	/**
+	 * The membership the bootstrap answers; just the bootstrap when the server has no
+	 * {@code ListNodes}, empty when it could not be asked.
+	 */
+	private Map<String, String> discover() {
+		String bootstrap = this.properties.serverUrl();
+		ManagedChannel channel = null;
+		try {
+			channel = NodeConnection.channel(bootstrap, this.properties, this.sslBundle(), this.budget);
+			return this.endpoints(NodeConnection.listNodes(channel, this.properties, this.clientId).getNodesList());
+		}
+		catch (StatusRuntimeException e) {
+			if (e.getStatus().getCode() == Status.Code.UNIMPLEMENTED) {
+				return Map.of(bootstrap, "");
+			}
+			log.warn("asking {} for the server nodes failed: {}", bootstrap, e.getStatus());
+			return Map.of();
+		}
+		catch (RuntimeException e) {
+			log.warn("asking {} for the server nodes failed: {}", bootstrap, e.toString());
+			return Map.of();
+		}
+		finally {
+			if (channel != null) {
+				channel.shutdownNow();
+			}
+		}
+	}
+
+	/**
+	 * The url each node is reached at, to the node id: its public url, or the bootstrap
+	 * for a node without one.
+	 */
+	private Map<String, String> endpoints(List<am.ik.sluice.v1.proto.Node> nodes) {
+		Map<String, String> endpoints = new LinkedHashMap<>();
+		for (am.ik.sluice.v1.proto.Node node : nodes) {
+			String url = node.getPublicUrl().isBlank() ? this.properties.serverUrl() : node.getPublicUrl();
+			endpoints.putIfAbsent(url, node.getNodeId());
+		}
+		return endpoints;
+	}
+
+	private @Nullable SslBundle sslBundle() {
+		String bundleName = this.properties.tlsBundle();
+		return bundleName == null || bundleName.isBlank() || this.sslBundles == null ? null
+				: this.sslBundles.getBundle(bundleName);
 	}
 
 	private void startConnection(String nodeId, String url) {
-		String bundleName = this.properties.tlsBundle();
-		SslBundle sslBundle = bundleName == null || bundleName.isBlank() || this.sslBundles == null ? null
-				: this.sslBundles.getBundle(bundleName);
 		NodeConnection connection = NodeConnection.builder()
-			.key(nodeId.isBlank() ? url : nodeId)
+			.key(url)
 			.nodeId(nodeId)
 			.url(url)
 			.properties(this.properties)
-			.sslBundle(sslBundle)
+			.sslBundle(this.sslBundle())
 			.clientId(this.clientId)
 			.taskExecutor(this.taskExecutor)
 			.listener(this)
@@ -274,52 +359,36 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 			.clientBuild(this.clientBuild)
 			.randomFactory(this.randomFactory)
 			.build();
-		this.connectionsByNode.put(nodeId.isBlank() ? url : nodeId, connection);
+		this.connectionsByUrl.put(url, connection);
 		connection.start();
 	}
 
 	@Override
 	public void onConnected(NodeConnection connection, String nodeId) {
-		this.supervise(() -> {
-			// rename the connection after the node id is known, so the bootstrap
-			// connection becomes the stream of that node instead of a duplicate
-			if (!nodeId.isBlank()) {
-				this.rekey(connection, nodeId);
-			}
-			// self-healing: re-fetch the node list on every established stream
-			this.reconcile(this.fetchNodes(connection));
-		});
+		String expected = this.membership.getOrDefault(connection.url(), "");
+		if (!expected.isBlank() && !nodeId.isBlank() && !expected.equals(nodeId)) {
+			// a public url balanced across nodes: two streams of this client may meet
+			// on one node and replace each other there, leaving the other node without
+			log.warn("the stream to node {} at {} reached node {}; every node needs a public url of its own", expected,
+					connection.url(), nodeId);
+		}
+		// self-healing: re-fetch the node list on every established stream
+		this.supervise(() -> this.reconcile(this.fetchNodes(connection)));
 	}
 
-	private void rekey(NodeConnection connection, String nodeId) {
-		NodeConnection existing = this.connectionsByNode.put(nodeId, connection);
-		if (existing == connection) {
-			return;
-		}
-		// remove the old key only when it still maps to this connection
-		this.connectionsByNode.remove(connection.key(), connection);
-		if (existing != null && existing != connection) {
-			log.info("duplicate stream for node {}; closing the older one", nodeId);
-			existing.close();
-			this.connectionsByNode.remove(nodeId, existing);
-		}
-	}
-
-	private List<am.ik.sluice.v1.proto.Node> fetchNodes(NodeConnection connection) {
+	private Map<String, String> fetchNodes(NodeConnection connection) {
 		try {
-			ListNodesResponse response = connection.listNodes();
-			this.membershipLearned.set(true);
-			return response.getNodesList();
+			return this.endpoints(connection.listNodes().getNodesList());
 		}
 		catch (Exception e) {
 			log.debug("ListNodes via {} failed: {}", connection.key(), e.toString());
-			return List.of();
+			return Map.of();
 		}
 	}
 
 	@Override
 	public void onMembership(List<am.ik.sluice.v1.proto.Node> nodes, long membershipVersion) {
-		this.supervise(() -> this.reconcile(nodes));
+		this.supervise(() -> this.reconcile(this.endpoints(nodes)));
 	}
 
 	/**
@@ -335,15 +404,6 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 		}
 	}
 
-	private @org.jspecify.annotations.Nullable NodeConnection byEndpoint(String url) {
-		for (NodeConnection connection : this.connectionsByNode.values()) {
-			if (connection.url().equals(url)) {
-				return connection;
-			}
-		}
-		return null;
-	}
-
 	@Override
 	public void onDrain(NodeConnection connection, String reason) {
 		// the stream is closing; the per-node loop retries with backoff until the node
@@ -351,38 +411,28 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 	}
 
 	/**
-	 * Adopts the given membership: opens streams to new nodes, closes streams of nodes
-	 * that are no longer listed. The bootstrap connection doubles as the stream of a
-	 * listed node without a public url.
+	 * Adopts the given membership (url to node id, see {@link #endpoints}): opens streams
+	 * to new urls, closes the streams of urls no longer listed.
 	 */
-	private void reconcile(List<am.ik.sluice.v1.proto.Node> nodes) {
-		if (!this.running || this.draining || nodes.isEmpty()) {
+	private void reconcile(Map<String, String> endpoints) {
+		if (!this.running || this.draining || endpoints.isEmpty()) {
 			return;
 		}
-		for (am.ik.sluice.v1.proto.Node node : nodes) {
-			String nodeId = node.getNodeId();
-			if (nodeId.isBlank() || this.connectionsByNode.containsKey(nodeId)) {
-				continue;
+		this.membership = Map.copyOf(endpoints);
+		endpoints.forEach((url, nodeId) -> {
+			if (!this.connectionsByUrl.containsKey(url)) {
+				log.info("opening tunnel stream to node {} at {}", nodeId.isBlank() ? "?" : nodeId, url);
+				this.startConnection(nodeId, url);
 			}
-			if (node.getPublicUrl().isBlank()) {
-				continue; // no reachable address known (the bootstrap stream covers it
-							// once acked)
+		});
+		this.connectionsByUrl.entrySet().removeIf(entry -> {
+			if (endpoints.containsKey(entry.getKey())) {
+				return false;
 			}
-			// reuse the connection that already points at this endpoint (the bootstrap
-			// stream): a second stream to the same node would make the server drop the
-			// first session on register and churn the routes
-			NodeConnection sameEndpoint = this.byEndpoint(node.getPublicUrl());
-			if (sameEndpoint != null) {
-				log.info("node {} is the endpoint of the {} stream; adopting it", nodeId, sameEndpoint.key());
-				this.rekey(sameEndpoint, nodeId);
-				continue;
-			}
-			log.info("opening tunnel stream to node {} at {}", nodeId, node.getPublicUrl());
-			this.startConnection(nodeId, node.getPublicUrl());
-		}
-		// close streams of nodes that left the membership
-		java.util.List<String> nodeIds = nodes.stream().map(am.ik.sluice.v1.proto.Node::getNodeId).toList();
-		this.connectionsByNode.keySet().retainAll(nodeIds);
+			log.info("closing tunnel stream to {}: no longer a member", entry.getValue().key());
+			entry.getValue().close();
+			return true;
+		});
 	}
 
 	/**
@@ -421,7 +471,7 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 			Thread.currentThread().interrupt();
 			return;
 		}
-		List<NodeConnection> connections = List.copyOf(this.connectionsByNode.values());
+		List<NodeConnection> connections = List.copyOf(this.connectionsByUrl.values());
 		log.info("draining: withdrawing the routes from {} server node(s); waiting up to {} for {} open connection(s)",
 				connections.size(), grace, openConnections());
 		CompletableFuture<?>[] drains = connections.stream()
@@ -455,17 +505,21 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 	}
 
 	private int openConnections() {
-		return this.connectionsByNode.values().stream().mapToInt(NodeConnection::activeConnections).sum();
+		return this.connectionsByUrl.values().stream().mapToInt(NodeConnection::activeConnections).sum();
 	}
 
 	@Override
 	public void stop() {
 		this.running = false;
+		Thread discovery = this.discovery;
+		if (discovery != null) {
+			discovery.interrupt();
+		}
 		this.supervisor.shutdownNow();
-		for (NodeConnection connection : this.connectionsByNode.values()) {
+		for (NodeConnection connection : this.connectionsByUrl.values()) {
 			connection.close();
 		}
-		this.connectionsByNode.clear();
+		this.connectionsByUrl.clear();
 	}
 
 	@Override

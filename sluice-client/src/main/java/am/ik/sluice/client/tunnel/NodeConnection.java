@@ -309,10 +309,7 @@ public final class NodeConnection implements AutoCloseable {
 		private Builder() {
 		}
 
-		/**
-		 * Registry key of this connection; the node id once known, else stable
-		 * placeholder.
-		 */
+		/** Log label of this connection. */
 		public Builder key(String key) {
 			this.key = key;
 			return this;
@@ -472,7 +469,15 @@ public final class NodeConnection implements AutoCloseable {
 	}
 
 	private ManagedChannel buildChannel() {
-		String url = this.url;
+		return channel(this.url, this.properties, this.sslBundle, this.budget);
+	}
+
+	/**
+	 * A channel to the control plane at {@code url}, set up as every tunnel stream's:
+	 * keepalive, the fixed flow control window and the TLS of the client.
+	 */
+	static ManagedChannel channel(String url, SluiceClientProperties properties, @Nullable SslBundle sslBundle,
+			TunnelBudget budget) {
 		boolean secure = url.startsWith("grpcs://");
 		String authority = url.replaceFirst("^grpcs?://", "");
 		int portSeparator = authority.lastIndexOf(':');
@@ -481,27 +486,27 @@ public final class NodeConnection implements AutoCloseable {
 		// a fixed window, gRPC's own tuning off (see TunnelBudget#transportWindow)
 		NettyChannelBuilder builder = NettyChannelBuilder.forAddress(host, port)
 			.enableRetry()
-			.keepAliveTime(this.properties.keepAliveTime().toSeconds(), TimeUnit.SECONDS)
-			.keepAliveTimeout(this.properties.keepAliveTimeout().toSeconds(), TimeUnit.SECONDS)
-			.flowControlWindow(this.budget.transportWindow());
+			.keepAliveTime(properties.keepAliveTime().toSeconds(), TimeUnit.SECONDS)
+			.keepAliveTimeout(properties.keepAliveTimeout().toSeconds(), TimeUnit.SECONDS)
+			.flowControlWindow(budget.transportWindow());
 		if (!secure) {
 			builder.usePlaintext();
 		}
-		else if (this.sslBundle != null) {
+		else if (sslBundle != null) {
 			try {
 				SslContextBuilder ssl = GrpcSslContexts.forClient()
-					.keyManager(this.sslBundle.getManagers().getKeyManagerFactory());
-				TrustManagerFactory trustManagerFactory = this.sslBundle.getManagers().getTrustManagerFactory();
+					.keyManager(sslBundle.getManagers().getKeyManagerFactory());
+				TrustManagerFactory trustManagerFactory = sslBundle.getManagers().getTrustManagerFactory();
 				if (trustManagerFactory != null) {
 					ssl.trustManager(trustManagerFactory);
 				}
 				builder.sslContext(ssl.build());
 			}
 			catch (Exception e) {
-				throw new IllegalStateException("failed to build SSL context from bundle " + this.sslBundle, e);
+				throw new IllegalStateException("failed to build SSL context from bundle " + sslBundle, e);
 			}
 		}
-		else if (this.properties.insecure()) {
+		else if (properties.insecure()) {
 			try {
 				builder
 					.sslContext(GrpcSslContexts.forClient().trustManager(InsecureTrustManagerFactory.INSTANCE).build());
@@ -715,12 +720,20 @@ public final class NodeConnection implements AutoCloseable {
 		if (channel == null || channel.isShutdown()) {
 			throw new IllegalStateException("channel is not connected");
 		}
+		return listNodes(channel, this.properties, this.clientId);
+	}
+
+	/**
+	 * Performs a unary {@code ListNodes} on the given channel, authenticated as the
+	 * tunnel streams are.
+	 */
+	static ListNodesResponse listNodes(ManagedChannel channel, SluiceClientProperties properties, String clientId) {
 		Metadata metadata = new Metadata();
-		String token = this.properties.tokenValue();
+		String token = properties.tokenValue();
 		if (!token.isBlank()) {
 			metadata.put(TOKEN_HEADER, "Bearer " + token);
 		}
-		metadata.put(CLIENT_ID_HEADER, this.clientId);
+		metadata.put(CLIENT_ID_HEADER, clientId);
 		return TunnelGrpc.newBlockingStub(channel)
 			.withDeadlineAfter(10, TimeUnit.SECONDS)
 			.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(metadata))

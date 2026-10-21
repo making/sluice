@@ -67,6 +67,11 @@ class TunnelTransportWindowE2ETest {
 
 	private static int dataPort;
 
+	/**
+	 * The tap's port: the node's public url, so the tunnel stream is its only connection.
+	 */
+	private static int tapPort;
+
 	@Autowired
 	private @Nullable Router router;
 
@@ -76,7 +81,9 @@ class TunnelTransportWindowE2ETest {
 	static void properties(DynamicPropertyRegistry registry) {
 		grpcPort = TestPorts.freePort();
 		dataPort = TestPorts.freePort();
+		tapPort = TestPorts.freePort();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
+		registry.add("sluice.node.public-url", () -> "grpc://127.0.0.1:" + tapPort);
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.limits.tunnel-budget", () -> BUDGET + "B");
 		registry.add("sluice.token", () -> "it-token");
@@ -101,8 +108,8 @@ class TunnelTransportWindowE2ETest {
 		String downloadHost = "download.transport.window.test";
 		String uploadHost = "upload.transport.window.test";
 		AtomicLong uploaded = new AtomicLong();
-		H2WindowTap tap = remember(H2WindowTap.start(grpcPort));
-		startClient(tap.port(), Upstream.builder().host(downloadHost).target("tcp://127.0.0.1:" + download()).build(),
+		H2WindowTap tap = remember(H2WindowTap.start(grpcPort, tapPort));
+		startClient(grpcPort, Upstream.builder().host(downloadHost).target("tcp://127.0.0.1:" + download()).build(),
 				Upstream.builder().host(uploadHost).target("tcp://127.0.0.1:" + sink(uploaded)).build());
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.getOutputStream()

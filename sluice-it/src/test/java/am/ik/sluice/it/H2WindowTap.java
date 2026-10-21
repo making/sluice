@@ -37,16 +37,19 @@ public final class H2WindowTap implements AutoCloseable {
 
 	private final Side target = new Side();
 
-	private H2WindowTap(int targetPort) throws IOException {
+	private H2WindowTap(int targetPort, int port) throws IOException {
 		this.targetPort = targetPort;
 		this.server = new ServerSocket();
-		this.server.bind(new InetSocketAddress("127.0.0.1", 0), 16);
+		this.server.bind(new InetSocketAddress("127.0.0.1", port), 16);
 		Thread.ofVirtual().name("e2e-h2-window-tap-accept").start(this::accept);
 	}
 
-	/** A tap relaying to {@code 127.0.0.1:targetPort}. */
-	public static H2WindowTap start(int targetPort) throws IOException {
-		return new H2WindowTap(targetPort);
+	/**
+	 * A tap on {@code 127.0.0.1:port} (taken from {@link TestPorts}) relaying to
+	 * {@code 127.0.0.1:targetPort}.
+	 */
+	public static H2WindowTap start(int targetPort, int port) throws IOException {
+		return new H2WindowTap(targetPort, port);
 	}
 
 	/** The port the tap listens on. */

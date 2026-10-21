@@ -393,6 +393,10 @@ Behavior:
   local node is always included). It is pushed to every client once it advertised and whenever it
   changes (`MEMBERSHIP_UPDATE` frame); the client opens/closes per-node streams accordingly.
   A node with an empty public url is reachable at the address the client bootstrapped with
+- bootstrap: the client asks `sluice.server-url` for the node list (`ListNodes`) and opens
+  its streams at the public urls only, so the bootstrap may be a load balancer over any
+  node. It is asked again while no stream is up. Each public url must reach its own node
+  (a client warns when a stream reaches another one)
 - routing: a domain (or listen port) claimed by several clients is served by the one with
   the smallest `sluice.client.id` -- deterministically on every node, since every node sees
   every client. A smaller id takes over a bound listen port on advertise; a larger id gets

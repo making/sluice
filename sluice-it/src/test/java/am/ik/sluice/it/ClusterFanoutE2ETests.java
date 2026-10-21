@@ -30,7 +30,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Full stack cluster test: two/three server nodes plus one client in one JVM. The client
  * fans out one tunnel stream per node, every node serves the data plane, a stopped node
- * is failed over, a started node joins via the membership push, and drain lets in-flight
+ * is failed over and served again once back (also behind a bootstrap balancing across the
+ * nodes), a started node joins via the membership push, and drain lets in-flight
  * connections finish.
  */
 @TestInstance(Lifecycle.PER_CLASS)
@@ -149,8 +150,12 @@ class ClusterFanoutE2ETests {
 	}
 
 	private void startClient() {
+		startClient(this.grpcPorts[0]);
+	}
+
+	private void startClient(int bootstrapPort) {
 		ConfigurableApplicationContext context = new SpringApplicationBuilder(SluiceClientApplication.class).run(
-				"--sluice.server-url=grpc://127.0.0.1:" + this.grpcPorts[0], "--sluice.client.id=it-client",
+				"--sluice.server-url=grpc://127.0.0.1:" + bootstrapPort, "--sluice.client.id=it-client",
 				"--sluice.client.upstream[0].host=" + HOST,
 				"--sluice.client.upstream[0].target=http://127.0.0.1:" + this.httpPort,
 				"--sluice.client.upstream[1].host=",
@@ -252,21 +257,30 @@ class ClusterFanoutE2ETests {
 		}
 		startServer(0);
 		startServer(1);
-		startClient();
-		this.awaitSessionOnAllNodes(2, Duration.ofSeconds(20));
+		// the bootstrap is a load balancer in front of the nodes, reaching node-1 first
+		try (DelayingProxy bootstrap = DelayingProxy.start(this.grpcPorts[0], Duration.ZERO)) {
+			startClient(bootstrap.port());
+			this.awaitSessionOnAllNodes(2, Duration.ofSeconds(20));
 
-		// the same routes serve through both nodes
-		assertThat(this.httpRoundTrip(0)).contains("cluster-ok");
-		assertThat(this.httpRoundTrip(1)).contains("cluster-ok");
-		assertThat(this.echoRoundTrip(0, "ping-a")).isEqualTo("ping-a");
-		assertThat(this.echoRoundTrip(1, "ping-b")).isEqualTo("ping-b");
+			// the same routes serve through both nodes
+			assertThat(this.httpRoundTrip(0)).contains("cluster-ok");
+			assertThat(this.httpRoundTrip(1)).contains("cluster-ok");
+			assertThat(this.echoRoundTrip(0, "ping-a")).isEqualTo("ping-a");
+			assertThat(this.echoRoundTrip(1, "ping-b")).isEqualTo("ping-b");
 
-		// node failure: the remaining node keeps serving, the client stays up
-		closeContext(this.servers[1]);
-		this.servers[1] = null;
-		// nullable write is fine: the array is scanned for null entries everywhere
-		assertThat(this.tunnelClient().isConnected()).isTrue();
-		assertThat(this.httpRoundTrip(0)).contains("cluster-ok");
+			// node failure: the remaining node keeps serving, the client stays up
+			bootstrap.retarget(this.grpcPorts[1]);
+			closeContext(this.servers[0]);
+			this.servers[0] = null;
+			assertThat(this.tunnelClient().isConnected()).isTrue();
+			assertThat(this.httpRoundTrip(1)).contains("cluster-ok");
+
+			// back, node-1 is served again: no stream went through the bootstrap, which
+			// now reaches node-2 and would have left node-1 without the client's routes
+			startServer(0);
+			this.awaitSessionOnAllNodes(2, Duration.ofSeconds(30));
+			assertThat(this.httpRoundTrip(0)).contains("cluster-ok");
+		}
 	}
 
 	@Test

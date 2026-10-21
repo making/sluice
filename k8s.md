@@ -298,9 +298,10 @@ Notes:
 - Replace the single-node release when switching (`helm uninstall sluice-server -n sluice`).
 - Env vars may use the plain property names (`sluice.token-file`) -- no need for
   `UPPER_SNAKE`; the values are plain strings and Spring binds them as-is.
-- Clients only need one entry point: the bootstrap `--sluice.server-url` (any node LB);
-    the rest of the membership arrives via the control plane. The data plane LB is the
-    front for ordinary HTTP traffic (`Host` header routing); any node answers.
+- Clients only need one entry point: the bootstrap `--sluice.server-url` (any node LB),
+    asked for the node list only; the streams go to the per-node addresses. The data
+    plane LB is the front for ordinary HTTP traffic (`Host` header routing); any node
+    answers.
 - A dynamic membership provider is planned; once it lands the env goes away and
   `kubectl scale` is enough.
 

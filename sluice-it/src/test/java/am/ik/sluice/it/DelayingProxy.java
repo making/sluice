@@ -21,13 +21,15 @@ import org.jspecify.annotations.Nullable;
  * directions, so a connection through it has a round trip of twice the delay; bandwidth
  * is not limited. Each accepted connection is relayed to the target over a connection of
  * its own; an EOF passes on as a half-close once its delay passed. A prefixing proxy
- * writes its prefix (a PROXY protocol header, say) to each target connection first.
+ * writes its prefix (a PROXY protocol header, say) to each target connection first. A
+ * retargeted proxy relays the connections it accepts from then on to the new target, as a
+ * load balancer picking another backend.
  */
 public final class DelayingProxy implements AutoCloseable {
 
 	private final ServerSocket server;
 
-	private final int targetPort;
+	private volatile int targetPort;
 
 	private final long delayNanos;
 
@@ -59,6 +61,11 @@ public final class DelayingProxy implements AutoCloseable {
 	 */
 	public static DelayingProxy prefixing(int targetPort, byte[] prefix) throws IOException {
 		return new DelayingProxy(targetPort, Duration.ZERO, prefix);
+	}
+
+	/** Relays the connections accepted from now on to {@code 127.0.0.1:targetPort}. */
+	public void retarget(int targetPort) {
+		this.targetPort = targetPort;
 	}
 
 	/** The port the proxy listens on. */
