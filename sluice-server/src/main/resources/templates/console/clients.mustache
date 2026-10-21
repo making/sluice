@@ -13,8 +13,7 @@
   </dl>
   {{#peerBuild}}
   <p class="client__build" data-testid="build"><span class="client__label">Build</span>
-    {{#known}}<span class="mono" title="{{detail}}">{{implementation}} {{version}} {{commit}}</span>{{#dirty}} <span class="tag" title="Built from a working tree with uncommitted changes">dirty</span>{{/dirty}}{{/known}}
-    {{^known}}<span class="tag tag--marker" title="The client announced no build; it predates build reporting">Unknown (older build)</span>{{/known}}
+    {{>console/peer-build}}
   </p>
   {{/peerBuild}}
   <table class="grid upstreams">

@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package sluice.v1;
 
+import "sluice/v1/build.proto";
+
 option java_multiple_files = true;
 option java_package = "am.ik.sluice.v1.proto";
 
@@ -131,21 +133,6 @@ message Advertise {
   // predating the field registers them unchanged and acknowledges the advertise
   // without `withdrawn`.
   bool withdraw = 4;
-}
-
-// Which build a peer runs. Each string may be empty when the peer could not tell
-// (e.g. no build metadata was packaged).
-message PeerBuild {
-  // Implementation: "sluice-client", "sluice-wicket-wasi" or "sluice-server".
-  string implementation = 1;
-  // Release version, e.g. "0.0.1-SNAPSHOT".
-  string version = 2;
-  // Git commit id the peer was built from (full id when known).
-  string commit = 3;
-  // Whether the working tree had uncommitted changes when the peer was built.
-  bool dirty = 4;
-  // Build time as an ISO-8601 instant, e.g. "2026-10-12T01:04:33Z".
-  string build_time = 5;
 }
 
 // Either direction: the sender consumed `increment` more payload bytes of

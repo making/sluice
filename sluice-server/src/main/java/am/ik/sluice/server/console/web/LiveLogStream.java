@@ -14,7 +14,9 @@ import org.slf4j.LoggerFactory;
 
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import am.ik.sluice.tunnel.PeerBuilds;
 import am.ik.sluice.v1.proto.WatchEvent;
+import am.ik.sluice.v1.proto.WatchHello;
 import am.ik.sluice.v1.proto.WatchRequest;
 
 /**
@@ -26,7 +28,7 @@ import am.ik.sluice.v1.proto.WatchRequest;
  * <p>
  * Events: {@code row} and {@code gap} (a table row), {@code nodes} (the strip of nodes),
  * {@code flume} ({@code up}, or {@code down} before the stream ends and the browser
- * retries).
+ * retries), {@code build} (the flume's).
  */
 final class LiveLogStream implements ClientResponseObserver<WatchRequest, WatchEvent> {
 
@@ -79,10 +81,13 @@ final class LiveLogStream implements ClientResponseObserver<WatchRequest, WatchE
 	public void onNext(WatchEvent event) {
 		boolean sent = switch (event.getBodyCase()) {
 			case HELLO -> {
-				this.epoch = event.getHello().getEpoch();
+				WatchHello hello = event.getHello();
+				this.epoch = hello.getEpoch();
 				yield this.send(SseEmitter.event().name("flume").data("up").reconnectTime(RETRY_MILLIS))
-						&& (!event.getHello().getReset()
-								|| this.send(SseEmitter.event().name("gap").data(this.view.restarted())));
+						&& this.send(SseEmitter.event()
+							.name("build")
+							.data(this.view.build(hello.hasBuild() ? PeerBuilds.sanitize(hello.getBuild()) : null)))
+						&& (!hello.getReset() || this.send(SseEmitter.event().name("gap").data(this.view.restarted())));
 			}
 			case RECORD -> this.send(SseEmitter.event()
 				.id(LiveLogView.idOf(this.epoch, event.getRecord().getSeq()))

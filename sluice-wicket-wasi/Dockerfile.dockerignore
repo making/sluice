@@ -1,0 +1,10 @@
+# the context is the repository root; the build needs the proto and the crate only
+*
+!sluice-proto/src/main/proto
+!sluice-build-info/Cargo.toml
+!sluice-build-info/src
+!sluice-wicket-wasi/Cargo.toml
+!sluice-wicket-wasi/Cargo.lock
+!sluice-wicket-wasi/wicket-wasi/Cargo.toml
+!sluice-wicket-wasi/wicket-wasi/build.rs
+!sluice-wicket-wasi/wicket-wasi/src

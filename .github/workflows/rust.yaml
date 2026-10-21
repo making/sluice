@@ -1,8 +1,8 @@
 name: Rust
 # The Rust crates' own gates, apart from CI: a Java-only change runs none of them, and
 # each crate's job runs only when its paths changed. CI still builds sluice-flume for the
-# sluice-it tests. A run with the sluice-flume job passed deploys its image
-# (deploy-flume.yaml).
+# sluice-it tests. A run with the sluice-flume / sluice-wicket-wasi job passed deploys
+# its image (deploy-flume.yaml / deploy-wicket.yaml).
 on:
   push:
     branches:
@@ -10,9 +10,11 @@ on:
     paths: &rust-paths
     - 'sluice-flume/**'
     - 'sluice-wicket-wasi/**'
+    - 'sluice-build-info/**'
     - 'sluice-proto/src/main/proto/**'
     - '.github/workflows/rust.yaml'
     - '.github/workflows/deploy-flume.yaml'
+    - '.github/workflows/deploy-wicket.yaml'
   pull_request:
     branches:
     - main
@@ -30,6 +32,7 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
+      build-info: ${{ steps.filter.outputs.build-info }}
       flume: ${{ steps.filter.outputs.flume }}
       wicket: ${{ steps.filter.outputs.wicket }}
     steps:
@@ -39,15 +42,41 @@ jobs:
       id: filter
       with:
         filters: |
+          build-info:
+          - 'sluice-build-info/**'
+          - '.github/workflows/rust.yaml'
           flume:
           - 'sluice-flume/**'
+          - 'sluice-build-info/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
           - '.github/workflows/deploy-flume.yaml'
           wicket:
           - 'sluice-wicket-wasi/**'
+          - 'sluice-build-info/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
+          - '.github/workflows/deploy-wicket.yaml'
+  sluice-build-info:
+    needs: changes
+    if: needs.changes.outputs.build-info == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sluice-build-info
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    # the toolchain rust-toolchain.toml pins
+    - name: Toolchain
+      run: rustup toolchain install
+    - name: Format
+      run: cargo fmt --check
+    - name: Clippy
+      run: cargo clippy --all-targets --locked -- -D warnings
+    - name: Test
+      run: cargo test --locked
   sluice-flume:
     needs: changes
     if: needs.changes.outputs.flume == 'true'

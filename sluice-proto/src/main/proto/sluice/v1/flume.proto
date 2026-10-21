@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package sluice.v1;
 
+import "sluice/v1/build.proto";
+
 option java_multiple_files = true;
 option java_package = "am.ik.sluice.v1.proto";
 
@@ -111,6 +113,8 @@ message WatchHello {
   // The requested cursor belongs to another run of the flume: the lines in
   // between are lost, and the watch began as one without a cursor.
   bool reset = 2;
+  // The flume's build; absent from a flume predating it.
+  PeerBuild build = 3;
 }
 
 message WatchRecord {

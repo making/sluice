@@ -1,0 +1,9 @@
+[package]
+name = "sluice-build-info"
+version = "0.0.1-SNAPSHOT"
+edition = "2024"
+publish = false
+
+# The build script dependency of sluice-flume and sluice-wicket-wasi (both their own
+# workspaces), so it is one too.
+[workspace]

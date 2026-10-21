@@ -1,0 +1,22 @@
+# sluice-wicket-wasi on distroless cc (glibc: wasmtime's many threads allocate through
+# glibc's malloc, not musl's). The proto lives in sluice-proto, so the build context is
+# the repository root:
+#   docker build -f sluice-wicket-wasi/Dockerfile --build-arg GIT_COMMIT=$(git rev-parse HEAD) .
+FROM rust:1.99-slim-trixie AS build
+RUN apt-get update -q && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY sluice-proto/src/main/proto sluice-proto/src/main/proto
+COPY sluice-build-info/Cargo.toml sluice-build-info/
+COPY sluice-build-info/src sluice-build-info/src
+COPY sluice-wicket-wasi/Cargo.toml sluice-wicket-wasi/Cargo.lock sluice-wicket-wasi/
+COPY sluice-wicket-wasi/wicket-wasi/Cargo.toml sluice-wicket-wasi/wicket-wasi/build.rs sluice-wicket-wasi/wicket-wasi/
+COPY sluice-wicket-wasi/wicket-wasi/src sluice-wicket-wasi/wicket-wasi/src
+# the context has no .git: the commit --version and the console show comes from here
+ARG GIT_COMMIT=""
+RUN SLUICE_GIT_COMMIT=${GIT_COMMIT} \
+    cargo build --release --locked --manifest-path sluice-wicket-wasi/Cargo.toml
+
+FROM gcr.io/distroless/cc-debian13:nonroot
+COPY --from=build /src/sluice-wicket-wasi/target/release/sluice-wicket-wasi /usr/local/bin/sluice-wicket-wasi
+ENTRYPOINT ["/usr/local/bin/sluice-wicket-wasi"]

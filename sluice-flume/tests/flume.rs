@@ -187,13 +187,6 @@ async fn shapes(events: &mut Streaming<WatchEvent>, count: usize) -> Vec<String>
     shapes
 }
 
-fn epoch_of(body: &watch_event::Body) -> u64 {
-    match body {
-        watch_event::Body::Hello(hello) => hello.epoch,
-        other => panic!("not a hello: {other:?}"),
-    }
-}
-
 /// The nodes feed only while someone watches them, the union of the watchers'
 /// filters; the watchers get the lines passing their own filter, a node's
 /// dropped lines, and the nodes coming and going.
@@ -269,14 +262,18 @@ async fn watchers_steer_the_feeds_and_get_the_lines_passing_their_filter() {
 
 /// A watch with a cursor resumes right after it, past a gap for the lines the
 /// ring lost meanwhile; one without, or with a cursor of another run, begins
-/// with the newest lines.
+/// with the newest lines. Its hello names the flume's build.
 #[tokio::test]
 async fn a_watch_resumes_after_its_cursor() {
     let url = flume(4, 2).await;
     let mut client = client(&url, TOKEN).await;
     let node = Node::connect(&mut client, "node-1", "boot").await;
     let mut first = watch(&mut client, AccessFilter::default(), None).await;
-    let epoch = epoch_of(&next(&mut first).await);
+    let watch_event::Body::Hello(hello) = next(&mut first).await else {
+        panic!("a hello first");
+    };
+    assert_eq!(hello.build, Some(sluice_flume::build()));
+    let epoch = hello.epoch;
     for node_seq in 1..=6 {
         node.event(node_seq, "request", "a.local").await;
     }

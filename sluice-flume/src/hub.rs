@@ -186,6 +186,7 @@ impl Hub {
         let mut first = vec![event(watch_event::Body::Hello(WatchHello {
             epoch: self.epoch,
             reset: after.is_some() && resume.is_none(),
+            build: Some(crate::build()),
         }))];
         first.extend(Self::node_states(&state));
         match resume {

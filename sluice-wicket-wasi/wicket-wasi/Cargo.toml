@@ -45,3 +45,4 @@ h2 = "0.4"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
+sluice-build-info = { path = "../../sluice-build-info" }

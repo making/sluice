@@ -43,11 +43,22 @@ target/debug/sluice-wicket-wasi --config wicket-wasi.yaml
 `cargo test -p sluice-wicket-wasi` builds the examples the same way (through the
 rustup `cargo` proxy, so rustup must be installed).
 
+The image `ghcr.io/making/sluice/sluice-wicket-wasi` (`latest` / `<sha>`, amd64 /
+aarch64) is published on every push to `main` changing the wicket; it takes the same
+arguments, with the components mounted:
+
+```text
+docker run --rm --pull always -v $PWD/examples/target/wasm32-wasip3/release:/wasm:ro \
+    ghcr.io/making/sluice/sluice-wicket-wasi \
+    --server grpc://host.docker.internal:8001 --token SECRET --wasm demo.local=/wasm/hello.wasm
+```
+
 `--version` prints the build: version, git commit (with `dirty` when tracked files had
-uncommitted changes) and build time, embedded by `build.rs` when the build script last
-ran. Without git the build still succeeds and
-reports `commit unknown`. The wicket logs the same line at startup and sends it in its
-`Advertise`, so the server console shows it on the wicket's row.
+uncommitted changes) and build time, embedded by `build.rs` (`sluice-build-info`) when the
+build script last ran. Without git the build still succeeds and reports `commit unknown`,
+unless `SLUICE_GIT_COMMIT` names the commit (the Dockerfile's `GIT_COMMIT` build arg). The
+wicket logs the same line at startup and sends it in its `Advertise`, so the server console
+shows it on the wicket's row.
 
 `--server` also accepts `grpcs://` (TLS). Verification uses `--ca-cert <file>` (PEM, may
 hold a chain), the webPKI roots when omitted, or nothing at all with `--insecure`

@@ -11,7 +11,7 @@ async fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Ok(Command::Version) => {
-            println!("sluice-flume {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", sluice_flume::describe_build());
             return ExitCode::SUCCESS;
         }
         Ok(Command::Serve(config)) => config,
@@ -38,8 +38,8 @@ async fn main() -> ExitCode {
     };
     // a parent process waits for this line before it dials
     println!(
-        "sluice-flume {} listening on {scheme}://{address} (ring {} lines)",
-        env!("CARGO_PKG_VERSION"),
+        "{} listening on {scheme}://{address} (ring {} lines)",
+        sluice_flume::describe_build(),
         config.settings.ring_size
     );
     let exit_on_stdin_close = config.exit_on_stdin_close;

@@ -17,7 +17,7 @@ usage: sluice-flume --token <token> [options]
   --ring-size <lines>     newest lines kept for backfill and resume (default 10000)
   --backfill <lines>      newest lines a new watch begins with (default 200)
   --exit-on-stdin-close   exit when stdin reaches its end (a parent's child process)
-  --version               print the version and exit
+  --version               print the build (version, commit, build time) and exit
 
 Each option also reads SLUICE_FLUME_<NAME> from the environment, e.g. SLUICE_FLUME_TOKEN.";
 

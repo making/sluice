@@ -13,6 +13,7 @@ on:
     - 'sluice-example-upstream/**'
     - 'sluice-it/**'
     - 'sluice-flume/**'
+    - 'sluice-build-info/**'
     - '.github/workflows/ci.yaml'
     - '.github/workflows/deploy.yaml'
   pull_request:

@@ -1933,6 +1933,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "sluice-build-info"
+version = "0.0.1-SNAPSHOT"
+
+[[package]]
 name = "sluice-wicket-wasi"
 version = "0.0.1-SNAPSHOT"
 dependencies = [
@@ -1951,6 +1955,7 @@ dependencies = [
  "serde",
  "serde-saphyr",
  "sha2",
+ "sluice-build-info",
  "tokio",
  "tokio-stream",
  "tokio-util",

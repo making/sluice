@@ -16,12 +16,13 @@ import org.springframework.stereotype.Component;
 
 import am.ik.sluice.v1.proto.AccessEvent;
 import am.ik.sluice.v1.proto.Cursor;
+import am.ik.sluice.v1.proto.PeerBuild;
 import am.ik.sluice.v1.proto.WatchGap;
 import am.ik.sluice.v1.proto.WatchRecord;
 
 /**
  * Renders what the flume streams into the HTML fragments the live access log page
- * inserts: one table row per line or gap, and the strip of nodes.
+ * inserts: one table row per line or gap, the strip of nodes, and the flume's build.
  */
 @Component
 class LiveLogView {
@@ -38,10 +39,13 @@ class LiveLogView {
 
 	private final Template nodes;
 
+	private final Template build;
+
 	LiveLogView(Mustache.Compiler compiler) {
 		this.row = compiler.loadTemplate("console/access-log-row");
 		this.gap = compiler.loadTemplate("console/access-log-gap");
 		this.nodes = compiler.loadTemplate("console/access-log-nodes");
+		this.build = compiler.loadTemplate("console/peer-build");
 	}
 
 	/** The SSE event id of a position: {@code <epoch>-<seq>}. */
@@ -105,6 +109,11 @@ class LiveLogView {
 			.map(entry -> new NodeChip(entry.getKey(), entry.getValue()))
 			.toList();
 		return this.nodes.execute(Map.of("nodes", chips));
+	}
+
+	/** The flume's build, sanitized; {@code null} = a flume predating build reporting. */
+	String build(@Nullable PeerBuild build) {
+		return this.build.execute(ConsoleView.PeerBuildView.of(build));
 	}
 
 	/**

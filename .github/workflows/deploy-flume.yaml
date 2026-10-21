@@ -1,7 +1,7 @@
 name: Deploy flume
 # Builds and saves the sluice-flume image once the Rust workflow succeeds on a push to
-# main with its sluice-flume job run (a wicket-only run deploys nothing). This file only
-# takes effect from the default branch (workflow_run).
+# main with its sluice-flume job run (a wicket-only run deploys nothing here). This file
+# only takes effect from the default branch (workflow_run).
 on:
   workflow_run:
     workflows:
@@ -88,7 +88,7 @@ jobs:
         ARCH: ${{ matrix.arch }}
       run: |
         IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/sluice-flume | tr '[:upper:]' '[:lower:]')"
-        docker build -f sluice-flume/Dockerfile -t ${IMAGE}:${ARCH}_${REVISION} .
+        docker build -f sluice-flume/Dockerfile --build-arg GIT_COMMIT=${REVISION} -t ${IMAGE}:${ARCH}_${REVISION} .
         docker push ${IMAGE}:${ARCH}_${REVISION}
         docker tag ${IMAGE}:${ARCH}_${REVISION} ${IMAGE}:${ARCH}
         docker push ${IMAGE}:${ARCH}

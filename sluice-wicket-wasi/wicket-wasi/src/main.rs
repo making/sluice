@@ -54,8 +54,6 @@ mod pb {
     include!(concat!(env!("OUT_DIR"), "/sluice.v1.rs"));
 }
 
-#[cfg(test)]
-mod build_info;
 mod config;
 mod routes;
 mod tls;
@@ -936,9 +934,9 @@ fn peer_build() -> PeerBuild {
     PeerBuild {
         implementation: "sluice-wicket-wasi".into(),
         version: env!("CARGO_PKG_VERSION").into(),
-        commit: env!("SLUICE_WICKET_COMMIT").into(),
-        dirty: env!("SLUICE_WICKET_DIRTY") == "true",
-        build_time: env!("SLUICE_WICKET_BUILD_TIME").into(),
+        commit: env!("SLUICE_BUILD_COMMIT").into(),
+        dirty: env!("SLUICE_BUILD_DIRTY") == "true",
+        build_time: env!("SLUICE_BUILD_TIME").into(),
     }
 }
 
@@ -1662,8 +1660,8 @@ mod tests {
         let build = advertise.build.expect("a build");
         assert_eq!(build.implementation, "sluice-wicket-wasi");
         assert_eq!(build.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(build.commit, env!("SLUICE_WICKET_COMMIT"));
-        assert_eq!(build.build_time, env!("SLUICE_WICKET_BUILD_TIME"));
+        assert_eq!(build.commit, env!("SLUICE_BUILD_COMMIT"));
+        assert_eq!(build.build_time, env!("SLUICE_BUILD_TIME"));
     }
 
     #[test]
@@ -1699,44 +1697,6 @@ mod tests {
                 "9".repeat(MAX_FIELD_CHARS)
             )
         );
-    }
-
-    /// A build without git (missing program, or outside a work tree) still
-    /// gets an identification: an empty commit, reported as unknown.
-    #[test]
-    fn git_state_without_git_is_unknown() {
-        let dir = std::env::temp_dir();
-        let missing = build_info::git_state("sluice-no-such-git", &dir);
-        assert_eq!(
-            missing,
-            build_info::GitState {
-                commit: String::new(),
-                dirty: false
-            }
-        );
-        assert!(build_info::git_watch_paths("sluice-no-such-git", &dir).is_empty());
-    }
-
-    #[test]
-    fn git_state_reads_the_commit_of_the_work_tree() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let Some(head) = build_info::git("git", dir, &["rev-parse", "HEAD"]) else {
-            return; // no git on this machine: covered by git_state_without_git_is_unknown
-        };
-        assert_eq!(build_info::git_state("git", dir).commit, head);
-        assert!(
-            build_info::git_watch_paths("git", dir)
-                .iter()
-                .any(|path| path.ends_with("HEAD")),
-            "HEAD is watched"
-        );
-    }
-
-    #[test]
-    fn rfc3339_formats_utc_instants() {
-        assert_eq!(build_info::rfc3339(0), "1970-01-01T00:00:00Z");
-        assert_eq!(build_info::rfc3339(951_782_400), "2000-02-29T00:00:00Z");
-        assert_eq!(build_info::rfc3339(1_760_000_000), "2025-10-09T08:53:20Z");
     }
 
     fn session(url: &str) -> Arc<Session> {

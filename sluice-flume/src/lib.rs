@@ -25,6 +25,39 @@ pub mod proto {
 
 use proto::flume_server::FlumeServer;
 
+/// This binary's build, embedded by `build.rs`; an empty commit means git was
+/// unavailable when it was built.
+pub fn build() -> proto::PeerBuild {
+    proto::PeerBuild {
+        implementation: "sluice-flume".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        commit: env!("SLUICE_BUILD_COMMIT").into(),
+        dirty: env!("SLUICE_BUILD_DIRTY") == "true",
+        build_time: env!("SLUICE_BUILD_TIME").into(),
+    }
+}
+
+/// [`build`] in one line, e.g. `sluice-flume 0.0.1-SNAPSHOT (<commit>, dirty, built
+/// 2026-10-12T01:04:33Z)`.
+pub fn describe_build() -> String {
+    let build = build();
+    let mut details = vec![if build.commit.is_empty() {
+        "commit unknown".to_string()
+    } else {
+        build.commit
+    }];
+    if build.dirty {
+        details.push("dirty".into());
+    }
+    details.push(format!("built {}", build.build_time));
+    format!(
+        "{} {} ({})",
+        build.implementation,
+        build.version,
+        details.join(", ")
+    )
+}
+
 /// What the server needs once its listener is bound.
 #[derive(Clone, Debug)]
 pub struct Settings {

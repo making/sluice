@@ -481,9 +481,9 @@ class ConsoleE2ETest {
 	}
 
 	/**
-	 * The access log page shows the node's lines as they are logged; a kind filter
-	 * narrows them (in the page's address too), and a paused view picks up the lines
-	 * logged meanwhile once resumed, each once.
+	 * The access log page shows the flume's build and the node's lines as they are
+	 * logged; a kind filter narrows them (in the page's address too), and a paused view
+	 * picks up the lines logged meanwhile once resumed, each once.
 	 */
 	@Test
 	void accessLogShowsTheLinesAsTheyAreLogged() throws Exception {
@@ -492,6 +492,7 @@ class ConsoleE2ETest {
 		LocatorAssertions.HasTextOptions redial = new LocatorAssertions.HasTextOptions().setTimeout(40_000);
 		LocatorAssertions.HasCountOptions wait = new LocatorAssertions.HasCountOptions().setTimeout(10_000);
 		PlaywrightAssertions.assertThat(page.getByTestId("livelog-state")).hasText("Live", redial);
+		PlaywrightAssertions.assertThat(page.getByTestId("livelog-build")).containsText("sluice-flume 0.0.1-SNAPSHOT");
 		PlaywrightAssertions.assertThat(page.locator("#livelog-nodes [data-node='console-node']"))
 			.hasText("console-node", redial);
 		Locator rows = page.locator("#livelog-rows tr");

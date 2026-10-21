@@ -29,10 +29,13 @@ sluice-flume/target/release/sluice-flume --token FLUME_SECRET            # grpc:
 Every flume option is also an environment variable `SLUICE_FLUME_<NAME>` (`--help`):
 `--host`, `--port` (8002), `--token` / `--token-file` (required), `--tls-cert` /
 `--tls-key` (PEM, serves `grpcs://`), `--ring-size`, `--backfill` (200: the newest lines a
-new view begins with), `--exit-on-stdin-close`. It prints a `listening on ...` line once
-bound and serves the gRPC health service (`sluice.v1.Flume`) without the token. Nodes dial
-a `grpcs://` flume verified against `sluice.live-log.tls-bundle`, else the JVM trust store;
-`sluice.live-log.insecure=true` skips the verification.
+new view begins with), `--exit-on-stdin-close`. `--version` prints its build (version, git
+commit, build time); the `listening on ...` line it prints once bound starts with the same,
+and every view's `WatchHello` carries it, shown next to the page's state (a flume predating
+that shows `Unknown (older build)`). It serves the gRPC health service (`sluice.v1.Flume`)
+without the token. Nodes dial a `grpcs://` flume verified against
+`sluice.live-log.tls-bundle`, else the JVM trust store; `sluice.live-log.insecure=true`
+skips the verification.
 
 ## When nodes send
 

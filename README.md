@@ -54,7 +54,8 @@ verification). For mutual TLS see "Mutual TLS (server <-> client)".
 Multi-arch (amd64 / aarch64) JVM and native images are published to ghcr.io on every push to
 `main`: `ghcr.io/making/sluice/sluice-server:{jvm,native}` and
 `ghcr.io/making/sluice/sluice-client:{jvm,native}` (immutable `jvm_<sha>` / `native_<sha>` tags too),
-and the live access log's `ghcr.io/making/sluice/sluice-flume` (`latest` / `<sha>`).
+the live access log's `ghcr.io/making/sluice/sluice-flume` and the experimental
+`ghcr.io/making/sluice/sluice-wicket-wasi` (both `latest` / `<sha>`).
 
 ```
 docker run --rm --pull always --name sluice-server -p 8000:8000 -p 8001:8001 -p 8081:8081 \
@@ -663,8 +664,8 @@ build when its stream comes up.
 logged, filtered by route, kind and node, with pause and follow. Behind a load balancer each
 request is logged by one node only; the nodes feed their lines to `sluice-flume`, a small
 gRPC server collecting them in memory while someone watches, and the console of any node
-shows them all. Without a viewer the nodes send nothing; without `sluice.live-log.url` the
-feature is off.
+shows them all, with the flume's build (version and commit). Without a viewer the nodes send
+nothing; without `sluice.live-log.url` the feature is off.
 
 ```text
 cargo build --release --manifest-path sluice-flume/Cargo.toml   # needs protoc

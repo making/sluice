@@ -194,7 +194,7 @@ class ConsoleView {
 				.inbound(Humanize.bytes(session.bytesInbound()))
 				.outbound(Humanize.bytes(session.bytesOutbound()))
 				.draining(session.drained() || session.withdrawn())
-				.peerBuild(peerBuild(session.clientBuild().orElse(null)))
+				.peerBuild(PeerBuildView.of(session.clientBuild().orElse(null)))
 				.upstreams(session.upstreams()
 					.stream()
 					.map(upstream -> upstreamRow(upstream, session.rejectedPorts().contains(upstream.getListenPort()))
@@ -203,25 +203,6 @@ class ConsoleView {
 					.toList())
 				.build())
 			.toList();
-	}
-
-	/**
-	 * The build a client announced, as display text; {@code null} = it announced none.
-	 */
-	private static PeerBuildView peerBuild(@Nullable PeerBuild build) {
-		if (build == null) {
-			return PeerBuildView.builder().known(false).build();
-		}
-		String time = build.getBuildTime().isEmpty() ? "build time unknown" : "built " + build.getBuildTime();
-		return PeerBuildView.builder()
-			.known(true)
-			.implementation(build.getImplementation().isEmpty() ? "Unknown implementation" : build.getImplementation())
-			.version(build.getVersion().isEmpty() ? "version unknown" : build.getVersion())
-			.commit(build.getCommit().isEmpty() ? "commit unknown" : PeerBuilds.shortCommit(build.getCommit()))
-			.dirty(build.getDirty())
-			.detail(build.getCommit().isEmpty() ? StringUtils.capitalize(time)
-					: "Commit " + build.getCommit() + ", " + time)
-			.build();
 	}
 
 	private static UpstreamRow.Builder upstreamRow(Upstream upstream, boolean rejected) {
@@ -625,17 +606,37 @@ class ConsoleView {
 	}
 
 	/**
-	 * The build a client announced in its {@code Advertise}, as display text. The strings
-	 * come from the peer, bounded by {@link PeerBuilds#sanitize}; the template escapes
-	 * them.
+	 * The build a peer announced (a client in its {@code Advertise}, the flume in its
+	 * {@code WatchHello}), as display text. The strings come from the peer, bounded by
+	 * {@link PeerBuilds#sanitize}; the template escapes them.
 	 *
-	 * @param known whether the client announced a build at all; one that predates build
+	 * @param known whether the peer announced a build at all; one that predates build
 	 * reporting announces none
 	 * @param commit the commit id, shortened when hexadecimal
 	 * @param detail the full commit id and the build time
 	 */
 	public record PeerBuildView(boolean known, String implementation, String version, String commit, boolean dirty,
 			String detail) {
+
+		/**
+		 * The display text of a sanitized build; {@code null} = the peer announced none.
+		 */
+		static PeerBuildView of(@Nullable PeerBuild build) {
+			if (build == null) {
+				return builder().known(false).build();
+			}
+			String time = build.getBuildTime().isEmpty() ? "build time unknown" : "built " + build.getBuildTime();
+			String implementation = build.getImplementation().isEmpty() ? "Unknown implementation"
+					: build.getImplementation();
+			return builder().known(true)
+				.implementation(implementation)
+				.version(build.getVersion().isEmpty() ? "version unknown" : build.getVersion())
+				.commit(build.getCommit().isEmpty() ? "commit unknown" : PeerBuilds.shortCommit(build.getCommit()))
+				.dirty(build.getDirty())
+				.detail(build.getCommit().isEmpty() ? StringUtils.capitalize(time)
+						: "Commit " + build.getCommit() + ", " + time)
+				.build();
+		}
 
 		public static Builder builder() {
 			return new Builder();

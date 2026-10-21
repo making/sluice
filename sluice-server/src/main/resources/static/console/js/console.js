@@ -26,6 +26,7 @@ document.addEventListener("htmx:finally:request", (event) => {
     const state = document.querySelector("[data-testid=livelog-state]");
     const missed = document.querySelector("[data-testid=livelog-missed]");
     const nodes = document.getElementById("livelog-nodes");
+    const build = document.getElementById("livelog-build");
     const pause = document.querySelector("[data-livelog-pause]");
     const follow = document.querySelector("[data-livelog-follow]");
     const scroll = document.querySelector("[data-livelog-scroll]");
@@ -90,6 +91,9 @@ document.addEventListener("htmx:finally:request", (event) => {
         nodes.innerHTML = event.data;
       });
       source.addEventListener("flume", (event) => setState(event.data));
+      source.addEventListener("build", (event) => {
+        build.innerHTML = event.data;
+      });
       // the browser retries on its own unless the answer was no stream at all (the
       // session expired, say)
       source.addEventListener("error", (event) => {
