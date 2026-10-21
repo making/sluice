@@ -53,7 +53,8 @@ verification). For mutual TLS see "Mutual TLS (server <-> client)".
 
 Multi-arch (amd64 / aarch64) JVM and native images are published to ghcr.io on every push to
 `main`: `ghcr.io/making/sluice/sluice-server:{jvm,native}` and
-`ghcr.io/making/sluice/sluice-client:{jvm,native}` (immutable `jvm_<sha>` / `native_<sha>` tags too).
+`ghcr.io/making/sluice/sluice-client:{jvm,native}` (immutable `jvm_<sha>` / `native_<sha>` tags too),
+and the live access log's `ghcr.io/making/sluice/sluice-flume` (`latest` / `<sha>`).
 
 ```
 docker run --rm --pull always --name sluice-server -p 8000:8000 -p 8001:8001 -p 8081:8081 \
@@ -656,6 +657,30 @@ hover. A client that predates build reporting shows `Unknown (older build)`; the
 The server logs each client's build at its first `Advertise`; the Java client logs the server's
 build when its stream comes up.
 
+#### Live access log
+
+`/console/access-log` shows the access log lines of every node of the cluster as they are
+logged, filtered by route, kind and node, with pause and follow. Behind a load balancer each
+request is logged by one node only; the nodes feed their lines to `sluice-flume`, a small
+gRPC server collecting them in memory while someone watches, and the console of any node
+shows them all. Without a viewer the nodes send nothing; without `sluice.live-log.url` the
+feature is off.
+
+```text
+cargo build --release --manifest-path sluice-flume/Cargo.toml   # needs protoc
+sluice-flume/target/release/sluice-flume --token FLUME_SECRET   # grpc://0.0.0.0:8002
+
+# every node
+java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar --sluice.token=SECRET \
+  --sluice.live-log.url=grpc://127.0.0.1:8002 --sluice.live-log.token=FLUME_SECRET
+```
+
+A node queues at most 4096 lines for the flume and drops (and counts) the rest, never
+holding a request back; the page shows the lines missed and the nodes disconnected. A
+browser reconnecting, to any node, resumes after the last line it showed. The server starts
+and serves with the flume down. Topology, drops, ordering and proxy settings:
+[.kb/live-access-log.md](.kb/live-access-log.md).
+
 #### Client certificate issuance
 
 With a CA configured, the console issues client certificates for the mTLS control plane:
@@ -797,6 +822,15 @@ its discovery document advertises an `end_session_endpoint`; register
 | `sluice.access-log.rate-limit.enabled` | `true` | rate limit access log lines per line kind, syslog style (as in `rate-limited-logger`) |
 | `sluice.access-log.rate-limit.max-rate` | `10` | max lines emitted per line kind (`conn-accept` / `conn-close` / `conn-reject` / `request`) within one period; the line that reaches the limit is still emitted |
 | `sluice.access-log.rate-limit.period` | `10s` | rate limit window; lines beyond the limit are counted and one `type=ratelimit` summary line reports the suppressed count when the period rolls over |
+
+### Live access log
+
+| Property | Default | Description |
+|---|---|---|
+| `sluice.live-log.url` | (empty = off) | the `sluice-flume` the node feeds its access log lines to while someone watches, and the console watches: `grpc://host:port` / `grpcs://host:port`; see "Live access log" |
+| `sluice.live-log.token` | - | the flume's bearer token (`--token` of `sluice-flume`) |
+| `sluice.live-log.tls-bundle` | - | SSL bundle verifying a `grpcs://` flume (truststore; a keystore is presented for mTLS) |
+| `sluice.live-log.insecure` | `false` | skip the verification of a `grpcs://` flume's certificate; `tls-bundle` takes precedence |
 
 ### Cluster
 

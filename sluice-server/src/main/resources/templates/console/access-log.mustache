@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Access log | Sluice console</title>
+  <link rel="icon" type="image/svg+xml" href="{{#src}}/console/img/logo.svg{{/src}}">
+  <link rel="stylesheet" href="{{#src}}/console/css/console.css{{/src}}">
+  <script src="{{#src}}/console/js/console.min.js{{/src}}" defer></script>
+</head>
+<body>
+
+{{>console/masthead}}
+
+<main class="report report--wide">
+  <section class="panel" aria-labelledby="access-log-heading">
+    <h1 id="access-log-heading" class="rule-heading">Access log</h1>
+    {{#enabled}}
+    <p class="hint">The access log lines of every node feeding <span class="mono">{{flumeUrl}}</span>, newest last, as the
+      nodes log them; a node sends its lines only while someone watches.</p>
+    <form class="livelog__filters" data-livelog-filters>
+      <label class="livelog__field">Route
+        <select name="route" data-testid="livelog-route">
+          <option value="">All routes</option>
+          {{#routes}}<option value="{{value}}"{{#selected}} selected{{/selected}}>{{label}}</option>{{/routes}}
+        </select>
+      </label>
+      <label class="livelog__field">Node
+        <select name="node" data-testid="livelog-node">
+          <option value="">All nodes</option>
+          {{#nodes}}<option value="{{value}}"{{#selected}} selected{{/selected}}>{{label}}</option>{{/nodes}}
+        </select>
+      </label>
+      <fieldset class="livelog__kinds">
+        <legend>Kinds <span class="hint">(none = all)</span></legend>
+        {{#kinds}}<label><input type="checkbox" name="kind" value="{{value}}"{{#selected}} checked{{/selected}}> {{label}}</label>{{/kinds}}
+      </fieldset>
+    </form>
+    <div class="livelog__bar">
+      <span class="livelog__state" data-testid="livelog-state" data-state="connecting">Connecting</span>
+      <span class="livelog__missed">Missed <span class="num" data-testid="livelog-missed">0</span></span>
+      <span class="livelog__nodes" id="livelog-nodes" data-testid="livelog-nodes"></span>
+      <span class="livelog__controls">
+        <label><input type="checkbox" data-livelog-follow checked> Follow</label>
+        <button type="button" class="route-gate__toggle" data-livelog-pause aria-pressed="false">Pause</button>
+      </span>
+    </div>
+    <div class="livelog__scroll" data-livelog-scroll>
+      <table class="grid livelog" data-testid="livelog-table">
+        <thead>
+          <tr><th>Time</th><th>Node</th><th>Kind</th><th>Route</th><th>Line</th></tr>
+        </thead>
+        <tbody id="livelog-rows" data-livelog-stream="/console/access-log/stream" data-row-cap="{{rowCap}}"></tbody>
+      </table>
+    </div>
+    {{/enabled}}
+    {{^enabled}}
+    <p class="empty" data-testid="livelog-off">The live access log is off. Point <code>sluice.live-log.url</code> (with
+      <code>sluice.live-log.token</code>) of every node at a sluice-flume to watch the lines of the whole cluster here.</p>
+    {{/enabled}}
+  </section>
+</main>
+</body>
+</html>

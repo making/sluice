@@ -168,6 +168,30 @@
 		"allDeclaredFields": true
 	},
 	{
+		"name": "am.ik.sluice.server.console.web.LiveLogView$Choice",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.LiveLogView$Gap",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.LiveLogView$NodeChip",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
+		"name": "am.ik.sluice.server.console.web.LiveLogView$Row",
+		"allDeclaredConstructors": true,
+		"allDeclaredMethods": true,
+		"allDeclaredFields": true
+	},
+	{
 		"name": "am.ik.sluice.server.proxy.hop.Hop$LockGuard",
 		"queryAllPublicMethods": true
 	},

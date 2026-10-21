@@ -52,7 +52,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Drives the management console in a real browser against a running server with one
- * tunnel client advertising an http and a tcp upstream.
+ * tunnel client advertising an http and a tcp upstream, feeding its access log to a
+ * sluice-flume started after the server.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -76,6 +77,10 @@ class ConsoleE2ETest {
 	private static int dataPort;
 
 	private static int tcpRoutePort;
+
+	private static int flumePort;
+
+	private static @Nullable Flume flume;
 
 	private static @Nullable HttpServer httpUpstream;
 
@@ -107,6 +112,9 @@ class ConsoleE2ETest {
 		grpcPort = TestPorts.freePort();
 		dataPort = TestPorts.freePort();
 		tcpRoutePort = TestPorts.freePort();
+		flumePort = TestPorts.freePort();
+		registry.add("sluice.live-log.url", () -> Flume.url(flumePort));
+		registry.add("sluice.live-log.token", () -> Flume.TOKEN);
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.token", () -> "it-token");
@@ -184,6 +192,8 @@ class ConsoleE2ETest {
 				.atMost(Duration.ofSeconds(10))
 				.until(() -> this.sessions.find(clientId).map(s -> !s.upstreams().isEmpty()).orElse(false));
 		}
+		// the server is up without its flume: the feed redials until it comes
+		flume = Flume.start(flumePort);
 		this.playwright = Playwright.create();
 		this.browser = this.playwright.chromium().launch();
 	}
@@ -227,6 +237,9 @@ class ConsoleE2ETest {
 		}
 		if (tcpUpstream != null) {
 			tcpUpstream.close();
+		}
+		if (flume != null) {
+			flume.close();
 		}
 		UPSTREAM_EXECUTOR.shutdownNow();
 	}
@@ -465,6 +478,60 @@ class ConsoleE2ETest {
 				.hasClass(Pattern.compile("is-active"), new LocatorAssertions.HasClassOptions().setTimeout(10_000));
 		}
 		PlaywrightAssertions.assertThat(open).hasText("0", wait);
+	}
+
+	/**
+	 * The access log page shows the node's lines as they are logged; a kind filter
+	 * narrows them (in the page's address too), and a paused view picks up the lines
+	 * logged meanwhile once resumed, each once.
+	 */
+	@Test
+	void accessLogShowsTheLinesAsTheyAreLogged() throws Exception {
+		Page page = page();
+		page.navigate("http://127.0.0.1:" + this.port + "/console/access-log");
+		LocatorAssertions.HasTextOptions redial = new LocatorAssertions.HasTextOptions().setTimeout(40_000);
+		LocatorAssertions.HasCountOptions wait = new LocatorAssertions.HasCountOptions().setTimeout(10_000);
+		PlaywrightAssertions.assertThat(page.getByTestId("livelog-state")).hasText("Live", redial);
+		PlaywrightAssertions.assertThat(page.locator("#livelog-nodes [data-node='console-node']"))
+			.hasText("console-node", redial);
+		Locator rows = page.locator("#livelog-rows tr");
+
+		dataPlaneGet("/first");
+		Locator first = rows.filter(new Locator.FilterOptions().setHasText("path=/first"));
+		PlaywrightAssertions.assertThat(first).hasCount(1, wait);
+		assertThat(first.locator("td").allInnerTexts().subList(1, 4)).containsExactly("console-node", "request",
+				"demo.local");
+		PlaywrightAssertions.assertThat(page.locator("#livelog-rows tr[data-kind='close']").first()).isAttached();
+
+		page.locator("input[name=kind][value=request]").check();
+		page.waitForURL(Pattern.compile("kind=request"));
+		// the flume's backfill, of requests only
+		PlaywrightAssertions.assertThat(first).hasCount(1, wait);
+		dataPlaneGet("/second");
+		Locator second = rows.filter(new Locator.FilterOptions().setHasText("path=/second"));
+		PlaywrightAssertions.assertThat(second).hasCount(1, wait);
+		assertThat(page.locator("#livelog-rows tr[data-kind]:not([data-kind='request'])").count()).isZero();
+
+		page.getByRole(AriaRole.BUTTON, new Page.GetByRoleOptions().setName("Pause")).click();
+		PlaywrightAssertions.assertThat(page.getByTestId("livelog-state")).hasText("Paused");
+		dataPlaneGet("/paused");
+		Locator paused = rows.filter(new Locator.FilterOptions().setHasText("path=/paused"));
+		assertThat(paused.count()).isZero();
+		page.getByRole(AriaRole.BUTTON, new Page.GetByRoleOptions().setName("Resume")).click();
+		PlaywrightAssertions.assertThat(paused).hasCount(1, wait);
+		PlaywrightAssertions.assertThat(page.getByTestId("livelog-state")).hasText("Live");
+		assertThat(second.count()).isEqualTo(1);
+	}
+
+	/** A request to demo.local through the data plane, read to its end. */
+	private static void dataPlaneGet(String path) throws Exception {
+		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+			socket.setSoTimeout(10_000);
+			socket.getOutputStream()
+				.write(("GET " + path + " HTTP/1.1\r\nHost: demo.local\r\nConnection: close\r\n\r\n")
+					.getBytes(StandardCharsets.US_ASCII));
+			assertThat(new String(socket.getInputStream().readAllBytes(), StandardCharsets.US_ASCII)).contains(" 200 ");
+		}
 	}
 
 }

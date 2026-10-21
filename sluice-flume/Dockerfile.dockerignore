@@ -1,0 +1,7 @@
+# the context is the repository root; the build needs the proto and the crate only
+*
+!sluice-proto/src/main/proto
+!sluice-flume/Cargo.toml
+!sluice-flume/Cargo.lock
+!sluice-flume/build.rs
+!sluice-flume/src

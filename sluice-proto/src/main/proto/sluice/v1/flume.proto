@@ -1,0 +1,146 @@
+syntax = "proto3";
+
+package sluice.v1;
+
+option java_multiple_files = true;
+option java_package = "am.ik.sluice.v1.proto";
+
+// The live access log of a cluster: every node feeds its access log lines to
+// sluice-flume while someone watches, and the console of any node watches them
+// all. Nodes and the flume deploy independently: evolve additively only.
+// Both rpcs are authenticated by `authorization: Bearer <token>` metadata.
+service Flume {
+  // Opened by a node and held while it runs. The node sends `hello` first, then
+  // events and gaps only between a `start` and a `stop` of the flume.
+  rpc Feed (stream FeedMessage) returns (stream FeedControl);
+  // The lines of every node as the flume receives them, newest last. The first
+  // message is a `hello`, followed by the connection state of every node the
+  // flume knows, the backfill and then the live lines.
+  rpc Watch (WatchRequest) returns (stream WatchEvent);
+}
+
+// One access log line of a node, as its `sluice.access` logger emits it.
+message AccessEvent {
+  // Increases by one per line of the node's run (`FeedHello.boot_id`).
+  uint64 node_seq = 1;
+  // When the node logged the line, in milliseconds since the epoch.
+  int64 time_unix_millis = 2;
+  // accept | close | reject | request | ratelimit
+  string kind = 3;
+  // The route key the line's settings follow (the domain or host pattern,
+  // `tcp:<port>`, `*` for the catch-all); empty before routing.
+  string route_key = 4;
+  // The key=value pairs of the line in order, values unquoted.
+  repeated Field fields = 5;
+
+  message Field {
+    string name = 1;
+    string value = 2;
+  }
+}
+
+// Which lines to pass; each list left empty passes everything.
+message AccessFilter {
+  repeated string route_keys = 1;
+  repeated string kinds = 2;
+  // Watch only: the nodes whose lines to pass.
+  repeated string node_ids = 3;
+}
+
+message FeedMessage {
+  oneof body {
+    FeedHello hello = 1;
+    AccessEvent event = 2;
+    FeedGap gap = 3;
+  }
+}
+
+message FeedHello {
+  string node_id = 1;
+  // Differs per run of the node: its `node_seq` starts over with each.
+  string boot_id = 2;
+}
+
+// Lines the node dropped since its last event (its queue to the flume was full).
+message FeedGap {
+  uint64 dropped = 1;
+}
+
+message FeedControl {
+  oneof body {
+    FeedStart start = 1;
+    FeedStop stop = 2;
+  }
+}
+
+// Start (or keep) feeding the lines passing `filter`, first those of the
+// node's recent lines past `after_node_seq` still at hand. Sent again when the
+// filter changes.
+message FeedStart {
+  uint64 after_node_seq = 1;
+  AccessFilter filter = 2;
+}
+
+// Nobody watches the node's lines any more: send nothing until the next start.
+message FeedStop {
+}
+
+message WatchRequest {
+  AccessFilter filter = 1;
+  // Resume after this line; absent = begin with the newest lines at hand.
+  optional Cursor after = 2;
+}
+
+// A position in the flume's stream of lines; `epoch` names the flume's run.
+message Cursor {
+  uint64 epoch = 1;
+  uint64 seq = 2;
+}
+
+message WatchEvent {
+  oneof body {
+    WatchHello hello = 1;
+    WatchRecord record = 2;
+    WatchGap gap = 3;
+    NodeState node = 4;
+  }
+}
+
+message WatchHello {
+  uint64 epoch = 1;
+  // The requested cursor belongs to another run of the flume: the lines in
+  // between are lost, and the watch began as one without a cursor.
+  bool reset = 2;
+}
+
+message WatchRecord {
+  uint64 seq = 1;
+  string node_id = 2;
+  AccessEvent event = 3;
+}
+
+// Lines that did not reach the watcher.
+message WatchGap {
+  // The flume's position of the gap; 0 when it has none (`BEHIND`).
+  uint64 seq = 1;
+  // The node that dropped them (`NODE_DROPPED`).
+  string node_id = 2;
+  // At most this many lines; exact without a filter.
+  uint64 dropped = 3;
+  Cause cause = 4;
+
+  enum Cause {
+    CAUSE_UNSPECIFIED = 0;
+    // The node's queue to the flume overflowed.
+    NODE_DROPPED = 1;
+    // The watcher fell behind the flume's ring of recent lines (it read too
+    // slowly, or resumed after a cursor no longer at hand).
+    BEHIND = 2;
+  }
+}
+
+message NodeState {
+  string node_id = 1;
+  // Whether the node's feed stream is open.
+  bool connected = 2;
+}

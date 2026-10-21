@@ -215,6 +215,10 @@ class ConsoleAuthE2ETest {
 		HttpResponse<String> console = get("/console");
 		assertThat(console.statusCode()).isEqualTo(200);
 		assertThat(console.body()).contains("Sluice console");
+		// no flume configured: the access log page names the setting, there is no stream
+		assertThat(get("/console/access-log").body()).contains("The live access log is off")
+			.contains("sluice.live-log.url");
+		assertThat(get("/console/access-log/stream").statusCode()).isEqualTo(404);
 
 		HttpResponse<String> logout = postForm("/logout", "_csrf=" + urlEncode(csrfOf(get("/login"))));
 		assertThat(logout.statusCode()).isEqualTo(302);

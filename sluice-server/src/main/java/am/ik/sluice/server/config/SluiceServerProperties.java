@@ -37,6 +37,8 @@ import am.ik.sluice.server.route.LoadBalance;
  * @param route per-route settings: the gate each route starts from, the credentials its
  * requests must carry
  * @param limits data plane connection limits and the head deadline
+ * @param liveLog the live access log: the flume this node feeds its lines to while
+ * someone watches, and the console watches the lines of every node from
  */
 @ConfigurationProperties("sluice")
 public record SluiceServerProperties(String token, @Nullable String tokenFile, @DefaultValue("0.0.0.0") String dataHost,
@@ -44,7 +46,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		@DefaultValue("false") boolean dataProxyProtocol, @DefaultValue("false") boolean controlProxyProtocol,
 		@DefaultValue("") String tcpPortRange, AccessLog accessLog, AccessControl accessControl, Node node,
 		Cluster cluster, Console console, Route route, @DefaultValue("smallest-client-id") LoadBalance httpLoadBalance,
-		@DefaultValue("smallest-client-id") LoadBalance tcpLoadBalance, Limits limits) {
+		@DefaultValue("smallest-client-id") LoadBalance tcpLoadBalance, Limits limits, LiveLog liveLog) {
 
 	public SluiceServerProperties {
 		dataHost = dataHost == null || dataHost.isBlank() ? "0.0.0.0" : dataHost;
@@ -55,6 +57,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		console = console == null ? Console.builder().build() : console;
 		route = route == null ? Route.builder().build() : route;
 		limits = limits == null ? Limits.builder().build() : limits;
+		liveLog = liveLog == null ? LiveLog.builder().build() : liveLog;
 	}
 
 	public boolean clusterEnabled() {
@@ -753,6 +756,77 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	}
 
 	/**
+	 * Live access log settings: while someone watches, this node feeds the access log
+	 * lines it emits to a sluice-flume, and the console watches the lines of every node
+	 * there.
+	 *
+	 * @param url the flume's address, {@code grpc://host:port} or {@code grpcs://}; empty
+	 * = off
+	 * @param token the bearer token the flume expects
+	 * @param tlsBundle SSL bundle used to dial a {@code grpcs://} flume (a truststore for
+	 * a self signed certificate)
+	 * @param insecure whether a {@code grpcs://} flume's certificate goes unverified;
+	 * {@code tls-bundle} takes precedence
+	 */
+	public record LiveLog(@DefaultValue("") String url, @DefaultValue("") String token,
+			@DefaultValue("") String tlsBundle, @DefaultValue("false") boolean insecure) {
+
+		public LiveLog {
+			url = url == null ? "" : url.strip();
+			token = token == null ? "" : token;
+			tlsBundle = tlsBundle == null ? "" : tlsBundle;
+		}
+
+		public boolean enabled() {
+			return !this.url.isEmpty();
+		}
+
+		public static Builder builder() {
+			return new Builder();
+		}
+
+		public static final class Builder {
+
+			private String url = "";
+
+			private String token = "";
+
+			private String tlsBundle = "";
+
+			private boolean insecure;
+
+			private Builder() {
+			}
+
+			public Builder url(String url) {
+				this.url = url;
+				return this;
+			}
+
+			public Builder token(String token) {
+				this.token = token;
+				return this;
+			}
+
+			public Builder tlsBundle(String tlsBundle) {
+				this.tlsBundle = tlsBundle;
+				return this;
+			}
+
+			public Builder insecure(boolean insecure) {
+				this.insecure = insecure;
+				return this;
+			}
+
+			public LiveLog build() {
+				return new LiveLog(this.url, this.token, this.tlsBundle, this.insecure);
+			}
+
+		}
+
+	}
+
+	/**
 	 * Management console settings.
 	 *
 	 * @param auth console authentication; the console is always authenticated, only the
@@ -1117,6 +1191,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 		@Nullable private Limits limits;
 
+		@Nullable private LiveLog liveLog;
+
 		private Builder() {
 		}
 
@@ -1210,6 +1286,11 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 			return this;
 		}
 
+		public Builder liveLog(LiveLog liveLog) {
+			this.liveLog = liveLog;
+			return this;
+		}
+
 		public SluiceServerProperties build() {
 			return new SluiceServerProperties(this.token == null ? "" : this.token, this.tokenFile,
 					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort, this.dataTlsBundle, this.caBundle,
@@ -1218,7 +1299,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 					this.node == null ? Node.builder().build() : this.node,
 					this.cluster == null ? Cluster.builder().build() : this.cluster,
 					this.console == null ? Console.builder().build() : this.console, this.route, this.httpLoadBalance,
-					this.tcpLoadBalance, this.limits == null ? Limits.builder().build() : this.limits);
+					this.tcpLoadBalance, this.limits == null ? Limits.builder().build() : this.limits,
+					this.liveLog == null ? LiveLog.builder().build() : this.liveLog);
 		}
 
 	}

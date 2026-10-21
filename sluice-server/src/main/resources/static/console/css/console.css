@@ -1436,3 +1436,125 @@ code {
 		padding-left: 0.6rem;
 	}
 }
+
+/* --------------------------------------------------------- live access log */
+
+.report--wide {
+	width: min(100%, 96rem);
+}
+
+.livelog__filters {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: end;
+	gap: 0.8rem 1.6rem;
+	margin: 0 0 1rem;
+	font-size: var(--step--1);
+}
+
+.livelog__field {
+	display: grid;
+	gap: 0.25rem;
+	font-weight: 600;
+}
+
+.livelog__field select {
+	min-width: 12rem;
+	padding: 0.3rem 0.1rem;
+	border: 0;
+	border-bottom: 1px solid var(--ink);
+	border-radius: 0;
+	background: transparent;
+	color: var(--ink);
+	font: inherit;
+	font-family: var(--mono);
+	font-weight: 400;
+}
+
+.livelog__kinds {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.2rem 1rem;
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+
+.livelog__kinds legend {
+	padding: 0 0 0.25rem;
+	font-weight: 600;
+}
+
+.livelog__kinds legend .hint {
+	font-weight: 400;
+}
+
+.livelog__bar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 0.5rem 1.2rem;
+	padding: 0.5rem 0;
+	border-top: 1px solid var(--hair);
+	border-bottom: 1px solid var(--hair);
+	font-size: var(--step--1);
+}
+
+.livelog__state {
+	font-weight: 700;
+	color: var(--amber);
+}
+
+.livelog__state[data-state="up"] {
+	color: var(--water);
+}
+
+.livelog__state[data-state="down"] {
+	color: var(--fault);
+}
+
+.livelog__nodes {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.3rem;
+}
+
+.livelog__controls {
+	display: flex;
+	gap: 1rem;
+	margin-left: auto;
+}
+
+.livelog__scroll {
+	max-height: min(70vh, 48rem);
+	overflow: auto;
+}
+
+.livelog th:nth-child(1) { width: 7.5rem; }
+.livelog th:nth-child(2) { width: 9rem; }
+.livelog th:nth-child(3) { width: 5.5rem; }
+.livelog th:nth-child(4) { width: 12rem; }
+
+.livelog thead th {
+	position: sticky;
+	top: 0;
+	background: var(--paper);
+}
+
+.livelog__line {
+	overflow-wrap: anywhere;
+}
+
+.livelog__gap td {
+	color: var(--amber);
+	font-style: italic;
+}
+
+@media (max-width: 720px) {
+	.livelog th:nth-child(2),
+	.livelog td:nth-child(2),
+	.livelog th:nth-child(4),
+	.livelog td:nth-child(4) {
+		display: none;
+	}
+}

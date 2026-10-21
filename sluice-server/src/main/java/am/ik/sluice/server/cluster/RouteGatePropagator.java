@@ -1,7 +1,5 @@
 package am.ik.sluice.server.cluster;
 
-import java.net.URI;
-import java.net.URISyntaxException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -15,15 +13,13 @@ import org.springframework.stereotype.Component;
 
 import am.ik.sluice.server.auth.TokenValidator;
 import am.ik.sluice.server.cluster.NodeDirectory.NodeMember;
+import am.ik.sluice.server.config.GrpcChannels;
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.v1.proto.SetRouteGateRequest;
 import am.ik.sluice.v1.proto.TunnelGrpc;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.stub.MetadataUtils;
-import io.grpc.netty.GrpcSslContexts;
-import io.grpc.netty.NettyChannelBuilder;
-import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 
 /**
  * Carries a route gate toggle made on this node's console over to the other cluster
@@ -94,54 +90,14 @@ public class RouteGatePropagator implements DisposableBean {
 	}
 
 	private ManagedChannel channel(String url) {
-		HostPort target = HostPort.parse(url);
-		NettyChannelBuilder builder = NettyChannelBuilder.forAddress(target.host(), target.port());
-		if (!url.startsWith("grpcs://")) {
-			return builder.usePlaintext().build();
-		}
-		String bundle = this.properties.cluster().tlsBundle();
-		try {
-			if (!bundle.isEmpty()) {
-				var managers = this.sslBundles.getBundle(bundle).getManagers();
-				io.netty.handler.ssl.SslContext ssl = GrpcSslContexts.forClient()
-					.keyManager(managers.getKeyManagerFactory())
-					.trustManager(managers.getTrustManagerFactory())
-					.build();
-				builder.sslContext(ssl);
-			}
-			else if (this.properties.cluster().insecure()) {
-				builder
-					.sslContext(GrpcSslContexts.forClient().trustManager(InsecureTrustManagerFactory.INSTANCE).build());
-			}
-			else {
-				return builder.useTransportSecurity().build();
-			}
-		}
-		catch (Exception e) {
-			throw new IllegalStateException("failed to build the TLS context for the peer " + url, e);
-		}
-		return builder.build();
+		return GrpcChannels
+			.builder(url, this.properties.cluster().tlsBundle(), this.properties.cluster().insecure(), this.sslBundles)
+			.build();
 	}
 
 	@Override
 	public void destroy() {
 		this.channels.values().forEach(ManagedChannel::shutdownNow);
-	}
-
-	/** {@code host} and port of a {@code grpc(s)://host[:port]} peer address. */
-	record HostPort(String host, int port) {
-
-		static HostPort parse(String url) {
-			try {
-				URI uri = new URI(url);
-				int port = uri.getPort();
-				return new HostPort(uri.getHost(), port > 0 ? port : "grpcs".equals(uri.getScheme()) ? 443 : 80);
-			}
-			catch (URISyntaxException e) {
-				throw new IllegalArgumentException("unparseable peer address: " + url, e);
-			}
-		}
-
 	}
 
 	/** The metadata keys of the control plane calls, shared with the server side. */

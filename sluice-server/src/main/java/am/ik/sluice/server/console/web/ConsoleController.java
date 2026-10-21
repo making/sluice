@@ -192,7 +192,7 @@ class ConsoleController {
 	 * The signed-in user as shown in the masthead. An OIDC subject is usually an opaque
 	 * id, so a readable claim is preferred when the provider sends one.
 	 */
-	private static String displayName(Authentication authentication) {
+	static String displayName(Authentication authentication) {
 		if (authentication.getPrincipal() instanceof OidcUser user) {
 			for (String name : new String[] { user.getPreferredUsername(), user.getEmail(), user.getFullName() }) {
 				if (name != null && !name.isBlank()) {

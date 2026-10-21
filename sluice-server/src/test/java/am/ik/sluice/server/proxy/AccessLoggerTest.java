@@ -14,6 +14,7 @@ import java.util.stream.Collectors;
 
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.config.SluiceServerProperties.AccessLog.Type;
+import am.ik.sluice.server.livelog.LiveLogTap;
 import am.ik.sluice.server.route.Router;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -33,7 +34,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * of a route, the route's; at most {@code maxRate} lines per kind within a period are
  * emitted, and the suppressed count is reported by a {@code type=ratelimit} line when the
  * period rolls over. A request refused for its route's credentials is a request line
- * naming the status and the reason.
+ * naming the status and the reason. The live access log's tap takes exactly the lines
+ * logged, and counts those its full queue drops.
  */
 class AccessLoggerTest {
 
@@ -57,6 +59,15 @@ class AccessLoggerTest {
 		return this.events.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
 	}
 
+	/** The lines the tap queued for the feed, oldest first. */
+	private static List<String> queued(LiveLogTap tap) throws InterruptedException {
+		List<String> lines = new java.util.ArrayList<>();
+		for (LiveLogTap.Line line; (line = tap.poll(Duration.ZERO)) != null;) {
+			lines.add(line.event().line());
+		}
+		return lines;
+	}
+
 	/**
 	 * A route's settings replace the server-wide ones for the lines of that route: a
 	 * request line follows its request's route, a close / reject line its connection's
@@ -65,6 +76,8 @@ class AccessLoggerTest {
 	 */
 	@Test
 	void routeSettingsReplaceTheServerWideOnesForTheLinesOfTheRoute() throws Exception {
+		LiveLogTap tap = new LiveLogTap(true, 64);
+		tap.start(0, LiveLogTap.Filter.ALL);
 		AccessLogger accessLogger = new AccessLogger(SluiceServerProperties.builder()
 			.accessLog(SluiceServerProperties.AccessLog.builder()
 				.types(Set.of(Type.ACCEPT, Type.REQUEST))
@@ -77,7 +90,7 @@ class AccessLoggerTest {
 						"tcp:9002", new SluiceServerProperties.Route.AccessLog(null, Set.of(Type.REJECT)), "*",
 						new SluiceServerProperties.Route.AccessLog(true, Set.of())))
 				.build())
-			.build(), this.now::get);
+			.build(), tap, this.now::get);
 		ConnectionHeadParser.Head.Request request = new ConnectionHeadParser.Head.Request("GET", "/", "1.1", false,
 				null);
 		try (ServerSocket serverSocket = loopbackServer();
@@ -129,6 +142,7 @@ class AccessLoggerTest {
 				"type=conn id=5 event=close listener=tcp:9000 route=db.local",
 				"type=conn id=6 event=reject listener=tcp:9000", "type=conn id=7 event=accept listener=tcp:9001",
 				"type=conn id=8 event=reject listener=tcp:9002");
+		assertThat(queued(tap)).as("the tap takes the lines logged").isEqualTo(this.messages());
 		assertThat(accessLogger.describeRoute("close.local")).isEqualTo("close");
 		assertThat(accessLogger.describeRoute("tcp:9000")).isEqualTo("accept, close, reject");
 		assertThat(accessLogger.describeRoute("tcp:9002")).isEqualTo("reject");
@@ -148,7 +162,7 @@ class AccessLoggerTest {
 			.route(SluiceServerProperties.Route.builder()
 				.accessLog(Map.of("loud.local", new SluiceServerProperties.Route.AccessLog(true, null)))
 				.build())
-			.build(), this.now::get);
+			.build(), LiveLogTap.off(), this.now::get);
 		ConnectionHeadParser.Head.Request request = new ConnectionHeadParser.Head.Request("GET", "/", "1.1", false,
 				null);
 		try (ServerSocket serverSocket = loopbackServer();
@@ -228,7 +242,7 @@ class AccessLoggerTest {
 					.build())
 				.build())
 			.build();
-		AccessLogger accessLogger = new AccessLogger(properties, this.now::get);
+		AccessLogger accessLogger = new AccessLogger(properties, LiveLogTap.off(), this.now::get);
 		try (ServerSocket serverSocket = loopbackServer();
 				Socket socket = new Socket("127.0.0.1", serverSocket.getLocalPort());
 				Socket accepted = serverSocket.accept()) {
@@ -256,7 +270,7 @@ class AccessLoggerTest {
 					.build())
 				.build())
 			.build();
-		AccessLogger accessLogger = new AccessLogger(properties, this.now::get);
+		AccessLogger accessLogger = new AccessLogger(properties, LiveLogTap.off(), this.now::get);
 		try (ServerSocket serverSocket = loopbackServer();
 				Socket socket = new Socket("127.0.0.1", serverSocket.getLocalPort());
 				Socket accepted = serverSocket.accept()) {
@@ -283,8 +297,15 @@ class AccessLoggerTest {
 		return remote.getHostString() + ":" + remote.getPort();
 	}
 
+	/**
+	 * Neither the lines suppressed reach the tap; the summary does. A line past the full
+	 * queue is dropped and counted, yet kept for the backfill; with the feed stopped, no
+	 * line is queued.
+	 */
 	@Test
 	void rateLimitsRejectLinesAndOmitsTheCloseLineOfARejectedConnection() throws Exception {
+		LiveLogTap tap = new LiveLogTap(true, 2);
+		tap.start(0, LiveLogTap.Filter.ALL);
 		SluiceServerProperties properties = SluiceServerProperties.builder()
 			.accessLog(SluiceServerProperties.AccessLog.builder()
 				.rateLimit(SluiceServerProperties.AccessLog.RateLimit.builder()
@@ -293,7 +314,7 @@ class AccessLoggerTest {
 					.build())
 				.build())
 			.build();
-		AccessLogger accessLogger = new AccessLogger(properties, this.now::get);
+		AccessLogger accessLogger = new AccessLogger(properties, tap, this.now::get);
 		try (ServerSocket serverSocket = loopbackServer();
 				Socket socket = new Socket("127.0.0.1", serverSocket.getLocalPort());
 				Socket accepted = serverSocket.accept()) {
@@ -314,6 +335,15 @@ class AccessLoggerTest {
 					type=ratelimit kind=conn-reject suppressed=2 periodMs=50
 					type=conn id=4 event=reject listener=data remote=%s reason=head-timeout durationMs=N
 					""".formatted(remote, remote));
+			assertThat(queued(tap)).isEqualTo(this.messages().subList(0, 2));
+			assertThat(tap.takeDropped()).isEqualTo(1);
+			assertThat(tap.start(0, LiveLogTap.Filter.ALL).stream().map(line -> line.event().line())).as("the backfill")
+				.isEqualTo(this.messages());
+			tap.stop();
+			this.now.addAndGet(Duration.ofMillis(100).toNanos());
+			accessLogger.accepted("data", socket).reject("limit");
+			assertThat(this.messages()).hasSize(4);
+			assertThat(queued(tap)).as("nobody watching: nothing queued").isEmpty();
 		}
 	}
 

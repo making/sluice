@@ -13,6 +13,9 @@
 		<!-- the test JVMs running at once: the classes mostly wait on timeouts, so more
 			 than the 4 vCPUs of a CI runner -->
 		<sluice.it.forks>6</sluice.it.forks>
+		<!-- the build of sluice-flume the live access log tests run as a child process -->
+		<sluice.flume.dir>${project.basedir}/../sluice-flume</sluice.flume.dir>
+		<skipTests>false</skipTests>
 	</properties>
 	<dependencies>
 		<dependency>
@@ -80,6 +83,32 @@
 				<artifactId>nullability-maven-plugin</artifactId>
 			</plugin>
 			<plugin>
+				<!-- Builds sluice-flume (Rust, debug) for the live access log tests; a
+					 missing Rust toolchain fails the build rather than skipping them. -->
+				<groupId>org.codehaus.mojo</groupId>
+				<artifactId>exec-maven-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>build-sluice-flume</id>
+						<phase>process-test-classes</phase>
+						<goals>
+							<goal>exec</goal>
+						</goals>
+						<configuration>
+							<skip>${skipTests}</skip>
+							<executable>cargo</executable>
+							<arguments>
+								<argument>build</argument>
+								<argument>--manifest-path</argument>
+								<argument>${sluice.flume.dir}/Cargo.toml</argument>
+								<argument>--target-dir</argument>
+								<argument>${sluice.flume.dir}/target</argument>
+							</arguments>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
 				<!-- The classes run in parallel JVMs, a class at a time in each, so they share no
 					 JVM state; TestPorts claims ports across JVMs. The JVMs compile
 					 with C1 only: C2 in six JVMs at once keeps the CPUs busy (on 1.8 CPUs the
@@ -90,6 +119,9 @@
 					<forkCount>${sluice.it.forks}</forkCount>
 					<reuseForks>true</reuseForks>
 					<argLine>-XX:TieredStopAtLevel=1</argLine>
+					<systemPropertyVariables>
+						<sluice.flume.binary>${sluice.flume.dir}/target/debug/sluice-flume</sluice.flume.binary>
+					</systemPropertyVariables>
 				</configuration>
 			</plugin>
 		</plugins>

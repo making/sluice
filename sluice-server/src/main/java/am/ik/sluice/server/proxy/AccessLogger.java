@@ -10,10 +10,13 @@ import java.util.Set;
 import java.util.StringJoiner;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
 import am.ik.sluice.server.auth.Verdict;
 import am.ik.sluice.server.config.SluiceServerProperties;
+import am.ik.sluice.server.livelog.AccessEvent;
+import am.ik.sluice.server.livelog.LiveLogTap;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.StreamRelay;
 import org.jspecify.annotations.Nullable;
@@ -41,6 +44,9 @@ import org.springframework.stereotype.Component;
  * within a {@code period} are emitted, further lines are suppressed and counted, and one
  * {@code type=ratelimit} summary line reports the suppressed count when the next period
  * starts.
+ * <p>
+ * Each line is built once as an {@link AccessEvent} and handed to the logger and to the
+ * live access log's tap alike: the live access log shows exactly the lines logged.
  */
 @Component
 public class AccessLogger {
@@ -61,12 +67,19 @@ public class AccessLogger {
 
 	private final @Nullable RateLimiter requestLimiter;
 
+	private final LiveLogTap tap;
+
 	@Autowired
-	AccessLogger(SluiceServerProperties properties) {
-		this(properties, System::nanoTime);
+	AccessLogger(SluiceServerProperties properties, LiveLogTap tap) {
+		this(properties, tap, System::nanoTime);
 	}
 
-	AccessLogger(SluiceServerProperties properties, LongSupplier clock) {
+	AccessLogger(SluiceServerProperties properties) {
+		this(properties, LiveLogTap.off(), System::nanoTime);
+	}
+
+	AccessLogger(SluiceServerProperties properties, LiveLogTap tap, LongSupplier clock) {
+		this.tap = tap;
 		SluiceServerProperties.AccessLog accessLog = properties.accessLog();
 		this.policy = Policy.of(accessLog.enabled(), accessLog.types());
 		Map<String, Policy> routePolicies = new HashMap<>();
@@ -80,24 +93,28 @@ public class AccessLogger {
 		if (rateLimit.enabled()) {
 			this.connAcceptLimiter = RateLimiter.builder()
 				.kind("conn-accept")
+				.sink(this::emit)
 				.maxRate(rateLimit.maxRate())
 				.period(rateLimit.period())
 				.clock(clock)
 				.build();
 			this.connCloseLimiter = RateLimiter.builder()
 				.kind("conn-close")
+				.sink(this::emit)
 				.maxRate(rateLimit.maxRate())
 				.period(rateLimit.period())
 				.clock(clock)
 				.build();
 			this.connRejectLimiter = RateLimiter.builder()
 				.kind("conn-reject")
+				.sink(this::emit)
 				.maxRate(rateLimit.maxRate())
 				.period(rateLimit.period())
 				.clock(clock)
 				.build();
 			this.requestLimiter = RateLimiter.builder()
 				.kind("request")
+				.sink(this::emit)
 				.maxRate(rateLimit.maxRate())
 				.period(rateLimit.period())
 				.clock(clock)
@@ -164,6 +181,12 @@ public class AccessLogger {
 		catch (Exception e) {
 			return "-";
 		}
+	}
+
+	/** Logs the line and hands it to the live access log. */
+	private void emit(AccessEvent event) {
+		log.info(event.line());
+		this.tap.publish(event);
 	}
 
 	private static boolean allows(@Nullable RateLimiter limiter) {
@@ -254,6 +277,9 @@ public class AccessLogger {
 
 		private String route = "-";
 
+		/** The route key the connection's lines follow; empty until known. */
+		private String routeKey = "";
+
 		private String transport = "-";
 
 		private long connectionId = -1;
@@ -302,6 +328,7 @@ public class AccessLogger {
 		 * route port's).
 		 */
 		Connection routeKey(String routeKey) {
+			this.routeKey = routeKey;
 			if (this.owner != null) {
 				this.policy = this.owner.policyOf(routeKey);
 			}
@@ -322,7 +349,7 @@ public class AccessLogger {
 		 * connection are logged by the rerouting relay with their own route.
 		 */
 		void request(ConnectionHeadParser.Head.Request request) {
-			this.logRequest(this.route, this.policy, request.method(), request.path(), request.version(),
+			this.logRequest(this.route, this.routeKey, this.policy, request.method(), request.path(), request.version(),
 					request.userAgent());
 		}
 
@@ -351,20 +378,25 @@ public class AccessLogger {
 			if (this.owner == null) {
 				return;
 			}
-			this.logRequest(tagOf(route), this.owner.policyOf(route), method, path, version, userAgent);
+			this.logRequest(route == null ? "-" : route.routeTag(), route == null ? "" : route.routeKey(),
+					this.owner.policyOf(route), method, path, version, userAgent);
 		}
 
-		private void logRequest(String routeTag, Policy policy, String method, String path, String version,
-				@Nullable String userAgent) {
+		private void logRequest(String routeTag, String routeKey, Policy policy, String method, String path,
+				String version, @Nullable String userAgent) {
 			if (!policy.request() || this.noop || this.closed || this.owner == null || !this.owner.allowRequest()) {
 				return;
 			}
-			log.info("type=req id={} route={} method={} path={} http={} remote={} userAgent={}", this.id, routeTag,
-					method, path, version, this.remote, quoted(userAgent));
-		}
-
-		private static String tagOf(Router.@Nullable Route route) {
-			return route == null ? "-" : route.routeTag();
+			this.owner.emit(AccessEvent.builder("request", routeKey)
+				.field("type", "req")
+				.field("id", this.id)
+				.field("route", routeTag)
+				.field("method", method)
+				.field("path", path)
+				.field("http", version)
+				.field("remote", this.remote)
+				.text("userAgent", userAgent)
+				.build());
 		}
 
 		/**
@@ -402,35 +434,18 @@ public class AccessLogger {
 					|| !this.owner.allowRequest()) {
 				return;
 			}
-			log.info("type=req id={} route={} method={} path={} http={} remote={} status={} reason={} userAgent={}",
-					this.id, route.routeTag(), request == null ? "-" : request.method(),
-					request == null ? "-" : request.path(), request == null ? "-" : request.version(), this.remote,
-					status, reason, quoted(request == null ? null : request.userAgent()));
-		}
-
-		/**
-		 * A free-text value as a logfmt value: {@code -} when absent, else in double
-		 * quotes with quotes and backslashes backslash-escaped and control characters as
-		 * Java unicode escapes, so it stays one field on one line.
-		 */
-		static String quoted(@Nullable String value) {
-			if (value == null) {
-				return "-";
-			}
-			StringBuilder quoted = new StringBuilder(value.length() + 2).append('"');
-			for (int i = 0; i < value.length(); i++) {
-				char c = value.charAt(i);
-				if (c == '"' || c == '\\') {
-					quoted.append('\\').append(c);
-				}
-				else if (Character.isISOControl(c)) {
-					quoted.append(String.format("\\u%04x", (int) c));
-				}
-				else {
-					quoted.append(c);
-				}
-			}
-			return quoted.append('"').toString();
+			this.owner.emit(AccessEvent.builder("request", route.routeKey())
+				.field("type", "req")
+				.field("id", this.id)
+				.field("route", route.routeTag())
+				.field("method", request == null ? "-" : request.method())
+				.field("path", request == null ? "-" : request.path())
+				.field("http", request == null ? "-" : request.version())
+				.field("remote", this.remote)
+				.field("status", status)
+				.field("reason", reason)
+				.text("userAgent", request == null ? null : request.userAgent())
+				.build());
 		}
 
 		/** Logs the connection acceptance, before route and transport are known. */
@@ -438,7 +453,7 @@ public class AccessLogger {
 			if (!this.policy.accept() || this.noop || this.owner == null || !this.owner.allowAccept()) {
 				return;
 			}
-			log.info("type=conn id={} event=accept listener={} remote={}", this.id, this.listener, this.remote);
+			this.owner.emit(this.connectionLine("accept").build());
 		}
 
 		/**
@@ -454,8 +469,10 @@ public class AccessLogger {
 			if (!this.policy.reject() || !this.owner.allowReject()) {
 				return;
 			}
-			log.info("type=conn id={} event=reject listener={} remote={} reason={} durationMs={}", this.id,
-					this.listener, this.remote, reason, (System.nanoTime() - this.startNanos) / 1_000_000);
+			this.owner.emit(this.connectionLine("reject")
+				.field("reason", reason)
+				.field("durationMs", this.durationMs())
+				.build());
 		}
 
 		/**
@@ -471,10 +488,12 @@ public class AccessLogger {
 			if (!this.policy.reject() || !this.owner.allowReject()) {
 				return;
 			}
-			log.info(
-					"type=conn id={} event=reject listener={} remote={} reason={} transport={} status={} durationMs={}",
-					this.id, this.listener, this.remote, reason, this.transport, status,
-					(System.nanoTime() - this.startNanos) / 1_000_000);
+			this.owner.emit(this.connectionLine("reject")
+				.field("reason", reason)
+				.field("transport", this.transport)
+				.field("status", status)
+				.field("durationMs", this.durationMs())
+				.build());
 		}
 
 		public void close() {
@@ -482,11 +501,33 @@ public class AccessLogger {
 				return;
 			}
 			this.closed = true;
-			log.info(
-					"type=conn id={} event=close listener={} route={} transport={} remote={} connId={} bytesIn={} bytesOut={} durationMs={}",
-					this.id, this.listener, this.route, this.transport, this.remote,
-					this.connectionId < 0 ? "-" : this.connectionId, this.bytesIn.get(), this.bytesOut.get(),
-					(System.nanoTime() - this.startNanos) / 1_000_000);
+			this.owner.emit(AccessEvent.builder("close", this.routeKey)
+				.field("type", "conn")
+				.field("id", this.id)
+				.field("event", "close")
+				.field("listener", this.listener)
+				.field("route", this.route)
+				.field("transport", this.transport)
+				.field("remote", this.remote)
+				.field("connId", this.connectionId < 0 ? "-" : this.connectionId)
+				.field("bytesIn", this.bytesIn.get())
+				.field("bytesOut", this.bytesOut.get())
+				.field("durationMs", this.durationMs())
+				.build());
+		}
+
+		/** The leading fields of an accept or reject line. */
+		private AccessEvent.Builder connectionLine(String event) {
+			return AccessEvent.builder(event, this.routeKey)
+				.field("type", "conn")
+				.field("id", this.id)
+				.field("event", event)
+				.field("listener", this.listener)
+				.field("remote", this.remote);
+		}
+
+		private long durationMs() {
+			return (System.nanoTime() - this.startNanos) / 1_000_000;
 		}
 
 		static final class Builder {
@@ -552,7 +593,7 @@ public class AccessLogger {
 	 */
 	static final class RateLimiter {
 
-		private final Logger logger;
+		private final Consumer<AccessEvent> sink;
 
 		private final String kind;
 
@@ -569,7 +610,7 @@ public class AccessLogger {
 		private long suppressed;
 
 		private RateLimiter(Builder builder) {
-			this.logger = builder.logger;
+			this.sink = builder.sink;
 			this.kind = builder.kind;
 			this.maxRate = builder.maxRate;
 			this.periodNanos = builder.period.toNanos();
@@ -601,14 +642,18 @@ public class AccessLogger {
 
 		private void report() {
 			if (this.suppressed > 0) {
-				this.logger.info("type=ratelimit kind={} suppressed={} periodMs={}", this.kind, this.suppressed,
-						this.periodNanos / 1_000_000);
+				this.sink.accept(AccessEvent.builder("ratelimit", "")
+					.field("type", "ratelimit")
+					.field("kind", this.kind)
+					.field("suppressed", this.suppressed)
+					.field("periodMs", this.periodNanos / 1_000_000)
+					.build());
 			}
 		}
 
 		static final class Builder {
 
-			private Logger logger = AccessLogger.log;
+			private Consumer<AccessEvent> sink = event -> AccessLogger.log.info(event.line());
 
 			private String kind = "-";
 
@@ -623,6 +668,14 @@ public class AccessLogger {
 
 			Builder kind(String kind) {
 				this.kind = Objects.requireNonNull(kind, "kind is required");
+				return this;
+			}
+
+			/**
+			 * Where the summary line goes; the {@code sluice.access} logger by default.
+			 */
+			Builder sink(Consumer<AccessEvent> sink) {
+				this.sink = Objects.requireNonNull(sink, "sink is required");
 				return this;
 			}
 

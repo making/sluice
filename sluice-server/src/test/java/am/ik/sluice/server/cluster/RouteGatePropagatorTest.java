@@ -74,14 +74,4 @@ class RouteGatePropagatorTest {
 		propagator.destroy();
 	}
 
-	@Test
-	void peerAddressIsParsedHostAndPort() {
-		assertThat(RouteGatePropagator.HostPort.parse("grpc://node-1:8001"))
-			.isEqualTo(new RouteGatePropagator.HostPort("node-1", 8001));
-		assertThat(RouteGatePropagator.HostPort.parse("grpcs://node-2"))
-			.isEqualTo(new RouteGatePropagator.HostPort("node-2", 443));
-		assertThat(RouteGatePropagator.HostPort.parse("grpc://node-3"))
-			.isEqualTo(new RouteGatePropagator.HostPort("node-3", 80));
-	}
-
 }
