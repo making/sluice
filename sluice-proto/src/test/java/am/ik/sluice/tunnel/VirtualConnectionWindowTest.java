@@ -64,6 +64,21 @@ class VirtualConnectionWindowTest {
 		}, command -> Thread.ofVirtual().start(command));
 	}
 
+	/**
+	 * Doubles the window once, whatever the timing: the remote sends its whole credit and
+	 * says it is blocked, then the reader takes it all at once. The remote is granted
+	 * twice the announced window and sends the byte it has left, which is read too. Where
+	 * a transfer leaves the window depends on the timing, down to the announced window.
+	 */
+	private static void doubleTheWindow(TunnelLink link) throws Exception {
+		CompletableFuture<Void> written = write(link.a, INITIAL + 1);
+		await(() -> link.toB.blocked.get() == 1 && link.toB.idle(), "the remote said it is blocked");
+		read(link.b, INITIAL);
+		assertThat(link.b.receiveWindow()).isEqualTo(2L * INITIAL);
+		written.get(20, TimeUnit.SECONDS);
+		read(link.b, 1);
+	}
+
 	/** Reads {@code bytes} as fast as they arrive. */
 	private static void read(VirtualConnection connection, long bytes) throws IOException {
 		read(connection, bytes, 64 * KIB, Duration.ZERO);
@@ -223,10 +238,8 @@ class VirtualConnectionWindowTest {
 	void anIdleConnectionTakesTheRemotesCreditBack() throws Exception {
 		TunnelBudget budget = new TunnelBudget(16L * MIB);
 		try (TunnelLink link = link(budget, Duration.ofMillis(100))) {
-			CompletableFuture<Void> written = write(link.a, 8L * MIB);
-			read(link.b, 8L * MIB);
-			written.get(20, TimeUnit.SECONDS);
-			assertThat(link.b.peakWindow()).isEqualTo(MAX);
+			doubleTheWindow(link);
+			assertThat(link.b.charged()).isEqualTo(INITIAL);
 			CompletableFuture<Void> idle = CompletableFuture.runAsync(() -> {
 				try {
 					read(link.b, 3L * MIB);
@@ -255,9 +268,7 @@ class VirtualConnectionWindowTest {
 		TunnelBudget budget = new TunnelBudget(16L * MIB);
 		try (TunnelLink link = link(budget, Duration.ofMillis(50))) {
 			link.toA.reclaims = false;
-			CompletableFuture<Void> written = write(link.a, 8L * MIB);
-			read(link.b, 8L * MIB);
-			written.get(20, TimeUnit.SECONDS);
+			doubleTheWindow(link);
 			CompletableFuture.runAsync(() -> {
 				try {
 					link.b.source().read(new byte[1]);
@@ -269,6 +280,7 @@ class VirtualConnectionWindowTest {
 			await(() -> link.b.reclaims() == 1, "a reclaim was asked");
 			sleep(Duration.ofMillis(300));
 			assertThat(link.b.reclaims()).isEqualTo(1);
+			assertThat(link.toA.reclaimsSent.get()).isEqualTo(1);
 			assertThat(link.b.charged()).isPositive().isEqualTo(budget.used());
 		}
 		assertThat(budget.used()).isZero();

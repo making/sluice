@@ -71,6 +71,10 @@ final class TunnelLink implements AutoCloseable {
 
 		final AtomicLong errors = new AtomicLong();
 
+		private final AtomicLong sent = new AtomicLong();
+
+		private final AtomicLong delivered = new AtomicLong();
+
 		Direction(Duration delay, String name) {
 			this.delayNanos = delay.toNanos();
 			this.thread = Thread.ofVirtual().name("link-" + name).start(this::deliver);
@@ -85,6 +89,7 @@ final class TunnelLink implements AutoCloseable {
 						TimeUnit.NANOSECONDS.sleep(wait);
 					}
 					delivery.action().run();
+					this.delivered.incrementAndGet();
 				}
 			}
 			catch (InterruptedException e) {
@@ -93,7 +98,13 @@ final class TunnelLink implements AutoCloseable {
 		}
 
 		private void send(Runnable action) {
+			this.sent.incrementAndGet();
 			this.queue.add(new Delivery(System.nanoTime() + this.delayNanos, action));
+		}
+
+		/** Whether every frame sent was delivered. */
+		boolean idle() {
+			return this.delivered.get() == this.sent.get();
 		}
 
 		private VirtualConnection peer() {
