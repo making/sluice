@@ -116,6 +116,8 @@ class ConsoleE2ETest {
 		registry.add("spring.security.user.name", () -> CONSOLE_USER);
 		registry.add("spring.security.user.password", () -> "{noop}" + CONSOLE_PASSWORD);
 		registry.add("sluice.route.auth.[h1only.local].bearer[0]", () -> "{noop}console-token");
+		registry.add("sluice.route.access-log.[h1only.local].enabled", () -> "false");
+		registry.add("sluice.route.access-log.[tcp:" + tcpRoutePort + "].types", () -> "close");
 	}
 
 	@BeforeAll
@@ -303,9 +305,14 @@ class ConsoleE2ETest {
 				""".formatted(httpPort, httpPort));
 		assertThat(page.locator("tbody[data-route='h1only.local'] [data-testid=route-auth]").innerText())
 			.isEqualTo("Auth: bearer");
+		assertThat(page.locator("tbody[data-route='h1only.local'] [data-testid=route-access-log]").innerText())
+			.isEqualTo("Log: off");
+		assertThat(page.locator("tbody[data-route='demo.local'] [data-testid=route-access-log]").count())
+			.as("no tag for a route on the server-wide settings")
+			.isZero();
 		assertThat(page.locator("tbody[data-port='" + tcpRoutePort + "']").innerText())
 			.isEqualToNormalizingWhitespace("""
-					:%d listening, owned by console-client Open Shut
+					:%d listening, owned by console-client Open Log: close Shut
 					console-client 127.0.0.1:%d Serving
 					""".formatted(tcpRoutePort, tcpPort));
 	}

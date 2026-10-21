@@ -2,7 +2,9 @@ package am.ik.sluice.server.config;
 
 import java.time.Duration;
 import java.util.Map;
+import java.util.Set;
 
+import am.ik.sluice.server.config.SluiceServerProperties.AccessLog.Type;
 import am.ik.sluice.server.route.LoadBalance;
 import org.junit.jupiter.api.Test;
 
@@ -61,6 +63,24 @@ class SluiceServerPropertiesTest {
 		SluiceServerProperties properties = bind(
 				Map.of("sluice.access-control.trusted-proxy-cidrs", "10.0.0.0/8,127.0.0.1"));
 		assertThat(properties.accessControl().trustedProxyCidrs()).containsExactly("10.0.0.0/8", "127.0.0.1");
+	}
+
+	@Test
+	void accessLogTypesBindWithConnectionShortForAcceptAndCloseAndRoutesInheritWhatTheyLeaveOut() {
+		SluiceServerProperties defaults = bind(Map.of("sluice.data-port", "8000"));
+		assertThat(defaults.accessLog().types()).containsExactly(Type.ACCEPT, Type.CLOSE, Type.REJECT, Type.REQUEST);
+		assertThat(defaults.route().accessLog()).isEmpty();
+		SluiceServerProperties bound = bind(Map.of("sluice.access-log.types", "connection",
+				"sluice.route.access-log.[a.local].types", "request,close", "sluice.route.access-log.[tcp:9000].types",
+				"connection", "sluice.route.access-log.[b.local].enabled", "false"));
+		assertThat(bound.accessLog().types()).containsExactly(Type.ACCEPT, Type.CLOSE, Type.REJECT);
+		assertThat(bound.route().accessLog()).containsOnlyKeys("a.local", "tcp:9000", "b.local");
+		assertThat(bound.route().accessLog().get("a.local"))
+			.isEqualTo(new SluiceServerProperties.Route.AccessLog(null, Set.of(Type.CLOSE, Type.REQUEST)));
+		assertThat(bound.route().accessLog().get("tcp:9000"))
+			.isEqualTo(new SluiceServerProperties.Route.AccessLog(null, Set.of(Type.ACCEPT, Type.CLOSE, Type.REJECT)));
+		assertThat(bound.route().accessLog().get("b.local"))
+			.isEqualTo(new SluiceServerProperties.Route.AccessLog(false, null));
 	}
 
 	@Test

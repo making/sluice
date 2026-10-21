@@ -3,14 +3,18 @@ package am.ik.sluice.server.proxy;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.time.Duration;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.StringJoiner;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 
 import am.ik.sluice.server.auth.Verdict;
 import am.ik.sluice.server.config.SluiceServerProperties;
+import am.ik.sluice.server.route.Router;
 import am.ik.sluice.tunnel.StreamRelay;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -24,6 +28,12 @@ import org.springframework.stereotype.Component;
  * {@code sluice.access} logger as single-line key=value pairs; disable via
  * {@code sluice.access-log.enabled=false}. Byte totals are accumulated per direction and
  * the {@code close} line is emitted when the relay completes, so the counts are final.
+ * <p>
+ * Which lines are emitted follows {@code sluice.access-log.enabled} / {@code types}, or a
+ * route's {@code sluice.route.access-log.[<route key>]} for a line of that route: a
+ * request line its request's route, a close or reject line its connection's route once
+ * known. A data port connection's accept line precedes its routing and follows the
+ * server-wide settings; a tcp route port's follows its route's.
  * <p>
  * When {@code sluice.access-log.rate-limit.enabled=true} (the default), each line kind
  * ({@code conn-accept} / {@code conn-close} / {@code conn-reject} / {@code request}) is
@@ -39,11 +49,9 @@ public class AccessLogger {
 
 	private final AtomicInteger sequence = new AtomicInteger();
 
-	private final boolean enabled;
+	private final Policy policy;
 
-	private final boolean connEnabled;
-
-	private final boolean requestEnabled;
+	private final Map<String, Policy> routePolicies;
 
 	private final @Nullable RateLimiter connAcceptLimiter;
 
@@ -60,10 +68,14 @@ public class AccessLogger {
 
 	AccessLogger(SluiceServerProperties properties, LongSupplier clock) {
 		SluiceServerProperties.AccessLog accessLog = properties.accessLog();
-		this.enabled = accessLog.enabled();
-		Set<SluiceServerProperties.AccessLog.Type> types = accessLog.types();
-		this.connEnabled = types.contains(SluiceServerProperties.AccessLog.Type.CONNECTION);
-		this.requestEnabled = types.contains(SluiceServerProperties.AccessLog.Type.REQUEST);
+		this.policy = Policy.of(accessLog.enabled(), accessLog.types());
+		Map<String, Policy> routePolicies = new HashMap<>();
+		properties.route()
+			.accessLog()
+			.forEach((key, route) -> routePolicies.put(normalize(key),
+					Policy.of(route.enabled() == null ? accessLog.enabled() : route.enabled(),
+							route.types() == null ? accessLog.types() : route.types())));
+		this.routePolicies = Map.copyOf(routePolicies);
 		SluiceServerProperties.AccessLog.RateLimit rateLimit = accessLog.rateLimit();
 		if (rateLimit.enabled()) {
 			this.connAcceptLimiter = RateLimiter.builder()
@@ -100,10 +112,11 @@ public class AccessLogger {
 	}
 
 	/**
-	 * Begins tracking an accepted connection; returns a no-op instance when disabled.
+	 * Begins tracking an accepted connection; returns a no-op instance when no line is
+	 * emitted, neither server-wide nor for any route.
 	 */
 	public Connection accepted(String listener, Socket socket) {
-		if (!this.enabled || (!this.connEnabled && !this.requestEnabled)) {
+		if (this.policy.none() && this.routePolicies.values().stream().allMatch(Policy::none)) {
 			return Connection.NOOP;
 		}
 		return Connection.builder()
@@ -111,9 +124,34 @@ public class AccessLogger {
 			.id(this.sequence.incrementAndGet())
 			.listener(listener)
 			.remote(peerOf(socket))
-			.connEnabled(this.connEnabled)
-			.requestEnabled(this.requestEnabled)
+			.policy(this.policy)
 			.build();
+	}
+
+	/**
+	 * The lines emitted for the route, the server-wide ones when it configures none.
+	 * @param routeKey the route key: the domain or host pattern, {@code tcp:<port>},
+	 * {@code *} or empty for the catch-all
+	 */
+	Policy policyOf(String routeKey) {
+		return this.routePolicies.getOrDefault(normalize(routeKey), this.policy);
+	}
+
+	private Policy policyOf(Router.@Nullable Route route) {
+		return route == null ? this.policy : this.policyOf(route.routeKey());
+	}
+
+	/**
+	 * The event types the route configures in place of the server-wide ones, comma
+	 * separated, {@code off} for none; empty when it configures none.
+	 */
+	public String describeRoute(String routeKey) {
+		Policy policy = this.routePolicies.get(normalize(routeKey));
+		return policy == null ? "" : policy.describe();
+	}
+
+	private static String normalize(String key) {
+		return key == null || key.isBlank() ? "*" : key.strip();
 	}
 
 	private static String peerOf(Socket socket) {
@@ -149,6 +187,46 @@ public class AccessLogger {
 	}
 
 	/**
+	 * The line kinds emitted: connection accept, close and reject, request.
+	 */
+	record Policy(boolean accept, boolean close, boolean reject, boolean request) {
+
+		static final Policy NONE = new Policy(false, false, false, false);
+
+		static Policy of(boolean enabled, Set<SluiceServerProperties.AccessLog.Type> types) {
+			if (!enabled) {
+				return NONE;
+			}
+			return new Policy(types.contains(SluiceServerProperties.AccessLog.Type.ACCEPT),
+					types.contains(SluiceServerProperties.AccessLog.Type.CLOSE),
+					types.contains(SluiceServerProperties.AccessLog.Type.REJECT),
+					types.contains(SluiceServerProperties.AccessLog.Type.REQUEST));
+		}
+
+		boolean none() {
+			return !this.accept && !this.close && !this.reject && !this.request;
+		}
+
+		String describe() {
+			StringJoiner kinds = new StringJoiner(", ");
+			if (this.accept) {
+				kinds.add("accept");
+			}
+			if (this.close) {
+				kinds.add("close");
+			}
+			if (this.reject) {
+				kinds.add("reject");
+			}
+			if (this.request) {
+				kinds.add("request");
+			}
+			return none() ? "off" : kinds.toString();
+		}
+
+	}
+
+	/**
 	 * The mutable per-connection state; all lifecycle methods are safe to call from any
 	 * relay thread, and the close line is emitted once.
 	 */
@@ -166,9 +244,7 @@ public class AccessLogger {
 
 		private final boolean noop;
 
-		private final boolean connEnabled;
-
-		private final boolean requestEnabled;
+		private Policy policy;
 
 		private final long startNanos = System.nanoTime();
 
@@ -190,8 +266,7 @@ public class AccessLogger {
 			this.listener = builder.listener;
 			this.remote = builder.remote;
 			this.noop = builder.noop;
-			this.connEnabled = builder.connEnabled;
-			this.requestEnabled = builder.requestEnabled;
+			this.policy = builder.policy;
 		}
 
 		static Builder builder() {
@@ -212,8 +287,24 @@ public class AccessLogger {
 			return this;
 		}
 
-		Connection route(String routeTag) {
-			this.route = routeTag;
+		/**
+		 * Names the route the connection is served by: the close line reports it, and it
+		 * and the reject line follow its settings.
+		 */
+		Connection route(Router.Route route) {
+			this.route = route.routeTag();
+			return this.routeKey(route.routeKey());
+		}
+
+		/**
+		 * Puts the connection's lines from now on under the settings of the route key,
+		 * for a connection whose route key is known before its route resolves (a tcp
+		 * route port's).
+		 */
+		Connection routeKey(String routeKey) {
+			if (this.owner != null) {
+				this.policy = this.owner.policyOf(routeKey);
+			}
 			return this;
 		}
 
@@ -231,20 +322,23 @@ public class AccessLogger {
 		 * connection are logged by the rerouting relay with their own route.
 		 */
 		void request(ConnectionHeadParser.Head.Request request) {
-			this.request(this.route, request);
+			this.logRequest(this.route, this.policy, request.method(), request.path(), request.version(),
+					request.userAgent());
 		}
 
 		/**
 		 * Logs a request head with the route it resolved to, which differs from the
-		 * connection's when the request is rerouted; a {@code null} request (a head that
-		 * is no well-formed request) is logged with {@code -} for each of its parts.
+		 * connection's when the request is rerouted, under that route's settings; a
+		 * {@code null} route (a request routed nowhere) is logged as {@code -} under the
+		 * server-wide ones, a {@code null} request (a head that is no well-formed
+		 * request) with {@code -} for each of its parts.
 		 */
-		void request(String routeTag, ConnectionHeadParser.Head.@Nullable Request request) {
+		void request(Router.@Nullable Route route, ConnectionHeadParser.Head.@Nullable Request request) {
 			if (request == null) {
-				this.request(routeTag, "-", "-", "-", null);
+				this.request(route, "-", "-", "-", null);
 			}
 			else {
-				this.request(routeTag, request.method(), request.path(), request.version(), request.userAgent());
+				this.request(route, request.method(), request.path(), request.version(), request.userAgent());
 			}
 		}
 
@@ -252,20 +346,33 @@ public class AccessLogger {
 		 * Logs a request head from its parts, for a head that is no well-formed request
 		 * yet has some of them (an h2 head without {@code :path}, say).
 		 */
-		void request(String routeTag, String method, String path, String version, @Nullable String userAgent) {
-			if (!this.requestEnabled || this.noop || this.closed || this.owner == null || !this.owner.allowRequest()) {
+		void request(Router.@Nullable Route route, String method, String path, String version,
+				@Nullable String userAgent) {
+			if (this.owner == null) {
+				return;
+			}
+			this.logRequest(tagOf(route), this.owner.policyOf(route), method, path, version, userAgent);
+		}
+
+		private void logRequest(String routeTag, Policy policy, String method, String path, String version,
+				@Nullable String userAgent) {
+			if (!policy.request() || this.noop || this.closed || this.owner == null || !this.owner.allowRequest()) {
 				return;
 			}
 			log.info("type=req id={} route={} method={} path={} http={} remote={} userAgent={}", this.id, routeTag,
 					method, path, version, this.remote, quoted(userAgent));
 		}
 
+		private static String tagOf(Router.@Nullable Route route) {
+			return route == null ? "-" : route.routeTag();
+		}
+
 		/**
 		 * Logs an h2 request head the relay answered {@code 421 Misdirected Request}
 		 * itself: its route's upstream is reached over HTTP/1.1 only.
 		 */
-		void misdirected(String routeTag, ConnectionHeadParser.Head.Request request) {
-			this.refused(routeTag, request, 421, "force-http1");
+		void misdirected(Router.Route route, ConnectionHeadParser.Head.Request request) {
+			this.refused(route, request, 421, "force-http1");
 		}
 
 		/**
@@ -274,12 +381,12 @@ public class AccessLogger {
 		 * {@code reason=auth-busy} / {@code auth-unavailable}; nothing for a verdict that
 		 * passes.
 		 */
-		void refused(String routeTag, ConnectionHeadParser.Head.@Nullable Request request, Verdict verdict) {
+		void refused(Router.Route route, ConnectionHeadParser.Head.@Nullable Request request, Verdict verdict) {
 			switch (verdict) {
 				case Verdict.Unauthorized unauthorized ->
-					this.refused(routeTag, request, 401, "auth-" + unauthorized.reason());
-				case Verdict.Busy busy -> this.refused(routeTag, request, 503, "auth-busy");
-				case Verdict.Unavailable unavailable -> this.refused(routeTag, request, 503, "auth-unavailable");
+					this.refused(route, request, 401, "auth-" + unauthorized.reason());
+				case Verdict.Busy busy -> this.refused(route, request, 503, "auth-busy");
+				case Verdict.Unavailable unavailable -> this.refused(route, request, 503, "auth-unavailable");
 				case Verdict.Pass pass -> {
 				}
 			}
@@ -289,14 +396,16 @@ public class AccessLogger {
 		 * Logs a request head the relay answered itself with {@code status} instead of
 		 * relaying it, for {@code reason}.
 		 */
-		void refused(String routeTag, ConnectionHeadParser.Head.@Nullable Request request, int status, String reason) {
-			if (!this.requestEnabled || this.noop || this.closed || this.owner == null || !this.owner.allowRequest()) {
+		void refused(Router.Route route, ConnectionHeadParser.Head.@Nullable Request request, int status,
+				String reason) {
+			if (this.noop || this.closed || this.owner == null || !this.owner.policyOf(route).request()
+					|| !this.owner.allowRequest()) {
 				return;
 			}
 			log.info("type=req id={} route={} method={} path={} http={} remote={} status={} reason={} userAgent={}",
-					this.id, routeTag, request == null ? "-" : request.method(), request == null ? "-" : request.path(),
-					request == null ? "-" : request.version(), this.remote, status, reason,
-					quoted(request == null ? null : request.userAgent()));
+					this.id, route.routeTag(), request == null ? "-" : request.method(),
+					request == null ? "-" : request.path(), request == null ? "-" : request.version(), this.remote,
+					status, reason, quoted(request == null ? null : request.userAgent()));
 		}
 
 		/**
@@ -326,7 +435,7 @@ public class AccessLogger {
 
 		/** Logs the connection acceptance, before route and transport are known. */
 		public void accept() {
-			if (!this.connEnabled || this.noop || this.owner == null || !this.owner.allowAccept()) {
+			if (!this.policy.accept() || this.noop || this.owner == null || !this.owner.allowAccept()) {
 				return;
 			}
 			log.info("type=conn id={} event=accept listener={} remote={}", this.id, this.listener, this.remote);
@@ -334,14 +443,15 @@ public class AccessLogger {
 
 		/**
 		 * Logs the connection as rejected before it was served (a connection limit, the
-		 * head deadline) instead of the close line, which is not emitted afterwards.
+		 * head deadline) instead of the close line, which is not emitted afterwards --
+		 * neither when the reject line is not emitted.
 		 */
 		void reject(String reason) {
-			if (!this.connEnabled || this.noop || this.closed || this.owner == null) {
+			if (this.noop || this.closed || this.owner == null) {
 				return;
 			}
 			this.closed = true;
-			if (!this.owner.allowReject()) {
+			if (!this.policy.reject() || !this.owner.allowReject()) {
 				return;
 			}
 			log.info("type=conn id={} event=reject listener={} remote={} reason={} durationMs={}", this.id,
@@ -354,11 +464,11 @@ public class AccessLogger {
 		 * limit answered 503).
 		 */
 		void rejectAnswered(String reason, int status) {
-			if (!this.connEnabled || this.noop || this.closed || this.owner == null) {
+			if (this.noop || this.closed || this.owner == null) {
 				return;
 			}
 			this.closed = true;
-			if (!this.owner.allowReject()) {
+			if (!this.policy.reject() || !this.owner.allowReject()) {
 				return;
 			}
 			log.info(
@@ -368,7 +478,7 @@ public class AccessLogger {
 		}
 
 		public void close() {
-			if (!this.connEnabled || this.noop || this.closed || this.owner == null || !this.owner.allowClose()) {
+			if (!this.policy.close() || this.noop || this.closed || this.owner == null || !this.owner.allowClose()) {
 				return;
 			}
 			this.closed = true;
@@ -391,9 +501,7 @@ public class AccessLogger {
 
 			private boolean noop;
 
-			private boolean connEnabled = true;
-
-			private boolean requestEnabled = true;
+			private Policy policy = Policy.NONE;
 
 			private Builder() {
 			}
@@ -418,13 +526,8 @@ public class AccessLogger {
 				return this;
 			}
 
-			Builder connEnabled(boolean connEnabled) {
-				this.connEnabled = connEnabled;
-				return this;
-			}
-
-			Builder requestEnabled(boolean requestEnabled) {
-				this.requestEnabled = requestEnabled;
+			Builder policy(Policy policy) {
+				this.policy = policy;
 				return this;
 			}
 

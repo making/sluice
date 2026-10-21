@@ -667,7 +667,7 @@ final class NettyHttp2DemuxRelay {
 		if (request == null) {
 			// malformed: a stream error, never forwarded (RFC 9113 8.1.1)
 			CharSequence method = headers.method();
-			this.access.request("-", method == null ? "-" : method.toString(), "-", HTTP_2,
+			this.access.request(null, method == null ? "-" : method.toString(), "-", HTTP_2,
 					ConnectionHeadParser.http2UserAgentOf(headers));
 			resetClientLocked(streamId, Http2Error.PROTOCOL_ERROR);
 			return;
@@ -732,7 +732,7 @@ final class NettyHttp2DemuxRelay {
 			return;
 		}
 		if (!(verdict instanceof Verdict.Pass pass)) {
-			this.access.refused(route.routeTag(), request, verdict);
+			this.access.refused(route, request, verdict);
 			releaseParkedDataLocked(stream);
 			Shortfall shortfall = answerLocked(streamId, this.errorResponse.refusalPage(stream.host, request, verdict),
 					false);
@@ -813,7 +813,7 @@ final class NettyHttp2DemuxRelay {
 				exchange.requestFlow.block(trailers, stream.trailersEnd);
 			}
 		}
-		this.access.request(route.routeTag(), request);
+		this.access.request(route, request);
 	}
 
 	/**
@@ -1063,7 +1063,7 @@ final class NettyHttp2DemuxRelay {
 	 * when the page does not fit; with the loop's lock.
 	 */
 	private void refuseLocked(int streamId, ConnectionHeadParser.Head.Request request, ErrorResponse.StreamPage page) {
-		this.access.request("-", request);
+		this.access.request(null, request);
 		Shortfall shortfall = answerLocked(streamId, page, false);
 		if (shortfall != null) {
 			refuseForBudgetLocked(streamId, shortfall);
@@ -1081,7 +1081,7 @@ final class NettyHttp2DemuxRelay {
 	private void misdirectLocked(int streamId, @Nullable String host, Router.Route route,
 			ConnectionHeadParser.Head.Request request, boolean endStream) {
 		this.meters.misdirectedForHttp1();
-		this.access.misdirected(route.routeTag(), request);
+		this.access.misdirected(route, request);
 		TlsHandshake handshake = this.handshake;
 		Hop client = client();
 		if (handshake != null && handshake.http1Offered() && handshake.isFor(host)
@@ -2709,7 +2709,7 @@ final class NettyHttp2DemuxRelay {
 		public void onGoAwaySent(int lastStreamId, long errorCode, ByteBuf debugData) {
 			if (errorCode == Http2Error.COMPRESSION_ERROR.code()) {
 				// a header block that did not decode: nothing of it is known
-				NettyHttp2DemuxRelay.this.access.request("-", "-", "-", HTTP_2, null);
+				NettyHttp2DemuxRelay.this.access.request(null, "-", "-", HTTP_2, null);
 			}
 		}
 

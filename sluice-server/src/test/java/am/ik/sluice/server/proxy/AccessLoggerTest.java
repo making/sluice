@@ -5,10 +5,16 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 
 import am.ik.sluice.server.config.SluiceServerProperties;
+import am.ik.sluice.server.config.SluiceServerProperties.AccessLog.Type;
+import am.ik.sluice.server.route.Router;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
@@ -23,12 +29,13 @@ import am.ik.sluice.server.auth.Verdict;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Rate limiting of the access log: at most {@code maxRate} lines per kind within a period
- * are emitted, and the suppressed count is reported by a {@code type=ratelimit} line when
- * the period rolls over. A request refused for its route's credentials is a request line
+ * The access log: the line kinds emitted follow the server-wide settings or, for a line
+ * of a route, the route's; at most {@code maxRate} lines per kind within a period are
+ * emitted, and the suppressed count is reported by a {@code type=ratelimit} line when the
+ * period rolls over. A request refused for its route's credentials is a request line
  * naming the status and the reason.
  */
-class AccessLoggerRateLimitTest {
+class AccessLoggerTest {
 
 	private final AtomicLong now = new AtomicLong(1_000_000_000L);
 
@@ -48,6 +55,142 @@ class AccessLoggerRateLimitTest {
 
 	private List<String> messages() {
 		return this.events.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+	}
+
+	/**
+	 * A route's settings replace the server-wide ones for the lines of that route: a
+	 * request line follows its request's route, a close / reject line its connection's
+	 * route, an accept line the server-wide settings on the data port and its route's on
+	 * a tcp route port.
+	 */
+	@Test
+	void routeSettingsReplaceTheServerWideOnesForTheLinesOfTheRoute() throws Exception {
+		AccessLogger accessLogger = new AccessLogger(SluiceServerProperties.builder()
+			.accessLog(SluiceServerProperties.AccessLog.builder()
+				.types(Set.of(Type.ACCEPT, Type.REQUEST))
+				.rateLimit(SluiceServerProperties.AccessLog.RateLimit.builder().enabled(false).build())
+				.build())
+			.route(SluiceServerProperties.Route.builder()
+				.accessLog(Map.of("quiet.local", new SluiceServerProperties.Route.AccessLog(false, null),
+						" close.local ", new SluiceServerProperties.Route.AccessLog(null, Set.of(Type.CLOSE)),
+						"tcp:9000", new SluiceServerProperties.Route.AccessLog(null, Set.of(Type.CONNECTION)),
+						"tcp:9002", new SluiceServerProperties.Route.AccessLog(null, Set.of(Type.REJECT)), "*",
+						new SluiceServerProperties.Route.AccessLog(true, Set.of())))
+				.build())
+			.build(), this.now::get);
+		ConnectionHeadParser.Head.Request request = new ConnectionHeadParser.Head.Request("GET", "/", "1.1", false,
+				null);
+		try (ServerSocket serverSocket = loopbackServer();
+				Socket socket = new Socket("127.0.0.1", serverSocket.getLocalPort());
+				Socket accepted = serverSocket.accept()) {
+			// head route quiet.local, its keep-alive successors rerouted
+			AccessLogger.Connection quiet = accessLogger.accepted("data", socket);
+			quiet.accept();
+			quiet.route(route("quiet.local", 0));
+			quiet.request(request);
+			quiet.request(route("close.local", 0), request);
+			quiet.request(route("other.local", 0), request);
+			quiet.request(null, request);
+			quiet.request(route("", 0), request);
+			quiet.close();
+			AccessLogger.Connection close = accessLogger.accepted("data", socket);
+			close.accept();
+			close.route(route("close.local", 0));
+			close.request(request);
+			close.refused(route("close.local", 0), request, 401, "auth-missing");
+			close.close();
+			// rejected once routed (an h2 relay that did not fit): neither its reject
+			// line
+			// nor a close line after it
+			AccessLogger.Connection closeRejected = accessLogger.accepted("data", socket);
+			closeRejected.route(route("close.local", 0));
+			closeRejected.reject("h2-limit");
+			closeRejected.close();
+			AccessLogger.Connection unrouted = accessLogger.accepted("data", socket);
+			unrouted.reject("head-timeout");
+			AccessLogger.Connection tcp = accessLogger.accepted("tcp:9000", socket).routeKey("tcp:9000");
+			tcp.accept();
+			tcp.route(route("db.local", 9000));
+			tcp.close();
+			AccessLogger.Connection tcpRejected = accessLogger.accepted("tcp:9000", socket).routeKey("tcp:9000");
+			tcpRejected.reject("limit");
+			AccessLogger.Connection otherPort = accessLogger.accepted("tcp:9001", socket).routeKey("tcp:9001");
+			otherPort.accept();
+			otherPort.close();
+			AccessLogger.Connection rejectOnly = accessLogger.accepted("tcp:9002", socket).routeKey("tcp:9002");
+			rejectOnly.accept();
+			rejectOnly.reject("address-limit");
+		}
+		assertThat(this.messages().stream().map(AccessLoggerTest::shape)).containsExactly(
+				"type=conn id=1 event=accept listener=data", "type=req id=1 route=other.local", "type=req id=1 route=-",
+				"type=conn id=2 event=accept listener=data",
+				"type=conn id=2 event=close listener=data route=close.local",
+				"type=conn id=5 event=accept listener=tcp:9000",
+				"type=conn id=5 event=close listener=tcp:9000 route=db.local",
+				"type=conn id=6 event=reject listener=tcp:9000", "type=conn id=7 event=accept listener=tcp:9001",
+				"type=conn id=8 event=reject listener=tcp:9002");
+		assertThat(accessLogger.describeRoute("close.local")).isEqualTo("close");
+		assertThat(accessLogger.describeRoute("tcp:9000")).isEqualTo("accept, close, reject");
+		assertThat(accessLogger.describeRoute("tcp:9002")).isEqualTo("reject");
+		assertThat(accessLogger.describeRoute("quiet.local")).isEqualTo("off");
+		assertThat(accessLogger.describeRoute("")).as("the catch-all").isEqualTo("off");
+		assertThat(accessLogger.describeRoute("other.local")).isEmpty();
+	}
+
+	/**
+	 * With the access log off server-wide, a route turning it on still gets its lines:
+	 * the connections are tracked, their accept lines left out.
+	 */
+	@Test
+	void aRouteEmitsItsLinesWithTheAccessLogOffServerWide() throws Exception {
+		AccessLogger accessLogger = new AccessLogger(SluiceServerProperties.builder()
+			.accessLog(SluiceServerProperties.AccessLog.builder().enabled(false).build())
+			.route(SluiceServerProperties.Route.builder()
+				.accessLog(Map.of("loud.local", new SluiceServerProperties.Route.AccessLog(true, null)))
+				.build())
+			.build(), this.now::get);
+		ConnectionHeadParser.Head.Request request = new ConnectionHeadParser.Head.Request("GET", "/", "1.1", false,
+				null);
+		try (ServerSocket serverSocket = loopbackServer();
+				Socket socket = new Socket("127.0.0.1", serverSocket.getLocalPort());
+				Socket accepted = serverSocket.accept()) {
+			AccessLogger.Connection other = accessLogger.accepted("data", socket);
+			other.accept();
+			other.route(route("other.local", 0));
+			other.request(request);
+			other.request(route("loud.local", 0), request);
+			other.close();
+			AccessLogger.Connection loud = accessLogger.accepted("data", socket);
+			loud.accept();
+			loud.route(route("loud.local", 0));
+			loud.close();
+			assertThat(new AccessLogger(SluiceServerProperties.builder()
+				.accessLog(SluiceServerProperties.AccessLog.builder().enabled(false).build())
+				.build()).accepted("data", socket))
+				.as("nothing logged anywhere: no connection tracked")
+				.isSameAs(new AccessLogger(SluiceServerProperties.builder()
+					.accessLog(SluiceServerProperties.AccessLog.builder().types(Set.of()).build())
+					.build()).accepted("data", socket))
+				.isNotSameAs(other);
+		}
+		assertThat(this.messages().stream().map(AccessLoggerTest::shape)).containsExactly(
+				"type=req id=1 route=loud.local", "type=conn id=2 event=close listener=data route=loud.local");
+	}
+
+	/** The fields of a line naming its kind, connection, listener and route. */
+	private static String shape(String line) {
+		return Arrays.stream(line.split(" "))
+			.filter(field -> field.matches("(type|id|event|listener|route)=.*"))
+			.collect(Collectors.joining(" "));
+	}
+
+	private static Router.Route route(String domain, int listenPort) {
+		return Router.Route.builder()
+			.clientId("client")
+			.domain(domain)
+			.address("127.0.0.1:1")
+			.listenPort(listenPort)
+			.build();
 	}
 
 	@Test
@@ -120,10 +263,11 @@ class AccessLoggerRateLimitTest {
 			AccessLogger.Connection connection = accessLogger.accepted("test", socket);
 			ConnectionHeadParser.Head.Request request = new ConnectionHeadParser.Head.Request("GET", "/x", "1.1", false,
 					"agent/1 \"q\" \\ \n\u007f\u009b");
-			connection.refused("a.local", request, new Verdict.Unauthorized("missing", List.of()));
-			connection.refused("a.local", request, new Verdict.Busy(Duration.ofSeconds(1)));
-			connection.refused("a.local", request, new Verdict.Unavailable(Duration.ofSeconds(10)));
-			connection.refused("a.local", request, new Verdict.Unauthorized("invalid", List.of()));
+			Router.Route route = route("a.local", 0);
+			connection.refused(route, request, new Verdict.Unauthorized("missing", List.of()));
+			connection.refused(route, request, new Verdict.Busy(Duration.ofSeconds(1)));
+			connection.refused(route, request, new Verdict.Unavailable(Duration.ofSeconds(10)));
+			connection.refused(route, request, new Verdict.Unauthorized("invalid", List.of()));
 			assertThat(this.messages()).as("the fourth past the request lines' rate")
 				.containsExactly("type=req id=1 route=a.local method=GET path=/x http=1.1 remote=" + remoteOf(socket)
 						+ " status=401 reason=auth-missing userAgent=\"agent/1 \\\"q\\\" \\\\ \\u000a\\u007f\\u009b\"",

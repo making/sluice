@@ -551,7 +551,7 @@ final class ReroutingRelay {
 		if (!inBody) {
 			ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser
 				.http1RequestOf(parser.malformedHead());
-			this.access.request("-", request);
+			this.access.request(null, request);
 		}
 		// the requests before the malformed one: every one relayed, but its own head
 		rejectAtBoundary(this.errorResponse.badRequest(), inBody);
@@ -664,7 +664,7 @@ final class ReroutingRelay {
 		Router.Route route = resolved.route();
 		Verdict verdict = this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head));
 		if (!(verdict instanceof Verdict.Pass pass)) {
-			this.access.refused(route.routeTag(), ConnectionHeadParser.http1RequestOf(head), verdict);
+			this.access.refused(route, ConnectionHeadParser.http1RequestOf(head), verdict);
 			this.refusal = this.errorResponse.refusal(ConnectionHeadParser.Head.http1(head, host), verdict);
 			return;
 		}
@@ -690,7 +690,7 @@ final class ReroutingRelay {
 					route = resolved.route();
 					verdict = this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head));
 					if (!(verdict instanceof Verdict.Pass passed)) {
-						this.access.refused(route.routeTag(), ConnectionHeadParser.http1RequestOf(head), verdict);
+						this.access.refused(route, ConnectionHeadParser.http1RequestOf(head), verdict);
 						this.refusal = this.errorResponse.refusal(ConnectionHeadParser.Head.http1(head, host), verdict);
 						return;
 					}
@@ -723,7 +723,7 @@ final class ReroutingRelay {
 				: stripped;
 		leg.toUpstream(relayed, 0, relayed.length);
 		if (request != null) {
-			this.access.request(route.routeTag(), request);
+			this.access.request(route, request);
 		}
 	}
 
@@ -770,7 +770,7 @@ final class ReroutingRelay {
 
 	private @Nullable Resolved refuse(byte[] head, @Nullable String host, byte[] response) {
 		ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser.http1RequestOf(head);
-		this.access.request("-", request);
+		this.access.request(null, request);
 		this.refusal = response;
 		return null;
 	}

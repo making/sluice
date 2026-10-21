@@ -519,7 +519,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		Runnable release = admission::release;
 		if (conn.head().undecodable()) {
 			// a connection error before any stream: nothing of it may be routed
-			access.request("-", "-", "-", "2", null);
+			access.request(null, "-", "-", "2", null);
 			this.reject(conn, this.errorResponse.compressionError());
 			return false;
 		}
@@ -541,7 +541,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			return false;
 		}
 		Router.Route route0 = route.get();
-		access.route(route0.routeTag());
+		access.route(route0);
 		ConnectionHeadParser.Head.Request request = conn.head().request();
 		boolean http2 = conn.head().http2Connection();
 		if ((request != null || http2) && !conn.head().encrypted()) {
@@ -606,7 +606,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 		if (this.routeAuth.protects(route0)) {
 			// relayed verbatim, no request of it could be checked: refused rather than
 			// passed unchecked (a TLS passthrough connection gets no answer)
-			access.refused(route0.routeTag(), request, 401, "auth-unreadable");
+			access.refused(route0, request, 401, "auth-unreadable");
 			this.reject(conn, this.errorResponse.unauthorized(conn.head(), List.of()));
 			return false;
 		}

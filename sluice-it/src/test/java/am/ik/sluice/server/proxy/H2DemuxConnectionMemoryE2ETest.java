@@ -37,6 +37,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
+import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
@@ -47,6 +48,9 @@ import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.it.WindowedH2Upstream;
 import am.ik.sluice.server.SluiceServerApplication;
 import am.ik.sluice.server.route.Router;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
@@ -66,7 +70,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * connection is admitted but not relayed as h2: in plaintext, or over TLS offering h2
  * alone, it gets a GOAWAY processing no stream; over TLS offering HTTP/1.1 too it gets
  * HTTP/1.1 and is served; a connection past what is left is answered 503. In the relay's
- * package for the relay's constants and the limits' accounts.
+ * package for the relay's constants and the limits' accounts. The h2 refusal is rejected
+ * once routed and follows its route's access log settings; the 503 answer precedes
+ * routing and follows the server-wide ones.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -132,6 +138,8 @@ class H2DemuxConnectionMemoryE2ETest {
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.token", () -> "it-token");
 		registry.add("sluice.access-log.rate-limit.enabled", () -> "false");
+		registry.add("sluice.route.access-log.[" + DOWNLOAD_HOST + "].types", () -> "close");
+		registry.add("sluice.route.access-log.[" + H1_HOST + "].enabled", () -> "false");
 		registry.add("sluice.limits.h2-queue-budget", () -> BUDGET + "B");
 		registry.add("sluice.limits.connection-memory", () -> MEMORY + "B");
 		registry.add("server.port", () -> String.valueOf(TestPorts.freePort()));
@@ -184,6 +192,9 @@ class H2DemuxConnectionMemoryE2ETest {
 		double declined = declined();
 		List<H2TestClient> downloads = new ArrayList<>();
 		List<Pump> uploads = new ArrayList<>();
+		ListAppender<ILoggingEvent> access = new ListAppender<>();
+		access.start();
+		((Logger) LoggerFactory.getLogger("sluice.access")).addAppender(access);
 		try {
 			for (int i = 0; i < H2_CONNECTIONS / 2; i++) {
 				downloads.add(download());
@@ -243,8 +254,14 @@ class H2DemuxConnectionMemoryE2ETest {
 			}
 			assertThat(rejected("h2-limit")).isEqualTo(rejectedH2 + 2);
 			assertThat(limits().h2Budget().used()).as("the held budget").isPositive();
+			assertThat(access.list.stream().map(ILoggingEvent::getFormattedMessage))
+				.as("the reject lines: the overflow's under the server-wide settings, the h2 refusals none")
+				.filteredOn(line -> line.contains("event=reject"))
+				.singleElement()
+				.satisfies(line -> assertThat(line).contains("reason=limit", "status=503"));
 		}
 		finally {
+			((Logger) LoggerFactory.getLogger("sluice.access")).detachAppender(access);
 			uploads.forEach(Pump::close);
 			downloads.forEach(H2DemuxConnectionMemoryE2ETest::close);
 		}

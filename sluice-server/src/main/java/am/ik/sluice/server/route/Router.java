@@ -69,6 +69,18 @@ public class Router {
 			return this.listenPort > 0 ? "tcp:" + this.listenPort : "*";
 		}
 
+		/**
+		 * The key the route is configured under ({@code sluice.route.*}) and gated by:
+		 * {@code tcp:<port>} for a tcp route, else the domain or host pattern, {@code *}
+		 * for the catch-all.
+		 */
+		public String routeKey() {
+			if (this.listenPort > 0) {
+				return "tcp:" + this.listenPort;
+			}
+			return this.domain.isEmpty() ? "*" : this.domain;
+		}
+
 		public static Builder builder() {
 			return new Builder();
 		}

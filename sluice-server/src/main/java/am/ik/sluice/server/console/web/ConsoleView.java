@@ -31,6 +31,7 @@ import am.ik.sluice.server.auth.RouteAuthenticator;
 import am.ik.sluice.server.cluster.NodeDirectory;
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.console.ControlPlanePort;
+import am.ik.sluice.server.proxy.AccessLogger;
 import am.ik.sluice.server.proxy.DataProxyServer;
 import am.ik.sluice.server.proxy.TcpPortGateway;
 import am.ik.sluice.server.route.GateState;
@@ -58,6 +59,8 @@ class ConsoleView {
 
 	private final RouteAuthenticator routeAuth;
 
+	private final AccessLogger accessLogger;
+
 	private final TcpPortGateway tcpPortGateway;
 
 	private final DataProxyServer dataProxyServer;
@@ -79,9 +82,11 @@ class ConsoleView {
 	ConsoleView(SessionRegistry sessions, Router router, TcpPortGateway tcpPortGateway, DataProxyServer dataProxyServer,
 			NodeDirectory nodeDirectory, ClusterLifecycle clusterLifecycle, ApplicationAvailability availability,
 			SluiceServerProperties properties, ControlPlanePort controlPlanePort, RouteAuthenticator routeAuth,
-			ObjectProvider<BuildProperties> buildProperties, ObjectProvider<GitProperties> gitProperties) {
+			AccessLogger accessLogger, ObjectProvider<BuildProperties> buildProperties,
+			ObjectProvider<GitProperties> gitProperties) {
 		this.sessions = sessions;
 		this.routeAuth = routeAuth;
+		this.accessLogger = accessLogger;
 		this.router = router;
 		this.tcpPortGateway = tcpPortGateway;
 		this.dataProxyServer = dataProxyServer;
@@ -309,7 +314,7 @@ class ConsoleView {
 			String tag = group.key().isEmpty() ? "*" : group.key();
 			GateState state = this.router.gate().stateOf(tag);
 			return new RouteRow(group.key(), candidates(group, loadBalance), state == GateState.OPEN, tag,
-					String.join(", ", this.routeAuth.schemes(tag)));
+					String.join(", ", this.routeAuth.schemes(tag)), this.accessLogger.describeRoute(tag));
 		}).toList();
 	}
 
@@ -325,6 +330,7 @@ class ConsoleView {
 					.orElse(""))
 				.candidates(candidates(group, loadBalance))
 				.open(state == GateState.OPEN)
+				.accessLog(this.accessLogger.describeRoute("tcp:" + group.key()))
 				.build();
 		}).toList();
 	}
@@ -401,10 +407,9 @@ class ConsoleView {
 						new Setting("HTTP load balancing", label(this.router.httpLoadBalance())),
 						new Setting("TCP load balancing", label(this.router.tcpLoadBalance())),
 						new Setting("Access log",
-								accessLog.enabled() ? accessLog.types()
+								accessLog.enabled() && !accessLog.types().isEmpty() ? accessLog.types()
 									.stream()
 									.map(type -> type.name().toLowerCase(Locale.ROOT))
-									.sorted()
 									.collect(Collectors.joining(", ")) : "Off")));
 		if (this.properties.clusterEnabled()) {
 			SluiceServerProperties.Cluster cluster = this.properties.cluster();
@@ -777,8 +782,11 @@ class ConsoleView {
 	 * @param gateKey the route key the gate is toggled under
 	 * @param auth the credential schemes the route requires, comma separated; empty when
 	 * none
+	 * @param accessLog the access log lines the route configures in place of the
+	 * server-wide ones ({@code off} for none); empty when it configures none
 	 */
-	public record RouteRow(String domain, List<Candidate> candidates, boolean open, String gateKey, String auth) {
+	public record RouteRow(String domain, List<Candidate> candidates, boolean open, String gateKey, String auth,
+			String accessLog) {
 
 		public boolean catchAll() {
 			return this.domain.isEmpty();
@@ -805,8 +813,10 @@ class ConsoleView {
 	 *
 	 * @param owner client whose listener is bound; empty when nothing is bound
 	 * @param open whether the route's gate is open (the console may have shut it)
+	 * @param accessLog the access log lines the route configures in place of the
+	 * server-wide ones ({@code off} for none); empty when it configures none
 	 */
-	public record PortRow(String port, String owner, List<Candidate> candidates, boolean open) {
+	public record PortRow(String port, String owner, List<Candidate> candidates, boolean open, String accessLog) {
 
 		public boolean bound() {
 			return !this.owner.isEmpty();
@@ -845,6 +855,8 @@ class ConsoleView {
 
 			private boolean open = true;
 
+			private String accessLog = "";
+
 			private Builder() {
 			}
 
@@ -868,9 +880,14 @@ class ConsoleView {
 				return this;
 			}
 
+			public Builder accessLog(String accessLog) {
+				this.accessLog = accessLog;
+				return this;
+			}
+
 			public PortRow build() {
 				return new PortRow(Objects.requireNonNull(this.port, "port is required"), this.owner,
-						List.copyOf(this.candidates), this.open);
+						List.copyOf(this.candidates), this.open, this.accessLog);
 			}
 
 		}

@@ -303,7 +303,9 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 		while (listener.running().get()) {
 			try {
 				Socket socket = listener.socket().accept();
-				AccessLogger.Connection access = this.accessLogger.accepted("tcp:" + port, socket).transport("tcp");
+				AccessLogger.Connection access = this.accessLogger.accepted("tcp:" + port, socket)
+					.routeKey("tcp:" + port)
+					.transport("tcp");
 				ConnectionLimits.Admission admission = this.limits.admit(access);
 				if (admission == null) {
 					// at the limit: closed unread, before any thread is spent on it
@@ -385,7 +387,7 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 			}
 			Router.Route route0 = route.get();
 			VirtualConnection connection = session.open(route0.address());
-			access.route(route0.routeTag()).connectionId(connection.connectionId());
+			access.route(route0).connectionId(connection.connectionId());
 			AtomicInteger active = this.activeConnections.computeIfAbsent(port, p -> new AtomicInteger());
 			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(socket);
 			// reads continue from the proxy parser's position: past the consumed header,

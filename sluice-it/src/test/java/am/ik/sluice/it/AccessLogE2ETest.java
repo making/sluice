@@ -39,7 +39,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * End to end for the access log: an HTTP request through the data plane must emit one
  * {@code request} line per request head (keep-alive successors included, each with its
  * own route and user agent) and one {@code conn ... event=close} line with the final byte
- * counts, in logfmt.
+ * counts, in logfmt. A route's {@code sluice.route.access-log} settings replace the
+ * server-wide ones for its lines.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -52,6 +53,8 @@ class AccessLogE2ETest {
 	private static int grpcPort;
 
 	private static int dataPort;
+
+	private static int tcpRoutePort;
 
 	private static HttpServer upstream;
 
@@ -77,8 +80,13 @@ class AccessLogE2ETest {
 	static void properties(DynamicPropertyRegistry registry) {
 		grpcPort = TestPorts.freePort();
 		dataPort = TestPorts.freePort();
+		tcpRoutePort = TestPorts.freePort();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
+		registry.add("sluice.tcp-port-range", () -> String.valueOf(tcpRoutePort));
+		registry.add("sluice.access-log.rate-limit.enabled", () -> "false");
+		registry.add("sluice.route.access-log.[quiet.local].types", () -> "close");
+		registry.add("sluice.route.access-log.[tcp:" + tcpRoutePort + "].types", () -> "close");
 		registry.add("sluice.token", () -> "it-token");
 		registry.add("server.port", () -> String.valueOf(TestPorts.freePort()));
 	}
@@ -87,12 +95,12 @@ class AccessLogE2ETest {
 		if (this.client != null) {
 			return;
 		}
+		String target = "127.0.0.1:" + upstream.getAddress().getPort();
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
-			.upstream(Upstream.builder()
-				.host("log.local")
-				.target("http://127.0.0.1:" + upstream.getAddress().getPort())
-				.build())
+			.upstream(Upstream.builder().host("log.local").target("http://" + target).build())
+			.upstream(Upstream.builder().host("quiet.local").target("http://" + target).build())
+			.upstream(Upstream.builder().host("log.tcp").target("tcp://" + target).listenPort(tcpRoutePort).build())
 			.token("it-token")
 			.build();
 		TunnelClient started = TunnelClient.builder()
@@ -202,6 +210,58 @@ class AccessLogE2ETest {
 			.as("each request line with its own user agent")
 			.map(e -> e.substring(e.indexOf(" userAgent=") + 1))
 			.containsExactly("userAgent=\"first/1\"", "userAgent=-");
+	}
+
+	/**
+	 * {@code quiet.local} and the tcp route port log their close lines only: a keep-alive
+	 * connection whose head goes to {@code quiet.local} logs the request rerouted to
+	 * {@code log.local} and the close line of {@code quiet.local}, its data port accept
+	 * line under the server-wide settings; the tcp route port connection logs no accept
+	 * line.
+	 */
+	@Test
+	void routeSettingsReplaceTheServerWideOnesForTheLinesOfTheRoute() throws Exception {
+		this.startClient();
+		this.clearEvents();
+		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
+			socket.setSoTimeout(10_000);
+			var out = socket.getOutputStream();
+			for (String host : List.of("quiet.local", "log.local")) {
+				out.write(("GET /" + host + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: keep-alive\r\n\r\n")
+					.getBytes(StandardCharsets.US_ASCII));
+				out.flush();
+				socket.getInputStream().readNBytes(64);
+			}
+			socket.shutdownOutput();
+			socket.getInputStream().readAllBytes();
+		}
+		String close = this.awaitCloseEvent("quiet.local")
+			.stream()
+			.filter(e -> e.contains("event=close"))
+			.findFirst()
+			.orElseThrow();
+		String id = field(close, "id");
+		assertThat(events()).filteredOn(e -> e.contains(" id=" + id + " "))
+			.map(e -> e.replaceAll(" (remote|connId|bytesIn|bytesOut|durationMs|userAgent)=\\S+", ""))
+			.containsExactly("type=conn id=%s event=accept listener=data".formatted(id),
+					"type=req id=%s route=log.local method=GET path=/log.local http=1.1".formatted(id),
+					"type=conn id=%s event=close listener=data route=quiet.local transport=h1".formatted(id));
+		this.clearEvents();
+		try (Socket socket = new Socket("127.0.0.1", tcpRoutePort)) {
+			socket.setSoTimeout(10_000);
+			socket.getOutputStream()
+				.write("GET / HTTP/1.1\r\nHost: log.tcp\r\nConnection: close\r\n\r\n"
+					.getBytes(StandardCharsets.US_ASCII));
+			assertThat(new String(socket.getInputStream().readAllBytes(), StandardCharsets.US_ASCII))
+				.contains("hello-from-upstream");
+		}
+		Awaitility.await()
+			.atMost(Duration.ofSeconds(5))
+			.until(() -> events().stream()
+				.anyMatch(e -> e.contains("event=close") && e.contains("listener=tcp:" + tcpRoutePort)));
+		assertThat(events()).as("the tcp route port's lines: its close line only")
+			.singleElement()
+			.satisfies(e -> assertThat(e).contains("event=close", "route=log.tcp", "transport=tcp"));
 	}
 
 	private static String field(String line, String key) {

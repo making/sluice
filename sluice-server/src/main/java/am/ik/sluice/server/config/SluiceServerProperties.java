@@ -1,6 +1,7 @@
 package am.ik.sluice.server.config;
 
 import java.time.Duration;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
@@ -215,28 +216,57 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 *
 	 * @param enabled whether access log lines are emitted to the {@code sluice.access}
 	 * logger
-	 * @param types event types to emit (comma separated in configuration): {@code conn}
-	 * (connection accept/close), {@code request} (head request)
+	 * @param types event types to emit (comma separated in configuration): {@code accept}
+	 * (connection accept), {@code close} (connection close), {@code reject} (connection
+	 * rejected before it was served), {@code request} (request heads); {@code connection}
+	 * is short for {@code accept,close,reject}
 	 * @param rateLimit rate limit applied per line kind (syslog style: the first
 	 * {@code maxRate} lines of each kind pass per {@code period}, further lines are
 	 * suppressed and counted, and one summary line reports the suppressed count when the
 	 * period rolls over)
 	 */
-	public record AccessLog(@DefaultValue("true") boolean enabled, @DefaultValue("connection,request") Set<Type> types,
-			RateLimit rateLimit) {
+	public record AccessLog(@DefaultValue("true") boolean enabled,
+			@DefaultValue("accept,close,reject,request") Set<Type> types, RateLimit rateLimit) {
 
 		public enum Type {
 
-			/** Connection accept/close lines. */
-			CONNECTION,
+			/** Connection accept lines. */
+			ACCEPT,
 
-			/** Head request lines. */
-			REQUEST
+			/** Connection close lines. */
+			CLOSE,
+
+			/** Connection reject lines, in place of the close line. */
+			REJECT,
+
+			/** Request head lines. */
+			REQUEST,
+
+			/**
+			 * Short for {@link #ACCEPT}, {@link #CLOSE} and {@link #REJECT}; never left
+			 * in a bound set.
+			 */
+			CONNECTION;
+
+			/**
+			 * The types with {@link #CONNECTION} replaced by what it stands for; empty
+			 * for {@code null}.
+			 */
+			public static Set<Type> expand(@Nullable Set<Type> types) {
+				EnumSet<Type> expanded = types == null || types.isEmpty() ? EnumSet.noneOf(Type.class)
+						: EnumSet.copyOf(types);
+				if (expanded.remove(CONNECTION)) {
+					expanded.add(ACCEPT);
+					expanded.add(CLOSE);
+					expanded.add(REJECT);
+				}
+				return Collections.unmodifiableSet(expanded);
+			}
 
 		}
 
 		public AccessLog {
-			types = types == null || types.isEmpty() ? EnumSet.noneOf(Type.class) : EnumSet.copyOf(types);
+			types = Type.expand(types);
 			rateLimit = rateLimit == null ? new RateLimit(true, 10, Duration.ofSeconds(10)) : rateLimit;
 		}
 
@@ -789,12 +819,31 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * @param auth the credentials the requests of a route must carry; absent = none. Only
 	 * a request the data plane reads can be checked: a tcp route's key fails the start, a
 	 * TLS passthrough or non-HTTP connection to the route is refused
+	 * @param accessLog the access log lines of a route, in place of
+	 * {@code sluice.access-log}'s; absent = those
 	 */
-	public record Route(@DefaultValue Map<String, GateState> gate, @DefaultValue Map<String, Auth> auth) {
+	public record Route(@DefaultValue Map<String, GateState> gate, @DefaultValue Map<String, Auth> auth,
+			@DefaultValue Map<String, AccessLog> accessLog) {
 
 		public Route {
 			gate = gate == null ? Map.of() : Map.copyOf(gate);
 			auth = auth == null ? Map.of() : Map.copyOf(auth);
+			accessLog = accessLog == null ? Map.of() : Map.copyOf(accessLog);
+		}
+
+		/**
+		 * The access log lines of one route; each setting left out is the server-wide one
+		 * ({@code sluice.access-log.enabled} / {@code types}).
+		 *
+		 * @param enabled whether the route's lines are emitted
+		 * @param types the event types emitted for the route
+		 */
+		public record AccessLog(@Nullable Boolean enabled, @Nullable Set<SluiceServerProperties.AccessLog.Type> types) {
+
+			public AccessLog {
+				types = types == null ? null : SluiceServerProperties.AccessLog.Type.expand(types);
+			}
+
 		}
 
 		/**
@@ -997,6 +1046,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 			private Map<String, Auth> auth = Map.of();
 
+			private Map<String, AccessLog> accessLog = Map.of();
+
 			private Builder() {
 			}
 
@@ -1010,8 +1061,13 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder accessLog(Map<String, AccessLog> accessLog) {
+				this.accessLog = accessLog;
+				return this;
+			}
+
 			public Route build() {
-				return new Route(this.gate == null ? Map.of() : this.gate, this.auth);
+				return new Route(this.gate == null ? Map.of() : this.gate, this.auth, this.accessLog);
 			}
 
 		}

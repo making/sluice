@@ -3,7 +3,7 @@
   <thead><tr><th scope="col">Client id</th><th scope="col">Target</th><th scope="col">Role</th><th scope="col"><span class="visually-hidden">Note</span></th></tr></thead>
   {{#httpRoutes}}
   <tbody data-route="{{domain}}" data-gate="{{gateLabel}}">
-    <tr class="routes__key"><th colspan="4" scope="rowgroup" class="mono">{{#catchAll}}<span class="catch-all">any host</span> (catch-all){{/catchAll}}{{^catchAll}}{{domain}}{{/catchAll}}{{#decision}} <span class="decision">{{decision}}</span>{{/decision}} <span class="tag route-gate{{^open}} route-gate--shut{{/open}}" data-testid="route-gate">{{gateLabel}}</span>{{#auth}} <span class="tag route-auth" data-testid="route-auth" title="credentials required">Auth: {{auth}}</span>{{/auth}}
+    <tr class="routes__key"><th colspan="4" scope="rowgroup" class="mono">{{#catchAll}}<span class="catch-all">any host</span> (catch-all){{/catchAll}}{{^catchAll}}{{domain}}{{/catchAll}}{{#decision}} <span class="decision">{{decision}}</span>{{/decision}} <span class="tag route-gate{{^open}} route-gate--shut{{/open}}" data-testid="route-gate">{{gateLabel}}</span>{{#auth}} <span class="tag route-auth" data-testid="route-auth" title="credentials required">Auth: {{auth}}</span>{{/auth}}{{#accessLog}} <span class="tag route-access-log" data-testid="route-access-log" title="access log lines of the route">Log: {{accessLog}}</span>{{/accessLog}}
       <form class="route-gate__form" method="post" action="/console/routes/gate">
         {{#_csrf}}<input type="hidden" name="{{_csrf.parameterName}}" value="{{_csrf.token}}">{{/_csrf}}
         <input type="hidden" name="key" value="{{gateKey}}">
@@ -30,7 +30,7 @@
   <thead><tr><th scope="col">Client id</th><th scope="col">Target</th><th scope="col">Role</th><th scope="col"><span class="visually-hidden">Note</span></th></tr></thead>
   {{#tcpRoutes}}
   <tbody data-port="{{port}}" data-gate="{{gateLabel}}">
-    <tr class="routes__key"><th colspan="4" scope="rowgroup"><span class="mono">:{{port}}</span> {{#bound}}<span class="bound">listening, owned by <span class="mono">{{owner}}</span></span>{{/bound}}{{^bound}}<span class="tag tag--fault">Not listening</span>{{/bound}}{{#decision}} <span class="decision">{{decision}}</span>{{/decision}} <span class="tag route-gate{{^open}} route-gate--shut{{/open}}" data-testid="route-gate">{{gateLabel}}</span>
+    <tr class="routes__key"><th colspan="4" scope="rowgroup"><span class="mono">:{{port}}</span> {{#bound}}<span class="bound">listening, owned by <span class="mono">{{owner}}</span></span>{{/bound}}{{^bound}}<span class="tag tag--fault">Not listening</span>{{/bound}}{{#decision}} <span class="decision">{{decision}}</span>{{/decision}} <span class="tag route-gate{{^open}} route-gate--shut{{/open}}" data-testid="route-gate">{{gateLabel}}</span>{{#accessLog}} <span class="tag route-access-log" data-testid="route-access-log" title="access log lines of the route">Log: {{accessLog}}</span>{{/accessLog}}
       <form class="route-gate__form" method="post" action="/console/routes/gate">
         {{#_csrf}}<input type="hidden" name="{{_csrf.parameterName}}" value="{{_csrf.token}}">{{/_csrf}}
         <input type="hidden" name="key" value="{{gateKey}}">

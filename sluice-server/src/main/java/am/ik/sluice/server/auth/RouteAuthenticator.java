@@ -202,7 +202,7 @@ public class RouteAuthenticator implements AutoCloseable {
 	 * credentials.
 	 */
 	public CompletableFuture<Verdict> verifyAsync(Router.Route route, RequestHeaders headers) {
-		Policy policy = this.policies.get(keyOf(route));
+		Policy policy = this.policies.get(route.routeKey());
 		if (policy == null) {
 			return CompletableFuture.completedFuture(Verdict.OPEN);
 		}
@@ -253,7 +253,7 @@ public class RouteAuthenticator implements AutoCloseable {
 	 * read a request of (TLS passthrough, a non-HTTP protocol) is refused.
 	 */
 	public boolean protects(Router.Route route) {
-		return this.policies.containsKey(keyOf(route));
+		return this.policies.containsKey(route.routeKey());
 	}
 
 	/**
@@ -427,14 +427,6 @@ public class RouteAuthenticator implements AutoCloseable {
 			log.debug("a credential did not match: {}", e.toString());
 			return false;
 		}
-	}
-
-	/** The route key of the route, as {@code sluice.route.auth} is keyed. */
-	private static String keyOf(Router.Route route) {
-		if (route.listenPort() > 0) {
-			return "tcp:" + route.listenPort();
-		}
-		return route.domain().isEmpty() ? "*" : route.domain();
 	}
 
 	private static String normalize(String key) {
