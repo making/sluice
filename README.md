@@ -18,6 +18,14 @@ Setup: [Run](#run). How it works: [Architecture](#architecture). Options: [Confi
 
 ## Run
 
+Requires JDK 25+. Build the executable jars once (see [Build](#build)):
+
+```
+./mvnw -DskipTests package
+```
+
+Then start the four processes, each in its own terminal:
+
 ```
 # terminal 1: upstream (sample server speaking http/1.1 and h2c on one port)
 java -jar sluice-example-upstream/target/sluice-example-upstream-0.0.1-SNAPSHOT-exec.jar 31080
