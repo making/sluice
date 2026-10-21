@@ -94,22 +94,23 @@ import io.netty.util.AsciiString;
  * A CONNECT stream is routed by its {@code :authority} and logged with it as its path.
  * <p>
  * Streams of one route share the route's leg and keep their stream ids on it, but for a
- * parked stream a later one overtook ({@link Leg#streamIdLocked}); with
- * {@code rewrite-host} the head's {@code :authority} becomes the route's address. Windows
- * are per hop: DATA read on one hop is written on the other ({@link Flow}: a copy, small
- * frames coalesced) and consumed -- its stream window granted back -- once written, so
- * what the relay holds per stream and direction stays within the stream window it
- * announced ({@link #STREAM_WINDOW} to the client, {@link #LEG_STREAM_WINDOW} to an
- * upstream); the connection windows refill as DATA arrives, not as it is written, so a
- * stream held by its upstream or its client holds back no other stream. Each hop's
- * connection window starts at RFC 9113's 65535 bytes and grows with what its peer sends
- * per round trip up to {@link #CONNECTION_WINDOW} (the client's) or
- * {@link #LEG_CONNECTION_WINDOW} (an upstream's) ({@link HopWindow}): the hop holds back
- * netty's connection-level WINDOW_UPDATEs and the review grants them
- * ({@link #grantLocked}). Resets pass either way with their code; an upstream's reset
- * after the response's end follows that end to the client. A stream the client ends
- * without its request's end resets its upstream stream with {@code CANCEL}; one an early
- * response closed for the client still delivers the request's rest.
+ * parked stream a later one overtook ({@link Leg#streamIdLocked}); the head gets the
+ * forwarding headers ({@link Forwarding}), and with {@code rewrite-host} its
+ * {@code :authority} becomes the route's address. Windows are per hop: DATA read on one
+ * hop is written on the other ({@link Flow}: a copy, small frames coalesced) and consumed
+ * -- its stream window granted back -- once written, so what the relay holds per stream
+ * and direction stays within the stream window it announced ({@link #STREAM_WINDOW} to
+ * the client, {@link #LEG_STREAM_WINDOW} to an upstream); the connection windows refill
+ * as DATA arrives, not as it is written, so a stream held by its upstream or its client
+ * holds back no other stream. Each hop's connection window starts at RFC 9113's 65535
+ * bytes and grows with what its peer sends per round trip up to
+ * {@link #CONNECTION_WINDOW} (the client's) or {@link #LEG_CONNECTION_WINDOW} (an
+ * upstream's) ({@link HopWindow}): the hop holds back netty's connection-level
+ * WINDOW_UPDATEs and the review grants them ({@link #grantLocked}). Resets pass either
+ * way with their code; an upstream's reset after the response's end follows that end to
+ * the client. A stream the client ends without its request's end resets its upstream
+ * stream with {@code CANCEL}; one an early response closed for the client still delivers
+ * the request's rest.
  * <p>
  * What the relay holds -- DATA, header blocks and pages not yet written, and every hop's
  * writer queue -- and the connection window its peers hold -- what they may still send --
@@ -341,6 +342,8 @@ final class NettyHttp2DemuxRelay {
 
 	private static final AsciiString EXPECT = AsciiString.cached("expect");
 
+	private static final AsciiString HOST = AsciiString.cached("host");
+
 	private static final AsciiString CONTINUE = AsciiString.cached("100-continue");
 
 	/** The payload of the PINGs probing a half-closed client: "sluice-p". */
@@ -378,6 +381,9 @@ final class NettyHttp2DemuxRelay {
 
 	/** The handshake the data plane terminated; null for plaintext h2. */
 	private final @Nullable TlsHandshake handshake;
+
+	/** How the connection reached the data plane, told by every relayed head. */
+	private final Forwarding forwarding;
 
 	private final ConnectionLimits.KeepAliveDeadline deadline;
 
@@ -521,6 +527,7 @@ final class NettyHttp2DemuxRelay {
 		this.initialSession = Objects.requireNonNull(builder.initialSession, "initialSession is required");
 		this.peer = builder.peer;
 		this.handshake = builder.handshake;
+		this.forwarding = Objects.requireNonNull(builder.forwarding, "forwarding is required");
 		this.deadline = Objects.requireNonNull(builder.deadline, "deadline is required");
 		this.streamWaitTimeout = builder.streamWaitTimeout;
 		if (this.streamWaitTimeout.isNegative()) {
@@ -749,6 +756,13 @@ final class NettyHttp2DemuxRelay {
 			misdirectLocked(streamId, stream.host, route, request, stream.requestEnded);
 			return;
 		}
+		CharSequence authority = headers.authority() != null ? headers.authority() : headers.get(HOST);
+		Forwarding.Headers forwarded = this.forwarding.headers(ConnectionHeadParser.http2Headers(headers),
+				authority == null ? null : authority.toString());
+		for (String name : forwarded.removed()) {
+			headers.remove(AsciiString.of(name));
+		}
+		forwarded.added().forEach((name, value) -> headers.add(AsciiString.of(name), value));
 		int headBytes = headerBytes(headers);
 		Shortfall shortfall = admitLocked(headBytes);
 		if (shortfall != null) {
@@ -2103,7 +2117,7 @@ final class NettyHttp2DemuxRelay {
 		if (authority != null && !authority.isEmpty()) {
 			return authority.toString();
 		}
-		CharSequence host = headers.get(AsciiString.cached("host"));
+		CharSequence host = headers.get(HOST);
 		return host == null || host.isEmpty() ? null : host.toString();
 	}
 
@@ -2955,6 +2969,8 @@ final class NettyHttp2DemuxRelay {
 
 		private @Nullable TlsHandshake handshake;
 
+		private @Nullable Forwarding forwarding;
+
 		private ConnectionLimits.@Nullable KeepAliveDeadline deadline;
 
 		private Duration streamWaitTimeout = Duration.ZERO;
@@ -3039,6 +3055,12 @@ final class NettyHttp2DemuxRelay {
 		 */
 		Builder handshake(@Nullable TlsHandshake handshake) {
 			this.handshake = handshake;
+			return this;
+		}
+
+		/** How the connection reached the data plane. */
+		Builder forwarding(Forwarding forwarding) {
+			this.forwarding = forwarding;
 			return this;
 		}
 

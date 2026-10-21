@@ -8,8 +8,10 @@ import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -158,6 +160,9 @@ final class ReroutingRelay {
 
 	private final @Nullable InetAddress peer;
 
+	/** How the connection reached the data plane, told by every relayed head. */
+	private final Forwarding forwarding;
+
 	private final Runnable onFinish;
 
 	/** Frees the connection's slot; run once the legs' queued frames left. */
@@ -244,8 +249,9 @@ final class ReroutingRelay {
 	ReroutingRelay(DuplexPipe pipe, ConnectionHeadParser.Head head, Router router, SessionRegistry sessions,
 			AccessControl accessControl, RouteAuthenticator routeAuth, ErrorResponse errorResponse,
 			AccessLogger.Connection access, MeterRegistry meterRegistry, Router.Route initialRoute,
-			TunnelSession initialSession, @Nullable InetAddress peer, ConnectionLimits.KeepAliveDeadline deadline,
-			Duration probeInterval, ProbeSeam probeSeam, HeadSeam headSeam, Runnable onFinish, Runnable release) {
+			TunnelSession initialSession, @Nullable InetAddress peer, Forwarding forwarding,
+			ConnectionLimits.KeepAliveDeadline deadline, Duration probeInterval, ProbeSeam probeSeam, HeadSeam headSeam,
+			Runnable onFinish, Runnable release) {
 		this.pipe = pipe;
 		this.seedHead = head.bytes();
 		this.router = router;
@@ -258,6 +264,7 @@ final class ReroutingRelay {
 		this.initialRoute = initialRoute;
 		this.initialSession = initialSession;
 		this.peer = peer;
+		this.forwarding = forwarding;
 		this.onFinish = onFinish;
 		this.release = release;
 		this.deadline = deadline;
@@ -718,7 +725,11 @@ final class ReroutingRelay {
 		}
 		leg.requestSent(host, request, Http1RequestParser.isUpgrade(head));
 		this.lastRequest = System.nanoTime();
-		byte[] stripped = ConnectionHeadRewriter.withoutHeaders(head, pass.strip());
+		Forwarding.Headers forwarded = this.forwarding.headers(ConnectionHeadParser.http1Headers(head),
+				ConnectionHeadParser.http1HostOf(head));
+		Set<String> removed = new HashSet<>(pass.strip());
+		removed.addAll(forwarded.removed());
+		byte[] stripped = ConnectionHeadRewriter.withHeaders(head, removed, forwarded.added());
 		byte[] relayed = route.rewriteHost() ? ConnectionHeadRewriter.rewriteHttp1(stripped, route.address())
 				: stripped;
 		leg.toUpstream(relayed, 0, relayed.length);

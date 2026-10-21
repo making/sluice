@@ -1,6 +1,7 @@
 package am.ik.sluice.server.proxy;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.Set;
 
 import org.junit.jupiter.api.Test;
@@ -10,8 +11,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Unit tests for {@link ConnectionHeadRewriter}: HTTP/1.1 Host line replacement,
  * verifiable by re-parsing with the production {@link ConnectionHeadParser}, and header
- * line removal. The h2 equivalents are covered end to end by the rerouting and
- * demultiplexing E2E tests.
+ * line removal (the lines added are covered by {@link ForwardingTest}). The h2
+ * equivalents are covered end to end by the rerouting and demultiplexing E2E tests.
  */
 class ConnectionHeadRewriterTest {
 
@@ -47,10 +48,10 @@ class ConnectionHeadRewriterTest {
 		byte[] head = ("POST / HTTP/1.1\r\nAuthorization: Basic YTpi\r\nHost: demo.local\r\nX-API-Token: t\r\n"
 				+ "authorization: Bearer c\r\n\r\nAuthorization: body")
 			.getBytes(StandardCharsets.US_ASCII);
-		byte[] stripped = ConnectionHeadRewriter.withoutHeaders(head, Set.of("authorization", "x-api-token"));
+		byte[] stripped = ConnectionHeadRewriter.withHeaders(head, Set.of("authorization", "x-api-token"), Map.of());
 		assertThat(new String(stripped, StandardCharsets.US_ASCII))
 			.isEqualTo("POST / HTTP/1.1\r\nHost: demo.local\r\n\r\nAuthorization: body");
-		assertThat(ConnectionHeadRewriter.withoutHeaders(head, Set.of("x-other"))).isSameAs(head);
+		assertThat(ConnectionHeadRewriter.withHeaders(head, Set.of("x-other"), Map.of())).isSameAs(head);
 	}
 
 	@Test

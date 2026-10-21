@@ -92,6 +92,21 @@ public class AccessControl {
 	}
 
 	/**
+	 * Whether the peer is a trusted proxy ({@code trusted-proxy-cidrs}).
+	 */
+	boolean trusts(@Nullable InetAddress peer) {
+		if (peer == null) {
+			return false;
+		}
+		for (Cidr trustedProxy : this.trustedProxies) {
+			if (trustedProxy.matches(peer)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
 	 * The address the connection may claim: the rightmost {@code Forwarded} {@code for=}
 	 * literal when the peer is a trusted proxy and carried the header, else the rightmost
 	 * forwarded-for entry, the peer itself otherwise (also when no proxy is trusted, no
@@ -100,35 +115,29 @@ public class AccessControl {
 	 */
 	private @Nullable InetAddress claimedAddress(@Nullable InetAddress peer, @Nullable String forwardedFor,
 			@Nullable String forwarded) {
-		if (peer == null || this.trustedProxies.isEmpty()) {
+		if (!trusts(peer)) {
 			return peer;
 		}
-		for (Cidr trustedProxy : this.trustedProxies) {
-			if (!trustedProxy.matches(peer)) {
-				continue;
-			}
-			if (forwarded != null) {
-				InetAddress literal = rightmostForwardedLiteral(forwarded);
-				if (literal != null) {
-					return literal;
-				}
-			}
-			if (forwardedFor == null) {
-				break;
-			}
-			String candidate = forwardedFor.substring(forwardedFor.lastIndexOf(',') + 1).trim();
-			if (candidate.isEmpty()) {
-				break;
-			}
-			try {
-				return InetAddress.getByName(candidate);
-			}
-			catch (Exception e) {
-				log.debug("ignoring malformed forwarded-for entry {}: {}", candidate, e.toString());
-				break;
+		if (forwarded != null) {
+			InetAddress literal = rightmostForwardedLiteral(forwarded);
+			if (literal != null) {
+				return literal;
 			}
 		}
-		return peer;
+		if (forwardedFor == null) {
+			return peer;
+		}
+		String candidate = forwardedFor.substring(forwardedFor.lastIndexOf(',') + 1).trim();
+		if (candidate.isEmpty()) {
+			return peer;
+		}
+		try {
+			return InetAddress.getByName(candidate);
+		}
+		catch (Exception e) {
+			log.debug("ignoring malformed forwarded-for entry {}: {}", candidate, e.toString());
+			return peer;
+		}
 	}
 
 	/**

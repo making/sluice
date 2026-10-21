@@ -375,7 +375,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * @param denyCidrs CIDRs / bare addresses rejected before any allow evaluation
 	 * @param trustedProxyCidrs CIDRs / bare addresses of proxying load balancers whose
 	 * {@code X-Forwarded-For} is trusted: when the connection peer matches, the rightmost
-	 * header entry (the one the proxy appended) is judged instead of the peer address
+	 * header entry (the one the proxy appended) is judged instead of the peer address,
+	 * and the forwarding headers it sent are relayed rather than dropped
 	 */
 	public record AccessControl(@DefaultValue List<String> allowCidrs, @DefaultValue List<String> denyCidrs,
 			@DefaultValue List<String> trustedProxyCidrs) {

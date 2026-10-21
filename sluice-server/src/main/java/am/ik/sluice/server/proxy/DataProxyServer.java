@@ -556,6 +556,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 				return false;
 			}
 			Runnable relayed = this.relayed(access);
+			Forwarding forwarding = new Forwarding(conn.handshake() != null, peer, this.accessControl.trusts(peer));
 			if (http2) {
 				NettyHttp2DemuxRelay demux = NettyHttp2DemuxRelay.builder()
 					.pipe(this.clientPipeSeam.apply(conn.pipe()))
@@ -570,6 +571,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 					.initialRoute(route0, session)
 					.handshake(conn.handshake())
 					.peer(peer)
+					.forwarding(forwarding)
 					.deadline(deadline)
 					.streamWaitTimeout(this.h2StreamWaitTimeout)
 					.probeInterval(this.properties.limits().halfCloseProbeInterval())
@@ -591,7 +593,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			}
 			ReroutingRelay rerouting = new ReroutingRelay(this.clientPipeSeam.apply(conn.pipe()), conn.head(),
 					this.router, this.sessions, this.accessControl, this.routeAuth, this.errorResponse, access,
-					this.meterRegistry, route0, session, peer, deadline,
+					this.meterRegistry, route0, session, peer, forwarding, deadline,
 					this.properties.limits().halfCloseProbeInterval(), this.probeSeam, this.headSeam, relayed, release);
 			this.activeConnections.incrementAndGet();
 			try {

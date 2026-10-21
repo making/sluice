@@ -22,19 +22,25 @@ import org.jspecify.annotations.Nullable;
 
 /**
  * An upstream speaking HTTP/1.1 (keep-alive) and h2c with prior knowledge on one port:
- * every request is answered {@code 200} with {@link #body} naming the credential headers
- * it carried, so a test sees what reached the upstream.
+ * every request is answered {@code 200} with {@link #body} naming the echoed headers it
+ * carried (the credential headers by default), so a test sees what reached the upstream.
  */
 final class HeaderEchoUpstream implements AutoCloseable {
 
 	static final String GREETING = "hello-from-upstream";
 
 	/** The headers the body names when the request carried them. */
-	private static final List<String> ECHOED = List.of("authorization", "x-api-token");
+	private final List<String> echoed;
 
 	private final ServerSocket server;
 
 	HeaderEchoUpstream() throws IOException {
+		this("authorization", "x-api-token");
+	}
+
+	/** An upstream echoing the headers named, lowercase. */
+	HeaderEchoUpstream(String... echoed) throws IOException {
+		this.echoed = List.of(echoed);
 		this.server = new ServerSocket();
 		this.server.bind(new InetSocketAddress("127.0.0.1", 0));
 		Thread.ofVirtual().name("e2e-header-echo-accept").start(this::acceptLoop);
@@ -48,9 +54,9 @@ final class HeaderEchoUpstream implements AutoCloseable {
 	 * The body answering a request with the headers: {@link #GREETING}, then
 	 * {@code  <name>=<value>} for each echoed header present.
 	 */
-	static String body(Function<String, @Nullable String> header) {
+	private String body(Function<String, @Nullable String> header) {
 		StringBuilder body = new StringBuilder(GREETING);
-		for (String name : ECHOED) {
+		for (String name : this.echoed) {
 			String value = header.apply(name);
 			if (value != null) {
 				body.append(' ').append(name).append('=').append(value);
@@ -63,7 +69,7 @@ final class HeaderEchoUpstream implements AutoCloseable {
 		while (!this.server.isClosed()) {
 			try {
 				Socket socket = this.server.accept();
-				Thread.ofVirtual().name("e2e-header-echo-conn").start(() -> serve(socket));
+				Thread.ofVirtual().name("e2e-header-echo-conn").start(() -> this.serve(socket));
 			}
 			catch (IOException e) {
 				return;
@@ -71,7 +77,7 @@ final class HeaderEchoUpstream implements AutoCloseable {
 		}
 	}
 
-	private static void serve(Socket socket) {
+	private void serve(Socket socket) {
 		try (socket) {
 			PushbackInputStream in = new PushbackInputStream(socket.getInputStream(), 3);
 			byte[] start = in.readNBytes(3);
@@ -80,10 +86,10 @@ final class HeaderEchoUpstream implements AutoCloseable {
 			}
 			in.unread(start);
 			if ("PRI".equals(new String(start, StandardCharsets.US_ASCII))) {
-				serveH2(in, socket.getOutputStream());
+				this.serveH2(in, socket.getOutputStream());
 			}
 			else {
-				serveH1(in, socket.getOutputStream());
+				this.serveH1(in, socket.getOutputStream());
 			}
 		}
 		catch (Exception e) {
@@ -91,7 +97,7 @@ final class HeaderEchoUpstream implements AutoCloseable {
 		}
 	}
 
-	private static void serveH1(InputStream in, OutputStream out) throws IOException {
+	private void serveH1(InputStream in, OutputStream out) throws IOException {
 		String head;
 		while ((head = readHead(in)) != null) {
 			Map<String, String> headers = new HashMap<>();
@@ -103,7 +109,7 @@ final class HeaderEchoUpstream implements AutoCloseable {
 				}
 			}
 			in.skipNBytes(Long.parseLong(headers.getOrDefault("content-length", "0")));
-			byte[] body = body(headers::get).getBytes(StandardCharsets.UTF_8);
+			byte[] body = this.body(headers::get).getBytes(StandardCharsets.UTF_8);
 			out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " + body.length + "\r\n\r\n")
 				.getBytes(StandardCharsets.US_ASCII));
 			out.write(body);
@@ -130,7 +136,7 @@ final class HeaderEchoUpstream implements AutoCloseable {
 		return null;
 	}
 
-	private static void serveH2(InputStream in, OutputStream out) throws Exception {
+	private void serveH2(InputStream in, OutputStream out) throws Exception {
 		if (in.readNBytes(TestH2.PREFACE.length).length < TestH2.PREFACE.length) {
 			return;
 		}
@@ -146,20 +152,20 @@ final class HeaderEchoUpstream implements AutoCloseable {
 				Http2Headers headers = decoder.decodeHeaders(frame.streamId(), Unpooled.wrappedBuffer(frame.payload()));
 				requests.put(frame.streamId(), headers);
 				if ((frame.flags() & TestH2.FLAG_END_STREAM) != 0) {
-					respond(out, frame.streamId(), headers);
+					this.respond(out, frame.streamId(), headers);
 				}
 			}
 			else if (frame.type() == TestH2.DATA && (frame.flags() & TestH2.FLAG_END_STREAM) != 0) {
 				Http2Headers headers = requests.get(frame.streamId());
 				if (headers != null) {
-					respond(out, frame.streamId(), headers);
+					this.respond(out, frame.streamId(), headers);
 				}
 			}
 		}
 	}
 
-	private static void respond(OutputStream out, int streamId, Http2Headers headers) throws IOException {
-		String body = body(name -> {
+	private void respond(OutputStream out, int streamId, Http2Headers headers) throws IOException {
+		String body = this.body(name -> {
 			CharSequence value = headers.get(name);
 			return value == null ? null : value.toString();
 		});

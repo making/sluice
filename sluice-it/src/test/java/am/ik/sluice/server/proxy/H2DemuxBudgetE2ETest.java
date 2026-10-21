@@ -343,7 +343,8 @@ class H2DemuxBudgetE2ETest {
 			client.headers(after, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/after"));
 			assertThat(client.awaitEnd(after, Duration.ofSeconds(10))).isTrue();
 			assertThat(log.requestHeads.get(after)).as("the next stream's head")
-				.isEqualTo(List.of(":authority: " + route, ":method: GET", ":path: /after"));
+				.isEqualTo(List.of(":authority: " + route, ":method: GET", ":path: /after", "x-forwarded-proto: http",
+						"x-forwarded-host: " + route, "x-forwarded-port: 80", "x-forwarded-for: 127.0.0.1"));
 			Awaitility.await()
 				.atMost(Duration.ofSeconds(5))
 				.untilAsserted(() -> assertThat(trackedStreams(route)).as("the reset stream no longer tracked either")

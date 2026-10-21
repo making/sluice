@@ -104,6 +104,9 @@ class TlsDataPlaneE2ETest {
 	/** An https upstream offering http/1.1 only over ALPN. */
 	private @Nullable SSLServerSocket h1AlpnUpstream;
 
+	/** A plaintext upstream echoing the forwarding headers it got. */
+	private @Nullable HeaderEchoUpstream forwardedUpstream;
+
 	/** The ALPN protocol each connection to an https upstream negotiated. */
 	private final List<String> httpsNegotiated = new CopyOnWriteArrayList<>();
 
@@ -307,6 +310,9 @@ class TlsDataPlaneE2ETest {
 			if (this.h1AlpnUpstream != null) {
 				this.h1AlpnUpstream.close();
 			}
+			if (this.forwardedUpstream != null) {
+				this.forwardedUpstream.close();
+			}
 		}
 		catch (Exception e) {
 			// ignore
@@ -328,6 +334,9 @@ class TlsDataPlaneE2ETest {
 		this.noAlpnUpstream = noAlpn;
 		SSLServerSocket h1Alpn = this.startHttpsUpstream("http/1.1");
 		this.h1AlpnUpstream = h1Alpn;
+		HeaderEchoUpstream forwarded = new HeaderEchoUpstream("x-forwarded-proto", "x-forwarded-host",
+				"x-forwarded-port", "x-forwarded-for");
+		this.forwardedUpstream = forwarded;
 		SluiceClientProperties properties = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:" + grpcPort)
 			// the https upstreams present the data plane's self-signed certificate
@@ -355,6 +364,11 @@ class TlsDataPlaneE2ETest {
 				.host("h1only.local")
 				.target("http://127.0.0.1:" + h1UpstreamAddress.getPort())
 				.forceHttp1(true)
+				.build())
+			.upstream(Upstream.builder()
+				.host("fwd.local")
+				.target("http://127.0.0.1:" + forwarded.port())
+				.rewriteHost(true)
 				.build())
 			.upstream(Upstream.builder()
 				.host("auth.local")
@@ -567,6 +581,30 @@ class TlsDataPlaneE2ETest {
 			assertThat(socket.getApplicationProtocol()).as("precondition: h2").isEqualTo("h2");
 			TestH2.writeClientHead(socket.getOutputStream(), 1, ":authority=auth.local", ":method=GET", ":path=/");
 			assertThat(TestH2.status(TestH2.readResponseFrames(socket.getInputStream()))).isEqualTo("401");
+		}
+	}
+
+	/**
+	 * The requests of TLS-terminated connections reach the plaintext upstream with the
+	 * forwarding headers of the URL the client used -- its host, though
+	 * {@code rewrite-host} rewrote it, and its port, else the https default --, a claim
+	 * of the client's own replaced: HTTP/1.1 and h2.
+	 */
+	@Test
+	void tlsTerminatedRequestsTellTheUpstreamTheUrlTheClientUsed() throws Exception {
+		this.startClient();
+		assertThat(tlsHttp1("GET / HTTP/1.1\r\nHost: fwd.local:" + dataPort
+				+ "\r\nX-Forwarded-Proto: http\r\nConnection: close\r\n\r\n"))
+			.startsWith("HTTP/1.1 200")
+			.endsWith(HeaderEchoUpstream.GREETING + " x-forwarded-proto=https x-forwarded-host=fwd.local:" + dataPort
+					+ " x-forwarded-port=" + dataPort + " x-forwarded-for=127.0.0.1");
+		try (SSLSocket socket = tls("fwd.local", "h2")) {
+			assertThat(socket.getApplicationProtocol()).as("precondition: h2").isEqualTo("h2");
+			TestH2.writeClientHead(socket.getOutputStream(), 1, ":authority=fwd.local", ":method=GET", ":scheme=https",
+					":path=/");
+			assertThat(TestH2.bodyOf(TestH2.readResponseFrames(socket.getInputStream())))
+				.isEqualTo(HeaderEchoUpstream.GREETING
+						+ " x-forwarded-proto=https x-forwarded-host=fwd.local x-forwarded-port=443 x-forwarded-for=127.0.0.1");
 		}
 	}
 

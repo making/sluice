@@ -41,7 +41,8 @@ the keys have not loaded). The code exchange is network I/O: do it in a
   APIs behind the same route get 157's bearer check.
 - WebSocket: the session cookie rides the upgrade request, so browsers can open one (unlike bearer).
 - Plaintext data plane: refuse to set the cookie without TLS (or a trusted `X-Forwarded-Proto`)?
-  Decide.
+  Decide. `Forwarding` (proxy package) already derives the effective protocol per connection
+  (TLS terminated, or a trusted proxy's `X-Forwarded-Proto`); the redirect URI can be built from it.
 
 ## Acceptance
 

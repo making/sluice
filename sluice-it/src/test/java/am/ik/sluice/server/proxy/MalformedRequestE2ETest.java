@@ -12,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyStore;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -218,11 +219,11 @@ class MalformedRequestE2ETest {
 		double idle = idleClosed();
 		try (Socket socket = connect()) {
 			byte[] head = utf8Get(ECHO_HOST);
-			assertThat(exchange(socket, head)).isEqualTo(echoed("", head));
+			assertThat(exchange(socket, head)).isEqualTo(echoed("", forwarded(head, ECHO_HOST)));
 			assertThat(admitted()).isEqualTo(1);
 			// still parsed: the next request reaches the upstream of its own host
 			byte[] next = get(OTHER_HOST);
-			assertThat(exchange(socket, next)).isEqualTo(echoed("other:", next));
+			assertThat(exchange(socket, next)).isEqualTo(echoed("other:", forwarded(next, OTHER_HOST)));
 			assertThat(TestSockets.awaitClosed(socket, WITHIN)).isGreaterThan(NOT_BEFORE);
 		}
 		awaitAdmitted(0);
@@ -234,11 +235,12 @@ class MalformedRequestE2ETest {
 		double idle = idleClosed();
 		try (Socket socket = connect()) {
 			byte[] first = get(ECHO_HOST);
-			assertThat(exchange(socket, first)).isEqualTo(echoed("", first));
+			assertThat(exchange(socket, first)).isEqualTo(echoed("", forwarded(first, ECHO_HOST)));
 			byte[] utf8 = utf8Get(ECHO_HOST);
-			assertThat(exchange(socket, utf8)).isEqualTo(echoed("", utf8));
+			assertThat(exchange(socket, utf8)).isEqualTo(echoed("", forwarded(utf8, ECHO_HOST)));
 			byte[] next = get(OTHER_HOST);
-			assertThat(exchange(socket, next)).as("rerouted by its Host").isEqualTo(echoed("other:", next));
+			assertThat(exchange(socket, next)).as("rerouted by its Host")
+				.isEqualTo(echoed("other:", forwarded(next, OTHER_HOST)));
 			assertThat(TestSockets.awaitClosed(socket, WITHIN)).isGreaterThan(NOT_BEFORE);
 		}
 		awaitAdmitted(0);
@@ -250,7 +252,7 @@ class MalformedRequestE2ETest {
 		try (Socket socket = connect()) {
 			byte[] head = utf8Get(REWRITE_HOST);
 			byte[] rewritten = utf8Get("127.0.0.1:" + rewritePort);
-			assertThat(exchange(socket, head)).isEqualTo(echoed("", rewritten));
+			assertThat(exchange(socket, head)).isEqualTo(echoed("", forwarded(rewritten, REWRITE_HOST)));
 		}
 	}
 
@@ -264,7 +266,7 @@ class MalformedRequestE2ETest {
 		});
 		try (Socket socket = connect()) {
 			byte[] first = get(ECHO_HOST);
-			assertThat(exchange(socket, first)).isEqualTo(echoed("", first));
+			assertThat(exchange(socket, first)).isEqualTo(echoed("", forwarded(first, ECHO_HOST)));
 			byte[] head = ascii(
 					"POST /upload HTTP/1.1\r\nHost: " + ECHO_HOST + "\r\nTransfer-Encoding: chunked\r\n\r\n");
 			long sent = System.nanoTime();
@@ -289,8 +291,10 @@ class MalformedRequestE2ETest {
 		finally {
 			dataProxyServer().clientPipeSeam(UnaryOperator.identity());
 		}
-		byte[] relayed = concat(get(ECHO_HOST),
-				ascii("POST /upload HTTP/1.1\r\nHost: " + ECHO_HOST + "\r\nTransfer-Encoding: chunked\r\n\r\n"));
+		byte[] relayed = concat(forwarded(get(ECHO_HOST), ECHO_HOST),
+				forwarded(
+						ascii("POST /upload HTTP/1.1\r\nHost: " + ECHO_HOST + "\r\nTransfer-Encoding: chunked\r\n\r\n"),
+						ECHO_HOST));
 		// the upstream reads the head, then waits for a chunk-size line until its EOF
 		Awaitility.await().atMost(Duration.ofSeconds(3)).until(() -> this.received.size() == 1);
 		ByteArrayOutputStream record = this.received.getFirst();
@@ -298,7 +302,7 @@ class MalformedRequestE2ETest {
 		// the head relayed before the invalid line may be dropped with the leg's teardown
 		assertThat(record.toByteArray()).as("the invalid chunk-size line is not relayed")
 			.satisfiesAnyOf(bytes -> assertThat(bytes).isEqualTo(relayed),
-					bytes -> assertThat(bytes).isEqualTo(get(ECHO_HOST)));
+					bytes -> assertThat(bytes).isEqualTo(forwarded(get(ECHO_HOST), ECHO_HOST)));
 	}
 
 	@Test
@@ -328,14 +332,15 @@ class MalformedRequestE2ETest {
 				: ascii(malformed);
 		try (Socket socket = connect()) {
 			byte[] first = get(ECHO_HOST);
-			assertThat(exchange(socket, first)).isEqualTo(echoed("", first));
+			assertThat(exchange(socket, first)).isEqualTo(echoed("", forwarded(first, ECHO_HOST)));
 			write(socket, bytes);
 			assertThat(TestSockets.readUntil(socket.getInputStream(), BAD_REQUEST.length())).isEqualTo(BAD_REQUEST);
 			TestSockets.awaitClosed(socket, CLOSED_WITHIN);
 		}
 		awaitAdmitted(0);
 		Awaitility.await().atMost(Duration.ofSeconds(3)).until(() -> this.received.size() == 1);
-		assertThat(this.received.getFirst().toByteArray()).as("the first request only").isEqualTo(get(ECHO_HOST));
+		assertThat(this.received.getFirst().toByteArray()).as("the first request only")
+			.isEqualTo(forwarded(get(ECHO_HOST), ECHO_HOST));
 	}
 
 	@ParameterizedTest
@@ -358,7 +363,7 @@ class MalformedRequestE2ETest {
 			byte[] malformed = ascii("GET / HTTP/1.1\r\nHost: " + ECHO_HOST + "\r\nContent-Length: -1\r\n\r\n");
 			long start = System.nanoTime();
 			write(socket, concat(slow, malformed));
-			byte[] expected = concat(echoed("", slow), ascii(BAD_REQUEST));
+			byte[] expected = concat(echoed("", forwarded(slow, ECHO_HOST)), ascii(BAD_REQUEST));
 			assertThat(socket.getInputStream().readNBytes(expected.length)).isEqualTo(expected);
 			assertThat(Duration.ofNanos(System.nanoTime() - start)).as("the upstream held the first response")
 				.isGreaterThan(SLOW.minusMillis(200));
@@ -472,6 +477,16 @@ class MalformedRequestE2ETest {
 	/** A GET whose head carries a UTF-8 field value. */
 	private static byte[] utf8Get(String host) {
 		return ("GET / HTTP/1.1\r\nHost: " + host + "\r\nX-Name: éほ\r\n\r\n").getBytes(StandardCharsets.UTF_8);
+	}
+
+	/**
+	 * The head as the data plane relays it from a plaintext client: with the forwarding
+	 * headers of {@code host}, the host the client sent.
+	 */
+	private static byte[] forwarded(byte[] head, String host) {
+		byte[] fields = ascii("x-forwarded-proto: http\r\nx-forwarded-host: " + host
+				+ "\r\nx-forwarded-port: 80\r\nx-forwarded-for: 127.0.0.1\r\n\r\n");
+		return concat(Arrays.copyOf(head, head.length - 2), fields);
 	}
 
 	private static byte[] ascii(String text) {
