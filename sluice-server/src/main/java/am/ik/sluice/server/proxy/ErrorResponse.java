@@ -64,7 +64,8 @@ public class ErrorResponse {
 	/** The debug data of the GOAWAY of {@link #connectionLimit()}. */
 	static final String CONNECTION_LIMIT = "connection limit";
 
-	private static final byte[] BAD_REQUEST = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+	private static final byte[] BAD_REQUEST = ("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n"
+			+ "Cache-Control: no-store\r\nConnection: close\r\n\r\n")
 		.getBytes(StandardCharsets.US_ASCII);
 
 	private final Page noRoute;
@@ -363,7 +364,8 @@ public class ErrorResponse {
 	}
 
 	private static byte[] bare(Page page) {
-		return ("HTTP/1.1 " + page.reason() + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		return ("HTTP/1.1 " + page.reason() + "\r\nContent-Length: 0\r\nCache-Control: no-store\r\n"
+				+ "Connection: close\r\n\r\n")
 			.getBytes(StandardCharsets.US_ASCII);
 	}
 

@@ -918,7 +918,7 @@ type RelayFrame = Result<http_body::Frame<bytes::Bytes>, RelayError>;
 type RelayBody = http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, RelayError>;
 
 /// The response head, or a synthesized failure with its message (the body is
-/// that single frame).
+/// that single frame, never stored by a cache).
 enum Head {
     Response(http::response::Parts),
     Failure(u16, String),
@@ -928,6 +928,7 @@ fn plain_response(status: u16, body: String) -> hyper::Response<RelayBody> {
     let frame = Ok(http_body::Frame::data(bytes::Bytes::from(body)));
     hyper::Response::builder()
         .status(status)
+        .header(http::header::CACHE_CONTROL, "no-store")
         .body(http_body_util::StreamBody::new(tokio_stream::iter([frame])).boxed_unsync())
         .expect("static response")
 }
@@ -4233,6 +4234,10 @@ pub(crate) mod tests {
             .expect("answered at the budget");
         let elapsed = started.elapsed();
         assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(
+            response.contains("cache-control: no-store\r\n"),
+            "{response}"
+        );
         assert!(response.contains(INSTANCE_LIMIT_REACHED), "{response}");
         assert!(elapsed >= budget, "not before the budget: {elapsed:?}");
         assert!(elapsed < budget + Duration::from_secs(1), "{elapsed:?}");

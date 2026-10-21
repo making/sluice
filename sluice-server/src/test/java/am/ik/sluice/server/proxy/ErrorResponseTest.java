@@ -124,9 +124,12 @@ class ErrorResponseTest {
 	}
 
 	@Test
-	void aHeadThatIsNoHttpRequestGetsNoBusyAnswer() {
+	void aHeadThatIsNoHttpRequestGetsNoBusyAnswerAndABareNoRoute() {
 		ConnectionHeadParser.Head head = head("*1\r\n$4\r\nPING\r\n");
 		assertThat(this.errorResponse.busy(head, Duration.ofSeconds(7))).isEmpty();
+		assertThat(new String(this.errorResponse.noRoute(head), StandardCharsets.US_ASCII))
+			.isEqualTo("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nCache-Control: no-store\r\n"
+					+ "Connection: close\r\n\r\n");
 	}
 
 	private static ConnectionHeadParser.Head head(String bytes) {

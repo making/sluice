@@ -7,6 +7,8 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
 import org.springframework.boot.webmvc.error.ErrorController;
+import org.springframework.http.CacheControl;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -19,6 +21,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
  * sign-in: a login posted after a redeploy dropped the session fails CSRF with a bare
  * 403, so the page names the likely cause and offers to sign in again. Requests that do
  * not accept HTML get a minimal JSON body, like Boot's own error controller sends.
+ * Neither is stored by any cache ({@code Cache-Control: no-store}).
  */
 @Controller
 class ConsoleErrorController implements ErrorController {
@@ -30,6 +33,7 @@ class ConsoleErrorController implements ErrorController {
 	Object error(HttpServletRequest request, HttpServletResponse response, Model model) {
 		int status = status(request);
 		String path = String.valueOf(request.getAttribute(RequestDispatcher.ERROR_REQUEST_URI));
+		response.setHeader(HttpHeaders.CACHE_CONTROL, CacheControl.noStore().getHeaderValue());
 		if (!acceptsHtml(request)) {
 			response.setStatus(status);
 			return ResponseEntity.status(status)

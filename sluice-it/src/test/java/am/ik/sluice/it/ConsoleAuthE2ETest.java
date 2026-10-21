@@ -178,6 +178,7 @@ class ConsoleAuthE2ETest {
 					.ofString("username=%s&password=%s&_csrf=stale".formatted(urlEncode(USER), urlEncode(PASSWORD))))
 				.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
 			assertThat(rejected.statusCode()).isEqualTo(403);
+			assertThat(rejected.headers().allValues("Cache-Control")).containsExactly("no-store");
 			assertThat(rejected.body()).contains("Sign in again")
 				.doesNotContain("Whitelabel")
 				// the content-hashed stylesheet link resolves on the error dispatch too
@@ -194,6 +195,9 @@ class ConsoleAuthE2ETest {
 	@Test
 	void staticAssetsStayOpenWithoutLogin() {
 		assertThat(get("/console/css/console.css").statusCode()).isEqualTo(200);
+		HttpResponse<String> missing = get("/console/css/missing.css");
+		assertThat(missing.statusCode()).isEqualTo(404);
+		assertThat(missing.headers().allValues("Cache-Control")).containsExactly("no-store");
 	}
 
 	@Test

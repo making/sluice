@@ -94,7 +94,8 @@ class MalformedRequestE2ETest {
 
 	private static final String OK = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 
-	private static final String BAD_REQUEST = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+	private static final String BAD_REQUEST = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n"
+			+ "Cache-Control: no-store\r\nConnection: close\r\n\r\n";
 
 	private static final String EARLY = "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n";
 
