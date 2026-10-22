@@ -7,6 +7,9 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
@@ -67,6 +70,9 @@ class ConsoleE2ETest {
 
 	/** A second client on the same host; the larger id stands by. */
 	private static final String STANDBY_ID = "console-z";
+
+	/** The browser's zone: unlike that of any machine running the server. */
+	private static final ZoneId BROWSER_ZONE = ZoneId.of("Pacific/Kiritimati");
 
 	private static final TaskExecutor TASK_EXECUTOR = task -> Thread.ofVirtual().name("e2e-console").start(task);
 
@@ -246,7 +252,8 @@ class ConsoleE2ETest {
 
 	@BeforeEach
 	void openPage() {
-		this.context = Objects.requireNonNull(this.browser).newContext();
+		this.context = Objects.requireNonNull(this.browser)
+			.newContext(new Browser.NewContextOptions().setTimezoneId(BROWSER_ZONE.getId()));
 		this.page = this.context.newPage();
 		this.signIn(this.page);
 	}
@@ -482,8 +489,9 @@ class ConsoleE2ETest {
 
 	/**
 	 * The access log page shows the flume's build and the node's lines as they are
-	 * logged; a kind filter narrows them (in the page's address too), and a paused view
-	 * picks up the lines logged meanwhile once resumed, each once.
+	 * logged, timed in the browser's zone; a kind filter narrows them (in the page's
+	 * address too), and a paused view picks up the lines logged meanwhile once resumed,
+	 * each once.
 	 */
 	@Test
 	void accessLogShowsTheLinesAsTheyAreLogged() throws Exception {
@@ -502,6 +510,10 @@ class ConsoleE2ETest {
 		PlaywrightAssertions.assertThat(first).hasCount(1, wait);
 		assertThat(first.locator("td").allInnerTexts().subList(1, 4)).containsExactly("console-node", "request",
 				"demo.local");
+		Locator time = first.locator("time");
+		assertThat(time.innerText()).isEqualTo(DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
+			.withZone(BROWSER_ZONE)
+			.format(Instant.parse(time.getAttribute("datetime"))));
 		PlaywrightAssertions.assertThat(page.locator("#livelog-rows tr[data-kind='close']").first()).isAttached();
 
 		page.locator("input[name=kind][value=request]").check();

@@ -1,8 +1,6 @@
 package am.ik.sluice.server.console.web;
 
 import java.time.Instant;
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -29,9 +27,6 @@ class LiveLogView {
 
 	/** The fields the other columns show: left out of the line column. */
 	private static final Set<String> SHOWN_APART = Set.of("type", "event", "route");
-
-	private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
-		.withZone(ZoneId.systemDefault());
 
 	private final Template row;
 
@@ -73,7 +68,6 @@ class LiveLogView {
 
 	String row(WatchRecord record) {
 		AccessEvent event = record.getEvent();
-		Instant time = Instant.ofEpochMilli(event.getTimeUnixMillis());
 		String route = event.getRouteKey().isEmpty() ? "-" : event.getRouteKey();
 		StringJoiner line = new StringJoiner(" ");
 		for (AccessEvent.Field field : event.getFieldsList()) {
@@ -84,8 +78,8 @@ class LiveLogView {
 				line.add(field.getName() + "=" + field.getValue());
 			}
 		}
-		return this.row.execute(new Row(record.getSeq(), TIME.format(time), time.toString(), record.getNodeId(),
-				event.getKind(), route, line.toString()));
+		return this.row.execute(new Row(record.getSeq(), Instant.ofEpochMilli(event.getTimeUnixMillis()).toString(),
+				record.getNodeId(), event.getKind(), route, line.toString()));
 	}
 
 	String gap(WatchGap gap) {
@@ -120,14 +114,14 @@ class LiveLogView {
 	 * One line of a node.
 	 *
 	 * @param seq the flume's position of the line
-	 * @param time when the node logged it, to the millisecond in this node's zone
-	 * @param instant the same as an ISO instant
+	 * @param instant when the node logged it, as an ISO instant; the page shows it in the
+	 * browser's zone
 	 * @param node the node that logged it
 	 * @param kind accept, close, reject, request or ratelimit
 	 * @param route the route as the line names it
 	 * @param line the rest of the line's key=value pairs
 	 */
-	record Row(long seq, String time, String instant, String node, String kind, String route, String line) {
+	record Row(long seq, String instant, String node, String kind, String route, String line) {
 
 	}
 

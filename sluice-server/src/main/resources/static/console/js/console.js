@@ -55,6 +55,15 @@ document.addEventListener("htmx:finally:request", (event) => {
       }
       return params;
     };
+    const pad = (value, width = 2) => String(value).padStart(width, "0");
+    // the server sends the instant; the time column reads it in the browser's zone
+    const localTime = (time) => {
+      const at = new Date(time.dateTime);
+      if (!Number.isNaN(at.getTime())) {
+        time.textContent = `${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}.${pad(at.getMilliseconds(), 3)}`;
+        time.title = at.toString();
+      }
+    };
     const append = (html) => {
       const template = document.createElement("template");
       template.innerHTML = html.trim();
@@ -62,6 +71,7 @@ document.addEventListener("htmx:finally:request", (event) => {
       if (!row) {
         return null;
       }
+      row.querySelectorAll("time[datetime]").forEach(localTime);
       rows.append(row);
       while (rows.rows.length > cap) {
         rows.deleteRow(0);
