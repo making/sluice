@@ -33,6 +33,7 @@
 			 header value validation by default. Read the release notes before changing:
 			 HTTP/2 validation and error choices change within 4.2.x. -->
 		<netty.version>4.2.19.Final</netty.version>
+		<tomcat.version>11.0.27</tomcat.version>
 	</properties>
 
 	<dependencyManagement>
