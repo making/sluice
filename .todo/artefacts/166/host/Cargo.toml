@@ -1,0 +1,20 @@
+[package]
+name = "kv-spike-host"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+wasmtime = "50"
+wasmtime-wasi = { version = "50", default-features = false, features = ["p3"] }
+wasmtime-wasi-http = { version = "50", default-features = false, features = ["default-send-request", "p3"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+async-trait = "0.1"
+redb = "4"
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+futures = "0.3"
+rusqlite = { version = "0.40", features = ["bundled"] }
