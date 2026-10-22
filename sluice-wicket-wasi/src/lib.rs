@@ -28,6 +28,11 @@
 //! change of their files, or on SIGHUP. Every node stream advertises the
 //! reloaded routes again.
 //!
+//! `--listen` serves the same routes over plain TCP (`listener`), routed by
+//! the request's host; without `--server` that is all the wicket does (local
+//! mode). A `wasi=keyvalue` route's guest keeps state in the host's stores
+//! (`keyvalue`).
+//!
 //! Scope (deliberately minimal):
 //!
 //! - `grpc://` / `grpcs://` control plane (`--ca-cert` pins the CA,
@@ -45,10 +50,13 @@
 //!     --wasm demo.local=./hello.wasm \
 //!     --wasm relay.local='./relay.wasm?wasi=cli,inherit-network'
 //! sluice-wicket-wasi --config wicket-wasi.yaml
+//! sluice-wicket-wasi --listen 127.0.0.1:8080 --wasm 'counter.local=./counter.wasm?wasi=keyvalue'
 //! ```
 
 pub mod config;
 mod drain;
+mod keyvalue;
+mod listener;
 mod routes;
 mod session;
 mod signals;
@@ -62,6 +70,7 @@ mod wasm_host;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 pub mod proto {
@@ -155,6 +164,7 @@ fn describe_peer(build: &PeerBuild) -> String {
 pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
     let config::Settings {
         server,
+        listen,
         token,
         client_id,
         insecure,
@@ -172,6 +182,43 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
     // Fetches / prewarms every route's component (fail fast) and builds its
     // handler on `instances`.
     let reloader = Reloader::start(routes, instances.clone()).await?;
+    let routes = reloader.routes().clone();
+    let listener = match &listen {
+        Some(address) => Some(listener::bind(address).await?),
+        None => None,
+    };
+    println!(
+        "instance limit {max_instances} ({} h2 streams per connection)",
+        instances.streams_per_connection()
+    );
+    println!(
+        "routes: {} (generation {}); watching their files every {}ms (0 = off), SIGHUP reloads",
+        routes.current().advertised.len(),
+        routes.current().generation,
+        watch_interval.as_millis()
+    );
+    let (hangups, hangups_received) = mpsc::channel(1);
+    signals::forward_hangups(hangups)?;
+    if let Some(listener) = listener {
+        println!(
+            "listening on {} (http/1.1, h2c), {max_connections} connections at most",
+            listener.local_addr()?
+        );
+        tokio::spawn(listener::run(
+            listener,
+            routes.clone(),
+            instances.clone(),
+            max_connections,
+        ));
+    }
+    let Some(server) = server else {
+        // local mode alone: nothing to drain, a signal ends the process
+        reloader
+            .run(watch_interval, hangups_received, CancellationToken::new())
+            .await;
+        return Ok(());
+    };
+
     let ca_pem = match ca_cert {
         Some(path) => {
             Some(std::fs::read(&path).map_err(|e| format!("--ca-cert {}: {e}", path.display()))?)
@@ -183,7 +230,7 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         id: client_id,
         insecure,
         ca_pem,
-        routes: reloader.routes().clone(),
+        routes,
         limit: tunnel::Limit::new(max_connections),
         stall_timeout,
         transport_window: transport_window(max_connections),
@@ -199,22 +246,9 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         "tunnel stall timeout {}s (0 = off)",
         stall_timeout.as_secs()
     );
-    println!(
-        "instance limit {max_instances} ({} h2 streams per connection)",
-        instances.streams_per_connection()
-    );
-
     println!("drain grace {}s (0 = off)", drain_grace.as_secs());
-    println!(
-        "routes: {} (generation {}); watching their files every {}ms (0 = off), SIGHUP reloads",
-        shared.routes.current().advertised.len(),
-        shared.routes.current().generation,
-        watch_interval.as_millis()
-    );
 
     // the drain stops the reloads: the routes are withdrawn
-    let (hangups, hangups_received) = mpsc::channel(1);
-    signals::forward_hangups(hangups)?;
     tokio::spawn(reloader.run(watch_interval, hangups_received, shared.drain.begin.clone()));
 
     let (tx, rx) = mpsc::channel(32);

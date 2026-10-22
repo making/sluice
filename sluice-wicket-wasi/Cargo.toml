@@ -24,9 +24,9 @@ futures-util = "0.3"
 # random default client id, same policy as the Java client
 uuid = { version = "1", features = ["v4"] }
 # wasi 0.3 (p3) host support only; p2 guests are unsupported
-wasmtime = "49"
-wasmtime-wasi = { version = "49", default-features = false, features = ["p3"] }
-wasmtime-wasi-http = { version = "49", default-features = false, features = ["default-send-request", "p3"] }
+wasmtime = "50"
+wasmtime-wasi = { version = "50", default-features = false, features = ["p3"] }
+wasmtime-wasi-http = { version = "50", default-features = false, features = ["default-send-request", "p3"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body = "1"
@@ -43,6 +43,8 @@ serde = { version = "1", features = ["derive"] }
 serde-saphyr = { version = "2", default-features = false, features = ["deserialize", "properties"] }
 # component digests: a reload keeps the handler of an unchanged component
 sha2 = "0.10"
+# the sqlite keyvalue store; bundled: no system libsqlite3 (the build compiles C for ring already)
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]
 # paused time for the stall watchdog tests

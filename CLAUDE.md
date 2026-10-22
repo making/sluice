@@ -26,7 +26,7 @@ The data plane relays raw bytes (the request head is inspected for routing; ever
 - `application.properties`: keys in alphabetical order; a comment stays directly above the key it describes.
 - gRPC 1.83.x quirks: `StreamObserver` / `ClientCallStreamObserver` live in `io.grpc.stub`. The client onReady handler may only be set inside `ClientResponseObserver#beforeStart`.
 - Boot 4.1: `HealthIndicator` is in `org.springframework.boot.health.contributor`.
-- wasmtime 49 (`sluice-wicket-wasi`): a timer raced inside the `run_concurrent` closure may never fire; put timeouts / watchdogs outside the call (see `supervise` in `wasm_host.rs`).
+- wasmtime 50 (`sluice-wicket-wasi`; seen on 49): a timer raced inside the `run_concurrent` closure may never fire; put timeouts / watchdogs outside the call (see `supervise` in `wasm_host.rs`).
 - Docker images via buildpack (`spring-boot:build-image`); no Dockerfile, except the Rust components (`sluice-flume/Dockerfile`, built from the repository root).
 - Console: Mustache + htmx 4 (same setup as blog-frontend-htmx: vendored `htmx.min.js`, `{{#src}}` content-hashed URLs from `WebConfig`, `compression-maven-plugin` .br/.gz). htmx 4 inherits nothing implicitly (`:inherited`). The drawing geometry lives in `FlowDrawing`; templates stay logic-less.
 - Native image (`-Pnative`, client/server): console view records are rendered via Mustache reflection -- when adding/renaming a record under `console/web`, register it in `sluice-server/src/main/resources/META-INF/native-image/am.ik.sluice/sluice-server/reflect-config.json`.

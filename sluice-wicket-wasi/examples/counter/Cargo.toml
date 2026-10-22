@@ -1,0 +1,11 @@
+[package]
+name = "counter"
+version = "0.0.1-SNAPSHOT"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { workspace = true }

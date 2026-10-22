@@ -4,24 +4,32 @@
 //! file's routes are read again by every reload (`routes::Reloader`); its other
 //! settings apply at startup only, and a reload reports the ones changed since.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::keyvalue::{self, StoreConfig, StoreLimits, Stores};
 use crate::routes::Spec;
 use crate::wasm_host::{Caps, Instances, Locator, Sandbox};
 
 pub const USAGE: &str = "\
 usage: sluice-wicket-wasi --server <url> --wasm <host>=<locator>[?<options>] ... [options]
+       sluice-wicket-wasi --listen <host:port> --wasm <host>=<locator>[?<options>] ... [options]
        sluice-wicket-wasi --config <file> [options]
 
   --server <url>                  bootstrap endpoint, grpc://host:port or grpcs://host:port
+  --listen <host:port>            also (or only, without --server) serve the routes over plain
+                                  TCP, http/1.1 and h2c, routed by the request's host
   --wasm <host>=<locator>         a route: a component path, file:// or http(s):// url;
                                   repeatable. ?budget-ms=N&instances=N&memory-mib=N&pool=N
-                                  &wasi=<cap>,... sets its sandbox
+                                  &wasi=<cap>,... sets its sandbox (wasi=keyvalue: the
+                                  default store, namespaced by the host)
   --config <file>                 YAML settings and routes, the routes reloaded on change
+  --keyvalue-file <path>          the SQLite file of the keyvalue store without a keyvalue
+                                  section in the --config file (default keyvalue.db)
   --token <token>                 bearer token of the tunnel streams
   --client-id <id>                client identity (default a random UUID)
   --ca-cert <path>                PEM CA verifying a grpcs:// server (default the webPKI roots)
@@ -58,8 +66,15 @@ const DEFAULT_MAX_INSTANCES: usize = 64;
 /// are polled for a change.
 const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The file of the keyvalue store without a `keyvalue` section (and without
+/// `--keyvalue-file`): next to the config file, else in the working
+/// directory.
+const DEFAULT_KEYVALUE_FILE: &str = "keyvalue.db";
+
 pub struct Settings {
-    pub server: String,
+    /// None: local mode alone (`listen`).
+    pub server: Option<String>,
+    pub listen: Option<String>,
     pub token: String,
     pub client_id: String,
     pub insecure: bool,
@@ -86,6 +101,7 @@ pub enum Command {
 struct Flags {
     config: Option<PathBuf>,
     server: Option<String>,
+    listen: Option<String>,
     token: Option<String>,
     client_id: Option<String>,
     insecure: bool,
@@ -95,12 +111,14 @@ struct Flags {
     stall_timeout: Option<Duration>,
     drain_grace: Option<Duration>,
     watch_interval: Option<Duration>,
+    keyvalue_file: Option<PathBuf>,
     routes: Vec<Spec>,
 }
 
 const VALUED: &[&str] = &[
     "config",
     "server",
+    "listen",
     "token",
     "client-id",
     "ca-cert",
@@ -109,6 +127,7 @@ const VALUED: &[&str] = &[
     "tunnel-stall-timeout",
     "drain-grace",
     "watch-interval",
+    "keyvalue-file",
     "wasm",
 ];
 
@@ -173,6 +192,7 @@ pub fn parse(
     let flags = Flags {
         config: value("config").map(PathBuf::from),
         server: value("server"),
+        listen: value("listen"),
         token: value("token"),
         client_id: value("client-id"),
         insecure: insecure
@@ -183,6 +203,7 @@ pub fn parse(
         stall_timeout: seconds("tunnel-stall-timeout")?,
         drain_grace: seconds("drain-grace")?,
         watch_interval: seconds("watch-interval")?,
+        keyvalue_file: value("keyvalue-file").map(PathBuf::from),
         routes,
     };
     merge(flags).map(|settings| Command::Run(Box::new(settings)))
@@ -221,13 +242,18 @@ fn merge(flags: Flags) -> Result<Settings, String> {
     let server = flags
         .server
         .or_else(|| settings.server.clone())
-        .filter(|server| !server.is_empty())
-        .ok_or("--server (or `server` in the --config file) is required")?;
-    if flags.config.is_none() && flags.routes.is_empty() {
+        .filter(|server| !server.is_empty());
+    let listen = flags
+        .listen
+        .or_else(|| settings.listen.clone())
+        .filter(|listen| !listen.is_empty());
+    if server.is_none() && listen.is_none() {
         return Err(
-            "--server and at least one --wasm host=locator (or a --config file) are required"
-                .into(),
+            "--server or --listen (or `server` / `listen` in the --config file) is required".into(),
         );
+    }
+    if flags.config.is_none() && flags.routes.is_empty() {
+        return Err("at least one --wasm host=locator (or a --config file) is required".into());
     }
     let max_connections = match (flags.max_connections, settings.max_connections) {
         (Some(limit), _) => limit,
@@ -276,12 +302,16 @@ fn merge(flags: Flags) -> Result<Settings, String> {
     let ca_cert = flags
         .ca_cert
         .or_else(|| settings.ca_cert.as_ref().map(|path| dir.join(path)));
+    let stores =
+        stores(settings.keyvalue.as_ref(), flags.keyvalue_file, &dir).map_err(|e| key(&e))?;
     let routes = RouteSource {
         config: file,
         flags: flags.routes,
+        stores: Arc::new(stores),
     };
     Ok(Settings {
         server,
+        listen,
         token,
         client_id,
         insecure,
@@ -296,10 +326,11 @@ fn merge(flags: Flags) -> Result<Settings, String> {
 }
 
 /// Where the routes come from: the `--config` file's, then the `--wasm`
-/// flags'.
+/// flags'; and the keyvalue stores their maps may name.
 pub struct RouteSource {
     config: Option<ConfigFile>,
     flags: Vec<Spec>,
+    stores: Arc<Stores>,
 }
 
 impl RouteSource {
@@ -309,16 +340,25 @@ impl RouteSource {
         RouteSource {
             config: None,
             flags,
+            stores: Arc::new(stores(None, None, Path::new("")).expect("the default store")),
         }
     }
 
-    /// Routes of the config file at `path` alone.
+    /// Routes of the config file at `path` alone, on its stores.
     #[cfg(test)]
     pub fn file(path: &Path) -> Result<RouteSource, String> {
+        let config = ConfigFile::read(path)?;
+        let stores = stores(config.settings.keyvalue.as_ref(), None, &config.dir())?;
         Ok(RouteSource {
-            config: Some(ConfigFile::read(path)?),
+            config: Some(config),
             flags: Vec::new(),
+            stores: Arc::new(stores),
         })
+    }
+
+    /// The keyvalue stores.
+    pub fn stores(&self) -> &Arc<Stores> {
+        &self.stores
     }
 
     /// The config file, if any.
@@ -347,12 +387,18 @@ impl RouteSource {
             for (n, route) in routes.into_iter().enumerate() {
                 specs.push(
                     route
-                        .spec(&dir)
+                        .spec(&dir, &self.stores)
                         .map_err(|e| format!("{}: routes[{n}]: {e}", config.path.display()))?,
                 );
             }
         }
-        specs.extend(self.flags.iter().cloned());
+        for flag in &self.flags {
+            let mut spec = flag.clone();
+            if spec.sandbox.caps.keyvalue {
+                spec.sandbox.keyvalue = self.stores.default_map(&spec.host);
+            }
+            specs.push(spec);
+        }
         let mut hosts = HashSet::new();
         for spec in &specs {
             if !hosts.insert(spec.host.as_str()) {
@@ -396,6 +442,7 @@ impl ConfigFile {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct File {
     server: Option<String>,
+    listen: Option<String>,
     token: Option<String>,
     client_id: Option<String>,
     insecure: Option<bool>,
@@ -405,6 +452,7 @@ struct File {
     tunnel_stall_timeout: Option<Scalar>,
     drain_grace: Option<Scalar>,
     watch_interval: Option<Scalar>,
+    keyvalue: Option<KeyValueFile>,
     #[serde(default)]
     routes: Vec<RouteFile>,
 }
@@ -433,6 +481,7 @@ impl File {
         }
         compare!(
             server => "server",
+            listen => "listen",
             token => "token",
             client_id => "client-id",
             insecure => "insecure",
@@ -442,6 +491,7 @@ impl File {
             tunnel_stall_timeout => "tunnel-stall-timeout",
             drain_grace => "drain-grace",
             watch_interval => "watch-interval",
+            keyvalue => "keyvalue",
         );
         changed
     }
@@ -458,17 +508,18 @@ struct RouteFile {
 }
 
 impl RouteFile {
-    fn spec(self, dir: &Path) -> Result<Spec, String> {
+    fn spec(self, dir: &Path, stores: &Stores) -> Result<Spec, String> {
         let component = match Locator::parse(&self.component)? {
             Locator::File(path) if path.is_relative() && !self.component.contains("://") => {
                 Locator::File(dir.join(path))
             }
             locator => locator,
         };
+        let sandbox = self.sandbox.sandbox(&self.host, stores)?;
         Ok(Spec {
             host: self.host,
             component,
-            sandbox: self.sandbox.sandbox()?,
+            sandbox,
         })
     }
 }
@@ -485,10 +536,13 @@ struct SandboxFile {
     memory: Option<Scalar>,
     pool: Option<usize>,
     instances: Option<usize>,
+    /// Keyvalue identifier -> `store[/namespace]` (`wasi: [keyvalue]`); the
+    /// namespace defaults to the host, the map to `"": <default store>`.
+    keyvalue: Option<BTreeMap<String, String>>,
 }
 
 impl SandboxFile {
-    fn sandbox(self) -> Result<Sandbox, String> {
+    fn sandbox(self, host: &str, stores: &Stores) -> Result<Sandbox, String> {
         let mut sandbox = Sandbox::default();
         if let Some(wasi) = self.wasi {
             sandbox.caps =
@@ -511,8 +565,144 @@ impl SandboxFile {
             Some(0) => return Err("sandbox.instances: must be at least 1".into()),
             cap => cap,
         };
+        sandbox.keyvalue = match (self.keyvalue, sandbox.caps.keyvalue) {
+            (None, false) => keyvalue::BucketMap::new(),
+            (Some(_), false) => {
+                return Err("sandbox.keyvalue: needs the capability (wasi: [keyvalue])".into());
+            }
+            (None, true) => stores.default_map(host),
+            (Some(map), true) if map.is_empty() => {
+                return Err("sandbox.keyvalue: maps no identifier".into());
+            }
+            (Some(map), true) => map
+                .into_iter()
+                .map(|(identifier, place)| {
+                    let place = stores
+                        .place(host, &place)
+                        .map_err(|e| format!("sandbox.keyvalue.\"{identifier}\": {e}"))?;
+                    Ok((identifier, place))
+                })
+                .collect::<Result<_, String>>()?,
+        };
         sandbox.check().map_err(|e| format!("sandbox: {e}"))?;
         Ok(sandbox)
+    }
+}
+
+/// The keyvalue stores: the `keyvalue` section's, else one `sqlite` store
+/// (`keyvalue::LOCAL`) at `file`, by default [`DEFAULT_KEYVALUE_FILE`] in
+/// `dir`.
+fn stores(
+    section: Option<&KeyValueFile>,
+    file: Option<PathBuf>,
+    dir: &Path,
+) -> Result<Stores, String> {
+    match (section, file) {
+        (Some(section), None) => section.stores(dir),
+        (Some(_), Some(_)) => Err("keyvalue: the section names the stores; --keyvalue-file \
+             (SLUICE_WICKET_WASI_KEYVALUE_FILE) applies only without one"
+            .into()),
+        (None, file) => Ok(Stores::new(
+            BTreeMap::from([(
+                keyvalue::LOCAL.to_string(),
+                StoreConfig {
+                    kind: keyvalue::Kind::Sqlite {
+                        path: file.unwrap_or_else(|| dir.join(DEFAULT_KEYVALUE_FILE)),
+                        max_namespace_bytes: keyvalue::DEFAULT_MAX_NAMESPACE_BYTES,
+                    },
+                    limits: StoreLimits::default(),
+                },
+            )]),
+            keyvalue::LOCAL.to_string(),
+        )),
+    }
+}
+
+/// The `keyvalue` section: the stores, process-wide (changes apply on a
+/// restart).
+#[derive(Deserialize, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
+struct KeyValueFile {
+    /// The store an identifier maps to by default; optional with one store.
+    default: Option<String>,
+    stores: BTreeMap<String, StoreFile>,
+}
+
+impl KeyValueFile {
+    /// The stores, paths relative to `dir`; errors name the key.
+    fn stores(&self, dir: &Path) -> Result<Stores, String> {
+        let mut configs = BTreeMap::new();
+        for (name, store) in &self.stores {
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-._".contains(&byte))
+            {
+                return Err(format!(
+                    "keyvalue.stores: '{name}' is no store name (letters, digits, '-', '.', '_')"
+                ));
+            }
+            let config = store
+                .config(dir)
+                .map_err(|e| format!("keyvalue.stores.{name}.{e}"))?;
+            configs.insert(name.clone(), config);
+        }
+        let default = match (&self.default, configs.len()) {
+            (Some(default), _) if configs.contains_key(default) => default.clone(),
+            (Some(default), _) => {
+                return Err(format!(
+                    "keyvalue.default: no store '{default}' in keyvalue.stores"
+                ));
+            }
+            (None, 1) => configs.keys().next().expect("one store").clone(),
+            (None, 0) => return Err("keyvalue.stores: names no store".into()),
+            (None, _) => {
+                return Err("keyvalue.default: required with more than one store".into());
+            }
+        };
+        Ok(Stores::new(configs, default))
+    }
+}
+
+/// One store of the `keyvalue` section.
+#[derive(Deserialize, PartialEq, Debug)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct StoreFile {
+    #[serde(rename = "type")]
+    kind: String,
+    /// The file of a `sqlite` store, relative to the config file.
+    path: Option<PathBuf>,
+    max_key_bytes: Option<Scalar>,
+    max_value_bytes: Option<Scalar>,
+    /// A `sqlite` store's bound on each namespace.
+    max_namespace_bytes: Option<Scalar>,
+}
+
+impl StoreFile {
+    /// The store's config; errors name the key below the store.
+    fn config(&self, dir: &Path) -> Result<StoreConfig, String> {
+        let kind = match self.kind.as_str() {
+            "sqlite" => keyvalue::Kind::Sqlite {
+                path: dir.join(
+                    self.path
+                        .as_ref()
+                        .ok_or("path: required by a sqlite store")?,
+                ),
+                max_namespace_bytes: match &self.max_namespace_bytes {
+                    Some(max) => max.bytes("max-namespace-bytes")? as u64,
+                    None => keyvalue::DEFAULT_MAX_NAMESPACE_BYTES,
+                },
+            },
+            other => return Err(format!("type: unknown store type '{other}' (sqlite)")),
+        };
+        let mut limits = StoreLimits::default();
+        if let Some(max) = &self.max_key_bytes {
+            limits.max_key_bytes = max.bytes("max-key-bytes")?;
+        }
+        if let Some(max) = &self.max_value_bytes {
+            limits.max_value_bytes = max.bytes("max-value-bytes")?;
+        }
+        Ok(StoreConfig { kind, limits })
     }
 }
 
@@ -562,31 +752,59 @@ impl Scalar {
     /// A size in bytes that is a positive whole number of MiB: a number with
     /// a suffix, binary (`Ki`, `Mi`, `Gi`) or decimal (`K`, `M`, `G`).
     fn mebibytes(&self, key: &str) -> Result<usize, String> {
-        let text = match self {
+        let expected =
+            |text: &str| format!("{key}: expected a size like 64Mi or 1Gi, got '{text}'");
+        let bytes = self.size(false).map_err(|text| expected(&text))?;
+        if bytes == 0 || bytes % (1 << 20) != 0 {
+            return Err(format!(
+                "{key}: must be a positive whole number of MiB (e.g. 64Mi), got '{}'",
+                self.text()
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// A positive size in bytes: a bare number, or one with a suffix as
+    /// [`Scalar::mebibytes`] takes.
+    fn bytes(&self, key: &str) -> Result<usize, String> {
+        match self.size(true) {
+            Ok(0) => Err(format!("{key}: must be positive, got '{}'", self.text())),
+            Ok(bytes) => Ok(bytes),
+            Err(text) => Err(format!(
+                "{key}: expected a size like 512, 4Ki or 1Mi, got '{text}'"
+            )),
+        }
+    }
+
+    fn text(&self) -> String {
+        match self {
             Scalar::Number(n) => n.to_string(),
             Scalar::Text(text) => text.trim().to_string(),
-        };
-        let expected = || format!("{key}: expected a size like 64Mi or 1Gi, got '{text}'");
+        }
+    }
+
+    /// The bytes of a number with a unit suffix (`bare`: or without); Err
+    /// holds the text that does not parse.
+    fn size(&self, bare: bool) -> Result<usize, String> {
+        let text = self.text();
         let split = text
             .find(|c: char| !c.is_ascii_digit())
-            .ok_or_else(expected)?;
-        let number: u64 = text[..split].parse().map_err(|_| expected())?;
+            .unwrap_or(text.len());
+        let number: u64 = text[..split].parse().map_err(|_| text.clone())?;
         let unit: u64 = match &text[split..] {
+            "" if bare => 1,
             "Ki" => 1 << 10,
             "Mi" => 1 << 20,
             "Gi" => 1 << 30,
             "K" => 1_000,
             "M" => 1_000_000,
             "G" => 1_000_000_000,
-            _ => return Err(expected()),
+            _ => return Err(text),
         };
-        let bytes = number.checked_mul(unit).ok_or_else(expected)?;
-        if bytes == 0 || bytes % (1 << 20) != 0 {
-            return Err(format!(
-                "{key}: must be a positive whole number of MiB (e.g. 64Mi), got '{text}'"
-            ));
-        }
-        usize::try_from(bytes).map_err(|_| expected())
+        number
+            .checked_mul(unit)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or(text)
     }
 }
 
@@ -661,8 +879,10 @@ mod tests {
     /// Every setting has its key; a flag overrides the environment, the
     /// environment the file, the file a default; `${NAME}` reads the
     /// environment; relative paths are the config file's; the flags' routes
-    /// follow the file's. A reload reads the routes again and names the other
-    /// settings changed since.
+    /// follow the file's. A keyvalue route's map names the section's stores,
+    /// its namespace by default the host; a flag's has the default map. A
+    /// reload reads the routes again and names the other settings changed
+    /// since.
     #[test]
     fn the_config_file_sets_every_setting_under_the_environment_and_the_flags() {
         let dir = Scratch::new("settings");
@@ -678,6 +898,19 @@ max-instances: 8
 tunnel-stall-timeout: 90s
 drain-grace: 0
 watch-interval: 250ms
+listen: 127.0.0.1:8080
+keyvalue:
+  default: local
+  stores:
+    local:
+      type: sqlite
+      path: kv.db
+      max-key-bytes: 512
+      max-value-bytes: 4Ki
+      max-namespace-bytes: 1Mi
+    shared:
+      type: sqlite
+      path: /var/shared.db
 routes:
   - host: a.local
     component: a.wasm
@@ -689,6 +922,11 @@ routes:
       instances: 4
   - host: b.local
     component: https://example.invalid/b.wasm
+    sandbox:
+      wasi: [keyvalue]
+      keyvalue:
+        \"\": local
+        sessions: shared/demo sessions
 "
             )
         };
@@ -696,7 +934,8 @@ routes:
         let config = path.to_str().unwrap();
 
         let file = settings(&["--config", config]).unwrap();
-        assert_eq!(file.server, "grpc://file:8001");
+        assert_eq!(file.server.as_deref(), Some("grpc://file:8001"));
+        assert_eq!(file.listen.as_deref(), Some("127.0.0.1:8080"));
         assert_eq!(
             file.token,
             format!("{}${{literal}}", std::env::var("HOME").unwrap())
@@ -721,6 +960,39 @@ routes:
             routes[1].component,
             Locator::parse("https://example.invalid/b.wasm").unwrap()
         );
+        assert_eq!(
+            route_target("b", &routes[1].sandbox),
+            "b?keyvalue=:local/b.local,sessions:shared/demo%20sessions&wasi=keyvalue"
+        );
+        let stores = file.routes.stores();
+        assert_eq!(stores.default_store(), "local");
+        assert_eq!(
+            stores.config("local"),
+            Some(&StoreConfig {
+                kind: keyvalue::Kind::Sqlite {
+                    path: dir.0.join("kv.db"),
+                    max_namespace_bytes: 1 << 20,
+                },
+                limits: StoreLimits {
+                    max_key_bytes: 512,
+                    max_value_bytes: 4 << 10,
+                },
+            })
+        );
+        assert_eq!(
+            stores.config("shared"),
+            Some(&StoreConfig {
+                kind: keyvalue::Kind::Sqlite {
+                    path: "/var/shared.db".into(),
+                    max_namespace_bytes: 64 << 20,
+                },
+                limits: StoreLimits {
+                    max_key_bytes: 1 << 10,
+                    max_value_bytes: 1 << 20,
+                },
+            }),
+            "the defaults"
+        );
 
         let env = |name: &str| match name {
             "SLUICE_WICKET_WASI_MAX_CONNECTIONS" => Some("12".to_string()),
@@ -739,12 +1011,15 @@ routes:
                 "5",
                 "--ca-cert",
                 "flag.pem",
-                "--wasm=c.local=c.wasm?pool=1",
+                "--listen",
+                "0.0.0.0:9",
+                "--wasm=c.local=c.wasm?pool=1&wasi=keyvalue",
             ],
             env,
         )
         .unwrap();
-        assert_eq!(flagged.server, "grpc://flag:1");
+        assert_eq!(flagged.server.as_deref(), Some("grpc://flag:1"));
+        assert_eq!(flagged.listen.as_deref(), Some("0.0.0.0:9"));
         assert_eq!(flagged.max_instances, 16, "the flag's");
         assert_eq!(flagged.max_connections, 12, "the environment's");
         assert_eq!(flagged.drain_grace, Duration::from_secs(5));
@@ -755,6 +1030,10 @@ routes:
         let hosts: Vec<_> = routes.iter().map(|route| route.host.as_str()).collect();
         assert_eq!(hosts, ["a.local", "b.local", "c.local"]);
         assert_eq!(routes[2].component, Locator::File("c.wasm".into()));
+        assert_eq!(
+            route_target("c", &routes[2].sandbox),
+            "c?keyvalue=:local/c.local&pool=1&wasi=keyvalue"
+        );
 
         dir.write("wicket.yaml", yaml("grpc://moved:8001"));
         let (_, warnings) = file.routes.read().unwrap();
@@ -763,14 +1042,37 @@ routes:
 
         dir.write("wicket.yaml", "server: \"${HOME}\"\n");
         let defaults = settings(&["--config", config]).unwrap();
-        assert_eq!(defaults.server, "${HOME}", "quoted: not expanded");
+        assert_eq!(
+            defaults.server.as_deref(),
+            Some("${HOME}"),
+            "quoted: not expanded"
+        );
         assert_eq!(defaults.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert_eq!(defaults.max_instances, DEFAULT_MAX_INSTANCES);
         assert_eq!(defaults.stall_timeout, DEFAULT_STALL_TIMEOUT);
         assert_eq!(defaults.drain_grace, DEFAULT_DRAIN_GRACE);
         assert_eq!(defaults.watch_interval, DEFAULT_WATCH_INTERVAL);
         assert!(!defaults.insecure);
+        assert_eq!(defaults.listen, None);
         assert_eq!(defaults.routes.read().unwrap().0, [], "no route yet");
+        let sqlite = |settings: Settings| match settings.routes.stores().config(keyvalue::LOCAL) {
+            Some(StoreConfig {
+                kind: keyvalue::Kind::Sqlite { path, .. },
+                ..
+            }) => path.clone(),
+            other => panic!("one sqlite store: {other:?}"),
+        };
+        assert_eq!(sqlite(defaults), dir.0.join("keyvalue.db"));
+        let moved = settings(&["--config", config, "--keyvalue-file", "/var/kv.db"]).unwrap();
+        assert_eq!(sqlite(moved), PathBuf::from("/var/kv.db"));
+
+        let local = settings(&["--listen", "127.0.0.1:0", "--wasm", "a=a.wasm"]).unwrap();
+        assert_eq!(local.server, None, "local mode alone");
+        assert_eq!(
+            sqlite(local),
+            PathBuf::from("keyvalue.db"),
+            "the working directory's"
+        );
     }
 
     /// An unknown key or a value that does not parse fails, naming it.
@@ -784,7 +1086,10 @@ routes:
         };
         let cases = [
             ("serverx: s\n".to_string(), "unknown field `serverx`"),
-            ("token: x\n".into(), "--server (or `server` in the --config file) is required"),
+            (
+                "token: x\n".into(),
+                "--server or --listen (or `server` / `listen` in the --config file) is required",
+            ),
             (
                 "server: s\ntoken: ${SLUICE_WICKET_TEST_UNSET}\n".into(),
                 "SLUICE_WICKET_TEST_UNSET",
@@ -809,6 +1114,53 @@ routes:
             (route("memory: 64"), "sandbox.memory: expected a size like 64Mi or 1Gi"),
             (route("instances: 0"), "sandbox.instances: must be at least 1"),
             (route("pool: 2, instances: 1"), "instances=1 is below pool=2"),
+            (
+                "server: s\nkeyvalue: {stores: {local: {type: redis, path: x}}}\n".into(),
+                "keyvalue.stores.local.type: unknown store type 'redis' (sqlite)",
+            ),
+            (
+                "server: s\nkeyvalue: {stores: {local: {type: sqlite}}}\n".into(),
+                "keyvalue.stores.local.path: required by a sqlite store",
+            ),
+            (
+                "server: s\nkeyvalue: {stores: {local: {type: sqlite, path: x, max-key-bytes: 0}}}\n"
+                    .into(),
+                "keyvalue.stores.local.max-key-bytes: must be positive",
+            ),
+            (
+                "server: s\nkeyvalue: {stores: {local: {type: sqlite, path: x, max-namespace-bytes: 1Q}}}\n"
+                    .into(),
+                "max-namespace-bytes: expected a size like 512, 4Ki or 1Mi, got '1Q'",
+            ),
+            (
+                "server: s\nkeyvalue: {stores: {a b: {type: sqlite, path: x}}}\n".into(),
+                "'a b' is no store name",
+            ),
+            (
+                "server: s\nkeyvalue: {stores: {a: {type: sqlite, path: a}, b: {type: sqlite, path: b}}}\n"
+                    .into(),
+                "keyvalue.default: required with more than one store",
+            ),
+            (
+                "server: s\nkeyvalue: {default: c, stores: {a: {type: sqlite, path: a}}}\n".into(),
+                "keyvalue.default: no store 'c' in keyvalue.stores",
+            ),
+            (
+                route("keyvalue: {'': local}"),
+                "sandbox.keyvalue: needs the capability (wasi: [keyvalue])",
+            ),
+            (
+                route("wasi: [keyvalue], keyvalue: {'': nowhere}"),
+                "routes[0]: sandbox.keyvalue.\"\": unknown keyvalue store 'nowhere' (local)",
+            ),
+            (
+                route("wasi: [keyvalue], keyvalue: {s: local/}"),
+                "'local/': empty namespace",
+            ),
+            (
+                route("wasi: [keyvalue], keyvalue: {}"),
+                "sandbox.keyvalue: maps no identifier",
+            ),
             (
                 "server: s\nroutes:\n  - {host: a, component: a.wasm}\n  - {host: a, component: b.wasm}\n"
                     .into(),
@@ -838,6 +1190,17 @@ routes:
             Some("route host 'a' is configured twice"),
             "a file's host given as a flag too"
         );
+        let path = dir.write(
+            "wicket.yaml",
+            "server: s\nkeyvalue: {stores: {local: {type: sqlite, path: x}}}\n",
+        );
+        let moved = settings(&["--config", path.to_str().unwrap(), "--keyvalue-file", "y"]);
+        assert!(
+            matches!(&moved, Err(e) if e.ends_with("--keyvalue-file \
+                (SLUICE_WICKET_WASI_KEYVALUE_FILE) applies only without one")),
+            "{:?}",
+            moved.err()
+        );
     }
 
     #[test]
@@ -851,6 +1214,7 @@ routes:
         assert_eq!(error(&["--server"]), "--server needs a value");
         assert_eq!(error(&["grpc://s:1"]), "unexpected argument: grpc://s:1");
         assert!(error(&["--server", "s"]).contains("at least one --wasm"));
+        assert!(error(&["--wasm", "a=a.wasm"]).contains("--server or --listen"));
         assert!(error(&["--wasm", "a.wasm"]).contains("host=component-locator"));
         assert!(matches!(
             parse(args(&["--server", "s", "--help"]), none),

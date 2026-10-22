@@ -25,7 +25,8 @@ Two Cargo workspaces:
   (wasm32-wasip3 ships rust-std on nightly only; rustup installs it on the
   first build). Each example's README says what it demonstrates and which
   capabilities its route needs
-- `wit/` — vendored wasi 0.3 (from wasmtime v49); each example declares its
+- `wit/` — vendored wasi 0.3 (from wasmtime v50) and `wasi:keyvalue@0.2.0-draft2`
+  (`deps/keyvalue`, WebAssembly/wasi-keyvalue main `aa972c8`); each example declares its
   own world inline, so a new example is just a new directory under `examples/`
 
 ## Run
@@ -44,6 +45,25 @@ target/debug/sluice-wicket-wasi --config wicket-wasi.yaml
 `cargo test` builds the examples the same way (through the
 rustup `cargo` proxy, so rustup must be installed).
 
+### Local mode
+
+`--listen <host:port>` serves the routes over plain TCP as well -- http/1.1 and h2c, the
+same handlers, sandbox, pools, budgets and reloads -- and without `--server` it is all the
+wicket does: a local loop like `wasmtime serve`, with no sluice server.
+
+```text
+target/debug/sluice-wicket-wasi --listen 127.0.0.1:8080 \
+    --wasm 'counter.local=examples/target/wasm32-wasip3/release/counter.wasm?wasi=keyvalue'
+curl 127.0.0.1:8080/
+```
+
+A request goes to the route of its host (the `Host` header, or the h2 authority; the port
+left out), or, with a single route, to that route whatever its host. An unknown host is
+answered 404. Both `--server` and `--listen` serve the tunnel and the listener at once.
+`--max-connections` bounds the listener's connections too, apart from the tunnel's (one
+beyond waits in the backlog). Without `--server` nothing drains: SIGTERM / SIGINT end the
+process at once.
+
 The image `ghcr.io/making/sluice/sluice-wicket-wasi` (`latest` / `<sha>`, amd64 /
 aarch64) is published on every push to `main` changing the wicket; it takes the same
 arguments, with the components mounted:
@@ -53,6 +73,10 @@ docker run --rm --pull always -v $PWD/examples/target/wasm32-wasip3/release:/was
     ghcr.io/making/sluice/sluice-wicket-wasi \
     --server grpc://host.docker.internal:8001 --token SECRET --wasm demo.local=/wasm/hello.wasm
 ```
+
+Its working directory is `/data`, where the [keyvalue](#key-value-stores-experimental) store
+is created without a `--config` file (`/data/keyvalue.db`): mount a volume there
+(`-v wicket-data:/data`) to keep it, or the stores die with the container.
 
 `--help` lists the options. Each option but `--wasm` also reads
 `SLUICE_WICKET_WASI_<NAME>` from the environment (upper case, `-` as `_`, e.g.
@@ -79,6 +103,10 @@ target/debug/sluice-wicket-wasi --server grpcs://127.0.0.1:8001 --insecure ...
 stream; when omitted a random UUID is used, matching the Java client's
 `sluice.client.id`. Re-registering with the same id replaces the previous
 registration on the server.
+
+`--listen <host:port>` serves the routes over plain TCP too (see [Local mode](#local-mode));
+`--keyvalue-file <path>` moves the keyvalue store (see
+[Key-value stores](#key-value-stores-experimental)).
 
 `--max-connections N` (default 256) caps the connections open at once over every
 node stream; a CONNECT beyond it is answered with the ERROR `connection limit reached`
@@ -144,8 +172,8 @@ reload error otherwise).
 `--config <file>` reads the settings from a YAML file. Every flag has its key; a flag
 overrides the environment (`SLUICE_WICKET_WASI_<NAME>`), the environment the file, the
 file a default. Without `--config` the flags alone apply, as
-before. With it, `server` is the one setting required: the routes may be empty at
-startup and added by a reload.
+before. With it, `server` or `listen` is the one setting required: the routes may be empty
+at startup and added by a reload.
 
 ```yaml
 server: grpc://127.0.0.1:8001
@@ -158,6 +186,17 @@ max-instances: 64
 tunnel-stall-timeout: 60s
 drain-grace: 20s
 watch-interval: 1s              # 0 = no polling, SIGHUP only
+# listen: 127.0.0.1:8080        # local mode, see Local mode
+
+keyvalue:                       # optional: one sqlite store, keyvalue.db next to this file
+  default: local                # optional with one store
+  stores:
+    local:
+      type: sqlite
+      path: keyvalue.db         # relative to this file
+      # max-key-bytes: 1Ki      # the defaults
+      # max-value-bytes: 1Mi
+      # max-namespace-bytes: 64Mi
 
 routes:
   - host: demo.local
@@ -170,10 +209,19 @@ routes:
       memory: 64Mi              # memory-mib: a whole number of MiB (Ki/Mi/Gi, K/M/G)
       pool: 2
       instances: 4
+  - host: counter.local
+    component: counter.wasm
+    sandbox:
+      wasi: [keyvalue]
+      keyvalue:                 # optional: identifier -> store[/namespace]
+        "": local               # the namespace defaults to the host
+        sessions: local/shared-sessions
 ```
 
 - durations take `ms`, `s`, `m` or `h` (`tunnel-stall-timeout`, `drain-grace` and
   `watch-interval` also a bare `0` = off); the flags keep whole seconds
+- sizes take a whole number with `Ki`, `Mi`, `Gi` (or `K`, `M`, `G`); `memory` must be
+  whole MiB, the keyvalue limits may be a bare number of bytes
 - `${NAME}` in a plain (unquoted) scalar is the environment variable `NAME`, with the
   docker compose forms (`${NAME:-default}`, `${NAME?message}`, ...); an unset `${NAME}`
   without a default is an error, `$${` a literal `${`, and a quoted scalar is never
@@ -213,14 +261,14 @@ stay as they were until a file changes again or SIGHUP. Otherwise
   request, and a new pool's units take the slots as they free (requests take the
   per-request path meanwhile)
 
-Only the routes are reloaded: another setting changed in the file is logged as such and
-applies on a restart. Removing every route needs a server from this version on (an
+Only the routes (with their keyvalue maps) are reloaded: another setting changed in the
+file -- the `keyvalue` stores included -- is logged as such and applies on a restart. Removing every route needs a server from this version on (an
 older one ignores an advertise without routes and keeps the old ones).
 
 ### Capabilities
 
 The `wasi` route option grants WASI capabilities, named after the `-S`
-options of `wasmtime serve` (v49), so a component runs here with the flags it
+options of `wasmtime serve` (v50), so a component runs here with the flags it
 runs with there. Without it a route gets the serve default: `wasi:http` (incoming and
 outgoing) plus the p3 `cli` / `clocks` / `random` interfaces. A component
 importing anything else fails at startup.
@@ -232,10 +280,13 @@ importing anything else fails at startup.
 | `inherit-network` | `-Sinherit-network` | sockets may use every address; implies `tcp` + `udp` |
 | `tcp` / `udp` | `-Stcp` / `-Sudp` | allows the protocol (every address stays denied without `inherit-network`) |
 | `allow-ip-name-lookup` | `-Sallow-ip-name-lookup` | allows `wasi:sockets/ip-name-lookup` |
+| `keyvalue` | `-Skeyvalue` | links `wasi:keyvalue@0.2.0-draft2` (see [Key-value stores](#key-value-stores-experimental)) |
 
 The network capabilities require `cli` (sockets are not linked otherwise) and
 are enforced by `wasmtime-wasi` on every socket call: a denied call returns
-`access-denied` to the guest. Unknown names are a startup error.
+`access-denied` to the guest. Unknown names are a startup error, and so is a component
+importing what its route does not link, named with the capability it needs
+(`imports wasi:keyvalue/store@0.2.0-draft2: the route needs wasi=keyvalue`).
 
 ```text
 --wasm 'api.local=app.wasm?wasi=cli,inherit-network'
@@ -244,6 +295,51 @@ are enforced by `wasmtime-wasi` on every socket call: a denied call returns
 Guest stdout / stderr always go to the wicket's stdout / stderr as whole
 lines, prefixed with the component and a request id
 (`stdout [app.wasm#12] :: ...`), as `wasmtime serve` does.
+
+### Key-value stores (experimental)
+
+`wasi=keyvalue` gives the guest `wasi:keyvalue@0.2.0-draft2` (`store`, `atomics`, `batch`;
+not the `watcher` export), the newest WASI keyvalue there is. The interface follows WASI
+keyvalue as it moves: an async WASI 0.3 version replaces draft2 once it exists, and the
+wicket's guest interface changes with it. A `0.2.0-draft` component (the version
+`wasmtime serve -Skeyvalue` links) does not link here; `wasmtime serve` in turn does not
+link draft2, so a draft2 guest runs locally in [local mode](#local-mode).
+
+The store behind it is the host's choice and invisible to the guest. A route maps the
+identifiers its guest may `open` to a store and a namespace in it (`sandbox.keyvalue` in
+the config file); the default map, and the only one `--wasm` gives, is `""` -> the default
+store, the route's host as the namespace. Routes are thus isolated unless their maps name
+one namespace. An identifier the map lacks is `no-such-store`. The map is part of the
+advertised target (`?keyvalue=:local/counter.local&wasi=keyvalue`), as the rest of the
+sandbox: a changed map is a new target.
+
+The stores are process-wide (the `keyvalue` section; a change applies on a restart). Without
+the section there is one, `local`: a `sqlite` file `keyvalue.db` next to the config file, or
+in the working directory without one; `--keyvalue-file` (`SLUICE_WICKET_WASI_KEYVALUE_FILE`)
+moves it. A store is opened when a route first maps to it: a wicket without a keyvalue
+route creates no file. A map naming an unknown store fails the startup or the reload.
+
+- `sqlite`: one SQLite file, the table `kv(namespace, key, value)`, inspected and edited with
+  the `sqlite3` CLI (`sqlite3 keyvalue.db "SELECT namespace, key, CAST(value AS TEXT) FROM
+  kv"`). WAL with `synchronous=NORMAL`: a power loss may drop the last commits, never
+  corrupts the file. Several wickets on one host may share the file (they wait up to 5s
+  for each other's lock); sharing across hosts is a networked store's job. `list-keys`
+  pages hold up to 100 keys in key order, the cursor the last key of a page. A namespace
+  holds at most `max-namespace-bytes` (default 64Mi) of keys and values, so a guest cannot
+  fill the disk: a write past it fails and changes nothing
+- every store: a key past `max-key-bytes` (default 1Ki) and a value past `max-value-bytes`
+  (default 1Mi) are rejected before the store sees them
+
+`increment` adds to the decimal ASCII of an i64 (absent: 0), as Redis `INCRBY`; any other
+value is an error. A `cas` holds the value read when it began, and `swap` writes only while
+the key still holds it; a lost race returns `cas-failed` with a handle on the current value.
+Every error the guest sees is `other(message)` (draft2 has no finer case); a store failure
+is logged (`[keyvalue] local/counter.local set failed: ...`).
+
+The draft2 functions are not `async`: a call blocks its instance -- other tasks of the same
+guest, a streaming response body among them -- while the store answers; other requests do
+not wait. A pooled unit keeping a bucket or cas handle across requests leaves its resource
+table dirty and is retired, so a guest opens its buckets per request (cheap: a table entry).
 
 ## Design notes
 
@@ -383,6 +479,9 @@ Kubernetes, `terminationGracePeriodSeconds` (30s by default) bounds it the same 
 - a reload changing a route's sandbox gives it a new target with its own `instances`
   cap: until the old target's requests ended, both caps count, so the route may hold
   up to twice its cap
+- wasi:keyvalue is draft2, without the `watcher` export, and its calls block the guest's
+  instance (see [Key-value stores](#key-value-stores-experimental)); `sqlite` is the only
+  store yet
 - file changes are seen by modification time, size and inode: a component rewritten
   in place with the same size within the file system's time granularity is missed
   until SIGHUP

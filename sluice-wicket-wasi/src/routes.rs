@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::RouteSource;
+use crate::keyvalue;
 use crate::proto::Upstream;
 use crate::wasm_host::{self, Binding, Handler, Instances, Loaded, Locator, Sandbox};
 
@@ -126,6 +127,22 @@ impl Routes {
         })
     }
 
+    /// The handler serving a request for `host` (no port) on the listener:
+    /// the route of that host, or the sole route whatever the host; None for
+    /// an unknown host.
+    pub fn by_host(&self, host: &str) -> Option<Arc<Handler>> {
+        let table = self.table.borrow();
+        let target = match table.advertised.as_slice() {
+            [sole] => &sole.target_url,
+            all => {
+                &all.iter()
+                    .find(|up| up.host.eq_ignore_ascii_case(host))?
+                    .target_url
+            }
+        };
+        table.entries.get(target).map(|entry| entry.handler.clone())
+    }
+
     /// Registers a live stream, unregistered when the guard drops.
     pub fn stream(self: &Arc<Self>) -> StreamAcks {
         let id = self.next_stream.fetch_add(1, Ordering::Relaxed);
@@ -203,8 +220,8 @@ type Stamps = HashMap<PathBuf, Option<Stamp>>;
 enum Planned {
     /// The current entry: the component did not change.
     Keep(Entry),
-    /// A new handler on this component.
-    New(Arc<Loaded>),
+    /// A new handler on this component, with its keyvalue buckets.
+    New(Arc<Loaded>, Option<Arc<keyvalue::Buckets>>),
 }
 
 /// A reload's outcome, by host.
@@ -241,6 +258,8 @@ impl std::fmt::Display for Change {
 pub struct Reloader {
     routes: Arc<Routes>,
     instances: Arc<Instances>,
+    /// The keyvalue stores the routes' maps name.
+    stores: Arc<keyvalue::Stores>,
     source: RouteSource,
     /// The files the table was read from (config, components), stamped
     /// before each was read.
@@ -264,6 +283,7 @@ impl Reloader {
                 entries: HashMap::new(),
             }),
             instances,
+            stores: source.stores().clone(),
             source,
             watched: Stamps::new(),
             pending: None,
@@ -430,11 +450,15 @@ impl Reloader {
                             wasm_host::compile(fetched, spec.sandbox.caps)
                                 .await
                                 .map_err(failed)?,
+                            self.stores
+                                .buckets(&spec.sandbox.keyvalue)
+                                .await
+                                .map_err(failed)?,
                         ),
                     }
                 }
             };
-            plan.targets.push((target, spec.sandbox, planned));
+            plan.targets.push((target, spec.sandbox.clone(), planned));
         }
         // every pooled unit holds a slot for good
         let pooled: usize = plan
@@ -471,7 +495,7 @@ impl Reloader {
             self.lingering.remove(&target);
             let entry = match planned {
                 Planned::Keep(entry) => entry,
-                Planned::New(loaded) => {
+                Planned::New(loaded, buckets) => {
                     println!(
                         "loaded {} (sha256 {}) for {target}",
                         loaded.label(),
@@ -485,7 +509,7 @@ impl Reloader {
                         }
                         None => CancellationToken::new(),
                     };
-                    let handler = Handler::new(loaded, sandbox, &self.instances)
+                    let handler = Handler::new(loaded, sandbox, buckets, &self.instances)
                         .expect("the sandbox was checked");
                     Entry { handler, gone }
                 }

@@ -11,8 +11,9 @@
 //! client backpressures the guest instead of buffering the response.
 //!
 //! The WASI surface follows `wasmtime serve` for p3: a route links http +
-//! the p3 cli/clocks/random interfaces, `cli` links the full wasi p3 set, and
-//! the network capabilities configure the per-request `WasiCtx`. wasi p2 is
+//! the p3 cli/clocks/random interfaces, `cli` links the full wasi p3 set,
+//! `keyvalue` wasi:keyvalue (`keyvalue`), and the network capabilities
+//! configure the per-request `WasiCtx`. wasi p2 is
 //! unsupported: a p2-importing component is rejected at load. Guest stdout /
 //! stderr always reach the process log, line-prefixed.
 
@@ -30,6 +31,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use wasmtime::AsContextMut as _;
 
+use crate::keyvalue;
 use crate::tunnel::TunnelIo;
 
 /// Relay slots between the guest's store task and hyper; together with the
@@ -38,7 +40,7 @@ use crate::tunnel::TunnelIo;
 const RELAY_BUFFER: usize = 2;
 
 /// Sniff timeout for the first bytes of a connection (h2 preface check).
-const SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Granularity of every request budget: the shared engine's epoch is
 /// incremented at this interval, and budgets are denominated in ticks.
@@ -383,6 +385,8 @@ impl Limits {
 ///   allows every address (and implies `tcp` + `udp`), `allow-ip-name-lookup`
 ///   allows `wasi:sockets/ip-name-lookup`. Without `inherit-network` every
 ///   address is denied. They need `cli`, since sockets are not linked otherwise.
+/// - `keyvalue` is linker-level too: `wasi:keyvalue@0.2.0-draft2` (`keyvalue`),
+///   its identifiers mapped by the route (`Sandbox::keyvalue`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Caps {
     pub cli: bool,
@@ -390,6 +394,7 @@ pub struct Caps {
     pub allow_ip_name_lookup: bool,
     pub tcp: bool,
     pub udp: bool,
+    pub keyvalue: bool,
 }
 
 impl Caps {
@@ -397,12 +402,13 @@ impl Caps {
     const HTTP: &'static str = "http";
 
     /// Capability names in canonical order.
-    const NAMES: [&'static str; 5] = [
+    const NAMES: [&'static str; 6] = [
         "cli",
         "inherit-network",
         "allow-ip-name-lookup",
         "tcp",
         "udp",
+        "keyvalue",
     ];
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -412,6 +418,7 @@ impl Caps {
             "allow-ip-name-lookup" => Some(&mut self.allow_ip_name_lookup),
             "tcp" => Some(&mut self.tcp),
             "udp" => Some(&mut self.udp),
+            "keyvalue" => Some(&mut self.keyvalue),
             _ => None,
         }
     }
@@ -471,8 +478,8 @@ impl Caps {
 }
 
 /// Everything a route configures for its instances: resource limits, WASI
-/// capabilities and instance pooling.
-#[derive(Clone, Copy, PartialEq, Debug, Default)]
+/// capabilities, the keyvalue map and instance pooling.
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct Sandbox {
     pub limits: Limits,
     pub caps: Caps,
@@ -483,6 +490,9 @@ pub struct Sandbox {
     /// units included (`Handler::admit`); None leaves the route bounded by
     /// `Instances` alone.
     pub instances: Option<usize>,
+    /// The keyvalue identifiers the guest may open, with `caps.keyvalue`;
+    /// filled in by the route's source (the map named, or the default one).
+    pub keyvalue: keyvalue::BucketMap,
 }
 
 impl Sandbox {
@@ -543,6 +553,21 @@ impl Sandbox {
         if let Some(cap) = self.instances {
             pairs.push(format!("instances={cap}"));
         }
+        if !self.keyvalue.is_empty() {
+            let map: Vec<_> = self
+                .keyvalue
+                .iter()
+                .map(|(identifier, place)| {
+                    format!(
+                        "{}:{}/{}",
+                        escape(identifier),
+                        escape(&place.store),
+                        escape(&place.namespace)
+                    )
+                })
+                .collect();
+            pairs.push(format!("keyvalue={}", map.join(",")));
+        }
         if self.limits.memory != defaults.memory {
             pairs.push(format!("memory-mib={}", self.limits.memory >> 20));
         }
@@ -555,6 +580,22 @@ impl Sandbox {
         }
         pairs.join("&")
     }
+}
+
+/// `text` with every byte but an unreserved one (`A-Z a-z 0-9 - . _ ~`)
+/// percent-encoded: a part of the query that cannot be mistaken for its
+/// separators.
+fn escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                escaped.push(byte as char)
+            }
+            _ => escaped.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    escaped
 }
 
 /// Fetches the component behind `locator`: reads the file, or GETs the url.
@@ -573,14 +614,15 @@ pub async fn fetch(locator: &Locator) -> Result<Fetched, String> {
     })
 }
 
-/// Compiles `fetched`, linked for the `caps` it runs with (only `cli` changes
-/// the linker), unless a component of the same target, digest and linker is
-/// still alive: then that one is shared. Only live components are kept, so a
-/// replaced one is freed with its last handler. The compilation runs on the
-/// blocking pool: a reload compiles while the wicket serves.
+/// Compiles `fetched`, linked for the `caps` it runs with (only `cli` and
+/// `keyvalue` change the linker), unless a component of the same target,
+/// digest and linker is still alive: then that one is shared. Only live
+/// components are kept, so a replaced one is freed with its last handler. The
+/// compilation runs on the blocking pool: a reload compiles while the wicket
+/// serves.
 pub async fn compile(fetched: Fetched, caps: Caps) -> Result<Arc<Loaded>, String> {
-    // (target, cli, digest) -> component: `cli` selects the linker
-    type Cache = Mutex<HashMap<(String, bool, String), std::sync::Weak<Loaded>>>;
+    // (target, (cli, keyvalue), digest) -> component: the caps select the linker
+    type Cache = Mutex<HashMap<(String, (bool, bool), String), std::sync::Weak<Loaded>>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let Fetched {
@@ -588,7 +630,7 @@ pub async fn compile(fetched: Fetched, caps: Caps) -> Result<Arc<Loaded>, String
         bytes,
         digest,
     } = fetched;
-    let key = (target, caps.cli, digest);
+    let key = (target, (caps.cli, caps.keyvalue), digest);
     if let Some(loaded) = cache
         .lock()
         .unwrap()
@@ -621,14 +663,33 @@ fn link(target: &str, bytes: &[u8], digest: String, caps: Caps) -> Result<Loaded
     let name = target.strip_prefix("wasm:").unwrap_or(target);
     let component = wasmtime::component::Component::new(&engine, bytes)
         .map_err(|e| format!("component {name}: {e}"))?;
-    if let Some(p2) = component
+    let imports: Vec<_> = component
         .component_type()
         .imports(&engine)
-        .map(|(import, _)| import)
-        .find(|import| import.starts_with("wasi:") && import.contains("@0.2."))
-    {
+        .map(|(import, _)| import.to_string())
+        .collect();
+    // wasi:keyvalue is 0.2.0-draft2 and no p2 package
+    let (stores, wasi): (Vec<_>, Vec<_>) = imports
+        .iter()
+        .filter(|import| import.starts_with("wasi:"))
+        .partition(|import| import.starts_with(keyvalue::PACKAGE));
+    if let Some(p2) = wasi.iter().find(|import| import.contains("@0.2.")) {
         return Err(format!(
             "component {name} imports {p2}: wasi p2 is unsupported (build for wasm32-wasip3)"
+        ));
+    }
+    if let Some(other) = stores
+        .iter()
+        .find(|import| !import.ends_with(keyvalue::VERSION))
+    {
+        return Err(format!(
+            "component {name} imports {other}: only wasi:keyvalue{} is linked",
+            keyvalue::VERSION
+        ));
+    }
+    if let Some(store) = stores.first().filter(|_| !caps.keyvalue) {
+        return Err(format!(
+            "component {name} imports {store}: the route needs wasi=keyvalue"
         ));
     }
     let linker = linker(&engine, caps).map_err(|e| format!("linker: {e}"))?;
@@ -650,8 +711,8 @@ fn link(target: &str, bytes: &[u8], digest: String, caps: Caps) -> Result<Loaded
 }
 
 /// The interfaces a route links, as `wasmtime serve` does for p3: http plus
-/// cli / clocks / random, or with `cli` the full wasi p3 set. Unlike serve's
-/// `-Scli`, no p2 interface is linked.
+/// cli / clocks / random, or with `cli` the full wasi p3 set; with `keyvalue`
+/// wasi:keyvalue too. Unlike serve's `-Scli`, no p2 interface is linked.
 fn linker(
     engine: &wasmtime::Engine,
     caps: Caps,
@@ -665,6 +726,12 @@ fn linker(
         wasmtime_wasi::p3::cli::add_to_linker(&mut linker)?;
     }
     wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
+    if caps.keyvalue {
+        keyvalue::add_to_linker(&mut linker, |ctx: &mut Ctx| keyvalue::KeyValueCtx {
+            buckets: ctx.keyvalue.as_deref(),
+            table: &mut ctx.table,
+        })?;
+    }
     Ok(linker)
 }
 
@@ -681,12 +748,14 @@ struct Ctx {
     http: wasmtime_wasi_http::WasiHttpCtx,
     hooks: NoHooks,
     limiter: MemoryCap,
+    /// The route's keyvalue buckets, with the capability.
+    keyvalue: Option<Arc<keyvalue::Buckets>>,
 }
 
 impl Ctx {
     /// A request's store state; `label` names the component in the guest's
     /// log lines.
-    fn new(sandbox: &Sandbox, label: &str) -> Self {
+    fn new(sandbox: &Sandbox, label: &str, keyvalue: Option<Arc<keyvalue::Buckets>>) -> Self {
         static REQUESTS: AtomicU64 = AtomicU64::new(1);
         let request = REQUESTS.fetch_add(1, Ordering::Relaxed);
         let mut wasi = wasmtime_wasi::WasiCtxBuilder::new();
@@ -709,6 +778,7 @@ impl Ctx {
                 used: 0,
                 grew: false,
             },
+            keyvalue,
         }
     }
 
@@ -1488,11 +1558,12 @@ async fn respond(
         ..
     } = job;
 
-    let (loaded, sandbox) = (&handler.loaded, handler.sandbox);
+    let loaded = &handler.loaded;
     // Declared after the slot and share, so dropped before them on every
     // path.
     let live = LiveStore::mark(&handler.live);
-    let mut store = wasmtime::Store::new(engine(), Ctx::new(&sandbox, &loaded.label));
+    let ctx = Ctx::new(&handler.sandbox, &loaded.label, handler.keyvalue.clone());
+    let mut store = wasmtime::Store::new(engine(), ctx);
     store.limiter_async(|ctx| &mut ctx.limiter);
     // The deadline must exist before any wasm runs: with epoch interruption
     // enabled, a store without one traps on the first observed tick.
@@ -1535,6 +1606,8 @@ async fn respond(
 pub struct Handler {
     loaded: Arc<Loaded>,
     sandbox: Sandbox,
+    /// The buckets of `sandbox.keyvalue`, resolved to their stores.
+    keyvalue: Option<Arc<keyvalue::Buckets>>,
     pool: Option<Arc<Pool>>,
     /// The process-wide instance slots every store of the route takes.
     instances: Arc<Instances>,
@@ -1555,6 +1628,7 @@ impl Handler {
     pub fn new(
         loaded: Arc<Loaded>,
         sandbox: Sandbox,
+        keyvalue: Option<Arc<keyvalue::Buckets>>,
         instances: &Arc<Instances>,
     ) -> Result<Arc<Handler>, String> {
         sandbox.check()?;
@@ -1566,7 +1640,8 @@ impl Handler {
             0 => None,
             _ => Some(Pool::new(
                 loaded.clone(),
-                sandbox,
+                sandbox.clone(),
+                keyvalue.clone(),
                 live.clone(),
                 instances.clone(),
                 route.clone(),
@@ -1576,6 +1651,7 @@ impl Handler {
             live,
             loaded,
             sandbox,
+            keyvalue,
             pool,
             instances: instances.clone(),
             route,
@@ -1744,6 +1820,7 @@ struct Job {
 struct Pool {
     loaded: Arc<Loaded>,
     sandbox: Sandbox,
+    keyvalue: Option<Arc<keyvalue::Buckets>>,
     /// The handler's gauge: every unit marks its store on it.
     live: Arc<Gauge>,
     /// The handler's slots: the process-wide ones and the route's cap.
@@ -1783,14 +1860,16 @@ impl Pool {
     fn new(
         loaded: Arc<Loaded>,
         sandbox: Sandbox,
+        keyvalue: Option<Arc<keyvalue::Buckets>>,
         live: Arc<Gauge>,
         instances: Arc<Instances>,
         route: Option<Arc<tokio::sync::Semaphore>>,
     ) -> Arc<Self> {
+        let units = sandbox.pool;
         let pool = Arc::new(Self {
             state: Mutex::new(PoolState {
                 idle: Vec::new(),
-                units: sandbox.pool,
+                units,
                 spawned: 0,
                 served: 0,
                 closed: false,
@@ -1798,12 +1877,13 @@ impl Pool {
             live,
             loaded,
             sandbox,
+            keyvalue,
             instances,
             route,
             offered: tokio::sync::Notify::new(),
             closed: CancellationToken::new(),
         });
-        for _ in 0..sandbox.pool {
+        for _ in 0..units {
             let slot = pool.instances.try_slot(pool.route.as_ref());
             Self::spawn_unit(pool.clone(), slot);
         }
@@ -1955,7 +2035,8 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot) {
     let loaded = pool.loaded.clone();
     let budget = pool.sandbox.limits.budget;
     let _live = LiveStore::mark(&pool.live);
-    let mut store = wasmtime::Store::new(engine(), Ctx::new(&pool.sandbox, &loaded.label));
+    let ctx = Ctx::new(&pool.sandbox, &loaded.label, pool.keyvalue.clone());
+    let mut store = wasmtime::Store::new(engine(), ctx);
     store.limiter_async(|ctx| &mut ctx.limiter);
     // As in `respond`: the deadline must exist before any wasm runs.
     store.set_epoch_deadline(budget_ticks(budget));
@@ -2065,13 +2146,50 @@ pub async fn serve(mut io: TunnelIo, binding: Binding) {
         io.peek_prefix(b"PRI")
     };
 
-    let streams = binding.opened.instances.streams_per_connection();
-    let share = binding.opened.instances.share();
+    let instances = binding.opened.instances.clone();
     let gone = binding.gone.clone();
     let binding = Arc::new(binding);
+    let route = move |_: &hyper::Request<hyper::body::Incoming>| Ok(binding.handler());
+    let label = format!("conn {conn_id}");
+    tokio::select! {
+        biased;
+        () = serve_http(io, h2, &instances, route, gone, &label) => {}
+        // dropping hyper drops the request in flight
+        () = failed => {}
+    }
+    ending.finish();
+}
+
+/// Serves the requests of one connection, h2 when `h2` (sniffed by the
+/// caller) else http/1.1, each by the handler `route` finds for it (404 with
+/// its message when none), until the connection ends; once `gone` is
+/// cancelled it shuts down gracefully. `label` names the connection in the
+/// log.
+pub(crate) async fn serve_http<I, R>(
+    io: I,
+    h2: bool,
+    instances: &Instances,
+    route: R,
+    gone: CancellationToken,
+    label: &str,
+) where
+    I: tokio::io::AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    R: Fn(&hyper::Request<hyper::body::Incoming>) -> Result<Arc<Handler>, String>
+        + Send
+        + Sync
+        + 'static,
+{
+    let streams = instances.streams_per_connection();
+    let share = instances.share();
+    let route = Arc::new(route);
     let service = hyper::service::service_fn(move |req| {
-        let (handler, share) = (binding.handler(), share.clone());
-        async move { Ok::<_, std::convert::Infallible>(respond(&handler, &share, req).await) }
+        let (handler, share) = (route(&req), share.clone());
+        async move {
+            Ok::<_, std::convert::Infallible>(match handler {
+                Ok(handler) => respond(&handler, &share, req).await,
+                Err(message) => plain_response(404, message),
+            })
+        }
     });
     let served = async {
         if h2 {
@@ -2092,17 +2210,9 @@ pub async fn serve(mut io: TunnelIo, binding: Binding) {
             .await
         }
     };
-    tokio::select! {
-        biased;
-        served = served => {
-            if let Err(e) = served {
-                eprintln!("[wasm] conn {conn_id} serve error: {e}");
-            }
-        }
-        // dropping hyper drops the request in flight
-        () = failed => {}
+    if let Err(e) = served.await {
+        eprintln!("[wasm] {label} serve error: {e}");
     }
-    ending.finish();
 }
 
 /// Drives `connection` to its end, shutting it down gracefully once `gone`
@@ -2322,13 +2432,13 @@ pub(crate) mod tests {
 
     /// A route handler without an instance limit to speak of.
     fn route(loaded: Arc<Loaded>, sandbox: Sandbox) -> Arc<Handler> {
-        Handler::new(loaded, sandbox, &Instances::new(Instances::MAX)).unwrap()
+        Handler::new(loaded, sandbox, None, &Instances::new(Instances::MAX)).unwrap()
     }
 
     /// Process-wide copy of every log line, guest or host, so tests can
     /// assert on them (they filter by their own marker: tests run
     /// concurrently).
-    pub(super) fn captured_log() -> &'static Mutex<Vec<u8>> {
+    pub(crate) fn captured_log() -> &'static Mutex<Vec<u8>> {
         static CAPTURED: Mutex<Vec<u8>> = Mutex::new(Vec::new());
         &CAPTURED
     }
@@ -2349,8 +2459,10 @@ pub(crate) mod tests {
             linker: &'a wasmtime::component::Linker<Ctx>,
             component: &'a wasmtime::component::Component,
         ) -> wasmtime::Result<()> {
-            let mut store =
-                wasmtime::Store::new(linker.engine(), Ctx::new(&Sandbox::default(), "bench"));
+            let mut store = wasmtime::Store::new(
+                linker.engine(),
+                Ctx::new(&Sandbox::default(), "bench", None),
+            );
             store.set_epoch_deadline(u64::MAX / 2);
             let _ = wasmtime_wasi_http::p3::bindings::Service::instantiate_async(
                 &mut store, component, linker,
@@ -2362,7 +2474,7 @@ pub(crate) mod tests {
         let pre = linker.instantiate_pre(&component).unwrap();
         async fn pre_linked(pre: &wasmtime::component::InstancePre<Ctx>) -> wasmtime::Result<()> {
             let mut store =
-                wasmtime::Store::new(pre.engine(), Ctx::new(&Sandbox::default(), "bench"));
+                wasmtime::Store::new(pre.engine(), Ctx::new(&Sandbox::default(), "bench", None));
             store.set_epoch_deadline(u64::MAX / 2);
             let _ = pre.instantiate_async(&mut store).await?;
             Ok(())
@@ -2482,7 +2594,7 @@ pub(crate) mod tests {
     }
 
     /// `exchange_raw` for text responses.
-    async fn exchange(handler: &Arc<Handler>, request: &str) -> String {
+    pub(crate) async fn exchange(handler: &Arc<Handler>, request: &str) -> String {
         String::from_utf8(exchange_raw(handler, request).await).expect("utf8 response")
     }
 
@@ -2911,7 +3023,7 @@ pub(crate) mod tests {
             ..Sandbox::default()
         };
         let body = exchange(
-            &route(loaded.clone(), sandbox),
+            &route(loaded.clone(), sandbox.clone()),
             "GET /balloon HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
         )
         .await;
@@ -3153,43 +3265,53 @@ pub(crate) mod tests {
         }
     }
 
-    /// Loading a p2-importing component names the cause instead of a missing
-    /// link (or a misleading `wasi=cli` hint).
+    /// A component importing what its route does not link fails at load
+    /// (startup), naming the import and the cause instead of a missing link:
+    /// wasi p2 (never linked, not even with `cli`), wasi:sockets without
+    /// `cli` (as under `wasmtime serve` without `-Scli`), wasi:keyvalue
+    /// without `keyvalue` (draft2 is no p2), and a wasi:keyvalue other than
+    /// draft2.
     #[tokio::test]
-    async fn loading_a_p2_component_is_rejected_as_unsupported() {
-        let path =
-            std::env::temp_dir().join(format!("sluice-p2-import-{}.wat", std::process::id()));
-        std::fs::write(
-            &path,
-            r#"(component
-                 (import "wasi:cli/environment@0.2.6" (instance
-                   (export "get-environment" (func (result (list (tuple string string)))))))
-               )"#,
-        )
-        .unwrap();
-        for caps in [Caps::default(), Caps::parse("cli").unwrap()] {
-            let error = match load(&Locator::File(path.clone()), caps).await {
-                Ok(_) => panic!("{caps:?} loaded a p2 component"),
+    async fn a_component_importing_what_its_route_does_not_link_fails_to_load() {
+        let dir = crate::routes::tests::Scratch::new("imports");
+        let importing = |import: &str| {
+            let wat = format!(r#"(component (import "{import}" (instance (export "f" (func)))))"#);
+            dir.write(&format!("{}.wat", import.replace(['/', ':'], "_")), wat)
+        };
+        let p2 = importing("wasi:cli/environment@0.2.6");
+        let p2_unsupported: &[&str] =
+            &["imports wasi:cli/environment@0.2.6: wasi p2 is unsupported"];
+        let cases: [(PathBuf, &str, &[&str]); 5] = [
+            (p2.clone(), "", p2_unsupported),
+            (p2, "cli", p2_unsupported),
+            (
+                guest_wasm("relay"),
+                "",
+                &["wasi:sockets/types@0.3.0", "(the route may need wasi=cli)"],
+            ),
+            (
+                guest_wasm("counter"),
+                "cli",
+                &["imports wasi:keyvalue/store@0.2.0-draft2: the route needs wasi=keyvalue"],
+            ),
+            (
+                importing("wasi:keyvalue/store@0.2.0-draft"),
+                "keyvalue",
+                &[
+                    "imports wasi:keyvalue/store@0.2.0-draft: only wasi:keyvalue@0.2.0-draft2 is linked",
+                ],
+            ),
+        ];
+        for (component, caps, needles) in cases {
+            let caps = Caps::parse(caps).unwrap();
+            let error = match load(&Locator::File(component.clone()), caps).await {
+                Ok(_) => panic!("{} loaded with {caps:?}", component.display()),
                 Err(error) => error,
             };
-            assert!(
-                error.contains("imports wasi:cli/environment@0.2.6"),
-                "{error}"
-            );
-            assert!(error.contains("wasi p2 is unsupported"), "{error}");
+            for needle in needles {
+                assert!(error.contains(needle), "{error}");
+            }
         }
-    }
-
-    /// Without `cli` wasi:sockets is not linked: a component importing it
-    /// fails at load (startup), as under `wasmtime serve` without `-Scli`.
-    #[tokio::test]
-    async fn a_socket_importing_component_needs_cli_to_load() {
-        let error = match load(&Locator::File(guest_wasm("relay")), Caps::default()).await {
-            Ok(_) => panic!("loaded without cli"),
-            Err(error) => error,
-        };
-        assert!(error.contains("wasi:sockets/types@0.3.0"), "{error}");
-        assert!(error.contains("wasi=cli"), "{error}");
     }
 
     fn fetch_request(url: &str) -> String {
@@ -3575,7 +3697,7 @@ pub(crate) mod tests {
             },
             ..Sandbox::default()
         };
-        let cold = route(loaded.clone(), sandbox);
+        let cold = route(loaded.clone(), sandbox.clone());
         let warm = pooled(&loaded, sandbox, 1);
         restocked(&warm, 1).await;
 
@@ -4133,7 +4255,7 @@ pub(crate) mod tests {
         if let Some(budget) = budget {
             sandbox.limits.budget = budget;
         }
-        Handler::new(loaded.clone(), sandbox, instances).unwrap()
+        Handler::new(loaded.clone(), sandbox, None, instances).unwrap()
     }
 
     /// Waits for the end of conn 1's response: the HTTP response, or None
@@ -4256,13 +4378,13 @@ pub(crate) mod tests {
             sandbox.limits.budget = budget;
             let (holder, waiter) = if pooled {
                 sandbox.pool = 1;
-                let handler = Handler::new(loaded.clone(), sandbox, &instances).unwrap();
+                let handler = Handler::new(loaded.clone(), sandbox, None, &instances).unwrap();
                 restocked(&handler, 1).await;
                 (handler.clone(), handler)
             } else {
                 (
                     limited(&loaded, &instances, None),
-                    Handler::new(loaded.clone(), sandbox, &instances).unwrap(),
+                    Handler::new(loaded.clone(), sandbox, None, &instances).unwrap(),
                 )
             };
             let occupant = stalled_connection(&holder).await;
@@ -4378,6 +4500,7 @@ pub(crate) mod tests {
                 },
                 ..Sandbox::default()
             },
+            None,
             &instances,
         )
         .unwrap();
@@ -4425,6 +4548,7 @@ pub(crate) mod tests {
                 pool: 1,
                 ..Sandbox::default()
             },
+            None,
             &instances,
         )
         .unwrap();
@@ -4471,6 +4595,7 @@ pub(crate) mod tests {
                 },
                 ..Sandbox::default()
             },
+            None,
             &instances,
         )
         .unwrap();
@@ -4493,9 +4618,9 @@ pub(crate) mod tests {
             pool: 2,
             ..Sandbox::default()
         };
-        let first = Handler::new(loaded.clone(), sandbox, &instances).unwrap();
+        let first = Handler::new(loaded.clone(), sandbox.clone(), None, &instances).unwrap();
         assert_eq!(instances.held(), 2);
-        let second = Handler::new(loaded.clone(), sandbox, &instances).unwrap();
+        let second = Handler::new(loaded.clone(), sandbox, None, &instances).unwrap();
         assert_eq!(instances.held(), 3, "the free slot is taken at once");
         assert_eq!(pool(&second).units(), 2, "the other unit waits");
         restocked(&second, 1).await;
@@ -4518,6 +4643,7 @@ pub(crate) mod tests {
                 pool: 2,
                 ..Sandbox::default()
             },
+            None,
             &instances,
         )
         .unwrap();
@@ -4751,7 +4877,7 @@ pub(crate) mod tests {
             let mut sandbox = Sandbox::default();
             sandbox.limits.budget = Duration::from_millis(1500);
             sandbox.pool = usize::from(pooled);
-            let spinning = Handler::new(loaded.clone(), sandbox, &instances).unwrap();
+            let spinning = Handler::new(loaded.clone(), sandbox, None, &instances).unwrap();
             if pooled {
                 restocked(&spinning, 1).await;
             }
@@ -4821,7 +4947,7 @@ pub(crate) mod tests {
         if let Some(budget) = budget {
             sandbox.limits.budget = budget;
         }
-        Handler::new(loaded.clone(), sandbox, instances).unwrap()
+        Handler::new(loaded.clone(), sandbox, None, instances).unwrap()
     }
 
     /// Asserts `response` is a 200.
@@ -5085,7 +5211,7 @@ pub(crate) mod tests {
                 },
                 ..Sandbox::default()
             };
-            Handler::new(loaded.clone(), sandbox, &instances).unwrap()
+            Handler::new(loaded.clone(), sandbox, None, &instances).unwrap()
         };
         let handler = tiny(0);
         let body = exchange(&handler, &get("/")).await;
@@ -5160,7 +5286,7 @@ pub(crate) mod tests {
             pool: 2,
             ..Sandbox::default()
         };
-        let error = match Handler::new(loaded.clone(), sandbox, &instances) {
+        let error = match Handler::new(loaded.clone(), sandbox, None, &instances) {
             Ok(_) => panic!("pool=2 fit a cap of 1"),
             Err(error) => error,
         };
