@@ -832,7 +832,7 @@ its discovery document advertises an `end_session_endpoint`; register
 | `sluice.access-control.deny-cidrs` | (empty) | data plane IP deny list, evaluated before any allow list and never overridden |
 | `sluice.access-control.trusted-proxy-cidrs` | (empty = the peer address is judged) | peers trusted as proxying load balancers: when the connection peer matches, the rightmost `X-Forwarded-For` entry (the one the proxy appended) is judged instead of the peer address; the LB must be configured to append to the header, client-sent entries stay part of the chain. Its `X-Forwarded-Proto` / `-Host` / `-Port` / `-Prefix` and `Forwarded` also reach the upstream, dropped from any other peer |
 | `sluice.route.auth.[<route key>].*` | (none) | credentials the requests of a route must carry; see "Route authentication" |
-| `sluice.route.session-secret` | (unset = a random one per start) | the secret the browser sign-in's cookies are sealed with, at least 32 characters (e.g. `openssl rand -base64 32`); the same on every node, required in cluster mode when a route signs browsers in. Changing it signs every browser out |
+| `sluice.route.session-secret` | (unset = a random one per start) | the secret the browser sign-in's cookies (session, sign-in state) are encrypted with, a key derived from it per route, at least 32 characters (e.g. `openssl rand -base64 32`). The same on every node: required in cluster mode when a route signs browsers in. Unset on a single node, every restart signs every browser out (WARN at start); changing it does too. Unused without `oidc.client-id` |
 
 ### Limits
 
