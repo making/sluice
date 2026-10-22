@@ -39,8 +39,8 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
-use crate::pb::frame::Body;
-use crate::pb::{Close, Connect, Data, Error, Frame, WindowUpdate};
+use crate::proto::frame::Body;
+use crate::proto::{Close, Connect, Data, Error, Frame, WindowUpdate};
 use crate::routes::Routes;
 use crate::wasm_host;
 #[cfg(test)]

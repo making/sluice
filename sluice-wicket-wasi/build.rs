@@ -3,13 +3,12 @@
 use std::path::PathBuf;
 
 fn main() {
-    // Repo root relative to this crate: ../../sluice-proto.
+    // Repo root relative to this crate: ../sluice-proto.
     let manifest_dir =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let root = manifest_dir
         .parent()
-        .and_then(|p| p.parent())
-        .expect("crate below <repo>/sluice-wicket-wasi/wicket-wasi")
+        .expect("crate below <repo>/sluice-wicket-wasi")
         .to_path_buf();
     let protos = root.join("sluice-proto/src/main/proto");
     tonic_prost_build::configure()
@@ -29,6 +28,6 @@ fn main() {
         "build.rs",
         "Cargo.toml",
         "src",
-        "../../sluice-proto/src/main/proto",
+        "../sluice-proto/src/main/proto",
     ]);
 }

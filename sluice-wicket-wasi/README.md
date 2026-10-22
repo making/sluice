@@ -18,7 +18,8 @@ sluice server --tunnel--> sluice-wicket-wasi --hyper(h1/h2c)--> wasi:http handle
 
 Two Cargo workspaces:
 
-- `wicket-wasi/` — `sluice-wicket-wasi`, the tunnel-side wasm host (wasmtime + hyper)
+- `.` — `sluice-wicket-wasi`, the tunnel-side wasm host (wasmtime + hyper), laid out as
+  `sluice-flume`: `src/lib.rs` wires the modules, `src/main.rs` reads the command line
 - `examples/` — sample handler components (`wasm32-wasip3`), a separate
   workspace pinned to a nightly toolchain by `rust-toolchain.toml`
   (wasm32-wasip3 ships rust-std on nightly only; rustup installs it on the
@@ -30,7 +31,7 @@ Two Cargo workspaces:
 ## Run
 
 ```text
-cargo build -p sluice-wicket-wasi
+cargo build
 (cd examples && cargo build --release)   # -> examples/target/wasm32-wasip3/release/<example>.wasm
 
 # sluice server as in the root README, then:
@@ -40,7 +41,7 @@ target/debug/sluice-wicket-wasi --server grpc://127.0.0.1:8001 --token SECRET \
 target/debug/sluice-wicket-wasi --config wicket-wasi.yaml
 ```
 
-`cargo test -p sluice-wicket-wasi` builds the examples the same way (through the
+`cargo test` builds the examples the same way (through the
 rustup `cargo` proxy, so rustup must be installed).
 
 The image `ghcr.io/making/sluice/sluice-wicket-wasi` (`latest` / `<sha>`, amd64 /
@@ -52,6 +53,11 @@ docker run --rm --pull always -v $PWD/examples/target/wasm32-wasip3/release:/was
     ghcr.io/making/sluice/sluice-wicket-wasi \
     --server grpc://host.docker.internal:8001 --token SECRET --wasm demo.local=/wasm/hello.wasm
 ```
+
+`--help` lists the options. Each option but `--wasm` also reads
+`SLUICE_WICKET_WASI_<NAME>` from the environment (upper case, `-` as `_`, e.g.
+`SLUICE_WICKET_WASI_TOKEN`; `SLUICE_WICKET_WASI_INSECURE=true`), and takes its value as
+`--name value` or `--name=value`.
 
 `--version` prints the build: version, git commit (with `dirty` when tracked files had
 uncommitted changes) and build time, embedded by `build.rs` (`sluice-build-info`) when the
@@ -136,7 +142,8 @@ reload error otherwise).
 ### Configuration file
 
 `--config <file>` reads the settings from a YAML file. Every flag has its key; a flag
-overrides the file, the file a default. Without `--config` the flags alone apply, as
+overrides the environment (`SLUICE_WICKET_WASI_<NAME>`), the environment the file, the
+file a default. Without `--config` the flags alone apply, as
 before. With it, `server` is the one setting required: the routes may be empty at
 startup and added by a reload.
 

@@ -1,8 +1,58 @@
+[package]
+name = "sluice-wicket-wasi"
+version = "0.0.1-SNAPSHOT"
+edition = "2024"
+publish = false
+# examples/ holds the guest components, not Cargo examples of this crate
+autoexamples = false
+
+# Its own workspace: built apart from sluice-flume (wasmtime in its tree). The guest
+# examples are another one (nightly toolchain, wasm32-wasip3).
 [workspace]
-resolver = "3"
-members = ["wicket-wasi"]
-# The guest examples are their own workspace (nightly toolchain, wasm32-wasip3).
 exclude = ["examples"]
+
+[dependencies]
+tonic = { version = "0.14", features = ["tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs", "signal"] }
+http = "1"
+tokio-stream = "0.1"
+# rt: the TaskTracker the drain waits on
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+# random default client id, same policy as the Java client
+uuid = { version = "1", features = ["v4"] }
+# wasi 0.3 (p3) host support only; p2 guests are unsupported
+wasmtime = "49"
+wasmtime-wasi = { version = "49", default-features = false, features = ["p3"] }
+wasmtime-wasi-http = { version = "49", default-features = false, features = ["default-send-request", "p3"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+# component fetch from http(s) locators
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+# control-plane TLS (grpcs / --insecure); the ring provider matches tonic's tls-ring
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# wasmtime's ResourceLimiterAsync is #[async_trait]; the impl must match
+async-trait = "0.1"
+# the --config file: YAML with ${NAME} interpolation from the environment
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = { version = "2", default-features = false, features = ["deserialize", "properties"] }
+# component digests: a reload keeps the handler of an unchanged component
+sha2 = "0.10"
+
+[dev-dependencies]
+# paused time for the stall watchdog tests
+tokio = { version = "1", features = ["test-util"] }
+# an h2 client for the per-connection stream limit; the version hyper uses
+h2 = "0.4"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+sluice-build-info = { path = "../sluice-build-info" }
 
 [profile.release]
 strip = true

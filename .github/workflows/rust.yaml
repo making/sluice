@@ -145,4 +145,4 @@ jobs:
         cargo clippy --all-targets --locked -- -D warnings
         (cd examples && cargo clippy --all-targets --locked -- -D warnings)
     - name: Test
-      run: cargo test --locked -p sluice-wicket-wasi
+      run: cargo test --locked

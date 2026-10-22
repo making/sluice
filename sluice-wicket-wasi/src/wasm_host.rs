@@ -2285,7 +2285,7 @@ pub(crate) mod tests {
     }
 
     use super::*;
-    use crate::pb::frame::Body;
+    use crate::proto::frame::Body;
     use crate::tunnel::testing::Peer;
     use std::time::{Duration, Instant};
 
@@ -2296,10 +2296,7 @@ pub(crate) mod tests {
     /// `$CARGO`, and without the `RUSTUP_TOOLCHAIN` the outer build exports.
     pub(crate) fn guest_wasm(name: &str) -> std::path::PathBuf {
         static BUILD: Mutex<()> = Mutex::new(());
-        let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("examples");
+        let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
         let _serialized = BUILD.lock().unwrap_or_else(|e| e.into_inner());
         let output = std::process::Command::new("cargo")
             .args(["build", "--release"])
@@ -2575,7 +2572,7 @@ pub(crate) mod tests {
             frames.iter().all(|body| matches!(body, Body::Data(_))),
             "still open: {frames:?}"
         );
-        peer.send(Body::Close(crate::pb::Close { conn_id: 1 }));
+        peer.send(Body::Close(crate::proto::Close { conn_id: 1 }));
         let tail = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
         assert!(matches!(tail[..], [Body::Close(_)]), "{tail:?}");
     }
@@ -2599,7 +2596,7 @@ pub(crate) mod tests {
         // a head cut short by the server's CLOSE: hyper fails the read; the
         // server closed, so CLOSE is owed, not ERROR
         let mut peer = open(&handler, "GET / HTTP/1.1\r\nhost:");
-        peer.send(Body::Close(crate::pb::Close { conn_id: 1 }));
+        peer.send(Body::Close(crate::proto::Close { conn_id: 1 }));
         let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
         assert_eq!(terminal(&frames), vec!["CLOSE"], "{frames:?}");
         // a response body cut short by the budget fails hyper while the
@@ -2646,7 +2643,7 @@ pub(crate) mod tests {
             "the initial credit"
         );
 
-        peer.send(Body::WindowUpdate(crate::pb::WindowUpdate {
+        peer.send(Body::WindowUpdate(crate::proto::WindowUpdate {
             conn_id: 1,
             increment: 100_000,
             ..Default::default()
@@ -3894,7 +3891,7 @@ pub(crate) mod tests {
 
     /// The server's CLOSE: the public client half-closed (a FIN).
     fn half_close(peer: &Peer) {
-        peer.send(Body::Close(crate::pb::Close { conn_id: 1 }));
+        peer.send(Body::Close(crate::proto::Close { conn_id: 1 }));
     }
 
     /// The connection-end frames among `frames`.
@@ -3924,7 +3921,7 @@ pub(crate) mod tests {
     async fn a_request_followed_by_the_servers_half_close_is_answered() {
         let handler = route(hello().await, Sandbox::default());
         let mut peer = open(&handler, &get("/"));
-        peer.send(Body::Close(crate::pb::Close { conn_id: 1 }));
+        peer.send(Body::Close(crate::proto::Close { conn_id: 1 }));
         let response = String::from_utf8(response_raw(&mut peer).await).unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     }

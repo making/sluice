@@ -15,10 +15,7 @@ const HANG: Duration = Duration::from_secs(60);
 /// The hello guest, built as the unit tests build it (the fetch guest beside
 /// it).
 fn hello_wasm() -> std::path::PathBuf {
-    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("examples");
+    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
     let output = Command::new("cargo")
         .args(["build", "--release", "-p", "hello", "-p", "fetch"])
         .env_remove("RUSTUP_TOOLCHAIN")

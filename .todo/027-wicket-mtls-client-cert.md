@@ -12,7 +12,7 @@ cert+key flag pair is enough for the PoC:
   `ClusterGrpcMutualTlsE2ETests`
 
 `tonic::transport::Identity::from_pem` and the `identity` field of `ClientTlsConfig`
-(already wired through `sluice-wicket-wasi/wicket-wasi/src/tls.rs`) are the pieces; rustls is
+(already wired through `sluice-wicket-wasi/src/tls.rs`) are the pieces; rustls is
 in the tree.
 
 Acceptance: `sluice-wicket-wasi --server grpcs://... --tls-cert ... --tls-key ...` against

@@ -1,9 +1,10 @@
-//! The settings: the command line and the `--config` YAML file, merged -- a
-//! flag overrides the file, the file a default. The file's routes are read
-//! again by every reload (`routes::Reloader`); its other settings apply at
-//! startup only, and a reload reports the ones changed since.
+//! The settings: the command line, the environment and the `--config` YAML
+//! file, merged -- an option `--name <value>` overrides `SLUICE_WICKET_WASI_<NAME>`
+//! (upper case, `-` as `_`), which overrides the file, the file a default. The
+//! file's routes are read again by every reload (`routes::Reloader`); its other
+//! settings apply at startup only, and a reload reports the ones changed since.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -11,6 +12,30 @@ use serde::Deserialize;
 
 use crate::routes::Spec;
 use crate::wasm_host::{Caps, Instances, Locator, Sandbox};
+
+pub const USAGE: &str = "\
+usage: sluice-wicket-wasi --server <url> --wasm <host>=<locator>[?<options>] ... [options]
+       sluice-wicket-wasi --config <file> [options]
+
+  --server <url>                  bootstrap endpoint, grpc://host:port or grpcs://host:port
+  --wasm <host>=<locator>         a route: a component path, file:// or http(s):// url;
+                                  repeatable. ?budget-ms=N&instances=N&memory-mib=N&pool=N
+                                  &wasi=<cap>,... sets its sandbox
+  --config <file>                 YAML settings and routes, the routes reloaded on change
+  --token <token>                 bearer token of the tunnel streams
+  --client-id <id>                client identity (default a random UUID)
+  --ca-cert <path>                PEM CA verifying a grpcs:// server (default the webPKI roots)
+  --insecure                      skip the verification of a grpcs:// server
+  --max-connections <n>           connections open at once (default 256)
+  --max-instances <n>             guest instances alive at once (default 64)
+  --tunnel-stall-timeout <secs>   give a stream up once its frames wait that long untaken
+                                  (default 60, 0 = off)
+  --drain-grace <secs>            the SIGTERM drain's bound (default 20, 0 = no drain)
+  --watch-interval <secs>         poll the routes' files (default 1, 0 = SIGHUP only)
+  --version                       print the build (version, commit, build time) and exit
+
+Each option but --wasm also reads SLUICE_WICKET_WASI_<NAME> from the environment, e.g.
+SLUICE_WICKET_WASI_TOKEN.";
 
 /// Default of `--max-connections`: 256 connections x one 1MiB receive window
 /// (plus at most two partly used 16KiB segments and 80 segments' overhead
@@ -48,14 +73,15 @@ pub struct Settings {
     pub routes: RouteSource,
 }
 
-/// What `parse` found on the command line.
-pub enum Parsed {
-    Run(Box<Settings>),
-    /// `--version`: print it and exit.
+/// What to run: print something and exit, or run.
+pub enum Command {
+    Help,
     Version,
+    Run(Box<Settings>),
 }
 
-/// The command line, each flag None / empty when not given.
+/// The command line over the environment, each setting None / empty when
+/// given by neither.
 #[derive(Default)]
 struct Flags {
     config: Option<PathBuf>,
@@ -72,52 +98,94 @@ struct Flags {
     routes: Vec<Spec>,
 }
 
-/// Parses the command line (without the program name) and the `--config`
-/// file it names.
-pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
-    let mut flags = Flags::default();
+const VALUED: &[&str] = &[
+    "config",
+    "server",
+    "token",
+    "client-id",
+    "ca-cert",
+    "max-connections",
+    "max-instances",
+    "tunnel-stall-timeout",
+    "drain-grace",
+    "watch-interval",
+    "wasm",
+];
+
+/// Parses the arguments (without the program name) over the environment, and
+/// the `--config` file they name.
+pub fn parse(
+    args: impl IntoIterator<Item = String>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Command, String> {
+    let mut given: HashMap<&str, String> = HashMap::new();
+    let mut insecure = false;
+    let mut routes = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        let mut value = |name: &str| {
-            args.next()
-                .ok_or_else(|| format!("missing value for {name}"))
-        };
         match arg.as_str() {
-            "--version" => return Ok(Parsed::Version),
-            "--config" => flags.config = Some(PathBuf::from(value("--config")?)),
-            "--server" => flags.server = Some(value("--server")?),
-            "--token" => flags.token = Some(value("--token")?),
-            "--client-id" => flags.client_id = Some(value("--client-id")?),
-            "--insecure" => flags.insecure = true,
-            "--ca-cert" => flags.ca_cert = Some(PathBuf::from(value("--ca-cert")?)),
-            "--max-connections" => {
-                let limit = value("--max-connections")?;
-                flags.max_connections = Some(parse_limit("max-connections", &limit, usize::MAX)?);
+            "-h" | "--help" => return Ok(Command::Help),
+            "-V" | "--version" => return Ok(Command::Version),
+            "--insecure" => insecure = true,
+            _ => {
+                let (name, inline) = match arg.strip_prefix("--").map(|rest| rest.split_once('=')) {
+                    Some(Some((name, value))) => (name, Some(value.to_string())),
+                    Some(None) => (&arg[2..], None),
+                    None => return Err(format!("unexpected argument: {arg}")),
+                };
+                let Some(name) = VALUED.iter().find(|valued| **valued == name) else {
+                    return Err(format!("unknown option: --{name}"));
+                };
+                let value = match inline {
+                    Some(value) => value,
+                    None => args
+                        .next()
+                        .ok_or_else(|| format!("--{name} needs a value"))?,
+                };
+                match *name {
+                    "wasm" => routes.push(parse_wasm_flag(&value)?),
+                    name => {
+                        given.insert(name, value);
+                    }
+                }
             }
-            "--max-instances" => {
-                let limit = value("--max-instances")?;
-                flags.max_instances = Some(parse_limit("max-instances", &limit, Instances::MAX)?);
-            }
-            "--tunnel-stall-timeout" => {
-                let seconds = value("--tunnel-stall-timeout")?;
-                flags.stall_timeout = Some(parse_seconds("tunnel-stall-timeout", &seconds)?);
-            }
-            "--drain-grace" => {
-                let seconds = value("--drain-grace")?;
-                flags.drain_grace = Some(parse_seconds("drain-grace", &seconds)?);
-            }
-            "--watch-interval" => {
-                let seconds = value("--watch-interval")?;
-                flags.watch_interval = Some(parse_seconds("watch-interval", &seconds)?);
-            }
-            "--wasm" => {
-                let spec = value("--wasm")?;
-                flags.routes.push(parse_wasm_flag(&spec)?);
-            }
-            other => return Err(format!("unknown argument '{other}'")),
         }
     }
-    merge(flags).map(|settings| Parsed::Run(Box::new(settings)))
+    let value = |name: &str| {
+        given.get(name).cloned().or_else(|| {
+            env(&format!(
+                "SLUICE_WICKET_WASI_{}",
+                name.to_uppercase().replace('-', "_")
+            ))
+            .filter(|value| !value.is_empty())
+        })
+    };
+    let limit = |name: &str, max: usize| {
+        value(name)
+            .map(|limit| parse_limit(name, &limit, max))
+            .transpose()
+    };
+    let seconds = |name: &str| {
+        value(name)
+            .map(|seconds| parse_seconds(name, &seconds))
+            .transpose()
+    };
+    let flags = Flags {
+        config: value("config").map(PathBuf::from),
+        server: value("server"),
+        token: value("token"),
+        client_id: value("client-id"),
+        insecure: insecure
+            || env("SLUICE_WICKET_WASI_INSECURE").is_some_and(|value| value == "true"),
+        ca_cert: value("ca-cert").map(PathBuf::from),
+        max_connections: limit("max-connections", usize::MAX)?,
+        max_instances: limit("max-instances", Instances::MAX)?,
+        stall_timeout: seconds("tunnel-stall-timeout")?,
+        drain_grace: seconds("drain-grace")?,
+        watch_interval: seconds("watch-interval")?,
+        routes,
+    };
+    merge(flags).map(|settings| Command::Run(Box::new(settings)))
 }
 
 /// `host=locator[?query]` of a `--wasm` flag.
@@ -572,19 +640,31 @@ mod tests {
     use crate::routes::tests::Scratch;
     use crate::wasm_host;
 
+    fn args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
     fn settings(args: &[&str]) -> Result<Settings, String> {
-        match parse(args.iter().map(|arg| arg.to_string()))? {
-            Parsed::Run(settings) => Ok(*settings),
-            Parsed::Version => panic!("not --version"),
+        settings_over(args, |_| None)
+    }
+
+    fn settings_over(
+        args: &[&str],
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Settings, String> {
+        match parse(self::args(args), env)? {
+            Command::Run(settings) => Ok(*settings),
+            _ => panic!("not a run command"),
         }
     }
 
-    /// Every setting has its key; a flag overrides the file, the file a
-    /// default; `${NAME}` reads the environment; relative paths are the
-    /// config file's; the flags' routes follow the file's. A reload reads
-    /// the routes again and names the other settings changed since.
+    /// Every setting has its key; a flag overrides the environment, the
+    /// environment the file, the file a default; `${NAME}` reads the
+    /// environment; relative paths are the config file's; the flags' routes
+    /// follow the file's. A reload reads the routes again and names the other
+    /// settings changed since.
     #[test]
-    fn the_config_file_sets_every_setting_and_a_flag_overrides_it() {
+    fn the_config_file_sets_every_setting_under_the_environment_and_the_flags() {
         let dir = Scratch::new("settings");
         let yaml = |server: &str| {
             format!(
@@ -642,26 +722,35 @@ routes:
             Locator::parse("https://example.invalid/b.wasm").unwrap()
         );
 
-        let flagged = settings(&[
-            "--config",
-            config,
-            "--server",
-            "grpc://flag:1",
-            "--max-instances",
-            "16",
-            "--drain-grace",
-            "5",
-            "--ca-cert",
-            "flag.pem",
-            "--wasm",
-            "c.local=c.wasm?pool=1",
-        ])
+        let env = |name: &str| match name {
+            "SLUICE_WICKET_WASI_MAX_CONNECTIONS" => Some("12".to_string()),
+            "SLUICE_WICKET_WASI_MAX_INSTANCES" => Some("32".to_string()),
+            "SLUICE_WICKET_WASI_TOKEN" => Some(String::new()),
+            _ => None,
+        };
+        let flagged = settings_over(
+            &[
+                "--config",
+                config,
+                "--server",
+                "grpc://flag:1",
+                "--max-instances=16",
+                "--drain-grace",
+                "5",
+                "--ca-cert",
+                "flag.pem",
+                "--wasm=c.local=c.wasm?pool=1",
+            ],
+            env,
+        )
         .unwrap();
         assert_eq!(flagged.server, "grpc://flag:1");
-        assert_eq!(flagged.max_instances, 16);
+        assert_eq!(flagged.max_instances, 16, "the flag's");
+        assert_eq!(flagged.max_connections, 12, "the environment's");
         assert_eq!(flagged.drain_grace, Duration::from_secs(5));
         assert_eq!(flagged.ca_cert, Some(PathBuf::from("flag.pem")));
-        assert_eq!(flagged.max_connections, 10, "the file's");
+        assert_eq!(flagged.stall_timeout, Duration::from_secs(90), "the file's");
+        assert_eq!(flagged.token, file.token, "an empty variable is unset");
         let (routes, _) = flagged.routes.read().unwrap();
         let hosts: Vec<_> = routes.iter().map(|route| route.host.as_str()).collect();
         assert_eq!(hosts, ["a.local", "b.local", "c.local"]);
@@ -749,6 +838,25 @@ routes:
             Some("route host 'a' is configured twice"),
             "a file's host given as a flag too"
         );
+    }
+
+    #[test]
+    fn rejects_a_command_line_it_cannot_read() {
+        let none = |_: &str| None;
+        let error = |line: &[&str]| match parse(args(line), none) {
+            Err(e) => e,
+            Ok(_) => panic!("{line:?} parsed"),
+        };
+        assert_eq!(error(&["--colour"]), "unknown option: --colour");
+        assert_eq!(error(&["--server"]), "--server needs a value");
+        assert_eq!(error(&["grpc://s:1"]), "unexpected argument: grpc://s:1");
+        assert!(error(&["--server", "s"]).contains("at least one --wasm"));
+        assert!(error(&["--wasm", "a.wasm"]).contains("host=component-locator"));
+        assert!(matches!(
+            parse(args(&["--server", "s", "--help"]), none),
+            Ok(Command::Help)
+        ));
+        assert!(matches!(parse(args(&["-V"]), none), Ok(Command::Version)));
     }
 
     #[test]

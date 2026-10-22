@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::RouteSource;
-use crate::pb::Upstream;
+use crate::proto::Upstream;
 use crate::wasm_host::{self, Binding, Handler, Instances, Loaded, Locator, Sandbox};
 
 /// One route as configured: a host served by a component in a sandbox.

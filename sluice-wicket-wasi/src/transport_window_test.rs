@@ -12,9 +12,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-use crate::pb::frame::Body;
-use crate::pb::{Data, Frame};
-use crate::{transport_window, tunnel, with_transport_window};
+use crate::proto::frame::Body;
+use crate::proto::{Data, Frame};
+use crate::session::{transport_window, with_transport_window};
+use crate::tunnel;
 
 const FRAME_PAYLOAD: usize = 16 * 1024;
 
@@ -189,7 +190,7 @@ async fn download(total: usize, window: u32) -> Vec<u64> {
     );
     let channel = endpoint.connect().await.unwrap();
     let outbound = futures_util::stream::pending::<Frame>();
-    let mut inbound = crate::pb::tunnel_client::TunnelClient::new(channel)
+    let mut inbound = crate::proto::tunnel_client::TunnelClient::new(channel)
         .connect(tonic::Request::new(outbound))
         .await
         .unwrap()

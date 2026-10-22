@@ -14,6 +14,7 @@ stale `~/.m2` snapshots and fails with misleading `NoSuchMethodError`s.
 - `sluice-client`: tunnel client. grpc:// / grpcs:// (TLS verification skip via `sluice.insecure`)
 - `sluice-it`: full stack E2E tests (real server + client apps in one JVM); E2E tests live here, not in the app modules
 - `sluice-flume` (Rust, own Cargo workspace): the live access log's collector; nodes feed it, consoles watch it (`flume.proto`). Gates: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
+- `sluice-wicket-wasi` (Rust, own Cargo workspace, laid out as sluice-flume): a tunnel client serving each route with a wasi:http component (wasmtime); its guest `examples/` are a separate workspace on a pinned nightly. Same gates
 - `sluice-build-info` (Rust, own Cargo workspace): build script dependency of sluice-flume and sluice-wicket-wasi embedding their build (git commit, dirty, build time; `SLUICE_GIT_COMMIT` where there is no work tree, as in the Docker builds). Same gates
 - `sluice-example-upstream`: minimal sample upstream (`It works`, http/1.1 + h2c) for manual checks
 

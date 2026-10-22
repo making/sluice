@@ -1,48 +1,8 @@
-//! sluice-wicket-wasi: a wasm platform on the sluice tunnel.
-//!
-//! Connectes to a sluice server with the same `sluice.v1.Tunnel` gRPC API as
-//! the Java client, but instead of relaying to TCP upstreams it terminates
-//! HTTP on the tunnel and handles every request with a wasi:http 0.3
-//! component (`wasi:http/handler@0.3.0`). One process, N routes.
-//!
-//! The supervisor (`supervise`) ports the Java client's fan-out semantics
-//! (`TunnelClient` / `NodeConnection`): the `--server` endpoint is only the
-//! bootstrap; the node list learned via `ListNodes` / `MembershipUpdate` keeps
-//! one tunnel stream per node, a dropped stream reconnects with jittered
-//! exponential backoff (ceiling 1s..30s, each wait drawn from its upper half), and the `AdvertiseAck` renames the session after its
-//! node. Exactly one stream per node is kept: the server closes the older
-//! registration when a client id re-registers.
-//!
-//! On SIGTERM / SIGINT the wicket drains ([`drain`], the Java client's
-//! `TunnelClient#drain`): every node stream withdraws the routes and ends
-//! once the server acknowledged it and no connection is left on it, within
-//! `--drain-grace`.
-//!
-//! The routes come from `--wasm` flags and / or a `--config` YAML file
-//! (`config`) and are reloaded without a restart (`routes::Reloader`): on a
-//! change of their files, or on SIGHUP. Every node stream advertises the
-//! reloaded routes again.
-//!
-//! Scope (deliberately minimal):
-//!
-//! - `grpc://` / `grpcs://` control plane (`--ca-cert` pins the CA,
-//!   `--insecure` skips verification); no mTLS yet
-//! - one pre-linked (`InstancePre`) instance per request, under a per-route
-//!   epoch CPU budget, memory cap and `wasmtime serve`-style WASI
-//!   capabilities, and a process-wide instance limit (`--max-instances`)
-//!   with optional per-route caps (`instances=N`);
-//!   response bodies stream via a bounded relay
-//!
-//! Usage:
-//!
-//! ```text
-//! sluice-wicket-wasi --server grpc://127.0.0.1:8001 --token SECRET \
-//!     --wasm demo.local=./hello.wasm \
-//!     --wasm relay.local='./relay.wasm?wasi=cli,inherit-network'
-//! sluice-wicket-wasi --config wicket-wasi.yaml
-//! ```
+//! One tunnel stream toward one node (`NodeConnection` of the Java client):
+//! connect, advertise the routes, serve the connections, reconnect with
+//! backoff.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,23 +10,13 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-mod pb {
-    include!(concat!(env!("OUT_DIR"), "/sluice.v1.rs"));
-}
-
-mod config;
-mod routes;
-mod tls;
-#[cfg(test)]
-mod transport_window_test;
-mod tunnel;
-mod wasm_host;
-
-use pb::frame::Body;
-use pb::{Advertise, Frame, PeerBuild, Upstream};
-use routes::{Reloader, Routes};
-use tunnel::{Connections, Outbound};
-use wasm_host::Instances;
+use crate::drain::Drain;
+use crate::proto::frame::Body;
+use crate::proto::{Advertise, Frame, Upstream};
+use crate::routes::{self, Routes};
+use crate::supervisor::Event;
+use crate::tunnel::{self, Connections, Outbound};
+use crate::{BoxError, UNKNOWN_BUILD, describe_peer, proto, tls};
 
 /// Reconnect backoff: the ceiling doubles from 1s to 30s and each wait is
 /// drawn from its upper half (equal jitter), as `ReconnectBackoff` of the Java
@@ -134,7 +84,7 @@ pub fn transport_window(max_connections: usize) -> u32 {
 /// stream, 5MiB per connection) the tunnel stream, shared by every virtual
 /// connection, would cap the whole tunnel at a fraction of one round trip's
 /// worth of the connections' windows.
-fn with_transport_window(
+pub fn with_transport_window(
     endpoint: tonic::transport::Endpoint,
     window: u32,
 ) -> tonic::transport::Endpoint {
@@ -144,61 +94,37 @@ fn with_transport_window(
         .http2_adaptive_window(false)
 }
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
 /// State shared by every node session.
-struct Shared {
-    token: String,
-    id: String,
-    insecure: bool,
-    ca_pem: Option<Vec<u8>>,
+pub struct Shared {
+    pub token: String,
+    pub id: String,
+    pub insecure: bool,
+    pub ca_pem: Option<Vec<u8>>,
     /// The routes every stream advertises and its connections are served
     /// by; replaced by a reload.
-    routes: Arc<Routes>,
+    pub routes: Arc<Routes>,
     /// Connections open at once, over every node session.
-    limit: Arc<tunnel::Limit>,
+    pub limit: Arc<tunnel::Limit>,
     /// How long connection frames may wait with none taken before a stream
     /// is given up; zero = never.
-    stall_timeout: Duration,
+    pub stall_timeout: Duration,
     /// HTTP/2 window (stream and connection) the gRPC connection announces,
     /// see [`transport_window`].
-    transport_window: u32,
+    pub transport_window: u32,
     /// The shutdown's drain, seen by every session.
-    drain: Drain,
+    pub drain: Drain,
     /// The session tasks, the detached ones included: the drain waits for
     /// them.
-    tasks: TaskTracker,
-}
-
-/// The shutdown's drain ([`drain`]).
-#[derive(Default)]
-struct Drain {
-    /// Cancelled once the drain began: every live stream withdraws the
-    /// routes, no stream is opened or reconnected.
-    begin: CancellationToken,
-    /// Cancelled once the drain is over (the grace ran out, a second signal):
-    /// every stream ends at once, failing its connections.
-    abort: CancellationToken,
+    pub tasks: TaskTracker,
 }
 
 /// One tunnel stream toward one node. The supervisor's `Arc` identity survives
 /// renames, so a session keeps its tasks across a rekey.
-struct Session {
+pub struct Session {
     /// Endpoint this session dials, as configured / advertised (`grpc(s)://host:port`).
-    url: String,
+    pub url: String,
     /// Cancelled by the supervisor to stop the reconnect loop.
-    token: CancellationToken,
-}
-
-/// Supervisor events, one channel shared by every session.
-enum Event {
-    /// The stream is up and the advertise was acked by `node_id`.
-    Connected {
-        session: Arc<Session>,
-        node_id: String,
-    },
-    /// A membership snapshot (pushed, or fetched via `ListNodes`).
-    Membership { nodes: Vec<pb::Node> },
+    pub token: CancellationToken,
 }
 
 /// A session task's fixed state across its reconnect attempts.
@@ -208,29 +134,6 @@ struct NodeTask {
     /// Map key this session started under; the supervisor renames it on ack.
     key: String,
     events: mpsc::Sender<Event>,
-}
-
-#[tokio::main]
-async fn main() {
-    let settings = match config::parse(std::env::args().skip(1)) {
-        Ok(config::Parsed::Run(settings)) => *settings,
-        Ok(config::Parsed::Version) => {
-            println!("{}", describe(&peer_build()));
-            std::process::exit(0);
-        }
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        }
-    };
-    match run(settings).await {
-        // drained: the tasks left (guest instances among them) are not waited for
-        Ok(()) => std::process::exit(0),
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    }
 }
 
 /// Splits the `--server` value into `(secure, authority)`; a bare host:port
@@ -254,312 +157,8 @@ fn identify<T>(request: &mut tonic::Request<T>, token: &str, id: &str) -> Result
     Ok(())
 }
 
-async fn run(settings: config::Settings) -> Result<(), BoxError> {
-    let config::Settings {
-        server,
-        token,
-        client_id,
-        insecure,
-        ca_cert,
-        max_connections,
-        max_instances,
-        stall_timeout,
-        drain_grace,
-        watch_interval,
-        routes,
-    } = settings;
-    println!("wicket build: {}", describe(&peer_build()));
-    let instances = Instances::new(max_instances);
-
-    // Fetches / prewarms every route's component (fail fast) and builds its
-    // handler on `instances`.
-    let reloader = Reloader::start(routes, instances.clone()).await?;
-    let ca_pem = match ca_cert {
-        Some(path) => {
-            Some(std::fs::read(&path).map_err(|e| format!("--ca-cert {}: {e}", path.display()))?)
-        }
-        None => None,
-    };
-    let shared = Arc::new(Shared {
-        token,
-        id: client_id,
-        insecure,
-        ca_pem,
-        routes: reloader.routes().clone(),
-        limit: tunnel::Limit::new(max_connections),
-        stall_timeout,
-        transport_window: transport_window(max_connections),
-        drain: Drain::default(),
-        tasks: TaskTracker::new(),
-    });
-    println!("connection limit {max_connections}");
-    println!(
-        "gRPC flow control window {} bytes",
-        transport_window(max_connections)
-    );
-    println!(
-        "tunnel stall timeout {}s (0 = off)",
-        stall_timeout.as_secs()
-    );
-    println!(
-        "instance limit {max_instances} ({} h2 streams per connection)",
-        instances.streams_per_connection()
-    );
-
-    println!("drain grace {}s (0 = off)", drain_grace.as_secs());
-    println!(
-        "routes: {} (generation {}); watching their files every {}ms (0 = off), SIGHUP reloads",
-        shared.routes.current().advertised.len(),
-        shared.routes.current().generation,
-        watch_interval.as_millis()
-    );
-
-    // the drain stops the reloads: the routes are withdrawn
-    let (hangups, hangups_received) = mpsc::channel(1);
-    forward_hangups(hangups)?;
-    tokio::spawn(reloader.run(watch_interval, hangups_received, shared.drain.begin.clone()));
-
-    let (tx, rx) = mpsc::channel::<Event>(32);
-    let supervisor = supervise(rx, tx, shared.clone(), server);
-    if drain_grace.is_zero() {
-        // no handler: a signal ends the process at once
-        return supervisor.await;
-    }
-    let mut signals = Signals::install()?;
-    tokio::select! {
-        result = supervisor => return result,
-        // dropping the supervisor: no membership change opens a stream from now on
-        name = signals.recv() => println!("{name}: draining"),
-    }
-    let interrupt = async {
-        let name = signals.recv().await;
-        eprintln!("{name} during the drain: ending it at once");
-    };
-    drain(&shared, drain_grace, interrupt).await;
-    Ok(())
-}
-
-/// Sends a message to `hangups` on every SIGHUP (which no longer ends the
-/// process); a reload is pending at most once.
-#[cfg(unix)]
-fn forward_hangups(hangups: mpsc::Sender<()>) -> std::io::Result<()> {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut hangup = signal(SignalKind::hangup())?;
-    tokio::spawn(async move {
-        while hangup.recv().await.is_some() {
-            let _ = hangups.try_send(());
-        }
-    });
-    Ok(())
-}
-
-/// No SIGHUP where there are no unix signals: the files are still polled.
-#[cfg(not(unix))]
-fn forward_hangups(_hangups: mpsc::Sender<()>) -> std::io::Result<()> {
-    Ok(())
-}
-
-/// SIGTERM and SIGINT. Once installed, neither ends the process by itself.
-#[cfg(unix)]
-struct Signals {
-    term: tokio::signal::unix::Signal,
-    int: tokio::signal::unix::Signal,
-}
-
-#[cfg(unix)]
-impl Signals {
-    fn install() -> std::io::Result<Signals> {
-        use tokio::signal::unix::{SignalKind, signal};
-        Ok(Signals {
-            term: signal(SignalKind::terminate())?,
-            int: signal(SignalKind::interrupt())?,
-        })
-    }
-
-    /// The next one received.
-    async fn recv(&mut self) -> &'static str {
-        tokio::select! {
-            _ = self.term.recv() => "SIGTERM",
-            _ = self.int.recv() => "SIGINT",
-        }
-    }
-}
-
-/// Ctrl-C where there are no unix signals.
-#[cfg(not(unix))]
-struct Signals;
-
-#[cfg(not(unix))]
-impl Signals {
-    fn install() -> std::io::Result<Signals> {
-        Ok(Signals)
-    }
-
-    async fn recv(&mut self) -> &'static str {
-        let _ = tokio::signal::ctrl_c().await;
-        "Ctrl-C"
-    }
-}
-
-/// How a drain ended.
-#[derive(Debug, PartialEq, Eq)]
-enum DrainEnd {
-    /// Every stream ended: drained, closed for a server predating the drain,
-    /// or failed.
-    Drained,
-    /// The grace ran out first.
-    GraceExpired,
-    /// `interrupt` came first.
-    Interrupted,
-}
-
-/// Drains the sessions (`TunnelClient#drain`): every live stream withdraws
-/// the routes and keeps serving its connections until the server
-/// acknowledged the withdrawal and none is left, then ends; a session not
-/// connected just stops. After `grace`, or once `interrupt` resolves, the
-/// streams left end at once, failing their connections. Returns once every
-/// session task ended (at most a few seconds after that).
-async fn drain(shared: &Shared, grace: Duration, interrupt: impl Future<Output = ()>) -> DrainEnd {
-    shared.drain.begin.cancel();
-    shared.tasks.close();
-    println!(
-        "draining: withdrawing the routes; waiting up to {}s for {} open connection(s)",
-        grace.as_secs(),
-        shared.limit.open()
-    );
-    let end = tokio::select! {
-        () = shared.tasks.wait() => DrainEnd::Drained,
-        () = tokio::time::sleep(grace) => DrainEnd::GraceExpired,
-        () = interrupt => DrainEnd::Interrupted,
-    };
-    let open = shared.limit.open();
-    match end {
-        DrainEnd::Drained => println!("drain ended with {open} open connection(s)"),
-        DrainEnd::GraceExpired => eprintln!(
-            "drain grace {}s expired; closing {open} open connection(s)",
-            grace.as_secs()
-        ),
-        DrainEnd::Interrupted => eprintln!("drain aborted; closing {open} open connection(s)"),
-    }
-    shared.drain.abort.cancel();
-    // the streams end on the abort without waiting on the server
-    if tokio::time::timeout(Duration::from_secs(5), shared.tasks.wait())
-        .await
-        .is_err()
-    {
-        eprintln!("drain: a session did not end within 5s of the abort");
-    }
-    end
-}
-
-/// The fan-out supervisor: one session per known node, keyed by node id (the
-/// bootstrap session keeps its endpoint as key until its first ack names the
-/// node). All membership transitions run on this single task.
-async fn supervise(
-    mut events: mpsc::Receiver<Event>,
-    spawn_events: mpsc::Sender<Event>,
-    shared: Arc<Shared>,
-    bootstrap: String,
-) -> Result<(), BoxError> {
-    let mut sessions: HashMap<String, Arc<Session>> = HashMap::new();
-    let session = spawn_session(
-        &shared,
-        bootstrap.clone(),
-        bootstrap.clone(),
-        spawn_events.clone(),
-    );
-    sessions.insert(bootstrap, session);
-    while let Some(event) = events.recv().await {
-        match event {
-            Event::Connected { session, node_id } => rekey(&mut sessions, session, node_id),
-            Event::Membership { nodes } => reconcile(&mut sessions, nodes, &shared, &spawn_events),
-        }
-    }
-    Ok(())
-}
-
-/// Renames `session` after the node id learned from its ack
-/// (`TunnelClient#rekey`). A different session already mapped to the node is a
-/// duplicate stream: the server keeps only the newest registration
-/// (`SessionRegistry#register` closes the old one), so it is cancelled here.
-fn rekey(sessions: &mut HashMap<String, Arc<Session>>, session: Arc<Session>, node_id: String) {
-    if node_id.is_empty() {
-        return;
-    }
-    let current = sessions
-        .iter()
-        .find(|(_, known)| Arc::ptr_eq(known, &session))
-        .map(|(key, _)| key.clone());
-    if current.as_deref() == Some(node_id.as_str()) {
-        return; // already known under this name
-    }
-    if let Some(known) = sessions.get(&node_id)
-        && !Arc::ptr_eq(known, &session)
-    {
-        println!("duplicate stream for node {node_id}; closing the older one");
-        known.token.cancel();
-    }
-    if let Some(key) = current {
-        sessions.remove(&key);
-    }
-    sessions.insert(node_id, session);
-}
-
-/// Adopts the membership (`TunnelClient#reconcile`): opens a stream per
-/// unseen node -- adopting the session already dialing that endpoint, a second
-/// stream to one node would make the server drop the first registration --
-/// and drops the map entries of nodes that left; their tasks keep retrying
-/// and re-enter via the ack rename.
-fn reconcile(
-    sessions: &mut HashMap<String, Arc<Session>>,
-    nodes: Vec<pb::Node>,
-    shared: &Arc<Shared>,
-    events: &mpsc::Sender<Event>,
-) {
-    if nodes.is_empty() {
-        return;
-    }
-    for node in &nodes {
-        if node.node_id.is_empty() || sessions.contains_key(&node.node_id) {
-            continue;
-        }
-        if node.public_url.is_empty() {
-            continue; // no reachable address; the bootstrap stream covers it once acked
-        }
-        let same_endpoint = sessions
-            .iter()
-            .find(|(_, session)| session.url == node.public_url)
-            .map(|(key, _)| key.clone());
-        match same_endpoint {
-            Some(key) => {
-                let session = sessions.remove(&key).expect("key found in the same map");
-                println!(
-                    "node {} is the endpoint of the {key} session; adopting it",
-                    node.node_id
-                );
-                rekey(sessions, session, node.node_id.clone());
-            }
-            None => {
-                println!(
-                    "opening tunnel stream to node {} at {}",
-                    node.node_id, node.public_url
-                );
-                let session = spawn_session(
-                    shared,
-                    node.node_id.clone(),
-                    node.public_url.clone(),
-                    events.clone(),
-                );
-                sessions.insert(node.node_id.clone(), session);
-            }
-        }
-    }
-    let live: HashSet<String> = nodes.into_iter().map(|node| node.node_id).collect();
-    sessions.retain(|key, _| live.contains(key));
-}
-
 /// Spawns the reconnect loop of one session; returns its handle.
-fn spawn_session(
+pub fn spawn_session(
     shared: &Arc<Shared>,
     key: String,
     url: String,
@@ -645,7 +244,7 @@ impl NodeTask {
         };
         let mut request = tonic::Request::new(frames);
         identify(&mut request, &self.shared.token, &self.shared.id)?;
-        let mut client = <pb::tunnel_client::TunnelClient<_>>::new(channel.clone());
+        let mut client = <proto::tunnel_client::TunnelClient<_>>::new(channel.clone());
         let inbound = tokio::select! {
             response = client.connect(request) => response?.into_inner(),
             // no frame of the server was taken: dropping the call cancels it
@@ -916,78 +515,10 @@ fn advertise(upstreams: Vec<Upstream>, withdraw: bool) -> Frame {
         body: Some(Body::Advertise(Advertise {
             upstreams,
             connection_window: tunnel::WINDOW,
-            build: Some(peer_build()),
+            build: Some(crate::build()),
             withdraw,
         })),
     }
-}
-
-/// How a server that sent no build (it predates the field) is described.
-const UNKNOWN_BUILD: &str = "unknown (older build)";
-
-/// Longest value kept from each string of a server's build, in chars.
-const MAX_FIELD_CHARS: usize = 64;
-
-/// This binary's build, embedded by `build.rs`; an empty commit means git
-/// was unavailable when it was built.
-fn peer_build() -> PeerBuild {
-    PeerBuild {
-        implementation: "sluice-wicket-wasi".into(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        commit: env!("SLUICE_BUILD_COMMIT").into(),
-        dirty: env!("SLUICE_BUILD_DIRTY") == "true",
-        build_time: env!("SLUICE_BUILD_TIME").into(),
-    }
-}
-
-/// One line naming a build, e.g. `sluice-wicket-wasi 0.0.1-SNAPSHOT
-/// (<commit>, dirty, built 2026-10-12T01:04:33Z)`; an empty field reads as
-/// unknown.
-fn describe(build: &PeerBuild) -> String {
-    let or = |value: &str, unknown: &str| {
-        if value.is_empty() {
-            unknown.to_string()
-        } else {
-            value.to_string()
-        }
-    };
-    let mut details = vec![or(&build.commit, "commit unknown")];
-    if build.dirty {
-        details.push("dirty".into());
-    }
-    if !build.build_time.is_empty() {
-        details.push(format!("built {}", build.build_time));
-    }
-    format!(
-        "{} {} ({})",
-        or(&build.implementation, "unknown implementation"),
-        or(&build.version, "version unknown"),
-        details.join(", ")
-    )
-}
-
-/// [`describe`] of a build another peer sent: control characters become `?`
-/// and each string keeps at most [`MAX_FIELD_CHARS`] chars, so it cannot
-/// forge or flood log lines.
-fn describe_peer(build: &PeerBuild) -> String {
-    let bound = |value: &str| -> String {
-        let mut bounded: String = value
-            .chars()
-            .take(MAX_FIELD_CHARS)
-            .map(|c| if c.is_control() { '?' } else { c })
-            .collect();
-        if value.chars().count() > MAX_FIELD_CHARS {
-            bounded.push_str("...");
-        }
-        bounded
-    };
-    describe(&PeerBuild {
-        implementation: bound(&build.implementation),
-        version: bound(&build.version),
-        commit: bound(&build.commit),
-        dirty: build.dirty,
-        build_time: bound(&build.build_time),
-    })
 }
 
 /// Unary `ListNodes` over an established stream's channel
@@ -995,11 +526,11 @@ fn describe_peer(build: &PeerBuild) -> String {
 async fn list_nodes(
     channel: &tonic::transport::Channel,
     shared: &Shared,
-) -> Result<Vec<pb::Node>, BoxError> {
-    let mut request = tonic::Request::new(pb::ListNodesRequest {});
+) -> Result<Vec<proto::Node>, BoxError> {
+    let mut request = tonic::Request::new(proto::ListNodesRequest {});
     identify(&mut request, &shared.token, &shared.id)?;
     request.set_timeout(Duration::from_secs(10));
-    let response = <pb::tunnel_client::TunnelClient<_>>::new(channel.clone())
+    let response = <proto::tunnel_client::TunnelClient<_>>::new(channel.clone())
         .list_nodes(request)
         .await?;
     Ok(response.into_inner().nodes)
@@ -1007,7 +538,13 @@ async fn list_nodes(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use super::testing::*;
     use super::*;
+    use crate::config;
+    use crate::routes::Reloader;
+    use crate::wasm_host::Instances;
 
     #[test]
     fn backoff_waits_in_the_upper_half_of_a_doubling_capped_ceiling() {
@@ -1061,17 +598,6 @@ mod tests {
         assert!(waits.len() > 10, "{} distinct of 20", waits.len());
     }
 
-    /// Frames of the server's stream, gRPC-framed (5-byte prefix + message).
-    fn grpc_frame(frame: &Frame) -> bytes::Bytes {
-        use prost::Message as _;
-        let message = frame.encode_to_vec();
-        let mut out = Vec::with_capacity(5 + message.len());
-        out.push(0);
-        out.extend_from_slice(&(message.len() as u32).to_be_bytes());
-        out.extend_from_slice(&message);
-        out.into()
-    }
-
     /// A tunnel server that stops reading: it reads the advertise, acks it,
     /// asks for one connection to `target` carrying an http/1.1 request for
     /// `/stream` (10MiB), and from then on never reads the request stream
@@ -1101,18 +627,18 @@ mod tests {
                     .unwrap();
                 let mut send = respond.send_response(response, false).unwrap();
                 let frames = [
-                    Body::AdvertiseAck(pb::AdvertiseAck {
+                    Body::AdvertiseAck(proto::AdvertiseAck {
                         node_id: "stalling".into(),
                         ..Default::default()
                     }),
-                    Body::Connect(pb::Connect {
+                    Body::Connect(proto::Connect {
                         conn_id: 1,
                         address: target.clone(),
                         // credit past the response: only the stream holds it back
                         connection_window: 64 << 20,
                         ..Default::default()
                     }),
-                    Body::Data(pb::Data {
+                    Body::Data(proto::Data {
                         conn_id: 1,
                         payload: b"GET /stream HTTP/1.1\r\nhost: stall.local\r\n\r\n".to_vec(),
                     }),
@@ -1168,347 +694,6 @@ mod tests {
             start.elapsed()
         );
         assert_eq!(limit.open(), 0, "the slot is freed");
-    }
-
-    /// The state of a wicket serving the hello guest for `hello.local`, its
-    /// connection limit and the route's target.
-    async fn hello_shared(stall_timeout: Duration) -> (Arc<Shared>, Arc<tunnel::Limit>, String) {
-        let hello = wasm_host::tests::guest_wasm("hello");
-        let source = config::RouteSource::flags(vec![routes::Spec {
-            host: "hello.local".into(),
-            component: wasm_host::Locator::parse(hello.to_str().unwrap()).unwrap(),
-            sandbox: wasm_host::Sandbox::default(),
-        }]);
-        let reloader = Reloader::start(source, Instances::new(4)).await.unwrap();
-        let (shared, limit) = shared_on(reloader.routes(), stall_timeout);
-        let target = shared.routes.current().advertised[0].target_url.clone();
-        (shared, limit, target)
-    }
-
-    /// The state of a wicket serving `routes`, and its connection limit.
-    fn shared_on(
-        routes: &Arc<Routes>,
-        stall_timeout: Duration,
-    ) -> (Arc<Shared>, Arc<tunnel::Limit>) {
-        let limit = tunnel::Limit::new(4);
-        let shared = Arc::new(Shared {
-            token: String::new(),
-            id: "test".into(),
-            insecure: false,
-            ca_pem: None,
-            routes: routes.clone(),
-            limit: limit.clone(),
-            stall_timeout,
-            transport_window: transport_window(4),
-            drain: Drain::default(),
-            tasks: TaskTracker::new(),
-        });
-        (shared, limit)
-    }
-
-    /// Hang guard of the drain tests' waits.
-    const HANG: Duration = Duration::from_secs(10);
-
-    /// One tunnel stream as the server sees it, over raw h2: the wicket's
-    /// frames in, the server's out.
-    struct ServerStream {
-        body: h2::RecvStream,
-        send: h2::SendStream<bytes::Bytes>,
-        buf: Vec<u8>,
-    }
-
-    impl ServerStream {
-        /// The wicket's next frame; `Ok(None)` once it ended its request
-        /// stream, an error once it reset it.
-        async fn recv(&mut self) -> Result<Option<Frame>, h2::Error> {
-            use prost::Message as _;
-            loop {
-                if self.buf.len() >= 5 {
-                    let len = u32::from_be_bytes(self.buf[1..5].try_into().unwrap()) as usize;
-                    if self.buf.len() >= 5 + len {
-                        let frame = Frame::decode(&self.buf[5..5 + len]).unwrap();
-                        self.buf.drain(..5 + len);
-                        return Ok(Some(frame));
-                    }
-                }
-                let Some(chunk) = self.body.data().await else {
-                    return Ok(None);
-                };
-                let chunk = chunk?;
-                let _ = self.body.flow_control().release_capacity(chunk.len());
-                self.buf.extend_from_slice(&chunk);
-            }
-        }
-
-        /// The next frame `pick` takes, skipping the others (window updates).
-        async fn next<T>(&mut self, mut pick: impl FnMut(Body) -> Option<T>) -> T {
-            loop {
-                let frame = tokio::time::timeout(HANG, self.recv())
-                    .await
-                    .expect("hang guard")
-                    .expect("the stream is open")
-                    .expect("the stream is open");
-                if let Some(picked) = frame.body.and_then(&mut pick) {
-                    return picked;
-                }
-            }
-        }
-
-        /// The wicket's next Advertise.
-        async fn advertise(&mut self) -> Advertise {
-            self.next(|body| match body {
-                Body::Advertise(advertise) => Some(advertise),
-                _ => None,
-            })
-            .await
-        }
-
-        /// Reads to the end of the wicket's request stream, ended or reset;
-        /// whether it was ended.
-        async fn ended(&mut self) -> bool {
-            loop {
-                match tokio::time::timeout(HANG, self.recv())
-                    .await
-                    .expect("hang guard")
-                {
-                    Ok(Some(_)) => {}
-                    Ok(None) => return true,
-                    Err(_) => return false,
-                }
-            }
-        }
-
-        fn send(&mut self, body: Body) {
-            self.send
-                .send_data(grpc_frame(&Frame { body: Some(body) }), false)
-                .unwrap();
-        }
-
-        fn ack(&mut self, withdrawn: bool) {
-            self.send(Body::AdvertiseAck(pb::AdvertiseAck {
-                node_id: "node".into(),
-                withdrawn,
-                ..Default::default()
-            }));
-        }
-
-        fn connect(&mut self, conn_id: i64, target: &str) {
-            self.send(Body::Connect(pb::Connect {
-                conn_id,
-                address: target.into(),
-                connection_window: tunnel::WINDOW,
-                ..Default::default()
-            }));
-        }
-
-        /// An http/1.1 request for `path` on `conn_id`; the status line of
-        /// its response, read to its end.
-        async fn exchange(&mut self, conn_id: i64, path: &str) -> String {
-            self.send(Body::Data(pb::Data {
-                conn_id,
-                payload: format!("GET {path} HTTP/1.1\r\nhost: hello.local\r\n\r\n").into_bytes(),
-            }));
-            let body = format!("path={path}\n");
-            let mut response = String::new();
-            while !(response.contains(&body) && response.ends_with("0\r\n\r\n")) {
-                let payload = self
-                    .next(|body| match body {
-                        Body::Data(data) if data.conn_id == conn_id => Some(data.payload),
-                        _ => None,
-                    })
-                    .await;
-                response.push_str(std::str::from_utf8(&payload).unwrap());
-            }
-            response.lines().next().unwrap_or_default().to_string()
-        }
-
-        /// Sends `bytes` on `conn_id`.
-        fn data(&mut self, conn_id: i64, bytes: &str) {
-            self.send(Body::Data(pb::Data {
-                conn_id,
-                payload: bytes.as_bytes().to_vec(),
-            }));
-        }
-
-        /// The chunked response on `conn_id`, read to its end.
-        async fn response(&mut self, conn_id: i64) -> String {
-            let mut response = String::new();
-            while !response.ends_with("\r\n0\r\n\r\n") {
-                let payload = self
-                    .next(|body| match body {
-                        Body::Data(data) if data.conn_id == conn_id => Some(data.payload),
-                        _ => None,
-                    })
-                    .await;
-                response.push_str(std::str::from_utf8(&payload).unwrap());
-            }
-            response
-        }
-
-        /// Ends the server's side with an OK status.
-        fn end(&mut self) {
-            let mut trailers = http::HeaderMap::new();
-            trailers.insert("grpc-status", "0".parse().unwrap());
-            self.send.send_trailers(trailers).unwrap();
-        }
-    }
-
-    /// A tunnel server handing each Connect stream to the test; ListNodes is
-    /// reset.
-    async fn tunnel_server() -> (String, mpsc::Receiver<ServerStream>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("grpc://{}", listener.local_addr().unwrap());
-        let (streams, received) = mpsc::channel(4);
-        tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut connection = h2::server::handshake(socket).await.unwrap();
-            // accept() drives the connection on
-            while let Some(Ok((request, mut respond))) = connection.accept().await {
-                if request.uri().path() != "/sluice.v1.Tunnel/Connect" {
-                    continue;
-                }
-                let response = http::Response::builder()
-                    .header("content-type", "application/grpc")
-                    .body(())
-                    .unwrap();
-                let send = respond.send_response(response, false).unwrap();
-                let stream = ServerStream {
-                    body: request.into_body(),
-                    send,
-                    buf: Vec::new(),
-                };
-                if streams.send(stream).await.is_err() {
-                    return;
-                }
-            }
-        });
-        (url, received)
-    }
-
-    /// A session of `shared` on a [`tunnel_server`], its stream as the server
-    /// sees it, and the session's event receiver (kept: the stream reports
-    /// to it).
-    async fn served_session(shared: &Arc<Shared>) -> (ServerStream, mpsc::Receiver<Event>) {
-        let (url, mut streams) = tunnel_server().await;
-        let (events, received) = mpsc::channel(32);
-        spawn_session(shared, url.clone(), url, events);
-        let stream = tokio::time::timeout(HANG, streams.recv())
-            .await
-            .expect("hang guard")
-            .expect("a stream");
-        (stream, received)
-    }
-
-    fn start_drain(shared: &Arc<Shared>, grace: Duration) -> tokio::task::JoinHandle<DrainEnd> {
-        let shared = shared.clone();
-        tokio::spawn(async move { drain(&shared, grace, std::future::pending()).await })
-    }
-
-    /// Waits until no connection holds a slot of `limit`, at most [`HANG`].
-    async fn all_closed(limit: &tunnel::Limit) -> bool {
-        let start = tokio::time::Instant::now();
-        while limit.open() != 0 && start.elapsed() < HANG {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        limit.open() == 0
-    }
-
-    /// Against a server supporting the drain: the routes are withdrawn on
-    /// the stream, the connection open keeps being served after the server
-    /// acknowledged the withdrawal, and the stream is ended once it closed;
-    /// the server's end of the stream ends the drain.
-    #[tokio::test]
-    async fn a_drain_ends_the_stream_after_the_withdrawn_ack_once_the_last_connection_closed() {
-        let (shared, limit, target) = hello_shared(Duration::ZERO).await;
-        let (mut stream, _events) = served_session(&shared).await;
-        assert!(!stream.advertise().await.withdraw);
-        stream.ack(false);
-        stream.connect(1, &target);
-        assert_eq!(stream.exchange(1, "/before").await, "HTTP/1.1 200 OK");
-
-        let drained = start_drain(&shared, HANG * 6);
-        let withdrawal = stream.advertise().await;
-        assert!(withdrawal.withdraw);
-        assert_eq!(
-            withdrawal.upstreams,
-            shared.routes.current().advertised,
-            "the routes repeated"
-        );
-        assert_eq!(withdrawal.connection_window, tunnel::WINDOW);
-        assert_eq!(limit.open(), 1, "precondition: the connection is open");
-        stream.ack(true);
-        assert_eq!(
-            stream.exchange(1, "/after").await,
-            "HTTP/1.1 200 OK",
-            "served after the withdrawn ack"
-        );
-        stream.send(Body::Close(pb::Close { conn_id: 1 }));
-        stream
-            .next(|body| matches!(body, Body::Close(close) if close.conn_id == 1).then_some(()))
-            .await;
-        assert!(
-            stream.ended().await,
-            "the request stream is ended, not reset"
-        );
-        stream.end();
-
-        let end = tokio::time::timeout(HANG * 7, drained)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(end, DrainEnd::Drained);
-        assert_eq!(limit.open(), 0);
-    }
-
-    /// A connection still open when the grace runs out is closed with its
-    /// stream.
-    #[tokio::test]
-    async fn the_drain_grace_closes_the_connections_still_open() {
-        let (shared, limit, target) = hello_shared(Duration::ZERO).await;
-        let (mut stream, _events) = served_session(&shared).await;
-        stream.advertise().await;
-        stream.ack(false);
-        stream.connect(1, &target);
-        assert_eq!(stream.exchange(1, "/before").await, "HTTP/1.1 200 OK");
-
-        let drained = start_drain(&shared, Duration::from_secs(1));
-        assert!(stream.advertise().await.withdraw);
-        stream.ack(true);
-        assert_eq!(limit.open(), 1, "precondition: the connection is open");
-
-        let end = tokio::time::timeout(HANG, drained).await.unwrap().unwrap();
-        assert_eq!(end, DrainEnd::GraceExpired);
-        assert!(!stream.ended().await, "the stream is reset");
-        assert!(all_closed(&limit).await, "the connection is closed");
-    }
-
-    /// Against a server predating the drain: its ack to the opening
-    /// advertise, arriving after the withdrawal was sent, ends nothing (the
-    /// acks are counted); its ack to the withdrawing advertise, without
-    /// `withdrawn`, ends the stream and with it the drain at once.
-    #[tokio::test]
-    async fn a_plain_ack_to_the_withdrawal_ends_the_stream_at_once() {
-        let (shared, limit, target) = hello_shared(Duration::ZERO).await;
-        let (mut stream, _events) = served_session(&shared).await;
-        assert!(!stream.advertise().await.withdraw);
-        // a connection served before any ack: the stream is up
-        stream.connect(1, &target);
-        assert_eq!(stream.exchange(1, "/before").await, "HTTP/1.1 200 OK");
-
-        let drained = start_drain(&shared, HANG * 6);
-        assert!(stream.advertise().await.withdraw);
-        stream.ack(false);
-        assert_eq!(
-            stream.exchange(1, "/between").await,
-            "HTTP/1.1 200 OK",
-            "the ack to the opening advertise ended nothing"
-        );
-        stream.ack(false);
-
-        let end = tokio::time::timeout(HANG, drained).await.unwrap().unwrap();
-        assert_eq!(end, DrainEnd::Drained);
-        assert!(!stream.ended().await, "the stream is reset");
-        assert!(all_closed(&limit).await, "the connection is closed");
     }
 
     /// A reload is advertised on the live stream. A component changed on
@@ -1665,48 +850,6 @@ mod tests {
     }
 
     #[test]
-    fn describe_names_every_known_part_and_reads_empty_as_unknown() {
-        let build = PeerBuild {
-            implementation: "sluice-server".into(),
-            version: "0.0.1-SNAPSHOT".into(),
-            commit: "7312472".into(),
-            dirty: true,
-            build_time: "2026-10-12T01:04:33Z".into(),
-        };
-        assert_eq!(
-            describe(&build),
-            "sluice-server 0.0.1-SNAPSHOT (7312472, dirty, built 2026-10-12T01:04:33Z)"
-        );
-        assert_eq!(
-            describe(&PeerBuild::default()),
-            "unknown implementation version unknown (commit unknown)"
-        );
-    }
-
-    #[test]
-    fn describe_peer_bounds_what_the_server_sent() {
-        let build = PeerBuild {
-            implementation: "sluice-server\nforged".into(),
-            version: "9".repeat(MAX_FIELD_CHARS + 1),
-            ..Default::default()
-        };
-        assert_eq!(
-            describe_peer(&build),
-            format!(
-                "sluice-server?forged {}... (commit unknown)",
-                "9".repeat(MAX_FIELD_CHARS)
-            )
-        );
-    }
-
-    fn session(url: &str) -> Arc<Session> {
-        Arc::new(Session {
-            url: url.into(),
-            token: CancellationToken::new(),
-        })
-    }
-
-    #[test]
     fn resolves_plain_grpc_https_and_bare_authority() {
         assert_eq!(
             resolve_server("grpc://127.0.0.1:8001"),
@@ -1718,50 +861,256 @@ mod tests {
         );
         assert_eq!(resolve_server("127.0.0.1:8001"), (false, "127.0.0.1:8001"));
     }
+}
 
-    #[test]
-    fn rekey_renames_the_session_and_cancels_the_duplicate() {
-        let mut sessions: HashMap<String, Arc<Session>> = HashMap::new();
-        let bootstrap = session("grpc://127.0.0.1:8101");
-        let other = session("grpcs://10.0.0.1:8201");
-        sessions.insert("grpc://127.0.0.1:8101".into(), bootstrap.clone());
-        sessions.insert("node-2".into(), other.clone());
+/// Test doubles of the server's side of a tunnel stream, and wickets serving
+/// the hello guest.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    use crate::config;
+    use crate::routes::Reloader;
+    use crate::wasm_host::{self, Instances};
 
-        // the bootstrap ack names its node: the endpoint key becomes the node id
-        rekey(&mut sessions, bootstrap.clone(), "node-1".into());
-        assert_eq!(sessions.len(), 2);
-        assert!(Arc::ptr_eq(sessions.get("node-1").unwrap(), &bootstrap));
-        assert!(sessions.contains_key("node-2"));
-        assert!(!sessions.contains_key("grpc://127.0.0.1:8101"));
-
-        // a second session acking as node-1 is a duplicate stream: it takes
-        // over and the previous one is cancelled
-        let duplicate = session("node-1-alt.example.com:8101");
-        rekey(&mut sessions, duplicate.clone(), "node-1".into());
-        assert!(Arc::ptr_eq(sessions.get("node-1").unwrap(), &duplicate));
-        assert!(bootstrap.token.is_cancelled());
-        assert!(!duplicate.token.is_cancelled());
+    /// Frames of the server's stream, gRPC-framed (5-byte prefix + message).
+    pub fn grpc_frame(frame: &Frame) -> bytes::Bytes {
+        use prost::Message as _;
+        let message = frame.encode_to_vec();
+        let mut out = Vec::with_capacity(5 + message.len());
+        out.push(0);
+        out.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        out.extend_from_slice(&message);
+        out.into()
     }
 
-    #[test]
-    fn rekey_registers_the_node_even_without_a_map_entry() {
-        // a prune may have dropped the entry before the ack arrived; the ack
-        // re-inserts the session (TunnelClient#rekey puts unconditionally)
-        let mut sessions: HashMap<String, Arc<Session>> = HashMap::new();
-        let session = session("grpc://127.0.0.1:8101");
-        rekey(&mut sessions, session.clone(), "node-1".into());
-        assert!(Arc::ptr_eq(sessions.get("node-1").unwrap(), &session));
-        assert!(!session.token.is_cancelled());
+    /// The state of a wicket serving the hello guest for `hello.local`, its
+    /// connection limit and the route's target.
+    pub async fn hello_shared(
+        stall_timeout: Duration,
+    ) -> (Arc<Shared>, Arc<tunnel::Limit>, String) {
+        let hello = wasm_host::tests::guest_wasm("hello");
+        let source = config::RouteSource::flags(vec![routes::Spec {
+            host: "hello.local".into(),
+            component: wasm_host::Locator::parse(hello.to_str().unwrap()).unwrap(),
+            sandbox: wasm_host::Sandbox::default(),
+        }]);
+        let reloader = Reloader::start(source, Instances::new(4)).await.unwrap();
+        let (shared, limit) = shared_on(reloader.routes(), stall_timeout);
+        let target = shared.routes.current().advertised[0].target_url.clone();
+        (shared, limit, target)
     }
 
-    #[test]
-    fn rekey_ignores_empty_and_known_node_ids() {
-        let mut sessions: HashMap<String, Arc<Session>> = HashMap::new();
-        let session = session("grpc://127.0.0.1:8101");
-        sessions.insert("node-1".into(), session.clone());
-        rekey(&mut sessions, session.clone(), String::new());
-        rekey(&mut sessions, session.clone(), "node-1".into());
-        assert!(Arc::ptr_eq(sessions.get("node-1").unwrap(), &session));
-        assert!(!session.token.is_cancelled());
+    /// The state of a wicket serving `routes`, and its connection limit.
+    pub fn shared_on(
+        routes: &Arc<Routes>,
+        stall_timeout: Duration,
+    ) -> (Arc<Shared>, Arc<tunnel::Limit>) {
+        let limit = tunnel::Limit::new(4);
+        let shared = Arc::new(Shared {
+            token: String::new(),
+            id: "test".into(),
+            insecure: false,
+            ca_pem: None,
+            routes: routes.clone(),
+            limit: limit.clone(),
+            stall_timeout,
+            transport_window: transport_window(4),
+            drain: Drain::default(),
+            tasks: TaskTracker::new(),
+        });
+        (shared, limit)
+    }
+
+    /// Hang guard of the drain tests' waits.
+    pub const HANG: Duration = Duration::from_secs(10);
+
+    /// One tunnel stream as the server sees it, over raw h2: the wicket's
+    /// frames in, the server's out.
+    pub struct ServerStream {
+        body: h2::RecvStream,
+        send: h2::SendStream<bytes::Bytes>,
+        buf: Vec<u8>,
+    }
+
+    impl ServerStream {
+        /// The wicket's next frame; `Ok(None)` once it ended its request
+        /// stream, an error once it reset it.
+        pub async fn recv(&mut self) -> Result<Option<Frame>, h2::Error> {
+            use prost::Message as _;
+            loop {
+                if self.buf.len() >= 5 {
+                    let len = u32::from_be_bytes(self.buf[1..5].try_into().unwrap()) as usize;
+                    if self.buf.len() >= 5 + len {
+                        let frame = Frame::decode(&self.buf[5..5 + len]).unwrap();
+                        self.buf.drain(..5 + len);
+                        return Ok(Some(frame));
+                    }
+                }
+                let Some(chunk) = self.body.data().await else {
+                    return Ok(None);
+                };
+                let chunk = chunk?;
+                let _ = self.body.flow_control().release_capacity(chunk.len());
+                self.buf.extend_from_slice(&chunk);
+            }
+        }
+
+        /// The next frame `pick` takes, skipping the others (window updates).
+        pub async fn next<T>(&mut self, mut pick: impl FnMut(Body) -> Option<T>) -> T {
+            loop {
+                let frame = tokio::time::timeout(HANG, self.recv())
+                    .await
+                    .expect("hang guard")
+                    .expect("the stream is open")
+                    .expect("the stream is open");
+                if let Some(picked) = frame.body.and_then(&mut pick) {
+                    return picked;
+                }
+            }
+        }
+
+        /// The wicket's next Advertise.
+        pub async fn advertise(&mut self) -> Advertise {
+            self.next(|body| match body {
+                Body::Advertise(advertise) => Some(advertise),
+                _ => None,
+            })
+            .await
+        }
+
+        /// Reads to the end of the wicket's request stream, ended or reset;
+        /// whether it was ended.
+        pub async fn ended(&mut self) -> bool {
+            loop {
+                match tokio::time::timeout(HANG, self.recv())
+                    .await
+                    .expect("hang guard")
+                {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return true,
+                    Err(_) => return false,
+                }
+            }
+        }
+
+        pub fn send(&mut self, body: Body) {
+            self.send
+                .send_data(grpc_frame(&Frame { body: Some(body) }), false)
+                .unwrap();
+        }
+
+        pub fn ack(&mut self, withdrawn: bool) {
+            self.send(Body::AdvertiseAck(proto::AdvertiseAck {
+                node_id: "node".into(),
+                withdrawn,
+                ..Default::default()
+            }));
+        }
+
+        pub fn connect(&mut self, conn_id: i64, target: &str) {
+            self.send(Body::Connect(proto::Connect {
+                conn_id,
+                address: target.into(),
+                connection_window: tunnel::WINDOW,
+                ..Default::default()
+            }));
+        }
+
+        /// An http/1.1 request for `path` on `conn_id`; the status line of
+        /// its response, read to its end.
+        pub async fn exchange(&mut self, conn_id: i64, path: &str) -> String {
+            self.send(Body::Data(proto::Data {
+                conn_id,
+                payload: format!("GET {path} HTTP/1.1\r\nhost: hello.local\r\n\r\n").into_bytes(),
+            }));
+            let body = format!("path={path}\n");
+            let mut response = String::new();
+            while !(response.contains(&body) && response.ends_with("0\r\n\r\n")) {
+                let payload = self
+                    .next(|body| match body {
+                        Body::Data(data) if data.conn_id == conn_id => Some(data.payload),
+                        _ => None,
+                    })
+                    .await;
+                response.push_str(std::str::from_utf8(&payload).unwrap());
+            }
+            response.lines().next().unwrap_or_default().to_string()
+        }
+
+        /// Sends `bytes` on `conn_id`.
+        pub fn data(&mut self, conn_id: i64, bytes: &str) {
+            self.send(Body::Data(proto::Data {
+                conn_id,
+                payload: bytes.as_bytes().to_vec(),
+            }));
+        }
+
+        /// The chunked response on `conn_id`, read to its end.
+        pub async fn response(&mut self, conn_id: i64) -> String {
+            let mut response = String::new();
+            while !response.ends_with("\r\n0\r\n\r\n") {
+                let payload = self
+                    .next(|body| match body {
+                        Body::Data(data) if data.conn_id == conn_id => Some(data.payload),
+                        _ => None,
+                    })
+                    .await;
+                response.push_str(std::str::from_utf8(&payload).unwrap());
+            }
+            response
+        }
+
+        /// Ends the server's side with an OK status.
+        pub fn end(&mut self) {
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("grpc-status", "0".parse().unwrap());
+            self.send.send_trailers(trailers).unwrap();
+        }
+    }
+
+    /// A tunnel server handing each Connect stream to the test; ListNodes is
+    /// reset.
+    pub async fn tunnel_server() -> (String, mpsc::Receiver<ServerStream>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("grpc://{}", listener.local_addr().unwrap());
+        let (streams, received) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            // accept() drives the connection on
+            while let Some(Ok((request, mut respond))) = connection.accept().await {
+                if request.uri().path() != "/sluice.v1.Tunnel/Connect" {
+                    continue;
+                }
+                let response = http::Response::builder()
+                    .header("content-type", "application/grpc")
+                    .body(())
+                    .unwrap();
+                let send = respond.send_response(response, false).unwrap();
+                let stream = ServerStream {
+                    body: request.into_body(),
+                    send,
+                    buf: Vec::new(),
+                };
+                if streams.send(stream).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (url, received)
+    }
+
+    /// A session of `shared` on a [`tunnel_server`], its stream as the server
+    /// sees it, and the session's event receiver (kept: the stream reports
+    /// to it).
+    pub async fn served_session(shared: &Arc<Shared>) -> (ServerStream, mpsc::Receiver<Event>) {
+        let (url, mut streams) = tunnel_server().await;
+        let (events, received) = mpsc::channel(32);
+        spawn_session(shared, url.clone(), url, events);
+        let stream = tokio::time::timeout(HANG, streams.recv())
+            .await
+            .expect("hang guard")
+            .expect("a stream");
+        (stream, received)
     }
 }
