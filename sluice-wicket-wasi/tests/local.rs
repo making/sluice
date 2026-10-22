@@ -1,9 +1,13 @@
 //! Local mode: `--listen` alone (no sluice server) serves the routes over
 //! plain TCP, routed by the request's host, at most `--max-connections` at
 //! once; a keyvalue route keeps its count in the sqlite file, across a
-//! restart and shared by two wickets on the file. Nothing drains: SIGTERM
-//! ends the process at once.
+//! restart and shared by two wickets on the file, or in a redis store two
+//! wickets share as wickets on two hosts would. Nothing drains: SIGTERM ends
+//! the process at once.
 #![cfg(unix)]
+
+#[path = "support/redis_server.rs"]
+mod redis_server;
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::ExitStatusExt;
@@ -130,6 +134,19 @@ async fn get_h2(address: &str, host: &str, path: &str) -> String {
     String::from_utf8(text).unwrap()
 }
 
+/// Two wickets counting on a.local at once, 20 increments and 20 cas.
+async fn count_at_once(a: &str, b: &str) {
+    let mut counting = tokio::task::JoinSet::new();
+    for n in 0..40 {
+        let address = if n % 2 == 0 { a } else { b }.to_string();
+        let path = if n % 4 < 2 { "/" } else { "/cas" };
+        counting.spawn(async move { get(&address, "a.local", path).await.0 });
+    }
+    while let Some(status) = counting.join_next().await {
+        assert_eq!(status.unwrap(), 200);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn local_mode_routes_by_host_and_keeps_the_keyvalue_file() {
     let guests = guests();
@@ -188,16 +205,7 @@ async fn local_mode_routes_by_host_and_keeps_the_keyvalue_file() {
         "the sole route, sharing a.local's namespace"
     );
 
-    // two wickets counting at once, by increment and by cas
-    let mut counting = tokio::task::JoinSet::new();
-    for n in 0..40 {
-        let address = if n % 2 == 0 { &address } else { &other }.clone();
-        let path = if n % 4 < 2 { "/" } else { "/cas" };
-        counting.spawn(async move { get(&address, "a.local", path).await.0 });
-    }
-    while let Some(status) = counting.join_next().await {
-        assert_eq!(status.unwrap(), 200);
-    }
+    count_at_once(&address, &other).await;
     assert_eq!(get(&address, "a.local", "/").await.1, "hits 24\n");
     assert_eq!(get(&other, "a.local", "/kv/cas-hits").await.1, "20");
 
@@ -239,5 +247,54 @@ async fn local_mode_routes_by_host_and_keeps_the_keyvalue_file() {
     };
     assert_eq!(exited.signal(), Some(15), "no drain: {exited:?}");
     drop(wicket);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two wickets sharing a redis store (over TLS, the server's certificate
+/// issued by the store's ca-cert) count right at once, by increment and by
+/// cas.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_wickets_count_on_a_shared_redis_store() {
+    let guests = guests();
+    let dir = std::env::temp_dir().join(format!("sluice-redis-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    std::fs::write(dir.join("ca.pem"), ca.self_signed(&ca_key).unwrap().pem()).unwrap();
+    let issuer = rcgen::Issuer::new(ca, ca_key);
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+        .unwrap()
+        .signed_by(&key, &issuer)
+        .unwrap();
+    let (cert_file, key_file) = (dir.join("redis.pem"), dir.join("redis.key"));
+    std::fs::write(&cert_file, cert.pem()).unwrap();
+    std::fs::write(&key_file, key.serialize_pem()).unwrap();
+    let server = redis_server::RedisServer::tls(&cert_file, &key_file);
+    let config = dir.join("wicket.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "keyvalue:
+  stores:
+    shared: {{type: redis, url: '{}/0', ca-cert: ca.pem, prefix: 'counter:'}}
+routes:
+  - host: a.local
+    component: {}
+    sandbox: {{wasi: [keyvalue]}}
+",
+            server.url,
+            guests.join("counter.wasm").display()
+        ),
+    )
+    .unwrap();
+    let args = ["--config", config.to_str().unwrap()];
+    let wickets = [Wicket::start(&args), Wicket::start(&args)];
+    let (a, b) = (wickets[0].address(), wickets[1].address());
+
+    count_at_once(&a, &b).await;
+    assert_eq!(get(&b, "a.local", "/").await.1, "hits 21\n");
+    assert_eq!(get(&a, "a.local", "/kv/cas-hits").await.1, "20");
     let _ = std::fs::remove_dir_all(&dir);
 }

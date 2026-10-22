@@ -45,12 +45,22 @@ serde-saphyr = { version = "2", default-features = false, features = ["deseriali
 sha2 = "0.10"
 # the sqlite keyvalue store; bundled: no system libsqlite3 (the build compiles C for ring already)
 rusqlite = { version = "0.40", features = ["bundled"] }
+# the redis keyvalue store: a multiplexed connection, reconnected; rediss:// on the ring
+# rustls (the webPKI roots, or the store's ca-cert)
+redis = { version = "1.7", optional = true, default-features = false, features = ["tokio-comp", "connection-manager", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+
+[features]
+default = ["redis"]
+# the redis keyvalue store
+redis = ["dep:redis"]
 
 [dev-dependencies]
 # paused time for the stall watchdog tests
 tokio = { version = "1", features = ["test-util"] }
 # an h2 client for the per-connection stream limit; the version hyper uses
 h2 = "0.4"
+# the CA and certificate of the redis-server the rediss:// test runs
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

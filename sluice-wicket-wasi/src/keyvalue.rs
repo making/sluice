@@ -14,11 +14,15 @@
 //! (other tasks of the same guest included) while the host awaits the store,
 //! not the other requests.
 
+#[cfg(feature = "redis")]
+mod redis;
 mod sqlite;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "redis")]
+use std::time::Duration;
 
 use wasmtime::component::{HasData, Linker, Resource, ResourceTable};
 
@@ -54,6 +58,9 @@ const DEFAULT_MAX_VALUE_BYTES: usize = 1 << 20;
 
 /// Default of a `sqlite` store's `max-namespace-bytes`.
 pub const DEFAULT_MAX_NAMESPACE_BYTES: u64 = 64 << 20;
+
+#[cfg(feature = "redis")]
+pub use self::redis::{DEFAULT_TIMEOUT as DEFAULT_REDIS_TIMEOUT, check as check_redis_url};
 
 // ---------------------------------------------------------------------------
 // Backends
@@ -163,13 +170,21 @@ fn add(key: &str, current: Option<&[u8]>, delta: i64) -> Outcome<i64> {
         Some(value) => std::str::from_utf8(value)
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
-            .ok_or_else(|| {
-                Failure::Rejected(format!("the value of '{key}' is not a decimal i64"))
-            })?,
+            .ok_or_else(|| Failure::Rejected(not_integer(key)))?,
     };
     current
         .checked_add(delta)
-        .ok_or_else(|| Failure::Rejected(format!("incrementing '{key}' overflows an i64")))
+        .ok_or_else(|| Failure::Rejected(overflows(key)))
+}
+
+/// Why `key` does not increment: it holds no integer.
+fn not_integer(key: &str) -> String {
+    format!("the value of '{key}' is not a decimal i64")
+}
+
+/// Why `key` does not increment: the sum is past an i64.
+fn overflows(key: &str) -> String {
+    format!("incrementing '{key}' overflows an i64")
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +204,16 @@ pub enum Kind {
     Sqlite {
         path: PathBuf,
         max_namespace_bytes: u64,
+    },
+    /// The keys after `prefix` on the Redis server at `url` (a `rediss://`
+    /// one's certificate issued by `ca_cert`, else by a webPKI root), each
+    /// call bounded by `timeout`.
+    #[cfg(feature = "redis")]
+    Redis {
+        url: String,
+        ca_cert: Option<PathBuf>,
+        prefix: String,
+        timeout: Duration,
     },
 }
 
@@ -333,6 +358,28 @@ impl Stores {
                     .map_err(|e| format!("keyvalue store '{name}': {e}"))?;
                 println!("keyvalue store '{name}': sqlite {}", path.display());
                 Arc::new(sqlite)
+            }
+            #[cfg(feature = "redis")]
+            Kind::Redis {
+                url,
+                ca_cert,
+                prefix,
+                timeout,
+            } => {
+                let failed = |e: String| format!("keyvalue store '{name}': {e}");
+                let ca_pem = match ca_cert {
+                    Some(path) => Some(
+                        std::fs::read(path)
+                            .map_err(|e| failed(format!("ca-cert {}: {e}", path.display())))?,
+                    ),
+                    None => None,
+                };
+                let redis = redis::Redis::open(url, ca_pem, prefix, *timeout).map_err(failed)?;
+                println!(
+                    "keyvalue store '{name}': redis {} (prefix '{prefix}')",
+                    redis.address()
+                );
+                Arc::new(redis)
             }
         };
         opened.insert(name.to_string(), backend.clone());

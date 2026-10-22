@@ -676,24 +676,74 @@ struct StoreFile {
     max_value_bytes: Option<Scalar>,
     /// A `sqlite` store's bound on each namespace.
     max_namespace_bytes: Option<Scalar>,
+    /// The server of a `redis` store.
+    url: Option<String>,
+    /// The CA of a `rediss://` server's certificate, relative to the config
+    /// file.
+    ca_cert: Option<PathBuf>,
+    /// What a `redis` store's keys begin with.
+    prefix: Option<String>,
+    /// A `redis` store's bound on each call.
+    timeout: Option<Scalar>,
 }
 
 impl StoreFile {
     /// The store's config; errors name the key below the store.
     fn config(&self, dir: &Path) -> Result<StoreConfig, String> {
+        let foreign = |keys: &[(&str, bool)]| match keys.iter().find(|(_, set)| *set) {
+            Some((key, _)) => Err(format!("{key}: not a key of a {} store", self.kind)),
+            None => Ok(()),
+        };
         let kind = match self.kind.as_str() {
-            "sqlite" => keyvalue::Kind::Sqlite {
-                path: dir.join(
-                    self.path
-                        .as_ref()
-                        .ok_or("path: required by a sqlite store")?,
-                ),
-                max_namespace_bytes: match &self.max_namespace_bytes {
-                    Some(max) => max.bytes("max-namespace-bytes")? as u64,
-                    None => keyvalue::DEFAULT_MAX_NAMESPACE_BYTES,
-                },
-            },
-            other => return Err(format!("type: unknown store type '{other}' (sqlite)")),
+            "sqlite" => {
+                foreign(&[
+                    ("url", self.url.is_some()),
+                    ("ca-cert", self.ca_cert.is_some()),
+                    ("prefix", self.prefix.is_some()),
+                    ("timeout", self.timeout.is_some()),
+                ])?;
+                keyvalue::Kind::Sqlite {
+                    path: dir.join(
+                        self.path
+                            .as_ref()
+                            .ok_or("path: required by a sqlite store")?,
+                    ),
+                    max_namespace_bytes: match &self.max_namespace_bytes {
+                        Some(max) => max.bytes("max-namespace-bytes")? as u64,
+                        None => keyvalue::DEFAULT_MAX_NAMESPACE_BYTES,
+                    },
+                }
+            }
+            #[cfg(feature = "redis")]
+            "redis" => {
+                foreign(&[
+                    ("path", self.path.is_some()),
+                    ("max-namespace-bytes", self.max_namespace_bytes.is_some()),
+                ])?;
+                let url = self.url.as_ref().ok_or("url: required by a redis store")?;
+                let tls = keyvalue::check_redis_url(url).map_err(|e| format!("url: {e}"))?;
+                if self.ca_cert.is_some() && !tls {
+                    return Err("ca-cert: needs a rediss:// url".into());
+                }
+                keyvalue::Kind::Redis {
+                    url: url.clone(),
+                    ca_cert: self.ca_cert.as_ref().map(|path| dir.join(path)),
+                    prefix: self.prefix.clone().unwrap_or_default(),
+                    timeout: match &self.timeout {
+                        Some(timeout) => timeout.duration("timeout", false)?,
+                        None => keyvalue::DEFAULT_REDIS_TIMEOUT,
+                    },
+                }
+            }
+            #[cfg(not(feature = "redis"))]
+            "redis" => {
+                return Err("type: a build without the redis store (cargo feature redis)".into());
+            }
+            other => {
+                return Err(format!(
+                    "type: unknown store type '{other}' (sqlite, redis)"
+                ));
+            }
         };
         let mut limits = StoreLimits::default();
         if let Some(max) = &self.max_key_bytes {
@@ -911,6 +961,13 @@ keyvalue:
     shared:
       type: sqlite
       path: /var/shared.db
+    cache:
+      type: redis
+      url: rediss://:${{SLUICE_WICKET_TEST_UNSET:-secret}}@cache.example:6380/2
+      ca-cert: cache-ca.pem
+      prefix: 'wicket:'
+      timeout: 2s
+      max-value-bytes: 64Ki
 routes:
   - host: a.local
     component: a.wasm
@@ -992,6 +1049,21 @@ routes:
                 },
             }),
             "the defaults"
+        );
+        assert_eq!(
+            stores.config("cache"),
+            Some(&StoreConfig {
+                kind: keyvalue::Kind::Redis {
+                    url: "rediss://:secret@cache.example:6380/2".into(),
+                    ca_cert: Some(dir.0.join("cache-ca.pem")),
+                    prefix: "wicket:".into(),
+                    timeout: Duration::from_secs(2),
+                },
+                limits: StoreLimits {
+                    max_key_bytes: 1 << 10,
+                    max_value_bytes: 64 << 10,
+                },
+            })
         );
 
         let env = |name: &str| match name {
@@ -1115,12 +1187,40 @@ routes:
             (route("instances: 0"), "sandbox.instances: must be at least 1"),
             (route("pool: 2, instances: 1"), "instances=1 is below pool=2"),
             (
-                "server: s\nkeyvalue: {stores: {local: {type: redis, path: x}}}\n".into(),
-                "keyvalue.stores.local.type: unknown store type 'redis' (sqlite)",
+                "server: s\nkeyvalue: {stores: {local: {type: mem}}}\n".into(),
+                "keyvalue.stores.local.type: unknown store type 'mem' (sqlite, redis)",
             ),
             (
                 "server: s\nkeyvalue: {stores: {local: {type: sqlite}}}\n".into(),
                 "keyvalue.stores.local.path: required by a sqlite store",
+            ),
+            (
+                "server: s\nkeyvalue: {stores: {local: {type: sqlite, path: x, prefix: p}}}\n"
+                    .into(),
+                "keyvalue.stores.local.prefix: not a key of a sqlite store",
+            ),
+            (
+                "server: s\nkeyvalue: {stores: {local: {type: redis, url: 'redis://r', path: x}}}\n"
+                    .into(),
+                "keyvalue.stores.local.path: not a key of a redis store",
+            ),
+            (
+                "server: s\nkeyvalue: {stores: {local: {type: redis}}}\n".into(),
+                "keyvalue.stores.local.url: required by a redis store",
+            ),
+            (
+                "server: s\nkeyvalue: {stores: {local: {type: redis, url: 'http://r'}}}\n".into(),
+                "keyvalue.stores.local.url: ",
+            ),
+            (
+                "server: s\nkeyvalue: {stores: {local: {type: redis, url: 'redis://r', ca-cert: c}}}\n"
+                    .into(),
+                "keyvalue.stores.local.ca-cert: needs a rediss:// url",
+            ),
+            (
+                "server: s\nkeyvalue: {stores: {local: {type: redis, url: 'redis://r', timeout: 0s}}}\n"
+                    .into(),
+                "keyvalue.stores.local.timeout: must be positive",
             ),
             (
                 "server: s\nkeyvalue: {stores: {local: {type: sqlite, path: x, max-key-bytes: 0}}}\n"

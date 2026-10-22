@@ -43,7 +43,9 @@ target/debug/sluice-wicket-wasi --config wicket-wasi.yaml
 ```
 
 `cargo test` builds the examples the same way (through the
-rustup `cargo` proxy, so rustup must be installed).
+rustup `cargo` proxy, so rustup must be installed), and runs `redis-server` (with TLS, as
+Homebrew's and Debian's are) for the redis store. `--no-default-features` builds without
+the redis store.
 
 ### Local mode
 
@@ -194,9 +196,15 @@ keyvalue:                       # optional: one sqlite store, keyvalue.db next t
     local:
       type: sqlite
       path: keyvalue.db         # relative to this file
-      # max-key-bytes: 1Ki      # the defaults
+      # max-key-bytes: 1Ki      # the defaults (every store)
       # max-value-bytes: 1Mi
       # max-namespace-bytes: 64Mi
+    shared:
+      type: redis
+      url: rediss://:${REDIS_PASSWORD}@redis.example:6380/0   # redis://, rediss://, redis+unix://
+      # ca-cert: redis-ca.pem   # the CA of a rediss:// certificate; default: the webPKI roots
+      # prefix: ""              # the defaults
+      # timeout: 5s
 
 routes:
   - host: demo.local
@@ -215,7 +223,7 @@ routes:
       wasi: [keyvalue]
       keyvalue:                 # optional: identifier -> store[/namespace]
         "": local               # the namespace defaults to the host
-        sessions: local/shared-sessions
+        sessions: shared/sessions
 ```
 
 - durations take `ms`, `s`, `m` or `h` (`tunnel-stall-timeout`, `drain-grace` and
@@ -323,10 +331,21 @@ route creates no file. A map naming an unknown store fails the startup or the re
   the `sqlite3` CLI (`sqlite3 keyvalue.db "SELECT namespace, key, CAST(value AS TEXT) FROM
   kv"`). WAL with `synchronous=NORMAL`: a power loss may drop the last commits, never
   corrupts the file. Several wickets on one host may share the file (they wait up to 5s
-  for each other's lock); sharing across hosts is a networked store's job. `list-keys`
+  for each other's lock); sharing across hosts is the `redis` store's job. `list-keys`
   pages hold up to 100 keys in key order, the cursor the last key of a page. A namespace
   holds at most `max-namespace-bytes` (default 64Mi) of keys and values, so a guest cannot
   fill the disk: a write past it fails and changes nothing
+- `redis`: the keys of a Redis or Valkey server (6 or later: the connection speaks RESP3),
+  shared by the wickets on every host reaching it. A key is `<prefix><namespace>:<key>`,
+  a `:` or `\` in the namespace escaped by `\` so no namespace reaches another's keys
+  (`redis-cli --scan --pattern 'counter.local:*'`). `increment` is `INCRBY`, a `swap` a
+  script, the batches `MGET` / `MSET` / `DEL`: each atomic. `list-keys` is one `SCAN` a
+  page, the cursor SCAN's: a page may be empty before the last, and a key may come twice.
+  No namespace bound: the server's `maxmemory` bounds it. A `rediss://` server's
+  certificate is verified against `ca-cert`, else the webPKI roots. The connection opens on
+  the first call and again once lost: a server down fails the calls with why (logged), not
+  the startup. Each call answers within `timeout` or fails; one timing out has the next
+  call open a new connection
 - every store: a key past `max-key-bytes` (default 1Ki) and a value past `max-value-bytes`
   (default 1Mi) are rejected before the store sees them
 
@@ -480,8 +499,7 @@ Kubernetes, `terminationGracePeriodSeconds` (30s by default) bounds it the same 
   cap: until the old target's requests ended, both caps count, so the route may hold
   up to twice its cap
 - wasi:keyvalue is draft2, without the `watcher` export, and its calls block the guest's
-  instance (see [Key-value stores](#key-value-stores-experimental)); `sqlite` is the only
-  store yet
+  instance (see [Key-value stores](#key-value-stores-experimental))
 - file changes are seen by modification time, size and inode: a component rewritten
   in place with the same size within the file system's time granularity is missed
   until SIGHUP

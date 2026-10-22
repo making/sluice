@@ -108,7 +108,8 @@ jobs:
       run: cargo test --locked
   # The wicket builds on its pinned stable toolchain; its tests build the example guests through
   # the rustup cargo proxy in examples/, pinned to a nightly with wasm32-wasip3
-  # (examples/rust-toolchain.toml).
+  # (examples/rust-toolchain.toml), and run redis-server (Debian's has TLS) for the redis
+  # store. The build without it (--no-default-features) is linted, its tests are not run.
   sluice-wicket-wasi:
     needs: changes
     if: needs.changes.outputs.wicket == 'true'
@@ -120,8 +121,8 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-    - name: Install protoc
-      run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends protobuf-compiler
+    - name: Install protoc and redis-server
+      run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends protobuf-compiler redis-server
     - uses: actions/cache@v4
       with:
         path: |
@@ -143,6 +144,7 @@ jobs:
     - name: Clippy
       run: |
         cargo clippy --all-targets --locked -- -D warnings
+        cargo clippy --locked --no-default-features -- -D warnings
         (cd examples && cargo clippy --all-targets --locked -- -D warnings)
     - name: Test
       run: cargo test --locked
