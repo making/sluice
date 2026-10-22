@@ -96,7 +96,9 @@ impl RedisServer {
         }
     }
 
-    /// Starts it, ready once it logs so; Err: its log when it exits first.
+    /// Starts it, ready once it logs so ("Ready to accept connections" in
+    /// 7.2+, "The server is now ready to accept connections at" on a unix
+    /// socket before); Err: its log when it exits first.
     fn try_start(&mut self) -> Result<(), String> {
         let mut child = Command::new("redis-server")
             .args(&self.args)
@@ -116,7 +118,11 @@ impl RedisServer {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match received.recv_timeout(left) {
-                Ok(line) if line.contains("Ready to accept connections") => {
+                Ok(line)
+                    if line
+                        .to_ascii_lowercase()
+                        .contains("ready to accept connections") =>
+                {
                     self.child = Some(child);
                     return Ok(());
                 }
