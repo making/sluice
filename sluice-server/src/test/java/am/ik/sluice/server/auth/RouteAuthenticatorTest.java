@@ -252,7 +252,7 @@ class RouteAuthenticatorTest {
 		};
 		assertThat(new RouteAuthenticator(properties(auth), failing, 2, RouteAuthenticator.CACHE_SIZE, this.now::get,
 				VIRTUAL, this.issuers())
-			.verify(route(ROUTE), headers("GET", "authorization", "Bearer sha-token")))
+			.verify(route(ROUTE), headers("GET", "authorization", "Bearer sha-token"), Origin.UNKNOWN))
 			.isInstanceOf(Verdict.Unauthorized.class);
 	}
 
@@ -264,7 +264,7 @@ class RouteAuthenticatorTest {
 			.build());
 
 		assertThat(verify(authenticator, "authorization", "Bearer token")).isEqualTo(Verdict.OPEN);
-		assertThat(authenticator.verify(route("other.local"), headers("GET"))).isEqualTo(Verdict.OPEN);
+		assertThat(authenticator.verify(route("other.local"), headers("GET"), Origin.UNKNOWN)).isEqualTo(Verdict.OPEN);
 		assertThat(authenticator.protects(route(ROUTE))).isTrue();
 		assertThat(authenticator.protects(route("other.local"))).isFalse();
 		assertThat(authenticator.schemes(ROUTE)).containsExactly("bearer");
@@ -276,11 +276,12 @@ class RouteAuthenticatorTest {
 			.bearer(List.of(secret("noop", "token")));
 		RequestHeaders preflight = headers("OPTIONS", "access-control-request-method", "POST");
 
-		assertThat(authenticator(auth.build()).verify(route(ROUTE), preflight))
+		assertThat(authenticator(auth.build()).verify(route(ROUTE), preflight, Origin.UNKNOWN))
 			.isInstanceOf(Verdict.Unauthorized.class);
 		RouteAuthenticator allowing = authenticator(auth.allowPreflight(true).build());
-		assertThat(allowing.verify(route(ROUTE), preflight)).isEqualTo(new Verdict.Pass(AUTHORIZATION));
-		assertThat(allowing.verify(route(ROUTE), headers("OPTIONS"))).as("an OPTIONS that is no preflight")
+		assertThat(allowing.verify(route(ROUTE), preflight, Origin.UNKNOWN)).isEqualTo(new Verdict.Pass(AUTHORIZATION));
+		assertThat(allowing.verify(route(ROUTE), headers("OPTIONS"), Origin.UNKNOWN))
+			.as("an OPTIONS that is no preflight")
 			.isInstanceOf(Verdict.Unauthorized.class);
 	}
 
@@ -365,11 +366,11 @@ class RouteAuthenticatorTest {
 	}
 
 	private static Verdict verify(RouteAuthenticator authenticator, String... headers) {
-		return authenticator.verify(route(ROUTE), headers("GET", headers));
+		return authenticator.verify(route(ROUTE), headers("GET", headers), Origin.UNKNOWN);
 	}
 
 	private static CompletableFuture<Verdict> verifyAsync(RouteAuthenticator authenticator, String... headers) {
-		return authenticator.verifyAsync(route(ROUTE), headers("GET", headers));
+		return authenticator.verifyAsync(route(ROUTE), headers("GET", headers), Origin.UNKNOWN);
 	}
 
 	private static Router.Route route(String domain) {
@@ -383,6 +384,11 @@ class RouteAuthenticatorTest {
 			@Override
 			public String method() {
 				return method;
+			}
+
+			@Override
+			public String target() {
+				return "/";
 			}
 
 			@Override

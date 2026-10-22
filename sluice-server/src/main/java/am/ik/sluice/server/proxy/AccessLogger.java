@@ -13,6 +13,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
+import am.ik.sluice.server.auth.RouteAuthenticator;
 import am.ik.sluice.server.auth.Verdict;
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.livelog.AccessEvent;
@@ -408,17 +409,27 @@ public class AccessLogger {
 		}
 
 		/**
-		 * Logs a request head refused for its route's credentials: {@code 401} with
+		 * Logs a request head its route's credential check answered: {@code 401} with
 		 * {@code reason=auth-missing} / {@code auth-invalid}, {@code 503} with
-		 * {@code reason=auth-busy} / {@code auth-unavailable}; nothing for a verdict that
-		 * passes.
+		 * {@code reason=auth-busy} / {@code auth-unavailable}, the browser sign-in's
+		 * {@code 403} with {@code reason=auth-denied} / {@code auth-insecure} /
+		 * {@code auth-failed} and {@code 302} with {@code reason=auth-sign-in} /
+		 * {@code auth-signed-in} / {@code auth-signed-out}; nothing for a verdict that
+		 * passes. The query of the sign-in's callback (its code and state) is left out.
 		 */
 		void refused(Router.Route route, ConnectionHeadParser.Head.@Nullable Request request, Verdict verdict) {
+			ConnectionHeadParser.Head.Request logged = request;
+			if (request != null && request.path().startsWith(RouteAuthenticator.CALLBACK_PATH + "?")) {
+				logged = new ConnectionHeadParser.Head.Request(request.method(), RouteAuthenticator.CALLBACK_PATH,
+						request.version(), request.json(), request.userAgent());
+			}
 			switch (verdict) {
 				case Verdict.Unauthorized unauthorized ->
-					this.refused(route, request, 401, "auth-" + unauthorized.reason());
-				case Verdict.Busy busy -> this.refused(route, request, 503, "auth-busy");
-				case Verdict.Unavailable unavailable -> this.refused(route, request, 503, "auth-unavailable");
+					this.refused(route, logged, 401, "auth-" + unauthorized.reason());
+				case Verdict.Busy busy -> this.refused(route, logged, 503, "auth-busy");
+				case Verdict.Unavailable unavailable -> this.refused(route, logged, 503, "auth-unavailable");
+				case Verdict.Forbidden forbidden -> this.refused(route, logged, 403, "auth-" + forbidden.reason());
+				case Verdict.Redirect redirect -> this.refused(route, logged, 302, "auth-" + redirect.reason());
 				case Verdict.Pass pass -> {
 				}
 			}

@@ -25,9 +25,9 @@ import org.jspecify.annotations.Nullable;
  * every request is answered {@code 200} with {@link #body} naming the echoed headers it
  * carried (the credential headers by default), so a test sees what reached the upstream.
  */
-final class HeaderEchoUpstream implements AutoCloseable {
+public final class HeaderEchoUpstream implements AutoCloseable {
 
-	static final String GREETING = "hello-from-upstream";
+	public static final String GREETING = "hello-from-upstream";
 
 	/** The headers the body names when the request carried them. */
 	private final List<String> echoed;
@@ -39,14 +39,14 @@ final class HeaderEchoUpstream implements AutoCloseable {
 	}
 
 	/** An upstream echoing the headers named, lowercase. */
-	HeaderEchoUpstream(String... echoed) throws IOException {
+	public HeaderEchoUpstream(String... echoed) throws IOException {
 		this.echoed = List.of(echoed);
 		this.server = new ServerSocket();
 		this.server.bind(new InetSocketAddress("127.0.0.1", 0));
 		Thread.ofVirtual().name("e2e-header-echo-accept").start(this::acceptLoop);
 	}
 
-	int port() {
+	public int port() {
 		return this.server.getLocalPort();
 	}
 

@@ -276,8 +276,8 @@ public final class ConnectionHeadParser {
 	}
 
 	/**
-	 * The method and headers of an HTTP/1.1 request head, as the route's credential check
-	 * reads them.
+	 * The method, target and headers of an HTTP/1.1 request head, as the route's
+	 * credential check reads them.
 	 */
 	static RequestHeaders http1Headers(byte[] head) {
 		return new RequestHeaders() {
@@ -289,6 +289,12 @@ public final class ConnectionHeadParser {
 			}
 
 			@Override
+			public String target() {
+				Head.Request request = http1RequestOf(head);
+				return request == null ? "" : request.path();
+			}
+
+			@Override
 			public List<String> values(String name) {
 				return http1HeaderValues(head, name);
 			}
@@ -297,16 +303,22 @@ public final class ConnectionHeadParser {
 	}
 
 	/**
-	 * The method and headers of an HTTP/2 request header block, as the route's credential
-	 * check reads them.
+	 * The method, target ({@code :path}) and headers of an HTTP/2 request header block,
+	 * as the route's credential check reads them.
 	 */
 	static RequestHeaders http2Headers(Http2Headers headers) {
 		CharSequence method = headers.method();
+		CharSequence path = headers.path();
 		return new RequestHeaders() {
 
 			@Override
 			public String method() {
 				return method == null ? "" : method.toString();
+			}
+
+			@Override
+			public String target() {
+				return path == null ? "" : path.toString();
 			}
 
 			@Override

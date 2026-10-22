@@ -1,7 +1,7 @@
 # Route authentication
 
 Detailed behavior behind README "Route authentication": the challenges, the checks, the
-credential cache and the refusal logs.
+credential cache, the browser sign-in and the refusal logs.
 
 ## Behavior
 
@@ -60,4 +60,78 @@ credential cache and the refusal logs.
   reason=auth-busy` and `reason=auth-unavailable` (the OIDC keys not loaded). Why a credential
   was refused (e.g. `Jwt expired at ...`, `The aud claim is not valid`, `Invalid signature`) is
   logged at debug by `am.ik.sluice.server.auth.RouteAuthenticator`, never the credential. The
-  console tags such a route `Auth: <schemes>` (`oidc` for the provider's tokens).
+  console tags such a route `Auth: <schemes>` (`oidc` for the provider's tokens, `oidc-login`
+  for the browser sign-in).
+
+## Browser sign-in
+
+A route with `oidc.client-id` is an OIDC client of its provider (authorization code flow, PKCE
+`S256` always; confidential with `client-secret`, public without). Per request, in order:
+
+1. `/.sluice/oauth2/callback` and `/.sluice/oauth2/sign-out` (the path, any query) are answered
+   by the data plane and never relayed, whatever the method.
+2. A CORS preflight passes as with the other schemes (`allow-preflight`).
+3. A session cookie that opens, has not expired and whose claims match `oidc.claims` passes.
+4. Otherwise the credential headers decide as without the sign-in (Basic, Bearer, API token).
+5. Without any: a session whose claims do not match is `403` (`reason=auth-denied`); a
+   browser's navigation is redirected to the provider (`302`, `reason=auth-sign-in`); any other
+   request is `401`, its challenges the route's schemes' and `OIDC realm="<realm>"` last.
+
+A navigation is a `GET` or `HEAD` whose `Accept` lists `text/html`, without
+`X-Requested-With`, and whose `Sec-Fetch-Mode` is absent or `navigate` (a WebSocket's is
+`websocket`, a `fetch` / XHR's `cors` / `same-origin`).
+
+- **Redirect to the provider**: the authorization endpoint of the discovery document, with
+  `response_type=code`, `client_id`, `redirect_uri=<origin>/.sluice/oauth2/callback`, `scope`,
+  `state`, `nonce` (32 random bytes each, base64url) and the PKCE challenge. The origin is the
+  one the client addressed: https when the data plane terminated TLS or a trusted proxy states
+  `X-Forwarded-Proto`, and the `Host` / `:authority` (a trusted proxy's `X-Forwarded-Host`, with
+  its `X-Forwarded-Port` when not the default). A host that is no DNS name, IPv4 or bracketed
+  IPv6 literal (with an optional port) gets no redirect, the `401` instead. Over http the
+  navigation is `403` (`reason=auth-insecure`): the cookies are `Secure`. While the discovery
+  document has not loaded, `503` with `Retry-After: 10` (`reason=auth-unavailable`).
+- **State cookie** `__Host-sluice-state-<first 12 characters of the state>`, `Max-Age=600`: the
+  state, nonce, PKCE verifier, origin and the page to return to (the request target when it is an
+  origin-form path of visible ASCII not starting `//` or `/\`, else `/`). One per sign-in, so
+  sign-ins in several tabs do not overwrite each other.
+- **Callback**: a query parameter twice, no `state`, no state cookie of it (its value compared
+  in constant time), one past its 10 minutes, the provider's `error`, or no `code` is `403`
+  (`reason=auth-failed`, the page offering a new sign-in). Otherwise the code is exchanged at the
+  token endpoint off the request thread, counted against the bound of the checks in flight (`503
+  reason=auth-busy` past it), within the fetch timeout (5 seconds) and 512KiB. The client
+  authenticates with `client_secret_basic` unless the discovery document lists only
+  `client_secret_post`. The ID token must verify against the provider's keys (loaded anew once
+  for a key not loaded, as for bearer tokens) with an allowed algorithm, carry `exp`, hold
+  `exp` / `nbf` within `clock-skew`, its `iss` the issuer, its `aud` the client id, its `azp`
+  (when present) the client id, its `nonce` the sign-in's; else `403` (`reason=auth-failed`).
+  Success is `302` (`reason=auth-signed-in`) back to `<origin><page>`, setting the session
+  cookie and removing the state cookie. Why a callback failed is logged at debug, never the code.
+  The access log leaves the callback's query (code, state) out.
+- **Session cookie** `__Host-sluice-session`, `Max-Age=<session-max-age>`: `sub` and the ID
+  token claims `oidc.claims` and `oidc.headers` name, with the expiry, sealed (below). The claims
+  are matched on every request, so a changed `oidc.claims` applies to the sessions issued
+  before. Nothing renews a session: past its max age the next navigation signs in anew (silently
+  while the provider's own session lasts), any other request is `401`. A session whose cookie
+  would exceed 4000 bytes fails the sign-in (`403`) with a WARN naming the subject: keep fewer
+  claims.
+- **Sealing**: AES-256-GCM, a random 12-byte nonce per cookie, the purpose (`session` /
+  `state`) as associated data, under a key derived per route by HKDF-SHA256 from
+  `sluice.route.session-secret` (salt `sluice route session`, info the route key). A cookie of one
+  route or purpose opens on no other; an altered one is no session (a navigation signs in anew).
+  Without the property a single node seals with a random secret per start (WARN); cluster mode
+  refuses to start.
+- **Relay**: the sign-in's cookies (`__Host-sluice-*`) are removed from `Cookie` before relay,
+  the other cookies kept in order (h2: joined into one `cookie` field), unless
+  `forward-credentials=true`. The `oidc.headers` are removed from every request of the route that
+  passes and set from the session: a list claim's values joined by `,`, the UTF-8 bytes as they
+  go on the wire, control characters dropped. An identity header must not name `Host`,
+  `Cookie`, `Authorization`, a framing / hop-by-hop header, a forwarding header or the route's
+  API token header.
+- **Sign-out**: removes the session cookie and redirects (`302 reason=auth-signed-out`) to the
+  provider's `end_session_endpoint` with `client_id` and `post_logout_redirect_uri=<origin>/`,
+  or to `<origin>/` when the provider names none (its session then lasts, and the next
+  navigation signs in silently).
+- On HTTP/1.1 every answer of the sign-in ends the connection like a refusal; on h2 the
+  connection goes on.
+- At startup a route signing browsers in on a data plane without TLS and without
+  `trusted-proxy-cidrs` is warned about: its sign-ins are refused over plaintext.

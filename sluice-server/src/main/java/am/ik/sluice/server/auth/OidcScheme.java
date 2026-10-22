@@ -69,10 +69,12 @@ final class OidcScheme implements CredentialScheme {
 	}
 
 	/**
-	 * The scheme of the route's {@code oidc} provider; null when it has none.
+	 * The scheme of the route's {@code oidc} provider; null when it has none, or accepts
+	 * no access token (a route signing browsers in only, without {@code audiences}).
 	 * @throws IllegalStateException for an issuer that is no absolute http(s) URI, no
-	 * audience, an algorithm that is no asymmetric JWS one, a required claim without a
-	 * value, or a negative clock skew
+	 * audience of a route that signs no browser in, a blank audience, an algorithm that
+	 * is no asymmetric JWS one, a required claim without a value, or a negative clock
+	 * skew
 	 */
 	static @Nullable OidcScheme of(String property, SluiceServerProperties.Route.Auth.@Nullable Oidc oidc,
 			OidcIssuers issuers) {
@@ -84,18 +86,10 @@ final class OidcScheme implements CredentialScheme {
 		if (!isHttpUri(issuer)) {
 			throw new IllegalStateException(prefix + ".issuer-uri is no absolute http(s) URI");
 		}
-		if (oidc.audiences().isEmpty() || oidc.audiences().stream().anyMatch(String::isBlank)) {
+		if (oidc.audiences().isEmpty() && !oidc.signsIn() || oidc.audiences().stream().anyMatch(String::isBlank)) {
 			throw new IllegalStateException(prefix + ".audiences names no audience, or a blank one");
 		}
-		Set<SignatureAlgorithm> algorithms = new LinkedHashSet<>();
-		for (String name : oidc.jwsAlgorithms()) {
-			SignatureAlgorithm algorithm = SignatureAlgorithm.from(name.strip());
-			if (algorithm == null) {
-				throw new IllegalStateException(prefix + ".jws-algorithms: " + name
-						+ " is none of RS256, RS384, RS512, ES256, ES384, ES512, PS256, PS384, PS512");
-			}
-			algorithms.add(algorithm);
-		}
+		Set<SignatureAlgorithm> algorithms = algorithms(prefix, oidc);
 		oidc.claims().forEach((claim, values) -> {
 			if (values.isEmpty() || values.stream().anyMatch(String::isEmpty)) {
 				throw new IllegalStateException(prefix + ".claims." + claim + " names no value, or an empty one");
@@ -103,6 +97,9 @@ final class OidcScheme implements CredentialScheme {
 		});
 		if (oidc.clockSkew().isNegative()) {
 			throw new IllegalStateException(prefix + ".clock-skew is negative");
+		}
+		if (oidc.audiences().isEmpty()) {
+			return null;
 		}
 		IssuerKeys keys = issuers.keys(issuer);
 		NimbusJwtDecoder decoder = NimbusJwtDecoder.withJwkSource(keys)
@@ -112,13 +109,27 @@ final class OidcScheme implements CredentialScheme {
 		return new OidcScheme(keys, decoder, issuers.clock(), issuers.timing().fetchTimeout().multipliedBy(2));
 	}
 
+	/**
+	 * The signature algorithms of the provider's tokens.
+	 * @throws IllegalStateException for one that is no asymmetric JWS algorithm
+	 */
+	static Set<SignatureAlgorithm> algorithms(String prefix, SluiceServerProperties.Route.Auth.Oidc oidc) {
+		Set<SignatureAlgorithm> algorithms = new LinkedHashSet<>();
+		for (String name : oidc.jwsAlgorithms()) {
+			SignatureAlgorithm algorithm = SignatureAlgorithm.from(name.strip());
+			if (algorithm == null) {
+				throw new IllegalStateException(prefix + ".jws-algorithms: " + name
+						+ " is none of RS256, RS384, RS512, ES256, ES384, ES512, PS256, PS384, PS512");
+			}
+			algorithms.add(algorithm);
+		}
+		return algorithms;
+	}
+
 	private static OAuth2TokenValidator<Jwt> validator(String issuer, SluiceServerProperties.Route.Auth.Oidc oidc,
 			Clock clock) {
-		JwtTimestampValidator timestamps = new JwtTimestampValidator(oidc.clockSkew());
-		timestamps.setClock(clock);
-		timestamps.setAllowEmptyExpiryClaim(false);
 		List<OAuth2TokenValidator<Jwt>> validators = new ArrayList<>();
-		validators.add(timestamps);
+		validators.add(timestamps(oidc, clock));
 		validators.add(new JwtIssuerValidator(issuer));
 		List<String> audiences = List.copyOf(oidc.audiences());
 		validators.add(new JwtClaimValidator<Collection<String>>(JwtClaimNames.AUD,
@@ -130,11 +141,19 @@ final class OidcScheme implements CredentialScheme {
 		return new DelegatingOAuth2TokenValidator<>(validators);
 	}
 
+	/** {@code exp} (required) and {@code nbf} within the clock skew. */
+	static JwtTimestampValidator timestamps(SluiceServerProperties.Route.Auth.Oidc oidc, Clock clock) {
+		JwtTimestampValidator timestamps = new JwtTimestampValidator(oidc.clockSkew());
+		timestamps.setClock(clock);
+		timestamps.setAllowEmptyExpiryClaim(false);
+		return timestamps;
+	}
+
 	/**
 	 * Whether the claim's value, or one of a list claim's, matches one accepted; a claim
 	 * absent fails in {@link JwtClaimValidator} itself.
 	 */
-	private static boolean holds(Object value, List<String> accepted) {
+	static boolean holds(Object value, List<String> accepted) {
 		if (value instanceof Collection<?> values) {
 			return values.stream().anyMatch(each -> each != null && matchesAny(String.valueOf(each), accepted));
 		}
@@ -168,7 +187,7 @@ final class OidcScheme implements CredentialScheme {
 		return value.length() - last.length() >= at && value.endsWith(last);
 	}
 
-	private static boolean isHttpUri(String value) {
+	static boolean isHttpUri(String value) {
 		try {
 			URI uri = new URI(value);
 			return uri.isAbsolute() && ("https".equals(uri.getScheme()) || "http".equals(uri.getScheme()))

@@ -9,9 +9,7 @@ import java.net.Socket;
 import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.KeyStore;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -27,7 +25,6 @@ import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
-import javax.net.ssl.TrustManagerFactory;
 
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -114,7 +111,7 @@ class ConnectionLimitOverflowE2ETest {
 		grpcPort = TestPorts.freePort();
 		dataPort = TestPorts.freePort();
 		tcpRoutePort = TestPorts.freePort();
-		keystorePath = createKeystore();
+		keystorePath = TestKeystore.create();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.tcp-port-range", () -> String.valueOf(tcpRoutePort));
@@ -129,37 +126,6 @@ class ConnectionLimitOverflowE2ETest {
 				() -> "file:" + Objects.requireNonNull(keystorePath).toAbsolutePath());
 		registry.add("spring.ssl.bundle.jks.data-plane.keystore.password", () -> "changeit");
 		registry.add("sluice.data-tls-bundle", () -> "data-plane");
-	}
-
-	/** A self-signed keystore with SANs for localhost, via keytool. */
-	private static Path createKeystore() throws Exception {
-		Path keystore = Files.createTempFile("sluice-e2e", ".p12");
-		Files.delete(keystore);
-		String keytool = Path.of(System.getProperty("java.home"), "bin", "keytool").toString();
-		Process process = new ProcessBuilder(keytool, "-genkeypair", "-alias", "e2e", "-keyalg", "RSA", "-keysize",
-				"2048", "-storetype", "PKCS12", "-storepass", "changeit", "-dname", "CN=localhost", "-ext",
-				"san=dns:localhost,ip:127.0.0.1", "-validity", "1", "-keystore", keystore.toAbsolutePath().toString())
-			.redirectErrorStream(true)
-			.start();
-		if (!process.waitFor(60, TimeUnit.SECONDS) || process.exitValue() != 0) {
-			throw new IllegalStateException(
-					"keytool failed: " + new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8));
-		}
-		keystore.toFile().deleteOnExit();
-		return keystore;
-	}
-
-	private static SSLContext clientSslContext() throws Exception {
-		KeyStore keyStore = KeyStore.getInstance("PKCS12");
-		try (InputStream in = Files.newInputStream(Objects.requireNonNull(keystorePath))) {
-			keyStore.load(in, "changeit".toCharArray());
-		}
-		TrustManagerFactory trustManagerFactory = TrustManagerFactory
-			.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-		trustManagerFactory.init(keyStore);
-		SSLContext sslContext = SSLContext.getInstance("TLS");
-		sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
-		return sslContext;
 	}
 
 	@BeforeEach
@@ -522,8 +488,9 @@ class ConnectionLimitOverflowE2ETest {
 
 	/** A TLS ClientHello naming {@code sni} as its server name, or none. */
 	private static byte[] clientHello(@Nullable String sni) throws Exception {
-		SSLEngine engine = sni == null ? clientSslContext().createSSLEngine()
-				: clientSslContext().createSSLEngine(sni, 443);
+		SSLEngine engine = sni == null
+				? TestKeystore.clientContext(Objects.requireNonNull(keystorePath)).createSSLEngine()
+				: TestKeystore.clientContext(Objects.requireNonNull(keystorePath)).createSSLEngine(sni, 443);
 		engine.setUseClientMode(true);
 		engine.beginHandshake();
 		ByteBuffer hello = ByteBuffer.allocate(engine.getSession().getPacketBufferSize());
@@ -542,7 +509,9 @@ class ConnectionLimitOverflowE2ETest {
 	}
 
 	private SSLSocket tlsSocket(String... protocols) throws Exception {
-		SSLSocket socket = (SSLSocket) clientSslContext().getSocketFactory().createSocket("127.0.0.1", dataPort);
+		SSLSocket socket = (SSLSocket) TestKeystore.clientContext(Objects.requireNonNull(keystorePath))
+			.getSocketFactory()
+			.createSocket("127.0.0.1", dataPort);
 		socket.setSoTimeout((int) WITHIN.toMillis());
 		SSLParameters parameters = socket.getSSLParameters();
 		parameters.setApplicationProtocols(protocols);

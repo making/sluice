@@ -30,8 +30,9 @@ import org.springframework.web.client.RestClient;
  * The signing keys of one OIDC issuer, held in memory so a token check selects among them
  * without I/O: the JWKS named by the issuer's discovery document
  * ({@code <issuer>/.well-known/openid-configuration}, whose {@code issuer} must equal
- * it). A load runs off the caller ({@link #refresh}), one at a time, at most one per
- * {@link OidcIssuers.Timing#minRefreshInterval} unless one is due: every
+ * it), with the endpoints the document names for the browser sign-in
+ * ({@link #endpoints()}). A load runs off the caller ({@link #refresh}), one at a time,
+ * at most one per {@link OidcIssuers.Timing#minRefreshInterval} unless one is due: every
  * {@link OidcIssuers.Timing#refreshInterval} after a load, every
  * {@code minRefreshInterval} after a failed one. A failed load keeps the keys loaded
  * before. Each document is fetched by the {@link RestClient} within
@@ -61,6 +62,9 @@ final class IssuerKeys implements JWKSource<SecurityContext> {
 
 	/** The JWKS location once discovered; forgotten when a load fails. */
 	private volatile @Nullable URI jwksUri;
+
+	/** The endpoints of the last discovery document read; kept when a load fails. */
+	private volatile @Nullable Endpoints endpoints;
 
 	/** The load in flight. With this lock, as all below. */
 	private @Nullable CompletableFuture<Void> loading;
@@ -99,6 +103,13 @@ final class IssuerKeys implements JWKSource<SecurityContext> {
 	public List<JWK> get(JWKSelector selector, @Nullable SecurityContext context) {
 		JWKSet loaded = this.keys;
 		return loaded == null ? List.of() : selector.select(loaded);
+	}
+
+	/**
+	 * The endpoints the discovery document names; null until one was read.
+	 */
+	@Nullable Endpoints endpoints() {
+		return this.endpoints;
 	}
 
 	/** Whether keys have loaded. */
@@ -274,8 +285,36 @@ final class IssuerKeys implements JWKSource<SecurityContext> {
 		if (uri == null) {
 			throw new IllegalStateException(this.discovery + " names no jwks_uri");
 		}
+		try {
+			List<String> methods = JSONObjectUtils.getStringList(metadata, "token_endpoint_auth_methods_supported");
+			this.endpoints = new Endpoints(JSONObjectUtils.getURI(metadata, "authorization_endpoint"),
+					JSONObjectUtils.getURI(metadata, "token_endpoint"),
+					JSONObjectUtils.getURI(metadata, "end_session_endpoint"), methods == null ? List.of() : methods);
+		}
+		catch (ParseException e) {
+			throw new IllegalStateException(this.discovery + " holds a malformed endpoint: " + e.getMessage(), e);
+		}
 		this.jwksUri = uri;
 		return uri;
+	}
+
+	/**
+	 * The endpoints of an issuer's discovery document the browser sign-in uses.
+	 *
+	 * @param authorization the authorization endpoint; null when the document names none
+	 * @param token the token endpoint; null when the document names none
+	 * @param endSession the end session endpoint (RP-initiated logout); null when the
+	 * document names none
+	 * @param tokenAuthMethods the client authentication methods the token endpoint
+	 * supports; empty when the document names none ({@code client_secret_basic} then)
+	 */
+	record Endpoints(@Nullable URI authorization, @Nullable URI token, @Nullable URI endSession,
+			List<String> tokenAuthMethods) {
+
+		Endpoints {
+			tokenAuthMethods = List.copyOf(tokenAuthMethods);
+		}
+
 	}
 
 	private static JWKSet keysOf(String document) {

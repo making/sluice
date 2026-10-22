@@ -3,6 +3,7 @@ package am.ik.sluice.server.auth;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -22,6 +23,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Semaphore;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 import org.jspecify.annotations.Nullable;
@@ -41,18 +43,21 @@ import am.ik.sluice.server.route.Router;
 /**
  * Per-route credential check of the data plane ({@code sluice.route.auth.<route key>}): a
  * request of a route with credentials passes with any one of them -- HTTP Basic,
- * {@code Authorization: Bearer} with a static token or an OIDC provider's JWT, or an API
- * token header --, else it is unauthorized, with the challenges of the route's schemes;
- * the challenge of a scheme whose credential was refused names the error where the scheme
- * has one. A request carrying one of the route's credential headers more than once is
- * unauthorized whatever the values. With {@code allow-preflight} a CORS preflight passes
- * without credentials. Unless the route forwards them, the headers of its schemes are
- * removed from every request that passes. Each scheme is a {@link CredentialScheme}
- * ({@link BasicScheme}, {@link OidcScheme}, {@link BearerScheme},
- * {@link ApiTokenScheme}); a header's value goes to the first scheme of the header whose
- * auth-scheme token it carries that {@link CredentialScheme#takes takes} it. A request
- * whose JWT could not be checked for its provider's keys not loaded is
- * {@link Verdict.Unavailable}.
+ * {@code Authorization: Bearer} with a static token or an OIDC provider's JWT, an API
+ * token header, or the session cookie of the browser sign-in ({@link OidcSignIn}) --,
+ * else it is unauthorized, with the challenges of the route's schemes; a browser's
+ * navigation of a route signing browsers in is redirected to its provider instead, and a
+ * signed-in user the route's claims do not admit is forbidden. The sign-in's callback and
+ * sign-out paths are answered, never relayed; the challenge of a scheme whose credential
+ * was refused names the error where the scheme has one. A request carrying one of the
+ * route's credential headers more than once is unauthorized whatever the values. With
+ * {@code allow-preflight} a CORS preflight passes without credentials. Unless the route
+ * forwards them, the headers of its schemes are removed from every request that passes.
+ * Each scheme is a {@link CredentialScheme} ({@link BasicScheme}, {@link OidcScheme},
+ * {@link BearerScheme}, {@link ApiTokenScheme}); a header's value goes to the first
+ * scheme of the header whose auth-scheme token it carries that
+ * {@link CredentialScheme#takes takes} it. A request whose JWT could not be checked for
+ * its provider's keys not loaded is {@link Verdict.Unavailable}.
  * <p>
  * Every secret is matched by the server's {@link PasswordEncoder} by its {@code {id}}
  * prefix; a secret without one, with an unknown id or malformed for its encoder fails the
@@ -87,6 +92,12 @@ public class RouteAuthenticator implements AutoCloseable {
 
 	static final String AUTHORIZATION = "authorization";
 
+	/** The path of the browser sign-in's callback on a route signing browsers in. */
+	public static final String CALLBACK_PATH = OidcSignIn.CALLBACK_PATH;
+
+	/** The path signing a browser out of a route signing browsers in. */
+	public static final String SIGN_OUT_PATH = OidcSignIn.SIGN_OUT_PATH;
+
 	private static final String PREFLIGHT_METHOD = "access-control-request-method";
 
 	private final Map<String, Policy> policies;
@@ -100,6 +111,9 @@ public class RouteAuthenticator implements AutoCloseable {
 	private final Executor executor;
 
 	private final OidcIssuers issuers;
+
+	/** The randomness of the browser sign-in: its states, and a session secret. */
+	private final SecureRandom random = new SecureRandom();
 
 	/** Matched credentials to the time they expire, least recently used first. */
 	private final Map<String, Long> verified;
@@ -144,9 +158,10 @@ public class RouteAuthenticator implements AutoCloseable {
 		this.issuers = issuers;
 		Map<String, Policy> policies = new TreeMap<>();
 		try {
+			byte[] secret = this.sessionSecret(properties);
 			properties.route().auth().forEach((key, auth) -> {
 				String normalized = normalize(key);
-				policies.put(normalized, this.policy(normalized, auth));
+				policies.put(normalized, this.policy(normalized, auth, secret));
 			});
 		}
 		catch (RuntimeException e) {
@@ -159,8 +174,55 @@ public class RouteAuthenticator implements AutoCloseable {
 					"routes {} require credentials, yet the data plane terminates no TLS (sluice.data-tls-bundle unset): "
 							+ "their credentials cross it in cleartext unless a front end terminates TLS",
 					policies.keySet());
+			List<String> signingIn = policies.values()
+				.stream()
+				.filter(policy -> policy.signIn() != null)
+				.map(Policy::key)
+				.toList();
+			if (!signingIn.isEmpty() && properties.accessControl().trustedProxyCidrs().isEmpty()) {
+				log.warn("routes {} sign browsers in, yet neither the data plane terminates TLS nor a trusted proxy "
+						+ "(sluice.access-control.trusted-proxy-cidrs) states X-Forwarded-Proto: "
+						+ "their sign-ins are refused 403 over plaintext", signingIn);
+			}
 		}
 		issuers.start();
+	}
+
+	/**
+	 * The secret the browser sign-in's cookies are sealed with: {@code session-secret},
+	 * else -- on a single node -- a random one for this start; empty when no route signs
+	 * browsers in.
+	 * @throws IllegalStateException for a secret shorter than 32 characters, or none in
+	 * cluster mode
+	 */
+	private byte[] sessionSecret(SluiceServerProperties properties) {
+		List<String> signingIn = properties.route()
+			.auth()
+			.entrySet()
+			.stream()
+			.filter(entry -> entry.getValue().oidc() != null && entry.getValue().oidc().signsIn())
+			.map(entry -> normalize(entry.getKey()))
+			.sorted()
+			.toList();
+		if (signingIn.isEmpty()) {
+			return new byte[0];
+		}
+		String secret = properties.route().sessionSecret();
+		if (secret.isEmpty()) {
+			if (properties.clusterEnabled()) {
+				throw new IllegalStateException("routes " + signingIn + " sign browsers in: cluster mode requires "
+						+ "sluice.route.session-secret, the same on every node");
+			}
+			log.warn("routes {} sign browsers in, yet sluice.route.session-secret is unset: their sessions are sealed "
+					+ "with a random secret and end with this start", signingIn);
+			byte[] random = new byte[32];
+			this.random.nextBytes(random);
+			return random;
+		}
+		if (secret.length() < 32) {
+			throw new IllegalStateException("sluice.route.session-secret is shorter than 32 characters");
+		}
+		return secret.getBytes(StandardCharsets.UTF_8);
 	}
 
 	/** Stops the loads of the OIDC issuers' keys. */
@@ -173,12 +235,13 @@ public class RouteAuthenticator implements AutoCloseable {
 	 * Checks the request of the route against the route's credentials;
 	 * {@link Verdict#OPEN} for a route without any. Blocks while a slow check runs
 	 * ({@link #verifyAsync}): for a caller on a thread of its own.
+	 * @param origin the origin the client addressed, which the browser sign-in returns to
 	 * @throws IllegalStateException interrupted while waiting for a slow check (the
 	 * thread's interrupt status set again), or the check failed
 	 */
-	public Verdict verify(Router.Route route, RequestHeaders headers) {
+	public Verdict verify(Router.Route route, RequestHeaders headers, Origin origin) {
 		try {
-			return verifyAsync(route, headers).get();
+			return verifyAsync(route, headers, origin).get();
 		}
 		catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
@@ -197,18 +260,32 @@ public class RouteAuthenticator implements AutoCloseable {
 	 * the verdict is complete at once unless a credential is to be checked against a slow
 	 * hash and is not remembered; that check runs on a virtual thread of its own -- or is
 	 * the one in flight for the same credential --, and the verdict completes with it, on
-	 * that thread, or exceptionally with what the check threw. Cancelling the verdict
-	 * leaves the check running to its end. {@link Verdict#OPEN} for a route without
-	 * credentials.
+	 * that thread, or exceptionally with what the check threw; so does the code exchange
+	 * of the browser sign-in's callback. Cancelling the verdict leaves the check running
+	 * to its end. {@link Verdict#OPEN} for a route without credentials.
+	 * <p>
+	 * On a route signing browsers in, the callback and sign-out paths are answered; a
+	 * session whose user the route admits passes, else the credentials presented decide;
+	 * without any, a signed-in user is forbidden, and a browser's navigation is
+	 * redirected to the provider.
+	 * @param origin the origin the client addressed, which the browser sign-in returns to
 	 */
-	public CompletableFuture<Verdict> verifyAsync(Router.Route route, RequestHeaders headers) {
+	public CompletableFuture<Verdict> verifyAsync(Router.Route route, RequestHeaders headers, Origin origin) {
 		Policy policy = this.policies.get(route.routeKey());
 		if (policy == null) {
 			return CompletableFuture.completedFuture(Verdict.OPEN);
 		}
+		OidcSignIn signIn = policy.signIn();
+		if (signIn != null && signIn.reserved(headers.target())) {
+			return signIn.answer(headers, origin, this::offCaller);
+		}
 		if (policy.allowPreflight() && "OPTIONS".equals(headers.method())
 				&& !headers.values(PREFLIGHT_METHOD).isEmpty()) {
-			return CompletableFuture.completedFuture(policy.pass());
+			return CompletableFuture.completedFuture(policy.pass(headers, null));
+		}
+		OidcSignIn.Session session = signIn == null ? null : signIn.session(headers);
+		if (signIn != null && session != null && signIn.admits(session)) {
+			return CompletableFuture.completedFuture(policy.pass(headers, session));
 		}
 		List<Presented> presented = new ArrayList<>(2);
 		for (String header : policy.headers()) {
@@ -221,9 +298,13 @@ public class RouteAuthenticator implements AutoCloseable {
 			}
 		}
 		if (presented.isEmpty()) {
-			return CompletableFuture.completedFuture(policy.unauthorized("missing"));
+			if (session != null) {
+				return CompletableFuture.completedFuture(new Verdict.Forbidden(Verdict.Forbidden.DENIED));
+			}
+			Verdict redirect = signIn == null ? null : signIn.signIn(headers, origin);
+			return CompletableFuture.completedFuture(redirect != null ? redirect : policy.unauthorized("missing"));
 		}
-		return this.decide(policy, presented, 0);
+		return this.decide(policy, headers, presented, 0);
 	}
 
 	/**
@@ -232,13 +313,14 @@ public class RouteAuthenticator implements AutoCloseable {
 	 * unavailable, and none matching is unauthorized, the challenges of their schemes
 	 * naming the error.
 	 */
-	private CompletableFuture<Verdict> decide(Policy policy, List<Presented> presented, int from) {
+	private CompletableFuture<Verdict> decide(Policy policy, RequestHeaders headers, List<Presented> presented,
+			int from) {
 		for (int i = from; i < presented.size(); i++) {
-			CompletableFuture<@Nullable Verdict> verdict = this.check(policy, presented.get(i));
+			CompletableFuture<@Nullable Verdict> verdict = this.check(policy, headers, presented.get(i));
 			if (!verdict.isDone() || verdict.isCompletedExceptionally()) {
 				int next = i + 1;
 				return verdict.thenCompose(checked -> checked != null ? CompletableFuture.completedFuture(checked)
-						: this.decide(policy, presented, next));
+						: this.decide(policy, headers, presented, next));
 			}
 			Verdict checked = verdict.join();
 			if (checked != null) {
@@ -267,7 +349,7 @@ public class RouteAuthenticator implements AutoCloseable {
 
 	/**
 	 * The schemes the route accepts -- {@code basic}, {@code oidc}, {@code bearer}, its
-	 * API token header --; empty when it requires no credential.
+	 * API token header, {@code oidc-login} --; empty when it requires no credential.
 	 * @param routeKey the route key: the domain or host pattern, {@code *} or empty for
 	 * the catch-all
 	 */
@@ -282,36 +364,37 @@ public class RouteAuthenticator implements AutoCloseable {
 	 * not loaded; null when it did not match. Complete at once but for a bounded
 	 * credential not remembered ({@link #slowMatch}).
 	 */
-	private CompletableFuture<@Nullable Verdict> check(Policy policy, Presented presented) {
+	private CompletableFuture<@Nullable Verdict> check(Policy policy, RequestHeaders headers, Presented presented) {
 		CredentialScheme.Credential credential = presented.credential();
 		if (credential.id().isEmpty()) {
 			return CompletableFuture.completedFuture(null);
 		}
 		String cacheKey = policy.key() + '\n' + presented.scheme() + '\n' + sha256(credential.id());
 		if (this.remembered(cacheKey)) {
-			return CompletableFuture.completedFuture(policy.pass());
+			return CompletableFuture.completedFuture(policy.pass(headers, null));
 		}
 		if (!credential.bounded()) {
 			CredentialScheme.Check checked = credential.check();
 			if (checked instanceof CredentialScheme.Check.Match match) {
 				this.remember(cacheKey, match);
 			}
-			return CompletableFuture.completedFuture(this.verdictOf(policy, presented.scheme(), checked));
+			return CompletableFuture.completedFuture(this.verdictOf(policy, headers, presented.scheme(), checked));
 		}
 		CompletableFuture<CredentialScheme.Check> matched = this.slowMatch(cacheKey, credential);
 		if (matched == null) {
 			return CompletableFuture.completedFuture(new Verdict.Busy(BUSY_RETRY_AFTER));
 		}
-		return matched.thenApply(checked -> this.verdictOf(policy, presented.scheme(), checked));
+		return matched.thenApply(checked -> this.verdictOf(policy, headers, presented.scheme(), checked));
 	}
 
 	/**
 	 * The verdict of a check: a pass, unavailable, or null for a mismatch -- whose cause
 	 * is logged at debug, never the credential.
 	 */
-	private @Nullable Verdict verdictOf(Policy policy, String scheme, CredentialScheme.Check checked) {
+	private @Nullable Verdict verdictOf(Policy policy, RequestHeaders headers, String scheme,
+			CredentialScheme.Check checked) {
 		return switch (checked) {
-			case CredentialScheme.Check.Match match -> policy.pass();
+			case CredentialScheme.Check.Match match -> policy.pass(headers, null);
 			case CredentialScheme.Check.Unavailable unavailable -> {
 				log.debug("route {}: a {} credential could not be checked: {}", policy.key(), scheme,
 						unavailable.why());
@@ -378,6 +461,45 @@ public class RouteAuthenticator implements AutoCloseable {
 		return matched;
 	}
 
+	/**
+	 * Runs the work -- the code exchange of a sign-in's callback, which waits for the
+	 * provider -- on a virtual thread of its own of the executor, holding one of the
+	 * verifications until it ended: busy when none is left. The verdict completes with
+	 * the work, on that thread, or exceptionally with what it threw.
+	 */
+	private CompletableFuture<Verdict> offCaller(Supplier<Verdict> work) {
+		if (!this.verifications.tryAcquire()) {
+			return CompletableFuture.completedFuture(new Verdict.Busy(BUSY_RETRY_AFTER));
+		}
+		CompletableFuture<Verdict> verdict = new CompletableFuture<>();
+		try {
+			this.executor.execute(() -> {
+				Verdict answered = null;
+				Throwable failure = null;
+				try {
+					answered = work.get();
+				}
+				catch (Throwable e) {
+					failure = e;
+				}
+				finally {
+					this.verifications.release();
+				}
+				if (failure != null) {
+					verdict.completeExceptionally(failure);
+				}
+				else {
+					verdict.complete(answered);
+				}
+			});
+		}
+		catch (RuntimeException | Error e) {
+			this.verifications.release();
+			verdict.completeExceptionally(e);
+		}
+		return verdict;
+	}
+
 	/** A slow check ended: it leaves the flight and frees its verification. */
 	private void landed(String cacheKey) {
 		synchronized (this.inFlight) {
@@ -433,7 +555,7 @@ public class RouteAuthenticator implements AutoCloseable {
 		return key == null || key.isBlank() ? "*" : key.strip();
 	}
 
-	private Policy policy(String key, SluiceServerProperties.Route.Auth auth) {
+	private Policy policy(String key, SluiceServerProperties.Route.Auth auth, byte[] sessionSecret) {
 		String property = "sluice.route.auth.[" + key + "]";
 		if (key.startsWith("tcp:")) {
 			throw new IllegalStateException(property + ": a tcp route carries no request whose credentials "
@@ -458,9 +580,12 @@ public class RouteAuthenticator implements AutoCloseable {
 		String quotedRealm = "realm=\"" + realm.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
 		Set<String> headers = new LinkedHashSet<>();
 		schemes.forEach(scheme -> headers.add(scheme.header()));
+		// after the schemes: OidcScheme#of checked the issuer
+		OidcSignIn signIn = OidcSignIn.of(property, key, auth.oidc(), this.issuers, sessionSecret, this.random,
+				headers);
 		return new Policy(key, List.copyOf(schemes), List.copyOf(headers),
-				auth.forwardCredentials() ? Verdict.OPEN : new Verdict.Pass(headers), auth.allowPreflight(),
-				quotedRealm);
+				auth.forwardCredentials() ? (Verdict.Pass) Verdict.OPEN : new Verdict.Pass(headers),
+				auth.forwardCredentials(), auth.allowPreflight(), quotedRealm, signIn);
 	}
 
 	private static String sha256(String value) {
@@ -478,11 +603,24 @@ public class RouteAuthenticator implements AutoCloseable {
 	 *
 	 * @param schemes the schemes it accepts, in the order its challenges are listed
 	 * @param headers the lowercase names of the headers carrying them, each once
-	 * @param pass the verdict on a request that passes
+	 * @param pass the verdict on a request that passes, but for the browser sign-in's
+	 * @param forward whether the route forwards its credentials
 	 * @param realm the quoted realm parameter of the challenges
+	 * @param signIn the browser sign-in; null when the route signs no browser in
 	 */
-	private record Policy(String key, List<CredentialScheme> schemes, List<String> headers, Verdict pass,
-			boolean allowPreflight, String realm) {
+	private record Policy(String key, List<CredentialScheme> schemes, List<String> headers, Verdict.Pass pass,
+			boolean forward, boolean allowPreflight, String realm, @Nullable OidcSignIn signIn) {
+
+		/**
+		 * The verdict on a request that passes: {@link #pass}, and on a route signing
+		 * browsers in its sign-in's cookies and identity headers
+		 * ({@link OidcSignIn#pass}).
+		 * @param session the session it passed with; null when none
+		 */
+		Verdict.Pass pass(RequestHeaders request, OidcSignIn.@Nullable Session session) {
+			OidcSignIn signIn = this.signIn;
+			return signIn == null ? this.pass : signIn.pass(this.pass, request, session, this.forward);
+		}
 
 		/** Unauthorized for the reason, with each scheme's challenge. */
 		Verdict unauthorized(String reason) {
@@ -500,9 +638,9 @@ public class RouteAuthenticator implements AutoCloseable {
 		}
 
 		/**
-		 * Unauthorized with a challenge per scheme, the refused schemes' refusals;
-		 * schemes sharing a challenge (static tokens and OIDC on {@code Bearer}) answer
-		 * it once, as a refusal when either refused.
+		 * Unauthorized with a challenge per scheme, the refused schemes' refusals, the
+		 * browser sign-in's last; schemes sharing a challenge (static tokens and OIDC on
+		 * {@code Bearer}) answer it once, as a refusal when either refused.
 		 */
 		private Verdict challenging(String reason, Set<String> refused) {
 			Map<String, String> challenges = new LinkedHashMap<>();
@@ -515,11 +653,20 @@ public class RouteAuthenticator implements AutoCloseable {
 					challenges.putIfAbsent(challenge, challenge);
 				}
 			}
+			OidcSignIn signIn = this.signIn;
+			if (signIn != null) {
+				String challenge = signIn.challenge(this.realm);
+				challenges.putIfAbsent(challenge, challenge);
+			}
 			return new Verdict.Unauthorized(reason, List.copyOf(challenges.values()));
 		}
 
 		List<String> names() {
-			return this.schemes.stream().map(CredentialScheme::name).toList();
+			List<String> names = new ArrayList<>(this.schemes.stream().map(CredentialScheme::name).toList());
+			if (this.signIn != null) {
+				names.add("oidc-login");
+			}
+			return List.copyOf(names);
 		}
 
 		/**

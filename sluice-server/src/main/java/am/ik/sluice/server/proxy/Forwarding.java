@@ -10,6 +10,7 @@ import java.util.Set;
 
 import org.jspecify.annotations.Nullable;
 
+import am.ik.sluice.server.auth.Origin;
 import am.ik.sluice.server.auth.RequestHeaders;
 
 /**
@@ -23,7 +24,8 @@ import am.ik.sluice.server.auth.RequestHeaders;
  * to the chain). A peer not trusted as a proxy ({@code trusted-proxy-cidrs}) cannot claim
  * them: what it sent of the first three, of {@code X-Forwarded-Prefix} and of
  * {@code Forwarded} is dropped. A trusted proxy's values are kept and the missing ones
- * added, the port defaulting by the protocol it stated.
+ * added, the port defaulting by the protocol it stated. The same values make the
+ * {@link #origin} the browser sign-in returns to.
  *
  * @param secure whether the data plane terminated TLS for the connection
  * @param peer the connection peer; null when unknown
@@ -76,6 +78,30 @@ record Forwarding(boolean secure, @Nullable InetAddress peer, boolean trustedPee
 		return new Headers(removed, added);
 	}
 
+	/**
+	 * The origin the client addressed: https when TLS ended here or a trusted proxy
+	 * stated it, and the host the client sent -- a trusted proxy's
+	 * {@code X-Forwarded-Host}, with its {@code X-Forwarded-Port} when the host names
+	 * none and the port is not the protocol's default.
+	 * @param request the request's headers as the client sent them
+	 * @param host the {@code Host} / {@code :authority} the client sent; null when none
+	 */
+	Origin origin(RequestHeaders request, @Nullable String host) {
+		String proto = this.trustedPeer ? first(request.values(PROTO)) : null;
+		boolean secure = proto == null ? this.secure : "https".equalsIgnoreCase(proto);
+		String authority = this.trustedPeer ? first(request.values(HOST)) : null;
+		if (authority == null) {
+			authority = host == null || host.isBlank() ? null : host.trim();
+		}
+		else {
+			String port = first(request.values(PORT));
+			if (port != null && explicitPort(authority) == null && !port.equals(secure ? "443" : "80")) {
+				authority = authority + ":" + port;
+			}
+		}
+		return new Origin(secure, authority);
+	}
+
 	/** The first element of a header's values; null when none. */
 	private static @Nullable String first(List<String> values) {
 		for (String value : values) {
@@ -90,15 +116,22 @@ record Forwarding(boolean secure, @Nullable InetAddress peer, boolean trustedPee
 
 	/** The port of the host, else the default port of the protocol. */
 	private static String portOf(@Nullable String host, String proto) {
-		if (host != null) {
-			int colon = host.lastIndexOf(':');
-			// not an IPv6 literal's colon
-			if (colon > host.lastIndexOf(']') && colon < host.length() - 1
-					&& host.substring(colon + 1).chars().allMatch(c -> c >= '0' && c <= '9')) {
-				return host.substring(colon + 1);
-			}
+		String port = host == null ? null : explicitPort(host);
+		if (port != null) {
+			return port;
 		}
 		return "https".equals(proto.toLowerCase(Locale.ROOT)) ? "443" : "80";
+	}
+
+	/** The port the host names; null when it names none. */
+	private static @Nullable String explicitPort(String host) {
+		int colon = host.lastIndexOf(':');
+		// not an IPv6 literal's colon
+		if (colon > host.lastIndexOf(']') && colon < host.length() - 1
+				&& host.substring(colon + 1).chars().allMatch(c -> c >= '0' && c <= '9')) {
+			return host.substring(colon + 1);
+		}
+		return null;
 	}
 
 	/**

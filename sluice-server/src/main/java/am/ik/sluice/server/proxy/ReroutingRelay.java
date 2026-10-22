@@ -9,7 +9,9 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -23,6 +25,7 @@ import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import am.ik.sluice.server.auth.Origin;
 import am.ik.sluice.server.auth.RouteAuthenticator;
 import am.ik.sluice.server.auth.Verdict;
 import am.ik.sluice.server.route.Router;
@@ -70,7 +73,9 @@ import io.micrometer.core.instrument.MeterRegistry;
  * <p>
  * Every request head is checked against its route's credentials
  * ({@link RouteAuthenticator}), the first one included; the headers of the route's
- * credentials are removed from a head that passes unless the route forwards them.
+ * credentials are removed from a head that passes unless the route forwards them, and the
+ * headers its verdict adds are set. A head the check answers itself -- a refusal, the
+ * browser sign-in's redirect -- ends the connection like a refused one.
  * <p>
  * A malformed request -- input the parser cannot follow, see {@link Http1RequestParser}
  * -- ends the connection at a request boundary: nothing of it or after it is relayed, the
@@ -669,7 +674,9 @@ final class ReroutingRelay {
 			}
 		}
 		Router.Route route = resolved.route();
-		Verdict verdict = this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head));
+		Origin origin = this.forwarding.origin(ConnectionHeadParser.http1Headers(head),
+				ConnectionHeadParser.http1HostOf(head));
+		Verdict verdict = this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head), origin);
 		if (!(verdict instanceof Verdict.Pass pass)) {
 			this.access.refused(route, ConnectionHeadParser.http1RequestOf(head), verdict);
 			this.refusal = this.errorResponse.refusal(ConnectionHeadParser.Head.http1(head, host), verdict);
@@ -695,7 +702,7 @@ final class ReroutingRelay {
 						return;
 					}
 					route = resolved.route();
-					verdict = this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head));
+					verdict = this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head), origin);
 					if (!(verdict instanceof Verdict.Pass passed)) {
 						this.access.refused(route, ConnectionHeadParser.http1RequestOf(head), verdict);
 						this.refusal = this.errorResponse.refusal(ConnectionHeadParser.Head.http1(head, host), verdict);
@@ -729,7 +736,9 @@ final class ReroutingRelay {
 				ConnectionHeadParser.http1HostOf(head));
 		Set<String> removed = new HashSet<>(pass.strip());
 		removed.addAll(forwarded.removed());
-		byte[] stripped = ConnectionHeadRewriter.withHeaders(head, removed, forwarded.added());
+		Map<String, String> added = new LinkedHashMap<>(pass.add());
+		added.putAll(forwarded.added());
+		byte[] stripped = ConnectionHeadRewriter.withHeaders(head, removed, added);
 		byte[] relayed = route.rewriteHost() ? ConnectionHeadRewriter.rewriteHttp1(stripped, route.address())
 				: stripped;
 		leg.toUpstream(relayed, 0, relayed.length);

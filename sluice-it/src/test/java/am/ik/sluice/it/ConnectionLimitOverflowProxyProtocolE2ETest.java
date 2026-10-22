@@ -6,18 +6,13 @@ import java.io.InputStream;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.KeyStore;
 import java.time.Duration;
 import java.util.Objects;
-import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
-import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
-import javax.net.ssl.TrustManagerFactory;
 
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -93,7 +88,7 @@ class ConnectionLimitOverflowProxyProtocolE2ETest {
 	static void properties(DynamicPropertyRegistry registry) throws Exception {
 		grpcPort = TestPorts.freePort();
 		dataPort = TestPorts.freePort();
-		keystorePath = createKeystore();
+		keystorePath = TestKeystore.create();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.data-proxy-protocol", () -> "true");
@@ -108,36 +103,6 @@ class ConnectionLimitOverflowProxyProtocolE2ETest {
 				() -> "file:" + Objects.requireNonNull(keystorePath).toAbsolutePath());
 		registry.add("spring.ssl.bundle.jks.data-plane.keystore.password", () -> "changeit");
 		registry.add("sluice.data-tls-bundle", () -> "data-plane");
-	}
-
-	private static Path createKeystore() throws Exception {
-		Path keystore = Files.createTempFile("sluice-e2e", ".p12");
-		Files.delete(keystore);
-		String keytool = Path.of(System.getProperty("java.home"), "bin", "keytool").toString();
-		Process process = new ProcessBuilder(keytool, "-genkeypair", "-alias", "e2e", "-keyalg", "RSA", "-keysize",
-				"2048", "-storetype", "PKCS12", "-storepass", "changeit", "-dname", "CN=localhost", "-ext",
-				"san=dns:localhost,ip:127.0.0.1", "-validity", "1", "-keystore", keystore.toAbsolutePath().toString())
-			.redirectErrorStream(true)
-			.start();
-		if (!process.waitFor(60, TimeUnit.SECONDS) || process.exitValue() != 0) {
-			throw new IllegalStateException(
-					"keytool failed: " + new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8));
-		}
-		keystore.toFile().deleteOnExit();
-		return keystore;
-	}
-
-	private static SSLContext clientSslContext() throws Exception {
-		KeyStore keyStore = KeyStore.getInstance("PKCS12");
-		try (InputStream in = Files.newInputStream(Objects.requireNonNull(keystorePath))) {
-			keyStore.load(in, "changeit".toCharArray());
-		}
-		TrustManagerFactory trustManagerFactory = TrustManagerFactory
-			.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-		trustManagerFactory.init(keyStore);
-		SSLContext sslContext = SSLContext.getInstance("TLS");
-		sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
-		return sslContext;
 	}
 
 	@BeforeEach
@@ -222,7 +187,8 @@ class ConnectionLimitOverflowProxyProtocolE2ETest {
 				raw.getOutputStream().flush();
 				Socket socket = raw;
 				if (tls) {
-					SSLSocket ssl = (SSLSocket) clientSslContext().getSocketFactory()
+					SSLSocket ssl = (SSLSocket) TestKeystore.clientContext(Objects.requireNonNull(keystorePath))
+						.getSocketFactory()
 						.createSocket(raw, "127.0.0.1", dataPort, true);
 					SSLParameters parameters = ssl.getSSLParameters();
 					parameters.setApplicationProtocols(new String[] { "http/1.1" });

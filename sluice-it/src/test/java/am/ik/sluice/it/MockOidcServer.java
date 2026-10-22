@@ -29,7 +29,7 @@ import com.sun.net.httpserver.HttpServer;
  * plus optionally RP-initiated logout (an end session endpoint that redirects straight
  * back).
  */
-class MockOidcServer implements AutoCloseable {
+public class MockOidcServer implements AutoCloseable {
 
 	private static final Base64.Encoder URL_ENCODER = Base64.getUrlEncoder().withoutPadding();
 
@@ -47,7 +47,7 @@ class MockOidcServer implements AutoCloseable {
 
 	private volatile Map<String, String> lastLogout = Map.of();
 
-	MockOidcServer(String clientId) {
+	public MockOidcServer(String clientId) {
 		this(clientId, true);
 	}
 
@@ -89,7 +89,7 @@ class MockOidcServer implements AutoCloseable {
 		this.server.stop(0);
 	}
 
-	String issuer() {
+	public String issuer() {
 		return "http://127.0.0.1:" + this.server.getAddress().getPort();
 	}
 
@@ -129,10 +129,12 @@ class MockOidcServer implements AutoCloseable {
 	 */
 	private void authorize(HttpExchange exchange) throws IOException {
 		Map<String, String> query = parseQuery(exchange.getRequestURI().getRawQuery());
-		String redirectUri = query.get("redirect_uri");
+		String redirectUri = URLDecoder.decode(query.get("redirect_uri"), StandardCharsets.UTF_8);
+		// echoed as it came
 		String state = query.getOrDefault("state", "");
-		// Spring Security validates the nonce claim of the id token itself
-		this.nonce = query.get("nonce");
+		// the client validates the nonce claim of the id token itself
+		String nonce = query.get("nonce");
+		this.nonce = nonce == null ? null : URLDecoder.decode(nonce, StandardCharsets.UTF_8);
 		exchange.getResponseHeaders().set("Location", redirectUri + "?code=mock-code&state=" + state);
 		exchange.sendResponseHeaders(302, -1);
 	}

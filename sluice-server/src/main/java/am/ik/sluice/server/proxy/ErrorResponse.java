@@ -6,6 +6,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -26,6 +27,7 @@ import io.netty.handler.codec.http2.Http2Headers;
 
 import org.springframework.stereotype.Component;
 
+import am.ik.sluice.server.auth.RouteAuthenticator;
 import am.ik.sluice.server.auth.Verdict;
 
 /**
@@ -36,13 +38,15 @@ import am.ik.sluice.server.auth.Verdict;
  * page with the route's {@code WWW-Authenticate} challenges for a request without its
  * credentials, the 503 busy page with {@code Retry-After} for a request whose credentials
  * could not be checked for the checks in flight or for its OIDC provider's keys not
- * loaded, a bare HTTP/1.1 400 for a malformed request, the 502 page for a request its
- * upstream lost before answering (HTTP/1.1: on its connection; HTTP/2: on its stream), a
- * bodiless HTTP/2 421 for a stream of a route reached over HTTP/1.1 only, a GOAWAY
- * {@code COMPRESSION_ERROR} for an HTTP/2 head whose header block does not decode, a
- * GOAWAY processing no stream for an HTTP/2 connection whose relay does not fit, and the
- * 503 busy page with {@code Retry-After} for a request past the connection limit. The
- * default error is a problem details document (RFC 9457,
+ * loaded, the browser sign-in's bodiless 302 with its {@code Location} and
+ * {@code Set-Cookie}s and its 403 denied page (a signed-in user the route does not admit,
+ * a sign-in over plaintext, a failed callback), a bare HTTP/1.1 400 for a malformed
+ * request, the 502 page for a request its upstream lost before answering (HTTP/1.1: on
+ * its connection; HTTP/2: on its stream), a bodiless HTTP/2 421 for a stream of a route
+ * reached over HTTP/1.1 only, a GOAWAY {@code COMPRESSION_ERROR} for an HTTP/2 head whose
+ * header block does not decode, a GOAWAY processing no stream for an HTTP/2 connection
+ * whose relay does not fit, and the 503 busy page with {@code Retry-After} for a request
+ * past the connection limit. The default error is a problem details document (RFC 9457,
  * {@code application/problem+json}) ({@link ConnectionHeadParser.Head.Request#json});
  * only a request whose {@code Accept} names {@code text/html} gets the page in place of
  * it; the headers stay headers.
@@ -78,6 +82,8 @@ public class ErrorResponse {
 
 	private final Page unauthorized;
 
+	private final Page denied;
+
 	ErrorResponse(Mustache.Compiler compiler) {
 		this.noRoute = new Page(compiler.loadTemplate("proxy/no-route"), "503 Service Unavailable",
 				"No tunnel is connected for this host.");
@@ -89,6 +95,7 @@ public class ErrorResponse {
 				"The server is at its connection limit.");
 		this.unauthorized = new Page(compiler.loadTemplate("proxy/unauthorized"), "401 Unauthorized",
 				"Credentials are required.");
+		this.denied = new Page(compiler.loadTemplate("proxy/denied"), "403 Forbidden", "");
 	}
 
 	/**
@@ -114,9 +121,10 @@ public class ErrorResponse {
 	}
 
 	/**
-	 * The answer to a request its route's credential check refused: {@link #unauthorized}
-	 * or the busy page of {@link #verificationBusy} / {@link Verdict.Unavailable}; empty
-	 * for a verdict that passes.
+	 * The answer to a request its route's credential check answered:
+	 * {@link #unauthorized}, the busy page of {@link #verificationBusy} /
+	 * {@link Verdict.Unavailable}, the denied page of {@link Verdict.Forbidden} or the
+	 * redirect of {@link Verdict.Redirect}; empty for a verdict that passes.
 	 */
 	public byte[] refusal(ConnectionHeadParser.Head head, Verdict verdict) {
 		return switch (verdict) {
@@ -124,14 +132,18 @@ public class ErrorResponse {
 			case Verdict.Busy busy -> this.verificationBusy(head, busy.retryAfter());
 			case Verdict.Unavailable unavailable ->
 				this.render(head, this.busy.keysUnloaded().retryingAfter(unavailable.retryAfter().toSeconds()));
+			case Verdict.Forbidden forbidden -> this.render(head, this.denied.forbidding(forbidden.reason()));
+			case Verdict.Redirect redirect -> this.render(head, Page.redirecting(redirect));
 			case Verdict.Pass pass -> new byte[0];
 		};
 	}
 
 	/**
-	 * The page on a single stream its route's credential check refused, for a relay whose
-	 * HTTP/2 codec frames it: {@link #unauthorizedPage}, {@link #verificationBusyPage} or
-	 * the busy page of {@link Verdict.Unavailable}.
+	 * The page on a single stream its route's credential check answered, for a relay
+	 * whose HTTP/2 codec frames it: {@link #unauthorizedPage},
+	 * {@link #verificationBusyPage}, the busy page of {@link Verdict.Unavailable}, the
+	 * denied page of {@link Verdict.Forbidden} or the redirect of
+	 * {@link Verdict.Redirect}.
 	 * @throws IllegalArgumentException for a verdict that passes
 	 */
 	public StreamPage refusalPage(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request,
@@ -141,6 +153,9 @@ public class ErrorResponse {
 			case Verdict.Busy busy -> this.verificationBusyPage(host, request, busy.retryAfter());
 			case Verdict.Unavailable unavailable -> this.streamPage(
 					this.busy.keysUnloaded().retryingAfter(unavailable.retryAfter().toSeconds()), host, request);
+			case Verdict.Forbidden forbidden ->
+				this.streamPage(this.denied.forbidding(forbidden.reason()), host, request);
+			case Verdict.Redirect redirect -> this.streamPage(Page.redirecting(redirect), host, request);
 			case Verdict.Pass pass -> throw new IllegalArgumentException("the request passed");
 		};
 	}
@@ -266,10 +281,11 @@ public class ErrorResponse {
 			ConnectionHeadParser.Head.@Nullable Request request) {
 		boolean withBody = request != null && !isHead(request);
 		byte[] body = this.page(host, request, page);
-		Http2Headers headers = new DefaultHttp2Headers().status(page.status())
-			.set("content-type", contentType(request))
-			.set("content-length", String.valueOf(body.length))
-			.set("cache-control", "no-store");
+		Http2Headers headers = new DefaultHttp2Headers().status(page.status());
+		if (page.page() != null) {
+			headers.set("content-type", contentType(request));
+		}
+		headers.set("content-length", String.valueOf(body.length)).set("cache-control", "no-store");
 		page.addHeaders(headers);
 		return new StreamPage(headers, withBody ? body : new byte[0]);
 	}
@@ -287,15 +303,23 @@ public class ErrorResponse {
 	}
 
 	private byte[] page(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request, Page page) {
+		Template template = page.page();
+		if (template == null) {
+			return new byte[0];
+		}
 		if (request != null && request.json()) {
 			return page.problem().getBytes(StandardCharsets.UTF_8);
 		}
 		// an empty value skips its section (emptyStringIsFalse)
-		Map<String, String> context = Map.of("host", host == null ? "" : host, "method",
-				request == null ? "" : request.method(), "path", request == null ? "" : request.path(), "verifying",
-				page.line().cause() == Cause.VERIFYING ? "true" : "", "keys",
-				page.line().cause() == Cause.KEYS ? "true" : "");
-		return page.page().execute(context).getBytes(StandardCharsets.UTF_8);
+		Map<String, String> context = new HashMap<>();
+		context.put("host", host == null ? "" : host);
+		context.put("method", request == null ? "" : request.method());
+		context.put("path", request == null ? "" : request.path());
+		for (Cause cause : Cause.values()) {
+			context.put(cause.key(), page.line().cause() == cause ? "true" : "");
+		}
+		context.put("signOut", RouteAuthenticator.SIGN_OUT_PATH);
+		return template.execute(context).getBytes(StandardCharsets.UTF_8);
 	}
 
 	private byte[] render(ConnectionHeadParser.Head head, Page page) {
@@ -317,9 +341,9 @@ public class ErrorResponse {
 		for (Header header : page.line().headers()) {
 			headers.append(header.name()).append(": ").append(header.value()).append("\r\n");
 		}
-		String responseHead = "HTTP/1.1 " + page.reason() + "\r\n" + "Content-Type: " + contentType(request) + "\r\n"
-				+ "Content-Length: " + body.length + "\r\n" + "Cache-Control: no-store\r\n" + headers
-				+ "Connection: close\r\n\r\n";
+		String contentType = page.page() == null ? "" : "Content-Type: " + contentType(request) + "\r\n";
+		String responseHead = "HTTP/1.1 " + page.reason() + "\r\n" + contentType + "Content-Length: " + body.length
+				+ "\r\n" + "Cache-Control: no-store\r\n" + headers + "Connection: close\r\n\r\n";
 		ByteArrayOutputStream out = new ByteArrayOutputStream(responseHead.length() + body.length);
 		out.writeBytes(responseHead.getBytes(StandardCharsets.US_ASCII));
 		if (!isHead(request)) {
@@ -338,10 +362,11 @@ public class ErrorResponse {
 		int streamId = head.h2() == null ? 1 : head.h2().streamId();
 		boolean withBody = request != null && !isHead(request);
 		byte[] body = request == null ? new byte[0] : this.page(head, page);
-		Http2Headers headers = new DefaultHttp2Headers().status(page.status())
-			.set("content-type", contentType(request))
-			.set("content-length", String.valueOf(body.length))
-			.set("cache-control", "no-store");
+		Http2Headers headers = new DefaultHttp2Headers().status(page.status());
+		if (page.page() != null) {
+			headers.set("content-type", contentType(request));
+		}
+		headers.set("content-length", String.valueOf(body.length)).set("cache-control", "no-store");
 		page.addHeaders(headers);
 		Http2Frames frames = new Http2Frames(streamId);
 		frames.write(Http2Frame.SETTINGS, new byte[0]);
@@ -373,11 +398,39 @@ public class ErrorResponse {
 		return "HEAD".equals(request.method());
 	}
 
-	/** An error page: its template and its status. */
-	private record Page(Template page, Status line, String detail) {
+	/**
+	 * An error page: its template and its status; a redirect has no template, no body.
+	 */
+	private record Page(@Nullable Template page, Status line, String detail) {
 
 		private Page(Template page, String reason, String detail) {
 			this(page, new Status(reason, List.of(), Cause.NONE), detail);
+		}
+
+		/**
+		 * The browser sign-in's redirect: a bodiless {@code 302 Found} with its
+		 * {@code Location} and {@code Set-Cookie}s.
+		 */
+		private static Page redirecting(Verdict.Redirect redirect) {
+			List<Header> headers = new ArrayList<>();
+			headers.add(new Header("Location", redirect.location()));
+			redirect.cookies().forEach(cookie -> headers.add(new Header("Set-Cookie", cookie)));
+			return new Page(null, new Status("302 Found", headers, Cause.NONE), "");
+		}
+
+		/** The denied page telling why the browser sign-in forbade the request. */
+		private Page forbidding(String reason) {
+			return switch (reason) {
+				case Verdict.Forbidden.DENIED ->
+					this.because(Cause.DENIED, "The signed-in user is not allowed to access this host.");
+				case Verdict.Forbidden.INSECURE ->
+					this.because(Cause.INSECURE, "Signing in to this host requires https.");
+				default -> this.because(Cause.FAILED, "The sign-in failed.");
+			};
+		}
+
+		private Page because(Cause cause, String detail) {
+			return new Page(this.page, new Status(this.line.reason(), this.line.headers(), cause), detail);
 		}
 
 		/**
@@ -460,7 +513,10 @@ public class ErrorResponse {
 	private record Header(String name, String value) {
 	}
 
-	/** Why a busy page could not check the request's credentials. */
+	/**
+	 * Why a busy page could not check the request's credentials, or why the denied page
+	 * forbade the request; the page's template reads it under {@link #key()}.
+	 */
 	private enum Cause {
 
 		/** It does not tell: the connection limit. */
@@ -470,7 +526,20 @@ public class ErrorResponse {
 		VERIFYING,
 
 		/** The OIDC provider's keys are not loaded. */
-		KEYS
+		KEYS,
+
+		/** A signed-in user the route does not admit. */
+		DENIED,
+
+		/** A sign-in over plaintext. */
+		INSECURE,
+
+		/** A callback whose sign-in failed. */
+		FAILED;
+
+		private String key() {
+			return this.name().toLowerCase(Locale.ROOT);
+		}
 
 	}
 

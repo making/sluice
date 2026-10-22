@@ -337,10 +337,36 @@ class RouteAuthenticatorOidcTest {
 		misconfigured.put(this.oidc().claims(Map.of("groups", List.of())).build(),
 				"claims.groups names no value, or an empty one");
 		misconfigured.put(this.oidc().clockSkew(Duration.ofSeconds(-1)).build(), "clock-skew is negative");
+		misconfigured.put(this.oidc().clientId("app").scopes(List.of("email")).build(),
+				"scopes [email] names no openid, or a malformed scope");
+		misconfigured.put(this.oidc().clientId("app").sessionMaxAge(Duration.ZERO).build(),
+				"session-max-age is not positive");
+		for (String header : List.of("Cookie", "X-Forwarded-For", "Authorization", "X User")) {
+			misconfigured.put(this.oidc().clientId("app").headers(Map.of(header, "email")).build(),
+					"headers." + header + " is no header name, or names one the relay sets or a credential header");
+		}
+		misconfigured.put(this.oidc().clientId("app").headers(Map.of("X-User", " ")).build(),
+				"headers.X-User names no claim");
 		misconfigured.forEach((oidc, message) -> assertThatIllegalStateException()
 			.isThrownBy(
 					() -> this.authenticator(SluiceServerProperties.Route.Auth.builder().oidc(oidc).build(), TIMING))
 			.withMessage("sluice.route.auth.[api.local].oidc." + message));
+		SluiceServerProperties.Route.Auth signIn = SluiceServerProperties.Route.Auth.builder()
+			.oidc(this.oidc().audiences(List.of()).clientId("app").build())
+			.build();
+		assertThatIllegalStateException().isThrownBy(() -> this.authenticator(SluiceServerProperties.builder()
+			.route(SluiceServerProperties.Route.builder()
+				.auth(Map.of(ROUTE, signIn))
+				.sessionSecret("x".repeat(31))
+				.build())
+			.build(), TIMING)).withMessage("sluice.route.session-secret is shorter than 32 characters");
+		assertThatIllegalStateException()
+			.isThrownBy(() -> this.authenticator(SluiceServerProperties.builder()
+				.cluster(SluiceServerProperties.Cluster.builder().nodes(List.of("a", "b")).build())
+				.route(SluiceServerProperties.Route.builder().auth(Map.of(ROUTE, signIn)).build())
+				.build(), TIMING))
+			.withMessage("routes [api.local] sign browsers in: cluster mode requires sluice.route.session-secret, "
+					+ "the same on every node");
 		assertThat(this.issuer.jwksFetches()).as("no load for a start that failed").isZero();
 	}
 
@@ -366,13 +392,15 @@ class RouteAuthenticatorOidcTest {
 	}
 
 	private RouteAuthenticator authenticator(SluiceServerProperties.Route.Auth auth, OidcIssuers.Timing timing) {
-		RouteAuthenticator authenticator = new RouteAuthenticator(
-				SluiceServerProperties.builder()
-					.route(SluiceServerProperties.Route.builder().auth(Map.of(ROUTE, auth)).build())
-					.build(),
-				PasswordEncoders.delegating(), 2, RouteAuthenticator.CACHE_SIZE, this.now::get,
-				RouteAuthenticatorTest.VIRTUAL, new OidcIssuers(timing, this.clock, this.now::get,
-						RouteAuthenticatorTest.VIRTUAL, RestClient.builder()));
+		return this.authenticator(SluiceServerProperties.builder()
+			.route(SluiceServerProperties.Route.builder().auth(Map.of(ROUTE, auth)).build())
+			.build(), timing);
+	}
+
+	private RouteAuthenticator authenticator(SluiceServerProperties properties, OidcIssuers.Timing timing) {
+		RouteAuthenticator authenticator = new RouteAuthenticator(properties, PasswordEncoders.delegating(), 2,
+				RouteAuthenticator.CACHE_SIZE, this.now::get, RouteAuthenticatorTest.VIRTUAL, new OidcIssuers(timing,
+						this.clock, this.now::get, RouteAuthenticatorTest.VIRTUAL, RestClient.builder()));
 		this.authenticators.add(authenticator);
 		return authenticator;
 	}
@@ -392,11 +420,16 @@ class RouteAuthenticatorOidcTest {
 					}
 
 					@Override
+					public String target() {
+						return "/";
+					}
+
+					@Override
 					public List<String> values(String name) {
 						return name.equals("authorization") ? List.of(authorization) : List.of();
 					}
 
-				});
+				}, Origin.UNKNOWN);
 	}
 
 }

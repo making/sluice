@@ -896,14 +896,18 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 	 * TLS passthrough or non-HTTP connection to the route is refused
 	 * @param accessLog the access log lines of a route, in place of
 	 * {@code sluice.access-log}'s; absent = those
+	 * @param sessionSecret the secret the browser sign-in's cookies are sealed with (at
+	 * least 32 characters), the same on every node; empty = a random one per start on a
+	 * single node, refused in cluster mode
 	 */
 	public record Route(@DefaultValue Map<String, GateState> gate, @DefaultValue Map<String, Auth> auth,
-			@DefaultValue Map<String, AccessLog> accessLog) {
+			@DefaultValue Map<String, AccessLog> accessLog, @DefaultValue("") String sessionSecret) {
 
 		public Route {
 			gate = gate == null ? Map.of() : Map.copyOf(gate);
 			auth = auth == null ? Map.of() : Map.copyOf(auth);
 			accessLog = accessLog == null ? Map.of() : Map.copyOf(accessLog);
+			sessionSecret = sessionSecret == null ? "" : sessionSecret;
 		}
 
 		/**
@@ -937,7 +941,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		 * {@code Access-Control-Request-Method}) passes without credentials: browsers
 		 * send none on it
 		 * @param oidc the provider whose access tokens are accepted as
-		 * {@code Authorization: Bearer <JWT>}; absent = none
+		 * {@code Authorization: Bearer <JWT>} (with {@code audiences}), and browsers sign
+		 * in through (with {@code client-id}); absent = none
 		 */
 		public record Auth(@DefaultValue Map<String, String> basic, @DefaultValue List<String> bearer,
 				@DefaultValue List<String> apiToken, @DefaultValue("X-API-Token") String apiTokenHeader,
@@ -1030,22 +1035,37 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 			/**
 			 * An OpenID Provider whose signed JWT access tokens a route accepts
-			 * (resource-server style). Its keys are discovered from the issuer and
-			 * refreshed in the background.
+			 * (resource-server style), and browsers sign in through (an OIDC client,
+			 * {@code client-id}). Its keys and endpoints are discovered from the issuer
+			 * and refreshed in the background.
 			 *
 			 * @param issuerUri the issuer: its discovery document is
 			 * {@code <issuer-uri>/.well-known/openid-configuration}, and a token's
 			 * {@code iss} must equal it
-			 * @param audiences a token's {@code aud} must hold one of them
-			 * @param jwsAlgorithms the signature algorithms accepted (RS, ES, PS)
-			 * @param claims further claims a token must carry: the claim name to the
-			 * values accepted, {@code *} matching any run of characters; a list claim
-			 * must hold one of them
+			 * @param audiences a token's {@code aud} must hold one of them; empty = no
+			 * access token accepted (a route signing browsers in only)
+			 * @param jwsAlgorithms the signature algorithms accepted (RS, ES, PS), of the
+			 * access tokens and of the browser sign-in's ID tokens
+			 * @param claims further claims a token, or a signed-in user's ID token, must
+			 * carry: the claim name to the values accepted, {@code *} matching any run of
+			 * characters; a list claim must hold one of them
 			 * @param clockSkew the leeway of {@code exp} / {@code nbf}
+			 * @param clientId the client the route signs browsers in as (authorization
+			 * code flow with PKCE); empty = no browser sign-in
+			 * @param clientSecret the client's secret; empty = a public client
+			 * @param scopes the scopes the sign-in requests; {@code openid} among them
+			 * @param sessionMaxAge how long a browser stays signed in before it signs in
+			 * anew
+			 * @param headers the headers telling the upstream who signed in: the header
+			 * name to the claim of the ID token it carries; removed from every request of
+			 * the route that the client sent
 			 */
 			public record Oidc(String issuerUri, @DefaultValue List<String> audiences,
 					@DefaultValue("RS256") List<String> jwsAlgorithms, @DefaultValue Map<String, List<String>> claims,
-					@DefaultValue("60s") Duration clockSkew) {
+					@DefaultValue("60s") Duration clockSkew, @DefaultValue("") String clientId,
+					@DefaultValue("") String clientSecret, @DefaultValue( {
+							"openid", "email", "profile" }) List<String> scopes,
+					@DefaultValue("8h") Duration sessionMaxAge, @DefaultValue Map<String, String> headers){
 
 				public Oidc {
 					issuerUri = issuerUri == null ? "" : issuerUri.strip();
@@ -1054,6 +1074,17 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 							: List.copyOf(jwsAlgorithms);
 					claims = claims == null ? Map.of() : Map.copyOf(claims);
 					clockSkew = clockSkew == null ? Duration.ofSeconds(60) : clockSkew;
+					clientId = clientId == null ? "" : clientId.strip();
+					clientSecret = clientSecret == null ? "" : clientSecret;
+					scopes = scopes == null || scopes.isEmpty() ? List.of("openid", "email", "profile")
+							: List.copyOf(scopes);
+					sessionMaxAge = sessionMaxAge == null ? Duration.ofHours(8) : sessionMaxAge;
+					headers = headers == null ? Map.of() : Map.copyOf(headers);
+				}
+
+				/** Whether the route signs browsers in. */
+				public boolean signsIn() {
+					return !this.clientId.isEmpty();
 				}
 
 				public static Builder builder() {
@@ -1071,6 +1102,16 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 					private Map<String, List<String>> claims = Map.of();
 
 					private Duration clockSkew = Duration.ofSeconds(60);
+
+					private String clientId = "";
+
+					private String clientSecret = "";
+
+					private List<String> scopes = List.of("openid", "email", "profile");
+
+					private Duration sessionMaxAge = Duration.ofHours(8);
+
+					private Map<String, String> headers = Map.of();
 
 					private Builder() {
 					}
@@ -1100,9 +1141,34 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 						return this;
 					}
 
+					public Builder clientId(String clientId) {
+						this.clientId = clientId;
+						return this;
+					}
+
+					public Builder clientSecret(String clientSecret) {
+						this.clientSecret = clientSecret;
+						return this;
+					}
+
+					public Builder scopes(List<String> scopes) {
+						this.scopes = scopes;
+						return this;
+					}
+
+					public Builder sessionMaxAge(Duration sessionMaxAge) {
+						this.sessionMaxAge = sessionMaxAge;
+						return this;
+					}
+
+					public Builder headers(Map<String, String> headers) {
+						this.headers = headers;
+						return this;
+					}
+
 					public Oidc build() {
-						return new Oidc(this.issuerUri, this.audiences, this.jwsAlgorithms, this.claims,
-								this.clockSkew);
+						return new Oidc(this.issuerUri, this.audiences, this.jwsAlgorithms, this.claims, this.clockSkew,
+								this.clientId, this.clientSecret, this.scopes, this.sessionMaxAge, this.headers);
 					}
 
 				}
@@ -1123,6 +1189,8 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 			private Map<String, AccessLog> accessLog = Map.of();
 
+			private String sessionSecret = "";
+
 			private Builder() {
 			}
 
@@ -1141,8 +1209,14 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 				return this;
 			}
 
+			public Builder sessionSecret(String sessionSecret) {
+				this.sessionSecret = sessionSecret;
+				return this;
+			}
+
 			public Route build() {
-				return new Route(this.gate == null ? Map.of() : this.gate, this.auth, this.accessLog);
+				return new Route(this.gate == null ? Map.of() : this.gate, this.auth, this.accessLog,
+						this.sessionSecret);
 			}
 
 		}

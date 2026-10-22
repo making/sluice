@@ -40,6 +40,11 @@ class ErrorResponseTest {
 					+ "Content-Length: 0\r\nCache-Control: no-store\r\nRetry-After: 7\r\nConnection: close\r\n\r\n");
 	}
 
+	/**
+	 * A request refused for its credentials gets a 401 with every challenge, a busy check
+	 * a 503, and the browser sign-in's answers are a bodiless 302 with its cookies and a
+	 * 403 telling why.
+	 */
 	@Test
 	void anUnauthorizedRequestGetsA401WithEveryChallengeAndABusyCheckA503() {
 		ConnectionHeadParser.Head head = head("GET / HTTP/1.1\r\nHost: a.local\r\nAccept: text/html\r\n\r\n");
@@ -60,6 +65,25 @@ class ErrorResponseTest {
 		assertThat(page.headers().status()).hasToString("401");
 		assertThat(page.headers().getAll("www-authenticate")).map(CharSequence::toString)
 			.containsExactlyElementsOf(challenges);
+
+		Verdict.Redirect redirect = new Verdict.Redirect("https://idp.example/authorize?state=s",
+				List.of("__Host-a=1; Path=/", "__Host-b=; Max-Age=0"), Verdict.Redirect.SIGN_IN);
+		assertThat(new String(this.errorResponse.refusal(head, redirect), StandardCharsets.US_ASCII))
+			.isEqualTo("HTTP/1.1 302 Found\r\nContent-Length: 0\r\nCache-Control: no-store\r\n"
+					+ "Location: https://idp.example/authorize?state=s\r\nSet-Cookie: __Host-a=1; Path=/\r\n"
+					+ "Set-Cookie: __Host-b=; Max-Age=0\r\nConnection: close\r\n\r\n");
+		ErrorResponse.StreamPage redirected = this.errorResponse.refusalPage("a.local",
+				new ConnectionHeadParser.Head.Request("GET", "/", "2", false), redirect);
+		assertThat(redirected.headers().status()).hasToString("302");
+		assertThat(redirected.headers().get("location")).hasToString(redirect.location());
+		assertThat(redirected.headers().getAll("set-cookie")).map(CharSequence::toString)
+			.containsExactlyElementsOf(redirect.cookies());
+		assertThat(redirected.headers().contains("content-type")).isFalse();
+		assertThat(redirected.body()).isEmpty();
+		assertThat(new String(this.errorResponse.refusal(head("GET / HTTP/1.1\r\nHost: a.local\r\n\r\n"),
+				new Verdict.Forbidden(Verdict.Forbidden.DENIED)), StandardCharsets.US_ASCII))
+			.startsWith("HTTP/1.1 403 Forbidden\r\nContent-Type: application/problem+json\r\n")
+			.endsWith("\"status\":403,\"detail\":\"The signed-in user is not allowed to access this host.\"}");
 	}
 
 	@Test
@@ -102,7 +126,10 @@ class ErrorResponseTest {
 		assertThat(unavailable.headers().get("retry-after")).hasToString("10");
 	}
 
-	/** The busy page tells which of its causes refused the request. */
+	/**
+	 * The busy page tells which of its causes refused the request, the sign-in's denied
+	 * page why it forbade it.
+	 */
 	@Test
 	void theBusyPageTellsItsCause() {
 		ErrorResponse pages = new ErrorResponse(Mustache.compiler().emptyStringIsFalse(true).withLoader(name -> {
@@ -121,6 +148,16 @@ class ErrorResponseTest {
 			.doesNotContain("connection limit", "keys");
 		assertThat(keys).contains("has not loaded the keys", "provider keys not loaded")
 			.doesNotContain("connection limit", "credential checks");
+		String denied = new String(pages.refusal(head, new Verdict.Forbidden(Verdict.Forbidden.DENIED)),
+				StandardCharsets.UTF_8);
+		String insecure = new String(pages.refusal(head, new Verdict.Forbidden(Verdict.Forbidden.INSECURE)),
+				StandardCharsets.UTF_8);
+		String failed = new String(pages.refusal(head, new Verdict.Forbidden(Verdict.Forbidden.FAILED)),
+				StandardCharsets.UTF_8);
+		assertThat(denied).contains("Not allowed for this user", "href=\"/.sluice/oauth2/sign-out\"")
+			.doesNotContain("requires https", "Sign-in failed");
+		assertThat(insecure).contains("Sign-in requires https").doesNotContain("Not allowed", "Sign-in failed");
+		assertThat(failed).contains("Sign-in failed", "href=\"/\"").doesNotContain("Not allowed", "requires https");
 	}
 
 	@Test

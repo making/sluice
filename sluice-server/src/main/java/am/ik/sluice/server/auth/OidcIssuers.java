@@ -18,11 +18,11 @@ import org.springframework.boot.http.client.HttpClientSettings;
 import org.springframework.web.client.RestClient;
 
 /**
- * The OIDC issuers the routes accept tokens of, one {@link IssuerKeys} each however many
- * routes name it, sharing a {@link RestClient} made with the first issuer from the
- * server's builder: its connect and read timeouts are the fetch timeout. The client and
- * every stage of the loads run on the executor (the server's virtual thread
- * {@code applicationTaskExecutor}).
+ * The OIDC issuers the routes accept tokens of or sign in through, one {@link IssuerKeys}
+ * each however many routes name it, sharing a {@link RestClient} made with the first
+ * issuer from the server's builder: its connect and read timeouts are the fetch timeout.
+ * The client and every stage of the loads run on the executor (the server's virtual
+ * thread {@code applicationTaskExecutor}).
  */
 final class OidcIssuers implements AutoCloseable {
 
@@ -67,20 +67,28 @@ final class OidcIssuers implements AutoCloseable {
 	synchronized IssuerKeys keys(String issuer) {
 		IssuerKeys keys = this.issuers.get(issuer);
 		if (keys == null) {
-			RestClient client = this.http;
-			if (client == null) {
-				client = this.restClientBuilder
-					.requestFactory(ClientHttpRequestFactoryBuilder.jdk()
-						.withExecutor(this.executor)
-						.build(HttpClientSettings.defaults()
-							.withTimeouts(this.timing.fetchTimeout(), this.timing.fetchTimeout())))
-					.build();
-				this.http = client;
-			}
-			keys = new IssuerKeys(issuer, client, this.executor, this.timing, this.nanos);
+			keys = new IssuerKeys(issuer, this.http(), this.executor, this.timing, this.nanos);
 			this.issuers.put(issuer, keys);
 		}
 		return keys;
+	}
+
+	/**
+	 * The client the issuers' documents are fetched with, and the browser sign-in's codes
+	 * exchanged.
+	 */
+	synchronized RestClient http() {
+		RestClient client = this.http;
+		if (client == null) {
+			client = this.restClientBuilder
+				.requestFactory(ClientHttpRequestFactoryBuilder.jdk()
+					.withExecutor(this.executor)
+					.build(HttpClientSettings.defaults()
+						.withTimeouts(this.timing.fetchTimeout(), this.timing.fetchTimeout())))
+				.build();
+			this.http = client;
+		}
+		return client;
 	}
 
 	/**

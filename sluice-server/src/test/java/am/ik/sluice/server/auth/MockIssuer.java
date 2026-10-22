@@ -35,8 +35,9 @@ import com.sun.net.httpserver.HttpServer;
 
 /**
  * An OIDC issuer for the tests: its discovery document and JWKS over HTTP on the
- * loopback, and the signed access tokens of its keys. It counts the fetches and can fail
- * them in the ways an issuer does ({@link Fault}).
+ * loopback, the signed access tokens of its keys, and a token endpoint answering the
+ * codes it was told of ({@link #code}) with their ID tokens. It counts the fetches and
+ * can fail them in the ways an issuer does ({@link Fault}).
  */
 final class MockIssuer implements AutoCloseable {
 
@@ -81,6 +82,12 @@ final class MockIssuer implements AutoCloseable {
 	/** Held, the JWKS answers once it is counted down. */
 	private volatile CountDownLatch held = new CountDownLatch(0);
 
+	/** The ID tokens the token endpoint answers, by code. */
+	private final Map<String, String> codes = new java.util.concurrent.ConcurrentHashMap<>();
+
+	/** The last token request: its form, and its Authorization header under {@code -}. */
+	private volatile Map<String, String> tokenRequest = Map.of();
+
 	MockIssuer() {
 		this.signing = rsa("key-1");
 		this.published = List.of(this.signing);
@@ -92,6 +99,7 @@ final class MockIssuer implements AutoCloseable {
 		}
 		this.server.createContext("/.well-known/openid-configuration", this::discovery);
 		this.server.createContext("/jwks", this::jwks);
+		this.server.createContext("/token", this::token);
 		this.server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
 		this.server.start();
 	}
@@ -113,6 +121,19 @@ final class MockIssuer implements AutoCloseable {
 
 	void fault(Fault fault) {
 		this.fault = fault;
+	}
+
+	/** The token endpoint answers the code with the ID token, once. */
+	void code(String code, String idToken) {
+		this.codes.put(code, idToken);
+	}
+
+	/**
+	 * The last token request's form parameters, decoded, and its Authorization header
+	 * under {@code -}.
+	 */
+	Map<String, String> tokenRequest() {
+		return this.tokenRequest;
 	}
 
 	/**
@@ -221,7 +242,35 @@ final class MockIssuer implements AutoCloseable {
 			return;
 		}
 		String issuer = this.fault == Fault.FOREIGN ? "http://elsewhere.example" : issuer();
-		answer(exchange, 200, JSONObjectUtils.toJSONString(Map.of("issuer", issuer, "jwks_uri", issuer() + "/jwks")));
+		answer(exchange, 200,
+				JSONObjectUtils.toJSONString(Map.of("issuer", issuer, "jwks_uri", issuer() + "/jwks",
+						"authorization_endpoint", issuer() + "/authorize?tenant=t1", "token_endpoint",
+						issuer() + "/token", "end_session_endpoint", issuer() + "/logout")));
+	}
+
+	/**
+	 * Answers a code it was told of with its ID token, once; any other with
+	 * {@code invalid_grant}.
+	 */
+	private void token(HttpExchange exchange) throws IOException {
+		Map<String, String> form = new java.util.LinkedHashMap<>();
+		for (String pair : new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8).split("&")) {
+			int equals = pair.indexOf('=');
+			form.put(java.net.URLDecoder.decode(pair.substring(0, equals), StandardCharsets.UTF_8),
+					java.net.URLDecoder.decode(pair.substring(equals + 1), StandardCharsets.UTF_8));
+		}
+		String authorization = exchange.getRequestHeaders().getFirst("Authorization");
+		if (authorization != null) {
+			form.put("-", authorization);
+		}
+		this.tokenRequest = Map.copyOf(form);
+		String idToken = this.codes.remove(form.getOrDefault("code", ""));
+		if (idToken == null) {
+			answer(exchange, 400, "{\"error\":\"invalid_grant\"}");
+			return;
+		}
+		answer(exchange, 200, JSONObjectUtils.toJSONString(
+				Map.of("access_token", "opaque", "token_type", "Bearer", "expires_in", 300, "id_token", idToken)));
 	}
 
 	private void jwks(HttpExchange exchange) throws IOException {

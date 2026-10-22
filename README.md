@@ -291,10 +291,15 @@ docker run --rm --pull always --name sluice-server -p 8000:8000 -p 8001:8001 -p 
 | `forward-credentials` | `false` | relay the credential headers to the upstream; by default they are removed |
 | `allow-preflight` | `false` | let a CORS preflight (`OPTIONS` with `Access-Control-Request-Method`) pass without credentials: browsers send none on it |
 | `oidc.issuer-uri` | - | the OpenID Provider whose access tokens are accepted as `Authorization: Bearer <JWT>`; its keys are found through `<issuer-uri>/.well-known/openid-configuration`, and a token's `iss` must equal it |
-| `oidc.audiences[n]` | - (required) | a token's `aud` must hold one of them |
-| `oidc.jws-algorithms[n]` | `RS256` | signature algorithms accepted: `RS256/384/512`, `ES256/384/512`, `PS256/384/512` |
-| `oidc.claims.<claim>[n]` | - | further claims a token must carry: one of the values, `*` matching any run of characters (e.g. `oidc.claims.email[0]=*@example.com`); a list claim (`groups`) must hold one of them |
+| `oidc.audiences[n]` | - (required without `oidc.client-id`) | a token's `aud` must hold one of them; none = no access token accepted (a route signing browsers in only) |
+| `oidc.jws-algorithms[n]` | `RS256` | signature algorithms accepted, of access tokens and ID tokens: `RS256/384/512`, `ES256/384/512`, `PS256/384/512` |
+| `oidc.claims.<claim>[n]` | - | further claims a token, or a signed-in user's ID token, must carry: one of the values, `*` matching any run of characters (e.g. `oidc.claims.email[0]=*@example.com`); a list claim (`groups`) must hold one of them |
 | `oidc.clock-skew` | `60s` | leeway of `exp` / `nbf` |
+| `oidc.client-id` | - | sign browsers in as this client of the provider; see "Browser sign-in" |
+| `oidc.client-secret` | - | the client's secret; none = a public client (PKCE only) |
+| `oidc.scopes[n]` | `openid`, `email`, `profile` | scopes of the sign-in; `openid` among them |
+| `oidc.session-max-age` | `8h` | how long a browser stays signed in |
+| `oidc.headers.<header>` | - | a header telling the upstream a claim of the signed-in user's ID token (e.g. `oidc.headers.X-Forwarded-Email=email`); what the client sent of it is removed |
 
 - A route can require HTTP Basic, `Bearer` (a static token or an OIDC JWT) or an API token header.
   A request passes with any one credential of its route; otherwise it is answered
@@ -307,6 +312,45 @@ docker run --rm --pull always --name sluice-server -p 8000:8000 -p 8001:8001 -p 
 - Only requests the data plane reads are checked: a TLS passthrough or non-HTTP connection to such a
   route is closed unrelayed.
 - Refusals are logged with their reason. Full behavior, limits and the logs: [.kb/route-auth.md](.kb/route-auth.md).
+
+#### Browser sign-in (OIDC)
+
+With `oidc.client-id` a route signs browsers in through its OpenID Provider (authorization code
+flow with PKCE), as oauth2-proxy or Traefik's OIDC middleware do, per route:
+
+```properties
+sluice.route.auth.[app.example.com].oidc.issuer-uri=https://idp.example.com/realms/main
+sluice.route.auth.[app.example.com].oidc.client-id=sluice-app
+sluice.route.auth.[app.example.com].oidc.client-secret=${APP_CLIENT_SECRET}
+# who may pass once signed in
+sluice.route.auth.[app.example.com].oidc.claims.email[0]=*@example.com
+# tell the upstream who signed in
+sluice.route.auth.[app.example.com].oidc.headers.X-Forwarded-Email=email
+# the same on every node: the cookies are sealed with it
+sluice.route.session-secret=${SLUICE_SESSION_SECRET}
+```
+
+- Register `https://<host>/.sluice/oauth2/callback` as a redirect URI of the client, one per host
+  the route serves (a host pattern route: each host), and `https://<host>/` as its post-logout
+  redirect URI. `<host>` is the host the browser addresses, with its port when not 443 (e.g.
+  `https://app.example.com:8443/.sluice/oauth2/callback`); the path is fixed.
+- A browser's navigation (`GET` / `HEAD` accepting `text/html`, no XHR or `fetch`) without a
+  session is redirected to the provider and comes back to the page it asked for. Any other request
+  without one is answered `401` (`WWW-Authenticate: OIDC realm=...`, plus the route's other
+  schemes): APIs behind the same route keep using `Bearer` tokens (`oidc.audiences`).
+- The session is an encrypted cookie (`__Host-sluice-session`, `Secure`, `HttpOnly`,
+  `SameSite=Lax`) holding the ID token claims the route reads, no store behind it: any node with
+  the same `sluice.route.session-secret` accepts it. Past `session-max-age` the browser signs in
+  anew; nothing is refreshed in between.
+- A signed-in user whose claims do not match `oidc.claims` gets `403`, not another redirect.
+- The sign-in's cookies are removed from `Cookie` before relay (the other cookies are kept), and
+  the `oidc.headers` the client sent are replaced. A WebSocket opened from the page carries the
+  session cookie and passes.
+- `/.sluice/oauth2/sign-out` removes the session and ends the provider's session when its
+  discovery names an `end_session_endpoint`.
+- The sign-in needs https as the client sees it: TLS terminated by the data plane, or a trusted
+  proxy (`trusted-proxy-cidrs`) stating `X-Forwarded-Proto: https`. Over plaintext it is answered
+  `403`.
 
 ## Cluster
 
@@ -788,6 +832,7 @@ its discovery document advertises an `end_session_endpoint`; register
 | `sluice.access-control.deny-cidrs` | (empty) | data plane IP deny list, evaluated before any allow list and never overridden |
 | `sluice.access-control.trusted-proxy-cidrs` | (empty = the peer address is judged) | peers trusted as proxying load balancers: when the connection peer matches, the rightmost `X-Forwarded-For` entry (the one the proxy appended) is judged instead of the peer address; the LB must be configured to append to the header, client-sent entries stay part of the chain. Its `X-Forwarded-Proto` / `-Host` / `-Port` / `-Prefix` and `Forwarded` also reach the upstream, dropped from any other peer |
 | `sluice.route.auth.[<route key>].*` | (none) | credentials the requests of a route must carry; see "Route authentication" |
+| `sluice.route.session-secret` | (unset = a random one per start) | the secret the browser sign-in's cookies are sealed with, at least 32 characters (e.g. `openssl rand -base64 32`); the same on every node, required in cluster mode when a route signs browsers in. Changing it signs every browser out |
 
 ### Limits
 

@@ -34,6 +34,11 @@ class ForwardingTest {
 		// no Host, no peer: the protocol and its default port only
 		assertThat(forward(new Forwarding(true, null, false), "GET / HTTP/1.0\r\n" + SPOOFED + "\r\n"))
 			.isEqualTo("GET / HTTP/1.0\r\nx-forwarded-proto: https\r\nx-forwarded-port: 443\r\n\r\n");
+		assertThat(origin(tls, "GET / HTTP/1.1\r\nHost: demo.local:8443\r\n" + SPOOFED + "\r\n"))
+			.as("the origin the sign-in returns to")
+			.isEqualTo("https://demo.local:8443");
+		assertThat(origin(plaintext, "GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n")).isEqualTo("http://[::1]");
+		assertThat(origin(tls, "GET / HTTP/1.1\r\nHost: evil.example/x\r\n\r\n")).as("no well-formed host").isNull();
 	}
 
 	@Test
@@ -48,6 +53,15 @@ class ForwardingTest {
 					+ "x-forwarded-port: 443\r\nx-forwarded-for: 198.51.100.7, 10.0.0.5\r\n\r\n");
 		assertThat(forward(trusted, "GET / HTTP/1.1\r\nHost: demo.local\r\n" + SPOOFED + "\r\n"))
 			.isEqualTo("GET / HTTP/1.1\r\nHost: demo.local\r\n" + SPOOFED + "x-forwarded-for: 10.0.0.5\r\n\r\n");
+		assertThat(origin(trusted, "GET / HTTP/1.1\r\nHost: demo.local\r\nX-Forwarded-Proto: https\r\n\r\n"))
+			.as("the origin the sign-in returns to")
+			.isEqualTo("https://demo.local");
+		assertThat(origin(trusted,
+				"GET / HTTP/1.1\r\nHost: internal:8080\r\nX-Forwarded-Proto: https\r\n"
+						+ "X-Forwarded-Host: demo.local\r\nX-Forwarded-Port: 8443\r\n\r\n"))
+			.isEqualTo("https://demo.local:8443");
+		assertThat(origin(trusted, "GET / HTTP/1.1\r\nHost: demo.local\r\n" + SPOOFED + "\r\n"))
+			.isEqualTo("http://evil.example:1");
 	}
 
 	private static String forward(Forwarding forwarding, String head) {
@@ -56,6 +70,12 @@ class ForwardingTest {
 				ConnectionHeadParser.http1HostOf(bytes));
 		return new String(ConnectionHeadRewriter.withHeaders(bytes, headers.removed(), headers.added()),
 				StandardCharsets.ISO_8859_1);
+	}
+
+	private static @Nullable String origin(Forwarding forwarding, String head) {
+		byte[] bytes = head.getBytes(StandardCharsets.ISO_8859_1);
+		return forwarding.origin(ConnectionHeadParser.http1Headers(bytes), ConnectionHeadParser.http1HostOf(bytes))
+			.uri();
 	}
 
 	private static @Nullable InetAddress address(String literal) {

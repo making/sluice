@@ -705,7 +705,8 @@ final class NettyHttp2DemuxRelay {
 		}
 		NewStream stream = new NewStream(streamId, route, session, host, request, headers, endStream);
 		CompletableFuture<Verdict> verdict = this.routeAuth.verifyAsync(route,
-				ConnectionHeadParser.http2Headers(headers));
+				ConnectionHeadParser.http2Headers(headers),
+				this.forwarding.origin(ConnectionHeadParser.http2Headers(headers), host));
 		if (verdict.isDone()) {
 			verifiedLocked(stream, verdict);
 		}
@@ -716,10 +717,11 @@ final class NettyHttp2DemuxRelay {
 
 	/**
 	 * Goes on with a new stream once its credential check ended: a refused one is
-	 * answered ({@code 401}, {@code 503}), one that passes loses the headers of its
-	 * route's credentials and goes to its route's leg -- with what the client sent while
-	 * it was parked --, or is answered {@code 421} for a {@code force-http1} route; a
-	 * check that failed resets it ({@code INTERNAL_ERROR}). With the loop's lock.
+	 * answered ({@code 401}, {@code 403}, {@code 503}, or the browser sign-in's
+	 * {@code 302}), one that passes loses the headers of its route's credentials, gets
+	 * those its verdict adds and goes to its route's leg -- with what the client sent
+	 * while it was parked --, or is answered {@code 421} for a {@code force-http1} route;
+	 * a check that failed resets it ({@code INTERNAL_ERROR}). With the loop's lock.
 	 */
 	private void verifiedLocked(NewStream stream, CompletableFuture<Verdict> checked) {
 		int streamId = stream.id;
@@ -751,6 +753,7 @@ final class NettyHttp2DemuxRelay {
 		for (String name : pass.strip()) {
 			headers.remove(AsciiString.of(name));
 		}
+		pass.add().forEach((name, value) -> headers.add(AsciiString.of(name), value));
 		if (route.forceHttp1()) {
 			releaseParkedDataLocked(stream);
 			misdirectLocked(streamId, stream.host, route, request, stream.requestEnded);

@@ -6,17 +6,12 @@ import java.io.OutputStream;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.KeyStore;
 import java.time.Duration;
 import java.util.Objects;
-import java.util.concurrent.TimeUnit;
 
-import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLSocket;
-import javax.net.ssl.TrustManagerFactory;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -79,7 +74,7 @@ class HeadDeadlineE2ETest {
 	static void properties(DynamicPropertyRegistry registry) throws Exception {
 		grpcPort = TestPorts.freePort();
 		dataPort = TestPorts.freePort();
-		keystorePath = createKeystore();
+		keystorePath = TestKeystore.create();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
 		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
 		registry.add("sluice.limits.head-timeout", () -> HEAD_TIMEOUT.toSeconds() + "s");
@@ -89,37 +84,6 @@ class HeadDeadlineE2ETest {
 				() -> "file:" + Objects.requireNonNull(keystorePath).toAbsolutePath());
 		registry.add("spring.ssl.bundle.jks.data-plane.keystore.password", () -> "changeit");
 		registry.add("sluice.data-tls-bundle", () -> "data-plane");
-	}
-
-	/** A self-signed keystore with SANs for localhost, via keytool. */
-	private static Path createKeystore() throws Exception {
-		Path keystore = Files.createTempFile("sluice-e2e", ".p12");
-		Files.delete(keystore);
-		String keytool = Path.of(System.getProperty("java.home"), "bin", "keytool").toString();
-		Process process = new ProcessBuilder(keytool, "-genkeypair", "-alias", "e2e", "-keyalg", "RSA", "-keysize",
-				"2048", "-storetype", "PKCS12", "-storepass", "changeit", "-dname", "CN=localhost", "-ext",
-				"san=dns:localhost,ip:127.0.0.1", "-validity", "1", "-keystore", keystore.toAbsolutePath().toString())
-			.redirectErrorStream(true)
-			.start();
-		if (!process.waitFor(60, TimeUnit.SECONDS) || process.exitValue() != 0) {
-			throw new IllegalStateException(
-					"keytool failed: " + new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8));
-		}
-		keystore.toFile().deleteOnExit();
-		return keystore;
-	}
-
-	private static SSLContext clientSslContext() throws Exception {
-		KeyStore keyStore = KeyStore.getInstance("PKCS12");
-		try (InputStream in = Files.newInputStream(Objects.requireNonNull(keystorePath))) {
-			keyStore.load(in, "changeit".toCharArray());
-		}
-		TrustManagerFactory trustManagerFactory = TrustManagerFactory
-			.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-		trustManagerFactory.init(keyStore);
-		SSLContext sslContext = SSLContext.getInstance("TLS");
-		sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
-		return sslContext;
 	}
 
 	@BeforeEach
@@ -188,7 +152,7 @@ class HeadDeadlineE2ETest {
 	@Test
 	void aStalledTlsHandshakeIsClosedAtTheDeadline() throws Exception {
 		double timeouts = headTimeouts();
-		SSLEngine engine = clientSslContext().createSSLEngine();
+		SSLEngine engine = TestKeystore.clientContext(Objects.requireNonNull(keystorePath)).createSSLEngine();
 		engine.setUseClientMode(true);
 		engine.beginHandshake();
 		ByteBuffer hello = ByteBuffer.allocate(engine.getSession().getPacketBufferSize());
@@ -209,7 +173,9 @@ class HeadDeadlineE2ETest {
 	void aTlsConnectionSilentAfterItsHandshakeIsClosedAtTheDeadline() throws Exception {
 		double timeouts = headTimeouts();
 		long start = System.nanoTime();
-		try (SSLSocket socket = (SSLSocket) clientSslContext().getSocketFactory().createSocket("127.0.0.1", dataPort)) {
+		try (SSLSocket socket = (SSLSocket) TestKeystore.clientContext(Objects.requireNonNull(keystorePath))
+			.getSocketFactory()
+			.createSocket("127.0.0.1", dataPort)) {
 			socket.startHandshake();
 			TestSockets.awaitClosed(socket, WITHIN);
 			// one deadline covers handshake and head together, counted from the accept
