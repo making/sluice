@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
@@ -14,7 +15,6 @@ use crate::drain::Drain;
 use crate::proto::frame::Body;
 use crate::proto::{Advertise, Frame, Upstream};
 use crate::routes::{self, Routes};
-use crate::supervisor::Event;
 use crate::tunnel::{self, Connections, Outbound};
 use crate::{BoxError, UNKNOWN_BUILD, describe_peer, proto, tls};
 
@@ -25,12 +25,12 @@ const BACKOFF_INITIAL_SECS: u64 = 1;
 
 const BACKOFF_MAX_SECS: u64 = 30;
 
-struct Backoff {
+pub(crate) struct Backoff {
     ceiling_secs: u64,
 }
 
 impl Backoff {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             ceiling_secs: BACKOFF_INITIAL_SECS,
         }
@@ -38,21 +38,21 @@ impl Backoff {
 
     /// The wait before the next attempt, `unit` in `[0, 1)` picking the point
     /// in the upper half of the ceiling; the ceiling of the one after doubles.
-    fn next(&mut self, unit: f64) -> Duration {
+    pub(crate) fn next(&mut self, unit: f64) -> Duration {
         let ceiling = Duration::from_secs(self.ceiling_secs);
         self.ceiling_secs = (self.ceiling_secs * 2).min(BACKOFF_MAX_SECS);
         ceiling / 2 + (ceiling / 2).mul_f64(unit)
     }
 
     /// Back to the initial ceiling, after the tunnel came up.
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.ceiling_secs = BACKOFF_INITIAL_SECS;
     }
 }
 
 /// A uniform random number in `[0, 1)` from the 53 high bits of a random
 /// (v4) uuid.
-fn jitter_unit() -> f64 {
+pub(crate) fn jitter_unit() -> f64 {
     (uuid::Uuid::new_v4().as_u128() >> 75) as f64 / (1u64 << 53) as f64
 }
 
@@ -116,13 +116,18 @@ pub struct Shared {
     /// The session tasks, the detached ones included: the drain waits for
     /// them.
     pub tasks: TaskTracker,
+    /// Tunnel streams up (their advertise acked) and not ended yet; the
+    /// supervisor asks the bootstrap for the nodes while there is none.
+    pub up: AtomicUsize,
 }
 
-/// One tunnel stream toward one node. The supervisor's `Arc` identity survives
-/// renames, so a session keeps its tasks across a rekey.
+/// One tunnel stream toward the node at one url.
 pub struct Session {
-    /// Endpoint this session dials, as configured / advertised (`grpc(s)://host:port`).
+    /// Endpoint this session dials: the node's public url, or the bootstrap
+    /// for a node without one (`grpc(s)://host:port`).
     pub url: String,
+    /// The node the membership names at `url`; empty when unknown.
+    pub node_id: String,
     /// Cancelled by the supervisor to stop the reconnect loop.
     pub token: CancellationToken,
 }
@@ -131,9 +136,27 @@ pub struct Session {
 struct NodeTask {
     shared: Arc<Shared>,
     session: Arc<Session>,
-    /// Map key this session started under; the supervisor renames it on ack.
-    key: String,
-    events: mpsc::Sender<Event>,
+    /// Log label: the node id, the url while it is unknown.
+    label: String,
+    /// The membership snapshots the session learns (pushed, or fetched via
+    /// `ListNodes`), to the supervisor.
+    events: mpsc::Sender<Vec<proto::Node>>,
+}
+
+/// Counts a stream in [`Shared::up`] while it lives.
+struct Up<'a>(&'a AtomicUsize);
+
+impl<'a> Up<'a> {
+    fn new(up: &'a AtomicUsize) -> Self {
+        up.fetch_add(1, Ordering::AcqRel);
+        Self(up)
+    }
+}
+
+impl Drop for Up<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Splits the `--server` value into `(secure, authority)`; a bare host:port
@@ -143,6 +166,26 @@ fn resolve_server(server: &str) -> (bool, &str) {
         Some(authority) => (true, authority),
         None => (false, server.strip_prefix("grpc://").unwrap_or(server)),
     }
+}
+
+/// The endpoint of the control plane at `url`, set up as every tunnel
+/// stream's: connect timeout, keepalive, the fixed transport window and the
+/// TLS of the wicket.
+fn endpoint(shared: &Shared, url: &str) -> Result<tonic::transport::Endpoint, BoxError> {
+    let (secure, authority) = resolve_server(url);
+    let mut endpoint = tonic::transport::Endpoint::from_shared(format!(
+        "{}://{authority}",
+        if secure { "https" } else { "http" }
+    ))?
+    .connect_timeout(CONNECT_TIMEOUT)
+    .http2_keep_alive_interval(Duration::from_secs(30))
+    .keep_alive_timeout(Duration::from_secs(10))
+    .keep_alive_while_idle(true);
+    endpoint = with_transport_window(endpoint, shared.transport_window);
+    if secure {
+        endpoint = tls::configure(endpoint, shared.insecure, shared.ca_pem.as_deref())?;
+    }
+    Ok(endpoint)
 }
 
 /// Attaches the client identity to a request: the `authorization` bearer token
@@ -157,21 +200,28 @@ fn identify<T>(request: &mut tonic::Request<T>, token: &str, id: &str) -> Result
     Ok(())
 }
 
-/// Spawns the reconnect loop of one session; returns its handle.
+/// Spawns the reconnect loop of the session to `node_id` (empty when
+/// unknown) at `url`; returns its handle.
 pub fn spawn_session(
     shared: &Arc<Shared>,
-    key: String,
+    node_id: String,
     url: String,
-    events: mpsc::Sender<Event>,
+    events: mpsc::Sender<Vec<proto::Node>>,
 ) -> Arc<Session> {
+    let label = if node_id.is_empty() {
+        url.clone()
+    } else {
+        node_id.clone()
+    };
     let session = Arc::new(Session {
         url,
+        node_id,
         token: CancellationToken::new(),
     });
     let task = NodeTask {
         shared: shared.clone(),
         session: session.clone(),
-        key,
+        label,
         events,
     };
     shared.tasks.spawn(task.run());
@@ -188,7 +238,7 @@ impl NodeTask {
             match self.attempt().await {
                 Ok(true) => backoff.reset(),
                 Ok(false) => {}
-                Err(e) => eprintln!("[{}] tunnel stream ended: {e}", self.key),
+                Err(e) => eprintln!("[{}] tunnel stream ended: {e}", self.label),
             }
             let token = self.session.token.clone();
             let draining = self.shared.drain.begin.clone();
@@ -203,24 +253,8 @@ impl NodeTask {
     /// One connect..stream-end attempt; `Ok(true)` when the tunnel came up
     /// (the advertise was acked) before the stream ended.
     async fn attempt(&self) -> Result<bool, BoxError> {
-        println!("[{}] connecting to {} ...", self.key, self.session.url);
-        let (secure, authority) = resolve_server(&self.session.url);
-        let mut endpoint = tonic::transport::Endpoint::from_shared(format!(
-            "{}://{authority}",
-            if secure { "https" } else { "http" }
-        ))?
-        .connect_timeout(CONNECT_TIMEOUT)
-        .http2_keep_alive_interval(Duration::from_secs(30))
-        .keep_alive_timeout(Duration::from_secs(10))
-        .keep_alive_while_idle(true);
-        endpoint = with_transport_window(endpoint, self.shared.transport_window);
-        if secure {
-            endpoint = tls::configure(
-                endpoint,
-                self.shared.insecure,
-                self.shared.ca_pem.as_deref(),
-            )?;
-        }
+        println!("[{}] connecting to {} ...", self.label, self.session.url);
+        let endpoint = endpoint(&self.shared, &self.session.url)?;
         let draining = self.shared.drain.begin.clone();
         let channel = tokio::select! {
             channel = endpoint.connect() => channel?,
@@ -253,7 +287,7 @@ impl NodeTask {
 
         let watchdog = outbound.clone();
         let connections = Connections::new(
-            self.key.clone(),
+            self.label.clone(),
             outbound,
             self.shared.routes.clone(),
             self.shared.limit.clone(),
@@ -304,6 +338,8 @@ impl NodeTask {
         mut advertised: Advertised,
     ) -> Result<bool, BoxError> {
         let mut established = false;
+        // counts the stream in `Shared::up` from its acknowledgement on
+        let mut _up = None;
         // the advertise opening the stream
         let mut advertises_sent = 1;
         let mut acks_received = 0;
@@ -335,7 +371,7 @@ impl NodeTask {
                 stalled = outbound.stalled(self.shared.stall_timeout) => {
                     eprintln!(
                         "[{}] tunnel stream held frames queued with none taken for {}ms: giving it up",
-                        self.key,
+                        self.label,
                         stalled.as_millis()
                     );
                     return Ok(established);
@@ -350,7 +386,7 @@ impl NodeTask {
                         outbound.control(advertise(advertised.upstreams.clone(), false));
                         println!(
                             "[{}] advertising the reloaded routes ({} upstream(s), generation {})",
-                            self.key,
+                            self.label,
                             advertised.upstreams.len(),
                             routes.generation
                         );
@@ -363,14 +399,14 @@ impl NodeTask {
                     outbound.control(advertise(advertised.upstreams.clone(), true));
                     println!(
                         "[{}] withdrawing the routes; {} connection(s) open",
-                        self.key,
+                        self.label,
                         *held.borrow()
                     );
                     continue;
                 }
                 Step::Drained => {
                     ending = true;
-                    println!("[{}] drained; ending the tunnel stream", self.key);
+                    println!("[{}] drained; ending the tunnel stream", self.label);
                     // no frame is left to send: the request stream ends
                     outbound.shutdown();
                     continue;
@@ -384,7 +420,7 @@ impl NodeTask {
                             withdrawn = true;
                             println!(
                                 "[{}] server acknowledged the withdrawal; {} connection(s) left",
-                                self.key,
+                                self.label,
                                 *held.borrow()
                             );
                         }
@@ -394,33 +430,38 @@ impl NodeTask {
                         eprintln!(
                             "[{}] the server predates the client drain (Advertise.withdraw) and \
                              keeps routing to this client; closing the tunnel stream at once",
-                            self.key
+                            self.label
                         );
                         return Ok(established);
                     }
                     advertised.acked();
                     println!(
                         "[{}] advertise acked by {} (rejected ports: {:?})",
-                        self.key, ack.node_id, ack.rejected_ports
+                        self.label, ack.node_id, ack.rejected_ports
                     );
                     if !established {
                         established = true;
+                        _up = Some(Up::new(&self.shared.up));
                         println!(
                             "[{}] server build: {}",
-                            self.key,
+                            self.label,
                             ack.build
                                 .as_ref()
                                 .map_or_else(|| UNKNOWN_BUILD.to_string(), describe_peer)
                         );
-                        if !ack.node_id.is_empty() {
-                            // the supervisor renames this session after the node
-                            let _ = self
-                                .events
-                                .send(Event::Connected {
-                                    session: self.session.clone(),
-                                    node_id: ack.node_id.clone(),
-                                })
-                                .await;
+                        let expected = &self.session.node_id;
+                        if !expected.is_empty()
+                            && !ack.node_id.is_empty()
+                            && ack.node_id != *expected
+                        {
+                            // a public url balanced across nodes: two streams of this
+                            // wicket may meet on one node and replace each other
+                            // there, leaving the other node without
+                            eprintln!(
+                                "[{}] the stream to node {expected} at {} reached node {}; \
+                                 every node needs a public url of its own",
+                                self.label, self.session.url, ack.node_id
+                            );
                         }
                         // self-healing: re-fetch the node list on every
                         // established stream (`TunnelClient#onConnected`)
@@ -430,7 +471,7 @@ impl NodeTask {
                         tokio::spawn(async move {
                             match list_nodes(&channel, &shared).await {
                                 Ok(nodes) => {
-                                    let _ = events.send(Event::Membership { nodes }).await;
+                                    let _ = events.send(nodes).await;
                                 }
                                 Err(e) => eprintln!("ListNodes failed: {e}"),
                             }
@@ -441,12 +482,12 @@ impl NodeTask {
                     // keep the stream: the server drains in-flight connections
                     // before it closes the stream itself; the failover is the
                     // membership's job (`NodeConnection` case DRAIN)
-                    println!("[{}] server draining: {}", self.key, drain.reason);
+                    println!("[{}] server draining: {}", self.label, drain.reason);
                 }
                 Some(Body::MembershipUpdate(update)) => {
                     println!(
                         "[{}] membership v{}: {:?}",
-                        self.key,
+                        self.label,
                         update.membership_version,
                         update
                             .nodes
@@ -454,12 +495,7 @@ impl NodeTask {
                             .map(|node| node.node_id.as_str())
                             .collect::<Vec<_>>()
                     );
-                    let _ = self
-                        .events
-                        .send(Event::Membership {
-                            nodes: update.nodes,
-                        })
-                        .await;
+                    let _ = self.events.send(update.nodes).await;
                 }
                 // connection frames; Advertise from the server is unexpected and
                 // keep-alive a no-op, both ignored there
@@ -521,8 +557,31 @@ fn advertise(upstreams: Vec<Upstream>, withdraw: bool) -> Frame {
     }
 }
 
-/// Unary `ListNodes` over an established stream's channel
-/// (`NodeConnection#listNodes`).
+/// The node list `bootstrap` answers (`TunnelClient#discover`): one node
+/// without id and public url, which stands for the bootstrap itself, when the
+/// server has no `ListNodes`; empty when it could not be asked.
+pub async fn discover(shared: &Shared, bootstrap: &str) -> Vec<proto::Node> {
+    let asked = async {
+        let channel = endpoint(shared, bootstrap)?.connect().await?;
+        list_nodes(&channel, shared).await
+    };
+    match asked.await {
+        Ok(nodes) => nodes,
+        Err(e)
+            if e.downcast_ref::<tonic::Status>()
+                .is_some_and(|status| status.code() == tonic::Code::Unimplemented) =>
+        {
+            vec![proto::Node::default()]
+        }
+        Err(e) => {
+            eprintln!("asking {bootstrap} for the server nodes failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Unary `ListNodes` on `channel` (`NodeConnection#listNodes`), authenticated
+/// as the tunnel streams are.
 async fn list_nodes(
     channel: &tonic::transport::Channel,
     shared: &Shared,
@@ -668,9 +727,10 @@ mod tests {
             shared,
             session: Arc::new(Session {
                 url,
+                node_id: String::new(),
                 token: CancellationToken::new(),
             }),
-            key: "stalling".into(),
+            label: "stalling".into(),
             events,
         };
         let start = tokio::time::Instant::now();
@@ -872,10 +932,9 @@ pub(crate) mod testing {
     use crate::routes::Reloader;
     use crate::wasm_host::{self, Instances};
 
-    /// Frames of the server's stream, gRPC-framed (5-byte prefix + message).
-    pub fn grpc_frame(frame: &Frame) -> bytes::Bytes {
-        use prost::Message as _;
-        let message = frame.encode_to_vec();
+    /// A message of the server's, gRPC-framed (5-byte prefix + message).
+    pub fn grpc_frame(message: &impl prost::Message) -> bytes::Bytes {
+        let message = message.encode_to_vec();
         let mut out = Vec::with_capacity(5 + message.len());
         out.push(0);
         out.extend_from_slice(&(message.len() as u32).to_be_bytes());
@@ -917,6 +976,7 @@ pub(crate) mod testing {
             transport_window: transport_window(4),
             drain: Drain::default(),
             tasks: TaskTracker::new(),
+            up: AtomicUsize::new(0),
         });
         (shared, limit)
     }
@@ -1069,32 +1129,51 @@ pub(crate) mod testing {
     }
 
     /// A tunnel server handing each Connect stream to the test; ListNodes is
-    /// reset.
-    pub async fn tunnel_server() -> (String, mpsc::Receiver<ServerStream>) {
+    /// answered with `nodes`, or reset without.
+    pub async fn tunnel_server(
+        nodes: Option<Vec<proto::Node>>,
+    ) -> (String, mpsc::Receiver<ServerStream>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("grpc://{}", listener.local_addr().unwrap());
         let (streams, received) = mpsc::channel(4);
         tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut connection = h2::server::handshake(socket).await.unwrap();
-            // accept() drives the connection on
-            while let Some(Ok((request, mut respond))) = connection.accept().await {
-                if request.uri().path() != "/sluice.v1.Tunnel/Connect" {
-                    continue;
-                }
-                let response = http::Response::builder()
-                    .header("content-type", "application/grpc")
-                    .body(())
-                    .unwrap();
-                let send = respond.send_response(response, false).unwrap();
-                let stream = ServerStream {
-                    body: request.into_body(),
-                    send,
-                    buf: Vec::new(),
-                };
-                if streams.send(stream).await.is_err() {
-                    return;
-                }
+            while let Ok((socket, _)) = listener.accept().await {
+                let streams = streams.clone();
+                let nodes = nodes.clone();
+                tokio::spawn(async move {
+                    let mut connection = h2::server::handshake(socket).await.unwrap();
+                    // accept() drives the connection on
+                    while let Some(Ok((request, mut respond))) = connection.accept().await {
+                        let response = http::Response::builder()
+                            .header("content-type", "application/grpc")
+                            .body(())
+                            .unwrap();
+                        if request.uri().path() != "/sluice.v1.Tunnel/Connect" {
+                            let Some(nodes) = nodes.clone() else {
+                                continue;
+                            };
+                            let mut send = respond.send_response(response, false).unwrap();
+                            let listed = proto::ListNodesResponse {
+                                nodes,
+                                membership_version: 1,
+                            };
+                            send.send_data(grpc_frame(&listed), false).unwrap();
+                            let mut trailers = http::HeaderMap::new();
+                            trailers.insert("grpc-status", "0".parse().unwrap());
+                            send.send_trailers(trailers).unwrap();
+                            continue;
+                        }
+                        let send = respond.send_response(response, false).unwrap();
+                        let stream = ServerStream {
+                            body: request.into_body(),
+                            send,
+                            buf: Vec::new(),
+                        };
+                        if streams.send(stream).await.is_err() {
+                            return;
+                        }
+                    }
+                });
             }
         });
         (url, received)
@@ -1103,10 +1182,12 @@ pub(crate) mod testing {
     /// A session of `shared` on a [`tunnel_server`], its stream as the server
     /// sees it, and the session's event receiver (kept: the stream reports
     /// to it).
-    pub async fn served_session(shared: &Arc<Shared>) -> (ServerStream, mpsc::Receiver<Event>) {
-        let (url, mut streams) = tunnel_server().await;
+    pub async fn served_session(
+        shared: &Arc<Shared>,
+    ) -> (ServerStream, mpsc::Receiver<Vec<proto::Node>>) {
+        let (url, mut streams) = tunnel_server(None).await;
         let (events, received) = mpsc::channel(32);
-        spawn_session(shared, url.clone(), url, events);
+        spawn_session(shared, String::new(), url, events);
         let stream = tokio::time::timeout(HANG, streams.recv())
             .await
             .expect("hang guard")

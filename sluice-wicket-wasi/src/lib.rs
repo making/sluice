@@ -10,13 +10,12 @@
 //! ```
 //!
 //! The supervisor (`supervisor`) ports the Java client's fan-out semantics
-//! (`TunnelClient` / `NodeConnection`): the `--server` endpoint is only the
-//! bootstrap; the node list learned via `ListNodes` / `MembershipUpdate` keeps
-//! one tunnel stream per node (`session`), a dropped stream reconnects with
-//! jittered exponential backoff (ceiling 1s..30s, each wait drawn from its
-//! upper half), and the `AdvertiseAck` renames the session after its node.
-//! Exactly one stream per node is kept: the server closes the older
-//! registration when a client id re-registers.
+//! (`TunnelClient` / `NodeConnection`): the `--server` endpoint is only asked
+//! for the node list (`ListNodes`); the membership keeps one tunnel stream
+//! (`session`) per node at its public url, and a dropped stream reconnects
+//! with jittered exponential backoff (ceiling 1s..30s, each wait drawn from
+//! its upper half). Exactly one stream per node is kept: the server closes
+//! the older registration when a client id re-registers.
 //!
 //! On SIGTERM / SIGINT the wicket drains (`drain`, the Java client's
 //! `TunnelClient#drain`): every node stream withdraws the routes and ends
@@ -236,6 +235,7 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         transport_window: transport_window(max_connections),
         drain: Drain::default(),
         tasks: TaskTracker::new(),
+        up: Default::default(),
     });
     println!("connection limit {max_connections}");
     println!(

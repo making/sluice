@@ -453,12 +453,14 @@ serves share that unit's single id.
 ## Cluster / reconnect
 
 Same semantics as the Java client (see "Cluster (scale-out)" in the root
-README): `--server` is only the bootstrap -- the node list is learned via
-`ListNodes` / `MembershipUpdate` and one tunnel stream is kept per node
-(`grpc://` / `grpcs://` addresses). A dropped stream reconnects with
-jittered exponential backoff (ceiling 1s..30s, each wait drawn from
-its upper half); exactly one stream per node is kept, so a
-duplicate is closed on the client side before the server drops it.
+README): `--server` is only the bootstrap, asked for the node list
+(`ListNodes`) and asked again while no stream is up; one tunnel stream is
+kept per node at its public url (`grpc://` / `grpcs://` addresses; the
+bootstrap for a node without one), following `MembershipUpdate`. So the
+bootstrap may be a load balancer over any node, but each public url must
+reach its own node (the wicket warns when a stream reaches another one). A
+dropped stream reconnects with jittered exponential backoff (ceiling
+1s..30s, each wait drawn from its upper half).
 
 ## Shutdown (drain)
 

@@ -35,7 +35,8 @@ fn hello_wasm() -> std::path::PathBuf {
 }
 
 /// A tunnel server acknowledging every advertise on every Connect stream
-/// (an empty `AdvertiseAck`, field 7 of `Frame`) and keeping the stream open.
+/// (an empty `AdvertiseAck`, field 7 of `Frame`) and keeping the stream open;
+/// without `ListNodes` (UNIMPLEMENTED), so the wicket streams to it.
 async fn acking_server() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("grpc://{}", listener.local_addr().unwrap());
@@ -47,6 +48,12 @@ async fn acking_server() -> String {
                 let mut held = Vec::new();
                 while let Some(Ok((request, mut respond))) = connection.accept().await {
                     if request.uri().path() != "/sluice.v1.Tunnel/Connect" {
+                        let unimplemented = http::Response::builder()
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", "12")
+                            .body(())
+                            .unwrap();
+                        let _ = respond.send_response(unimplemented, true);
                         continue;
                     }
                     let response = http::Response::builder()
