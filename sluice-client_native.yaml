@@ -1,8 +1,8 @@
-image: ghcr.io/making/sluice/sluice-client@sha256:df6719dfe800e8cc2678bef7c639ba5c83dab139755916352dfcb3ed7281b6fd
-git_revision: ea35efa5d72c81a0aaa47dd957966e49726d4b80
+image: ghcr.io/making/sluice/sluice-client@sha256:dc58e7dc6e9e35c647c86d69f1b5e71f79b6713381e85b1338a68c7e8e4bf675
+git_revision: 9dc103ebd9080db54707755b00128c7651399b60
 deployment:
   image:
     repository: ghcr.io/making/sluice/sluice-client
-    digest: sha256:df6719dfe800e8cc2678bef7c639ba5c83dab139755916352dfcb3ed7281b6fd
+    digest: sha256:dc58e7dc6e9e35c647c86d69f1b5e71f79b6713381e85b1338a68c7e8e4bf675
   podLabels:
-    github.com/revision: ea35efa5d72c81a0aaa47dd957966e49726d4b80
+    github.com/revision: 9dc103ebd9080db54707755b00128c7651399b60
