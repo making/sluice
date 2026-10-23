@@ -5,7 +5,7 @@
 	<parent>
 		<groupId>org.springframework.boot</groupId>
 		<artifactId>spring-boot-starter-parent</artifactId>
-		<version>4.1.1</version>
+		<version>4.1.2</version>
 		<relativePath/> <!-- lookup parent from repository -->
 	</parent>
 	<groupId>am.ik.sluice</groupId>
@@ -27,13 +27,6 @@
 		<java.version>25</java.version>
 		<spring-boot.version>${project.parent.parent.version}</spring-boot.version>
 		<sluice.version>0.0.1-SNAPSHOT</sluice.version>
-		<!-- Pinned above the Spring Boot managed version (4.2.17): 4.2.18 / 4.2.19 carry
-			 codec-http2 security fixes and flush fixes on writability changes, which the
-			 netty h2 hop (am.ik.sluice.server.proxy.hop) drives; 4.2.18 enables HTTP/2
-			 header value validation by default. Read the release notes before changing:
-			 HTTP/2 validation and error choices change within 4.2.x. -->
-		<netty.version>4.2.19.Final</netty.version>
-		<tomcat.version>11.0.27</tomcat.version>
 	</properties>
 
 	<dependencyManagement>
