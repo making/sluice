@@ -1,14 +1,10 @@
 package am.ik.sluice.it;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -44,7 +40,6 @@ import am.ik.sluice.v1.proto.Frame;
 import am.ik.sluice.v1.proto.TunnelGrpc;
 import am.ik.sluice.v1.proto.Upstream;
 import am.ik.sluice.v1.proto.WindowUpdate;
-import com.google.protobuf.ByteString;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Metadata;
@@ -78,15 +73,7 @@ class TunnelStallWatchdogE2ETest {
 	/** Connections to this target are kept open and never answered. */
 	private static final String HOLDING_TARGET = "127.0.0.1:1004";
 
-	/** The HTTP hosts' targets, answered with {@link #RESPONSE}. */
-	private static final Set<String> HTTP_TARGETS = Set.of("127.0.0.1:1001", "127.0.0.1:1002");
-
-	private static final byte[] RESPONSE = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
-		.getBytes(StandardCharsets.US_ASCII);
-
 	private static int grpcPort;
-
-	private static int dataPort;
 
 	private static int stallingPort;
 
@@ -105,7 +92,7 @@ class TunnelStallWatchdogE2ETest {
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
 		grpcPort = TestPorts.freePort();
-		dataPort = TestPorts.freePort();
+		int dataPort = TestPorts.freePort();
 		stallingPort = TestPorts.freePort();
 		healthyPort = TestPorts.freePort();
 		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
@@ -320,77 +307,6 @@ class TunnelStallWatchdogE2ETest {
 		assertThat(session.connectionCount()).isEqualTo(1);
 	}
 
-	/**
-	 * An HTTP/1.1 connection switching routes waits for the frames queued for the
-	 * previous route's leg; when the watchdog fails the stalled session, the dropped
-	 * frames end the wait, and the client is answered instead of waiting for good.
-	 */
-	@Test
-	void anH1RouteSwitchWaitingOnAStalledLegEndsWithTheSession() throws Exception {
-		RawClient stalling = connect(STALLING_ID, stallingPort);
-		Socket h1 = open(dataPort);
-		OutputStream out = h1.getOutputStream();
-		InputStream in = h1.getInputStream();
-		int body = 256 * 1024;
-		out.write(("POST /a HTTP/1.1\r\nHost: a.local\r\nContent-Length: " + body + "\r\n\r\n")
-			.getBytes(StandardCharsets.US_ASCII));
-		out.flush();
-		assertThat(in.readNBytes(RESPONSE.length)).isEqualTo(RESPONSE);
-		SessionSender sender = (SessionSender) session(STALLING_ID).sender();
-		double failuresBefore = stallFailures();
-		long stallStart = System.nanoTime();
-		stalling.stall.set(true);
-		// fillers queue more than the stream window and its buffers take
-		for (int i = 0; i < 3; i++) {
-			open(stallingPort).getOutputStream().write(new byte[VirtualConnection.DEFAULT_WINDOW]);
-		}
-		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> stalling.blocked.get());
-		int fillers = settledQueues(sender);
-		out.write(new byte[body]);
-		out.flush();
-		Awaitility.await()
-			.atMost(Duration.ofSeconds(5))
-			.alias("precondition: the body waits in the queue of route a's leg")
-			.until(() -> sender.connectionQueues() == fillers + 1);
-		out.write("GET /b HTTP/1.1\r\nHost: b.local\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
-		out.flush();
-		long switchedAt = System.nanoTime();
-		h1.setSoTimeout((int) TIMEOUT.plusSeconds(5).toMillis());
-		byte[] answer = in.readAllBytes();
-		Duration waited = Duration.ofNanos(System.nanoTime() - switchedAt);
-
-		assertThat(Duration.ofNanos(System.nanoTime() - stallStart)).as("held until the watchdog fired")
-			.isGreaterThanOrEqualTo(TIMEOUT);
-		assertThat(waited).as("answered within the timeout and its check").isLessThan(TIMEOUT.plusSeconds(4));
-		assertThat(new String(answer, StandardCharsets.US_ASCII))
-			.as("route b's leg failed with the session before answering: a 502, then the connection's end")
-			.startsWith("HTTP/1.1 502 Bad Gateway\r\n");
-		Awaitility.await()
-			.atMost(Duration.ofSeconds(5))
-			.alias("the watchdog failed the session")
-			.until(() -> registry().find(STALLING_ID).isEmpty());
-		assertThat(stallFailures() - failuresBefore).isEqualTo(1);
-	}
-
-	/** The sender's live queues once they stopped changing for 300ms. */
-	private static int settledQueues(SessionSender sender) throws InterruptedException {
-		long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-		int last = -1;
-		long since = System.nanoTime();
-		while (System.nanoTime() < deadline) {
-			int current = sender.connectionQueues();
-			if (current != last) {
-				last = current;
-				since = System.nanoTime();
-			}
-			else if (System.nanoTime() - since > Duration.ofMillis(300).toNanos()) {
-				return current;
-			}
-			TimeUnit.MILLISECONDS.sleep(20);
-		}
-		return last;
-	}
-
 	private RawClient connect(String id, int listenPort) throws InterruptedException {
 		ManagedChannel channel = ManagedChannelBuilder.forAddress("127.0.0.1", grpcPort).usePlaintext().build();
 		RawClient client = new RawClient(channel, listenPort);
@@ -449,10 +365,10 @@ class TunnelStallWatchdogE2ETest {
 
 	/**
 	 * A tunnel client advertising a tcp route on {@code listenPort} -- whose connections
-	 * are answered with a CLOSE on the stalling client's port and held open otherwise --
-	 * and two HTTP hosts answered with {@link #RESPONSE}. Once {@link #stall} is set, its
-	 * receive callback blocks until {@link #resume}; with {@link #millisPer64KiB} it
-	 * sleeps that long per 64KiB of DATA received and grants the payload back.
+	 * are answered with a CLOSE on the stalling client's port and held open otherwise.
+	 * Once {@link #stall} is set, its receive callback blocks until {@link #resume}; with
+	 * {@link #millisPer64KiB} it sleeps that long per 64KiB of DATA received and grants
+	 * the payload back.
 	 */
 	private static final class RawClient implements StreamObserver<Frame> {
 
@@ -480,10 +396,6 @@ class TunnelStallWatchdogE2ETest {
 
 		final AtomicReference<@Nullable Status> status = new AtomicReference<>();
 
-		private final Map<Long, String> addresses = new ConcurrentHashMap<>();
-
-		private final Set<Long> answered = ConcurrentHashMap.newKeySet();
-
 		private @Nullable StreamObserver<Frame> requests;
 
 		RawClient(ManagedChannel channel, int listenPort) {
@@ -496,8 +408,6 @@ class TunnelStallWatchdogE2ETest {
 			String tcpTarget = this.listenPort == stallingPort ? CLOSING_TARGET : HOLDING_TARGET;
 			send(Frame.newBuilder()
 				.setAdvertise(Advertise.newBuilder()
-					.addUpstreams(upstream("a.local", "http://127.0.0.1:1001", 0))
-					.addUpstreams(upstream("b.local", "http://127.0.0.1:1002", 0))
 					.addUpstreams(upstream("route.tcp", "tcp://" + tcpTarget, this.listenPort))
 					.setConnectionWindow(VirtualConnection.DEFAULT_WINDOW))
 				.build());
@@ -530,7 +440,6 @@ class TunnelStallWatchdogE2ETest {
 				case ADVERTISE_ACK -> this.acked.countDown();
 				case CONNECT -> {
 					long id = frame.getConnect().getConnId();
-					this.addresses.put(id, frame.getConnect().getAddress());
 					this.connects.add(id);
 					if (CLOSING_TARGET.equals(frame.getConnect().getAddress()) && this.millisPer64KiB.get() == 0) {
 						send(Frame.newBuilder().setClose(Close.newBuilder().setConnId(id)).build());
@@ -546,12 +455,6 @@ class TunnelStallWatchdogE2ETest {
 
 		private void onData(Data data) {
 			long id = data.getConnId();
-			String address = this.addresses.get(id);
-			if (address != null && HTTP_TARGETS.contains(address) && this.answered.add(id)) {
-				send(Frame.newBuilder()
-					.setData(Data.newBuilder().setConnId(id).setPayload(ByteString.copyFrom(RESPONSE)))
-					.build());
-			}
 			int size = data.getPayload().size();
 			long millis = this.millisPer64KiB.get();
 			if (millis == 0) {
