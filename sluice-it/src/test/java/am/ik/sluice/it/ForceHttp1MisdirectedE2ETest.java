@@ -84,7 +84,7 @@ class ForceHttp1MisdirectedE2ETest {
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
-	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ListAppender<>();
+	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ConcurrentListAppender<>();
 
 	private static final String H2_HOST = "h2.local";
 
@@ -529,7 +529,7 @@ class ForceHttp1MisdirectedE2ETest {
 
 	private static List<String> accessLines() {
 		synchronized (ACCESS_EVENTS) {
-			return List.copyOf(ACCESS_EVENTS.list).stream().map(ILoggingEvent::getFormattedMessage).toList();
+			return ACCESS_EVENTS.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
 		}
 	}
 

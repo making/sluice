@@ -87,7 +87,7 @@ class TlsDataPlaneE2ETest {
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
-	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ListAppender<>();
+	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ConcurrentListAppender<>();
 
 	private static java.net.InetSocketAddress h1UpstreamAddress;
 
@@ -454,7 +454,7 @@ class TlsDataPlaneE2ETest {
 			String host = mismatch[0];
 			this.httpsNegotiated.clear();
 			this.httpsFirstLines.clear();
-			ListAppender<ILoggingEvent> connectorEvents = new ListAppender<>();
+			ListAppender<ILoggingEvent> connectorEvents = new ConcurrentListAppender<>();
 			connectorEvents.start();
 			Logger connectorLogger = (Logger) LoggerFactory.getLogger(LocalConnector.class);
 			connectorLogger.addAppender(connectorEvents);
@@ -481,7 +481,7 @@ class TlsDataPlaneE2ETest {
 	}
 
 	private static List<String> accessLines() {
-		return List.copyOf(ACCESS_EVENTS.list).stream().map(ILoggingEvent::getFormattedMessage).toList();
+		return ACCESS_EVENTS.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
 	}
 
 	private static SSLSocket tls(String sni, String... protocols) throws Exception {

@@ -76,7 +76,7 @@ class ConnectionLimitOverflowE2ETest {
 
 	private static final Duration WITHIN = Duration.ofSeconds(4);
 
-	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ListAppender<>();
+	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ConcurrentListAppender<>();
 
 	private static final Pattern ANSWERED_LINE = Pattern.compile(
 			"type=conn id=\\d+ event=reject listener=data remote=127\\.0\\.0\\.1:\\d+ reason=limit transport=(h1|h2) "
@@ -569,8 +569,7 @@ class ConnectionLimitOverflowE2ETest {
 	}
 
 	private List<String> answeredLines() {
-		return List.copyOf(ACCESS_EVENTS.list)
-			.stream()
+		return ACCESS_EVENTS.list.stream()
 			.map(ILoggingEvent::getFormattedMessage)
 			.filter(line -> ANSWERED_LINE.matcher(line).matches())
 			.toList();

@@ -60,7 +60,7 @@ class KeepAliveReroutingE2ETest {
 
 	private static final TaskExecutor TASK_EXECUTOR = task -> Thread.ofVirtual().name("e2e-rerouting").start(task);
 
-	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ListAppender<>();
+	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ConcurrentListAppender<>();
 
 	private static int grpcPort;
 
@@ -168,8 +168,7 @@ class KeepAliveReroutingE2ETest {
 	}
 
 	private List<String> requestLines(String route) {
-		return List.copyOf(ACCESS_EVENTS.list)
-			.stream()
+		return ACCESS_EVENTS.list.stream()
 			.map(e -> e.getFormattedMessage())
 			.filter(m -> m.startsWith("type=req") && m.contains("route=" + route + " "))
 			.toList();

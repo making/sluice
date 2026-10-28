@@ -99,7 +99,7 @@ class ClientDrainE2ETest {
 
 	private static final ExecutorService UPSTREAM_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
-	private static final ListAppender<ILoggingEvent> CLIENT_EVENTS = new ListAppender<>();
+	private static final ListAppender<ILoggingEvent> CLIENT_EVENTS = new ConcurrentListAppender<>();
 
 	private static int grpcPort;
 
@@ -543,7 +543,7 @@ class ClientDrainE2ETest {
 	}
 
 	private static List<String> messages() {
-		return List.copyOf(CLIENT_EVENTS.list).stream().map(ILoggingEvent::getFormattedMessage).toList();
+		return CLIENT_EVENTS.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
 	}
 
 }

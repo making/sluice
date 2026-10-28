@@ -69,7 +69,7 @@ class ProxyProtocolE2ETest {
 
 	private static final TaskExecutor TASK_EXECUTOR = task -> Thread.ofVirtual().name("e2e-proxy-worker").start(task);
 
-	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ListAppender<>();
+	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ConcurrentListAppender<>();
 
 	private static final Duration HEAD_TIMEOUT = Duration.ofSeconds(2);
 
@@ -428,7 +428,7 @@ class ProxyProtocolE2ETest {
 	private static List<String> accessLines() {
 		// the appender appends under its own monitor
 		synchronized (ACCESS_EVENTS) {
-			return List.copyOf(ACCESS_EVENTS.list).stream().map(ILoggingEvent::getFormattedMessage).toList();
+			return ACCESS_EVENTS.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
 		}
 	}
 

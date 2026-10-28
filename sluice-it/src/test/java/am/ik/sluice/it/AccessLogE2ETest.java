@@ -48,7 +48,7 @@ class AccessLogE2ETest {
 
 	private static final TaskExecutor TASK_EXECUTOR = task -> Thread.ofVirtual().name("e2e-access-worker").start(task);
 
-	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ListAppender<>();
+	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ConcurrentListAppender<>();
 
 	private static int grpcPort;
 
@@ -130,7 +130,7 @@ class AccessLogE2ETest {
 	SessionRegistry sessions;
 
 	private List<String> events() {
-		return List.copyOf(ACCESS_EVENTS.list).stream().map(ILoggingEvent::getFormattedMessage).toList();
+		return ACCESS_EVENTS.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
 	}
 
 	private void clearEvents() {

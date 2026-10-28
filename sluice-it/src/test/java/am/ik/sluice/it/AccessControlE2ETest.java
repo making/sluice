@@ -80,9 +80,9 @@ class AccessControlE2ETest {
 
 	private static int openRoutePort;
 
-	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ListAppender<>();
+	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ConcurrentListAppender<>();
 
-	private static final ListAppender<ILoggingEvent> SESSION_EVENTS = new ListAppender<>();
+	private static final ListAppender<ILoggingEvent> SESSION_EVENTS = new ConcurrentListAppender<>();
 
 	private static final String OIDC_AUDIENCE = "api://oidc.local";
 
@@ -472,7 +472,7 @@ class AccessControlE2ETest {
 	}
 
 	private static List<String> accessLines() {
-		return List.copyOf(ACCESS_EVENTS.list).stream().map(ILoggingEvent::getFormattedMessage).toList();
+		return ACCESS_EVENTS.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
 	}
 
 	private static Http2Headers headersOf(List<TestH2.Frame> frames) throws Exception {

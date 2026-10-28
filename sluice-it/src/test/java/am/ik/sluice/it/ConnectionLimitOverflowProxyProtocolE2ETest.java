@@ -8,7 +8,6 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.List;
 import java.util.Objects;
 import java.util.regex.Pattern;
 
@@ -63,7 +62,7 @@ class ConnectionLimitOverflowProxyProtocolE2ETest {
 		.compile("type=conn id=\\d+ event=reject listener=data remote=203\\.0\\.113\\.7:32100 reason=limit "
 				+ "transport=h1 status=503 durationMs=\\d+");
 
-	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ListAppender<>();
+	private static final ListAppender<ILoggingEvent> ACCESS_EVENTS = new ConcurrentListAppender<>();
 
 	private static int grpcPort;
 
@@ -173,7 +172,7 @@ class ConnectionLimitOverflowProxyProtocolE2ETest {
 			}
 			Awaitility.await().atMost(WITHIN).until(() -> overflow() == 0);
 			assertThat(rejected()).isEqualTo(rejected + 1);
-			assertThat(List.copyOf(ACCESS_EVENTS.list).stream().map(ILoggingEvent::getFormattedMessage))
+			assertThat(ACCESS_EVENTS.list.stream().map(ILoggingEvent::getFormattedMessage))
 				.noneMatch(line -> line.contains("status=503"));
 		}
 	}
@@ -208,8 +207,7 @@ class ConnectionLimitOverflowProxyProtocolE2ETest {
 			// the PROXY source, not the socket peer, on the reject line
 			Awaitility.await()
 				.atMost(WITHIN)
-				.untilAsserted(() -> assertThat(List.copyOf(ACCESS_EVENTS.list)
-					.stream()
+				.untilAsserted(() -> assertThat(ACCESS_EVENTS.list.stream()
 					.map(ILoggingEvent::getFormattedMessage)
 					.filter(line -> PROXIED_LINE.matcher(line).matches())).hasSize(1));
 		}
