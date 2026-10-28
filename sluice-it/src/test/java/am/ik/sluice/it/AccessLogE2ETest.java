@@ -130,7 +130,7 @@ class AccessLogE2ETest {
 	SessionRegistry sessions;
 
 	private List<String> events() {
-		return ACCESS_EVENTS.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+		return List.copyOf(ACCESS_EVENTS.list).stream().map(ILoggingEvent::getFormattedMessage).toList();
 	}
 
 	private void clearEvents() {

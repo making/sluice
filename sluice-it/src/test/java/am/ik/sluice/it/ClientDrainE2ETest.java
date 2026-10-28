@@ -543,7 +543,7 @@ class ClientDrainE2ETest {
 	}
 
 	private static List<String> messages() {
-		return CLIENT_EVENTS.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+		return List.copyOf(CLIENT_EVENTS.list).stream().map(ILoggingEvent::getFormattedMessage).toList();
 	}
 
 }

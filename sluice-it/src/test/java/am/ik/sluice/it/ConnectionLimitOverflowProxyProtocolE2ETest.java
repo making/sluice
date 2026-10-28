@@ -8,6 +8,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.Objects;
 import java.util.regex.Pattern;
 
@@ -172,7 +173,7 @@ class ConnectionLimitOverflowProxyProtocolE2ETest {
 			}
 			Awaitility.await().atMost(WITHIN).until(() -> overflow() == 0);
 			assertThat(rejected()).isEqualTo(rejected + 1);
-			assertThat(ACCESS_EVENTS.list.stream().map(ILoggingEvent::getFormattedMessage))
+			assertThat(List.copyOf(ACCESS_EVENTS.list).stream().map(ILoggingEvent::getFormattedMessage))
 				.noneMatch(line -> line.contains("status=503"));
 		}
 	}
@@ -207,7 +208,8 @@ class ConnectionLimitOverflowProxyProtocolE2ETest {
 			// the PROXY source, not the socket peer, on the reject line
 			Awaitility.await()
 				.atMost(WITHIN)
-				.untilAsserted(() -> assertThat(ACCESS_EVENTS.list.stream()
+				.untilAsserted(() -> assertThat(List.copyOf(ACCESS_EVENTS.list)
+					.stream()
 					.map(ILoggingEvent::getFormattedMessage)
 					.filter(line -> PROXIED_LINE.matcher(line).matches())).hasSize(1));
 		}

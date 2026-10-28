@@ -569,7 +569,8 @@ class ConnectionLimitOverflowE2ETest {
 	}
 
 	private List<String> answeredLines() {
-		return ACCESS_EVENTS.list.stream()
+		return List.copyOf(ACCESS_EVENTS.list)
+			.stream()
 			.map(ILoggingEvent::getFormattedMessage)
 			.filter(line -> ANSWERED_LINE.matcher(line).matches())
 			.toList();

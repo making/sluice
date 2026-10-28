@@ -168,7 +168,8 @@ class KeepAliveReroutingE2ETest {
 	}
 
 	private List<String> requestLines(String route) {
-		return ACCESS_EVENTS.list.stream()
+		return List.copyOf(ACCESS_EVENTS.list)
+			.stream()
 			.map(e -> e.getFormattedMessage())
 			.filter(m -> m.startsWith("type=req") && m.contains("route=" + route + " "))
 			.toList();

@@ -529,7 +529,7 @@ class ForceHttp1MisdirectedE2ETest {
 
 	private static List<String> accessLines() {
 		synchronized (ACCESS_EVENTS) {
-			return ACCESS_EVENTS.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+			return List.copyOf(ACCESS_EVENTS.list).stream().map(ILoggingEvent::getFormattedMessage).toList();
 		}
 	}
 

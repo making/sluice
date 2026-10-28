@@ -472,7 +472,7 @@ class AccessControlE2ETest {
 	}
 
 	private static List<String> accessLines() {
-		return ACCESS_EVENTS.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+		return List.copyOf(ACCESS_EVENTS.list).stream().map(ILoggingEvent::getFormattedMessage).toList();
 	}
 
 	private static Http2Headers headersOf(List<TestH2.Frame> frames) throws Exception {

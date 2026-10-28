@@ -456,7 +456,7 @@ class H2ReroutingE2ETest {
 					TestH2.headerBlock(":authority=log2.b.test", ":method=GET", ":path=/two"));
 			drainStreams(socket.getInputStream(), 1, 3);
 		}
-		List<String> events = ACCESS_EVENTS.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+		List<String> events = List.copyOf(ACCESS_EVENTS.list).stream().map(ILoggingEvent::getFormattedMessage).toList();
 		Awaitility.await()
 			.atMost(Duration.ofSeconds(5))
 			.until(() -> events.stream()
