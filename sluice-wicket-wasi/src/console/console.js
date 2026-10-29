@@ -946,7 +946,7 @@ function toggleEditor(route) {
   const form = h("form", { class: "editor", novalidate: true, "aria-label": `Sandbox of ${host}` },
     fields.element, h("div", { class: "editor__actions" }, save, cancel), outcome);
   form.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
+    if (event.key === "Escape" && !cancel.disabled) {
       toggleEditor(route);
     }
   });
@@ -1101,17 +1101,23 @@ function renderRoutes() {
   }
 }
 
-/** Puts `nodes` in `parent` in order, moving only the ones out of place. */
+/**
+ * Puts `nodes` in `parent` in order, moving only the ones out of place: the rest go first, so
+ * a row gone above an editor does not move it (a moved node loses the focus).
+ */
 function reconcile(parent, nodes) {
+  const kept = new Set(nodes);
+  for (const child of [...parent.children]) {
+    if (!kept.has(child)) {
+      child.remove();
+    }
+  }
   nodes.forEach((node, index) => {
     const current = parent.children[index];
     if (current !== node) {
       parent.insertBefore(node, current ?? null);
     }
   });
-  while (parent.children.length > nodes.length) {
-    parent.lastElementChild.remove();
-  }
 }
 
 function routeRow(route) {
