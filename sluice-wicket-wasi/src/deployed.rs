@@ -16,10 +16,11 @@
 //! its route is retargeted, and the old target drains as a removed one does.
 //! The routes and apps are held here, `routes.yaml` being their copy: an edit
 //! is reloaded first (`routes::Reloader::apply`) and written once the reload
-//! published it, so the file never names routes that did not load. A
-//! component file nothing names is removed after every edit and at startup,
-//! an upload once [`UPLOAD_GRACE`] passed: an app naming it links it below
-//! `components/` before.
+//! published it, so the file never names routes that did not load. It holds
+//! the apps' env, so only its owner reads it (0600). A component file
+//! nothing names is removed after every edit and at startup, an upload once
+//! [`UPLOAD_GRACE`] passed: an app naming it links it below `components/`
+//! before.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -49,6 +50,9 @@ const MAX_NAME: usize = 100;
 /// naming it after the upload never races its removal.
 const UPLOAD_GRACE: Duration = Duration::from_secs(10 * 60);
 
+/// Longest tag of an app, in bytes.
+const MAX_TAG: usize = 128;
+
 /// One of the console's routes.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Route {
@@ -57,7 +61,7 @@ pub struct Route {
     /// `components/<sha256>/<name>`.
     pub component: String,
     /// Without a keyvalue map: with `wasi=keyvalue` the default one applies
-    /// (the default store, the host as the namespace).
+    /// (the default store, the host as the namespace). Without an env.
     pub sandbox: Sandbox,
     /// When it took this component and sandbox, RFC 3339.
     pub deployed: String,
@@ -77,6 +81,8 @@ pub struct App {
     /// With its keyvalue map in full: an app has no one host to default a
     /// namespace to.
     pub sandbox: Sandbox,
+    /// The owner's, kept and listed as given ([`check_tag`]).
+    pub tag: Option<String>,
     /// When it took this component and sandbox, RFC 3339.
     pub deployed: String,
 }
@@ -92,6 +98,7 @@ pub struct AppSpec {
     pub file: String,
     /// With its keyvalue map ([`app_map`]).
     pub sandbox: Sandbox,
+    pub tag: Option<String>,
 }
 
 /// The console's routes in the order deployed, its apps in the order put,
@@ -153,6 +160,7 @@ impl Deployed {
                 origin: Origin::Api {
                     name: app.name.clone(),
                     owner: app.owner.clone(),
+                    tag: app.tag.clone(),
                     deployed: app.deployed.clone(),
                 },
             })
@@ -172,6 +180,7 @@ impl Deployed {
         now: SystemTime,
     ) -> Result<Deployed, Refused> {
         debug_assert!(sandbox.keyvalue.is_empty(), "the default map applies");
+        debug_assert!(sandbox.env.is_empty(), "the page sets no env");
         let host = check_host(host).map_err(Refused::Invalid)?;
         let component = self
             .store(&file_name(name, &host), component)
@@ -192,6 +201,7 @@ impl Deployed {
         now: SystemTime,
     ) -> Result<Deployed, Refused> {
         debug_assert!(sandbox.keyvalue.is_empty(), "the default map applies");
+        debug_assert!(sandbox.env.is_empty(), "the page sets no env");
         let route = self.route(host)?;
         Ok(self.with(Route {
             sandbox,
@@ -260,14 +270,14 @@ impl Deployed {
             )));
         }
         let path = self.dir.join(UPLOADS).join(format!("{given}.wasm"));
-        write_by_rename(&path, component).map_err(Refused::Failed)
+        write_by_rename(&path, component, false).map_err(Refused::Failed)
     }
 
     /// The apps with the app `name` as `app` has it since `now`: its
     /// component made from an upload or another file of its digest, in place
     /// of the app of that name -- which keeps its time when its component and
-    /// sandbox stay -- or added last. Another owner's app is refused, and so
-    /// is a component of a digest not kept.
+    /// sandbox stay, its tag changing or not -- or added last. Another
+    /// owner's app is refused, and so is a component of a digest not kept.
     pub fn with_app(&self, name: &str, app: AppSpec, now: SystemTime) -> Result<Deployed, Refused> {
         check_name("app", name).map_err(Refused::Invalid)?;
         check_name("owner", &app.owner).map_err(Refused::Invalid)?;
@@ -275,6 +285,9 @@ impl Deployed {
         let sha256 = check_digest(&app.sha256)
             .map_err(|e| Refused::Invalid(format!("component.sha256: {e}")))?;
         check_file(&app.file).map_err(|e| Refused::Invalid(format!("component.name: {e}")))?;
+        if let Some(tag) = &app.tag {
+            check_tag(tag).map_err(Refused::Invalid)?;
+        }
         debug_assert!(
             app_map(app.sandbox.caps, map_specs(&app.sandbox.keyvalue)).is_ok(),
             "an app names its map with the capability"
@@ -293,12 +306,14 @@ impl Deployed {
             hosts,
             component: self.materialize(&sha256, &app.file)?,
             sandbox: app.sandbox,
+            tag: app.tag,
             deployed: rfc3339(now),
         };
         let mut deployed = self.clone();
         match deployed.apps.iter_mut().find(|kept| kept.name == app.name) {
             Some(kept) if kept.component == app.component && kept.sandbox == app.sandbox => {
                 kept.hosts = app.hosts;
+                kept.tag = app.tag;
             }
             Some(kept) => *kept = app,
             None => deployed.apps.push(app),
@@ -369,15 +384,17 @@ impl Deployed {
         if std::fs::read(&path).is_ok_and(|kept| kept == component) {
             return Ok(relative);
         }
-        write_by_rename(&path, component)?;
+        write_by_rename(&path, component, false)?;
         Ok(relative)
     }
 
-    /// Writes the routes and apps to `routes.yaml`, by a rename.
+    /// Writes the routes and apps to `routes.yaml`, by a rename; for its
+    /// owner's eyes only, as it holds the apps' env.
     pub fn save(&self) -> Result<(), String> {
         write_by_rename(
             &self.dir.join(MANIFEST),
             write(&self.routes, &self.apps).as_bytes(),
+            true,
         )
     }
 
@@ -445,14 +462,29 @@ fn hidden(path: &Path) -> bool {
 }
 
 /// Writes `bytes` to `path` by a rename (no reader sees it half written),
-/// its directory made when missing.
-fn write_by_rename(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// its directory made when missing; `private`, readable by its owner only
+/// (0600) from its first byte on.
+fn write_by_rename(path: &Path, bytes: &[u8], private: bool) -> Result<(), String> {
+    use std::io::Write as _;
     let failed = |e: std::io::Error| format!("write {}: {e}", path.display());
     let parent = path.parent().expect("a file in a directory");
     std::fs::create_dir_all(parent).map_err(failed)?;
     let name = path.file_name().expect("a file").to_string_lossy();
     let partial = parent.join(format!(".{name}.partial"));
-    std::fs::write(&partial, bytes).map_err(failed)?;
+    // one a crash left keeps its mode: made anew
+    let _ = std::fs::remove_file(&partial);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    options
+        .open(&partial)
+        .and_then(|mut file| file.write_all(bytes))
+        .map_err(failed)?;
     std::fs::rename(&partial, path).map_err(failed)
 }
 
@@ -519,6 +551,19 @@ pub fn check_name(what: &str, name: &str) -> Result<(), String> {
         Err(format!(
             "{what}: '{name}' is no name (1 to {MAX_NAME} of A-Z, a-z, 0-9, '.', '_' and '-', \
              starting with a letter or a digit)"
+        ))
+    }
+}
+
+/// Whether `tag` is an app's tag: 1 to [`MAX_TAG`] printable ASCII chars
+/// but the space. Opaque to the wicket: its owner tells by it what it put
+/// (the digest of an env it can't read back, say).
+pub fn check_tag(tag: &str) -> Result<(), String> {
+    if (1..=MAX_TAG).contains(&tag.len()) && tag.bytes().all(|byte| byte.is_ascii_graphic()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "tag: '{tag}' is no tag (1 to {MAX_TAG} printable ASCII chars but the space)"
         ))
     }
 }
@@ -664,14 +709,18 @@ struct ManifestApp {
     hosts: Vec<String>,
     component: String,
     deployed: String,
+    tag: Option<String>,
     #[serde(default)]
     sandbox: SandboxFile,
 }
 
-/// The routes and apps of `routes.yaml`; errors name the route or app. A
-/// host is routed once over both.
+/// The routes and apps of `routes.yaml`; errors name the route or app (and a
+/// line, never the file's text: it holds the apps' env). A host is routed
+/// once over both.
 fn read(text: &str) -> Result<(Vec<Route>, Vec<App>), String> {
-    let file: ManifestFile = serde_saphyr::from_str(text).map_err(|e| {
+    let mut options = serde_saphyr::Options::default();
+    options.with_snippet = false;
+    let file: ManifestFile = serde_saphyr::from_str_with_options(text, options).map_err(|e| {
         let e = e.to_string();
         e.strip_prefix("error: ").unwrap_or(&e).to_string()
     })?;
@@ -689,6 +738,9 @@ fn read(text: &str) -> Result<(Vec<Route>, Vec<App>), String> {
             return Err(failed(
                 "sandbox.keyvalue: the console's routes take the default map".into(),
             ));
+        }
+        if !sandbox.env.is_empty() {
+            return Err(failed("sandbox.env: the console's routes take none".into()));
         }
         routes.push(Route {
             host,
@@ -710,6 +762,9 @@ fn read(text: &str) -> Result<(Vec<Route>, Vec<App>), String> {
             return Err(failed(format!("host '{host}' twice")));
         }
         let component = check_component(&app.component).map_err(failed)?;
+        if let Some(tag) = &app.tag {
+            check_tag(tag).map_err(failed)?;
+        }
         let (mut sandbox, map) = app.sandbox.split().map_err(failed)?;
         sandbox.keyvalue = app_map(sandbox.caps, map.unwrap_or_default()).map_err(failed)?;
         apps.push(App {
@@ -718,6 +773,7 @@ fn read(text: &str) -> Result<(Vec<Route>, Vec<App>), String> {
             hosts,
             component,
             sandbox,
+            tag: app.tag,
             deployed: app.deployed,
         });
     }
@@ -774,6 +830,9 @@ fn write(routes: &[Route], apps: &[App]) -> String {
         yaml.push_str(&format!("    hosts: [{}]\n", hosts.join(", ")));
         yaml.push_str(&format!("    component: {}\n", quote(&app.component)));
         yaml.push_str(&format!("    deployed: {}\n", quote(&app.deployed)));
+        if let Some(tag) = &app.tag {
+            yaml.push_str(&format!("    tag: {}\n", quote(tag)));
+        }
         if let Some(sandbox) = sandbox_yaml(&app.sandbox, true) {
             yaml.push_str(&format!("    sandbox: {sandbox}\n"));
         }
@@ -864,13 +923,20 @@ mod tests {
         for bad in [&sha256[1..], &format!("{}g", &sha256[1..]), ""] {
             assert!(check_digest(bad).is_err(), "'{bad}'");
         }
+        for tag in ["v1", &sha256, "a:b/c=\"d\"~", &"x".repeat(MAX_TAG)] {
+            assert_eq!(check_tag(tag), Ok(()), "'{tag}'");
+        }
+        for bad in ["", "a b", "a\nb", "ä", &"x".repeat(MAX_TAG + 1)] {
+            assert!(check_tag(bad).is_err(), "'{bad}'");
+        }
     }
 
-    /// The routes file reads back as written, routes and apps; what the
-    /// console never writes -- a component not its own, a keyvalue map of a
-    /// route, an app's map without a namespace, a host or an app twice --
-    /// fails, naming the route or the app. A move keeps a route as it is, in
-    /// its place, and replaces none.
+    /// The routes file reads back as written, routes and apps, an app's env
+    /// and tag included; what the console never writes -- a component not
+    /// its own, a keyvalue map or an env of a route, an app's map without a
+    /// namespace, a host or an app twice -- fails, naming the route or the
+    /// app, never a value. A move keeps a route as it is, in its place, and
+    /// replaces none.
     #[test]
     fn the_routes_file_reads_back_as_written() {
         let routes = vec![
@@ -899,6 +965,16 @@ mod tests {
             ]),
         )
         .unwrap();
+        sandbox.env = crate::env::Env::new(BTreeMap::from([
+            ("GREETING".into(), "hello".into()),
+            (
+                "PEM".into(),
+                "-----BEGIN-----\n\"AA==\"\\\n-----END-----".into(),
+            ),
+            ("PORT".into(), "8080".into()),
+            ("odd: name".into(), "${HOME}".into()),
+        ]))
+        .unwrap();
         let apps = vec![
             App {
                 name: "0b9e2c6a".into(),
@@ -906,6 +982,7 @@ mod tests {
                 hosts: vec!["c.local".into(), "d.local".into()],
                 component: format!("components/{}/c.wasm", "0".repeat(64)),
                 sandbox,
+                tag: Some("0123456789abcdef:\"#{}".into()),
                 deployed: rfc3339(UNIX_EPOCH),
             },
             App {
@@ -914,6 +991,7 @@ mod tests {
                 hosts: vec!["e.local".into()],
                 component: format!("components/{}/e.wasm", "e".repeat(64)),
                 sandbox: Sandbox::default(),
+                tag: None,
                 deployed: rfc3339(UNIX_EPOCH),
             },
         ];
@@ -1047,11 +1125,23 @@ mod tests {
                 apps("").replace("[b.local]", "[]"),
                 "apps[0]: hosts: an app serves one host at least".into(),
             ),
+            (
+                routes(&format!(
+                    "component: {component}, sandbox: {{env: {{K: s3cr3t}}}}"
+                )),
+                "routes[0]: sandbox.env: the console's routes take none".into(),
+            ),
+            (apps(", tag: 'a b'"), "apps[0]: tag: 'a b' is no tag".into()),
+            // a line, never the file's text: it holds the apps' env
+            (
+                apps(", sandbox: {env: {K: s3cr3t}}, fuel: 1"),
+                "unknown field `fuel`".into(),
+            ),
         ];
         for (yaml, error) in cases {
             let failed = read(&yaml);
             assert!(
-                matches!(&failed, Err(e) if e.contains(&error)),
+                matches!(&failed, Err(e) if e.contains(&error) && !e.contains("s3cr3t")),
                 "{yaml}: {failed:?}"
             );
         }

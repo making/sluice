@@ -351,9 +351,10 @@ routes:
 /// on the listener, listed -- a long poll answering the change -- and kept
 /// across a restart, until removed. It asks for its token, and refuses an
 /// edit from another origin and a body that is no wasm. A controller's app,
-/// its component uploaded by digest, serves its hosts at once, listed as it
-/// was put, the page's endpoints refusing them, until its owner removes it;
-/// the data of its keyvalue namespace is deleted only then.
+/// its component uploaded by digest, serves its hosts at once -- its guest
+/// seeing its env -- listed as it was put but the env's values, never shown,
+/// the page's endpoints refusing them, until its owner removes it; the data
+/// of its keyvalue namespace is deleted only then.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_console_deploys_an_uploaded_component_as_a_route() {
     let hello = std::fs::read(guests().join("hello.wasm")).unwrap();
@@ -499,9 +500,10 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
     let app = |hosts: &[&str], component: &[u8]| {
         let component = serde_json::json!({"sha256": digest(component), "name": "app.wasm"});
         let sandbox = serde_json::json!({"wasi": ["cli", "keyvalue"], "pool": 1,
-                                         "keyvalue": {"": "local/cf/shop"}});
+                                         "keyvalue": {"": "local/cf/shop"},
+                                         "env": {"GREETING": "s3cr3t-greeting"}});
         let app = serde_json::json!({"owner": "cf", "hosts": hosts, "component": component,
-                                     "sandbox": sandbox});
+                                     "sandbox": sandbox, "tag": "v1"});
         app.to_string().into_bytes()
     };
     let shop = app(&["b.localhost", "a.localhost"], &hello);
@@ -520,19 +522,30 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
             "{host}: {status} {body}"
         );
     }
+    assert_eq!(
+        get(&address, "a.localhost", "/env/GREETING").await,
+        (200, "s3cr3t-greeting".into()),
+        "the guest's environment"
+    );
     let (_, _, listing) = console(&at, "GET /api/routes", &[bearer], b"").await;
+    assert!(!listing.contains("s3cr3t"), "names only: {listing}");
     let listing: serde_json::Value = serde_json::from_str(&listing).unwrap();
     let route = &listing["routes"][0];
     assert_eq!(
         (&route["origin"], &route["app"], &route["owner"]),
         (&"api".into(), &"shop".into(), &"cf".into())
     );
+    assert_eq!(route["sandbox"]["env"], serde_json::json!(["GREETING"]));
+    let target = route["target"].as_str().unwrap();
+    assert!(target.contains("&env="), "a digest: {target}");
     assert_eq!(
         listing["keyvalue_stores"],
         serde_json::json!([{"name": "local", "type": "sqlite", "default": true}])
     );
-    // listed as put: put again, it changes nothing; with what a sandbox may hold
+    // listed as put, the env named only: put again, it changes nothing; with
+    // what a sandbox may hold
     let (_, _, apps) = console(&at, "GET /api/apps", &[bearer], b"").await;
+    assert!(!apps.contains("s3cr3t"), "names only: {apps}");
     let apps: serde_json::Value = serde_json::from_str(&apps).unwrap();
     let capabilities = [
         "cli",
@@ -551,6 +564,11 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         listed["hosts"],
         serde_json::json!(["a.localhost", "b.localhost"])
     );
+    assert_eq!(
+        (&listed["sandbox"]["env"], &listed["tag"]),
+        (&serde_json::json!(["GREETING"]), &"v1".into())
+    );
+    listed["sandbox"]["env"] = serde_json::json!({"GREETING": "s3cr3t-greeting"});
     let listed_app = listed.as_object_mut().unwrap();
     assert_eq!(listed_app.remove("name"), Some("shop".into()));
     assert!(listed_app.remove("deployed").is_some());
@@ -567,6 +585,11 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
     assert_eq!((status, body.as_str()), (409, taken));
     let (status, _, body) = console(&at, "DELETE /api/routes/a.localhost", &[bearer], b"").await;
     assert_eq!((status, body.as_str()), (409, taken));
+    // the page sets no env
+    let page_env = "PUT /api/routes/c.localhost?name=hello.wasm&env=K";
+    let (status, _, body) = console(&at, page_env, &[bearer], &hello).await;
+    assert_eq!(status, 400);
+    assert!(body.contains("unknown option 'env'"), "{body}");
     // a component never uploaded: 409 naming it; one that does not compile:
     // 422 naming the host, the component by its path in --console-dir
     let never = app(&["c.localhost"], b"never uploaded");
@@ -576,7 +599,8 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         (status, &body["missing"]),
         (409, &serde_json::json!([digest(b"never uploaded")]))
     );
-    let truncated = &hello[..100];
+    // its last section cut short: never a component
+    let truncated = &hello[..hello.len() - 1];
     let (status, _, _) = console(&at, &upload(truncated), &[bearer], truncated).await;
     assert_eq!(status, 200);
     let broken = app(&["c.localhost"], truncated);

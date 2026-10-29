@@ -65,6 +65,7 @@ pub mod config;
 mod console;
 mod deployed;
 mod drain;
+mod env;
 mod flume;
 mod keyvalue;
 mod listener;

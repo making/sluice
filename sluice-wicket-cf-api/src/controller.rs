@@ -1,10 +1,11 @@
 //! The wicket serves what the state wants: an app started with a droplet and
 //! a route is an app of the wicket, named by its guid (its routes' hosts,
-//! the snapshot's component and sandbox, the process's instances as the
-//! pool); stopped, or without a route, it is none. The desired state is the
-//! cf-api's: at startup and whenever the wicket's revision moves, its apps
-//! of the owner are listed and the difference put / deleted. The wicket
-//! serves on while the cf-api is down.
+//! the snapshot's component and sandbox -- its env, which the wicket lists
+//! by the names only, told by the snapshot's tag -- and the process's
+//! instances as the pool); stopped, or without a route, it is none. The
+//! desired state is the cf-api's: at startup and whenever the wicket's
+//! revision moves, its apps of the owner are listed and the difference put /
+//! deleted. The wicket serves on while the cf-api is down.
 //!
 //! The data of a deleted keyvalue instance is deleted once no app maps its
 //! namespace, the wicket's draining routes included: tried at the deletion
@@ -56,7 +57,9 @@ impl Controller {
                 pool: app.process.instances,
                 instances: running.instances,
                 keyvalue: running.keyvalue.clone(),
+                env: running.env.clone(),
             },
+            tag: running.tag.clone(),
         })
     }
 
@@ -315,7 +318,7 @@ impl Controller {
 
 /// Whether the wicket serves `desired` as listed: a `budget_ms` left to
 /// the wicket's default matches whatever it chose; the capabilities in any
-/// order.
+/// order; the env, which the wicket lists by its names, by the tag.
 fn same(listed: &AppBody, desired: &AppBody) -> bool {
     let sorted = |list: &[String]| {
         let mut list = list.to_vec();
@@ -333,6 +336,7 @@ fn same(listed: &AppBody, desired: &AppBody) -> bool {
             .budget_ms
             .is_none_or(|budget| listed.sandbox.budget_ms == Some(budget))
         && listed.sandbox.keyvalue == desired.sandbox.keyvalue
+        && listed.tag == desired.tag
 }
 
 #[cfg(test)]
@@ -356,6 +360,8 @@ mod tests {
             instances: None,
             wasi: vec!["keyvalue".into(), "cli".into()],
             keyvalue: [(String::new(), "local/cf/i".to_string())].into(),
+            env: [("GREETING".to_string(), "hello".to_string())].into(),
+            tag: Some("t1".into()),
             since: 0,
         };
         state.app_mut(&guid).unwrap().running = Some(running);
@@ -370,7 +376,18 @@ mod tests {
         assert_eq!(desired.sandbox.pool, 2);
         assert_eq!(desired.sandbox.memory_mib, Some(64));
         assert_eq!(desired.sandbox.keyvalue[""], "local/cf/i");
-        let mut listed = desired.clone();
+        // the env put, listed by its names: told by the tag
+        let mut body = serde_json::to_value(&desired).unwrap();
+        assert_eq!(
+            (&body["sandbox"]["env"]["GREETING"], &body["tag"]),
+            (&"hello".into(), &"t1".into())
+        );
+        body["sandbox"]["env"] = serde_json::json!(["GREETING"]);
+        let mut listed: AppBody = serde_json::from_value(body).unwrap();
+        assert!(same(&listed, &desired));
+        listed.tag = Some("t0".into());
+        assert!(!same(&listed, &desired), "another snapshot");
+        listed.tag = desired.tag.clone();
         listed.sandbox.budget_ms = Some(5000);
         // the wicket lists the capabilities in its order
         listed.sandbox.wasi = vec!["cli".into(), "keyvalue".into()];

@@ -1301,6 +1301,10 @@ function sandboxCell(sandbox) {
     parts.push(h("span", { class: "route__kv mono", title: "keyvalue identifier → store/namespace" },
       `${identifier} → ${entry.store}/${entry.namespace}`));
   }
+  if (sandbox.env?.length) {
+    parts.push(h("span", { class: "route__env mono", title: "the guest's environment variables (their values are never shown)" },
+      `env ${sandbox.env.join(", ")}`));
+  }
   if (!parts.length) {
     parts.push(h("span", { class: "route__defaults" }, "defaults"));
   }

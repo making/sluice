@@ -55,11 +55,12 @@ pub enum Origin {
     Flag,
     /// The console's page, which deployed it at `deployed` (RFC 3339).
     Console { deployed: String },
-    /// The app `name` of the console's API, put by `owner`; it took its
-    /// component and sandbox at `deployed` (RFC 3339).
+    /// The app `name` of the console's API, put by `owner` with its `tag`;
+    /// it took its component and sandbox at `deployed` (RFC 3339).
     Api {
         name: String,
         owner: String,
+        tag: Option<String>,
         deployed: String,
     },
 }
@@ -859,16 +860,25 @@ impl Reloader {
     }
 
     /// Publishes `plan` and retires the handlers it replaced; None when it
-    /// changes nothing.
+    /// changes no route. Origins changed alone (an app's tag) are published
+    /// in the generation they were: nothing to advertise or acknowledge.
     fn commit(&mut self, plan: Plan) -> Option<Change> {
         let current = self.routes.current();
         let unchanged = plan.advertised == current.advertised
-            && plan.origins == current.origins
             && plan
                 .targets
                 .iter()
                 .all(|(_, _, planned)| matches!(planned, Planned::Keep(_)));
         if unchanged && current.generation > 0 {
+            if plan.origins != current.origins {
+                self.routes.publish(Table {
+                    generation: current.generation,
+                    advertised: current.advertised.clone(),
+                    origins: plan.origins,
+                    entries: current.entries.clone(),
+                });
+                self.status.send_modify(|status| status.revision += 1);
+            }
             return None;
         }
         let generation = current.generation + 1;
@@ -1061,7 +1071,7 @@ fn change(old: &[Upstream], new: &[Upstream], updated: &HashSet<String>) -> Chan
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::wasm_host::tests::guest_wasm;
+    use crate::wasm_host::tests::{exchange, guest_wasm};
 
     /// A directory of its own under the system temp dir, removed on drop.
     pub(crate) struct Scratch(pub(crate) PathBuf);
@@ -1201,11 +1211,12 @@ pub(crate) mod tests {
     }
 
     /// A reload publishes the routes read again: an added and a removed host,
-    /// a host moved to another sandbox (another target) and a component
-    /// changed on disk (its target keeps, with a new handler); an unchanged
-    /// route keeps its handler. The replaced and removed handlers' pools are
-    /// retired, and the removed targets stay resolvable until acknowledged.
-    /// Read again unchanged, nothing is published.
+    /// a host moved to another sandbox (another target) -- another env
+    /// included, which its guest answers, its target holding no value -- and a
+    /// component changed on disk (its target keeps, with a new handler); an
+    /// unchanged route keeps its handler. The replaced and removed handlers'
+    /// pools are retired, and the removed targets stay resolvable until
+    /// acknowledged. Read again unchanged, nothing is published.
     #[tokio::test]
     async fn a_reload_publishes_the_changed_routes_and_keeps_the_unchanged_handlers() {
         let dir = Scratch::new("reload");
@@ -1220,7 +1231,7 @@ pub(crate) mod tests {
                 ("a.local", "a.wasm", "pool: 1"),
                 ("b.local", "b.wasm", "pool: 1"),
                 ("c.local", "c.wasm", ""),
-                ("d.local", "d.wasm", ""),
+                ("d.local", "d.wasm", "env: {GREETING: hello-d}"),
                 ("f.local", &remote, ""),
             ]),
         );
@@ -1238,7 +1249,7 @@ pub(crate) mod tests {
             config(&[
                 ("a.local", "a.wasm", "pool: 1"),
                 ("c.local", "c.wasm", "budget: 5s"),
-                ("d.local", "d.wasm", ""),
+                ("d.local", "d.wasm", "env: {GREETING: hello-d}"),
                 ("e.local", "e.wasm", ""),
                 ("f.local", &remote, ""),
             ]),
@@ -1270,6 +1281,7 @@ pub(crate) mod tests {
             before.handler(&d).unwrap(),
             after.handler(&d).unwrap()
         ));
+        assert!(d.contains("?env=") && !d.contains("hello-d"), "{d}");
         assert_eq!(after.advertised.len(), 5);
         assert_eq!(
             after.targets(),
@@ -1292,13 +1304,27 @@ pub(crate) mod tests {
                 ("a.local", "a.wasm", "pool: 1"),
                 ("b.local", "b.wasm", "pool: 1"),
                 ("c.local", "c.wasm", "budget: 5s"),
-                ("d.local", "d.wasm", ""),
+                ("d.local", "d.wasm", "env: {GREETING: s3cr3t-d}"),
                 ("e.local", "e.wasm", ""),
                 ("f.local", &remote, ""),
             ]),
         );
         let change = reloader.reload(false).await.unwrap().unwrap();
         assert_eq!(change.added, ["b.local"]);
+        assert_eq!(
+            change.retargeted,
+            ["d.local"],
+            "another env, another target"
+        );
+        let table = reloader.routes().current();
+        let d = table.target("d.local");
+        assert!(!d.contains("s3cr3t"), "{d}");
+        let request = "GET /env/GREETING HTTP/1.1\r\nhost: d.local\r\nconnection: close\r\n\r\n";
+        let answer = exchange(table.handler(&d).unwrap(), request).await;
+        assert!(
+            answer.starts_with("HTTP/1.1 200") && answer.contains("s3cr3t-d"),
+            "{answer}"
+        );
         let b = before.target("b.local");
         assert!(!Arc::ptr_eq(
             before.handler(&b).unwrap(),
@@ -1337,7 +1363,8 @@ pub(crate) mod tests {
             (
                 "truncated component",
                 good.clone(),
-                &hello[..100],
+                // its last section cut short: never a component
+                &hello[..hello.len() - 1],
                 "component",
             ),
             (
@@ -1395,7 +1422,8 @@ pub(crate) mod tests {
     /// other content or another sandbox retargets it (the replaced component
     /// removed), a removal removes it. An app -- hosts served by a component
     /// uploaded by its digest first, in one sandbox, its keyvalue map named
-    /// -- changes in one generation a PUT, on handlers of its own. A host
+    /// -- changes in one generation a PUT, on handlers of its own; its tag
+    /// alone changes no route, and the routes file is its owner's only. A host
     /// another source routes, another owner's app, a component not kept or
     /// that does not compile, pools past the limit, an unknown host and no
     /// host name are refused: the table, the routes file and the components
@@ -1456,6 +1484,7 @@ pub(crate) mod tests {
                         sha256: hex(component),
                         file: "app.wasm".into(),
                         sandbox,
+                        tag: None,
                     },
                 }
             };
@@ -1644,6 +1673,40 @@ pub(crate) mod tests {
         );
         let table = reloader.routes().current();
         assert_eq!(table.origins["s1.local"], origin);
+        // a tag alone changes no route: published in the same generation,
+        // for the listings to show, and kept
+        let revision = status.borrow().revision;
+        let retagged = match shop(&["s1.local"], &fetch, &place) {
+            Edit::PutApp { name, mut app } => {
+                app.tag = Some("v2".into());
+                Edit::PutApp { name, app }
+            }
+            _ => unreachable!("an app's PUT"),
+        };
+        assert_eq!(
+            reloader.apply(retagged).await,
+            Ok(Outcome {
+                generation: generation + 2,
+                change: None,
+            })
+        );
+        let mut origin = origin;
+        if let Origin::Api { tag, .. } = &mut origin {
+            *tag = Some("v2".into());
+        }
+        assert_eq!(reloader.routes().current().origins["s1.local"], origin);
+        assert!(status.borrow().revision > revision, "the console sees it");
+        assert!(manifest().contains("tag: \"v2\""), "{}", manifest());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let file = std::fs::metadata(deployed.join("routes.yaml")).unwrap();
+            assert_eq!(
+                file.permissions().mode() & 0o777,
+                0o600,
+                "it holds the apps' env"
+            );
+        }
         let handler = table.handler(&table.target("s1.local")).unwrap();
         assert_eq!(
             handler.sandbox().keyvalue[""],
@@ -1666,7 +1729,8 @@ pub(crate) mod tests {
             Refused::Rejected(_) => "rejected".into(),
             Refused::Failed(_) => "failed".into(),
         };
-        let truncated = &hello[..100];
+        // its last section cut short: never a component
+        let truncated = &hello[..hello.len() - 1];
         reloader
             .apply(upload(truncated, &hex(truncated)))
             .await

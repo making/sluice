@@ -15,6 +15,7 @@
 pub mod api;
 pub mod config;
 pub mod controller;
+mod env;
 pub mod flume;
 pub mod logs;
 pub mod manifest;

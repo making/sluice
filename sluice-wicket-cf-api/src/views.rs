@@ -366,32 +366,28 @@ pub fn job(base: &str, job: &Job) -> Value {
     })
 }
 
+/// The app's environment as `cf env` shows it: the user's variables, and
+/// the `VCAP_*` its next start gives the guest.
 pub fn env(base: &str, state: &State, app: &App) -> Value {
-    let uris: Vec<String> = state
-        .routes_of(&app.guid)
-        .map(|route| state.url(route))
-        .collect();
     json!({
         "staging_env_json": {},
         "running_env_json": {},
-        "environment_variables": {},
+        "environment_variables": app.env,
         "system_env_json": {"VCAP_SERVICES": crate::services::vcap_services(state, &app.guid)},
-        "application_env_json": {"VCAP_APPLICATION": {
-            "application_id": app.guid,
-            "application_name": app.name,
-            "application_uris": uris,
-            "application_version": app.process.guid,
-            "cf_api": base,
-            "limits": {"fds": 16384, "mem": app.process.memory_mb, "disk": app.process.disk_mb},
-            "name": app.name,
-            "organization_id": state.org.guid,
-            "organization_name": state.org.name,
-            "space_id": state.space.guid,
-            "space_name": state.space.name,
-            "uris": uris,
-            "users": null,
-            "version": app.process.guid,
-        }},
+        "application_env_json": {
+            "VCAP_APPLICATION": crate::env::vcap_application(base, state, app),
+        },
+    })
+}
+
+/// The user's variables, as `cf set-env` gets them back.
+pub fn environment_variables(base: &str, app: &App) -> Value {
+    json!({
+        "var": app.env,
+        "links": {
+            "self": {"href": format!("{base}/v3/apps/{}/environment_variables", app.guid)},
+            "app": {"href": format!("{base}/v3/apps/{}", app.guid)},
+        },
     })
 }
 
@@ -437,6 +433,12 @@ pub fn manifest(state: &State, app: &App) -> String {
     if !services.is_empty() {
         text.push_str("  services:\n");
         text.extend(services);
+    }
+    if !app.env.is_empty() {
+        text.push_str("  env:\n");
+        for (name, value) in &app.env {
+            text.push_str(&format!("    {}: {}\n", quoted(name), quoted(value)));
+        }
     }
     if !app.annotations.is_empty() || !app.labels.is_empty() {
         text.push_str("  metadata:\n");

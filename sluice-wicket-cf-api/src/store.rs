@@ -1,9 +1,10 @@
 //! The desired state: one organization and space, the shared domains, the
-//! apps with their web process, the routes, packages, builds, droplets,
-//! deployments and jobs, the service instances and their bindings. In
-//! memory, written by a rename to `state.json` in the data directory on
-//! every change; the blobs next to it (`packages/<guid>.zip`,
-//! `droplets/<sha256>.wasm`).
+//! apps with their web process and environment variables, the routes,
+//! packages, builds, droplets, deployments and jobs, the service instances
+//! and their bindings. In memory, written by a rename to `state.json` in the
+//! data directory on every change; the blobs next to it
+//! (`packages/<guid>.zip`, `droplets/<sha256>.wasm`). Every file is its
+//! owner's only (0600): the state holds the apps' environment.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -78,6 +79,10 @@ pub struct App {
     pub annotations: BTreeMap<String, String>,
     pub process: Process,
     pub current_droplet: Option<String>,
+    /// The user's environment variables (`crate::env`); the guest gets them
+    /// at its next start.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     /// What the wicket serves since the last start, restart or deployment:
     /// the snapshot taken then.
     pub running: Option<Running>,
@@ -132,6 +137,14 @@ pub struct Running {
     /// The keyvalue map the bindings made: identifier -> `store/namespace`.
     #[serde(default)]
     pub keyvalue: BTreeMap<String, String>,
+    /// The guest's environment (`crate::env::guest`); none in a snapshot
+    /// taken before the cf-api gave one.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Tells the wicket's app of this snapshot from another
+    /// (`crate::env::tag`): the wicket lists no env back.
+    #[serde(default)]
+    pub tag: Option<String>,
     /// Seconds since the epoch.
     pub since: u64,
 }
@@ -391,6 +404,7 @@ impl State {
                 updated_at: at,
             },
             current_droplet: None,
+            env: BTreeMap::new(),
             running: None,
         });
         self.apps.last_mut().expect("just pushed")
@@ -672,9 +686,20 @@ impl Store {
     }
 }
 
-fn write_by_rename(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// Writes `bytes` to `path` by a rename, for its owner only (0600) from the
+/// first byte on.
+pub(crate) fn write_by_rename(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)
+    // one a crash left keeps its mode: made anew
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(bytes))
         .and_then(|()| std::fs::rename(&tmp, path))
         .map_err(|e| format!("{}: {e}", path.display()))
 }

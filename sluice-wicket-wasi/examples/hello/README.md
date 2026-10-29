@@ -16,6 +16,7 @@ sluice-wicket-wasi ... --wasm 'demo.local=examples/target/wasm32-wasip3/release/
 | `/panic` | guest trap -> 500; the tunnel and later requests survive |
 | `/spin` | CPU busy loop interrupted by `budget-ms` -> 504 |
 | `/balloon` | allocation denied by `memory-mib` -> 500 |
+| `/env/<NAME>` | the route's variable `NAME` (`sandbox.env`), 404 when unset |
 
 ```text
 curl -H 'Host: demo.local' http://127.0.0.1:8000/hello

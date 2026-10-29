@@ -54,7 +54,8 @@ pub struct Claims {
 }
 
 impl Uaa {
-    /// The key of `jwt.key` in `dir`, made when missing.
+    /// The key of `jwt.key` in `dir`, made when missing; the file its
+    /// owner's only (0600).
     pub fn open(dir: &Path) -> Result<Uaa, String> {
         let file = dir.join("jwt.key");
         let failed = |e: std::io::Error| format!("{}: {e}", file.display());
@@ -70,14 +71,18 @@ impl Uaa {
                     .filter(|bytes| bytes.len() == 32)
                     .ok_or_else(|| format!("{}: not a 64 hex digit key", file.display()))?;
                 key.copy_from_slice(&bytes);
+                // one an older cf-api wrote as any file
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let private = std::fs::Permissions::from_mode(0o600);
+                    std::fs::set_permissions(&file, private).map_err(failed)?;
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 getrandom::fill(&mut key).map_err(|e| format!("no random key: {e}"))?;
                 let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
-                let tmp = file.with_extension("tmp");
-                std::fs::write(&tmp, hex)
-                    .and_then(|()| std::fs::rename(&tmp, &file))
-                    .map_err(failed)?;
+                crate::store::write_by_rename(&file, hex.as_bytes())?;
             }
             Err(e) => return Err(failed(e)),
         }
@@ -298,8 +303,21 @@ mod tests {
             .unwrap();
         assert_eq!(claims.user_name, "alice");
         assert_eq!(claims.iss, issuer);
-        // the same key again: the token is still good after a restart
+        // the same key again: the token is still good after a restart; the
+        // key file is its owner's only, one an older cf-api wrote included
+        #[cfg(unix)]
+        let mode = || {
+            use std::os::unix::fs::PermissionsExt as _;
+            let file = dir.join("jwt.key");
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            mode
+        };
+        #[cfg(unix)]
+        assert_eq!(mode(), 0o600);
         let again = Uaa::open(&dir).unwrap();
+        #[cfg(unix)]
+        assert_eq!(mode(), 0o600);
         let refreshed = again
             .grant(
                 format!(

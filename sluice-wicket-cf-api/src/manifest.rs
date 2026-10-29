@@ -1,7 +1,8 @@
 //! The manifest `cf push` applies (`POST /v3/spaces/:guid/actions/apply_manifest`,
 //! and `manifest_diff` before it with a manifest file): the apps, their web
-//! process, routes, service bindings and metadata are applied server side,
-//! as on CF. What the wicket cannot serve is refused, naming it.
+//! process, routes, service bindings, environment variables and metadata
+//! are applied server side, as on CF. What the wicket cannot serve is
+//! refused, naming it.
 
 use std::collections::BTreeMap;
 
@@ -130,11 +131,6 @@ fn apply_app(state: &mut State, spec: &AppManifest) -> Result<String, String> {
             "{name}: docker images are not supported: push a directory or a zip holding the component"
         ));
     }
-    if spec.env.as_ref().is_some_and(|env| !env.is_empty()) {
-        return Err(format!(
-            "{name}: environment variables are not supported yet"
-        ));
-    }
     if spec.sidecars.is_some() {
         return Err(format!("{name}: sidecars are not supported"));
     }
@@ -166,6 +162,11 @@ fn apply_app(state: &mut State, spec: &AppManifest) -> Result<String, String> {
         merge(&mut app.annotations, metadata.annotations.as_ref());
         check_annotations(&app.annotations).map_err(|e| format!("{name}: {e}"))?;
     }
+    // as cf push does: merged, the guest gets them at the start that follows
+    let mut env = app.env.clone();
+    merge(&mut env, spec.env.as_ref());
+    crate::env::check(&env).map_err(|e| format!("{name}: {e}"))?;
+    app.env = env;
     let process = &mut app.process;
     let fields = [(
         spec.instances,
@@ -481,7 +482,7 @@ mod tests {
     fn applies_the_process_the_routes_the_services_and_the_metadata() {
         let mut state = state();
         let manifest = parse(
-            "applications:\n- name: counter\n  path: /tmp/x\n  command: counter.wasm\n  instances: 2\n  memory: 64M\n  default-route: true\n  routes:\n  - route: counter.localhost\n  - route: count.example.com\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/budget-ms: 5000\n  unknown-key: ignored\n",
+            "applications:\n- name: counter\n  path: /tmp/x\n  command: counter.wasm\n  instances: 2\n  memory: 64M\n  default-route: true\n  routes:\n  - route: counter.localhost\n  - route: count.example.com\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/budget-ms: 5000\n  env:\n    GREETING: 'a: \"b\"'\n    WORKERS: 4\n  unknown-key: ignored\n",
         )
         .unwrap();
         let guids = apply(&mut state, &manifest).unwrap();
@@ -491,6 +492,13 @@ mod tests {
         assert_eq!(app.process.memory_mb, 64);
         assert_eq!(app.process.command.as_deref(), Some("counter.wasm"));
         assert_eq!(app.annotations[BUDGET_ANNOTATION], "5000");
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect()
+        };
+        assert_eq!(app.env, env(&[("GREETING", "a: \"b\""), ("WORKERS", "4")]));
         let mut urls: Vec<String> = state
             .routes_of(&guids[0])
             .map(|route| state.url(route))
@@ -498,12 +506,19 @@ mod tests {
         urls.sort();
         assert_eq!(urls, ["count.example.com", "counter.localhost"]);
 
-        // again: the same app, the routes kept; a default route only without any
-        let again = parse("applications:\n- name: counter\n  default-route: true\n  memory: 128\n")
-            .unwrap();
+        // again: the same app, the routes kept; a default route only without
+        // any; the env merged, a null removing a variable
+        let again = parse(
+            "applications:\n- name: counter\n  default-route: true\n  memory: 128\n  env:\n    WORKERS: ~\n",
+        )
+        .unwrap();
         assert_eq!(apply(&mut state, &again).unwrap(), guids);
         assert_eq!(state.app(&guids[0]).unwrap().process.memory_mb, 128);
         assert_eq!(state.routes_of(&guids[0]).count(), 2);
+        assert_eq!(
+            state.app(&guids[0]).unwrap().env,
+            env(&[("GREETING", "a: \"b\"")])
+        );
 
         // a second app takes its default route; a route serves one app
         let other = parse("applications:\n- name: other\n  default-route: true\n").unwrap();
@@ -575,7 +590,13 @@ mod tests {
         let written = parse(&crate::views::manifest(&state, &app)).unwrap();
         let mut again = state.clone();
         again.bindings.clear();
+        again.app_mut(&guids[0]).unwrap().env.clear();
         apply(&mut again, &written).unwrap();
+        assert_eq!(
+            again.app(&guids[0]).unwrap().env,
+            app.env,
+            "the manifest written sets the same env"
+        );
         let made = |state: &State| -> Vec<(String, String, Option<String>)> {
             state
                 .bindings
@@ -608,7 +629,10 @@ mod tests {
             apply(&mut state, &manifest).unwrap_err()
         };
         assert!(refused("applications:\n- name: a\n  docker:\n    image: x\n").contains("docker"));
-        assert!(refused("applications:\n- name: a\n  env:\n    K: v\n").contains("environment"));
+        assert!(
+            refused("applications:\n- name: a\n  env:\n    VCAP_SERVICES: v\n")
+                .contains("a: environment variable \"VCAP_SERVICES\": cannot start with VCAP_")
+        );
         let services = [
             ("- nope", "service instance 'nope' not found"),
             (

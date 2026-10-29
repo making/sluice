@@ -35,6 +35,10 @@ pub struct AppBody {
     pub hosts: Vec<String>,
     pub component: ComponentRef,
     pub sandbox: Sandbox,
+    /// Opaque to the wicket, listed as put: the snapshot's
+    /// (`crate::env::tag`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -43,8 +47,9 @@ pub struct ComponentRef {
     pub name: String,
 }
 
-/// The sandbox: the `--wasm` route options in JSON, and the keyvalue map. A
-/// key left out takes the wicket's default; a listing names every one.
+/// The sandbox: the `--wasm` route options in JSON, the keyvalue map and
+/// the env. A key left out takes the wicket's default; a listing names
+/// every one, the env by the names only.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Sandbox {
     #[serde(default)]
@@ -56,6 +61,9 @@ pub struct Sandbox {
     pub instances: Option<u64>,
     #[serde(default)]
     pub keyvalue: BTreeMap<String, String>,
+    /// Put, never read back: the app's tag tells what the wicket serves.
+    #[serde(skip_deserializing, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]

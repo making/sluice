@@ -220,6 +220,10 @@ keyvalue:                       # optional: one sqlite store, keyvalue.db next t
 routes:
   - host: demo.local
     component: hello.wasm       # a path relative to this file, file:// or http(s)://
+    sandbox:
+      env:                      # the guest's environment variables (wasi:cli/environment)
+        GREETING: hello
+        API_KEY: ${DEMO_API_KEY}  # a secret: kept out of the file
   - host: relay.local
     component: relay.wasm
     sandbox:                    # the --wasm query options; unset keys keep their defaults
@@ -246,7 +250,12 @@ routes:
   without a default is an error, `$${` a literal `${`, and a quoted scalar is never
   expanded
 - an unknown key or a value that does not parse fails, naming the line, or the route and
-  key (`routes[1]: sandbox.memory: ...`)
+  key (`routes[1]: sandbox.memory: ...`), never the file's text
+- a route's `env` is what its guest's `wasi:cli/environment` answers, each scalar as text (a
+  name not empty, without `=` or a control character; 128KiB in all). It may hold secrets:
+  the advertised target carries a digest of it (keyed by the process: another env, another
+  target, and no value in it), the console and the logs its names only. `--wasm` and the
+  console's page set none
 - the `--wasm` routes follow the file's
 
 ### Reloading routes
@@ -271,11 +280,12 @@ stay as they were until a file changes again or SIGHUP. Otherwise
 - a component changed on disk serves the next request, of a connection already open
   too; a request in flight finishes on the one it started with. Its target is
   unchanged, so nothing is advertised again
-- an added or removed host, or a changed sandbox (a new target), is advertised again
-  on every node stream. A removed target keeps being served -- a connection the server
-  routed before it took the new routes included -- until every stream acknowledged
-  them; then its connections shut down gracefully (http/1.1 once the request in flight
-  is answered, h2 with GOAWAY after its streams) and a CONNECT to it fails
+- an added or removed host, or a changed sandbox (a new target; its env included), is
+  advertised again on every node stream. A removed target keeps being served -- a
+  connection the server routed before it took the new routes included -- until every
+  stream acknowledged them; then its connections shut down gracefully (http/1.1 once the
+  request in flight is answered, h2 with GOAWAY after its streams) and a CONNECT to it
+  fails
 - the replaced handlers' pools close: idle units end at once, busy ones after their
   request, and a new pool's units take the slots as they free (requests take the
   per-request path meanwhile)
@@ -321,12 +331,12 @@ deployed/components/<sha256>/<name>.wasm  the components they name, never rewrit
 deployed/uploads/<sha256>.wasm            the components uploaded by digest, for an app to name
 ```
 
-`routes.yaml` is written once a change loaded, and a component no route or app names is
-removed; an upload, 10 minutes after it (an app naming it links it below `components/`). A
-component's path names its digest, so other content is another target: the route is
-retargeted, and its old target drains as a removed one does. Without `--console` the directory
-is not read: the console's routes are served with the console only. One wicket per
-directory.
+`routes.yaml` is written once a change loaded -- for its owner only (0600): it holds the apps'
+env -- and a component no route or app names is removed; an upload, 10 minutes after it (an
+app naming it links it below `components/`). A component's path names its digest, so other
+content is another target: the route is retargeted, and its old target drains as a removed
+one does. Without `--console` the directory is not read: the console's routes are served with
+the console only. One wicket per directory.
 
 `--console-token <token>` (`console-token`, `SLUICE_WICKET_WASI_CONSOLE_TOKEN`) is asked of
 every request: the browser prompts for it (HTTP Basic, any user name, the token as the
@@ -394,7 +404,8 @@ starts with no data; what it stored stays under the old host.
 
 The listing names each route's `origin` (`config`, `flag`, `console`, `api`), its advertised
 `target` (the route's identity on the server: the component's absolute URL and the sandbox),
-its component and sandbox, and the wicket's `keyvalue_stores` (`name`, `type`, `default`).
+its component and sandbox (its `env` by the names), and the wicket's `keyvalue_stores`
+(`name`, `type`, `default`).
 
 #### Apps
 
@@ -416,7 +427,9 @@ removed by its owner: the API of a controller keeping the desired state of its a
   "hosts": ["counter.localhost", "count.localhost"],
   "component": {"sha256": "0954dc11…e8", "name": "counter.wasm"},
   "sandbox": {"wasi": ["keyvalue"], "budget_ms": 10000, "memory_mib": 256, "pool": 1,
-              "instances": null, "keyvalue": {"": "local/cf/5d2f-guid"}}
+              "instances": null, "keyvalue": {"": "local/cf/5d2f-guid"},
+              "env": {"GREETING": "hello"}},
+  "tag": "3f1c…9a"
 }
 ```
 
@@ -430,11 +443,17 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
 - the sandbox is the route options of `--wasm` in JSON (`wasi` a list, `budget_ms`,
   `memory_mib`, `pool`, `instances`), each left out taking its default, and the keyvalue map:
   with `keyvalue` granted, each identifier to `store/namespace` in full (an app has no one
-  host to default the namespace to), the stores those of `keyvalue_stores`
+  host to default the namespace to), the stores those of `keyvalue_stores`; and its `env`,
+  `name -> value` as a config file route's (strings). The listings name the variables only
+  (`"env": ["GREETING"]`, left out without one), never a value
+- `tag` (optional; 1 to 128 printable ASCII chars but the space) is opaque to the wicket:
+  kept and listed as given, so a controller tells what it put, an env it cannot read back
+  included (`sluice-wicket-cf-api` tags each start's snapshot with a random tag). A tag alone
+  changes no route
 - a PUT is one reload, as a deploy: every host of the app or none, kept only when the routes
   load; the same app again changes nothing, and an app keeps its `deployed` time while its
   component and sandbox stay. An app listed by `GET /api/apps` is a body its PUT takes (less
-  `name` and `deployed`)
+  `name` and `deployed`, and the env's values); a PUT is 1MiB at most
 - an app's routes share a handler, and never with another app (its target names it,
   `…/counter.wasm?app=counter&…`): its pool, its `instances` cap and its guests' output stay
   its own
@@ -626,7 +645,11 @@ table dirty and is retired, so a guest opens its buckets per request (cheap: a t
   passes `wasm:` targets through verbatim as the dial address — oci / s3
   resolvers slot into the same form), so routes sharing a component with
   different options stay distinct, and routes (hosts) with the same component
-  and options share one handler: one pool, one `instances` cap
+  and options share one handler: one pool, one `instances` cap. A route's env
+  is in its target as `env=<digest>`: HMAC-SHA256 under a key the process
+  draws at startup, so the server never sees a value, nor a digest to test a
+  guess against (another process, another digest: a restart re-advertises
+  such a route under another target)
 
 ### Instance pool
 
@@ -717,7 +740,9 @@ Kubernetes, `terminationGracePeriodSeconds` (30s by default) bounds it the same 
   in place with the same size within the file system's time granularity is missed
   until SIGHUP
 - the console has no TLS of its own, its page sets no keyvalue map but the default one (an
-  app names its own), and it keeps its directory to one wicket (nothing locks it)
+  app names its own) and no env, and it keeps its directory to one wicket (nothing locks it)
+- an env is in the clear in the config file (unless read from the environment, `${NAME}`)
+  and in `routes.yaml`: their file permissions keep it
 
 ## Build note
 

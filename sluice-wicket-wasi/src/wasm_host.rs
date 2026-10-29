@@ -12,11 +12,12 @@
 //!
 //! The WASI surface follows `wasmtime serve` for p3: a route links http +
 //! the p3 cli/clocks/random interfaces, `cli` links the full wasi p3 set,
-//! `keyvalue` wasi:keyvalue (`keyvalue`), and the network capabilities
-//! configure the per-request `WasiCtx`. wasi p2 is
-//! unsupported: a p2-importing component is rejected at load. Guest stdout /
-//! stderr always reach the process log, line-prefixed; with a flume they and
-//! a line per answered request reach the live access log too (`flume`).
+//! `keyvalue` wasi:keyvalue (`keyvalue`), and the network capabilities and
+//! the route's environment (`env`) configure the per-request `WasiCtx`.
+//! wasi p2 is unsupported: a p2-importing component is rejected at load.
+//! Guest stdout / stderr always reach the process log, line-prefixed; with a
+//! flume they and a line per answered request reach the live access log too
+//! (`flume`).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -33,6 +34,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use wasmtime::AsContextMut as _;
 
+use crate::env::Env;
 use crate::flume::Tap;
 use crate::keyvalue;
 use crate::tunnel::TunnelIo;
@@ -494,7 +496,7 @@ impl Caps {
 }
 
 /// Everything a route configures for its instances: resource limits, WASI
-/// capabilities, the keyvalue map and instance pooling.
+/// capabilities, the keyvalue map, the environment and instance pooling.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Sandbox {
     pub limits: Limits,
@@ -509,6 +511,9 @@ pub struct Sandbox {
     /// The keyvalue identifiers the guest may open, with `caps.keyvalue`;
     /// filled in by the route's source (the map named, or the default one).
     pub keyvalue: keyvalue::BucketMap,
+    /// The guest's environment variables (`wasi:cli/environment`): the
+    /// config file's and the apps'; the target holds their digest only.
+    pub env: Env,
 }
 
 impl Sandbox {
@@ -571,12 +576,16 @@ impl Sandbox {
 
     /// The canonical query of the non-default settings; empty for defaults.
     /// Part of the advertised target, so every distinct sandbox of one
-    /// component is its own dial address.
+    /// component is its own dial address. The environment is its digest
+    /// ([`Env::digest`]): the target never holds a value.
     pub fn query(&self) -> String {
         let defaults = Limits::default();
         let mut pairs = Vec::new();
         if self.limits.budget != defaults.budget {
             pairs.push(format!("budget-ms={}", self.limits.budget.as_millis()));
+        }
+        if !self.env.is_empty() {
+            pairs.push(format!("env={}", self.env.digest()));
         }
         if let Some(cap) = self.instances {
             pairs.push(format!("instances={cap}"));
@@ -812,6 +821,9 @@ impl Ctx {
         let log = |output| GuestLog::new(output, label, store, tap.clone(), serving.clone());
         wasi.stdout(log(Output::Stdout));
         wasi.stderr(log(Output::Stderr));
+        for (name, value) in sandbox.env.iter() {
+            wasi.env(name, value);
+        }
         sandbox.caps.configure(&mut wasi);
         Self {
             table: wasmtime::component::ResourceTable::default(),

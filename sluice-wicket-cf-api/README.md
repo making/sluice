@@ -78,6 +78,7 @@ sidecar, `kubectl port-forward`).
 | web process `instances` | `pool`: warm instances. A request beyond them gets an instance of its own, as on every route: 0 still serves |
 | web process `memory` | `memory-mib` |
 | annotations `wicket.sluice.ik.am/budget-ms`, `wicket.sluice.ik.am/instances` | `budget-ms`, `instances` (the route's cap; below `pool` the wicket refuses) |
+| environment variables (`cf set-env`, a manifest's `env:`), `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: what the guest's `wasi:cli/environment` answers |
 | disk, health check, log rate, stack, buildpacks | accepted and shown, no effect |
 | instance state | `RUNNING` once the wicket took the app; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable |
 | rolling deployment | the app put with the new droplet: the wicket swaps it in place; finalized at once |
@@ -91,8 +92,17 @@ sidecar, `kubectl port-forward`).
 ## Behavior
 
 - as on CF, routes and `instances` apply at once; the droplet and the rest of the sandbox
-  (memory, annotations, the service bindings) at a start, restart, restage or deployment: the
-  running app is the snapshot taken then. For `scale -m` the CLI stops and starts the app itself
+  (memory, annotations, the service bindings, the environment variables) at a start, restart,
+  restage or deployment: the running app is the snapshot taken then. For `scale -m` the CLI
+  stops and starts the app itself
+- environment variables: `cf set-env` / `unset-env`, a manifest's `env:` (merged, as `cf push`
+  does) and `cf env` work as on CF. Refused: the names CF reserves (`VCAP_*`, `VMC*`, `PORT`),
+  what the wicket refuses (`=` or a control character in a name, a NUL in a value) and more
+  than 64KiB in all. The guest gets them with `VCAP_APPLICATION` and `VCAP_SERVICES` (JSON, as
+  `cf env` shows them). No log holds a value (`cf logs` says `[PRIVATE DATA HIDDEN]`), nor does
+  the wicket's listing, which names the variables only: the app carries a tag drawn at each
+  start, which the cf-api compares instead. The data directory's files are its owner's only
+  (0600): `state.json` holds the values
 - an edit the wicket answers at once (map-route, unmap-route, scale -i, a manifest's routes)
   is refused with 422 and the wicket's reason, and changes nothing; a start, restart or
   deployment is accepted, and its outcome shows in the process stats and the log (`cf logs`)
@@ -146,9 +156,9 @@ config.
 ## Limits
 
 Refused with why (422): route paths, ports and wildcards, private and internal domains, docker
-images, tasks, ssh, sidecars, process types but `web`, route services, environment variables
-(`cf set-env`, a manifest's `env:`), user-provided services, service keys. One owner (`cf`) per
-wicket: two cf-apis must not share one.
+images, tasks, ssh, sidecars, process types but `web`, route services, environment variable
+groups, user-provided services, service keys. One owner (`cf`) per wicket: two cf-apis must not
+share one.
 
 The integration test (`tests/cli.rs`) runs the OSS CLI -- `SLUICE_CF_CLI`, else `cf8` on the
 PATH -- against the cf-api and a wicket in local mode on a flume, building the wicket and its

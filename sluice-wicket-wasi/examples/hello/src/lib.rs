@@ -7,6 +7,7 @@ wit_bindgen::generate!({
         package sluice:hello;
 
         world hello {
+            import wasi:cli/environment@0.3.0;
             import wasi:clocks/monotonic-clock@0.3.0;
             import wasi:http/types@0.3.0;
             export wasi:http/handler@0.3.0;
@@ -136,24 +137,42 @@ impl Guest for Component {
             return Ok(response);
         }
 
-        let payload =
-            format!("hello from wasm\nmethod={method:?}\npath={path}\nbody_bytes={body_len}\n");
-        // Fresh headers: the request's would carry a mismatched content-length.
-        let response_headers = wasi::http::types::Headers::new();
-        let _ = response_headers.append("content-type", b"text/plain");
-        let (mut body_tx, body_rx) = wit_stream::new();
-        let (trailers_tx, trailers_rx) = wit_future::new(|| todo!());
-        let (response, _transmit) = Response::new(response_headers, Some(body_rx), trailers_rx);
-        wit_bindgen::spawn_local(async move {
-            let _ = body_tx.write_all(payload.into_bytes()).await;
-            drop(body_tx);
-            let _ = trailers_tx.write(Ok(None)).await;
-        });
-        Ok(response)
+        if let Some(name) = path.strip_prefix("/env/") {
+            // Environment demo: the value of the route's variable `name`.
+            let value = wasi::cli::environment::get_environment()
+                .into_iter()
+                .find_map(|(key, value)| (key == name).then_some(value));
+            return Ok(match value {
+                Some(value) => text(200, value),
+                None => text(404, format!("no variable {name}\n")),
+            });
+        }
+
+        Ok(text(
+            200,
+            format!("hello from wasm\nmethod={method:?}\npath={path}\nbody_bytes={body_len}\n"),
+        ))
     }
 }
 
 export!(Component);
+
+/// A `text/plain` response of `payload` with `status`.
+fn text(status: u16, payload: String) -> Response {
+    // Fresh headers: the request's would carry a mismatched content-length.
+    let response_headers = wasi::http::types::Headers::new();
+    let _ = response_headers.append("content-type", b"text/plain");
+    let (mut body_tx, body_rx) = wit_stream::new();
+    let (trailers_tx, trailers_rx) = wit_future::new(|| todo!());
+    let (response, _transmit) = Response::new(response_headers, Some(body_rx), trailers_rx);
+    let _ = response.set_status_code(status);
+    wit_bindgen::spawn_local(async move {
+        let _ = body_tx.write_all(payload.into_bytes()).await;
+        drop(body_tx);
+        let _ = trailers_tx.write(Ok(None)).await;
+    });
+    response
+}
 
 /// Burns CPU forever; the host's epoch budget is what ends it (504).
 fn spin() -> ! {

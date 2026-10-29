@@ -6,10 +6,11 @@
 //!
 //! Routes and `instances` apply at once: an edit the wicket refuses is
 //! answered 422 with its reason and changes nothing. The droplet and the
-//! rest of the sandbox, the service bindings' grants included, apply at a
-//! start, restart or deployment: the running app is the snapshot taken
-//! then, and the outcome shows in the process stats and the log. The
-//! services are in [`crate::services`].
+//! rest of the sandbox, the service bindings' grants and the environment
+//! variables included, apply at a start, restart or deployment: the running
+//! app is the snapshot taken then, and the outcome shows in the process
+//! stats and the log. The services are in [`crate::services`], the
+//! environment variables in [`crate::env`].
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 use crate::controller::Controller;
+use crate::env;
 use crate::logs::{self, Logs};
 use crate::manifest;
 use crate::services;
@@ -517,12 +519,11 @@ impl Api {
                 Ok(json(StatusCode::OK, &store.read(|state| views::env(base, state, &app))))
             }
             (&Method::GET, ["apps", guid, "environment_variables"]) => {
-                self.app(guid)?;
-                Ok(json(StatusCode::OK, &json!({"var": {}, "links": {"self": {"href": format!("{base}/v3/apps/{guid}/environment_variables")}}})))
+                let app = self.app(guid)?;
+                Ok(json(StatusCode::OK, &views::environment_variables(base, &app)))
             }
             (&Method::PATCH, ["apps", guid, "environment_variables"]) => {
-                self.app(guid)?;
-                Err(ApiError::unprocessable("environment variables are not supported yet"))
+                self.set_env(req, guid).await
             }
             (&Method::GET, ["apps", guid, "manifest"]) => {
                 let app = self.app(guid)?;
@@ -681,6 +682,9 @@ impl Api {
             (&Method::GET, ["environment_variable_groups", _]) => {
                 Ok(json(StatusCode::OK, &json!({"var": {}, "links": {}})))
             }
+            (&Method::PATCH, ["environment_variable_groups", _]) => Err(ApiError::unprocessable(
+                "environment variable groups are not supported: set an app's own (cf set-env)",
+            )),
             _ => Err(ApiError::unknown(&req.method, &req.path)),
         }
     }
@@ -899,14 +903,15 @@ impl Api {
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .ok_or_else(|| ApiError::unprocessable("Name must be a string"))?;
-        if body["environment_variables"]
-            .as_object()
-            .is_some_and(|vars| !vars.is_empty())
-        {
-            return Err(ApiError::unprocessable(
-                "environment variables are not supported yet",
-            ));
-        }
+        let env = match &body["environment_variables"] {
+            Value::Null => Default::default(),
+            Value::Object(var) => env::merged(&Default::default(), var)?,
+            _ => {
+                return Err(ApiError::unprocessable(
+                    "Environment variables must be an object",
+                ));
+            }
+        };
         if body["lifecycle"]["type"]
             .as_str()
             .is_some_and(|kind| kind == "docker")
@@ -927,6 +932,7 @@ impl Api {
             }
             let guid = state.create_app(name).guid.clone();
             let app = state.app_mut(&guid).expect("just created");
+            app.env = env;
             apply_metadata(app, &body["metadata"])?;
             if let Some(buildpacks) = body["lifecycle"]["data"]["buildpacks"].as_array() {
                 app.buildpacks = buildpacks
@@ -986,6 +992,37 @@ impl Api {
             Ok(views::app(&req.base, state, &app))
         })?;
         Ok(json(StatusCode::OK, &view))
+    }
+
+    /// Merges the body's `var` into the app's environment variables (a null
+    /// removes one); the guest gets them at its next start, as on CF. The
+    /// log names no value.
+    async fn set_env(&self, req: &Req, guid: &str) -> Reply {
+        let body: Value = req.json()?;
+        let var = body["var"]
+            .as_object()
+            .ok_or_else(|| ApiError::unprocessable("Var must be an object"))?;
+        self.app(guid)?;
+        let _edit = self.controller.edits.lock().await;
+        let app = self.store.update(|state| {
+            let app = state
+                .app_mut(guid)
+                .ok_or_else(|| ApiError::not_found("App"))?;
+            app.env = env::merged(&app.env, var)?;
+            app.updated_at = now();
+            Ok::<_, ApiError>(app.clone())
+        })?;
+        self.logs.add(
+            guid,
+            "API",
+            format!(
+                "Updated app with guid {guid} ({{\"environment_variables\"=>\"[PRIVATE DATA HIDDEN]\"}})"
+            ),
+        );
+        Ok(json(
+            StatusCode::OK,
+            &views::environment_variables(&req.base, &app),
+        ))
     }
 
     async fn delete_app(&self, req: &Req, guid: &str) -> Reply {
@@ -1135,8 +1172,9 @@ impl Api {
     }
 
     /// A start (and a restart) takes the snapshot the wicket gets: the
-    /// current droplet, the memory and the annotations; a stop removes the
-    /// app from the wicket. The outcome is in the stats and the log.
+    /// current droplet, the memory, the annotations, the bindings' grants
+    /// and the environment; a stop removes the app from the wicket. The
+    /// outcome is in the stats and the log.
     async fn lifecycle(&self, req: &Req, guid: &str, action: &str) -> Reply {
         self.app(guid)?;
         let _edit = self.controller.edits.lock().await;
@@ -1144,7 +1182,7 @@ impl Api {
             let running = if action == "stop" {
                 None
             } else {
-                Some(snapshot(state, guid)?)
+                Some(snapshot(state, guid, &req.base)?)
             };
             let app = state
                 .app_mut(guid)
@@ -1518,7 +1556,7 @@ impl Api {
                 }
                 blobs = state.set_current_droplet(&app, droplet);
             }
-            let running = snapshot(state, &app)?;
+            let running = snapshot(state, &app, &req.base)?;
             let droplet = running.droplet.clone();
             let kept = state.app_mut(&app).expect("found above");
             kept.running = Some(running);
@@ -1558,8 +1596,10 @@ impl Api {
 }
 
 /// The snapshot a start takes: the current droplet, the memory, the
-/// annotations and what the service bindings grant.
-fn snapshot(state: &State, guid: &str) -> Result<Running, ApiError> {
+/// annotations, what the service bindings grant, and the guest's
+/// environment (`VCAP_APPLICATION` naming the API at `base`) with a tag of
+/// its own.
+fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> {
     let app = state.app(guid).ok_or_else(|| ApiError::not_found("App"))?;
     let current = app
         .current_droplet
@@ -1589,6 +1629,8 @@ fn snapshot(state: &State, guid: &str) -> Result<Running, ApiError> {
         instances: annotation(INSTANCES_ANNOTATION),
         wasi,
         keyvalue,
+        env: env::guest(base, state, app),
+        tag: Some(env::tag()),
         since: epoch_secs(),
     })
 }

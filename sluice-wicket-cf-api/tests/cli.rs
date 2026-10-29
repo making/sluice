@@ -1,9 +1,10 @@
 //! The OSS cf CLI (`SLUICE_CF_CLI`, else `cf8` on the PATH; the Tanzu
 //! distribution refuses any other platform) against the cf-api and a wicket
 //! in local mode, both on a flume: login, push, the app's logs, map-route,
-//! scale, a rolling push with requests all along, stop and start, a restart
-//! of the cf-api, a component the wicket refuses until a service binding
-//! grants what it needs, the services' lifecycle, delete.
+//! scale, a rolling push with requests all along, stop and start, the
+//! user's environment variables and VCAP_*, a restart of the cf-api, a
+//! component the wicket refuses until a service binding grants what it
+//! needs, the services' lifecycle, delete.
 
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::net::TcpStream;
@@ -453,6 +454,48 @@ fn the_cf_cli_deploys_to_the_wicket() {
     assert!(listing(&console)["apps"].as_array().unwrap().is_empty());
     cf.ok(&["start", "hello"]);
     assert_eq!(get(&listen, "hello.localhost", "/", None).0, 200);
+
+    // the user's variables, VCAP_APPLICATION and VCAP_SERVICES: the guest
+    // gets them from the next start on; no log and no listing of the
+    // wicket holds a value
+    let variable = |name: &str| get(&listen, "hello.localhost", &format!("/env/{name}"), None);
+    cf.ok(&["set-env", "hello", "GREETING", "s3cr3t-greeting"]);
+    assert_eq!(variable("GREETING").0, 404, "until the next start");
+    cf.ok(&["restart", "hello"]);
+    assert_eq!(variable("GREETING"), (200, "s3cr3t-greeting".into()));
+    let (status, vcap) = variable("VCAP_APPLICATION");
+    assert_eq!(status, 200, "{vcap}");
+    let vcap: Value = serde_json::from_str(&vcap).unwrap();
+    assert_eq!(vcap["application_name"], "hello");
+    assert_eq!(variable("VCAP_SERVICES"), (200, "{}".into()));
+    let env = cf.ok(&["env", "hello"]);
+    assert!(env.contains("GREETING: s3cr3t-greeting"), "{env}");
+    let (_, apps) = get(&console, &console, "/api/apps", Some(TOKEN));
+    assert!(
+        apps.contains("\"GREETING\"") && !apps.contains("s3cr3t"),
+        "{apps}"
+    );
+    let recent = cf.ok(&["logs", "hello", "--recent"]);
+    assert!(
+        recent.contains("[PRIVATE DATA HIDDEN]") && !recent.contains("s3cr3t"),
+        "{recent}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let state = std::fs::metadata(dir.join("cf/state.json")).unwrap();
+        assert_eq!(
+            state.permissions().mode() & 0o777,
+            0o600,
+            "it holds the env"
+        );
+    }
+    cf.ok(&["unset-env", "hello", "GREETING"]);
+    let env = cf.ok(&["env", "hello"]);
+    assert!(
+        env.contains("No user-provided env variables have been set"),
+        "{env}"
+    );
 
     // the cf-api restarted: its state kept (the token too), the wicket's
     // generation unchanged

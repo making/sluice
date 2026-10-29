@@ -12,6 +12,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::deployed::Deployed;
+use crate::env::Env;
 use crate::keyvalue::{self, StoreConfig, StoreLimits, Stores};
 use crate::routes::{Origin, Spec};
 use crate::wasm_host::{Caps, Instances, Limits, Locator, Sandbox};
@@ -608,7 +609,11 @@ impl File {
     fn read(path: &Path) -> Result<File, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("--config {}: {e}", path.display()))?;
-        let options = serde_saphyr::Options::default().with_properties(std::env::vars().collect());
+        let mut options =
+            serde_saphyr::Options::default().with_properties(std::env::vars().collect());
+        // an error names the line, never the file's text around it: the
+        // routes' env and the tokens are no log's business
+        options.with_snippet = false;
         serde_saphyr::from_str_with_options(&text, options).map_err(|e| {
             let e = e.to_string();
             let e = e.strip_prefix("error: ").unwrap_or(&e);
@@ -696,6 +701,8 @@ pub(crate) struct SandboxFile {
     /// Keyvalue identifier -> `store[/namespace]` (`wasi: [keyvalue]`); the
     /// namespace defaults to the host, the map to `"": <default store>`.
     keyvalue: Option<BTreeMap<String, String>>,
+    /// The guest's environment variables: name -> value.
+    env: Option<BTreeMap<String, String>>,
 }
 
 impl SandboxFile {
@@ -709,6 +716,7 @@ impl SandboxFile {
             pool,
             instances,
             keyvalue,
+            env,
         } = self;
         let mut sandbox = Sandbox::default();
         if let Some(wasi) = wasi {
@@ -732,6 +740,9 @@ impl SandboxFile {
             Some(0) => return Err("sandbox.instances: must be at least 1".into()),
             cap => cap,
         };
+        if let Some(env) = env {
+            sandbox.env = Env::new(env).map_err(|e| format!("sandbox.env: {e}"))?;
+        }
         sandbox.check().map_err(|e| format!("sandbox: {e}"))?;
         Ok((sandbox, keyvalue))
     }
@@ -764,7 +775,7 @@ impl SandboxFile {
 /// `sandbox` in the shape [`SandboxFile`] reads, as a YAML flow mapping of
 /// its settings besides the defaults (None when all defaults); its keyvalue
 /// map with `map` (an app's, every place named in full), else none, the
-/// default one applying.
+/// default one applying; its env as it is (the file holding it is private).
 pub(crate) fn sandbox_yaml(sandbox: &Sandbox, map: bool) -> Option<String> {
     let defaults = Limits::default();
     let mut pairs = Vec::new();
@@ -794,6 +805,14 @@ pub(crate) fn sandbox_yaml(sandbox: &Sandbox, map: bool) -> Option<String> {
             })
             .collect();
         pairs.push(format!("keyvalue: {{{}}}", places.join(", ")));
+    }
+    if !sandbox.env.is_empty() {
+        let vars: Vec<String> = sandbox
+            .env
+            .iter()
+            .map(|(name, value)| format!("{}: {}", quote(name), quote(value)))
+            .collect();
+        pairs.push(format!("env: {{{}}}", vars.join(", ")));
     }
     (!pairs.is_empty()).then(|| format!("{{{}}}", pairs.join(", ")))
 }
@@ -1155,8 +1174,8 @@ mod tests {
     /// environment; relative paths are the config file's; the flags' routes
     /// follow the file's. A keyvalue route's map names the section's stores,
     /// its namespace by default the host; a flag's has the default map. A
-    /// reload reads the routes again and names the other settings changed
-    /// since.
+    /// route's env takes scalars as text, its target their digest. A reload
+    /// reads the routes again and names the other settings changed since.
     #[test]
     fn the_config_file_sets_every_setting_under_the_environment_and_the_flags() {
         let dir = Scratch::new("settings");
@@ -1215,6 +1234,10 @@ routes:
       keyvalue:
         \"\": local
         sessions: shared/demo sessions
+      env:
+        GREETING: hello
+        PORT: 8080
+        TOKEN: ${{SLUICE_WICKET_TEST_UNSET:-s3cr3t}}
 "
             )
         };
@@ -1261,9 +1284,24 @@ routes:
             routes[1].component,
             Locator::parse("https://example.invalid/b.wasm").unwrap()
         );
+        let vars = &routes[1].sandbox.env;
+        let text = |pairs: [(&str, &str); 3]| {
+            pairs.map(|(name, value)| (name.to_string(), value.to_string()))
+        };
+        assert_eq!(
+            vars.map(),
+            &BTreeMap::from(text([
+                ("GREETING", "hello"),
+                ("PORT", "8080"),
+                ("TOKEN", "s3cr3t")
+            ]))
+        );
         assert_eq!(
             route_target("b", &routes[1].sandbox),
-            "b?keyvalue=:local/b.local,sessions:shared/demo%20sessions&wasi=keyvalue"
+            format!(
+                "b?env={}&keyvalue=:local/b.local,sessions:shared/demo%20sessions&wasi=keyvalue",
+                vars.digest()
+            )
         );
         let stores = file.routes.stores();
         assert_eq!(stores.default_store(), "local");
@@ -1437,7 +1475,8 @@ routes:
         );
     }
 
-    /// An unknown key or a value that does not parse fails, naming it.
+    /// An unknown key or a value that does not parse fails, naming it -- and
+    /// a line, never the file's text: a route's env is no log's business.
     #[test]
     fn a_bad_config_names_what_failed() {
         let dir = Scratch::new("bad");
@@ -1560,6 +1599,13 @@ routes:
                 "sandbox.keyvalue: maps no identifier",
             ),
             (
+                route("env: {'A=B': s3cr3t}"),
+                "routes[0]: sandbox.env: \"A=B\" is no variable name",
+            ),
+            (route("env: {K: [s3cr3t]}"), "expected string scalar at line 3"),
+            (route("env: s3cr3t"), "expected mapping start at line 3"),
+            (route("env: {K: s3cr3t}, fuel: 1"), "unknown field `fuel`"),
+            (
                 "server: s\nroutes:\n  - {host: a, component: a.wasm}\n  - {host: a, component: b.wasm}\n"
                     .into(),
                 "route host 'a' is configured twice: by the config file",
@@ -1570,7 +1616,7 @@ routes:
             let failed = settings(&["--config", path.to_str().unwrap()])
                 .and_then(|settings| settings.routes.read().map(|_| ()));
             assert!(
-                matches!(&failed, Err(e) if e.contains(error)),
+                matches!(&failed, Err(e) if e.contains(error) && !e.contains("s3cr3t")),
                 "{yaml}: {:?}",
                 failed.err()
             );

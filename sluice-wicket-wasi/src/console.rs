@@ -22,9 +22,12 @@
 //!
 //! The options are the `--wasm` route's (`budget-ms`, `instances`,
 //! `memory-mib`, `pool`, `wasi`), the whole sandbox: an option left out takes
-//! its default. An app's sandbox is the same in JSON, with its keyvalue map;
-//! the apps' listing names what a sandbox may hold (the capabilities and the
-//! keyvalue stores), as the routes' does.
+//! its default. An app's sandbox is the same in JSON, with its keyvalue map
+//! and its env (the guest's environment variables, which may hold secrets:
+//! the listings name them, never their values; an app's `tag`, opaque to the
+//! console, tells its owner what it put); the apps' listing names what a
+//! sandbox may hold (the capabilities and the keyvalue stores), as the
+//! routes' does.
 //!
 //! With `--console-token` every request needs the token, as the password of
 //! HTTP Basic (any user name: the browser asks for it) or as a Bearer token.
@@ -50,6 +53,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::deployed::{self, AppSpec, rfc3339};
+use crate::env::Env;
 use crate::keyvalue::{Place, Stores};
 use crate::routes::{Edit, Origin, Outcome, Refused, Request, Routes, Status};
 use crate::wasm_host::{Caps, Limits, Sandbox};
@@ -57,8 +61,9 @@ use crate::wasm_host::{Caps, Limits, Sandbox};
 /// Largest component an upload may carry.
 pub const MAX_COMPONENT_BYTES: usize = 128 << 20;
 
-/// Largest app (its JSON) a PUT may carry.
-const MAX_APP_BYTES: usize = 64 << 10;
+/// Largest app (its JSON) a PUT may carry: an env of the most an env holds
+/// fits, escaped.
+const MAX_APP_BYTES: usize = 1 << 20;
 
 /// How long `GET /api/routes?after=<the current revision>` waits for a change.
 const LONG_POLL: Duration = Duration::from_secs(25);
@@ -301,6 +306,7 @@ impl Console {
                         name,
                         owner,
                         deployed,
+                        ..
                     }) => (
                         "api",
                         Some(deployed.clone()),
@@ -350,7 +356,8 @@ impl Console {
         }
     }
 
-    /// The apps the table serves, in the order put, each as its PUT has it.
+    /// The apps the table serves, in the order put, each as its PUT has it
+    /// -- but the env, named only.
     fn apps(&self, status: &Status) -> AppsView {
         let table = self.routes.current();
         let mut apps: Vec<AppView> = Vec::new();
@@ -358,6 +365,7 @@ impl Console {
             let Some(Origin::Api {
                 name,
                 owner,
+                tag,
                 deployed,
             }) = table.origins.get(&up.host)
             else {
@@ -378,7 +386,11 @@ impl Console {
                     sha256: handler.loaded().digest().to_string(),
                     name: handler.loaded().label().to_string(),
                 },
-                sandbox: SandboxBody::of(handler.sandbox()),
+                sandbox: AppSandboxView {
+                    body: SandboxBody::of(handler.sandbox()),
+                    env: handler.sandbox().env.names(),
+                },
+                tag: tag.clone(),
                 deployed: deployed.clone(),
             });
         }
@@ -512,12 +524,16 @@ impl Console {
         deployed::check_name("owner", &body.owner)?;
         let sha256 = deployed::check_digest(&body.component.sha256)
             .map_err(|e| format!("component.sha256: {e}"))?;
+        if let Some(tag) = &body.tag {
+            deployed::check_tag(tag)?;
+        }
         Ok(AppSpec {
             owner: body.owner,
             hosts: deployed::check_hosts(&body.hosts)?,
             sha256,
             file: body.component.name,
             sandbox: body.sandbox.sandbox(&self.stores)?,
+            tag: body.tag,
         })
     }
 
@@ -909,6 +925,8 @@ struct SandboxView {
     pool: usize,
     instances: Option<usize>,
     keyvalue: Vec<BucketView>,
+    /// The names of the guest's environment variables, never their values.
+    env: Vec<String>,
 }
 
 impl SandboxView {
@@ -928,6 +946,7 @@ impl SandboxView {
                     namespace: place.namespace.clone(),
                 })
                 .collect(),
+            env: sandbox.env.names(),
         }
     }
 }
@@ -949,16 +968,28 @@ struct AppsView {
     apps: Vec<AppView>,
 }
 
-/// An app as listed: what its PUT takes, its name, and since when it serves
-/// this component and sandbox.
+/// An app as listed: what its PUT takes -- but the env, named only -- its
+/// name, and since when it serves this component and sandbox.
 #[derive(Serialize)]
 struct AppView {
     name: String,
     owner: String,
     hosts: Vec<String>,
     component: ComponentRef,
-    sandbox: SandboxBody,
+    sandbox: AppSandboxView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag: Option<String>,
     deployed: String,
+}
+
+/// An app's sandbox as listed: the env's names in place of the env, left
+/// out without one (the listing of an app without an env is its PUT).
+#[derive(Serialize)]
+struct AppSandboxView {
+    #[serde(flatten)]
+    body: SandboxBody,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    env: Vec<String>,
 }
 
 /// The body of an app's PUT.
@@ -970,6 +1001,9 @@ struct AppBody {
     component: ComponentRef,
     #[serde(default)]
     sandbox: SandboxBody,
+    /// Opaque to the console, kept and listed as given
+    /// ([`deployed::check_tag`]).
+    tag: Option<String>,
 }
 
 /// A component uploaded by digest, and the file name it is kept as.
@@ -980,9 +1014,10 @@ struct ComponentRef {
     name: String,
 }
 
-/// An app's sandbox: the `--wasm` route options, and its keyvalue map
-/// (`identifier -> store/namespace`). A key left out takes its default; a
-/// listing names every one.
+/// An app's sandbox: the `--wasm` route options, its keyvalue map
+/// (`identifier -> store/namespace`) and its env (`name -> value`). A key
+/// left out takes its default; a listing names every one but the env
+/// ([`AppSandboxView`]).
 #[derive(Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 struct SandboxBody {
@@ -995,9 +1030,12 @@ struct SandboxBody {
     instances: Option<usize>,
     #[serde(default)]
     keyvalue: BTreeMap<String, String>,
+    #[serde(default, skip_serializing)]
+    env: BTreeMap<String, String>,
 }
 
 impl SandboxBody {
+    /// Without the env: its values are never listed.
     fn of(sandbox: &Sandbox) -> SandboxBody {
         SandboxBody {
             wasi: sandbox.caps.names().into_iter().map(String::from).collect(),
@@ -1006,6 +1044,7 @@ impl SandboxBody {
             pool: sandbox.pool,
             instances: sandbox.instances,
             keyvalue: deployed::map_specs(&sandbox.keyvalue),
+            env: BTreeMap::new(),
         }
     }
 
@@ -1036,6 +1075,7 @@ impl SandboxBody {
             cap => cap,
         };
         sandbox.check().map_err(|e| format!("sandbox: {e}"))?;
+        sandbox.env = Env::new(self.env).map_err(|e| format!("sandbox.env: {e}"))?;
         sandbox.keyvalue = deployed::app_map(sandbox.caps, self.keyvalue)?;
         for place in sandbox.keyvalue.values() {
             stores

@@ -23,6 +23,8 @@ tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = "0.3"
 # random default client id, same policy as the Java client
 uuid = { version = "1", features = ["v4"] }
+# the key of the env digests (the version uuid takes)
+getrandom = "0.4"
 # wasi 0.3 (p3) host support only; p2 guests are unsupported
 wasmtime = "50"
 wasmtime-wasi = { version = "50", default-features = false, features = ["p3"] }
