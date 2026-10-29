@@ -1,0 +1,1430 @@
+/*
+ * sluice wicket console: a sibling sheet of the sluice server console, drawn the same way.
+ * Dark scheme: a blueprint (white linework on Prussian blue). Light scheme: a whiteprint
+ * (Prussian-blue ink on cool paper). Water is the only saturated colour and appears only
+ * where something flows -- a component on its way in; amber marks transitions, red marks
+ * faults. Overpass descends from Highway Gothic, the lettering of public works; the mono
+ * cut is kept for literal values.
+ */
+
+@font-face {
+	font-family: "Overpass";
+	src: url("/fonts/overpass.woff2") format("woff2");
+	font-weight: 100 900;
+	font-display: swap;
+}
+
+@font-face {
+	font-family: "Overpass Mono";
+	src: url("/fonts/overpass-mono.woff2") format("woff2");
+	font-weight: 300 700;
+	font-display: swap;
+}
+
+:root {
+	/* whiteprint */
+	--paper: #f3f6f9;
+	--paper-raised: #e9eff5;
+	--ink: #143b69;
+	--ink-soft: #4b6789;
+	--hair: rgb(20 59 105 / 0.32);
+	--hair-faint: rgb(20 59 105 / 0.14);
+	--grid: rgb(20 59 105 / 0.045);
+	--grid-major: rgb(20 59 105 / 0.085);
+	--water: #1b86c2;
+	--water-bed: rgb(27 134 194 / 0.16);
+	--amber: #a86b00;
+	--fault: #c0392b;
+	--on-ink: #f3f6f9;
+
+	--sans: "Overpass", "Helvetica Neue", Arial, sans-serif;
+	--mono: "Overpass Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+	/* modular scale, ratio 1.25 from 15px */
+	--step--1: 0.8125rem;
+	--step-0: 0.9375rem;
+	--step-1: 1.17rem;
+	--step-2: 1.46rem;
+	--step-3: 1.83rem;
+	--step-4: 2.29rem;
+
+	--gutter: clamp(16px, 3.2vw, 44px);
+	color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root:not([data-theme="light"]) {
+		/* blueprint */
+		--paper: #0f2d52;
+		--paper-raised: #0c2646;
+		--ink: #e4edf7;
+		--ink-soft: #a9bdd4;
+		--hair: rgb(228 237 247 / 0.34);
+		--hair-faint: rgb(228 237 247 / 0.14);
+		--grid: rgb(228 237 247 / 0.045);
+		--grid-major: rgb(228 237 247 / 0.09);
+		--water: #6fd0f5;
+		--water-bed: rgb(111 208 245 / 0.2);
+		--amber: #f2b33d;
+		--fault: #ff8a7a;
+		--on-ink: #0f2d52;
+		color-scheme: dark;
+	}
+}
+
+:root[data-theme="dark"] {
+	--paper: #0f2d52;
+	--paper-raised: #0c2646;
+	--ink: #e4edf7;
+	--ink-soft: #a9bdd4;
+	--hair: rgb(228 237 247 / 0.34);
+	--hair-faint: rgb(228 237 247 / 0.14);
+	--grid: rgb(228 237 247 / 0.045);
+	--grid-major: rgb(228 237 247 / 0.09);
+	--water: #6fd0f5;
+	--water-bed: rgb(111 208 245 / 0.2);
+	--amber: #f2b33d;
+	--fault: #ff8a7a;
+	--on-ink: #0f2d52;
+	color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html {
+	-webkit-text-size-adjust: 100%;
+}
+
+body {
+	margin: 0;
+	color: var(--ink);
+	font-family: var(--sans);
+	font-size: var(--step-0);
+	line-height: 1.5;
+	background-color: var(--paper);
+	/* drawing paper: 24px minor grid, 120px major grid */
+	background-image:
+		linear-gradient(var(--grid-major) 1px, transparent 1px),
+		linear-gradient(90deg, var(--grid-major) 1px, transparent 1px),
+		linear-gradient(var(--grid) 1px, transparent 1px),
+		linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+	background-size: 120px 120px, 120px 120px, 24px 24px, 24px 24px;
+	background-position: -1px -1px;
+}
+
+:focus-visible {
+	outline: 2px solid var(--water);
+	outline-offset: 2px;
+}
+
+a {
+	color: inherit;
+	text-decoration-color: var(--hair);
+	text-underline-offset: 0.2em;
+}
+
+a:hover {
+	text-decoration-color: currentColor;
+}
+
+code {
+	font-family: var(--mono);
+	font-size: 0.9em;
+}
+
+.mono {
+	font-family: var(--mono);
+	font-size: 0.92em;
+	letter-spacing: -0.01em;
+	overflow-wrap: anywhere;
+}
+
+.num {
+	font-variant-numeric: tabular-nums;
+}
+
+.hint {
+	margin: 0 0 0.9rem;
+	color: var(--ink-soft);
+	font-size: var(--step--1);
+}
+
+.empty {
+	margin: 0;
+	color: var(--ink-soft);
+	font-style: italic;
+}
+
+.visually-hidden {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
+}
+
+[hidden] {
+	display: none !important;
+}
+
+/* ---------------------------------------------------------------- masthead */
+
+.masthead {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 0.5rem 1.5rem;
+	max-width: 1320px;
+	margin: 0 auto;
+	padding: 1.25rem var(--gutter) 0;
+}
+
+.brand {
+	display: inline-flex;
+	align-items: baseline;
+	gap: 0.55rem;
+	text-decoration: none;
+}
+
+.brand__mark {
+	align-self: center;
+	width: 30px;
+	height: 30px;
+}
+
+.brand__word {
+	font-size: var(--step-2);
+	font-weight: 700;
+	letter-spacing: -0.02em;
+}
+
+.brand__sub {
+	font-size: var(--step-2);
+	font-weight: 200;
+	color: var(--ink-soft);
+	letter-spacing: -0.01em;
+}
+
+.masthead__end {
+	min-width: 0;
+	font-size: var(--step--1);
+}
+
+/* a peer-supplied build string: wraps anywhere instead of widening the page */
+.masthead__build {
+	margin: 0;
+	overflow-wrap: anywhere;
+}
+
+.masthead__label {
+	color: var(--ink-soft);
+}
+
+/* ------------------------------------------------------------------- sheet */
+
+/* the drawing sheet: an outer frame and an inset border, title block in the corner */
+.sheet {
+	position: relative;
+	max-width: 1320px;
+	margin: 1.25rem auto 0;
+	padding: 0 var(--gutter);
+}
+
+.sheet__drawing {
+	position: relative;
+	padding: clamp(1rem, 2.5vw, 2rem) clamp(0.75rem, 2vw, 1.5rem) clamp(4.5rem, 7vw, 5.5rem);
+	border: 1px solid var(--hair);
+	outline: 1px solid var(--hair-faint);
+	outline-offset: 5px;
+	background: color-mix(in srgb, var(--paper) 72%, transparent);
+	transition: border-color 0.25s ease, outline-color 0.25s ease, background-color 0.25s ease;
+}
+
+.drawing {
+	display: block;
+	width: 100%;
+	height: auto;
+	overflow: visible;
+	font-family: var(--sans);
+}
+
+.drawing text {
+	fill: var(--ink);
+	font-size: 15px;
+}
+
+.drawing .strong {
+	font-weight: 700;
+}
+
+.drawing .detail,
+.drawing .caption {
+	fill: var(--ink-soft);
+	font-size: 13px;
+}
+
+.drawing .caption {
+	font-size: 10.5px;
+	letter-spacing: 0.12em;
+}
+
+.wall {
+	fill: url(#hatch);
+	stroke: var(--ink);
+	stroke-width: 1.25;
+}
+
+.hatch-line {
+	stroke: var(--hair);
+	stroke-width: 1;
+}
+
+.leader {
+	fill: none;
+	stroke: var(--ink-soft);
+	stroke-width: 0.75;
+}
+
+.leader__dot {
+	fill: var(--ink-soft);
+}
+
+.stream {
+	fill: none;
+	stroke: var(--water);
+	stroke-width: 2;
+	stroke-linecap: round;
+	stroke-dasharray: 1.5 11;
+	animation: stream var(--dur, 0.9s) linear infinite;
+}
+
+@keyframes stream {
+	to {
+		stroke-dashoffset: -12.5;
+	}
+}
+
+/* the one orchestrated moment: the gate's linework draws itself on first paint */
+.ink {
+	stroke-dasharray: 1;
+	stroke-dashoffset: 1;
+	animation: draw 1.3s cubic-bezier(0.6, 0, 0.3, 1) forwards;
+}
+
+@keyframes draw {
+	to {
+		stroke-dashoffset: 0;
+	}
+}
+
+/* ---------------------------------------------------------- the intake (drop zone) */
+
+/* room below the drawing for the title block pinned to the frame's corner */
+.sheet__drawing.intake {
+	padding-bottom: 7.75rem;
+}
+
+.intake {
+	display: grid;
+	grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+	align-items: center;
+	gap: 1.25rem clamp(1.5rem, 4vw, 3.5rem);
+}
+
+.intake__text {
+	min-width: 0;
+}
+
+.intake__lead {
+	margin: 0 0 0.9rem;
+	font-size: var(--step-4);
+	font-weight: 200;
+	letter-spacing: -0.03em;
+	line-height: 1.08;
+}
+
+.intake__kind {
+	font-weight: 600;
+	letter-spacing: -0.02em;
+}
+
+.intake__hint {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 0.6rem 0.9rem;
+	margin: 0;
+	color: var(--ink-soft);
+	font-size: var(--step--1);
+}
+
+.intake__choose {
+	padding: 0.55rem 1.3rem 0.45rem;
+	border: 1px solid var(--ink);
+	border-radius: 0;
+	background: var(--ink);
+	color: var(--on-ink);
+	font-family: var(--sans);
+	font-size: var(--step-0);
+	font-weight: 600;
+	cursor: pointer;
+}
+
+/* the drawing's notes, as in the corner of an engineering sheet */
+.intake__notes {
+	margin: 1.5rem 0 0;
+	padding: 0.7rem 0 0;
+	border-top: 1px solid var(--hair-faint);
+	color: var(--ink-soft);
+	font-size: var(--step--1);
+}
+
+.intake__notes-title {
+	margin: 0 0 0.3rem;
+	font-size: 0.72rem;
+	font-weight: 600;
+	letter-spacing: 0.12em;
+	text-transform: uppercase;
+}
+
+.intake__notes ol {
+	margin: 0;
+	padding-left: 1.3rem;
+}
+
+.intake__notes li + li {
+	margin-top: 0.15rem;
+}
+
+.intake__choose:hover {
+	border-color: var(--water);
+	background: var(--water);
+}
+
+.intake__choose .mono {
+	font-size: 0.9em;
+}
+
+.intake__drawing {
+	max-height: 13rem;
+}
+
+.intake__head {
+	fill: var(--water-bed);
+}
+
+.intake__surface {
+	fill: none;
+	stroke: var(--hair);
+	stroke-width: 1;
+}
+
+.intake__level {
+	fill: none;
+	stroke: var(--ink-soft);
+	stroke-width: 1;
+}
+
+.intake__tail {
+	fill: var(--water-bed);
+	transform-box: fill-box;
+	transform-origin: 50% 100%;
+	transition: transform 1.2s cubic-bezier(0.3, 0, 0.2, 1);
+}
+
+.intake__jet {
+	opacity: 0;
+	transition: opacity 0.4s ease;
+}
+
+.ground {
+	fill: none;
+	stroke: var(--ink);
+	stroke-width: 1.25;
+}
+
+.ground__cut {
+	fill: url(#hatch);
+}
+
+.wicket {
+	transition: transform 0.9s cubic-bezier(0.3, 0, 0.2, 1);
+}
+
+.wicket__rod {
+	fill: none;
+	stroke: var(--ink);
+	stroke-width: 1.25;
+}
+
+.wicket__paddle {
+	fill: var(--paper);
+	stroke: var(--ink);
+	stroke-width: 1.5;
+}
+
+/* a file dragged over the page: the frame takes the water's colour and the wicket opens */
+.intake[data-intake="over"] {
+	border-color: var(--water);
+	outline-color: var(--water);
+	background-color: color-mix(in srgb, var(--water-bed) 45%, var(--paper));
+}
+
+.intake[data-intake="over"] .wicket,
+.intake[data-intake="busy"] .wicket {
+	transform: translateY(-30px);
+}
+
+.intake[data-intake="over"] .intake__jet,
+.intake[data-intake="busy"] .intake__jet {
+	opacity: 1;
+}
+
+.intake[data-intake="over"] .intake__tail,
+.intake[data-intake="busy"] .intake__tail {
+	transform: scaleY(1.7);
+}
+
+/* a component on its way in: the wicket stays open while it uploads and compiles */
+.intake[data-intake="busy"] .wicket__paddle {
+	stroke: var(--water);
+}
+
+/* ------------------------------------------------------------- title block */
+
+.sheet__title {
+	position: absolute;
+	right: var(--gutter);
+	bottom: 0;
+	max-width: calc(100% - 2 * var(--gutter));
+}
+
+.titleblock {
+	display: grid;
+	grid-template-columns: repeat(3, auto);
+	margin: 0;
+	border-top: 1px solid var(--hair);
+	border-left: 1px solid var(--hair);
+	background: var(--paper-raised);
+	font-size: var(--step--1);
+}
+
+.titleblock div {
+	display: flex;
+	flex-direction: column;
+	gap: 0.05rem;
+	min-width: 7.5rem;
+	padding: 0.4rem 0.8rem 0.45rem;
+	border-right: 1px solid var(--hair-faint);
+	border-bottom: 1px solid var(--hair-faint);
+}
+
+.titleblock .titleblock__node {
+	grid-row: span 2;
+	justify-content: center;
+	min-width: 8rem;
+}
+
+.titleblock__node dd {
+	font-size: var(--step-3);
+	font-weight: 200;
+	letter-spacing: -0.03em;
+	line-height: 1.1;
+}
+
+.titleblock dt {
+	color: var(--ink-soft);
+	font-size: 0.72rem;
+}
+
+.titleblock dd {
+	margin: 0;
+	font-weight: 600;
+	white-space: nowrap;
+}
+
+.titleblock dd.mono {
+	max-width: 18rem;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.state {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.4rem;
+}
+
+.state::before {
+	content: "";
+	width: 0.55rem;
+	height: 0.55rem;
+	border-radius: 50%;
+	background: var(--water);
+}
+
+.link__lost {
+	display: none;
+	color: var(--fault);
+}
+
+[data-link="lost"] .link__live {
+	display: none;
+}
+
+[data-link="lost"] .link__lost {
+	display: inline;
+}
+
+/* a view that stopped refreshing is marked stale instead of looking current */
+[data-link="lost"] .page,
+[data-link="lost"] .intake__drawing {
+	opacity: 0.5;
+	transition: opacity 0.4s ease;
+}
+
+/* ---------------------------------------------------------------- the page */
+
+.page {
+	max-width: 1320px;
+	margin: 0 auto;
+	padding: 1rem var(--gutter) 5rem;
+}
+
+.panel {
+	padding-top: 2.25rem;
+}
+
+/* a heading extended by a hairline to the edge, like a drawing's detail label */
+.rule-heading {
+	display: flex;
+	align-items: baseline;
+	gap: 1rem;
+	margin: 0 0 1.1rem;
+	font-size: var(--step-3);
+	font-weight: 300;
+	letter-spacing: -0.02em;
+	line-height: 1.1;
+}
+
+.rule-heading::after {
+	content: "";
+	flex: 1;
+	min-width: 1.5rem;
+	border-bottom: 1px solid var(--hair);
+	transform: translateY(-0.3em);
+}
+
+/* ----------------------------------------------------------------- buttons */
+
+.button {
+	padding: 0.5rem 1.2rem 0.4rem;
+	border: 1px solid var(--hair);
+	border-radius: 0;
+	background: none;
+	color: var(--ink);
+	font-family: var(--sans);
+	font-size: var(--step--1);
+	font-weight: 600;
+	cursor: pointer;
+}
+
+.button:hover {
+	border-color: var(--ink);
+}
+
+.button--primary {
+	padding: 0.65rem 1.6rem 0.55rem;
+	border-color: var(--ink);
+	background: var(--ink);
+	color: var(--on-ink);
+	font-size: var(--step-0);
+}
+
+.button--primary:hover {
+	border-color: var(--water);
+	background: var(--water);
+}
+
+/* the small outlined buttons of a route row, as the server console's gate toggles */
+.button--small {
+	padding: 0.05rem 0.5rem 0;
+	font-size: 0.75rem;
+	line-height: 1.6;
+	white-space: nowrap;
+}
+
+.button--danger:hover {
+	border-color: var(--fault);
+	color: var(--fault);
+}
+
+/* a toggle whose panel is open */
+.button[aria-expanded="true"] {
+	border-color: var(--ink);
+	background: var(--hair-faint);
+}
+
+.button:disabled,
+.button:disabled:hover {
+	border-color: var(--hair);
+	background: none;
+	color: var(--ink-soft);
+	cursor: not-allowed;
+	opacity: 0.6;
+}
+
+.button--primary:disabled,
+.button--primary:disabled:hover {
+	background: var(--hair-faint);
+}
+
+.link-button {
+	padding: 0;
+	border: 0;
+	background: none;
+	color: inherit;
+	font: inherit;
+	text-decoration: underline;
+	text-decoration-color: var(--hair);
+	text-underline-offset: 0.2em;
+	cursor: pointer;
+}
+
+.link-button:hover {
+	text-decoration-color: currentColor;
+}
+
+/* ------------------------------------------------------------------ banner */
+
+/* a background reload of the routes' files failed: held in red until one succeeds */
+.banner {
+	margin-top: 1.75rem;
+	padding: 0.9rem 1.1rem 1rem;
+	border: 1px solid var(--hair);
+	border-left: 3px solid var(--fault);
+	background: color-mix(in srgb, var(--paper-raised) 80%, transparent);
+}
+
+.banner__title {
+	margin: 0 0 0.25rem;
+	color: var(--fault);
+	font-size: var(--step-1);
+	font-weight: 700;
+}
+
+.banner__meta {
+	margin: 0 0 0.6rem;
+	color: var(--ink-soft);
+	font-size: var(--step--1);
+}
+
+/* a multi-line error from the wicket (a wasmtime compile error, a config path), verbatim */
+.banner__error,
+.outcome__error {
+	max-height: 20rem;
+	margin: 0;
+	padding: 0.7rem 0.9rem;
+	overflow: auto;
+	border: 1px solid var(--hair-faint);
+	background: var(--paper);
+	color: var(--ink);
+	font-family: var(--mono);
+	font-size: var(--step--1);
+	line-height: 1.55;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------------ fields */
+
+.field {
+	display: grid;
+	grid-template-columns: 9rem minmax(0, 1fr);
+	align-items: baseline;
+	gap: 0.3rem 1.25rem;
+}
+
+.field > label,
+.field > .field__label {
+	font-size: var(--step--1);
+	font-weight: 600;
+}
+
+.field__control {
+	min-width: 0;
+}
+
+.field input[type="text"],
+.field input[type="number"] {
+	padding: 0.45rem 0.1rem 0.35rem;
+	border: 0;
+	border-bottom: 1px solid var(--ink);
+	border-radius: 0;
+	background: transparent;
+	color: var(--ink);
+	font-family: var(--mono);
+	font-size: var(--step-0);
+}
+
+.field--host input {
+	width: min(100%, 34rem);
+	font-size: var(--step-1);
+}
+
+.field input:focus-visible {
+	outline: none;
+	border-bottom-color: var(--water);
+	box-shadow: 0 1px 0 var(--water);
+}
+
+.field input[aria-invalid="true"] {
+	border-bottom-color: var(--fault);
+}
+
+.field__note {
+	min-height: 1.4em;
+	margin: 0.35rem 0 0;
+	color: var(--ink-soft);
+	font-size: var(--step--1);
+}
+
+.field__note--replace {
+	color: var(--amber);
+}
+
+.field__note--fault {
+	color: var(--fault);
+}
+
+/* the sandbox: capabilities as a set of grants, then the limits */
+.sandbox {
+	display: grid;
+	gap: 1.1rem;
+	margin: 1.1rem 0 0;
+	padding: 0;
+	border: 0;
+	min-width: 0;
+}
+
+.sandbox legend {
+	padding: 0;
+	font-size: var(--step--1);
+	font-weight: 600;
+}
+
+.caps {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(13.5rem, 1fr));
+	gap: 0.4rem 1rem;
+}
+
+.cap {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr);
+	gap: 0 0.55rem;
+	align-items: baseline;
+	padding: 0.4rem 0.6rem 0.35rem;
+	border: 1px solid var(--hair-faint);
+	cursor: pointer;
+}
+
+.cap:hover {
+	border-color: var(--hair);
+}
+
+.cap:has(input:checked) {
+	border-color: var(--ink);
+	background: color-mix(in srgb, var(--paper-raised) 70%, transparent);
+}
+
+.cap input {
+	margin: 0;
+	accent-color: var(--ink);
+	transform: translateY(0.1em);
+}
+
+.cap__name {
+	font-family: var(--mono);
+	font-size: var(--step--1);
+	font-weight: 600;
+}
+
+.cap__hint {
+	grid-column: 2;
+	color: var(--ink-soft);
+	font-size: 0.75rem;
+	line-height: 1.35;
+}
+
+.limits {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.6rem 1.75rem;
+}
+
+.limit {
+	display: grid;
+	gap: 0.1rem;
+}
+
+.limit label {
+	color: var(--ink-soft);
+	font-size: 0.75rem;
+	font-weight: 600;
+}
+
+.limit__control {
+	display: flex;
+	align-items: baseline;
+	gap: 0.35rem;
+}
+
+.limit input {
+	width: 6.5rem;
+}
+
+.limit__unit {
+	color: var(--ink-soft);
+	font-size: var(--step--1);
+}
+
+.sandbox__note {
+	margin: 0;
+	min-height: 1.4em;
+	color: var(--fault);
+	font-size: var(--step--1);
+}
+
+/* ------------------------------------------------------------------ deploy */
+
+.deploy__form {
+	display: grid;
+	gap: 0.4rem;
+	padding: 1.3rem 1.2rem 1.2rem;
+	border: 1px solid var(--hair);
+	background: color-mix(in srgb, var(--paper) 80%, transparent);
+}
+
+.deploy__fields {
+	display: grid;
+	gap: 0.4rem;
+	min-width: 0;
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+
+.deploy__file {
+	font-size: 0.8em;
+	font-weight: 500;
+	letter-spacing: -0.01em;
+}
+
+/* an empty progress or outcome slot takes no gap */
+.deploy__form > :empty {
+	display: none;
+}
+
+.deploy__meta {
+	margin: 0 0 0.6rem;
+	color: var(--ink-soft);
+	font-size: var(--step--1);
+}
+
+.deploy__meta--fault {
+	color: var(--fault);
+}
+
+.deploy__meta--marker {
+	color: var(--amber);
+}
+
+.deploy__actions {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.75rem 1rem;
+	margin-top: 1.1rem;
+}
+
+/* --------------------------------------------------------- progress / outcome */
+
+.progress {
+	display: grid;
+	gap: 0.35rem;
+	margin-top: 0.9rem;
+}
+
+.progress__track {
+	position: relative;
+	height: 3px;
+	overflow: hidden;
+	background: var(--hair-faint);
+}
+
+/* focused only to hold the focus of the controls disabled meanwhile */
+.progress__track:focus {
+	outline: none;
+}
+
+.progress__bar {
+	position: absolute;
+	inset: 0 auto 0 0;
+	width: 0;
+	background: var(--water);
+	transition: width 0.2s linear;
+}
+
+/* compiling and reloading: no measure of how long, so the water just runs */
+.progress--indeterminate .progress__bar {
+	width: 32%;
+	transition: none;
+	animation: sweep 1.25s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+
+@keyframes sweep {
+	from {
+		transform: translateX(-100%);
+	}
+	to {
+		transform: translateX(320%);
+	}
+}
+
+.progress__label {
+	margin: 0;
+	color: var(--ink-soft);
+	font-size: var(--step--1);
+}
+
+.outcome {
+	display: grid;
+	gap: 0.5rem;
+	margin-top: 0.9rem;
+	padding: 0.15rem 0 0.15rem 0.8rem;
+	border-left: 2px solid var(--water);
+	font-size: var(--step--1);
+}
+
+.outcome p {
+	margin: 0;
+}
+
+.outcome__title {
+	font-weight: 700;
+}
+
+.outcome__actions {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 0.5rem;
+	margin-top: 0.2rem;
+}
+
+.outcome--fault {
+	border-left-color: var(--fault);
+}
+
+.outcome--fault .outcome__title {
+	color: var(--fault);
+}
+
+/* ------------------------------------------------------------------ routes */
+
+/* the outcome of a route whose row is gone */
+[data-slot="routes-note"] > .outcome {
+	margin: 0 0 1.2rem;
+}
+
+.routes-frame {
+	overflow-x: auto;
+}
+
+.grid {
+	width: 100%;
+	border-collapse: collapse;
+	table-layout: fixed;
+	font-size: var(--step--1);
+}
+
+.grid th,
+.grid td {
+	padding: 0.5rem 0.75rem 0.5rem 0;
+	text-align: left;
+	vertical-align: baseline;
+}
+
+.grid thead th {
+	color: var(--ink-soft);
+	font-weight: 600;
+	border-bottom: 1px solid var(--hair);
+}
+
+.grid tbody td {
+	border-bottom: 1px solid var(--hair-faint);
+}
+
+/* the head row sets the columns (fixed layout); the group keys span them */
+.routes thead th:nth-child(1) { width: 26%; }
+.routes thead th:nth-child(2) { width: 27%; }
+.routes thead th:nth-child(4) { width: 16.5rem; }
+
+.routes__key th {
+	padding-top: 1.1rem;
+	font-size: var(--step-0);
+	font-weight: 700;
+}
+
+.routes__key .decision {
+	margin-left: 0.75rem;
+	font-size: var(--step--1);
+	font-weight: 400;
+	color: var(--ink-soft);
+}
+
+.routes tr.route td:first-child,
+.routes tr.route__status td,
+.routes tr.route__editor td {
+	padding-left: 0.75rem;
+}
+
+.route__host {
+	display: block;
+	font-weight: 600;
+}
+
+.catch-all {
+	font-family: var(--sans);
+	font-style: italic;
+	font-weight: 400;
+}
+
+.route__reach {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 0.2rem 0.6rem;
+	margin-top: 0.2rem;
+	color: var(--ink-soft);
+}
+
+.route__curl {
+	font-size: 0.75rem;
+	overflow-wrap: anywhere;
+}
+
+a.route__curl {
+	color: var(--ink);
+}
+
+.route__component {
+	display: block;
+}
+
+.route__meta {
+	display: block;
+	color: var(--ink-soft);
+}
+
+.route__digest {
+	font-size: 0.75rem;
+}
+
+.route__deployed {
+	display: block;
+	margin-top: 0.15rem;
+	color: var(--ink-soft);
+}
+
+.route__sandbox {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.25rem 0.4rem;
+	align-items: baseline;
+}
+
+.route__limit {
+	white-space: nowrap;
+}
+
+/* a separator between run-in values: a drawn dot, spaced evenly whatever the font */
+.sep {
+	display: inline-block;
+	width: 3px;
+	height: 3px;
+	margin: 0 0.5em;
+	border-radius: 50%;
+	background: currentColor;
+	vertical-align: 0.25em;
+	opacity: 0.7;
+}
+
+.route__kv {
+	flex-basis: 100%;
+	font-size: 0.75rem;
+	color: var(--ink-soft);
+}
+
+.route__defaults {
+	color: var(--ink-soft);
+	font-style: italic;
+}
+
+.route__actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.35rem;
+}
+
+.route__readonly {
+	color: var(--ink-soft);
+	font-style: italic;
+}
+
+.tag {
+	display: inline-block;
+	padding: 0 0.4rem;
+	border: 1px solid currentColor;
+	font-size: 0.75rem;
+	font-weight: 600;
+	line-height: 1.5;
+	color: var(--ink-soft);
+	background: var(--paper);
+}
+
+/* a console row a file is dragged over: the water marks where the component will go */
+.route.is-target td {
+	background: var(--water-bed);
+}
+
+.route.is-target td:first-child {
+	box-shadow: inset 3px 0 0 var(--water);
+}
+
+/* a read-only row refuses the drop: hatched as a closed gate, a fault mark at its edge */
+.route.is-refusing td {
+	background: repeating-linear-gradient(-45deg, transparent 0 6px, var(--hair-faint) 6px 7px);
+	color: var(--ink-soft);
+}
+
+.route.is-refusing td:first-child {
+	box-shadow: inset 3px 0 0 var(--fault);
+}
+
+.route.is-busy td:first-child {
+	box-shadow: inset 2px 0 0 var(--water);
+}
+
+/* just deployed: the water mark fades out of the row */
+.route.is-fresh td:first-child {
+	animation: fresh 4s ease-out forwards;
+}
+
+@keyframes fresh {
+	from {
+		box-shadow: inset 3px 0 0 var(--water);
+	}
+	to {
+		box-shadow: inset 3px 0 0 transparent;
+	}
+}
+
+.route__status td,
+.route__editor td {
+	padding-top: 0;
+}
+
+.route__status .outcome,
+.route__status .progress {
+	margin-top: 0;
+}
+
+.route__editor .sandbox {
+	margin-top: 0.25rem;
+}
+
+.editor {
+	display: grid;
+	gap: 0.6rem;
+	padding: 0.8rem 1rem 1rem;
+	border: 1px solid var(--hair);
+	background: color-mix(in srgb, var(--paper-raised) 55%, transparent);
+}
+
+.editor__actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.6rem;
+}
+
+/* ------------------------------------------------------------ reduced motion */
+
+@media (prefers-reduced-motion: reduce) {
+	.ink {
+		animation: none;
+		stroke-dasharray: none;
+		stroke-dashoffset: 0;
+	}
+
+	.stream,
+	.route.is-fresh td:first-child {
+		animation: none;
+	}
+
+	.wicket,
+	.intake__tail,
+	.intake__jet,
+	.sheet__drawing,
+	.progress__bar {
+		transition: none;
+	}
+
+	.progress--indeterminate .progress__bar {
+		width: 100%;
+		animation: none;
+		opacity: 0.5;
+	}
+}
+
+/* -------------------------------------------------------------- responsive */
+
+@media (max-width: 960px) {
+	.intake {
+		grid-template-columns: minmax(0, 1fr);
+	}
+
+	.intake__drawing {
+		max-height: none;
+	}
+}
+
+@media (max-width: 760px) {
+	.sheet__drawing,
+	.sheet__drawing.intake {
+		padding-bottom: 1rem;
+	}
+
+	.sheet__title {
+		position: static;
+		max-width: none;
+		margin-top: 0.75rem;
+	}
+
+	.titleblock {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+
+	.titleblock .titleblock__node {
+		grid-row: auto;
+		grid-column: span 2;
+	}
+
+	.titleblock div {
+		min-width: 0;
+	}
+
+	.titleblock dd,
+	.titleblock dd.mono {
+		max-width: none;
+		white-space: normal;
+		overflow-wrap: anywhere;
+	}
+
+	.intake__lead {
+		font-size: var(--step-3);
+	}
+
+	.field {
+		grid-template-columns: minmax(0, 1fr);
+	}
+
+	.limits {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+
+	.limit input {
+		flex: 1;
+		width: 0;
+		min-width: 0;
+	}
+
+	.deploy__form {
+		padding: 1rem 0.8rem;
+	}
+
+	/* rows become stacked records: host, component, sandbox, actions */
+	.routes thead {
+		display: none;
+	}
+
+	.routes,
+	.routes tbody,
+	.routes tr,
+	.routes td,
+	.routes th {
+		display: block;
+		width: auto;
+	}
+
+	.routes tr.route {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		gap: 0.3rem;
+		padding: 0.6rem 0 0.7rem 0.6rem;
+		border-bottom: 1px solid var(--hair-faint);
+	}
+
+	.routes tr.route td {
+		padding: 0;
+		border: 0;
+	}
+
+	.routes tr.route td:first-child,
+	.routes tr.route__status td,
+	.routes tr.route__editor td {
+		padding-left: 0;
+	}
+
+	.routes tr.route__status,
+	.routes tr.route__editor {
+		padding: 0 0 0.7rem 0.6rem;
+	}
+
+	.routes tr.route__status td,
+	.routes tr.route__editor td {
+		border: 0;
+	}
+
+	.routes__key th {
+		padding: 1rem 0 0.25rem;
+	}
+
+	.routes__key .decision {
+		display: block;
+		margin-left: 0;
+	}
+
+	.route.is-target,
+	.route.is-busy {
+		box-shadow: inset 3px 0 0 var(--water);
+	}
+
+	.route.is-refusing {
+		box-shadow: inset 3px 0 0 var(--fault);
+	}
+
+	.route.is-target td:first-child,
+	.route.is-busy td:first-child,
+	.route.is-refusing td:first-child {
+		box-shadow: none;
+	}
+}

@@ -3,7 +3,8 @@
 //! once; a keyvalue route keeps its count in the sqlite file, across a
 //! restart and shared by two wickets on the file, or in a redis store two
 //! wickets share as wickets on two hosts would. Nothing drains: SIGTERM ends
-//! the process at once.
+//! the process at once. The console deploys an uploaded component as a route
+//! at once.
 #![cfg(unix)]
 
 #[path = "support/redis_server.rs"]
@@ -76,14 +77,26 @@ impl Wicket {
 
     /// The address it listens on, from its log.
     fn address(&self) -> String {
+        self.logged("listening on ")
+    }
+
+    /// The address its console listens on, from its log (after
+    /// [`Wicket::address`]).
+    fn console(&self) -> String {
+        self.logged("console on http://")
+    }
+
+    /// The first word after `prefix` of the next line of its log starting
+    /// with it.
+    fn logged(&self, prefix: &str) -> String {
         let deadline = Instant::now() + HANG;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let line = self
                 .lines
                 .recv_timeout(left)
-                .unwrap_or_else(|e| panic!("not listening: {e}"));
-            if let Some(rest) = line.strip_prefix("listening on ") {
+                .unwrap_or_else(|e| panic!("never logged '{prefix}': {e}"));
+            if let Some(rest) = line.strip_prefix(prefix) {
                 return rest.split(' ').next().unwrap().to_string();
             }
         }
@@ -132,6 +145,39 @@ async fn get_h2(address: &str, host: &str, path: &str) -> String {
         text.extend_from_slice(&chunk);
     }
     String::from_utf8(text).unwrap()
+}
+
+/// An http/1.1 request to the console at `address`, closed after it: the
+/// status, the head (in lower case) and the body.
+async fn console(
+    address: &str,
+    request: &str,
+    headers: &[&str],
+    body: &[u8],
+) -> (u16, String, String) {
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut head = format!(
+        "{request} HTTP/1.1\r\nhost: {address}\r\nconnection: close\r\ncontent-length: {}\r\n",
+        body.len()
+    );
+    for header in headers {
+        head.push_str(&format!("{header}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(HANG, stream.read_to_end(&mut raw))
+        .await
+        .expect("answered")
+        .unwrap();
+    let text = String::from_utf8(raw).unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").expect("a response");
+    (
+        head[9..12].parse().unwrap(),
+        head.to_lowercase(),
+        body.to_string(),
+    )
 }
 
 /// Two wickets counting on a.local at once, 20 increments and 20 cas.
@@ -296,5 +342,115 @@ routes:
     count_at_once(&a, &b).await;
     assert_eq!(get(&b, "a.local", "/").await.1, "hits 21\n");
     assert_eq!(get(&a, "a.local", "/kv/cas-hits").await.1, "20");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The console deploys a component uploaded to it as a route at once: served
+/// on the listener, listed -- a long poll answering the change -- and kept
+/// across a restart, until removed. It asks for its token, and refuses an
+/// edit from another origin and a body that is no wasm.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_console_deploys_an_uploaded_component_as_a_route() {
+    let hello = std::fs::read(guests().join("hello.wasm")).unwrap();
+    let dir = std::env::temp_dir().join(format!("sluice-console-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let kept = dir.join("deployed");
+    let args = [
+        "--console",
+        "127.0.0.1:0",
+        "--console-token",
+        "s3cret",
+        "--console-dir",
+        kept.to_str().unwrap(),
+    ];
+    let mut wicket = Wicket::start(&args);
+    let (address, at) = (wicket.address(), wicket.console());
+    // admin:s3cret
+    let basic = "authorization: Basic YWRtaW46czNjcmV0";
+    let bearer = "authorization: Bearer s3cret";
+
+    let (status, head, _) = console(&at, "GET /api/routes", &[], b"").await;
+    assert_eq!(status, 401);
+    assert!(head.contains("www-authenticate: basic realm="), "{head}");
+    let (status, head, page) = console(&at, "GET /", &[basic], b"").await;
+    assert_eq!(status, 200);
+    assert!(head.contains("content-type: text/html"), "{head}");
+    assert!(
+        head.contains("content-security-policy: default-src 'none'"),
+        "{head}"
+    );
+    assert!(page.contains("/console.js"), "{page}");
+    let (status, _, listing) = console(&at, "GET /api/routes", &[bearer], b"").await;
+    assert_eq!(status, 200);
+    let listing: serde_json::Value = serde_json::from_str(&listing).unwrap();
+    assert_eq!(listing["routes"], serde_json::json!([]));
+    let revision = listing["revision"].as_u64().unwrap();
+    let polled = {
+        let at = at.clone();
+        tokio::spawn(async move {
+            let request = format!("GET /api/routes?after={revision}");
+            console(&at, &request, &[bearer], b"").await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!polled.is_finished(), "held while nothing changed");
+
+    let deploy = "PUT /api/routes/Hello.localhost?name=hello.wasm\
+                  &wasi=cli%2Cinherit-network&budget-ms=5000";
+    let foreign = [bearer, "origin: http://rebound.example"];
+    let (status, _, body) = console(&at, deploy, &foreign, &hello).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (403, r#"{"error":"an edit from another origin is refused"}"#)
+    );
+    let (status, _, body) = console(&at, deploy, &[bearer], b"<html>").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("not a wasm binary"), "{body}");
+    let same_origin = format!("origin: http://{at}");
+    let (status, _, body) = console(&at, deploy, &[bearer, &same_origin], &hello).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (200, r#"{"generation":2,"message":"added hello.localhost"}"#)
+    );
+    let (status, _, listing) = tokio::time::timeout(HANG, polled).await.unwrap().unwrap();
+    assert_eq!(status, 200);
+    let listing: serde_json::Value = serde_json::from_str(&listing).unwrap();
+    assert_ne!(
+        listing["revision"].as_u64(),
+        Some(revision),
+        "answered the change"
+    );
+    let route = &listing["routes"][0];
+    assert_eq!(route["host"], "hello.localhost");
+    assert_eq!(route["origin"], "console");
+    assert_eq!(route["component"]["name"], "hello.wasm");
+    assert_eq!(route["component"]["bytes"], hello.len());
+    assert_eq!(
+        route["sandbox"]["wasi"],
+        serde_json::json!(["cli", "inherit-network"])
+    );
+    assert_eq!(route["sandbox"]["budget_ms"], 5000);
+    let (status, body) = get(&address, "hello.localhost", "/").await;
+    assert_eq!(status, 200);
+    assert!(body.starts_with("hello from wasm"), "{body}");
+
+    drop(wicket);
+    wicket = Wicket::start(&args);
+    let (address, at) = (wicket.address(), wicket.console());
+    let (status, body) = get(&address, "hello.localhost", "/").await;
+    assert_eq!(status, 200, "kept across the restart: {body}");
+    let removal = "DELETE /api/routes/hello.localhost";
+    let (status, _, body) = console(&at, removal, &[basic], b"").await;
+    assert_eq!(
+        (status, body.as_str()),
+        (
+            200,
+            r#"{"generation":2,"message":"removed hello.localhost"}"#
+        )
+    );
+    assert_eq!(get(&address, "hello.localhost", "/").await.0, 404);
+    let (status, _, _) = console(&at, removal, &[basic], b"").await;
+    assert_eq!(status, 404, "no longer the console's");
+    drop(wicket);
     let _ = std::fs::remove_dir_all(&dir);
 }

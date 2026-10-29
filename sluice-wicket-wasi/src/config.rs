@@ -4,16 +4,17 @@
 //! file's routes are read again by every reload (`routes::Reloader`); its other
 //! settings apply at startup only, and a reload reports the ones changed since.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::deployed::Deployed;
 use crate::keyvalue::{self, StoreConfig, StoreLimits, Stores};
-use crate::routes::Spec;
-use crate::wasm_host::{Caps, Instances, Locator, Sandbox};
+use crate::routes::{Origin, Spec};
+use crate::wasm_host::{Caps, Instances, Limits, Locator, Sandbox};
 
 pub const USAGE: &str = "\
 usage: sluice-wicket-wasi --server <url> --wasm <host>=<locator>[?<options>] ... [options]
@@ -28,6 +29,12 @@ usage: sluice-wicket-wasi --server <url> --wasm <host>=<locator>[?<options>] ...
                                   &wasi=<cap>,... sets its sandbox (wasi=keyvalue: the
                                   default store, namespaced by the host)
   --config <file>                 YAML settings and routes, the routes reloaded on change
+  --console <host:port>           serve the console: a page and an API deploying uploaded
+                                  components as routes, kept in --console-dir
+  --console-token <token>         the console's credentials (the HTTP Basic password, or a
+                                  Bearer token); required on a non-loopback address
+  --console-dir <path>            where the console keeps its routes and components
+                                  (default deployed, next to the --config file)
   --keyvalue-file <path>          the SQLite file of the keyvalue store without a keyvalue
                                   section in the --config file (default keyvalue.db)
   --token <token>                 bearer token of the tunnel streams
@@ -71,6 +78,10 @@ const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 /// directory.
 const DEFAULT_KEYVALUE_FILE: &str = "keyvalue.db";
 
+/// The console's directory without `--console-dir`: next to the config file,
+/// else in the working directory.
+const DEFAULT_CONSOLE_DIR: &str = "deployed";
+
 pub struct Settings {
     /// None: local mode alone (`listen`).
     pub server: Option<String>,
@@ -85,7 +96,18 @@ pub struct Settings {
     pub drain_grace: Duration,
     /// Zero: the files are not polled; only SIGHUP reloads.
     pub watch_interval: Duration,
+    pub console: Option<ConsoleSettings>,
     pub routes: RouteSource,
+}
+
+/// The console (`--console`).
+pub struct ConsoleSettings {
+    /// Where it listens, `host:port`.
+    pub address: String,
+    /// The credentials it asks for; None: none, on a loopback address only.
+    pub token: Option<String>,
+    /// Where it keeps the routes it deployed.
+    pub dir: PathBuf,
 }
 
 /// What to run: print something and exit, or run.
@@ -112,6 +134,9 @@ struct Flags {
     drain_grace: Option<Duration>,
     watch_interval: Option<Duration>,
     keyvalue_file: Option<PathBuf>,
+    console: Option<String>,
+    console_token: Option<String>,
+    console_dir: Option<PathBuf>,
     routes: Vec<Spec>,
 }
 
@@ -128,6 +153,9 @@ const VALUED: &[&str] = &[
     "drain-grace",
     "watch-interval",
     "keyvalue-file",
+    "console",
+    "console-token",
+    "console-dir",
     "wasm",
 ];
 
@@ -204,6 +232,9 @@ pub fn parse(
         drain_grace: seconds("drain-grace")?,
         watch_interval: seconds("watch-interval")?,
         keyvalue_file: value("keyvalue-file").map(PathBuf::from),
+        console: value("console"),
+        console_token: value("console-token"),
+        console_dir: value("console-dir").map(PathBuf::from),
         routes,
     };
     merge(flags).map(|settings| Command::Run(Box::new(settings)))
@@ -221,6 +252,7 @@ fn parse_wasm_flag(spec: &str) -> Result<Spec, String> {
         host: host.to_string(),
         component,
         sandbox,
+        origin: Origin::Flag,
     })
 }
 
@@ -252,8 +284,26 @@ fn merge(flags: Flags) -> Result<Settings, String> {
             "--server or --listen (or `server` / `listen` in the --config file) is required".into(),
         );
     }
-    if flags.config.is_none() && flags.routes.is_empty() {
-        return Err("at least one --wasm host=locator (or a --config file) is required".into());
+    let console = flags
+        .console
+        .or_else(|| settings.console.clone())
+        .filter(|console| !console.is_empty())
+        .map(|address| ConsoleSettings {
+            address,
+            token: flags
+                .console_token
+                .or_else(|| settings.console_token.clone())
+                .filter(|token| !token.is_empty()),
+            dir: flags
+                .console_dir
+                .or_else(|| settings.console_dir.as_ref().map(|path| dir.join(path)))
+                .unwrap_or_else(|| dir.join(DEFAULT_CONSOLE_DIR)),
+        });
+    if flags.config.is_none() && flags.routes.is_empty() && console.is_none() {
+        return Err(
+            "at least one --wasm host=locator (or a --config file, or --console) is required"
+                .into(),
+        );
     }
     let max_connections = match (flags.max_connections, settings.max_connections) {
         (Some(limit), _) => limit,
@@ -307,6 +357,7 @@ fn merge(flags: Flags) -> Result<Settings, String> {
     let routes = RouteSource {
         config: file,
         flags: flags.routes,
+        deployed: None,
         stores: Arc::new(stores),
     };
     Ok(Settings {
@@ -321,15 +372,18 @@ fn merge(flags: Flags) -> Result<Settings, String> {
         stall_timeout,
         drain_grace,
         watch_interval,
+        console,
         routes,
     })
 }
 
 /// Where the routes come from: the `--config` file's, then the `--wasm`
-/// flags'; and the keyvalue stores their maps may name.
+/// flags', then the console's; and the keyvalue stores their maps may name.
 pub struct RouteSource {
     config: Option<ConfigFile>,
     flags: Vec<Spec>,
+    /// The console's routes, with a console.
+    deployed: Option<Deployed>,
     stores: Arc<Stores>,
 }
 
@@ -340,6 +394,7 @@ impl RouteSource {
         RouteSource {
             config: None,
             flags,
+            deployed: None,
             stores: Arc::new(stores(None, None, Path::new("")).expect("the default store")),
         }
     }
@@ -352,8 +407,19 @@ impl RouteSource {
         Ok(RouteSource {
             config: Some(config),
             flags: Vec::new(),
+            deployed: None,
             stores: Arc::new(stores),
         })
+    }
+
+    /// The console's routes, if any.
+    pub fn deployed(&self) -> Option<&Deployed> {
+        self.deployed.as_ref()
+    }
+
+    /// Takes `deployed` as the console's routes; the ones before, if any.
+    pub fn deploy(&mut self, deployed: Deployed) -> Option<Deployed> {
+        self.deployed.replace(deployed)
     }
 
     /// The keyvalue stores.
@@ -399,10 +465,21 @@ impl RouteSource {
             }
             specs.push(spec);
         }
-        let mut hosts = HashSet::new();
+        if let Some(deployed) = &self.deployed {
+            specs.extend(deployed.specs(&self.stores));
+        }
+        let mut hosts: HashMap<&str, &Origin> = HashMap::new();
         for spec in &specs {
-            if !hosts.insert(spec.host.as_str()) {
-                return Err(format!("route host '{}' is configured twice", spec.host));
+            if let Some(first) = hosts.insert(&spec.host, &spec.origin) {
+                let by = if std::mem::discriminant(first) == std::mem::discriminant(&spec.origin) {
+                    format!("by {first}")
+                } else {
+                    format!("by {first} and by {}", spec.origin)
+                };
+                return Err(format!(
+                    "route host '{}' is configured twice: {by}",
+                    spec.host
+                ));
             }
         }
         Ok((specs, warnings))
@@ -453,6 +530,9 @@ struct File {
     drain_grace: Option<Scalar>,
     watch_interval: Option<Scalar>,
     keyvalue: Option<KeyValueFile>,
+    console: Option<String>,
+    console_token: Option<String>,
+    console_dir: Option<PathBuf>,
     #[serde(default)]
     routes: Vec<RouteFile>,
 }
@@ -492,6 +572,9 @@ impl File {
             drain_grace => "drain-grace",
             watch_interval => "watch-interval",
             keyvalue => "keyvalue",
+            console => "console",
+            console_token => "console-token",
+            console_dir => "console-dir",
         );
         changed
     }
@@ -520,14 +603,16 @@ impl RouteFile {
             host: self.host,
             component,
             sandbox,
+            origin: Origin::Config,
         })
     }
 }
 
-/// A route's sandbox; unset keys keep the defaults.
+/// A route's sandbox; unset keys keep the defaults. The console's routes are
+/// written in this shape too ([`sandbox_yaml`]).
 #[derive(Deserialize, Default, PartialEq, Debug)]
 #[serde(deny_unknown_fields)]
-struct SandboxFile {
+pub(crate) struct SandboxFile {
     /// WASI capabilities (`wasi=` of the flag).
     wasi: Option<Vec<String>>,
     /// The request budget, a duration (`250ms`).
@@ -542,13 +627,23 @@ struct SandboxFile {
 }
 
 impl SandboxFile {
-    fn sandbox(self, host: &str, stores: &Stores) -> Result<Sandbox, String> {
+    /// The sandbox but its keyvalue map, and the map named (None: the
+    /// default one).
+    pub(crate) fn split(self) -> Result<(Sandbox, Option<BTreeMap<String, String>>), String> {
+        let SandboxFile {
+            wasi,
+            budget,
+            memory,
+            pool,
+            instances,
+            keyvalue,
+        } = self;
         let mut sandbox = Sandbox::default();
-        if let Some(wasi) = self.wasi {
+        if let Some(wasi) = wasi {
             sandbox.caps =
                 Caps::parse(&wasi.join(",")).map_err(|e| format!("sandbox.wasi: {e}"))?;
         }
-        if let Some(budget) = self.budget {
+        if let Some(budget) = budget {
             let budget = budget.duration("sandbox.budget", false)?;
             if budget.subsec_nanos() % 1_000_000 != 0 {
                 return Err(format!(
@@ -557,15 +652,21 @@ impl SandboxFile {
             }
             sandbox.limits.budget = budget;
         }
-        if let Some(memory) = self.memory {
+        if let Some(memory) = memory {
             sandbox.limits.memory = memory.mebibytes("sandbox.memory")?;
         }
-        sandbox.pool = self.pool.unwrap_or(0);
-        sandbox.instances = match self.instances {
+        sandbox.pool = pool.unwrap_or(0);
+        sandbox.instances = match instances {
             Some(0) => return Err("sandbox.instances: must be at least 1".into()),
             cap => cap,
         };
-        sandbox.keyvalue = match (self.keyvalue, sandbox.caps.keyvalue) {
+        sandbox.check().map_err(|e| format!("sandbox: {e}"))?;
+        Ok((sandbox, keyvalue))
+    }
+
+    fn sandbox(self, host: &str, stores: &Stores) -> Result<Sandbox, String> {
+        let (mut sandbox, map) = self.split()?;
+        sandbox.keyvalue = match (map, sandbox.caps.keyvalue) {
             (None, false) => keyvalue::BucketMap::new(),
             (Some(_), false) => {
                 return Err("sandbox.keyvalue: needs the capability (wasi: [keyvalue])".into());
@@ -584,9 +685,33 @@ impl SandboxFile {
                 })
                 .collect::<Result<_, String>>()?,
         };
-        sandbox.check().map_err(|e| format!("sandbox: {e}"))?;
         Ok(sandbox)
     }
+}
+
+/// `sandbox` in the shape [`SandboxFile`] reads, as a YAML flow mapping of
+/// its settings besides the defaults (None when all defaults); without a
+/// keyvalue map, the default one applying.
+pub(crate) fn sandbox_yaml(sandbox: &Sandbox) -> Option<String> {
+    let defaults = Limits::default();
+    let mut pairs = Vec::new();
+    let caps = sandbox.caps.names();
+    if !caps.is_empty() {
+        pairs.push(format!("wasi: [{}]", caps.join(", ")));
+    }
+    if sandbox.limits.budget != defaults.budget {
+        pairs.push(format!("budget: {}ms", sandbox.limits.budget.as_millis()));
+    }
+    if sandbox.limits.memory != defaults.memory {
+        pairs.push(format!("memory: {}Mi", sandbox.limits.memory >> 20));
+    }
+    if sandbox.pool > 0 {
+        pairs.push(format!("pool: {}", sandbox.pool));
+    }
+    if let Some(cap) = sandbox.instances {
+        pairs.push(format!("instances: {cap}"));
+    }
+    (!pairs.is_empty()).then(|| format!("{{{}}}", pairs.join(", ")))
 }
 
 /// The keyvalue stores: the `keyvalue` section's, else one `sqlite` store
@@ -949,6 +1074,9 @@ tunnel-stall-timeout: 90s
 drain-grace: 0
 watch-interval: 250ms
 listen: 127.0.0.1:8080
+console: 127.0.0.1:9090
+console-token: t0ken
+console-dir: kept
 keyvalue:
   default: local
   stores:
@@ -1005,6 +1133,10 @@ routes:
         assert_eq!(file.stall_timeout, Duration::from_secs(90));
         assert_eq!(file.drain_grace, Duration::ZERO);
         assert_eq!(file.watch_interval, Duration::from_millis(250));
+        let console = file.console.as_ref().expect("a console");
+        assert_eq!(console.address, "127.0.0.1:9090");
+        assert_eq!(console.token.as_deref(), Some("t0ken"));
+        assert_eq!(console.dir, dir.0.join("kept"));
         let (routes, warnings) = file.routes.read().unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(routes[0].host, "a.local");
@@ -1085,6 +1217,8 @@ routes:
                 "flag.pem",
                 "--listen",
                 "0.0.0.0:9",
+                "--console-dir",
+                "/var/kept",
                 "--wasm=c.local=c.wasm?pool=1&wasi=keyvalue",
             ],
             env,
@@ -1098,6 +1232,9 @@ routes:
         assert_eq!(flagged.ca_cert, Some(PathBuf::from("flag.pem")));
         assert_eq!(flagged.stall_timeout, Duration::from_secs(90), "the file's");
         assert_eq!(flagged.token, file.token, "an empty variable is unset");
+        let console = flagged.console.as_ref().expect("the file's console");
+        assert_eq!(console.dir, PathBuf::from("/var/kept"));
+        assert_eq!(console.token.as_deref(), Some("t0ken"));
         let (routes, _) = flagged.routes.read().unwrap();
         let hosts: Vec<_> = routes.iter().map(|route| route.host.as_str()).collect();
         assert_eq!(hosts, ["a.local", "b.local", "c.local"]);
@@ -1126,6 +1263,7 @@ routes:
         assert_eq!(defaults.watch_interval, DEFAULT_WATCH_INTERVAL);
         assert!(!defaults.insecure);
         assert_eq!(defaults.listen, None);
+        assert!(defaults.console.is_none());
         assert_eq!(defaults.routes.read().unwrap().0, [], "no route yet");
         let sqlite = |settings: Settings| match settings.routes.stores().config(keyvalue::LOCAL) {
             Some(StoreConfig {
@@ -1140,6 +1278,16 @@ routes:
 
         let local = settings(&["--listen", "127.0.0.1:0", "--wasm", "a=a.wasm"]).unwrap();
         assert_eq!(local.server, None, "local mode alone");
+        let console = settings(&["--listen", "127.0.0.1:0", "--console", "127.0.0.1:0"])
+            .unwrap()
+            .console
+            .expect("routes deployed at runtime only");
+        assert_eq!(console.token, None);
+        assert_eq!(
+            console.dir,
+            PathBuf::from("deployed"),
+            "the working directory's"
+        );
         assert_eq!(
             sqlite(local),
             PathBuf::from("keyvalue.db"),
@@ -1264,7 +1412,7 @@ routes:
             (
                 "server: s\nroutes:\n  - {host: a, component: a.wasm}\n  - {host: a, component: b.wasm}\n"
                     .into(),
-                "route host 'a' is configured twice",
+                "route host 'a' is configured twice: by the config file",
             ),
         ];
         for (yaml, error) in cases {
@@ -1287,7 +1435,7 @@ routes:
             .read();
         assert_eq!(
             twice.err().as_deref(),
-            Some("route host 'a' is configured twice"),
+            Some("route host 'a' is configured twice: by the config file and by a --wasm flag"),
             "a file's host given as a flag too"
         );
         let path = dir.write(
@@ -1434,13 +1582,19 @@ routes:
         assert_eq!(sandbox.instances, None, "no cap unless set");
     }
 
-    /// A zero cap, a cap below the pool (in either order) and a non-number
-    /// are startup errors.
+    /// A zero cap or limit, a cap below the pool (in either order) and a
+    /// non-number are startup errors.
     #[test]
-    fn route_target_rejects_a_cap_below_one_or_the_pool() {
+    fn route_target_rejects_zero_and_a_cap_below_the_pool() {
+        for zero in ["instances", "budget-ms", "memory-mib"] {
+            assert_eq!(
+                parse_route_target(&format!("./a.wasm?{zero}=0")).unwrap_err(),
+                format!("{zero}: must be at least 1")
+            );
+        }
         assert_eq!(
-            parse_route_target("./a.wasm?instances=0").unwrap_err(),
-            "instances: must be at least 1"
+            parse_route_target("./a.wasm?memory-mib=18446744073709551615").unwrap_err(),
+            "memory-mib: too large '18446744073709551615'"
         );
         let below = "instances=1 is below pool=2: every pooled unit holds one of the route's \
                      instance slots";

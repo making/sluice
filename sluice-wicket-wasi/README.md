@@ -40,6 +40,8 @@ target/debug/sluice-wicket-wasi --server grpc://127.0.0.1:8001 --token SECRET \
     --wasm demo.local=examples/target/wasm32-wasip3/release/hello.wasm
 # or with the routes in a file, reloaded on change (see Configuration file)
 target/debug/sluice-wicket-wasi --config wicket-wasi.yaml
+# or deploying them from a page, by dropping the .wasm files on it (see Console)
+target/debug/sluice-wicket-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090
 ```
 
 `cargo test` builds the examples the same way (through the
@@ -108,7 +110,8 @@ registration on the server.
 
 `--listen <host:port>` serves the routes over plain TCP too (see [Local mode](#local-mode));
 `--keyvalue-file <path>` moves the keyvalue store (see
-[Key-value stores](#key-value-stores-experimental)).
+[Key-value stores](#key-value-stores-experimental)); `--console <host:port>` serves a page
+deploying components as routes (see [Console](#console)).
 
 `--max-connections N` (default 256) caps the connections open at once over every
 node stream; a CONNECT beyond it is answered with the ERROR `connection limit reached`
@@ -189,6 +192,9 @@ tunnel-stall-timeout: 60s
 drain-grace: 20s
 watch-interval: 1s              # 0 = no polling, SIGHUP only
 # listen: 127.0.0.1:8080        # local mode, see Local mode
+# console: 127.0.0.1:9090       # see Console
+# console-token: ${CONSOLE_TOKEN}
+# console-dir: deployed         # relative to this file
 
 keyvalue:                       # optional: one sqlite store, keyvalue.db next to this file
   default: local                # optional with one store
@@ -269,9 +275,108 @@ stay as they were until a file changes again or SIGHUP. Otherwise
   request, and a new pool's units take the slots as they free (requests take the
   per-request path meanwhile)
 
-Only the routes (with their keyvalue maps) are reloaded: another setting changed in the
-file -- the `keyvalue` stores included -- is logged as such and applies on a restart. Removing every route needs a server from this version on (an
+The console's edits go through the same reload (see [Console](#console)). Only the routes
+(with their keyvalue maps) are reloaded: another setting changed in the file -- the
+`keyvalue` stores included -- is logged as such and applies on a restart. Removing every route needs a server from this version on (an
 older one ignores an advertise without routes and keeps the old ones).
+
+### Console
+
+`--console <host:port>` (`console`) serves a page and a JSON API deploying components as
+routes at once, without a restart: drop a `.wasm` file on the page (or choose one), give it a
+host and a sandbox, and it is served -- on the tunnel and on `--listen` alike. Dropped on a
+route of the console, a file replaces its component. The routes of the config file and the
+`--wasm` flags are listed too, read-only.
+
+```text
+target/debug/sluice-wicket-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090
+# open http://127.0.0.1:9090/ and drop hello.wasm on it: served as hello.localhost
+curl http://hello.localhost:8080/   # *.localhost is the loopback, in browsers too
+```
+
+A deploy is a reload (see [Reloading routes](#reloading-routes)) of the routes as they would
+be with it, and it is kept only when they load: a component that does not compile, a host the
+config file or a flag routes, pools past `--max-instances` refuse it with the reason, and the
+routes stay as they were. The console's hosts are hosts like any other: routing one in the
+config file too fails that reload (`configured twice: by the config file and by the
+console`).
+
+The console keeps its routes in `--console-dir` (`console-dir`, default `deployed` next to the
+config file, else in the working directory: `/data/deployed` in the image) and serves them
+again after a restart:
+
+```text
+deployed/routes.yaml                      the routes, in the config file's route shape
+deployed/components/<sha256>/<name>.wasm  the uploaded components, never rewritten
+```
+
+`routes.yaml` is written once a change loaded, and a component no route names is removed. A
+component's path names its digest, so other content is another target: the route is
+retargeted, and its old target drains as a removed one does. Without `--console` the directory
+is not read: the console's routes are served with the console only. One wicket per
+directory.
+
+`--console-token <token>` (`console-token`, `SLUICE_WICKET_WASI_CONSOLE_TOKEN`) is asked of
+every request: the browser prompts for it (HTTP Basic, any user name, the token as the
+password), an API client sends `Authorization: Bearer <token>`. Without one the console must
+listen on a loopback address (a startup error otherwise), and answers only requests for an IP
+address or `localhost`, so a DNS rebinding page cannot reach it. An edit from another origin
+is refused. The console speaks plain HTTP: reached from another host, put it behind TLS (a
+proxy passing the `Host` header on: an edit's `Origin` is checked against it).
+
+In a container the console listens on all addresses, to be reached through a published port,
+so it takes a token. With Docker Compose (`compose.yaml`; the console's routes and the
+keyvalue store kept in a volume):
+
+```yaml
+services:
+  wicket:
+    image: ghcr.io/making/sluice/sluice-wicket-wasi
+    pull_policy: always
+    command: --listen 0.0.0.0:8080 --console 0.0.0.0:9090
+    environment:
+      SLUICE_WICKET_WASI_CONSOLE_TOKEN: ${CONSOLE_TOKEN:?set CONSOLE_TOKEN}
+      # through a sluice server too (see Run):
+      # SLUICE_WICKET_WASI_SERVER: grpc://host.docker.internal:8001
+      # SLUICE_WICKET_WASI_TOKEN: ${SLUICE_TOKEN:?set SLUICE_TOKEN}
+    ports:
+    - "8080:8080"            # --listen, on the same port: the page links it
+    - "127.0.0.1:9090:9090"  # the console, from this host only
+    volumes:
+    - wicket-data:/data      # deployed/ (the console's routes) and keyvalue.db
+    # with a server: above --drain-grace, see Shutdown (drain)
+    # stop_grace_period: 30s
+volumes:
+  wicket-data:
+```
+
+```text
+CONSOLE_TOKEN=s3cret docker compose up -d
+# open http://127.0.0.1:9090/ (any user name, s3cret as the password) and drop hello.wasm on it
+curl http://hello.localhost:8080/
+```
+
+The API the page uses; `<options>` are the `--wasm` route options, the whole sandbox (one left
+out takes its default):
+
+| request | |
+|---|---|
+| `GET /api/routes[?after=<revision>]` | every route and the last failed reload of the files, as JSON; with `after` the current `revision`, held until they change (25s at most) |
+| `PUT /api/routes/<host>?name=<file>&<options>` | deploys the body, a component of 128MiB at most, to the host (replacing the console's route of the host) |
+| `PATCH /api/routes/<host>?<options>` | gives the console's route of the host another sandbox |
+| `DELETE /api/routes/<host>` | removes the console's route of the host |
+
+```text
+curl -T hello.wasm -H 'Authorization: Bearer SECRET' \
+    'http://127.0.0.1:9090/api/routes/hello.localhost?name=hello.wasm&wasi=cli,inherit-network'
+{"generation":2,"message":"added hello.localhost"}
+```
+
+An edit is answered 400 (a bad host name, option or body), 404 (no route of the console), 409
+(a host the config file or a flag routes), 413, 422 (the routes did not load with it; the
+reason follows) or 503 (draining). A host is dot-separated labels of `a-z`, `0-9` and `-`. A
+`wasi=keyvalue` route gets the default keyvalue map: the default store, the host as the
+namespace.
 
 ### Capabilities
 
@@ -505,6 +610,8 @@ Kubernetes, `terminationGracePeriodSeconds` (30s by default) bounds it the same 
 - file changes are seen by modification time, size and inode: a component rewritten
   in place with the same size within the file system's time granularity is missed
   until SIGHUP
+- the console has no TLS of its own, sets no keyvalue map but the default one, and keeps
+  its directory to one wicket (nothing locks it)
 
 ## Build note
 

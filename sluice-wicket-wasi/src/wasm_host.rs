@@ -301,6 +301,8 @@ pub struct Loaded {
     /// sha256 of the component's bytes, hex: a reload keeps the handler of a
     /// component whose digest did not change.
     digest: String,
+    /// The component's size in bytes.
+    size: usize,
 }
 
 impl Loaded {
@@ -310,6 +312,10 @@ impl Loaded {
 
     pub fn digest(&self) -> &str {
         &self.digest
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
     }
 }
 
@@ -356,13 +362,20 @@ impl Limits {
     /// Applies one `key=value` route option; false when the key is not a limit.
     fn set(&mut self, key: &str, value: &str) -> Result<bool, String> {
         let number = || -> Result<u64, String> {
-            value
-                .parse()
-                .map_err(|_| format!("{key}: not a number '{value}'"))
+            match value.parse() {
+                Ok(0) => Err(format!("{key}: must be at least 1")),
+                Ok(number) => Ok(number),
+                Err(_) => Err(format!("{key}: not a number '{value}'")),
+            }
         };
         match key {
-            "budget-ms" => self.budget = std::time::Duration::from_millis(number()?.max(1)),
-            "memory-mib" => self.memory = (number()? as usize) << 20,
+            "budget-ms" => self.budget = std::time::Duration::from_millis(number()?),
+            "memory-mib" => {
+                self.memory = number()?
+                    .checked_mul(1 << 20)
+                    .and_then(|bytes| usize::try_from(bytes).ok())
+                    .ok_or_else(|| format!("{key}: too large '{value}'"))?
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -402,7 +415,7 @@ impl Caps {
     const HTTP: &'static str = "http";
 
     /// Capability names in canonical order.
-    const NAMES: [&'static str; 6] = [
+    pub const NAMES: [&'static str; 6] = [
         "cli",
         "inherit-network",
         "allow-ip-name-lookup",
@@ -453,7 +466,7 @@ impl Caps {
     }
 
     /// The granted names in canonical order.
-    fn names(&self) -> Vec<&'static str> {
+    pub fn names(&self) -> Vec<&'static str> {
         let mut caps = *self;
         Caps::NAMES
             .into_iter()
@@ -499,11 +512,23 @@ impl Sandbox {
     /// Parses the route query
     /// (`budget-ms=N&instances=N&memory-mib=N&pool=N&wasi=cli,tcp`).
     pub fn parse(query: &str) -> Result<Sandbox, String> {
-        let mut sandbox = Sandbox::default();
+        let mut pairs = Vec::new();
         for pair in query.split('&').filter(|pair| !pair.is_empty()) {
-            let Some((key, value)) = pair.split_once('=') else {
+            let Some(pair) = pair.split_once('=') else {
                 return Err(format!("expected key=value in '{query}'"));
             };
+            pairs.push(pair);
+        }
+        Sandbox::from_pairs(pairs)
+    }
+
+    /// The sandbox of route options already split into `(key, value)` (see
+    /// [`Sandbox::parse`]).
+    pub fn from_pairs<'a>(
+        pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<Sandbox, String> {
+        let mut sandbox = Sandbox::default();
+        for (key, value) in pairs {
             let count = || -> Result<usize, String> {
                 value
                     .parse()
@@ -707,6 +732,7 @@ fn link(target: &str, bytes: &[u8], digest: String, caps: Caps) -> Result<Loaded
         service_pre,
         label,
         digest,
+        size: bytes.len(),
     })
 }
 
@@ -1660,6 +1686,10 @@ impl Handler {
 
     pub fn loaded(&self) -> &Arc<Loaded> {
         &self.loaded
+    }
+
+    pub fn sandbox(&self) -> &Sandbox {
+        &self.sandbox
     }
 
     /// Takes the handler out of service: its pool closes (idle units end at

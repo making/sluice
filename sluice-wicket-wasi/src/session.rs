@@ -781,8 +781,14 @@ mod tests {
             (table.target("a.local"), table.target("b.local"))
         };
         let (hangups, hangups_received) = mpsc::channel(1);
+        let (_requests, requests_received) = mpsc::channel(1);
         let stop = CancellationToken::new();
-        tokio::spawn(reloader.run(Duration::ZERO, hangups_received, stop.clone()));
+        tokio::spawn(reloader.run(
+            Duration::ZERO,
+            hangups_received,
+            requests_received,
+            stop.clone(),
+        ));
         let (mut stream, _events) = served_session(&shared).await;
         assert_eq!(stream.advertise().await.upstreams.len(), 2);
         stream.ack(false);
@@ -952,6 +958,7 @@ pub(crate) mod testing {
             host: "hello.local".into(),
             component: wasm_host::Locator::parse(hello.to_str().unwrap()).unwrap(),
             sandbox: wasm_host::Sandbox::default(),
+            origin: routes::Origin::Flag,
         }]);
         let reloader = Reloader::start(source, Instances::new(4)).await.unwrap();
         let (shared, limit) = shared_on(reloader.routes(), stall_timeout);

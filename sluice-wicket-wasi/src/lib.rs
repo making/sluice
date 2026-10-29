@@ -32,6 +32,10 @@
 //! mode). A `wasi=keyvalue` route's guest keeps state in the host's stores
 //! (`keyvalue`).
 //!
+//! `--console` serves a page and an API (`console`) deploying uploaded
+//! components as routes, through the same reload; they are kept in the
+//! console's directory (`deployed`) across restarts.
+//!
 //! Scope (deliberately minimal):
 //!
 //! - `grpc://` / `grpcs://` control plane (`--ca-cert` pins the CA,
@@ -50,9 +54,12 @@
 //!     --wasm relay.local='./relay.wasm?wasi=cli,inherit-network'
 //! sluice-wicket-wasi --config wicket-wasi.yaml
 //! sluice-wicket-wasi --listen 127.0.0.1:8080 --wasm 'counter.local=./counter.wasm?wasi=keyvalue'
+//! sluice-wicket-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090
 //! ```
 
 pub mod config;
+mod console;
+mod deployed;
 mod drain;
 mod keyvalue;
 mod listener;
@@ -76,6 +83,8 @@ pub mod proto {
     tonic::include_proto!("sluice.v1");
 }
 
+use console::Console;
+use deployed::Deployed;
 use drain::Drain;
 use proto::PeerBuild;
 use routes::Reloader;
@@ -173,10 +182,17 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         stall_timeout,
         drain_grace,
         watch_interval,
-        routes,
+        mut console,
+        mut routes,
     } = settings;
     println!("wicket build: {}", describe_build());
     let instances = Instances::new(max_instances);
+    if let Some(console) = &mut console {
+        let deployed = Deployed::open(&console.dir)?;
+        // named as it resolved from here on: the log says where the files are
+        console.dir = deployed.dir().to_path_buf();
+        routes.deploy(deployed);
+    }
 
     // Fetches / prewarms every route's component (fail fast) and builds its
     // handler on `instances`.
@@ -184,6 +200,10 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
     let routes = reloader.routes().clone();
     let listener = match &listen {
         Some(address) => Some(listener::bind(address).await?),
+        None => None,
+    };
+    let console_listener = match &console {
+        Some(console) => Some(console::bind(&console.address, console.token.is_some()).await?),
         None => None,
     };
     println!(
@@ -198,11 +218,11 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
     );
     let (hangups, hangups_received) = mpsc::channel(1);
     signals::forward_hangups(hangups)?;
+    let mut listening = None;
     if let Some(listener) = listener {
-        println!(
-            "listening on {} (http/1.1, h2c), {max_connections} connections at most",
-            listener.local_addr()?
-        );
+        let address = listener.local_addr()?;
+        println!("listening on {address} (http/1.1, h2c), {max_connections} connections at most");
+        listening = Some(address);
         tokio::spawn(listener::run(
             listener,
             routes.clone(),
@@ -210,10 +230,41 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
             max_connections,
         ));
     }
+    let (requests, requests_received) = mpsc::channel(8);
+    if let (Some(console), Some(listener)) = (console, console_listener) {
+        println!(
+            "console on http://{} ({}); its routes kept in {}",
+            listener.local_addr()?,
+            match console.token {
+                Some(_) => "--console-token required",
+                None => "loopback, no token",
+            },
+            console.dir.display()
+        );
+        tokio::spawn(console::run(
+            listener,
+            Arc::new(Console {
+                routes: routes.clone(),
+                status: reloader.status(),
+                requests,
+                token: console.token,
+                server: server.clone(),
+                listen: listening,
+            }),
+        ));
+    } else {
+        // no console: the reloader sees the channel closed, no edit comes
+        drop(requests);
+    }
     let Some(server) = server else {
         // local mode alone: nothing to drain, a signal ends the process
         reloader
-            .run(watch_interval, hangups_received, CancellationToken::new())
+            .run(
+                watch_interval,
+                hangups_received,
+                requests_received,
+                CancellationToken::new(),
+            )
             .await;
         return Ok(());
     };
@@ -248,8 +299,13 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
     );
     println!("drain grace {}s (0 = off)", drain_grace.as_secs());
 
-    // the drain stops the reloads: the routes are withdrawn
-    tokio::spawn(reloader.run(watch_interval, hangups_received, shared.drain.begin.clone()));
+    // the drain stops the reloads (the console's edits too): the routes are withdrawn
+    tokio::spawn(reloader.run(
+        watch_interval,
+        hangups_received,
+        requests_received,
+        shared.drain.begin.clone(),
+    ));
 
     let (tx, rx) = mpsc::channel(32);
     let supervisor = supervisor::supervise(rx, tx, shared.clone(), server);

@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en" data-link="live">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Sluice wicket</title>
+  <!-- the brand mark, palette pinned to the light theme (a favicon cannot read CSS variables) -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M3 9h9M3 23h9M20 9h9M20 23h9' fill='none' stroke='%23143b69' stroke-width='1.5'/%3E%3Cpath d='M12 9l4 7M12 23l4-7' fill='none' stroke='%23143b69' stroke-width='2.5' stroke-linecap='round'/%3E%3Cpath d='M2 16h8M22 16h8' fill='none' stroke='%231b86c2' stroke-width='1.5' stroke-dasharray='2 3'/%3E%3C/svg%3E">
+  <link rel="preload" href="/fonts/overpass.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/console.css">
+  <script type="module" src="/console.js"></script>
+</head>
+<body>
+<header class="masthead">
+  <a class="brand" href="/">
+    <svg class="brand__mark" viewBox="0 0 32 32" aria-hidden="true">
+      <path d="M3 9h9M3 23h9M20 9h9M20 23h9" fill="none" stroke="currentColor" stroke-width="1.5"/>
+      <path d="M12 9l4 7M12 23l4-7" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+      <path d="M2 16h8M22 16h8" fill="none" stroke="var(--water)" stroke-width="1.5" stroke-dasharray="2 3"/>
+    </svg>
+    <span class="brand__word">sluice</span>
+    <span class="brand__sub">wicket</span>
+  </a>
+  <div class="masthead__end">
+    <p class="masthead__build"><span class="masthead__label">Build</span> <span class="mono" data-field="build" data-testid="build">&hellip;</span></p>
+  </div>
+</header>
+
+<section class="sheet" aria-labelledby="intake-heading">
+  <!-- the drop zone, drawn as a section through a lock gate: dropping a component opens
+       its wicket and lets the water through -->
+  <div class="sheet__drawing intake" data-intake="idle" data-testid="drop-zone">
+    <div class="intake__text">
+      <h1 id="intake-heading" class="intake__lead">Drop a <span class="intake__kind">wasi:http</span> component</h1>
+      <p class="intake__hint">
+        <button type="button" class="intake__choose" data-action="choose">Choose a <span class="mono">.wasm</span> file</button>
+        <span>or drop it anywhere on this page.</span>
+      </p>
+      <div class="intake__notes">
+        <p class="intake__notes-title">Notes</p>
+        <ol>
+          <li>A wasi:http component (<span class="mono">wasm32-wasip3</span>) of at most <span data-field="limit">the upload limit</span>.</li>
+          <li>Compiled and checked before anything changes: if it fails, the routes stay as they were.</li>
+          <li>Served at once, without a restart. A host deployed here is replaced in place; routes of the config file and <span class="mono">--wasm</span> flags are read-only.</li>
+        </ol>
+      </div>
+    </div>
+    <svg class="drawing intake__drawing" viewBox="0 0 640 158" aria-hidden="true">
+      <defs>
+        <pattern id="hatch" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+          <line x1="0" y1="0" x2="0" y2="7" class="hatch-line"/>
+        </pattern>
+      </defs>
+      <!-- head water held against the gate, tail water below it -->
+      <rect class="intake__head" x="0" y="44" width="300" height="84"/>
+      <path class="intake__surface" d="M 0 44 H 300"/>
+      <path class="intake__level" d="M 34 34 h 12 l -6 8 z M 33 49 h 14 M 36 53 h 8"/>
+      <rect class="intake__tail" x="318" y="106" width="322" height="22"/>
+      <!-- the jet through the open wicket -->
+      <g class="intake__jet">
+        <path class="stream" d="M 226 97 H 318 C 352 97 374 102 436 108"/>
+        <path class="stream" d="M 226 104 H 318 C 356 104 382 109 480 114"/>
+        <path class="stream" d="M 226 111 H 318 C 350 111 378 116 456 121"/>
+      </g>
+      <!-- the gate leaf in section, its wicket opening between y 92 and 116 -->
+      <rect class="wall ink" pathLength="1" x="300" y="14" width="18" height="78"/>
+      <rect class="wall ink" pathLength="1" x="300" y="116" width="18" height="12"/>
+      <g class="wicket">
+        <path class="wicket__rod" d="M 294.5 0 V 89"/>
+        <rect class="wicket__paddle" x="290" y="89" width="9" height="30"/>
+      </g>
+      <!-- bed in section -->
+      <path class="ground ink" pathLength="1" d="M 0 128 H 640"/>
+      <rect class="ground__cut" x="0" y="128" width="640" height="9"/>
+      <!-- callout -->
+      <path class="leader" d="M 322 104 L 356 58 H 404"/>
+      <circle class="leader__dot" cx="322" cy="104" r="2"/>
+      <text class="strong" x="410" y="56">wicket</text>
+      <text class="detail" x="410" y="74" data-field="opening">clear opening &le; the upload limit</text>
+      <text class="caption" x="0" y="154">SECTION A&ndash;A, WICKET IN THE GATE LEAF</text>
+    </svg>
+    <input type="file" data-region="intake-file" accept=".wasm,application/wasm" hidden>
+  </div>
+  <div class="sheet__title">
+    <dl class="titleblock" data-testid="status">
+      <div class="titleblock__node"><dt>Generation</dt><dd class="num" data-field="generation">&ndash;</dd></div>
+      <div><dt>Routes</dt><dd class="num" data-field="route-count">&ndash;</dd></div>
+      <div><dt>Link</dt><dd><span class="link__live state">Live</span><span class="link__lost">Connection lost</span></dd></div>
+      <div><dt>Listen</dt><dd class="mono" data-field="listen">&ndash;</dd></div>
+      <div><dt>Server</dt><dd class="mono" data-field="server">&ndash;</dd></div>
+    </dl>
+  </div>
+</section>
+
+<main class="page">
+  <section class="banner" data-region="reload-failure" aria-labelledby="failure-heading" hidden>
+    <h2 id="failure-heading" class="banner__title">The routes&rsquo; files did not reload</h2>
+    <p class="banner__meta">
+      <span data-field="failure-reason"></span>, <time data-field="failure-at"></time>.
+      The routes stay as they were until a file changes again (or SIGHUP).
+    </p>
+    <pre class="banner__error" data-field="failure-error"></pre>
+  </section>
+
+  <section class="panel deploy" data-region="deploy" aria-labelledby="deploy-heading" hidden>
+    <h2 id="deploy-heading" class="rule-heading">Deploy <span class="mono deploy__file" data-field="deploy-file"></span></h2>
+    <form class="deploy__form" data-region="deploy-form" novalidate>
+      <p class="deploy__meta" data-field="deploy-meta"></p>
+      <!-- disabled as a whole while the component uploads and compiles -->
+      <fieldset class="deploy__fields" data-region="deploy-fields">
+        <legend class="visually-hidden">Route</legend>
+        <div class="field field--host">
+          <label for="deploy-host">Host</label>
+          <div class="field__control">
+            <input id="deploy-host" name="host" type="text" required autocomplete="off" autocapitalize="none"
+                   spellcheck="false" inputmode="url" aria-describedby="deploy-host-note">
+            <p id="deploy-host-note" class="field__note" data-field="host-note"></p>
+          </div>
+        </div>
+        <div data-slot="sandbox"></div>
+        <div class="deploy__actions">
+          <button type="submit" class="button button--primary" data-action="deploy">Deploy</button>
+          <button type="button" class="button" data-action="cancel">Cancel</button>
+        </div>
+      </fieldset>
+      <div data-slot="progress"></div>
+      <div data-slot="outcome"></div>
+    </form>
+  </section>
+
+  <section class="panel" aria-labelledby="routes-heading">
+    <h2 id="routes-heading" class="rule-heading">Routes</h2>
+    <p class="hint">Routes deployed here can be replaced by dropping a <span class="mono">.wasm</span> on their row. Routes from the config file and <span class="mono">--wasm</span> flags are read-only here.</p>
+    <div data-slot="routes-note"></div>
+    <div class="routes-frame">
+      <table class="grid routes" data-testid="routes">
+        <caption class="visually-hidden">Routes served by this wicket</caption>
+        <thead><tr><th scope="col">Host</th><th scope="col">Component</th><th scope="col">Sandbox</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr></thead>
+        <tbody data-region="routes-loading"><tr><td colspan="4" class="empty">Reading the routes&hellip;</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <p class="visually-hidden" data-region="announcer" aria-live="polite"></p>
+</main>
+<input type="file" data-region="replace-file" accept=".wasm,application/wasm" hidden>
+</body>
+</html>

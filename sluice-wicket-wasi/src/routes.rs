@@ -12,14 +12,18 @@
 //! (`NodeTask::stream`); a removed target stays resolvable until every stream
 //! acknowledged its removal, since the server may have routed a connection to
 //! it before, and its connections then shut down gracefully.
+//!
+//! The console changes its own routes through the same reload
+//! ([`Reloader::apply`]): the routes as they would be are reloaded first, and
+//! kept only when they loaded.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::RouteSource;
@@ -33,6 +37,28 @@ pub struct Spec {
     pub host: String,
     pub component: Locator,
     pub sandbox: Sandbox,
+    pub origin: Origin,
+}
+
+/// Where a route comes from.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Origin {
+    /// The `--config` file.
+    Config,
+    /// A `--wasm` flag.
+    Flag,
+    /// The console, which deployed it at `deployed` (RFC 3339).
+    Console { deployed: String },
+}
+
+impl std::fmt::Display for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Origin::Config => "the config file",
+            Origin::Flag => "a --wasm flag",
+            Origin::Console { .. } => "the console",
+        })
+    }
 }
 
 /// The advertised target of a route: the component locator plus its
@@ -60,10 +86,19 @@ pub struct Table {
     pub generation: u64,
     /// The upstreams every stream advertises.
     pub advertised: Vec<Upstream>,
+    /// Host -> where its route comes from, for each advertised host.
+    pub origins: HashMap<String, Origin>,
     /// Target (`wasm:<locator>[?<sandbox>]`, the dial address) -> its entry:
     /// the advertised targets, plus removed ones until every stream
     /// acknowledged their removal.
     entries: HashMap<String, Entry>,
+}
+
+impl Table {
+    /// The handler serving `target`.
+    pub fn handler(&self, target: &str) -> Option<&Arc<Handler>> {
+        self.entries.get(target).map(|entry| &entry.handler)
+    }
 }
 
 /// The current [`Table`], shared by every node stream and connection, and the
@@ -91,6 +126,7 @@ impl Routes {
         Routes::new(Table {
             generation: 1,
             advertised: Vec::new(),
+            origins: HashMap::new(),
             entries: handlers
                 .into_iter()
                 .map(|(target, handler)| {
@@ -252,11 +288,108 @@ impl std::fmt::Display for Change {
     }
 }
 
-/// Reloads the routes, on a change of the files they come from (polled) or
-/// on request (SIGHUP), and retires the targets removed once the streams
-/// acknowledged it. Reloads run one at a time, on this task.
+/// What the console shows of the reloads besides the table.
+#[derive(Clone, Default)]
+pub struct Status {
+    /// Changes with every change the console shows: a table published, a
+    /// reload of the files failing, or the next reload succeeding.
+    pub revision: u64,
+    /// The last reload of the files that failed, unless one succeeded since.
+    pub failure: Option<Failure>,
+}
+
+/// A failed reload of the files.
+#[derive(Clone)]
+pub struct Failure {
+    /// What started it: `file change` or `SIGHUP`.
+    pub reason: String,
+    pub error: String,
+    pub at: SystemTime,
+}
+
+/// A change of the console's routes, and where its outcome goes.
+pub struct Request {
+    pub edit: Edit,
+    pub reply: oneshot::Sender<Result<Outcome, Refused>>,
+}
+
+/// A change of the console's routes.
+pub enum Edit {
+    /// Serves `host` by the uploaded `component` (named `name`) in `sandbox`.
+    Deploy {
+        host: String,
+        name: String,
+        component: bytes::Bytes,
+        sandbox: Sandbox,
+    },
+    /// Gives the console's route of `host` another sandbox.
+    Sandbox { host: String, sandbox: Sandbox },
+    /// Removes the console's route of `host`.
+    Remove { host: String },
+}
+
+impl Edit {
+    fn host(&self) -> &str {
+        match self {
+            Edit::Deploy { host, .. } | Edit::Sandbox { host, .. } | Edit::Remove { host } => host,
+        }
+    }
+
+    /// How the log names it; not by the name uploaded, which may hold
+    /// anything (the component's file name is logged as it is kept).
+    fn describe(&self) -> String {
+        match self {
+            Edit::Deploy { host, .. } => format!("console: deploy to {host}"),
+            Edit::Sandbox { host, .. } => format!("console: sandbox of {host}"),
+            Edit::Remove { host } => format!("console: remove {host}"),
+        }
+    }
+}
+
+/// An edit the routes took.
+#[derive(Debug, PartialEq)]
+pub struct Outcome {
+    /// The generation serving it.
+    pub generation: u64,
+    /// None when it changed nothing.
+    pub change: Option<Change>,
+}
+
+/// Why an edit was refused; the routes stay as they were.
+#[derive(Debug, PartialEq)]
+pub enum Refused {
+    /// The edit is malformed.
+    Invalid(String),
+    /// The console routes no such host.
+    Unknown(String),
+    /// Another source routes the host.
+    Taken(String),
+    /// The routes did not load with it: the reload's error.
+    Rejected(String),
+    /// The console's directory failed.
+    Failed(String),
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::Invalid(message)
+            | Refused::Unknown(message)
+            | Refused::Taken(message)
+            | Refused::Rejected(message)
+            | Refused::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+/// Reloads the routes, on a change of the files they come from (polled), on
+/// request (SIGHUP) or on an edit of the console's routes, and retires the
+/// targets removed once the streams acknowledged it. Reloads run one at a
+/// time, on this task.
 pub struct Reloader {
     routes: Arc<Routes>,
+    /// What the console shows of the reloads.
+    status: watch::Sender<Status>,
     instances: Arc<Instances>,
     /// The keyvalue stores the routes' maps name.
     stores: Arc<keyvalue::Stores>,
@@ -280,8 +413,10 @@ impl Reloader {
             routes: Routes::new(Table {
                 generation: 0,
                 advertised: Vec::new(),
+                origins: HashMap::new(),
                 entries: HashMap::new(),
             }),
+            status: watch::Sender::new(Status::default()),
             instances,
             stores: source.stores().clone(),
             source,
@@ -299,13 +434,19 @@ impl Reloader {
         &self.routes
     }
 
+    /// Follows what the console shows of the reloads.
+    pub fn status(&self) -> watch::Receiver<Status> {
+        self.status.subscribe()
+    }
+
     /// Reloads until `stop`: polls the watched files every `interval` (zero:
-    /// never) and reloads on each `hangups` message, re-fetching remote
-    /// components too.
+    /// never), reloads on each `hangups` message, re-fetching remote
+    /// components too, and applies each of the console's `requests`.
     pub async fn run(
         mut self,
         interval: Duration,
         mut hangups: mpsc::Receiver<()>,
+        mut requests: mpsc::Receiver<Request>,
         stop: CancellationToken,
     ) {
         let mut ticks = (!interval.is_zero()).then(|| {
@@ -315,6 +456,7 @@ impl Reloader {
             ticks
         });
         let mut hangups_open = true;
+        let mut requests_open = true;
         loop {
             let oldest = self.lingering.values().min().copied();
             let routes = self.routes.clone();
@@ -330,6 +472,12 @@ impl Reloader {
                     Some(()) => self.reload_logged("SIGHUP", true).await,
                     None => hangups_open = false,
                 },
+                request = requests.recv(), if requests_open => match request {
+                    Some(Request { edit, reply }) => {
+                        let _ = reply.send(self.apply(edit).await);
+                    }
+                    None => requests_open = false,
+                },
                 _ = async { ticks.as_mut().expect("polling").tick().await }, if ticks.is_some() => {
                     if self.poll().await {
                         self.reload_logged("file change", false).await;
@@ -342,15 +490,97 @@ impl Reloader {
 
     async fn reload_logged(&mut self, reason: &str, refetch: bool) {
         match self.reload(refetch).await {
-            Ok(Some(change)) => println!(
-                "routes reloaded ({reason}), generation {}: {change}",
-                self.routes.current().generation
-            ),
-            Ok(None) => println!("routes reload ({reason}): no change"),
-            Err(e) => eprintln!(
-                "routes reload ({reason}) failed; keeping generation {}: {e}",
-                self.routes.current().generation
-            ),
+            Ok(change) => {
+                log_reloaded(reason, self.routes.current().generation, &change);
+                self.recovered();
+            }
+            Err(e) => {
+                log_failed(reason, self.routes.current().generation, &e);
+                self.status.send_modify(|status| {
+                    status.revision += 1;
+                    status.failure = Some(Failure {
+                        reason: reason.to_string(),
+                        error: e,
+                        at: SystemTime::now(),
+                    });
+                });
+            }
+        }
+    }
+
+    /// A reload read every route: a failure shown before is over.
+    fn recovered(&self) {
+        self.status.send_if_modified(|status| {
+            if status.failure.is_none() {
+                return false;
+            }
+            status.revision += 1;
+            status.failure = None;
+            true
+        });
+    }
+
+    /// Applies an edit of the console's routes: the component written, the
+    /// routes as they would be are reloaded, and kept -- written to the
+    /// console's directory -- only when they loaded; refused, the routes and
+    /// the directory stay as they were.
+    pub async fn apply(&mut self, edit: Edit) -> Result<Outcome, Refused> {
+        let reason = edit.describe();
+        let current = self.routes.current();
+        if let Some(origin @ (Origin::Config | Origin::Flag)) = current.origins.get(edit.host()) {
+            return Err(Refused::Taken(format!(
+                "{} is routed by {origin}, not by the console",
+                edit.host()
+            )));
+        }
+        let deployed = self
+            .source
+            .deployed()
+            .expect("edits come from the console, which deploys");
+        let edited = match edit {
+            Edit::Deploy {
+                host,
+                name,
+                component,
+                sandbox,
+            } => deployed.deploy(&host, &name, &component, sandbox, SystemTime::now()),
+            Edit::Sandbox { host, sandbox } => {
+                deployed.with_sandbox(&host, sandbox, SystemTime::now())
+            }
+            Edit::Remove { host } => deployed.without(&host),
+        }?;
+        if &edited == deployed {
+            return Ok(Outcome {
+                generation: current.generation,
+                change: None,
+            });
+        }
+        let previous = self.source.deploy(edited).expect("the console's routes");
+        let watched = self.watched.clone();
+        match self.reload(false).await {
+            Ok(change) => {
+                let generation = self.routes.current().generation;
+                log_reloaded(&reason, generation, &change);
+                self.recovered();
+                let deployed = self.source.deployed().expect("just deployed");
+                let saved = deployed.save();
+                deployed.collect_garbage();
+                saved.map_err(|e| {
+                    eprintln!("{reason}: {e}");
+                    Refused::Failed(e)
+                })?;
+                Ok(Outcome { generation, change })
+            }
+            Err(e) => {
+                log_failed(&reason, current.generation, &e);
+                // the files a failed reload stamped were read for an edit
+                // that is not kept
+                self.watched = watched;
+                self.source.deploy(previous);
+                let deployed = self.source.deployed().expect("restored");
+                deployed.collect_garbage();
+                Err(Refused::Rejected(e))
+            }
         }
     }
 
@@ -411,6 +641,7 @@ impl Reloader {
         let current = self.routes.current();
         let mut plan = Plan {
             advertised: Vec::with_capacity(specs.len()),
+            origins: HashMap::new(),
             targets: Vec::new(),
         };
         let mut seen = HashSet::new();
@@ -429,6 +660,7 @@ impl Reloader {
                 rewrite_host: false,
                 ..Default::default()
             });
+            plan.origins.insert(spec.host.clone(), spec.origin.clone());
             // routes on one target share its handler: one pool, one cap
             if !seen.insert(target.clone()) {
                 continue;
@@ -480,6 +712,7 @@ impl Reloader {
     fn commit(&mut self, plan: Plan) -> Option<Change> {
         let current = self.routes.current();
         let unchanged = plan.advertised == current.advertised
+            && plan.origins == current.origins
             && plan
                 .targets
                 .iter()
@@ -531,8 +764,10 @@ impl Reloader {
         self.routes.publish(Table {
             generation,
             advertised: plan.advertised,
+            origins: plan.origins,
             entries,
         });
+        self.status.send_modify(|status| status.revision += 1);
         for handler in replaced {
             handler.retire();
         }
@@ -560,6 +795,7 @@ impl Reloader {
         self.routes.publish(Table {
             generation: current.generation,
             advertised: current.advertised.clone(),
+            origins: current.origins.clone(),
             entries,
         });
         for token in tokens {
@@ -570,6 +806,17 @@ impl Reloader {
             gone.join(", ")
         );
     }
+}
+
+fn log_reloaded(reason: &str, generation: u64, change: &Option<Change>) {
+    match change {
+        Some(change) => println!("routes reloaded ({reason}), generation {generation}: {change}"),
+        None => println!("routes reload ({reason}): no change"),
+    }
+}
+
+fn log_failed(reason: &str, generation: u64, error: &str) {
+    eprintln!("routes reload ({reason}) failed; keeping generation {generation}: {error}");
 }
 
 /// Reads the routes of `source`, stamping its config file before the read.
@@ -584,10 +831,12 @@ async fn read(source: &RouteSource, watched: &mut Stamps) -> Result<Vec<Spec>, S
     Ok(specs)
 }
 
-/// The routes resolved by a reload: what to advertise, and each distinct
-/// target in order with its sandbox and handler.
+/// The routes resolved by a reload: what to advertise (and where each host's
+/// route comes from), and each distinct target in order with its sandbox and
+/// handler.
 struct Plan {
     advertised: Vec<Upstream>,
+    origins: HashMap<String, Origin>,
     targets: Vec<(String, Sandbox, Planned)>,
 }
 
@@ -660,10 +909,6 @@ pub(crate) mod tests {
             self.entries.len()
         }
 
-        pub(crate) fn handler(&self, target: &str) -> Option<&Arc<Handler>> {
-            self.entries.get(target).map(|entry| &entry.handler)
-        }
-
         /// The advertised target of `host`.
         pub(crate) fn target(&self, host: &str) -> String {
             self.advertised
@@ -679,6 +924,7 @@ pub(crate) mod tests {
             Table {
                 generation,
                 advertised,
+                origins: HashMap::new(),
                 entries: HashMap::new(),
             }
         }
@@ -731,6 +977,7 @@ pub(crate) mod tests {
                 instances: Some(1),
                 ..Sandbox::default()
             },
+            origin: Origin::Flag,
         };
         let instances = Instances::new(4);
         let source = RouteSource::flags(vec![route("a.local"), route("b.local")]);
@@ -945,6 +1192,206 @@ pub(crate) mod tests {
         assert_eq!(reloader.reload(true).await, Ok(None), "back as it was");
     }
 
+    /// The console's edits reload the routes with them and are kept -- the
+    /// routes file written, a component under its digest -- only when they
+    /// load: a deploy adds a route, the same upload again changes nothing,
+    /// other content or another sandbox retargets it (the replaced component
+    /// removed), a removal removes it. A host another source routes, a
+    /// component that does not compile, pools past the limit, an unknown host
+    /// and no host name are refused: the table, the routes file and the
+    /// components stay as they were. A failed reload of the files shows until
+    /// a reload reads every route again. A restart serves the routes kept,
+    /// their sandboxes and times included, and removes the files no route
+    /// names.
+    #[tokio::test]
+    async fn the_consoles_edits_are_kept_only_when_they_load() {
+        use crate::deployed::Deployed;
+        use sha2::Digest as _;
+        let dir = Scratch::new("console");
+        dir.guest("a.wasm", "hello");
+        let path = dir.write("wicket.yaml", config(&[("a.local", "a.wasm", "")]));
+        let hello = std::fs::read(guest_wasm("hello")).unwrap();
+        let fetch = std::fs::read(guest_wasm("fetch")).unwrap();
+        let deployed = dir.0.join("deployed");
+        let source = || {
+            let mut source = RouteSource::file(&path).unwrap();
+            source.deploy(Deployed::open(&deployed).unwrap());
+            source
+        };
+        let mut reloader = Reloader::start(source(), Instances::new(4)).await.unwrap();
+        let status = reloader.status();
+        let deploy = |host: &str, component: &[u8], sandbox: &str| Edit::Deploy {
+            host: host.into(),
+            name: "hello.wasm".into(),
+            component: bytes::Bytes::copy_from_slice(component),
+            sandbox: Sandbox::parse(sandbox).unwrap(),
+        };
+        let components = || {
+            let mut files = Vec::new();
+            for digest in std::fs::read_dir(deployed.join("components")).unwrap() {
+                let digest = digest.unwrap();
+                for file in std::fs::read_dir(digest.path()).unwrap() {
+                    files.push(format!(
+                        "{}/{}",
+                        digest.file_name().to_string_lossy(),
+                        file.unwrap().file_name().to_string_lossy()
+                    ));
+                }
+            }
+            files.sort();
+            files
+        };
+        let manifest = || std::fs::read_to_string(deployed.join("routes.yaml")).unwrap_or_default();
+        assert_eq!(manifest(), "", "precondition: nothing deployed yet");
+
+        let outcome = reloader.apply(deploy("b.local", &hello, "")).await;
+        assert_eq!(
+            outcome,
+            Ok(Outcome {
+                generation: 2,
+                change: Some(Change {
+                    added: vec!["b.local".into()],
+                    ..Change::default()
+                }),
+            })
+        );
+        let table = reloader.routes().current();
+        let digest: String = sha2::Sha256::digest(&hello)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let target = table.target("b.local");
+        assert!(
+            target.ends_with(&format!("/components/{digest}/hello.wasm")),
+            "{target}"
+        );
+        assert!(matches!(
+            table.origins.get("b.local"),
+            Some(Origin::Console { .. })
+        ));
+        assert_eq!(table.origins.get("a.local"), Some(&Origin::Config));
+        assert_eq!(components(), [format!("{digest}/hello.wasm")]);
+        assert!(manifest().contains("host: \"b.local\""), "{}", manifest());
+        let revision = status.borrow().revision;
+        assert_eq!(
+            reloader.apply(deploy("b.local", &hello, "")).await,
+            Ok(Outcome {
+                generation: 2,
+                change: None,
+            })
+        );
+
+        let change = reloader.apply(deploy("b.local", &fetch, "")).await.unwrap();
+        assert_eq!(change.change.unwrap().retargeted, ["b.local"]);
+        assert_eq!(components().len(), 1, "the replaced component removed");
+        let resandboxed = Edit::Sandbox {
+            host: "b.local".into(),
+            sandbox: Sandbox::parse("pool=1&wasi=keyvalue").unwrap(),
+        };
+        let change = reloader.apply(resandboxed).await.unwrap();
+        assert_eq!(change.change.unwrap().retargeted, ["b.local"]);
+        let table = reloader.routes().current();
+        let sandbox = table
+            .handler(&table.target("b.local"))
+            .unwrap()
+            .sandbox()
+            .clone();
+        assert_eq!(sandbox.pool, 1);
+        assert_eq!(
+            sandbox.keyvalue[""].namespace, "b.local",
+            "the default map, the host as the namespace"
+        );
+        assert!(status.borrow().revision > revision, "the console sees it");
+
+        let before = (reloader.routes().current(), manifest(), components());
+        let refusals = [
+            (
+                deploy("a.local", &hello, ""),
+                Refused::Taken(String::new()),
+                "a.local is routed by the config file, not by the console",
+            ),
+            (
+                deploy("c.local", &hello[..100], ""),
+                Refused::Rejected(String::new()),
+                "wasm route 'c.local': component ",
+            ),
+            (
+                deploy("c.local", &hello, "pool=5"),
+                Refused::Rejected(String::new()),
+                "more than --max-instances 4",
+            ),
+            (
+                Edit::Remove {
+                    host: "x.local".into(),
+                },
+                Refused::Unknown(String::new()),
+                "the console routes no host 'x.local'",
+            ),
+            (
+                deploy("a_b", &hello, ""),
+                Refused::Invalid(String::new()),
+                "'a_b' is no host name",
+            ),
+        ];
+        for (edit, kind, error) in refusals {
+            let refused = reloader.apply(edit).await.unwrap_err();
+            assert!(
+                std::mem::discriminant(&refused) == std::mem::discriminant(&kind)
+                    && refused.to_string().contains(error),
+                "{error}: {refused:?}"
+            );
+            assert!(
+                Arc::ptr_eq(&before.0, &reloader.routes().current()),
+                "{error}: the table stays"
+            );
+            assert_eq!(
+                (manifest(), components()),
+                (before.1.clone(), before.2.clone()),
+                "{error}: the routes file and the components stay"
+            );
+        }
+
+        dir.write(
+            "wicket.yaml",
+            config(&[("a.local", "a.wasm", ""), ("b.local", "a.wasm", "")]),
+        );
+        reloader.reload_logged("file change", false).await;
+        let failure = status.borrow().failure.clone().expect("shown");
+        assert!(
+            failure.error.contains(
+                "route host 'b.local' is configured twice: by the config file and by the console"
+            ),
+            "{}",
+            failure.error
+        );
+        dir.write("wicket.yaml", config(&[("a.local", "a.wasm", "")]));
+        let removed = Edit::Remove {
+            host: "b.local".into(),
+        };
+        let change = reloader.apply(removed).await.unwrap();
+        assert_eq!(change.change.unwrap().removed, ["b.local"]);
+        assert!(status.borrow().failure.is_none(), "read every route again");
+        assert_eq!(components(), Vec::<String>::new());
+        assert!(manifest().ends_with("routes: []\n"), "{}", manifest());
+
+        let sandbox = "budget-ms=250&instances=2&memory-mib=64&pool=1&wasi=cli,keyvalue";
+        reloader
+            .apply(deploy("d.local", &hello, sandbox))
+            .await
+            .unwrap();
+        let kept = reloader.routes().current();
+        // what a crash between an upload and the routes file leaves
+        let components_dir = deployed.join("components");
+        std::fs::create_dir_all(components_dir.join("0".repeat(64))).unwrap();
+        std::fs::write(components_dir.join("0".repeat(64)).join("lost.wasm"), "").unwrap();
+        std::fs::write(components_dir.join(&digest).join(".hello.wasm.partial"), "").unwrap();
+        let restarted = Reloader::start(source(), Instances::new(4)).await.unwrap();
+        let table = restarted.routes().current();
+        assert_eq!(table.advertised, kept.advertised, "the same targets");
+        assert_eq!(table.origins, kept.origins, "deployed at the same time");
+        assert_eq!(components(), [format!("{digest}/hello.wasm")]);
+    }
+
     /// A change of a watched file is reloaded once a poll saw it unchanged
     /// since the previous one, not while it keeps changing; the reloader's
     /// task does so on its interval. The routes may start empty.
@@ -979,8 +1426,13 @@ pub(crate) mod tests {
         let mut table = routes.subscribe();
         let stop = CancellationToken::new();
         let (_hangups, hangups_received) = mpsc::channel(1);
-        let task =
-            tokio::spawn(reloader.run(Duration::from_millis(20), hangups_received, stop.clone()));
+        let (_requests, requests_received) = mpsc::channel(1);
+        let task = tokio::spawn(reloader.run(
+            Duration::from_millis(20),
+            hangups_received,
+            requests_received,
+            stop.clone(),
+        ));
         tokio::time::timeout(
             Duration::from_secs(10),
             table.wait_for(|table| table.generation == 3),

@@ -952,7 +952,7 @@ its discovery document advertises an `end_session_endpoint`; register
 - `sluice-proto` - `.proto` contract, generated stubs, and the shared tunnel primitives (`VirtualConnection`, `SessionSender`, `SocketRelay`)
 - `sluice-server` - exit node: gRPC control plane (`spring.grpc.server.port`, default 8001) + raw TCP data plane (`sluice.data-port`, default 8000) + actuator and management console (`server.port`, default 8081)
 - `sluice-client` - tunnel client: connects to the server, advertises upstreams, dials local upstreams on CONNECT, reconnects with jittered exponential backoff (ceiling 1s..30s, each wait drawn from its upper half), actuator on `server.port` (default 9001)
-- `sluice-wicket-wasi` - experimental Rust client: like `sluice-client` on the tunnel side, but terminates HTTP and hands each request to a `wasi:http` component (wasmtime) instead of dialing a TCP upstream (also without a server: `--listen`; state in `wasi:keyvalue`); see its README
+- `sluice-wicket-wasi` - experimental Rust client: like `sluice-client` on the tunnel side, but terminates HTTP and hands each request to a `wasi:http` component (wasmtime) instead of dialing a TCP upstream (also without a server: `--listen`; state in `wasi:keyvalue`; components deployed from its console by drag and drop: `--console`); see its README
 - `sluice-it` - full stack integration tests running the real server and client applications in one JVM (proxying, reconnect after server restart, wrong-token rejection)
 - `sluice-example-upstream` - minimal sample upstream for manual checks (`It works` over http/1.1 and h2c)
 
