@@ -353,10 +353,19 @@ pub struct Failure {
     pub at: SystemTime,
 }
 
-/// A change of the console's routes or apps, and where its outcome goes.
-pub struct Request {
-    pub edit: Edit,
-    pub reply: oneshot::Sender<Result<Outcome, Refused>>,
+/// A change of the console's routes or apps, or a purge of a keyvalue
+/// namespace, and where its outcome goes. Both run on the reloader's task: no
+/// route maps a namespace while it is purged.
+pub enum Request {
+    Edit {
+        edit: Edit,
+        reply: oneshot::Sender<Result<Outcome, Refused>>,
+    },
+    /// Deletes the data of the namespace: the keys it held.
+    Purge {
+        place: keyvalue::Place,
+        reply: oneshot::Sender<Result<u64, Refused>>,
+    },
 }
 
 /// A change of the console's routes (the page's, one host each) or of its
@@ -418,15 +427,17 @@ pub struct Outcome {
 pub enum Refused {
     /// The edit is malformed.
     Invalid(String),
-    /// The console routes no such host, or has no such app.
+    /// The console routes no such host, has no such app, or there is no
+    /// such keyvalue store.
     Unknown(String),
-    /// Another source routes the host, or another owner has the app.
+    /// Another source routes the host, another owner has the app, or a
+    /// route maps the keyvalue namespace.
     Taken(String),
     /// No component of this digest (sha256) is kept: it takes an upload.
     Missing(String),
     /// The routes did not load with it: the reload's error.
     Rejected(Unloaded),
-    /// The console's directory failed.
+    /// The console's directory or the keyvalue store failed.
     Failed(String),
 }
 
@@ -545,8 +556,11 @@ impl Reloader {
                     None => hangups_open = false,
                 },
                 request = requests.recv(), if requests_open => match request {
-                    Some(Request { edit, reply }) => {
+                    Some(Request::Edit { edit, reply }) => {
                         let _ = reply.send(self.apply(edit).await);
+                    }
+                    Some(Request::Purge { place, reply }) => {
+                        let _ = reply.send(self.purge(&place).await);
                     }
                     None => requests_open = false,
                 },
@@ -661,6 +675,56 @@ impl Reloader {
                 let deployed = self.source.deployed().expect("restored");
                 deployed.collect_garbage();
                 Err(Refused::Rejected(e))
+            }
+        }
+    }
+
+    /// Deletes the data of the keyvalue namespace `place`: the keys it held.
+    /// Refused while a route maps it -- one being drained included, as it may
+    /// still serve -- so no route loses its data under it.
+    pub async fn purge(&mut self, place: &keyvalue::Place) -> Result<u64, Refused> {
+        let named = format!("{}/{}", place.store, place.namespace);
+        self.stores
+            .known(&place.store)
+            .map_err(|e| Refused::Unknown(format!("{named}: {e}")))?;
+        let table = self.routes.current();
+        let mut users: Vec<&str> = Vec::new();
+        for (target, entry) in &table.entries {
+            if !entry
+                .handler
+                .sandbox()
+                .keyvalue
+                .values()
+                .any(|mapped| mapped == place)
+            {
+                continue;
+            }
+            let hosts = table
+                .advertised
+                .iter()
+                .filter(|up| up.target_url == *target);
+            let before = users.len();
+            users.extend(hosts.map(|up| up.host.as_str()));
+            if users.len() == before {
+                users.push("a route being drained");
+            }
+        }
+        if !users.is_empty() {
+            users.sort_unstable();
+            users.dedup();
+            return Err(Refused::Taken(format!(
+                "the keyvalue namespace {named} is mapped by {}",
+                users.join(", ")
+            )));
+        }
+        match self.stores.purge(place).await {
+            Ok(keys) => {
+                println!("api: purged the keyvalue namespace {named}: {keys} key(s)");
+                Ok(keys)
+            }
+            Err(e) => {
+                eprintln!("api: purging the keyvalue namespace {named} failed: {e}");
+                Err(Refused::Failed(e))
             }
         }
     }
@@ -1339,7 +1403,8 @@ pub(crate) mod tests {
     /// component by its path in the directory. A failed reload of the files
     /// shows until a reload reads every route again. A restart serves the
     /// routes and apps kept, their sandboxes and times included, and removes
-    /// the files nothing names and the uploads kept long enough.
+    /// the files nothing names and the uploads kept long enough. A keyvalue
+    /// namespace is purged only once no route maps it, a drained one included.
     #[tokio::test]
     async fn the_consoles_edits_are_kept_only_when_they_load() {
         use crate::deployed::{Deployed, app_map};
@@ -1794,6 +1859,43 @@ pub(crate) mod tests {
         assert!(!stale.exists(), "an upload a day old goes");
         let fresh = deployed.join("uploads").join(format!("{digest}.wasm"));
         assert!(fresh.exists(), "a fresh one stays");
+
+        // a keyvalue namespace is purged once no route maps it, one being
+        // drained included
+        let shops = keyvalue::Place {
+            store: "local".into(),
+            namespace: "cf/7f3c-guid".into(),
+        };
+        let mapped = |by: &str| {
+            Err(Refused::Taken(format!(
+                "the keyvalue namespace local/cf/7f3c-guid is mapped by {by}"
+            )))
+        };
+        assert_eq!(reloader.purge(&shops).await, mapped("s1.local"));
+        let other = keyvalue::Place {
+            namespace: "cf/other".into(),
+            ..shops.clone()
+        };
+        assert_eq!(reloader.purge(&other).await, Ok(0));
+        let unknown = keyvalue::Place {
+            store: "nope".into(),
+            ..shops.clone()
+        };
+        assert!(matches!(
+            reloader.purge(&unknown).await,
+            Err(Refused::Unknown(message)) if message.contains("unknown keyvalue store 'nope'")
+        ));
+        let deleted = Edit::DeleteApp {
+            name: "shop".into(),
+            owner: "cf".into(),
+        };
+        reloader.apply(deleted).await.unwrap();
+        assert_eq!(
+            reloader.purge(&shops).await,
+            mapped("a route being drained")
+        );
+        reloader.expire(reloader.routes().current().generation);
+        assert_eq!(reloader.purge(&shops).await, Ok(0));
     }
 
     /// A change of a watched file is reloaded once a poll saw it unchanged

@@ -17,11 +17,14 @@
 //! GET    /api/apps[?after=<revision>]           the apps, as `/api/routes`
 //! PUT    /api/apps/<name>                       serves the app the body (JSON) has
 //! DELETE /api/apps/<name>?owner=<owner>         removes the app
+//! DELETE /api/keyvalue/<store>/<namespace>      deletes the data of a namespace no route maps
 //! ```
 //!
 //! The options are the `--wasm` route's (`budget-ms`, `instances`,
 //! `memory-mib`, `pool`, `wasi`), the whole sandbox: an option left out takes
-//! its default. An app's sandbox is the same in JSON, with its keyvalue map.
+//! its default. An app's sandbox is the same in JSON, with its keyvalue map;
+//! the apps' listing names what a sandbox may hold (the capabilities and the
+//! keyvalue stores), as the routes' does.
 //!
 //! With `--console-token` every request needs the token, as the password of
 //! HTTP Basic (any user name: the browser asks for it) or as a Bearer token.
@@ -47,7 +50,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::deployed::{self, AppSpec, rfc3339};
-use crate::keyvalue::Stores;
+use crate::keyvalue::{Place, Stores};
 use crate::routes::{Edit, Origin, Outcome, Refused, Request, Routes, Status};
 use crate::wasm_host::{Caps, Limits, Sandbox};
 
@@ -204,6 +207,14 @@ impl Console {
                         Method::PUT => self.upload(sha256, parts, take()).await,
                         _ => error(StatusCode::METHOD_NOT_ALLOWED, "a component takes PUT"),
                     }
+                } else if let Some(place) = path.strip_prefix("/api/keyvalue/") {
+                    match *method {
+                        Method::DELETE => self.purge(place).await,
+                        _ => error(
+                            StatusCode::METHOD_NOT_ALLOWED,
+                            "a keyvalue namespace takes DELETE",
+                        ),
+                    }
                 } else {
                     error(StatusCode::NOT_FOUND, format!("nothing at {path}"))
                 }
@@ -329,16 +340,7 @@ impl Console {
                 budget_ms: defaults.budget.as_millis(),
                 memory_mib: defaults.memory >> 20,
             },
-            keyvalue_stores: self
-                .stores
-                .described()
-                .into_iter()
-                .map(|(name, kind, default)| StoreView {
-                    name: name.to_string(),
-                    kind,
-                    default,
-                })
-                .collect(),
+            keyvalue_stores: self.store_views(),
             reload_failure: status.failure.as_ref().map(|failure| FailureView {
                 reason: failure.reason.clone(),
                 error: failure.error.clone(),
@@ -383,8 +385,23 @@ impl Console {
         AppsView {
             revision: status.revision,
             generation: table.generation,
+            capabilities: &Caps::NAMES,
+            keyvalue_stores: self.store_views(),
             apps,
         }
+    }
+
+    /// The keyvalue stores an app's map may name.
+    fn store_views(&self) -> Vec<StoreView> {
+        self.stores
+            .described()
+            .into_iter()
+            .map(|(name, kind, default)| StoreView {
+                name: name.to_string(),
+                kind,
+                default,
+            })
+            .collect()
     }
 
     async fn deploy(&self, host: &str, parts: &Parts, body: Incoming) -> Response {
@@ -536,20 +553,64 @@ impl Console {
         }
     }
 
+    /// Deletes the data of the keyvalue namespace `place`
+    /// (`<store>/<namespace>`, percent-decoded: the namespace may hold `/`).
+    async fn purge(&self, place: &str) -> Response {
+        let place = percent_encoding::percent_decode_str(place).decode_utf8_lossy();
+        let place = match place.split_once('/') {
+            Some((store, namespace)) if !store.is_empty() && !namespace.is_empty() => Place {
+                store: store.to_string(),
+                namespace: namespace.to_string(),
+            },
+            _ => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    format!("'{place}' is no keyvalue <store>/<namespace>"),
+                );
+            }
+        };
+        let (reply, purged) = oneshot::channel();
+        let request = Request::Purge {
+            place: place.clone(),
+            reply,
+        };
+        match self.reloader(request, purged).await {
+            Ok(keys) => json(
+                StatusCode::OK,
+                &Purged {
+                    store: place.store,
+                    namespace: place.namespace,
+                    keys,
+                },
+            ),
+            Err(refused) => refused.into(),
+        }
+    }
+
     /// Has the reloader apply `edit`: its outcome, or the answer refusing it.
     async fn request(&self, edit: Edit) -> Result<Outcome, Refusal> {
+        let (reply, outcome) = oneshot::channel();
+        self.reloader(Request::Edit { edit, reply }, outcome).await
+    }
+
+    /// Sends `request` to the reloader: what it answers on `answer`, or the
+    /// answer refusing it.
+    async fn reloader<T>(
+        &self,
+        request: Request,
+        answer: oneshot::Receiver<Result<T, Refused>>,
+    ) -> Result<T, Refusal> {
         let draining = || {
             Refusal::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "the wicket is draining: its routes change no more",
             )
         };
-        let (reply, outcome) = oneshot::channel();
-        if self.requests.send(Request { edit, reply }).await.is_err() {
+        if self.requests.send(request).await.is_err() {
             return Err(draining());
         }
-        match outcome.await {
-            Ok(Ok(outcome)) => Ok(outcome),
+        match answer.await {
+            Ok(Ok(answer)) => Ok(answer),
             Ok(Err(refused)) => {
                 let status = match refused {
                     Refused::Invalid(_) => StatusCode::BAD_REQUEST,
@@ -777,6 +838,14 @@ struct Uploaded {
 }
 
 #[derive(Serialize)]
+struct Purged {
+    store: String,
+    namespace: String,
+    /// The keys the namespace held.
+    keys: u64,
+}
+
+#[derive(Serialize)]
 struct Listing {
     revision: u64,
     generation: u64,
@@ -870,10 +939,13 @@ struct BucketView {
     namespace: String,
 }
 
+/// The apps, and what their sandboxes may hold.
 #[derive(Serialize)]
 struct AppsView {
     revision: u64,
     generation: u64,
+    capabilities: &'static [&'static str],
+    keyvalue_stores: Vec<StoreView>,
     apps: Vec<AppView>,
 }
 

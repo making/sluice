@@ -7,7 +7,7 @@
 //! A namespace holds at most `max_namespace_bytes` of keys and values, so a
 //! guest cannot fill the host's disk: triggers keep each namespace's bytes in
 //! `usage` (whichever wicket writes), and a write taking it past the bound is
-//! rolled back.
+//! rolled back. A purge deletes a namespace's rows and its `usage` row.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -319,6 +319,25 @@ impl Backend for Sqlite {
             }
             transaction.commit()?;
             Ok(())
+        })
+        .await
+    }
+
+    /// The namespace's rows and its usage, in one transaction.
+    async fn purge(&self, namespace: &str) -> Outcome<u64> {
+        let namespace = namespace.to_string();
+        self.blocking(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // first: the trigger of each row deleted then finds no usage to update
+            transaction
+                .prepare_cached("DELETE FROM usage WHERE namespace = ?1")?
+                .execute(params![namespace])?;
+            let keys = transaction
+                .prepare_cached("DELETE FROM kv WHERE namespace = ?1")?
+                .execute(params![namespace])?;
+            transaction.commit()?;
+            Ok(keys as u64)
         })
         .await
     }

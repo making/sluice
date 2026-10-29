@@ -1,8 +1,9 @@
 //! The desired state: one organization and space, the shared domains, the
 //! apps with their web process, the routes, packages, builds, droplets,
-//! deployments and jobs. In memory, written by a rename to `state.json` in
-//! the data directory on every change; the blobs next to it
-//! (`packages/<guid>.zip`, `droplets/<sha256>.wasm`).
+//! deployments and jobs, the service instances and their bindings. In
+//! memory, written by a rename to `state.json` in the data directory on
+//! every change; the blobs next to it (`packages/<guid>.zip`,
+//! `droplets/<sha256>.wasm`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,14 @@ pub struct State {
     pub droplets: Vec<Droplet>,
     pub deployments: Vec<Deployment>,
     pub jobs: Vec<Job>,
+    #[serde(default)]
+    pub instances: Vec<Instance>,
+    #[serde(default)]
+    pub bindings: Vec<Binding>,
+    /// The keyvalue namespaces of deleted instances whose data the wicket
+    /// is yet to delete.
+    #[serde(default)]
+    pub purges: Vec<Purge>,
     /// What the wicket answered of each app, by guid; not kept: a start
     /// lists the wicket.
     #[serde(skip)]
@@ -106,8 +115,51 @@ pub struct Running {
     pub memory_mib: u64,
     pub budget_ms: Option<u64>,
     pub instances: Option<u64>,
+    /// The capabilities the bindings granted.
+    #[serde(default)]
+    pub wasi: Vec<String>,
+    /// The keyvalue map the bindings made: identifier -> `store/namespace`.
+    #[serde(default)]
+    pub keyvalue: BTreeMap<String, String>,
     /// Seconds since the epoch.
     pub since: u64,
+}
+
+/// A service instance: a namespace of a keyvalue store (offering
+/// `keyvalue`, the store its plan) or a capability (offering `wasi`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Instance {
+    pub guid: String,
+    pub name: String,
+    pub offering: String,
+    pub plan: String,
+    pub tags: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// An app bound to a service instance; applied at the app's next start.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Binding {
+    pub guid: String,
+    /// `--binding-name`.
+    pub name: Option<String>,
+    pub app: String,
+    pub instance: String,
+    /// The keyvalue identifier the app opens the namespace by; empty for a
+    /// capability.
+    pub identifier: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// The data of a deleted keyvalue instance, deleted once no app maps it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Purge {
+    pub store: String,
+    pub namespace: String,
+    /// The instance's name, for the log.
+    pub instance: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -269,6 +321,25 @@ impl State {
         self.jobs.iter().find(|job| job.guid == guid)
     }
 
+    pub fn instance(&self, guid: &str) -> Option<&Instance> {
+        self.instances.iter().find(|instance| instance.guid == guid)
+    }
+
+    pub fn instance_named(&self, name: &str) -> Option<&Instance> {
+        self.instances.iter().find(|instance| instance.name == name)
+    }
+
+    pub fn binding(&self, guid: &str) -> Option<&Binding> {
+        self.bindings.iter().find(|binding| binding.guid == guid)
+    }
+
+    /// The bindings of the app `guid`, as they were made.
+    pub fn bindings_of(&self, guid: &str) -> impl Iterator<Item = &Binding> {
+        self.bindings
+            .iter()
+            .filter(move |binding| binding.app == guid)
+    }
+
     /// The routes mapped to the app `guid`.
     pub fn routes_of(&self, guid: &str) -> impl Iterator<Item = &Route> {
         self.routes
@@ -374,10 +445,12 @@ impl State {
         guid
     }
 
-    /// Removes the app, its routes' mapping, its packages, builds, droplets
-    /// and deployments; the blobs no other app needs are listed to delete.
+    /// Removes the app, its routes' mapping, its bindings, packages, builds,
+    /// droplets and deployments; the blobs no other app needs are listed to
+    /// delete.
     pub fn remove_app(&mut self, guid: &str) -> Vec<Blob> {
         let mut blobs = Vec::new();
+        self.bindings.retain(|binding| binding.app != guid);
         for route in self.routes.iter_mut() {
             if route.app.as_deref() == Some(guid) {
                 route.app = None;
@@ -676,6 +749,18 @@ mod tests {
             state.keep_newest_package(&app),
             vec![Blob::Package("p1".into())]
         );
+        // its bindings go with it, another app's stay
+        for (guid, bound) in [("b1", app.as_str()), ("b2", "other")] {
+            state.bindings.push(Binding {
+                guid: guid.into(),
+                name: None,
+                app: bound.into(),
+                instance: "i".into(),
+                identifier: String::new(),
+                created_at: now(),
+                updated_at: now(),
+            });
+        }
         assert_eq!(
             state.remove_app(&app),
             vec![
@@ -685,6 +770,8 @@ mod tests {
             ]
         );
         assert!(state.apps.is_empty());
+        let kept: Vec<&str> = state.bindings.iter().map(|b| b.guid.as_str()).collect();
+        assert_eq!(kept, ["b2"]);
     }
 
     #[test]

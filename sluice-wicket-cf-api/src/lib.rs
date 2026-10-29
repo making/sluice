@@ -2,7 +2,8 @@
 //! deploys wasm components through -- the subset of the Cloud Controller v3
 //! API, the UAA token endpoints and log-cache's read API it uses -- keeping
 //! the desired state of its apps and having one wicket serve them through
-//! the wicket's app API.
+//! the wicket's app API; the wicket's keyvalue stores and capabilities are
+//! its services.
 //!
 //! ```text
 //! cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> sluice-wicket-wasi
@@ -14,6 +15,7 @@ pub mod controller;
 pub mod logs;
 pub mod manifest;
 mod multipart;
+pub mod services;
 pub mod staging;
 pub mod store;
 pub mod uaa;
@@ -126,6 +128,7 @@ pub async fn serve(
         wicket,
         logs: logs.clone(),
         edits: tokio::sync::Mutex::new(()),
+        offer: std::sync::Mutex::new(None),
     });
     let api = Arc::new(api::Api {
         store,

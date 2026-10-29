@@ -400,9 +400,10 @@ removed by its owner: the API of a controller keeping the desired state of its a
 | request | |
 |---|---|
 | `PUT /api/components/<sha256>` | keeps the body, a component of 128MiB at most, under its digest (400 when the body has another): `{"sha256": .., "bytes": ..}` |
-| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "apps": [..]}` |
+| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "capabilities", "keyvalue_stores", "apps": [..]}`; `capabilities` and `keyvalue_stores` name what a sandbox may hold |
 | `PUT /api/apps/<name>` | serves the app of the body (JSON, below) |
 | `DELETE /api/apps/<name>?owner=<owner>` | removes the app of `owner` |
+| `DELETE /api/keyvalue/<store>/<namespace>` | deletes the namespace's keys (its usage too): `{"store", "namespace", "keys": <deleted>}`. Refused (409) while a route maps it, one being drained included; 404 for an unknown store. The namespace may hold `/` (percent-encoded or not) |
 
 ```json
 {
@@ -440,6 +441,9 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
   per-host endpoints refuse their hosts (409)
 - an app and an owner are named by 1 to 100 of `A-Z`, `a-z`, `0-9`, `.`, `_` and `-`, starting
   with a letter or a digit; a component's file name by those, ending in `.wasm`
+- the data of a namespace no app maps any more stays until deleted (`DELETE
+  /api/keyvalue/...`): a controller deletes it with what owned it (`sluice-wicket-cf-api`: a
+  service instance)
 
 ### Capabilities
 
@@ -502,18 +506,20 @@ route creates no file. A map naming an unknown store fails the startup or the re
   for each other's lock); sharing across hosts is the `redis` store's job. `list-keys`
   pages hold up to 100 keys in key order, the cursor the last key of a page. A namespace
   holds at most `max-namespace-bytes` (default 64Mi) of keys and values, so a guest cannot
-  fill the disk: a write past it fails and changes nothing
+  fill the disk: a write past it fails and changes nothing. A purge deletes a namespace's
+  rows and its usage in one transaction
 - `redis`: the keys of a Redis or Valkey server (6 or later: the connection speaks RESP3),
   shared by the wickets on every host reaching it. A key is `<prefix><namespace>:<key>`,
   a `:` or `\` in the namespace escaped by `\` so no namespace reaches another's keys
   (`redis-cli --scan --pattern 'counter.local:*'`). `increment` is `INCRBY`, a `swap` a
   script, the batches `MGET` / `MSET` / `DEL`: each atomic. `list-keys` is one `SCAN` a
   page, the cursor SCAN's: a page may be empty before the last, and a key may come twice.
-  No namespace bound: the server's `maxmemory` bounds it. A `rediss://` server's
-  certificate is verified against `ca-cert`, else the webPKI roots. The connection opens on
-  the first call and again once lost: a server down fails the calls with why (logged), not
-  the startup. Each call answers within `timeout` or fails; one timing out has the next
-  call open a new connection
+  No namespace bound: the server's `maxmemory` bounds it. A purge is `SCAN` + `DEL` of the
+  namespace's keys, a batch at a time (not atomic: a write meanwhile may stay). A
+  `rediss://` server's certificate is verified against `ca-cert`, else the webPKI roots.
+  The connection opens on the first call and again once lost: a server down fails the calls
+  with why (logged), not the startup. Each call answers within `timeout` or fails; one
+  timing out has the next call open a new connection
 - every store: a key past `max-key-bytes` (default 1Ki) and a value past `max-value-bytes`
   (default 1Mi) are rejected before the store sees them
 

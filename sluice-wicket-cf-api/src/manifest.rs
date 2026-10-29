@@ -1,13 +1,14 @@
 //! The manifest `cf push` applies (`POST /v3/spaces/:guid/actions/apply_manifest`,
 //! and `manifest_diff` before it with a manifest file): the apps, their web
-//! process, routes and metadata are applied server side, as on CF. What the
-//! wicket cannot serve is refused, naming it.
+//! process, routes, service bindings and metadata are applied server side,
+//! as on CF. What the wicket cannot serve is refused, naming it.
 
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 
+use crate::services::{self, Unbound};
 use crate::store::{BUDGET_ANNOTATION, INSTANCES_ANNOTATION, State, now};
 
 #[derive(Deserialize, Debug, Default)]
@@ -37,7 +38,7 @@ pub struct AppManifest {
     pub health_check_invocation_timeout: Option<u64>,
     pub timeout: Option<u64>,
     pub env: Option<BTreeMap<String, Option<Scalar>>>,
-    pub services: Option<Vec<IgnoredAny>>,
+    pub services: Option<Vec<ServiceManifest>>,
     pub docker: Option<IgnoredAny>,
     pub sidecars: Option<IgnoredAny>,
     pub processes: Option<Vec<ProcessManifest>>,
@@ -48,6 +49,19 @@ pub struct AppManifest {
 pub struct RouteManifest {
     pub route: String,
     pub protocol: Option<String>,
+}
+
+/// A service instance the app binds: its name, or the name with the
+/// binding's parameters and name.
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+pub enum ServiceManifest {
+    Name(String),
+    Binding {
+        name: String,
+        parameters: Option<serde_json::Value>,
+        binding_name: Option<String>,
+    },
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -120,13 +134,6 @@ fn apply_app(state: &mut State, spec: &AppManifest) -> Result<String, String> {
         return Err(format!(
             "{name}: environment variables are not supported yet"
         ));
-    }
-    if spec
-        .services
-        .as_ref()
-        .is_some_and(|services| !services.is_empty())
-    {
-        return Err(format!("{name}: services are not supported yet"));
     }
     if spec.sidecars.is_some() {
         return Err(format!("{name}: sidecars are not supported"));
@@ -212,7 +219,35 @@ fn apply_app(state: &mut State, spec: &AppManifest) -> Result<String, String> {
     process.updated_at = now();
     app.updated_at = now();
     apply_routes(state, &guid, spec)?;
+    apply_services(state, &guid, spec)?;
     Ok(guid)
+}
+
+/// `services:` binds the instances the app is not bound to yet, as `cf
+/// bind-service` does; a binding there stays as it is.
+fn apply_services(state: &mut State, guid: &str, spec: &AppManifest) -> Result<(), String> {
+    let name = spec.name.trim();
+    for entry in spec.services.iter().flatten() {
+        let (instance, parameters, binding_name) = match entry {
+            ServiceManifest::Name(instance) => (instance, None, None),
+            ServiceManifest::Binding {
+                name,
+                parameters,
+                binding_name,
+            } => (name, parameters.as_ref(), binding_name.clone()),
+        };
+        let found = state
+            .instance_named(instance)
+            .ok_or_else(|| format!("{name}: service instance '{instance}' not found"))?
+            .guid
+            .clone();
+        let parameters = parameters.cloned().unwrap_or_default();
+        match services::bind(state, guid, &found, binding_name, &parameters) {
+            Ok(_) | Err(Unbound::Already) => {}
+            Err(Unbound::Refused(e)) => return Err(format!("{name}: service {instance}: {e}")),
+        }
+    }
+    Ok(())
 }
 
 /// `routes:` adds routes; `no-route` unmaps them all; `default-route` /
@@ -421,13 +456,29 @@ pub fn check_annotations(annotations: &BTreeMap<String, String>) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Instance;
+    use serde_json::json;
 
     fn state() -> State {
         State::new("o", "s", &["localhost".into(), "example.com".into()])
     }
 
+    /// Adds the service instance `name`: its guid.
+    fn instance(state: &mut State, name: &str, offering: &str, plan: &str) -> String {
+        state.instances.push(Instance {
+            guid: format!("{name}-guid"),
+            name: name.into(),
+            offering: offering.into(),
+            plan: plan.into(),
+            tags: Vec::new(),
+            created_at: now(),
+            updated_at: now(),
+        });
+        format!("{name}-guid")
+    }
+
     #[test]
-    fn applies_the_process_the_routes_and_the_metadata() {
+    fn applies_the_process_the_routes_the_services_and_the_metadata() {
         let mut state = state();
         let manifest = parse(
             "applications:\n- name: counter\n  path: /tmp/x\n  command: counter.wasm\n  instances: 2\n  memory: 64M\n  default-route: true\n  routes:\n  - route: counter.localhost\n  - route: count.example.com\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/budget-ms: 5000\n  unknown-key: ignored\n",
@@ -481,18 +532,105 @@ mod tests {
             url.starts_with("other-") && url.ends_with(".localhost"),
             "{url}"
         );
+
+        // services: an instance by name, or with the binding's parameters
+        // and name; again, the bindings stay as they are
+        let kv = instance(&mut state, "kv", "keyvalue", "local");
+        let sessions = instance(&mut state, "sessions", "keyvalue", "shared");
+        instance(&mut state, "net", "wasi", "inherit-network");
+        let bound = parse(
+            "applications:\n- name: counter\n  services:\n  - kv\n  - name: sessions\n    binding_name: s\n    parameters:\n      identifier: sessions\n  - net\n",
+        )
+        .unwrap();
+        apply(&mut state, &bound).unwrap();
+        apply(&mut state, &bound).unwrap();
+        assert_eq!(state.bindings.len(), 3);
+        let (wasi, keyvalue) = services::grants(&state, &guids[0]);
+        assert_eq!(wasi, ["cli", "inherit-network", "keyvalue"]);
+        assert_eq!(
+            keyvalue,
+            BTreeMap::from([
+                (String::new(), format!("local/cf/{kv}")),
+                ("sessions".into(), format!("shared/cf/{sessions}")),
+            ])
+        );
+        // as cf env and cf create-app-manifest show them
+        let app = state.app(&guids[0]).unwrap().clone();
+        let env = crate::views::env("http://api", &state, &app);
+        let vcap = &env["system_env_json"]["VCAP_SERVICES"];
+        assert_eq!(
+            (
+                &vcap["keyvalue"][1]["name"],
+                &vcap["keyvalue"][1]["credentials"]
+            ),
+            (
+                &json!("s"),
+                &json!({"store": "shared", "namespace": format!("cf/{sessions}"), "identifier": "sessions"})
+            )
+        );
+        assert_eq!(
+            vcap["wasi"][0]["credentials"],
+            json!({"capabilities": ["inherit-network", "cli"]})
+        );
+        let written = parse(&crate::views::manifest(&state, &app)).unwrap();
+        let mut again = state.clone();
+        again.bindings.clear();
+        apply(&mut again, &written).unwrap();
+        let made = |state: &State| -> Vec<(String, String, Option<String>)> {
+            state
+                .bindings
+                .iter()
+                .map(|binding| {
+                    let identifier = binding.identifier.clone();
+                    (binding.instance.clone(), identifier, binding.name.clone())
+                })
+                .collect()
+        };
+        assert_eq!(
+            made(&again),
+            made(&state),
+            "the manifest written binds the same"
+        );
     }
 
     #[test]
     fn refuses_what_the_wicket_cannot_serve() {
         let mut state = state();
+        for (name, offering, plan) in [
+            ("kv", "keyvalue", "local"),
+            ("other", "keyvalue", "local"),
+            ("net", "wasi", "tcp"),
+        ] {
+            instance(&mut state, name, offering, plan);
+        }
         let mut refused = |text: &str| {
             let manifest = parse(text).unwrap();
             apply(&mut state, &manifest).unwrap_err()
         };
         assert!(refused("applications:\n- name: a\n  docker:\n    image: x\n").contains("docker"));
         assert!(refused("applications:\n- name: a\n  env:\n    K: v\n").contains("environment"));
-        assert!(refused("applications:\n- name: a\n  services:\n  - kv\n").contains("services"));
+        let services = [
+            ("- nope", "service instance 'nope' not found"),
+            (
+                "- name: net\n    parameters: {identifier: x}",
+                "a wasi binding takes no parameters",
+            ),
+            (
+                "- name: kv\n    parameters: {store: x}",
+                "takes the parameter 'identifier' only",
+            ),
+            // the last: kv is bound then
+            (
+                "- kv\n  - other",
+                "a binds kv at the keyvalue identifier \"\" already: bind other at another",
+            ),
+        ];
+        for (entries, error) in services {
+            let refusal = refused(&format!(
+                "applications:\n- name: a\n  services:\n  {entries}\n"
+            ));
+            assert!(refusal.contains(error), "{refusal}");
+        }
         assert!(
             refused("applications:\n- name: a\n  processes:\n  - type: worker\n")
                 .contains("worker")

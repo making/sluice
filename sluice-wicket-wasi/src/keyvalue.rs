@@ -161,6 +161,9 @@ pub trait Backend: Send + Sync {
         }
         Ok(())
     }
+
+    /// Deletes every key of `namespace`: how many there were.
+    async fn purge(&self, namespace: &str) -> Outcome<u64>;
 }
 
 /// `current` (the decimal ASCII of an i64, None: 0) plus `delta`.
@@ -361,6 +364,30 @@ impl Stores {
             );
         }
         Ok(Some(Arc::new(Buckets(buckets))))
+    }
+
+    /// Deletes the data of `place`: how many keys it held. A `sqlite` store
+    /// not opened yet holds none without its file, which is not created.
+    pub async fn purge(&self, place: &Place) -> Result<u64, String> {
+        let config = self
+            .configs
+            .get(&place.store)
+            .ok_or_else(|| format!("unknown keyvalue store '{}'", place.store))?;
+        let opened = self.opened.lock().await.contains_key(&place.store);
+        if let Kind::Sqlite { path, .. } = &config.kind
+            && !opened
+            && !path.exists()
+        {
+            return Ok(0);
+        }
+        let backend = self.open(&place.store, config).await?;
+        backend.purge(&place.namespace).await.map_err(|failure| {
+            let (Failure::Rejected(message) | Failure::Backend(message)) = failure;
+            format!(
+                "keyvalue store '{}': purging {}: {message}",
+                place.store, place.namespace
+            )
+        })
     }
 
     async fn open(&self, name: &str, config: &StoreConfig) -> Result<Arc<dyn Backend>, String> {
@@ -728,6 +755,10 @@ mod tests {
         async fn swap(&self, _: &str, _: &str, _: Option<Vec<u8>>, _: Vec<u8>) -> Outcome<Swap> {
             Err(Failure::Backend("disk on fire".into()))
         }
+
+        async fn purge(&self, _: &str) -> Outcome<u64> {
+            Err(Failure::Backend("disk on fire".into()))
+        }
     }
 
     fn request(method: &str, path: &str, body: &str) -> String {
@@ -741,7 +772,8 @@ mod tests {
     /// route opens the namespaces its map names, a namespace two routes map
     /// to is shared, an identifier the map lacks is no store; cas reads again
     /// after a lost race; list-keys pages; the store's limits reject a key, a
-    /// value and a batch past them (the batch as a whole); a value that is no
+    /// value and a batch past them (the batch as a whole); a purge deletes a
+    /// namespace's keys and its usage, no other's; a value that is no
     /// integer does not increment. The pooled path serves the same. A store
     /// failing is the guest's `other`, logged.
     #[tokio::test]
@@ -819,6 +851,22 @@ mod tests {
             get(&a, "/keys?store=own").await.contains(keys),
             "none of the batch"
         );
+        let own = Place {
+            store: "local".into(),
+            namespace: "a.local".into(),
+        };
+        assert_eq!(reloader.stores().purge(&own).await, Ok(251));
+        assert!(
+            get(&a, "/keys?store=own")
+                .await
+                .contains("0 keys in 1 page(s)\n")
+        );
+        assert!(
+            get(&a, "/").await.contains("hits 3\n"),
+            "only that namespace's"
+        );
+        let fill = exchange(&a, &request("POST", "/fill/600?store=own", "")).await;
+        assert!(fill.contains("ok\n"), "its usage gone too: {fill}");
 
         exchange(&b, &request("PUT", "/kv/hits", "abc")).await;
         assert!(

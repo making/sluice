@@ -2,7 +2,8 @@
 //! wickets on every host reaching it. A key is `<prefix><namespace>:<key>`,
 //! a `:` or `\` in the namespace escaped by `\`: no namespace reaches
 //! another's keys. The operations are the server's own (`INCRBY`, `MGET`,
-//! ...), a swap a script, so each is atomic.
+//! ...), a swap a script, so each is atomic; a purge is `SCAN` + `DEL` of the
+//! namespace's keys, a batch at a time.
 //!
 //! One multiplexed connection per store, speaking RESP3: a server closing it
 //! is seen at once and it reconnects in the background. Every call is
@@ -26,6 +27,9 @@ use super::{Backend, Failure, Outcome, PAGE_KEYS, Swap, not_integer, overflows};
 
 /// Default of a `redis` store's `timeout`.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The keys one `SCAN` of a purge looks at.
+const PURGE_SCAN: usize = 1000;
 
 /// Writes ARGV[1] while KEYS[1] holds ARGV[2] (is absent without one):
 /// 1 when written, else what it holds (0: nothing).
@@ -99,6 +103,20 @@ impl Redis {
         }
         space.push(':');
         space
+    }
+
+    /// The `SCAN` pattern matching the keys of `space` alone: its glob
+    /// characters escaped.
+    fn pattern(space: &str) -> String {
+        let mut pattern = String::with_capacity(space.len() + 1);
+        for c in space.chars() {
+            if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+                pattern.push('\\');
+            }
+            pattern.push(c);
+        }
+        pattern.push('*');
+        pattern
     }
 
     /// `command`'s answer within the timeout.
@@ -193,20 +211,12 @@ impl Backend for Redis {
                 .map_err(|_| Failure::Rejected(format!("'{cursor}' is no cursor of this store")))?,
         };
         let space = self.space(namespace);
-        let mut pattern = String::with_capacity(space.len() + 1);
-        for c in space.chars() {
-            if matches!(c, '*' | '?' | '[' | ']' | '\\') {
-                pattern.push('\\');
-            }
-            pattern.push(c);
-        }
-        pattern.push('*');
         let (next, keys): (u64, Vec<Vec<u8>>) = self
             .call(
                 cmd("SCAN")
                     .arg(start)
                     .arg("MATCH")
-                    .arg(pattern)
+                    .arg(Redis::pattern(&space))
                     .arg("COUNT")
                     .arg(PAGE_KEYS),
             )
@@ -309,6 +319,36 @@ impl Backend for Redis {
         }
         Ok(self.call(&command).await?)
     }
+
+    /// A `SCAN` of the namespace's keys, each batch found deleted by `DEL`,
+    /// until the scan ends.
+    async fn purge(&self, namespace: &str) -> Outcome<u64> {
+        let pattern = Redis::pattern(&self.space(namespace));
+        let (mut cursor, mut deleted) = (0u64, 0u64);
+        loop {
+            let (next, keys): (u64, Vec<Vec<u8>>) = self
+                .call(
+                    cmd("SCAN")
+                        .arg(cursor)
+                        .arg("MATCH")
+                        .arg(&pattern)
+                        .arg("COUNT")
+                        .arg(PURGE_SCAN),
+                )
+                .await?;
+            if !keys.is_empty() {
+                let mut command = cmd("DEL");
+                for key in &keys {
+                    command.arg(key);
+                }
+                deleted += self.call::<u64>(&command).await?;
+            }
+            if next == 0 {
+                return Ok(deleted);
+            }
+            cursor = next;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -351,12 +391,13 @@ mod tests {
     }
 
     /// The namespaces stay apart, after the prefix (a `:` or a glob
-    /// character in one reaches no other's keys); a swap writes only over
-    /// the value expected, increment is `INCRBY` and refuses what is no
-    /// integer as the trait's does; list-keys pages through more keys than
-    /// one SCAN gives; the batches are whole. A call timing out has the next
-    /// one open a new connection; the server stopped fails the calls (not
-    /// the opening of a store), started again they succeed.
+    /// character in one reaches no other's keys, listed or purged); a swap
+    /// writes only over the value expected, increment is `INCRBY` and
+    /// refuses what is no integer as the trait's does; list-keys pages
+    /// through more keys than one SCAN gives; the batches are whole. A call
+    /// timing out has the next one open a new connection; the server stopped
+    /// fails the calls (not the opening of a store), started again they
+    /// succeed.
     #[tokio::test]
     async fn a_redis_store_keeps_its_namespaces_apart_on_a_real_server() {
         let mut server = RedisServer::unix();
@@ -382,6 +423,11 @@ mod tests {
             let (keys, _) = listed(&store, namespace).await;
             assert_eq!(keys, BTreeSet::from([key.to_string()]), "{namespace}");
         }
+        assert_eq!(store.purge("a*").await, Ok(1));
+        assert_eq!(store.purge("a*").await, Ok(0));
+        let mut keys: Vec<String> = cmd("KEYS").arg("*").query_async(&mut side).await.unwrap();
+        keys.sort();
+        assert_eq!(keys, ["w:a:b:c", r"w:a\:b:c"], "no other namespace's");
 
         assert_eq!(
             store.swap("s", "k", None, b"1".into()).await,

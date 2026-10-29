@@ -4,8 +4,8 @@ A Cloud Foundry API facade for one [sluice-wicket-wasi](../sluice-wicket-wasi/RE
 subset of the Cloud Controller v3 API, the UAA token endpoints and log-cache's read API the
 stock `cf` CLI uses, on one origin. It keeps the desired state of its apps and has the wicket
 serve them through the wicket's [app API](../sluice-wicket-wasi/README.md#apps), so a wasm
-component is deployed with `cf push`, and routes, scaling, rolling updates, stop and start and
-`cf logs` work as the CLI expects.
+component is deployed with `cf push`, and routes, scaling, rolling updates, stop and start,
+services (the wicket's keyvalue stores and capabilities) and `cf logs` work as the CLI expects.
 
 ```text
 cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> sluice-wicket-wasi <--tunnel-- sluice server
@@ -32,6 +32,10 @@ cf8 map-route hello localhost --hostname hi
 cf8 scale hello -i 2
 cf8 push hello -p dist/ --strategy rolling       # swapped in place
 cf8 logs hello --recent
+cf8 marketplace                                  # the wicket's keyvalue stores and capabilities
+cf8 create-service keyvalue local kv             # a namespace of the store local
+cf8 bind-service counter kv                      # counter: a wasi:keyvalue component
+cf8 restart counter                              # a binding applies at the next start
 ```
 
 | option | |
@@ -68,12 +72,17 @@ sidecar, `kubectl port-forward`).
 | instance state | `RUNNING` once the wicket took the app; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable |
 | rolling deployment | the app put with the new droplet: the wicket swaps it in place; finalized at once |
 | org / space | one of each |
+| service offering `keyvalue`, plan `<store>` | a keyvalue store of the wicket (`keyvalue.stores`, else `local`) |
+| service offering `wasi`, plan `<capability>` | a capability of the sandbox's `wasi`: `cli`, `inherit-network`, `allow-ip-name-lookup`, `tcp`, `udp` |
+| keyvalue service instance | the namespace `cf/<instance guid>` of its plan's store |
+| binding to a keyvalue instance | the sandbox's `keyvalue` map: its identifier (parameter `identifier`, default `""`) -> `<store>/cf/<instance guid>`, and the capability `keyvalue` |
+| binding to a wasi instance | the plan's capability; a network one `cli` too |
 
 ## Behavior
 
 - as on CF, routes and `instances` apply at once; the droplet and the rest of the sandbox
-  (memory, annotations) at a start, restart, restage or deployment: the running app is the
-  snapshot taken then. For `scale -m` the CLI stops and starts the app itself
+  (memory, annotations, the service bindings) at a start, restart, restage or deployment: the
+  running app is the snapshot taken then. For `scale -m` the CLI stops and starts the app itself
 - an edit the wicket answers at once (map-route, unmap-route, scale -i, a manifest's routes)
   is refused with 422 and the wicket's reason, and changes nothing; a start, restart or
   deployment is accepted, and its outcome shows in the process stats and the log (`cf logs`)
@@ -92,12 +101,39 @@ sidecar, `kubectl port-forward`).
 - errors are in CC's shape (`{"errors": [{"code", "title", "detail"}]}`); `/v3/info` names
   this API
 
+## Services
+
+The wicket's keyvalue stores and capabilities are the plans of the service offerings
+`keyvalue` and `wasi` of the broker `sluice-wicket`, which is no process: the cf-api offers
+them as the wicket lists them (`GET /api/apps`), so `cf marketplace` follows the wicket's
+config.
+
+- `cf create-service keyvalue <store> <name>` makes a namespace, `cf/<instance guid>`, of the
+  store; `cf bind-service <app> <name> [-c '{"identifier":"<id>"}']` lets the app open it at the
+  identifier (default `""`, what `store::open("")` opens). An app binds one instance per
+  identifier (a second is refused, 422). Renaming the instance or moving the app's routes leaves
+  the data where it is
+- `cf create-service wasi <capability> <name>` and a binding grant the capability; a network
+  one (`inherit-network`, `allow-ip-name-lookup`, `tcp`, `udp`) `cli` too
+- as the rest of the sandbox, a binding (and an unbinding) applies at the app's next start,
+  restart, restage or deployment. A manifest's `services:` (a name, or `name` with `parameters`
+  and `binding_name`) binds what the app is not bound to yet, as `cf bind-service`
+- `cf env` shows the bindings in `VCAP_SERVICES` (by offering; a keyvalue binding's
+  credentials are `store`, `namespace` and `identifier`, a wasi one's `capabilities`)
+- instance and binding operations complete at once. `cf delete-service` is refused while the
+  instance is bound (as on CF); a keyvalue instance deleted has its data deleted once no app
+  maps its namespace any more -- no started app's snapshot, no route of the wicket, a draining
+  one included (`DELETE /api/keyvalue/<store>/<namespace>`, tried at the deletion and after each
+  listing of the wicket). `cf purge-service-instance` drops the bindings with the instance
+- `cf rename-service` and `cf update-service -t` apply at once; a plan change, instance
+  parameters, service keys, user-provided instances and sharing are refused (422)
+
 ## Limits
 
 Refused with why (422): route paths, ports and wildcards, private and internal domains, docker
 images, tasks, ssh, sidecars, process types but `web`, route services, environment variables
-(`cf set-env`, a manifest's `env:`), services (`cf create-service`, `bind-service`, a manifest's
-`services:`). One owner (`cf`) per wicket: two cf-apis must not share one.
+(`cf set-env`, a manifest's `env:`), user-provided services, service keys. One owner (`cf`) per
+wicket: two cf-apis must not share one.
 
 The integration test (`tests/cli.rs`) runs the OSS CLI -- `SLUICE_CF_CLI`, else `cf8` on the
 PATH -- against the cf-api and a wicket in local mode, building the wicket and its example

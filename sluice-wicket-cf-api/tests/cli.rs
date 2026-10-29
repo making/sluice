@@ -2,7 +2,8 @@
 //! distribution refuses any other platform) against the cf-api and a wicket
 //! in local mode: login, push, map-route, scale, a rolling push with
 //! requests all along, stop and start, a restart of the cf-api, a component
-//! the wicket refuses, delete.
+//! the wicket refuses until a service binding grants what it needs, the
+//! services' lifecycle, delete.
 
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::net::TcpStream;
@@ -56,8 +57,8 @@ fn wicket_binary() -> PathBuf {
         .join("debug/sluice-wicket-wasi")
 }
 
-/// The directory of the hello and counter guests: `SLUICE_WICKET_GUESTS`,
-/// else built as the wicket's tests build them.
+/// The directory of the hello, counter and relay guests:
+/// `SLUICE_WICKET_GUESTS`, else built as the wicket's tests build them.
 fn guests() -> PathBuf {
     if let Ok(given) = std::env::var("SLUICE_WICKET_GUESTS") {
         return PathBuf::from(given);
@@ -65,7 +66,16 @@ fn guests() -> PathBuf {
     let examples = wicket_crate().join("examples");
     cargo(
         &examples,
-        &["build", "--release", "-p", "hello", "-p", "counter"],
+        &[
+            "build",
+            "--release",
+            "-p",
+            "hello",
+            "-p",
+            "counter",
+            "-p",
+            "relay",
+        ],
     );
     std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
@@ -108,6 +118,13 @@ impl Process {
 
     /// The word after `marker` in the next line of the log holding it.
     fn logged(&self, marker: &str) -> String {
+        let line = self.line(marker);
+        let (_, rest) = line.split_once(marker).expect("holds it");
+        rest.split(' ').next().unwrap().to_string()
+    }
+
+    /// The next line of the log holding `marker`.
+    fn line(&self, marker: &str) -> String {
         let deadline = Instant::now() + HANG;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -115,8 +132,8 @@ impl Process {
                 .lines
                 .recv_timeout(left)
                 .unwrap_or_else(|e| panic!("never logged '{marker}': {e}"));
-            if let Some((_, rest)) = line.split_once(marker) {
-                return rest.split(' ').next().unwrap().to_string();
+            if line.contains(marker) {
+                return line;
             }
         }
     }
@@ -254,17 +271,19 @@ fn the_cf_cli_deploys_to_the_wicket() {
     let wicket_binary = wicket_binary();
     let dir = std::env::temp_dir().join(format!("sluice-cf-api-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    for sub in ["app", "app2", "counter", "cfhome"] {
+    for sub in ["app", "app2", "counter", "relay", "cfhome"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
     let hello = std::fs::read(guests.join("hello.wasm")).unwrap();
     std::fs::write(dir.join("app/hello.wasm"), &hello).unwrap();
     std::fs::write(dir.join("app2/hello.wasm"), variant(&hello)).unwrap();
-    std::fs::copy(
-        guests.join("counter.wasm"),
-        dir.join("counter/counter.wasm"),
-    )
-    .unwrap();
+    for guest in ["counter", "relay"] {
+        std::fs::copy(
+            guests.join(format!("{guest}.wasm")),
+            dir.join(guest).join(format!("{guest}.wasm")),
+        )
+        .unwrap();
+    }
 
     let wicket = Process::spawn(
         &wicket_binary,
@@ -389,11 +408,121 @@ fn the_cf_cli_deploys_to_the_wicket() {
     assert!(output.contains("needs wasi=keyvalue"), "{output}");
     assert!(output.contains("crashed"), "{output}");
 
-    // gone from the wicket
-    cf.ok(&["delete", "hello", "-r", "-f"]);
+    // a keyvalue store as a service: bound, the app counts in the
+    // instance's namespace from its next start on, across a restart and a
+    // rename of the instance
+    let marketplace = cf.ok(&["marketplace"]);
+    for offered in [
+        "keyvalue",
+        "local",
+        "wasi",
+        "inherit-network",
+        "sluice-wicket",
+    ] {
+        assert!(marketplace.contains(offered), "{offered}: {marketplace}");
+    }
+    cf.ok(&["create-service", "keyvalue", "local", "kv"]);
+    cf.ok(&["bind-service", "counter", "kv"]);
+    cf.ok(&["restart", "counter"]);
+    let count = |path: &str| get(&listen, "counter.localhost", path, None).1;
+    assert_eq!(count("/"), "hits 1\n");
+    assert_eq!(count("/"), "hits 2\n");
+    cf.ok(&["rename-service", "kv", "counts"]);
+    cf.ok(&["restart", "counter"]);
+    assert_eq!(count("/"), "hits 3\n");
+    // another instance at another identifier; at the same one, refused
+    cf.ok(&["create-service", "keyvalue", "local", "sessions"]);
+    let identifier = r#"{"identifier":"sessions"}"#;
+    cf.ok(&["bind-service", "counter", "sessions", "-c", identifier]);
+    cf.ok(&["create-service", "keyvalue", "local", "spare"]);
+    let output = cf.fails(&["bind-service", "counter", "spare"]);
+    assert!(
+        output.contains("counter binds counts at the keyvalue identifier \"\" already"),
+        "{output}"
+    );
+    let env = cf.ok(&["env", "counter"]);
+    assert!(env.contains("\"identifier\": \"sessions\""), "{env}");
+    cf.ok(&["restart", "counter"]);
+    assert_eq!(count("/?store=sessions"), "hits 1\n");
+    let service = cf.ok(&["service", "counts"]);
+    for shown in ["keyvalue", "local", "sluice-wicket", "counter"] {
+        assert!(service.contains(shown), "{shown}: {service}");
+    }
+    // an instance bound is not deleted; unbound and deleted, its data goes
+    // once no app maps it (the restart), and a new instance counts from 1
+    let output = cf.fails(&["delete-service", "counts", "-f"]);
+    assert!(output.contains("counts is bound to counter"), "{output}");
+    cf.ok(&["unbind-service", "counter", "counts"]);
+    cf.ok(&["delete-service", "counts", "-f"]);
+    assert!(!cf.ok(&["services"]).contains("counts"));
+    cf.ok(&["create-service", "keyvalue", "local", "kv"]);
+    cf.ok(&["bind-service", "counter", "kv"]);
+    cf.ok(&["restart", "counter"]);
+    assert_eq!(count("/"), "hits 1\n");
+    let purged = api.line("SERVICES: deleted the data of service instance counts");
+    assert!(purged.ends_with(": 1 key(s)"), "{purged}");
+
+    // a capability as a service, bound by the manifest: cli links relay's
+    // sockets, every address denied; inherit-network lets it relay
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for mut stream in upstream.incoming().map_while(Result::ok) {
+            let mut head = [0u8; 1024];
+            let _ = stream.read(&mut head);
+            let _ = stream.write_all(b"HTTP/1.0 200 OK\r\n\r\nupstream\n");
+        }
+    });
+    cf.ok(&["create-service", "wasi", "cli", "sockets"]);
+    let manifest = dir.join("relay/manifest.yml");
+    std::fs::write(
+        &manifest,
+        "applications:\n- name: relay\n  routes:\n  - route: relay.localhost\n  services:\n  - sockets\n",
+    )
+    .unwrap();
+    let relay_dir = dir.join("relay");
+    let pushed = [
+        "push",
+        "-f",
+        manifest.to_str().unwrap(),
+        "-p",
+        relay_dir.to_str().unwrap(),
+    ];
+    cf.ok(&pushed);
+    let relayed = || {
+        get(
+            &listen,
+            "relay.localhost",
+            &format!("/?addr={upstream_addr}"),
+            None,
+        )
+    };
+    let (status, body) = relayed();
+    assert_eq!(status, 502, "{body}");
+    assert!(body.contains("AccessDenied"), "{body}");
+    cf.ok(&["create-service", "wasi", "inherit-network", "net"]);
+    cf.ok(&["bind-service", "relay", "net"]);
+    cf.ok(&["restart", "relay"]);
+    let (status, body) = relayed();
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.starts_with(&format!("relayed from {upstream_addr}\n"))
+            && body.ends_with("upstream\n"),
+        "{body}"
+    );
+
+    // gone from the wicket; their instances stay, unbound
+    for app in ["hello", "counter", "relay"] {
+        cf.ok(&["delete", app, "-r", "-f"]);
+    }
     assert!(listing(&console)["apps"].as_array().unwrap().is_empty());
     assert_eq!(get(&listen, "hello.localhost", "/", None).0, 404);
     assert!(!cf.ok(&["apps"]).contains("hello"));
+    let services = cf.ok(&["services"]);
+    assert!(
+        services.contains("sessions") && !services.contains("counter"),
+        "{services}"
+    );
 
     drop(api);
     drop(wicket);

@@ -6,9 +6,10 @@
 //!
 //! Routes and `instances` apply at once: an edit the wicket refuses is
 //! answered 422 with its reason and changes nothing. The droplet and the
-//! rest of the sandbox apply at a start, restart or deployment: the running
-//! app is the snapshot taken then, and the outcome shows in the process
-//! stats and the log.
+//! rest of the sandbox, the service bindings' grants included, apply at a
+//! start, restart or deployment: the running app is the snapshot taken
+//! then, and the outcome shows in the process stats and the log. The
+//! services are in [`crate::services`].
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ use tokio::net::TcpListener;
 use crate::controller::Controller;
 use crate::logs::{self, Logs};
 use crate::manifest;
+use crate::services;
 use crate::staging;
 use crate::store::{
     BUDGET_ANNOTATION, Build, Deployment, Droplet, INSTANCES_ANNOTATION, JobError, Package,
@@ -42,8 +44,8 @@ const MAX_BODY_BYTES: usize = 1 << 20;
 /// Connections open at once.
 const MAX_CONNECTIONS: usize = 64;
 
-type Response = hyper::Response<Full<Bytes>>;
-type Reply = Result<Response, ApiError>;
+pub(crate) type Response = hyper::Response<Full<Bytes>>;
+pub(crate) type Reply = Result<Response, ApiError>;
 
 pub struct Api {
     pub store: Arc<Store>,
@@ -91,7 +93,7 @@ impl ApiError {
         }
     }
 
-    fn unknown(method: &Method, path: &str) -> ApiError {
+    pub(crate) fn unknown(method: &Method, path: &str) -> ApiError {
         ApiError {
             status: StatusCode::NOT_FOUND,
             code: 10000,
@@ -157,25 +159,25 @@ impl From<String> for ApiError {
 }
 
 /// A request read whole.
-struct Req {
-    method: Method,
-    path: String,
-    query: Vec<(String, String)>,
+pub(crate) struct Req {
+    pub(crate) method: Method,
+    pub(crate) path: String,
+    pub(crate) query: Vec<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
     /// Where the CLI reaches this API: the links name it.
-    base: String,
+    pub(crate) base: String,
 }
 
 impl Req {
-    fn q(&self, key: &str) -> Option<&str> {
+    pub(crate) fn q(&self, key: &str) -> Option<&str> {
         self.query
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, value)| value.as_str())
     }
 
-    fn json<T: DeserializeOwned>(&self) -> Result<T, ApiError> {
+    pub(crate) fn json<T: DeserializeOwned>(&self) -> Result<T, ApiError> {
         serde_json::from_slice(&self.body)
             .map_err(|e| ApiError::bad_request(format!("Request invalid due to parse error: {e}")))
     }
@@ -656,15 +658,17 @@ impl Api {
             (&Method::GET, ["jobs", guid]) => store
                 .read(|state| state.job(guid).map(|job| views::job(base, job)))
                 .map_or_else(|| Err(ApiError::not_found("Job")), |job| Ok(json(StatusCode::OK, &job))),
+            // --- services
+            (_, ["service_brokers" | "service_offerings" | "service_plans" | "service_instances" | "service_credential_bindings", ..]) => {
+                self.services(req, segments).await
+            }
+            (&Method::POST, ["service_route_bindings"]) => {
+                Err(ApiError::unprocessable("route services are not supported"))
+            }
             // --- what there is none of
             (&Method::GET, ["buildpacks"])
             | (&Method::GET, ["security_groups"])
             | (&Method::GET, ["service_route_bindings"])
-            | (&Method::GET, ["service_instances"])
-            | (&Method::GET, ["service_plans"])
-            | (&Method::GET, ["service_offerings"])
-            | (&Method::GET, ["service_brokers"])
-            | (&Method::GET, ["service_credential_bindings"])
             | (&Method::GET, ["audit_events"])
             | (&Method::GET, ["isolation_segments"])
             | (&Method::GET, ["users"])
@@ -676,9 +680,6 @@ impl Api {
             | (&Method::GET, ["revisions"]) => empty(),
             (&Method::GET, ["environment_variable_groups", _]) => {
                 Ok(json(StatusCode::OK, &json!({"var": {}, "links": {}})))
-            }
-            (&Method::POST, ["service_instances"]) | (&Method::POST, ["service_credential_bindings"]) | (&Method::POST, ["service_route_bindings"]) => {
-                Err(ApiError::unprocessable("services are not supported yet"))
             }
             _ => Err(ApiError::unknown(&req.method, &req.path)),
         }
@@ -722,7 +723,7 @@ impl Api {
     }
 
     /// A job done (or failed with `errors`), answered 202 with its location.
-    fn job(
+    pub(crate) fn job(
         &self,
         req: &Req,
         operation: &str,
@@ -836,6 +837,18 @@ impl Api {
                 }
             }
         }
+        // the bindings `services:` made
+        let bound: Vec<(String, String)> = self.store.read(|state| {
+            trial
+                .bindings
+                .iter()
+                .filter(|binding| state.binding(&binding.guid).is_none())
+                .filter_map(|binding| {
+                    let instance = trial.instance(&binding.instance)?;
+                    Some((binding.app.clone(), instance.name.clone()))
+                })
+                .collect()
+        });
         let space = self.store.update(|state| {
             let wicket = std::mem::take(&mut state.wicket);
             *state = trial;
@@ -844,6 +857,13 @@ impl Api {
         });
         for guid in &guids {
             self.logs.add(guid, "API", "Applied the manifest");
+        }
+        for (app, instance) in bound {
+            self.logs.add(
+                &app,
+                "API",
+                format!("Bound service instance {instance}: applies at the next start, restart or restage"),
+            );
         }
         self.job(
             req,
@@ -1465,9 +1485,7 @@ impl Api {
                 self.store.read(|state| state.url(&route))
             ),
         );
-        let mut response = json(StatusCode::NO_CONTENT, &Value::Null);
-        *response.body_mut() = Full::new(Bytes::new());
-        Ok(response)
+        Ok(no_content())
     }
 
     // --- deployments
@@ -1539,8 +1557,8 @@ impl Api {
     }
 }
 
-/// The snapshot a start takes: the current droplet, the memory and the
-/// annotations.
+/// The snapshot a start takes: the current droplet, the memory, the
+/// annotations and what the service bindings grant.
 fn snapshot(state: &State, guid: &str) -> Result<Running, ApiError> {
     let app = state.app(guid).ok_or_else(|| ApiError::not_found("App"))?;
     let current = app
@@ -1556,6 +1574,7 @@ fn snapshot(state: &State, guid: &str) -> Result<Running, ApiError> {
             .get(key)
             .and_then(|value| value.parse::<u64>().ok())
     };
+    let (wasi, keyvalue) = services::grants(state, guid);
     Ok(Running {
         droplet: droplet.guid.clone(),
         sha256: droplet.sha256.clone(),
@@ -1568,6 +1587,8 @@ fn snapshot(state: &State, guid: &str) -> Result<Running, ApiError> {
         memory_mib: app.process.memory_mb,
         budget_ms: annotation(BUDGET_ANNOTATION),
         instances: annotation(INSTANCES_ANNOTATION),
+        wasi,
+        keyvalue,
         since: epoch_secs(),
     })
 }
@@ -1599,12 +1620,19 @@ fn apply_metadata(app: &mut crate::store::App, metadata: &Value) -> Result<(), A
     Ok(())
 }
 
-fn json(status: StatusCode, body: &Value) -> Response {
+pub(crate) fn json(status: StatusCode, body: &Value) -> Response {
     let body = serde_json::to_vec(body).expect("plain data");
     hyper::Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
         .body(Full::new(Bytes::from(body)))
+        .expect("a plain response")
+}
+
+pub(crate) fn no_content() -> Response {
+    hyper::Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Full::new(Bytes::new()))
         .expect("a plain response")
 }
 

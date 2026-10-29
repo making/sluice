@@ -5,13 +5,17 @@
 //! cf-api's: at startup and whenever the wicket's revision moves, its apps
 //! of the owner are listed and the difference put / deleted. The wicket
 //! serves on while the cf-api is down.
+//!
+//! The data of a deleted keyvalue instance is deleted once no app maps its
+//! namespace, the wicket's draining routes included: tried at the deletion
+//! and again after each listing.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::logs::Logs;
-use crate::store::{App, Outcome, State, Store};
+use crate::services::Offer;
+use crate::store::{App, Outcome, Purge, State, Store};
 use crate::wicket::{AppBody, ComponentRef, Failure, ListedApp, Sandbox, Wicket};
 
 pub struct Controller {
@@ -21,6 +25,8 @@ pub struct Controller {
     /// One edit at a time: a trial against the wicket and its commit are
     /// not interleaved with another's.
     pub edits: tokio::sync::Mutex<()>,
+    /// What the wicket offers, as it last listed it.
+    pub offer: Mutex<Option<Offer>>,
 }
 
 impl Controller {
@@ -44,14 +50,72 @@ impl Controller {
                 name: running.file.clone(),
             },
             sandbox: Sandbox {
-                wasi: Vec::new(),
+                wasi: running.wasi.clone(),
                 budget_ms: running.budget_ms,
                 memory_mib: Some(running.memory_mib),
                 pool: app.process.instances,
                 instances: running.instances,
-                keyvalue: BTreeMap::new(),
+                keyvalue: running.keyvalue.clone(),
             },
         })
+    }
+
+    /// What the wicket offers: as last listed, else listed now.
+    pub async fn offer(&self) -> Result<Offer, Failure> {
+        if let Some(offer) = self.offer.lock().expect("no panic under the lock").clone() {
+            return Ok(offer);
+        }
+        let listing = self.wicket.list(None).await?;
+        Ok(self.note_offer(&listing.capabilities, &listing.keyvalue_stores))
+    }
+
+    fn note_offer(&self, capabilities: &[String], stores: &[crate::wicket::ListedStore]) -> Offer {
+        let offer = Offer::new(capabilities, stores);
+        *self.offer.lock().expect("no panic under the lock") = Some(offer.clone());
+        offer
+    }
+
+    /// Deletes the data of the deleted instances no started app's snapshot
+    /// maps any more, as far as the wicket lets it: one a route still maps
+    /// (409) waits, as does an unreachable wicket; one it cannot delete (a
+    /// store gone: 404) is dropped. Not under the edit lock: the caller
+    /// holds it.
+    pub async fn purge_pending(&self) {
+        let due: Vec<Purge> = self.store.read(|state| {
+            state
+                .purges
+                .iter()
+                .filter(|purge| {
+                    let place = format!("{}/{}", purge.store, purge.namespace);
+                    !state.apps.iter().any(|app| {
+                        app.started
+                            && app.running.as_ref().is_some_and(|running| {
+                                running.keyvalue.values().any(|kept| *kept == place)
+                            })
+                    })
+                })
+                .cloned()
+                .collect()
+        });
+        for purge in due {
+            let named = format!(
+                "the data of service instance {} ({}/{})",
+                purge.instance, purge.store, purge.namespace
+            );
+            match self.wicket.purge(&purge.store, &purge.namespace).await {
+                Ok(keys) => println!("SERVICES: deleted {named}: {keys} key(s)"),
+                Err(Failure::Refused {
+                    status: status @ (400 | 404),
+                    error,
+                    ..
+                }) => {
+                    println!("SERVICES: dropped {named}: the wicket refused it ({status}): {error}")
+                }
+                Err(_) => continue,
+            }
+            self.store
+                .update(|state| state.purges.retain(|kept| *kept != purge));
+        }
     }
 
     /// The desired app of `guid` in the state now.
@@ -195,7 +259,9 @@ impl Controller {
         }
     }
 
-    /// Lists the wicket's apps and fixes the difference at startup and whenever the wicket's revision moves; while
+    /// Lists the wicket's apps and fixes the difference at startup and
+    /// whenever the wicket's revision moves, then tries the pending purges
+    /// (after a hold too: a drained route's end moves no revision); while
     /// the wicket is unreachable, every started app is `STARTING`, and the
     /// wicket is tried again with a growing pause.
     pub async fn watch(self: Arc<Self>) {
@@ -212,13 +278,18 @@ impl Controller {
                 }
             };
             pause = Duration::from_secs(1);
-            if after == Some(listing.revision) {
-                // the hold ended: nothing moved
+            self.note_offer(&listing.capabilities, &listing.keyvalue_stores);
+            let moved = after != Some(listing.revision);
+            after = Some(listing.revision);
+            let pending = self.store.read(|state| !state.purges.is_empty());
+            if !moved && !pending {
                 continue;
             }
-            after = Some(listing.revision);
             let _edit = self.edits.lock().await;
-            self.fix(&listing.apps).await;
+            if moved {
+                self.fix(&listing.apps).await;
+            }
+            self.purge_pending().await;
         }
     }
 
@@ -243,13 +314,17 @@ impl Controller {
 }
 
 /// Whether the wicket serves `desired` as listed: a `budget_ms` left to
-/// the wicket's default matches whatever it chose.
+/// the wicket's default matches whatever it chose; the capabilities in any
+/// order.
 fn same(listed: &AppBody, desired: &AppBody) -> bool {
-    let mut hosts = listed.hosts.clone();
-    hosts.sort();
-    hosts == desired.hosts
+    let sorted = |list: &[String]| {
+        let mut list = list.to_vec();
+        list.sort();
+        list
+    };
+    sorted(&listed.hosts) == desired.hosts
         && listed.component == desired.component
-        && listed.sandbox.wasi == desired.sandbox.wasi
+        && sorted(&listed.sandbox.wasi) == sorted(&desired.sandbox.wasi)
         && listed.sandbox.pool == desired.sandbox.pool
         && listed.sandbox.instances == desired.sandbox.instances
         && listed.sandbox.memory_mib == desired.sandbox.memory_mib
@@ -279,6 +354,8 @@ mod tests {
             memory_mib: 64,
             budget_ms: Some(5000),
             instances: None,
+            wasi: vec!["keyvalue".into(), "cli".into()],
+            keyvalue: [(String::new(), "local/cf/i".to_string())].into(),
             since: 0,
         };
         state.app_mut(&guid).unwrap().running = Some(running);
@@ -292,8 +369,11 @@ mod tests {
         assert_eq!(desired.hosts, ["hello.localhost"]);
         assert_eq!(desired.sandbox.pool, 2);
         assert_eq!(desired.sandbox.memory_mib, Some(64));
+        assert_eq!(desired.sandbox.keyvalue[""], "local/cf/i");
         let mut listed = desired.clone();
         listed.sandbox.budget_ms = Some(5000);
+        // the wicket lists the capabilities in its order
+        listed.sandbox.wasi = vec!["cli".into(), "keyvalue".into()];
         assert!(same(&listed, &desired));
         listed.sandbox.pool = 3;
         assert!(!same(&listed, &desired));

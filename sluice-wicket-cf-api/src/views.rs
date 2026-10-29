@@ -43,6 +43,11 @@ pub fn v3(base: &str) -> Value {
         "packages",
         "processes",
         "routes",
+        "service_brokers",
+        "service_credential_bindings",
+        "service_instances",
+        "service_offerings",
+        "service_plans",
         "spaces",
         "stacks",
     ];
@@ -370,7 +375,7 @@ pub fn env(base: &str, state: &State, app: &App) -> Value {
         "staging_env_json": {},
         "running_env_json": {},
         "environment_variables": {},
-        "system_env_json": {"VCAP_SERVICES": {}},
+        "system_env_json": {"VCAP_SERVICES": crate::services::vcap_services(state, &app.guid)},
         "application_env_json": {"VCAP_APPLICATION": {
             "application_id": app.guid,
             "application_name": app.name,
@@ -410,6 +415,29 @@ pub fn manifest(state: &State, app: &App) -> String {
         text.push_str("  routes:\n");
         text.extend(routes);
     }
+    // a JSON string is a YAML scalar
+    let quoted = |text: &str| serde_json::to_string(text).expect("a string");
+    let services: Vec<String> = state
+        .bindings_of(&app.guid)
+        .filter_map(|binding| {
+            let instance = state.instance(&binding.instance)?;
+            let mut entry = format!("  - name: {}\n", quoted(&instance.name));
+            if let Some(name) = &binding.name {
+                entry.push_str(&format!("    binding_name: {}\n", quoted(name)));
+            }
+            if !binding.identifier.is_empty() {
+                entry.push_str(&format!(
+                    "    parameters:\n      identifier: {}\n",
+                    quoted(&binding.identifier)
+                ));
+            }
+            Some(entry)
+        })
+        .collect();
+    if !services.is_empty() {
+        text.push_str("  services:\n");
+        text.extend(services);
+    }
     if !app.annotations.is_empty() || !app.labels.is_empty() {
         text.push_str("  metadata:\n");
         for (what, map) in [("labels", &app.labels), ("annotations", &app.annotations)] {
@@ -426,7 +454,7 @@ pub fn manifest(state: &State, app: &App) -> String {
 
 /// The filters the CLI sends, as JSON pointers into a resource's view;
 /// `app_guids` of a route reads its destinations.
-const FILTERS: [(&str, &str); 16] = [
+const FILTERS: [(&str, &str); 22] = [
     ("names", "/name"),
     ("guids", "/guid"),
     ("space_guids", "/relationships/space/data/guid"),
@@ -446,6 +474,24 @@ const FILTERS: [(&str, &str); 16] = [
     ("lifecycle_type", "/lifecycle/type"),
     ("package_guids", "/package/guid"),
     ("droplet_guids", "/droplet/guid"),
+    ("type", "/type"),
+    ("available", "/available"),
+    (
+        "service_instance_guids",
+        "/relationships/service_instance/data/guid",
+    ),
+    (
+        "service_plan_guids",
+        "/relationships/service_plan/data/guid",
+    ),
+    (
+        "service_offering_guids",
+        "/relationships/service_offering/data/guid",
+    ),
+    (
+        "service_broker_guids",
+        "/relationships/service_broker/data/guid",
+    ),
 ];
 
 /// `items` filtered and ordered as `query` asks (`names=a,b`, `order_by=-name`).

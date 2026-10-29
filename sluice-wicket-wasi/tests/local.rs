@@ -5,7 +5,8 @@
 //! wickets share as wickets on two hosts would. Nothing drains: SIGTERM ends
 //! the process at once, with 0. The console deploys an uploaded component as
 //! a route at once, and moves it to another host as it is; its API serves a
-//! controller's app of hosts the same way.
+//! controller's app of hosts the same way, and deletes the data of a keyvalue
+//! namespace no route maps.
 #![cfg(unix)]
 
 #[path = "support/redis_server.rs"]
@@ -351,13 +352,15 @@ routes:
 /// across a restart, until removed. It asks for its token, and refuses an
 /// edit from another origin and a body that is no wasm. A controller's app,
 /// its component uploaded by digest, serves its hosts at once, listed as it
-/// was put, the page's endpoints refusing them, until its owner removes it.
+/// was put, the page's endpoints refusing them, until its owner removes it;
+/// the data of its keyvalue namespace is deleted only then.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_console_deploys_an_uploaded_component_as_a_route() {
     let hello = std::fs::read(guests().join("hello.wasm")).unwrap();
     let dir = std::env::temp_dir().join(format!("sluice-console-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let kept = dir.join("deployed");
+    let kv_file = dir.join("kv.db").to_string_lossy().into_owned();
     let args = [
         "--console",
         "127.0.0.1:0",
@@ -365,6 +368,8 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         "s3cret",
         "--console-dir",
         kept.to_str().unwrap(),
+        "--keyvalue-file",
+        kv_file.as_str(),
     ];
     let mut wicket = Wicket::start(&args);
     let (address, at) = (wicket.address(), wicket.console());
@@ -493,8 +498,10 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
     assert_eq!((status, body), (200, uploaded));
     let app = |hosts: &[&str], component: &[u8]| {
         let component = serde_json::json!({"sha256": digest(component), "name": "app.wasm"});
+        let sandbox = serde_json::json!({"wasi": ["cli", "keyvalue"], "pool": 1,
+                                         "keyvalue": {"": "local/cf/shop"}});
         let app = serde_json::json!({"owner": "cf", "hosts": hosts, "component": component,
-                                     "sandbox": {"wasi": ["cli"], "pool": 1}});
+                                     "sandbox": sandbox});
         app.to_string().into_bytes()
     };
     let shop = app(&["b.localhost", "a.localhost"], &hello);
@@ -524,9 +531,21 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         listing["keyvalue_stores"],
         serde_json::json!([{"name": "local", "type": "sqlite", "default": true}])
     );
-    // listed as put: put again, it changes nothing
+    // listed as put: put again, it changes nothing; with what a sandbox may hold
     let (_, _, apps) = console(&at, "GET /api/apps", &[bearer], b"").await;
     let apps: serde_json::Value = serde_json::from_str(&apps).unwrap();
+    let capabilities = [
+        "cli",
+        "inherit-network",
+        "allow-ip-name-lookup",
+        "tcp",
+        "udp",
+    ];
+    assert_eq!(
+        apps["capabilities"],
+        serde_json::json!([&capabilities[..], &["keyvalue"]].concat())
+    );
+    assert_eq!(apps["keyvalue_stores"], listing["keyvalue_stores"]);
     let mut listed = apps["apps"][0].clone();
     assert_eq!(
         listed["hosts"],
@@ -572,6 +591,18 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         )),
         "{error}"
     );
+    // its keyvalue namespace's data is deleted once no route maps it
+    let purge = "DELETE /api/keyvalue/local/cf%2Fshop";
+    let (status, _, body) = console(&at, purge, &[bearer], b"").await;
+    assert_eq!(
+        (status, body.as_str()),
+        (
+            409,
+            r#"{"error":"the keyvalue namespace local/cf/shop is mapped by a.localhost, b.localhost"}"#
+        )
+    );
+    let (status, _, body) = console(&at, "DELETE /api/keyvalue/nope/x", &[bearer], b"").await;
+    assert_eq!(status, 404, "{body}");
     // removed by its owner only
     let intruder = "DELETE /api/apps/shop?owner=intruder";
     let (status, _, _) = console(&at, intruder, &[bearer], b"").await;
@@ -585,6 +616,19 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         )
     );
     assert_eq!(get(&address, "a.localhost", "/").await.0, 404);
+    // once its routes drained: at once without a sluice server
+    let started = Instant::now();
+    let (status, _, body) = loop {
+        let answer = console(&at, purge, &[bearer], b"").await;
+        if answer.0 != 409 || started.elapsed() > HANG {
+            break answer;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        (status, body.as_str()),
+        (200, r#"{"store":"local","namespace":"cf/shop","keys":0}"#)
+    );
     drop(wicket);
     let _ = std::fs::remove_dir_all(&dir);
 }

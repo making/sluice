@@ -47,6 +47,8 @@ sha2 = "0.10"
 serde_json = "1"
 form_urlencoded = "1"
 base64 = "0.22"
+# the console: a keyvalue namespace in a path (it may hold '/')
+percent-encoding = "2"
 # the sqlite keyvalue store; bundled: no system libsqlite3 (the build compiles C for ring already)
 rusqlite = { version = "0.40", features = ["bundled"] }
 # the redis keyvalue store: a multiplexed connection, reconnected; rediss:// on the ring

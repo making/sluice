@@ -3,10 +3,12 @@
 //! component is uploaded by digest first.
 //!
 //! ```text
-//! GET    /api/apps[?after=<revision>]   the apps; held until they change with `after`
-//! PUT    /api/components/<sha256>       keeps the body under its digest
-//! PUT    /api/apps/<name>               serves the app of the body
-//! DELETE /api/apps/<name>?owner=<owner> removes the app
+//! GET    /api/apps[?after=<revision>]          the apps, the capabilities and the keyvalue
+//!                                              stores; held until they change with `after`
+//! PUT    /api/components/<sha256>              keeps the body under its digest
+//! PUT    /api/apps/<name>                      serves the app of the body
+//! DELETE /api/apps/<name>?owner=<owner>        removes the app
+//! DELETE /api/keyvalue/<store>/<namespace>     deletes the data of a namespace no route maps
 //! ```
 
 use std::collections::BTreeMap;
@@ -60,7 +62,21 @@ pub struct Sandbox {
 pub struct Listing {
     pub revision: u64,
     pub generation: u64,
+    /// What a sandbox may hold: the capabilities, in the wicket's order.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub keyvalue_stores: Vec<ListedStore>,
     pub apps: Vec<ListedApp>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct ListedStore {
+    pub name: String,
+    /// `sqlite` or `redis`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub default: bool,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -180,6 +196,30 @@ impl Wicket {
         }
         serde_json::from_slice(&body)
             .map(Some)
+            .map_err(|e| Failure::Unreachable(format!("the answer: {e}")))
+    }
+
+    /// Deletes the data of the keyvalue namespace: how many keys it held.
+    /// Refused (409) while a route maps it.
+    pub async fn purge(&self, store: &str, namespace: &str) -> Result<u64, Failure> {
+        // no space in a store's name nor in `cf/<guid>`: form encoding is
+        // path encoding here
+        let place: String =
+            form_urlencoded::byte_serialize(format!("{store}/{namespace}").as_bytes()).collect();
+        let request = self
+            .client
+            .delete(format!("{}/api/keyvalue/{place}", self.base))
+            .timeout(EDIT_TIMEOUT);
+        let (status, body) = self.send(request).await?;
+        if !status.is_success() {
+            return Err(refused(status, &body));
+        }
+        #[derive(Deserialize)]
+        struct Purged {
+            keys: u64,
+        }
+        serde_json::from_slice::<Purged>(&body)
+            .map(|purged| purged.keys)
             .map_err(|e| Failure::Unreachable(format!("the answer: {e}")))
     }
 
