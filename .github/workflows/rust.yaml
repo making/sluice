@@ -1,8 +1,8 @@
 name: Rust
 # The Rust crates' own gates, apart from CI: a Java-only change runs none of them, and
 # each crate's job runs only when its paths changed. CI still builds sluice-flume for the
-# sluice-it tests. A run with the sluice-flume / sluice-wicket-wasi job passed deploys
-# its image (deploy-flume.yaml / deploy-wicket.yaml).
+# sluice-it tests. A run with the sluice-flume / sluice-wicket-wasi / sluice-wicket-cf-api
+# job passed deploys its image (deploy-flume.yaml / deploy-wicket.yaml / deploy-cf-api.yaml).
 on:
   push:
     branches:
@@ -10,11 +10,13 @@ on:
     paths: &rust-paths
     - 'sluice-flume/**'
     - 'sluice-wicket-wasi/**'
+    - 'sluice-wicket-cf-api/**'
     - 'sluice-build-info/**'
     - 'sluice-proto/src/main/proto/**'
     - '.github/workflows/rust.yaml'
     - '.github/workflows/deploy-flume.yaml'
     - '.github/workflows/deploy-wicket.yaml'
+    - '.github/workflows/deploy-cf-api.yaml'
   pull_request:
     branches:
     - main
@@ -35,6 +37,7 @@ jobs:
       build-info: ${{ steps.filter.outputs.build-info }}
       flume: ${{ steps.filter.outputs.flume }}
       wicket: ${{ steps.filter.outputs.wicket }}
+      cf-api: ${{ steps.filter.outputs.cf-api }}
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -57,6 +60,14 @@ jobs:
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
           - '.github/workflows/deploy-wicket.yaml'
+          # its integration test runs the wicket: a wicket change is its change too
+          cf-api:
+          - 'sluice-wicket-cf-api/**'
+          - 'sluice-wicket-wasi/**'
+          - 'sluice-build-info/**'
+          - 'sluice-proto/src/main/proto/**'
+          - '.github/workflows/rust.yaml'
+          - '.github/workflows/deploy-cf-api.yaml'
   sluice-build-info:
     needs: changes
     if: needs.changes.outputs.build-info == 'true'
@@ -146,5 +157,47 @@ jobs:
         cargo clippy --all-targets --locked -- -D warnings
         cargo clippy --locked --no-default-features -- -D warnings
         (cd examples && cargo clippy --all-targets --locked -- -D warnings)
+    - name: Test
+      run: cargo test --locked
+  # The cf-api's integration test drives the OSS cf CLI (installed here) against the cf-api
+  # and a wicket in local mode: the test builds the wicket (debug) and its example guests
+  # (the nightly toolchain examples/ pins) with cargo, so their targets are cached too.
+  sluice-wicket-cf-api:
+    needs: changes
+    if: needs.changes.outputs.cf-api == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: sluice-wicket-cf-api
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Install protoc
+      run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends protobuf-compiler
+    - name: Install the cf CLI
+      run: |
+        curl -sSL https://github.com/cloudfoundry/cli/releases/download/v8.19.0/cf8-cli_8.19.0_linux_x86-64.tgz | sudo tar -xz -C /usr/local/bin cf8
+        cf8 --version
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.rustup/toolchains/nightly-*
+          ~/.rustup/toolchains/1.*
+          ~/.cargo/registry
+          ~/.cargo/git
+          sluice-wicket-cf-api/target
+          sluice-wicket-wasi/target
+          sluice-wicket-wasi/examples/target
+        key: cargo-cf-api-${{ runner.os }}-${{ hashFiles('sluice-wicket-cf-api/Cargo.lock', 'sluice-wicket-wasi/Cargo.lock', 'sluice-wicket-wasi/examples/Cargo.lock', 'sluice-wicket-cf-api/rust-toolchain.toml', 'sluice-wicket-wasi/rust-toolchain.toml', 'sluice-wicket-wasi/examples/rust-toolchain.toml') }}
+    - name: Toolchains
+      run: |
+        rustup toolchain install
+        (cd ../sluice-wicket-wasi && rustup toolchain install)
+        (cd ../sluice-wicket-wasi/examples && rustup toolchain install)
+    - name: Format
+      run: cargo fmt --check
+    - name: Clippy
+      run: cargo clippy --all-targets --locked -- -D warnings
     - name: Test
       run: cargo test --locked

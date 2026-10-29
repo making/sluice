@@ -1,0 +1,39 @@
+[package]
+name = "sluice-wicket-cf-api"
+version = "0.0.1-SNAPSHOT"
+edition = "2024"
+publish = false
+
+# Its own workspace, laid out as sluice-flume: built apart from sluice-wicket-wasi (no
+# wasmtime in its tree: whether a component loads is the wicket's call).
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-std", "io-util", "signal"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+# the wicket's app API (plain HTTP: the cf-api sits next to its wicket)
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# the manifests cf push applies
+serde-saphyr = { version = "2", default-features = false, features = ["deserialize"] }
+# the droplets' digests, and the HMAC of the tokens
+sha2 = "0.10"
+# the package cf push uploads
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# the guids
+uuid = { version = "1", features = ["v4"] }
+form_urlencoded = "1"
+base64 = "0.22"
+# the key the tokens are signed with
+getrandom = "0.4"
+
+[build-dependencies]
+sluice-build-info = { path = "../sluice-build-info" }
+
+[profile.release]
+strip = true

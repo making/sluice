@@ -1,0 +1,111 @@
+# sluice-wicket-cf-api
+
+A Cloud Foundry API facade for one [sluice-wicket-wasi](../sluice-wicket-wasi/README.md): the
+subset of the Cloud Controller v3 API, the UAA token endpoints and log-cache's read API the
+stock `cf` CLI uses, on one origin. It keeps the desired state of its apps and has the wicket
+serve them through the wicket's [app API](../sluice-wicket-wasi/README.md#apps), so a wasm
+component is deployed with `cf push`, and routes, scaling, rolling updates, stop and start and
+`cf logs` work as the CLI expects.
+
+```text
+cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> sluice-wicket-wasi <--tunnel-- sluice server
+```
+
+The target is the OSS CLI ([cloudfoundry/cli](https://github.com/cloudfoundry/cli) v8, `cf8`);
+the Tanzu distribution (`cf` 10.x) reads `/v3/info` and refuses any other platform.
+
+## Run
+
+```text
+cargo build --release                                # needs git only (the build embeds the commit)
+
+# the wicket, serving on 8080 with its console on 9090 (see its README)
+sluice-wicket-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090 --console-token SECRET
+
+# the cf-api, on http://127.0.0.1:9091
+target/release/sluice-wicket-cf-api --wicket http://127.0.0.1:9090 --wicket-token SECRET
+
+cf8 login -a http://127.0.0.1:9091 -u me -p x   # any credentials
+cf8 push hello -p dist/                          # dist/ holds hello.wasm (a wasi:http 0.3 component)
+curl http://hello.localhost:8080/                # the wicket's --listen; *.localhost is the loopback
+cf8 map-route hello localhost --hostname hi
+cf8 scale hello -i 2
+cf8 push hello -p dist/ --strategy rolling       # swapped in place
+cf8 logs hello --recent
+```
+
+| option | |
+|---|---|
+| `--listen <host:port>` | bind address (default `127.0.0.1:9091`); a loopback address only, as the API takes any credentials |
+| `--wicket <url>` | the wicket's console, `http://host:port` |
+| `--wicket-token <token>` / `--wicket-token-file <path>` | its `--console-token` |
+| `--domain <name>` | a shared domain; repeatable (or comma-separated): the first takes the default and random routes (default `localhost`). Through a sluice server, a suffix whose wildcard DNS reaches it |
+| `--data-dir <path>` | the state and the blobs (default `cf-api`): `state.json` (written by a rename on every change), `jwt.key`, `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app) |
+| `--org <name>` / `--space <name>` | the one organization and space (default `sluice` / `wicket`) |
+| `--exit-on-stdin-close` | exit when stdin reaches its end (a parent's child process) |
+
+Each option also reads `SLUICE_WICKET_CF_API_<NAME>` from the environment. The image
+`ghcr.io/making/sluice/sluice-wicket-cf-api` (`latest` / `<sha>`, built from
+`Dockerfile` at the repository root) keeps `/data` as the working directory; it listens on
+the loopback, so it is reached from the wicket's network namespace (`--network host`, a
+sidecar, `kubectl port-forward`).
+
+## Mapping
+
+| CF | wicket |
+|---|---|
+| app, started, with a droplet and a route | an app named by its guid, owner `cf`: its routes' hosts, the droplet's component, the sandbox below |
+| app stopped, or without a route | no app in the wicket |
+| route `<host>.<domain>` | a host: labels of `a-z`, `0-9` and `-`. No path, port or wildcard (422). A route serves one app: a second destination is refused; zero-downtime updates are `--strategy rolling` |
+| shared domain | `--domain` |
+| package (bits) | the uploaded zip: `cf push` takes a directory or a zip (`-p hello.wasm` fails in the CLI: `not a valid zip file`) |
+| build | picks the component: the one the web process command names (`-c hello.wasm`, `command:`), else the package's only `.wasm`; it must be a component (`\0asm`, layer 1). Anything else fails the build, naming what it found |
+| droplet | that component, by sha256 (`process_types.web` its path; stack `wasip3`, buildpack `wasm`) |
+| web process `instances` | `pool`: warm instances. A request beyond them gets an instance of its own, as on every route: 0 still serves |
+| web process `memory` | `memory-mib` |
+| annotations `wicket.sluice.ik.am/budget-ms`, `wicket.sluice.ik.am/instances` | `budget-ms`, `instances` (the route's cap; below `pool` the wicket refuses) |
+| disk, health check, log rate, stack, buildpacks | accepted and shown, no effect |
+| instance state | `RUNNING` once the wicket took the app; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable |
+| rolling deployment | the app put with the new droplet: the wicket swaps it in place; finalized at once |
+| org / space | one of each |
+
+## Behavior
+
+- as on CF, routes and `instances` apply at once; the droplet and the rest of the sandbox
+  (memory, annotations) at a start, restart, restage or deployment: the running app is the
+  snapshot taken then. For `scale -m` the CLI stops and starts the app itself
+- an edit the wicket answers at once (map-route, unmap-route, scale -i, a manifest's routes)
+  is refused with 422 and the wicket's reason, and changes nothing; a start, restart or
+  deployment is accepted, and its outcome shows in the process stats and the log (`cf logs`)
+- the desired state is the cf-api's: at startup and whenever the wicket's revision moves
+  (`GET /api/apps?after=`), it lists the wicket's apps of its owner and puts / deletes the
+  difference (the same app again changes nothing: the wicket's generation stays). The wicket
+  serves on while the cf-api is down; with the wicket down, the apps show `STARTING` and are
+  put when it is back
+- `cf logs` (log-cache `read`, polled by the CLI): an in-memory ring of 1000 lines per app of
+  the cf-api's own lines: staging (`STG`), lifecycle (`API`), the wicket's outcome (`CELL`)
+- auth: `POST /uaa/oauth/token` takes any credentials (the password, refresh_token and
+  client_credentials grants) and answers a JWT (HS256) signed with the key in `--data-dir`, so
+  a login outlives a restart; every request but the root document, `/v3`, `/v3/info` and the
+  UAA endpoints needs a valid one (log-cache's included), and everyone may do everything. That is
+  why the listener binds a loopback address only
+- errors are in CC's shape (`{"errors": [{"code", "title", "detail"}]}`); `/v3/info` names
+  this API
+
+## Limits
+
+Refused with why (422): route paths, ports and wildcards, private and internal domains, docker
+images, tasks, ssh, sidecars, process types but `web`, route services, environment variables
+(`cf set-env`, a manifest's `env:`), services (`cf create-service`, `bind-service`, a manifest's
+`services:`). One owner (`cf`) per wicket: two cf-apis must not share one.
+
+The integration test (`tests/cli.rs`) runs the OSS CLI -- `SLUICE_CF_CLI`, else `cf8` on the
+PATH -- against the cf-api and a wicket in local mode, building the wicket and its example
+guests from `../sluice-wicket-wasi` (or taking `SLUICE_WICKET_WASI` and
+`SLUICE_WICKET_GUESTS`):
+
+```text
+gh release download v8.19.0 -R cloudfoundry/cli -p 'cf8-cli_8.19.0_macosarm.tgz'
+tar xzf cf8-cli_8.19.0_macosarm.tgz
+SLUICE_CF_CLI=$PWD/cf8 cargo test
+```

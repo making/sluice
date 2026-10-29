@@ -1,0 +1,170 @@
+name: Deploy cf-api
+# Builds and saves the sluice-wicket-cf-api image once the Rust workflow succeeds on a push
+# to main with its sluice-wicket-cf-api job run (a run without it deploys nothing here). This
+# file only takes effect from the default branch (workflow_run).
+on:
+  workflow_run:
+    workflows:
+    - Rust
+    types:
+    - completed
+    branches:
+    - main
+# One deploy at a time, never cancelled midway (it may be pushing the images branch);
+# GitHub keeps one pending run per group and cancels the older pending one.
+concurrency:
+  group: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && 'deploy-cf-api' || format('deploy-cf-api-noop-{0}', github.run_id) }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+env:
+  REGISTRY: ghcr.io
+jobs:
+  target:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      revision: ${{ steps.target.outputs.revision }}
+    steps:
+    # Target: the commit of the triggering run, when its sluice-wicket-cf-api job ran and
+    # passed.
+    # Skipped when the images branch already holds it or a newer commit.
+    - name: Pick the revision to deploy
+      id: target
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RUN_ID: ${{ github.event.workflow_run.id }}
+        TARGET: ${{ github.event.workflow_run.head_sha }}
+      run: |
+        CFAPI=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" --jq '.jobs[] | select(.name == "sluice-wicket-cf-api") | .conclusion')
+        if [ "${CFAPI}" != "success" ]; then
+          echo "Skipped: the sluice-wicket-cf-api job of run ${RUN_ID} did not run (${CFAPI:-absent})" | tee -a "${GITHUB_STEP_SUMMARY}"
+          exit 0
+        fi
+        # absent before the first deploy
+        DEPLOYED=$(gh api "repos/${GITHUB_REPOSITORY}/contents/sluice-wicket-cf-api.yaml?ref=images" --jq .content 2>/dev/null | base64 -d | awk '/^git_revision:/{print $2}' || true)
+        STATUS=none
+        if [ -n "${DEPLOYED}" ]; then
+          STATUS=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${DEPLOYED}...${TARGET}" --jq .status)
+        fi
+        echo "target: ${TARGET}, deployed: ${DEPLOYED:-none}, target vs deployed: ${STATUS}" | tee -a "${GITHUB_STEP_SUMMARY}"
+        case "${STATUS}" in
+          identical|behind) echo "Skipped: ${TARGET} is not newer than the deployed revision" | tee -a "${GITHUB_STEP_SUMMARY}" ;;
+          *) echo "revision=${TARGET}" >> "${GITHUB_OUTPUT}" ;;
+        esac
+  # a Dockerfile build (a static Rust binary), not a buildpack one
+  build-image:
+    needs: target
+    if: needs.target.outputs.revision != ''
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - { arch: amd64,   runs_on: ubuntu-latest }
+        - { arch: aarch64, runs_on: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runs_on }}
+    env:
+      REVISION: ${{ needs.target.outputs.revision }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ needs.target.outputs.revision }}
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build and push image (${{ matrix.arch }})
+      env:
+        ARCH: ${{ matrix.arch }}
+      run: |
+        IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/sluice-wicket-cf-api | tr '[:upper:]' '[:lower:]')"
+        docker build -f sluice-wicket-cf-api/Dockerfile --build-arg GIT_COMMIT=${REVISION} -t ${IMAGE}:${ARCH}_${REVISION} .
+        docker push ${IMAGE}:${ARCH}_${REVISION}
+        docker tag ${IMAGE}:${ARCH}_${REVISION} ${IMAGE}:${ARCH}
+        docker push ${IMAGE}:${ARCH}
+  push-manifest:
+    needs:
+    - target
+    - build-image
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    env:
+      REVISION: ${{ needs.target.outputs.revision }}
+    steps:
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Create and push manifest
+      run: |
+        IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/sluice-wicket-cf-api | tr '[:upper:]' '[:lower:]')"
+        docker manifest create ${IMAGE}:${REVISION} \
+          --amend ${IMAGE}:amd64_${REVISION} \
+          --amend ${IMAGE}:aarch64_${REVISION}
+        docker manifest push ${IMAGE}:${REVISION}
+        docker manifest create ${IMAGE}:latest \
+          --amend ${IMAGE}:amd64_${REVISION} \
+          --amend ${IMAGE}:aarch64_${REVISION}
+        docker manifest push ${IMAGE}:latest
+    - name: Generate image file
+      run: |
+        IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/sluice-wicket-cf-api | tr '[:upper:]' '[:lower:]')"
+        DIGEST=$(docker buildx imagetools inspect ${IMAGE}:${REVISION} | awk '/^Digest:/{print $2}')
+        cat <<EOF > sluice-wicket-cf-api.yaml
+        image: ${IMAGE}@${DIGEST}
+        git_revision: ${REVISION}
+        deployment:
+          image:
+            repository: ${IMAGE}
+            digest: ${DIGEST}
+          podLabels:
+            github.com/revision: ${REVISION}
+        EOF
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: sluice-wicket-cf-api
+        path: sluice-wicket-cf-api.yaml
+  save-image:
+    needs:
+    - target
+    - push-manifest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      REVISION: ${{ needs.target.outputs.revision }}
+    steps:
+    - name: Checkout images branch
+      uses: actions/checkout@v4
+      with:
+        ref: images
+    - name: Download image file
+      uses: actions/download-artifact@v4
+      with:
+        name: sluice-wicket-cf-api
+    - name: Commit and push
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add sluice-wicket-cf-api.yaml
+        git diff --cached --quiet || git commit -m ":robot: Update sluice-wicket-cf-api.yaml for ${REVISION}"
+        git pull --rebase origin images
+        git push origin images

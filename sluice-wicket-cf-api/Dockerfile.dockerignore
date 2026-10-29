@@ -1,0 +1,8 @@
+# the context is the repository root; the build needs the crate and its build script dependency only
+*
+!sluice-build-info/Cargo.toml
+!sluice-build-info/src
+!sluice-wicket-cf-api/Cargo.toml
+!sluice-wicket-cf-api/Cargo.lock
+!sluice-wicket-cf-api/build.rs
+!sluice-wicket-cf-api/src
