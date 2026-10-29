@@ -36,5 +36,14 @@ The PoC was verified by hand only; nothing runs it in `./mvnw verify`.
   real server: a wicket whose stream the server stops reading gives it up and
   reconnects
 
+- console (`--console`): the page was checked by hand in Chrome only; `tests/local.rs`
+  covers its API. A Playwright test (as `ConsoleE2ETest`) against the real binary: a
+  component chosen in the file chooser deploys and serves; one dropped on a console row
+  replaces its component (a synthetic `DataTransfer` drop); a refused deploy (`counter`
+  without `keyvalue`) shows the reason and the routes stay; the sandbox editor saves, and
+  refuses instances below the pool; remove asks first; a config route has no actions; a
+  core module is stopped before the upload; a broken config file shows the reload-failure
+  banner and the fix clears it
+
 Acceptance: `./mvnw verify` covers the wasm path; CI without rust still passes
 (skipped, not failed).
