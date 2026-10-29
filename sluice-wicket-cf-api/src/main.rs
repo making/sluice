@@ -14,7 +14,7 @@ async fn main() -> ExitCode {
             println!("{}", sluice_wicket_cf_api::describe_build());
             return ExitCode::SUCCESS;
         }
-        Ok(Command::Serve(config)) => config,
+        Ok(Command::Serve(config)) => *config,
         Err(message) => {
             eprintln!("{message}\n\n{}", config::USAGE);
             return ExitCode::from(2);

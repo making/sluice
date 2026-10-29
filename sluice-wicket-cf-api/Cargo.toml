@@ -31,8 +31,15 @@ form_urlencoded = "1"
 base64 = "0.22"
 # the key the tokens are signed with
 getrandom = "0.4"
+# the live access log the apps' logs come from: a watch of the sluice-flume
+tonic = { version = "0.14", features = ["tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14"
+prost = "0.14"
+# its TLS (grpcs, --flume-insecure); the ring provider matches tonic's tls-ring
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [build-dependencies]
+tonic-prost-build = "0.14"
 sluice-build-info = { path = "../sluice-build-info" }
 
 [profile.release]

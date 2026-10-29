@@ -60,10 +60,11 @@ jobs:
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
           - '.github/workflows/deploy-wicket.yaml'
-          # its integration test runs the wicket: a wicket change is its change too
+          # its integration test runs the wicket and the flume: their change is its change too
           cf-api:
           - 'sluice-wicket-cf-api/**'
           - 'sluice-wicket-wasi/**'
+          - 'sluice-flume/**'
           - 'sluice-build-info/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
@@ -160,8 +161,9 @@ jobs:
     - name: Test
       run: cargo test --locked
   # The cf-api's integration test drives the OSS cf CLI (installed here) against the cf-api
-  # and a wicket in local mode: the test builds the wicket (debug) and its example guests
-  # (the nightly toolchain examples/ pins) with cargo, so their targets are cached too.
+  # and a wicket in local mode on a flume: the test builds the wicket (debug), its example
+  # guests (the nightly toolchain examples/ pins) and the flume with cargo, so their targets
+  # are cached too.
   sluice-wicket-cf-api:
     needs: changes
     if: needs.changes.outputs.cf-api == 'true'
@@ -189,12 +191,14 @@ jobs:
           sluice-wicket-cf-api/target
           sluice-wicket-wasi/target
           sluice-wicket-wasi/examples/target
-        key: cargo-cf-api-${{ runner.os }}-${{ hashFiles('sluice-wicket-cf-api/Cargo.lock', 'sluice-wicket-wasi/Cargo.lock', 'sluice-wicket-wasi/examples/Cargo.lock', 'sluice-wicket-cf-api/rust-toolchain.toml', 'sluice-wicket-wasi/rust-toolchain.toml', 'sluice-wicket-wasi/examples/rust-toolchain.toml') }}
+          sluice-flume/target
+        key: cargo-cf-api-${{ runner.os }}-${{ hashFiles('sluice-wicket-cf-api/Cargo.lock', 'sluice-wicket-wasi/Cargo.lock', 'sluice-wicket-wasi/examples/Cargo.lock', 'sluice-flume/Cargo.lock', 'sluice-wicket-cf-api/rust-toolchain.toml', 'sluice-wicket-wasi/rust-toolchain.toml', 'sluice-wicket-wasi/examples/rust-toolchain.toml', 'sluice-flume/rust-toolchain.toml') }}
     - name: Toolchains
       run: |
         rustup toolchain install
         (cd ../sluice-wicket-wasi && rustup toolchain install)
         (cd ../sluice-wicket-wasi/examples && rustup toolchain install)
+        (cd ../sluice-flume && rustup toolchain install)
     - name: Format
       run: cargo fmt --check
     - name: Clippy

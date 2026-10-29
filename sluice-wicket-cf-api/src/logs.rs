@@ -1,6 +1,8 @@
 //! The log lines `cf logs` reads through log-cache's read API: an in-memory
-//! ring per app (the source id is the app's guid) of the cf-api's own lines:
-//! staging (`STG`), lifecycle (`API`) and the wicket's outcome (`CELL`).
+//! ring per app (the source id is the app's guid) of the cf-api's own lines --
+//! staging (`STG`), lifecycle (`API`) and the wicket's outcome (`CELL`) --
+//! and, with a flume, the app's own from the live access log (`flume`): its
+//! output (`APP/PROC/WEB`), its requests (`RTR`) and the lines lost (`LGR`).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -13,11 +15,20 @@ use crate::store::epoch_nanos;
 /// Lines kept per app.
 const RING: usize = 1000;
 
+/// The stream a line is of, as `cf logs` tells them apart.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Stream {
+    Out,
+    Err,
+}
+
 #[derive(Clone, Debug)]
 pub struct Line {
-    /// Nanoseconds since the epoch, unique and ascending within an app.
+    /// Nanoseconds since the epoch, unique and ascending within an app:
+    /// when the line was added, so a reader past a line misses none after it.
     pub timestamp: u128,
     pub source: &'static str,
+    pub stream: Stream,
     pub text: String,
 }
 
@@ -27,9 +38,15 @@ pub struct Logs {
 }
 
 impl Logs {
+    /// Adds a line of the cf-api's own, printed to its stdout too.
     pub fn add(&self, app: &str, source: &'static str, text: impl Into<String>) {
         let text = text.into();
         println!("[{app}] {source}: {text}");
+        self.push(app, source, Stream::Out, text);
+    }
+
+    /// Adds a line of the app's own, which its wicket logs already.
+    pub fn push(&self, app: &str, source: &'static str, stream: Stream, text: String) {
         let mut rings = self.rings.lock().expect("no panic under the lock");
         let ring = rings.entry(app.to_string()).or_default();
         let timestamp = ring
@@ -39,6 +56,7 @@ impl Logs {
         ring.push_back(Line {
             timestamp,
             source,
+            stream,
             text,
         });
         while ring.len() > RING {
@@ -90,7 +108,10 @@ pub fn envelopes(app: &str, lines: &[Line]) -> Value {
                 "tags": {"source_type": line.source},
                 "log": {
                     "payload": base64::engine::general_purpose::STANDARD.encode(&line.text),
-                    "type": "OUT",
+                    "type": match line.stream {
+                        Stream::Out => "OUT",
+                        Stream::Err => "ERR",
+                    },
                 },
             })
         })

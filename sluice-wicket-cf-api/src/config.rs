@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::Settings;
+use crate::flume::FlumeSettings;
 
 pub const USAGE: &str = "\
 usage: sluice-wicket-cf-api --wicket <url> [options]
@@ -19,6 +20,13 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
   --data-dir <path>           the state, the packages and the droplets (default cf-api)
   --org <name>                the one organization (default sluice)
   --space <name>              the one space (default wicket)
+  --flume <url>               the sluice-flume the wicket feeds: the apps' output and
+                              requests reach cf logs from it; grpc://host:port or
+                              grpcs://host:port
+  --flume-token <token>       its bearer token (required with --flume)
+  --flume-token-file <path>   read the token from a file instead
+  --flume-ca-cert <path>      PEM CA verifying a grpcs:// flume (default the webPKI roots)
+  --flume-insecure            skip the verification of a grpcs:// flume
   --exit-on-stdin-close       exit when stdin reaches its end (a parent's child process)
   --version                   print the build (version, commit, build time) and exit
 
@@ -30,7 +38,7 @@ SLUICE_WICKET_CF_API_WICKET_TOKEN.";
 pub enum Command {
     Help,
     Version,
-    Serve(Config),
+    Serve(Box<Config>),
 }
 
 #[derive(Debug)]
@@ -49,6 +57,10 @@ const VALUED: &[&str] = &[
     "data-dir",
     "org",
     "space",
+    "flume",
+    "flume-token",
+    "flume-token-file",
+    "flume-ca-cert",
 ];
 
 /// Parses the arguments (without the program name) over the environment.
@@ -58,12 +70,14 @@ pub fn parse(
 ) -> Result<Command, String> {
     let mut given: HashMap<&str, Vec<String>> = HashMap::new();
     let mut exit_on_stdin_close = false;
+    let mut flume_insecure = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
             "-V" | "--version" => return Ok(Command::Version),
             "--exit-on-stdin-close" => exit_on_stdin_close = true,
+            "--flume-insecure" => flume_insecure = true,
             _ => {
                 let (name, inline) = match arg.strip_prefix("--").map(|rest| rest.split_once('=')) {
                     Some(Some((name, value))) => (name, Some(value.to_string())),
@@ -99,15 +113,46 @@ pub fn parse(
     if !wicket.starts_with("http://") && !wicket.starts_with("https://") {
         return Err(format!("--wicket: not an http(s) url: {wicket}"));
     }
-    let wicket_token = match (value("wicket-token"), value("wicket-token-file")) {
-        (Some(token), _) => Some(token),
-        (None, Some(path)) => Some(
-            std::fs::read_to_string(&path)
-                .map_err(|e| format!("--wicket-token-file {path}: {e}"))?
-                .trim()
-                .to_string(),
-        ),
-        (None, None) => None,
+    // a token, else the file holding it
+    let token = |name: &str| -> Result<Option<String>, String> {
+        match (value(name), value(&format!("{name}-file"))) {
+            (Some(token), _) => Ok(Some(token)),
+            (None, Some(path)) => Ok(Some(
+                std::fs::read_to_string(&path)
+                    .map_err(|e| format!("--{name}-file {path}: {e}"))?
+                    .trim()
+                    .to_string(),
+            )),
+            (None, None) => Ok(None),
+        }
+    };
+    let wicket_token = token("wicket-token")?;
+    let flume = match value("flume") {
+        Some(url) => {
+            if !url.starts_with("grpc://") && !url.starts_with("grpcs://") {
+                return Err(format!(
+                    "--flume: expected grpc://host:port or grpcs://host:port, got '{url}'"
+                ));
+            }
+            let token = token("flume-token")?
+                .filter(|token| !token.is_empty())
+                .ok_or("--flume-token (or --flume-token-file) is required with --flume")?;
+            let ca_pem = match value("flume-ca-cert") {
+                Some(path) => {
+                    Some(std::fs::read(&path).map_err(|e| format!("--flume-ca-cert {path}: {e}"))?)
+                }
+                None => None,
+            };
+            Some(FlumeSettings {
+                url,
+                token,
+                ca_pem,
+                insecure: flume_insecure
+                    || env("SLUICE_WICKET_CF_API_FLUME_INSECURE")
+                        .is_some_and(|value| value == "true"),
+            })
+        }
+        None => None,
     };
     let mut domains: Vec<String> = values("domain")
         .iter()
@@ -129,7 +174,7 @@ pub fn parse(
         }
     }
     domains.dedup();
-    Ok(Command::Serve(Config {
+    Ok(Command::Serve(Box::new(Config {
         listen: value("listen").unwrap_or_else(|| "127.0.0.1:9091".to_string()),
         exit_on_stdin_close: exit_on_stdin_close
             || env("SLUICE_WICKET_CF_API_EXIT_ON_STDIN_CLOSE").is_some_and(|value| value == "true"),
@@ -140,8 +185,9 @@ pub fn parse(
             data_dir: PathBuf::from(value("data-dir").unwrap_or_else(|| "cf-api".to_string())),
             org: value("org").unwrap_or_else(|| "sluice".to_string()),
             space: value("space").unwrap_or_else(|| "wicket".to_string()),
+            flume,
         },
-    }))
+    })))
 }
 
 #[cfg(test)]
@@ -154,7 +200,7 @@ mod tests {
 
     fn serve(command: Result<Command, String>) -> Config {
         match command {
-            Ok(Command::Serve(config)) => config,
+            Ok(Command::Serve(config)) => *config,
             other => panic!("not a serve command: {other:?}"),
         }
     }
@@ -165,10 +211,12 @@ mod tests {
             "SLUICE_WICKET_CF_API_WICKET" => Some("http://wicket:9090".to_string()),
             "SLUICE_WICKET_CF_API_WICKET_TOKEN" => Some("from-env".to_string()),
             "SLUICE_WICKET_CF_API_DOMAIN" => Some("a.example, b.example".to_string()),
+            "SLUICE_WICKET_CF_API_FLUME_TOKEN" => Some("flume-env".to_string()),
+            "SLUICE_WICKET_CF_API_FLUME_INSECURE" => Some("true".to_string()),
             _ => None,
         };
         let config = serve(parse(
-            args("--listen 127.0.0.1:9191 --domain=c.example"),
+            args("--listen 127.0.0.1:9191 --domain=c.example --flume grpcs://flume:8002"),
             env,
         ));
         assert_eq!(config.listen, "127.0.0.1:9191");
@@ -178,6 +226,12 @@ mod tests {
         assert_eq!(config.settings.data_dir, PathBuf::from("cf-api"));
         assert_eq!(config.settings.org, "sluice");
         assert!(!config.exit_on_stdin_close);
+        let flume = config.settings.flume.expect("a flume");
+        assert_eq!(
+            (flume.url.as_str(), flume.token.as_str(), flume.insecure),
+            ("grpcs://flume:8002", "flume-env", true)
+        );
+        assert!(flume.ca_pem.is_none());
         let config = serve(parse(
             args("--wicket http://w:1 --domain x.io --domain y.io,Z.io."),
             |_| None,
@@ -190,6 +244,7 @@ mod tests {
         assert_eq!(config.settings.domains, ["localhost"]);
         assert!(config.exit_on_stdin_close);
         assert!(config.settings.wicket_token.is_none());
+        assert!(config.settings.flume.is_none());
     }
 
     #[test]
@@ -215,6 +270,19 @@ mod tests {
             parse(args("--wicket"), none)
                 .unwrap_err()
                 .contains("needs a value")
+        );
+        assert!(
+            parse(args("--wicket http://w:1 --flume grpc://f:1"), none)
+                .unwrap_err()
+                .contains("--flume-token (or --flume-token-file) is required")
+        );
+        assert!(
+            parse(
+                args("--wicket http://w:1 --flume f:1 --flume-token t"),
+                none
+            )
+            .unwrap_err()
+            .contains("expected grpc://host:port or grpcs://host:port, got 'f:1'")
         );
         assert!(matches!(
             parse(args("--wicket http://w:1 --help"), none),

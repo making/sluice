@@ -9,7 +9,9 @@ option java_package = "am.ik.sluice.v1.proto";
 
 // The live access log of a cluster: every node feeds its access log lines to
 // sluice-flume while someone watches, and the console of any node watches them
-// all. Nodes and the flume deploy independently: evolve additively only.
+// all. A wicket feeds as a node does (node id `wicket:<client-id>`): the
+// requests it answered and its guests' output. Nodes and the flume deploy
+// independently: evolve additively only.
 // Both rpcs are authenticated by `authorization: Bearer <token>` metadata.
 service Flume {
   // Opened by a node and held while it runs. The node sends `hello` first, then
@@ -27,10 +29,12 @@ message AccessEvent {
   uint64 node_seq = 1;
   // When the node logged the line, in milliseconds since the epoch.
   int64 time_unix_millis = 2;
-  // accept | close | reject | request | ratelimit
+  // accept | close | reject | request | ratelimit; a wicket's response |
+  // stdout | stderr
   string kind = 3;
   // The route key the line's settings follow (the domain or host pattern,
-  // `tcp:<port>`, `*` for the catch-all); empty before routing.
+  // `tcp:<port>`, `*` for the catch-all); empty before routing. A wicket's:
+  // the host of the request the line is about.
   string route_key = 4;
   // The key=value pairs of the line in order, values unquoted.
   repeated Field fields = 5;

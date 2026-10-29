@@ -41,6 +41,12 @@ usage: sluice-wicket-wasi --server <url> --wasm <host>=<locator>[?<options>] ...
   --client-id <id>                client identity (default a random UUID)
   --ca-cert <path>                PEM CA verifying a grpcs:// server (default the webPKI roots)
   --insecure                      skip the verification of a grpcs:// server
+  --flume <url>                   feed the guests' output and the requests answered to a
+                                  sluice-flume while someone watches (the live access log),
+                                  grpc://host:port or grpcs://host:port
+  --flume-token <token>           the flume's bearer token (required with --flume)
+  --flume-ca-cert <path>          PEM CA verifying a grpcs:// flume (default the webPKI roots)
+  --flume-insecure                skip the verification of a grpcs:// flume
   --max-connections <n>           connections open at once (default 256)
   --max-instances <n>             guest instances alive at once (default 64)
   --tunnel-stall-timeout <secs>   give a stream up once its frames wait that long untaken
@@ -97,7 +103,21 @@ pub struct Settings {
     /// Zero: the files are not polled; only SIGHUP reloads.
     pub watch_interval: Duration,
     pub console: Option<ConsoleSettings>,
+    pub flume: Option<FlumeSettings>,
     pub routes: RouteSource,
+}
+
+/// The flume the wicket feeds its live access log to (`--flume`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FlumeSettings {
+    /// `grpc://host:port` or `grpcs://host:port`.
+    pub url: String,
+    /// Its bearer token.
+    pub token: String,
+    /// The PEM CA verifying a `grpcs://` flume; None: the webPKI roots.
+    pub ca_cert: Option<PathBuf>,
+    /// Skip the verification of a `grpcs://` flume.
+    pub insecure: bool,
 }
 
 /// The console (`--console`).
@@ -137,6 +157,10 @@ struct Flags {
     console: Option<String>,
     console_token: Option<String>,
     console_dir: Option<PathBuf>,
+    flume: Option<String>,
+    flume_token: Option<String>,
+    flume_ca_cert: Option<PathBuf>,
+    flume_insecure: bool,
     routes: Vec<Spec>,
 }
 
@@ -156,6 +180,9 @@ const VALUED: &[&str] = &[
     "console",
     "console-token",
     "console-dir",
+    "flume",
+    "flume-token",
+    "flume-ca-cert",
     "wasm",
 ];
 
@@ -167,6 +194,7 @@ pub fn parse(
 ) -> Result<Command, String> {
     let mut given: HashMap<&str, String> = HashMap::new();
     let mut insecure = false;
+    let mut flume_insecure = false;
     let mut routes = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -174,6 +202,7 @@ pub fn parse(
             "-h" | "--help" => return Ok(Command::Help),
             "-V" | "--version" => return Ok(Command::Version),
             "--insecure" => insecure = true,
+            "--flume-insecure" => flume_insecure = true,
             _ => {
                 let (name, inline) = match arg.strip_prefix("--").map(|rest| rest.split_once('=')) {
                     Some(Some((name, value))) => (name, Some(value.to_string())),
@@ -235,6 +264,11 @@ pub fn parse(
         console: value("console"),
         console_token: value("console-token"),
         console_dir: value("console-dir").map(PathBuf::from),
+        flume: value("flume"),
+        flume_token: value("flume-token"),
+        flume_ca_cert: value("flume-ca-cert").map(PathBuf::from),
+        flume_insecure: flume_insecure
+            || env("SLUICE_WICKET_WASI_FLUME_INSECURE").is_some_and(|value| value == "true"),
         routes,
     };
     merge(flags).map(|settings| Command::Run(Box::new(settings)))
@@ -353,6 +387,33 @@ fn merge(flags: Flags) -> Result<Settings, String> {
     let ca_cert = flags
         .ca_cert
         .or_else(|| settings.ca_cert.as_ref().map(|path| dir.join(path)));
+    let flume = match flags
+        .flume
+        .or_else(|| settings.flume.clone())
+        .filter(|flume| !flume.is_empty())
+    {
+        Some(url) => {
+            if !url.starts_with("grpc://") && !url.starts_with("grpcs://") {
+                return Err(format!(
+                    "--flume: expected grpc://host:port or grpcs://host:port, got '{url}'"
+                ));
+            }
+            let token = flags
+                .flume_token
+                .or_else(|| settings.flume_token.clone())
+                .filter(|token| !token.is_empty())
+                .ok_or("--flume-token (or `flume-token` in the --config file) is required with --flume")?;
+            Some(FlumeSettings {
+                url,
+                token,
+                ca_cert: flags
+                    .flume_ca_cert
+                    .or_else(|| settings.flume_ca_cert.as_ref().map(|path| dir.join(path))),
+                insecure: flags.flume_insecure || settings.flume_insecure.unwrap_or(false),
+            })
+        }
+        None => None,
+    };
     let stores =
         stores(settings.keyvalue.as_ref(), flags.keyvalue_file, &dir).map_err(|e| key(&e))?;
     let routes = RouteSource {
@@ -374,6 +435,7 @@ fn merge(flags: Flags) -> Result<Settings, String> {
         drain_grace,
         watch_interval,
         console,
+        flume,
         routes,
     })
 }
@@ -534,6 +596,10 @@ struct File {
     console: Option<String>,
     console_token: Option<String>,
     console_dir: Option<PathBuf>,
+    flume: Option<String>,
+    flume_token: Option<String>,
+    flume_ca_cert: Option<PathBuf>,
+    flume_insecure: Option<bool>,
     #[serde(default)]
     routes: Vec<RouteFile>,
 }
@@ -576,6 +642,10 @@ impl File {
             console => "console",
             console_token => "console-token",
             console_dir => "console-dir",
+            flume => "flume",
+            flume_token => "flume-token",
+            flume_ca_cert => "flume-ca-cert",
+            flume_insecure => "flume-insecure",
         );
         changed
     }
@@ -1106,6 +1176,10 @@ listen: 127.0.0.1:8080
 console: 127.0.0.1:9090
 console-token: t0ken
 console-dir: kept
+flume: grpcs://flume.example:443
+flume-token: ${{SLUICE_WICKET_TEST_UNSET:-f1ume}}
+flume-ca-cert: flume-ca.pem
+flume-insecure: true
 keyvalue:
   default: local
   stores:
@@ -1166,6 +1240,15 @@ routes:
         assert_eq!(console.address, "127.0.0.1:9090");
         assert_eq!(console.token.as_deref(), Some("t0ken"));
         assert_eq!(console.dir, dir.0.join("kept"));
+        assert_eq!(
+            file.flume,
+            Some(FlumeSettings {
+                url: "grpcs://flume.example:443".into(),
+                token: "f1ume".into(),
+                ca_cert: Some(dir.0.join("flume-ca.pem")),
+                insecure: true,
+            })
+        );
         let (routes, warnings) = file.routes.read().unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(routes[0].host, "a.local");
@@ -1231,6 +1314,7 @@ routes:
             "SLUICE_WICKET_WASI_MAX_CONNECTIONS" => Some("12".to_string()),
             "SLUICE_WICKET_WASI_MAX_INSTANCES" => Some("32".to_string()),
             "SLUICE_WICKET_WASI_TOKEN" => Some(String::new()),
+            "SLUICE_WICKET_WASI_FLUME_TOKEN" => Some("env-token".to_string()),
             _ => None,
         };
         let flagged = settings_over(
@@ -1248,6 +1332,8 @@ routes:
                 "0.0.0.0:9",
                 "--console-dir",
                 "/var/kept",
+                "--flume",
+                "grpc://flag:8002",
                 "--wasm=c.local=c.wasm?pool=1&wasi=keyvalue",
             ],
             env,
@@ -1264,6 +1350,14 @@ routes:
         let console = flagged.console.as_ref().expect("the file's console");
         assert_eq!(console.dir, PathBuf::from("/var/kept"));
         assert_eq!(console.token.as_deref(), Some("t0ken"));
+        let flume = flagged.flume.as_ref().expect("a flume");
+        assert_eq!(flume.url, "grpc://flag:8002");
+        assert_eq!(flume.token, "env-token");
+        assert_eq!(
+            flume.ca_cert,
+            Some(dir.0.join("flume-ca.pem")),
+            "the file's"
+        );
         let (routes, _) = flagged.routes.read().unwrap();
         let hosts: Vec<_> = routes.iter().map(|route| route.host.as_str()).collect();
         assert_eq!(hosts, ["a.local", "b.local", "c.local"]);
@@ -1293,6 +1387,7 @@ routes:
         assert!(!defaults.insecure);
         assert_eq!(defaults.listen, None);
         assert!(defaults.console.is_none());
+        assert_eq!(defaults.flume, None);
         assert_eq!(defaults.routes.read().unwrap().0, [], "no route yet");
         let sqlite = |settings: Settings| match settings.routes.stores().config(keyvalue::LOCAL) {
             Some(StoreConfig {
@@ -1305,8 +1400,26 @@ routes:
         let moved = settings(&["--config", config, "--keyvalue-file", "/var/kv.db"]).unwrap();
         assert_eq!(sqlite(moved), PathBuf::from("/var/kv.db"));
 
-        let local = settings(&["--listen", "127.0.0.1:0", "--wasm", "a=a.wasm"]).unwrap();
+        let local = settings(&[
+            "--listen",
+            "127.0.0.1:0",
+            "--wasm",
+            "a=a.wasm",
+            "--flume=grpcs://f:1",
+            "--flume-token=t",
+            "--flume-insecure",
+        ])
+        .unwrap();
         assert_eq!(local.server, None, "local mode alone");
+        assert_eq!(
+            local.flume,
+            Some(FlumeSettings {
+                url: "grpcs://f:1".into(),
+                token: "t".into(),
+                ca_cert: None,
+                insecure: true,
+            })
+        );
         let console = settings(&["--listen", "127.0.0.1:0", "--console", "127.0.0.1:0"])
             .unwrap()
             .console
@@ -1346,6 +1459,14 @@ routes:
             (
                 "server: s\nmax-instances: 0\n".into(),
                 "max-instances must be a number from 1 to",
+            ),
+            (
+                "server: s\nflume: grpc://f:1\n".into(),
+                "--flume-token (or `flume-token` in the --config file) is required with --flume",
+            ),
+            (
+                "server: s\nflume: f:1\nflume-token: t\n".into(),
+                "--flume: expected grpc://host:port or grpcs://host:port, got 'f:1'",
             ),
             (
                 "server: s\ndrain-grace: 20\n".into(),

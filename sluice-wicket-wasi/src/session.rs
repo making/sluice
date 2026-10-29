@@ -159,9 +159,9 @@ impl Drop for Up<'_> {
     }
 }
 
-/// Splits the `--server` value into `(secure, authority)`; a bare host:port
-/// and `grpc://` are plaintext, `grpcs://` is TLS.
-fn resolve_server(server: &str) -> (bool, &str) {
+/// Splits the `--server` (or `--flume`) value into `(secure, authority)`; a
+/// bare host:port and `grpc://` are plaintext, `grpcs://` is TLS.
+pub(crate) fn resolve_server(server: &str) -> (bool, &str) {
     match server.strip_prefix("grpcs://") {
         Some(authority) => (true, authority),
         None => (false, server.strip_prefix("grpc://").unwrap_or(server)),

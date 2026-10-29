@@ -111,13 +111,14 @@ class LiveLogView {
 	}
 
 	/**
-	 * One line of a node.
+	 * One line of a node or a wicket.
 	 *
 	 * @param seq the flume's position of the line
 	 * @param instant when the node logged it, as an ISO instant; the page shows it in the
 	 * browser's zone
 	 * @param node the node that logged it
-	 * @param kind accept, close, reject, request or ratelimit
+	 * @param kind a node's accept, close, reject, request or ratelimit; a wicket's
+	 * response, stdout or stderr
 	 * @param route the route as the line names it
 	 * @param line the rest of the line's key=value pairs
 	 */

@@ -9,6 +9,8 @@ services (the wicket's keyvalue stores and capabilities) and `cf logs` work as t
 
 ```text
 cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> sluice-wicket-wasi <--tunnel-- sluice server
+                                             ^                                  |
+                                             +--Watch-- sluice-flume <--Feed----+  (cf logs, optional)
 ```
 
 The target is the OSS CLI ([cloudfoundry/cli](https://github.com/cloudfoundry/cli) v8, `cf8`);
@@ -17,13 +19,18 @@ the Tanzu distribution (`cf` 10.x) reads `/v3/info` and refuses any other platfo
 ## Run
 
 ```text
-cargo build --release                                # needs git only (the build embeds the commit)
+cargo build --release                                # needs protoc, and git (the build embeds the commit)
+
+# optional, for the apps' output and requests in cf logs: a flume (see sluice-flume)
+sluice-flume --token FLUME_SECRET                     # grpc://0.0.0.0:8002
 
 # the wicket, serving on 8080 with its console on 9090 (see its README)
-sluice-wicket-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090 --console-token SECRET
+sluice-wicket-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090 --console-token SECRET \
+  --flume grpc://127.0.0.1:8002 --flume-token FLUME_SECRET
 
 # the cf-api, on http://127.0.0.1:9091
-target/release/sluice-wicket-cf-api --wicket http://127.0.0.1:9090 --wicket-token SECRET
+target/release/sluice-wicket-cf-api --wicket http://127.0.0.1:9090 --wicket-token SECRET \
+  --flume grpc://127.0.0.1:8002 --flume-token FLUME_SECRET
 
 cf8 login -a http://127.0.0.1:9091 -u me -p x   # any credentials
 cf8 push hello -p dist/                          # dist/ holds hello.wasm (a wasi:http 0.3 component)
@@ -46,6 +53,9 @@ cf8 restart counter                              # a binding applies at the next
 | `--domain <name>` | a shared domain; repeatable (or comma-separated): the first takes the default and random routes (default `localhost`). Through a sluice server, a suffix whose wildcard DNS reaches it |
 | `--data-dir <path>` | the state and the blobs (default `cf-api`): `state.json` (written by a rename on every change), `jwt.key`, `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app) |
 | `--org <name>` / `--space <name>` | the one organization and space (default `sluice` / `wicket`) |
+| `--flume <url>` | the sluice-flume the wicket feeds (`grpc://host:port` / `grpcs://host:port`): the apps' output and requests reach `cf logs` from it |
+| `--flume-token <token>` / `--flume-token-file <path>` | its bearer token |
+| `--flume-ca-cert <path>` / `--flume-insecure` | a `grpcs://` flume verified against this PEM CA (default the webPKI roots), or not at all |
 | `--exit-on-stdin-close` | exit when stdin reaches its end (a parent's child process) |
 
 Each option also reads `SLUICE_WICKET_CF_API_<NAME>` from the environment. The image
@@ -92,7 +102,12 @@ sidecar, `kubectl port-forward`).
   serves on while the cf-api is down; with the wicket down, the apps show `STARTING` and are
   put when it is back
 - `cf logs` (log-cache `read`, polled by the CLI): an in-memory ring of 1000 lines per app of
-  the cf-api's own lines: staging (`STG`), lifecycle (`API`), the wicket's outcome (`CELL`)
+  the cf-api's own lines: staging (`STG`), lifecycle (`API`), the wicket's outcome (`CELL`).
+  With `--flume`, the app's own too, from the live access log the wicket feeds: its output
+  (`APP/PROC/WEB` OUT / ERR), its requests (`RTR`, in the gorouter's access log format) and
+  the lines lost on the way (`LGR`). The cf-api watches its apps' hosts and resumes past the
+  last line it took (kept in `state.json`); see
+  [Live access log](../.kb/live-access-log.md#wickets-and-the-cf-api)
 - auth: `POST /uaa/oauth/token` takes any credentials (the password, refresh_token and
   client_credentials grants) and answers a JWT (HS256) signed with the key in `--data-dir`, so
   a login outlives a restart; every request but the root document, `/v3`, `/v3/info` and the
@@ -136,9 +151,9 @@ images, tasks, ssh, sidecars, process types but `web`, route services, environme
 wicket: two cf-apis must not share one.
 
 The integration test (`tests/cli.rs`) runs the OSS CLI -- `SLUICE_CF_CLI`, else `cf8` on the
-PATH -- against the cf-api and a wicket in local mode, building the wicket and its example
-guests from `../sluice-wicket-wasi` (or taking `SLUICE_WICKET_WASI` and
-`SLUICE_WICKET_GUESTS`):
+PATH -- against the cf-api and a wicket in local mode on a flume, building the wicket and its
+example guests from `../sluice-wicket-wasi` and the flume from `../sluice-flume` (or taking
+`SLUICE_WICKET_WASI`, `SLUICE_WICKET_GUESTS` and `SLUICE_FLUME`):
 
 ```text
 gh release download v8.19.0 -R cloudfoundry/cli -p 'cf8-cli_8.19.0_macosarm.tgz'

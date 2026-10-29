@@ -41,10 +41,21 @@ pub struct State {
     /// is yet to delete.
     #[serde(default)]
     pub purges: Vec<Purge>,
+    /// Where the watch of the flume resumes: past the last line it took
+    /// (`flume`); None before one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flume: Option<FlumeCursor>,
     /// What the wicket answered of each app, by guid; not kept: a start
     /// lists the wicket.
     #[serde(skip)]
     pub wicket: BTreeMap<String, Outcome>,
+}
+
+/// A position in the flume's lines: its run (`epoch`) and the line's `seq`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct FlumeCursor {
+    pub epoch: u64,
+    pub seq: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -549,6 +560,8 @@ pub enum Blob {
 pub struct Store {
     dir: PathBuf,
     state: Mutex<State>,
+    /// Signalled on every change written (`changed`).
+    changes: tokio::sync::Notify,
 }
 
 impl Store {
@@ -584,6 +597,7 @@ impl Store {
         let store = Store {
             dir: dir.to_path_buf(),
             state: Mutex::new(state),
+            changes: tokio::sync::Notify::new(),
         };
         store.read(|state| store.save(state))?;
         Ok(store)
@@ -600,7 +614,15 @@ impl Store {
         if let Err(e) = self.save(&state) {
             eprintln!("cannot write the state: {e}");
         }
+        drop(state);
+        self.changes.notify_one();
         result
+    }
+
+    /// Resolves after an `update` since the last call resolved (at once
+    /// when one was made meanwhile); for one waiter.
+    pub async fn changed(&self) {
+        self.changes.notified().await;
     }
 
     /// Changes what is not kept (the wicket's outcomes).

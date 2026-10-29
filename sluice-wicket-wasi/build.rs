@@ -1,5 +1,5 @@
-// Compiles the tunnel proto shared with the Java modules (single source of truth)
-// and embeds the build identification (git commit, dirty flag, build time).
+// Compiles the tunnel and flume protos shared with the Java modules (single source of
+// truth) and embeds the build identification (git commit, dirty flag, build time).
 use std::path::PathBuf;
 
 fn main() {
@@ -19,11 +19,12 @@ fn main() {
         .compile_protos(
             &[
                 protos.join("sluice/v1/tunnel.proto"),
+                protos.join("sluice/v1/flume.proto"),
                 protos.join("sluice/v1/build.proto"),
             ],
             &[protos],
         )
-        .expect("failed to compile tunnel.proto");
+        .expect("failed to compile the protos");
     sluice_build_info::embed(&[
         "build.rs",
         "Cargo.toml",

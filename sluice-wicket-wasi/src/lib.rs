@@ -36,6 +36,10 @@
 //! components as routes, through the same reload; they are kept in the
 //! console's directory (`deployed`) across restarts.
 //!
+//! `--flume` feeds the guests' output and the answered requests to a
+//! sluice-flume (`flume`), the live access log the sluice console and the
+//! cf-api watch.
+//!
 //! Scope (deliberately minimal):
 //!
 //! - `grpc://` / `grpcs://` control plane (`--ca-cert` pins the CA,
@@ -61,6 +65,7 @@ pub mod config;
 mod console;
 mod deployed;
 mod drain;
+mod flume;
 mod keyvalue;
 mod listener;
 mod routes;
@@ -86,6 +91,7 @@ pub mod proto {
 use console::Console;
 use deployed::Deployed;
 use drain::Drain;
+use flume::Tap;
 use proto::PeerBuild;
 use routes::Reloader;
 use session::{Shared, transport_window};
@@ -184,10 +190,15 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         drain_grace,
         watch_interval,
         mut console,
+        flume,
         mut routes,
     } = settings;
     println!("wicket build: {}", describe_build());
-    let instances = Instances::new(max_instances);
+    let tap = match flume {
+        Some(_) => Tap::new(),
+        None => Tap::off(),
+    };
+    let instances = Instances::fed(max_instances, tap.clone());
     if let Some(console) = &mut console {
         let deployed = Deployed::open(&console.dir)?;
         // named as it resolved from here on: the log says where the files are
@@ -257,6 +268,18 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
     } else {
         // no console: the reloader sees the channel closed, no edit comes
         drop(requests);
+    }
+    if let Some(flume) = flume {
+        let ca_pem = match &flume.ca_cert {
+            Some(path) => Some(
+                std::fs::read(path)
+                    .map_err(|e| format!("--flume-ca-cert {}: {e}", path.display()))?,
+            ),
+            None => None,
+        };
+        let node_id = format!("wicket:{client_id}");
+        println!("live access log: feeding {} as {node_id}", flume.url);
+        tokio::spawn(flume::feed(flume, ca_pem, tap, node_id));
     }
     // installed whether or not a drain follows: as the init (pid 1) of a
     // container, a process without a handler ignores SIGTERM

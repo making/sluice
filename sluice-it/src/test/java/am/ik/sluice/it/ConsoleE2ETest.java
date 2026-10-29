@@ -39,9 +39,14 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.server.SluiceServerApplication;
+import am.ik.sluice.server.livelog.FlumeConnection;
 import am.ik.sluice.server.route.GateState;
 import am.ik.sluice.server.route.Router;
 import am.ik.sluice.server.tunnel.SessionRegistry;
+import am.ik.sluice.v1.proto.AccessEvent;
+import am.ik.sluice.v1.proto.FeedHello;
+import am.ik.sluice.v1.proto.FeedMessage;
+import io.grpc.stub.StreamObserver;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import org.springframework.beans.factory.annotation.Autowired;
@@ -112,6 +117,9 @@ class ConsoleE2ETest {
 
 	@Autowired
 	Router router;
+
+	@Autowired
+	FlumeConnection flumeConnection;
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
@@ -489,9 +497,11 @@ class ConsoleE2ETest {
 
 	/**
 	 * The access log page shows the flume's build and the node's lines as they are
-	 * logged, timed in the browser's zone; a kind filter narrows them (in the page's
-	 * address too), and a paused view picks up the lines logged meanwhile once resumed,
-	 * each once.
+	 * logged, timed in the browser's zone; a kind filter -- of a node's kinds and a
+	 * wicket's -- narrows them (in the page's address too), and a paused view picks up
+	 * the lines logged meanwhile once resumed, each once. A wicket feeding the flume
+	 * joins the node selector, which lists the cluster's nodes: its lines alone, kept
+	 * selected across a reload.
 	 */
 	@Test
 	void accessLogShowsTheLinesAsTheyAreLogged() throws Exception {
@@ -499,6 +509,8 @@ class ConsoleE2ETest {
 		page.navigate("http://127.0.0.1:" + this.port + "/console/access-log");
 		LocatorAssertions.HasTextOptions redial = new LocatorAssertions.HasTextOptions().setTimeout(40_000);
 		LocatorAssertions.HasCountOptions wait = new LocatorAssertions.HasCountOptions().setTimeout(10_000);
+		assertThat(page.locator("input[name=kind]").all().stream().map(kind -> kind.getAttribute("value")))
+			.containsExactly("request", "accept", "close", "reject", "ratelimit", "response", "stdout", "stderr");
 		PlaywrightAssertions.assertThat(page.getByTestId("livelog-state")).hasText("Live", redial);
 		PlaywrightAssertions.assertThat(page.getByTestId("livelog-build")).containsText("sluice-flume 0.0.1-SNAPSHOT");
 		PlaywrightAssertions.assertThat(page.locator("#livelog-nodes [data-node='console-node']"))
@@ -534,6 +546,38 @@ class ConsoleE2ETest {
 		PlaywrightAssertions.assertThat(paused).hasCount(1, wait);
 		PlaywrightAssertions.assertThat(page.getByTestId("livelog-state")).hasText("Live");
 		assertThat(second.count()).isEqualTo(1);
+
+		page.locator("input[name=kind][value=request]").uncheck();
+		StreamObserver<FeedMessage> wicket = this.flumeConnection.stub().feed(new Ignored<>());
+		try {
+			wicket.onNext(FeedMessage.newBuilder()
+				.setHello(FeedHello.newBuilder().setNodeId("wicket:console").setBootId("console-boot"))
+				.build());
+			wicket.onNext(FeedMessage.newBuilder()
+				.setEvent(AccessEvent.newBuilder()
+					.setNodeSeq(1)
+					.setTimeUnixMillis(System.currentTimeMillis())
+					.setKind("response")
+					.setRouteKey("demo.local")
+					.addFields(AccessEvent.Field.newBuilder().setName("path").setValue("/answered"))
+					.addFields(AccessEvent.Field.newBuilder().setName("status").setValue("200")))
+				.build());
+			PlaywrightAssertions.assertThat(page.locator("#livelog-nodes [data-node='wicket:console']"))
+				.hasText("wicket:console", redial);
+			page.getByTestId("livelog-node").selectOption("wicket:console");
+			page.waitForURL(Pattern.compile("node=wicket"));
+			Locator answered = rows.filter(new Locator.FilterOptions().setHasText("path=/answered"));
+			PlaywrightAssertions.assertThat(answered).hasCount(1, wait);
+			assertThat(answered.locator("td").allInnerTexts().subList(1, 4)).containsExactly("wicket:console",
+					"response", "demo.local");
+			assertThat(page.locator("#livelog-rows tr[data-node]:not([data-node='wicket:console'])").count()).isZero();
+			page.reload();
+			PlaywrightAssertions.assertThat(page.getByTestId("livelog-node")).hasValue("wicket:console");
+			PlaywrightAssertions.assertThat(answered).hasCount(1, wait);
+		}
+		finally {
+			wicket.onCompleted();
+		}
 	}
 
 	/** A request to demo.local through the data plane, read to its end. */
@@ -545,6 +589,23 @@ class ConsoleE2ETest {
 					.getBytes(StandardCharsets.US_ASCII));
 			assertThat(new String(socket.getInputStream().readAllBytes(), StandardCharsets.US_ASCII)).contains(" 200 ");
 		}
+	}
+
+	/** Takes the flume's start and stop: the test's wicket sends regardless. */
+	private static final class Ignored<T> implements StreamObserver<T> {
+
+		@Override
+		public void onNext(T value) {
+		}
+
+		@Override
+		public void onError(Throwable t) {
+		}
+
+		@Override
+		public void onCompleted() {
+		}
+
 	}
 
 }

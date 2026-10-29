@@ -77,6 +77,54 @@ the position is the flume's -- without repeating a line. Pause closes the stream
 reopens it after the last row the same way. A position of an earlier flume run starts the
 view over with the note that the flume restarted.
 
+## Wickets and the cf-api
+
+```
+wicket ──Feed (as a node)──> sluice-flume <──Watch── sluice-wicket-cf-api <──log-cache read── cf logs
+```
+
+A wicket (`sluice-wicket-wasi --flume URL --flume-token TOKEN`) feeds as a node does -- the
+same start and stop, ring of 512, queue of 4096 and gaps -- as the node
+`wicket:<client-id>`, with kinds of its own. A line's route key is the host of its request
+(`Host` / `:authority`, lowercase, without the port):
+
+| kind | fields |
+|---|---|
+| `response` | `method`, `path`, `http`, `status`, `durationMs`, `bytes`, `remote`, `userAgent` |
+| `stdout` / `stderr` | `component`, `store` (the id of the wicket's log prefix), `line` |
+
+- `response` is logged once the response body ended or the client left, with status 499
+  when it left before the head; `durationMs` runs from the request's arrival. `remote` is
+  the last `X-Forwarded-For` entry (the node's peer), the TCP peer on `--listen`.
+- A guest's output belongs to the request its store serves: a store serves one request,
+  a pooled unit one at a time, so the attribution is exact. A pooled unit's output before
+  its first request has an empty route key.
+- The console shows a wicket's rows like a node's (the route column is the host) and
+  names it `wicket:<client-id>` in the node strip; the kind filter lists its kinds. The
+  node selector starts with the cluster's nodes and adds a wicket once the flume reports
+  it; a node or route the page's address names stays a choice across a reload.
+
+The cf-api (`sluice-wicket-cf-api --flume URL --flume-token TOKEN`) watches the hosts of
+its apps' routes with the kinds `response`, `stdout` and `stderr`, and adds each line to
+the log of the app holding its host, which `cf logs` shows as Cloud Foundry does:
+
+```text
+[APP/PROC/WEB/0] OUT hello stdout: Method::Get /log body_bytes=0
+[APP/PROC/WEB/0] ERR hello stderr: Method::Get /log
+[RTR/0] OUT hello.localhost - [2026-10-30T01:17:47.123Z] "GET /log HTTP/1.1" 200 - 58 "-" "curl/8.7.1" "10.0.0.1" "-" response_time:0.000522 app_id:"<guid>" app_index:"0"
+```
+
+- The watch resumes past its cursor (kept in `state.json`) when the hosts change or the
+  stream drops. Without a host it holds no watch: an empty filter passes every line.
+- Lines lost become an `LGR` ERR line in the log of every app watched, as they may be any
+  app's: a wicket's drops, `Up to N lines missed` when the watch fell behind, a flume
+  restart. A node's drops are never an app's lines and are left out.
+- The lines are kept in memory, 1000 per app, stamped when they reach the cf-api: the
+  order `cf logs` streams them in. While the cf-api watches, the nodes and the wicket keep
+  feeding, and `cf logs --recent` shows what arrived since.
+- After a flume restart the wicket sends again the lines of its ring the new flume lacks,
+  so an app's log may repeat some.
+
 ## Deployment notes
 
 - The console session is per node: a browser's SSE reconnect must reach the node it signed

@@ -1,9 +1,9 @@
 //! The OSS cf CLI (`SLUICE_CF_CLI`, else `cf8` on the PATH; the Tanzu
 //! distribution refuses any other platform) against the cf-api and a wicket
-//! in local mode: login, push, map-route, scale, a rolling push with
-//! requests all along, stop and start, a restart of the cf-api, a component
-//! the wicket refuses until a service binding grants what it needs, the
-//! services' lifecycle, delete.
+//! in local mode, both on a flume: login, push, the app's logs, map-route,
+//! scale, a rolling push with requests all along, stop and start, a restart
+//! of the cf-api, a component the wicket refuses until a service binding
+//! grants what it needs, the services' lifecycle, delete.
 
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::net::TcpStream;
@@ -20,6 +20,8 @@ use sha2::{Digest, Sha256};
 const HANG: Duration = Duration::from_secs(120);
 
 const TOKEN: &str = "s3cret";
+
+const FLUME_TOKEN: &str = "f1ume";
 
 fn wicket_crate() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../sluice-wicket-wasi")
@@ -55,6 +57,19 @@ fn wicket_binary() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| dir.join("target"))
         .join("debug/sluice-wicket-wasi")
+}
+
+/// The flume: `SLUICE_FLUME`, else built from the crate next door.
+fn flume_binary() -> PathBuf {
+    if let Ok(given) = std::env::var("SLUICE_FLUME") {
+        return PathBuf::from(given);
+    }
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../sluice-flume");
+    cargo(&dir, &["build", "--locked"]);
+    std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dir.join("target"))
+        .join("debug/sluice-flume")
 }
 
 /// The directory of the hello, counter and relay guests:
@@ -95,12 +110,17 @@ struct Process {
 
 impl Process {
     fn spawn(program: &Path, args: &[&str]) -> Process {
-        let mut child = Command::new(program)
-            .args(args)
+        let mut command = Command::new(program);
+        command.args(args);
+        Process::start(command)
+    }
+
+    fn start(mut command: Command) -> Process {
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .unwrap_or_else(|e| panic!("run {}: {e}", program.display()));
+            .unwrap_or_else(|e| panic!("run {:?}: {e}", command.get_program()));
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let (lines, received) = mpsc::channel();
         std::thread::spawn(move || {
@@ -157,19 +177,23 @@ struct Cf {
 }
 
 impl Cf {
-    /// Runs the command: whether it succeeded, and its output.
-    fn run(&self, args: &[&str]) -> (bool, String) {
-        let output = Command::new(&self.cli)
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(&self.cli);
+        command
             .args(args)
             .env("CF_HOME", &self.home)
-            .env("CF_COLOR", "false")
-            .output()
-            .unwrap_or_else(|e| {
-                panic!(
-                    "run the cf CLI {}: {e} (SLUICE_CF_CLI names the OSS CLI v8)",
-                    self.cli.display()
-                )
-            });
+            .env("CF_COLOR", "false");
+        command
+    }
+
+    /// Runs the command: whether it succeeded, and its output.
+    fn run(&self, args: &[&str]) -> (bool, String) {
+        let output = self.command(args).output().unwrap_or_else(|e| {
+            panic!(
+                "run the cf CLI {}: {e} (SLUICE_CF_CLI names the OSS CLI v8)",
+                self.cli.display()
+            )
+        });
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
@@ -247,7 +271,7 @@ fn variant(hello: &[u8]) -> Vec<u8> {
     component
 }
 
-fn start_api(listen: &str, console: &str, data: &Path) -> (Process, String) {
+fn start_api(listen: &str, console: &str, flume: &str, data: &Path) -> (Process, String) {
     let api = Process::spawn(
         Path::new(env!("CARGO_BIN_EXE_sluice-wicket-cf-api")),
         &[
@@ -259,6 +283,10 @@ fn start_api(listen: &str, console: &str, data: &Path) -> (Process, String) {
             TOKEN,
             "--data-dir",
             data.to_str().unwrap(),
+            "--flume",
+            flume,
+            "--flume-token",
+            FLUME_TOKEN,
         ],
     );
     let url = api.logged("listening on ");
@@ -285,9 +313,18 @@ fn the_cf_cli_deploys_to_the_wicket() {
         .unwrap();
     }
 
+    let flume = Process::spawn(
+        &flume_binary(),
+        &["--host", "127.0.0.1", "--port", "0", "--token", FLUME_TOKEN],
+    );
+    let flume_url = flume.logged("listening on ");
     let wicket = Process::spawn(
         &wicket_binary,
         &[
+            "--flume",
+            &flume_url,
+            "--flume-token",
+            FLUME_TOKEN,
             "--listen",
             "127.0.0.1:0",
             "--console",
@@ -310,7 +347,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
         .unwrap()
         .port();
     let api_listen = format!("127.0.0.1:{port}");
-    let (mut api, url) = start_api(&api_listen, &console, &dir.join("cf"));
+    let (mut api, url) = start_api(&api_listen, &console, &flume_url, &dir.join("cf"));
     let cf = Cf {
         cli: cf_cli(),
         home: dir.join("cfhome"),
@@ -328,6 +365,34 @@ fn the_cf_cli_deploys_to_the_wicket() {
         cf.ok(&["logs", "hello", "--recent"])
             .contains("Staged hello.wasm")
     );
+
+    // the app's output and requests, from the flume: recent, then streamed
+    assert_eq!(get(&listen, "hello.localhost", "/log", None).0, 200);
+    let router = "[RTR/0] OUT hello.localhost - [";
+    let request = |path: &str| format!("\"GET {path} HTTP/1.0\" 200 ");
+    let output = [
+        "[APP/PROC/WEB/0] OUT hello stdout: Method::Get /log body_bytes=0",
+        "[APP/PROC/WEB/0] ERR hello stderr: Method::Get /log",
+    ];
+    let deadline = Instant::now() + HANG;
+    loop {
+        let recent = cf.ok(&["logs", "hello", "--recent"]);
+        if output.iter().all(|line| recent.contains(line))
+            && recent
+                .lines()
+                .any(|line| line.contains(router) && line.contains(&request("/log")))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the app's lines never came");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let streaming = Process::start(cf.command(&["logs", "hello"]));
+    streaming.logged("Retrieving logs");
+    assert_eq!(get(&listen, "hello.localhost", "/streamed", None).0, 200);
+    // the word after the request: the bytes received, unknown
+    assert_eq!(streaming.logged(&request("/streamed")), "-");
+    drop(streaming);
 
     // routes and instances apply at once
     cf.ok(&["map-route", "hello", "localhost", "--hostname", "hi"]);
@@ -393,7 +458,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
     // generation unchanged
     let generation = listing(&console)["generation"].as_u64().unwrap();
     api.kill();
-    let (api, _) = start_api(&api_listen, &console, &dir.join("cf"));
+    let (api, _) = start_api(&api_listen, &console, &flume_url, &dir.join("cf"));
     api.logged("Found in the wicket as wanted");
     assert!(cf.ok(&["app", "hello"]).contains("hi.localhost"));
     assert_eq!(listing(&console)["generation"], generation);
@@ -526,5 +591,6 @@ fn the_cf_cli_deploys_to_the_wicket() {
 
     drop(api);
     drop(wicket);
+    drop(flume);
     let _ = std::fs::remove_dir_all(&dir);
 }

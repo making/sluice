@@ -15,9 +15,11 @@
 //! `keyvalue` wasi:keyvalue (`keyvalue`), and the network capabilities
 //! configure the per-request `WasiCtx`. wasi p2 is
 //! unsupported: a p2-importing component is rejected at load. Guest stdout /
-//! stderr always reach the process log, line-prefixed.
+//! stderr always reach the process log, line-prefixed; with a flume they and
+//! a line per answered request reach the live access log too (`flume`).
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr as _;
@@ -31,6 +33,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use wasmtime::AsContextMut as _;
 
+use crate::flume::Tap;
 use crate::keyvalue;
 use crate::tunnel::TunnelIo;
 
@@ -794,20 +797,21 @@ struct Ctx {
 }
 
 impl Ctx {
-    /// A request's store state; `label` names the component in the guest's
-    /// log lines.
-    fn new(sandbox: &Sandbox, label: &str, keyvalue: Option<Arc<keyvalue::Buckets>>) -> Self {
-        static REQUESTS: AtomicU64 = AtomicU64::new(1);
-        let request = REQUESTS.fetch_add(1, Ordering::Relaxed);
+    /// A store's state; `label` names the component in the guest's log
+    /// lines, which also go to `tap` as lines of the request `serving`.
+    fn new(
+        sandbox: &Sandbox,
+        label: &str,
+        keyvalue: Option<Arc<keyvalue::Buckets>>,
+        tap: &Arc<Tap>,
+        serving: &Serving,
+    ) -> Self {
+        static STORES: AtomicU64 = AtomicU64::new(1);
+        let store = STORES.fetch_add(1, Ordering::Relaxed);
         let mut wasi = wasmtime_wasi::WasiCtxBuilder::new();
-        wasi.stdout(GuestLog::new(
-            format!("stdout [{label}#{request}] :: "),
-            Output::Stdout,
-        ));
-        wasi.stderr(GuestLog::new(
-            format!("stderr [{label}#{request}] :: "),
-            Output::Stderr,
-        ));
+        let log = |output| GuestLog::new(output, label, store, tap.clone(), serving.clone());
+        wasi.stdout(log(Output::Stdout));
+        wasi.stderr(log(Output::Stderr));
         sandbox.caps.configure(&mut wasi);
         Self {
             table: wasmtime::component::ResourceTable::default(),
@@ -893,11 +897,43 @@ enum Output {
     Stderr,
 }
 
+impl Output {
+    /// The stream's name: the prefix of its lines, their kind in the live
+    /// access log.
+    fn name(self) -> &'static str {
+        match self {
+            Output::Stdout => "stdout",
+            Output::Stderr => "stderr",
+        }
+    }
+}
+
+/// The host of the request a store serves, the route key of its guest's
+/// output lines in the live access log: a request's store serves the one, a
+/// pooled unit sets the host of each request it takes (one at a time).
+#[derive(Clone, Default)]
+struct Serving(Arc<Mutex<String>>);
+
+impl Serving {
+    fn of(host: String) -> Serving {
+        Serving(Arc::new(Mutex::new(host)))
+    }
+
+    fn set(&self, host: String) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = host;
+    }
+
+    fn get(&self) -> String {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 /// A guest stdout / stderr: whole lines, each prefixed with the component and
-/// request, are written to the process stream in one call, so concurrent
-/// requests do not interleave mid-line. A trailing partial line is flushed
-/// when the request's store goes away, an overlong one at
-/// `GUEST_LOG_LINE_MAX`.
+/// the store (`stdout [hello.wasm#12] :: `), are written to the process
+/// stream in one call, so concurrent requests do not interleave mid-line,
+/// and go to the live access log's tap as lines of the request the store
+/// serves. A trailing partial line is flushed when the store goes away, an
+/// overlong one at `GUEST_LOG_LINE_MAX`.
 #[derive(Clone)]
 struct GuestLog {
     state: Arc<GuestLogState>,
@@ -907,15 +943,24 @@ struct GuestLogState {
     prefix: String,
     output: Output,
     pending: Mutex<Vec<u8>>,
+    tap: Arc<Tap>,
+    /// The component's label and the store's id, the prefix's.
+    component: String,
+    store: u64,
+    serving: Serving,
 }
 
 impl GuestLog {
-    fn new(prefix: String, output: Output) -> Self {
+    fn new(output: Output, label: &str, store: u64, tap: Arc<Tap>, serving: Serving) -> Self {
         Self {
             state: Arc::new(GuestLogState {
-                prefix,
+                prefix: format!("{} [{label}#{store}] :: ", output.name()),
                 output,
                 pending: Mutex::new(Vec::new()),
+                tap,
+                component: label.to_string(),
+                store,
+                serving,
             }),
         }
     }
@@ -935,13 +980,32 @@ impl GuestLog {
 }
 
 impl GuestLogState {
-    /// Writes complete lines (the last may lack its newline) with the prefix.
+    /// Writes complete lines (the last may lack its newline) with the prefix,
+    /// and hands each to the tap.
     fn emit(&self, lines: &[u8]) -> std::io::Result<()> {
         use std::io::Write as _;
         let mut out = Vec::with_capacity(lines.len() + 16);
+        let route_key = if self.tap.on() {
+            Some(self.serving.get())
+        } else {
+            None
+        };
         for line in lines.split_inclusive(|b| *b == b'\n') {
             out.extend_from_slice(self.prefix.as_bytes());
             out.extend_from_slice(line);
+            if let Some(route_key) = &route_key {
+                let text = line.strip_suffix(b"\n").unwrap_or(line);
+                let text = text.strip_suffix(b"\r").unwrap_or(text);
+                self.tap.publish(
+                    self.output.name(),
+                    route_key.clone(),
+                    vec![
+                        ("component", self.component.clone()),
+                        ("store", self.store.to_string()),
+                        ("line", String::from_utf8_lossy(text).into_owned()),
+                    ],
+                );
+            }
         }
         if !out.ends_with(b"\n") {
             out.push(b'\n');
@@ -1467,6 +1531,9 @@ pub const INSTANCE_LIMIT_REACHED: &str = "wasm instance limit reached";
 pub struct Instances {
     slots: Arc<tokio::sync::Semaphore>,
     max: usize,
+    /// Where the guests' output and the answered requests go besides the
+    /// process log: the live access log's tap, off without a flume.
+    tap: Arc<Tap>,
 }
 
 /// One instance slot -- the process-wide one, plus the route's own under
@@ -1480,10 +1547,19 @@ impl Instances {
     /// The largest limit the semaphore takes.
     pub const MAX: usize = tokio::sync::Semaphore::MAX_PERMITS;
 
+    /// [`Instances::fed`] without a flume.
+    #[cfg(test)]
     pub fn new(max: usize) -> Arc<Instances> {
+        Instances::fed(max, Tap::off())
+    }
+
+    /// `max` slots; the guests' output and the answered requests go to
+    /// `tap` too.
+    pub fn fed(max: usize, tap: Arc<Tap>) -> Arc<Instances> {
         Arc::new(Instances {
             slots: Arc::new(tokio::sync::Semaphore::new(max)),
             max,
+            tap,
         })
     }
 
@@ -1603,7 +1679,13 @@ async fn respond(
     // Declared after the slot and share, so dropped before them on every
     // path.
     let live = LiveStore::mark(&handler.live);
-    let ctx = Ctx::new(&handler.sandbox, &loaded.label, handler.keyvalue.clone());
+    let ctx = Ctx::new(
+        &handler.sandbox,
+        &loaded.label,
+        handler.keyvalue.clone(),
+        &handler.instances.tap,
+        &Serving::of(request_host(&request)),
+    );
     let mut store = wasmtime::Store::new(engine(), ctx);
     store.limiter_async(|ctx| &mut ctx.limiter);
     // The deadline must exist before any wasm runs: with epoch interruption
@@ -2080,7 +2162,15 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot) {
     let loaded = pool.loaded.clone();
     let budget = pool.sandbox.limits.budget;
     let _live = LiveStore::mark(&pool.live);
-    let ctx = Ctx::new(&pool.sandbox, &loaded.label, pool.keyvalue.clone());
+    // no request before the first job: the guest's output names no host
+    let serving = Serving::default();
+    let ctx = Ctx::new(
+        &pool.sandbox,
+        &loaded.label,
+        pool.keyvalue.clone(),
+        &pool.instances.tap,
+        &serving,
+    );
     let mut store = wasmtime::Store::new(engine(), ctx);
     store.limiter_async(|ctx| &mut ctx.limiter);
     // As in `respond`: the deadline must exist before any wasm runs.
@@ -2113,6 +2203,8 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot) {
                 reply: job.reply.clone(),
                 deadline: job.deadline,
             }));
+            // the guest's output from now on is this request's
+            serving.set(request_host(&job.request));
             accessor.with(|mut store| {
                 store
                     .as_context_mut()
@@ -2198,7 +2290,8 @@ pub async fn serve(mut io: TunnelIo, binding: Binding) {
     let label = format!("conn {conn_id}");
     tokio::select! {
         biased;
-        () = serve_http(io, h2, &instances, route, gone, &label) => {}
+        // the node's peer is the last entry of the request's X-Forwarded-For
+        () = serve_http(io, h2, &instances, route, gone, &label, None) => {}
         // dropping hyper drops the request in flight
         () = failed => {}
     }
@@ -2209,7 +2302,8 @@ pub async fn serve(mut io: TunnelIo, binding: Binding) {
 /// caller) else http/1.1, each by the handler `route` finds for it (404 with
 /// its message when none), until the connection ends; once `gone` is
 /// cancelled it shuts down gracefully. `label` names the connection in the
-/// log.
+/// log; `peer` is its client, None for a tunnel connection (whose client is
+/// the last entry of each request's `X-Forwarded-For`).
 pub(crate) async fn serve_http<I, R>(
     io: I,
     h2: bool,
@@ -2217,6 +2311,7 @@ pub(crate) async fn serve_http<I, R>(
     route: R,
     gone: CancellationToken,
     label: &str,
+    peer: Option<SocketAddr>,
 ) where
     I: tokio::io::AsyncRead + AsyncWrite + Unpin + Send + 'static,
     R: Fn(&hyper::Request<hyper::body::Incoming>) -> Result<Arc<Handler>, String>
@@ -2226,13 +2321,19 @@ pub(crate) async fn serve_http<I, R>(
 {
     let streams = instances.streams_per_connection();
     let share = instances.share();
+    let tap = instances.tap.clone();
     let route = Arc::new(route);
     let service = hyper::service::service_fn(move |req| {
         let (handler, share) = (route(&req), share.clone());
+        let answered = Answered::of(&tap, &req, peer);
         async move {
-            Ok::<_, std::convert::Infallible>(match handler {
+            let response = match handler {
                 Ok(handler) => respond(&handler, &share, req).await,
                 Err(message) => plain_response(404, message),
+            };
+            Ok::<_, std::convert::Infallible>(match answered {
+                Some(answered) => answered.counting(response),
+                None => response,
             })
         }
     });
@@ -2257,6 +2358,162 @@ pub(crate) async fn serve_http<I, R>(
     };
     if let Err(e) = served.await {
         eprintln!("[wasm] {label} serve error: {e}");
+    }
+}
+
+/// The host a request is for: the authority of an h2 request, the `Host`
+/// header of an http/1.1 one; lowercase, its port left out, empty when it
+/// names none.
+pub(crate) fn request_host<B>(request: &hyper::Request<B>) -> String {
+    let host = match request.uri().host() {
+        Some(host) => host.to_string(),
+        None => request
+            .headers()
+            .get(http::header::HOST)
+            .and_then(|host| host.to_str().ok())
+            .and_then(|host| host.parse::<http::uri::Authority>().ok())
+            .map(|authority| authority.host().to_string())
+            .unwrap_or_default(),
+    };
+    host.to_ascii_lowercase()
+}
+
+/// A request's line in the live access log (`response`), handed to the tap
+/// once its response is done: its body relayed to the end, or dropped
+/// before (the client left) -- or, the client gone before the head, with
+/// the 499 of a request its client closed.
+struct Answered {
+    tap: Arc<Tap>,
+    host: String,
+    began: std::time::Instant,
+    method: String,
+    path: String,
+    http: &'static str,
+    remote: String,
+    user_agent: String,
+    status: u16,
+    /// Body bytes relayed.
+    bytes: u64,
+}
+
+impl Answered {
+    /// None while the tap keeps nothing. `peer` is the connection's client,
+    /// else the request's `X-Forwarded-For` names it: its last entry, the
+    /// node's peer.
+    fn of<B>(
+        tap: &Arc<Tap>,
+        request: &hyper::Request<B>,
+        peer: Option<SocketAddr>,
+    ) -> Option<Answered> {
+        if !tap.on() {
+            return None;
+        }
+        let headers = request.headers();
+        let remote = match peer {
+            Some(peer) => Some(peer.to_string()),
+            None => headers
+                .get_all("x-forwarded-for")
+                .iter()
+                .next_back()
+                .and_then(|chain| chain.to_str().ok())
+                .and_then(|chain| chain.rsplit(',').next())
+                .map(|last| last.trim().to_string())
+                .filter(|last| !last.is_empty()),
+        };
+        let http = match request.version() {
+            http::Version::HTTP_09 => "0.9",
+            http::Version::HTTP_10 => "1.0",
+            http::Version::HTTP_11 => "1.1",
+            http::Version::HTTP_2 => "2",
+            http::Version::HTTP_3 => "3",
+            _ => "-",
+        };
+        Some(Answered {
+            tap: tap.clone(),
+            host: request_host(request),
+            began: std::time::Instant::now(),
+            method: request.method().to_string(),
+            path: request
+                .uri()
+                .path_and_query()
+                .map_or("/", |path| path.as_str())
+                .to_string(),
+            http,
+            remote: remote.unwrap_or_else(|| "-".into()),
+            user_agent: headers
+                .get(http::header::USER_AGENT)
+                .and_then(|agent| agent.to_str().ok())
+                .unwrap_or("-")
+                .to_string(),
+            status: 499,
+            bytes: 0,
+        })
+    }
+
+    /// The response, its line handed to the tap once its body is done.
+    fn counting(mut self, response: hyper::Response<RelayBody>) -> hyper::Response<RelayBody> {
+        self.status = response.status().as_u16();
+        response.map(|body| {
+            Counted {
+                body,
+                answered: self,
+            }
+            .boxed_unsync()
+        })
+    }
+}
+
+impl Drop for Answered {
+    fn drop(&mut self) {
+        let took = self.began.elapsed().as_secs_f64() * 1000.0;
+        self.tap.publish(
+            "response",
+            std::mem::take(&mut self.host),
+            vec![
+                ("method", std::mem::take(&mut self.method)),
+                ("path", std::mem::take(&mut self.path)),
+                ("http", self.http.to_string()),
+                ("status", self.status.to_string()),
+                ("durationMs", format!("{took:.3}")),
+                ("bytes", self.bytes.to_string()),
+                ("remote", std::mem::take(&mut self.remote)),
+                ("userAgent", std::mem::take(&mut self.user_agent)),
+            ],
+        );
+    }
+}
+
+/// A response body counting the bytes relayed, its request's line logged
+/// when hyper drops it.
+struct Counted {
+    body: RelayBody,
+    answered: Answered,
+}
+
+impl http_body::Body for Counted {
+    type Data = bytes::Bytes;
+    type Error = RelayError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        let polled = Pin::new(&mut this.body).poll_frame(cx);
+        if let Poll::Ready(Some(Ok(frame))) = &polled
+            && let Some(data) = frame.data_ref()
+        {
+            this.answered.bytes += data.len() as u64;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
     }
 }
 
@@ -2498,16 +2755,22 @@ pub(crate) mod tests {
         let engine = engine().clone();
         let component = wasmtime::component::Component::new(&engine, &bytes).unwrap();
         let linker = linker(&engine, Caps::default()).unwrap();
+        fn bench_ctx() -> Ctx {
+            Ctx::new(
+                &Sandbox::default(),
+                "bench",
+                None,
+                &Tap::off(),
+                &Serving::default(),
+            )
+        }
 
         // full path: import resolution + instantiation, once per request
         async fn full<'a>(
             linker: &'a wasmtime::component::Linker<Ctx>,
             component: &'a wasmtime::component::Component,
         ) -> wasmtime::Result<()> {
-            let mut store = wasmtime::Store::new(
-                linker.engine(),
-                Ctx::new(&Sandbox::default(), "bench", None),
-            );
+            let mut store = wasmtime::Store::new(linker.engine(), bench_ctx());
             store.set_epoch_deadline(u64::MAX / 2);
             let _ = wasmtime_wasi_http::p3::bindings::Service::instantiate_async(
                 &mut store, component, linker,
@@ -2518,8 +2781,7 @@ pub(crate) mod tests {
         // pre-linked path: instantiation only, what `respond` pays
         let pre = linker.instantiate_pre(&component).unwrap();
         async fn pre_linked(pre: &wasmtime::component::InstancePre<Ctx>) -> wasmtime::Result<()> {
-            let mut store =
-                wasmtime::Store::new(pre.engine(), Ctx::new(&Sandbox::default(), "bench", None));
+            let mut store = wasmtime::Store::new(pre.engine(), bench_ctx());
             store.set_epoch_deadline(u64::MAX / 2);
             let _ = pre.instantiate_async(&mut store).await?;
             Ok(())
@@ -3140,17 +3402,32 @@ pub(crate) mod tests {
         assert!(spread > 300, "body spread too small: {spread}ms");
     }
 
+    /// The fields of the tap's `kind` lines of `host`, in order.
+    fn tapped(tap: &Tap, kind: &str, host: &str) -> Vec<HashMap<&'static str, String>> {
+        tap.recent()
+            .iter()
+            .filter(|line| line.kind == kind && line.route_key == host)
+            .map(|line| line.fields.iter().cloned().collect())
+            .collect()
+    }
+
     /// Guest stdout and stderr reach the process log as whole lines, each
-    /// prefixed with the component and the request -- with no capability, as
-    /// under `wasmtime serve`.
+    /// prefixed with the component and the store -- with no capability, as
+    /// under `wasmtime serve` -- and the live access log's tap as lines of
+    /// the request's host, beside the request's `response` line. A pooled
+    /// unit's lines name the host of the request it serves at the time.
     #[tokio::test]
     async fn guest_stdio_lands_in_the_log_with_a_request_prefix() {
         let loaded = load(&Locator::File(hello_wasm()), Caps::default())
             .await
             .unwrap();
+        let tap = Tap::new();
+        let instances = Instances::fed(Instances::MAX, tap.clone());
+        let handler = Handler::new(loaded.clone(), Sandbox::default(), None, &instances).unwrap();
         let body = exchange(
-            &route(loaded.clone(), Sandbox::default()),
-            "GET /log HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+            &handler,
+            "GET /log HTTP/1.1\r\nhost: T.Example:8080\r\nuser-agent: probe/1\r\n\
+             x-forwarded-for: 203.0.113.9, 10.0.0.1\r\nconnection: close\r\n\r\n",
         )
         .await;
         assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
@@ -3177,15 +3454,86 @@ pub(crate) mod tests {
                 .0
                 .to_string()
         };
-        assert_eq!(id(&stdout), id(&stderr));
+        let store = id(&stdout);
+        assert_eq!(store, id(&stderr));
+
+        // the tap: the request's host, lowercase without its port
+        let guest = |line: &str| {
+            HashMap::from([
+                ("component", "hello.wasm".to_string()),
+                ("store", store.clone()),
+                ("line", line.to_string()),
+            ])
+        };
+        assert_eq!(
+            tapped(&tap, "stdout", "t.example"),
+            [guest("hello stdout: Method::Get /log body_bytes=0")]
+        );
+        assert_eq!(
+            tapped(&tap, "stderr", "t.example"),
+            [guest("hello stderr: Method::Get /log")]
+        );
+        let [mut response] = tapped(&tap, "response", "t.example").try_into().unwrap();
+        let took: f64 = response.remove("durationMs").unwrap().parse().unwrap();
+        assert!(took >= 0.0, "{took}");
+        let payload = "hello from wasm\nmethod=Method::Get\npath=/log\nbody_bytes=0\n";
+        assert!(body.contains(payload), "{body}");
+        assert_eq!(
+            response,
+            HashMap::from([
+                ("method", "GET".to_string()),
+                ("path", "/log".to_string()),
+                ("http", "1.1".to_string()),
+                ("status", "200".to_string()),
+                ("bytes", payload.len().to_string()),
+                // the node's peer: the last entry
+                ("remote", "10.0.0.1".to_string()),
+                ("userAgent", "probe/1".to_string()),
+            ])
+        );
+
+        // a pooled unit serves a and then b: one store, the host of each
+        let pooled = Handler::new(
+            loaded,
+            Sandbox {
+                pool: 1,
+                ..Sandbox::default()
+            },
+            None,
+            &instances,
+        )
+        .unwrap();
+        for host in ["a", "b"] {
+            restocked(&pooled, 1).await;
+            let request = format!("GET /log HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n\r\n");
+            let body = exchange(&pooled, &request).await;
+            assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
+        }
+        let stores: Vec<String> = ["a", "b"]
+            .iter()
+            .flat_map(|host| tapped(&tap, "stdout", host))
+            .map(|fields| fields["store"].clone())
+            .collect();
+        assert_eq!(stores.len(), 2, "{stores:?}");
+        assert_eq!(stores[0], stores[1], "one unit");
+        assert_ne!(stores[0], store, "not the cold request's store");
+        assert_eq!(pool(&pooled).spawned(), 1);
     }
 
     /// A guest writing without newlines is emitted in bounded pieces instead
     /// of buffering on the host; the remainder is flushed when the log drops.
     #[test]
     fn guest_log_bounds_an_unterminated_line() {
-        let prefix = "stdout [unterminated-test] :: ";
-        let log = GuestLog::new(prefix.into(), Output::Stdout);
+        // store 0: no store's id, the counter starts at 1
+        let prefix = "stdout [unterminated-test#0] :: ";
+        let tap = Tap::new();
+        let log = GuestLog::new(
+            Output::Stdout,
+            "unterminated-test",
+            0,
+            tap.clone(),
+            Serving::default(),
+        );
         log.write(&vec![b'x'; GUEST_LOG_LINE_MAX + 10]).unwrap();
         assert_eq!(log.state.pending.lock().unwrap().len(), 0);
         log.write(b"tail").unwrap();
@@ -3197,10 +3545,14 @@ pub(crate) mod tests {
             .lines()
             .filter_map(|line| line.strip_prefix(prefix).map(str::to_string))
             .collect();
-        assert_eq!(
-            lines,
-            ["x".repeat(GUEST_LOG_LINE_MAX + 10), "tail".to_string()]
-        );
+        let expected = ["x".repeat(GUEST_LOG_LINE_MAX + 10), "tail".to_string()];
+        assert_eq!(lines, expected);
+        // the tap's too, of no request yet
+        let tapped: Vec<String> = tapped(&tap, "stdout", "")
+            .into_iter()
+            .map(|fields| fields["line"].clone())
+            .collect();
+        assert_eq!(tapped, expected);
     }
 
     /// A raw TCP upstream: reads each request head, answers `pong` (HTTP/1.0,

@@ -1,9 +1,11 @@
-# sluice-wicket-cf-api as a static musl binary on distroless static. The build script
-# dependency lives in sluice-build-info, so the build context is the repository root:
+# sluice-wicket-cf-api as a static musl binary on distroless static. The flume proto lives
+# in sluice-proto and the build script dependency in sluice-build-info, so the build context
+# is the repository root:
 #   docker build -f sluice-wicket-cf-api/Dockerfile --build-arg GIT_COMMIT=$(git rev-parse HEAD) .
 FROM rust:1.99-alpine AS build
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache musl-dev protoc
 WORKDIR /src
+COPY sluice-proto/src/main/proto sluice-proto/src/main/proto
 COPY sluice-build-info/Cargo.toml sluice-build-info/
 COPY sluice-build-info/src sluice-build-info/src
 COPY sluice-wicket-cf-api/Cargo.toml sluice-wicket-cf-api/Cargo.lock sluice-wicket-cf-api/build.rs sluice-wicket-cf-api/

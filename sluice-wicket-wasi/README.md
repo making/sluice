@@ -111,7 +111,8 @@ registration on the server.
 `--listen <host:port>` serves the routes over plain TCP too (see [Local mode](#local-mode));
 `--keyvalue-file <path>` moves the keyvalue store (see
 [Key-value stores](#key-value-stores-experimental)); `--console <host:port>` serves a page
-deploying components as routes (see [Console](#console)).
+deploying components as routes (see [Console](#console)); `--flume <url>` feeds the live
+access log (see [Live access log](#live-access-log)).
 
 `--max-connections N` (default 256) caps the connections open at once over every
 node stream; a CONNECT beyond it is answered with the ERROR `connection limit reached`
@@ -195,6 +196,10 @@ watch-interval: 1s              # 0 = no polling, SIGHUP only
 # console: 127.0.0.1:9090       # see Console
 # console-token: ${CONSOLE_TOKEN}
 # console-dir: deployed         # relative to this file
+# flume: grpc://127.0.0.1:8002  # see Live access log
+# flume-token: ${FLUME_TOKEN}
+# flume-ca-cert: flume-ca.pem   # relative to this file
+# flume-insecure: true
 
 keyvalue:                       # optional: one sqlite store, keyvalue.db next to this file
   default: local                # optional with one store
@@ -473,8 +478,36 @@ importing what its route does not link, named with the capability it needs
 ```
 
 Guest stdout / stderr always go to the wicket's stdout / stderr as whole
-lines, prefixed with the component and a request id
-(`stdout [app.wasm#12] :: ...`), as `wasmtime serve` does.
+lines, prefixed with the component and the id of the store writing them
+(`stdout [app.wasm#12] :: ...`: a request's, or a pooled unit's for all its requests), as
+`wasmtime serve` does; with a flume they reach the [live access log](#live-access-log) too.
+
+### Live access log
+
+`--flume <grpc://host:port | grpcs://host:port>` with `--flume-token <token>` feeds the
+live access log of a sluice-flume as a sluice node feeds its own (see
+[Live access log](../README.md#live-access-log)), so the consoles watching the flume and the
+cf-api (`cf logs`) see the wicket's lines:
+
+| kind | fields |
+|---|---|
+| `stdout` / `stderr` | `component`, `store` (the prefix's id), `line` |
+| `response` | `method`, `path`, `http` (`1.1`, `2`), `status`, `durationMs`, `bytes` (of the body), `remote`, `userAgent` |
+
+- the route key of a line is the host of its request: the `Host` (`:authority`), lowercase,
+  without its port. A pooled unit serves one request at a time, so its output names the
+  request it was written during (empty before its first)
+- `remote` is the last entry of the request's `X-Forwarded-For` (the node's peer), the
+  client's `ip:port` on `--listen`; `durationMs` runs from the request's arrival to the end
+  of its response body; a client gone before the response head is logged with status 499
+- the wicket is the flume's node `wicket:<client-id>`: pin `--client-id` to stay one node
+  across restarts
+- as a node's: the feed runs while the flume asks for it; the last 512 lines are kept for its
+  backfill, up to 4096 wait for a slow flume, past them lines are dropped and reach it as a
+  gap; a flume down costs a warning per 5 minutes, redialed with a backoff of 1s to 30s
+- a `grpcs://` flume is verified with `--flume-ca-cert <file>` (PEM), the webPKI roots by
+  default, or not at all with `--flume-insecure`; in the config file `flume`,
+  `flume-token`, `flume-ca-cert`, `flume-insecure` (read at startup)
 
 ### Key-value stores (experimental)
 

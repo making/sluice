@@ -1,5 +1,6 @@
-# the context is the repository root; the build needs the crate and its build script dependency only
+# the context is the repository root; the build needs the proto, the crate and its build script dependency only
 *
+!sluice-proto/src/main/proto
 !sluice-build-info/Cargo.toml
 !sluice-build-info/src
 !sluice-wicket-cf-api/Cargo.toml

@@ -49,28 +49,18 @@ pub async fn run(
                 move |request: &hyper::Request<hyper::body::Incoming>| route(&routes, request);
             let label = format!("listener conn {peer}");
             // never gone: a reload changes the routes request by request
-            wasm_host::serve_http(io, h2, &instances, route, CancellationToken::new(), &label)
-                .await;
+            let gone = CancellationToken::new();
+            wasm_host::serve_http(io, h2, &instances, route, gone, &label, Some(peer)).await;
         });
     }
 }
 
-/// The handler of `request`'s host: the authority of an h2 request, the
-/// `Host` header of an http/1.1 one, its port left out.
+/// The handler of `request`'s host (`wasm_host::request_host`).
 fn route(
     routes: &Routes,
     request: &hyper::Request<hyper::body::Incoming>,
 ) -> Result<Arc<Handler>, String> {
-    let host = match request.uri().host() {
-        Some(host) => host.to_string(),
-        None => request
-            .headers()
-            .get(http::header::HOST)
-            .and_then(|host| host.to_str().ok())
-            .and_then(|host| host.parse::<http::uri::Authority>().ok())
-            .map(|authority| authority.host().to_string())
-            .unwrap_or_default(),
-    };
+    let host = wasm_host::request_host(request);
     routes
         .by_host(&host)
         .ok_or_else(|| format!("no wasm route for host '{host}'"))

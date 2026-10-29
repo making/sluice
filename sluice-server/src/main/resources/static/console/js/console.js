@@ -26,6 +26,7 @@ document.addEventListener("htmx:finally:request", (event) => {
     const state = document.querySelector("[data-testid=livelog-state]");
     const missed = document.querySelector("[data-testid=livelog-missed]");
     const nodes = document.getElementById("livelog-nodes");
+    const nodeChoice = form.querySelector("select[name=node]");
     const build = document.getElementById("livelog-build");
     const pause = document.querySelector("[data-livelog-pause]");
     const follow = document.querySelector("[data-livelog-follow]");
@@ -99,6 +100,14 @@ document.addEventListener("htmx:finally:request", (event) => {
       });
       source.addEventListener("nodes", (event) => {
         nodes.innerHTML = event.data;
+        // the selector starts with the cluster's nodes; one feeding from outside it (a
+        // wicket) joins once the flume reports it
+        for (const chip of nodes.querySelectorAll("[data-node]")) {
+          const id = chip.dataset.node;
+          if (!Array.from(nodeChoice.options).some((option) => option.value === id)) {
+            nodeChoice.add(new Option(id, id));
+          }
+        }
       });
       source.addEventListener("flume", (event) => setState(event.data));
       source.addEventListener("build", (event) => {

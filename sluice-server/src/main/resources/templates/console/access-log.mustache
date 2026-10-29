@@ -18,7 +18,8 @@
     <h1 id="access-log-heading" class="rule-heading">Access log</h1>
     {{#enabled}}
     <p class="hint">The access log lines of every node feeding <span class="mono">{{flumeUrl}}</span>, newest last, as the
-      nodes log them; a node sends its lines only while someone watches.</p>
+      nodes log them; a node sends its lines only while someone watches. A wicket feeds the requests it answered and
+      its guests' output.</p>
     <form class="livelog__filters" data-livelog-filters>
       <label class="livelog__field">Route
         <select name="route" data-testid="livelog-route">

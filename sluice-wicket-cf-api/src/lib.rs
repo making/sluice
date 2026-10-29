@@ -3,24 +3,33 @@
 //! API, the UAA token endpoints and log-cache's read API it uses -- keeping
 //! the desired state of its apps and having one wicket serve them through
 //! the wicket's app API; the wicket's keyvalue stores and capabilities are
-//! its services.
+//! its services. With a flume, the apps' output and requests reach their
+//! logs from the live access log the wicket feeds (`flume`).
 //!
 //! ```text
 //! cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> sluice-wicket-wasi
+//!                                                  ^                              |
+//!                                                  +--Watch-- sluice-flume <--Feed+
 //! ```
 
 pub mod api;
 pub mod config;
 pub mod controller;
+pub mod flume;
 pub mod logs;
 pub mod manifest;
 mod multipart;
 pub mod services;
 pub mod staging;
 pub mod store;
+mod tls;
 pub mod uaa;
 mod views;
 pub mod wicket;
+
+pub mod proto {
+    tonic::include_proto!("sluice.v1");
+}
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -83,6 +92,9 @@ pub struct Settings {
     pub data_dir: PathBuf,
     pub org: String,
     pub space: String,
+    /// Where the apps' output and requests come from; None: the logs hold
+    /// the cf-api's own lines only.
+    pub flume: Option<flume::FlumeSettings>,
 }
 
 /// Binds `listen`: a loopback address only, as the API takes any
@@ -130,8 +142,12 @@ pub async fn serve(
         edits: tokio::sync::Mutex::new(()),
         offer: std::sync::Mutex::new(None),
     });
+    let flume = settings
+        .flume
+        .clone()
+        .map(|flume| tokio::spawn(flume::watch(flume, store.clone(), logs.clone())));
     let api = Arc::new(api::Api {
-        store,
+        store: store.clone(),
         uaa,
         logs,
         controller: controller.clone(),
@@ -143,5 +159,10 @@ pub async fn serve(
         () = shutdown => {}
     }
     watch.abort();
+    if let Some(flume) = flume {
+        flume.abort();
+        // the watch's cursor as it got
+        store.update(|_| ());
+    }
     Ok(())
 }

@@ -29,14 +29,18 @@ import am.ik.sluice.v1.proto.Cursor;
 import am.ik.sluice.v1.proto.WatchRequest;
 
 /**
- * The live access log: the lines of every node as the flume of
+ * The live access log: the lines of every node (and wicket) as the flume of
  * {@code sluice.live-log.url} streams them, filtered there by route, kind and node.
  */
 @Controller
 class LiveLogController implements DisposableBean {
 
-	/** The kinds of lines, in the order the filter lists them. */
-	static final List<String> KINDS = List.of("request", "accept", "close", "reject", "ratelimit");
+	/**
+	 * The kinds of lines, in the order the filter lists them: a node's, then a wicket's
+	 * (the requests it answered, its guests' output).
+	 */
+	static final List<String> KINDS = List.of("request", "accept", "close", "reject", "ratelimit", "response", "stdout",
+			"stderr");
 
 	/** How often an idle stream carries a comment line. */
 	static final Duration HEARTBEAT = Duration.ofSeconds(15);
@@ -68,13 +72,18 @@ class LiveLogController implements DisposableBean {
 		model.addAttribute("user", ConsoleController.displayName(authentication));
 		model.addAttribute("enabled", this.flume.enabled());
 		model.addAttribute("flumeUrl", this.flume.url());
+		// a route or node the address names beyond the cluster's (a wicket's host or the
+		// wicket) stays a choice
 		Set<String> routeKeys = new LinkedHashSet<>();
 		this.consoleView.httpRoutes().forEach(route -> routeKeys.add(route.gateKey()));
 		this.consoleView.tcpRoutes().forEach(route -> routeKeys.add(route.gateKey()));
+		routeKeys.addAll(present(routes));
 		model.addAttribute("routes", choices(routeKeys, routes));
 		model.addAttribute("kinds", choices(KINDS, kinds));
-		model.addAttribute("nodes",
-				choices(this.consoleView.cluster().nodes().stream().map(ConsoleView.NodeRow::nodeId).toList(), nodes));
+		Set<String> nodeIds = new LinkedHashSet<>();
+		this.consoleView.cluster().nodes().forEach(node -> nodeIds.add(node.nodeId()));
+		nodeIds.addAll(present(nodes));
+		model.addAttribute("nodes", choices(nodeIds, nodes));
 		model.addAttribute("rowCap", 1000);
 		return "console/access-log";
 	}
