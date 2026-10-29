@@ -644,8 +644,13 @@ pub async fn fetch(locator: &Locator) -> Result<Fetched, String> {
 /// digest and linker is still alive: then that one is shared. Only live
 /// components are kept, so a replaced one is freed with its last handler. The
 /// compilation runs on the blocking pool: a reload compiles while the wicket
-/// serves.
-pub async fn compile(fetched: Fetched, caps: Caps) -> Result<Arc<Loaded>, String> {
+/// serves. Its errors name the component `shown`, else by its locator (the
+/// target minus `wasm:`).
+pub async fn compile(
+    fetched: Fetched,
+    caps: Caps,
+    shown: Option<&str>,
+) -> Result<Arc<Loaded>, String> {
     // (target, (cli, keyvalue), digest) -> component: the caps select the linker
     type Cache = Mutex<HashMap<(String, (bool, bool), String), std::sync::Weak<Loaded>>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -665,9 +670,13 @@ pub async fn compile(fetched: Fetched, caps: Caps) -> Result<Arc<Loaded>, String
         return Ok(loaded);
     }
     let (target, _, digest) = key.clone();
-    let loaded = tokio::task::spawn_blocking(move || link(&target, &bytes, digest, caps))
+    let name = shown
+        .unwrap_or_else(|| target.strip_prefix("wasm:").unwrap_or(&target))
+        .to_string();
+    let named = name.clone();
+    let loaded = tokio::task::spawn_blocking(move || link(&target, &named, &bytes, digest, caps))
         .await
-        .map_err(|e| format!("compile {}: {e}", key.0))??;
+        .map_err(|e| format!("compile {name}: {e}"))??;
     let loaded = Arc::new(loaded);
     let mut cache = cache.lock().unwrap();
     cache.retain(|_, weak| weak.strong_count() > 0);
@@ -678,14 +687,20 @@ pub async fn compile(fetched: Fetched, caps: Caps) -> Result<Arc<Loaded>, String
 /// Fetches and compiles the component behind `locator` ([`fetch`], [`compile`]).
 #[cfg(test)]
 pub async fn load(locator: &Locator, caps: Caps) -> Result<Arc<Loaded>, String> {
-    compile(fetch(locator).await?, caps).await
+    compile(fetch(locator).await?, caps, None).await
 }
 
-/// Compiles and pre-links `bytes` of the component at `target`.
-fn link(target: &str, bytes: &[u8], digest: String, caps: Caps) -> Result<Loaded, String> {
+/// Compiles and pre-links `bytes` of the component at `target`, its errors
+/// naming it `name`.
+fn link(
+    target: &str,
+    name: &str,
+    bytes: &[u8],
+    digest: String,
+    caps: Caps,
+) -> Result<Loaded, String> {
     let label = target.rsplit('/').next().unwrap_or(target).to_string();
     let engine = engine().clone();
-    let name = target.strip_prefix("wasm:").unwrap_or(target);
     let component = wasmtime::component::Component::new(&engine, bytes)
         .map_err(|e| format!("component {name}: {e}"))?;
     let imports: Vec<_> = component

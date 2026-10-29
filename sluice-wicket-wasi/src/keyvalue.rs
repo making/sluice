@@ -300,12 +300,7 @@ impl Stores {
             Some((store, namespace)) => (store, namespace),
             None => (spec, host),
         };
-        if !self.configs.contains_key(store) {
-            return Err(format!(
-                "unknown keyvalue store '{store}' ({})",
-                self.configs.keys().cloned().collect::<Vec<_>>().join(", ")
-            ));
-        }
+        self.known(store)?;
         if namespace.is_empty() {
             return Err(format!("'{spec}': empty namespace"));
         }
@@ -313,6 +308,33 @@ impl Stores {
             store: store.to_string(),
             namespace: namespace.to_string(),
         })
+    }
+
+    /// Whether `store` is one of the stores; the error names them.
+    pub fn known(&self, store: &str) -> Result<(), String> {
+        if self.configs.contains_key(store) {
+            return Ok(());
+        }
+        Err(format!(
+            "unknown keyvalue store '{store}' ({})",
+            self.configs.keys().cloned().collect::<Vec<_>>().join(", ")
+        ))
+    }
+
+    /// Each store's name and type (`sqlite`, `redis`), and whether it is the
+    /// default one; by name.
+    pub fn described(&self) -> Vec<(&str, &'static str, bool)> {
+        self.configs
+            .iter()
+            .map(|(name, config)| {
+                let kind = match config.kind {
+                    Kind::Sqlite { .. } => "sqlite",
+                    #[cfg(feature = "redis")]
+                    Kind::Redis { .. } => "redis",
+                };
+                (name.as_str(), kind, *name == self.default)
+            })
+            .collect()
     }
 
     /// The buckets of `map`, opening the stores it names that are not yet;

@@ -1101,6 +1101,11 @@ code {
 	font-weight: 600;
 }
 
+.route__app {
+	display: block;
+	color: var(--ink-soft);
+}
+
 .catch-all {
 	font-family: var(--sans);
 	font-style: italic;

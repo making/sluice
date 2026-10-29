@@ -287,7 +287,8 @@ routes at once, without a restart: drop a `.wasm` file on the page (or choose on
 host and a sandbox, and it is served -- on the tunnel and on `--listen` alike. Dropped on a
 route of the console, a file replaces its component; renamed, a route moves to another host
 with its component and sandbox. The routes of the config file and the `--wasm` flags are
-listed too, read-only.
+listed too, read-only, and so are the [apps](#apps) a controller deploys through the API: hosts
+served by one component in one sandbox.
 
 ```text
 target/debug/sluice-wicket-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090
@@ -300,18 +301,23 @@ be with it, and it is kept only when they load: a component that does not compil
 config file or a flag routes, pools past `--max-instances` refuse it with the reason, and the
 routes stay as they were. The console's hosts are hosts like any other: routing one in the
 config file too fails that reload (`configured twice: by the config file and by the
-console`).
+console`). An error names a component of the console by its path in `--console-dir`
+(`wasm route 'counter.localhost': component components/0954…e8/counter.wasm imports
+wasi:keyvalue/store@0.2.0-draft2: the route needs wasi=keyvalue`), one of the config file or a
+flag by its file.
 
-The console keeps its routes in `--console-dir` (`console-dir`, default `deployed` next to the
-config file, else in the working directory: `/data/deployed` in the image) and serves them
-again after a restart:
+The console keeps its routes and apps in `--console-dir` (`console-dir`, default `deployed`
+next to the config file, else in the working directory: `/data/deployed` in the image) and
+serves them again after a restart:
 
 ```text
-deployed/routes.yaml                      the routes, in the config file's route shape
-deployed/components/<sha256>/<name>.wasm  the uploaded components, never rewritten
+deployed/routes.yaml                      the routes and the apps, in the config file's route shape
+deployed/components/<sha256>/<name>.wasm  the components they name, never rewritten
+deployed/uploads/<sha256>.wasm            the components uploaded by digest, for an app to name
 ```
 
-`routes.yaml` is written once a change loaded, and a component no route names is removed. A
+`routes.yaml` is written once a change loaded, and a component no route or app names is
+removed; an upload, 10 minutes after it (an app naming it links it below `components/`). A
 component's path names its digest, so other content is another target: the route is
 retargeted, and its old target drains as a removed one does. Without `--console` the directory
 is not read: the console's routes are served with the console only. One wicket per
@@ -375,11 +381,65 @@ curl -T hello.wasm -H 'Authorization: Bearer SECRET' \
 ```
 
 An edit is answered 400 (a bad host name, option or body), 404 (no route of the console), 409
-(a host the config file or a flag routes; for a move, any routed host), 413, 422 (the routes
-did not load with it; the reason follows) or 503 (draining). A host is dot-separated labels of
-`a-z`, `0-9` and `-`. A `wasi=keyvalue` route gets the default keyvalue map: the default
-store, the host as the namespace. The namespace follows a move, so a moved route starts with
-no data; what it stored stays under the old host.
+(a host the config file, a flag or an app routes; for a move, any routed host), 413, 422 (the
+routes did not load with it; the reason follows) or 503 (draining). A host is dot-separated
+labels of `a-z`, `0-9` and `-`. A `wasi=keyvalue` route gets the default keyvalue map: the
+default store, the host as the namespace. The namespace follows a move, so a moved route
+starts with no data; what it stored stays under the old host.
+
+The listing names each route's `origin` (`config`, `flag`, `console`, `api`), its advertised
+`target` (the route's identity on the server: the component's absolute URL and the sandbox),
+its component and sandbox, and the wicket's `keyvalue_stores` (`name`, `type`, `default`).
+
+#### Apps
+
+An app is hosts served by one component in one sandbox, its keyvalue map named, put and
+removed by its owner: the API of a controller keeping the desired state of its apps (as
+`sluice-wicket-cf-api` does). Its component is uploaded by digest first; the app names it:
+
+| request | |
+|---|---|
+| `PUT /api/components/<sha256>` | keeps the body, a component of 128MiB at most, under its digest (400 when the body has another): `{"sha256": .., "bytes": ..}` |
+| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "apps": [..]}` |
+| `PUT /api/apps/<name>` | serves the app of the body (JSON, below) |
+| `DELETE /api/apps/<name>?owner=<owner>` | removes the app of `owner` |
+
+```json
+{
+  "owner": "cf",
+  "hosts": ["counter.localhost", "count.localhost"],
+  "component": {"sha256": "0954dc11…e8", "name": "counter.wasm"},
+  "sandbox": {"wasi": ["keyvalue"], "budget_ms": 10000, "memory_mib": 256, "pool": 1,
+              "instances": null, "keyvalue": {"": "local/cf/5d2f-guid"}}
+}
+```
+
+```text
+SHA=$(shasum -a 256 counter.wasm | cut -d' ' -f1)
+curl -T counter.wasm -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/components/$SHA
+curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/apps/counter
+{"generation":3,"message":"added count.localhost, counter.localhost"}
+```
+
+- the sandbox is the route options of `--wasm` in JSON (`wasi` a list, `budget_ms`,
+  `memory_mib`, `pool`, `instances`), each left out taking its default, and the keyvalue map:
+  with `keyvalue` granted, each identifier to `store/namespace` in full (an app has no one
+  host to default the namespace to), the stores those of `keyvalue_stores`
+- a PUT is one reload, as a deploy: every host of the app or none, kept only when the routes
+  load; the same app again changes nothing, and an app keeps its `deployed` time while its
+  component and sandbox stay. An app listed by `GET /api/apps` is a body its PUT takes (less
+  `name` and `deployed`)
+- an app's routes share a handler, and never with another app (its target names it,
+  `…/counter.wasm?app=counter&…`): its pool, its `instances` cap and its guests' output stay
+  its own
+- answered as the console's edits, and 409 for a host another source, the page or another app
+  routes, for another owner's app, and for a component no upload kept (`"missing":
+  ["<sha256>"]`); a 422 names the host whose route did not load (`"host"`; none when no one
+  route failed, e.g. pools past `--max-instances`)
+- the page lists an app's routes read-only (`origin: "api"`, with `app` and `owner`), and its
+  per-host endpoints refuse their hosts (409)
+- an app and an owner are named by 1 to 100 of `A-Z`, `a-z`, `0-9`, `.`, `_` and `-`, starting
+  with a letter or a digit; a component's file name by those, ending in `.wasm`
 
 ### Capabilities
 
@@ -617,8 +677,8 @@ Kubernetes, `terminationGracePeriodSeconds` (30s by default) bounds it the same 
 - file changes are seen by modification time, size and inode: a component rewritten
   in place with the same size within the file system's time granularity is missed
   until SIGHUP
-- the console has no TLS of its own, sets no keyvalue map but the default one, and keeps
-  its directory to one wicket (nothing locks it)
+- the console has no TLS of its own, its page sets no keyvalue map but the default one (an
+  app names its own), and it keeps its directory to one wicket (nothing locks it)
 
 ## Build note
 

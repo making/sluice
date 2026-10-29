@@ -42,7 +42,7 @@
         <ol>
           <li>A wasi:http component (<span class="mono">wasm32-wasip3</span>) of at most <span data-field="limit">the upload limit</span>.</li>
           <li>Compiled and checked before anything changes: if it fails, the routes stay as they were.</li>
-          <li>Served at once, without a restart. A host deployed here is replaced in place; routes of the config file and <span class="mono">--wasm</span> flags are read-only.</li>
+          <li>Served at once, without a restart. A host deployed here is replaced in place; routes of the config file, <span class="mono">--wasm</span> flags and apps are read-only.</li>
         </ol>
       </div>
     </div>
@@ -131,7 +131,7 @@
 
   <section class="panel" aria-labelledby="routes-heading">
     <h2 id="routes-heading" class="rule-heading">Routes</h2>
-    <p class="hint">Routes deployed here can be replaced by dropping a <span class="mono">.wasm</span> on their row. Routes from the config file and <span class="mono">--wasm</span> flags are read-only here.</p>
+    <p class="hint">Routes deployed here can be replaced by dropping a <span class="mono">.wasm</span> on their row. Routes from the config file, <span class="mono">--wasm</span> flags and apps (put through <span class="mono">/api/apps</span>) are read-only here.</p>
     <div data-slot="routes-note"></div>
     <div class="routes-frame">
       <table class="grid routes" data-testid="routes">

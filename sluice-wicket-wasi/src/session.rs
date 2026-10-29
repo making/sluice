@@ -957,6 +957,7 @@ pub(crate) mod testing {
         let source = config::RouteSource::flags(vec![routes::Spec {
             host: "hello.local".into(),
             component: wasm_host::Locator::parse(hello.to_str().unwrap()).unwrap(),
+            shown: None,
             sandbox: wasm_host::Sandbox::default(),
             origin: routes::Origin::Flag,
         }]);

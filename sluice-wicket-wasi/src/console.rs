@@ -3,7 +3,8 @@
 //! route at once, without a restart: the console hands the edit to the
 //! reloader (`routes::Reloader::apply`), which reloads the routes with it and
 //! keeps them only when they loaded, the console's routes in its directory
-//! (`deployed`).
+//! (`deployed`). A controller deploys apps the same way: hosts served by a
+//! component it uploaded by digest before, in one sandbox.
 //!
 //! ```text
 //! GET    /api/routes[?after=<revision>]         the routes; held until they change when
@@ -12,11 +13,15 @@
 //! PATCH  /api/routes/<host>?<options>           gives the console's route another sandbox
 //! PATCH  /api/routes/<host>?host=<to>           moves the console's route to another host
 //! DELETE /api/routes/<host>                     removes the console's route
+//! PUT    /api/components/<sha256>               keeps the body, a component, under its digest
+//! GET    /api/apps[?after=<revision>]           the apps, as `/api/routes`
+//! PUT    /api/apps/<name>                       serves the app the body (JSON) has
+//! DELETE /api/apps/<name>?owner=<owner>         removes the app
 //! ```
 //!
 //! The options are the `--wasm` route's (`budget-ms`, `instances`,
 //! `memory-mib`, `pool`, `wasi`), the whole sandbox: an option left out takes
-//! its default.
+//! its default. An app's sandbox is the same in JSON, with its keyvalue map.
 //!
 //! With `--console-token` every request needs the token, as the password of
 //! HTTP Basic (any user name: the browser asks for it) or as a Bearer token.
@@ -25,6 +30,7 @@
 //! cannot reach it. Edits take no simple method -- neither a form nor
 //! `sendBeacon` can send one -- and one from another origin is refused.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -36,16 +42,20 @@ use http::request::Parts;
 use http::{HeaderValue, Method, StatusCode, header};
 use http_body_util::{BodyExt as _, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::deployed::{self, rfc3339};
+use crate::deployed::{self, AppSpec, rfc3339};
+use crate::keyvalue::Stores;
 use crate::routes::{Edit, Origin, Outcome, Refused, Request, Routes, Status};
 use crate::wasm_host::{Caps, Limits, Sandbox};
 
 /// Largest component an upload may carry.
 pub const MAX_COMPONENT_BYTES: usize = 128 << 20;
+
+/// Largest app (its JSON) a PUT may carry.
+const MAX_APP_BYTES: usize = 64 << 10;
 
 /// How long `GET /api/routes?after=<the current revision>` waits for a change.
 const LONG_POLL: Duration = Duration::from_secs(25);
@@ -72,6 +82,8 @@ pub struct Console {
     pub status: watch::Receiver<Status>,
     /// To the reloader, which applies the edits.
     pub requests: mpsc::Sender<Request>,
+    /// The keyvalue stores an app's map may name.
+    pub stores: Arc<Stores>,
     /// None: no credentials asked, on a loopback address.
     pub token: Option<String>,
     /// What the page shows besides the routes.
@@ -155,26 +167,47 @@ impl Console {
     /// Answers the request of `parts`, taking `body` when it reads it.
     async fn route(&self, parts: &Parts, body: &mut Option<Incoming>) -> Response {
         let (method, path, query) = (&parts.method, parts.uri.path(), parts.uri.query());
+        let mut take = || body.take().expect("not read yet");
         match (method, path) {
             (&Method::GET, "/") => asset("text/html; charset=utf-8", INDEX.as_bytes()),
             (&Method::GET, "/console.css") => asset("text/css; charset=utf-8", CSS.as_bytes()),
             (&Method::GET, "/console.js") => asset("text/javascript; charset=utf-8", JS.as_bytes()),
             (&Method::GET, "/fonts/overpass.woff2") => asset("font/woff2", OVERPASS),
             (&Method::GET, "/fonts/overpass-mono.woff2") => asset("font/woff2", OVERPASS_MONO),
-            (&Method::GET, "/api/routes") => self.list(query).await,
-            _ => match path.strip_prefix("/api/routes/") {
-                Some(host) if method == Method::PUT => {
-                    let body = body.take().expect("not read yet");
-                    self.deploy(host, parts, body).await
+            (&Method::GET, "/api/routes") => {
+                let status = self.settled(query).await;
+                json(StatusCode::OK, &self.listing(&status))
+            }
+            (&Method::GET, "/api/apps") => {
+                let status = self.settled(query).await;
+                json(StatusCode::OK, &self.apps(&status))
+            }
+            _ => {
+                if let Some(host) = path.strip_prefix("/api/routes/") {
+                    match *method {
+                        Method::PUT => self.deploy(host, parts, take()).await,
+                        Method::PATCH => self.patch(host, query).await,
+                        Method::DELETE => self.remove(host).await,
+                        _ => error(
+                            StatusCode::METHOD_NOT_ALLOWED,
+                            "a route takes PUT, PATCH or DELETE",
+                        ),
+                    }
+                } else if let Some(name) = path.strip_prefix("/api/apps/") {
+                    match *method {
+                        Method::PUT => self.put_app(name, parts, take()).await,
+                        Method::DELETE => self.delete_app(name, query).await,
+                        _ => error(StatusCode::METHOD_NOT_ALLOWED, "an app takes PUT or DELETE"),
+                    }
+                } else if let Some(sha256) = path.strip_prefix("/api/components/") {
+                    match *method {
+                        Method::PUT => self.upload(sha256, parts, take()).await,
+                        _ => error(StatusCode::METHOD_NOT_ALLOWED, "a component takes PUT"),
+                    }
+                } else {
+                    error(StatusCode::NOT_FOUND, format!("nothing at {path}"))
                 }
-                Some(host) if method == Method::PATCH => self.patch(host, query).await,
-                Some(host) if method == Method::DELETE => self.remove(host).await,
-                Some(_) => error(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "a route takes PUT, PATCH or DELETE",
-                ),
-                None => error(StatusCode::NOT_FOUND, format!("nothing at {path}")),
-            },
+            }
         }
     }
 
@@ -224,9 +257,9 @@ impl Console {
         })
     }
 
-    /// The routes; with `after` the current revision, once they changed or
-    /// [`LONG_POLL`] passed.
-    async fn list(&self, query: Option<&str>) -> Response {
+    /// The status once the routes moved past `after` of `query` (the current
+    /// revision) or [`LONG_POLL`] passed; at once without `after`.
+    async fn settled(&self, query: Option<&str>) -> Status {
         let after = form_urlencoded::parse(query.unwrap_or_default().as_bytes())
             .find(|(key, _)| key == "after")
             .and_then(|(_, value)| value.parse::<u64>().ok());
@@ -239,8 +272,7 @@ impl Console {
                 tokio::time::sleep(LONG_POLL).await;
             }
         }
-        let status = status.borrow().clone();
-        json(StatusCode::OK, &self.listing(&status))
+        status.borrow().clone()
     }
 
     fn listing(&self, status: &Status) -> Listing {
@@ -250,16 +282,30 @@ impl Console {
             .iter()
             .filter_map(|up| {
                 let handler = table.handler(&up.target_url)?;
-                let (origin, deployed) = match table.origins.get(&up.host) {
-                    Some(Origin::Console { deployed }) => ("console", Some(deployed.clone())),
-                    Some(Origin::Config) => ("config", None),
-                    _ => ("flag", None),
+                let (origin, deployed, app, owner) = match table.origins.get(&up.host) {
+                    Some(Origin::Console { deployed }) => {
+                        ("console", Some(deployed.clone()), None, None)
+                    }
+                    Some(Origin::Api {
+                        name,
+                        owner,
+                        deployed,
+                    }) => (
+                        "api",
+                        Some(deployed.clone()),
+                        Some(name.clone()),
+                        Some(owner.clone()),
+                    ),
+                    Some(Origin::Config) => ("config", None, None, None),
+                    _ => ("flag", None, None, None),
                 };
                 let loaded = handler.loaded();
                 Some(RouteView {
                     host: up.host.clone(),
                     origin,
                     deployed,
+                    app,
+                    owner,
                     target: up.target_url.clone(),
                     component: ComponentView {
                         name: loaded.label().to_string(),
@@ -283,6 +329,16 @@ impl Console {
                 budget_ms: defaults.budget.as_millis(),
                 memory_mib: defaults.memory >> 20,
             },
+            keyvalue_stores: self
+                .stores
+                .described()
+                .into_iter()
+                .map(|(name, kind, default)| StoreView {
+                    name: name.to_string(),
+                    kind,
+                    default,
+                })
+                .collect(),
             reload_failure: status.failure.as_ref().map(|failure| FailureView {
                 reason: failure.reason.clone(),
                 error: failure.error.clone(),
@@ -292,27 +348,49 @@ impl Console {
         }
     }
 
-    /// Reads the component before anything else: a refusal answered before
-    /// would be lost to the reset of the connection (see [`drain`]).
-    async fn deploy(&self, host: &str, parts: &Parts, body: Incoming) -> Response {
-        let too_large = || {
-            error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("a component is {} MiB at most", MAX_COMPONENT_BYTES >> 20),
-            )
-        };
-        let declared = parts
-            .headers
-            .get(header::CONTENT_LENGTH)
-            .and_then(|length| length.to_str().ok())
-            .and_then(|length| length.parse::<u64>().ok());
-        if declared.is_some_and(|length| length > MAX_COMPONENT_BYTES as u64) {
-            return too_large();
+    /// The apps the table serves, in the order put, each as its PUT has it.
+    fn apps(&self, status: &Status) -> AppsView {
+        let table = self.routes.current();
+        let mut apps: Vec<AppView> = Vec::new();
+        for up in &table.advertised {
+            let Some(Origin::Api {
+                name,
+                owner,
+                deployed,
+            }) = table.origins.get(&up.host)
+            else {
+                continue;
+            };
+            if let Some(app) = apps.iter_mut().find(|app| app.name == *name) {
+                app.hosts.push(up.host.clone());
+                continue;
+            }
+            let Some(handler) = table.handler(&up.target_url) else {
+                continue;
+            };
+            apps.push(AppView {
+                name: name.clone(),
+                owner: owner.clone(),
+                hosts: vec![up.host.clone()],
+                component: ComponentRef {
+                    sha256: handler.loaded().digest().to_string(),
+                    name: handler.loaded().label().to_string(),
+                },
+                sandbox: SandboxBody::of(handler.sandbox()),
+                deployed: deployed.clone(),
+            });
         }
-        let component = match Limited::new(body, MAX_COMPONENT_BYTES).collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(e) if e.is::<LengthLimitError>() => return too_large(),
-            Err(e) => return error(StatusCode::BAD_REQUEST, format!("the upload failed: {e}")),
+        AppsView {
+            revision: status.revision,
+            generation: table.generation,
+            apps,
+        }
+    }
+
+    async fn deploy(&self, host: &str, parts: &Parts, body: Incoming) -> Response {
+        let component = match component(parts, body).await {
+            Ok(component) => component,
+            Err(refused) => return refused.into(),
         };
         let host = match deployed::check_host(host) {
             Ok(host) => host,
@@ -322,17 +400,8 @@ impl Console {
             Ok(options) => options,
             Err(e) => return error(StatusCode::BAD_REQUEST, e),
         };
-        if component.is_empty() {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "no component: send the .wasm file as the request body",
-            );
-        }
-        if !component.starts_with(b"\0asm") {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "not a wasm binary (it does not start with \\0asm)",
-            );
+        if let Err(refused) = wasm(&component) {
+            return refused.into();
         }
         self.edit(Edit::Deploy {
             host,
@@ -376,39 +445,182 @@ impl Console {
         }
     }
 
+    /// Keeps the body under its digest `sha256` for an app to name.
+    async fn upload(&self, sha256: &str, parts: &Parts, body: Incoming) -> Response {
+        let component = match component(parts, body).await {
+            Ok(component) => component,
+            Err(refused) => return refused.into(),
+        };
+        let sha256 = match deployed::check_digest(sha256) {
+            Ok(sha256) => sha256,
+            Err(e) => return error(StatusCode::BAD_REQUEST, e),
+        };
+        if let Err(refused) = wasm(&component) {
+            return refused.into();
+        }
+        let bytes = component.len();
+        let upload = Edit::Upload {
+            sha256: sha256.clone(),
+            component,
+        };
+        match self.request(upload).await {
+            Ok(_) => json(StatusCode::OK, &Uploaded { sha256, bytes }),
+            Err(refused) => refused.into(),
+        }
+    }
+
+    /// Serves the app `name` as the body has it; every check of its own
+    /// before the reloader's, so a malformed app is a 400 first.
+    async fn put_app(&self, name: &str, parts: &Parts, body: Incoming) -> Response {
+        let too_large = format!("an app is {} KiB at most", MAX_APP_BYTES >> 10);
+        let body = match read(parts, body, MAX_APP_BYTES, &too_large).await {
+            Ok(body) => body,
+            Err(refused) => return refused.into(),
+        };
+        let app = serde_json::from_slice::<AppBody>(&body)
+            .map_err(|e| format!("the app: {e}"))
+            .and_then(|app| self.app_spec(name, app));
+        match app {
+            Ok(app) => {
+                let name = name.to_string();
+                self.edit(Edit::PutApp { name, app }).await
+            }
+            Err(e) => error(StatusCode::BAD_REQUEST, e),
+        }
+    }
+
+    /// The app `name` of `body`, checked; its keyvalue map names the stores.
+    fn app_spec(&self, name: &str, body: AppBody) -> Result<AppSpec, String> {
+        deployed::check_name("app", name)?;
+        deployed::check_name("owner", &body.owner)?;
+        let sha256 = deployed::check_digest(&body.component.sha256)
+            .map_err(|e| format!("component.sha256: {e}"))?;
+        Ok(AppSpec {
+            owner: body.owner,
+            hosts: deployed::check_hosts(&body.hosts)?,
+            sha256,
+            file: body.component.name,
+            sandbox: body.sandbox.sandbox(&self.stores)?,
+        })
+    }
+
+    async fn delete_app(&self, name: &str, query: Option<&str>) -> Response {
+        let owner = pairs(query)
+            .into_iter()
+            .find(|(key, _)| key == "owner")
+            .map(|(_, owner)| owner);
+        let checked = deployed::check_name("app", name).and_then(|()| match owner {
+            Some(owner) => deployed::check_name("owner", &owner).map(|()| owner),
+            None => Err("owner=<owner> names the app's owner: a controller removes its own".into()),
+        });
+        match checked {
+            Ok(owner) => {
+                let name = name.to_string();
+                self.edit(Edit::DeleteApp { name, owner }).await
+            }
+            Err(e) => error(StatusCode::BAD_REQUEST, e),
+        }
+    }
+
     /// Has the reloader apply `edit`, and answers its outcome.
     async fn edit(&self, edit: Edit) -> Response {
-        let draining = || {
-            error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the wicket is draining: its routes change no more",
-            )
-        };
-        let (reply, outcome) = oneshot::channel();
-        if self.requests.send(Request { edit, reply }).await.is_err() {
-            return draining();
-        }
-        match outcome.await {
-            Ok(Ok(Outcome { generation, change })) => json(
+        match self.request(edit).await {
+            Ok(Outcome { generation, change }) => json(
                 StatusCode::OK,
                 &Edited {
                     generation,
                     message: change.map_or_else(|| "no change".into(), |change| change.to_string()),
                 },
             ),
+            Err(refused) => refused.into(),
+        }
+    }
+
+    /// Has the reloader apply `edit`: its outcome, or the answer refusing it.
+    async fn request(&self, edit: Edit) -> Result<Outcome, Refusal> {
+        let draining = || {
+            Refusal::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the wicket is draining: its routes change no more",
+            )
+        };
+        let (reply, outcome) = oneshot::channel();
+        if self.requests.send(Request { edit, reply }).await.is_err() {
+            return Err(draining());
+        }
+        match outcome.await {
+            Ok(Ok(outcome)) => Ok(outcome),
             Ok(Err(refused)) => {
                 let status = match refused {
                     Refused::Invalid(_) => StatusCode::BAD_REQUEST,
                     Refused::Unknown(_) => StatusCode::NOT_FOUND,
-                    Refused::Taken(_) => StatusCode::CONFLICT,
+                    Refused::Taken(_) | Refused::Missing(_) => StatusCode::CONFLICT,
                     Refused::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
                     Refused::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 };
-                error(status, refused.to_string())
+                let mut refusal = Refusal::new(status, refused.to_string());
+                match refused {
+                    Refused::Rejected(unloaded) => refusal.view.host = unloaded.host,
+                    Refused::Missing(sha256) => refusal.view.missing = vec![sha256],
+                    _ => {}
+                }
+                Err(refusal)
             }
-            Err(_) => draining(),
+            Err(_) => Err(draining()),
         }
     }
+}
+
+/// The component an upload carries, read before anything is answered: a
+/// refusal answered before would be lost to the reset of the connection
+/// (see [`drain`]).
+async fn component(parts: &Parts, body: Incoming) -> Result<Bytes, Refusal> {
+    let too_large = format!("a component is {} MiB at most", MAX_COMPONENT_BYTES >> 20);
+    read(parts, body, MAX_COMPONENT_BYTES, &too_large).await
+}
+
+/// The body of a request, `limit` bytes at most (else 413, `too_large`).
+async fn read(
+    parts: &Parts,
+    body: Incoming,
+    limit: usize,
+    too_large: &str,
+) -> Result<Bytes, Refusal> {
+    let declared = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|length| length.to_str().ok())
+        .and_then(|length| length.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > limit as u64) {
+        return Err(Refusal::new(StatusCode::PAYLOAD_TOO_LARGE, too_large));
+    }
+    match Limited::new(body, limit).collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(e) if e.is::<LengthLimitError>() => {
+            Err(Refusal::new(StatusCode::PAYLOAD_TOO_LARGE, too_large))
+        }
+        Err(e) => Err(Refusal::new(
+            StatusCode::BAD_REQUEST,
+            format!("the upload failed: {e}"),
+        )),
+    }
+}
+
+/// Refuses an upload that is no wasm binary.
+fn wasm(component: &Bytes) -> Result<(), Refusal> {
+    if component.is_empty() {
+        return Err(Refusal::new(
+            StatusCode::BAD_REQUEST,
+            "no component: send the .wasm file as the request body",
+        ));
+    }
+    if !component.starts_with(b"\0asm") {
+        return Err(Refusal::new(
+            StatusCode::BAD_REQUEST,
+            "not a wasm binary (it does not start with \\0asm)",
+        ));
+    }
+    Ok(())
 }
 
 /// Reads `body` to its end, [`MAX_COMPONENT_BYTES`] at most, and drops it.
@@ -513,23 +725,55 @@ fn json(status: StatusCode, body: &impl Serialize) -> Response {
 }
 
 fn error(status: StatusCode, message: impl Into<String>) -> Response {
-    json(
-        status,
-        &ErrorView {
-            error: message.into(),
-        },
-    )
+    Refusal::new(status, message).into()
+}
+
+/// The answer refusing a request, before it is one.
+struct Refusal {
+    status: StatusCode,
+    view: ErrorView,
+}
+
+impl Refusal {
+    fn new(status: StatusCode, message: impl Into<String>) -> Refusal {
+        Refusal {
+            status,
+            view: ErrorView {
+                error: message.into(),
+                host: None,
+                missing: Vec::new(),
+            },
+        }
+    }
+}
+
+impl From<Refusal> for Response {
+    fn from(refusal: Refusal) -> Response {
+        json(refusal.status, &refusal.view)
+    }
 }
 
 #[derive(Serialize)]
 struct ErrorView {
     error: String,
+    /// The host of the route that did not load (422).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    /// The digests of the components an app named and no upload kept (409).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    missing: Vec<String>,
 }
 
 #[derive(Serialize)]
 struct Edited {
     generation: u64,
     message: String,
+}
+
+#[derive(Serialize)]
+struct Uploaded {
+    sha256: String,
+    bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -542,6 +786,7 @@ struct Listing {
     max_component_bytes: usize,
     capabilities: &'static [&'static str],
     defaults: Defaults,
+    keyvalue_stores: Vec<StoreView>,
     reload_failure: Option<FailureView>,
     routes: Vec<RouteView>,
 }
@@ -550,6 +795,14 @@ struct Listing {
 struct Defaults {
     budget_ms: u128,
     memory_mib: usize,
+}
+
+#[derive(Serialize)]
+struct StoreView {
+    name: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    default: bool,
 }
 
 #[derive(Serialize)]
@@ -564,6 +817,9 @@ struct RouteView {
     host: String,
     origin: &'static str,
     deployed: Option<String>,
+    /// An app's route: the app and its owner.
+    app: Option<String>,
+    owner: Option<String>,
     target: String,
     component: ComponentView,
     sandbox: SandboxView,
@@ -612,6 +868,110 @@ struct BucketView {
     identifier: String,
     store: String,
     namespace: String,
+}
+
+#[derive(Serialize)]
+struct AppsView {
+    revision: u64,
+    generation: u64,
+    apps: Vec<AppView>,
+}
+
+/// An app as listed: what its PUT takes, its name, and since when it serves
+/// this component and sandbox.
+#[derive(Serialize)]
+struct AppView {
+    name: String,
+    owner: String,
+    hosts: Vec<String>,
+    component: ComponentRef,
+    sandbox: SandboxBody,
+    deployed: String,
+}
+
+/// The body of an app's PUT.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AppBody {
+    owner: String,
+    hosts: Vec<String>,
+    component: ComponentRef,
+    #[serde(default)]
+    sandbox: SandboxBody,
+}
+
+/// A component uploaded by digest, and the file name it is kept as.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ComponentRef {
+    sha256: String,
+    name: String,
+}
+
+/// An app's sandbox: the `--wasm` route options, and its keyvalue map
+/// (`identifier -> store/namespace`). A key left out takes its default; a
+/// listing names every one.
+#[derive(Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SandboxBody {
+    #[serde(default)]
+    wasi: Vec<String>,
+    budget_ms: Option<u64>,
+    memory_mib: Option<u64>,
+    #[serde(default)]
+    pool: usize,
+    instances: Option<usize>,
+    #[serde(default)]
+    keyvalue: BTreeMap<String, String>,
+}
+
+impl SandboxBody {
+    fn of(sandbox: &Sandbox) -> SandboxBody {
+        SandboxBody {
+            wasi: sandbox.caps.names().into_iter().map(String::from).collect(),
+            budget_ms: Some(sandbox.limits.budget.as_millis() as u64),
+            memory_mib: Some((sandbox.limits.memory >> 20) as u64),
+            pool: sandbox.pool,
+            instances: sandbox.instances,
+            keyvalue: deployed::map_specs(&sandbox.keyvalue),
+        }
+    }
+
+    /// The sandbox, its map naming `stores`; errors name the key.
+    fn sandbox(self, stores: &Stores) -> Result<Sandbox, String> {
+        let mut sandbox = Sandbox {
+            caps: Caps::parse(&self.wasi.join(",")).map_err(|e| format!("sandbox.wasi: {e}"))?,
+            pool: self.pool,
+            ..Sandbox::default()
+        };
+        match self.budget_ms {
+            Some(0) => return Err("sandbox.budget_ms: must be at least 1".into()),
+            Some(budget) => sandbox.limits.budget = Duration::from_millis(budget),
+            None => {}
+        }
+        match self.memory_mib {
+            Some(0) => return Err("sandbox.memory_mib: must be at least 1".into()),
+            Some(memory) => {
+                sandbox.limits.memory = memory
+                    .checked_mul(1 << 20)
+                    .and_then(|bytes| usize::try_from(bytes).ok())
+                    .ok_or_else(|| format!("sandbox.memory_mib: too large '{memory}'"))?;
+            }
+            None => {}
+        }
+        sandbox.instances = match self.instances {
+            Some(0) => return Err("sandbox.instances: must be at least 1".into()),
+            cap => cap,
+        };
+        sandbox.check().map_err(|e| format!("sandbox: {e}"))?;
+        sandbox.keyvalue = deployed::app_map(sandbox.caps, self.keyvalue)?;
+        for place in sandbox.keyvalue.values() {
+            stores
+                .known(&place.store)
+                .map_err(|e| format!("sandbox.keyvalue: {e}"))?;
+        }
+        Ok(sandbox)
+    }
 }
 
 #[cfg(test)]

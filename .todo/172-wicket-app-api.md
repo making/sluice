@@ -43,6 +43,17 @@ DELETE /api/apps/<name>
   model may serve both: a console route is an app of one host owned by the page
 - errors name a component as todo 170 has the console's do
 
+## As built
+
+- `DELETE /api/apps/<name>?owner=<owner>`: the owner in the query (400 without one)
+- the sandbox in JSON has the listing's keys (`wasi` a list, `budget_ms`, `memory_mib`,
+  `pool`, `instances`, `keyvalue` a map), not the `--wasm` option names; with `keyvalue`
+  granted the map is required, each place `store/namespace` in full
+- `GET /api/apps` takes `?after=<revision>` as `/api/routes`; an app as listed is a body its
+  PUT takes (less `name` and `deployed`)
+- not one model: the page's routes and the apps are two lists in `routes.yaml` (a route takes
+  the default map, an app names its own); an upload waits in `uploads/` for 10 minutes
+
 ## Acceptance
 
 - `the_consoles_edits_are_kept_only_when_they_load` (`routes.rs`), extended or a sibling: a

@@ -60,6 +60,12 @@ every command below; `requests.md` lists the requests each made, `README.md` the
 | rolling deployment | the app PUT with the new droplet: the wicket swaps it in place |
 | org / space | one of each (`--org`, `--space`) |
 
+The app API as built (172; the wicket README's Apps): `DELETE /api/apps/<name>?owner=<owner>`;
+the sandbox in JSON with the listing's keys (`budget_ms`, `memory_mib`, `pool`, `instances`,
+`wasi`, `keyvalue`: `identifier -> store/namespace`); `GET /api/apps?after=<revision>`
+long-polls as `/api/routes`; a 409 for a component not uploaded names it in `missing`, a 422
+the host that failed in `host`.
+
 ## Behavior
 
 - as on CF, routes and `instances` apply at once; the droplet and the rest of the sandbox

@@ -4,7 +4,8 @@
 //! restart and shared by two wickets on the file, or in a redis store two
 //! wickets share as wickets on two hosts would. Nothing drains: SIGTERM ends
 //! the process at once, with 0. The console deploys an uploaded component as
-//! a route at once, and moves it to another host as it is.
+//! a route at once, and moves it to another host as it is; its API serves a
+//! controller's app of hosts the same way.
 #![cfg(unix)]
 
 #[path = "support/redis_server.rs"]
@@ -348,7 +349,9 @@ routes:
 /// The console deploys a component uploaded to it as a route at once: served
 /// on the listener, listed -- a long poll answering the change -- and kept
 /// across a restart, until removed. It asks for its token, and refuses an
-/// edit from another origin and a body that is no wasm.
+/// edit from another origin and a body that is no wasm. A controller's app,
+/// its component uploaded by digest, serves its hosts at once, listed as it
+/// was put, the page's endpoints refusing them, until its owner removes it.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_console_deploys_an_uploaded_component_as_a_route() {
     let hello = std::fs::read(guests().join("hello.wasm")).unwrap();
@@ -476,6 +479,112 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
     assert_eq!(get(&address, "greet.localhost", "/").await.0, 404);
     let (status, _, _) = console(&at, removal, &[basic], b"").await;
     assert_eq!(status, 404, "no longer the console's");
+
+    // an app: its component uploaded by digest first, its hosts in one PUT
+    let digest = |bytes: &[u8]| -> String {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    };
+    let upload = |component: &[u8]| format!("PUT /api/components/{}", digest(component));
+    let (status, _, body) = console(&at, &upload(&hello), &[bearer], &hello).await;
+    let uploaded = serde_json::json!({"sha256": digest(&hello), "bytes": hello.len()});
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((status, body), (200, uploaded));
+    let app = |hosts: &[&str], component: &[u8]| {
+        let component = serde_json::json!({"sha256": digest(component), "name": "app.wasm"});
+        let app = serde_json::json!({"owner": "cf", "hosts": hosts, "component": component,
+                                     "sandbox": {"wasi": ["cli"], "pool": 1}});
+        app.to_string().into_bytes()
+    };
+    let shop = app(&["b.localhost", "a.localhost"], &hello);
+    let (status, _, body) = console(&at, "PUT /api/apps/shop", &[bearer], &shop).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (
+            200,
+            r#"{"generation":3,"message":"added a.localhost, b.localhost"}"#
+        )
+    );
+    for host in ["a.localhost", "b.localhost"] {
+        let (status, body) = get(&address, host, "/").await;
+        assert!(
+            body.starts_with("hello from wasm"),
+            "{host}: {status} {body}"
+        );
+    }
+    let (_, _, listing) = console(&at, "GET /api/routes", &[bearer], b"").await;
+    let listing: serde_json::Value = serde_json::from_str(&listing).unwrap();
+    let route = &listing["routes"][0];
+    assert_eq!(
+        (&route["origin"], &route["app"], &route["owner"]),
+        (&"api".into(), &"shop".into(), &"cf".into())
+    );
+    assert_eq!(
+        listing["keyvalue_stores"],
+        serde_json::json!([{"name": "local", "type": "sqlite", "default": true}])
+    );
+    // listed as put: put again, it changes nothing
+    let (_, _, apps) = console(&at, "GET /api/apps", &[bearer], b"").await;
+    let apps: serde_json::Value = serde_json::from_str(&apps).unwrap();
+    let mut listed = apps["apps"][0].clone();
+    assert_eq!(
+        listed["hosts"],
+        serde_json::json!(["a.localhost", "b.localhost"])
+    );
+    let listed_app = listed.as_object_mut().unwrap();
+    assert_eq!(listed_app.remove("name"), Some("shop".into()));
+    assert!(listed_app.remove("deployed").is_some());
+    let again = listed.to_string().into_bytes();
+    let (status, _, body) = console(&at, "PUT /api/apps/shop", &[bearer], &again).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (200, r#"{"generation":3,"message":"no change"}"#)
+    );
+    // the page's endpoints refuse its hosts
+    let taken = r#"{"error":"a.localhost is routed by the app 'shop' of cf, not by the console"}"#;
+    let page_deploy = "PUT /api/routes/a.localhost?name=hello.wasm";
+    let (status, _, body) = console(&at, page_deploy, &[bearer], &hello).await;
+    assert_eq!((status, body.as_str()), (409, taken));
+    let (status, _, body) = console(&at, "DELETE /api/routes/a.localhost", &[bearer], b"").await;
+    assert_eq!((status, body.as_str()), (409, taken));
+    // a component never uploaded: 409 naming it; one that does not compile:
+    // 422 naming the host, the component by its path in --console-dir
+    let never = app(&["c.localhost"], b"never uploaded");
+    let (status, _, body) = console(&at, "PUT /api/apps/blog", &[bearer], &never).await;
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        (status, &body["missing"]),
+        (409, &serde_json::json!([digest(b"never uploaded")]))
+    );
+    let truncated = &hello[..100];
+    let (status, _, _) = console(&at, &upload(truncated), &[bearer], truncated).await;
+    assert_eq!(status, 200);
+    let broken = app(&["c.localhost"], truncated);
+    let (status, _, body) = console(&at, "PUT /api/apps/blog", &[bearer], &broken).await;
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let error = body["error"].as_str().unwrap();
+    let component = format!("components/{}/app.wasm", digest(truncated));
+    assert_eq!((status, &body["host"]), (422, &"c.localhost".into()));
+    assert!(
+        error.starts_with(&format!(
+            "wasm route 'c.localhost': component {component}: "
+        )),
+        "{error}"
+    );
+    // removed by its owner only
+    let intruder = "DELETE /api/apps/shop?owner=intruder";
+    let (status, _, _) = console(&at, intruder, &[bearer], b"").await;
+    assert_eq!(status, 409);
+    let (status, _, body) = console(&at, "DELETE /api/apps/shop?owner=cf", &[bearer], b"").await;
+    assert_eq!(
+        (status, body.as_str()),
+        (
+            200,
+            r#"{"generation":4,"message":"removed a.localhost, b.localhost"}"#
+        )
+    );
+    assert_eq!(get(&address, "a.localhost", "/").await.0, 404);
     drop(wicket);
     let _ = std::fs::remove_dir_all(&dir);
 }

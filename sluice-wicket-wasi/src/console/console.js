@@ -24,7 +24,20 @@ const ORIGINS = {
   console: { title: "Console", note: "drop a .wasm on a row to replace its component" },
   config: { title: "Config file", note: "read-only here: edit the file, the wicket reloads it" },
   flag: { title: "--wasm flags", note: "read-only: set on the command line" },
+  api: { title: "Apps", note: "read-only here: a controller puts them through /api/apps" },
 };
+
+/** What routes `route` instead of this page, as the end of "routed by …". */
+function routedBy(route) {
+  switch (route.origin) {
+    case "config":
+      return "the config file";
+    case "api":
+      return `the app '${route.app}' of ${route.owner}`;
+    default:
+      return "the --wasm flags";
+  }
+}
 
 // dot-separated labels of a-z, 0-9 and '-', none starting or ending with '-'
 const HOST = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
@@ -700,7 +713,7 @@ function refreshDeploy() {
     kind = "replace";
   }
   else if (route) {
-    note = `Routed by the ${route.origin === "config" ? "config file" : "--wasm flags"}: read-only here.`;
+    note = `Routed by ${routedBy(route)}: read-only here.`;
     kind = "fault";
     blocked = true;
   }
@@ -1003,7 +1016,7 @@ function renameCheck(route, value) {
   }
   const taken = routeOf(to);
   if (taken) {
-    const by = taken.origin === "console" ? "a route of the console already" : `routed by the ${taken.origin === "config" ? "config file" : "--wasm flags"}`;
+    const by = taken.origin === "console" ? "a route of the console already" : `routed by ${routedBy(taken)}`;
     return { text: `${to} is ${by}.`, kind: "fault", blocked: true };
   }
   if (route.sandbox.wasi.includes("keyvalue")) {
@@ -1250,7 +1263,10 @@ function hostCell(route) {
   const name = route.host === ""
     ? h("span", { class: "route__host catch-all" }, "any host")
     : h("span", { class: "route__host mono" }, route.host);
-  return [name, reachView(route.host)];
+  const app = route.origin === "api"
+    ? h("span", { class: "route__app" }, "app ", h("span", { class: "mono" }, route.app), " of ", route.owner)
+    : null;
+  return [name, app, reachView(route.host)];
 }
 
 function componentCell(route) {
@@ -1261,7 +1277,7 @@ function componentCell(route) {
       h("span", { class: "route__digest mono", title: `sha256 ${component.sha256}` }, component.sha256.slice(0, 12)),
       sep(),
       h("span", { class: "num" }, humanBytes(component.bytes))),
-    route.origin === "console" && route.deployed ? h("span", { class: "route__deployed" }, "deployed ", timeView(route.deployed)) : null,
+    route.deployed ? h("span", { class: "route__deployed" }, "deployed ", timeView(route.deployed)) : null,
   ];
 }
 

@@ -248,6 +248,7 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
                 routes: routes.clone(),
                 status: reloader.status(),
                 requests,
+                stores: reloader.stores().clone(),
                 token: console.token,
                 server: server.clone(),
                 listen: listening,

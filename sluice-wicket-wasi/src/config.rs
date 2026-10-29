@@ -251,6 +251,7 @@ fn parse_wasm_flag(spec: &str) -> Result<Spec, String> {
     Ok(Spec {
         host: host.to_string(),
         component,
+        shown: None,
         sandbox,
         origin: Origin::Flag,
     })
@@ -602,14 +603,15 @@ impl RouteFile {
         Ok(Spec {
             host: self.host,
             component,
+            shown: None,
             sandbox,
             origin: Origin::Config,
         })
     }
 }
 
-/// A route's sandbox; unset keys keep the defaults. The console's routes are
-/// written in this shape too ([`sandbox_yaml`]).
+/// A route's sandbox; unset keys keep the defaults. The console's routes and
+/// apps are written in this shape too ([`sandbox_yaml`]).
 #[derive(Deserialize, Default, PartialEq, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SandboxFile {
@@ -690,9 +692,10 @@ impl SandboxFile {
 }
 
 /// `sandbox` in the shape [`SandboxFile`] reads, as a YAML flow mapping of
-/// its settings besides the defaults (None when all defaults); without a
-/// keyvalue map, the default one applying.
-pub(crate) fn sandbox_yaml(sandbox: &Sandbox) -> Option<String> {
+/// its settings besides the defaults (None when all defaults); its keyvalue
+/// map with `map` (an app's, every place named in full), else none, the
+/// default one applying.
+pub(crate) fn sandbox_yaml(sandbox: &Sandbox, map: bool) -> Option<String> {
     let defaults = Limits::default();
     let mut pairs = Vec::new();
     let caps = sandbox.caps.names();
@@ -711,7 +714,33 @@ pub(crate) fn sandbox_yaml(sandbox: &Sandbox) -> Option<String> {
     if let Some(cap) = sandbox.instances {
         pairs.push(format!("instances: {cap}"));
     }
+    if map && !sandbox.keyvalue.is_empty() {
+        let places: Vec<String> = sandbox
+            .keyvalue
+            .iter()
+            .map(|(identifier, place)| {
+                let place = format!("{}/{}", place.store, place.namespace);
+                format!("{}: {}", quote(identifier), quote(&place))
+            })
+            .collect();
+        pairs.push(format!("keyvalue: {{{}}}", places.join(", ")));
+    }
     (!pairs.is_empty()).then(|| format!("{{{}}}", pairs.join(", ")))
+}
+
+/// `text` as a YAML double-quoted scalar: never expanded.
+pub(crate) fn quote(text: &str) -> String {
+    let mut quoted = String::from('"');
+    for c in text.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            c if c.is_control() => quoted.push_str(&format!("\\u{:04x}", c as u32)),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// The keyvalue stores: the `keyvalue` section's, else one `sqlite` store

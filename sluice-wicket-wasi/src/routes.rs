@@ -13,9 +13,9 @@
 //! acknowledged its removal, since the server may have routed a connection to
 //! it before, and its connections then shut down gracefully.
 //!
-//! The console changes its own routes through the same reload
-//! ([`Reloader::apply`]): the routes as they would be are reloaded first, and
-//! kept only when they loaded.
+//! The console changes its own routes and its API's apps through the same
+//! reload ([`Reloader::apply`]): the routes as they would be are reloaded
+//! first, and kept only when they loaded.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -27,6 +27,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::RouteSource;
+use crate::deployed::AppSpec;
 use crate::keyvalue;
 use crate::proto::Upstream;
 use crate::wasm_host::{self, Binding, Handler, Instances, Loaded, Locator, Sandbox};
@@ -36,6 +37,11 @@ use crate::wasm_host::{self, Binding, Handler, Instances, Loaded, Locator, Sandb
 pub struct Spec {
     pub host: String,
     pub component: Locator,
+    /// How errors name the component: the console's by its path in
+    /// `--console-dir` (`components/<sha256>/<name>`), a directory their
+    /// user does not act on; None by its locator, the file the operator
+    /// needs.
+    pub shown: Option<String>,
     pub sandbox: Sandbox,
     pub origin: Origin,
 }
@@ -47,17 +53,25 @@ pub enum Origin {
     Config,
     /// A `--wasm` flag.
     Flag,
-    /// The console, which deployed it at `deployed` (RFC 3339).
+    /// The console's page, which deployed it at `deployed` (RFC 3339).
     Console { deployed: String },
+    /// The app `name` of the console's API, put by `owner`; it took its
+    /// component and sandbox at `deployed` (RFC 3339).
+    Api {
+        name: String,
+        owner: String,
+        deployed: String,
+    },
 }
 
 impl std::fmt::Display for Origin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Origin::Config => "the config file",
-            Origin::Flag => "a --wasm flag",
-            Origin::Console { .. } => "the console",
-        })
+        match self {
+            Origin::Config => f.write_str("the config file"),
+            Origin::Flag => f.write_str("a --wasm flag"),
+            Origin::Console { .. } => f.write_str("the console"),
+            Origin::Api { name, owner, .. } => write!(f, "the app '{name}' of {owner}"),
+        }
     }
 }
 
@@ -67,6 +81,17 @@ pub fn route_target(locator: &str, sandbox: &Sandbox) -> String {
     match sandbox.query() {
         query if query.is_empty() => locator.to_string(),
         query => format!("{locator}?{query}"),
+    }
+}
+
+/// The advertised target of a route of the app `app`: [`route_target`]
+/// naming the app first (`app` sorts before every sandbox key), so no other
+/// route shares its handler: its pool, its `instances` cap and its guests'
+/// output stay its own. An app's name is unreserved chars: no escaping.
+fn app_target(locator: &str, sandbox: &Sandbox, app: &str) -> String {
+    match sandbox.query() {
+        query if query.is_empty() => format!("{locator}?app={app}"),
+        query => format!("{locator}?app={app}&{query}"),
     }
 }
 
@@ -288,6 +313,27 @@ impl std::fmt::Display for Change {
     }
 }
 
+/// Why a reload failed: its error, and the host of the route that did not
+/// load when one did not (none for a config file that does not parse, or for
+/// pools past the instance limit), so the API's client blames the right app.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Unloaded {
+    pub host: Option<String>,
+    pub error: String,
+}
+
+impl Unloaded {
+    fn of(error: String) -> Unloaded {
+        Unloaded { host: None, error }
+    }
+}
+
+impl std::fmt::Display for Unloaded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)
+    }
+}
+
 /// What the console shows of the reloads besides the table.
 #[derive(Clone, Default)]
 pub struct Status {
@@ -307,13 +353,14 @@ pub struct Failure {
     pub at: SystemTime,
 }
 
-/// A change of the console's routes, and where its outcome goes.
+/// A change of the console's routes or apps, and where its outcome goes.
 pub struct Request {
     pub edit: Edit,
     pub reply: oneshot::Sender<Result<Outcome, Refused>>,
 }
 
-/// A change of the console's routes.
+/// A change of the console's routes (the page's, one host each) or of its
+/// API's apps.
 pub enum Edit {
     /// Serves `host` by the uploaded `component` (named `name`) in `sandbox`.
     Deploy {
@@ -328,18 +375,20 @@ pub enum Edit {
     Move { host: String, to: String },
     /// Removes the console's route of `host`.
     Remove { host: String },
+    /// Keeps `component`, uploaded by its digest `sha256`, for an app to
+    /// name; changes no route.
+    Upload {
+        sha256: String,
+        component: bytes::Bytes,
+    },
+    /// Serves the app `name` as `app` has it: its hosts by its component in
+    /// its sandbox.
+    PutApp { name: String, app: AppSpec },
+    /// Removes the app `name`, of `owner`.
+    DeleteApp { name: String, owner: String },
 }
 
 impl Edit {
-    fn host(&self) -> &str {
-        match self {
-            Edit::Deploy { host, .. }
-            | Edit::Sandbox { host, .. }
-            | Edit::Move { host, .. }
-            | Edit::Remove { host } => host,
-        }
-    }
-
     /// How the log names it; not by the name uploaded, which may hold
     /// anything (the component's file name is logged as it is kept).
     fn describe(&self) -> String {
@@ -348,6 +397,9 @@ impl Edit {
             Edit::Sandbox { host, .. } => format!("console: sandbox of {host}"),
             Edit::Move { host, to } => format!("console: move {host} to {to}"),
             Edit::Remove { host } => format!("console: remove {host}"),
+            Edit::Upload { sha256, .. } => format!("api: upload {sha256}"),
+            Edit::PutApp { name, app } => format!("api: app {name} of {}", app.owner),
+            Edit::DeleteApp { name, owner } => format!("api: remove app {name} of {owner}"),
         }
     }
 }
@@ -366,12 +418,14 @@ pub struct Outcome {
 pub enum Refused {
     /// The edit is malformed.
     Invalid(String),
-    /// The console routes no such host.
+    /// The console routes no such host, or has no such app.
     Unknown(String),
-    /// Another source routes the host.
+    /// Another source routes the host, or another owner has the app.
     Taken(String),
+    /// No component of this digest (sha256) is kept: it takes an upload.
+    Missing(String),
     /// The routes did not load with it: the reload's error.
-    Rejected(String),
+    Rejected(Unloaded),
     /// The console's directory failed.
     Failed(String),
 }
@@ -382,8 +436,12 @@ impl std::fmt::Display for Refused {
             Refused::Invalid(message)
             | Refused::Unknown(message)
             | Refused::Taken(message)
-            | Refused::Rejected(message)
             | Refused::Failed(message) => f.write_str(message),
+            Refused::Missing(sha256) => write!(
+                f,
+                "no component {sha256} is kept: upload it first (PUT /api/components/{sha256})"
+            ),
+            Refused::Rejected(unloaded) => unloaded.fmt(f),
         }
     }
 }
@@ -414,7 +472,7 @@ impl Reloader {
     /// Reads the routes and builds the startup table; an error is fatal.
     pub async fn start(source: RouteSource, instances: Arc<Instances>) -> Result<Reloader, String> {
         let mut watched = Stamps::new();
-        let specs = read(&source, &mut watched).await?;
+        let specs = read(&source, &mut watched).await.map_err(|e| e.error)?;
         let mut reloader = Reloader {
             routes: Routes::new(Table {
                 generation: 0,
@@ -430,7 +488,10 @@ impl Reloader {
             pending: None,
             lingering: HashMap::new(),
         };
-        let planned = reloader.plan(&specs, true, &mut watched).await?;
+        let planned = reloader
+            .plan(&specs, true, &mut watched)
+            .await
+            .map_err(|e| e.error)?;
         reloader.commit(planned);
         reloader.watched = watched;
         Ok(reloader)
@@ -438,6 +499,11 @@ impl Reloader {
 
     pub fn routes(&self) -> &Arc<Routes> {
         &self.routes
+    }
+
+    /// The keyvalue stores the routes' maps name.
+    pub fn stores(&self) -> &Arc<keyvalue::Stores> {
+        &self.stores
     }
 
     /// Follows what the console shows of the reloads.
@@ -501,12 +567,12 @@ impl Reloader {
                 self.recovered();
             }
             Err(e) => {
-                log_failed(reason, self.routes.current().generation, &e);
+                log_failed(reason, self.routes.current().generation, &e.error);
                 self.status.send_modify(|status| {
                     status.revision += 1;
                     status.failure = Some(Failure {
                         reason: reason.to_string(),
-                        error: e,
+                        error: e.error,
                         at: SystemTime::now(),
                     });
                 });
@@ -526,40 +592,43 @@ impl Reloader {
         });
     }
 
-    /// Applies an edit of the console's routes: the component written, the
-    /// routes as they would be are reloaded, and kept -- written to the
-    /// console's directory -- only when they loaded; refused, the routes and
-    /// the directory stay as they were.
+    /// Applies an edit of the console's routes or apps: the component
+    /// written, the routes as they would be are reloaded, and kept -- written
+    /// to the console's directory -- only when they loaded; refused, the
+    /// routes and the directory stay as they were. An upload keeps its
+    /// component and changes no route.
     pub async fn apply(&mut self, edit: Edit) -> Result<Outcome, Refused> {
         let reason = edit.describe();
         let current = self.routes.current();
-        if let Some(origin @ (Origin::Config | Origin::Flag)) = current.origins.get(edit.host()) {
-            return Err(Refused::Taken(format!(
-                "{} is routed by {origin}, not by the console",
-                edit.host()
-            )));
-        }
-        if let Edit::Move { to, .. } = &edit
-            && let Some(origin @ (Origin::Config | Origin::Flag)) = current.origins.get(to)
-        {
-            return Err(Refused::Taken(format!("{to} is routed by {origin}")));
-        }
+        taken(&edit, &current.origins)?;
         let deployed = self
             .source
             .deployed()
             .expect("edits come from the console, which deploys");
+        let now = SystemTime::now();
         let edited = match edit {
             Edit::Deploy {
                 host,
                 name,
                 component,
                 sandbox,
-            } => deployed.deploy(&host, &name, &component, sandbox, SystemTime::now()),
-            Edit::Sandbox { host, sandbox } => {
-                deployed.with_sandbox(&host, sandbox, SystemTime::now())
-            }
+            } => deployed.deploy(&host, &name, &component, sandbox, now),
+            Edit::Sandbox { host, sandbox } => deployed.with_sandbox(&host, sandbox, now),
             Edit::Move { host, to } => deployed.moved(&host, &to),
             Edit::Remove { host } => deployed.without(&host),
+            Edit::Upload { sha256, component } => {
+                let uploaded = deployed.upload(&sha256, &component);
+                // the uploads kept long enough go
+                deployed.collect_garbage();
+                uploaded?;
+                println!("{reason}: {} bytes kept", component.len());
+                return Ok(Outcome {
+                    generation: current.generation,
+                    change: None,
+                });
+            }
+            Edit::PutApp { name, app } => deployed.with_app(&name, app, now),
+            Edit::DeleteApp { name, owner } => deployed.without_app(&name, &owner),
         }?;
         if &edited == deployed {
             return Ok(Outcome {
@@ -584,7 +653,7 @@ impl Reloader {
                 Ok(Outcome { generation, change })
             }
             Err(e) => {
-                log_failed(&reason, current.generation, &e);
+                log_failed(&reason, current.generation, &e.error);
                 // the files a failed reload stamped were read for an edit
                 // that is not kept
                 self.watched = watched;
@@ -600,7 +669,7 @@ impl Reloader {
     /// then the current table stays. `refetch` fetches remote components
     /// again; else only a new remote target is fetched. None when nothing
     /// changed.
-    pub async fn reload(&mut self, refetch: bool) -> Result<Option<Change>, String> {
+    pub async fn reload(&mut self, refetch: bool) -> Result<Option<Change>, Unloaded> {
         let mut watched = Stamps::new();
         let outcome = async {
             let specs = read(&self.source, &mut watched).await?;
@@ -649,7 +718,7 @@ impl Reloader {
         specs: &[Spec],
         refetch: bool,
         watched: &mut Stamps,
-    ) -> Result<Plan, String> {
+    ) -> Result<Plan, Unloaded> {
         let current = self.routes.current();
         let mut plan = Plan {
             advertised: Vec::with_capacity(specs.len()),
@@ -658,14 +727,20 @@ impl Reloader {
         };
         let mut seen = HashSet::new();
         for spec in specs {
-            let failed = |e: String| format!("wasm route '{}': {e}", spec.host);
+            let failed = |e: String| Unloaded {
+                host: Some(spec.host.clone()),
+                error: format!("wasm route '{}': {e}", spec.host),
+            };
             spec.sandbox.check().map_err(failed)?;
             if let Some(path) = spec.component.path() {
                 // before the read: a write after it shows as a change
                 watched.insert(path.to_path_buf(), stamp(path).await);
             }
             let locator = spec.component.target().await.map_err(failed)?;
-            let target = route_target(&locator, &spec.sandbox);
+            let target = match &spec.origin {
+                Origin::Api { name, .. } => app_target(&locator, &spec.sandbox, name),
+                _ => route_target(&locator, &spec.sandbox),
+            };
             plan.advertised.push(Upstream {
                 host: spec.host.clone(),
                 target_url: target.clone(),
@@ -691,7 +766,7 @@ impl Reloader {
                             Planned::Keep(entry.clone())
                         }
                         _ => Planned::New(
-                            wasm_host::compile(fetched, spec.sandbox.caps)
+                            wasm_host::compile(fetched, spec.sandbox.caps, spec.shown.as_deref())
                                 .await
                                 .map_err(failed)?,
                             self.stores
@@ -711,10 +786,10 @@ impl Reloader {
             .map(|(_, sandbox, _)| sandbox.pool)
             .sum();
         if pooled > self.instances.max() {
-            return Err(format!(
+            return Err(Unloaded::of(format!(
                 "the routes' pools need {pooled} instance slots, more than --max-instances {}",
                 self.instances.max()
-            ));
+            )));
         }
         Ok(plan)
     }
@@ -832,15 +907,60 @@ fn log_failed(reason: &str, generation: u64, error: &str) {
 }
 
 /// Reads the routes of `source`, stamping its config file before the read.
-async fn read(source: &RouteSource, watched: &mut Stamps) -> Result<Vec<Spec>, String> {
+async fn read(source: &RouteSource, watched: &mut Stamps) -> Result<Vec<Spec>, Unloaded> {
     if let Some(path) = source.config() {
         watched.insert(path.to_path_buf(), stamp(path).await);
     }
-    let (specs, warnings) = source.read()?;
+    let (specs, warnings) = source.read().map_err(Unloaded::of)?;
     for warning in warnings {
         eprintln!("{warning}");
     }
     Ok(specs)
+}
+
+/// Refuses an edit of a host another source routes: the page edits the
+/// console's own routes, and moves one only to a host no other source
+/// routes; an app takes no host another source or app routes. The hosts are
+/// checked (lower case) already.
+fn taken(edit: &Edit, origins: &HashMap<String, Origin>) -> Result<(), Refused> {
+    let foreign = |host: &str| {
+        origins
+            .get(host)
+            .filter(|origin| !matches!(origin, Origin::Console { .. }))
+    };
+    match edit {
+        Edit::Deploy { host, .. }
+        | Edit::Sandbox { host, .. }
+        | Edit::Move { host, .. }
+        | Edit::Remove { host } => {
+            if let Some(origin) = foreign(host) {
+                return Err(Refused::Taken(format!(
+                    "{host} is routed by {origin}, not by the console"
+                )));
+            }
+            if let Edit::Move { to, .. } = edit
+                && let Some(origin) = foreign(to)
+            {
+                return Err(Refused::Taken(format!("{to} is routed by {origin}")));
+            }
+        }
+        Edit::PutApp { name, app } => {
+            for host in &app.hosts {
+                match origins.get(host) {
+                    None => {}
+                    Some(Origin::Api { name: own, .. }) if own == name => {}
+                    Some(Origin::Console { .. }) => {
+                        return Err(Refused::Taken(format!("{host} is a route of the console")));
+                    }
+                    Some(origin) => {
+                        return Err(Refused::Taken(format!("{host} is routed by {origin}")));
+                    }
+                }
+            }
+        }
+        Edit::Upload { .. } | Edit::DeleteApp { .. } => {}
+    }
+    Ok(())
 }
 
 /// The routes resolved by a reload: what to advertise (and where each host's
@@ -984,6 +1104,7 @@ pub(crate) mod tests {
         let route = |host: &str| Spec {
             host: host.into(),
             component: Locator::parse(path.to_str().unwrap()).unwrap(),
+            shown: None,
             sandbox: Sandbox {
                 pool: 1,
                 instances: Some(1),
@@ -1191,7 +1312,7 @@ pub(crate) mod tests {
             dir.write("a.wasm", component);
             let failed = reloader.reload(true).await;
             assert!(
-                matches!(&failed, Err(e) if e.contains(error)),
+                matches!(&failed, Err(e) if e.error.contains(error)),
                 "{what}: {failed:?}"
             );
             assert!(
@@ -1208,16 +1329,20 @@ pub(crate) mod tests {
     /// routes file written, a component under its digest -- only when they
     /// load: a deploy adds a route, the same upload again changes nothing,
     /// other content or another sandbox retargets it (the replaced component
-    /// removed), a removal removes it. A host another source routes, a
-    /// component that does not compile, pools past the limit, an unknown host
-    /// and no host name are refused: the table, the routes file and the
-    /// components stay as they were. A failed reload of the files shows until
-    /// a reload reads every route again. A restart serves the routes kept,
-    /// their sandboxes and times included, and removes the files no route
-    /// names.
+    /// removed), a removal removes it. An app -- hosts served by a component
+    /// uploaded by its digest first, in one sandbox, its keyvalue map named
+    /// -- changes in one generation a PUT, on handlers of its own. A host
+    /// another source routes, another owner's app, a component not kept or
+    /// that does not compile, pools past the limit, an unknown host and no
+    /// host name are refused: the table, the routes file and the components
+    /// stay as they were, a route that did not load named, a console's
+    /// component by its path in the directory. A failed reload of the files
+    /// shows until a reload reads every route again. A restart serves the
+    /// routes and apps kept, their sandboxes and times included, and removes
+    /// the files nothing names and the uploads kept long enough.
     #[tokio::test]
     async fn the_consoles_edits_are_kept_only_when_they_load() {
-        use crate::deployed::Deployed;
+        use crate::deployed::{Deployed, app_map};
         use sha2::Digest as _;
         let dir = Scratch::new("console");
         dir.guest("a.wasm", "hello");
@@ -1232,11 +1357,46 @@ pub(crate) mod tests {
         };
         let mut reloader = Reloader::start(source(), Instances::new(4)).await.unwrap();
         let status = reloader.status();
+        let hex = |bytes: &[u8]| -> String {
+            sha2::Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
         let deploy = |host: &str, component: &[u8], sandbox: &str| Edit::Deploy {
             host: host.into(),
             name: "hello.wasm".into(),
             component: bytes::Bytes::copy_from_slice(component),
             sandbox: Sandbox::parse(sandbox).unwrap(),
+        };
+        let upload = |component: &[u8], sha256: &str| Edit::Upload {
+            sha256: sha256.into(),
+            component: bytes::Bytes::copy_from_slice(component),
+        };
+        // an app of `component` in the default sandbox, or with `map`
+        let put =
+            |name: &str, owner: &str, hosts: &[&str], component: &[u8], map: &[(&str, &str)]| {
+                let mut sandbox =
+                    Sandbox::parse(if map.is_empty() { "" } else { "wasi=keyvalue" }).unwrap();
+                let map = map
+                    .iter()
+                    .map(|(identifier, place)| (identifier.to_string(), place.to_string()))
+                    .collect();
+                sandbox.keyvalue = app_map(sandbox.caps, map).unwrap();
+                Edit::PutApp {
+                    name: name.into(),
+                    app: AppSpec {
+                        owner: owner.into(),
+                        hosts: hosts.iter().map(|host| host.to_string()).collect(),
+                        sha256: hex(component),
+                        file: "app.wasm".into(),
+                        sandbox,
+                    },
+                }
+            };
+        let sorted = |mut files: Vec<String>| {
+            files.sort();
+            files
         };
         let components = || {
             let mut files = Vec::new();
@@ -1268,10 +1428,7 @@ pub(crate) mod tests {
             })
         );
         let table = reloader.routes().current();
-        let digest: String = sha2::Sha256::digest(&hello)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        let digest = hex(&hello);
         let target = table.target("b.local");
         assert!(
             target.ends_with(&format!("/components/{digest}/hello.wasm")),
@@ -1344,51 +1501,223 @@ pub(crate) mod tests {
         };
         reloader.apply(back).await.unwrap();
 
+        // an app's component is uploaded by its digest first
+        let generation = reloader.routes().current().generation;
+        let shop = |hosts: &[&str], component: &[u8], map: &[(&str, &str)]| {
+            put("shop", "cf", hosts, component, map)
+        };
+        assert_eq!(
+            reloader.apply(shop(&["s1.local"], &hello, &[])).await,
+            Err(Refused::Missing(digest.clone()))
+        );
+        assert_eq!(
+            reloader.apply(upload(&hello, &hex(&fetch))).await,
+            Err(Refused::Invalid(format!(
+                "the body's sha256 is {digest}, not {}",
+                hex(&fetch)
+            )))
+        );
+        let unchanged = Ok(Outcome {
+            generation,
+            change: None,
+        });
+        assert_eq!(reloader.apply(upload(&hello, &digest)).await, unchanged);
+        // two hosts in one generation; the same again changes nothing
+        let added = Ok(Outcome {
+            generation: generation + 1,
+            change: Some(Change {
+                added: vec!["s1.local".into(), "s2.local".into()],
+                ..Change::default()
+            }),
+        });
+        let both = shop(&["s2.local", "s1.local"], &hello, &[]);
+        assert_eq!(reloader.apply(both).await, added);
+        let unchanged = Ok(Outcome {
+            generation: generation + 1,
+            change: None,
+        });
+        let both = shop(&["s1.local", "s2.local"], &hello, &[]);
+        assert_eq!(reloader.apply(both).await, unchanged);
+        // another app of the component and sandbox: handlers of its own
+        let blog = put("blog", "cf", &["b1.local"], &hello, &[]);
+        reloader.apply(blog).await.unwrap();
+        let table = reloader.routes().current();
+        let handler = |host: &str| table.handler(&table.target(host)).unwrap().clone();
+        assert!(Arc::ptr_eq(&handler("s1.local"), &handler("s2.local")));
+        assert!(!Arc::ptr_eq(&handler("s1.local"), &handler("b1.local")));
+        let target = table.target("s1.local");
+        assert!(
+            target.ends_with(&format!("/components/{digest}/app.wasm?app=shop")),
+            "{target}"
+        );
+        assert!(matches!(
+            &table.origins["b1.local"],
+            Origin::Api { name, owner, .. } if name == "blog" && owner == "cf"
+        ));
+        // another component -- linked from the route's file of its digest --
+        // with a keyvalue map, then a host dropped: a generation each, the
+        // app's time kept by the drop
+        let generation = table.generation;
+        let place = [("", "local/cf/7f3c-guid")];
+        let changed = shop(&["s1.local", "s2.local"], &fetch, &place);
+        let change = reloader.apply(changed).await.unwrap();
+        assert_eq!(
+            (change.generation, change.change.unwrap().retargeted),
+            (generation + 1, vec!["s1.local".into(), "s2.local".into()])
+        );
+        let origin = reloader.routes().current().origins["s1.local"].clone();
+        let dropped = Ok(Outcome {
+            generation: generation + 2,
+            change: Some(Change {
+                removed: vec!["s2.local".into()],
+                ..Change::default()
+            }),
+        });
+        assert_eq!(
+            reloader.apply(shop(&["s1.local"], &fetch, &place)).await,
+            dropped
+        );
+        let table = reloader.routes().current();
+        assert_eq!(table.origins["s1.local"], origin);
+        let handler = table.handler(&table.target("s1.local")).unwrap();
+        assert_eq!(
+            handler.sandbox().keyvalue[""],
+            keyvalue::Place {
+                store: "local".into(),
+                namespace: "cf/7f3c-guid".into(),
+            }
+        );
+        assert!(manifest().contains("name: \"shop\""), "{}", manifest());
+
+        // the kind of a refusal; the host a rejected one names
+        let kind = |refused: &Refused| match refused {
+            Refused::Invalid(_) => "invalid".to_string(),
+            Refused::Unknown(_) => "unknown".into(),
+            Refused::Taken(_) => "taken".into(),
+            Refused::Missing(_) => "missing".into(),
+            Refused::Rejected(Unloaded {
+                host: Some(host), ..
+            }) => format!("rejected at {host}"),
+            Refused::Rejected(_) => "rejected".into(),
+            Refused::Failed(_) => "failed".into(),
+        };
+        let truncated = &hello[..100];
+        reloader
+            .apply(upload(truncated, &hex(truncated)))
+            .await
+            .unwrap();
+        let never = b"never uploaded";
         let before = (reloader.routes().current(), manifest(), components());
         let refusals = [
             (
                 deploy("a.local", &hello, ""),
-                Refused::Taken(String::new()),
-                "a.local is routed by the config file, not by the console",
+                "taken",
+                "a.local is routed by the config file, not by the console".to_string(),
             ),
             (
                 Edit::Move {
                     host: "b.local".into(),
                     to: "a.local".into(),
                 },
-                Refused::Taken(String::new()),
-                "a.local is routed by the config file",
+                "taken",
+                "a.local is routed by the config file".into(),
             ),
             (
-                deploy("c.local", &hello[..100], ""),
-                Refused::Rejected(String::new()),
-                "wasm route 'c.local': component ",
+                deploy("s1.local", &hello, ""),
+                "taken",
+                "s1.local is routed by the app 'shop' of cf, not by the console".into(),
+            ),
+            (
+                Edit::Move {
+                    host: "b.local".into(),
+                    to: "b1.local".into(),
+                },
+                "taken",
+                "b1.local is routed by the app 'blog' of cf".into(),
+            ),
+            (
+                deploy("c.local", truncated, ""),
+                "rejected at c.local",
+                format!(
+                    "wasm route 'c.local': component components/{}/hello.wasm: ",
+                    hex(truncated)
+                ),
             ),
             (
                 deploy("c.local", &hello, "pool=5"),
-                Refused::Rejected(String::new()),
-                "more than --max-instances 4",
+                "rejected",
+                "more than --max-instances 4".into(),
             ),
             (
                 Edit::Remove {
                     host: "x.local".into(),
                 },
-                Refused::Unknown(String::new()),
-                "the console routes no host 'x.local'",
+                "unknown",
+                "the console routes no host 'x.local'".into(),
             ),
             (
                 deploy("a_b", &hello, ""),
-                Refused::Invalid(String::new()),
-                "'a_b' is no host name",
+                "invalid",
+                "'a_b' is no host name".into(),
+            ),
+            (
+                put("blog", "cf", &["b.local"], &hello, &[]),
+                "taken",
+                "b.local is a route of the console".into(),
+            ),
+            (
+                put("blog", "cf", &["a.local"], &hello, &[]),
+                "taken",
+                "a.local is routed by the config file".into(),
+            ),
+            (
+                put("blog", "cf", &["b1.local", "s1.local"], &hello, &[]),
+                "taken",
+                "s1.local is routed by the app 'shop' of cf".into(),
+            ),
+            (
+                put("blog", "intruder", &["b1.local"], &hello, &[]),
+                "taken",
+                "the app 'blog' is cf's, not intruder's".into(),
+            ),
+            (
+                Edit::DeleteApp {
+                    name: "blog".into(),
+                    owner: "intruder".into(),
+                },
+                "taken",
+                "the app 'blog' is cf's, not intruder's".into(),
+            ),
+            (
+                Edit::DeleteApp {
+                    name: "nope".into(),
+                    owner: "cf".into(),
+                },
+                "unknown",
+                "the console has no app 'nope'".into(),
+            ),
+            (
+                put("blog", "cf", &["b1.local"], never, &[]),
+                "missing",
+                format!("no component {} is kept", hex(never)),
+            ),
+            // one reload: no host of it, b2.local neither
+            (
+                put("blog", "cf", &["b2.local", "b1.local"], truncated, &[]),
+                "rejected at b1.local",
+                format!(
+                    "wasm route 'b1.local': component components/{}/app.wasm: ",
+                    hex(truncated)
+                ),
             ),
         ];
-        for (edit, kind, error) in refusals {
+        let kept_in = deployed.to_string_lossy().to_string();
+        for (edit, expected, error) in refusals {
             let refused = reloader.apply(edit).await.unwrap_err();
-            assert!(
-                std::mem::discriminant(&refused) == std::mem::discriminant(&kind)
-                    && refused.to_string().contains(error),
-                "{error}: {refused:?}"
-            );
+            let message = refused.to_string();
+            assert_eq!(kind(&refused), expected, "{error}: {refused:?}");
+            assert!(message.contains(&error), "{error}: {refused:?}");
+            assert!(!message.contains(&kept_in), "{error}: {refused:?}");
             assert!(
                 Arc::ptr_eq(&before.0, &reloader.routes().current()),
                 "{error}: the table stays"
@@ -1420,8 +1749,19 @@ pub(crate) mod tests {
         let change = reloader.apply(removed).await.unwrap();
         assert_eq!(change.change.unwrap().removed, ["b.local"]);
         assert!(status.borrow().failure.is_none(), "read every route again");
-        assert_eq!(components(), Vec::<String>::new());
-        assert!(manifest().ends_with("routes: []\n"), "{}", manifest());
+        let apps = sorted(vec![
+            format!("{digest}/app.wasm"),
+            format!("{}/app.wasm", hex(&fetch)),
+        ]);
+        assert_eq!(components(), apps, "the apps' stay");
+        assert!(manifest().contains("routes: []\n"), "{}", manifest());
+        let removed = Edit::DeleteApp {
+            name: "blog".into(),
+            owner: "cf".into(),
+        };
+        let change = reloader.apply(removed).await.unwrap();
+        assert_eq!(change.change.unwrap().removed, ["b1.local"]);
+        assert_eq!(components(), [format!("{}/app.wasm", hex(&fetch))]);
 
         let sandbox = "budget-ms=250&instances=2&memory-mib=64&pool=1&wasi=cli,keyvalue";
         reloader
@@ -1429,16 +1769,31 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let kept = reloader.routes().current();
-        // what a crash between an upload and the routes file leaves
+        // what a crash between an upload and the routes file leaves, and an
+        // upload kept long enough
         let components_dir = deployed.join("components");
         std::fs::create_dir_all(components_dir.join("0".repeat(64))).unwrap();
         std::fs::write(components_dir.join("0".repeat(64)).join("lost.wasm"), "").unwrap();
         std::fs::write(components_dir.join(&digest).join(".hello.wasm.partial"), "").unwrap();
+        let stale = deployed
+            .join("uploads")
+            .join(format!("{}.wasm", "1".repeat(64)));
+        std::fs::write(&stale, "").unwrap();
+        let day = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
+        let file = std::fs::File::options().write(true).open(&stale).unwrap();
+        file.set_modified(day).unwrap();
         let restarted = Reloader::start(source(), Instances::new(4)).await.unwrap();
         let table = restarted.routes().current();
         assert_eq!(table.advertised, kept.advertised, "the same targets");
         assert_eq!(table.origins, kept.origins, "deployed at the same time");
-        assert_eq!(components(), [format!("{digest}/hello.wasm")]);
+        let served = sorted(vec![
+            format!("{digest}/hello.wasm"),
+            format!("{}/app.wasm", hex(&fetch)),
+        ]);
+        assert_eq!(components(), served);
+        assert!(!stale.exists(), "an upload a day old goes");
+        let fresh = deployed.join("uploads").join(format!("{digest}.wasm"));
+        assert!(fresh.exists(), "a fresh one stays");
     }
 
     /// A change of a watched file is reloaded once a poll saw it unchanged

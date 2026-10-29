@@ -25,6 +25,10 @@ already gone: the refused component is collected right after. `components/<sha25
 - the listing's `target` field (`GET /api/routes`) carries the same absolute URL; the page
   does not show it. Decide whether the API keeps it
 
+## As built
+
+- the listing keeps `target`: the route's identity on the server (the README says so)
+
 ## Acceptance
 
 - a refused console deploy names its component without the absolute path of
