@@ -17,7 +17,8 @@ Decision deferred: whether the data follows the route, and how.
   map. The manifest refuses a keyvalue map today (`read()` in `deployed.rs`: what the
   console never writes), so `routes.yaml` and the console's sandbox need one; the page shows
   the pin (the sandbox cell lists `identifier -> store/namespace` already) and needs a way
-  back to the default. Whether a later deploy or sandbox edit keeps the pin is part of it
+  back to the default. Whether a later deploy or sandbox edit keeps the pin is part of it.
+  Todo 172 gives the app API explicit maps, which the pin can build on
 - move the data in the store: sqlite updates `kv` and its `usage` accounting (the triggers
   do not move bytes between namespaces) and checks `max-namespace-bytes`; redis renames
   every `<prefix><namespace>:<key>`, not atomic with the reload. Data already under the new

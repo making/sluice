@@ -1,0 +1,14 @@
+applications:
+- name: counter
+  command: counter.wasm
+  instances: 2
+  memory: 64M
+  routes:
+  - route: counter.localhost
+  - route: count.localhost
+  services:
+  - name: kv
+    parameters: {identifier: ""}
+  metadata:
+    annotations:
+      wicket.sluice.ik.am/budget-ms: "5000"
