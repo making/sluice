@@ -10,6 +10,7 @@
 //!                                               `after` is the current revision
 //! PUT    /api/routes/<host>?name=..&<options>   deploys the body, a component, to the host
 //! PATCH  /api/routes/<host>?<options>           gives the console's route another sandbox
+//! PATCH  /api/routes/<host>?host=<to>           moves the console's route to another host
 //! DELETE /api/routes/<host>                     removes the console's route
 //! ```
 //!
@@ -166,7 +167,7 @@ impl Console {
                     let body = body.take().expect("not read yet");
                     self.deploy(host, parts, body).await
                 }
-                Some(host) if method == Method::PATCH => self.sandbox(host, query).await,
+                Some(host) if method == Method::PATCH => self.patch(host, query).await,
                 Some(host) if method == Method::DELETE => self.remove(host).await,
                 Some(_) => error(
                     StatusCode::METHOD_NOT_ALLOWED,
@@ -317,7 +318,7 @@ impl Console {
             Ok(host) => host,
             Err(e) => return error(StatusCode::BAD_REQUEST, e),
         };
-        let (name, sandbox) = match options(parts.uri.query(), true) {
+        let (name, sandbox) = match options(&pairs(parts.uri.query()), true) {
             Ok(options) => options,
             Err(e) => return error(StatusCode::BAD_REQUEST, e),
         };
@@ -342,12 +343,27 @@ impl Console {
         .await
     }
 
-    async fn sandbox(&self, host: &str, query: Option<&str>) -> Response {
+    /// `host=<to>` alone moves the route; any other query is its whole
+    /// sandbox. Never both: a sandbox left out would read as the defaults.
+    async fn patch(&self, host: &str, query: Option<&str>) -> Response {
         let host = match deployed::check_host(host) {
             Ok(host) => host,
             Err(e) => return error(StatusCode::BAD_REQUEST, e),
         };
-        match options(query, false) {
+        let pairs = pairs(query);
+        if let Some((_, to)) = pairs.iter().find(|(key, _)| key == "host") {
+            if pairs.len() > 1 {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "host= moves the route as it is: a sandbox takes a PATCH of its own",
+                );
+            }
+            return match deployed::check_host(to) {
+                Ok(to) => self.edit(Edit::Move { host, to }).await,
+                Err(e) => error(StatusCode::BAD_REQUEST, e),
+            };
+        }
+        match options(&pairs, false) {
             Ok((_, sandbox)) => self.edit(Edit::Sandbox { host, sandbox }).await,
             Err(e) => error(StatusCode::BAD_REQUEST, e),
         }
@@ -409,15 +425,19 @@ async fn drain(mut body: Incoming) {
     }
 }
 
-/// The name (with `named`) and the sandbox of an edit's query: the `--wasm`
-/// route options, url-decoded.
-fn options(query: Option<&str>, named: bool) -> Result<(Option<String>, Sandbox), String> {
-    let pairs: Vec<(String, String)> = form_urlencoded::parse(query.unwrap_or_default().as_bytes())
+/// The pairs of an edit's query, url-decoded.
+fn pairs(query: Option<&str>) -> Vec<(String, String)> {
+    form_urlencoded::parse(query.unwrap_or_default().as_bytes())
         .into_owned()
-        .collect();
+        .collect()
+}
+
+/// The name (with `named`) and the sandbox of an edit's query: the `--wasm`
+/// route options.
+fn options(pairs: &[(String, String)], named: bool) -> Result<(Option<String>, Sandbox), String> {
     let mut name = None;
     let mut options = Vec::with_capacity(pairs.len());
-    for (key, value) in &pairs {
+    for (key, value) in pairs {
         if named && key == "name" {
             name = Some(value.clone());
         } else {

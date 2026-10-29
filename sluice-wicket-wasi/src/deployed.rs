@@ -146,6 +146,26 @@ impl Deployed {
         Ok(deployed)
     }
 
+    /// The routes with the route of `host` moved to `to` as it is: its
+    /// component, sandbox and time, in its place. A move replaces no route of
+    /// the console.
+    pub fn moved(&self, host: &str, to: &str) -> Result<Deployed, Refused> {
+        let host = self.route(host)?.host.clone();
+        let to = check_host(to).map_err(Refused::Invalid)?;
+        if to != host && self.routes.iter().any(|route| route.host == to) {
+            return Err(Refused::Taken(format!(
+                "{to} is a route of the console already"
+            )));
+        }
+        let mut deployed = self.clone();
+        for route in &mut deployed.routes {
+            if route.host == host {
+                route.host = to.clone();
+            }
+        }
+        Ok(deployed)
+    }
+
     fn route(&self, host: &str) -> Result<&Route, Refused> {
         let host = host.to_ascii_lowercase();
         self.routes
@@ -461,7 +481,8 @@ mod tests {
 
     /// The routes file reads back as written; what the console never writes
     /// -- a component not its own, a keyvalue map, a host twice -- fails,
-    /// naming the route.
+    /// naming the route. A move keeps a route as it is, in its place, and
+    /// replaces none.
     #[test]
     fn the_routes_file_reads_back_as_written() {
         let routes = vec![
@@ -481,6 +502,37 @@ mod tests {
                 deployed: rfc3339(UNIX_EPOCH + Duration::from_secs(1_793_276_096)),
             },
         ];
+        let deployed = Deployed {
+            dir: PathBuf::new(),
+            routes: routes.clone(),
+        };
+        let moved = deployed.moved("a.local", "C.local").unwrap();
+        assert_eq!(moved.routes[0].host, "c.local");
+        assert_eq!(
+            (&moved.routes[0].component, &moved.routes[0].deployed),
+            (&routes[0].component, &routes[0].deployed)
+        );
+        assert_eq!(moved.routes[1], routes[1]);
+        assert_eq!(deployed.moved("a.local", "a.local"), Ok(deployed.clone()));
+        for (to, refused) in [
+            (
+                "b.local",
+                Refused::Taken("b.local is a route of the console already".into()),
+            ),
+            (
+                "a_b",
+                Refused::Invalid(
+                    "'a_b' is no host name (dot-separated labels of a-z, 0-9 and '-')".into(),
+                ),
+            ),
+        ] {
+            assert_eq!(deployed.moved("a.local", to), Err(refused));
+        }
+        assert!(matches!(
+            deployed.moved("x.local", "c.local"),
+            Err(Refused::Unknown(_))
+        ));
+
         let text = write(&routes);
         assert_eq!(read(&text), Ok(routes));
         assert!(

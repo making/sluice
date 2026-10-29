@@ -285,8 +285,9 @@ older one ignores an advertise without routes and keeps the old ones).
 `--console <host:port>` (`console`) serves a page and a JSON API deploying components as
 routes at once, without a restart: drop a `.wasm` file on the page (or choose one), give it a
 host and a sandbox, and it is served -- on the tunnel and on `--listen` alike. Dropped on a
-route of the console, a file replaces its component. The routes of the config file and the
-`--wasm` flags are listed too, read-only.
+route of the console, a file replaces its component; renamed, a route moves to another host
+with its component and sandbox. The routes of the config file and the `--wasm` flags are
+listed too, read-only.
 
 ```text
 target/debug/sluice-wicket-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090
@@ -364,6 +365,7 @@ out takes its default):
 | `GET /api/routes[?after=<revision>]` | every route and the last failed reload of the files, as JSON; with `after` the current `revision`, held until they change (25s at most) |
 | `PUT /api/routes/<host>?name=<file>&<options>` | deploys the body, a component of 128MiB at most, to the host (replacing the console's route of the host) |
 | `PATCH /api/routes/<host>?<options>` | gives the console's route of the host another sandbox |
+| `PATCH /api/routes/<host>?host=<to>` | moves the console's route of the host to `<to>` as it is (the route is renamed); `host=` takes no other option |
 | `DELETE /api/routes/<host>` | removes the console's route of the host |
 
 ```text
@@ -373,10 +375,11 @@ curl -T hello.wasm -H 'Authorization: Bearer SECRET' \
 ```
 
 An edit is answered 400 (a bad host name, option or body), 404 (no route of the console), 409
-(a host the config file or a flag routes), 413, 422 (the routes did not load with it; the
-reason follows) or 503 (draining). A host is dot-separated labels of `a-z`, `0-9` and `-`. A
-`wasi=keyvalue` route gets the default keyvalue map: the default store, the host as the
-namespace.
+(a host the config file or a flag routes; for a move, any routed host), 413, 422 (the routes
+did not load with it; the reason follows) or 503 (draining). A host is dot-separated labels of
+`a-z`, `0-9` and `-`. A `wasi=keyvalue` route gets the default keyvalue map: the default
+store, the host as the namespace. The namespace follows a move, so a moved route starts with
+no data; what it stored stays under the old host.
 
 ### Capabilities
 

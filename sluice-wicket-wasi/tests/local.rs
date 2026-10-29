@@ -4,7 +4,7 @@
 //! restart and shared by two wickets on the file, or in a redis store two
 //! wickets share as wickets on two hosts would. Nothing drains: SIGTERM ends
 //! the process at once, with 0. The console deploys an uploaded component as
-//! a route at once.
+//! a route at once, and moves it to another host as it is.
 #![cfg(unix)]
 
 #[path = "support/redis_server.rs"]
@@ -434,21 +434,46 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
     assert_eq!(status, 200);
     assert!(body.starts_with("hello from wasm"), "{body}");
 
+    // a move takes the host alone: a sandbox left out would read as the defaults
+    let mixed = "PATCH /api/routes/hello.localhost?host=greet.localhost&pool=1";
+    let (status, _, body) = console(&at, mixed, &[bearer], b"").await;
+    assert_eq!(status, 400, "{body}");
+    let moved = "PATCH /api/routes/hello.localhost?host=greet.localhost";
+    let (status, _, body) = console(&at, moved, &[bearer], b"").await;
+    assert_eq!(
+        (status, body.as_str()),
+        (
+            200,
+            r#"{"generation":3,"message":"added greet.localhost; removed hello.localhost"}"#
+        )
+    );
+
     drop(wicket);
     wicket = Wicket::start(&args);
     let (address, at) = (wicket.address(), wicket.console());
-    let (status, body) = get(&address, "hello.localhost", "/").await;
-    assert_eq!(status, 200, "kept across the restart: {body}");
-    let removal = "DELETE /api/routes/hello.localhost";
+    let (_, _, listing) = console(&at, "GET /api/routes", &[bearer], b"").await;
+    let listing: serde_json::Value = serde_json::from_str(&listing).unwrap();
+    let route = &listing["routes"][0];
+    assert_eq!(
+        (
+            route["host"].as_str(),
+            route["sandbox"]["budget_ms"].as_u64()
+        ),
+        (Some("greet.localhost"), Some(5000)),
+        "moved as it was, and kept across the restart"
+    );
+    let (status, body) = get(&address, "greet.localhost", "/").await;
+    assert_eq!(status, 200, "{body}");
+    let removal = "DELETE /api/routes/greet.localhost";
     let (status, _, body) = console(&at, removal, &[basic], b"").await;
     assert_eq!(
         (status, body.as_str()),
         (
             200,
-            r#"{"generation":2,"message":"removed hello.localhost"}"#
+            r#"{"generation":2,"message":"removed greet.localhost"}"#
         )
     );
-    assert_eq!(get(&address, "hello.localhost", "/").await.0, 404);
+    assert_eq!(get(&address, "greet.localhost", "/").await.0, 404);
     let (status, _, _) = console(&at, removal, &[basic], b"").await;
     assert_eq!(status, 404, "no longer the console's");
     drop(wicket);

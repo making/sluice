@@ -324,6 +324,8 @@ pub enum Edit {
     },
     /// Gives the console's route of `host` another sandbox.
     Sandbox { host: String, sandbox: Sandbox },
+    /// Moves the console's route of `host` to `to` as it is.
+    Move { host: String, to: String },
     /// Removes the console's route of `host`.
     Remove { host: String },
 }
@@ -331,7 +333,10 @@ pub enum Edit {
 impl Edit {
     fn host(&self) -> &str {
         match self {
-            Edit::Deploy { host, .. } | Edit::Sandbox { host, .. } | Edit::Remove { host } => host,
+            Edit::Deploy { host, .. }
+            | Edit::Sandbox { host, .. }
+            | Edit::Move { host, .. }
+            | Edit::Remove { host } => host,
         }
     }
 
@@ -341,6 +346,7 @@ impl Edit {
         match self {
             Edit::Deploy { host, .. } => format!("console: deploy to {host}"),
             Edit::Sandbox { host, .. } => format!("console: sandbox of {host}"),
+            Edit::Move { host, to } => format!("console: move {host} to {to}"),
             Edit::Remove { host } => format!("console: remove {host}"),
         }
     }
@@ -533,6 +539,11 @@ impl Reloader {
                 edit.host()
             )));
         }
+        if let Edit::Move { to, .. } = &edit
+            && let Some(origin @ (Origin::Config | Origin::Flag)) = current.origins.get(to)
+        {
+            return Err(Refused::Taken(format!("{to} is routed by {origin}")));
+        }
         let deployed = self
             .source
             .deployed()
@@ -547,6 +558,7 @@ impl Reloader {
             Edit::Sandbox { host, sandbox } => {
                 deployed.with_sandbox(&host, sandbox, SystemTime::now())
             }
+            Edit::Move { host, to } => deployed.moved(&host, &to),
             Edit::Remove { host } => deployed.without(&host),
         }?;
         if &edited == deployed {
@@ -1303,12 +1315,49 @@ pub(crate) mod tests {
         );
         assert!(status.borrow().revision > revision, "the console sees it");
 
+        // a move: the route as it is at another host, in one generation; the
+        // keyvalue namespace follows the host
+        let generation = reloader.routes().current().generation;
+        let moved = Edit::Move {
+            host: "b.local".into(),
+            to: "e.local".into(),
+        };
+        assert_eq!(
+            reloader.apply(moved).await,
+            Ok(Outcome {
+                generation: generation + 1,
+                change: Some(Change {
+                    added: vec!["e.local".into()],
+                    removed: vec!["b.local".into()],
+                    ..Change::default()
+                }),
+            })
+        );
+        let table = reloader.routes().current();
+        let handler = table.handler(&table.target("e.local")).unwrap();
+        assert_eq!(handler.sandbox().keyvalue[""].namespace, "e.local");
+        assert!(manifest().contains("host: \"e.local\""), "{}", manifest());
+        assert_eq!(components().len(), 1, "its component stays");
+        let back = Edit::Move {
+            host: "e.local".into(),
+            to: "b.local".into(),
+        };
+        reloader.apply(back).await.unwrap();
+
         let before = (reloader.routes().current(), manifest(), components());
         let refusals = [
             (
                 deploy("a.local", &hello, ""),
                 Refused::Taken(String::new()),
                 "a.local is routed by the config file, not by the console",
+            ),
+            (
+                Edit::Move {
+                    host: "b.local".into(),
+                    to: "a.local".into(),
+                },
+                Refused::Taken(String::new()),
+                "a.local is routed by the config file",
             ),
             (
                 deploy("c.local", &hello[..100], ""),

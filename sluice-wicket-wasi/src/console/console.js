@@ -933,7 +933,7 @@ function routesNote(outcome) {
 
 function toggleEditor(route) {
   const { host } = route;
-  if (state.editors.has(host)) {
+  if (state.editors.get(host)?.kind === "sandbox") {
     state.editors.delete(host);
     render();
     focusAction(host, "edit");
@@ -983,9 +983,118 @@ function toggleEditor(route) {
     }
   });
   const row = h("tr", { class: "route__editor", "data-host": host }, h("td", { colspan: 4 }, form));
-  state.editors.set(host, { row, fields });
+  state.editors.set(host, { kind: "sandbox", row, fields });
   render();
   fields.focus();
+}
+
+/** The note on moving `route` to the host `value`, and whether it may be sent. */
+function renameCheck(route, value) {
+  const to = normalizeHost(value);
+  if (to === route.host || to === "") {
+    return { text: "The host the route moves to.", kind: "", blocked: true };
+  }
+  if (!HOST.test(to)) {
+    return {
+      text: "Not a host name: dot-separated labels of a-z, 0-9 and '-', none starting or ending with '-'.",
+      kind: "fault",
+      blocked: true,
+    };
+  }
+  const taken = routeOf(to);
+  if (taken) {
+    const by = taken.origin === "console" ? "a route of the console already" : `routed by the ${taken.origin === "config" ? "config file" : "--wasm flags"}`;
+    return { text: `${to} is ${by}.`, kind: "fault", blocked: true };
+  }
+  if (route.sandbox.wasi.includes("keyvalue")) {
+    return { text: `Its keyvalue data stays under ${route.host}: at ${to} it starts with none.`, kind: "replace", blocked: false };
+  }
+  return { text: `Served at ${to} at once, its component and sandbox as they are.`, kind: "", blocked: false };
+}
+
+/** Moves the console route `route` to another host as it is: its component and sandbox. */
+function toggleRename(route) {
+  const { host } = route;
+  if (state.editors.get(host)?.kind === "rename") {
+    state.editors.delete(host);
+    render();
+    focusAction(host, "rename");
+    return;
+  }
+  const id = `rename-${++fieldsets}`;
+  const input = h("input", {
+    id, type: "text", required: true, autocomplete: "off", autocapitalize: "none", spellcheck: "false",
+    inputmode: "url", "aria-describedby": `${id}-note`,
+  });
+  input.value = host;
+  const note = h("p", { id: `${id}-note`, class: "field__note" });
+  const outcome = h("div");
+  const save = h("button", { type: "submit", class: "button button--primary" }, "Rename");
+  const cancel = h("button", { type: "button", class: "button", onclick: () => toggleRename(route) }, "Cancel");
+  let sending = false;
+  const check = () => {
+    const { text, kind, blocked } = renameCheck(routeOf(host) ?? route, input.value);
+    note.className = `field__note${kind ? ` field__note--${kind}` : ""}`;
+    note.textContent = text;
+    if (kind === "fault") {
+      input.setAttribute("aria-invalid", "true");
+    }
+    else {
+      input.removeAttribute("aria-invalid");
+    }
+    save.disabled = blocked || sending;
+  };
+  input.addEventListener("input", check);
+  const form = h("form", { class: "editor", novalidate: true, "aria-label": `Rename ${host}` },
+    h("div", { class: "field field--host" },
+      h("label", { for: id }, "New host"),
+      h("div", { class: "field__control" }, input, note)),
+    h("div", { class: "editor__actions" }, save, cancel),
+    outcome);
+  form.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !cancel.disabled) {
+      toggleRename(route);
+    }
+  });
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    check();
+    if (save.disabled) {
+      return;
+    }
+    const to = normalizeHost(input.value);
+    sending = true;
+    save.disabled = true;
+    cancel.disabled = true;
+    const progress = progressView();
+    progress.working("Reloading the routes…");
+    outcome.replaceChildren(progress.element);
+    progress.focus();
+    try {
+      const answer = await send("PATCH", host, [`host=${encodeURIComponent(to)}`], null);
+      state.editors.delete(host);
+      // marked until the next listing drops the row; the route shows at its new host
+      state.busy.set(host, { phase: "working", text: `Moved to ${to}.` });
+      state.fresh = { host: to, until: Date.now() + 4000 };
+      const moved = routesNote(changed(answer));
+      announce(spoken(changed(answer)));
+      render();
+      moved.focus();
+    }
+    catch (error) {
+      outcome.replaceChildren(outcomeView({ kind: "fault", title: `${titleOf(error)}:`, summary: `${host} stays as it was.`, detail: error.message }));
+      announce(`Renaming ${host} failed: ${error.message}`);
+      sending = false;
+      cancel.disabled = false;
+      check();
+      (save.disabled ? input : save).focus();
+    }
+  });
+  const row = h("tr", { class: "route__editor", "data-host": host }, h("td", { colspan: 4 }, form));
+  state.editors.set(host, { kind: "rename", row, refresh: check });
+  render();
+  input.focus();
+  input.select();
 }
 
 // --------------------------------------------------------------------- rendering
@@ -1122,7 +1231,7 @@ function reconcile(parent, nodes) {
 
 function routeRow(route) {
   const fresh = state.fresh?.host === route.host && state.fresh.until > Date.now();
-  const signature = JSON.stringify([route, state.busy.has(route.host), state.editors.has(route.host), fresh, state.listing.listen, state.listing.defaults]);
+  const signature = JSON.stringify([route, state.busy.has(route.host), state.editors.get(route.host)?.kind ?? null, fresh, state.listing.listen, state.listing.defaults]);
   const cached = rows.get(route.host);
   if (cached?.signature === signature) {
     return cached.row;
@@ -1187,7 +1296,7 @@ function actionsCell(route) {
     return null;
   }
   const busy = state.busy.has(route.host);
-  const editing = state.editors.has(route.host);
+  const editing = state.editors.get(route.host)?.kind;
   return h("div", { class: "route__actions" },
     h("button", {
       type: "button", class: "button button--small", "data-action": "replace", disabled: busy,
@@ -1199,8 +1308,13 @@ function actionsCell(route) {
     }, "Replace…"),
     h("button", {
       type: "button", class: "button button--small", "data-action": "edit", disabled: busy,
-      "aria-expanded": String(editing), onclick: () => toggleEditor(route),
+      "aria-expanded": String(editing === "sandbox"), onclick: () => toggleEditor(route),
     }, "Edit sandbox"),
+    h("button", {
+      type: "button", class: "button button--small", "data-action": "rename", disabled: busy,
+      title: "Serve this route at another host, keeping its component and sandbox",
+      "aria-expanded": String(editing === "rename"), onclick: () => toggleRename(route),
+    }, "Rename…"),
     h("button", {
       type: "button", class: "button button--small button--danger", "data-action": "remove", disabled: busy,
       onclick: () => removeRoute(route),
@@ -1251,6 +1365,10 @@ function render() {
   renderStatus();
   renderRoutes();
   refreshDeploy();
+  // a rename's note follows the listing, as the deploy form's does
+  for (const editor of state.editors.values()) {
+    editor.refresh?.();
+  }
 }
 
 // ----------------------------------------------------------------------- the link
