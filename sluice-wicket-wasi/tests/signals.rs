@@ -1,10 +1,10 @@
 //! The signals of the process: SIGHUP reloads the routes; SIGTERM starts the
 //! drain and a second one ends it at once; with `--drain-grace 0` SIGTERM ends
-//! the process as the default action does.
+//! the process at once, through its handler (exit 0, not the default action:
+//! the init of a container has none).
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader};
-use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -166,11 +166,12 @@ async fn sigterm_drains_and_a_second_one_ends_the_drain() {
     let status = exit_within(&mut child, Duration::from_secs(15));
     assert!(status.success(), "{status:?}");
 
-    // no drain: the default action ends the process
+    // no drain: the handler ends the process at once
     let (mut child, lines) = wicket(&server, "0", &hello);
     await_line(&lines, "advertise acked by");
     sigterm(&child);
+    await_line(&lines, "SIGTERM: ending at once (--drain-grace 0)");
     let status = exit_within(&mut child, Duration::from_secs(15));
-    assert_eq!(status.signal(), Some(15), "{status:?}");
+    assert!(status.success(), "{status:?}");
     let _ = std::fs::remove_file(&component);
 }

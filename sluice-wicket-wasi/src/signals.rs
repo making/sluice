@@ -1,5 +1,5 @@
 //! The signals of the process: SIGHUP reloads the routes, SIGTERM / SIGINT
-//! drain.
+//! drain, or end the process at once where nothing drains.
 
 use tokio::sync::mpsc;
 

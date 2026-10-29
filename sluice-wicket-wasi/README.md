@@ -579,10 +579,14 @@ On SIGTERM / SIGINT the wicket drains as the Java client does (see "Client shutd
   The process exits with 0 once every stream ended
 - `--drain-grace SECONDS` (default 20) bounds the wait: the connections still open are
   then closed (`drain grace 20s expired; closing N open connection(s)`). `0` turns the
-  drain off: no signal handler is installed, a signal ends the process at once
+  drain off: a signal ends the process at once
 - a second SIGTERM / SIGINT ends the drain at once
 - a server predating the drain acknowledges the withdrawal without `withdrawn` and keeps
   routing to the wicket: the wicket closes that stream at once
+
+Where nothing drains (`--drain-grace 0`, or no `--server`) the process exits with 0 at once:
+its handler ends it, as the init (pid 1) of a container too, which ignores a signal it has no
+handler for.
 
 `docker compose stop` (and `up -d` replacing a container) sends SIGKILL 10s after
 SIGTERM: set `stop_grace_period` above `--drain-grace`, e.g. `30s` for the default. On

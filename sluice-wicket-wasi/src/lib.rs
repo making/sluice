@@ -167,8 +167,9 @@ fn describe_peer(build: &PeerBuild) -> String {
     })
 }
 
-/// Connects to the server and serves the routes of `settings` until the drain
-/// after SIGTERM / SIGINT ended, or at once on one with `--drain-grace 0`.
+/// Serves the routes of `settings` (through the server, on `--listen`, or
+/// both) until SIGTERM / SIGINT: until the drain after it ended, or at once
+/// where nothing drains (without `--server`, or with `--drain-grace 0`).
 pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
     let config::Settings {
         server,
@@ -256,16 +257,21 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         // no console: the reloader sees the channel closed, no edit comes
         drop(requests);
     }
+    // installed whether or not a drain follows: as the init (pid 1) of a
+    // container, a process without a handler ignores SIGTERM
+    let mut signals = Signals::install()?;
     let Some(server) = server else {
-        // local mode alone: nothing to drain, a signal ends the process
-        reloader
-            .run(
-                watch_interval,
-                hangups_received,
-                requests_received,
-                CancellationToken::new(),
-            )
-            .await;
+        // local mode alone: nothing to drain, a signal ends the process at once
+        let reloads = reloader.run(
+            watch_interval,
+            hangups_received,
+            requests_received,
+            CancellationToken::new(),
+        );
+        tokio::select! {
+            () = reloads => {}
+            name = signals.recv() => println!("{name}: ending at once"),
+        }
         return Ok(());
     };
 
@@ -309,16 +315,16 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
 
     let (tx, rx) = mpsc::channel(32);
     let supervisor = supervisor::supervise(rx, tx, shared.clone(), server);
-    if drain_grace.is_zero() {
-        // no handler: a signal ends the process at once
-        return supervisor.await;
-    }
-    let mut signals = Signals::install()?;
-    tokio::select! {
+    let name = tokio::select! {
         result = supervisor => return result,
         // dropping the supervisor: no membership change opens a stream from now on
-        name = signals.recv() => println!("{name}: draining"),
+        name = signals.recv() => name,
+    };
+    if drain_grace.is_zero() {
+        println!("{name}: ending at once (--drain-grace 0)");
+        return Ok(());
     }
+    println!("{name}: draining");
     let interrupt = async {
         let name = signals.recv().await;
         eprintln!("{name} during the drain: ending it at once");

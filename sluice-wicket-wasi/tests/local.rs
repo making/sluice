@@ -3,15 +3,14 @@
 //! once; a keyvalue route keeps its count in the sqlite file, across a
 //! restart and shared by two wickets on the file, or in a redis store two
 //! wickets share as wickets on two hosts would. Nothing drains: SIGTERM ends
-//! the process at once. The console deploys an uploaded component as a route
-//! at once.
+//! the process at once, with 0. The console deploys an uploaded component as
+//! a route at once.
 #![cfg(unix)]
 
 #[path = "support/redis_server.rs"]
 mod redis_server;
 
 use std::io::{BufRead, BufReader};
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -291,7 +290,8 @@ async fn local_mode_routes_by_host_and_keeps_the_keyvalue_file() {
         assert!(Instant::now() < deadline, "still running after SIGTERM");
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert_eq!(exited.signal(), Some(15), "no drain: {exited:?}");
+    // its handler, not the default action: the init of a container has none
+    assert!(exited.success(), "no drain: {exited:?}");
     drop(wicket);
     let _ = std::fs::remove_dir_all(&dir);
 }
