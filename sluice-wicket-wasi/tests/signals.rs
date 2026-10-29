@@ -72,13 +72,37 @@ async fn acking_server() -> String {
     url
 }
 
+/// A wicket process, killed on drop: a failed wait leaves none running.
+struct Wicket(Child);
+
+impl std::ops::Deref for Wicket {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Wicket {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Wicket {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// The wicket on `server` serving `component` for `hello.local`, polling
 /// nothing (SIGHUP alone reloads), its stdout lines on the receiver.
 fn wicket(
     server: &str,
     drain_grace: &str,
     component: &std::path::Path,
-) -> (Child, mpsc::Receiver<String>) {
+) -> (Wicket, mpsc::Receiver<String>) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-wasi"))
         .args(["--server", server, "--drain-grace", drain_grace])
         .args(["--watch-interval", "0", "--wasm"])
@@ -95,7 +119,7 @@ fn wicket(
             }
         }
     });
-    (child, received)
+    (Wicket(child), received)
 }
 
 /// Waits for a line containing `text`.
@@ -133,7 +157,6 @@ fn exit_within(child: &mut Child, within: Duration) -> std::process::ExitStatus 
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let _ = child.kill();
     panic!("still running after {within:?}");
 }
 
