@@ -2,11 +2,16 @@
 //! distribution refuses any other platform) against the cf-api and a wicket
 //! in local mode, both on a flume: login, push, the app's logs, map-route,
 //! scale, a rolling push with requests all along, stop and start, the
-//! user's environment variables and VCAP_*, a restart of the cf-api with an
-//! OpenID Provider (a mock) and TLS of its own -- `cf login --sso` through
-//! the passcode page, a refresh, the clients configured, who is refused --,
-//! a component the wicket refuses until a service binding grants what it
-//! needs, the services' lifecycle, delete.
+//! user's environment variables and VCAP_*, a private component in an OCI
+//! registry (a stub) pushed by tag -- its credentials, a restart keeping
+//! the digest staged when the tag moves, a restage taking the new one --, a
+//! restart of the cf-api with an OpenID Provider (a mock) and TLS of its
+//! own -- `cf login --sso` through the passcode page, a refresh, the
+//! clients configured, who is refused --, a component the wicket refuses
+//! until a service binding grants what it needs, the services' lifecycle,
+//! delete.
+
+mod registry;
 
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::net::TcpStream;
@@ -16,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use registry::Registry;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sluice_oidc::mock::MockProvider;
@@ -197,8 +203,13 @@ impl Cf {
 
     /// Runs the command with `input` on its stdin (what a prompt reads).
     fn run_with_stdin(&self, args: &[&str], input: &str) -> (bool, String) {
-        let mut child = self
-            .command(args)
+        self.output(self.command(args), input)
+    }
+
+    /// Runs `command` (of [`Cf::command`]) with `input` on its stdin:
+    /// whether it succeeded, and its output.
+    fn output(&self, mut command: Command, input: &str) -> (bool, String) {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -221,6 +232,10 @@ impl Cf {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
         println!("$ cf {}\n{text}", args.join(" "));
         (output.status.success(), text)
     }
@@ -622,6 +637,74 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "{env}"
     );
 
+    // a component in an OCI registry (the test's, as ghcr.io: a token for
+    // every pull, the user's for a private image), pushed by tag: its
+    // credentials kept with the app, the password shown nowhere; the tag
+    // pinned to its digest, so a restart keeps the component staged when
+    // the tag moves, and a restage pulls the tag again. Pushed with bits,
+    // the app is a zip's again
+    let registry = Registry::start("robot", "p4ss");
+    let first = registry.push("private/hello", "1", &hello);
+    let image = format!("{}/private/hello:1", registry.address);
+    let output = cf.fails(&["push", "img", "--docker-image", &image]);
+    assert!(
+        output.contains("it is private: --docker-username"),
+        "{output}"
+    );
+    let mut push = cf.command(&[
+        "push",
+        "img",
+        "--docker-image",
+        &image,
+        "--docker-username",
+        "robot",
+    ]);
+    push.env("CF_DOCKER_PASSWORD", "p4ss");
+    let (ok, output) = cf.output(push, "");
+    assert!(ok, "{output}");
+    let (status, body) = get(&listen, "img.localhost", "/", None);
+    assert_eq!(status, 200, "{body}");
+    let shown = cf.ok(&["app", "img"]);
+    assert!(
+        shown.contains("docker image:") && shown.contains(&format!("{image}@{first}")),
+        "{shown}"
+    );
+    let (token, _) = cf.tokens();
+    let (_, _, packages) = http.get(&format!("{url}/v3/packages"), Some(&token));
+    assert!(
+        packages.contains(r#""password":"***""#) && !packages.contains("p4ss"),
+        "{packages}"
+    );
+    assert!(!cf.ok(&["logs", "img", "--recent"]).contains("p4ss"));
+    let served = || {
+        listing(&console)["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|app| app["hosts"] == json!(["img.localhost"]))
+            .map(|app| app["component"]["sha256"].as_str().unwrap().to_string())
+            .unwrap()
+    };
+    let (hello_sha256, variant_sha256) = (
+        sha256(&dir.join("app/hello.wasm")),
+        sha256(&dir.join("app2/hello.wasm")),
+    );
+    assert_eq!(served(), hello_sha256);
+    let second = registry.push("private/hello", "1", &variant(&hello));
+    let pulls = registry.pulls();
+    cf.ok(&["restart", "img"]);
+    assert_eq!(registry.pulls(), pulls, "a restart pulls nothing");
+    assert_eq!(served(), hello_sha256);
+    cf.ok(&["restage", "img"]);
+    assert_eq!(served(), variant_sha256);
+    assert!(
+        cf.ok(&["app", "img"])
+            .contains(&format!("{image}@{second}"))
+    );
+    cf.ok(&["push", "img", "-p", dir.join("app").to_str().unwrap()]);
+    assert_eq!(served(), hello_sha256);
+    assert!(!cf.ok(&["app", "img"]).contains("docker image:"));
+
     // the cf-api restarted with an OpenID Provider and TLS of its own: its
     // state kept, the wicket's generation unchanged; the open mode's token
     // is no good any more, nor is a password
@@ -842,7 +925,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
     );
 
     // gone from the wicket; their instances stay, unbound
-    for app in ["hello", "counter", "relay"] {
+    for app in ["hello", "counter", "relay", "img"] {
         cf.ok(&["delete", app, "-r", "-f"]);
     }
     assert!(listing(&console)["apps"].as_array().unwrap().is_empty());

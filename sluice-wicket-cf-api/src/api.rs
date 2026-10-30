@@ -31,22 +31,26 @@ use crate::env;
 use crate::logs::{self, Logs};
 use crate::manifest;
 use crate::oidc::Provider;
+use crate::registry::{Reference, Registry};
 use crate::services;
 use crate::staging;
 use crate::store::{
-    BUDGET_ANNOTATION, Build, Deployment, Droplet, INSTANCES_ANNOTATION, JobError, Package,
-    Running, State, Store, epoch_secs, guid, now,
+    BUDGET_ANNOTATION, Build, Deployment, DockerImage, INSTANCES_ANNOTATION, JobError, Lifecycle,
+    Package, Running, State, Store, epoch_secs, guid, now,
 };
 use crate::uaa::{self, Uaa};
 use crate::views;
 use crate::wicket::Failure;
 
-/// Largest package upload.
-const MAX_UPLOAD_BYTES: usize = 160 << 20;
+/// Largest package upload, and component pulled.
+pub(crate) const MAX_UPLOAD_BYTES: usize = 160 << 20;
 /// Largest body of any other request.
 const MAX_BODY_BYTES: usize = 1 << 20;
 /// Connections open at once.
 const MAX_CONNECTIONS: usize = 64;
+/// How long a build's request waits for its staging: a longer pull goes on,
+/// the CLI polling the build (every 3s).
+const STAGING_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub(crate) type Response = hyper::Response<Full<Bytes>>;
 pub(crate) type Reply = Result<Response, ApiError>;
@@ -60,6 +64,8 @@ pub struct Api {
     pub tls: bool,
     pub logs: Arc<Logs>,
     pub controller: Arc<Controller>,
+    /// Where docker packages' images are pulled from.
+    pub registry: Registry,
     /// What `/v3/info` names as the build.
     pub build: String,
 }
@@ -858,7 +864,7 @@ impl Api {
                 }),
                 None,
             ),
-            (&Method::POST, ["builds"]) => self.create_build(req),
+            (&Method::POST, ["builds"]) => self.create_build(req).await,
             (&Method::GET, ["builds", guid]) => store
                 .read(|state| {
                     state
@@ -1221,14 +1227,7 @@ impl Api {
                 ));
             }
         };
-        if body["lifecycle"]["type"]
-            .as_str()
-            .is_some_and(|kind| kind == "docker")
-        {
-            return Err(ApiError::unprocessable(
-                "docker images are not supported: push a directory or a zip holding the component",
-            ));
-        }
+        let lifecycle = lifecycle(&body)?;
         let _edit = self.controller.edits.lock().await;
         let view = self.store.update(|state| {
             if state.app_named(name).is_some() {
@@ -1242,6 +1241,7 @@ impl Api {
             let guid = state.create_app(name).guid.clone();
             let app = state.app_mut(&guid).expect("just created");
             app.env = env;
+            app.lifecycle = lifecycle.unwrap_or_default();
             apply_metadata(app, &body["metadata"])?;
             if let Some(buildpacks) = body["lifecycle"]["data"]["buildpacks"].as_array() {
                 app.buildpacks = buildpacks
@@ -1261,6 +1261,7 @@ impl Api {
 
     async fn patch_app(&self, req: &Req, guid: &str) -> Reply {
         let body: Value = req.json()?;
+        let lifecycle = lifecycle(&body)?;
         self.app(guid)?;
         let _edit = self.controller.edits.lock().await;
         let view = self.store.update(|state| {
@@ -1279,11 +1280,8 @@ impl Api {
             if let Some(name) = body["name"].as_str() {
                 app.name = name.to_string();
             }
-            if body["lifecycle"]["type"]
-                .as_str()
-                .is_some_and(|kind| kind == "docker")
-            {
-                return Err(ApiError::unprocessable("docker images are not supported"));
+            if let Some(lifecycle) = lifecycle {
+                app.lifecycle = lifecycle;
             }
             if let Some(buildpacks) = body["lifecycle"]["data"]["buildpacks"].as_array() {
                 app.buildpacks = buildpacks
@@ -1523,31 +1521,51 @@ impl Api {
 
     // --- packages, builds
 
+    /// A bits package awaits its upload; a docker one, its image and the
+    /// credentials it is pulled with, is ready at once: the app's older
+    /// packages go.
     fn create_package(&self, req: &Req) -> Reply {
         let body: Value = req.json()?;
-        if body["type"].as_str() == Some("docker") {
-            return Err(ApiError::unprocessable(
-                "docker images are not supported: push a directory or a zip holding the component",
-            ));
-        }
+        let docker = match body["type"].as_str().unwrap_or("bits") {
+            "bits" => None,
+            "docker" => Some(docker_image(&body["data"])?),
+            other => {
+                return Err(ApiError::unprocessable(format!(
+                    "a package is of the type bits or docker, not {other}"
+                )));
+            }
+        };
         let app = body["relationships"]["app"]["data"]["guid"]
             .as_str()
             .ok_or_else(|| ApiError::unprocessable("relationships.app names the app"))?;
         self.app(app)?;
-        let view = self.store.update(|state| {
+        let image = docker.as_ref().map(|docker| docker.image.clone());
+        let (view, blobs) = self.store.update(|state| {
             let at = now();
+            let ready = docker.is_some();
             let package = Package {
                 guid: guid(),
                 app: app.to_string(),
-                state: "AWAITING_UPLOAD".into(),
+                state: if ready { "READY" } else { "AWAITING_UPLOAD" }.into(),
                 sha256: None,
+                docker,
                 created_at: at.clone(),
                 updated_at: at,
             };
             let view = views::package(&req.base, &package);
             state.packages.push(package);
-            view
+            let blobs = if ready {
+                state.keep_newest_package(app)
+            } else {
+                Vec::new()
+            };
+            (view, blobs)
         });
+        self.store.delete(&blobs);
+        if let Some(image) = image {
+            self.logs
+                .add(app, "API", format!("Created a docker package of {image}"));
+        }
         Ok(json(StatusCode::CREATED, &view))
     }
 
@@ -1557,6 +1575,11 @@ impl Api {
             .store
             .read(|state| state.package(guid).cloned())
             .ok_or_else(|| ApiError::not_found("Package"))?;
+        if package.docker.is_some() {
+            return Err(ApiError::unprocessable(
+                "a docker package takes no upload: its image is pulled at staging",
+            ));
+        }
         let content_type = req.header(header::CONTENT_TYPE).unwrap_or_default();
         let parts =
             crate::multipart::parts(content_type, &req.body).map_err(ApiError::bad_request)?;
@@ -1565,13 +1588,7 @@ impl Api {
             .find(|part| part.name == "bits")
             .ok_or_else(|| ApiError::bad_request("the upload has no 'bits' part"))?;
         self.store.write_package(guid, bits.body)?;
-        let sha256: String = {
-            use sha2::Digest as _;
-            sha2::Sha256::digest(bits.body)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect()
-        };
+        let sha256 = staging::sha256(bits.body);
         let (view, blobs) = self.store.update(|state| {
             let blobs = state.keep_newest_package(&package.app);
             let package = state
@@ -1593,8 +1610,10 @@ impl Api {
         Ok(json(StatusCode::OK, &view))
     }
 
-    /// Stages the package at once: the droplet is the component picked.
-    fn create_build(&self, req: &Req) -> Reply {
+    /// Stages the package: the droplet is the component picked from its zip
+    /// or pulled from its image (`staging::run`). Answered once staged, or
+    /// STAGING after [`STAGING_WAIT`], the staging going on.
+    async fn create_build(&self, req: &Req) -> Reply {
         let body: Value = req.json()?;
         let package_guid = body["package"]["guid"]
             .as_str()
@@ -1609,63 +1628,62 @@ impl Api {
                 "Only packages with state READY can be staged.",
             ));
         }
-        self.logs.add(&app.guid, "STG", "Staging with the wasm lifecycle: the web process command names the component, else the package's only .wasm");
-        let staged = std::fs::read(self.store.package_path(package_guid))
-            .map_err(|e| format!("the package is gone: {e}"))
-            .and_then(|zip| staging::stage(&zip, app.process.command.as_deref()));
+        let lifecycle = if package.docker.is_some() {
+            Lifecycle::Docker
+        } else {
+            Lifecycle::Buildpack
+        };
         let at = now();
-        let mut build = Build {
+        let build = Build {
             guid: guid(),
             app: app.guid.clone(),
             package: package_guid.to_string(),
-            state: "STAGED".into(),
+            state: "STAGING".into(),
+            lifecycle,
             error: None,
             droplet: None,
             created_at: at.clone(),
-            updated_at: at.clone(),
+            updated_at: at,
         };
-        match staged {
-            Ok(staged) => {
-                self.store.write_droplet(&staged.sha256, &staged.bytes)?;
-                let droplet = Droplet {
-                    guid: guid(),
-                    app: app.guid.clone(),
-                    package: package_guid.to_string(),
-                    sha256: staged.sha256.clone(),
-                    file: staged.entry.clone(),
-                    bytes: staged.bytes.len() as u64,
-                    created_at: at.clone(),
-                    updated_at: at,
-                };
-                self.logs.add(
-                    &app.guid,
-                    "STG",
-                    format!(
-                        "Staged {} ({} bytes, sha256 {})",
-                        staged.entry,
-                        staged.bytes.len(),
-                        &staged.sha256[..12]
-                    ),
-                );
-                build.droplet = Some(droplet.guid.clone());
-                self.store.update(|state| state.droplets.push(droplet));
+        let guid = build.guid.clone();
+        // the app is what it was staged as last
+        self.store.update(|state| {
+            if let Some(app) = state.app_mut(&build.app) {
+                app.lifecycle = lifecycle;
             }
-            Err(e) => {
-                self.logs
-                    .add(&app.guid, "STG", format!("Staging failed: {e}"));
-                build.state = "FAILED".into();
-                build.error = Some(format!("StagingError - {e}"));
-            }
-        }
-        let view = self.store.update(|state| {
-            let view = views::build(&req.base, state, &build);
             state.builds.push(build);
             if state.builds.len() > 1000 {
                 state.builds.remove(0);
             }
-            view
         });
-        Ok(json(StatusCode::CREATED, &view))
+        let staging = tokio::spawn({
+            let (store, logs, registry) =
+                (self.store.clone(), self.logs.clone(), self.registry.clone());
+            let (guid, command) = (guid.clone(), app.process.command.clone());
+            async move {
+                staging::run(
+                    &store,
+                    &logs,
+                    &registry,
+                    &guid,
+                    &package,
+                    command.as_deref(),
+                )
+                .await;
+            }
+        });
+        // past the wait, the staging goes on: the CLI polls the build
+        let _ = tokio::time::timeout(STAGING_WAIT, staging).await;
+        self.store
+            .read(|state| {
+                state
+                    .build(&guid)
+                    .map(|build| views::build(&req.base, state, build))
+            })
+            .map_or_else(
+                || Err(ApiError::not_found("Build")),
+                |build| Ok(json(StatusCode::CREATED, &build)),
+            )
     }
 
     // --- routes
@@ -1944,9 +1962,47 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
     })
 }
 
-/// The feature flags the CLI asks for: none enabled.
+/// The lifecycle a body's `lifecycle.type` names: an app is a zip's
+/// (`buildpack`) or an image's (`docker`).
+fn lifecycle(body: &Value) -> Result<Option<Lifecycle>, ApiError> {
+    match body["lifecycle"]["type"].as_str() {
+        None => Ok(None),
+        Some("buildpack") => Ok(Some(Lifecycle::Buildpack)),
+        Some("docker") => Ok(Some(Lifecycle::Docker)),
+        Some(other) => Err(ApiError::unprocessable(format!(
+            "the {other} lifecycle is not supported: buildpack (a zip holding the component) or docker (an image)"
+        ))),
+    }
+}
+
+/// A docker package's `data`: the image, and the credentials of a private
+/// one (`--docker-username`, with `CF_DOCKER_PASSWORD`).
+fn docker_image(data: &Value) -> Result<DockerImage, ApiError> {
+    let text = |key: &str| {
+        data[key]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(String::from)
+    };
+    let image =
+        text("image").ok_or_else(|| ApiError::unprocessable("data.image names the image"))?;
+    Reference::parse(&image)?;
+    let (username, password) = (text("username"), text("password"));
+    if username.is_some() != password.is_some() {
+        return Err(ApiError::unprocessable(
+            "data.username and data.password go together: --docker-username, with CF_DOCKER_PASSWORD",
+        ));
+    }
+    Ok(DockerImage {
+        image,
+        username,
+        password,
+    })
+}
+
+/// The feature flags the CLI asks for: docker images, no sharing.
 fn feature_flag(name: &str) -> Value {
-    json!({"name": name, "enabled": false, "updated_at": null, "custom_error_message": null, "links": {}})
+    json!({"name": name, "enabled": name == "diego_docker", "updated_at": null, "custom_error_message": null, "links": {}})
 }
 
 /// Merges `metadata` (labels and annotations; a null value removes the

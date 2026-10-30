@@ -4,7 +4,8 @@
 //! and their bindings. In memory, written by a rename to `state.json` in the
 //! data directory on every change; the blobs next to it
 //! (`packages/<guid>.zip`, `droplets/<sha256>.wasm`). Every file is its
-//! owner's only (0600): the state holds the apps' environment.
+//! owner's only (0600): the state holds the apps' environment and the
+//! credentials of their images.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -73,6 +74,9 @@ pub struct App {
     pub started: bool,
     pub created_at: String,
     pub updated_at: String,
+    /// What the app was last pushed or staged as: `docker` an image's.
+    #[serde(default)]
+    pub lifecycle: Lifecycle,
     pub buildpacks: Vec<String>,
     pub stack: String,
     pub labels: BTreeMap<String, String>,
@@ -86,6 +90,17 @@ pub struct App {
     /// What the wicket serves since the last start, restart or deployment:
     /// the snapshot taken then.
     pub running: Option<Running>,
+}
+
+/// An app's lifecycle, as CC names it: a droplet is a component either way.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Lifecycle {
+    /// A zip holding the component.
+    #[default]
+    Buildpack,
+    /// An OCI image holding it.
+    Docker,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -206,8 +221,37 @@ pub struct Package {
     /// `AWAITING_UPLOAD`, `READY` or `FAILED`.
     pub state: String,
     pub sha256: Option<String>,
+    /// A docker package's image; None: the bits uploaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker: Option<DockerImage>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// The image of a docker package and the credentials it is pulled with: the
+/// password is for the pull only, shown nowhere.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct DockerImage {
+    pub image: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+impl DockerImage {
+    /// The username and the password, both given.
+    pub fn credentials(&self) -> Option<(&str, &str)> {
+        Some((self.username.as_deref()?, self.password.as_deref()?))
+    }
+}
+
+impl std::fmt::Debug for DockerImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DockerImage")
+            .field("image", &self.image)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .finish()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -215,8 +259,11 @@ pub struct Build {
     pub guid: String,
     pub app: String,
     pub package: String,
-    /// `STAGED` or `FAILED`.
+    /// `STAGING`, `STAGED` or `FAILED`.
     pub state: String,
+    /// The package's: `docker` for an image.
+    #[serde(default)]
+    pub lifecycle: Lifecycle,
     pub error: Option<String>,
     pub droplet: Option<String>,
     pub created_at: String,
@@ -229,9 +276,13 @@ pub struct Droplet {
     pub app: String,
     pub package: String,
     pub sha256: String,
-    /// The component's path in the package.
+    /// The component's path in the package; its file name for an image.
     pub file: String,
     pub bytes: u64,
+    /// The image it was pulled from, pinned to its manifest's digest; None
+    /// for a zip's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -409,6 +460,7 @@ impl State {
             started: false,
             created_at: at.clone(),
             updated_at: at.clone(),
+            lifecycle: Lifecycle::Buildpack,
             buildpacks: Vec::new(),
             stack: STACK.into(),
             labels: BTreeMap::new(),
@@ -564,6 +616,21 @@ impl State {
             .collect()
     }
 
+    /// Fails the builds a stop of the cf-api cut short: no staging outlives
+    /// it.
+    pub fn fail_unfinished_builds(&mut self) {
+        for build in self
+            .builds
+            .iter_mut()
+            .filter(|build| build.state == "STAGING")
+        {
+            build.state = "FAILED".into();
+            build.error =
+                Some("StagingError - cut short by a restart of the cf-api: stage again".into());
+            build.updated_at = now();
+        }
+    }
+
     /// Keeps the app's newest package only; the others are listed to delete.
     pub fn keep_newest_package(&mut self, app: &str) -> Vec<Blob> {
         let newest = self
@@ -612,6 +679,7 @@ impl Store {
                 let mut state: State = serde_json::from_slice(&json)
                     .map_err(|e| format!("{}: {e}", file.display()))?;
                 state.follow_domains(domains);
+                state.fail_unfinished_builds();
                 state
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::new(org, space, domains),
@@ -763,7 +831,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_current_droplet_keeps_the_previous_and_the_packages_the_newest() {
+    fn the_current_droplet_keeps_the_previous_the_packages_the_newest_and_no_build_outlives_a_restart()
+     {
         let mut state = State::new("o", "s", &["localhost".into()]);
         let app = state.create_app("hello").guid.clone();
         let droplet = |guid: &str, sha256: &str| Droplet {
@@ -773,6 +842,7 @@ mod tests {
             sha256: sha256.into(),
             file: "hello.wasm".into(),
             bytes: 1,
+            image: None,
             created_at: now(),
             updated_at: now(),
         };
@@ -791,12 +861,24 @@ mod tests {
             state.set_current_droplet(&app, "d4"),
             vec![Blob::Droplet("b".into())]
         );
-        for guid in ["p1", "p2"] {
+        // a zip, then an image whose password no debug output shows
+        for (guid, docker) in [
+            ("p1", None),
+            (
+                "p2",
+                Some(DockerImage {
+                    image: "ghcr.io/me/hello:1".into(),
+                    username: Some("me".into()),
+                    password: Some("p4ss".into()),
+                }),
+            ),
+        ] {
             state.packages.push(Package {
                 guid: guid.into(),
                 app: app.clone(),
                 state: "READY".into(),
                 sha256: None,
+                docker,
                 created_at: now(),
                 updated_at: now(),
             });
@@ -805,6 +887,28 @@ mod tests {
             state.keep_newest_package(&app),
             vec![Blob::Package("p1".into())]
         );
+        let shown = format!("{:?}", state.packages);
+        assert!(
+            shown.contains("\"***\"") && !shown.contains("p4ss"),
+            "{shown}"
+        );
+        // a staging cut short fails, a staged build stays
+        for (guid, staged) in [("b1", "STAGING"), ("b2", "STAGED")] {
+            state.builds.push(Build {
+                guid: guid.into(),
+                app: app.clone(),
+                package: "p2".into(),
+                state: staged.into(),
+                lifecycle: Lifecycle::Docker,
+                error: None,
+                droplet: None,
+                created_at: now(),
+                updated_at: now(),
+            });
+        }
+        state.fail_unfinished_builds();
+        let states: Vec<&str> = state.builds.iter().map(|b| b.state.as_str()).collect();
+        assert_eq!(states, ["FAILED", "STAGED"]);
         // its bindings go with it, another app's stay
         for (guid, bound) in [("b1", app.as_str()), ("b2", "other")] {
             state.bindings.push(Binding {

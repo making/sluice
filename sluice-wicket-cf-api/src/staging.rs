@@ -1,19 +1,128 @@
 //! A build: the package's zip is read and the component picked -- the one the
-//! web process command names, else the package's only `.wasm` -- and it must
-//! be a component (`\0asm`, layer 1). Anything else fails the build, naming
-//! what was found.
+//! web process command names, else the package's only `.wasm` -- or a docker
+//! package's image pulled (`crate::registry`), and it must be a component
+//! (`\0asm`, layer 1). Anything else fails the build, naming what was found.
+//! The droplet is the component, by its digest.
 
 use std::io::{Cursor, Read as _};
 
 use sha2::{Digest, Sha256};
 
+use crate::logs::Logs;
+use crate::registry::Registry;
+use crate::store::{Droplet, Package, Store, guid, now};
+
 /// The component a build picked.
 #[derive(Debug)]
 pub struct Staged {
-    /// Its path in the package.
+    /// Its path in the package; its file name for an image.
     pub entry: String,
     pub bytes: Vec<u8>,
     pub sha256: String,
+    /// The image it was pulled from, pinned to its digest.
+    pub image: Option<String>,
+}
+
+/// Stages the build `build` of `package` and records how it went: STAGED
+/// with its droplet, or FAILED naming why. A zip's component is the one
+/// `command` names, else its only `.wasm` ([`stage`]); an image's is pulled
+/// from its registry with the package's credentials, if any.
+pub async fn run(
+    store: &Store,
+    logs: &Logs,
+    registry: &Registry,
+    build: &str,
+    package: &Package,
+    command: Option<&str>,
+) {
+    let app = package.app.as_str();
+    let staged = match &package.docker {
+        None => {
+            logs.add(app, "STG", "Staging with the wasm lifecycle: the web process command names the component, else the package's only .wasm");
+            std::fs::read(store.package_path(&package.guid))
+                .map_err(|e| format!("the package is gone: {e}"))
+                .and_then(|zip| stage(&zip, command))
+        }
+        Some(docker) => {
+            let credentials = docker.credentials();
+            logs.add(
+                app,
+                "STG",
+                format!(
+                    "Staging with the wasm lifecycle: pulling {}{}",
+                    docker.image,
+                    if credentials.is_some() {
+                        " with the package's credentials"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+            registry
+                .pull(&docker.image, credentials)
+                .await
+                .map(|pulled| Staged {
+                    entry: pulled.file,
+                    bytes: pulled.bytes,
+                    sha256: pulled.sha256,
+                    image: Some(pulled.image),
+                })
+                .map_err(|e| format!("{}: {e}", docker.image))
+        }
+    };
+    let staged = staged.and_then(|staged| {
+        store
+            .write_droplet(&staged.sha256, &staged.bytes)
+            .map(|()| staged)
+    });
+    let at = now();
+    match staged {
+        Ok(staged) => {
+            logs.add(
+                app,
+                "STG",
+                format!(
+                    "Staged {} ({} bytes, sha256 {}){}",
+                    staged.entry,
+                    staged.bytes.len(),
+                    &staged.sha256[..12],
+                    staged
+                        .image
+                        .as_ref()
+                        .map_or(String::new(), |image| format!(" from {image}"))
+                ),
+            );
+            let droplet = Droplet {
+                guid: guid(),
+                app: app.to_string(),
+                package: package.guid.clone(),
+                sha256: staged.sha256,
+                file: staged.entry,
+                bytes: staged.bytes.len() as u64,
+                image: staged.image,
+                created_at: at.clone(),
+                updated_at: at.clone(),
+            };
+            store.update(|state| {
+                if let Some(staging) = state.builds.iter_mut().find(|kept| kept.guid == build) {
+                    staging.state = "STAGED".into();
+                    staging.droplet = Some(droplet.guid.clone());
+                    staging.updated_at = at;
+                }
+                state.droplets.push(droplet);
+            });
+        }
+        Err(e) => {
+            logs.add(app, "STG", format!("Staging failed: {e}"));
+            store.update(|state| {
+                if let Some(staging) = state.builds.iter_mut().find(|kept| kept.guid == build) {
+                    staging.state = "FAILED".into();
+                    staging.error = Some(format!("StagingError - {e}"));
+                    staging.updated_at = at;
+                }
+            });
+        }
+    }
 }
 
 /// Stages `package` (a zip) for the web process `command`.
@@ -64,20 +173,25 @@ pub fn stage(package: &[u8], command: Option<&str>) -> Result<Staged, String> {
         .and_then(|mut file| file.read_to_end(&mut bytes).map_err(Into::into))
         .map_err(|e| format!("cannot read {entry}: {e}"))?;
     check_component(&entry, &bytes)?;
-    let sha256 = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
     Ok(Staged {
+        sha256: sha256(&bytes),
         entry,
         bytes,
-        sha256,
+        image: None,
     })
+}
+
+/// The SHA-256 of `bytes`, in hex.
+pub fn sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// A wasm component: the magic, then the version and the layer (1; a core
 /// module is layer 0).
-fn check_component(entry: &str, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn check_component(entry: &str, bytes: &[u8]) -> Result<(), String> {
     match bytes {
         [0, b'a', b's', b'm', _, _, 1, 0, ..] => Ok(()),
         [0, b'a', b's', b'm', 1, 0, 0, 0, ..] => Err(format!(

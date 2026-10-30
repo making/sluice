@@ -5,8 +5,8 @@ use serde_json::{Value, json};
 
 use crate::controller::Controller;
 use crate::store::{
-    App, Build, Deployment, Droplet, Job, Named, Outcome, Package, Route, STACK, State, epoch_secs,
-    now,
+    App, Build, Deployment, Droplet, Job, Lifecycle, Named, Outcome, Package, Route, STACK, State,
+    epoch_secs, now,
 };
 
 /// The Cloud Controller version announced.
@@ -83,6 +83,16 @@ fn metadata(app: Option<&App>) -> Value {
     }
 }
 
+/// A lifecycle as CC shows it: a docker one holds no data.
+fn lifecycle(lifecycle: Lifecycle, buildpacks: &[String], stack: &str) -> Value {
+    match lifecycle {
+        Lifecycle::Buildpack => {
+            json!({"type": "buildpack", "data": {"buildpacks": buildpacks, "stack": stack}})
+        }
+        Lifecycle::Docker => json!({"type": "docker", "data": {}}),
+    }
+}
+
 fn rel(guid: Option<&str>) -> Value {
     match guid {
         Some(guid) => json!({"data": {"guid": guid}}),
@@ -152,7 +162,7 @@ pub fn app(base: &str, state: &State, app: &App) -> Value {
         "guid": guid, "created_at": app.created_at, "updated_at": app.updated_at,
         "name": app.name,
         "state": if app.started { "STARTED" } else { "STOPPED" },
-        "lifecycle": {"type": "buildpack", "data": {"buildpacks": app.buildpacks, "stack": app.stack}},
+        "lifecycle": lifecycle(app.lifecycle, &app.buildpacks, &app.stack),
         "relationships": {"space": rel(Some(&state.space.guid))},
         "metadata": metadata(Some(app)),
         "links": {
@@ -269,20 +279,39 @@ pub fn destinations(route: &Route) -> Vec<Value> {
     }
 }
 
+/// A package; a docker one's password as `***`, as CC shows it.
 pub fn package(base: &str, package: &Package) -> Value {
+    let mut links = json!({
+        "self": {"href": format!("{base}/v3/packages/{}", package.guid)},
+        "app": {"href": format!("{base}/v3/apps/{}", package.app)},
+    });
+    let (kind, data) = match &package.docker {
+        Some(docker) => (
+            "docker",
+            json!({
+                "image": docker.image,
+                "username": docker.username,
+                "password": docker.password.as_ref().map(|_| "***"),
+            }),
+        ),
+        None => {
+            links["upload"] = json!({"href": format!("{base}/v3/packages/{}/upload", package.guid), "method": "POST"});
+            links["download"] =
+                json!({"href": format!("{base}/v3/packages/{}/download", package.guid)});
+            (
+                "bits",
+                json!({"error": null, "checksum": {"type": "sha256", "value": package.sha256}}),
+            )
+        }
+    };
     json!({
         "guid": package.guid, "created_at": package.created_at, "updated_at": package.updated_at,
-        "type": "bits",
-        "data": {"error": null, "checksum": {"type": "sha256", "value": package.sha256}},
+        "type": kind,
+        "data": data,
         "state": package.state,
         "relationships": {"app": rel(Some(&package.app))},
         "metadata": metadata(None),
-        "links": {
-            "self": {"href": format!("{base}/v3/packages/{}", package.guid)},
-            "upload": {"href": format!("{base}/v3/packages/{}/upload", package.guid), "method": "POST"},
-            "download": {"href": format!("{base}/v3/packages/{}/download", package.guid)},
-            "app": {"href": format!("{base}/v3/apps/{}", package.app)},
-        },
+        "links": links,
     })
 }
 
@@ -295,10 +324,11 @@ pub fn build(base: &str, state: &State, build: &Build) -> Value {
         "staging_memory_in_mb": 1024, "staging_disk_in_mb": 1024,
         "staging_log_rate_limit_bytes_per_second": -1,
         "error": build.error,
-        "lifecycle": {"type": "buildpack", "data": {
-            "buildpacks": app.map_or(Vec::new(), |app| app.buildpacks.clone()),
-            "stack": app.map_or(STACK.to_string(), |app| app.stack.clone()),
-        }},
+        "lifecycle": lifecycle(
+            build.lifecycle,
+            app.map_or(&[][..], |app| &app.buildpacks),
+            app.map_or(STACK, |app| &app.stack),
+        ),
         "package": {"guid": build.package},
         "droplet": build.droplet.as_ref().map(|guid| json!({"guid": guid})),
         "relationships": {"app": rel(Some(&build.app))},
@@ -310,16 +340,26 @@ pub fn build(base: &str, state: &State, build: &Build) -> Value {
     })
 }
 
+/// A droplet: an image's shows the image, pinned to its digest (what `cf
+/// app` shows of a docker app), and no buildpack.
 pub fn droplet(base: &str, droplet: &Droplet) -> Value {
+    let (kind, buildpacks, stack) = match droplet.image {
+        Some(_) => ("docker", json!([]), Value::Null),
+        None => (
+            "buildpack",
+            json!([{"name": "wasm", "detect_output": "wasm", "buildpack_name": "wasm", "version": "0.0.1"}]),
+            json!(STACK),
+        ),
+    };
     json!({
         "guid": droplet.guid, "created_at": droplet.created_at, "updated_at": droplet.updated_at,
         "state": "STAGED", "error": null,
-        "lifecycle": {"type": "buildpack", "data": {}},
+        "lifecycle": {"type": kind, "data": {}},
         "execution_metadata": "",
         "process_types": {"web": droplet.file},
         "checksum": {"type": "sha256", "value": droplet.sha256},
-        "buildpacks": [{"name": "wasm", "detect_output": "wasm", "buildpack_name": "wasm", "version": "0.0.1"}],
-        "stack": STACK, "image": null,
+        "buildpacks": buildpacks,
+        "stack": stack, "image": droplet.image,
         "relationships": {"app": rel(Some(&droplet.app))},
         "metadata": metadata(None),
         "links": {
@@ -391,13 +431,35 @@ pub fn environment_variables(base: &str, app: &App) -> Value {
     })
 }
 
-/// The app's manifest, as `cf create-app-manifest` writes it.
+/// The app's manifest, as `cf create-app-manifest` writes it: a docker
+/// app's names the image of its newest package (and its username), and no
+/// stack.
 pub fn manifest(state: &State, app: &App) -> String {
+    // a JSON string is a YAML scalar
+    let quoted = |text: &str| serde_json::to_string(text).expect("a string");
     let mut text = format!("---\napplications:\n- name: {}\n", app.name);
     text.push_str(&format!(
-        "  instances: {}\n  memory: {}M\n  disk_quota: {}M\n  stack: {}\n",
-        app.process.instances, app.process.memory_mb, app.process.disk_mb, app.stack
+        "  instances: {}\n  memory: {}M\n  disk_quota: {}M\n",
+        app.process.instances, app.process.memory_mb, app.process.disk_mb
     ));
+    let image = state
+        .packages
+        .iter()
+        .rev()
+        .filter(|package| package.app == app.guid)
+        .find_map(|package| package.docker.as_ref());
+    match (app.lifecycle, image) {
+        (Lifecycle::Docker, Some(docker)) => {
+            text.push_str(&format!(
+                "  docker:\n    image: {}\n",
+                quoted(&docker.image)
+            ));
+            if let Some(username) = &docker.username {
+                text.push_str(&format!("    username: {}\n", quoted(username)));
+            }
+        }
+        _ => text.push_str(&format!("  stack: {}\n", app.stack)),
+    }
     if let Some(command) = &app.process.command {
         text.push_str(&format!("  command: {command}\n"));
     }
@@ -411,8 +473,6 @@ pub fn manifest(state: &State, app: &App) -> String {
         text.push_str("  routes:\n");
         text.extend(routes);
     }
-    // a JSON string is a YAML scalar
-    let quoted = |text: &str| serde_json::to_string(text).expect("a string");
     let services: Vec<String> = state
         .bindings_of(&app.guid)
         .filter_map(|binding| {

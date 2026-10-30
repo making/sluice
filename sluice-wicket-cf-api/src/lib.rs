@@ -2,9 +2,10 @@
 //! deploys wasm components through -- the subset of the Cloud Controller v3
 //! API, the UAA token endpoints and log-cache's read API it uses -- keeping
 //! the desired state of its apps and having one wicket serve them through
-//! the wicket's app API; the wicket's keyvalue stores and capabilities are
-//! its services. With a flume, the apps' output and requests reach their
-//! logs from the live access log the wicket feeds (`flume`).
+//! the wicket's app API; a component comes in a zip or from an OCI registry
+//! (`registry`), and the wicket's keyvalue stores and capabilities are its
+//! services. With a flume, the apps' output and requests reach their logs
+//! from the live access log the wicket feeds (`flume`).
 //!
 //! ```text
 //! cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> sluice-wicket-wasi
@@ -22,6 +23,7 @@ pub mod manifest;
 mod multipart;
 /// The OpenID Provider client, shared with the wicket's console.
 pub use sluice_oidc as oidc;
+pub mod registry;
 pub mod services;
 pub mod staging;
 pub mod store;
@@ -209,6 +211,7 @@ pub async fn serve(
         tls: acceptor.is_some(),
         logs,
         controller: controller.clone(),
+        registry: registry::Registry::new()?,
         build: describe_build(),
     });
     let watch = tokio::spawn(controller.watch());

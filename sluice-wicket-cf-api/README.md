@@ -4,7 +4,8 @@ A Cloud Foundry API facade for one [sluice-wicket-wasi](../sluice-wicket-wasi/RE
 subset of the Cloud Controller v3 API, the UAA token endpoints and log-cache's read API the
 stock `cf` CLI uses, on one origin. It keeps the desired state of its apps and has the wicket
 serve them through the wicket's [app API](../sluice-wicket-wasi/README.md#apps), so a wasm
-component is deployed with `cf push`, and routes, scaling, rolling updates, stop and start,
+component is deployed with `cf push` (its bits, or an image in an OCI registry:
+`--docker-image`), and routes, scaling, rolling updates, stop and start,
 services (the wicket's keyvalue stores and capabilities) and `cf logs` work as the CLI expects.
 Users log in through an OpenID Provider (`cf login --sso`; see [Login](#login)), or, on the
 loopback, with any credentials.
@@ -43,6 +44,8 @@ target/release/sluice-wicket-cf-api --wicket http://127.0.0.1:9090 --wicket-toke
 cf login -a http://127.0.0.1:9091 -u me -p x   # any credentials: no --oidc-issuer (see Login)
 cf push hello -p hello/                        # hello/ holds hello.wasm (a wasi:http 0.3 component)
 curl http://hello.localhost:8080/              # the wicket's --listen; *.localhost is the loopback
+wkg oci push ghcr.io/me/hello:1 hello.wasm     # or: oras push ghcr.io/me/hello:1 hello.wasm:application/wasm
+cf push img --docker-image ghcr.io/me/hello:1  # private: --docker-username me, with CF_DOCKER_PASSWORD
 cf map-route hello localhost --hostname hi
 cf scale hello -i 2
 cf push hello -p hello/ --strategy rolling     # swapped in place
@@ -255,8 +258,9 @@ another OpenID Provider and the like.
 | route `<host>.<domain>` | a host: labels of `a-z`, `0-9` and `-`. No path, port or wildcard (422). A route serves one app: a second destination is refused; zero-downtime updates are `--strategy rolling` |
 | shared domain | `--domain` |
 | package (bits) | the uploaded zip: `cf push` takes a directory or a zip (`-p hello.wasm` fails in the CLI: `not a valid zip file`) |
-| build | picks the component: the one the web process command names (`-c hello.wasm`, `command:`), else the package's only `.wasm`; it must be a component (`\0asm`, layer 1). Anything else fails the build, naming what it found |
-| droplet | that component, by sha256 (`process_types.web` its path; stack `wasip3`, buildpack `wasm`) |
+| package (docker) | an image (`cf push --docker-image`, a manifest's `docker.image`) holding the component as one `application/wasm` layer, as `wkg oci push` and `oras push <ref> hello.wasm:application/wasm` push it (of an index, its `wasm` entry). `--docker-username` with `CF_DOCKER_PASSWORD` are its credentials |
+| build | picks the component: the one the web process command names (`-c hello.wasm`, `command:`), else the package's only `.wasm`; of an image, pulls it. It must be a component (`\0asm`, layer 1). Anything else fails the build, naming what it found |
+| droplet | that component, by sha256 (`process_types.web` its path; stack `wasip3`, buildpack `wasm`); of an image, the image by digest (`cf app`: `docker image:`), `process_types.web` the repository's last segment `.wasm` |
 | web process `instances` | `pool`: warm instances. A request beyond them gets an instance of its own, as on every route: 0 still serves |
 | web process `memory` | `memory-mib` |
 | annotations `wicket.sluice.ik.am/budget-ms`, `wicket.sluice.ik.am/instances` | `budget-ms`, `instances` (the route's cap; below `pool` the wicket refuses) |
@@ -285,6 +289,15 @@ another OpenID Provider and the like.
   the wicket's listing, which names the variables only: the app carries a tag drawn at each
   start, which the cf-api compares instead. The data directory's files are its owner's only
   (0600): `state.json` holds the values
+- images (`--docker-image`): staging pulls the tag and pins it to its manifest's digest, kept
+  with the droplet: a restart serves the staged component after the tag moved, a restage
+  pulls the tag again. A registry on the loopback is reached over plain HTTP, any other over
+  HTTPS (the webPKI roots); asked to authenticate, a pull gets a token from the registry's
+  realm, anonymous or with the credentials, or answers a basic challenge with them. The
+  password is in no answer (`***` in the package) and no log; `state.json` holds it. The
+  wicket gets the component as from a zip: it never reaches the registry. An app is an
+  image's after a push of one, a zip's after a push of bits. A build the cf-api's restart cut
+  short fails: restage
 - an edit the wicket answers at once (map-route, unmap-route, scale -i, a manifest's routes)
   is refused with 422 and the wicket's reason, and changes nothing; a start, restart or
   deployment is accepted, and its outcome shows in the process stats and the log (`cf logs`)
@@ -372,9 +385,10 @@ config.
 
 ## Limits
 
-Refused with why (422): route paths, ports and wildcards, private and internal domains, docker
-images, tasks, ssh, sidecars, process types but `web`, route services, environment variable
-groups, user-provided services, service keys. One owner (`cf`) per wicket: two cf-apis must not
+Refused with why (422): route paths, ports and wildcards, private and internal domains, tasks,
+ssh, sidecars, process types but `web`, route services, environment variable groups,
+user-provided services, service keys. Images hold a wasm component, not a container: any other
+fails the build. A registry's own CA is not taken: HTTPS verifies against the webPKI roots. One owner (`cf`) per wicket: two cf-apis must not
 share one. No roles: whoever may log in may do everything.
 
 The integration test (`tests/cli.rs`) runs the OSS CLI -- `SLUICE_CF_CLI`, else `cf8` on the
@@ -382,7 +396,7 @@ PATH, never a `cf` that may be the Tanzu one -- against the cf-api and a wicket 
 on a flume, building the wicket and its example guests from `../sluice-wicket-wasi` and the
 flume from `../sluice-flume` (or taking `SLUICE_WICKET_WASI`, `SLUICE_WICKET_GUESTS` and
 `SLUICE_FLUME`); the login through a provider runs against a mock of one in the test, with TLS
-of the cf-api's own:
+of the cf-api's own, and the images against a registry in the test (`tests/registry`):
 
 ```text
 gh release download v8.19.0 -R cloudfoundry/cli -p 'cf8-cli_8.19.0_macosarm.tgz'

@@ -1,8 +1,10 @@
 //! The manifest `cf push` applies (`POST /v3/spaces/:guid/actions/apply_manifest`,
 //! and `manifest_diff` before it with a manifest file): the apps, their web
 //! process, routes, service bindings, environment variables and metadata
-//! are applied server side, as on CF. What the wicket cannot serve is
-//! refused, naming it.
+//! are applied server side, as on CF, and the lifecycle: `docker` with an
+//! image (`docker.image`, which `--docker-image` sets), else `buildpack` --
+//! the CLI uploads the bits of an app it reads as no docker one. What the
+//! wicket cannot serve is refused, naming it.
 
 use std::collections::BTreeMap;
 
@@ -10,7 +12,7 @@ use serde::Deserialize;
 use serde::de::IgnoredAny;
 
 use crate::services::{self, Unbound};
-use crate::store::{BUDGET_ANNOTATION, INSTANCES_ANNOTATION, State, now};
+use crate::store::{BUDGET_ANNOTATION, INSTANCES_ANNOTATION, Lifecycle, State, now};
 
 #[derive(Deserialize, Debug, Default)]
 pub struct Manifest {
@@ -40,10 +42,18 @@ pub struct AppManifest {
     pub timeout: Option<u64>,
     pub env: Option<BTreeMap<String, Option<Scalar>>>,
     pub services: Option<Vec<ServiceManifest>>,
-    pub docker: Option<IgnoredAny>,
+    pub docker: Option<DockerManifest>,
     pub sidecars: Option<IgnoredAny>,
     pub processes: Option<Vec<ProcessManifest>>,
     pub metadata: Option<Metadata>,
+}
+
+/// The image of a docker app; the package the CLI creates carries it, with
+/// the password.
+#[derive(Deserialize, Debug, Default)]
+pub struct DockerManifest {
+    pub image: Option<String>,
+    pub username: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -126,11 +136,6 @@ fn apply_app(state: &mut State, spec: &AppManifest) -> Result<String, String> {
     if name.is_empty() {
         return Err("an application needs a name".into());
     }
-    if spec.docker.is_some() {
-        return Err(format!(
-            "{name}: docker images are not supported: push a directory or a zip holding the component"
-        ));
-    }
     if spec.sidecars.is_some() {
         return Err(format!("{name}: sidecars are not supported"));
     }
@@ -149,6 +154,15 @@ fn apply_app(state: &mut State, spec: &AppManifest) -> Result<String, String> {
         None => state.create_app(name).guid.clone(),
     };
     let app = state.app_mut(&guid).expect("just found or created");
+    // the CLI reads this back: a docker app's bits it does not gather
+    app.lifecycle = match spec
+        .docker
+        .as_ref()
+        .and_then(|docker| docker.image.as_deref())
+    {
+        Some(image) if !image.trim().is_empty() => Lifecycle::Docker,
+        _ => Lifecycle::Buildpack,
+    };
     if let Some(buildpacks) = &spec.buildpacks {
         app.buildpacks = buildpacks.clone();
     } else if let Some(buildpack) = &spec.buildpack {
@@ -457,7 +471,7 @@ pub fn check_annotations(annotations: &BTreeMap<String, String>) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Instance;
+    use crate::store::{DockerImage, Instance, Package};
     use serde_json::json;
 
     fn state() -> State {
@@ -612,6 +626,42 @@ mod tests {
             made(&state),
             "the manifest written binds the same"
         );
+
+        // an image makes a docker app, a manifest without one a zip's again
+        // (the CLI uploads the bits then); the manifest written names the
+        // image of its newest package, the password never
+        let docker = "applications:\n- name: img\n  docker:\n    image: ghcr.io/me/hello:1\n";
+        let img = apply(&mut state, &parse(docker).unwrap()).unwrap()[0].clone();
+        assert_eq!(state.app(&img).unwrap().lifecycle, Lifecycle::Docker);
+        state.packages.push(Package {
+            guid: "p".into(),
+            app: img.clone(),
+            state: "READY".into(),
+            sha256: None,
+            docker: Some(DockerImage {
+                image: "ghcr.io/me/hello:1".into(),
+                username: Some("me".into()),
+                password: Some("p4ss".into()),
+            }),
+            created_at: now(),
+            updated_at: now(),
+        });
+        let written = crate::views::manifest(&state, state.app(&img).unwrap());
+        assert!(
+            written
+                .contains("  docker:\n    image: \"ghcr.io/me/hello:1\"\n    username: \"me\"\n")
+                && !written.contains("stack:")
+                && !written.contains("p4ss"),
+            "{written}"
+        );
+        apply(
+            &mut state,
+            &parse("applications:\n- name: img\n  path: /x\n").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state.app(&img).unwrap().lifecycle, Lifecycle::Buildpack);
+        apply(&mut state, &parse(&written).unwrap()).unwrap();
+        assert_eq!(state.app(&img).unwrap().lifecycle, Lifecycle::Docker);
     }
 
     #[test]
@@ -628,7 +678,6 @@ mod tests {
             let manifest = parse(text).unwrap();
             apply(&mut state, &manifest).unwrap_err()
         };
-        assert!(refused("applications:\n- name: a\n  docker:\n    image: x\n").contains("docker"));
         assert!(
             refused("applications:\n- name: a\n  env:\n    VCAP_SERVICES: v\n")
                 .contains("a: environment variable \"VCAP_SERVICES\": cannot start with VCAP_")
