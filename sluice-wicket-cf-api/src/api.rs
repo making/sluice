@@ -2,7 +2,8 @@
 //! uses, the UAA endpoints (`/uaa`) and log-cache's read API (`/api/v1`) on
 //! one origin, in CC's shapes (an error is `{"errors": [{"code", "title",
 //! "detail"}]}`). Every request but the root document, `/v3/info` and the
-//! UAA endpoints needs a token of [`Uaa`].
+//! UAA endpoints needs a token of [`Uaa`]; with a [`Provider`], the browser
+//! pages `/uaa/passcode` and `/uaa/callback` of `cf login --sso`.
 //!
 //! Routes and `instances` apply at once: an edit the wicket refuses is
 //! answered 422 with its reason and changes nothing. The droplet and the
@@ -29,6 +30,7 @@ use crate::controller::Controller;
 use crate::env;
 use crate::logs::{self, Logs};
 use crate::manifest;
+use crate::oidc::Provider;
 use crate::services;
 use crate::staging;
 use crate::store::{
@@ -52,6 +54,10 @@ pub(crate) type Reply = Result<Response, ApiError>;
 pub struct Api {
     pub store: Arc<Store>,
     pub uaa: Uaa,
+    /// The OpenID Provider users log in through; None: any credentials.
+    pub provider: Option<Provider>,
+    /// Whether the listener serves TLS: the scheme of the links.
+    pub tls: bool,
     pub logs: Arc<Logs>,
     pub controller: Arc<Controller>,
     /// What `/v3/info` names as the build.
@@ -189,8 +195,9 @@ impl Req {
     }
 }
 
-/// Serves the API on `listener` for good, [`MAX_CONNECTIONS`] at once.
-pub async fn run(listener: TcpListener, api: Arc<Api>) {
+/// Serves the API on `listener` for good, [`MAX_CONNECTIONS`] at once; with
+/// `tls`, each connection's handshake first.
+pub async fn run(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, api: Arc<Api>) {
     let open = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let permit = open.clone().acquire_owned().await.expect("never closed");
@@ -203,17 +210,31 @@ pub async fn run(listener: TcpListener, api: Arc<Api>) {
             }
         };
         let api = api.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
-            let service = hyper::service::service_fn(move |request| {
-                let api = api.clone();
-                async move { Ok::<_, Infallible>(api.handle(request).await) }
-            });
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service)
-                .await;
+            match tls {
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(stream) => serve_connection(stream, api).await,
+                    Err(e) => eprintln!("tls handshake failed: {e}"),
+                },
+                None => serve_connection(stream, api).await,
+            }
             drop(permit);
         });
     }
+}
+
+async fn serve_connection<S>(stream: S, api: Arc<Api>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = hyper::service::service_fn(move |request| {
+        let api = api.clone();
+        async move { Ok::<_, Infallible>(api.handle(request).await) }
+    });
+    let _ = hyper::server::conn::http1::Builder::new()
+        .serve_connection(TokioIo::new(stream), service)
+        .await;
 }
 
 impl Api {
@@ -241,13 +262,16 @@ impl Api {
             .and_then(|host| host.to_str().ok())
             .unwrap_or("127.0.0.1")
             .to_string();
-        let scheme = parts
+        let forwarded_https = parts
             .headers
             .get("x-forwarded-proto")
             .and_then(|proto| proto.to_str().ok())
-            .filter(|proto| *proto == "https")
-            .unwrap_or("http")
-            .to_string();
+            .is_some_and(|proto| proto == "https");
+        let scheme = if self.tls || forwarded_https {
+            "https"
+        } else {
+            "http"
+        };
         let req = Req {
             method: parts.method,
             query: form_urlencoded::parse(parts.uri.query().unwrap_or_default().as_bytes())
@@ -312,6 +336,89 @@ impl Api {
                 }
             }
             (&Method::GET, ["uaa", "token_keys"]) => Ok(json(StatusCode::OK, &json!({"keys": []}))),
+            (&Method::GET, ["uaa", "passcode"]) => {
+                let Some(provider) = &self.provider else {
+                    return Ok(page(
+                        StatusCode::NOT_FOUND,
+                        "No OpenID Provider",
+                        "<p>This API has no OpenID Provider configured: <code>cf login</code> takes any credentials.</p>".into(),
+                    ));
+                };
+                match provider.begin(&format!("{base}/uaa/callback")).await {
+                    Ok(location) => Ok(redirect(&location)),
+                    Err(e) => Ok(page(
+                        StatusCode::BAD_GATEWAY,
+                        "The provider is unreachable",
+                        format!("<p>{}</p>", escape(&e)),
+                    )),
+                }
+            }
+            (&Method::GET, ["uaa", "callback"]) => {
+                let Some(provider) = &self.provider else {
+                    return Err(ApiError::unknown(&req.method, &req.path));
+                };
+                if let Some(error) = req.q("error") {
+                    return Ok(page(
+                        StatusCode::BAD_REQUEST,
+                        "The provider refused the sign-in",
+                        format!(
+                            "<p>{}: {}</p>",
+                            escape(error),
+                            escape(req.q("error_description").unwrap_or("no reason given"))
+                        ),
+                    ));
+                }
+                let (Some(code), Some(state)) = (req.q("code"), req.q("state")) else {
+                    return Ok(page(
+                        StatusCode::BAD_REQUEST,
+                        "Not a callback",
+                        "<p>The provider sent no code and state: start again at <a href=\"passcode\">passcode</a>.</p>".into(),
+                    ));
+                };
+                match provider
+                    .finish(code, state, &format!("{base}/uaa/callback"))
+                    .await
+                {
+                    Ok(identity) => {
+                        let user = identity.user_name.clone();
+                        match self.uaa.passcode(identity) {
+                            Ok(passcode) => Ok(page(
+                                StatusCode::OK,
+                                "Temporary Authentication Code",
+                                format!(
+                                    "<p>Signed in as <b>{}</b>. Paste this code into <code>cf login --sso</code> (or <code>cf login --sso-passcode {passcode}</code>) within {} minutes; it works once.</p><p><code id=\"passcode\" class=\"big\">{passcode}</code></p>",
+                                    escape(&user),
+                                    uaa::PASSCODE_TTL.as_secs() / 60
+                                ),
+                            )),
+                            Err(e) => Ok(page(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "No code",
+                                format!("<p>{}</p>", escape(&e)),
+                            )),
+                        }
+                    }
+                    Err(e) => {
+                        let status = if e.starts_with("the claim ") {
+                            StatusCode::FORBIDDEN
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        };
+                        Ok(page(
+                            status,
+                            if status == StatusCode::FORBIDDEN {
+                                "Not allowed"
+                            } else {
+                                "The sign-in failed"
+                            },
+                            format!(
+                                "<p>{}</p><p><a href=\"passcode\">Start again</a></p>",
+                                escape(&e)
+                            ),
+                        ))
+                    }
+                }
+            }
             _ => {
                 self.authenticate(req)?;
                 match segments.as_slice() {
@@ -1676,6 +1783,34 @@ pub(crate) fn no_content() -> Response {
         .status(StatusCode::NO_CONTENT)
         .body(Full::new(Bytes::new()))
         .expect("a plain response")
+}
+
+/// A page of the browser flow: `title` and the `body` fragment.
+fn page(status: StatusCode, title: &str, body: String) -> Response {
+    text(
+        status,
+        "text/html; charset=utf-8",
+        format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>{title}</title><style>body{{font-family:system-ui,sans-serif;max-width:40em;margin:3em auto;padding:0 1em;line-height:1.5}}code{{background:#f2f2f2;padding:.1em .3em;border-radius:.2em}}code.big{{font-size:2em;letter-spacing:.1em;display:inline-block;padding:.3em .6em;user-select:all}}</style></head><body><h1>{title}</h1>{body}</body></html>"
+        ),
+    )
+}
+
+fn redirect(location: &str) -> Response {
+    hyper::Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, location)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Full::new(Bytes::new()))
+        .expect("a plain response")
+}
+
+/// `text` safe inside an HTML element.
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn text(status: StatusCode, content_type: &str, body: String) -> Response {

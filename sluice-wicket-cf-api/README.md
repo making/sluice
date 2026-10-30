@@ -6,6 +6,8 @@ stock `cf` CLI uses, on one origin. It keeps the desired state of its apps and h
 serve them through the wicket's [app API](../sluice-wicket-wasi/README.md#apps), so a wasm
 component is deployed with `cf push`, and routes, scaling, rolling updates, stop and start,
 services (the wicket's keyvalue stores and capabilities) and `cf logs` work as the CLI expects.
+Users log in through an OpenID Provider (`cf login --sso`; see [Login](#login)), or, on the
+loopback, with any credentials.
 
 ```text
 cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> sluice-wicket-wasi <--tunnel-- sluice server
@@ -38,7 +40,7 @@ sluice-wicket-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090 --console-to
 target/release/sluice-wicket-cf-api --wicket http://127.0.0.1:9090 --wicket-token SECRET \
   --flume grpc://127.0.0.1:8002 --flume-token FLUME_SECRET
 
-cf login -a http://127.0.0.1:9091 -u me -p x   # any credentials
+cf login -a http://127.0.0.1:9091 -u me -p x   # any credentials: no --oidc-issuer (see Login)
 cf push hello -p hello/                        # hello/ holds hello.wasm (a wasi:http 0.3 component)
 curl http://hello.localhost:8080/              # the wicket's --listen; *.localhost is the loopback
 cf map-route hello localhost --hostname hi
@@ -54,33 +56,44 @@ cf start counter                               # a binding applies at the next s
 
 | option | |
 |---|---|
-| `--listen <host:port>` | bind address (default `127.0.0.1:9091`); a loopback address only, as the API takes any credentials |
+| `--listen <host:port>` | bind address (default `127.0.0.1:9091`); without `--oidc-issuer` a loopback address only, as the API takes any credentials then |
 | `--wicket <url>` | the wicket's console, `http://host:port` |
 | `--wicket-token <token>` / `--wicket-token-file <path>` | its `--console-token` |
 | `--domain <name>` | a shared domain; repeatable (or comma-separated): the first takes the default and random routes (default `localhost`). Through a sluice server, a suffix whose wildcard DNS reaches it |
-| `--data-dir <path>` | the state and the blobs (default `cf-api`): `state.json` (written by a rename on every change), `jwt.key`, `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app) |
+| `--data-dir <path>` | the state and the blobs (default `cf-api`): `state.json` (written by a rename on every change), `jwt.key` and `sessions.json` (the logins), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app) |
 | `--org <name>` / `--space <name>` | the one organization and space (default `sluice` / `wicket`) |
 | `--flume <url>` | the sluice-flume the wicket feeds (`grpc://host:port` / `grpcs://host:port`): the apps' output and requests reach `cf logs` from it |
 | `--flume-token <token>` / `--flume-token-file <path>` | its bearer token |
 | `--flume-ca-cert <path>` / `--flume-insecure` | a `grpcs://` flume verified against this PEM CA (default the webPKI roots), or not at all |
+| `--oidc-issuer <url>` | the OpenID Provider users log in through (`cf login --sso`); its discovery document is at `<url>/.well-known/openid-configuration` |
+| `--oidc-client-id <id>` | the client registered with the provider, whose redirect URI is `<API URL>/uaa/callback` (required with `--oidc-issuer`) |
+| `--oidc-client-secret <secret>` / `--oidc-client-secret-file <path>` | its secret; none = a public client (PKCE only) |
+| `--oidc-claim <claim>=<pattern>` | who may log in: the ID token's claim must hold (a list claim: contain) the pattern, `*` matching any run of characters; repeatable (or comma-separated). One claim's patterns are alternatives, distinct claims must all hold. At least one rule is required with `--oidc-issuer` (`email=*` lets anyone the provider knows in) |
+| `--oidc-scopes <list>` | the scopes asked for, comma-separated (default `openid,email,profile`; Dex sends the `groups` claim for the scope `groups`) |
+| `--oidc-ca-cert <path>` | a PEM CA the provider's certificate is verified against (default the webPKI roots) |
+| `--client-credentials <id>:<secret>` / `--client-credentials-file <path>` | a client of `cf auth <id> <secret> --client-credentials` (CI); repeatable, the file one per line. With `--oidc-issuer` only |
+| `--tls-cert <path>` / `--tls-key <path>` | serve TLS: the certificate chain and its private key, PEM. Without them, behind a TLS proxy, `X-Forwarded-Proto: https` makes the links `https` |
 | `--exit-on-stdin-close` | exit when stdin reaches its end (a parent's child process) |
 
 Each option also reads `SLUICE_WICKET_CF_API_<NAME>` from the environment. The image
 `ghcr.io/making/sluice/sluice-wicket-cf-api` (`latest` / `<sha>`, built from
-`Dockerfile` at the repository root) keeps `/data` as the working directory; it listens on
-the loopback, so it is reached from the wicket's network namespace (`--network host`, a
-sidecar, `kubectl port-forward`).
+`Dockerfile` at the repository root) keeps `/data` as the working directory; without
+`--oidc-issuer` it listens on the loopback, so it is reached from the wicket's network
+namespace (`--network host`, a sidecar, `kubectl port-forward`).
 
 ### Docker Compose
 
 The images on one host, on its network (`network_mode: host`), with Redis holding the apps'
-keyvalue data: the cf-api listens on the loopback only, and reaches the wicket's console and
-the flume there. `cf` runs on that host (Docker Engine on Linux, OrbStack on macOS) or through
-an SSH tunnel (`ssh -L 9091:127.0.0.1:9091 <host>`).
+keyvalue data and [Dex](https://dexidp.io/) as the OpenID Provider, its users in its
+configuration file: the cf-api listens on the loopback, and reaches the wicket's console, the
+flume and Dex there. `cf` and the browser run on that host (Docker Engine on Linux, OrbStack on
+macOS) or through an SSH tunnel (`ssh -L 9091:127.0.0.1:9091 -L 5556:127.0.0.1:5556 <host>`).
 
 ```yaml
-# compose.yaml; .env holds FLUME_TOKEN, CONSOLE_TOKEN and REDIS_PASSWORD (openssl rand -hex 16
-# each), and APPS_DOMAIN: a name whose wildcard DNS reaches the host (default localhost)
+# compose.yaml; .env holds FLUME_TOKEN, CONSOLE_TOKEN, REDIS_PASSWORD and OIDC_CLIENT_SECRET
+# (openssl rand -hex 16 each), ADMIN_PASSWORD_HASH (a bcrypt hash, single-quoted for its $:
+# htpasswd -bnBC 10 "" <password> | tr -d ':\n'), and APPS_DOMAIN: a name whose wildcard DNS
+# reaches the host (default localhost)
 services:
   redis:
     image: redis:7-alpine
@@ -97,6 +110,17 @@ services:
     command: [--host, 127.0.0.1]    # this host's wicket and cf-api only
     environment:
       SLUICE_FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
+    restart: unless-stopped
+  dex:
+    image: ghcr.io/dexidp/dex:v2.46.1
+    pull_policy: always
+    network_mode: host
+    command: [dex, serve, /etc/dex/dex.yaml]
+    environment:                    # what dex.yaml's secretEnv and hashFromEnv read
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?ADMIN_PASSWORD_HASH}
+    volumes:
+      - ./dex.yaml:/etc/dex/dex.yaml:ro
     restart: unless-stopped
   wicket:
     image: ghcr.io/making/sluice/sluice-wicket-wasi
@@ -116,13 +140,17 @@ services:
     image: ghcr.io/making/sluice/sluice-wicket-cf-api
     pull_policy: always
     network_mode: host
-    command: [--wicket, http://127.0.0.1:9090, --flume, grpc://127.0.0.1:8002]
+    command: [--wicket, http://127.0.0.1:9090, --flume, grpc://127.0.0.1:8002, --oidc-issuer, http://127.0.0.1:5556/dex]
     environment:
       SLUICE_WICKET_CF_API_WICKET_TOKEN: ${CONSOLE_TOKEN:?CONSOLE_TOKEN}
       SLUICE_WICKET_CF_API_FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
       SLUICE_WICKET_CF_API_DOMAIN: ${APPS_DOMAIN:-localhost}
+      SLUICE_WICKET_CF_API_OIDC_CLIENT_ID: cf
+      SLUICE_WICKET_CF_API_OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
+      SLUICE_WICKET_CF_API_OIDC_CLAIM: email=admin@example.com    # who may log in
     volumes:
       - cf-api:/data    # the desired state, packages and droplets (cf-api/)
+    depends_on: [dex]
     restart: unless-stopped
 volumes:
   redis:
@@ -146,9 +174,33 @@ keyvalue:
       url: redis://:${REDIS_PASSWORD}@127.0.0.1:6379/0
 ```
 
+```yaml
+# dex.yaml, next to compose.yaml: the OpenID Provider (https://dexidp.io/docs/), its users
+# in this file
+issuer: http://127.0.0.1:5556/dex
+storage:
+  type: memory
+web:
+  http: 127.0.0.1:5556
+oauth2:
+  skipApprovalScreen: true
+staticClients:
+  - id: cf                      # the cf-api's --oidc-client-id
+    name: sluice-wicket-cf-api
+    secretEnv: OIDC_CLIENT_SECRET
+    redirectURIs: [http://127.0.0.1:9091/uaa/callback]
+enablePasswordDB: true
+staticPasswords:                # the users: Dex asks for the email and the password
+  - email: admin@example.com
+    username: admin
+    preferredUsername: admin    # the cf user name
+    userID: 1c2a0b3e-0000-4000-8000-000000000001
+    hashFromEnv: ADMIN_PASSWORD_HASH
+```
+
 ```text
 docker compose up -d
-cf login -a http://127.0.0.1:9091 -u me -p x
+cf login -a http://127.0.0.1:9091 --sso    # open the URL it prints, log in at Dex, paste the code
 cf push hello -p hello/                    # hello/ holds hello.wasm, as in Run
 curl http://hello.localhost:8080/          # with APPS_DOMAIN: http://hello.apps.example.com:8080/
 cf create-service keyvalue redis kv        # the namespace cf/<instance guid> in Redis
@@ -159,7 +211,12 @@ curl http://counter.localhost:8080/        # hits 1, 2, ... in Redis: cf/<instan
 ```
 
 `docker compose down` keeps the volumes: the next `up` serves the apps again, with their data
-(Redis keeps it in its append-only file).
+(Redis keeps it in its append-only file) and the logins (`sessions.json` in the cf-api's). For
+other users, add them to `staticPasswords` and to `SLUICE_WICKET_CF_API_OIDC_CLAIM`
+(`email=admin@example.com,email=dev@example.com`), or give them a group and allow the group
+(`groups=devs`, with `--oidc-scopes openid,email,profile,groups`); a Dex
+[connector](https://dexidp.io/docs/connectors/) replaces the static users with GitHub, LDAP,
+another OpenID Provider and the like.
 
 ## Mapping
 
@@ -215,13 +272,48 @@ curl http://counter.localhost:8080/        # hits 1, 2, ... in Redis: cf/<instan
   the lines lost on the way (`LGR`). The cf-api watches its apps' hosts and resumes past the
   last line it took (kept in `state.json`); see
   [Live access log](../.kb/live-access-log.md#wickets-and-the-cf-api)
-- auth: `POST /uaa/oauth/token` takes any credentials (the password, refresh_token and
-  client_credentials grants) and answers a JWT (HS256) signed with the key in `--data-dir`, so
-  a login outlives a restart; every request but the root document, `/v3`, `/v3/info` and the
-  UAA endpoints needs a valid one (log-cache's included), and everyone may do everything. That is
-  why the listener binds a loopback address only
+- auth: see [Login](#login). Every request but the root document, `/v3`, `/v3/info` and the
+  UAA endpoints needs a valid token (log-cache's included), and whoever holds one may do
+  everything
 - errors are in CC's shape (`{"errors": [{"code", "title", "detail"}]}`); `/v3/info` names
   this API
+
+## Login
+
+The cf-api is its own UAA: `POST /uaa/oauth/token` answers a JWT (HS256) signed with the key in
+`--data-dir` (`jwt.key`), good for 12 hours, with a refresh token good for 30 days and once: a
+refresh answers a new pair and the old refresh token is spent (`sessions.json` keeps the logins,
+so they outlive a restart). Who gets a token:
+
+- without `--oidc-issuer`, anyone: the password, client_credentials and refresh_token grants
+  take any credentials (`cf login -u me -p x`). That is why the listener then binds a loopback
+  address only
+- with `--oidc-issuer`, the users an OpenID Provider signs in and the clients configured. The
+  listener may bind any address, with TLS of its own (`--tls-cert`, `--tls-key`) or behind a
+  TLS proxy:
+  - `cf login --sso` asks for a code and names where to get one, `<API URL>/uaa/passcode`
+    (`cf login` without `--sso`, and `-u -p`, are refused with that hint). The page sends the
+    browser to the provider (authorization code flow with PKCE and a nonce) and the callback,
+    `<API URL>/uaa/callback`, exchanges the code for the ID token. The token comes straight from
+    the provider's token endpoint, over TLS and against the client's secret, so its claims are
+    taken as they come (OpenID Connect Core 3.1.3.7, item 6) once `iss`, `aud`, `exp` and the
+    nonce check out; the `--oidc-claim` rules then say who may log in (`403` with the claim
+    that failed), and the page shows an 8-character code, good for 5 minutes and once. The CLI
+    posts it (`grant_type=password&passcode=`) and gets the cf-api's tokens; the user name is
+    the ID token's `preferred_username`, else `email`, else `sub`
+  - `cf auth <id> <secret> --client-credentials` (CI) takes a client of `--client-credentials`
+  - a refresh of a user's tokens applies the `--oidc-claim` rules again to the ID token's claims
+    of the login: a user no longer allowed is refused (`401`: `<user> is no longer allowed
+    (...)`) and logged out. The access token stays good until it expires (12 hours at most)
+  - the tokens of the open mode are refused once a provider is configured: everyone logs in
+    again
+
+The provider needs a client (confidential, or public with PKCE) whose redirect URI is `<API
+URL>/uaa/callback` -- the URL `cf api` targets, as the links are made from the request's
+`Host` (and `X-Forwarded-Proto`) -- with the scopes `openid`, `email`, `profile` (and `groups`
+for Dex's groups); the discovery document must be reachable from the cf-api, which finds it at
+the first sign-in and keeps it. Dex, Keycloak, Entra ID, Google and the like serve; the
+[Docker Compose](#docker-compose) sample runs Dex with its users in a file.
 
 ## Services
 
@@ -255,12 +347,14 @@ config.
 Refused with why (422): route paths, ports and wildcards, private and internal domains, docker
 images, tasks, ssh, sidecars, process types but `web`, route services, environment variable
 groups, user-provided services, service keys. One owner (`cf`) per wicket: two cf-apis must not
-share one.
+share one. No roles: whoever may log in may do everything.
 
 The integration test (`tests/cli.rs`) runs the OSS CLI -- `SLUICE_CF_CLI`, else `cf8` on the
-PATH, never a `cf` that may be the Tanzu one -- against the cf-api and a wicket in local mode on a flume, building the wicket and its
-example guests from `../sluice-wicket-wasi` and the flume from `../sluice-flume` (or taking
-`SLUICE_WICKET_WASI`, `SLUICE_WICKET_GUESTS` and `SLUICE_FLUME`):
+PATH, never a `cf` that may be the Tanzu one -- against the cf-api and a wicket in local mode
+on a flume, building the wicket and its example guests from `../sluice-wicket-wasi` and the
+flume from `../sluice-flume` (or taking `SLUICE_WICKET_WASI`, `SLUICE_WICKET_GUESTS` and
+`SLUICE_FLUME`); the login through a provider runs against a mock of one in the test, with TLS
+of the cf-api's own:
 
 ```text
 gh release download v8.19.0 -R cloudfoundry/cli -p 'cf8-cli_8.19.0_macosarm.tgz'

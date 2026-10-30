@@ -20,23 +20,34 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let listener = match sluice_wicket_cf_api::bind(&config.listen).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let listener =
+        match sluice_wicket_cf_api::bind(&config.listen, config.settings.oidc.is_none()).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        };
     let address = listener
         .local_addr()
         .map_or_else(|_| config.listen.clone(), |a| a.to_string());
     // a parent process waits for this line before it dials
     println!(
-        "{} listening on http://{address} (wicket {}, domains {}, data {})",
+        "{} listening on {}://{address} (wicket {}, domains {}, data {}, auth {})",
         sluice_wicket_cf_api::describe_build(),
+        if config.settings.tls.is_some() {
+            "https"
+        } else {
+            "http"
+        },
         config.settings.wicket,
         config.settings.domains.join(", "),
-        config.settings.data_dir.display()
+        config.settings.data_dir.display(),
+        config
+            .settings
+            .oidc
+            .as_ref()
+            .map_or("any credentials".to_string(), |oidc| oidc.issuer.clone())
     );
     let exit_on_stdin_close = config.exit_on_stdin_close;
     match sluice_wicket_cf_api::serve(listener, config.settings, shutdown(exit_on_stdin_close))

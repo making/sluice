@@ -20,6 +20,7 @@ pub mod flume;
 pub mod logs;
 pub mod manifest;
 mod multipart;
+pub mod oidc;
 pub mod services;
 pub mod staging;
 pub mod store;
@@ -96,22 +97,57 @@ pub struct Settings {
     /// Where the apps' output and requests come from; None: the logs hold
     /// the cf-api's own lines only.
     pub flume: Option<flume::FlumeSettings>,
+    /// The OpenID Provider users log in through; None: any credentials pass.
+    pub oidc: Option<oidc::OidcSettings>,
+    /// The clients of `cf auth --client-credentials`, with the provider.
+    pub clients: Vec<(String, String)>,
+    /// The listener's own TLS; None: plain HTTP.
+    pub tls: Option<TlsSettings>,
 }
 
-/// Binds `listen`: a loopback address only, as the API takes any
-/// credentials yet.
-pub async fn bind(listen: &str) -> Result<TcpListener, String> {
+/// The listener's certificate chain and private key, PEM.
+#[derive(Clone, Debug)]
+pub struct TlsSettings {
+    pub cert_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+}
+
+/// Binds `listen`; `loopback_only` (no provider: the API takes any
+/// credentials) refuses any other address.
+pub async fn bind(listen: &str, loopback_only: bool) -> Result<TcpListener, String> {
     let failed = |e: std::io::Error| format!("--listen {listen}: {e}");
     let resolved: Vec<SocketAddr> = tokio::net::lookup_host(listen)
         .await
         .map_err(failed)?
         .collect();
-    if resolved.iter().any(|at| !at.ip().is_loopback()) {
+    if loopback_only && resolved.iter().any(|at| !at.ip().is_loopback()) {
         return Err(format!(
-            "--listen {listen}: the API takes any credentials, so it listens on a loopback address only"
+            "--listen {listen}: without --oidc-issuer the API takes any credentials, so it listens on a loopback address only"
         ));
     }
     TcpListener::bind(&resolved[..]).await.map_err(failed)
+}
+
+/// The TLS of the listener, from `--tls-cert` / `--tls-key`.
+fn tls_acceptor(tls: &TlsSettings) -> Result<tokio_rustls::TlsAcceptor, String> {
+    use rustls::pki_types::pem::PemObject as _;
+    let certs = rustls::pki_types::CertificateDer::pem_slice_iter(&tls.cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("--tls-cert: {e}"))?;
+    if certs.is_empty() {
+        return Err("--tls-cert: no certificate in it".into());
+    }
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&tls.key_pem)
+        .map_err(|e| format!("--tls-key: {e}"))?;
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| format!("tls: {e}"))?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .map_err(|e| format!("--tls-cert / --tls-key: {e}"))?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
 /// Serves the API on `listener` until `shutdown` completes, the wicket
@@ -121,6 +157,9 @@ pub async fn serve(
     settings: Settings,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), String> {
+    // reqwest brings no crypto provider of its own (rustls-no-provider):
+    // ring, as tonic's TLS and the listener's
+    let _ = rustls::crypto::ring::default_provider().install_default();
     std::fs::create_dir_all(&settings.data_dir)
         .map_err(|e| format!("--data-dir {}: {e}", settings.data_dir.display()))?;
     let store = Arc::new(store::Store::open(
@@ -129,7 +168,22 @@ pub async fn serve(
         &settings.space,
         &settings.domains,
     )?);
-    let uaa = uaa::Uaa::open(&settings.data_dir)?;
+    let mode = match &settings.oidc {
+        Some(oidc) => uaa::Mode::Provider {
+            clients: settings.clients.clone(),
+            rules: oidc.claims.clone(),
+        },
+        None => uaa::Mode::Open,
+    };
+    let uaa = uaa::Uaa::open(&settings.data_dir, mode)?;
+    let provider = match &settings.oidc {
+        Some(oidc) => Some(oidc::Provider::new(oidc.clone())?),
+        None => None,
+    };
+    let acceptor = match &settings.tls {
+        Some(tls) => Some(tls_acceptor(tls)?),
+        None => None,
+    };
     let logs = Arc::new(logs::Logs::default());
     let wicket = Arc::new(wicket::Wicket::new(
         &settings.wicket,
@@ -150,13 +204,15 @@ pub async fn serve(
     let api = Arc::new(api::Api {
         store: store.clone(),
         uaa,
+        provider,
+        tls: acceptor.is_some(),
         logs,
         controller: controller.clone(),
         build: describe_build(),
     });
     let watch = tokio::spawn(controller.watch());
     tokio::select! {
-        () = api::run(listener, api) => {}
+        () = api::run(listener, acceptor, api) => {}
         () = shutdown => {}
     }
     watch.abort();

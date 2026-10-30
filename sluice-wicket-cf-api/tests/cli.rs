@@ -2,19 +2,23 @@
 //! distribution refuses any other platform) against the cf-api and a wicket
 //! in local mode, both on a flume: login, push, the app's logs, map-route,
 //! scale, a rolling push with requests all along, stop and start, the
-//! user's environment variables and VCAP_*, a restart of the cf-api, a
-//! component the wicket refuses until a service binding grants what it
+//! user's environment variables and VCAP_*, a restart of the cf-api with an
+//! OpenID Provider (a mock) and TLS of its own -- `cf login --sso` through
+//! the passcode page, a refresh, the clients configured, who is refused --,
+//! a component the wicket refuses until a service binding grants what it
 //! needs, the services' lifecycle, delete.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read as _, Write as _};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use base64::Engine as _;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 /// Hang guard of every wait; the first covers a cold build of the wicket.
@@ -189,12 +193,30 @@ impl Cf {
 
     /// Runs the command: whether it succeeded, and its output.
     fn run(&self, args: &[&str]) -> (bool, String) {
-        let output = self.command(args).output().unwrap_or_else(|e| {
-            panic!(
-                "run the cf CLI {}: {e} (SLUICE_CF_CLI names the OSS CLI v8)",
-                self.cli.display()
-            )
-        });
+        self.run_with_stdin(args, "")
+    }
+
+    /// Runs the command with `input` on its stdin (what a prompt reads).
+    fn run_with_stdin(&self, args: &[&str], input: &str) -> (bool, String) {
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "run the cf CLI {}: {e} (SLUICE_CF_CLI names the OSS CLI v8)",
+                    self.cli.display()
+                )
+            });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
@@ -204,8 +226,26 @@ impl Cf {
         (output.status.success(), text)
     }
 
+    /// The tokens the CLI holds: `config.json`'s AccessToken (`bearer ...`)
+    /// and RefreshToken.
+    fn tokens(&self) -> (String, String) {
+        let config: Value =
+            serde_json::from_slice(&std::fs::read(self.home.join(".cf/config.json")).unwrap())
+                .unwrap();
+        (
+            config["AccessToken"].as_str().unwrap().to_string(),
+            config["RefreshToken"].as_str().unwrap().to_string(),
+        )
+    }
+
     fn ok(&self, args: &[&str]) -> String {
         let (ok, text) = self.run(args);
+        assert!(ok, "cf {} failed:\n{text}", args.join(" "));
+        text
+    }
+
+    fn ok_with_stdin(&self, args: &[&str], input: &str) -> String {
+        let (ok, text) = self.run_with_stdin(args, input);
         assert!(ok, "cf {} failed:\n{text}", args.join(" "));
         text
     }
@@ -272,26 +312,110 @@ fn variant(hello: &[u8]) -> Vec<u8> {
     component
 }
 
-fn start_api(listen: &str, console: &str, flume: &str, data: &Path) -> (Process, String) {
-    let api = Process::spawn(
-        Path::new(env!("CARGO_BIN_EXE_sluice-wicket-cf-api")),
-        &[
-            "--listen",
-            listen,
-            "--wicket",
-            &format!("http://{console}"),
-            "--wicket-token",
-            TOKEN,
-            "--data-dir",
-            data.to_str().unwrap(),
-            "--flume",
-            flume,
-            "--flume-token",
-            FLUME_TOKEN,
-        ],
-    );
+fn start_api(
+    listen: &str,
+    console: &str,
+    flume: &str,
+    data: &Path,
+    more: &[&str],
+) -> (Process, String) {
+    let wicket = format!("http://{console}");
+    let mut args = vec![
+        "--listen",
+        listen,
+        "--wicket",
+        &wicket,
+        "--wicket-token",
+        TOKEN,
+        "--data-dir",
+        data.to_str().unwrap(),
+        "--flume",
+        flume,
+        "--flume-token",
+        FLUME_TOKEN,
+    ];
+    args.extend_from_slice(more);
+    let api = Process::spawn(Path::new(env!("CARGO_BIN_EXE_sluice-wicket-cf-api")), &args);
     let url = api.logged("listening on ");
     (api, url)
+}
+
+/// HTTP(S) requests of the test to the cf-api (its certificate self-signed)
+/// and the mock provider, redirects not followed.
+struct Http(reqwest::blocking::Client);
+
+impl Http {
+    fn new() -> Http {
+        // reqwest brings no crypto provider of its own here
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Http(
+            reqwest::blocking::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// The status, the Location header and the body.
+    fn get(&self, url: &str, bearer: Option<&str>) -> (u16, String, String) {
+        let mut request = self.0.get(url);
+        if let Some(token) = bearer {
+            request = request.header("Authorization", token);
+        }
+        let response = request.send().unwrap();
+        let status = response.status().as_u16();
+        let location = response
+            .headers()
+            .get("location")
+            .map(|at| at.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        (status, location, response.text().unwrap())
+    }
+
+    /// A token request as the CLI makes it: the status and the JSON.
+    fn token(&self, api: &str, form: &str) -> (u16, Value) {
+        let response = self
+            .0
+            .post(format!("{api}/uaa/oauth/token"))
+            .basic_auth("cf", Some(""))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(form.to_string())
+            .send()
+            .unwrap();
+        (response.status().as_u16(), response.json().unwrap())
+    }
+}
+
+/// `cf login --sso`'s browser side: `/uaa/passcode` to the provider, back
+/// to the callback: the status and the page.
+fn passcode_page(http: &Http, api: &str) -> (u16, String) {
+    let (status, authorize, _) = http.get(&format!("{api}/uaa/passcode"), None);
+    assert_eq!(status, 302);
+    let callback = form_urlencoded::byte_serialize(format!("{api}/uaa/callback").as_bytes())
+        .collect::<String>();
+    for expected in [
+        "response_type=code",
+        "code_challenge_method=S256",
+        &format!("redirect_uri={callback}"),
+        "scope=openid+email+profile+groups",
+    ] {
+        assert!(authorize.contains(expected), "{expected}: {authorize}");
+    }
+    let (status, callback, _) = http.get(&authorize, None);
+    assert_eq!(status, 302, "{authorize}");
+    let (status, _, page) = http.get(&callback, None);
+    (status, page)
+}
+
+/// The code of the passcode page.
+fn passcode(http: &Http, api: &str) -> String {
+    let (status, page) = passcode_page(http, api);
+    assert_eq!(status, 200, "{page}");
+    let (_, rest) = page
+        .split_once("id=\"passcode\" class=\"big\">")
+        .expect("the code");
+    rest.split_once("</code>").unwrap().0.to_string()
 }
 
 #[test]
@@ -348,7 +472,9 @@ fn the_cf_cli_deploys_to_the_wicket() {
         .unwrap()
         .port();
     let api_listen = format!("127.0.0.1:{port}");
-    let (mut api, url) = start_api(&api_listen, &console, &flume_url, &dir.join("cf"));
+    let (mut api, url) = start_api(&api_listen, &console, &flume_url, &dir.join("cf"), &[]);
+    let provider = MockProvider::start("cf-api", "s3");
+    let http = Http::new();
     let cf = Cf {
         cli: cf_cli(),
         home: dir.join("cfhome"),
@@ -497,14 +623,111 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "{env}"
     );
 
-    // the cf-api restarted: its state kept (the token too), the wicket's
-    // generation unchanged
+    // the cf-api restarted with an OpenID Provider and TLS of its own: its
+    // state kept, the wicket's generation unchanged; the open mode's token
+    // is no good any more, nor is a password
     let generation = listing(&console)["generation"].as_u64().unwrap();
+    let (open_token, _) = cf.tokens();
     api.kill();
-    let (api, _) = start_api(&api_listen, &console, &flume_url, &dir.join("cf"));
+    let tls = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+    let (cert_file, key_file) = (dir.join("tls.crt"), dir.join("tls.key"));
+    std::fs::write(&cert_file, tls.cert.pem()).unwrap();
+    std::fs::write(&key_file, tls.signing_key.serialize_pem()).unwrap();
+    let oidc = [
+        "--oidc-issuer",
+        &provider.issuer,
+        "--oidc-client-id",
+        "cf-api",
+        "--oidc-client-secret",
+        "s3",
+        "--oidc-scopes",
+        "openid,email,profile,groups",
+        "--client-credentials",
+        "robot:r0bot",
+        "--tls-cert",
+        cert_file.to_str().unwrap(),
+        "--tls-key",
+        key_file.to_str().unwrap(),
+    ];
+    let with_rules = |rules: &[&str]| {
+        let mut args: Vec<&str> = oidc.to_vec();
+        for rule in rules {
+            args.extend_from_slice(&["--oidc-claim", rule]);
+        }
+        start_api(&api_listen, &console, &flume_url, &dir.join("cf"), &args)
+    };
+    let (api, url) = with_rules(&["email=*@example.com", "groups=devs"]);
+    assert!(url.starts_with("https://"), "{url}");
     api.logged("Found in the wicket as wanted");
-    assert!(cf.ok(&["app", "hello"]).contains("hi.localhost"));
     assert_eq!(listing(&console)["generation"], generation);
+    let (status, _, body) = http.get(&format!("{url}/v3/apps"), Some(&open_token));
+    assert_eq!(status, 401, "{body}");
+    assert!(body.contains("log in again"), "{body}");
+    cf.ok(&["api", &url, "--skip-ssl-validation"]);
+    let output = cf.fails(&["login", "-u", "me", "-p", "x"]);
+    assert!(
+        output.contains(&format!(
+            "cf login --sso, with a one-time code from {url}/uaa/passcode"
+        )),
+        "{output}"
+    );
+
+    // alice, allowed, signs in through the provider: the passcode page's
+    // code logs the CLI in, once
+    provider.sign_in(json!({
+        "sub": "1", "email": "alice@example.com", "preferred_username": "alice", "groups": ["devs"]
+    }));
+    let code = passcode(&http, &url);
+    assert_eq!(code.len(), 8);
+    let output = cf.ok_with_stdin(&["login", "--sso"], &format!("{code}\n"));
+    assert!(output.contains("Authenticating...\nOK"), "{output}");
+    assert!(cf.ok(&["target"]).contains("user:           alice"));
+    assert!(cf.ok(&["app", "hello"]).contains("hi.localhost"));
+    let (_, refresh_token) = cf.tokens();
+    // (a failed login drops the CLI's tokens: taken above)
+    let output = cf.fails(&["login", "--sso-passcode", &code]);
+    assert!(output.contains("used already"), "{output}");
+
+    // the refresh token is good once; bob, out of the group, is refused at
+    // the callback
+    let refresh = |token: &str| {
+        http.token(
+            &url,
+            &format!("grant_type=refresh_token&refresh_token={token}"),
+        )
+    };
+    let (status, refreshed) = refresh(&refresh_token);
+    assert_eq!(status, 200, "{refreshed}");
+    let alice_refresh = refreshed["refresh_token"].as_str().unwrap().to_string();
+    assert_ne!(alice_refresh, refresh_token);
+    let (status, again) = refresh(&refresh_token);
+    assert_eq!(status, 401, "{again}");
+    assert!(
+        again["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("used already")
+    );
+    provider.sign_in(json!({
+        "sub": "2", "email": "bob@example.com", "preferred_username": "bob", "groups": ["ops"]
+    }));
+    let (status, page) = passcode_page(&http, &url);
+    assert_eq!(status, 403, "{page}");
+    assert!(
+        page.contains("the claim groups is [&quot;ops&quot;], not 'devs'"),
+        "{page}"
+    );
+
+    // a client configured: cf auth, with its secret; the rest of the test
+    // runs as it
+    let output = cf.fails(&["auth", "robot", "wrong", "--client-credentials"]);
+    assert!(
+        output.contains("unknown client 'robot' or wrong secret"),
+        "{output}"
+    );
+    cf.ok(&["auth", "robot", "r0bot", "--client-credentials"]);
+    cf.ok(&["target", "-o", "sluice", "-s", "wicket"]);
+    assert!(cf.ok(&["app", "hello"]).contains("hi.localhost"));
 
     // a component the wicket refuses: its reason reaches the user
     let output = cf.fails(&[
@@ -632,8 +855,222 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "{services}"
     );
 
+    // alice no longer allowed (the rules changed): her next refresh is
+    // refused, and her session with it
+    drop(api);
+    let (api, url) = with_rules(&["email=*@example.com", "groups=ops"]);
+    let (status, refused) = http.token(
+        &url,
+        &format!("grant_type=refresh_token&refresh_token={alice_refresh}"),
+    );
+    assert_eq!(status, 401, "{refused}");
+    let why = refused["error_description"].as_str().unwrap();
+    assert!(
+        why.starts_with("alice is no longer allowed (the claim groups is [\"devs\"]"),
+        "{why}"
+    );
+
     drop(api);
     drop(wicket);
     drop(flume);
+    drop(provider);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An OpenID Provider as sluice-it's MockOidcServer: discovery, an
+/// authorization endpoint consenting at once as the user set by `sign_in`,
+/// a token endpoint answering an ID token (its signature is not checked:
+/// the cf-api takes the token straight from this endpoint). Plain HTTP on
+/// the loopback, one request per connection.
+struct MockProvider {
+    issuer: String,
+    user: Arc<Mutex<Value>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl MockProvider {
+    fn start(client_id: &str, client_secret: &str) -> MockProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let user = Arc::new(Mutex::new(Value::Null));
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(Mutex::new(MockState {
+            issuer: issuer.clone(),
+            client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
+            user: user.clone(),
+            codes: HashMap::new(),
+        }));
+        let stopping = stop.clone();
+        std::thread::spawn(move || {
+            while !stopping.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        state.lock().unwrap().serve(stream);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("mock provider accept: {e}"),
+                }
+            }
+        });
+        MockProvider { issuer, user, stop }
+    }
+
+    /// Who the next sign-ins are: the ID token's claims (sub, email, ...).
+    fn sign_in(&self, claims: Value) {
+        *self.user.lock().unwrap() = claims;
+    }
+}
+
+impl Drop for MockProvider {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+struct MockState {
+    issuer: String,
+    client_id: String,
+    client_secret: String,
+    user: Arc<Mutex<Value>>,
+    /// The codes issued: the nonce, the PKCE challenge and the redirect URI
+    /// of their authorization request.
+    codes: HashMap<String, (String, String, String)>,
+}
+
+impl MockState {
+    fn serve(&mut self, mut stream: TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).unwrap_or(0) == 0 {
+                return;
+            }
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head).to_string();
+        let mut lines = head.lines();
+        let request = lines.next().unwrap_or_default().to_string();
+        let headers: HashMap<String, String> = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+            .collect();
+        let length: usize = headers
+            .get("content-length")
+            .and_then(|length| length.parse().ok())
+            .unwrap_or(0);
+        let mut body = vec![0u8; length];
+        stream.read_exact(&mut body).unwrap();
+        let mut parts = request.split(' ');
+        let (method, target) = (parts.next().unwrap(), parts.next().unwrap());
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let query: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect();
+        let (status, location, body) = match (method, path) {
+            ("GET", "/.well-known/openid-configuration") => (
+                200,
+                None,
+                json!({
+                    "issuer": self.issuer,
+                    "authorization_endpoint": format!("{}/authorize", self.issuer),
+                    "token_endpoint": format!("{}/token", self.issuer),
+                    "jwks_uri": format!("{}/jwks", self.issuer),
+                    "response_types_supported": ["code"],
+                    "subject_types_supported": ["public"],
+                    "id_token_signing_alg_values_supported": ["RS256"],
+                    "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+                    "code_challenge_methods_supported": ["S256"],
+                })
+                .to_string(),
+            ),
+            ("GET", "/authorize") => {
+                assert_eq!(query["client_id"], self.client_id);
+                assert_eq!(query["response_type"], "code");
+                assert_eq!(query["code_challenge_method"], "S256");
+                let code = format!("code-{}", self.codes.len() + 1);
+                self.codes.insert(
+                    code.clone(),
+                    (
+                        query["nonce"].clone(),
+                        query["code_challenge"].clone(),
+                        query["redirect_uri"].clone(),
+                    ),
+                );
+                (
+                    302,
+                    Some(format!(
+                        "{}?code={code}&state={}",
+                        query["redirect_uri"], query["state"]
+                    )),
+                    String::new(),
+                )
+            }
+            ("POST", "/token") => {
+                let form: HashMap<String, String> =
+                    form_urlencoded::parse(&body).into_owned().collect();
+                let basic = base64::engine::general_purpose::STANDARD
+                    .encode(format!("{}:{}", self.client_id, self.client_secret));
+                if headers.get("authorization") != Some(&format!("Basic {basic}")) {
+                    (401, None, json!({"error": "invalid_client"}).to_string())
+                } else {
+                    let Some((nonce, challenge, redirect_uri)) = self
+                        .codes
+                        .remove(form.get("code").map_or("", String::as_str))
+                    else {
+                        panic!("the mock provider never issued this code: {form:?}");
+                    };
+                    assert_eq!(form["grant_type"], "authorization_code");
+                    assert_eq!(form["redirect_uri"], redirect_uri);
+                    let verified = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode(Sha256::digest(form["code_verifier"].as_bytes()));
+                    assert_eq!(verified, challenge, "PKCE");
+                    let mut claims = self.user.lock().unwrap().clone();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    claims["iss"] = json!(self.issuer);
+                    claims["aud"] = json!(self.client_id);
+                    claims["iat"] = json!(now);
+                    claims["exp"] = json!(now + 300);
+                    claims["nonce"] = json!(nonce);
+                    let encode = |value: &Value| {
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .encode(serde_json::to_vec(value).unwrap())
+                    };
+                    let id_token = format!(
+                        "{}.{}.not-checked",
+                        encode(&json!({"alg": "RS256", "kid": "mock"})),
+                        encode(&claims)
+                    );
+                    (
+                        200,
+                        None,
+                        json!({
+                            "access_token": "mock-access", "token_type": "bearer",
+                            "expires_in": 300, "id_token": id_token,
+                        })
+                        .to_string(),
+                    )
+                }
+            }
+            _ => (404, None, format!("no {method} {path}")),
+        };
+        let location = location.map_or(String::new(), |at| format!("Location: {at}\r\n"));
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 {status} X\r\n{location}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+    }
 }
