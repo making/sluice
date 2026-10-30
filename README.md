@@ -813,8 +813,8 @@ its discovery document advertises an `end_session_endpoint`; register
 | `sluice.data-port` | `8000` | data plane port |
 | `spring.grpc.server.port` | `8001` | gRPC control plane port |
 | `server.port` | `8081` | actuator (health / info / prometheus) and the management console (`/console`) |
-| `sluice.token` | (unset = auto-generated; the generated token is written to a temporary file whose path is logged) | bearer token for tunnel clients (`Authorization: Bearer <token>`, constant-time compare) |
-| `sluice.token-file` | - | read the token from a file |
+| `sluice.token` | (unset = auto-generated; the generated token is written to a temporary file whose path is logged) | bearer tokens tunnel clients may carry (`Authorization: Bearer <token>`, constant-time compare): `sluice.token[0..]` or comma separated. A token holding a comma needs the indexed form |
+| `sluice.token-file` | - | read the tokens from a file, one per line; used instead of `sluice.token` |
 
 ### TLS and PROXY protocol
 

@@ -9,50 +9,73 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.List;
 
 import am.ik.sluice.server.config.SluiceServerProperties;
 
 import org.springframework.stereotype.Component;
 
 /**
- * Validates the {@code Authorization: Bearer <token>} header using a constant-time
- * comparison. When neither {@code sluice.token} nor {@code sluice.token-file} is
- * configured, a random token is generated, written to a temporary file and its path is
- * logged.
+ * Validates the {@code Authorization: Bearer <token>} header against each configured
+ * token using a constant-time comparison. When neither {@code sluice.token} nor
+ * {@code sluice.token-file} is configured, a random token is generated, written to a
+ * temporary file and its path is logged.
  */
 @Component
 public class TokenValidator {
 
 	private static final Logger log = LoggerFactory.getLogger(TokenValidator.class);
 
-	private final byte[] token;
+	/** The acceptable header values; empty = a header of any value passes. */
+	private final List<byte[]> bearerValues;
 
 	public TokenValidator(SluiceServerProperties properties) {
-		String token = resolveToken(properties);
-		this.token = ("Bearer " + token).getBytes(StandardCharsets.UTF_8);
+		List<String> tokens = resolveTokens(properties);
+		this.bearerValues = tokens.stream().map(token -> ("Bearer " + token).getBytes(StandardCharsets.UTF_8)).toList();
 	}
 
-	private static String resolveToken(SluiceServerProperties properties) {
+	private static List<String> resolveTokens(SluiceServerProperties properties) {
 		if (properties.tokenFile() != null && !properties.tokenFile().isBlank()) {
-			try {
-				String content = Files.readString(Path.of(properties.tokenFile()), StandardCharsets.UTF_8);
-				// trailing new-lines are stripped to keep the setup foolproof
-				return content.stripTrailing();
-			}
-			catch (Exception e) {
-				throw new IllegalStateException("unable to load token file: " + properties.tokenFile(), e);
+			return readTokenFile(properties.tokenFile());
+		}
+		List<String> tokens = new ArrayList<>();
+		for (String token : properties.token()) {
+			if (!token.isBlank()) {
+				tokens.add(token);
 			}
 		}
-		String token = properties.token();
-		if (token == null || token.isBlank()) {
+		if (tokens.isEmpty()) {
 			if (properties.clusterEnabled()) {
 				// per-node random tokens would break clients connected to every node
 				throw new IllegalStateException("cluster mode requires an explicit sluice.token / sluice.token-file");
 			}
-			return generateToken();
+			return List.of(generateToken());
 		}
-		return token;
+		// a fixed order, so every node of a cluster sends the same one to its peers
+		return tokens.stream().sorted().toList();
+	}
+
+	/**
+	 * Reads one token per line; an empty file leaves the tunnel open, as a blank token
+	 * did.
+	 */
+	private static List<String> readTokenFile(String path) {
+		List<String> tokens = new ArrayList<>();
+		try {
+			for (String line : Files.readAllLines(Path.of(path), StandardCharsets.UTF_8)) {
+				// surrounding blanks are stripped to keep the setup foolproof
+				String token = line.strip();
+				if (!token.isEmpty()) {
+					tokens.add(token);
+				}
+			}
+		}
+		catch (Exception e) {
+			throw new IllegalStateException("unable to load token file: " + path, e);
+		}
+		return tokens.stream().sorted().toList();
 	}
 
 	/**
@@ -81,19 +104,24 @@ public class TokenValidator {
 	 * Returns {@code true} when the given header value is acceptable.
 	 */
 	public boolean isValid(@Nullable String authorizationHeader) {
-		if (this.token.length == "Bearer ".length()) { // empty token configured
+		if (this.bearerValues.isEmpty()) { // empty token configured
 			return true;
 		}
 		byte[] given = authorizationHeader == null ? new byte[0] : authorizationHeader.getBytes(StandardCharsets.UTF_8);
-		return MessageDigest.isEqual(this.token, given);
+		// every one is compared, so the time taken tells nothing of which matched
+		boolean valid = false;
+		for (byte[] bearerValue : this.bearerValues) {
+			valid |= MessageDigest.isEqual(bearerValue, given);
+		}
+		return valid;
 	}
 
 	/**
-	 * The {@code authorization} header value that passes {@link #isValid}: the shared
-	 * token, for peer to peer calls (the route gate propagation).
+	 * The {@code authorization} header value that passes {@link #isValid}: the first of
+	 * the configured tokens, for peer to peer calls (the route gate propagation).
 	 */
 	public String authorizationHeader() {
-		return new String(this.token, StandardCharsets.UTF_8);
+		return this.bearerValues.isEmpty() ? "Bearer " : new String(this.bearerValues.get(0), StandardCharsets.UTF_8);
 	}
 
 }

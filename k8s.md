@@ -298,6 +298,8 @@ Notes:
 - Replace the single-node release when switching (`helm uninstall sluice-server -n sluice`).
 - Env vars may use the plain property names (`sluice.token-file`) -- no need for
   `UPPER_SNAKE`; the values are plain strings and Spring binds them as-is.
+- The mounted token file may hold several tokens, one per line, all accepted: add the new
+  one before the clients switch and remove the old one after they have.
 - Clients only need one entry point: the bootstrap `--sluice.server-url` (any node LB),
     asked for the node list only; the streams go to the per-node addresses. The data
     plane LB is the front for ordinary HTTP traffic (`Host` header routing); any node

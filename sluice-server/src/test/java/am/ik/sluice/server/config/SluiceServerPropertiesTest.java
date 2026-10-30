@@ -38,6 +38,15 @@ class SluiceServerPropertiesTest {
 	}
 
 	@Test
+	void tunnelTokensBindAsASetAndASingleValueStillBinds() {
+		assertThat(bind(Map.of("sluice.data-port", "8000")).token()).isEmpty();
+		assertThat(bind(Map.of("sluice.token", "SECRET")).token()).containsExactly("SECRET");
+		assertThat(bind(Map.of("sluice.token", "a,b")).token()).containsExactlyInAnyOrder("a", "b");
+		assertThat(bind(Map.of("sluice.token[0]", "a", "sluice.token[1]", "b")).token()).containsExactlyInAnyOrder("a",
+				"b");
+	}
+
+	@Test
 	void accessControlDefaultsToEmptyLists() {
 		SluiceServerProperties properties = bind(Map.of("sluice.data-port", "8000"));
 		assertThat(properties.accessControl().allowCidrs()).isEmpty();

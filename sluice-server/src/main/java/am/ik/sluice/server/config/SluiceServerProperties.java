@@ -1,6 +1,7 @@
 package am.ik.sluice.server.config;
 
 import java.time.Duration;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
@@ -39,16 +40,22 @@ import am.ik.sluice.server.route.LoadBalance;
  * @param limits data plane connection limits and the head deadline
  * @param liveLog the live access log: the flume this node feeds its lines to while
  * someone watches, and the console watches the lines of every node from
+ * @param token the bearer tokens tunnel clients may carry ({@code sluice.token[0..]}, or
+ * comma separated); empty = one is generated
+ * @param tokenFile a file holding the tokens, one per line; when set it is used instead
+ * of {@code token}
  */
 @ConfigurationProperties("sluice")
-public record SluiceServerProperties(String token, @Nullable String tokenFile, @DefaultValue("0.0.0.0") String dataHost,
-		@DefaultValue("8000") int dataPort, @Nullable String dataTlsBundle, @Nullable String caBundle,
-		@DefaultValue("false") boolean dataProxyProtocol, @DefaultValue("false") boolean controlProxyProtocol,
-		@DefaultValue("") String tcpPortRange, AccessLog accessLog, AccessControl accessControl, Node node,
-		Cluster cluster, Console console, Route route, @DefaultValue("smallest-client-id") LoadBalance httpLoadBalance,
+public record SluiceServerProperties(Set<String> token, @Nullable String tokenFile,
+		@DefaultValue("0.0.0.0") String dataHost, @DefaultValue("8000") int dataPort, @Nullable String dataTlsBundle,
+		@Nullable String caBundle, @DefaultValue("false") boolean dataProxyProtocol,
+		@DefaultValue("false") boolean controlProxyProtocol, @DefaultValue("") String tcpPortRange, AccessLog accessLog,
+		AccessControl accessControl, Node node, Cluster cluster, Console console, Route route,
+		@DefaultValue("smallest-client-id") LoadBalance httpLoadBalance,
 		@DefaultValue("smallest-client-id") LoadBalance tcpLoadBalance, Limits limits, LiveLog liveLog) {
 
 	public SluiceServerProperties {
+		token = token == null ? Set.of() : Set.copyOf(token);
 		dataHost = dataHost == null || dataHost.isBlank() ? "0.0.0.0" : dataHost;
 		accessLog = accessLog == null ? AccessLog.builder().build() : accessLog;
 		accessControl = accessControl == null ? AccessControl.builder().build() : accessControl;
@@ -1229,7 +1236,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 
 	public static final class Builder {
 
-		@Nullable private String token;
+		private Set<String> token = Set.of();
 
 		@Nullable private String tokenFile;
 
@@ -1271,7 +1278,12 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		}
 
 		public Builder token(String token) {
-			this.token = token;
+			this.token = Set.of(token);
+			return this;
+		}
+
+		public Builder tokens(Collection<String> tokens) {
+			this.token = Set.copyOf(tokens);
 			return this;
 		}
 
@@ -1366,7 +1378,7 @@ public record SluiceServerProperties(String token, @Nullable String tokenFile, @
 		}
 
 		public SluiceServerProperties build() {
-			return new SluiceServerProperties(this.token == null ? "" : this.token, this.tokenFile,
+			return new SluiceServerProperties(this.token, this.tokenFile,
 					this.dataHost == null ? "0.0.0.0" : this.dataHost, this.dataPort, this.dataTlsBundle, this.caBundle,
 					this.dataProxyProtocol, this.controlProxyProtocol, this.tcpPortRange,
 					this.accessLog == null ? AccessLog.builder().build() : this.accessLog, this.accessControl,

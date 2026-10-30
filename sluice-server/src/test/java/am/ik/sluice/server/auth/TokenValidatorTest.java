@@ -37,6 +37,27 @@ class TokenValidatorTest {
 	}
 
 	@Test
+	void everyConfiguredTokenIsAcceptedAndPeersGetAFixedOne() {
+		TokenValidator validator = new TokenValidator(
+				SluiceServerProperties.builder().tokens(java.util.List.of("b-token", "a-token")).build());
+		assertThat(validator.isValid("Bearer a-token")).isTrue();
+		assertThat(validator.isValid("Bearer b-token")).isTrue();
+		assertThat(validator.isValid("Bearer c-token")).isFalse();
+		assertThat(validator.authorizationHeader()).isEqualTo("Bearer a-token");
+	}
+
+	@Test
+	void tokenFileHoldsOneTokenPerLine(@org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
+		java.nio.file.Path file = dir.resolve("token.txt");
+		java.nio.file.Files.writeString(file, "b-token\n\na-token\n");
+		TokenValidator validator = new TokenValidator(
+				SluiceServerProperties.builder().tokenFile(file.toString()).build());
+		assertThat(validator.isValid("Bearer a-token")).isTrue();
+		assertThat(validator.isValid("Bearer b-token")).isTrue();
+		assertThat(validator.isValid(null)).as("a blank line does not open the tunnel").isFalse();
+	}
+
+	@Test
 	void clusterModeWithoutTokenRefusesToStart() {
 		org.assertj.core.api.Assertions
 			.assertThatThrownBy(() -> new TokenValidator(SluiceServerProperties.builder()
