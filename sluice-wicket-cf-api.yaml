@@ -1,8 +1,8 @@
-image: ghcr.io/making/sluice/sluice-wicket-cf-api@sha256:7e41f2ae93104a560502c9128e0612aba8a856b513c835234d2ec6b0858671c3
-git_revision: fb3b884d9964ce24c25084c9037d0b850dd88d50
+image: ghcr.io/making/sluice/sluice-wicket-cf-api@sha256:643b94047c49ee4a9610f7d924b96e1ce179eaed0838647f8fad85b85a40d95e
+git_revision: efbbd88436023d3ed273d014d47f380b3f7420d8
 deployment:
   image:
     repository: ghcr.io/making/sluice/sluice-wicket-cf-api
-    digest: sha256:7e41f2ae93104a560502c9128e0612aba8a856b513c835234d2ec6b0858671c3
+    digest: sha256:643b94047c49ee4a9610f7d924b96e1ce179eaed0838647f8fad85b85a40d95e
   podLabels:
-    github.com/revision: fb3b884d9964ce24c25084c9037d0b850dd88d50
+    github.com/revision: efbbd88436023d3ed273d014d47f380b3f7420d8
