@@ -85,8 +85,8 @@ namespace (`--network host`, a sidecar, `kubectl port-forward`).
 
 The images on one host, with Redis holding the apps' keyvalue data and [Dex](https://dexidp.io/)
 as the OpenID Provider of the cf-api and of the wicket's console alike, its users in its
-configuration file. The apps are published on 8080, the cf-api (9091), the console (9090) and
-Dex (5556) on the host's loopback: `cf` and the browser run on that host (Docker Engine on
+configuration file. The apps are published on 18080 (8080 is often taken on a workstation), the
+cf-api (9091), the console (9090) and Dex (5556) on the host's loopback: `cf` and the browser run on that host (Docker Engine on
 Linux, Docker Desktop or OrbStack on macOS) or through an SSH tunnel
 (`ssh -L 9091:127.0.0.1:9091 -L 9090:127.0.0.1:9090 -L 5556:127.0.0.1:5556 <host>`). Dex is
 `dex.localhost` for everyone: the loopback to the browser (`*.localhost`), the service's alias
@@ -135,7 +135,7 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
     ports:
-      - "8080:8080"                 # the apps
+      - "18080:8080"                # the apps
       - "127.0.0.1:9090:9090"       # the console, from this host only
     volumes:
       - ./wicket.yaml:/etc/sluice/wicket.yaml:ro
@@ -230,12 +230,12 @@ docker compose up -d
 cf login -a http://127.0.0.1:9091 --sso    # open the URL it prints, log in at Dex (admin@example.com / secret), paste the code
 cf push hello -p hello/                    # hello/ holds hello.wasm, as in Run
 open http://127.0.0.1:9090/                # the wicket's console: signed in through Dex too
-curl http://hello.localhost:8080/          # with APPS_DOMAIN: http://hello.apps.example.com:8080/
+curl http://hello.localhost:18080/         # with APPS_DOMAIN: http://hello.apps.example.com:18080/
 cf create-service keyvalue redis kv        # the namespace cf/<instance guid> in Redis
 cf push counter -p counter/ --no-start
 cf bind-service counter kv
 cf start counter
-curl http://counter.localhost:8080/        # hits 1, 2, ... in Redis: cf/<instance guid>:hits
+curl http://counter.localhost:18080/       # hits 1, 2, ... in Redis: cf/<instance guid>:hits
 ```
 
 `docker compose down` keeps the volumes: the next `up` serves the apps again, with their data
