@@ -13,8 +13,14 @@ cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> sluice-w
                                              +--Watch-- sluice-flume <--Feed----+  (cf logs, optional)
 ```
 
-The target is the OSS CLI ([cloudfoundry/cli](https://github.com/cloudfoundry/cli) v8, `cf8`);
-the Tanzu distribution (`cf` 10.x) reads `/v3/info` and refuses any other platform.
+The `cf` here is the OSS CLI ([cloudfoundry/cli](https://github.com/cloudfoundry/cli) v8, whose
+archive holds it as `cf` and `cf8`); the Tanzu distribution (`cf` 10.x) reads `/v3/info` and
+refuses any other platform.
+
+[![cf push, routes, scale, environment variables, a keyvalue service and cf logs against a wicket in local mode](demo/sluice-cf-demo.gif)](demo/sluice-cf-demo.mp4)
+
+The GIF links to the [MP4](demo/sluice-cf-demo.mp4); both are recorded by `demo/record.sh`
+([demo/README.md](demo/README.md)).
 
 ## Run
 
@@ -32,17 +38,18 @@ sluice-wicket-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090 --console-to
 target/release/sluice-wicket-cf-api --wicket http://127.0.0.1:9090 --wicket-token SECRET \
   --flume grpc://127.0.0.1:8002 --flume-token FLUME_SECRET
 
-cf8 login -a http://127.0.0.1:9091 -u me -p x   # any credentials
-cf8 push hello -p dist/                          # dist/ holds hello.wasm (a wasi:http 0.3 component)
-curl http://hello.localhost:8080/                # the wicket's --listen; *.localhost is the loopback
-cf8 map-route hello localhost --hostname hi
-cf8 scale hello -i 2
-cf8 push hello -p dist/ --strategy rolling       # swapped in place
-cf8 logs hello --recent
-cf8 marketplace                                  # the wicket's keyvalue stores and capabilities
-cf8 create-service keyvalue local kv             # a namespace of the store local
-cf8 bind-service counter kv                      # counter: a wasi:keyvalue component
-cf8 restart counter                              # a binding applies at the next start
+cf login -a http://127.0.0.1:9091 -u me -p x   # any credentials
+cf push hello -p hello/                        # hello/ holds hello.wasm (a wasi:http 0.3 component)
+curl http://hello.localhost:8080/              # the wicket's --listen; *.localhost is the loopback
+cf map-route hello localhost --hostname hi
+cf scale hello -i 2
+cf push hello -p hello/ --strategy rolling     # swapped in place
+cf logs hello --recent
+cf marketplace                                 # the wicket's keyvalue stores and capabilities
+cf create-service keyvalue local kv            # a namespace of the store local
+cf push counter -p counter/ --no-start         # counter/ holds counter.wasm, a wasi:keyvalue component
+cf bind-service counter kv
+cf start counter                               # a binding applies at the next start
 ```
 
 | option | |
@@ -161,12 +168,12 @@ groups, user-provided services, service keys. One owner (`cf`) per wicket: two c
 share one.
 
 The integration test (`tests/cli.rs`) runs the OSS CLI -- `SLUICE_CF_CLI`, else `cf8` on the
-PATH -- against the cf-api and a wicket in local mode on a flume, building the wicket and its
+PATH, never a `cf` that may be the Tanzu one -- against the cf-api and a wicket in local mode on a flume, building the wicket and its
 example guests from `../sluice-wicket-wasi` and the flume from `../sluice-flume` (or taking
 `SLUICE_WICKET_WASI`, `SLUICE_WICKET_GUESTS` and `SLUICE_FLUME`):
 
 ```text
 gh release download v8.19.0 -R cloudfoundry/cli -p 'cf8-cli_8.19.0_macosarm.tgz'
 tar xzf cf8-cli_8.19.0_macosarm.tgz
-SLUICE_CF_CLI=$PWD/cf8 cargo test
+SLUICE_CF_CLI=$PWD/cf cargo test
 ```
