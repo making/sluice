@@ -249,7 +249,7 @@ function errorMessage(status, answer, text) {
     return answer.error;
   }
   if (status === 401) {
-    return "The console token was refused or is missing. Reload the page to sign in again.";
+    return "Not signed in: the token was refused or is missing, or the session ended. Reload the page to sign in again.";
   }
   return text ? `HTTP ${status}: ${text.slice(0, 500)}` : `HTTP ${status}`;
 }
@@ -1115,6 +1115,10 @@ function toggleRename(route) {
 function renderStatus() {
   const { listing } = state;
   field("build").textContent = listing.build || "unknown";
+  // signed in through the OpenID Provider: the masthead names the user
+  const session = $(".masthead__user");
+  session.hidden = !listing.user;
+  field("user").textContent = listing.user ?? "";
   field("generation").textContent = String(listing.generation);
   field("route-count").textContent = String(listing.routes.length);
   const listen = field("listen");

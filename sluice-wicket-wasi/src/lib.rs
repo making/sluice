@@ -216,7 +216,13 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         None => None,
     };
     let console_listener = match &console {
-        Some(console) => Some(console::bind(&console.address, console.token.is_some()).await?),
+        Some(console) => Some(
+            console::bind(
+                &console.address,
+                console.token.is_some() || console.oidc.is_some(),
+            )
+            .await?,
+        ),
         None => None,
     };
     println!(
@@ -248,9 +254,12 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         println!(
             "console on http://{} ({}); its routes kept in {}",
             listener.local_addr()?,
-            match console.token {
-                Some(_) => "--console-token required",
-                None => "loopback, no token",
+            match (&console.token, &console.oidc) {
+                (Some(_), Some(oidc)) =>
+                    format!("--console-token, or a sign-in at {}", oidc.issuer),
+                (None, Some(oidc)) => format!("a sign-in at {}", oidc.issuer),
+                (Some(_), None) => "--console-token required".to_string(),
+                (None, None) => "loopback, no token".to_string(),
             },
             console.dir.display()
         );
@@ -262,6 +271,13 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
                 requests,
                 stores: reloader.stores().clone(),
                 token: console.token,
+                sign_in: match console.oidc {
+                    Some(oidc) => Some(console::SignIn {
+                        provider: sluice_oidc::Provider::new(oidc)?,
+                        signer: sluice_oidc::Signer::random(),
+                    }),
+                    None => None,
+                },
                 server: server.clone(),
                 listen: listening,
             }),

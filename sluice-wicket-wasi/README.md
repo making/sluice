@@ -196,6 +196,12 @@ watch-interval: 1s              # 0 = no polling, SIGHUP only
 # console: 127.0.0.1:9090       # see Console
 # console-token: ${CONSOLE_TOKEN}
 # console-dir: deployed         # relative to this file
+# oidc-issuer: https://idp.example.com/dex   # the console's browsers sign in through it
+# oidc-client-id: wicket
+# oidc-client-secret: ${OIDC_CLIENT_SECRET}
+# oidc-claim: [email=*@example.com, groups=devs]
+# oidc-scopes: openid,email,profile,groups
+# oidc-ca-cert: idp-ca.pem      # relative to this file
 # flume: grpc://127.0.0.1:8002  # see Live access log
 # flume-token: ${FLUME_TOKEN}
 # flume-ca-cert: flume-ca.pem   # relative to this file
@@ -340,11 +346,38 @@ the console only. One wicket per directory.
 
 `--console-token <token>` (`console-token`, `SLUICE_WICKET_WASI_CONSOLE_TOKEN`) is asked of
 every request: the browser prompts for it (HTTP Basic, any user name, the token as the
-password), an API client sends `Authorization: Bearer <token>`. Without one the console must
-listen on a loopback address (a startup error otherwise), and answers only requests for an IP
-address or `localhost`, so a DNS rebinding page cannot reach it. An edit from another origin
-is refused. The console speaks plain HTTP: reached from another host, put it behind TLS (a
-proxy passing the `Host` header on: an edit's `Origin` is checked against it).
+password), an API client sends `Authorization: Bearer <token>`. Without one, and without a
+provider (below), the console must listen on a loopback address (a startup error otherwise),
+and answers only requests for an IP address or `localhost`, so a DNS rebinding page cannot
+reach it. An edit from another origin is refused. The console speaks plain HTTP: reached from
+another host, put it behind TLS (a proxy passing the `Host` header on, and `X-Forwarded-Proto`:
+an edit's `Origin` is checked against the host, the sign-in's callback is made from both).
+
+#### Sign-in through an OpenID Provider
+
+With `--oidc-issuer` (`oidc-issuer`) a browser signs in through the provider instead of
+typing the token (which API clients keep sending as `Bearer`, the cf-api among them):
+
+| option | |
+|---|---|
+| `--oidc-issuer <url>` | the provider; its discovery document is at `<url>/.well-known/openid-configuration`, found at the first sign-in |
+| `--oidc-client-id <id>` | the client registered with it, whose redirect URI is `<console URL>/oauth2/callback` (required with `--oidc-issuer`) |
+| `--oidc-client-secret <secret>` | its secret; none = a public client (PKCE only) |
+| `--oidc-claim <claim>=<pattern>` | who may sign in: the ID token's claim must hold (a list claim: contain) the pattern, `*` matching any run of characters; repeatable (or comma-separated; a list in the config file). One claim's patterns are alternatives, distinct claims must all hold. At least one rule is required (`email=*` lets anyone the provider knows in) |
+| `--oidc-scopes <list>` | the scopes asked for, comma-separated (default `openid,email,profile`; Dex sends the `groups` claim for the scope `groups`) |
+| `--oidc-ca-cert <path>` | a PEM CA the provider's certificate is verified against (default the webPKI roots) |
+
+A page request without a session is sent to `/login`, which runs the authorization code flow
+(PKCE, a nonce) and whose callback, `/oauth2/callback`, exchanges the code for the ID token --
+taken as it comes from the provider's token endpoint (over TLS, against the client's secret;
+OpenID Connect Core 3.1.3.7, item 6) once `iss`, `aud`, `exp` and the nonce check out -- and
+applies the `--oidc-claim` rules (`403` naming the claim that failed). The session is a cookie
+sealed with a key drawn at startup (`HttpOnly`, `SameSite=Lax`, `Secure` behind
+`X-Forwarded-Proto: https`), good for 8 hours; a restart signs every browser out. The page
+names the user (`preferred_username`, else `email`, else `sub`) and links `/logout`. An API
+request without a session or the token is answered `401` (no Basic prompt then: the page is
+reloaded to sign in again). The cf-api's [Docker Compose](../sluice-wicket-cf-api/README.md#docker-compose)
+sample runs the console and the cf-api on one Dex.
 
 In a container the console listens on all addresses, to be reached through a published port,
 so it takes a token. With Docker Compose (`compose.yaml`; the console's routes and the

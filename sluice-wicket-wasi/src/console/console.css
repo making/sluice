@@ -226,6 +226,15 @@ code {
 	color: var(--ink-soft);
 }
 
+/* who signed in through the OpenID Provider, with the way out */
+.masthead__user {
+	margin: 0.15rem 0 0;
+}
+
+.masthead__signout {
+	margin-left: 0.5rem;
+}
+
 /* ------------------------------------------------------------------- sheet */
 
 /* the drawing sheet: an outer frame and an inset border, title block in the corner */

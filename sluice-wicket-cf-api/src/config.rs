@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::flume::FlumeSettings;
-use crate::oidc::{ClaimRule, OidcSettings};
+use crate::oidc::{OidcSettings, parse_rules};
 use crate::{Settings, TlsSettings};
 
 pub const USAGE: &str = "\
@@ -217,27 +217,10 @@ pub fn parse(
             }
             let client_id =
                 value("oidc-client-id").ok_or("--oidc-client-id is required with --oidc-issuer")?;
-            let mut claims: Vec<ClaimRule> = Vec::new();
-            for rule in values("oidc-claim")
-                .iter()
-                .flat_map(|value| value.split(','))
-                .map(str::trim)
-                .filter(|rule| !rule.is_empty())
-            {
-                let (claim, pattern) = rule
-                    .split_once('=')
-                    .filter(|(claim, _)| !claim.is_empty())
-                    .ok_or_else(|| {
-                        format!("--oidc-claim: expected <claim>=<pattern>, got '{rule}'")
-                    })?;
-                match claims.iter_mut().find(|known| known.claim == claim) {
-                    Some(known) => known.patterns.push(pattern.to_string()),
-                    None => claims.push(ClaimRule {
-                        claim: claim.to_string(),
-                        patterns: vec![pattern.to_string()],
-                    }),
-                }
-            }
+            let claims = parse_rules(
+                values("oidc-claim").iter().map(String::as_str),
+                "--oidc-claim",
+            )?;
             if claims.is_empty() {
                 return Err(
                     "--oidc-claim is required with --oidc-issuer: who may log in (email=* for anyone the provider knows)".into(),
@@ -320,6 +303,7 @@ pub fn parse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oidc::ClaimRule;
 
     fn args(line: &str) -> Vec<String> {
         line.split_whitespace().map(String::from).collect()

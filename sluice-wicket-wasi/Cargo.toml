@@ -34,8 +34,10 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body = "1"
 http-body-util = "0.1"
 bytes = "1"
-# component fetch from http(s) locators
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+# component fetch from http(s) locators, through sluice-oidc's rustls (no TLS of its own)
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
+# the console's sign-in through an OpenID Provider
+sluice-oidc = { path = "../sluice-oidc" }
 # control-plane TLS (grpcs / --insecure); the ring provider matches tonic's tls-ring
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # wasmtime's ResourceLimiterAsync is #[async_trait]; the impl must match
@@ -65,6 +67,8 @@ redis = ["dep:redis"]
 [dev-dependencies]
 # paused time for the stall watchdog tests
 tokio = { version = "1", features = ["test-util"] }
+# the console test's OpenID Provider
+sluice-oidc = { path = "../sluice-oidc", features = ["mock"] }
 # an h2 client for the per-connection stream limit; the version hyper uses
 h2 = "0.4"
 # the CA and certificate of the redis-server the rediss:// test runs

@@ -84,10 +84,11 @@ namespace (`--network host`, a sidecar, `kubectl port-forward`).
 ### Docker Compose
 
 The images on one host, on its network (`network_mode: host`), with Redis holding the apps'
-keyvalue data and [Dex](https://dexidp.io/) as the OpenID Provider, its users in its
-configuration file: the cf-api listens on the loopback, and reaches the wicket's console, the
-flume and Dex there. `cf` and the browser run on that host (Docker Engine on Linux, OrbStack on
-macOS) or through an SSH tunnel (`ssh -L 9091:127.0.0.1:9091 -L 5556:127.0.0.1:5556 <host>`).
+keyvalue data and [Dex](https://dexidp.io/) as the OpenID Provider of the cf-api and of the
+wicket's console alike, its users in its configuration file: the cf-api listens on the
+loopback, and reaches the wicket's console, the flume and Dex there. `cf` and the browser run
+on that host (Docker Engine on Linux, OrbStack on macOS) or through an SSH tunnel
+(`ssh -L 9091:127.0.0.1:9091 -L 9090:127.0.0.1:9090 -L 5556:127.0.0.1:5556 <host>`).
 
 ```yaml
 # compose.yaml; .env holds FLUME_TOKEN, CONSOLE_TOKEN, REDIS_PASSWORD and OIDC_CLIENT_SECRET
@@ -131,10 +132,11 @@ services:
       CONSOLE_TOKEN: ${CONSOLE_TOKEN:?CONSOLE_TOKEN}
       FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
     volumes:
       - ./wicket.yaml:/etc/sluice/wicket.yaml:ro
       - wicket:/data    # the apps and their components (deployed/)
-    depends_on: [redis]
+    depends_on: [redis, dex]
     restart: unless-stopped
   cf-api:
     image: ghcr.io/making/sluice/sluice-wicket-cf-api
@@ -145,7 +147,7 @@ services:
       SLUICE_WICKET_CF_API_WICKET_TOKEN: ${CONSOLE_TOKEN:?CONSOLE_TOKEN}
       SLUICE_WICKET_CF_API_FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
       SLUICE_WICKET_CF_API_DOMAIN: ${APPS_DOMAIN:-localhost}
-      SLUICE_WICKET_CF_API_OIDC_CLIENT_ID: cf
+      SLUICE_WICKET_CF_API_OIDC_CLIENT_ID: sluice
       SLUICE_WICKET_CF_API_OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
       SLUICE_WICKET_CF_API_OIDC_CLAIM: email=admin@example.com    # who may log in
     volumes:
@@ -163,8 +165,12 @@ volumes:
 # wicket's environment
 listen: 0.0.0.0:8080            # the apps; with server and token also through a sluice server
 console: 127.0.0.1:9090
-console-token: ${CONSOLE_TOKEN}
+console-token: ${CONSOLE_TOKEN}  # the cf-api's
 console-dir: /data/deployed     # in the volume, not next to this file
+oidc-issuer: http://127.0.0.1:5556/dex    # the browser signs in through Dex
+oidc-client-id: sluice
+oidc-client-secret: ${OIDC_CLIENT_SECRET}
+oidc-claim: email=admin@example.com       # who may sign in
 flume: grpc://127.0.0.1:8002
 flume-token: ${FLUME_TOKEN}
 keyvalue:
@@ -185,10 +191,12 @@ web:
 oauth2:
   skipApprovalScreen: true
 staticClients:
-  - id: cf                      # the cf-api's --oidc-client-id
-    name: sluice-wicket-cf-api
+  - id: sluice                  # the cf-api's and the console's oidc-client-id
+    name: sluice
     secretEnv: OIDC_CLIENT_SECRET
-    redirectURIs: [http://127.0.0.1:9091/uaa/callback]
+    redirectURIs:
+      - http://127.0.0.1:9091/uaa/callback      # the cf-api
+      - http://127.0.0.1:9090/oauth2/callback   # the wicket's console
 enablePasswordDB: true
 staticPasswords:                # the users: Dex asks for the email and the password
   - email: admin@example.com
@@ -202,6 +210,7 @@ staticPasswords:                # the users: Dex asks for the email and the pass
 docker compose up -d
 cf login -a http://127.0.0.1:9091 --sso    # open the URL it prints, log in at Dex, paste the code
 cf push hello -p hello/                    # hello/ holds hello.wasm, as in Run
+open http://127.0.0.1:9090/                # the wicket's console: signed in through Dex too
 curl http://hello.localhost:8080/          # with APPS_DOMAIN: http://hello.apps.example.com:8080/
 cf create-service keyvalue redis kv        # the namespace cf/<instance guid> in Redis
 cf push counter -p counter/ --no-start
@@ -212,9 +221,9 @@ curl http://counter.localhost:8080/        # hits 1, 2, ... in Redis: cf/<instan
 
 `docker compose down` keeps the volumes: the next `up` serves the apps again, with their data
 (Redis keeps it in its append-only file) and the logins (`sessions.json` in the cf-api's). For
-other users, add them to `staticPasswords` and to `SLUICE_WICKET_CF_API_OIDC_CLAIM`
-(`email=admin@example.com,email=dev@example.com`), or give them a group and allow the group
-(`groups=devs`, with `--oidc-scopes openid,email,profile,groups`); a Dex
+other users, add them to `staticPasswords` and to `SLUICE_WICKET_CF_API_OIDC_CLAIM` and
+wicket.yaml's `oidc-claim` (`email=admin@example.com,email=dev@example.com`), or give them a
+group and allow the group (`groups=devs`, with the scopes `openid,email,profile,groups`); a Dex
 [connector](https://dexidp.io/docs/connectors/) replaces the static users with GitHub, LDAP,
 another OpenID Provider and the like.
 

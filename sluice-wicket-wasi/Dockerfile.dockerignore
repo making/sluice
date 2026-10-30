@@ -3,6 +3,8 @@
 !sluice-proto/src/main/proto
 !sluice-build-info/Cargo.toml
 !sluice-build-info/src
+!sluice-oidc/Cargo.toml
+!sluice-oidc/src
 !sluice-wicket-wasi/Cargo.toml
 !sluice-wicket-wasi/Cargo.lock
 !sluice-wicket-wasi/build.rs

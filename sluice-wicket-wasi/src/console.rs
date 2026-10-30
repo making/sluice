@@ -31,10 +31,14 @@
 //!
 //! With `--console-token` every request needs the token, as the password of
 //! HTTP Basic (any user name: the browser asks for it) or as a Bearer token.
-//! Without one the console listens on a loopback address only and answers
-//! only requests for an IP address or `localhost`, so a DNS rebinding page
-//! cannot reach it. Edits take no simple method -- neither a form nor
-//! `sendBeacon` can send one -- and one from another origin is refused.
+//! With `--oidc-issuer` a browser signs in through the OpenID Provider
+//! instead (`/login`, `/oauth2/callback`, `/logout`): the session is a
+//! cookie sealed with a key drawn at startup, good for [`SESSION_MAX_AGE`].
+//! Without either the console listens on a loopback address only and
+//! answers only requests for an IP address or `localhost`, so a DNS
+//! rebinding page cannot reach it. Edits take no simple method -- neither a
+//! form nor `sendBeacon` can send one -- and one from another origin is
+//! refused.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -49,6 +53,7 @@ use http::{HeaderValue, Method, StatusCode, header};
 use http_body_util::{BodyExt as _, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use serde::{Deserialize, Serialize};
+use sluice_oidc::{Provider, Signer};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -70,6 +75,11 @@ const LONG_POLL: Duration = Duration::from_secs(25);
 
 /// Connections open at once; one beyond waits in the backlog.
 const MAX_CONNECTIONS: usize = 64;
+
+/// How long a browser stays signed in.
+const SESSION_MAX_AGE: Duration = Duration::from_secs(8 * 3600);
+
+const SESSION_COOKIE: &str = "sluice-wicket-session";
 
 const INDEX: &str = include_str!("console/index.html");
 const CSS: &str = include_str!("console/console.css");
@@ -94,22 +104,40 @@ pub struct Console {
     pub stores: Arc<Stores>,
     /// None: no credentials asked, on a loopback address.
     pub token: Option<String>,
+    /// The browsers' sign-in through the OpenID Provider; None: the token.
+    pub sign_in: Option<SignIn>,
     /// What the page shows besides the routes.
     pub server: Option<String>,
     pub listen: Option<SocketAddr>,
 }
 
-/// Binds `address`; without a token, a loopback address only, checked before
-/// anything listens.
-pub async fn bind(address: &str, token: bool) -> Result<TcpListener, String> {
+/// The sign-in through the OpenID Provider (`--oidc-issuer`).
+pub struct SignIn {
+    pub provider: Provider,
+    /// Seals the sessions; drawn at startup: a restart signs every browser
+    /// out.
+    pub signer: Signer,
+}
+
+/// What a session cookie says.
+#[derive(Serialize, Deserialize)]
+struct Session {
+    user: String,
+    /// Seconds since the epoch.
+    exp: u64,
+}
+
+/// Binds `address`; `authenticated` (a token or a provider) or a loopback
+/// address only, checked before anything listens.
+pub async fn bind(address: &str, authenticated: bool) -> Result<TcpListener, String> {
     let failed = |e: std::io::Error| format!("--console {address}: {e}");
     let resolved: Vec<SocketAddr> = tokio::net::lookup_host(address)
         .await
         .map_err(failed)?
         .collect();
-    if !token && resolved.iter().any(|at| !at.ip().is_loopback()) {
+    if !authenticated && resolved.iter().any(|at| !at.ip().is_loopback()) {
         return Err(format!(
-            "--console {address}: a console on a non-loopback address needs --console-token"
+            "--console {address}: a console on a non-loopback address needs --console-token or --oidc-issuer"
         ));
     }
     TcpListener::bind(&resolved[..]).await.map_err(failed)
@@ -149,9 +177,15 @@ impl Console {
     async fn handle(&self, request: hyper::Request<Incoming>) -> Response {
         let (parts, body) = request.into_parts();
         let mut body = Some(body);
-        let mut response = match self.refusal(&parts) {
-            Some(refused) => refused,
-            None => self.route(&parts, &mut body).await,
+        let mut response = match (&self.sign_in, parts.uri.path()) {
+            // the way in: before any refusal
+            (Some(sign_in), "/login" | "/oauth2/callback" | "/logout") => {
+                self.sign_in_route(sign_in, &parts).await
+            }
+            _ => match self.refusal(&parts) {
+                Some(refused) => refused,
+                None => self.route(&parts, &mut body).await,
+            },
         };
         if let Some(body) = body {
             drain(body).await;
@@ -184,7 +218,10 @@ impl Console {
             (&Method::GET, "/fonts/overpass-mono.woff2") => asset("font/woff2", OVERPASS_MONO),
             (&Method::GET, "/api/routes") => {
                 let status = self.settled(query).await;
-                json(StatusCode::OK, &self.listing(&status))
+                json(
+                    StatusCode::OK,
+                    &self.listing(&status, self.session(&parts.headers)),
+                )
             }
             (&Method::GET, "/api/apps") => {
                 let status = self.settled(query).await;
@@ -227,34 +264,60 @@ impl Console {
         }
     }
 
-    /// The answer refusing a request without the token; without a token, one
-    /// for a host name but localhost (DNS rebinding); and an edit from another
-    /// origin. None: the request is admitted.
+    /// The answer refusing a request without the token or a session; without
+    /// either configured, one for a host name but localhost (DNS rebinding);
+    /// and an edit from another origin. None: the request is admitted.
     fn refusal(&self, parts: &Parts) -> Option<Response> {
         let headers = &parts.headers;
         let host = headers
             .get(header::HOST)
             .and_then(|host| host.to_str().ok())
             .unwrap_or_default();
-        match &self.token {
-            Some(token) if !authorized(headers.get(header::AUTHORIZATION), token) => {
-                let mut response = error(StatusCode::UNAUTHORIZED, "the console needs its token");
-                response.headers_mut().insert(
-                    header::WWW_AUTHENTICATE,
-                    HeaderValue::from_static(
-                        "Basic realm=\"sluice-wicket-wasi console\", charset=\"UTF-8\"",
-                    ),
-                );
-                return Some(response);
-            }
-            None if !local_authority(host) => {
+        let token = self
+            .token
+            .as_deref()
+            .is_some_and(|token| authorized(headers.get(header::AUTHORIZATION), token));
+        match (&self.token, &self.sign_in) {
+            (None, None) if !local_authority(host) => {
                 return Some(error(
                     StatusCode::FORBIDDEN,
-                    "without --console-token the console answers requests for an IP address \
-                     or localhost only",
+                    "without --console-token or --oidc-issuer the console answers requests for \
+                     an IP address or localhost only",
                 ));
             }
-            _ => {}
+            (None, None) => {}
+            _ if token || self.session(headers).is_some() => {}
+            (token, sign_in) => {
+                // a browser's page: to the sign-in; an API request: 401
+                let page = sign_in.is_some()
+                    && parts.method == Method::GET
+                    && !parts.uri.path().starts_with("/api/")
+                    && headers
+                        .get(header::ACCEPT)
+                        .and_then(|accept| accept.to_str().ok())
+                        .is_some_and(|accept| accept.contains("text/html"));
+                if page {
+                    return Some(redirect("/login", None));
+                }
+                let mut response = error(
+                    StatusCode::UNAUTHORIZED,
+                    if sign_in.is_some() {
+                        "the console needs a sign-in (/login), or its token"
+                    } else {
+                        "the console needs its token"
+                    },
+                );
+                // the browser's prompt, where the token is the way in
+                if token.is_some() && sign_in.is_none() {
+                    response.headers_mut().insert(
+                        header::WWW_AUTHENTICATE,
+                        HeaderValue::from_static(
+                            "Basic realm=\"sluice-wicket-wasi console\", charset=\"UTF-8\"",
+                        ),
+                    );
+                }
+                return Some(response);
+            }
         }
         let edit = !matches!(parts.method, Method::GET | Method::HEAD);
         let foreign = headers.get(header::ORIGIN).is_some_and(|origin| {
@@ -271,6 +334,116 @@ impl Console {
                 "an edit from another origin is refused",
             )
         })
+    }
+
+    /// Who the session cookie of `headers` names, when it is sealed with the
+    /// key and not expired.
+    fn session(&self, headers: &http::HeaderMap) -> Option<String> {
+        let signer = &self.sign_in.as_ref()?.signer;
+        let sealed = headers
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|cookies| cookies.to_str().ok())
+            .flat_map(|cookies| cookies.split(';'))
+            .map(str::trim)
+            .find_map(|cookie| {
+                cookie
+                    .strip_prefix(SESSION_COOKIE)
+                    .and_then(|rest| rest.strip_prefix('='))
+            })?;
+        let session: Session = serde_json::from_slice(&signer.verify(sealed)?).ok()?;
+        (session.exp > sluice_oidc::epoch_secs()).then_some(session.user)
+    }
+
+    /// `/login`, `/oauth2/callback` and `/logout`: the sign-in through the
+    /// provider, the session set by the callback.
+    async fn sign_in_route(&self, sign_in: &SignIn, parts: &Parts) -> Response {
+        let headers = &parts.headers;
+        let host = headers
+            .get(header::HOST)
+            .and_then(|host| host.to_str().ok())
+            .unwrap_or("localhost");
+        // the console speaks plain HTTP: https is a proxy's ahead of it
+        let https = headers
+            .get("x-forwarded-proto")
+            .and_then(|proto| proto.to_str().ok())
+            .is_some_and(|proto| proto == "https");
+        let callback = format!(
+            "{}://{host}/oauth2/callback",
+            if https { "https" } else { "http" }
+        );
+        let query: Vec<(String, String)> =
+            form_urlencoded::parse(parts.uri.query().unwrap_or_default().as_bytes())
+                .into_owned()
+                .collect();
+        let q = |key: &str| {
+            query
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, value)| value.as_str())
+        };
+        if parts.method != Method::GET {
+            return error(StatusCode::METHOD_NOT_ALLOWED, "the sign-in takes GET");
+        }
+        match parts.uri.path() {
+            "/login" => match sign_in.provider.begin(&callback).await {
+                Ok(location) => redirect(&location, None),
+                Err(e) => page(
+                    StatusCode::BAD_GATEWAY,
+                    "The provider is unreachable",
+                    format!("<p>{}</p>", escape(&e)),
+                ),
+            },
+            "/logout" => redirect("/", Some(cookie("", 0, https))),
+            _ => {
+                if let Some(error) = q("error") {
+                    return page(
+                        StatusCode::BAD_REQUEST,
+                        "The provider refused the sign-in",
+                        format!(
+                            "<p>{}: {}</p>",
+                            escape(error),
+                            escape(q("error_description").unwrap_or("no reason given"))
+                        ),
+                    );
+                }
+                let (Some(code), Some(state)) = (q("code"), q("state")) else {
+                    return page(
+                        StatusCode::BAD_REQUEST,
+                        "Not a callback",
+                        "<p>The provider sent no code and state: <a href=\"/login\">sign in again</a>.</p>".into(),
+                    );
+                };
+                match sign_in.provider.finish(code, state, &callback).await {
+                    Ok(identity) => {
+                        let session = Session {
+                            user: identity.user_name,
+                            exp: sluice_oidc::epoch_secs() + SESSION_MAX_AGE.as_secs(),
+                        };
+                        let sealed = sign_in
+                            .signer
+                            .sign(&serde_json::to_vec(&session).expect("plain data"));
+                        redirect("/", Some(cookie(&sealed, SESSION_MAX_AGE.as_secs(), https)))
+                    }
+                    Err(e) if e.starts_with("the claim ") => page(
+                        StatusCode::FORBIDDEN,
+                        "Not allowed",
+                        format!(
+                            "<p>{}</p><p><a href=\"/login\">Sign in again</a></p>",
+                            escape(&e)
+                        ),
+                    ),
+                    Err(e) => page(
+                        StatusCode::BAD_REQUEST,
+                        "The sign-in failed",
+                        format!(
+                            "<p>{}</p><p><a href=\"/login\">Sign in again</a></p>",
+                            escape(&e)
+                        ),
+                    ),
+                }
+            }
+        }
     }
 
     /// The status once the routes moved past `after` of `query` (the current
@@ -291,7 +464,7 @@ impl Console {
         status.borrow().clone()
     }
 
-    fn listing(&self, status: &Status) -> Listing {
+    fn listing(&self, status: &Status, user: Option<String>) -> Listing {
         let table = self.routes.current();
         let routes = table
             .advertised
@@ -338,6 +511,7 @@ impl Console {
             revision: status.revision,
             generation: table.generation,
             build: crate::describe_build(),
+            user,
             server: self.server.clone(),
             listen: self.listen.map(|listen| listen.to_string()),
             max_component_bytes: MAX_COMPONENT_BYTES,
@@ -781,6 +955,49 @@ fn local_authority(authority: &str) -> bool {
     host.parse::<std::net::IpAddr>().is_ok() || host.eq_ignore_ascii_case("localhost")
 }
 
+/// A redirect to `location`, setting `cookie` when there is one.
+fn redirect(location: &str, cookie: Option<String>) -> Response {
+    let mut response = hyper::Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, location)
+        .header(header::CACHE_CONTROL, "no-store");
+    if let Some(cookie) = cookie {
+        response = response.header(header::SET_COOKIE, cookie);
+    }
+    response
+        .body(Full::new(Bytes::new()))
+        .expect("a plain response")
+}
+
+/// The session cookie holding `sealed` for `max_age` seconds (0: cleared).
+fn cookie(sealed: &str, max_age: u64, https: bool) -> String {
+    format!(
+        "{SESSION_COOKIE}={sealed}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{}",
+        if https { "; Secure" } else { "" }
+    )
+}
+
+/// A page of the sign-in: `title` and the `body` fragment (the page's own
+/// style is behind the sign-in).
+fn page(status: StatusCode, title: &str, body: String) -> Response {
+    hyper::Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Full::new(Bytes::from(format!(
+            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title} - Sluice wicket</title></head><body><h1>{title}</h1>{body}</body></html>"
+        ))))
+        .expect("a plain response")
+}
+
+/// `text` safe inside an HTML element.
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn asset(content_type: &'static str, body: &'static [u8]) -> Response {
     hyper::Response::builder()
         .header(header::CONTENT_TYPE, content_type)
@@ -866,6 +1083,9 @@ struct Listing {
     revision: u64,
     generation: u64,
     build: String,
+    /// Who is signed in through the provider, for the page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
     server: Option<String>,
     listen: Option<String>,
     max_component_bytes: usize,
@@ -1124,7 +1344,10 @@ mod tests {
         // refused before anything listens: no socket on these addresses
         for exposed in ["0.0.0.0:0", "[::]:0", "192.0.2.1:9090"] {
             let refused = bind(exposed, false).await.unwrap_err();
-            assert!(refused.ends_with("needs --console-token"), "{refused}");
+            assert!(
+                refused.ends_with("needs --console-token or --oidc-issuer"),
+                "{refused}"
+            );
         }
         for loopback in ["127.0.0.1:0", "localhost:0"] {
             bind(loopback, false).await.unwrap();

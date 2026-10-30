@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
+use sluice_oidc::OidcSettings;
 
 use crate::deployed::Deployed;
 use crate::env::Env;
@@ -33,9 +34,23 @@ usage: sluice-wicket-wasi --server <url> --wasm <host>=<locator>[?<options>] ...
   --console <host:port>           serve the console: a page and an API deploying uploaded
                                   components as routes, kept in --console-dir
   --console-token <token>         the console's credentials (the HTTP Basic password, or a
-                                  Bearer token); required on a non-loopback address
+                                  Bearer token); a non-loopback address needs it or
+                                  --oidc-issuer
   --console-dir <path>            where the console keeps its routes and components
                                   (default deployed, next to the --config file)
+  --oidc-issuer <url>             the OpenID Provider the console's browsers sign in
+                                  through (discovery at <url>/.well-known/openid-configuration)
+  --oidc-client-id <id>           the client registered with it, whose redirect URI is
+                                  <console url>/oauth2/callback (required with --oidc-issuer)
+  --oidc-client-secret <secret>   its secret; none = a public client (PKCE only)
+  --oidc-claim <claim>=<pattern>  who may sign in: the ID token's claim must hold (a list:
+                                  contain) the pattern, * matching any run of characters;
+                                  repeatable (or comma-separated): one claim's patterns are
+                                  alternatives, distinct claims must all hold (at least one
+                                  rule is required with --oidc-issuer, e.g. email=*)
+  --oidc-scopes <list>            the scopes asked for, comma-separated (default
+                                  openid,email,profile)
+  --oidc-ca-cert <path>           PEM CA verifying the provider (default the webPKI roots)
   --keyvalue-file <path>          the SQLite file of the keyvalue store without a keyvalue
                                   section in the --config file (default keyvalue.db)
   --token <token>                 bearer token of the tunnel streams
@@ -125,10 +140,13 @@ pub struct FlumeSettings {
 pub struct ConsoleSettings {
     /// Where it listens, `host:port`.
     pub address: String,
-    /// The credentials it asks for; None: none, on a loopback address only.
+    /// The credentials it asks for; None: none, unless browsers sign in
+    /// through the provider, on a loopback address only.
     pub token: Option<String>,
     /// Where it keeps the routes it deployed.
     pub dir: PathBuf,
+    /// The OpenID Provider its browsers sign in through.
+    pub oidc: Option<OidcSettings>,
 }
 
 /// What to run: print something and exit, or run.
@@ -158,6 +176,12 @@ struct Flags {
     console: Option<String>,
     console_token: Option<String>,
     console_dir: Option<PathBuf>,
+    oidc_issuer: Option<String>,
+    oidc_client_id: Option<String>,
+    oidc_client_secret: Option<String>,
+    oidc_claim: Option<String>,
+    oidc_scopes: Option<String>,
+    oidc_ca_cert: Option<PathBuf>,
     flume: Option<String>,
     flume_token: Option<String>,
     flume_ca_cert: Option<PathBuf>,
@@ -181,6 +205,12 @@ const VALUED: &[&str] = &[
     "console",
     "console-token",
     "console-dir",
+    "oidc-issuer",
+    "oidc-client-id",
+    "oidc-client-secret",
+    "oidc-claim",
+    "oidc-scopes",
+    "oidc-ca-cert",
     "flume",
     "flume-token",
     "flume-ca-cert",
@@ -221,6 +251,16 @@ pub fn parse(
                 };
                 match *name {
                     "wasm" => routes.push(parse_wasm_flag(&value)?),
+                    // repeatable: the rules add up
+                    "oidc-claim" => match given.get_mut("oidc-claim") {
+                        Some(rules) => {
+                            rules.push(',');
+                            rules.push_str(&value);
+                        }
+                        None => {
+                            given.insert("oidc-claim", value);
+                        }
+                    },
                     name => {
                         given.insert(name, value);
                     }
@@ -265,6 +305,12 @@ pub fn parse(
         console: value("console"),
         console_token: value("console-token"),
         console_dir: value("console-dir").map(PathBuf::from),
+        oidc_issuer: value("oidc-issuer"),
+        oidc_client_id: value("oidc-client-id"),
+        oidc_client_secret: value("oidc-client-secret"),
+        oidc_claim: value("oidc-claim"),
+        oidc_scopes: value("oidc-scopes"),
+        oidc_ca_cert: value("oidc-ca-cert").map(PathBuf::from),
         flume: value("flume"),
         flume_token: value("flume-token"),
         flume_ca_cert: value("flume-ca-cert").map(PathBuf::from),
@@ -320,6 +366,76 @@ fn merge(flags: Flags) -> Result<Settings, String> {
             "--server or --listen (or `server` / `listen` in the --config file) is required".into(),
         );
     }
+    let oidc = match flags
+        .oidc_issuer
+        .or_else(|| settings.oidc_issuer.clone())
+        .filter(|issuer| !issuer.is_empty())
+    {
+        Some(issuer) => {
+            if !issuer.starts_with("http://") && !issuer.starts_with("https://") {
+                return Err(format!(
+                    "{}: not an http(s) url: {issuer}",
+                    key("oidc-issuer")
+                ));
+            }
+            let client_id = flags
+                .oidc_client_id
+                .or_else(|| settings.oidc_client_id.clone())
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| format!("{} is required with oidc-issuer", key("oidc-client-id")))?;
+            let claims = match flags.oidc_claim {
+                Some(rules) => sluice_oidc::parse_rules([rules.as_str()], "--oidc-claim")?,
+                None => sluice_oidc::parse_rules(
+                    settings
+                        .oidc_claim
+                        .iter()
+                        .flat_map(|rules| rules.0.iter())
+                        .map(String::as_str),
+                    &key("oidc-claim"),
+                )?,
+            };
+            if claims.is_empty() {
+                return Err(format!(
+                    "{} is required with oidc-issuer: who may sign in (email=* for anyone the provider knows)",
+                    key("oidc-claim")
+                ));
+            }
+            let scopes: Vec<String> = flags
+                .oidc_scopes
+                .or_else(|| settings.oidc_scopes.clone())
+                .unwrap_or_else(|| "openid,email,profile".into())
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .map(str::to_string)
+                .collect();
+            if !scopes.iter().any(|scope| scope == "openid") {
+                return Err(format!("{}: openid must be among them", key("oidc-scopes")));
+            }
+            let ca_pem = match flags
+                .oidc_ca_cert
+                .or_else(|| settings.oidc_ca_cert.as_ref().map(|path| dir.join(path)))
+            {
+                Some(path) => Some(
+                    std::fs::read(&path)
+                        .map_err(|e| format!("{} {}: {e}", key("oidc-ca-cert"), path.display()))?,
+                ),
+                None => None,
+            };
+            Some(OidcSettings {
+                issuer,
+                client_id,
+                client_secret: flags
+                    .oidc_client_secret
+                    .or_else(|| settings.oidc_client_secret.clone())
+                    .filter(|secret| !secret.is_empty()),
+                scopes,
+                claims,
+                ca_pem,
+            })
+        }
+        None => None,
+    };
     let console = flags
         .console
         .or_else(|| settings.console.clone())
@@ -334,7 +450,11 @@ fn merge(flags: Flags) -> Result<Settings, String> {
                 .console_dir
                 .or_else(|| settings.console_dir.as_ref().map(|path| dir.join(path)))
                 .unwrap_or_else(|| dir.join(DEFAULT_CONSOLE_DIR)),
+            oidc: oidc.clone(),
         });
+    if oidc.is_some() && console.is_none() {
+        return Err(format!("{} needs --console", key("oidc-issuer")));
+    }
     if flags.config.is_none() && flags.routes.is_empty() && console.is_none() {
         return Err(
             "at least one --wasm host=locator (or a --config file, or --console) is required"
@@ -597,12 +717,40 @@ struct File {
     console: Option<String>,
     console_token: Option<String>,
     console_dir: Option<PathBuf>,
+    oidc_issuer: Option<String>,
+    oidc_client_id: Option<String>,
+    oidc_client_secret: Option<String>,
+    /// `<claim>=<pattern>` rules: one (comma-separated) or a list.
+    oidc_claim: Option<Rules>,
+    oidc_scopes: Option<String>,
+    oidc_ca_cert: Option<PathBuf>,
     flume: Option<String>,
     flume_token: Option<String>,
     flume_ca_cert: Option<PathBuf>,
     flume_insecure: Option<bool>,
     #[serde(default)]
     routes: Vec<RouteFile>,
+}
+
+/// A rule, or a list of them.
+#[derive(Deserialize, PartialEq, Debug, Default)]
+#[serde(from = "OneOrMany")]
+struct Rules(Vec<String>);
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl From<OneOrMany> for Rules {
+    fn from(given: OneOrMany) -> Rules {
+        Rules(match given {
+            OneOrMany::One(rule) => vec![rule],
+            OneOrMany::Many(rules) => rules,
+        })
+    }
 }
 
 impl File {
@@ -647,6 +795,12 @@ impl File {
             console => "console",
             console_token => "console-token",
             console_dir => "console-dir",
+            oidc_issuer => "oidc-issuer",
+            oidc_client_id => "oidc-client-id",
+            oidc_client_secret => "oidc-client-secret",
+            oidc_claim => "oidc-claim",
+            oidc_scopes => "oidc-scopes",
+            oidc_ca_cert => "oidc-ca-cert",
             flume => "flume",
             flume_token => "flume-token",
             flume_ca_cert => "flume-ca-cert",
@@ -1195,6 +1349,12 @@ listen: 127.0.0.1:8080
 console: 127.0.0.1:9090
 console-token: t0ken
 console-dir: kept
+oidc-issuer: https://idp.example/dex
+oidc-client-id: wicket
+oidc-client-secret: ${{SLUICE_WICKET_TEST_UNSET:-hush}}
+oidc-claim: [email=*@example.com, 'email=root@example.org,groups=devs']
+oidc-scopes: openid,email,groups
+oidc-ca-cert: idp-ca.pem
 flume: grpcs://flume.example:443
 flume-token: ${{SLUICE_WICKET_TEST_UNSET:-f1ume}}
 flume-ca-cert: flume-ca.pem
@@ -1241,6 +1401,7 @@ routes:
 "
             )
         };
+        dir.write("idp-ca.pem", "idp ca");
         let path = dir.write("wicket.yaml", yaml("grpc://file:8001"));
         let config = path.to_str().unwrap();
 
@@ -1263,6 +1424,35 @@ routes:
         assert_eq!(console.address, "127.0.0.1:9090");
         assert_eq!(console.token.as_deref(), Some("t0ken"));
         assert_eq!(console.dir, dir.0.join("kept"));
+        let oidc = console.oidc.as_ref().expect("a provider");
+        assert_eq!(
+            (
+                oidc.issuer.as_str(),
+                oidc.client_id.as_str(),
+                oidc.client_secret.as_deref(),
+                oidc.ca_pem.as_deref()
+            ),
+            (
+                "https://idp.example/dex",
+                "wicket",
+                Some("hush"),
+                Some(&b"idp ca"[..])
+            )
+        );
+        assert_eq!(oidc.scopes, ["openid", "email", "groups"]);
+        assert_eq!(
+            oidc.claims,
+            [
+                sluice_oidc::ClaimRule {
+                    claim: "email".into(),
+                    patterns: vec!["*@example.com".into(), "root@example.org".into()],
+                },
+                sluice_oidc::ClaimRule {
+                    claim: "groups".into(),
+                    patterns: vec!["devs".into()],
+                },
+            ]
+        );
         assert_eq!(
             file.flume,
             Some(FlumeSettings {
@@ -1504,6 +1694,22 @@ routes:
                 "--flume-token (or `flume-token` in the --config file) is required with --flume",
             ),
             (
+                "server: s\nconsole: 127.0.0.1:0\noidc-issuer: https://idp\n".into(),
+                "oidc-client-id is required with oidc-issuer",
+            ),
+            (
+                "server: s\nconsole: 127.0.0.1:0\noidc-issuer: https://idp\noidc-client-id: w\n".into(),
+                "oidc-claim is required with oidc-issuer",
+            ),
+            (
+                "server: s\nconsole: 127.0.0.1:0\noidc-issuer: https://idp\noidc-client-id: w\noidc-claim: email\n".into(),
+                "oidc-claim: expected <claim>=<pattern>, got 'email'",
+            ),
+            (
+                "server: s\noidc-issuer: https://idp\noidc-client-id: w\noidc-claim: email=*\n".into(),
+                "oidc-issuer needs --console",
+            ),
+            (
                 "server: s\nflume: f:1\nflume-token: t\n".into(),
                 "--flume: expected grpc://host:port or grpcs://host:port, got 'f:1'",
             ),
@@ -1660,6 +1866,69 @@ routes:
         assert!(error(&["--server", "s"]).contains("at least one --wasm"));
         assert!(error(&["--wasm", "a=a.wasm"]).contains("--server or --listen"));
         assert!(error(&["--wasm", "a.wasm"]).contains("host=component-locator"));
+        let oidc = [
+            "--listen",
+            "127.0.0.1:0",
+            "--console",
+            "127.0.0.1:0",
+            "--oidc-issuer",
+        ];
+        assert!(error(&[&oidc[..], &["idp"]].concat()).contains("not an http(s) url"));
+        assert!(
+            error(
+                &[
+                    &oidc[..],
+                    &[
+                        "https://idp",
+                        "--oidc-client-id",
+                        "w",
+                        "--oidc-claim",
+                        "email=*",
+                        "--oidc-scopes",
+                        "email"
+                    ]
+                ]
+                .concat()
+            )
+            .contains("openid must be among them")
+        );
+        // the flags' rules add up, over the file's
+        let dir = Scratch::new("oidc-flags");
+        let config = dir.write(
+            "wicket.yaml",
+            "listen: 127.0.0.1:0\nconsole: 127.0.0.1:0\noidc-claim: email=*\n",
+        );
+        let settings = match parse(
+            args(&[
+                "--config",
+                config.to_str().unwrap(),
+                "--oidc-issuer",
+                "https://idp",
+                "--oidc-client-id",
+                "w",
+                "--oidc-claim",
+                "groups=ops",
+                "--oidc-claim",
+                "groups=devs,email=me@example.com",
+            ]),
+            none,
+        ) {
+            Ok(Command::Run(settings)) => settings,
+            other => panic!("{:?}", other.map(|_| ())),
+        };
+        let oidc = settings.console.unwrap().oidc.unwrap();
+        assert_eq!(oidc.client_secret, None);
+        assert_eq!(oidc.scopes, ["openid", "email", "profile"]);
+        assert_eq!(
+            oidc.claims
+                .iter()
+                .map(|rule| (rule.claim.as_str(), rule.patterns.clone()))
+                .collect::<Vec<_>>(),
+            [
+                ("groups", vec!["ops".to_string(), "devs".to_string()]),
+                ("email", vec!["me@example.com".to_string()])
+            ]
+        );
         assert!(matches!(
             parse(args(&["--server", "s", "--help"]), none),
             Ok(Command::Help)

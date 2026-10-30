@@ -239,7 +239,9 @@ impl Locator {
             Locator::Http(uri) => {
                 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
                 let client = CLIENT.get_or_init(|| {
-                    reqwest::Client::builder()
+                    // the webPKI roots, as before sluice-oidc brought the TLS
+                    sluice_oidc::http_client(None, "fetch")
+                        .expect("the roots load")
                         .timeout(FETCH_TIMEOUT)
                         .build()
                         .expect("a plain client builds")

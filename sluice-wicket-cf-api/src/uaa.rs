@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::oidc::{ClaimRule, Identity};
+use crate::oidc::{ClaimRule, Identity, constant_time_eq, hmac_sha256};
 use crate::store::{epoch_secs, guid, write_by_rename};
 
 /// How long an access token is valid.
@@ -456,46 +456,9 @@ fn random_code() -> String {
     code
 }
 
-/// RFC 2104, with SHA-256: the key is 32 bytes, below the block size.
-fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
-    let mut ipad = [0x36u8; 64];
-    let mut opad = [0x5cu8; 64];
-    for (i, byte) in key.iter().enumerate() {
-        ipad[i] ^= byte;
-        opad[i] ^= byte;
-    }
-    let inner = Sha256::new()
-        .chain_update(ipad)
-        .chain_update(data)
-        .finalize();
-    Sha256::new()
-        .chain_update(opad)
-        .chain_update(inner)
-        .finalize()
-        .into()
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// RFC 4231 test case 2.
-    #[test]
-    fn hmac_sha256_matches_the_known_answer() {
-        let mut key = [0u8; 32];
-        key[..4].copy_from_slice(b"Jefe");
-        // the RFC's key is the 4 bytes; a zero-padded key hashes the same (padding to the block)
-        let mac = hmac_sha256(&key, b"what do ya want for nothing?");
-        let hex: String = mac.iter().map(|byte| format!("{byte:02x}")).collect();
-        assert_eq!(
-            hex,
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
-    }
 
     fn fresh_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("sluice-uaa-{name}-{}", std::process::id()));

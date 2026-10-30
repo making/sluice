@@ -1,11 +1,12 @@
-//! The OpenID Provider behind `cf login --sso`: `GET /uaa/passcode` sends the
-//! browser through the authorization code flow (PKCE, a nonce) and the
-//! callback exchanges the code for an ID token at the provider's token
-//! endpoint, found by discovery. The ID token comes straight from that
+//! The OpenID Provider client of the wicket's console and the cf-api: a page
+//! sends the browser through the authorization code flow (PKCE, a nonce)
+//! and the callback exchanges the code for an ID token at the provider's
+//! token endpoint, found by discovery. The ID token comes straight from that
 //! endpoint over TLS, authenticated by the client's secret, so its claims are
 //! taken as they come (OpenID Connect Core 3.1.3.7, item 6) once `iss`,
-//! `aud`, `exp` and the nonce check out; `--oidc-claim` then says who may
-//! log in.
+//! `aud`, `exp` and the nonce check out; the [`ClaimRule`]s then say who may
+//! log in. [`Signer`] seals what a login leaves behind (a session cookie);
+//! [`mock`] (feature `mock`) is a provider for the tests.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -18,7 +19,8 @@ use rustls::pki_types::pem::PemObject as _;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::store::epoch_secs;
+#[cfg(feature = "mock")]
+pub mod mock;
 
 /// How long a sign-in may take between the redirect and the callback.
 const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
@@ -28,7 +30,7 @@ const MAX_PENDING: usize = 1000;
 const TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The provider and the client registered with it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OidcSettings {
     /// The issuer: discovery is at `<issuer>/.well-known/openid-configuration`.
     pub issuer: String,
@@ -85,32 +87,36 @@ pub struct Provider {
     pending: Mutex<HashMap<String, Pending>>,
 }
 
+/// An HTTP client verifying servers against `ca_pem` (a PEM CA, the error
+/// naming `option`), else the webPKI roots: reqwest brings no TLS of its own
+/// here (`rustls-no-provider`), the ring provider does.
+pub fn http_client(ca_pem: Option<&[u8]>, option: &str) -> Result<reqwest::ClientBuilder, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    match ca_pem {
+        Some(pem) => {
+            for cert in CertificateDer::pem_slice_iter(pem) {
+                let cert = cert.map_err(|e| format!("{option}: {e}"))?;
+                roots.add(cert).map_err(|e| format!("{option}: {e}"))?;
+            }
+            if roots.is_empty() {
+                return Err(format!("{option}: no certificate in it"));
+            }
+        }
+        None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+    }
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| format!("tls: {e}"))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(reqwest::Client::builder().use_preconfigured_tls(tls))
+}
+
 impl Provider {
     pub fn new(settings: OidcSettings) -> Result<Provider, String> {
-        let mut roots = rustls::RootCertStore::empty();
-        match &settings.ca_pem {
-            Some(pem) => {
-                for cert in CertificateDer::pem_slice_iter(pem) {
-                    let cert = cert.map_err(|e| format!("--oidc-ca-cert: {e}"))?;
-                    roots
-                        .add(cert)
-                        .map_err(|e| format!("--oidc-ca-cert: {e}"))?;
-                }
-                if roots.is_empty() {
-                    return Err("--oidc-ca-cert: no certificate in it".into());
-                }
-            }
-            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
-        }
-        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("tls: {e}"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        let http = reqwest::Client::builder()
-            .use_preconfigured_tls(tls)
+        let http = http_client(settings.ca_pem.as_deref(), "--oidc-ca-cert")?
             .timeout(TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -310,6 +316,35 @@ impl Provider {
     }
 }
 
+/// The rules of `<claim>=<pattern>` values, each possibly several
+/// comma-separated: one claim's patterns are alternatives, distinct claims
+/// must all hold. `option` names the option in an error.
+pub fn parse_rules<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    option: &str,
+) -> Result<Vec<ClaimRule>, String> {
+    let mut rules: Vec<ClaimRule> = Vec::new();
+    for rule in values
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+    {
+        let (claim, pattern) = rule
+            .split_once('=')
+            .filter(|(claim, _)| !claim.is_empty())
+            .ok_or_else(|| format!("{option}: expected <claim>=<pattern>, got '{rule}'"))?;
+        match rules.iter_mut().find(|known| known.claim == claim) {
+            Some(known) => known.patterns.push(pattern.to_string()),
+            None => rules.push(ClaimRule {
+                claim: claim.to_string(),
+                patterns: vec![pattern.to_string()],
+            }),
+        }
+    }
+    Ok(rules)
+}
+
 /// Checks `claims` against every rule: why the user is not allowed.
 pub fn allowed(rules: &[ClaimRule], claims: &Value) -> Result<(), String> {
     for rule in rules {
@@ -379,10 +414,77 @@ fn claims_of(token: &str) -> Result<Value, String> {
 
 /// 32 random bytes, base64url (43 characters: a state, a nonce, a PKCE
 /// verifier).
-fn random() -> String {
+pub fn random() -> String {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).expect("the OS has randomness");
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Seconds since the epoch.
+pub fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// Seals values with a key (HMAC-SHA256): what a login leaves in a cookie,
+/// readable by anyone, forged by no one.
+pub struct Signer {
+    key: [u8; 32],
+}
+
+impl Signer {
+    /// A key drawn now: what it signed is good until the process ends.
+    pub fn random() -> Signer {
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).expect("the OS has randomness");
+        Signer { key }
+    }
+
+    pub fn with_key(key: [u8; 32]) -> Signer {
+        Signer { key }
+    }
+
+    /// `payload`, base64url, with its signature after a dot.
+    pub fn sign(&self, payload: &[u8]) -> String {
+        let body = URL_SAFE_NO_PAD.encode(payload);
+        let signature = URL_SAFE_NO_PAD.encode(hmac_sha256(&self.key, body.as_bytes()));
+        format!("{body}.{signature}")
+    }
+
+    /// The payload of `sealed` when its signature is this key's.
+    pub fn verify(&self, sealed: &str) -> Option<Vec<u8>> {
+        let (body, signature) = sealed.rsplit_once('.')?;
+        let given = URL_SAFE_NO_PAD.decode(signature).ok()?;
+        if !constant_time_eq(&given, &hmac_sha256(&self.key, body.as_bytes())) {
+            return None;
+        }
+        URL_SAFE_NO_PAD.decode(body).ok()
+    }
+}
+
+/// RFC 2104, with SHA-256: the key is 32 bytes, below the block size.
+pub fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for (i, byte) in key.iter().enumerate() {
+        ipad[i] ^= byte;
+        opad[i] ^= byte;
+    }
+    let inner = Sha256::new()
+        .chain_update(ipad)
+        .chain_update(data)
+        .finalize();
+    Sha256::new()
+        .chain_update(opad)
+        .chain_update(inner)
+        .finalize()
+        .into()
+}
+
+/// Whether `a` is `b`, in a time that does not tell where they differ.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
 #[cfg(test)]
@@ -428,6 +530,57 @@ mod tests {
         assert!(allowed(&[], &json!({})).is_ok());
         assert!(glob("a*b*c", "abc") && glob("a*b*c", "a-b-c") && !glob("a*b*c", "ac"));
         assert!(glob("*", "") && glob("x", "x") && !glob("x", "xx") && !glob("", "x"));
+    }
+
+    #[test]
+    fn rules_are_parsed_from_claim_equals_pattern() {
+        let rules = parse_rules(
+            [
+                "email=*@example.com, email=root@example.org",
+                "groups=devs",
+                "",
+            ],
+            "--oidc-claim",
+        )
+        .unwrap();
+        assert_eq!(
+            rules,
+            [
+                ClaimRule {
+                    claim: "email".into(),
+                    patterns: vec!["*@example.com".into(), "root@example.org".into()],
+                },
+                ClaimRule {
+                    claim: "groups".into(),
+                    patterns: vec!["devs".into()],
+                },
+            ]
+        );
+        assert_eq!(
+            parse_rules(["email"], "--oidc-claim").unwrap_err(),
+            "--oidc-claim: expected <claim>=<pattern>, got 'email'"
+        );
+        assert!(parse_rules(["=x"], "--oidc-claim").is_err());
+    }
+
+    /// RFC 4231 test case 2; a sealed value opens with its key only.
+    #[test]
+    fn hmac_matches_the_known_answer_and_seals() {
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(b"Jefe");
+        // the RFC's key is the 4 bytes; a zero-padded key hashes the same (padding to the block)
+        let mac = hmac_sha256(&key, b"what do ya want for nothing?");
+        let hex: String = mac.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(
+            hex,
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        let signer = Signer::random();
+        let sealed = signer.sign(b"alice");
+        assert_eq!(signer.verify(&sealed).as_deref(), Some(&b"alice"[..]));
+        assert!(Signer::random().verify(&sealed).is_none());
+        assert!(signer.verify("YWxpY2U").is_none());
+        assert!(signer.verify(&format!("{sealed}x")).is_none());
     }
 
     #[test]

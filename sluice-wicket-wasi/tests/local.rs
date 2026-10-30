@@ -18,6 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use sluice_oidc::mock::MockProvider;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 /// Hang guard of every wait; the first one covers the components' load.
@@ -156,6 +157,18 @@ async fn console(
     headers: &[&str],
     body: &[u8],
 ) -> (u16, String, String) {
+    let (status, head, body) = console_raw(address, request, headers, body).await;
+    (status, head.to_lowercase(), body)
+}
+
+/// [`console`] with the head as it came: a Location or a cookie is
+/// case-sensitive.
+async fn console_raw(
+    address: &str,
+    request: &str,
+    headers: &[&str],
+    body: &[u8],
+) -> (u16, String, String) {
     let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
     let mut head = format!(
         "{request} HTTP/1.1\r\nhost: {address}\r\nconnection: close\r\ncontent-length: {}\r\n",
@@ -176,7 +189,7 @@ async fn console(
     let (head, body) = text.split_once("\r\n\r\n").expect("a response");
     (
         head[9..12].parse().unwrap(),
-        head.to_lowercase(),
+        head.to_string(),
         body.to_string(),
     )
 }
@@ -654,5 +667,132 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         (200, r#"{"store":"local","namespace":"cf/shop","keys":0}"#)
     );
     drop(wicket);
+
+    // with an OpenID Provider, a browser signs in through it: the page is
+    // sent to /login, the callback sets the session cookie the API takes,
+    // the listing names the user; a user the rules refuse gets 403; the
+    // token still works for API clients; the logout ends the session
+    let provider = MockProvider::start("wicket", "s3");
+    let signed_in = dir.join("oidc").to_string_lossy().into_owned();
+    let oidc_kv = dir.join("oidc.db").to_string_lossy().into_owned();
+    let args = [
+        "--console",
+        "127.0.0.1:0",
+        "--console-token",
+        "s3cret",
+        "--console-dir",
+        signed_in.as_str(),
+        "--keyvalue-file",
+        oidc_kv.as_str(),
+        "--oidc-issuer",
+        &provider.issuer,
+        "--oidc-client-id",
+        "wicket",
+        "--oidc-client-secret",
+        "s3",
+        "--oidc-claim",
+        "email=*@example.com",
+        "--oidc-claim",
+        "groups=ops,groups=devs",
+        "--oidc-scopes",
+        "openid,email,groups",
+    ];
+    let wicket = Wicket::start(&args);
+    let _ = wicket.address();
+    let at = wicket.console();
+    let html = "accept: text/html,*/*";
+    let (status, head, _) = console(&at, "GET /", &[html], b"").await;
+    assert_eq!(
+        (status, head.contains("location: /login")),
+        (302, true),
+        "{head}"
+    );
+    let (status, head, body) = console(&at, "GET /api/routes", &[], b"").await;
+    assert_eq!(status, 401, "{body}");
+    assert!(!head.contains("www-authenticate"), "{head}");
+    assert!(body.contains("/login"), "{body}");
+    let (status, _, listing) = console(&at, "GET /api/routes", &[bearer], b"").await;
+    assert_eq!(status, 200);
+    assert!(!listing.contains("\"user\""), "{listing}");
+    // hyper writes header names in lower case, the mock as written
+    let header = |head: &str, name: &str| {
+        head.lines()
+            .find_map(|line| {
+                line.split_once(": ")
+                    .filter(|(found, _)| found.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.to_string())
+            })
+            .unwrap_or_else(|| panic!("no {name} in {head}"))
+    };
+    let location = |head: &str| header(head, "location");
+    // the browser's trip: /login, the provider (consenting as the user set),
+    // back to the callback
+    let issuer = provider.issuer.as_str();
+    let sign_in = |at: String| async move {
+        let (status, head, _) = console_raw(&at, "GET /login", &[], b"").await;
+        assert_eq!(status, 302, "{head}");
+        let authorize = location(&head);
+        assert!(
+            authorize.starts_with(&format!("{issuer}/authorize?"))
+                && authorize.contains("scope=openid+email+groups")
+                && authorize.contains(&format!(
+                    "redirect_uri=http%3A%2F%2F{}%2Foauth2%2Fcallback",
+                    at.replace(':', "%3A")
+                )),
+            "{authorize}"
+        );
+        let (status, head, _) = console_raw(
+            &issuer["http://".len()..],
+            &format!("GET {}", &authorize[issuer.len()..]),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(status, 302, "{head}");
+        let callback = location(&head);
+        let path = &callback[format!("http://{at}").len()..];
+        console_raw(&at, &format!("GET {path}"), &[], b"").await
+    };
+    provider.sign_in(serde_json::json!({
+        "sub": "1", "email": "alice@example.com", "preferred_username": "alice", "groups": ["devs"]
+    }));
+    let (status, head, _) = sign_in(at.clone()).await;
+    assert_eq!((status, location(&head).as_str()), (302, "/"), "{head}");
+    let cookie = header(&head, "set-cookie");
+    assert!(
+        cookie.starts_with("sluice-wicket-session=")
+            && cookie.ends_with("; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800"),
+        "{cookie}"
+    );
+    let session = format!("cookie: {}", cookie.split(';').next().unwrap());
+    let (status, _, listing) = console(&at, "GET /api/routes", &[&session], b"").await;
+    assert_eq!(status, 200, "{listing}");
+    let listing: serde_json::Value = serde_json::from_str(&listing).unwrap();
+    assert_eq!(listing["user"], "alice");
+    let (status, _, page) = console(&at, "GET /", &[html, &session], b"").await;
+    assert_eq!((status, page.contains("/console.js")), (200, true));
+    // forged, or another wicket's: no session
+    let forged = format!("{}x", session);
+    let (status, _, _) = console(&at, "GET /api/routes", &[&forged], b"").await;
+    assert_eq!(status, 401);
+    provider.sign_in(serde_json::json!({
+        "sub": "2", "email": "bob@example.com", "preferred_username": "bob", "groups": ["qa"]
+    }));
+    let (status, _, page) = sign_in(at.clone()).await;
+    assert_eq!(status, 403, "{page}");
+    assert!(
+        page.contains("the claim groups is [&quot;qa&quot;], not 'ops' or 'devs'"),
+        "{page}"
+    );
+    let (status, head, _) = console(&at, "GET /logout", &[&session], b"").await;
+    assert_eq!(status, 302);
+    assert!(
+        head.contains(
+            "set-cookie: sluice-wicket-session=; path=/; httponly; samesite=lax; max-age=0"
+        ),
+        "{head}"
+    );
+    drop(wicket);
+    drop(provider);
     let _ = std::fs::remove_dir_all(&dir);
 }
