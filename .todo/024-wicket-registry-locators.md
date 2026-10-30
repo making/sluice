@@ -7,7 +7,11 @@ address form was designed for more sources:
 
 - `oci://registry/repo:tag` (or `wasm:oci://...`) — pull a component artifact from an
   OCI registry; consider `oci-wasm` / wasm pack manifest type, or shelling to
-  `wasm-tools`? decide and document
+  `wasm-tools`? decide and document. The cf-api already pulls components
+  (`sluice-wicket-cf-api/src/registry.rs`: the distribution API over reqwest, bearer and
+  basic challenges, `wkg oci push` / `oras push` artifacts, an index's `wasm` entry, tag
+  pinned to the digest): move it into a crate both depend on, as `sluice-oidc`, rather
+  than write a second client
 - `s3://bucket/key` — presigned-GET style; credentials via env/flags
 - integrity: sha256 pinning (`--wasm host=...#sha256:...`) verified after fetch,
   surfaced in the advertise log; matters once components come from the network
