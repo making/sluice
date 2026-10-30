@@ -19,7 +19,7 @@
 //! flume they and a line per answered request reach the live access log too
 //! (`flume`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -809,18 +809,20 @@ struct Ctx {
 
 impl Ctx {
     /// A store's state; `label` names the component in the guest's log
-    /// lines, which also go to `tap` as lines of the request `serving`.
+    /// lines, which also go to `tap` as lines of the request `serving`, of
+    /// the instance `index` (see `respond`).
     fn new(
         sandbox: &Sandbox,
         label: &str,
         keyvalue: Option<Arc<keyvalue::Buckets>>,
         tap: &Arc<Tap>,
         serving: &Serving,
+        index: usize,
     ) -> Self {
         static STORES: AtomicU64 = AtomicU64::new(1);
         let store = STORES.fetch_add(1, Ordering::Relaxed);
         let mut wasi = wasmtime_wasi::WasiCtxBuilder::new();
-        let log = |output| GuestLog::new(output, label, store, tap.clone(), serving.clone());
+        let log = |output| GuestLog::new(output, label, store, index, tap.clone(), serving.clone());
         wasi.stdout(log(Output::Stdout));
         wasi.stderr(log(Output::Stderr));
         for (name, value) in sandbox.env.iter() {
@@ -946,8 +948,8 @@ impl Serving {
 /// the store (`stdout [hello.wasm#12] :: `), are written to the process
 /// stream in one call, so concurrent requests do not interleave mid-line,
 /// and go to the live access log's tap as lines of the request the store
-/// serves. A trailing partial line is flushed when the store goes away, an
-/// overlong one at `GUEST_LOG_LINE_MAX`.
+/// serves, naming the store's instance index. A trailing partial line is
+/// flushed when the store goes away, an overlong one at `GUEST_LOG_LINE_MAX`.
 #[derive(Clone)]
 struct GuestLog {
     state: Arc<GuestLogState>,
@@ -961,11 +963,20 @@ struct GuestLogState {
     /// The component's label and the store's id, the prefix's.
     component: String,
     store: u64,
+    /// The store's instance index on its route (see `respond`).
+    instance: usize,
     serving: Serving,
 }
 
 impl GuestLog {
-    fn new(output: Output, label: &str, store: u64, tap: Arc<Tap>, serving: Serving) -> Self {
+    fn new(
+        output: Output,
+        label: &str,
+        store: u64,
+        instance: usize,
+        tap: Arc<Tap>,
+        serving: Serving,
+    ) -> Self {
         Self {
             state: Arc::new(GuestLogState {
                 prefix: format!("{} [{label}#{store}] :: ", output.name()),
@@ -974,6 +985,7 @@ impl GuestLog {
                 tap,
                 component: label.to_string(),
                 store,
+                instance,
                 serving,
             }),
         }
@@ -1016,6 +1028,7 @@ impl GuestLogState {
                     vec![
                         ("component", self.component.clone()),
                         ("store", self.store.to_string()),
+                        ("instance", self.instance.to_string()),
                         ("line", String::from_utf8_lossy(text).into_owned()),
                     ],
                 );
@@ -1651,25 +1664,67 @@ type Share = tokio::sync::OwnedSemaphorePermit;
     reason = "returned once per request and destructured at once; boxing would allocate on every request"
 )]
 enum Admission {
-    /// Handed to an idle pooled unit.
-    Pooled,
+    /// Handed to the idle pooled unit of this index.
+    Pooled(usize),
     /// A slot for a per-request instance.
     Cold(Job, Slot),
     /// No share, slot or unit within the budget.
     Full,
 }
 
+/// The indices a handler's per-request instances hold (see `respond`).
+#[derive(Default)]
+struct ColdIndices(Mutex<BTreeSet<usize>>);
+
+impl ColdIndices {
+    /// The lowest index from `from` up that no per-request instance holds.
+    fn take(self: &Arc<Self>, from: usize) -> ColdIndex {
+        let mut held = self.0.lock().unwrap();
+        let mut index = from;
+        for taken in held.range(from..) {
+            if *taken != index {
+                break;
+            }
+            index += 1;
+        }
+        held.insert(index);
+        ColdIndex {
+            indices: self.clone(),
+            index,
+        }
+    }
+}
+
+/// A per-request instance's index, freed when it drops.
+struct ColdIndex {
+    indices: Arc<ColdIndices>,
+    index: usize,
+}
+
+impl Drop for ColdIndex {
+    fn drop(&mut self) {
+        self.indices.0.lock().unwrap().remove(&self.index);
+    }
+}
+
+/// Serves `request` on an instance of `handler`'s route, telling `admitted`
+/// the instance's index among the route's instances alive, as CF numbers an
+/// app's: a pooled unit's `0..pool`, kept by its replacement, a per-request
+/// instance's the lowest free from `pool` up while its store lives. Nothing
+/// is told for a request finding no instance within its budget (503).
 async fn respond(
     handler: &Handler,
     share: &Arc<tokio::sync::Semaphore>,
     request: hyper::Request<hyper::body::Incoming>,
+    admitted: impl FnOnce(usize),
 ) -> hyper::Response<RelayBody> {
     // The budget runs from the request's arrival: it covers the wait for an
     // instance, instantiation, handler and response relay alike.
     let deadline = tokio::time::Instant::now() + handler.sandbox.limits.budget;
     let (reply, awaited) = reply(request.method() == hyper::Method::HEAD);
     let (job, slot) = match handler.admit(request, &reply, share, deadline).await {
-        Admission::Pooled => {
+        Admission::Pooled(index) => {
+            admitted(index);
             // The unit's job holds the reply now: a job lost with its
             // unit must close the head channel, so the 500 below wins.
             drop(reply);
@@ -1690,6 +1745,8 @@ async fn respond(
     } = job;
 
     let loaded = &handler.loaded;
+    let cold = handler.cold.take(handler.sandbox.pool);
+    admitted(cold.index);
     // Declared after the slot and share, so dropped before them on every
     // path.
     let live = LiveStore::mark(&handler.live);
@@ -1699,6 +1756,7 @@ async fn respond(
         handler.keyvalue.clone(),
         &handler.instances.tap,
         &Serving::of(request_host(&request)),
+        cold.index,
     );
     let mut store = wasmtime::Store::new(engine(), ctx);
     store.limiter_async(|ctx| &mut ctx.limiter);
@@ -1716,9 +1774,11 @@ async fn respond(
     // task ends when the response is fully relayed or the watchdog stops it.
     let label = loaded.label.clone();
     tokio::spawn(async move {
-        // Locals drop in reverse: the store, then its mark, then its slots.
+        // Locals drop in reverse: the store, then its mark and its index,
+        // then its slots.
         let _slot = slot;
         let _share = share;
+        let _cold = cold;
         let _live = live;
         let mut store = store;
         let (_watch, watched) = watch::channel(Some(InFlight {
@@ -1753,6 +1813,9 @@ pub struct Handler {
     route: Option<Arc<tokio::sync::Semaphore>>,
     /// Backing for `live_stores`, marked by `LiveStore`.
     live: Arc<Gauge>,
+    /// The indices of the per-request instances alive, from the pool's
+    /// size up.
+    cold: Arc<ColdIndices>,
 }
 
 impl Handler {
@@ -1792,6 +1855,7 @@ impl Handler {
             pool,
             instances: instances.clone(),
             route,
+            cold: Arc::default(),
         }))
     }
 
@@ -1872,7 +1936,7 @@ impl Handler {
             tokio::pin!(offered);
             offered.as_mut().enable();
             job = match pool.dispatch(job) {
-                Ok(()) => return Admission::Pooled,
+                Ok(index) => return Admission::Pooled(index),
                 Err(job) => job,
             };
             tokio::select! {
@@ -1943,7 +2007,9 @@ struct Job {
 /// serves one request at a time; the pool's size is the warm concurrency, and
 /// requests beyond it fall back to the per-request path (`respond`) while an
 /// instance slot is free (within the route's cap, which counts the units), so
-/// the pool only ever improves the warm latency.
+/// the pool only ever improves the warm latency. The units take the requests
+/// in turn, the one idle longest first, as the gorouter balances an app's
+/// instances, and each has an index of `0..pool` (see `respond`).
 /// Measured on the hello guest (the ignored `load_comparison_reference`,
 /// sequential requests, dev profile): ~380us cold vs ~120us pooled per
 /// request. Every unit holds an instance slot for its lifetime, handed on to
@@ -1980,9 +2046,9 @@ struct Pool {
 type UnitMessage = Option<Job>;
 
 struct PoolState {
-    /// Senders to idle units; one entry per instantiated unit between
-    /// requests.
-    idle: Vec<mpsc::Sender<UnitMessage>>,
+    /// The idle units' indices and senders, the one idle longest first; one
+    /// entry per instantiated unit between requests.
+    idle: VecDeque<(usize, mpsc::Sender<UnitMessage>)>,
     /// Live unit tasks, the ones waiting for a slot included.
     units: usize,
     /// Units ever spawned; growth beyond the target signals recycling
@@ -1995,9 +2061,10 @@ struct PoolState {
 }
 
 impl Pool {
-    /// Spawns `sandbox.pool` units, each on a slot taken at once when one is
-    /// free, else waiting for one. Each instantiates asynchronously and is
-    /// offered once ready; until then requests take the per-request path.
+    /// Spawns `sandbox.pool` units, indices `0..pool`, each on a slot taken
+    /// at once when one is free, else waiting for one. Each instantiates
+    /// asynchronously and is offered once ready; until then requests take
+    /// the per-request path.
     fn new(
         loaded: Arc<Loaded>,
         sandbox: Sandbox,
@@ -2009,7 +2076,7 @@ impl Pool {
         let units = sandbox.pool;
         let pool = Arc::new(Self {
             state: Mutex::new(PoolState {
-                idle: Vec::new(),
+                idle: VecDeque::new(),
                 units,
                 spawned: 0,
                 served: 0,
@@ -2024,16 +2091,16 @@ impl Pool {
             offered: tokio::sync::Notify::new(),
             closed: CancellationToken::new(),
         });
-        for _ in 0..units {
+        for index in 0..units {
             let slot = pool.instances.try_slot(pool.route.as_ref());
-            Self::spawn_unit(pool.clone(), slot);
+            Self::spawn_unit(pool.clone(), slot, index);
         }
         pool
     }
 
-    /// Starts one unit, already counted in `units`, on `slot` or, without
-    /// one, on the next slot freed.
-    fn spawn_unit(pool: Arc<Pool>, slot: Option<Slot>) {
+    /// Starts the unit `index`, already counted in `units`, on `slot` or,
+    /// without one, on the next slot freed.
+    fn spawn_unit(pool: Arc<Pool>, slot: Option<Slot>, index: usize) {
         pool.state.lock().unwrap().spawned += 1;
         tokio::spawn(async move {
             let slot = match slot {
@@ -2046,24 +2113,25 @@ impl Pool {
                             pool,
                             replace: false,
                             slot: None,
+                            index,
                         });
                         return;
                     }
                 },
             };
-            run_unit(pool, slot).await;
+            run_unit(pool, slot, index).await;
         });
     }
 
-    /// Offers an idle unit and wakes a request waiting for an instance;
-    /// false once the pool closed: the unit ends.
-    fn offer(&self, unit: mpsc::Sender<UnitMessage>) -> bool {
+    /// Offers the idle unit `index`, last in turn, and wakes a request
+    /// waiting for an instance; false once the pool closed: the unit ends.
+    fn offer(&self, index: usize, unit: mpsc::Sender<UnitMessage>) -> bool {
         {
             let mut state = self.state.lock().unwrap();
             if state.closed {
                 return false;
             }
-            state.idle.push(unit);
+            state.idle.push_back((index, unit));
         }
         self.offered.notify_one();
         true
@@ -2078,27 +2146,28 @@ impl Pool {
             std::mem::take(&mut state.idle)
         };
         self.closed.cancel();
-        for unit in idle {
+        for (_, unit) in idle {
             // an idle unit's channel is empty; a stale entry's unit is gone
             let _ = unit.try_send(None);
         }
     }
 
-    /// Hands the job to an idle unit. `Err(job)` when none accepted it (no
-    /// stock, or a unit vanished): the caller instantiates per request.
+    /// Hands the job to the unit idle longest, returning its index.
+    /// `Err(job)` when none accepted it (no stock, or a unit vanished): the
+    /// caller instantiates per request.
     #[expect(
         clippy::result_large_err,
         reason = "handed back to the caller, which waits or instantiates anyway"
     )]
-    fn dispatch(&self, mut job: Job) -> Result<(), Job> {
+    fn dispatch(&self, mut job: Job) -> Result<usize, Job> {
         loop {
-            let Some(tx) = self.state.lock().unwrap().idle.pop() else {
+            let Some((index, tx)) = self.state.lock().unwrap().idle.pop_front() else {
                 return Err(job);
             };
             job = match tx.try_send(Some(job)) {
                 Ok(()) => {
                     self.state.lock().unwrap().served += 1;
-                    return Ok(());
+                    return Ok(index);
                 }
                 // A unit died since it went idle; its entry is stale.
                 Err(tokio::sync::mpsc::error::TrySendError::Full(job))
@@ -2136,8 +2205,8 @@ impl Pool {
 
 /// Runs at unit exit, however it exits, after the unit's store is gone:
 /// frees the unit's place and, unless the unit never got viable or the pool
-/// closed, spawns a replacement on its instance slot while the pool is below
-/// target; else the slot frees.
+/// closed, spawns a replacement on its instance slot and its index while the
+/// pool is below target; else the slot frees.
 struct Retire {
     pool: Arc<Pool>,
     /// False when the unit never served (e.g. its instantiate failed): the
@@ -2145,6 +2214,8 @@ struct Retire {
     replace: bool,
     /// The unit's instance slot.
     slot: Option<Slot>,
+    /// The unit's index.
+    index: usize,
 }
 
 impl Drop for Retire {
@@ -2160,18 +2231,19 @@ impl Drop for Retire {
         };
         if respawn {
             let slot = self.slot.take().expect("a unit holds its slot");
-            Pool::spawn_unit(self.pool.clone(), Some(slot));
+            Pool::spawn_unit(self.pool.clone(), Some(slot), self.index);
         }
     }
 }
 
-/// The body of one pooled unit, on its instance slot.
-async fn run_unit(pool: Arc<Pool>, slot: Slot) {
+/// The body of the pooled unit `index`, on its instance slot.
+async fn run_unit(pool: Arc<Pool>, slot: Slot, index: usize) {
     // Declared first, so dropped last: after the store.
     let mut retire = Retire {
         pool: pool.clone(),
         replace: true,
         slot: Some(slot),
+        index,
     };
     let loaded = pool.loaded.clone();
     let budget = pool.sandbox.limits.budget;
@@ -2184,6 +2256,7 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot) {
         pool.keyvalue.clone(),
         &pool.instances.tap,
         &serving,
+        index,
     );
     let mut store = wasmtime::Store::new(engine(), ctx);
     store.limiter_async(|ctx| &mut ctx.limiter);
@@ -2201,7 +2274,7 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot) {
     // Offered only now: a request never queues behind an instantiate that
     // may fail.
     let (tx, mut rx) = mpsc::channel::<UnitMessage>(1);
-    if !pool.offer(tx.clone()) {
+    if !pool.offer(index, tx.clone()) {
         return;
     }
 
@@ -2246,7 +2319,7 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot) {
                 eprintln!("[wasm] recycling {} pool unit: {reason}", pool.loaded.label);
                 break;
             }
-            if !pool.offer(tx.clone()) {
+            if !pool.offer(index, tx.clone()) {
                 break;
             }
         }
@@ -2339,10 +2412,17 @@ pub(crate) async fn serve_http<I, R>(
     let route = Arc::new(route);
     let service = hyper::service::service_fn(move |req| {
         let (handler, share) = (route(&req), share.clone());
-        let answered = Answered::of(&tap, &req, peer);
+        let mut answered = Answered::of(&tap, &req, peer);
         async move {
             let response = match handler {
-                Ok(handler) => respond(&handler, &share, req).await,
+                Ok(handler) => {
+                    let admitted = |index| {
+                        if let Some(answered) = &mut answered {
+                            answered.instance = Some(index);
+                        }
+                    };
+                    respond(&handler, &share, req, admitted).await
+                }
                 Err(message) => plain_response(404, message),
             };
             Ok::<_, std::convert::Infallible>(match answered {
@@ -2408,6 +2488,9 @@ struct Answered {
     status: u16,
     /// Body bytes relayed.
     bytes: u64,
+    /// The instance that served it (`respond`); None when none did (no
+    /// route, none within its budget, its client gone while it waited).
+    instance: Option<usize>,
 }
 
 impl Answered {
@@ -2461,6 +2544,7 @@ impl Answered {
                 .to_string(),
             status: 499,
             bytes: 0,
+            instance: None,
         })
     }
 
@@ -2480,20 +2564,21 @@ impl Answered {
 impl Drop for Answered {
     fn drop(&mut self) {
         let took = self.began.elapsed().as_secs_f64() * 1000.0;
-        self.tap.publish(
-            "response",
-            std::mem::take(&mut self.host),
-            vec![
-                ("method", std::mem::take(&mut self.method)),
-                ("path", std::mem::take(&mut self.path)),
-                ("http", self.http.to_string()),
-                ("status", self.status.to_string()),
-                ("durationMs", format!("{took:.3}")),
-                ("bytes", self.bytes.to_string()),
-                ("remote", std::mem::take(&mut self.remote)),
-                ("userAgent", std::mem::take(&mut self.user_agent)),
-            ],
-        );
+        let mut fields = vec![
+            ("method", std::mem::take(&mut self.method)),
+            ("path", std::mem::take(&mut self.path)),
+            ("http", self.http.to_string()),
+            ("status", self.status.to_string()),
+            ("durationMs", format!("{took:.3}")),
+            ("bytes", self.bytes.to_string()),
+            ("remote", std::mem::take(&mut self.remote)),
+            ("userAgent", std::mem::take(&mut self.user_agent)),
+        ];
+        if let Some(instance) = self.instance {
+            fields.push(("instance", instance.to_string()));
+        }
+        self.tap
+            .publish("response", std::mem::take(&mut self.host), fields);
     }
 }
 
@@ -2776,6 +2861,7 @@ pub(crate) mod tests {
                 None,
                 &Tap::off(),
                 &Serving::default(),
+                0,
             )
         }
 
@@ -3428,8 +3514,9 @@ pub(crate) mod tests {
     /// Guest stdout and stderr reach the process log as whole lines, each
     /// prefixed with the component and the store -- with no capability, as
     /// under `wasmtime serve` -- and the live access log's tap as lines of
-    /// the request's host, beside the request's `response` line. A pooled
-    /// unit's lines name the host of the request it serves at the time.
+    /// the request's host, beside the request's `response` line, both naming
+    /// the instance index. A pooled unit's lines name the host of the request
+    /// it serves at the time, and the units serve in turn.
     #[tokio::test]
     async fn guest_stdio_lands_in_the_log_with_a_request_prefix() {
         let loaded = load(&Locator::File(hello_wasm()), Caps::default())
@@ -3471,11 +3558,13 @@ pub(crate) mod tests {
         let store = id(&stdout);
         assert_eq!(store, id(&stderr));
 
-        // the tap: the request's host, lowercase without its port
+        // the tap: the request's host, lowercase without its port; the
+        // instance index of a per-request instance on a route without a pool
         let guest = |line: &str| {
             HashMap::from([
                 ("component", "hello.wasm".to_string()),
                 ("store", store.clone()),
+                ("instance", "0".to_string()),
                 ("line", line.to_string()),
             ])
         };
@@ -3503,35 +3592,48 @@ pub(crate) mod tests {
                 // the node's peer: the last entry
                 ("remote", "10.0.0.1".to_string()),
                 ("userAgent", "probe/1".to_string()),
+                ("instance", "0".to_string()),
             ])
         );
 
-        // a pooled unit serves a and then b: one store, the host of each
+        // two units serve a, b and c in turn: a's unit serves c, each line
+        // naming its request's host and the unit's index
         let pooled = Handler::new(
             loaded,
             Sandbox {
-                pool: 1,
+                pool: 2,
                 ..Sandbox::default()
             },
             None,
             &instances,
         )
         .unwrap();
-        for host in ["a", "b"] {
-            restocked(&pooled, 1).await;
+        let hosts = ["a", "b", "c"];
+        for host in hosts {
+            restocked(&pooled, 2).await;
             let request = format!("GET /log HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n\r\n");
             let body = exchange(&pooled, &request).await;
             assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
         }
-        let stores: Vec<String> = ["a", "b"]
+        let served: Vec<(String, String)> = hosts
             .iter()
-            .flat_map(|host| tapped(&tap, "stdout", host))
-            .map(|fields| fields["store"].clone())
+            .map(|host| {
+                let [stdout] = tapped(&tap, "stdout", host).try_into().unwrap();
+                let [response] = tapped(&tap, "response", host).try_into().unwrap();
+                assert_eq!(stdout["instance"], response["instance"], "{host}");
+                (stdout["store"].clone(), stdout["instance"].clone())
+            })
             .collect();
-        assert_eq!(stores.len(), 2, "{stores:?}");
-        assert_eq!(stores[0], stores[1], "one unit");
-        assert_ne!(stores[0], store, "not the cold request's store");
-        assert_eq!(pool(&pooled).spawned(), 1);
+        assert_eq!(served[0], served[2], "a's unit serves c");
+        assert_ne!(served[0].0, served[1].0, "b's unit is the other");
+        let mut indices = [served[0].1.as_str(), served[1].1.as_str()];
+        indices.sort();
+        assert_eq!(indices, ["0", "1"]);
+        assert!(
+            served.iter().all(|(unit, _)| *unit != store),
+            "not the cold request's store"
+        );
+        assert_eq!(pool(&pooled).spawned(), 2);
     }
 
     /// A guest writing without newlines is emitted in bounded pieces instead
@@ -3544,6 +3646,7 @@ pub(crate) mod tests {
         let log = GuestLog::new(
             Output::Stdout,
             "unterminated-test",
+            0,
             0,
             tap.clone(),
             Serving::default(),
@@ -4012,10 +4115,22 @@ pub(crate) mod tests {
     }
 
     /// Beyond the pool's size requests fall back to per-request instantiation:
-    /// a second concurrent connection is served while the single unit streams.
+    /// a second concurrent connection is served while the single unit streams,
+    /// by an instance taking the lowest index free from the pool's size up,
+    /// freed with its store.
     #[tokio::test]
     async fn pool_exhaustion_falls_back_to_per_request_instantiation() {
-        let handler = pooled(&hello().await, Sandbox::default(), 1);
+        let tap = Tap::new();
+        let handler = Handler::new(
+            hello().await,
+            Sandbox {
+                pool: 1,
+                ..Sandbox::default()
+            },
+            None,
+            &Instances::fed(Instances::MAX, tap.clone()),
+        )
+        .unwrap();
         restocked(&handler, 1).await;
 
         // occupy the only unit for the ~1s the stream takes
@@ -4024,7 +4139,10 @@ pub(crate) mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(pool(&handler).idle(), 0, "the unit is busy streaming");
 
-        // no stock: served on the cold path, still a clean 200
+        // no stock: served on the cold path, still a clean 200, past the
+        // index another per-request instance holds
+        let held = handler.cold.take(1);
+        assert_eq!(held.index, 1, "the lowest from the pool's size up");
         let body = exchange(&handler, &get("/")).await;
         assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
         assert_eq!(
@@ -4032,6 +4150,7 @@ pub(crate) mod tests {
             1,
             "the fallback is not counted as pooled"
         );
+        drop(held);
 
         let first = first.await.unwrap();
         assert!(
@@ -4040,6 +4159,15 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&first)
         );
         assert!(first.len() > 1000, "streaming body arrived");
+        let instances: Vec<String> = tapped(&tap, "response", "t")
+            .into_iter()
+            .map(|fields| fields["instance"].clone())
+            .collect();
+        assert_eq!(instances, ["2", "0"], "the cold request's, then the unit's");
+        eventually("the cold index frees", Duration::from_secs(5), || {
+            handler.cold.0.lock().unwrap().is_empty()
+        })
+        .await;
     }
 
     /// A job lost by its unit (dropped before it was served) fails with a
@@ -4048,9 +4176,14 @@ pub(crate) mod tests {
     async fn a_job_lost_by_its_unit_fails_instead_of_hanging() {
         let handler = pooled(&hello().await, Sandbox::default(), 1);
         restocked(&handler, 1).await;
-        // a unit that takes the job and dies with it
+        // a unit that takes the job and dies with it, first in turn
         let (tx, mut rx) = mpsc::channel::<UnitMessage>(1);
-        pool(&handler).state.lock().unwrap().idle.push(tx);
+        pool(&handler)
+            .state
+            .lock()
+            .unwrap()
+            .idle
+            .push_front((0, tx));
         tokio::spawn(async move { drop(rx.recv().await) });
 
         let answered =
@@ -4135,14 +4268,25 @@ pub(crate) mod tests {
 
     /// A client leaving while its guest is still in the handler cancels the
     /// request: the unit is stopped and replaced at once instead of staying
-    /// busy until the budget.
+    /// busy until the budget. Its line has the 499 of a request its client
+    /// closed, naming the unit.
     #[tokio::test]
     async fn a_client_leaving_mid_request_frees_its_unit() {
         let loaded = load(&Locator::File(guest_wasm("fetch")), Caps::default())
             .await
             .unwrap();
         let silent = silent_upstream().await;
-        let handler = pooled(&loaded, Sandbox::default(), 1);
+        let tap = Tap::new();
+        let handler = Handler::new(
+            loaded,
+            Sandbox {
+                pool: 1,
+                ..Sandbox::default()
+            },
+            None,
+            &Instances::fed(Instances::MAX, tap.clone()),
+        )
+        .unwrap();
         restocked(&handler, 1).await;
 
         let peer = open(&handler, &fetch_request(&format!("http://{silent}/")));
@@ -4159,6 +4303,8 @@ pub(crate) mod tests {
             started.elapsed()
         );
         assert_eq!(pool(&handler).spawned(), 2, "the unit was replaced");
+        let [line] = tapped(&tap, "response", "t").try_into().unwrap();
+        assert_eq!((&*line["status"], &*line["instance"]), ("499", "0"));
     }
 
     /// A client leaving mid-stream retires the unit (its relay was cut short)

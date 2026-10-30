@@ -261,7 +261,7 @@ another OpenID Provider and the like.
 | package (docker) | an image (`cf push --docker-image`, a manifest's `docker.image`) holding the component as one `application/wasm` layer, as `wkg oci push` and `oras push <ref> hello.wasm:application/wasm` push it (of an index, its `wasm` entry). `--docker-username` with `CF_DOCKER_PASSWORD` are its credentials |
 | build | picks the component: the one the web process command names (`-c hello.wasm`, `command:`), else the package's only `.wasm`; of an image, pulls it. It must be a component (`\0asm`, layer 1). Anything else fails the build, naming what it found |
 | droplet | that component, by sha256 (`process_types.web` its path; stack `wasip3`, buildpack `wasm`); of an image, the image by digest (`cf app`: `docker image:`), `process_types.web` the repository's last segment `.wasm` |
-| web process `instances` | `pool`: warm instances. A request beyond them gets an instance of its own, as on every route: 0 still serves |
+| web process `instances` | `pool`: warm instances, taking the requests in turn. A request beyond them gets an instance of its own, as on every route: 0 still serves. `cf logs` names the instance (`APP/PROC/WEB/<index>`, the requests' `app_index`): a warm one's `0` to `instances - 1`, one of its own the lowest index free from `instances` up |
 | web process `memory` | `memory-mib` |
 | annotations `wicket.sluice.ik.am/budget-ms`, `wicket.sluice.ik.am/instances` | `budget-ms`, `instances` (the route's cap; below `pool` the wicket refuses) |
 | environment variables (`cf set-env`, a manifest's `env:`), `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: what the guest's `wasi:cli/environment` answers |
@@ -309,9 +309,9 @@ another OpenID Provider and the like.
 - `cf logs` (log-cache `read`, polled by the CLI): an in-memory ring of 1000 lines per app of
   the cf-api's own lines: staging (`STG`), lifecycle (`API`), the wicket's outcome (`CELL`).
   With `--flume`, the app's own too, from the live access log the wicket feeds: its output
-  (`APP/PROC/WEB` OUT / ERR), its requests (`RTR`, in the gorouter's access log format) and
-  the lines lost on the way (`LGR`). The cf-api watches its apps' hosts and resumes past the
-  last line it took (kept in `state.json`); see
+  (`APP/PROC/WEB` OUT / ERR), its requests (`RTR`, in the gorouter's access log format),
+  each naming its instance (see Mapping), and the lines lost on the way (`LGR`). The cf-api
+  watches its apps' hosts and resumes past the last line it took (kept in `state.json`); see
   [Live access log](../.kb/live-access-log.md#wickets-and-the-cf-api)
 - auth: see [Login](#login). Every request but the root document, `/v3`, `/v3/info` and the
   UAA endpoints needs a valid token (log-cache's included), and whoever holds one may do

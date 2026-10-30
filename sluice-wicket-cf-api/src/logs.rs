@@ -28,6 +28,9 @@ pub struct Line {
     /// when the line was added, so a reader past a line misses none after it.
     pub timestamp: u128,
     pub source: &'static str,
+    /// The index of the source's instance the line is of (`APP/PROC/WEB/1`);
+    /// 0 for the sources of one instance.
+    pub instance: u64,
     pub stream: Stream,
     pub text: String,
 }
@@ -42,11 +45,18 @@ impl Logs {
     pub fn add(&self, app: &str, source: &'static str, text: impl Into<String>) {
         let text = text.into();
         println!("[{app}] {source}: {text}");
-        self.push(app, source, Stream::Out, text);
+        self.push(app, source, 0, Stream::Out, text);
     }
 
     /// Adds a line of the app's own, which its wicket logs already.
-    pub fn push(&self, app: &str, source: &'static str, stream: Stream, text: String) {
+    pub fn push(
+        &self,
+        app: &str,
+        source: &'static str,
+        instance: u64,
+        stream: Stream,
+        text: String,
+    ) {
         let mut rings = self.rings.lock().expect("no panic under the lock");
         let ring = rings.entry(app.to_string()).or_default();
         let timestamp = ring
@@ -56,6 +66,7 @@ impl Logs {
         ring.push_back(Line {
             timestamp,
             source,
+            instance,
             stream,
             text,
         });
@@ -103,7 +114,7 @@ pub fn envelopes(app: &str, lines: &[Line]) -> Value {
             json!({
                 "timestamp": line.timestamp.to_string(),
                 "source_id": app,
-                "instance_id": "0",
+                "instance_id": line.instance.to_string(),
                 "deprecated_tags": {},
                 "tags": {"source_type": line.source},
                 "log": {
@@ -154,6 +165,12 @@ mod tests {
         assert!(logs.read("b", 0, None, 10, false).is_empty());
         let view = envelopes("a", &newest);
         assert_eq!(view["envelopes"]["batch"][0]["tags"]["source_type"], "STG");
+        assert_eq!(view["envelopes"]["batch"][0]["instance_id"], "0");
         assert_eq!(view["envelopes"]["batch"][0]["log"]["payload"], "bGluZSA0");
+        // an app's line, of its instance
+        logs.push("c", "APP/PROC/WEB", 2, Stream::Err, "x".into());
+        let view = envelopes("c", &logs.read("c", 0, None, 10, false));
+        assert_eq!(view["envelopes"]["batch"][0]["instance_id"], "2");
+        assert_eq!(view["envelopes"]["batch"][0]["log"]["type"], "ERR");
     }
 }

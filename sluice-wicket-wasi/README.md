@@ -547,12 +547,16 @@ cf-api (`cf logs`) see the wicket's lines:
 
 | kind | fields |
 |---|---|
-| `stdout` / `stderr` | `component`, `store` (the prefix's id), `line` |
-| `response` | `method`, `path`, `http` (`1.1`, `2`), `status`, `durationMs`, `bytes` (of the body), `remote`, `userAgent` |
+| `stdout` / `stderr` | `component`, `store` (the prefix's id), `instance`, `line` |
+| `response` | `method`, `path`, `http` (`1.1`, `2`), `status`, `durationMs`, `bytes` (of the body), `remote`, `userAgent`, `instance` |
 
 - the route key of a line is the host of its request: the `Host` (`:authority`), lowercase,
   without its port. A pooled unit serves one request at a time, so its output names the
   request it was written during (empty before its first)
+- `instance` is the index of the instance writing the line or serving the request among
+  its route's instances alive: a pooled unit's `0..pool` (its replacement keeps it), a
+  per-request instance's the lowest free from `pool` up. A request no instance served (no
+  route, none within its budget, its client gone while it waited) has none
 - `remote` is the last entry of the request's `X-Forwarded-For` (the node's peer), the
   client's `ip:port` on `--listen`; `durationMs` runs from the request's arrival to the end
   of its response body; a client gone before the response head is logged with status 499
@@ -694,15 +698,19 @@ table dirty and is retired, so a guest opens its buckets per request (cheap: a t
 a detached task that runs `Store::run_concurrent` once (it consumes the
 store) with a per-request job loop inside, so reuse cannot hand instances
 back: a unit serves one request at a time and the pool size is the warm
-concurrency. A unit is offered once instantiated; a request beyond the
-stock, or on a route without `pool`, uses the per-request path above while
-an instance slot is free (and the route's `instances` cap allows), so the
-pool only ever improves the warm latency (hello guest, dev profile: ~380us
-cold vs ~120us pooled per request). Each unit holds an instance slot of
-`--max-instances`, and one of its route's cap, for its lifetime (a retired
-unit's replacement takes them over); the pools of all routes together may not
-exceed the limit, which is checked at startup and on every reload. With no slot
-free, a request waits for whichever comes first, an idle unit or a free slot.
+concurrency. The units take requests in turn, the one idle longest first, as
+the gorouter balances an app's instances; each has an index of `0..N`, kept by
+its replacement (the `instance` of its lines in the
+[live access log](#live-access-log)). A unit is offered once instantiated; a
+request beyond the stock, or on a route without `pool`, uses the per-request
+path above while an instance slot is free (and the route's `instances` cap
+allows), so the pool only ever improves the warm latency (hello guest, dev
+profile: ~380us cold vs ~120us pooled per request). Each unit holds an
+instance slot of `--max-instances`, and one of its route's cap, for its
+lifetime (a retired unit's replacement takes them over); the pools of all
+routes together may not exceed the limit, which is checked at startup and on
+every reload. With no slot free, a request waits for whichever comes first, an
+idle unit or a free slot.
 
 Reuse assumes stateless / reentrant-safe guests: module state legitimately
 persists across a unit's requests, so a misbehaving guest poisons its own

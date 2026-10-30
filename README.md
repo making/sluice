@@ -730,9 +730,9 @@ A node queues at most 4096 lines for the flume and drops (and counts) the rest, 
 holding a request back; the page shows the lines missed and the nodes disconnected. A
 browser reconnecting, to any node, resumes after the last line it showed. The server starts
 and serves with the flume down. A wicket feeds the flume too (`--flume`): the requests it
-answered (`response`) and its guests' output (`stdout`, `stderr`), which the cf-api turns
-into the apps' `cf logs`. Topology, drops, ordering, wickets and proxy settings:
-[.kb/live-access-log.md](.kb/live-access-log.md).
+answered (`response`) and its guests' output (`stdout`, `stderr`), each naming its
+instance, which the cf-api turns into the apps' `cf logs`. Topology, drops, ordering,
+wickets and proxy settings: [.kb/live-access-log.md](.kb/live-access-log.md).
 
 #### Client certificate issuance
 

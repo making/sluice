@@ -90,8 +90,8 @@ same start and stop, ring of 512, queue of 4096 and gaps -- as the node
 
 | kind | fields |
 |---|---|
-| `response` | `method`, `path`, `http`, `status`, `durationMs`, `bytes`, `remote`, `userAgent` |
-| `stdout` / `stderr` | `component`, `store` (the id of the wicket's log prefix), `line` |
+| `response` | `method`, `path`, `http`, `status`, `durationMs`, `bytes`, `remote`, `userAgent`, `instance` |
+| `stdout` / `stderr` | `component`, `store` (the id of the wicket's log prefix), `instance`, `line` |
 
 - `response` is logged once the response body ended or the client left, with status 499
   when it left before the head; `durationMs` runs from the request's arrival. `remote` is
@@ -99,6 +99,12 @@ same start and stop, ring of 512, queue of 4096 and gaps -- as the node
 - A guest's output belongs to the request its store serves: a store serves one request,
   a pooled unit one at a time, so the attribution is exact. A pooled unit's output before
   its first request has an empty route key.
+- `instance` is the index of the instance among its route's instances alive, as CF numbers
+  an app's: a pooled unit's `0..pool`, kept by its replacement, and a per-request
+  instance's the lowest free from `pool` up while its store lives. The units take requests
+  in turn, the one idle longest first, as the gorouter's round-robin does. A `response`
+  no instance served (no route, none within its budget, its client gone while it waited)
+  has none.
 - The console shows a wicket's rows like a node's (the route column is the host) and
   names it `wicket:<client-id>` in the node strip; the kind filter lists its kinds. The
   node selector starts with the cluster's nodes and adds a wicket once the flume reports
@@ -106,14 +112,19 @@ same start and stop, ring of 512, queue of 4096 and gaps -- as the node
 
 The cf-api (`sluice-wicket-cf-api --flume URL --flume-token TOKEN`) watches the hosts of
 its apps' routes with the kinds `response`, `stdout` and `stderr`, and adds each line to
-the log of the app holding its host, which `cf logs` shows as Cloud Foundry does:
+the log of the app holding its host, which `cf logs` shows as Cloud Foundry does, the
+`instance` as the output's instance (`APP/PROC/WEB/1`) and the request's `app_index`
+(`-` for none; `RTR/0` is the router, the wicket):
 
 ```text
-[APP/PROC/WEB/0] OUT hello stdout: Method::Get /log body_bytes=0
-[APP/PROC/WEB/0] ERR hello stderr: Method::Get /log
-[RTR/0] OUT hello.localhost - [2026-10-30T01:17:47.123Z] "GET /log HTTP/1.1" 200 - 58 "-" "curl/8.7.1" "10.0.0.1" "-" response_time:0.000522 app_id:"<guid>" app_index:"0"
+[APP/PROC/WEB/1] OUT hello stdout: Method::Get /log body_bytes=0
+[APP/PROC/WEB/1] ERR hello stderr: Method::Get /log
+[RTR/0] OUT hello.localhost - [2026-10-30T01:17:47.123Z] "GET /log HTTP/1.1" 200 - 58 "-" "curl/8.7.1" "10.0.0.1" "-" response_time:0.000522 app_id:"<guid>" app_index:"1"
 ```
 
+- An app's web process `instances` is its route's `pool`: with `cf scale -i 3`, requests
+  one after another rotate over instances 0 to 2; one arriving while all three are busy
+  runs on an instance of its own, index 3 or above.
 - The watch resumes past its cursor (kept in `state.json`) when the hosts change or the
   stream drops. Without a host it holds no watch: an empty filter passes every line.
 - Lines lost become an `LGR` ERR line in the log of every app watched, as they may be any

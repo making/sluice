@@ -546,6 +546,26 @@ fn the_cf_cli_deploys_to_the_wicket() {
     );
     cf.ok(&["scale", "hello", "-i", "2"]);
     assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 2);
+    // the second warm instance takes its turn: its index in the output and in
+    // app_index (a request before the units are up runs on an instance of its
+    // own, index 2)
+    let deadline = Instant::now() + HANG;
+    loop {
+        assert_eq!(get(&listen, "hello.localhost", "/log", None).0, 200);
+        let recent = cf.ok(&["logs", "hello", "--recent"]);
+        if recent.contains("[APP/PROC/WEB/1] OUT hello stdout: Method::Get /log")
+            && recent
+                .lines()
+                .any(|line| line.contains(&request("/log")) && line.contains("app_index:\"1\""))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "instance 1 never served: {recent}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 
     // a rolling push of another component, with no failed request during it
     let stop = Arc::new(AtomicBool::new(false));

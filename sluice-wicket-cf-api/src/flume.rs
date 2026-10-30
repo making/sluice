@@ -2,8 +2,9 @@
 //! (`--flume`) for what the wicket feeds of the apps' hosts -- the guests'
 //! output (`stdout`, `stderr`) and the requests answered (`response`) -- each
 //! line added to the log of the app holding its host, as Cloud Foundry has
-//! it: the output as `APP/PROC/WEB` OUT / ERR, a request as `RTR` in the
-//! gorouter's access log format.
+//! it: the output as `APP/PROC/WEB` OUT / ERR of the instance writing it, a
+//! request as `RTR` in the gorouter's access log format, naming the instance
+//! that served it (`app_index`).
 //!
 //! ```text
 //! wicket --Feed--> sluice-flume <--Watch-- cf-api --log-cache read API--> cf logs
@@ -212,13 +213,16 @@ impl Taker<'_> {
                 let Some(app) = self.hosts.get(&event.route_key) else {
                     return;
                 };
-                let (source, stream, text) = match event.kind.as_str() {
-                    "stdout" => ("APP/PROC/WEB", Stream::Out, field(&event, "line")),
-                    "stderr" => ("APP/PROC/WEB", Stream::Err, field(&event, "line")),
-                    "response" => ("RTR", Stream::Out, router_line(&event, app)),
+                // a wicket predating the instance index names none: 0, as before
+                let index = instance(&event).unwrap_or(0);
+                let (source, index, stream, text) = match event.kind.as_str() {
+                    "stdout" => ("APP/PROC/WEB", index, Stream::Out, field(&event, "line")),
+                    "stderr" => ("APP/PROC/WEB", index, Stream::Err, field(&event, "line")),
+                    // the router's index: the wicket is the one router
+                    "response" => ("RTR", 0, Stream::Out, router_line(&event, app)),
                     _ => return,
                 };
-                self.logs.push(app, source, stream, text);
+                self.logs.push(app, source, index, stream, text);
             }
             watch_event::Body::Gap(gap) => {
                 if gap.seq > 0 {
@@ -261,7 +265,7 @@ impl Taker<'_> {
     fn lost(&self, text: String) {
         let apps: BTreeSet<&String> = self.hosts.values().collect();
         for app in apps {
-            self.logs.push(app, "LGR", Stream::Err, text.clone());
+            self.logs.push(app, "LGR", 0, Stream::Err, text.clone());
         }
     }
 }
@@ -275,9 +279,21 @@ fn field(event: &AccessEvent, name: &str) -> String {
         .map_or_else(|| "-".to_string(), |field| field.value.clone())
 }
 
+/// The index of the app's instance the event is of (`instance`): the one
+/// writing the output, the one serving the request. None for a request no
+/// instance served, and from a wicket predating it.
+fn instance(event: &AccessEvent) -> Option<u64> {
+    event
+        .fields
+        .iter()
+        .find(|field| field.name == "instance")
+        .and_then(|field| field.value.parse().ok())
+}
+
 /// A response as the gorouter's access log has it: the host, when the
 /// request began, its line, the status, the bytes (received unknown, sent),
-/// the user agent, the client, the response time in seconds and the app.
+/// the user agent, the client, the response time in seconds, the app and
+/// its instance that served it (`-` for none, as the gorouter has it).
 fn router_line(event: &AccessEvent, app: &str) -> String {
     let took: f64 = field(event, "durationMs").parse().unwrap_or(0.0);
     let began = event
@@ -290,7 +306,7 @@ fn router_line(event: &AccessEvent, app: &str) -> String {
         began % 1000
     );
     format!(
-        "{} - [{began}] \"{} {} HTTP/{}\" {} - {} \"-\" \"{}\" \"{}\" \"-\" response_time:{:.6} app_id:\"{app}\" app_index:\"0\"",
+        "{} - [{began}] \"{} {} HTTP/{}\" {} - {} \"-\" \"{}\" \"{}\" \"-\" response_time:{:.6} app_id:\"{app}\" app_index:\"{}\"",
         event.route_key,
         field(event, "method"),
         field(event, "path"),
@@ -300,6 +316,7 @@ fn router_line(event: &AccessEvent, app: &str) -> String {
         field(event, "userAgent"),
         field(event, "remote"),
         took / 1000.0,
+        instance(event).map_or_else(|| "-".to_string(), |index| index.to_string()),
     )
 }
 
@@ -363,19 +380,20 @@ mod tests {
         })
     }
 
-    /// The lines of `app`: source, stream and text, oldest first.
-    fn lines(logs: &Logs, app: &str) -> Vec<(&'static str, Stream, String)> {
+    /// The lines of `app`: source, instance, stream and text, oldest first.
+    fn lines(logs: &Logs, app: &str) -> Vec<(&'static str, u64, Stream, String)> {
         logs.read(app, 0, None, 100, false)
             .into_iter()
-            .map(|line| (line.source, line.stream, line.text))
+            .map(|line| (line.source, line.instance, line.stream, line.text))
             .collect()
     }
 
     /// Each line goes to the app holding its host, as cf has it: the output
-    /// `APP/PROC/WEB` OUT / ERR, a response `RTR` in the gorouter's format.
-    /// The lines lost reach every app watched -- a sluice node's drops none
-    /// of them -- and the cursor follows the lines taken, of the flume's run
-    /// at hand.
+    /// `APP/PROC/WEB` OUT / ERR of its instance (0 from a wicket naming
+    /// none), a response `RTR` in the gorouter's format, naming the instance
+    /// that served it (`-` for none). The lines lost reach every app watched
+    /// -- a sluice node's drops none of them -- and the cursor follows the
+    /// lines taken, of the flume's run at hand.
     #[test]
     fn lines_reach_the_app_of_their_host_and_losses_every_app() {
         let dir = std::env::temp_dir().join(format!("sluice-cf-api-flume-{}", std::process::id()));
@@ -402,25 +420,31 @@ mod tests {
             build: None,
         }));
         assert_eq!(store.read(|state| state.flume), None, "another run's");
-        taker.take(event(1, "stdout", "a.localhost", &[("line", "out")]));
-        taker.take(event(2, "stderr", "hi.localhost", &[("line", "err")]));
         taker.take(event(
-            3,
-            "response",
-            "b.localhost",
-            &[
+            1,
+            "stdout",
+            "a.localhost",
+            &[("instance", "1"), ("line", "out")],
+        ));
+        taker.take(event(2, "stderr", "hi.localhost", &[("line", "err")]));
+        let response = |seq: u64, status: &str, instance: Option<&str>| {
+            let mut fields = vec![
                 ("method", "GET"),
                 ("path", "/x?y=1"),
                 ("http", "1.1"),
-                ("status", "200"),
+                ("status", status),
                 ("durationMs", "2.500"),
                 ("bytes", "13"),
                 ("remote", "10.0.0.1"),
                 ("userAgent", "curl/8"),
-            ],
-        ));
+            ];
+            fields.extend(instance.map(|instance| ("instance", instance)));
+            event(seq, "response", "b.localhost", &fields)
+        };
+        taker.take(response(3, "200", Some("1")));
+        taker.take(response(4, "503", None));
         taker.take(event(
-            4,
+            5,
             "stdout",
             "c.localhost",
             &[("line", "not watched")],
@@ -431,16 +455,19 @@ mod tests {
 
         let restarted = (
             "LGR",
+            0,
             Stream::Err,
             "Lines may be missing: the flume restarted".to_string(),
         );
         let dropped = (
             "LGR",
+            0,
             Stream::Err,
             "Up to 3 lines missed: the wicket's queue to the flume was full".to_string(),
         );
         let behind = (
             "LGR",
+            0,
             Stream::Err,
             "Up to 3 lines missed: the cf-api fell behind the flume".to_string(),
         );
@@ -448,31 +475,37 @@ mod tests {
             lines(&logs, "app-a"),
             [
                 restarted.clone(),
-                ("APP/PROC/WEB", Stream::Out, "out".to_string()),
-                ("APP/PROC/WEB", Stream::Err, "err".to_string()),
+                ("APP/PROC/WEB", 1, Stream::Out, "out".to_string()),
+                ("APP/PROC/WEB", 0, Stream::Err, "err".to_string()),
                 dropped.clone(),
                 behind.clone(),
             ]
         );
+        let router = |status: &str, index: &str| {
+            (
+                "RTR",
+                0,
+                Stream::Out,
+                format!(
+                    "b.localhost - [2026-10-30T01:17:47.497Z] \"GET /x?y=1 HTTP/1.1\" {status} - \
+                     13 \"-\" \"curl/8\" \"10.0.0.1\" \"-\" response_time:0.002500 \
+                     app_id:\"app-b\" app_index:\"{index}\""
+                ),
+            )
+        };
         assert_eq!(
             lines(&logs, "app-b"),
             [
                 restarted,
-                (
-                    "RTR",
-                    Stream::Out,
-                    "b.localhost - [2026-10-30T01:17:47.497Z] \"GET /x?y=1 HTTP/1.1\" 200 - 13 \
-                     \"-\" \"curl/8\" \"10.0.0.1\" \"-\" response_time:0.002500 \
-                     app_id:\"app-b\" app_index:\"0\""
-                        .to_string()
-                ),
+                router("200", "1"),
+                router("503", "-"),
                 dropped,
                 behind,
             ]
         );
         assert_eq!(
             store.read(|state| state.flume),
-            Some(FlumeCursor { epoch: 2, seq: 4 }),
+            Some(FlumeCursor { epoch: 2, seq: 5 }),
             "the last line taken"
         );
         let _ = std::fs::remove_dir_all(&dir);
