@@ -1,16 +1,21 @@
 # Recording the cf CLI demo
 
 `sluice-cf-demo.mp4` is the demo the [README](../README.md) shows (as `sluice-cf-demo.gif`):
-the stock `cf` CLI against the cf-api and a wicket in local mode on a flume -- login, push,
-routes, scale, environment variables, a keyvalue service, logs, delete. `demo.tape` is its
-script for [VHS](https://github.com/charmbracelet/vhs), which types it into a real shell and
-records the terminal; `record.sh` runs it on a fresh stack.
+the stock `cf` CLI against the cf-api and a wicket in local mode on a flume, with Dex as the
+OpenID Provider -- `cf login --sso`, push, routes, scale, environment variables, a keyvalue
+service, logs, delete. `demo.tape` is its script for
+[VHS](https://github.com/charmbracelet/vhs), which types it into a real shell and records the
+terminal; `record.sh` runs it on a fresh stack. The browser's part of `cf login --sso` (the
+sign-in at Dex, the page with the one-time code) is done by `passcode.sh` before the recording,
+and the tape types the code at the prompt (`{{PASSCODE}}`, replaced by `record.sh`).
 
 ## Prerequisites
 
 - the toolchains the Rust workspaces need (`record.sh` builds the release binaries and the
   guests), `protoc`
 - `vhs` (with `ttyd` and `ffmpeg`), `jq`, `curl`, `nc`: `brew install vhs jq` on macOS
+- Docker (OrbStack or Docker Desktop on macOS): Dex runs as a container on the host's network
+  (`ghcr.io/dexidp/dex`, pulled on the first run), its users in `dex.yaml`
 - the OSS cf CLI v8: `SLUICE_CF_CLI`, else `cf8` or `cf` on the PATH. The Tanzu `cf` 10.x
   refuses this API
 
@@ -19,7 +24,7 @@ records the terminal; `record.sh` runs it on a fresh stack.
   tar xzf cf8-cli_8.19.0_macosarm.tgz && export SLUICE_CF_CLI=$PWD/cf
   ```
 
-- the loopback ports 8002, 8080, 9090 and 9091 free
+- the loopback ports 5556, 8002, 8080, 9090 and 9091 free
 
 ## Record
 
@@ -53,7 +58,7 @@ Before committing the new files:
   ```text
   sluice-wicket-cf-api/demo/start.sh
   export CF_HOME=$PWD/sluice-wicket-cf-api/target/demo/cfhome
-  cf api http://127.0.0.1:9091 && cf login -u demo -p demo
+  cf api http://127.0.0.1:9091 && cf login --sso-passcode "$(sluice-wicket-cf-api/demo/passcode.sh)"
   cd sluice-wicket-cf-api/target/demo/apps && cf push hello -p hello/
   sluice-wicket-cf-api/demo/stop.sh --reset    # --reset: no apps, services or login left
   ```
@@ -63,3 +68,5 @@ Before committing the new files:
 - quote a path in the tape (`Output "out/sluice-cf-demo.mp4"`): VHS refuses a bare absolute one
 - the apps' packages are `apps/hello` and `apps/counter` in `../target/demo`, copied by
   `start.sh` from the guests the wicket's examples build
+- the code `passcode.sh` prints is good for 5 minutes and once: the login is the tape's first
+  scene, and a failed take needs a new code (`record.sh` takes one each run)

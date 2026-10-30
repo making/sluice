@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Records demo.tape on a fresh demo stack into sluice-cf-demo.mp4 and sluice-cf-demo.gif next to
-# this script (see README.md). Needs vhs (with ttyd and ffmpeg), jq, curl and the OSS cf CLI v8:
-# SLUICE_CF_CLI, else cf8 or cf on the PATH.
+# this script (see README.md). Needs vhs (with ttyd and ffmpeg), jq, curl, docker (Dex) and the
+# OSS cf CLI v8: SLUICE_CF_CLI, else cf8 or cf on the PATH.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 work=$repo/sluice-wicket-cf-api/target/demo
 
-for tool in vhs ffmpeg jq curl nc; do
+for tool in vhs ffmpeg jq curl nc docker; do
 	if ! command -v "$tool" > /dev/null; then
 		echo "$tool is missing" >&2
 		exit 1
@@ -37,8 +37,11 @@ trap '"$here/stop.sh"' EXIT
 # the tape types cf: this one, whichever cf the PATH holds
 mkdir -p "$work/bin" "$work/out"
 ln -sf "$cli" "$work/bin/cf"
+# the browser's part of cf login --sso, done here: the tape types the code (good for 5 minutes)
+passcode=$("$here/passcode.sh")
+sed "s/{{PASSCODE}}/$passcode/" "$here/demo.tape" > "$work/demo.tape"
 cd "$work"
-CF_HOME=$work/cfhome PATH=$work/bin:$PATH vhs "$here/demo.tape"
+CF_HOME=$work/cfhome PATH=$work/bin:$PATH vhs demo.tape
 
 cp out/sluice-cf-demo.mp4 "$here/"
 # the README shows the GIF: GitHub plays no video committed to the repository

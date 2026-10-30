@@ -19,6 +19,7 @@ for name in cf-api wicket flume; do
 	done
 	kill -9 "$pid" 2> /dev/null || true
 done
+docker rm -f sluice-cf-demo-dex > /dev/null 2>&1 || true
 if [ "${1:-}" = --reset ]; then
 	rm -rf "$work/run" "$work/logs" "$work/cfhome"
 fi

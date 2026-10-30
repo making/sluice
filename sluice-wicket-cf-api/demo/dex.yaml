@@ -1,0 +1,21 @@
+# The demo's OpenID Provider (start.sh runs it with Docker): one user, demo@example.com with
+# the password demo, and the cf-api as its client.
+issuer: http://127.0.0.1:5556/dex
+storage:
+  type: memory
+web:
+  http: 127.0.0.1:5556
+oauth2:
+  skipApprovalScreen: true
+staticClients:
+  - id: cf
+    name: sluice-wicket-cf-api
+    secret: demo-secret
+    redirectURIs: [http://127.0.0.1:9091/uaa/callback]
+enablePasswordDB: true
+staticPasswords:
+  - email: demo@example.com
+    username: demo
+    preferredUsername: demo
+    userID: 1c2a0b3e-0000-4000-8000-000000000002
+    hash: $2y$10$EAhSs4ahnjR2Rfjxkz9Y3uq2MyG87Rwswp2nfJ5wZ6JvrNl/h8C4i

@@ -1,5 +1,6 @@
 # The README's demo: the cf CLI against the cf-api and a wicket in local mode. record.sh runs it
-# in ../target/demo (apps/ holds the packages, out/ takes the video) on a fresh stack.
+# in ../target/demo (apps/ holds the packages, out/ takes the video) on a fresh stack, with
+# {{PASSCODE}} replaced by the one-time code of cf login --sso (passcode.sh, the browser's part).
 Output "out/sluice-cf-demo.mp4"
 
 Require cf
@@ -32,10 +33,13 @@ Type "cf api http://127.0.0.1:9091"
 Enter
 Wait
 Sleep 1.5s
-Type "cf login -u demo -p demo    # any credentials in the MVP"
+Type "cf login --sso    # an OpenID Provider (Dex here) signs the user in: a one-time code from the browser"
+Enter
+Sleep 2s
+Type "{{PASSCODE}}"
 Enter
 Wait
-Sleep 2.5s
+Sleep 3s
 
 Hide
 Type "clear"

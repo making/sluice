@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Starts the demo stack on the loopback from the release builds: sluice-flume (8002), the wicket
-# in local mode (the apps on 8080, its console on 9090) and the cf-api (9091). Its state, logs
-# and the packages cf push takes (apps/hello, apps/counter) are in ../target/demo.
+# in local mode (the apps on 8080, its console on 9090), Dex as the OpenID Provider (5556, with
+# Docker; dex.yaml: the user demo@example.com, password demo) and the cf-api (9091) logging in
+# through it. Its state, logs and the packages cf push takes (apps/hello, apps/counter) are in
+# ../target/demo.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
@@ -18,7 +20,11 @@ for file in "$flume" "$wicket" "$cf_api" "$guests/hello.wasm" "$guests/counter.w
 		exit 1
 	fi
 done
-for port in 8002 8080 9090 9091; do
+if ! command -v docker > /dev/null; then
+	echo "docker is missing: Dex, the demo's OpenID Provider, runs as a container" >&2
+	exit 1
+fi
+for port in 5556 8002 8080 9090 9091; do
 	if nc -z 127.0.0.1 "$port" 2> /dev/null; then
 		echo "port $port is in use (the demo stack still running? stop.sh)" >&2
 		exit 1
@@ -52,10 +58,16 @@ start wicket "$run/wicket" "$wicket" \
 	--console-dir "$run/wicket/deployed" \
 	--flume grpc://127.0.0.1:8002 --flume-token flume-secret
 wait_port 9090
+# Dex on the host's network: the browser, the cf-api and this script reach it at 127.0.0.1:5556
+docker run -d --rm --name sluice-cf-demo-dex --network host \
+	-v "$here/dex.yaml:/etc/dex/dex.yaml:ro" ghcr.io/dexidp/dex:v2.46.1 dex serve /etc/dex/dex.yaml > /dev/null
+wait_port 5556
 start cf-api "$run/cf-api" "$cf_api" \
 	--listen 127.0.0.1:9091 --wicket http://127.0.0.1:9090 --wicket-token wicket-secret \
 	--data-dir "$run/cf-api" \
-	--flume grpc://127.0.0.1:8002 --flume-token flume-secret
+	--flume grpc://127.0.0.1:8002 --flume-token flume-secret \
+	--oidc-issuer http://127.0.0.1:5556/dex --oidc-client-id cf --oidc-client-secret demo-secret \
+	--oidc-claim 'email=*@example.com'
 wait_port 9091
-echo "cf API http://127.0.0.1:9091, apps http://<app>.localhost:8080," \
-	"wicket console http://127.0.0.1:9090 (password wicket-secret)"
+echo "cf API http://127.0.0.1:9091 (cf login --sso: demo@example.com / demo at Dex, or passcode.sh)," \
+	"apps http://<app>.localhost:8080, wicket console http://127.0.0.1:9090 (password wicket-secret)"
