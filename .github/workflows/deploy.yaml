@@ -168,14 +168,10 @@ jobs:
         VARIANT: ${{ matrix.variant }}
       run: |
         IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/${APP} | tr '[:upper:]' '[:lower:]')"
-        docker manifest create ${IMAGE}:${VARIANT}_${REVISION} \
-          --amend ${IMAGE}:${VARIANT}_amd64_${REVISION} \
-          --amend ${IMAGE}:${VARIANT}_aarch64_${REVISION}
-        docker manifest push ${IMAGE}:${VARIANT}_${REVISION}
-        docker manifest create ${IMAGE}:${VARIANT} \
-          --amend ${IMAGE}:${VARIANT}_amd64_${REVISION} \
-          --amend ${IMAGE}:${VARIANT}_aarch64_${REVISION}
-        docker manifest push ${IMAGE}:${VARIANT}
+        # imagetools, not docker manifest: an arch's image may be an index itself (on
+        # ubuntu-26.04 docker keeps images in containerd and attaches their provenance)
+        docker buildx imagetools create -t ${IMAGE}:${VARIANT}_${REVISION} -t ${IMAGE}:${VARIANT} \
+          ${IMAGE}:${VARIANT}_amd64_${REVISION} ${IMAGE}:${VARIANT}_aarch64_${REVISION}
     - name: Generate image file
       env:
         APP: ${{ matrix.app }}

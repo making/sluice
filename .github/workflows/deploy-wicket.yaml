@@ -169,14 +169,10 @@ jobs:
     - name: Create and push manifest
       run: |
         IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/sluice-wicket-wasi | tr '[:upper:]' '[:lower:]')"
-        docker manifest create ${IMAGE}:${REVISION} \
-          --amend ${IMAGE}:amd64_${REVISION} \
-          --amend ${IMAGE}:aarch64_${REVISION}
-        docker manifest push ${IMAGE}:${REVISION}
-        docker manifest create ${IMAGE}:latest \
-          --amend ${IMAGE}:amd64_${REVISION} \
-          --amend ${IMAGE}:aarch64_${REVISION}
-        docker manifest push ${IMAGE}:latest
+        # imagetools, not docker manifest: an arch's image may be an index itself (on
+        # ubuntu-26.04 docker keeps images in containerd and attaches their provenance)
+        docker buildx imagetools create -t ${IMAGE}:${REVISION} -t ${IMAGE}:latest \
+          ${IMAGE}:amd64_${REVISION} ${IMAGE}:aarch64_${REVISION}
     - name: Generate image file
       run: |
         IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/sluice-wicket-wasi | tr '[:upper:]' '[:lower:]')"
