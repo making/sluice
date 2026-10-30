@@ -144,10 +144,10 @@ impl Provider {
             .send()
             .await
             .and_then(|response| response.error_for_status())
-            .map_err(|e| format!("{url}: {e}"))?
+            .map_err(|e| format!("{url}: {}", causes(&e)))?
             .json()
             .await
-            .map_err(|e| format!("{url}: {e}"))?;
+            .map_err(|e| format!("{url}: {}", causes(&e)))?;
         if document["issuer"]
             .as_str()
             .map(|found| found.trim_end_matches('/'))
@@ -265,7 +265,7 @@ impl Provider {
             .body(body)
             .send()
             .await
-            .map_err(|e| format!("{}: {e}", discovery.token_endpoint))?;
+            .map_err(|e| format!("{}: {}", discovery.token_endpoint, causes(&e)))?;
         let status = response.status();
         let body: Value = response.json().await.unwrap_or(Value::Null);
         if !status.is_success() {
@@ -482,6 +482,18 @@ pub fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
         .into()
 }
 
+/// An error with its causes: reqwest's own names the request only, not the
+/// refused connection or the failed lookup behind it.
+fn causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    text
+}
+
 /// Whether `a` is `b`, in a time that does not tell where they differ.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
@@ -581,6 +593,34 @@ mod tests {
         assert!(Signer::random().verify(&sealed).is_none());
         assert!(signer.verify("YWxpY2U").is_none());
         assert!(signer.verify(&format!("{sealed}x")).is_none());
+    }
+
+    /// A provider that hangs up: the error says why, not only which request.
+    #[tokio::test]
+    async fn an_unreachable_provider_is_named_with_the_cause() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}/dex", listener.local_addr().unwrap());
+        std::thread::spawn(move || listener.incoming().for_each(drop));
+        let provider = Provider::new(OidcSettings {
+            issuer: issuer.clone(),
+            client_id: "sluice".into(),
+            client_secret: None,
+            scopes: vec!["openid".into()],
+            claims: vec![],
+            ca_pem: None,
+        })
+        .unwrap();
+        let error = provider
+            .begin("http://127.0.0.1/callback")
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with(&format!(
+                "{issuer}/.well-known/openid-configuration: error sending request"
+            )),
+            "{error}"
+        );
+        assert!(error.contains("connection closed"), "{error}");
     }
 
     #[test]
