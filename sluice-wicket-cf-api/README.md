@@ -71,6 +71,60 @@ Each option also reads `SLUICE_WICKET_CF_API_<NAME>` from the environment. The i
 the loopback, so it is reached from the wicket's network namespace (`--network host`, a
 sidecar, `kubectl port-forward`).
 
+### Docker Compose
+
+The three images on one host, on its network (`network_mode: host`): the cf-api listens on the
+loopback only, and reaches the wicket's console and the flume there. `cf` runs on that host
+(Docker Engine on Linux, OrbStack on macOS) or through an SSH tunnel
+(`ssh -L 9091:127.0.0.1:9091 <host>`).
+
+```yaml
+# compose.yaml; .env holds FLUME_TOKEN and CONSOLE_TOKEN (openssl rand -hex 16 each), and
+# APPS_DOMAIN: a name whose wildcard DNS reaches the host (default localhost)
+services:
+  flume:
+    image: ghcr.io/making/sluice/sluice-flume
+    network_mode: host
+    command: [--host, 127.0.0.1]    # this host's wicket and cf-api only
+    environment:
+      SLUICE_FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
+    restart: unless-stopped
+  wicket:
+    image: ghcr.io/making/sluice/sluice-wicket-wasi
+    network_mode: host
+    # the apps on 8080; with --server and SLUICE_WICKET_WASI_TOKEN also through a sluice server
+    command: [--listen, 0.0.0.0:8080, --console, 127.0.0.1:9090, --flume, grpc://127.0.0.1:8002]
+    environment:
+      SLUICE_WICKET_WASI_CONSOLE_TOKEN: ${CONSOLE_TOKEN:?CONSOLE_TOKEN}
+      SLUICE_WICKET_WASI_FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
+    volumes:
+      - wicket:/data    # the apps and their components (deployed/), the keyvalue store
+    restart: unless-stopped
+  cf-api:
+    image: ghcr.io/making/sluice/sluice-wicket-cf-api
+    network_mode: host
+    command: [--wicket, http://127.0.0.1:9090, --flume, grpc://127.0.0.1:8002]
+    environment:
+      SLUICE_WICKET_CF_API_WICKET_TOKEN: ${CONSOLE_TOKEN:?CONSOLE_TOKEN}
+      SLUICE_WICKET_CF_API_FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
+      SLUICE_WICKET_CF_API_DOMAIN: ${APPS_DOMAIN:-localhost}
+    volumes:
+      - cf-api:/data    # the desired state, packages and droplets (cf-api/)
+    restart: unless-stopped
+volumes:
+  wicket:
+  cf-api:
+```
+
+```text
+docker compose up -d
+cf login -a http://127.0.0.1:9091 -u me -p x
+cf push hello -p hello/                    # hello/ holds hello.wasm, as in Run
+curl http://hello.localhost:8080/          # with APPS_DOMAIN: http://hello.apps.example.com:8080/
+```
+
+`docker compose down` keeps the volumes: the next `up` serves the apps again, with their data.
+
 ## Mapping
 
 | CF | wicket |
