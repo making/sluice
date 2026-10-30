@@ -90,11 +90,10 @@ loopback, and reaches the wicket's console, the flume and Dex there. `cf` and th
 on that host (Docker Engine on Linux, OrbStack on macOS) or through an SSH tunnel
 (`ssh -L 9091:127.0.0.1:9091 -L 9090:127.0.0.1:9090 -L 5556:127.0.0.1:5556 <host>`).
 
+Four files in one directory, as below: `compose.yaml`, `wicket.yaml`, `dex.yaml` and `.env`.
+
 ```yaml
-# compose.yaml; .env holds FLUME_TOKEN, CONSOLE_TOKEN, REDIS_PASSWORD and OIDC_CLIENT_SECRET
-# (openssl rand -hex 16 each), ADMIN_PASSWORD_HASH (a bcrypt hash, single-quoted for its $:
-# htpasswd -bnBC 10 "" <password> | tr -d ':\n'), and APPS_DOMAIN: a name whose wildcard DNS
-# reaches the host (default localhost)
+# compose.yaml; .env holds the secrets and APPS_DOMAIN
 services:
   redis:
     image: redis:7-alpine
@@ -207,8 +206,22 @@ staticPasswords:                # the users: Dex asks for the email and the pass
 ```
 
 ```text
+# .env, next to compose.yaml: these values work as they are; change the secrets (openssl rand
+# -hex 16 each) and the password before anyone else can reach the host
+FLUME_TOKEN=d6edd1ade98c42dd49b77a7ba4906881
+CONSOLE_TOKEN=92190bcaf0277ff738ee4162d89c9eeb
+REDIS_PASSWORD=1b2ee329d0ec1fa3127d57206537d7a7
+OIDC_CLIENT_SECRET=13915f086b88d15379e27e6c3aa4a59f
+# admin@example.com's password, bcrypt: htpasswd -bnBC 10 "" <password> | tr -d ':\n'
+# (single-quoted: $ is Compose's otherwise); this one is "secret"
+ADMIN_PASSWORD_HASH='$2y$10$cYEVeVIzJX6QWDQcjRUaNe1RHrXamph8BdMRzlR/LS7msAe83oJOi'
+# a name whose wildcard DNS reaches the host (default localhost)
+# APPS_DOMAIN=apps.example.com
+```
+
+```text
 docker compose up -d
-cf login -a http://127.0.0.1:9091 --sso    # open the URL it prints, log in at Dex, paste the code
+cf login -a http://127.0.0.1:9091 --sso    # open the URL it prints, log in at Dex (admin@example.com / secret), paste the code
 cf push hello -p hello/                    # hello/ holds hello.wasm, as in Run
 open http://127.0.0.1:9090/                # the wicket's console: signed in through Dex too
 curl http://hello.localhost:8080/          # with APPS_DOMAIN: http://hello.apps.example.com:8080/
