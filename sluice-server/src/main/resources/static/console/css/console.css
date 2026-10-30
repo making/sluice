@@ -1535,7 +1535,7 @@ code {
 	overflow: auto;
 }
 
-.livelog th:nth-child(1) { width: 7.5rem; }
+.livelog th:nth-child(1) { width: 10.5rem; }
 .livelog th:nth-child(2) { width: 9rem; }
 .livelog th:nth-child(3) { width: 5.5rem; }
 .livelog th:nth-child(4) { width: 12rem; }

@@ -68,7 +68,7 @@ count is exact without a filter and an upper bound with one. The page sums both 
 
 The flume numbers every line it receives with one sequence (its run's `epoch` plus a
 counter); a view shows them in that order, which is per node the node's order, across
-nodes the order they reached the flume. The time column is the node's clock, shown in the browser's time zone (the full date and
+nodes the order they reached the flume. The time column is the node's clock, shown with its date in the browser's time zone (the
 zone on hover).
 
 The SSE event id is the flume's position (`<epoch>-<seq>`). A browser reconnecting sends

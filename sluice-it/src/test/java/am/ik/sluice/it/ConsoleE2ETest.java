@@ -523,7 +523,7 @@ class ConsoleE2ETest {
 		assertThat(first.locator("td").allInnerTexts().subList(1, 4)).containsExactly("console-node", "request",
 				"demo.local");
 		Locator time = first.locator("time");
-		assertThat(time.innerText()).isEqualTo(DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
+		assertThat(time.innerText()).isEqualTo(DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss")
 			.withZone(BROWSER_ZONE)
 			.format(Instant.parse(time.getAttribute("datetime"))));
 		PlaywrightAssertions.assertThat(page.locator("#livelog-rows tr[data-kind='close']").first()).isAttached();

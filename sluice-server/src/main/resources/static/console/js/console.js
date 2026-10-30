@@ -56,12 +56,12 @@ document.addEventListener("htmx:finally:request", (event) => {
       }
       return params;
     };
-    const pad = (value, width = 2) => String(value).padStart(width, "0");
+    const pad = (value) => String(value).padStart(2, "0");
     // the server sends the instant; the time column reads it in the browser's zone
     const localTime = (time) => {
       const at = new Date(time.dateTime);
       if (!Number.isNaN(at.getTime())) {
-        time.textContent = `${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}.${pad(at.getMilliseconds(), 3)}`;
+        time.textContent = `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`;
         time.title = at.toString();
       }
     };
