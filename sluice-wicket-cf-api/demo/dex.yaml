@@ -4,7 +4,7 @@ issuer: http://127.0.0.1:5556/dex
 storage:
   type: memory
 web:
-  http: 127.0.0.1:5556
+  http: 0.0.0.0:5556            # in the container; published on 127.0.0.1:5556
 oauth2:
   skipApprovalScreen: true
 staticClients:

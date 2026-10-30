@@ -83,12 +83,14 @@ namespace (`--network host`, a sidecar, `kubectl port-forward`).
 
 ### Docker Compose
 
-The images on one host, on its network (`network_mode: host`), with Redis holding the apps'
-keyvalue data and [Dex](https://dexidp.io/) as the OpenID Provider of the cf-api and of the
-wicket's console alike, its users in its configuration file: the cf-api listens on the
-loopback, and reaches the wicket's console, the flume and Dex there. `cf` and the browser run
-on that host (Docker Engine on Linux, OrbStack on macOS) or through an SSH tunnel
-(`ssh -L 9091:127.0.0.1:9091 -L 9090:127.0.0.1:9090 -L 5556:127.0.0.1:5556 <host>`).
+The images on one host, with Redis holding the apps' keyvalue data and [Dex](https://dexidp.io/)
+as the OpenID Provider of the cf-api and of the wicket's console alike, its users in its
+configuration file. The apps are published on 8080, the cf-api (9091), the console (9090) and
+Dex (5556) on the host's loopback: `cf` and the browser run on that host (Docker Engine on
+Linux, Docker Desktop or OrbStack on macOS) or through an SSH tunnel
+(`ssh -L 9091:127.0.0.1:9091 -L 9090:127.0.0.1:9090 -L 5556:127.0.0.1:5556 <host>`). Dex is
+`dex.localhost` for everyone: the loopback to the browser (`*.localhost`), the service's alias
+on the Compose network to the cf-api and the wicket, so the ID tokens' issuer is one URL.
 
 Four files in one directory, as below: `compose.yaml`, `wicket.yaml`, `dex.yaml` and `.env`.
 
@@ -98,40 +100,43 @@ services:
   redis:
     image: redis:7-alpine
     pull_policy: always
-    network_mode: host
-    command: [redis-server, --bind, 127.0.0.1, --requirepass, "${REDIS_PASSWORD:?REDIS_PASSWORD}", --appendonly, "yes"]
+    command: [redis-server, --requirepass, "${REDIS_PASSWORD:?REDIS_PASSWORD}", --appendonly, "yes"]
     volumes:
       - redis:/data
     restart: unless-stopped
   flume:
     image: ghcr.io/making/sluice/sluice-flume
     pull_policy: always
-    network_mode: host
-    command: [--host, 127.0.0.1]    # this host's wicket and cf-api only
     environment:
       SLUICE_FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
     restart: unless-stopped
   dex:
     image: ghcr.io/dexidp/dex:v2.46.1
     pull_policy: always
-    network_mode: host
     command: [dex, serve, /etc/dex/dex.yaml]
     environment:                    # what dex.yaml's secretEnv and hashFromEnv read
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
       ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?ADMIN_PASSWORD_HASH}
+    networks:
+      default:
+        aliases: [dex.localhost]    # the issuer's host, as the browser reaches it on the loopback
+    ports:
+      - "127.0.0.1:5556:5556"
     volumes:
       - ./dex.yaml:/etc/dex/dex.yaml:ro
     restart: unless-stopped
   wicket:
     image: ghcr.io/making/sluice/sluice-wicket-wasi
     pull_policy: always
-    network_mode: host
     command: [--config, /etc/sluice/wicket.yaml]
     environment:                    # what wicket.yaml's ${...} take
       CONSOLE_TOKEN: ${CONSOLE_TOKEN:?CONSOLE_TOKEN}
       FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
+    ports:
+      - "8080:8080"                 # the apps
+      - "127.0.0.1:9090:9090"       # the console, from this host only
     volumes:
       - ./wicket.yaml:/etc/sluice/wicket.yaml:ro
       - wicket:/data    # the apps and their components (deployed/)
@@ -140,8 +145,7 @@ services:
   cf-api:
     image: ghcr.io/making/sluice/sluice-wicket-cf-api
     pull_policy: always
-    network_mode: host
-    command: [--wicket, http://127.0.0.1:9090, --flume, grpc://127.0.0.1:8002, --oidc-issuer, http://127.0.0.1:5556/dex]
+    command: [--listen, 0.0.0.0:9091, --wicket, http://wicket:9090, --flume, grpc://flume:8002, --oidc-issuer, http://dex.localhost:5556/dex]
     environment:
       SLUICE_WICKET_CF_API_WICKET_TOKEN: ${CONSOLE_TOKEN:?CONSOLE_TOKEN}
       SLUICE_WICKET_CF_API_FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
@@ -149,9 +153,11 @@ services:
       SLUICE_WICKET_CF_API_OIDC_CLIENT_ID: sluice
       SLUICE_WICKET_CF_API_OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
       SLUICE_WICKET_CF_API_OIDC_CLAIM: email=admin@example.com    # who may log in
+    ports:
+      - "127.0.0.1:9091:9091"       # the API, from this host only
     volumes:
       - cf-api:/data    # the desired state, packages and droplets (cf-api/)
-    depends_on: [dex]
+    depends_on: [wicket, dex]
     restart: unless-stopped
 volumes:
   redis:
@@ -163,30 +169,30 @@ volumes:
 # wicket.yaml, next to compose.yaml (see the wicket's Configuration file); ${NAME} is the
 # wicket's environment
 listen: 0.0.0.0:8080            # the apps; with server and token also through a sluice server
-console: 127.0.0.1:9090
+console: 0.0.0.0:9090           # published on the host's loopback only
 console-token: ${CONSOLE_TOKEN}  # the cf-api's
 console-dir: /data/deployed     # in the volume, not next to this file
-oidc-issuer: http://127.0.0.1:5556/dex    # the browser signs in through Dex
+oidc-issuer: http://dex.localhost:5556/dex  # the browser signs in through Dex
 oidc-client-id: sluice
 oidc-client-secret: ${OIDC_CLIENT_SECRET}
 oidc-claim: email=admin@example.com       # who may sign in
-flume: grpc://127.0.0.1:8002
+flume: grpc://flume:8002
 flume-token: ${FLUME_TOKEN}
 keyvalue:
   stores:
     redis:                      # the plan of cf create-service keyvalue
       type: redis
-      url: redis://:${REDIS_PASSWORD}@127.0.0.1:6379/0
+      url: redis://:${REDIS_PASSWORD}@redis:6379/0
 ```
 
 ```yaml
 # dex.yaml, next to compose.yaml: the OpenID Provider (https://dexidp.io/docs/), its users
 # in this file
-issuer: http://127.0.0.1:5556/dex
+issuer: http://dex.localhost:5556/dex
 storage:
   type: memory
 web:
-  http: 127.0.0.1:5556
+  http: 0.0.0.0:5556
 oauth2:
   skipApprovalScreen: true
 staticClients:

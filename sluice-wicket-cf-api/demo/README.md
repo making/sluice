@@ -14,8 +14,8 @@ and the tape types the code at the prompt (`{{PASSCODE}}`, replaced by `record.s
 - the toolchains the Rust workspaces need (`record.sh` builds the release binaries and the
   guests), `protoc`
 - `vhs` (with `ttyd` and `ffmpeg`), `jq`, `curl`, `nc`: `brew install vhs jq` on macOS
-- Docker (OrbStack or Docker Desktop on macOS): Dex runs as a container on the host's network
-  (`ghcr.io/dexidp/dex`, pulled on the first run), its users in `dex.yaml`
+- Docker (OrbStack or Docker Desktop on macOS): Dex runs as a container, its port published on
+  the loopback (`ghcr.io/dexidp/dex`, pulled on the first run), its users in `dex.yaml`
 - the OSS cf CLI v8: `SLUICE_CF_CLI`, else `cf8` or `cf` on the PATH. The Tanzu `cf` 10.x
   refuses this API
 

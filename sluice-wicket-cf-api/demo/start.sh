@@ -58,8 +58,8 @@ start wicket "$run/wicket" "$wicket" \
 	--console-dir "$run/wicket/deployed" \
 	--flume grpc://127.0.0.1:8002 --flume-token flume-secret
 wait_port 9090
-# Dex on the host's network: the browser, the cf-api and this script reach it at 127.0.0.1:5556
-docker run -d --rm --name sluice-cf-demo-dex --network host \
+# Dex, published on the loopback: the browser, the cf-api and passcode.sh reach it at 127.0.0.1:5556
+docker run -d --rm --name sluice-cf-demo-dex -p 127.0.0.1:5556:5556 \
 	-v "$here/dex.yaml:/etc/dex/dex.yaml:ro" ghcr.io/dexidp/dex:v2.46.1 dex serve /etc/dex/dex.yaml > /dev/null
 wait_port 5556
 start cf-api "$run/cf-api" "$cf_api" \
