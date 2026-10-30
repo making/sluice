@@ -542,7 +542,10 @@ public final class NodeConnection implements AutoCloseable {
 
 			@Override
 			public void onError(Throwable t) {
-				log.info("[{}] tunnel stream error: {}", NodeConnection.this.key, t.toString());
+				// a transport failure arrives as a bare UNKNOWN; its cause names it
+				Throwable cause = t.getCause();
+				log.info("[{}] tunnel stream error: {}{}", NodeConnection.this.key, t.toString(),
+						(cause != null) ? " caused by " + cause : "");
 				markCallClosed();
 				closed.countDown();
 			}

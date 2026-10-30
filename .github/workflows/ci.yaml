@@ -58,3 +58,6 @@ jobs:
         key: cargo-test-${{ runner.os }}-${{ hashFiles('sluice-flume/Cargo.lock') }}
     - name: Test
       run: ./mvnw -V -B --no-transfer-progress verify
+    # what only a native image runs into (the released images are native)
+    - name: Native test
+      run: ./mvnw -B --no-transfer-progress -pl sluice-client -am -PnativeTest test -Dtest=DirectBufferReleaseTest -Dsurefire.failIfNoSpecifiedTests=false

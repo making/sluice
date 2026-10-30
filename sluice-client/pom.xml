@@ -142,6 +142,18 @@
 				</plugins>
 			</build>
 		</profile>
+		<!-- tests on a native image: ./mvnw -pl sluice-client -am -PnativeTest test -Dtest=<class> -->
+		<profile>
+			<id>nativeTest</id>
+			<build>
+				<plugins>
+					<plugin>
+						<groupId>org.graalvm.buildtools</groupId>
+						<artifactId>native-maven-plugin</artifactId>
+					</plugin>
+				</plugins>
+			</build>
+		</profile>
 	</profiles>
 
 </project>
