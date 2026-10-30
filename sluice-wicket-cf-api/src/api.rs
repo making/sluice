@@ -491,16 +491,39 @@ impl Api {
             }
             (&Method::GET, ["organizations", guid]) => store
                 .read(|state| (state.org.guid == *guid).then(|| views::org(base, state)))
-                .map_or_else(|| Err(ApiError::not_found("Organization")), |org| Ok(json(StatusCode::OK, &org))),
+                .map_or_else(
+                    || Err(ApiError::not_found("Organization")),
+                    |org| Ok(json(StatusCode::OK, &org)),
+                ),
             (&Method::GET, ["organizations", _, "domains"]) | (&Method::GET, ["domains"]) => {
-                listing(store.read(|state| state.domains.iter().map(|domain| views::domain(base, domain)).collect()), None)
+                listing(
+                    store.read(|state| {
+                        state
+                            .domains
+                            .iter()
+                            .map(|domain| views::domain(base, domain))
+                            .collect()
+                    }),
+                    None,
+                )
             }
             (&Method::GET, ["organizations", _, "domains", "default"]) => store
-                .read(|state| state.domains.first().map(|domain| views::domain(base, domain)))
-                .map_or_else(|| Err(ApiError::not_found("Domain")), |domain| Ok(json(StatusCode::OK, &domain))),
+                .read(|state| {
+                    state
+                        .domains
+                        .first()
+                        .map(|domain| views::domain(base, domain))
+                })
+                .map_or_else(
+                    || Err(ApiError::not_found("Domain")),
+                    |domain| Ok(json(StatusCode::OK, &domain)),
+                ),
             (&Method::GET, ["domains", guid]) => store
                 .read(|state| state.domain(guid).map(|domain| views::domain(base, domain)))
-                .map_or_else(|| Err(ApiError::not_found("Domain")), |domain| Ok(json(StatusCode::OK, &domain))),
+                .map_or_else(
+                    || Err(ApiError::not_found("Domain")),
+                    |domain| Ok(json(StatusCode::OK, &domain)),
+                ),
             (&Method::POST, ["domains"]) => Err(ApiError::unprocessable(
                 "private domains are not supported: the shared domains are the cf-api's --domain",
             )),
@@ -508,7 +531,9 @@ impl Api {
                 "the shared domains are the cf-api's --domain",
             )),
             (&Method::GET, ["spaces"]) => {
-                let included = req.q("include").is_some_and(|include| include.contains("organization"));
+                let included = req
+                    .q("include")
+                    .is_some_and(|include| include.contains("organization"));
                 store.read(|state| {
                     listing(
                         vec![views::space(base, state)],
@@ -518,7 +543,10 @@ impl Api {
             }
             (&Method::GET, ["spaces", guid]) => store
                 .read(|state| (state.space.guid == *guid).then(|| views::space(base, state)))
-                .map_or_else(|| Err(ApiError::not_found("Space")), |space| Ok(json(StatusCode::OK, &space))),
+                .map_or_else(
+                    || Err(ApiError::not_found("Space")),
+                    |space| Ok(json(StatusCode::OK, &space)),
+                ),
             (&Method::GET, ["spaces", _, "features", name]) => Ok(json(
                 StatusCode::OK,
                 &json!({"name": name, "description": "", "enabled": false}),
@@ -532,21 +560,22 @@ impl Api {
             }
             (&Method::GET, ["spaces", _, "running_security_groups"])
             | (&Method::GET, ["spaces", _, "staging_security_groups"]) => empty(),
-            (&Method::POST, ["spaces", _, "actions", "apply_manifest"]) => self.apply_manifest(req).await,
+            (&Method::POST, ["spaces", _, "actions", "apply_manifest"]) => {
+                self.apply_manifest(req).await
+            }
             (&Method::POST, ["spaces", _, "manifest_diff"]) => self.manifest_diff(req),
             (&Method::GET, ["stacks"]) => listing(vec![views::stack(base)], None),
             (&Method::GET, ["stacks", _]) => Ok(json(StatusCode::OK, &views::stack(base))),
             (&Method::GET, ["feature_flags"]) => listing(
                 ["service_instance_sharing", "diego_docker"]
                     .iter()
-                    .map(|name| json!({"name": name, "enabled": false, "updated_at": null, "custom_error_message": null, "links": {}}))
+                    .map(|name| feature_flag(name))
                     .collect(),
                 None,
             ),
-            (&Method::GET, ["feature_flags", name]) => Ok(json(
-                StatusCode::OK,
-                &json!({"name": name, "enabled": false, "updated_at": null, "custom_error_message": null, "links": {}}),
-            )),
+            (&Method::GET, ["feature_flags", name]) => {
+                Ok(json(StatusCode::OK, &feature_flag(name)))
+            }
             // --- apps
             (&Method::GET, ["apps"]) => {
                 let include = req.q("include").unwrap_or_default();
@@ -559,7 +588,11 @@ impl Api {
                         included.insert("organizations".into(), json!([views::org(base, state)]));
                     }
                     listing(
-                        state.apps.iter().map(|app| views::app(base, state, app)).collect(),
+                        state
+                            .apps
+                            .iter()
+                            .map(|app| views::app(base, state, app))
+                            .collect(),
                         (!included.is_empty()).then_some(Value::Object(included)),
                     )
                 })
@@ -570,91 +603,161 @@ impl Api {
             (&Method::DELETE, ["apps", guid]) => self.delete_app(req, guid).await,
             (&Method::GET, ["apps", guid, "processes"]) => {
                 let app = self.app(guid)?;
-                listing(store.read(|state| vec![views::process(base, state, &app)]), None)
+                listing(
+                    store.read(|state| vec![views::process(base, state, &app)]),
+                    None,
+                )
             }
             (&Method::GET, ["apps", guid, "processes", "web"]) => {
                 let app = self.app(guid)?;
-                Ok(json(StatusCode::OK, &store.read(|state| views::process(base, state, &app))))
+                Ok(json(
+                    StatusCode::OK,
+                    &store.read(|state| views::process(base, state, &app)),
+                ))
             }
             (&Method::GET, ["apps", guid, "processes", "web", "stats"]) => self.stats(guid),
             (&Method::POST, ["apps", guid, "processes", "web", "actions", "scale"]) => {
                 self.scale(req, guid).await
             }
-            (&Method::GET, ["apps", _, "processes", kind]) | (&Method::GET, ["apps", _, "processes", kind, "stats"]) | (&Method::POST, ["apps", _, "processes", kind, "actions", "scale"]) => {
+            (&Method::GET, ["apps", _, "processes", kind])
+            | (&Method::GET, ["apps", _, "processes", kind, "stats"])
+            | (&Method::POST, ["apps", _, "processes", kind, "actions", "scale"]) => {
                 Err(ApiError::not_found(&format!("Process ({kind})")))
             }
             (&Method::GET, ["apps", guid, "routes"]) => {
                 self.app(guid)?;
                 listing(
-                    store.read(|state| state.routes_of(guid).map(|route| views::route(base, state, route)).collect()),
+                    store.read(|state| {
+                        state
+                            .routes_of(guid)
+                            .map(|route| views::route(base, state, route))
+                            .collect()
+                    }),
                     None,
                 )
             }
             (&Method::GET, ["apps", guid, "packages"]) => {
                 self.app(guid)?;
                 listing(
-                    store.read(|state| state.packages.iter().filter(|package| package.app == *guid).map(|package| views::package(base, package)).collect()),
+                    store.read(|state| {
+                        state
+                            .packages
+                            .iter()
+                            .filter(|package| package.app == *guid)
+                            .map(|package| views::package(base, package))
+                            .collect()
+                    }),
                     None,
                 )
             }
             (&Method::GET, ["apps", guid, "droplets"]) => {
                 self.app(guid)?;
                 listing(
-                    store.read(|state| state.droplets.iter().filter(|droplet| droplet.app == *guid).map(|droplet| views::droplet(base, droplet)).collect()),
+                    store.read(|state| {
+                        state
+                            .droplets
+                            .iter()
+                            .filter(|droplet| droplet.app == *guid)
+                            .map(|droplet| views::droplet(base, droplet))
+                            .collect()
+                    }),
                     None,
                 )
             }
             (&Method::GET, ["apps", guid, "droplets", "current"]) => {
                 let app = self.app(guid)?;
-                let current = app.current_droplet.as_deref().ok_or_else(|| ApiError::not_found("Droplet"))?;
+                let current = app
+                    .current_droplet
+                    .as_deref()
+                    .ok_or_else(|| ApiError::not_found("Droplet"))?;
                 store
-                    .read(|state| state.droplet(current).map(|droplet| views::droplet(base, droplet)))
-                    .map_or_else(|| Err(ApiError::not_found("Droplet")), |droplet| Ok(json(StatusCode::OK, &droplet)))
+                    .read(|state| {
+                        state
+                            .droplet(current)
+                            .map(|droplet| views::droplet(base, droplet))
+                    })
+                    .map_or_else(
+                        || Err(ApiError::not_found("Droplet")),
+                        |droplet| Ok(json(StatusCode::OK, &droplet)),
+                    )
             }
             (&Method::GET, ["apps", guid, "relationships", "current_droplet"]) => {
                 let app = self.app(guid)?;
-                Ok(json(StatusCode::OK, &json!({"data": app.current_droplet.as_ref().map(|guid| json!({"guid": guid})), "links": {}})))
+                Ok(json(
+                    StatusCode::OK,
+                    &json!({"data": app.current_droplet.as_ref().map(|guid| json!({"guid": guid})), "links": {}}),
+                ))
             }
             (&Method::PATCH, ["apps", guid, "relationships", "current_droplet"]) => {
                 self.set_current_droplet(req, guid).await
             }
-            (&Method::POST, ["apps", guid, "actions", action @ ("start" | "stop" | "restart")]) => {
-                self.lifecycle(req, guid, action).await
-            }
+            (
+                &Method::POST,
+                [
+                    "apps",
+                    guid,
+                    "actions",
+                    action @ ("start" | "stop" | "restart"),
+                ],
+            ) => self.lifecycle(req, guid, action).await,
             (&Method::GET, ["apps", guid, "env"]) => {
                 let app = self.app(guid)?;
-                Ok(json(StatusCode::OK, &store.read(|state| views::env(base, state, &app))))
+                Ok(json(
+                    StatusCode::OK,
+                    &store.read(|state| views::env(base, state, &app)),
+                ))
             }
             (&Method::GET, ["apps", guid, "environment_variables"]) => {
                 let app = self.app(guid)?;
-                Ok(json(StatusCode::OK, &views::environment_variables(base, &app)))
+                Ok(json(
+                    StatusCode::OK,
+                    &views::environment_variables(base, &app),
+                ))
             }
             (&Method::PATCH, ["apps", guid, "environment_variables"]) => {
                 self.set_env(req, guid).await
             }
             (&Method::GET, ["apps", guid, "manifest"]) => {
                 let app = self.app(guid)?;
-                Ok(text(StatusCode::OK, "application/x-yaml", store.read(|state| views::manifest(state, &app))))
+                Ok(text(
+                    StatusCode::OK,
+                    "application/x-yaml",
+                    store.read(|state| views::manifest(state, &app)),
+                ))
             }
             (&Method::GET, ["apps", guid, "features"]) => {
                 self.app(guid)?;
-                Ok(json(StatusCode::OK, &json!({"resources": [{"name": "ssh", "description": "", "enabled": false}, {"name": "revisions", "description": "", "enabled": false}], "pagination": {"total_results": 2, "total_pages": 1}})))
+                Ok(json(
+                    StatusCode::OK,
+                    &json!({"resources": [{"name": "ssh", "description": "", "enabled": false}, {"name": "revisions", "description": "", "enabled": false}], "pagination": {"total_results": 2, "total_pages": 1}}),
+                ))
             }
             (&Method::GET, ["apps", guid, "features", name]) => {
                 self.app(guid)?;
-                Ok(json(StatusCode::OK, &json!({"name": name, "description": "", "enabled": false})))
+                Ok(json(
+                    StatusCode::OK,
+                    &json!({"name": name, "description": "", "enabled": false}),
+                ))
             }
             (&Method::GET, ["apps", guid, "ssh_enabled"]) => {
                 self.app(guid)?;
-                Ok(json(StatusCode::OK, &json!({"enabled": false, "reason": "ssh is not supported: a wasm component has no shell"})))
+                Ok(json(
+                    StatusCode::OK,
+                    &json!({"enabled": false, "reason": "ssh is not supported: a wasm component has no shell"}),
+                ))
             }
-            (&Method::GET, ["apps", guid, "sidecars"]) | (&Method::GET, ["apps", guid, "revisions"]) | (&Method::GET, ["apps", guid, "revisions", "deployed"]) | (&Method::GET, ["apps", guid, "tasks"]) => {
+            (&Method::GET, ["apps", guid, "sidecars"])
+            | (&Method::GET, ["apps", guid, "revisions"])
+            | (&Method::GET, ["apps", guid, "revisions", "deployed"])
+            | (&Method::GET, ["apps", guid, "tasks"]) => {
                 self.app(guid)?;
                 empty()
             }
             (&Method::POST, ["apps", guid, "tasks"]) => {
                 self.app(guid)?;
-                Err(ApiError::unprocessable("tasks are not supported: a wasm component serves requests only"))
+                Err(ApiError::unprocessable(
+                    "tasks are not supported: a wasm component serves requests only",
+                ))
             }
             (&Method::POST, ["apps", guid, "sidecars"]) => {
                 self.app(guid)?;
@@ -662,12 +765,21 @@ impl Api {
             }
             // --- processes
             (&Method::GET, ["processes"]) => listing(
-                store.read(|state| state.apps.iter().map(|app| views::process(base, state, app)).collect()),
+                store.read(|state| {
+                    state
+                        .apps
+                        .iter()
+                        .map(|app| views::process(base, state, app))
+                        .collect()
+                }),
                 None,
             ),
             (&Method::GET, ["processes", guid]) => {
                 let app = self.app_of_process(guid)?;
-                Ok(json(StatusCode::OK, &store.read(|state| views::process(base, state, &app))))
+                Ok(json(
+                    StatusCode::OK,
+                    &store.read(|state| views::process(base, state, &app)),
+                ))
             }
             (&Method::PATCH, ["processes", guid]) => self.patch_process(req, guid).await,
             (&Method::GET, ["processes", guid, "stats"]) => {
@@ -684,18 +796,40 @@ impl Api {
             }
             // --- packages, builds, droplets
             (&Method::GET, ["packages"]) => listing(
-                store.read(|state| state.packages.iter().map(|package| views::package(base, package)).collect()),
+                store.read(|state| {
+                    state
+                        .packages
+                        .iter()
+                        .map(|package| views::package(base, package))
+                        .collect()
+                }),
                 None,
             ),
             (&Method::POST, ["packages"]) => self.create_package(req),
             (&Method::GET, ["packages", guid]) => store
-                .read(|state| state.package(guid).map(|package| views::package(base, package)))
-                .map_or_else(|| Err(ApiError::not_found("Package")), |package| Ok(json(StatusCode::OK, &package))),
+                .read(|state| {
+                    state
+                        .package(guid)
+                        .map(|package| views::package(base, package))
+                })
+                .map_or_else(
+                    || Err(ApiError::not_found("Package")),
+                    |package| Ok(json(StatusCode::OK, &package)),
+                ),
             (&Method::POST, ["packages", guid, "upload"]) => self.upload(req, guid),
             (&Method::GET, ["packages", guid, "droplets"]) => {
-                store.read(|state| state.package(guid).map(|_| ())).ok_or_else(|| ApiError::not_found("Package"))?;
+                store
+                    .read(|state| state.package(guid).map(|_| ()))
+                    .ok_or_else(|| ApiError::not_found("Package"))?;
                 listing(
-                    store.read(|state| state.droplets.iter().filter(|droplet| droplet.package == *guid).map(|droplet| views::droplet(base, droplet)).collect()),
+                    store.read(|state| {
+                        state
+                            .droplets
+                            .iter()
+                            .filter(|droplet| droplet.package == *guid)
+                            .map(|droplet| views::droplet(base, droplet))
+                            .collect()
+                    }),
                     None,
                 )
             }
@@ -711,22 +845,50 @@ impl Api {
                 store.delete(&[crate::store::Blob::Package(guid.to_string())]);
                 self.job(req, "package.delete", Vec::new(), None)
             }
-            (&Method::POST, ["resource_matches"]) => Ok(json(StatusCode::CREATED, &json!({"resources": []}))),
+            (&Method::POST, ["resource_matches"]) => {
+                Ok(json(StatusCode::CREATED, &json!({"resources": []})))
+            }
             (&Method::GET, ["builds"]) => listing(
-                store.read(|state| state.builds.iter().map(|build| views::build(base, state, build)).collect()),
+                store.read(|state| {
+                    state
+                        .builds
+                        .iter()
+                        .map(|build| views::build(base, state, build))
+                        .collect()
+                }),
                 None,
             ),
             (&Method::POST, ["builds"]) => self.create_build(req),
             (&Method::GET, ["builds", guid]) => store
-                .read(|state| state.build(guid).map(|build| views::build(base, state, build)))
-                .map_or_else(|| Err(ApiError::not_found("Build")), |build| Ok(json(StatusCode::OK, &build))),
+                .read(|state| {
+                    state
+                        .build(guid)
+                        .map(|build| views::build(base, state, build))
+                })
+                .map_or_else(
+                    || Err(ApiError::not_found("Build")),
+                    |build| Ok(json(StatusCode::OK, &build)),
+                ),
             (&Method::GET, ["droplets"]) => listing(
-                store.read(|state| state.droplets.iter().map(|droplet| views::droplet(base, droplet)).collect()),
+                store.read(|state| {
+                    state
+                        .droplets
+                        .iter()
+                        .map(|droplet| views::droplet(base, droplet))
+                        .collect()
+                }),
                 None,
             ),
             (&Method::GET, ["droplets", guid]) => store
-                .read(|state| state.droplet(guid).map(|droplet| views::droplet(base, droplet)))
-                .map_or_else(|| Err(ApiError::not_found("Droplet")), |droplet| Ok(json(StatusCode::OK, &droplet))),
+                .read(|state| {
+                    state
+                        .droplet(guid)
+                        .map(|droplet| views::droplet(base, droplet))
+                })
+                .map_or_else(
+                    || Err(ApiError::not_found("Droplet")),
+                    |droplet| Ok(json(StatusCode::OK, &droplet)),
+                ),
             // --- routes
             (&Method::GET, ["routes"]) => {
                 let include = req.q("include").unwrap_or_default();
@@ -739,37 +901,77 @@ impl Api {
             }
             (&Method::POST, ["routes"]) => self.create_route(req),
             (&Method::GET, ["routes", guid]) | (&Method::PATCH, ["routes", guid]) => store
-                .read(|state| state.route(guid).map(|route| views::route(base, state, route)))
-                .map_or_else(|| Err(ApiError::not_found("Route")), |route| Ok(json(StatusCode::OK, &route))),
+                .read(|state| {
+                    state
+                        .route(guid)
+                        .map(|route| views::route(base, state, route))
+                })
+                .map_or_else(
+                    || Err(ApiError::not_found("Route")),
+                    |route| Ok(json(StatusCode::OK, &route)),
+                ),
             (&Method::DELETE, ["routes", guid]) => self.delete_route(req, guid).await,
             (&Method::GET, ["routes", guid, "destinations"]) => {
-                let route = store.read(|state| state.route(guid).cloned()).ok_or_else(|| ApiError::not_found("Route"))?;
-                Ok(json(StatusCode::OK, &json!({"destinations": views::destinations(&route), "links": {"self": {"href": format!("{base}/v3/routes/{guid}/destinations")}, "route": {"href": format!("{base}/v3/routes/{guid}")}}})))
+                let route = store
+                    .read(|state| state.route(guid).cloned())
+                    .ok_or_else(|| ApiError::not_found("Route"))?;
+                Ok(json(
+                    StatusCode::OK,
+                    &json!({"destinations": views::destinations(&route), "links": {"self": {"href": format!("{base}/v3/routes/{guid}/destinations")}, "route": {"href": format!("{base}/v3/routes/{guid}")}}}),
+                ))
             }
-            (&Method::POST, ["routes", guid, "destinations"]) => self.map_route(req, guid, false).await,
-            (&Method::PATCH, ["routes", guid, "destinations"]) => self.map_route(req, guid, true).await,
+            (&Method::POST, ["routes", guid, "destinations"]) => {
+                self.map_route(req, guid, false).await
+            }
+            (&Method::PATCH, ["routes", guid, "destinations"]) => {
+                self.map_route(req, guid, true).await
+            }
             (&Method::DELETE, ["routes", guid, "destinations", destination]) => {
                 self.unmap_route(req, guid, destination).await
             }
             // --- deployments, jobs
             (&Method::GET, ["deployments"]) => listing(
-                store.read(|state| state.deployments.iter().map(|deployment| views::deployment(base, deployment)).collect()),
+                store.read(|state| {
+                    state
+                        .deployments
+                        .iter()
+                        .map(|deployment| views::deployment(base, deployment))
+                        .collect()
+                }),
                 None,
             ),
             (&Method::POST, ["deployments"]) => self.create_deployment(req).await,
             (&Method::GET, ["deployments", guid]) => store
-                .read(|state| state.deployment(guid).map(|deployment| views::deployment(base, deployment)))
-                .map_or_else(|| Err(ApiError::not_found("Deployment")), |deployment| Ok(json(StatusCode::OK, &deployment))),
+                .read(|state| {
+                    state
+                        .deployment(guid)
+                        .map(|deployment| views::deployment(base, deployment))
+                })
+                .map_or_else(
+                    || Err(ApiError::not_found("Deployment")),
+                    |deployment| Ok(json(StatusCode::OK, &deployment)),
+                ),
             (&Method::POST, ["deployments", _, "actions", _]) => Err(ApiError::unprocessable(
                 "a deployment is finalized at once: the wicket swaps the app in place",
             )),
             (&Method::GET, ["jobs", guid]) => store
                 .read(|state| state.job(guid).map(|job| views::job(base, job)))
-                .map_or_else(|| Err(ApiError::not_found("Job")), |job| Ok(json(StatusCode::OK, &job))),
+                .map_or_else(
+                    || Err(ApiError::not_found("Job")),
+                    |job| Ok(json(StatusCode::OK, &job)),
+                ),
             // --- services
-            (_, ["service_brokers" | "service_offerings" | "service_plans" | "service_instances" | "service_credential_bindings", ..]) => {
-                self.services(req, segments).await
-            }
+            (
+                _,
+                [
+                    "service_brokers"
+                    | "service_offerings"
+                    | "service_plans"
+                    | "service_instances"
+                    | "service_credential_bindings",
+                    ..,
+                ],
+            ) => self.services(req, segments).await,
             (&Method::POST, ["service_route_bindings"]) => {
                 Err(ApiError::unprocessable("route services are not supported"))
             }
@@ -1740,6 +1942,11 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
         tag: Some(env::tag()),
         since: epoch_secs(),
     })
+}
+
+/// The feature flags the CLI asks for: none enabled.
+fn feature_flag(name: &str) -> Value {
+    json!({"name": name, "enabled": false, "updated_at": null, "custom_error_message": null, "links": {}})
 }
 
 /// Merges `metadata` (labels and annotations; a null value removes the
