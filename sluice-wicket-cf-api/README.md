@@ -44,8 +44,8 @@ target/release/sluice-wicket-cf-api --wicket http://127.0.0.1:9090 --wicket-toke
 cf login -a http://127.0.0.1:9091 -u me -p x   # any credentials: no --oidc-issuer (see Login)
 cf push hello -p hello/                        # hello/ holds hello.wasm (a wasi:http 0.3 component)
 curl http://hello.localhost:8080/              # the wicket's --listen; *.localhost is the loopback
-wkg oci push ghcr.io/me/hello:1 hello.wasm     # or: oras push ghcr.io/me/hello:1 hello.wasm:application/wasm
-cf push img --docker-image ghcr.io/me/hello:1  # private: --docker-username me, with CF_DOCKER_PASSWORD
+# an image (see Mapping): the wicket's hello example, as its CI publishes it
+cf push img --docker-image ghcr.io/making/sluice/sluice-wicket-wasi/examples/hello
 cf map-route hello localhost --hostname hi
 cf scale hello -i 2
 cf push hello -p hello/ --strategy rolling     # swapped in place

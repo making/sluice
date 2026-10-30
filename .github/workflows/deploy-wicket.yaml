@@ -56,6 +56,61 @@ jobs:
           identical|behind) echo "Skipped: ${TARGET} is not newer than the deployed revision" | tee -a "${GITHUB_STEP_SUMMARY}" ;;
           *) echo "revision=${TARGET}" >> "${GITHUB_OUTPUT}" ;;
         esac
+  # The example guests (sluice-wicket-wasi/examples) as wasm OCI artifacts, as wkg oci push
+  # makes them (a config of application/vnd.wasm.config.v0+json, the component one layer of
+  # application/wasm): <registry>/<repository>/sluice-wicket-wasi/examples/<example>, the
+  # revision and latest, what cf push --docker-image pulls. Apart from the image: its failure
+  # deploys the wicket all the same.
+  push-guests:
+    needs: target
+    if: needs.target.outputs.revision != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: sluice-wicket-wasi/examples
+    env:
+      REVISION: ${{ needs.target.outputs.revision }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ needs.target.outputs.revision }}
+    # the nightly examples/rust-toolchain.toml pins, with wasm32-wasip3
+    - name: Build the guests
+      run: |
+        rustup toolchain install
+        cargo build --release --locked
+    - name: Install wkg
+      run: |
+        curl -sSfL -o "${RUNNER_TEMP}/wkg" https://github.com/bytecodealliance/wasm-pkg-tools/releases/download/v0.16.1/wkg-x86_64-unknown-linux-gnu
+        echo "235ecf455e11b8b146e00f24f24c95b573cfe6a432f332358463b229311cec57  ${RUNNER_TEMP}/wkg" | sha256sum -c -
+        sudo install -m 0755 "${RUNNER_TEMP}/wkg" /usr/local/bin/wkg
+    - name: Push the guests
+      env:
+        WKG_OCI_USERNAME: ${{ github.actor }}
+        WKG_OCI_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        for WASM in target/wasm32-wasip3/release/*.wasm; do
+          GUEST=$(basename "${WASM}" .wasm)
+          REPOSITORY=$(echo "${GITHUB_REPOSITORY}/sluice-wicket-wasi/examples/${GUEST}" | tr '[:upper:]' '[:lower:]')
+          wkg oci push \
+            --annotation "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --annotation "org.opencontainers.image.revision=${REVISION}" \
+            --annotation "org.opencontainers.image.description=The ${GUEST} example guest of sluice-wicket-wasi, a wasi:http 0.3 component" \
+            "${REGISTRY}/${REPOSITORY}:${REVISION}" "${WASM}"
+          # latest: the revision's manifest under a second tag (a second push would make
+          # another one, its config holding the push time)
+          TOKEN=$(curl -sSf -u "${WKG_OCI_USERNAME}:${WKG_OCI_PASSWORD}" "https://${REGISTRY}/token?service=${REGISTRY}&scope=repository:${REPOSITORY}:pull,push" | jq -r .token)
+          curl -sSf -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+            -o "${RUNNER_TEMP}/manifest.json" "https://${REGISTRY}/v2/${REPOSITORY}/manifests/${REVISION}"
+          curl -sSf -X PUT -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/vnd.oci.image.manifest.v1+json" \
+            --data-binary "@${RUNNER_TEMP}/manifest.json" "https://${REGISTRY}/v2/${REPOSITORY}/manifests/latest"
+          echo "pushed ${REGISTRY}/${REPOSITORY}:${REVISION} and :latest" | tee -a "${GITHUB_STEP_SUMMARY}"
+        done
   # a Dockerfile build (a Rust binary), not a buildpack one
   build-image:
     needs: target

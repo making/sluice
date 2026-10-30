@@ -24,7 +24,9 @@ Two Cargo workspaces:
   workspace pinned to a nightly toolchain by `rust-toolchain.toml`
   (wasm32-wasip3 ships rust-std on nightly only; rustup installs it on the
   first build). Each example's README says what it demonstrates and which
-  capabilities its route needs
+  capabilities its route needs. The CI publishes them with the image, as wasm OCI artifacts
+  (`wkg oci push`): `ghcr.io/making/sluice/sluice-wicket-wasi/examples/<example>`
+  (`latest` / `<sha>`)
 - `wit/` — vendored wasi 0.3 (from wasmtime v50) and `wasi:keyvalue@0.2.0-draft2`
   (`deps/keyvalue`, WebAssembly/wasi-keyvalue main `aa972c8`); each example declares its
   own world inline, so a new example is just a new directory under `examples/`
@@ -34,6 +36,8 @@ Two Cargo workspaces:
 ```text
 cargo build
 (cd examples && cargo build --release)   # -> examples/target/wasm32-wasip3/release/<example>.wasm
+# or the published ones (see Layout)
+wkg oci pull ghcr.io/making/sluice/sluice-wicket-wasi/examples/hello -o hello.wasm
 
 # sluice server as in the root README, then:
 target/debug/sluice-wicket-wasi --server grpc://127.0.0.1:8001 --token SECRET \

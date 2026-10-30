@@ -56,7 +56,8 @@ Multi-arch (amd64 / aarch64) JVM and native images are published to ghcr.io on e
 `ghcr.io/making/sluice/sluice-client:{jvm,native}` (immutable `jvm_<sha>` / `native_<sha>` tags too),
 the live access log's `ghcr.io/making/sluice/sluice-flume` and the experimental
 `ghcr.io/making/sluice/sluice-wicket-wasi` and `ghcr.io/making/sluice/sluice-wicket-cf-api`
-(all `latest` / `<sha>`).
+(all `latest` / `<sha>`). The wicket's example guests go with its image, as wasm OCI artifacts:
+`ghcr.io/making/sluice/sluice-wicket-wasi/examples/<example>` (`latest` / `<sha>`).
 
 ```
 docker run --rm --pull always --name sluice-server -p 8000:8000 -p 8001:8001 -p 8081:8081 \
