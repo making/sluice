@@ -84,6 +84,7 @@ an SSH tunnel (`ssh -L 9091:127.0.0.1:9091 <host>`).
 services:
   redis:
     image: redis:7-alpine
+    pull_policy: always
     network_mode: host
     command: [redis-server, --bind, 127.0.0.1, --requirepass, "${REDIS_PASSWORD:?REDIS_PASSWORD}", --appendonly, "yes"]
     volumes:
@@ -91,6 +92,7 @@ services:
     restart: unless-stopped
   flume:
     image: ghcr.io/making/sluice/sluice-flume
+    pull_policy: always
     network_mode: host
     command: [--host, 127.0.0.1]    # this host's wicket and cf-api only
     environment:
@@ -98,6 +100,7 @@ services:
     restart: unless-stopped
   wicket:
     image: ghcr.io/making/sluice/sluice-wicket-wasi
+    pull_policy: always
     network_mode: host
     command: [--config, /etc/sluice/wicket.yaml]
     environment:                    # what wicket.yaml's ${...} take
@@ -111,6 +114,7 @@ services:
     restart: unless-stopped
   cf-api:
     image: ghcr.io/making/sluice/sluice-wicket-cf-api
+    pull_policy: always
     network_mode: host
     command: [--wicket, http://127.0.0.1:9090, --flume, grpc://127.0.0.1:8002]
     environment:
