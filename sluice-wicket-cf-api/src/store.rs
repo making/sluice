@@ -323,6 +323,27 @@ impl State {
         self.domains.iter().find(|domain| domain.name == name)
     }
 
+    /// Takes the flags' domains, in their order: the first takes the default and random
+    /// routes. A domain gone from the flags stays behind them, so its routes keep its guid.
+    pub fn follow_domains(&mut self, domains: &[String]) {
+        for domain in domains {
+            if self.domain_named(domain).is_none() {
+                self.domains.push(Named {
+                    guid: guid(),
+                    name: domain.clone(),
+                    created_at: now(),
+                });
+            }
+        }
+        // a gone domain has no position: last, not first as None would sort
+        self.domains.sort_by_key(|domain| {
+            domains
+                .iter()
+                .position(|name| *name == domain.name)
+                .unwrap_or(usize::MAX)
+        });
+    }
+
     pub fn package(&self, guid: &str) -> Option<&Package> {
         self.packages.iter().find(|package| package.guid == guid)
     }
@@ -590,19 +611,7 @@ impl Store {
             Ok(json) => {
                 let mut state: State = serde_json::from_slice(&json)
                     .map_err(|e| format!("{}: {e}", file.display()))?;
-                // the domains follow the flags; a route of a domain gone keeps its guid
-                for domain in domains {
-                    if state.domain_named(domain).is_none() {
-                        state.domains.push(Named {
-                            guid: guid(),
-                            name: domain.clone(),
-                            created_at: now(),
-                        });
-                    }
-                }
-                state
-                    .domains
-                    .sort_by_key(|domain| domains.iter().position(|name| *name == domain.name));
+                state.follow_domains(domains);
                 state
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::new(org, space, domains),
@@ -819,6 +828,19 @@ mod tests {
         assert!(state.apps.is_empty());
         let kept: Vec<&str> = state.bindings.iter().map(|b| b.guid.as_str()).collect();
         assert_eq!(kept, ["b2"]);
+    }
+
+    #[test]
+    fn the_flags_first_domain_takes_the_default_routes_a_gone_one_stays_behind() {
+        let mut state = State::new("o", "s", &["localhost".into()]);
+        let localhost = state.domains[0].guid.clone();
+        state.follow_domains(&["apps.example.com".into()]);
+        let names: Vec<&str> = state.domains.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["apps.example.com", "localhost"]);
+        // back in the flags, with the guid its routes hold
+        state.follow_domains(&["localhost".into(), "apps.example.com".into()]);
+        assert_eq!(state.domains.len(), 2);
+        assert_eq!(state.domains[0].guid, localhost);
     }
 
     #[test]
