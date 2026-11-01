@@ -39,9 +39,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
 
 use log::Log;
+use reaper::Reaper;
 use wire::Stream;
 
 mod log;
+mod reaper;
 mod wire;
 
 const VSOCK_PORT: u32 = 8080;
@@ -52,6 +54,9 @@ const HELLO_PORT: u16 = 8081;
 const LAUNCH_CONFIG: &str = "/sluice/init.json";
 
 static SERVED: AtomicU64 = AtomicU64::new(0);
+
+/// Reaps every child of /init in launcher mode.
+static REAPER: Reaper = Reaper::new();
 
 /// Hello mode's random state, of its own (as a process's generator is): seeded at
 /// boot, so a clone has its snapshot's until the restore notice reseeds it.
@@ -241,18 +246,13 @@ fn start(launch: Launch, log: &Arc<Log>) -> std::io::Result<()> {
     capture(&mut child, log);
     println!("guest: started {program} (pid {})", child.id());
     // PID 1 reaps every orphan; the process's exit is logged, the VM stays up
+    let pid = child.id() as libc::pid_t;
     std::thread::spawn(move || {
-        let pid = child.id() as libc::pid_t;
-        loop {
-            let mut status = 0;
-            // SAFETY: a plain wait for any child
-            let reaped = unsafe { libc::wait(&mut status) };
+        REAPER.run(|reaped, status| {
             if reaped == pid {
-                eprintln!("guest: {program} exited (status {status})");
-            } else if reaped < 0 {
-                std::thread::sleep(Duration::from_millis(100));
+                eprintln!("guest: {program} exited ({status})");
             }
-        }
+        })
     });
     Ok(())
 }
@@ -347,11 +347,12 @@ async fn restored(
             Ok(())
         });
     }
-    let mut child = command.spawn()?;
+    // its status from the reaper's, which reaps any child: a wait of its own would race it
+    let (mut child, status) = REAPER.spawn(&mut command)?;
     capture(&mut child, log);
-    let status = tokio::task::spawn_blocking(move || child.wait())
+    let status = status
         .await
-        .map_err(std::io::Error::other)??;
+        .map_err(|_| std::io::Error::other(format!("restore hook {program}: no exit status")))?;
     if !status.success() {
         return Err(std::io::Error::other(format!(
             "restore hook {program}: {status}"

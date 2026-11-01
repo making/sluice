@@ -39,8 +39,9 @@ Two Cargo workspaces:
   `output.rs` the VMs' output, `wire.rs` the vsock framing and the restore notice,
   `listener.rs` `--listen`
 - `guest/` -- the VMs' `/init`, built for `x86_64-unknown-linux-musl` (its
-  `rust-toolchain.toml` has rustup add the target): `log.rs` the processes' output;
-  `guest/src/wire.rs` is a copy of `src/wire.rs`: keep them alike
+  `rust-toolchain.toml` has rustup add the target): `log.rs` the processes' output,
+  `reaper.rs` PID 1's reaping; `guest/src/wire.rs` is a copy of `src/wire.rs`: keep them
+  alike
 - `scripts/` -- `build-guest.sh` (the sample rootfs), `cnb-rootfs.sh` (an OCI image's),
   `try.sh` (the debug build on `--listen`)
 - `tests/vm.rs` -- the VM test (see [Tests](#tests))
@@ -446,6 +447,10 @@ Measured on a 64-core x86_64 host, through a sluice server on the same host, wit
   restored with `clock_realtime` (it advances kvmclock, not the TSC, the guest's default
   clocksource): a clone restored 6s after its snapshot was 6s behind, now within
   milliseconds.
+- **PID 1 reaps in one place**: `/init` reaps any child (orphans come to it), so its own
+  wait for the restore hook raced that reaping and now and then lost the hook's status
+  (`restore notice: ERR No child process`, a clone failed). The reaper hands the hook its
+  status instead: 44 hooked clones of the CNB Java image, none failed.
 
 Caveats:
 
