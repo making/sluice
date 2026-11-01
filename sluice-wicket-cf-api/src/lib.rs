@@ -22,7 +22,7 @@ pub mod logs;
 pub mod manifest;
 mod multipart;
 /// The OpenID Provider client, shared with the wicket's console.
-pub use sluice_oidc as oidc;
+pub use sluice_wicket_oidc as oidc;
 pub mod registry;
 pub mod services;
 pub mod staging;
@@ -160,7 +160,7 @@ pub async fn serve(
     settings: Settings,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), String> {
-    // reqwest brings no crypto provider of its own (sluice-oidc's
+    // reqwest brings no crypto provider of its own (sluice-wicket-oidc's
     // rustls-no-provider): ring, as tonic's TLS and the listener's
     let _ = rustls::crypto::ring::default_provider().install_default();
     std::fs::create_dir_all(&settings.data_dir)

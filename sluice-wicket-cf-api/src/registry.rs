@@ -183,7 +183,7 @@ pub struct Registry {
 
 impl Registry {
     pub fn new() -> Result<Registry, String> {
-        let http = sluice_oidc::http_client(None, "the registries")?
+        let http = sluice_wicket_oidc::http_client(None, "the registries")?
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(60))
             .user_agent(concat!("sluice-wicket-cf-api/", env!("CARGO_PKG_VERSION")))

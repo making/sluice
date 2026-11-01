@@ -18,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use sluice_oidc::mock::MockProvider;
+use sluice_wicket_oidc::mock::MockProvider;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 /// Hang guard of every wait; the first one covers the components' load.

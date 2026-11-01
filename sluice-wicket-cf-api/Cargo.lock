@@ -1561,22 +1561,6 @@ name = "sluice-build-info"
 version = "0.0.1-SNAPSHOT"
 
 [[package]]
-name = "sluice-oidc"
-version = "0.0.1-SNAPSHOT"
-dependencies = [
- "base64 0.22.1",
- "form_urlencoded",
- "getrandom 0.4.3",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "webpki-roots",
-]
-
-[[package]]
 name = "sluice-wicket-cf-api"
 version = "0.0.1-SNAPSHOT"
 dependencies = [
@@ -1597,7 +1581,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sluice-build-info",
- "sluice-oidc",
+ "sluice-wicket-oidc",
  "tokio",
  "tokio-rustls",
  "tonic",
@@ -1605,6 +1589,22 @@ dependencies = [
  "tonic-prost-build",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "sluice-wicket-oidc"
+version = "0.0.1-SNAPSHOT"
+dependencies = [
+ "base64 0.22.1",
+ "form_urlencoded",
+ "getrandom 0.4.3",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "webpki-roots",
 ]
 
 [[package]]

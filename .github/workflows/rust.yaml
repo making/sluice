@@ -14,7 +14,7 @@ on:
     - 'sluice-wicket-cf-api/**'
     - 'sluice-wicket-firecracker/**'
     - 'sluice-build-info/**'
-    - 'sluice-oidc/**'
+    - 'sluice-wicket-oidc/**'
     - 'sluice-wicket-tunnel/**'
     - 'sluice-proto/src/main/proto/**'
     - '.github/workflows/rust.yaml'
@@ -57,7 +57,7 @@ jobs:
           - 'sluice-build-info/**'
           - '.github/workflows/rust.yaml'
           oidc:
-          - 'sluice-oidc/**'
+          - 'sluice-wicket-oidc/**'
           - '.github/workflows/rust.yaml'
           tunnel:
           - 'sluice-wicket-tunnel/**'
@@ -72,7 +72,7 @@ jobs:
           wicket:
           - 'sluice-wicket-wasi/**'
           - 'sluice-build-info/**'
-          - 'sluice-oidc/**'
+          - 'sluice-wicket-oidc/**'
           - 'sluice-wicket-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
@@ -83,7 +83,7 @@ jobs:
           - 'sluice-wicket-wasi/**'
           - 'sluice-flume/**'
           - 'sluice-build-info/**'
-          - 'sluice-oidc/**'
+          - 'sluice-wicket-oidc/**'
           - 'sluice-wicket-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
@@ -115,14 +115,14 @@ jobs:
       run: cargo clippy --all-targets --locked -- -D warnings
     - name: Test
       run: cargo test --locked
-  sluice-oidc:
+  sluice-wicket-oidc:
     needs: changes
     if: needs.changes.outputs.oidc == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
       run:
-        working-directory: sluice-oidc
+        working-directory: sluice-wicket-oidc
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -134,8 +134,8 @@ jobs:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
-          sluice-oidc/target
-        key: cargo-oidc-${{ runner.os }}-${{ hashFiles('sluice-oidc/Cargo.lock', 'sluice-oidc/rust-toolchain.toml') }}
+          sluice-wicket-oidc/target
+        key: cargo-wicket-oidc-${{ runner.os }}-${{ hashFiles('sluice-wicket-oidc/Cargo.lock', 'sluice-wicket-oidc/rust-toolchain.toml') }}
     - name: Format
       run: cargo fmt --check
     - name: Clippy

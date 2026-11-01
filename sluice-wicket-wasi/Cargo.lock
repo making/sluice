@@ -2282,7 +2282,7 @@ name = "sluice-build-info"
 version = "0.0.1-SNAPSHOT"
 
 [[package]]
-name = "sluice-oidc"
+name = "sluice-wicket-oidc"
 version = "0.0.1-SNAPSHOT"
 dependencies = [
  "base64 0.22.1",
@@ -2342,7 +2342,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sluice-build-info",
- "sluice-oidc",
+ "sluice-wicket-oidc",
  "sluice-wicket-tunnel",
  "tokio",
  "tokio-stream",

@@ -202,8 +202,8 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
                 token: console.token,
                 sign_in: match console.oidc {
                     Some(oidc) => Some(console::SignIn {
-                        provider: sluice_oidc::Provider::new(oidc)?,
-                        signer: sluice_oidc::Signer::random(),
+                        provider: sluice_wicket_oidc::Provider::new(oidc)?,
+                        signer: sluice_wicket_oidc::Signer::random(),
                     }),
                     None => None,
                 },

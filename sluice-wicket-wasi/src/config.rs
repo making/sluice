@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use sluice_oidc::OidcSettings;
+use sluice_wicket_oidc::OidcSettings;
 // the tunnel's: --max-connections, --tunnel-stall-timeout, --drain-grace
 use sluice_wicket_tunnel::{DEFAULT_DRAIN_GRACE, DEFAULT_MAX_CONNECTIONS, DEFAULT_STALL_TIMEOUT};
 
@@ -380,8 +380,8 @@ fn merge(flags: Flags) -> Result<Settings, String> {
                 .filter(|id| !id.is_empty())
                 .ok_or_else(|| format!("{} is required with oidc-issuer", key("oidc-client-id")))?;
             let claims = match flags.oidc_claim {
-                Some(rules) => sluice_oidc::parse_rules([rules.as_str()], "--oidc-claim")?,
-                None => sluice_oidc::parse_rules(
+                Some(rules) => sluice_wicket_oidc::parse_rules([rules.as_str()], "--oidc-claim")?,
+                None => sluice_wicket_oidc::parse_rules(
                     settings
                         .oidc_claim
                         .iter()
@@ -1456,11 +1456,11 @@ routes:
         assert_eq!(
             oidc.claims,
             [
-                sluice_oidc::ClaimRule {
+                sluice_wicket_oidc::ClaimRule {
                     claim: "email".into(),
                     patterns: vec!["*@example.com".into(), "root@example.org".into()],
                 },
-                sluice_oidc::ClaimRule {
+                sluice_wicket_oidc::ClaimRule {
                     claim: "groups".into(),
                     patterns: vec!["devs".into()],
                 },

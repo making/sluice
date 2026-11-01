@@ -53,7 +53,7 @@ use http::{HeaderValue, Method, StatusCode, header};
 use http_body_util::{BodyExt as _, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use serde::{Deserialize, Serialize};
-use sluice_oidc::{Provider, Signer};
+use sluice_wicket_oidc::{Provider, Signer};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -352,7 +352,7 @@ impl Console {
                     .and_then(|rest| rest.strip_prefix('='))
             })?;
         let session: Session = serde_json::from_slice(&signer.verify(sealed)?).ok()?;
-        (session.exp > sluice_oidc::epoch_secs()).then_some(session.user)
+        (session.exp > sluice_wicket_oidc::epoch_secs()).then_some(session.user)
     }
 
     /// `/login`, `/oauth2/callback` and `/logout`: the sign-in through the
@@ -418,7 +418,7 @@ impl Console {
                     Ok(identity) => {
                         let session = Session {
                             user: identity.user_name,
-                            exp: sluice_oidc::epoch_secs() + SESSION_MAX_AGE.as_secs(),
+                            exp: sluice_wicket_oidc::epoch_secs() + SESSION_MAX_AGE.as_secs(),
                         };
                         let sealed = sign_in
                             .signer

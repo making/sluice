@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use registry::Registry;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sluice_oidc::mock::MockProvider;
+use sluice_wicket_oidc::mock::MockProvider;
 
 /// Hang guard of every wait; the first covers a cold build of the wicket.
 const HANG: Duration = Duration::from_secs(120);
