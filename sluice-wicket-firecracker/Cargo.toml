@@ -1,0 +1,28 @@
+[package]
+name = "sluice-wicket-firecracker"
+version = "0.0.1-SNAPSHOT"
+edition = "2024"
+publish = false
+
+# Its own workspace, as sluice-wicket-wasi; the guest (guest/) is another one (musl target)
+[workspace]
+exclude = ["guest"]
+
+[dependencies]
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs", "process", "signal"] }
+tokio-stream = "0.1"
+# the Firecracker API: HTTP/1.1 over its Unix socket
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+# PR_SET_PDEATHSIG: a VM never outlives the wicket
+libc = "0.2"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
