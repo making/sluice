@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
@@ -26,6 +26,16 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a restored guest may take to accept a stream again (its vsock transport
 /// is reset on restore).
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The longest answer to a restore notice the wicket reads (`OK`, or the guest's
+/// error).
+const MAX_NOTICE_ANSWER: usize = 1024;
+
+/// How long a template may take to answer a priming request, its answer read to the end.
+const PRIME_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The bytes of a priming answer the wicket keeps: its status line, to check.
+const STATUS_LINE: usize = 80;
 
 /// How long a template's output may take to reach the wicket before its snapshot.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(2);
@@ -316,36 +326,22 @@ impl Cloner {
             return Err(std::io::Error::last_os_error().into());
         }
         let mut stream = vm.dial_ready(wire::CONTROL_PORT, RESTORE_TIMEOUT).await?;
-        // borrowed halves: an owned write half shuts the socket down when dropped,
-        // which Firecracker takes as the end of the whole stream (the answer lost)
-        let (reader, mut writer) = stream.split();
-        let answered = async {
-            // the time read just before the write: the guest sets its clock to it as
-            // it arrives
-            let notice = wire::Notice {
-                seed,
-                time: match crate::vm::RESTORE_ADVANCES_CLOCK {
-                    true => None,
-                    false => Some(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_err(std::io::Error::other)?,
-                    ),
-                },
-            };
-            writer.write_all(notice.line().as_bytes()).await?;
-            let mut answer = String::new();
-            tokio::io::BufReader::new(reader)
-                .read_line(&mut answer)
-                .await?;
-            Ok::<_, std::io::Error>(answer)
+        // the time read just before the write: the guest sets its clock to it as it
+        // arrives
+        let notice = wire::Notice {
+            seed,
+            time: match crate::vm::RESTORE_ADVANCES_CLOCK {
+                true => None,
+                false => Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(std::io::Error::other)?,
+                ),
+            },
         };
-        let answer = tokio::time::timeout(RESTORE_TIMEOUT, answered)
-            .await
-            .map_err(|_| format!("restore notice: no answer within {RESTORE_TIMEOUT:?}"))??;
-        if answer.trim_end() != "OK" {
-            return Err(format!("restore notice: {}", answer.trim_end()).into());
-        }
+        // the stream kept whole: Firecracker takes a write half shut down as the end
+        // of the whole stream (the answer lost)
+        notify(&mut stream, &notice).await?;
         // the guest's listener outlives the restore; its lines wait for the stream
         let output = match self.output {
             true => match vm.dial(wire::LOG_PORT).await {
@@ -428,7 +424,9 @@ impl Route {
                     .into());
                 }
                 for _ in 0..spec.prime {
-                    prime(&vm, spec.port).await?;
+                    prime(vm.dial(spec.port), PRIME_TIMEOUT)
+                        .await
+                        .map_err(|e| format!("route {label}: {e}"))?;
                 }
                 // the template's lines are the template's: before the snapshot, they
                 // are the clones' to discard
@@ -583,30 +581,64 @@ async fn ready(
     Ok(Some(output))
 }
 
-/// One `GET /` to the guest, its answer read to the guest's CLOSE.
-async fn prime(vm: &Vm, port: u32) -> Result<(), BoxError> {
-    let stream = vm.dial(port).await?;
-    let (reader, mut writer) = stream.into_split();
-    wire::write_data(
-        &mut writer,
-        b"GET / HTTP/1.1\r\nHost: prime\r\nConnection: close\r\n\r\n",
-    )
-    .await?;
-    wire::write_close(&mut writer).await?;
-    let mut reader = wire::Reader::new(reader);
-    let mut answer = Vec::new();
-    let mut buffer = vec![0u8; 16 * 1024];
-    loop {
-        match reader.read(&mut buffer).await? {
-            wire::Read::Data(n) => answer.extend_from_slice(&buffer[..n]),
-            wire::Read::Close => break,
-            wire::Read::Eof => return Err("priming request: no CLOSE from the guest".into()),
-        }
+/// Sends `notice` on a clone's control stream and reads its answer, a line of at most
+/// [`MAX_NOTICE_ANSWER`] bytes, within [`RESTORE_TIMEOUT`]: `OK`.
+async fn notify<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    notice: &wire::Notice,
+) -> Result<(), BoxError> {
+    let answered = async {
+        stream.write_all(notice.line().as_bytes()).await?;
+        crate::vm::read_short_line(stream, MAX_NOTICE_ANSWER).await
+    };
+    let answer = tokio::time::timeout(RESTORE_TIMEOUT, answered)
+        .await
+        .map_err(|_| format!("restore notice: no answer within {RESTORE_TIMEOUT:?}"))?
+        .map_err(|e| format!("restore notice: {e}"))?;
+    let answer = answer.trim_ascii_end();
+    if answer != b"OK" {
+        return Err(format!("restore notice: {}", String::from_utf8_lossy(answer)).into());
     }
-    if !answer.starts_with(b"HTTP/1.1 2") {
+    Ok(())
+}
+
+/// One `GET /` to a guest on the stream `dial` opens, its answer read to the guest's
+/// CLOSE within `timeout`: a 2xx. Of the answer, its first [`STATUS_LINE`] bytes are
+/// kept.
+async fn prime<S: AsyncRead + AsyncWrite + Unpin>(
+    dial: impl Future<Output = Result<S, BoxError>>,
+    timeout: Duration,
+) -> Result<(), BoxError> {
+    let answered = async {
+        let mut stream = dial.await?;
+        wire::write_data(
+            &mut stream,
+            b"GET / HTTP/1.1\r\nHost: prime\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+        wire::write_close(&mut stream).await?;
+        let mut reader = wire::Reader::new(stream);
+        let mut head = Vec::with_capacity(STATUS_LINE);
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            match reader.read(&mut buffer).await? {
+                wire::Read::Data(n) => {
+                    let kept = n.min(STATUS_LINE - head.len());
+                    head.extend_from_slice(&buffer[..kept]);
+                }
+                wire::Read::Close => return Ok::<_, BoxError>(head),
+                wire::Read::Eof => return Err("priming request: no CLOSE from the guest".into()),
+            }
+        }
+    };
+    let head = tokio::time::timeout(timeout, answered)
+        .await
+        .map_err(|_| format!("priming request: no answer within {timeout:?}"))??;
+    if !head.starts_with(b"HTTP/1.1 2") {
+        let line = head.split(|&byte| byte == b'\r' || byte == b'\n').next();
         return Err(format!(
             "priming request: {}",
-            String::from_utf8_lossy(&answer[..answer.len().min(80)])
+            String::from_utf8_lossy(line.unwrap_or_default())
         )
         .into());
     }
@@ -646,6 +678,85 @@ async fn keep_warm(
                 eprintln!("warm clone: {e}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::DuplexStream;
+
+    use super::*;
+
+    /// The wicket's end of a stream whose guest double runs `answer` on the other end.
+    fn guest<F>(answer: impl FnOnce(DuplexStream) -> F) -> DuplexStream
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let (wicket, guest) = tokio::io::duplex(4096);
+        tokio::spawn(answer(guest));
+        wicket
+    }
+
+    /// What the wicket takes from a guest is bounded: a restore notice's answer is a
+    /// short line; a priming answer is checked by its status line, the rest dropped, and
+    /// read to its end within a timeout.
+    #[tokio::test]
+    async fn a_guests_answers_are_read_within_bounds() {
+        let notice = wire::Notice {
+            seed: [0; 32],
+            time: None,
+        };
+        for (answer, expected) in [
+            (b"OK\n".to_vec(), Ok(())),
+            (
+                b"ERR restore hook /hook: exit status: 1\n".to_vec(),
+                Err("restore notice: ERR restore hook /hook: exit status: 1"),
+            ),
+            // read up to the bound alone: the rest stays with the double
+            (
+                vec![b'x'; 1 << 20],
+                Err("restore notice: a line longer than 1024 bytes"),
+            ),
+        ] {
+            let mut wicket = guest(async move |mut guest| {
+                let _ = guest.write_all(&answer).await;
+            });
+            let notified = notify(&mut wicket, &notice).await;
+            assert_eq!(
+                notified.map_err(|e| e.to_string()),
+                expected.map_err(String::from)
+            );
+        }
+
+        let answer = |status: &'static [u8]| {
+            async move |mut guest: DuplexStream| {
+                let _ = wire::write_data(&mut guest, status).await;
+                let _ = wire::write_data(&mut guest, &[b'.'; 1 << 20]).await;
+                let _ = wire::write_close(&mut guest).await;
+            }
+        };
+        let timeout = Duration::from_millis(200);
+        for (wicket, expected) in [
+            (guest(answer(b"HTTP/1.1 200 OK\r\n\r\n")), Ok(())),
+            (
+                guest(answer(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")),
+                Err("priming request: HTTP/1.1 503 Service Unavailable"),
+            ),
+            // an answer without end
+            (
+                guest(async |mut guest| {
+                    let _ = wire::write_data(&mut guest, b"HTTP/1.1 200 OK\r\n\r\n").await;
+                    while wire::write_data(&mut guest, b".").await.is_ok() {}
+                }),
+                Err("priming request: no answer within 200ms"),
+            ),
+        ] {
+            let primed = prime(async { Ok(wicket) }, timeout).await;
+            assert_eq!(
+                primed.map_err(|e| e.to_string()),
+                expected.map_err(String::from)
+            );
         }
     }
 }

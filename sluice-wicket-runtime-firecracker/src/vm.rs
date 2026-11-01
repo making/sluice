@@ -34,7 +34,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
@@ -520,18 +520,10 @@ impl Vm {
         stream
             .write_all(format!("CONNECT {port}\n").as_bytes())
             .await?;
-        // byte by byte: what follows the line is the guest's
-        let mut line = Vec::with_capacity(16);
-        loop {
-            let byte = stream.read_u8().await?;
-            if byte == b'\n' {
-                break;
-            }
-            line.push(byte);
-            if line.len() > 64 {
-                return Err("vsock handshake: overlong answer".into());
-            }
-        }
+        // what follows the line is the guest's
+        let line = read_short_line(&mut stream, 64)
+            .await
+            .map_err(|e| format!("vsock handshake: {e}"))?;
         if !line.starts_with(b"OK ") {
             return Err(
                 format!("vsock handshake: {}", String::from_utf8_lossy(&line).trim()).into(),
@@ -600,6 +592,28 @@ impl Drop for Vm {
             // the keeper reaps it and removes its directory
             Process::Jailed { keeper, vm, .. } => keeper.kill(*vm),
         }
+    }
+}
+
+/// Reads a line of at most `max` bytes, its newline dropped, byte by byte: what follows
+/// it stays unread. A longer line is an error, and so is the end of the stream before it.
+pub async fn read_short_line<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut line = Vec::with_capacity(16);
+    loop {
+        let byte = reader.read_u8().await?;
+        if byte == b'\n' {
+            return Ok(line);
+        }
+        if line.len() == max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("a line longer than {max} bytes"),
+            ));
+        }
+        line.push(byte);
     }
 }
 

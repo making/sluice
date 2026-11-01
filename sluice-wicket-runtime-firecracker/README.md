@@ -19,7 +19,8 @@ route's VMs are:
 - `mode=shared` (default): one VM booted at start serves every connection
 - `mode=per-connection`: each connection gets a VM of its own, cloned from a snapshot of
   a template VM taken once its process accepted (`prime=N` sends N `GET /` first, so the
-  clones start warmed up); the VM is killed when the connection ends. `warm=N` keeps N
+  clones start warmed up; each must be answered with a 2xx within 10s, or the route's
+  start fails); the VM is killed when the connection ends. `warm=N` keeps N
   clones restored ahead
 
 The rootfs is either the built-in sample (`scripts/build-guest.sh`: `/init` serves HTTP
