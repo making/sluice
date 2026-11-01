@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use sluice_wicket_tunnel::workers::Workers;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -51,6 +52,8 @@ pub struct Egress {
     sink: Arc<Sink>,
     /// A VM's connections open at once at most.
     max: usize,
+    /// Where its connections are relayed.
+    workers: Arc<Workers>,
 }
 
 /// A VM's listener being served ([`Egress::listen`]); dropped with the VM, it ends.
@@ -76,12 +79,18 @@ struct Record {
 
 impl Egress {
     /// The egress of a route's `rules`, its records naming the route's `hosts`, to `sink`.
-    pub fn new(rules: Vec<Rule>, hosts: Arc<Hosts>, sink: Arc<Sink>) -> Arc<Egress> {
+    pub fn new(
+        rules: Vec<Rule>,
+        hosts: Arc<Hosts>,
+        sink: Arc<Sink>,
+        workers: Arc<Workers>,
+    ) -> Arc<Egress> {
         Arc::new(Egress {
             rules,
             hosts,
             sink,
             max: MAX_CONNECTIONS,
+            workers,
         })
     }
 
@@ -108,7 +117,16 @@ impl Egress {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let permit = open.clone().try_acquire_owned().ok();
-                    tokio::spawn(self.clone().serve(stream, vm.clone(), permit));
+                    let Ok(stream) = stream.into_std() else {
+                        continue;
+                    };
+                    let (egress, vm) = (self.clone(), vm.clone());
+                    self.workers.place().spawn(async move {
+                        // the worker's from here on
+                        if let Ok(stream) = UnixStream::from_std(stream) {
+                            egress.serve(stream, vm, permit).await;
+                        }
+                    });
                 }
                 // out of files, for one: a moment for some to close
                 Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
@@ -356,6 +374,7 @@ mod tests {
             hosts: Hosts::new(&["a.local".into()]),
             sink,
             max: 2,
+            workers: Arc::new(Workers::start(1, "relay").unwrap()),
         });
         let dir = std::env::temp_dir().join(format!("sfc-egress-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

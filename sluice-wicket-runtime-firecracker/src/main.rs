@@ -1,4 +1,5 @@
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use sluice_wicket_runtime_firecracker::config::{self, Command};
@@ -6,6 +7,7 @@ use sluice_wicket_runtime_firecracker::keeper::{self, Client};
 use sluice_wicket_runtime_firecracker::seccomp::Filter;
 use sluice_wicket_runtime_firecracker::state::StateDir;
 use sluice_wicket_runtime_firecracker::vm::{self, Launcher};
+use sluice_wicket_tunnel::workers::Workers;
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -88,15 +90,26 @@ fn main() -> ExitCode {
         eprintln!("the seccomp filter: {e}");
         return ExitCode::FAILURE;
     }
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(runtime) => runtime,
+    // the main thread's runtime boots, restores and reloads; the workers relay
+    let (runtime, workers) = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .and_then(|runtime| Ok((runtime, Workers::start(settings.workers, "relay")?)))
+    {
+        Ok((runtime, workers)) => (runtime, Arc::new(workers)),
         Err(e) => {
             eprintln!("cannot start the runtime: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let ran = runtime.block_on(sluice_wicket_runtime_firecracker::run(settings, launcher));
-    // the tasks left are dropped, and with them the VMs they hold (killed)
+    let ran = runtime.block_on(sluice_wicket_runtime_firecracker::run(
+        settings,
+        launcher,
+        workers.clone(),
+    ));
+    // the tasks left are dropped, and with them the VMs they hold (killed): the
+    // connections' first, the main runtime's reaping theirs
+    workers.shutdown();
     runtime.shutdown_timeout(Duration::from_secs(5));
     if let Some(state) = state {
         state.close();

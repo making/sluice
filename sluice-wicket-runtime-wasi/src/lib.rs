@@ -247,6 +247,7 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
             max_connections,
             stall_timeout,
             build: build(),
+            workers: None,
         },
         routes,
     );

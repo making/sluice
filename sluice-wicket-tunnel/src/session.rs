@@ -16,6 +16,7 @@ use crate::proto::frame::Body;
 use crate::proto::{Advertise, Frame, PeerBuild, Upstream};
 use crate::routes::{Routes, StreamAcks, Table};
 use crate::tunnel::{self, Connections, Outbound};
+use crate::workers::Workers;
 use crate::{BoxError, UNKNOWN_BUILD, describe_peer, proto, tls};
 
 /// Reconnect backoff: the ceiling doubles from 1s to 30s and each wait is
@@ -118,6 +119,9 @@ pub struct Settings {
     pub stall_timeout: Duration,
     /// This wicket's build, sent in every Advertise.
     pub build: PeerBuild,
+    /// The workers a node session is placed on ([`Workers::place`]), its connections
+    /// with it; None = the runtime of the moment.
+    pub workers: Option<Arc<Workers>>,
 }
 
 /// State shared by every node session.
@@ -147,6 +151,8 @@ pub struct Shared<T> {
     pub up: AtomicUsize,
     /// This wicket's build, sent in every Advertise.
     pub build: PeerBuild,
+    /// See [`Settings::workers`].
+    pub workers: Option<Arc<Workers>>,
 }
 
 impl<T> Shared<T> {
@@ -160,6 +166,7 @@ impl<T> Shared<T> {
             max_connections,
             stall_timeout,
             build,
+            workers,
         } = settings;
         Arc::new(Shared {
             token,
@@ -174,6 +181,7 @@ impl<T> Shared<T> {
             tasks: TaskTracker::new(),
             up: AtomicUsize::new(0),
             build,
+            workers,
         })
     }
 }
@@ -281,7 +289,10 @@ pub fn spawn_session<T: Table>(
         label,
         events,
     };
-    shared.tasks.spawn(task.run());
+    match &shared.workers {
+        Some(workers) => shared.tasks.spawn_on(task.run(), workers.place()),
+        None => shared.tasks.spawn(task.run()),
+    };
     session
 }
 
@@ -981,6 +992,7 @@ pub mod testing {
                 max_connections: 4,
                 stall_timeout,
                 build: PeerBuild::default(),
+                workers: None,
             },
             routes.clone(),
         );

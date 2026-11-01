@@ -39,6 +39,7 @@ pub mod tls;
 #[cfg(test)]
 mod transport_window_test;
 pub mod tunnel;
+pub mod workers;
 
 use std::sync::Arc;
 use std::time::Duration;

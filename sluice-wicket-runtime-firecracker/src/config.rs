@@ -58,6 +58,8 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
                                   templates (default 64)
   --max-memory <MiB>              their guest memory (mem) at most (default none: --max-vms
                                   x the largest mem bounds it)
+  --workers <n>                   threads relaying the connections, a node's tunnel stream
+                                  and its connections on one (default 4, at most the CPUs)
   --tunnel-stall-timeout <secs>   give a stream up once its frames wait that long untaken
                                   (default 60, 0 = off)
   --drain-grace <secs>            the SIGTERM drain's bound (default 20, 0 = no drain)
@@ -84,6 +86,11 @@ SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN.";
 /// Default of `--max-vms`.
 pub const DEFAULT_MAX_VMS: usize = 64;
 
+/// Default of `--workers`, at most the CPUs: a worker per node stream of a small
+/// cluster, and a few for `--listen`'s and the egress's connections (more cost more
+/// wakeups than they relay in parallel, see the README's Findings).
+const DEFAULT_WORKERS: usize = 4;
+
 /// Default of `--watch-interval`.
 const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -108,6 +115,8 @@ pub struct Settings {
     pub max_vms: usize,
     /// MiB; None = no memory budget.
     pub max_memory: Option<u64>,
+    /// The relay workers (`sluice_wicket_tunnel::workers`).
+    pub workers: usize,
     /// How often the routes' files are polled; zero = SIGHUP only.
     pub watch_interval: Duration,
     /// Where the VMs' files go; None = a directory of the process's own.
@@ -147,6 +156,7 @@ const VALUED: &[&str] = &[
     "max-connections",
     "max-vms",
     "max-memory",
+    "workers",
     "tunnel-stall-timeout",
     "drain-grace",
     "watch-interval",
@@ -252,6 +262,14 @@ pub fn parse(
     let max_vms = positive("max-vms", file.and_then(|file| file.max_vms))?
         .map_or(DEFAULT_MAX_VMS, |max| max as usize);
     let max_memory = positive("max-memory", file.and_then(|file| file.max_memory))?;
+    let workers = positive("workers", file.and_then(|file| file.workers))?.map_or_else(
+        || {
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(DEFAULT_WORKERS)
+        },
+        |workers| workers as usize,
+    );
     let server = flag("server").or_else(|| file.and_then(|file| file.server.clone()));
     let listen = flag("listen").or_else(|| file.and_then(|file| file.listen.clone()));
     if server.is_none() && listen.is_none() {
@@ -343,6 +361,7 @@ pub fn parse(
         )?,
         max_vms,
         max_memory,
+        workers,
         watch_interval: seconds(
             "watch-interval",
             file.and_then(|file| file.watch_interval.as_ref()),
@@ -487,6 +506,7 @@ struct File {
     max_connections: Option<u64>,
     max_vms: Option<u64>,
     max_memory: Option<u64>,
+    workers: Option<u64>,
     tunnel_stall_timeout: Option<Scalar>,
     drain_grace: Option<Scalar>,
     watch_interval: Option<Scalar>,
@@ -634,7 +654,7 @@ mod tests {
         let config = dir.join("wicket.yaml");
         std::fs::write(
             &config,
-            "server: grpc://file:8001\ntoken: from-file\nkernel: vmlinux\nmax-vms: 8\n\
+            "server: grpc://file:8001\ntoken: from-file\nkernel: vmlinux\nmax-vms: 8\nworkers: 2\n\
              drain-grace: 5s\nflume: grpc://file:8002\nflume-token: from-file\n\
              flume-ca-cert: flume-ca.pem\njail-ids: 900000-900063\njail-user: from-file\n\
              routes:\n  - {host: a.local, rootfs: app.ext4, mode: per-connection, warm: 2, cpu: 50,\n     \
@@ -678,6 +698,7 @@ mod tests {
             })
         );
         assert_eq!(settings.max_vms, 8);
+        assert_eq!(settings.workers, 2);
         assert_eq!(settings.drain_grace, Duration::from_secs(5));
         assert_eq!(settings.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert_eq!(settings.stall_timeout, DEFAULT_STALL_TIMEOUT);
@@ -701,6 +722,7 @@ mod tests {
                 "--token",
                 "flag",
                 "--max-vms=4",
+                "--workers=3",
                 "--flume=grpcs://flag:8002",
                 "--flume-ca-cert",
                 "ca.pem",
@@ -715,6 +737,7 @@ mod tests {
         .unwrap();
         assert_eq!(settings.token, "flag");
         assert_eq!(settings.max_vms, 4);
+        assert_eq!(settings.workers, 3);
         assert_eq!(
             settings.jail,
             Some(JailSettings {

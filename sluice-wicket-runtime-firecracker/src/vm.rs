@@ -31,8 +31,8 @@ use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -42,7 +42,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use crate::BoxError;
 use crate::capacity::Slot;
@@ -106,6 +106,54 @@ fn set_soft_open_files(soft: u64) -> std::io::Result<u64> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(limit.rlim_max)
+}
+
+/// The threads spawning the launchers, see [`launching`].
+const LAUNCHING_THREADS: usize = 4;
+
+/// A spawn on a launching thread.
+type Launching = Box<dyn FnOnce() + Send>;
+
+/// Runs `spawn` (a launcher's spawn) on one of the wicket's launching threads, in the
+/// caller's runtime: a `posix_spawn` holds its thread until the launcher's exec (1ms), a
+/// worker's relays with it. A child's parent death signal fires as the thread that
+/// spawned it ends, not its process: the threads live as long as the wicket (a runtime's
+/// blocking threads end once idle, and their VMs with them).
+async fn launching<R: Send + 'static>(
+    spawn: impl FnOnce() -> R + Send + 'static,
+) -> Result<R, BoxError> {
+    static THREADS: OnceLock<Mutex<std::sync::mpsc::Sender<Launching>>> = OnceLock::new();
+    let threads = THREADS.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<Launching>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        for n in 0..LAUNCHING_THREADS {
+            let receiver = receiver.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("launching-{n}"))
+                .spawn(move || {
+                    loop {
+                        let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        match next {
+                            Ok(spawn) => spawn(),
+                            Err(_) => return,
+                        }
+                    }
+                });
+        }
+        Mutex::new(sender)
+    });
+    let runtime = tokio::runtime::Handle::current();
+    let (done, spawned) = oneshot::channel();
+    let job: Launching = Box::new(move || {
+        let _entered = runtime.enter();
+        let _ = done.send(spawn());
+    });
+    threads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .send(job)
+        .map_err(|_| "no launching thread")?;
+    Ok(spawned.await.map_err(|_| "no launching thread")?)
 }
 
 /// The launcher mode (`<wicket> --launch-vm <wicket pid> <open files> <file size>
@@ -374,27 +422,33 @@ impl Vm {
             .into());
         }
         let log = dir.join("firecracker.log");
-        let file = std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
-        // the wicket itself, as the launcher (see `launch`): a posix_spawn, no fork
-        let child = Command::new("/proc/self/exe")
-            .arg(LAUNCH)
-            .arg(std::process::id().to_string())
-            .arg(VM_OPEN_FILES.load(Ordering::Relaxed).to_string())
-            .arg(file_size.to_string())
-            .arg(firecracker)
-            .arg("--api-sock")
-            .arg(&api)
-            .current_dir(&dir)
-            // the wicket's environment (its token among it) is no VM's business;
-            // PATH finds a bare --firecracker
-            .env_clear()
-            .envs(std::env::var_os("PATH").map(|path| ("PATH", path)))
-            .stdin(Stdio::null())
-            .stdout(file.try_clone()?)
-            .stderr(file)
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("{LAUNCH} {}: {e}", firecracker.display()))?;
+        let vm_log = log.clone();
+        let (firecracker, api_path, dir_path) = (firecracker.to_owned(), api.clone(), dir.clone());
+        let child = launching(move || -> Result<Child, BoxError> {
+            let file =
+                std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
+            // the wicket itself, as the launcher (see `launch`): a posix_spawn, no fork
+            Ok(Command::new("/proc/self/exe")
+                .arg(LAUNCH)
+                .arg(std::process::id().to_string())
+                .arg(VM_OPEN_FILES.load(Ordering::Relaxed).to_string())
+                .arg(file_size.to_string())
+                .arg(&firecracker)
+                .arg("--api-sock")
+                .arg(&api_path)
+                .current_dir(&dir_path)
+                // the wicket's environment (its token among it) is no VM's business;
+                // PATH finds a bare --firecracker
+                .env_clear()
+                .envs(std::env::var_os("PATH").map(|path| ("PATH", path)))
+                .stdin(Stdio::null())
+                .stdout(file.try_clone()?)
+                .stderr(file)
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|e| format!("{LAUNCH} {}: {e}", firecracker.display()))?)
+        })
+        .await??;
         let vsock = dir.join("v.sock");
         let mut vm = Vm {
             process: Process::Child { child, dir },
@@ -402,7 +456,7 @@ impl Vm {
             api,
             vsock_inside: vsock.clone(),
             vsock,
-            log,
+            log: vm_log,
             egress: None,
         };
         vm.ready().await?;

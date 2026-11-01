@@ -6,10 +6,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use sluice_wicket_tunnel::workers::Workers;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -471,6 +472,7 @@ impl Route {
         n: u64,
         capacity: Arc<Capacity>,
         sink: Arc<Sink>,
+        workers: Arc<Workers>,
     ) -> Result<Route, BoxError> {
         let hosts = Hosts::new(hosts);
         let label = hosts.current().label.clone();
@@ -495,7 +497,7 @@ impl Route {
             Mode::PerConnection => ("template", Role::Template),
         };
         let egress = (!spec.vm.egress.is_empty())
-            .then(|| Egress::new(spec.vm.egress.clone(), hosts.clone(), sink.clone()));
+            .then(|| Egress::new(spec.vm.egress.clone(), hosts.clone(), sink.clone(), workers));
         let named = egress.as_ref().map(|egress| (egress, name.to_string()));
         let vm = Vm::boot(&spec.vm, &place, role, slot, named).await?;
         let mut output = ready(&vm, spec.port, &sink, &hosts, name).await?;
@@ -653,39 +655,61 @@ async fn ready(
     hosts: &Arc<Hosts>,
     name: &str,
 ) -> Result<Option<Output>, BoxError> {
-    let follow = |stream| output::follow(stream, sink.clone(), hosts.clone(), name.to_string());
+    let output = followed(
+        || vm.dial(wire::LOG_PORT),
+        vm.dial_ready(port, BOOT_TIMEOUT),
+        |stream| output::follow(stream, sink.clone(), hosts.clone(), name.to_string()),
+    )
+    .await?;
+    if output.is_none() {
+        eprintln!(
+            "route {}: the guest sends no output (vsock port {}): its /init predates it, \
+             build the rootfs again (scripts/build-guest.sh, scripts/cnb-rootfs.sh)",
+            hosts.current().label,
+            wire::LOG_PORT
+        );
+    }
+    Ok(output)
+}
+
+/// [`ready`]'s course: the log stream dialed (`dial_log`, again each millisecond while
+/// refused) and followed (`follow`) while the guest comes to listen (`listening`). None
+/// when the guest listens without a log stream.
+async fn followed<D>(
+    dial_log: impl Fn() -> D,
+    listening: impl Future<Output = Result<UnixStream, BoxError>>,
+    follow: impl FnOnce(UnixStream) -> Output,
+) -> Result<Option<Output>, BoxError>
+where
+    D: Future<Output = Result<UnixStream, BoxError>>,
+{
+    // set once the guest listens: its log stream is open by then, if it has one
+    let listened = AtomicBool::new(false);
     let log = async {
         loop {
-            match vm.dial(wire::LOG_PORT).await {
-                Ok(stream) => return stream,
+            let late = listened.load(Ordering::Relaxed);
+            match dial_log().await {
+                Ok(stream) => return Some(stream),
+                Err(_) if late => return None,
+                Err(_) if listened.load(Ordering::Relaxed) => {}
                 Err(_) => tokio::time::sleep(Duration::from_millis(1)).await,
             }
         }
     };
-    let listening = vm.dial_ready(port, BOOT_TIMEOUT);
-    tokio::pin!(listening);
+    tokio::pin!(log, listening);
     let output = tokio::select! {
-        stream = log => follow(stream),
+        biased;
+        stream = &mut log => stream.map(follow),
         listening = &mut listening => {
             drop(listening?);
-            // listening, the log stream is open if the guest has one
-            return Ok(match vm.dial(wire::LOG_PORT).await {
-                Ok(stream) => Some(follow(stream)),
-                Err(_) => {
-                    eprintln!(
-                        "route {}: the guest sends no output (vsock port {}): its /init \
-                         predates it, build the rootfs again (scripts/build-guest.sh, \
-                         scripts/cnb-rootfs.sh)",
-                        hosts.current().label,
-                        wire::LOG_PORT
-                    );
-                    None
-                }
-            });
+            // the dial in flight is let finish: the guest may have taken the stream, and
+            // the lines it sent on it would go with it
+            listened.store(true, Ordering::Relaxed);
+            return Ok(log.await.map(follow));
         }
     };
     drop(listening.await?);
-    Ok(Some(output))
+    Ok(output)
 }
 
 /// Sends `notice` on a clone's control stream and reads its answer, a line of at most
@@ -865,5 +889,64 @@ mod tests {
                 expected.map_err(String::from)
             );
         }
+    }
+
+    /// The log stream in flight as the guest comes to listen is followed, not dropped:
+    /// the guest took it and sent its lines on it. A guest listening without one has
+    /// none followed.
+    #[tokio::test]
+    async fn the_log_stream_in_flight_as_the_guest_listens_is_followed() {
+        use std::sync::atomic::AtomicUsize;
+
+        use crate::output::{Printer, Written};
+        use crate::wire::{LogFrame, Stream};
+        use sluice_wicket_tunnel::flume::Tap;
+
+        let stdout = Written::default();
+        let sink = Arc::new(Sink {
+            printer: Printer::new(stdout.clone(), Written::default()),
+            tap: Tap::off(),
+        });
+        let hosts = Hosts::new(&["a.local".into()]);
+        let follow =
+            |stream| output::follow(stream, sink.clone(), hosts.clone(), "vm-0".to_string());
+        // the guest takes each stream at once, its lines on the first; its answer to the
+        // handshake comes once it listens
+        let (dials, listened) = (AtomicUsize::new(0), AtomicBool::new(false));
+        let listening = async || {
+            while dials.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+            listened.store(true, Ordering::Relaxed);
+            Ok(UnixStream::pair()?.0)
+        };
+        let guests = Mutex::new(Vec::new());
+        let dial_log = || async {
+            let (wicket, mut guest) = UnixStream::pair()?;
+            if dials.fetch_add(1, Ordering::Relaxed) == 0 {
+                let mut lines = Vec::new();
+                let line = LogFrame::Line(Stream::Stdout, b"hello".to_vec());
+                wire::put_log_frame(&mut lines, &line);
+                guest.write_all(&lines).await?;
+            }
+            guests.lock().unwrap().push(guest);
+            while !listened.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+            tokio::task::yield_now().await;
+            Ok(wicket)
+        };
+        let output = followed(dial_log, listening(), follow).await.unwrap();
+        assert!(output.is_some());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stdout.text().is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(stdout.text(), "stdout [a.local vm-0] :: hello\n");
+
+        let refused = || async { Err::<UnixStream, BoxError>("refused".into()) };
+        let listening = async { Ok(UnixStream::pair()?.0) };
+        let output = followed(refused, listening, follow).await.unwrap();
+        assert!(output.is_none());
     }
 }

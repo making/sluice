@@ -685,6 +685,14 @@ table dirty and is retired, so a guest opens its buckets per request (cheap: a t
   public client's FIN) is a half-close: an http/1.1 request already received
   is still answered, and one whose guest stalls is held until the server's
   ERROR or the budget
+- the runtime is tokio's default, a worker per core. On a 64-core host, keep-alive `GET /`
+  to the hello guest (per-request instances, `oha -c 16` for 5s, through a server or
+  `--listen` alike): 4.0-4.2k req/s at 1.4ms of the wicket's CPU a request with 64 workers,
+  6.8-8.4k at 0.44-0.52ms with 4 (`TOKIO_WORKER_THREADS`), 5.2k at 0.38ms with 2, 3.2k at
+  0.30ms with 1, 4.3-4.8k at 1.0-1.4ms with 8 to 32. Past a few workers the CPU goes to
+  the kernel's memory map lock and TLB shootdowns (`rwsem_spin_on_owner`,
+  `smp_call_function_many_cond` in `perf`): each instance's memory is mapped and unmapped
+  in the process, and an unmapping interrupts every core running one of its threads
 - guests are ordinary wasm components exporting `wasi:http/handler@0.3.0`;
   the linked wasi surface follows `wasmtime serve` (see `wasi` above) for
   p3 only. wasi p2 is unsupported and never linked (unlike serve's `-Scli`):

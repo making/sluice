@@ -50,6 +50,7 @@ use sluice_wicket_tunnel::flume::{self, Tap};
 use sluice_wicket_tunnel::proto::PeerBuild;
 use sluice_wicket_tunnel::session::{self, Shared};
 use sluice_wicket_tunnel::signals::{self, Signals};
+use sluice_wicket_tunnel::workers::Workers;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -81,7 +82,11 @@ pub fn describe_build() -> String {
 /// server, on `--listen`, or both) until SIGTERM / SIGINT: until the drain
 /// after it ended, or at once where nothing drains (without `--server`, or
 /// with `--drain-grace 0`).
-pub async fn run(settings: config::Settings, launcher: Launcher) -> Result<(), BoxError> {
+pub async fn run(
+    settings: config::Settings,
+    launcher: Launcher,
+    workers: Arc<Workers>,
+) -> Result<(), BoxError> {
     let config::Settings {
         server,
         listen,
@@ -94,6 +99,7 @@ pub async fn run(settings: config::Settings, launcher: Launcher) -> Result<(), B
         drain_grace,
         max_vms,
         max_memory,
+        workers: _,
         watch_interval,
         state_dir: _,
         flume,
@@ -127,7 +133,7 @@ pub async fn run(settings: config::Settings, launcher: Launcher) -> Result<(), B
         tap: tap.clone(),
     });
     let places = Arc::new(launcher.start()?);
-    let reloader = Reloader::start(routes, specs, capacity, places, sink).await?;
+    let reloader = Reloader::start(routes, specs, capacity, places, sink, workers.clone()).await?;
     let routes = reloader.routes().clone();
     if let Some(flume) = flume {
         flume::start(flume, tap, &client_id)?;
@@ -142,7 +148,7 @@ pub async fn run(settings: config::Settings, launcher: Launcher) -> Result<(), B
     if let Some(address) = listen {
         let listener = tokio::net::TcpListener::bind(&address).await?;
         println!("listening on {}", listener.local_addr()?);
-        tokio::spawn(listener::run(listener, routes.clone()));
+        tokio::spawn(listener::run(listener, routes.clone(), workers.clone()));
     }
     let Some(server) = server else {
         // local mode alone: nothing to drain, a signal ends the process at once
@@ -162,6 +168,7 @@ pub async fn run(settings: config::Settings, launcher: Launcher) -> Result<(), B
             max_connections,
             stall_timeout,
             build: build(),
+            workers: Some(workers),
         },
         Arc::clone(&routes),
     );

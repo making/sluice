@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime};
 use sluice_wicket_tunnel::proto::Upstream;
 use sluice_wicket_tunnel::routes::{Binding, Routes};
 use sluice_wicket_tunnel::tunnel::TunnelIo;
+use sluice_wicket_tunnel::workers::Workers;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -218,6 +219,8 @@ pub struct Reloader {
     capacity: Arc<Capacity>,
     /// Where the VMs' output goes.
     sink: Arc<Sink>,
+    /// Where the egress's connections are relayed.
+    workers: Arc<Workers>,
     /// Where the routes' VMs start, the `n`th route started its place.
     places: Arc<Places>,
     next_place: u64,
@@ -239,6 +242,7 @@ impl Reloader {
         capacity: Arc<Capacity>,
         places: Arc<Places>,
         sink: Arc<Sink>,
+        workers: Arc<Workers>,
     ) -> Result<Reloader, BoxError> {
         fits(&specs, &capacity)?;
         let mut reloader = Reloader {
@@ -250,6 +254,7 @@ impl Reloader {
             source,
             capacity,
             sink,
+            workers,
             places,
             next_place: 0,
             started: HashMap::new(),
@@ -390,13 +395,15 @@ impl Reloader {
             }
             let n = self.next_place;
             self.next_place += 1;
-            let (places, capacity, sink) = (
+            let (places, capacity, sink, workers) = (
                 self.places.clone(),
                 self.capacity.clone(),
                 self.sink.clone(),
+                self.workers.clone(),
             );
             starting.spawn(async move {
-                let route = Route::start(spec.clone(), &hosts, &places, n, capacity, sink).await;
+                let route =
+                    Route::start(spec.clone(), &hosts, &places, n, capacity, sink, workers).await;
                 let started = route.map(|route| Started {
                     spec,
                     stamps,

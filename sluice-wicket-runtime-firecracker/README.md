@@ -182,6 +182,7 @@ kernel: /opt/firecracker/vmlinux
 firecracker: firecracker        # on the PATH
 max-vms: 64
 max-memory: 16384               # MiB of guest memory
+workers: 4                      # threads relaying the connections (see Findings)
 watch-interval: 1s              # 0 = SIGHUP only
 drain-grace: 20s
 # flume: grpc://127.0.0.1:8002  # see Output and the live access log
@@ -735,10 +736,37 @@ Measured on a 64-core x86_64 host, through a sluice server on the same host, wit
   31-33k on 2 (the host's: 110-131k). A connection's first round trip, its setup with it:
   1.3-1.9ms to an address, 2.0-2.3ms to `localhost` (the host's resolver); a connection per
   request (`oha -c 16`): 2.3-2.7k req/s on 1 vCPU, 4.3k on 2 (11-12k and 20-23k for `GET /`).
-- **A runtime worker per core doubles the wicket's CPU per relayed request**: an egress round
-  trip took 55-69us of the wicket's CPU with the default workers (64 here), 25-30us with one
-  (`TOKIO_WORKER_THREADS=1`), at the same rate; a keep-alive request on `--listen` 75us
-  against 27us, at 17k req/s against 25k.
+- **The wicket relays on a few single-threaded workers, not tokio's work-stealing
+  runtime**: that runtime (a worker per core, 64 here) wakes its idle workers to steal for
+  each frame relayed. `--workers` (default 4) runtimes of one thread each relay instead: a
+  node's tunnel stream and its connections on one (no frame crosses threads), a
+  `--listen` or egress connection on the one with the fewest tasks; the main thread's
+  boots, restores and reloads. Two runs each, `oha` 5s, the sample guest; rate, and the
+  wicket's CPU per request (per round trip for the egress):
+
+  | | 64 workers | 1 worker | `--workers 4` |
+  |---|---|---|---|
+  | server, shared VM (2 vCPUs), keep-alive c=16 | 13.5-13.6k, 116-117us | 15.3-15.8k, 46us | 15.3-16.1k, 44-45us |
+  | server, 48 clones, keep-alive c=48 | 30.2-30.4k, 73-74us | 33.0-33.8k, 29-30us | 31.7-32.7k, 30-31us |
+  | server, a clone per connection, c=16 | 1,505-1,555, 1,310us | 1,123-1,132, 733-739us | 1,472-1,488, 1,020-1,030us |
+  | `--listen`, shared VM, keep-alive c=16 | 17.4k, 74-76us | 14.7-15.8k, 37-39us | 18.8-20.0k, 61-62us |
+  | `--listen`, 48 clones, keep-alive c=48 | 82.4-82.9k, 47-49us | 47.5-49.6k, 20-21us | 87.7-87.9k, 40us |
+  | egress, Redis PING over 16 connections (2 vCPUs) | 25.6-30.5k, 62-65us | 15.3-15.4k, 38us | 30.2-31.0k, 52us |
+
+  The cost lies in the threads a request wakes more than in the stealing: one busy thread
+  takes its events in batches (32 per `epoll_wait` at 49k req/s, 1.1 for four threads at
+  88k); 16 workers took 62us a request on `--listen`, 101-108us an egress round trip. One
+  worker (`TOKIO_WORKER_THREADS=1` on the work-stealing runtime, the VMs spawned on it)
+  costs least, but halves the rate of what is not one stream: the `--listen` clones, the
+  egress. A node's stream is about one core either way (its HTTP/2 connection): 30k req/s
+  on 2.2 cores with 64 workers, 33k on one. The wicket's seccomp filter took 8% of a relay
+  worker's time (clones through the server, `perf`).
+- **A VM is spawned from a thread living as long as the wicket**: `posix_spawn` holds its
+  thread until the launcher's exec (about 1ms), on a runtime's thread its relays with it
+  (one worker: 1,130 clones/s against 1,500); and a child's parent death signal fires as
+  the thread that spawned it ends, not its process: spawned from tokio's blocking pool
+  (an idle thread ends after 10s), the VMs died with their threads. Four launching
+  threads spawn them.
 
 [Jail mode](#jail-mode), on the same host through `--listen` (no server), `oha` for 5s:
 
