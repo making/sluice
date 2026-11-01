@@ -1,0 +1,134 @@
+name: Deploy wicket runtime firecracker
+# Builds and saves the sluice-wicket-runtime-firecracker image once the Rust workflow succeeds on a push
+# to main with its sluice-wicket-runtime-firecracker job run (a run without it deploys nothing here). This
+# file only takes effect from the default branch (workflow_run).
+on:
+  workflow_run:
+    workflows:
+    - Rust
+    types:
+    - completed
+    branches:
+    - main
+# One deploy at a time, never cancelled midway (it may be pushing the images branch);
+# GitHub keeps one pending run per group and cancels the older pending one.
+concurrency:
+  group: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && 'deploy-wicket-runtime-firecracker' || format('deploy-wicket-runtime-firecracker-noop-{0}', github.run_id) }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+env:
+  REGISTRY: ghcr.io
+jobs:
+  target:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      revision: ${{ steps.target.outputs.revision }}
+    steps:
+    # Target: the commit of the triggering run, when its sluice-wicket-runtime-firecracker job ran and
+    # passed.
+    # Skipped when the images branch already holds it or a newer commit.
+    - name: Pick the revision to deploy
+      id: target
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RUN_ID: ${{ github.event.workflow_run.id }}
+        TARGET: ${{ github.event.workflow_run.head_sha }}
+      run: |
+        WICKET=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" --jq '.jobs[] | select(.name == "sluice-wicket-runtime-firecracker") | .conclusion')
+        if [ "${WICKET}" != "success" ]; then
+          echo "Skipped: the sluice-wicket-runtime-firecracker job of run ${RUN_ID} did not run (${WICKET:-absent})" | tee -a "${GITHUB_STEP_SUMMARY}"
+          exit 0
+        fi
+        # absent before the first deploy
+        DEPLOYED=$(gh api "repos/${GITHUB_REPOSITORY}/contents/sluice-wicket-runtime-firecracker.yaml?ref=images" --jq .content 2>/dev/null | base64 -d | awk '/^git_revision:/{print $2}' || true)
+        STATUS=none
+        if [ -n "${DEPLOYED}" ]; then
+          STATUS=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${DEPLOYED}...${TARGET}" --jq .status)
+        fi
+        echo "target: ${TARGET}, deployed: ${DEPLOYED:-none}, target vs deployed: ${STATUS}" | tee -a "${GITHUB_STEP_SUMMARY}"
+        case "${STATUS}" in
+          identical|behind) echo "Skipped: ${TARGET} is not newer than the deployed revision" | tee -a "${GITHUB_STEP_SUMMARY}" ;;
+          *) echo "revision=${TARGET}" >> "${GITHUB_OUTPUT}" ;;
+        esac
+  # a Dockerfile build, amd64 alone: the guest, the Firecracker release and the kernel in
+  # the image are x86_64's
+  build-image:
+    needs: target
+    if: needs.target.outputs.revision != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REVISION: ${{ needs.target.outputs.revision }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ needs.target.outputs.revision }}
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build and push image
+      run: |
+        IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/sluice-wicket-runtime-firecracker | tr '[:upper:]' '[:lower:]')"
+        docker build -f sluice-wicket-runtime-firecracker/Dockerfile --build-arg GIT_COMMIT=${REVISION} -t ${IMAGE}:${REVISION} .
+        docker push ${IMAGE}:${REVISION}
+        docker tag ${IMAGE}:${REVISION} ${IMAGE}:latest
+        docker push ${IMAGE}:latest
+    - name: Generate image file
+      run: |
+        IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/sluice-wicket-runtime-firecracker | tr '[:upper:]' '[:lower:]')"
+        DIGEST=$(docker buildx imagetools inspect ${IMAGE}:${REVISION} | awk '/^Digest:/{print $2}')
+        cat <<EOF > sluice-wicket-runtime-firecracker.yaml
+        image: ${IMAGE}@${DIGEST}
+        git_revision: ${REVISION}
+        deployment:
+          image:
+            repository: ${IMAGE}
+            digest: ${DIGEST}
+          podLabels:
+            github.com/revision: ${REVISION}
+        EOF
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: sluice-wicket-runtime-firecracker
+        path: sluice-wicket-runtime-firecracker.yaml
+  save-image:
+    needs:
+    - target
+    - build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      REVISION: ${{ needs.target.outputs.revision }}
+    steps:
+    - name: Checkout images branch
+      uses: actions/checkout@v4
+      with:
+        ref: images
+    - name: Download image file
+      uses: actions/download-artifact@v4
+      with:
+        name: sluice-wicket-runtime-firecracker
+    - name: Commit and push
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add sluice-wicket-runtime-firecracker.yaml
+        git diff --cached --quiet || git commit -m ":robot: Update sluice-wicket-runtime-firecracker.yaml for ${REVISION}"
+        git pull --rebase origin images
+        git push origin images

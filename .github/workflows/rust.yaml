@@ -2,8 +2,8 @@ name: Rust
 # The Rust crates' own gates, apart from CI: a Java-only change runs none of them, and
 # each crate's job runs only when its paths changed. CI still builds sluice-flume for the
 # sluice-it tests. A run with the sluice-flume / sluice-wicket-runtime-wasi / sluice-wicket-cf-api /
-# sluice-wicket-firecracker job passed deploys its image (deploy-flume.yaml /
-# deploy-wicket-runtime-wasi.yaml / deploy-cf-api.yaml / deploy-firecracker.yaml).
+# sluice-wicket-runtime-firecracker job passed deploys its image (deploy-flume.yaml /
+# deploy-wicket-runtime-wasi.yaml / deploy-cf-api.yaml / deploy-wicket-runtime-firecracker.yaml).
 on:
   push:
     branches:
@@ -12,7 +12,7 @@ on:
     - 'sluice-flume/**'
     - 'sluice-wicket-runtime-wasi/**'
     - 'sluice-wicket-cf-api/**'
-    - 'sluice-wicket-firecracker/**'
+    - 'sluice-wicket-runtime-firecracker/**'
     - 'sluice-build-info/**'
     - 'sluice-wicket-oidc/**'
     - 'sluice-wicket-tunnel/**'
@@ -21,7 +21,7 @@ on:
     - '.github/workflows/deploy-flume.yaml'
     - '.github/workflows/deploy-wicket-runtime-wasi.yaml'
     - '.github/workflows/deploy-cf-api.yaml'
-    - '.github/workflows/deploy-firecracker.yaml'
+    - '.github/workflows/deploy-wicket-runtime-firecracker.yaml'
   pull_request:
     branches:
     - main
@@ -89,12 +89,12 @@ jobs:
           - '.github/workflows/rust.yaml'
           - '.github/workflows/deploy-cf-api.yaml'
           firecracker:
-          - 'sluice-wicket-firecracker/**'
+          - 'sluice-wicket-runtime-firecracker/**'
           - 'sluice-build-info/**'
           - 'sluice-wicket-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
-          - '.github/workflows/deploy-firecracker.yaml'
+          - '.github/workflows/deploy-wicket-runtime-firecracker.yaml'
   sluice-build-info:
     needs: changes
     if: needs.changes.outputs.build-info == 'true'
@@ -291,17 +291,17 @@ jobs:
   # usable for the runner's user by a udev rule) and is skipped where it does not; Firecracker
   # and the guest kernel are pinned here, checksums verified. Its guest (guest/, the VMs'
   # /init on musl) is its own workspace, linted and tested apart.
-  sluice-wicket-firecracker:
+  sluice-wicket-runtime-firecracker:
     needs: changes
     if: needs.changes.outputs.firecracker == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
       run:
-        working-directory: sluice-wicket-firecracker
+        working-directory: sluice-wicket-runtime-firecracker
     env:
-      SLUICE_FIRECRACKER: /usr/local/bin/firecracker
-      SLUICE_FIRECRACKER_KERNEL: /opt/firecracker/vmlinux
+      SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER: /usr/local/bin/firecracker
+      SLUICE_WICKET_RUNTIME_FIRECRACKER_KERNEL: /opt/firecracker/vmlinux
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -322,18 +322,18 @@ jobs:
         curl -fsSLO https://github.com/firecracker-microvm/firecracker/releases/download/$FC/firecracker-$FC-$ARCH.tgz
         echo "06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558  firecracker-$FC-$ARCH.tgz" | sha256sum -c
         tar xzf firecracker-$FC-$ARCH.tgz
-        sudo install -D release-$FC-$ARCH/firecracker-$FC-$ARCH "$SLUICE_FIRECRACKER"
+        sudo install -D release-$FC-$ARCH/firecracker-$FC-$ARCH "$SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER"
         curl -fsSL -o vmlinux https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20261028-84df49062576-0/x86_64/vmlinux-6.18.56
         echo "a00c1f68304e83ae4e0b5afe88972ad23fda52ed1a40335611aa18faa95d1b10  vmlinux" | sha256sum -c
-        sudo install -D -m 0644 vmlinux "$SLUICE_FIRECRACKER_KERNEL"
+        sudo install -D -m 0644 vmlinux "$SLUICE_WICKET_RUNTIME_FIRECRACKER_KERNEL"
     - uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
-          sluice-wicket-firecracker/target
-          sluice-wicket-firecracker/guest/target
-        key: cargo-firecracker-${{ runner.os }}-${{ hashFiles('sluice-wicket-firecracker/Cargo.lock', 'sluice-wicket-firecracker/guest/Cargo.lock', 'sluice-wicket-firecracker/rust-toolchain.toml', 'sluice-wicket-firecracker/guest/rust-toolchain.toml') }}
+          sluice-wicket-runtime-firecracker/target
+          sluice-wicket-runtime-firecracker/guest/target
+        key: cargo-wicket-runtime-firecracker-${{ runner.os }}-${{ hashFiles('sluice-wicket-runtime-firecracker/Cargo.lock', 'sluice-wicket-runtime-firecracker/guest/Cargo.lock', 'sluice-wicket-runtime-firecracker/rust-toolchain.toml', 'sluice-wicket-runtime-firecracker/guest/rust-toolchain.toml') }}
     # the toolchains rust-toolchain.toml pins, the guest's with the musl target
     - name: Toolchains
       run: |
@@ -355,5 +355,5 @@ jobs:
     - name: Test the image
       run: |
         if [ ! -e /dev/kvm ]; then echo "no /dev/kvm: skipped"; exit 0; fi
-        docker build -f Dockerfile --build-arg GIT_COMMIT=${GITHUB_SHA} -t sluice-wicket-firecracker:ci ..
-        SLUICE_FIRECRACKER_IMAGE=sluice-wicket-firecracker:ci cargo test --locked --test vm
+        docker build -f Dockerfile --build-arg GIT_COMMIT=${GITHUB_SHA} -t sluice-wicket-runtime-firecracker:ci ..
+        SLUICE_WICKET_RUNTIME_FIRECRACKER_IMAGE=sluice-wicket-runtime-firecracker:ci cargo test --locked --test vm
