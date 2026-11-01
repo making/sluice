@@ -5,7 +5,7 @@
 //! - new mount, PID, IPC and UTS namespaces, `firecracker` PID 1 of its own; the network
 //!   namespace is the keeper's, empty, the VMs' alike (one per VM costs about 0.9ms of
 //!   each spawn; the jailer's is the host's unless `--netns`)
-//! - its root a tmpfs of its own, read-only, pivoted into: `/dev/kvm` (a node of the
+//! - its root a tmpfs of its own, read-only, chrooted into: `/dev/kvm` (a node of the
 //!   VM's), `/rootfs` and `/vmlinux` (bound read-only from the files the wicket opened),
 //!   `/run` (bound from the VM's directory of the keeper's: the API and vsock sockets) and
 //!   `/snapshot` (the route's snapshot directory: writable by its template, read-only to
@@ -13,7 +13,8 @@
 //!   of the host's: the caches and `MIDR_EL1` Firecracker reads, the files the jailer
 //!   copies). No `/dev/net/tun`, `/dev/urandom` or `/dev/userfaultfd`: a vsock-only
 //!   VM restored from a file needs none
-//! - a cgroup of its own ([`Cgroups`]), entered by `clone3` (`CLONE_INTO_CGROUP`)
+//! - a cgroup of its own ([`Cgroups`]), entered by `clone3` (`CLONE_INTO_CGROUP`), a
+//!   group of the cpu controller of its own only when its route caps its CPU
 //! - a uid and gid of its own, no supplementary group, the capability bounding set
 //!   dropped, no new privileges; the wicket's seccomp filter (`seccomp`), then
 //!   Firecracker's as it installs them
@@ -34,6 +35,13 @@
 //! wicket's is bound instead, from a detached mount of the fd the wicket passed
 //! (`open_tree`; a mount of another namespace cannot be bound). Nothing is mounted where
 //! the host sees it, nothing is left to unmount.
+//!
+//! The jail's tmpfs is moved onto the template's root and chrooted into, the keeper's
+//! directory unmounted first: the template's root, empty, stays beneath it. `pivot_root`
+//! would drop that as well, but walks every thread of the host to move the ones rooted
+//! at the old root (`chroot_fs_refs`), holding the kernel's task list lock, which every
+//! fork and exit of the host takes: 0.25-1ms per VM among 2,300 threads, the keeper's
+//! next spawn and the VMs' own threads stalled behind it.
 
 use std::ffi::{CStr, CString};
 use std::io;
@@ -418,6 +426,8 @@ struct Prepared {
     /// Where the jail's tmpfs is mounted, and its options.
     mountpoint: CString,
     options: CString,
+    /// The keeper's directory in the template.
+    state: CString,
     dev: CString,
     kvm: CString,
     /// Directories made before the binds: the parents of a bind's target.
@@ -480,6 +490,7 @@ pub fn spawn(jail: &Jail<'_>) -> io::Result<libc::pid_t> {
     let prepared = Prepared {
         mountpoint: cstring(TEMPLATE_JAIL.as_bytes())?,
         options: cstring(ROOT_OPTIONS.as_bytes())?,
+        state: cstring(TEMPLATE_STATE.as_bytes())?,
         dev: inside("/dev")?,
         kvm: inside("/dev/kvm")?,
         dirs,
@@ -609,12 +620,21 @@ fn jailed(jail: &Jail<'_>, prepared: &Prepared) -> io::Result<std::convert::Infa
         ))
         .map_err(failed("the jail's tmpfs read-only"))?;
 
-        // the tmpfs the root: the template's stacked on it by pivot_root(".", "."), then
-        // detached
+        // the tmpfs the root: the keeper's directory unmounted (the binds are mounts of
+        // their own), the tmpfs moved onto the template's root and chrooted into -- not
+        // pivot_root (see the module's documentation)
+        check(libc::umount2(prepared.state.as_ptr(), libc::MNT_DETACH))
+            .map_err(failed("the keeper's directory"))?;
         check(libc::chdir(prepared.mountpoint.as_ptr())).map_err(failed("chdir"))?;
-        check(libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c".".as_ptr()) as libc::c_int)
-            .map_err(failed("pivot_root"))?;
-        check(libc::umount2(c".".as_ptr(), libc::MNT_DETACH)).map_err(failed("the old root"))?;
+        check(libc::mount(
+            c".".as_ptr(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_MOVE,
+            std::ptr::null(),
+        ))
+        .map_err(failed("the jail's tmpfs onto /"))?;
+        check(libc::chroot(c".".as_ptr())).map_err(failed("chroot"))?;
         check(libc::chdir(c"/".as_ptr())).map_err(failed("chdir /"))?;
 
         for (resource, limit) in [
@@ -776,10 +796,13 @@ impl Ids {
     }
 }
 
-/// The VMs' cgroups (v2): a parent of theirs, `route-<n>` for a route's shared VM or
-/// template (its snapshot, written by the template, is charged there as long as the
-/// route lives) and `vm-<n>` for a clone, one per uid of [`Ids`] and reused (no cgroup
-/// made and removed per clone).
+/// The VMs' cgroups (v2), under a parent of theirs in two classes: `capped/` the VMs
+/// whose CPU their route's `cpu` caps (`cpu.max`), each a group of the cpu controller,
+/// `uncapped/` the others, without it (their class one group between them): a group per
+/// VM, scheduled on its own, cost 10% of the clone rate. In each, `route-<n>` for a
+/// route's shared VM or template (its snapshot, written by the template, is charged
+/// there as long as the route lives) and `vm-<n>` for a clone, one per uid of [`Ids`]
+/// and reused (no cgroup made and removed per clone).
 pub struct Cgroups {
     /// The parent, absolute.
     dir: PathBuf,
@@ -793,9 +816,14 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// The controllers the VMs' cgroups use.
 const CONTROLLERS: &str = "+memory +pids";
 
-/// The controller of a route's `cpu`, enabled with [`CONTROLLERS`] where the hierarchy
-/// has it: a route asking for it fails its VMs' spawn where it is missing.
+/// The controller of a route's `cpu`, enabled with [`CONTROLLERS`] down to the capped
+/// class where the hierarchy has it: a route asking for it fails its VMs' spawn where it
+/// is missing.
 const CPU_CONTROLLER: &str = "+cpu";
+
+/// The classes of the VMs' cgroups ([`Cgroups`]).
+const CAPPED: &str = "capped";
+const UNCAPPED: &str = "uncapped";
 
 /// The period of a VM's `cpu.max`, microseconds.
 pub const CPU_PERIOD_US: u64 = 100_000;
@@ -816,8 +844,9 @@ impl Cgroups {
     /// controllers enabled down to it; or, None, the keeper's own cgroup (delegated to
     /// it: a systemd service's with `Delegate=yes`, a container's), which the keeper
     /// leaves for a leaf (`keeper`): cgroup v2 enables no controller for the children of
-    /// a cgroup holding processes. Removes the VMs' cgroups a previous keeper left, and
-    /// fails when one still holds a process.
+    /// a cgroup holding processes. Its classes made, the controllers enabled in them.
+    /// Removes the VMs' cgroups a previous keeper left, and fails when one still holds a
+    /// process.
     pub fn setup(path: Option<&str>) -> io::Result<Cgroups> {
         let root = Path::new(CGROUP_ROOT);
         if !is_cgroup2(root) {
@@ -844,10 +873,10 @@ impl Cgroups {
                 let busy = "it holds processes: choose a jail-cgroup none of whose \
                             ancestors (but the root) does";
                 let mut at = root.to_path_buf();
-                enable(&at, busy)?;
+                enable(&at, busy, true)?;
                 for component in relative.components() {
                     at.push(component);
-                    enable(&at, busy)?;
+                    enable(&at, busy, true)?;
                 }
                 Cgroups { dir, made }
             }
@@ -873,10 +902,25 @@ impl Cgroups {
                     "other processes share the keeper's cgroup, so it cannot hold the VMs' \
                      cgroups: run the wicket as a service with Delegate=yes, in a container, \
                      or set jail-cgroup",
+                    true,
                 )?;
                 Cgroups { dir, made: false }
             }
         };
+        for capped in [true, false] {
+            let class = cgroups.class(capped);
+            match std::fs::create_dir(&class) {
+                Err(e) if e.kind() != io::ErrorKind::AlreadyExists => {
+                    return Err(failed(&class.display().to_string())(e));
+                }
+                _ => {}
+            }
+            enable(
+                &class,
+                "it holds processes, another wicket's: choose another jail-cgroup",
+                capped,
+            )?;
+        }
         for stale in cgroups.children()? {
             let procs = std::fs::read_to_string(stale.join("cgroup.procs")).unwrap_or_default();
             if !procs.trim().is_empty() {
@@ -895,9 +939,15 @@ impl Cgroups {
         &self.dir
     }
 
-    /// The child cgroup `name`, made if missing.
-    pub fn child(&self, name: &str) -> io::Result<Cgroup> {
-        let dir = self.dir.join(name);
+    /// The class of the VMs whose CPU is `capped`, or not.
+    fn class(&self, capped: bool) -> PathBuf {
+        self.dir.join(if capped { CAPPED } else { UNCAPPED })
+    }
+
+    /// The cgroup `name` of the class of the VMs whose CPU is `capped`, or not, made if
+    /// missing.
+    pub fn child(&self, name: &str, capped: bool) -> io::Result<Cgroup> {
+        let dir = self.class(capped).join(name);
         match std::fs::create_dir(&dir) {
             Err(e) if e.kind() != io::ErrorKind::AlreadyExists => {
                 return Err(failed(&dir.display().to_string())(e));
@@ -920,33 +970,45 @@ impl Cgroups {
         })
     }
 
-    /// Removes the child cgroup `name` (its processes ended; the pages charged to it
-    /// stay charged to it, a dying cgroup, until they are freed).
+    /// Removes the cgroup `name`, of either class (its processes ended; the pages charged
+    /// to it stay charged to it, a dying cgroup, until they are freed).
     pub fn remove(&self, name: &str) {
-        let _ = std::fs::remove_dir(self.dir.join(name));
+        for capped in [true, false] {
+            let _ = std::fs::remove_dir(self.class(capped).join(name));
+        }
     }
 
-    /// The VMs' cgroups: `route-*` and `vm-*`.
+    /// The VMs' cgroups, `route-*` and `vm-*`: the classes', and the parent's (an
+    /// earlier keeper's, without classes).
     fn children(&self) -> io::Result<Vec<PathBuf>> {
         let mut children = Vec::new();
-        for entry in std::fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if entry.file_type()?.is_dir()
-                && (name.starts_with("route-") || name.starts_with("vm-"))
-            {
-                children.push(entry.path());
+        for dir in [self.dir.clone(), self.class(true), self.class(false)] {
+            let entries = match std::fs::read_dir(&dir) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                entries => entries?,
+            };
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if entry.file_type()?.is_dir()
+                    && (name.starts_with("route-") || name.starts_with("vm-"))
+                {
+                    children.push(entry.path());
+                }
             }
         }
         Ok(children)
     }
 
-    /// Removes the VMs' cgroups (their processes ended), and the parent if the keeper
-    /// made it.
+    /// Removes the VMs' cgroups (their processes ended), the classes, and the parent if
+    /// the keeper made it.
     pub fn close(&self) {
         for child in self.children().unwrap_or_default() {
             let _ = std::fs::remove_dir(child);
+        }
+        for capped in [true, false] {
+            let _ = std::fs::remove_dir(self.class(capped));
         }
         if self.made {
             let _ = std::fs::remove_dir(&self.dir);
@@ -978,13 +1040,10 @@ impl Cgroup {
         ] {
             self.write(file, &value.to_string())?;
         }
-        // written when set, or lifted from the cgroup's previous VM: a hierarchy
-        // without the cpu controller takes the routes without `cpu`
-        if limits.cpu.is_some() || self.limits.is_some_and(|last| last.cpu.is_some()) {
-            let value = match limits.cpu {
-                Some(quota) => format!("{quota} {CPU_PERIOD_US}"),
-                None => "max".to_string(),
-            };
+        // a capped VM's (its class's cgroups alone have the cpu controller: a hierarchy
+        // without it takes the routes without `cpu`)
+        if let Some(quota) = limits.cpu {
+            let value = format!("{quota} {CPU_PERIOD_US}");
             self.write(c"cpu.max", &value).map_err(|e| match e.kind() {
                 io::ErrorKind::NotFound => io::Error::other(
                     "cpu.max: the cpu controller is not enabled for the VMs' cgroups (cpu \
@@ -1059,11 +1118,11 @@ fn writable(root: &Path) -> io::Result<()> {
     )))
 }
 
-/// Enables [`CONTROLLERS`] for the children of the cgroup `dir`, and
+/// Enables [`CONTROLLERS`] for the children of the cgroup `dir`, and, `cpu`,
 /// [`CPU_CONTROLLER`] where `dir` has it (unchecked); `busy` says why it cannot when
 /// `dir` holds processes (cgroup v2 enables no controller for the children of a cgroup
 /// holding processes).
-fn enable(dir: &Path, busy: &str) -> io::Result<()> {
+fn enable(dir: &Path, busy: &str, cpu: bool) -> io::Result<()> {
     let control = dir.join("cgroup.subtree_control");
     std::fs::write(&control, CONTROLLERS).map_err(|e| {
         let why = match e.raw_os_error() {
@@ -1076,7 +1135,7 @@ fn enable(dir: &Path, busy: &str) -> io::Result<()> {
         )
     })?;
     let available = std::fs::read_to_string(dir.join("cgroup.controllers")).unwrap_or_default();
-    if available.split_whitespace().any(|name| name == "cpu") {
+    if cpu && available.split_whitespace().any(|name| name == "cpu") {
         let _ = std::fs::write(&control, CPU_CONTROLLER);
     }
     Ok(())

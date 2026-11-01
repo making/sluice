@@ -384,8 +384,9 @@ struct Keeper {
     /// The ids whose directory (`vm-<n>`) is made, kept for the next VM of the id.
     made: HashSet<u32>,
     cgroups: Cgroups,
-    /// The clones' cgroups by id, made with the first and reused.
-    clones: HashMap<u32, Cgroup>,
+    /// The clones' cgroups by id and whether their CPU is capped, made with the first
+    /// and reused.
+    clones: HashMap<(u32, bool), Cgroup>,
     /// The keeper's directory: `jail` (the template namespace's root), `route-<n>`,
     /// `vm-<n>`.
     dir: PathBuf,
@@ -927,8 +928,8 @@ impl Keeper {
 
     /// Starts the VM of `request` as the id `id`, its directory `dir`: the directory
     /// made for the id's first VM and kept (the reap empties its `run`), its log afresh,
-    /// its cgroup (the route's for a shared VM or template, the id's for a clone) made
-    /// for the first and limited for each.
+    /// its cgroup (the route's for a shared VM or template, the id's for a clone, in the
+    /// class of its CPU, capped or not) made for the first and limited for each.
     fn jail(&mut self, id: u32, dir: &Path, request: &Waiting) -> io::Result<libc::pid_t> {
         let n = id - self.ids.first;
         if !self.made.contains(&id) {
@@ -966,18 +967,20 @@ impl Keeper {
                 .cpu
                 .map(|percent| u64::from(percent) * jail::CPU_PERIOD_US / 100),
         };
+        let capped = limits.cpu.is_some();
         let route = self.routes.get_mut(&request.route).expect("checked");
         let cgroup = match request.role {
             Role::Shared | Role::Template => {
                 if route.cgroup.is_none() {
-                    route.cgroup = Some(self.cgroups.child(&format!("route-{}", request.route))?);
+                    let name = format!("route-{}", request.route);
+                    route.cgroup = Some(self.cgroups.child(&name, capped)?);
                 }
                 route.cgroup.as_mut().expect("made")
             }
-            Role::Clone => match self.clones.entry(id) {
+            Role::Clone => match self.clones.entry((id, capped)) {
                 std::collections::hash_map::Entry::Occupied(cgroup) => cgroup.into_mut(),
                 std::collections::hash_map::Entry::Vacant(vacant) => {
-                    vacant.insert(self.cgroups.child(&format!("vm-{n}"))?)
+                    vacant.insert(self.cgroups.child(&format!("vm-{n}"), capped)?)
                 }
             },
         };

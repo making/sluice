@@ -7,7 +7,7 @@
 //!   what the guests send) and each jailed `firecracker` before its exec (Firecracker's
 //!   own filters follow, stacked)
 //! - [`Filter::keeper`]: the keeper (jail mode, root), and what it spawns before their
-//!   own: the same but for the namespace and mount calls of the jails (`jail`)
+//!   own: the same but for the namespace, mount and root calls of the jails (`jail`)
 //!
 //! A denylist, not the profile's allowlist: the calls the profile refuses, the ones
 //! newer than the kernels it knows aside. Denied calls fail with `EPERM`, `clone3` with
@@ -42,7 +42,6 @@ const DENIED: &[libc::c_long] = &[
     libc::SYS_acct,
     libc::SYS_add_key,
     libc::SYS_bpf,
-    libc::SYS_chroot,
     libc::SYS_clock_settime,
     libc::SYS_delete_module,
     libc::SYS_fanotify_init,
@@ -114,8 +113,9 @@ const DENIED_ARCH: &[libc::c_long] = &[
 #[cfg(target_arch = "aarch64")]
 const DENIED_ARCH: &[libc::c_long] = &[];
 
-/// The namespace and mount calls of the jails, refused but to the keeper.
+/// The namespace, mount and root calls of the jails, refused but to the keeper.
 const JAILS: &[libc::c_long] = &[
+    libc::SYS_chroot,
     libc::SYS_mount,
     libc::SYS_move_mount,
     libc::SYS_open_tree,
@@ -301,10 +301,16 @@ mod tests {
     /// allows return there, as an unprivileged process sees them.
     #[test]
     fn the_filters_refuse_dockers_denials_and_the_keeper_its_jails_calls() {
-        let [eperm, einval, ebadf, enosys] =
-            [libc::EPERM, libc::EINVAL, libc::EBADF, libc::ENOSYS].map(|e| Some(-i64::from(e)));
+        let [eperm, einval, ebadf, enosys, enoent] = [
+            libc::EPERM,
+            libc::EINVAL,
+            libc::EBADF,
+            libc::ENOSYS,
+            libc::ENOENT,
+        ]
+        .map(|e| Some(-i64::from(e)));
         // SAFETY (each check): a plain call; a clone that succeeds exits at once
-        let checks: [Check; 9] = [
+        let checks: [Check; 10] = [
             (
                 "getpid",
                 || call(unsafe { libc::syscall(libc::SYS_getpid) }),
@@ -322,6 +328,13 @@ mod tests {
                 || call(unsafe { libc::syscall(libc::SYS_setns, -1, 0) }),
                 eperm,
                 ebadf,
+            ),
+            // the empty path refused before the capability is checked
+            (
+                "chroot(\"\")",
+                || call(unsafe { libc::syscall(libc::SYS_chroot, c"".as_ptr()) }),
+                eperm,
+                enoent,
             ),
             (
                 "keyctl",
@@ -369,7 +382,7 @@ mod tests {
             ),
         ];
         for (unprivileged, filter) in [(true, Filter::unprivileged()), (false, Filter::keeper())] {
-            let mut results = [i64::MIN; 9];
+            let mut results = [i64::MIN; 10];
             let mut pipe = [0; 2];
             // SAFETY: a pipe, a fork whose child installs the filter and writes what the
             // checks return (no allocation), and the parent's read and wait
@@ -377,7 +390,7 @@ mod tests {
                 assert_eq!(libc::pipe(pipe.as_mut_ptr()), 0);
                 match libc::fork() {
                     0 => {
-                        let mut got = [i64::MIN; 9];
+                        let mut got = [i64::MIN; 10];
                         if filter.install().is_ok() {
                             for (i, (_, check, _, _)) in checks.iter().enumerate() {
                                 got[i] = check();

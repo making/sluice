@@ -32,7 +32,7 @@
 //! and checks the jails: each VM a `firecracker` of an id of its own, PID 1 of its
 //! namespace, without privileges, under seccomp filters of the keeper's, its own and
 //! Firecracker's, in a cgroup limiting its memory (and a route's
-//! clones' CPU, `cpu`); the VMs and the
+//! clones' CPU, `cpu`, theirs alone with the cpu controller); the VMs and the
 //! wicket ending with the keeper (SIGKILL).
 #![cfg(target_os = "linux")]
 
@@ -332,8 +332,8 @@ fn filters(pid: i32) -> u32 {
 /// The jails of the VMs alive (the shared VM and the warm clones): each a
 /// `firecracker` of an id of its own, PID 1 of its namespace, without capability or
 /// new privileges, its seccomp filter on, in a cgroup of the keeper's limiting its
-/// memory, and the CPU of clone.local's (under `cgroup`, else beside the keeper's own:
-/// its default), on aarch64 the
+/// memory, and the CPU of clone.local's alone (under `cgroup`, else beside the keeper's
+/// own: its default), on aarch64 the
 /// host CPU's files Firecracker reads in it; the wicket as `user`. The keeper killed (SIGKILL), they and the wicket end with it (their parent
 /// death signal); its files and cgroups are removed here (a container's go with it).
 fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
@@ -401,13 +401,18 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
         );
         let max = std::fs::read_to_string(format!("/sys/fs/cgroup/{own}/memory.max")).unwrap();
         assert_ne!(max.trim(), "max", "{vm}: its memory limited");
-        // clone.local's CPU limited, the others' not
-        let cpu = std::fs::read_to_string(format!("/sys/fs/cgroup/{own}/cpu.max")).unwrap();
-        match cpu.trim() {
-            "max 100000" => {}
-            limited => {
-                assert_eq!(limited, format!("{} 100000", CLONE_CPU * 1000), "{vm}");
+        // clone.local's CPU capped, its cgroup a group of the cpu controller; the
+        // others' without the controller
+        let cpu = std::fs::read_to_string(format!("/sys/fs/cgroup/{own}/cpu.max"));
+        match own.rsplit('/').nth(1) {
+            Some("capped") => {
+                let limit = format!("{} 100000", CLONE_CPU * 1000);
+                assert_eq!(cpu.unwrap().trim(), limit, "{vm}");
                 cpu_limited += 1;
+            }
+            class => {
+                assert_eq!(class, Some("uncapped"), "{vm}: its cgroup {own}");
+                assert!(cpu.is_err(), "{vm}: its cgroup {own} has cpu.max");
             }
         }
         // aarch64: the host CPU's files Firecracker reads, the host's in the jail

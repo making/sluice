@@ -406,8 +406,10 @@ Each VM's `firecracker`:
   (it writes its snapshot), `pids.max` its vCPUs plus 16. Past its limit the kernel's OOM
   killer ends the VM, nothing else. A per-connection route's snapshot stays charged to the
   route's cgroup (`route-<n>`) as long as the route lives; a clone's cgroup (`vm-<n>`, one
-  per id) is reused. `cpu.max` its route's `cpu` (see [Limits](#limits)), else unlimited:
-  the vCPUs bound it
+  per id) is reused. With its route's `cpu` (see [Limits](#limits)) it is in `capped/`, a
+  group of the cpu controller of its own, `cpu.max` the route's `cpu`; else in
+  `uncapped/`, without (the class one group of it): the vCPUs bound it. A group per VM cost
+  10% of the clone rate (see [Findings](#findings))
 - ends with the keeper: its parent death signal is set after the uid change (which clears
   it: the jailer's `firecracker` outlives the jailer's parent). The keeper forwards SIGTERM,
   SIGINT and SIGHUP to the wicket and ends with it, its VMs killed, their files and cgroups
@@ -425,10 +427,11 @@ What it needs:
   own: the files need others' read permission (`o+r`); their directory may stay private (a
   jail binds the file, not its directory)
 - `--jail-cgroup <path>`: the VMs' parent cgroup under `/sys/fs/cgroup`, made, the memory and
-  pids controllers enabled down to it, and cpu where the hierarchy has it (a route's `cpu`
-  fails its VMs' spawn without it). By default the wicket's own cgroup, which the keeper
-  leaves for `keeper/` (cgroup v2 enables no controller for the children of a cgroup holding
-  processes): a systemd service's with `Delegate=yes`, a container's; run by hand, give a path
+  pids controllers enabled down to it, and cpu down to `capped/` where the hierarchy has it
+  (a route's `cpu` fails its VMs' spawn without it). By default the wicket's own cgroup,
+  which the keeper leaves for `keeper/` (cgroup v2 enables no controller for the children of
+  a cgroup holding processes): a systemd service's with `Delegate=yes`, a container's; run
+  by hand, give a path
 - the firecracker binary is the keeper's, the one named at startup: a reload may replace the
   file (a rename), not name another
 
@@ -637,9 +640,10 @@ sg kvm -c "SLUICE_WICKET_RUNTIME_FIRECRACKER_VMS='java.local=$T/upstream.ext4?me
 started as root (`sudo -n`; skipped without it) or, with `..._IMAGE`, as the image runs it
 jailed, and checks the jails of the VMs alive: an id of its own each, PID 1 of its
 namespace, no capability, no new privileges, the jail's seccomp filter and Firecracker's
-on the keeper's, a cgroup limiting its memory (and a route's clones' CPU), on aarch64 the
-host CPU's files, the wicket as `--jail-user` under its filter; the keeper killed
-(SIGKILL), the VMs and the wicket end. Unjailed, it checks the wicket's filter.
+on the keeper's, a cgroup limiting its memory (and a route's clones' CPU, theirs alone with
+the cpu controller), on aarch64 the host CPU's files, the wicket as `--jail-user` under its
+filter; the keeper killed (SIGKILL), the VMs and the wicket end. Unjailed, it checks the
+wicket's filter.
 
 The CI runs it on an x86_64 and an aarch64 runner, where the runner exposes `/dev/kvm`,
 with the Firecracker release and the kernel above pinned, and again jailed, on the runner
@@ -740,8 +744,9 @@ Measured on a 64-core x86_64 host, through a sluice server on the same host, wit
 
 | VM per connection, sample guest, warm=16 | new connection req/s, c=1 | c=16 |
 |---|---|---|
-| without the jail, 3 runs | 504-650 | 1,455-1,544 |
-| jailed, the same runs alternating | 508-658 | 1,295-1,320 |
+| without the jail, 3 runs | 534-572 | 1,562-1,616 |
+| jailed, the same runs alternating | 547-569 | 1,534-1,584 |
+| jailed by `pivot_root`, a cpu group per VM (the same runs) | 555-592 | 1,231-1,239 |
 
 - **Firecracker's jailer costs a VM's spawn 2.5-4.2ms**: from spawn to API socket 2.1ms
   without it, 4.6ms with it (`--new-pid-ns`, a chroot on a tmpfs), 6.3ms with a cgroup's
@@ -753,12 +758,24 @@ Measured on a 64-core x86_64 host, through a sluice server on the same host, wit
 - **A jailed restore is faster than the launcher's**: a fresh clone restored in 11.9ms
   (p50, c=1, warm=0) against 13.6ms: one fork of the small keeper and one `execveat` instead
   of the launcher's two execs (the wicket's own exec costs 1.2ms here).
-- **The keeper's thread bounds the jailed clone rate** (85% of the unjailed at c=16, as
-  above): it forks every VM, and a fork of any process costs 130us on this 64-core 6.8
-  kernel (its new memory map's per-CPU counters), with the copy-on-write faults after it
-  about 0.6ms of the keeper's thread per VM. A vfork child would hold the keeper for the
-  jail's setup, 1-4ms per VM (mostly the kernel's mount namespace lock: `pivot_root`,
-  `mount`, `umount2`, `unshare`; in parallel in the children).
+- **`pivot_root` stalls every fork of the host**: it walks every thread of the host
+  (`chroot_fs_refs`, 2,300 threads here) under the kernel's task list lock, which a fork
+  or an exit takes, 0.25-1ms per VM. The keeper's `clone3` waited on it for 37% of its
+  thread's time (82% busy at 1,232 VMs/s, 0.66ms per VM), Firecracker's threads as they
+  started and ended alike. The jail's tmpfs is moved onto the template's root and chrooted
+  into instead: 0.40ms of the keeper per VM, the jail's setup in the child 1-2ms instead
+  of 2-4. Unmounting the keeper's directory in each jail (an expedited RCU grace period,
+  0.3ms) costs nothing measurable.
+- **A group of the cpu controller per VM costs 10% of the clone rate** (its scheduling
+  entities on every CPU, their load tracked): 1,390-1,460 VMs/s at c=16 against
+  1,530-1,630 without the controller, 1,543 with one group for every clone. Hence a group
+  of its own only for a VM whose route caps its CPU (`capped/`).
+- **The keeper's thread does not bound the jailed clone rate**: 63% busy at the unjailed
+  rate, 0.4ms per VM (its fork 0.2ms), so about 2,500 VMs/s at most. Spawner processes
+  forking in parallel (built and measured; the keeper's round trip p90 from 5.0ms to
+  2.0ms) gained nothing at 8 refill workers, 2-3% at 16 (where the jailed rate is 93% of
+  the unjailed, the keeper 58% busy). A vfork child would hold the keeper for the jail's
+  setup.
 - **A jail's mount namespace is copied from a template**: `clone3`'s `CLONE_NEWNS` copied
   the host's 41 mounts per VM in the keeper's thread (900 clones/s at c=16); a template of
   2 mounts copied in the child, 1,200; each id's directory and cgroup reused, 1,300. A
