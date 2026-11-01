@@ -6,10 +6,12 @@
 //! travels in band: `[type: u8][len: u32 BE][payload]`, `DATA` or `CLOSE` (no payload).
 //! A stream ending without a `CLOSE` from its side failed.
 //!
-//! The guest's output travels on a stream of its own, framed alike ([`LOG_PORT`]).
+//! The guest's output travels on a stream of its own, framed alike ([`LOG_PORT`]), and
+//! so do its egress connections, after their request ([`EGRESS_PORT`]).
 //!
 //! A copy of the wicket's `src/wire.rs` (with its tests): keep them alike.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -51,6 +53,257 @@ pub const LOG_PORT: u32 = 1025;
 
 /// The longest line of the log stream.
 pub const MAX_LINE: usize = 16 * 1024;
+
+/// The vsock port of the host the guest's `/init` dials for each connection a process
+/// opens to a destination of its route's egress; Firecracker connects the stream to the
+/// wicket's socket `<the VM's vsock socket>_1026`. It opens with the guest's request,
+/// `CONNECT <destination>\n` (a [`Rule`] naming one), answered `OK\n` once the wicket
+/// connected to the destination, else `ERR <why>\n` and the end of the stream; then it
+/// carries the connection, framed as the others.
+pub const EGRESS_PORT: u32 = 1026;
+
+/// The guest kernel's command line parameter naming its route's egress:
+/// `sluice.egress=<rule>,<rule>...` ([`Rule`]). A parameter of a module the kernel does
+/// not have: no process gets it, `/init` reads `/proc/cmdline`.
+pub const EGRESS_PARAMETER: &str = "sluice.egress";
+
+/// The longest line of an egress stream's request or answer.
+const MAX_EGRESS_LINE: usize = 512;
+
+/// A destination of a route's egress: a name or an address range, and a port --
+/// `db.internal:5432`, `10.0.0.5:5432`, `10.0.0.0/24:5432`, `[2001:db8::5]:443`,
+/// `[2001:db8::/32]:443`. A name is lowercase, its last label starts with a letter (no
+/// address in disguise, `10.1` or `0x7f.1`); a range's address has no bit set past its
+/// prefix. An egress request names one destination: a name, or one address.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Rule {
+    pub host: Host,
+    pub port: u16,
+}
+
+/// What a [`Rule`] names: a host name, or an address and the bits of its prefix (one
+/// address: its family's all).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Host {
+    Name(String),
+    Net(IpAddr, u8),
+}
+
+/// The bits of an address of `ip`'s family.
+pub fn bits(ip: IpAddr) -> u8 {
+    match ip {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    }
+}
+
+/// An address's bits from the top: an IPv4 address's are the first 32.
+fn top(ip: IpAddr) -> u128 {
+    match ip {
+        IpAddr::V4(ip) => u128::from(u32::from(ip)) << 96,
+        IpAddr::V6(ip) => u128::from(ip),
+    }
+}
+
+/// Whether the range of `net` and `prefix` holds `ip` (an IPv4 address mapped into IPv6
+/// is IPv4's).
+#[allow(dead_code)] // the wicket's: each copy has it
+pub fn holds(net: IpAddr, prefix: u8, ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    // the first `prefix` bits alike
+    net.is_ipv4() == ip.is_ipv4()
+        && (top(net) ^ top(ip))
+            .checked_shr(128 - u32::from(prefix))
+            .unwrap_or(0)
+            == 0
+}
+
+impl Rule {
+    /// The rule of one address and port (an IPv4 address mapped into IPv6 is IPv4's).
+    pub fn address(address: SocketAddr) -> Rule {
+        let ip = address.ip().to_canonical();
+        Rule {
+            host: Host::Net(ip, bits(ip)),
+            port: address.port(),
+        }
+    }
+
+    /// Whether it names one destination: a name, or one address.
+    pub fn is_one(&self) -> bool {
+        match self.host {
+            Host::Name(_) => true,
+            Host::Net(ip, prefix) => prefix == bits(ip),
+        }
+    }
+}
+
+impl std::str::FromStr for Rule {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Rule, String> {
+        let (host, port) = match text.strip_prefix('[') {
+            Some(rest) => {
+                let (net, port) = rest
+                    .split_once("]:")
+                    .ok_or_else(|| format!("{text}: expected [<IPv6 address>[/<bits>]]:<port>"))?;
+                (Rule::net(net, true)?, port)
+            }
+            None => {
+                let (host, port) = text
+                    .rsplit_once(':')
+                    .ok_or_else(|| format!("{text}: expected <host>:<port>"))?;
+                let host = match host.contains('/') || host.parse::<Ipv4Addr>().is_ok() {
+                    true => Rule::net(host, false)?,
+                    false => Host::Name(Rule::name(host)?),
+                };
+                (host, port)
+            }
+        };
+        match port.parse::<u16>() {
+            Ok(port) if port > 0 => Ok(Rule { host, port }),
+            _ => Err(format!("{text}: port {port}: expected 1 to 65535")),
+        }
+    }
+}
+
+impl Rule {
+    /// An address and its prefix's bits (`<address>[/<bits>]`), of IPv6 or of IPv4.
+    fn net(text: &str, v6: bool) -> Result<Host, String> {
+        let (address, prefix) = match text.split_once('/') {
+            Some((address, prefix)) => (address, Some(prefix)),
+            None => (text, None),
+        };
+        let ip = match v6 {
+            true => address.parse().map(IpAddr::V6),
+            false => address.parse().map(IpAddr::V4),
+        }
+        .map_err(|_| format!("{address}: not an IPv{} address", if v6 { 6 } else { 4 }))?;
+        let prefix = match prefix {
+            None => bits(ip),
+            Some(prefix) => prefix
+                .parse::<u8>()
+                .ok()
+                .filter(|prefix| *prefix <= bits(ip))
+                .ok_or_else(|| format!("{text}: /{prefix}: expected 0 to {}", bits(ip)))?,
+        };
+        // the range starts at its address
+        if top(ip).checked_shl(u32::from(prefix)).unwrap_or(0) != 0 {
+            return Err(format!("{text}: bits set past the prefix"));
+        }
+        Ok(Host::Net(ip, prefix))
+    }
+
+    /// A host name, lowercased: labels of letters, digits, `-` and `_`, the last one
+    /// starting with a letter.
+    fn name(text: &str) -> Result<String, String> {
+        let name = text.to_ascii_lowercase();
+        let label = |label: &str| {
+            (1..=63).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        };
+        let last = name.rsplit('.').next().unwrap_or_default();
+        if name.len() > 253
+            || !name.split('.').all(label)
+            || !last.starts_with(|first: char| first.is_ascii_lowercase())
+        {
+            return Err(format!(
+                "{text}: not a host name (labels of letters, digits, - and _, the last one \
+                 starting with a letter) nor an address"
+            ));
+        }
+        Ok(name)
+    }
+}
+
+impl std::fmt::Display for Rule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let port = self.port;
+        match &self.host {
+            Host::Name(name) => write!(f, "{name}:{port}"),
+            Host::Net(IpAddr::V4(ip), 32) => write!(f, "{ip}:{port}"),
+            Host::Net(IpAddr::V4(ip), prefix) => write!(f, "{ip}/{prefix}:{port}"),
+            Host::Net(IpAddr::V6(ip), 128) => write!(f, "[{ip}]:{port}"),
+            Host::Net(IpAddr::V6(ip), prefix) => write!(f, "[{ip}/{prefix}]:{port}"),
+        }
+    }
+}
+
+/// Sends the egress request for `to` on `stream` and reads the answer (the guest's
+/// half): Ok once the wicket connected to it.
+#[allow(dead_code)] // the guest's half: each copy has both
+pub async fn request_egress<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    to: &Rule,
+) -> std::io::Result<()> {
+    stream
+        .write_all(format!("CONNECT {to}\n").as_bytes())
+        .await?;
+    let answer = read_short_line(stream, MAX_EGRESS_LINE).await?;
+    match answer.strip_prefix(b"ERR ") {
+        _ if answer == b"OK" => Ok(()),
+        Some(why) => Err(std::io::Error::other(String::from_utf8_lossy(why))),
+        None => Err(std::io::Error::other(format!(
+            "not an answer: {}",
+            String::from_utf8_lossy(&answer)
+        ))),
+    }
+}
+
+/// Reads an egress request (the wicket's half): the destination it names.
+#[allow(dead_code)] // the wicket's half: each copy has both
+pub async fn read_egress_request<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Rule> {
+    let invalid = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidData, why);
+    let line = read_short_line(reader, MAX_EGRESS_LINE).await?;
+    let line = String::from_utf8_lossy(&line);
+    let to: Rule = line
+        .strip_prefix("CONNECT ")
+        .ok_or_else(|| invalid(format!("not a request: {line}")))?
+        .parse()
+        .map_err(invalid)?;
+    if !to.is_one() {
+        return Err(invalid(format!("{to}: a range, not a destination")));
+    }
+    Ok(to)
+}
+
+/// Answers an egress request (the wicket's half): connected, else why not.
+#[allow(dead_code)] // the wicket's half: each copy has both
+pub async fn answer_egress<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    answer: Result<(), &str>,
+) -> std::io::Result<()> {
+    let line = match answer {
+        Ok(()) => "OK\n".to_string(),
+        Err(why) => format!("ERR {}\n", why.replace('\n', " ")),
+    };
+    writer.write_all(line.as_bytes()).await
+}
+
+/// Reads a line of at most `max` bytes, its newline dropped, byte by byte: what follows
+/// it stays unread. A longer line is an error, and so is the end of the stream before it.
+pub async fn read_short_line<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut line = Vec::with_capacity(16);
+    loop {
+        let byte = reader.read_u8().await?;
+        if byte == b'\n' {
+            return Ok(line);
+        }
+        if line.len() == max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("a line longer than {max} bytes"),
+            ));
+        }
+        line.push(byte);
+    }
+}
 
 /// A process's output stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,6 +633,69 @@ mod tests {
         );
         assert_eq!(Notice::parse("RESTORED 00"), None);
         assert_eq!(Notice::parse("HELLO"), None);
+    }
+
+    /// A rule prints as it parses (a name lowercased); a range holds the addresses of its
+    /// prefix; what is not a rule is refused, a request names one destination and is
+    /// answered.
+    #[tokio::test]
+    async fn egress_rules_and_requests_read_as_written() {
+        for (text, printed) in [
+            ("DB.Internal:5432", "db.internal:5432"),
+            ("my_db:6379", "my_db:6379"),
+            ("10.0.0.5:5432", "10.0.0.5:5432"),
+            ("10.0.0.0/24:5432", "10.0.0.0/24:5432"),
+            ("0.0.0.0/0:443", "0.0.0.0/0:443"),
+            ("[2001:db8::5]:443", "[2001:db8::5]:443"),
+            ("[2001:db8::/32]:443", "[2001:db8::/32]:443"),
+        ] {
+            let rule: Rule = text.parse().unwrap();
+            assert_eq!(rule.to_string(), printed);
+            assert_eq!(printed.parse::<Rule>(), Ok(rule));
+        }
+        for (net, prefix, ip, held) in [
+            ("10.0.0.0", 24, "10.0.0.77", true),
+            ("10.0.0.0", 24, "10.0.1.0", false),
+            ("10.0.0.0", 24, "::ffff:10.0.0.77", true),
+            ("0.0.0.0", 0, "192.0.2.1", true),
+            ("0.0.0.0", 0, "2001:db8::1", false),
+            ("2001:db8::", 32, "2001:db8:ffff::1", true),
+            ("2001:db8::", 32, "2001:db9::1", false),
+            ("2001:db8::5", 128, "2001:db8::5", true),
+        ] {
+            let (net, ip) = (net.parse().unwrap(), ip.parse().unwrap());
+            assert_eq!(holds(net, prefix, ip), held, "{net}/{prefix} {ip}");
+        }
+        for wrong in [
+            "db.internal",
+            "db.internal:0",
+            "db.internal:65536",
+            "10.1:5432",
+            "0x7f.1:80",
+            "-db:5432",
+            "2001:db8::5:443",
+            "[10.0.0.5]:443",
+            "10.0.0.5/24:5432",
+            "10.0.0.0/33:5432",
+            "[2001:db8::/129]:443",
+        ] {
+            assert!(wrong.parse::<Rule>().is_err(), "{wrong}");
+        }
+
+        let (mut guest, mut wicket) = tokio::io::duplex(1024);
+        let to: Rule = "[2001:db8::5]:443".parse().unwrap();
+        let answered = async {
+            assert_eq!(read_egress_request(&mut wicket).await.unwrap(), to);
+            answer_egress(&mut wicket, Err("denied\nfor good")).await
+        };
+        let (requested, answered) = tokio::join!(request_egress(&mut guest, &to), answered);
+        answered.unwrap();
+        assert_eq!(requested.unwrap_err().to_string(), "denied for good");
+        for request in ["CONNECT 10.0.0.0/24:5432\n", "OPEN db:5432\n"] {
+            let (mut guest, mut wicket) = tokio::io::duplex(1024);
+            guest.write_all(request.as_bytes()).await.unwrap();
+            assert!(read_egress_request(&mut wicket).await.is_err(), "{request}");
+        }
     }
 
     /// A relay fails on a framed stream ending without its CLOSE, and on reading

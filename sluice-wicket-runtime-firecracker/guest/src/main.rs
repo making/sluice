@@ -21,6 +21,10 @@
 //! restore did not advance the clock), puts its seed into the kernel's random pool,
 //! reseeds it, and runs the image's restore hook (`restore` in `/sluice/init.json`, as the
 //! image's user, `SLUICE_RESTORE_GENERATION` set) before it answers.
+//!
+//! The process connects to the destinations of the route's egress as named, through
+//! /init and the wicket (`egress`): set up before it starts. Hello mode's
+//! `POST /egress?to=<host>:<port>` connects so too.
 
 use std::convert::Infallible;
 use std::ffi::CString;
@@ -36,13 +40,15 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
 
+use egress::Egress;
 use log::Log;
 use reaper::Reaper;
 use wire::Stream;
 
+mod egress;
 mod log;
 mod reaper;
 mod wire;
@@ -93,6 +99,10 @@ fn main() {
     let booted = Instant::now();
     mount("proc", "/proc", "proc", 0);
     mount("sysfs", "/sys", "sysfs", 0);
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let mut egress = Egress::of(&cmdline);
+    // on a tmpfs mounted on /tmp a moment: before /tmp's own
+    egress.name();
     mount("tmpfs", "/tmp", "tmpfs", 0);
     mount("tmpfs", "/dev/shm", "tmpfs", 0);
     let launch = std::fs::read(LAUNCH_CONFIG).ok().map(|json| {
@@ -120,6 +130,8 @@ fn main() {
         let output = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, wire::LOG_PORT))?;
         tokio::spawn(log.clone().serve(output));
         loopback_up()?;
+        // before the process starts: it may connect at once
+        egress.listen(launch.as_ref().map(|launch| launch.port), &log);
         let hook = launch.as_ref().map(|launch| Hook {
             argv: launch.restore.clone(),
             env: launch.env.clone(),
@@ -496,6 +508,15 @@ async fn answer(
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let served = SERVED.fetch_add(1, Ordering::Relaxed) + 1;
     let (head, body) = request.into_parts();
+    let body = body
+        .collect()
+        .await
+        .map(|b| b.to_bytes())
+        .unwrap_or_default();
+    if head.uri.path() == "/egress" {
+        let answer = egress(head.uri.query().unwrap_or_default(), &body).await;
+        return Ok(Response::new(Full::new(Bytes::from(answer))));
+    }
     if head.uri.path() == "/log" {
         let line = format!(
             "{} {}, request {served} of boot id {boot_id}",
@@ -504,11 +525,7 @@ async fn answer(
         log.line(Stream::Stdout, line.as_bytes());
         log.line(Stream::Stderr, line.as_bytes());
     }
-    let received = body
-        .collect()
-        .await
-        .map(|b| b.to_bytes().len())
-        .unwrap_or(0);
+    let received = body.len();
     let forwarded = head
         .headers
         .get("x-forwarded-for")
@@ -534,4 +551,82 @@ async fn answer(
         head.version,
     );
     Ok(Response::new(Full::new(Bytes::from(text))))
+}
+
+/// Hello mode's `POST /egress?to=<host>:<port>[&rounds=N&reply=K]`: a connection of its
+/// own to `to`, as a process connects to a destination of the route's egress. Without
+/// `rounds` it sends the body, half-closes and reads the answer to its end; with it, it
+/// sends the body `rounds` times (0: none), reading `reply` bytes after each, and times
+/// the round trips. Its answer: how long connecting took, then the destination's answer,
+/// the round trips' times, or the error.
+async fn egress(query: &str, body: &[u8]) -> String {
+    let parameter = |name: &str| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+    };
+    let number = |name| parameter(name).and_then(|value| value.parse::<usize>().ok());
+    let Some(to) = parameter("to") else {
+        return "error: no to=<host>:<port>\n".into();
+    };
+    let started = Instant::now();
+    let mut stream = match tokio::net::TcpStream::connect(to).await {
+        Ok(stream) => stream,
+        Err(e) => return format!("error: {to}: {e}\n"),
+    };
+    let mut answer = format!("connected in {}us\n", started.elapsed().as_micros());
+    let _ = stream.set_nodelay(true);
+    let exchanged = match number("rounds") {
+        None => {
+            async {
+                stream.write_all(body).await?;
+                stream.shutdown().await?;
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).await?;
+                Ok(format!("answer: {}\n", String::from_utf8_lossy(&got)))
+            }
+            .await
+        }
+        Some(rounds) => {
+            async {
+                let mut reply = vec![0u8; number("reply").unwrap_or(0)];
+                let mut times = Vec::with_capacity(rounds);
+                for _ in 0..rounds {
+                    let round = Instant::now();
+                    stream.write_all(body).await?;
+                    stream.read_exact(&mut reply).await?;
+                    times.push(round.elapsed().as_micros());
+                }
+                Ok::<_, std::io::Error>(timed(&times))
+            }
+            .await
+        }
+    };
+    match exchanged {
+        Ok(more) => answer.push_str(&more),
+        Err(e) => answer.push_str(&format!("error: {e}\n")),
+    }
+    answer
+}
+
+/// Round trips' times, microseconds: the first's (the connection's setup with it), the
+/// others' percentiles.
+fn timed(times: &[u128]) -> String {
+    let Some((first, rest)) = times.split_first() else {
+        return "no round trip\n".into();
+    };
+    let mut rest = rest.to_vec();
+    rest.sort_unstable();
+    let at = |percent: usize| {
+        let at = (rest.len() * percent / 100).min(rest.len().saturating_sub(1));
+        rest.get(at).copied().unwrap_or_default()
+    };
+    format!(
+        "round trips: the first {first}us; the other {}: p50 {}us, p90 {}us, p99 {}us, max {}us\n",
+        rest.len(),
+        at(50),
+        at(90),
+        at(99),
+        rest.last().copied().unwrap_or_default()
+    )
 }

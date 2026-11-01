@@ -15,8 +15,10 @@ if [ -z "$guest" ]; then
 fi
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
-mkdir -p "$root"/{dev,proc,sys,tmp}
+mkdir -p "$root"/{dev,etc,proc,sys,tmp}
 install -m 0755 "$guest" "$root/init"
+# /init puts the names of a route's egress before these lines
+printf '127.0.0.1 localhost sluice\n' > "$root/etc/hosts"
 mkdir -p "$(dirname "$out")"
 rm -f "$out"
 truncate -s 16M "$out"

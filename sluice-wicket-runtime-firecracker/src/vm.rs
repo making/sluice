@@ -19,6 +19,11 @@
 //! In jail mode the keeper spawns the VMs, each in a jail ([`Place::Jail`], `keeper`,
 //! `jail`): `firecracker` sees its files at the jail's paths (`jail::KERNEL`, ...), the
 //! wicket reaches its sockets in the VM's directory.
+//!
+//! A route with egress has its guests' streams to the host's vsock port
+//! `wire::EGRESS_PORT` served by the wicket (`egress`): its VMs get the rules on their
+//! kernel command line (`wire::EGRESS_PARAMETER`), and the wicket listens at each one's
+//! socket for the port before it starts.
 
 use std::ffi::OsString;
 use std::os::fd::OwnedFd;
@@ -34,15 +39,17 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
 
 use crate::BoxError;
 use crate::capacity::Slot;
+use crate::egress::{self, Egress, Listening};
 use crate::jail;
 use crate::keeper::{Client, Role, Size, vm_file_size};
+use crate::wire::{self, Rule};
 
 /// Guest CID of every VM: each VM has its own vsock device, so they need not differ.
 const GUEST_CID: u32 = 3;
@@ -62,16 +69,22 @@ pub const LAUNCH: &str = "--launch-vm";
 /// vCPUs', event fds, its sockets, files and log.
 const VM_OWN_FILES: u64 = 128;
 
+/// The bytes of a route's egress rules a VM's kernel command line takes at most (2048 in
+/// all, Firecracker's parameters and the wicket's own among them).
+pub const MAX_EGRESS: usize = 1024;
+
 /// The soft open file limit of each `firecracker`, see [`set_open_files`].
 static VM_OPEN_FILES: AtomicU64 = AtomicU64::new(1024);
 
 /// Raises the wicket's soft open file limit to its hard one (a connection holds a
 /// vsock stream, a VM its sockets and log; a container's soft limit is often 1024),
 /// and sets each `firecracker`'s to `connections` (its vsock streams at most) plus its
-/// own. Returns both limits.
+/// egress streams and its own. Returns both limits.
 pub fn set_open_files(connections: usize) -> std::io::Result<(u64, u64)> {
     let hard = set_soft_open_files(u64::MAX)?;
-    let vm = (connections as u64).saturating_add(VM_OWN_FILES).min(hard);
+    let vm = (connections as u64)
+        .saturating_add(egress::MAX_CONNECTIONS as u64 + VM_OWN_FILES)
+        .min(hard);
     VM_OPEN_FILES.store(vm, Ordering::Relaxed);
     Ok((hard, vm))
 }
@@ -159,6 +172,15 @@ pub struct Spec {
     /// Jail mode: the host CPU time a VM may take, in percent of one CPU (its cgroup's
     /// `cpu.max`); None = its vCPUs bound it.
     pub cpu: Option<u32>,
+    /// The destinations its guests may connect to, through the wicket (sorted, once
+    /// each).
+    pub egress: Vec<Rule>,
+}
+
+/// `rules` as a VM's kernel command line and a route's target name them: `,` between.
+pub fn egress_list(rules: &[Rule]) -> String {
+    let rules: Vec<String> = rules.iter().map(Rule::to_string).collect();
+    rules.join(",")
 }
 
 impl Spec {
@@ -324,6 +346,8 @@ pub struct Vm {
     log: PathBuf,
     /// Its vsock socket as `firecracker` sees it.
     vsock_inside: PathBuf,
+    /// Its listener for the guest's egress streams, when its route has egress.
+    egress: Option<Listening>,
 }
 
 impl Vm {
@@ -340,8 +364,9 @@ impl Vm {
             .await
             .map_err(|e| format!("{}: {e}", dir.display()))?;
         let api = dir.join("api.sock");
-        // sun_path holds 108 bytes, its NUL included
-        if api.as_os_str().len() > 107 {
+        // sun_path holds 108 bytes, its NUL included; the egress's is the longest socket
+        let longest = dir.join(format!("v.sock_{}", wire::EGRESS_PORT));
+        if longest.as_os_str().len() > 107 {
             return Err(format!(
                 "{}: the VM's sockets need a path below 108 bytes; choose a shorter --state-dir",
                 dir.display()
@@ -378,6 +403,7 @@ impl Vm {
             vsock_inside: vsock.clone(),
             vsock,
             log,
+            egress: None,
         };
         vm.ready().await?;
         Ok(vm)
@@ -405,6 +431,7 @@ impl Vm {
             vsock: run.join("v.sock"),
             log: spawned.dir.join("firecracker.log"),
             vsock_inside: PathBuf::from(jail::VSOCK_SOCKET),
+            egress: None,
         };
         vm.ready().await?;
         Ok(vm)
@@ -433,9 +460,15 @@ impl Vm {
     }
 
     /// Boots a fresh VM of `spec` at `place` (cold boot), the route's shared VM or its
-    /// template (`role`).
-    pub async fn boot(spec: &Spec, place: &Place, role: Role, slot: Slot) -> Result<Vm, BoxError> {
-        let (vm, kernel, rootfs) = match place {
+    /// template (`role`); its egress served by `egress` as the VM named so.
+    pub async fn boot(
+        spec: &Spec,
+        place: &Place,
+        role: Role,
+        slot: Slot,
+        egress: Option<(&Arc<Egress>, String)>,
+    ) -> Result<Vm, BoxError> {
+        let (mut vm, kernel, rootfs) = match place {
             Place::Dir(dir) => (
                 Vm::spawn(
                     &spec.firecracker,
@@ -453,6 +486,7 @@ impl Vm {
                 PathBuf::from(jail::ROOTFS),
             ),
         };
+        vm.listen(egress)?;
         vm.api(
             "PUT",
             "/machine-config",
@@ -464,7 +498,7 @@ impl Vm {
             "/boot-source",
             json!({
                 "kernel_image_path": kernel,
-                "boot_args": boot_args(),
+                "boot_args": boot_args(&spec.egress),
             }),
         )
         .await?;
@@ -493,13 +527,15 @@ impl Vm {
 
     /// Clones a running VM from `snapshot` at `place` (the `n`th clone): its memory file
     /// is mapped private (copy on write), so clones share the pages they do not write.
+    /// Its egress is served by `egress`.
     pub async fn restore(
         snapshot: &Snapshot,
         place: &Place,
         n: u64,
         slot: Slot,
+        egress: Option<&Arc<Egress>>,
     ) -> Result<Vm, BoxError> {
-        let vm = match place {
+        let mut vm = match place {
             Place::Dir(dir) => {
                 let dir = dir.join("clones").join(format!("vm-{n}"));
                 let size = vm_file_size(Role::Clone, u64::from(snapshot.size.mem));
@@ -509,6 +545,7 @@ impl Vm {
                 Vm::jailed(keeper, *route, Role::Clone, snapshot.size, slot).await?
             }
         };
+        vm.listen(egress.map(|egress| (egress, format!("vm-{n}"))))?;
         vm.api(
             "PUT",
             "/snapshot/load",
@@ -559,6 +596,15 @@ impl Vm {
         Ok(snapshot)
     }
 
+    /// Listens for the guest's egress streams, served by `egress` as the VM named so:
+    /// before it starts, or is restored.
+    fn listen(&mut self, egress: Option<(&Arc<Egress>, String)>) -> Result<(), BoxError> {
+        if let Some((egress, name)) = egress {
+            self.egress = Some(egress.listen(&self.vsock, name)?);
+        }
+        Ok(())
+    }
+
     /// Opens a stream to the guest's vsock `port`.
     pub async fn dial(&self, port: u32) -> Result<UnixStream, BoxError> {
         let mut stream = UnixStream::connect(&self.vsock).await?;
@@ -566,7 +612,7 @@ impl Vm {
             .write_all(format!("CONNECT {port}\n").as_bytes())
             .await?;
         // what follows the line is the guest's
-        let line = read_short_line(&mut stream, 64)
+        let line = wire::read_short_line(&mut stream, 64)
             .await
             .map_err(|e| format!("vsock handshake: {e}"))?;
         if !line.starts_with(b"OK ") {
@@ -640,28 +686,6 @@ impl Drop for Vm {
     }
 }
 
-/// Reads a line of at most `max` bytes, its newline dropped, byte by byte: what follows
-/// it stays unread. A longer line is an error, and so is the end of the stream before it.
-pub async fn read_short_line<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    max: usize,
-) -> std::io::Result<Vec<u8>> {
-    let mut line = Vec::with_capacity(16);
-    loop {
-        let byte = reader.read_u8().await?;
-        if byte == b'\n' {
-            return Ok(line);
-        }
-        if line.len() == max {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("a line longer than {max} bytes"),
-            ));
-        }
-        line.push(byte);
-    }
-}
-
 /// The last lines of a VM's log at `path` (Firecracker's and the guest console's), read
 /// from its last 4KiB: for an error.
 pub fn log_tail(path: &Path) -> String {
@@ -682,8 +706,9 @@ pub fn log_tail(path: &Path) -> String {
 
 /// No serial console unless `SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE` is set (the kernel's and
 /// `/init`'s own output then goes to the VM's log; the processes' goes to the wicket's
-/// stdout / stderr regardless): printing to it is the slowest part of a boot.
-fn boot_args() -> String {
+/// stdout / stderr regardless): printing to it is the slowest part of a boot. The route's
+/// `egress`, if any, for `/init`.
+fn boot_args(egress: &[Rule]) -> String {
     let console = match std::env::var_os("SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE") {
         Some(_) => "console=ttyS0",
         None => "console=none 8250.nr_uarts=0",
@@ -694,5 +719,9 @@ fn boot_args() -> String {
         true => " pci=off clocksource=kvm-clock",
         false => "",
     };
-    format!("{console} reboot=k panic=1 quiet{arch} init=/init")
+    let egress = match egress {
+        [] => String::new(),
+        rules => format!(" {}={}", wire::EGRESS_PARAMETER, egress_list(rules)),
+    };
+    format!("{console} reboot=k panic=1 quiet{arch} init=/init{egress}")
 }

@@ -34,7 +34,10 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
                                   port=N (the guest's vsock port, 8080), per-client=N a
                                   client address's connections at once, idle-ms=N a
                                   connection may relay no byte, cpu=N (jail mode) a VM's
-                                  host CPU in percent of one
+                                  host CPU in percent of one, egress=<host>:<port>,... the
+                                  destinations its guests may connect to through the
+                                  wicket: names, addresses, ranges (10.0.0.0/24:5432,
+                                  [2001:db8::/32]:443)
   --config <file>                 YAML settings and routes, the routes reloaded on change
   --kernel <path>                 the guest kernel (vmlinux)
   --firecracker <path>            the firecracker binary (default firecracker on the PATH)
@@ -535,6 +538,7 @@ struct FileRoute {
     cpu: Option<u32>,
     per_client: Option<u32>,
     idle_ms: Option<u32>,
+    egress: Option<Vec<String>>,
 }
 
 impl FileRoute {
@@ -559,6 +563,7 @@ impl FileRoute {
                     .into_iter()
                     .filter_map(|(key, value)| Some((key, value?.to_string()))),
             )
+            .chain(self.egress.iter().map(|rules| ("egress", rules.join(","))))
             .collect()
     }
 }
@@ -633,7 +638,8 @@ mod tests {
              drain-grace: 5s\nflume: grpc://file:8002\nflume-token: from-file\n\
              flume-ca-cert: flume-ca.pem\njail-ids: 900000-900063\njail-user: from-file\n\
              routes:\n  - {host: a.local, rootfs: app.ext4, mode: per-connection, warm: 2, cpu: 50,\n     \
-             per-client: 4, idle-ms: 30000}\n",
+             per-client: 4, idle-ms: 30000, egress: [DB.internal:5432, '[2001:db8::/32]:443',\n     \
+             10.0.0.0/24:6379]}\n",
         )
         .unwrap();
         let vm = format!("b.local={}", rootfs.display());
@@ -681,10 +687,11 @@ mod tests {
         assert_eq!(
             settings.specs[0].target(),
             format!(
-                "firecracker:{}?mode=per-connection&cpu=50&warm=2&per-client=4&idle-ms=30000",
+                "firecracker:{}?mode=per-connection&cpu=50&warm=2&per-client=4&idle-ms=30000\
+                 &egress=db.internal:5432,10.0.0.0/24:6379,[2001:db8::/32]:443",
                 rootfs.display()
             ),
-            "the options set to other than their defaults"
+            "the options set to other than their defaults, the egress in one order"
         );
 
         let settings = run(
@@ -749,6 +756,9 @@ mod tests {
         let twice = format!("a.local={}", rootfs.display());
         let cpu = format!("c.local={}?cpu=50", rootfs.display());
         let no_share = format!("c.local={}?per-client=0", rootfs.display());
+        let no_port = format!("c.local={}?egress=db.internal", rootfs.display());
+        let egress: Vec<String> = (0..64).map(|n| format!("db-{n}.internal:5432")).collect();
+        let too_long = format!("c.local={}?egress={}", rootfs.display(), egress.join(","));
         for (args, error) in [
             (
                 vec!["--server", "s", "--kernel", "k", "--vm", &cpu],
@@ -757,6 +767,14 @@ mod tests {
             (
                 vec!["--server", "s", "--kernel", "k", "--vm", &no_share],
                 "per-client must be at least 1",
+            ),
+            (
+                vec!["--server", "s", "--kernel", "k", "--vm", &no_port],
+                "egress db.internal: expected <host>:<port>",
+            ),
+            (
+                vec!["--server", "s", "--kernel", "k", "--vm", &too_long],
+                "egress of 1269 bytes: a guest's kernel command line takes 1024",
             ),
             (vec!["--kernel", "k", "--vm", &vm], "--server or --listen"),
             (vec!["--server", "s", "--vm", &vm], "--kernel is required"),

@@ -22,12 +22,17 @@
 //! with `--flume` the live access log (`output`, through `sluice-wicket-tunnel`'s
 //! feed).
 //!
+//! The guests have no network device: their connections to the destinations of
+//! their route's `egress` reach the wicket over vsock, which connects to them
+//! (`egress`).
+//!
 //! In jail mode (`--jail-ids`) the process started as root is the keeper
 //! (`keeper`): it runs the wicket as `--jail-user` and spawns the VMs at its
 //! request, each in a jail of its own (`jail`).
 
 pub mod capacity;
 pub mod config;
+pub mod egress;
 pub mod jail;
 pub mod keeper;
 pub mod listener;

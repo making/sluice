@@ -7,8 +7,10 @@
 //! failed and their VMs ended, its clones restored with the clock of the
 //! moment and random state of their own; the VMs'
 //! output -- a shared VM's, a template's, a clone's -- on the wicket's stdout /
-//! stderr and on a flume (`sluice-wicket-tunnel`'s double); a reload of the
-//! `--config` file, polled, removing a route and replacing a rootfs.
+//! stderr and on a flume (`sluice-wicket-tunnel`'s double); the guests' egress to
+//! a destination on the host, by name, address, range and IPv6, from a shared VM
+//! and a clone, and its records; a reload of the `--config` file, polled,
+//! removing a route and replacing a rootfs.
 //!
 //! Skipped where `/dev/kvm` is not usable. Elsewhere it needs Firecracker
 //! (`SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER`, else `firecracker` on
@@ -127,6 +129,20 @@ async fn every_route_serves_http_through_the_tunnel() {
     // replaced below
     let dir = Scratch::new();
     std::fs::copy(&rootfs, dir.0.join("shared.ext4")).unwrap();
+    let (port, v6) = destination().await;
+    // the shared target's egress: the host's localhost, a name the host does not
+    // resolve, a range, addresses the guest routes to itself, IPv6 where the host has it
+    let mut shared_egress = vec![
+        format!("localhost:{port}"),
+        "db.invalid:5432".to_string(),
+        format!("127.0.0.0/8:{port}"),
+        format!("192.0.2.7:{port}"),
+        format!("'[2001:db8::/64]:{port}'"),
+    ];
+    if v6 {
+        shared_egress.push(format!("'[::1]:{port}'"));
+    }
+    let shared_egress = shared_egress.join(", ");
     let config = dir.0.join("wicket.yaml");
     // jailed, the clones' CPU limited by their cgroups
     let cpu = match jailed {
@@ -135,10 +151,11 @@ async fn every_route_serves_http_through_the_tunnel() {
     };
     let routes = format!(
         "watch-interval: 100ms\nroutes:\n\
-         - {{host: shared.local, rootfs: shared.ext4}}\n\
-         - {{host: clone.local, rootfs: {rootfs}, mode: per-connection, warm: 2{cpu}}}\n\
+         - {{host: shared.local, rootfs: shared.ext4, egress: [{shared_egress}]}}\n\
+         - {{host: clone.local, rootfs: {rootfs}, mode: per-connection, warm: 2{cpu}, \
+         egress: [localhost:{port}]}}\n\
          # the shared target again: its VM serves both hosts\n\
-         - {{host: alias.local, rootfs: shared.ext4, mode: shared}}\n",
+         - {{host: alias.local, rootfs: shared.ext4, mode: shared, egress: [{shared_egress}]}}\n",
         rootfs = rootfs.display()
     );
     let capped = format!(
@@ -226,7 +243,15 @@ async fn every_route_serves_http_through_the_tunnel() {
         assert!(checked.is_ok(), "{}: hung; {}", route.host, wicket.log());
     }
 
-    let output = output(&tunnel, &target, &mut conn_id, &wicket, &mut feed);
+    let egressed = egress(&tunnel, &target, &mut conn_id, &wicket, port, v6);
+    assert!(
+        tokio::time::timeout(HANG, egressed).await.is_ok(),
+        "the guests' egress: hung; {}",
+        wicket.log()
+    );
+
+    let egress = format!("localhost:{port}");
+    let output = output(&tunnel, &target, &mut conn_id, &wicket, &mut feed, &egress);
     assert!(
         tokio::time::timeout(HANG, output).await.is_ok(),
         "the VMs' output: hung; {}",
@@ -432,17 +457,139 @@ fn children(pid: i32) -> Vec<i32> {
         .collect()
 }
 
+/// The test's egress destination: answers `got <what it read>` once its client
+/// half-closed, at 127.0.0.1, 127.0.0.5 and, where the host has IPv6, ::1 (whether it
+/// does), all on one port.
+async fn destination() -> (u16, bool) {
+    let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = first.local_addr().unwrap().port();
+    let mut listeners = vec![
+        first,
+        tokio::net::TcpListener::bind(("127.0.0.5", port))
+            .await
+            .unwrap(),
+    ];
+    let v6 = tokio::net::TcpListener::bind(("::1", port)).await;
+    let v6 = v6.map(|listener| listeners.push(listener)).is_ok();
+    for listener in listeners {
+        tokio::spawn(async move {
+            while let Ok((mut connection, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut got = Vec::new();
+                    if connection.read_to_end(&mut got).await.is_ok() {
+                        let _ = connection.write_all(&[b"got ", &got[..]].concat()).await;
+                    }
+                });
+            }
+        });
+    }
+    (port, v6)
+}
+
+/// The guests' egress to the destination at `port` (with IPv6: `v6`): a shared VM's to
+/// the host's localhost, an address of a range and IPv6's are relayed both ways, the
+/// half-close passed on; a name the host does not resolve is reset in the guest, after
+/// the guest resolved it and connected; addresses outside 127.0.0.0/8 are the guest's to
+/// connect to; a clone's egress is its own VM's. Each is recorded on the wicket's
+/// stdout, named after the route's hosts and the VM, and the guest set its rules up
+/// without an error.
+async fn egress(
+    tunnel: &ServerTunnel,
+    target: &impl Fn(&str) -> String,
+    conn_id: &mut i64,
+    wicket: &Wicket,
+    port: u16,
+    v6: bool,
+) {
+    let route = |host| Route {
+        tunnel,
+        host,
+        address: dial_address(&target(host)),
+    };
+    let mut ask = async |route: &Route<'_>, query: String, body: &str| {
+        *conn_id += 1;
+        route
+            .post(*conn_id, &format!("/egress?{query}"), body)
+            .await
+    };
+    let shared = route("shared.local");
+    let mut relayed = vec![format!("localhost:{port}"), format!("127.0.0.5:{port}")];
+    if v6 {
+        relayed.push(format!("[::1]:{port}"));
+    }
+    for to in &relayed {
+        let answer = ask(&shared, format!("to={to}"), to).await;
+        assert!(
+            answer.ends_with(&format!("answer: got {to}\n")),
+            "{to}: {answer}"
+        );
+    }
+    let unresolved = ask(&shared, "to=db.invalid:5432".into(), "x").await;
+    assert!(
+        unresolved.starts_with("connected in ") && unresolved.contains("error: Connection reset"),
+        "{unresolved}"
+    );
+    for to in [format!("192.0.2.7:{port}"), format!("[2001:db8::9]:{port}")] {
+        let connected = ask(&shared, format!("to={to}&rounds=0"), "").await;
+        assert!(connected.starts_with("connected in "), "{to}: {connected}");
+    }
+    let to = format!("localhost:{port}");
+    let cloned = ask(&route("clone.local"), format!("to={to}"), "from a clone").await;
+    assert!(cloned.ends_with("answer: got from a clone\n"), "{cloned}");
+
+    let vm = "shared.local, alias.local vm-0";
+    let mut records: Vec<String> = relayed
+        .iter()
+        .map(|to| format!("egress [{vm}] {to} ("))
+        .collect();
+    records.push(format!("egress [{vm}] db.invalid:5432: failed: "));
+    records.push(format!(
+        "stdout [{vm}] :: guest: egress to db.invalid:5432 at 127.1.0.1, "
+    ));
+    let deadline = Instant::now() + HANG;
+    loop {
+        let log = std::fs::read_to_string(&wicket.log).unwrap_or_default();
+        let lines: Vec<&str> = log.lines().collect();
+        let of_clone = lines.iter().any(|line| {
+            line.strip_prefix("egress [clone.local vm-")
+                .and_then(|rest| rest.split_once("] "))
+                .is_some_and(|(n, rest)| {
+                    n.parse::<u64>().is_ok() && rest.starts_with(&format!("{to} ("))
+                })
+        });
+        if of_clone
+            && records
+                .iter()
+                .all(|record| lines.iter().any(|line| line.starts_with(record.as_str())))
+        {
+            let errors = lines
+                .iter()
+                .filter(|line| line.contains(":: guest: egress ") && line.starts_with("stderr"));
+            assert_eq!(errors.count(), 0, "{}", wicket.log());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the egress records: {records:?}; {}",
+            wicket.log()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// The VMs' output: the sample guest's line at its start and its two lines (stdout,
 /// stderr) per `/log` request, of a shared VM (serving two hosts), a template and a
 /// clone, reach the wicket's stdout / stderr named after the route's hosts and the VM,
 /// and the flume as lines of the route's first host naming the VM. A clone's lines are
-/// its own: the template's start line comes once, not again from its clones.
+/// its own: the template's start line comes once, not again from its clones. The
+/// shared VM's egress to `egress` is on the flume too.
 async fn output(
     tunnel: &ServerTunnel,
     target: &impl Fn(&str) -> String,
     conn_id: &mut i64,
     wicket: &Wicket,
     feed: &mut FeedStream,
+    egress: &str,
 ) {
     let route = |host| Route {
         tunnel,
@@ -518,6 +665,7 @@ async fn output(
             clone.as_str(),
             request("1", template),
         ),
+        ("egress", "shared.local", "vm-0", egress.to_string()),
     ];
     while !expected.iter().all(|line| fed.contains(line)) {
         let feed_message::Body::Event(event) = feed.next().await else {
@@ -527,17 +675,19 @@ async fn output(
             let field = event.fields.iter().find(|field| field.name == name);
             field.map(|field| field.value.clone()).unwrap_or_default()
         };
-        let (vm, line) = (field("vm"), field("line"));
+        let kind = match event.kind.as_str() {
+            "stdout" => "stdout",
+            "egress" => "egress",
+            _ => "stderr",
+        };
+        // of an egress line, its destination
+        let line = field(if kind == "egress" { "to" } else { "line" });
+        let vm = field("vm");
         let vm = expected
             .iter()
             .map(|(_, _, vm, _)| *vm)
             .find(|known| *known == vm)
             .unwrap_or("another");
-        let kind = if event.kind == "stdout" {
-            "stdout"
-        } else {
-            "stderr"
-        };
         let route = ["shared.local", "clone.local"]
             .into_iter()
             .find(|host| *host == event.route_key)
@@ -708,15 +858,26 @@ impl Route<'_> {
 
     /// A GET of `path` on a connection of its own; its answer.
     async fn get(&self, conn_id: i64, path: &str) -> String {
+        self.send(conn_id, "GET", path, "").await
+    }
+
+    /// A POST of `body` to `path` on a connection of its own; its answer.
+    async fn post(&self, conn_id: i64, path: &str, body: &str) -> String {
+        self.send(conn_id, "POST", path, body).await
+    }
+
+    async fn send(&self, conn_id: i64, method: &str, path: &str, body: &str) -> String {
         let io = TokioIo::new(self.tunnel.connect(conn_id, &self.address));
         let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await.unwrap();
         tokio::spawn(connection);
-        let request = hyper::Request::get(path)
+        let request = hyper::Request::builder()
+            .method(method)
+            .uri(path)
             .header("host", self.host)
-            .body(Full::new(Bytes::new()))
+            .body(Full::new(Bytes::from(body.to_string())))
             .unwrap();
         let response = sender.send_request(request).await.unwrap();
-        assert_eq!(response.status(), 200, "{}: GET {path}", self.host);
+        assert_eq!(response.status(), 200, "{}: {method} {path}", self.host);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8_lossy(&body).into_owned()
     }

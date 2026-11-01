@@ -229,34 +229,35 @@ pub fn follow(mut stream: UnixStream, sink: Arc<Sink>, hosts: Arc<Hosts>, vm: St
     Output { syncs, synced }
 }
 
+/// What a printer wrote, for the tests.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct Written(Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl Write for Written {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Written {
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use tokio::io::AsyncReadExt as _;
 
     use super::*;
-
-    /// What a printer wrote.
-    #[derive(Clone, Default)]
-    struct Written(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for Written {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl Written {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
 
     /// Syncs `output`, the guest double answering with `frames` before its answer.
     async fn synced(output: &mut Output, guest: &mut UnixStream, frames: &[LogFrame]) -> bool {

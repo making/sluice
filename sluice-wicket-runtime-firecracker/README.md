@@ -28,7 +28,9 @@ itself) or an OCI image converted by `scripts/cnb-rootfs.sh`, e.g. a Cloud Nativ
 Buildpacks image: `/init` starts the image's `Entrypoint` + `Cmd` as its `User` in its
 `WorkingDir` with its `Env` (and `PORT`), and opens the vsock port once the process
 accepts on `127.0.0.1:$PORT`. The process's output reaches the wicket's stdout / stderr,
-and with `--flume` the live access log (see [Output](#output-and-the-live-access-log)).
+and with `--flume` the live access log (see [Output](#output-and-the-live-access-log)). A
+guest has no network device: it connects to the destinations its route allows through
+the wicket (see [Egress](#egress)).
 
 In [jail mode](#jail-mode) (`--jail-ids`, started as root) every VM runs in a jail of its
 own: an id, namespaces, a root and a cgroup of its own, Firecracker's `jailer`'s isolation.
@@ -40,13 +42,14 @@ Two Cargo workspaces:
 - `.` -- the wicket: `src/lib.rs` wires the modules, `src/main.rs` reads the command line
   (`config.rs`); `routes.rs` the route table, its reload and the relay of a connection,
   `route.rs` a route's VMs, `capacity.rs` their budget, `vm.rs` one Firecracker VM,
-  `output.rs` the VMs' output, `wire.rs` the vsock framing and the restore notice,
+  `output.rs` the VMs' output, `egress.rs` their egress, `wire.rs` the vsock framing, the
+  restore notice and the egress rules,
   `listener.rs` `--listen`, `state.rs` the state dir; jail mode's `keeper.rs` (the
   privileged half, and the wicket's client of it) and `jail.rs` (one VM's jail, the VMs'
   cgroups)
 - `guest/` -- the VMs' `/init`, built for `x86_64-unknown-linux-musl` or
   `aarch64-unknown-linux-musl` (its `rust-toolchain.toml` has rustup add both, rust-lld
-  links the other arch's): `log.rs` the processes' output,
+  links the other arch's): `log.rs` the processes' output, `egress.rs` their egress,
   `reaper.rs` PID 1's reaping; `guest/src/wire.rs` is a copy of `src/wire.rs`: keep them
   alike
 - `scripts/` -- `build-guest.sh` (the sample rootfs), `cnb-rootfs.sh` (an OCI image's),
@@ -138,7 +141,7 @@ platform, `linux/arm64` or `linux/amd64`).
 `--vm host=<rootfs>[?<options>]` adds a route: `mode=shared|per-connection`, `vcpus=N` (1),
 `mem=MiB` (128), `port=N` (the guest's vsock port, 8080), `per-client=N`, `idle-ms=N`, `cpu=N`
 (jail mode) and, per connection, `warm=N`, `prime=N`, `vms=N` and `wait-ms=N` (see
-[Limits](#limits)). The advertised target is
+[Limits](#limits)), `egress=<host>:<port>,...` (see [Egress](#egress)). The advertised target is
 `firecracker:<rootfs>` plus the options set to other than their defaults; the server dials
 it verbatim, and the hosts of one target share its VMs. `--listen host:port` serves the sole
 route over plain TCP too (without `--server`, all the wicket does: a local loop for trying a
@@ -189,7 +192,8 @@ drain-grace: 20s
 routes:
   - {host: hello.local, rootfs: guest.ext4}
   - {host: app.local, rootfs: upstream.ext4, mode: per-connection, mem: 512, vcpus: 2,
-     prime: 200, warm: 4, vms: 16, wait-ms: 10000, per-client: 4, idle-ms: 30000}
+     prime: 200, warm: 4, vms: 16, wait-ms: 10000, per-client: 4, idle-ms: 30000,
+     egress: [db.internal:5432, 10.0.0.0/24:6379, '[2001:db8::/32]:443']}
 ```
 
 ### Reloading routes
@@ -293,6 +297,49 @@ A line's route key is the first host of its route (the hosts of one target share
 a reload keeping the VMs names their lines after its hosts from then on), and the VMs'
 drops reach the flume as gaps. The wicket relays a connection's bytes without reading
 them, so it logs no `response` lines: the server's access log has the requests.
+
+### Egress
+
+A guest has no network device: its connections leave the VM through the wicket, to the
+destinations of its route's `egress` alone (`egress=db.internal:5432,10.0.0.0/24:6379` in
+`--vm`, a list in the config file, an IPv6 rule quoted). A rule is TCP to a port of:
+
+- a name: `db.internal:5432`, which the wicket connects to as the host resolves it (a name
+  is trusted to resolve where it should). `localhost:6379` is the host's
+- an address or a range: `10.0.0.5:5432`, `10.0.0.0/24:5432`, `[2001:db8::5]:443`,
+  `[2001:db8::/32]:443`. `0.0.0.0/0:443` is every address, the host's own and link-local
+  ones (a cloud's metadata service) among them
+
+The process connects to them as named. Before it starts, `/init`:
+
+- gives each name an address of its own, 127.1.0.1 on, in `/etc/hosts` (the rootfs's, the
+  names first, bound over it: the rootfs needs one, the scripts write it); `localhost` stays
+  the guest's 127.0.0.1 and ::1
+- routes each address and range to the guest itself (a local route on `lo`)
+- listens at each name's address and each address, at the rule's port, and at every address
+  at a range's port: the process cannot listen at every address (`0.0.0.0`, Go's `:8080`)
+  on a rule's port, nor at all on a range's (on its own, `PORT`, `/init` says so)
+
+and relays each connection over vsock (port 1026) to the wicket. The wicket checks the
+destination against the route's rules (a guest's root may ask for any), connects within 10s
+and relays the connection, or refuses it: the process's connection is reset. A VM's egress
+connections open at once are 256 at most. Each is recorded once it ended or was refused, on
+the wicket's stdout and as an `egress` line of the route's first host in the live access
+log (`vm`, `to`, `peer`, `ms`, `out`, `in`, `error`):
+
+```text
+egress [app.local vm-3] db.internal:5432 (10.0.0.5:5432): 1532ms, 1234 bytes out, 15000 in
+egress [app.local vm-3] db.internal:5433: denied: not in the route's egress
+egress [app.local vm-3] cache.internal:6379: failed: Connection refused (os error 111)
+```
+
+The VM's output says what `/init` set up (`guest: egress to db.internal:5432 at 127.1.0.1,
+...`) and what it could not; a rootfs whose `/init` predates egress boots without it. A
+per-connection route's template has its egress (a process connecting at its start, or
+primed): a connection it left open is every clone's, and reset in each (a restore resets
+every vsock stream): a pool opens another. The sample guest's
+`POST /egress?to=<host>:<port>` connects as a process does: it sends the body, half-closes
+and answers with the answer (`&rounds=N&reply=K`: N round trips of K bytes, timed).
 
 ### Clones
 
@@ -431,9 +478,10 @@ What applies, in both modes unless said:
   VM's log (`firecracker.log` in the state dir, on a tmpfs: memory) is bounded at 16 MiB
   (`RLIMIT_FSIZE`, a template's at its `mem` more for its snapshot; past it Firecracker
   ends the VM), and a VM dumps no core (of its memory)
-- **network and disk**: none to filter or throttle: the VMs have no network interface
-  (vsock only; jailed, a network namespace without one either), their rootfs is read-only,
-  and the snapshots stay on the state dir's tmpfs
+- **network and disk**: the VMs have no network interface (vsock only; jailed, a network
+  namespace without one either): their [egress](#egress) is the wicket's connections, which
+  the host's firewall sees as the wicket's. Their rootfs is read-only, and the snapshots
+  stay on the state dir's tmpfs
 - **the jailer's isolation**: [jail mode](#jail-mode). Unjailed, every VM runs as the
   wicket's user: a guest escaping its `firecracker` (past KVM and seccomp) holds every VM's
   sockets and snapshots and the wicket's token, and the VMs have no cgroup of their own
@@ -487,7 +535,8 @@ docker run --rm --device /dev/kvm --group-add $(stat -c %g /dev/kvm) \
   The wicket is the container's PID 1: it drains on SIGTERM and reaps its VMs, no init
   needed
 - **open files**: the wicket raises its soft limit to the hard one (Docker's soft one is
-  1024) and gives each `firecracker` `--max-connections` + 128 (see [Findings](#findings))
+  1024) and gives each `firecracker` `--max-connections` + 384 (256 of them its egress, see
+  [Findings](#findings))
 - **`docker logs`** shows the VMs' output, each line named after its route and VM (see
   [Output](#output-and-the-live-access-log))
 
@@ -562,8 +611,9 @@ two VMs at most, one per client address, it checks http/1.1 with keep-alive, h2c
 under the tunnel's flow control and a client half-closing after its request, the clones'
 clock and random values, a client past its share, the connection finding no room, idle
 connections failed, the VMs' output (a shared VM's, a template's, a clone's)
-on the wicket's stdout / stderr and on a flume (`sluice-wicket-tunnel`'s double), and
-reloads of the config file. It needs Firecracker
+on the wicket's stdout / stderr and on a flume (`sluice-wicket-tunnel`'s double), the
+guests' egress (a shared VM's and a clone's, to a destination on the host by name, address,
+range and IPv6, and its records), and reloads of the config file. It needs Firecracker
 (`SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER`, else `firecracker` on the PATH) and a guest
 kernel (`SLUICE_WICKET_RUNTIME_FIRECRACKER_KERNEL`, else `~/.local/firecracker/vmlinux`), the
 variables of the wicket's own `--firecracker` and `--kernel`, and builds the sample rootfs.
@@ -633,7 +683,8 @@ Measured on a 64-core x86_64 host, through a sluice server on the same host, wit
 - **Firecracker's start grows with the open file limit**: it grows its file table to the
   soft `RLIMIT_NOFILE` at its start (`dup2` to the last descriptor), 2.6ms from spawn to
   API socket at 1024, 5.4ms at 1048576 (a login shell's limit here). The launcher sets
-  each `firecracker`'s to `--max-connections` + 128 (its vsock streams and its own); the
+  each `firecracker`'s to `--max-connections` + 384 (its vsock streams, 256 of them its
+  egress's, and its own); at + 128 the
   sample guest's clone rate at c=16 rose from 1,230 to 1,600 req/s (c=1: 545 to 650), the
   JVM's (bound by its guest) stayed. A container's default soft limit (1024) hid the cost.
 - **The clone rate is bound by the restores in flight**: one refill worker capped it at
@@ -658,6 +709,23 @@ Measured on a 64-core x86_64 host, through a sluice server on the same host, wit
   wait for the restore hook raced that reaping and now and then lost the hook's status
   (`restore notice: ERR No child process`, a clone failed). The reaper hands the hook its
   status instead: 44 hooked clones of the CNB Java image, none failed.
+- **Egress goes through the wicket, not a TAP device**: a TAP device per VM needs
+  `CAP_NET_ADMIN` (the [Docker image](#docker-image) runs without a capability) and an
+  address per VM, and would go into jail mode's network namespace, which the VMs share;
+  its filtering would be the host's firewall's. Over vsock, egress needs neither, works
+  alike in every mode, and the wicket checks, bounds and records each connection.
+- **The relay costs a database round trip about 0.2ms**: a Redis PING on one connection
+  (the sample guest's `POST /egress`, through `--listen`), p50 29-68us from the host (its
+  spread over runs), 277-295us from a guest of 1 vCPU through the wicket (p99 410-700us),
+  217-273us of 2 -- two loopback legs, `/init`'s and the wicket's relays and the vsock device
+  both ways. Over 16 connections the guest's vCPUs bound it: 13-15k round trips/s on 1 vCPU,
+  31-33k on 2 (the host's: 110-131k). A connection's first round trip, its setup with it:
+  1.3-1.9ms to an address, 2.0-2.3ms to `localhost` (the host's resolver); a connection per
+  request (`oha -c 16`): 2.3-2.7k req/s on 1 vCPU, 4.3k on 2 (11-12k and 20-23k for `GET /`).
+- **A runtime worker per core doubles the wicket's CPU per relayed request**: an egress round
+  trip took 55-69us of the wicket's CPU with the default workers (64 here), 25-30us with one
+  (`TOKIO_WORKER_THREADS=1`), at the same rate; a keep-alive request on `--listen` 75us
+  against 27us, at 17k req/s against 25k.
 
 [Jail mode](#jail-mode), on the same host through `--listen` (no server), `oha` for 5s:
 
@@ -720,5 +788,5 @@ Caveats:
 
 ## Not yet
 
-Clone reuse and pools of shared VMs, CPU limits without the jail, and the wasm wicket's
-console.
+Clone reuse and pools of shared VMs, CPU limits without the jail, the wasm wicket's
+console, and egress over UDP or to names a route does not list (`*.example.com`).

@@ -16,10 +16,11 @@ use tokio::sync::mpsc;
 
 use crate::BoxError;
 use crate::capacity::{Capacity, Need, Pool, Slot};
+use crate::egress::Egress;
 use crate::keeper::Role;
 use crate::output::{self, Hosts, Output, Sink};
-use crate::vm::{Place, Places, Snapshot, Spec, Vm};
-use crate::wire;
+use crate::vm::{self, Place, Places, Snapshot, Spec, Vm};
+use crate::wire::{self, Rule};
 
 /// How long a cold-booted guest may take to listen on its port.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -96,7 +97,7 @@ pub struct RouteSpec {
 }
 
 impl RouteSpec {
-    /// Parses `host=<rootfs>[?mode=shared|per-connection&vcpus=N&mem=MiB&cpu=N&port=N&warm=N&prime=N&vms=N&wait-ms=N&per-client=N&idle-ms=N]`.
+    /// Parses `host=<rootfs>[?mode=shared|per-connection&vcpus=N&mem=MiB&cpu=N&port=N&warm=N&prime=N&vms=N&wait-ms=N&per-client=N&idle-ms=N&egress=<rule>,...]`.
     pub fn parse(
         flag: &str,
         firecracker: &std::path::Path,
@@ -140,6 +141,7 @@ impl RouteSpec {
                 vcpus: 1,
                 mem_mib: 128,
                 cpu: None,
+                egress: Vec::new(),
             },
             mode: Mode::Shared,
             port: 8080,
@@ -178,8 +180,26 @@ impl RouteSpec {
                 "cpu" => spec.vm.cpu = Some(positive()?),
                 "per-client" => spec.per_client = Some(positive()? as usize),
                 "idle-ms" => spec.idle = Some(Duration::from_millis(u64::from(positive()?))),
+                "egress" => {
+                    for rule in value.split(',').filter(|rule| !rule.is_empty()) {
+                        let rule: Rule =
+                            rule.parse().map_err(|e| format!("{named}: egress {e}"))?;
+                        spec.vm.egress.push(rule);
+                    }
+                }
                 _ => return Err(format!("{named}: unknown key {key}")),
             }
+        }
+        // one order and each rule once: the target names them
+        spec.vm.egress.sort();
+        spec.vm.egress.dedup();
+        let egress = vm::egress_list(&spec.vm.egress).len();
+        if egress > vm::MAX_EGRESS {
+            return Err(format!(
+                "{named}: egress of {egress} bytes: a guest's kernel command line takes {} \
+                 (a range takes the place of its addresses)",
+                vm::MAX_EGRESS
+            ));
         }
         let per_connection = spec.mode == Mode::PerConnection;
         if !per_connection && (spec.warm > 0 || spec.prime > 0 || spec.vms.is_some()) {
@@ -249,6 +269,9 @@ impl RouteSpec {
             if value != default {
                 options.push(format!("{key}={value}"));
             }
+        }
+        if !self.vm.egress.is_empty() {
+            options.push(format!("egress={}", vm::egress_list(&self.vm.egress)));
         }
         let rootfs = self.vm.rootfs.display();
         match options.join("&") {
@@ -378,6 +401,8 @@ struct Cloner {
     hosts: Arc<Hosts>,
     /// Whether the guest sends its output: its template's did.
     output: bool,
+    /// The route's egress, if it has any.
+    egress: Option<Arc<Egress>>,
 }
 
 impl Cloner {
@@ -386,7 +411,7 @@ impl Cloner {
     /// then on.
     async fn restore(&self, slot: Slot) -> Result<Cloned, BoxError> {
         let n = self.next.fetch_add(1, Ordering::Relaxed);
-        let vm = Vm::restore(&self.snapshot, &self.place, n, slot).await?;
+        let vm = Vm::restore(&self.snapshot, &self.place, n, slot, self.egress.as_ref()).await?;
         let mut seed = [0u8; 32];
         // SAFETY: getrandom into a buffer of its length
         if unsafe { libc::getrandom(seed.as_mut_ptr().cast(), seed.len(), 0) }
@@ -469,7 +494,10 @@ impl Route {
             Mode::Shared => ("vm-0", Role::Shared),
             Mode::PerConnection => ("template", Role::Template),
         };
-        let vm = Vm::boot(&spec.vm, &place, role, slot).await?;
+        let egress = (!spec.vm.egress.is_empty())
+            .then(|| Egress::new(spec.vm.egress.clone(), hosts.clone(), sink.clone()));
+        let named = egress.as_ref().map(|egress| (egress, name.to_string()));
+        let vm = Vm::boot(&spec.vm, &place, role, slot, named).await?;
         let mut output = ready(&vm, spec.port, &sink, &hosts, name).await?;
         let booted = started.elapsed();
         let backend = match spec.mode {
@@ -526,6 +554,7 @@ impl Route {
                     sink,
                     hosts: hosts.clone(),
                     output: output.is_some(),
+                    egress,
                 });
                 let (refill, warm) = mpsc::channel(spec.warm.max(1));
                 let warm = Arc::new(Warm {
@@ -667,7 +696,7 @@ async fn notify<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(), BoxError> {
     let answered = async {
         stream.write_all(notice.line().as_bytes()).await?;
-        crate::vm::read_short_line(stream, MAX_NOTICE_ANSWER).await
+        wire::read_short_line(stream, MAX_NOTICE_ANSWER).await
     };
     let answer = tokio::time::timeout(RESTORE_TIMEOUT, answered)
         .await
