@@ -55,7 +55,10 @@ usage: sluice-wicket-wasi --server <url> --wasm <host>=<locator>[?<options>] ...
   --oidc-ca-cert <path>           PEM CA verifying the provider (default the webPKI roots)
   --keyvalue-file <path>          the SQLite file of the keyvalue store without a keyvalue
                                   section in the --config file (default keyvalue.db)
-  --token <token>                 bearer token of the tunnel streams
+  --token <token>                 bearer token of the tunnel streams (on the command line
+                                  every user of the host sees it: prefer the environment,
+                                  the config file or --token-file)
+  --token-file <path>             read the token from a file instead
   --client-id <id>                client identity (default a random UUID)
   --ca-cert <path>                PEM CA verifying a grpcs:// server (default the webPKI roots)
   --insecure                      skip the verification of a grpcs:// server
@@ -154,6 +157,7 @@ struct Flags {
     server: Option<String>,
     listen: Option<String>,
     token: Option<String>,
+    token_file: Option<PathBuf>,
     client_id: Option<String>,
     insecure: bool,
     ca_cert: Option<PathBuf>,
@@ -184,6 +188,7 @@ const VALUED: &[&str] = &[
     "server",
     "listen",
     "token",
+    "token-file",
     "client-id",
     "ca-cert",
     "max-connections",
@@ -282,6 +287,7 @@ pub fn parse(
         server: value("server"),
         listen: value("listen"),
         token: value("token"),
+        token_file: value("token-file").map(PathBuf::from),
         client_id: value("client-id"),
         insecure: insecure
             || env("SLUICE_WICKET_WASI_INSECURE").is_some_and(|value| value == "true"),
@@ -485,10 +491,25 @@ fn merge(flags: Flags) -> Result<Settings, String> {
         "watch-interval",
         DEFAULT_WATCH_INTERVAL,
     )?;
-    let token = flags
-        .token
-        .or_else(|| settings.token.clone())
-        .unwrap_or_default();
+    // a token given, else the file holding it: the flag's (or environment's)
+    // over the config file's
+    let read = |named: String, path: &Path| {
+        std::fs::read_to_string(path)
+            .map(|token| token.trim().to_string())
+            .map_err(|e| format!("{named} {}: {e}", path.display()))
+    };
+    let token = match (
+        flags.token,
+        flags.token_file,
+        &settings.token,
+        &settings.token_file,
+    ) {
+        (Some(token), _, _, _) => token,
+        (None, Some(path), _, _) => read("--token-file".into(), &path)?,
+        (None, None, Some(token), _) => token.clone(),
+        (None, None, None, Some(path)) => read(key("token-file"), &dir.join(path))?,
+        (None, None, None, None) => String::new(),
+    };
     // same default policy as the Java client: random id unless set
     let client_id = flags
         .client_id
@@ -695,6 +716,7 @@ struct File {
     server: Option<String>,
     listen: Option<String>,
     token: Option<String>,
+    token_file: Option<PathBuf>,
     client_id: Option<String>,
     insecure: Option<bool>,
     ca_cert: Option<PathBuf>,
@@ -773,6 +795,7 @@ impl File {
             server => "server",
             listen => "listen",
             token => "token",
+            token_file => "token-file",
             client_id => "client-id",
             insecure => "insecure",
             ca_cert => "ca-cert",
@@ -1565,6 +1588,20 @@ routes:
         assert_eq!(flagged.ca_cert, Some(PathBuf::from("flag.pem")));
         assert_eq!(flagged.stall_timeout, Duration::from_secs(90), "the file's");
         assert_eq!(flagged.token, file.token, "an empty variable is unset");
+        // a token file, the flag's over the file's token
+        let token_file = dir.0.join("token");
+        std::fs::write(&token_file, "from-token-file\n").unwrap();
+        let by_file = settings_over(
+            &[
+                "--config",
+                config,
+                "--token-file",
+                token_file.to_str().unwrap(),
+            ],
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(by_file.token, "from-token-file");
         let console = flagged.console.as_ref().expect("the file's console");
         assert_eq!(console.dir, PathBuf::from("/var/kept"));
         assert_eq!(console.token.as_deref(), Some("t0ken"));

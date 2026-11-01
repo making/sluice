@@ -89,6 +89,8 @@ pub async fn run(settings: config::Settings, state_dir: PathBuf) -> Result<(), B
         }
         None => None,
     };
+    let (open_files, vm_open_files) = vm::set_open_files(max_connections)?;
+    println!("open file limit {open_files}, each VM's {vm_open_files}");
     let capacity = Capacity::new(max_vms, max_memory);
     println!(
         "VM limit {max_vms}, guest memory limit {}",

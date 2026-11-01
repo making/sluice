@@ -5,18 +5,24 @@
 # Usage: scripts/cnb-rootfs.sh <image> <out.ext4> [port]   (port: the process's, default 8080)
 # SLUICE_RESTORE='["<program>", "<arg>", ...]' sets the restore hook, which /init runs in
 # each clone as the image's user before the clone serves (SLUICE_RESTORE_GENERATION set).
+# SLUICE_GUEST=<path> takes a guest built already (as scripts/build-guest.sh does).
 # Needs docker and sudo (the files keep the image's owners).
 set -euo pipefail
+# before the cd: a path relative to the caller's directory
+guest=${SLUICE_GUEST:+$(realpath "$SLUICE_GUEST")}
 cd "$(dirname "$0")/.."
 image=$1 out=$2 port=${3:-8080}
-(cd guest && cargo build --release --target x86_64-unknown-linux-musl)
+if [ -z "$guest" ]; then
+  (cd guest && cargo build --release --target x86_64-unknown-linux-musl)
+  guest=guest/target/x86_64-unknown-linux-musl/release/sluice-firecracker-guest
+fi
 work=$(mktemp -d)
 trap 'sudo rm -rf "$work"; [ -n "${cid:-}" ] && docker rm -f "$cid" >/dev/null' EXIT
 cid=$(docker create "$image")
 docker inspect --format '{{json .Config}}' "$image" > "$work/config.json"
 mkdir "$work/root"
 docker export "$cid" | sudo tar -xpf - -C "$work/root"
-sudo install -m 0755 guest/target/x86_64-unknown-linux-musl/release/sluice-firecracker-guest "$work/root/init"
+sudo install -m 0755 "$guest" "$work/root/init"
 # docker export leaves the files docker bind mounts empty
 printf '127.0.0.1 localhost sluice\n' | sudo tee "$work/root/etc/hosts" >/dev/null
 sudo mkdir -p "$work/root/sluice"

@@ -46,7 +46,8 @@ Two Cargo workspaces:
 ## Setup
 
 x86_64 Linux with KVM (bare metal, or a VM with nested virtualization): `/dev/kvm` must
-exist. Ubuntu 24.04 was used; the versions below are the ones tested.
+exist. Ubuntu 24.04 was used; the versions below are the ones tested. The
+[Docker image](#docker-image) holds steps 2 and 3.
 
 1. Access to `/dev/kvm` through the `kvm` group (an ACL set by hand is rewritten by udev):
 
@@ -128,10 +129,16 @@ route over plain TCP too (without `--server`, all the wicket does: a local loop 
 rootfs; `scripts/try.sh <rootfs> '<options>' [port]` runs the debug build so).
 `--firecracker` names the binary (default `firecracker` on the PATH), `--state-dir` the VMs'
 files (their Unix sockets need paths below 108 bytes; the default is a directory of the
-process's own under the system's temp dir, removed at the end; a `--state-dir` given gets a
-`route-<n>` directory per route started, removed with it).
+process's own, 0700, under `$XDG_RUNTIME_DIR` (a tmpfs where systemd sets it), else the
+system's temp dir, removed at the end; a `--state-dir` given gets a `route-<n>` directory
+(0700) per route started, removed with it). A per-connection route's snapshot there is its
+template's whole memory, unencrypted: keep the state dir on a tmpfs (the wicket warns
+otherwise), or it is on disk until the route ends, and after a crash. The tmpfs must hold
+every per-connection route's `mem` (systemd sizes `$XDG_RUNTIME_DIR` to 10% of the host's
+memory: `RuntimeDirectorySize` in `logind.conf`).
 
-The tunnel's settings are `sluice-wicket-wasi`'s: `--token`, `--client-id`, `--ca-cert`,
+The tunnel's settings are `sluice-wicket-wasi`'s: `--token` (or `--token-file`; on the
+command line every user of the host sees it), `--client-id`, `--ca-cert`,
 `--insecure` (`grpcs://`), `--max-connections` (256), `--tunnel-stall-timeout` (60s) and
 `--drain-grace` (20s: SIGTERM / SIGINT withdraw the routes and end the streams once their
 connections ended; a second signal ends at once). Each also reads
@@ -149,7 +156,7 @@ routed once.
 
 ```yaml
 server: grpc://127.0.0.1:8001
-token: ${SLUICE_TOKEN}
+token: ${SLUICE_TOKEN}           # or token-file: <path>
 kernel: /opt/firecracker/vmlinux
 firecracker: firecracker        # on the PATH
 max-vms: 64
@@ -216,8 +223,78 @@ A clone's memory is its snapshot's. What the wicket and `/init` do about it:
   `/sluice/init.json`) runs as the image's user with `SLUICE_RESTORE_GENERATION` set, before
   the clone serves; a hook failing fails the clone. A rootfs whose `/init` predates the notice
   fails a per-connection route's start
+- **secrets**: what the process generated before the snapshot (a key pair, a session
+  ticket key, a token) is every clone's alike, the reseed changes the generators, not what
+  they produced: generate such secrets in the restore hook, or after it
 
 The kernel's boot id remains the snapshot's.
+
+## Docker image
+
+`Dockerfile` (built from the repository root:
+`docker build -f sluice-wicket-firecracker/Dockerfile --build-arg GIT_COMMIT=$(git rev-parse HEAD) .`;
+published as `ghcr.io/making/sluice/sluice-wicket-firecracker`, amd64 only) holds the wicket,
+Firecracker v1.17.0 and the 6.18.56 kernel above (both checksum verified), the guest of the
+wicket's own version and the sample rootfs, under `/usr/local/share/sluice-wicket-firecracker/`.
+The host needs KVM (bare metal, or a VM with nested virtualization); the container needs
+`/dev/kvm` and its group alone (no `--privileged`, no capability: vsock only), and runs under
+Docker's default seccomp profile, Firecracker's own filters stacked on it:
+
+```text
+docker run --rm --device /dev/kvm --group-add $(stat -c %g /dev/kvm) \
+    --tmpfs /run/sluice --memory 1g --stop-timeout 30 \
+    --add-host host.docker.internal:host-gateway -e SLUICE_WICKET_FIRECRACKER_TOKEN=SECRET \
+    ghcr.io/making/sluice/sluice-wicket-firecracker \
+    --server grpc://host.docker.internal:8001 \
+    --vm hello.local=/usr/local/share/sluice-wicket-firecracker/guest.ext4
+```
+
+- **its environment** sets `KERNEL`, `FIRECRACKER` and `STATE_DIR`
+  (`SLUICE_WICKET_FIRECRACKER_<NAME>`), which win over a `--config` file's keys; `-e`
+  overrides them
+- **rootfs images** come in through a volume (`-v $PWD/rootfs:/rootfs:ro`), readable by the
+  image's user (65532). Their `/init` must be the image's guest (a rootfs without the restore
+  notice fails a per-connection route): build them with it, `docker create --name guest
+  <image>`, `docker cp guest:/usr/local/share/sluice-wicket-firecracker/init init`,
+  `docker rm guest`, then `SLUICE_GUEST=init scripts/cnb-rootfs.sh ...` (or
+  `scripts/build-guest.sh`); the scripts stay out of the image (they need docker and sudo)
+- **`/run/sluice`**, the state dir, on a tmpfs (`--tmpfs`): the snapshots stay off the disk;
+  the wicket warns otherwise
+- **`--stop-timeout`** above `--drain-grace` (20s; Docker's default stop timeout is 10s).
+  The wicket is the container's PID 1: it drains on SIGTERM and reaps its VMs, no init
+  needed
+- **open files**: the wicket raises its soft limit to the hard one (Docker's soft one is
+  1024) and gives each `firecracker` `--max-connections` + 128 (see [Findings](#findings))
+
+The VMs' memory counts against the container's memory cgroup: a VM's guest memory as the
+guest touches it, the `firecracker` process's few MiB, and a per-connection route's snapshot
+on the tmpfs, its `mem` whole (shmem: never reclaimed without swap). Measured:
+
+| | container memory |
+|---|---|
+| shared VM, sample guest | 60 MiB |
+| shared VM, CNB Java (2 vCPUs, 512 MiB), after a load | 212 MiB |
+| VM per connection, sample guest, warm=16 | 175 MiB (128 snapshot) |
+| VM per connection, CNB Java, prime=200, warm=16 | 602 MiB (512 snapshot); 694 MiB at start, the template beside its snapshot |
+| the same, 48 keep-alive connections at 17k req/s | 3,277 MiB peak: about 56 MiB per busy JVM clone |
+
+An idle clone costs its dirty pages (1-4 MiB here), a busy one up to its `mem`. The bound
+to set (`--memory`, a Pod's limit): `--max-memory` (every VM at its `mem`; without it,
+`--max-vms` x the largest `mem`) plus each per-connection route's `mem` (its snapshot; twice
+while a reload restarts it and the old clones live) plus 64 MiB for the wicket. Past it,
+the kernel's OOM killer ends a `firecracker` or the wicket.
+
+Through the image (`--network host` or a bridge, the same host) the [Findings](#findings)
+cases are within the spread of runs outside it: two runs each, e.g. a shared VM on 2 vCPUs
+13.5-13.8k keep-alive req/s (outside 13.8-13.9k, bridged 13.6-13.9k), a VM per connection
+1,603-1,614 new connections/s (outside 1,598-1,615, bridged 1,614-1,652), CNB Java per
+connection 647-737 (outside 623-672).
+
+Kubernetes: `/dev/kvm` reaches a Pod through a device plugin (KubeVirt's
+`devices.kubevirt.io/kvm`, or a generic one), or a privileged container;
+`securityContext.supplementalGroups` holds the node's `kvm` gid, `/run/sluice` is an
+`emptyDir` of `medium: Memory` (counted against the Pod's memory limit), and
+`terminationGracePeriodSeconds` exceeds `--drain-grace`.
 
 ## Tests
 
@@ -257,7 +334,7 @@ Measured on a 64-core x86_64 host, through a sluice server on the same host, wit
 | shared VM, CNB Java (Jetty, 2 vCPUs, 512 MiB) | 2.0s | 8,228 | - |
 | shared VM, CNB Go | 0.74s | 8,382 | - |
 | shared VM, CNB Go, 4 vCPUs | 0.77s | 14,991 | - |
-| VM per connection, sample guest, warm=16 | - | - | 1,211 (17.9ms); c=1: 536 (1.6ms) |
+| VM per connection, sample guest, warm=16 | - | - | 1,600 (13.3ms); c=1: 650 (1.5ms) |
 | VM per connection, CNB Java (2 vCPUs, 512 MiB), prime=200, warm=16 | - | - | 689 (18.1ms); c=1: 130 (7.2ms) |
 
 - **vsock carries no half-close** (Firecracker v1.17.0 `csm/connection.rs`): the host
@@ -287,6 +364,12 @@ Measured on a 64-core x86_64 host, through a sluice server on the same host, wit
   (`--launch-vm`, no page table copy) that sets the signal, checks its parent and execs
   `firecracker`: the clone rate at c=16 rose from 549 to 773 req/s, the c=1 latency fell
   from 3.5 to 2.5ms. A VM still never outlives the wicket (`kill -9` checked).
+- **Firecracker's start grows with the open file limit**: it grows its file table to the
+  soft `RLIMIT_NOFILE` at its start (`dup2` to the last descriptor), 2.6ms from spawn to
+  API socket at 1024, 5.4ms at 1048576 (a login shell's limit here). The launcher sets
+  each `firecracker`'s to `--max-connections` + 128 (its vsock streams and its own); the
+  sample guest's clone rate at c=16 rose from 1,230 to 1,600 req/s (c=1: 545 to 650), the
+  JVM's (bound by its guest) stayed. A container's default soft limit (1024) hid the cost.
 - **The clone rate is bound by the restores in flight**: one refill worker capped it at
   about 230 VMs/s (1 / 4ms), 8 workers lift it further; the restore notice's round trip at
   refill time, before a clone is handed out, also takes the clone's first page faults out
@@ -315,6 +398,5 @@ Caveats:
 
 ## Not yet
 
-The jailer (chroot, cgroups, seccomp) and aarch64 (`.todo` items of their own), a Docker
-image (`.todo` 182), clone reuse and pools of shared VMs (`.todo` 181), and the wasm
-wicket's console and live access log.
+The jailer (chroot, cgroups, seccomp) and aarch64 (`.todo` items of their own), clone reuse
+and pools of shared VMs (`.todo` 181), and the wasm wicket's console and live access log.

@@ -1,5 +1,6 @@
 //! A route: the VMs serving one host, and how a connection gets one of them.
 
+use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -152,11 +153,17 @@ impl RouteSpec {
         {
             return Err(format!("{named}: vms must be at least 1 and at least warm"));
         }
-        if !spec.vm.rootfs.is_file() {
-            return Err(format!(
-                "{named}: {} is not a file",
-                spec.vm.rootfs.display()
-            ));
+        // opened: a file the wicket's user cannot read fails here, not in the VM
+        let rootfs = std::fs::File::open(&spec.vm.rootfs).and_then(|file| file.metadata());
+        match rootfs {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "{named}: {} is not a file",
+                    spec.vm.rootfs.display()
+                ));
+            }
+            Err(e) => return Err(format!("{named}: {}: {e}", spec.vm.rootfs.display())),
         }
         Ok(spec)
     }
@@ -284,6 +291,11 @@ impl Route {
             .take(need, START_WAIT)
             .await
             .map_err(|e| format!("route {label}: {e}"))?;
+        // the snapshot is the template's whole memory: the wicket's user's alone
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| format!("route {label}: {}: {e}", dir.display()))?;
         let started = Instant::now();
         let vm = Vm::boot(&spec.vm, dir.join("boot"), slot).await?;
         drop(vm.dial_ready(spec.port, BOOT_TIMEOUT).await?);

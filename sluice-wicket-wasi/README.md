@@ -92,6 +92,9 @@ is created without a `--config` file (`/data/keyvalue.db`): mount a volume there
 `SLUICE_WICKET_WASI_<NAME>` from the environment (upper case, `-` as `_`, e.g.
 `SLUICE_WICKET_WASI_TOKEN`; `SLUICE_WICKET_WASI_INSECURE=true`), and takes its value as
 `--name value` or `--name=value`.
+A token on the command line is in `/proc/<pid>/cmdline`, which every user of the host
+reads: give the tunnel's in the environment, the config file or a file
+(`--token-file <path>`, `token-file`).
 
 `--version` prints the build: version, git commit (with `dirty` when tracked files had
 uncommitted changes) and build time, embedded by `build.rs` (`sluice-build-info`) when the
@@ -190,6 +193,7 @@ at startup and added by a reload.
 ```yaml
 server: grpc://127.0.0.1:8001
 token: ${SLUICE_TOKEN}          # an environment variable
+# token-file: /run/secrets/token  # or a file holding it
 client-id: ${HOSTNAME:-wicket}  # with a default
 # insecure: true
 # ca-cert: ca.pem               # relative to this file

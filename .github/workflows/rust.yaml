@@ -1,8 +1,9 @@
 name: Rust
 # The Rust crates' own gates, apart from CI: a Java-only change runs none of them, and
 # each crate's job runs only when its paths changed. CI still builds sluice-flume for the
-# sluice-it tests. A run with the sluice-flume / sluice-wicket-wasi / sluice-wicket-cf-api
-# job passed deploys its image (deploy-flume.yaml / deploy-wicket.yaml / deploy-cf-api.yaml).
+# sluice-it tests. A run with the sluice-flume / sluice-wicket-wasi / sluice-wicket-cf-api /
+# sluice-wicket-firecracker job passed deploys its image (deploy-flume.yaml /
+# deploy-wicket.yaml / deploy-cf-api.yaml / deploy-firecracker.yaml).
 on:
   push:
     branches:
@@ -20,6 +21,7 @@ on:
     - '.github/workflows/deploy-flume.yaml'
     - '.github/workflows/deploy-wicket.yaml'
     - '.github/workflows/deploy-cf-api.yaml'
+    - '.github/workflows/deploy-firecracker.yaml'
   pull_request:
     branches:
     - main
@@ -88,9 +90,11 @@ jobs:
           - '.github/workflows/deploy-cf-api.yaml'
           firecracker:
           - 'sluice-wicket-firecracker/**'
+          - 'sluice-build-info/**'
           - 'sluice-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
+          - '.github/workflows/deploy-firecracker.yaml'
   sluice-build-info:
     needs: changes
     if: needs.changes.outputs.build-info == 'true'
@@ -347,3 +351,9 @@ jobs:
       run: |
         cargo test --locked
         (cd guest && cargo test --locked)
+    # the VM test again, the wicket run as its image (Dockerfile) as the README runs it
+    - name: Test the image
+      run: |
+        if [ ! -e /dev/kvm ]; then echo "no /dev/kvm: skipped"; exit 0; fi
+        docker build -f Dockerfile --build-arg GIT_COMMIT=${GITHUB_SHA} -t sluice-wicket-firecracker:ci ..
+        SLUICE_FIRECRACKER_IMAGE=sluice-wicket-firecracker:ci cargo test --locked --test vm

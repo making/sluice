@@ -13,6 +13,11 @@
 //! (`scripts/build-guest.sh`). `SLUICE_FIRECRACKER_VMS` adds routes (`--vm`
 //! values, whitespace-separated, e.g. a CNB image's rootfs), whose answers
 //! are checked by their status alone.
+//!
+//! `SLUICE_FIRECRACKER_IMAGE=<image>` runs the wicket as that Docker image
+//! (`Dockerfile`) instead, with its Firecracker and kernel, as the README
+//! runs it: `/dev/kvm` and its group alone, Docker's default seccomp profile,
+//! the state dir on a tmpfs.
 #![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
@@ -31,6 +36,20 @@ const HANG: Duration = Duration::from_secs(120);
 /// The POST's body.
 const UPLOAD: usize = 5_000_000;
 
+/// The launcher (`--launch-vm`) execs the program with the soft open file
+/// limit given: Firecracker grows its file table to the limit at its start, a
+/// cost that grows with it (3ms at 1048576).
+#[test]
+fn the_launcher_execs_with_the_open_file_limit_given() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-firecracker"))
+        .args(["--launch-vm", &std::process::id().to_string(), "1100"])
+        .args(["/bin/sh", "-c", "ulimit -Sn"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1100");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn every_route_serves_http_through_the_tunnel() {
     if std::fs::OpenOptions::new()
@@ -42,7 +61,9 @@ async fn every_route_serves_http_through_the_tunnel() {
         eprintln!("skipped: /dev/kvm is not usable here (the kvm group: sg kvm -c 'cargo test')");
         return;
     }
-    let (firecracker, kernel) = tools();
+    let image = std::env::var("SLUICE_FIRECRACKER_IMAGE")
+        .ok()
+        .filter(|image| !image.is_empty());
     let rootfs = sample_rootfs();
     let extra: Vec<String> = std::env::var("SLUICE_FIRECRACKER_VMS")
         .unwrap_or_default()
@@ -70,7 +91,13 @@ async fn every_route_serves_http_through_the_tunnel() {
     let mut args = vec!["--config".to_string(), config.display().to_string()];
     args.extend(extra.iter().flat_map(|vm| ["--vm".to_string(), vm.clone()]));
     let (url, mut streams) = tunnel_server(None).await;
-    let wicket = Wicket::start(&url, &firecracker, &kernel, &args);
+    let wicket = match &image {
+        Some(image) => Wicket::in_image(image, &url, &dir.0, &args),
+        None => {
+            let (firecracker, kernel) = tools();
+            Wicket::start(&url, &firecracker, &kernel, &args)
+        }
+    };
     let stream = tokio::time::timeout(HANG, streams.recv())
         .await
         .ok()
@@ -291,6 +318,8 @@ impl Route<'_> {
                 .header("host", self.host)
                 .body(Full::new(Bytes::new()))
                 .unwrap();
+            // the previous answer read does not make the connection ready at once
+            sender.ready().await.unwrap();
             let response = sender.send_request(request).await.unwrap();
             assert_eq!(response.status(), 200, "{}: GET {path}", self.host);
             let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -412,26 +441,61 @@ fn sample_rootfs() -> PathBuf {
 struct Wicket {
     child: Child,
     log: PathBuf,
+    /// The container's name, when run as an image.
+    container: Option<String>,
 }
 
 impl Wicket {
     fn start(server: &str, firecracker: &Path, kernel: &Path, args: &[String]) -> Wicket {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-firecracker"));
+        command
+            .args(["--firecracker"])
+            .arg(firecracker)
+            .arg("--kernel")
+            .arg(kernel);
+        Wicket::spawn(command, server, args, None)
+    }
+
+    /// The wicket as the Docker `image`, with its own Firecracker and kernel,
+    /// reading the rootfs images under `target/` and `scratch`.
+    fn in_image(image: &str, server: &str, scratch: &Path, args: &[String]) -> Wicket {
+        use std::os::unix::fs::MetadataExt as _;
+        let kvm = std::fs::metadata("/dev/kvm").unwrap().gid();
+        let name = format!("sfc-vm-{}", std::process::id());
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        let mount = |dir: &Path| format!("{0}:{0}:ro", dir.display());
+        let mut command = Command::new("docker");
+        command
+            .args(["run", "--rm", "--name", &name, "--network", "host"])
+            .args(["--device", "/dev/kvm", "--group-add", &kvm.to_string()])
+            .args(["--tmpfs", "/run/sluice"])
+            .args(["-v", &mount(&target), "-v", &mount(scratch), image]);
+        Wicket::spawn(command, server, args, Some(name))
+    }
+
+    fn spawn(
+        mut command: Command,
+        server: &str,
+        args: &[String],
+        container: Option<String>,
+    ) -> Wicket {
         let log = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("wicket-{}.log", std::process::id()));
         let file = std::fs::File::create(&log).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-firecracker"))
+        let child = command
             // the drain is the tunnel's, tested there: Ctrl-C ends the wicket at once
-            .args(["--server", server, "--drain-grace", "0", "--firecracker"])
-            .arg(firecracker)
-            .arg("--kernel")
-            .arg(kernel)
+            .args(["--server", server, "--drain-grace", "0"])
             .args(args)
             .stdin(Stdio::null())
             .stdout(file.try_clone().unwrap())
             .stderr(file)
             .spawn()
             .expect("run sluice-wicket-firecracker");
-        Wicket { child, log }
+        Wicket {
+            child,
+            log,
+            container,
+        }
     }
 
     /// Its output so far.
@@ -445,6 +509,7 @@ impl Wicket {
 
 impl Drop for Wicket {
     fn drop(&mut self) {
+        // docker run passes the signal on to the container
         let _ = Command::new("kill")
             .args(["-INT", &self.child.id().to_string()])
             .status();
@@ -457,5 +522,10 @@ impl Drop for Wicket {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(container) = &self.container {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", container])
+                .output();
+        }
     }
 }

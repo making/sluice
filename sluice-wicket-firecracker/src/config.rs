@@ -34,9 +34,13 @@ usage: sluice-wicket-firecracker --kernel <vmlinux> --vm <host>=<rootfs.ext4>[?<
   --kernel <path>                 the guest kernel (vmlinux)
   --firecracker <path>            the firecracker binary (default firecracker on the PATH)
   --state-dir <path>              the VMs' files: their sockets need paths below 108 bytes
-                                  (default a directory of the process's own under the
-                                  system's temp dir)
-  --token <token>                 bearer token of the tunnel streams
+                                  (default a directory of the process's own under
+                                  $XDG_RUNTIME_DIR, else the system's temp dir; a tmpfs
+                                  keeps the snapshots off the disk)
+  --token <token>                 bearer token of the tunnel streams (on the command line
+                                  every user of the host sees it: prefer the environment,
+                                  the config file or --token-file)
+  --token-file <path>             read the token from a file instead
   --client-id <id>                client identity (default a random UUID)
   --ca-cert <path>                PEM CA verifying a grpcs:// server (default the webPKI roots)
   --insecure                      skip the verification of a grpcs:// server
@@ -100,6 +104,7 @@ const VALUED: &[&str] = &[
     "firecracker",
     "state-dir",
     "token",
+    "token-file",
     "client-id",
     "ca-cert",
     "max-connections",
@@ -223,12 +228,27 @@ pub fn parse(
             specs.len()
         ));
     }
+    // a token given, else the file holding it: the flag's (or environment's)
+    // over the config file's
+    let read = |path: PathBuf| {
+        std::fs::read_to_string(&path)
+            .map(|token| token.trim().to_string())
+            .map_err(|e| format!("--token-file {}: {e}", path.display()))
+    };
+    let token = match (flag("token"), flag("token-file"), file) {
+        (Some(token), _, _) => token,
+        (None, Some(path), _) => read(PathBuf::from(path))?,
+        (None, None, Some(file)) => match (&file.token, in_file(&file.token_file)) {
+            (Some(token), _) => token.clone(),
+            (None, Some(path)) => read(path)?,
+            (None, None) => String::new(),
+        },
+        (None, None, None) => String::new(),
+    };
     Ok(Command::Run(Box::new(Settings {
         server,
         listen,
-        token: flag("token")
-            .or_else(|| file.and_then(|file| file.token.clone()))
-            .unwrap_or_default(),
+        token,
         client_id: flag("client-id")
             .or_else(|| file.and_then(|file| file.client_id.clone()))
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
@@ -353,6 +373,7 @@ struct File {
     server: Option<String>,
     listen: Option<String>,
     token: Option<String>,
+    token_file: Option<PathBuf>,
     client_id: Option<String>,
     insecure: Option<bool>,
     ca_cert: Option<PathBuf>,
@@ -531,6 +552,26 @@ mod tests {
         assert_eq!(settings.token, "flag");
         assert_eq!(settings.max_vms, 4);
 
+        // a token file: the flag's over the file's, relative to the config file
+        std::fs::write(dir.join("token"), "from-token-file\n").unwrap();
+        std::fs::write(
+            dir.join("by-file.yaml"),
+            "server: s\nkernel: k\ntoken-file: token\nroutes: []\n",
+        )
+        .unwrap();
+        let by_file = dir.join("by-file.yaml").display().to_string();
+        assert_eq!(
+            run(&["--config", &by_file], &[]).unwrap().token,
+            "from-token-file"
+        );
+        let token_file = dir.join("token").display().to_string();
+        let settings = run(
+            &["--config", &config_flag, "--token-file", &token_file],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(settings.token, "from-token-file");
+
         let twice = format!("a.local={}", rootfs.display());
         for (args, error) in [
             (vec!["--kernel", "k", "--vm", &vm], "--server or --listen"),
@@ -538,7 +579,7 @@ mod tests {
             (vec!["--server", "s", "--kernel", "k"], "--vm is required"),
             (
                 vec!["--config", &config_flag, "--vm", "c.local=missing"],
-                "is not a file",
+                "missing: No such file or directory",
             ),
             (
                 vec!["--config", &config_flag, "--vm", &twice],
@@ -547,6 +588,10 @@ mod tests {
             (
                 vec!["--listen", "l", "--config", &config_flag, "--vm", &vm],
                 "listen serves the sole route: 2 given",
+            ),
+            (
+                vec!["--config", &config_flag, "--token-file", "missing"],
+                "--token-file missing:",
             ),
         ] {
             // no Debug for the settings: the token is no output's business

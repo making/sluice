@@ -11,11 +11,16 @@
 //! of no page fault, no allocation growing the heap, on any of its threads, for every
 //! VM spawned); the wicket instead spawns itself (`posix_spawn`, no copy) as a launcher
 //! ([`launch`]) that sets the signal and execs `firecracker`.
+//!
+//! The launcher also lowers `firecracker`'s soft open file limit to what a VM needs
+//! ([`set_open_files`]): Firecracker grows its file table to that limit at its start
+//! (`dup2` to the last descriptor), 3ms per VM at 1048576.
 
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -38,16 +43,58 @@ const API_TIMEOUT: Duration = Duration::from_secs(5);
 /// The first argument of the wicket's launcher mode, see [`launch`].
 pub const LAUNCH: &str = "--launch-vm";
 
-/// The launcher mode (`<wicket> --launch-vm <wicket pid> <program> <args>...`), run
-/// before anything else: sets the parent death signal (SIGKILL), checks that the
-/// parent is still the wicket of `<wicket pid>` (else it died before the signal was
-/// set, and exits), and execs the program. Returns only when that failed.
+/// The descriptors a `firecracker` holds besides its vsock streams: KVM's, its
+/// vCPUs', event fds, its sockets, files and log.
+const VM_OWN_FILES: u64 = 128;
+
+/// The soft open file limit of each `firecracker`, see [`set_open_files`].
+static VM_OPEN_FILES: AtomicU64 = AtomicU64::new(1024);
+
+/// Raises the wicket's soft open file limit to its hard one (a connection holds a
+/// vsock stream, a VM its sockets and log; a container's soft limit is often 1024),
+/// and sets each `firecracker`'s to `connections` (its vsock streams at most) plus its
+/// own. Returns both limits.
+pub fn set_open_files(connections: usize) -> std::io::Result<(u64, u64)> {
+    let hard = set_soft_open_files(u64::MAX)?;
+    let vm = (connections as u64).saturating_add(VM_OWN_FILES).min(hard);
+    VM_OPEN_FILES.store(vm, Ordering::Relaxed);
+    Ok((hard, vm))
+}
+
+/// Sets the process's soft open file limit to `soft`, at most its hard one; returns
+/// the hard one.
+fn set_soft_open_files(soft: u64) -> std::io::Result<u64> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: plain getrlimit / setrlimit on a valid struct
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    limit.rlim_cur = soft.min(limit.rlim_max);
+    // SAFETY: as above
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(limit.rlim_max)
+}
+
+/// The launcher mode (`<wicket> --launch-vm <wicket pid> <open files> <program>
+/// <args>...`), run before anything else: sets the parent death signal (SIGKILL),
+/// checks that the parent is still the wicket of `<wicket pid>` (else it died before
+/// the signal was set, and exits), sets the soft open file limit and execs the
+/// program. Returns only when that failed.
 pub fn launch(mut args: impl Iterator<Item = OsString>) -> std::io::Error {
-    let wicket = args
-        .next()
-        .and_then(|pid| pid.to_str()?.parse::<libc::pid_t>().ok());
-    let (Some(wicket), Some(program)) = (wicket, args.next()) else {
-        return std::io::Error::other(format!("usage: {LAUNCH} <wicket pid> <program> <args>..."));
+    let mut number = || {
+        args.next()
+            .and_then(|arg| arg.to_str()?.parse::<u64>().ok())
+    };
+    let (wicket, files) = (number(), number());
+    let (Some(wicket), Some(files), Some(program)) = (wicket, files, args.next()) else {
+        return std::io::Error::other(format!(
+            "usage: {LAUNCH} <wicket pid> <open files> <program> <args>..."
+        ));
     };
     // SAFETY: a plain prctl; the signal follows the parent thread, a runtime worker
     // living as long as the wicket
@@ -55,8 +102,11 @@ pub fn launch(mut args: impl Iterator<Item = OsString>) -> std::io::Error {
         return std::io::Error::last_os_error();
     }
     // SAFETY: a plain getppid
-    if unsafe { libc::getppid() } != wicket {
+    if u64::try_from(unsafe { libc::getppid() }) != Ok(wicket) {
         return std::io::Error::other("the wicket ended before the VM started");
+    }
+    if let Err(e) = set_soft_open_files(files) {
+        return e;
     }
     std::process::Command::new(program).args(args).exec()
 }
@@ -93,7 +143,9 @@ impl Vm {
     /// Starts `firecracker` in `dir` (created; its API socket, vsock socket and log go
     /// there) and waits for its API socket.
     async fn spawn(firecracker: &Path, dir: PathBuf, slot: Slot) -> Result<Vm, BoxError> {
-        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
         let api = dir.join("api.sock");
         // sun_path holds 108 bytes, its NUL included
         if api.as_os_str().len() > 107 {
@@ -103,20 +155,27 @@ impl Vm {
             )
             .into());
         }
-        let log = std::fs::File::create(dir.join("firecracker.log"))?;
+        let log = dir.join("firecracker.log");
+        let log = std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
         // the wicket itself, as the launcher (see `launch`): a posix_spawn, no fork
         let child = Command::new("/proc/self/exe")
             .arg(LAUNCH)
             .arg(std::process::id().to_string())
+            .arg(VM_OPEN_FILES.load(Ordering::Relaxed).to_string())
             .arg(firecracker)
             .arg("--api-sock")
             .arg(&api)
             .current_dir(&dir)
+            // the wicket's environment (its token among it) is no VM's business;
+            // PATH finds a bare --firecracker
+            .env_clear()
+            .envs(std::env::var_os("PATH").map(|path| ("PATH", path)))
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
             .kill_on_drop(true)
-            .spawn()?;
+            .spawn()
+            .map_err(|e| format!("{LAUNCH} {}: {e}", firecracker.display()))?;
         let mut vm = Vm {
             child,
             _slot: slot,
