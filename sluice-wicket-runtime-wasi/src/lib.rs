@@ -120,6 +120,8 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         mut routes,
     } = settings;
     println!("wicket build: {}", describe_build());
+    // before any component compiles: the pool is sized once, by the instance limit
+    println!("{}", wasm_host::start_engine(max_instances));
     let tap = match flume {
         Some(_) => Tap::new(),
         None => Tap::off(),

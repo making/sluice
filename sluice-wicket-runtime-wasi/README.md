@@ -140,7 +140,8 @@ session reconnects (`sluice.client.tunnel-stall-timeout` of the Java client). A 
 restarts the wait; control frames do not count.
 
 `--max-instances N` (default 64) caps the guest instances alive at once over every route,
-so guest linear memory stays within N x the largest `memory-mib` (16GiB at the defaults).
+so guest linear memory stays within N x the largest `memory-mib` (16GiB at the defaults),
+and sizes wasmtime's instance pool (see [Design notes](#design-notes)).
 Every instance holds one of the N slots until it is gone: a request's, or a pooled unit's
 for the unit's lifetime (see [Instance pool](#instance-pool)). A request finding no slot
 waits for one within its `budget-ms` (freed slots go to the waiting requests in arrival
@@ -685,14 +686,30 @@ table dirty and is retired, so a guest opens its buckets per request (cheap: a t
   public client's FIN) is a half-close: an http/1.1 request already received
   is still answered, and one whose guest stalls is held until the server's
   ERROR or the budget
+- instances come from wasmtime's pooling allocator, a slot of each kind per
+  `--max-instances` instance (4 linear memories and a GC heap, 16 tables of 100k elements,
+  32 core instances, 8 fiber stacks), so an instantiate never finds the pool exhausted; a
+  component needing more is rejected at load. A memory slot reserves 4GiB of address space
+  and a 32MiB guard, no memory (1.3TiB at the default 64 instances). An ended instance's
+  memory is reset in place: with `PAGEMAP_SCAN` (Linux 6.7+) the pages it wrote, up to 4MiB
+  a memory or table, are copied back and stay resident, the rest is released (`madvise`).
+  Where the address space cannot be reserved (e.g. `ulimit -v`), instances are allocated on
+  demand; the startup log names the allocator
 - the runtime is tokio's default, a worker per core. On a 64-core host, keep-alive `GET /`
-  to the hello guest (per-request instances, `oha -c 16` for 5s, through a server or
-  `--listen` alike): 4.0-4.2k req/s at 1.4ms of the wicket's CPU a request with 64 workers,
-  6.8-8.4k at 0.44-0.52ms with 4 (`TOKIO_WORKER_THREADS`), 5.2k at 0.38ms with 2, 3.2k at
-  0.30ms with 1, 4.3-4.8k at 1.0-1.4ms with 8 to 32. Past a few workers the CPU goes to
-  the kernel's memory map lock and TLB shootdowns (`rwsem_spin_on_owner`,
-  `smp_call_function_many_cond` in `perf`): each instance's memory is mapped and unmapped
-  in the process, and an unmapping interrupts every core running one of its threads
+  to the hello guest (per-request instances, `oha` for 5s on `--listen`; rate, and the
+  wicket's CPU per request):
+
+  | workers (`TOKIO_WORKER_THREADS`) | 1 | 4 | 16 | 64 |
+  |---|---|---|---|---|
+  | pooled, `-c 16` | 5.3k, 0.19ms | 15k, 0.26ms | 47k, 0.31ms | 42-44k, 0.37-0.41ms |
+  | pooled, `-c 64` | | | 62k, 0.25ms | 118-125k, 0.36-0.37ms |
+  | on demand, `-c 16` | 3.2k, 0.30ms | 6.8-8.4k, 0.44-0.52ms | 4.3-4.8k, 1.0-1.4ms | 3.8-4.2k, 1.4-1.5ms |
+
+  On demand, each instance's memory and fiber stack were mapped and unmapped, and past a
+  few workers the CPU went to the kernel's memory map lock and TLB shootdowns
+  (`rwsem_spin_on_owner`, `smp_call_function_many_cond` in `perf`: an unmapping
+  interrupts every core running one of the process's threads); pooled, no memory map call
+  is left per request. A `pool=16` route serves 66k at 0.23ms either way
 - guests are ordinary wasm components exporting `wasi:http/handler@0.3.0`;
   the linked wasi surface follows `wasmtime serve` (see `wasi` above) for
   p3 only. wasi p2 is unsupported and never linked (unlike serve's `-Scli`):
@@ -720,8 +737,8 @@ its replacement (the `instance` of its lines in the
 [live access log](#live-access-log)). A unit is offered once instantiated; a
 request beyond the stock, or on a route without `pool`, uses the per-request
 path above while an instance slot is free (and the route's `instances` cap
-allows), so the pool only ever improves the warm latency (hello guest, dev
-profile: ~380us cold vs ~120us pooled per request). Each unit holds an
+allows), so the pool only ever improves the warm latency (hello guest, release
+profile: ~250us cold vs ~130us pooled per request). Each unit holds an
 instance slot of `--max-instances`, and one of its route's cap, for its
 lifetime (a retired unit's replacement takes them over); the pools of all
 routes together may not exceed the limit, which is checked at startup and on

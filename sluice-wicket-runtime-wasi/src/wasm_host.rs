@@ -69,47 +69,160 @@ const GUEST_LOG_LINE_MAX: usize = 16 * 1024;
 // ---------------------------------------------------------------------------
 // Engine
 
-/// The engine shared by every component: one epoch ticker drives the
-/// per-request deadlines of all stores.
-fn engine() -> &'static wasmtime::Engine {
-    static ENGINE: OnceLock<wasmtime::Engine> = OnceLock::new();
+/// The engine shared by every component, started by [`start_engine`] (or,
+/// where nothing started it, as the unit tests do, on first use, sized for
+/// [`UNSIZED_INSTANCES`]). One epoch ticker drives the per-request deadlines
+/// of all stores.
+static ENGINE: OnceLock<wasmtime::Engine> = OnceLock::new();
+
+/// The instances the pool is sized for when no `--max-instances` sized it:
+/// wasmtime's own default.
+const UNSIZED_INSTANCES: usize = 1000;
+
+/// What the pool holds for each instance: the linear memories a component
+/// may define (a component with more is rejected at load), one more for its
+/// store's GC heap, and the tables, core instances and fiber stacks.
+const POOL_MEMORIES: u32 = 4;
+const POOL_TABLES: u32 = 16;
+const POOL_CORE_INSTANCES: u32 = 32;
+const POOL_STACKS: u32 = 8;
+
+/// Elements a pooled table may hold (8 bytes each, reserved per table slot).
+const POOL_TABLE_ELEMENTS: usize = 100_000;
+
+/// The pages a pooled memory or table was written to that stay resident
+/// when its instance ends, reset by `memset` instead of `madvise`; only
+/// where the kernel tells the pages written (`PAGEMAP_SCAN`, Linux 6.7+).
+const POOL_KEEP_RESIDENT: usize = 4 << 20;
+
+/// Starts the engine, its instance pool sized for `max_instances`, and
+/// describes its allocator for the startup log. Falls back to allocating
+/// each instance on demand where the pool's address space cannot be
+/// reserved.
+pub fn start_engine(max_instances: usize) -> String {
+    let mut described = None;
     ENGINE.get_or_init(|| {
-        let mut config = wasmtime::Config::new();
-        config.wasm_component_model_async(true);
-        // Epoch deadlines raise `Trap::Interrupt` in guest code; without this
-        // a budget could not interrupt a guest between yield points.
-        config.epoch_interruption(true);
-        let engine = wasmtime::Engine::new(&config).expect("valid engine config");
-        // A dedicated thread: guests run on tokio workers and can starve the
-        // timer wheel with a busy loop, which would stall their own budget.
-        let ticker = engine.clone();
-        std::thread::Builder::new()
-            .name("wasm-epoch-ticker".into())
-            .spawn(move || {
-                // Without the ticker no budget ever fires: fail stop.
-                run_guarded(
-                    || {
-                        run_ticker(
-                            || ticker.increment_epoch(),
-                            EpochSchedule::new(std::time::Instant::now(), EPOCH_TICK),
-                            std::time::Instant::now,
-                            |until| {
-                                std::thread::sleep(
-                                    until.saturating_duration_since(std::time::Instant::now()),
-                                );
-                                true
-                            },
-                        )
-                    },
-                    || {
-                        eprintln!("[wasm] epoch ticker stopped: aborting");
-                        std::process::abort()
-                    },
-                )
-            })
-            .expect("spawn epoch ticker");
+        let (engine, description) = new_engine(max_instances);
+        described = Some(description);
         engine
-    })
+    });
+    described.unwrap_or_else(|| "instance allocator: started before".into())
+}
+
+fn engine() -> &'static wasmtime::Engine {
+    ENGINE.get_or_init(|| new_engine(UNSIZED_INSTANCES).0)
+}
+
+/// The engine with its pool for `instances`, else on demand; and its
+/// ticker.
+fn new_engine(instances: usize) -> (wasmtime::Engine, String) {
+    let pooled = || {
+        let mut config = engine_config();
+        let keep_resident = wasmtime::PoolingAllocationConfig::is_pagemap_scan_available();
+        config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pool_config(
+            instances,
+            keep_resident,
+        )));
+        wasmtime::Engine::new(&config).map(|engine| (engine, keep_resident))
+    };
+    let (engine, description) = match pooled() {
+        Ok((engine, keep_resident)) => {
+            let slot = engine.get_memory_reservation() + engine.get_memory_guard_size();
+            let kept = if keep_resident {
+                format!("written pages up to {}MiB kept", POOL_KEEP_RESIDENT >> 20)
+            } else {
+                "written pages released (no PAGEMAP_SCAN)".into()
+            };
+            let description = format!(
+                "instance allocator: pooled for {instances} instances, {} memory slots \
+                 of {}MiB address space; {kept} a slot",
+                pool_count(instances, POOL_MEMORIES + 1),
+                slot >> 20
+            );
+            (engine, description)
+        }
+        Err(e) => {
+            let engine = wasmtime::Engine::new(&engine_config()).expect("valid engine config");
+            let description = format!(
+                "instance allocator: on demand (a pool for {instances} instances failed: {e:#})"
+            );
+            (engine, description)
+        }
+    };
+    // A dedicated thread: guests run on tokio workers and can starve the
+    // timer wheel with a busy loop, which would stall their own budget.
+    let ticker = engine.clone();
+    std::thread::Builder::new()
+        .name("wasm-epoch-ticker".into())
+        .spawn(move || {
+            // Without the ticker no budget ever fires: fail stop.
+            run_guarded(
+                || {
+                    run_ticker(
+                        || ticker.increment_epoch(),
+                        EpochSchedule::new(std::time::Instant::now(), EPOCH_TICK),
+                        std::time::Instant::now,
+                        |until| {
+                            std::thread::sleep(
+                                until.saturating_duration_since(std::time::Instant::now()),
+                            );
+                            true
+                        },
+                    )
+                },
+                || {
+                    eprintln!("[wasm] epoch ticker stopped: aborting");
+                    std::process::abort()
+                },
+            )
+        })
+        .expect("spawn epoch ticker");
+    (engine, description)
+}
+
+/// The engine's settings but its allocator.
+fn engine_config() -> wasmtime::Config {
+    let mut config = wasmtime::Config::new();
+    config.wasm_component_model_async(true);
+    // Epoch deadlines raise `Trap::Interrupt` in guest code; without this
+    // a budget could not interrupt a guest between yield points.
+    config.epoch_interruption(true);
+    config
+}
+
+/// The pool for `instances`: a slot of each kind for every instance the
+/// `Instances` semaphore may let live at once, so an instantiate never finds
+/// the pool exhausted. Instances allocated on demand map their memory and
+/// fiber stack and unmap them when they end: past a few runtime workers
+/// the memory map lock and the TLB shootdowns of the unmapping took most of
+/// the CPU. A slot is reused instead, its memory reset in place.
+fn pool_config(instances: usize, keep_resident: bool) -> wasmtime::PoolingAllocationConfig {
+    let mut pool = wasmtime::PoolingAllocationConfig::new();
+    pool.total_component_instances(pool_count(instances, 1))
+        .total_core_instances(pool_count(instances, POOL_CORE_INSTANCES))
+        .max_core_instances_per_component(POOL_CORE_INSTANCES)
+        .total_memories(pool_count(instances, POOL_MEMORIES + 1))
+        .max_memories_per_component(POOL_MEMORIES)
+        .max_memories_per_module(POOL_MEMORIES)
+        .total_gc_heaps(pool_count(instances, 1))
+        .total_tables(pool_count(instances, POOL_TABLES))
+        .max_tables_per_component(POOL_TABLES)
+        .max_tables_per_module(POOL_TABLES)
+        .table_elements(POOL_TABLE_ELEMENTS)
+        .total_stacks(pool_count(instances, POOL_STACKS));
+    if keep_resident {
+        pool.linear_memory_keep_resident(POOL_KEEP_RESIDENT)
+            .table_keep_resident(POOL_KEEP_RESIDENT)
+            .pagemap_scan(wasmtime::Enabled::Yes);
+    }
+    pool
+}
+
+/// `instances` x `each`, saturated (a pool that large fails to reserve).
+fn pool_count(instances: usize, each: u32) -> u32 {
+    u32::try_from(instances)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(each)
 }
 
 /// Most ticks one wake-up increments. A ticker that wakes later than this
@@ -296,8 +409,9 @@ pub struct Loaded {
     /// The pre-linked instantiation plan: import resolution and interface
     /// typechecking happen once here, so the per-request `instantiate_async`
     /// skips them. Measured on the hello guest (see the ignored
-    /// `instantiation_latency_reference`): ~260us full vs ~200us pre-linked
-    /// (dev profile) per instantiation, i.e. the warm path stays far below a
+    /// `instantiation_latency_reference`): ~60us full vs ~35us pre-linked
+    /// (release profile, ~140us vs ~95us with instances allocated on demand)
+    /// per instantiation, i.e. the warm path stays far below a
     /// millisecond -- so instances are not pooled by default. `pool=N` opts a
     /// route into `Pool`, which amortizes even that by keeping whole
     /// `(Store, Service)` units warm; pooling assumes stateless guests (see
@@ -2011,9 +2125,9 @@ struct Job {
 /// in turn, the one idle longest first, as the gorouter balances an app's
 /// instances, and each has an index of `0..pool` (see `respond`).
 /// Measured on the hello guest (the ignored `load_comparison_reference`,
-/// sequential requests, dev profile): ~380us cold vs ~120us pooled per
-/// request. Every unit holds an instance slot for its lifetime, handed on to
-/// its replacement.
+/// sequential requests, release profile): ~250us cold vs ~130us pooled per
+/// request (~360us cold with instances allocated on demand). Every unit
+/// holds an instance slot for its lifetime, handed on to its replacement.
 ///
 /// Reuse assumes stateless / reentrant-safe guests: module state legitimately
 /// persists across a unit's requests. A guest that misbehaves poisons its own
@@ -2853,7 +2967,7 @@ pub(crate) mod tests {
 
     /// Reference latencies for the instantiation paths, backing the decision
     /// recorded on `Loaded`. Run with:
-    /// `cargo test -p sluice-wicket-runtime-wasi --bin sluice-wicket-runtime-wasi instantiation_latency -- --ignored --nocapture`
+    /// `cargo test --release --lib instantiation_latency -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "reference numbers; run manually with --nocapture"]
     async fn instantiation_latency_reference() {
@@ -2917,7 +3031,7 @@ pub(crate) mod tests {
     /// Reference latency for the cold vs pooled request path, backing the
     /// numbers recorded on `Pool`. End-to-end over the in-process tunnel on
     /// the hello guest, sequential requests. Run with:
-    /// `cargo test -p sluice-wicket-runtime-wasi --bin sluice-wicket-runtime-wasi load_comparison -- --ignored --nocapture`
+    /// `cargo test --release --lib load_comparison -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "reference numbers; run manually with --nocapture"]
     async fn load_comparison_reference() {
@@ -2945,9 +3059,7 @@ pub(crate) mod tests {
             "every measured request pooled"
         );
 
-        println!(
-            "cold: {cold:?} / pooled(4): {pooled:?} per request (mean of {iterations}, dev profile)"
-        );
+        println!("cold: {cold:?} / pooled(4): {pooled:?} per request (mean of {iterations})");
     }
 
     async fn hello() -> Arc<Loaded> {
@@ -3809,14 +3921,15 @@ pub(crate) mod tests {
         }
     }
 
-    /// A component importing what its route does not link fails at load
-    /// (startup), naming the import and the cause instead of a missing link:
-    /// wasi p2 (never linked, not even with `cli`), wasi:sockets without
-    /// `cli` (as under `wasmtime serve` without `-Scli`), wasi:keyvalue
-    /// without `keyvalue` (draft2 is no p2), and a wasi:keyvalue other than
-    /// draft2.
+    /// A component its route cannot run fails at load (startup), naming the
+    /// cause instead of failing every request. One importing what the route
+    /// does not link names the import: wasi p2 (never linked, not even with
+    /// `cli`), wasi:sockets without `cli` (as under `wasmtime serve` without
+    /// `-Scli`), wasi:keyvalue without `keyvalue` (draft2 is no p2), and a
+    /// wasi:keyvalue other than draft2. One defining more linear memories
+    /// than an instance's pool slots hold names the limit.
     #[tokio::test]
-    async fn a_component_importing_what_its_route_does_not_link_fails_to_load() {
+    async fn a_component_its_route_cannot_run_fails_to_load() {
         let dir = crate::routes::tests::Scratch::new("imports");
         let importing = |import: &str| {
             let wat = format!(r#"(component (import "{import}" (instance (export "f" (func)))))"#);
@@ -3825,7 +3938,14 @@ pub(crate) mod tests {
         let p2 = importing("wasi:cli/environment@0.2.6");
         let p2_unsupported: &[&str] =
             &["imports wasi:cli/environment@0.2.6: wasi p2 is unsupported"];
-        let cases: [(PathBuf, &str, &[&str]); 5] = [
+        let memories = dir.write(
+            "memories.wat",
+            format!(
+                "(component (core module $m (memory 1)) {})",
+                "(core instance (instantiate $m)) ".repeat(POOL_MEMORIES as usize + 1)
+            ),
+        );
+        let cases: [(PathBuf, &str, &[&str]); 6] = [
             (p2.clone(), "", p2_unsupported),
             (p2, "cli", p2_unsupported),
             (
@@ -3844,6 +3964,11 @@ pub(crate) mod tests {
                 &[
                     "imports wasi:keyvalue/store@0.2.0-draft: only wasi:keyvalue@0.2.0-draft2 is linked",
                 ],
+            ),
+            (
+                memories,
+                "",
+                &["5 Wasm linear memories, which exceeds the configured maximum of 4"],
             ),
         ];
         for (component, caps, needles) in cases {
