@@ -6,6 +6,7 @@ use std::sync::Arc;
 use sluice_wicket_tunnel::routes::Routes;
 use tokio::net::TcpListener;
 
+use crate::route::Lease;
 use crate::routes::Table;
 use crate::wire;
 
@@ -22,12 +23,15 @@ pub async fn run(listener: TcpListener, routes: Arc<Routes<Table>>) {
         };
         tokio::spawn(async move {
             match route.open().await {
-                Ok(lease) => {
-                    if let Err(e) = wire::relay(client, lease.stream).await {
-                        eprintln!("listener ({}): {e}", route.label);
+                Ok(Lease { stream, vm }) => {
+                    if let Err(e) = wire::relay(client, stream).await {
+                        eprintln!("listener ({}): {e}", route.label());
+                    }
+                    if let Some(vm) = vm {
+                        vm.end().await;
                     }
                 }
-                Err(e) => eprintln!("listener ({}): {e}", route.label),
+                Err(e) => eprintln!("listener ({}): {e}", route.label()),
             }
         });
     }

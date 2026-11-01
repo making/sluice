@@ -574,6 +574,8 @@ cf-api (`cf logs`) see the wicket's lines:
 - a `grpcs://` flume is verified with `--flume-ca-cert <file>` (PEM), the webPKI roots by
   default, or not at all with `--flume-insecure`; in the config file `flume`,
   `flume-token`, `flume-ca-cert`, `flume-insecure` (read at startup)
+- the feed is `sluice-wicket-tunnel`'s (`flume`): `sluice-wicket-runtime-firecracker` feeds
+  its VMs' output through it (its README, "Output and the live access log")
 
 ### Key-value stores (experimental)
 

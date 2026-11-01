@@ -734,8 +734,9 @@ holding a request back; the page shows the lines missed and the nodes disconnect
 browser reconnecting, to any node, resumes after the last line it showed. The server starts
 and serves with the flume down. A wicket feeds the flume too (`--flume`): the requests it
 answered (`response`) and its guests' output (`stdout`, `stderr`), each naming its
-instance, which the cf-api turns into the apps' `cf logs`. Topology, drops, ordering,
-wickets and proxy settings: [.kb/live-access-log.md](.kb/live-access-log.md).
+instance, which the cf-api turns into the apps' `cf logs`; a Firecracker wicket its VMs'
+output, each line naming its VM. Topology, drops, ordering, wickets and proxy settings:
+[.kb/live-access-log.md](.kb/live-access-log.md).
 
 #### Client certificate issuance
 

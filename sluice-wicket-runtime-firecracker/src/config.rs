@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use sluice_wicket_tunnel::flume::FlumeSettings;
 use sluice_wicket_tunnel::{DEFAULT_DRAIN_GRACE, DEFAULT_MAX_CONNECTIONS, DEFAULT_STALL_TIMEOUT};
 
 use crate::route::RouteSpec;
@@ -54,6 +55,12 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
   --drain-grace <secs>            the SIGTERM drain's bound (default 20, 0 = no drain)
   --watch-interval <secs>         poll the routes' files: the config file, the rootfs
                                   images, the kernel (default 1, 0 = SIGHUP only)
+  --flume <url>                   feed the VMs' output to a sluice-flume while someone
+                                  watches (the live access log), grpc://host:port or
+                                  grpcs://host:port
+  --flume-token <token>           the flume's bearer token (required with --flume)
+  --flume-ca-cert <path>          PEM CA verifying a grpcs:// flume (default the webPKI roots)
+  --flume-insecure                skip the verification of a grpcs:// flume
   --version                       print the build (version, commit, build time) and exit
 
 Each option but --vm also reads SLUICE_WICKET_RUNTIME_FIRECRACKER_<NAME> from the environment, e.g.
@@ -90,6 +97,8 @@ pub struct Settings {
     pub watch_interval: Duration,
     /// Where the VMs' files go; None = a directory of the process's own.
     pub state_dir: Option<PathBuf>,
+    /// The flume the VMs' output is fed to.
+    pub flume: Option<FlumeSettings>,
     /// Where the routes come from, read again on a reload.
     pub routes: RouteSource,
     /// The routes at startup.
@@ -113,6 +122,9 @@ const VALUED: &[&str] = &[
     "tunnel-stall-timeout",
     "drain-grace",
     "watch-interval",
+    "flume",
+    "flume-token",
+    "flume-ca-cert",
     "vm",
 ];
 
@@ -124,6 +136,7 @@ pub fn parse(
 ) -> Result<Command, String> {
     let mut given: HashMap<&str, String> = HashMap::new();
     let mut insecure = false;
+    let mut flume_insecure = false;
     let mut vms = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -131,6 +144,7 @@ pub fn parse(
             "-h" | "--help" => return Ok(Command::Help),
             "-V" | "--version" => return Ok(Command::Version),
             "--insecure" => insecure = true,
+            "--flume-insecure" => flume_insecure = true,
             _ => {
                 let (name, inline) = match arg.strip_prefix("--").map(|rest| rest.split_once('=')) {
                     Some(Some((name, value))) => (name, Some(value.to_string())),
@@ -235,6 +249,20 @@ pub fn parse(
             .map(|token| token.trim().to_string())
             .map_err(|e| format!("--token-file {}: {e}", path.display()))
     };
+    let switch = |name: &str| {
+        env(&format!("SLUICE_WICKET_RUNTIME_FIRECRACKER_{name}"))
+            .is_some_and(|value| value == "true")
+    };
+    let flume = FlumeSettings::of(
+        flag("flume").or_else(|| file.and_then(|file| file.flume.clone())),
+        flag("flume-token").or_else(|| file.and_then(|file| file.flume_token.clone())),
+        flag("flume-ca-cert")
+            .map(PathBuf::from)
+            .or_else(|| file.and_then(|file| in_file(&file.flume_ca_cert))),
+        flume_insecure
+            || switch("FLUME_INSECURE")
+            || file.and_then(|file| file.flume_insecure).unwrap_or(false),
+    )?;
     let token = match (flag("token"), flag("token-file"), file) {
         (Some(token), _, _) => token,
         (None, Some(path), _) => read(PathBuf::from(path))?,
@@ -253,8 +281,7 @@ pub fn parse(
             .or_else(|| file.and_then(|file| file.client_id.clone()))
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         insecure: insecure
-            || env("SLUICE_WICKET_RUNTIME_FIRECRACKER_INSECURE")
-                .is_some_and(|value| value == "true")
+            || switch("INSECURE")
             || file.and_then(|file| file.insecure).unwrap_or(false),
         ca_cert: flag("ca-cert")
             .map(PathBuf::from)
@@ -280,6 +307,7 @@ pub fn parse(
         state_dir: flag("state-dir")
             .map(PathBuf::from)
             .or_else(|| file.and_then(|file| in_file(&file.state_dir))),
+        flume,
         routes,
         specs,
     })))
@@ -387,6 +415,10 @@ struct File {
     tunnel_stall_timeout: Option<Scalar>,
     drain_grace: Option<Scalar>,
     watch_interval: Option<Scalar>,
+    flume: Option<String>,
+    flume_token: Option<String>,
+    flume_ca_cert: Option<PathBuf>,
+    flume_insecure: Option<bool>,
     #[serde(default)]
     routes: Vec<FileRoute>,
 }
@@ -516,7 +548,9 @@ mod tests {
         std::fs::write(
             &config,
             "server: grpc://file:8001\ntoken: from-file\nkernel: vmlinux\nmax-vms: 8\n\
-             drain-grace: 5s\nroutes:\n  - {host: a.local, rootfs: app.ext4, mode: per-connection, warm: 2}\n",
+             drain-grace: 5s\nflume: grpc://file:8002\nflume-token: from-file\n\
+             flume-ca-cert: flume-ca.pem\n\
+             routes:\n  - {host: a.local, rootfs: app.ext4, mode: per-connection, warm: 2}\n",
         )
         .unwrap();
         let vm = format!("b.local={}", rootfs.display());
@@ -524,11 +558,24 @@ mod tests {
 
         let settings = run(
             &["--config", &config_flag, "--vm", &vm],
-            &[("SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN", "from-env")],
+            &[
+                ("SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN", "from-env"),
+                ("SLUICE_WICKET_RUNTIME_FIRECRACKER_FLUME_TOKEN", "flume-env"),
+                ("SLUICE_WICKET_RUNTIME_FIRECRACKER_FLUME_INSECURE", "true"),
+            ],
         )
         .unwrap();
         assert_eq!(settings.server.as_deref(), Some("grpc://file:8001"));
         assert_eq!(settings.token, "from-env");
+        assert_eq!(
+            settings.flume,
+            Some(FlumeSettings {
+                url: "grpc://file:8002".into(),
+                token: "flume-env".into(),
+                ca_cert: Some(dir.join("flume-ca.pem")),
+                insecure: true,
+            })
+        );
         assert_eq!(settings.max_vms, 8);
         assert_eq!(settings.drain_grace, Duration::from_secs(5));
         assert_eq!(settings.max_connections, DEFAULT_MAX_CONNECTIONS);
@@ -546,12 +593,31 @@ mod tests {
         );
 
         let settings = run(
-            &["--config", &config_flag, "--token", "flag", "--max-vms=4"],
+            &[
+                "--config",
+                &config_flag,
+                "--token",
+                "flag",
+                "--max-vms=4",
+                "--flume=grpcs://flag:8002",
+                "--flume-ca-cert",
+                "ca.pem",
+                "--flume-insecure",
+            ],
             &[("SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN", "from-env")],
         )
         .unwrap();
         assert_eq!(settings.token, "flag");
         assert_eq!(settings.max_vms, 4);
+        assert_eq!(
+            settings.flume,
+            Some(FlumeSettings {
+                url: "grpcs://flag:8002".into(),
+                token: "from-file".into(),
+                ca_cert: Some("ca.pem".into()),
+                insecure: true,
+            })
+        );
 
         // a token file: the flag's over the file's, relative to the config file
         std::fs::write(dir.join("token"), "from-token-file\n").unwrap();
@@ -593,6 +659,25 @@ mod tests {
             (
                 vec!["--config", &config_flag, "--token-file", "missing"],
                 "--token-file missing:",
+            ),
+            (
+                vec![
+                    "--server", "s", "--kernel", "k", "--vm", &vm, "--flume", "f:1",
+                ],
+                "--flume: expected grpc://host:port or grpcs://host:port, got 'f:1'",
+            ),
+            (
+                vec![
+                    "--server",
+                    "s",
+                    "--kernel",
+                    "k",
+                    "--vm",
+                    &vm,
+                    "--flume",
+                    "grpc://f:1",
+                ],
+                "--flume-token (or `flume-token` in the --config file) is required",
             ),
         ] {
             // no Debug for the settings: the token is no output's business

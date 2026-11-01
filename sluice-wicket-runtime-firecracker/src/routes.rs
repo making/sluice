@@ -12,7 +12,8 @@
 //! from the new VMs; a connection open stays on the VMs it got, which end
 //! with the last of them. A removed target is served until every node stream
 //! acknowledged its removal: the server may have routed a connection to it
-//! before.
+//! before. A target kept serves under the hosts of the reload: its VMs' output
+//! is named after them.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,7 +30,8 @@ use tokio_util::sync::CancellationToken;
 use crate::BoxError;
 use crate::capacity::Capacity;
 use crate::config::RouteSource;
-use crate::route::{Mode, Route, RouteSpec};
+use crate::output::Sink;
+use crate::route::{Lease, Mode, Route, RouteSpec};
 use crate::wire;
 
 /// The routes at one point, as every node stream advertises them.
@@ -101,28 +103,30 @@ impl Binding for Connection {
     async fn serve(self, mut io: TunnelIo) {
         let conn_id = io.conn_id();
         let ending = io.ending();
-        let lease = match self.route.open().await {
+        let Lease { stream, vm } = match self.route.open().await {
             Ok(lease) => lease,
             Err(e) => {
-                eprintln!("conn {conn_id} ({}): {e}", self.route.label);
+                eprintln!("conn {conn_id} ({}): {e}", self.route.label());
                 ending.fail(&format!("guest unreachable: {e}"));
                 return;
             }
         };
         let failed = io.failed();
         let relayed = tokio::select! {
-            relayed = wire::relay(&mut io, lease.stream) => relayed,
+            relayed = wire::relay(&mut io, stream) => relayed,
             // the server's ERROR or the stream's end: nothing is sent any more
             () = failed => Ok(()),
         };
-        // a per-connection VM ends with its connection
-        drop(lease.vm);
         match relayed {
             Ok(()) => ending.finish(),
             Err(e) => {
-                eprintln!("conn {conn_id} ({}): {e}", self.route.label);
+                eprintln!("conn {conn_id} ({}): {e}", self.route.label());
                 ending.fail(&e.to_string());
             }
+        }
+        // a per-connection VM ends with its connection
+        if let Some(vm) = vm {
+            vm.end().await;
         }
     }
 }
@@ -204,6 +208,8 @@ pub struct Reloader {
     routes: Arc<Routes<Table>>,
     source: RouteSource,
     capacity: Arc<Capacity>,
+    /// Where the VMs' output goes.
+    sink: Arc<Sink>,
     /// The state dir, where every route started gets `route-<n>`.
     dir: PathBuf,
     next_dir: u64,
@@ -217,13 +223,14 @@ pub struct Reloader {
 
 impl Reloader {
     /// Starts the VMs of every route of `specs` (read from `source`) within
-    /// `capacity`, each target in a directory of its own under `dir`; the
-    /// first failure ends them all.
+    /// `capacity`, each target in a directory of its own under `dir`, their
+    /// output to `sink`; the first failure ends them all.
     pub async fn start(
         source: RouteSource,
         specs: Vec<RouteSpec>,
         capacity: Arc<Capacity>,
         dir: PathBuf,
+        sink: Arc<Sink>,
     ) -> Result<Reloader, BoxError> {
         fits(&specs, &capacity)?;
         let mut reloader = Reloader {
@@ -234,6 +241,7 @@ impl Reloader {
             }),
             source,
             capacity,
+            sink,
             dir,
             next_dir: 0,
             started: HashMap::new(),
@@ -367,7 +375,7 @@ impl Reloader {
             let stamps = stamps(files(&spec));
             match self.started.get(&target) {
                 Some(started) if started.spec.same_vms(&spec) && started.stamps == stamps => {
-                    kept.push(target);
+                    kept.push((target, hosts));
                     continue;
                 }
                 Some(_) => change.restarted.extend(hosts.iter().cloned()),
@@ -376,9 +384,9 @@ impl Reloader {
             let dir = self.dir.join(format!("route-{}", self.next_dir));
             self.next_dir += 1;
             dirs.push(dir.clone());
-            let capacity = self.capacity.clone();
+            let (capacity, sink) = (self.capacity.clone(), self.sink.clone());
             starting.spawn(async move {
-                let route = Route::start(spec.clone(), hosts.join(", "), dir, capacity).await;
+                let route = Route::start(spec.clone(), &hosts, dir, capacity, sink).await;
                 let started = route.map(|route| Started {
                     spec,
                     stamps,
@@ -425,7 +433,11 @@ impl Reloader {
         let generation = current.generation + 1;
         let mut started: HashMap<String, Started> = kept
             .into_iter()
-            .filter_map(|target| self.started.remove_entry(&target))
+            .filter_map(|(target, hosts)| {
+                let kept = self.started.remove_entry(&target)?;
+                kept.1.route.rename(&hosts);
+                Some(kept)
+            })
             .collect();
         started.extend(new);
         let mut routes: HashMap<String, Arc<Route>> = started

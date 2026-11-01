@@ -6,12 +6,21 @@
 //! travels in band: `[type: u8][len: u32 BE][payload]`, `DATA` or `CLOSE` (no payload).
 //! A stream ending without a `CLOSE` from its side failed.
 //!
+//! The guest's output travels on a stream of its own, framed alike ([`LOG_PORT`]).
+//!
 //! The guest has a copy of this module (`guest/src/wire.rs`): keep them alike.
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 const DATA: u8 = 0;
 const CLOSE: u8 = 1;
+
+/// The log stream's frames: a line of the processes' stdout, of their stderr, the lines
+/// dropped, the answer to a sync -- whose request, the wicket's, is this one byte.
+const STDOUT: u8 = 2;
+const STDERR: u8 = 3;
+const GAP: u8 = 4;
+pub const SYNC: u8 = 5;
 
 /// A frame's head: its type and its payload's length.
 const HEAD: usize = 5;
@@ -26,6 +35,112 @@ const MAX_PAYLOAD: usize = 16 * 1024;
 /// snapshot's, random state included: the kernel reseeds on the VM generation
 /// change (VMGenID) a moment after the restore, a process's own generator never.
 pub const CONTROL_PORT: u32 = 1024;
+
+/// The vsock port of the guest's log stream: the output of the processes its `/init`
+/// starts, as lines. The wicket dials it once `/init` runs, before the process starts
+/// (and a clone's after its restore notice: a restore resets every stream); `/init` sends
+/// its lines on the newest stream. Its frames ([`LogFrame`]) are a line (`STDOUT` /
+/// `STDERR`, without its newline, at most [`MAX_LINE`] bytes: a longer line goes in
+/// pieces), the lines dropped there (`GAP`: stdout's and stderr's, two u64 BE) and
+/// `SYNC` (no payload): the answer to the wicket's byte `SYNC` once every line the
+/// processes wrote before it was sent.
+pub const LOG_PORT: u32 = 1025;
+
+/// The longest line of the log stream.
+pub const MAX_LINE: usize = 16 * 1024;
+
+/// A process's output stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
+impl Stream {
+    /// Its name: a line's prefix and its kind in the live access log.
+    #[allow(dead_code)] // the wicket's: each copy has it
+    pub fn name(self) -> &'static str {
+        match self {
+            Stream::Stdout => "stdout",
+            Stream::Stderr => "stderr",
+        }
+    }
+}
+
+/// A frame of the log stream.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LogFrame {
+    /// A line of a process's output, without its newline.
+    Line(Stream, Vec<u8>),
+    /// The lines dropped here: the guest's buffer of them was full.
+    Gap { stdout: u64, stderr: u64 },
+    /// Every line written before the wicket's sync came before this.
+    Synced,
+}
+
+/// Appends `frame` to `out`.
+#[allow(dead_code)] // the guest's half: each copy has both
+pub fn put_log_frame(out: &mut Vec<u8>, frame: &LogFrame) {
+    let (kind, payload): (u8, &[u8]) = match frame {
+        LogFrame::Line(Stream::Stdout, line) => (STDOUT, line),
+        LogFrame::Line(Stream::Stderr, line) => (STDERR, line),
+        LogFrame::Gap { stdout, stderr } => {
+            out.push(GAP);
+            out.extend_from_slice(&16u32.to_be_bytes());
+            out.extend_from_slice(&stdout.to_be_bytes());
+            out.extend_from_slice(&stderr.to_be_bytes());
+            return;
+        }
+        LogFrame::Synced => (SYNC, &[]),
+    };
+    out.push(kind);
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(payload);
+}
+
+/// The next frame of a log stream; None once it ended between frames. A frame of an
+/// unknown type, or longer than its type allows, is an error: what the wicket takes of
+/// a guest is bounded.
+#[allow(dead_code)] // the wicket's half: each copy has both
+pub async fn read_log_frame<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+) -> std::io::Result<Option<LogFrame>> {
+    if reader.fill_buf().await?.is_empty() {
+        return Ok(None);
+    }
+    let mut head = [0u8; HEAD];
+    reader.read_exact(&mut head).await?;
+    let len = u32::from_be_bytes(head[1..].try_into().expect("4 bytes")) as usize;
+    let fits = match head[0] {
+        STDOUT | STDERR => len <= MAX_LINE,
+        GAP => len == 16,
+        SYNC => len == 0,
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown frame type {other}"),
+            ));
+        }
+    };
+    if !fits {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("a frame of type {} and {len} bytes", head[0]),
+        ));
+    }
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).await?;
+    let count = |at: usize| u64::from_be_bytes(payload[at..at + 8].try_into().expect("8 bytes"));
+    Ok(Some(match head[0] {
+        STDOUT => LogFrame::Line(Stream::Stdout, payload),
+        STDERR => LogFrame::Line(Stream::Stderr, payload),
+        GAP => LogFrame::Gap {
+            stdout: count(0),
+            stderr: count(8),
+        },
+        _ => LogFrame::Synced,
+    }))
+}
 
 /// The restore notice carrying `seed`.
 #[allow(dead_code)] // the wicket's half: each copy has both

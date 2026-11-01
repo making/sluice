@@ -366,8 +366,9 @@ impl Drop for Vm {
     }
 }
 
-/// No serial console unless `SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE` is set (the guest's output then
-/// goes to the VM's log): printing to it is the slowest part of a boot.
+/// No serial console unless `SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE` is set (the kernel's and
+/// `/init`'s own output then goes to the VM's log; the processes' goes to the wicket's
+/// stdout / stderr regardless): printing to it is the slowest part of a boot.
 fn boot_args() -> String {
     let console = match std::env::var_os("SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE") {
         Some(_) => "console=ttyS0",

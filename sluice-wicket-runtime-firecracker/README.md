@@ -26,7 +26,8 @@ The rootfs is either the built-in sample (`scripts/build-guest.sh`: `/init` serv
 itself) or an OCI image converted by `scripts/cnb-rootfs.sh`, e.g. a Cloud Native
 Buildpacks image: `/init` starts the image's `Entrypoint` + `Cmd` as its `User` in its
 `WorkingDir` with its `Env` (and `PORT`), and opens the vsock port once the process
-accepts on `127.0.0.1:$PORT`.
+accepts on `127.0.0.1:$PORT`. The process's output reaches the wicket's stdout / stderr,
+and with `--flume` the live access log (see [Output](#output-and-the-live-access-log)).
 
 ## Layout
 
@@ -35,10 +36,11 @@ Two Cargo workspaces:
 - `.` -- the wicket: `src/lib.rs` wires the modules, `src/main.rs` reads the command line
   (`config.rs`); `routes.rs` the route table, its reload and the relay of a connection,
   `route.rs` a route's VMs, `capacity.rs` their budget, `vm.rs` one Firecracker VM,
-  `wire.rs` the vsock framing and the restore notice, `listener.rs` `--listen`
+  `output.rs` the VMs' output, `wire.rs` the vsock framing and the restore notice,
+  `listener.rs` `--listen`
 - `guest/` -- the VMs' `/init`, built for `x86_64-unknown-linux-musl` (its
-  `rust-toolchain.toml` has rustup add the target); `guest/src/wire.rs` is a copy of
-  `src/wire.rs`: keep them alike
+  `rust-toolchain.toml` has rustup add the target): `log.rs` the processes' output;
+  `guest/src/wire.rs` is a copy of `src/wire.rs`: keep them alike
 - `scripts/` -- `build-guest.sh` (the sample rootfs), `cnb-rootfs.sh` (an OCI image's),
   `try.sh` (the debug build on `--listen`)
 - `tests/vm.rs` -- the VM test (see [Tests](#tests))
@@ -144,8 +146,10 @@ command line every user of the host sees it), `--client-id`, `--ca-cert`,
 connections ended; a second signal ends at once). Each also reads
 `SLUICE_WICKET_RUNTIME_FIRECRACKER_<NAME>` from the environment, e.g. `SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN`.
 
-`SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE=1` gives the VMs a serial console (into each VM's
-`firecracker.log`), `SLUICE_WICKET_RUNTIME_FIRECRACKER_TRACE=1` logs each clone's restore time.
+`SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE=1` gives the VMs a serial console, the kernel's and
+`/init`'s own output into each VM's `firecracker.log` (the processes' reaches the wicket
+regardless, see [Output](#output-and-the-live-access-log));
+`SLUICE_WICKET_RUNTIME_FIRECRACKER_TRACE=1` logs each clone's restore time.
 
 ### Configuration file
 
@@ -163,6 +167,8 @@ max-vms: 64
 max-memory: 16384               # MiB of guest memory
 watch-interval: 1s              # 0 = SIGHUP only
 drain-grace: 20s
+# flume: grpc://127.0.0.1:8002  # see Output and the live access log
+# flume-token: ${FLUME_TOKEN}
 routes:
   - {host: hello.local, rootfs: guest.ext4}
   - {host: app.local, rootfs: upstream.ext4, mode: per-connection, mem: 512, vcpus: 2,
@@ -207,6 +213,50 @@ the server answers with `502 Bad Gateway` (HTTP/1.1) or by closing the connectio
 clones take room nobody waits for, and give it up: the first connection in line short of
 room has a warm clone of another route killed.
 
+### Output and the live access log
+
+What the processes in the VMs write to their stdout and stderr -- an image's process, its
+restore hook, the sample guest's own lines -- reaches the wicket's stdout and stderr (so
+`docker logs` shows it), each line prefixed with its route's hosts and its VM:
+
+```text
+stdout [app.local template] :: Started Application in 1.9 seconds
+stderr [app.local vm-3] :: WARN payment declined
+stdout [hello.local, hi.local vm-0] :: GET /log, request 7 of boot id ...
+```
+
+- the VM is `vm-0` for a shared VM, `template` for a per-connection route's template and
+  `vm-<n>` for its clones, numbered in the order they were restored. A line is the VM's
+  whose process wrote it: the template's lines are taken before its snapshot, and what a
+  clone holds of them at its restore notice is discarded, with what its process wrote
+  before the notice
+- `/init` reads the pipes as lines (one longer than 16KiB in pieces) and sends them on a
+  vsock stream (port 1025) the wicket dials before the process starts: a process failing
+  to start shows why. A process never waits for the wicket: up to 4096 lines (1 MiB) wait
+  in the VM, past them lines are dropped and counted (`route app.local vm-3: 12 line(s) of
+  its output dropped, its buffer of them full`). The wicket writes the lines from a thread
+  of its own: a slow reader of its stdout holds the VMs' streams back, not the connections
+- a connection's own VM is killed once its output came (within 1s): what the process
+  writes after its answer is not lost
+- a rootfs whose `/init` predates the stream boots all the same, with no output (`the
+  guest sends no output (vsock port 1025)`)
+
+`--flume <grpc://host:port | grpcs://host:port>` with `--flume-token <token>` feeds the
+lines to a sluice-flume as `sluice-wicket-runtime-wasi` feeds its own (its README, "Live
+access log": the node `wicket:<client-id>`, the ring of 512, the queue of 4096, the gaps,
+the redial; `--flume-ca-cert`, `--flume-insecure`, and `flume`, `flume-token`,
+`flume-ca-cert`, `flume-insecure` in the config file), so the consoles watching the flume
+show them:
+
+| kind | fields |
+|---|---|
+| `stdout` / `stderr` | `vm` (the prefix's), `line` |
+
+A line's route key is the first host of its route (the hosts of one target share its VMs;
+a reload keeping the VMs names their lines after its hosts from then on), and the VMs'
+drops reach the flume as gaps. The wicket relays a connection's bytes without reading
+them, so it logs no `response` lines: the server's access log has the requests.
+
 ### Clones
 
 A clone's memory is its snapshot's. What the wicket and `/init` do about it:
@@ -226,6 +276,9 @@ A clone's memory is its snapshot's. What the wicket and `/init` do about it:
 - **secrets**: what the process generated before the snapshot (a key pair, a session
   ticket key, a token) is every clone's alike, the reseed changes the generators, not what
   they produced: generate such secrets in the restore hook, or after it
+- **a start not done**: the guest is ready once its port accepts, which a process may do
+  before its start ended (Jetty binds first, then prints that it listens): each clone
+  finishes the start, its last lines each clone's. `prime=N` has the template finish it
 
 The kernel's boot id remains the snapshot's.
 
@@ -265,6 +318,8 @@ docker run --rm --device /dev/kvm --group-add $(stat -c %g /dev/kvm) \
   needed
 - **open files**: the wicket raises its soft limit to the hard one (Docker's soft one is
   1024) and gives each `firecracker` `--max-connections` + 128 (see [Findings](#findings))
+- **`docker logs`** shows the VMs' output, each line named after its route and VM (see
+  [Output](#output-and-the-live-access-log))
 
 The VMs' memory counts against the container's memory cgroup: a VM's guest memory as the
 guest touches it, the `firecracker` process's few MiB, and a per-connection route's snapshot
@@ -306,7 +361,9 @@ sg kvm -c 'cargo test'
 tunnel server double, for a shared VM serving two hosts, a VM per connection and a route of
 one VM at most, it checks http/1.1 with keep-alive, h2c, a 5MB POST under the tunnel's flow
 control and a client half-closing after its request, the clones' clock and random values,
-the connection finding no room, and reloads of the config file. It needs Firecracker
+the connection finding no room, the VMs' output (a shared VM's, a template's, a clone's)
+on the wicket's stdout / stderr and on a flume (`sluice-wicket-tunnel`'s double), and
+reloads of the config file. It needs Firecracker
 (`SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER`, else `firecracker` on the PATH) and a guest
 kernel (`SLUICE_WICKET_RUNTIME_FIRECRACKER_KERNEL`, else `~/.local/firecracker/vmlinux`), the
 variables of the wicket's own `--firecracker` and `--kernel`, and builds the sample rootfs.
@@ -400,4 +457,4 @@ Caveats:
 ## Not yet
 
 The jailer (chroot, cgroups, seccomp) and aarch64 (`.todo` items of their own), clone reuse
-and pools of shared VMs (`.todo` 181), and the wasm wicket's console and live access log.
+and pools of shared VMs (`.todo` 181), and the wasm wicket's console.

@@ -110,6 +110,15 @@ same start and stop, ring of 512, queue of 4096 and gaps -- as the node
   node selector starts with the cluster's nodes and adds a wicket once the flume reports
   it; a node or route the page's address names stays a choice across a reload.
 
+`sluice-wicket-runtime-firecracker --flume URL --flume-token TOKEN` feeds the same way (the
+feed is `sluice-wicket-tunnel`'s) the output of the processes in its VMs, `stdout` /
+`stderr` with the fields `vm` (`vm-0` a shared VM, `template` a per-connection route's
+template, `vm-<n>` its clones) and `line`; the route key is the first host of the VM's
+route, as the VMs of one target serve all its hosts. A clone's lines are its own: the
+template's are taken before the snapshot, what a clone holds of them at its restore is
+discarded. The lines a VM's own buffer dropped (4096 lines waiting for the wicket) reach
+the flume as a gap. It relays bytes, not requests: no `response` lines.
+
 The cf-api (`sluice-wicket-cf-api --flume URL --flume-token TOKEN`) watches the hosts of
 its apps' routes with the kinds `response`, `stdout` and `stderr`, and adds each line to
 the log of the app holding its host, which `cf logs` shows as Cloud Foundry does, the

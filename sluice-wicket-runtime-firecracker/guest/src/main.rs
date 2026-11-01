@@ -12,6 +12,10 @@
 //! The vsock port opens once the process accepts: the wicket takes the guest as ready
 //! (or snapshots it) when it does.
 //!
+//! The process's stdout and stderr (and hello mode's own lines) go to the wicket as lines
+//! on the log stream (`log`, vsock port `wire::LOG_PORT`), open before the process starts;
+//! /init's own output goes to the console.
+//!
 //! A VM cloned from a snapshot gets the wicket's restore notice on the control port
 //! (`wire::CONTROL_PORT`): /init puts its seed into the kernel's random pool, reseeds
 //! it, and runs the image's restore hook (`restore` in `/sluice/init.json`, as the
@@ -20,6 +24,8 @@
 use std::convert::Infallible;
 use std::ffi::CString;
 use std::os::unix::process::CommandExt;
+use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -32,6 +38,10 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
 
+use log::Log;
+use wire::Stream;
+
+mod log;
 mod wire;
 
 const VSOCK_PORT: u32 = 8080;
@@ -99,6 +109,10 @@ fn main() {
     .build()
     .expect("runtime");
     let result = runtime.block_on(async {
+        // first: the wicket follows the output from before the process starts
+        let log = Log::new();
+        let output = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, wire::LOG_PORT))?;
+        tokio::spawn(log.clone().serve(output));
         loopback_up()?;
         let hook = launch.as_ref().map(|launch| Hook {
             argv: launch.restore.clone(),
@@ -108,16 +122,16 @@ fn main() {
             workdir: launch.workdir.clone(),
         });
         let control = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, wire::CONTROL_PORT))?;
-        tokio::spawn(control_loop(control, hook));
+        tokio::spawn(control_loop(control, hook, log.clone()));
         let port = match launch {
             Some(launch) => {
                 let port = launch.port;
-                start(launch)?;
+                start(launch, &log)?;
                 port
             }
             None => {
                 let listener = tokio::net::TcpListener::bind(("127.0.0.1", HELLO_PORT)).await?;
-                tokio::spawn(hello(listener, booted));
+                tokio::spawn(hello(listener, booted, log));
                 HELLO_PORT
             }
         };
@@ -189,8 +203,8 @@ fn loopback_up() -> std::io::Result<()> {
     }
 }
 
-/// Launcher mode: starts the image's process.
-fn start(launch: Launch) -> std::io::Result<()> {
+/// Launcher mode: starts the image's process, its output to `log`.
+fn start(launch: Launch, log: &Arc<Log>) -> std::io::Result<()> {
     let hostname = c"sluice";
     // SAFETY: a NUL-terminated name and its length
     unsafe { libc::sethostname(hostname.as_ptr(), hostname.to_bytes().len()) };
@@ -204,7 +218,10 @@ fn start(launch: Launch) -> std::io::Result<()> {
         .env_clear()
         .envs(launch.env.iter().filter_map(|pair| pair.split_once('=')))
         .env("PORT", launch.port.to_string())
-        .current_dir(&launch.workdir);
+        .current_dir(&launch.workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let (uid, gid) = (launch.uid, launch.gid);
     // SAFETY: setgroups / setgid / setuid are async-signal-safe. Done here rather than
     // with Command::uid / gid: the closure runs after those, without the right to drop
@@ -220,7 +237,8 @@ fn start(launch: Launch) -> std::io::Result<()> {
             Ok(())
         });
     }
-    let child = command.spawn()?;
+    let mut child = command.spawn()?;
+    capture(&mut child, log);
     println!("guest: started {program} (pid {})", child.id());
     // PID 1 reaps every orphan; the process's exit is logged, the VM stays up
     std::thread::spawn(move || {
@@ -239,6 +257,16 @@ fn start(launch: Launch) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Has `log` read the output of `child` (spawned with it piped).
+fn capture(child: &mut std::process::Child, log: &Arc<Log>) {
+    if let Some(stdout) = child.stdout.take() {
+        log.capture(Stream::Stdout, stdout);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        log.capture(Stream::Stderr, stderr);
+    }
+}
+
 /// What the restore hook runs as: the image's process's user, environment and
 /// directory.
 struct Hook {
@@ -249,16 +277,18 @@ struct Hook {
     workdir: String,
 }
 
-/// Answers each restore notice of the wicket's (one per restore): the seed into
-/// the kernel's random pool, the pool reseeded, hello mode's generator reseeded,
-/// the hook run; then `OK`.
-async fn control_loop(listener: VsockListener, hook: Option<Hook>) {
-    let hook = std::sync::Arc::new(hook);
+/// Answers each restore notice of the wicket's (one per restore): the output
+/// waiting discarded (the snapshot's), the seed into the kernel's random pool,
+/// the pool reseeded, hello mode's generator reseeded, the hook run (its output
+/// to `log`); then `OK`.
+async fn control_loop(listener: VsockListener, hook: Option<Hook>, log: Arc<Log>) {
+    let hook = Arc::new(hook);
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
         let hook = hook.clone();
+        let log = log.clone();
         tokio::spawn(async move {
             let (reader, mut writer) = tokio::io::split(stream);
             let mut line = String::new();
@@ -267,7 +297,7 @@ async fn control_loop(listener: VsockListener, hook: Option<Hook>) {
                 return;
             }
             let answer = match wire::seed(line.trim_end()) {
-                Some(seed) => match restored(&seed, &hook).await {
+                Some(seed) => match restored(&seed, &hook, &log).await {
                     Ok(()) => "OK\n".to_string(),
                     Err(e) => format!("ERR {e}\n"),
                 },
@@ -278,7 +308,12 @@ async fn control_loop(listener: VsockListener, hook: Option<Hook>) {
     }
 }
 
-async fn restored(seed: &[u8; 32], hook: &std::sync::Arc<Option<Hook>>) -> std::io::Result<()> {
+async fn restored(
+    seed: &[u8; 32],
+    hook: &Arc<Option<Hook>>,
+    log: &Arc<Log>,
+) -> std::io::Result<()> {
+    log.restored();
     reseed(seed)?;
     RANDOM.store(
         u64::from_le_bytes(seed[..8].try_into().unwrap()),
@@ -295,7 +330,10 @@ async fn restored(seed: &[u8; 32], hook: &std::sync::Arc<Option<Hook>>) -> std::
         .env_clear()
         .envs(hook.env.iter().filter_map(|pair| pair.split_once('=')))
         .env("SLUICE_RESTORE_GENERATION", generation.to_string())
-        .current_dir(&hook.workdir);
+        .current_dir(&hook.workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let (uid, gid) = (hook.uid, hook.gid);
     // SAFETY: as for the process (`start`)
     unsafe {
@@ -309,7 +347,9 @@ async fn restored(seed: &[u8; 32], hook: &std::sync::Arc<Option<Hook>>) -> std::
             Ok(())
         });
     }
-    let status = tokio::task::spawn_blocking(move || command.status())
+    let mut child = command.spawn()?;
+    capture(&mut child, log);
+    let status = tokio::task::spawn_blocking(move || child.wait())
         .await
         .map_err(std::io::Error::other)??;
     if !status.success() {
@@ -377,12 +417,16 @@ async fn relay(port: u16, booted: Instant) -> std::io::Result<()> {
     }
 }
 
-/// Hello mode: the guest's own HTTP server.
-async fn hello(listener: tokio::net::TcpListener, booted: Instant) {
+/// Hello mode: the guest's own HTTP server, its lines to `log` as a process's
+/// output: one at its start, two (stdout, stderr) per request for `/log`.
+async fn hello(listener: tokio::net::TcpListener, booted: Instant, log: Arc<Log>) {
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|id| id.trim().to_string())
         .unwrap_or_else(|_| "unknown (no /proc)".into());
-    println!("guest: hello server, boot id {boot_id}");
+    log.line(
+        Stream::Stdout,
+        format!("hello server, boot id {boot_id}").as_bytes(),
+    );
     let mut seed = [0u8; 8];
     // SAFETY: getrandom into a buffer of its length
     unsafe { libc::getrandom(seed.as_mut_ptr().cast(), seed.len(), 0) };
@@ -392,9 +436,11 @@ async fn hello(listener: tokio::net::TcpListener, booted: Instant) {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
+        let log = log.clone();
         tokio::spawn(async move {
-            let service =
-                hyper::service::service_fn(move |request| answer(request, booted, boot_id));
+            let service = hyper::service::service_fn(move |request| {
+                answer(request, booted, boot_id, log.clone())
+            });
             let mut builder = auto::Builder::new(TokioExecutor::new());
             // a client half-closing after its request still gets the answer
             builder.http1().half_close(true);
@@ -422,9 +468,18 @@ async fn answer(
     request: Request<hyper::body::Incoming>,
     booted: Instant,
     boot_id: &str,
+    log: Arc<Log>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let served = SERVED.fetch_add(1, Ordering::Relaxed) + 1;
     let (head, body) = request.into_parts();
+    if head.uri.path() == "/log" {
+        let line = format!(
+            "{} {}, request {served} of boot id {boot_id}",
+            head.method, head.uri
+        );
+        log.line(Stream::Stdout, line.as_bytes());
+        log.line(Stream::Stderr, line.as_bytes());
+    }
     let received = body
         .collect()
         .await

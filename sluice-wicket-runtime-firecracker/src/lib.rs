@@ -17,10 +17,15 @@
 //! `/init` relays it on to the process's TCP port (`routes`). A route's VMs
 //! are either one shared VM, or a VM per connection cloned from a snapshot
 //! (`route`, `vm`), within the VMs' budget (`capacity`).
+//!
+//! The processes' output in the VMs reaches the wicket's stdout / stderr, and
+//! with `--flume` the live access log (`output`, through `sluice-wicket-tunnel`'s
+//! feed).
 
 pub mod capacity;
 pub mod config;
 pub mod listener;
+pub mod output;
 pub mod route;
 pub mod routes;
 pub mod vm;
@@ -29,6 +34,7 @@ pub mod wire;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use sluice_wicket_tunnel::flume::{self, Tap};
 use sluice_wicket_tunnel::proto::PeerBuild;
 use sluice_wicket_tunnel::session::{self, Shared};
 use sluice_wicket_tunnel::signals::{self, Signals};
@@ -36,6 +42,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use capacity::Capacity;
+use output::{Printer, Sink};
 use routes::Reloader;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -76,6 +83,7 @@ pub async fn run(settings: config::Settings, state_dir: PathBuf) -> Result<(), B
         max_memory,
         watch_interval,
         state_dir: _,
+        flume,
         routes,
         specs,
     } = settings;
@@ -96,8 +104,19 @@ pub async fn run(settings: config::Settings, state_dir: PathBuf) -> Result<(), B
         "VM limit {max_vms}, guest memory limit {}",
         max_memory.map_or("none".to_string(), |mib| format!("{mib} MiB"))
     );
-    let reloader = Reloader::start(routes, specs, capacity, state_dir).await?;
+    let tap = match flume {
+        Some(_) => Tap::new(),
+        None => Tap::off(),
+    };
+    let sink = Arc::new(Sink {
+        printer: Printer::stdio(),
+        tap: tap.clone(),
+    });
+    let reloader = Reloader::start(routes, specs, capacity, state_dir, sink).await?;
     let routes = reloader.routes().clone();
+    if let Some(flume) = flume {
+        flume::start(flume, tap, &client_id)?;
+    }
     println!(
         "routes: {}; watching their files every {}ms (0 = off), SIGHUP reloads",
         routes.current().advertised_hosts(),

@@ -3,8 +3,10 @@
 //! http/1.1 with keep-alive, h2c, a 5MB POST under the tunnel's flow control
 //! and a client half-closing after its request; a route of one VM at most
 //! failing the connection that finds no room in time, its clones restored
-//! with the clock of the moment and random state of their own; a reload of
-//! the `--config` file, polled, removing a route and replacing a rootfs.
+//! with the clock of the moment and random state of their own; the VMs'
+//! output -- a shared VM's, a template's, a clone's -- on the wicket's stdout /
+//! stderr and on a flume (`sluice-wicket-tunnel`'s double); a reload of the
+//! `--config` file, polled, removing a route and replacing a rootfs.
 //!
 //! Skipped where `/dev/kvm` is not usable. Elsewhere it needs Firecracker
 //! (`SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER`, else `firecracker` on
@@ -29,6 +31,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use sluice_wicket_tunnel::flume::testing::{FeedStream, flume_server};
+use sluice_wicket_tunnel::proto::{AccessFilter, feed_message};
 use sluice_wicket_tunnel::session::testing::{ServerTunnel, dial_address, tunnel_server};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -90,7 +94,19 @@ async fn every_route_serves_http_through_the_tunnel() {
         rootfs.display()
     );
     std::fs::write(&config, format!("{routes}{capped}")).unwrap();
-    let mut args = vec!["--config".to_string(), config.display().to_string()];
+    let (flume, mut feeds) = flume_server().await;
+    let mut args: Vec<String> = [
+        "--config",
+        &config.display().to_string(),
+        "--client-id",
+        "vm-test",
+        "--flume",
+        &flume,
+        "--flume-token",
+        "f1ume",
+    ]
+    .map(String::from)
+    .into();
     args.extend(extra.iter().flat_map(|vm| ["--vm".to_string(), vm.clone()]));
     let (url, mut streams) = tunnel_server(None).await;
     let wicket = match &image {
@@ -106,6 +122,17 @@ async fn every_route_serves_http_through_the_tunnel() {
         .flatten()
         .unwrap_or_else(|| panic!("no tunnel stream; {}", wicket.log()));
     let (tunnel, advertise) = ServerTunnel::new(stream).await;
+    let mut feed = tokio::time::timeout(HANG, feeds.recv())
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| panic!("no feed stream; {}", wicket.log()));
+    assert_eq!(feed.authorization.as_deref(), Some("Bearer f1ume"));
+    let feed_message::Body::Hello(hello) = feed.next().await else {
+        panic!("no hello first");
+    };
+    assert_eq!(hello.node_id, "wicket:vm-test");
+    feed.start(0, AccessFilter::default());
     let build = advertise.build.clone().expect("the wicket's build");
     assert_eq!(build.implementation, "sluice-wicket-runtime-firecracker");
     let hosts: Vec<_> = advertise.upstreams.iter().map(|up| &up.host).collect();
@@ -139,6 +166,13 @@ async fn every_route_serves_http_through_the_tunnel() {
         let checked = tokio::time::timeout(HANG, route.check(&mut conn_id, sample, before)).await;
         assert!(checked.is_ok(), "{}: hung; {}", route.host, wicket.log());
     }
+
+    let output = output(&tunnel, &target, &mut conn_id, &wicket, &mut feed);
+    assert!(
+        tokio::time::timeout(HANG, output).await.is_ok(),
+        "the VMs' output: hung; {}",
+        wicket.log()
+    );
 
     // reloads, once a poll found the files quiet: the config file's alone
     // (capped.local removed), then the shared rootfs replaced
@@ -180,6 +214,123 @@ async fn every_route_serves_http_through_the_tunnel() {
         assert!(Instant::now() < deadline, "capped.local is still served");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// The VMs' output: the sample guest's line at its start and its two lines (stdout,
+/// stderr) per `/log` request, of a shared VM (serving two hosts), a template and a
+/// clone, reach the wicket's stdout / stderr named after the route's hosts and the VM,
+/// and the flume as lines of the route's first host naming the VM. A clone's lines are
+/// its own: the template's start line comes once, not again from its clones.
+async fn output(
+    tunnel: &ServerTunnel,
+    target: &impl Fn(&str) -> String,
+    conn_id: &mut i64,
+    wicket: &Wicket,
+    feed: &mut FeedStream,
+) {
+    let route = |host| Route {
+        tunnel,
+        host,
+        address: dial_address(&target(host)),
+    };
+    *conn_id += 1;
+    let shared = route("alias.local").get(*conn_id, "/log").await;
+    let (served, booted) = (
+        field(&shared, "served by this VM: "),
+        field(&shared, "boot id: "),
+    );
+    *conn_id += 1;
+    // a clone counts from its first request, of its template's boot id
+    let cloned = route("clone.local").get(*conn_id, "/log").await;
+    assert_eq!(field(&cloned, "served by this VM: "), "1", "{cloned}");
+    let template = field(&cloned, "boot id: ");
+    let request =
+        |served: &str, boot: &str| format!("GET /log, request {served} of boot id {boot}");
+    let started = |boot: &str| format!("hello server, boot id {boot}");
+    let shared = "shared.local, alias.local vm-0";
+    let printed = [
+        format!("stdout [{shared}] :: {}", started(booted)),
+        format!("stdout [{shared}] :: {}", request(served, booted)),
+        format!("stderr [{shared}] :: {}", request(served, booted)),
+        format!("stdout [clone.local template] :: {}", started(template)),
+    ];
+    // the clone's VM is the route's vm-<n>
+    let of_clone = |stream: &str, line: &str| {
+        let rest = line.strip_prefix(&format!("{stream} [clone.local vm-"))?;
+        let (n, rest) = rest.split_once("] :: ")?;
+        (rest == request("1", template) && n.parse::<u64>().is_ok()).then(|| format!("vm-{n}"))
+    };
+    let deadline = Instant::now() + HANG;
+    let clone = loop {
+        let log = std::fs::read_to_string(&wicket.log).unwrap_or_default();
+        let lines: Vec<&str> = log.lines().collect();
+        let clone = lines.iter().find_map(|line| of_clone("stdout", line));
+        if let Some(clone) = clone
+            && printed.iter().all(|line| lines.contains(&line.as_str()))
+            && lines
+                .iter()
+                .any(|line| of_clone("stderr", line).as_ref() == Some(&clone))
+        {
+            let again = started(template);
+            let starts = lines.iter().filter(|line| line.ends_with(&again)).count();
+            assert_eq!(starts, 1, "the template's start, once; {}", wicket.log());
+            break clone;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the VMs' lines are not on the wicket's stdout / stderr; {}",
+            wicket.log()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let mut fed = Vec::new();
+    let expected = [
+        ("stdout", "shared.local", "vm-0", started(booted)),
+        ("stdout", "shared.local", "vm-0", request(served, booted)),
+        ("stderr", "shared.local", "vm-0", request(served, booted)),
+        ("stdout", "clone.local", "template", started(template)),
+        (
+            "stdout",
+            "clone.local",
+            clone.as_str(),
+            request("1", template),
+        ),
+        (
+            "stderr",
+            "clone.local",
+            clone.as_str(),
+            request("1", template),
+        ),
+    ];
+    while !expected.iter().all(|line| fed.contains(line)) {
+        let feed_message::Body::Event(event) = feed.next().await else {
+            continue;
+        };
+        let field = |name: &str| {
+            let field = event.fields.iter().find(|field| field.name == name);
+            field.map(|field| field.value.clone()).unwrap_or_default()
+        };
+        let (vm, line) = (field("vm"), field("line"));
+        let vm = expected
+            .iter()
+            .map(|(_, _, vm, _)| *vm)
+            .find(|known| *known == vm)
+            .unwrap_or("another");
+        let kind = if event.kind == "stdout" {
+            "stdout"
+        } else {
+            "stderr"
+        };
+        let route = ["shared.local", "clone.local"]
+            .into_iter()
+            .find(|host| *host == event.route_key)
+            .unwrap_or("another");
+        fed.push((kind, route, vm, line));
+    }
+    let again = started(template);
+    let starts = fed.iter().filter(|(_, _, _, line)| *line == again).count();
+    assert_eq!(starts, 1, "the template's start, once: {fed:?}");
 }
 
 /// A directory of its own under the system's temp dir (short paths: the VMs'
@@ -307,6 +458,21 @@ impl Route<'_> {
             field(&first, "random: "),
             "two clones of one snapshot draw alike"
         );
+    }
+
+    /// A GET of `path` on a connection of its own; its answer.
+    async fn get(&self, conn_id: i64, path: &str) -> String {
+        let io = TokioIo::new(self.tunnel.connect(conn_id, &self.address));
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(connection);
+        let request = hyper::Request::get(path)
+            .header("host", self.host)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), 200, "{}: GET {path}", self.host);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&body).into_owned()
     }
 
     /// Three http/1.1 requests on one connection; their bodies.
