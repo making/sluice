@@ -658,14 +658,15 @@ public class Router {
 
 	/**
 	 * Extracts {@code host[:port]} from an upstream URL; {@code null} when unparseable.
-	 * {@code wasm:} targets are component locators resolved by the client (file / oci /
-	 * s3 / ...): they pass through verbatim as the dial address.
+	 * Targets a wicket resolves itself pass through verbatim as the dial address:
+	 * {@code wasm:} component locators (file / oci / s3 / ...) and {@code firecracker:}
+	 * microVM specs.
 	 */
 	static Optional<String> addressOf(String targetUrl) {
 		if (targetUrl == null || targetUrl.isBlank()) {
 			return Optional.empty();
 		}
-		if (targetUrl.startsWith("wasm:")) {
+		if (targetUrl.startsWith("wasm:") || targetUrl.startsWith("firecracker:")) {
 			return Optional.of(targetUrl.trim());
 		}
 		try {

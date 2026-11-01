@@ -1,0 +1,393 @@
+//! The VMs' budget: the VMs alive at once (`--max-vms`) and their guest memory
+//! (`--max-memory`) over every route, and a route's own cap (`vms=N`). A VM
+//! holds its share, a [`Slot`], from before its `firecracker` starts until it is
+//! killed.
+//!
+//! Slots go to the VMs asking for one in the order they asked
+//! ([`Capacity::take`]), but for one held back by its route's cap alone, which
+//! keeps no other route waiting. A warm clone is restored only into room nobody
+//! waits for ([`Capacity::try_take`]), and gives its slot up to a VM that does:
+//! the first in line, finding no room within the global limits, has a warm clone
+//! of another route killed ([`Pool::evict`]).
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
+
+use tokio::sync::Notify;
+use tokio::time::Instant;
+
+/// What one VM takes: its guest memory, counted against its route's cap.
+#[derive(Clone, Copy, Debug)]
+pub struct Need {
+    /// MiB.
+    pub memory: u64,
+    pub route: u64,
+    /// The route's VMs alive at once at most; None = the global limits alone.
+    pub cap: Option<usize>,
+}
+
+/// Warm clones a route keeps ahead of its connections.
+pub trait Pool: Send + Sync {
+    /// Kills one idle clone, freeing its slot; false when there is none.
+    fn evict(&self) -> bool;
+}
+
+pub struct Capacity {
+    max_vms: usize,
+    /// MiB.
+    max_memory: u64,
+    state: Mutex<State>,
+    changed: Notify,
+}
+
+#[derive(Default)]
+struct State {
+    vms: usize,
+    memory: u64,
+    /// Route -> its VMs alive.
+    routes: HashMap<u64, usize>,
+    /// The VMs waiting for a slot, their tickets and needs, in the order they
+    /// asked.
+    waiting: VecDeque<(u64, Need)>,
+    next_ticket: u64,
+    /// Route -> its warm clones.
+    pools: Vec<(u64, Weak<dyn Pool>)>,
+}
+
+/// Why a VM finds no room.
+#[derive(Debug, PartialEq, Eq)]
+enum Short {
+    /// `--max-vms` or `--max-memory`: another route's warm clone may give way.
+    Global,
+    /// The route's own cap.
+    Route,
+}
+
+/// A VM's share of the budget, given back when dropped.
+pub struct Slot {
+    capacity: Arc<Capacity>,
+    need: Need,
+}
+
+impl std::fmt::Debug for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Slot").field("need", &self.need).finish()
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        {
+            let mut state = self.capacity.state.lock().unwrap();
+            state.vms -= 1;
+            state.memory -= self.need.memory;
+            if let Some(count) = state.routes.get_mut(&self.need.route) {
+                *count -= 1;
+            }
+        }
+        self.capacity.changed.notify_waiters();
+    }
+}
+
+/// No room was found in time.
+#[derive(Debug)]
+pub struct Full(String);
+
+impl std::fmt::Display for Full {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Full {}
+
+impl Capacity {
+    /// `max_memory` in MiB; None = no memory budget (`max_vms` x the largest
+    /// VM bounds it).
+    pub fn new(max_vms: usize, max_memory: Option<u64>) -> Arc<Capacity> {
+        Arc::new(Capacity {
+            max_vms,
+            max_memory: max_memory.unwrap_or(u64::MAX),
+            state: Mutex::default(),
+            changed: Notify::new(),
+        })
+    }
+
+    /// Lets a waiting VM of another route kill a warm clone of `pool`.
+    pub fn register(&self, route: u64, pool: Weak<dyn Pool>) {
+        self.state.lock().unwrap().pools.push((route, pool));
+    }
+
+    /// What keeps `need` out of `state`, if anything.
+    fn short(&self, state: &State, need: &Need) -> Option<Short> {
+        let alive = state.routes.get(&need.route).copied().unwrap_or(0);
+        if need.cap.is_some_and(|cap| alive >= cap) {
+            Some(Short::Route)
+        } else if state.vms >= self.max_vms
+            || state.memory.saturating_add(need.memory) > self.max_memory
+        {
+            Some(Short::Global)
+        } else {
+            None
+        }
+    }
+
+    fn grant(self: &Arc<Self>, state: &mut State, need: Need) -> Slot {
+        state.vms += 1;
+        state.memory += need.memory;
+        *state.routes.entry(need.route).or_default() += 1;
+        Slot {
+            capacity: self.clone(),
+            need,
+        }
+    }
+
+    /// Whether a VM waiting before `ticket` (every one, without) may take the
+    /// room: one held back by its route's cap alone may not.
+    fn ahead(&self, state: &State, ticket: Option<u64>) -> bool {
+        state
+            .waiting
+            .iter()
+            .take_while(|(queued, _)| Some(*queued) != ticket)
+            .any(|(_, need)| self.short(state, need) != Some(Short::Route))
+    }
+
+    /// A slot if one fits now and no VM waits for one: a warm clone's.
+    pub fn try_take(self: &Arc<Self>, need: Need) -> Option<Slot> {
+        let mut state = self.state.lock().unwrap();
+        (!self.ahead(&state, None) && self.short(&state, &need).is_none())
+            .then(|| self.grant(&mut state, need))
+    }
+
+    /// A slot in turn, within `wait`. The first in line finding no room
+    /// within the global limits has a warm clone of another route killed.
+    pub async fn take(self: &Arc<Self>, need: Need, wait: Duration) -> Result<Slot, Full> {
+        let deadline = Instant::now() + wait;
+        let ticket = {
+            let mut state = self.state.lock().unwrap();
+            let ticket = state.next_ticket;
+            state.next_ticket += 1;
+            state.waiting.push_back((ticket, need));
+            ticket
+        };
+        // gives the turn up when the wait is dropped (the connection ended)
+        let mut queued = Queued {
+            capacity: self,
+            ticket: Some(ticket),
+        };
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let evict = {
+                let mut state = self.state.lock().unwrap();
+                let first = !self.ahead(&state, Some(ticket));
+                match self.short(&state, &need) {
+                    None if first => {
+                        state.waiting.retain(|(queued, _)| *queued != ticket);
+                        queued.ticket = None;
+                        let slot = self.grant(&mut state, need);
+                        drop(state);
+                        // the next in line may fit too
+                        self.changed.notify_waiters();
+                        return Ok(slot);
+                    }
+                    Some(Short::Global) if first => Self::pool(&mut state, need.route),
+                    _ => None,
+                }
+            };
+            // outside the lock: the clone's slot takes it on its way out
+            if let Some(pool) = evict
+                && pool.evict()
+            {
+                continue;
+            }
+            tokio::select! {
+                () = notified => {}
+                () = tokio::time::sleep_until(deadline) => {
+                    let state = self.state.lock().unwrap();
+                    return Err(Full(format!(
+                        "no room for a VM within {}ms (VMs {}/{}, memory {}/{} MiB, the route's {}/{})",
+                        wait.as_millis(),
+                        state.vms,
+                        self.max_vms,
+                        state.memory,
+                        if self.max_memory == u64::MAX { "-".to_string() } else { self.max_memory.to_string() },
+                        state.routes.get(&need.route).copied().unwrap_or(0),
+                        need.cap.map_or("-".to_string(), |cap| cap.to_string()),
+                    )));
+                }
+            }
+        }
+    }
+
+    /// A pool of another route than `route` to evict from, dropping the gone
+    /// ones.
+    fn pool(state: &mut State, route: u64) -> Option<Arc<dyn Pool>> {
+        state.pools.retain(|(_, pool)| pool.strong_count() > 0);
+        state
+            .pools
+            .iter()
+            .filter(|(owner, _)| *owner != route)
+            .find_map(|(_, pool)| pool.upgrade())
+    }
+
+    /// A slot as soon as one fits with no VM waiting: a warm clone's.
+    pub async fn take_spare(self: &Arc<Self>, need: Need) -> Slot {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(slot) = self.try_take(need) {
+                return slot;
+            }
+            notified.await;
+        }
+    }
+
+    pub fn max_vms(&self) -> usize {
+        self.max_vms
+    }
+
+    /// MiB; None = no memory budget.
+    pub fn max_memory(&self) -> Option<u64> {
+        (self.max_memory != u64::MAX).then_some(self.max_memory)
+    }
+}
+
+/// A VM's place in line, given up when dropped before its turn came.
+struct Queued<'a> {
+    capacity: &'a Arc<Capacity>,
+    ticket: Option<u64>,
+}
+
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket {
+            self.capacity
+                .state
+                .lock()
+                .unwrap()
+                .waiting
+                .retain(|(queued, _)| *queued != ticket);
+            // the next in line may be first now
+            self.capacity.changed.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    fn need(memory: u64, route: u64, cap: Option<usize>) -> Need {
+        Need { memory, route, cap }
+    }
+
+    /// Warm clones held as slots, given up one by one.
+    struct Warm(Mutex<Vec<Slot>>, AtomicUsize);
+
+    impl Pool for Warm {
+        fn evict(&self) -> bool {
+            let evicted = self.0.lock().unwrap().pop().is_some();
+            if evicted {
+                self.1.fetch_add(1, Ordering::SeqCst);
+            }
+            evicted
+        }
+    }
+
+    /// The limits count VMs, memory and a route's VMs; a wait gets the slot
+    /// a VM gives back, in the order of asking, and a warm clone only takes
+    /// room nobody waits for.
+    #[tokio::test(start_paused = true)]
+    async fn slots_go_in_turn_within_the_limits() {
+        let capacity = Capacity::new(3, Some(1024));
+        let big = capacity
+            .take(need(768, 1, None), Duration::ZERO)
+            .await
+            .unwrap();
+        let small = capacity.try_take(need(128, 2, Some(1))).unwrap();
+        assert!(
+            capacity.try_take(need(128, 2, Some(1))).is_none(),
+            "the route's cap"
+        );
+        assert!(
+            capacity.try_take(need(256, 3, None)).is_none(),
+            "the memory: 768 + 128 + 256"
+        );
+        let full = capacity
+            .take(need(256, 3, None), Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(full.to_string().contains("memory 896/1024 MiB"), "{full}");
+
+        let waiting = tokio::spawn({
+            let capacity = capacity.clone();
+            async move {
+                capacity
+                    .take(need(256, 3, None), Duration::from_secs(10))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            capacity.try_take(need(64, 4, None)).is_none(),
+            "room nobody waits for only"
+        );
+        drop(big);
+        let third = waiting.await.unwrap().unwrap();
+        assert!(
+            capacity.try_take(need(64, 4, None)).is_some(),
+            "and the rest"
+        );
+        drop((small, third));
+    }
+
+    /// The first in line short of global room has another route's warm clone
+    /// killed; a route at its own cap waits for its own VMs.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_has_another_routes_warm_clone_give_way() {
+        let capacity = Capacity::new(2, None);
+        let warm = Arc::new(Warm(
+            Mutex::new(vec![
+                capacity.try_take(need(128, 1, None)).unwrap(),
+                capacity.try_take(need(128, 1, None)).unwrap(),
+            ]),
+            AtomicUsize::new(0),
+        ));
+        let pool: Arc<dyn Pool> = warm.clone();
+        capacity.register(1, Arc::downgrade(&pool));
+
+        let slot = capacity
+            .take(need(128, 2, None), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(warm.1.load(Ordering::SeqCst), 1, "one clone gave way");
+
+        // route 1 at its cap waits for its own VMs, and keeps nobody waiting
+        let capped = tokio::spawn({
+            let capacity = capacity.clone();
+            async move {
+                capacity
+                    .take(need(128, 1, Some(1)), Duration::from_millis(50))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(slot);
+        let other = capacity
+            .take(need(128, 3, None), Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(
+            capped.await.unwrap().is_err(),
+            "its own route's clone is no room for a route at its cap"
+        );
+        assert_eq!(warm.1.load(Ordering::SeqCst), 1);
+        drop(other);
+    }
+}

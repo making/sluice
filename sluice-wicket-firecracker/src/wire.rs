@@ -8,20 +8,57 @@
 //!
 //! The guest has a copy of this module (`guest/src/wire.rs`): keep them alike.
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 const DATA: u8 = 0;
 const CLOSE: u8 = 1;
 
-/// Writes `payload` as one DATA frame.
+/// A frame's head: its type and its payload's length.
+const HEAD: usize = 5;
+
+/// The most payload [`relay`] puts in a frame.
+const MAX_PAYLOAD: usize = 16 * 1024;
+
+/// The vsock port of the guest's control stream, which carries the wicket's
+/// notice to a VM just restored from a snapshot (a clone): `RESTORED <seed: 64 hex
+/// digits>\n`, answered `OK\n` once the guest put the seed into its kernel's random
+/// pool and reseeded it, and ran the image's restore hook. A clone's memory is its
+/// snapshot's, random state included: the kernel reseeds on the VM generation
+/// change (VMGenID) a moment after the restore, a process's own generator never.
+pub const CONTROL_PORT: u32 = 1024;
+
+/// The restore notice carrying `seed`.
+#[allow(dead_code)] // the wicket's half: each copy has both
+pub fn restored(seed: &[u8; 32]) -> String {
+    let hex: String = seed.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("RESTORED {hex}\n")
+}
+
+/// The seed of a restore notice's line (its newline trimmed); None for another line.
+#[allow(dead_code)] // the guest's half: each copy has both
+pub fn seed(line: &str) -> Option<[u8; 32]> {
+    let hex = line.strip_prefix("RESTORED ")?;
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut seed = [0u8; 32];
+    for (i, byte) in seed.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(seed)
+}
+
+/// Writes `payload` as one DATA frame, in one write: a vsock packet per write.
+#[allow(dead_code)] // the wicket's (its template's priming): each copy has it
 pub async fn write_data<W: AsyncWrite + Unpin>(
     writer: &mut W,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    let mut head = [DATA, 0, 0, 0, 0];
-    head[1..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-    writer.write_all(&head).await?;
-    writer.write_all(payload).await
+    let mut frame = Vec::with_capacity(HEAD + payload.len());
+    frame.push(DATA);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    writer.write_all(&frame).await
 }
 
 /// Writes the half-close: no DATA follows from this side.
@@ -40,9 +77,10 @@ pub enum Read {
     Eof,
 }
 
-/// Reads the frames of one direction, payload in pieces as large as the caller takes.
+/// Reads the frames of one direction, payload in pieces as large as the caller
+/// takes; buffered: a read takes the heads and the payloads that arrived together.
 pub struct Reader<R> {
-    inner: R,
+    inner: BufReader<R>,
     /// Payload bytes of the current DATA frame not read yet.
     remaining: usize,
 }
@@ -50,7 +88,8 @@ pub struct Reader<R> {
 impl<R: AsyncRead + Unpin> Reader<R> {
     pub fn new(inner: R) -> Self {
         Reader {
-            inner,
+            // a page: a small frame whole, a large one's payload read past it
+            inner: BufReader::with_capacity(4096, inner),
             remaining: 0,
         }
     }
@@ -58,11 +97,11 @@ impl<R: AsyncRead + Unpin> Reader<R> {
     /// Reads at most `buf.len()` (non-zero) payload bytes, or the next CLOSE / EOF.
     pub async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<Read> {
         while self.remaining == 0 {
-            let mut head = [0u8; 5];
-            match self.inner.read(&mut head[..1]).await? {
-                0 => return Ok(Read::Eof),
-                _ => self.inner.read_exact(&mut head[1..]).await?,
-            };
+            if self.inner.fill_buf().await?.is_empty() {
+                return Ok(Read::Eof);
+            }
+            let mut head = [0u8; HEAD];
+            self.inner.read_exact(&mut head).await?;
             match head[0] {
                 DATA => {
                     self.remaining =
@@ -98,7 +137,7 @@ where
     let (framed_reader, mut framed_writer) = tokio::io::split(framed);
     let mut framed_reader = Reader::new(framed_reader);
     let inbound = async {
-        let mut buffer = vec![0u8; 16 * 1024];
+        let mut buffer = vec![0u8; MAX_PAYLOAD];
         loop {
             match framed_reader.read(&mut buffer).await? {
                 Read::Data(n) => plain_writer.write_all(&buffer[..n]).await?,
@@ -108,13 +147,16 @@ where
         }
     };
     let outbound = async {
-        let mut buffer = vec![0u8; 16 * 1024];
+        // the payload read behind room for its head: a frame is one write
+        let mut frame = vec![0u8; HEAD + MAX_PAYLOAD];
         loop {
-            let n = plain_reader.read(&mut buffer).await?;
+            let n = plain_reader.read(&mut frame[HEAD..]).await?;
             if n == 0 {
                 return write_close(&mut framed_writer).await;
             }
-            write_data(&mut framed_writer, &buffer[..n]).await?;
+            frame[0] = DATA;
+            frame[1..HEAD].copy_from_slice(&(n as u32).to_be_bytes());
+            framed_writer.write_all(&frame[..HEAD + n]).await?;
         }
     };
     tokio::try_join!(inbound, outbound).map(|_| ())

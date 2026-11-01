@@ -11,6 +11,7 @@ on:
     - 'sluice-flume/**'
     - 'sluice-wicket-wasi/**'
     - 'sluice-wicket-cf-api/**'
+    - 'sluice-wicket-firecracker/**'
     - 'sluice-build-info/**'
     - 'sluice-oidc/**'
     - 'sluice-tunnel/**'
@@ -42,6 +43,7 @@ jobs:
       flume: ${{ steps.filter.outputs.flume }}
       wicket: ${{ steps.filter.outputs.wicket }}
       cf-api: ${{ steps.filter.outputs.cf-api }}
+      firecracker: ${{ steps.filter.outputs.firecracker }}
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -84,6 +86,11 @@ jobs:
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
           - '.github/workflows/deploy-cf-api.yaml'
+          firecracker:
+          - 'sluice-wicket-firecracker/**'
+          - 'sluice-tunnel/**'
+          - 'sluice-proto/src/main/proto/**'
+          - '.github/workflows/rust.yaml'
   sluice-build-info:
     needs: changes
     if: needs.changes.outputs.build-info == 'true'
@@ -276,3 +283,67 @@ jobs:
       run: cargo clippy --all-targets --locked -- -D warnings
     - name: Test
       run: cargo test --locked
+  # The wicket's VM test boots Firecracker microVMs where the runner exposes /dev/kvm (made
+  # usable for the runner's user by a udev rule) and is skipped where it does not; Firecracker
+  # and the guest kernel are pinned here, checksums verified. Its guest (guest/, the VMs'
+  # /init on musl) is its own workspace, linted and tested apart.
+  sluice-wicket-firecracker:
+    needs: changes
+    if: needs.changes.outputs.firecracker == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: sluice-wicket-firecracker
+    env:
+      SLUICE_FIRECRACKER: /usr/local/bin/firecracker
+      SLUICE_FIRECRACKER_KERNEL: /opt/firecracker/vmlinux
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Install protoc
+      run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends protobuf-compiler
+    - name: KVM
+      run: |
+        if [ -e /dev/kvm ]; then
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+        fi
+        ls -l /dev/kvm || echo "no /dev/kvm: the VM test is skipped"
+    - name: Firecracker and a guest kernel
+      working-directory: ${{ runner.temp }}
+      run: |
+        FC=v1.17.0 ARCH=x86_64
+        curl -fsSLO https://github.com/firecracker-microvm/firecracker/releases/download/$FC/firecracker-$FC-$ARCH.tgz
+        echo "06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558  firecracker-$FC-$ARCH.tgz" | sha256sum -c
+        tar xzf firecracker-$FC-$ARCH.tgz
+        sudo install -D release-$FC-$ARCH/firecracker-$FC-$ARCH "$SLUICE_FIRECRACKER"
+        curl -fsSL -o vmlinux https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20261028-84df49062576-0/x86_64/vmlinux-6.18.56
+        echo "a00c1f68304e83ae4e0b5afe88972ad23fda52ed1a40335611aa18faa95d1b10  vmlinux" | sha256sum -c
+        sudo install -D -m 0644 vmlinux "$SLUICE_FIRECRACKER_KERNEL"
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          sluice-wicket-firecracker/target
+          sluice-wicket-firecracker/guest/target
+        key: cargo-firecracker-${{ runner.os }}-${{ hashFiles('sluice-wicket-firecracker/Cargo.lock', 'sluice-wicket-firecracker/guest/Cargo.lock', 'sluice-wicket-firecracker/rust-toolchain.toml', 'sluice-wicket-firecracker/guest/rust-toolchain.toml') }}
+    # the toolchains rust-toolchain.toml pins, the guest's with the musl target
+    - name: Toolchains
+      run: |
+        rustup toolchain install
+        (cd guest && rustup toolchain install)
+    - name: Format
+      run: |
+        cargo fmt --check
+        (cd guest && cargo fmt --check)
+    - name: Clippy
+      run: |
+        cargo clippy --all-targets --locked -- -D warnings
+        (cd guest && cargo clippy --all-targets --locked -- -D warnings)
+    - name: Test
+      run: |
+        cargo test --locked
+        (cd guest && cargo test --locked)

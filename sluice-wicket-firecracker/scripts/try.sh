@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Spike helper: runs the debug build of the wicket in local mode (--listen) with the CI kernel.
+# Runs the debug build of the wicket in local mode (--listen) with the kernel of the README's Setup.
 # Usage: scripts/try.sh <rootfs.ext4> <route query> [port]
 set -euo pipefail
 cd "$(dirname "$0")/.."

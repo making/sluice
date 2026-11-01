@@ -6,6 +6,8 @@ import java.util.Map;
 
 import am.ik.sluice.v1.proto.Upstream;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -232,12 +234,13 @@ class RouterTest {
 		assertThat(router.register("c1", List.of(upstream("a", "::::")))).isZero();
 	}
 
-	@Test
-	void wasmLocatorTargetIsPassedThroughVerbatim() {
+	@ParameterizedTest
+	@ValueSource(
+			strings = { "wasm:file:///opt/hello.wasm", "firecracker:/var/lib/vms/app.ext4?mode=per-connection&warm=4" })
+	void wicketTargetIsPassedThroughVerbatim(String target) {
 		Router router = new Router();
-		String locator = "wasm:file:///opt/hello.wasm";
-		assertThat(router.register("c1", List.of(upstream("demo.local", locator)))).isOne();
-		assertThat(router.lookup("demo.local").orElseThrow().address()).isEqualTo(locator);
+		assertThat(router.register("c1", List.of(upstream("demo.local", target)))).isOne();
+		assertThat(router.lookup("demo.local").orElseThrow().address()).isEqualTo(target);
 	}
 
 	private static Upstream portUpstream(int listenPort, String targetUrl) {

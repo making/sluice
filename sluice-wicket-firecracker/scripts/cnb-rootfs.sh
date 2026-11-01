@@ -3,6 +3,8 @@
 # the image's filesystem (docker export), the guest as /init, and /sluice/init.json
 # holding what the image's config says to run (Entrypoint + Cmd, Env, User, WorkingDir).
 # Usage: scripts/cnb-rootfs.sh <image> <out.ext4> [port]   (port: the process's, default 8080)
+# SLUICE_RESTORE='["<program>", "<arg>", ...]' sets the restore hook, which /init runs in
+# each clone as the image's user before the clone serves (SLUICE_RESTORE_GENERATION set).
 # Needs docker and sudo (the files keep the image's owners).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -19,8 +21,11 @@ sudo install -m 0755 guest/target/x86_64-unknown-linux-musl/release/sluice-firec
 printf '127.0.0.1 localhost sluice\n' | sudo tee "$work/root/etc/hosts" >/dev/null
 sudo mkdir -p "$work/root/sluice"
 python3 -I - "$work/config.json" "$work/root" "$port" <<'PY' | sudo tee "$work/root/sluice/init.json" >/dev/null
-import json, sys
+import json, os, sys
 config, root, port = json.load(open(sys.argv[1])), sys.argv[2], int(sys.argv[3])
+restore = json.loads(os.environ.get("SLUICE_RESTORE") or "[]")
+if not isinstance(restore, list) or not all(isinstance(arg, str) for arg in restore):
+    raise SystemExit("SLUICE_RESTORE: a JSON array of strings, the hook's argv")
 
 def lookup(table, name):
     # numeric, or a name in the image's /etc/passwd / /etc/group
@@ -49,6 +54,7 @@ print(json.dumps({
     "gid": gid,
     "workdir": config.get("WorkingDir") or "/",
     "port": port,
+    "restore": restore,
 }, indent=2))
 PY
 sudo cat "$work/root/sluice/init.json" >&2

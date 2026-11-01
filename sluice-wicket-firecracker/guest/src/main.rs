@@ -11,12 +11,17 @@
 //!
 //! The vsock port opens once the process accepts: the wicket takes the guest as ready
 //! (or snapshots it) when it does.
+//!
+//! A VM cloned from a snapshot gets the wicket's restore notice on the control port
+//! (`wire::CONTROL_PORT`): /init puts its seed into the kernel's random pool, reseeds
+//! it, and runs the image's restore hook (`restore` in `/sluice/init.json`, as the
+//! image's user, `SLUICE_RESTORE_GENERATION` set) before it answers.
 
 use std::convert::Infallible;
 use std::ffi::CString;
 use std::os::unix::process::CommandExt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -24,6 +29,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use serde::Deserialize;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
 
 mod wire;
@@ -37,6 +43,19 @@ const LAUNCH_CONFIG: &str = "/sluice/init.json";
 
 static SERVED: AtomicU64 = AtomicU64::new(0);
 
+/// Hello mode's random state, of its own (as a process's generator is): seeded at
+/// boot, so a clone has its snapshot's until the restore notice reseeds it.
+static RANDOM: AtomicU64 = AtomicU64::new(0);
+
+/// The restores of this VM, as the restore hook sees them.
+static RESTORES: AtomicU64 = AtomicU64::new(0);
+
+/// `RNDADDENTROPY`: `_IOW('R', 0x03, int[2])`.
+const RNDADDENTROPY: libc::c_ulong = 0x4008_5203;
+
+/// `RNDRESEEDCRNG`: `_IO('R', 0x07)`.
+const RNDRESEEDCRNG: libc::c_ulong = 0x5207;
+
 /// The process to run, from the image's config.
 #[derive(Deserialize)]
 struct Launch {
@@ -49,6 +68,9 @@ struct Launch {
     workdir: String,
     /// The TCP port the process listens on (also set as `PORT`).
     port: u16,
+    /// The restore hook: run after each restore of a clone, before it serves.
+    #[serde(default)]
+    restore: Vec<String>,
 }
 
 fn main() {
@@ -63,12 +85,30 @@ fn main() {
             park()
         })
     });
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
+    // a worker per vCPU: the relay (and hello mode's server) on every one; on a
+    // single vCPU a runtime of one thread (no handoffs between threads)
+    let runtime = match std::thread::available_parallelism().map_or(1, |n| n.get()) {
+        1 => tokio::runtime::Builder::new_current_thread(),
+        vcpus => {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.worker_threads(vcpus);
+            builder
+        }
+    }
+    .enable_all()
+    .build()
+    .expect("runtime");
     let result = runtime.block_on(async {
         loopback_up()?;
+        let hook = launch.as_ref().map(|launch| Hook {
+            argv: launch.restore.clone(),
+            env: launch.env.clone(),
+            uid: launch.uid,
+            gid: launch.gid,
+            workdir: launch.workdir.clone(),
+        });
+        let control = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, wire::CONTROL_PORT))?;
+        tokio::spawn(control_loop(control, hook));
         let port = match launch {
             Some(launch) => {
                 let port = launch.port;
@@ -199,6 +239,117 @@ fn start(launch: Launch) -> std::io::Result<()> {
     Ok(())
 }
 
+/// What the restore hook runs as: the image's process's user, environment and
+/// directory.
+struct Hook {
+    argv: Vec<String>,
+    env: Vec<String>,
+    uid: u32,
+    gid: u32,
+    workdir: String,
+}
+
+/// Answers each restore notice of the wicket's (one per restore): the seed into
+/// the kernel's random pool, the pool reseeded, hello mode's generator reseeded,
+/// the hook run; then `OK`.
+async fn control_loop(listener: VsockListener, hook: Option<Hook>) {
+    let hook = std::sync::Arc::new(hook);
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let hook = hook.clone();
+        tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut line = String::new();
+            let mut reader = tokio::io::BufReader::new(reader);
+            if reader.read_line(&mut line).await.is_err() {
+                return;
+            }
+            let answer = match wire::seed(line.trim_end()) {
+                Some(seed) => match restored(&seed, &hook).await {
+                    Ok(()) => "OK\n".to_string(),
+                    Err(e) => format!("ERR {e}\n"),
+                },
+                None => "ERR not a restore notice\n".to_string(),
+            };
+            let _ = writer.write_all(answer.as_bytes()).await;
+        });
+    }
+}
+
+async fn restored(seed: &[u8; 32], hook: &std::sync::Arc<Option<Hook>>) -> std::io::Result<()> {
+    reseed(seed)?;
+    RANDOM.store(
+        u64::from_le_bytes(seed[..8].try_into().unwrap()),
+        Ordering::Relaxed,
+    );
+    let generation = RESTORES.fetch_add(1, Ordering::Relaxed) + 1;
+    let Some(hook) = hook.as_ref().as_ref().filter(|hook| !hook.argv.is_empty()) else {
+        return Ok(());
+    };
+    let (program, args) = hook.argv.split_first().expect("not empty");
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .env_clear()
+        .envs(hook.env.iter().filter_map(|pair| pair.split_once('=')))
+        .env("SLUICE_RESTORE_GENERATION", generation.to_string())
+        .current_dir(&hook.workdir);
+    let (uid, gid) = (hook.uid, hook.gid);
+    // SAFETY: as for the process (`start`)
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setgroups(0, std::ptr::null()) != 0
+                || libc::setgid(gid) != 0
+                || libc::setuid(uid) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let status = tokio::task::spawn_blocking(move || command.status())
+        .await
+        .map_err(std::io::Error::other)??;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "restore hook {program}: {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Puts `seed` into the kernel's random pool, credited, and reseeds the pool
+/// from it at once, ahead of the VM generation change it may not have taken yet.
+fn reseed(seed: &[u8; 32]) -> std::io::Result<()> {
+    #[repr(C)]
+    struct PoolInfo {
+        entropy_count: libc::c_int,
+        buf_size: libc::c_int,
+        buf: [u8; 32],
+    }
+    let info = PoolInfo {
+        entropy_count: 256,
+        buf_size: 32,
+        buf: *seed,
+    };
+    let random = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/urandom")?;
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&random);
+    // SAFETY: the ioctls of random(4) on an open /dev/urandom, `info` laid out
+    // as its struct rand_pool_info
+    unsafe {
+        if libc::ioctl(fd, RNDADDENTROPY as _, &info) != 0
+            || libc::ioctl(fd, RNDRESEEDCRNG as _) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Relays every vsock stream to `127.0.0.1:port`, once the port accepts.
 async fn relay(port: u16, booted: Instant) -> std::io::Result<()> {
     let target = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -232,6 +383,10 @@ async fn hello(listener: tokio::net::TcpListener, booted: Instant) {
         .map(|id| id.trim().to_string())
         .unwrap_or_else(|_| "unknown (no /proc)".into());
     println!("guest: hello server, boot id {boot_id}");
+    let mut seed = [0u8; 8];
+    // SAFETY: getrandom into a buffer of its length
+    unsafe { libc::getrandom(seed.as_mut_ptr().cast(), seed.len(), 0) };
+    RANDOM.store(u64::from_le_bytes(seed), Ordering::Relaxed);
     let boot_id: &'static str = Box::leak(boot_id.into_boxed_str());
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -253,6 +408,16 @@ async fn hello(listener: tokio::net::TcpListener, booted: Instant) {
     }
 }
 
+/// The next value of hello mode's generator (splitmix64).
+fn next_random() -> u64 {
+    let mut z = RANDOM
+        .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
+        .wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 async fn answer(
     request: Request<hyper::body::Incoming>,
     booted: Instant,
@@ -270,13 +435,21 @@ async fn answer(
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-");
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
     let text = format!(
         "Hello from a Firecracker microVM\n\
          boot id: {boot_id}\n\
          served by this VM: {served}\n\
          since boot: {}ms\n\
+         time: {}.{:03}\n\
+         random: {:016x}\n\
          request: {} {} {:?}, {received} body bytes, x-forwarded-for {forwarded}\n",
         booted.elapsed().as_millis(),
+        now.as_secs(),
+        now.subsec_millis(),
+        next_random(),
         head.method,
         head.uri,
         head.version,

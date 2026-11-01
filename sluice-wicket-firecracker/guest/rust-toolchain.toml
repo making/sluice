@@ -1,0 +1,5 @@
+# The VMs' /init: static, for x86_64-unknown-linux-musl (rustup adds the target).
+[toolchain]
+channel = "1.99"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-musl"]

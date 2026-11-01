@@ -4,7 +4,16 @@
 //! The guest is reached over vsock only (no TAP device, so no root): Firecracker exposes
 //! the device as a Unix socket on the host, and a host-initiated stream is a connect to
 //! it followed by `CONNECT <port>\n`, answered `OK <host port>\n`.
+//!
+//! A VM never outlives the wicket: `firecracker` runs with the parent death signal set
+//! (SIGKILL). Setting it between fork and exec would make every spawn a fork of the
+//! wicket, whose page tables the fork copies holding the wicket's memory map lock (1-2ms
+//! of no page fault, no allocation growing the heap, on any of its threads, for every
+//! VM spawned); the wicket instead spawns itself (`posix_spawn`, no copy) as a launcher
+//! ([`launch`]) that sets the signal and execs `firecracker`.
 
+use std::ffi::OsString;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -18,6 +27,7 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
 use crate::BoxError;
+use crate::capacity::Slot;
 
 /// Guest CID of every VM: each VM has its own vsock device, so they need not differ.
 const GUEST_CID: u32 = 3;
@@ -25,8 +35,34 @@ const GUEST_CID: u32 = 3;
 /// How long the `firecracker` process may take to open its API socket.
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The first argument of the wicket's launcher mode, see [`launch`].
+pub const LAUNCH: &str = "--launch-vm";
+
+/// The launcher mode (`<wicket> --launch-vm <wicket pid> <program> <args>...`), run
+/// before anything else: sets the parent death signal (SIGKILL), checks that the
+/// parent is still the wicket of `<wicket pid>` (else it died before the signal was
+/// set, and exits), and execs the program. Returns only when that failed.
+pub fn launch(mut args: impl Iterator<Item = OsString>) -> std::io::Error {
+    let wicket = args
+        .next()
+        .and_then(|pid| pid.to_str()?.parse::<libc::pid_t>().ok());
+    let (Some(wicket), Some(program)) = (wicket, args.next()) else {
+        return std::io::Error::other(format!("usage: {LAUNCH} <wicket pid> <program> <args>..."));
+    };
+    // SAFETY: a plain prctl; the signal follows the parent thread, a runtime worker
+    // living as long as the wicket
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+        return std::io::Error::last_os_error();
+    }
+    // SAFETY: a plain getppid
+    if unsafe { libc::getppid() } != wicket {
+        return std::io::Error::other("the wicket ended before the VM started");
+    }
+    std::process::Command::new(program).args(args).exec()
+}
+
 /// What a route's VMs are booted from.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Spec {
     pub firecracker: PathBuf,
     pub kernel: PathBuf,
@@ -46,6 +82,8 @@ pub struct Snapshot {
 /// A running VM, killed and its directory removed on drop.
 pub struct Vm {
     child: Child,
+    /// The VM's share of the budget, given back once it is killed.
+    _slot: Slot,
     dir: PathBuf,
     api: PathBuf,
     vsock: PathBuf,
@@ -54,7 +92,7 @@ pub struct Vm {
 impl Vm {
     /// Starts `firecracker` in `dir` (created; its API socket, vsock socket and log go
     /// there) and waits for its API socket.
-    async fn spawn(firecracker: &Path, dir: PathBuf) -> Result<Vm, BoxError> {
+    async fn spawn(firecracker: &Path, dir: PathBuf, slot: Slot) -> Result<Vm, BoxError> {
         tokio::fs::create_dir_all(&dir).await?;
         let api = dir.join("api.sock");
         // sun_path holds 108 bytes, its NUL included
@@ -66,38 +104,29 @@ impl Vm {
             .into());
         }
         let log = std::fs::File::create(dir.join("firecracker.log"))?;
-        let mut command = Command::new(firecracker);
-        command
+        // the wicket itself, as the launcher (see `launch`): a posix_spawn, no fork
+        let child = Command::new("/proc/self/exe")
+            .arg(LAUNCH)
+            .arg(std::process::id().to_string())
+            .arg(firecracker)
             .arg("--api-sock")
             .arg(&api)
             .current_dir(&dir)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
-            .kill_on_drop(true);
-        // SAFETY: prctl is async-signal-safe. Killed with the wicket however it ends
-        // (a drop covers only an orderly end); the signal follows the spawning thread,
-        // a runtime worker living as long as the wicket
-        unsafe {
-            command.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = command
-            .spawn()
-            .map_err(|e| format!("{}: {e}", firecracker.display()))?;
-        let vm = Vm {
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut vm = Vm {
             child,
+            _slot: slot,
             vsock: dir.join("v.sock"),
             api,
             dir,
         };
         let deadline = Instant::now() + API_TIMEOUT;
         while UnixStream::connect(&vm.api).await.is_err() {
-            if Instant::now() > deadline {
+            if Instant::now() > deadline || vm.child.try_wait()?.is_some() {
                 return Err(format!("no API socket within {API_TIMEOUT:?}; {}", vm.log()).into());
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -106,8 +135,8 @@ impl Vm {
     }
 
     /// Boots a fresh VM of `spec` in `dir` (cold boot).
-    pub async fn boot(spec: &Spec, dir: PathBuf) -> Result<Vm, BoxError> {
-        let vm = Vm::spawn(&spec.firecracker, dir).await?;
+    pub async fn boot(spec: &Spec, dir: PathBuf, slot: Slot) -> Result<Vm, BoxError> {
+        let vm = Vm::spawn(&spec.firecracker, dir, slot).await?;
         vm.api(
             "PUT",
             "/machine-config",
@@ -148,8 +177,8 @@ impl Vm {
 
     /// Clones a running VM from `snapshot` into `dir`: its memory file is mapped
     /// private (copy on write), so clones share the pages they do not write.
-    pub async fn restore(snapshot: &Snapshot, dir: PathBuf) -> Result<Vm, BoxError> {
-        let vm = Vm::spawn(&snapshot.firecracker, dir).await?;
+    pub async fn restore(snapshot: &Snapshot, dir: PathBuf, slot: Slot) -> Result<Vm, BoxError> {
+        let vm = Vm::spawn(&snapshot.firecracker, dir, slot).await?;
         vm.api(
             "PUT",
             "/snapshot/load",
@@ -157,6 +186,9 @@ impl Vm {
                 "snapshot_path": snapshot.state,
                 "mem_backend": { "backend_type": "File", "backend_path": snapshot.memory },
                 "vsock_override": { "uds_path": vm.vsock },
+                // the clock advanced by the time since the snapshot, not resumed
+                // from it (x86_64)
+                "clock_realtime": true,
                 "resume_vm": true,
             }),
         )
@@ -282,5 +314,6 @@ fn boot_args() -> String {
         Some(_) => "console=ttyS0",
         None => "console=none 8250.nr_uarts=0",
     };
-    format!("{console} reboot=k panic=1 pci=off quiet init=/init")
+    // kvm-clock: the clock a restore advances (`clock_realtime`), the TSC it does not
+    format!("{console} reboot=k panic=1 pci=off quiet clocksource=kvm-clock init=/init")
 }

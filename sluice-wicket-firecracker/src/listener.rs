@@ -3,25 +3,31 @@
 
 use std::sync::Arc;
 
+use sluice_tunnel::routes::Routes;
 use tokio::net::TcpListener;
 
-use crate::route::Route;
+use crate::routes::Table;
 use crate::wire;
 
-pub async fn run(listener: TcpListener, route: Arc<Route>) {
+/// Serves each connection with the sole route of the table of the moment; a
+/// connection while the routes are not one is closed at once.
+pub async fn run(listener: TcpListener, routes: Arc<Routes<Table>>) {
     loop {
         let Ok((client, _)) = listener.accept().await else {
             continue;
         };
-        let route = route.clone();
+        let Some(route) = routes.current().sole() else {
+            eprintln!("listener: the routes are not one; closing the connection");
+            continue;
+        };
         tokio::spawn(async move {
             match route.open().await {
                 Ok(lease) => {
                     if let Err(e) = wire::relay(client, lease.stream).await {
-                        eprintln!("listener ({}): {e}", route.spec.host);
+                        eprintln!("listener ({}): {e}", route.label);
                     }
                 }
-                Err(e) => eprintln!("listener ({}): {e}", route.spec.host),
+                Err(e) => eprintln!("listener ({}): {e}", route.label),
             }
         });
     }

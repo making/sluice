@@ -11,9 +11,12 @@ snapshot per connection, discarded after it. Add the modes between them:
   count), scaling to zero when idle. It gives up isolation (a connection sees the state of
   the previous ones): state it per route
 - A pool of shared VMs per route, connections spread over them: fixed size, or grown and
-  shrunk with the load from the snapshot. Each VM has its own VMM thread, the suspected
-  bound of one shared VM's throughput (about 8k req/s keep-alive, 2.9k new connections/s
-  in the spike's measurement): measure whether N VMs give about N times that
+  shrunk with the load from the snapshot. The VMM thread turned out not to bound a shared
+  VM (at most 57% busy; the vCPUs are at 85-97%, see the README's Findings): `vcpus=N` on
+  one VM already scales it (the sample guest 10.8k req/s keep-alive on 1 vCPU, 13.1k on 2;
+  the CNB Go app 8.4k on 1, 15k on 4). Measure what a pool adds over that: N VMs of 1 vCPU
+  against one VM of N (throughput, memory, a VM's failure), and whether the vsock device's
+  single VMM thread shows past 4 vCPUs
 
 Measure each mode as the README's Findings table does (`oha -c 16` through the data plane,
 keep-alive and `--disable-keepalive`) and add the rows there.

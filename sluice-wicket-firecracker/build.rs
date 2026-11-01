@@ -1,23 +1,4 @@
-// Compiles the tunnel proto shared with the Java modules (single source of truth).
-use std::path::PathBuf;
-
+// Embeds the build identification (git commit, dirty flag, build time).
 fn main() {
-    let manifest_dir =
-        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let protos = manifest_dir
-        .parent()
-        .expect("crate below <repo>/sluice-wicket-firecracker")
-        .join("sluice-proto/src/main/proto");
-    tonic_prost_build::configure()
-        .build_server(false)
-        // the generated `connect` constructor collides with the `Tunnel/Connect` rpc
-        .build_transport(false)
-        .compile_protos(
-            &[
-                protos.join("sluice/v1/tunnel.proto"),
-                protos.join("sluice/v1/build.proto"),
-            ],
-            &[protos],
-        )
-        .expect("failed to compile the protos");
+    sluice_build_info::embed(&["build.rs", "Cargo.toml", "src"]);
 }

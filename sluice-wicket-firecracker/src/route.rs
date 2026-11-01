@@ -1,15 +1,16 @@
 //! A route: the VMs serving one host, and how a connection gets one of them.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 use crate::BoxError;
+use crate::capacity::{Capacity, Need, Pool, Slot};
 use crate::vm::{Snapshot, Spec, Vm};
 use crate::wire;
 
@@ -23,6 +24,16 @@ const RESTORE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Most clones of a route restored at once to refill its warm pool.
 const REFILL_WORKERS: usize = 8;
 
+/// How long a route's start may wait for room for its VM (a shared one, or the
+/// template): the room another route's start holds frees within it.
+const START_WAIT: Duration = Duration::from_secs(60);
+
+/// Default of `wait-ms`: how long a connection may wait for room for its VM.
+const DEFAULT_WAIT: Duration = Duration::from_secs(10);
+
+/// Names the routes for the budget, over every route the wicket ever started.
+static NEXT_ROUTE: AtomicU64 = AtomicU64::new(0);
+
 /// How a connection of the route gets its VM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -34,8 +45,8 @@ pub enum Mode {
     PerConnection,
 }
 
-/// One `--vm` flag.
-#[derive(Clone, Debug)]
+/// One route as configured: a `--vm` flag, or a route of the `--config` file.
+#[derive(Clone, Debug, PartialEq)]
 pub struct RouteSpec {
     pub host: String,
     pub vm: Spec,
@@ -47,25 +58,55 @@ pub struct RouteSpec {
     /// Per-connection mode: `GET /` requests sent to the template before its snapshot,
     /// so the clones start from a warmed-up process (JIT, lazily loaded code).
     pub prime: u32,
+    /// Per-connection mode: the route's VMs alive at once (warm, in use, the
+    /// template) at most; None = the global limits alone.
+    pub vms: Option<usize>,
+    /// Per-connection mode: how long a connection may wait for room for its VM.
+    pub wait: Duration,
 }
 
 impl RouteSpec {
-    /// Parses `host=<rootfs>[?mode=shared|per-connection&vcpus=N&mem=MiB&port=N&warm=N&prime=N]`.
+    /// Parses `host=<rootfs>[?mode=shared|per-connection&vcpus=N&mem=MiB&port=N&warm=N&prime=N&vms=N&wait-ms=N]`.
     pub fn parse(
         flag: &str,
         firecracker: &std::path::Path,
         kernel: &std::path::Path,
-    ) -> Result<RouteSpec, BoxError> {
+    ) -> Result<RouteSpec, String> {
         let (host, locator) = flag
             .split_once('=')
             .ok_or_else(|| format!("--vm {flag}: expected host=<rootfs>"))?;
         let (rootfs, query) = locator.split_once('?').unwrap_or((locator, ""));
+        let options = query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| pair.split_once('=').unwrap_or((pair, "")));
+        let rootfs = std::path::absolute(rootfs).map_err(|e| format!("--vm {flag}: {e}"))?;
+        RouteSpec::new(
+            &format!("--vm {flag}"),
+            host,
+            rootfs,
+            options,
+            firecracker,
+            kernel,
+        )
+    }
+
+    /// The route of `host` on `rootfs` (absolute) with `options`, the keys of a
+    /// `--vm` flag's query; `named` names it in an error.
+    pub fn new<'a>(
+        named: &str,
+        host: &str,
+        rootfs: PathBuf,
+        options: impl IntoIterator<Item = (&'a str, &'a str)>,
+        firecracker: &std::path::Path,
+        kernel: &std::path::Path,
+    ) -> Result<RouteSpec, String> {
         let mut spec = RouteSpec {
             host: host.to_string(),
             vm: Spec {
                 firecracker: firecracker.to_path_buf(),
                 kernel: kernel.to_path_buf(),
-                rootfs: std::path::absolute(rootfs)?,
+                rootfs,
                 vcpus: 1,
                 mem_mib: 128,
             },
@@ -73,20 +114,21 @@ impl RouteSpec {
             port: 8080,
             warm: 0,
             prime: 0,
+            vms: None,
+            wait: DEFAULT_WAIT,
         };
-        for pair in query.split('&').filter(|pair| !pair.is_empty()) {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            let number = || -> Result<u32, BoxError> {
+        for (key, value) in options {
+            let number = || -> Result<u32, String> {
                 value
                     .parse()
-                    .map_err(|_| format!("--vm {flag}: {key}={value} is not a number").into())
+                    .map_err(|_| format!("{named}: {key}={value} is not a number"))
             };
             match key {
                 "mode" => {
                     spec.mode = match value {
                         "shared" => Mode::Shared,
                         "per-connection" => Mode::PerConnection,
-                        _ => return Err(format!("--vm {flag}: unknown mode {value}").into()),
+                        _ => return Err(format!("{named}: unknown mode {value}")),
                     }
                 }
                 "vcpus" => spec.vm.vcpus = number()?,
@@ -94,25 +136,71 @@ impl RouteSpec {
                 "port" => spec.port = number()?,
                 "warm" => spec.warm = number()? as usize,
                 "prime" => spec.prime = number()?,
-                _ => return Err(format!("--vm {flag}: unknown key {key}").into()),
+                "vms" => spec.vms = Some(number()? as usize),
+                "wait-ms" => spec.wait = Duration::from_millis(u64::from(number()?)),
+                _ => return Err(format!("{named}: unknown key {key}")),
             }
         }
+        let per_connection = spec.mode == Mode::PerConnection;
+        if !per_connection && (spec.warm > 0 || spec.prime > 0 || spec.vms.is_some()) {
+            return Err(format!(
+                "{named}: warm, prime and vms need mode=per-connection"
+            ));
+        }
+        if let Some(vms) = spec.vms
+            && (vms == 0 || vms < spec.warm)
+        {
+            return Err(format!("{named}: vms must be at least 1 and at least warm"));
+        }
         if !spec.vm.rootfs.is_file() {
-            return Err(format!("--vm {flag}: {} is not a file", spec.vm.rootfs.display()).into());
+            return Err(format!(
+                "{named}: {} is not a file",
+                spec.vm.rootfs.display()
+            ));
         }
         Ok(spec)
     }
 
-    /// The target advertised for the route. The server dials `host[:port]` of a target
-    /// URL (only `wasm:` targets go verbatim), so every CONNECT for it names
-    /// [`RouteSpec::address`].
-    pub fn target(&self) -> String {
-        format!("firecracker://{}", self.host)
+    /// Whether `other` asks for the same VMs, its host aside.
+    pub fn same_vms(&self, other: &RouteSpec) -> bool {
+        let unhosted = |spec: &RouteSpec| RouteSpec {
+            host: String::new(),
+            ..spec.clone()
+        };
+        unhosted(self) == unhosted(other)
     }
 
-    /// What a CONNECT for the route names.
-    pub fn address(&self) -> String {
-        self.host.clone()
+    /// The target advertised for the route, which the server passes verbatim as the
+    /// dial address of its CONNECTs: `firecracker:<rootfs>`, plus the options set to
+    /// other than their defaults (`?mode=per-connection&vcpus=2...`, in a fixed order).
+    /// Routes of one target share its VMs.
+    pub fn target(&self) -> String {
+        let mut options = Vec::new();
+        if self.mode == Mode::PerConnection {
+            options.push("mode=per-connection".to_string());
+        }
+        for (key, value, default) in [
+            ("vcpus", self.vm.vcpus, 1),
+            ("mem", self.vm.mem_mib, 128),
+            ("port", self.port, 8080),
+            ("warm", self.warm as u32, 0),
+            ("prime", self.prime, 0),
+            ("vms", self.vms.unwrap_or(0) as u32, 0),
+            (
+                "wait-ms",
+                self.wait.as_millis() as u32,
+                DEFAULT_WAIT.as_millis() as u32,
+            ),
+        ] {
+            if value != default {
+                options.push(format!("{key}={value}"));
+            }
+        }
+        let rootfs = self.vm.rootfs.display();
+        match options.join("&") {
+            query if query.is_empty() => format!("firecracker:{rootfs}"),
+            query => format!("firecracker:{rootfs}?{query}"),
+        }
     }
 }
 
@@ -125,6 +213,13 @@ pub struct Lease {
 
 pub struct Route {
     pub spec: RouteSpec,
+    /// The hosts the route serves, for the log.
+    pub label: String,
+    /// The route's files (the template's snapshot, the clones'), removed with it.
+    dir: PathBuf,
+    capacity: Arc<Capacity>,
+    /// What each of the route's VMs takes of the budget.
+    need: Need,
     backend: Backend,
 }
 
@@ -134,8 +229,26 @@ enum Backend {
         snapshot: Snapshot,
         clones: Clones,
         /// Restored ahead of the connections, refilled as they are taken.
-        warm: Mutex<mpsc::Receiver<Vm>>,
+        warm: Arc<Warm>,
     },
+}
+
+/// A route's warm clones, which give their room up to another route's VM.
+struct Warm {
+    clones: Mutex<mpsc::Receiver<Vm>>,
+}
+
+impl Warm {
+    fn take(&self) -> Option<Vm> {
+        self.clones.lock().unwrap().try_recv().ok()
+    }
+}
+
+impl Pool for Warm {
+    fn evict(&self) -> bool {
+        // dropped: killed, its slot given back
+        self.take().is_some()
+    }
 }
 
 /// Names the clone directories of a route.
@@ -154,22 +267,47 @@ impl Clones {
 
 impl Route {
     /// Boots the route's VM (shared), or boots a template VM, snapshots it once its
-    /// guest listens and kills it (per-connection); `dir` holds the route's files.
-    pub async fn start(spec: RouteSpec, dir: PathBuf) -> Result<Route, BoxError> {
+    /// guest listens and kills it (per-connection); `dir` holds the route's files,
+    /// `label` names it in the log. Its VMs take their room from `capacity`.
+    pub async fn start(
+        spec: RouteSpec,
+        label: String,
+        dir: PathBuf,
+        capacity: Arc<Capacity>,
+    ) -> Result<Route, BoxError> {
+        let need = Need {
+            memory: u64::from(spec.vm.mem_mib),
+            route: NEXT_ROUTE.fetch_add(1, Ordering::Relaxed),
+            cap: spec.vms,
+        };
+        let slot = capacity
+            .take(need, START_WAIT)
+            .await
+            .map_err(|e| format!("route {label}: {e}"))?;
         let started = Instant::now();
-        let vm = Vm::boot(&spec.vm, dir.join("boot")).await?;
+        let vm = Vm::boot(&spec.vm, dir.join("boot"), slot).await?;
         drop(vm.dial_ready(spec.port, BOOT_TIMEOUT).await?);
         let booted = started.elapsed();
         let backend = match spec.mode {
             Mode::Shared => {
                 println!(
-                    "route {}: VM booted, guest listening after {}ms",
-                    spec.host,
+                    "route {label}: VM booted, guest listening after {}ms",
                     booted.as_millis()
                 );
                 Backend::Shared(vm)
             }
             Mode::PerConnection => {
+                // its clones are told they were restored: a guest predating the
+                // notice would fail every one of them
+                if let Err(e) = vm.dial(wire::CONTROL_PORT).await {
+                    return Err(format!(
+                        "route {label}: the guest takes no restore notice (vsock port {}): \
+                         its /init predates it, build the rootfs again (scripts/build-guest.sh, \
+                         scripts/cnb-rootfs.sh); {e}",
+                        wire::CONTROL_PORT
+                    )
+                    .into());
+                }
                 for _ in 0..spec.prime {
                     prime(&vm, spec.port).await?;
                 }
@@ -178,8 +316,7 @@ impl Route {
                 drop(vm);
                 let size = tokio::fs::metadata(&snapshot.memory).await?.len();
                 println!(
-                    "route {}: template booted in {}ms, primed with {} request(s), snapshot taken after {}ms ({} MiB memory file)",
-                    spec.host,
+                    "route {label}: template booted in {}ms, primed with {} request(s), snapshot taken after {}ms ({} MiB memory file)",
                     booted.as_millis(),
                     spec.prime,
                     started.elapsed().as_millis(),
@@ -190,6 +327,11 @@ impl Route {
                     next: Arc::default(),
                 };
                 let (refill, warm) = mpsc::channel(spec.warm.max(1));
+                let warm = Arc::new(Warm {
+                    clones: Mutex::new(warm),
+                });
+                let pool: Arc<dyn Pool> = warm.clone();
+                capacity.register(need.route, Arc::downgrade(&pool));
                 // restores run in parallel: one at a time caps the clone rate at about
                 // 1 / restore time
                 for _ in 0..spec.warm.min(REFILL_WORKERS) {
@@ -198,16 +340,25 @@ impl Route {
                         clones.clone(),
                         spec.port,
                         refill.clone(),
+                        capacity.clone(),
+                        need,
                     ));
                 }
                 Backend::PerConnection {
                     snapshot,
                     clones,
-                    warm: Mutex::new(warm),
+                    warm,
                 }
             }
         };
-        Ok(Route { spec, backend })
+        Ok(Route {
+            spec,
+            label,
+            dir,
+            capacity,
+            need,
+            backend,
+        })
     }
 
     /// A stream to a guest for one connection.
@@ -223,16 +374,20 @@ impl Route {
                 warm,
             } => {
                 let started = Instant::now();
-                let (vm, warm) = match warm.lock().await.try_recv() {
-                    Ok(vm) => (vm, true),
-                    Err(_) => (Vm::restore(snapshot, clones.next()).await?, false),
+                let warm = warm.take();
+                let (vm, warm) = match warm {
+                    Some(vm) => (vm, true),
+                    None => {
+                        let slot = self.capacity.take(self.need, self.spec.wait).await?;
+                        (clone(snapshot, clones.next(), slot).await?, false)
+                    }
                 };
                 let restored = started.elapsed();
                 let stream = vm.dial_ready(self.spec.port, RESTORE_TIMEOUT).await?;
                 if std::env::var_os("SLUICE_FIRECRACKER_TRACE").is_some() {
                     eprintln!(
                         "route {}: {} clone, restored in {}us, guest accepting after {}us",
-                        self.spec.host,
+                        self.label,
                         if warm { "warm" } else { "fresh" },
                         restored.as_micros(),
                         started.elapsed().as_micros()
@@ -245,6 +400,44 @@ impl Route {
             }
         }
     }
+}
+
+impl Drop for Route {
+    /// The last connection on the route ended, and the route left the table
+    /// (or never made it): its files go; its VMs, killed, after them.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A VM restored from `snapshot` into `dir`, told it was (`wire::CONTROL_PORT`):
+/// its random state reseeded from the host's, its restore hook run.
+async fn clone(snapshot: &Snapshot, dir: PathBuf, slot: Slot) -> Result<Vm, BoxError> {
+    let vm = Vm::restore(snapshot, dir, slot).await?;
+    let mut seed = [0u8; 32];
+    // SAFETY: getrandom into a buffer of its length
+    if unsafe { libc::getrandom(seed.as_mut_ptr().cast(), seed.len(), 0) } != seed.len() as isize {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut stream = vm.dial_ready(wire::CONTROL_PORT, RESTORE_TIMEOUT).await?;
+    // borrowed halves: an owned write half shuts the socket down when dropped,
+    // which Firecracker takes as the end of the whole stream (the answer lost)
+    let (reader, mut writer) = stream.split();
+    let answered = async {
+        writer.write_all(wire::restored(&seed).as_bytes()).await?;
+        let mut answer = String::new();
+        tokio::io::BufReader::new(reader)
+            .read_line(&mut answer)
+            .await?;
+        Ok::<_, std::io::Error>(answer)
+    };
+    let answer = tokio::time::timeout(RESTORE_TIMEOUT, answered)
+        .await
+        .map_err(|_| format!("restore notice: no answer within {RESTORE_TIMEOUT:?}"))??;
+    if answer.trim_end() != "OK" {
+        return Err(format!("restore notice: {}", answer.trim_end()).into());
+    }
+    Ok(vm)
 }
 
 /// One `GET /` to the guest, its answer read to the guest's CLOSE.
@@ -277,13 +470,25 @@ async fn prime(vm: &Vm, port: u32) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Keeps `refill`'s buffer full of restored clones until the route is gone.
-async fn keep_warm(snapshot: Snapshot, clones: Clones, port: u32, refill: mpsc::Sender<Vm>) {
+/// Keeps `refill`'s buffer full of restored clones, in room no VM waits for,
+/// until the route is gone.
+async fn keep_warm(
+    snapshot: Snapshot,
+    clones: Clones,
+    port: u32,
+    refill: mpsc::Sender<Vm>,
+    capacity: Arc<Capacity>,
+    need: Need,
+) {
     loop {
         let Ok(permit) = refill.reserve().await else {
             return;
         };
-        match Vm::restore(&snapshot, clones.next()).await {
+        let slot = tokio::select! {
+            slot = capacity.take_spare(need) => slot,
+            () = refill.closed() => return,
+        };
+        match clone(&snapshot, clones.next(), slot).await {
             Ok(vm) => {
                 // ready before it is handed out: a warm clone answers at once
                 match vm.dial_ready(port, RESTORE_TIMEOUT).await {
@@ -302,6 +507,3 @@ async fn keep_warm(snapshot: Snapshot, clones: Clones, port: u32, refill: mpsc::
         }
     }
 }
-
-/// The routes by the address their CONNECTs name.
-pub type Routes = HashMap<String, Arc<Route>>;
