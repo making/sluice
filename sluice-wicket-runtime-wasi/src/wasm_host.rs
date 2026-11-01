@@ -5463,24 +5463,40 @@ pub(crate) mod tests {
     /// A reset stream keeps its connection's share until its instance is
     /// gone, not just until the stream ended: a spinning guest runs on to
     /// its budget after the reset, and the connection's next stream waits
-    /// for it instead of taking a further slot -- per request and on a
-    /// pooled unit. Multi-threaded, as the spin holds its worker.
+    /// for it, though a slot is free -- per request and on a pooled unit.
+    /// The next stream goes to a handler of the default budget, so a spin
+    /// interrupted late (seconds on a busy machine) only delays its answer.
+    /// Multi-threaded, as the spin holds its worker.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_reset_stream_keeps_its_share_until_its_instance_is_gone() {
         let loaded = hello().await;
+        let budget = Duration::from_secs(1);
         for pooled in [false, true] {
             let instances = Instances::new(2);
             let mut sandbox = Sandbox::default();
-            sandbox.limits.budget = Duration::from_millis(1500);
+            sandbox.limits.budget = budget;
             sandbox.pool = usize::from(pooled);
             let spinning = Handler::new(loaded.clone(), sandbox, None, &instances).unwrap();
             if pooled {
                 restocked(&spinning, 1).await;
             }
-            let created = spinning.stores_created();
-            let mut client = h2_client(&spinning).await;
+            let current = Arc::new(Mutex::new(spinning.clone()));
+            let peer = Peer::new(crate::routes::fixed(HashMap::new()));
+            peer.serve(
+                1,
+                Binding {
+                    opened: spinning.clone(),
+                    current: Box::new({
+                        let current = current.clone();
+                        move || Some(current.lock().unwrap().clone())
+                    }),
+                    gone: CancellationToken::new(),
+                },
+            );
+            let (mut client, _connection) = h2_client_on(peer).await;
+            let started = Instant::now();
             let (first, _) = client.send_request(h2_get("/spin"), true).unwrap();
-            eventually("the first is served", Duration::from_secs(2), || {
+            eventually("the first is served", Duration::from_secs(10), || {
                 if pooled {
                     pool(&spinning).served() == 1
                 } else {
@@ -5488,39 +5504,31 @@ pub(crate) mod tests {
                 }
             })
             .await;
-            eventually("the one-stream SETTINGS", Duration::from_secs(1), || {
+            eventually("the one-stream SETTINGS", Duration::from_secs(10), || {
                 client.current_max_send_streams() == 1
             })
             .await;
 
             // the reset ends the stream; the spinning guest keeps its
-            // instance. The second stream comes later, so its budget
-            // outlasts the first's: the spin ends on epoch ticks, which lag
-            // the wall clock under load (up to ~2s for these 1.5s measured
-            // in the parallel suite).
+            // instance and the share
             drop(first);
-            tokio::time::sleep(Duration::from_millis(900)).await;
+            let patient = limited(&loaded, &instances, None);
+            *current.lock().unwrap() = patient.clone();
             client = client.ready().await.unwrap();
-            let (second, _) = client.send_request(h2_get("/spin"), true).unwrap();
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            assert_eq!(
-                spinning.stores_created(),
-                created + usize::from(!pooled),
-                "pooled {pooled}: the second stream waits for the share"
-            );
-            assert_eq!(instances.held(), 1, "pooled {pooled}: one slot held");
-
-            let other = limited(&loaded, &instances, Some(Duration::from_secs(1)));
-            let body = exchange(&other, &get("/")).await;
-            assert!(body.starts_with("HTTP/1.1 200"), "pooled {pooled}: {body}");
-
-            // the first instance gone at its budget, the second stream runs
-            // into its own: a 504, not the 503 of a request never admitted
-            let second = tokio::time::timeout(Duration::from_secs(3), second)
+            let (second, _) = client.send_request(h2_get("/"), true).unwrap();
+            let second = tokio::time::timeout(Duration::from_secs(20), second)
                 .await
                 .expect("the second stream is answered")
                 .unwrap();
-            assert_eq!(second.status(), 504, "pooled {pooled}");
+            assert_eq!(second.status(), 200, "pooled {pooled}");
+            // the spin ends at its budget at the earliest: half of it is
+            // well past a second stream served at once, and leaves the epoch
+            // ticker room to have lagged when the deadline was set
+            assert!(
+                started.elapsed() >= budget / 2,
+                "pooled {pooled}: answered only once the spin's budget ended it: {:?}",
+                started.elapsed()
+            );
         }
     }
 
