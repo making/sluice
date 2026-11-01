@@ -804,8 +804,8 @@ mod tests {
         );
         reloader.reload(false).await.unwrap();
         assert!(dir.0.join("kv.db").exists());
-        let a = reloader.routes().by_host("a.local").unwrap();
-        let b = reloader.routes().by_host("b.local").unwrap();
+        let a = reloader.routes().current().by_host("a.local").unwrap();
+        let b = reloader.routes().current().by_host("b.local").unwrap();
         let get = async |handler, path| exchange(handler, &request("GET", path, "")).await;
 
         assert!(get(&a, "/").await.contains("hits 1\n"));

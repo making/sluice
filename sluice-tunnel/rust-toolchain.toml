@@ -1,0 +1,5 @@
+# Pinned so CI lints and tests with the toolchain used locally;
+# a newer clippy brings new findings with each release.
+[toolchain]
+channel = "1.99"
+components = ["rustfmt", "clippy"]

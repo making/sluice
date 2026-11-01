@@ -13,6 +13,7 @@ on:
     - 'sluice-wicket-cf-api/**'
     - 'sluice-build-info/**'
     - 'sluice-oidc/**'
+    - 'sluice-tunnel/**'
     - 'sluice-proto/src/main/proto/**'
     - '.github/workflows/rust.yaml'
     - '.github/workflows/deploy-flume.yaml'
@@ -37,6 +38,7 @@ jobs:
     outputs:
       build-info: ${{ steps.filter.outputs.build-info }}
       oidc: ${{ steps.filter.outputs.oidc }}
+      tunnel: ${{ steps.filter.outputs.tunnel }}
       flume: ${{ steps.filter.outputs.flume }}
       wicket: ${{ steps.filter.outputs.wicket }}
       cf-api: ${{ steps.filter.outputs.cf-api }}
@@ -53,6 +55,10 @@ jobs:
           oidc:
           - 'sluice-oidc/**'
           - '.github/workflows/rust.yaml'
+          tunnel:
+          - 'sluice-tunnel/**'
+          - 'sluice-proto/src/main/proto/**'
+          - '.github/workflows/rust.yaml'
           flume:
           - 'sluice-flume/**'
           - 'sluice-build-info/**'
@@ -63,6 +69,7 @@ jobs:
           - 'sluice-wicket-wasi/**'
           - 'sluice-build-info/**'
           - 'sluice-oidc/**'
+          - 'sluice-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
           - '.github/workflows/deploy-wicket.yaml'
@@ -73,6 +80,7 @@ jobs:
           - 'sluice-flume/**'
           - 'sluice-build-info/**'
           - 'sluice-oidc/**'
+          - 'sluice-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
           - '.github/workflows/deploy-cf-api.yaml'
@@ -117,6 +125,35 @@ jobs:
           ~/.cargo/git
           sluice-oidc/target
         key: cargo-oidc-${{ runner.os }}-${{ hashFiles('sluice-oidc/Cargo.lock', 'sluice-oidc/rust-toolchain.toml') }}
+    - name: Format
+      run: cargo fmt --check
+    - name: Clippy
+      run: cargo clippy --all-targets --all-features --locked -- -D warnings
+    - name: Test
+      run: cargo test --all-features --locked
+  sluice-tunnel:
+    needs: changes
+    if: needs.changes.outputs.tunnel == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sluice-tunnel
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Install protoc
+      run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends protobuf-compiler
+    # the toolchain rust-toolchain.toml pins
+    - name: Toolchain
+      run: rustup toolchain install
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          sluice-tunnel/target
+        key: cargo-tunnel-${{ runner.os }}-${{ hashFiles('sluice-tunnel/Cargo.lock', 'sluice-tunnel/rust-toolchain.toml') }}
     - name: Format
       run: cargo fmt --check
     - name: Clippy

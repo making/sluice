@@ -1,5 +1,6 @@
-// Compiles the tunnel and flume protos shared with the Java modules (single source of
-// truth) and embeds the build identification (git commit, dirty flag, build time).
+// Compiles the flume proto shared with the Java modules (single source of truth; the
+// tunnel's messages are sluice-tunnel's) and embeds the build identification (git
+// commit, dirty flag, build time).
 use std::path::PathBuf;
 
 fn main() {
@@ -13,17 +14,10 @@ fn main() {
     let protos = root.join("sluice-proto/src/main/proto");
     tonic_prost_build::configure()
         .build_server(false)
-        // the generated `connect` convenience constructor collides with the
-        // `Tunnel/Connect` rpc method (E0592); build the client from a channel
         .build_transport(false)
-        .compile_protos(
-            &[
-                protos.join("sluice/v1/tunnel.proto"),
-                protos.join("sluice/v1/flume.proto"),
-                protos.join("sluice/v1/build.proto"),
-            ],
-            &[protos],
-        )
+        // the message it shares with the tunnel: sluice-tunnel's type
+        .extern_path(".sluice.v1.PeerBuild", "::sluice_tunnel::proto::PeerBuild")
+        .compile_protos(&[protos.join("sluice/v1/flume.proto")], &[protos])
         .expect("failed to compile the protos");
     sluice_build_info::embed(&[
         "build.rs",

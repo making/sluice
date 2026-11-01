@@ -13,8 +13,8 @@ use tokio_util::task::TaskTracker;
 
 use crate::drain::Drain;
 use crate::proto::frame::Body;
-use crate::proto::{Advertise, Frame, Upstream};
-use crate::routes::{self, Routes};
+use crate::proto::{Advertise, Frame, PeerBuild, Upstream};
+use crate::routes::{Routes, StreamAcks, Table};
 use crate::tunnel::{self, Connections, Outbound};
 use crate::{BoxError, UNKNOWN_BUILD, describe_peer, proto, tls};
 
@@ -25,12 +25,12 @@ const BACKOFF_INITIAL_SECS: u64 = 1;
 
 const BACKOFF_MAX_SECS: u64 = 30;
 
-pub(crate) struct Backoff {
+pub struct Backoff {
     ceiling_secs: u64,
 }
 
 impl Backoff {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             ceiling_secs: BACKOFF_INITIAL_SECS,
         }
@@ -38,21 +38,21 @@ impl Backoff {
 
     /// The wait before the next attempt, `unit` in `[0, 1)` picking the point
     /// in the upper half of the ceiling; the ceiling of the one after doubles.
-    pub(crate) fn next(&mut self, unit: f64) -> Duration {
+    pub fn next(&mut self, unit: f64) -> Duration {
         let ceiling = Duration::from_secs(self.ceiling_secs);
         self.ceiling_secs = (self.ceiling_secs * 2).min(BACKOFF_MAX_SECS);
         ceiling / 2 + (ceiling / 2).mul_f64(unit)
     }
 
     /// Back to the initial ceiling, after the tunnel came up.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.ceiling_secs = BACKOFF_INITIAL_SECS;
     }
 }
 
 /// A uniform random number in `[0, 1)` from the 53 high bits of a random
 /// (v4) uuid.
-pub(crate) fn jitter_unit() -> f64 {
+pub fn jitter_unit() -> f64 {
     (uuid::Uuid::new_v4().as_u128() >> 75) as f64 / (1u64 << 53) as f64
 }
 
@@ -94,15 +94,41 @@ pub fn with_transport_window(
         .http2_adaptive_window(false)
 }
 
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What the node sessions of a wicket are set up with.
+pub struct Settings {
+    /// The bearer token of every request; empty = none.
+    pub token: String,
+    /// The client id (`x-sluice-id`).
+    pub id: String,
+    /// `grpcs://` without verifying the server's certificate.
+    pub insecure: bool,
+    /// The CA a `grpcs://` server's certificate is verified against; None =
+    /// the webPKI roots.
+    pub ca_pem: Option<Vec<u8>>,
+    /// Connections open at once, over every node session.
+    pub max_connections: usize,
+    /// How long connection frames may wait with none taken before a stream
+    /// is given up; zero = never.
+    pub stall_timeout: Duration,
+    /// This wicket's build, sent in every Advertise.
+    pub build: PeerBuild,
+}
+
 /// State shared by every node session.
-pub struct Shared {
+pub struct Shared<T> {
     pub token: String,
     pub id: String,
     pub insecure: bool,
     pub ca_pem: Option<Vec<u8>>,
     /// The routes every stream advertises and its connections are served
     /// by; replaced by a reload.
-    pub routes: Arc<Routes>,
+    pub routes: Arc<Routes<T>>,
     /// Connections open at once, over every node session.
     pub limit: Arc<tunnel::Limit>,
     /// How long connection frames may wait with none taken before a stream
@@ -119,6 +145,37 @@ pub struct Shared {
     /// Tunnel streams up (their advertise acked) and not ended yet; the
     /// supervisor asks the bootstrap for the nodes while there is none.
     pub up: AtomicUsize,
+    /// This wicket's build, sent in every Advertise.
+    pub build: PeerBuild,
+}
+
+impl<T> Shared<T> {
+    /// The state of the sessions serving `routes`, before any started.
+    pub fn new(settings: Settings, routes: Arc<Routes<T>>) -> Arc<Shared<T>> {
+        let Settings {
+            token,
+            id,
+            insecure,
+            ca_pem,
+            max_connections,
+            stall_timeout,
+            build,
+        } = settings;
+        Arc::new(Shared {
+            token,
+            id,
+            insecure,
+            ca_pem,
+            routes,
+            limit: tunnel::Limit::new(max_connections),
+            stall_timeout,
+            transport_window: transport_window(max_connections),
+            drain: Drain::default(),
+            tasks: TaskTracker::new(),
+            up: AtomicUsize::new(0),
+            build,
+        })
+    }
 }
 
 /// One tunnel stream toward the node at one url.
@@ -133,8 +190,8 @@ pub struct Session {
 }
 
 /// A session task's fixed state across its reconnect attempts.
-struct NodeTask {
-    shared: Arc<Shared>,
+struct NodeTask<T> {
+    shared: Arc<Shared<T>>,
     session: Arc<Session>,
     /// Log label: the node id, the url while it is unknown.
     label: String,
@@ -161,7 +218,7 @@ impl Drop for Up<'_> {
 
 /// Splits the `--server` (or `--flume`) value into `(secure, authority)`; a
 /// bare host:port and `grpc://` are plaintext, `grpcs://` is TLS.
-pub(crate) fn resolve_server(server: &str) -> (bool, &str) {
+pub fn resolve_server(server: &str) -> (bool, &str) {
     match server.strip_prefix("grpcs://") {
         Some(authority) => (true, authority),
         None => (false, server.strip_prefix("grpc://").unwrap_or(server)),
@@ -171,7 +228,7 @@ pub(crate) fn resolve_server(server: &str) -> (bool, &str) {
 /// The endpoint of the control plane at `url`, set up as every tunnel
 /// stream's: connect timeout, keepalive, the fixed transport window and the
 /// TLS of the wicket.
-fn endpoint(shared: &Shared, url: &str) -> Result<tonic::transport::Endpoint, BoxError> {
+fn endpoint<T>(shared: &Shared<T>, url: &str) -> Result<tonic::transport::Endpoint, BoxError> {
     let (secure, authority) = resolve_server(url);
     let mut endpoint = tonic::transport::Endpoint::from_shared(format!(
         "{}://{authority}",
@@ -202,8 +259,8 @@ fn identify<T>(request: &mut tonic::Request<T>, token: &str, id: &str) -> Result
 
 /// Spawns the reconnect loop of the session to `node_id` (empty when
 /// unknown) at `url`; returns its handle.
-pub fn spawn_session(
-    shared: &Arc<Shared>,
+pub fn spawn_session<T: Table>(
+    shared: &Arc<Shared<T>>,
     node_id: String,
     url: String,
     events: mpsc::Sender<Vec<proto::Node>>,
@@ -228,7 +285,7 @@ pub fn spawn_session(
     session
 }
 
-impl NodeTask {
+impl<T: Table> NodeTask<T> {
     /// Connect / serve / reconnect loop with jittered exponential backoff
     /// (`NodeConnection#runLoop`); exits once the supervisor cancels the token
     /// or the drain began, after the stream's end.
@@ -270,10 +327,14 @@ impl NodeTask {
         let acks = self.shared.routes.stream();
         let mut table = self.shared.routes.subscribe();
         let routes = table.borrow_and_update().clone();
-        outbound.control(advertise(routes.advertised.clone(), false));
+        outbound.control(advertise(
+            routes.advertised().to_vec(),
+            false,
+            &self.shared.build,
+        ));
         let advertised = Advertised {
-            upstreams: routes.advertised.clone(),
-            unacked: VecDeque::from([routes.generation]),
+            upstreams: routes.advertised().to_vec(),
+            unacked: VecDeque::from([routes.generation()]),
             acks,
         };
         let mut request = tonic::Request::new(frames);
@@ -331,10 +392,10 @@ impl NodeTask {
     async fn stream(
         &self,
         mut inbound: tonic::Streaming<Frame>,
-        connections: &Connections,
+        connections: &Connections<T>,
         channel: &tonic::transport::Channel,
         outbound: &Outbound,
-        mut table: watch::Receiver<Arc<routes::Table>>,
+        mut table: watch::Receiver<Arc<T>>,
         mut advertised: Advertised,
     ) -> Result<bool, BoxError> {
         let mut established = false;
@@ -381,14 +442,18 @@ impl NodeTask {
                 Step::Frame(frame) => frame,
                 Step::Reloaded => {
                     let routes = table.borrow_and_update().clone();
-                    if advertised.update(&routes) {
+                    if advertised.update(&*routes) {
                         advertises_sent += 1;
-                        outbound.control(advertise(advertised.upstreams.clone(), false));
+                        outbound.control(advertise(
+                            advertised.upstreams.clone(),
+                            false,
+                            &self.shared.build,
+                        ));
                         println!(
                             "[{}] advertising the reloaded routes ({} upstream(s), generation {})",
                             self.label,
                             advertised.upstreams.len(),
-                            routes.generation
+                            routes.generation()
                         );
                     }
                     continue;
@@ -396,7 +461,11 @@ impl NodeTask {
                 Step::Withdraw => {
                     advertises_sent += 1;
                     withdrawal = advertises_sent;
-                    outbound.control(advertise(advertised.upstreams.clone(), true));
+                    outbound.control(advertise(
+                        advertised.upstreams.clone(),
+                        true,
+                        &self.shared.build,
+                    ));
                     println!(
                         "[{}] withdrawing the routes; {} connection(s) open",
                         self.label,
@@ -512,7 +581,7 @@ struct Advertised {
     upstreams: Vec<Upstream>,
     /// Oldest first: acknowledgements come in the order of the advertises.
     unacked: VecDeque<u64>,
-    acks: routes::StreamAcks,
+    acks: StreamAcks,
 }
 
 impl Advertised {
@@ -520,15 +589,15 @@ impl Advertised {
     /// are to be advertised. Unchanged, the server already has them: the
     /// generation counts as acknowledged with the advertise still pending,
     /// or at once.
-    fn update(&mut self, routes: &routes::Table) -> bool {
-        if routes.advertised != self.upstreams {
-            self.upstreams = routes.advertised.clone();
-            self.unacked.push_back(routes.generation);
+    fn update(&mut self, routes: &impl Table) -> bool {
+        if routes.advertised() != self.upstreams {
+            self.upstreams = routes.advertised().to_vec();
+            self.unacked.push_back(routes.generation());
             return true;
         }
         match self.unacked.back_mut() {
-            Some(pending) => *pending = routes.generation,
-            None => self.acks.acked(routes.generation),
+            Some(pending) => *pending = routes.generation(),
+            None => self.acks.acked(routes.generation()),
         }
         false
     }
@@ -542,16 +611,16 @@ impl Advertised {
 }
 
 /// The Advertise opening every stream: the routes, the receive window the
-/// server requires (it fails the stream of a peer announcing none), and this
-/// binary's build. With `withdraw`, the drain's: the routes are repeated, so
-/// a server predating the field registers them unchanged and acknowledges it
-/// without `withdrawn`.
-fn advertise(upstreams: Vec<Upstream>, withdraw: bool) -> Frame {
+/// server requires (it fails the stream of a peer announcing none), and the
+/// wicket's `build`. With `withdraw`, the drain's: the routes are repeated,
+/// so a server predating the field registers them unchanged and acknowledges
+/// it without `withdrawn`.
+fn advertise(upstreams: Vec<Upstream>, withdraw: bool, build: &PeerBuild) -> Frame {
     Frame {
         body: Some(Body::Advertise(Advertise {
             upstreams,
             connection_window: tunnel::WINDOW,
-            build: Some(crate::build()),
+            build: Some(build.clone()),
             withdraw,
         })),
     }
@@ -560,7 +629,7 @@ fn advertise(upstreams: Vec<Upstream>, withdraw: bool) -> Frame {
 /// The node list `bootstrap` answers (`TunnelClient#discover`): one node
 /// without id and public url, which stands for the bootstrap itself, when the
 /// server has no `ListNodes`; empty when it could not be asked.
-pub async fn discover(shared: &Shared, bootstrap: &str) -> Vec<proto::Node> {
+pub async fn discover<T>(shared: &Shared<T>, bootstrap: &str) -> Vec<proto::Node> {
     let asked = async {
         let channel = endpoint(shared, bootstrap)?.connect().await?;
         list_nodes(&channel, shared).await
@@ -582,9 +651,9 @@ pub async fn discover(shared: &Shared, bootstrap: &str) -> Vec<proto::Node> {
 
 /// Unary `ListNodes` on `channel` (`NodeConnection#listNodes`), authenticated
 /// as the tunnel streams are.
-async fn list_nodes(
+async fn list_nodes<T>(
     channel: &tonic::transport::Channel,
-    shared: &Shared,
+    shared: &Shared<T>,
 ) -> Result<Vec<proto::Node>, BoxError> {
     let mut request = tonic::Request::new(proto::ListNodesRequest {});
     identify(&mut request, &shared.token, &shared.id)?;
@@ -597,13 +666,9 @@ async fn list_nodes(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::testing::*;
     use super::*;
-    use crate::config;
-    use crate::routes::Reloader;
-    use crate::wasm_host::Instances;
+    use crate::routes::testing::Fixed;
 
     #[test]
     fn backoff_waits_in_the_upper_half_of_a_doubling_capped_ceiling() {
@@ -720,7 +785,7 @@ mod tests {
     #[tokio::test]
     async fn a_server_that_stops_reading_has_the_stream_given_up_at_the_stall_timeout() {
         let timeout = Duration::from_secs(2);
-        let (shared, limit, target) = hello_shared(timeout).await;
+        let (shared, limit, target) = hello_shared(timeout);
         let (url, _server) = stalling_server(target).await;
         let (events, _received) = mpsc::channel(32);
         let task = NodeTask {
@@ -756,101 +821,22 @@ mod tests {
         assert_eq!(limit.open(), 0, "the slot is freed");
     }
 
-    /// A reload is advertised on the live stream. A component changed on
-    /// disk serves the next request of a connection already open, after the
-    /// request in flight finished on the old one; a removed target keeps
-    /// being served -- a CONNECT the server routed before it took the new
-    /// routes included -- until the stream acknowledged them, then its
-    /// connections close and a CONNECT to it fails.
+    /// A table published with other upstreams is advertised on the live
+    /// stream; one with the same upstreams is not.
     #[tokio::test]
-    async fn a_reload_is_advertised_and_a_removed_target_serves_until_acknowledged() {
-        let dir = routes::tests::Scratch::new("advertise");
-        dir.guest("a.wasm", "hello");
-        dir.guest("b.wasm", "hello");
-        let path = dir.write(
-            "wicket.yaml",
-            "routes:\n  - {host: a.local, component: a.wasm}\n  - {host: b.local, component: b.wasm}\n",
-        );
-        let reloader =
-            Reloader::start(config::RouteSource::file(&path).unwrap(), Instances::new(8))
-                .await
-                .unwrap();
-        let (shared, limit) = shared_on(reloader.routes(), Duration::ZERO);
-        let (a, b) = {
-            let table = shared.routes.current();
-            (table.target("a.local"), table.target("b.local"))
-        };
-        let (hangups, hangups_received) = mpsc::channel(1);
-        let (_requests, requests_received) = mpsc::channel(1);
-        let stop = CancellationToken::new();
-        tokio::spawn(reloader.run(
-            Duration::ZERO,
-            hangups_received,
-            requests_received,
-            stop.clone(),
-        ));
+    async fn a_published_table_is_advertised_when_its_upstreams_changed() {
+        let routes = Routes::new(Fixed::hosts(1, &["a.local"]));
+        let (shared, _) = shared_on(&routes, Duration::ZERO);
         let (mut stream, _events) = served_session(&shared).await;
-        assert_eq!(stream.advertise().await.upstreams.len(), 2);
+        assert_eq!(stream.advertise().await.upstreams.len(), 1);
         stream.ack(false);
-        stream.connect(1, &a);
-        stream.connect(2, &b);
-        assert_eq!(stream.exchange(2, "/b").await, "HTTP/1.1 200 OK");
-        // in flight across the reload: the body is half sent
-        stream.data(
-            1,
-            "POST / HTTP/1.1\r\nhost: a.local\r\ncontent-length: 4\r\n\r\nab",
-        );
 
-        dir.guest("a.wasm", "fetch");
-        dir.write(
-            "wicket.yaml",
-            "routes:\n  - {host: a.local, component: a.wasm}\n",
-        );
-        hangups.send(()).await.unwrap();
+        routes.publish(Fixed::hosts(2, &["a.local"]));
+        routes.publish(Fixed::hosts(3, &["a.local", "b.local"]));
         let readvertised = stream.advertise().await;
         let hosts: Vec<_> = readvertised.upstreams.iter().map(|up| &up.host).collect();
-        assert_eq!(hosts, ["a.local"]);
+        assert_eq!(hosts, ["a.local", "b.local"], "the changed table only");
         assert!(!readvertised.withdraw);
-        assert_eq!(
-            readvertised.upstreams[0].target_url, a,
-            "a keeps its target"
-        );
-
-        stream.data(1, "cd");
-        let in_flight = stream.response(1).await;
-        assert!(in_flight.contains("body_bytes=4"), "the old a: {in_flight}");
-        stream.data(1, "GET / HTTP/1.1\r\nhost: a.local\r\n\r\n");
-        let next = stream.response(1).await;
-        assert!(next.starts_with("HTTP/1.1 400"), "the new a: {next}");
-        // routed by the server before it took the new routes
-        stream.connect(3, &b);
-        assert_eq!(stream.exchange(3, "/late").await, "HTTP/1.1 200 OK");
-        assert_eq!(stream.exchange(2, "/again").await, "HTTP/1.1 200 OK");
-
-        stream.ack(false);
-        let mut closed = Vec::new();
-        while closed.len() < 2 {
-            closed.push(
-                stream
-                    .next(|body| match body {
-                        Body::Close(close) => Some(close.conn_id),
-                        _ => None,
-                    })
-                    .await,
-            );
-        }
-        closed.sort();
-        assert_eq!(closed, [2, 3], "b's connections close, a's stays");
-        stream.connect(4, &b);
-        let error = stream
-            .next(|body| match body {
-                Body::Error(error) if error.conn_id == 4 => Some(error.message),
-                _ => None,
-            })
-            .await;
-        assert!(error.contains("no wasm route"), "{error}");
-        assert_eq!(limit.open(), 1, "a's connection only");
-        stop.cancel();
     }
 
     /// Each acknowledgement tells which generation the server took: the one
@@ -860,7 +846,7 @@ mod tests {
     #[test]
     fn an_advertise_acknowledges_the_generations_carrying_its_routes() {
         use futures_util::FutureExt as _;
-        let routes = Routes::fixed(HashMap::new());
+        let routes = Routes::new(Fixed::hosts(1, &[]));
         let acknowledged = |generation| routes.acknowledged(generation).now_or_never().is_some();
         let upstream = |host: &str| Upstream {
             host: host.into(),
@@ -871,11 +857,9 @@ mod tests {
             unacked: VecDeque::from([1]),
             acks: routes.stream(),
         };
-        let table = |generation, hosts: &[&str]| {
-            routes::Table::advertising(
-                generation,
-                hosts.iter().map(|host| upstream(host)).collect(),
-            )
+        let table = |generation, hosts: &[&str]| Fixed {
+            generation,
+            advertised: hosts.iter().map(|host| upstream(host)).collect(),
         };
         assert!(!advertised.update(&table(2, &["a"])), "the same routes");
         assert!(!acknowledged(1));
@@ -891,28 +875,21 @@ mod tests {
         assert!(acknowledged(99), "no live stream holds anything back");
     }
 
-    /// Without the window the server fails the stream (FAILED_PRECONDITION),
-    /// and no other test here would notice.
+    /// Without the window the server fails the stream (FAILED_PRECONDITION);
+    /// without the build it shows the wicket as an older build.
     #[test]
-    fn the_advertise_announces_the_connection_window() {
-        let Some(Body::Advertise(advertise)) = advertise(Vec::new(), false).body else {
+    fn the_advertise_announces_the_connection_window_and_the_build() {
+        let build = PeerBuild {
+            implementation: "sluice-wicket-test".into(),
+            version: "1".into(),
+            ..Default::default()
+        };
+        let Some(Body::Advertise(advertise)) = advertise(Vec::new(), false, &build).body else {
             panic!("an Advertise");
         };
         assert_eq!(advertise.connection_window, 1024 * 1024);
         assert_eq!(advertise.connection_window, tunnel::WINDOW);
-    }
-
-    /// Without the build the server shows this wicket as an older build.
-    #[test]
-    fn the_advertise_carries_the_embedded_build() {
-        let Some(Body::Advertise(advertise)) = advertise(Vec::new(), false).body else {
-            panic!("an Advertise");
-        };
-        let build = advertise.build.expect("a build");
-        assert_eq!(build.implementation, "sluice-wicket-wasi");
-        assert_eq!(build.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(build.commit, env!("SLUICE_BUILD_COMMIT"));
-        assert_eq!(build.build_time, env!("SLUICE_BUILD_TIME"));
+        assert_eq!(advertise.build, Some(build));
     }
 
     #[test]
@@ -929,14 +906,15 @@ mod tests {
     }
 }
 
-/// Test doubles of the server's side of a tunnel stream, and wickets serving
-/// the hello guest.
-#[cfg(test)]
-pub(crate) mod testing {
+/// Test doubles of the server's side of a tunnel stream, and the state of
+/// wickets on it.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use std::collections::HashMap;
+
+    use tokio::sync::Semaphore;
+
     use super::*;
-    use crate::config;
-    use crate::routes::Reloader;
-    use crate::wasm_host::{self, Instances};
 
     /// A message of the server's, gRPC-framed (5-byte prefix + message).
     pub fn grpc_frame(message: &impl prost::Message) -> bytes::Bytes {
@@ -948,48 +926,44 @@ pub(crate) mod testing {
         out.into()
     }
 
-    /// The state of a wicket serving the hello guest for `hello.local`, its
+    /// The state of a wicket serving the test routes' `hello.local`, its
     /// connection limit and the route's target.
-    pub async fn hello_shared(
+    #[cfg(test)]
+    pub(crate) fn hello_shared(
         stall_timeout: Duration,
-    ) -> (Arc<Shared>, Arc<tunnel::Limit>, String) {
-        let hello = wasm_host::tests::guest_wasm("hello");
-        let source = config::RouteSource::flags(vec![routes::Spec {
-            host: "hello.local".into(),
-            component: wasm_host::Locator::parse(hello.to_str().unwrap()).unwrap(),
-            shown: None,
-            sandbox: wasm_host::Sandbox::default(),
-            origin: routes::Origin::Flag,
-        }]);
-        let reloader = Reloader::start(source, Instances::new(4)).await.unwrap();
-        let (shared, limit) = shared_on(reloader.routes(), stall_timeout);
-        let target = shared.routes.current().advertised[0].target_url.clone();
+    ) -> (
+        Arc<Shared<crate::routes::testing::Fixed>>,
+        Arc<tunnel::Limit>,
+        String,
+    ) {
+        let routes = Routes::new(crate::routes::testing::Fixed::hosts(1, &["hello.local"]));
+        let (shared, limit) = shared_on(&routes, stall_timeout);
+        let target = routes.current().advertised[0].target_url.clone();
         (shared, limit, target)
     }
 
-    /// The state of a wicket serving `routes`, and its connection limit.
-    pub fn shared_on(
-        routes: &Arc<Routes>,
+    /// The state of a wicket serving `routes`, and its connection limit (4).
+    pub fn shared_on<T>(
+        routes: &Arc<Routes<T>>,
         stall_timeout: Duration,
-    ) -> (Arc<Shared>, Arc<tunnel::Limit>) {
-        let limit = tunnel::Limit::new(4);
-        let shared = Arc::new(Shared {
-            token: String::new(),
-            id: "test".into(),
-            insecure: false,
-            ca_pem: None,
-            routes: routes.clone(),
-            limit: limit.clone(),
-            stall_timeout,
-            transport_window: transport_window(4),
-            drain: Drain::default(),
-            tasks: TaskTracker::new(),
-            up: AtomicUsize::new(0),
-        });
+    ) -> (Arc<Shared<T>>, Arc<tunnel::Limit>) {
+        let shared = Shared::new(
+            Settings {
+                token: String::new(),
+                id: "test".into(),
+                insecure: false,
+                ca_pem: None,
+                max_connections: 4,
+                stall_timeout,
+                build: PeerBuild::default(),
+            },
+            routes.clone(),
+        );
+        let limit = shared.limit.clone();
         (shared, limit)
     }
 
-    /// Hang guard of the drain tests' waits.
+    /// Hang guard of the tests' waits.
     pub const HANG: Duration = Duration::from_secs(10);
 
     /// One tunnel stream as the server sees it, over raw h2: the wicket's
@@ -1024,7 +998,7 @@ pub(crate) mod testing {
         }
 
         /// The next frame `pick` takes, skipping the others (window updates).
-        pub async fn next<T>(&mut self, mut pick: impl FnMut(Body) -> Option<T>) -> T {
+        pub async fn next<R>(&mut self, mut pick: impl FnMut(Body) -> Option<R>) -> R {
             loop {
                 let frame = tokio::time::timeout(HANG, self.recv())
                     .await
@@ -1085,7 +1059,8 @@ pub(crate) mod testing {
         }
 
         /// An http/1.1 request for `path` on `conn_id`; the status line of
-        /// its response, read to its end.
+        /// its response, read to its end (a chunked body holding
+        /// `path=<path>\n`, as the hello guests answer).
         pub async fn exchange(&mut self, conn_id: i64, path: &str) -> String {
             self.send(Body::Data(proto::Data {
                 conn_id,
@@ -1137,7 +1112,8 @@ pub(crate) mod testing {
     }
 
     /// A tunnel server handing each Connect stream to the test; ListNodes is
-    /// answered with `nodes`, or reset without.
+    /// answered with `nodes`, or UNIMPLEMENTED without (a server predating
+    /// it: the supervisor streams to the bootstrap).
     pub async fn tunnel_server(
         nodes: Option<Vec<proto::Node>>,
     ) -> (String, mpsc::Receiver<ServerStream>) {
@@ -1158,6 +1134,12 @@ pub(crate) mod testing {
                             .unwrap();
                         if request.uri().path() != "/sluice.v1.Tunnel/Connect" {
                             let Some(nodes) = nodes.clone() else {
+                                let unimplemented = http::Response::builder()
+                                    .header("content-type", "application/grpc")
+                                    .header("grpc-status", "12")
+                                    .body(())
+                                    .unwrap();
+                                let _ = respond.send_response(unimplemented, true);
                                 continue;
                             };
                             let mut send = respond.send_response(response, false).unwrap();
@@ -1187,11 +1169,243 @@ pub(crate) mod testing {
         (url, received)
     }
 
+    /// The dial address the server derives from an advertised target URL
+    /// (`Router.addressOf` of sluice-server): a `wasm:` or `firecracker:`
+    /// target verbatim, `host[:port]` of any other.
+    pub fn dial_address(target_url: &str) -> String {
+        if target_url.starts_with("wasm:") || target_url.starts_with("firecracker:") {
+            return target_url.to_string();
+        }
+        let rest = target_url
+            .split_once("://")
+            .map_or(target_url, |(_, rest)| rest);
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host)
+            .to_string()
+    }
+
+    /// The server's side of one tunnel stream, as its data plane runs it:
+    /// every Advertise is acknowledged (and handed to the test), and each
+    /// virtual connection opened ([`ServerTunnel::connect`]) is a byte stream
+    /// as the server's public client sees it, both ways under the protocol's
+    /// flow control: the wicket's payload is granted back as the test reads
+    /// it, and the test's goes out against the wicket's credit. The test's
+    /// shutdown of its writes is the CLOSE; the wicket's CLOSE ends the
+    /// test's reads; its ERROR drops the stream. The wicket ending its side
+    /// of the tunnel stream (drained) ends the server's.
+    pub struct ServerTunnel {
+        state: Arc<TunnelState>,
+        advertises: mpsc::UnboundedReceiver<Advertise>,
+    }
+
+    type PumpedConnection = (mpsc::UnboundedSender<Body>, Arc<Semaphore>);
+
+    struct TunnelState {
+        send: std::sync::Mutex<h2::SendStream<bytes::Bytes>>,
+        /// conn id -> the connection's frames from the wicket, and the
+        /// wicket's credit for the test's payload on it.
+        connections: std::sync::Mutex<HashMap<i64, PumpedConnection>>,
+        /// The receive window the wicket announced (its latest Advertise).
+        window: std::sync::atomic::AtomicU32,
+    }
+
+    impl TunnelState {
+        fn send(&self, body: Body) {
+            // a stream the wicket ended takes nothing more: the test sees it
+            // through the connections ending
+            let _ = self
+                .send
+                .lock()
+                .unwrap()
+                .send_data(grpc_frame(&Frame { body: Some(body) }), false);
+        }
+    }
+
+    impl ServerTunnel {
+        /// Takes over `stream` once its first Advertise arrived (returned,
+        /// acknowledged).
+        pub async fn new(mut stream: ServerStream) -> (ServerTunnel, Advertise) {
+            let advertise = stream.advertise().await;
+            stream.ack(false);
+            let ServerStream {
+                mut body,
+                send,
+                mut buf,
+            } = stream;
+            let state = Arc::new(TunnelState {
+                send: std::sync::Mutex::new(send),
+                connections: Default::default(),
+                window: advertise.connection_window.into(),
+            });
+            let (advertised, advertises) = mpsc::unbounded_channel();
+            let demux = state.clone();
+            tokio::spawn(async move {
+                use prost::Message as _;
+                loop {
+                    while buf.len() >= 5 {
+                        let len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+                        if buf.len() < 5 + len {
+                            break;
+                        }
+                        let frame = Frame::decode(&buf[5..5 + len]).unwrap();
+                        buf.drain(..5 + len);
+                        demux.dispatch(frame, &advertised);
+                    }
+                    let chunk = match body.data().await {
+                        Some(Ok(chunk)) => chunk,
+                        // the wicket ended its side (drained): so does the server
+                        None => {
+                            let mut trailers = http::HeaderMap::new();
+                            trailers.insert("grpc-status", "0".parse().unwrap());
+                            let _ = demux.send.lock().unwrap().send_trailers(trailers);
+                            break;
+                        }
+                        Some(Err(_)) => break,
+                    };
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    buf.extend_from_slice(&chunk);
+                }
+                // the stream ended: so do its connections
+                demux.connections.lock().unwrap().clear();
+            });
+            (ServerTunnel { state, advertises }, advertise)
+        }
+
+        /// The wicket's next Advertise after the first, acknowledged.
+        pub async fn advertise(&mut self) -> Advertise {
+            tokio::time::timeout(HANG, self.advertises.recv())
+                .await
+                .expect("hang guard")
+                .expect("the stream is open")
+        }
+
+        /// Opens connection `conn_id` to the dial address `address`, as the
+        /// server does for a client of the route.
+        pub fn connect(&self, conn_id: i64, address: &str) -> tokio::io::DuplexStream {
+            let (client, pumped) = tokio::io::duplex(64 * 1024);
+            let credit = Arc::new(Semaphore::new(
+                self.state.window.load(std::sync::atomic::Ordering::Acquire) as usize,
+            ));
+            let (frames, received) = mpsc::unbounded_channel();
+            self.state
+                .connections
+                .lock()
+                .unwrap()
+                .insert(conn_id, (frames, credit.clone()));
+            self.state.send(Body::Connect(proto::Connect {
+                conn_id,
+                address: address.into(),
+                connection_window: tunnel::WINDOW,
+                ..Default::default()
+            }));
+            tokio::spawn(pump(conn_id, pumped, credit, received, self.state.clone()));
+            client
+        }
+    }
+
+    impl TunnelState {
+        /// One frame of the wicket's, to its connection.
+        fn dispatch(&self, frame: Frame, advertised: &mpsc::UnboundedSender<Advertise>) {
+            let connection = |conn_id| self.connections.lock().unwrap().get(&conn_id).cloned();
+            match frame.body {
+                Some(Body::Advertise(advertise)) => {
+                    self.window.store(
+                        advertise.connection_window,
+                        std::sync::atomic::Ordering::Release,
+                    );
+                    self.send(Body::AdvertiseAck(proto::AdvertiseAck {
+                        node_id: "node".into(),
+                        withdrawn: advertise.withdraw,
+                        ..Default::default()
+                    }));
+                    let _ = advertised.send(advertise);
+                }
+                Some(Body::WindowUpdate(update)) if update.increment > 0 => {
+                    if let Some((_, credit)) = connection(update.conn_id) {
+                        credit.add_permits(update.increment as usize);
+                    }
+                }
+                Some(body @ (Body::Data(_) | Body::Close(_) | Body::Error(_))) => {
+                    let conn_id = match &body {
+                        Body::Data(data) => data.conn_id,
+                        Body::Close(close) => close.conn_id,
+                        Body::Error(error) => error.conn_id,
+                        _ => unreachable!(),
+                    };
+                    if let Some((frames, _)) = connection(conn_id) {
+                        let _ = frames.send(body);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Relays one connection between the test's byte stream (`pumped`'s
+    /// other end) and the tunnel stream, until both directions ended.
+    async fn pump(
+        conn_id: i64,
+        pumped: tokio::io::DuplexStream,
+        credit: Arc<Semaphore>,
+        mut frames: mpsc::UnboundedReceiver<Body>,
+        state: Arc<TunnelState>,
+    ) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut reader, mut writer) = tokio::io::split(pumped);
+        let up = async {
+            let mut buffer = vec![0u8; 16 * 1024];
+            loop {
+                let n = reader.read(&mut buffer).await?;
+                if n == 0 {
+                    state.send(Body::Close(proto::Close { conn_id }));
+                    return Ok(());
+                }
+                credit
+                    .acquire_many(n as u32)
+                    .await
+                    .map_err(std::io::Error::other)?
+                    .forget();
+                state.send(Body::Data(proto::Data {
+                    conn_id,
+                    payload: buffer[..n].to_vec(),
+                }));
+            }
+        };
+        let down = async {
+            while let Some(body) = frames.recv().await {
+                match body {
+                    Body::Data(data) => {
+                        writer.write_all(&data.payload).await?;
+                        state.send(Body::WindowUpdate(proto::WindowUpdate {
+                            conn_id,
+                            increment: data.payload.len() as u32,
+                            ..Default::default()
+                        }));
+                    }
+                    Body::Close(_) => return writer.shutdown().await,
+                    _ => break,
+                }
+            }
+            Err(std::io::Error::other("the connection failed"))
+        };
+        let failed = tokio::try_join!(up, down).is_err();
+        state.connections.lock().unwrap().remove(&conn_id);
+        if failed {
+            // the test's end sees the stream dropped; the wicket, an ERROR
+            state.send(Body::Error(proto::Error {
+                conn_id,
+                message: "connection closed".into(),
+            }));
+        }
+    }
+
     /// A session of `shared` on a [`tunnel_server`], its stream as the server
     /// sees it, and the session's event receiver (kept: the stream reports
     /// to it).
-    pub async fn served_session(
-        shared: &Arc<Shared>,
+    pub async fn served_session<T: Table>(
+        shared: &Arc<Shared<T>>,
     ) -> (ServerStream, mpsc::Receiver<Vec<proto::Node>>) {
         let (url, mut streams) = tunnel_server(None).await;
         let (events, received) = mpsc::channel(32);

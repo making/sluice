@@ -62,6 +62,7 @@ fn route(
 ) -> Result<Arc<Handler>, String> {
     let host = wasm_host::request_host(request);
     routes
+        .current()
         .by_host(&host)
         .ok_or_else(|| format!("no wasm route for host '{host}'"))
 }

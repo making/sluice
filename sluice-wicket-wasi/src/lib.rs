@@ -9,18 +9,11 @@
 //! sluice server(s) --tunnel stream per node--> wicket --hyper (h1 / h2c)--> wasi:http component
 //! ```
 //!
-//! The supervisor (`supervisor`) ports the Java client's fan-out semantics
-//! (`TunnelClient` / `NodeConnection`): the `--server` endpoint is only asked
-//! for the node list (`ListNodes`); the membership keeps one tunnel stream
-//! (`session`) per node at its public url, and a dropped stream reconnects
-//! with jittered exponential backoff (ceiling 1s..30s, each wait drawn from
-//! its upper half). Exactly one stream per node is kept: the server closes
-//! the older registration when a client id re-registers.
-//!
-//! On SIGTERM / SIGINT the wicket drains (`drain`, the Java client's
-//! `TunnelClient#drain`): every node stream withdraws the routes and ends
-//! once the server acknowledged it and no connection is left on it, within
-//! `--drain-grace`.
+//! The tunnel client is `sluice-tunnel`'s, as the other Rust wickets': the
+//! `--server` endpoint is asked for the node list, one tunnel stream per node
+//! advertises the routes and serves their connections, and SIGTERM / SIGINT
+//! drains the streams within `--drain-grace`. Each connection is served by
+//! the component of its target (`wasm_host::serve`).
 //!
 //! The routes come from `--wasm` flags and / or a `--config` YAML file
 //! (`config`) and are reloaded without a restart (`routes::Reloader`): on a
@@ -64,48 +57,34 @@
 pub mod config;
 mod console;
 mod deployed;
-mod drain;
 mod env;
 mod flume;
 mod keyvalue;
 mod listener;
 mod routes;
-mod session;
-mod signals;
-mod supervisor;
-mod tls;
-#[cfg(test)]
-mod transport_window_test;
-mod tunnel;
 mod wasm_host;
 
 use std::sync::Arc;
 
+use sluice_tunnel::session::Shared;
+use sluice_tunnel::signals::{self, Signals};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 
+/// The tunnel's messages (`sluice-tunnel`'s) and the flume's.
 pub mod proto {
+    pub use sluice_tunnel::proto::*;
     tonic::include_proto!("sluice.v1");
 }
 
 use console::Console;
 use deployed::Deployed;
-use drain::Drain;
 use flume::Tap;
 use proto::PeerBuild;
 use routes::Reloader;
-use session::{Shared, transport_window};
-use signals::Signals;
 use wasm_host::Instances;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
-/// How a server that sent no build (it predates the field) is described.
-const UNKNOWN_BUILD: &str = "unknown (older build)";
-
-/// Longest value kept from each string of a server's build, in chars.
-const MAX_FIELD_CHARS: usize = 64;
 
 /// This binary's build, embedded by `build.rs`; an empty commit means git
 /// was unavailable when it was built.
@@ -119,59 +98,9 @@ pub fn build() -> PeerBuild {
     }
 }
 
-/// [`build`] in one line, see [`describe`].
+/// [`build`] in one line, see [`sluice_tunnel::describe`].
 pub fn describe_build() -> String {
-    describe(&build())
-}
-
-/// One line naming a build, e.g. `sluice-wicket-wasi 0.0.1-SNAPSHOT
-/// (<commit>, dirty, built 2026-10-12T01:04:33Z)`; an empty field reads as
-/// unknown.
-fn describe(build: &PeerBuild) -> String {
-    let or = |value: &str, unknown: &str| {
-        if value.is_empty() {
-            unknown.to_string()
-        } else {
-            value.to_string()
-        }
-    };
-    let mut details = vec![or(&build.commit, "commit unknown")];
-    if build.dirty {
-        details.push("dirty".into());
-    }
-    if !build.build_time.is_empty() {
-        details.push(format!("built {}", build.build_time));
-    }
-    format!(
-        "{} {} ({})",
-        or(&build.implementation, "unknown implementation"),
-        or(&build.version, "version unknown"),
-        details.join(", ")
-    )
-}
-
-/// [`describe`] of a build another peer sent: control characters become `?`
-/// and each string keeps at most [`MAX_FIELD_CHARS`] chars, so it cannot
-/// forge or flood log lines.
-fn describe_peer(build: &PeerBuild) -> String {
-    let bound = |value: &str| -> String {
-        let mut bounded: String = value
-            .chars()
-            .take(MAX_FIELD_CHARS)
-            .map(|c| if c.is_control() { '?' } else { c })
-            .collect();
-        if value.chars().count() > MAX_FIELD_CHARS {
-            bounded.push_str("...");
-        }
-        bounded
-    };
-    describe(&PeerBuild {
-        implementation: bound(&build.implementation),
-        version: bound(&build.version),
-        commit: bound(&build.commit),
-        dirty: build.dirty,
-        build_time: bound(&build.build_time),
-    })
+    sluice_tunnel::describe(&build())
 }
 
 /// Serves the routes of `settings` (through the server, on `--listen`, or
@@ -322,29 +251,18 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         }
         None => None,
     };
-    let shared = Arc::new(Shared {
-        token,
-        id: client_id,
-        insecure,
-        ca_pem,
+    let shared = Shared::new(
+        sluice_tunnel::session::Settings {
+            token,
+            id: client_id,
+            insecure,
+            ca_pem,
+            max_connections,
+            stall_timeout,
+            build: build(),
+        },
         routes,
-        limit: tunnel::Limit::new(max_connections),
-        stall_timeout,
-        transport_window: transport_window(max_connections),
-        drain: Drain::default(),
-        tasks: TaskTracker::new(),
-        up: Default::default(),
-    });
-    println!("connection limit {max_connections}");
-    println!(
-        "gRPC flow control window {} bytes",
-        transport_window(max_connections)
     );
-    println!(
-        "tunnel stall timeout {}s (0 = off)",
-        stall_timeout.as_secs()
-    );
-    println!("drain grace {}s (0 = off)", drain_grace.as_secs());
 
     // the drain stops the reloads (the console's edits too): the routes are withdrawn
     tokio::spawn(reloader.run(
@@ -354,62 +272,5 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         shared.drain.begin.clone(),
     ));
 
-    let (tx, rx) = mpsc::channel(32);
-    let supervisor = supervisor::supervise(rx, tx, shared.clone(), server);
-    let name = tokio::select! {
-        result = supervisor => return result,
-        // dropping the supervisor: no membership change opens a stream from now on
-        name = signals.recv() => name,
-    };
-    if drain_grace.is_zero() {
-        println!("{name}: ending at once (--drain-grace 0)");
-        return Ok(());
-    }
-    println!("{name}: draining");
-    let interrupt = async {
-        let name = signals.recv().await;
-        eprintln!("{name} during the drain: ending it at once");
-    };
-    drain::drain(&shared, drain_grace, interrupt).await;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn describe_names_every_known_part_and_reads_empty_as_unknown() {
-        let build = PeerBuild {
-            implementation: "sluice-server".into(),
-            version: "0.0.1-SNAPSHOT".into(),
-            commit: "7312472".into(),
-            dirty: true,
-            build_time: "2026-10-12T01:04:33Z".into(),
-        };
-        assert_eq!(
-            describe(&build),
-            "sluice-server 0.0.1-SNAPSHOT (7312472, dirty, built 2026-10-12T01:04:33Z)"
-        );
-        assert_eq!(
-            describe(&PeerBuild::default()),
-            "unknown implementation version unknown (commit unknown)"
-        );
-    }
-
-    #[test]
-    fn describe_peer_bounds_what_the_server_sent() {
-        let build = PeerBuild {
-            implementation: "sluice-server\nforged".into(),
-            version: "9".repeat(MAX_FIELD_CHARS + 1),
-            ..Default::default()
-        };
-        assert_eq!(
-            describe_peer(&build),
-            format!(
-                "sluice-server?forged {}... (commit unknown)",
-                "9".repeat(MAX_FIELD_CHARS)
-            )
-        );
-    }
+    sluice_tunnel::serve(shared, server, drain_grace, &mut signals).await
 }

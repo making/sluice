@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use sluice_oidc::OidcSettings;
+// the tunnel's: --max-connections, --tunnel-stall-timeout, --drain-grace
+use sluice_tunnel::{DEFAULT_DRAIN_GRACE, DEFAULT_MAX_CONNECTIONS, DEFAULT_STALL_TIMEOUT};
 
 use crate::deployed::Deployed;
 use crate::env::Env;
@@ -73,18 +75,6 @@ usage: sluice-wicket-wasi --server <url> --wasm <host>=<locator>[?<options>] ...
 
 Each option but --wasm also reads SLUICE_WICKET_WASI_<NAME> from the environment, e.g.
 SLUICE_WICKET_WASI_TOKEN.";
-
-/// Default of `--max-connections`: 256 connections x one 1MiB receive window
-/// (plus at most two partly used 16KiB segments and 80 segments' overhead
-/// each) = about 265MiB of the server's payload buffered at most.
-pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
-
-/// Default of `--tunnel-stall-timeout`, the Java side's
-/// `sluice.client.tunnel-stall-timeout`.
-const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Default of `--drain-grace`, the Java side's `sluice.client.drain-grace`.
-const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(20);
 
 /// Default of `--max-instances`: 64 guest instances alive at once, i.e. at
 /// most 64 x the largest `memory-mib` of guest linear memory (16GiB at the

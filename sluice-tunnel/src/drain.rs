@@ -37,8 +37,8 @@ pub enum DrainEnd {
 /// connected just stops. After `grace`, or once `interrupt` resolves, the
 /// streams left end at once, failing their connections. Returns once every
 /// session task ended (at most a few seconds after that).
-pub async fn drain(
-    shared: &Shared,
+pub async fn drain<T>(
+    shared: &Shared<T>,
     grace: Duration,
     interrupt: impl Future<Output = ()>,
 ) -> DrainEnd {
@@ -80,10 +80,14 @@ mod tests {
 
     use super::*;
     use crate::proto::{self, frame::Body};
+    use crate::routes::testing::Fixed;
     use crate::session::testing::*;
     use crate::tunnel;
 
-    fn start_drain(shared: &Arc<Shared>, grace: Duration) -> tokio::task::JoinHandle<DrainEnd> {
+    fn start_drain(
+        shared: &Arc<Shared<Fixed>>,
+        grace: Duration,
+    ) -> tokio::task::JoinHandle<DrainEnd> {
         let shared = shared.clone();
         tokio::spawn(async move { drain(&shared, grace, std::future::pending()).await })
     }
@@ -103,7 +107,7 @@ mod tests {
     /// the server's end of the stream ends the drain.
     #[tokio::test]
     async fn a_drain_ends_the_stream_after_the_withdrawn_ack_once_the_last_connection_closed() {
-        let (shared, limit, target) = hello_shared(Duration::ZERO).await;
+        let (shared, limit, target) = hello_shared(Duration::ZERO);
         let (mut stream, _events) = served_session(&shared).await;
         assert!(!stream.advertise().await.withdraw);
         stream.ack(false);
@@ -148,7 +152,7 @@ mod tests {
     /// stream.
     #[tokio::test]
     async fn the_drain_grace_closes_the_connections_still_open() {
-        let (shared, limit, target) = hello_shared(Duration::ZERO).await;
+        let (shared, limit, target) = hello_shared(Duration::ZERO);
         let (mut stream, _events) = served_session(&shared).await;
         stream.advertise().await;
         stream.ack(false);
@@ -172,7 +176,7 @@ mod tests {
     /// `withdrawn`, ends the stream and with it the drain at once.
     #[tokio::test]
     async fn a_plain_ack_to_the_withdrawal_ends_the_stream_at_once() {
-        let (shared, limit, target) = hello_shared(Duration::ZERO).await;
+        let (shared, limit, target) = hello_shared(Duration::ZERO);
         let (mut stream, _events) = served_session(&shared).await;
         assert!(!stream.advertise().await.withdraw);
         // a connection served before any ack: the stream is up

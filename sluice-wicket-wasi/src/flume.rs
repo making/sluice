@@ -24,13 +24,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::BoxError;
 use crate::config::FlumeSettings;
 use crate::proto::flume_client::FlumeClient;
 use crate::proto::{
     AccessEvent, AccessFilter, FeedGap, FeedHello, FeedMessage, access_event, feed_control,
     feed_message,
 };
-use crate::{BoxError, session, tls};
+use sluice_tunnel::{session, tls};
 
 /// The recent lines kept for the backfill.
 pub const RING_SIZE: usize = 512;

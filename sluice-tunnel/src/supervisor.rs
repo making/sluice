@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 
 use crate::BoxError;
 use crate::proto;
+use crate::routes::Table;
 use crate::session::{self, Backoff, Session, Shared, jitter_unit, spawn_session};
 
 /// The fan-out supervisor. `bootstrap` is asked for the node list
@@ -20,10 +21,10 @@ use crate::session::{self, Backoff, Session, Shared, jitter_unit, spawn_session}
 /// bootstrap is asked again whenever no stream is up, in case the whole
 /// membership moved. A server without `ListNodes` is served by one session to
 /// the bootstrap. All membership transitions run on this single task.
-pub async fn supervise(
+pub async fn supervise<T: Table>(
     mut events: mpsc::Receiver<Vec<proto::Node>>,
     spawn_events: mpsc::Sender<Vec<proto::Node>>,
-    shared: Arc<Shared>,
+    shared: Arc<Shared<T>>,
     bootstrap: String,
 ) -> Result<(), BoxError> {
     let mut sessions: HashMap<String, Arc<Session>> = HashMap::new();
@@ -45,7 +46,7 @@ pub async fn supervise(
 /// Asks the bootstrap for the node list until a stream is up, and again
 /// whenever none is (`TunnelClient#discoverLoop`); with the backoff of the
 /// sessions between attempts. Never returns.
-async fn discover(shared: &Shared, bootstrap: &str, events: &mpsc::Sender<Vec<proto::Node>>) {
+async fn discover<T>(shared: &Shared<T>, bootstrap: &str, events: &mpsc::Sender<Vec<proto::Node>>) {
     let mut backoff = Backoff::new();
     loop {
         if shared.up.load(Ordering::Acquire) > 0 {
@@ -81,10 +82,10 @@ fn endpoints(nodes: Vec<proto::Node>, bootstrap: &str) -> Vec<(String, String)> 
 /// Adopts the membership (`TunnelClient#reconcile`, url to node id, see
 /// [`endpoints`]): opens a session to every new url, closes the sessions of
 /// the urls no longer listed.
-fn reconcile(
+fn reconcile<T: Table>(
     sessions: &mut HashMap<String, Arc<Session>>,
     endpoints: Vec<(String, String)>,
-    shared: &Arc<Shared>,
+    shared: &Arc<Shared<T>>,
     events: &mpsc::Sender<Vec<proto::Node>>,
 ) {
     if endpoints.is_empty() {
@@ -146,7 +147,7 @@ mod tests {
     /// the membership is closed.
     #[tokio::test]
     async fn the_bootstrap_lists_the_nodes_and_the_streams_go_to_their_public_urls() {
-        let (shared, _, _) = hello_shared(Duration::ZERO).await;
+        let (shared, _, _) = hello_shared(Duration::ZERO);
         let (url0, mut streams0) = tunnel_server(None).await;
         let (url1, mut streams1) = tunnel_server(None).await;
         let (bootstrap, mut bootstrap_streams) =

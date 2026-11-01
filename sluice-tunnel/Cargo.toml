@@ -1,0 +1,40 @@
+[package]
+name = "sluice-tunnel"
+version = "0.0.1-SNAPSHOT"
+edition = "2024"
+publish = false
+
+# The tunnel client of sluice-wicket-wasi and sluice-wicket-firecracker (both their own
+# workspaces), so it is one too.
+[workspace]
+
+[dependencies]
+tonic = { version = "0.14", features = ["tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util", "signal"] }
+# rt: the TaskTracker the drain waits on
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+# the reconnect backoff's jitter
+uuid = { version = "1", features = ["v4"] }
+# control-plane TLS (grpcs / --insecure); the ring provider matches tonic's tls-ring
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# testing: the server's side of a tunnel stream, over raw h2
+h2 = { version = "0.4", optional = true }
+http = { version = "1", optional = true }
+bytes = { version = "1", optional = true }
+
+[features]
+# the doubles of the tests: a tunnel server and a peer feeding the dispatch
+testing = ["dep:h2", "dep:http", "dep:bytes"]
+
+[dev-dependencies]
+# paused time for the stall watchdog tests
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+h2 = "0.4"
+http = "1"
+bytes = "1"
+
+[build-dependencies]
+tonic-prost-build = "0.14"

@@ -38,8 +38,8 @@ bytes = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
 # the console's sign-in through an OpenID Provider
 sluice-oidc = { path = "../sluice-oidc" }
-# control-plane TLS (grpcs / --insecure); the ring provider matches tonic's tls-ring
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# the tunnel client: node streams, flow control, the drain
+sluice-tunnel = { path = "../sluice-tunnel" }
 # wasmtime's ResourceLimiterAsync is #[async_trait]; the impl must match
 async-trait = "0.1"
 # the --config file: YAML with ${NAME} interpolation from the environment
@@ -69,6 +69,8 @@ redis = ["dep:redis"]
 tokio = { version = "1", features = ["test-util"] }
 # the console test's OpenID Provider
 sluice-oidc = { path = "../sluice-oidc", features = ["mock"] }
+# the tunnel's doubles: a tunnel server, a peer feeding the dispatch
+sluice-tunnel = { path = "../sluice-tunnel", features = ["testing"] }
 # an h2 client for the per-connection stream limit; the version hyper uses
 h2 = "0.4"
 # the CA and certificate of the redis-server the rediss:// test runs

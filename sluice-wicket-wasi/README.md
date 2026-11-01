@@ -19,7 +19,9 @@ sluice server --tunnel--> sluice-wicket-wasi --hyper(h1/h2c)--> wasi:http handle
 Two Cargo workspaces:
 
 - `.` — `sluice-wicket-wasi`, the tunnel-side wasm host (wasmtime + hyper), laid out as
-  `sluice-flume`: `src/lib.rs` wires the modules, `src/main.rs` reads the command line
+  `sluice-flume`: `src/lib.rs` wires the modules, `src/main.rs` reads the command line.
+  The tunnel client (node streams, flow control, the drain) is `../sluice-tunnel`, shared
+  with `sluice-wicket-firecracker`
 - `examples/` — sample handler components (`wasm32-wasip3`), a separate
   workspace pinned to a nightly toolchain by `rust-toolchain.toml`
   (wasm32-wasip3 ships rust-std on nightly only; rustup installs it on the

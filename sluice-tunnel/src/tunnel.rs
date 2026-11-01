@@ -1,7 +1,8 @@
 //! The virtual connections of one tunnel stream: dispatch of the server's
 //! frames, per-connection credit flow control, the scheduling of outbound
-//! frames ([`Outbound`]), and the byte stream adapter hyper serves each
-//! connection over.
+//! frames ([`Outbound`]), and the byte stream each connection's handler (the
+//! route's [`Binding`](crate::routes::Binding)) serves it over
+//! ([`TunnelIo`]).
 //!
 //! The flow control follows the protocol of the Java `VirtualConnection`
 //! (`sluice-proto`). Every connection is windowed; a CONNECT without a
@@ -14,9 +15,9 @@
 //!   connection. The payload waits in the connection's [`Inbox`], coalesced
 //!   into segments of at most [`SEGMENT`], so its memory stays near the window
 //!   whatever the size of the frames;
-//! - bytes handed to hyper are granted back (WindowUpdate) once they reach
+//! - bytes handed to the handler are granted back (WindowUpdate) once they reach
 //!   half the window;
-//! - hyper's writes send only against the server's credit; a write without
+//! - the handler's writes send only against the server's credit; a write without
 //!   credit waits on its own task until a grant, the server's ERROR or the
 //!   stream's end, and tells the server once per wait (WindowUpdate
 //!   `blocked`), so that the server may grow its window;
@@ -41,10 +42,7 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::proto::frame::Body;
 use crate::proto::{Close, Connect, Data, Error, Frame, WindowUpdate};
-use crate::routes::Routes;
-use crate::wasm_host;
-#[cfg(test)]
-use crate::wasm_host::Handler;
+use crate::routes::{Binding as _, Routes, Table};
 
 /// Receive window of every connection, announced in `Advertise`;
 /// the Java side's `VirtualConnection.DEFAULT_WINDOW`.
@@ -73,7 +71,7 @@ pub const SERVER_WINDOW_REQUIRED: &str = "the server announced no per-connection
 /// Read error of a connection the server failed.
 const ABORTED: &str = "connection aborted by the tunnel peer";
 
-/// Upper bound for a single DATA frame emitted by the hyper write path.
+/// Upper bound for a single DATA frame emitted by a connection's writes.
 const CHUNK: usize = 16 * 1024;
 
 /// The most payload one receive segment holds;
@@ -91,7 +89,7 @@ const fn max_segments(window: usize) -> usize {
 
 /// DATA frames one connection may have queued on the outbound stream; its
 /// writer waits beyond it. 16 x [`CHUNK`] = 256KiB.
-pub(crate) const DATA_QUEUE_CAPACITY: usize = 16;
+pub const DATA_QUEUE_CAPACITY: usize = 16;
 
 /// Write error after the connection's CLOSE or ERROR was queued.
 const WRITE_CLOSED: &str = "connection closed for writing";
@@ -353,7 +351,7 @@ impl Outbound {
     }
 
     /// The DATA frames queued for `conn_id`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     fn queued_data(&self, conn_id: i64) -> usize {
         self.lock()
             .connections
@@ -438,6 +436,11 @@ impl Limit {
     pub fn open(&self) -> usize {
         self.open.load(Ordering::Acquire)
     }
+
+    /// The most permits held at once.
+    pub fn max(&self) -> usize {
+        self.max
+    }
 }
 
 /// The slot of one connection, freed when dropped: held by its byte stream,
@@ -476,7 +479,7 @@ struct Flow {
     window: u32,
     state: Mutex<FlowState>,
     /// Cancelled once the connection failed: the server's ERROR or a local
-    /// reset. The serve task watches it, since hyper may not be reading.
+    /// reset. The serve task watches it, since the handler may not be reading.
     failed: CancellationToken,
 }
 
@@ -758,25 +761,26 @@ impl Flow {
 /// attempt, since conn ids are the server's.
 type Registry = Arc<Mutex<HashMap<i64, Arc<Flow>>>>;
 
-/// The virtual connections of one stream attempt.
-pub struct Connections {
+/// The virtual connections of one stream attempt, bound to the routes of
+/// `T`.
+pub struct Connections<T> {
     /// Session label for the log.
     key: String,
     outbound: Outbound,
     /// Dial address (the advertised target) -> its handler.
-    routes: Arc<Routes>,
+    routes: Arc<Routes<T>>,
     registry: Registry,
     limit: Arc<Limit>,
     /// The slots this stream's connections hold: an accepted connection's
     /// until its last frame left the outbound queue, or the stream ended.
     held: Arc<watch::Sender<usize>>,
     /// Test hook: the CONNECTs rejected for announcing no window.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     windowless_rejections: AtomicUsize,
 }
 
-impl Connections {
-    pub fn new(key: String, outbound: Outbound, routes: Arc<Routes>, limit: Arc<Limit>) -> Self {
+impl<T: Table> Connections<T> {
+    pub fn new(key: String, outbound: Outbound, routes: Arc<Routes<T>>, limit: Arc<Limit>) -> Self {
         Connections {
             key,
             outbound,
@@ -784,7 +788,7 @@ impl Connections {
             registry: Registry::default(),
             limit,
             held: Arc::new(watch::Sender::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             windowless_rejections: AtomicUsize::new(0),
         }
     }
@@ -848,18 +852,19 @@ impl Connections {
                 "[{}] {SERVER_WINDOW_REQUIRED}; rejecting conn {}",
                 self.key, connect.conn_id
             );
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             self.windowless_rejections.fetch_add(1, Ordering::AcqRel);
             self.outbound
                 .control(error_frame(connect.conn_id, SERVER_WINDOW_REQUIRED));
             return;
         }
-        let Some(binding) = self.routes.bind(&connect.address) else {
-            self.outbound.control(error_frame(
-                connect.conn_id,
-                &format!("no wasm route for '{}'", connect.address),
-            ));
-            return;
+        let binding = match self.routes.bind(&connect.address) {
+            Ok(binding) => binding,
+            Err(message) => {
+                self.outbound
+                    .control(error_frame(connect.conn_id, &message));
+                return;
+            }
         };
         // answered like a missing route: neither registered nor served
         let Some(permit) = self.limit.try_acquire() else {
@@ -869,7 +874,7 @@ impl Connections {
         };
         let mut io = self.register(connect.conn_id, connect.connection_window);
         io.permit = Some(permit.counted(&self.held));
-        tokio::spawn(wasm_host::serve(io, binding));
+        tokio::spawn(binding.serve(io));
     }
 
     fn data(&self, data: Data) {
@@ -889,7 +894,7 @@ impl Connections {
     }
 
     /// Registers a connection with the server's window as its initial credit
-    /// and returns the byte stream hyper serves it over.
+    /// and returns the byte stream its handler serves it over.
     fn register(&self, conn_id: i64, server_window: u32) -> TunnelIo {
         let flow = Arc::new(Flow::new(WINDOW, u64::from(server_window)));
         self.registry.lock().unwrap().insert(conn_id, flow.clone());
@@ -911,8 +916,8 @@ impl Connections {
     }
 
     /// Test hook: the CONNECTs rejected for announcing no window.
-    #[cfg(test)]
-    pub(crate) fn windowless_rejections(&self) -> usize {
+    #[cfg(any(test, feature = "testing"))]
+    pub fn windowless_rejections(&self) -> usize {
         self.windowless_rejections.load(Ordering::Acquire)
     }
 
@@ -930,7 +935,7 @@ impl Connections {
 }
 
 // ---------------------------------------------------------------------------
-// Tunnel <-> hyper byte stream adapter
+// Tunnel <-> handler byte stream adapter
 
 /// AsyncRead/AsyncWrite over one virtual connection: reads take the inbox,
 /// writes emit DATA frames against the server's credit.
@@ -939,7 +944,7 @@ pub struct TunnelIo {
     outbound: Outbound,
     flow: Arc<Flow>,
     registry: Registry,
-    /// Bytes handed to hyper and not yet granted back.
+    /// Bytes handed to the handler and not yet granted back.
     consumed: u64,
     /// The connection's slot of the connection limit, until `ending` takes
     /// it.
@@ -963,7 +968,7 @@ impl TunnelIo {
 
     /// Resolves once the connection failed: the server's ERROR, payload past
     /// the window, or the stream's end. Unlike the read error these cause,
-    /// it does not depend on hyper reading.
+    /// it does not depend on the handler reading.
     pub fn failed(&self) -> WaitForCancellationFutureOwned {
         self.flow.failed.clone().cancelled_owned()
     }
@@ -990,7 +995,7 @@ impl TunnelIo {
         Poll::Pending
     }
 
-    /// What the serve task needs once hyper is done with the connection;
+    /// What the serve task needs once the handler is done with the connection;
     /// takes over the connection's slot.
     pub fn ending(&mut self) -> Ending {
         Ending {
@@ -1024,7 +1029,7 @@ impl TunnelIo {
             let n = state.inbox.read_into(buf);
             if n == 0 {
                 return match state.remote_end {
-                    // an unfilled ReadBuf on return signals EOF to hyper
+                    // an unfilled ReadBuf on return signals EOF
                     Some(RemoteEnd::Closed) => Poll::Ready(Ok(())),
                     Some(RemoteEnd::Failed) => Poll::Ready(Err(std::io::Error::other(ABORTED))),
                     None => {
@@ -1178,13 +1183,13 @@ impl AsyncWrite for TunnelIo {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        // Half-close the tunnel direction when hyper is done with the connection.
+        // Half-close the tunnel direction: the handler is done writing.
         self.send_close();
         Poll::Ready(Ok(()))
     }
 }
 
-/// The end of one connection, run by its serve task after hyper returned.
+/// The end of one connection, run by its serve task after the handler returned.
 pub struct Ending {
     conn_id: i64,
     flow: Arc<Flow>,
@@ -1196,25 +1201,50 @@ pub struct Ending {
 impl Ending {
     /// Unregisters the connection and queues its terminal frame after its
     /// DATA, without waiting: ERROR ("connection closed") for a connection
-    /// the server may still send on, else CLOSE unless one went
-    /// out (hyper skips its shutdown on an error). The connection's slot is
-    /// freed once its queued frames left.
-    pub fn finish(mut self) {
+    /// the server may still send on, else CLOSE unless one went out (a
+    /// handler may skip its shutdown on an error, as hyper does). The
+    /// connection's slot is freed once its queued frames left.
+    pub fn finish(self) {
+        let conn_id = self.conn_id;
+        self.end(|state| {
+            if !state.remote_closed && !state.remote_failed {
+                state.error_sent = true;
+                Some(error_frame(conn_id, CONNECTION_CLOSED))
+            } else if !state.close_sent {
+                state.close_sent = true;
+                Some(close_frame(conn_id))
+            } else {
+                None
+            }
+        });
+    }
+
+    /// [`Ending::finish`] of a connection its handler failed (its upstream
+    /// gone mid-stream, say): ERROR `message` unless the server failed it
+    /// first, after the server's CLOSE and the handler's too, so that the
+    /// server drops its client's connection rather than ending it cleanly.
+    pub fn fail(self, message: &str) {
+        let conn_id = self.conn_id;
+        self.end(|state| {
+            (!state.remote_failed).then(|| {
+                state.error_sent = true;
+                error_frame(conn_id, message)
+            })
+        });
+    }
+
+    /// Unregisters the connection and queues the terminal frame `terminal`
+    /// picks, unless the connection was reset or already sent its ERROR.
+    fn end(mut self, terminal: impl FnOnce(&mut FlowState) -> Option<Frame>) {
         self.registry.lock().unwrap().remove(&self.conn_id);
         let frame = {
             let mut state = self.flow.lock();
-            // hyper is done: what it did not read is never read
+            // the handler is done: what it did not read is never read
             state.inbox.clear();
             if state.reset || state.error_sent {
                 None
-            } else if !state.remote_closed && !state.remote_failed {
-                state.error_sent = true;
-                Some(error_frame(self.conn_id, CONNECTION_CLOSED))
-            } else if !state.close_sent {
-                state.close_sent = true;
-                Some(close_frame(self.conn_id))
             } else {
-                None
+                terminal(&mut state)
             }
         };
         if let Some(frame) = frame {
@@ -1231,44 +1261,40 @@ impl Ending {
 
 /// A stand-in for the server side of the stream: feeds frames through the
 /// dispatch as the receive loop does and reads what the wicket sends.
-#[cfg(test)]
-pub(crate) mod testing {
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
     use super::*;
 
-    pub(crate) struct Peer {
-        pub(crate) connections: Connections,
+    pub struct Peer<T: Table> {
+        pub connections: Connections<T>,
         frames: Pin<Box<dyn Stream<Item = Frame> + Send + Sync>>,
         /// Grant every DATA frame back as it is received, as a server whose
         /// public peer reads promptly does.
-        pub(crate) auto_grant: bool,
+        pub auto_grant: bool,
     }
 
-    impl Peer {
-        pub(crate) fn new(routes: HashMap<String, Arc<Handler>>) -> Peer {
+    impl<T: Table> Peer<T> {
+        /// A peer whose connections are bound by `routes`.
+        pub fn new(routes: Arc<Routes<T>>) -> Peer<T> {
             Peer::limited(routes, Limit::new(usize::MAX))
         }
 
         /// A peer whose connections share `limit`.
-        pub(crate) fn limited(routes: HashMap<String, Arc<Handler>>, limit: Arc<Limit>) -> Peer {
+        pub fn limited(routes: Arc<Routes<T>>, limit: Arc<Limit>) -> Peer<T> {
             let (outbound, frames) = Outbound::new();
             Peer {
-                connections: Connections::new(
-                    "test".into(),
-                    outbound,
-                    Routes::fixed(routes),
-                    limit,
-                ),
+                connections: Connections::new("test".into(), outbound, routes, limit),
                 frames: Box::pin(frames),
                 auto_grant: true,
             }
         }
 
         /// One frame from the server, dispatched as the receive loop does.
-        pub(crate) fn send(&self, body: Body) {
+        pub fn send(&self, body: Body) {
             self.connections.dispatch(body);
         }
 
-        pub(crate) fn connect(&self, conn_id: i64, address: &str, window: u32) {
+        pub fn connect(&self, conn_id: i64, address: &str, window: u32) {
             self.send(Body::Connect(Connect {
                 conn_id,
                 address: address.into(),
@@ -1277,14 +1303,14 @@ pub(crate) mod testing {
             }));
         }
 
-        pub(crate) fn data(&self, conn_id: i64, payload: &[u8]) {
+        pub fn data(&self, conn_id: i64, payload: &[u8]) {
             self.send(Body::Data(Data {
                 conn_id,
                 payload: payload.to_vec(),
             }));
         }
 
-        pub(crate) fn error(&self, conn_id: i64, message: &str) {
+        pub fn error(&self, conn_id: i64, message: &str) {
             self.send(Body::Error(Error {
                 conn_id,
                 message: message.into(),
@@ -1293,23 +1319,23 @@ pub(crate) mod testing {
 
         /// Opens `conn_id` on `binding` directly, as a CONNECT resolved to
         /// it would.
-        pub(crate) fn serve(&self, conn_id: i64, binding: wasm_host::Binding) {
+        pub fn serve(&self, conn_id: i64, binding: T::Binding) {
             let io = self.connections.register(conn_id, WINDOW);
-            tokio::spawn(wasm_host::serve(io, binding));
+            tokio::spawn(binding.serve(io));
         }
 
         /// The DATA frames queued for `conn_id`.
-        pub(crate) fn queued_data(&self, conn_id: i64) -> usize {
+        pub fn queued_data(&self, conn_id: i64) -> usize {
             self.connections.outbound.queued_data(conn_id)
         }
 
         /// The connection is registered (its end has not run).
-        pub(crate) fn registered(&self, conn_id: i64) -> bool {
+        pub fn registered(&self, conn_id: i64) -> bool {
             self.connections.lookup(conn_id).is_some()
         }
 
         /// The next frame the wicket sent; None once the stream ended.
-        pub(crate) async fn recv(&mut self) -> Option<Frame> {
+        pub async fn recv(&mut self) -> Option<Frame> {
             use futures_util::StreamExt as _;
             let frame = self.frames.next().await?;
             if let (true, Some(Body::Data(data))) = (self.auto_grant, &frame.body) {
@@ -1323,7 +1349,7 @@ pub(crate) mod testing {
         }
     }
 
-    impl Drop for Peer {
+    impl<T: Table> Drop for Peer<T> {
         /// The stream ends with the peer, as on a real stream.
         fn drop(&mut self) {
             self.connections.teardown();
@@ -1335,6 +1361,7 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::Peer;
     use super::*;
+    use crate::routes::testing::Fixed;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::Wake;
     use std::time::Duration;
@@ -1353,8 +1380,12 @@ mod tests {
         (counter.clone(), Waker::from(counter))
     }
 
-    fn peer() -> Peer {
-        Peer::new(HashMap::new())
+    fn peer() -> Peer<Fixed> {
+        Peer::new(no_routes())
+    }
+
+    fn no_routes() -> Arc<Routes<Fixed>> {
+        Routes::new(Fixed::hosts(1, &[]))
     }
 
     fn data_frame(conn_id: i64, len: usize) -> Frame {
@@ -1371,7 +1402,7 @@ mod tests {
     }
 
     /// Feeds `total` bytes to `conn_id` in 16KiB frames.
-    fn feed(peer: &Peer, conn_id: i64, total: usize) {
+    fn feed(peer: &Peer<Fixed>, conn_id: i64, total: usize) {
         let mut left = total;
         while left > 0 {
             let n = left.min(CHUNK);
@@ -1389,14 +1420,14 @@ mod tests {
     }
 
     /// The next frame, or None when nothing arrives within 200ms.
-    async fn next_frame(peer: &mut Peer) -> Option<Frame> {
+    async fn next_frame(peer: &mut Peer<Fixed>) -> Option<Frame> {
         tokio::time::timeout(Duration::from_millis(200), peer.recv())
             .await
             .ok()
             .flatten()
     }
 
-    async fn drain_frames(peer: &mut Peer) -> Vec<Body> {
+    async fn drain_frames(peer: &mut Peer<Fixed>) -> Vec<Body> {
         let mut frames = Vec::new();
         while let Some(frame) = next_frame(peer).await {
             frames.push(frame.body.expect("frame body"));
@@ -1803,15 +1834,11 @@ mod tests {
         for _ in 0..DATA_QUEUE_CAPACITY {
             outbound.data(9, data_frame(9, 1));
         }
-        let connections = Connections::new(
-            "test".into(),
-            outbound,
-            Routes::fixed(HashMap::new()),
-            Limit::new(usize::MAX),
-        );
+        let connections =
+            Connections::new("test".into(), outbound, no_routes(), Limit::new(usize::MAX));
         connections.dispatch(Body::Connect(Connect {
             conn_id: 7,
-            address: "wasm:missing".into(),
+            address: "test:missing".into(),
             connection_window: WINDOW,
             ..Default::default()
         }));
@@ -1819,7 +1846,7 @@ mod tests {
         let first = frames.next().await.unwrap();
         assert!(
             matches!(&first.body, Some(Body::Error(error))
-                if error.conn_id == 7 && error.message.contains("no wasm route")),
+                if error.conn_id == 7 && error.message == "no test route for 'test:missing'"),
             "{first:?}"
         );
     }
@@ -1860,14 +1887,29 @@ mod tests {
         );
     }
 
+    /// After the server's CLOSE a connection ends with CLOSE, or with the
+    /// ERROR its handler failed it with.
     #[tokio::test]
-    async fn a_windowed_connection_ending_after_the_servers_close_sends_close() {
-        let mut peer = peer();
-        let io = peer.connections.register(1, WINDOW);
-        peer.send(Body::Close(Close { conn_id: 1 }));
-        finish(io).await;
-        let frames = drain_frames(&mut peer).await;
-        assert!(matches!(&frames[..], [Body::Close(_)]), "{frames:?}");
+    async fn a_windowed_connection_ending_after_the_servers_close_sends_close_or_its_failure() {
+        for failed in [false, true] {
+            let mut peer = peer();
+            let mut io = peer.connections.register(1, WINDOW);
+            peer.send(Body::Close(Close { conn_id: 1 }));
+            if failed {
+                io.ending().fail("upstream gone");
+            } else {
+                finish(io).await;
+            }
+            let frames = drain_frames(&mut peer).await;
+            if failed {
+                assert!(
+                    matches!(&frames[..], [Body::Error(error)] if error.message == "upstream gone"),
+                    "{frames:?}"
+                );
+            } else {
+                assert!(matches!(&frames[..], [Body::Close(_)]), "{frames:?}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -2228,7 +2270,7 @@ mod tests {
         let connections = Connections::new(
             "test".into(),
             outbound.clone(),
-            Routes::fixed(HashMap::new()),
+            no_routes(),
             Limit::new(usize::MAX),
         );
         let mut io = connections.register(1, WINDOW);
@@ -2260,7 +2302,7 @@ mod tests {
         let connections = Connections::new(
             "test".into(),
             outbound.clone(),
-            Routes::fixed(HashMap::new()),
+            no_routes(),
             Limit::new(usize::MAX),
         );
         let mut frames = Box::pin(frames);

@@ -20,7 +20,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::{mpsc, oneshot, watch};
@@ -125,76 +124,12 @@ impl Table {
     pub fn handler(&self, target: &str) -> Option<&Arc<Handler>> {
         self.entries.get(target).map(|entry| &entry.handler)
     }
-}
-
-/// The current [`Table`], shared by every node stream and connection, and the
-/// acknowledgements of the streams.
-pub struct Routes {
-    table: watch::Sender<Arc<Table>>,
-    /// Live stream -> the newest generation the server acknowledged on it (0
-    /// before its first acknowledgement).
-    acks: watch::Sender<HashMap<u64, u64>>,
-    next_stream: AtomicU64,
-}
-
-impl Routes {
-    fn new(table: Table) -> Arc<Routes> {
-        Arc::new(Routes {
-            table: watch::Sender::new(Arc::new(table)),
-            acks: watch::Sender::new(HashMap::new()),
-            next_stream: AtomicU64::new(0),
-        })
-    }
-
-    /// Routes serving `handlers` by target for good, advertising nothing.
-    #[cfg(test)]
-    pub fn fixed(handlers: HashMap<String, Arc<Handler>>) -> Arc<Routes> {
-        Routes::new(Table {
-            generation: 1,
-            advertised: Vec::new(),
-            origins: HashMap::new(),
-            entries: handlers
-                .into_iter()
-                .map(|(target, handler)| {
-                    let gone = CancellationToken::new();
-                    (target, Entry { handler, gone })
-                })
-                .collect(),
-        })
-    }
-
-    pub fn current(&self) -> Arc<Table> {
-        self.table.borrow().clone()
-    }
-
-    /// Follows the table: a stream re-advertises on a change.
-    pub fn subscribe(&self) -> watch::Receiver<Arc<Table>> {
-        self.table.subscribe()
-    }
-
-    /// What a connection to `address` serves; None for an unknown target.
-    pub fn bind(self: &Arc<Self>, address: &str) -> Option<Binding> {
-        let entry = self.table.borrow().entries.get(address)?.clone();
-        let (routes, target) = (self.clone(), address.to_string());
-        Some(Binding {
-            opened: entry.handler,
-            current: Box::new(move || {
-                let table = routes.table.borrow();
-                table
-                    .entries
-                    .get(&target)
-                    .map(|entry| entry.handler.clone())
-            }),
-            gone: entry.gone,
-        })
-    }
 
     /// The handler serving a request for `host` (no port) on the listener:
     /// the route of that host, or the sole route whatever the host; None for
     /// an unknown host.
     pub fn by_host(&self, host: &str) -> Option<Arc<Handler>> {
-        let table = self.table.borrow();
-        let target = match table.advertised.as_slice() {
+        let target = match self.advertised.as_slice() {
             [sole] => &sole.target_url,
             all => {
                 &all.iter()
@@ -202,58 +137,64 @@ impl Routes {
                     .target_url
             }
         };
-        table.entries.get(target).map(|entry| entry.handler.clone())
-    }
-
-    /// Registers a live stream, unregistered when the guard drops.
-    pub fn stream(self: &Arc<Self>) -> StreamAcks {
-        let id = self.next_stream.fetch_add(1, Ordering::Relaxed);
-        self.acks.send_modify(|acks| {
-            acks.insert(id, 0);
-        });
-        StreamAcks {
-            routes: self.clone(),
-            id,
-        }
-    }
-
-    /// Resolves once every live stream acknowledged `generation` or a later
-    /// one; at once without a live stream.
-    pub(crate) async fn acknowledged(&self, generation: u64) {
-        let mut acks = self.acks.subscribe();
-        let _ = acks
-            .wait_for(|acks| acks.values().all(|acked| *acked >= generation))
-            .await;
-    }
-
-    fn publish(&self, table: Table) {
-        self.table.send_replace(Arc::new(table));
+        self.entries.get(target).map(|entry| entry.handler.clone())
     }
 }
 
-/// A live stream's acknowledgements; dropping it unregisters the stream.
-pub struct StreamAcks {
-    routes: Arc<Routes>,
-    id: u64,
-}
+impl sluice_tunnel::routes::Table for Table {
+    type Binding = Binding;
 
-impl StreamAcks {
-    /// The server took the routes of `generation` on this stream.
-    pub fn acked(&self, generation: u64) {
-        self.routes.acks.send_modify(|acks| {
-            if let Some(acked) = acks.get_mut(&self.id) {
-                *acked = (*acked).max(generation);
-            }
-        });
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn advertised(&self) -> &[Upstream] {
+        &self.advertised
+    }
+
+    /// A connection to `address` serves each request by the target's
+    /// handler of the moment.
+    fn bind(routes: &Arc<Routes>, address: &str) -> Result<Binding, String> {
+        let entry = routes
+            .current()
+            .entries
+            .get(address)
+            .cloned()
+            .ok_or_else(|| format!("no wasm route for '{address}'"))?;
+        let (routes, target) = (routes.clone(), address.to_string());
+        Ok(Binding {
+            opened: entry.handler,
+            current: Box::new(move || {
+                routes
+                    .current()
+                    .entries
+                    .get(&target)
+                    .map(|entry| entry.handler.clone())
+            }),
+            gone: entry.gone,
+        })
     }
 }
 
-impl Drop for StreamAcks {
-    fn drop(&mut self) {
-        self.routes.acks.send_modify(|acks| {
-            acks.remove(&self.id);
-        });
-    }
+/// The current [`Table`], shared by every node stream and connection, and the
+/// acknowledgements of the streams.
+pub type Routes = sluice_tunnel::routes::Routes<Table>;
+
+/// Routes serving `handlers` by target for good, advertising nothing.
+#[cfg(test)]
+pub fn fixed(handlers: HashMap<String, Arc<Handler>>) -> Arc<Routes> {
+    Routes::new(Table {
+        generation: 1,
+        advertised: Vec::new(),
+        origins: HashMap::new(),
+        entries: handlers
+            .into_iter()
+            .map(|(target, handler)| {
+                let gone = CancellationToken::new();
+                (target, Entry { handler, gone })
+            })
+            .collect(),
+    })
 }
 
 /// A file's identity as a poll sees it; None for a missing file.
@@ -1070,8 +1011,12 @@ fn change(old: &[Upstream], new: &[Upstream], updated: &HashSet<String>) -> Chan
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+    use crate::proto::frame::Body;
     use crate::wasm_host::tests::{exchange, guest_wasm};
+    use sluice_tunnel::session::testing::{served_session, shared_on};
 
     /// A directory of its own under the system temp dir, removed on drop.
     pub(crate) struct Scratch(pub(crate) PathBuf);
@@ -1124,16 +1069,6 @@ pub(crate) mod tests {
                 .target_url
                 .clone()
         }
-
-        /// A table advertising `advertised`, serving nothing.
-        pub(crate) fn advertising(generation: u64, advertised: Vec<Upstream>) -> Table {
-            Table {
-                generation,
-                advertised,
-                origins: HashMap::new(),
-                entries: HashMap::new(),
-            }
-        }
     }
 
     /// Serves `body` to every GET on an ephemeral port; the url of
@@ -1167,6 +1102,102 @@ pub(crate) mod tests {
             assert!(tokio::time::Instant::now() < deadline, "{what}");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// A reload is advertised on the live stream. A component changed on
+    /// disk serves the next request of a connection already open, after the
+    /// request in flight finished on the old one; a removed target keeps
+    /// being served -- a CONNECT the server routed before it took the new
+    /// routes included -- until the stream acknowledged them, then its
+    /// connections close and a CONNECT to it fails.
+    #[tokio::test]
+    async fn a_reload_is_advertised_and_a_removed_target_serves_until_acknowledged() {
+        let dir = Scratch::new("advertise");
+        dir.guest("a.wasm", "hello");
+        dir.guest("b.wasm", "hello");
+        let path = dir.write(
+            "wicket.yaml",
+            "routes:\n  - {host: a.local, component: a.wasm}\n  - {host: b.local, component: b.wasm}\n",
+        );
+        let reloader = Reloader::start(RouteSource::file(&path).unwrap(), Instances::new(8))
+            .await
+            .unwrap();
+        let (shared, limit) = shared_on(reloader.routes(), Duration::ZERO);
+        let (a, b) = {
+            let table = shared.routes.current();
+            (table.target("a.local"), table.target("b.local"))
+        };
+        let (hangups, hangups_received) = mpsc::channel(1);
+        let (_requests, requests_received) = mpsc::channel(1);
+        let stop = CancellationToken::new();
+        tokio::spawn(reloader.run(
+            Duration::ZERO,
+            hangups_received,
+            requests_received,
+            stop.clone(),
+        ));
+        let (mut stream, _events) = served_session(&shared).await;
+        assert_eq!(stream.advertise().await.upstreams.len(), 2);
+        stream.ack(false);
+        stream.connect(1, &a);
+        stream.connect(2, &b);
+        assert_eq!(stream.exchange(2, "/b").await, "HTTP/1.1 200 OK");
+        // in flight across the reload: the body is half sent
+        stream.data(
+            1,
+            "POST / HTTP/1.1\r\nhost: a.local\r\ncontent-length: 4\r\n\r\nab",
+        );
+
+        dir.guest("a.wasm", "fetch");
+        dir.write(
+            "wicket.yaml",
+            "routes:\n  - {host: a.local, component: a.wasm}\n",
+        );
+        hangups.send(()).await.unwrap();
+        let readvertised = stream.advertise().await;
+        let hosts: Vec<_> = readvertised.upstreams.iter().map(|up| &up.host).collect();
+        assert_eq!(hosts, ["a.local"]);
+        assert!(!readvertised.withdraw);
+        assert_eq!(
+            readvertised.upstreams[0].target_url, a,
+            "a keeps its target"
+        );
+
+        stream.data(1, "cd");
+        let in_flight = stream.response(1).await;
+        assert!(in_flight.contains("body_bytes=4"), "the old a: {in_flight}");
+        stream.data(1, "GET / HTTP/1.1\r\nhost: a.local\r\n\r\n");
+        let next = stream.response(1).await;
+        assert!(next.starts_with("HTTP/1.1 400"), "the new a: {next}");
+        // routed by the server before it took the new routes
+        stream.connect(3, &b);
+        assert_eq!(stream.exchange(3, "/late").await, "HTTP/1.1 200 OK");
+        assert_eq!(stream.exchange(2, "/again").await, "HTTP/1.1 200 OK");
+
+        stream.ack(false);
+        let mut closed = Vec::new();
+        while closed.len() < 2 {
+            closed.push(
+                stream
+                    .next(|body| match body {
+                        Body::Close(close) => Some(close.conn_id),
+                        _ => None,
+                    })
+                    .await,
+            );
+        }
+        closed.sort();
+        assert_eq!(closed, [2, 3], "b's connections close, a's stays");
+        stream.connect(4, &b);
+        let error = stream
+            .next(|body| match body {
+                Body::Error(error) if error.conn_id == 4 => Some(error.message),
+                _ => None,
+            })
+            .await;
+        assert!(error.contains("no wasm route"), "{error}");
+        assert_eq!(limit.open(), 1, "a's connection only");
+        stop.cancel();
     }
 
     /// Routes naming one component with the same options share a dial
