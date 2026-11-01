@@ -1,0 +1,17 @@
+# the context is the repository root; the build needs the proto, the crates it depends on, the
+# guest and the crate only
+*
+!sluice-proto/src/main/proto
+!sluice-build-info/Cargo.toml
+!sluice-build-info/src
+!sluice-tunnel/Cargo.toml
+!sluice-tunnel/build.rs
+!sluice-tunnel/src
+!sluice-wicket-firecracker/Cargo.toml
+!sluice-wicket-firecracker/Cargo.lock
+!sluice-wicket-firecracker/build.rs
+!sluice-wicket-firecracker/src
+!sluice-wicket-firecracker/guest/Cargo.toml
+!sluice-wicket-firecracker/guest/Cargo.lock
+!sluice-wicket-firecracker/guest/src
+!sluice-wicket-firecracker/scripts/build-guest.sh
