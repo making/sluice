@@ -6,7 +6,7 @@ fn main() {
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let protos = manifest_dir
         .parent()
-        .expect("crate below <repo>/sluice-tunnel")
+        .expect("crate below <repo>/sluice-wicket-tunnel")
         .join("sluice-proto/src/main/proto");
     tonic_prost_build::configure()
         .build_server(false)

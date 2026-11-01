@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use sluice_tunnel::routes::Routes;
+use sluice_wicket_tunnel::routes::Routes;
 use tokio::net::TcpListener;
 
 use crate::routes::Table;

@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use sluice_oidc::OidcSettings;
 // the tunnel's: --max-connections, --tunnel-stall-timeout, --drain-grace
-use sluice_tunnel::{DEFAULT_DRAIN_GRACE, DEFAULT_MAX_CONNECTIONS, DEFAULT_STALL_TIMEOUT};
+use sluice_wicket_tunnel::{DEFAULT_DRAIN_GRACE, DEFAULT_MAX_CONNECTIONS, DEFAULT_STALL_TIMEOUT};
 
 use crate::deployed::Deployed;
 use crate::env::Env;

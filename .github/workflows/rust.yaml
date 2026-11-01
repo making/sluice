@@ -15,7 +15,7 @@ on:
     - 'sluice-wicket-firecracker/**'
     - 'sluice-build-info/**'
     - 'sluice-oidc/**'
-    - 'sluice-tunnel/**'
+    - 'sluice-wicket-tunnel/**'
     - 'sluice-proto/src/main/proto/**'
     - '.github/workflows/rust.yaml'
     - '.github/workflows/deploy-flume.yaml'
@@ -60,7 +60,7 @@ jobs:
           - 'sluice-oidc/**'
           - '.github/workflows/rust.yaml'
           tunnel:
-          - 'sluice-tunnel/**'
+          - 'sluice-wicket-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
           flume:
@@ -73,7 +73,7 @@ jobs:
           - 'sluice-wicket-wasi/**'
           - 'sluice-build-info/**'
           - 'sluice-oidc/**'
-          - 'sluice-tunnel/**'
+          - 'sluice-wicket-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
           - '.github/workflows/deploy-wicket.yaml'
@@ -84,14 +84,14 @@ jobs:
           - 'sluice-flume/**'
           - 'sluice-build-info/**'
           - 'sluice-oidc/**'
-          - 'sluice-tunnel/**'
+          - 'sluice-wicket-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
           - '.github/workflows/deploy-cf-api.yaml'
           firecracker:
           - 'sluice-wicket-firecracker/**'
           - 'sluice-build-info/**'
-          - 'sluice-tunnel/**'
+          - 'sluice-wicket-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
           - '.github/workflows/deploy-firecracker.yaml'
@@ -142,14 +142,14 @@ jobs:
       run: cargo clippy --all-targets --all-features --locked -- -D warnings
     - name: Test
       run: cargo test --all-features --locked
-  sluice-tunnel:
+  sluice-wicket-tunnel:
     needs: changes
     if: needs.changes.outputs.tunnel == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
       run:
-        working-directory: sluice-tunnel
+        working-directory: sluice-wicket-tunnel
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -163,8 +163,8 @@ jobs:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
-          sluice-tunnel/target
-        key: cargo-tunnel-${{ runner.os }}-${{ hashFiles('sluice-tunnel/Cargo.lock', 'sluice-tunnel/rust-toolchain.toml') }}
+          sluice-wicket-tunnel/target
+        key: cargo-wicket-tunnel-${{ runner.os }}-${{ hashFiles('sluice-wicket-tunnel/Cargo.lock', 'sluice-wicket-tunnel/rust-toolchain.toml') }}
     - name: Format
       run: cargo fmt --check
     - name: Clippy

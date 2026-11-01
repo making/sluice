@@ -141,7 +141,7 @@ impl Table {
     }
 }
 
-impl sluice_tunnel::routes::Table for Table {
+impl sluice_wicket_tunnel::routes::Table for Table {
     type Binding = Binding;
 
     fn generation(&self) -> u64 {
@@ -178,7 +178,7 @@ impl sluice_tunnel::routes::Table for Table {
 
 /// The current [`Table`], shared by every node stream and connection, and the
 /// acknowledgements of the streams.
-pub type Routes = sluice_tunnel::routes::Routes<Table>;
+pub type Routes = sluice_wicket_tunnel::routes::Routes<Table>;
 
 /// Routes serving `handlers` by target for good, advertising nothing.
 #[cfg(test)]
@@ -1016,7 +1016,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::proto::frame::Body;
     use crate::wasm_host::tests::{exchange, guest_wasm};
-    use sluice_tunnel::session::testing::{served_session, shared_on};
+    use sluice_wicket_tunnel::session::testing::{served_session, shared_on};
 
     /// A directory of its own under the system temp dir, removed on drop.
     pub(crate) struct Scratch(pub(crate) PathBuf);

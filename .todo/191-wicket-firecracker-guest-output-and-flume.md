@@ -21,7 +21,7 @@ its own stdout / stderr and feeds them to a sluice-flume (`--flume`, `src/flume.
   and the VM (`stdout [app.local vm-3] :: ...`), so `docker logs` shows them
 - `--flume` / `--flume-token` / `--flume-ca-cert` / `--flume-insecure` feed the lines as
   wasi's do (`stdout` / `stderr` kinds, the node `wicket:<client-id>`, the ring and queue,
-  the redial). Move wasi's feed into a crate both share (sluice-tunnel's or one of its own)
+  the redial). Move wasi's feed into a crate both share (sluice-wicket-tunnel's or one of its own)
   rather than copy it. Response lines: the wicket relays bytes verbatim, the server's own
   access log has the requests; decide whether the wicket adds any
 - the console can stay off; `SLUICE_FIRECRACKER_CONSOLE` remains for the kernel's and

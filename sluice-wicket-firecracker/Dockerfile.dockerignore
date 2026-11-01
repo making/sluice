@@ -4,9 +4,9 @@
 !sluice-proto/src/main/proto
 !sluice-build-info/Cargo.toml
 !sluice-build-info/src
-!sluice-tunnel/Cargo.toml
-!sluice-tunnel/build.rs
-!sluice-tunnel/src
+!sluice-wicket-tunnel/Cargo.toml
+!sluice-wicket-tunnel/build.rs
+!sluice-wicket-tunnel/src
 !sluice-wicket-firecracker/Cargo.toml
 !sluice-wicket-firecracker/Cargo.lock
 !sluice-wicket-firecracker/build.rs

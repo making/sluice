@@ -1,4 +1,4 @@
-//! sluice-tunnel: the tunnel client of the Rust wickets (`sluice-wicket-wasi`,
+//! sluice-wicket-tunnel: the tunnel client of the Rust wickets (`sluice-wicket-wasi`,
 //! `sluice-wicket-firecracker`), the `sluice.v1.Tunnel` gRPC API of the Java
 //! client (`TunnelClient` / `NodeConnection`).
 //!

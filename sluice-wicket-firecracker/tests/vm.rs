@@ -1,4 +1,4 @@
-//! The wicket booting VMs, through a tunnel server double (`sluice-tunnel`'s):
+//! The wicket booting VMs, through a tunnel server double (`sluice-wicket-tunnel`'s):
 //! for a shared VM (serving two hosts: one target) and a VM per connection,
 //! http/1.1 with keep-alive, h2c, a 5MB POST under the tunnel's flow control
 //! and a client half-closing after its request; a route of one VM at most
@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use sluice_tunnel::session::testing::{ServerTunnel, dial_address, tunnel_server};
+use sluice_wicket_tunnel::session::testing::{ServerTunnel, dial_address, tunnel_server};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 /// Hang guard of every wait; the first covers the boots and the snapshot.

@@ -904,7 +904,26 @@ name = "sluice-build-info"
 version = "0.0.1-SNAPSHOT"
 
 [[package]]
-name = "sluice-tunnel"
+name = "sluice-wicket-firecracker"
+version = "0.0.1-SNAPSHOT"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "sluice-build-info",
+ "sluice-wicket-tunnel",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "sluice-wicket-tunnel"
 version = "0.0.1-SNAPSHOT"
 dependencies = [
  "bytes",
@@ -918,25 +937,6 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
- "uuid",
-]
-
-[[package]]
-name = "sluice-wicket-firecracker"
-version = "0.0.1-SNAPSHOT"
-dependencies = [
- "bytes",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "serde",
- "serde-saphyr",
- "serde_json",
- "sluice-build-info",
- "sluice-tunnel",
- "tokio",
- "tokio-util",
  "uuid",
 ]
 

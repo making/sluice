@@ -1,6 +1,6 @@
 # sluice-wicket-firecracker on distroless cc (glibc), with the pinned Firecracker release,
 # a guest kernel of Firecracker's CI, the guest (/init of the wicket's own version) and the
-# sample rootfs. The proto lives in sluice-proto and the tunnel client in sluice-tunnel, so
+# sample rootfs. The proto lives in sluice-proto and the tunnel client in sluice-wicket-tunnel, so
 # the build context is the repository root:
 #   docker build -f sluice-wicket-firecracker/Dockerfile --build-arg GIT_COMMIT=$(git rev-parse HEAD) .
 # x86_64 only (the musl guest, the release and the kernel are x86_64's).
@@ -31,8 +31,8 @@ RUN tar -xzf /tmp/firecracker-v1.17.0-x86_64.tgz -C /tmp \
 COPY sluice-proto/src/main/proto sluice-proto/src/main/proto
 COPY sluice-build-info/Cargo.toml sluice-build-info/
 COPY sluice-build-info/src sluice-build-info/src
-COPY sluice-tunnel/Cargo.toml sluice-tunnel/build.rs sluice-tunnel/
-COPY sluice-tunnel/src sluice-tunnel/src
+COPY sluice-wicket-tunnel/Cargo.toml sluice-wicket-tunnel/build.rs sluice-wicket-tunnel/
+COPY sluice-wicket-tunnel/src sluice-wicket-tunnel/src
 COPY sluice-wicket-firecracker/Cargo.toml sluice-wicket-firecracker/Cargo.lock sluice-wicket-firecracker/build.rs sluice-wicket-firecracker/
 COPY sluice-wicket-firecracker/src sluice-wicket-firecracker/src
 # the context has no .git: the commit --version shows comes from here

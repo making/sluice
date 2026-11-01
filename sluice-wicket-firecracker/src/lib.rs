@@ -6,7 +6,7 @@
 //! sluice server(s) --tunnel--> wicket --vsock (raw bytes per connection)--> guest in a microVM
 //! ```
 //!
-//! The tunnel client is `sluice-tunnel`'s, as sluice-wicket-wasi's: the
+//! The tunnel client is `sluice-wicket-tunnel`'s, as sluice-wicket-wasi's: the
 //! `--server` endpoint is asked for the node list, one tunnel stream per node
 //! advertises the routes and serves their connections, and SIGTERM / SIGINT
 //! drains the streams within `--drain-grace`.
@@ -29,9 +29,9 @@ pub mod wire;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sluice_tunnel::proto::PeerBuild;
-use sluice_tunnel::session::{self, Shared};
-use sluice_tunnel::signals::{self, Signals};
+use sluice_wicket_tunnel::proto::PeerBuild;
+use sluice_wicket_tunnel::session::{self, Shared};
+use sluice_wicket_tunnel::signals::{self, Signals};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -52,9 +52,9 @@ pub fn build() -> PeerBuild {
     }
 }
 
-/// [`build`] in one line, see [`sluice_tunnel::describe`].
+/// [`build`] in one line, see [`sluice_wicket_tunnel::describe`].
 pub fn describe_build() -> String {
-    sluice_tunnel::describe(&build())
+    sluice_wicket_tunnel::describe(&build())
 }
 
 /// Boots the routes' VMs into `state_dir` and serves them (through the
@@ -133,5 +133,5 @@ pub async fn run(settings: config::Settings, state_dir: PathBuf) -> Result<(), B
     );
     // the drain stops the reloads: the routes are withdrawn
     tokio::spawn(reloader.run(watch_interval, hangups_received, shared.drain.begin.clone()));
-    sluice_tunnel::serve(shared, server, drain_grace, &mut signals).await
+    sluice_wicket_tunnel::serve(shared, server, drain_grace, &mut signals).await
 }

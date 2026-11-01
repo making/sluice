@@ -31,7 +31,7 @@ use crate::proto::{
     AccessEvent, AccessFilter, FeedGap, FeedHello, FeedMessage, access_event, feed_control,
     feed_message,
 };
-use sluice_tunnel::{session, tls};
+use sluice_wicket_tunnel::{session, tls};
 
 /// The recent lines kept for the backfill.
 pub const RING_SIZE: usize = 512;

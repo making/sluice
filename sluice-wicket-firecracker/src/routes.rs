@@ -19,9 +19,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use sluice_tunnel::proto::Upstream;
-use sluice_tunnel::routes::{Binding, Routes};
-use sluice_tunnel::tunnel::TunnelIo;
+use sluice_wicket_tunnel::proto::Upstream;
+use sluice_wicket_tunnel::routes::{Binding, Routes};
+use sluice_wicket_tunnel::tunnel::TunnelIo;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -64,7 +64,7 @@ impl Table {
     }
 }
 
-impl sluice_tunnel::routes::Table for Table {
+impl sluice_wicket_tunnel::routes::Table for Table {
     type Binding = Connection;
 
     fn generation(&self) -> u64 {

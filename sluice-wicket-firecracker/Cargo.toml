@@ -10,7 +10,7 @@ exclude = ["guest"]
 
 [dependencies]
 # the tunnel client: node streams, flow control, the drain
-sluice-tunnel = { path = "../sluice-tunnel" }
+sluice-wicket-tunnel = { path = "../sluice-wicket-tunnel" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs", "process", "signal"] }
 # the reloads' stop: the drain's token
 tokio-util = "0.7"
@@ -30,7 +30,7 @@ libc = "0.2"
 
 [dev-dependencies]
 # the tunnel's doubles: a tunnel server opening the tests' connections
-sluice-tunnel = { path = "../sluice-tunnel", features = ["testing"] }
+sluice-wicket-tunnel = { path = "../sluice-wicket-tunnel", features = ["testing"] }
 # the tests' clients over a tunnel connection: http/1.1 and h2c
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

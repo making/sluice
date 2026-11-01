@@ -9,7 +9,7 @@
 //! sluice server(s) --tunnel stream per node--> wicket --hyper (h1 / h2c)--> wasi:http component
 //! ```
 //!
-//! The tunnel client is `sluice-tunnel`'s, as the other Rust wickets': the
+//! The tunnel client is `sluice-wicket-tunnel`'s, as the other Rust wickets': the
 //! `--server` endpoint is asked for the node list, one tunnel stream per node
 //! advertises the routes and serves their connections, and SIGTERM / SIGINT
 //! drains the streams within `--drain-grace`. Each connection is served by
@@ -66,14 +66,14 @@ mod wasm_host;
 
 use std::sync::Arc;
 
-use sluice_tunnel::session::Shared;
-use sluice_tunnel::signals::{self, Signals};
+use sluice_wicket_tunnel::session::Shared;
+use sluice_wicket_tunnel::signals::{self, Signals};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// The tunnel's messages (`sluice-tunnel`'s) and the flume's.
+/// The tunnel's messages (`sluice-wicket-tunnel`'s) and the flume's.
 pub mod proto {
-    pub use sluice_tunnel::proto::*;
+    pub use sluice_wicket_tunnel::proto::*;
     tonic::include_proto!("sluice.v1");
 }
 
@@ -98,9 +98,9 @@ pub fn build() -> PeerBuild {
     }
 }
 
-/// [`build`] in one line, see [`sluice_tunnel::describe`].
+/// [`build`] in one line, see [`sluice_wicket_tunnel::describe`].
 pub fn describe_build() -> String {
-    sluice_tunnel::describe(&build())
+    sluice_wicket_tunnel::describe(&build())
 }
 
 /// Serves the routes of `settings` (through the server, on `--listen`, or
@@ -252,7 +252,7 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         None => None,
     };
     let shared = Shared::new(
-        sluice_tunnel::session::Settings {
+        sluice_wicket_tunnel::session::Settings {
             token,
             id: client_id,
             insecure,
@@ -272,5 +272,5 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         shared.drain.begin.clone(),
     ));
 
-    sluice_tunnel::serve(shared, server, drain_grace, &mut signals).await
+    sluice_wicket_tunnel::serve(shared, server, drain_grace, &mut signals).await
 }

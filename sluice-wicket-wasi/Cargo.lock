@@ -2298,7 +2298,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sluice-tunnel"
+name = "sluice-wicket-tunnel"
 version = "0.0.1-SNAPSHOT"
 dependencies = [
  "bytes",
@@ -2343,7 +2343,7 @@ dependencies = [
  "sha2",
  "sluice-build-info",
  "sluice-oidc",
- "sluice-tunnel",
+ "sluice-wicket-tunnel",
  "tokio",
  "tokio-stream",
  "tokio-util",

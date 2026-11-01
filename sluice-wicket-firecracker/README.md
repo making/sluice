@@ -11,7 +11,7 @@ sluice server --tunnel--> wicket --vsock, framed--> /init (PID 1) --TCP 127.0.0.
 ```
 
 The wicket connects to a sluice server like the Java client (the tunnel client is
-`../sluice-tunnel`'s: the node list, a stream per node, flow control, the connection limit,
+`../sluice-wicket-tunnel`'s: the node list, a stream per node, flow control, the connection limit,
 the drain) and relays each tunnel connection verbatim (no HTTP termination) to a vsock stream
 of a guest. The guest's `/init` (`guest/`, static musl) relays it on to the process. A
 route's VMs are:

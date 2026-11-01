@@ -37,7 +37,7 @@ use wasmtime::AsContextMut as _;
 use crate::env::Env;
 use crate::flume::Tap;
 use crate::keyvalue;
-use sluice_tunnel::tunnel::TunnelIo;
+use sluice_wicket_tunnel::tunnel::TunnelIo;
 
 /// Relay slots between the guest's store task and hyper; together with the
 /// pipe buffer inside the body conversion this bounds the in-flight response
@@ -2653,7 +2653,7 @@ impl Binding {
     }
 }
 
-impl sluice_tunnel::routes::Binding for Binding {
+impl sluice_wicket_tunnel::routes::Binding for Binding {
     fn serve(self, io: TunnelIo) -> impl Future<Output = ()> + Send + 'static {
         serve(io, self)
     }
@@ -2804,7 +2804,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::proto::frame::Body;
     use crate::routes::Table;
-    use sluice_tunnel::tunnel::testing::Peer;
+    use sluice_wicket_tunnel::tunnel::testing::Peer;
     use std::time::{Duration, Instant};
 
     /// Builds the example guests (a no-op when fresh, serialized across
@@ -2985,7 +2985,7 @@ pub(crate) mod tests {
             ROUTE.to_string(),
             handler.clone(),
         )])));
-        peer.connect(1, ROUTE, sluice_tunnel::tunnel::WINDOW);
+        peer.connect(1, ROUTE, sluice_wicket_tunnel::tunnel::WINDOW);
         peer.data(1, request.as_bytes());
         peer
     }
@@ -3043,7 +3043,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_connect_without_a_window_is_answered_with_an_error() {
         let handler = route(hello().await, Sandbox::default());
-        let limit = sluice_tunnel::tunnel::Limit::new(1);
+        let limit = sluice_wicket_tunnel::tunnel::Limit::new(1);
         let mut peer = Peer::limited(
             crate::routes::fixed(HashMap::from([(ROUTE.to_string(), handler.clone())])),
             limit.clone(),
@@ -3054,14 +3054,14 @@ pub(crate) mod tests {
         let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
         assert!(
             matches!(&frames[..], [Body::Error(error)]
-                if error.conn_id == 1 && error.message == sluice_tunnel::tunnel::SERVER_WINDOW_REQUIRED),
+                if error.conn_id == 1 && error.message == sluice_wicket_tunnel::tunnel::SERVER_WINDOW_REQUIRED),
             "{frames:?}"
         );
         assert!(!peer.registered(1), "not registered");
         assert_eq!(limit.open(), 0, "no slot taken");
         assert_eq!(peer.connections.windowless_rejections(), 1, "logged once");
 
-        peer.connect(2, ROUTE, sluice_tunnel::tunnel::WINDOW);
+        peer.connect(2, ROUTE, sluice_wicket_tunnel::tunnel::WINDOW);
         peer.data(2, get("/").as_bytes());
         let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
         let response = String::from_utf8(data_bytes(&frames, 2)).unwrap();
@@ -3083,7 +3083,7 @@ pub(crate) mod tests {
             .collect();
         assert!(
             matches!(tail[..], [Body::Close(_), Body::Error(error)]
-                if error.message == sluice_tunnel::tunnel::CONNECTION_CLOSED),
+                if error.message == sluice_wicket_tunnel::tunnel::CONNECTION_CLOSED),
             "{tail:?}"
         );
 
@@ -3153,7 +3153,7 @@ pub(crate) mod tests {
             terminal(&frames),
             vec![format!(
                 "ERROR {}",
-                sluice_tunnel::tunnel::CONNECTION_CLOSED
+                sluice_wicket_tunnel::tunnel::CONNECTION_CLOSED
             )]
         );
     }
@@ -3192,7 +3192,7 @@ pub(crate) mod tests {
     /// its backlog.
     #[tokio::test]
     async fn a_response_backlog_delays_another_connection_by_one_frame_per_frame() {
-        use sluice_tunnel::tunnel::DATA_QUEUE_CAPACITY;
+        use sluice_wicket_tunnel::tunnel::DATA_QUEUE_CAPACITY;
         async fn until(what: &str, condition: impl Fn() -> bool) {
             let deadline = Instant::now() + Duration::from_secs(5);
             while !condition() {
@@ -3206,14 +3206,14 @@ pub(crate) mod tests {
             handler.clone(),
         )])));
         peer.auto_grant = false;
-        peer.connect(1, ROUTE, sluice_tunnel::tunnel::WINDOW);
+        peer.connect(1, ROUTE, sluice_wicket_tunnel::tunnel::WINDOW);
         peer.data(1, get("/stream").as_bytes());
         until("conn 1 fills its queue", || {
             peer.queued_data(1) == DATA_QUEUE_CAPACITY
         })
         .await;
 
-        peer.connect(2, ROUTE, sluice_tunnel::tunnel::WINDOW);
+        peer.connect(2, ROUTE, sluice_wicket_tunnel::tunnel::WINDOW);
         peer.data(2, get("/").as_bytes());
         until("conn 2's response is queued to its end", || {
             !peer.registered(2)
@@ -3279,7 +3279,7 @@ pub(crate) mod tests {
         let mut payload = head.as_bytes().to_vec();
         payload.resize(total, 0x42);
         let mut upload = Upload {
-            credit: u64::from(sluice_tunnel::tunnel::WINDOW),
+            credit: u64::from(sluice_wicket_tunnel::tunnel::WINDOW),
             ..Default::default()
         };
         while upload.sent < total {
@@ -3322,8 +3322,8 @@ pub(crate) mod tests {
             ROUTE.to_string(),
             handler.clone(),
         )])));
-        peer.connect(1, ROUTE, sluice_tunnel::tunnel::WINDOW);
-        let body_len = 4 * sluice_tunnel::tunnel::WINDOW as usize;
+        peer.connect(1, ROUTE, sluice_wicket_tunnel::tunnel::WINDOW);
+        let body_len = 4 * sluice_wicket_tunnel::tunnel::WINDOW as usize;
         let head = format!(
             "POST / HTTP/1.1\r\nhost: t\r\ncontent-length: {body_len}\r\nconnection: close\r\n\r\n"
         );
@@ -3337,7 +3337,7 @@ pub(crate) mod tests {
 
         assert!(upload.grants >= 1, "the guest's reads were granted");
         assert!(
-            upload.sent > sluice_tunnel::tunnel::WINDOW as usize,
+            upload.sent > sluice_wicket_tunnel::tunnel::WINDOW as usize,
             "more than one window went out: {}",
             upload.sent
         );
@@ -3356,7 +3356,7 @@ pub(crate) mod tests {
         assert!(read > 1024 * 1024, "the guest read past one window: {read}");
         assert!(
             matches!(upload.frames.last(), Some(Body::Error(error))
-                if error.message == sluice_tunnel::tunnel::CONNECTION_CLOSED),
+                if error.message == sluice_wicket_tunnel::tunnel::CONNECTION_CLOSED),
             "the ERROR ended the upload: {:?}",
             upload.frames.last()
         );
@@ -3372,8 +3372,8 @@ pub(crate) mod tests {
             ROUTE.to_string(),
             handler.clone(),
         )])));
-        peer.connect(1, ROUTE, sluice_tunnel::tunnel::WINDOW);
-        let body_len = 8 * sluice_tunnel::tunnel::WINDOW as usize;
+        peer.connect(1, ROUTE, sluice_wicket_tunnel::tunnel::WINDOW);
+        let body_len = 8 * sluice_wicket_tunnel::tunnel::WINDOW as usize;
         // the guest reads just past 1MiB, then answers /stall slowly
         let head = format!("POST /stall HTTP/1.1\r\nhost: t\r\ncontent-length: {body_len}\r\n\r\n");
         let stalled = upload(&mut peer, &head, body_len, Duration::from_millis(500)).await;
@@ -3388,7 +3388,7 @@ pub(crate) mod tests {
         );
 
         let started = Instant::now();
-        peer.connect(2, ROUTE, sluice_tunnel::tunnel::WINDOW);
+        peer.connect(2, ROUTE, sluice_wicket_tunnel::tunnel::WINDOW);
         peer.data(2, get("/").as_bytes());
         let mut frames = Vec::new();
         let served = async {
@@ -4558,20 +4558,20 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_connect_beyond_the_limit_is_refused_until_a_slot_frees() {
         let handler = route(hello().await, Sandbox::default());
-        let limit = sluice_tunnel::tunnel::Limit::new(1);
+        let limit = sluice_wicket_tunnel::tunnel::Limit::new(1);
         let mut peer = Peer::limited(
             crate::routes::fixed(HashMap::from([(ROUTE.to_string(), handler.clone())])),
             limit.clone(),
         );
         // admitted, and held open: no request yet
-        peer.connect(1, ROUTE, sluice_tunnel::tunnel::WINDOW);
+        peer.connect(1, ROUTE, sluice_wicket_tunnel::tunnel::WINDOW);
         assert_eq!(limit.open(), 1);
 
-        peer.connect(2, ROUTE, sluice_tunnel::tunnel::WINDOW);
+        peer.connect(2, ROUTE, sluice_wicket_tunnel::tunnel::WINDOW);
         let frames = frames_until_quiet(&mut peer, Duration::from_millis(300)).await;
         assert!(
             matches!(&frames[..], [Body::Error(error)]
-                if error.conn_id == 2 && error.message == sluice_tunnel::tunnel::LIMIT_REACHED),
+                if error.conn_id == 2 && error.message == sluice_wicket_tunnel::tunnel::LIMIT_REACHED),
             "{frames:?}"
         );
         assert_eq!(limit.open(), 1, "the refused connection holds no slot");
@@ -4592,7 +4592,7 @@ pub(crate) mod tests {
         );
         assert_eq!(limit.open(), 0, "freed once the CLOSE left");
 
-        peer.connect(3, ROUTE, sluice_tunnel::tunnel::WINDOW);
+        peer.connect(3, ROUTE, sluice_wicket_tunnel::tunnel::WINDOW);
         peer.data(3, get("/").as_bytes());
         let response = String::from_utf8(response_raw(&mut peer).await).unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -4643,12 +4643,12 @@ pub(crate) mod tests {
         let handler = route(hello().await, Sandbox::default());
         let keep_alive = "GET / HTTP/1.1\r\nhost: t\r\n\r\n";
         for request in [get("/"), keep_alive.to_string()] {
-            let limit = sluice_tunnel::tunnel::Limit::new(1);
+            let limit = sluice_wicket_tunnel::tunnel::Limit::new(1);
             let mut peer = Peer::limited(
                 crate::routes::fixed(HashMap::from([(ROUTE.to_string(), handler.clone())])),
                 limit.clone(),
             );
-            peer.connect(1, ROUTE, sluice_tunnel::tunnel::WINDOW);
+            peer.connect(1, ROUTE, sluice_wicket_tunnel::tunnel::WINDOW);
             peer.data(1, request.as_bytes());
             half_close(&peer);
             let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
@@ -4688,12 +4688,12 @@ pub(crate) mod tests {
     async fn a_request_body_cut_short_by_the_half_close_ends_the_connection() {
         let handler = route(hello().await, Sandbox::default());
         let post = "POST / HTTP/1.1\r\nhost: t\r\ncontent-length: 100\r\n\r\n0123456789";
-        let limit = sluice_tunnel::tunnel::Limit::new(1);
+        let limit = sluice_wicket_tunnel::tunnel::Limit::new(1);
         let mut peer = Peer::limited(
             crate::routes::fixed(HashMap::from([(ROUTE.to_string(), handler.clone())])),
             limit.clone(),
         );
-        peer.connect(1, ROUTE, sluice_tunnel::tunnel::WINDOW);
+        peer.connect(1, ROUTE, sluice_wicket_tunnel::tunnel::WINDOW);
         peer.data(1, post.as_bytes());
         half_close(&peer);
         let frames = frames_until_quiet(&mut peer, Duration::from_millis(500)).await;
@@ -4817,7 +4817,10 @@ pub(crate) mod tests {
     async fn payload_past_the_window_frees_a_stalled_store() {
         let handler = route(hello().await, Sandbox::default());
         let mut peer = stalled_connection(&handler).await;
-        peer.data(1, &vec![0x5a; sluice_tunnel::tunnel::WINDOW as usize + 1]);
+        peer.data(
+            1,
+            &vec![0x5a; sluice_wicket_tunnel::tunnel::WINDOW as usize + 1],
+        );
         eventually("the store is freed", Duration::from_secs(3), || {
             handler.live_stores() == 0
         })
@@ -4825,7 +4828,10 @@ pub(crate) mod tests {
         let frames = frames_until_quiet(&mut peer, Duration::from_millis(300)).await;
         assert_eq!(
             terminal_frames(&frames),
-            vec![format!("ERROR {}", sluice_tunnel::tunnel::WINDOW_EXCEEDED)],
+            vec![format!(
+                "ERROR {}",
+                sluice_wicket_tunnel::tunnel::WINDOW_EXCEEDED
+            )],
             "{frames:?}"
         );
     }
@@ -5273,7 +5279,7 @@ pub(crate) mod tests {
             ROUTE.to_string(),
             handler.clone(),
         )])));
-        peer.connect(1, ROUTE, sluice_tunnel::tunnel::WINDOW);
+        peer.connect(1, ROUTE, sluice_wicket_tunnel::tunnel::WINDOW);
         h2_client_on(peer).await.0
     }
 

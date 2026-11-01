@@ -6,9 +6,9 @@
 !sluice-build-info/src
 !sluice-oidc/Cargo.toml
 !sluice-oidc/src
-!sluice-tunnel/Cargo.toml
-!sluice-tunnel/build.rs
-!sluice-tunnel/src
+!sluice-wicket-tunnel/Cargo.toml
+!sluice-wicket-tunnel/build.rs
+!sluice-wicket-tunnel/src
 !sluice-wicket-wasi/Cargo.toml
 !sluice-wicket-wasi/Cargo.lock
 !sluice-wicket-wasi/build.rs

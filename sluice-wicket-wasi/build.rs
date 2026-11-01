@@ -1,5 +1,5 @@
 // Compiles the flume proto shared with the Java modules (single source of truth; the
-// tunnel's messages are sluice-tunnel's) and embeds the build identification (git
+// tunnel's messages are sluice-wicket-tunnel's) and embeds the build identification (git
 // commit, dirty flag, build time).
 use std::path::PathBuf;
 
@@ -15,8 +15,11 @@ fn main() {
     tonic_prost_build::configure()
         .build_server(false)
         .build_transport(false)
-        // the message it shares with the tunnel: sluice-tunnel's type
-        .extern_path(".sluice.v1.PeerBuild", "::sluice_tunnel::proto::PeerBuild")
+        // the message it shares with the tunnel: sluice-wicket-tunnel's type
+        .extern_path(
+            ".sluice.v1.PeerBuild",
+            "::sluice_wicket_tunnel::proto::PeerBuild",
+        )
         .compile_protos(&[protos.join("sluice/v1/flume.proto")], &[protos])
         .expect("failed to compile the protos");
     sluice_build_info::embed(&[
