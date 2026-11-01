@@ -42,7 +42,7 @@ use tokio::sync::watch;
 use crate::BoxError;
 use crate::capacity::Slot;
 use crate::jail;
-use crate::keeper::{Client, Role, Size};
+use crate::keeper::{Client, Role, Size, vm_file_size};
 
 /// Guest CID of every VM: each VM has its own vsock device, so they need not differ.
 const GUEST_CID: u32 = 3;
@@ -95,20 +95,22 @@ fn set_soft_open_files(soft: u64) -> std::io::Result<u64> {
     Ok(limit.rlim_max)
 }
 
-/// The launcher mode (`<wicket> --launch-vm <wicket pid> <open files> <program>
-/// <args>...`), run before anything else: sets the parent death signal (SIGKILL),
-/// checks that the parent is still the wicket of `<wicket pid>` (else it died before
-/// the signal was set, and exits), sets the soft open file limit and execs the
-/// program. Returns only when that failed.
+/// The launcher mode (`<wicket> --launch-vm <wicket pid> <open files> <file size>
+/// <program> <args>...`), run before anything else: sets the parent death signal
+/// (SIGKILL), checks that the parent is still the wicket of `<wicket pid>` (else it
+/// died before the signal was set, and exits), sets the soft open file limit, the file
+/// size limit (bytes; a guest's output to its VM's log bounded, as a jail's) and no
+/// core (of a VM's memory), and execs the program. Returns only when that failed.
 pub fn launch(mut args: impl Iterator<Item = OsString>) -> std::io::Error {
     let mut number = || {
         args.next()
             .and_then(|arg| arg.to_str()?.parse::<u64>().ok())
     };
-    let (wicket, files) = (number(), number());
-    let (Some(wicket), Some(files), Some(program)) = (wicket, files, args.next()) else {
+    let (wicket, files, size) = (number(), number(), number());
+    let (Some(wicket), Some(files), Some(size), Some(program)) = (wicket, files, size, args.next())
+    else {
         return std::io::Error::other(format!(
-            "usage: {LAUNCH} <wicket pid> <open files> <program> <args>..."
+            "usage: {LAUNCH} <wicket pid> <open files> <file size> <program> <args>..."
         ));
     };
     // SAFETY: a plain prctl; the signal follows the parent thread, a runtime worker
@@ -122,6 +124,26 @@ pub fn launch(mut args: impl Iterator<Item = OsString>) -> std::io::Error {
     }
     if let Err(e) = set_soft_open_files(files) {
         return e;
+    }
+    // soft and hard, at most the hard one
+    for (resource, limit) in [(libc::RLIMIT_FSIZE, size), (libc::RLIMIT_CORE, 0)] {
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: plain getrlimit / setrlimit on a valid struct
+        if unsafe { libc::getrlimit(resource, &mut current) } != 0 {
+            return std::io::Error::last_os_error();
+        }
+        let limit = limit.min(current.rlim_max);
+        let limit = libc::rlimit {
+            rlim_cur: limit,
+            rlim_max: limit,
+        };
+        // SAFETY: as above
+        if unsafe { libc::setrlimit(resource, &limit) } != 0 {
+            return std::io::Error::last_os_error();
+        }
     }
     std::process::Command::new(program).args(args).exec()
 }
@@ -306,8 +328,14 @@ pub struct Vm {
 
 impl Vm {
     /// Starts `firecracker` in `dir` (created; its API socket, vsock socket and log go
-    /// there) and waits for its API socket.
-    async fn spawn(firecracker: &Path, dir: PathBuf, slot: Slot) -> Result<Vm, BoxError> {
+    /// there), the files it writes at most `file_size` bytes each, and waits for its API
+    /// socket.
+    async fn spawn(
+        firecracker: &Path,
+        dir: PathBuf,
+        file_size: u64,
+        slot: Slot,
+    ) -> Result<Vm, BoxError> {
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -327,6 +355,7 @@ impl Vm {
             .arg(LAUNCH)
             .arg(std::process::id().to_string())
             .arg(VM_OPEN_FILES.load(Ordering::Relaxed).to_string())
+            .arg(file_size.to_string())
             .arg(firecracker)
             .arg("--api-sock")
             .arg(&api)
@@ -408,7 +437,13 @@ impl Vm {
     pub async fn boot(spec: &Spec, place: &Place, role: Role, slot: Slot) -> Result<Vm, BoxError> {
         let (vm, kernel, rootfs) = match place {
             Place::Dir(dir) => (
-                Vm::spawn(&spec.firecracker, dir.join("boot"), slot).await?,
+                Vm::spawn(
+                    &spec.firecracker,
+                    dir.join("boot"),
+                    vm_file_size(role, u64::from(spec.mem_mib)),
+                    slot,
+                )
+                .await?,
                 spec.kernel.clone(),
                 spec.rootfs.clone(),
             ),
@@ -467,7 +502,8 @@ impl Vm {
         let vm = match place {
             Place::Dir(dir) => {
                 let dir = dir.join("clones").join(format!("vm-{n}"));
-                Vm::spawn(&snapshot.firecracker, dir, slot).await?
+                let size = vm_file_size(Role::Clone, u64::from(snapshot.size.mem));
+                Vm::spawn(&snapshot.firecracker, dir, size, slot).await?
             }
             Place::Jail { keeper, route, .. } => {
                 Vm::jailed(keeper, *route, Role::Clone, snapshot.size, slot).await?

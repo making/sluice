@@ -58,8 +58,18 @@ pub fn vm_overhead_mib(mem: u64) -> u64 {
 }
 
 /// A VM's log at most (`RLIMIT_FSIZE`; past it Firecracker ends the VM): its own lines,
-/// and its guest's console with `SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE`.
+/// and its guest's console with `SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE` (or a
+/// guest re-enabling its serial device).
 const LOG_MIB: u64 = 16;
+
+/// A VM's `RLIMIT_FSIZE`, bytes, for `mem` MiB of guest memory: its log, and a
+/// template's snapshot, which it writes.
+pub fn vm_file_size(role: Role, mem: u64) -> u64 {
+    match role {
+        Role::Template => (mem + LOG_MIB) << 20,
+        Role::Shared | Role::Clone => LOG_MIB << 20,
+    }
+}
 
 /// Threads of a VM besides its vCPUs (its VMM and API threads, a few more).
 const THREADS: u64 = 16;
@@ -932,13 +942,13 @@ impl Keeper {
         std::os::unix::fs::fchown(&log, Some(0), Some(self.group))?;
         let mem = u64::from(request.size.mem);
         let overhead = (vm_overhead_mib(mem) + LOG_MIB) << 20;
-        let (memory, file_size) = match request.role {
-            Role::Shared => ((mem << 20) + overhead, LOG_MIB << 20),
+        let memory = match request.role {
+            Role::Shared | Role::Clone => (mem << 20) + overhead,
             // its snapshot, which it writes, is charged to it (to the route's cgroup,
             // for the route's lifetime)
-            Role::Template => (((2 * mem) << 20) + overhead, (mem + LOG_MIB) << 20),
-            Role::Clone => ((mem << 20) + overhead, LOG_MIB << 20),
+            Role::Template => ((2 * mem) << 20) + overhead,
         };
+        let file_size = vm_file_size(request.role, mem);
         let limits = Limits {
             memory,
             pids: u64::from(request.size.vcpus) + THREADS,

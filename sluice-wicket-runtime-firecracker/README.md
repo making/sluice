@@ -58,7 +58,7 @@ Two Cargo workspaces:
 x86_64 or aarch64 Linux with KVM (bare metal, or a VM with nested virtualization):
 `/dev/kvm` must exist. Ubuntu 24.04 on x86_64 was used; the versions below are the ones
 tested (aarch64: see [aarch64](#aarch64)). The [Docker image](#docker-image) holds steps 2
-and 3.
+and 3. A host serving others: also [Host setup](#host-setup).
 
 1. Access to `/dev/kvm` through the `kvm` group (an ACL set by hand is rewritten by udev):
 
@@ -392,6 +392,64 @@ sudo target/release/sluice-wicket-runtime-firecracker --jail-ids 900000-900127 -
 
 As a systemd service: `ExecStart=` the wicket with its `--config`, `Delegate=yes` (the
 default `--jail-cgroup`), `TimeoutStopSec=` above `--drain-grace`.
+
+## Host setup
+
+Firecracker's
+[production host setup](https://github.com/firecracker-microvm/firecracker/blob/v1.17.0/docs/prod-host-setup.md)
+asks of the host what the wicket cannot do itself. Firecracker isolates one process from
+another, and a VM is a `firecracker` process of its own; the tenants to keep apart on a
+wicket host are:
+
+- **routes'**: a wicket serving routes of several owners, or several wickets on a host
+- **clients' of a per-connection route**: a clone is per connection to the sluice server,
+  which opens an upstream connection per client connection and route (h2 too: a
+  connection's streams to a route share one). A proxy in front of the server pooling its
+  clients' connections (a load balancer or CDN reusing its upstream connections) puts
+  several clients in one clone. The clones of a route share their snapshot's pages (mapped
+  private): what the template held is every clone's (see [Clones](#clones)), and the
+  shared pages are the side channel KSM opens (Flush+Reload), whatever the host's KSM
+
+What applies, in both modes unless said:
+
+- **SMT off** where tenants share the host (`echo off > /sys/devices/system/cpu/smt/control`,
+  or `nosmt` on the kernel command line): the wicket pins no VM to a CPU, any two vCPUs may
+  be siblings. A host of one tenant may keep it
+- **KSM off** (`/sys/kernel/mm/ksm/run` 0, the default)
+- **swap off, or encrypted**: it writes the guests' memory, the snapshots (shmem on the
+  state dir's tmpfs) and the VMs' logs to disk (`swapon --show` prints nothing). The
+  memory bound of the [Docker image](#docker-image) assumes none
+- **the host's mitigations and microcode**: the kernel's defaults (`mitigations=auto`),
+  checked in `/sys/devices/system/cpu/vulnerabilities/` or with Firecracker's
+  `spectre-meltdown-checker`; memory with ECC and TRR (Rowhammer). aarch64: a host kernel
+  6.4+ (Firecracker resets a VM's physical counter, `CNTPCT`, with `KVM_CAP_COUNTER_OFFSET`;
+  older ones show the host's)
+- **seccomp**: Firecracker's default filters, as the wicket never passes
+  `--seccomp-filter` or `--no-seccomp`
+- **the serial console and the logs**: the VMs boot with `8250.nr_uarts=0` (the console
+  only with `SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE`), which a guest's root may undo. A
+  VM's log (`firecracker.log` in the state dir, on a tmpfs: memory) is bounded at 16 MiB
+  (`RLIMIT_FSIZE`, a template's at its `mem` more for its snapshot; past it Firecracker
+  ends the VM), and a VM dumps no core (of its memory)
+- **network and disk**: none to filter or throttle: the VMs have no network interface
+  (vsock only; jailed, a network namespace without one either), their rootfs is read-only,
+  and the snapshots stay on the state dir's tmpfs
+- **the jailer's isolation**: [jail mode](#jail-mode). Unjailed, every VM runs as the
+  wicket's user: a guest escaping its `firecracker` (past KVM and seccomp) holds every VM's
+  sockets and snapshots and the wicket's token, and the VMs have no cgroup of their own
+  (the wicket's, a container's or a unit's `MemoryMax=`, holds them all). Tenants on one
+  wicket call for jail mode
+- **`/dev/kvm`**: unjailed, the wicket's user in the `kvm` group (see [Setup](#setup)), and
+  nobody else: a member boots VMs past `--max-vms` and `--max-memory`. Jailed, nobody: the
+  keeper (root) makes each jail a node of its own, its VM's id's alone, so the host's may
+  stay root's (`--jail-user` needs no group)
+- **x86_64's `kvm-pit/<pid>`**: a VM's PIT kernel thread stays in the root cgroup (the
+  wicket does not move it): a guest driving its PIT takes host CPU past its route's `cpu`,
+  at most what `kvm.min_timer_period_us` (200us by default) lets it
+
+Not needed at the wicket's rates: Linux 6.1's boot time mitigations (`favordynmods`,
+`kvm.nx_huge_pages=never`): `KVM_CREATE_VM` takes 0.26ms on the 6.8 kernel of
+[Findings](#findings) (0.34-0.51ms, 16 at once), of a clone's 12ms restore.
 
 ## Docker image
 

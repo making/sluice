@@ -64,17 +64,34 @@ const CLONE_CPU: u32 = 50;
 const CAPPED_IDLE: Duration = Duration::from_secs(5);
 
 /// The launcher (`--launch-vm`) execs the program with the soft open file
-/// limit given: Firecracker grows its file table to the limit at its start, a
-/// cost that grows with it (3ms at 1048576).
+/// limit given (Firecracker grows its file table to the limit at its start, a
+/// cost that grows with it: 3ms at 1048576), the file size given (a guest's
+/// output to its VM's log bounded) and no core (of a VM's memory).
 #[test]
-fn the_launcher_execs_with_the_open_file_limit_given() {
+fn the_launcher_execs_with_the_limits_given() {
     let output = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-runtime-firecracker"))
-        .args(["--launch-vm", &std::process::id().to_string(), "1100"])
-        .args(["/bin/sh", "-c", "ulimit -Sn"])
+        .args([
+            "--launch-vm",
+            &std::process::id().to_string(),
+            "1100",
+            "1048576",
+        ])
+        .args(["/bin/cat", "/proc/self/limits"])
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1100");
+    let limits = String::from_utf8_lossy(&output.stdout);
+    let limit = |name: &str| -> Vec<String> {
+        let line = limits.lines().find(|line| line.starts_with(name)).unwrap();
+        line[name.len()..]
+            .split_whitespace()
+            .take(2)
+            .map(String::from)
+            .collect()
+    };
+    assert_eq!(limit("Max open files")[0], "1100", "{limits}");
+    assert_eq!(limit("Max file size"), ["1048576", "1048576"], "{limits}");
+    assert_eq!(limit("Max core file size"), ["0", "0"], "{limits}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
