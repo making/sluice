@@ -10,6 +10,9 @@
 //!
 //! A copy of the wicket's `src/wire.rs` (with its tests): keep them alike.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 const DATA: u8 = 0;
@@ -264,8 +267,9 @@ impl<R: AsyncRead + Unpin> Reader<R> {
 }
 
 /// Relays a plain byte stream (`plain`) and a framed one both ways until both
-/// directions closed; an EOF without CLOSE on the framed side is an error.
-pub async fn relay<P, F>(plain: P, framed: F) -> std::io::Result<()>
+/// directions closed; an EOF without CLOSE on the framed side is an error, and so is
+/// reading nothing from either side for `idle` (`TimedOut`).
+pub async fn relay<P, F>(plain: P, framed: F, idle: Option<Duration>) -> std::io::Result<()>
 where
     P: AsyncRead + AsyncWrite + Unpin,
     F: AsyncRead + AsyncWrite + Unpin,
@@ -273,10 +277,16 @@ where
     let (mut plain_reader, mut plain_writer) = tokio::io::split(plain);
     let (framed_reader, mut framed_writer) = tokio::io::split(framed);
     let mut framed_reader = Reader::new(framed_reader);
+    // when a byte was read last, either way: milliseconds since the start
+    let start = tokio::time::Instant::now();
+    let last = AtomicU64::new(0);
+    let read = || last.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
     let inbound = async {
         let mut buffer = vec![0u8; MAX_PAYLOAD];
         loop {
-            match framed_reader.read(&mut buffer).await? {
+            let frame = framed_reader.read(&mut buffer).await?;
+            read();
+            match frame {
                 Read::Data(n) => plain_writer.write_all(&buffer[..n]).await?,
                 Read::Close => return plain_writer.shutdown().await,
                 Read::Eof => return Err(std::io::Error::other("peer gone without CLOSE")),
@@ -288,6 +298,7 @@ where
         let mut frame = vec![0u8; HEAD + MAX_PAYLOAD];
         loop {
             let n = plain_reader.read(&mut frame[HEAD..]).await?;
+            read();
             if n == 0 {
                 return write_close(&mut framed_writer).await;
             }
@@ -296,7 +307,25 @@ where
             framed_writer.write_all(&frame[..HEAD + n]).await?;
         }
     };
-    tokio::try_join!(inbound, outbound).map(|_| ())
+    let idled = async {
+        let Some(idle) = idle else {
+            return std::future::pending().await;
+        };
+        loop {
+            let due = start + Duration::from_millis(last.load(Ordering::Relaxed)) + idle;
+            if tokio::time::Instant::now() >= due {
+                return std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("no byte relayed for {}ms (idle-ms)", idle.as_millis()),
+                );
+            }
+            tokio::time::sleep_until(due).await;
+        }
+    };
+    tokio::select! {
+        relayed = async { tokio::try_join!(inbound, outbound) } => relayed.map(|_| ()),
+        e = idled => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -308,7 +337,7 @@ mod tests {
         // client <-> plain | relay | framed <-> peer speaking the framing
         let (client, plain) = tokio::io::duplex(64);
         let (framed, peer) = tokio::io::duplex(64);
-        let relay = tokio::spawn(relay(plain, framed));
+        let relay = tokio::spawn(relay(plain, framed, None));
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
         let (peer_reader, mut peer_writer) = tokio::io::split(peer);
         let mut peer_reader = Reader::new(peer_reader);
@@ -353,12 +382,28 @@ mod tests {
         assert_eq!(Notice::parse("HELLO"), None);
     }
 
-    #[tokio::test]
-    async fn a_stream_ending_without_close_fails_the_relay() {
+    /// A relay fails on a framed stream ending without its CLOSE, and on reading
+    /// nothing from either side for its idle bound, counted from the last byte read.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_ending_without_close_or_idling_fails_the_relay() {
         let (_client, plain) = tokio::io::duplex(64);
         let (framed, peer) = tokio::io::duplex(64);
-        let relay = tokio::spawn(relay(plain, framed));
+        let relayed = tokio::spawn(relay(plain, framed, None));
         drop(peer);
-        assert!(relay.await.unwrap().is_err());
+        assert!(relayed.await.unwrap().is_err());
+
+        let (mut client, plain) = tokio::io::duplex(64);
+        let (framed, _peer) = tokio::io::duplex(64);
+        let started = tokio::time::Instant::now();
+        let relayed = tokio::spawn(relay(plain, framed, Some(Duration::from_secs(10))));
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        client.write_all(b"x").await.unwrap();
+        let failed = relayed.await.unwrap().unwrap_err();
+        assert_eq!(failed.kind(), std::io::ErrorKind::TimedOut, "{failed}");
+        let idled = started.elapsed();
+        assert!(
+            idled >= Duration::from_secs(16) && idled < Duration::from_secs(17),
+            "{idled:?}"
+        );
     }
 }

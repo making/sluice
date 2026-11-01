@@ -874,6 +874,7 @@ impl<T: Table> Connections<T> {
         };
         let mut io = self.register(connect.conn_id, connect.connection_window);
         io.permit = Some(permit.counted(&self.held));
+        io.client_address = connect.client_address;
         tokio::spawn(binding.serve(io));
     }
 
@@ -905,6 +906,7 @@ impl<T: Table> Connections<T> {
             registry: self.registry.clone(),
             consumed: 0,
             permit: None,
+            client_address: String::new(),
         }
     }
 
@@ -949,11 +951,20 @@ pub struct TunnelIo {
     /// The connection's slot of the connection limit, until `ending` takes
     /// it.
     permit: Option<Permit>,
+    /// The CONNECT's `client_address`.
+    client_address: String,
 }
 
 impl TunnelIo {
     pub fn conn_id(&self) -> i64 {
         self.conn_id
+    }
+
+    /// The IP address of the data plane connection this one relays, as the
+    /// server saw it (a PROXY header's source where one applies); empty when
+    /// the server did not tell.
+    pub fn client_address(&self) -> &str {
+        &self.client_address
     }
 
     /// The bytes received and not yet read.

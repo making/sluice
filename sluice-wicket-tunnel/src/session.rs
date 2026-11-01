@@ -1293,6 +1293,17 @@ pub mod testing {
         /// Opens connection `conn_id` to the dial address `address`, as the
         /// server does for a client of the route.
         pub fn connect(&self, conn_id: i64, address: &str) -> tokio::io::DuplexStream {
+            self.connect_from(conn_id, address, "")
+        }
+
+        /// Opens connection `conn_id` as [`ServerTunnel::connect`] does, for a
+        /// client of `client_address` (the CONNECT's).
+        pub fn connect_from(
+            &self,
+            conn_id: i64,
+            address: &str,
+            client_address: &str,
+        ) -> tokio::io::DuplexStream {
             let (client, pumped) = tokio::io::duplex(64 * 1024);
             let credit = Arc::new(Semaphore::new(
                 self.state.window.load(std::sync::atomic::Ordering::Acquire) as usize,
@@ -1307,6 +1318,7 @@ pub mod testing {
                 conn_id,
                 address: address.into(),
                 connection_window: tunnel::WINDOW,
+                client_address: client_address.into(),
                 ..Default::default()
             }));
             tokio::spawn(pump(conn_id, pumped, credit, received, self.state.clone()));

@@ -1,9 +1,11 @@
 //! The wicket booting VMs, through a tunnel server double (`sluice-wicket-tunnel`'s):
 //! for a shared VM (serving two hosts: one target) and a VM per connection,
 //! http/1.1 with keep-alive, h2c, a 5MB POST under the tunnel's flow control
-//! and a client half-closing after its request; a route of one VM at most
-//! failing the connection that finds no room in time, its clones restored
-//! with the clock of the moment and random state of their own; the VMs'
+//! and a client half-closing after its request; a route of two VMs at most,
+//! one per client address, failing a client's connection past its share at
+//! once and the connection that finds no room in time, its idle connections
+//! failed and their VMs ended, its clones restored with the clock of the
+//! moment and random state of their own; the VMs'
 //! output -- a shared VM's, a template's, a clone's -- on the wicket's stdout /
 //! stderr and on a flume (`sluice-wicket-tunnel`'s double); a reload of the
 //! `--config` file, polled, removing a route and replacing a rootfs.
@@ -26,7 +28,8 @@
 //! `SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL=1` runs it in jail mode instead,
 //! started as root (`sudo -n`, skipped without it), the wicket as the test's user,
 //! and checks the jails: each VM a `firecracker` of an id of its own, PID 1 of its
-//! namespace, without privileges, in a cgroup limiting its memory; the VMs and the
+//! namespace, without privileges, in a cgroup limiting its memory (and a route's
+//! clones' CPU, `cpu`); the VMs and the
 //! wicket ending with the keeper (SIGKILL).
 #![cfg(target_os = "linux")]
 
@@ -53,6 +56,12 @@ const JAIL_IDS: (u32, u32) = (1_900_000_000, 1_900_000_127);
 
 /// The image's user (distroless `nonroot`).
 const NONROOT: u32 = 65532;
+
+/// Jail mode: clone.local's `cpu`, percent of a host CPU.
+const CLONE_CPU: u32 = 50;
+
+/// capped.local's `idle-ms`: above what its checks take before its VMs idle out.
+const CAPPED_IDLE: Duration = Duration::from_secs(5);
 
 /// The launcher (`--launch-vm`) execs the program with the soft open file
 /// limit given: Firecracker grows its file table to the limit at its start, a
@@ -102,17 +111,24 @@ async fn every_route_serves_http_through_the_tunnel() {
     let dir = Scratch::new();
     std::fs::copy(&rootfs, dir.0.join("shared.ext4")).unwrap();
     let config = dir.0.join("wicket.yaml");
+    // jailed, the clones' CPU limited by their cgroups
+    let cpu = match jailed {
+        true => format!(", cpu: {CLONE_CPU}"),
+        false => String::new(),
+    };
     let routes = format!(
         "watch-interval: 100ms\nroutes:\n\
          - {{host: shared.local, rootfs: shared.ext4}}\n\
-         - {{host: clone.local, rootfs: {rootfs}, mode: per-connection, warm: 2}}\n\
+         - {{host: clone.local, rootfs: {rootfs}, mode: per-connection, warm: 2{cpu}}}\n\
          # the shared target again: its VM serves both hosts\n\
          - {{host: alias.local, rootfs: shared.ext4, mode: shared}}\n",
         rootfs = rootfs.display()
     );
     let capped = format!(
-        "- {{host: capped.local, rootfs: {}, mode: per-connection, vms: 1, wait-ms: 300}}\n",
-        rootfs.display()
+        "- {{host: capped.local, rootfs: {}, mode: per-connection, vms: 2, wait-ms: 1000, \
+         per-client: 1, idle-ms: {}}}\n",
+        rootfs.display(),
+        CAPPED_IDLE.as_millis()
     );
     std::fs::write(&config, format!("{routes}{capped}")).unwrap();
     let (flume, mut feeds) = flume_server().await;
@@ -252,7 +268,8 @@ async fn every_route_serves_http_through_the_tunnel() {
 /// The jails of the VMs alive (the shared VM and the warm clones): each a
 /// `firecracker` of an id of its own, PID 1 of its namespace, without capability or
 /// new privileges, its seccomp filter on, in a cgroup of the keeper's limiting its
-/// memory (under `cgroup`, else beside the keeper's own: its default), on aarch64 the
+/// memory, and the CPU of clone.local's (under `cgroup`, else beside the keeper's own:
+/// its default), on aarch64 the
 /// host CPU's files Firecracker reads in it; the wicket as `user`. The keeper killed (SIGKILL), they and the wicket end with it (their parent
 /// death signal); its files and cgroups are removed here (a container's go with it).
 fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
@@ -292,6 +309,7 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
         wicket.log()
     );
     let mut ids = Vec::new();
+    let mut cpu_limited = 0;
     for vm in &vms {
         let id = field(*vm, "Uid:");
         assert!(
@@ -320,6 +338,15 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
         );
         let max = std::fs::read_to_string(format!("/sys/fs/cgroup/{own}/memory.max")).unwrap();
         assert_ne!(max.trim(), "max", "{vm}: its memory limited");
+        // clone.local's CPU limited, the others' not
+        let cpu = std::fs::read_to_string(format!("/sys/fs/cgroup/{own}/cpu.max")).unwrap();
+        match cpu.trim() {
+            "max 100000" => {}
+            limited => {
+                assert_eq!(limited, format!("{} 100000", CLONE_CPU * 1000), "{vm}");
+                cpu_limited += 1;
+            }
+        }
         // aarch64: the host CPU's files Firecracker reads, the host's in the jail
         if cfg!(target_arch = "aarch64") {
             for file in [
@@ -340,6 +367,10 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
     ids.sort();
     ids.dedup();
     assert_eq!(ids.len(), vms.len(), "an id per VM: {ids:?}");
+    assert!(
+        cpu_limited > 0,
+        "clone.local's warm clones: their CPU limited"
+    );
     assert_eq!(others.len(), 1, "the wicket: {others:?}");
     assert_eq!(
         field(others[0], "Uid:").split_whitespace().next(),
@@ -579,11 +610,13 @@ impl Route<'_> {
         );
     }
 
-    /// A route of one VM, cloned for each connection: a second connection,
-    /// finding no room while the first holds the VM, fails unanswered once its
-    /// wait ran out; a connection after the first ended gets the VM. The
-    /// clones, restored seconds after the snapshot, tell the time of the moment
-    /// and random values of their own.
+    /// A route of two VMs, one per client address, cloned for each connection:
+    /// a client's second connection fails at once while its first holds its VM,
+    /// another client's gets the second VM, and a third client's, finding no
+    /// room, fails unanswered once its wait ran out. Idle past the route's
+    /// `idle-ms`, the connections fail and their VMs end: the first client's
+    /// next connection gets a VM. The clones, restored seconds after the
+    /// snapshot, tell the time of the moment and random values of their own.
     async fn capped(&self, conn_id: &mut i64) {
         let mut next = || {
             *conn_id += 1;
@@ -592,17 +625,7 @@ impl Route<'_> {
         // the snapshot (taken at startup) seconds old: a clock resumed from it
         // shows
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let io = TokioIo::new(self.tunnel.connect(next(), &self.address));
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await.unwrap();
-        tokio::spawn(connection);
-        let request = hyper::Request::get("/")
-            .header("host", self.host)
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-        let response = sender.send_request(request).await.unwrap();
-        assert_eq!(response.status(), 200, "capped.local: the first connection");
-        let first = response.into_body().collect().await.unwrap().to_bytes();
-        let first = String::from_utf8_lossy(&first).into_owned();
+        let (first_sender, first, first_ended) = self.held(next(), "192.0.2.1").await;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -614,18 +637,56 @@ impl Route<'_> {
             now - guest
         );
 
-        let refused = self.half_closed(next()).await;
+        // refused at once: no wait for room
+        let asked = Instant::now();
+        let refused = self.half_closed_from(next(), "192.0.2.1").await;
+        assert!(refused.is_empty(), "past its share, no answer: {refused:?}");
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            asked.elapsed()
+        );
+
+        let (second_sender, _, second_ended) = self.held(next(), "192.0.2.2").await;
+        let refused = self.half_closed_from(next(), "192.0.2.3").await;
         assert!(refused.is_empty(), "no room, no answer: {refused:?}");
 
-        // the first connection ends, and its VM with it
-        drop(sender);
-        let answer = self.half_closed(next()).await;
+        // idle, the connections fail (cut between answers: hyper's outcome
+        // aside), and their VMs end; the senders kept
+        let _ = first_ended.await.unwrap();
+        let _ = second_ended.await.unwrap();
+        drop((first_sender, second_sender));
+        let answer = self.half_closed_from(next(), "192.0.2.1").await;
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer:?}");
         assert_ne!(
             field(&answer, "random: "),
             field(&first, "random: "),
             "two clones of one snapshot draw alike"
         );
+    }
+
+    /// A GET / on a connection of its own of a client of `client` (its address),
+    /// kept open: its sender, its answer, and the connection's end.
+    async fn held(
+        &self,
+        conn_id: i64,
+        client: &str,
+    ) -> (
+        hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+        String,
+        tokio::task::JoinHandle<hyper::Result<()>>,
+    ) {
+        let io = TokioIo::new(self.tunnel.connect_from(conn_id, &self.address, client));
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        let ended = tokio::spawn(connection);
+        let request = hyper::Request::get("/")
+            .header("host", self.host)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), 200, "{}: GET / of {client}", self.host);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (sender, String::from_utf8_lossy(&body).into_owned(), ended)
     }
 
     /// A GET of `path` on a connection of its own; its answer.
@@ -695,7 +756,12 @@ impl Route<'_> {
 
     /// A GET whose client half-closes after it; the answer, read to the end.
     async fn half_closed(&self, conn_id: i64) -> String {
-        let mut io = self.tunnel.connect(conn_id, &self.address);
+        self.half_closed_from(conn_id, "").await
+    }
+
+    /// [`Route::half_closed`] for a client of `client` (its address).
+    async fn half_closed_from(&self, conn_id: i64, client: &str) -> String {
+        let mut io = self.tunnel.connect_from(conn_id, &self.address, client);
         let request = format!("GET /half HTTP/1.1\r\nhost: {}\r\n\r\n", self.host);
         io.write_all(request.as_bytes()).await.unwrap();
         io.shutdown().await.unwrap();

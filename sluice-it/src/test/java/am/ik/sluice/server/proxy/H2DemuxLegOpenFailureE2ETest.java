@@ -3,6 +3,7 @@ package am.ik.sluice.server.proxy;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -115,11 +116,11 @@ class H2DemuxLegOpenFailureE2ETest {
 		AtomicBoolean fail = new AtomicBoolean();
 		Objects.requireNonNull(this.dataProxyServer).legSeam(new NettyHttp2DemuxRelay.LegSeam() {
 			@Override
-			public VirtualConnection open(TunnelSession session, String address) {
+			public VirtualConnection open(TunnelSession session, String address, @Nullable InetAddress client) {
 				if (fail.get()) {
 					throw new IllegalStateException("the session cannot open");
 				}
-				return NettyHttp2DemuxRelay.LegSeam.NONE.open(session, address);
+				return NettyHttp2DemuxRelay.LegSeam.NONE.open(session, address, client);
 			}
 		});
 		assertFailedLegsAreGivenBack(fail, "open");

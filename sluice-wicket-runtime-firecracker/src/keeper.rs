@@ -86,6 +86,16 @@ pub enum Role {
     Clone,
 }
 
+/// What a VM is given, which its cgroup bounds.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Size {
+    pub vcpus: u32,
+    /// Its guest memory, MiB.
+    pub mem: u32,
+    /// The host CPU time it may take, percent of one CPU; None = its vCPUs bound it.
+    pub cpu: Option<u32>,
+}
+
 /// A request of the wicket's.
 #[derive(Serialize, Deserialize, Debug)]
 enum Request {
@@ -96,8 +106,7 @@ enum Request {
     Spawn {
         route: u64,
         role: Role,
-        vcpus: u32,
-        mem: u32,
+        size: Size,
         open_files: u64,
     },
     /// Kill the VM (unanswered: its exit is reported).
@@ -341,8 +350,7 @@ struct Waiting {
     since: std::time::Instant,
     route: u64,
     role: Role,
-    vcpus: u32,
-    mem: u32,
+    size: Size,
     open_files: u64,
 }
 
@@ -730,8 +738,7 @@ impl Keeper {
             Request::Spawn {
                 route,
                 role,
-                vcpus,
-                mem,
+                size,
                 open_files,
             } => {
                 let waiting = Waiting {
@@ -739,8 +746,7 @@ impl Keeper {
                     since: std::time::Instant::now(),
                     route,
                     role,
-                    vcpus,
-                    mem,
+                    size,
                     open_files,
                 };
                 if self.free.is_empty() {
@@ -924,7 +930,7 @@ impl Keeper {
             .custom_flags(libc::O_APPEND | libc::O_CLOEXEC)
             .open(dir.join("firecracker.log"))?;
         std::os::unix::fs::fchown(&log, Some(0), Some(self.group))?;
-        let mem = u64::from(request.mem);
+        let mem = u64::from(request.size.mem);
         let overhead = (vm_overhead_mib(mem) + LOG_MIB) << 20;
         let (memory, file_size) = match request.role {
             Role::Shared => ((mem << 20) + overhead, LOG_MIB << 20),
@@ -935,7 +941,11 @@ impl Keeper {
         };
         let limits = Limits {
             memory,
-            pids: u64::from(request.vcpus) + THREADS,
+            pids: u64::from(request.size.vcpus) + THREADS,
+            cpu: request
+                .size
+                .cpu
+                .map(|percent| u64::from(percent) * jail::CPU_PERIOD_US / 100),
         };
         let route = self.routes.get_mut(&request.route).expect("checked");
         let cgroup = match request.role {
@@ -1313,15 +1323,13 @@ impl Client {
         &self,
         route: u64,
         role: Role,
-        vcpus: u32,
-        mem: u32,
+        size: Size,
         open_files: u64,
     ) -> Result<Spawned, BoxError> {
         let request = Request::Spawn {
             route,
             role,
-            vcpus,
-            mem,
+            size,
             open_files,
         };
         match self.call(request, Vec::new()).await? {

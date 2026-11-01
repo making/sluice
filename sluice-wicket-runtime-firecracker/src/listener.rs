@@ -14,7 +14,7 @@ use crate::wire;
 /// connection while the routes are not one is closed at once.
 pub async fn run(listener: TcpListener, routes: Arc<Routes<Table>>) {
     loop {
-        let Ok((client, _)) = listener.accept().await else {
+        let Ok((client, peer)) = listener.accept().await else {
             continue;
         };
         let Some(route) = routes.current().sole() else {
@@ -22,9 +22,13 @@ pub async fn run(listener: TcpListener, routes: Arc<Routes<Table>>) {
             continue;
         };
         tokio::spawn(async move {
-            match route.open().await {
-                Ok(Lease { stream, vm }) => {
-                    if let Err(e) = wire::relay(client, stream).await {
+            match route.open(&peer.ip().to_string()).await {
+                Ok(Lease {
+                    stream,
+                    vm,
+                    share: _share,
+                }) => {
+                    if let Err(e) = wire::relay(client, stream, route.spec.idle).await {
                         eprintln!("listener ({}): {e}", route.label());
                     }
                     if let Some(vm) = vm {

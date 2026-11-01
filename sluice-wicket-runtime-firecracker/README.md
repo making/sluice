@@ -136,8 +136,9 @@ The scripts build the guest for the host's arch, a VM's; `SLUICE_GUEST_ARCH=aarc
 platform, `linux/arm64` or `linux/amd64`).
 
 `--vm host=<rootfs>[?<options>]` adds a route: `mode=shared|per-connection`, `vcpus=N` (1),
-`mem=MiB` (128), `port=N` (the guest's vsock port, 8080) and, per connection, `warm=N`,
-`prime=N`, `vms=N` and `wait-ms=N` (see [Limits](#limits)). The advertised target is
+`mem=MiB` (128), `port=N` (the guest's vsock port, 8080), `per-client=N`, `idle-ms=N`, `cpu=N`
+(jail mode) and, per connection, `warm=N`, `prime=N`, `vms=N` and `wait-ms=N` (see
+[Limits](#limits)). The advertised target is
 `firecracker:<rootfs>` plus the options set to other than their defaults; the server dials
 it verbatim, and the hosts of one target share its VMs. `--listen host:port` serves the sole
 route over plain TCP too (without `--server`, all the wicket does: a local loop for trying a
@@ -188,7 +189,7 @@ drain-grace: 20s
 routes:
   - {host: hello.local, rootfs: guest.ext4}
   - {host: app.local, rootfs: upstream.ext4, mode: per-connection, mem: 512, vcpus: 2,
-     prime: 200, warm: 4, vms: 16, wait-ms: 10000}
+     prime: 200, warm: 4, vms: 16, wait-ms: 10000, per-client: 4, idle-ms: 30000}
 ```
 
 ### Reloading routes
@@ -228,6 +229,26 @@ route's `vms` alone keeps no other route waiting), at most its route's `wait-ms`
 the server answers with `502 Bad Gateway` (HTTP/1.1) or by closing the connection. Warm
 clones take room nobody waits for, and give it up: the first connection in line short of
 room has a warm clone of another route killed.
+
+Without more, one client holds as many of a route's VMs as it opens connections, until the
+server's `sluice.limits.idle-timeout` closes them. What bounds one client's share:
+
+- **`per-client=N`**: a client address's connections to the route open at once (a
+  per-connection route's VMs, those waiting for room included); one past them fails at
+  once with an ERROR (`client <address> holds N connection(s) of the route already`). The
+  address is the server's data plane peer, a PROXY protocol header's source where one
+  applies (`Connect.client_address`; `--listen`: the TCP peer): behind a front end without
+  the PROXY protocol every connection carries the front end's, and a server predating the
+  field sends none, which the bound does not apply to. A browser opens up to 6 connections
+  per host
+- **`idle-ms=N`**: a connection relaying no byte, either way, for that long fails with an
+  ERROR, and its clone is killed: a bound below the server's idle timeout, of the route's
+  own. A long poll or a stream quiet for longer is cut as well
+- **`cpu=N`** (jail mode): a VM's host CPU time, in percent of one CPU (`cpu=50`, half a
+  CPU; `cpu=200`, two), its cgroup's `cpu.max` (per 100ms), its VMM and API threads
+  counted. Without the jail a VM takes at most its `vcpus` host CPUs (and its VMM thread's
+  share), which a guest spinning them takes from the others: the route's `cpu` needs jail
+  mode (`--jail-ids`)
 
 ### Output and the live access log
 
@@ -338,7 +359,8 @@ Each VM's `firecracker`:
   (it writes its snapshot), `pids.max` its vCPUs plus 16. Past its limit the kernel's OOM
   killer ends the VM, nothing else. A per-connection route's snapshot stays charged to the
   route's cgroup (`route-<n>`) as long as the route lives; a clone's cgroup (`vm-<n>`, one
-  per id) is reused. CPU is not limited: the vCPUs bound it
+  per id) is reused. `cpu.max` its route's `cpu` (see [Limits](#limits)), else unlimited:
+  the vCPUs bound it
 - ends with the keeper: its parent death signal is set after the uid change (which clears
   it: the jailer's `firecracker` outlives the jailer's parent). The keeper forwards SIGTERM,
   SIGINT and SIGHUP to the wicket and ends with it, its VMs killed, their files and cgroups
@@ -356,7 +378,8 @@ What it needs:
   own: the files need others' read permission (`o+r`); their directory may stay private (a
   jail binds the file, not its directory)
 - `--jail-cgroup <path>`: the VMs' parent cgroup under `/sys/fs/cgroup`, made, the memory and
-  pids controllers enabled down to it. By default the wicket's own cgroup, which the keeper
+  pids controllers enabled down to it, and cpu where the hierarchy has it (a route's `cpu`
+  fails its VMs' spawn without it). By default the wicket's own cgroup, which the keeper
   leaves for `keeper/` (cgroup v2 enables no controller for the children of a cgroup holding
   processes): a systemd service's with `Delegate=yes`, a container's; run by hand, give a path
 - the firecracker binary is the keeper's, the one named at startup: a reload may replace the
@@ -477,9 +500,10 @@ sg kvm -c 'cargo test'
 
 `tests/vm.rs` boots VMs where `/dev/kvm` is usable (it is skipped elsewhere): through a
 tunnel server double, for a shared VM serving two hosts, a VM per connection and a route of
-one VM at most, it checks http/1.1 with keep-alive, h2c, a 5MB POST under the tunnel's flow
-control and a client half-closing after its request, the clones' clock and random values,
-the connection finding no room, the VMs' output (a shared VM's, a template's, a clone's)
+two VMs at most, one per client address, it checks http/1.1 with keep-alive, h2c, a 5MB POST
+under the tunnel's flow control and a client half-closing after its request, the clones'
+clock and random values, a client past its share, the connection finding no room, idle
+connections failed, the VMs' output (a shared VM's, a template's, a clone's)
 on the wicket's stdout / stderr and on a flume (`sluice-wicket-tunnel`'s double), and
 reloads of the config file. It needs Firecracker
 (`SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER`, else `firecracker` on the PATH) and a guest
@@ -498,7 +522,7 @@ sg kvm -c "SLUICE_WICKET_RUNTIME_FIRECRACKER_VMS='java.local=$T/upstream.ext4?me
 started as root (`sudo -n`; skipped without it) or, with `..._IMAGE`, as the image runs it
 jailed, and checks the jails of the VMs alive: an id of its own each, PID 1 of its
 namespace, no capability, no new privileges, the seccomp filter on, a cgroup limiting its
-memory, on aarch64 the host CPU's files, the wicket as `--jail-user`; the keeper killed (SIGKILL), the VMs and the wicket end.
+memory (and a route's clones' CPU), on aarch64 the host CPU's files, the wicket as `--jail-user`; the keeper killed (SIGKILL), the VMs and the wicket end.
 
 The CI runs it on an x86_64 and an aarch64 runner, where the runner exposes `/dev/kvm`,
 with the Firecracker release and the kernel above pinned, and again jailed, on the runner
@@ -638,4 +662,5 @@ Caveats:
 
 ## Not yet
 
-Clone reuse and pools of shared VMs, CPU limits per VM, and the wasm wicket's console.
+Clone reuse and pools of shared VMs, CPU limits without the jail, and the wasm wicket's
+console.

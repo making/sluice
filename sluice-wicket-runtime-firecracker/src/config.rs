@@ -31,7 +31,10 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
                                   prime=N GET / sent before the snapshot, vms=N the
                                   route's VMs at most, wait-ms=N a connection may wait for
                                   room for its VM, 10000), vcpus=N (1), mem=MiB (128),
-                                  port=N (the guest's vsock port, 8080)
+                                  port=N (the guest's vsock port, 8080), per-client=N a
+                                  client address's connections at once, idle-ms=N a
+                                  connection may relay no byte, cpu=N (jail mode) a VM's
+                                  host CPU in percent of one
   --config <file>                 YAML settings and routes, the routes reloaded on change
   --kernel <path>                 the guest kernel (vmlinux)
   --firecracker <path>            the firecracker binary (default firecracker on the PATH)
@@ -251,11 +254,24 @@ pub fn parse(
     if server.is_none() && listen.is_none() {
         return Err("--server or --listen is required".into());
     }
+    let jail = match (
+        flag("jail-ids").or_else(|| file.and_then(|file| file.jail_ids.clone())),
+        flag("jail-user").or_else(|| file.and_then(|file| file.jail_user.clone())),
+    ) {
+        (Some(ids), Some(user)) => Some(JailSettings {
+            user,
+            ids: Ids::parse(&ids)?,
+            cgroup: flag("jail-cgroup").or_else(|| file.and_then(|file| file.jail_cgroup.clone())),
+        }),
+        (None, None) => None,
+        _ => return Err("--jail-ids and --jail-user go together (jail mode)".into()),
+    };
     let routes = RouteSource {
         config: config.as_ref().map(|(_, path)| path.clone()),
         flags: vms,
         kernel: flag("kernel").map(PathBuf::from),
         firecracker: flag("firecracker").map(PathBuf::from),
+        jailed: jail.is_some(),
     };
     let specs = routes.read()?;
     if config.is_none() && specs.is_empty() {
@@ -288,18 +304,6 @@ pub fn parse(
             || switch("FLUME_INSECURE")
             || file.and_then(|file| file.flume_insecure).unwrap_or(false),
     )?;
-    let jail = match (
-        flag("jail-ids").or_else(|| file.and_then(|file| file.jail_ids.clone())),
-        flag("jail-user").or_else(|| file.and_then(|file| file.jail_user.clone())),
-    ) {
-        (Some(ids), Some(user)) => Some(JailSettings {
-            user,
-            ids: Ids::parse(&ids)?,
-            cgroup: flag("jail-cgroup").or_else(|| file.and_then(|file| file.jail_cgroup.clone())),
-        }),
-        (None, None) => None,
-        _ => return Err("--jail-ids and --jail-user go together (jail mode)".into()),
-    };
     let token = match (flag("token"), flag("token-file"), file) {
         (Some(token), _, _) => token,
         (None, Some(path), _) => read(PathBuf::from(path))?,
@@ -358,6 +362,8 @@ pub struct RouteSource {
     /// `--kernel` / `--firecracker` (flag or environment), over the file's.
     kernel: Option<PathBuf>,
     firecracker: Option<PathBuf>,
+    /// Jail mode: a route's `cpu` is its VMs' cgroups'.
+    jailed: bool,
 }
 
 impl RouteSource {
@@ -450,6 +456,12 @@ impl RouteSource {
             if specs[..n].iter().any(|other| other.host == spec.host) {
                 return Err(format!("{}: routed twice", spec.host));
             }
+            if spec.vm.cpu.is_some() && !self.jailed {
+                return Err(format!(
+                    "{}: cpu needs jail mode (--jail-ids): its VMs' cgroups bound it",
+                    spec.host
+                ));
+            }
         }
         Ok(specs)
     }
@@ -520,6 +532,9 @@ struct FileRoute {
     prime: Option<u32>,
     vms: Option<u32>,
     wait_ms: Option<u32>,
+    cpu: Option<u32>,
+    per_client: Option<u32>,
+    idle_ms: Option<u32>,
 }
 
 impl FileRoute {
@@ -527,11 +542,14 @@ impl FileRoute {
         let numbers = [
             ("vcpus", self.vcpus),
             ("mem", self.mem),
+            ("cpu", self.cpu),
             ("port", self.port),
             ("warm", self.warm),
             ("prime", self.prime),
             ("vms", self.vms),
             ("wait-ms", self.wait_ms),
+            ("per-client", self.per_client),
+            ("idle-ms", self.idle_ms),
         ];
         self.mode
             .iter()
@@ -600,7 +618,8 @@ mod tests {
 
     /// A flag wins over the environment, the environment over the file, the
     /// file over the defaults; the file's paths are relative to it, its routes
-    /// come before the flags', a host is routed once.
+    /// come before the flags', a host is routed once, a route's `cpu` needs jail
+    /// mode.
     #[test]
     fn flags_win_over_the_environment_over_the_file_over_the_defaults() {
         let dir = std::env::temp_dir().join(format!("sfc-config-{}", std::process::id()));
@@ -613,7 +632,8 @@ mod tests {
             "server: grpc://file:8001\ntoken: from-file\nkernel: vmlinux\nmax-vms: 8\n\
              drain-grace: 5s\nflume: grpc://file:8002\nflume-token: from-file\n\
              flume-ca-cert: flume-ca.pem\njail-ids: 900000-900063\njail-user: from-file\n\
-             routes:\n  - {host: a.local, rootfs: app.ext4, mode: per-connection, warm: 2}\n",
+             routes:\n  - {host: a.local, rootfs: app.ext4, mode: per-connection, warm: 2, cpu: 50,\n     \
+             per-client: 4, idle-ms: 30000}\n",
         )
         .unwrap();
         let vm = format!("b.local={}", rootfs.display());
@@ -661,7 +681,7 @@ mod tests {
         assert_eq!(
             settings.specs[0].target(),
             format!(
-                "firecracker:{}?mode=per-connection&warm=2",
+                "firecracker:{}?mode=per-connection&cpu=50&warm=2&per-client=4&idle-ms=30000",
                 rootfs.display()
             ),
             "the options set to other than their defaults"
@@ -727,7 +747,17 @@ mod tests {
         assert_eq!(settings.token, "from-token-file");
 
         let twice = format!("a.local={}", rootfs.display());
+        let cpu = format!("c.local={}?cpu=50", rootfs.display());
+        let no_share = format!("c.local={}?per-client=0", rootfs.display());
         for (args, error) in [
+            (
+                vec!["--server", "s", "--kernel", "k", "--vm", &cpu],
+                "c.local: cpu needs jail mode",
+            ),
+            (
+                vec!["--server", "s", "--kernel", "k", "--vm", &no_share],
+                "per-client must be at least 1",
+            ),
             (vec!["--kernel", "k", "--vm", &vm], "--server or --listen"),
             (vec!["--server", "s", "--vm", &vm], "--kernel is required"),
             (vec!["--server", "s", "--kernel", "k"], "--vm is required"),

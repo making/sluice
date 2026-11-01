@@ -42,7 +42,7 @@ use tokio::sync::watch;
 use crate::BoxError;
 use crate::capacity::Slot;
 use crate::jail;
-use crate::keeper::{Client, Role};
+use crate::keeper::{Client, Role, Size};
 
 /// Guest CID of every VM: each VM has its own vsock device, so they need not differ.
 const GUEST_CID: u32 = 3;
@@ -134,6 +134,20 @@ pub struct Spec {
     pub rootfs: PathBuf,
     pub vcpus: u32,
     pub mem_mib: u32,
+    /// Jail mode: the host CPU time a VM may take, in percent of one CPU (its cgroup's
+    /// `cpu.max`); None = its vCPUs bound it.
+    pub cpu: Option<u32>,
+}
+
+impl Spec {
+    /// What a VM of the spec is given, as the keeper limits it.
+    fn size(&self) -> Size {
+        Size {
+            vcpus: self.vcpus,
+            mem: self.mem_mib,
+            cpu: self.cpu,
+        }
+    }
 }
 
 /// A paused VM's state and memory, which [`Vm::restore`] clones VMs from.
@@ -145,8 +159,8 @@ pub struct Snapshot {
     pub memory: PathBuf,
     /// The memory file on the host.
     pub memory_on_host: PathBuf,
-    pub vcpus: u32,
-    pub mem_mib: u32,
+    /// Its template's, its clones'.
+    size: Size,
 }
 
 /// How the wicket starts VMs, before its runtime does.
@@ -345,14 +359,11 @@ impl Vm {
         keeper: &Arc<Client>,
         route: u64,
         role: Role,
-        vcpus: u32,
-        mem_mib: u32,
+        size: Size,
         slot: Slot,
     ) -> Result<Vm, BoxError> {
         let open_files = VM_OPEN_FILES.load(Ordering::Relaxed);
-        let spawned = keeper
-            .spawn(route, role, vcpus, mem_mib, open_files)
-            .await?;
+        let spawned = keeper.spawn(route, role, size, open_files).await?;
         let run = spawned.dir.join("run");
         let mut vm = Vm {
             process: Process::Jailed {
@@ -402,7 +413,7 @@ impl Vm {
                 spec.rootfs.clone(),
             ),
             Place::Jail { keeper, route, .. } => (
-                Vm::jailed(keeper, *route, role, spec.vcpus, spec.mem_mib, slot).await?,
+                Vm::jailed(keeper, *route, role, spec.size(), slot).await?,
                 PathBuf::from(jail::KERNEL),
                 PathBuf::from(jail::ROOTFS),
             ),
@@ -459,8 +470,7 @@ impl Vm {
                 Vm::spawn(&snapshot.firecracker, dir, slot).await?
             }
             Place::Jail { keeper, route, .. } => {
-                let (vcpus, mem) = (snapshot.vcpus, snapshot.mem_mib);
-                Vm::jailed(keeper, *route, Role::Clone, vcpus, mem, slot).await?
+                Vm::jailed(keeper, *route, Role::Clone, snapshot.size, slot).await?
             }
         };
         vm.api(
@@ -496,8 +506,7 @@ impl Vm {
             state: inside.join("vm.state"),
             memory: inside.join("vm.mem"),
             memory_on_host: on_host.join("vm.mem"),
-            vcpus: spec.vcpus,
-            mem_mib: spec.mem_mib,
+            size: spec.size(),
         };
         self.api("PATCH", "/vm", json!({ "state": "Paused" }))
             .await?;

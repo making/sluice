@@ -98,13 +98,20 @@ pub struct Connection {
 impl Binding for Connection {
     /// Relays the connection to a guest stream of the route until both
     /// directions closed, their CLOSEs passed on. A guest stream that could
-    /// not be had, or ended without its CLOSE, fails the connection with an
-    /// ERROR: the server drops its client's connection instead of ending it
-    /// as if the answer were complete.
+    /// not be had (the client's share of the route taken included), ended
+    /// without its CLOSE, or relaying no byte for the route's `idle-ms`, fails
+    /// the connection with an ERROR: the server drops its client's connection
+    /// instead of ending it as if the answer were complete.
     async fn serve(self, mut io: TunnelIo) {
         let conn_id = io.conn_id();
         let ending = io.ending();
-        let Lease { stream, vm } = match self.route.open().await {
+        let lease = self.route.open(io.client_address()).await;
+        // the share held until the VM ended
+        let Lease {
+            stream,
+            vm,
+            share: _share,
+        } = match lease {
             Ok(lease) => lease,
             Err(e) => {
                 eprintln!("conn {conn_id} ({}): {e}", self.route.label());
@@ -114,7 +121,7 @@ impl Binding for Connection {
         };
         let failed = io.failed();
         let relayed = tokio::select! {
-            relayed = wire::relay(&mut io, stream) => relayed,
+            relayed = wire::relay(&mut io, stream, self.route.spec.idle) => relayed,
             // the server's ERROR or the stream's end: nothing is sent any more
             () = failed => Ok(()),
         };

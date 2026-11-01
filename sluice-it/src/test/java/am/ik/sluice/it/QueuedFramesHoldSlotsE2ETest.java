@@ -63,7 +63,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * for the tunnel stream still wait in the server's sender: the connection limit bounds
  * what ended connections still queue. The stream is held not ready by a tunnel client
  * that stops reading it (its receive callback blocks), which leaves the server's frames
- * queued.
+ * queued. Its CONNECTs -- tcp route, HTTP/1.1, h2 and passthrough connections -- name the
+ * data plane connection's client address.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -179,6 +180,7 @@ class QueuedFramesHoldSlotsE2ETest {
 		client.resume.countDown();
 		Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> sender().connectionQueues() == 0);
 		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> admitted() == 0);
+		assertThat(client.clientAddresses).as("every CONNECT names its data plane client").containsOnly("127.0.0.1");
 	}
 
 	/** The end of the tunnel session drops the queued frames and frees their slots. */
@@ -226,6 +228,7 @@ class QueuedFramesHoldSlotsE2ETest {
 
 		client.resume.countDown();
 		assertThat(in.readNBytes(RESPONSE.length)).as("route b answers once a's frames left").isEqualTo(RESPONSE);
+		assertThat(client.clientAddresses).as("every CONNECT names its data plane client").containsOnly("127.0.0.1");
 	}
 
 	/** An HTTP/1.1 relay that ended keeps its slot while its leg's frames are queued. */
@@ -296,6 +299,7 @@ class QueuedFramesHoldSlotsE2ETest {
 
 		client.resume.countDown();
 		Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> admitted() == FILLERS);
+		assertThat(client.clientAddresses).as("every CONNECT names its data plane client").containsOnly("127.0.0.1");
 	}
 
 	/**
@@ -361,6 +365,7 @@ class QueuedFramesHoldSlotsE2ETest {
 
 		client.resume.countDown();
 		Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> admitted() == FILLERS);
+		assertThat(client.clientAddresses).as("every CONNECT names its data plane client").containsOnly("127.0.0.1");
 	}
 
 	/** Reads frames until the relay resets {@code streamId}. */
@@ -534,6 +539,9 @@ class QueuedFramesHoldSlotsE2ETest {
 
 		private final Map<Long, String> addresses = new ConcurrentHashMap<>();
 
+		/** The client addresses the CONNECTs named. */
+		final Set<String> clientAddresses = ConcurrentHashMap.newKeySet();
+
 		private final Set<Long> answered = ConcurrentHashMap.newKeySet();
 
 		private @Nullable StreamObserver<Frame> requests;
@@ -583,6 +591,7 @@ class QueuedFramesHoldSlotsE2ETest {
 				case CONNECT -> {
 					long id = frame.getConnect().getConnId();
 					this.addresses.put(id, frame.getConnect().getAddress());
+					this.clientAddresses.add(frame.getConnect().getClientAddress());
 					if (TCP_TARGET.equals(frame.getConnect().getAddress())) {
 						send(Frame.newBuilder().setClose(Close.newBuilder().setConnId(id)).build());
 						this.closedTcp.add(id);

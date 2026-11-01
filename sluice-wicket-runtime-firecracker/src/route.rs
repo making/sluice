@@ -4,6 +4,7 @@
 //! `template` a per-connection route's template, `vm-<n>` its clones in the order
 //! they were restored.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -86,10 +87,16 @@ pub struct RouteSpec {
     pub vms: Option<usize>,
     /// Per-connection mode: how long a connection may wait for room for its VM.
     pub wait: Duration,
+    /// The route's connections of one client address open at once at most (in
+    /// per-connection mode, its VMs); None = no bound of its own.
+    pub per_client: Option<usize>,
+    /// How long a connection may relay no byte, either way, before it is failed (and
+    /// its VM killed); None = no bound of its own.
+    pub idle: Option<Duration>,
 }
 
 impl RouteSpec {
-    /// Parses `host=<rootfs>[?mode=shared|per-connection&vcpus=N&mem=MiB&port=N&warm=N&prime=N&vms=N&wait-ms=N]`.
+    /// Parses `host=<rootfs>[?mode=shared|per-connection&vcpus=N&mem=MiB&cpu=N&port=N&warm=N&prime=N&vms=N&wait-ms=N&per-client=N&idle-ms=N]`.
     pub fn parse(
         flag: &str,
         firecracker: &std::path::Path,
@@ -132,6 +139,7 @@ impl RouteSpec {
                 rootfs,
                 vcpus: 1,
                 mem_mib: 128,
+                cpu: None,
             },
             mode: Mode::Shared,
             port: 8080,
@@ -139,12 +147,18 @@ impl RouteSpec {
             prime: 0,
             vms: None,
             wait: DEFAULT_WAIT,
+            per_client: None,
+            idle: None,
         };
         for (key, value) in options {
             let number = || -> Result<u32, String> {
                 value
                     .parse()
                     .map_err(|_| format!("{named}: {key}={value} is not a number"))
+            };
+            let positive = || match number()? {
+                0 => Err(format!("{named}: {key} must be at least 1")),
+                n => Ok(n),
             };
             match key {
                 "mode" => {
@@ -161,6 +175,9 @@ impl RouteSpec {
                 "prime" => spec.prime = number()?,
                 "vms" => spec.vms = Some(number()? as usize),
                 "wait-ms" => spec.wait = Duration::from_millis(u64::from(number()?)),
+                "cpu" => spec.vm.cpu = Some(positive()?),
+                "per-client" => spec.per_client = Some(positive()? as usize),
+                "idle-ms" => spec.idle = Some(Duration::from_millis(u64::from(positive()?))),
                 _ => return Err(format!("{named}: unknown key {key}")),
             }
         }
@@ -201,7 +218,8 @@ impl RouteSpec {
 
     /// The target advertised for the route, which the server passes verbatim as the
     /// dial address of its CONNECTs: `firecracker:<rootfs>`, plus the options set to
-    /// other than their defaults (`?mode=per-connection&vcpus=2...`, in a fixed order).
+    /// other than their defaults (`?mode=per-connection&vcpus=2...`, in a fixed order;
+    /// the bounds of a connection too: a target's connections are bound alike).
     /// Routes of one target share its VMs.
     pub fn target(&self) -> String {
         let mut options = Vec::new();
@@ -211,6 +229,7 @@ impl RouteSpec {
         for (key, value, default) in [
             ("vcpus", self.vm.vcpus, 1),
             ("mem", self.vm.mem_mib, 128),
+            ("cpu", self.vm.cpu.unwrap_or(0), 0),
             ("port", self.port, 8080),
             ("warm", self.warm as u32, 0),
             ("prime", self.prime, 0),
@@ -219,6 +238,12 @@ impl RouteSpec {
                 "wait-ms",
                 self.wait.as_millis() as u32,
                 DEFAULT_WAIT.as_millis() as u32,
+            ),
+            ("per-client", self.per_client.unwrap_or(0) as u32, 0),
+            (
+                "idle-ms",
+                self.idle.map_or(0, |idle| idle.as_millis() as u32),
+                0,
             ),
         ] {
             if value != default {
@@ -238,6 +263,48 @@ pub struct Lease {
     pub stream: UnixStream,
     /// Per-connection mode: the connection's own VM.
     pub vm: Option<Cloned>,
+    /// With `per-client`: the connection's place in its client's share of the route.
+    pub share: Option<Share>,
+}
+
+/// A route's connections open by client address, which `per-client` bounds.
+#[derive(Default)]
+struct Clients(Mutex<HashMap<String, usize>>);
+
+impl Clients {
+    /// A place for a connection of `client`, unless it holds `max` already.
+    fn claim(self: &Arc<Self>, client: &str, max: usize) -> Result<Share, String> {
+        let mut open = self.0.lock().unwrap();
+        let held = open.entry(client.to_string()).or_insert(0);
+        if *held >= max {
+            return Err(format!(
+                "client {client} holds {max} connection(s) of the route already (per-client)"
+            ));
+        }
+        *held += 1;
+        Ok(Share {
+            clients: self.clone(),
+            client: client.to_string(),
+        })
+    }
+}
+
+/// A connection's place in its client's share of a route, given back when dropped.
+pub struct Share {
+    clients: Arc<Clients>,
+    client: String,
+}
+
+impl Drop for Share {
+    fn drop(&mut self) {
+        let mut open = self.clients.0.lock().unwrap();
+        if let Some(held) = open.get_mut(&self.client) {
+            *held -= 1;
+            if *held == 0 {
+                open.remove(&self.client);
+            }
+        }
+    }
 }
 
 /// A clone, killed when dropped ([`Cloned::end`] once its output came), and its output
@@ -268,6 +335,8 @@ pub struct Route {
     /// What each of the route's VMs takes of the budget.
     need: Need,
     backend: Backend,
+    /// Its connections open by client address.
+    clients: Arc<Clients>,
 }
 
 enum Backend {
@@ -485,6 +554,7 @@ impl Route {
             capacity,
             need,
             backend,
+            clients: Arc::default(),
         })
     }
 
@@ -498,12 +568,19 @@ impl Route {
         self.hosts.set(hosts);
     }
 
-    /// A stream to a guest for one connection.
-    pub async fn open(&self) -> Result<Lease, BoxError> {
+    /// A stream to a guest for one connection of `client` (its IP address; empty when
+    /// unknown, which `per-client` does not bound): failed at once when the client
+    /// holds its share of the route already.
+    pub async fn open(&self, client: &str) -> Result<Lease, BoxError> {
+        let share = match self.spec.per_client {
+            Some(max) if !client.is_empty() => Some(self.clients.claim(client, max)?),
+            _ => None,
+        };
         match &self.backend {
             Backend::Shared(vm) => Ok(Lease {
                 stream: vm.dial(self.spec.port).await?,
                 vm: None,
+                share,
             }),
             Backend::PerConnection { cloner, warm } => {
                 let started = Instant::now();
@@ -529,6 +606,7 @@ impl Route {
                 Ok(Lease {
                     stream,
                     vm: Some(clone),
+                    share,
                 })
             }
         }

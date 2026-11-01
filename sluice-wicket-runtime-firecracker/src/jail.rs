@@ -34,7 +34,7 @@
 //! (`open_tree`; a mount of another namespace cannot be bound). Nothing is mounted where
 //! the host sees it, nothing is left to unmount.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -783,6 +783,13 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// The controllers the VMs' cgroups use.
 const CONTROLLERS: &str = "+memory +pids";
 
+/// The controller of a route's `cpu`, enabled with [`CONTROLLERS`] where the hierarchy
+/// has it: a route asking for it fails its VMs' spawn where it is missing.
+const CPU_CONTROLLER: &str = "+cpu";
+
+/// The period of a VM's `cpu.max`, microseconds.
+pub const CPU_PERIOD_US: u64 = 100_000;
+
 /// What a VM's cgroup allows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -790,6 +797,8 @@ pub struct Limits {
     pub memory: u64,
     /// `pids.max`: its threads.
     pub pids: u64,
+    /// `cpu.max`'s quota per [`CPU_PERIOD_US`], microseconds; None = no limit.
+    pub cpu: Option<u64>,
 }
 
 impl Cgroups {
@@ -957,25 +966,45 @@ impl Cgroup {
             (c"memory.oom.group", 1),
             (c"pids.max", limits.pids),
         ] {
-            let value = value.to_string();
-            // SAFETY: openat of a NUL-terminated name in our directory, a write of a
-            // buffer of its length, the close of our fd
-            unsafe {
-                let fd = libc::openat(
-                    self.dir.as_raw_fd(),
-                    file.as_ptr(),
-                    libc::O_WRONLY | libc::O_CLOEXEC,
-                );
-                check(fd).map_err(failed(&format!("{file:?}")))?;
-                let written = libc::write(fd, value.as_ptr().cast(), value.len());
-                let error = io::Error::last_os_error();
-                libc::close(fd);
-                if written != value.len() as isize {
-                    return Err(failed(&format!("{file:?} {value}"))(error));
-                }
-            }
+            self.write(file, &value.to_string())?;
+        }
+        // written when set, or lifted from the cgroup's previous VM: a hierarchy
+        // without the cpu controller takes the routes without `cpu`
+        if limits.cpu.is_some() || self.limits.is_some_and(|last| last.cpu.is_some()) {
+            let value = match limits.cpu {
+                Some(quota) => format!("{quota} {CPU_PERIOD_US}"),
+                None => "max".to_string(),
+            };
+            self.write(c"cpu.max", &value).map_err(|e| match e.kind() {
+                io::ErrorKind::NotFound => io::Error::other(
+                    "cpu.max: the cpu controller is not enabled for the VMs' cgroups (cpu \
+                     needs it)",
+                ),
+                _ => e,
+            })?;
         }
         self.limits = Some(limits);
+        Ok(())
+    }
+
+    /// Writes `value` into the cgroup's `file`.
+    fn write(&self, file: &CStr, value: &str) -> io::Result<()> {
+        // SAFETY: openat of a NUL-terminated name in our directory, a write of a buffer
+        // of its length, the close of our fd
+        unsafe {
+            let fd = libc::openat(
+                self.dir.as_raw_fd(),
+                file.as_ptr(),
+                libc::O_WRONLY | libc::O_CLOEXEC,
+            );
+            check(fd).map_err(failed(&format!("{file:?}")))?;
+            let written = libc::write(fd, value.as_ptr().cast(), value.len());
+            let error = io::Error::last_os_error();
+            libc::close(fd);
+            if written != value.len() as isize {
+                return Err(failed(&format!("{file:?} {value}"))(error));
+            }
+        }
         Ok(())
     }
 }
@@ -1020,9 +1049,10 @@ fn writable(root: &Path) -> io::Result<()> {
     )))
 }
 
-/// Enables [`CONTROLLERS`] for the children of the cgroup `dir`; `busy` says why it
-/// cannot when `dir` holds processes (cgroup v2 enables no controller for the children
-/// of a cgroup holding processes).
+/// Enables [`CONTROLLERS`] for the children of the cgroup `dir`, and
+/// [`CPU_CONTROLLER`] where `dir` has it (unchecked); `busy` says why it cannot when
+/// `dir` holds processes (cgroup v2 enables no controller for the children of a cgroup
+/// holding processes).
 fn enable(dir: &Path, busy: &str) -> io::Result<()> {
     let control = dir.join("cgroup.subtree_control");
     std::fs::write(&control, CONTROLLERS).map_err(|e| {
@@ -1034,7 +1064,12 @@ fn enable(dir: &Path, busy: &str) -> io::Result<()> {
             e.kind(),
             format!("{}: {CONTROLLERS}: {e}{why}", control.display()),
         )
-    })
+    })?;
+    let available = std::fs::read_to_string(dir.join("cgroup.controllers")).unwrap_or_default();
+    if available.split_whitespace().any(|name| name == "cpu") {
+        let _ = std::fs::write(&control, CPU_CONTROLLER);
+    }
+    Ok(())
 }
 
 /// A pidfd of this process (`pidfd_open`, close-on-exec), for [`Jail::keeper`].

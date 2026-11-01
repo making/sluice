@@ -431,7 +431,7 @@ async fn relay(port: u16, booted: Instant) -> std::io::Result<()> {
         tokio::spawn(async move {
             match tokio::net::TcpStream::connect(target).await {
                 Ok(upstream) => {
-                    if let Err(e) = wire::relay(upstream, stream).await {
+                    if let Err(e) = wire::relay(upstream, stream, None).await {
                         eprintln!("guest: relay: {e}");
                     }
                 }

@@ -101,6 +101,12 @@ message Connect {
   // and from a server before this field. A client dialing a TLS upstream
   // negotiates it over ALPN.
   string application_protocol = 4;
+  // The IP address (no port) of the data plane connection this one relays:
+  // its socket peer, or the source of its PROXY protocol header. Behind a
+  // front end without the PROXY protocol, the front end's. Empty when unknown,
+  // and from a server before this field. A client may bound what one address
+  // holds by it.
+  string client_address = 5;
 }
 
 message Close {

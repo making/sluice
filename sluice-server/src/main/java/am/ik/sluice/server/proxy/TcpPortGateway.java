@@ -386,7 +386,7 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 				return;
 			}
 			Router.Route route0 = route.get();
-			VirtualConnection connection = session.open(route0.address());
+			VirtualConnection connection = session.open(route0.address(), "", peer);
 			access.route(route0).connectionId(connection.connectionId());
 			AtomicInteger active = this.activeConnections.computeIfAbsent(port, p -> new AtomicInteger());
 			ConnectionLimits.KeepAliveDeadline deadline = this.limits.keepAliveDeadline(socket);

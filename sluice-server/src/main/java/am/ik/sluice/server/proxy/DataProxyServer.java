@@ -612,7 +612,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			this.reject(conn, this.errorResponse.unauthorized(conn.head(), List.of()));
 			return false;
 		}
-		VirtualConnection connection = session.open(route0.address());
+		VirtualConnection connection = session.open(route0.address(), "", peer);
 		access.connectionId(connection.connectionId());
 		if (request != null) {
 			access.request(request);
