@@ -1,6 +1,7 @@
 //! sluice-wicket-tunnel: the tunnel client of the Rust wickets (`sluice-wicket-runtime-wasi`,
 //! `sluice-wicket-runtime-firecracker`), the `sluice.v1.Tunnel` gRPC API of the Java
-//! client (`TunnelClient` / `NodeConnection`).
+//! client (`TunnelClient` / `NodeConnection`), and their live access log's feed to a
+//! sluice-flume (`sluice.v1.Flume`).
 //!
 //! ```text
 //! sluice server(s) --tunnel stream per node--> wicket --TunnelIo per connection--> the wicket's handler
@@ -24,8 +25,12 @@
 //! `TunnelClient#drain`): every node stream withdraws the routes and ends
 //! once the server acknowledged it and no connection is left on it, within
 //! the drain grace ([`serve`]).
+//!
+//! A wicket feeds its live access log -- its guests' output, the requests it
+//! answered -- to a sluice-flume as a node does ([`flume`]).
 
 pub mod drain;
+pub mod flume;
 pub mod routes;
 pub mod session;
 pub mod signals;

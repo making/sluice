@@ -35,8 +35,8 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use wasmtime::AsContextMut as _;
 
 use crate::env::Env;
-use crate::flume::Tap;
 use crate::keyvalue;
+use sluice_wicket_tunnel::flume::Tap;
 use sluice_wicket_tunnel::tunnel::TunnelIo;
 
 /// Relay slots between the guest's store task and hyper; together with the

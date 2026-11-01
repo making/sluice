@@ -926,6 +926,31 @@ pub mod testing {
         out.into()
     }
 
+    /// The peer's next gRPC message on `body`, `buf` holding what arrived of
+    /// it; `Ok(None)` once the peer ended its stream, an error once it reset
+    /// it.
+    pub async fn recv_message<M: prost::Message + Default>(
+        body: &mut h2::RecvStream,
+        buf: &mut Vec<u8>,
+    ) -> Result<Option<M>, h2::Error> {
+        loop {
+            if buf.len() >= 5 {
+                let len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+                if buf.len() >= 5 + len {
+                    let message = M::decode(&buf[5..5 + len]).unwrap();
+                    buf.drain(..5 + len);
+                    return Ok(Some(message));
+                }
+            }
+            let Some(chunk) = body.data().await else {
+                return Ok(None);
+            };
+            let chunk = chunk?;
+            let _ = body.flow_control().release_capacity(chunk.len());
+            buf.extend_from_slice(&chunk);
+        }
+    }
+
     /// The state of a wicket serving the test routes' `hello.local`, its
     /// connection limit and the route's target.
     #[cfg(test)]
@@ -978,23 +1003,7 @@ pub mod testing {
         /// The wicket's next frame; `Ok(None)` once it ended its request
         /// stream, an error once it reset it.
         pub async fn recv(&mut self) -> Result<Option<Frame>, h2::Error> {
-            use prost::Message as _;
-            loop {
-                if self.buf.len() >= 5 {
-                    let len = u32::from_be_bytes(self.buf[1..5].try_into().unwrap()) as usize;
-                    if self.buf.len() >= 5 + len {
-                        let frame = Frame::decode(&self.buf[5..5 + len]).unwrap();
-                        self.buf.drain(..5 + len);
-                        return Ok(Some(frame));
-                    }
-                }
-                let Some(chunk) = self.body.data().await else {
-                    return Ok(None);
-                };
-                let chunk = chunk?;
-                let _ = self.body.flow_control().release_capacity(chunk.len());
-                self.buf.extend_from_slice(&chunk);
-            }
+            recv_message(&mut self.body, &mut self.buf).await
         }
 
         /// The next frame `pick` takes, skipping the others (window updates).

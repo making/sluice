@@ -30,8 +30,8 @@
 //! console's directory (`deployed`) across restarts.
 //!
 //! `--flume` feeds the guests' output and the answered requests to a
-//! sluice-flume (`flume`), the live access log the sluice console and the
-//! cf-api watch.
+//! sluice-flume (`sluice-wicket-tunnel`'s `flume`), the live access log the
+//! sluice console and the cf-api watch.
 //!
 //! Scope (deliberately minimal):
 //!
@@ -58,7 +58,6 @@ pub mod config;
 mod console;
 mod deployed;
 mod env;
-mod flume;
 mod keyvalue;
 mod listener;
 mod routes;
@@ -66,20 +65,17 @@ mod wasm_host;
 
 use std::sync::Arc;
 
+use sluice_wicket_tunnel::flume::{self, Tap};
 use sluice_wicket_tunnel::session::Shared;
 use sluice_wicket_tunnel::signals::{self, Signals};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// The tunnel's messages (`sluice-wicket-tunnel`'s) and the flume's.
-pub mod proto {
-    pub use sluice_wicket_tunnel::proto::*;
-    tonic::include_proto!("sluice.v1");
-}
+/// The tunnel's messages and the flume's (`sluice-wicket-tunnel`'s).
+pub use sluice_wicket_tunnel::proto;
 
 use console::Console;
 use deployed::Deployed;
-use flume::Tap;
 use proto::PeerBuild;
 use routes::Reloader;
 use wasm_host::Instances;
@@ -216,16 +212,7 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         drop(requests);
     }
     if let Some(flume) = flume {
-        let ca_pem = match &flume.ca_cert {
-            Some(path) => Some(
-                std::fs::read(path)
-                    .map_err(|e| format!("--flume-ca-cert {}: {e}", path.display()))?,
-            ),
-            None => None,
-        };
-        let node_id = format!("wicket:{client_id}");
-        println!("live access log: feeding {} as {node_id}", flume.url);
-        tokio::spawn(flume::feed(flume, ca_pem, tap, node_id));
+        flume::start(flume, tap, &client_id)?;
     }
     // installed whether or not a drain follows: as the init (pid 1) of a
     // container, a process without a handler ignores SIGTERM

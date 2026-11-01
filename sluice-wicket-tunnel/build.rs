@@ -1,4 +1,5 @@
-// Compiles the tunnel proto shared with the Java modules (single source of truth).
+// Compiles the tunnel and flume protos shared with the Java modules (single source of truth):
+// the tunnel's client, the flume's (its feed).
 use std::path::PathBuf;
 
 fn main() {
@@ -17,6 +18,7 @@ fn main() {
             &[
                 protos.join("sluice/v1/tunnel.proto"),
                 protos.join("sluice/v1/build.proto"),
+                protos.join("sluice/v1/flume.proto"),
             ],
             &[protos],
         )

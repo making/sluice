@@ -117,17 +117,7 @@ pub struct Settings {
 }
 
 /// The flume the wicket feeds its live access log to (`--flume`).
-#[derive(Clone, Debug, PartialEq)]
-pub struct FlumeSettings {
-    /// `grpc://host:port` or `grpcs://host:port`.
-    pub url: String,
-    /// Its bearer token.
-    pub token: String,
-    /// The PEM CA verifying a `grpcs://` flume; None: the webPKI roots.
-    pub ca_cert: Option<PathBuf>,
-    /// Skip the verification of a `grpcs://` flume.
-    pub insecure: bool,
-}
+pub use sluice_wicket_tunnel::flume::FlumeSettings;
 
 /// The console (`--console`).
 pub struct ConsoleSettings {
@@ -520,33 +510,14 @@ fn merge(flags: Flags) -> Result<Settings, String> {
     let ca_cert = flags
         .ca_cert
         .or_else(|| settings.ca_cert.as_ref().map(|path| dir.join(path)));
-    let flume = match flags
-        .flume
-        .or_else(|| settings.flume.clone())
-        .filter(|flume| !flume.is_empty())
-    {
-        Some(url) => {
-            if !url.starts_with("grpc://") && !url.starts_with("grpcs://") {
-                return Err(format!(
-                    "--flume: expected grpc://host:port or grpcs://host:port, got '{url}'"
-                ));
-            }
-            let token = flags
-                .flume_token
-                .or_else(|| settings.flume_token.clone())
-                .filter(|token| !token.is_empty())
-                .ok_or("--flume-token (or `flume-token` in the --config file) is required with --flume")?;
-            Some(FlumeSettings {
-                url,
-                token,
-                ca_cert: flags
-                    .flume_ca_cert
-                    .or_else(|| settings.flume_ca_cert.as_ref().map(|path| dir.join(path))),
-                insecure: flags.flume_insecure || settings.flume_insecure.unwrap_or(false),
-            })
-        }
-        None => None,
-    };
+    let flume = FlumeSettings::of(
+        flags.flume.or_else(|| settings.flume.clone()),
+        flags.flume_token.or_else(|| settings.flume_token.clone()),
+        flags
+            .flume_ca_cert
+            .or_else(|| settings.flume_ca_cert.as_ref().map(|path| dir.join(path))),
+        flags.flume_insecure || settings.flume_insecure.unwrap_or(false),
+    )?;
     let stores =
         stores(settings.keyvalue.as_ref(), flags.keyvalue_file, &dir).map_err(|e| key(&e))?;
     let routes = RouteSource {

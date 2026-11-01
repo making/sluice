@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 # The tunnel client of sluice-wicket-runtime-wasi and sluice-wicket-runtime-firecracker (both their own
-# workspaces), so it is one too.
+# workspaces), and their live access log's feed to a sluice-flume, so it is one too.
 [workspace]
 
 [dependencies]
@@ -20,13 +20,13 @@ futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 # control-plane TLS (grpcs / --insecure); the ring provider matches tonic's tls-ring
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-# testing: the server's side of a tunnel stream, over raw h2
+# testing: the server's side of a tunnel stream and the flume's of a feed, over raw h2
 h2 = { version = "0.4", optional = true }
 http = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
 
 [features]
-# the doubles of the tests: a tunnel server and a peer feeding the dispatch
+# the doubles of the tests: a tunnel server, a peer feeding the dispatch, a flume
 testing = ["dep:h2", "dep:http", "dep:bytes"]
 
 [dev-dependencies]

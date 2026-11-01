@@ -1,37 +1,36 @@
-//! The wicket's live access log: its guests' output lines (`stdout`,
-//! `stderr`) and the requests it answered (`response`), fed to a sluice-flume
-//! (`--flume`) while someone watches, as a sluice node feeds its access log
-//! lines (`FlumeFeed` / `LiveLogTap` of the server).
+//! A wicket's live access log: its lines (its guests' output, the requests
+//! it answered) fed to a sluice-flume (`--flume`) while someone watches, as
+//! a sluice node feeds its access log lines (`FlumeFeed` / `LiveLogTap` of
+//! the server).
 //!
 //! ```text
-//! guest output, answered request --> Tap --Feed (the wicket dials out)--> sluice-flume <--Watch-- console, cf-api
+//! the wicket's lines --> Tap --Feed (the wicket dials out)--> sluice-flume <--Watch-- console, cf-api
 //! ```
 //!
 //! Every line goes to a ring of the recent ones ([`RING_SIZE`]), the backfill
 //! once the flume starts the feed; while it feeds, the lines passing its
 //! filter also go to a bounded queue ([`QUEUE_CAPACITY`]) the feed drains.
 //! Nothing waits for the flume: a line past a full queue is dropped and
-//! counted, and the count reaches the flume as a gap at its place. The feed
-//! stream is held open while the wicket runs and redialed with a backoff of
-//! 1s doubling to 30s whenever it ends; a flume down costs a warning per 5
-//! minutes.
+//! counted, and the count reaches the flume as a gap at its place, as do the
+//! lines a wicket counts dropped before they reached the tap
+//! ([`Tap::dropped`]). The feed stream is held open while the wicket runs
+//! and redialed with a backoff of 1s doubling to 30s whenever it ends; a
+//! flume down costs a warning per 5 minutes.
 
 use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Notify, mpsc};
-use tokio_stream::wrappers::ReceiverStream;
 
-use crate::BoxError;
-use crate::config::FlumeSettings;
 use crate::proto::flume_client::FlumeClient;
 use crate::proto::{
     AccessEvent, AccessFilter, FeedGap, FeedHello, FeedMessage, access_event, feed_control,
     feed_message,
 };
-use sluice_wicket_tunnel::{session, tls};
+use crate::{BoxError, session, tls};
 
 /// The recent lines kept for the backfill.
 pub const RING_SIZE: usize = 512;
@@ -53,6 +52,49 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// control holds the feed back, and the queue fills.
 const SEND_BUFFER: usize = 16;
 
+/// The flume a wicket feeds its live access log to (`--flume`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FlumeSettings {
+    /// `grpc://host:port` or `grpcs://host:port`.
+    pub url: String,
+    /// Its bearer token.
+    pub token: String,
+    /// The PEM CA verifying a `grpcs://` flume; None: the webPKI roots.
+    pub ca_cert: Option<PathBuf>,
+    /// Skip the verification of a `grpcs://` flume.
+    pub insecure: bool,
+}
+
+impl FlumeSettings {
+    /// The flume of `url` (`--flume`), none when it is unset or empty: a
+    /// `grpc://` or `grpcs://` URL whose `token` (`--flume-token`) is
+    /// required.
+    pub fn of(
+        url: Option<String>,
+        token: Option<String>,
+        ca_cert: Option<PathBuf>,
+        insecure: bool,
+    ) -> Result<Option<FlumeSettings>, String> {
+        let Some(url) = url.filter(|url| !url.is_empty()) else {
+            return Ok(None);
+        };
+        if !url.starts_with("grpc://") && !url.starts_with("grpcs://") {
+            return Err(format!(
+                "--flume: expected grpc://host:port or grpcs://host:port, got '{url}'"
+            ));
+        }
+        let token = token.filter(|token| !token.is_empty()).ok_or(
+            "--flume-token (or `flume-token` in the --config file) is required with --flume",
+        )?;
+        Ok(Some(FlumeSettings {
+            url,
+            token,
+            ca_cert,
+            insecure,
+        }))
+    }
+}
+
 /// One line of the live access log.
 #[derive(Debug)]
 pub struct Line {
@@ -62,7 +104,7 @@ pub struct Line {
     pub time_unix_millis: i64,
     /// `stdout`, `stderr` or `response`.
     pub kind: &'static str,
-    /// The host of the request it is about, lowercase, without the port.
+    /// The host the line is about, lowercase, without the port.
     pub route_key: String,
     pub fields: Vec<(&'static str, String)>,
 }
@@ -89,9 +131,9 @@ impl Filter {
         }
     }
 
-    fn passes(&self, line: &Line) -> bool {
-        (self.route_keys.is_empty() || self.route_keys.contains(&line.route_key))
-            && (self.kinds.is_empty() || self.kinds.contains(line.kind))
+    fn passes(&self, kind: &str, route_key: &str) -> bool {
+        (self.route_keys.is_empty() || self.route_keys.contains(route_key))
+            && (self.kinds.is_empty() || self.kinds.contains(kind))
     }
 }
 
@@ -113,6 +155,23 @@ struct State {
     queue: VecDeque<Item>,
     /// The lines in `queue`, its gaps aside.
     lines: usize,
+}
+
+impl State {
+    /// Counts `dropped` lines in a gap at the queue's end.
+    fn gap(&mut self, dropped: u64) {
+        match self.queue.back_mut() {
+            Some(Item::Gap(gap)) => *gap += dropped,
+            // past the capacity by this one gap: the lines dropped next count in it
+            _ => self.queue.push_back(Item::Gap(dropped)),
+        }
+    }
+
+    fn passes(&self, kind: &str, route_key: &str) -> bool {
+        self.feeding
+            .as_ref()
+            .is_some_and(|filter| filter.passes(kind, route_key))
+    }
 }
 
 impl Tap {
@@ -171,22 +230,31 @@ impl Tap {
         if state.ring.len() > RING_SIZE {
             state.ring.pop_front();
         }
-        if !state
-            .feeding
-            .as_ref()
-            .is_some_and(|filter| filter.passes(&line))
-        {
+        if !state.passes(line.kind, &line.route_key) {
             return;
         }
         if state.lines < QUEUE_CAPACITY {
             state.queue.push_back(Item::Line(line));
             state.lines += 1;
-        } else if let Some(Item::Gap(dropped)) = state.queue.back_mut() {
-            *dropped += 1;
         } else {
-            // past the capacity by this one gap: the lines dropped next count in it
-            state.queue.push_back(Item::Gap(1));
+            state.gap(1);
         }
+        drop(state);
+        self.queued.notify_one();
+    }
+
+    /// Counts `count` lines of `kind` about `route_key` that were dropped
+    /// before they reached the tap (a guest's own buffer was full): in a gap
+    /// at the queue's end while the flume feeds and such lines pass its
+    /// filter, as a line dropped past the queue is.
+    pub fn dropped(&self, kind: &'static str, route_key: &str, count: u64) {
+        let Some(mut state) = self.state() else {
+            return;
+        };
+        if count == 0 || !state.passes(kind, route_key) {
+            return;
+        }
+        state.gap(count);
         drop(state);
         self.queued.notify_one();
     }
@@ -204,7 +272,7 @@ impl Tap {
         let backfill = state
             .ring
             .iter()
-            .filter(|line| line.seq > after && filter.passes(line))
+            .filter(|line| line.seq > after && filter.passes(line.kind, &line.route_key))
             .cloned()
             .collect();
         state.feeding = Some(filter);
@@ -236,12 +304,28 @@ impl Tap {
     }
 
     /// The lines of the ring, oldest first.
-    #[cfg(test)]
-    pub(crate) fn recent(&self) -> Vec<Arc<Line>> {
+    #[cfg(any(test, feature = "testing"))]
+    pub fn recent(&self) -> Vec<Arc<Line>> {
         self.state()
             .map(|state| state.ring.iter().cloned().collect())
             .unwrap_or_default()
     }
+}
+
+/// Starts feeding `tap` to `flume` in a task of its own, for good, as the
+/// node `wicket:<client_id>`; fails only when its `--flume-ca-cert` cannot
+/// be read.
+pub fn start(flume: FlumeSettings, tap: Arc<Tap>, client_id: &str) -> Result<(), BoxError> {
+    let ca_pem = match &flume.ca_cert {
+        Some(path) => Some(
+            std::fs::read(path).map_err(|e| format!("--flume-ca-cert {}: {e}", path.display()))?,
+        ),
+        None => None,
+    };
+    let node_id = format!("wicket:{client_id}");
+    println!("live access log: feeding {} as {node_id}", flume.url);
+    tokio::spawn(feed(flume, ca_pem, tap, node_id));
+    Ok(())
 }
 
 /// Feeds `tap` to the flume as the node `node_id` for good: one feed stream
@@ -299,7 +383,10 @@ async fn stream(
             })),
         })
         .await?;
-    let mut request = tonic::Request::new(ReceiverStream::new(outgoing));
+    let outgoing = futures_util::stream::unfold(outgoing, |mut outgoing| async move {
+        outgoing.recv().await.map(|message| (message, outgoing))
+    });
+    let mut request = tonic::Request::new(outgoing);
     request
         .metadata_mut()
         .insert("authorization", format!("Bearer {}", flume.token).parse()?);
@@ -385,9 +472,109 @@ fn endpoint(
     Ok(endpoint)
 }
 
+/// A flume double: the flume's side of each feed stream, over raw h2.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use tokio::sync::mpsc;
+
+    use crate::proto::{
+        AccessFilter, FeedControl, FeedMessage, FeedStart, FeedStop, feed_control, feed_message,
+    };
+    use crate::session::testing::{HANG, grpc_frame, recv_message};
+
+    /// One feed stream as the flume sees it: the wicket's messages in, the
+    /// flume's controls out.
+    pub struct FeedStream {
+        /// The `authorization` the wicket sent.
+        pub authorization: Option<String>,
+        body: h2::RecvStream,
+        send: h2::SendStream<bytes::Bytes>,
+        buf: Vec<u8>,
+    }
+
+    impl FeedStream {
+        /// The wicket's next message, within the hang guard; panics once it
+        /// ended or reset its stream.
+        pub async fn next(&mut self) -> feed_message::Body {
+            let message: Option<FeedMessage> =
+                tokio::time::timeout(HANG, recv_message(&mut self.body, &mut self.buf))
+                    .await
+                    .expect("hang guard")
+                    .expect("the feed stream is open");
+            message
+                .and_then(|message| message.body)
+                .expect("a message of the feed")
+        }
+
+        /// Asks for the lines past `after` passing `filter`.
+        pub fn start(&mut self, after: u64, filter: AccessFilter) {
+            self.control(feed_control::Body::Start(FeedStart {
+                after_node_seq: after,
+                filter: Some(filter),
+            }));
+        }
+
+        /// Asks for nothing until the next start.
+        pub fn stop(&mut self) {
+            self.control(feed_control::Body::Stop(FeedStop {}));
+        }
+
+        fn control(&mut self, body: feed_control::Body) {
+            self.send
+                .send_data(grpc_frame(&FeedControl { body: Some(body) }), false)
+                .unwrap();
+        }
+    }
+
+    /// A flume handing each feed stream to the test; its other calls are
+    /// answered UNIMPLEMENTED.
+    pub async fn flume_server() -> (String, mpsc::Receiver<FeedStream>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("grpc://{}", listener.local_addr().unwrap());
+        let (streams, received) = mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let streams = streams.clone();
+                tokio::spawn(async move {
+                    let mut connection = h2::server::handshake(socket).await.unwrap();
+                    // accept() drives the connection on
+                    while let Some(Ok((request, mut respond))) = connection.accept().await {
+                        let response =
+                            http::Response::builder().header("content-type", "application/grpc");
+                        if request.uri().path() != "/sluice.v1.Flume/Feed" {
+                            let unimplemented = response.header("grpc-status", "12").body(());
+                            let _ = respond.send_response(unimplemented.unwrap(), true);
+                            continue;
+                        }
+                        let send = respond
+                            .send_response(response.body(()).unwrap(), false)
+                            .unwrap();
+                        let authorization = request
+                            .headers()
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .map(String::from);
+                        let stream = FeedStream {
+                            authorization,
+                            body: request.into_body(),
+                            send,
+                            buf: Vec::new(),
+                        };
+                        if streams.send(stream).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, received)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::feed_message::Body;
 
     fn publish(tap: &Tap, kind: &'static str, host: &str) {
         tap.publish(kind, host.to_string(), vec![("line", String::new())]);
@@ -414,14 +601,16 @@ mod tests {
     /// those past the flume's position passing its filter, and queues the
     /// passing lines published after it, each once. Past a full queue the
     /// lines are dropped and counted in a gap at their place, behind the
-    /// lines queued before them and ahead of those after. A stop empties the
-    /// queue; a tap without a flume keeps nothing.
+    /// lines queued before them and ahead of those after, as are the lines
+    /// dropped before the tap that pass. A stop empties the queue; a tap
+    /// without a flume keeps nothing.
     #[test]
     fn a_start_backfills_past_the_flume_and_queues_what_passes_with_its_drops_in_place() {
         let tap = Tap::new();
         publish(&tap, "stdout", "a"); // 1
         publish(&tap, "stdout", "b"); // 2
         publish(&tap, "response", "a"); // 3
+        tap.dropped("stdout", "a", 7);
         assert!(!tap.pending(), "nothing queued before a start");
         let backfill = tap.start(1, filter(&["a"], &[]));
         assert_eq!(
@@ -429,8 +618,11 @@ mod tests {
             [3]
         );
         publish(&tap, "stdout", "b"); // 4: not passing
+        tap.dropped("stdout", "b", 3);
         publish(&tap, "stderr", "a"); // 5
-        assert_eq!(drain(&tap), [5]);
+        tap.dropped("stdout", "a", 2);
+        tap.dropped("stderr", "a", 1);
+        assert_eq!(drain(&tap), [5, -3]);
 
         // a new filter: queued from now on only
         let backfill = tap.start(5, filter(&[], &["stdout"]));
@@ -455,6 +647,80 @@ mod tests {
 
         let off = Tap::off();
         publish(&off, "stdout", "a");
+        off.dropped("stdout", "a", 1);
         assert!(off.start(0, Filter::default()).is_empty() && !off.pending());
+    }
+
+    /// The feed says hello as its node, with the flume's token; the flume's
+    /// start has it send the recent lines past its position passing its
+    /// filter, then the lines and the drops that follow, in order.
+    #[tokio::test]
+    async fn the_feed_sends_what_the_flume_starts() {
+        let (url, mut streams) = testing::flume_server().await;
+        let tap = Tap::new();
+        publish(&tap, "stdout", "a"); // 1
+        publish(&tap, "stdout", "b"); // 2: not passing
+        publish(&tap, "stderr", "a"); // 3
+        let flume = FlumeSettings::of(Some(url), Some("f1ume".into()), None, false)
+            .unwrap()
+            .unwrap();
+        let feeding = tokio::spawn(feed(flume, None, tap.clone(), "wicket:test".into()));
+        let mut stream = tokio::time::timeout(crate::session::testing::HANG, streams.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stream.authorization.as_deref(), Some("Bearer f1ume"));
+        let Body::Hello(hello) = stream.next().await else {
+            panic!("no hello first");
+        };
+        assert_eq!(hello.node_id, "wicket:test");
+
+        stream.start(
+            1,
+            AccessFilter {
+                route_keys: vec!["a".into()],
+                ..Default::default()
+            },
+        );
+        let mut received = Vec::new();
+        received.push(stream.next().await);
+        publish(&tap, "stdout", "a"); // 4
+        tap.dropped("stdout", "b", 5);
+        tap.dropped("stderr", "a", 2);
+        publish(&tap, "stdout", "a"); // 5
+        for _ in 0..3 {
+            received.push(stream.next().await);
+        }
+        let received: Vec<i64> = received
+            .into_iter()
+            .map(|body| match body {
+                Body::Event(event) => {
+                    assert_eq!(event.route_key, "a");
+                    event.node_seq as i64
+                }
+                Body::Gap(gap) => -(gap.dropped as i64),
+                Body::Hello(_) => panic!("a second hello"),
+            })
+            .collect();
+        assert_eq!(received, [3, 4, -2, 5]);
+        feeding.abort();
+
+        assert!(
+            FlumeSettings::of(None, None, None, false)
+                .unwrap()
+                .is_none()
+        );
+        for (url, token, error) in [
+            (
+                "f:1",
+                Some("t"),
+                "expected grpc://host:port or grpcs://host:port",
+            ),
+            ("grpcs://f:1", None, "--flume-token (or `flume-token`"),
+        ] {
+            let failed = FlumeSettings::of(Some(url.into()), token.map(String::from), None, false)
+                .unwrap_err();
+            assert!(failed.contains(error), "{failed}");
+        }
     }
 }
