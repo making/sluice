@@ -3,31 +3,46 @@
 # sample rootfs. The proto lives in sluice-proto and the tunnel client in sluice-wicket-tunnel, so
 # the build context is the repository root:
 #   docker build -f sluice-wicket-runtime-firecracker/Dockerfile --build-arg GIT_COMMIT=$(git rev-parse HEAD) .
-# x86_64 only (the musl guest, the release and the kernel are x86_64's).
+# amd64 and arm64: the release, the kernel and the guest are the target's (a VM's arch is
+# its host's).
+ARG TARGETARCH
+
+# the release and the kernel of each arch, checksums verified: the ones the CI's VM test
+# pins (.github/workflows/rust.yaml)
+FROM scratch AS vm-amd64
+ADD --checksum=sha256:06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558 \
+    https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-x86_64.tgz /firecracker.tgz
+ADD --checksum=sha256:a00c1f68304e83ae4e0b5afe88972ad23fda52ed1a40335611aa18faa95d1b10 \
+    https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20261028-84df49062576-0/x86_64/vmlinux-6.18.56 /vmlinux
+
+FROM scratch AS vm-arm64
+ADD --checksum=sha256:e351ebe4f7a16b5873bbd51005d2e6767103cff4d5ebc829df2d3f95a93e2256 \
+    https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-aarch64.tgz /firecracker.tgz
+ADD --checksum=sha256:ba2081f71b3405e7f7be606b849b5341d2272dcb79999cb67f8061e711d0883f \
+    https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20261028-84df49062576-0/aarch64/vmlinux-6.18.56 /vmlinux
+
+FROM vm-${TARGETARCH} AS vm
+
 FROM rust:1.99-slim-trixie AS build
 RUN apt-get update -q && apt-get install -y --no-install-recommends protobuf-compiler e2fsprogs \
     && rm -rf /var/lib/apt/lists/* \
-    && rustup target add x86_64-unknown-linux-musl
+    && rustup target add "$(uname -m)-unknown-linux-musl"
 WORKDIR /src
 # the guest first: it changes less often than the wicket
 COPY sluice-wicket-runtime-firecracker/guest/Cargo.toml sluice-wicket-runtime-firecracker/guest/Cargo.lock sluice-wicket-runtime-firecracker/guest/
+COPY sluice-wicket-runtime-firecracker/guest/.cargo sluice-wicket-runtime-firecracker/guest/.cargo
 COPY sluice-wicket-runtime-firecracker/guest/src sluice-wicket-runtime-firecracker/guest/src
-COPY sluice-wicket-runtime-firecracker/scripts/build-guest.sh sluice-wicket-runtime-firecracker/scripts/
-RUN cargo build --release --locked --target x86_64-unknown-linux-musl \
-        --manifest-path sluice-wicket-runtime-firecracker/guest/Cargo.toml \
-    && mkdir /out \
-    && cp sluice-wicket-runtime-firecracker/guest/target/x86_64-unknown-linux-musl/release/sluice-wicket-runtime-firecracker-guest /out/init \
+COPY sluice-wicket-runtime-firecracker/scripts/guest.sh sluice-wicket-runtime-firecracker/scripts/build-guest.sh sluice-wicket-runtime-firecracker/scripts/
+RUN mkdir /out \
+    && cp "sluice-wicket-runtime-firecracker/$(sluice-wicket-runtime-firecracker/scripts/guest.sh)" /out/init \
     && SLUICE_GUEST=/out/init sluice-wicket-runtime-firecracker/scripts/build-guest.sh /out/guest.ext4
-# the release and checksum the CI's VM test pins (.github/workflows/rust.yaml)
-ADD --checksum=sha256:06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558 \
-    https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-x86_64.tgz /tmp/
-# the kernel the CI's VM test pins (a remote ADD leaves it 0600; ADD --chmod would set the
-# mode of the directories it creates too)
-ADD --checksum=sha256:a00c1f68304e83ae4e0b5afe88972ad23fda52ed1a40335611aa18faa95d1b10 \
-    https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20261028-84df49062576-0/x86_64/vmlinux-6.18.56 /out/vmlinux
-RUN tar -xzf /tmp/firecracker-v1.17.0-x86_64.tgz -C /tmp \
-    && install /tmp/release-v1.17.0-x86_64/firecracker-v1.17.0-x86_64 /out/firecracker \
-    && chmod 0644 /out/vmlinux
+# a remote ADD leaves the kernel 0600 (ADD --chmod would set the mode of the directories it
+# creates too)
+COPY --from=vm /firecracker.tgz /vmlinux /tmp/
+RUN arch=$(uname -m) \
+    && tar -xzf /tmp/firecracker.tgz -C /tmp \
+    && install /tmp/release-v1.17.0-$arch/firecracker-v1.17.0-$arch /out/firecracker \
+    && install -m 0644 /tmp/vmlinux /out/vmlinux
 COPY sluice-proto/src/main/proto sluice-proto/src/main/proto
 COPY sluice-build-info/Cargo.toml sluice-build-info/
 COPY sluice-build-info/src sluice-build-info/src

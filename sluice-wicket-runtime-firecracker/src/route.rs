@@ -320,7 +320,20 @@ impl Cloner {
         // which Firecracker takes as the end of the whole stream (the answer lost)
         let (reader, mut writer) = stream.split();
         let answered = async {
-            writer.write_all(wire::restored(&seed).as_bytes()).await?;
+            // the time read just before the write: the guest sets its clock to it as
+            // it arrives
+            let notice = wire::Notice {
+                seed,
+                time: match crate::vm::RESTORE_ADVANCES_CLOCK {
+                    true => None,
+                    false => Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_err(std::io::Error::other)?,
+                    ),
+                },
+            };
+            writer.write_all(notice.line().as_bytes()).await?;
             let mut answer = String::new();
             tokio::io::BufReader::new(reader)
                 .read_line(&mut answer)

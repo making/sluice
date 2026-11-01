@@ -17,8 +17,9 @@
 //! /init's own output goes to the console.
 //!
 //! A VM cloned from a snapshot gets the wicket's restore notice on the control port
-//! (`wire::CONTROL_PORT`): /init puts its seed into the kernel's random pool, reseeds
-//! it, and runs the image's restore hook (`restore` in `/sluice/init.json`, as the
+//! (`wire::CONTROL_PORT`): /init sets the clock to its time (where it carries one: the
+//! restore did not advance the clock), puts its seed into the kernel's random pool,
+//! reseeds it, and runs the image's restore hook (`restore` in `/sluice/init.json`, as the
 //! image's user, `SLUICE_RESTORE_GENERATION` set) before it answers.
 
 use std::convert::Infallible;
@@ -278,7 +279,8 @@ struct Hook {
 }
 
 /// Answers each restore notice of the wicket's (one per restore): the output
-/// waiting discarded (the snapshot's), the seed into the kernel's random pool,
+/// waiting discarded (the snapshot's), the clock set (given a time), the seed into
+/// the kernel's random pool,
 /// the pool reseeded, hello mode's generator reseeded, the hook run (its output
 /// to `log`); then `OK`.
 async fn control_loop(listener: VsockListener, hook: Option<Hook>, log: Arc<Log>) {
@@ -296,8 +298,8 @@ async fn control_loop(listener: VsockListener, hook: Option<Hook>, log: Arc<Log>
             if reader.read_line(&mut line).await.is_err() {
                 return;
             }
-            let answer = match wire::seed(line.trim_end()) {
-                Some(seed) => match restored(&seed, &hook, &log).await {
+            let answer = match wire::Notice::parse(line.trim_end()) {
+                Some(notice) => match restored(&notice, &hook, &log).await {
                     Ok(()) => "OK\n".to_string(),
                     Err(e) => format!("ERR {e}\n"),
                 },
@@ -309,11 +311,16 @@ async fn control_loop(listener: VsockListener, hook: Option<Hook>, log: Arc<Log>
 }
 
 async fn restored(
-    seed: &[u8; 32],
+    notice: &wire::Notice,
     hook: &Arc<Option<Hook>>,
     log: &Arc<Log>,
 ) -> std::io::Result<()> {
+    // first: the hook runs at the time of the moment, not the snapshot's
+    if let Some(time) = notice.time {
+        set_clock(time)?;
+    }
     log.restored();
+    let seed = &notice.seed;
     reseed(seed)?;
     RANDOM.store(
         u64::from_le_bytes(seed[..8].try_into().unwrap()),
@@ -356,6 +363,22 @@ async fn restored(
     if !status.success() {
         return Err(std::io::Error::other(format!(
             "restore hook {program}: {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Sets the wall clock to `since_epoch`, the host's time of the restore notice.
+fn set_clock(since_epoch: Duration) -> std::io::Result<()> {
+    let time = libc::timespec {
+        tv_sec: since_epoch.as_secs() as _,
+        tv_nsec: since_epoch.subsec_nanos() as _,
+    };
+    // SAFETY: clock_settime of a valid timespec
+    if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &time) } != 0 {
+        return Err(std::io::Error::other(format!(
+            "clock_settime: {}",
+            std::io::Error::last_os_error()
         )));
     }
     Ok(())

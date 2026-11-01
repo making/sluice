@@ -15,3 +15,5 @@
 !sluice-wicket-runtime-firecracker/guest/Cargo.lock
 !sluice-wicket-runtime-firecracker/guest/src
 !sluice-wicket-runtime-firecracker/scripts/build-guest.sh
+!sluice-wicket-runtime-firecracker/guest/.cargo/config.toml
+!sluice-wicket-runtime-firecracker/scripts/guest.sh

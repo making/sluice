@@ -252,8 +252,8 @@ async fn every_route_serves_http_through_the_tunnel() {
 /// The jails of the VMs alive (the shared VM and the warm clones): each a
 /// `firecracker` of an id of its own, PID 1 of its namespace, without capability or
 /// new privileges, its seccomp filter on, in a cgroup of the keeper's limiting its
-/// memory (under `cgroup`, else beside the keeper's own: its default); the wicket as
-/// `user`. The keeper killed (SIGKILL), they and the wicket end with it (their parent
+/// memory (under `cgroup`, else beside the keeper's own: its default), on aarch64 the
+/// host CPU's files Firecracker reads in it; the wicket as `user`. The keeper killed (SIGKILL), they and the wicket end with it (their parent
 /// death signal); its files and cgroups are removed here (a container's go with it).
 fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
     let keeper = wicket.keeper();
@@ -320,6 +320,21 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
         );
         let max = std::fs::read_to_string(format!("/sys/fs/cgroup/{own}/memory.max")).unwrap();
         assert_ne!(max.trim(), "max", "{vm}: its memory limited");
+        // aarch64: the host CPU's files Firecracker reads, the host's in the jail
+        if cfg!(target_arch = "aarch64") {
+            for file in [
+                "sys/devices/system/cpu/cpu0/cache/index0/level",
+                "sys/devices/system/cpu/cpu0/regs/identification/midr_el1",
+            ] {
+                let jailed = Command::new("sudo")
+                    .args(["-n", "cat"])
+                    .arg(format!("/proc/{vm}/root/{file}"))
+                    .output()
+                    .unwrap();
+                let host = std::fs::read(format!("/{file}")).unwrap();
+                assert_eq!(jailed.stdout, host, "{vm}: /{file}");
+            }
+        }
         ids.push(id);
     }
     ids.sort();

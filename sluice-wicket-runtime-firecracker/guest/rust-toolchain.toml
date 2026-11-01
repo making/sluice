@@ -1,5 +1,5 @@
-# The VMs' /init: static, for x86_64-unknown-linux-musl (rustup adds the target).
+# The VMs' /init: static, for <arch>-unknown-linux-musl, the VMs' arch (rustup adds both).
 [toolchain]
 channel = "1.99"
 components = ["rustfmt", "clippy"]
-targets = ["x86_64-unknown-linux-musl"]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]

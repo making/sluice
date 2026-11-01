@@ -9,7 +9,9 @@
 //!   VM's), `/rootfs` and `/vmlinux` (bound read-only from the files the wicket opened),
 //!   `/run` (bound from the VM's directory of the keeper's: the API and vsock sockets) and
 //!   `/snapshot` (the route's snapshot directory: writable by its template, read-only to
-//!   its clones). No `/dev/net/tun`, `/dev/urandom` or `/dev/userfaultfd`: a vsock-only
+//!   its clones); on aarch64 `/sys/devices/system/cpu/cpu0` (bound from the keeper's copy
+//!   of the host's: the caches and `MIDR_EL1` Firecracker reads, the files the jailer
+//!   copies). No `/dev/net/tun`, `/dev/urandom` or `/dev/userfaultfd`: a vsock-only
 //!   VM restored from a file needs none
 //! - a cgroup of its own ([`Cgroups`]), entered by `clone3` (`CLONE_INTO_CGROUP`)
 //! - a uid and gid of its own, no supplementary group, the capability bounding set
@@ -106,6 +108,8 @@ pub struct Jail<'a> {
     pub run: &'a Path,
     /// The route's snapshot directory, bound at [`SNAPSHOT`].
     pub snapshot: Option<(&'a Path, Access)>,
+    /// The copy of [`HOST_CPU`]'s files ([`copy_host_cpu`]), bound at [`HOST_CPU`].
+    pub host_cpu: Option<&'a Path>,
     /// `/dev/null`, `firecracker`'s stdin.
     pub null: BorrowedFd<'a>,
     /// `firecracker`'s stdout and stderr.
@@ -124,6 +128,68 @@ pub struct Jail<'a> {
 /// The names of a route's files in its directory.
 pub const ROUTE_ROOTFS: &str = "rootfs";
 pub const ROUTE_KERNEL: &str = "vmlinux";
+
+/// The host CPU's sysfs directory, where Firecracker reads its caches (the guest's cache
+/// topology) and `MIDR_EL1` on aarch64: the jailer copies those files into each jail.
+pub const HOST_CPU: &str = "/sys/devices/system/cpu/cpu0";
+
+/// Whether a jail holds a copy of [`HOST_CPU`]'s files ([`copy_host_cpu`]), bound at the
+/// same path: Firecracker reads them on aarch64 alone.
+pub const JAIL_HOST_CPU: bool = cfg!(target_arch = "aarch64");
+
+/// The files of a cache level (`cache/index<n>`) Firecracker reads, the jailer's list.
+const CACHE_FILES: [&str; 6] = [
+    "size",
+    "level",
+    "type",
+    "shared_cpu_map",
+    "coherency_line_size",
+    "number_of_sets",
+];
+
+/// The last cache level of arm64 Linux (`index0` to `index7`).
+const MAX_CACHE_INDEX: u8 = 7;
+
+/// `MIDR_EL1`, in a CPU's sysfs directory.
+const MIDR_EL1: &str = "regs/identification/midr_el1";
+
+/// Copies what Firecracker reads of `from` (a CPU's sysfs directory) into `to`, made:
+/// each cache level's files (the levels up to the first missing one; a file missing is
+/// skipped, as the jailer does) and `MIDR_EL1` (where it exists), root's and readable by
+/// every id. sysfs files are read whole: their size says nothing.
+pub fn copy_host_cpu(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    let make = |dir: &Path| {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(dir)
+            .map_err(failed(&dir.display().to_string()))
+    };
+    let copy = |name: &Path| {
+        let Ok(bytes) = std::fs::read(from.join(name)) else {
+            return Ok(());
+        };
+        let target = to.join(name);
+        make(target.parent().expect("a file in a directory"))?;
+        std::fs::write(&target, bytes)
+            .and_then(|()| {
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444))
+            })
+            .map_err(failed(&target.display().to_string()))
+    };
+    make(to)?;
+    for index in 0..=MAX_CACHE_INDEX {
+        let level = Path::new("cache").join(format!("index{index}"));
+        if !from.join(&level).is_dir() {
+            break;
+        }
+        for file in CACHE_FILES {
+            copy(&level.join(file))?;
+        }
+    }
+    copy(Path::new(MIDR_EL1))
+}
 
 fn cstring(bytes: &[u8]) -> io::Result<CString> {
     CString::new(bytes).map_err(|_| io::Error::other("a path holds a NUL byte"))
@@ -349,6 +415,8 @@ struct Prepared {
     options: CString,
     dev: CString,
     kvm: CString,
+    /// Directories made before the binds: the parents of a bind's target.
+    dirs: Vec<CString>,
     /// A file of the template's, where it is bound and whether it is a directory.
     binds: Vec<(CString, CString, Access, bool)>,
     argv: Vec<CString>,
@@ -394,11 +462,22 @@ pub fn spawn(jail: &Jail<'_>) -> io::Result<libc::pid_t> {
     if let Some((dir, access)) = jail.snapshot {
         binds.push((kept(dir)?, inside(SNAPSHOT)?, access, true));
     }
+    let mut dirs = Vec::new();
+    if let Some(copy) = jail.host_cpu {
+        // its parents, outermost first: /sys, /sys/devices, ...
+        let mut parents: Vec<_> = Path::new(HOST_CPU).ancestors().skip(1).collect();
+        parents.pop(); // the root
+        for parent in parents.into_iter().rev() {
+            dirs.push(inside(&parent.to_string_lossy())?);
+        }
+        binds.push((kept(copy)?, inside(HOST_CPU)?, Access::ReadOnly, true));
+    }
     let prepared = Prepared {
         mountpoint: cstring(TEMPLATE_JAIL.as_bytes())?,
         options: cstring(ROOT_OPTIONS.as_bytes())?,
         dev: inside("/dev")?,
         kvm: inside("/dev/kvm")?,
+        dirs,
         binds,
         argv: vec![
             cstring(b"firecracker")?,
@@ -488,6 +567,10 @@ fn jailed(jail: &Jail<'_>, prepared: &Prepared) -> io::Result<std::convert::Infa
         ))
         .map_err(failed("mknod /dev/kvm"))?;
         check(libc::chown(prepared.kvm.as_ptr(), jail.id, jail.id)).map_err(failed("/dev/kvm"))?;
+        for dir in &prepared.dirs {
+            check(libc::mkdir(dir.as_ptr(), 0o755))
+                .map_err(|e| io::Error::new(e.kind(), format!("{dir:?}: {e}")))?;
+        }
         for (source, target, access, directory) in &prepared.binds {
             let bound = (|| {
                 if *directory {
@@ -961,4 +1044,50 @@ pub fn own_pidfd() -> io::Result<OwnedFd> {
     check(fd).map_err(failed("pidfd_open"))?;
     // SAFETY: a new fd of ours
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What Firecracker reads of a CPU's sysfs directory: each cache level's files up to
+    /// the first level missing, and MIDR_EL1; readable by every id.
+    #[test]
+    fn the_host_cpus_copy_holds_what_firecracker_reads() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("sfc-host-cpu-{}", std::process::id()));
+        let (from, to) = (dir.join("cpu0"), dir.join("copy"));
+        let write = |name: &str, content: &str| {
+            let path = from.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        for file in CACHE_FILES {
+            write(&format!("cache/index0/{file}"), &format!("{file} 0\n"));
+        }
+        write("cache/index0/id", "0\n");
+        write("cache/index1/level", "1\n");
+        // past index2, missing: not copied
+        write("cache/index3/level", "2\n");
+        write(MIDR_EL1, "0x00000000410fd0c0\n");
+
+        copy_host_cpu(&from, &to).unwrap();
+        let read = |name: &str| std::fs::read_to_string(to.join(name)).ok();
+        for file in CACHE_FILES {
+            let name = format!("cache/index0/{file}");
+            assert_eq!(read(&name), Some(format!("{file} 0\n")));
+        }
+        assert_eq!(read("cache/index0/id"), None);
+        assert_eq!(read("cache/index1/level").as_deref(), Some("1\n"));
+        assert_eq!(read("cache/index1/size"), None);
+        assert!(!to.join("cache/index3").exists());
+        assert_eq!(read(MIDR_EL1).as_deref(), Some("0x00000000410fd0c0\n"));
+        let mode = |name: &str| {
+            let metadata = std::fs::metadata(to.join(name)).unwrap();
+            metadata.permissions().mode() & 0o777
+        };
+        assert_eq!(mode(MIDR_EL1), 0o444);
+        assert_eq!(mode("cache/index0"), 0o755);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

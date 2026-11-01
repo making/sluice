@@ -30,8 +30,8 @@ jobs:
     outputs:
       revision: ${{ steps.target.outputs.revision }}
     steps:
-    # Target: the commit of the triggering run, when its sluice-wicket-runtime-firecracker job ran and
-    # passed.
+    # Target: the commit of the triggering run, when its sluice-wicket-runtime-firecracker jobs
+    # (one per arch) ran and passed.
     # Skipped when the images branch already holds it or a newer commit.
     - name: Pick the revision to deploy
       id: target
@@ -40,7 +40,7 @@ jobs:
         RUN_ID: ${{ github.event.workflow_run.id }}
         TARGET: ${{ github.event.workflow_run.head_sha }}
       run: |
-        WICKET=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" --jq '.jobs[] | select(.name == "sluice-wicket-runtime-firecracker") | .conclusion')
+        WICKET=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" --jq '[.jobs[] | select(.name | startswith("sluice-wicket-runtime-firecracker (")) | .conclusion] | if length == 2 and all(. == "success") then "success" else unique | join(",") end')
         if [ "${WICKET}" != "success" ]; then
           echo "Skipped: the sluice-wicket-runtime-firecracker job of run ${RUN_ID} did not run (${WICKET:-absent})" | tee -a "${GITHUB_STEP_SUMMARY}"
           exit 0
@@ -56,16 +56,22 @@ jobs:
           identical|behind) echo "Skipped: ${TARGET} is not newer than the deployed revision" | tee -a "${GITHUB_STEP_SUMMARY}" ;;
           *) echo "revision=${TARGET}" >> "${GITHUB_OUTPUT}" ;;
         esac
-  # a Dockerfile build, amd64 alone: the guest, the Firecracker release and the kernel in
-  # the image are x86_64's
+  # a Dockerfile build per arch, on a runner of that arch: the guest, the Firecracker release
+  # and the kernel in each image are its arch's
   build-image:
     needs: target
     if: needs.target.outputs.revision != ''
-    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - { arch: amd64,   runs_on: ubuntu-latest }
+        - { arch: aarch64, runs_on: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runs_on }}
     env:
       REVISION: ${{ needs.target.outputs.revision }}
     steps:
@@ -79,13 +85,40 @@ jobs:
         registry: ${{ env.REGISTRY }}
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    - name: Build and push image
+    - name: Build and push image (${{ matrix.arch }})
+      env:
+        ARCH: ${{ matrix.arch }}
       run: |
         IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/sluice-wicket-runtime-firecracker | tr '[:upper:]' '[:lower:]')"
-        docker build -f sluice-wicket-runtime-firecracker/Dockerfile --build-arg GIT_COMMIT=${REVISION} -t ${IMAGE}:${REVISION} .
-        docker push ${IMAGE}:${REVISION}
-        docker tag ${IMAGE}:${REVISION} ${IMAGE}:latest
-        docker push ${IMAGE}:latest
+        docker build -f sluice-wicket-runtime-firecracker/Dockerfile --build-arg GIT_COMMIT=${REVISION} -t ${IMAGE}:${ARCH}_${REVISION} .
+        docker push ${IMAGE}:${ARCH}_${REVISION}
+        docker tag ${IMAGE}:${ARCH}_${REVISION} ${IMAGE}:${ARCH}
+        docker push ${IMAGE}:${ARCH}
+  push-manifest:
+    needs:
+    - target
+    - build-image
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    env:
+      REVISION: ${{ needs.target.outputs.revision }}
+    steps:
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Create and push manifest
+      run: |
+        IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/sluice-wicket-runtime-firecracker | tr '[:upper:]' '[:lower:]')"
+        # imagetools, not docker manifest: an arch's image may be an index itself (on
+        # ubuntu-26.04 docker keeps images in containerd and attaches their provenance)
+        docker buildx imagetools create -t ${IMAGE}:${REVISION} -t ${IMAGE}:latest \
+          ${IMAGE}:amd64_${REVISION} ${IMAGE}:aarch64_${REVISION}
     - name: Generate image file
       run: |
         IMAGE="${REGISTRY}/$(echo ${GITHUB_REPOSITORY}/sluice-wicket-runtime-firecracker | tr '[:upper:]' '[:lower:]')"
@@ -108,7 +141,7 @@ jobs:
   save-image:
     needs:
     - target
-    - build-image
+    - push-manifest
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

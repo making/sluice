@@ -290,11 +290,26 @@ jobs:
   # The wicket's VM test boots Firecracker microVMs where the runner exposes /dev/kvm (made
   # usable for the runner's user by a udev rule) and is skipped where it does not; Firecracker
   # and the guest kernel are pinned here, checksums verified. Its guest (guest/, the VMs'
-  # /init on musl) is its own workspace, linted and tested apart.
+  # /init on musl) is its own workspace, linted and tested apart. Once per arch: a runner
+  # without /dev/kvm still builds the code, the guests and the image, and runs the tests
+  # without VMs.
   sluice-wicket-runtime-firecracker:
     needs: changes
     if: needs.changes.outputs.firecracker == 'true'
-    runs-on: ubuntu-latest
+    name: sluice-wicket-runtime-firecracker (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - arch: x86_64
+          runs_on: ubuntu-latest
+          firecracker_sha256: 06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558
+          kernel_sha256: a00c1f68304e83ae4e0b5afe88972ad23fda52ed1a40335611aa18faa95d1b10
+        - arch: aarch64
+          runs_on: ubuntu-24.04-arm
+          firecracker_sha256: e351ebe4f7a16b5873bbd51005d2e6767103cff4d5ebc829df2d3f95a93e2256
+          kernel_sha256: ba2081f71b3405e7f7be606b849b5341d2272dcb79999cb67f8061e711d0883f
+    runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 30
     defaults:
       run:
@@ -317,14 +332,18 @@ jobs:
         ls -l /dev/kvm || echo "no /dev/kvm: the VM test is skipped"
     - name: Firecracker and a guest kernel
       working-directory: ${{ runner.temp }}
+      env:
+        ARCH: ${{ matrix.arch }}
+        FIRECRACKER_SHA256: ${{ matrix.firecracker_sha256 }}
+        KERNEL_SHA256: ${{ matrix.kernel_sha256 }}
       run: |
-        FC=v1.17.0 ARCH=x86_64
+        FC=v1.17.0
         curl -fsSLO https://github.com/firecracker-microvm/firecracker/releases/download/$FC/firecracker-$FC-$ARCH.tgz
-        echo "06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558  firecracker-$FC-$ARCH.tgz" | sha256sum -c
+        echo "$FIRECRACKER_SHA256  firecracker-$FC-$ARCH.tgz" | sha256sum -c
         tar xzf firecracker-$FC-$ARCH.tgz
         sudo install -D release-$FC-$ARCH/firecracker-$FC-$ARCH "$SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER"
-        curl -fsSL -o vmlinux https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20261028-84df49062576-0/x86_64/vmlinux-6.18.56
-        echo "a00c1f68304e83ae4e0b5afe88972ad23fda52ed1a40335611aa18faa95d1b10  vmlinux" | sha256sum -c
+        curl -fsSL -o vmlinux https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20261028-84df49062576-0/$ARCH/vmlinux-6.18.56
+        echo "$KERNEL_SHA256  vmlinux" | sha256sum -c
         sudo install -D -m 0644 vmlinux "$SLUICE_WICKET_RUNTIME_FIRECRACKER_KERNEL"
     - uses: actions/cache@v4
       with:
@@ -333,8 +352,8 @@ jobs:
           ~/.cargo/git
           sluice-wicket-runtime-firecracker/target
           sluice-wicket-runtime-firecracker/guest/target
-        key: cargo-wicket-runtime-firecracker-${{ runner.os }}-${{ hashFiles('sluice-wicket-runtime-firecracker/Cargo.lock', 'sluice-wicket-runtime-firecracker/guest/Cargo.lock', 'sluice-wicket-runtime-firecracker/rust-toolchain.toml', 'sluice-wicket-runtime-firecracker/guest/rust-toolchain.toml') }}
-    # the toolchains rust-toolchain.toml pins, the guest's with the musl target
+        key: cargo-wicket-runtime-firecracker-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('sluice-wicket-runtime-firecracker/Cargo.lock', 'sluice-wicket-runtime-firecracker/guest/Cargo.lock', 'sluice-wicket-runtime-firecracker/rust-toolchain.toml', 'sluice-wicket-runtime-firecracker/guest/rust-toolchain.toml') }}
+    # the toolchains rust-toolchain.toml pins, the guest's with both arches' musl targets
     - name: Toolchains
       run: |
         rustup toolchain install
@@ -351,17 +370,22 @@ jobs:
       run: |
         cargo test --locked
         (cd guest && cargo test --locked)
+    # the guest of the runner's arch and, cross built, of the other
+    - name: Guests
+      run: |
+        SLUICE_GUEST_ARCH=x86_64 scripts/guest.sh
+        SLUICE_GUEST_ARCH=aarch64 scripts/guest.sh
     # the VM test again in jail mode: the wicket started as root (sudo -n)
     - name: Test the jail
       run: |
         if [ ! -e /dev/kvm ]; then echo "no /dev/kvm: skipped"; exit 0; fi
         SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL=1 cargo test --locked --test vm
-    # the VM test again, the wicket run as its image (Dockerfile) as the README runs it, then
-    # jailed
+    # the image of the runner's arch (Dockerfile), then the VM test again, the wicket run as
+    # the image as the README runs it, then jailed
     - name: Test the image
       run: |
-        if [ ! -e /dev/kvm ]; then echo "no /dev/kvm: skipped"; exit 0; fi
         docker build -f Dockerfile --build-arg GIT_COMMIT=${GITHUB_SHA} -t sluice-wicket-runtime-firecracker:ci ..
+        if [ ! -e /dev/kvm ]; then echo "no /dev/kvm: the VM test skipped"; exit 0; fi
         SLUICE_WICKET_RUNTIME_FIRECRACKER_IMAGE=sluice-wicket-runtime-firecracker:ci cargo test --locked --test vm
         SLUICE_WICKET_RUNTIME_FIRECRACKER_IMAGE=sluice-wicket-runtime-firecracker:ci SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL=1 \
           cargo test --locked --test vm

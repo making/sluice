@@ -29,8 +29,8 @@ const HEAD: usize = 5;
 const MAX_PAYLOAD: usize = 16 * 1024;
 
 /// The vsock port of the guest's control stream, which carries the wicket's
-/// notice to a VM just restored from a snapshot (a clone): `RESTORED <seed: 64 hex
-/// digits>\n`, answered `OK\n` once the guest put the seed into its kernel's random
+/// notice to a VM just restored from a snapshot (a clone), [`Notice`], answered `OK\n`
+/// once the guest set its clock (given a time), put the seed into its kernel's random
 /// pool and reseeded it, and ran the image's restore hook. A clone's memory is its
 /// snapshot's, random state included: the kernel reseeds on the VM generation
 /// change (VMGenID) a moment after the restore, a process's own generator never.
@@ -142,25 +142,47 @@ pub async fn read_log_frame<R: AsyncRead + Unpin>(
     }))
 }
 
-/// The restore notice carrying `seed`.
-#[allow(dead_code)] // the wicket's half: each copy has both
-pub fn restored(seed: &[u8; 32]) -> String {
-    let hex: String = seed.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("RESTORED {hex}\n")
+/// The wicket's notice to a clone just restored: `RESTORED <seed: 64 hex digits>[ <time:
+/// nanoseconds since the Unix epoch>]\n`. The time where the restore left the guest's
+/// clock at its snapshot's (aarch64: Firecracker advances kvmclock on x86_64 alone); on
+/// x86_64 the notice goes without, as a guest predating the time reads it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Notice {
+    pub seed: [u8; 32],
+    pub time: Option<std::time::Duration>,
 }
 
-/// The seed of a restore notice's line (its newline trimmed); None for another line.
-#[allow(dead_code)] // the guest's half: each copy has both
-pub fn seed(line: &str) -> Option<[u8; 32]> {
-    let hex = line.strip_prefix("RESTORED ")?;
-    if hex.len() != 64 {
-        return None;
+impl Notice {
+    /// Its line, newline included.
+    #[allow(dead_code)] // the wicket's half: each copy has both
+    pub fn line(&self) -> String {
+        let hex: String = self.seed.iter().map(|byte| format!("{byte:02x}")).collect();
+        match self.time {
+            Some(time) => format!("RESTORED {hex} {}\n", time.as_nanos()),
+            None => format!("RESTORED {hex}\n"),
+        }
     }
-    let mut seed = [0u8; 32];
-    for (i, byte) in seed.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
+
+    /// The notice of a line (its newline trimmed); None for another line.
+    #[allow(dead_code)] // the guest's half: each copy has both
+    pub fn parse(line: &str) -> Option<Notice> {
+        let rest = line.strip_prefix("RESTORED ")?;
+        let (hex, time) = match rest.split_once(' ') {
+            Some((hex, nanos)) => (hex, Some(nanos.parse::<u64>().ok()?)),
+            None => (rest, None),
+        };
+        if hex.len() != 64 {
+            return None;
+        }
+        let mut seed = [0u8; 32];
+        for (i, byte) in seed.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
+        }
+        Some(Notice {
+            seed,
+            time: time.map(std::time::Duration::from_nanos),
+        })
     }
-    Some(seed)
 }
 
 /// Writes `payload` as one DATA frame, in one write: a vsock packet per write.
@@ -311,6 +333,24 @@ mod tests {
         client_reader.read_to_end(&mut answer).await.unwrap();
         assert_eq!(answer, b"answer");
         relay.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_restore_notice_carries_its_seed_and_the_time_where_given() {
+        let seed: [u8; 32] = std::array::from_fn(|i| i as u8 * 7);
+        for time in [
+            None,
+            Some(std::time::Duration::new(1_793_000_000, 123_456_789)),
+        ] {
+            let notice = Notice { seed, time };
+            assert_eq!(Notice::parse(notice.line().trim_end()), Some(notice));
+        }
+        assert_eq!(
+            Notice::parse(&format!("RESTORED {} soon", "00".repeat(32))),
+            None
+        );
+        assert_eq!(Notice::parse("RESTORED 00"), None);
+        assert_eq!(Notice::parse("HELLO"), None);
     }
 
     #[tokio::test]

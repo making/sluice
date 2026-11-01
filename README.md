@@ -55,8 +55,8 @@ Multi-arch (amd64 / aarch64) JVM and native images are published to ghcr.io on e
 `main`: `ghcr.io/making/sluice/sluice-server:{jvm,native}` and
 `ghcr.io/making/sluice/sluice-client:{jvm,native}` (immutable `jvm_<sha>` / `native_<sha>` tags too),
 the live access log's `ghcr.io/making/sluice/sluice-flume` and the experimental
-`ghcr.io/making/sluice/sluice-wicket-runtime-wasi` and `ghcr.io/making/sluice/sluice-wicket-cf-api`
-(all `latest` / `<sha>`), and `ghcr.io/making/sluice/sluice-wicket-runtime-firecracker` (amd64 only).
+`ghcr.io/making/sluice/sluice-wicket-runtime-wasi`, `ghcr.io/making/sluice/sluice-wicket-cf-api`
+and `ghcr.io/making/sluice/sluice-wicket-runtime-firecracker` (all `latest` / `<sha>`).
 The wicket's example guests go with its image, as wasm OCI artifacts:
 `ghcr.io/making/sluice/sluice-wicket-runtime-wasi/examples/<example>` (`latest` / `<sha>`).
 The packages under the former names (`sluice-wicket-wasi`, its `examples/<example>`,

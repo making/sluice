@@ -43,19 +43,21 @@ Two Cargo workspaces:
   `listener.rs` `--listen`, `state.rs` the state dir; jail mode's `keeper.rs` (the
   privileged half, and the wicket's client of it) and `jail.rs` (one VM's jail, the VMs'
   cgroups)
-- `guest/` -- the VMs' `/init`, built for `x86_64-unknown-linux-musl` (its
-  `rust-toolchain.toml` has rustup add the target): `log.rs` the processes' output,
+- `guest/` -- the VMs' `/init`, built for `x86_64-unknown-linux-musl` or
+  `aarch64-unknown-linux-musl` (its `rust-toolchain.toml` has rustup add both, rust-lld
+  links the other arch's): `log.rs` the processes' output,
   `reaper.rs` PID 1's reaping; `guest/src/wire.rs` is a copy of `src/wire.rs`: keep them
   alike
 - `scripts/` -- `build-guest.sh` (the sample rootfs), `cnb-rootfs.sh` (an OCI image's),
-  `try.sh` (the debug build on `--listen`)
+  `guest.sh` (the guest, which both build), `try.sh` (the debug build on `--listen`)
 - `tests/vm.rs` -- the VM test (see [Tests](#tests))
 
 ## Setup
 
-x86_64 Linux with KVM (bare metal, or a VM with nested virtualization): `/dev/kvm` must
-exist. Ubuntu 24.04 was used; the versions below are the ones tested. The
-[Docker image](#docker-image) holds steps 2 and 3.
+x86_64 or aarch64 Linux with KVM (bare metal, or a VM with nested virtualization):
+`/dev/kvm` must exist. Ubuntu 24.04 on x86_64 was used; the versions below are the ones
+tested (aarch64: see [aarch64](#aarch64)). The [Docker image](#docker-image) holds steps 2
+and 3.
 
 1. Access to `/dev/kvm` through the `kvm` group (an ACL set by hand is rewritten by udev):
 
@@ -66,7 +68,7 @@ exist. Ubuntu 24.04 was used; the versions below are the ones tested. The
 2. Firecracker (v1.17.0) from its release, checksum verified:
 
    ```text
-   FC=v1.17.0 ARCH=x86_64
+   FC=v1.17.0 ARCH=$(uname -m)
    curl -fsSLO https://github.com/firecracker-microvm/firecracker/releases/download/$FC/firecracker-$FC-$ARCH.tgz
    curl -fsSL https://github.com/firecracker-microvm/firecracker/releases/download/$FC/firecracker-$FC-$ARCH.tgz.sha256.txt | sha256sum -c
    tar xzf firecracker-$FC-$ARCH.tgz
@@ -75,14 +77,14 @@ exist. Ubuntu 24.04 was used; the versions below are the ones tested. The
    ```
 
 3. A guest kernel, the latest of Firecracker's CI builds (6.18.56 was used; it has
-   `CONFIG_VIRTIO_VSOCKETS`, `CONFIG_VMGENID` and kvm-clock):
+   `CONFIG_VIRTIO_VSOCKETS`, `CONFIG_VMGENID` and, on x86_64, kvm-clock):
 
    ```text
-   S3=https://s3.amazonaws.com/spec.ccfc.min
+   S3=https://s3.amazonaws.com/spec.ccfc.min ARCH=$(uname -m)
    CI=$(curl -fsSL "$S3?list-type=2&prefix=firecracker-ci/&delimiter=/" \
        | grep -oP "(?<=<Prefix>)firecracker-ci/[0-9]{8}-[^/]+/(?=</Prefix>)" | sort | tail -1)
-   KERNEL=$(curl -fsSL "$S3?list-type=2&prefix=${CI}x86_64/vmlinux-" \
-       | grep -oP "(?<=<Key>)${CI}x86_64/vmlinux-[0-9]+\.[0-9]+\.[0-9]{1,3}(?=</Key>)" | sort -V | tail -1)
+   KERNEL=$(curl -fsSL "$S3?list-type=2&prefix=${CI}$ARCH/vmlinux-" \
+       | grep -oP "(?<=<Key>)${CI}$ARCH/vmlinux-[0-9]+\.[0-9]+\.[0-9]{1,3}(?=</Key>)" | sort -V | tail -1)
    mkdir -p ~/.local/firecracker && curl -fsSL -o ~/.local/firecracker/vmlinux "$S3/$KERNEL"
    ```
 
@@ -127,6 +129,10 @@ sg kvm -c "target/release/sluice-wicket-runtime-firecracker \
 
 curl -H 'Host: hello.local' http://127.0.0.1:8000/
 ```
+
+The scripts build the guest for the host's arch, a VM's; `SLUICE_GUEST_ARCH=aarch64` (or
+`x86_64`) builds a rootfs for the other's (`cnb-rootfs.sh` then takes the image of that
+platform, `linux/arm64` or `linux/amd64`).
 
 `--vm host=<rootfs>[?<options>]` adds a route: `mode=shared|per-connection`, `vcpus=N` (1),
 `mem=MiB` (128), `port=N` (the guest's vsock port, 8080) and, per connection, `warm=N`,
@@ -270,14 +276,18 @@ them, so it logs no `response` lines: the server's access log has the requests.
 
 A clone's memory is its snapshot's. What the wicket and `/init` do about it:
 
-- **the clock**: the VMs boot with `clocksource=kvm-clock` and are restored with
+- **the clock**: on x86_64 the VMs boot with `clocksource=kvm-clock` and are restored with
   `clock_realtime`: Firecracker advances kvmclock by the time since the snapshot, so a clone
-  resumes at the time of the moment (the TSC, the default clocksource, it does not advance)
+  resumes at the time of the moment (the TSC, the default clocksource, it does not advance).
+  On aarch64 Firecracker advances no clock (`clock_realtime` is x86_64's; its VMClock device
+  marks the restore but carries no time): the restore notice carries the host's time, and
+  `/init` sets the clock to it first
 - **random state**: right after the restore the wicket sends the clone a restore notice on
-  vsock port 1024 with 32 random bytes of the host's; `/init` puts them into the kernel's
-  random pool, reseeds it (ahead of the reseed on the VM generation change, VMGenID, which
-  comes a moment after the restore), runs the image's restore hook, and answers. A process's
-  own generator seeded before the snapshot is its business: the hook
+  vsock port 1024 with 32 random bytes of the host's (and on aarch64 its time); `/init`
+  puts them into the kernel's random pool, reseeds it (ahead of the reseed on the VM
+  generation change, VMGenID, which comes a moment after the restore), runs the image's
+  restore hook, and answers. A process's own generator seeded before the snapshot is its
+  business: the hook
   (`SLUICE_RESTORE='["<program>", "<arg>"]' scripts/cnb-rootfs.sh ...`, `restore` in
   `/sluice/init.json`) runs as the image's user with `SLUICE_RESTORE_GENERATION` set, before
   the clone serves; a hook failing fails the clone. A rootfs whose `/init` predates the notice
@@ -315,7 +325,10 @@ Each VM's `firecracker`:
 - has a read-only tmpfs as its root holding `/dev/kvm` (a node of its own), its rootfs and
   kernel (bound read-only, from the files the wicket opened), `/run` (a directory of the
   keeper's, the wicket's group's: its API and vsock sockets) and, for a per-connection route,
-  `/snapshot`: the template's to write, made read-only (root's) before the first clone
+  `/snapshot`: the template's to write, made read-only (root's) before the first clone; on
+  aarch64 `/sys/devices/system/cpu/cpu0`, the host CPU's cache and `MIDR_EL1` files
+  Firecracker reads, copied by the keeper at its start (the jailer copies them into every
+  jail)
 - runs its route's copy of `firecracker` (a sealed memfd): the jailer copies the binary into
   every jail so that VMs share none of its pages; the clones of a route share their
   snapshot's pages anyway, so they share their route's copy, and routes share nothing
@@ -360,9 +373,10 @@ default `--jail-cgroup`), `TimeoutStopSec=` above `--drain-grace`.
 
 `Dockerfile` (built from the repository root:
 `docker build -f sluice-wicket-runtime-firecracker/Dockerfile --build-arg GIT_COMMIT=$(git rev-parse HEAD) .`;
-published as `ghcr.io/making/sluice/sluice-wicket-runtime-firecracker`, amd64 only) holds the wicket,
-Firecracker v1.17.0 and the 6.18.56 kernel above (both checksum verified), the guest of the
-wicket's own version and the sample rootfs, under `/usr/local/share/sluice-wicket-runtime-firecracker/`.
+published as `ghcr.io/making/sluice/sluice-wicket-runtime-firecracker`, amd64 and arm64) holds the
+wicket, Firecracker v1.17.0 and the 6.18.56 kernel above (both of its arch, checksum
+verified), the guest of the wicket's own version and the sample rootfs, under
+`/usr/local/share/sluice-wicket-runtime-firecracker/`.
 The host needs KVM (bare metal, or a VM with nested virtualization); the container needs
 `/dev/kvm` and its group alone (no `--privileged`, no capability: vsock only), and runs under
 Docker's default seccomp profile, Firecracker's own filters stacked on it:
@@ -441,6 +455,19 @@ Kubernetes: `/dev/kvm` reaches a Pod through a device plugin (KubeVirt's
 `capabilities.add: [SYS_ADMIN]`, `seccompProfile` and `appArmorProfile` `Unconfined` (or a
 privileged container).
 
+## aarch64
+
+The wicket, its guest and its image build for aarch64 as for x86_64. What differs on an
+aarch64 host:
+
+- **the clones' clock**: Firecracker restores none (see [Clones](#clones)); the restore
+  notice carries the host's time and `/init` sets the clock to it. The VMs boot without
+  x86_64's `pci=off` and `clocksource=kvm-clock`
+- **jail mode**: a jail holds the keeper's copy of the host CPU's cache and `MIDR_EL1`
+  files (see [Jail mode](#jail-mode))
+- **VMGenID and vsock** are as on x86_64 (Firecracker gives an aarch64 VM its VMGenID
+  through the device tree)
+
 ## Tests
 
 ```text
@@ -470,10 +497,12 @@ sg kvm -c "SLUICE_WICKET_RUNTIME_FIRECRACKER_VMS='java.local=$T/upstream.ext4?me
 started as root (`sudo -n`; skipped without it) or, with `..._IMAGE`, as the image runs it
 jailed, and checks the jails of the VMs alive: an id of its own each, PID 1 of its
 namespace, no capability, no new privileges, the seccomp filter on, a cgroup limiting its
-memory, the wicket as `--jail-user`; the keeper killed (SIGKILL), the VMs and the wicket end.
+memory, on aarch64 the host CPU's files, the wicket as `--jail-user`; the keeper killed (SIGKILL), the VMs and the wicket end.
 
-The CI runs it on a runner exposing `/dev/kvm`, with the Firecracker release and the kernel
-above pinned, and again jailed, on the runner and in the image.
+The CI runs it on an x86_64 and an aarch64 runner, where the runner exposes `/dev/kvm`,
+with the Firecracker release and the kernel above pinned, and again jailed, on the runner
+and in the image; a runner without `/dev/kvm` still builds both arches' guests and its
+arch's image.
 
 ## Findings
 
@@ -585,6 +614,20 @@ Measured on a 64-core x86_64 host, through a sluice server on the same host, wit
   `mount`, `umount2` pass), and its AppArmor profile mounts: jail mode runs unconfined in a
   container.
 
+[aarch64](#aarch64) had no machine of its own: the VM test ran on an emulated one -- QEMU
+8.2 TCG (`-M virt,virtualization=on,gic-version=3 -cpu max,pauth-impdef=on`), Ubuntu 24.04
+arm64, whose KVM ran Firecracker v1.17.0 and the 6.18.56 kernel -- with the wicket's boot and
+restore timeouts raised to its pace (a guest boots in about 6s), and passed plain and jailed:
+the clones' clock and random state, the half-close framing, the output, the reloads, the
+jails. Its timings say nothing of a real host.
+
+- **A clone's clock is its snapshot's without the notice's time**: 46.6s behind there (the
+  snapshot taken at startup), within the test's second with it.
+- **Firecracker boots without the host CPU's files** (v1.17.0, a warning: `Could not read
+  ... for cache level 1`): the guest then lacks the host's cache topology (its device
+  tree's cache nodes, `CLIDR_EL1`), and a restore its CPU manufacturer check (`MIDR_EL1`,
+  a warning on a mismatch). The jail's copy keeps a jailed VM's CPU an unjailed one's.
+
 Caveats:
 
 - `/dev/kvm` ACLs set by hand do not last: udev rewrote one within minutes. Use the
@@ -594,5 +637,4 @@ Caveats:
 
 ## Not yet
 
-aarch64 (a `.todo` item of its own), clone reuse and pools of shared VMs (`.todo` 181), CPU
-limits per VM, and the wasm wicket's console.
+Clone reuse and pools of shared VMs, CPU limits per VM, and the wasm wicket's console.

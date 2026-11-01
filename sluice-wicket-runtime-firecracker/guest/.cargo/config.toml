@@ -1,0 +1,3 @@
+# rust-lld links the aarch64 guest on any host (musl is self-contained): no cross linker
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

@@ -50,6 +50,11 @@ const GUEST_CID: u32 = 3;
 /// How long the `firecracker` process may take to open its API socket.
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Whether a restore advances the guest's clock by the time since its snapshot
+/// (`clock_realtime`, kvmclock: x86_64 alone); elsewhere the clone resumes at its
+/// snapshot's time, and the restore notice carries the host's (`wire::Notice`).
+pub const RESTORE_ADVANCES_CLOCK: bool = cfg!(target_arch = "x86_64");
+
 /// The first argument of the wicket's launcher mode, see [`launch`].
 pub const LAUNCH: &str = "--launch-vm";
 
@@ -466,8 +471,8 @@ impl Vm {
                 "mem_backend": { "backend_type": "File", "backend_path": snapshot.memory },
                 "vsock_override": { "uds_path": vm.vsock_inside },
                 // the clock advanced by the time since the snapshot, not resumed
-                // from it (x86_64)
-                "clock_realtime": true,
+                // from it (x86_64; elsewhere the restore notice sets it)
+                "clock_realtime": RESTORE_ADVANCES_CLOCK,
                 "resume_vm": true,
             }),
         )
@@ -624,6 +629,11 @@ fn boot_args() -> String {
         Some(_) => "console=ttyS0",
         None => "console=none 8250.nr_uarts=0",
     };
-    // kvm-clock: the clock a restore advances (`clock_realtime`), the TSC it does not
-    format!("{console} reboot=k panic=1 pci=off quiet clocksource=kvm-clock init=/init")
+    // x86_64's (arm64 knows neither): no PCI bus probed; kvm-clock, the clock a restore
+    // advances (`clock_realtime`), the TSC it does not
+    let arch = match cfg!(target_arch = "x86_64") {
+        true => " pci=off clocksource=kvm-clock",
+        false => "",
+    };
+    format!("{console} reboot=k panic=1 quiet{arch} init=/init")
 }

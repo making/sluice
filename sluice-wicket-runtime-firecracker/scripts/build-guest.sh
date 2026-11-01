@@ -3,6 +3,7 @@
 # Usage: scripts/build-guest.sh [out.ext4]   (default target/guest.ext4)
 # SLUICE_GUEST=<path> takes a guest built already (the image's /usr/local/share/
 # sluice-wicket-runtime-firecracker/init: the wicket's own version) instead of building guest/.
+# SLUICE_GUEST_ARCH=x86_64|aarch64 builds the guest for VMs of that arch (default: the host's).
 # No root needed: mkfs.ext4 -d populates the image from a directory.
 set -euo pipefail
 # before the cd: a path relative to the caller's directory
@@ -10,8 +11,7 @@ guest=${SLUICE_GUEST:+$(realpath "$SLUICE_GUEST")}
 cd "$(dirname "$0")/.."
 out=${1:-target/guest.ext4}
 if [ -z "$guest" ]; then
-  (cd guest && cargo build --release --target x86_64-unknown-linux-musl)
-  guest=guest/target/x86_64-unknown-linux-musl/release/sluice-wicket-runtime-firecracker-guest
+  guest=$(scripts/guest.sh)
 fi
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT

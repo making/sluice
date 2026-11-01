@@ -67,6 +67,10 @@ const THREADS: u64 = 16;
 /// `RLIMIT_NOFILE` of a VM at most, whatever the wicket asks.
 const MAX_OPEN_FILES: u64 = 1 << 20;
 
+/// The copy of the host CPU's files the jails hold (`jail::JAIL_HOST_CPU`), in the
+/// keeper's directory.
+const HOST_CPU_COPY: &str = "cpu0";
+
 /// How long a VM's spawn may wait for an id to be freed (the reap of a VM killed).
 const ID_WAIT_MS: i32 = 5000;
 
@@ -449,6 +453,9 @@ impl Keeper {
                  template's whole memory) is written to disk",
                 dir.display()
             );
+        }
+        if jail::JAIL_HOST_CPU {
+            jail::copy_host_cpu(Path::new(jail::HOST_CPU), &dir.join(HOST_CPU_COPY))?;
         }
         let template = Template::build(&dir)?;
         let null = std::fs::File::open("/dev/null")?.into();
@@ -966,6 +973,7 @@ impl Keeper {
             kernel: request.role != Role::Clone,
             run: &run_in_dir,
             snapshot,
+            host_cpu: jail::JAIL_HOST_CPU.then_some(Path::new(HOST_CPU_COPY)),
             null: self.null.as_fd(),
             log: log.as_fd(),
             keeper: self.pidfd.as_fd(),

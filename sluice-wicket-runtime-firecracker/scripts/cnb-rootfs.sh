@@ -6,20 +6,29 @@
 # SLUICE_RESTORE='["<program>", "<arg>", ...]' sets the restore hook, which /init runs in
 # each clone as the image's user before the clone serves (SLUICE_RESTORE_GENERATION set).
 # SLUICE_GUEST=<path> takes a guest built already (as scripts/build-guest.sh does).
+# SLUICE_GUEST_ARCH=x86_64|aarch64: the VMs' arch, default the host's; the image's platform
+# is the arch's (linux/amd64, linux/arm64), and so must SLUICE_GUEST's be.
 # Needs docker and sudo (the files keep the image's owners).
 set -euo pipefail
 # before the cd: a path relative to the caller's directory
 guest=${SLUICE_GUEST:+$(realpath "$SLUICE_GUEST")}
 cd "$(dirname "$0")/.."
 image=$1 out=$2 port=${3:-8080}
+arch=${SLUICE_GUEST_ARCH:-$(uname -m)}
+case "$arch" in
+  x86_64) platform=amd64 ;;
+  aarch64) platform=arm64 ;;
+  *) echo "SLUICE_GUEST_ARCH: x86_64 or aarch64, not $arch" >&2; exit 1 ;;
+esac
 if [ -z "$guest" ]; then
-  (cd guest && cargo build --release --target x86_64-unknown-linux-musl)
-  guest=guest/target/x86_64-unknown-linux-musl/release/sluice-wicket-runtime-firecracker-guest
+  guest=$(scripts/guest.sh)
 fi
 work=$(mktemp -d)
 trap 'sudo rm -rf "$work"; [ -n "${cid:-}" ] && docker rm -f "$cid" >/dev/null' EXIT
-cid=$(docker create "$image")
-docker inspect --format '{{json .Config}}' "$image" > "$work/config.json"
+# an image of another platform fails here; the container's config is its image's (of a
+# multi-platform image, the platform's)
+cid=$(docker create --platform "linux/$platform" "$image")
+docker inspect --format '{{json .Config}}' "$cid" > "$work/config.json"
 mkdir "$work/root"
 docker export "$cid" | sudo tar -xpf - -C "$work/root"
 sudo install -m 0755 "$guest" "$work/root/init"
