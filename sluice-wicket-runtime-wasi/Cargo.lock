@@ -2298,25 +2298,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sluice-wicket-tunnel"
-version = "0.0.1-SNAPSHOT"
-dependencies = [
- "bytes",
- "futures-util",
- "h2",
- "http",
- "prost",
- "rustls",
- "tokio",
- "tokio-util",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "uuid",
-]
-
-[[package]]
-name = "sluice-wicket-wasi"
+name = "sluice-wicket-runtime-wasi"
 version = "0.0.1-SNAPSHOT"
 dependencies = [
  "async-trait",
@@ -2354,6 +2336,24 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
+]
+
+[[package]]
+name = "sluice-wicket-tunnel"
+version = "0.0.1-SNAPSHOT"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "h2",
+ "http",
+ "prost",
+ "rustls",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "uuid",
 ]
 
 [[package]]

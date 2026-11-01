@@ -4,7 +4,7 @@ version = "0.0.1-SNAPSHOT"
 edition = "2024"
 publish = false
 
-# The tunnel client of sluice-wicket-wasi and sluice-wicket-firecracker (both their own
+# The tunnel client of sluice-wicket-runtime-wasi and sluice-wicket-firecracker (both their own
 # workspaces), so it is one too.
 [workspace]
 

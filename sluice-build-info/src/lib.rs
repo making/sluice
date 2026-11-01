@@ -1,4 +1,4 @@
-//! The build identification of sluice-flume and sluice-wicket-wasi, computed by
+//! The build identification of sluice-flume and sluice-wicket-runtime-wasi, computed by
 //! their build scripts ([`embed`]). Nothing here may fail the build: without git
 //! (or outside a work tree) the commit is empty and the tree counts as clean.
 

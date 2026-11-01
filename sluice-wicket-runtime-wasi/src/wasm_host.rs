@@ -2853,7 +2853,7 @@ pub(crate) mod tests {
 
     /// Reference latencies for the instantiation paths, backing the decision
     /// recorded on `Loaded`. Run with:
-    /// `cargo test -p sluice-wicket-wasi --bin sluice-wicket-wasi instantiation_latency -- --ignored --nocapture`
+    /// `cargo test -p sluice-wicket-runtime-wasi --bin sluice-wicket-runtime-wasi instantiation_latency -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "reference numbers; run manually with --nocapture"]
     async fn instantiation_latency_reference() {
@@ -2917,7 +2917,7 @@ pub(crate) mod tests {
     /// Reference latency for the cold vs pooled request path, backing the
     /// numbers recorded on `Pool`. End-to-end over the in-process tunnel on
     /// the hello guest, sequential requests. Run with:
-    /// `cargo test -p sluice-wicket-wasi --bin sluice-wicket-wasi load_comparison -- --ignored --nocapture`
+    /// `cargo test -p sluice-wicket-runtime-wasi --bin sluice-wicket-runtime-wasi load_comparison -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "reference numbers; run manually with --nocapture"]
     async fn load_comparison_reference() {

@@ -4,7 +4,7 @@ version = "0.0.1-SNAPSHOT"
 edition = "2024"
 publish = false
 
-# Its own workspace: built apart from sluice-wicket-wasi (no wasmtime in its tree).
+# Its own workspace: built apart from sluice-wicket-runtime-wasi (no wasmtime in its tree).
 [workspace]
 
 [dependencies]

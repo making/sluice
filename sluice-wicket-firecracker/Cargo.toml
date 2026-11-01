@@ -4,7 +4,7 @@ version = "0.0.1-SNAPSHOT"
 edition = "2024"
 publish = false
 
-# Its own workspace, as sluice-wicket-wasi; the guest (guest/) is another one (musl target)
+# Its own workspace, as sluice-wicket-runtime-wasi; the guest (guest/) is another one (musl target)
 [workspace]
 exclude = ["guest"]
 

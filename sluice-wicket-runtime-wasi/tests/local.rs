@@ -56,12 +56,12 @@ impl Wicket {
     /// Starts one with `args` besides `--listen`; [`Wicket::address`] waits
     /// until it listens.
     fn start(args: &[&str]) -> Wicket {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-wasi"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-runtime-wasi"))
             .args(["--listen", "127.0.0.1:0", "--watch-interval", "0"])
             .args(args)
             .stdout(Stdio::piped())
             .spawn()
-            .expect("run sluice-wicket-wasi");
+            .expect("run sluice-wicket-runtime-wasi");
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let (lines, received) = mpsc::channel();
         std::thread::spawn(move || {

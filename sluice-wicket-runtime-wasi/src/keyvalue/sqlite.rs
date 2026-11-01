@@ -101,7 +101,7 @@ impl Sqlite {
             .map_err(failed)?;
         if format > FORMAT {
             return Err(format!(
-                "{}: format {format} of a newer sluice-wicket-wasi (this one reads {FORMAT})",
+                "{}: format {format} of a newer sluice-wicket-runtime-wasi (this one reads {FORMAT})",
                 path.display()
             ));
         }

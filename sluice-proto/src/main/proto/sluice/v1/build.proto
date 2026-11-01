@@ -8,7 +8,7 @@ option java_package = "am.ik.sluice.v1.proto";
 // Which build a peer runs. Each string may be empty when the peer could not tell
 // (e.g. no build metadata was packaged).
 message PeerBuild {
-  // Implementation: "sluice-client", "sluice-wicket-wasi", "sluice-server" or
+  // Implementation: "sluice-client", "sluice-wicket-runtime-wasi", "sluice-server" or
   // "sluice-flume".
   string implementation = 1;
   // Release version, e.g. "0.0.1-SNAPSHOT".

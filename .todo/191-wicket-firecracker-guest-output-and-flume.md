@@ -6,7 +6,7 @@ A guest process's stdout / stderr reach only the VM's serial console, which is o
 (it is the slowest part of a boot) and, with `SLUICE_FIRECRACKER_CONSOLE=1`, lands in each
 VM's `firecracker.log` under the state dir: inside the image's tmpfs (no `docker logs`), named
 `route-<n>` by start order, and gone with the VM, so a per-connection clone's output (and its
-template's before the snapshot) is lost. sluice-wicket-wasi prefixes its guests' lines onto
+template's before the snapshot) is lost. sluice-wicket-runtime-wasi prefixes its guests' lines onto
 its own stdout / stderr and feeds them to a sluice-flume (`--flume`, `src/flume.rs`, README
 "Live access log"), which the consoles and the cf-api (`cf logs`) watch.
 

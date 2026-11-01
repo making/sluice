@@ -4,7 +4,7 @@ version = "0.0.1-SNAPSHOT"
 edition = "2024"
 publish = false
 
-# Its own workspace, laid out as sluice-flume: built apart from sluice-wicket-wasi (no
+# Its own workspace, laid out as sluice-flume: built apart from sluice-wicket-runtime-wasi (no
 # wasmtime in its tree: whether a component loads is the wicket's call).
 [workspace]
 

@@ -11,9 +11,9 @@ work=$repo/sluice-wicket-cf-api/target/demo
 run=$work/run
 
 flume=$repo/sluice-flume/target/release/sluice-flume
-wicket=$repo/sluice-wicket-wasi/target/release/sluice-wicket-wasi
+wicket=$repo/sluice-wicket-runtime-wasi/target/release/sluice-wicket-runtime-wasi
 cf_api=$repo/sluice-wicket-cf-api/target/release/sluice-wicket-cf-api
-guests=$repo/sluice-wicket-wasi/examples/target/wasm32-wasip3/release
+guests=$repo/sluice-wicket-runtime-wasi/examples/target/wasm32-wasip3/release
 for file in "$flume" "$wicket" "$cf_api" "$guests/hello.wasm" "$guests/counter.wasm"; do
 	if [ ! -f "$file" ]; then
 		echo "$file is missing: build it (cargo build --release), or run record.sh" >&2

@@ -804,7 +804,7 @@ fn check_component(component: &str) -> Result<String, String> {
 /// never expanded. The apps' section only with apps.
 fn write(routes: &[Route], apps: &[App]) -> String {
     let mut yaml = String::from(
-        "# The routes and apps the console of sluice-wicket-wasi (--console) deployed, written \
+        "# The routes and apps the console of sluice-wicket-runtime-wasi (--console) deployed, written \
          by it:\n# read at its startup, overwritten by its next change.\n",
     );
     if routes.is_empty() {

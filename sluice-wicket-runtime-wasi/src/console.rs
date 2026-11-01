@@ -312,7 +312,7 @@ impl Console {
                     response.headers_mut().insert(
                         header::WWW_AUTHENTICATE,
                         HeaderValue::from_static(
-                            "Basic realm=\"sluice-wicket-wasi console\", charset=\"UTF-8\"",
+                            "Basic realm=\"sluice-wicket-runtime-wasi console\", charset=\"UTF-8\"",
                         ),
                     );
                 }

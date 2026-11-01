@@ -34,7 +34,7 @@ const TOKEN: &str = "s3cret";
 const FLUME_TOKEN: &str = "f1ume";
 
 fn wicket_crate() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../sluice-wicket-wasi")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../sluice-wicket-runtime-wasi")
 }
 
 /// Runs cargo in `dir` (through the rustup proxy, the toolchain the
@@ -56,9 +56,9 @@ fn cargo(dir: &Path, args: &[&str]) {
     );
 }
 
-/// The wicket: `SLUICE_WICKET_WASI`, else built from the crate next door.
+/// The wicket: `SLUICE_WICKET_RUNTIME_WASI`, else built from the crate next door.
 fn wicket_binary() -> PathBuf {
-    if let Ok(given) = std::env::var("SLUICE_WICKET_WASI") {
+    if let Ok(given) = std::env::var("SLUICE_WICKET_RUNTIME_WASI") {
         return PathBuf::from(given);
     }
     let dir = wicket_crate();
@@ -66,7 +66,7 @@ fn wicket_binary() -> PathBuf {
     std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| dir.join("target"))
-        .join("debug/sluice-wicket-wasi")
+        .join("debug/sluice-wicket-runtime-wasi")
 }
 
 /// The flume: `SLUICE_FLUME`, else built from the crate next door.

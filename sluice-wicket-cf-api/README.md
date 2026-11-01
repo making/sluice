@@ -1,9 +1,9 @@
 # sluice-wicket-cf-api
 
-A Cloud Foundry API facade for one [sluice-wicket-wasi](../sluice-wicket-wasi/README.md): the
+A Cloud Foundry API facade for one [sluice-wicket-runtime-wasi](../sluice-wicket-runtime-wasi/README.md): the
 subset of the Cloud Controller v3 API, the UAA token endpoints and log-cache's read API the
 stock `cf` CLI uses, on one origin. It keeps the desired state of its apps and has the wicket
-serve them through the wicket's [app API](../sluice-wicket-wasi/README.md#apps), so a wasm
+serve them through the wicket's [app API](../sluice-wicket-runtime-wasi/README.md#apps), so a wasm
 component is deployed with `cf push` (its bits, or an image in an OCI registry:
 `--docker-image`), and routes, scaling, rolling updates, stop and start,
 services (the wicket's keyvalue stores and capabilities) and `cf logs` work as the CLI expects.
@@ -11,7 +11,7 @@ Users log in through an OpenID Provider (`cf login --sso`; see [Login](#login)),
 loopback, with any credentials.
 
 ```text
-cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> sluice-wicket-wasi <--tunnel-- sluice server
+cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> sluice-wicket-runtime-wasi <--tunnel-- sluice server
                                              ^                                  |
                                              +--Watch-- sluice-flume <--Feed----+  (cf logs, optional)
 ```
@@ -34,7 +34,7 @@ cargo build --release                                # needs protoc, and git (th
 sluice-flume --token FLUME_SECRET                     # grpc://0.0.0.0:8002
 
 # the wicket, serving on 8080 with its console on 9090 (see its README)
-sluice-wicket-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090 --console-token SECRET \
+sluice-wicket-runtime-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090 --console-token SECRET \
   --flume grpc://127.0.0.1:8002 --flume-token FLUME_SECRET
 
 # the cf-api, on http://127.0.0.1:9091
@@ -45,7 +45,7 @@ cf login -a http://127.0.0.1:9091 -u me -p x   # any credentials: no --oidc-issu
 cf push hello -p hello/                        # hello/ holds hello.wasm (a wasi:http 0.3 component)
 curl http://hello.localhost:8080/              # the wicket's --listen; *.localhost is the loopback
 # an image (see Mapping): the wicket's hello example, as its CI publishes it
-cf push img --docker-image ghcr.io/making/sluice/sluice-wicket-wasi/examples/hello
+cf push img --docker-image ghcr.io/making/sluice/sluice-wicket-runtime-wasi/examples/hello
 cf map-route hello localhost --hostname hi
 cf scale hello -i 2
 cf push hello -p hello/ --strategy rolling     # swapped in place
@@ -129,7 +129,7 @@ services:
       - ./dex.yaml:/etc/dex/dex.yaml:ro
     restart: unless-stopped
   wicket:
-    image: ghcr.io/making/sluice/sluice-wicket-wasi
+    image: ghcr.io/making/sluice/sluice-wicket-runtime-wasi
     pull_policy: always
     command: [--config, /etc/sluice/wicket.yaml]
     environment:                    # what wicket.yaml's ${...} take
@@ -393,8 +393,8 @@ share one. No roles: whoever may log in may do everything.
 
 The integration test (`tests/cli.rs`) runs the OSS CLI -- `SLUICE_CF_CLI`, else `cf8` on the
 PATH, never a `cf` that may be the Tanzu one -- against the cf-api and a wicket in local mode
-on a flume, building the wicket and its example guests from `../sluice-wicket-wasi` and the
-flume from `../sluice-flume` (or taking `SLUICE_WICKET_WASI`, `SLUICE_WICKET_GUESTS` and
+on a flume, building the wicket and its example guests from `../sluice-wicket-runtime-wasi` and the
+flume from `../sluice-flume` (or taking `SLUICE_WICKET_RUNTIME_WASI`, `SLUICE_WICKET_GUESTS` and
 `SLUICE_FLUME`); the login through a provider runs against a mock of one in the test, with TLS
 of the cf-api's own, and the images against a registry in the test (`tests/registry`):
 

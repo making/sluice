@@ -26,8 +26,8 @@ esac
 cli=$(cd "$(dirname "$cli")" && pwd)/$(basename "$cli")
 
 (cd "$repo/sluice-flume" && cargo build --release --locked)
-(cd "$repo/sluice-wicket-wasi" && cargo build --release --locked)
-(cd "$repo/sluice-wicket-wasi/examples" && cargo build --release --locked -p hello -p counter)
+(cd "$repo/sluice-wicket-runtime-wasi" && cargo build --release --locked)
+(cd "$repo/sluice-wicket-runtime-wasi/examples" && cargo build --release --locked -p hello -p counter)
 (cd "$repo/sluice-wicket-cf-api" && cargo build --release --locked)
 
 "$here/stop.sh" --reset

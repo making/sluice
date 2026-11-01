@@ -1,4 +1,4 @@
-# sluice-wicket-wasi
+# sluice-wicket-runtime-wasi
 
 > **Experimental / proof of concept.** The API, layout, and behavior are
 > unstable and may change or disappear; the limitations listed at the bottom
@@ -11,14 +11,14 @@ the tunnel and hands every request to a **wasi:http 0.3 component**
 from `sluice-proto` — a single source of truth with the Java modules.
 
 ```
-sluice server --tunnel--> sluice-wicket-wasi --hyper(h1/h2c)--> wasi:http handler component
+sluice server --tunnel--> sluice-wicket-runtime-wasi --hyper(h1/h2c)--> wasi:http handler component
 ```
 
 ## Layout
 
 Two Cargo workspaces:
 
-- `.` — `sluice-wicket-wasi`, the tunnel-side wasm host (wasmtime + hyper), laid out as
+- `.` — `sluice-wicket-runtime-wasi`, the tunnel-side wasm host (wasmtime + hyper), laid out as
   `sluice-flume`: `src/lib.rs` wires the modules, `src/main.rs` reads the command line.
   The tunnel client (node streams, flow control, the drain) is `../sluice-wicket-tunnel`, shared
   with `sluice-wicket-firecracker`
@@ -27,7 +27,7 @@ Two Cargo workspaces:
   (wasm32-wasip3 ships rust-std on nightly only; rustup installs it on the
   first build). Each example's README says what it demonstrates and which
   capabilities its route needs. The CI publishes them with the image, as wasm OCI artifacts
-  (`wkg oci push`): `ghcr.io/making/sluice/sluice-wicket-wasi/examples/<example>`
+  (`wkg oci push`): `ghcr.io/making/sluice/sluice-wicket-runtime-wasi/examples/<example>`
   (`latest` / `<sha>`)
 - `wit/` — vendored wasi 0.3 (from wasmtime v50) and `wasi:keyvalue@0.2.0-draft2`
   (`deps/keyvalue`, WebAssembly/wasi-keyvalue main `aa972c8`); each example declares its
@@ -39,15 +39,15 @@ Two Cargo workspaces:
 cargo build
 (cd examples && cargo build --release)   # -> examples/target/wasm32-wasip3/release/<example>.wasm
 # or the published ones (see Layout)
-wkg oci pull ghcr.io/making/sluice/sluice-wicket-wasi/examples/hello -o hello.wasm
+wkg oci pull ghcr.io/making/sluice/sluice-wicket-runtime-wasi/examples/hello -o hello.wasm
 
 # sluice server as in the root README, then:
-target/debug/sluice-wicket-wasi --server grpc://127.0.0.1:8001 --token SECRET \
+target/debug/sluice-wicket-runtime-wasi --server grpc://127.0.0.1:8001 --token SECRET \
     --wasm demo.local=examples/target/wasm32-wasip3/release/hello.wasm
 # or with the routes in a file, reloaded on change (see Configuration file)
-target/debug/sluice-wicket-wasi --config wicket-wasi.yaml
+target/debug/sluice-wicket-runtime-wasi --config wicket-runtime-wasi.yaml
 # or deploying them from a page, by dropping the .wasm files on it (see Console)
-target/debug/sluice-wicket-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090
+target/debug/sluice-wicket-runtime-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090
 ```
 
 `cargo test` builds the examples the same way (through the
@@ -62,7 +62,7 @@ same handlers, sandbox, pools, budgets and reloads -- and without `--server` it 
 wicket does: a local loop like `wasmtime serve`, with no sluice server.
 
 ```text
-target/debug/sluice-wicket-wasi --listen 127.0.0.1:8080 \
+target/debug/sluice-wicket-runtime-wasi --listen 127.0.0.1:8080 \
     --wasm 'counter.local=examples/target/wasm32-wasip3/release/counter.wasm?wasi=keyvalue'
 curl 127.0.0.1:8080/
 ```
@@ -74,13 +74,13 @@ answered 404. Both `--server` and `--listen` serve the tunnel and the listener a
 beyond waits in the backlog). Without `--server` nothing drains: SIGTERM / SIGINT end the
 process at once.
 
-The image `ghcr.io/making/sluice/sluice-wicket-wasi` (`latest` / `<sha>`, amd64 /
+The image `ghcr.io/making/sluice/sluice-wicket-runtime-wasi` (`latest` / `<sha>`, amd64 /
 aarch64) is published on every push to `main` changing the wicket; it takes the same
 arguments, with the components mounted:
 
 ```text
 docker run --rm --pull always -v $PWD/examples/target/wasm32-wasip3/release:/wasm:ro \
-    ghcr.io/making/sluice/sluice-wicket-wasi \
+    ghcr.io/making/sluice/sluice-wicket-runtime-wasi \
     --server grpc://host.docker.internal:8001 --token SECRET --wasm demo.local=/wasm/hello.wasm
 ```
 
@@ -89,8 +89,8 @@ is created without a `--config` file (`/data/keyvalue.db`): mount a volume there
 (`-v wicket-data:/data`) to keep it, or the stores die with the container.
 
 `--help` lists the options. Each option but `--wasm` also reads
-`SLUICE_WICKET_WASI_<NAME>` from the environment (upper case, `-` as `_`, e.g.
-`SLUICE_WICKET_WASI_TOKEN`; `SLUICE_WICKET_WASI_INSECURE=true`), and takes its value as
+`SLUICE_WICKET_RUNTIME_WASI_<NAME>` from the environment (upper case, `-` as `_`, e.g.
+`SLUICE_WICKET_RUNTIME_WASI_TOKEN`; `SLUICE_WICKET_RUNTIME_WASI_INSECURE=true`), and takes its value as
 `--name value` or `--name=value`.
 A token on the command line is in `/proc/<pid>/cmdline`, which every user of the host
 reads: give the tunnel's in the environment, the config file or a file
@@ -108,8 +108,8 @@ hold a chain), the webPKI roots when omitted, or nothing at all with `--insecure
 (self-signed setups; the `sluice.insecure` equivalent):
 
 ```text
-target/debug/sluice-wicket-wasi --server grpcs://127.0.0.1:8001 --ca-cert ca.pem ...
-target/debug/sluice-wicket-wasi --server grpcs://127.0.0.1:8001 --insecure ...
+target/debug/sluice-wicket-runtime-wasi --server grpcs://127.0.0.1:8001 --ca-cert ca.pem ...
+target/debug/sluice-wicket-runtime-wasi --server grpcs://127.0.0.1:8001 --insecure ...
 ```
 
 `--client-id <id>` pins the client identity sent as `x-sluice-id` on every tunnel
@@ -185,7 +185,7 @@ reload error otherwise).
 ### Configuration file
 
 `--config <file>` reads the settings from a YAML file. Every flag has its key; a flag
-overrides the environment (`SLUICE_WICKET_WASI_<NAME>`), the environment the file, the
+overrides the environment (`SLUICE_WICKET_RUNTIME_WASI_<NAME>`), the environment the file, the
 file a default. Without `--config` the flags alone apply, as
 before. With it, `server` or `listen` is the one setting required: the routes may be empty
 at startup and added by a reload.
@@ -322,7 +322,7 @@ listed too, read-only, and so are the [apps](#apps) a controller deploys through
 served by one component in one sandbox.
 
 ```text
-target/debug/sluice-wicket-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090
+target/debug/sluice-wicket-runtime-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090
 # open http://127.0.0.1:9090/ and drop hello.wasm on it: served as hello.localhost
 curl http://hello.localhost:8080/   # *.localhost is the loopback, in browsers too
 ```
@@ -354,7 +354,7 @@ content is another target: the route is retargeted, and its old target drains as
 one does. Without `--console` the directory is not read: the console's routes are served with
 the console only. One wicket per directory.
 
-`--console-token <token>` (`console-token`, `SLUICE_WICKET_WASI_CONSOLE_TOKEN`) is asked of
+`--console-token <token>` (`console-token`, `SLUICE_WICKET_RUNTIME_WASI_CONSOLE_TOKEN`) is asked of
 every request: the browser prompts for it (HTTP Basic, any user name, the token as the
 password), an API client sends `Authorization: Bearer <token>`. Without one, and without a
 provider (below), the console must listen on a loopback address (a startup error otherwise),
@@ -396,14 +396,14 @@ keyvalue store kept in a volume):
 ```yaml
 services:
   wicket:
-    image: ghcr.io/making/sluice/sluice-wicket-wasi
+    image: ghcr.io/making/sluice/sluice-wicket-runtime-wasi
     pull_policy: always
     command: --listen 0.0.0.0:8080 --console 0.0.0.0:9090
     environment:
-      SLUICE_WICKET_WASI_CONSOLE_TOKEN: ${CONSOLE_TOKEN:?set CONSOLE_TOKEN}
+      SLUICE_WICKET_RUNTIME_WASI_CONSOLE_TOKEN: ${CONSOLE_TOKEN:?set CONSOLE_TOKEN}
       # through a sluice server too (see Run):
-      # SLUICE_WICKET_WASI_SERVER: grpc://host.docker.internal:8001
-      # SLUICE_WICKET_WASI_TOKEN: ${SLUICE_TOKEN:?set SLUICE_TOKEN}
+      # SLUICE_WICKET_RUNTIME_WASI_SERVER: grpc://host.docker.internal:8001
+      # SLUICE_WICKET_RUNTIME_WASI_TOKEN: ${SLUICE_TOKEN:?set SLUICE_TOKEN}
     ports:
     - "8080:8080"            # --listen, on the same port: the page links it
     - "127.0.0.1:9090:9090"  # the console, from this host only
@@ -594,7 +594,7 @@ sandbox: a changed map is a new target.
 
 The stores are process-wide (the `keyvalue` section; a change applies on a restart). Without
 the section there is one, `local`: a `sqlite` file `keyvalue.db` next to the config file, or
-in the working directory without one; `--keyvalue-file` (`SLUICE_WICKET_WASI_KEYVALUE_FILE`)
+in the working directory without one; `--keyvalue-file` (`SLUICE_WICKET_RUNTIME_WASI_KEYVALUE_FILE`)
 moves it. A store is opened when a route first maps to it: a wicket without a keyvalue
 route creates no file. A map naming an unknown store fails the startup or the reload.
 

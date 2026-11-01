@@ -7,7 +7,7 @@ outgoing http is linked for every route, as under `wasmtime serve` (the
 
 ```text
 cargo build --release -p fetch   # from examples/
-sluice-wicket-wasi ... --wasm fetch.local=examples/target/wasm32-wasip3/release/fetch.wasm
+sluice-wicket-runtime-wasi ... --wasm fetch.local=examples/target/wasm32-wasip3/release/fetch.wasm
 ```
 
 ```text

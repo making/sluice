@@ -1,16 +1,16 @@
 name: Rust
 # The Rust crates' own gates, apart from CI: a Java-only change runs none of them, and
 # each crate's job runs only when its paths changed. CI still builds sluice-flume for the
-# sluice-it tests. A run with the sluice-flume / sluice-wicket-wasi / sluice-wicket-cf-api /
+# sluice-it tests. A run with the sluice-flume / sluice-wicket-runtime-wasi / sluice-wicket-cf-api /
 # sluice-wicket-firecracker job passed deploys its image (deploy-flume.yaml /
-# deploy-wicket.yaml / deploy-cf-api.yaml / deploy-firecracker.yaml).
+# deploy-wicket-runtime-wasi.yaml / deploy-cf-api.yaml / deploy-firecracker.yaml).
 on:
   push:
     branches:
     - main
     paths: &rust-paths
     - 'sluice-flume/**'
-    - 'sluice-wicket-wasi/**'
+    - 'sluice-wicket-runtime-wasi/**'
     - 'sluice-wicket-cf-api/**'
     - 'sluice-wicket-firecracker/**'
     - 'sluice-build-info/**'
@@ -19,7 +19,7 @@ on:
     - 'sluice-proto/src/main/proto/**'
     - '.github/workflows/rust.yaml'
     - '.github/workflows/deploy-flume.yaml'
-    - '.github/workflows/deploy-wicket.yaml'
+    - '.github/workflows/deploy-wicket-runtime-wasi.yaml'
     - '.github/workflows/deploy-cf-api.yaml'
     - '.github/workflows/deploy-firecracker.yaml'
   pull_request:
@@ -70,17 +70,17 @@ jobs:
           - '.github/workflows/rust.yaml'
           - '.github/workflows/deploy-flume.yaml'
           wicket:
-          - 'sluice-wicket-wasi/**'
+          - 'sluice-wicket-runtime-wasi/**'
           - 'sluice-build-info/**'
           - 'sluice-wicket-oidc/**'
           - 'sluice-wicket-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
-          - '.github/workflows/deploy-wicket.yaml'
+          - '.github/workflows/deploy-wicket-runtime-wasi.yaml'
           # its integration test runs the wicket and the flume: their change is its change too
           cf-api:
           - 'sluice-wicket-cf-api/**'
-          - 'sluice-wicket-wasi/**'
+          - 'sluice-wicket-runtime-wasi/**'
           - 'sluice-flume/**'
           - 'sluice-build-info/**'
           - 'sluice-wicket-oidc/**'
@@ -204,14 +204,14 @@ jobs:
   # the rustup cargo proxy in examples/, pinned to a nightly with wasm32-wasip3
   # (examples/rust-toolchain.toml), and run redis-server (Debian's has TLS) for the redis
   # store. The build without it (--no-default-features) is linted, its tests are not run.
-  sluice-wicket-wasi:
+  sluice-wicket-runtime-wasi:
     needs: changes
     if: needs.changes.outputs.wicket == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
       run:
-        working-directory: sluice-wicket-wasi
+        working-directory: sluice-wicket-runtime-wasi
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -224,9 +224,9 @@ jobs:
           ~/.rustup/toolchains/1.*
           ~/.cargo/registry
           ~/.cargo/git
-          sluice-wicket-wasi/target
-          sluice-wicket-wasi/examples/target
-        key: cargo-wicket-${{ runner.os }}-${{ hashFiles('sluice-wicket-wasi/Cargo.lock', 'sluice-wicket-wasi/examples/Cargo.lock', 'sluice-wicket-wasi/rust-toolchain.toml', 'sluice-wicket-wasi/examples/rust-toolchain.toml') }}
+          sluice-wicket-runtime-wasi/target
+          sluice-wicket-runtime-wasi/examples/target
+        key: cargo-wicket-runtime-wasi-${{ runner.os }}-${{ hashFiles('sluice-wicket-runtime-wasi/Cargo.lock', 'sluice-wicket-runtime-wasi/examples/Cargo.lock', 'sluice-wicket-runtime-wasi/rust-toolchain.toml', 'sluice-wicket-runtime-wasi/examples/rust-toolchain.toml') }}
     - name: Toolchains
       run: |
         rustup toolchain install
@@ -271,15 +271,15 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           sluice-wicket-cf-api/target
-          sluice-wicket-wasi/target
-          sluice-wicket-wasi/examples/target
+          sluice-wicket-runtime-wasi/target
+          sluice-wicket-runtime-wasi/examples/target
           sluice-flume/target
-        key: cargo-cf-api-${{ runner.os }}-${{ hashFiles('sluice-wicket-cf-api/Cargo.lock', 'sluice-wicket-wasi/Cargo.lock', 'sluice-wicket-wasi/examples/Cargo.lock', 'sluice-flume/Cargo.lock', 'sluice-wicket-cf-api/rust-toolchain.toml', 'sluice-wicket-wasi/rust-toolchain.toml', 'sluice-wicket-wasi/examples/rust-toolchain.toml', 'sluice-flume/rust-toolchain.toml') }}
+        key: cargo-cf-api-${{ runner.os }}-${{ hashFiles('sluice-wicket-cf-api/Cargo.lock', 'sluice-wicket-runtime-wasi/Cargo.lock', 'sluice-wicket-runtime-wasi/examples/Cargo.lock', 'sluice-flume/Cargo.lock', 'sluice-wicket-cf-api/rust-toolchain.toml', 'sluice-wicket-runtime-wasi/rust-toolchain.toml', 'sluice-wicket-runtime-wasi/examples/rust-toolchain.toml', 'sluice-flume/rust-toolchain.toml') }}
     - name: Toolchains
       run: |
         rustup toolchain install
-        (cd ../sluice-wicket-wasi && rustup toolchain install)
-        (cd ../sluice-wicket-wasi/examples && rustup toolchain install)
+        (cd ../sluice-wicket-runtime-wasi && rustup toolchain install)
+        (cd ../sluice-wicket-runtime-wasi/examples && rustup toolchain install)
         (cd ../sluice-flume && rustup toolchain install)
     - name: Format
       run: cargo fmt --check

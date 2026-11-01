@@ -115,12 +115,12 @@ message Error {
 
 message Advertise {
   // Upstream services exposed by the client. Every advertise on a stream
-  // replaces the client's routes on the node (sluice-wicket-wasi re-advertises
+  // replaces the client's routes on the node (sluice-wicket-runtime-wasi re-advertises
   // on a route reload); one without upstreams removes them.
   repeated Upstream upstreams = 1;
   // Client's initial receive window per connection, in bytes; it may grant
   // more (WindowUpdate) and reclaim what was left unused. 0 (a client without
-  // per-connection flow control: sluice-client before 046cd21, sluice-wicket-wasi
+  // per-connection flow control: sluice-client before 046cd21, sluice-wicket-runtime-wasi
   // before f76388d) fails the tunnel stream with FAILED_PRECONDITION.
   uint32 connection_window = 2;
   // Build of the client; unset by clients that predate the field.

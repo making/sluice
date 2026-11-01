@@ -103,13 +103,13 @@ fn wicket(
     drain_grace: &str,
     component: &std::path::Path,
 ) -> (Wicket, mpsc::Receiver<String>) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-wasi"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-runtime-wasi"))
         .args(["--server", server, "--drain-grace", drain_grace])
         .args(["--watch-interval", "0", "--wasm"])
         .arg(format!("hello.local={}", component.display()))
         .stdout(Stdio::piped())
         .spawn()
-        .expect("run sluice-wicket-wasi");
+        .expect("run sluice-wicket-runtime-wasi");
     let stdout = BufReader::new(child.stdout.take().unwrap());
     let (lines, received) = mpsc::channel();
     std::thread::spawn(move || {

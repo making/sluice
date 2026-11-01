@@ -1,12 +1,12 @@
 //! sluice-wicket-firecracker: a tunnel client serving each route with
-//! Firecracker microVMs, as sluice-wicket-wasi serves each with a wasi:http
+//! Firecracker microVMs, as sluice-wicket-runtime-wasi serves each with a wasi:http
 //! component.
 //!
 //! ```text
 //! sluice server(s) --tunnel--> wicket --vsock (raw bytes per connection)--> guest in a microVM
 //! ```
 //!
-//! The tunnel client is `sluice-wicket-tunnel`'s, as sluice-wicket-wasi's: the
+//! The tunnel client is `sluice-wicket-tunnel`'s, as sluice-wicket-runtime-wasi's: the
 //! `--server` endpoint is asked for the node list, one tunnel stream per node
 //! advertises the routes and serves their connections, and SIGTERM / SIGINT
 //! drains the streams within `--drain-grace`.

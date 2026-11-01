@@ -68,7 +68,7 @@ pub fn info(base: &str, build: &str) -> Value {
         "build": build,
         "cli_version": {"minimum": "", "recommended": ""},
         "custom": {},
-        "description": "sluice-wicket-cf-api: deploys wasm components to a sluice-wicket-wasi with the cf CLI",
+        "description": "sluice-wicket-cf-api: deploys wasm components to a sluice-wicket-runtime-wasi with the cf CLI",
         "name": "sluice-wicket-cf-api",
         "version": 0,
         "osbapi_version": "2.15",
@@ -149,7 +149,7 @@ pub fn domain(base: &str, domain: &Named) -> Value {
 pub fn stack(base: &str) -> Value {
     json!({
         "guid": STACK, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
-        "name": STACK, "description": "WASI 0.3 components, served by sluice-wicket-wasi",
+        "name": STACK, "description": "WASI 0.3 components, served by sluice-wicket-runtime-wasi",
         "build_rootfs_image": STACK, "run_rootfs_image": STACK, "default": true,
         "metadata": metadata(None),
         "links": {"self": {"href": format!("{base}/v3/stacks/{STACK}")}},

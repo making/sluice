@@ -5,7 +5,7 @@ no capability.
 
 ```text
 cargo build --release -p hello   # from examples/
-sluice-wicket-wasi ... --wasm 'demo.local=examples/target/wasm32-wasip3/release/hello.wasm?budget-ms=3000&memory-mib=64'
+sluice-wicket-runtime-wasi ... --wasm 'demo.local=examples/target/wasm32-wasip3/release/hello.wasm?budget-ms=3000&memory-mib=64'
 ```
 
 | request | demonstrates |

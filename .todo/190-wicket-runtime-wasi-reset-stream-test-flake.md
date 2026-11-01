@@ -1,6 +1,6 @@
 Difficulty: Medium
 
-# sluice-wicket-wasi: a reset stream's share test failed once under load
+# sluice-wicket-runtime-wasi: a reset stream's share test failed once under load
 
 `wasm_host::tests::a_reset_stream_keeps_its_share_until_its_instance_is_gone` failed once in
 `cargo test` (2026-11-01, the failure message not kept) while a Maven build ran beside it,

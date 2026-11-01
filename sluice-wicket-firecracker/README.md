@@ -3,7 +3,7 @@
 > **Experimental.** The API, layout and behavior may change; what is not there yet is listed
 > under [Not yet](#not-yet).
 
-A tunnel client serving each route with **Firecracker microVMs**, as `sluice-wicket-wasi`
+A tunnel client serving each route with **Firecracker microVMs**, as `sluice-wicket-runtime-wasi`
 serves each with a wasi:http component:
 
 ```
@@ -137,7 +137,7 @@ otherwise), or it is on disk until the route ends, and after a crash. The tmpfs 
 every per-connection route's `mem` (systemd sizes `$XDG_RUNTIME_DIR` to 10% of the host's
 memory: `RuntimeDirectorySize` in `logind.conf`).
 
-The tunnel's settings are `sluice-wicket-wasi`'s: `--token` (or `--token-file`; on the
+The tunnel's settings are `sluice-wicket-runtime-wasi`'s: `--token` (or `--token-file`; on the
 command line every user of the host sees it), `--client-id`, `--ca-cert`,
 `--insecure` (`grpcs://`), `--max-connections` (256), `--tunnel-stall-timeout` (60s) and
 `--drain-grace` (20s: SIGTERM / SIGINT withdraw the routes and end the streams once their

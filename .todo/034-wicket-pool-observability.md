@@ -1,6 +1,6 @@
 Difficulty: Medium
 
-# sluice-wicket-wasi: make the instance pool observable
+# sluice-wicket-runtime-wasi: make the instance pool observable
 
 The pool counters (`units` / `idle` / `spawned` / `served` on `Pool` in
 `wasm_host.rs`) are read only in tests. In production an exhausted pool

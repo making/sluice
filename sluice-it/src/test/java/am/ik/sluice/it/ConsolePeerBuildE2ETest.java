@@ -142,7 +142,7 @@ class ConsolePeerBuildE2ETest {
 				Advertise.newBuilder()
 					.setConnectionWindow(VirtualConnection.DEFAULT_WINDOW)
 					.setBuild(PeerBuild.newBuilder()
-						.setImplementation("sluice-wicket-wasi")
+						.setImplementation("sluice-wicket-runtime-wasi")
 						.setVersion("0.0.1-SNAPSHOT")
 						.setCommit(WICKET_COMMIT)
 						.setBuildTime("2026-10-12T00:00:00Z")));
@@ -264,7 +264,7 @@ class ConsolePeerBuildE2ETest {
 	void wicketRowShowsItsBuild() {
 		Locator buildLine = row(WICKET_ID).getByTestId("build");
 		assertThat(buildLine.innerText())
-			.isEqualToNormalizingWhitespace("Build sluice-wicket-wasi 0.0.1-SNAPSHOT 0123456");
+			.isEqualToNormalizingWhitespace("Build sluice-wicket-runtime-wasi 0.0.1-SNAPSHOT 0123456");
 		assertThat(buildLine.locator(".mono").getAttribute("title"))
 			.isEqualTo("Commit " + WICKET_COMMIT + ", built 2026-10-12T00:00:00Z");
 	}
@@ -320,7 +320,7 @@ class ConsolePeerBuildE2ETest {
 				output.getAll().lines().filter(line -> line.contains(" runs ")).map(ConsolePeerBuildE2ETest::message))
 			.containsOnlyOnce(
 					"client " + WICKET_ID
-							+ " runs sluice-wicket-wasi 0.0.1-SNAPSHOT (0123456, built 2026-10-12T00:00:00Z)",
+							+ " runs sluice-wicket-runtime-wasi 0.0.1-SNAPSHOT (0123456, built 2026-10-12T00:00:00Z)",
 					"client " + UNKNOWN_ID + " runs " + PeerBuilds.UNKNOWN,
 					"client " + HOSTILE_ID + " runs <img src=x onerror=\"window.pwned=1\"> " + "9".repeat(64)
 							+ "... (abc?def, built <b>now</b>)");

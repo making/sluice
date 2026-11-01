@@ -1,6 +1,6 @@
 Difficulty: Medium
 
-# wicket-wasi console: what a move does with the route's keyvalue data
+# wicket-runtime-wasi console: what a move does with the route's keyvalue data
 
 A console route with `wasi=keyvalue` gets the default keyvalue map: the default store, the
 host as the namespace (`Deployed::specs` in `deployed.rs`, `Stores::default_map`). A move

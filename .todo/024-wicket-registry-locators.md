@@ -2,7 +2,7 @@ Difficulty: Medium
 
 # Component locators: oci / s3 resolvers and integrity
 
-`wicket-wasi/src/wasm_host.rs` `Locator` has `File` and `Http` variants; the `wasm:<url>`
+`wicket-runtime-wasi/src/wasm_host.rs` `Locator` has `File` and `Http` variants; the `wasm:<url>`
 address form was designed for more sources:
 
 - `oci://registry/repo:tag` (or `wasm:oci://...`) — pull a component artifact from an

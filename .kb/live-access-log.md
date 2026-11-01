@@ -83,7 +83,7 @@ view over with the note that the flume restarted.
 wicket ──Feed (as a node)──> sluice-flume <──Watch── sluice-wicket-cf-api <──log-cache read── cf logs
 ```
 
-A wicket (`sluice-wicket-wasi --flume URL --flume-token TOKEN`) feeds as a node does -- the
+A wicket (`sluice-wicket-runtime-wasi --flume URL --flume-token TOKEN`) feeds as a node does -- the
 same start and stop, ring of 512, queue of 4096 and gaps -- as the node
 `wicket:<client-id>`, with kinds of its own. A line's route key is the host of its request
 (`Host` / `:authority`, lowercase, without the port):

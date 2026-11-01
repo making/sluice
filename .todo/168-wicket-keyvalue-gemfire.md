@@ -1,9 +1,9 @@
 Difficulty: High
 
-# wicket-wasi: `gemfire` keyvalue store
+# wicket-runtime-wasi: `gemfire` keyvalue store
 
 The Tanzu GemFire store of the wicket's wasi:keyvalue (166: the `Backend` trait in
-`sluice-wicket-wasi/src/keyvalue.rs`, README "Key-value stores"). Do 167 (redis) first:
+`sluice-wicket-runtime-wasi/src/keyvalue.rs`, README "Key-value stores"). Do 167 (redis) first:
 it settles the networked-store questions (timeouts, connection loss, config shape).
 
 ## Design (from 166)

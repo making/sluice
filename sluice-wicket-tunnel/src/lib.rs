@@ -1,4 +1,4 @@
-//! sluice-wicket-tunnel: the tunnel client of the Rust wickets (`sluice-wicket-wasi`,
+//! sluice-wicket-tunnel: the tunnel client of the Rust wickets (`sluice-wicket-runtime-wasi`,
 //! `sluice-wicket-firecracker`), the `sluice.v1.Tunnel` gRPC API of the Java
 //! client (`TunnelClient` / `NodeConnection`).
 //!
@@ -109,7 +109,7 @@ pub async fn serve<T: Table>(
     Ok(())
 }
 
-/// One line naming a build, e.g. `sluice-wicket-wasi 0.0.1-SNAPSHOT
+/// One line naming a build, e.g. `sluice-wicket-runtime-wasi 0.0.1-SNAPSHOT
 /// (<commit>, dirty, built 2026-10-12T01:04:33Z)`; an empty field reads as
 /// unknown.
 pub fn describe(build: &PeerBuild) -> String {

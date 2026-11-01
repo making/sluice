@@ -4,7 +4,7 @@ version = "0.0.1-SNAPSHOT"
 edition = "2024"
 publish = false
 
-# The OpenID Provider client of sluice-wicket-wasi's console and sluice-wicket-cf-api (both
+# The OpenID Provider client of sluice-wicket-runtime-wasi's console and sluice-wicket-cf-api (both
 # their own workspaces), so it is one too.
 [workspace]
 

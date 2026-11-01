@@ -1,5 +1,5 @@
 //! The settings: the command line, the environment and the `--config` YAML
-//! file, merged -- an option `--name <value>` overrides `SLUICE_WICKET_WASI_<NAME>`
+//! file, merged -- an option `--name <value>` overrides `SLUICE_WICKET_RUNTIME_WASI_<NAME>`
 //! (upper case, `-` as `_`), which overrides the file, the file a default. The
 //! file's routes are read again by every reload (`routes::Reloader`); its other
 //! settings apply at startup only, and a reload reports the ones changed since.
@@ -21,9 +21,9 @@ use crate::routes::{Origin, Spec};
 use crate::wasm_host::{Caps, Instances, Limits, Locator, Sandbox};
 
 pub const USAGE: &str = "\
-usage: sluice-wicket-wasi --server <url> --wasm <host>=<locator>[?<options>] ... [options]
-       sluice-wicket-wasi --listen <host:port> --wasm <host>=<locator>[?<options>] ... [options]
-       sluice-wicket-wasi --config <file> [options]
+usage: sluice-wicket-runtime-wasi --server <url> --wasm <host>=<locator>[?<options>] ... [options]
+       sluice-wicket-runtime-wasi --listen <host:port> --wasm <host>=<locator>[?<options>] ... [options]
+       sluice-wicket-runtime-wasi --config <file> [options]
 
   --server <url>                  bootstrap endpoint, grpc://host:port or grpcs://host:port
   --listen <host:port>            also (or only, without --server) serve the routes over plain
@@ -76,8 +76,8 @@ usage: sluice-wicket-wasi --server <url> --wasm <host>=<locator>[?<options>] ...
   --watch-interval <secs>         poll the routes' files (default 1, 0 = SIGHUP only)
   --version                       print the build (version, commit, build time) and exit
 
-Each option but --wasm also reads SLUICE_WICKET_WASI_<NAME> from the environment, e.g.
-SLUICE_WICKET_WASI_TOKEN.";
+Each option but --wasm also reads SLUICE_WICKET_RUNTIME_WASI_<NAME> from the environment, e.g.
+SLUICE_WICKET_RUNTIME_WASI_TOKEN.";
 
 /// Default of `--max-instances`: 64 guest instances alive at once, i.e. at
 /// most 64 x the largest `memory-mib` of guest linear memory (16GiB at the
@@ -266,7 +266,7 @@ pub fn parse(
     let value = |name: &str| {
         given.get(name).cloned().or_else(|| {
             env(&format!(
-                "SLUICE_WICKET_WASI_{}",
+                "SLUICE_WICKET_RUNTIME_WASI_{}",
                 name.to_uppercase().replace('-', "_")
             ))
             .filter(|value| !value.is_empty())
@@ -290,7 +290,7 @@ pub fn parse(
         token_file: value("token-file").map(PathBuf::from),
         client_id: value("client-id"),
         insecure: insecure
-            || env("SLUICE_WICKET_WASI_INSECURE").is_some_and(|value| value == "true"),
+            || env("SLUICE_WICKET_RUNTIME_WASI_INSECURE").is_some_and(|value| value == "true"),
         ca_cert: value("ca-cert").map(PathBuf::from),
         max_connections: limit("max-connections", usize::MAX)?,
         max_instances: limit("max-instances", Instances::MAX)?,
@@ -311,7 +311,8 @@ pub fn parse(
         flume_token: value("flume-token"),
         flume_ca_cert: value("flume-ca-cert").map(PathBuf::from),
         flume_insecure: flume_insecure
-            || env("SLUICE_WICKET_WASI_FLUME_INSECURE").is_some_and(|value| value == "true"),
+            || env("SLUICE_WICKET_RUNTIME_WASI_FLUME_INSECURE")
+                .is_some_and(|value| value == "true"),
         routes,
     };
     merge(flags).map(|settings| Command::Run(Box::new(settings)))
@@ -1010,7 +1011,7 @@ fn stores(
     match (section, file) {
         (Some(section), None) => section.stores(dir),
         (Some(_), Some(_)) => Err("keyvalue: the section names the stores; --keyvalue-file \
-             (SLUICE_WICKET_WASI_KEYVALUE_FILE) applies only without one"
+             (SLUICE_WICKET_RUNTIME_WASI_KEYVALUE_FILE) applies only without one"
             .into()),
         (None, file) => Ok(Stores::new(
             BTreeMap::from([(
@@ -1552,10 +1553,10 @@ routes:
         );
 
         let env = |name: &str| match name {
-            "SLUICE_WICKET_WASI_MAX_CONNECTIONS" => Some("12".to_string()),
-            "SLUICE_WICKET_WASI_MAX_INSTANCES" => Some("32".to_string()),
-            "SLUICE_WICKET_WASI_TOKEN" => Some(String::new()),
-            "SLUICE_WICKET_WASI_FLUME_TOKEN" => Some("env-token".to_string()),
+            "SLUICE_WICKET_RUNTIME_WASI_MAX_CONNECTIONS" => Some("12".to_string()),
+            "SLUICE_WICKET_RUNTIME_WASI_MAX_INSTANCES" => Some("32".to_string()),
+            "SLUICE_WICKET_RUNTIME_WASI_TOKEN" => Some(String::new()),
+            "SLUICE_WICKET_RUNTIME_WASI_FLUME_TOKEN" => Some("env-token".to_string()),
             _ => None,
         };
         let flagged = settings_over(
@@ -1874,7 +1875,7 @@ routes:
         let moved = settings(&["--config", path.to_str().unwrap(), "--keyvalue-file", "y"]);
         assert!(
             matches!(&moved, Err(e) if e.ends_with("--keyvalue-file \
-                (SLUICE_WICKET_WASI_KEYVALUE_FILE) applies only without one")),
+                (SLUICE_WICKET_RUNTIME_WASI_KEYVALUE_FILE) applies only without one")),
             "{:?}",
             moved.err()
         );

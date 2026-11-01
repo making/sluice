@@ -6,7 +6,7 @@ of the route's map than the default `""`.
 
 ```text
 cargo build --release -p counter   # from examples/
-sluice-wicket-wasi --listen 127.0.0.1:8080 \
+sluice-wicket-runtime-wasi --listen 127.0.0.1:8080 \
     --wasm 'counter.local=examples/target/wasm32-wasip3/release/counter.wasm?wasi=keyvalue'
 ```
 

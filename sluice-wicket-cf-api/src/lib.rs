@@ -8,7 +8,7 @@
 //! from the live access log the wicket feeds (`flume`).
 //!
 //! ```text
-//! cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> sluice-wicket-wasi
+//! cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> sluice-wicket-runtime-wasi
 //!                                                  ^                              |
 //!                                                  +--Watch-- sluice-flume <--Feed+
 //! ```

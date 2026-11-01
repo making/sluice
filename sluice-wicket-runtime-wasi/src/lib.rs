@@ -1,4 +1,4 @@
-//! sluice-wicket-wasi: a wasm platform on the sluice tunnel.
+//! sluice-wicket-runtime-wasi: a wasm platform on the sluice tunnel.
 //!
 //! Connects to a sluice server with the same `sluice.v1.Tunnel` gRPC API as
 //! the Java client, but instead of relaying to TCP upstreams it terminates
@@ -46,12 +46,12 @@
 //! Usage:
 //!
 //! ```text
-//! sluice-wicket-wasi --server grpc://127.0.0.1:8001 --token SECRET \
+//! sluice-wicket-runtime-wasi --server grpc://127.0.0.1:8001 --token SECRET \
 //!     --wasm demo.local=./hello.wasm \
 //!     --wasm relay.local='./relay.wasm?wasi=cli,inherit-network'
-//! sluice-wicket-wasi --config wicket-wasi.yaml
-//! sluice-wicket-wasi --listen 127.0.0.1:8080 --wasm 'counter.local=./counter.wasm?wasi=keyvalue'
-//! sluice-wicket-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090
+//! sluice-wicket-runtime-wasi --config wicket-runtime-wasi.yaml
+//! sluice-wicket-runtime-wasi --listen 127.0.0.1:8080 --wasm 'counter.local=./counter.wasm?wasi=keyvalue'
+//! sluice-wicket-runtime-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090
 //! ```
 
 pub mod config;
@@ -90,7 +90,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// was unavailable when it was built.
 pub fn build() -> PeerBuild {
     PeerBuild {
-        implementation: "sluice-wicket-wasi".into(),
+        implementation: "sluice-wicket-runtime-wasi".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         commit: env!("SLUICE_BUILD_COMMIT").into(),
         dirty: env!("SLUICE_BUILD_DIRTY") == "true",
