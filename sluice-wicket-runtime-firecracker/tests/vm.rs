@@ -22,6 +22,12 @@
 //! Docker image (`Dockerfile`) instead, with its Firecracker and kernel, as
 //! the README runs it: `/dev/kvm` and its group alone, Docker's default
 //! seccomp profile, the state dir on a tmpfs.
+//!
+//! `SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL=1` runs it in jail mode instead,
+//! started as root (`sudo -n`, skipped without it), the wicket as the test's user,
+//! and checks the jails: each VM a `firecracker` of an id of its own, PID 1 of its
+//! namespace, without privileges, in a cgroup limiting its memory; the VMs and the
+//! wicket ending with the keeper (SIGKILL).
 #![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
@@ -42,6 +48,12 @@ const HANG: Duration = Duration::from_secs(120);
 /// The POST's body.
 const UPLOAD: usize = 5_000_000;
 
+/// Jail mode's ids.
+const JAIL_IDS: (u32, u32) = (1_900_000_000, 1_900_000_127);
+
+/// The image's user (distroless `nonroot`).
+const NONROOT: u32 = 65532;
+
 /// The launcher (`--launch-vm`) execs the program with the soft open file
 /// limit given: Firecracker grows its file table to the limit at its start, a
 /// cost that grows with it (3ms at 1048576).
@@ -58,7 +70,16 @@ fn the_launcher_execs_with_the_open_file_limit_given() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn every_route_serves_http_through_the_tunnel() {
-    if std::fs::OpenOptions::new()
+    let jailed = std::env::var_os("SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL")
+        .is_some_and(|jail| !jail.is_empty());
+    if jailed {
+        // the jails' VMs open nodes of their own, the keeper is root
+        let sudo = Command::new("sudo").args(["-n", "true"]).status();
+        if !Path::new("/dev/kvm").exists() || !sudo.is_ok_and(|sudo| sudo.success()) {
+            eprintln!("skipped: jail mode needs /dev/kvm and sudo -n");
+            return;
+        }
+    } else if std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/kvm")
@@ -109,8 +130,13 @@ async fn every_route_serves_http_through_the_tunnel() {
     .into();
     args.extend(extra.iter().flat_map(|vm| ["--vm".to_string(), vm.clone()]));
     let (url, mut streams) = tunnel_server(None).await;
+    let cgroup = format!("sluice-vm-test-{}", std::process::id());
     let wicket = match &image {
-        Some(image) => Wicket::in_image(image, &url, &dir.0, &args),
+        Some(image) => Wicket::in_image(image, &url, &dir.0, &args, jailed),
+        None if jailed => {
+            let (firecracker, kernel) = tools();
+            Wicket::jailed(&url, &firecracker, &kernel, &cgroup, &args)
+        }
         None => {
             let (firecracker, kernel) = tools();
             Wicket::start(&url, &firecracker, &kernel, &args)
@@ -214,6 +240,133 @@ async fn every_route_serves_http_through_the_tunnel() {
         assert!(Instant::now() < deadline, "capped.local is still served");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    match (jailed, &image) {
+        // the image's keeper in the container's cgroup, the wicket its nonroot user
+        (true, Some(_)) => jails(&wicket, None, NONROOT),
+        // SAFETY: getuid
+        (true, None) => jails(&wicket, Some(&cgroup), unsafe { libc::getuid() }),
+        (false, _) => {}
+    }
+}
+
+/// The jails of the VMs alive (the shared VM and the warm clones): each a
+/// `firecracker` of an id of its own, PID 1 of its namespace, without capability or
+/// new privileges, its seccomp filter on, in a cgroup of the keeper's limiting its
+/// memory (under `cgroup`, else beside the keeper's own: its default); the wicket as
+/// `user`. The keeper killed (SIGKILL), they and the wicket end with it (their parent
+/// death signal); its files and cgroups are removed here (a container's go with it).
+fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
+    let keeper = wicket.keeper();
+    let field = |pid: i32, name: &str| {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default()
+    };
+    let cgroup_of = |pid: i32| {
+        let own = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+        own.trim()
+            .strip_prefix("0::/")
+            .unwrap_or_default()
+            .to_string()
+    };
+    // the keeper leaves its own for a leaf of it (`keeper`), the VMs' cgroups beside
+    let cgroup = cgroup.map(String::from).unwrap_or_else(|| {
+        let own = cgroup_of(keeper);
+        own.strip_suffix("/keeper").unwrap_or(&own).to_string()
+    });
+    let user = user.to_string();
+    let (vms, others): (Vec<i32>, Vec<i32>) = children(keeper).into_iter().partition(|pid| {
+        let uid: u32 = field(*pid, "Uid:")
+            .split_whitespace()
+            .next()
+            .and_then(|uid| uid.parse().ok())
+            .unwrap_or(0);
+        (JAIL_IDS.0..=JAIL_IDS.1).contains(&uid)
+    });
+    assert!(
+        vms.len() >= 2,
+        "the shared VM and warm clones: {vms:?}; {}",
+        wicket.log()
+    );
+    let mut ids = Vec::new();
+    for vm in &vms {
+        let id = field(*vm, "Uid:");
+        assert!(
+            id.split_whitespace()
+                .all(|each| Some(each) == id.split_whitespace().next()),
+            "{vm}: {id}"
+        );
+        assert_eq!(field(*vm, "Gid:"), id, "{vm}: its gid its uid");
+        assert_eq!(field(*vm, "Groups:"), "", "{vm}: no supplementary group");
+        assert!(
+            field(*vm, "NSpid:").ends_with("\t1"),
+            "{vm}: PID 1 of its namespace"
+        );
+        for (name, value) in [
+            ("CapEff:", "0000000000000000"),
+            ("CapBnd:", "0000000000000000"),
+            ("NoNewPrivs:", "1"),
+            ("Seccomp:", "2"),
+        ] {
+            assert_eq!(field(*vm, name), value, "{vm}: {name}");
+        }
+        let own = cgroup_of(*vm);
+        assert!(
+            own.starts_with(&format!("{cgroup}/")),
+            "{vm}: its cgroup {own}, not in {cgroup}"
+        );
+        let max = std::fs::read_to_string(format!("/sys/fs/cgroup/{own}/memory.max")).unwrap();
+        assert_ne!(max.trim(), "max", "{vm}: its memory limited");
+        ids.push(id);
+    }
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), vms.len(), "an id per VM: {ids:?}");
+    assert_eq!(others.len(), 1, "the wicket: {others:?}");
+    assert_eq!(
+        field(others[0], "Uid:").split_whitespace().next(),
+        Some(user.as_str()),
+        "the wicket runs as jail-user"
+    );
+
+    let killed = Command::new("sudo")
+        .args(["-n", "kill", "-KILL", &keeper.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ended = |pid: &i32| matches!(field(*pid, "State:").chars().next(), None | Some('Z'));
+    while !vms.iter().chain(&others).all(ended) {
+        assert!(
+            Instant::now() < deadline,
+            "VMs outlived the keeper: {vms:?}, {others:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if wicket.container.is_none() {
+        // what the keeper did not end
+        let cleaned = Command::new("sudo")
+            .args(["-n", "sh", "-c"])
+            .arg(format!(
+                "rm -rf /run/sluice-wicket-runtime-firecracker-{keeper}; \
+                 find /sys/fs/cgroup/{cgroup} -depth -type d -exec rmdir {{}} +"
+            ))
+            .status()
+            .unwrap();
+        assert!(cleaned.success());
+    }
+}
+
+/// The children of `pid`.
+fn children(pid: i32) -> Vec<i32> {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|child| child.parse().ok())
+        .collect()
 }
 
 /// The VMs' output: the sample guest's line at its start and its two lines (stdout,
@@ -558,11 +711,20 @@ fn served(bodies: &[String]) -> Vec<u64> {
         .collect()
 }
 
-/// Firecracker and the guest kernel.
+/// Firecracker (a path: root's PATH is another) and the guest kernel.
 fn tools() -> (PathBuf, PathBuf) {
     let firecracker = std::env::var_os("SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER")
         .map(PathBuf::from)
         .unwrap_or_else(|| "firecracker".into());
+    let firecracker = match firecracker.components().count() {
+        1 => std::env::var_os("PATH")
+            .iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join(&firecracker))
+            .find(|path| path.is_file())
+            .unwrap_or(firecracker),
+        _ => firecracker,
+    };
     let kernel = std::env::var_os("SLUICE_WICKET_RUNTIME_FIRECRACKER_KERNEL")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -624,9 +786,44 @@ impl Wicket {
         Wicket::spawn(command, server, args, None)
     }
 
+    /// The wicket in jail mode, started as root (`sudo -n`), as the test's user, its
+    /// VMs' cgroups in `cgroup`.
+    fn jailed(
+        server: &str,
+        firecracker: &Path,
+        kernel: &Path,
+        cgroup: &str,
+        args: &[String],
+    ) -> Wicket {
+        // SAFETY: getuid, getgid
+        let user = unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) };
+        let mut command = Command::new("sudo");
+        command
+            .args([
+                "-n",
+                env!("CARGO_BIN_EXE_sluice-wicket-runtime-firecracker"),
+            ])
+            .args(["--firecracker"])
+            .arg(firecracker)
+            .arg("--kernel")
+            .arg(kernel)
+            .args(["--jail-ids", &format!("{}-{}", JAIL_IDS.0, JAIL_IDS.1)])
+            .args(["--jail-user", &user, "--jail-cgroup", cgroup]);
+        Wicket::spawn(command, server, args, None)
+    }
+
     /// The wicket as the Docker `image`, with its own Firecracker and kernel,
     /// reading the rootfs images under `target/` and `scratch`.
-    fn in_image(image: &str, server: &str, scratch: &Path, args: &[String]) -> Wicket {
+    /// `jailed`: as the README runs it in jail mode, root in the container (with
+    /// `CAP_SYS_ADMIN`, unconfined: Docker's AppArmor profile denies mounts, its seccomp
+    /// profile `pivot_root`), the wicket as `nonroot`.
+    fn in_image(
+        image: &str,
+        server: &str,
+        scratch: &Path,
+        args: &[String],
+        jailed: bool,
+    ) -> Wicket {
         use std::os::unix::fs::MetadataExt as _;
         let kvm = std::fs::metadata("/dev/kvm").unwrap().gid();
         let name = format!("sfc-vm-{}", std::process::id());
@@ -635,10 +832,46 @@ impl Wicket {
         let mut command = Command::new("docker");
         command
             .args(["run", "--rm", "--name", &name, "--network", "host"])
-            .args(["--device", "/dev/kvm", "--group-add", &kvm.to_string()])
-            .args(["--tmpfs", "/run/sluice"])
-            .args(["-v", &mount(&target), "-v", &mount(scratch), image]);
+            .args(["--device", "/dev/kvm"]);
+        if jailed {
+            command
+                .args(["-u", "0", "--cap-add", "SYS_ADMIN"])
+                .args(["--security-opt", "apparmor=unconfined"])
+                .args(["--security-opt", "seccomp=unconfined"]);
+        } else {
+            command.args(["--group-add", &kvm.to_string()]);
+        }
+        command.args(["--tmpfs", "/run/sluice"]).args([
+            "-v",
+            &mount(&target),
+            "-v",
+            &mount(scratch),
+            image,
+        ]);
+        if jailed {
+            command
+                .args(["--jail-ids", &format!("{}-{}", JAIL_IDS.0, JAIL_IDS.1)])
+                .args(["--jail-user", "nonroot"]);
+        }
         Wicket::spawn(command, server, args, Some(name))
+    }
+
+    /// The keeper (jail mode): sudo's child, or the container's first process.
+    fn keeper(&self) -> i32 {
+        let keeper = match &self.container {
+            Some(container) => {
+                let inspected = Command::new("docker")
+                    .args(["inspect", "-f", "{{.State.Pid}}", container])
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&inspected.stdout)
+                    .trim()
+                    .parse()
+                    .ok()
+            }
+            None => children(self.child.id() as i32).into_iter().next(),
+        };
+        keeper.unwrap_or_else(|| panic!("no keeper; {}", self.log()))
     }
 
     fn spawn(

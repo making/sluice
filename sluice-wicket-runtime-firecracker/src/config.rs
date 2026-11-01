@@ -12,6 +12,7 @@ use serde::Deserialize;
 use sluice_wicket_tunnel::flume::FlumeSettings;
 use sluice_wicket_tunnel::{DEFAULT_DRAIN_GRACE, DEFAULT_MAX_CONNECTIONS, DEFAULT_STALL_TIMEOUT};
 
+use crate::jail::Ids;
 use crate::route::RouteSpec;
 
 pub const USAGE: &str = "\
@@ -36,8 +37,9 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
   --firecracker <path>            the firecracker binary (default firecracker on the PATH)
   --state-dir <path>              the VMs' files: their sockets need paths below 108 bytes
                                   (default a directory of the process's own under
-                                  $XDG_RUNTIME_DIR, else the system's temp dir; a tmpfs
-                                  keeps the snapshots off the disk)
+                                  $XDG_RUNTIME_DIR, else the system's temp dir; jail mode:
+                                  the keeper's own under /run; a tmpfs keeps the snapshots
+                                  off the disk)
   --token <token>                 bearer token of the tunnel streams (on the command line
                                   every user of the host sees it: prefer the environment,
                                   the config file or --token-file)
@@ -61,7 +63,14 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
   --flume-token <token>           the flume's bearer token (required with --flume)
   --flume-ca-cert <path>          PEM CA verifying a grpcs:// flume (default the webPKI roots)
   --flume-insecure                skip the verification of a grpcs:// flume
-  --version                       print the build (version, commit, build time) and exit
+  --jail-ids <first>-<last>       jail mode: each VM in a jail of its own (namespaces, root,
+                                  cgroup) as an id (uid and gid) of the range, one per VM
+                                  alive; the wicket starts as root, which stays to spawn
+                                  the VMs, and runs as --jail-user
+  --jail-user <name|uid:gid>      jail mode: the user the wicket runs as (not root)
+  --jail-cgroup <path>            jail mode: the VMs' parent cgroup under /sys/fs/cgroup
+                                  (default the wicket's own, delegated to it)
+  --version                      print the build (version, commit, build time) and exit
 
 Each option but --vm also reads SLUICE_WICKET_RUNTIME_FIRECRACKER_<NAME> from the environment, e.g.
 SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN.";
@@ -99,10 +108,23 @@ pub struct Settings {
     pub state_dir: Option<PathBuf>,
     /// The flume the VMs' output is fed to.
     pub flume: Option<FlumeSettings>,
+    /// Jail mode: the VMs in jails, spawned by the keeper.
+    pub jail: Option<JailSettings>,
     /// Where the routes come from, read again on a reload.
     pub routes: RouteSource,
     /// The routes at startup.
     pub specs: Vec<RouteSpec>,
+}
+
+/// Jail mode's settings (`keeper`, `jail`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JailSettings {
+    /// The user the wicket runs as: a name, or `uid:gid`.
+    pub user: String,
+    /// The VMs' uids and gids.
+    pub ids: Ids,
+    /// The VMs' parent cgroup under the hierarchy's root; None: the keeper's own.
+    pub cgroup: Option<String>,
 }
 
 const VALUED: &[&str] = &[
@@ -125,6 +147,9 @@ const VALUED: &[&str] = &[
     "flume",
     "flume-token",
     "flume-ca-cert",
+    "jail-ids",
+    "jail-user",
+    "jail-cgroup",
     "vm",
 ];
 
@@ -263,6 +288,18 @@ pub fn parse(
             || switch("FLUME_INSECURE")
             || file.and_then(|file| file.flume_insecure).unwrap_or(false),
     )?;
+    let jail = match (
+        flag("jail-ids").or_else(|| file.and_then(|file| file.jail_ids.clone())),
+        flag("jail-user").or_else(|| file.and_then(|file| file.jail_user.clone())),
+    ) {
+        (Some(ids), Some(user)) => Some(JailSettings {
+            user,
+            ids: Ids::parse(&ids)?,
+            cgroup: flag("jail-cgroup").or_else(|| file.and_then(|file| file.jail_cgroup.clone())),
+        }),
+        (None, None) => None,
+        _ => return Err("--jail-ids and --jail-user go together (jail mode)".into()),
+    };
     let token = match (flag("token"), flag("token-file"), file) {
         (Some(token), _, _) => token,
         (None, Some(path), _) => read(PathBuf::from(path))?,
@@ -308,6 +345,7 @@ pub fn parse(
             .map(PathBuf::from)
             .or_else(|| file.and_then(|file| in_file(&file.state_dir))),
         flume,
+        jail,
         routes,
         specs,
     })))
@@ -326,6 +364,42 @@ impl RouteSource {
     /// The config file, if any.
     pub fn config(&self) -> Option<&Path> {
         self.config.as_deref()
+    }
+
+    /// The firecracker binary as the routes name it now (a bare name is looked up on
+    /// the PATH).
+    pub fn firecracker(&self) -> Result<PathBuf, String> {
+        let file = match &self.config {
+            Some(path) => Some(File::read(path)?),
+            None => None,
+        };
+        let dir = self
+            .config
+            .as_ref()
+            .and_then(|path| path.parent())
+            .unwrap_or(Path::new("."));
+        self.firecracker_of(file.as_ref(), dir)
+    }
+
+    /// `--firecracker` (flag or environment), over the config `file`'s (relative to
+    /// its `dir`), over `firecracker` on the PATH.
+    fn firecracker_of(&self, file: Option<&File>, dir: &Path) -> Result<PathBuf, String> {
+        let named = self.firecracker.clone().or_else(|| {
+            file.and_then(|file| file.firecracker.as_ref()).map(|path| {
+                match path.components().count() {
+                    // a bare name is looked up on the PATH
+                    1 => path.clone(),
+                    _ => dir.join(path),
+                }
+            })
+        });
+        Ok(match named {
+            Some(path) if path.components().count() > 1 => {
+                std::path::absolute(path).map_err(|e| format!("--firecracker: {e}"))?
+            }
+            Some(name) => name,
+            None => PathBuf::from("firecracker"),
+        })
     }
 
     /// Reads the routes, the config file's again: a host may appear once.
@@ -350,21 +424,7 @@ impl RouteSource {
             .ok_or("--kernel is required")?;
         // absolute: each firecracker runs in its VM's directory
         let kernel = std::path::absolute(kernel).map_err(|e| format!("--kernel: {e}"))?;
-        let firecracker = match self.firecracker.clone().or_else(|| {
-            file.as_ref()
-                .and_then(|file| file.firecracker.as_ref())
-                .map(|path| match path.components().count() {
-                    // a bare name is looked up on the PATH
-                    1 => path.clone(),
-                    _ => dir.join(path),
-                })
-        }) {
-            Some(path) if path.components().count() > 1 => {
-                std::path::absolute(path).map_err(|e| format!("--firecracker: {e}"))?
-            }
-            Some(name) => name,
-            None => PathBuf::from("firecracker"),
-        };
+        let firecracker = self.firecracker_of(file.as_ref(), dir)?;
         let mut specs = Vec::new();
         if let (Some(file), Some(path)) = (file, &self.config) {
             for (n, route) in file.routes.iter().enumerate() {
@@ -419,6 +479,9 @@ struct File {
     flume_token: Option<String>,
     flume_ca_cert: Option<PathBuf>,
     flume_insecure: Option<bool>,
+    jail_ids: Option<String>,
+    jail_user: Option<String>,
+    jail_cgroup: Option<String>,
     #[serde(default)]
     routes: Vec<FileRoute>,
 }
@@ -549,7 +612,7 @@ mod tests {
             &config,
             "server: grpc://file:8001\ntoken: from-file\nkernel: vmlinux\nmax-vms: 8\n\
              drain-grace: 5s\nflume: grpc://file:8002\nflume-token: from-file\n\
-             flume-ca-cert: flume-ca.pem\n\
+             flume-ca-cert: flume-ca.pem\njail-ids: 900000-900063\njail-user: from-file\n\
              routes:\n  - {host: a.local, rootfs: app.ext4, mode: per-connection, warm: 2}\n",
         )
         .unwrap();
@@ -562,11 +625,23 @@ mod tests {
                 ("SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN", "from-env"),
                 ("SLUICE_WICKET_RUNTIME_FIRECRACKER_FLUME_TOKEN", "flume-env"),
                 ("SLUICE_WICKET_RUNTIME_FIRECRACKER_FLUME_INSECURE", "true"),
+                ("SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL_USER", "from-env"),
             ],
         )
         .unwrap();
         assert_eq!(settings.server.as_deref(), Some("grpc://file:8001"));
         assert_eq!(settings.token, "from-env");
+        assert_eq!(
+            settings.jail,
+            Some(JailSettings {
+                user: "from-env".into(),
+                ids: Ids {
+                    first: 900000,
+                    last: 900063
+                },
+                cgroup: None,
+            })
+        );
         assert_eq!(
             settings.flume,
             Some(FlumeSettings {
@@ -603,12 +678,24 @@ mod tests {
                 "--flume-ca-cert",
                 "ca.pem",
                 "--flume-insecure",
+                "--jail-ids",
+                "1-2",
+                "--jail-cgroup",
+                "/sluice",
             ],
             &[("SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN", "from-env")],
         )
         .unwrap();
         assert_eq!(settings.token, "flag");
         assert_eq!(settings.max_vms, 4);
+        assert_eq!(
+            settings.jail,
+            Some(JailSettings {
+                user: "from-file".into(),
+                ids: Ids { first: 1, last: 2 },
+                cgroup: Some("/sluice".into()),
+            })
+        );
         assert_eq!(
             settings.flume,
             Some(FlumeSettings {
@@ -678,6 +765,32 @@ mod tests {
                     "grpc://f:1",
                 ],
                 "--flume-token (or `flume-token` in the --config file) is required",
+            ),
+            (
+                vec![
+                    "--server",
+                    "s",
+                    "--kernel",
+                    "k",
+                    "--vm",
+                    &vm,
+                    "--jail-ids",
+                    "1-2",
+                ],
+                "--jail-ids and --jail-user go together",
+            ),
+            // ids are neither root nor -1, first to last
+            (
+                vec!["--config", &config_flag, "--jail-ids", "0-10"],
+                "jail-ids 0-10: expected <first>-<last>",
+            ),
+            (
+                vec!["--config", &config_flag, "--jail-ids", "10-9"],
+                "jail-ids 10-9: expected",
+            ),
+            (
+                vec!["--config", &config_flag, "--jail-ids", "1-4294967295"],
+                "jail-ids 1-4294967295: expected",
             ),
         ] {
             // no Debug for the settings: the token is no output's business

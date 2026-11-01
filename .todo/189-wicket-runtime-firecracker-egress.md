@@ -10,7 +10,8 @@ calling a database or another service cannot run. Options:
   and relays each connection over vsock to the wicket, which dials it if the route's allow
   list (host:port, CIDR) has it. No root, no TAP; the wicket logs and limits the egress
 - A TAP device per VM with egress filtering on the host: needs NET_ADMIN (the Docker image,
-  `.todo` 182, runs without it) and an address per VM
+  `.todo` 182, runs without it) and an address per VM; jail mode's VMs share an empty
+  network namespace of the keeper's (`src/keeper.rs`), where their TAP devices would go
 - Clones: a connection open in the template's snapshot is every clone's; egress opens after
   the restore only
 

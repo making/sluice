@@ -11,5 +11,7 @@ The other clients then wait `wait-ms` and fail. Nothing bounds one client's shar
   wicket, or the server limits a client's connections per route
 - An idle bound of the route's own (`idle-ms`): a clone relaying no byte for it is killed
   and its connection failed, below the server's idle timeout
-- CPU: a guest spinning its vCPUs takes host cores from the others. cgroups (`cpu.max` per
-  VM) are `.todo` 183's (the jailer); until then the README names the vCPUs as the bound
+- CPU: a guest spinning its vCPUs takes host cores from the others. Jail mode gives each VM
+  a cgroup (`src/jail.rs`, memory and pids limited): a route's `cpu.max` there (the cpu
+  controller enabled with the others); without the jail the README names the vCPUs as the
+  bound

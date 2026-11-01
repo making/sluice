@@ -4,7 +4,6 @@
 //! `template` a per-connection route's template, `vm-<n>` its clones in the order
 //! they were restored.
 
-use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,8 +15,9 @@ use tokio::sync::mpsc;
 
 use crate::BoxError;
 use crate::capacity::{Capacity, Need, Pool, Slot};
+use crate::keeper::Role;
 use crate::output::{self, Hosts, Output, Sink};
-use crate::vm::{Snapshot, Spec, Vm};
+use crate::vm::{Place, Places, Snapshot, Spec, Vm};
 use crate::wire;
 
 /// How long a cold-booted guest may take to listen on its port.
@@ -251,8 +251,9 @@ pub struct Route {
     pub spec: RouteSpec,
     /// The hosts the route serves, which the log and its VMs' output name.
     hosts: Arc<Hosts>,
-    /// The route's files (the template's snapshot, the clones'), removed with it.
-    dir: PathBuf,
+    /// Where its VMs are and its files (the template's snapshot, the clones'), removed
+    /// with it (and its clones' restorer).
+    _place: Arc<Place>,
     capacity: Arc<Capacity>,
     /// What each of the route's VMs takes of the budget.
     need: Need,
@@ -290,8 +291,8 @@ impl Pool for Warm {
 /// output.
 struct Cloner {
     snapshot: Snapshot,
-    /// Where the clones' directories go (`vm-<n>`).
-    dir: PathBuf,
+    /// Where the clones are started.
+    place: Arc<Place>,
     /// Numbers the clones.
     next: AtomicU64,
     sink: Arc<Sink>,
@@ -306,7 +307,7 @@ impl Cloner {
     /// then on.
     async fn restore(&self, slot: Slot) -> Result<Cloned, BoxError> {
         let n = self.next.fetch_add(1, Ordering::Relaxed);
-        let vm = Vm::restore(&self.snapshot, self.dir.join(format!("vm-{n}")), slot).await?;
+        let vm = Vm::restore(&self.snapshot, &self.place, n, slot).await?;
         let mut seed = [0u8; 32];
         // SAFETY: getrandom into a buffer of its length
         if unsafe { libc::getrandom(seed.as_mut_ptr().cast(), seed.len(), 0) }
@@ -357,13 +358,14 @@ impl Cloner {
 
 impl Route {
     /// Boots the route's VM (shared), or boots a template VM, snapshots it once its
-    /// guest listens and kills it (per-connection); `dir` holds the route's files,
-    /// `hosts` name it in the log. Its VMs take their room from `capacity`; their
-    /// output goes to `sink`.
+    /// guest listens and kills it (per-connection); the route is the `n`th started of
+    /// `places`, `hosts` name it in the log. Its VMs take their room from `capacity`;
+    /// their output goes to `sink`.
     pub async fn start(
         spec: RouteSpec,
         hosts: &[String],
-        dir: PathBuf,
+        places: &Places,
+        n: u64,
         capacity: Arc<Capacity>,
         sink: Arc<Sink>,
     ) -> Result<Route, BoxError> {
@@ -378,17 +380,18 @@ impl Route {
             .take(need, START_WAIT)
             .await
             .map_err(|e| format!("route {label}: {e}"))?;
-        // the snapshot is the template's whole memory: the wicket's user's alone
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .map_err(|e| format!("route {label}: {}: {e}", dir.display()))?;
+        let place = Arc::new(
+            places
+                .place(n, &spec.vm)
+                .await
+                .map_err(|e| format!("route {label}: {e}"))?,
+        );
         let started = Instant::now();
-        let vm = Vm::boot(&spec.vm, dir.join("boot"), slot).await?;
-        let name = match spec.mode {
-            Mode::Shared => "vm-0",
-            Mode::PerConnection => "template",
+        let (name, role) = match spec.mode {
+            Mode::Shared => ("vm-0", Role::Shared),
+            Mode::PerConnection => ("template", Role::Template),
         };
+        let vm = Vm::boot(&spec.vm, &place, role, slot).await?;
         let mut output = ready(&vm, spec.port, &sink, &hosts, name).await?;
         let booted = started.elapsed();
         let backend = match spec.mode {
@@ -424,10 +427,11 @@ impl Route {
                          {SYNC_TIMEOUT:?}; snapshotting without the rest"
                     );
                 }
-                let mut snapshot = vm.snapshot(&dir.join("snapshot")).await?;
-                snapshot.firecracker = spec.vm.firecracker.clone();
+                let snapshot = vm.snapshot(&place, &spec.vm).await?;
                 drop(vm);
-                let size = tokio::fs::metadata(&snapshot.memory).await?.len();
+                // the template gone, its snapshot the clones' alone to read (jail mode)
+                place.seal().await?;
+                let size = tokio::fs::metadata(&snapshot.memory_on_host).await?.len();
                 println!(
                     "route {label}: template booted in {}ms, primed with {} request(s), snapshot taken after {}ms ({} MiB memory file)",
                     booted.as_millis(),
@@ -437,7 +441,7 @@ impl Route {
                 );
                 let cloner = Arc::new(Cloner {
                     snapshot,
-                    dir: dir.join("clones"),
+                    place: place.clone(),
                     next: AtomicU64::new(0),
                     sink,
                     hosts: hosts.clone(),
@@ -466,7 +470,7 @@ impl Route {
         Ok(Route {
             spec,
             hosts,
-            dir,
+            _place: place,
             capacity,
             need,
             backend,
@@ -517,14 +521,6 @@ impl Route {
                 })
             }
         }
-    }
-}
-
-impl Drop for Route {
-    /// The last connection on the route ended, and the route left the table
-    /// (or never made it): its files go; its VMs, killed, after them.
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 

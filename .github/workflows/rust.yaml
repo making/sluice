@@ -351,9 +351,17 @@ jobs:
       run: |
         cargo test --locked
         (cd guest && cargo test --locked)
-    # the VM test again, the wicket run as its image (Dockerfile) as the README runs it
+    # the VM test again in jail mode: the wicket started as root (sudo -n)
+    - name: Test the jail
+      run: |
+        if [ ! -e /dev/kvm ]; then echo "no /dev/kvm: skipped"; exit 0; fi
+        SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL=1 cargo test --locked --test vm
+    # the VM test again, the wicket run as its image (Dockerfile) as the README runs it, then
+    # jailed
     - name: Test the image
       run: |
         if [ ! -e /dev/kvm ]; then echo "no /dev/kvm: skipped"; exit 0; fi
         docker build -f Dockerfile --build-arg GIT_COMMIT=${GITHUB_SHA} -t sluice-wicket-runtime-firecracker:ci ..
         SLUICE_WICKET_RUNTIME_FIRECRACKER_IMAGE=sluice-wicket-runtime-firecracker:ci cargo test --locked --test vm
+        SLUICE_WICKET_RUNTIME_FIRECRACKER_IMAGE=sluice-wicket-runtime-firecracker:ci SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL=1 \
+          cargo test --locked --test vm

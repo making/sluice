@@ -21,17 +21,23 @@
 //! The processes' output in the VMs reaches the wicket's stdout / stderr, and
 //! with `--flume` the live access log (`output`, through `sluice-wicket-tunnel`'s
 //! feed).
+//!
+//! In jail mode (`--jail-ids`) the process started as root is the keeper
+//! (`keeper`): it runs the wicket as `--jail-user` and spawns the VMs at its
+//! request, each in a jail of its own (`jail`).
 
 pub mod capacity;
 pub mod config;
+pub mod jail;
+pub mod keeper;
 pub mod listener;
 pub mod output;
 pub mod route;
 pub mod routes;
+pub mod state;
 pub mod vm;
 pub mod wire;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use sluice_wicket_tunnel::flume::{self, Tap};
@@ -44,6 +50,7 @@ use tokio_util::sync::CancellationToken;
 use capacity::Capacity;
 use output::{Printer, Sink};
 use routes::Reloader;
+use vm::Launcher;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -64,11 +71,11 @@ pub fn describe_build() -> String {
     sluice_wicket_tunnel::describe(&build())
 }
 
-/// Boots the routes' VMs into `state_dir` and serves them (through the
+/// Boots the routes' VMs as `launcher` starts them and serves them (through the
 /// server, on `--listen`, or both) until SIGTERM / SIGINT: until the drain
 /// after it ended, or at once where nothing drains (without `--server`, or
 /// with `--drain-grace 0`).
-pub async fn run(settings: config::Settings, state_dir: PathBuf) -> Result<(), BoxError> {
+pub async fn run(settings: config::Settings, launcher: Launcher) -> Result<(), BoxError> {
     let config::Settings {
         server,
         listen,
@@ -84,6 +91,7 @@ pub async fn run(settings: config::Settings, state_dir: PathBuf) -> Result<(), B
         watch_interval,
         state_dir: _,
         flume,
+        jail: _,
         routes,
         specs,
     } = settings;
@@ -112,7 +120,8 @@ pub async fn run(settings: config::Settings, state_dir: PathBuf) -> Result<(), B
         printer: Printer::stdio(),
         tap: tap.clone(),
     });
-    let reloader = Reloader::start(routes, specs, capacity, state_dir, sink).await?;
+    let places = Arc::new(launcher.start()?);
+    let reloader = Reloader::start(routes, specs, capacity, places, sink).await?;
     let routes = reloader.routes().clone();
     if let Some(flume) = flume {
         flume::start(flume, tap, &client_id)?;

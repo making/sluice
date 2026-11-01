@@ -32,6 +32,7 @@ use crate::capacity::Capacity;
 use crate::config::RouteSource;
 use crate::output::Sink;
 use crate::route::{Lease, Mode, Route, RouteSpec};
+use crate::vm::Places;
 use crate::wire;
 
 /// The routes at one point, as every node stream advertises them.
@@ -210,9 +211,9 @@ pub struct Reloader {
     capacity: Arc<Capacity>,
     /// Where the VMs' output goes.
     sink: Arc<Sink>,
-    /// The state dir, where every route started gets `route-<n>`.
-    dir: PathBuf,
-    next_dir: u64,
+    /// Where the routes' VMs start, the `n`th route started its place.
+    places: Arc<Places>,
+    next_place: u64,
     /// Target -> its route as started; the advertised targets only.
     started: HashMap<String, Started>,
     /// Removed targets still in the table -> the generation that removed them.
@@ -223,13 +224,13 @@ pub struct Reloader {
 
 impl Reloader {
     /// Starts the VMs of every route of `specs` (read from `source`) within
-    /// `capacity`, each target in a directory of its own under `dir`, their
-    /// output to `sink`; the first failure ends them all.
+    /// `capacity`, each target in a place of its own of `places`, their output to
+    /// `sink`; the first failure ends them all.
     pub async fn start(
         source: RouteSource,
         specs: Vec<RouteSpec>,
         capacity: Arc<Capacity>,
-        dir: PathBuf,
+        places: Arc<Places>,
         sink: Arc<Sink>,
     ) -> Result<Reloader, BoxError> {
         fits(&specs, &capacity)?;
@@ -242,8 +243,8 @@ impl Reloader {
             source,
             capacity,
             sink,
-            dir,
-            next_dir: 0,
+            places,
+            next_place: 0,
             started: HashMap::new(),
             lingering: HashMap::new(),
             read: HashMap::new(),
@@ -369,7 +370,6 @@ impl Reloader {
         }
         let mut change = Change::default();
         let mut starting = JoinSet::new();
-        let mut dirs = Vec::new();
         let mut kept = Vec::new();
         for (target, spec, hosts) in targets {
             let stamps = stamps(files(&spec));
@@ -381,12 +381,15 @@ impl Reloader {
                 Some(_) => change.restarted.extend(hosts.iter().cloned()),
                 None => {}
             }
-            let dir = self.dir.join(format!("route-{}", self.next_dir));
-            self.next_dir += 1;
-            dirs.push(dir.clone());
-            let (capacity, sink) = (self.capacity.clone(), self.sink.clone());
+            let n = self.next_place;
+            self.next_place += 1;
+            let (places, capacity, sink) = (
+                self.places.clone(),
+                self.capacity.clone(),
+                self.sink.clone(),
+            );
             starting.spawn(async move {
-                let route = Route::start(spec.clone(), &hosts, dir, capacity, sink).await;
+                let route = Route::start(spec.clone(), &hosts, &places, n, capacity, sink).await;
                 let started = route.map(|route| Started {
                     spec,
                     stamps,
@@ -403,9 +406,6 @@ impl Reloader {
                     // the starts under way end, and with them their VMs and files
                     starting.shutdown().await;
                     drop(new);
-                    for dir in dirs {
-                        let _ = std::fs::remove_dir_all(dir);
-                    }
                     return Err(match failed {
                         Ok((_, Err(e))) => e,
                         Err(e) => e.into(),

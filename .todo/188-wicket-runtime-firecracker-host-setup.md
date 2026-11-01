@@ -12,3 +12,6 @@ it in the README, with:
 - per-connection isolation is per connection to the sluice server (the server opens an
   upstream connection per client connection and route, h2 too): a proxy in front of the
   server pooling its clients' connections puts several clients in one clone
+- jail mode (the README's Jail mode) needs no `/dev/kvm` access for the wicket's user (each
+  VM opens a node of its own) and takes root for its keeper: which of these the host setup
+  asks for in each mode

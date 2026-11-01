@@ -29,6 +29,9 @@ Buildpacks image: `/init` starts the image's `Entrypoint` + `Cmd` as its `User` 
 accepts on `127.0.0.1:$PORT`. The process's output reaches the wicket's stdout / stderr,
 and with `--flume` the live access log (see [Output](#output-and-the-live-access-log)).
 
+In [jail mode](#jail-mode) (`--jail-ids`, started as root) every VM runs in a jail of its
+own: an id, namespaces, a root and a cgroup of its own, Firecracker's `jailer`'s isolation.
+
 ## Layout
 
 Two Cargo workspaces:
@@ -37,7 +40,9 @@ Two Cargo workspaces:
   (`config.rs`); `routes.rs` the route table, its reload and the relay of a connection,
   `route.rs` a route's VMs, `capacity.rs` their budget, `vm.rs` one Firecracker VM,
   `output.rs` the VMs' output, `wire.rs` the vsock framing and the restore notice,
-  `listener.rs` `--listen`
+  `listener.rs` `--listen`, `state.rs` the state dir; jail mode's `keeper.rs` (the
+  privileged half, and the wicket's client of it) and `jail.rs` (one VM's jail, the VMs'
+  cgroups)
 - `guest/` -- the VMs' `/init`, built for `x86_64-unknown-linux-musl` (its
   `rust-toolchain.toml` has rustup add the target): `log.rs` the processes' output,
   `reaper.rs` PID 1's reaping; `guest/src/wire.rs` is a copy of `src/wire.rs`: keep them
@@ -170,6 +175,9 @@ watch-interval: 1s              # 0 = SIGHUP only
 drain-grace: 20s
 # flume: grpc://127.0.0.1:8002  # see Output and the live access log
 # flume-token: ${FLUME_TOKEN}
+# jail-ids: 900000-900127       # see Jail mode
+# jail-user: sluice
+# jail-cgroup: sluice
 routes:
   - {host: hello.local, rootfs: guest.ext4}
   - {host: app.local, rootfs: upstream.ext4, mode: per-connection, mem: 512, vcpus: 2,
@@ -283,6 +291,71 @@ A clone's memory is its snapshot's. What the wicket and `/init` do about it:
 
 The kernel's boot id remains the snapshot's.
 
+## Jail mode
+
+`--jail-ids <first>-<last>` with `--jail-user <name|uid:gid>` (`jail-ids`, `jail-user` in the
+config file) runs every VM in a jail of its own: Firecracker's
+[`jailer`](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md)'s
+isolation, done by the wicket (see [Findings](#findings) for why not the jailer). The wicket
+starts as root; that process, the keeper, stays root to spawn, kill and reap the VMs, and
+runs the wicket proper -- the tunnel, the routes, everything reading what the guests send --
+as `--jail-user`, which asks the keeper for its VMs over a socket pair and drives them:
+
+```text
+keeper (root) --runs--> wicket (jail-user) --requests--> keeper --clone3--> firecracker (jailed)
+```
+
+Each VM's `firecracker`:
+
+- runs as an id (uid and gid) of `--jail-ids` of its own, without supplementary group,
+  capability (the bounding set dropped) or new privileges; Firecracker's seccomp filters as
+  always
+- is PID 1 of a PID namespace of its own, in mount, IPC and UTS namespaces of its own and a
+  network namespace without interfaces (the VMs' alike: one per VM cost 0.9ms of each spawn)
+- has a read-only tmpfs as its root holding `/dev/kvm` (a node of its own), its rootfs and
+  kernel (bound read-only, from the files the wicket opened), `/run` (a directory of the
+  keeper's, the wicket's group's: its API and vsock sockets) and, for a per-connection route,
+  `/snapshot`: the template's to write, made read-only (root's) before the first clone
+- runs its route's copy of `firecracker` (a sealed memfd): the jailer copies the binary into
+  every jail so that VMs share none of its pages; the clones of a route share their
+  snapshot's pages anyway, so they share their route's copy, and routes share nothing
+- is in a cgroup (v2) of its own: `memory.max` its `mem` plus 32 MiB plus `mem`/128 (its
+  page tables) plus 16 MiB (its log, bound by `RLIMIT_FSIZE`), its `mem` twice for a template
+  (it writes its snapshot), `pids.max` its vCPUs plus 16. Past its limit the kernel's OOM
+  killer ends the VM, nothing else. A per-connection route's snapshot stays charged to the
+  route's cgroup (`route-<n>`) as long as the route lives; a clone's cgroup (`vm-<n>`, one
+  per id) is reused. CPU is not limited: the vCPUs bound it
+- ends with the keeper: its parent death signal is set after the uid change (which clears
+  it: the jailer's `firecracker` outlives the jailer's parent). The keeper forwards SIGTERM,
+  SIGINT and SIGHUP to the wicket and ends with it, its VMs killed, their files and cgroups
+  removed; the wicket ends with the keeper as well
+
+What it needs:
+
+- root, cgroup v2 (`/sys/fs/cgroup`). The keeper's directory is
+  `/run/sluice-wicket-runtime-firecracker-<pid>` (a tmpfs), or such a directory in
+  `--state-dir`
+- `--jail-ids`: a range no user of the host has, nor a subordinate range of `/etc/subuid`, of
+  `--max-vms` ids at least (one per VM alive)
+- `--jail-user` reads what the wicket reads: the config file, the token, the CA certificates,
+  the rootfs images and the kernel. The VMs read the images and the kernel as ids of their
+  own: the files need others' read permission (`o+r`); their directory may stay private (a
+  jail binds the file, not its directory)
+- `--jail-cgroup <path>`: the VMs' parent cgroup under `/sys/fs/cgroup`, made, the memory and
+  pids controllers enabled down to it. By default the wicket's own cgroup, which the keeper
+  leaves for `keeper/` (cgroup v2 enables no controller for the children of a cgroup holding
+  processes): a systemd service's with `Delegate=yes`, a container's; run by hand, give a path
+- the firecracker binary is the keeper's, the one named at startup: a reload may replace the
+  file (a rename), not name another
+
+```text
+sudo target/release/sluice-wicket-runtime-firecracker --jail-ids 900000-900127 --jail-user sluice \
+    --jail-cgroup sluice --config /etc/sluice/wicket.yaml
+```
+
+As a systemd service: `ExecStart=` the wicket with its `--config`, `Delegate=yes` (the
+default `--jail-cgroup`), `TimeoutStopSec=` above `--drain-grace`.
+
 ## Docker image
 
 `Dockerfile` (built from the repository root:
@@ -322,6 +395,20 @@ docker run --rm --device /dev/kvm --group-add $(stat -c %g /dev/kvm) \
 - **`docker logs`** shows the VMs' output, each line named after its route and VM (see
   [Output](#output-and-the-live-access-log))
 
+[Jail mode](#jail-mode) runs as root in the container (the keeper; the wicket as `nonroot`)
+with `CAP_SYS_ADMIN` (namespaces, mounts, `pivot_root`), unconfined: Docker's AppArmor
+profile denies mounts, and its seccomp profile `pivot_root` (with the capability too; the
+VMs keep Firecracker's filters). Its default `--jail-cgroup` is the container's own (the
+keeper remounts the read-only cgroup filesystem writable), and the VMs need no group:
+
+```text
+docker run --rm --device /dev/kvm -u 0 --cap-add SYS_ADMIN \
+    --security-opt apparmor=unconfined --security-opt seccomp=unconfined \
+    --tmpfs /run/sluice --memory 1g --stop-timeout 30 ... \
+    ghcr.io/making/sluice/sluice-wicket-runtime-firecracker \
+    --jail-ids 900000-900127 --jail-user nonroot --server ... --vm ...
+```
+
 The VMs' memory counts against the container's memory cgroup: a VM's guest memory as the
 guest touches it, the `firecracker` process's few MiB, and a per-connection route's snapshot
 on the tmpfs, its `mem` whole (shmem: never reclaimed without swap). Measured:
@@ -350,7 +437,9 @@ Kubernetes: `/dev/kvm` reaches a Pod through a device plugin (KubeVirt's
 `devices.kubevirt.io/kvm`, or a generic one), or a privileged container;
 `securityContext.supplementalGroups` holds the node's `kvm` gid, `/run/sluice` is an
 `emptyDir` of `medium: Memory` (counted against the Pod's memory limit), and
-`terminationGracePeriodSeconds` exceeds `--drain-grace`.
+`terminationGracePeriodSeconds` exceeds `--drain-grace`. Jail mode: `runAsUser: 0`,
+`capabilities.add: [SYS_ADMIN]`, `seccompProfile` and `appArmorProfile` `Unconfined` (or a
+privileged container).
 
 ## Tests
 
@@ -377,8 +466,14 @@ sg kvm -c "SLUICE_WICKET_RUNTIME_FIRECRACKER_VMS='java.local=$T/upstream.ext4?me
     jclone.local=$T/upstream.ext4?mode=per-connection&mem=512&vcpus=2&prime=200&warm=4' cargo test"
 ```
 
+`SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL=1` runs it in [jail mode](#jail-mode), the wicket
+started as root (`sudo -n`; skipped without it) or, with `..._IMAGE`, as the image runs it
+jailed, and checks the jails of the VMs alive: an id of its own each, PID 1 of its
+namespace, no capability, no new privileges, the seccomp filter on, a cgroup limiting its
+memory, the wicket as `--jail-user`; the keeper killed (SIGKILL), the VMs and the wicket end.
+
 The CI runs it on a runner exposing `/dev/kvm`, with the Firecracker release and the kernel
-above pinned.
+above pinned, and again jailed, on the runner and in the image.
 
 ## Findings
 
@@ -404,8 +499,8 @@ Measured on a 64-core x86_64 host, through a sluice server on the same host, wit
 - **No SDK is needed**: the API is REST over a Unix socket; `src/vm.rs` drives it with
   hyper. The Go SDK (firecracker-go-sdk) adds networking (CNI) and the jailer, neither of
   which a vsock-only wicket needs.
-- **No root, no TAP**: vsock only. The VMs share one read-only rootfs; `vsock_override` on
-  snapshot load gives every clone its own socket.
+- **No root, no TAP**: vsock only (jail mode takes root for the keeper alone). The VMs share
+  one read-only rootfs; `vsock_override` on snapshot load gives every clone its own socket.
 - **CNB images fit the launcher model**: their config is one `Entrypoint`
   (`/cnb/process/web`), a few `Env` entries, a `User` and a `WorkingDir`; everything else
   is in `/layers`. The Java buildpack's exec.d helpers (memory calculator, CA certificates)
@@ -452,6 +547,44 @@ Measured on a 64-core x86_64 host, through a sluice server on the same host, wit
   (`restore notice: ERR No child process`, a clone failed). The reaper hands the hook its
   status instead: 44 hooked clones of the CNB Java image, none failed.
 
+[Jail mode](#jail-mode), on the same host through `--listen` (no server), `oha` for 5s:
+
+| VM per connection, sample guest, warm=16 | new connection req/s, c=1 | c=16 |
+|---|---|---|
+| without the jail, 3 runs | 504-650 | 1,455-1,544 |
+| jailed, the same runs alternating | 508-658 | 1,295-1,320 |
+
+- **Firecracker's jailer costs a VM's spawn 2.5-4.2ms**: from spawn to API socket 2.1ms
+  without it, 4.6ms with it (`--new-pid-ns`, a chroot on a tmpfs), 6.3ms with a cgroup's
+  `memory.max` and `pids.max`. It copies the binary (3.6 MB) into every jail, so every clone
+  holds a copy of its own; it needs its chroot base executable and with devices (Ubuntu's
+  `/run` is `noexec,nodev`, Docker's `--tmpfs` `noexec`) and the files hard-linked into the
+  jails (one filesystem); its `setuid` clears the parent death signal, and `--new-pid-ns`
+  forks it away. Hence the wicket's jail of its own.
+- **A jailed restore is faster than the launcher's**: a fresh clone restored in 11.9ms
+  (p50, c=1, warm=0) against 13.6ms: one fork of the small keeper and one `execveat` instead
+  of the launcher's two execs (the wicket's own exec costs 1.2ms here).
+- **The keeper's thread bounds the jailed clone rate** (85% of the unjailed at c=16, as
+  above): it forks every VM, and a fork of any process costs 130us on this 64-core 6.8
+  kernel (its new memory map's per-CPU counters), with the copy-on-write faults after it
+  about 0.6ms of the keeper's thread per VM. A vfork child would hold the keeper for the
+  jail's setup, 1-4ms per VM (mostly the kernel's mount namespace lock: `pivot_root`,
+  `mount`, `umount2`, `unshare`; in parallel in the children).
+- **A jail's mount namespace is copied from a template**: `clone3`'s `CLONE_NEWNS` copied
+  the host's 41 mounts per VM in the keeper's thread (900 clones/s at c=16); a template of
+  2 mounts copied in the child, 1,200; each id's directory and cgroup reused, 1,300. A
+  route's files are bound from mounts of the template made once per route (`open_tree` of
+  the wicket's fds: a mount of another namespace cannot be bound in the jail's).
+- **A jailed VM's charge beyond its guest memory is 2.5-3 MiB** (its heap, KVM's
+  structures, page tables of 0.25% of what the guest touched): a shared CNB Java VM (512
+  MiB, 2 vCPUs) peaked at 248 MiB under load, its limit 564; its clones idle at 5-6 MiB and
+  peak at 50-60 MiB under keep-alive load, the route's cgroup holding the 512 MiB snapshot.
+  Jailed, 13.0k keep-alive req/s for the shared JVM, 41.5k over 16 JVM clones, 596 new
+  connections/s (689 through the server above).
+- **Docker's seccomp profile refuses `pivot_root`**, `CAP_SYS_ADMIN` or not (`unshare`,
+  `mount`, `umount2` pass), and its AppArmor profile mounts: jail mode runs unconfined in a
+  container.
+
 Caveats:
 
 - `/dev/kvm` ACLs set by hand do not last: udev rewrote one within minutes. Use the
@@ -461,5 +594,5 @@ Caveats:
 
 ## Not yet
 
-The jailer (chroot, cgroups, seccomp) and aarch64 (`.todo` items of their own), clone reuse
-and pools of shared VMs (`.todo` 181), and the wasm wicket's console.
+aarch64 (a `.todo` item of its own), clone reuse and pools of shared VMs (`.todo` 181), CPU
+limits per VM, and the wasm wicket's console.

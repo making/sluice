@@ -14,4 +14,7 @@ The wicket, its guest and the CI run on x86_64 only. Firecracker supports aarch6
   Firecracker's vmclock device (once released) has the guest resync
 - VMGenID and the vsock device on aarch64 Firecracker: check a clone's random state and
   the half-close framing as `tests/vm.rs` does
+- Jail mode: on aarch64 Firecracker reads the host's cache topology
+  (`/sys/devices/system/cpu/cpu0/cache`) and `MIDR_EL1`, which the jailer copies into its
+  jails; the wicket's jail (`src/jail.rs`) holds no `/sys`
 - CI: an aarch64 runner exposing `/dev/kvm`, or the job stays x86_64
