@@ -30,7 +30,8 @@
 //! `SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL=1` runs it in jail mode instead,
 //! started as root (`sudo -n`, skipped without it), the wicket as the test's user,
 //! and checks the jails: each VM a `firecracker` of an id of its own, PID 1 of its
-//! namespace, without privileges, in a cgroup limiting its memory (and a route's
+//! namespace, without privileges, under seccomp filters of the keeper's, its own and
+//! Firecracker's, in a cgroup limiting its memory (and a route's
 //! clones' CPU, `cpu`); the VMs and the
 //! wicket ending with the keeper (SIGKILL).
 #![cfg(target_os = "linux")]
@@ -303,8 +304,29 @@ async fn every_route_serves_http_through_the_tunnel() {
         (true, Some(_)) => jails(&wicket, None, NONROOT),
         // SAFETY: getuid
         (true, None) => jails(&wicket, Some(&cgroup), unsafe { libc::getuid() }),
-        (false, _) => {}
+        // the wicket's seccomp filter, on the test's (if any)
+        (false, None) => assert_eq!(
+            filters(wicket.child.id() as i32),
+            filters(std::process::id() as i32) + 1,
+            "the wicket's filter"
+        ),
+        (false, Some(_)) => {}
     }
+}
+
+/// The field `name` of the status of `pid` (empty: none, or no such process).
+fn status(pid: i32, name: &str) -> String {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(name))
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// The seccomp filters of `pid`'s main thread.
+fn filters(pid: i32) -> u32 {
+    status(pid, "Seccomp_filters:").parse().unwrap_or(0)
 }
 
 /// The jails of the VMs alive (the shared VM and the warm clones): each a
@@ -316,14 +338,9 @@ async fn every_route_serves_http_through_the_tunnel() {
 /// death signal); its files and cgroups are removed here (a container's go with it).
 fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
     let keeper = wicket.keeper();
-    let field = |pid: i32, name: &str| {
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix(name))
-            .map(|value| value.trim().to_string())
-            .unwrap_or_default()
-    };
+    // the keeper's seccomp filter (the container's under it, if any), the wicket's and
+    // each jail's on it, Firecracker's on the jail's
+    assert_eq!(status(keeper, "Seccomp:"), "2", "the keeper's filter");
     let cgroup_of = |pid: i32| {
         let own = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
         own.trim()
@@ -338,7 +355,7 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
     });
     let user = user.to_string();
     let (vms, others): (Vec<i32>, Vec<i32>) = children(keeper).into_iter().partition(|pid| {
-        let uid: u32 = field(*pid, "Uid:")
+        let uid: u32 = status(*pid, "Uid:")
             .split_whitespace()
             .next()
             .and_then(|uid| uid.parse().ok())
@@ -353,16 +370,16 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
     let mut ids = Vec::new();
     let mut cpu_limited = 0;
     for vm in &vms {
-        let id = field(*vm, "Uid:");
+        let id = status(*vm, "Uid:");
         assert!(
             id.split_whitespace()
                 .all(|each| Some(each) == id.split_whitespace().next()),
             "{vm}: {id}"
         );
-        assert_eq!(field(*vm, "Gid:"), id, "{vm}: its gid its uid");
-        assert_eq!(field(*vm, "Groups:"), "", "{vm}: no supplementary group");
+        assert_eq!(status(*vm, "Gid:"), id, "{vm}: its gid its uid");
+        assert_eq!(status(*vm, "Groups:"), "", "{vm}: no supplementary group");
         assert!(
-            field(*vm, "NSpid:").ends_with("\t1"),
+            status(*vm, "NSpid:").ends_with("\t1"),
             "{vm}: PID 1 of its namespace"
         );
         for (name, value) in [
@@ -371,8 +388,12 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
             ("NoNewPrivs:", "1"),
             ("Seccomp:", "2"),
         ] {
-            assert_eq!(field(*vm, name), value, "{vm}: {name}");
+            assert_eq!(status(*vm, name), value, "{vm}: {name}");
         }
+        assert!(
+            filters(*vm) >= filters(keeper) + 2,
+            "{vm}: the jail's filter and Firecracker's"
+        );
         let own = cgroup_of(*vm);
         assert!(
             own.starts_with(&format!("{cgroup}/")),
@@ -415,9 +436,14 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
     );
     assert_eq!(others.len(), 1, "the wicket: {others:?}");
     assert_eq!(
-        field(others[0], "Uid:").split_whitespace().next(),
+        status(others[0], "Uid:").split_whitespace().next(),
         Some(user.as_str()),
         "the wicket runs as jail-user"
+    );
+    assert_eq!(
+        filters(others[0]),
+        filters(keeper) + 1,
+        "the wicket's filter on the keeper's"
     );
 
     let killed = Command::new("sudo")
@@ -426,7 +452,7 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
         .unwrap();
     assert!(killed.success());
     let deadline = Instant::now() + Duration::from_secs(10);
-    let ended = |pid: &i32| matches!(field(*pid, "State:").chars().next(), None | Some('Z'));
+    let ended = |pid: &i32| matches!(status(*pid, "State:").chars().next(), None | Some('Z'));
     while !vms.iter().chain(&others).all(ended) {
         assert!(
             Instant::now() < deadline,

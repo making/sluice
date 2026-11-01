@@ -39,6 +39,7 @@ pub mod listener;
 pub mod output;
 pub mod route;
 pub mod routes;
+pub mod seccomp;
 pub mod state;
 pub mod vm;
 pub mod wire;

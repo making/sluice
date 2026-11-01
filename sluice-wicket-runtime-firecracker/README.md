@@ -44,9 +44,9 @@ Two Cargo workspaces:
   `route.rs` a route's VMs, `capacity.rs` their budget, `vm.rs` one Firecracker VM,
   `output.rs` the VMs' output, `egress.rs` their egress, `wire.rs` the vsock framing, the
   restore notice and the egress rules,
-  `listener.rs` `--listen`, `state.rs` the state dir; jail mode's `keeper.rs` (the
-  privileged half, and the wicket's client of it) and `jail.rs` (one VM's jail, the VMs'
-  cgroups)
+  `listener.rs` `--listen`, `state.rs` the state dir, `seccomp.rs` the seccomp filters;
+  jail mode's `keeper.rs` (the privileged half, and the wicket's client of it) and
+  `jail.rs` (one VM's jail, the VMs' cgroups)
 - `guest/` -- the VMs' `/init`, built for `x86_64-unknown-linux-musl` or
   `aarch64-unknown-linux-musl` (its `rust-toolchain.toml` has rustup add both, rust-lld
   links the other arch's): `log.rs` the processes' output, `egress.rs` their egress,
@@ -387,8 +387,8 @@ keeper (root) --runs--> wicket (jail-user) --requests--> keeper --clone3--> fire
 Each VM's `firecracker`:
 
 - runs as an id (uid and gid) of `--jail-ids` of its own, without supplementary group,
-  capability (the bounding set dropped) or new privileges; Firecracker's seccomp filters as
-  always
+  capability (the bounding set dropped) or new privileges; the wicket's seccomp filter,
+  Firecracker's stacked on it (see [Host setup](#host-setup))
 - is PID 1 of a PID namespace of its own, in mount, IPC and UTS namespaces of its own and a
   network namespace without interfaces (the VMs' alike: one per VM cost 0.9ms of each spawn)
 - has a read-only tmpfs as its root holding `/dev/kvm` (a node of its own), its rootfs and
@@ -472,7 +472,12 @@ What applies, in both modes unless said:
   6.4+ (Firecracker resets a VM's physical counter, `CNTPCT`, with `KVM_CAP_COUNTER_OFFSET`;
   older ones show the host's)
 - **seccomp**: Firecracker's default filters, as the wicket never passes
-  `--seccomp-filter` or `--no-seccomp`
+  `--seccomp-filter` or `--no-seccomp`, stacked on the wicket's own: the calls Docker's
+  default seccomp profile refuses a process without capabilities (`src/seccomp.rs`: mounts,
+  namespaces, `bpf`, `keyctl`, `io_uring`, `userfaultfd`, `clone3` (`ENOSYS`, as there),
+  old socket families...), and `ptrace`. The wicket installs it on itself before it starts,
+  and in jail mode on each jail before its `firecracker`; the keeper runs under the same but
+  for the jails' namespace and mount calls
 - **the serial console and the logs**: the VMs boot with `8250.nr_uarts=0` (the console
   only with `SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE`), which a guest's root may undo. A
   VM's log (`firecracker.log` in the state dir, on a tmpfs: memory) is bounded at 16 MiB
@@ -509,7 +514,7 @@ verified), the guest of the wicket's own version and the sample rootfs, under
 `/usr/local/share/sluice-wicket-runtime-firecracker/`.
 The host needs KVM (bare metal, or a VM with nested virtualization); the container needs
 `/dev/kvm` and its group alone (no `--privileged`, no capability: vsock only), and runs under
-Docker's default seccomp profile, Firecracker's own filters stacked on it:
+Docker's default seccomp profile, the wicket's and Firecracker's own filters stacked on it:
 
 ```text
 docker run --rm --device /dev/kvm --group-add $(stat -c %g /dev/kvm) \
@@ -542,9 +547,11 @@ docker run --rm --device /dev/kvm --group-add $(stat -c %g /dev/kvm) \
 
 [Jail mode](#jail-mode) runs as root in the container (the keeper; the wicket as `nonroot`)
 with `CAP_SYS_ADMIN` (namespaces, mounts, `pivot_root`), unconfined: Docker's AppArmor
-profile denies mounts, and its seccomp profile `pivot_root` (with the capability too; the
-VMs keep Firecracker's filters). Its default `--jail-cgroup` is the container's own (the
-keeper remounts the read-only cgroup filesystem writable), and the VMs need no group:
+profile denies mounts, and its seccomp profile `pivot_root` (with the capability too). The
+container's seccomp profile is replaced by the wicket's filters (see
+[Host setup](#host-setup)): the profile's denials, the keeper's allowing the jails' calls.
+Its default `--jail-cgroup` is the container's own (the keeper remounts the read-only
+cgroup filesystem writable), and the VMs need no group:
 
 ```text
 docker run --rm --device /dev/kvm -u 0 --cap-add SYS_ADMIN \
@@ -583,8 +590,8 @@ Kubernetes: `/dev/kvm` reaches a Pod through a device plugin (KubeVirt's
 `securityContext.supplementalGroups` holds the node's `kvm` gid, `/run/sluice` is an
 `emptyDir` of `medium: Memory` (counted against the Pod's memory limit), and
 `terminationGracePeriodSeconds` exceeds `--drain-grace`. Jail mode: `runAsUser: 0`,
-`capabilities.add: [SYS_ADMIN]`, `seccompProfile` and `appArmorProfile` `Unconfined` (or a
-privileged container).
+`capabilities.add: [SYS_ADMIN]`, `seccompProfile` (the wicket's filters replace it) and
+`appArmorProfile` `Unconfined` (or a privileged container).
 
 ## aarch64
 
@@ -629,8 +636,10 @@ sg kvm -c "SLUICE_WICKET_RUNTIME_FIRECRACKER_VMS='java.local=$T/upstream.ext4?me
 `SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL=1` runs it in [jail mode](#jail-mode), the wicket
 started as root (`sudo -n`; skipped without it) or, with `..._IMAGE`, as the image runs it
 jailed, and checks the jails of the VMs alive: an id of its own each, PID 1 of its
-namespace, no capability, no new privileges, the seccomp filter on, a cgroup limiting its
-memory (and a route's clones' CPU), on aarch64 the host CPU's files, the wicket as `--jail-user`; the keeper killed (SIGKILL), the VMs and the wicket end.
+namespace, no capability, no new privileges, the jail's seccomp filter and Firecracker's
+on the keeper's, a cgroup limiting its memory (and a route's clones' CPU), on aarch64 the
+host CPU's files, the wicket as `--jail-user` under its filter; the keeper killed
+(SIGKILL), the VMs and the wicket end. Unjailed, it checks the wicket's filter.
 
 The CI runs it on an x86_64 and an aarch64 runner, where the runner exposes `/dev/kvm`,
 with the Firecracker release and the kernel above pinned, and again jailed, on the runner

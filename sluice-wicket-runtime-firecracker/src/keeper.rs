@@ -36,6 +36,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::BoxError;
 use crate::config::JailSettings;
 use crate::jail::{self, Access, Cgroup, Cgroups, Ids, Jail, Limits, Template};
+use crate::seccomp::Filter;
 
 /// The environment variable naming the wicket's end of the socket pair.
 pub const KEEPER_FD: &str = "SLUICE_WICKET_RUNTIME_FIRECRACKER_KEEPER_FD";
@@ -318,6 +319,11 @@ pub fn run(
     state: Option<PathBuf>,
     max_vms: usize,
 ) -> ExitCode {
+    // first, single-threaded: the wicket and the jails inherit it
+    if let Err(e) = Filter::keeper().install() {
+        eprintln!("keeper: the seccomp filter: {e}");
+        return ExitCode::FAILURE;
+    }
     match Keeper::start(jail, firecracker, state, max_vms) {
         Ok(mut keeper) => {
             let code = keeper.serve();
@@ -397,6 +403,8 @@ struct Keeper {
     waiting: VecDeque<Waiting>,
     /// Seals waiting for their route's template to be reaped: call, route.
     seals: Vec<(u64, u64)>,
+    /// The VMs' seccomp filter, installed in each jail.
+    filter: Filter,
 }
 
 impl Keeper {
@@ -575,6 +583,7 @@ impl Keeper {
             next_vm: 0,
             waiting: VecDeque::new(),
             seals: Vec::new(),
+            filter: Filter::unprivileged(),
         })
     }
 
@@ -1000,6 +1009,7 @@ impl Keeper {
             cgroup: cgroup.fd(),
             open_files: request.open_files.min(MAX_OPEN_FILES),
             file_size,
+            filter: &self.filter,
         })
     }
 

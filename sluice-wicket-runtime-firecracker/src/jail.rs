@@ -15,7 +15,8 @@
 //!   VM restored from a file needs none
 //! - a cgroup of its own ([`Cgroups`]), entered by `clone3` (`CLONE_INTO_CGROUP`)
 //! - a uid and gid of its own, no supplementary group, the capability bounding set
-//!   dropped, no new privileges; Firecracker's seccomp filters as it installs them
+//!   dropped, no new privileges; the wicket's seccomp filter (`seccomp`), then
+//!   Firecracker's as it installs them
 //! - the open file, file size and core limits; umask 007 (its sockets reach the wicket
 //!   through the group of their directory)
 //! - its program the route's copy of `firecracker`, a sealed memfd executed by
@@ -39,6 +40,8 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+
+use crate::seccomp::Filter;
 
 /// `CLONE_INTO_CGROUP` (Linux 5.7), which libc does not name for every target.
 const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
@@ -123,6 +126,8 @@ pub struct Jail<'a> {
     pub open_files: u64,
     /// `RLIMIT_FSIZE`, bytes: a template writes its memory, the others their log alone.
     pub file_size: u64,
+    /// The VM's seccomp filter before Firecracker's ([`Filter::unprivileged`]).
+    pub filter: &'a Filter,
 }
 
 /// The names of a route's files in its directory.
@@ -641,6 +646,11 @@ fn jailed(jail: &Jail<'_>, prepared: &Prepared) -> io::Result<std::convert::Infa
         // the uid change cleared it
         check(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0))
             .map_err(failed("the parent death signal"))?;
+        // the calls Docker's default profile refuses, the jail's among them, which the
+        // keeper's filter allows; Firecracker's filters stack on it
+        jail.filter
+            .install()
+            .map_err(failed("the seccomp filter"))?;
         // the keeper ended before it was set? (getppid says 0 in a new PID namespace)
         let mut keeper = libc::pollfd {
             fd: jail.keeper.as_raw_fd(),

@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use sluice_wicket_runtime_firecracker::config::{self, Command};
 use sluice_wicket_runtime_firecracker::keeper::{self, Client};
+use sluice_wicket_runtime_firecracker::seccomp::Filter;
 use sluice_wicket_runtime_firecracker::state::StateDir;
 use sluice_wicket_runtime_firecracker::vm::{self, Launcher};
 
@@ -81,6 +82,12 @@ fn main() -> ExitCode {
             }
         },
     };
+    // the wicket reads what the guests send: under its seccomp filter from here on, its
+    // VMs too (single-threaded: before the runtime)
+    if let Err(e) = Filter::unprivileged().install() {
+        eprintln!("the seccomp filter: {e}");
+        return ExitCode::FAILURE;
+    }
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(e) => {
