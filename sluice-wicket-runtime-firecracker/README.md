@@ -172,7 +172,9 @@ The scripts build the guest for the host's arch, a VM's; `SLUICE_GUEST_ARCH=aarc
 platform, `linux/arm64` or `linux/amd64`).
 
 `--vm host=<rootfs>[?<options>]` adds a route: `mode=shared|per-connection|reuse|pool`,
-`vcpus=N` (1), `mem=MiB` (128), `port=N` (the guest's vsock port, 8080), `per-client=N`,
+`vcpus=N` (1), `mem=MiB` (128), `port=N` (the guest's vsock port, 8080), `boot-ms=N` (how long
+a cold-booted guest may take to listen, 10000; its process exiting first fails it at once: a
+JVM on one vCPU can take more), `per-client=N`,
 `idle-ms=N`, `cpu=N` (jail mode), for the cloned modes `warm=N`, `prime=N`, `vms=N` and
 `wait-ms=N` (see [Limits](#limits)), `keep-ms=N` (reuse, pool), `uses=N` and `lifetime-ms=N`
 (reuse), `conns=N` (pool), `egress=<host>:<port>,...` (see [Egress](#egress)). The advertised
@@ -403,8 +405,10 @@ The manifest of the wicket's platform is pulled (of an index, its `linux/<arch>`
 arches are refused), then its layers (tar or gzip; zstd is refused), checked against their
 digests: a registry on the loopback over plain HTTP, any other over HTTPS against the webPKI
 roots. They unpack over each other as a runtime's do, whiteouts and all, a link never leading
-out of the root, within 4 GiB. The image holds what they say of every file, the guest as `/init`
-and `/sluice/init.json` from the image's config, as `scripts/cnb-rootfs.sh` writes it. One build
+out of the root, within 4 GiB. The image holds what they say of every file, the guest as `/init`,
+`/sluice/init.json` from the image's config, as `scripts/cnb-rootfs.sh` writes it, and what a
+container runtime provides: `/etc/hosts`, and an empty `/etc/resolv.conf` (no name server; the
+JVM buildpack's helper fails the launch without the file). One build
 at a time; the request is held until it is done, ten minutes at most (a refusal is a 422 with
 the reason). xattrs (file capabilities) are dropped.
 

@@ -29,6 +29,7 @@ const NUMBERS = [
   { key: "vcpus", group: "vm", label: "vCPUs", unit: "", fallback: 1, min: 1, modes: MODES },
   { key: "mem", group: "vm", label: "Memory", unit: "MiB", fallback: 128, min: 1, modes: MODES },
   { key: "port", group: "vm", label: "Port", unit: "vsock", fallback: 8080, min: 0, modes: MODES },
+  { key: "boot-ms", group: "vm", label: "Boot", unit: "ms to listen", fallback: 10000, min: 1, modes: MODES },
   { key: "cpu", group: "vm", label: "CPU", unit: "% of one", fallback: null, min: 1, modes: MODES, jailed: true },
   { key: "warm", group: "clones", label: "Warm", unit: "ahead", fallback: 0, min: 0, modes: CLONED },
   { key: "prime", group: "clones", label: "Prime", unit: "GET /", fallback: 0, min: 0, modes: CLONED },

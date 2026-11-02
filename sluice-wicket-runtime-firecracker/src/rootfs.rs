@@ -436,6 +436,9 @@ impl Tree {
         // is a runtime's to write
         let hosts = b"127.0.0.1 localhost sluice\n";
         write(&mut self, "etc", "hosts", hosts, 0o644)?;
+        // empty: no name server, the names are in /etc/hosts. A program may need the file
+        // (the JVM buildpack's link-local-dns helper fails the launch without it)
+        write(&mut self, "etc", "resolv.conf", b"", 0o644)?;
         self.within_limit()?;
 
         // room for what the file system itself takes
@@ -700,6 +703,12 @@ mod tests {
     fn tree(root: &Path) -> Tree {
         let lower = layer(|tar| {
             dir(tar, "etc/", 0o755, 0);
+            link(
+                tar,
+                tar::EntryType::Symlink,
+                "etc/resolv.conf",
+                "../run/systemd/resolve/stub-resolv.conf",
+            );
             file(
                 tar,
                 "etc/passwd",
@@ -805,6 +814,9 @@ mod tests {
             ("/bin", "symlink", "0777", 7, 8),
             ("/init", "regular", "0755", 0, 0),
             ("/tmp", "directory", "0755", 0, 0),
+            ("/etc/hosts", "regular", "0644", 0, 0),
+            // the image's link is replaced; a runtime's file, read by the JVM buildpack's helper
+            ("/etc/resolv.conf", "regular", "0644", 0, 0),
         ] {
             let stat = stat_of(&tools, &image, path);
             for expected in [

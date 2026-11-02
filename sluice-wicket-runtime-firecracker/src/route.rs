@@ -25,8 +25,8 @@ use crate::output::{self, Hosts, Output, Sink};
 use crate::vm::{self, Place, Places, Snapshot, Spec, Vm};
 use crate::wire::{self, Rule};
 
-/// How long a cold-booted guest may take to listen on its port.
-const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default of `boot-ms`: how long a cold-booted guest may take to listen on its port.
+const DEFAULT_BOOT: Duration = Duration::from_secs(10);
 
 /// How long a restored guest may take to accept a stream again (its vsock transport
 /// is reset on restore).
@@ -132,6 +132,8 @@ pub struct RouteSpec {
     pub mode: Mode,
     /// The guest's vsock port.
     pub port: u32,
+    /// How long a cold-booted guest may take to listen on it.
+    pub boot: Duration,
     /// Per-connection and reuse modes: clones kept restored ahead of the connections;
     /// pool mode: the pool's VMs kept serving no connection (default `vms`).
     pub warm: usize,
@@ -163,7 +165,7 @@ pub struct RouteSpec {
 }
 
 impl RouteSpec {
-    /// Parses `host=<rootfs>[?mode=shared|per-connection|reuse|pool&vcpus=N&mem=MiB&cpu=N&port=N&warm=N&prime=N&vms=N&wait-ms=N&keep-ms=N&uses=N&lifetime-ms=N&conns=N&per-client=N&idle-ms=N&egress=<rule>,...&disk=<path>&disk-mib=N]`.
+    /// Parses `host=<rootfs>[?mode=shared|per-connection|reuse|pool&vcpus=N&mem=MiB&cpu=N&port=N&boot-ms=N&warm=N&prime=N&vms=N&wait-ms=N&keep-ms=N&uses=N&lifetime-ms=N&conns=N&per-client=N&idle-ms=N&egress=<rule>,...&disk=<path>&disk-mib=N]`.
     pub fn parse(
         flag: &str,
         firecracker: &std::path::Path,
@@ -235,6 +237,7 @@ impl RouteSpec {
             },
             mode: Mode::Shared,
             port: 8080,
+            boot: DEFAULT_BOOT,
             warm: 0,
             prime: 0,
             vms: None,
@@ -271,6 +274,7 @@ impl RouteSpec {
                 "vcpus" => spec.vm.vcpus = number()?,
                 "mem" => spec.vm.mem_mib = number()?,
                 "port" => spec.port = number()?,
+                "boot-ms" => spec.boot = millis()?,
                 "warm" => spec.warm = number()? as usize,
                 "prime" => spec.prime = number()?,
                 "vms" => spec.vms = Some(number()? as usize),
@@ -419,6 +423,11 @@ impl RouteSpec {
             ("mem", self.vm.mem_mib, 128),
             ("cpu", self.vm.cpu.unwrap_or(0), 0),
             ("port", self.port, 8080),
+            (
+                "boot-ms",
+                self.boot.as_millis() as u32,
+                DEFAULT_BOOT.as_millis() as u32,
+            ),
             ("warm", self.warm as u32, warm as u32),
             ("prime", self.prime, 0),
             ("vms", self.vms.unwrap_or(0) as u32, 0),
@@ -1259,7 +1268,7 @@ impl Route {
             .then(|| Egress::new(spec.vm.egress.clone(), hosts.clone(), sink.clone(), workers));
         let named = egress.as_ref().map(|egress| (egress, name.to_string()));
         let vm = Vm::boot(&spec.vm, &place, role, slot, named).await?;
-        let mut output = ready(&vm, spec.port, &sink, &hosts, name).await?;
+        let mut output = ready(&vm, spec.port, spec.boot, &sink, &hosts, name).await?;
         let booted = started.elapsed();
         let mut taken = None;
         let backend = match spec.mode {
@@ -1547,18 +1556,20 @@ impl Route {
 
 /// Waits for a guest just booted to listen on `port`, its output (the VM `name` of the
 /// route of `hosts`) followed meanwhile: `/init` opens the log stream before it starts
-/// the process, so the output of a process failing to start is printed too. None when
-/// the guest has no log stream (its `/init` predates it).
+/// the process, so the output of a process failing to start is printed too, and a process
+/// exiting before it listens ends the wait. None when the guest has no log stream (its
+/// `/init` predates it).
 async fn ready(
     vm: &Vm,
     port: u32,
+    boot: Duration,
     sink: &Arc<Sink>,
     hosts: &Arc<Hosts>,
     name: &str,
 ) -> Result<Option<Output>, BoxError> {
     let output = followed(
         || vm.dial(wire::LOG_PORT),
-        vm.dial_ready(port, BOOT_TIMEOUT),
+        vm.dial_ready(port, boot),
         |stream| output::follow(stream, sink.clone(), hosts.clone(), name.to_string()),
     )
     .await?;
@@ -1609,8 +1620,20 @@ where
             return Ok(log.await.map(follow));
         }
     };
-    drop(listening.await?);
-    Ok(output)
+    let Some(mut output) = output else {
+        drop(listening.await?);
+        return Ok(None);
+    };
+    tokio::select! {
+        biased;
+        listening = &mut listening => drop(listening?),
+        () = output.exited() => {
+            // its last lines first: what says why
+            output.sync(END_SYNC_TIMEOUT).await;
+            return Err("the guest's process exited before it listened (see its output)".into());
+        }
+    }
+    Ok(Some(output))
 }
 
 /// Sends `notice` on a clone's control stream and reads its answer, a line of at most

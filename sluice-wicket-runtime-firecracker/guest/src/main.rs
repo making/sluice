@@ -450,6 +450,7 @@ fn start(launch: Launch, log: &Arc<Log>) -> std::io::Result<()> {
             if reaped == pid {
                 let line = format!("guest: {program} exited ({status})");
                 log.line(Stream::Stderr, line.as_bytes());
+                log.exited();
             }
         })
     });

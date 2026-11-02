@@ -1,13 +1,24 @@
 //! A sample of what an image runs, for the tests of an image's rootfs: a static HTTP/1.1
 //! server on `PORT` answering what the process is as text -- its uid and gid, the owner and
 //! mode of each path of its arguments, its environment -- and printing a line per request,
-//! as a process's output.
+//! as a process's output. `SAMPLE_WAIT_MS` delays its listening, `SAMPLE_EXIT` has it exit
+//! instead, as a process failing to start does.
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::os::unix::fs::MetadataExt as _;
 
 fn main() {
+    if std::env::var_os("SAMPLE_EXIT").is_some() {
+        eprintln!("sample process: exiting as told");
+        std::process::exit(82);
+    }
+    if let Some(wait) = std::env::var("SAMPLE_WAIT_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(wait));
+    }
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let listener = TcpListener::bind(("127.0.0.1", port.parse().expect("PORT"))).expect("bind");
     println!("sample process on port {port}");

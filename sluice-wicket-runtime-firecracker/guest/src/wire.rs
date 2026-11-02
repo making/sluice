@@ -21,11 +21,13 @@ const DATA: u8 = 0;
 const CLOSE: u8 = 1;
 
 /// The log stream's frames: a line of the processes' stdout, of their stderr, the lines
-/// dropped, the answer to a sync -- whose request, the wicket's, is this one byte.
+/// dropped, the answer to a sync -- whose request, the wicket's, is this one byte -- and
+/// the image's process ended.
 const STDOUT: u8 = 2;
 const STDERR: u8 = 3;
 const GAP: u8 = 4;
 pub const SYNC: u8 = 5;
+const EXITED: u8 = 6;
 
 /// A frame's head: its type and its payload's length.
 const HEAD: usize = 5;
@@ -48,7 +50,7 @@ pub const CONTROL_PORT: u32 = 1024;
 /// `STDERR`, without its newline, at most [`MAX_LINE`] bytes: a longer line goes in
 /// pieces), the lines dropped there (`GAP`: stdout's and stderr's, two u64 BE) and
 /// `SYNC` (no payload): the answer to the wicket's byte `SYNC` once every line the
-/// processes wrote before it was sent.
+/// processes wrote before it was sent, and `EXITED` (no payload): the image's process ended.
 pub const LOG_PORT: u32 = 1025;
 
 /// The longest line of the log stream.
@@ -423,6 +425,8 @@ pub enum LogFrame {
     Gap { stdout: u64, stderr: u64 },
     /// Every line written before the wicket's sync came before this.
     Synced,
+    /// The image's process ended; the VM stays up.
+    Exited,
 }
 
 /// Appends `frame` to `out`.
@@ -439,6 +443,7 @@ pub fn put_log_frame(out: &mut Vec<u8>, frame: &LogFrame) {
             return;
         }
         LogFrame::Synced => (SYNC, &[]),
+        LogFrame::Exited => (EXITED, &[]),
     };
     out.push(kind);
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -461,7 +466,7 @@ pub async fn read_log_frame<R: AsyncRead + Unpin>(
     let fits = match head[0] {
         STDOUT | STDERR => len <= MAX_LINE,
         GAP => len == 16,
-        SYNC => len == 0,
+        SYNC | EXITED => len == 0,
         other => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -485,6 +490,7 @@ pub async fn read_log_frame<R: AsyncRead + Unpin>(
             stdout: count(0),
             stderr: count(8),
         },
+        EXITED => LogFrame::Exited,
         _ => LogFrame::Synced,
     }))
 }

@@ -156,6 +156,12 @@ impl Log {
         }
     }
 
+    /// Tells the wicket the image's process ended, after its last line.
+    pub fn exited(&self) {
+        lock(&self.state).add(LogFrame::Exited);
+        self.queued.notify_one();
+    }
+
     /// Reads `output` (a process's stdout or stderr: the read end of its pipe) to its
     /// end, its lines queued; a last line without its newline is one too.
     pub fn capture(self: &Arc<Self>, stream: Stream, output: impl Into<OwnedFd>) {

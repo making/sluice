@@ -41,6 +41,7 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
                                   warm=N kept (vms), grown by one while each holds conns=N
                                   (16), one beyond warm idle keep-ms killed), vcpus=N (1),
                                   mem=MiB (128), port=N (the guest's vsock port, 8080),
+                                  boot-ms=N a cold-booted guest may take to listen (10000),
                                   per-client=N a client address's connections at once,
                                   idle-ms=N a connection may relay no byte, cpu=N (jail
                                   mode) a VM's host CPU in percent of one,
@@ -727,6 +728,7 @@ pub(crate) struct FileRoute {
     vcpus: Option<u32>,
     mem: Option<u32>,
     port: Option<u32>,
+    boot_ms: Option<u32>,
     warm: Option<u32>,
     prime: Option<u32>,
     vms: Option<u32>,
@@ -745,12 +747,13 @@ pub(crate) struct FileRoute {
 
 impl FileRoute {
     /// The keys of [`FileRoute::options`], in their order.
-    pub(crate) const KEYS: [&'static str; 18] = [
+    pub(crate) const KEYS: [&'static str; 19] = [
         "mode",
         "vcpus",
         "mem",
         "cpu",
         "port",
+        "boot-ms",
         "warm",
         "prime",
         "vms",
@@ -774,6 +777,7 @@ impl FileRoute {
             ("mem", self.mem),
             ("cpu", self.cpu),
             ("port", self.port),
+            ("boot-ms", self.boot_ms),
             ("warm", self.warm),
             ("prime", self.prime),
             ("vms", self.vms),
@@ -880,7 +884,7 @@ mod tests {
         )
         .unwrap();
         let vm = format!(
-            "b.local={}?mode=pool&vms=4&warm=1&conns=8&keep-ms=60000",
+            "b.local={}?mode=pool&vms=4&warm=1&conns=8&keep-ms=60000&boot-ms=90000",
             rootfs.display()
         );
         let config_flag = config.display().to_string();
@@ -947,7 +951,7 @@ mod tests {
         assert_eq!(
             settings.specs[1].target(),
             format!(
-                "firecracker:{}?mode=pool&warm=1&vms=4&conns=8",
+                "firecracker:{}?mode=pool&boot-ms=90000&warm=1&vms=4&conns=8",
                 rootfs.display()
             ),
             "a pool's warm by default its vms"

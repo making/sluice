@@ -164,9 +164,17 @@ impl Sink {
 pub struct Output {
     syncs: mpsc::Sender<()>,
     synced: watch::Receiver<u64>,
+    exited: watch::Receiver<bool>,
 }
 
 impl Output {
+    /// Resolves once the guest said its process ended; never if the stream ends first.
+    pub async fn exited(&mut self) {
+        if self.exited.wait_for(|exited| *exited).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
     /// Waits for every line the guest's processes wrote so far, handed on (to the
     /// printer, and the tap), within `timeout`: whether they were.
     pub async fn sync(&mut self, timeout: Duration) -> bool {
@@ -185,6 +193,7 @@ impl Output {
 pub fn follow(mut stream: UnixStream, sink: Arc<Sink>, hosts: Arc<Hosts>, vm: String) -> Output {
     let (syncs, mut asked) = mpsc::channel(1);
     let (count, synced) = watch::channel(0u64);
+    let (ended, exited) = watch::channel(false);
     tokio::spawn(async move {
         // borrowed halves: an owned write half shuts the socket down when dropped,
         // which Firecracker takes as the end of the whole stream
@@ -200,6 +209,7 @@ pub fn follow(mut stream: UnixStream, sink: Arc<Sink>, hosts: Arc<Hosts>, vm: St
                         sink.gap(&hosts, &vm, stdout, stderr).await;
                     }
                     Ok(Some(LogFrame::Synced)) => count.send_modify(|count| *count += 1),
+                    Ok(Some(LogFrame::Exited)) => drop(ended.send(true)),
                     Ok(None) => return,
                     Err(e) => {
                         let note = format!(
@@ -226,7 +236,11 @@ pub fn follow(mut stream: UnixStream, sink: Arc<Sink>, hosts: Arc<Hosts>, vm: St
             () = asking => {}
         }
     });
-    Output { syncs, synced }
+    Output {
+        syncs,
+        synced,
+        exited,
+    }
 }
 
 /// What a printer wrote, for the tests.
