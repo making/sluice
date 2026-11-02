@@ -164,6 +164,14 @@ pub enum Failure {
     Unreachable(String),
 }
 
+impl Failure {
+    /// Whether a removal the wicket answered so is to be tried again: anything but another
+    /// owner's app, which stays that way.
+    pub fn retried(&self) -> bool {
+        !matches!(self, Failure::Refused { status: 409, .. })
+    }
+}
+
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

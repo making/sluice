@@ -8,11 +8,16 @@
 //! revision moves, its apps of the owner are listed and the difference put /
 //! deleted. The wicket serves on while the cf-api is down.
 //!
+//! An app of the owner the state does not know is left where it is, and logged: a state
+//! that never knew an app did not put it (a lost data directory, another cf-api on the
+//! wicket), and its absence says nothing of what is wanted. What the state deletes it
+//! removes itself, at once or, the wicket not taking it, from `State::removals`.
+//!
 //! The data of a deleted keyvalue instance is deleted once no app maps its
 //! namespace, the wicket's draining routes included: tried at the deletion
 //! and again after each listing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,6 +37,8 @@ pub struct Controller {
     pub offer: Mutex<Option<Offer>>,
     /// What the wicket runs apps as, as it last listed it.
     pub runtime: Mutex<Option<Runtime>>,
+    /// The apps of the owner the state does not know, as logged: once each.
+    pub strangers: Mutex<BTreeSet<String>>,
 }
 
 impl Controller {
@@ -137,6 +144,23 @@ impl Controller {
             }
             self.store
                 .update(|state| state.purges.retain(|kept| *kept != purge));
+        }
+    }
+
+    /// Removes from the wicket the apps deleted while it was unreachable, as far as it
+    /// answers. Not under the edit lock: the caller holds it.
+    async fn remove_pending(&self) {
+        for guid in self.store.read(|state| state.removals.clone()) {
+            match self.wicket.delete(&guid).await {
+                Ok(_) => println!("[{guid}] CELL: removed from the wicket: the app was deleted"),
+                Err(e) if e.retried() => {
+                    println!("[{guid}] CELL: not removed from the wicket yet: {e}");
+                    continue;
+                }
+                Err(e) => println!("[{guid}] CELL: not removed from the wicket: {e}"),
+            }
+            self.store
+                .update(|state| state.removals.retain(|kept| *kept != guid));
         }
     }
 
@@ -288,8 +312,9 @@ impl Controller {
         self.apply(guid, desired.as_ref()).await
     }
 
-    /// Puts / deletes the difference between the apps the wicket listed and
-    /// the state. Not under the edit lock: the caller holds it.
+    /// Puts / deletes the difference between the apps the wicket listed and the state, and
+    /// logs the apps of the owner the state does not know. The listing is taken under the
+    /// edit lock, which the caller holds: what an edit did while it waited is in it.
     async fn fix(&self, listed: &[ListedApp]) {
         let owner = &self.wicket.owner;
         let wanted: Vec<(String, Option<AppBody>)> = self.store.read(|state| {
@@ -313,21 +338,32 @@ impl Controller {
                 (None, None) => {}
             }
         }
-        for app in listed {
-            if app.app.owner == *owner && !wanted.iter().any(|(guid, _)| *guid == app.name) {
-                match self.wicket.delete(&app.name).await {
-                    Ok(_) => println!("[{}] CELL: removed from the wicket: no such app", app.name),
-                    Err(e) => println!("[{}] CELL: not removed from the wicket: {e}", app.name),
-                }
+        let removing = self.store.read(|state| state.removals.clone());
+        let strangers: BTreeSet<&str> = listed
+            .iter()
+            .filter(|app| app.app.owner == *owner)
+            .map(|app| app.name.as_str())
+            .filter(|name| !wanted.iter().any(|(guid, _)| guid == name))
+            .filter(|name| !removing.iter().any(|guid| guid == name))
+            .collect();
+        let mut logged = self.strangers.lock().expect("no panic under the lock");
+        logged.retain(|name| strangers.contains(name.as_str()));
+        for name in strangers {
+            if logged.insert(name.to_string()) {
+                println!(
+                    "[{name}] CELL: left in the wicket: this state did not put it (a lost \
+                     --data-dir, another cf-api?); DELETE /api/apps/{name}?owner={owner} of the \
+                     wicket removes it"
+                );
             }
         }
     }
 
-    /// Lists the wicket's apps and fixes the difference at startup and
-    /// whenever the wicket's revision moves, then tries the pending purges
-    /// (after a hold too: a drained route's end moves no revision); while
-    /// the wicket is unreachable, every started app is `STARTING`, and the
-    /// wicket is tried again with a growing pause.
+    /// Lists the wicket's apps and fixes the difference at startup, whenever the wicket's
+    /// revision moves and when it answers again, then tries the pending removals and
+    /// purges (after a hold too: a drained route's end moves no revision); while the wicket
+    /// is unreachable, every started app is `STARTING`, and the wicket is tried again with
+    /// a growing pause.
     pub async fn watch(self: Arc<Self>) {
         let mut after: Option<u64> = None;
         let mut pause = Duration::from_secs(1);
@@ -336,6 +372,9 @@ impl Controller {
                 Ok(listing) => listing,
                 Err(e) => {
                     self.unreachable(&e);
+                    // back, it is looked at whatever its revision: a wicket restarted
+                    // may have come to the one it had
+                    after = None;
                     tokio::time::sleep(pause).await;
                     pause = (pause * 2).min(Duration::from_secs(30));
                     continue;
@@ -345,14 +384,20 @@ impl Controller {
             self.note_offer(&listing);
             let moved = after != Some(listing.revision);
             after = Some(listing.revision);
-            let pending = self.store.read(|state| !state.purges.is_empty());
+            let pending = self
+                .store
+                .read(|state| !state.purges.is_empty() || !state.removals.is_empty());
             if !moved && !pending {
                 continue;
             }
             let _edit = self.edits.lock().await;
             if moved {
-                self.fix(&listing.apps).await;
+                match self.wicket.list(None).await {
+                    Ok(current) => self.fix(&current.apps).await,
+                    Err(_) => after = None,
+                }
             }
+            self.remove_pending().await;
             self.purge_pending().await;
         }
     }
@@ -517,6 +562,16 @@ mod tests {
             let sandbox = vm_sandbox(64, instances, &BTreeMap::new());
             assert_eq!((sandbox.mode.as_deref(), sandbox.vms), (Some(mode), vms));
         }
+        // a removal the wicket did not take is tried again, but for another owner's app
+        let refused = |status| Failure::Refused {
+            status,
+            error: String::new(),
+            host: None,
+            missing: Vec::new(),
+        };
+        assert!(refused(422).retried());
+        assert!(Failure::Unreachable(String::new()).retried());
+        assert!(!refused(409).retried());
 
         state.app_mut(&guid).unwrap().started = false;
         assert_eq!(

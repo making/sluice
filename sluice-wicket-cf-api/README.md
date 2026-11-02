@@ -320,7 +320,11 @@ On a Firecracker wicket (its listing says `runtime: firecracker`):
   (`GET /api/apps?after=`), it lists the wicket's apps of its owner and puts / deletes the
   difference (the same app again changes nothing: the wicket's generation stays). The wicket
   serves on while the cf-api is down; with the wicket down, the apps show `STARTING` and are
-  put when it is back
+  put when it is back, and an app deleted meanwhile (or whose removal it refused) is removed then
+- an app of its owner the state does not know is left where it is: a new or lost `--data-dir`
+  removes nothing. It is logged (`CELL: left in the wicket`), still serves, and keeps its hosts
+  (a push of one is refused, naming it): `DELETE /api/apps/<guid>?owner=cf` of the wicket's
+  console removes it. The login's key goes with the directory too: the CLI logs in again
 - `cf logs` (log-cache `read`, polled by the CLI): an in-memory ring of 1000 lines per app of
   the cf-api's own lines: staging (`STG`), lifecycle (`API`), the wicket's outcome (`CELL`).
   With `--flume`, the app's own too, from the live access log the wicket feeds: its output

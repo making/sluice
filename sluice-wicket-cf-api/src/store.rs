@@ -43,6 +43,12 @@ pub struct State {
     /// is yet to delete.
     #[serde(default)]
     pub purges: Vec<Purge>,
+    /// The guids of the apps deleted while the wicket did not take it, to remove from it
+    /// when it does. All an app of the owner is ever removed for without an app here to
+    /// say so: a state that is not the one that put an app (a lost data directory, another
+    /// cf-api) knows nothing of it, and leaves it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removals: Vec<String>,
     /// Where the watch of the flume resumes: past the last line it took
     /// (`flume`); None before one.
     #[serde(default, skip_serializing_if = "Option::is_none")]

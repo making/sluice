@@ -245,7 +245,7 @@ impl Uaa {
             .map_err(|_| "bad signature encoding")?;
         let expected = hmac_sha256(&self.key, signed.as_bytes());
         if !constant_time_eq(&given, &expected) {
-            return Err("bad signature".into());
+            return Err("signed with another key (a new data directory?): log in again".into());
         }
         let header: Value = serde_json::from_slice(
             &URL_SAFE_NO_PAD
@@ -561,7 +561,7 @@ mod tests {
             other
                 .verify(tokens["access_token"].as_str().unwrap())
                 .unwrap_err(),
-            "bad signature"
+            "signed with another key (a new data directory?): log in again"
         );
         assert!(uaa.verify("not.a.jwt").is_err());
         let _ = std::fs::remove_dir_all(&dir);

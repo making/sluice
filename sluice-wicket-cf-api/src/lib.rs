@@ -201,6 +201,7 @@ pub async fn serve(
         edits: tokio::sync::Mutex::new(()),
         offer: std::sync::Mutex::new(None),
         runtime: std::sync::Mutex::new(None),
+        strangers: std::sync::Mutex::default(),
     });
     let flume = settings
         .flume

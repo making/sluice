@@ -734,6 +734,17 @@ fn the_cf_cli_deploys_to_the_wicket() {
     let generation = listing(&console)["generation"].as_u64().unwrap();
     let (open_token, _) = cf.tokens();
     api.kill();
+
+    // a lost state (a new data directory): the wicket's apps of the owner stay, and the
+    // log says so
+    let (lost, _) = start_api(&api_listen, &console, &flume_url, &dir.join("cf-lost"), &[]);
+    let left = lost.line("CELL: ");
+    assert!(left.contains("left in the wicket"), "{left}");
+    assert_eq!(listing(&console)["generation"], generation);
+    assert_eq!(listing(&console)["apps"].as_array().unwrap().len(), 2);
+    assert_eq!(get(&listen, "hello.localhost", "/", None).0, 200);
+    drop(lost);
+
     let tls = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
     let (cert_file, key_file) = (dir.join("tls.crt"), dir.join("tls.key"));
     std::fs::write(&cert_file, tls.cert.pem()).unwrap();
@@ -1217,6 +1228,28 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         std::thread::sleep(Duration::from_millis(500));
     }
 
+    // the wicket restarted, back at the revision it had: the app shows starting while the
+    // wicket is down, and running again once it is back
+    let shows = |app: &str, state: &str| {
+        let deadline = Instant::now() + HANG;
+        loop {
+            let shown = cf.ok(&["app", app]);
+            if shown
+                .lines()
+                .any(|line| line.starts_with("#0") && line.contains(state))
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{app} is not {state}: {shown}");
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+    wicket.kill();
+    drop(wicket);
+    shows("fc", "starting");
+    wicket = start_wicket();
+    shows("fc", "running");
+
     // two instances: a pool of two VMs cloned from a snapshot, env and all
     cf.ok(&["scale", "fc", "-i", "2"]);
     let scaled = &listing(&console)["apps"][0]["sandbox"];
@@ -1237,6 +1270,23 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         status == 200 && body.contains("VCAP_APPLICATION={"),
         "{status}: {body}"
     );
+
+    // deleted while the wicket is down: removed when it is back
+    cf.ok(&["push", "gone", "-p", dir.join("rootfs").to_str().unwrap()]);
+    wicket.kill();
+    drop(wicket);
+    cf.ok(&["delete", "gone", "-r", "-f"]);
+    wicket = start_wicket();
+    let deadline = Instant::now() + HANG;
+    while listing(&console)["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|app| app["hosts"][0] == "gone.localhost")
+    {
+        assert!(Instant::now() < deadline, "the deleted app stays");
+        std::thread::sleep(Duration::from_millis(200));
+    }
 
     // the wicket's directory lost: the cf-api puts its apps back, the image's rootfs
     // made again, of the digest it had

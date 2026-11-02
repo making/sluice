@@ -1335,9 +1335,14 @@ impl Api {
     async fn delete_app(&self, req: &Req, guid: &str) -> Reply {
         let app = self.app(guid)?;
         let _edit = self.controller.edits.lock().await;
-        // gone from the wicket first; unreachable, the watch removes it later
-        let _ = self.controller.apply(guid, None).await;
-        let blobs = self.store.update(|state| state.remove_app(guid));
+        // gone from the wicket first; if it does not take that, the watch removes it when it does
+        let removed = self.controller.apply(guid, None).await;
+        let blobs = self.store.update(|state| {
+            if removed.as_ref().is_err_and(Failure::retried) {
+                state.removals.push(guid.to_string());
+            }
+            state.remove_app(guid)
+        });
         self.store.delete(&blobs);
         self.logs.forget(guid);
         println!("[{guid}] API: deleted app {}", app.name);
