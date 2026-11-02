@@ -19,6 +19,9 @@
 //! reused by the next connections, or a pool serving many each -- (`route`, `vm`),
 //! within the VMs' budget (`capacity`).
 //!
+//! `--listen` serves the routes over plain TCP as well, each connection routed
+//! by its first request's host (`listener`).
+//!
 //! The processes' output in the VMs reaches the wicket's stdout / stderr, and
 //! with `--flume` the live access log (`output`, through `sluice-wicket-tunnel`'s
 //! feed).
@@ -34,6 +37,8 @@
 pub mod capacity;
 pub mod config;
 pub mod egress;
+pub mod head;
+pub mod hpack;
 pub mod jail;
 pub mod keeper;
 pub mod listener;
@@ -118,7 +123,9 @@ pub async fn run(
         }
         None => None,
     };
-    let (open_files, vm_open_files) = vm::set_open_files(max_connections)?;
+    // a shared VM's connections: the tunnel's and the listener's
+    let serving = usize::from(server.is_some()) + usize::from(listen.is_some());
+    let (open_files, vm_open_files) = vm::set_open_files(max_connections * serving)?;
     println!("open file limit {open_files}, each VM's {vm_open_files}");
     let capacity = Capacity::new(max_vms, max_memory);
     println!(
@@ -147,9 +154,17 @@ pub async fn run(
     let (hangups, hangups_received) = mpsc::channel(1);
     signals::forward_hangups(hangups)?;
     if let Some(address) = listen {
-        let listener = tokio::net::TcpListener::bind(&address).await?;
-        println!("listening on {}", listener.local_addr()?);
-        tokio::spawn(listener::run(listener, routes.clone(), workers.clone()));
+        let listener = sluice_wicket_tunnel::listener::bind(&address).await?;
+        println!(
+            "listening on {}, {max_connections} connections at most",
+            listener.local_addr()?
+        );
+        tokio::spawn(listener::run(
+            listener,
+            routes.clone(),
+            workers.clone(),
+            max_connections,
+        ));
     }
     let Some(server) = server else {
         // local mode alone: nothing to drain, a signal ends the process at once

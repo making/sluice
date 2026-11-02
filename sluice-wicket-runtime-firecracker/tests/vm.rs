@@ -9,8 +9,9 @@
 //! output -- a shared VM's, a template's, a clone's -- on the wicket's stdout /
 //! stderr and on a flume (`sluice-wicket-tunnel`'s double); the guests' egress to
 //! a destination on the host, by name, address, range and IPv6, from a shared VM
-//! and a clone, and its records; a reload of the `--config` file, polled,
-//! removing a route and replacing a rootfs.
+//! and a clone, and its records; the routes through `--listen` as well, by host
+//! (http/1.1 and h2c, an unknown one answered 404); a reload of the `--config`
+//! file, polled, removing a route and replacing a rootfs.
 //!
 //! Skipped where `/dev/kvm` is not usable. Elsewhere it needs Firecracker
 //! (`SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER`, else `firecracker` on
@@ -186,6 +187,8 @@ async fn every_route_serves_http_through_the_tunnel() {
         &flume,
         "--flume-token",
         "f1ume",
+        "--listen",
+        "127.0.0.1:0",
     ]
     .map(String::from)
     .into();
@@ -240,6 +243,7 @@ async fn every_route_serves_http_through_the_tunnel() {
             tunnel: &tunnel,
             host: &upstream.host,
             address: dial_address(&upstream.target_url),
+            listen: None,
         };
         let sample = !extra
             .iter()
@@ -264,6 +268,36 @@ async fn every_route_serves_http_through_the_tunnel() {
             assert!(checked.is_ok(), "reuse.local: hung; {}", wicket.log());
         }
     }
+
+    // through --listen, by host: the shared VM counting on (by Host, then by h2c
+    // :authority), a clone of its own, an unknown host answered 404
+    let listening = wicket.listening();
+    let via = |host| Route {
+        tunnel: &tunnel,
+        host,
+        address: String::new(),
+        listen: Some(listening),
+    };
+    let shared = counts.get_mut(&target("shared.local")).unwrap();
+    let listened = async {
+        let base = *shared;
+        let first = via("shared.local").keep_alive(0).await;
+        assert_eq!(served(&first), [base + 1, base + 2, base + 3], "{first:?}");
+        let (status, body) = via("alias.local").request(0, true, Bytes::new()).await;
+        assert_eq!((status, served(&[body])), (200, vec![base + 4]));
+        *shared += 4;
+        assert_eq!(served(&via("clone.local").keep_alive(0).await), [1, 2, 3]);
+        for h2 in [false, true] {
+            let refused = via("unknown.local").request(0, h2, Bytes::new()).await;
+            let message = "no firecracker route for host 'unknown.local'";
+            assert_eq!(refused, (404, message.to_string()), "h2 {h2}");
+        }
+    };
+    assert!(
+        tokio::time::timeout(HANG, listened).await.is_ok(),
+        "--listen: hung; {}",
+        wicket.log()
+    );
 
     let egressed = egress(&tunnel, &target, &mut conn_id, &wicket, port, v6);
     assert!(
@@ -294,6 +328,7 @@ async fn every_route_serves_http_through_the_tunnel() {
         tunnel: &tunnel,
         host: "shared.local",
         address: dial_address(&target("shared.local")),
+        listen: None,
     };
     // the old VM counts on until a new one on the new rootfs serves
     let deadline = Instant::now() + HANG;
@@ -310,6 +345,7 @@ async fn every_route_serves_http_through_the_tunnel() {
         tunnel: &tunnel,
         host: "capped.local",
         address: dial_address(&target("capped.local")),
+        listen: None,
     };
     let deadline = Instant::now() + HANG;
     loop {
@@ -579,6 +615,7 @@ async fn egress(
         tunnel,
         host,
         address: dial_address(&target(host)),
+        listen: None,
     };
     let mut ask = async |route: &Route<'_>, query: String, body: &str| {
         *conn_id += 1;
@@ -669,6 +706,7 @@ async fn output(
         tunnel,
         host,
         address: dial_address(&target(host)),
+        listen: None,
     };
     *conn_id += 1;
     let shared = route("alias.local").get(*conn_id, "/log").await;
@@ -791,14 +829,32 @@ impl Drop for Scratch {
     }
 }
 
-/// One advertised route, reached through the tunnel.
+/// One advertised route, reached through the tunnel, or through `--listen` at
+/// `listen`.
 struct Route<'a> {
     tunnel: &'a ServerTunnel,
     host: &'a str,
     address: String,
+    listen: Option<std::net::SocketAddr>,
 }
 
 impl Route<'_> {
+    /// Connection `conn_id` to the route: the tunnel's, or one to `--listen`
+    /// pumped to it.
+    fn connect(&self, conn_id: i64) -> tokio::io::DuplexStream {
+        let Some(listen) = self.listen else {
+            return self.tunnel.connect(conn_id, &self.address);
+        };
+        let (client, mut pumped) = tokio::io::duplex(64 * 1024);
+        let stream = std::net::TcpStream::connect(listen).unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let mut stream = tokio::net::TcpStream::from_std(stream).unwrap();
+        tokio::spawn(async move {
+            let _ = tokio::io::copy_bidirectional(&mut pumped, &mut stream).await;
+        });
+        client
+    }
+
     /// `scripts/check.sh`'s cases. With the sample guest (`sample`), the
     /// answers tell the VMs apart: a VM per connection starts every
     /// connection at its first request, a shared VM counts on from the
@@ -1037,7 +1093,7 @@ impl Route<'_> {
     }
 
     async fn send(&self, conn_id: i64, method: &str, path: &str, body: &str) -> String {
-        let io = TokioIo::new(self.tunnel.connect(conn_id, &self.address));
+        let io = TokioIo::new(self.connect(conn_id));
         let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await.unwrap();
         tokio::spawn(connection);
         let request = hyper::Request::builder()
@@ -1054,7 +1110,7 @@ impl Route<'_> {
 
     /// Three http/1.1 requests on one connection, its end awaited; their bodies.
     async fn keep_alive(&self, conn_id: i64) -> Vec<String> {
-        let io = TokioIo::new(self.tunnel.connect(conn_id, &self.address));
+        let io = TokioIo::new(self.connect(conn_id));
         let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await.unwrap();
         let ended = tokio::spawn(connection.without_shutdown());
         let mut bodies = Vec::new();
@@ -1083,7 +1139,7 @@ impl Route<'_> {
     /// http/1.1: a POST of `body`, or a GET without one; the status and the
     /// answer.
     async fn request(&self, conn_id: i64, h2: bool, body: Bytes) -> (u16, String) {
-        let io = TokioIo::new(self.tunnel.connect(conn_id, &self.address));
+        let io = TokioIo::new(self.connect(conn_id));
         let method = if body.is_empty() { "GET" } else { "POST" };
         let request = hyper::Request::builder()
             .method(method)
@@ -1331,6 +1387,22 @@ impl Wicket {
             child,
             log,
             container,
+        }
+    }
+
+    /// The address `--listen` bound, from its log.
+    fn listening(&self) -> std::net::SocketAddr {
+        let deadline = Instant::now() + HANG;
+        loop {
+            let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+            let line = log
+                .lines()
+                .find_map(|line| line.strip_prefix("listening on "));
+            if let Some(line) = line {
+                return line.split(',').next().unwrap().parse().unwrap();
+            }
+            assert!(Instant::now() < deadline, "not listening; {}", self.log());
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 

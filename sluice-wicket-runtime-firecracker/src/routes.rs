@@ -59,12 +59,19 @@ impl Table {
         }
     }
 
-    /// The route when one alone is advertised (`--listen`).
+    /// The route when one alone is advertised (`--listen`: whatever the host).
     pub fn sole(&self) -> Option<Arc<Route>> {
         match &self.advertised[..] {
             [sole] => self.routes.get(&sole.target_url).cloned(),
             _ => None,
         }
+    }
+
+    /// The route of `host` (no port) on `--listen`
+    /// (`sluice_wicket_tunnel::routes::Table::host_route`).
+    pub fn by_host(&self, host: &str) -> Option<Arc<Route>> {
+        let target = &sluice_wicket_tunnel::routes::Table::host_route(self, host)?.target_url;
+        self.routes.get(target).cloned()
     }
 }
 

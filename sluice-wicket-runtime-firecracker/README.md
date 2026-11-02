@@ -71,7 +71,8 @@ Two Cargo workspaces:
   `route.rs` a route's VMs, `capacity.rs` their budget, `vm.rs` one Firecracker VM,
   `output.rs` the VMs' output, `egress.rs` their egress, `wire.rs` the vsock framing, the
   restore notice and the egress rules,
-  `listener.rs` `--listen`, `state.rs` the state dir, `seccomp.rs` the seccomp filters;
+  `listener.rs` `--listen` (`head.rs` the request head routing a connection, `hpack.rs`
+  an h2c one's), `state.rs` the state dir, `seccomp.rs` the seccomp filters;
   jail mode's `keeper.rs` (the privileged half, and the wicket's client of it) and
   `jail.rs` (one VM's jail, the VMs' cgroups)
 - `guest/` -- the VMs' `/init`, built for `x86_64-unknown-linux-musl` or
@@ -171,9 +172,21 @@ platform, `linux/arm64` or `linux/amd64`).
 `wait-ms=N` (see [Limits](#limits)), `keep-ms=N` (reuse, pool), `uses=N` and `lifetime-ms=N`
 (reuse), `conns=N` (pool), `egress=<host>:<port>,...` (see [Egress](#egress)). The advertised
 target is `firecracker:<rootfs>` plus the options set to other than their defaults; the server
-dials it verbatim, and the hosts of one target share its VMs. `--listen host:port` serves the
-sole route over plain TCP too (without `--server`, all the wicket does: a local loop for trying
-a rootfs; `scripts/try.sh <rootfs> '<options>' [port]` runs the debug build so).
+dials it verbatim, and the hosts of one target share its VMs.
+
+`--listen host:port` serves the routes over plain TCP too (without `--server`, all the wicket
+does: a local loop for trying a rootfs; `scripts/try.sh <rootfs> '<options>' [port]` runs the
+debug build so, on `a.local`, the arguments after the port the wicket's: `--vm
+b.local=<rootfs>` a second route). A connection goes to the route of its first request's host
+(the `Host` header, or the h2c `:authority`; the port left out, the case ignored), or, with a
+single route, to that route whatever its host, nothing read first (its guest may speak first).
+An unknown host is answered 404; a connection that is not HTTP, or whose head runs past 64KiB
+or takes over 10s, is closed. The head is relayed verbatim with the rest: unlike the server,
+the wicket routes a connection once -- a later request on it (an h2 stream, a keep-alive
+request) for another host stays on the first one's route -- and adds no `X-Forwarded-*`
+header (the guest sees what the client sent: the sample's `x-forwarded-for -`), since only
+the first request of a connection would get them. `--max-connections` bounds the listener's
+connections too, apart from the tunnel's (one beyond waits in the backlog).
 `--firecracker` names the binary (default `firecracker` on the PATH), `--state-dir` the VMs'
 files (their Unix sockets need paths below 108 bytes; the default is a directory of the
 process's own, 0700, under `$XDG_RUNTIME_DIR` (a tmpfs where systemd sets it), else the

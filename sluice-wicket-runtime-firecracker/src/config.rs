@@ -22,8 +22,10 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
 
   --server <url>                  the sluice server, grpc://host:port or grpcs://host:port;
                                   asked for its nodes, one tunnel stream to each
-  --listen <host:port>            serve the sole route over plain TCP too (no server
-                                  needed), relayed as the tunnel's connections are
+  --listen <host:port>            serve the routes over plain TCP too (no server needed),
+                                  relayed as the tunnel's connections are: each by its
+                                  first request's host (Host, h2c :authority), a sole
+                                  route whatever the host, an unknown host answered 404
   --vm <host>=<rootfs>[?<opts>]   a route served by Firecracker microVMs booted from the
                                   rootfs; repeatable. mode=shared (default: one VM serves
                                   every connection), mode=per-connection (a VM cloned from
@@ -58,7 +60,8 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
   --client-id <id>                client identity (default a random UUID)
   --ca-cert <path>                PEM CA verifying a grpcs:// server (default the webPKI roots)
   --insecure                      skip the verification of a grpcs:// server
-  --max-connections <n>           connections open at once (default 256)
+  --max-connections <n>           connections open at once (default 256): the tunnel's,
+                                  and --listen's apart
   --max-vms <n>                   VMs alive at once over every route: shared, warm, in use,
                                   templates (default 64)
   --max-memory <MiB>              their guest memory (mem) at most (default none: --max-vms
@@ -302,12 +305,6 @@ pub fn parse(
     let specs = routes.read()?;
     if config.is_none() && specs.is_empty() {
         return Err("--vm is required (or a --config file)".into());
-    }
-    if listen.is_some() && specs.len() != 1 {
-        return Err(format!(
-            "listen serves the sole route: {} given",
-            specs.len()
-        ));
     }
     // a token given, else the file holding it: the flag's (or environment's)
     // over the config file's
@@ -848,10 +845,6 @@ mod tests {
             (
                 vec!["--config", &config_flag, "--vm", &twice],
                 "a.local: routed twice",
-            ),
-            (
-                vec!["--listen", "l", "--config", &config_flag, "--vm", &vm],
-                "listen serves the sole route: 2 given",
             ),
             (
                 vec!["--config", &config_flag, "--token-file", "missing"],
