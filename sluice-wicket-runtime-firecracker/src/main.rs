@@ -16,7 +16,7 @@ fn main() -> ExitCode {
         eprintln!(
             "{} {}: {error}",
             vm::LAUNCH,
-            std::env::args().nth(4).unwrap_or_default()
+            std::env::args().nth(6).unwrap_or_default()
         );
         return ExitCode::from(127);
     }

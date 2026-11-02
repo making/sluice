@@ -21,6 +21,8 @@
 //! GET    /api/apps[?after=<revision>]           the apps, as `/api/routes`
 //! PUT    /api/apps/<name>                       serves the app the body (JSON) has
 //! DELETE /api/apps/<name>?owner=<owner>         removes the app
+//! GET    /api/disks                             the apps' disks, which outlive them
+//! DELETE /api/disks/<name>?owner=<owner>        removes the disk of an app that was
 //! ```
 //!
 //! The options are the `--vm` route's (`mode`, `vcpus`, `mem`, `warm`, `vms`,
@@ -29,7 +31,8 @@
 //! way (images run to hundreds of MiB), and kept under its digest. An app's
 //! sandbox is the same in JSON, with its env (its process's environment
 //! variables, which may hold secrets: the listings name them, never their
-//! values; an app's `tag`, opaque to the console, tells its owner what it put).
+//! values; an app's `tag`, opaque to the console, tells its owner what it put),
+//! and its `disk` (`disk`).
 //!
 //! The credentials, the page's shared files and the directory's layout are
 //! `sluice-wicket-console`'s.
@@ -137,6 +140,15 @@ impl Service for Console {
                     StatusCode::METHOD_NOT_ALLOWED,
                     "a route takes PUT, PATCH or DELETE",
                 ),
+            };
+        }
+        if (method, path) == (&Method::GET, "/api/disks") {
+            return json(StatusCode::OK, &self.disks());
+        }
+        if let Some(name) = path.strip_prefix("/api/disks/") {
+            return match *method {
+                Method::DELETE => self.delete_disk(name, query).await,
+                _ => error(StatusCode::METHOD_NOT_ALLOWED, "a disk takes DELETE"),
             };
         }
         if let Some(name) = path.strip_prefix("/api/apps/") {
@@ -385,19 +397,46 @@ impl Console {
     }
 
     async fn delete_app(&self, name: &str, query: Option<&str>) -> Response {
-        let owner = pairs(query)
-            .into_iter()
-            .find(|(key, _)| key == "owner")
-            .map(|(_, owner)| owner);
-        let checked = check_name("app", name).and_then(|()| match owner {
-            Some(owner) => check_name("owner", &owner).map(|()| owner),
-            None => Err("owner=<owner> names the app's owner: a controller removes its own".into()),
-        });
-        match checked {
+        match owner_of(name, query) {
             Ok(owner) => {
                 let name = name.to_string();
                 self.edit(Edit::DeleteApp { name, owner }).await
             }
+            Err(e) => error(StatusCode::BAD_REQUEST, e),
+        }
+    }
+
+    /// The disks kept in the console's directory, and whether an app has each.
+    fn disks(&self) -> DisksView {
+        let table = self.routes.current();
+        let apps: Vec<(&str, &str)> = table
+            .served()
+            .filter_map(|(_, origin, _)| match origin {
+                Origin::Api { name, owner, .. } => Some((owner.as_str(), name.as_str())),
+                _ => None,
+            })
+            .collect();
+        DisksView {
+            disks: deployed::disks(&self.dir, |owner, name| apps.contains(&(owner, name))),
+        }
+    }
+
+    async fn delete_disk(&self, name: &str, query: Option<&str>) -> Response {
+        let edit = owner_of(name, query).map(|owner| Edit::DeleteDisk {
+            name: name.to_string(),
+            owner,
+        });
+        match edit {
+            Ok(edit) => match self.request(edit).await {
+                Ok(_) => json(
+                    StatusCode::OK,
+                    &Edited {
+                        generation: self.routes.current().generation(),
+                        message: format!("removed the disk of {name}"),
+                    },
+                ),
+                Err(refused) => refused.into(),
+            },
             Err(e) => error(StatusCode::BAD_REQUEST, e),
         }
     }
@@ -524,6 +563,18 @@ impl Console {
     }
 }
 
+/// The owner `query` names of the app `name`, both checked.
+fn owner_of(name: &str, query: Option<&str>) -> Result<String, String> {
+    let owner = pairs(query)
+        .into_iter()
+        .find(|(key, _)| key == "owner")
+        .map(|(_, owner)| owner);
+    check_name("app", name).and_then(|()| match owner {
+        Some(owner) => check_name("owner", &owner).map(|()| owner),
+        None => Err("owner=<owner> names the app's owner: a controller removes its own".into()),
+    })
+}
+
 /// The digest a kept image's path (`rootfs/<sha256>/<name>`) names.
 fn kept_digest(relative: &Path) -> Option<String> {
     relative
@@ -589,6 +640,7 @@ fn sandbox_view(spec: &RouteSpec) -> Map<String, Value> {
         let value = match key {
             "mode" => continue,
             "egress" => value.split(',').collect::<Vec<_>>().into(),
+            "disk" => value.into(),
             _ => value.parse::<u64>().map_or(Value::Null, Value::from),
         };
         sandbox.insert(key.into(), value);
@@ -597,6 +649,12 @@ fn sandbox_view(spec: &RouteSpec) -> Map<String, Value> {
         sandbox.insert("env".into(), spec.vm.env.names().into());
     }
     sandbox
+}
+
+/// What `GET /api/disks` answers.
+#[derive(Serialize)]
+struct DisksView {
+    disks: Vec<deployed::KeptDisk>,
 }
 
 /// What `PUT /api/images` takes.

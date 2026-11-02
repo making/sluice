@@ -14,9 +14,10 @@
 //! file, polled, removing a route and replacing a rootfs; the console deploying
 //! one more route from an uploaded rootfs (refusing what it does not take),
 //! served on the tunnel, listed with its VMs, and an app of two hosts on one
-//! rootfs uploaded by digest, its env seen by the guest; both served again after
-//! a restart from the console's directory (not with the image: its directory is
-//! the test's).
+//! rootfs uploaded by digest, its env seen by the guest, and an app with a disk:
+//! what it wrote kept across a restart of its VM, a failed start, a growth and
+//! its app's removal, one VM at a time on it; both served again after a restart
+//! from the console's directory (not with the image: its directory is the test's).
 //!
 //! Skipped where `/dev/kvm` is not usable. Elsewhere it needs Firecracker
 //! (`SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER`, else `firecracker` on
@@ -83,19 +84,52 @@ const CONSOLE_TOKEN: &str = "c0ns0le";
 /// The launcher (`--launch-vm`) execs the program with the soft open file
 /// limit given (Firecracker grows its file table to the limit at its start, a
 /// cost that grows with it: 3ms at 1048576), the file size given (a guest's
-/// output to its VM's log bounded) and no core (of a VM's memory).
+/// output to its VM's log bounded) and no core (of a VM's memory); holding the
+/// disk's lock for it, across the exec, or refusing to start while another does.
 #[test]
 fn the_launcher_execs_with_the_limits_given() {
-    let output = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-runtime-firecracker"))
-        .args([
-            "--launch-vm",
-            &std::process::id().to_string(),
-            "1100",
-            "1048576",
-        ])
-        .args(["/bin/cat", "/proc/self/limits"])
-        .output()
-        .unwrap();
+    use std::os::fd::AsRawFd as _;
+    let launch = |disk: &str, program: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_sluice-wicket-runtime-firecracker"))
+            .args([
+                "--launch-vm",
+                &std::process::id().to_string(),
+                "1100",
+                "1048576",
+                disk,
+            ])
+            .args(program)
+            .output()
+            .unwrap()
+    };
+    let disk = std::env::temp_dir().join(format!("sfc-launch-{}.ext4", std::process::id()));
+    std::fs::write(&disk, b"").unwrap();
+    let file = disk.clone();
+    let disk = disk.to_str().unwrap();
+    // the program's own files: the disk among them, while the lock is held by it alone
+    let held = launch(
+        disk,
+        &["/bin/sh", "-c", "ls -l /proc/self/fd; cat /proc/locks"],
+    );
+    let files = String::from_utf8_lossy(&held.stdout);
+    assert!(held.status.success(), "{held:?}");
+    assert!(files.contains(disk), "not inherited: {files}");
+    assert!(files.contains("FLOCK"), "not locked: {files}");
+    let holder = std::fs::File::open(disk).unwrap();
+    // SAFETY: flock of an open file
+    assert_eq!(
+        unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) },
+        0,
+        "given up as the program ended"
+    );
+    let refused = launch(disk, &["/bin/true"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    let error = String::from_utf8_lossy(&refused.stderr);
+    assert!(error.contains("in use by another VM"), "{error}");
+    drop(holder);
+    std::fs::remove_file(&file).unwrap();
+
+    let output = launch("-", &["/bin/cat", "/proc/self/limits"]);
     assert!(output.status.success(), "{output:?}");
     let limits = String::from_utf8_lossy(&output.stdout);
     let limit = |name: &str| -> Vec<String> {
@@ -186,6 +220,7 @@ async fn every_route_serves_http_through_the_tunnel() {
         CAPPED_IDLE.as_millis()
     );
     std::fs::write(&config, format!("{routes}{capped}")).unwrap();
+    // relative: the wicket's working directory is the test's scratch directory, jailed too
     let console_dir = dir.0.join("deployed");
     let console_args = [
         "--console",
@@ -193,7 +228,7 @@ async fn every_route_serves_http_through_the_tunnel() {
         "--console-token",
         CONSOLE_TOKEN,
         "--console-dir",
-        &console_dir.display().to_string(),
+        "deployed",
     ]
     .map(String::from);
     let (flume, mut feeds) = flume_server().await;
@@ -380,7 +415,14 @@ async fn every_route_serves_http_through_the_tunnel() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     if image.is_none() {
-        let deployed = deploy(&mut tunnel, &wicket, &rootfs, &console_dir, &mut conn_id);
+        let deployed = deploy(
+            &mut tunnel,
+            &wicket,
+            &rootfs,
+            &console_dir,
+            &mut conn_id,
+            jailed,
+        );
         assert!(
             tokio::time::timeout(HANG, deployed).await.is_ok(),
             "the console: hung; {}",
@@ -418,12 +460,18 @@ async fn every_route_serves_http_through_the_tunnel() {
             .ok()
             .flatten()
             .unwrap_or_else(|| panic!("no tunnel stream after the restart; {}", wicket.log()));
-        let (tunnel, advertise) = ServerTunnel::new(stream).await;
+        let (mut tunnel, advertise) = ServerTunnel::new(stream).await;
         let hosts: Vec<_> = advertise.upstreams.iter().map(|up| &up.host).collect();
         assert_eq!(
             hosts,
-            ["console.local", "app1.local", "app2.local"],
+            ["console.local", "app1.local", "app2.local", "data.local"],
             "{}",
+            wicket.log()
+        );
+        let kept = disk_kept(&mut tunnel, &wicket, &console_dir, &advertise, jailed);
+        assert!(
+            tokio::time::timeout(HANG, kept).await.is_ok(),
+            "the disk after a restart: hung; {}",
             wicket.log()
         );
         let app = Route {
@@ -501,6 +549,7 @@ async fn deploy(
     rootfs: &Path,
     dir: &Path,
     conn_id: &mut i64,
+    jailed: bool,
 ) {
     let at = wicket.console();
     let (status, _) = console(at, "GET", "/api/routes", false, Bytes::new()).await;
@@ -696,6 +745,274 @@ async fn deploy(
     assert_eq!(status, 409, "{refused}");
     let (status, same) = console(at, "PUT", "/api/apps/shop", true, body()).await;
     assert_eq!((status, same["message"].as_str()), (200, Some("no change")));
+
+    disk_app(tunnel, wicket, &sha256, dir, conn_id, jailed).await;
+}
+
+/// The app `data` with `sandbox`, of the image `sha256`, on the wicket at `at`.
+async fn put_data(
+    at: std::net::SocketAddr,
+    sha256: &str,
+    sandbox: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let app = serde_json::json!({
+        "owner": "cf",
+        "hosts": ["data.local"],
+        "component": {"sha256": sha256, "name": "app.ext4"},
+        "sandbox": sandbox,
+    });
+    console(
+        at,
+        "PUT",
+        "/api/apps/data",
+        true,
+        Bytes::from(app.to_string()),
+    )
+    .await
+}
+
+/// A POST to the app `data` at `address` on a connection of its own; its answer.
+async fn on_data(
+    tunnel: &ServerTunnel,
+    address: &str,
+    conn_id: &mut i64,
+    path: &str,
+    body: &str,
+) -> String {
+    *conn_id += 1;
+    let route = Route {
+        tunnel,
+        host: "data.local",
+        address: address.to_string(),
+        listen: None,
+    };
+    route.post(*conn_id, path, body).await
+}
+
+/// An app with a disk: refused in a cloned mode; made once, what the guest wrote kept across
+/// its VM's restart, fsynced or not (the stop writes it out), a start that fails (the old VM
+/// started again on it) and its growth, a smaller size refused; for the app's VM alone, its
+/// id's in a jail; listed, and not removed under its app. One more file left unsynced: the
+/// wicket's end writes it out.
+async fn disk_app(
+    tunnel: &mut ServerTunnel,
+    wicket: &Wicket,
+    sha256: &str,
+    dir: &Path,
+    conn_id: &mut i64,
+    jailed: bool,
+) {
+    use std::os::unix::fs::MetadataExt as _;
+    let at = wicket.console();
+    let (status, refused) = put_data(
+        at,
+        sha256,
+        serde_json::json!({"mode": "pool", "vms": 2, "disk": "/tmp/data"}),
+    )
+    .await;
+    assert_eq!(status, 400, "{refused}");
+    let why = refused["error"].as_str().unwrap();
+    assert!(why.contains("disk needs mode=shared: one VM"), "{why}");
+
+    let sandbox = |mib: u32, generation: &str| serde_json::json!({"disk": "/tmp/data", "disk-mib": mib, "env": {"RUN": generation}});
+    let (status, put) = put_data(at, sha256, sandbox(64, "1")).await;
+    assert_eq!(status, 200, "{put}; {}", wicket.log());
+    assert_eq!(put["message"], "added data.local");
+    let advertised = tunnel.advertise().await;
+    let target_of = |advertised: &sluice_wicket_tunnel::proto::Advertise| {
+        let up = advertised
+            .upstreams
+            .iter()
+            .find(|up| up.host == "data.local");
+        dial_address(&up.expect("data.local advertised").target_url)
+    };
+    let mut address = target_of(&advertised);
+    let answer = on_data(tunnel, &address, conn_id, "/disk", "").await;
+    let mib = |answer: &str| -> u64 {
+        let line = answer.lines().next().unwrap_or_default();
+        line.strip_prefix("mib ")
+            .and_then(|mib| mib.parse().ok())
+            .unwrap_or(0)
+    };
+    let first_size = mib(&answer);
+    assert!((40..=64).contains(&first_size), "{answer}");
+    assert!(answer.ends_with("uid 0 gid 0\n"), "{answer}");
+    for (path, body) in [
+        ("/disk?write=a&sync=1", "fsynced"),
+        ("/disk?write=b", "written"),
+    ] {
+        let wrote = on_data(tunnel, &address, conn_id, path, body).await;
+        assert!(wrote.starts_with("wrote "), "{wrote}");
+    }
+    let file = dir.join("disks/cf/data.ext4");
+    let made = std::fs::metadata(&file).unwrap();
+    assert_eq!(made.len(), 64 << 20);
+    match jailed {
+        true => {
+            assert!((JAIL_IDS.0..=JAIL_IDS.1).contains(&made.uid()), "{made:?}");
+            assert_eq!(made.mode() & 0o777, 0o660);
+        }
+        false => assert_eq!(made.mode() & 0o777, 0o600),
+    }
+
+    // its VM again (another env, the same target): a stop, then a boot, all kept
+    let (status, put) = put_data(at, sha256, sandbox(64, "2")).await;
+    assert_eq!(
+        (status, put["message"].as_str()),
+        (200, Some("restarted data.local")),
+        "{put}"
+    );
+    let read = on_data(tunnel, &address, conn_id, "/disk?read=a", "").await;
+    assert_eq!(read, "fsynced");
+    let read = on_data(tunnel, &address, conn_id, "/disk?read=b", "").await;
+    assert_eq!(read, "written", "the stop wrote it out");
+
+    // a start that fails, a disk nowhere to go, its file grown by then: refused, the old VM
+    // started again on it, of the size the file has now
+    let (status, refused) = put_data(
+        at,
+        sha256,
+        serde_json::json!({"disk": "/no/such", "disk-mib": 96, "env": {"RUN": "2"}}),
+    )
+    .await;
+    assert_eq!(status, 422, "{refused}");
+    let why = refused["error"].as_str().unwrap();
+    assert!(why.contains("Read-only file system"), "{why}");
+    let read = on_data(tunnel, &address, conn_id, "/disk?read=a", "").await;
+    assert_eq!(read, "fsynced", "the old VM, on the disk it left");
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), 96 << 20);
+    let answer = on_data(tunnel, &address, conn_id, "/disk", "").await;
+    assert!(mib(&answer) > first_size + 16, "{first_size}: {answer}");
+
+    // grown: another target, its file and file system larger; smaller: refused before its VM
+    // is touched
+    let (status, put) = put_data(at, sha256, sandbox(128, "2")).await;
+    assert_eq!(status, 200, "{put}; {}", wicket.log());
+    address = target_of(&tunnel.advertise().await);
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), 128 << 20);
+    let answer = on_data(tunnel, &address, conn_id, "/disk", "").await;
+    assert!(mib(&answer) > first_size + 32, "{first_size}: {answer}");
+    let booted = on_data(tunnel, &address, conn_id, "/", "").await;
+    let booted = field(&booted, "boot id").to_string();
+    let (status, refused) = put_data(at, sha256, sandbox(64, "2")).await;
+    assert_eq!(status, 422, "{refused}");
+    let why = refused["error"].as_str().unwrap();
+    assert!(why.contains("a disk only grows"), "{why}");
+    let same = on_data(tunnel, &address, conn_id, "/", "").await;
+    assert_eq!(field(&same, "boot id"), booted, "its VM untouched");
+
+    // a wedged guest (its children, unjailed): its stop gives up in time, the VM killed, the
+    // next one started on what it had made durable
+    if !jailed {
+        let held = vms_on(wicket.child.id() as i32, &file);
+        let [vm] = held[..] else {
+            panic!("one VM on the disk: {held:?}");
+        };
+        // SAFETY: a plain kill of the wicket's child
+        assert_eq!(unsafe { libc::kill(vm, libc::SIGSTOP) }, 0);
+        let (status, put) = put_data(at, sha256, sandbox(128, "3")).await;
+        assert_eq!(
+            (status, put["message"].as_str()),
+            (200, Some("restarted data.local")),
+            "{put}"
+        );
+        let read = on_data(tunnel, &address, conn_id, "/disk?read=a", "").await;
+        assert_eq!(read, "fsynced");
+    }
+
+    // listed; under its app, not removed
+    let (status, apps) = console(at, "GET", "/api/apps", true, Bytes::new()).await;
+    assert_eq!(status, 200, "{apps}");
+    let listed = apps["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|app| app["name"] == "data")
+        .unwrap();
+    assert_eq!(listed["sandbox"]["disk"], "/tmp/data");
+    assert_eq!(listed["sandbox"]["disk-mib"], 128);
+    let (status, disks) = console(at, "GET", "/api/disks", true, Bytes::new()).await;
+    assert_eq!(status, 200, "{disks}");
+    assert_eq!(
+        disks["disks"],
+        serde_json::json!([{"owner": "cf", "name": "data", "mib": 128, "app": true}])
+    );
+    let gone = "/api/disks/data?owner=cf";
+    let (status, refused) = console(at, "DELETE", gone, true, Bytes::new()).await;
+    assert_eq!(status, 409, "{refused}");
+
+    // for the wicket's end to write out, and the restart to find
+    let wrote = on_data(tunnel, &address, conn_id, "/disk?write=c", "at the end").await;
+    assert!(wrote.starts_with("wrote "), "{wrote}");
+}
+
+/// The disk after the wicket's restart (a kill of the keeper, when `jailed`; else its end):
+/// what the app wrote; its app removed, it stays for the next app of that name and owner, and
+/// goes once no VM holds it.
+async fn disk_kept(
+    tunnel: &mut ServerTunnel,
+    wicket: &Wicket,
+    dir: &Path,
+    advertised: &sluice_wicket_tunnel::proto::Advertise,
+    jailed: bool,
+) {
+    let at = wicket.console();
+    let up = advertised
+        .upstreams
+        .iter()
+        .find(|up| up.host == "data.local");
+    let address = dial_address(&up.expect("data.local advertised").target_url);
+    let mut conn_id = 10;
+    let read = on_data(tunnel, &address, &mut conn_id, "/disk?read=a", "").await;
+    assert_eq!(read, "fsynced");
+    if !jailed {
+        let read = on_data(tunnel, &address, &mut conn_id, "/disk?read=c", "").await;
+        assert_eq!(read, "at the end");
+    }
+    let sha256 = up.unwrap().target_url.split("/rootfs/").nth(1).unwrap();
+    let sha256 = sha256.split('/').next().unwrap().to_string();
+    let path = "/api/apps/data?owner=cf";
+    let (status, removed) = console(at, "DELETE", path, true, Bytes::new()).await;
+    assert_eq!(status, 200, "{removed}");
+    tunnel.advertise().await;
+    let (_, disks) = console(at, "GET", "/api/disks", true, Bytes::new()).await;
+    assert_eq!(disks["disks"][0]["app"], false, "{disks}");
+
+    // the next app finds it; the VM left of the last is stopped for it
+    let (status, put) = put_data(
+        at,
+        &sha256,
+        serde_json::json!({"disk": "/tmp/data", "disk-mib": 128}),
+    )
+    .await;
+    assert_eq!(status, 200, "{put}; {}", wicket.log());
+    let advertised = tunnel.advertise().await;
+    let up = advertised
+        .upstreams
+        .iter()
+        .find(|up| up.host == "data.local");
+    let address = dial_address(&up.expect("data.local advertised").target_url);
+    let read = on_data(tunnel, &address, &mut conn_id, "/disk?read=a", "").await;
+    assert_eq!(read, "fsynced");
+
+    let (status, removed) = console(at, "DELETE", path, true, Bytes::new()).await;
+    assert_eq!(status, 200, "{removed}");
+    tunnel.advertise().await;
+    let deadline = Instant::now() + HANG;
+    let gone = "/api/disks/data?owner=cf";
+    loop {
+        let (status, answer) = console(at, "DELETE", gone, true, Bytes::new()).await;
+        match status {
+            200 => break,
+            // its VM stopping
+            409 => assert!(Instant::now() < deadline, "{answer}"),
+            _ => panic!("{status}: {answer}"),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!dir.join("disks/cf/data.ext4").exists());
+    let (status, none) = console(at, "DELETE", gone, true, Bytes::new()).await;
+    assert_eq!(status, 404, "{none}");
 }
 
 /// The field `name` of the status of `pid` (empty: none, or no such process).
@@ -1167,8 +1484,12 @@ async fn output(
 struct Scratch(PathBuf);
 
 impl Scratch {
+    fn path() -> PathBuf {
+        std::env::temp_dir().join(format!("sfc-vm-{}", std::process::id()))
+    }
+
     fn new() -> Scratch {
-        let dir = std::env::temp_dir().join(format!("sfc-vm-{}", std::process::id()));
+        let dir = Scratch::path();
         std::fs::create_dir_all(&dir).unwrap();
         Scratch(dir)
     }
@@ -1729,6 +2050,7 @@ impl Wicket {
             // the drain is the tunnel's, tested there: Ctrl-C ends the wicket at once
             .args(["--server", server, "--drain-grace", "0"])
             .args(args)
+            .current_dir(Scratch::path())
             .stdin(Stdio::null())
             .stdout(file.try_clone().unwrap())
             .stderr(file)

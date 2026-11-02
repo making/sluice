@@ -15,6 +15,13 @@
 //! before. A target kept serves under the hosts of the reload: its VMs' output
 //! is named after them.
 //!
+//! A disk has one writer (`disk`), so a route's VM on a disk is the exception to the
+//! order: once every other target started, the VM holding the disk is stopped, then
+//! the new one started. A start failing then starts the old one again, on the disk
+//! it left, and the reload fails as any other; failing as well, the route serves
+//! nothing until the next reload, which the failure says. Its connections fail
+//! meanwhile, a boot long.
+//!
 //! The console's edits ([`Edit`]) are reloads too, of the routes as they would
 //! be with them: kept -- written to the console's directory -- only when they
 //! started. An app's are one reload: every host of it or none.
@@ -97,6 +104,17 @@ impl Table {
     pub fn by_host(&self, host: &str) -> Option<Arc<Route>> {
         let target = &sluice_wicket_tunnel::routes::Table::host_route(self, host)?.target_url;
         self.routes.get(target).cloned()
+    }
+
+    /// Stops the VMs holding a disk, each given its time: the wicket is ending, and what
+    /// they wrote goes to their disks first.
+    pub async fn stop_disks(&self) {
+        let mut stopping = JoinSet::new();
+        for route in self.routes.values().filter(|route| route.disk().is_some()) {
+            let route = route.clone();
+            stopping.spawn(async move { route.stop().await });
+        }
+        while stopping.join_next().await.is_some() {}
     }
 }
 
@@ -264,6 +282,8 @@ pub enum Edit {
     PutApp { name: String, app: AppSpec },
     /// Removes the app `name` of `owner`.
     DeleteApp { name: String, owner: String },
+    /// Removes the disk of the app `name` of `owner` that was.
+    DeleteDisk { name: String, owner: String },
 }
 
 impl Edit {
@@ -278,6 +298,7 @@ impl Edit {
             Edit::Upload { sha256, .. } => format!("api: upload {sha256}"),
             Edit::PutApp { name, app } => format!("api: app {name} of {}", app.owner),
             Edit::DeleteApp { name, owner } => format!("api: remove app {name} of {owner}"),
+            Edit::DeleteDisk { name, owner } => format!("api: remove disk {name} of {owner}"),
         }
     }
 }
@@ -514,10 +535,21 @@ impl Reloader {
                     change: None,
                 });
             }
+            Edit::DeleteDisk { name, owner } => {
+                deployed.remove_disk(&name, &owner)?;
+                println!("{reason}: removed");
+                return Ok(Outcome {
+                    generation: current.generation,
+                    change: None,
+                });
+            }
             Edit::PutApp { name, app } => deployed.with_app(&name, app, now),
             Edit::DeleteApp { name, owner } => deployed.without_app(&name, &owner),
         }?;
-        if &edited == deployed {
+        // the same again changes nothing, unless a VM is to come back: its route left stopped
+        // by a start that failed ([`Reloader::back`])
+        let stopped = self.started.values().any(|started| started.route.stopped());
+        if &edited == deployed && !stopped {
             return Ok(Outcome {
                 generation: current.generation,
                 change: None,
@@ -606,37 +638,40 @@ impl Reloader {
                 }
             }
         }
+        let current = self.routes.current();
         let mut change = Change::default();
         let mut starting = JoinSet::new();
         let mut kept = Vec::new();
+        // the targets a VM on their disk stands in the way of, and that VM
+        let mut swaps = Vec::new();
         for (target, spec, hosts) in targets {
             let stamps = stamps(files(&spec));
             match self.started.get(&target) {
-                Some(started) if started.spec.same_vms(&spec) && started.stamps == stamps => {
+                Some(started)
+                    if started.spec.same_vms(&spec)
+                        && started.stamps == stamps
+                        && !started.route.stopped() =>
+                {
                     kept.push((target, hosts));
                     continue;
                 }
                 Some(_) => change.restarted.extend(hosts.iter().cloned()),
                 None => {}
             }
-            let n = self.next_place;
-            self.next_place += 1;
-            let (places, capacity, sink, workers) = (
-                self.places.clone(),
-                self.capacity.clone(),
-                self.sink.clone(),
-                self.workers.clone(),
-            );
-            starting.spawn(async move {
-                let route =
-                    Route::start(spec.clone(), &hosts, &places, n, capacity, sink, workers).await;
-                let started = route.map(|route| Started {
-                    spec,
-                    stamps,
-                    route: Arc::new(route),
-                });
-                (target, started)
+            let holder = spec.vm.disk.as_ref().and_then(|disk| {
+                current
+                    .routes
+                    .values()
+                    .find(|route| route.disk() == Some(disk.file.as_path()))
+                    .cloned()
             });
+            match holder {
+                Some(holder) => swaps.push((holder, target, spec, hosts, stamps)),
+                None => {
+                    let start = self.starter(spec, hosts, stamps);
+                    starting.spawn(async move { (target, start.await) });
+                }
+            }
         }
         let mut new = HashMap::new();
         while let Some(joined) = starting.join_next().await {
@@ -655,11 +690,41 @@ impl Reloader {
             };
             new.insert(target, started);
         }
+        let mut stopped: Vec<Arc<Route>> = Vec::new();
+        let mut swapped: Vec<String> = Vec::new();
+        for (holder, target, spec, hosts, stamps) in swaps {
+            holder.stop().await;
+            stopped.push(holder);
+            let start = self.starter(spec, hosts, stamps);
+            match start.await {
+                Ok(started) => {
+                    new.insert(target.clone(), started);
+                    swapped.push(target);
+                }
+                Err(e) => {
+                    let back = self.back(new, &swapped, &stopped).await;
+                    return Err(match back {
+                        Ok(()) => e,
+                        Err(again) => format!(
+                            "{e}; starting the old VM again failed as well, the route serves \
+                             nothing until the next reload: {again}"
+                        )
+                        .into(),
+                    });
+                }
+            }
+        }
 
-        let current = self.routes.current();
         for up in &advertised {
-            if !current.advertised.iter().any(|old| old.host == up.host) {
-                change.added.push(up.host.clone());
+            match current.advertised.iter().find(|old| old.host == up.host) {
+                None => change.added.push(up.host.clone()),
+                // its image or options are another target's: VMs started anew all the same
+                Some(old)
+                    if old.target_url != up.target_url && !change.restarted.contains(&up.host) =>
+                {
+                    change.restarted.push(up.host.clone());
+                }
+                Some(_) => {}
             }
         }
         for up in &current.advertised {
@@ -715,7 +780,85 @@ impl Reloader {
         Ok(change)
     }
 
-    /// Drops the removed targets every stream acknowledged by `generation`.
+    /// What starts the target of `spec`, the next place's.
+    fn starter(
+        &mut self,
+        spec: RouteSpec,
+        hosts: Vec<String>,
+        stamps: Stamps,
+    ) -> impl Future<Output = Result<Started, BoxError>> + Send + 'static {
+        let n = self.next_place;
+        self.next_place += 1;
+        let (places, capacity, sink, workers) = (
+            self.places.clone(),
+            self.capacity.clone(),
+            self.sink.clone(),
+            self.workers.clone(),
+        );
+        async move {
+            let route =
+                Route::start(spec.clone(), &hosts, &places, n, capacity, sink, workers).await?;
+            Ok(Started {
+                spec,
+                stamps,
+                route: Arc::new(route),
+            })
+        }
+    }
+
+    /// A reload failed after it stopped the VMs `stopped` for the targets `swapped` of the new
+    /// ones started, `new`: they end, and the routes of `stopped` still advertised start
+    /// again on their disks, the table following.
+    async fn back(
+        &mut self,
+        mut new: HashMap<String, Started>,
+        swapped: &[String],
+        stopped: &[Arc<Route>],
+    ) -> Result<(), BoxError> {
+        for target in swapped {
+            if let Some(started) = new.remove(target) {
+                started.route.stop().await;
+            }
+        }
+        drop(new);
+        let mut failed = None;
+        for holder in stopped {
+            let current = self.routes.current();
+            let Some((target, was)) = self
+                .started
+                .iter()
+                .find(|(_, started)| Arc::ptr_eq(&started.route, holder))
+            else {
+                continue;
+            };
+            let target = target.clone();
+            let hosts: Vec<String> = current
+                .advertised
+                .iter()
+                .filter(|up| up.target_url == target)
+                .map(|up| up.host.clone())
+                .collect();
+            let start = self.starter(was.spec.clone(), hosts, was.stamps.clone());
+            match start.await {
+                Ok(started) => {
+                    let mut routes = current.routes.clone();
+                    routes.insert(target.clone(), started.route.clone());
+                    self.started.insert(target, started);
+                    self.routes.publish(Table {
+                        generation: current.generation,
+                        advertised: current.advertised.clone(),
+                        routes,
+                        origins: current.origins.clone(),
+                    });
+                }
+                Err(e) => failed = Some(e),
+            }
+        }
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// Drops the removed targets every stream acknowledged by `generation`, the VM of one with
+    /// a disk stopped: no connection of its is to outlive it, what it wrote on the disk.
     fn expire(&mut self, generation: u64) {
         let expired: Vec<String> = self
             .lingering
@@ -727,6 +870,13 @@ impl Reloader {
             self.lingering.remove(target);
         }
         let current = self.routes.current();
+        for target in &expired {
+            if let Some(route) = current.routes.get(target).cloned()
+                && route.disk().is_some()
+            {
+                tokio::spawn(async move { route.stop().await });
+            }
+        }
         self.routes.publish(Table {
             generation: current.generation,
             advertised: current.advertised.clone(),
@@ -781,7 +931,7 @@ fn taken(edit: &Edit, origins: &HashMap<String, Origin>) -> Result<(), Refused> 
                 }
             }
         }
-        Edit::Upload { .. } | Edit::DeleteApp { .. } => {}
+        Edit::Upload { .. } | Edit::DeleteApp { .. } | Edit::DeleteDisk { .. } => {}
     }
     Ok(())
 }

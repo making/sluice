@@ -637,6 +637,13 @@ impl RouteSource {
                     spec.host
                 ));
             }
+            if spec.vm.disk.is_some() && !matches!(origin, Origin::Api { .. }) {
+                return Err(format!(
+                    "{}: disk is an app's (PUT /api/apps/<name>), kept by its name in the \
+                     console's directory",
+                    spec.host
+                ));
+            }
         }
         Ok(specs)
     }
@@ -732,11 +739,13 @@ pub(crate) struct FileRoute {
     per_client: Option<u32>,
     idle_ms: Option<u32>,
     egress: Option<Vec<String>>,
+    disk: Option<String>,
+    disk_mib: Option<u32>,
 }
 
 impl FileRoute {
     /// The keys of [`FileRoute::options`], in their order.
-    pub(crate) const KEYS: [&'static str; 16] = [
+    pub(crate) const KEYS: [&'static str; 18] = [
         "mode",
         "vcpus",
         "mem",
@@ -753,6 +762,8 @@ impl FileRoute {
         "per-client",
         "idle-ms",
         "egress",
+        "disk",
+        "disk-mib",
     ];
 
     /// The options set, as a `--vm` flag's query has them, in the order of
@@ -783,6 +794,12 @@ impl FileRoute {
                     .filter_map(|(key, value)| Some((key, value?.to_string()))),
             )
             .chain(self.egress.iter().map(|rules| ("egress", rules.join(","))))
+            .chain(self.disk.iter().map(|mount| ("disk", mount.clone())))
+            .chain(
+                self.disk_mib
+                    .iter()
+                    .map(|mib| ("disk-mib", mib.to_string())),
+            )
             .collect()
     }
 }
@@ -1016,6 +1033,7 @@ mod tests {
         assert_eq!(settings.token, "from-token-file");
 
         let twice = format!("a.local={}", rootfs.display());
+        let disk = format!("d.local={}?disk=/data", rootfs.display());
         let cpu = format!("c.local={}?cpu=50", rootfs.display());
         let no_share = format!("c.local={}?per-client=0", rootfs.display());
         let no_port = format!("c.local={}?egress=db.internal", rootfs.display());
@@ -1040,6 +1058,10 @@ mod tests {
             (
                 vec!["--server", "s", "--kernel", "k", "--vm", &cpu],
                 "c.local: cpu needs jail mode",
+            ),
+            (
+                vec!["--server", "s", "--kernel", "k", "--vm", &disk],
+                "d.local: disk is an app's",
             ),
             (
                 vec!["--server", "s", "--kernel", "k", "--vm", &no_share],

@@ -29,6 +29,12 @@
 //! A route's environment variables come from the wicket on the env stream
 //! (`wire::ENV_PORT`) when the kernel's command line says so (`wire::ENV_PARAMETER`):
 //! read before the process starts, over the image's. Hello mode's `GET /env` answers them.
+//!
+//! An app's disk (`wire::DISK_PARAMETER`) is mounted before the process starts, grown to the
+//! drive's size and its root given to the image's user: a failure is told on the control
+//! port (`wire::DISK_QUESTION`) and starts no process. A stop notice on that port
+//! (`wire::parse_stop`) ends the process and writes all out before the wicket kills the VM.
+//! Hello mode's `/disk` reads and writes it.
 
 use std::convert::Infallible;
 use std::ffi::CString;
@@ -85,6 +91,15 @@ const RNDRESEEDCRNG: libc::c_ulong = 0x5207;
 /// What the wicket gave on the env stream, `NAME=value`.
 static GIVEN_ENV: OnceLock<Vec<String>> = OnceLock::new();
 
+/// `EXT4_IOC_RESIZE_FS`: `_IOW('f', 16, __u64)`.
+const EXT4_IOC_RESIZE_FS: libc::c_ulong = 0x4008_6610;
+
+/// How long a process killed may take to end, before all is written all the same.
+const KILLED_WAIT: Duration = Duration::from_secs(1);
+
+/// Where the VM's disk is mounted, or why it is not; unset without a disk.
+static DISK: OnceLock<Result<String, String>> = OnceLock::new();
+
 /// The process to run, from the image's config.
 #[derive(Deserialize)]
 struct Launch {
@@ -121,6 +136,11 @@ fn main() {
     let env_given = cmdline
         .split_whitespace()
         .any(|parameter| parameter == format!("{}=1", wire::ENV_PARAMETER));
+    let disk = cmdline.split_whitespace().find_map(|parameter| {
+        parameter
+            .strip_prefix(wire::DISK_PARAMETER)?
+            .strip_prefix('=')
+    });
     // a worker per vCPU: the relay (and hello mode's server) on every one; on a
     // single vCPU a runtime of one thread (no handoffs between threads)
     let runtime = match std::thread::available_parallelism().map_or(1, |n| n.get()) {
@@ -147,6 +167,21 @@ fn main() {
             }
             let _ = GIVEN_ENV.set(given);
         }
+        if let Some(path) = disk {
+            let owner = launch.as_ref().map(|launch| (launch.uid, launch.gid));
+            let mounted = mount_disk(path, owner, &log);
+            if let Err(e) = &mounted {
+                log.line(
+                    Stream::Stderr,
+                    format!("guest: the disk at {path}: {e}").as_bytes(),
+                );
+            }
+            let _ = DISK.set(
+                mounted
+                    .map(|()| path.to_string())
+                    .map_err(|e| e.to_string()),
+            );
+        }
         // before the process starts: it may connect at once
         egress.listen(launch.as_ref().map(|launch| launch.port), &log);
         let hook = launch.as_ref().map(|launch| Hook {
@@ -158,6 +193,10 @@ fn main() {
         });
         let control = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, wire::CONTROL_PORT))?;
         tokio::spawn(control_loop(control, hook, log.clone()));
+        if DISK.get().is_some_and(Result::is_err) {
+            // no process without its disk: the wicket asks why
+            std::future::pending::<()>().await;
+        }
         let port = match launch {
             Some(launch) => {
                 let port = launch.port;
@@ -225,6 +264,119 @@ fn mount(source: &str, target: &str, fstype: &str, flags: libc::c_ulong) {
     }
 }
 
+/// Mounts the VM's disk at `path` (a directory of the image, or made on a tmpfs), grown to the
+/// drive's size, its root given to the image's process's `owner`. `nodioread_nolock`: a VM
+/// killed is a crash to its file system, and a file written and renamed without an fsync then
+/// reads as NUL bytes under ext4's default, the old or the new one under this.
+fn mount_disk(path: &str, owner: Option<(u32, u32)>, log: &Log) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    let (source, target, fstype, options) = (
+        CString::new(wire::DISK_DEVICE)?,
+        CString::new(path)?,
+        c"ext4",
+        c"nodioread_nolock",
+    );
+    // SAFETY: NUL-terminated strings, the data ext4's options
+    let mounted = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            options.as_ptr().cast(),
+        )
+    };
+    if mounted != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // a grown drive's room: on a mount, as nothing else in the guest knows; no error of it
+    // keeps the disk from serving at the size it has
+    if let Err(e) = grow_disk(path) {
+        log.line(
+            Stream::Stderr,
+            format!("guest: the disk at {path} is not grown: {e}").as_bytes(),
+        );
+    }
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::chown(path, Some(uid), Some(gid))?;
+    }
+    Ok(())
+}
+
+/// Grows the file system mounted at `path` to the drive's size (nothing to do at that size).
+fn grow_disk(path: &str) -> std::io::Result<()> {
+    use std::io::Seek as _;
+    use std::os::fd::AsRawFd as _;
+    let bytes = std::fs::File::open(wire::DISK_DEVICE)?.seek(std::io::SeekFrom::End(0))?;
+    let root = std::fs::File::open(path)?;
+    let mut fs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: fstatvfs of an open file into a buffer of its type
+    if unsafe { libc::fstatvfs(root.as_raw_fd(), fs.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: filled by the successful call
+    let block = unsafe { fs.assume_init() }.f_frsize;
+    let blocks: u64 = bytes / block;
+    // SAFETY: the ioctl of ext4 on its mount's root, the count of blocks it reads
+    if unsafe { libc::ioctl(root.as_raw_fd(), EXT4_IOC_RESIZE_FS as _, &blocks) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Whether a process but /init is left: a kernel thread has no command line, nor has a zombie.
+fn processes_left() -> bool {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| *pid != 1)
+        .any(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|line| !line.is_empty()))
+}
+
+/// What a stop notice asks: every process ended (SIGTERM, `grace` to do it, then SIGKILL): the
+/// image's and what it started, which holds the disk just as well; what is dirty written, the
+/// disk unmounted (read-only where something holds it).
+async fn stop(grace: Duration) -> std::io::Result<()> {
+    let ended = async |within: Duration| {
+        let deadline = Instant::now() + within;
+        while processes_left() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        !processes_left()
+    };
+    // SAFETY: a plain kill of every process but PID 1 itself
+    let signal = |signal| unsafe {
+        libc::kill(-1, signal);
+    };
+    signal(libc::SIGTERM);
+    if !ended(grace).await {
+        signal(libc::SIGKILL);
+        ended(KILLED_WAIT).await;
+    }
+    tokio::task::spawn_blocking(|| {
+        // SAFETY: plain sync; umount2 and a remount of a NUL-terminated path
+        unsafe {
+            libc::sync();
+            if let Some(Ok(path)) = DISK.get()
+                && let Ok(path) = CString::new(path.as_str())
+                && libc::umount2(path.as_ptr(), 0) != 0
+            {
+                libc::mount(
+                    std::ptr::null(),
+                    path.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REMOUNT | libc::MS_RDONLY,
+                    std::ptr::null(),
+                );
+            }
+        }
+    })
+    .await
+    .map_err(std::io::Error::other)
+}
+
 /// Brings the loopback interface up: the relay reaches the process on 127.0.0.1.
 fn loopback_up() -> std::io::Result<()> {
     // SAFETY: a plain ioctl on a fresh socket with a zeroed, NUL-terminated ifreq
@@ -289,12 +441,15 @@ fn start(launch: Launch, log: &Arc<Log>) -> std::io::Result<()> {
     let mut child = command.spawn()?;
     capture(&mut child, log);
     println!("guest: started {program} (pid {})", child.id());
-    // PID 1 reaps every orphan; the process's exit is logged, the VM stays up
+    // PID 1 reaps every orphan; the process's exit reaches the wicket as its last line (no
+    // serial console tells it), the VM stays up
     let pid = child.id() as libc::pid_t;
+    let log = log.clone();
     std::thread::spawn(move || {
         REAPER.run(|reaped, status| {
             if reaped == pid {
-                eprintln!("guest: {program} exited ({status})");
+                let line = format!("guest: {program} exited ({status})");
+                log.line(Stream::Stderr, line.as_bytes());
             }
         })
     });
@@ -325,7 +480,7 @@ struct Hook {
 /// waiting discarded (the snapshot's), the clock set (given a time), the seed into
 /// the kernel's random pool,
 /// the pool reseeded, hello mode's generator reseeded, the hook run (its output
-/// to `log`); then `OK`.
+/// to `log`); then `OK`. And its question of the disk, and its stop notice (`stop`).
 async fn control_loop(listener: VsockListener, hook: Option<Hook>, log: Arc<Log>) {
     let hook = Arc::new(hook);
     loop {
@@ -341,12 +496,23 @@ async fn control_loop(listener: VsockListener, hook: Option<Hook>, log: Arc<Log>
             if reader.read_line(&mut line).await.is_err() {
                 return;
             }
-            let answer = match wire::Notice::parse(line.trim_end()) {
-                Some(notice) => match restored(&notice, &hook, &log).await {
-                    Ok(()) => "OK\n".to_string(),
-                    Err(e) => format!("ERR {e}\n"),
-                },
-                None => "ERR not a restore notice\n".to_string(),
+            let line = line.trim_end();
+            let done = if line == wire::DISK_QUESTION {
+                match DISK.get() {
+                    Some(Ok(_)) => Ok(()),
+                    Some(Err(e)) => Err(std::io::Error::other(e.clone())),
+                    None => Err(std::io::Error::other("no disk given")),
+                }
+            } else if let Some(grace) = wire::parse_stop(line) {
+                stop(grace).await
+            } else if let Some(notice) = wire::Notice::parse(line) {
+                restored(&notice, &hook, &log).await
+            } else {
+                Err(std::io::Error::other("not a restore notice"))
+            };
+            let answer = match done {
+                Ok(()) => "OK\n".to_string(),
+                Err(e) => format!("ERR {e}\n"),
             };
             let _ = writer.write_all(answer.as_bytes()).await;
         });
@@ -521,6 +687,59 @@ async fn hello(listener: tokio::net::TcpListener, booted: Instant, log: Arc<Log>
     }
 }
 
+/// Hello mode's `/disk`: `?write=<name>` keeps the body as that file, by a rename, with
+/// `&sync=1` durably; `?read=<name>` answers the file; else the disk's size and its root's
+/// owner. A file's lines are what the tests of a disk read back.
+fn disk_answer(query: &str, body: &[u8]) -> String {
+    use std::os::unix::fs::MetadataExt as _;
+    let Some(Ok(mount)) = DISK.get() else {
+        return "no disk\n".into();
+    };
+    let parameter = |name: &str| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+    };
+    let mount = std::path::Path::new(mount);
+    let result = if let Some(name) = parameter("write") {
+        let durable = parameter("sync") == Some("1");
+        let file = mount.join(name);
+        let partial = mount.join(format!("{name}.partial"));
+        std::fs::File::create(&partial)
+            .and_then(|mut written| {
+                use std::io::Write as _;
+                written.write_all(body)?;
+                if durable {
+                    written.sync_all()?;
+                }
+                std::fs::rename(&partial, &file)
+            })
+            .and_then(|()| match durable {
+                true => std::fs::File::open(mount)?.sync_all(),
+                false => Ok(()),
+            })
+            .map(|()| format!("wrote {name}\n"))
+    } else if let Some(name) = parameter("read") {
+        std::fs::read(mount.join(name)).map(|file| String::from_utf8_lossy(&file).into_owned())
+    } else {
+        std::fs::metadata(mount).map(|root| {
+            let mut fs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+            let path = CString::new(mount.as_os_str().as_encoded_bytes()).expect("a parameter");
+            // SAFETY: statvfs of a NUL-terminated path into a buffer of its type
+            let mib = match unsafe { libc::statvfs(path.as_ptr(), fs.as_mut_ptr()) } {
+                0 => {
+                    // SAFETY: filled by the successful call
+                    let fs = unsafe { fs.assume_init() };
+                    (fs.f_blocks * fs.f_frsize) >> 20
+                }
+                _ => 0,
+            };
+            format!("mib {mib}\nuid {} gid {}\n", root.uid(), root.gid())
+        })
+    };
+    result.unwrap_or_else(|e| format!("error: {e}\n"))
+}
+
 /// The next value of hello mode's generator (splitmix64).
 fn next_random() -> u64 {
     let mut z = RANDOM
@@ -552,6 +771,10 @@ async fn answer(
         let mut lines = GIVEN_ENV.get().cloned().unwrap_or_default().join("\n");
         lines.push('\n');
         return Ok(Response::new(Full::new(Bytes::from(lines))));
+    }
+    if head.uri.path() == "/disk" {
+        let answer = disk_answer(head.uri.query().unwrap_or_default(), &body);
+        return Ok(Response::new(Full::new(Bytes::from(answer))));
     }
     if head.uri.path() == "/log" {
         let line = format!(

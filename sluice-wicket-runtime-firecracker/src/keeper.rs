@@ -48,7 +48,7 @@ const WICKET_FD: RawFd = 3;
 const MESSAGE: usize = 16 * 1024;
 
 /// Fds one request carries at most.
-const MAX_FDS: usize = 2;
+const MAX_FDS: usize = 3;
 
 /// What a VM is charged besides its guest memory, its log and a template's snapshot, in
 /// MiB, for `mem` MiB of guest memory: `firecracker`'s heap and KVM's structures (about
@@ -110,8 +110,8 @@ pub struct Size {
 /// A request of the wicket's.
 #[derive(Serialize, Deserialize, Debug)]
 enum Request {
-    /// A route's VMs are to come, from the files passed with it: the kernel, then the
-    /// rootfs. Its `firecracker` is copied, its directory made.
+    /// A route's VMs are to come, from the files passed with it: the kernel, the rootfs,
+    /// and an app's disk. Its `firecracker` is copied, its directory made.
     Open,
     /// A VM of `route`.
     Spawn {
@@ -346,6 +346,9 @@ struct Route {
     dir: PathBuf,
     /// Its shared VM's or template's cgroup, made with the first.
     cgroup: Option<Cgroup>,
+    /// An app's disk: attached in the template, its VM's to write once given its id, and
+    /// locked per VM on an open file of its own.
+    disk: Option<OwnedFd>,
     sealed: bool,
     closing: bool,
 }
@@ -377,6 +380,8 @@ struct Keeper {
     /// The wicket's pid, and its wait status once reaped.
     wicket: libc::pid_t,
     ended: Option<libc::c_int>,
+    /// The wicket's user: a disk it passes is its file, or a VM's of the ids before.
+    user: u32,
     /// The wicket's group: the VMs' directories are its.
     group: u32,
     ids: Ids,
@@ -471,6 +476,8 @@ impl Keeper {
         dir: PathBuf,
     ) -> io::Result<Keeper> {
         owned(&dir, 0, user.gid, 0o750)?;
+        // the wicket's, for the paths of its command line; the keeper's is / from here on
+        let working = std::env::current_dir()?;
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(dir.join("jail"))?;
@@ -535,7 +542,7 @@ impl Keeper {
                 std::mem::size_of::<libc::timeval>() as libc::socklen_t,
             )
         })?;
-        let wicket = match spawn_wicket(&user, theirs) {
+        let wicket = match spawn_wicket(&user, theirs, &working) {
             Ok(wicket) => wicket,
             Err(e) => {
                 cgroups.close();
@@ -566,6 +573,7 @@ impl Keeper {
             signals,
             wicket,
             ended: None,
+            user: user.uid,
             group: user.gid,
             free: (ids.first..=ids.last).collect(),
             ids,
@@ -822,8 +830,11 @@ impl Keeper {
         }
     }
 
-    /// A route from the wicket's files: its kernel and rootfs, regular files.
-    fn open(&mut self, fds: Vec<OwnedFd>) -> Result<Answer, String> {
+    /// A route from the wicket's files: its kernel and rootfs, regular files, and its disk: a
+    /// regular file open for writing, the wicket's own or a VM's before (nothing else of the
+    /// host's is given away to a VM's id, [`Keeper::jail`]).
+    fn open(&mut self, mut fds: Vec<OwnedFd>) -> Result<Answer, String> {
+        let disk = (fds.len() > 2).then(|| fds.pop()).flatten();
         let [kernel, rootfs]: [OwnedFd; 2] = fds
             .try_into()
             .map_err(|_| "a route needs its kernel and rootfs".to_string())?;
@@ -831,6 +842,19 @@ impl Keeper {
             let mode = jail::mode(fd.as_fd()).map_err(|e| format!("the route's {name}: {e}"))?;
             if let Some(why) = jail::unshareable(mode) {
                 return Err(format!("the route's {name}: {why}"));
+            }
+        }
+        if let Some(disk) = &disk {
+            let file = fstat(disk).map_err(|e| format!("the route's disk: {e}"))?;
+            // SAFETY: fcntl of an fd of ours
+            let flags = unsafe { libc::fcntl(disk.as_raw_fd(), libc::F_GETFL) };
+            if file.st_mode & libc::S_IFMT != libc::S_IFREG
+                || flags & libc::O_ACCMODE != libc::O_RDWR
+                || (file.st_uid != self.user && !self.ids.contains(file.st_uid))
+            {
+                return Err(
+                    "the route's disk: a regular file of the wicket's, open for writing".into(),
+                );
             }
         }
         let firecracker = jail::sealed_copy(&self.firecracker)
@@ -846,13 +870,19 @@ impl Keeper {
             std::fs::DirBuilder::new()
                 .mode(0o700)
                 .create(dir.join("snapshot"))?;
-            for (file, fd) in [(jail::ROUTE_KERNEL, &kernel), (jail::ROUTE_ROOTFS, &rootfs)] {
+            let files = [
+                (jail::ROUTE_KERNEL, Some(&kernel), Access::ReadOnly),
+                (jail::ROUTE_ROOTFS, Some(&rootfs), Access::ReadOnly),
+                (jail::ROUTE_DISK, disk.as_ref(), Access::ReadWrite),
+            ];
+            for (file, fd, access) in files {
+                let Some(fd) = fd else { continue };
                 std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .mode(0o600)
                     .open(dir.join(file))?;
-                self.template.attach(fd.as_fd(), &name.join(file))?;
+                self.template.attach(fd.as_fd(), &name.join(file), access)?;
             }
             Ok::<_, io::Error>(())
         })();
@@ -867,6 +897,7 @@ impl Keeper {
                 firecracker,
                 dir,
                 cgroup: None,
+                disk,
                 sealed: false,
                 closing: false,
             },
@@ -877,7 +908,7 @@ impl Keeper {
     /// Removes the route `name`'s files: detached from the template, its directory
     /// removed.
     fn forget(&self, name: &Path) {
-        for file in [jail::ROUTE_KERNEL, jail::ROUTE_ROOTFS] {
+        for file in [jail::ROUTE_KERNEL, jail::ROUTE_ROOTFS, jail::ROUTE_DISK] {
             self.template.detach(&name.join(file));
         }
         let _ = std::fs::remove_dir_all(self.dir.join(name));
@@ -899,6 +930,9 @@ impl Keeper {
                 return Err("a route has one template".into());
             }
             Role::Clone if !route.sealed => return Err("the route's snapshot is not sealed".into()),
+            Role::Template | Role::Clone if route.disk.is_some() => {
+                return Err("a disk has one VM: its route's shared one".into());
+            }
             _ => {}
         }
         let id = self.free.pop_first().expect("an id is free");
@@ -958,7 +992,28 @@ impl Keeper {
             // for the route's lifetime)
             Role::Template => ((2 * mem) << 20) + overhead,
         };
-        let file_size = vm_file_size(request.role, mem);
+        let route = self.routes.get(&request.route).expect("checked");
+        // the disk: the VM's id's to write, the wicket's group keeping its way to it; and the
+        // VM's lock, on an open file of its own going with it
+        let locked = match &route.disk {
+            Some(disk) => {
+                std::os::unix::fs::fchown(disk, Some(id), Some(self.group))?;
+                let file = std::fs::File::from(disk.try_clone()?);
+                file.set_permissions(std::fs::Permissions::from_mode(0o660))?;
+                let locked = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_CLOEXEC)
+                    .open(format!("/proc/self/fd/{}", disk.as_raw_fd()))?;
+                if !crate::disk::lock(locked.as_raw_fd())? {
+                    return Err(io::Error::other("the disk is in use by another VM"));
+                }
+                Some((locked, fstat(disk)?.st_size as u64))
+            }
+            None => None,
+        };
+        let file_size =
+            vm_file_size(request.role, mem).max(locked.as_ref().map_or(0, |(_, bytes)| *bytes));
         let limits = Limits {
             memory,
             pids: u64::from(request.size.vcpus) + THREADS,
@@ -1003,6 +1058,7 @@ impl Keeper {
             firecracker: route.firecracker.as_fd(),
             route: &route_in_dir,
             kernel: request.role != Role::Clone,
+            disk: locked.as_ref().map(|(file, _)| file.as_fd()),
             run: &run_in_dir,
             snapshot,
             host_cpu: jail::JAIL_HOST_CPU.then_some(Path::new(HOST_CPU_COPY)),
@@ -1089,6 +1145,15 @@ fn describe(status: libc::c_int) -> String {
     }
 }
 
+/// What the kernel knows of the open file `fd`.
+fn fstat(fd: &OwnedFd) -> io::Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat into a buffer of its type
+    check(unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) })?;
+    // SAFETY: filled by the successful call
+    Ok(unsafe { stat.assume_init() })
+}
+
 /// Sets `path`'s owner and mode (setgid included, which `mkdir`'s mode drops).
 fn owned(path: &Path, uid: u32, gid: u32, mode: u32) -> io::Result<()> {
     std::os::unix::fs::lchown(path, Some(uid), Some(gid))?;
@@ -1113,11 +1178,11 @@ fn executable(program: &Path) -> io::Result<PathBuf> {
         })
 }
 
-/// Spawns the wicket, this program again with its command line, as `user`, its end of
-/// the socket pair at [`WICKET_FD`]; in a process group of its own (the keeper alone
-/// gets a terminal's signals, and forwards them once). Its parent death signal set: it
-/// ends with the keeper.
-fn spawn_wicket(user: &User, socket: OwnedFd) -> io::Result<libc::pid_t> {
+/// Spawns the wicket, this program again with its command line, in the directory `working`,
+/// as `user`, its end of the socket pair at [`WICKET_FD`]; in a process group of its own (the
+/// keeper alone gets a terminal's signals, and forwards them once). Its parent death signal
+/// set: it ends with the keeper.
+fn spawn_wicket(user: &User, socket: OwnedFd, working: &Path) -> io::Result<libc::pid_t> {
     // SAFETY: getpid
     let keeper = unsafe { libc::getpid() };
     let raw = socket.as_raw_fd();
@@ -1127,6 +1192,7 @@ fn spawn_wicket(user: &User, socket: OwnedFd) -> io::Result<libc::pid_t> {
     command
         .args(std::env::args_os().skip(1))
         .env(KEEPER_FD, WICKET_FD.to_string())
+        .current_dir(working)
         .process_group(0);
     // SAFETY: only async-signal-safe calls between fork and exec
     unsafe {
@@ -1326,16 +1392,16 @@ impl Client {
         let _ = self.calls.send((bytes, Vec::new()));
     }
 
-    /// Opens a route of `kernel` and `rootfs`: its id and snapshot directory.
+    /// Opens a route of `kernel`, `rootfs` and `disk`: its id and snapshot directory.
     pub async fn open(
         &self,
         kernel: std::fs::File,
         rootfs: std::fs::File,
+        disk: Option<std::fs::File>,
     ) -> Result<(u64, PathBuf), BoxError> {
-        match self
-            .call(Request::Open, vec![kernel.into(), rootfs.into()])
-            .await?
-        {
+        let mut fds: Vec<OwnedFd> = vec![kernel.into(), rootfs.into()];
+        fds.extend(disk.map(OwnedFd::from));
+        match self.call(Request::Open, fds).await? {
             (Answer::Opened { route, snapshot }, _) => Ok((route, snapshot)),
             (answer, _) => Err(format!("keeper: unexpected {answer:?}").into()),
         }

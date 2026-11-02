@@ -10,6 +10,7 @@
 //! <dir>/rootfs/<sha256>/<name>.ext4   the images they name, never rewritten
 //! <dir>/uploads/<sha256>.ext4         the images uploaded by digest, or made (`image`), for UPLOAD_GRACE
 //! <dir>/builds/                       what the images being made take, removed at startup
+//! <dir>/disks/<owner>/<name>.ext4     the apps' disks (`disk`), kept by the app's name
 //! ```
 //!
 //! An image's path names its digest, so other content is another target: its
@@ -19,7 +20,9 @@
 //! published it, so the file never names routes that did not start. It holds
 //! the apps' env, so only its owner reads it (0600). An image nothing names is
 //! removed after every edit and at startup, an upload once `UPLOAD_GRACE`
-//! passed: an app naming it links it below `rootfs/` before.
+//! passed: an app naming it links it below `rootfs/` before. A disk stays as the
+//! app goes, its next one of that name and owner finding it, until it is removed
+//! ([`Deployed::remove_disk`]).
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -30,10 +33,11 @@ use sluice_wicket_console::env::Env;
 use sluice_wicket_console::http::Received;
 use sluice_wicket_console::store::{
     Blobs, UPLOADS, check_digest, check_file, check_host, check_hosts, check_kept, check_name,
-    check_tag, collect_uploads, file_name, quote, rfc3339, write_by_rename,
+    check_tag, collect_uploads, file_name, hidden, quote, rfc3339, write_by_rename,
 };
 
 use crate::config::{FileRoute, Origin};
+use crate::disk;
 use crate::route::RouteSpec;
 use crate::routes::Refused;
 
@@ -46,7 +50,11 @@ const ROOTFS: &str = "rootfs";
 /// What the images being made take, in the directory.
 pub const BUILDS: &str = "builds";
 
-/// The extension an image is kept with.
+/// The apps' disks' directory in the directory: apart from the images', which a
+/// collection empties of what no route names.
+const DISKS: &str = "disks";
+
+/// The extension an image and a disk are kept with.
 const EXT4: &str = ".ext4";
 
 /// A route's options: the keys of a `--vm` flag's query, the values as given
@@ -81,6 +89,24 @@ pub struct App {
     pub tag: Option<String>,
     /// When it took this image, these options and this env, RFC 3339.
     pub deployed: String,
+}
+
+impl App {
+    /// Whether its options name a disk.
+    fn disk(&self) -> bool {
+        self.options.iter().any(|(key, _)| key == "disk")
+    }
+}
+
+/// A disk in the console's directory, as listed.
+#[derive(Clone, PartialEq, Debug, serde::Serialize)]
+pub struct KeptDisk {
+    pub owner: String,
+    /// Its app's name.
+    pub name: String,
+    pub mib: u64,
+    /// Whether that app is there.
+    pub app: bool,
 }
 
 /// An app as its PUT has it.
@@ -181,6 +207,9 @@ impl Deployed {
                 let mut spec = spec(named, host, &app.rootfs, &app.options)?;
                 spec.app = Some(app.name.clone());
                 spec.vm.env = app.env.clone();
+                if let Some(disk) = &mut spec.vm.disk {
+                    disk.file = self.disk_file(&app.owner, &app.name);
+                }
                 let origin = Origin::Api {
                     name: app.name.clone(),
                     owner: app.owner.clone(),
@@ -321,6 +350,17 @@ impl Deployed {
                 kept.owner, app.owner
             )));
         }
+        // before its VM is touched: a smaller file system does not start, nor does the old VM
+        // go for it
+        if let Some(wanted) = disk_mib(&app.options)
+            && let Ok(kept) = std::fs::metadata(self.disk_file(&app.owner, name))
+            && kept.len() > u64::from(wanted) << 20
+        {
+            return Err(Refused::Rejected(format!(
+                "the disk of the app '{name}' is {} MiB, not {wanted}: a disk only grows",
+                kept.len() >> 20
+            )));
+        }
         let upload = self.dir.join(UPLOADS).join(format!("{sha256}{EXT4}"));
         let rootfs = self
             .images()
@@ -373,6 +413,42 @@ impl Deployed {
         self.apps.iter().find(|app| app.name == name)
     }
 
+    /// The disk of the app `name` of `owner`, by a path of checked names.
+    fn disk_file(&self, owner: &str, name: &str) -> PathBuf {
+        self.dir
+            .join(DISKS)
+            .join(owner)
+            .join(format!("{name}{EXT4}"))
+    }
+
+    /// Removes the disk of the app `name` of `owner` that was: refused while an app has it,
+    /// or a VM of one still holds it (a removed app's, draining).
+    pub fn remove_disk(&self, name: &str, owner: &str) -> Result<(), Refused> {
+        check_name("app", name).map_err(Refused::Invalid)?;
+        check_name("owner", owner).map_err(Refused::Invalid)?;
+        if self
+            .app(name)
+            .is_some_and(|app| app.owner == owner && app.disk())
+        {
+            return Err(Refused::Taken(format!(
+                "the app '{name}' has that disk: remove it first"
+            )));
+        }
+        let file = self.disk_file(owner, name);
+        let failed = |e: std::io::Error| Refused::Failed(format!("{}: {e}", file.display()));
+        if disk::held(&file).map_err(failed)? {
+            return Err(Refused::Taken(format!(
+                "a VM of the app '{name}' still holds that disk"
+            )));
+        }
+        match std::fs::remove_file(&file) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Refused::Unknown(format!(
+                "no disk of the app '{name}' of {owner}"
+            ))),
+            removed => removed.map_err(failed),
+        }
+    }
+
     /// Writes the routes and apps to `routes.yaml`, by a rename; for its
     /// owner's eyes only, as it holds the apps' env.
     pub fn save(&self) -> Result<(), String> {
@@ -396,6 +472,45 @@ impl Deployed {
     }
 }
 
+/// The size `options` ask of a disk, when they name one.
+fn disk_mib(options: &Options) -> Option<u32> {
+    let value = |name: &str| options.iter().find(|(key, _)| key == name);
+    value("disk")?;
+    let mib = value("disk-mib").and_then(|(_, mib)| mib.parse().ok());
+    Some(mib.unwrap_or(disk::DEFAULT_MIB))
+}
+
+/// The disks kept in the directory `dir`, by owner and name: `app` tells whether an app has
+/// each.
+pub fn disks(dir: &Path, app: impl Fn(&str, &str) -> bool) -> Vec<KeptDisk> {
+    let mut disks = Vec::new();
+    for owner in std::fs::read_dir(dir.join(DISKS)).into_iter().flatten() {
+        let Ok(owner) = owner else { continue };
+        let owner_name = owner.file_name().to_string_lossy().into_owned();
+        for file in std::fs::read_dir(owner.path()).into_iter().flatten() {
+            let Ok(file) = file else { continue };
+            let file_name = file.file_name().to_string_lossy().into_owned();
+            let Some(name) = file_name
+                .strip_suffix(EXT4)
+                .filter(|_| !hidden(&file.path()))
+            else {
+                continue;
+            };
+            let Ok(metadata) = file.metadata() else {
+                continue;
+            };
+            disks.push(KeptDisk {
+                app: app(&owner_name, name),
+                name: name.to_string(),
+                owner: owner_name.clone(),
+                mib: metadata.len() >> 20,
+            });
+        }
+    }
+    disks.sort_by(|a, b| (&a.owner, &a.name).cmp(&(&b.owner, &b.name)));
+    disks
+}
+
 /// The options of a query's `pairs` (the `--vm` flag's keys) checked as the
 /// route of `host` takes them, but its files: in [`FileRoute::options`]'
 /// order, the numbers normalized.
@@ -409,7 +524,7 @@ pub fn options(host: &str, pairs: &[(String, String)]) -> Result<Options, String
             return Err(format!("{key} given twice"));
         }
         let value = match key.as_str() {
-            "mode" | "egress" => value.clone(),
+            "mode" | "egress" | "disk" => value.clone(),
             _ => value
                 .parse::<u32>()
                 .map_err(|_| format!("{key}={value} is not a number"))?
@@ -644,6 +759,15 @@ mod tests {
                 "egress=db.internal",
                 "egress db.internal: expected <host>:<port>",
             ),
+            ("disk=data", "disk data: expected an absolute path"),
+            ("disk=/proc/x", "disk /proc/x: /proc is the guest's own"),
+            ("disk-mib=64", "disk-mib needs disk"),
+            ("disk=/data&disk-mib=7", "disk-mib must be at least 8"),
+            ("disk-mib=lots&disk=/data", "disk-mib=lots is not a number"),
+            (
+                "disk=/data&mode=reuse",
+                "disk needs mode=shared: one VM writes",
+            ),
         ] {
             let refused = options("a.local", &pairs(query));
             assert!(
@@ -692,6 +816,16 @@ mod tests {
                 hosts: vec!["e.local".into()],
                 rootfs: image("e", "e.ext4"),
                 options: Vec::new(),
+                env: Env::default(),
+                tag: None,
+                deployed: rfc3339(UNIX_EPOCH),
+            },
+            App {
+                name: "kept".into(),
+                owner: "ops".into(),
+                hosts: vec!["f.local".into()],
+                rootfs: image("e", "e.ext4"),
+                options: pairs("disk=/var/lib/app&disk-mib=64"),
                 env: Env::default(),
                 tag: None,
                 deployed: rfc3339(UNIX_EPOCH),

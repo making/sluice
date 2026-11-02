@@ -503,21 +503,27 @@ pub struct Tools {
 }
 
 impl Tools {
-    /// `mkfs.ext4` and `debugfs` of e2fsprogs: on the PATH, or where a distribution keeps
-    /// them away from a user's.
+    /// `name` of e2fsprogs: on the PATH, or where a distribution keeps it away from a user's.
+    fn find_tool(name: &str) -> Result<PathBuf, String> {
+        std::env::var_os("PATH")
+            .iter()
+            .flat_map(std::env::split_paths)
+            .chain(["/usr/sbin".into(), "/sbin".into()])
+            .map(|dir: PathBuf| dir.join(name))
+            .find(|path| path.is_file())
+            .ok_or_else(|| format!("{name} (e2fsprogs) is not on the PATH"))
+    }
+
+    /// `mkfs.ext4`, what a disk is made with.
+    pub fn mkfs() -> Result<PathBuf, String> {
+        Tools::find_tool("mkfs.ext4")
+    }
+
+    /// `mkfs.ext4` and `debugfs`.
     pub fn find() -> Result<Tools, String> {
-        let find = |name: &str| {
-            std::env::var_os("PATH")
-                .iter()
-                .flat_map(std::env::split_paths)
-                .chain(["/usr/sbin".into(), "/sbin".into()])
-                .map(|dir: PathBuf| dir.join(name))
-                .find(|path| path.is_file())
-                .ok_or_else(|| format!("{name} (e2fsprogs) is not on the PATH"))
-        };
         Ok(Tools {
-            mkfs: find("mkfs.ext4")?,
-            debugfs: find("debugfs")?,
+            mkfs: Tools::mkfs()?,
+            debugfs: Tools::find_tool("debugfs")?,
         })
     }
 }

@@ -73,8 +73,8 @@ Two Cargo workspaces:
   restore notice and the egress rules,
   `listener.rs` `--listen` (`head.rs` the request head routing a connection, `hpack.rs`
   an h2c one's), `console.rs` the console (its page in `src/console/`), `deployed.rs` its
-  routes and apps kept, `image.rs` an OCI image pulled, `rootfs.rs` its layers as an ext4
-  image, `state.rs` the state dir, `seccomp.rs` the seccomp filters;
+  routes and apps kept, `disk.rs` an app's disk, `image.rs` an OCI image pulled, `rootfs.rs`
+  its layers as an ext4 image, `state.rs` the state dir, `seccomp.rs` the seccomp filters;
   jail mode's `keeper.rs` (the privileged half, and the wicket's client of it) and
   `jail.rs` (one VM's jail, the VMs' cgroups)
 - `guest/` -- the VMs' `/init`, built for `x86_64-unknown-linux-musl` or
@@ -265,6 +265,7 @@ removed ...; restarted ...`):
 - a host added or removed is advertised on every node stream; a removed target is served
   until every stream acknowledged its removal (the server may have routed a connection to it
   before)
+- an app's VM on a [disk](#disks) is stopped before its next one starts, last of all
 
 Only the routes, the kernel and the firecracker binary are reloaded; the other settings apply
 at startup. The console's edits go through the same reload (see [Console](#console)).
@@ -303,6 +304,7 @@ deployed/routes.yaml                    the routes and apps, in the config file'
 deployed/rootfs/<sha256>/<name>.ext4    the images they name, never rewritten
 deployed/uploads/<sha256>.ext4          the images uploaded by digest, or made, for ten minutes
 deployed/builds/                        what the images being made take, removed at startup
+deployed/disks/<owner>/<app>.ext4       the apps' disks (see Disks), its owner's only (0600)
 ```
 
 `routes.yaml` is written once a change started (0600), and an image no route names is
@@ -407,6 +409,62 @@ the reason). xattrs (file capabilities) are dropped.
 
 The same manifest, guest, port and hook make the same bytes: a build again has the digest it
 had, so its target and VMs stay. Another wicket's guest makes another digest.
+
+#### Disks
+
+An app's shared VM may have a disk: a writable drive that outlives it, kept by the app's owner
+and name in the console's directory, whatever the image, options or env. The sandbox's `disk`
+is where `/init` mounts it before the process starts, `disk-mib` its size (default 1024):
+
+```json
+{"owner": "ops", "hosts": ["db.localhost"], "component": {"sha256": "0954dc11…e8", "name": "db.ext4"},
+ "sandbox": {"mem": 256, "disk": "/data", "disk-mib": 4096}}
+```
+
+- **made** at the app's first start, by `mkfs.ext4` (the wicket needs it, e2fsprogs: in the
+  image), its room taken on the host then (`fallocate`): a disk the host has no room for is a
+  refused PUT, not an I/O error in the guest later. ext4 with a journal: no fsck runs in a VM,
+  and nothing on the host reads what a guest wrote
+- **`disk`** is a directory of the image (the rootfs is read-only: `mkdir` works on `/tmp` alone).
+  Its root goes to the image's user at each mount; what is below stays as it was, whoever wrote
+  it. Refused with the guest's reason (`the guest's disk: ...`, 422) when it cannot mount, and an
+  image whose `/init` predates disks is refused too: it would serve without one
+- **one VM writes it**: `mode=shared` alone (a clone's snapshot holds its guest's page cache of
+  the drive; refused in the other modes), and the file is locked by its `firecracker`
+  (`flock`, the kernel's: gone with the process, whatever became of the wicket), so a second
+  wicket on the directory, or a VM not yet gone, is waited for and then refused. A change of
+  the VM (its image, options, env) is the exception to [Reloading routes](#reloading-routes):
+  once every other target started, the old VM is stopped, then the new one started, on the
+  same disk. Its connections fail meanwhile, a boot long (measured with the cf-api: 0.7-0.8s).
+  A start failing starts the old VM again, the PUT refused as any other (with a process that
+  never listens: 11.5s, the 10s of its boot's bound); failing as well, the route serves nothing
+  until the next reload (SIGHUP, or the same PUT again), and the refusal says so
+- **a stop** tells `/init`: SIGTERM to every process, 10s for them to end (then SIGKILL), what
+  is dirty written out, the disk unmounted, the VM killed, 20s at most. So does the wicket's own
+  end, after its drain (`--drain-grace` and these 20s: `--stop-timeout`, `TimeoutStopSec`). A VM
+  simply killed,
+  the wicket's or the host's crash, is a crash to the file system: the journal replays at the
+  next mount, and what the process had not fsynced may be gone, up to the commit interval's
+  5s. A file written and renamed stays the old one or the new one, not NUL bytes
+  (`nodioread_nolock`, see [Findings](#findings)). Guest flushes reach the host's disk
+  (`cache_type` `Writeback`)
+- **grows** with a PUT of a larger `disk-mib` (the file, then `/init` at its next mount: online,
+  0.2s to 64 GiB). A smaller one is refused (422), its VM untouched; one below 8 MiB too (400:
+  `mkfs.ext4` makes such a file system without a journal). A start that failed may leave it
+  grown, which the old VM then has: the next PUT asks for that much at least
+- **stays** as its app goes (`DELETE /api/apps/<name>`), for the next app of that name and
+  owner. `GET /api/disks` lists them, `{"disks": [{"owner", "name", "mib", "app": <whether it has
+  its app>}]}`; `DELETE /api/disks/<name>?owner=<owner>` removes one, refused (409) while its app
+  is there or a VM of it still holds it
+- **a backup** is the file, while no VM holds it: `flock -n <file> cp --sparse=always <file> <copy>`
+  fails while one does (stop it by removing its app: the disk stays). Copying under a running VM
+  gives a file system nothing checks. A file of another wicket's restored under
+  `deployed/disks/<owner>/<app>.ext4` is what the next start of that app finds
+- **a wicket's start** fails on a disk that does not mount, as on any route that does not start:
+  the first failure ends them all
+- **jail mode**: the file is the wicket's user's to open, bound writable at the jail's `/disk`
+  (see [Jail mode](#jail-mode)). A disk is an app's: the config file's, a flag's and the page's
+  routes take none (they have no name to keep it by)
 
 ### Limits
 
@@ -586,16 +644,18 @@ Each VM's `firecracker`:
 - has a read-only tmpfs as its root holding `/dev/kvm` (a node of its own), its rootfs and
   kernel (bound read-only, from the files the wicket opened), `/run` (a directory of the
   keeper's, the wicket's group's: its API and vsock sockets) and, for a cloned route,
-  `/snapshot`: the template's to write, made read-only (root's) before the first clone; on
-  aarch64 `/sys/devices/system/cpu/cpu0`, the host CPU's cache and `MIDR_EL1` files
-  Firecracker reads, copied by the keeper at its start (the jailer copies them into every
-  jail)
+  `/snapshot`: the template's to write, made read-only (root's) before the first clone; an
+  app's [disk](#disks) at `/disk`, bound writable from the file the wicket opened, owned by the
+  VM's id while it boots (the wicket's group keeps its way to it: 0660); on aarch64
+  `/sys/devices/system/cpu/cpu0`, the host CPU's cache and `MIDR_EL1` files Firecracker reads,
+  copied by the keeper at its start (the jailer copies them into every jail)
 - runs its route's copy of `firecracker` (a sealed memfd): the jailer copies the binary into
   every jail so that VMs share none of its pages; the clones of a route share their
   snapshot's pages anyway, so they share their route's copy, and routes share nothing
 - is in a cgroup (v2) of its own: `memory.max` its `mem` plus 32 MiB plus `mem`/128 (its
-  page tables) plus 16 MiB (its log, bound by `RLIMIT_FSIZE`), its `mem` twice for a template
-  (it writes its snapshot), `pids.max` its vCPUs plus 16. Past its limit the kernel's OOM
+  page tables) plus 16 MiB (its log, bound by `RLIMIT_FSIZE`, a disk's size with a disk: the
+  limit holds for an offset in any file), its `mem` twice for a template (it writes its
+  snapshot), `pids.max` its vCPUs plus 16. Past its limit the kernel's OOM
   killer ends the VM, nothing else. A cloned route's snapshot stays charged to the
   route's cgroup (`route-<n>`) as long as the route lives; a clone's cgroup (`vm-<n>`, one
   per id) is reused. With its route's `cpu` (see [Limits](#limits)) it is in `capped/`, a
@@ -682,7 +742,8 @@ What applies, in both modes unless said:
 - **network and disk**: the VMs have no network interface (vsock only; jailed, a network
   namespace without one either): their [egress](#egress) is the wicket's connections, which
   the host's firewall sees as the wicket's. Their rootfs is read-only, and the snapshots
-  stay on the state dir's tmpfs
+  stay on the state dir's tmpfs. An app's [disk](#disks) is a file of the console's directory,
+  a guest's data at rest as it wrote it: encrypt the host's disk where that matters
 - **the jailer's isolation**: [jail mode](#jail-mode). Unjailed, every VM runs as the
   wicket's user: a guest escaping its `firecracker` (past KVM and seccomp) holds every VM's
   sockets and snapshots and the wicket's token, and the VMs have no cgroup of their own
@@ -732,9 +793,12 @@ docker run --rm --device /dev/kvm --group-add $(stat -c %g /dev/kvm) \
   `scripts/build-guest.sh`); the scripts stay out of the image (they need docker and sudo)
 - **`/run/sluice`**, the state dir, on a tmpfs (`--tmpfs`): the snapshots stay off the disk;
   the wicket warns otherwise
-- **`--stop-timeout`** above `--drain-grace` (20s; Docker's default stop timeout is 10s).
-  The wicket is the container's PID 1: it drains on SIGTERM and reaps its VMs, no init
-  needed
+- **`--stop-timeout`** above `--drain-grace` (20s; Docker's default stop timeout is 10s), and
+  20s more with an app's [disk](#disks). The wicket is the container's PID 1: it drains on
+  SIGTERM and reaps its VMs, no init needed
+- **`/data`** on a volume with `--console`: `deployed/`, the console's directory, holds the
+  routes, the images and the apps' [disks](#disks). The volume is the image's user's (65532),
+  as a new named volume is
 - **open files**: the wicket raises its soft limit to the hard one (Docker's soft one is
   1024) and gives each `firecracker` `--max-connections` + 384 (256 of them its egress, see
   [Findings](#findings))
@@ -829,7 +893,8 @@ sg kvm -c 'cargo test'
 ```
 
 `tests/vm.rs` boots VMs where `/dev/kvm` is usable (it is skipped elsewhere): through a tunnel
-server double, for a shared VM serving two hosts, a VM per connection, reused clones, a pool
+server double, an app's disk through a restart of its VM, a failed start, a growth, the wicket's
+end and its restart, and for a shared VM serving two hosts, a VM per connection, reused clones, a pool
 and a route of two VMs at most, one per client address, it checks http/1.1 with keep-alive,
 h2c, a 5MB POST under the tunnel's flow control and a client half-closing after its request,
 the clones' clock and random values, a client past its share, the connection finding no room,
@@ -1128,8 +1193,8 @@ Caveats:
   its snapshot's memory.
 - **A rootfs is made on the wicket, not in the cf-api**: `/init` must be of the wicket's
   version and arch, which it alone knows; a pull straight to the wicket saves sending the
-  image over again (a CNB image is hundreds of MiB, and the cf-api reads a droplet whole); and
-  the API serves a controller or a user alike. The cf-api keeps the pinned reference as its
+  image over again (a CNB image is hundreds of MiB); and the API serves a controller or a user
+  alike. The cf-api keeps the pinned reference as its
   droplet and has the rootfs made again when the wicket lost it.
 - **`mkfs.ext4 -d` alone cannot make an image's file system as a user** (e2fsprogs 1.47.0,
   uid 1000): every file gets the runner's uid (`-E root_owner` is the root directory's alone), a
@@ -1146,9 +1211,41 @@ Caveats:
   pulled from a local registry and made in 24.5s by the debug build, a build again of the same
   digest; served with the image's user (`cnb`, 1002:1001) and `/usr/bin/passwd` still setuid.
 
+- **A disk is a drive of ext4 with a journal, not an API of the wicket's** (the cf-api's state,
+  its first use): an API needs one writer as much (two VMs during a reload), so a fencing token,
+  and in the cf-api an asynchronous store and its blobs through the egress; a drive needs a
+  stop before the start and costs an app nothing: it writes files. Measured on the 64-core host
+  (NVMe; v1.17.0, the 6.18.56 kernel):
+  - `mkfs.ext4` of a sparse file: 6ms and 33 MiB on the disk at 1 GiB, 23ms and 1 GiB at 256 GiB
+    (`mke2fs` punches an allocated file's holes back: allocate after it)
+  - the guest's mount: 6ms; after a SIGKILL, its journal replayed, 55-65ms
+  - a durable save of 100 KiB (write, `fsync`, rename, `fsync` of the directory): `cache_type`
+    `Unsafe` (the default: a guest's flush is dropped) p50 0.7ms, `Writeback` 3.6ms; a SATA SSD
+    12ms. `Unsafe` breaks the journal's ordering across a crash of the host
+  - **a VM's SIGKILL is a crash of its file system, and ext4's default makes the worst of it**: a
+    small file written and renamed every 20ms without an `fsync`, the VM killed 6-8s in, reads
+    back as NUL bytes of the size it had in 10 kills of 10, and at 12s and 32s too (11 of 12 in
+    all: `dioread_nolock`, the size committed, its extent still unwritten). With
+    `nodioread_nolock` (ordered mode as it was) a complete file in 10 of 10, up to a commit
+    interval's saves gone (5s), at the same save's cost; `data=journal` alike. With an `fsync`
+    before the rename, none gone either way: why `/init` mounts so, and why the cf-api's writes
+    `fsync` (its push right before a kill was lost without)
+  - one drive under two VMs: nothing refuses, both mount, `e2fsck` finds damage in seconds.
+    A `flock` taken by the launcher, on a file open across its exec, holds as long as
+    `firecracker` lives and is gone 43ms after its SIGKILL (a 128 MiB VM's teardown): a start
+    right after a kill must wait for it
+  - `RLIMIT_FSIZE` of 16 MiB under a 256 MiB drive: Firecracker ends at the first write past
+    16 MiB (signal 25, exit 151), the file's size whatever: the limit is the larger of the log's
+    and the drive's
+  - `EXT4_IOC_RESIZE_FS` from `/init`: 19ms to 1 GiB, 185ms to 64 GiB, `e2fsck` clean after
+  - a stop: `sync` of 64 MiB dirty 60ms, the unmount 9ms
+
 ## Not yet
 
-A shared VM replaced when it fails (a pool's are: `mode=pool&vms=1` is one), a pool
+A shared VM replaced when it fails, its process restarted (a pool's VMs are: `mode=pool&vms=1`
+is one; but a [disk](#disks) needs a shared VM: `guest: <program> exited` on the wicket's stderr is
+all that says so), a disk on a route of the config file, a flag or the page, a backup of a
+running disk, a pool
 spreading by load rather than by connections, CPU limits without the jail, an image of the
 page rather than the API (`PUT /api/images`), a docker-archive upload, the requests on the
 flume (the VMs' output alone: `cf logs` shows no `RTR` line here), and egress over UDP or to

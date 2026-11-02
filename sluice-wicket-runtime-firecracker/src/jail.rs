@@ -7,9 +7,10 @@
 //!   each spawn; the jailer's is the host's unless `--netns`)
 //! - its root a tmpfs of its own, read-only, chrooted into: `/dev/kvm` (a node of the
 //!   VM's), `/rootfs` and `/vmlinux` (bound read-only from the files the wicket opened),
-//!   `/run` (bound from the VM's directory of the keeper's: the API and vsock sockets) and
-//!   `/snapshot` (the route's snapshot directory: writable by its template, read-only to
-//!   its clones); on aarch64 `/sys/devices/system/cpu/cpu0` (bound from the keeper's copy
+//!   `/disk` (an app's disk, the same but writable), `/run` (bound from the VM's directory
+//!   of the keeper's: the API and vsock sockets) and `/snapshot` (the route's snapshot
+//!   directory: writable by its template, read-only to its clones); on aarch64
+//!   `/sys/devices/system/cpu/cpu0` (bound from the keeper's copy
 //!   of the host's: the caches and `MIDR_EL1` Firecracker reads, the files the jailer
 //!   copies). No `/dev/net/tun`, `/dev/urandom` or `/dev/userfaultfd`: a vsock-only
 //!   VM restored from a file needs none
@@ -94,6 +95,9 @@ pub const ROOTFS: &str = "/rootfs";
 /// The route's snapshot directory, as `firecracker` sees it.
 pub const SNAPSHOT: &str = "/snapshot";
 
+/// The route's disk, as `firecracker` sees it.
+pub const DISK: &str = "/disk";
+
 /// Whether a bound file or directory is writable in the jail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
@@ -115,6 +119,9 @@ pub struct Jail<'a> {
     pub route: &'a Path,
     /// Whether the kernel is bound: a VM booted, not restored.
     pub kernel: bool,
+    /// The route's disk: bound at [`DISK`] from the route's directory, and this open file of
+    /// it, locked, the VM's across its exec (`disk`): the lock goes with `firecracker`.
+    pub disk: Option<BorrowedFd<'a>>,
     /// The VM's directory, bound at [`RUN`].
     pub run: &'a Path,
     /// The route's snapshot directory, bound at [`SNAPSHOT`].
@@ -141,6 +148,7 @@ pub struct Jail<'a> {
 /// The names of a route's files in its directory.
 pub const ROUTE_ROOTFS: &str = "rootfs";
 pub const ROUTE_KERNEL: &str = "vmlinux";
+pub const ROUTE_DISK: &str = "disk";
 
 /// The host CPU's sysfs directory, where Firecracker reads its caches (the guest's cache
 /// topology) and `MIDR_EL1` on aarch64: the jailer copies those files into each jail.
@@ -341,8 +349,8 @@ impl Template {
     }
 
     /// Attaches the file `fd` (of the keeper's namespace) at `at`, an empty file of the
-    /// keeper's directory, in the template: read-only, its propagation private.
-    pub fn attach(&self, fd: BorrowedFd<'_>, at: &Path) -> io::Result<()> {
+    /// keeper's directory, in the template: as `access` says, its propagation private.
+    pub fn attach(&self, fd: BorrowedFd<'_>, at: &Path, access: Access) -> io::Result<()> {
         let target = kept(at)?;
         // SAFETY: open_tree of an fd with an empty path, in the file's namespace
         let tree = unsafe {
@@ -378,7 +386,7 @@ impl Template {
                     std::ptr::null(),
                 ))?;
             }
-            restrict(&target, Access::ReadOnly)
+            restrict(&target, access)
         })
         .map_err(failed(&format!("attaching {}", at.display())))
     }
@@ -470,6 +478,14 @@ pub fn spawn(jail: &Jail<'_>) -> io::Result<libc::pid_t> {
             kept(&jail.route.join(ROUTE_KERNEL))?,
             inside(KERNEL)?,
             Access::ReadOnly,
+            false,
+        ));
+    }
+    if jail.disk.is_some() {
+        binds.push((
+            kept(&jail.route.join(ROUTE_DISK))?,
+            inside(DISK)?,
+            Access::ReadWrite,
             false,
         ));
     }
@@ -688,6 +704,9 @@ fn jailed(jail: &Jail<'_>, prepared: &Prepared) -> io::Result<std::convert::Infa
             libc::c_uint::MAX,
             libc::CLOSE_RANGE_CLOEXEC as libc::c_int,
         );
+        if let Some(disk) = jail.disk {
+            check(libc::fcntl(disk.as_raw_fd(), libc::F_SETFD, 0)).map_err(failed("the disk"))?;
+        }
         let argv: Vec<*const libc::c_char> = prepared
             .argv
             .iter()

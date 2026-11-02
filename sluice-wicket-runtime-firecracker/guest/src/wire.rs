@@ -130,6 +130,34 @@ pub async fn answer_env<W: AsyncWrite + Unpin>(writer: &mut W) -> std::io::Resul
     writer.write_all(b"OK\n").await
 }
 
+/// The guest kernel's command line parameter naming where `/init` mounts the VM's disk, the
+/// drive after its rootfs ([`DISK_DEVICE`]), before the process starts: `sluice.disk=<path>`.
+/// As [`EGRESS_PARAMETER`], no process gets it.
+pub const DISK_PARAMETER: &str = "sluice.disk";
+
+/// The VM's disk, as its guest sees it: Firecracker attaches the root device first.
+pub const DISK_DEVICE: &str = "/dev/vdb";
+
+/// The control stream's question of a VM with a disk, once `/init` runs: answered `OK\n` with
+/// the disk mounted, else `ERR <why>\n`, the process not started (a guest predating disks
+/// answers as to a line it does not know). The disk's own errors reach the wicket so.
+pub const DISK_QUESTION: &str = "DISK";
+
+/// The control stream's stop notice, [`stop_line`]: `/init` has the process end, SIGTERM and
+/// `grace` to do it (SIGKILL after), then writes what is dirty and unmounts the disk, and
+/// answers `OK\n`. What was only in the guest's page cache is gone with the VM otherwise.
+#[allow(dead_code)] // the wicket's half: each copy has both
+pub fn stop_line(grace: Duration) -> String {
+    format!("STOP {}\n", grace.as_millis())
+}
+
+/// The grace of a stop notice's line (its newline trimmed); None for another line.
+#[allow(dead_code)] // the guest's half: each copy has both
+pub fn parse_stop(line: &str) -> Option<Duration> {
+    let millis = line.strip_prefix("STOP ")?.parse().ok()?;
+    Some(Duration::from_millis(millis))
+}
+
 /// The longest line of an egress stream's request or answer.
 const MAX_EGRESS_LINE: usize = 512;
 
@@ -696,6 +724,10 @@ mod tests {
         );
         assert_eq!(Notice::parse("RESTORED 00"), None);
         assert_eq!(Notice::parse("HELLO"), None);
+        let grace = Duration::from_millis(2500);
+        assert_eq!(parse_stop(stop_line(grace).trim_end()), Some(grace));
+        assert_eq!(parse_stop("STOP soon"), None);
+        assert_eq!(parse_stop(DISK_QUESTION), None);
     }
 
     /// A rule prints as it parses (a name lowercased); a range holds the addresses of its

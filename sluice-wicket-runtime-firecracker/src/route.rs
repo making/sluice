@@ -18,6 +18,7 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::BoxError;
 use crate::capacity::{Capacity, Need, Pool, Slot};
+use crate::disk::{self, Disk};
 use crate::egress::Egress;
 use crate::keeper::Role;
 use crate::output::{self, Hosts, Output, Sink};
@@ -162,7 +163,7 @@ pub struct RouteSpec {
 }
 
 impl RouteSpec {
-    /// Parses `host=<rootfs>[?mode=shared|per-connection|reuse|pool&vcpus=N&mem=MiB&cpu=N&port=N&warm=N&prime=N&vms=N&wait-ms=N&keep-ms=N&uses=N&lifetime-ms=N&conns=N&per-client=N&idle-ms=N&egress=<rule>,...]`.
+    /// Parses `host=<rootfs>[?mode=shared|per-connection|reuse|pool&vcpus=N&mem=MiB&cpu=N&port=N&warm=N&prime=N&vms=N&wait-ms=N&keep-ms=N&uses=N&lifetime-ms=N&conns=N&per-client=N&idle-ms=N&egress=<rule>,...&disk=<path>&disk-mib=N]`.
     pub fn parse(
         flag: &str,
         firecracker: &std::path::Path,
@@ -230,6 +231,7 @@ impl RouteSpec {
                 cpu: None,
                 egress: Vec::new(),
                 env: Env::default(),
+                disk: None,
             },
             mode: Mode::Shared,
             port: 8080,
@@ -246,6 +248,7 @@ impl RouteSpec {
             app: None,
         };
         let mut given = Vec::new();
+        let (mut mount, mut disk_mib) = (None, None);
         for (key, value) in options {
             given.push(key);
             let number = || -> Result<u32, String> {
@@ -286,6 +289,20 @@ impl RouteSpec {
                         spec.vm.egress.push(rule);
                     }
                 }
+                "disk" => {
+                    Disk::check_mount(value).map_err(|e| format!("{named}: {e}"))?;
+                    mount = Some(value.to_string());
+                }
+                "disk-mib" => match number()? {
+                    mib if mib < disk::MIN_MIB => {
+                        return Err(format!(
+                            "{named}: disk-mib must be at least {}: a smaller file system has \
+                             no journal",
+                            disk::MIN_MIB
+                        ));
+                    }
+                    mib => disk_mib = Some(mib),
+                },
                 _ => return Err(format!("{named}: unknown key {key}")),
             }
         }
@@ -299,6 +316,23 @@ impl RouteSpec {
                  (a range takes the place of its addresses)",
                 vm::MAX_EGRESS
             ));
+        }
+        match (mount, disk_mib) {
+            (None, Some(_)) => return Err(format!("{named}: disk-mib needs disk")),
+            (None, None) => {}
+            (Some(_), _) if spec.mode != Mode::Shared => {
+                return Err(format!(
+                    "{named}: disk needs mode=shared: one VM writes a disk, and a clone's \
+                     snapshot holds its guest's page cache of it"
+                ));
+            }
+            (Some(mount), mib) => {
+                spec.vm.disk = Some(Disk {
+                    file: PathBuf::new(),
+                    mount,
+                    mib: mib.unwrap_or(disk::DEFAULT_MIB),
+                });
+            }
         }
         for (key, modes) in MODE_OPTIONS {
             if given.contains(key) && !modes.contains(&spec.mode) {
@@ -410,6 +444,12 @@ impl RouteSpec {
         }
         if !self.vm.egress.is_empty() {
             options.push(("egress", vm::egress_list(&self.vm.egress)));
+        }
+        if let Some(disk) = &self.vm.disk {
+            options.push(("disk", disk.mount.clone()));
+            if disk.mib != disk::DEFAULT_MIB {
+                options.push(("disk-mib", disk.mib.to_string()));
+            }
         }
         options
     }
@@ -593,7 +633,8 @@ pub struct Route {
 }
 
 enum Backend {
-    Shared(Box<Vm>),
+    /// Its VM; none once stopped ([`Route::stop`]).
+    Shared(Mutex<Option<Arc<Vm>>>),
     /// Per-connection and reuse modes: a clone per connection at a time.
     Cloned {
         cloner: Arc<Cloner>,
@@ -1198,6 +1239,11 @@ impl Route {
             .take(need, START_WAIT)
             .await
             .map_err(|e| format!("route {label}: {e}"))?;
+        if let Some(disk) = &spec.vm.disk {
+            disk.ready()
+                .await
+                .map_err(|e| format!("route {label}: {e}"))?;
+        }
         let place = Arc::new(
             places
                 .place(n, &spec.vm)
@@ -1222,7 +1268,7 @@ impl Route {
                     "route {label}: VM booted, guest listening after {}ms",
                     booted.as_millis()
                 );
-                Backend::Shared(Box::new(vm))
+                Backend::Shared(Mutex::new(Some(Arc::new(vm))))
             }
             Mode::PerConnection | Mode::Reuse | Mode::Pool => {
                 // its clones are told they were restored: a guest predating the
@@ -1362,7 +1408,7 @@ impl Route {
             ..Vms::default()
         };
         match &self.backend {
-            Backend::Shared(_) => vms.shared = true,
+            Backend::Shared(vm) => vms.shared = vm.lock().unwrap().is_some(),
             Backend::Cloned { warm, kept, .. } => {
                 vms.warm = warm.clones.lock().unwrap().len();
                 vms.kept = kept
@@ -1393,6 +1439,36 @@ impl Route {
         self.hosts.set(hosts);
     }
 
+    /// Whether a VM of it holds a disk: its disk's file.
+    pub fn disk(&self) -> Option<&std::path::Path> {
+        let disk = self.spec.vm.disk.as_ref()?;
+        (!self.stopped()).then_some(disk.file.as_path())
+    }
+
+    /// Whether its shared VM was stopped: its connections fail from then on.
+    pub fn stopped(&self) -> bool {
+        matches!(&self.backend, Backend::Shared(vm) if vm.lock().unwrap().is_none())
+    }
+
+    /// Stops the VM of a route with a disk, for good: what the process wrote is all on the
+    /// disk, as far as it ended within [`disk::STOP_GRACE`], and its open connections end.
+    /// It gives the disk up as it is gone (the lock tells, [`Disk::ready`]). Any other route's
+    /// VMs end with their last connection.
+    pub async fn stop(&self) {
+        let Backend::Shared(vm) = &self.backend else {
+            return;
+        };
+        if self.spec.vm.disk.is_none() {
+            return;
+        }
+        let vm = vm.lock().unwrap().take();
+        if let Some(vm) = vm
+            && let Err(e) = vm.stop(disk::STOP_GRACE).await
+        {
+            eprintln!("route {}: its VM's stop: {e}; killed", self.label());
+        }
+    }
+
     /// A stream to a guest for one connection of `client` (its IP address; empty when
     /// unknown, which `per-client` does not bound): failed at once when the client
     /// holds its share of the route already.
@@ -1417,7 +1493,11 @@ impl Route {
     async fn dial(&self) -> Result<(UnixStream, Held), BoxError> {
         let trace = std::env::var_os("SLUICE_WICKET_RUNTIME_FIRECRACKER_TRACE").is_some();
         match &self.backend {
-            Backend::Shared(vm) => Ok((vm.dial(self.spec.port).await?, Held::Shared)),
+            Backend::Shared(vm) => {
+                let vm = vm.lock().unwrap().clone();
+                let vm = vm.ok_or("its VM was stopped: the route is restarting")?;
+                Ok((vm.dial(self.spec.port).await?, Held::Shared))
+            }
             Backend::Pool(pool) => {
                 let (stream, seat) = pool.open().await?;
                 Ok((stream, Held::Pooled(seat)))

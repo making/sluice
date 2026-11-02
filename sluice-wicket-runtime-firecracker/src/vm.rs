@@ -30,6 +30,11 @@
 //! them in its snapshot's memory. No file holds them, so a jail needs nothing more, and
 //! the kernel's command line, which any process of the guest reads, says only that they
 //! are coming.
+//!
+//! An app's shared VM may have a disk (`disk`), a second drive: the launcher takes its lock
+//! for `firecracker`, whose guest's flushes reach the host's disk (`Writeback`: its journal
+//! relies on them across a crash of the host). Its VM is stopped by a notice before it is
+//! killed ([`Vm::stop`]).
 
 use std::ffi::OsString;
 use std::os::fd::OwnedFd;
@@ -53,6 +58,7 @@ use tokio::sync::{oneshot, watch};
 
 use crate::BoxError;
 use crate::capacity::Slot;
+use crate::disk::{self, Disk};
 use crate::egress::{self, Egress, Listening};
 use crate::jail;
 use crate::keeper::{Client, Role, Size, vm_file_size};
@@ -72,12 +78,28 @@ pub const RESTORE_ADVANCES_CLOCK: bool = cfg!(target_arch = "x86_64");
 /// The first argument of the wicket's launcher mode, see [`launch`].
 pub const LAUNCH: &str = "--launch-vm";
 
+/// The launcher's disk argument for a VM without one.
+const NO_DISK: &str = "-";
+
 /// The descriptors a `firecracker` holds besides its vsock streams: KVM's, its
 /// vCPUs', event fds, its sockets, files and log.
 const VM_OWN_FILES: u64 = 128;
 
 /// How long `/init` may take to read the env stream.
 const ENV_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a guest may take to answer of its disk: it mounts it first, a journal to replay.
+const DISK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a guest may take to write all out once its process ended (a stop).
+const STOP_WRITES: Duration = Duration::from_secs(10);
+
+/// How long a guest may take to take a vsock stream: its kernel's, its process's business
+/// aside. Past it the guest is wedged, and no connection, stop or reload waits on for it.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest answer of a guest's control stream the wicket reads.
+const MAX_CONTROL_ANSWER: usize = 1024;
 
 /// The bytes of a route's egress rules a VM's kernel command line takes at most (2048 in
 /// all, Firecracker's parameters and the wicket's own among them).
@@ -167,21 +189,23 @@ async fn launching<R: Send + 'static>(
 }
 
 /// The launcher mode (`<wicket> --launch-vm <wicket pid> <open files> <file size>
-/// <program> <args>...`), run before anything else: sets the parent death signal
-/// (SIGKILL), checks that the parent is still the wicket of `<wicket pid>` (else it
+/// <disk or -> <program> <args>...`), run before anything else: sets the parent death
+/// signal (SIGKILL), checks that the parent is still the wicket of `<wicket pid>` (else it
 /// died before the signal was set, and exits), sets the soft open file limit, the file
 /// size limit (bytes; a guest's output to its VM's log bounded, as a jail's) and no
-/// core (of a VM's memory), and execs the program. Returns only when that failed.
+/// core (of a VM's memory), takes the disk's lock for the program ([`disk::hold`]), and
+/// execs the program. Returns only when that failed.
 pub fn launch(mut args: impl Iterator<Item = OsString>) -> std::io::Error {
     let mut number = || {
         args.next()
             .and_then(|arg| arg.to_str()?.parse::<u64>().ok())
     };
     let (wicket, files, size) = (number(), number(), number());
-    let (Some(wicket), Some(files), Some(size), Some(program)) = (wicket, files, size, args.next())
+    let (Some(wicket), Some(files), Some(size), Some(locked), Some(program)) =
+        (wicket, files, size, args.next(), args.next())
     else {
         return std::io::Error::other(format!(
-            "usage: {LAUNCH} <wicket pid> <open files> <file size> <program> <args>..."
+            "usage: {LAUNCH} <wicket pid> <open files> <file size> <disk or -> <program> <args>..."
         ));
     };
     // SAFETY: a plain prctl; the signal follows the parent thread, a runtime worker
@@ -216,6 +240,11 @@ pub fn launch(mut args: impl Iterator<Item = OsString>) -> std::io::Error {
             return std::io::Error::last_os_error();
         }
     }
+    if locked != NO_DISK
+        && let Err(e) = disk::hold(Path::new(&locked))
+    {
+        return e;
+    }
     std::process::Command::new(program).args(args).exec()
 }
 
@@ -235,6 +264,8 @@ pub struct Spec {
     pub egress: Vec<Rule>,
     /// The environment variables of its process, over the image's.
     pub env: Env,
+    /// Its disk: a shared VM's, an app's.
+    pub disk: Option<Disk>,
 }
 
 /// `rules` as a VM's kernel command line and a route's target name them: `,` between.
@@ -335,8 +366,20 @@ impl Places {
                         None => Ok::<_, BoxError>(file),
                     }
                 };
+                // its file the VM's alone to write, once the keeper gave it its id
+                let disk = spec
+                    .disk
+                    .as_ref()
+                    .map(|disk| {
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(&disk.file)
+                            .map_err(|e| format!("{}: {e}", disk.file.display()))
+                    })
+                    .transpose()?;
                 let (route, snapshot) = keeper
-                    .open(open(&spec.kernel)?, open(&spec.rootfs)?)
+                    .open(open(&spec.kernel)?, open(&spec.rootfs)?, disk)
                     .await?;
                 Ok(Place::Jail {
                     keeper: keeper.clone(),
@@ -412,12 +455,13 @@ pub struct Vm {
 
 impl Vm {
     /// Starts `firecracker` in `dir` (created; its API socket, vsock socket and log go
-    /// there), the files it writes at most `file_size` bytes each, and waits for its API
-    /// socket.
+    /// there), the files it writes at most `file_size` bytes each, holding its `disk`'s
+    /// lock, and waits for its API socket.
     async fn spawn(
         firecracker: &Path,
         dir: PathBuf,
         file_size: u64,
+        disk: Option<&Path>,
         slot: Slot,
     ) -> Result<Vm, BoxError> {
         tokio::fs::create_dir_all(&dir)
@@ -436,6 +480,7 @@ impl Vm {
         let log = dir.join("firecracker.log");
         let vm_log = log.clone();
         let (firecracker, api_path, dir_path) = (firecracker.to_owned(), api.clone(), dir.clone());
+        let disk = disk.map_or_else(|| PathBuf::from(NO_DISK), Path::to_path_buf);
         let child = launching(move || -> Result<Child, BoxError> {
             let file =
                 std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
@@ -445,6 +490,7 @@ impl Vm {
                 .arg(std::process::id().to_string())
                 .arg(VM_OPEN_FILES.load(Ordering::Relaxed).to_string())
                 .arg(file_size.to_string())
+                .arg(&disk)
                 .arg(&firecracker)
                 .arg("--api-sock")
                 .arg(&api_path)
@@ -534,22 +580,30 @@ impl Vm {
         slot: Slot,
         egress: Option<(&Arc<Egress>, String)>,
     ) -> Result<Vm, BoxError> {
-        let (mut vm, kernel, rootfs) = match place {
+        let (mut vm, kernel, rootfs, disk) = match place {
             Place::Dir(dir) => (
                 Vm::spawn(
                     &spec.firecracker,
                     dir.join("boot"),
-                    vm_file_size(role, u64::from(spec.mem_mib)),
+                    vm_file_size(role, u64::from(spec.mem_mib)).max(
+                        spec.disk
+                            .as_ref()
+                            .map_or(Ok(0), Disk::file_bytes)
+                            .map_err(BoxError::from)?,
+                    ),
+                    spec.disk.as_ref().map(|disk| disk.file.as_path()),
                     slot,
                 )
                 .await?,
                 spec.kernel.clone(),
                 spec.rootfs.clone(),
+                spec.disk.as_ref().map(|disk| disk.file.clone()),
             ),
             Place::Jail { keeper, route, .. } => (
                 Vm::jailed(keeper, *route, role, spec.size(), slot).await?,
                 PathBuf::from(jail::KERNEL),
                 PathBuf::from(jail::ROOTFS),
+                spec.disk.as_ref().map(|_| PathBuf::from(jail::DISK)),
             ),
         };
         vm.listen(egress)?;
@@ -564,7 +618,11 @@ impl Vm {
             "/boot-source",
             json!({
                 "kernel_image_path": kernel,
-                "boot_args": boot_args(&spec.egress, !spec.env.is_empty()),
+                "boot_args": boot_args(
+                    &spec.egress,
+                    !spec.env.is_empty(),
+                    spec.disk.as_ref().map(|disk| disk.mount.as_str()),
+                ),
             }),
         )
         .await?;
@@ -580,6 +638,20 @@ impl Vm {
             }),
         )
         .await?;
+        if let Some(disk) = disk {
+            vm.api(
+                "PUT",
+                "/drives/disk",
+                json!({
+                    "drive_id": "disk",
+                    "path_on_host": disk,
+                    "is_root_device": false,
+                    "is_read_only": false,
+                    "cache_type": "Writeback",
+                }),
+            )
+            .await?;
+        }
         vm.api(
             "PUT",
             "/vsock",
@@ -591,7 +663,72 @@ impl Vm {
         if !spec.env.is_empty() {
             vm.give_env(&spec.env).await?;
         }
+        if spec.disk.is_some() {
+            vm.ask_disk().await?;
+        }
         Ok(vm)
+    }
+
+    /// `line` to `/init` on the control stream `stream`, and its answer within `timeout`:
+    /// `OK`, or its error. The stream kept whole: Firecracker takes a write half shut down as
+    /// the end of the whole stream.
+    async fn control(
+        &self,
+        mut stream: UnixStream,
+        line: &str,
+        timeout: Duration,
+    ) -> Result<(), BoxError> {
+        let answered = async {
+            stream.write_all(line.as_bytes()).await?;
+            Ok::<_, BoxError>(wire::read_short_line(&mut stream, MAX_CONTROL_ANSWER).await?)
+        };
+        let answer = tokio::time::timeout(timeout, answered)
+            .await
+            .map_err(|_| format!("no answer within {timeout:?}; {}", self.log()))??;
+        match answer.trim_ascii_end() {
+            b"OK" => Ok(()),
+            other => {
+                let other = String::from_utf8_lossy(other);
+                Err(other
+                    .strip_prefix("ERR ")
+                    .unwrap_or(&other)
+                    .to_string()
+                    .into())
+            }
+        }
+    }
+
+    /// Whether `/init`, once it runs, mounted the disk: its error, or that it knows of none.
+    /// A guest predating disks would serve without one, what it writes gone with the VM.
+    async fn ask_disk(&self) -> Result<(), BoxError> {
+        let stream = self.dial_ready(wire::CONTROL_PORT, DISK_TIMEOUT).await?;
+        let line = format!("{}\n", wire::DISK_QUESTION);
+        let asked = self.control(stream, &line, DISK_TIMEOUT).await;
+        asked.map_err(|e| {
+            let e = e.to_string();
+            match e.as_str() {
+                "not a restore notice" => {
+                    "the guest mounts no disk: its /init predates them, build the rootfs again"
+                        .to_string()
+                }
+                _ => format!("the guest's disk: {e}"),
+            }
+            .into()
+        })
+    }
+
+    /// Has `/init` end the process within `grace` and write all out, so that the kill to come
+    /// loses nothing of what it wrote; `grace` and [`STOP_WRITES`] at most, a wedged guest's
+    /// too. A VM ended already says so at once.
+    pub async fn stop(&self, grace: Duration) -> Result<(), BoxError> {
+        let within = grace + STOP_WRITES;
+        let stopped = async {
+            let stream = self.dial(wire::CONTROL_PORT).await?;
+            self.control(stream, &wire::stop_line(grace), within).await
+        };
+        tokio::time::timeout(within, stopped)
+            .await
+            .map_err(|_| format!("no answer within {within:?}"))?
     }
 
     /// Gives `/init`, waiting for it, the variables of the process's environment. An
@@ -619,7 +756,7 @@ impl Vm {
             Place::Dir(dir) => {
                 let dir = dir.join("clones").join(format!("vm-{n}"));
                 let size = vm_file_size(Role::Clone, u64::from(snapshot.size.mem));
-                Vm::spawn(&snapshot.firecracker, dir, size, slot).await?
+                Vm::spawn(&snapshot.firecracker, dir, size, None, slot).await?
             }
             Place::Jail { keeper, route, .. } => {
                 Vm::jailed(keeper, *route, Role::Clone, snapshot.size, slot).await?
@@ -685,29 +822,39 @@ impl Vm {
         Ok(())
     }
 
-    /// Opens a stream to the guest's vsock `port`.
+    /// Opens a stream to the guest's vsock `port`, within [`DIAL_TIMEOUT`].
     pub async fn dial(&self, port: u32) -> Result<UnixStream, BoxError> {
-        let mut stream = UnixStream::connect(&self.vsock).await?;
-        stream
-            .write_all(format!("CONNECT {port}\n").as_bytes())
-            .await?;
-        // what follows the line is the guest's
-        let line = wire::read_short_line(&mut stream, 64)
+        let dialed = async {
+            let mut stream = UnixStream::connect(&self.vsock).await?;
+            stream
+                .write_all(format!("CONNECT {port}\n").as_bytes())
+                .await?;
+            // what follows the line is the guest's
+            let line = wire::read_short_line(&mut stream, 64)
+                .await
+                .map_err(|e| format!("vsock handshake: {e}"))?;
+            if !line.starts_with(b"OK ") {
+                return Err(
+                    format!("vsock handshake: {}", String::from_utf8_lossy(&line).trim()).into(),
+                );
+            }
+            Ok::<_, BoxError>(stream)
+        };
+        tokio::time::timeout(DIAL_TIMEOUT, dialed)
             .await
-            .map_err(|e| format!("vsock handshake: {e}"))?;
-        if !line.starts_with(b"OK ") {
-            return Err(
-                format!("vsock handshake: {}", String::from_utf8_lossy(&line).trim()).into(),
-            );
-        }
-        Ok(stream)
+            .map_err(|_| format!("vsock handshake: no answer within {DIAL_TIMEOUT:?}"))?
     }
 
     /// [`Vm::dial`] retried until the guest listens on `port`, within `timeout`.
     pub async fn dial_ready(&self, port: u32, timeout: Duration) -> Result<UnixStream, BoxError> {
         let deadline = Instant::now() + timeout;
         loop {
-            match self.dial(port).await {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let dialed = match tokio::time::timeout(left, self.dial(port)).await {
+                Ok(dialed) => dialed,
+                Err(_) => Err("vsock handshake: no answer".into()),
+            };
+            match dialed {
                 Ok(stream) => return Ok(stream),
                 Err(e) if Instant::now() > deadline => {
                     return Err(format!(
@@ -787,8 +934,8 @@ pub fn log_tail(path: &Path) -> String {
 /// No serial console unless `SLUICE_WICKET_RUNTIME_FIRECRACKER_SERIAL_CONSOLE` is set (the kernel's and
 /// `/init`'s own output then goes to the VM's log; the processes' goes to the wicket's
 /// stdout / stderr regardless): printing to it is the slowest part of a boot. The route's
-/// `egress`, if any, for `/init`, and that its env is coming (`env`).
-fn boot_args(egress: &[Rule], env: bool) -> String {
+/// `egress`, if any, for `/init`, that its env is coming (`env`), and where its disk goes.
+fn boot_args(egress: &[Rule], env: bool, disk: Option<&str>) -> String {
     let console = match std::env::var_os("SLUICE_WICKET_RUNTIME_FIRECRACKER_SERIAL_CONSOLE") {
         Some(_) => "console=ttyS0",
         None => "console=none 8250.nr_uarts=0",
@@ -807,5 +954,8 @@ fn boot_args(egress: &[Rule], env: bool) -> String {
         true => format!(" {}=1", wire::ENV_PARAMETER),
         false => String::new(),
     };
-    format!("{console} reboot=k panic=1 quiet{arch} init=/init{egress}{env}")
+    let disk = disk.map_or(String::new(), |mount| {
+        format!(" {}={mount}", wire::DISK_PARAMETER)
+    });
+    format!("{console} reboot=k panic=1 quiet{arch} init=/init{egress}{env}{disk}")
 }

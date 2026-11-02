@@ -32,7 +32,8 @@
 //!
 //! `--console` serves a page and an API (`console`) deploying uploaded rootfs
 //! images as routes without a restart, kept in the console's directory
-//! (`deployed`) across restarts.
+//! (`deployed`) across restarts. An app's shared VM may have a disk there that
+//! outlives it (`disk`).
 //!
 //! In jail mode (`--jail-ids`) the process started as root is the keeper
 //! (`keeper`): it runs the wicket as `--jail-user` and spawns the VMs at its
@@ -42,6 +43,7 @@ pub mod capacity;
 pub mod config;
 pub mod console;
 pub mod deployed;
+pub mod disk;
 pub mod egress;
 pub mod head;
 pub mod hpack;
@@ -231,6 +233,7 @@ pub async fn run(
             () = reloads => {}
             name = signals.recv() => println!("{name}: ending at once"),
         }
+        routes.current().stop_disks().await;
         return Ok(());
     };
     let shared = Shared::new(
@@ -253,7 +256,9 @@ pub async fn run(
         requests_received,
         shared.drain.begin.clone(),
     ));
-    sluice_wicket_tunnel::serve(shared, server, drain_grace, &mut signals).await
+    let served = sluice_wicket_tunnel::serve(shared, server, drain_grace, &mut signals).await;
+    routes.current().stop_disks().await;
+    served
 }
 
 /// What the console makes rootfs images with (`--guest`), in the directory `dir`.
