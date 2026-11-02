@@ -36,7 +36,7 @@ cleanup() {
   docker rm -f "$registry_name" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
   docker volume rm "$volume" >/dev/null 2>&1 || true
-  docker rmi "$wicket_image" "$flume_image" "$registry/test/cf-api:1" "$registry/test/web:1" >/dev/null 2>&1 || true
+  docker rmi "$wicket_image" "$flume_image" "$registry/test/cf-api:1" >/dev/null 2>&1 || true
   cd /
   rm -rf "$work"
 }
@@ -49,12 +49,6 @@ expect() { # <what> <text> <pattern>
 docker build -q -f "$repo/sluice-wicket-runtime-firecracker/Dockerfile" -t "$wicket_image" "$repo" >/dev/null
 docker build -q -f "$repo/sluice-flume/Dockerfile" -t "$flume_image" "$repo" >/dev/null
 docker build -q -f "$repo/sluice-wicket-cf-api/Dockerfile" -t "$registry/test/cf-api:1" "$repo" >/dev/null
-fc=$repo/sluice-wicket-runtime-firecracker
-guest=$fc/$("$fc/scripts/guest.sh" 2>/dev/null)
-mkdir ctx
-cp "$(dirname "$guest")/sample-process" ctx/serve
-printf 'FROM scratch\nCOPY serve /app/serve\nENTRYPOINT ["/app/serve", "/app/serve"]\n' > ctx/Dockerfile
-docker build -q -t "$registry/test/web:1" ctx >/dev/null
 
 # the page's <n>th block of commands of the section
 block() {
@@ -76,7 +70,6 @@ local_to_this_run() {
   sed -e "s#ghcr.io/making/sluice/sluice-wicket-runtime-firecracker#$wicket_image#" \
     -e "s#ghcr.io/making/sluice/sluice-flume#$flume_image#" \
     -e "s#ghcr.io/making/sluice/sluice-wicket-cf-api#$registry/test/cf-api:1#" \
-    -e "s#ghcr.io/me/web:1#$registry/test/web:1#" \
     -e "s#docker network create sluice#docker network create $network \&\& docker run -d --name $registry_name --network $network -p 127.0.0.1:$listen:8080 -p 127.0.0.1:$console:9090 -p $registry:$registry_port -e REGISTRY_HTTP_ADDR=0.0.0.0:$registry_port registry:3#" \
     -e "s#--name wicket --network sluice#--name $name --network container:$registry_name#" \
     -e "s#--network sluice #--network $network #" \
@@ -107,7 +100,6 @@ until docker push -q "$registry/test/cf-api:1" >/dev/null 2>&1; do
   [ "$SECONDS" -lt "$deadline" ] || exit 1
   sleep 1
 done
-docker push -q "$registry/test/web:1" >/dev/null
 until docker logs "$name" 2>&1 | grep -q "console on"; do
   [ "$SECONDS" -lt "$deadline" ] || exit 1
   sleep 0.2
@@ -120,11 +112,11 @@ expect "the cf-api's app" "$(tail -1 "$log")" "added cf.localhost"
 
 echo "the CLI"
 page 3
+expect "the image the page names, served" "$(grep -c "^Host: web.localhost:$listen" "$log")" "^1$"
 expect "the env given" "$(grep -c '^GREETING=hi$' "$log")" "^1$"
 deadline=$((SECONDS + 60))
-until cf8 logs web --recent 2>&1 | grep -q 'APP/PROC/WEB/0\] OUT GET / HTTP'; do
+until cf8 logs web --recent 2>&1 | grep -q 'APP/PROC/WEB/0\] ERR .*Starting up on port 80'; do
   [ "$SECONDS" -lt "$deadline" ] || { echo "the app's output never came through the flume" >&2; exit 1; }
-  command curl -s -o /dev/null -H 'Host: web.localhost' "http://127.0.0.1:$listen/"
   sleep 0.5
 done
 echo "ok: the process's output in cf logs, through the flume"
@@ -137,7 +129,8 @@ echo "a restart of the wicket"
 started=$(date +%s%N)
 page 4
 echo "   back, the app served, $(( ($(date +%s%N) - started) / 1000000 ))ms after the restart began (5s of it the page's sleep)"
-expect "the CLI's login, its app" "$(tail -30 "$log")" "web"
+expect "the CLI's login, its app" "$(tail -30 "$log")" "^web "
+expect "the app served" "$(tail -30 "$log")" "^Host: web.localhost:$listen"
 
 answers() {
   local deadline=$((SECONDS + 60))

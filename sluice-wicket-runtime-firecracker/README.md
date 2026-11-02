@@ -393,11 +393,12 @@ digest, or made of an OCI image, first; the app names it:
 `debugfs` (in the image too), no root and no docker. Without `--guest` it is refused (422):
 
 ```json
-{"image": "ghcr.io/me/shop:1", "username": "me", "password": "…", "port": 8080}
+{"image": "ghcr.io/traefik/whoami:v1.11.0", "port": 80}
 ```
 
 Only `image` is required; `port` is the process's, `PORT` in its environment (default the
-lowest the image exposes, else 8080), `restore` the restore hook's argv (see [Clones](#clones)).
+lowest the image exposes, else 8080), `username` and `password` a private image's credentials,
+`restore` the restore hook's argv (see [Clones](#clones)).
 The manifest of the wicket's platform is pulled (of an index, its `linux/<arch>` entry; other
 arches are refused), then its layers (tar or gzip; zstd is refused), checked against their
 digests: a registry on the loopback over plain HTTP, any other over HTTPS against the webPKI
@@ -788,7 +789,8 @@ docker run --rm --device /dev/kvm --group-add $(stat -c %g /dev/kvm) \
 - **rootfs images** come in through a volume (`-v $PWD/rootfs:/rootfs:ro`), readable by the
   image's user (65532). Their `/init` must be the image's guest (a rootfs without the restore
   notice fails a cloned route): build them with it, `docker create --name guest
-  <image>`, `docker cp guest:/usr/local/share/sluice-wicket-runtime-firecracker/init init`,
+  ghcr.io/making/sluice/sluice-wicket-runtime-firecracker`,
+  `docker cp guest:/usr/local/share/sluice-wicket-runtime-firecracker/init init`,
   `docker rm guest`, then `SLUICE_GUEST=init scripts/cnb-rootfs.sh ...` (or
   `scripts/build-guest.sh`); the scripts stay out of the image (they need docker and sudo)
 - **`/run/sluice`**, the state dir, on a tmpfs (`--tmpfs`): the snapshots stay off the disk;

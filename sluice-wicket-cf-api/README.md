@@ -310,8 +310,9 @@ The CLI works as on any wicket, an app being a container image or a rootfs (see
 cf api http://cf.localhost:8080
 cf login -u me -p x                              # any credentials: no provider yet
 
-# any container image whose process listens on $PORT; the wicket pulls it and makes its rootfs
-cf push web --docker-image ghcr.io/me/web:1
+# any image whose process listens on $PORT: the port it exposes, else 8080. The wicket pulls it
+# and makes its rootfs, read-only but for /tmp
+cf push web --docker-image ghcr.io/traefik/whoami:v1.11.0
 curl http://web.localhost:8080/
 cf logs web --recent                             # the process's output, from the flume
 
