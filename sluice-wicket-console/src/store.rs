@@ -5,6 +5,7 @@
 //! ```text
 //! <dir>/routes.yaml                 the routes (the wicket's shape), for its owner only
 //! <dir>/<kind>/<sha256>/<name>      the files they name: components, rootfs images
+//! <dir>/uploads/<sha256><ext>       the files uploaded by digest, for UPLOAD_GRACE
 //! ```
 //!
 //! A file's path names its digest, so other content is another target: its
@@ -15,7 +16,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::http::Received;
 
@@ -25,6 +26,34 @@ pub const MAX_NAME: usize = 100;
 
 /// Longest tag of an app, in bytes.
 const MAX_TAG: usize = 128;
+
+/// The uploads' directory in the directory.
+pub const UPLOADS: &str = "uploads";
+
+/// How long an upload is kept for an app to name it: minutes, so the PUT
+/// naming it after the upload never races its removal.
+pub const UPLOAD_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// Removes the uploads of `dir` kept for [`UPLOAD_GRACE`], and any partial one
+/// a crash left: an app naming one links it below its kind's directory before.
+pub fn collect_uploads(dir: &Path) {
+    for upload in std::fs::read_dir(dir.join(UPLOADS))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        // a time ahead of the clock is fresh
+        let fresh = upload.metadata().is_ok_and(|metadata| {
+            metadata.is_file()
+                && metadata
+                    .modified()
+                    .is_ok_and(|at| at.elapsed().is_ok_and(|age| age <= UPLOAD_GRACE))
+        });
+        if !fresh || hidden(&upload.path()) {
+            remove(&upload.path());
+        }
+    }
+}
 
 /// The files of one kind kept below `<dir>/<kind>/<sha256>/<name>`.
 pub struct Blobs<'a> {

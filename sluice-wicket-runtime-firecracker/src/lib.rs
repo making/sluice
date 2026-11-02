@@ -45,10 +45,12 @@ pub mod deployed;
 pub mod egress;
 pub mod head;
 pub mod hpack;
+pub mod image;
 pub mod jail;
 pub mod keeper;
 pub mod listener;
 pub mod output;
+pub mod rootfs;
 pub mod route;
 pub mod routes;
 pub mod seccomp;
@@ -116,6 +118,7 @@ pub async fn run(
         workers: _,
         watch_interval,
         state_dir: _,
+        guest,
         flume,
         jail,
         mut console,
@@ -204,6 +207,7 @@ pub async fn run(
                     status: reloader.status(),
                     requests,
                     capacity,
+                    images: guest.map(|guest| images(guest, &console.dir)).transpose()?,
                     dir: console.dir,
                     intake,
                     jailed: jail.is_some(),
@@ -250,4 +254,20 @@ pub async fn run(
         shared.drain.begin.clone(),
     ));
     sluice_wicket_tunnel::serve(shared, server, drain_grace, &mut signals).await
+}
+
+/// What the console makes rootfs images with (`--guest`), in the directory `dir`.
+fn images(guest: std::path::PathBuf, dir: &std::path::Path) -> Result<image::Images, BoxError> {
+    std::fs::File::open(&guest).map_err(|e| format!("--guest {}: {e}", guest.display()))?;
+    Ok(image::Images {
+        registry: sluice_wicket_registry::Registry::new(concat!(
+            "sluice-wicket-runtime-firecracker/",
+            env!("CARGO_PKG_VERSION")
+        ))?,
+        guest,
+        tools: rootfs::Tools::find()?,
+        building: tokio::sync::Semaphore::new(1),
+        limit: console::MAX_ROOTFS_BYTES,
+        work: dir.join(deployed::BUILDS),
+    })
 }

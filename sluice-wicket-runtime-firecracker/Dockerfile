@@ -1,8 +1,8 @@
 # sluice-wicket-runtime-firecracker on distroless cc (glibc), with the pinned Firecracker release,
 # a guest kernel of Firecracker's CI, the guest (/init of the wicket's own version) and the
 # sample rootfs. The proto lives in sluice-proto, the tunnel client in sluice-wicket-tunnel and
-# the console's shared parts in sluice-wicket-console (its sign-in in sluice-wicket-oidc), so the
-# build context is the repository root:
+# the console's shared parts in sluice-wicket-console (its sign-in in sluice-wicket-oidc) and the
+# image pulls in sluice-wicket-registry, so the build context is the repository root:
 #   docker build -f sluice-wicket-runtime-firecracker/Dockerfile --build-arg GIT_COMMIT=$(git rev-parse HEAD) .
 # amd64 and arm64: the release, the kernel and the guest are the target's (a VM's arch is
 # its host's).
@@ -51,6 +51,8 @@ COPY sluice-wicket-oidc/Cargo.toml sluice-wicket-oidc/
 COPY sluice-wicket-oidc/src sluice-wicket-oidc/src
 COPY sluice-wicket-console/Cargo.toml sluice-wicket-console/
 COPY sluice-wicket-console/src sluice-wicket-console/src
+COPY sluice-wicket-registry/Cargo.toml sluice-wicket-registry/
+COPY sluice-wicket-registry/src sluice-wicket-registry/src
 COPY sluice-wicket-tunnel/Cargo.toml sluice-wicket-tunnel/build.rs sluice-wicket-tunnel/
 COPY sluice-wicket-tunnel/src sluice-wicket-tunnel/src
 COPY sluice-wicket-runtime-firecracker/Cargo.toml sluice-wicket-runtime-firecracker/Cargo.lock sluice-wicket-runtime-firecracker/build.rs sluice-wicket-runtime-firecracker/
@@ -61,17 +63,28 @@ RUN SLUICE_GIT_COMMIT=${GIT_COMMIT} \
     cargo build --release --locked --manifest-path sluice-wicket-runtime-firecracker/Cargo.toml \
     && mkdir -p -m 1777 /run-dir/sluice \
     && mkdir /data
+# what PUT /api/images makes a rootfs with: e2fsprogs' mkfs.ext4 and debugfs, their libraries
+# but the base image's libc, each at its real path (the base image's /lib is a link)
+RUN mkdir -p /tools/usr/sbin /tools/etc \
+    && cp -L /usr/sbin/mkfs.ext4 /usr/sbin/debugfs /tools/usr/sbin/ \
+    && cp /etc/mke2fs.conf /tools/etc/ \
+    && ldd /usr/sbin/mkfs.ext4 /usr/sbin/debugfs | awk '$3 ~ /^\// {print $3}' | grep -v '/libc\.so' | sort -u \
+    | while read -r lib; do \
+        dir=$(dirname "$(readlink -f "$lib")"); mkdir -p "/tools$dir" && cp -L "$lib" "/tools$dir/"; \
+      done
 
 FROM gcr.io/distroless/cc-debian13:nonroot
 COPY --from=build /src/sluice-wicket-runtime-firecracker/target/release/sluice-wicket-runtime-firecracker /out/firecracker /usr/local/bin/
 # the kernel; /init for a rootfs of one's own (scripts/build-guest.sh, scripts/cnb-rootfs.sh
 # with SLUICE_GUEST); the sample rootfs
 COPY --from=build /out/vmlinux /out/init /out/guest.ext4 /usr/local/share/sluice-wicket-runtime-firecracker/
+COPY --from=build /tools/ /
 # the VMs' files (route-<n>, 0700): a tmpfs mounted there keeps the snapshots off the disk.
 # 1777 as /tmp: a tmpfs over it takes the directory's mode, not its owner
 COPY --from=build /run-dir/ /run/
 ENV SLUICE_WICKET_RUNTIME_FIRECRACKER_KERNEL=/usr/local/share/sluice-wicket-runtime-firecracker/vmlinux \
     SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER=/usr/local/bin/firecracker \
+    SLUICE_WICKET_RUNTIME_FIRECRACKER_GUEST=/usr/local/share/sluice-wicket-runtime-firecracker/init \
     SLUICE_WICKET_RUNTIME_FIRECRACKER_STATE_DIR=/run/sluice
 # the working directory, where --console keeps its routes (deployed/) without a --config
 # file: writable by the wicket's user, a volume to keep it

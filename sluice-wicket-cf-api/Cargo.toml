@@ -19,6 +19,8 @@ bytes = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 # the OpenID Provider behind cf login --sso
 sluice-wicket-oidc = { path = "../sluice-wicket-oidc" }
+# the images cf push --docker-image names
+sluice-wicket-registry = { path = "../sluice-wicket-registry" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # the manifests cf push applies
@@ -48,6 +50,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["blocking"] }
 sluice-wicket-oidc = { path = "../sluice-wicket-oidc", features = ["mock"] }
+# the layers of the image the test pushes for a Firecracker wicket
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

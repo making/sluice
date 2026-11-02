@@ -343,11 +343,15 @@ pub fn build(base: &str, state: &State, build: &Build) -> Value {
 /// A droplet: an image's shows the image, pinned to its digest (what `cf
 /// app` shows of a docker app), and no buildpack.
 pub fn droplet(base: &str, droplet: &Droplet) -> Value {
+    let buildpack = match droplet.file.ends_with(crate::staging::ROOTFS) {
+        true => "rootfs",
+        false => "wasm",
+    };
     let (kind, buildpacks, stack) = match droplet.image {
         Some(_) => ("docker", json!([]), Value::Null),
         None => (
             "buildpack",
-            json!([{"name": "wasm", "detect_output": "wasm", "buildpack_name": "wasm", "version": "0.0.1"}]),
+            json!([{"name": buildpack, "detect_output": buildpack, "buildpack_name": buildpack, "version": "0.0.1"}]),
             json!(STACK),
         ),
     };

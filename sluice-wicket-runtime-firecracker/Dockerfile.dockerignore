@@ -8,6 +8,8 @@
 !sluice-wicket-oidc/src
 !sluice-wicket-console/Cargo.toml
 !sluice-wicket-console/src
+!sluice-wicket-registry/Cargo.toml
+!sluice-wicket-registry/src
 !sluice-wicket-tunnel/Cargo.toml
 !sluice-wicket-tunnel/build.rs
 !sluice-wicket-tunnel/src

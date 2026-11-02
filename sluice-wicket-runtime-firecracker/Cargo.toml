@@ -32,6 +32,14 @@ libc = "0.2"
 # the console: its gate, its page's shared files, its directory's layout
 sluice-wicket-console = { path = "../sluice-wicket-console" }
 http = "1"
+# PUT /api/images: an image's rootfs, pulled from its registry, its layers unpacked
+sluice-wicket-registry = { path = "../sluice-wicket-registry" }
+reqwest = { version = "0.13", default-features = false }
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
+sha2 = "0.10"
+# the names of the builds' directories
+getrandom = "0.4"
 
 [dev-dependencies]
 # the tunnel's doubles: a tunnel server opening the tests' connections

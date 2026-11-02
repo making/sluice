@@ -6,6 +6,8 @@
 //! GET    /api/apps[?after=<revision>]          the apps, the capabilities and the keyvalue
 //!                                              stores; held until they change with `after`
 //! PUT    /api/components/<sha256>              keeps the body under its digest
+//! PUT    /api/images                           a Firecracker wicket: makes an ext4 image of
+//!                                              an OCI image, kept under its digest
 //! PUT    /api/apps/<name>                      serves the app of the body
 //! DELETE /api/apps/<name>?owner=<owner>        removes the app
 //! DELETE /api/keyvalue/<store>/<namespace>     deletes the data of a namespace no route maps
@@ -18,6 +20,8 @@ use serde::{Deserialize, Serialize};
 
 /// A PUT may compile the component: generous.
 const EDIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// A rootfs made of an image: minutes, the wicket's own bound a little within it.
+const IMAGE_TIMEOUT: Duration = Duration::from_secs(660);
 /// A listing with `after` is held 25s at most.
 const LIST_TIMEOUT: Duration = Duration::from_secs(40);
 
@@ -47,35 +51,79 @@ pub struct ComponentRef {
     pub name: String,
 }
 
-/// The sandbox: the `--wasm` route options in JSON, the keyvalue map and
-/// the env. A key left out takes the wicket's default; a listing names
-/// every one, the env by the names only.
+/// The sandbox: the route options in JSON, as the wicket runs apps: the `--wasm`
+/// options, the keyvalue map and the env; or the `--vm` options and the env. A key left
+/// out takes the wicket's default; a listing names every one the wicket has, the env by
+/// the names only.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Sandbox {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wasi: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_mib: Option<u64>,
-    #[serde(default)]
-    pub pool: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub instances: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub keyvalue: BTreeMap<String, String>,
+    /// A Firecracker wicket's: how a connection gets its VM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// A Firecracker wicket's: a VM's memory in MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem: Option<u64>,
+    /// A Firecracker wicket's: its pool's VMs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vms: Option<u64>,
     /// Put, never read back: the app's tag tells what the wicket serves.
     #[serde(skip_deserializing, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+}
+
+/// What a wicket runs apps as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Runtime {
+    /// wasm components: a wicket whose listing names none is one.
+    Wasm,
+    /// ext4 images in microVMs.
+    Firecracker,
+}
+
+/// An image the wicket made of an OCI image: what an app names.
+#[derive(Deserialize, Debug)]
+pub struct MadeImage {
+    /// The reference, pinned to its manifest's digest.
+    pub image: String,
+    pub name: String,
+    pub sha256: String,
+    pub bytes: u64,
 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct Listing {
     pub revision: u64,
     pub generation: u64,
+    /// `firecracker`, or none from a wasm wicket.
+    #[serde(default)]
+    pub runtime: Option<String>,
     /// What a sandbox may hold: the capabilities, in the wicket's order.
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub keyvalue_stores: Vec<ListedStore>,
     pub apps: Vec<ListedApp>,
+}
+
+impl Listing {
+    pub fn runtime(&self) -> Runtime {
+        match self.runtime.as_deref() {
+            Some("firecracker") => Runtime::Firecracker,
+            _ => Runtime::Wasm,
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -186,6 +234,30 @@ impl Wicket {
             return Err(refused(status, &body));
         }
         Ok(())
+    }
+
+    /// Has the wicket make an ext4 image of the OCI image `image`, with the
+    /// `(username, password)` of a private one.
+    pub async fn make_image(
+        &self,
+        image: &str,
+        credentials: Option<(&str, &str)>,
+    ) -> Result<MadeImage, Failure> {
+        let mut body = serde_json::json!({"image": image});
+        if let Some((username, password)) = credentials {
+            body["username"] = username.into();
+            body["password"] = password.into();
+        }
+        let request = self
+            .client
+            .put(format!("{}/api/images", self.base))
+            .timeout(IMAGE_TIMEOUT)
+            .json(&body);
+        let (status, body) = self.send(request).await?;
+        if !status.is_success() {
+            return Err(refused(status, &body));
+        }
+        serde_json::from_slice(&body).map_err(|e| Failure::Unreachable(format!("the answer: {e}")))
     }
 
     /// Removes the app; None when the wicket has none of the name.

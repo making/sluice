@@ -67,6 +67,69 @@ pub const EGRESS_PORT: u32 = 1026;
 /// not have: no process gets it, `/init` reads `/proc/cmdline`.
 pub const EGRESS_PARAMETER: &str = "sluice.egress";
 
+/// The vsock port of the guest's env stream: the wicket dials it once `/init` runs, when
+/// the VM's kernel command line says so ([`ENV_PARAMETER`]), and writes the variables of
+/// the process's environment: `[len: u32 BE][a JSON object of name -> value]`, at most
+/// [`MAX_ENV`] bytes, answered `OK\n`. `/init` starts nothing before: a clone has them in
+/// its snapshot's memory, and only there. They may hold secrets, so they never pass
+/// through a file or the kernel's command line (which any process of the guest reads).
+pub const ENV_PORT: u32 = 1027;
+
+/// The guest kernel's command line parameter telling `/init` to wait for the env stream
+/// ([`ENV_PORT`]): `sluice.env=1`. As [`EGRESS_PARAMETER`], no process gets it.
+pub const ENV_PARAMETER: &str = "sluice.env";
+
+/// The most an env stream's JSON holds: any env of 128 KiB, escaped.
+pub const MAX_ENV: usize = 1 << 20;
+
+/// Writes the env stream's `json` and reads its answer (the wicket's half).
+#[allow(dead_code)] // the wicket's half: each copy has both
+pub async fn send_env<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    json: &[u8],
+) -> std::io::Result<()> {
+    if json.len() > MAX_ENV {
+        return Err(std::io::Error::other(format!(
+            "an env of {} bytes: {MAX_ENV} at most",
+            json.len()
+        )));
+    }
+    let mut frame = Vec::with_capacity(4 + json.len());
+    frame.extend_from_slice(&(json.len() as u32).to_be_bytes());
+    frame.extend_from_slice(json);
+    stream.write_all(&frame).await?;
+    let answer = read_short_line(stream, MAX_EGRESS_LINE).await?;
+    match answer.as_slice() {
+        b"OK" => Ok(()),
+        other => Err(std::io::Error::other(format!(
+            "not an answer: {}",
+            String::from_utf8_lossy(other)
+        ))),
+    }
+}
+
+/// Reads the env stream's JSON (the guest's half); [`answer_env`] answers it.
+#[allow(dead_code)] // the guest's half: each copy has both
+pub async fn read_env<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Vec<u8>> {
+    let mut len = [0u8; 4];
+    reader.read_exact(&mut len).await?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_ENV {
+        return Err(std::io::Error::other(format!(
+            "an env of {len} bytes: {MAX_ENV} at most"
+        )));
+    }
+    let mut json = vec![0u8; len];
+    reader.read_exact(&mut json).await?;
+    Ok(json)
+}
+
+/// Answers the env stream (the guest's half).
+#[allow(dead_code)] // the guest's half: each copy has both
+pub async fn answer_env<W: AsyncWrite + Unpin>(writer: &mut W) -> std::io::Result<()> {
+    writer.write_all(b"OK\n").await
+}
+
 /// The longest line of an egress stream's request or answer.
 const MAX_EGRESS_LINE: usize = 512;
 
@@ -640,6 +703,16 @@ mod tests {
     /// answered.
     #[tokio::test]
     async fn egress_rules_and_requests_read_as_written() {
+        // the env stream's frame is read as written, and a longer one refused
+        let (mut wicket, mut guest) = tokio::io::duplex(64);
+        let sent = tokio::spawn(async move { send_env(&mut wicket, b"{\"K\":\"v\"}").await });
+        assert_eq!(read_env(&mut guest).await.unwrap(), b"{\"K\":\"v\"}");
+        answer_env(&mut guest).await.unwrap();
+        sent.await.unwrap().unwrap();
+        let (mut wicket, _guest) = tokio::io::duplex(64);
+        let large = vec![b' '; MAX_ENV + 1];
+        assert!(send_env(&mut wicket, &large).await.is_err());
+
         for (text, printed) in [
             ("DB.Internal:5432", "db.internal:5432"),
             ("my_db:6379", "my_db:6379"),

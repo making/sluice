@@ -57,11 +57,12 @@
 pub mod config;
 mod console;
 mod deployed;
-mod env;
 mod keyvalue;
 mod listener;
 mod routes;
 mod wasm_host;
+
+use sluice_wicket_console::env;
 
 use std::sync::Arc;
 

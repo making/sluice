@@ -2,22 +2,36 @@
 //! web process command names, else the package's only `.wasm` -- or a docker
 //! package's image pulled (`crate::registry`), and it must be a component
 //! (`\0asm`, layer 1). Anything else fails the build, naming what was found.
-//! The droplet is the component, by its digest.
+//! The droplet is the component, by its digest. On a Firecracker wicket the
+//! droplet is a rootfs: an `.ext4` of the zip, or the wicket's make of the
+//! image, which it keeps (the cf-api the image's pinned reference, to have it
+//! made again).
 
 use std::io::{Cursor, Read as _};
 
 use sha2::{Digest, Sha256};
 
+use crate::controller::Controller;
 use crate::logs::Logs;
 use crate::registry::Registry;
-use crate::store::{Droplet, Package, Store, guid, now};
+use crate::store::{DockerImage, Droplet, Package, Store, guid, now};
+use crate::wicket::Runtime;
+
+/// A rootfs's file name ends so; a droplet's kind is its file's.
+pub const ROOTFS: &str = ".ext4";
+
+/// Where the ext2/3/4 superblock's magic is, and what it is (little-endian 0xEF53).
+const MAGIC_AT: usize = 1024 + 56;
+const MAGIC: [u8; 2] = [0x53, 0xEF];
 
 /// The component a build picked.
 #[derive(Debug)]
 pub struct Staged {
     /// Its path in the package; its file name for an image.
     pub entry: String,
+    /// Empty when the wicket keeps it: a rootfs it made.
     pub bytes: Vec<u8>,
+    pub size: u64,
     pub sha256: String,
     /// The image it was pulled from, pinned to its digest.
     pub image: Option<String>,
@@ -31,6 +45,7 @@ pub async fn run(
     store: &Store,
     logs: &Logs,
     registry: &Registry,
+    controller: &Controller,
     build: &str,
     package: &Package,
     command: Option<&str>,
@@ -43,34 +58,34 @@ pub async fn run(
                 .map_err(|e| format!("the package is gone: {e}"))
                 .and_then(|zip| stage(&zip, command))
         }
-        Some(docker) => {
-            let credentials = docker.credentials();
-            logs.add(
-                app,
-                "STG",
-                format!(
-                    "Staging with the wasm lifecycle: pulling {}{}",
-                    docker.image,
-                    if credentials.is_some() {
-                        " with the package's credentials"
-                    } else {
-                        ""
-                    }
-                ),
-            );
-            registry
-                .pull(&docker.image, credentials)
-                .await
-                .map(|pulled| Staged {
-                    entry: pulled.file,
-                    bytes: pulled.bytes,
-                    sha256: pulled.sha256,
-                    image: Some(pulled.image),
-                })
-                .map_err(|e| format!("{}: {e}", docker.image))
-        }
+        Some(docker) => match controller.runtime().await {
+            Ok(Runtime::Wasm) => pull(logs, registry, app, docker).await,
+            Ok(Runtime::Firecracker) => {
+                logs.add(
+                    app,
+                    "STG",
+                    format!("The wicket is making a rootfs of {}", docker.image),
+                );
+                controller
+                    .wicket
+                    .make_image(&docker.image, docker.credentials())
+                    .await
+                    .map(|made| Staged {
+                        entry: made.name,
+                        bytes: Vec::new(),
+                        size: made.bytes,
+                        sha256: made.sha256,
+                        image: Some(made.image),
+                    })
+                    .map_err(|e| format!("{}: {e}", docker.image))
+            }
+            Err(e) => Err(format!("what the image is staged as: {e}")),
+        },
     };
     let staged = staged.and_then(|staged| {
+        if staged.bytes.is_empty() {
+            return Ok(staged);
+        }
         store
             .write_droplet(&staged.sha256, &staged.bytes)
             .map(|()| staged)
@@ -84,7 +99,7 @@ pub async fn run(
                 format!(
                     "Staged {} ({} bytes, sha256 {}){}",
                     staged.entry,
-                    staged.bytes.len(),
+                    staged.size,
                     &staged.sha256[..12],
                     staged
                         .image
@@ -98,7 +113,7 @@ pub async fn run(
                 package: package.guid.clone(),
                 sha256: staged.sha256,
                 file: staged.entry,
-                bytes: staged.bytes.len() as u64,
+                bytes: staged.size,
                 image: staged.image,
                 created_at: at.clone(),
                 updated_at: at.clone(),
@@ -125,6 +140,41 @@ pub async fn run(
     }
 }
 
+/// The component of `docker`'s image, pulled from its registry with the package's
+/// credentials, if any.
+async fn pull(
+    logs: &Logs,
+    registry: &Registry,
+    app: &str,
+    docker: &DockerImage,
+) -> Result<Staged, String> {
+    let credentials = docker.credentials();
+    logs.add(
+        app,
+        "STG",
+        format!(
+            "Staging with the wasm lifecycle: pulling {}{}",
+            docker.image,
+            if credentials.is_some() {
+                " with the package's credentials"
+            } else {
+                ""
+            }
+        ),
+    );
+    registry
+        .pull(&docker.image, credentials)
+        .await
+        .map(|pulled| Staged {
+            entry: pulled.file,
+            size: pulled.bytes.len() as u64,
+            bytes: pulled.bytes,
+            sha256: pulled.sha256,
+            image: Some(pulled.image),
+        })
+        .map_err(|e| format!("{}: {e}", docker.image))
+}
+
 /// Stages `package` (a zip) for the web process `command`.
 pub fn stage(package: &[u8], command: Option<&str>) -> Result<Staged, String> {
     let mut archive =
@@ -137,7 +187,7 @@ pub fn stage(package: &[u8], command: Option<&str>) -> Result<Staged, String> {
         .collect();
     let components: Vec<&String> = names
         .iter()
-        .filter(|name| name.ends_with(".wasm"))
+        .filter(|name| name.ends_with(".wasm") || name.ends_with(ROOTFS))
         .collect();
     let entry = match command.map(str::trim).filter(|command| !command.is_empty()) {
         Some(command) => names
@@ -154,7 +204,7 @@ pub fn stage(package: &[u8], command: Option<&str>) -> Result<Staged, String> {
             [only] => (*only).clone(),
             [] => {
                 return Err(format!(
-                    "the package holds no .wasm component (found: {})",
+                    "the package holds no .wasm component, nor an .ext4 rootfs (found: {})",
                     listed(&names)
                 ));
             }
@@ -172,9 +222,13 @@ pub fn stage(package: &[u8], command: Option<&str>) -> Result<Staged, String> {
         .by_name(&entry)
         .and_then(|mut file| file.read_to_end(&mut bytes).map_err(Into::into))
         .map_err(|e| format!("cannot read {entry}: {e}"))?;
-    check_component(&entry, &bytes)?;
+    match entry.ends_with(ROOTFS) {
+        true => check_rootfs(&entry, &bytes)?,
+        false => check_component(&entry, &bytes)?,
+    }
     Ok(Staged {
         sha256: sha256(&bytes),
+        size: bytes.len() as u64,
         entry,
         bytes,
         image: None,
@@ -199,6 +253,14 @@ pub(crate) fn check_component(entry: &str, bytes: &[u8]) -> Result<(), String> {
         )),
         [0, b'a', b's', b'm', ..] => Err(format!("{entry} is wasm of an unknown layer")),
         _ => Err(format!("{entry} is not wasm")),
+    }
+}
+
+/// An ext2/3/4 image: its superblock's magic.
+fn check_rootfs(entry: &str, bytes: &[u8]) -> Result<(), String> {
+    match bytes.get(MAGIC_AT..MAGIC_AT + MAGIC.len()) {
+        Some(magic) if magic == MAGIC => Ok(()),
+        _ => Err(format!("{entry} is not an ext4 image")),
     }
 }
 
@@ -261,7 +323,20 @@ mod tests {
         assert!(
             stage(&zipped(&[("index.html", b"<p>")]), None)
                 .unwrap_err()
-                .contains("no .wasm component (found: index.html)")
+                .contains("no .wasm component, nor an .ext4 rootfs (found: index.html)")
+        );
+        let mut rootfs = vec![0; 2048];
+        rootfs[MAGIC_AT..MAGIC_AT + 2].copy_from_slice(&MAGIC);
+        assert_eq!(
+            stage(&zipped(&[("app/r.ext4", &rootfs)]), None)
+                .unwrap()
+                .entry,
+            "app/r.ext4"
+        );
+        assert!(
+            stage(&zipped(&[("r.ext4", b"not one")]), None)
+                .unwrap_err()
+                .contains("not an ext4 image")
         );
         assert!(
             stage(&zipped(&[("m.wasm", MODULE)]), None)

@@ -1,26 +1,36 @@
-//! The routes the console deployed (`--console`): hosts served by uploaded
-//! rootfs images, kept in the console's directory (`--console-dir`) so a
-//! restart serves them again (`sluice-wicket-console`'s layout).
+//! The routes and apps the console deployed (`--console`): hosts served by
+//! uploaded rootfs images, kept in the console's directory (`--console-dir`) so
+//! a restart serves them again (`sluice-wicket-console`'s layout). A route is
+//! the page's: one host, its image uploaded with it. An app is the API's (a
+//! controller's): hosts served by one image in one set of options with an env,
+//! its image uploaded by digest first, changed by its owner only.
 //!
 //! ```text
-//! <dir>/routes.yaml                   the routes, in the --config file's route shape
+//! <dir>/routes.yaml                   the routes and the apps, in the --config file's route shape
 //! <dir>/rootfs/<sha256>/<name>.ext4   the images they name, never rewritten
+//! <dir>/uploads/<sha256>.ext4         the images uploaded by digest, or made (`image`), for UPLOAD_GRACE
+//! <dir>/builds/                       what the images being made take, removed at startup
 //! ```
 //!
 //! An image's path names its digest, so other content is another target: its
 //! route's VMs start anew, and the old target drains as a removed one does.
-//! The routes are held here, `routes.yaml` being their copy: an edit is
-//! reloaded first (`routes::Reloader::edit`) and written once the reload
-//! published it, so the file never names routes that did not start. An image
-//! nothing names is removed after every edit and at startup.
+//! The routes and apps are held here, `routes.yaml` being their copy: an edit
+//! is reloaded first (`routes::Reloader::edit`) and written once the reload
+//! published it, so the file never names routes that did not start. It holds
+//! the apps' env, so only its owner reads it (0600). An image nothing names is
+//! removed after every edit and at startup, an upload once `UPLOAD_GRACE`
+//! passed: an app naming it links it below `rootfs/` before.
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::Deserialize;
+use sluice_wicket_console::env::Env;
 use sluice_wicket_console::http::Received;
 use sluice_wicket_console::store::{
-    Blobs, check_host, check_kept, file_name, quote, rfc3339, write_by_rename,
+    Blobs, UPLOADS, check_digest, check_file, check_host, check_hosts, check_kept, check_name,
+    check_tag, collect_uploads, file_name, quote, rfc3339, write_by_rename,
 };
 
 use crate::config::{FileRoute, Origin};
@@ -32,6 +42,9 @@ const MANIFEST: &str = "routes.yaml";
 
 /// The images' directory in the directory.
 const ROOTFS: &str = "rootfs";
+
+/// What the images being made take, in the directory.
+pub const BUILDS: &str = "builds";
 
 /// The extension an image is kept with.
 const EXT4: &str = ".ext4";
@@ -51,27 +64,68 @@ pub struct Route {
     pub deployed: String,
 }
 
-/// The console's routes in the order deployed, and their directory.
+/// One app of the console's API: hosts served by one image in one set of
+/// options, put and removed by its owner only.
+#[derive(Clone, PartialEq, Debug)]
+pub struct App {
+    pub name: String,
+    pub owner: String,
+    /// Sorted, each once.
+    pub hosts: Vec<String>,
+    /// The image relative to the directory, `rootfs/<sha256>/<name>.ext4`.
+    pub rootfs: String,
+    pub options: Options,
+    /// Its VMs' process's environment, over the image's.
+    pub env: Env,
+    /// The owner's, kept and listed as given ([`check_tag`]).
+    pub tag: Option<String>,
+    /// When it took this image, these options and this env, RFC 3339.
+    pub deployed: String,
+}
+
+/// An app as its PUT has it.
+#[derive(Clone, PartialEq, Debug)]
+pub struct AppSpec {
+    pub owner: String,
+    pub hosts: Vec<String>,
+    /// The image's digest.
+    pub sha256: String,
+    /// The file name the image is kept as.
+    pub file: String,
+    pub options: Options,
+    pub env: Env,
+    pub tag: Option<String>,
+}
+
+/// The console's routes in the order deployed, its apps in the order put, and
+/// their directory.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Deployed {
     dir: PathBuf,
     routes: Vec<Route>,
+    apps: Vec<App>,
 }
 
 impl Deployed {
-    /// The routes kept in `dir`, created when missing; removes the images
-    /// nothing names (an upload a crash cut short included).
+    /// The routes and apps kept in `dir`, created when missing; removes the
+    /// images nothing names (an upload a crash cut short included).
     pub fn open(dir: &Path) -> Result<Deployed, String> {
         let failed = |e: std::io::Error| format!("--console-dir {}: {e}", dir.display());
         std::fs::create_dir_all(dir.join(ROOTFS)).map_err(failed)?;
         let dir = dir.canonicalize().map_err(failed)?;
+        // a build a crash cut short
+        if let Err(e) = std::fs::remove_dir_all(dir.join(BUILDS))
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("--console-dir: remove {BUILDS}: {e}");
+        }
         let manifest = dir.join(MANIFEST);
-        let routes = match std::fs::read_to_string(&manifest) {
+        let (routes, apps) = match std::fs::read_to_string(&manifest) {
             Ok(text) => read(&text).map_err(|e| format!("{}: {e}", manifest.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
             Err(e) => return Err(format!("{}: {e}", manifest.display())),
         };
-        let deployed = Deployed { dir, routes };
+        let deployed = Deployed { dir, routes, apps };
         deployed.collect_garbage(true);
         Ok(deployed)
     }
@@ -92,34 +146,51 @@ impl Deployed {
         }
     }
 
-    /// The routes as specs of `firecracker` and `kernel`; an error names the
-    /// route by its host.
+    /// The routes, then the apps' (one per host), as specs of `firecracker` and
+    /// `kernel`; an error names the route by its host, an app's by its name.
     pub fn specs(
         &self,
         firecracker: &Path,
         kernel: &Path,
     ) -> Result<Vec<(RouteSpec, Origin)>, String> {
-        self.routes
-            .iter()
-            .map(|route| {
-                let options = route
-                    .options
-                    .iter()
-                    .map(|(key, value)| (key.as_str(), value.as_str()));
-                let spec = RouteSpec::new(
-                    &format!("console route {}", route.host),
-                    &route.host,
-                    self.dir.join(&route.rootfs),
-                    options,
-                    firecracker,
-                    kernel,
-                )?;
-                let origin = Origin::Console {
-                    deployed: route.deployed.clone(),
+        let spec = |named: String, host: &str, rootfs: &str, options: &Options| {
+            let options = options
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()));
+            RouteSpec::new(
+                &named,
+                host,
+                self.dir.join(rootfs),
+                options,
+                firecracker,
+                kernel,
+            )
+        };
+        let mut specs = Vec::new();
+        for route in &self.routes {
+            let named = format!("console route {}", route.host);
+            let origin = Origin::Console {
+                deployed: route.deployed.clone(),
+            };
+            let spec = spec(named, &route.host, &route.rootfs, &route.options)?;
+            specs.push((spec, origin));
+        }
+        for app in &self.apps {
+            for host in &app.hosts {
+                let named = format!("app {}", app.name);
+                let mut spec = spec(named, host, &app.rootfs, &app.options)?;
+                spec.app = Some(app.name.clone());
+                spec.vm.env = app.env.clone();
+                let origin = Origin::Api {
+                    name: app.name.clone(),
+                    owner: app.owner.clone(),
+                    tag: app.tag.clone(),
+                    deployed: app.deployed.clone(),
                 };
-                Ok((spec, origin))
-            })
-            .collect()
+                specs.push((spec, origin));
+            }
+        }
+        Ok(specs)
     }
 
     /// The routes with `host` served by the image `received` (uploaded as
@@ -210,21 +281,118 @@ impl Deployed {
         deployed
     }
 
-    /// Writes the routes to `routes.yaml`, by a rename; for its owner's eyes
-    /// only.
+    /// Keeps `received` as the upload of `sha256`, its digest. An upload again
+    /// takes the place of the one kept, so it is kept longer: a file of its own,
+    /// as the one kept may be linked below `rootfs/`, whose time a route watches.
+    pub fn upload(&self, sha256: &str, received: Received) -> Result<(), Refused> {
+        let given = check_digest(sha256).map_err(Refused::Invalid)?;
+        if received.sha256 != given {
+            return Err(Refused::Invalid(format!(
+                "the body's sha256 is {}, not {given}",
+                received.sha256
+            )));
+        }
+        let path = self.dir.join(UPLOADS).join(format!("{given}{EXT4}"));
+        let _ = std::fs::remove_file(&path);
+        received.keep(&path).map_err(Refused::Failed)
+    }
+
+    /// The apps with the app `name` as `app` has it since `now`: its image made
+    /// from an upload or another file of its digest, in place of the app of
+    /// that name -- which keeps its time when its image, options and env stay,
+    /// its hosts and tag changing or not -- or added last. Another owner's app
+    /// is refused, and so is an image of a digest not kept.
+    pub fn with_app(&self, name: &str, app: AppSpec, now: SystemTime) -> Result<Deployed, Refused> {
+        check_name("app", name).map_err(Refused::Invalid)?;
+        check_name("owner", &app.owner).map_err(Refused::Invalid)?;
+        let hosts = check_hosts(&app.hosts).map_err(Refused::Invalid)?;
+        let sha256 = check_digest(&app.sha256)
+            .map_err(|e| Refused::Invalid(format!("component.sha256: {e}")))?;
+        check_file(&app.file, EXT4, "an image")
+            .map_err(|e| Refused::Invalid(format!("component.name: {e}")))?;
+        if let Some(tag) = &app.tag {
+            check_tag(tag).map_err(Refused::Invalid)?;
+        }
+        if let Some(kept) = self.app(name)
+            && kept.owner != app.owner
+        {
+            return Err(Refused::Taken(format!(
+                "the app '{name}' is {}'s, not {}'s",
+                kept.owner, app.owner
+            )));
+        }
+        let upload = self.dir.join(UPLOADS).join(format!("{sha256}{EXT4}"));
+        let rootfs = self
+            .images()
+            .materialize(&sha256, &app.file, &upload)
+            .map_err(Refused::Failed)?
+            .ok_or_else(|| Refused::Missing(sha256.clone()))?;
+        let app = App {
+            name: name.to_string(),
+            owner: app.owner,
+            hosts,
+            rootfs,
+            options: app.options,
+            env: app.env,
+            tag: app.tag,
+            deployed: rfc3339(now),
+        };
+        let mut deployed = self.clone();
+        match deployed.apps.iter_mut().find(|kept| kept.name == app.name) {
+            Some(kept)
+                if kept.rootfs == app.rootfs
+                    && kept.options == app.options
+                    && kept.env == app.env =>
+            {
+                kept.hosts = app.hosts;
+                kept.tag = app.tag;
+            }
+            Some(kept) => *kept = app,
+            None => deployed.apps.push(app),
+        }
+        Ok(deployed)
+    }
+
+    /// The apps without the app `name`, which is `owner`'s.
+    pub fn without_app(&self, name: &str, owner: &str) -> Result<Deployed, Refused> {
+        let kept = self
+            .app(name)
+            .ok_or_else(|| Refused::Unknown(format!("the console has no app '{name}'")))?;
+        if kept.owner != owner {
+            return Err(Refused::Taken(format!(
+                "the app '{name}' is {}'s, not {owner}'s",
+                kept.owner
+            )));
+        }
+        let mut deployed = self.clone();
+        deployed.apps.retain(|app| app.name != name);
+        Ok(deployed)
+    }
+
+    fn app(&self, name: &str) -> Option<&App> {
+        self.apps.iter().find(|app| app.name == name)
+    }
+
+    /// Writes the routes and apps to `routes.yaml`, by a rename; for its
+    /// owner's eyes only, as it holds the apps' env.
     pub fn save(&self) -> Result<(), String> {
         write_by_rename(
             &self.dir.join(MANIFEST),
-            write(&self.routes).as_bytes(),
+            write(&self.routes, &self.apps).as_bytes(),
             true,
         )
     }
 
     /// Removes the images nothing names; at `startup` the uploads a crash cut
-    /// short too.
+    /// short too; and the uploads kept for `UPLOAD_GRACE`.
     pub fn collect_garbage(&self, startup: bool) {
-        let named = self.routes.iter().map(|route| &route.rootfs);
+        let named = self
+            .routes
+            .iter()
+            .map(|route| &route.rootfs)
+            .chain(self.apps.iter().map(|app| &app.rootfs));
         self.images().collect_garbage(named, startup);
+        collect_uploads(&self.dir);
     }
 }
 
@@ -268,27 +436,48 @@ pub fn options(host: &str, pairs: &[(String, String)]) -> Result<Options, String
 }
 
 /// `routes.yaml`: the routes in the shape of the `--config` file's, each with
-/// the time it was deployed.
+/// the time it was deployed, and the apps.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestFile {
     #[serde(default)]
     routes: Vec<FileRoute>,
+    #[serde(default)]
+    apps: Vec<ManifestApp>,
 }
 
-/// The routes of `routes.yaml`; errors name the route. A host is routed once.
-fn read(text: &str) -> Result<Vec<Route>, String> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestApp {
+    name: String,
+    owner: String,
+    hosts: Vec<String>,
+    rootfs: String,
+    deployed: String,
+    tag: Option<String>,
+    /// As a `--vm` flag's query has them.
+    #[serde(default)]
+    options: BTreeMap<String, String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+}
+
+/// The routes and apps of `routes.yaml`; errors name the route or app (and a
+/// line, never the file's text: it holds the apps' env). A host is routed once
+/// over both.
+fn read(text: &str) -> Result<(Vec<Route>, Vec<App>), String> {
     let mut parsing = serde_saphyr::Options::default();
     parsing.with_snippet = false;
     let file: ManifestFile = serde_saphyr::from_str_with_options(text, parsing).map_err(|e| {
         let e = e.to_string();
         e.strip_prefix("error: ").unwrap_or(&e).to_string()
     })?;
+    let mut routed = HashSet::new();
     let mut routes: Vec<Route> = Vec::with_capacity(file.routes.len());
     for (n, route) in file.routes.into_iter().enumerate() {
         let failed = |e: String| format!("routes[{n}]: {e}");
         let host = check_host(&route.host).map_err(failed)?;
-        if routes.iter().any(|known| known.host == host) {
+        if !routed.insert(host.clone()) {
             return Err(failed(format!("host '{host}' twice")));
         }
         let rootfs = route.rootfs.to_string_lossy().to_string();
@@ -310,13 +499,44 @@ fn read(text: &str) -> Result<Vec<Route>, String> {
             deployed,
         });
     }
-    Ok(routes)
+    let mut apps: Vec<App> = Vec::with_capacity(file.apps.len());
+    for (n, app) in file.apps.into_iter().enumerate() {
+        let failed = |e: String| format!("apps[{n}]: {e}");
+        check_name("name", &app.name).map_err(failed)?;
+        if apps.iter().any(|known| known.name == app.name) {
+            return Err(failed(format!("app '{}' twice", app.name)));
+        }
+        check_name("owner", &app.owner).map_err(failed)?;
+        let hosts = check_hosts(&app.hosts).map_err(failed)?;
+        if let Some(host) = hosts.iter().find(|host| !routed.insert((*host).clone())) {
+            return Err(failed(format!("host '{host}' twice")));
+        }
+        check_kept(&app.rootfs, ROOTFS, EXT4).map_err(|e| failed(format!("rootfs: {e}")))?;
+        if let Some(tag) = &app.tag {
+            check_tag(tag).map_err(failed)?;
+        }
+        let pairs: Vec<(String, String)> = app.options.into_iter().collect();
+        let options = options(&hosts[0], &pairs).map_err(failed)?;
+        let env = Env::new(app.env).map_err(|e| failed(format!("env: {e}")))?;
+        apps.push(App {
+            name: app.name,
+            owner: app.owner,
+            hosts,
+            rootfs: app.rootfs,
+            options,
+            env,
+            tag: app.tag,
+            deployed: app.deployed,
+        });
+    }
+    Ok((routes, apps))
 }
 
-/// `routes` as `routes.yaml`; every string double-quoted, so never expanded.
-fn write(routes: &[Route]) -> String {
+/// `routes` and `apps` as `routes.yaml`; every string double-quoted, so never
+/// expanded. The apps' section only with apps.
+fn write(routes: &[Route], apps: &[App]) -> String {
     let mut yaml = String::from(
-        "# The routes the console of sluice-wicket-runtime-firecracker (--console) deployed, \
+        "# The routes and apps the console of sluice-wicket-runtime-firecracker (--console) deployed, \
          written by it:\n# read at its startup, overwritten by its next change.\n",
     );
     if routes.is_empty() {
@@ -344,6 +564,37 @@ fn write(routes: &[Route]) -> String {
             yaml.push_str(&format!("    {key}: {value}\n"));
         }
     }
+    if !apps.is_empty() {
+        yaml.push_str("apps:\n");
+    }
+    let map = |pairs: Vec<(&str, &str)>| {
+        let pairs: Vec<String> = pairs
+            .into_iter()
+            .map(|(key, value)| format!("{}: {}", quote(key), quote(value)))
+            .collect();
+        format!("{{{}}}", pairs.join(", "))
+    };
+    for app in apps {
+        let hosts: Vec<String> = app.hosts.iter().map(|host| quote(host)).collect();
+        yaml.push_str(&format!("  - name: {}\n", quote(&app.name)));
+        yaml.push_str(&format!("    owner: {}\n", quote(&app.owner)));
+        yaml.push_str(&format!("    hosts: [{}]\n", hosts.join(", ")));
+        yaml.push_str(&format!("    rootfs: {}\n", quote(&app.rootfs)));
+        yaml.push_str(&format!("    deployed: {}\n", quote(&app.deployed)));
+        if let Some(tag) = &app.tag {
+            yaml.push_str(&format!("    tag: {}\n", quote(tag)));
+        }
+        if !app.options.is_empty() {
+            let options = app
+                .options
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()));
+            yaml.push_str(&format!("    options: {}\n", map(options.collect())));
+        }
+        if !app.env.is_empty() {
+            yaml.push_str(&format!("    env: {}\n", map(app.env.iter().collect())));
+        }
+    }
     yaml
 }
 
@@ -365,10 +616,11 @@ mod tests {
     }
 
     /// The options are the `--vm` flag's, checked as a route takes them, kept in
-    /// one order; the routes file reads back as written, and what the console never
-    /// writes -- an image not its own, a host twice, an option a route refuses, no
-    /// time -- fails, naming the route. A move keeps a route as it is, in its place,
-    /// and replaces none.
+    /// one order; the routes file reads back as written, routes and apps, an app's
+    /// env and tag included, and what the console never writes -- an image not its
+    /// own, a host or an app twice, an option a route refuses, no time -- fails,
+    /// naming the route or the app, never a value. A move keeps a route as it is, in
+    /// its place, and replaces none.
     #[test]
     fn the_options_and_the_routes_file() {
         let kept = options(
@@ -415,17 +667,49 @@ mod tests {
                 deployed: rfc3339(UNIX_EPOCH + Duration::from_secs(1_793_276_096)),
             },
         ];
-        let text = write(&routes);
-        assert_eq!(read(&text), Ok(routes.clone()), "{text}");
+        let apps = vec![
+            App {
+                name: "0b9e2c6a".into(),
+                owner: "cf".into(),
+                hosts: vec!["c.local".into(), "d.local".into()],
+                rootfs: image("0", "c.ext4"),
+                options: pairs("mode=pool&vms=2&egress=db.internal:5432,10.0.0.0/24:6379"),
+                env: Env::new(BTreeMap::from([
+                    ("GREETING".into(), "hello".into()),
+                    (
+                        "PEM".into(),
+                        "-----BEGIN-----\n\"AA==\"\\\n-----END-----".into(),
+                    ),
+                    ("odd: name".into(), "${HOME}".into()),
+                ]))
+                .unwrap(),
+                tag: Some("0123456789abcdef:\"#{}".into()),
+                deployed: rfc3339(UNIX_EPOCH),
+            },
+            App {
+                name: "plain".into(),
+                owner: "cf".into(),
+                hosts: vec!["e.local".into()],
+                rootfs: image("e", "e.ext4"),
+                options: Vec::new(),
+                env: Env::default(),
+                tag: None,
+                deployed: rfc3339(UNIX_EPOCH),
+            },
+        ];
+        let text = write(&routes, &apps);
+        assert_eq!(read(&text), Ok((routes.clone(), apps)), "{text}");
         assert!(
             text.contains("egress: [\"db.internal:5432\", \"10.0.0.0/24:6379\"]"),
             "{text}"
         );
-        assert_eq!(read(&write(&[])), Ok(Vec::new()));
+        assert_eq!(read(&write(&[], &[])), Ok(Default::default()));
+        assert!(!write(&routes, &[]).contains("\napps:"), "no apps' section");
 
         let deployed = Deployed {
             dir: PathBuf::new(),
             routes: routes.clone(),
+            apps: Vec::new(),
         };
         let moved = deployed.moved("a.local", "C.local").unwrap();
         assert_eq!(moved.routes[0].host, "c.local");
@@ -454,7 +738,48 @@ mod tests {
         let route = |rest: &str| {
             format!("routes:\n  - {{host: a.local, rootfs: {rootfs}, deployed: x{rest}}}\n")
         };
+        let app = |rest: &str| {
+            format!(
+                "  - {{name: a, owner: o, hosts: [b.local], rootfs: {rootfs}, deployed: x{rest}}}\n"
+            )
+        };
+        let apps = |rest: &str| format!("apps:\n{}", app(rest));
         for (yaml, error) in [
+            (
+                format!("{}{}", route(""), apps("").replace("b.local", "a.local")),
+                "apps[0]: host 'a.local' twice",
+            ),
+            (
+                format!(
+                    "apps:\n{}{}",
+                    app(""),
+                    app("").replace("b.local", "c.local")
+                ),
+                "apps[1]: app 'a' twice",
+            ),
+            (
+                apps("").replace("owner: o", "owner: ''"),
+                "apps[0]: owner: '' is no name",
+            ),
+            (
+                apps("").replace("[b.local]", "[]"),
+                "apps[0]: hosts: an app serves one host at least",
+            ),
+            (
+                apps("").replace(&rootfs, "../a.ext4"),
+                "apps[0]: rootfs: '../a.ext4' is not one of the console's",
+            ),
+            (apps(", tag: 'a b'"), "apps[0]: tag: 'a b' is no tag"),
+            (
+                apps(", options: {mode: pool}"),
+                "apps[0]: the route: mode=pool needs vms",
+            ),
+            (
+                apps(", env: {'A=B': s3cr3t}"),
+                "apps[0]: env: \"A=B\" is no variable name",
+            ),
+            // a line, never the file's text: it holds the apps' env
+            (apps(", env: {K: s3cr3t}, fuel: 1"), "unknown field `fuel`"),
             (
                 route("").replace(&rootfs, "../a.ext4"),
                 "routes[0]: rootfs: '../a.ext4' is not one of the console's",
@@ -476,7 +801,7 @@ mod tests {
         ] {
             let failed = read(&yaml);
             assert!(
-                matches!(&failed, Err(e) if e.contains(error)),
+                matches!(&failed, Err(e) if e.contains(error) && !e.contains("s3cr3t")),
                 "{yaml}: {failed:?}"
             );
         }

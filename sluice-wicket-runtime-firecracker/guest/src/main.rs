@@ -25,13 +25,17 @@
 //! The process connects to the destinations of the route's egress as named, through
 //! /init and the wicket (`egress`): set up before it starts. Hello mode's
 //! `POST /egress?to=<host>:<port>` connects so too.
+//!
+//! A route's environment variables come from the wicket on the env stream
+//! (`wire::ENV_PORT`) when the kernel's command line says so (`wire::ENV_PARAMETER`):
+//! read before the process starts, over the image's. Hello mode's `GET /env` answers them.
 
 use std::convert::Infallible;
 use std::ffi::CString;
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
@@ -78,6 +82,9 @@ const RNDADDENTROPY: libc::c_ulong = 0x4008_5203;
 /// `RNDRESEEDCRNG`: `_IO('R', 0x07)`.
 const RNDRESEEDCRNG: libc::c_ulong = 0x5207;
 
+/// What the wicket gave on the env stream, `NAME=value`.
+static GIVEN_ENV: OnceLock<Vec<String>> = OnceLock::new();
+
 /// The process to run, from the image's config.
 #[derive(Deserialize)]
 struct Launch {
@@ -105,12 +112,15 @@ fn main() {
     egress.name();
     mount("tmpfs", "/tmp", "tmpfs", 0);
     mount("tmpfs", "/dev/shm", "tmpfs", 0);
-    let launch = std::fs::read(LAUNCH_CONFIG).ok().map(|json| {
+    let mut launch = std::fs::read(LAUNCH_CONFIG).ok().map(|json| {
         serde_json::from_slice::<Launch>(&json).unwrap_or_else(|e| {
             eprintln!("guest: {LAUNCH_CONFIG}: {e}");
             park()
         })
     });
+    let env_given = cmdline
+        .split_whitespace()
+        .any(|parameter| parameter == format!("{}=1", wire::ENV_PARAMETER));
     // a worker per vCPU: the relay (and hello mode's server) on every one; on a
     // single vCPU a runtime of one thread (no handoffs between threads)
     let runtime = match std::thread::available_parallelism().map_or(1, |n| n.get()) {
@@ -130,6 +140,13 @@ fn main() {
         let output = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, wire::LOG_PORT))?;
         tokio::spawn(log.clone().serve(output));
         loopback_up()?;
+        if env_given {
+            let given = given_env().await?;
+            if let Some(launch) = &mut launch {
+                launch.env.extend(given.iter().cloned());
+            }
+            let _ = GIVEN_ENV.set(given);
+        }
         // before the process starts: it may connect at once
         egress.listen(launch.as_ref().map(|launch| launch.port), &log);
         let hook = launch.as_ref().map(|launch| Hook {
@@ -159,6 +176,20 @@ fn main() {
         eprintln!("guest: {e}");
     }
     park()
+}
+
+/// The variables of the env stream: the wicket's, one stream, once.
+async fn given_env() -> std::io::Result<Vec<String>> {
+    let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, wire::ENV_PORT))?;
+    let (mut stream, _) = listener.accept().await?;
+    let json = wire::read_env(&mut stream).await?;
+    let given: std::collections::BTreeMap<String, String> =
+        serde_json::from_slice(&json).map_err(std::io::Error::other)?;
+    wire::answer_env(&mut stream).await?;
+    Ok(given
+        .into_iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect())
 }
 
 /// PID 1 must never exit: the kernel panics when it does.
@@ -516,6 +547,11 @@ async fn answer(
     if head.uri.path() == "/egress" {
         let answer = egress(head.uri.query().unwrap_or_default(), &body).await;
         return Ok(Response::new(Full::new(Bytes::from(answer))));
+    }
+    if head.uri.path() == "/env" {
+        let mut lines = GIVEN_ENV.get().cloned().unwrap_or_default().join("\n");
+        lines.push('\n');
+        return Ok(Response::new(Full::new(Bytes::from(lines))));
     }
     if head.uri.path() == "/log" {
         let line = format!(

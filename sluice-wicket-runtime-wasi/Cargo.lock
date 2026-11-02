@@ -2323,7 +2323,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
- "getrandom 0.4.3",
  "h2",
  "http",
  "http-body",

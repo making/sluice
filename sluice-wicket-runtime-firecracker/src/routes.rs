@@ -17,7 +17,7 @@
 //!
 //! The console's edits ([`Edit`]) are reloads too, of the routes as they would
 //! be with them: kept -- written to the console's directory -- only when they
-//! started.
+//! started. An app's are one reload: every host of it or none.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -37,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 use crate::BoxError;
 use crate::capacity::Capacity;
 use crate::config::{Origin, RouteSource};
-use crate::deployed::Options;
+use crate::deployed::{AppSpec, Options};
 use crate::output::Sink;
 use crate::route::{Lease, Route, RouteSpec};
 use crate::vm::Places;
@@ -258,6 +258,12 @@ pub enum Edit {
     Move { host: String, to: String },
     /// Removes the console's route of `host`.
     Remove { host: String },
+    /// Keeps the image `received` under its digest `sha256` for an app to name.
+    Upload { sha256: String, received: Received },
+    /// Serves the app `name` as `app` has it.
+    PutApp { name: String, app: AppSpec },
+    /// Removes the app `name` of `owner`.
+    DeleteApp { name: String, owner: String },
 }
 
 impl Edit {
@@ -269,15 +275,9 @@ impl Edit {
             Edit::Options { host, .. } => format!("console: options of {host}"),
             Edit::Move { host, to } => format!("console: move {host} to {to}"),
             Edit::Remove { host } => format!("console: remove {host}"),
-        }
-    }
-
-    fn host(&self) -> &str {
-        match self {
-            Edit::Deploy { host, .. }
-            | Edit::Options { host, .. }
-            | Edit::Move { host, .. }
-            | Edit::Remove { host } => host,
+            Edit::Upload { sha256, .. } => format!("api: upload {sha256}"),
+            Edit::PutApp { name, app } => format!("api: app {name} of {}", app.owner),
+            Edit::DeleteApp { name, owner } => format!("api: remove app {name} of {owner}"),
         }
     }
 }
@@ -300,6 +300,8 @@ pub enum Refused {
     Unknown(String),
     /// Another source routes the host.
     Taken(String),
+    /// An app names an image of a digest not kept: upload it first.
+    Missing(String),
     /// The routes did not start with it: the reload's error.
     Rejected(String),
     /// The console's directory failed.
@@ -314,6 +316,9 @@ impl std::fmt::Display for Refused {
             | Refused::Taken(message)
             | Refused::Rejected(message)
             | Refused::Failed(message) => f.write_str(message),
+            Refused::Missing(sha256) => {
+                write!(f, "no image of the digest {sha256} kept: upload it first")
+            }
         }
     }
 }
@@ -475,10 +480,11 @@ impl Reloader {
         );
     }
 
-    /// Applies an edit of the console's routes: the image kept, the routes as
-    /// they would be are reloaded, and kept -- written to the console's
-    /// directory -- only when they started; refused, the routes and the
-    /// directory stay as they were.
+    /// Applies an edit of the console's routes or apps: the image kept, the
+    /// routes as they would be are reloaded, and kept -- written to the
+    /// console's directory -- only when they started; refused, the routes and
+    /// the directory stay as they were. An upload keeps its image and changes
+    /// no route.
     pub async fn edit(&mut self, edit: Edit) -> Result<Outcome, Refused> {
         let reason = edit.describe();
         let current = self.routes.current();
@@ -498,6 +504,18 @@ impl Reloader {
             Edit::Options { host, options } => deployed.with_options(&host, options, now),
             Edit::Move { host, to } => deployed.moved(&host, &to),
             Edit::Remove { host } => deployed.without(&host),
+            Edit::Upload { sha256, received } => {
+                let uploaded = deployed.upload(&sha256, received);
+                // the uploads kept long enough go
+                deployed.collect_garbage(false);
+                uploaded?;
+                return Ok(Outcome {
+                    generation: current.generation,
+                    change: None,
+                });
+            }
+            Edit::PutApp { name, app } => deployed.with_app(&name, app, now),
+            Edit::DeleteApp { name, owner } => deployed.without_app(&name, &owner),
         }?;
         if &edited == deployed {
             return Ok(Outcome {
@@ -724,24 +742,46 @@ impl Reloader {
 }
 
 /// Refuses an edit of a host another source routes: the console edits its own
-/// routes, and moves one only to a host no other source routes. The hosts are
-/// checked (lower case) by the console before.
+/// routes, and moves one only to a host no other source routes; an app takes
+/// no host another source or app routes. The hosts are checked (lower case) by
+/// the console before.
 fn taken(edit: &Edit, origins: &HashMap<String, Origin>) -> Result<(), Refused> {
     let foreign = |host: &str| {
         origins
             .get(host)
             .filter(|origin| !matches!(origin, Origin::Console { .. }))
     };
-    let host = edit.host();
-    if let Some(origin) = foreign(host) {
-        return Err(Refused::Taken(format!(
-            "{host} is routed by {origin}, not by the console"
-        )));
-    }
-    if let Edit::Move { to, .. } = edit
-        && let Some(origin) = foreign(to)
-    {
-        return Err(Refused::Taken(format!("{to} is routed by {origin}")));
+    match edit {
+        Edit::Deploy { host, .. }
+        | Edit::Options { host, .. }
+        | Edit::Move { host, .. }
+        | Edit::Remove { host } => {
+            if let Some(origin) = foreign(host) {
+                return Err(Refused::Taken(format!(
+                    "{host} is routed by {origin}, not by the console"
+                )));
+            }
+            if let Edit::Move { to, .. } = edit
+                && let Some(origin) = foreign(to)
+            {
+                return Err(Refused::Taken(format!("{to} is routed by {origin}")));
+            }
+        }
+        Edit::PutApp { name, app } => {
+            for host in &app.hosts {
+                match origins.get(host) {
+                    None => {}
+                    Some(Origin::Api { name: own, .. }) if own == name => {}
+                    Some(Origin::Console { .. }) => {
+                        return Err(Refused::Taken(format!("{host} is a route of the console")));
+                    }
+                    Some(origin) => {
+                        return Err(Refused::Taken(format!("{host} is routed by {origin}")));
+                    }
+                }
+            }
+        }
+        Edit::Upload { .. } | Edit::DeleteApp { .. } => {}
     }
     Ok(())
 }

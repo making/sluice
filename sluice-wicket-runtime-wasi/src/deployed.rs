@@ -19,17 +19,17 @@
 //! published it, so the file never names routes that did not load. It holds
 //! the apps' env, so only its owner reads it (0600). A component file
 //! nothing names is removed after every edit and at startup, an upload once
-//! [`UPLOAD_GRACE`] passed: an app naming it links it below `components/`
+//! `UPLOAD_GRACE` passed: an app naming it links it below `components/`
 //! before.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use serde::Deserialize;
 use sluice_wicket_console::store::{
-    Blobs, check_digest, check_file, check_host, check_hosts, check_kept, check_name, check_tag,
-    digest, file_name, hidden, remove, rfc3339, write_by_rename,
+    Blobs, UPLOADS, check_digest, check_file, check_host, check_hosts, check_kept, check_name,
+    check_tag, collect_uploads, digest, file_name, rfc3339, write_by_rename,
 };
 
 use crate::config::{SandboxFile, quote, sandbox_yaml};
@@ -42,13 +42,6 @@ const MANIFEST: &str = "routes.yaml";
 
 /// The components' directory in the directory.
 const COMPONENTS: &str = "components";
-
-/// The uploads' directory in the directory.
-const UPLOADS: &str = "uploads";
-
-/// How long an upload is kept for an app to name it: minutes, so the PUT
-/// naming it after the upload never races its removal.
-const UPLOAD_GRACE: Duration = Duration::from_secs(10 * 60);
 
 /// One of the console's routes.
 #[derive(Clone, PartialEq, Debug)]
@@ -376,7 +369,7 @@ impl Deployed {
 
     /// Removes the files below `components/` nothing names, and the
     /// directories they leave empty, and the uploads kept for
-    /// [`UPLOAD_GRACE`]. Links are removed, never followed.
+    /// `UPLOAD_GRACE`. Links are removed, never followed.
     pub fn collect_garbage(&self) {
         let named = self
             .routes
@@ -385,22 +378,7 @@ impl Deployed {
             .chain(self.apps.iter().map(|app| &app.component));
         // the components are written on the reloader's task alone: none is being written
         self.components().collect_garbage(named, true);
-        for upload in std::fs::read_dir(self.dir.join(UPLOADS))
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            // a partial one a crash left is hidden; a time ahead of the clock is fresh
-            let fresh = upload.metadata().is_ok_and(|metadata| {
-                metadata.is_file()
-                    && metadata
-                        .modified()
-                        .is_ok_and(|at| at.elapsed().is_ok_and(|age| age <= UPLOAD_GRACE))
-            });
-            if !fresh || hidden(&upload.path()) {
-                remove(&upload.path());
-            }
-        }
+        collect_uploads(&self.dir);
     }
 }
 

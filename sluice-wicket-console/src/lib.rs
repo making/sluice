@@ -4,6 +4,7 @@
 //! ([`serve::Service`]); this crate serves them behind the same gate and keeps
 //! the same directory layout:
 //!
+//! - [`env`]: a route's environment variables, their values never shown
 //! - [`gate`]: the credentials (`--console-token`, the sign-in through an
 //!   OpenID Provider), else loopback only and no DNS rebinding; no edit from
 //!   another origin
@@ -15,6 +16,7 @@
 //! - [`status`]: what the page shows of the reloads, and its long poll
 //! - [`settings`]: the console's options, as both wickets take them
 
+pub mod env;
 pub mod gate;
 pub mod http;
 pub mod serve;

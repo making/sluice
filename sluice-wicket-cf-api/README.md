@@ -7,7 +7,9 @@ serve them through the wicket's [app API](../sluice-wicket-runtime-wasi/README.m
 component is deployed with `cf push` (its bits, or an image in an OCI registry:
 `--docker-image`), and routes, scaling, rolling updates, stop and start,
 services (the wicket's keyvalue stores and capabilities) and `cf logs` work as the CLI expects.
-Users log in through an OpenID Provider (`cf login --sso`; see [Login](#login)), or, on the
+Pointed at a [sluice-wicket-runtime-firecracker](../sluice-wicket-runtime-firecracker/README.md#apps)
+instead, `cf push --docker-image` deploys a container image, a CNB image say, as microVMs
+(see [Mapping](#mapping)). Users log in through an OpenID Provider (`cf login --sso`; see [Login](#login)), or, on the
 loopback, with any credentials.
 
 ```text
@@ -275,6 +277,19 @@ another OpenID Provider and the like.
 | binding to a keyvalue instance | the sandbox's `keyvalue` map: its identifier (parameter `identifier`, default `""`) -> `<store>/cf/<instance guid>`, and the capability `keyvalue` |
 | binding to a wasi instance | the plan's capability; a network one `cli` too |
 
+On a Firecracker wicket (its listing says `runtime: firecracker`):
+
+| CF | wicket |
+|---|---|
+| package (docker) | any container image, `--docker-username` with `CF_DOCKER_PASSWORD` its credentials: the build has the wicket make its rootfs (`PUT /api/images`), which pulls it. Listening on `PORT`, as on CF |
+| package (bits) | a zip holding the rootfs, `.ext4` as a component's `.wasm` is picked (160 MiB at most: an image is the way for more) |
+| droplet | the rootfs by sha256: the wicket keeps an image's, the cf-api its reference pinned to the manifest's digest, and has it made again when the wicket lost it (the same digest, unless the wicket's guest changed) |
+| web process `instances` | 1: a shared VM; more: `mode=pool`, that many VMs cloned from a snapshot; 0: a VM of its own per connection, killed when it ends |
+| web process `memory` | `mem` |
+| environment variables, `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: the process's environment, over the image's (its `PORT` is `/init`'s) |
+| services | none: the listing offers neither capabilities nor keyvalue stores |
+| `cf logs` | the process's output, instance 0; no `RTR` line: this wicket feeds no requests to the flume |
+
 ## Behavior
 
 - as on CF, routes and `instances` apply at once; the droplet and the rest of the sandbox
@@ -387,8 +402,8 @@ config.
 
 Refused with why (422): route paths, ports and wildcards, private and internal domains, tasks,
 ssh, sidecars, process types but `web`, route services, environment variable groups,
-user-provided services, service keys. Images hold a wasm component, not a container: any other
-fails the build. A registry's own CA is not taken: HTTPS verifies against the webPKI roots. One owner (`cf`) per wicket: two cf-apis must not
+user-provided services, service keys. On a wasm wicket images hold a wasm component, not a
+container: any other fails the build. A registry's own CA is not taken: HTTPS verifies against the webPKI roots. One owner (`cf`) per wicket: two cf-apis must not
 share one. No roles: whoever may log in may do everything.
 
 The integration test (`tests/cli.rs`) runs the OSS CLI -- `SLUICE_CF_CLI`, else `cf8` on the
@@ -396,7 +411,10 @@ PATH, never a `cf` that may be the Tanzu one -- against the cf-api and a wicket 
 on a flume, building the wicket and its example guests from `../sluice-wicket-runtime-wasi` and the
 flume from `../sluice-flume` (or taking `SLUICE_WICKET_RUNTIME_WASI`, `SLUICE_WICKET_GUESTS` and
 `SLUICE_FLUME`); the login through a provider runs against a mock of one in the test, with TLS
-of the cf-api's own, and the images against a registry in the test (`tests/registry`):
+of the cf-api's own, and the images against a registry in the test (`tests/registry`). Where
+`/dev/kvm` is usable, with Firecracker and a guest kernel (as the wicket's VM test finds them), a
+second test runs against `../sluice-wicket-runtime-firecracker` (`sg kvm -c 'cargo test'` until
+the `kvm` group is in the login):
 
 ```text
 gh release download v8.19.0 -R cloudfoundry/cli -p 'cf8-cli_8.19.0_macosarm.tgz'

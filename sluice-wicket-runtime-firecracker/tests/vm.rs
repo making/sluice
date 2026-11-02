@@ -13,9 +13,10 @@
 //! (http/1.1 and h2c, an unknown one answered 404); a reload of the `--config`
 //! file, polled, removing a route and replacing a rootfs; the console deploying
 //! one more route from an uploaded rootfs (refusing what it does not take),
-//! served on the tunnel, listed with its VMs, and served again after a restart
-//! from the console's directory (not with the image: its directory is the
-//! test's).
+//! served on the tunnel, listed with its VMs, and an app of two hosts on one
+//! rootfs uploaded by digest, its env seen by the guest; both served again after
+//! a restart from the console's directory (not with the image: its directory is
+//! the test's).
 //!
 //! Skipped where `/dev/kvm` is not usable. Elsewhere it needs Firecracker
 //! (`SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER`, else `firecracker` on
@@ -48,6 +49,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use sha2::Digest as _;
 use sluice_wicket_tunnel::flume::testing::{FeedStream, flume_server};
 use sluice_wicket_tunnel::proto::{AccessFilter, feed_message};
 use sluice_wicket_tunnel::session::testing::{ServerTunnel, dial_address, tunnel_server};
@@ -411,7 +413,33 @@ async fn every_route_serves_http_through_the_tunnel() {
             .unwrap_or_else(|| panic!("no tunnel stream after the restart; {}", wicket.log()));
         let (tunnel, advertise) = ServerTunnel::new(stream).await;
         let hosts: Vec<_> = advertise.upstreams.iter().map(|up| &up.host).collect();
-        assert_eq!(hosts, ["console.local"], "{}", wicket.log());
+        assert_eq!(
+            hosts,
+            ["console.local", "app1.local", "app2.local"],
+            "{}",
+            wicket.log()
+        );
+        let app = Route {
+            tunnel: &tunnel,
+            host: "app2.local",
+            address: dial_address(&advertise.upstreams[2].target_url),
+            listen: None,
+        };
+        let env = tokio::time::timeout(HANG, app.get(2, "/env")).await;
+        let env = env.unwrap_or_else(|_| panic!("app2.local: hung; {}", wicket.log()));
+        assert_eq!(env, "GREETING=hello world\nPEM=a\nb\n");
+        let (status, removed) = console(
+            wicket.console(),
+            "DELETE",
+            "/api/apps/shop?owner=cf",
+            true,
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(
+            (status, removed["message"].as_str()),
+            (200, Some("removed app1.local, app2.local"))
+        );
         let again = Route {
             tunnel: &tunnel,
             host: "console.local",
@@ -554,6 +582,113 @@ async fn deploy(
     let budget = &listing["budget"];
     assert!(budget["vms"].as_u64() >= Some(1), "{budget}");
     assert_eq!(budget["max_vms"], 64);
+
+    // an app: refused until its image is uploaded under its digest, then two hosts on
+    // one rootfs and VMs of its own, its env seen by the guest and listed by its names
+    let mut other = image.to_vec();
+    other.extend_from_slice(&[0; 4096]);
+    let image = Bytes::from(other);
+    let sha256: String = sha2::Sha256::digest(&image)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let app = serde_json::json!({
+        "owner": "cf",
+        "hosts": ["app2.local", "app1.local"],
+        "component": {"sha256": sha256, "name": "app.ext4"},
+        "sandbox": {"mem": 128, "env": {"GREETING": "hello world", "PEM": "a\nb"}},
+        "tag": "t1",
+    });
+    let body = || Bytes::from(app.to_string());
+    let (status, refused) = console(at, "PUT", "/api/apps/shop", true, body()).await;
+    assert_eq!(
+        (status, &refused["missing"][0]),
+        (409, &sha256.as_str().into())
+    );
+    let wrong = format!("/api/components/{}", "0".repeat(64));
+    let (status, refused) = console(at, "PUT", &wrong, true, image.clone()).await;
+    assert_eq!(status, 400, "{refused}");
+    let upload = format!("/api/components/{sha256}");
+    let (status, uploaded) = console(at, "PUT", &upload, true, image.clone()).await;
+    assert_eq!(
+        (status, uploaded["bytes"].as_u64()),
+        (200, Some(image.len() as u64)),
+        "{uploaded}"
+    );
+    assert!(dir.join(format!("uploads/{sha256}.ext4")).is_file());
+    let (status, put) = console(at, "PUT", "/api/apps/shop", true, body()).await;
+    assert_eq!(status, 200, "{put}; {}", wicket.log());
+    assert_eq!(put["message"], "added app1.local, app2.local");
+    let advertised = tunnel.advertise().await;
+    let target = |host: &str| {
+        let up = advertised.upstreams.iter().find(|up| up.host == host);
+        up.unwrap_or_else(|| panic!("{host} not advertised"))
+            .target_url
+            .clone()
+    };
+    assert_eq!(target("app1.local"), target("app2.local"), "one target");
+    assert!(
+        target("app1.local").ends_with("/app.ext4?app=shop"),
+        "{}",
+        target("app1.local")
+    );
+    for host in ["app1.local", "app2.local"] {
+        *conn_id += 1;
+        let route = Route {
+            tunnel,
+            host,
+            address: dial_address(&target(host)),
+            listen: None,
+        };
+        assert_eq!(
+            route.get(*conn_id, "/env").await,
+            "GREETING=hello world\nPEM=a\nb\n"
+        );
+    }
+    let (status, apps) = console(at, "GET", "/api/apps", true, Bytes::new()).await;
+    assert_eq!(status, 200, "{apps}");
+    let listed = &apps["apps"][0];
+    assert_eq!(apps["runtime"], "firecracker");
+    assert_eq!(
+        (&listed["name"], &listed["owner"], &listed["tag"]),
+        (&"shop".into(), &"cf".into(), &"t1".into())
+    );
+    assert_eq!(
+        listed["hosts"],
+        serde_json::json!(["app1.local", "app2.local"])
+    );
+    assert_eq!(listed["component"], app["component"]);
+    assert_eq!(
+        listed["sandbox"],
+        serde_json::json!({"mode": "shared", "vcpus": 1, "mem": 128, "env": ["GREETING", "PEM"]})
+    );
+    // kept for its owner's eyes alone, and to a restart; another owner changes nothing
+    let manifest = dir.join("routes.yaml");
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&manifest).unwrap().permissions()
+        ) & 0o777,
+        0o600
+    );
+    assert!(
+        std::fs::read_to_string(&manifest)
+            .unwrap()
+            .contains("hello world")
+    );
+    let (status, refused) = console(
+        at,
+        "DELETE",
+        "/api/apps/shop?owner=other",
+        true,
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(status, 409, "{refused}");
+    let (status, refused) =
+        console(at, "DELETE", "/api/routes/app1.local", true, Bytes::new()).await;
+    assert_eq!(status, 409, "{refused}");
+    let (status, same) = console(at, "PUT", "/api/apps/shop", true, body()).await;
+    assert_eq!((status, same["message"].as_str()), (200, Some("no change")));
 }
 
 /// The field `name` of the status of `pid` (empty: none, or no such process).

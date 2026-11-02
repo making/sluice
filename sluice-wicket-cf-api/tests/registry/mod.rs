@@ -105,6 +105,48 @@ impl Registry {
         manifest_digest
     }
 
+    /// Pushes a container image of `config` (the image's config object) and `layers` (tar,
+    /// gzipped), as a builder does, to `repository:tag`: its manifest's digest.
+    pub fn push_image(
+        &self,
+        repository: &str,
+        tag: &str,
+        config: &serde_json::Value,
+        layers: &[Vec<u8>],
+    ) -> String {
+        let config = serde_json::to_vec(config).unwrap();
+        let descriptors: Vec<_> = layers
+            .iter()
+            .map(|layer| {
+                json!({
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": digest(layer),
+                    "size": layer.len(),
+                })
+            })
+            .collect();
+        let manifest = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": MANIFEST,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": digest(&config), "size": config.len()},
+            "layers": descriptors,
+        }))
+        .unwrap();
+        let manifest_digest = digest(&manifest);
+        let mut content = self.content.lock().unwrap();
+        for reference in [tag, &manifest_digest] {
+            content.manifests.insert(
+                (repository.to_string(), reference.to_string()),
+                manifest.clone(),
+            );
+        }
+        content.blobs.insert(digest(&config), config);
+        for layer in layers {
+            content.blobs.insert(digest(layer), layer.clone());
+        }
+        manifest_digest
+    }
+
     /// The manifests served so far.
     pub fn pulls(&self) -> usize {
         self.content.lock().unwrap().pulls

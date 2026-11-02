@@ -9,7 +9,10 @@
 //! own -- `cf login --sso` through the passcode page, a refresh, the
 //! clients configured, who is refused --, a component the wicket refuses
 //! until a service binding grants what it needs, the services' lifecycle,
-//! delete.
+//! delete. And against a Firecracker wicket, where `/dev/kvm` is usable: a
+//! private image made into a rootfs by the wicket, its process's user, files and
+//! environment seen from the VM, a scale, a rootfs of a zip, the wicket's
+//! directory lost and the image's rootfs made again, of the digest it had.
 
 mod registry;
 
@@ -976,5 +979,296 @@ fn the_cf_cli_deploys_to_the_wicket() {
     drop(wicket);
     drop(flume);
     drop(provider);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A file of a layer the test pushes.
+fn layer_file(tar: &mut tar::Builder<Vec<u8>>, path: &str, mode: u32, owner: u64, body: &[u8]) {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_mode(mode);
+    header.set_uid(owner);
+    header.set_gid(owner + 1);
+    header.set_size(body.len() as u64);
+    tar.append_data(&mut header, path, body).unwrap();
+}
+
+/// `build`'s tar, gzipped.
+fn layer(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
+    let mut tar = tar::Builder::new(Vec::new());
+    build(&mut tar);
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gzip.write_all(&tar.into_inner().unwrap()).unwrap();
+    gzip.finish().unwrap()
+}
+
+/// Firecracker and the guest kernel the wicket's VM test takes (its environment, else its
+/// defaults); None where they are not, or `/dev/kvm` is not usable.
+fn firecracker_tools() -> Option<(PathBuf, PathBuf)> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .ok()?;
+    let firecracker = std::env::var_os("SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER")
+        .map_or_else(|| PathBuf::from("firecracker"), PathBuf::from);
+    let runs = Command::new(&firecracker).arg("--version").output();
+    let kernel = std::env::var_os("SLUICE_WICKET_RUNTIME_FIRECRACKER_KERNEL")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let home = PathBuf::from(std::env::var_os("HOME")?);
+            Some(home.join(".local/firecracker/vmlinux"))
+        })?;
+    (runs.is_ok_and(|output| output.status.success()) && kernel.is_file())
+        .then_some((firecracker, kernel))
+}
+
+#[test]
+fn the_cf_cli_deploys_to_a_firecracker_wicket() {
+    let Some((firecracker, kernel)) = firecracker_tools() else {
+        eprintln!("skipped: needs a usable /dev/kvm, Firecracker and a guest kernel");
+        return;
+    };
+    let wicket_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../sluice-wicket-runtime-firecracker");
+    cargo(&wicket_dir, &["build", "--locked"]);
+    let wicket_binary = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| wicket_dir.join("target"))
+        .join("debug/sluice-wicket-runtime-firecracker");
+    let script = |script: &str, args: &[&Path]| {
+        let output = Command::new(wicket_dir.join(script))
+            .args(args)
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .env_remove("CARGO")
+            .env_remove("CARGO_TARGET_DIR")
+            .current_dir(&wicket_dir)
+            .output()
+            .expect("run the wicket's script");
+        assert!(
+            output.status.success(),
+            "{script}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    let guest = wicket_dir.join(script("scripts/guest.sh", &[]));
+    let sample = std::fs::read(guest.with_file_name("sample-process")).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("sluice-cf-api-fc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for sub in ["rootfs", "cfhome"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    script("scripts/build-guest.sh", &[&dir.join("rootfs/guest.ext4")]);
+
+    let registry = Registry::start("robot", "p4ss");
+    let base = layer(|tar| {
+        layer_file(
+            tar,
+            "etc/passwd",
+            0o644,
+            0,
+            b"root:x:0:0::/root:/bin/sh\napp:x:1000:1001::/home/app:/bin/sh\n",
+        );
+    });
+    let app = layer(|tar| {
+        layer_file(tar, "app/serve", 0o755, 0, &sample);
+        layer_file(tar, "app/data", 0o640, 1000, b"data");
+        layer_file(tar, "app/tool", 0o4755, 0, b"tool");
+    });
+    let config = json!({
+        "architecture": if cfg!(target_arch = "x86_64") { "amd64" } else { "arm64" },
+        "os": "linux",
+        "config": {
+            "Entrypoint": ["/app/serve", "/app/data", "/app/tool"],
+            "Env": ["IMAGE_VAR=from-image"],
+            "User": "app",
+            "WorkingDir": "/app",
+        },
+    });
+    let manifest = registry.push_image("private/sample", "1", &config, &[base, app]);
+    let image = format!("{}/private/sample:1", registry.address);
+
+    let flume = Process::spawn(
+        &flume_binary(),
+        &["--host", "127.0.0.1", "--port", "0", "--token", FLUME_TOKEN],
+    );
+    let flume_url = flume.logged("listening on ");
+    // ports of its own, kept across the wicket's restart (the cf-api names its console)
+    let free = || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .unwrap()
+            .to_string()
+    };
+    let (listen, console, api_listen) = (free(), free(), free());
+    // a state directory each: a killed wicket's stays, and is refused
+    let starts = AtomicUsize::new(0);
+    let start_wicket = || {
+        let (firecracker, kernel, state) = (
+            firecracker.to_str().unwrap(),
+            kernel.to_str().unwrap(),
+            dir.join(format!("state{}", starts.fetch_add(1, Ordering::Relaxed))),
+        );
+        let wicket = Process::spawn(
+            &wicket_binary,
+            &[
+                "--kernel",
+                kernel,
+                "--firecracker",
+                firecracker,
+                "--state-dir",
+                state.to_str().unwrap(),
+                "--flume",
+                &flume_url,
+                "--flume-token",
+                FLUME_TOKEN,
+                "--listen",
+                &listen,
+                "--console",
+                &console,
+                "--console-token",
+                TOKEN,
+                "--console-dir",
+                dir.join("deployed").to_str().unwrap(),
+                "--guest",
+                guest.to_str().unwrap(),
+                "--watch-interval",
+                "0",
+            ],
+        );
+        wicket.logged("console on http://");
+        wicket
+    };
+    let mut wicket = start_wicket();
+    let (_api, url) = start_api(&api_listen, &console, &flume_url, &dir.join("cf"), &[]);
+    let cf = Cf {
+        cli: cf_cli(),
+        home: dir.join("cfhome"),
+    };
+    cf.ok(&["api", &url]);
+    cf.ok(&["login", "-u", "me", "-p", "x"]);
+
+    // the image's credentials go to the wicket, which pulls it
+    let refused = cf.fails(&["push", "fc", "--docker-image", &image]);
+    assert!(
+        refused.contains("the image does not exist, or it is private"),
+        "{refused}"
+    );
+    let mut push = cf.command(&[
+        "push",
+        "fc",
+        "--docker-image",
+        &image,
+        "--docker-username",
+        "robot",
+        "--no-start",
+    ]);
+    push.env("CF_DOCKER_PASSWORD", "p4ss");
+    let (ok, output) = cf.output(push, "");
+    assert!(ok, "{output}");
+    cf.ok(&["set-env", "fc", "GREETING", "hello world"]);
+    cf.ok(&["start", "fc"]);
+    let shown = cf.ok(&["app", "fc"]);
+    assert!(shown.contains(&format!("{image}@{manifest}")), "{shown}");
+
+    // from inside the VM: the image's user, its files' owners and modes, the env
+    let (status, body) = get(&listen, "fc.localhost", "/", None);
+    assert_eq!(status, 200, "{body}");
+    for expected in [
+        "uid 1000 gid 1001\n",
+        "/app/data uid 1000 gid 1001 mode 640\n",
+        "/app/tool uid 0 gid 1 mode 4755\n",
+        "GREETING=hello world\n",
+        "HOME=/home/app\n",
+        "IMAGE_VAR=from-image\n",
+        "PORT=8080\n",
+        "VCAP_APPLICATION={",
+    ] {
+        assert!(body.contains(expected), "{expected}: {body}");
+    }
+    let listed = listing(&console);
+    let fc = &listed["apps"][0];
+    assert_eq!(listed["runtime"], "firecracker");
+    assert_eq!(fc["hosts"], json!(["fc.localhost"]));
+    assert_eq!(fc["sandbox"]["mode"], "shared");
+    assert!(
+        fc["sandbox"]["env"]
+            .as_array()
+            .unwrap()
+            .contains(&"GREETING".into()),
+        "{fc}"
+    );
+    let sha256 = fc["component"]["sha256"].as_str().unwrap().to_string();
+    assert_eq!(fc["component"]["name"], "sample.ext4");
+
+    // the process's output, from the flume (this wicket feeds no requests)
+    let deadline = Instant::now() + HANG;
+    loop {
+        assert_eq!(get(&listen, "fc.localhost", "/log", None).0, 200);
+        if cf
+            .ok(&["logs", "fc", "--recent"])
+            .contains("[APP/PROC/WEB/0] OUT GET /log HTTP/1.0")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the app's lines never came");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // two instances: a pool of two VMs cloned from a snapshot, env and all
+    cf.ok(&["scale", "fc", "-i", "2"]);
+    let scaled = &listing(&console)["apps"][0]["sandbox"];
+    assert_eq!(
+        (&scaled["mode"], &scaled["vms"]),
+        (&"pool".into(), &2.into())
+    );
+    let (status, body) = get(&listen, "fc.localhost", "/", None);
+    assert!(
+        status == 200 && body.contains("GREETING=hello world\n"),
+        "{status}: {body}"
+    );
+
+    // a rootfs in a zip: uploaded by the cf-api, as a component is
+    cf.ok(&["push", "zipped", "-p", dir.join("rootfs").to_str().unwrap()]);
+    let (status, body) = get(&listen, "zipped.localhost", "/env", None);
+    assert!(
+        status == 200 && body.contains("VCAP_APPLICATION={"),
+        "{status}: {body}"
+    );
+
+    // the wicket's directory lost: the cf-api puts its apps back, the image's rootfs
+    // made again, of the digest it had
+    wicket.kill();
+    drop(wicket);
+    let _ = std::fs::remove_dir_all(dir.join("deployed"));
+    wicket = start_wicket();
+    let deadline = Instant::now() + HANG;
+    loop {
+        if get(&listen, "fc.localhost", "/", None).0 == 200
+            && get(&listen, "zipped.localhost", "/env", None).0 == 200
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the apps never came back");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let listed = listing(&console);
+    let fc = listed["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|app| app["hosts"][0] == "fc.localhost");
+    assert_eq!(fc.unwrap()["component"]["sha256"], sha256.as_str());
+
+    for app in ["fc", "zipped"] {
+        cf.ok(&["delete", app, "-r", "-f"]);
+    }
+    assert!(listing(&console)["apps"].as_array().unwrap().is_empty());
+    assert_eq!(get(&listen, "fc.localhost", "/", None).0, 404);
+
+    drop(wicket);
+    drop(flume);
     let _ = std::fs::remove_dir_all(&dir);
 }

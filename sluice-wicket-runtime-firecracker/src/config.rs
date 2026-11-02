@@ -95,6 +95,9 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
                                   --oidc-issuer
   --console-dir <path>            where the console keeps its routes and images (default
                                   deployed, next to the config file)
+  --guest <path>                  the guest (/init of the wicket's version), which lets
+                                  PUT /api/images make a rootfs of an OCI image; needs
+                                  mkfs.ext4 and debugfs (e2fsprogs)
   --oidc-issuer <url>             the OpenID Provider the console's browsers sign in
                                   through instead of the token
   --oidc-client-id <id>           the client registered with it, whose redirect URI is
@@ -150,6 +153,8 @@ pub struct Settings {
     pub watch_interval: Duration,
     /// Where the VMs' files go; None = a directory of the process's own.
     pub state_dir: Option<PathBuf>,
+    /// The guest, `/init` of the images the console makes.
+    pub guest: Option<PathBuf>,
     /// The flume the VMs' output is fed to.
     pub flume: Option<FlumeSettings>,
     /// Jail mode: the VMs in jails, spawned by the keeper.
@@ -202,6 +207,7 @@ const VALUED: &[&str] = &[
     "console",
     "console-token",
     "console-dir",
+    "guest",
     "oidc-issuer",
     "oidc-client-id",
     "oidc-client-secret",
@@ -445,6 +451,9 @@ pub fn parse(
             file.and_then(|file| file.watch_interval.as_ref()),
             DEFAULT_WATCH_INTERVAL,
         )?,
+        guest: flag("guest")
+            .map(PathBuf::from)
+            .or_else(|| file.and_then(|file| in_file(&file.guest))),
         state_dir: flag("state-dir")
             .map(PathBuf::from)
             .or_else(|| file.and_then(|file| in_file(&file.state_dir))),
@@ -465,6 +474,14 @@ pub enum Origin {
     Flag,
     /// The console, which deployed it at `deployed` (RFC 3339).
     Console { deployed: String },
+    /// An app of the console's API, `name` of `owner` (its `tag` opaque to the
+    /// console), which took its rootfs and options at `deployed` (RFC 3339).
+    Api {
+        name: String,
+        owner: String,
+        tag: Option<String>,
+        deployed: String,
+    },
 }
 
 impl Origin {
@@ -474,17 +491,19 @@ impl Origin {
             Origin::Config => "config",
             Origin::Flag => "flag",
             Origin::Console { .. } => "console",
+            Origin::Api { .. } => "api",
         }
     }
 }
 
 impl std::fmt::Display for Origin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Origin::Config => "the config file",
-            Origin::Flag => "a --vm flag",
-            Origin::Console { .. } => "the console",
-        })
+        match self {
+            Origin::Config => f.write_str("the config file"),
+            Origin::Flag => f.write_str("a --vm flag"),
+            Origin::Console { .. } => f.write_str("the console"),
+            Origin::Api { name, owner, .. } => write!(f, "the app '{name}' of {owner}"),
+        }
     }
 }
 
@@ -637,6 +656,7 @@ struct File {
     kernel: Option<PathBuf>,
     firecracker: Option<PathBuf>,
     state_dir: Option<PathBuf>,
+    guest: Option<PathBuf>,
     max_connections: Option<u64>,
     max_vms: Option<u64>,
     max_memory: Option<u64>,

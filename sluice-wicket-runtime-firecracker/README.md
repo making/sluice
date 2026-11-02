@@ -73,14 +73,15 @@ Two Cargo workspaces:
   restore notice and the egress rules,
   `listener.rs` `--listen` (`head.rs` the request head routing a connection, `hpack.rs`
   an h2c one's), `console.rs` the console (its page in `src/console/`), `deployed.rs` its
-  routes kept, `state.rs` the state dir, `seccomp.rs` the seccomp filters;
+  routes and apps kept, `image.rs` an OCI image pulled, `rootfs.rs` its layers as an ext4
+  image, `state.rs` the state dir, `seccomp.rs` the seccomp filters;
   jail mode's `keeper.rs` (the privileged half, and the wicket's client of it) and
   `jail.rs` (one VM's jail, the VMs' cgroups)
 - `guest/` -- the VMs' `/init`, built for `x86_64-unknown-linux-musl` or
   `aarch64-unknown-linux-musl` (its `rust-toolchain.toml` has rustup add both, rust-lld
   links the other arch's): `log.rs` the processes' output, `egress.rs` their egress,
   `reaper.rs` PID 1's reaping; `guest/src/wire.rs` is a copy of `src/wire.rs`: keep them
-  alike
+  alike; `src/bin/sample-process.rs` what the tests' images run
 - `scripts/` -- `build-guest.sh` (the sample rootfs), `cnb-rootfs.sh` (an OCI image's),
   `guest.sh` (the guest, which both build), `try.sh` (the debug build on `--listen`)
 - `tests/vm.rs` -- the VM test (see [Tests](#tests))
@@ -127,7 +128,8 @@ and 3. A host serving others: also [Host setup](#host-setup).
    sudo apt-get install -y protobuf-compiler e2fsprogs python3
    ```
 
-5. For CNB images only: docker, sudo (`cnb-rootfs.sh` keeps the image's file owners), and
+5. For CNB images through the script only (`PUT /api/images` needs neither, see
+   [Apps](#apps)): docker, sudo (`cnb-rootfs.sh` keeps the image's file owners), and
    `pack` (v0.40.10):
 
    ```text
@@ -295,8 +297,10 @@ config file, else in the working directory: `/data/deployed` in the image) and s
 after a restart:
 
 ```text
-deployed/routes.yaml                    the routes, in the config file's route shape (and their time)
+deployed/routes.yaml                    the routes and apps, in the config file's route shape (and their time)
 deployed/rootfs/<sha256>/<name>.ext4    the images they name, never rewritten
+deployed/uploads/<sha256>.ext4          the images uploaded by digest, or made, for ten minutes
+deployed/builds/                        what the images being made take, removed at startup
 ```
 
 `routes.yaml` is written once a change started (0600), and an image no route names is
@@ -336,8 +340,71 @@ An edit is answered 400 (a bad host name, option or image), 404 (no route of the
 did not start with it; the reason follows) or 503 (draining). The options are checked before
 the image is read: a client sending `Expect: 100-continue` (curl does for a large file) is
 refused before it uploads. The listing names each route's `origin` (`config`, `flag`,
-`console`), its advertised `target`, its `rootfs` (a console route's path in the directory and
-its digest), its `options` set to other than their defaults, its `vms` and `snapshot`.
+`console`, `api`), its advertised `target`, its `rootfs` (a console route's path in the directory
+and its digest), its `options` set to other than their defaults, its `vms` and `snapshot`, an
+app's name and owner, and the names of its env.
+
+#### Apps
+
+An app is hosts served by one rootfs in one set of options with an env, put and removed by its
+owner: the API of a controller keeping the desired state of its apps (as
+`sluice-wicket-cf-api` does), the wasm wicket's
+([Apps](../sluice-wicket-runtime-wasi/README.md#apps)) but its sandbox. Its image is uploaded by
+digest, or made of an OCI image, first; the app names it:
+
+| request | |
+|---|---|
+| `PUT /api/components/<sha256>` | keeps the body, an ext4 image of 4 GiB at most, under its digest (400 when the body has another): `{"sha256": .., "bytes": ..}` |
+| `PUT /api/images` | makes an ext4 image of the OCI image the body names (below), kept under its digest as an upload: `{"image": <the reference pinned to its digest>, "name": .., "sha256": .., "bytes": ..}` |
+| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "runtime": "firecracker", "capabilities": [], "keyvalue_stores": [], "apps": [..]}` |
+| `PUT /api/apps/<name>` | serves the app of the body (JSON, below) |
+| `DELETE /api/apps/<name>?owner=<owner>` | removes the app of `owner` |
+
+```json
+{
+  "owner": "cf",
+  "hosts": ["shop.localhost", "store.localhost"],
+  "component": {"sha256": "0954dc11…e8", "name": "shop.ext4"},
+  "sandbox": {"mode": "pool", "vms": 2, "mem": 256, "egress": ["db.internal:5432"],
+              "env": {"GREETING": "hello"}},
+  "tag": "3f1c…9a"
+}
+```
+
+- the sandbox is the route options of `--vm` in JSON (a number, or a string; `egress` a list),
+  each left out taking its default, and its `env`, `name -> value`, over the image's. The
+  listings name the variables only (`"env": ["GREETING"]`), never a value
+- `tag` (optional) is opaque to the wicket, kept and listed as given: a controller tells by it
+  what it put, an env it cannot read back included. A tag or hosts alone start no VM
+- a PUT is one reload: every host of the app or none, kept only when its VMs started; the same
+  app again changes nothing. An app's target names it (`?app=<name>`), so its VMs are its own,
+  whoever else names the image; the env is in no target: another env starts its VMs anew
+- 409 and `{"missing": [<sha256>]}` when no image of the digest is kept: upload it and put
+  again. An upload is kept for ten minutes, a file an app named as long as an app does
+- a host the config file, a flag, a console route or another app routes is refused (409), and so
+  is a change of another owner's app; the page lists an app's routes, read-only
+
+**An image of a registry**, `PUT /api/images` with `--guest <path>`
+(`SLUICE_WICKET_RUNTIME_FIRECRACKER_GUEST`; the image sets it) and e2fsprogs' `mkfs.ext4` and
+`debugfs` (in the image too), no root and no docker. Without `--guest` it is refused (422):
+
+```json
+{"image": "ghcr.io/me/shop:1", "username": "me", "password": "…", "port": 8080}
+```
+
+Only `image` is required; `port` is the process's, `PORT` in its environment (default the
+lowest the image exposes, else 8080), `restore` the restore hook's argv (see [Clones](#clones)).
+The manifest of the wicket's platform is pulled (of an index, its `linux/<arch>` entry; other
+arches are refused), then its layers (tar or gzip; zstd is refused), checked against their
+digests: a registry on the loopback over plain HTTP, any other over HTTPS against the webPKI
+roots. They unpack over each other as a runtime's do, whiteouts and all, a link never leading
+out of the root, within 4 GiB. The image holds what they say of every file, the guest as `/init`
+and `/sluice/init.json` from the image's config, as `scripts/cnb-rootfs.sh` writes it. One build
+at a time; the request is held until it is done, ten minutes at most (a refusal is a 422 with
+the reason). xattrs (file capabilities) are dropped.
+
+The same manifest, guest, port and hook make the same bytes: a build again has the digest it
+had, so its target and VMs stay. Another wicket's guest makes another digest.
 
 ### Limits
 
@@ -652,7 +719,7 @@ docker run --rm --device /dev/kvm --group-add $(stat -c %g /dev/kvm) \
     --vm hello.local=/usr/local/share/sluice-wicket-runtime-firecracker/guest.ext4
 ```
 
-- **its environment** sets `KERNEL`, `FIRECRACKER` and `STATE_DIR`
+- **its environment** sets `KERNEL`, `FIRECRACKER`, `GUEST` and `STATE_DIR`
   (`SLUICE_WICKET_RUNTIME_FIRECRACKER_<NAME>`), which win over a `--config` file's keys; `-e`
   overrides them
 - **rootfs images** come in through a volume (`-v $PWD/rootfs:/rootfs:ro`), readable by the
@@ -1021,10 +1088,36 @@ Caveats:
 - An h2c-unaware process answers prior-knowledge h2 with 502, as behind the Java client;
   the Go sample enables h2c (`http.Protocols`).
 
+- **The env goes over vsock, not a drive**: the kernel's command line (2048 bytes, and any
+  process of the guest reads it) cannot hold it. A second drive would mean a file per target
+  holding secrets on the disk, bound into each jail through the keeper. The wicket instead dials
+  `/init` on a port of its own (`wire::ENV_PORT`) before the process starts: nothing but
+  `routes.yaml` (0600) holds it on the host, a jail needs nothing more, and a clone has it in
+  its snapshot's memory.
+- **A rootfs is made on the wicket, not in the cf-api**: `/init` must be of the wicket's
+  version and arch, which it alone knows; a pull straight to the wicket saves sending the
+  image over again (a CNB image is hundreds of MiB, and the cf-api reads a droplet whole); and
+  the API serves a controller or a user alike. The cf-api keeps the pinned reference as its
+  droplet and has the rootfs made again when the wicket lost it.
+- **`mkfs.ext4 -d` alone cannot make an image's file system as a user** (e2fsprogs 1.47.0,
+  uid 1000): every file gets the runner's uid (`-E root_owner` is the root directory's alone), a
+  mode 000 file fails the build (`Permission denied`), and `-d` takes no tar before 1.47.1
+  (Ubuntu 24.04 has 1.47.0). So the tree is unpacked owner-readable and `debugfs -w -f` sets each
+  inode's owner, mode and times: 40000 `sif` commands in 0.48s against 1.0s of `mkfs` for 20000
+  files. It exits 0 whatever a command did (the errors are its stderr); a name is quoted with
+  `""` for a quote and a bare backslash; `mknod` takes an entry of the current directory, not
+  a path (`/app/null` is one illegal name in `/`).
+- **An ext4 image can be reproducible**: `E2FSPROGS_FAKE_TIME`, `-U` and `-E hash_seed` fix the
+  file system's own bytes, and the directory's order does not matter; what `-d` copies of each
+  file (atime, ctime, their nanoseconds) must be set too, or two builds differ in every inode.
+  A Paketo noble run image with a binary (5029 files; 216 MiB, 118 MiB on the disk, sparse) was
+  pulled from a local registry and made in 24.5s by the debug build, a build again of the same
+  digest; served with the image's user (`cnb`, 1002:1001) and `/usr/bin/passwd` still setuid.
+
 ## Not yet
 
 A shared VM replaced when it fails (a pool's are: `mode=pool&vms=1` is one), a pool
-spreading by load rather than by connections, CPU limits without the jail, the console's apps
-API (what `sluice-wicket-cf-api` deploys through on the wasm wicket) with a rootfs made from an
-OCI / CNB image on the wicket, and egress over UDP or to names a route does not list
-(`*.example.com`).
+spreading by load rather than by connections, CPU limits without the jail, an image of the
+page rather than the API (`PUT /api/images`), a docker-archive upload, the requests on the
+flume (the VMs' output alone: `cf logs` shows no `RTR` line here), and egress over UDP or to
+names a route does not list (`*.example.com`).

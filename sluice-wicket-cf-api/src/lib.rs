@@ -1,14 +1,15 @@
 //! sluice-wicket-cf-api: the Cloud Foundry API facade the stock cf CLI
-//! deploys wasm components through -- the subset of the Cloud Controller v3
-//! API, the UAA token endpoints and log-cache's read API it uses -- keeping
-//! the desired state of its apps and having one wicket serve them through
-//! the wicket's app API; a component comes in a zip or from an OCI registry
-//! (`registry`), and the wicket's keyvalue stores and capabilities are its
-//! services. With a flume, the apps' output and requests reach their logs
+//! deploys wasm components (or, on a Firecracker wicket, rootfs images) through
+//! -- the subset of the Cloud Controller v3 API, the UAA token endpoints and
+//! log-cache's read API it uses -- keeping the desired state of its apps and
+//! having one wicket serve them through the wicket's app API; a component comes
+//! in a zip or from an OCI registry (`registry`), a rootfs in a zip or made by
+//! the wicket of an OCI image, and the wicket's keyvalue stores and capabilities
+//! are its services. With a flume, the apps' output and requests reach their logs
 //! from the live access log the wicket feeds (`flume`).
 //!
 //! ```text
-//! cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> sluice-wicket-runtime-wasi
+//! cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> a wicket
 //!                                                  ^                              |
 //!                                                  +--Watch-- sluice-flume <--Feed+
 //! ```
@@ -199,6 +200,7 @@ pub async fn serve(
         logs: logs.clone(),
         edits: tokio::sync::Mutex::new(()),
         offer: std::sync::Mutex::new(None),
+        runtime: std::sync::Mutex::new(None),
     });
     let flume = settings
         .flume

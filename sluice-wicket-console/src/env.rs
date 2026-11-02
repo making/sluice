@@ -1,6 +1,5 @@
-//! A route's environment variables (`sandbox.env`): what the guest's
-//! `wasi:cli/environment` answers. They may hold secrets, so their values
-//! are never shown: the advertised target carries a digest of them, keyed
+//! A route's environment variables (`sandbox.env`): what its guests get as
+//! their environment. They may hold secrets, so their values are never shown: the advertised target carries a digest of them, keyed
 //! by a random key of the process (it tells nothing of the values, and
 //! another process has another), the listings their names only, and so does
 //! `Debug`.

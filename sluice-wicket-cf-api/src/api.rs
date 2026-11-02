@@ -1657,14 +1657,19 @@ impl Api {
             }
         });
         let staging = tokio::spawn({
-            let (store, logs, registry) =
-                (self.store.clone(), self.logs.clone(), self.registry.clone());
+            let (store, logs, registry, controller) = (
+                self.store.clone(),
+                self.logs.clone(),
+                self.registry.clone(),
+                self.controller.clone(),
+            );
             let (guid, command) = (guid.clone(), app.process.command.clone());
             async move {
                 staging::run(
                     &store,
                     &logs,
                     &registry,
+                    &controller,
                     &guid,
                     &package,
                     command.as_deref(),

@@ -192,6 +192,15 @@ pub struct Received {
 }
 
 impl Received {
+    /// The file at `path`, hidden on the file system it is kept on, as if received.
+    pub fn adopt(path: PathBuf, sha256: String, bytes: u64) -> Received {
+        Received {
+            path: Some(path),
+            sha256,
+            bytes,
+        }
+    }
+
     /// Renames the file to `to` (made in its directory, which is made when
     /// missing), unless a file is there: one of the same digest, as the
     /// caller names it.

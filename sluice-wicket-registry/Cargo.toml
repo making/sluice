@@ -1,0 +1,17 @@
+[package]
+name = "sluice-wicket-registry"
+version = "0.0.1-SNAPSHOT"
+edition = "2024"
+publish = false
+
+# What sluice-wicket-cf-api (a wasm component's image) and sluice-wicket-runtime-firecracker
+# (an image's rootfs), both their own workspaces, pull images with, so it is one too.
+[workspace]
+
+[dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+# its HTTP client: the webPKI roots, ring
+sluice-wicket-oidc = { path = "../sluice-wicket-oidc" }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"

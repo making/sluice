@@ -16,6 +16,7 @@ on:
     - 'sluice-build-info/**'
     - 'sluice-wicket-oidc/**'
     - 'sluice-wicket-console/**'
+    - 'sluice-wicket-registry/**'
     - 'sluice-wicket-tunnel/**'
     - 'sluice-proto/src/main/proto/**'
     - '.github/workflows/rust.yaml'
@@ -65,6 +66,10 @@ jobs:
           - 'sluice-wicket-console/**'
           - 'sluice-wicket-oidc/**'
           - '.github/workflows/rust.yaml'
+          registry:
+          - 'sluice-wicket-registry/**'
+          - 'sluice-wicket-oidc/**'
+          - '.github/workflows/rust.yaml'
           tunnel:
           - 'sluice-wicket-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
@@ -92,15 +97,20 @@ jobs:
           - 'sluice-build-info/**'
           - 'sluice-wicket-oidc/**'
           - 'sluice-wicket-console/**'
+          - 'sluice-wicket-registry/**'
           - 'sluice-wicket-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
           - '.github/workflows/deploy-cf-api.yaml'
+          # its job runs the cf-api's test against the wicket, on a flume
           firecracker:
           - 'sluice-wicket-runtime-firecracker/**'
+          - 'sluice-wicket-cf-api/**'
+          - 'sluice-flume/**'
           - 'sluice-build-info/**'
           - 'sluice-wicket-oidc/**'
           - 'sluice-wicket-console/**'
+          - 'sluice-wicket-registry/**'
           - 'sluice-wicket-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
@@ -173,6 +183,33 @@ jobs:
           ~/.cargo/git
           sluice-wicket-console/target
         key: cargo-wicket-console-${{ runner.os }}-${{ hashFiles('sluice-wicket-console/Cargo.lock', 'sluice-wicket-console/rust-toolchain.toml') }}
+    - name: Format
+      run: cargo fmt --check
+    - name: Clippy
+      run: cargo clippy --all-targets --locked -- -D warnings
+    - name: Test
+      run: cargo test --locked
+  sluice-wicket-registry:
+    needs: changes
+    if: needs.changes.outputs.registry == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sluice-wicket-registry
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    # the toolchain rust-toolchain.toml pins
+    - name: Toolchain
+      run: rustup toolchain install
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          sluice-wicket-registry/target
+        key: cargo-wicket-registry-${{ runner.os }}-${{ hashFiles('sluice-wicket-registry/Cargo.lock', 'sluice-wicket-registry/rust-toolchain.toml') }}
     - name: Format
       run: cargo fmt --check
     - name: Clippy
@@ -407,6 +444,17 @@ jobs:
       run: |
         cargo test --locked
         (cd guest && cargo test --locked)
+    # the OSS cf CLI (x86_64's alone is published) deploying to the wicket, its image made
+    # on the wicket: skipped by the cf-api's job, which has no Firecracker
+    - name: Test the cf-api on it
+      if: matrix.arch == 'x86_64'
+      run: |
+        if [ ! -e /dev/kvm ]; then echo "no /dev/kvm: skipped"; exit 0; fi
+        curl -sSL https://github.com/cloudfoundry/cli/releases/download/v8.19.0/cf8-cli_8.19.0_linux_x86-64.tgz | sudo tar -xz -C /usr/local/bin cf8
+        (cd ../sluice-flume && rustup toolchain install)
+        cd ../sluice-wicket-cf-api
+        rustup toolchain install
+        cargo test --locked --test cli the_cf_cli_deploys_to_a_firecracker_wicket
     # the guest of the runner's arch and, cross built, of the other
     - name: Guests
       run: |

@@ -24,6 +24,12 @@
 //! `wire::EGRESS_PORT` served by the wicket (`egress`): its VMs get the rules on their
 //! kernel command line (`wire::EGRESS_PARAMETER`), and the wicket listens at each one's
 //! socket for the port before it starts.
+//!
+//! A route's environment variables go to each VM it boots on the env stream
+//! (`wire::ENV_PORT`), the wicket dialing `/init` before the process starts; a clone has
+//! them in its snapshot's memory. No file holds them, so a jail needs nothing more, and
+//! the kernel's command line, which any process of the guest reads, says only that they
+//! are coming.
 
 use std::ffi::OsString;
 use std::os::fd::OwnedFd;
@@ -39,6 +45,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
+use sluice_wicket_console::env::Env;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
@@ -68,6 +75,9 @@ pub const LAUNCH: &str = "--launch-vm";
 /// The descriptors a `firecracker` holds besides its vsock streams: KVM's, its
 /// vCPUs', event fds, its sockets, files and log.
 const VM_OWN_FILES: u64 = 128;
+
+/// How long `/init` may take to read the env stream.
+const ENV_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The bytes of a route's egress rules a VM's kernel command line takes at most (2048 in
 /// all, Firecracker's parameters and the wicket's own among them).
@@ -223,6 +233,8 @@ pub struct Spec {
     /// The destinations its guests may connect to, through the wicket (sorted, once
     /// each).
     pub egress: Vec<Rule>,
+    /// The environment variables of its process, over the image's.
+    pub env: Env,
 }
 
 /// `rules` as a VM's kernel command line and a route's target name them: `,` between.
@@ -552,7 +564,7 @@ impl Vm {
             "/boot-source",
             json!({
                 "kernel_image_path": kernel,
-                "boot_args": boot_args(&spec.egress),
+                "boot_args": boot_args(&spec.egress, !spec.env.is_empty()),
             }),
         )
         .await?;
@@ -576,7 +588,21 @@ impl Vm {
         .await?;
         vm.api("PUT", "/actions", json!({ "action_type": "InstanceStart" }))
             .await?;
+        if !spec.env.is_empty() {
+            vm.give_env(&spec.env).await?;
+        }
         Ok(vm)
+    }
+
+    /// Gives `/init`, waiting for it, the variables of the process's environment. An
+    /// error names none of them.
+    async fn give_env(&self, env: &Env) -> Result<(), BoxError> {
+        let mut stream = self.dial_ready(wire::ENV_PORT, ENV_TIMEOUT).await?;
+        let json = serde_json::to_vec(env.map())?;
+        wire::send_env(&mut stream, &json)
+            .await
+            .map_err(|e| format!("the guest's env stream: {e}; {}", self.log()))?;
+        Ok(())
     }
 
     /// Clones a running VM from `snapshot` at `place` (the `n`th clone): its memory file
@@ -761,8 +787,8 @@ pub fn log_tail(path: &Path) -> String {
 /// No serial console unless `SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE` is set (the kernel's and
 /// `/init`'s own output then goes to the VM's log; the processes' goes to the wicket's
 /// stdout / stderr regardless): printing to it is the slowest part of a boot. The route's
-/// `egress`, if any, for `/init`.
-fn boot_args(egress: &[Rule]) -> String {
+/// `egress`, if any, for `/init`, and that its env is coming (`env`).
+fn boot_args(egress: &[Rule], env: bool) -> String {
     let console = match std::env::var_os("SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE") {
         Some(_) => "console=ttyS0",
         None => "console=none 8250.nr_uarts=0",
@@ -777,5 +803,9 @@ fn boot_args(egress: &[Rule]) -> String {
         [] => String::new(),
         rules => format!(" {}={}", wire::EGRESS_PARAMETER, egress_list(rules)),
     };
-    format!("{console} reboot=k panic=1 quiet{arch} init=/init{egress}")
+    let env = match env {
+        true => format!(" {}=1", wire::ENV_PARAMETER),
+        false => String::new(),
+    };
+    format!("{console} reboot=k panic=1 quiet{arch} init=/init{egress}{env}")
 }

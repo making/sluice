@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use sluice_wicket_console::env::Env;
 use sluice_wicket_tunnel::workers::Workers;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::UnixStream;
@@ -156,6 +157,8 @@ pub struct RouteSpec {
     /// How long a connection may relay no byte, either way, before it is failed (and
     /// its VM killed); None = no bound of its own.
     pub idle: Option<Duration>,
+    /// The console's app it is a route of: its target names it, so its VMs are its own.
+    pub app: Option<String>,
 }
 
 impl RouteSpec {
@@ -226,6 +229,7 @@ impl RouteSpec {
                 mem_mib: 128,
                 cpu: None,
                 egress: Vec::new(),
+                env: Env::default(),
             },
             mode: Mode::Shared,
             port: 8080,
@@ -239,6 +243,7 @@ impl RouteSpec {
             conns: DEFAULT_CONNS,
             per_client: None,
             idle: None,
+            app: None,
         };
         let mut given = Vec::new();
         for (key, value) in options {
@@ -341,13 +346,20 @@ impl RouteSpec {
     /// The target advertised for the route, which the server passes verbatim as the
     /// dial address of its CONNECTs: `firecracker:<rootfs>`, plus the options set to
     /// other than their defaults (`?mode=per-connection&vcpus=2...`, in a fixed order;
-    /// the bounds of a connection too: a target's connections are bound alike).
-    /// Routes of one target share its VMs.
+    /// the bounds of a connection too: a target's connections are bound alike), an
+    /// app's name first (unreserved chars: no escaping). Routes of one target share its
+    /// VMs. Its env is not in it: the server sees targets, and a change of the env starts
+    /// the target's VMs anew all the same ([`RouteSpec::same_vms`]).
     pub fn target(&self) -> String {
         let query: Vec<String> = self
-            .options()
-            .into_iter()
-            .map(|(key, value)| format!("{key}={value}"))
+            .app
+            .iter()
+            .map(|app| format!("app={app}"))
+            .chain(
+                self.options()
+                    .into_iter()
+                    .map(|(key, value)| format!("{key}={value}")),
+            )
             .collect();
         let rootfs = self.vm.rootfs.display();
         match query.join("&") {
