@@ -26,18 +26,23 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
                                   needed), relayed as the tunnel's connections are
   --vm <host>=<rootfs>[?<opts>]   a route served by Firecracker microVMs booted from the
                                   rootfs; repeatable. mode=shared (default: one VM serves
-                                  every connection) or mode=per-connection (a VM cloned from
+                                  every connection), mode=per-connection (a VM cloned from
                                   a snapshot per connection; warm=N kept restored ahead,
                                   prime=N GET / sent before the snapshot, vms=N the
                                   route's VMs at most, wait-ms=N a connection may wait for
-                                  room for its VM, 10000), vcpus=N (1), mem=MiB (128),
-                                  port=N (the guest's vsock port, 8080), per-client=N a
-                                  client address's connections at once, idle-ms=N a
-                                  connection may relay no byte, cpu=N (jail mode) a VM's
-                                  host CPU in percent of one, egress=<host>:<port>,... the
-                                  destinations its guests may connect to through the
-                                  wicket: names, addresses, ranges (10.0.0.0/24:5432,
-                                  [2001:db8::/32]:443)
+                                  room for its VM, 10000), mode=reuse (as per-connection, a
+                                  clone serving the next connection until kept unused for
+                                  keep-ms=N (60000), uses=N connections, lifetime-ms=N) or
+                                  mode=pool (vms=N clones each serving many connections,
+                                  warm=N kept (vms), grown by one while each holds conns=N
+                                  (16), one beyond warm idle keep-ms killed), vcpus=N (1),
+                                  mem=MiB (128), port=N (the guest's vsock port, 8080),
+                                  per-client=N a client address's connections at once,
+                                  idle-ms=N a connection may relay no byte, cpu=N (jail
+                                  mode) a VM's host CPU in percent of one,
+                                  egress=<host>:<port>,... the destinations its guests may
+                                  connect to through the wicket: names, addresses, ranges
+                                  (10.0.0.0/24:5432, [2001:db8::/32]:443)
   --config <file>                 YAML settings and routes, the routes reloaded on change
   --kernel <path>                 the guest kernel (vmlinux)
   --firecracker <path>            the firecracker binary (default firecracker on the PATH)
@@ -555,6 +560,10 @@ struct FileRoute {
     prime: Option<u32>,
     vms: Option<u32>,
     wait_ms: Option<u32>,
+    keep_ms: Option<u32>,
+    uses: Option<u32>,
+    lifetime_ms: Option<u32>,
+    conns: Option<u32>,
     cpu: Option<u32>,
     per_client: Option<u32>,
     idle_ms: Option<u32>,
@@ -572,6 +581,10 @@ impl FileRoute {
             ("prime", self.prime),
             ("vms", self.vms),
             ("wait-ms", self.wait_ms),
+            ("keep-ms", self.keep_ms),
+            ("uses", self.uses),
+            ("lifetime-ms", self.lifetime_ms),
+            ("conns", self.conns),
             ("per-client", self.per_client),
             ("idle-ms", self.idle_ms),
         ];
@@ -662,7 +675,10 @@ mod tests {
              10.0.0.0/24:6379]}\n",
         )
         .unwrap();
-        let vm = format!("b.local={}", rootfs.display());
+        let vm = format!(
+            "b.local={}?mode=pool&vms=4&warm=1&conns=8&keep-ms=60000",
+            rootfs.display()
+        );
         let config_flag = config.display().to_string();
 
         let settings = run(
@@ -713,6 +729,14 @@ mod tests {
                 rootfs.display()
             ),
             "the options set to other than their defaults, the egress in one order"
+        );
+        assert_eq!(
+            settings.specs[1].target(),
+            format!(
+                "firecracker:{}?mode=pool&warm=1&vms=4&conns=8",
+                rootfs.display()
+            ),
+            "a pool's warm by default its vms"
         );
 
         let settings = run(
@@ -782,7 +806,22 @@ mod tests {
         let no_port = format!("c.local={}?egress=db.internal", rootfs.display());
         let egress: Vec<String> = (0..64).map(|n| format!("db-{n}.internal:5432")).collect();
         let too_long = format!("c.local={}?egress={}", rootfs.display(), egress.join(","));
+        let shared_warm = format!("c.local={}?warm=1", rootfs.display());
+        let cloned_uses = format!("c.local={}?mode=per-connection&uses=2", rootfs.display());
+        let unsized_pool = format!("c.local={}?mode=pool&warm=1", rootfs.display());
         for (args, error) in [
+            (
+                vec!["--server", "s", "--kernel", "k", "--vm", &shared_warm],
+                "warm needs mode=per-connection, mode=reuse, mode=pool",
+            ),
+            (
+                vec!["--server", "s", "--kernel", "k", "--vm", &cloned_uses],
+                "uses needs mode=reuse",
+            ),
+            (
+                vec!["--server", "s", "--kernel", "k", "--vm", &unsized_pool],
+                "mode=pool needs vms",
+            ),
             (
                 vec!["--server", "s", "--kernel", "k", "--vm", &cpu],
                 "c.local: cpu needs jail mode",

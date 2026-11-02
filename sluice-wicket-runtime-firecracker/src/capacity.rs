@@ -7,8 +7,9 @@
 //! ([`Capacity::take`]), but for one held back by its route's cap alone, which
 //! keeps no other route waiting. A warm clone is restored only into room nobody
 //! waits for ([`Capacity::try_take`]), and gives its slot up to a VM that does:
-//! the first in line, finding no room within the global limits, has a warm clone
-//! of another route killed ([`Pool::evict`]).
+//! the first in line, finding no room within the global limits, has a spare VM
+//! of another route killed ([`Pool::evict`]) -- a warm clone, a reuse route's
+//! clone serving no connection, a pool's VM beyond its `warm` serving none.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
@@ -27,9 +28,9 @@ pub struct Need {
     pub cap: Option<usize>,
 }
 
-/// Warm clones a route keeps ahead of its connections.
+/// Spare VMs a route keeps: serving no connection, and not needed for one.
 pub trait Pool: Send + Sync {
-    /// Kills one idle clone, freeing its slot; false when there is none.
+    /// Kills one spare VM, freeing its slot; false when there is none.
     fn evict(&self) -> bool;
 }
 
@@ -51,14 +52,14 @@ struct State {
     /// asked.
     waiting: VecDeque<(u64, Need)>,
     next_ticket: u64,
-    /// Route -> its warm clones.
+    /// Route -> its spare VMs (a route may have more than one kind).
     pools: Vec<(u64, Weak<dyn Pool>)>,
 }
 
 /// Why a VM finds no room.
 #[derive(Debug, PartialEq, Eq)]
 enum Short {
-    /// `--max-vms` or `--max-memory`: another route's warm clone may give way.
+    /// `--max-vms` or `--max-memory`: another route's spare VM may give way.
     Global,
     /// The route's own cap.
     Route,
@@ -114,7 +115,7 @@ impl Capacity {
         })
     }
 
-    /// Lets a waiting VM of another route kill a warm clone of `pool`.
+    /// Lets a waiting VM of another route kill a spare VM of `pool`.
     pub fn register(&self, route: u64, pool: Weak<dyn Pool>) {
         self.state.lock().unwrap().pools.push((route, pool));
     }
@@ -161,7 +162,7 @@ impl Capacity {
     }
 
     /// A slot in turn, within `wait`. The first in line finding no room
-    /// within the global limits has a warm clone of another route killed.
+    /// within the global limits has a spare VM of another route killed.
     pub async fn take(self: &Arc<Self>, need: Need, wait: Duration) -> Result<Slot, Full> {
         let deadline = Instant::now() + wait;
         let ticket = {
@@ -193,14 +194,12 @@ impl Capacity {
                         self.changed.notify_waiters();
                         return Ok(slot);
                     }
-                    Some(Short::Global) if first => Self::pool(&mut state, need.route),
-                    _ => None,
+                    Some(Short::Global) if first => Self::pools(&mut state, need.route),
+                    _ => Vec::new(),
                 }
             };
-            // outside the lock: the clone's slot takes it on its way out
-            if let Some(pool) = evict
-                && pool.evict()
-            {
+            // outside the lock: the VM's slot takes it on its way out
+            if evict.iter().any(|pool| pool.evict()) {
                 continue;
             }
             tokio::select! {
@@ -222,15 +221,16 @@ impl Capacity {
         }
     }
 
-    /// A pool of another route than `route` to evict from, dropping the gone
-    /// ones.
-    fn pool(state: &mut State, route: u64) -> Option<Arc<dyn Pool>> {
+    /// The pools of other routes than `route` to evict from, in the order
+    /// they came, dropping the gone ones.
+    fn pools(state: &mut State, route: u64) -> Vec<Arc<dyn Pool>> {
         state.pools.retain(|(_, pool)| pool.strong_count() > 0);
         state
             .pools
             .iter()
             .filter(|(owner, _)| *owner != route)
-            .find_map(|(_, pool)| pool.upgrade())
+            .filter_map(|(_, pool)| pool.upgrade())
+            .collect()
     }
 
     /// A slot as soon as one fits with no VM waiting: a warm clone's.
@@ -347,11 +347,14 @@ mod tests {
         drop((small, third));
     }
 
-    /// The first in line short of global room has another route's warm clone
-    /// killed; a route at its own cap waits for its own VMs.
+    /// The first in line short of global room has another route's spare VM
+    /// killed, past the pools with none; a route at its own cap waits for its
+    /// own VMs.
     #[tokio::test(start_paused = true)]
     async fn a_wait_has_another_routes_warm_clone_give_way() {
         let capacity = Capacity::new(2, None);
+        let empty: Arc<dyn Pool> = Arc::new(Warm(Mutex::new(Vec::new()), AtomicUsize::new(0)));
+        capacity.register(4, Arc::downgrade(&empty));
         let warm = Arc::new(Warm(
             Mutex::new(vec![
                 capacity.try_take(need(128, 1, None)).unwrap(),

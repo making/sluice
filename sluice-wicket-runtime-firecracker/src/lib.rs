@@ -15,8 +15,9 @@
 //! verbatim to a vsock stream of a guest (framed, see `wire`, to carry
 //! half-closes), as the Java client relays to a TCP upstream; the guest's
 //! `/init` relays it on to the process's TCP port (`routes`). A route's VMs
-//! are either one shared VM, or a VM per connection cloned from a snapshot
-//! (`route`, `vm`), within the VMs' budget (`capacity`).
+//! are either one shared VM, or clones of a snapshot -- one per connection,
+//! reused by the next connections, or a pool serving many each -- (`route`, `vm`),
+//! within the VMs' budget (`capacity`).
 //!
 //! The processes' output in the VMs reaches the wicket's stdout / stderr, and
 //! with `--flume` the live access log (`output`, through `sluice-wicket-tunnel`'s

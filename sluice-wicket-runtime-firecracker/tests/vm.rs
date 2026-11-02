@@ -66,6 +66,10 @@ const CLONE_CPU: u32 = 50;
 /// capped.local's `idle-ms`: above what its checks take before its VMs idle out.
 const CAPPED_IDLE: Duration = Duration::from_secs(5);
 
+/// reuse.local's and pool.local's `keep-ms`: above what a check of theirs takes
+/// between connections.
+const KEEP: Duration = Duration::from_millis(1500);
+
 /// The launcher (`--launch-vm`) execs the program with the soft open file
 /// limit given (Firecracker grows its file table to the limit at its start, a
 /// cost that grows with it: 3ms at 1048576), the file size given (a guest's
@@ -130,6 +134,8 @@ async fn every_route_serves_http_through_the_tunnel() {
     // replaced below
     let dir = Scratch::new();
     std::fs::copy(&rootfs, dir.0.join("shared.ext4")).unwrap();
+    // the pool's VMs told by their files
+    std::fs::copy(&rootfs, dir.0.join("pool.ext4")).unwrap();
     let (port, v6) = destination().await;
     // the shared target's egress: the host's localhost, a name the host does not
     // resolve, a range, addresses the guest routes to itself, IPv6 where the host has it
@@ -156,8 +162,12 @@ async fn every_route_serves_http_through_the_tunnel() {
          - {{host: clone.local, rootfs: {rootfs}, mode: per-connection, warm: 2{cpu}, \
          egress: [localhost:{port}]}}\n\
          # the shared target again: its VM serves both hosts\n\
-         - {{host: alias.local, rootfs: shared.ext4, mode: shared, egress: [{shared_egress}]}}\n",
-        rootfs = rootfs.display()
+         - {{host: alias.local, rootfs: shared.ext4, mode: shared, egress: [{shared_egress}]}}\n\
+         - {{host: reuse.local, rootfs: {rootfs}, mode: reuse, uses: 3, keep-ms: {keep}}}\n\
+         - {{host: pool.local, rootfs: pool.ext4, mode: pool, vms: 2, warm: 1, conns: 1, \
+         keep-ms: {keep}}}\n",
+        rootfs = rootfs.display(),
+        keep = KEEP.as_millis()
     );
     let capped = format!(
         "- {{host: capped.local, rootfs: {}, mode: per-connection, vms: 2, wait-ms: 1000, \
@@ -213,7 +223,7 @@ async fn every_route_serves_http_through_the_tunnel() {
     let build = advertise.build.clone().expect("the wicket's build");
     assert_eq!(build.implementation, "sluice-wicket-runtime-firecracker");
     let hosts: Vec<_> = advertise.upstreams.iter().map(|up| &up.host).collect();
-    assert_eq!(hosts.len(), 4 + extra.len(), "{hosts:?}");
+    assert_eq!(hosts.len(), 6 + extra.len(), "{hosts:?}");
 
     let target = |host: &str| {
         let upstream = advertise.upstreams.iter().find(|up| up.host == host);
@@ -239,9 +249,20 @@ async fn every_route_serves_http_through_the_tunnel() {
             assert!(checked.is_ok(), "capped.local: hung; {}", wicket.log());
             continue;
         }
+        if route.host == "pool.local" {
+            // its VMs killed: they are the wicket's children unjailed
+            let pid = (!jailed && image.is_none()).then(|| wicket.child.id() as i32);
+            let pool = dir.0.join("pool.ext4");
+            let checked = tokio::time::timeout(HANG, route.pooled(&mut conn_id, pid, &pool));
+            assert!(checked.await.is_ok(), "pool.local: hung; {}", wicket.log());
+        }
         let before = counts.entry(upstream.target_url.clone()).or_insert(0);
         let checked = tokio::time::timeout(HANG, route.check(&mut conn_id, sample, before)).await;
         assert!(checked.is_ok(), "{}: hung; {}", route.host, wicket.log());
+        if route.host == "reuse.local" {
+            let checked = tokio::time::timeout(HANG, route.reused(&mut conn_id)).await;
+            assert!(checked.is_ok(), "reuse.local: hung; {}", wicket.log());
+        }
     }
 
     let egressed = egress(&tunnel, &target, &mut conn_id, &wicket, port, v6);
@@ -266,7 +287,7 @@ async fn every_route_serves_http_through_the_tunnel() {
     let reloaded = tunnel.advertise().await;
     let hosts: Vec<_> = reloaded.upstreams.iter().map(|up| &up.host).collect();
     assert!(!hosts.contains(&&"capped.local".to_string()), "{hosts:?}");
-    assert_eq!(hosts.len(), 3 + extra.len(), "{hosts:?}");
+    assert_eq!(hosts.len(), 5 + extra.len(), "{hosts:?}");
     std::fs::copy(&rootfs, dir.0.join("shared.ext4.new")).unwrap();
     std::fs::rename(dir.0.join("shared.ext4.new"), dir.0.join("shared.ext4")).unwrap();
     let shared = Route {
@@ -477,6 +498,28 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
             .unwrap();
         assert!(cleaned.success());
     }
+}
+
+/// The VMs of the wicket `pid` (unjailed: its children) with `rootfs` open.
+fn vms_on(pid: i32, rootfs: &Path) -> Vec<i32> {
+    let threads = std::fs::read_dir(format!("/proc/{pid}/task")).unwrap();
+    threads
+        .filter_map(|thread| thread.ok()?.file_name().to_str()?.parse().ok())
+        .flat_map(|thread: i32| {
+            std::fs::read_to_string(format!("/proc/{pid}/task/{thread}/children"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .filter_map(|child| child.parse().ok())
+                .collect::<Vec<i32>>()
+        })
+        .filter(|vm| {
+            std::fs::read_dir(format!("/proc/{vm}/fd")).is_ok_and(|mut fds| {
+                fds.any(|fd| {
+                    fd.is_ok_and(|fd| std::fs::read_link(fd.path()).is_ok_and(|to| to == rootfs))
+                })
+            })
+        })
+        .collect()
 }
 
 /// The children of `pid`.
@@ -768,7 +811,9 @@ impl Route<'_> {
         };
         let first = self.keep_alive(next()).await;
         let again = self.keep_alive(next()).await;
-        if sample {
+        // a pool's connections take turns on its VMs
+        if sample && !self.address.contains("mode=pool") {
+            // a reused clone counts on as a shared VM
             let shared = !self.address.contains("mode=per-connection");
             let base = if shared { *before } else { 0 };
             assert_eq!(
@@ -863,6 +908,100 @@ impl Route<'_> {
         );
     }
 
+    /// A reuse route of `uses=3`: a clone serves the next connection, until it served
+    /// three, or was kept unused for `keep-ms`.
+    async fn reused(&self, conn_id: &mut i64) {
+        let mut next = || {
+            *conn_id += 1;
+            *conn_id
+        };
+        // the clones of the checks before expired
+        tokio::time::sleep(KEEP + Duration::from_secs(1)).await;
+        for expected in [[1, 2, 3], [4, 5, 6], [7, 8, 9], [1, 2, 3]] {
+            assert_eq!(
+                served(&self.keep_alive(next()).await),
+                expected,
+                "{}",
+                self.host
+            );
+        }
+        tokio::time::sleep(KEEP + Duration::from_secs(1)).await;
+        assert_eq!(
+            served(&self.keep_alive(next()).await),
+            [1, 2, 3],
+            "{}: a clone kept past keep-ms",
+            self.host
+        );
+    }
+
+    /// A pool route of 2 VMs at most, 1 kept, growing as each holds `conns=1`: a
+    /// connection held, the next goes to a VM started for it; a third shares one of
+    /// them. Idle, the pool shrinks to one, and grows again with a VM of its own. With
+    /// the wicket's `pid` (its VMs its children), its VMs on `rootfs` killed: the next
+    /// connection gets a VM started in their place.
+    async fn pooled(&self, conn_id: &mut i64, pid: Option<i32>, rootfs: &Path) {
+        let mut next = || {
+            *conn_id += 1;
+            *conn_id
+        };
+        // the first VM has served nothing: its first answer counts 1, another VM's too
+        let (x, first, _) = self.held(next(), "").await;
+        assert_eq!(served(&[first]), [1], "{}: the first VM", self.host);
+        let (y, _) = self.fresh(&mut next).await;
+        let (z, third, _) = self.held(next(), "").await;
+        assert_ne!(served(&[third]), [1], "{}: past vms=2", self.host);
+        drop((x, y, z));
+        tokio::time::sleep(KEEP + Duration::from_secs(1)).await;
+        // the one left counts on; the next connection gets a VM of its own
+        let (p, kept, _) = self.held(next(), "").await;
+        assert_ne!(served(&[kept]), [1], "{}: the VM kept", self.host);
+        let (q, _) = self.fresh(&mut next).await;
+        drop((p, q));
+        let Some(pid) = pid else {
+            return;
+        };
+        let killed = vms_on(pid, rootfs);
+        assert_eq!(killed.len(), 2, "{}: its VMs: {killed:?}", self.host);
+        for &vm in &killed {
+            // SAFETY: kill
+            assert_eq!(unsafe { libc::kill(vm, libc::SIGKILL) }, 0);
+        }
+        // ended: gone, or a zombie (its sockets closed)
+        let ended = |vm: &i32| {
+            std::fs::read_to_string(format!("/proc/{vm}/stat")).map_or(true, |stat| {
+                stat.rsplit(") ")
+                    .next()
+                    .is_some_and(|rest| rest.starts_with('Z'))
+            })
+        };
+        while !killed.iter().all(ended) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let answer = self.half_closed(next()).await;
+        assert!(
+            answer.starts_with("HTTP/1.1 200"),
+            "{}: {answer:?}",
+            self.host
+        );
+        assert_eq!(served(&[answer]), [1], "{}: a VM in their place", self.host);
+    }
+
+    /// Connections held on the route, dropped until one gets a VM started for it (its
+    /// first answer counting 1); that one, its sender and its answer.
+    async fn fresh(
+        &self,
+        next: &mut impl FnMut() -> i64,
+    ) -> (hyper::client::conn::http1::SendRequest<Full<Bytes>>, String) {
+        loop {
+            let (sender, answer, _) = self.held(next(), "").await;
+            if served(std::slice::from_ref(&answer)) == [1] {
+                return (sender, answer);
+            }
+            drop(sender);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// A GET / on a connection of its own of a client of `client` (its address),
     /// kept open: its sender, its answer, and the connection's end.
     async fn held(
@@ -913,11 +1052,11 @@ impl Route<'_> {
         String::from_utf8_lossy(&body).into_owned()
     }
 
-    /// Three http/1.1 requests on one connection; their bodies.
+    /// Three http/1.1 requests on one connection, its end awaited; their bodies.
     async fn keep_alive(&self, conn_id: i64) -> Vec<String> {
         let io = TokioIo::new(self.tunnel.connect(conn_id, &self.address));
         let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await.unwrap();
-        tokio::spawn(connection);
+        let ended = tokio::spawn(connection.without_shutdown());
         let mut bodies = Vec::new();
         for path in ["/1", "/2", "/3"] {
             let request = hyper::Request::get(path)
@@ -931,6 +1070,12 @@ impl Route<'_> {
             let body = response.into_body().collect().await.unwrap().to_bytes();
             bodies.push(String::from_utf8_lossy(&body).into_owned());
         }
+        // the wicket's end of the connection read: its VM is done with it
+        drop(sender);
+        let mut io = ended.await.unwrap().unwrap().io.into_inner();
+        io.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        io.read_to_end(&mut rest).await.unwrap();
         bodies
     }
 

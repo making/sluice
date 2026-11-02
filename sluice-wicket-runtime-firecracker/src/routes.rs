@@ -6,7 +6,7 @@
 //! their files (the `--config` file, a rootfs, the kernel, the firecracker
 //! binary) or on SIGHUP. A reload reads the routes again and starts the VMs
 //! of every target that is new or whose spec or files changed -- a shared VM
-//! booted, a per-connection route's template booted and snapshotted again --
+//! booted, a cloned route's template booted and snapshotted again --
 //! before it changes anything: one failure keeps the current table. A target
 //! kept as it was keeps its VMs. A changed target serves its next connection
 //! from the new VMs; a connection open stays on the VMs it got, which end
@@ -32,7 +32,7 @@ use crate::BoxError;
 use crate::capacity::Capacity;
 use crate::config::RouteSource;
 use crate::output::Sink;
-use crate::route::{Lease, Mode, Route, RouteSpec};
+use crate::route::{Lease, Route, RouteSpec};
 use crate::vm::Places;
 use crate::wire;
 
@@ -107,12 +107,7 @@ impl Binding for Connection {
         let conn_id = io.conn_id();
         let ending = io.ending();
         let lease = self.route.open(io.client_address()).await;
-        // the share held until the VM ended
-        let Lease {
-            stream,
-            vm,
-            share: _share,
-        } = match lease {
+        let Lease { stream, hold } = match lease {
             Ok(lease) => lease,
             Err(e) => {
                 eprintln!("conn {conn_id} ({}): {e}", self.route.label());
@@ -126,6 +121,7 @@ impl Binding for Connection {
             // the server's ERROR or the stream's end: nothing is sent any more
             () = failed => Ok(()),
         };
+        let ended = hold.end(relayed.is_ok());
         match relayed {
             Ok(()) => ending.finish(),
             Err(e) => {
@@ -133,10 +129,7 @@ impl Binding for Connection {
                 ending.fail(&e.to_string());
             }
         }
-        // a per-connection VM ends with its connection
-        if let Some(vm) = vm {
-            vm.end().await;
-        }
+        ended.await;
     }
 }
 
@@ -501,8 +494,8 @@ impl Reloader {
     }
 }
 
-/// Whether the routes can start within `capacity`: their shared VMs for good,
-/// beside a template at a time (the largest).
+/// Whether the routes can start within `capacity`: their shared VMs and their pools'
+/// warm VMs for good, beside a template at a time (the largest).
 fn fits(specs: &[RouteSpec], capacity: &Capacity) -> Result<(), BoxError> {
     let mut targets: Vec<(String, &RouteSpec)> = Vec::new();
     for spec in specs {
@@ -511,21 +504,25 @@ fn fits(specs: &[RouteSpec], capacity: &Capacity) -> Result<(), BoxError> {
             targets.push((target, spec));
         }
     }
-    let shared = || targets.iter().filter(|(_, spec)| spec.mode == Mode::Shared);
     let template = targets
         .iter()
-        .filter(|(_, spec)| spec.mode == Mode::PerConnection)
+        .filter(|(_, spec)| spec.mode.cloned())
         .map(|(_, spec)| u64::from(spec.vm.mem_mib))
         .max();
-    let vms = shared().count() + usize::from(template.is_some());
-    let memory: u64 = shared()
-        .map(|(_, spec)| u64::from(spec.vm.mem_mib))
+    let vms = targets
+        .iter()
+        .map(|(_, spec)| spec.resident())
+        .sum::<usize>()
+        + usize::from(template.is_some());
+    let memory: u64 = targets
+        .iter()
+        .map(|(_, spec)| spec.resident() as u64 * u64::from(spec.vm.mem_mib))
         .sum::<u64>()
         + template.unwrap_or(0);
     if vms > capacity.max_vms() || capacity.max_memory().is_some_and(|max| memory > max) {
         return Err(format!(
             "the routes need {vms} VM(s) and {memory} MiB of guest memory to start (their shared \
-             VMs, and a template at a time): over --max-vms {} / --max-memory {}",
+             VMs, their pools' warm VMs, and a template at a time): over --max-vms {} / --max-memory {}",
             capacity.max_vms(),
             capacity
                 .max_memory()

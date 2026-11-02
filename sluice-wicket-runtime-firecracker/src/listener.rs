@@ -31,17 +31,16 @@ pub async fn run(listener: TcpListener, routes: Arc<Routes<Table>>, workers: Arc
                 return;
             };
             match route.open(&peer.ip().to_string()).await {
-                Ok(Lease {
-                    stream,
-                    vm,
-                    share: _share,
-                }) => {
-                    if let Err(e) = wire::relay(client, stream, route.spec.idle).await {
+                Ok(Lease { stream, hold }) => {
+                    let mut client = client;
+                    let relayed = wire::relay(&mut client, stream, route.spec.idle).await;
+                    // a reused clone kept before the client sees the end
+                    let ended = hold.end(relayed.is_ok());
+                    drop(client);
+                    if let Err(e) = relayed {
                         eprintln!("listener ({}): {e}", route.label());
                     }
-                    if let Some(vm) = vm {
-                        vm.end().await;
-                    }
+                    ended.await;
                 }
                 Err(e) => eprintln!("listener ({}): {e}", route.label()),
             }

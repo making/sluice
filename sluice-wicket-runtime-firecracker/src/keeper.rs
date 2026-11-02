@@ -90,7 +90,7 @@ const ID_WAIT_MS: i32 = 5000;
 pub enum Role {
     /// A shared VM: booted, serving the route's connections.
     Shared,
-    /// A per-connection route's template: booted, snapshotted into the route's
+    /// A cloned route's template: booted, snapshotted into the route's
     /// directory.
     Template,
     /// Restored from the route's snapshot (sealed).
@@ -476,7 +476,7 @@ impl Keeper {
             .create(dir.join("jail"))?;
         if !crate::state::on_tmpfs(&dir) {
             eprintln!(
-                "keeper: warning: {} is not on a tmpfs: a per-connection route's snapshot (its \
+                "keeper: warning: {} is not on a tmpfs: a cloned route's snapshot (its \
                  template's whole memory) is written to disk",
                 dir.display()
             );
