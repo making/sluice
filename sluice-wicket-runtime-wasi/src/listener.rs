@@ -2,7 +2,8 @@
 //! without a sluice server. Every connection is served as a tunnel one is
 //! (`wasm_host::serve_http`: http/1.1 or h2c sniffed, the same handlers,
 //! sandbox, pools and budgets), but each request finds its route by its
-//! host: the route of that host, or the sole route whatever the host.
+//! host: the route of that host, or the sole route whatever the host
+//! (`sluice_wicket_tunnel::routes::Table::sole`).
 
 use std::sync::Arc;
 

@@ -26,8 +26,9 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
                                   asked for its nodes, one tunnel stream to each
   --listen <host:port>            serve the routes over plain TCP too (no server needed),
                                   relayed as the tunnel's connections are: each by its
-                                  first request's host (Host, h2c :authority), a sole
-                                  route whatever the host, an unknown host answered 404
+                                  first request's host (Host, h2c :authority), a --vm
+                                  route alone without --console whatever the host, an
+                                  unknown host answered 404
   --vm <host>=<rootfs>[?<opts>]   a route served by Firecracker microVMs booted from the
                                   rootfs; repeatable. mode=shared (default: one VM serves
                                   every connection), mode=per-connection (a VM cloned from

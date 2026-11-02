@@ -151,7 +151,8 @@ mod tests {
     use crate::routes::Table as _;
     use crate::routes::testing::Fixed;
 
-    /// A host is routed ignoring its case and port; a sole route takes any host.
+    /// A host is routed ignoring its case and port; a route alone takes any host
+    /// only as its wicket says.
     #[test]
     fn a_host_takes_its_route_or_the_sole_one() {
         let two = Fixed::hosts(1, &["a.local", "[::1]"]);
@@ -164,9 +165,20 @@ mod tests {
         assert_eq!(routed(&two, "[::1]:8080").as_deref(), Some("[::1]"));
         assert_eq!(routed(&two, "b.local"), None);
         assert_eq!(routed(&two, ""), None);
-        let sole = Fixed::hosts(1, &["a.local"]);
+        let alone = Fixed::hosts(1, &["a.local"]);
+        assert_eq!(routed(&alone, "A.local").as_deref(), Some("a.local"));
+        assert_eq!(routed(&alone, "b.local"), None);
+        let sole = Fixed {
+            takes_any_host: true,
+            ..alone
+        };
         assert_eq!(routed(&sole, "b.local").as_deref(), Some("a.local"));
         assert_eq!(routed(&Fixed::hosts(1, &[]), "a.local"), None);
+        let several = Fixed {
+            takes_any_host: true,
+            ..Fixed::hosts(1, &["a.local", "b.local"])
+        };
+        assert_eq!(routed(&several, "c.local"), None);
     }
 
     /// The bytes filled are read again first, then the rest of the stream.

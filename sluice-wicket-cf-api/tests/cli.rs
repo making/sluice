@@ -1843,6 +1843,12 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     for app in ["vm", "kept"] {
         cf.ok(&["delete", app, "-r", "-f"]);
     }
+    assert_eq!(
+        get(&listen, "vm.localhost", "/", None).0,
+        404,
+        "the cf-api's route, alone, takes its own host only"
+    );
+    assert_eq!(get(&listen, "127.0.0.1", "/", None).0, 200);
     let path = "/api/apps/cf-api?owner=ops";
     let (status, removed) = console_api(reqwest::Method::DELETE, path, json!({}));
     assert_eq!(status, 200, "{removed}");

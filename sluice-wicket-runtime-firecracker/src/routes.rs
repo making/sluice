@@ -75,6 +75,8 @@ pub struct Table {
     routes: HashMap<String, Arc<Route>>,
     /// Host -> where its route comes from.
     origins: HashMap<String, Origin>,
+    /// The wicket has a console, editing its routes.
+    console: bool,
 }
 
 impl Table {
@@ -106,12 +108,11 @@ impl Table {
         }
     }
 
-    /// The route when one alone is advertised (`--listen`: whatever the host).
+    /// The route taking any host on `--listen`
+    /// (`sluice_wicket_tunnel::routes::Table::sole`), if one does.
     pub fn sole(&self) -> Option<Arc<Route>> {
-        match &self.advertised[..] {
-            [sole] => self.routes.get(&sole.target_url).cloned(),
-            _ => None,
-        }
+        let sole = sluice_wicket_tunnel::routes::Table::sole(self)?;
+        self.routes.get(&sole.target_url).cloned()
     }
 
     /// The route of `host` (no port) on `--listen`
@@ -142,6 +143,12 @@ impl sluice_wicket_tunnel::routes::Table for Table {
 
     fn advertised(&self) -> &[Upstream] {
         &self.advertised
+    }
+
+    /// A `--vm` route, on a wicket without a console: not a config file's, whose
+    /// routes come and go as well.
+    fn takes_any_host(&self, route: &Upstream) -> bool {
+        !self.console && self.origins.get(&route.host) == Some(&Origin::Flag)
     }
 
     fn bind(routes: &Arc<Routes<Table>>, address: &str) -> Result<Connection, String> {
@@ -435,6 +442,7 @@ impl Reloader {
                 advertised: Vec::new(),
                 routes: HashMap::new(),
                 origins: HashMap::new(),
+                console: source.deployed().is_some(),
             }),
             status: watch::Sender::new(Status::default()),
             source,
@@ -796,6 +804,7 @@ impl Reloader {
             advertised: current.advertised.clone(),
             routes,
             origins: current.origins.clone(),
+            console: current.console,
         });
     }
 
@@ -951,6 +960,7 @@ impl Reloader {
                     advertised: current.advertised.clone(),
                     routes: current.routes.clone(),
                     origins,
+                    console: current.console,
                 });
                 self.status.send_modify(|status| status.revision += 1);
             }
@@ -988,6 +998,7 @@ impl Reloader {
             advertised,
             routes,
             origins,
+            console: current.console,
         });
         self.status.send_modify(|status| status.revision += 1);
         Ok(change)
@@ -1087,6 +1098,7 @@ impl Reloader {
                 .map(|(target, route)| (target.clone(), route.clone()))
                 .collect(),
             origins: current.origins.clone(),
+            console: current.console,
         });
     }
 }
@@ -1173,4 +1185,36 @@ fn fits(specs: &[RouteSpec], capacity: &Capacity) -> Result<(), BoxError> {
         .into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A route takes any host alone, from a flag, on a wicket without a console.
+    #[test]
+    fn only_a_flag_route_alone_without_a_console_takes_any_host() {
+        let console = || Origin::Console {
+            deployed: String::new(),
+        };
+        for (origin, on_console, takes) in [
+            (Origin::Flag, false, true),
+            (Origin::Flag, true, false),
+            (Origin::Config, false, false),
+            (console(), true, false),
+        ] {
+            let table = Table {
+                generation: 1,
+                advertised: vec![Upstream {
+                    host: "a.local".into(),
+                    ..Default::default()
+                }],
+                routes: HashMap::new(),
+                origins: HashMap::from([("a.local".to_string(), origin.clone())]),
+                console: on_console,
+            };
+            let routed = sluice_wicket_tunnel::routes::Table::host_route(&table, "b.local");
+            assert_eq!(routed.is_some(), takes, "{origin:?}, console {on_console}");
+        }
+    }
 }

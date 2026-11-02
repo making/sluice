@@ -3,8 +3,8 @@
 //!
 //! A connection is routed once, by its first request (`head`): the route of its
 //! host -- the `Host` header, or the h2c `:authority` -- or the sole route
-//! whatever the host (`sluice_wicket_tunnel::routes::Table::host_route`), which
-//! reads nothing first: its guest may speak first. What was read is relayed
+//! whatever the host (`sluice_wicket_tunnel::routes::Table::sole`), which reads
+//! nothing first: its guest may speak first. What was read is relayed
 //! verbatim, as the rest: a later request of the connection, an h2 stream or a
 //! keep-alive request, stays on that route whatever its host, and no
 //! `X-Forwarded-*` header is added. An unknown host is answered 404; a

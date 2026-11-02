@@ -5,8 +5,7 @@ through the VM, a restart, an upgrade and a failed start of the VM, the outages 
 if a step behaves otherwise.
 
 Ports 18399 and 19399 (`LISTEN_PORT`, `CONSOLE_PORT`) are fixed: the cf-api's egress names the
-console's. On `--listen`, a sole route answers any host, so a host check after a removal proves
-nothing.
+console's.
 
 `./one-container.sh [jail]`: the cf-api's README, "On a Firecracker wicket", its commands taken from the
 page and run in order, but for images built from the work tree, names and free ports of its own;

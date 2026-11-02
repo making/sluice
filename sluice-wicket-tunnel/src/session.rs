@@ -871,6 +871,7 @@ mod tests {
         let table = |generation, hosts: &[&str]| Fixed {
             generation,
             advertised: hosts.iter().map(|host| upstream(host)).collect(),
+            takes_any_host: false,
         };
         assert!(!advertised.update(&table(2, &["a"])), "the same routes");
         assert!(!acknowledged(1));

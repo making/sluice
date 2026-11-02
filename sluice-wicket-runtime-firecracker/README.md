@@ -187,8 +187,9 @@ dials it verbatim, and the hosts of one target share its VMs.
 does: a local loop for trying a rootfs; `scripts/try.sh <rootfs> '<options>' [port]` runs the
 debug build so, on `a.local`, the arguments after the port the wicket's: `--vm
 b.local=<rootfs>` a second route). A connection goes to the route of its first request's host
-(the `Host` header, or the h2c `:authority`; the port left out, the case ignored), or, with a
-single route, to that route whatever its host, nothing read first (its guest may speak first).
+(the `Host` header, or the h2c `:authority`; the port left out, the case ignored). A single
+route given by `--vm`, on a wicket without `--console`, takes any host, nothing read first (its
+guest may speak first): not a route of the config file or the console, whose routes come and go.
 An unknown host is answered 404; a connection that is not HTTP, or whose head runs past 64KiB
 or takes over 10s, is closed. A process unaware of h2c answers prior-knowledge h2 with 502, as
 behind the Java client. The head is relayed verbatim with the rest: unlike the server,

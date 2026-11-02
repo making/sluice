@@ -10,7 +10,8 @@
 //! stderr and on a flume (`sluice-wicket-tunnel`'s double); the guests' egress to
 //! a destination on the host, by name, address, range and IPv6, from a shared VM
 //! and a clone, and its records; the routes through `--listen` as well, by host
-//! (http/1.1 and h2c, an unknown one answered 404); a reload of the `--config`
+//! (http/1.1 and h2c, an unknown one answered 404), a `--vm` route alone
+//! whatever the host; a reload of the `--config`
 //! file, polled, removing a route and replacing a rootfs; the console deploying
 //! one more route from an uploaded rootfs (refusing what it does not take),
 //! served on the tunnel, listed with its VMs, and an app of two hosts on one
@@ -505,6 +506,27 @@ async fn every_route_serves_http_through_the_tunnel() {
         let bodies =
             served_again.unwrap_or_else(|_| panic!("console.local: hung; {}", wicket.log()));
         assert_eq!(served(&bodies), [1, 2, 3]);
+        if !jailed {
+            drop(wicket);
+            let wicket = start(
+                &url,
+                &[
+                    "--listen".to_string(),
+                    "127.0.0.1:0".to_string(),
+                    "--vm".to_string(),
+                    format!("sole.local={}", rootfs.display()),
+                ],
+            );
+            let sole = Route {
+                tunnel: &tunnel,
+                host: "any.local",
+                address: String::new(),
+                listen: Some(wicket.listening()),
+            };
+            let answered = tokio::time::timeout(HANG, sole.keep_alive(1)).await;
+            let bodies = answered.unwrap_or_else(|_| panic!("any.local: hung; {}", wicket.log()));
+            assert_eq!(served(&bodies), [1, 2, 3]);
+        }
     }
 }
 

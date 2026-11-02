@@ -24,9 +24,7 @@ sluice-wicket-cf-api/demo/record-firecracker.sh
 ```
 
 It needs `vhs`, `ffmpeg`, `jq`, `curl`, `nc`, `limactl` and the OSS cf CLI v8 below. The wicket's log
-is in `../target/demo-firecracker/wicket.log`. The tape leaves `web` when it checks the 404: a
-[sole route](../../sluice-wicket-runtime-firecracker/README.md#run) takes any host, the cf-api's
-when no app is left.
+is in `../target/demo-firecracker/wicket.log`.
 
 The rest of this page is the wasi wicket's demo.
 

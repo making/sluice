@@ -354,6 +354,11 @@ routes:
     let wickets = [Wicket::start(&args), Wicket::start(&args)];
     let (a, b) = (wickets[0].address(), wickets[1].address());
 
+    assert_eq!(
+        get(&a, "b.local", "/").await.0,
+        404,
+        "a config file's route, alone, takes its own host only"
+    );
     count_at_once(&a, &b).await;
     assert_eq!(get(&b, "a.local", "/").await.1, "hits 21\n");
     assert_eq!(get(&a, "a.local", "/kv/cas-hits").await.1, "20");
@@ -455,6 +460,11 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
     let (status, body) = get(&address, "hello.localhost", "/").await;
     assert_eq!(status, 200);
     assert!(body.starts_with("hello from wasm"), "{body}");
+    assert_eq!(
+        get(&address, "other.localhost", "/").await.0,
+        404,
+        "a console's route, alone, takes its own host only"
+    );
 
     // a move takes the host alone: a sandbox left out would read as the defaults
     let mixed = "PATCH /api/routes/hello.localhost?host=greet.localhost&pool=1";

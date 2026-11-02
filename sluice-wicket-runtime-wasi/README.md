@@ -70,7 +70,8 @@ curl 127.0.0.1:8080/
 ```
 
 A request goes to the route of its host (the `Host` header, or the h2 authority; the port
-left out), or, with a single route, to that route whatever its host. An unknown host is
+left out). A single route given by `--wasm`, on a wicket without `--console`, takes any host: not
+a route of the config file or the console, whose routes come and go. An unknown host is
 answered 404. Both `--server` and `--listen` serve the tunnel and the listener at once.
 `--max-connections` bounds the listener's connections too, apart from the tunnel's (one
 beyond waits in the backlog). Without `--server` nothing drains: SIGTERM / SIGINT end the

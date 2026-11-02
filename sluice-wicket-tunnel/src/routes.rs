@@ -27,14 +27,29 @@ pub trait Table: Send + Sync + Sized + 'static {
     /// The upstreams every stream advertises.
     fn advertised(&self) -> &[Upstream];
 
+    /// Whether `route`, advertised alone, takes any host on a wicket's listener:
+    /// the local loop of a route given by a flag. Not on a wicket whose routes are
+    /// edited: a host left without a route is not another's.
+    fn takes_any_host(&self, route: &Upstream) -> bool;
+
+    /// The route taking any host on a wicket's listener, if one does.
+    fn sole(&self) -> Option<&Upstream> {
+        match self.advertised() {
+            [sole] if self.takes_any_host(sole) => Some(sole),
+            _ => None,
+        }
+    }
+
     /// The advertised route of `host` (no port, see
     /// [`crate::listener::host_of`]) on a wicket's listener, compared ignoring
-    /// case; or the sole route whatever the host. None for an unknown host.
+    /// case; or the [`Table::sole`] route whatever the host. None for an unknown
+    /// host.
     fn host_route(&self, host: &str) -> Option<&Upstream> {
-        match self.advertised() {
-            [sole] => Some(sole),
-            all => all.iter().find(|up| up.host.eq_ignore_ascii_case(host)),
-        }
+        self.sole().or_else(|| {
+            self.advertised()
+                .iter()
+                .find(|up| up.host.eq_ignore_ascii_case(host))
+        })
     }
 
     /// What serves a connection to `address` (the dial address the server
@@ -156,6 +171,8 @@ pub(crate) mod testing {
     pub(crate) struct Fixed {
         pub(crate) generation: u64,
         pub(crate) advertised: Vec<Upstream>,
+        /// See [`Table::takes_any_host`].
+        pub(crate) takes_any_host: bool,
     }
 
     impl Fixed {
@@ -171,6 +188,7 @@ pub(crate) mod testing {
                         ..Default::default()
                     })
                     .collect(),
+                takes_any_host: false,
             }
         }
     }
@@ -184,6 +202,10 @@ pub(crate) mod testing {
 
         fn advertised(&self) -> &[Upstream] {
             &self.advertised
+        }
+
+        fn takes_any_host(&self, _route: &Upstream) -> bool {
+            self.takes_any_host
         }
 
         fn bind(routes: &Arc<Routes<Fixed>>, address: &str) -> Result<Hello, String> {
