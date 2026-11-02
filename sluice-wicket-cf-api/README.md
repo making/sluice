@@ -82,7 +82,7 @@ as the OpenID Provider of the cf-api and of the wicket's console alike, its user
 configuration file. The apps are published on 28000 (8080 and its usual stand-ins are often taken), the
 cf-api (9091), the console (9090) and Dex (5556) on the host's loopback: `cf` and the browser run on that host (Docker Engine on
 Linux, Docker Desktop or OrbStack on macOS) or through an SSH tunnel
-(`ssh -L 9091:127.0.0.1:9091 -L 9090:127.0.0.1:9090 -L 5556:127.0.0.1:5556 <host>`). Dex is
+(`ssh -L 9091:127.0.0.1:9091 -L 9090:127.0.0.1:9090 -L 5556:127.0.0.1:5556 -L 28000:127.0.0.1:28000 <host>`). Dex is
 `dex.localhost` for everyone: the loopback to the browser (`*.localhost`), the service's alias
 on the Compose network to the cf-api and the wicket, so the ID tokens' issuer is one URL.
 
@@ -129,7 +129,7 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
     ports:
-      - "28000:8080"                # the apps
+      - "28000:28000"               # the apps: --listen, on the same port (the console links it)
       - "127.0.0.1:9090:9090"       # the console, from this host only
     volumes:
       - ./wicket.yaml:/etc/sluice/wicket.yaml:ro
@@ -162,7 +162,7 @@ volumes:
 ```yaml
 # wicket.yaml, next to compose.yaml (see the wicket's Configuration file); ${NAME} is the
 # wicket's environment
-listen: 0.0.0.0:8080            # the apps; with server and token also through a sluice server
+listen: 0.0.0.0:28000           # the apps; with server and token also through a sluice server
 console: 0.0.0.0:9090           # published on the host's loopback only
 console-token: ${CONSOLE_TOKEN}  # the cf-api's
 console-dir: /data/deployed     # in the volume, not next to this file
@@ -223,7 +223,7 @@ ADMIN_PASSWORD_HASH='$2y$10$cYEVeVIzJX6QWDQcjRUaNe1RHrXamph8BdMRzlR/LS7msAe83oJO
 docker compose up -d
 cf login -a http://127.0.0.1:9091 --sso    # open the URL it prints, log in at Dex (admin@example.com / secret), paste the code
 cf push hello -p hello/                    # hello/ holds hello.wasm, as in Run
-open http://127.0.0.1:9090/                # the wicket's console: signed in through Dex too
+# in a browser, http://127.0.0.1:9090/: the wicket's console, signed in through Dex too
 curl http://hello.localhost:28000/         # with APPS_DOMAIN: http://hello.apps.example.com:28000/
 cf create-service keyvalue redis kv        # the namespace cf/<instance guid> in Redis
 cf push counter -p counter/ --no-start
@@ -442,7 +442,7 @@ its users in its configuration file. The cf-api is a container next to the wicke
 on a volume of its own. The apps are published on 28000 (8080 and its usual stand-ins are often
 taken), the cf-api (9091), the console (9090) and Dex (5556) on the host's loopback: `cf` and the
 browser run on that host or through an SSH tunnel
-(`ssh -L 9091:127.0.0.1:9091 -L 9090:127.0.0.1:9090 -L 5556:127.0.0.1:5556 <host>`). Dex is
+(`ssh -L 9091:127.0.0.1:9091 -L 9090:127.0.0.1:9090 -L 5556:127.0.0.1:5556 -L 28000:127.0.0.1:28000 <host>`). Dex is
 `dex.localhost` for everyone: the loopback to the browser (`*.localhost`), the service's alias on
 the Compose network to the cf-api and the wicket, so the ID tokens' issuer is one URL.
 
@@ -475,7 +475,7 @@ services:
   wicket:
     image: ghcr.io/making/sluice/sluice-wicket-runtime-firecracker
     pull_policy: always
-    command: [--listen, 0.0.0.0:8080, --console, 0.0.0.0:9090, --flume, grpc://flume:8002, --oidc-issuer, http://dex.localhost:5556/dex]
+    command: [--listen, 0.0.0.0:28000, --console, 0.0.0.0:9090, --flume, grpc://flume:8002, --oidc-issuer, http://dex.localhost:5556/dex]
     environment:
       SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE_TOKEN: ${CONSOLE_TOKEN:?CONSOLE_TOKEN}    # the cf-api's
       SLUICE_WICKET_RUNTIME_FIRECRACKER_FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
@@ -490,7 +490,7 @@ services:
       - /run/sluice                 # the VMs' snapshots stay off the disk
     stop_grace_period: 40s          # the drain's 20s, and 20s for an app's disk
     ports:
-      - "28000:8080"                # the apps
+      - "28000:28000"               # the apps: --listen, on the same port (the console links it)
       - "127.0.0.1:9090:9090"       # the console, from this host only
     volumes:
       - wicket:/data    # the apps, their root filesystems and disks (deployed/)
@@ -569,7 +569,7 @@ docker compose cp wicket:/usr/local/share/sluice-wicket-runtime-firecracker/gues
 cf push hello -p hello/
 curl http://hello.localhost:28000/
 cf scale hello -i 2                        # a pool of 2 VMs, cloned from a snapshot
-open http://127.0.0.1:9090/                # the wicket's console: signed in through Dex too
+# in a browser, http://127.0.0.1:9090/: the wicket's console, signed in through Dex too
 ```
 
 `docker compose down` keeps the volumes: the next `up` serves the apps again, once their VMs have
