@@ -1,11 +1,12 @@
 //! A sample of what an image runs, for the tests of an image's rootfs: a static HTTP/1.1
 //! server on `PORT` answering what the process is as text -- its uid and gid, the owner and
 //! mode of each path of its arguments, its environment -- and printing a line per request,
-//! as a process's output. `SAMPLE_WAIT_MS` delays its listening, `SAMPLE_EXIT` has it exit
+//! as a process's output. `/egress?to=<host>:<port>` connects as a process does, half-closes
+//! and answers with what came. `SAMPLE_WAIT_MS` delays its listening, `SAMPLE_EXIT` has it exit
 //! instead, as a process failing to start does.
 
 use std::io::{Read as _, Write as _};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::fs::MetadataExt as _;
 
 fn main() {
@@ -33,13 +34,31 @@ fn main() {
             }
         }
         let line = String::from_utf8_lossy(&request);
-        println!("{}", line.lines().next().unwrap_or_default());
-        let body = answer();
+        let first = line.lines().next().unwrap_or_default();
+        println!("{first}");
+        let path = first.split(' ').nth(1).unwrap_or_default();
+        let body = match path.strip_prefix("/egress?to=") {
+            Some(to) => egress(to),
+            None => answer(),
+        };
         let _ = write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
+    }
+}
+
+fn egress(to: &str) -> String {
+    let exchanged = TcpStream::connect(to).and_then(|mut stream| {
+        stream.shutdown(Shutdown::Write)?;
+        let mut got = String::new();
+        stream.read_to_string(&mut got)?;
+        Ok(got)
+    });
+    match exchanged {
+        Ok(got) => format!("answer: {got}\n"),
+        Err(e) => format!("error: {to}: {e}\n"),
     }
 }
 

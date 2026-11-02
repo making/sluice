@@ -183,7 +183,7 @@ fn main() {
             );
         }
         // before the process starts: it may connect at once
-        egress.listen(launch.as_ref().map(|launch| launch.port), &log);
+        let port_held = egress.listen(launch.as_ref().map(|launch| launch.port), &log);
         let hook = launch.as_ref().map(|launch| Hook {
             argv: launch.restore.clone(),
             env: launch.env.clone(),
@@ -195,6 +195,15 @@ fn main() {
         tokio::spawn(control_loop(control, hook, log.clone()));
         if DISK.get().is_some_and(Result::is_err) {
             // no process without its disk: the wicket asks why
+            std::future::pending::<()>().await;
+        }
+        if port_held {
+            // no process: the wicket would take /init's listener for it
+            log.line(
+                Stream::Stderr,
+                b"guest: the process is not started: a rule of the egress holds its port",
+            );
+            log.exited();
             std::future::pending::<()>().await;
         }
         let port = match launch {

@@ -577,7 +577,9 @@ The process connects to them as named. Before it starts, `/init`:
 - routes each address and range to the guest itself (a local route on `lo`)
 - listens at each name's address and each address, at the rule's port, and at every address
   at a range's port: the process cannot listen at every address (`0.0.0.0`, Go's `:8080`)
-  on a rule's port, nor at all on a range's (on its own, `PORT`, `/init` says so)
+  on a rule's port, nor at all on a range's. On its own, `PORT`, `/init` says so, and where
+  its listener would answer for the process (a range's, `localhost`'s, `127.0.0.1`'s) starts
+  no process: the VM is refused
 
 and relays each connection over vsock (port 1026) to the wicket. The wicket checks the
 destination against the route's rules (a guest's root may ask for any), connects within 10s

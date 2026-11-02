@@ -93,10 +93,12 @@ impl Egress {
 
     /// Routes the addresses to the guest and listens at the destinations, before the
     /// process starts (`own`: the port it listens on, launcher mode's); tells `log` what
-    /// it did, and what went wrong.
-    pub fn listen(mut self, own: Option<u16>, log: &Arc<Log>) {
+    /// it did, and what went wrong. Whether /init itself then answers at the process's
+    /// `127.0.0.1:own`, where a process counts as listening: it could not, and it would seem
+    /// to.
+    pub fn listen(mut self, own: Option<u16>, log: &Arc<Log>) -> bool {
         if self.rules.is_empty() && self.errors.is_empty() {
-            return;
+            return false;
         }
         // SAFETY: a NUL-terminated name
         let lo = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
@@ -169,6 +171,11 @@ impl Egress {
         for error in self.errors {
             log.line(Stream::Stderr, format!("guest: egress {error}").as_bytes());
         }
+        listening.iter().any(|address| {
+            Some(address.port()) == own
+                && (address.ip() == IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                    || address.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
+        })
     }
 }
 
