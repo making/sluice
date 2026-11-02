@@ -62,7 +62,15 @@ impl Controller {
                 name: running.file.clone(),
             },
             sandbox: match running.file.ends_with(crate::staging::ROOTFS) {
-                true => vm_sandbox(running.memory_mib, app.process.instances, &running.env),
+                true => vm_sandbox(
+                    running.memory_mib,
+                    app.process.instances,
+                    app.process
+                        .health_check
+                        .timeout
+                        .unwrap_or(DEFAULT_HEALTH_CHECK_TIMEOUT),
+                    &running.env,
+                ),
                 false => Sandbox {
                     wasi: running.wasi.clone(),
                     budget_ms: running.budget_ms,
@@ -251,7 +259,13 @@ impl Controller {
             Err(_) => {}
         }
         let image = self.store.read(|state| {
-            let droplet = state.droplets.iter().find(|kept| kept.sha256 == sha256)?;
+            // the newest of that digest: an older one's package, and its credentials, may
+            // be gone, the same image pushed again
+            let droplet = state
+                .droplets
+                .iter()
+                .rev()
+                .find(|kept| kept.sha256 == sha256)?;
             let image = droplet.image.clone()?;
             let credentials = state
                 .packages
@@ -422,10 +436,26 @@ impl Controller {
     }
 }
 
+/// Cloud Controller's `default_health_check_timeout`: the seconds an app's process has to
+/// listen.
+const DEFAULT_HEALTH_CHECK_TIMEOUT: u64 = 60;
+
+/// Its `maximum_health_check_timeout`.
+const MAXIMUM_HEALTH_CHECK_TIMEOUT: u64 = 180;
+
+/// What a Firecracker wicket does not list of a route's `boot-ms`: its default.
+const WICKET_DEFAULT_BOOT_MS: u64 = 10_000;
+
 /// A rootfs's sandbox on a Firecracker wicket: `instances` VMs, as a process's are. One
 /// is a shared VM, booted at once; more, a pool cloned from a snapshot; none still
-/// serves, as on a wasm wicket: a VM of its own per connection.
-fn vm_sandbox(memory_mib: u64, instances: u64, env: &BTreeMap<String, String>) -> Sandbox {
+/// serves, as on a wasm wicket: a VM of its own per connection. Its process has `timeout`
+/// seconds to listen.
+fn vm_sandbox(
+    memory_mib: u64,
+    instances: u64,
+    timeout: u64,
+    env: &BTreeMap<String, String>,
+) -> Sandbox {
     let (mode, vms) = match instances {
         0 => ("per-connection", None),
         1 => ("shared", None),
@@ -435,6 +465,7 @@ fn vm_sandbox(memory_mib: u64, instances: u64, env: &BTreeMap<String, String>) -
         mode: Some(mode.into()),
         mem: Some(memory_mib),
         vms,
+        boot_ms: Some(timeout.clamp(1, MAXIMUM_HEALTH_CHECK_TIMEOUT) * 1000),
         env: env.clone(),
         ..Sandbox::default()
     }
@@ -473,6 +504,9 @@ fn same(listed: &AppBody, desired: &AppBody) -> bool {
         && listed.sandbox.mode == desired.sandbox.mode
         && listed.sandbox.mem == desired.sandbox.mem
         && listed.sandbox.vms == desired.sandbox.vms
+        && desired.sandbox.boot_ms.is_none_or(|boot_ms| {
+            listed.sandbox.boot_ms.unwrap_or(WICKET_DEFAULT_BOOT_MS) == boot_ms
+        })
         && listed.tag == desired.tag
 }
 
@@ -544,7 +578,7 @@ mod tests {
         let body = serde_json::to_value(&desired).unwrap();
         assert_eq!(
             body["sandbox"],
-            serde_json::json!({"mode": "pool", "mem": 64, "vms": 2, "env": {"GREETING": "hello"}})
+            serde_json::json!({"mode": "pool", "mem": 64, "vms": 2, "boot-ms": 60_000, "env": {"GREETING": "hello"}})
         );
         // as the wicket lists it: its vCPUs too, the env by its names
         let mut listed = body;
@@ -554,12 +588,27 @@ mod tests {
         assert!(same(&listed, &desired));
         listed.sandbox.vms = Some(3);
         assert!(!same(&listed, &desired));
+        listed.sandbox.vms = Some(2);
+        listed.sandbox.boot_ms = Some(10_000);
+        assert!(!same(&listed, &desired));
+        // the wicket's default goes unlisted
+        let mut asked = desired.clone();
+        asked.sandbox.boot_ms = Some(10_000);
+        listed.sandbox.boot_ms = None;
+        assert!(same(&listed, &asked));
+        // the health check's timeout, within Cloud Controller's maximum
+        for (timeout, boot_ms) in [(None, 60_000), (Some(5), 5_000), (Some(9_999), 180_000)] {
+            let app = state.app_mut(&guid).unwrap();
+            app.process.health_check.timeout = timeout;
+            let desired = Controller::desired(&state, state.app(&guid).unwrap(), "cf").unwrap();
+            assert_eq!(desired.sandbox.boot_ms, Some(boot_ms));
+        }
         for (instances, mode, vms) in [
             (0, "per-connection", None),
             (1, "shared", None),
             (3, "pool", Some(3)),
         ] {
-            let sandbox = vm_sandbox(64, instances, &BTreeMap::new());
+            let sandbox = vm_sandbox(64, instances, 60, &BTreeMap::new());
             assert_eq!((sandbox.mode.as_deref(), sandbox.vms), (Some(mode), vms));
         }
         // a removal the wicket did not take is tried again, but for another owner's app

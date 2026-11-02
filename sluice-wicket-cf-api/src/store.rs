@@ -477,7 +477,7 @@ impl State {
             process: Process {
                 guid: guid(),
                 instances: 1,
-                memory_mb: 256,
+                memory_mb: 1024, // Cloud Controller's default_app_memory
                 disk_mb: 1024,
                 log_rate_limit: -1,
                 command: None,

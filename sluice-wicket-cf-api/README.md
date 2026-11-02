@@ -602,14 +602,16 @@ The wicket's listing says `runtime: firecracker`.
 
 | CF | wicket |
 |---|---|
-| package (docker) | any container image, `--docker-username` with `CF_DOCKER_PASSWORD` its credentials: the build has the wicket make its rootfs (`PUT /api/images`), which pulls it. Listening on `PORT`, as on CF |
+| package (docker) | any container image, `--docker-username` with `CF_DOCKER_PASSWORD` its credentials: the build has the wicket make its rootfs (`PUT /api/images`), which pulls it. Listening on `PORT`, as on CF. Spring Boot reads `SERVER_PORT`, not `PORT`: its default fits, an app with another `server.port` takes `cf set-env <app> SERVER_PORT 8080` |
 | package (bits) | a zip holding the rootfs, `.ext4` as a component's `.wasm` is picked (160 MiB at most, unpacking to 4 GiB at most: an image is the way for more) |
 | droplet | the rootfs by sha256 (stack `firecracker`, buildpack `rootfs`; an image's has neither, as on CF): the wicket keeps an image's, the cf-api its reference pinned to the manifest's digest, and has it made again when the wicket lost it (the same digest, unless the wicket's guest changed) |
 | web process `instances` | 1: a shared VM; more: `mode=pool`, that many VMs cloned from a snapshot; 0: a VM of its own per connection, killed when it ends |
-| web process `memory` | `mem` |
+| web process `memory` | `mem`, 1G by default as on CF: less fails a CNB Java image's memory calculator at its start. A pool's snapshot takes that much of the host's memory (`--tmpfs /run/sluice`): `cf scale -m` a small app |
+| web process `health_check` `timeout` (`cf push -t`) | `boot-ms`, 60s by default and 180s at most as on CF: how long the process may take to listen, in the request that starts it. A process exiting first is refused at once |
 | environment variables, `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: the process's environment, over the image's (its `PORT` is `/init`'s) |
 | disk | no effect: the rootfs is read-only and `/tmp` a tmpfs of the VM's memory; a persistent disk is the wicket API's, with no CF counterpart |
 | services | none: the listing offers neither capabilities nor keyvalue stores |
+| outbound connections | none: the wicket's `egress` has no CF counterpart here, an app reaches no other host |
 | `cf logs` | the process's output, instance 0; no `RTR` line: this wicket feeds no requests to the flume |
 | annotations | no effect: a VM's sandbox is its `mode`, `mem`, `vms` and `env` |
 

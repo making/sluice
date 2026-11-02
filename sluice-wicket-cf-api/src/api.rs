@@ -36,11 +36,11 @@ use crate::services;
 use crate::staging::{self, Hashed};
 use crate::store::{
     BUDGET_ANNOTATION, Blob, Build, Deployment, DockerImage, INSTANCES_ANNOTATION, JobError,
-    Lifecycle, Package, Running, Spool, State, Store, epoch_secs, guid, now,
+    Lifecycle, Outcome, Package, Running, Spool, State, Store, epoch_secs, guid, now,
 };
 use crate::uaa::{self, Uaa};
 use crate::views;
-use crate::wicket::{Failure, Runtime};
+use crate::wicket::{AppBody, Failure, Runtime};
 
 /// Largest package upload, and component pulled.
 pub(crate) const MAX_UPLOAD_BYTES: usize = 160 << 20;
@@ -1129,7 +1129,7 @@ impl Api {
         })?;
         let mut applied: Vec<&str> = Vec::new();
         for (guid, desired) in &trial {
-            match self.controller.apply(guid, desired.as_ref()).await {
+            match self.trial_put(guid, desired.as_ref()).await {
                 Ok(()) | Err(Failure::Unreachable(_)) => applied.push(guid),
                 Err(refused) => {
                     // the apps put before go back to what the state has
@@ -1141,6 +1141,27 @@ impl Api {
             }
         }
         self.store.update(|state| change(state))
+    }
+
+    /// Puts an app as an edit would leave it. An app the wicket is not known to serve (it
+    /// refused it, or a client gave up on its start) has nothing to break: refused it goes
+    /// through, or what would fix the app (a push of another image, more memory) could not
+    /// be made. As it was, it is not tried: the refusal is known, and may have taken the
+    /// health check's whole timeout.
+    async fn trial_put(&self, guid: &str, desired: Option<&AppBody>) -> Result<(), Failure> {
+        let (serving, unchanged) = self.store.read(|state| {
+            (
+                matches!(state.wicket.get(guid), Some(Outcome::Running)),
+                self.controller.desired_of(state, guid).as_ref() == desired,
+            )
+        });
+        if !serving && unchanged {
+            return Ok(());
+        }
+        match self.controller.apply(guid, desired).await {
+            Err(Failure::Refused { .. }) if !serving => Ok(()),
+            put => put,
+        }
     }
 
     // --- the manifest
@@ -1196,7 +1217,7 @@ impl Api {
             {
                 continue;
             }
-            match self.controller.apply(guid, desired.as_ref()).await {
+            match self.trial_put(guid, desired.as_ref()).await {
                 Ok(()) | Err(Failure::Unreachable(_)) => applied.push(guid),
                 Err(refused) => {
                     for guid in applied {

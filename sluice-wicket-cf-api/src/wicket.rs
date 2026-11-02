@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 /// A PUT may compile the component: generous.
-const EDIT_TIMEOUT: Duration = Duration::from_secs(120);
+const EDIT_TIMEOUT: Duration = Duration::from_secs(240);
 /// A rootfs made of an image, or uploaded (4 GiB at most): minutes, the wicket's own bound of
 /// a make a little within it.
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(660);
@@ -79,6 +79,9 @@ pub struct Sandbox {
     /// A Firecracker wicket's: its pool's VMs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vms: Option<u64>,
+    /// A Firecracker wicket's: how long a VM's process may take to listen.
+    #[serde(rename = "boot-ms", skip_serializing_if = "Option::is_none")]
+    pub boot_ms: Option<u64>,
     /// Put, never read back: the app's tag tells what the wicket serves.
     #[serde(skip_deserializing, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,

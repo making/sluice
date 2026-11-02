@@ -1258,6 +1258,9 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     assert_eq!(listed["runtime"], "firecracker");
     assert_eq!(fc["hosts"], json!(["fc.localhost"]));
     assert_eq!(fc["sandbox"]["mode"], "shared");
+    // as Cloud Controller's defaults: what a JVM needs of memory and of time to listen
+    assert_eq!(fc["sandbox"]["mem"], 1024);
+    assert_eq!(fc["sandbox"]["boot-ms"], 60_000);
     assert!(
         fc["sandbox"]["env"]
             .as_array()
@@ -1281,6 +1284,45 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         assert!(Instant::now() < deadline, "the app's lines never came");
         std::thread::sleep(Duration::from_millis(500));
     }
+
+    // a process exiting before it listens is refused at once, not at the health check's
+    // timeout (60s), its output in the logs; a push over the crashed app goes through
+    cf.ok(&["set-env", "fc", "SAMPLE_EXIT", "1"]);
+    let started = Instant::now();
+    cf.fails(&["restart", "fc"]);
+    assert!(started.elapsed() < Duration::from_secs(30), "not at once");
+    let logs = cf.ok(&["logs", "fc", "--recent"]);
+    assert!(logs.contains("sample process: exiting as told"), "{logs}");
+    assert!(logs.contains("exited before it listened"), "{logs}");
+    cf.ok(&["unset-env", "fc", "SAMPLE_EXIT"]);
+    let pushed = |extra: &[&str]| {
+        let mut args = vec![
+            "push",
+            "fc",
+            "--docker-image",
+            &image,
+            "--docker-username",
+            "robot",
+        ];
+        args.extend_from_slice(extra);
+        let mut push = cf.command(&args);
+        push.env("CF_DOCKER_PASSWORD", "p4ss");
+        cf.output(push, "")
+    };
+    let (ok, output) = pushed(&["-m", "512M"]);
+    assert!(ok, "{output}");
+    assert_eq!(listing(&console)["apps"][0]["sandbox"]["mem"], 512);
+    // cf push -t is how long it may take to listen
+    cf.ok(&["set-env", "fc", "SAMPLE_WAIT_MS", "3000"]);
+    let (ok, output) = pushed(&["-t", "1"]);
+    assert!(!ok, "{output}");
+    assert!(output.contains("within 1s"), "{output}");
+    let (ok, output) = pushed(&["-t", "20"]);
+    assert!(ok, "{output}");
+    assert_eq!(listing(&console)["apps"][0]["sandbox"]["boot-ms"], 20_000);
+    assert_eq!(get(&listen, "fc.localhost", "/", None).0, 200);
+    cf.ok(&["unset-env", "fc", "SAMPLE_WAIT_MS"]);
+    cf.ok(&["restart", "fc"]);
 
     // the wicket restarted, back at the revision it had: the app shows starting while the
     // wicket is down, and running again once it is back
