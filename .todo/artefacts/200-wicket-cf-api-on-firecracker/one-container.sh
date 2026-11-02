@@ -53,7 +53,7 @@ docker build -q -f "$repo/sluice-wicket-cf-api/Dockerfile" -t "$registry/test/cf
 # the page's <n>th block of commands of the section
 block() {
   awk -v wanted="$1" '
-    /^### On a Firecracker wicket$/ { section = 1; next }
+    /^## On a Firecracker wicket$/ { section = 1; next }
     section && /^## / { section = 0 }
     section && /^```text$/ { n++; inside = 1; next }
     inside && /^```$/ { inside = 0; next }

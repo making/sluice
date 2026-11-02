@@ -1,33 +1,47 @@
 # sluice-wicket-cf-api
 
-A Cloud Foundry API facade for one [sluice-wicket-runtime-wasi](../sluice-wicket-runtime-wasi/README.md): the
-subset of the Cloud Controller v3 API, the UAA token endpoints and log-cache's read API the
-stock `cf` CLI uses, on one origin. It keeps the desired state of its apps and has the wicket
-serve them through the wicket's [app API](../sluice-wicket-runtime-wasi/README.md#apps), so a wasm
-component is deployed with `cf push` (its bits, or an image in an OCI registry:
-`--docker-image`), and routes, scaling, rolling updates, stop and start,
-services (the wicket's keyvalue stores and capabilities) and `cf logs` work as the CLI expects.
-Pointed at a [sluice-wicket-runtime-firecracker](../sluice-wicket-runtime-firecracker/README.md#apps)
-instead, `cf push --docker-image` deploys a container image, a CNB image say, as microVMs
-(see [On a Firecracker wicket](#on-a-firecracker-wicket)). Users log in through an OpenID Provider (`cf login --sso`; see [Login](#login)), or, on the
-loopback, with any credentials.
+A Cloud Foundry API facade for one sluice wicket: the subset of the Cloud Controller v3 API, the
+UAA token endpoints and log-cache's read API the stock `cf` CLI uses, on one origin. It keeps the
+desired state of its apps and has the wicket serve them through the wicket's app API, so routes,
+scaling, rolling updates, stop and start and `cf logs` work as the CLI expects. Users log in
+through an OpenID Provider (`cf login --sso`; see [Login](#login)), or, on the loopback, with any
+credentials.
+
+What `cf push` deploys depends on the wicket, whose listing names its runtime:
+
+| | [On a wasi wicket](#on-a-wasi-wicket) | [On a Firecracker wicket](#on-a-firecracker-wicket) |
+|---|---|---|
+| the wicket | [sluice-wicket-runtime-wasi](../sluice-wicket-runtime-wasi/README.md#apps) | [sluice-wicket-runtime-firecracker](../sluice-wicket-runtime-firecracker/README.md#apps) |
+| an app | a wasm component: its bits, or an image in an OCI registry | a container image, a CNB image say, or a rootfs in a zip: microVMs |
+| the cf-api | a process or a container next to the wicket | an app of the wicket, in a VM with a disk, or next to it |
+| services | the wicket's keyvalue stores and capabilities | none |
+| `cf logs` | the app's output and requests | the process's output |
+
+The rest holds for both: [Options](#options), [Mapping](#mapping), [Behavior](#behavior),
+[Login](#login), [Limits](#limits), [Tests](#tests).
 
 ```text
-cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> sluice-wicket-runtime-wasi <--tunnel-- sluice server
-                                             ^                                  |
-                                             +--Watch-- sluice-flume <--Feed----+  (cf logs, optional)
+cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> a wicket <--tunnel-- sluice server
+                                             ^                             |
+                                             +--Watch-- sluice-flume <--Feed  (cf logs, optional)
 ```
 
 The `cf` here is the OSS CLI ([cloudfoundry/cli](https://github.com/cloudfoundry/cli) v8, whose
 archive holds it as `cf` and `cf8`); the Tanzu distribution (`cf` 10.x) reads `/v3/info` and
 refuses any other platform.
 
+## On a wasi wicket
+
+A wasm component deployed with `cf push`, from its bits or an image in an OCI registry
+(`--docker-image`), with the wicket's keyvalue stores and capabilities as
+[services](#services).
+
 [![cf login --sso through Dex, cf push, routes, scale, environment variables, a keyvalue service and cf logs against a wicket in local mode](demo/sluice-cf-demo.gif)](demo/sluice-cf-demo.mp4)
 
 The GIF links to the [MP4](demo/sluice-cf-demo.mp4); both are recorded by `demo/record.sh`
 ([demo/README.md](demo/README.md)).
 
-## Run
+### Run
 
 ```text
 cargo build --release                                # needs protoc, and git (the build embeds the commit)
@@ -46,7 +60,7 @@ target/release/sluice-wicket-cf-api --wicket http://127.0.0.1:9090 --wicket-toke
 cf login -a http://127.0.0.1:9091 -u me -p x   # any credentials: no --oidc-issuer (see Login)
 cf push hello -p hello/                        # hello/ holds hello.wasm (a wasi:http 0.3 component)
 curl http://hello.localhost:8080/              # the wicket's --listen; *.localhost is the loopback
-# an image (see Mapping): the wicket's hello example, as its CI publishes it
+# an image (see Images): the wicket's hello example, as its CI publishes it
 cf push img --docker-image ghcr.io/making/sluice/sluice-wicket-runtime-wasi/examples/hello
 cf map-route hello localhost --hostname hi
 cf scale hello -i 2
@@ -59,32 +73,7 @@ cf bind-service counter kv
 cf start counter                               # a binding applies at the next start
 ```
 
-| option | |
-|---|---|
-| `--listen <host:port>` | bind address (default `127.0.0.1:9091`); without `--oidc-issuer` a loopback address only, as the API takes any credentials then |
-| `--wicket <url>` | the wicket's console, `http://host:port` |
-| `--wicket-token <token>` / `--wicket-token-file <path>` | its `--console-token` |
-| `--domain <name>` | a shared domain; repeatable (or comma-separated): the first takes the default and random routes (default `localhost`). Through a sluice server, a suffix whose wildcard DNS reaches it |
-| `--data-dir <path>` | the state and the blobs (default `cf-api`): `state.json` (written by a rename on every change), `jwt.key` and `sessions.json` (the logins), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app) |
-| `--org <name>` / `--space <name>` | the one organization and space (default `sluice` / `wicket`) |
-| `--flume <url>` | the sluice-flume the wicket feeds (`grpc://host:port` / `grpcs://host:port`): the apps' output and requests reach `cf logs` from it |
-| `--flume-token <token>` / `--flume-token-file <path>` | its bearer token |
-| `--flume-ca-cert <path>` / `--flume-insecure` | a `grpcs://` flume verified against this PEM CA (default the webPKI roots), or not at all |
-| `--oidc-issuer <url>` | the OpenID Provider users log in through (`cf login --sso`); its discovery document is at `<url>/.well-known/openid-configuration` |
-| `--oidc-client-id <id>` | the client registered with the provider, whose redirect URI is `<API URL>/uaa/callback` (required with `--oidc-issuer`) |
-| `--oidc-client-secret <secret>` / `--oidc-client-secret-file <path>` | its secret; none = a public client (PKCE only) |
-| `--oidc-claim <claim>=<pattern>` | who may log in: the ID token's claim must hold (a list claim: contain) the pattern, `*` matching any run of characters; repeatable (or comma-separated). One claim's patterns are alternatives, distinct claims must all hold. At least one rule is required with `--oidc-issuer` (`email=*` lets anyone the provider knows in) |
-| `--oidc-scopes <list>` | the scopes asked for, comma-separated (default `openid,email,profile`; Dex sends the `groups` claim for the scope `groups`) |
-| `--oidc-ca-cert <path>` | a PEM CA the provider's certificate is verified against (default the webPKI roots) |
-| `--client-credentials <id>:<secret>` / `--client-credentials-file <path>` | a client of `cf auth <id> <secret> --client-credentials` (CI); repeatable, the file one per line. With `--oidc-issuer` only |
-| `--tls-cert <path>` / `--tls-key <path>` | serve TLS: the certificate chain and its private key, PEM. Without them, behind a TLS proxy, `X-Forwarded-Proto: https` makes the links `https` |
-| `--exit-on-stdin-close` | exit when stdin reaches its end (a parent's child process) |
-
-Each option also reads `SLUICE_WICKET_CF_API_<NAME>` from the environment. The image
-`ghcr.io/making/sluice/sluice-wicket-cf-api` (`latest` / `<sha>`, built from
-`Dockerfile` at the repository root) keeps `/data` as the working directory; without
-`--oidc-issuer` it listens on the loopback, so it is reached from the wicket's network
-namespace (`--network host`, a sidecar, `kubectl port-forward`).
+The options are in [Options](#options).
 
 ### Docker Compose
 
@@ -251,16 +240,71 @@ group and allow the group (`groups=devs`, with the scopes `openid,email,profile,
 [connector](https://dexidp.io/docs/connectors/) replaces the static users with GitHub, LDAP,
 another OpenID Provider and the like.
 
-### On a Firecracker wicket
+### Mapping to components
+
+| CF | wicket |
+|---|---|
+| package (bits) | the uploaded zip: `cf push` takes a directory or a zip (`-p hello.wasm` fails in the CLI: `not a valid zip file`) |
+| package (docker) | an image (`cf push --docker-image`, a manifest's `docker.image`) holding the component as one `application/wasm` layer, as `wkg oci push` and `oras push <ref> hello.wasm:application/wasm` push it (of an index, its `wasm` entry). `--docker-username` with `CF_DOCKER_PASSWORD` are its credentials |
+| build | picks the component: the one the web process command names (`-c hello.wasm`, `command:`), else the package's only `.wasm`; of an image, pulls it. It must be a component (`\0asm`, layer 1). Anything else fails the build, naming what it found |
+| droplet | that component, by sha256 (`process_types.web` its path; stack `wasip3`, buildpack `wasm`); of an image, the image by digest (`cf app`: `docker image:`), `process_types.web` the repository's last segment `.wasm` |
+| web process `instances` | `pool`: warm instances, taking the requests in turn. A request beyond them gets an instance of its own, as on every route: 0 still serves. `cf logs` names the instance (`APP/PROC/WEB/<index>`, the requests' `app_index`): a warm one's `0` to `instances - 1`, one of its own the lowest index free from `instances` up |
+| web process `memory` | `memory-mib` |
+| annotations `wicket.sluice.ik.am/budget-ms`, `wicket.sluice.ik.am/instances` | `budget-ms`, `instances` (the route's cap; below `pool` the wicket refuses) |
+| environment variables (`cf set-env`, a manifest's `env:`), `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: what the guest's `wasi:cli/environment` answers |
+| disk | accepted and shown, no effect |
+| service offering `keyvalue`, plan `<store>` | a keyvalue store of the wicket (`keyvalue.stores`, else `local`) |
+| service offering `wasi`, plan `<capability>` | a capability of the sandbox's `wasi`: `cli`, `inherit-network`, `allow-ip-name-lookup`, `tcp`, `udp` |
+| keyvalue service instance | the namespace `cf/<instance guid>` of its plan's store |
+| binding to a keyvalue instance | the sandbox's `keyvalue` map: its identifier (parameter `identifier`, default `""`) -> `<store>/cf/<instance guid>`, and the capability `keyvalue` |
+| binding to a wasi instance | the plan's capability; a network one `cli` too |
+
+### Images
+
+Staging pulls the image itself: the wicket gets the component as from a zip and never reaches
+the registry. A registry on the loopback is reached over plain HTTP, any other over HTTPS (the
+webPKI roots; a registry's own CA is not taken); asked to authenticate, a pull gets a token from
+the registry's realm, anonymous or with the credentials, or answers a basic challenge with them.
+An image holds a wasm component, not a container: any other fails the build.
+
+### Services
+
+The wicket's keyvalue stores and capabilities are the plans of the service offerings
+`keyvalue` and `wasi` of the broker `sluice-wicket`, which is no process: the cf-api offers
+them as the wicket lists them (`GET /api/apps`), so `cf marketplace` follows the wicket's
+config.
+
+- `cf create-service keyvalue <store> <name>` makes a namespace, `cf/<instance guid>`, of the
+  store; `cf bind-service <app> <name> [-c '{"identifier":"<id>"}']` lets the app open it at the
+  identifier (default `""`, what `store::open("")` opens). An app binds one instance per
+  identifier (a second is refused, 422). Renaming the instance or moving the app's routes leaves
+  the data where it is
+- `cf create-service wasi <capability> <name>` and a binding grant the capability; a network
+  one (`inherit-network`, `allow-ip-name-lookup`, `tcp`, `udp`) `cli` too
+- as the rest of the sandbox, a binding (and an unbinding) applies at the app's next start,
+  restart, restage or deployment. A manifest's `services:` (a name, or `name` with `parameters`
+  and `binding_name`) binds what the app is not bound to yet, as `cf bind-service`
+- `cf env` shows the bindings in `VCAP_SERVICES` (by offering; a keyvalue binding's
+  credentials are `store`, `namespace` and `identifier`, a wasi one's `capabilities`)
+- instance and binding operations complete at once. `cf delete-service` is refused while the
+  instance is bound (as on CF); a keyvalue instance deleted has its data deleted once no app
+  maps its namespace any more -- no started app's snapshot, no route of the wicket, a draining
+  one included (`DELETE /api/keyvalue/<store>/<namespace>`, tried at the deletion and after each
+  listing of the wicket). `cf purge-service-instance` drops the bindings with the instance
+- `cf rename-service` and `cf update-service -t` apply at once; a plan change, instance
+  parameters, service keys, user-provided instances and sharing are refused (422)
+
+## On a Firecracker wicket
 
 For a host with KVM that should run the wicket and little else: the cf-api is an app of the
 [wicket](../sluice-wicket-runtime-firecracker/README.md#docker-image), in a VM of its own, its
 state on a [disk](../sluice-wicket-runtime-firecracker/README.md#disks) that outlives the VM, and
 `cf push` deploys container images as microVMs. The flume is what brings the apps' output to `cf
 logs`: to do without it, leave out its container, `--network`, `--flume`, and its `egress` and
-`env` below. An Apple silicon Mac runs this in its Lima VM
-([On a Mac](../sluice-wicket-runtime-firecracker/README.md#on-a-mac)), the commands of the wicket
-and the flume there, `curl` and `cf` on the Mac; an image must have a `linux/arm64` build.
+`env` below. The cf-api also runs next to the wicket, as in [Run](#run), with `--wicket` at its
+console.
+
+### Run as an app of the wicket
 
 The wicket and the flume, on the host's loopback (see **who reaches it** below):
 
@@ -306,7 +350,7 @@ JSON
 ```
 
 The CLI works as on any wicket, an app being a container image or a rootfs (see
-[Mapping](#mapping)):
+[Mapping to VMs](#mapping-to-vms)):
 
 ```text
 cf api http://cf.localhost:8080
@@ -347,6 +391,8 @@ cf apps
 curl http://web.localhost:8080/
 ```
 
+### Operating it
+
 - **who reaches it**: without a provider the cf-api takes any credentials, and that it listens on
   its VM's loopback protects nothing here: the wicket relays its route to whoever reaches
   `--listen`, or the sluice server with `--server`, saying `Host: cf.localhost`. Keep them on the
@@ -382,33 +428,23 @@ curl http://web.localhost:8080/
   `guest: /usr/local/bin/sluice-wicket-cf-api exited`: a PUT with another env starts it again.
   The apps serve on meanwhile
 
-## Mapping
+### On a Mac
 
-| CF | wicket |
-|---|---|
-| app, started, with a droplet and a route | an app named by its guid, owner `cf`: its routes' hosts, the droplet's component, the sandbox below |
-| app stopped, or without a route | no app in the wicket |
-| route `<host>.<domain>` | a host: labels of `a-z`, `0-9` and `-`. No path, port or wildcard (422). A route serves one app: a second destination is refused; zero-downtime updates are `--strategy rolling` |
-| shared domain | `--domain` |
-| package (bits) | the uploaded zip: `cf push` takes a directory or a zip (`-p hello.wasm` fails in the CLI: `not a valid zip file`) |
-| package (docker) | an image (`cf push --docker-image`, a manifest's `docker.image`) holding the component as one `application/wasm` layer, as `wkg oci push` and `oras push <ref> hello.wasm:application/wasm` push it (of an index, its `wasm` entry). `--docker-username` with `CF_DOCKER_PASSWORD` are its credentials |
-| build | picks the component: the one the web process command names (`-c hello.wasm`, `command:`), else the package's only `.wasm`; of an image, pulls it. It must be a component (`\0asm`, layer 1). Anything else fails the build, naming what it found |
-| droplet | that component, by sha256 (`process_types.web` its path; stack `wasip3`, buildpack `wasm`); of an image, the image by digest (`cf app`: `docker image:`), `process_types.web` the repository's last segment `.wasm` |
-| web process `instances` | `pool`: warm instances, taking the requests in turn. A request beyond them gets an instance of its own, as on every route: 0 still serves. `cf logs` names the instance (`APP/PROC/WEB/<index>`, the requests' `app_index`): a warm one's `0` to `instances - 1`, one of its own the lowest index free from `instances` up |
-| web process `memory` | `memory-mib` |
-| annotations `wicket.sluice.ik.am/budget-ms`, `wicket.sluice.ik.am/instances` | `budget-ms`, `instances` (the route's cap; below `pool` the wicket refuses) |
-| environment variables (`cf set-env`, a manifest's `env:`), `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: what the guest's `wasi:cli/environment` answers |
-| disk, health check, log rate, stack, buildpacks | accepted and shown, no effect |
-| instance state | `RUNNING` once the wicket took the app; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable |
-| rolling deployment | the app put with the new droplet: the wicket swaps it in place; finalized at once |
-| org / space | one of each |
-| service offering `keyvalue`, plan `<store>` | a keyvalue store of the wicket (`keyvalue.stores`, else `local`) |
-| service offering `wasi`, plan `<capability>` | a capability of the sandbox's `wasi`: `cli`, `inherit-network`, `allow-ip-name-lookup`, `tcp`, `udp` |
-| keyvalue service instance | the namespace `cf/<instance guid>` of its plan's store |
-| binding to a keyvalue instance | the sandbox's `keyvalue` map: its identifier (parameter `identifier`, default `""`) -> `<store>/cf/<instance guid>`, and the capability `keyvalue` |
-| binding to a wasi instance | the plan's capability; a network one `cli` too |
+An Apple silicon Mac (M3 or later) runs this in the Lima VM of the wicket's
+[On a Mac](../sluice-wicket-runtime-firecracker/README.md#on-a-mac), started by its `lima.sh`. The
+`docker` commands run in the VM, with the same `$TOKEN` and `$FLUME_TOKEN`; `curl` and `cf` run on
+the Mac, whose loopback the VM's ports are forwarded to. `docker cp` leaves the sample guest in the
+VM, for `limactl copy`. An image must have a `linux/arm64` build: `the image is for amd64, this
+wicket's VMs for arm64` fails the build otherwise.
 
-On a Firecracker wicket (its listing says `runtime: firecracker`):
+```text
+../sluice-wicket-runtime-firecracker/scripts/lima.sh true     # makes and starts the VM
+limactl shell sluice-firecracker                              # the first time: newgrp docker in it
+```
+
+### Mapping to VMs
+
+The wicket's listing says `runtime: firecracker`.
 
 | CF | wicket |
 |---|---|
@@ -421,6 +457,52 @@ On a Firecracker wicket (its listing says `runtime: firecracker`):
 | disk | no effect: the rootfs is read-only and `/tmp` a tmpfs of the VM's memory; a persistent disk is the wicket API's, with no CF counterpart |
 | services | none: the listing offers neither capabilities nor keyvalue stores |
 | `cf logs` | the process's output, instance 0; no `RTR` line: this wicket feeds no requests to the flume |
+| annotations | no effect: a VM's sandbox is its `mode`, `mem`, `vms` and `env` |
+
+## Options
+
+| option | |
+|---|---|
+| `--listen <host:port>` | bind address (default `127.0.0.1:9091`); without `--oidc-issuer` a loopback address only, as the API takes any credentials then |
+| `--wicket <url>` | the wicket's console, `http://host:port` |
+| `--wicket-token <token>` / `--wicket-token-file <path>` | its `--console-token` |
+| `--domain <name>` | a shared domain; repeatable (or comma-separated): the first takes the default and random routes (default `localhost`). Through a sluice server, a suffix whose wildcard DNS reaches it |
+| `--data-dir <path>` | the state and the blobs (default `cf-api`): `state.json` (written by a rename on every change), `jwt.key` and `sessions.json` (the logins), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app) |
+| `--org <name>` / `--space <name>` | the one organization and space (default `sluice` / `wicket`) |
+| `--flume <url>` | the sluice-flume the wicket feeds (`grpc://host:port` / `grpcs://host:port`): the apps' output and requests reach `cf logs` from it |
+| `--flume-token <token>` / `--flume-token-file <path>` | its bearer token |
+| `--flume-ca-cert <path>` / `--flume-insecure` | a `grpcs://` flume verified against this PEM CA (default the webPKI roots), or not at all |
+| `--oidc-issuer <url>` | the OpenID Provider users log in through (`cf login --sso`); its discovery document is at `<url>/.well-known/openid-configuration` |
+| `--oidc-client-id <id>` | the client registered with the provider, whose redirect URI is `<API URL>/uaa/callback` (required with `--oidc-issuer`) |
+| `--oidc-client-secret <secret>` / `--oidc-client-secret-file <path>` | its secret; none = a public client (PKCE only) |
+| `--oidc-claim <claim>=<pattern>` | who may log in: the ID token's claim must hold (a list claim: contain) the pattern, `*` matching any run of characters; repeatable (or comma-separated). One claim's patterns are alternatives, distinct claims must all hold. At least one rule is required with `--oidc-issuer` (`email=*` lets anyone the provider knows in) |
+| `--oidc-scopes <list>` | the scopes asked for, comma-separated (default `openid,email,profile`; Dex sends the `groups` claim for the scope `groups`) |
+| `--oidc-ca-cert <path>` | a PEM CA the provider's certificate is verified against (default the webPKI roots) |
+| `--client-credentials <id>:<secret>` / `--client-credentials-file <path>` | a client of `cf auth <id> <secret> --client-credentials` (CI); repeatable, the file one per line. With `--oidc-issuer` only |
+| `--tls-cert <path>` / `--tls-key <path>` | serve TLS: the certificate chain and its private key, PEM. Without them, behind a TLS proxy, `X-Forwarded-Proto: https` makes the links `https` |
+| `--exit-on-stdin-close` | exit when stdin reaches its end (a parent's child process) |
+
+Each option also reads `SLUICE_WICKET_CF_API_<NAME>` from the environment. The image
+`ghcr.io/making/sluice/sluice-wicket-cf-api` (`latest` / `<sha>`, built from
+`Dockerfile` at the repository root) keeps `/data` as the working directory; without
+`--oidc-issuer` it listens on the loopback, so it is reached from the wicket's network
+namespace (`--network host`, a sidecar, `kubectl port-forward`).
+
+## Mapping
+
+What holds on both wickets; a component's and a VM's are in
+[Mapping to components](#mapping-to-components) and [Mapping to VMs](#mapping-to-vms).
+
+| CF | wicket |
+|---|---|
+| app, started, with a droplet and a route | an app named by its guid, owner `cf`: its routes' hosts, the droplet's component, the sandbox below |
+| app stopped, or without a route | no app in the wicket |
+| route `<host>.<domain>` | a host: labels of `a-z`, `0-9` and `-`. No path, port or wildcard (422). A route serves one app: a second destination is refused; zero-downtime updates are `--strategy rolling` |
+| shared domain | `--domain` |
+| instance state | `RUNNING` once the wicket took the app; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable |
+| rolling deployment | the app put with the new droplet: the wicket swaps it in place; finalized at once |
+| org / space | one of each |
+| health check, log rate, stack, buildpacks | accepted and shown, no effect |
 
 ## Behavior
 
@@ -437,13 +519,9 @@ On a Firecracker wicket (its listing says `runtime: firecracker`):
   start, which the cf-api compares instead. The data directory's files are its owner's only
   (0600): `state.json` holds the values. They are written by a rename and an `fsync`: on the
   disk when the answer comes
-- images (`--docker-image`): staging pulls the tag and pins it to its manifest's digest, kept
-  with the droplet: a restart serves the staged component after the tag moved, a restage
-  pulls the tag again. A registry on the loopback is reached over plain HTTP, any other over
-  HTTPS (the webPKI roots); asked to authenticate, a pull gets a token from the registry's
-  realm, anonymous or with the credentials, or answers a basic challenge with them. The
-  password is in no answer (`***` in the package) and no log; `state.json` holds it. The
-  wicket gets the component as from a zip: it never reaches the registry. An app is an
+- images (`--docker-image`): staging pins the tag to its manifest's digest, kept with the droplet:
+  a restart serves what was staged after the tag moved, a restage takes the tag again. The
+  password is in no answer (`***` in the package) and no log; `state.json` holds it. An app is an
   image's after a push of one, a zip's after a push of bits. A build the cf-api's restart cut
   short fails: restage
 - an edit the wicket answers at once (map-route, unmap-route, scale -i, a manifest's routes)
@@ -461,8 +539,8 @@ On a Firecracker wicket (its listing says `runtime: firecracker`):
 - `cf logs` (log-cache `read`, polled by the CLI): an in-memory ring of 1000 lines per app of
   the cf-api's own lines: staging (`STG`), lifecycle (`API`), the wicket's outcome (`CELL`).
   With `--flume`, the app's own too, from the live access log the wicket feeds: its output
-  (`APP/PROC/WEB` OUT / ERR), its requests (`RTR`, in the gorouter's access log format),
-  each naming its instance (see Mapping), and the lines lost on the way (`LGR`). The cf-api
+  (`APP/PROC/WEB` OUT / ERR), on a wasi wicket its requests (`RTR`, in the gorouter's access log
+  format), each naming its instance, and the lines lost on the way (`LGR`). The cf-api
   watches its apps' hosts and resumes past the last line it took (kept in `state.json`); see
   [Live access log](../.kb/live-access-log.md#wickets-and-the-cf-api)
 - auth: see [Login](#login). Every request but the root document, `/v3`, `/v3/info` and the
@@ -508,40 +586,14 @@ for Dex's groups); the discovery document must be reachable from the cf-api, whi
 the first sign-in and keeps it. Dex, Keycloak, Entra ID, Google and the like serve; the
 [Docker Compose](#docker-compose) sample runs Dex with its users in a file.
 
-## Services
-
-The wicket's keyvalue stores and capabilities are the plans of the service offerings
-`keyvalue` and `wasi` of the broker `sluice-wicket`, which is no process: the cf-api offers
-them as the wicket lists them (`GET /api/apps`), so `cf marketplace` follows the wicket's
-config.
-
-- `cf create-service keyvalue <store> <name>` makes a namespace, `cf/<instance guid>`, of the
-  store; `cf bind-service <app> <name> [-c '{"identifier":"<id>"}']` lets the app open it at the
-  identifier (default `""`, what `store::open("")` opens). An app binds one instance per
-  identifier (a second is refused, 422). Renaming the instance or moving the app's routes leaves
-  the data where it is
-- `cf create-service wasi <capability> <name>` and a binding grant the capability; a network
-  one (`inherit-network`, `allow-ip-name-lookup`, `tcp`, `udp`) `cli` too
-- as the rest of the sandbox, a binding (and an unbinding) applies at the app's next start,
-  restart, restage or deployment. A manifest's `services:` (a name, or `name` with `parameters`
-  and `binding_name`) binds what the app is not bound to yet, as `cf bind-service`
-- `cf env` shows the bindings in `VCAP_SERVICES` (by offering; a keyvalue binding's
-  credentials are `store`, `namespace` and `identifier`, a wasi one's `capabilities`)
-- instance and binding operations complete at once. `cf delete-service` is refused while the
-  instance is bound (as on CF); a keyvalue instance deleted has its data deleted once no app
-  maps its namespace any more -- no started app's snapshot, no route of the wicket, a draining
-  one included (`DELETE /api/keyvalue/<store>/<namespace>`, tried at the deletion and after each
-  listing of the wicket). `cf purge-service-instance` drops the bindings with the instance
-- `cf rename-service` and `cf update-service -t` apply at once; a plan change, instance
-  parameters, service keys, user-provided instances and sharing are refused (422)
-
 ## Limits
 
 Refused with why (422): route paths, ports and wildcards, private and internal domains, tasks,
 ssh, sidecars, process types but `web`, route services, environment variable groups,
-user-provided services, service keys. On a wasm wicket images hold a wasm component, not a
-container: any other fails the build. A registry's own CA is not taken: HTTPS verifies against the webPKI roots. One owner (`cf`) per wicket: two cf-apis must not
-share one. No roles: whoever may log in may do everything.
+user-provided services, service keys. One owner (`cf`) per wicket: two cf-apis must not share one.
+No roles: whoever may log in may do everything.
+
+## Tests
 
 The integration test (`tests/cli.rs`) runs the OSS CLI -- `SLUICE_CF_CLI`, else `cf8` on the
 PATH, never a `cf` that may be the Tanzu one -- against the cf-api and a wicket in local mode
@@ -559,4 +611,12 @@ upgrade:
 gh release download v8.19.0 -R cloudfoundry/cli -p 'cf8-cli_8.19.0_macosarm.tgz'
 tar xzf cf8-cli_8.19.0_macosarm.tgz
 SLUICE_CF_CLI=$PWD/cf cargo test
+```
+
+On an Apple silicon Mac, the Firecracker test in its Lima VM
+([On a Mac](../sluice-wicket-runtime-firecracker/README.md#on-a-mac)):
+
+```text
+../sluice-wicket-runtime-firecracker/scripts/lima.sh bash -c \
+  'cd ../sluice-wicket-cf-api && cargo test --locked --test cli the_cf_cli_deploys_to_a_firecracker_wicket'
 ```
