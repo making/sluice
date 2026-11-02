@@ -2282,6 +2282,25 @@ name = "sluice-build-info"
 version = "0.0.1-SNAPSHOT"
 
 [[package]]
+name = "sluice-wicket-console"
+version = "0.0.1-SNAPSHOT"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "form_urlencoded",
+ "getrandom 0.4.3",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sluice-wicket-oidc",
+ "tokio",
+]
+
+[[package]]
 name = "sluice-wicket-oidc"
 version = "0.0.1-SNAPSHOT"
 dependencies = [
@@ -2302,9 +2321,7 @@ name = "sluice-wicket-runtime-wasi"
 version = "0.0.1-SNAPSHOT"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
  "bytes",
- "form_urlencoded",
  "futures-util",
  "getrandom 0.4.3",
  "h2",
@@ -2323,6 +2340,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sluice-build-info",
+ "sluice-wicket-console",
  "sluice-wicket-oidc",
  "sluice-wicket-tunnel",
  "tokio",

@@ -269,24 +269,7 @@ impl std::fmt::Display for Unloaded {
     }
 }
 
-/// What the console shows of the reloads besides the table.
-#[derive(Clone, Default)]
-pub struct Status {
-    /// Changes with every change the console shows: a table published, a
-    /// reload of the files failing, or the next reload succeeding.
-    pub revision: u64,
-    /// The last reload of the files that failed, unless one succeeded since.
-    pub failure: Option<Failure>,
-}
-
-/// A failed reload of the files.
-#[derive(Clone)]
-pub struct Failure {
-    /// What started it: `file change` or `SIGHUP`.
-    pub reason: String,
-    pub error: String,
-    pub at: SystemTime,
-}
+pub use sluice_wicket_console::status::Status;
 
 /// A change of the console's routes or apps, or a purge of a keyvalue
 /// namespace, and where its outcome goes. Both run on the reloader's task: no
@@ -517,28 +500,14 @@ impl Reloader {
             }
             Err(e) => {
                 log_failed(reason, self.routes.current().generation, &e.error);
-                self.status.send_modify(|status| {
-                    status.revision += 1;
-                    status.failure = Some(Failure {
-                        reason: reason.to_string(),
-                        error: e.error,
-                        at: SystemTime::now(),
-                    });
-                });
+                Status::failed(&self.status, reason, e.error);
             }
         }
     }
 
     /// A reload read every route: a failure shown before is over.
     fn recovered(&self) {
-        self.status.send_if_modified(|status| {
-            if status.failure.is_none() {
-                return false;
-            }
-            status.revision += 1;
-            status.failure = None;
-            true
-        });
+        Status::recovered(&self.status);
     }
 
     /// Applies an edit of the console's routes or apps: the component

@@ -2,6 +2,12 @@
 // on the page or chosen from a file, and replaces, reconfigures or removes the routes
 // deployed here. Every string from the wicket is put in the DOM as text, never as markup.
 
+import {
+  $, HOST, OK_OUTCOME_MS, announce, changed, field, follow, formatMs, h, humanBytes, normalizeHost,
+  outcomeView, parseListen, progressView, reachView, region, send, sep, slot, spoken, suggestHost,
+  timeView, titleOf,
+} from "/kit.js";
+
 const NETWORK = ["inherit-network", "allow-ip-name-lookup", "tcp", "udp"];
 
 // what each capability grants, after the README's table
@@ -39,142 +45,6 @@ function routedBy(route) {
   }
 }
 
-// dot-separated labels of a-z, 0-9 and '-', none starting or ending with '-'
-const HOST = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
-
-const POLL_RETRY_MS = 2000;
-// the wicket holds a poll for about 25s; a longer silence is a dead link
-const POLL_ABORT_MS = 40000;
-const OK_OUTCOME_MS = 10000;
-
-// ------------------------------------------------------------------------- helpers
-
-/** An element with attributes (functions become listeners) and text or element children. */
-function h(tag, props = {}, ...children) {
-  const node = document.createElement(tag);
-  for (const [key, value] of Object.entries(props)) {
-    if (value === null || value === undefined || value === false) {
-      continue;
-    }
-    if (typeof value === "function") {
-      node.addEventListener(key.replace(/^on/, ""), value);
-    }
-    else if (key === "class") {
-      node.className = value;
-    }
-    else {
-      node.setAttribute(key, value === true ? "" : String(value));
-    }
-  }
-  node.append(...children.flat(Infinity)
-    .filter((child) => child !== null && child !== undefined && child !== false)
-    .map((child) => (child instanceof Node ? child : String(child))));
-  return node;
-}
-
-const $ = (selector, root = document) => root.querySelector(selector);
-const field = (name) => $(`[data-field="${name}"]`);
-const slot = (name) => $(`[data-slot="${name}"]`);
-const region = (name) => $(`[data-region="${name}"]`);
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-function humanBytes(bytes) {
-  if (bytes < 1024) {
-    return `${bytes} B`;
-  }
-  const units = ["KiB", "MiB", "GiB"];
-  let value = bytes / 1024;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value >= 100 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
-}
-
-// a drawn dot: the middle dot of the subset Overpass has no width; read and copied as a comma
-const sep = () => h("span", { class: "sep" }, h("span", { class: "visually-hidden" }, ", "));
-
-/** `parts` with a separator between each two. */
-const joined = (parts) => parts.filter(Boolean).flatMap((part, index) => (index ? [sep(), part] : [part]));
-
-const formatMs = (ms) => (ms % 1000 === 0 ? `${ms / 1000} s` : `${ms} ms`);
-
-const relativeFormat = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
-
-function relativeTime(iso) {
-  const at = Date.parse(iso);
-  if (Number.isNaN(at)) {
-    return iso;
-  }
-  const seconds = Math.round((at - Date.now()) / 1000);
-  const steps = [[60, "second"], [60, "minute"], [24, "hour"], [30, "day"], [12, "month"]];
-  let value = seconds;
-  for (const [size, unit] of steps) {
-    if (Math.abs(value) < size) {
-      return unit === "second" && Math.abs(value) < 45 ? "just now" : relativeFormat.format(value, unit);
-    }
-    value = Math.round(value / size);
-  }
-  return relativeFormat.format(value, "year");
-}
-
-/** A <time> kept relative ("3 minutes ago") by the refresher, the instant as its title. */
-function timeView(iso) {
-  const at = new Date(iso);
-  const title = Number.isNaN(at.getTime()) ? iso : `${at.toLocaleString()} (${iso})`;
-  return h("time", { datetime: iso, title, "data-relative": true }, relativeTime(iso));
-}
-
-/** `fileName` as a host: "hello.wasm" -> "hello.localhost", which browsers resolve to loopback. */
-function suggestHost(fileName) {
-  const label = fileName
-    .replace(/\.wasm$/i, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9-]+/g, "-")
-    .replace(/-{2,}/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 63)
-    .replace(/-+$/, "");
-  return `${label || "component"}.localhost`;
-}
-
-const normalizeHost = (value) => value.trim().toLowerCase();
-
-/** `listen` ("127.0.0.1:8080", "[::]:8080") split into a URL host and a port. */
-function parseListen(listen) {
-  if (!listen) {
-    return null;
-  }
-  const colon = listen.lastIndexOf(":");
-  if (colon < 0) {
-    return null;
-  }
-  const host = listen.slice(0, colon).replace(/^\[|\]$/g, "");
-  const port = listen.slice(colon + 1);
-  const unspecified = host === "0.0.0.0" || host === "::";
-  return { host, port, unspecified };
-}
-
-const urlHost = (host) => (host.includes(":") && !host.startsWith("[") ? `[${host}]` : host);
-
-const loopbackPage = () => ["localhost", "127.0.0.1", "[::1]", "::1"].includes(location.hostname);
-
-const shellQuote = (text) => `'${text.replaceAll("'", "'\\''")}'`;
-
-function announce(text) {
-  const announcer = region("announcer");
-  announcer.textContent = "";
-  // a new node in the next frame, so the same text is announced again
-  requestAnimationFrame(() => {
-    announcer.textContent = text;
-  });
-}
-
-/**
- * The head of `file` checked before it is sent: {error} keeps it from being sent at all.
- * A component begins with `\0asm` and has layer 1 in bytes 6-7; a core module has layer 0.
- */
 async function sniff(file) {
   const max = state.listing?.max_component_bytes;
   if (max && file.size > max) {
@@ -221,52 +91,6 @@ const state = {
 const defaults = () => state.listing?.defaults ?? FALLBACK.defaults;
 const routeOf = (host) => state.listing?.routes.find((route) => route.host === host);
 
-// ------------------------------------------------------------------------- requests
-
-class ApiError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
-}
-
-const TITLES = {
-  0: "No answer",
-  400: "Refused",
-  401: "Not signed in",
-  403: "Forbidden",
-  404: "Not a console route",
-  409: "Host taken",
-  413: "Too large",
-  422: "Rejected",
-  503: "Draining",
-};
-
-const titleOf = (error) => TITLES[error.status] ?? `Failed (HTTP ${error.status})`;
-
-function errorMessage(status, answer, text) {
-  if (typeof answer?.error === "string" && answer.error) {
-    return answer.error;
-  }
-  if (status === 401) {
-    return "Not signed in: the token was refused or is missing, or the session ended. Reload the page to sign in again.";
-  }
-  return text ? `HTTP ${status}: ${text.slice(0, 500)}` : `HTTP ${status}`;
-}
-
-function parseJson(text) {
-  try {
-    return JSON.parse(text);
-  }
-  catch {
-    return null;
-  }
-}
-
-/**
- * The route's sandbox as query pairs, defaults left out (the wicket takes a left-out option
- * as its default). No value needs escaping: capability names are [a-z-], the rest numbers.
- */
 function sandboxPairs(sandbox) {
   const pairs = [];
   if (sandbox.wasi.length) {
@@ -285,133 +109,6 @@ function sandboxPairs(sandbox) {
     pairs.push(`instances=${sandbox.instances}`);
   }
   return pairs;
-}
-
-/**
- * `method` on the route of `host` with an XMLHttpRequest (fetch reports no upload
- * progress). `onUpload(fraction, sent)` follows the body; `sent` once all of it left,
- * when the wicket compiles and reloads before it answers.
- */
-function send(method, host, pairs, body, onUpload) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    const query = pairs.length ? `?${pairs.join("&")}` : "";
-    xhr.open(method, `/api/routes/${encodeURIComponent(host)}${query}`);
-    xhr.setRequestHeader("Accept", "application/json");
-    if (body) {
-      xhr.setRequestHeader("Content-Type", "application/wasm");
-      xhr.upload.addEventListener("progress", (event) => {
-        onUpload?.(event.lengthComputable ? event.loaded / event.total : 0, false);
-      });
-      xhr.upload.addEventListener("load", () => onUpload?.(1, true));
-    }
-    xhr.addEventListener("load", () => {
-      const answer = parseJson(xhr.responseText);
-      if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(answer ?? {});
-      }
-      else {
-        reject(new ApiError(xhr.status, errorMessage(xhr.status, answer, xhr.responseText)));
-      }
-    });
-    xhr.addEventListener("error", () => {
-      reject(new ApiError(0, "The wicket did not answer (network error, or it closed the connection)."));
-    });
-    xhr.send(body ?? null);
-  });
-}
-
-/** A successful edit: the wicket's account of the change ("added a.localhost", "no change"), then the generation. */
-function changed(answer) {
-  const message = answer.message || "done";
-  return {
-    kind: "ok",
-    title: `${message.charAt(0).toUpperCase()}${message.slice(1)}.`,
-    summary: answer.generation !== undefined ? `Generation ${answer.generation}.` : null,
-  };
-}
-
-const spoken = (outcome) => [outcome.title, outcome.summary].filter(Boolean).join(" ");
-
-// ------------------------------------------------------------------- shared views
-
-/** The progress of one request: an upload bar, then an indeterminate run. */
-function progressView() {
-  const bar = h("div", { class: "progress__bar" });
-  const track = h("div", { class: "progress__track", role: "progressbar", tabindex: -1, "aria-valuemin": 0, "aria-valuemax": 100 }, bar);
-  const label = h("p", { class: "progress__label" });
-  const element = h("div", { class: "progress" }, track, label);
-  return {
-    element,
-    /** holds the focus of a control disabled while the request runs */
-    focus() {
-      track.focus();
-    },
-    upload(fraction, total) {
-      const percent = Math.round(fraction * 100);
-      element.classList.remove("progress--indeterminate");
-      bar.style.width = `${percent}%`;
-      track.setAttribute("aria-valuenow", String(percent));
-      track.setAttribute("aria-label", "Upload");
-      label.textContent = `Uploading ${percent}% of ${humanBytes(total)}`;
-    },
-    working(text) {
-      element.classList.add("progress--indeterminate");
-      bar.style.width = "";
-      track.removeAttribute("aria-valuenow");
-      track.setAttribute("aria-label", text);
-      label.textContent = text;
-    },
-  };
-}
-
-/** An outcome: its title and summary, then `extra` (a node), the error text verbatim, the actions. */
-function outcomeView(outcome, ...actions) {
-  return h("div", { class: `outcome outcome--${outcome.kind}` },
-    h("p", {}, h("span", { class: "outcome__title" }, outcome.title), outcome.summary ? ` ${outcome.summary}` : null),
-    outcome.extra ?? null,
-    outcome.detail ? h("pre", { class: "outcome__error" }, outcome.detail) : null,
-    actions.length ? h("p", { class: "outcome__actions" }, actions) : null);
-}
-
-/** How to reach `host` through `--listen`: a link where the browser resolves it, else a curl line. */
-function reachView(host) {
-  const listen = parseListen(state.listing?.listen);
-  if (!listen || !host) {
-    return null;
-  }
-  // the browser resolves *.localhost to the loopback address: a link where --listen takes it
-  const loopbackListen = listen.unspecified || ["127.0.0.1", "::1", "localhost"].includes(listen.host);
-  if (loopbackPage() && loopbackListen && host.endsWith(".localhost") && HOST.test(host)) {
-    const url = `http://${host}:${listen.port}/`;
-    return h("span", { class: "route__reach" },
-      h("a", { class: "mono route__curl", href: url, target: "_blank", rel: "noopener noreferrer" }, `${url} ↗`));
-  }
-  const target = listen.unspecified ? urlHost(location.hostname) : urlHost(listen.host);
-  const command = `curl -H ${shellQuote(`Host: ${host}`)} http://${target}:${listen.port}/`;
-  const code = h("code", { class: "route__curl" }, command);
-  const copy = h("button", { type: "button", class: "link-button", "data-action": "copy" }, "Copy");
-  copy.addEventListener("click", () => copyText(command, code, copy));
-  return h("span", { class: "route__reach" }, code, copy);
-}
-
-async function copyText(text, code, button) {
-  const label = button.textContent;
-  try {
-    await navigator.clipboard.writeText(text);
-    button.textContent = "Copied";
-  }
-  catch {
-    // no clipboard outside a secure context: select it for the keyboard instead
-    const range = document.createRange();
-    range.selectNodeContents(code);
-    getSelection().removeAllRanges();
-    getSelection().addRange(range);
-    button.textContent = "Selected: press Ctrl+C";
-  }
-  setTimeout(() => {
-    button.textContent = label;
-  }, 1800);
 }
 
 let fieldsets = 0;
@@ -647,7 +344,7 @@ function openDeploy(file, notice = null) {
   deploy.check = {};
   deploy.touched = false;
   field("deploy-file").textContent = file.name;
-  deploy.host.value = suggestHost(file.name);
+  deploy.host.value = suggestHost(file.name, ".wasm", "component");
   deploy.host.removeAttribute("aria-invalid");
   const existing = routeOf(deploy.host.value);
   deploy.sandbox = sandboxFields(existing?.origin === "console" ? existing.sandbox : defaultSandbox(), () => {
@@ -780,13 +477,13 @@ deploy.form.addEventListener("submit", async (event) => {
   let failed = false;
   try {
     const answer = await send("PUT", host, [`name=${encodeURIComponent(file.name)}`, ...sandboxPairs(sandbox)], file,
-      (fraction, sent) => (sent ? progress.working("Compiling and reloading the routes…") : progress.upload(fraction, file.size)));
+      (fraction, sent) => (sent ? progress.working("Compiling and reloading the routes…") : progress.upload(fraction, file.size)), "application/wasm");
     state.fresh = { host, until: Date.now() + 4000 };
     state.pending = null;
     deploy.fields.hidden = true;
     const close = h("button", { type: "button", class: "button", onclick: closeDeploy }, "Close");
     const another = h("button", { type: "button", class: "link-button", onclick: () => intakeFile.click() }, "deploy another component");
-    const reach = reachView(host);
+    const reach = reachView(host, state.listing?.listen);
     slot("outcome").replaceChildren(outcomeView({
       ...changed(answer), extra: reach ? h("p", {}, reach) : null,
     }, close, " or ", another));
@@ -876,7 +573,7 @@ async function replace(route, file) {
         busy.progress = fraction;
         rowStatuses.get(host)?.progress?.upload(fraction, file.size);
       }
-    });
+    }, "application/wasm");
     state.fresh = { host, until: Date.now() + 4000 };
     settle(host, changed(answer));
     announce(spoken(changed(answer)));
@@ -1270,7 +967,7 @@ function hostCell(route) {
   const app = route.origin === "api"
     ? h("span", { class: "route__app" }, "app ", h("span", { class: "mono" }, route.app), " of ", route.owner)
     : null;
-  return [name, app, reachView(route.host)];
+  return [name, app, reachView(route.host, state.listing?.listen)];
 }
 
 function componentCell(route) {
@@ -1395,52 +1092,9 @@ function render() {
   }
 }
 
-// ----------------------------------------------------------------------- the link
-
-function setLink(live, error = null) {
-  document.documentElement.dataset.link = live ? "live" : "lost";
-  const lost = $(".link__lost");
-  lost.title = error ? error.message : "";
-}
-
-/** Follows the routes: the wicket answers at once when the listing moved past `after`, else holds the poll. */
-async function poll() {
-  for (;;) {
-    const controller = new AbortController();
-    const abort = setTimeout(() => controller.abort(), POLL_ABORT_MS);
-    try {
-      const url = state.revision === null ? "/api/routes" : `/api/routes?after=${encodeURIComponent(state.revision)}`;
-      const response = await fetch(url, { cache: "no-store", signal: controller.signal, headers: { Accept: "application/json" } });
-      if (!response.ok) {
-        const text = await response.text();
-        throw new ApiError(response.status, errorMessage(response.status, parseJson(text), text));
-      }
-      const listing = await response.json();
-      setLink(true);
-      const moved = listing.revision !== state.revision || state.listing === null;
-      state.listing = listing;
-      state.revision = listing.revision;
-      if (moved) {
-        render();
-      }
-    }
-    catch (error) {
-      setLink(false, error.name === "AbortError" ? new Error("The wicket stopped answering.") : error);
-      // the next request is answered at once, not held: it tells the link is back
-      state.revision = null;
-      await sleep(POLL_RETRY_MS);
-    }
-    finally {
-      clearTimeout(abort);
-    }
+follow((listing, moved) => {
+  state.listing = listing;
+  if (moved) {
+    render();
   }
-}
-
-// relative times age without a new listing
-setInterval(() => {
-  for (const time of document.querySelectorAll("time[data-relative]")) {
-    time.textContent = relativeTime(time.dateTime);
-  }
-}, 30000);
-
-poll();
+});

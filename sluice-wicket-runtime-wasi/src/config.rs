@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use sluice_wicket_oidc::OidcSettings;
+use sluice_wicket_console::settings::{ConsoleOptions, Rules};
 // the tunnel's: --max-connections, --tunnel-stall-timeout, --drain-grace
 use sluice_wicket_tunnel::{DEFAULT_DRAIN_GRACE, DEFAULT_MAX_CONNECTIONS, DEFAULT_STALL_TIMEOUT};
 
@@ -93,10 +93,6 @@ const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 /// directory.
 const DEFAULT_KEYVALUE_FILE: &str = "keyvalue.db";
 
-/// The console's directory without `--console-dir`: next to the config file,
-/// else in the working directory.
-const DEFAULT_CONSOLE_DIR: &str = "deployed";
-
 pub struct Settings {
     /// None: local mode alone (`listen`).
     pub server: Option<String>,
@@ -120,17 +116,7 @@ pub struct Settings {
 pub use sluice_wicket_tunnel::flume::FlumeSettings;
 
 /// The console (`--console`).
-pub struct ConsoleSettings {
-    /// Where it listens, `host:port`.
-    pub address: String,
-    /// The credentials it asks for; None: none, unless browsers sign in
-    /// through the provider, on a loopback address only.
-    pub token: Option<String>,
-    /// Where it keeps the routes it deployed.
-    pub dir: PathBuf,
-    /// The OpenID Provider its browsers sign in through.
-    pub oidc: Option<OidcSettings>,
-}
+pub use sluice_wicket_console::settings::ConsoleSettings;
 
 /// What to run: print something and exit, or run.
 pub enum Command {
@@ -353,95 +339,32 @@ fn merge(flags: Flags) -> Result<Settings, String> {
             "--server or --listen (or `server` / `listen` in the --config file) is required".into(),
         );
     }
-    let oidc = match flags
-        .oidc_issuer
-        .or_else(|| settings.oidc_issuer.clone())
-        .filter(|issuer| !issuer.is_empty())
-    {
-        Some(issuer) => {
-            if !issuer.starts_with("http://") && !issuer.starts_with("https://") {
-                return Err(format!(
-                    "{}: not an http(s) url: {issuer}",
-                    key("oidc-issuer")
-                ));
-            }
-            let client_id = flags
-                .oidc_client_id
-                .or_else(|| settings.oidc_client_id.clone())
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| format!("{} is required with oidc-issuer", key("oidc-client-id")))?;
-            let claims = match flags.oidc_claim {
-                Some(rules) => sluice_wicket_oidc::parse_rules([rules.as_str()], "--oidc-claim")?,
-                None => sluice_wicket_oidc::parse_rules(
-                    settings
-                        .oidc_claim
-                        .iter()
-                        .flat_map(|rules| rules.0.iter())
-                        .map(String::as_str),
-                    &key("oidc-claim"),
-                )?,
-            };
-            if claims.is_empty() {
-                return Err(format!(
-                    "{} is required with oidc-issuer: who may sign in (email=* for anyone the provider knows)",
-                    key("oidc-claim")
-                ));
-            }
-            let scopes: Vec<String> = flags
-                .oidc_scopes
-                .or_else(|| settings.oidc_scopes.clone())
-                .unwrap_or_else(|| "openid,email,profile".into())
-                .split([',', ' '])
-                .map(str::trim)
-                .filter(|scope| !scope.is_empty())
-                .map(str::to_string)
-                .collect();
-            if !scopes.iter().any(|scope| scope == "openid") {
-                return Err(format!("{}: openid must be among them", key("oidc-scopes")));
-            }
-            let ca_pem = match flags
-                .oidc_ca_cert
-                .or_else(|| settings.oidc_ca_cert.as_ref().map(|path| dir.join(path)))
-            {
-                Some(path) => Some(
-                    std::fs::read(&path)
-                        .map_err(|e| format!("{} {}: {e}", key("oidc-ca-cert"), path.display()))?,
-                ),
-                None => None,
-            };
-            Some(OidcSettings {
-                issuer,
-                client_id,
-                client_secret: flags
-                    .oidc_client_secret
-                    .or_else(|| settings.oidc_client_secret.clone())
-                    .filter(|secret| !secret.is_empty()),
-                scopes,
-                claims,
-                ca_pem,
-            })
-        }
-        None => None,
-    };
-    let console = flags
-        .console
-        .or_else(|| settings.console.clone())
-        .filter(|console| !console.is_empty())
-        .map(|address| ConsoleSettings {
-            address,
-            token: flags
-                .console_token
-                .or_else(|| settings.console_token.clone())
-                .filter(|token| !token.is_empty()),
-            dir: flags
-                .console_dir
-                .or_else(|| settings.console_dir.as_ref().map(|path| dir.join(path)))
-                .unwrap_or_else(|| dir.join(DEFAULT_CONSOLE_DIR)),
-            oidc: oidc.clone(),
-        });
-    if oidc.is_some() && console.is_none() {
-        return Err(format!("{} needs --console", key("oidc-issuer")));
-    }
+    let console = ConsoleOptions::resolve(
+        ConsoleOptions {
+            console: flags.console,
+            console_token: flags.console_token,
+            console_dir: flags.console_dir,
+            oidc_issuer: flags.oidc_issuer,
+            oidc_client_id: flags.oidc_client_id,
+            oidc_client_secret: flags.oidc_client_secret,
+            oidc_claim: flags.oidc_claim.map(|rules| vec![rules]),
+            oidc_scopes: flags.oidc_scopes,
+            oidc_ca_cert: flags.oidc_ca_cert,
+        },
+        ConsoleOptions {
+            console: settings.console.clone(),
+            console_token: settings.console_token.clone(),
+            console_dir: settings.console_dir.clone(),
+            oidc_issuer: settings.oidc_issuer.clone(),
+            oidc_client_id: settings.oidc_client_id.clone(),
+            oidc_client_secret: settings.oidc_client_secret.clone(),
+            oidc_claim: settings.oidc_claim.clone().map(|rules| rules.0),
+            oidc_scopes: settings.oidc_scopes.clone(),
+            oidc_ca_cert: settings.oidc_ca_cert.clone(),
+        },
+        &dir,
+        key,
+    )?;
     if flags.config.is_none() && flags.routes.is_empty() && console.is_none() {
         return Err(
             "at least one --wasm host=locator (or a --config file, or --console) is required"
@@ -716,27 +639,6 @@ struct File {
     routes: Vec<RouteFile>,
 }
 
-/// A rule, or a list of them.
-#[derive(Deserialize, PartialEq, Debug, Default)]
-#[serde(from = "OneOrMany")]
-struct Rules(Vec<String>);
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum OneOrMany {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl From<OneOrMany> for Rules {
-    fn from(given: OneOrMany) -> Rules {
-        Rules(match given {
-            OneOrMany::One(rule) => vec![rule],
-            OneOrMany::Many(rules) => rules,
-        })
-    }
-}
-
 impl File {
     fn read(path: &Path) -> Result<File, String> {
         let text = std::fs::read_to_string(path)
@@ -957,19 +859,7 @@ pub(crate) fn sandbox_yaml(sandbox: &Sandbox, map: bool) -> Option<String> {
 }
 
 /// `text` as a YAML double-quoted scalar: never expanded.
-pub(crate) fn quote(text: &str) -> String {
-    let mut quoted = String::from('"');
-    for c in text.chars() {
-        match c {
-            '"' => quoted.push_str("\\\""),
-            '\\' => quoted.push_str("\\\\"),
-            c if c.is_control() => quoted.push_str(&format!("\\u{:04x}", c as u32)),
-            c => quoted.push(c),
-        }
-    }
-    quoted.push('"');
-    quoted
-}
+pub(crate) use sluice_wicket_console::store::quote;
 
 /// The keyvalue stores: the `keyvalue` section's, else one `sqlite` store
 /// (`keyvalue::LOCAL`) at `file`, by default [`DEFAULT_KEYVALUE_FILE`] in

@@ -35,6 +35,8 @@ bytes = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
 # the console's sign-in through an OpenID Provider
 sluice-wicket-oidc = { path = "../sluice-wicket-oidc" }
+# the console's gate, its page's shared files, its directory's layout
+sluice-wicket-console = { path = "../sluice-wicket-console" }
 # the tunnel client: node streams, flow control, the drain
 sluice-wicket-tunnel = { path = "../sluice-wicket-tunnel" }
 # wasmtime's ResourceLimiterAsync is #[async_trait]; the impl must match
@@ -44,10 +46,8 @@ serde = { version = "1", features = ["derive"] }
 serde-saphyr = { version = "2", default-features = false, features = ["deserialize", "properties"] }
 # component digests: a reload keeps the handler of an unchanged component
 sha2 = "0.10"
-# the console: its JSON API, the query of an upload, HTTP Basic credentials
+# the console: its JSON API
 serde_json = "1"
-form_urlencoded = "1"
-base64 = "0.22"
 # the console: a keyvalue namespace in a path (it may hold '/')
 percent-encoding = "2"
 # the sqlite keyvalue store; bundled: no system libsqlite3 (the build compiles C for ring already)
