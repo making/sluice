@@ -1,8 +1,8 @@
-image: ghcr.io/making/sluice/sluice-flume@sha256:bda563ee4a4d3fed6aaef365f274880fdda60b1d42080f3657773484aa75e7f1
-git_revision: 7fdad9b7cbc2dc8afb8f7d045f776a7d352366cd
+image: ghcr.io/making/sluice/sluice-flume@sha256:7b5fc2d7f9b058bc2713964f272ca226674e5e137260e054fc39a2e1427a9fc4
+git_revision: df782869e04a29c715bb7c921a3cd28c35ec0fa4
 deployment:
   image:
     repository: ghcr.io/making/sluice/sluice-flume
-    digest: sha256:bda563ee4a4d3fed6aaef365f274880fdda60b1d42080f3657773484aa75e7f1
+    digest: sha256:7b5fc2d7f9b058bc2713964f272ca226674e5e137260e054fc39a2e1427a9fc4
   podLabels:
-    github.com/revision: 7fdad9b7cbc2dc8afb8f7d045f776a7d352366cd
+    github.com/revision: df782869e04a29c715bb7c921a3cd28c35ec0fa4
