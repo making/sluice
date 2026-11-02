@@ -301,8 +301,8 @@ For a host with KVM that should run the wicket and little else: the cf-api is an
 state on a [disk](../sluice-wicket-runtime-firecracker/README.md#disks) that outlives the VM, and
 `cf push` deploys container images as microVMs. The flume is what brings the apps' output to `cf
 logs`: to do without it, leave out its container, `--network`, `--flume`, and its `egress` and
-`env` below. The cf-api also runs next to the wicket, as in [Run](#run), with `--wicket` at its
-console.
+`env` below. The cf-api also runs next to the wicket, with `--wicket` at its console, as in
+[Docker Compose](#docker-compose-1).
 
 [![cf login --sso through Dex, cf push of a container image and a root filesystem as microVMs, logs, routes, a pool of VMs, environment variables and a restart of the wicket](demo/sluice-cf-firecracker-demo.gif)](demo/sluice-cf-firecracker-demo.mp4)
 
@@ -434,6 +434,151 @@ curl http://web.localhost:8080/
   `guest: /usr/local/bin/sluice-wicket-cf-api exited`: a PUT with another env starts it again.
   The apps serve on meanwhile
 
+### Docker Compose
+
+The images on one host with KVM (Docker Engine on Linux; on a Mac see [On a Mac](#on-a-mac)), with
+[Dex](https://dexidp.io/) as the OpenID Provider of the cf-api and of the wicket's console alike,
+its users in its configuration file. The cf-api is a container next to the wicket here, its state
+on a volume of its own. The apps are published on 28000 (8080 and its usual stand-ins are often
+taken), the cf-api (9091), the console (9090) and Dex (5556) on the host's loopback: `cf` and the
+browser run on that host or through an SSH tunnel
+(`ssh -L 9091:127.0.0.1:9091 -L 9090:127.0.0.1:9090 -L 5556:127.0.0.1:5556 <host>`). Dex is
+`dex.localhost` for everyone: the loopback to the browser (`*.localhost`), the service's alias on
+the Compose network to the cf-api and the wicket, so the ID tokens' issuer is one URL.
+
+Three files in one directory, as below: `compose.yaml`, `dex.yaml` and `.env`.
+
+```yaml
+# compose.yaml; .env holds the secrets, KVM_GID and APPS_DOMAIN
+services:
+  flume:
+    image: ghcr.io/making/sluice/sluice-flume
+    pull_policy: always
+    environment:
+      SLUICE_FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
+    restart: unless-stopped
+  dex:
+    image: ghcr.io/dexidp/dex:v2.46.1
+    pull_policy: always
+    command: [dex, serve, /etc/dex/dex.yaml]
+    environment:                    # what dex.yaml's secretEnv and hashFromEnv read
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?ADMIN_PASSWORD_HASH}
+    networks:
+      default:
+        aliases: [dex.localhost]    # the issuer's host, as the browser reaches it on the loopback
+    ports:
+      - "127.0.0.1:5556:5556"
+    volumes:
+      - ./dex.yaml:/etc/dex/dex.yaml:ro
+    restart: unless-stopped
+  wicket:
+    image: ghcr.io/making/sluice/sluice-wicket-runtime-firecracker
+    pull_policy: always
+    command: [--listen, 0.0.0.0:8080, --console, 0.0.0.0:9090, --flume, grpc://flume:8002, --oidc-issuer, http://dex.localhost:5556/dex]
+    environment:
+      SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE_TOKEN: ${CONSOLE_TOKEN:?CONSOLE_TOKEN}    # the cf-api's
+      SLUICE_WICKET_RUNTIME_FIRECRACKER_FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
+      SLUICE_WICKET_RUNTIME_FIRECRACKER_OIDC_CLIENT_ID: sluice
+      SLUICE_WICKET_RUNTIME_FIRECRACKER_OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
+      SLUICE_WICKET_RUNTIME_FIRECRACKER_OIDC_CLAIM: email=admin@example.com    # who may sign in
+    devices:
+      - /dev/kvm
+    group_add:
+      - ${KVM_GID:?KVM_GID}
+    tmpfs:
+      - /run/sluice                 # the VMs' snapshots stay off the disk
+    stop_grace_period: 40s          # the drain's 20s, and 20s for an app's disk
+    ports:
+      - "28000:8080"                # the apps
+      - "127.0.0.1:9090:9090"       # the console, from this host only
+    volumes:
+      - wicket:/data    # the apps, their root filesystems and disks (deployed/)
+    depends_on: [flume, dex]
+    restart: unless-stopped
+  cf-api:
+    image: ghcr.io/making/sluice/sluice-wicket-cf-api
+    pull_policy: always
+    command: [--listen, 0.0.0.0:9091, --wicket, http://wicket:9090, --flume, grpc://flume:8002, --oidc-issuer, http://dex.localhost:5556/dex]
+    environment:
+      SLUICE_WICKET_CF_API_WICKET_TOKEN: ${CONSOLE_TOKEN:?CONSOLE_TOKEN}
+      SLUICE_WICKET_CF_API_FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
+      SLUICE_WICKET_CF_API_DOMAIN: ${APPS_DOMAIN:-localhost}
+      SLUICE_WICKET_CF_API_OIDC_CLIENT_ID: sluice
+      SLUICE_WICKET_CF_API_OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
+      SLUICE_WICKET_CF_API_OIDC_CLAIM: email=admin@example.com    # who may log in
+    ports:
+      - "127.0.0.1:9091:9091"       # the API, from this host only
+    volumes:
+      - cf-api:/data    # the desired state, packages and droplets (cf-api/)
+    depends_on: [wicket, dex]
+    restart: unless-stopped
+volumes:
+  wicket:
+  cf-api:
+```
+
+```yaml
+# dex.yaml, next to compose.yaml: the OpenID Provider (https://dexidp.io/docs/), its users
+# in this file
+issuer: http://dex.localhost:5556/dex
+storage:
+  type: memory
+web:
+  http: 0.0.0.0:5556
+oauth2:
+  skipApprovalScreen: true
+staticClients:
+  - id: sluice                  # the cf-api's and the console's client id
+    name: sluice
+    secretEnv: OIDC_CLIENT_SECRET
+    redirectURIs:
+      - http://127.0.0.1:9091/uaa/callback      # the cf-api
+      - http://127.0.0.1:9090/oauth2/callback   # the wicket's console
+enablePasswordDB: true
+staticPasswords:                # the users: Dex asks for the email and the password
+  - email: admin@example.com
+    username: admin
+    preferredUsername: admin    # the cf user name
+    userID: 1c2a0b3e-0000-4000-8000-000000000001
+    hashFromEnv: ADMIN_PASSWORD_HASH
+```
+
+```text
+# .env, next to compose.yaml: these values work as they are; change the secrets (openssl rand
+# -hex 16 each) and the password before anyone else can reach the host
+FLUME_TOKEN=d6edd1ade98c42dd49b77a7ba4906881
+CONSOLE_TOKEN=92190bcaf0277ff738ee4162d89c9eeb
+OIDC_CLIENT_SECRET=13915f086b88d15379e27e6c3aa4a59f
+# admin@example.com's password, bcrypt: htpasswd -bnBC 10 "" <password> | tr -d ':\n'
+# (single-quoted: $ is Compose's otherwise); this one is "secret"
+ADMIN_PASSWORD_HASH='$2y$10$cYEVeVIzJX6QWDQcjRUaNe1RHrXamph8BdMRzlR/LS7msAe83oJOi'
+# a name whose wildcard DNS reaches the host (default localhost)
+# APPS_DOMAIN=apps.example.com
+```
+
+```text
+echo "KVM_GID=$(stat -c %g /dev/kvm)" >> .env    # the group of /dev/kvm, the host's
+docker compose up -d
+cf login -a http://127.0.0.1:9091 --sso    # open the URL it prints, log in at Dex (admin@example.com / secret), paste the code
+cf push web --docker-image ghcr.io/traefik/whoami:v1.11.0
+curl http://web.localhost:28000/           # with APPS_DOMAIN: http://web.apps.example.com:28000/
+cf logs web --recent
+mkdir hello                                # or a root filesystem of your own, here the sample's
+docker compose cp wicket:/usr/local/share/sluice-wicket-runtime-firecracker/guest.ext4 hello/hello.ext4
+cf push hello -p hello/
+curl http://hello.localhost:28000/
+cf scale hello -i 2                        # a pool of 2 VMs, cloned from a snapshot
+open http://127.0.0.1:9090/                # the wicket's console: signed in through Dex too
+```
+
+`docker compose down` keeps the volumes: the next `up` serves the apps again, once their VMs have
+booted, with the logins (`sessions.json` in the cf-api's). For other users, add them to
+`staticPasswords` and to both `..._OIDC_CLAIM`s (`email=admin@example.com,email=dev@example.com`), or
+give them a group and allow the group (`groups=devs`, with the scopes `openid,email,profile,groups`);
+a Dex [connector](https://dexidp.io/docs/connectors/) replaces the static users with GitHub, LDAP,
+another OpenID Provider and the like.
+
 ### On a Mac
 
 An Apple silicon Mac (M3 or later) runs this in the Lima VM of the wicket's
@@ -447,6 +592,9 @@ wicket's VMs for arm64` fails the build otherwise.
 ../sluice-wicket-runtime-firecracker/scripts/lima.sh true     # makes and starts the VM
 limactl shell sluice-firecracker                              # the first time: newgrp docker in it
 ```
+
+[Docker Compose](#docker-compose-1) likewise: the VM mounts nothing, so its directory is copied in
+(`limactl copy -r . sluice-firecracker:compose`), where `KVM_GID` is added and `docker compose` runs.
 
 ### Mapping to VMs
 

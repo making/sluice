@@ -25,7 +25,7 @@ fi
 ssh_config=$HOME/.lima/$vm/ssh.config
 
 # The tools of the CI's VM test, the release and the kernel it pins (.github/workflows/rust.yaml),
-# and the OSS cf CLI of sluice-wicket-cf-api's test
+# and the OSS cf CLI of sluice-wicket-cf-api's test and the Compose of its README
 limactl shell --workdir / "$vm" bash -c '
   set -euo pipefail
   command -v cf8 >/dev/null || (
@@ -35,12 +35,18 @@ limactl shell --workdir / "$vm" bash -c '
     tar xzf cf8-cli_8.19.0_linux_arm64.tgz cf8
     sudo install cf8 /usr/local/bin/cf8
   )
-  [ -e ~/.sluice-provisioned ] && exit 0
+  [ -e ~/.sluice-provisioned ] && {
+    dpkg -s docker-compose-v2 >/dev/null 2>&1 || {
+      sudo apt-get -o DPkg::Lock::Timeout=600 update -q
+      sudo apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends docker-compose-v2
+    }
+    exit 0
+  }
   [ -e /dev/kvm ] || { echo "no /dev/kvm: nested virtualization needs an M3 or later, macOS 15 or later" >&2; exit 1; }
   sudo apt-get -o DPkg::Lock::Timeout=600 update -q
   sudo apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends \
     protobuf-compiler e2fsprogs python3 build-essential pkg-config curl ca-certificates rsync \
-    docker.io docker-buildx
+    docker.io docker-buildx docker-compose-v2
   sudo usermod -aG docker "$(id -un)"
   echo "KERNEL==\"kvm\", GROUP=\"kvm\", MODE=\"0666\", OPTIONS+=\"static_node=kvm\"" \
     | sudo tee /etc/udev/rules.d/99-kvm4all.rules
