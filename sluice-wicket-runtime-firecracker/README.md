@@ -880,13 +880,19 @@ its first run, copies the work tree into it at each, and runs a command there:
 scripts/lima.sh                     # the VM test
 scripts/lima.sh env SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL=1 cargo test --locked --test vm
 scripts/lima.sh bash -c 'cargo build --locked && scripts/build-guest.sh'
+scripts/lima.sh bash -c 'cd ../sluice-wicket-cf-api && cargo test --locked --test cli the_cf_cli_deploys_to_a_firecracker_wicket'
 limactl shell sluice-firecracker    # a shell; the copy is ~/sluice
 limactl delete -f sluice-firecracker
 ```
 
 From the VM a sluice server on the Mac is `grpc://host.lima.internal:8001`; a port the wicket
-listens at on the VM's loopback (`--listen`, `--console`) is forwarded to the Mac's. A Mac's
-timings say nothing of a real host (see [Findings](#findings)).
+listens at on the VM's loopback (`--listen`, `--console`, or Docker's `-p 127.0.0.1:...`) is
+forwarded to the Mac's. `lima.sh` starts the VM with `LIMA_SSH_PORT_FORWARDER=true`: Lima's
+default forwarder (2.1.1) leaves the VM's end of a connection open when the Mac's closes, and at
+`--max-connections` of them the listener stops answering. Starting the VM by hand, set it too.
+
+A Mac's timings say nothing of a real host (see [Findings](#findings)). The wicket listens once
+every VM it restores has booted: 9.6s here with a Node.js image, 3.7s with a Go one.
 
 ## Tests
 

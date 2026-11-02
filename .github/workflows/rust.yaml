@@ -445,8 +445,8 @@ jobs:
       run: |
         cargo test --locked
         (cd guest && cargo test --locked)
-    # the OSS cf CLI (x86_64's alone is published) deploying to the wicket, its image made
-    # on the wicket: skipped by the cf-api's job, which has no Firecracker
+    # the OSS cf CLI deploying to the wicket, its image made on the wicket (x86_64 alone: the
+    # aarch64 runner has no /dev/kvm): skipped by the cf-api's job, which has no Firecracker
     - name: Test the cf-api on it
       if: matrix.arch == 'x86_64'
       run: |

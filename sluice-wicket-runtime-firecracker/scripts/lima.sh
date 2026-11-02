@@ -10,6 +10,9 @@ vm=${SLUICE_LIMA_VM:-sluice-firecracker}
 here=$(cd "$(dirname "$0")/.." && pwd)
 root=$(cd "$here/.." && pwd)
 commit=$(git -C "$root" rev-parse HEAD)
+# Lima's default forwarder leaves the VM's end of a forwarded connection open when the Mac's
+# closes (Lima 2.1.1): each would hold one of the wicket's --max-connections
+export LIMA_SSH_PORT_FORWARDER=true
 
 if ! limactl list -q | grep -qx "$vm"; then
   # no mount (the VM's builds stay out of the work tree), no containerd (docker below, the CI's)
@@ -21,9 +24,17 @@ elif [ "$(limactl list -f '{{.Status}}' "$vm")" != Running ]; then
 fi
 ssh_config=$HOME/.lima/$vm/ssh.config
 
-# The tools of the CI's VM test, the release and the kernel it pins (.github/workflows/rust.yaml)
+# The tools of the CI's VM test, the release and the kernel it pins (.github/workflows/rust.yaml),
+# and the OSS cf CLI of sluice-wicket-cf-api's test
 limactl shell --workdir / "$vm" bash -c '
   set -euo pipefail
+  command -v cf8 >/dev/null || (
+    cd "$(mktemp -d)"
+    curl -fsSLO https://github.com/cloudfoundry/cli/releases/download/v8.19.0/cf8-cli_8.19.0_linux_arm64.tgz
+    echo "454c29a44a51c8edc9696678403e2e40808357a397033af5a018e6ca8ee32117  cf8-cli_8.19.0_linux_arm64.tgz" | sha256sum -c
+    tar xzf cf8-cli_8.19.0_linux_arm64.tgz cf8
+    sudo install cf8 /usr/local/bin/cf8
+  )
   [ -e ~/.sluice-provisioned ] && exit 0
   [ -e /dev/kvm ] || { echo "no /dev/kvm: nested virtualization needs an M3 or later, macOS 15 or later" >&2; exit 1; }
   sudo apt-get -o DPkg::Lock::Timeout=600 update -q

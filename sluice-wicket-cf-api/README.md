@@ -258,7 +258,9 @@ For a host with KVM that should run the wicket and little else: the cf-api is an
 state on a [disk](../sluice-wicket-runtime-firecracker/README.md#disks) that outlives the VM, and
 `cf push` deploys container images as microVMs. The flume is what brings the apps' output to `cf
 logs`: to do without it, leave out its container, `--network`, `--flume`, and its `egress` and
-`env` below.
+`env` below. An Apple silicon Mac runs this in its Lima VM
+([On a Mac](../sluice-wicket-runtime-firecracker/README.md#on-a-mac)), the commands of the wicket
+and the flume there, `curl` and `cf` on the Mac; an image must have a `linux/arm64` build.
 
 The wicket and the flume, on the host's loopback (see **who reaches it** below):
 
