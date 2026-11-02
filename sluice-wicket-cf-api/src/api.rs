@@ -40,7 +40,7 @@ use crate::store::{
 };
 use crate::uaa::{self, Uaa};
 use crate::views;
-use crate::wicket::Failure;
+use crate::wicket::{Failure, Runtime};
 
 /// Largest package upload, and component pulled.
 pub(crate) const MAX_UPLOAD_BYTES: usize = 160 << 20;
@@ -610,8 +610,14 @@ impl Api {
                 self.apply_manifest(req).await
             }
             (&Method::POST, ["spaces", _, "manifest_diff"]) => self.manifest_diff(req),
-            (&Method::GET, ["stacks"]) => listing(vec![views::stack(base)], None),
-            (&Method::GET, ["stacks", _]) => Ok(json(StatusCode::OK, &views::stack(base))),
+            (&Method::GET, ["stacks"]) => {
+                let runtime = self.controller.runtime().await.ok();
+                listing(vec![views::stack(base, runtime)], None)
+            }
+            (&Method::GET, ["stacks", _]) => {
+                let runtime = self.controller.runtime().await.ok();
+                Ok(json(StatusCode::OK, &views::stack(base, runtime)))
+            }
             (&Method::GET, ["feature_flags"]) => listing(
                 ["service_instance_sharing", "diego_docker"]
                     .iter()
@@ -1139,6 +1145,14 @@ impl Api {
 
     // --- the manifest
 
+    /// A new app's stack: of what the wicket runs, a wasm wicket's until it answers.
+    async fn stack_of_new_apps(&self) -> &'static str {
+        self.controller
+            .runtime()
+            .await
+            .map_or(crate::store::STACK, Runtime::stack)
+    }
+
     async fn apply_manifest(&self, req: &Req) -> Reply {
         let manifest = match manifest::parse(
             std::str::from_utf8(&req.body)
@@ -1154,10 +1168,11 @@ impl Api {
                 );
             }
         };
+        let stack = self.stack_of_new_apps().await;
         let _edit = self.controller.edits.lock().await;
         let (trial, guids) = {
             let mut trial = self.store.read(State::clone);
-            match manifest::apply(&mut trial, &manifest) {
+            match manifest::apply(&mut trial, &manifest, stack) {
                 Ok(guids) => (trial, guids),
                 Err(e) => {
                     return self.job(
@@ -1268,6 +1283,7 @@ impl Api {
             }
         };
         let lifecycle = lifecycle(&body)?;
+        let stack = self.stack_of_new_apps().await;
         let _edit = self.controller.edits.lock().await;
         let view = self.store.update(|state| {
             if state.app_named(name).is_some() {
@@ -1278,7 +1294,7 @@ impl Api {
                     detail: format!("App with the name '{name}' already exists."),
                 });
             }
-            let guid = state.create_app(name).guid.clone();
+            let guid = state.create_app(name, stack).guid.clone();
             let app = state.app_mut(&guid).expect("just created");
             app.env = env;
             app.lifecycle = lifecycle.unwrap_or_default();

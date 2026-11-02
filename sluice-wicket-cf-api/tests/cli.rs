@@ -522,6 +522,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
         cf.ok(&["logs", "hello", "--recent"])
             .contains("Staged hello.wasm")
     );
+    assert!(cf.ok(&["stacks"]).contains("wasip3 "));
 
     // the app's output and requests, from the flume: recent, then streamed
     assert_eq!(get(&listen, "hello.localhost", "/log", None).0, 200);
@@ -1323,6 +1324,15 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         status == 200 && body.contains("VCAP_APPLICATION={"),
         "{status}: {body}"
     );
+    // the stack names what the wicket runs
+    let shown = cf.ok(&["app", "zipped"]);
+    assert!(
+        shown
+            .lines()
+            .any(|line| line.starts_with("stack:") && line.ends_with("firecracker")),
+        "{shown}"
+    );
+    assert!(cf.ok(&["stacks"]).contains("firecracker "));
 
     // deleted while the wicket is down: removed when it is back
     cf.ok(&["push", "gone", "-p", dir.join("rootfs").to_str().unwrap()]);

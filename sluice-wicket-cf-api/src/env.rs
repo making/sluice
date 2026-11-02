@@ -185,7 +185,7 @@ mod tests {
         }
 
         let mut state = State::new("o", "s", &["localhost".into()]);
-        let guid = state.create_app("hello").guid.clone();
+        let guid = state.create_app("hello", crate::store::STACK).guid.clone();
         let domain = state.domains[0].guid.clone();
         let route = state.create_route("hello", &domain).guid.clone();
         state.map(&route, &guid);

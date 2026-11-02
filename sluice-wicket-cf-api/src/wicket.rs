@@ -93,6 +93,16 @@ pub enum Runtime {
     Firecracker,
 }
 
+impl Runtime {
+    /// The stack of its apps.
+    pub fn stack(self) -> &'static str {
+        match self {
+            Runtime::Wasm => crate::store::STACK,
+            Runtime::Firecracker => crate::store::ROOTFS_STACK,
+        }
+    }
+}
+
 /// An image the wicket made of an OCI image: what an app names.
 #[derive(Deserialize, Debug)]
 pub struct MadeImage {

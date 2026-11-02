@@ -62,7 +62,18 @@ pub async fn run(
     let app = package.app.as_str();
     let staged = match &package.docker {
         None => {
-            logs.add(app, "STG", "Staging with the wasm lifecycle: the web process command names the component, else the package's only .wasm");
+            logs.add(
+                app,
+                "STG",
+                match controller.runtime().await {
+                    Ok(Runtime::Firecracker) => {
+                        "Staging a rootfs: the web process command names the image, else the package's only .ext4"
+                    }
+                    _ => {
+                        "Staging with the wasm lifecycle: the web process command names the component, else the package's only .wasm"
+                    }
+                },
+            );
             unpack(store.clone(), &package.guid, command).await
         }
         Some(docker) => match controller.runtime().await {

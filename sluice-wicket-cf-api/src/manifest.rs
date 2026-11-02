@@ -123,15 +123,15 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
 }
 
 /// Applies `manifest` to `state`: the guids of the apps it names.
-pub fn apply(state: &mut State, manifest: &Manifest) -> Result<Vec<String>, String> {
+pub fn apply(state: &mut State, manifest: &Manifest, stack: &str) -> Result<Vec<String>, String> {
     let mut guids = Vec::new();
     for spec in &manifest.applications {
-        guids.push(apply_app(state, spec)?);
+        guids.push(apply_app(state, spec, stack)?);
     }
     Ok(guids)
 }
 
-fn apply_app(state: &mut State, spec: &AppManifest) -> Result<String, String> {
+fn apply_app(state: &mut State, spec: &AppManifest, stack: &str) -> Result<String, String> {
     let name = spec.name.trim();
     if name.is_empty() {
         return Err("an application needs a name".into());
@@ -151,7 +151,7 @@ fn apply_app(state: &mut State, spec: &AppManifest) -> Result<String, String> {
     }
     let guid = match state.app_named(name) {
         Some(app) => app.guid.clone(),
-        None => state.create_app(name).guid.clone(),
+        None => state.create_app(name, stack).guid.clone(),
     };
     let app = state.app_mut(&guid).expect("just found or created");
     // the CLI reads this back: a docker app's bits it does not gather
@@ -499,7 +499,7 @@ mod tests {
             "applications:\n- name: counter\n  path: /tmp/x\n  command: counter.wasm\n  instances: 2\n  memory: 64M\n  default-route: true\n  routes:\n  - route: counter.localhost\n  - route: count.example.com\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/budget-ms: 5000\n  env:\n    GREETING: 'a: \"b\"'\n    WORKERS: 4\n  unknown-key: ignored\n",
         )
         .unwrap();
-        let guids = apply(&mut state, &manifest).unwrap();
+        let guids = apply(&mut state, &manifest, crate::store::STACK).unwrap();
         let app = state.app(&guids[0]).unwrap();
         assert_eq!(app.name, "counter");
         assert_eq!(app.process.instances, 2);
@@ -526,7 +526,10 @@ mod tests {
             "applications:\n- name: counter\n  default-route: true\n  memory: 128\n  env:\n    WORKERS: ~\n",
         )
         .unwrap();
-        assert_eq!(apply(&mut state, &again).unwrap(), guids);
+        assert_eq!(
+            apply(&mut state, &again, crate::store::STACK).unwrap(),
+            guids
+        );
         assert_eq!(state.app(&guids[0]).unwrap().process.memory_mb, 128);
         assert_eq!(state.routes_of(&guids[0]).count(), 2);
         assert_eq!(
@@ -536,7 +539,7 @@ mod tests {
 
         // a second app takes its default route; a route serves one app
         let other = parse("applications:\n- name: other\n  default-route: true\n").unwrap();
-        let other = apply(&mut state, &other).unwrap()[0].clone();
+        let other = apply(&mut state, &other, crate::store::STACK).unwrap()[0].clone();
         assert_eq!(
             state.url(state.routes_of(&other).next().unwrap()),
             "other.localhost"
@@ -545,17 +548,17 @@ mod tests {
             parse("applications:\n- name: other\n  routes:\n  - route: counter.localhost\n")
                 .unwrap();
         assert!(
-            apply(&mut state, &taken)
+            apply(&mut state, &taken, crate::store::STACK)
                 .unwrap_err()
                 .contains("mapped to counter")
         );
 
         // no-route unmaps; random-route names one
         let none = parse("applications:\n- name: other\n  no-route: true\n").unwrap();
-        apply(&mut state, &none).unwrap();
+        apply(&mut state, &none, crate::store::STACK).unwrap();
         assert_eq!(state.routes_of(&other).count(), 0);
         let random = parse("applications:\n- name: other\n  random-route: true\n").unwrap();
-        apply(&mut state, &random).unwrap();
+        apply(&mut state, &random, crate::store::STACK).unwrap();
         let url = state.url(state.routes_of(&other).next().unwrap());
         assert!(
             url.starts_with("other-") && url.ends_with(".localhost"),
@@ -571,8 +574,8 @@ mod tests {
             "applications:\n- name: counter\n  services:\n  - kv\n  - name: sessions\n    binding_name: s\n    parameters:\n      identifier: sessions\n  - net\n",
         )
         .unwrap();
-        apply(&mut state, &bound).unwrap();
-        apply(&mut state, &bound).unwrap();
+        apply(&mut state, &bound, crate::store::STACK).unwrap();
+        apply(&mut state, &bound, crate::store::STACK).unwrap();
         assert_eq!(state.bindings.len(), 3);
         let (wasi, keyvalue) = services::grants(&state, &guids[0]);
         assert_eq!(wasi, ["cli", "inherit-network", "keyvalue"]);
@@ -605,7 +608,7 @@ mod tests {
         let mut again = state.clone();
         again.bindings.clear();
         again.app_mut(&guids[0]).unwrap().env.clear();
-        apply(&mut again, &written).unwrap();
+        apply(&mut again, &written, crate::store::STACK).unwrap();
         assert_eq!(
             again.app(&guids[0]).unwrap().env,
             app.env,
@@ -631,7 +634,8 @@ mod tests {
         // (the CLI uploads the bits then); the manifest written names the
         // image of its newest package, the password never
         let docker = "applications:\n- name: img\n  docker:\n    image: ghcr.io/me/hello:1\n";
-        let img = apply(&mut state, &parse(docker).unwrap()).unwrap()[0].clone();
+        let img =
+            apply(&mut state, &parse(docker).unwrap(), crate::store::STACK).unwrap()[0].clone();
         assert_eq!(state.app(&img).unwrap().lifecycle, Lifecycle::Docker);
         state.packages.push(Package {
             guid: "p".into(),
@@ -657,10 +661,11 @@ mod tests {
         apply(
             &mut state,
             &parse("applications:\n- name: img\n  path: /x\n").unwrap(),
+            crate::store::STACK,
         )
         .unwrap();
         assert_eq!(state.app(&img).unwrap().lifecycle, Lifecycle::Buildpack);
-        apply(&mut state, &parse(&written).unwrap()).unwrap();
+        apply(&mut state, &parse(&written).unwrap(), crate::store::STACK).unwrap();
         assert_eq!(state.app(&img).unwrap().lifecycle, Lifecycle::Docker);
     }
 
@@ -676,7 +681,7 @@ mod tests {
         }
         let mut refused = |text: &str| {
             let manifest = parse(text).unwrap();
-            apply(&mut state, &manifest).unwrap_err()
+            apply(&mut state, &manifest, crate::store::STACK).unwrap_err()
         };
         assert!(
             refused("applications:\n- name: a\n  env:\n    VCAP_SERVICES: v\n")

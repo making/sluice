@@ -20,8 +20,10 @@ pub const BUDGET_ANNOTATION: &str = "wicket.sluice.ik.am/budget-ms";
 /// The annotation of an app setting its routes' `instances` cap.
 pub const INSTANCES_ANNOTATION: &str = "wicket.sluice.ik.am/instances";
 
-/// The stack every app is staged on.
+/// The stack of a wasm wicket's apps.
 pub const STACK: &str = "wasip3";
+/// The stack of a Firecracker wicket's apps.
+pub const ROOTFS_STACK: &str = "firecracker";
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct State {
@@ -459,7 +461,7 @@ impl State {
     }
 
     /// Adds the app `name`, stopped, with its web process.
-    pub fn create_app(&mut self, name: &str) -> &mut App {
+    pub fn create_app(&mut self, name: &str, stack: &str) -> &mut App {
         let at = now();
         self.apps.push(App {
             guid: guid(),
@@ -469,7 +471,7 @@ impl State {
             updated_at: at.clone(),
             lifecycle: Lifecycle::Buildpack,
             buildpacks: Vec::new(),
-            stack: STACK.into(),
+            stack: stack.into(),
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             process: Process {
@@ -948,7 +950,7 @@ mod tests {
     fn the_current_droplet_keeps_the_previous_the_packages_the_newest_and_no_build_outlives_a_restart()
      {
         let mut state = State::new("o", "s", &["localhost".into()]);
-        let app = state.create_app("hello").guid.clone();
+        let app = state.create_app("hello", STACK).guid.clone();
         let droplet = |guid: &str, sha256: &str| Droplet {
             guid: guid.into(),
             app: app.clone(),

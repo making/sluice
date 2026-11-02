@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn an_app_is_desired_started_with_a_droplet_and_a_route() {
         let mut state = State::new("o", "s", &["localhost".into()]);
-        let guid = state.create_app("hello").guid.clone();
+        let guid = state.create_app("hello", crate::store::STACK).guid.clone();
         let domain = state.domains[0].guid.clone();
         let app = state.app(&guid).unwrap().clone();
         assert_eq!(Controller::desired(&state, &app, "cf"), None);

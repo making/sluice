@@ -5,8 +5,8 @@ use serde_json::{Value, json};
 
 use crate::controller::Controller;
 use crate::store::{
-    App, Build, Deployment, Droplet, Job, Lifecycle, Named, Outcome, Package, Route, STACK, State,
-    epoch_secs, now,
+    App, Build, Deployment, Droplet, Job, Lifecycle, Named, Outcome, Package, ROOTFS_STACK, Route,
+    STACK, State, epoch_secs, now,
 };
 use crate::wicket::Runtime;
 
@@ -157,13 +157,24 @@ pub fn domain(base: &str, domain: &Named) -> Value {
     })
 }
 
-pub fn stack(base: &str) -> Value {
+/// The one stack, of what the wicket runs (a wasm wicket's until it answers).
+pub fn stack(base: &str, runtime: Option<Runtime>) -> Value {
+    let (name, description) = match runtime {
+        Some(Runtime::Firecracker) => (
+            ROOTFS_STACK,
+            "root filesystems in microVMs, served by sluice-wicket-runtime-firecracker",
+        ),
+        _ => (
+            STACK,
+            "WASI 0.3 components, served by sluice-wicket-runtime-wasi",
+        ),
+    };
     json!({
-        "guid": STACK, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
-        "name": STACK, "description": "WASI 0.3 components, served by sluice-wicket-runtime-wasi",
-        "build_rootfs_image": STACK, "run_rootfs_image": STACK, "default": true,
+        "guid": name, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+        "name": name, "description": description,
+        "build_rootfs_image": name, "run_rootfs_image": name, "default": true,
         "metadata": metadata(None),
-        "links": {"self": {"href": format!("{base}/v3/stacks/{STACK}")}},
+        "links": {"self": {"href": format!("{base}/v3/stacks/{name}")}},
     })
 }
 
@@ -354,16 +365,16 @@ pub fn build(base: &str, state: &State, build: &Build) -> Value {
 /// A droplet: an image's shows the image, pinned to its digest (what `cf
 /// app` shows of a docker app), and no buildpack.
 pub fn droplet(base: &str, droplet: &Droplet) -> Value {
-    let buildpack = match droplet.file.ends_with(crate::staging::ROOTFS) {
-        true => "rootfs",
-        false => "wasm",
+    let (buildpack, stack) = match droplet.file.ends_with(crate::staging::ROOTFS) {
+        true => ("rootfs", ROOTFS_STACK),
+        false => ("wasm", STACK),
     };
     let (kind, buildpacks, stack) = match droplet.image {
         Some(_) => ("docker", json!([]), Value::Null),
         None => (
             "buildpack",
             json!([{"name": buildpack, "detect_output": buildpack, "buildpack_name": buildpack, "version": "0.0.1"}]),
-            json!(STACK),
+            json!(stack),
         ),
     };
     json!({
