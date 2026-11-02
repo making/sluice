@@ -1,11 +1,12 @@
 // The sluice wicket console: lists the routes (long-polled), deploys a component dropped
 // on the page or chosen from a file, and replaces, reconfigures or removes the routes
-// deployed here. Every string from the wicket is put in the DOM as text, never as markup.
+// deployed here. The flow is kit.js's; here is what is the wasm wicket's: the sandbox fields,
+// the component's check, the cells. Every string from the wicket is put in the DOM as text,
+// never as markup.
 
 import {
-  $, HOST, OK_OUTCOME_MS, announce, changed, field, follow, formatMs, h, humanBytes, normalizeHost,
-  outcomeView, parseListen, progressView, reachView, region, send, sep, slot, spoken, suggestHost,
-  timeView, titleOf,
+  choiceView, consolePage, currentListing, deployedView, envView, follow, formatMs, h, humanBytes, limitView,
+  nextId, refuse, sep, showListing,
 } from "/kit.js";
 
 const NETWORK = ["inherit-network", "allow-ip-name-lookup", "tcp", "udp"];
@@ -26,40 +27,10 @@ const FALLBACK = {
   defaults: { budget_ms: 10000, memory_mib: 256 },
 };
 
-const ORIGINS = {
-  console: { title: "Console", note: "drop a .wasm on a row to replace its component" },
-  config: { title: "Config file", note: "read-only here: edit the file, the wicket reloads it" },
-  flag: { title: "--wasm flags", note: "read-only: set on the command line" },
-  api: { title: "Apps", note: "read-only here: a controller puts them through /api/apps" },
-};
+const defaults = () => currentListing()?.defaults ?? FALLBACK.defaults;
 
-/** What routes `route` instead of this page, as the end of "routed by …". */
-function routedBy(route) {
-  switch (route.origin) {
-    case "config":
-      return "the config file";
-    case "api":
-      return `the app '${route.app}' of ${route.owner}`;
-    default:
-      return "the --wasm flags";
-  }
-}
-
-async function sniff(file) {
-  const max = state.listing?.max_component_bytes;
-  if (max && file.size > max) {
-    return { error: `${file.name} is ${humanBytes(file.size)}, more than the ${humanBytes(max)} the console accepts.` };
-  }
-  if (file.size === 0) {
-    return { error: `${file.name} is empty.` };
-  }
-  let head;
-  try {
-    head = new Uint8Array(await file.slice(0, 8).arrayBuffer());
-  }
-  catch {
-    return {};
-  }
+/** Its first 8 bytes: the wasm magic, then the version's layer (0: a core module). */
+function sniff(file, head) {
   if (!(head[0] === 0x00 && head[1] === 0x61 && head[2] === 0x73 && head[3] === 0x6d)) {
     return { error: `${file.name} is not a WebAssembly binary: it does not begin with \\0asm.` };
   }
@@ -68,28 +39,6 @@ async function sniff(file) {
   }
   return {};
 }
-
-// ---------------------------------------------------------------------------- state
-
-const state = {
-  listing: null,
-  revision: null,
-  /** host -> {phase: "uploading" | "compiling" | "working", progress, total, text} */
-  busy: new Map(),
-  /** host -> {kind: "ok" | "fault", title, summary, detail} */
-  outcomes: new Map(),
-  /** host -> {row, fields}: the open sandbox editors */
-  editors: new Map(),
-  /** {host, until}: the row marked as just deployed */
-  fresh: null,
-  /** requests carrying a component, which keep the intake's wicket open */
-  inFlight: 0,
-  /** the file the deploy form is about */
-  pending: null,
-};
-
-const defaults = () => state.listing?.defaults ?? FALLBACK.defaults;
-const routeOf = (host) => state.listing?.routes.find((route) => route.host === host);
 
 function sandboxPairs(sandbox) {
   const pairs = [];
@@ -111,25 +60,20 @@ function sandboxPairs(sandbox) {
   return pairs;
 }
 
-let fieldsets = 0;
-
 /**
  * The sandbox fields of a route, `initial` filled in: the capabilities as checkboxes,
  * then the limits. `read()` returns the sandbox, or throws (marking the field) when a
  * value is out of range.
  */
 function sandboxFields(initial, onChange) {
-  const id = `sandbox-${++fieldsets}`;
+  const id = nextId("sandbox");
   const boxes = new Map();
   const caps = h("div", { class: "field__control caps", role: "group", "aria-labelledby": `${id}-caps` });
-  for (const name of state.listing?.capabilities ?? FALLBACK.capabilities) {
+  for (const name of currentListing()?.capabilities ?? FALLBACK.capabilities) {
     const box = h("input", { type: "checkbox", id: `${id}-${name}`, value: name });
     box.checked = initial.wasi.includes(name);
     boxes.set(name, box);
-    caps.append(h("label", { class: "cap", for: box.id },
-      box,
-      h("span", { class: "cap__name" }, name),
-      h("span", { class: "cap__hint" }, CAP_HINTS[name] ?? "")));
+    caps.append(choiceView(box, name, CAP_HINTS[name] ?? ""));
   }
   // the network capabilities need cli (wasi:sockets is linked only with it)
   caps.addEventListener("change", (event) => {
@@ -151,10 +95,7 @@ function sandboxFields(initial, onChange) {
     const input = h("input", {
       type: "number", id: `${id}-${key}`, step: 1, inputmode: "numeric", value: value ?? "", "aria-describedby": `${id}-note`, ...extra,
     });
-    const element = h("div", { class: "limit" },
-      h("label", { for: input.id }, label),
-      h("div", { class: "limit__control" }, input, unit ? h("span", { class: "limit__unit" }, unit) : null));
-    return { input, element };
+    return { input, element: limitView(input, label, unit) };
   };
   const budget = number("budget", "Budget", "ms", initial.budget_ms, { min: 1 });
   const memory = number("memory", "Memory", "MiB", initial.memory_mib, { min: 1 });
@@ -174,12 +115,7 @@ function sandboxFields(initial, onChange) {
   element.addEventListener("input", () => onChange?.());
   element.addEventListener("change", () => onChange?.());
 
-  const fail = (input, message) => {
-    input.setAttribute("aria-invalid", "true");
-    note.textContent = message;
-    input.focus();
-    throw new Error(message);
-  };
+  const fail = (input, message) => refuse(input, note, message);
   const whole = (input, min, what) => {
     const text = input.value.trim();
     const value = Number(text);
@@ -226,748 +162,17 @@ function sandboxFields(initial, onChange) {
 
 const defaultSandbox = () => ({ wasi: [], budget_ms: defaults().budget_ms, memory_mib: defaults().memory_mib, pool: 0, instances: null });
 
-// --------------------------------------------------------------------- the intake
-
-const intake = $("[data-testid=drop-zone]");
-
-/** The drawing's wicket: open while a file is dragged over the page or a component is on its way. */
-function setIntake(dragging) {
-  intake.dataset.intake = dragging ? "over" : state.inFlight > 0 ? "busy" : "idle";
-}
-
-let dragEnd = null;
-let dragRows = [];
-
-function markRows(target, refusing) {
-  for (const row of dragRows) {
-    row.classList.remove("is-target", "is-refusing");
-  }
-  dragRows = [target, refusing].filter(Boolean);
-  target?.classList.add("is-target");
-  refusing?.classList.add("is-refusing");
-}
-
-function endDrag() {
-  clearTimeout(dragEnd);
-  markRows(null, null);
-  setIntake(false);
-}
-
-const carriesFiles = (event) => Boolean(event.dataTransfer?.types?.includes("Files"));
-
-/** The console route row under `event`, or the read-only one that refuses the drop. */
-function dropRow(event) {
-  const row = event.target instanceof Element ? event.target.closest("tr.route") : null;
-  if (!row) {
-    return { target: null, refusing: null };
-  }
-  const deployable = row.dataset.origin === "console" && !state.busy.has(row.dataset.host);
-  return deployable ? { target: row, refusing: null } : { target: null, refusing: row };
-}
-
-// dragover keeps firing while a drag stays over the page; once it stops (left the window,
-// or dropped) the timer puts everything back
-function onDrag(event) {
-  if (!carriesFiles(event)) {
-    return;
-  }
-  event.preventDefault();
-  const { target, refusing } = dropRow(event);
-  event.dataTransfer.dropEffect = refusing ? "none" : "copy";
-  markRows(target, refusing);
-  setIntake(true);
-  clearTimeout(dragEnd);
-  dragEnd = setTimeout(endDrag, 200);
-}
-
-document.addEventListener("dragenter", onDrag);
-document.addEventListener("dragover", onDrag);
-document.addEventListener("drop", (event) => {
-  if (!carriesFiles(event)) {
-    return;
-  }
-  // never let the browser open the file instead of the page
-  event.preventDefault();
-  const { target, refusing } = dropRow(event);
-  endDrag();
-  const files = [...event.dataTransfer.files];
-  if (!files.length) {
-    return;
-  }
-  const file = files.find((candidate) => /\.wasm$/i.test(candidate.name)) ?? files[0];
-  const several = files.length > 1 ? `Only one component at a time: ${file.name} was taken.` : null;
-  if (target) {
-    replace(routeOf(target.dataset.host), file);
-  }
-  else if (refusing) {
-    announce(`${refusing.dataset.host} is read-only here.`);
-  }
-  else {
-    openDeploy(file, several);
-  }
-});
-
-const intakeFile = region("intake-file");
-$("[data-action=choose]").addEventListener("click", () => intakeFile.click());
-intakeFile.addEventListener("change", () => {
-  const [file] = intakeFile.files;
-  intakeFile.value = "";
-  if (file) {
-    openDeploy(file);
-  }
-});
-
-// ------------------------------------------------------------------ the deploy form
-
-const deploy = {
-  section: region("deploy"),
-  form: region("deploy-form"),
-  fields: region("deploy-fields"),
-  host: $("#deploy-host"),
-  note: field("host-note"),
-  meta: field("deploy-meta"),
-  submit: $("[data-action=deploy]"),
-  sandbox: null,
-  /** the user changed the sandbox: a host matching a console route no longer refills it */
-  touched: false,
-  /** the file's check: {error} or {} */
-  check: {},
-  sending: false,
-};
-
-function openDeploy(file, notice = null) {
-  if (deploy.sending) {
-    announce("A deploy is in progress; drop the next component once it finished.");
-    return;
-  }
-  state.pending = file;
-  deploy.check = {};
-  deploy.touched = false;
-  field("deploy-file").textContent = file.name;
-  deploy.host.value = suggestHost(file.name, ".wasm", "component");
-  deploy.host.removeAttribute("aria-invalid");
-  const existing = routeOf(deploy.host.value);
-  deploy.sandbox = sandboxFields(existing?.origin === "console" ? existing.sandbox : defaultSandbox(), () => {
-    deploy.touched = true;
-  });
-  slot("sandbox").replaceChildren(deploy.sandbox.element);
-  slot("progress").replaceChildren();
-  slot("outcome").replaceChildren();
-  deploy.fields.hidden = false;
-  deploy.fields.disabled = false;
-  deploy.section.hidden = false;
-  describeFile(file, notice);
-  refreshDeploy();
-  deploy.host.focus();
-  deploy.host.select();
-  deploy.section.scrollIntoView({ block: "nearest", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
-  sniff(file).then((check) => {
-    if (state.pending !== file) {
-      return;
-    }
-    deploy.check = check;
-    describeFile(file, notice);
-    refreshDeploy();
-  });
-}
-
-function describeFile(file, notice) {
-  const { error } = deploy.check;
-  deploy.meta.className = `deploy__meta${error ? " deploy__meta--fault" : notice ? " deploy__meta--marker" : ""}`;
-  deploy.meta.replaceChildren(...joined([humanBytes(file.size), error ?? "a WebAssembly component", notice]));
-}
-
-function closeDeploy() {
-  if (deploy.sending) {
-    return;
-  }
-  state.pending = null;
-  deploy.section.hidden = true;
-  $("[data-action=choose]").focus();
-}
-
-/** The host note and whether the form may be sent, against the routes of the moment. */
-function refreshDeploy() {
-  if (deploy.section.hidden || deploy.fields.hidden) {
-    return;
-  }
-  const host = normalizeHost(deploy.host.value);
-  const route = routeOf(host);
-  let note = "";
-  let kind = "";
-  let blocked = Boolean(deploy.check.error) || deploy.sending;
-  if (host === "") {
-    note = "The host the route serves.";
-    blocked = true;
-  }
-  else if (!HOST.test(host)) {
-    note = "Not a host name: dot-separated labels of a-z, 0-9 and '-', none starting or ending with '-'.";
-    kind = "fault";
-    blocked = true;
-  }
-  else if (route?.origin === "console") {
-    note = "Replaces the component and sandbox of this console route.";
-    kind = "replace";
-  }
-  else if (route) {
-    note = `Routed by ${routedBy(route)}: read-only here.`;
-    kind = "fault";
-    blocked = true;
-  }
-  else {
-    const listen = parseListen(state.listing?.listen);
-    note = listen ? `A new route, reached through --listen on port ${listen.port}.` : "A new route.";
-  }
-  deploy.note.className = `field__note${kind ? ` field__note--${kind}` : ""}`;
-  deploy.note.textContent = note;
-  if (kind === "fault") {
-    deploy.host.setAttribute("aria-invalid", "true");
-  }
-  else {
-    deploy.host.removeAttribute("aria-invalid");
-  }
-  deploy.submit.disabled = blocked;
-}
-
-deploy.host.addEventListener("input", () => {
-  // a host of a console route brings its sandbox along, any other host the defaults, unless
-  // the user set one already
-  const route = routeOf(normalizeHost(deploy.host.value));
-  if (!deploy.touched) {
-    deploy.sandbox.set(route?.origin === "console" ? route.sandbox : defaultSandbox());
-  }
-  refreshDeploy();
-});
-
-deploy.form.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") {
-    closeDeploy();
-  }
-});
-
-$("[data-action=cancel]").addEventListener("click", closeDeploy);
-
-deploy.form.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const file = state.pending;
-  if (!file || deploy.sending) {
-    return;
-  }
-  refreshDeploy();
-  if (deploy.submit.disabled) {
-    return;
-  }
-  const host = normalizeHost(deploy.host.value);
-  let sandbox;
-  try {
-    sandbox = deploy.sandbox.read();
-  }
-  catch {
-    return;
-  }
-  deploy.sending = true;
-  deploy.fields.disabled = true;
-  const progress = progressView();
-  progress.upload(0, file.size);
-  slot("progress").replaceChildren(progress.element);
-  slot("outcome").replaceChildren();
-  progress.focus();
-  state.inFlight += 1;
-  setIntake(false);
-  let failed = false;
-  try {
-    const answer = await send("PUT", host, [`name=${encodeURIComponent(file.name)}`, ...sandboxPairs(sandbox)], file,
-      (fraction, sent) => (sent ? progress.working("Compiling and reloading the routes…") : progress.upload(fraction, file.size)), "application/wasm");
-    state.fresh = { host, until: Date.now() + 4000 };
-    state.pending = null;
-    deploy.fields.hidden = true;
-    const close = h("button", { type: "button", class: "button", onclick: closeDeploy }, "Close");
-    const another = h("button", { type: "button", class: "link-button", onclick: () => intakeFile.click() }, "deploy another component");
-    const reach = reachView(host, state.listing?.listen);
-    slot("outcome").replaceChildren(outcomeView({
-      ...changed(answer), extra: reach ? h("p", {}, reach) : null,
-    }, close, " or ", another));
-    announce(spoken(changed(answer)));
-    close.focus();
-  }
-  catch (error) {
-    slot("outcome").replaceChildren(outcomeView({ kind: "fault", title: `${titleOf(error)}:`, summary: "the routes stay as they were.", detail: error.message }));
-    announce(`Deploy of ${host} failed: ${error.message}`);
-    failed = true;
-  }
-  finally {
-    slot("progress").replaceChildren();
-    deploy.sending = false;
-    deploy.fields.disabled = false;
-    state.inFlight -= 1;
-    setIntake(false);
-    refreshDeploy();
-    render();
-  }
-  if (failed) {
-    (deploy.submit.disabled ? deploy.host : deploy.submit).focus();
-  }
-});
-
-// --------------------------------------------------------------- route operations
-
-const replaceFile = region("replace-file");
-let replaceHost = null;
-
-replaceFile.addEventListener("change", () => {
-  const [file] = replaceFile.files;
-  replaceFile.value = "";
-  const route = routeOf(replaceHost);
-  if (file && route) {
-    replace(route, file);
-  }
-});
-
-function settle(host, outcome) {
-  state.outcomes.set(host, outcome);
-  if (outcome.kind === "ok") {
-    setTimeout(() => {
-      if (state.outcomes.get(host) === outcome) {
-        state.outcomes.delete(host);
-        render();
-      }
-    }, OK_OUTCOME_MS);
-  }
-}
-
-/** Whether the focus is on a control of the rows of `host`. */
-const focusIn = (host) => document.activeElement?.closest?.("tr[data-host]")?.dataset.host === host;
-
-const focusAction = (host, action) => $(`tr.route[data-host="${CSS.escape(host)}"] [data-action="${action}"]`)?.focus();
-
-/** Deploys `file` to the console route `route`, keeping its sandbox. */
-async function replace(route, file) {
-  if (!route || route.origin !== "console" || state.busy.has(route.host)) {
-    return;
-  }
-  const { host } = route;
-  // the row's buttons are disabled while it is busy: the focus comes back once it is done
-  const refocus = focusIn(host);
-  state.outcomes.delete(host);
-  const check = await sniff(file);
-  if (state.busy.has(host)) {
-    return;
-  }
-  if (check.error) {
-    settle(host, { kind: "fault", title: "Not sent:", summary: check.error });
-    render();
-    return;
-  }
-  state.busy.set(host, { phase: "uploading", progress: 0, total: file.size });
-  state.inFlight += 1;
-  setIntake(false);
-  render();
-  try {
-    const answer = await send("PUT", host, [`name=${encodeURIComponent(file.name)}`, ...sandboxPairs(route.sandbox)], file, (fraction, sent) => {
-      const busy = state.busy.get(host);
-      if (sent) {
-        busy.phase = "compiling";
-        render();
-      }
-      else {
-        busy.progress = fraction;
-        rowStatuses.get(host)?.progress?.upload(fraction, file.size);
-      }
-    }, "application/wasm");
-    state.fresh = { host, until: Date.now() + 4000 };
-    settle(host, changed(answer));
-    announce(spoken(changed(answer)));
-  }
-  catch (error) {
-    settle(host, { kind: "fault", title: `${titleOf(error)}:`, summary: `${file.name} was not deployed; ${host} stays as it was.`, detail: error.message });
-    announce(`Replacing ${host} failed: ${error.message}`);
-  }
-  finally {
-    state.busy.delete(host);
-    state.inFlight -= 1;
-    setIntake(false);
-    render();
-  }
-  if (refocus) {
-    focusAction(host, "replace");
-  }
-}
-
-async function removeRoute(route) {
-  const { host } = route;
-  const kept = route.sandbox.wasi.includes("keyvalue") ? " Its keyvalue data stays in the store." : "";
-  if (!confirm(`Remove ${host}?\n\nThe route is withdrawn at once, and its component file deleted unless another console route uses it.${kept}`)) {
-    return;
-  }
-  const refocus = focusIn(host);
-  state.outcomes.delete(host);
-  state.editors.delete(host);
-  state.busy.set(host, { phase: "working", text: "Removing…" });
-  render();
-  let note = null;
-  try {
-    const answer = await send("DELETE", host, [], null);
-    // marked until the next listing drops the row
-    state.busy.set(host, { phase: "working", text: "Removed." });
-    note = routesNote(changed(answer));
-    announce(spoken(changed(answer)));
-  }
-  catch (error) {
-    state.busy.delete(host);
-    settle(host, { kind: "fault", title: `${titleOf(error)}:`, summary: `${host} was not removed.`, detail: error.message });
-    announce(`Removing ${host} failed: ${error.message}`);
-  }
-  finally {
-    render();
-  }
-  if (refocus && note) {
-    note.focus();
-  }
-  else if (refocus) {
-    focusAction(host, "remove");
-  }
-}
-
-/** A note above the table, for an outcome whose row is gone. */
-function routesNote(outcome) {
-  const note = outcomeView(outcome);
-  note.tabIndex = -1;
-  slot("routes-note").replaceChildren(note);
-  setTimeout(() => {
-    if (note.isConnected) {
-      note.remove();
-    }
-  }, OK_OUTCOME_MS);
-  return note;
-}
-
-function toggleEditor(route) {
-  const { host } = route;
-  if (state.editors.get(host)?.kind === "sandbox") {
-    state.editors.delete(host);
-    render();
-    focusAction(host, "edit");
-    return;
-  }
-  const fields = sandboxFields(route.sandbox);
-  const outcome = h("div");
-  const save = h("button", { type: "submit", class: "button button--primary" }, "Save sandbox");
-  const cancel = h("button", { type: "button", class: "button", onclick: () => toggleEditor(route) }, "Cancel");
-  const form = h("form", { class: "editor", novalidate: true, "aria-label": `Sandbox of ${host}` },
-    fields.element, h("div", { class: "editor__actions" }, save, cancel), outcome);
-  form.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !cancel.disabled) {
-      toggleEditor(route);
-    }
-  });
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    let sandbox;
-    try {
-      sandbox = fields.read();
-    }
-    catch {
-      return;
-    }
-    save.disabled = true;
-    cancel.disabled = true;
-    const progress = progressView();
-    progress.working("Reloading the routes…");
-    outcome.replaceChildren(progress.element);
-    progress.focus();
-    try {
-      const answer = await send("PATCH", host, sandboxPairs(sandbox), null);
-      state.editors.delete(host);
-      state.fresh = { host, until: Date.now() + 4000 };
-      settle(host, changed(answer));
-      announce(spoken(changed(answer)));
-      render();
-      focusAction(host, "edit");
-    }
-    catch (error) {
-      outcome.replaceChildren(outcomeView({ kind: "fault", title: `${titleOf(error)}:`, summary: "the sandbox stays as it was.", detail: error.message }));
-      announce(`Changing the sandbox of ${host} failed: ${error.message}`);
-      save.disabled = false;
-      cancel.disabled = false;
-      save.focus();
-    }
-  });
-  const row = h("tr", { class: "route__editor", "data-host": host }, h("td", { colspan: 4 }, form));
-  state.editors.set(host, { kind: "sandbox", row, fields });
-  render();
-  fields.focus();
-}
-
-/** The note on moving `route` to the host `value`, and whether it may be sent. */
-function renameCheck(route, value) {
-  const to = normalizeHost(value);
-  if (to === route.host || to === "") {
-    return { text: "The host the route moves to.", kind: "", blocked: true };
-  }
-  if (!HOST.test(to)) {
-    return {
-      text: "Not a host name: dot-separated labels of a-z, 0-9 and '-', none starting or ending with '-'.",
-      kind: "fault",
-      blocked: true,
-    };
-  }
-  const taken = routeOf(to);
-  if (taken) {
-    const by = taken.origin === "console" ? "a route of the console already" : `routed by ${routedBy(taken)}`;
-    return { text: `${to} is ${by}.`, kind: "fault", blocked: true };
-  }
+/** The note on moving `route` to the free host `to`. */
+function renamed(route, to) {
   if (route.sandbox.wasi.includes("keyvalue")) {
-    return { text: `Its keyvalue data stays under ${route.host}: at ${to} it starts with none.`, kind: "replace", blocked: false };
+    return { text: `Its keyvalue data stays under ${route.host}: at ${to} it starts with none.`, kind: "replace" };
   }
-  return { text: `Served at ${to} at once, its component and sandbox as they are.`, kind: "", blocked: false };
+  return { text: `Served at ${to} at once, its component and sandbox as they are.`, kind: "" };
 }
 
-/** Moves the console route `route` to another host as it is: its component and sandbox. */
-function toggleRename(route) {
-  const { host } = route;
-  if (state.editors.get(host)?.kind === "rename") {
-    state.editors.delete(host);
-    render();
-    focusAction(host, "rename");
-    return;
-  }
-  const id = `rename-${++fieldsets}`;
-  const input = h("input", {
-    id, type: "text", required: true, autocomplete: "off", autocapitalize: "none", spellcheck: "false",
-    inputmode: "url", "aria-describedby": `${id}-note`,
-  });
-  input.value = host;
-  const note = h("p", { id: `${id}-note`, class: "field__note" });
-  const outcome = h("div");
-  const save = h("button", { type: "submit", class: "button button--primary" }, "Rename");
-  const cancel = h("button", { type: "button", class: "button", onclick: () => toggleRename(route) }, "Cancel");
-  let sending = false;
-  const check = () => {
-    const { text, kind, blocked } = renameCheck(routeOf(host) ?? route, input.value);
-    note.className = `field__note${kind ? ` field__note--${kind}` : ""}`;
-    note.textContent = text;
-    if (kind === "fault") {
-      input.setAttribute("aria-invalid", "true");
-    }
-    else {
-      input.removeAttribute("aria-invalid");
-    }
-    save.disabled = blocked || sending;
-  };
-  input.addEventListener("input", check);
-  const form = h("form", { class: "editor", novalidate: true, "aria-label": `Rename ${host}` },
-    h("div", { class: "field field--host" },
-      h("label", { for: id }, "New host"),
-      h("div", { class: "field__control" }, input, note)),
-    h("div", { class: "editor__actions" }, save, cancel),
-    outcome);
-  form.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !cancel.disabled) {
-      toggleRename(route);
-    }
-  });
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    check();
-    if (save.disabled) {
-      return;
-    }
-    const to = normalizeHost(input.value);
-    sending = true;
-    save.disabled = true;
-    cancel.disabled = true;
-    const progress = progressView();
-    progress.working("Reloading the routes…");
-    outcome.replaceChildren(progress.element);
-    progress.focus();
-    try {
-      const answer = await send("PATCH", host, [`host=${encodeURIComponent(to)}`], null);
-      state.editors.delete(host);
-      // marked until the next listing drops the row; the route shows at its new host
-      state.busy.set(host, { phase: "working", text: `Moved to ${to}.` });
-      state.fresh = { host: to, until: Date.now() + 4000 };
-      const moved = routesNote(changed(answer));
-      announce(spoken(changed(answer)));
-      render();
-      moved.focus();
-    }
-    catch (error) {
-      outcome.replaceChildren(outcomeView({ kind: "fault", title: `${titleOf(error)}:`, summary: `${host} stays as it was.`, detail: error.message }));
-      announce(`Renaming ${host} failed: ${error.message}`);
-      sending = false;
-      cancel.disabled = false;
-      check();
-      (save.disabled ? input : save).focus();
-    }
-  });
-  const row = h("tr", { class: "route__editor", "data-host": host }, h("td", { colspan: 4 }, form));
-  state.editors.set(host, { kind: "rename", row, refresh: check });
-  render();
-  input.focus();
-  input.select();
-}
-
-// --------------------------------------------------------------------- rendering
-
-function renderStatus() {
-  const { listing } = state;
-  field("build").textContent = listing.build || "unknown";
-  // signed in through the OpenID Provider: the masthead names the user
-  const session = $(".masthead__user");
-  session.hidden = !listing.user;
-  field("user").textContent = listing.user ?? "";
-  field("generation").textContent = String(listing.generation);
-  field("route-count").textContent = String(listing.routes.length);
-  const listen = field("listen");
-  listen.textContent = listing.listen ?? "off";
-  listen.title = listing.listen ?? "no --listen";
-  const server = field("server");
-  server.textContent = listing.server ?? "local mode";
-  server.title = listing.server ?? "no --server: local mode";
-  field("opening").textContent = `clear opening ≤ ${humanBytes(listing.max_component_bytes)}`;
-  field("limit").textContent = humanBytes(listing.max_component_bytes);
-
-  const banner = region("reload-failure");
-  const failure = listing.reload_failure;
-  banner.hidden = !failure;
-  if (failure) {
-    field("failure-reason").textContent = `Reload (${failure.reason}) failed`;
-    const at = new Date(failure.at);
-    const time = field("failure-at");
-    time.dateTime = failure.at;
-    time.title = failure.at;
-    time.textContent = Number.isNaN(at.getTime())
-      ? failure.at
-      : at.toDateString() === new Date().toDateString() ? `at ${at.toLocaleTimeString()}` : `on ${at.toLocaleString()}`;
-    field("failure-error").textContent = failure.error;
-  }
-}
-
-const groups = new Map(); // origin -> {tbody, key}
-const rows = new Map(); // host -> {signature, row}
-const rowStatuses = new Map(); // host -> {signature, row, progress}
-let emptyBody = null;
-
-function renderRoutes() {
-  const table = $("[data-testid=routes]");
-  region("routes-loading")?.remove();
-  const byOrigin = new Map();
-  for (const route of state.listing.routes) {
-    if (!byOrigin.has(route.origin)) {
-      byOrigin.set(route.origin, []);
-    }
-    byOrigin.get(route.origin).push(route);
-  }
-
-  // keep focus on a button of a row rebuilt under it
-  const focused = document.activeElement?.closest?.("tr[data-host]") && document.activeElement.dataset.action
-    ? { host: document.activeElement.closest("tr[data-host]").dataset.host, action: document.activeElement.dataset.action }
-    : null;
-
-  let anchor = table.tHead;
-  if (byOrigin.size === 0) {
-    emptyBody ??= h("tbody", {}, h("tr", {}, h("td", { colspan: 4, class: "empty" },
-      "No routes yet. Drop a component above to deploy the first one.")));
-    anchor.after(emptyBody);
-    anchor = emptyBody;
-  }
-  else {
-    emptyBody?.remove();
-  }
-
-  const hosts = new Set();
-  for (const [origin, routes] of byOrigin) {
-    let group = groups.get(origin);
-    if (!group) {
-      const key = h("tr", { class: "routes__key" }, h("th", { colspan: 4, scope: "rowgroup" }));
-      group = { tbody: h("tbody", { "data-origin": origin }, key), key };
-      groups.set(origin, group);
-    }
-    const label = ORIGINS[origin] ?? { title: origin, note: "" };
-    group.key.firstElementChild.replaceChildren(label.title, " ",
-      h("span", { class: "decision" }, `${routes.length} route${routes.length === 1 ? "" : "s"}`, sep(), label.note));
-    const nodes = [group.key];
-    for (const route of routes) {
-      hosts.add(route.host);
-      nodes.push(routeRow(route));
-      const status = statusRow(route.host);
-      if (status) {
-        nodes.push(status);
-      }
-      const editor = state.editors.get(route.host);
-      if (editor && route.origin === "console") {
-        nodes.push(editor.row);
-      }
-    }
-    reconcile(group.tbody, nodes);
-    if (anchor.nextElementSibling !== group.tbody) {
-      anchor.after(group.tbody);
-    }
-    anchor = group.tbody;
-  }
-  for (const [origin, group] of groups) {
-    if (!byOrigin.has(origin)) {
-      group.tbody.remove();
-      groups.delete(origin);
-    }
-  }
-  for (const map of [rows, rowStatuses, state.editors, state.outcomes, state.busy]) {
-    for (const host of map.keys()) {
-      if (!hosts.has(host)) {
-        map.delete(host);
-      }
-    }
-  }
-
-  if (focused && (document.activeElement === document.body || !document.activeElement)) {
-    focusAction(focused.host, focused.action);
-  }
-}
-
-/**
- * Puts `nodes` in `parent` in order, moving only the ones out of place: the rest go first, so
- * a row gone above an editor does not move it (a moved node loses the focus).
- */
-function reconcile(parent, nodes) {
-  const kept = new Set(nodes);
-  for (const child of [...parent.children]) {
-    if (!kept.has(child)) {
-      child.remove();
-    }
-  }
-  nodes.forEach((node, index) => {
-    const current = parent.children[index];
-    if (current !== node) {
-      parent.insertBefore(node, current ?? null);
-    }
-  });
-}
-
-function routeRow(route) {
-  const fresh = state.fresh?.host === route.host && state.fresh.until > Date.now();
-  const signature = JSON.stringify([route, state.busy.has(route.host), state.editors.get(route.host)?.kind ?? null, fresh, state.listing.listen, state.listing.defaults]);
-  const cached = rows.get(route.host);
-  if (cached?.signature === signature) {
-    return cached.row;
-  }
-  const classes = ["route", state.busy.has(route.host) ? "is-busy" : "", fresh ? "is-fresh" : ""].filter(Boolean).join(" ");
-  const row = h("tr", { class: classes, "data-host": route.host, "data-origin": route.origin, "data-testid": "route" },
-    h("td", {}, hostCell(route)),
-    h("td", {}, componentCell(route)),
-    h("td", {}, sandboxCell(route.sandbox)),
-    h("td", {}, actionsCell(route)));
-  rows.set(route.host, { signature, row });
-  return row;
-}
-
-function hostCell(route) {
-  const name = route.host === ""
-    ? h("span", { class: "route__host catch-all" }, "any host")
-    : h("span", { class: "route__host mono" }, route.host);
-  const app = route.origin === "api"
-    ? h("span", { class: "route__app" }, "app ", h("span", { class: "mono" }, route.app), " of ", route.owner)
-    : null;
-  return [name, app, reachView(route.host, state.listing?.listen)];
+function removal(route) {
+  const kept = route.sandbox.wasi.includes("keyvalue") ? " Its keyvalue data stays in the store." : "";
+  return `The route is withdrawn at once, and its component file deleted unless another console route uses it.${kept}`;
 }
 
 function componentCell(route) {
@@ -978,11 +183,11 @@ function componentCell(route) {
       h("span", { class: "route__digest mono", title: `sha256 ${component.sha256}` }, component.sha256.slice(0, 12)),
       sep(),
       h("span", { class: "num" }, humanBytes(component.bytes))),
-    route.deployed ? h("span", { class: "route__deployed" }, "deployed ", timeView(route.deployed)) : null,
+    deployedView(route),
   ];
 }
 
-function sandboxCell(sandbox) {
+function sandboxCell({ sandbox }) {
   const parts = sandbox.wasi.map((cap) => h("span", { class: "tag", title: CAP_HINTS[cap] ?? null }, cap));
   const limit = (text) => h("span", { class: "route__limit" }, text);
   if (sandbox.budget_ms !== defaults().budget_ms) {
@@ -1002,9 +207,9 @@ function sandboxCell(sandbox) {
     parts.push(h("span", { class: "route__kv mono", title: "keyvalue identifier → store/namespace" },
       `${identifier} → ${entry.store}/${entry.namespace}`));
   }
-  if (sandbox.env?.length) {
-    parts.push(h("span", { class: "route__env mono", title: "the guest's environment variables (their values are never shown)" },
-      `env ${sandbox.env.join(", ")}`));
+  const env = envView(sandbox.env);
+  if (env) {
+    parts.push(env);
   }
   if (!parts.length) {
     parts.push(h("span", { class: "route__defaults" }, "defaults"));
@@ -1012,89 +217,36 @@ function sandboxCell(sandbox) {
   return h("div", { class: "route__sandbox" }, parts);
 }
 
-function actionsCell(route) {
-  if (route.origin !== "console") {
-    return null;
-  }
-  const busy = state.busy.has(route.host);
-  const editing = state.editors.get(route.host)?.kind;
-  return h("div", { class: "route__actions" },
-    h("button", {
-      type: "button", class: "button button--small", "data-action": "replace", disabled: busy,
-      title: "Deploy another component to this host, keeping its sandbox",
-      onclick: () => {
-        replaceHost = route.host;
-        replaceFile.click();
-      },
-    }, "Replace…"),
-    h("button", {
-      type: "button", class: "button button--small", "data-action": "edit", disabled: busy,
-      "aria-expanded": String(editing === "sandbox"), onclick: () => toggleEditor(route),
-    }, "Edit sandbox"),
-    h("button", {
-      type: "button", class: "button button--small", "data-action": "rename", disabled: busy,
-      title: "Serve this route at another host, keeping its component and sandbox",
-      "aria-expanded": String(editing === "rename"), onclick: () => toggleRename(route),
-    }, "Rename…"),
-    h("button", {
-      type: "button", class: "button button--small button--danger", "data-action": "remove", disabled: busy,
-      onclick: () => removeRoute(route),
-    }, "Remove"));
-}
-
-function statusRow(host) {
-  const busy = state.busy.get(host);
-  const outcome = state.outcomes.get(host);
-  if (!busy && !outcome) {
-    rowStatuses.delete(host);
-    return null;
-  }
-  const signature = JSON.stringify([busy?.phase, busy?.text, outcome]);
-  let cached = rowStatuses.get(host);
-  if (cached?.signature !== signature) {
-    let content;
-    let progress = null;
-    if (busy) {
-      progress = progressView();
-      if (busy.phase === "uploading") {
-        progress.upload(busy.progress, busy.total);
-      }
-      else {
-        progress.working(busy.text ?? "Compiling and reloading the routes…");
-      }
-      content = progress.element;
-    }
-    else {
-      content = outcomeView(outcome, h("button", {
-        type: "button", class: "link-button",
-        onclick: () => {
-          state.outcomes.delete(host);
-          render();
-        },
-      }, "Dismiss"));
-    }
-    cached = { signature, row: h("tr", { class: "route__status", "data-host": host }, h("td", { colspan: 4 }, content)), progress };
-    rowStatuses.set(host, cached);
-  }
-  return cached.row;
-}
-
-function render() {
-  if (!state.listing) {
-    return;
-  }
-  renderStatus();
-  renderRoutes();
-  refreshDeploy();
-  // a rename's note follows the listing, as the deploy form's does
-  for (const editor of state.editors.values()) {
-    editor.refresh?.();
-  }
-}
-
-follow((listing, moved) => {
-  state.listing = listing;
-  if (moved) {
-    render();
-  }
+consolePage({
+  limit: "max_component_bytes",
+  head: [0, 8],
+  sniff,
+  accept: /\.wasm$/i,
+  extension: ".wasm",
+  fallback: "component",
+  contentType: "application/wasm",
+  flags: "--wasm",
+  settings: {
+    noun: "sandbox",
+    unchanged: "the sandbox stays as it was.",
+    of: (route) => route.sandbox,
+    initial: defaultSandbox,
+    pairs: sandboxPairs,
+    fields: sandboxFields,
+  },
+  cells: [componentCell, sandboxCell],
+  removal,
+  renamed,
+  words: {
+    one: "component",
+    first: "a component",
+    kind: "a WebAssembly component",
+    replaces: "Replaces the component and sandbox of this console route.",
+    onRow: "drop a .wasm on a row to replace its component",
+    loading: "Compiling and reloading the routes…",
+    saving: "Reloading the routes…",
+    keeps: "component and sandbox",
+  },
 });
+
+follow(showListing);

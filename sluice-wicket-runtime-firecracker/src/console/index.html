@@ -43,7 +43,7 @@
         <ol>
           <li>An ext4 image whose <span class="mono">/init</span> is the wicket&rsquo;s guest (<span class="mono">scripts/build-guest.sh</span>, <span class="mono">scripts/cnb-rootfs.sh</span>), of at most <span data-field="limit">the upload limit</span>.</li>
           <li>Its VMs boot (a template is snapshotted) before anything changes: if they fail, the routes stay as they were.</li>
-          <li>Served at once, without a restart. A host deployed here is replaced in place; routes of the config file and <span class="mono">--vm</span> flags are read-only.</li>
+          <li>Served at once, without a restart. A host deployed here is replaced in place; routes of the config file and <span class="mono">--vm</span> flags, and apps, are read-only.</li>
         </ol>
       </div>
     </div>
@@ -134,7 +134,7 @@
 
   <section class="panel" aria-labelledby="routes-heading">
     <h2 id="routes-heading" class="rule-heading">Routes</h2>
-    <p class="hint">Routes deployed here can be replaced by dropping an <span class="mono">.ext4</span> image on their row. Routes from the config file and <span class="mono">--vm</span> flags are read-only here.</p>
+    <p class="hint">Routes deployed here can be replaced by dropping an <span class="mono">.ext4</span> image on their row. Apps and routes from the config file and <span class="mono">--vm</span> flags are read-only here.</p>
     <div data-slot="routes-note"></div>
     <div class="routes-frame">
       <table class="grid routes" data-testid="routes">
