@@ -10,6 +10,16 @@ The cf-api in a VM of the wicket, on its disk (its README,
 - an upgrade: the new one boots on the disk: 0.7-0.8s of no API. A new image that does not start is
   refused (422, 11.5s)
 
+## A start that never listens
+
+An app's process living and not listening takes its start `boot-ms` (the health check's timeout, 60s
+by default). Before, the edit lock and the wicket's reload both waited for it: `cf set-env` of another
+app was seen past a 20s client timeout. With one such start under way (40s timeout), of another app:
+`cf set-env` 41ms, `cf restart` 797ms.
+
+Still held for a boot: a disk's VM replaced, and a reload of the wicket's files or on SIGHUP. A pool's
+fill failing for room reads as its VMs not starting: not tried again at a revision.
+
 ## Who logs in
 
 Neither `--oidc-issuer` nor `--any-credentials`: no start, on a host as in a VM. A flag, not

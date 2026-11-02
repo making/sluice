@@ -98,6 +98,13 @@ impl Drop for Slot {
 #[derive(Debug)]
 pub struct Full(String);
 
+impl Full {
+    /// Named after the route that asked.
+    pub fn of(self, label: &str) -> Full {
+        Full(format!("route {label}: {}", self.0))
+    }
+}
+
 impl std::fmt::Display for Full {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)

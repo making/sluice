@@ -30,6 +30,7 @@ impl Refusal {
                 error: message.into(),
                 host: None,
                 missing: Vec::new(),
+                did_not_start: false,
             },
         }
     }
@@ -50,6 +51,10 @@ pub struct ErrorView {
     /// The digests of the files an app named and no upload kept (409).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<String>,
+    /// The route's VMs did not start, of what they are (422): a controller need not try again
+    /// until something it asks changes.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub did_not_start: bool,
 }
 
 /// An edit the routes took: the generation serving it, and what changed.

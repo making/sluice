@@ -1382,7 +1382,7 @@ impl Route {
             None => capacity
                 .take(need, START_WAIT)
                 .await
-                .map_err(|e| format!("route {label}: {e}"))?,
+                .map_err(|e| e.of(&label))?,
         };
         if let Some(disk) = &spec.vm.disk {
             disk.ready()

@@ -84,6 +84,15 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    fn internal(e: &tokio::task::JoinError) -> ApiError {
+        ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: 10001,
+            title: "UnknownError",
+            detail: format!("the request failed: {e}"),
+        }
+    }
+
     pub fn not_found(what: &str) -> ApiError {
         ApiError {
             status: StatusCode::NOT_FOUND,
@@ -251,7 +260,12 @@ where
 {
     let service = hyper::service::service_fn(move |request| {
         let api = api.clone();
-        async move { Ok::<_, Infallible>(api.handle(request).await) }
+        async move {
+            // in a task of its own: an edit goes on when its client gives up (a start may take
+            // the health check's whole timeout), the state and the wicket's answer kept
+            let handled = tokio::spawn(async move { api.handle(request).await }).await;
+            Ok::<_, Infallible>(handled.unwrap_or_else(|e| ApiError::internal(&e).into()))
+        }
     });
     let _ = hyper::server::conn::http1::Builder::new()
         .serve_connection(TokioIo::new(stream), service)
@@ -1152,7 +1166,7 @@ impl Api {
         guids: &[String],
         change: &(dyn Fn(&mut State) -> Result<(), ApiError> + Sync),
     ) -> Result<(), ApiError> {
-        let _edit = self.controller.edits.lock().await;
+        let _apps = self.controller.hold_all(guids).await;
         let trial = self.store.read(|state| {
             let mut trial = state.clone();
             change(&mut trial)?;
@@ -1180,7 +1194,7 @@ impl Api {
     }
 
     /// Puts an app as an edit would leave it. An app the wicket is not known to serve (it
-    /// refused it, or a client gave up on its start) has nothing to break: refused it goes
+    /// refused it) has nothing to break: refused it goes
     /// through, or what would fix the app (a push of another image, more memory) could not
     /// be made. As it was, it is not tried: the refusal is known, and may have taken the
     /// health check's whole timeout.
@@ -1226,7 +1240,14 @@ impl Api {
             }
         };
         let stack = self.stack_of_new_apps().await;
-        let _edit = self.controller.edits.lock().await;
+        let named: Vec<String> = self.store.read(|state| {
+            let named = manifest.applications.iter();
+            named
+                .filter_map(|spec| state.app_named(spec.name.trim()))
+                .map(|app| app.guid.clone())
+                .collect()
+        });
+        let _apps = self.controller.hold_all(&named).await;
         let (trial, guids) = {
             let mut trial = self.store.read(State::clone);
             match manifest::apply(&mut trial, &manifest, stack) {
@@ -1268,24 +1289,38 @@ impl Api {
                 }
             }
         }
-        // the bindings `services:` made
-        let bound: Vec<(String, String)> = self.store.read(|state| {
-            trial
+        // made on the state as it is by now: all of it or, the other edits since refusing it,
+        // none. An app new since the trial was not put: it is no started one
+        let committed = self.store.update(|state| {
+            let mut next = state.clone();
+            let guids = manifest::apply(&mut next, &manifest, stack)?;
+            // the bindings `services:` made
+            let bound: Vec<(String, String)> = next
                 .bindings
                 .iter()
                 .filter(|binding| state.binding(&binding.guid).is_none())
                 .filter_map(|binding| {
-                    let instance = trial.instance(&binding.instance)?;
+                    let instance = next.instance(&binding.instance)?;
                     Some((binding.app.clone(), instance.name.clone()))
                 })
-                .collect()
+                .collect();
+            *state = next;
+            Ok::<_, String>((guids, bound, state.space.guid.clone()))
         });
-        let space = self.store.update(|state| {
-            let wicket = std::mem::take(&mut state.wicket);
-            *state = trial;
-            state.wicket = wicket;
-            state.space.guid.clone()
-        });
+        let (guids, bound, space) = match committed {
+            Ok(committed) => committed,
+            Err(e) => {
+                for guid in applied {
+                    let _ = self.controller.sync(guid).await;
+                }
+                return self.job(
+                    req,
+                    "space.apply_manifest",
+                    vec![ApiError::unprocessable(e).job_error()],
+                    None,
+                );
+            }
+        };
         for guid in &guids {
             self.logs.add(guid, "API", "Applied the manifest");
         }
@@ -1341,7 +1376,6 @@ impl Api {
         };
         let lifecycle = lifecycle(&body)?;
         let stack = self.stack_of_new_apps().await;
-        let _edit = self.controller.edits.lock().await;
         let view = self.store.update(|state| {
             if state.app_named(name).is_some() {
                 return Err(ApiError {
@@ -1376,7 +1410,6 @@ impl Api {
         let body: Value = req.json()?;
         let lifecycle = lifecycle(&body)?;
         self.app(guid)?;
-        let _edit = self.controller.edits.lock().await;
         let view = self.store.update(|state| {
             if let Some(name) = body["name"].as_str()
                 && state
@@ -1423,7 +1456,6 @@ impl Api {
             .as_object()
             .ok_or_else(|| ApiError::unprocessable("Var must be an object"))?;
         self.app(guid)?;
-        let _edit = self.controller.edits.lock().await;
         let app = self.store.update(|state| {
             let app = state
                 .app_mut(guid)
@@ -1447,7 +1479,7 @@ impl Api {
 
     async fn delete_app(&self, req: &Req, guid: &str) -> Reply {
         let app = self.app(guid)?;
-        let _edit = self.controller.edits.lock().await;
+        let _app = self.controller.hold(guid).await;
         // gone from the wicket first; if it does not take that, the watch removes it when it does
         let removed = self.controller.apply(guid, None).await;
         let blobs = self.store.update(|state| {
@@ -1458,6 +1490,7 @@ impl Api {
         });
         self.store.delete(&blobs);
         self.logs.forget(guid);
+        self.controller.forget(guid);
         println!("[{guid}] API: deleted app {}", app.name);
         self.job(req, "app.delete", Vec::new(), None)
     }
@@ -1465,7 +1498,6 @@ impl Api {
     async fn patch_process(&self, req: &Req, process: &str) -> Reply {
         let body: Value = req.json()?;
         let app = self.app_of_process(process)?;
-        let _edit = self.controller.edits.lock().await;
         let view = self.store.update(|state| {
             let app = state
                 .app_mut(&app.guid)
@@ -1572,7 +1604,7 @@ impl Api {
             .ok_or_else(|| ApiError::unprocessable("data.guid names the droplet"))?
             .to_string();
         self.app(guid)?;
-        let _edit = self.controller.edits.lock().await;
+        let _app = self.controller.hold(guid).await;
         let blobs = self.store.update(|state| {
             match state.droplet(&droplet) {
                 Some(found) if found.app == guid => {}
@@ -1602,7 +1634,7 @@ impl Api {
     /// outcome is in the stats and the log.
     async fn lifecycle(&self, req: &Req, guid: &str, action: &str) -> Reply {
         self.app(guid)?;
-        let _edit = self.controller.edits.lock().await;
+        let _app = self.controller.hold(guid).await;
         let app = self.store.update(|state| {
             let running = if action == "stop" {
                 None
@@ -1869,6 +1901,7 @@ impl Api {
     }
 
     async fn delete_route(&self, req: &Req, guid: &str) -> Reply {
+        let _route = self.controller.hold(guid).await;
         let route = self
             .store
             .read(|state| state.route(guid).cloned())
@@ -1883,6 +1916,7 @@ impl Api {
         }
         self.store
             .update(|state| state.routes.retain(|kept| kept.guid != guid));
+        self.controller.forget(guid);
         self.job(req, "route.delete", Vec::new(), None)
     }
 
@@ -1890,6 +1924,7 @@ impl Api {
     /// `replace` (a PATCH) unmaps the app mapped before.
     async fn map_route(&self, req: &Req, guid: &str, replace: bool) -> Reply {
         let body: Value = req.json()?;
+        let _route = self.controller.hold(guid).await;
         let route = self
             .store
             .read(|state| state.route(guid).cloned())
@@ -1972,6 +2007,7 @@ impl Api {
     }
 
     async fn unmap_route(&self, _req: &Req, guid: &str, destination: &str) -> Reply {
+        let _route = self.controller.hold(guid).await;
         let route = self
             .store
             .read(|state| state.route(guid).cloned())
@@ -2024,7 +2060,7 @@ impl Api {
             )));
         }
         let given = body["droplet"]["guid"].as_str().map(String::from);
-        let _edit = self.controller.edits.lock().await;
+        let _app = self.controller.hold(&app).await;
         let (deployment, blobs) = self.store.update(|state| {
             let previous = state.app(&app).and_then(|app| app.current_droplet.clone());
             let mut blobs = Vec::new();

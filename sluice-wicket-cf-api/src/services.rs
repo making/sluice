@@ -810,7 +810,6 @@ impl Api {
                     "Invalid service plan. Ensure that the service plan exists, is available, and you have access to it.",
                 )
             })?;
-        let _edit = self.controller.edits.lock().await;
         let instance = self.store.update(|state| {
             if state.instance_named(&name).is_some() {
                 return Err(name_taken(&name));
@@ -858,7 +857,6 @@ impl Api {
             .then(|| tags(&body["tags"]))
             .transpose()?;
         let plan = body["relationships"]["service_plan"]["data"]["guid"].as_str();
-        let _edit = self.controller.edits.lock().await;
         let view = self.store.update(|state| {
             let current = state
                 .instance(guid)
@@ -899,7 +897,6 @@ impl Api {
     /// instance's data is deleted once no app maps it.
     async fn delete_instance(&self, req: &Req, guid: &str) -> Reply {
         let purge = req.q("purge") == Some("true");
-        let _edit = self.controller.edits.lock().await;
         let (instance, dropped) = self.store.update(|state| {
             let instance = state
                 .instance(guid)
@@ -981,7 +978,6 @@ impl Api {
             .as_str()
             .ok_or_else(|| ApiError::unprocessable("relationships.app names the app"))?;
         let name = body["name"].as_str().map(String::from);
-        let _edit = self.controller.edits.lock().await;
         let (binding, instance_name) = self.store.update(|state| {
             if state.app(app).is_none() {
                 return Err(ApiError::unprocessable(format!(
@@ -1026,7 +1022,6 @@ impl Api {
     }
 
     async fn delete_binding(&self, req: &Req, guid: &str) -> Reply {
-        let _edit = self.controller.edits.lock().await;
         let (binding, instance_name) = self.store.update(|state| {
             let binding = state
                 .binding(guid)

@@ -170,12 +170,13 @@ pub struct Edited {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Failure {
     /// The wicket answered no (4xx): its reason, the host of the route that
-    /// did not load, the components it has no upload of.
+    /// did not load, the components it has no upload of, whether the app's VMs did not start.
     Refused {
         status: u16,
         error: String,
         host: Option<String>,
         missing: Vec<String>,
+        did_not_start: bool,
     },
     /// No answer, or none to act on (5xx).
     Unreachable(String),
@@ -204,6 +205,8 @@ struct ErrorBody {
     host: Option<String>,
     #[serde(default)]
     missing: Vec<String>,
+    #[serde(default)]
+    did_not_start: bool,
 }
 
 impl Wicket {
@@ -369,12 +372,14 @@ fn refused(status: reqwest::StatusCode, body: &[u8]) -> Failure {
             error: error.error,
             host: error.host,
             missing: error.missing,
+            did_not_start: error.did_not_start,
         },
         Err(_) => Failure::Refused {
             status: status.as_u16(),
             error: format!("{status}: {}", String::from_utf8_lossy(body)),
             host: None,
             missing: Vec::new(),
+            did_not_start: false,
         },
     }
 }

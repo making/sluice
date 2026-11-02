@@ -8,6 +8,12 @@
 //! revision moves, its apps of the owner are listed and the difference put /
 //! deleted. The wicket serves on while the cf-api is down.
 //!
+//! A put may take an app's health check timeout, so nothing but that app waits for it:
+//! one edit of an app at a time ([`Controller::hold`]), each put of the listing's differences
+//! in a task of its own. The state's changes are atomic, an edit tried against the wicket making
+//! its change on the state as it is by then. An app whose VMs did not start is not tried again
+//! until what is asked of it changes, the wicket came back, or the cf-api started.
+//!
 //! An app of the owner the state does not know is left where it is, and logged: a state
 //! that never knew an app did not put it (a lost data directory, another cf-api on the
 //! wicket), and its absence says nothing of what is wanted. What the state deletes it
@@ -17,7 +23,7 @@
 //! namespace, the wicket's draining routes included: tried at the deletion
 //! and again after each listing.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,9 +36,10 @@ pub struct Controller {
     pub store: Arc<Store>,
     pub wicket: Arc<Wicket>,
     pub logs: Arc<Logs>,
-    /// One edit at a time: a trial against the wicket and its commit are
-    /// not interleaved with another's.
-    pub edits: tokio::sync::Mutex<()>,
+    /// What is edited one at a time, by guid ([`Controller::hold`]).
+    pub held: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// The apps whose VMs did not start, as they were put.
+    pub did_not_start: Mutex<BTreeMap<String, AppBody>>,
     /// What the wicket offers, as it last listed it.
     pub offer: Mutex<Option<Offer>>,
     /// What the wicket runs apps as, as it last listed it.
@@ -42,6 +49,38 @@ pub struct Controller {
 }
 
 impl Controller {
+    /// Waits for the edit under way of the app or route `guid`, if any: its trial against the
+    /// wicket and its commit are not interleaved with another's. A route is held before its
+    /// apps, and an edit's apps at once ([`Controller::hold_all`]).
+    pub async fn hold(&self, guid: &str) -> Held {
+        self.lock_of(guid).lock_owned().await
+    }
+
+    /// [`Controller::hold`] of the apps `guids`, in an order every edit takes them in.
+    pub async fn hold_all(&self, guids: &[String]) -> Vec<Held> {
+        let mut sorted: Vec<&String> = guids.iter().collect();
+        sorted.sort();
+        sorted.dedup();
+        let mut held = Vec::with_capacity(sorted.len());
+        for guid in sorted {
+            held.push(self.hold(guid).await);
+        }
+        held
+    }
+
+    /// `guid`, deleted, is held no more.
+    pub fn forget(&self, guid: &str) {
+        self.held
+            .lock()
+            .expect("no panic under the lock")
+            .remove(guid);
+    }
+
+    fn lock_of(&self, guid: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut held = self.held.lock().expect("no panic under the lock");
+        held.entry(guid.to_string()).or_default().clone()
+    }
+
     /// The wicket's app of `app` as `state` wants it; None when the app is
     /// stopped, was never started with a droplet, or has no route.
     pub fn desired(state: &State, app: &App, owner: &str) -> Option<AppBody> {
@@ -116,8 +155,7 @@ impl Controller {
     /// Deletes the data of the deleted instances no started app's snapshot
     /// maps any more, as far as the wicket lets it: one a route still maps
     /// (409) waits, as does an unreachable wicket; one it cannot delete (a
-    /// store gone: 404) is dropped. Not under the edit lock: the caller
-    /// holds it.
+    /// store gone: 404) is dropped.
     pub async fn purge_pending(&self) {
         let due: Vec<Purge> = self.store.read(|state| {
             state
@@ -157,7 +195,7 @@ impl Controller {
     }
 
     /// Removes from the wicket the apps deleted while it was unreachable, as far as it
-    /// answers. Not under the edit lock: the caller holds it.
+    /// answers.
     async fn remove_pending(&self) {
         for guid in self.store.read(|state| state.removals.clone()) {
             match self.wicket.delete(&guid).await {
@@ -184,6 +222,10 @@ impl Controller {
     /// outcome: what the process stats and the log show.
     pub async fn apply(&self, guid: &str, desired: Option<&AppBody>) -> Result<(), Failure> {
         let Some(app) = desired else {
+            self.did_not_start
+                .lock()
+                .expect("no panic under the lock")
+                .remove(guid);
             return match self.wicket.delete(guid).await {
                 Ok(edited) => {
                     let was = self.store.note(|state| state.wicket.remove(guid));
@@ -222,6 +264,16 @@ impl Controller {
             }
         }
         let app = &app;
+        {
+            let mut crashed = self.did_not_start.lock().expect("no panic under the lock");
+            match &put {
+                Err(Failure::Refused {
+                    did_not_start: true,
+                    ..
+                }) => crashed.insert(guid.to_string(), app.clone()),
+                _ => crashed.remove(guid),
+            };
+        }
         let (outcome, line) = match &put {
             Ok(edited) => (
                 Outcome::Running,
@@ -327,10 +379,10 @@ impl Controller {
         self.apply(guid, desired.as_ref()).await
     }
 
-    /// Puts / deletes the difference between the apps the wicket listed and the state, and
-    /// logs the apps of the owner the state does not know. The listing is taken under the
-    /// edit lock, which the caller holds: what an edit did while it waited is in it.
-    async fn fix(&self, listed: &[ListedApp]) {
+    /// Puts / deletes, each in a task, the difference between the apps the wicket listed and
+    /// the state, and logs the apps of the owner the state does not know. An app under an edit
+    /// is the edit's, one whose VMs did not start as it is wanted is not tried again.
+    fn fix(self: &Arc<Self>, listed: &[ListedApp]) {
         let owner = &self.wicket.owner;
         let wanted: Vec<(String, Option<AppBody>)> = self.store.read(|state| {
             state
@@ -347,10 +399,18 @@ impl Controller {
                 (Some(desired), Some(listed)) if same(&listed.app, desired) => {
                     self.record(guid, Outcome::Running, "Found in the wicket as wanted");
                 }
-                (Some(_), _) | (None, Some(_)) => {
-                    let _ = self.apply(guid, desired.as_ref()).await;
-                }
                 (None, None) => {}
+                _ if self.refused_as(guid, desired.as_ref()) => {}
+                _ => {
+                    let Ok(held) = self.lock_of(guid).try_lock_owned() else {
+                        continue;
+                    };
+                    let (controller, guid) = (self.clone(), guid.clone());
+                    tokio::spawn(async move {
+                        let _held = held;
+                        let _ = controller.sync(&guid).await;
+                    });
+                }
             }
         }
         let removing = self.store.read(|state| state.removals.clone());
@@ -374,6 +434,12 @@ impl Controller {
         }
     }
 
+    /// Whether the wicket's refusal of `desired` holds: its VMs did not start.
+    fn refused_as(&self, guid: &str, desired: Option<&AppBody>) -> bool {
+        let crashed = self.did_not_start.lock().expect("no panic under the lock");
+        crashed.get(guid).is_some_and(|put| Some(put) == desired)
+    }
+
     /// Lists the wicket's apps and fixes the difference at startup, whenever the wicket's
     /// revision moves and when it answers again, then tries the pending removals and
     /// purges (after a hold too: a drained route's end moves no revision); while the wicket
@@ -390,6 +456,10 @@ impl Controller {
                     // back, it is looked at whatever its revision: a wicket restarted
                     // may have come to the one it had
                     after = None;
+                    self.did_not_start
+                        .lock()
+                        .expect("no panic under the lock")
+                        .clear();
                     tokio::time::sleep(pause).await;
                     pause = (pause * 2).min(Duration::from_secs(30));
                     continue;
@@ -405,12 +475,8 @@ impl Controller {
             if !moved && !pending {
                 continue;
             }
-            let _edit = self.edits.lock().await;
             if moved {
-                match self.wicket.list(None).await {
-                    Ok(current) => self.fix(&current.apps).await,
-                    Err(_) => after = None,
-                }
+                self.fix(&listing.apps);
             }
             self.remove_pending().await;
             self.purge_pending().await;
@@ -436,6 +502,9 @@ impl Controller {
         }
     }
 }
+
+/// What [`Controller::hold`] gives: held until dropped.
+pub type Held = tokio::sync::OwnedMutexGuard<()>;
 
 /// Cloud Controller's `default_health_check_timeout`: the seconds an app's process has to
 /// listen.
@@ -481,6 +550,7 @@ fn gone(sha256: &str, path: &std::path::Path, e: std::io::Error) -> Failure {
         error: format!("the droplet {sha256} is gone from {}: {e}", path.display()),
         host: None,
         missing: Vec::new(),
+        did_not_start: false,
     }
 }
 
@@ -629,6 +699,7 @@ mod tests {
             error: String::new(),
             host: None,
             missing: Vec::new(),
+            did_not_start: false,
         };
         assert!(refused(422).retried());
         assert!(Failure::Unreachable(String::new()).retried());

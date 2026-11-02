@@ -768,8 +768,67 @@ async fn deploy(
     let (status, same) = console(at, "PUT", "/api/apps/shop", true, body()).await;
     assert_eq!((status, same["message"].as_str()), (200, Some("no change")));
 
+    never_listening_app(tunnel, wicket, &sha256).await;
     restarting_app(tunnel, wicket, &sha256, conn_id).await;
     disk_app(tunnel, wicket, &sha256, dir, conn_id, jailed).await;
+}
+
+/// An app's VM never listening: its start holds no other edit, another edit of the app takes
+/// over from it, and its end tells a controller its VMs did not start.
+async fn never_listening_app(tunnel: &mut ServerTunnel, wicket: &Wicket, sha256: &str) {
+    let at = wicket.console();
+    let body = |host: &str, sandbox: serde_json::Value| {
+        let app = serde_json::json!({
+            "owner": "cf",
+            "hosts": [host],
+            "component": {"sha256": sha256, "name": "app.ext4"},
+            "sandbox": sandbox,
+        });
+        Bytes::from(app.to_string())
+    };
+    let hung = body(
+        "hung.local",
+        serde_json::json!({"port": 9999, "boot-ms": 60_000}),
+    );
+    let hanging = tokio::spawn(console(at, "PUT", "/api/apps/hung", true, hung));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let other = body("other.local", serde_json::json!({}));
+    let (status, put) = console(at, "PUT", "/api/apps/other", true, other).await;
+    assert_eq!(status, 200, "{put}; {}", wicket.log());
+    tunnel.advertise().await;
+    let gone = "/api/apps/other?owner=cf";
+    let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
+    assert_eq!(status, 200, "{removed}");
+    tunnel.advertise().await;
+    assert!(!hanging.is_finished(), "they waited for its start");
+
+    let fixed = body("hung.local", serde_json::json!({"mem": 128}));
+    let (status, put) = console(at, "PUT", "/api/apps/hung", true, fixed).await;
+    assert_eq!(status, 200, "{put}; {}", wicket.log());
+    tunnel.advertise().await;
+    let (status, refused) = hanging.await.unwrap();
+    assert_eq!(status, 422, "{refused}");
+    assert!(
+        refused["error"].as_str().unwrap().contains("took over"),
+        "{refused}"
+    );
+    assert_eq!(refused["did_not_start"], serde_json::Value::Null);
+
+    let hung = body(
+        "hung.local",
+        serde_json::json!({"port": 9999, "boot-ms": 500}),
+    );
+    let (status, refused) = console(at, "PUT", "/api/apps/hung", true, hung).await;
+    assert_eq!(
+        (status, &refused["did_not_start"]),
+        (422, &true.into()),
+        "{refused}"
+    );
+    let gone = "/api/apps/hung?owner=cf";
+    let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
+    assert_eq!(status, 200, "{removed}");
+    tunnel.advertise().await;
 }
 
 /// How long a route's VM may take to come back.

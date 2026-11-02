@@ -551,12 +551,16 @@ impl Console {
                     Refused::Invalid(_) => StatusCode::BAD_REQUEST,
                     Refused::Unknown(_) => StatusCode::NOT_FOUND,
                     Refused::Taken(_) | Refused::Missing(_) => StatusCode::CONFLICT,
-                    Refused::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
+                    Refused::Rejected(_) | Refused::DidNotStart(_) => {
+                        StatusCode::UNPROCESSABLE_ENTITY
+                    }
                     Refused::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 };
                 let mut refusal = Refusal::new(status, refused.to_string());
-                if let Refused::Missing(sha256) = refused {
-                    refusal.view.missing = vec![sha256];
+                match refused {
+                    Refused::Missing(sha256) => refusal.view.missing = vec![sha256],
+                    Refused::DidNotStart(_) => refusal.view.did_not_start = true,
+                    _ => {}
                 }
                 Err(refusal)
             }

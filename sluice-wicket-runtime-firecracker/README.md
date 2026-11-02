@@ -333,6 +333,11 @@ a host the config file or a flag routes, routes past the budget refuse it with t
 the routes stay as they were. The image is received to the console's directory as it comes
 (4 GiB at most), hashed on the way, and refused unless it carries an ext2/3/4 superblock.
 
+An edit's VMs start beside the other edits: none waits for a boot, which a process never listening
+takes a `boot-ms` long. A later edit of the same route or app takes over from it, ending its VMs
+(its request a 422). What still holds the edits for a boot is a [disk](#disks)'s VM replaced, and a
+reload of the files or on SIGHUP.
+
 The console keeps its routes in `--console-dir` (`console-dir`, default `deployed` next to the
 config file, else in the working directory: `/data/deployed` in the image) and serves them again
 after a restart:
@@ -421,6 +426,9 @@ digest, or made of an OCI image, first; the app names it:
 - a PUT is one reload: every host of the app or none, kept only when its VMs started; the same
   app again changes nothing. An app's target names it (`?app=<name>`), so its VMs are its own,
   whoever else names the image; the env is in no target: another env starts its VMs anew
+- 422 with `"did_not_start": true` when its VMs did not start, of what they are: a controller need
+  not try again until something it asks changes; a 422 without it may pass as the routes change
+  (no room for them)
 - 409 and `{"missing": [<sha256>]}` when no image of the digest is kept: upload it and put
   again. An upload is kept for ten minutes, a file an app named as long as an app does
 - a host the config file, a flag, a console route or another app routes is refused (409), and so

@@ -18,6 +18,7 @@ fn main() {
         .ok()
         .and_then(|ms| ms.parse().ok())
     {
+        eprintln!("sample process: waiting {wait}ms");
         std::thread::sleep(std::time::Duration::from_millis(wait));
     }
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());

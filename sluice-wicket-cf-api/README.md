@@ -737,6 +737,12 @@ What holds on both wickets; a component's and a VM's are in
 - an edit the wicket answers at once (map-route, unmap-route, scale -i, a manifest's routes)
   is refused with 422 and the wicket's reason, and changes nothing; a start, restart or
   deployment is accepted, and its outcome shows in the process stats and the log (`cf logs`)
+- a VM's start may take the health check's timeout (`cf push -t`, 60s by default): only that app's
+  edits that touch the wicket wait for it (`cf set-env` does not), and a client giving up leaves
+  it going, its outcome shown all the same. An app whose VMs did not start (`CRASHED`) is not
+  tried again until what is asked of it changes (`cf restart`), the wicket comes back or the
+  cf-api restarts; one the wicket refused for another reason (no room, a host taken) whenever
+  its revision moves
 - the desired state is the cf-api's: at startup and whenever the wicket's revision moves
   (`GET /api/apps?after=`), it lists the wicket's apps of its owner and puts / deletes the
   difference (the same app again changes nothing: the wicket's generation stays). The wicket

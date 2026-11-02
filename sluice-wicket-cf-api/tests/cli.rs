@@ -1525,10 +1525,10 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     assert!(logs.contains("sample process: exiting as told"), "{logs}");
     assert!(logs.contains("exited before it listened"), "{logs}");
     cf.ok(&["unset-env", "fc", "SAMPLE_EXIT"]);
-    let pushed = |extra: &[&str]| {
+    let pushed_as = |app: &'static str, extra: &[&str]| {
         let mut args = vec![
             "push",
-            "fc",
+            app,
             "--docker-image",
             &image,
             "--docker-username",
@@ -1539,6 +1539,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         push.env("CF_DOCKER_PASSWORD", "p4ss");
         cf.output(push, "")
     };
+    let pushed = |extra: &[&str]| pushed_as("fc", extra);
     let (ok, output) = pushed(&["-m", "512M"]);
     assert!(ok, "{output}");
     assert_eq!(listing(&console)["apps"][0]["sandbox"]["mem"], 512);
@@ -1554,8 +1555,6 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     cf.ok(&["unset-env", "fc", "SAMPLE_WAIT_MS"]);
     cf.ok(&["restart", "fc"]);
 
-    // the wicket restarted, back at the revision it had: the app shows starting while the
-    // wicket is down, and running again once it is back
     let shows = |app: &str, state: &str| {
         let deadline = Instant::now() + HANG;
         loop {
@@ -1570,6 +1569,49 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
             std::thread::sleep(Duration::from_millis(500));
         }
     };
+
+    // a process that lives and does not listen takes its start the health check's timeout, and
+    // no other app's edit waits for it; the start's client giving up, its outcome still shows
+    let (ok, output) = pushed_as("slow", &["-t", "40", "--no-start"]);
+    assert!(ok, "{output}");
+    cf.ok(&["set-env", "slow", "SAMPLE_WAIT_MS", "600000"]);
+    let mut starting = cf
+        .command(&["start", "slow"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let waiting = || {
+        cf.ok(&["logs", "slow", "--recent"])
+            .matches("sample process: waiting")
+            .count()
+    };
+    let deadline = Instant::now() + HANG;
+    while waiting() == 0 {
+        assert!(Instant::now() < deadline, "the process never started");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    cf.ok(&["set-env", "fc", "OTHER", "edit"]);
+    cf.ok(&["restart", "fc"]);
+    assert_eq!(get(&listen, "fc.localhost", "/", None).0, 200);
+    assert!(
+        starting.try_wait().unwrap().is_none(),
+        "the other app's edits waited for its start"
+    );
+    starting.kill().unwrap();
+    starting.wait().unwrap();
+    shows("slow", "crashed");
+    let logs = cf.ok(&["logs", "slow", "--recent"]);
+    assert!(logs.contains("within 40s"), "{logs}");
+    // the wicket's revision moving, it is not tried again: nothing it depends on changed
+    cf.ok(&["unset-env", "fc", "OTHER"]);
+    cf.ok(&["restart", "fc"]);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(waiting(), 1, "tried again");
+    cf.ok(&["delete", "slow", "-f"]);
+
+    // the wicket restarted, back at the revision it had: the app shows starting while the
+    // wicket is down, and running again once it is back
     wicket.kill();
     drop(wicket);
     shows("fc", "starting");

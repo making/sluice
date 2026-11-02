@@ -152,7 +152,7 @@ impl Deployed {
             Err(e) => return Err(format!("{}: {e}", manifest.display())),
         };
         let deployed = Deployed { dir, routes, apps };
-        deployed.collect_garbage(true);
+        deployed.collect_garbage(true, []);
         Ok(deployed)
     }
 
@@ -222,9 +222,8 @@ impl Deployed {
         Ok(specs)
     }
 
-    /// The routes with `host` served by the image `received` (uploaded as
-    /// `name`) with `options` since `now`; the image kept. The same image and
-    /// options again change nothing.
+    /// The route of `host` served by the image `received` (uploaded as `name`) with `options`
+    /// since `now`, for [`Deployed::with`]; the image kept.
     pub fn deploy(
         &self,
         host: &str,
@@ -232,18 +231,18 @@ impl Deployed {
         received: Received,
         options: Options,
         now: SystemTime,
-    ) -> Result<Deployed, Refused> {
+    ) -> Result<Route, Refused> {
         let host = check_host(host).map_err(Refused::Invalid)?;
         let rootfs = self
             .images()
             .keep(&file_name(name, &host, EXT4), received)
             .map_err(Refused::Failed)?;
-        Ok(self.with(Route {
+        Ok(Route {
             host,
             rootfs,
             options,
             deployed: rfc3339(now),
-        }))
+        })
     }
 
     /// The routes with the route of `host` taking `options` since `now`.
@@ -300,7 +299,7 @@ impl Deployed {
     /// The routes with `route` in place of the one of its host -- which stays
     /// as it was, its time included, when the image and the options are the
     /// same -- or added last.
-    fn with(&self, route: Route) -> Deployed {
+    pub fn with(&self, route: Route) -> Deployed {
         let mut deployed = self.clone();
         match deployed.routes.iter_mut().find(|r| r.host == route.host) {
             Some(r) if r.rootfs == route.rootfs && r.options == route.options => {}
@@ -459,14 +458,20 @@ impl Deployed {
         )
     }
 
-    /// Removes the images nothing names; at `startup` the uploads a crash cut
-    /// short too; and the uploads kept for `UPLOAD_GRACE`.
-    pub fn collect_garbage(&self, startup: bool) {
+    /// Removes the images nothing names but `starting`, relative to the directory, the VMs of
+    /// an edit starting from them; at `startup` the uploads a crash cut short too; and the
+    /// uploads kept for `UPLOAD_GRACE`.
+    pub fn collect_garbage<'a>(
+        &'a self,
+        startup: bool,
+        starting: impl IntoIterator<Item = &'a String>,
+    ) {
         let named = self
             .routes
             .iter()
             .map(|route| &route.rootfs)
-            .chain(self.apps.iter().map(|app| &app.rootfs));
+            .chain(self.apps.iter().map(|app| &app.rootfs))
+            .chain(starting);
         self.images().collect_garbage(named, startup);
         collect_uploads(&self.dir);
     }

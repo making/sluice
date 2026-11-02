@@ -30,7 +30,11 @@
 //!
 //! The console's edits ([`Edit`]) are reloads too, of the routes as they would
 //! be with them: kept -- written to the console's directory -- only when they
-//! started. An app's are one reload: every host of it or none.
+//! started. An app's are one reload: every host of it or none. An edit's VMs start in a task
+//! ([`Ahead`]), the edit made once they did, on the routes as they are by then: no other edit
+//! waits for a boot, which a process never listening takes a `boot-ms` long. A later edit of the
+//! same app or host takes over from it, its VMs ended. A start in the order of a disk's is
+//! within its reload, as is a reload of the files or on SIGHUP: those hold the edits for it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -49,9 +53,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::BoxError;
-use crate::capacity::{Capacity, Slot};
+use crate::capacity::{Capacity, Full, Slot};
 use crate::config::{Origin, RouteSource};
-use crate::deployed::{AppSpec, Options};
+use crate::deployed::{self, AppSpec, Deployed, Options};
 use crate::output::Sink;
 use crate::route::{Down, Lease, Route, RouteSpec, Starting};
 use crate::vm::Places;
@@ -318,6 +322,8 @@ pub enum Edit {
         received: Received,
         options: Options,
     },
+    /// A deploy, its image kept: what can be made again on the routes as they are by then.
+    Kept { route: deployed::Route },
     /// Gives the console's route of `host` other options.
     Options { host: String, options: Options },
     /// Moves the console's route of `host` to `to` as it is.
@@ -340,6 +346,7 @@ impl Edit {
     fn describe(&self) -> String {
         match self {
             Edit::Deploy { host, .. } => format!("console: deploy to {host}"),
+            Edit::Kept { route } => format!("console: deploy to {}", route.host),
             Edit::Options { host, .. } => format!("console: options of {host}"),
             Edit::Move { host, to } => format!("console: move {host} to {to}"),
             Edit::Remove { host } => format!("console: remove {host}"),
@@ -347,6 +354,37 @@ impl Edit {
             Edit::PutApp { name, app } => format!("api: app {name} of {}", app.owner),
             Edit::DeleteApp { name, owner } => format!("api: remove app {name} of {owner}"),
             Edit::DeleteDisk { name, owner } => format!("api: remove disk {name} of {owner}"),
+        }
+    }
+
+    /// The console's route it changes.
+    fn host(&self) -> Option<&str> {
+        match self {
+            Edit::Deploy { host, .. }
+            | Edit::Options { host, .. }
+            | Edit::Move { host, .. }
+            | Edit::Remove { host } => Some(host),
+            Edit::Kept { route } => Some(&route.host),
+            Edit::Upload { .. }
+            | Edit::PutApp { .. }
+            | Edit::DeleteApp { .. }
+            | Edit::DeleteDisk { .. } => None,
+        }
+    }
+
+    /// Whether it takes over from `waiting`, an edit waiting for its VMs: another of the same
+    /// route, or of the same app by its owner.
+    fn takes_over(&self, waiting: &Edit) -> bool {
+        if self.host().is_some() {
+            return self.host() == waiting.host();
+        }
+        let Edit::PutApp { name, app: put } = waiting else {
+            return false;
+        };
+        match self {
+            Edit::PutApp { name: of, app } => of == name && app.owner == put.owner,
+            Edit::DeleteApp { name: of, owner } => of == name && *owner == put.owner,
+            _ => false,
         }
     }
 }
@@ -373,6 +411,8 @@ pub enum Refused {
     Missing(String),
     /// The routes did not start with it: the reload's error.
     Rejected(String),
+    /// Its VMs did not start, of what they are: another try, nothing else changed, fails alike.
+    DidNotStart(String),
     /// The console's directory failed.
     Failed(String),
 }
@@ -384,6 +424,7 @@ impl std::fmt::Display for Refused {
             | Refused::Unknown(message)
             | Refused::Taken(message)
             | Refused::Rejected(message)
+            | Refused::DidNotStart(message)
             | Refused::Failed(message) => f.write_str(message),
             Refused::Missing(sha256) => {
                 write!(f, "no image of the digest {sha256} kept: upload it first")
@@ -392,9 +433,63 @@ impl std::fmt::Display for Refused {
     }
 }
 
+/// A route's VMs did not start, room for them aside ([`Full`]).
+#[derive(Debug)]
+struct DidNotStart(String);
+
+impl std::fmt::Display for DidNotStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DidNotStart {}
+
+/// What a reload failing refuses an edit with.
+fn refused(e: &BoxError) -> Refused {
+    match e.is::<DidNotStart>() {
+        true => Refused::DidNotStart(e.to_string()),
+        false => Refused::Rejected(e.to_string()),
+    }
+}
+
+/// A target to start: its spec, its hosts and the stamps of its files.
+struct Start {
+    target: String,
+    spec: RouteSpec,
+    hosts: Vec<String>,
+    stamps: Stamps,
+}
+
+/// How a target gets the VMs its spec asks.
+enum Way {
+    /// It has them.
+    Kept,
+    Start,
+    /// Started once the route holding its disk stopped.
+    Swap(Arc<Route>),
+}
+
+/// An edit waiting for its VMs.
+struct Ahead {
+    edit: Edit,
+    reason: String,
+    reply: oneshot::Sender<Result<Outcome, Refused>>,
+    /// The images they start from, relative to the console's directory: no collection takes them.
+    images: Vec<String>,
+    /// Their starts, ended with it.
+    _starting: AbortOnDropHandle<()>,
+}
+
+/// The starts of an [`Ahead`] ended.
+struct StartedAhead {
+    id: u64,
+    started: Result<HashMap<String, Started>, BoxError>,
+}
+
 /// Starts the routes and keeps them current: on a change of their files, on
 /// request (SIGHUP), or on an edit of the console's. Reloads run one at a
-/// time.
+/// time, an edit's VMs starting before its own ([`Ahead`]).
 pub struct Reloader {
     routes: Arc<Routes<Table>>,
     /// What the console shows of the reloads.
@@ -417,6 +512,13 @@ pub struct Reloader {
     /// Targets whose shared VM went down -> how that goes.
     restarts: HashMap<String, Restart>,
     attempts: u64,
+    /// Edits waiting for their VMs, by a number of their own.
+    ahead: HashMap<u64, Ahead>,
+    next_ahead: u64,
+    /// The VMs the edit being made started, by target: the reload's to take.
+    ready: HashMap<String, Started>,
+    started_ahead: mpsc::UnboundedReceiver<StartedAhead>,
+    tell_started_ahead: mpsc::UnboundedSender<StartedAhead>,
     downs: mpsc::UnboundedReceiver<Down>,
     tell_down: mpsc::UnboundedSender<Down>,
     restarted: mpsc::UnboundedReceiver<Restarted>,
@@ -436,6 +538,7 @@ impl Reloader {
     ) -> Result<Reloader, BoxError> {
         let (tell_down, downs) = mpsc::unbounded_channel();
         let (tell_restarted, restarted) = mpsc::unbounded_channel();
+        let (tell_started_ahead, started_ahead) = mpsc::unbounded_channel();
         let mut reloader = Reloader {
             routes: Routes::new(Table {
                 generation: 0,
@@ -456,6 +559,11 @@ impl Reloader {
             read: HashMap::new(),
             restarts: HashMap::new(),
             attempts: 0,
+            ahead: HashMap::new(),
+            next_ahead: 0,
+            ready: HashMap::new(),
+            started_ahead,
+            tell_started_ahead,
             downs,
             tell_down,
             restarted,
@@ -513,12 +621,17 @@ impl Reloader {
                 }
                 request = requests.recv(), if requests_open => {
                     match request {
-                        Some(Request { edit, reply }) => {
-                            let _ = reply.send(self.edit(edit).await);
+                        Some(request) => {
+                            self.take(request).await;
                             seen = self.watched();
                         }
                         None => requests_open = false,
                     }
+                    continue;
+                }
+                Some(started) = self.started_ahead.recv() => {
+                    self.ahead_ended(started).await;
+                    seen = self.watched();
                     continue;
                 }
                 Some(down) = self.downs.recv() => {
@@ -573,12 +686,179 @@ impl Reloader {
         );
     }
 
-    /// Applies an edit of the console's routes or apps: the image kept, the
-    /// routes as they would be are reloaded, and kept -- written to the
+    /// Takes an edit of the console's: its VMs to start, they start in a task and the edit is
+    /// made when they did ([`Reloader::ahead_ended`]); else it is made here. It takes over from
+    /// an edit of the same route or app waiting for its VMs, which is refused.
+    async fn take(&mut self, request: Request) {
+        let Request { edit, reply } = request;
+        let over: Vec<u64> = self
+            .ahead
+            .iter()
+            .filter(|(_, ahead)| edit.takes_over(&ahead.edit))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in over {
+            let ahead = self.ahead.remove(&id).expect("just found");
+            let why = format!("{} took over from it", edit.describe());
+            self.failed(&ahead.reason, &why);
+            let _ = ahead.reply.send(Err(Refused::Rejected(why)));
+        }
+        if let Edit::DeleteDisk { name, owner } = &edit
+            && self.ahead.values().any(|ahead| {
+                matches!(&ahead.edit, Edit::PutApp { name: of, app } if of == name && app.owner == *owner)
+            })
+        {
+            let held = format!("the app '{name}' is starting on that disk");
+            let _ = reply.send(Err(Refused::Taken(held)));
+            return;
+        }
+        match self.prepared(edit) {
+            Err(refused) => {
+                let _ = reply.send(Err(refused));
+            }
+            Ok((edit, starts)) if starts.is_empty() => {
+                let _ = reply.send(self.edit(edit).await);
+            }
+            Ok((edit, starts)) => self.start_ahead(edit, reply, starts),
+        }
+    }
+
+    /// The edit as it goes on, a deploy's image kept, and the VMs to start ahead of it: none
+    /// when it starts none, the routes would refuse it before they start any, or a start is
+    /// to wait for another VM to stop.
+    fn prepared(&mut self, edit: Edit) -> Result<(Edit, Vec<Start>), Refused> {
+        taken(&edit, &self.routes.current().origins)?;
+        let deployed = self
+            .source
+            .deployed()
+            .expect("edits come from the console, which deploys");
+        let now = SystemTime::now();
+        let edit = match edit {
+            Edit::Upload { .. } | Edit::DeleteDisk { .. } => return Ok((edit, Vec::new())),
+            Edit::Deploy {
+                host,
+                name,
+                received,
+                options,
+            } => Edit::Kept {
+                route: deployed.deploy(&host, &name, received, options, now)?,
+            },
+            edit => edit,
+        };
+        let edited = edited(deployed, &edit, now)?;
+        if &edited == deployed {
+            return Ok((edit, Vec::new()));
+        }
+        let previous = self.source.deploy(edited).expect("the console's routes");
+        let specs = self.source.read();
+        self.source.deploy(previous);
+        let Ok(specs) = specs else {
+            return Ok((edit, Vec::new()));
+        };
+        let specs: Vec<RouteSpec> = specs.into_iter().map(|(spec, _)| spec).collect();
+        if fits(&specs, &self.capacity).is_err() {
+            return Ok((edit, Vec::new()));
+        }
+        let mut starts = Vec::new();
+        for (target, spec, hosts) in targets(specs) {
+            let stamps = stamps(files(&spec));
+            match self.way(&target, &spec, &stamps) {
+                Way::Kept => {}
+                Way::Start => starts.push(Start {
+                    target,
+                    spec,
+                    hosts,
+                    stamps,
+                }),
+                Way::Swap(_) => return Ok((edit, Vec::new())),
+            }
+        }
+        Ok((edit, starts))
+    }
+
+    /// Starts `starts` in a task: `edit` waits for them.
+    fn start_ahead(
+        &mut self,
+        edit: Edit,
+        reply: oneshot::Sender<Result<Outcome, Refused>>,
+        starts: Vec<Start>,
+    ) {
+        let reason = edit.describe();
+        let dir = self.source.deployed().expect("an edit").dir().to_path_buf();
+        let images = starts
+            .iter()
+            .filter_map(|start| start.spec.vm.rootfs.strip_prefix(&dir).ok())
+            .map(|image| image.to_string_lossy().into_owned())
+            .collect();
+        let starting: Vec<_> = starts
+            .into_iter()
+            .map(|start| {
+                let Start {
+                    target,
+                    spec,
+                    hosts,
+                    stamps,
+                } = start;
+                (target, self.starter(spec, hosts, stamps, None))
+            })
+            .collect();
+        self.next_ahead += 1;
+        let id = self.next_ahead;
+        let tell = self.tell_started_ahead.clone();
+        let task = tokio::spawn(async move {
+            let started = all_started(starting).await;
+            let _ = tell.send(StartedAhead { id, started });
+        });
+        self.ahead.insert(
+            id,
+            Ahead {
+                edit,
+                reason,
+                reply,
+                images,
+                _starting: AbortOnDropHandle::new(task),
+            },
+        );
+    }
+
+    /// The VMs of an edit started: it is made, of the routes as they are by now. Of one that
+    /// was taken over: nothing, the VMs ending. Not started: it is refused.
+    async fn ahead_ended(&mut self, started: StartedAhead) {
+        let StartedAhead { id, started } = started;
+        let Some(ahead) = self.ahead.remove(&id) else {
+            return;
+        };
+        let outcome = match started {
+            Ok(started) => {
+                self.ready = started;
+                let outcome = self.edit(ahead.edit).await;
+                self.ready.clear();
+                outcome
+            }
+            Err(e) => {
+                self.failed(&ahead.reason, &e.to_string());
+                self.collect_garbage();
+                Err(refused(&e))
+            }
+        };
+        let _ = ahead.reply.send(outcome);
+    }
+
+    /// Removes the images nothing names but the edits waiting for their VMs.
+    fn collect_garbage(&self) {
+        let starting = self.ahead.values().flat_map(|ahead| &ahead.images);
+        self.source
+            .deployed()
+            .expect("edits come from the console, which deploys")
+            .collect_garbage(false, starting);
+    }
+
+    /// Applies an edit of the console's routes or apps (a deploy's image kept: [`Edit::Kept`]):
+    /// the routes as they would be are reloaded, and kept -- written to the
     /// console's directory -- only when they started; refused, the routes and
     /// the directory stay as they were. An upload keeps its image and changes
     /// no route.
-    pub async fn edit(&mut self, edit: Edit) -> Result<Outcome, Refused> {
+    async fn edit(&mut self, edit: Edit) -> Result<Outcome, Refused> {
         let reason = edit.describe();
         let current = self.routes.current();
         taken(&edit, &current.origins)?;
@@ -588,19 +868,10 @@ impl Reloader {
             .expect("edits come from the console, which deploys");
         let now = SystemTime::now();
         let edited = match edit {
-            Edit::Deploy {
-                host,
-                name,
-                received,
-                options,
-            } => deployed.deploy(&host, &name, received, options, now),
-            Edit::Options { host, options } => deployed.with_options(&host, options, now),
-            Edit::Move { host, to } => deployed.moved(&host, &to),
-            Edit::Remove { host } => deployed.without(&host),
             Edit::Upload { sha256, received } => {
                 let uploaded = deployed.upload(&sha256, received);
                 // the uploads kept long enough go
-                deployed.collect_garbage(false);
+                self.collect_garbage();
                 uploaded?;
                 return Ok(Outcome {
                     generation: current.generation,
@@ -615,8 +886,7 @@ impl Reloader {
                     change: None,
                 });
             }
-            Edit::PutApp { name, app } => deployed.with_app(&name, app, now),
-            Edit::DeleteApp { name, owner } => deployed.without_app(&name, &owner),
+            edit => edited(deployed, &edit, now),
         }?;
         // the same again changes nothing: a VM down comes back by itself
         if &edited == deployed {
@@ -630,9 +900,8 @@ impl Reloader {
             Ok(change) => {
                 self.logged(&reason, &change);
                 Status::recovered(&self.status);
-                let deployed = self.source.deployed().expect("just deployed");
-                let saved = deployed.save();
-                deployed.collect_garbage(false);
+                let saved = self.source.deployed().expect("just deployed").save();
+                self.collect_garbage();
                 saved.map_err(|e| {
                     eprintln!("{reason}: {e}");
                     Refused::Failed(e)
@@ -645,9 +914,8 @@ impl Reloader {
             Err(e) => {
                 self.failed(&reason, &e.to_string());
                 self.source.deploy(previous);
-                let deployed = self.source.deployed().expect("restored");
-                deployed.collect_garbage(false);
-                Err(Refused::Rejected(e.to_string()))
+                self.collect_garbage();
+                Err(refused(&e))
             }
         }
     }
@@ -827,9 +1095,29 @@ impl Reloader {
         as_started
     }
 
-    /// Starts what `specs` need that is not running as they ask, and
-    /// publishes them; nothing changes when a start fails, or when they do not
-    /// fit the VMs' budget.
+    /// How `target` gets the VMs `spec` asks, the files as `stamps` tell.
+    fn way(&self, target: &str, spec: &RouteSpec, stamps: &Stamps) -> Way {
+        // stopped too: it comes back by itself, no reload failing for it
+        if let Some(started) = self.started.get(target)
+            && started.spec.same_vms(spec)
+            && started.stamps == *stamps
+        {
+            return Way::Kept;
+        }
+        let holder = spec.vm.disk.as_ref().and_then(|disk| {
+            let current = self.routes.current();
+            current
+                .routes
+                .values()
+                .find(|route| route.disk() == Some(disk.file.as_path()))
+                .cloned()
+        });
+        holder.map_or(Way::Start, Way::Swap)
+    }
+
+    /// Starts what `specs` need that is not running as they ask, nor started by the edit being
+    /// made, and publishes them; nothing changes when a start fails, or when they do not fit
+    /// the VMs' budget.
     async fn apply(&mut self, specs: Vec<(RouteSpec, Origin)>) -> Result<Change, BoxError> {
         let (specs, origins): (Vec<RouteSpec>, Vec<Origin>) = specs.into_iter().unzip();
         fits(&specs, &self.capacity)?;
@@ -838,77 +1126,49 @@ impl Reloader {
             .map(|spec| spec.host.clone())
             .zip(origins)
             .collect();
-        // target -> its spec and hosts, in the order of the specs
-        let mut targets: Vec<(String, RouteSpec, Vec<String>)> = Vec::new();
-        let mut advertised = Vec::new();
-        for spec in specs {
-            let target = spec.target();
-            advertised.push(Upstream {
+        let advertised: Vec<Upstream> = specs
+            .iter()
+            .map(|spec| Upstream {
                 host: spec.host.clone(),
-                target_url: target.clone(),
+                target_url: spec.target(),
                 ..Default::default()
-            });
-            match targets.iter_mut().find(|(known, ..)| *known == target) {
-                Some((_, _, hosts)) => hosts.push(spec.host),
-                None => {
-                    let host = spec.host.clone();
-                    targets.push((target, spec, vec![host]));
-                }
-            }
-        }
+            })
+            .collect();
         let current = self.routes.current();
         let mut change = Change::default();
-        let mut starting = JoinSet::new();
+        let mut starting = Vec::new();
         let mut kept = Vec::new();
+        let mut ready = HashMap::new();
         // the targets a VM on their disk stands in the way of, and that VM
         let mut swaps = Vec::new();
-        for (target, spec, hosts) in targets {
+        for (target, spec, hosts) in targets(specs) {
             let stamps = stamps(files(&spec));
-            match self.started.get(&target) {
-                // stopped too: it comes back by itself, no reload failing for it
-                Some(started) if started.spec.same_vms(&spec) && started.stamps == stamps => {
-                    kept.push((target, hosts));
-                    continue;
-                }
-                Some(_) => {
-                    change.restarted.extend(hosts.iter().cloned());
-                    // this start takes over: on no room held, and with no wait
-                    self.restarts.remove(&target);
-                }
-                None => {}
+            let way = self.way(&target, &spec, &stamps);
+            if matches!(way, Way::Kept) {
+                kept.push((target, hosts));
+                continue;
             }
-            let holder = spec.vm.disk.as_ref().and_then(|disk| {
-                current
-                    .routes
-                    .values()
-                    .find(|route| route.disk() == Some(disk.file.as_path()))
-                    .cloned()
-            });
-            match holder {
-                Some(holder) => swaps.push((holder, target, spec, hosts, stamps)),
-                None => {
-                    let start = self.starter(spec, hosts, stamps, None);
-                    starting.spawn(async move { (target, start.await) });
-                }
+            if self.started.contains_key(&target) {
+                change.restarted.extend(hosts.iter().cloned());
+                // this start takes over: on no room held, and with no wait
+                self.restarts.remove(&target);
+            }
+            if let Some(started) = self
+                .ready
+                .remove(&target)
+                .filter(|started| started.spec.same_vms(&spec) && started.stamps == stamps)
+            {
+                started.route.rename(&hosts);
+                ready.insert(target, started);
+                continue;
+            }
+            match way {
+                Way::Swap(holder) => swaps.push((holder, target, spec, hosts, stamps)),
+                _ => starting.push((target, self.starter(spec, hosts, stamps, None))),
             }
         }
-        let mut new = HashMap::new();
-        while let Some(joined) = starting.join_next().await {
-            let (target, started) = match joined {
-                Ok((target, Ok(started))) => (target, started),
-                failed => {
-                    // the starts under way end, and with them their VMs and files
-                    starting.shutdown().await;
-                    drop(new);
-                    return Err(match failed {
-                        Ok((_, Err(e))) => e,
-                        Err(e) => e.into(),
-                        Ok((_, Ok(_))) => unreachable!(),
-                    });
-                }
-            };
-            new.insert(target, started);
-        }
+        let mut new = all_started(starting).await?;
+        new.extend(ready);
         let mut stopped: Vec<Arc<Route>> = Vec::new();
         let mut swapped: Vec<String> = Vec::new();
         for (holder, target, spec, hosts, stamps) in swaps {
@@ -1012,7 +1272,7 @@ impl Reloader {
         hosts: Vec<String>,
         stamps: Stamps,
         held: Option<Arc<Slot>>,
-    ) -> impl Future<Output = Result<Started, BoxError>> + Send + 'static {
+    ) -> impl Future<Output = Result<Started, BoxError>> + Send + 'static + use<> {
         let n = self.next_place;
         self.next_place += 1;
         let starting = Starting {
@@ -1024,7 +1284,12 @@ impl Reloader {
             workers: self.workers.clone(),
         };
         async move {
-            let route = Route::start(spec.clone(), &hosts, starting).await?;
+            let route = Route::start(spec.clone(), &hosts, starting)
+                .await
+                .map_err(|e| match e.is::<Full>() {
+                    true => e,
+                    false => DidNotStart(e.to_string()).into(),
+                })?;
             Ok(Started {
                 spec,
                 stamps,
@@ -1103,6 +1368,64 @@ impl Reloader {
     }
 }
 
+/// What `edit` makes of `deployed` since `now`. An upload, the removal of a disk and a deploy
+/// whose image is not kept yet are no change of it.
+fn edited(deployed: &Deployed, edit: &Edit, now: SystemTime) -> Result<Deployed, Refused> {
+    match edit {
+        Edit::Kept { route } => Ok(deployed.with(route.clone())),
+        Edit::Options { host, options } => deployed.with_options(host, options.clone(), now),
+        Edit::Move { host, to } => deployed.moved(host, to),
+        Edit::Remove { host } => deployed.without(host),
+        Edit::PutApp { name, app } => deployed.with_app(name, app.clone(), now),
+        Edit::DeleteApp { name, owner } => deployed.without_app(name, owner),
+        Edit::Deploy { .. } | Edit::Upload { .. } | Edit::DeleteDisk { .. } => Ok(deployed.clone()),
+    }
+}
+
+/// Target -> its spec and hosts, in the order of the specs.
+fn targets(specs: Vec<RouteSpec>) -> Vec<(String, RouteSpec, Vec<String>)> {
+    let mut targets: Vec<(String, RouteSpec, Vec<String>)> = Vec::new();
+    for spec in specs {
+        let target = spec.target();
+        match targets.iter_mut().find(|(known, ..)| *known == target) {
+            Some((_, _, hosts)) => hosts.push(spec.host),
+            None => {
+                let host = spec.host.clone();
+                targets.push((target, spec, vec![host]));
+            }
+        }
+    }
+    targets
+}
+
+/// Runs the starts at once: the first failure ends the others, and with them their VMs and files.
+async fn all_started<F>(starts: Vec<(String, F)>) -> Result<HashMap<String, Started>, BoxError>
+where
+    F: Future<Output = Result<Started, BoxError>> + Send + 'static,
+{
+    let mut starting = JoinSet::new();
+    for (target, start) in starts {
+        starting.spawn(async move { (target, start.await) });
+    }
+    let mut new = HashMap::new();
+    while let Some(joined) = starting.join_next().await {
+        match joined {
+            Ok((target, Ok(started))) => {
+                new.insert(target, started);
+            }
+            Ok((_, Err(e))) => {
+                starting.shutdown().await;
+                return Err(e);
+            }
+            Err(e) => {
+                starting.shutdown().await;
+                return Err(e.into());
+            }
+        }
+    }
+    Ok(new)
+}
+
 /// Refuses an edit of a host another source routes: the console edits its own
 /// routes, and moves one only to a host no other source routes; an app takes
 /// no host another source or app routes. The hosts are checked (lower case) by
@@ -1114,10 +1437,12 @@ fn taken(edit: &Edit, origins: &HashMap<String, Origin>) -> Result<(), Refused> 
             .filter(|origin| !matches!(origin, Origin::Console { .. }))
     };
     match edit {
-        Edit::Deploy { host, .. }
-        | Edit::Options { host, .. }
-        | Edit::Move { host, .. }
-        | Edit::Remove { host } => {
+        Edit::Deploy { .. }
+        | Edit::Kept { .. }
+        | Edit::Options { .. }
+        | Edit::Move { .. }
+        | Edit::Remove { .. } => {
+            let host = edit.host().expect("a route's");
             if let Some(origin) = foreign(host) {
                 return Err(Refused::Taken(format!(
                     "{host} is routed by {origin}, not by the console"
