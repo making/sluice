@@ -3,7 +3,7 @@
 //! session's connections stay on its worker with its stream, and a frame relayed wakes
 //! no other thread. A work-stealing runtime wakes its idle workers to steal for each
 //! frame: with a worker per core, a request relayed through a server took 2.6 times
-//! the CPU (see the firecracker wicket's README, Findings).
+//! the CPU (see `.kb/wicket-firecracker-findings.md`).
 
 use std::io;
 use std::sync::Mutex;

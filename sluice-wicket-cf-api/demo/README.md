@@ -69,7 +69,7 @@ Before committing the new files:
   ffmpeg -ss 23.5 -i sluice-cf-demo.mp4 -frames:v 1 scene.png
   ```
 
-- the GIF stays a few MB (2.5MB now): it is the copy the README shows, since GitHub plays no
+- the GIF stays a few MB: it is the copy the README shows, since GitHub plays no
   video committed to a repository
 
 ## Changing the demo

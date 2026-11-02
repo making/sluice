@@ -121,7 +121,7 @@ pub const DEFAULT_MAX_VMS: usize = 64;
 
 /// Default of `--workers`, at most the CPUs: a worker per node stream of a small
 /// cluster, and a few for `--listen`'s and the egress's connections (more cost more
-/// wakeups than they relay in parallel, see the README's Findings).
+/// wakeups than they relay in parallel, see `.kb/wicket-firecracker-findings.md`).
 const DEFAULT_WORKERS: usize = 4;
 
 /// Default of `--watch-interval`.

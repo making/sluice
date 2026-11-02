@@ -420,13 +420,13 @@ curl http://web.localhost:8080/
   `/init` relays to). TLS is the sluice server's in front of it (`X-Forwarded-Proto` makes the
   links `https://`): `--tls-cert` here has no host to be routed by on `--listen`, the wicket
   reading a request's `Host`
-- **`mem`**: an upload, a package and a droplet go through files, not memory: 128 MiB took a push
-  of a 150 MiB zip. **`disk-mib`**: an image's droplet is a reference, a zip's is kept as a file
+- **`mem`**: an upload, a package and a droplet go through files, not memory: a `mem` below a zip's
+  size takes its push. **`disk-mib`**: an image's droplet is a reference, a zip's is kept as a file
   for each app (that one, the one before, and its package, with the upload while it comes)
 - **an upgrade**: `PUT /api/images` of the new image, then this app with its `sha256` (or another
-  env): the old VM stops (SIGTERM, all written out), the new one boots on the disk: 0.7-0.8s of
-  no API, the CLI's login still good, the wicket's apps served all along. A new image that does
-  not start is refused (422, 11.5s), the old VM started again
+  env): the old VM stops (SIGTERM, all written out), the new one boots on the disk: a boot long of
+  no API ([measured](../.kb/wicket-cf-api-findings.md)), the CLI's login still good, the wicket's
+  apps served all along. A new image that does not start is refused (422), the old VM started again
 - **a backup**: [the disk's](../sluice-wicket-runtime-firecracker/README.md#disks), whose file is
   `deployed/disks/ops/cf-api.ext4` in the volume. Lost, the apps serve on, a new cf-api leaves
   them (see Behavior)
