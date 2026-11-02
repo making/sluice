@@ -7,11 +7,13 @@
 //! the digest staged when the tag moves, a restage taking the new one --, a
 //! restart of the cf-api with an OpenID Provider (a mock) and TLS of its
 //! own -- `cf login --sso` through the passcode page, a refresh, the
-//! clients configured, who is refused --, a component the wicket refuses
+//! clients configured, who is refused, who may edit the security groups --, a component
+//! the wicket refuses
 //! until a service binding grants what it needs, the services' lifecycle,
 //! delete. And against a Firecracker wicket, where `/dev/kvm` is usable: a
 //! private image made into a rootfs by the wicket, its process's user, files and
-//! environment seen from the VM, a scale, a rootfs of a zip, the wicket's
+//! environment seen from the VM, its connections through the security groups, a scale, a
+//! rootfs of a zip, the wicket's
 //! directory lost and the image's rootfs made again, of the digest it had; then the
 //! cf-api itself an app of that wicket, in a VM with a disk, the flume and a provider
 //! through its egress: its apps and logins kept across a restart of the VM, a wicket
@@ -360,6 +362,13 @@ fn start_api(
     (api, url)
 }
 
+/// `rules` as a file `cf create-security-group` takes.
+fn security_group_file(dir: &Path, name: &str, rules: &Value) -> String {
+    let file = dir.join(format!("{name}.json"));
+    std::fs::write(&file, rules.to_string()).unwrap();
+    file.to_str().unwrap().to_string()
+}
+
 /// HTTP(S) requests of the test to the cf-api (its certificate self-signed)
 /// and the mock provider, redirects not followed.
 struct Http(reqwest::blocking::Client);
@@ -512,6 +521,20 @@ fn the_cf_cli_deploys_to_the_wicket() {
 
     cf.ok(&["api", &url]);
     cf.ok(&["login", "-u", "me", "-p", "x"]);
+
+    // the security groups: whoever logs in reads them, nobody edits them unless named, on
+    // an API that takes any credentials above all
+    let tcp_rule = json!([{"protocol": "tcp", "destination": "10.0.0.5", "ports": "443"}]);
+    let group = security_group_file(&dir, "group", &tcp_rule);
+    let refused = cf.fails(&["create-security-group", "group", &group]);
+    assert!(
+        refused.contains("--security-group-editor names no one"),
+        "{refused}"
+    );
+    assert!(
+        cf.ok(&["security-groups"])
+            .contains("No security groups found")
+    );
 
     // push from a directory: served on the wicket's listener
     cf.ok(&["push", "hello", "-p", dir.join("app").to_str().unwrap()]);
@@ -809,6 +832,12 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "openid,email,profile,groups",
         "--client-credentials",
         "robot:r0bot",
+        "--client-credentials",
+        "other:0ther",
+        "--security-group-editor",
+        "groups=ops",
+        "--security-group-editor-client",
+        "robot",
         "--tls-cert",
         cert_file.to_str().unwrap(),
         "--tls-key",
@@ -883,6 +912,34 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "{page}"
     );
 
+    // who edits the security groups: the rule at the request, whoever else logged in
+    let login = |who: Value| {
+        provider.sign_in(who);
+        let code = passcode(&http, &url);
+        cf.ok_with_stdin(&["login", "--sso"], &format!("{code}\n"));
+    };
+    login(json!({
+        "sub": "1", "email": "alice@example.com", "preferred_username": "alice", "groups": ["devs"]
+    }));
+    let refused = cf.fails(&["create-security-group", "group", &group]);
+    assert!(
+        refused.contains("the claim groups is [\"devs\"], not 'ops'"),
+        "{refused}"
+    );
+    login(json!({
+        "sub": "3", "email": "carol@example.com", "preferred_username": "carol",
+        "groups": ["devs", "ops"]
+    }));
+    cf.ok(&["create-security-group", "group", &group]);
+    api.logged("SECURITY GROUPS: carol: POST /v3/security_groups");
+    cf.ok(&["auth", "other", "0ther", "--client-credentials"]);
+    let refused = cf.fails(&["delete-security-group", "group", "-f"]);
+    assert!(
+        refused.contains("the client other is not of --security-group-editor-client"),
+        "{refused}"
+    );
+    assert!(cf.ok(&["security-groups"]).contains("group"));
+
     // a client configured: cf auth, with its secret; the rest of the test
     // runs as it
     let output = cf.fails(&["auth", "robot", "wrong", "--client-credentials"]);
@@ -893,6 +950,8 @@ fn the_cf_cli_deploys_to_the_wicket() {
     cf.ok(&["auth", "robot", "r0bot", "--client-credentials"]);
     cf.ok(&["target", "-o", "sluice", "-s", "wicket"]);
     assert!(cf.ok(&["app", "hello"]).contains("hi.localhost"));
+
+    cf.ok(&["delete-security-group", "group", "-f"]);
 
     // a component the wicket refuses: its reason reaches the user
     let output = cf.fails(&[
@@ -1207,7 +1266,14 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         wicket
     };
     let mut wicket = start_wicket();
-    let (api, url) = start_api(&api_listen, &console, &flume_url, &dir.join("cf"), &[]);
+    // an API taking any credentials names who edits the security groups by the name given
+    let (api, url) = start_api(
+        &api_listen,
+        &console,
+        &flume_url,
+        &dir.join("cf"),
+        &["--security-group-editor", "user_name=me"],
+    );
     let cf = Cf {
         cli: cf_cli(),
         home: dir.join("cfhome"),
@@ -1284,6 +1350,125 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         assert!(Instant::now() < deadline, "the app's lines never came");
         std::thread::sleep(Duration::from_millis(500));
     }
+
+    // the app connects through the security groups, at its next start. A rule's text is 18
+    // bytes here, a range's: its rules fill what a guest's kernel command line takes
+    let destination = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = destination.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in destination.incoming().flatten() {
+            let mut stream = stream;
+            let mut got = String::new();
+            let _ = stream.read_to_string(&mut got);
+            let _ = stream.write_all(b"pong");
+        }
+    });
+    let connects = |to: &str| {
+        let path = format!("/egress?to={to}");
+        let (status, answer) = get(&listen, "fc.localhost", &path, None);
+        assert_eq!(status, 200, "{answer}");
+        answer.ends_with("answer: pong\n")
+    };
+    let egress = || listing(&console)["apps"][0]["sandbox"]["egress"].clone();
+    let by_name = format!("localhost:{port}");
+    assert!(!connects(&by_name));
+    let rules = json!([
+        {"protocol": "tcp", "destination": "localhost", "ports": port.to_string()},
+        {"protocol": "tcp", "destination": "db.invalid", "ports": port.to_string()},
+        {"protocol": "tcp", "destination": "127.0.0.2-127.0.0.3",
+            "ports": format!("{}-{port}", port - 51), "description": "a port range"},
+    ]);
+    let group = security_group_file(&dir, "web", &rules);
+    cf.ok(&["create-security-group", "web", &group]);
+    cf.ok(&["bind-security-group", "web", "sluice", "--space", "wicket"]);
+    assert!(!connects(&by_name), "before a restart");
+    cf.ok(&["restart", "fc"]);
+    let listed = egress();
+    let rule_count = listed.as_array().unwrap().len();
+    assert_eq!(rule_count, 54, "{listed}");
+    let texts: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rule| rule.as_str().unwrap())
+        .collect();
+    assert!(texts.join(",").len() > 1000, "near the bound: {listed}");
+    assert!(
+        texts.contains(&format!("127.0.0.2/31:{port}").as_str()),
+        "{listed}"
+    );
+    assert!(connects(&by_name));
+    assert!(
+        connects(&format!("127.0.0.3:{port}")),
+        "a range's last port"
+    );
+    assert!(!connects(&format!("127.0.0.4:{port}")), "not in the rules");
+    assert!(
+        cf.ok(&["logs", "fc", "--recent"])
+            .contains(&format!("guest: egress to db.invalid:{port} at 127.1.0.1")),
+        "a name of its own in the guest"
+    );
+
+    // the same bound by the org's global group; staging's have no effect, no VM stages
+    cf.ok(&["unbind-security-group", "web", "sluice", "wicket"]);
+    cf.ok(&["bind-running-security-group", "web"]);
+    cf.ok(&["restart", "fc"]);
+    assert_eq!(egress(), listed);
+    assert!(connects(&by_name));
+    cf.ok(&["unbind-running-security-group", "web"]);
+    cf.ok(&["bind-staging-security-group", "web"]);
+    cf.ok(&["restart", "fc"]);
+    assert_eq!(egress(), Value::Null);
+    assert!(!connects(&by_name));
+    cf.ok(&["unbind-staging-security-group", "web"]);
+
+    // what the wicket cannot do is refused: a protocol, ports past a guest's command line
+    // at the edit; groups past it together at the start, naming them; the process's own
+    // port, which only /init knows, by /init's starting no process, its line in the logs
+    let other = security_group_file(
+        &dir,
+        "udp",
+        &json!([{"protocol": "udp", "destination": "10.0.0.5", "ports": "53"}]),
+    );
+    let refused = cf.fails(&["create-security-group", "other", &other]);
+    assert!(refused.contains("the wicket relays tcp alone"), "{refused}");
+    let every_port = security_group_file(
+        &dir,
+        "every-port",
+        &json!([{"protocol": "tcp", "destination": "0.0.0.0/0", "ports": "1-65535"}]),
+    );
+    let refused = cf.fails(&["create-security-group", "other", &every_port]);
+    assert!(refused.contains("a guest takes 1024 bytes"), "{refused}");
+    let more = security_group_file(
+        &dir,
+        "more",
+        &json!([{"protocol": "tcp", "destination": "127.0.0.4-127.0.0.5",
+            "ports": format!("{}-{port}", port - 51)}]),
+    );
+    cf.ok(&["create-security-group", "more", &more]);
+    cf.ok(&["bind-running-security-group", "web"]);
+    cf.ok(&["bind-running-security-group", "more"]);
+    let refused = cf.fails(&["restart", "fc"]);
+    assert!(
+        refused.contains("a guest's kernel command line takes 1024"),
+        "{refused}"
+    );
+    cf.ok(&["delete-security-group", "more", "-f"]);
+    let own = security_group_file(
+        &dir,
+        "own",
+        &json!([{"protocol": "tcp", "destination": "10.0.0.0/8", "ports": "8080"}]),
+    );
+    cf.ok(&["update-security-group", "web", &own]);
+    cf.fails(&["restart", "fc"]);
+    let logs = cf.ok(&["logs", "fc", "--recent"]);
+    assert!(
+        logs.contains("port 8080 is the process's own (PORT): it cannot listen there"),
+        "{logs}"
+    );
+    cf.ok(&["delete-security-group", "web", "-f"]);
+    cf.ok(&["restart", "fc"]);
+    assert_eq!(get(&listen, "fc.localhost", "/", None).0, 200);
 
     // a process exiting before it listens is refused at once, not at the health check's
     // timeout (60s), its output in the logs; a push over the crashed app goes through

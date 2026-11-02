@@ -11,7 +11,8 @@
 //! variables included, apply at a start, restart or deployment: the running
 //! app is the snapshot taken then, and the outcome shows in the process
 //! stats and the log. The services are in [`crate::services`], the
-//! environment variables in [`crate::env`].
+//! environment variables in [`crate::env`], the security groups, which
+//! apply at a start too, in [`crate::security_groups`].
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -32,6 +33,7 @@ use crate::logs::{self, Logs};
 use crate::manifest;
 use crate::oidc::Provider;
 use crate::registry::{Reference, Registry};
+use crate::security_groups;
 use crate::services;
 use crate::staging::{self, Hashed};
 use crate::store::{
@@ -58,6 +60,8 @@ pub(crate) type Reply = Result<Response, ApiError>;
 pub struct Api {
     pub store: Arc<Store>,
     pub uaa: Uaa,
+    /// Who may edit the security groups.
+    pub security_group_editors: crate::security_groups::Editors,
     /// The OpenID Provider users log in through; None: any credentials.
     pub provider: Option<Provider>,
     /// Whether the listener serves TLS: the scheme of the links.
@@ -131,6 +135,15 @@ impl ApiError {
             code: 1000,
             title: "CF-InvalidAuthToken",
             detail: format!("Invalid Auth Token: {why}"),
+        }
+    }
+
+    pub(crate) fn not_authorized(why: &str) -> ApiError {
+        ApiError {
+            status: StatusCode::FORBIDDEN,
+            code: 10003,
+            title: "CF-NotAuthorized",
+            detail: format!("You are not authorized to perform the requested action: {why}"),
         }
     }
 
@@ -456,6 +469,15 @@ impl Api {
     }
 
     fn authenticated(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+        self.token(headers).map(|_| ())
+    }
+
+    /// The claims of the request's token.
+    pub(crate) fn claims(&self, req: &Req) -> Result<uaa::Claims, ApiError> {
+        self.token(&req.headers)
+    }
+
+    fn token(&self, headers: &HeaderMap) -> Result<uaa::Claims, ApiError> {
         let token = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
@@ -467,7 +489,6 @@ impl Api {
             .ok_or_else(ApiError::unauthenticated)?;
         self.uaa
             .verify(token.trim())
-            .map(|_| ())
             .map_err(|e| ApiError::invalid_token(&e))
     }
 
@@ -541,6 +562,15 @@ impl Api {
                     || Err(ApiError::not_found("Organization")),
                     |org| Ok(json(StatusCode::OK, &org)),
                 ),
+            (
+                &Method::GET,
+                [
+                    "organizations",
+                    _,
+                    "relationships",
+                    "default_isolation_segment",
+                ],
+            ) => Ok(json(StatusCode::OK, &json!({"data": null, "links": {}}))),
             (&Method::GET, ["organizations", _, "domains"]) | (&Method::GET, ["domains"]) => {
                 listing(
                     store.read(|state| {
@@ -604,8 +634,14 @@ impl Api {
             (&Method::GET, ["spaces", _, "relationships", "isolation_segment"]) => {
                 Ok(json(StatusCode::OK, &json!({"data": null, "links": {}})))
             }
-            (&Method::GET, ["spaces", _, "running_security_groups"])
-            | (&Method::GET, ["spaces", _, "staging_security_groups"]) => empty(),
+            (
+                &Method::GET,
+                [
+                    "spaces",
+                    guid,
+                    kind @ ("running_security_groups" | "staging_security_groups"),
+                ],
+            ) => self.security_groups_of_space(req, guid, *kind == "running_security_groups"),
             (&Method::POST, ["spaces", _, "actions", "apply_manifest"]) => {
                 self.apply_manifest(req).await
             }
@@ -1024,12 +1060,12 @@ impl Api {
                     ..,
                 ],
             ) => self.services(req, segments).await,
+            (_, ["security_groups", ..]) => self.security_groups(req, segments),
             (&Method::POST, ["service_route_bindings"]) => {
                 Err(ApiError::unprocessable("route services are not supported"))
             }
             // --- what there is none of
             (&Method::GET, ["buildpacks"])
-            | (&Method::GET, ["security_groups"])
             | (&Method::GET, ["service_route_bindings"])
             | (&Method::GET, ["audit_events"])
             | (&Method::GET, ["isolation_segments"])
@@ -2039,8 +2075,8 @@ impl Api {
 }
 
 /// The snapshot a start takes: the current droplet, the memory, the
-/// annotations, what the service bindings grant, and the guest's
-/// environment (`VCAP_APPLICATION` naming the API at `base`) with a tag of
+/// annotations, what the service bindings grant, what the security groups
+/// let it reach, and the guest's environment (`VCAP_APPLICATION` naming the API at `base`) with a tag of
 /// its own.
 fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> {
     let app = state.app(guid).ok_or_else(|| ApiError::not_found("App"))?;
@@ -2073,6 +2109,7 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
         wasi,
         keyvalue,
         env: env::guest(base, state, app),
+        egress: security_groups::egress(state)?,
         tag: Some(env::tag()),
         since: epoch_secs(),
     })

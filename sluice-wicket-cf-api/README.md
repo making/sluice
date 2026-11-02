@@ -253,6 +253,7 @@ another OpenID Provider and the like.
 | annotations `wicket.sluice.ik.am/budget-ms`, `wicket.sluice.ik.am/instances` | `budget-ms`, `instances` (the route's cap; below `pool` the wicket refuses) |
 | environment variables (`cf set-env`, a manifest's `env:`), `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: what the guest's `wasi:cli/environment` answers |
 | disk | accepted and shown, no effect |
+| security groups | accepted and shown, no effect: a component's network is the capabilities below |
 | service offering `keyvalue`, plan `<store>` | a keyvalue store of the wicket (`keyvalue.stores`, else `local`) |
 | service offering `wasi`, plan `<capability>` | a capability of the sandbox's `wasi`: `cli`, `inherit-network`, `allow-ip-name-lookup`, `tcp`, `udp` |
 | keyvalue service instance | the namespace `cf/<instance guid>` of its plan's store |
@@ -611,9 +612,57 @@ The wicket's listing says `runtime: firecracker`.
 | environment variables, `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: the process's environment, over the image's (its `PORT` is `/init`'s) |
 | disk | no effect: the rootfs is read-only and `/tmp` a tmpfs of the VM's memory; a persistent disk is the wicket API's, with no CF counterpart |
 | services | none: the listing offers neither capabilities nor keyvalue stores |
-| outbound connections | none: the wicket's `egress` has no CF counterpart here, an app reaches no other host |
+| outbound connections | the [security groups](#security-groups): the route's `egress`. An app reaches no other host |
 | `cf logs` | the process's output, instance 0; no `RTR` line: this wicket feeds no requests to the flume |
 | annotations | no effect: a VM's sandbox is its `mode`, `mem`, `vms` and `env` |
+
+### Security groups
+
+An app of a Firecracker wicket reaches the destinations of the groups bound to its space, through
+the wicket's [egress](../sluice-wicket-runtime-firecracker/README.md#egress), from its next start:
+
+```text
+cf create-security-group blog-backend rules.json
+cf bind-security-group blog-backend sluice --space wicket
+cf restart blog
+```
+
+```json
+[{"protocol": "tcp", "destination": "entry-api.ik.am", "ports": "443"}]
+```
+
+| CF | the wicket's `egress` |
+|---|---|
+| `destination`: an address, a CIDR | an address, a range; bits past the prefix mean nothing, as to a firewall |
+| `destination`: `10.0.0.1-10.0.0.9` | the fewest CIDRs covering it |
+| `destination`: a name | a name, which CF does not have: a guest has no name server, so `0.0.0.0/0:443` connects to any address and resolves nothing. The wicket connects to it as its host resolves it |
+| `destination`: comma-separated | a rule per destination |
+| `ports`: `443`, `80,443`, `8000-8100` | a rule per port |
+| `protocol`: `tcp` | what a rule is |
+| `protocol`: `udp`, `icmp`, `all` | refused (422): the wicket relays TCP alone |
+| `bind-security-group`, `bind-running-security-group` | the apps of the one space, at their next start: the `running` snapshot |
+| `--lifecycle staging`, `bind-staging-security-group` | shown, no effect: no VM stages |
+| `log`, `description` | shown, no effect: the wicket records every connection |
+
+- **Who edits them.** A rule reaches what the wicket's host reaches: `localhost` is the host's, a
+  range covers link-local addresses, and on the Compose network `wicket:9090` is the console. So
+  editing takes more than logging in, whose `cloud_controller.admin` everyone holds:
+  `--security-group-editor` names who, as a claim rule, `--security-group-editor-client` which
+  clients; without them nobody may (`403`), with or without a provider. Without a provider the
+  claims are `user_name` and `email`, both the name given at `cf login`, which anyone can say: on
+  the host's loopback, `--security-group-editor user_name=me`. A rule reads the claims of the
+  login, at each edit; an edit is logged with who (`SECURITY GROUPS: alice: POST ...`). Anyone
+  logged in reads them
+- **How many.** A guest takes 1024 bytes of rules on its kernel's command line: 64 rules of
+  `0.0.0.0/0:10000`, 39 of a 20-character name at a 4-digit port. A group past them is refused at the
+  edit (`1-65535` always is), groups past them together at the start (`CRASHED`, the wicket's
+  reason in `cf push`'s `Error starting instances`)
+- **The process's own port.** A rule on the process's port (`PORT`) holds it in the guest. A range's
+  rule, `localhost`'s or `127.0.0.1`'s: `/init` starts no process and the start fails, its reason
+  in `cf logs` (`port 8080 is the process's own`). Another address's or a name's: a process
+  listening at `127.0.0.1` still can, one at every address (`0.0.0.0`, a JVM) cannot: it exits,
+  with `/init`'s line in the logs. Only `/init` knows the port (an image's `EXPOSE`), so neither
+  the cf-api nor the wicket refuses the rule before
 
 ## Options
 
@@ -635,6 +684,8 @@ The wicket's listing says `runtime: firecracker`.
 | `--oidc-scopes <list>` | the scopes asked for, comma-separated (default `openid,email,profile`; Dex sends the `groups` claim for the scope `groups`) |
 | `--oidc-ca-cert <path>` | a PEM CA the provider's certificate is verified against (default the webPKI roots) |
 | `--client-credentials <id>:<secret>` / `--client-credentials-file <path>` | a client of `cf auth <id> <secret> --client-credentials` (CI); repeatable, the file one per line. With `--oidc-issuer` only |
+| `--security-group-editor <claim>=<pattern>` | who may edit the [security groups](#security-groups), nobody without it: as `--oidc-claim`; without `--oidc-issuer` the claims are `user_name` and `email`, both the name anyone logs in with |
+| `--security-group-editor-client <id>` | a client of `--client-credentials` who may too; repeatable |
 | `--tls-cert <path>` / `--tls-key <path>` | serve TLS: the certificate chain and its private key, PEM. Without them, behind a TLS proxy, `X-Forwarded-Proto: https` makes the links `https` |
 | `--exit-on-stdin-close` | exit when stdin reaches its end (a parent's child process) |
 
@@ -663,9 +714,9 @@ What holds on both wickets; a component's and a VM's are in
 ## Behavior
 
 - as on CF, routes and `instances` apply at once; the droplet and the rest of the sandbox
-  (memory, annotations, the service bindings, the environment variables) at a start, restart,
-  restage or deployment: the running app is the snapshot taken then. For `scale -m` the CLI
-  stops and starts the app itself
+  (memory, annotations, the service bindings, the environment variables, the security groups) at a
+  start, restart, restage or deployment: the running app is the snapshot taken then. For `scale -m`
+  the CLI stops and starts the app itself
 - environment variables: `cf set-env` / `unset-env`, a manifest's `env:` (merged, as `cf push`
   does) and `cf env` work as on CF. Refused: the names CF reserves (`VCAP_*`, `VMC*`, `PORT`),
   what the wicket refuses (`=` or a control character in a name, a NUL in a value) and more
@@ -701,7 +752,7 @@ What holds on both wickets; a component's and a VM's are in
   [Live access log](../.kb/live-access-log.md#wickets-and-the-cf-api)
 - auth: see [Login](#login). Every request but the root document, `/v3`, `/v3/info` and the
   UAA endpoints needs a valid token (log-cache's included), and whoever holds one may do
-  everything
+  everything but edit the [security groups](#security-groups)
 - errors are in CC's shape (`{"errors": [{"code", "title", "detail"}]}`); `/v3/info` names
   this API
 
@@ -747,7 +798,8 @@ the first sign-in and keeps it. Dex, Keycloak, Entra ID, Google and the like ser
 Refused with why (422): route paths, ports and wildcards, private and internal domains, tasks,
 ssh, sidecars, process types but `web`, route services, environment variable groups,
 user-provided services, service keys. One owner (`cf`) per wicket: two cf-apis must not share one.
-No roles: whoever may log in may do everything.
+No roles: whoever may log in may do everything, but for the
+[security groups](#security-groups).
 
 ## Tests
 

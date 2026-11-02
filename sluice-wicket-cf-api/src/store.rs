@@ -46,6 +46,8 @@ pub struct State {
     /// is yet to delete.
     #[serde(default)]
     pub purges: Vec<Purge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security_groups: Vec<SecurityGroup>,
     /// The guids of the apps deleted while the wicket did not take it, to remove from it
     /// when it does. All an app of the owner is ever removed for without an app here to
     /// say so: a state that is not the one that put an app (a lost data directory, another
@@ -165,6 +167,10 @@ pub struct Running {
     /// taken before the cf-api gave one.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// The destinations the security groups let a VM connect to, as the wicket names them
+    /// (`crate::security_groups::egress`): a wasm app's are not put.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress: Vec<String>,
     /// Tells the wicket's app of this snapshot from another
     /// (`crate::env::tag`): the wicket lists no env back.
     #[serde(default)]
@@ -184,6 +190,35 @@ pub struct Instance {
     pub tags: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// A security group (`crate::security_groups`): its rules, as given, and where they apply.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SecurityGroup {
+    pub guid: String,
+    pub name: String,
+    pub rules: Vec<SecurityRule>,
+    /// `globally_enabled`: every space's apps, running and staging.
+    pub running: bool,
+    pub staging: bool,
+    /// The guids of the spaces it is bound to.
+    pub running_spaces: Vec<String>,
+    pub staging_spaces: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A rule of a security group, as CC has it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SecurityRule {
+    pub protocol: String,
+    pub destination: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ports: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<bool>,
 }
 
 /// An app bound to a service instance; applied at the app's next start.

@@ -25,6 +25,7 @@ mod multipart;
 /// The OpenID Provider client, shared with the wicket's console.
 pub use sluice_wicket_oidc as oidc;
 pub mod registry;
+pub mod security_groups;
 pub mod services;
 pub mod staging;
 pub mod store;
@@ -105,6 +106,8 @@ pub struct Settings {
     pub oidc: Option<oidc::OidcSettings>,
     /// The clients of `cf auth --client-credentials`, with the provider.
     pub clients: Vec<(String, String)>,
+    /// Who may edit the security groups.
+    pub security_group_editors: security_groups::Editors,
     /// The listener's own TLS; None: plain HTTP.
     pub tls: Option<TlsSettings>,
 }
@@ -218,6 +221,7 @@ pub async fn serve(
     let api = Arc::new(api::Api {
         store: store.clone(),
         uaa,
+        security_group_editors: settings.security_group_editors.clone(),
         provider,
         tls: acceptor.is_some(),
         logs,

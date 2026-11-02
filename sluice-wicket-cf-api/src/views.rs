@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use crate::controller::Controller;
 use crate::store::{
     App, Build, Deployment, Droplet, Job, Lifecycle, Named, Outcome, Package, ROOTFS_STACK, Route,
-    STACK, State, epoch_secs, now,
+    STACK, SecurityGroup, State, epoch_secs, now,
 };
 use crate::wicket::Runtime;
 
@@ -154,6 +154,21 @@ pub fn domain(base: &str, domain: &Named) -> Value {
             "self": {"href": format!("{base}/v3/domains/{}", domain.guid)},
             "route_reservations": {"href": format!("{base}/v3/domains/{}/route_reservations", domain.guid)},
         },
+    })
+}
+
+pub fn security_group(base: &str, group: &SecurityGroup) -> Value {
+    let spaces = |guids: &[String]| json!({"data": guids.iter().map(|guid| json!({"guid": guid})).collect::<Vec<_>>()});
+    json!({
+        "guid": group.guid, "created_at": group.created_at, "updated_at": group.updated_at,
+        "name": group.name,
+        "globally_enabled": {"running": group.running, "staging": group.staging},
+        "rules": group.rules,
+        "relationships": {
+            "running_spaces": spaces(&group.running_spaces),
+            "staging_spaces": spaces(&group.staging_spaces),
+        },
+        "links": {"self": {"href": format!("{base}/v3/security_groups/{}", group.guid)}},
     })
 }
 
@@ -542,7 +557,7 @@ pub fn manifest(state: &State, app: &App) -> String {
 
 /// The filters the CLI sends, as JSON pointers into a resource's view;
 /// `app_guids` of a route reads its destinations.
-const FILTERS: [(&str, &str); 22] = [
+const FILTERS: [(&str, &str); 24] = [
     ("names", "/name"),
     ("guids", "/guid"),
     ("space_guids", "/relationships/space/data/guid"),
@@ -564,6 +579,8 @@ const FILTERS: [(&str, &str); 22] = [
     ("droplet_guids", "/droplet/guid"),
     ("type", "/type"),
     ("available", "/available"),
+    ("globally_enabled_running", "/globally_enabled/running"),
+    ("globally_enabled_staging", "/globally_enabled/staging"),
     (
         "service_instance_guids",
         "/relationships/service_instance/data/guid",

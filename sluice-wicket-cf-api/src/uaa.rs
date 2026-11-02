@@ -271,6 +271,19 @@ impl Uaa {
         Ok(claims)
     }
 
+    /// What the rules of who may do more than the login (`--security-group-editor`) read of
+    /// the holder of `token`: the claims of its login's ID token, kept by its session (the
+    /// token has them not), None once a refresh replaced the token; in the open mode, the
+    /// name it logged in with.
+    pub fn identity(&self, token: &Claims) -> Option<Value> {
+        if token.origin == "uaa" {
+            return Some(json!({"user_name": token.user_name, "email": token.email}));
+        }
+        let sessions = self.sessions.lock().expect("no panic held it");
+        let session = sessions.by_jti.get(&format!("{}-r", token.jti))?;
+        Some(session.subject.claims.clone())
+    }
+
     /// A one-time code for `identity`, good for [`PASSCODE_TTL`]: what
     /// `cf login --sso` asks for.
     pub fn passcode(&self, identity: Identity) -> Result<String, String> {
@@ -504,6 +517,10 @@ mod tests {
             (claims.user_name.as_str(), claims.origin.as_str()),
             ("alice", "uaa")
         );
+        assert_eq!(
+            uaa.identity(&claims),
+            Some(json!({"user_name": "alice", "email": "alice"}))
+        );
         assert_eq!(claims.iss, issuer);
         // the same key again: the token and the session are still good after
         // a restart; the files are their owner's only, one an older cf-api
@@ -623,6 +640,9 @@ mod tests {
             ),
             ("alice", "alice@example.com", "oidc")
         );
+        // the claims of the login, from its session: a refresh replaces the token
+        let groups = |identity: Option<Value>| identity.map(|claims| claims["groups"].clone());
+        assert_eq!(groups(uaa.identity(&claims)), Some(json!(["devs"])));
         assert!(
             uaa.grant(form.as_bytes(), None, issuer)
                 .unwrap_err()
@@ -660,6 +680,11 @@ mod tests {
         );
         // a refresh re-reads the rules: alice is out of the group now
         let refreshed = refresh(&uaa, &tokens, issuer).unwrap();
+        assert_eq!(uaa.identity(&claims), None);
+        let current = uaa
+            .verify(refreshed["access_token"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(groups(uaa.identity(&current)), Some(json!(["devs"])));
         let later = Uaa::open(&dir, mode("ops")).unwrap();
         let refused = refresh(&later, &refreshed, issuer).unwrap_err();
         assert!(

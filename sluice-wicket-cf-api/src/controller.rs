@@ -70,6 +70,7 @@ impl Controller {
                         .timeout
                         .unwrap_or(DEFAULT_HEALTH_CHECK_TIMEOUT),
                     &running.env,
+                    &running.egress,
                 ),
                 false => Sandbox {
                     wasi: running.wasi.clone(),
@@ -449,12 +450,13 @@ const WICKET_DEFAULT_BOOT_MS: u64 = 10_000;
 /// A rootfs's sandbox on a Firecracker wicket: `instances` VMs, as a process's are. One
 /// is a shared VM, booted at once; more, a pool cloned from a snapshot; none still
 /// serves, as on a wasm wicket: a VM of its own per connection. Its process has `timeout`
-/// seconds to listen.
+/// seconds to listen, and connects to the destinations of `egress`.
 fn vm_sandbox(
     memory_mib: u64,
     instances: u64,
     timeout: u64,
     env: &BTreeMap<String, String>,
+    egress: &[String],
 ) -> Sandbox {
     let (mode, vms) = match instances {
         0 => ("per-connection", None),
@@ -466,6 +468,7 @@ fn vm_sandbox(
         mem: Some(memory_mib),
         vms,
         boot_ms: Some(timeout.clamp(1, MAXIMUM_HEALTH_CHECK_TIMEOUT) * 1000),
+        egress: egress.to_vec(),
         env: env.clone(),
         ..Sandbox::default()
     }
@@ -482,8 +485,8 @@ fn gone(sha256: &str, path: &std::path::Path, e: std::io::Error) -> Failure {
 }
 
 /// Whether the wicket serves `desired` as listed: a `budget_ms` left to
-/// the wicket's default matches whatever it chose; the capabilities in any
-/// order; the env, which the wicket lists by its names, by the tag.
+/// the wicket's default matches whatever it chose; the capabilities and the
+/// egress in any order; the env, which the wicket lists by its names, by the tag.
 fn same(listed: &AppBody, desired: &AppBody) -> bool {
     let sorted = |list: &[String]| {
         let mut list = list.to_vec();
@@ -493,6 +496,7 @@ fn same(listed: &AppBody, desired: &AppBody) -> bool {
     sorted(&listed.hosts) == desired.hosts
         && listed.component == desired.component
         && sorted(&listed.sandbox.wasi) == sorted(&desired.sandbox.wasi)
+        && sorted(&listed.sandbox.egress) == sorted(&desired.sandbox.egress)
         && listed.sandbox.pool == desired.sandbox.pool
         && listed.sandbox.instances == desired.sandbox.instances
         && listed.sandbox.memory_mib == desired.sandbox.memory_mib
@@ -532,6 +536,7 @@ mod tests {
             wasi: vec!["keyvalue".into(), "cli".into()],
             keyvalue: [(String::new(), "local/cf/i".to_string())].into(),
             env: [("GREETING".to_string(), "hello".to_string())].into(),
+            egress: vec!["db.internal:5432".into(), "10.0.0.0/24:443".into()],
             tag: Some("t1".into()),
             since: 0,
         };
@@ -547,6 +552,7 @@ mod tests {
         assert_eq!(desired.sandbox.pool, Some(2));
         assert_eq!(desired.sandbox.memory_mib, Some(64));
         assert_eq!(desired.sandbox.keyvalue[""], "local/cf/i");
+        assert!(desired.sandbox.egress.is_empty(), "no VM: nothing to bound");
         // the env put, listed by its names: told by the tag
         let mut body = serde_json::to_value(&desired).unwrap();
         assert_eq!(
@@ -578,14 +584,20 @@ mod tests {
         let body = serde_json::to_value(&desired).unwrap();
         assert_eq!(
             body["sandbox"],
-            serde_json::json!({"mode": "pool", "mem": 64, "vms": 2, "boot-ms": 60_000, "env": {"GREETING": "hello"}})
+            serde_json::json!({"mode": "pool", "mem": 64, "vms": 2, "boot-ms": 60_000,
+                "egress": ["db.internal:5432", "10.0.0.0/24:443"], "env": {"GREETING": "hello"}})
         );
         // as the wicket lists it: its vCPUs too, the env by its names
         let mut listed = body;
         listed["sandbox"]["vcpus"] = 1.into();
         listed["sandbox"]["env"] = serde_json::json!(["GREETING"]);
+        // the egress in the wicket's order
+        listed["sandbox"]["egress"] = serde_json::json!(["10.0.0.0/24:443", "db.internal:5432"]);
         let mut listed: AppBody = serde_json::from_value(listed).unwrap();
         assert!(same(&listed, &desired));
+        listed.sandbox.egress.pop();
+        assert!(!same(&listed, &desired), "another group's rules");
+        listed.sandbox.egress = desired.sandbox.egress.clone();
         listed.sandbox.vms = Some(3);
         assert!(!same(&listed, &desired));
         listed.sandbox.vms = Some(2);
@@ -608,7 +620,7 @@ mod tests {
             (1, "shared", None),
             (3, "pool", Some(3)),
         ] {
-            let sandbox = vm_sandbox(64, instances, 60, &BTreeMap::new());
+            let sandbox = vm_sandbox(64, instances, 60, &BTreeMap::new(), &[]);
             assert_eq!((sandbox.mode.as_deref(), sandbox.vms), (Some(mode), vms));
         }
         // a removal the wicket did not take is tried again, but for another owner's app

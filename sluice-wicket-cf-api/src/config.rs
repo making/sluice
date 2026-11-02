@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::flume::FlumeSettings;
 use crate::oidc::{OidcSettings, parse_rules};
+use crate::security_groups::Editors;
 use crate::{Settings, TlsSettings};
 
 pub const USAGE: &str = "\
@@ -48,6 +49,12 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
                               a client of cf auth --client-credentials (CI); repeatable
   --client-credentials-file <path>
                               read them from a file instead, one <id>:<secret> per line
+  --security-group-editor <claim>=<pattern>
+                              who may edit the security groups, nobody without it: as
+                              --oidc-claim; without --oidc-issuer the claims are user_name
+                              and email, both the name anyone logs in with
+  --security-group-editor-client <id>
+                              a client of --client-credentials who may too; repeatable
   --tls-cert <path>           serve TLS: the certificate chain, PEM
   --tls-key <path>            and its private key, PEM
   --exit-on-stdin-close       exit when stdin reaches its end (a parent's child process)
@@ -93,6 +100,8 @@ const VALUED: &[&str] = &[
     "oidc-ca-cert",
     "client-credentials",
     "client-credentials-file",
+    "security-group-editor",
+    "security-group-editor-client",
     "tls-cert",
     "tls-key",
 ];
@@ -273,6 +282,22 @@ pub fn parse(
             "--client-credentials needs --oidc-issuer: without it any client passes".into(),
         );
     }
+    let security_group_editors = Editors {
+        rules: parse_rules(
+            values("security-group-editor").iter().map(String::as_str),
+            "--security-group-editor",
+        )?,
+        clients: values("security-group-editor-client"),
+    };
+    if let Some(unknown) = security_group_editors
+        .clients
+        .iter()
+        .find(|client| !clients.iter().any(|(id, _)| id == *client))
+    {
+        return Err(format!(
+            "--security-group-editor-client {unknown}: not a client of --client-credentials"
+        ));
+    }
     let tls = match (value("tls-cert").is_some(), value("tls-key").is_some()) {
         (true, true) => Some(TlsSettings {
             cert_pem: pem("tls-cert")?.expect("given"),
@@ -295,6 +320,7 @@ pub fn parse(
             flume,
             oidc,
             clients,
+            security_group_editors,
             tls,
         },
     })))
@@ -329,6 +355,8 @@ mod tests {
                 Some("email=*@example.com, email=root@example.org,groups=devs".to_string())
             }
             "SLUICE_WICKET_CF_API_CLIENT_CREDENTIALS" => Some("robot:r0bot".to_string()),
+            "SLUICE_WICKET_CF_API_SECURITY_GROUP_EDITOR" => Some("groups=ops".to_string()),
+            "SLUICE_WICKET_CF_API_SECURITY_GROUP_EDITOR_CLIENT" => Some("robot".to_string()),
             _ => None,
         };
         let config = serve(parse(
@@ -379,6 +407,16 @@ mod tests {
             config.settings.clients,
             [("robot".to_string(), "r0bot".to_string())]
         );
+        assert_eq!(
+            config.settings.security_group_editors,
+            Editors {
+                rules: vec![ClaimRule {
+                    claim: "groups".into(),
+                    patterns: vec!["ops".into()],
+                }],
+                clients: vec!["robot".into()],
+            }
+        );
         assert!(config.settings.tls.is_none());
         let config = serve(parse(
             args("--wicket http://w:1 --domain x.io --domain y.io,Z.io."),
@@ -395,6 +433,7 @@ mod tests {
         assert!(config.settings.flume.is_none());
         assert!(config.settings.oidc.is_none());
         assert!(config.settings.clients.is_empty());
+        assert_eq!(config.settings.security_group_editors, Editors::default());
     }
 
     #[test]
@@ -433,6 +472,11 @@ mod tests {
                 "{oidc} --oidc-claim email=* --client-credentials robot"
             ))
             .contains("<id>:<secret>")
+        );
+        assert!(error("--wicket http://w:1 --security-group-editor email").contains("<claim>="));
+        assert!(
+            error("--wicket http://w:1 --security-group-editor-client robot")
+                .contains("not a client of --client-credentials")
         );
         assert!(error("--wicket http://w:1 --tls-key k.pem").contains("go together"));
         assert!(matches!(
