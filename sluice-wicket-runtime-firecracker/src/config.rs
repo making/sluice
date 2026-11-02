@@ -579,13 +579,19 @@ impl RouteSource {
         })
     }
 
-    /// Reads the routes, the config file's again, then the flags', then the
-    /// console's: a host may appear once.
+    /// The routes, the config file's read again ([`RouteSource::specs`]).
     pub fn read(&self) -> Result<Vec<(RouteSpec, Origin)>, String> {
-        let file = match &self.config {
-            Some(path) => Some(File::read(path)?),
-            None => None,
-        };
+        self.specs(self.file()?.as_ref())
+    }
+
+    /// Reads the config file again.
+    pub fn file(&self) -> Result<Option<File>, String> {
+        self.config.as_deref().map(File::read).transpose()
+    }
+
+    /// The routes: the config file `file`'s, then the flags', then the console's: a host may
+    /// appear once.
+    pub fn specs(&self, file: Option<&File>) -> Result<Vec<(RouteSpec, Origin)>, String> {
         let dir = self
             .config
             .as_ref()
@@ -595,14 +601,13 @@ impl RouteSource {
             .kernel
             .clone()
             .or_else(|| {
-                file.as_ref()
-                    .and_then(|file| file.kernel.as_ref())
+                file.and_then(|file| file.kernel.as_ref())
                     .map(|kernel| dir.join(kernel))
             })
             .ok_or("--kernel is required")?;
         // absolute: each firecracker runs in its VM's directory
         let kernel = std::path::absolute(kernel).map_err(|e| format!("--kernel: {e}"))?;
-        let firecracker = self.firecracker_of(file.as_ref(), dir)?;
+        let firecracker = self.firecracker_of(file, dir)?;
         let mut specs = Vec::new();
         if let (Some(file), Some(path)) = (file, &self.config) {
             for (n, route) in file.routes.iter().enumerate() {
@@ -654,7 +659,7 @@ impl RouteSource {
 /// The `--config` file.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-struct File {
+pub struct File {
     server: Option<String>,
     listen: Option<String>,
     token: Option<String>,

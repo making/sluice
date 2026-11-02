@@ -413,7 +413,7 @@ impl Deployed {
     }
 
     /// The disk of the app `name` of `owner`, by a path of checked names.
-    fn disk_file(&self, owner: &str, name: &str) -> PathBuf {
+    pub fn disk_file(&self, owner: &str, name: &str) -> PathBuf {
         self.dir
             .join(DISKS)
             .join(owner)

@@ -17,8 +17,9 @@ by default). Before, the edit lock and the wicket's reload both waited for it: `
 app was seen past a 20s client timeout. With one such start under way (40s timeout), of another app:
 `cf set-env` 41ms, `cf restart` 797ms.
 
-Still held for a boot: a disk's VM replaced, and a reload of the wicket's files or on SIGHUP. A pool's
-fill failing for room reads as its VMs not starting: not tried again at a revision.
+A disk's VM replaced and a reload of the wicket's files or on SIGHUP start beside the edits as well:
+the wicket's reloader awaits no boot. A pool's fill failing for room is no `did_not_start`: tried
+again as the routes change.
 
 ## Who logs in
 

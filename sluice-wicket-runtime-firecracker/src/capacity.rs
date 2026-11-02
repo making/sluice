@@ -95,7 +95,7 @@ impl Drop for Slot {
 }
 
 /// No room was found in time.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Full(String);
 
 impl Full {

@@ -275,6 +275,10 @@ removed ...; restarted ...`):
   before)
 - an app's VM on a [disk](#disks) is stopped before its next one starts, last of all
 
+The VMs start beside the rest (`routes reload (file change): its VMs starting`): no edit waits for
+them. The next change of the files takes over from a start under way, ending its VMs; SIGHUP with
+none leaves it.
+
 Only the routes, the kernel and the firecracker binary are reloaded; the other settings apply
 at startup. The console's edits go through the same reload (see [Console](#console)).
 
@@ -333,10 +337,12 @@ a host the config file or a flag routes, routes past the budget refuse it with t
 the routes stay as they were. The image is received to the console's directory as it comes
 (4 GiB at most), hashed on the way, and refused unless it carries an ext2/3/4 superblock.
 
-An edit's VMs start beside the other edits: none waits for a boot, which a process never listening
-takes a `boot-ms` long. A later edit of the same route or app takes over from it, ending its VMs
-(its request a 422). What still holds the edits for a boot is a [disk](#disks)'s VM replaced, and a
-reload of the files or on SIGHUP.
+An edit's VMs start beside everything else: none waits for a boot, which a process never listening
+takes a `boot-ms` long, whether a [disk](#disks)'s VM is replaced or the files are reloaded. A later
+edit of the same route or app takes over from it, ending its VMs (its request a 422). An edit goes
+by the config file as the routes last took it and leaves a changed file to its reload, whose failure
+refuses no edit; an edit needing a disk that reload starts a VM on takes over from it, the reload
+made again after it.
 
 The console keeps its routes in `--console-dir` (`console-dir`, default `deployed` next to the
 config file, else in the working directory: `/data/deployed` in the image) and serves them again

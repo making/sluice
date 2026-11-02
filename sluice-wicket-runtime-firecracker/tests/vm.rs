@@ -17,8 +17,10 @@
 //! served on the tunnel, listed with its VMs, and an app of two hosts on one
 //! rootfs uploaded by digest, its env seen by the guest, and an app with a disk:
 //! what it wrote kept across a restart of its VM, a failed start, a growth and
-//! its app's removal, one VM at a time on it; both served again after a restart
-//! from the console's directory (not with the image: its directory is the test's).
+//! its app's removal, one VM at a time on it; a VM never listening holding no other
+//! edit, by an app's edit, in the place of a disk's VM and through the config file;
+//! both served again after a restart from the console's directory (not with the
+//! image: its directory is the test's).
 //!
 //! Skipped where `/dev/kvm` is not usable. Elsewhere it needs Firecracker
 //! (`SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER`, else `firecracker` on
@@ -421,6 +423,7 @@ async fn every_route_serves_http_through_the_tunnel() {
             &wicket,
             &rootfs,
             &console_dir,
+            &config,
             &mut conn_id,
             jailed,
         );
@@ -570,6 +573,7 @@ async fn deploy(
     wicket: &Wicket,
     rootfs: &Path,
     dir: &Path,
+    config: &Path,
     conn_id: &mut i64,
     jailed: bool,
 ) {
@@ -768,24 +772,67 @@ async fn deploy(
     let (status, same) = console(at, "PUT", "/api/apps/shop", true, body()).await;
     assert_eq!((status, same["message"].as_str()), (200, Some("no change")));
 
-    never_listening_app(tunnel, wicket, &sha256).await;
+    never_listening_app(tunnel, wicket, &sha256, config).await;
     restarting_app(tunnel, wicket, &sha256, conn_id).await;
     disk_app(tunnel, wicket, &sha256, dir, conn_id, jailed).await;
 }
 
-/// An app's VM never listening: its start holds no other edit, another edit of the app takes
-/// over from it, and its end tells a controller its VMs did not start.
-async fn never_listening_app(tunnel: &mut ServerTunnel, wicket: &Wicket, sha256: &str) {
+/// The body of an app of `host` and `sandbox`, on the image `sha256`.
+fn app_body(host: &str, sha256: &str, sandbox: serde_json::Value) -> Bytes {
+    let app = serde_json::json!({
+        "owner": "cf",
+        "hosts": [host],
+        "component": {"sha256": sha256, "name": "app.ext4"},
+        "sandbox": sandbox,
+    });
+    Bytes::from(app.to_string())
+}
+
+/// Another app put and removed on the wicket, its start beside what is under way.
+async fn another_app(tunnel: &mut ServerTunnel, wicket: &Wicket, sha256: &str) {
     let at = wicket.console();
-    let body = |host: &str, sandbox: serde_json::Value| {
-        let app = serde_json::json!({
-            "owner": "cf",
-            "hosts": [host],
-            "component": {"sha256": sha256, "name": "app.ext4"},
-            "sandbox": sandbox,
-        });
-        Bytes::from(app.to_string())
-    };
+    let other = app_body("other.local", sha256, serde_json::json!({}));
+    let (status, put) = console(at, "PUT", "/api/apps/other", true, other).await;
+    assert_eq!(status, 200, "{put}; {}", wicket.log());
+    let advertised = tunnel.advertise().await;
+    let hosts: Vec<_> = advertised.upstreams.iter().map(|up| &up.host).collect();
+    assert!(
+        !hosts.iter().any(|host| host.starts_with("hung")),
+        "{hosts:?}"
+    );
+    let gone = "/api/apps/other?owner=cf";
+    let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
+    assert_eq!(status, 200, "{removed}");
+    tunnel.advertise().await;
+}
+
+/// How long a wicket's log may take to say what comes next.
+const SAID: Duration = Duration::from_secs(10);
+
+/// Waits for `wicket`'s log to say `what`.
+async fn said(wicket: &Wicket, what: &str) {
+    let deadline = Instant::now() + SAID;
+    while !wicket.log().contains(what) {
+        assert!(
+            Instant::now() < deadline,
+            "not said: {what}; {}",
+            wicket.log()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A VM never listening: an app's start holds no other edit, another edit of the app takes over
+/// from it, and its end tells a controller its VMs did not start; a route of the config file's
+/// holds no edit either, and the next change of the file takes over from its reload.
+async fn never_listening_app(
+    tunnel: &mut ServerTunnel,
+    wicket: &Wicket,
+    sha256: &str,
+    config: &Path,
+) {
+    let at = wicket.console();
+    let body = |host: &str, sandbox: serde_json::Value| app_body(host, sha256, sandbox);
     let hung = body(
         "hung.local",
         serde_json::json!({"port": 9999, "boot-ms": 60_000}),
@@ -793,14 +840,7 @@ async fn never_listening_app(tunnel: &mut ServerTunnel, wicket: &Wicket, sha256:
     let hanging = tokio::spawn(console(at, "PUT", "/api/apps/hung", true, hung));
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let other = body("other.local", serde_json::json!({}));
-    let (status, put) = console(at, "PUT", "/api/apps/other", true, other).await;
-    assert_eq!(status, 200, "{put}; {}", wicket.log());
-    tunnel.advertise().await;
-    let gone = "/api/apps/other?owner=cf";
-    let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
-    assert_eq!(status, 200, "{removed}");
-    tunnel.advertise().await;
+    another_app(tunnel, wicket, sha256).await;
     assert!(!hanging.is_finished(), "they waited for its start");
 
     let fixed = body("hung.local", serde_json::json!({"mem": 128}));
@@ -829,27 +869,42 @@ async fn never_listening_app(tunnel: &mut ServerTunnel, wicket: &Wicket, sha256:
     let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
     assert_eq!(status, 200, "{removed}");
     tunnel.advertise().await;
+
+    let written = std::fs::read_to_string(config).unwrap();
+    let hung = "- {host: hung.config.local, rootfs: shared.ext4, port: 9999, boot-ms: 60000}\n";
+    std::fs::write(config, format!("{written}{hung}")).unwrap();
+    said(wicket, "routes reload (file change): its VMs starting").await;
+    another_app(tunnel, wicket, sha256).await;
+    std::fs::write(config, written).unwrap();
+    said(wicket, "file change took over from it").await;
+    said(wicket, "routes reload (file change): no change").await;
 }
 
 /// How long a route's VM may take to come back.
 const RESTART: Duration = Duration::from_secs(60);
 
+/// The listing of `host`.
+async fn listed(wicket: &Wicket, host: &str) -> serde_json::Value {
+    let at = wicket.console();
+    let (status, listing) = console(at, "GET", "/api/routes", true, Bytes::new()).await;
+    assert_eq!(status, 200, "{listing}");
+    listing["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|route| route["host"] == host)
+        .unwrap_or_else(|| panic!("{host} not listed: {listing}"))
+        .clone()
+}
+
 /// The listing of `host` once it was restarted `times` and is up again.
 async fn restarted(wicket: &Wicket, host: &str, times: u64) -> serde_json::Value {
-    let at = wicket.console();
     let deadline = Instant::now() + RESTART;
     loop {
-        let (status, listing) = console(at, "GET", "/api/routes", true, Bytes::new()).await;
-        assert_eq!(status, 200, "{listing}");
-        let route = listing["routes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|route| route["host"] == host)
-            .unwrap_or_else(|| panic!("{host} not listed: {listing}"));
+        let route = listed(wicket, host).await;
         let vms = &route["vms"];
         if vms["restarts"] == times && vms["shared"] == true {
-            return route.clone();
+            return route;
         }
         assert!(
             Instant::now() < deadline,
@@ -934,20 +989,8 @@ async fn put_data(
     sha256: &str,
     sandbox: serde_json::Value,
 ) -> (u16, serde_json::Value) {
-    let app = serde_json::json!({
-        "owner": "cf",
-        "hosts": ["data.local"],
-        "component": {"sha256": sha256, "name": "app.ext4"},
-        "sandbox": sandbox,
-    });
-    console(
-        at,
-        "PUT",
-        "/api/apps/data",
-        true,
-        Bytes::from(app.to_string()),
-    )
-    .await
+    let body = app_body("data.local", sha256, sandbox);
+    console(at, "PUT", "/api/apps/data", true, body).await
 }
 
 /// A POST to the app `data` at `address` on a connection of its own; its answer.
@@ -970,8 +1013,9 @@ async fn on_data(
 
 /// An app with a disk: refused in a cloned mode; made once, what the guest wrote kept across
 /// its VM's restart, fsynced or not (the stop writes it out), a start that fails (the old VM
-/// started again on it) and its growth, a smaller size refused; for the app's VM alone, its
-/// id's in a jail; listed, and not removed under its app. One more file left unsynced: the
+/// started again on it) and its growth, a smaller size refused; a VM never listening in its
+/// place holding no other edit, none coming back on the disk meanwhile; for the app's VM alone,
+/// its id's in a jail; listed, and not removed under its app. One more file left unsynced: the
 /// wicket's end writes it out.
 async fn disk_app(
     tunnel: &mut ServerTunnel,
@@ -1096,6 +1140,43 @@ async fn disk_app(
     assert!(why.contains("a disk only grows"), "{why}");
     let same = on_data(tunnel, &address, conn_id, "/", "").await;
     assert_eq!(field(&same, "boot id"), booted, "its VM untouched");
+
+    // a VM never listening in its place: the old one stopped, no edit waiting for its start, no
+    // VM coming back on the disk meanwhile; the next edit takes over, all on the disk kept
+    let again = "its VM starts again";
+    let starts = wicket.log().matches(again).count();
+    let hung = serde_json::json!({"disk": "/tmp/data", "disk-mib": 128, "port": 9999, "boot-ms": 60_000, "env": {"RUN": "2"}});
+    let image = sha256.to_string();
+    let hanging = tokio::spawn(async move { put_data(at, &image, hung).await });
+    let deadline = Instant::now() + SAID;
+    while listed(wicket, "data.local").await["vms"]["shared"] == true {
+        assert!(Instant::now() < deadline, "not stopped; {}", wicket.log());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    another_app(tunnel, wicket, sha256).await;
+    assert!(!hanging.is_finished(), "it waited for the start");
+    assert_eq!(listed(wicket, "data.local").await["vms"]["shared"], false);
+    assert_eq!(
+        wicket.log().matches(again).count(),
+        starts,
+        "{}",
+        wicket.log()
+    );
+    let (status, put) = put_data(at, sha256, sandbox(128, "2b")).await;
+    assert_eq!(
+        (status, put["message"].as_str()),
+        (200, Some("restarted data.local")),
+        "{put}; {}",
+        wicket.log()
+    );
+    let (status, refused) = hanging.await.unwrap();
+    assert_eq!(status, 422, "{refused}");
+    assert!(
+        refused["error"].as_str().unwrap().contains("took over"),
+        "{refused}"
+    );
+    let read = on_data(tunnel, &address, conn_id, "/disk?read=a", "").await;
+    assert_eq!(read, "fsynced");
 
     // a wedged guest (its children, unjailed): its stop gives up in time, the VM killed, the
     // next one started on what it had made durable

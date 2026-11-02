@@ -20,7 +20,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{Notify, mpsc};
 
 use crate::BoxError;
-use crate::capacity::{Capacity, Need, Pool, Slot};
+use crate::capacity::{Capacity, Full, Need, Pool, Slot};
 use crate::disk::{self, Disk};
 use crate::egress::Egress;
 use crate::keeper::Role;
@@ -673,6 +673,8 @@ pub struct Route {
     restarts: AtomicU64,
     /// Shared mode: why its VM is down.
     down: Mutex<Option<String>>,
+    /// Held by what stops its shared VM ([`Route::stopping`]), for [`Route::stop`] to wait for.
+    stops: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// A shared route's VM; none once stopped ([`Route::stop`]).
@@ -870,6 +872,8 @@ struct Members {
     /// Counts the starts that failed, the last one's error.
     failures: u64,
     failed: String,
+    /// The last one failed for room.
+    full: Option<Full>,
     /// No VM is started to make up `warm` again before then, after a failure.
     retry: Option<Instant>,
 }
@@ -884,6 +888,22 @@ struct Member {
 }
 
 impl Members {
+    /// A start failed with `e`.
+    fn failed(&mut self, e: BoxError) {
+        self.failures += 1;
+        self.failed = e.to_string();
+        self.full = e.downcast().ok().map(|full| *full);
+        self.retry = Some(Instant::now() + POOL_RETRY);
+    }
+
+    /// The last start's failure, which says when it was for room.
+    fn failure(&self) -> BoxError {
+        match &self.full {
+            Some(full) => full.clone().into(),
+            None => self.failed.clone().into(),
+        }
+    }
+
     /// The VM holding the fewest connections, the one after the last seat taken first
     /// among them.
     fn least(&self) -> Option<usize> {
@@ -994,9 +1014,7 @@ impl SharedPool {
                 }
                 Err(e) => {
                     eprintln!("route {}: pool VM: {e}", self.cloner.hosts.current().label);
-                    members.failures += 1;
-                    members.failed = e.to_string();
-                    members.retry = Some(Instant::now() + POOL_RETRY);
+                    members.failed(e);
                 }
             }
         }
@@ -1012,7 +1030,7 @@ impl SharedPool {
             {
                 let mut members = self.members.lock().unwrap();
                 if members.failures > 0 {
-                    return Err(members.failed.clone().into());
+                    return Err(members.failure());
                 }
                 if members.vms.len() >= self.min {
                     return Ok(());
@@ -1353,6 +1371,14 @@ async fn watched(
     }
 }
 
+/// A pool's VMs not started for `e`, named after the route `label`: for room still.
+fn pool_failure(label: &str, e: BoxError) -> BoxError {
+    match e.downcast::<Full>() {
+        Ok(full) => full.of(label).into(),
+        Err(e) => format!("route {label}: pool VM: {e}").into(),
+    }
+}
+
 impl Route {
     /// Boots the route's VM (shared), or boots a template VM, snapshots it once its
     /// guest listens and kills it (the cloned modes; a pool's `warm` VMs restored then);
@@ -1503,7 +1529,7 @@ impl Route {
                     });
                     pool.fill(START_WAIT)
                         .await
-                        .map_err(|e| format!("route {label}: pool VM: {e}"))?;
+                        .map_err(|e| pool_failure(&label, e))?;
                     println!(
                         "route {label}: {} pool VM(s) up after {}ms",
                         spec.warm,
@@ -1561,6 +1587,7 @@ impl Route {
             taken,
             restarts: AtomicU64::new(0),
             down: Mutex::default(),
+            stops: Arc::default(),
         })
     }
 
@@ -1654,9 +1681,10 @@ impl Route {
         self.restarts.store(restarts, Ordering::Relaxed);
     }
 
-    /// Stops its shared VM, for good ([`Route::stopping`]).
+    /// Stops its shared VM, for good ([`Route::stopping`]); a stop under way too.
     pub async fn stop(&self) {
         self.stopping().await;
+        drop(self.stops.lock().await);
     }
 
     /// Takes its shared VM out now, its connections failing from then on, and what stops it:
@@ -1669,12 +1697,17 @@ impl Route {
             Backend::Cloned { .. } | Backend::Pool(_) => None,
         };
         let label = self.label();
+        // one VM, taken out once: free
+        let stops = vm
+            .as_ref()
+            .and_then(|_| self.stops.clone().try_lock_owned().ok());
         async move {
             if let Some(vm) = vm
                 && let Err(e) = vm.stop(disk::STOP_GRACE).await
             {
                 eprintln!("route {label}: its VM's stop: {e}; killed");
             }
+            drop(stops);
         }
     }
 
@@ -1955,6 +1988,31 @@ mod tests {
     use tokio::io::DuplexStream;
 
     use super::*;
+
+    /// A pool's start failing for room reads so up to the route's start, and only that: what a
+    /// controller tries again as the routes change, unlike VMs that do not start.
+    #[tokio::test]
+    async fn a_pool_failing_for_room_says_so() {
+        let need = Need {
+            memory: 1,
+            route: 1,
+            cap: None,
+        };
+        let Err(full) = Capacity::new(0, None).take(need, Duration::ZERO).await else {
+            panic!("no room at all");
+        };
+        for (failed, is_full, says) in [
+            (BoxError::from(full), true, "route a.local: no room"),
+            ("it died".into(), false, "route a.local: pool VM: it died"),
+        ] {
+            let mut members = Members::default();
+            members.failed(failed);
+            assert_eq!(members.failures, 1);
+            let failure = pool_failure("a.local", members.failure());
+            assert_eq!(failure.is::<Full>(), is_full, "{failure}");
+            assert!(failure.to_string().starts_with(says), "{failure}");
+        }
+    }
 
     /// The wicket's end of a stream whose guest double runs `answer` on the other end.
     fn guest<F>(answer: impl FnOnce(DuplexStream) -> F) -> DuplexStream
