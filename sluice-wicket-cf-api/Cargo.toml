@@ -9,14 +9,14 @@ publish = false
 [workspace]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-std", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-std", "io-util", "signal", "fs"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
-# the wicket's app API (plain HTTP: the cf-api sits next to its wicket)
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+# the wicket's app API (plain HTTP: the cf-api sits next to its wicket); a droplet as a stream
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
 # the OpenID Provider behind cf login --sso
 sluice-wicket-oidc = { path = "../sluice-wicket-oidc" }
 # the images cf push --docker-image names

@@ -12,7 +12,10 @@
 //! delete. And against a Firecracker wicket, where `/dev/kvm` is usable: a
 //! private image made into a rootfs by the wicket, its process's user, files and
 //! environment seen from the VM, a scale, a rootfs of a zip, the wicket's
-//! directory lost and the image's rootfs made again, of the digest it had.
+//! directory lost and the image's rootfs made again, of the digest it had; then the
+//! cf-api itself an app of that wicket, in a VM with a disk, the flume and a provider
+//! through its egress: its apps and logins kept across a restart of the VM, a wicket
+//! killed right after a push and an upgrade.
 
 mod registry;
 
@@ -444,6 +447,16 @@ fn the_cf_cli_deploys_to_the_wicket() {
     for sub in ["app", "app2", "counter", "relay", "cfhome"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
+
+    // a data directory it cannot write: no listener first, which a VM's /init takes for ready
+    let unwritable = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-cf-api"))
+        .args(["--wicket", "http://127.0.0.1:1", "--listen", "127.0.0.1:0"])
+        .args(["--data-dir", "/proc/sluice-cf-api"])
+        .output()
+        .unwrap();
+    assert!(!unwritable.status.success());
+    let said = String::from_utf8_lossy(&unwritable.stdout);
+    assert!(!said.contains("listening on"), "{said}");
     let hello = std::fs::read(guests.join("hello.wasm")).unwrap();
     std::fs::write(dir.join("app/hello.wasm"), &hello).unwrap();
     std::fs::write(dir.join("app2/hello.wasm"), variant(&hello)).unwrap();
@@ -728,6 +741,41 @@ fn the_cf_cli_deploys_to_the_wicket() {
     assert_eq!(served(), hello_sha256);
     assert!(!cf.ok(&["app", "img"]).contains("docker image:"));
 
+    // an upload to a package a newer one of its app replaced (two pushes at once): refused,
+    // and the API goes on
+    {
+        let (token, _) = cf.tokens();
+        let (_, _, apps) = http.get(&format!("{url}/v3/apps?names=hello"), Some(&token));
+        let apps: Value = serde_json::from_str(&apps).unwrap();
+        let guid = apps["resources"][0]["guid"].as_str().unwrap().to_string();
+        let package = || {
+            let response = http
+                .0
+                .post(format!("{url}/v3/packages"))
+                .header("Authorization", &token)
+                .body(
+                    json!({"type": "bits", "relationships": {"app": {"data": {"guid": guid}}}})
+                        .to_string(),
+                )
+                .send()
+                .unwrap();
+            let created: Value = response.json().unwrap();
+            created["guid"].as_str().unwrap().to_string()
+        };
+        let older = package();
+        package();
+        let replaced = http
+            .0
+            .post(format!("{url}/v3/packages/{older}/upload"))
+            .header("Authorization", &token)
+            .header("Content-Type", "multipart/form-data; boundary=xyz")
+            .body("--xyz\r\nContent-Disposition: form-data; name=\"bits\"\r\n\r\nPK\r\n--xyz--\r\n")
+            .send();
+        let status = replaced.map(|response| response.status().as_u16());
+        assert!(matches!(status, Ok(422)), "{status:?}");
+        assert_eq!(http.get(&format!("{url}/v3/apps"), Some(&token)).0, 200);
+    }
+
     // the cf-api restarted with an OpenID Provider and TLS of its own: its
     // state kept, the wicket's generation unchanged; the open mode's token
     // is no good any more, nor is a password
@@ -1004,13 +1052,18 @@ fn layer_file(tar: &mut tar::Builder<Vec<u8>>, path: &str, mode: u32, owner: u64
     tar.append_data(&mut header, path, body).unwrap();
 }
 
-/// `build`'s tar, gzipped.
-fn layer(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
+/// `build`'s tar, gzipped as `level` says.
+fn layer_of(level: flate2::Compression, build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
     let mut tar = tar::Builder::new(Vec::new());
     build(&mut tar);
-    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), level);
     gzip.write_all(&tar.into_inner().unwrap()).unwrap();
     gzip.finish().unwrap()
+}
+
+/// `build`'s tar, gzipped.
+fn layer(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
+    layer_of(flate2::Compression::fast(), build)
 }
 
 /// Firecracker and the guest kernel the wicket's VM test takes (its environment, else its
@@ -1153,7 +1206,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         wicket
     };
     let mut wicket = start_wicket();
-    let (_api, url) = start_api(&api_listen, &console, &flume_url, &dir.join("cf"), &[]);
+    let (api, url) = start_api(&api_listen, &console, &flume_url, &dir.join("cf"), &[]);
     let cf = Cf {
         cli: cf_cli(),
         home: dir.join("cfhome"),
@@ -1317,8 +1370,242 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     }
     assert!(listing(&console)["apps"].as_array().unwrap().is_empty());
     assert_eq!(get(&listen, "fc.localhost", "/", None).0, 404);
+    drop(api);
+
+    // the cf-api as an app of the wicket, owner ops, a disk of its own at its working
+    // directory, reaching the console and the flume through its egress; the host an
+    // address, not to depend on *.localhost resolving here
+    let cf_api = cf_api_image(&registry, &dir);
+    let http = Http::new();
+    let console_api = |method: reqwest::Method, path: &str, body: Value| {
+        let response = http
+            .0
+            .request(method, format!("http://{console}{path}"))
+            .bearer_auth(TOKEN)
+            .timeout(Duration::from_secs(300))
+            .body(body.to_string())
+            .send()
+            .unwrap();
+        let status = response.status().as_u16();
+        (status, response.json::<Value>().unwrap())
+    };
+    let made = |image: &str| {
+        let body = json!({"image": image, "username": "robot", "password": "p4ss"});
+        let (status, made) = console_api(reqwest::Method::PUT, "/api/images", body);
+        assert_eq!(status, 200, "{made}");
+        made["sha256"].as_str().unwrap().to_string()
+    };
+    let port_of = |address: &str| address.rsplit(':').next().unwrap().to_string();
+    let (console_port, flume_port) = (port_of(&console), port_of(&flume_url));
+    let provider = MockProvider::start("cf-api", "s3");
+    let provider_at = provider.issuer.trim_start_matches("http://");
+    let provider_at = provider_at.split('/').next().unwrap().to_string();
+    let put_cf_api = |sha256: &str, env: Value| {
+        let mut all = json!({
+            "SLUICE_WICKET_CF_API_WICKET": format!("http://localhost:{console_port}"),
+            "SLUICE_WICKET_CF_API_WICKET_TOKEN": TOKEN,
+            "SLUICE_WICKET_CF_API_FLUME": format!("grpc://localhost:{flume_port}"),
+            "SLUICE_WICKET_CF_API_FLUME_TOKEN": FLUME_TOKEN,
+        });
+        all.as_object_mut()
+            .unwrap()
+            .extend(env.as_object().unwrap().clone());
+        console_api(
+            reqwest::Method::PUT,
+            "/api/apps/cf-api",
+            json!({
+                "owner": "ops",
+                "hosts": ["127.0.0.1"],
+                "component": {"sha256": sha256, "name": "cf-api.ext4"},
+                "sandbox": {
+                    "mem": 256,
+                    "disk": "/data",
+                    "disk-mib": 256,
+                    "egress": [
+                        format!("localhost:{console_port}"),
+                        format!("localhost:{flume_port}"),
+                        provider_at,
+                    ],
+                    "env": all,
+                },
+            }),
+        )
+    };
+    let sha256 = made(&cf_api);
+    let (status, put) = put_cf_api(&sha256, json!({}));
+    assert_eq!(status, 200, "{put}");
+    assert_eq!(put["message"], "added 127.0.0.1");
+    let vm_url = format!("http://127.0.0.1:{}", port_of(&listen));
+    cf.ok(&["api", &vm_url]);
+    cf.ok(&["login", "-u", "me", "-p", "x"]);
+    let (status, info) = get(&listen, "127.0.0.1", "/v3/info", None);
+    assert_eq!(status, 200, "{info}");
+    assert!(info.contains("sluice-wicket-runtime-firecracker"), "{info}");
+    let mut push = cf.command(&[
+        "push",
+        "vm",
+        "--docker-image",
+        &image,
+        "--docker-username",
+        "robot",
+    ]);
+    push.env("CF_DOCKER_PASSWORD", "p4ss");
+    let (ok, output) = cf.output(push, "");
+    assert!(ok, "{output}");
+    let (status, body) = get(&listen, "vm.localhost", "/", None);
+    assert_eq!(status, 200, "{body}");
+
+    // through the flume, the cf-api's watch of it over its egress
+    let deadline = Instant::now() + HANG;
+    loop {
+        assert_eq!(get(&listen, "vm.localhost", "/log", None).0, 200);
+        if cf
+            .ok(&["logs", "vm", "--recent"])
+            .contains("[APP/PROC/WEB/0] OUT GET /log HTTP/1.0")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the app's lines never came");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // a restart of its VM: the app is served all along, the CLI's token still good, the
+    // app the cf-api's still
+    let answers = || {
+        let deadline = Instant::now() + HANG;
+        while !matches!(
+            std::panic::catch_unwind(|| get(&listen, "127.0.0.1", "/v3/info", None)),
+            Ok((200, _))
+        ) {
+            assert!(Instant::now() < deadline, "the cf-api never came back");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    let generation = listing(&console)["generation"].as_u64().unwrap();
+    let (status, put) = put_cf_api(&sha256, json!({"RESTART": "1"}));
+    assert_eq!(status, 200, "{put}");
+    assert_eq!(put["message"], "restarted 127.0.0.1");
+    answers();
+    assert!(cf.ok(&["apps"]).contains("vm"));
+    shows("vm", "running");
+    assert_eq!(get(&listen, "vm.localhost", "/", None).0, 200);
+    assert_eq!(
+        listing(&console)["generation"],
+        generation + 1,
+        "its own restart alone"
+    );
+
+    // the wicket killed right after a push: the push is on the disk, and served again
+    cf.ok(&["push", "kept", "-p", dir.join("rootfs").to_str().unwrap()]);
+    wicket.kill();
+    drop(wicket);
+    wicket = start_wicket();
+    answers();
+    cf.ok(&["app", "kept"]);
+    shows("kept", "running");
+    assert_eq!(get(&listen, "kept.localhost", "/env", None).0, 200);
+
+    // an upgrade: another image (the same, of another digest), the disk kept, the old VM
+    // stopped for the new one; with a provider through its egress, the CLI's token no good
+    // any more but for what the disk keeps: alice signs in
+    let mut image =
+        std::fs::read(dir.join(format!("deployed/rootfs/{sha256}/cf-api.ext4"))).unwrap();
+    image.extend_from_slice(&[0; 4096]);
+    let upgraded: String = Sha256::digest(&image)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let uploaded = http
+        .0
+        .put(format!("http://{console}/api/components/{upgraded}"))
+        .bearer_auth(TOKEN)
+        .timeout(Duration::from_secs(300))
+        .body(image)
+        .send()
+        .unwrap();
+    assert_eq!(uploaded.status().as_u16(), 200);
+    let (status, put) = put_cf_api(
+        &upgraded,
+        json!({
+            "SLUICE_WICKET_CF_API_OIDC_ISSUER": provider.issuer,
+            "SLUICE_WICKET_CF_API_OIDC_CLIENT_ID": "cf-api",
+            "SLUICE_WICKET_CF_API_OIDC_CLIENT_SECRET": "s3",
+            "SLUICE_WICKET_CF_API_OIDC_SCOPES": "openid,email,profile,groups",
+            "SLUICE_WICKET_CF_API_OIDC_CLAIM": "email=*@example.com",
+        }),
+    );
+    assert_eq!(status, 200, "{put}");
+    assert_eq!(put["message"], "restarted 127.0.0.1");
+    answers();
+    provider.sign_in(json!({
+        "sub": "1", "email": "alice@example.com", "preferred_username": "alice", "groups": []
+    }));
+    let code = passcode(&http, &vm_url);
+    let output = cf.ok_with_stdin(&["login", "--sso"], &format!("{code}\n"));
+    assert!(output.contains("Authenticating...\nOK"), "{output}");
+    assert!(cf.ok(&["apps"]).contains("kept"));
+
+    for app in ["vm", "kept"] {
+        cf.ok(&["delete", app, "-r", "-f"]);
+    }
+    let path = "/api/apps/cf-api?owner=ops";
+    let (status, removed) = console_api(reqwest::Method::DELETE, path, json!({}));
+    assert_eq!(status, 200, "{removed}");
+    assert!(listing(&console)["apps"].as_array().unwrap().is_empty());
 
     drop(wicket);
     drop(flume);
+    drop(provider);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cf-api as an image (no docker here: this binary stripped, what it links, the host's
+/// CA bundle, the working directory its user's and the port its Dockerfile's, in one layer
+/// of no compression: debug builds read it all, more than once); its reference in `registry`.
+fn cf_api_image(registry: &Registry, dir: &Path) -> String {
+    let built = env!("CARGO_BIN_EXE_sluice-wicket-cf-api");
+    let binary = dir.join("cf-api-stripped");
+    let stripped = Command::new("strip")
+        .args(["--strip-debug", "-o"])
+        .arg(&binary)
+        .arg(built)
+        .status()
+        .expect("run strip");
+    assert!(stripped.success());
+    let linked = Command::new("ldd").arg(built).output().unwrap();
+    let linked = String::from_utf8_lossy(&linked.stdout).into_owned();
+    let libraries: Vec<&str> = linked
+        .split_whitespace()
+        .filter(|word| word.starts_with('/'))
+        .collect();
+    let layer = layer_of(flate2::Compression::none(), |tar| {
+        layer_file(tar, "cf-api", 0o755, 0, &std::fs::read(&binary).unwrap());
+        for library in &libraries {
+            let bytes = std::fs::read(library).unwrap();
+            layer_file(tar, &library[1..], 0o755, 0, &bytes);
+        }
+        let bundle = "/etc/ssl/certs/ca-certificates.crt";
+        let roots = std::fs::read(bundle).unwrap();
+        layer_file(tar, &bundle[1..], 0o644, 0, &roots);
+        let mut data = tar::Header::new_gnu();
+        data.set_entry_type(tar::EntryType::Directory);
+        data.set_mode(0o755);
+        data.set_uid(65532);
+        data.set_gid(65532);
+        data.set_size(0);
+        tar.append_data(&mut data, "data/", std::io::empty())
+            .unwrap();
+    });
+    let config = json!({
+        "architecture": if cfg!(target_arch = "x86_64") { "amd64" } else { "arm64" },
+        "os": "linux",
+        "config": {
+            "Entrypoint": ["/cf-api"],
+            "User": "65532:65532",
+            "WorkingDir": "/data",
+            "ExposedPorts": {"9091/tcp": {}},
+        },
+    });
+    registry.push_image("private/cf-api", "1", &config, &[layer]);
+    format!("{}/private/cf-api:1", registry.address)
 }

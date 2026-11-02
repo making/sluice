@@ -8,6 +8,7 @@ use crate::store::{
     App, Build, Deployment, Droplet, Job, Lifecycle, Named, Outcome, Package, Route, STACK, State,
     epoch_secs, now,
 };
+use crate::wicket::Runtime;
 
 /// The Cloud Controller version announced.
 pub const CC_VERSION: &str = "3.200.0";
@@ -63,12 +64,22 @@ pub fn v3(base: &str) -> Value {
     json!({"links": links})
 }
 
-pub fn info(base: &str, build: &str) -> Value {
+/// `/v3/info`: the description names what the wicket runs, when it answers.
+pub fn info(base: &str, build: &str, runtime: Option<Runtime>) -> Value {
+    let description = match runtime {
+        Some(Runtime::Wasm) => {
+            "sluice-wicket-cf-api: deploys wasm components to a sluice-wicket-runtime-wasi with the cf CLI"
+        }
+        Some(Runtime::Firecracker) => {
+            "sluice-wicket-cf-api: deploys container images and rootfs images to a sluice-wicket-runtime-firecracker with the cf CLI"
+        }
+        None => "sluice-wicket-cf-api: deploys apps to a sluice wicket with the cf CLI",
+    };
     json!({
         "build": build,
         "cli_version": {"minimum": "", "recommended": ""},
         "custom": {},
-        "description": "sluice-wicket-cf-api: deploys wasm components to a sluice-wicket-runtime-wasi with the cf CLI",
+        "description": description,
         "name": "sluice-wicket-cf-api",
         "version": 0,
         "osbapi_version": "2.15",

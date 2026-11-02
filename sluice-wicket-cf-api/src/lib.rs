@@ -116,6 +116,16 @@ pub struct TlsSettings {
     pub key_pem: Vec<u8>,
 }
 
+/// Whether the data directory can be written, made if missing: before the listener binds, which
+/// a VM's `/init` takes for ready.
+pub fn check_data_dir(dir: &std::path::Path) -> Result<(), String> {
+    let probe = dir.join(format!("{}.tmp", store::guid()));
+    std::fs::create_dir_all(dir)
+        .and_then(|()| std::fs::write(&probe, b""))
+        .and_then(|()| std::fs::remove_file(&probe))
+        .map_err(|e| format!("--data-dir {}: {e}", dir.display()))
+}
+
 /// Binds `listen`; `loopback_only` (no provider: the API takes any
 /// credentials) refuses any other address.
 pub async fn bind(listen: &str, loopback_only: bool) -> Result<TcpListener, String> {
@@ -164,8 +174,6 @@ pub async fn serve(
     // reqwest brings no crypto provider of its own (sluice-wicket-oidc's
     // rustls-no-provider): ring, as tonic's TLS and the listener's
     let _ = rustls::crypto::ring::default_provider().install_default();
-    std::fs::create_dir_all(&settings.data_dir)
-        .map_err(|e| format!("--data-dir {}: {e}", settings.data_dir.display()))?;
     let store = Arc::new(store::Store::open(
         &settings.data_dir,
         &settings.org,

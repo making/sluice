@@ -20,6 +20,10 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Err(e) = sluice_wicket_cf_api::check_data_dir(&config.settings.data_dir) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
     let listener =
         match sluice_wicket_cf_api::bind(&config.listen, config.settings.oidc.is_none()).await {
             Ok(listener) => listener,

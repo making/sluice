@@ -5,7 +5,8 @@
 //! data directory on every change; the blobs next to it
 //! (`packages/<guid>.zip`, `droplets/<sha256>.wasm`). Every file is its
 //! owner's only (0600): the state holds the apps' environment and the
-//! credentials of their images.
+//! credentials of their images. A write is durable when it returns, for a kill of a
+//! VM holding the directory on its disk.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -637,6 +638,15 @@ impl State {
         }
     }
 
+    /// Whether `package` is the newest of the app `app`: an older one is gone with a newer's
+    /// upload.
+    pub fn is_newest_package(&self, package: &str, app: &str) -> bool {
+        self.packages
+            .iter()
+            .rfind(|package| package.app == app)
+            .is_some_and(|newest| newest.guid == package)
+    }
+
     /// Keeps the app's newest package only; the others are listed to delete.
     pub fn keep_newest_package(&mut self, app: &str) -> Vec<Blob> {
         let newest = self
@@ -654,6 +664,25 @@ impl State {
             kept
         });
         blobs
+    }
+}
+
+/// An upload's file, by the name of its extension: what a stop cuts short goes at the next
+/// start.
+const SPOOLED: &str = ".upload";
+
+/// An upload received to a file, removed with this.
+pub struct Spool(PathBuf);
+
+impl Spool {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Spool {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -678,6 +707,20 @@ impl Store {
         for sub in ["packages", "droplets"] {
             std::fs::create_dir_all(dir.join(sub))
                 .map_err(|e| format!("{}: {e}", dir.join(sub).display()))?;
+        }
+        // what a stop cut short: an upload, a file being written, a droplet being made
+        for sub in [".", "packages", "droplets"] {
+            for entry in std::fs::read_dir(dir.join(sub))
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let path = entry.path();
+                let name = path.to_string_lossy();
+                if name.ends_with(SPOOLED) || name.ends_with(".tmp") || name.ends_with(".droplet") {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
         }
         let file = dir.join("state.json");
         let state = match std::fs::read(&file) {
@@ -741,9 +784,13 @@ impl Store {
         self.dir.join("droplets").join(format!("{sha256}.wasm"))
     }
 
-    /// Writes a blob by a rename.
-    pub fn write_package(&self, guid: &str, bytes: &[u8]) -> Result<(), String> {
-        write_by_rename(&self.package_path(guid), bytes)
+    /// Makes the package `guid` of what `write` writes, by a rename.
+    pub fn make_package<T>(
+        &self,
+        guid: &str,
+        write: impl FnOnce(&mut std::fs::File) -> Result<T, String>,
+    ) -> Result<T, String> {
+        make_by_rename(&self.package_path(guid), write)
     }
 
     pub fn write_droplet(&self, sha256: &str, bytes: &[u8]) -> Result<(), String> {
@@ -752,6 +799,45 @@ impl Store {
             return Ok(());
         }
         write_by_rename(&path, bytes)
+    }
+
+    /// Makes the droplet of what `write` writes, named by the digest it answers with what
+    /// it made of it (a droplet of that digest kept stays as it is).
+    pub fn make_droplet<T>(
+        &self,
+        write: impl FnOnce(&mut std::fs::File) -> Result<(T, String), String>,
+    ) -> Result<T, String> {
+        let partial = self
+            .dir
+            .join("droplets")
+            .join(format!("{}.droplet", guid()));
+        let (made, sha256) = make_by_rename(&partial, write)?;
+        let path = self.droplet_path(&sha256);
+        let failed = |e: std::io::Error| format!("{}: {e}", path.display());
+        if path.exists() {
+            std::fs::remove_file(&partial).map_err(failed)?;
+        } else {
+            std::fs::rename(&partial, &path)
+                .and_then(|()| std::fs::File::open(self.dir.join("droplets"))?.sync_all())
+                .map_err(failed)?;
+        }
+        Ok(made)
+    }
+
+    /// Where an upload is received, for its owner only, gone with what is returned.
+    pub fn spool(&self) -> Result<(Spool, std::fs::File), String> {
+        let path = self
+            .dir
+            .join("packages")
+            .join(format!("{}{SPOOLED}", guid()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok((Spool(path), file))
     }
 
     pub fn delete(&self, blobs: &[Blob]) {
@@ -769,22 +855,44 @@ impl Store {
     }
 }
 
-/// Writes `bytes` to `path` by a rename, for its owner only (0600) from the
-/// first byte on.
+/// Writes `bytes` to `path`, as [`make_by_rename`] does.
 pub(crate) fn write_by_rename(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
-    // one a crash left keeps its mode: made anew
-    let _ = std::fs::remove_file(&tmp);
+    make_by_rename(path, |file| {
+        file.write_all(bytes)
+            .map_err(|e| format!("{}: {e}", path.display()))
+    })
+}
+
+/// Makes `path` of what `write` writes, by a rename, for its owner only (0600) from the
+/// first byte on, on the disk once it returns: in a VM, a kill loses what its guest's page
+/// cache held, and an edit answered must be there. Failing, nothing is left.
+pub(crate) fn make_by_rename<T>(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> Result<T, String>,
+) -> Result<T, String> {
+    // of its own: two uploads to one package may be under way
+    let tmp = path.with_extension(format!("{}.tmp", guid()));
+    let failed = |e: std::io::Error| format!("{}: {e}", path.display());
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options
-        .open(&tmp)
-        .and_then(|mut file| file.write_all(bytes))
-        .and_then(|()| std::fs::rename(&tmp, path))
-        .map_err(|e| format!("{}: {e}", path.display()))
+    let mut file = options.open(&tmp).map_err(failed)?;
+    let made = write(&mut file).and_then(|made| {
+        file.sync_all()
+            .and_then(|()| std::fs::rename(&tmp, path))
+            .and_then(|()| match path.parent() {
+                Some(dir) => std::fs::File::open(dir)?.sync_all(),
+                None => Ok(()),
+            })
+            .map_err(failed)?;
+        Ok(made)
+    });
+    if made.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    made
 }
 
 pub fn guid() -> String {

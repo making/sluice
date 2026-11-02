@@ -33,10 +33,10 @@ use crate::manifest;
 use crate::oidc::Provider;
 use crate::registry::{Reference, Registry};
 use crate::services;
-use crate::staging;
+use crate::staging::{self, Hashed};
 use crate::store::{
-    BUDGET_ANNOTATION, Build, Deployment, DockerImage, INSTANCES_ANNOTATION, JobError, Lifecycle,
-    Package, Running, State, Store, epoch_secs, guid, now,
+    BUDGET_ANNOTATION, Blob, Build, Deployment, DockerImage, INSTANCES_ANNOTATION, JobError,
+    Lifecycle, Package, Running, Spool, State, Store, epoch_secs, guid, now,
 };
 use crate::uaa::{self, Uaa};
 use crate::views;
@@ -172,13 +172,15 @@ impl From<String> for ApiError {
     }
 }
 
-/// A request read whole.
+/// A request, its body read: an upload's to a file.
 pub(crate) struct Req {
     pub(crate) method: Method,
     pub(crate) path: String,
     pub(crate) query: Vec<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
+    /// An upload's body, in a file.
+    spool: Option<Spool>,
     /// Where the CLI reaches this API: the links name it.
     pub(crate) base: String,
 }
@@ -247,20 +249,28 @@ impl Api {
     async fn handle(&self, request: hyper::Request<Incoming>) -> Response {
         let (parts, body) = request.into_parts();
         let path = parts.uri.path().to_string();
-        let limit = if path.ends_with("/upload") {
-            MAX_UPLOAD_BYTES
-        } else {
-            MAX_BODY_BYTES
-        };
-        let body = match Limited::new(body, limit).collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(e)
-                if e.downcast_ref::<http_body_util::LengthLimitError>()
-                    .is_some() =>
-            {
-                return ApiError::too_large(limit).into();
+        // a package to a file as it comes: it may be larger than this process's memory; and
+        // only from whoever may leave one, the others refused below, their body unread.
+        // Any other body is small
+        let (body, spool) = if path.ends_with("/upload") {
+            match self.authenticated(&parts.headers) {
+                Ok(()) => match self.spooled(body).await {
+                    Ok(spool) => (Bytes::new(), Some(spool)),
+                    Err(error) => return error.into(),
+                },
+                Err(_) => (Bytes::new(), None),
             }
-            Err(e) => return ApiError::bad_request(format!("the body: {e}")).into(),
+        } else {
+            match Limited::new(body, MAX_BODY_BYTES).collect().await {
+                Ok(collected) => (collected.to_bytes(), None),
+                Err(e)
+                    if e.downcast_ref::<http_body_util::LengthLimitError>()
+                        .is_some() =>
+                {
+                    return ApiError::too_large(MAX_BODY_BYTES).into();
+                }
+                Err(e) => return ApiError::bad_request(format!("the body: {e}")).into(),
+            }
         };
         let host = parts
             .headers
@@ -285,6 +295,7 @@ impl Api {
                 .collect(),
             headers: parts.headers,
             body,
+            spool,
             base: format!("{scheme}://{host}"),
             path,
         };
@@ -311,7 +322,11 @@ impl Api {
             (&Method::GET, []) => Ok(json(StatusCode::OK, &views::root(base))),
             (&Method::GET, ["v3"]) => Ok(json(StatusCode::OK, &views::v3(base))),
             (&Method::GET, ["v3", "info"]) => {
-                Ok(json(StatusCode::OK, &views::info(base, &self.build)))
+                let runtime = self.controller.runtime().await.ok();
+                Ok(json(
+                    StatusCode::OK,
+                    &views::info(base, &self.build, runtime),
+                ))
             }
             (&Method::GET, ["uaa", "login"]) | (&Method::GET, ["login"]) => Ok(json(
                 StatusCode::OK,
@@ -437,8 +452,13 @@ impl Api {
     }
 
     fn authenticate(&self, req: &Req) -> Result<(), ApiError> {
-        let token = req
-            .header(header::AUTHORIZATION)
+        self.authenticated(&req.headers)
+    }
+
+    fn authenticated(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+        let token = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
             .and_then(|value| {
                 value
                     .strip_prefix("bearer ")
@@ -449,6 +469,26 @@ impl Api {
             .verify(token.trim())
             .map(|_| ())
             .map_err(|e| ApiError::invalid_token(&e))
+    }
+
+    /// `body` in a file, [`MAX_UPLOAD_BYTES`] at most.
+    async fn spooled(&self, mut body: Incoming) -> Result<Spool, ApiError> {
+        use std::io::Write as _;
+        let (spool, mut file) = self.store.spool()?;
+        let failed = |e: std::io::Error| ApiError::from(format!("{}: {e}", spool.path().display()));
+        let mut bytes = 0;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| ApiError::bad_request(format!("the body: {e}")))?;
+            let Some(data) = frame.data_ref() else {
+                continue;
+            };
+            bytes += data.len();
+            if bytes > MAX_UPLOAD_BYTES {
+                return Err(ApiError::too_large(MAX_UPLOAD_BYTES));
+            }
+            file.write_all(data).map_err(failed)?;
+        }
+        Ok(spool)
     }
 
     fn log_cache(&self, req: &Req, segments: &[&str]) -> Reply {
@@ -822,7 +862,7 @@ impl Api {
                     || Err(ApiError::not_found("Package")),
                     |package| Ok(json(StatusCode::OK, &package)),
                 ),
-            (&Method::POST, ["packages", guid, "upload"]) => self.upload(req, guid),
+            (&Method::POST, ["packages", guid, "upload"]) => self.upload(req, guid).await,
             (&Method::GET, ["packages", guid, "droplets"]) => {
                 store
                     .read(|state| state.package(guid).map(|_| ()))
@@ -1574,8 +1614,10 @@ impl Api {
         Ok(json(StatusCode::CREATED, &view))
     }
 
-    /// The `bits` part of the upload is the zip; the app's older packages go.
-    fn upload(&self, req: &Req, guid: &str) -> Reply {
+    /// The `bits` part of the upload is the zip, copied on a blocking thread: a VM of one vCPU
+    /// has one worker, which its API and its watch run on. The app's older packages go, and an
+    /// upload to one that went is refused.
+    async fn upload(&self, req: &Req, guid: &str) -> Reply {
         let package = self
             .store
             .read(|state| state.package(guid).cloned())
@@ -1585,32 +1627,59 @@ impl Api {
                 "a docker package takes no upload: its image is pulled at staging",
             ));
         }
-        let content_type = req.header(header::CONTENT_TYPE).unwrap_or_default();
-        let parts =
-            crate::multipart::parts(content_type, &req.body).map_err(ApiError::bad_request)?;
-        let bits = parts
-            .iter()
-            .find(|part| part.name == "bits")
-            .ok_or_else(|| ApiError::bad_request("the upload has no 'bits' part"))?;
-        self.store.write_package(guid, bits.body)?;
-        let sha256 = staging::sha256(bits.body);
-        let (view, blobs) = self.store.update(|state| {
+        let replaced = || ApiError::unprocessable("a newer package of the app replaced this one");
+        let newest = |state: &State| state.is_newest_package(guid, &package.app);
+        if !self.store.read(newest) {
+            return Err(replaced());
+        }
+        let content_type = req
+            .header(header::CONTENT_TYPE)
+            .unwrap_or_default()
+            .to_string();
+        let spool = req
+            .spool
+            .as_ref()
+            .ok_or_else(|| ApiError::bad_request("no body"))?;
+        let body = std::fs::File::open(spool.path())
+            .map_err(|e| ApiError::from(format!("{}: {e}", spool.path().display())))?;
+        let copied = {
+            let (store, guid) = (self.store.clone(), guid.to_string());
+            tokio::task::spawn_blocking(move || {
+                store.make_package(&guid, |file| {
+                    let mut hashed = Hashed::new(file);
+                    let bytes =
+                        crate::multipart::copy_part(&content_type, body, "bits", &mut hashed)?
+                            .ok_or("the upload has no 'bits' part")?;
+                    Ok((bytes, hashed.finish()))
+                })
+            })
+            .await
+            .map_err(|e| ApiError::from(format!("the upload: {e}")))?
+        };
+        let (bytes, sha256) = copied.map_err(ApiError::bad_request)?;
+        let updated = self.store.update(|state| {
+            if !newest(state) {
+                return None;
+            }
             let blobs = state.keep_newest_package(&package.app);
             let package = state
                 .packages
                 .iter_mut()
-                .find(|package| package.guid == guid)
-                .expect("the newest");
+                .find(|package| package.guid == guid)?;
             package.state = "READY".into();
             package.sha256 = Some(sha256);
             package.updated_at = now();
-            (views::package(&req.base, package), blobs)
+            Some((views::package(&req.base, package), blobs))
         });
+        let Some((view, blobs)) = updated else {
+            self.store.delete(&[Blob::Package(guid.to_string())]);
+            return Err(replaced());
+        };
         self.store.delete(&blobs);
         self.logs.add(
             &package.app,
             "API",
-            format!("Uploaded a package of {} bytes", bits.body.len()),
+            format!("Uploaded a package of {bytes} bytes"),
         );
         Ok(json(StatusCode::OK, &view))
     }

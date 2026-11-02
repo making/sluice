@@ -7,7 +7,8 @@
 //! image, which it keeps (the cf-api the image's pinned reference, to have it
 //! made again).
 
-use std::io::{Cursor, Read as _};
+use std::io::{Read, Seek, Write};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
@@ -20,6 +21,13 @@ use crate::wicket::Runtime;
 /// A rootfs's file name ends so; a droplet's kind is its file's.
 pub const ROOTFS: &str = ".ext4";
 
+/// What a package's component may unpack to: the largest image a wicket takes. A zip takes
+/// any size down to next to nothing.
+const MAX_DROPLET_BYTES: u64 = 4 << 30;
+
+/// What a component is told by, before it is unpacked: the superblock's magic of a rootfs.
+const HEAD: usize = MAGIC_AT + MAGIC.len();
+
 /// Where the ext2/3/4 superblock's magic is, and what it is (little-endian 0xEF53).
 const MAGIC_AT: usize = 1024 + 56;
 const MAGIC: [u8; 2] = [0x53, 0xEF];
@@ -29,7 +37,8 @@ const MAGIC: [u8; 2] = [0x53, 0xEF];
 pub struct Staged {
     /// Its path in the package; its file name for an image.
     pub entry: String,
-    /// Empty when the wicket keeps it: a rootfs it made.
+    /// A component pulled, to keep; empty when kept already (a zip's), or when the wicket
+    /// keeps it (a rootfs it made).
     pub bytes: Vec<u8>,
     pub size: u64,
     pub sha256: String,
@@ -42,7 +51,7 @@ pub struct Staged {
 /// `command` names, else its only `.wasm` ([`stage`]); an image's is pulled
 /// from its registry with the package's credentials, if any.
 pub async fn run(
-    store: &Store,
+    store: &Arc<Store>,
     logs: &Logs,
     registry: &Registry,
     controller: &Controller,
@@ -54,9 +63,7 @@ pub async fn run(
     let staged = match &package.docker {
         None => {
             logs.add(app, "STG", "Staging with the wasm lifecycle: the web process command names the component, else the package's only .wasm");
-            std::fs::read(store.package_path(&package.guid))
-                .map_err(|e| format!("the package is gone: {e}"))
-                .and_then(|zip| stage(&zip, command))
+            unpack(store.clone(), &package.guid, command).await
         }
         Some(docker) => match controller.runtime().await {
             Ok(Runtime::Wasm) => pull(logs, registry, app, docker).await,
@@ -140,6 +147,23 @@ pub async fn run(
     }
 }
 
+/// Stages the zip of the package `guid`, its droplet made, on a blocking thread: a VM of one
+/// vCPU has one worker, which the API and the watch run on.
+async fn unpack(store: Arc<Store>, guid: &str, command: Option<&str>) -> Result<Staged, String> {
+    let (guid, command) = (guid.to_string(), command.map(str::to_string));
+    tokio::task::spawn_blocking(move || {
+        let zip = std::fs::File::open(store.package_path(&guid))
+            .map_err(|e| format!("the package is gone: {e}"))?;
+        store.make_droplet(|droplet| {
+            let staged = stage(zip, command.as_deref(), droplet, MAX_DROPLET_BYTES)?;
+            let sha256 = staged.sha256.clone();
+            Ok((staged, sha256))
+        })
+    })
+    .await
+    .map_err(|e| format!("staging: {e}"))?
+}
+
 /// The component of `docker`'s image, pulled from its registry with the package's
 /// credentials, if any.
 async fn pull(
@@ -175,10 +199,15 @@ async fn pull(
         .map_err(|e| format!("{}: {e}", docker.image))
 }
 
-/// Stages `package` (a zip) for the web process `command`.
-pub fn stage(package: &[u8], command: Option<&str>) -> Result<Staged, String> {
-    let mut archive =
-        zip::ZipArchive::new(Cursor::new(package)).map_err(|e| format!("not a zip: {e}"))?;
+/// Stages `package` (a zip) for the web process `command`: the component unpacked to
+/// `droplet` as it comes, `max` bytes at most, not a process's memory.
+pub fn stage(
+    package: impl Read + Seek,
+    command: Option<&str>,
+    droplet: &mut impl Write,
+    max: u64,
+) -> Result<Staged, String> {
+    let mut archive = zip::ZipArchive::new(package).map_err(|e| format!("not a zip: {e}"))?;
     let names: Vec<String> = archive
         .file_names()
         .filter_map(|name| name.ok())
@@ -217,30 +246,85 @@ pub fn stage(package: &[u8], command: Option<&str>) -> Result<Staged, String> {
             }
         },
     };
-    let mut bytes = Vec::new();
-    archive
+    let unread = |e: std::io::Error| format!("cannot read {entry}: {e}");
+    let mut file = archive
         .by_name(&entry)
-        .and_then(|mut file| file.read_to_end(&mut bytes).map_err(Into::into))
         .map_err(|e| format!("cannot read {entry}: {e}"))?;
+    let mut head = Vec::with_capacity(HEAD);
+    (&mut file)
+        .take(HEAD as u64)
+        .read_to_end(&mut head)
+        .map_err(unread)?;
     match entry.ends_with(ROOTFS) {
-        true => check_rootfs(&entry, &bytes)?,
-        false => check_component(&entry, &bytes)?,
+        true => check_rootfs(&entry, &head)?,
+        false => check_component(&entry, &head)?,
     }
+    let unwritten = |e: std::io::Error| format!("writing {entry}: {e}");
+    let mut hashed = Hashed::new(droplet);
+    hashed.write_all(&head).map_err(unwritten)?;
+    let mut size = head.len() as u64;
+    let mut chunk = vec![0; 1 << 20];
+    loop {
+        let read = file.read(&mut chunk).map_err(unread)?;
+        if read == 0 {
+            break;
+        }
+        size += read as u64;
+        if size > max {
+            return Err(format!("{entry} unpacks to more than {} MiB", max >> 20));
+        }
+        hashed.write_all(&chunk[..read]).map_err(unwritten)?;
+    }
+    drop(file);
     Ok(Staged {
-        sha256: sha256(&bytes),
-        size: bytes.len() as u64,
+        sha256: hashed.finish(),
+        size,
         entry,
-        bytes,
+        bytes: Vec::new(),
         image: None,
     })
 }
 
+/// A writer keeping the digest of what passes it.
+pub struct Hashed<W> {
+    out: W,
+    hasher: Sha256,
+}
+
+impl<W: Write> Hashed<W> {
+    pub fn new(out: W) -> Hashed<W> {
+        Hashed {
+            out,
+            hasher: Sha256::new(),
+        }
+    }
+
+    /// The digest, in hex.
+    pub fn finish(self) -> String {
+        hex(&self.hasher.finalize())
+    }
+}
+
+impl<W: Write> Write for Hashed<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.out.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
 /// The SHA-256 of `bytes`, in hex.
 pub fn sha256(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex(&Sha256::digest(bytes))
+}
+
+/// `digest` in hex.
+fn hex(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// A wasm component: the magic, then the version and the layer (1; a core
@@ -277,7 +361,7 @@ fn listed<S: AsRef<str>>(names: &[S]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
+    use std::io::Cursor;
 
     use super::*;
 
@@ -294,60 +378,77 @@ mod tests {
         zip.finish().unwrap().into_inner()
     }
 
+    /// [`stage`] of `zip`, the droplet in memory; within `max` bytes.
+    fn staged(zip: &[u8], command: Option<&str>, max: u64) -> Result<(Staged, Vec<u8>), String> {
+        let mut droplet = Vec::new();
+        stage(Cursor::new(zip), command, &mut droplet, max).map(|staged| (staged, droplet))
+    }
+
     #[test]
     fn picks_the_only_component_or_the_one_the_command_names() {
-        let staged = stage(
+        let (hello, droplet) = staged(
             &zipped(&[("hello.wasm", COMPONENT), ("README", b"x")]),
             None,
+            1 << 20,
         )
         .unwrap();
-        assert_eq!(staged.entry, "hello.wasm");
-        assert_eq!(staged.bytes, COMPONENT);
-        assert_eq!(staged.sha256.len(), 64);
+        assert_eq!(hello.entry, "hello.wasm");
+        assert_eq!(droplet, COMPONENT);
+        assert_eq!(hello.sha256, sha256(COMPONENT));
+        assert_eq!(hello.size, COMPONENT.len() as u64);
         let two = zipped(&[("a.wasm", COMPONENT), ("dist/b.wasm", COMPONENT)]);
+        let picked = |zip: &[u8], command| staged(zip, command, 1 << 20).map(|(staged, _)| staged);
         assert!(
-            stage(&two, None)
+            picked(&two, None)
                 .unwrap_err()
                 .contains("2 components (a.wasm, dist/b.wasm)")
         );
-        assert_eq!(stage(&two, Some("b.wasm")).unwrap().entry, "dist/b.wasm");
+        assert_eq!(picked(&two, Some("b.wasm")).unwrap().entry, "dist/b.wasm");
         assert_eq!(
-            stage(&two, Some("dist/b.wasm")).unwrap().entry,
+            picked(&two, Some("dist/b.wasm")).unwrap().entry,
             "dist/b.wasm"
         );
         assert!(
-            stage(&two, Some("c.wasm"))
+            picked(&two, Some("c.wasm"))
                 .unwrap_err()
                 .contains("names 'c.wasm'")
         );
         assert!(
-            stage(&zipped(&[("index.html", b"<p>")]), None)
+            picked(&zipped(&[("index.html", b"<p>")]), None)
                 .unwrap_err()
                 .contains("no .wasm component, nor an .ext4 rootfs (found: index.html)")
         );
         let mut rootfs = vec![0; 2048];
         rootfs[MAGIC_AT..MAGIC_AT + 2].copy_from_slice(&MAGIC);
-        assert_eq!(
-            stage(&zipped(&[("app/r.ext4", &rootfs)]), None)
-                .unwrap()
-                .entry,
-            "app/r.ext4"
+        let rootfs_zip = zipped(&[("app/r.ext4", &rootfs)]);
+        let (picked_rootfs, unpacked) = staged(&rootfs_zip, None, 1 << 20).unwrap();
+        assert_eq!(picked_rootfs.entry, "app/r.ext4");
+        assert_eq!(unpacked, rootfs);
+        // what unpacks past the bound, however small its zip
+        assert!(
+            staged(&rootfs_zip, None, 2047)
+                .unwrap_err()
+                .contains("app/r.ext4 unpacks to more than")
         );
         assert!(
-            stage(&zipped(&[("r.ext4", b"not one")]), None)
+            picked(&zipped(&[("r.ext4", b"not one")]), None)
                 .unwrap_err()
                 .contains("not an ext4 image")
         );
         assert!(
-            stage(&zipped(&[("m.wasm", MODULE)]), None)
+            picked(&zipped(&[("m.wasm", MODULE)]), None)
                 .unwrap_err()
                 .contains("core wasm module")
         );
         assert!(
-            stage(&zipped(&[("t.wasm", b"text")]), None)
+            picked(&zipped(&[("t.wasm", b"text")]), None)
                 .unwrap_err()
                 .contains("not wasm")
         );
-        assert!(stage(b"not a zip", None).unwrap_err().contains("not a zip"));
+        assert!(
+            picked(b"not a zip", None)
+                .unwrap_err()
+                .contains("not a zip")
+        );
     }
 }

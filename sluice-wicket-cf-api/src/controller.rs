@@ -243,7 +243,7 @@ impl Controller {
     /// that one's from here on, a rebuild of the same image and guest the same.
     async fn provide(&self, sha256: &str, app: &mut AppBody) -> Result<(), Failure> {
         let path = self.store.droplet_path(sha256);
-        match std::fs::read(&path) {
+        match tokio::fs::File::open(&path).await {
             Ok(component) => return self.wicket.upload(sha256, component).await,
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 return Err(gone(sha256, &path, e));

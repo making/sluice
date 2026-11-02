@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 
 /// A PUT may compile the component: generous.
 const EDIT_TIMEOUT: Duration = Duration::from_secs(120);
-/// A rootfs made of an image: minutes, the wicket's own bound a little within it.
+/// A rootfs made of an image, or uploaded (4 GiB at most): minutes, the wicket's own bound of
+/// a make a little within it.
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(660);
 /// A listing with `after` is held 25s at most.
 const LIST_TIMEOUT: Duration = Duration::from_secs(40);
@@ -230,13 +231,21 @@ impl Wicket {
         serde_json::from_slice(&body).map_err(|e| Failure::Unreachable(format!("the answer: {e}")))
     }
 
-    pub async fn upload(&self, sha256: &str, component: Vec<u8>) -> Result<(), Failure> {
+    /// Uploads the component in `file` as it is read: it may be larger than this process's
+    /// memory.
+    pub async fn upload(&self, sha256: &str, file: tokio::fs::File) -> Result<(), Failure> {
+        let bytes = file
+            .metadata()
+            .await
+            .map_err(|e| Failure::Unreachable(format!("the component: {e}")))?
+            .len();
         let request = self
             .client
             .put(format!("{}/api/components/{sha256}", self.base))
-            .timeout(EDIT_TIMEOUT)
+            .timeout(IMAGE_TIMEOUT)
             .header("content-type", "application/wasm")
-            .body(component);
+            .header("content-length", bytes)
+            .body(file);
         let (status, body) = self.send(request).await?;
         if !status.is_success() {
             return Err(refused(status, &body));

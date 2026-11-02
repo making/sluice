@@ -9,7 +9,7 @@ component is deployed with `cf push` (its bits, or an image in an OCI registry:
 services (the wicket's keyvalue stores and capabilities) and `cf logs` work as the CLI expects.
 Pointed at a [sluice-wicket-runtime-firecracker](../sluice-wicket-runtime-firecracker/README.md#apps)
 instead, `cf push --docker-image` deploys a container image, a CNB image say, as microVMs
-(see [Mapping](#mapping)). Users log in through an OpenID Provider (`cf login --sso`; see [Login](#login)), or, on the
+(see [On a Firecracker wicket](#on-a-firecracker-wicket)). Users log in through an OpenID Provider (`cf login --sso`; see [Login](#login)), or, on the
 loopback, with any credentials.
 
 ```text
@@ -251,6 +251,134 @@ group and allow the group (`groups=devs`, with the scopes `openid,email,profile,
 [connector](https://dexidp.io/docs/connectors/) replaces the static users with GitHub, LDAP,
 another OpenID Provider and the like.
 
+### On a Firecracker wicket
+
+For a host with KVM that should run the wicket and little else: the cf-api is an app of the
+[wicket](../sluice-wicket-runtime-firecracker/README.md#docker-image), in a VM of its own, its
+state on a [disk](../sluice-wicket-runtime-firecracker/README.md#disks) that outlives the VM, and
+`cf push` deploys container images as microVMs. The flume is what brings the apps' output to `cf
+logs`: to do without it, leave out its container, `--network`, `--flume`, and its `egress` and
+`env` below.
+
+The wicket and the flume, on the host's loopback (see **who reaches it** below):
+
+```text
+export TOKEN=$(openssl rand -hex 16) FLUME_TOKEN=$(openssl rand -hex 16)
+docker network create sluice
+docker run -d --name flume --network sluice --restart unless-stopped \
+    -e SLUICE_FLUME_TOKEN=$FLUME_TOKEN ghcr.io/making/sluice/sluice-flume
+docker run -d --name wicket --network sluice --restart unless-stopped --device /dev/kvm \
+    --group-add $(stat -c %g /dev/kvm) --tmpfs /run/sluice --stop-timeout 40 -v wicket:/data \
+    -p 127.0.0.1:8080:8080 -p 127.0.0.1:9090:9090 \
+    -e SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE_TOKEN=$TOKEN \
+    -e SLUICE_WICKET_RUNTIME_FIRECRACKER_FLUME_TOKEN=$FLUME_TOKEN \
+    ghcr.io/making/sluice/sluice-wicket-runtime-firecracker \
+    --listen 0.0.0.0:8080 --console 0.0.0.0:9090 --flume grpc://flume:8002
+```
+
+Then the cf-api: its rootfs, made by the wicket of its image, and the app naming it. The wicket
+serves on `127.0.0.1:9090` once `docker logs wicket` says `console on`:
+
+```text
+sha256=$(curl -sS -X PUT -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9090/api/images \
+    -d '{"image": "ghcr.io/making/sluice/sluice-wicket-cf-api"}' | jq -r .sha256)
+curl -sS -X PUT -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9090/api/apps/cf-api -d @- <<JSON
+{
+  "owner": "ops",
+  "hosts": ["cf.localhost"],
+  "component": {"sha256": "$sha256", "name": "sluice-wicket-cf-api.ext4"},
+  "sandbox": {
+    "mem": 256,
+    "disk": "/data",
+    "disk-mib": 4096,
+    "egress": ["localhost:9090", "flume:8002"],
+    "env": {
+      "SLUICE_WICKET_CF_API_WICKET": "http://localhost:9090",
+      "SLUICE_WICKET_CF_API_WICKET_TOKEN": "$TOKEN",
+      "SLUICE_WICKET_CF_API_FLUME": "grpc://flume:8002",
+      "SLUICE_WICKET_CF_API_FLUME_TOKEN": "$FLUME_TOKEN"
+    }
+  }
+}
+JSON
+```
+
+The CLI works as on any wicket, an app being a container image or a rootfs (see
+[Mapping](#mapping)):
+
+```text
+cf api http://cf.localhost:8080
+cf login -u me -p x                              # any credentials: no provider yet
+
+# any container image whose process listens on $PORT; the wicket pulls it and makes its rootfs
+cf push web --docker-image ghcr.io/me/web:1
+curl http://web.localhost:8080/
+cf logs web --recent                             # the process's output, from the flume
+
+# a rootfs in a zip: here the sample guest the wicket's image holds
+mkdir hello
+docker cp wicket:/usr/local/share/sluice-wicket-runtime-firecracker/guest.ext4 hello/
+cf push hello -p hello/
+curl http://hello.localhost:8080/
+
+cf set-env hello GREETING hi
+cf restart hello                                 # the env applies at the next start
+curl http://hello.localhost:8080/env             # the sample guest's answer: the env it was given
+cf map-route hello localhost --hostname hi       # routes apply at once
+curl http://hi.localhost:8080/
+cf scale hello -i 2                              # a pool of 2 VMs, cloned from a snapshot
+cf scale hello -m 256M -f                        # a VM's memory: stops and starts the app
+cf push hello -p hello/ --strategy rolling
+cf stop hello
+cf start hello
+cf delete hello -r -f
+```
+
+A private image takes `--docker-username me` with `CF_DOCKER_PASSWORD`. The apps and the cf-api's
+state come back with the wicket, from the volume:
+
+```text
+docker restart wicket
+sleep 5                                          # the VMs boot again
+cf apps
+curl http://web.localhost:8080/
+```
+
+- **who reaches it**: without a provider the cf-api takes any credentials, and that it listens on
+  its VM's loopback protects nothing here: the wicket relays its route to whoever reaches
+  `--listen`, or the sluice server with `--server`, saying `Host: cf.localhost`. Keep them on the
+  host's loopback as above until it has a provider: `..._OIDC_ISSUER`, `..._OIDC_CLIENT_ID`,
+  `..._OIDC_CLIENT_SECRET`, `..._OIDC_CLAIM` in `env` (see [Login](#login)), the provider's
+  `host:port` in `egress`. Then `-p 8080:8080`, `cf login --sso`
+- **jail mode**, for tenants on the wicket: in `docker run`, `-u 0 --cap-add SYS_ADMIN --security-opt
+  apparmor=unconfined --security-opt seccomp=unconfined` for `--group-add`, and `--jail-ids
+  900000-900127 --jail-user nonroot` (see the wicket's
+  [Jail mode](../sluice-wicket-runtime-firecracker/README.md#jail-mode))
+- **`owner`** is any but the cf-api's own (`cf`): what it manages is the apps of that one
+- **`disk`** at `/data`, the image's working directory: `--data-dir`'s default is on it. Without a
+  disk the rootfs is read-only and the cf-api does not start (the PUT is refused). Every write of
+  its state is durable when it returns: a kill loses no edit it answered
+- **`egress`** names what it reaches, and the env says so by the same name; the wicket connects
+  by the name. Any other option is an env of its own (`SLUICE_WICKET_CF_API_DOMAIN=apps.example.com`,
+  with `"hosts": ["cf.apps.example.com"]`, for a domain of a wildcard DNS of yours)
+- **its listener** stays on the VM's loopback (`127.0.0.1:9091`, the port the image exposes, what
+  `/init` relays to). TLS is the sluice server's in front of it (`X-Forwarded-Proto` makes the
+  links `https://`): `--tls-cert` here has no host to be routed by on `--listen`, the wicket
+  reading a request's `Host`
+- **`mem`**: an upload, a package and a droplet go through files, not memory: 128 MiB took a push
+  of a 150 MiB zip. **`disk-mib`**: an image's droplet is a reference, a zip's is kept as a file
+  for each app (that one, the one before, and its package, with the upload while it comes)
+- **an upgrade**: `PUT /api/images` of the new image, then this app with its `sha256` (or another
+  env): the old VM stops (SIGTERM, all written out), the new one boots on the disk: 0.7-0.8s of
+  no API, the CLI's login still good, the wicket's apps served all along. A new image that does
+  not start is refused (422, 11.5s), the old VM started again
+- **a backup**: [the disk's](../sluice-wicket-runtime-firecracker/README.md#disks), whose file is
+  `deployed/disks/ops/cf-api.ext4` in the volume. Lost, the apps serve on, a new cf-api leaves
+  them (see Behavior)
+- **a crash of the cf-api** (not a stop) leaves its VM up without it, the wicket's stderr saying
+  `guest: /usr/local/bin/sluice-wicket-cf-api exited`: a PUT with another env starts it again.
+  The apps serve on meanwhile
+
 ## Mapping
 
 | CF | wicket |
@@ -282,11 +410,12 @@ On a Firecracker wicket (its listing says `runtime: firecracker`):
 | CF | wicket |
 |---|---|
 | package (docker) | any container image, `--docker-username` with `CF_DOCKER_PASSWORD` its credentials: the build has the wicket make its rootfs (`PUT /api/images`), which pulls it. Listening on `PORT`, as on CF |
-| package (bits) | a zip holding the rootfs, `.ext4` as a component's `.wasm` is picked (160 MiB at most: an image is the way for more) |
+| package (bits) | a zip holding the rootfs, `.ext4` as a component's `.wasm` is picked (160 MiB at most, unpacking to 4 GiB at most: an image is the way for more) |
 | droplet | the rootfs by sha256: the wicket keeps an image's, the cf-api its reference pinned to the manifest's digest, and has it made again when the wicket lost it (the same digest, unless the wicket's guest changed) |
 | web process `instances` | 1: a shared VM; more: `mode=pool`, that many VMs cloned from a snapshot; 0: a VM of its own per connection, killed when it ends |
 | web process `memory` | `mem` |
 | environment variables, `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: the process's environment, over the image's (its `PORT` is `/init`'s) |
+| disk | no effect: the rootfs is read-only and `/tmp` a tmpfs of the VM's memory; a persistent disk is the wicket API's, with no CF counterpart |
 | services | none: the listing offers neither capabilities nor keyvalue stores |
 | `cf logs` | the process's output, instance 0; no `RTR` line: this wicket feeds no requests to the flume |
 
@@ -303,7 +432,8 @@ On a Firecracker wicket (its listing says `runtime: firecracker`):
   `cf env` shows them). No log holds a value (`cf logs` says `[PRIVATE DATA HIDDEN]`), nor does
   the wicket's listing, which names the variables only: the app carries a tag drawn at each
   start, which the cf-api compares instead. The data directory's files are its owner's only
-  (0600): `state.json` holds the values
+  (0600): `state.json` holds the values. They are written by a rename and an `fsync`: on the
+  disk when the answer comes
 - images (`--docker-image`): staging pulls the tag and pins it to its manifest's digest, kept
   with the droplet: a restart serves the staged component after the tag moved, a restage
   pulls the tag again. A registry on the loopback is reached over plain HTTP, any other over
@@ -418,7 +548,9 @@ flume from `../sluice-flume` (or taking `SLUICE_WICKET_RUNTIME_WASI`, `SLUICE_WI
 of the cf-api's own, and the images against a registry in the test (`tests/registry`). Where
 `/dev/kvm` is usable, with Firecracker and a guest kernel (as the wicket's VM test finds them), a
 second test runs against `../sluice-wicket-runtime-firecracker` (`sg kvm -c 'cargo test'` until
-the `kvm` group is in the login):
+the `kvm` group is in the login), then runs the cf-api itself on it, in a VM with a disk, the flume
+and a provider through its egress, across a restart, a wicket killed right after a push and an
+upgrade:
 
 ```text
 gh release download v8.19.0 -R cloudfoundry/cli -p 'cf8-cli_8.19.0_macosarm.tgz'
