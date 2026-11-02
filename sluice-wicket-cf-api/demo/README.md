@@ -9,6 +9,27 @@ terminal; `record.sh` runs it on a fresh stack. The browser's part of `cf login 
 sign-in at Dex, the page with the one-time code) is done by `passcode.sh` before the recording,
 and the tape types the code at the prompt (`{{PASSCODE}}`, replaced by `record.sh`).
 
+## On a Firecracker wicket
+
+`sluice-cf-firecracker-demo.mp4` (and `.gif`) is the same for a Firecracker wicket: `cf login --sso`
+through Dex, a container image and a root filesystem pushed, logs, routes, a pool of VMs,
+environment variables, a restart of the wicket, delete. `firecracker.tape` is its script,
+`dex-firecracker.yaml` its provider. On an Apple silicon Mac, `record-firecracker.sh` builds the
+images from the work tree in the wicket's Lima VM (`scripts/lima.sh`, see
+[On a Mac](../../sluice-wicket-runtime-firecracker/README.md#on-a-mac)), runs them with Dex and
+records the `cf` CLI on the Mac, on the ports 5556, 8080 and 9090:
+
+```text
+sluice-wicket-cf-api/demo/record-firecracker.sh
+```
+
+It needs `vhs`, `ffmpeg`, `jq`, `curl`, `nc`, `limactl` and the OSS cf CLI v8 below. The wicket's log
+is in `../target/demo-firecracker/wicket.log`. The tape leaves `web` when it checks the 404: a
+[sole route](../../sluice-wicket-runtime-firecracker/README.md#run) takes any host, the cf-api's
+when no app is left.
+
+The rest of this page is the wasi wicket's demo.
+
 ## Prerequisites
 
 - the toolchains the Rust workspaces need (`record.sh` builds the release binaries and the

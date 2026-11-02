@@ -151,8 +151,8 @@ expect "served" "$(served kept)" "Hello from a Firecracker microVM"
 
 echo "the sample guest with a disk, written well past its VM's memory"
 auth="Authorization: Bearer $TOKEN" api=http://127.0.0.1:$console
-digest=$(sha256sum "$work/hello/guest.ext4" | cut -d' ' -f1)
-command curl -sS -X PUT --max-time 120 -H "$auth" --data-binary "@$work/hello/guest.ext4" "$api/api/components/$digest" >/dev/null
+digest=$(sha256sum "$work/hello/hello.ext4" | cut -d' ' -f1)
+command curl -sS -X PUT --max-time 120 -H "$auth" --data-binary "@$work/hello/hello.ext4" "$api/api/components/$digest" >/dev/null
 expect "its app" "$(command curl -sS -X PUT --max-time 60 -H "$auth" "$api/api/apps/data" -d "{\"owner\":\"ops\",\"hosts\":[\"data.localhost\"],\"component\":{\"sha256\":\"$digest\",\"name\":\"guest.ext4\"},\"sandbox\":{\"mem\":256,\"disk\":\"/tmp/data\",\"disk-mib\":2048}}")" "added data.localhost"
 head -c 48M /dev/urandom | base64 -w0 >blob
 started=$(date +%s%N)

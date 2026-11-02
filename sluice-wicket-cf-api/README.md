@@ -304,6 +304,11 @@ logs`: to do without it, leave out its container, `--network`, `--flume`, and it
 `env` below. The cf-api also runs next to the wicket, as in [Run](#run), with `--wicket` at its
 console.
 
+[![cf login --sso through Dex, cf push of a container image and a root filesystem as microVMs, logs, routes, a pool of VMs, environment variables and a restart of the wicket](demo/sluice-cf-firecracker-demo.gif)](demo/sluice-cf-firecracker-demo.mp4)
+
+The GIF links to the [MP4](demo/sluice-cf-firecracker-demo.mp4); both are recorded on a Mac by
+`demo/record-firecracker.sh` ([demo/README.md](demo/README.md#on-a-firecracker-wicket)).
+
 ### Run as an app of the wicket
 
 The wicket and the flume, on the host's loopback (see **who reaches it** below):
@@ -362,9 +367,10 @@ cf push web --docker-image ghcr.io/traefik/whoami:v1.11.0
 curl http://web.localhost:8080/
 cf logs web --recent                             # the process's output, from the flume
 
-# a rootfs in a zip: here the sample guest the wicket's image holds
+# or a root filesystem of your own, an ext4 image in a zip: here of the small sample server the
+# wicket's image holds
 mkdir hello
-docker cp wicket:/usr/local/share/sluice-wicket-runtime-firecracker/guest.ext4 hello/
+docker cp wicket:/usr/local/share/sluice-wicket-runtime-firecracker/guest.ext4 hello/hello.ext4
 cf push hello -p hello/
 curl http://hello.localhost:8080/
 
@@ -450,7 +456,7 @@ The wicket's listing says `runtime: firecracker`.
 |---|---|
 | package (docker) | any container image, `--docker-username` with `CF_DOCKER_PASSWORD` its credentials: the build has the wicket make its rootfs (`PUT /api/images`), which pulls it. Listening on `PORT`, as on CF |
 | package (bits) | a zip holding the rootfs, `.ext4` as a component's `.wasm` is picked (160 MiB at most, unpacking to 4 GiB at most: an image is the way for more) |
-| droplet | the rootfs by sha256: the wicket keeps an image's, the cf-api its reference pinned to the manifest's digest, and has it made again when the wicket lost it (the same digest, unless the wicket's guest changed) |
+| droplet | the rootfs by sha256 (stack `firecracker`, buildpack `rootfs`; an image's has neither, as on CF): the wicket keeps an image's, the cf-api its reference pinned to the manifest's digest, and has it made again when the wicket lost it (the same digest, unless the wicket's guest changed) |
 | web process `instances` | 1: a shared VM; more: `mode=pool`, that many VMs cloned from a snapshot; 0: a VM of its own per connection, killed when it ends |
 | web process `memory` | `mem` |
 | environment variables, `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: the process's environment, over the image's (its `PORT` is `/init`'s) |
