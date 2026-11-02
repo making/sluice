@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "description": "jsdom checks of the wickets' console pages (todo 198, for 199)",
+  "dependencies": {
+    "jsdom": "24.1.3"
+  }
+}

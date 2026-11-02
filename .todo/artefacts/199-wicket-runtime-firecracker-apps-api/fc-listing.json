@@ -1,0 +1,20 @@
+{"revision":4,"generation":3,"build":"0.0.1-SNAPSHOT (abc)","server":"grpc://127.0.0.1:8001","listen":"127.0.0.1:8080",
+ "max_rootfs_bytes":4294967296,"jailed":false,
+ "budget":{"max_vms":64,"max_memory_mib":null,"vms":5,"memory_mib":640},
+ "reload_failure":{"reason":"file change","error":"wicket.yaml: routes[2]: <script>x</script>","at":"2026-11-02T01:00:00Z"},
+ "routes":[
+  {"host":"app.localhost","origin":"console","deployed":"2026-11-02T00:00:00Z","target":"firecracker:/d/rootfs/aa/app.ext4?mode=per-connection&warm=2",
+   "rootfs":{"name":"app.ext4","path":"rootfs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/app.ext4","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bytes":67108864},
+   "options":{"mode":"per-connection","warm":"2","egress":"db.internal:5432,10.0.0.0/24:6379"},"mode":"per-connection","mem_mib":128,"vcpus":1,
+   "vms":{"alive":2,"shared":false,"warm":2,"kept":0,"pooled":0,"starting":0,"connections":0},
+   "snapshot":{"memory_bytes":134217728,"booted_ms":812,"taken_ms":1430,"at":"2026-11-02T00:00:02Z"}},
+  {"host":"shared.local","origin":"config","deployed":null,"target":"firecracker:/c/shared.ext4",
+   "rootfs":{"name":"shared.ext4","path":"/c/shared.ext4","sha256":null,"bytes":1048576},
+   "options":{},"mode":"shared","mem_mib":128,"vcpus":1,
+   "vms":{"alive":1,"shared":true,"warm":0,"kept":0,"pooled":0,"starting":0,"connections":3},"snapshot":null},
+  {"host":"pool.local","origin":"flag","deployed":null,"target":"firecracker:/c/pool.ext4?mode=pool&vms=4&mem=256",
+   "rootfs":{"name":"pool.ext4","path":"/c/pool.ext4","sha256":null,"bytes":2097152},
+   "options":{"mode":"pool","mem":"256","vms":"4","keep-ms":"1500"},"mode":"pool","mem_mib":256,"vcpus":1,
+   "vms":{"alive":2,"shared":false,"warm":0,"kept":0,"pooled":2,"starting":1,"connections":5},
+   "snapshot":{"memory_bytes":268435456,"booted_ms":900,"taken_ms":1500,"at":"2026-11-02T00:00:03Z"}}
+ ]}

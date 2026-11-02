@@ -30,7 +30,8 @@ alike in both consoles' scripts but copied; `kit.js` shares only the helpers, th
 the progress / outcome views and the long poll. Share the flow too, the wicket's script
 supplying its fields (the sandbox, the options) and its row cells -- verified in a browser
 (the environment of todo 198 had none; a jsdom harness compared the wasm page's rendering
-before and after the split).
+before and after the split: `.todo/artefacts/199-wicket-runtime-firecracker-apps-api/`, its
+README says how to run it and what it misses).
 
 Tests: the apps API in the VM test (an app of two hosts on one rootfs uploaded by digest,
 its env seen by the guest, kept across a restart), unit tests of its persistence as the
