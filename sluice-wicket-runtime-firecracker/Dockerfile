@@ -1,7 +1,8 @@
 # sluice-wicket-runtime-firecracker on distroless cc (glibc), with the pinned Firecracker release,
 # a guest kernel of Firecracker's CI, the guest (/init of the wicket's own version) and the
-# sample rootfs. The proto lives in sluice-proto and the tunnel client in sluice-wicket-tunnel, so
-# the build context is the repository root:
+# sample rootfs. The proto lives in sluice-proto, the tunnel client in sluice-wicket-tunnel and
+# the console's shared parts in sluice-wicket-console (its sign-in in sluice-wicket-oidc), so the
+# build context is the repository root:
 #   docker build -f sluice-wicket-runtime-firecracker/Dockerfile --build-arg GIT_COMMIT=$(git rev-parse HEAD) .
 # amd64 and arm64: the release, the kernel and the guest are the target's (a VM's arch is
 # its host's).
@@ -46,6 +47,10 @@ RUN arch=$(uname -m) \
 COPY sluice-proto/src/main/proto sluice-proto/src/main/proto
 COPY sluice-build-info/Cargo.toml sluice-build-info/
 COPY sluice-build-info/src sluice-build-info/src
+COPY sluice-wicket-oidc/Cargo.toml sluice-wicket-oidc/
+COPY sluice-wicket-oidc/src sluice-wicket-oidc/src
+COPY sluice-wicket-console/Cargo.toml sluice-wicket-console/
+COPY sluice-wicket-console/src sluice-wicket-console/src
 COPY sluice-wicket-tunnel/Cargo.toml sluice-wicket-tunnel/build.rs sluice-wicket-tunnel/
 COPY sluice-wicket-tunnel/src sluice-wicket-tunnel/src
 COPY sluice-wicket-runtime-firecracker/Cargo.toml sluice-wicket-runtime-firecracker/Cargo.lock sluice-wicket-runtime-firecracker/build.rs sluice-wicket-runtime-firecracker/
@@ -54,7 +59,8 @@ COPY sluice-wicket-runtime-firecracker/src sluice-wicket-runtime-firecracker/src
 ARG GIT_COMMIT=""
 RUN SLUICE_GIT_COMMIT=${GIT_COMMIT} \
     cargo build --release --locked --manifest-path sluice-wicket-runtime-firecracker/Cargo.toml \
-    && mkdir -p -m 1777 /run-dir/sluice
+    && mkdir -p -m 1777 /run-dir/sluice \
+    && mkdir /data
 
 FROM gcr.io/distroless/cc-debian13:nonroot
 COPY --from=build /src/sluice-wicket-runtime-firecracker/target/release/sluice-wicket-runtime-firecracker /out/firecracker /usr/local/bin/
@@ -67,4 +73,8 @@ COPY --from=build /run-dir/ /run/
 ENV SLUICE_WICKET_RUNTIME_FIRECRACKER_KERNEL=/usr/local/share/sluice-wicket-runtime-firecracker/vmlinux \
     SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER=/usr/local/bin/firecracker \
     SLUICE_WICKET_RUNTIME_FIRECRACKER_STATE_DIR=/run/sluice
+# the working directory, where --console keeps its routes (deployed/) without a --config
+# file: writable by the wicket's user, a volume to keep it
+COPY --from=build --chown=65532:65532 /data /data
+WORKDIR /data
 ENTRYPOINT ["/usr/local/bin/sluice-wicket-runtime-firecracker"]

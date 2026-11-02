@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use sluice_wicket_console::settings::{ConsoleOptions, ConsoleSettings, Rules};
 use sluice_wicket_tunnel::flume::FlumeSettings;
 use sluice_wicket_tunnel::{DEFAULT_DRAIN_GRACE, DEFAULT_MAX_CONNECTIONS, DEFAULT_STALL_TIMEOUT};
 
+use crate::deployed::Deployed;
 use crate::jail::Ids;
 use crate::route::RouteSpec;
 
@@ -86,6 +88,25 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
   --jail-user <name|uid:gid>      jail mode: the user the wicket runs as (not root)
   --jail-cgroup <path>            jail mode: the VMs' parent cgroup under /sys/fs/cgroup
                                   (default the wicket's own, delegated to it)
+  --console <host:port>           serve the console: a page and an API deploying uploaded
+                                  rootfs images as routes, kept in --console-dir
+  --console-token <token>         the console's credentials (the HTTP Basic password, or a
+                                  Bearer token); required off loopback, unless with
+                                  --oidc-issuer
+  --console-dir <path>            where the console keeps its routes and images (default
+                                  deployed, next to the config file)
+  --oidc-issuer <url>             the OpenID Provider the console's browsers sign in
+                                  through instead of the token
+  --oidc-client-id <id>           the client registered with it, whose redirect URI is
+                                  <console url>/oauth2/callback (required with --oidc-issuer)
+  --oidc-client-secret <secret>   its secret; none = a public client (PKCE only)
+  --oidc-claim <claim>=<pattern>  who may sign in: the ID token's claim must hold (a list:
+                                  contain) the pattern, * any run of characters;
+                                  repeatable, distinct claims all hold; at least one
+                                  rule is required with --oidc-issuer, e.g. email=*
+  --oidc-scopes <list>            the scopes asked for, comma-separated (default
+                                  openid,email,profile)
+  --oidc-ca-cert <path>           PEM CA verifying the provider (default the webPKI roots)
   --version                      print the build (version, commit, build time) and exit
 
 Each option but --vm also reads SLUICE_WICKET_RUNTIME_FIRECRACKER_<NAME> from the environment, e.g.
@@ -133,9 +154,13 @@ pub struct Settings {
     pub flume: Option<FlumeSettings>,
     /// Jail mode: the VMs in jails, spawned by the keeper.
     pub jail: Option<JailSettings>,
-    /// Where the routes come from, read again on a reload.
+    /// The console (`--console`).
+    pub console: Option<ConsoleSettings>,
+    /// Where the routes come from, read again on a reload (the console's
+    /// added once its directory is open).
     pub routes: RouteSource,
-    /// The routes at startup.
+    /// The routes of the config file and the flags, read as they were
+    /// parsed: checked before anything starts.
     pub specs: Vec<RouteSpec>,
 }
 
@@ -174,6 +199,15 @@ const VALUED: &[&str] = &[
     "jail-ids",
     "jail-user",
     "jail-cgroup",
+    "console",
+    "console-token",
+    "console-dir",
+    "oidc-issuer",
+    "oidc-client-id",
+    "oidc-client-secret",
+    "oidc-claim",
+    "oidc-scopes",
+    "oidc-ca-cert",
     "vm",
 ];
 
@@ -187,6 +221,7 @@ pub fn parse(
     let mut insecure = false;
     let mut flume_insecure = false;
     let mut vms = Vec::new();
+    let mut claims = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -211,6 +246,8 @@ pub fn parse(
                 };
                 match *name {
                     "vm" => vms.push(value),
+                    // repeatable: the rules add up
+                    "oidc-claim" => claims.push(value),
                     name => {
                         given.insert(name, value);
                     }
@@ -301,10 +338,49 @@ pub fn parse(
         kernel: flag("kernel").map(PathBuf::from),
         firecracker: flag("firecracker").map(PathBuf::from),
         jailed: jail.is_some(),
+        console: None,
     };
-    let specs = routes.read()?;
-    if config.is_none() && specs.is_empty() {
-        return Err("--vm is required (or a --config file)".into());
+    let key = |key: &str| match &config {
+        Some((_, path)) => format!("{}: {key}", path.display()),
+        None => key.to_string(),
+    };
+    if claims.is_empty()
+        && let Some(rules) = flag("oidc-claim")
+    {
+        claims.push(rules);
+    }
+    let console = ConsoleOptions::resolve(
+        ConsoleOptions {
+            console: flag("console"),
+            console_token: flag("console-token"),
+            console_dir: flag("console-dir").map(PathBuf::from),
+            oidc_issuer: flag("oidc-issuer"),
+            oidc_client_id: flag("oidc-client-id"),
+            oidc_client_secret: flag("oidc-client-secret"),
+            oidc_claim: (!claims.is_empty()).then_some(claims),
+            oidc_scopes: flag("oidc-scopes"),
+            oidc_ca_cert: flag("oidc-ca-cert").map(PathBuf::from),
+        },
+        match file {
+            Some(file) => ConsoleOptions {
+                console: file.console.clone(),
+                console_token: file.console_token.clone(),
+                console_dir: file.console_dir.clone(),
+                oidc_issuer: file.oidc_issuer.clone(),
+                oidc_client_id: file.oidc_client_id.clone(),
+                oidc_client_secret: file.oidc_client_secret.clone(),
+                oidc_claim: file.oidc_claim.clone().map(|rules| rules.0),
+                oidc_scopes: file.oidc_scopes.clone(),
+                oidc_ca_cert: file.oidc_ca_cert.clone(),
+            },
+            None => ConsoleOptions::default(),
+        },
+        dir,
+        key,
+    )?;
+    let specs: Vec<RouteSpec> = routes.read()?.into_iter().map(|(spec, _)| spec).collect();
+    if config.is_none() && specs.is_empty() && console.is_none() {
+        return Err("--vm is required (or a --config file, or --console)".into());
     }
     // a token given, else the file holding it: the flag's (or environment's)
     // over the config file's
@@ -374,9 +450,42 @@ pub fn parse(
             .or_else(|| file.and_then(|file| in_file(&file.state_dir))),
         flume,
         jail,
+        console,
         routes,
         specs,
     })))
+}
+
+/// Where a route comes from.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Origin {
+    /// The `--config` file.
+    Config,
+    /// A `--vm` flag.
+    Flag,
+    /// The console, which deployed it at `deployed` (RFC 3339).
+    Console { deployed: String },
+}
+
+impl Origin {
+    /// How the console's listing names it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Origin::Config => "config",
+            Origin::Flag => "flag",
+            Origin::Console { .. } => "console",
+        }
+    }
+}
+
+impl std::fmt::Display for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Origin::Config => "the config file",
+            Origin::Flag => "a --vm flag",
+            Origin::Console { .. } => "the console",
+        })
+    }
 }
 
 /// Where the routes come from: the `--config` file's, then the `--vm` flags'.
@@ -388,12 +497,29 @@ pub struct RouteSource {
     firecracker: Option<PathBuf>,
     /// Jail mode: a route's `cpu` is its VMs' cgroups'.
     jailed: bool,
+    /// The console's routes, with `--console`.
+    console: Option<Deployed>,
 }
 
 impl RouteSource {
     /// The config file, if any.
     pub fn config(&self) -> Option<&Path> {
         self.config.as_deref()
+    }
+
+    /// The console's routes, with `--console`.
+    pub fn deployed(&self) -> Option<&Deployed> {
+        self.console.as_ref()
+    }
+
+    /// Takes `deployed` as the console's routes: the previous ones.
+    pub fn deploy(&mut self, deployed: Deployed) -> Option<Deployed> {
+        self.console.replace(deployed)
+    }
+
+    /// Whether a route's `cpu` is its VMs' cgroups' (jail mode).
+    pub fn jailed(&self) -> bool {
+        self.jailed
     }
 
     /// The firecracker binary as the routes name it now (a bare name is looked up on
@@ -432,8 +558,9 @@ impl RouteSource {
         })
     }
 
-    /// Reads the routes, the config file's again: a host may appear once.
-    pub fn read(&self) -> Result<Vec<RouteSpec>, String> {
+    /// Reads the routes, the config file's again, then the flags', then the
+    /// console's: a host may appear once.
+    pub fn read(&self) -> Result<Vec<(RouteSpec, Origin)>, String> {
         let file = match &self.config {
             Some(path) => Some(File::read(path)?),
             None => None,
@@ -459,26 +586,31 @@ impl RouteSource {
         if let (Some(file), Some(path)) = (file, &self.config) {
             for (n, route) in file.routes.iter().enumerate() {
                 let named = format!("{}: routes[{n}]", path.display());
+                if route.deployed.is_some() {
+                    return Err(format!("{named}: deployed is the console's (routes.yaml)"));
+                }
                 let rootfs = std::path::absolute(dir.join(&route.rootfs))
                     .map_err(|e| format!("{named}: {e}"))?;
                 let options = route.options();
                 let options = options.iter().map(|(key, value)| (*key, value.as_str()));
-                specs.push(RouteSpec::new(
-                    &named,
-                    &route.host,
-                    rootfs,
-                    options,
-                    &firecracker,
-                    &kernel,
-                )?);
+                specs.push((
+                    RouteSpec::new(&named, &route.host, rootfs, options, &firecracker, &kernel)?,
+                    Origin::Config,
+                ));
             }
         }
         for flag in &self.flags {
-            specs.push(RouteSpec::parse(flag, &firecracker, &kernel)?);
+            specs.push((RouteSpec::parse(flag, &firecracker, &kernel)?, Origin::Flag));
         }
-        for (n, spec) in specs.iter().enumerate() {
-            if specs[..n].iter().any(|other| other.host == spec.host) {
-                return Err(format!("{}: routed twice", spec.host));
+        if let Some(console) = &self.console {
+            specs.extend(console.specs(&firecracker, &kernel)?);
+        }
+        for (n, (spec, origin)) in specs.iter().enumerate() {
+            if let Some((_, other)) = specs[..n].iter().find(|(other, _)| other.host == spec.host) {
+                return Err(match other == origin {
+                    true => format!("{}: routed twice", spec.host),
+                    false => format!("{}: routed twice: by {other} and by {origin}", spec.host),
+                });
             }
             if spec.vm.cpu.is_some() && !self.jailed {
                 return Err(format!(
@@ -519,6 +651,18 @@ struct File {
     jail_ids: Option<String>,
     jail_user: Option<String>,
     jail_cgroup: Option<String>,
+    console: Option<String>,
+    console_token: Option<String>,
+    /// Relative to the file.
+    console_dir: Option<PathBuf>,
+    oidc_issuer: Option<String>,
+    oidc_client_id: Option<String>,
+    oidc_client_secret: Option<String>,
+    /// `<claim>=<pattern>` rules: one (comma-separated) or a list.
+    oidc_claim: Option<Rules>,
+    oidc_scopes: Option<String>,
+    /// Relative to the file.
+    oidc_ca_cert: Option<PathBuf>,
     #[serde(default)]
     routes: Vec<FileRoute>,
 }
@@ -542,13 +686,16 @@ impl File {
     }
 }
 
-/// A route of the `--config` file: the keys of a `--vm` flag's query.
+/// A route of the `--config` file: the keys of a `--vm` flag's query; one of
+/// the console's (`deployed`) has the time it was deployed.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-struct FileRoute {
-    host: String,
+pub(crate) struct FileRoute {
+    pub(crate) host: String,
     /// Relative to the file.
-    rootfs: PathBuf,
+    pub(crate) rootfs: PathBuf,
+    /// The console's routes only (`routes.yaml`).
+    pub(crate) deployed: Option<String>,
     mode: Option<String>,
     vcpus: Option<u32>,
     mem: Option<u32>,
@@ -568,7 +715,29 @@ struct FileRoute {
 }
 
 impl FileRoute {
-    fn options(&self) -> Vec<(&'static str, String)> {
+    /// The keys of [`FileRoute::options`], in their order.
+    pub(crate) const KEYS: [&'static str; 16] = [
+        "mode",
+        "vcpus",
+        "mem",
+        "cpu",
+        "port",
+        "warm",
+        "prime",
+        "vms",
+        "wait-ms",
+        "keep-ms",
+        "uses",
+        "lifetime-ms",
+        "conns",
+        "per-client",
+        "idle-ms",
+        "egress",
+    ];
+
+    /// The options set, as a `--vm` flag's query has them, in the order of
+    /// [`FileRoute::KEYS`].
+    pub(crate) fn options(&self) -> Vec<(&'static str, String)> {
         let numbers = [
             ("vcpus", self.vcpus),
             ("mem", self.mem),
@@ -667,6 +836,7 @@ mod tests {
             "server: grpc://file:8001\ntoken: from-file\nkernel: vmlinux\nmax-vms: 8\nworkers: 2\n\
              drain-grace: 5s\nflume: grpc://file:8002\nflume-token: from-file\n\
              flume-ca-cert: flume-ca.pem\njail-ids: 900000-900063\njail-user: from-file\n\
+             console: 127.0.0.1:9090\nconsole-dir: kept\noidc-claim: [email=*]\n\
              routes:\n  - {host: a.local, rootfs: app.ext4, mode: per-connection, warm: 2, cpu: 50,\n     \
              per-client: 4, idle-ms: 30000, egress: [DB.internal:5432, '[2001:db8::/32]:443',\n     \
              10.0.0.0/24:6379]}\n",
@@ -710,6 +880,16 @@ mod tests {
                 insecure: true,
             })
         );
+        let console = settings.console.as_ref().expect("the file's console");
+        assert_eq!(
+            (
+                console.address.as_str(),
+                &console.dir,
+                console.token.as_deref()
+            ),
+            ("127.0.0.1:9090", &dir.join("kept"), None),
+            "its directory relative to the file"
+        );
         assert_eq!(settings.max_vms, 8);
         assert_eq!(settings.workers, 2);
         assert_eq!(settings.drain_grace, Duration::from_secs(5));
@@ -752,10 +932,28 @@ mod tests {
                 "1-2",
                 "--jail-cgroup",
                 "/sluice",
+                "--console-token",
+                "s3cret",
+                "--oidc-issuer",
+                "https://idp.example",
+                "--oidc-client-id",
+                "wicket",
+                "--oidc-claim",
+                "email=*@example.com",
+                "--oidc-claim",
+                "groups=devs",
             ],
             &[("SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN", "from-env")],
         )
         .unwrap();
+        let console = settings.console.as_ref().expect("the file's console");
+        assert_eq!(console.token.as_deref(), Some("s3cret"));
+        let oidc = console.oidc.as_ref().expect("a provider");
+        assert_eq!(
+            oidc.claims.len(),
+            2,
+            "the flags' rules add up, over the file's"
+        );
         assert_eq!(settings.token, "flag");
         assert_eq!(settings.max_vms, 4);
         assert_eq!(settings.workers, 3);
@@ -838,6 +1036,23 @@ mod tests {
             (vec!["--kernel", "k", "--vm", &vm], "--server or --listen"),
             (vec!["--server", "s", "--vm", &vm], "--kernel is required"),
             (vec!["--server", "s", "--kernel", "k"], "--vm is required"),
+            (
+                vec![
+                    "--server",
+                    "s",
+                    "--kernel",
+                    "k",
+                    "--vm",
+                    &vm,
+                    "--oidc-issuer",
+                    "https://idp.example",
+                    "--oidc-client-id",
+                    "wicket",
+                    "--oidc-claim",
+                    "email=*",
+                ],
+                "oidc-issuer needs --console",
+            ),
             (
                 vec!["--config", &config_flag, "--vm", "c.local=missing"],
                 "missing: No such file or directory",

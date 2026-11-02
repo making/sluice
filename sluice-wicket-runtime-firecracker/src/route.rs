@@ -92,7 +92,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Mode::Shared => "shared",
             Mode::PerConnection => "per-connection",
@@ -185,8 +185,30 @@ impl RouteSpec {
     }
 
     /// The route of `host` on `rootfs` (absolute) with `options`, the keys of a
-    /// `--vm` flag's query; `named` names it in an error.
+    /// `--vm` flag's query; `named` names it in an error. The rootfs is opened:
+    /// a file the wicket's user cannot read fails here, not in the VM.
     pub fn new<'a>(
+        named: &str,
+        host: &str,
+        rootfs: PathBuf,
+        options: impl IntoIterator<Item = (&'a str, &'a str)>,
+        firecracker: &std::path::Path,
+        kernel: &std::path::Path,
+    ) -> Result<RouteSpec, String> {
+        let spec = RouteSpec::configure(named, host, rootfs, options, firecracker, kernel)?;
+        let rootfs = std::fs::File::open(&spec.vm.rootfs).and_then(|file| file.metadata());
+        match rootfs {
+            Ok(metadata) if metadata.is_file() => Ok(spec),
+            Ok(_) => Err(format!(
+                "{named}: {} is not a file",
+                spec.vm.rootfs.display()
+            )),
+            Err(e) => Err(format!("{named}: {}: {e}", spec.vm.rootfs.display())),
+        }
+    }
+
+    /// [`RouteSpec::new`] but the rootfs, not opened: the options checked.
+    pub fn configure<'a>(
         named: &str,
         host: &str,
         rootfs: PathBuf,
@@ -295,18 +317,6 @@ impl RouteSpec {
         {
             return Err(format!("{named}: vms must be at least 1 and at least warm"));
         }
-        // opened: a file the wicket's user cannot read fails here, not in the VM
-        let rootfs = std::fs::File::open(&spec.vm.rootfs).and_then(|file| file.metadata());
-        match rootfs {
-            Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => {
-                return Err(format!(
-                    "{named}: {} is not a file",
-                    spec.vm.rootfs.display()
-                ));
-            }
-            Err(e) => return Err(format!("{named}: {}: {e}", spec.vm.rootfs.display())),
-        }
         Ok(spec)
     }
 
@@ -334,9 +344,24 @@ impl RouteSpec {
     /// the bounds of a connection too: a target's connections are bound alike).
     /// Routes of one target share its VMs.
     pub fn target(&self) -> String {
+        let query: Vec<String> = self
+            .options()
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        let rootfs = self.vm.rootfs.display();
+        match query.join("&") {
+            query if query.is_empty() => format!("firecracker:{rootfs}"),
+            query => format!("firecracker:{rootfs}?{query}"),
+        }
+    }
+
+    /// The options set to other than their defaults, as a `--vm` flag's query
+    /// has them (the order of [`RouteSpec::target`]).
+    pub fn options(&self) -> Vec<(&'static str, String)> {
         let mut options = Vec::new();
         if self.mode != Mode::Shared {
-            options.push(format!("mode={}", self.mode.name()));
+            options.push(("mode", self.mode.name().to_string()));
         }
         let warm = match self.mode {
             Mode::Pool => self.vms.unwrap_or(0),
@@ -368,17 +393,13 @@ impl RouteSpec {
             ("idle-ms", millis(self.idle), 0),
         ] {
             if value != default {
-                options.push(format!("{key}={value}"));
+                options.push((key, value.to_string()));
             }
         }
         if !self.vm.egress.is_empty() {
-            options.push(format!("egress={}", vm::egress_list(&self.vm.egress)));
+            options.push(("egress", vm::egress_list(&self.vm.egress)));
         }
-        let rootfs = self.vm.rootfs.display();
-        match options.join("&") {
-            query if query.is_empty() => format!("firecracker:{rootfs}"),
-            query => format!("firecracker:{rootfs}?{query}"),
-        }
+        options
     }
 }
 
@@ -394,6 +415,56 @@ pub struct Hold {
     vm: Held,
     /// With `per-client`: given back once the VM was.
     _share: Option<Share>,
+    /// Counts the route's connections open while held.
+    _open: Open,
+}
+
+/// One of a route's connections open, counted while it lives.
+struct Open(Arc<AtomicU64>);
+
+impl Open {
+    fn new(open: &Arc<AtomicU64>) -> Open {
+        open.fetch_add(1, Ordering::Relaxed);
+        Open(open.clone())
+    }
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// What a route's VMs are, at one point (the console's listing).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Vms {
+    /// Its VMs alive, as the budget counts them: in use, warm, kept, pooled,
+    /// being restored or started, the template while it is.
+    pub alive: usize,
+    /// Shared mode: its VM is up.
+    pub shared: bool,
+    /// Per-connection and reuse modes: clones restored ahead of the connections.
+    pub warm: usize,
+    /// Reuse mode: clones kept for the next connection.
+    pub kept: usize,
+    /// Pool mode: the pool's VMs, and those being started.
+    pub pooled: usize,
+    pub starting: usize,
+    /// Its connections open.
+    pub connections: u64,
+}
+
+/// A cloned route's snapshot of its template.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Taken {
+    /// Its memory file, in bytes.
+    pub memory: u64,
+    /// The template booted (its guest listening) after, and the snapshot taken
+    /// after its boot began.
+    pub booted: Duration,
+    pub taken: Duration,
+    /// When it was taken.
+    pub at: std::time::SystemTime,
 }
 
 enum Held {
@@ -420,8 +491,9 @@ impl Hold {
             Held::Reused(reused, _) => Some(reused.clone),
             Held::Shared | Held::Pooled(_) => None,
         };
-        let share = self._share;
+        let (share, open) = (self._share, self._open);
         async move {
+            let _open = open;
             if let Some(clone) = ended {
                 clone.end().await;
             }
@@ -502,6 +574,10 @@ pub struct Route {
     backend: Backend,
     /// Its connections open by client address.
     clients: Arc<Clients>,
+    /// Its connections open.
+    open: Arc<AtomicU64>,
+    /// Cloned modes: its template's snapshot.
+    taken: Option<Taken>,
 }
 
 enum Backend {
@@ -1127,6 +1203,7 @@ impl Route {
         let vm = Vm::boot(&spec.vm, &place, role, slot, named).await?;
         let mut output = ready(&vm, spec.port, &sink, &hosts, name).await?;
         let booted = started.elapsed();
+        let mut taken = None;
         let backend = match spec.mode {
             Mode::Shared => {
                 println!(
@@ -1167,6 +1244,12 @@ impl Route {
                 // the template gone, its snapshot the clones' alone to read (jail mode)
                 place.seal().await?;
                 let size = tokio::fs::metadata(&snapshot.memory_on_host).await?.len();
+                taken = Some(Taken {
+                    memory: size,
+                    booted,
+                    taken: started.elapsed(),
+                    at: std::time::SystemTime::now(),
+                });
                 println!(
                     "route {label}: template booted in {}ms, primed with {} request(s), snapshot taken after {}ms ({} MiB memory file)",
                     booted.as_millis(),
@@ -1254,7 +1337,38 @@ impl Route {
             need,
             backend,
             clients: Arc::default(),
+            open: Arc::default(),
+            taken,
         })
+    }
+
+    /// What its VMs are now.
+    pub fn vms(&self) -> Vms {
+        let mut vms = Vms {
+            alive: self.capacity.alive(self.need.route),
+            connections: self.open.load(Ordering::Relaxed),
+            ..Vms::default()
+        };
+        match &self.backend {
+            Backend::Shared(_) => vms.shared = true,
+            Backend::Cloned { warm, kept, .. } => {
+                vms.warm = warm.clones.lock().unwrap().len();
+                vms.kept = kept
+                    .as_ref()
+                    .map_or(0, |kept| kept.idle.lock().unwrap().len());
+            }
+            Backend::Pool(pool) => {
+                let members = pool.members.lock().unwrap();
+                vms.pooled = members.vms.len();
+                vms.starting = members.starting;
+            }
+        }
+        vms
+    }
+
+    /// Cloned modes: its template's snapshot.
+    pub fn taken(&self) -> Option<&Taken> {
+        self.taken.as_ref()
     }
 
     /// The hosts the route serves, for the log: `a.local, b.local`.
@@ -1275,10 +1389,15 @@ impl Route {
             Some(max) if !client.is_empty() => Some(self.clients.claim(client, max)?),
             _ => None,
         };
+        let open = Open::new(&self.open);
         let (stream, vm) = self.dial().await?;
         Ok(Lease {
             stream,
-            hold: Hold { vm, _share: share },
+            hold: Hold {
+                vm,
+                _share: share,
+                _open: open,
+            },
         })
     }
 

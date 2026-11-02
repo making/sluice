@@ -246,6 +246,18 @@ impl Capacity {
         }
     }
 
+    /// The VMs alive and their guest memory (MiB), over every route.
+    pub fn usage(&self) -> (usize, u64) {
+        let state = self.state.lock().unwrap();
+        (state.vms, state.memory)
+    }
+
+    /// The VMs alive of `route`.
+    pub fn alive(&self, route: u64) -> usize {
+        let state = self.state.lock().unwrap();
+        state.routes.get(&route).copied().unwrap_or(0)
+    }
+
     pub fn max_vms(&self) -> usize {
         self.max_vms
     }

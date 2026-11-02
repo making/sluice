@@ -14,23 +14,30 @@
 //! acknowledged its removal: the server may have routed a connection to it
 //! before. A target kept serves under the hosts of the reload: its VMs' output
 //! is named after them.
+//!
+//! The console's edits ([`Edit`]) are reloads too, of the routes as they would
+//! be with them: kept -- written to the console's directory -- only when they
+//! started.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use sluice_wicket_console::http::Received;
+use sluice_wicket_console::status::Status;
 use sluice_wicket_tunnel::proto::Upstream;
 use sluice_wicket_tunnel::routes::{Binding, Routes};
 use sluice_wicket_tunnel::tunnel::TunnelIo;
 use sluice_wicket_tunnel::workers::Workers;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::BoxError;
 use crate::capacity::Capacity;
-use crate::config::RouteSource;
+use crate::config::{Origin, RouteSource};
+use crate::deployed::Options;
 use crate::output::Sink;
 use crate::route::{Lease, Route, RouteSpec};
 use crate::vm::Places;
@@ -44,9 +51,27 @@ pub struct Table {
     /// Target (the dial address) -> its route: the advertised targets, plus
     /// removed ones until every stream acknowledged their removal.
     routes: HashMap<String, Arc<Route>>,
+    /// Host -> where its route comes from.
+    origins: HashMap<String, Origin>,
 }
 
 impl Table {
+    /// The advertised routes in their order, each with where it comes from
+    /// and its target's route.
+    pub fn served(&self) -> impl Iterator<Item = (&Upstream, &Origin, &Arc<Route>)> {
+        self.advertised.iter().filter_map(|up| {
+            Some((
+                up,
+                self.origins.get(&up.host)?,
+                self.routes.get(&up.target_url)?,
+            ))
+        })
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// The advertised hosts, for the log.
     pub fn advertised_hosts(&self) -> String {
         match &self.advertised[..] {
@@ -190,7 +215,7 @@ pub struct Change {
 }
 
 impl Change {
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty() && self.restarted.is_empty()
     }
 }
@@ -211,10 +236,95 @@ impl std::fmt::Display for Change {
     }
 }
 
-/// Starts the routes and keeps them current: on a change of their files, or
-/// on request (SIGHUP). Reloads run one at a time.
+/// A change of the console's routes, and where its outcome goes.
+pub struct Request {
+    pub edit: Edit,
+    pub reply: oneshot::Sender<Result<Outcome, Refused>>,
+}
+
+/// A change of the console's routes (one host each).
+pub enum Edit {
+    /// Serves `host` by the uploaded image `received` (named `name`) with
+    /// `options`.
+    Deploy {
+        host: String,
+        name: String,
+        received: Received,
+        options: Options,
+    },
+    /// Gives the console's route of `host` other options.
+    Options { host: String, options: Options },
+    /// Moves the console's route of `host` to `to` as it is.
+    Move { host: String, to: String },
+    /// Removes the console's route of `host`.
+    Remove { host: String },
+}
+
+impl Edit {
+    /// How the log names it; not by the name uploaded, which may hold
+    /// anything.
+    fn describe(&self) -> String {
+        match self {
+            Edit::Deploy { host, .. } => format!("console: deploy to {host}"),
+            Edit::Options { host, .. } => format!("console: options of {host}"),
+            Edit::Move { host, to } => format!("console: move {host} to {to}"),
+            Edit::Remove { host } => format!("console: remove {host}"),
+        }
+    }
+
+    fn host(&self) -> &str {
+        match self {
+            Edit::Deploy { host, .. }
+            | Edit::Options { host, .. }
+            | Edit::Move { host, .. }
+            | Edit::Remove { host } => host,
+        }
+    }
+}
+
+/// An edit the routes took.
+#[derive(Debug)]
+pub struct Outcome {
+    /// The generation serving it.
+    pub generation: u64,
+    /// None when it changed nothing.
+    pub change: Option<Change>,
+}
+
+/// Why an edit was refused; the routes stay as they were.
+#[derive(Debug, PartialEq)]
+pub enum Refused {
+    /// The edit is malformed.
+    Invalid(String),
+    /// The console routes no such host.
+    Unknown(String),
+    /// Another source routes the host.
+    Taken(String),
+    /// The routes did not start with it: the reload's error.
+    Rejected(String),
+    /// The console's directory failed.
+    Failed(String),
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::Invalid(message)
+            | Refused::Unknown(message)
+            | Refused::Taken(message)
+            | Refused::Rejected(message)
+            | Refused::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+/// Starts the routes and keeps them current: on a change of their files, on
+/// request (SIGHUP), or on an edit of the console's. Reloads run one at a
+/// time.
 pub struct Reloader {
     routes: Arc<Routes<Table>>,
+    /// What the console shows of the reloads.
+    status: watch::Sender<Status>,
     source: RouteSource,
     capacity: Arc<Capacity>,
     /// Where the VMs' output goes.
@@ -233,24 +343,24 @@ pub struct Reloader {
 }
 
 impl Reloader {
-    /// Starts the VMs of every route of `specs` (read from `source`) within
-    /// `capacity`, each target in a place of its own of `places`, their output to
-    /// `sink`; the first failure ends them all.
+    /// Starts the VMs of every route of `source` within `capacity`, each target
+    /// in a place of its own of `places`, their output to `sink`; the first
+    /// failure ends them all.
     pub async fn start(
         source: RouteSource,
-        specs: Vec<RouteSpec>,
         capacity: Arc<Capacity>,
         places: Arc<Places>,
         sink: Arc<Sink>,
         workers: Arc<Workers>,
     ) -> Result<Reloader, BoxError> {
-        fits(&specs, &capacity)?;
         let mut reloader = Reloader {
             routes: Routes::new(Table {
                 generation: 0,
                 advertised: Vec::new(),
                 routes: HashMap::new(),
+                origins: HashMap::new(),
             }),
+            status: watch::Sender::new(Status::default()),
             source,
             capacity,
             sink,
@@ -263,6 +373,7 @@ impl Reloader {
         };
         // read before it: a change while it starts is a change for the next poll
         reloader.read = stamps(reloader.source.config());
+        let specs = reloader.source.read()?;
         reloader.apply(specs).await?;
         Ok(reloader)
     }
@@ -271,16 +382,24 @@ impl Reloader {
         &self.routes
     }
 
+    /// Follows what the console shows of the reloads.
+    pub fn status(&self) -> watch::Receiver<Status> {
+        self.status.subscribe()
+    }
+
     /// Reloads on SIGHUP (`hangups`) and on a change of the routes' files,
-    /// polled every `interval` (zero: never), and drops a removed target once
-    /// every stream acknowledged its removal; until `stop`.
+    /// polled every `interval` (zero: never), applies each of the console's
+    /// `requests`, and drops a removed target once every stream acknowledged
+    /// its removal; until `stop`.
     pub async fn run(
         mut self,
         interval: Duration,
         mut hangups: mpsc::Receiver<()>,
+        mut requests: mpsc::Receiver<Request>,
         stop: CancellationToken,
     ) {
         let mut seen = self.watched();
+        let mut requests_open = true;
         loop {
             let oldest = self.lingering.values().min().copied();
             let routes = self.routes.clone();
@@ -302,6 +421,16 @@ impl Reloader {
                     self.expire(oldest.expect("waited on it"));
                     continue;
                 }
+                request = requests.recv(), if requests_open => {
+                    match request {
+                        Some(Request { edit, reply }) => {
+                            let _ = reply.send(self.edit(edit).await);
+                            seen = self.watched();
+                        }
+                        None => requests_open = false,
+                    }
+                    continue;
+                }
                 Some(()) = hangups.recv() => "SIGHUP",
                 () = poll => {
                     // a change is reloaded once a poll found it unchanged since the
@@ -316,19 +445,90 @@ impl Reloader {
                 }
             };
             match self.reload().await {
-                Ok(change) if change.is_empty() => {
-                    println!("routes reload ({reason}): no change");
+                Ok(change) => {
+                    self.logged(reason, &change);
+                    Status::recovered(&self.status);
                 }
-                Ok(change) => println!(
-                    "routes reloaded ({reason}), generation {}: {change}",
-                    self.routes.current().generation
-                ),
-                Err(e) => eprintln!(
-                    "routes reload ({reason}) failed; keeping generation {}: {e}",
-                    self.routes.current().generation
-                ),
+                Err(e) => {
+                    self.failed(reason, &e.to_string());
+                    Status::failed(&self.status, reason, e.to_string());
+                }
             }
             seen = self.watched();
+        }
+    }
+
+    fn logged(&self, reason: &str, change: &Change) {
+        match change.is_empty() {
+            true => println!("routes reload ({reason}): no change"),
+            false => println!(
+                "routes reloaded ({reason}), generation {}: {change}",
+                self.routes.current().generation
+            ),
+        }
+    }
+
+    fn failed(&self, reason: &str, error: &str) {
+        eprintln!(
+            "routes reload ({reason}) failed; keeping generation {}: {error}",
+            self.routes.current().generation
+        );
+    }
+
+    /// Applies an edit of the console's routes: the image kept, the routes as
+    /// they would be are reloaded, and kept -- written to the console's
+    /// directory -- only when they started; refused, the routes and the
+    /// directory stay as they were.
+    pub async fn edit(&mut self, edit: Edit) -> Result<Outcome, Refused> {
+        let reason = edit.describe();
+        let current = self.routes.current();
+        taken(&edit, &current.origins)?;
+        let deployed = self
+            .source
+            .deployed()
+            .expect("edits come from the console, which deploys");
+        let now = SystemTime::now();
+        let edited = match edit {
+            Edit::Deploy {
+                host,
+                name,
+                received,
+                options,
+            } => deployed.deploy(&host, &name, received, options, now),
+            Edit::Options { host, options } => deployed.with_options(&host, options, now),
+            Edit::Move { host, to } => deployed.moved(&host, &to),
+            Edit::Remove { host } => deployed.without(&host),
+        }?;
+        if &edited == deployed {
+            return Ok(Outcome {
+                generation: current.generation,
+                change: None,
+            });
+        }
+        let previous = self.source.deploy(edited).expect("the console's routes");
+        match self.reload().await {
+            Ok(change) => {
+                self.logged(&reason, &change);
+                Status::recovered(&self.status);
+                let deployed = self.source.deployed().expect("just deployed");
+                let saved = deployed.save();
+                deployed.collect_garbage(false);
+                saved.map_err(|e| {
+                    eprintln!("{reason}: {e}");
+                    Refused::Failed(e)
+                })?;
+                Ok(Outcome {
+                    generation: self.routes.current().generation,
+                    change: (!change.is_empty()).then_some(change),
+                })
+            }
+            Err(e) => {
+                self.failed(&reason, &e.to_string());
+                self.source.deploy(previous);
+                let deployed = self.source.deployed().expect("restored");
+                deployed.collect_garbage(false);
+                Err(Refused::Rejected(e.to_string()))
+            }
         }
     }
 
@@ -360,8 +560,16 @@ impl Reloader {
     }
 
     /// Starts what `specs` need that is not running as they ask, and
-    /// publishes them; nothing changes when a start fails.
-    async fn apply(&mut self, specs: Vec<RouteSpec>) -> Result<Change, BoxError> {
+    /// publishes them; nothing changes when a start fails, or when they do not
+    /// fit the VMs' budget.
+    async fn apply(&mut self, specs: Vec<(RouteSpec, Origin)>) -> Result<Change, BoxError> {
+        let (specs, origins): (Vec<RouteSpec>, Vec<Origin>) = specs.into_iter().unzip();
+        fits(&specs, &self.capacity)?;
+        let origins: HashMap<String, Origin> = specs
+            .iter()
+            .map(|spec| spec.host.clone())
+            .zip(origins)
+            .collect();
         // target -> its spec and hosts, in the order of the specs
         let mut targets: Vec<(String, RouteSpec, Vec<String>)> = Vec::new();
         let mut advertised = Vec::new();
@@ -442,6 +650,17 @@ impl Reloader {
             }
         }
         if change.is_empty() && advertised == current.advertised {
+            // where a route comes from changed alone (a console route's time): in the
+            // generation it was, nothing to advertise
+            if origins != current.origins {
+                self.routes.publish(Table {
+                    generation: current.generation,
+                    advertised: current.advertised.clone(),
+                    routes: current.routes.clone(),
+                    origins,
+                });
+                self.status.send_modify(|status| status.revision += 1);
+            }
             return Ok(change);
         }
         let generation = current.generation + 1;
@@ -472,7 +691,9 @@ impl Reloader {
             generation,
             advertised,
             routes,
+            origins,
         });
+        self.status.send_modify(|status| status.revision += 1);
         Ok(change)
     }
 
@@ -497,8 +718,32 @@ impl Reloader {
                 .filter(|(target, _)| !expired.contains(target))
                 .map(|(target, route)| (target.clone(), route.clone()))
                 .collect(),
+            origins: current.origins.clone(),
         });
     }
+}
+
+/// Refuses an edit of a host another source routes: the console edits its own
+/// routes, and moves one only to a host no other source routes. The hosts are
+/// checked (lower case) by the console before.
+fn taken(edit: &Edit, origins: &HashMap<String, Origin>) -> Result<(), Refused> {
+    let foreign = |host: &str| {
+        origins
+            .get(host)
+            .filter(|origin| !matches!(origin, Origin::Console { .. }))
+    };
+    let host = edit.host();
+    if let Some(origin) = foreign(host) {
+        return Err(Refused::Taken(format!(
+            "{host} is routed by {origin}, not by the console"
+        )));
+    }
+    if let Edit::Move { to, .. } = edit
+        && let Some(origin) = foreign(to)
+    {
+        return Err(Refused::Taken(format!("{to} is routed by {origin}")));
+    }
+    Ok(())
 }
 
 /// Whether the routes can start within `capacity`: their shared VMs and their pools'

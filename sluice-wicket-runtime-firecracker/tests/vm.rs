@@ -11,7 +11,11 @@
 //! a destination on the host, by name, address, range and IPv6, from a shared VM
 //! and a clone, and its records; the routes through `--listen` as well, by host
 //! (http/1.1 and h2c, an unknown one answered 404); a reload of the `--config`
-//! file, polled, removing a route and replacing a rootfs.
+//! file, polled, removing a route and replacing a rootfs; the console deploying
+//! one more route from an uploaded rootfs (refusing what it does not take),
+//! served on the tunnel, listed with its VMs, and served again after a restart
+//! from the console's directory (not with the image: its directory is the
+//! test's).
 //!
 //! Skipped where `/dev/kvm` is not usable. Elsewhere it needs Firecracker
 //! (`SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER`, else `firecracker` on
@@ -70,6 +74,9 @@ const CAPPED_IDLE: Duration = Duration::from_secs(5);
 /// reuse.local's and pool.local's `keep-ms`: above what a check of theirs takes
 /// between connections.
 const KEEP: Duration = Duration::from_millis(1500);
+
+/// The console's token.
+const CONSOLE_TOKEN: &str = "c0ns0le";
 
 /// The launcher (`--launch-vm`) execs the program with the soft open file
 /// limit given (Firecracker grows its file table to the limit at its start, a
@@ -177,6 +184,16 @@ async fn every_route_serves_http_through_the_tunnel() {
         CAPPED_IDLE.as_millis()
     );
     std::fs::write(&config, format!("{routes}{capped}")).unwrap();
+    let console_dir = dir.0.join("deployed");
+    let console_args = [
+        "--console",
+        "127.0.0.1:0",
+        "--console-token",
+        CONSOLE_TOKEN,
+        "--console-dir",
+        &console_dir.display().to_string(),
+    ]
+    .map(String::from);
     let (flume, mut feeds) = flume_server().await;
     let mut args: Vec<String> = [
         "--config",
@@ -193,19 +210,23 @@ async fn every_route_serves_http_through_the_tunnel() {
     .map(String::from)
     .into();
     args.extend(extra.iter().flat_map(|vm| ["--vm".to_string(), vm.clone()]));
+    if image.is_none() {
+        args.extend(console_args.iter().cloned());
+    }
     let (url, mut streams) = tunnel_server(None).await;
     let cgroup = format!("sluice-vm-test-{}", std::process::id());
-    let wicket = match &image {
-        Some(image) => Wicket::in_image(image, &url, &dir.0, &args, jailed),
+    let start = |url: &str, args: &[String]| match &image {
+        Some(image) => Wicket::in_image(image, url, &dir.0, args, jailed),
         None if jailed => {
             let (firecracker, kernel) = tools();
-            Wicket::jailed(&url, &firecracker, &kernel, &cgroup, &args)
+            Wicket::jailed(url, &firecracker, &kernel, &cgroup, args)
         }
         None => {
             let (firecracker, kernel) = tools();
-            Wicket::start(&url, &firecracker, &kernel, &args)
+            Wicket::start(url, &firecracker, &kernel, args)
         }
     };
+    let wicket = start(&url, &args);
     let stream = tokio::time::timeout(HANG, streams.recv())
         .await
         .ok()
@@ -356,6 +377,14 @@ async fn every_route_serves_http_through_the_tunnel() {
         assert!(Instant::now() < deadline, "capped.local is still served");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    if image.is_none() {
+        let deployed = deploy(&mut tunnel, &wicket, &rootfs, &console_dir, &mut conn_id);
+        assert!(
+            tokio::time::timeout(HANG, deployed).await.is_ok(),
+            "the console: hung; {}",
+            wicket.log()
+        );
+    }
     match (jailed, &image) {
         // the image's keeper in the container's cgroup, the wicket its nonroot user
         (true, Some(_)) => jails(&wicket, None, NONROOT),
@@ -369,6 +398,162 @@ async fn every_route_serves_http_through_the_tunnel() {
         ),
         (false, Some(_)) => {}
     }
+
+    // the console's route after a restart: started again from its directory alone
+    if image.is_none() {
+        drop(wicket);
+        let (url, mut streams) = tunnel_server(None).await;
+        let wicket = start(&url, &console_args);
+        let stream = tokio::time::timeout(HANG, streams.recv())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| panic!("no tunnel stream after the restart; {}", wicket.log()));
+        let (tunnel, advertise) = ServerTunnel::new(stream).await;
+        let hosts: Vec<_> = advertise.upstreams.iter().map(|up| &up.host).collect();
+        assert_eq!(hosts, ["console.local"], "{}", wicket.log());
+        let again = Route {
+            tunnel: &tunnel,
+            host: "console.local",
+            address: dial_address(&advertise.upstreams[0].target_url),
+            listen: None,
+        };
+        let served_again = tokio::time::timeout(HANG, again.keep_alive(1)).await;
+        let bodies =
+            served_again.unwrap_or_else(|_| panic!("console.local: hung; {}", wicket.log()));
+        assert_eq!(served(&bodies), [1, 2, 3]);
+    }
+}
+
+/// A request to the console at `address`, with its token or not: the status and
+/// the JSON answered.
+async fn console(
+    address: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    token: bool,
+    body: Bytes,
+) -> (u16, serde_json::Value) {
+    let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    let mut request = hyper::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", address.to_string());
+    if token {
+        request = request.header("authorization", format!("Bearer {CONSOLE_TOKEN}"));
+    }
+    let response = sender
+        .send_request(request.body(Full::new(body)).unwrap())
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap_or_default())
+}
+
+/// The console deploying `rootfs` as console.local, cloned per connection: refused
+/// without the token, on a host the config file routes and for a body that is no
+/// ext4 image; then advertised on the image kept below `dir` under its digest,
+/// served on the tunnel, listed with its VMs and its template's snapshot, written to
+/// `dir`'s routes.yaml.
+async fn deploy(
+    tunnel: &mut ServerTunnel,
+    wicket: &Wicket,
+    rootfs: &Path,
+    dir: &Path,
+    conn_id: &mut i64,
+) {
+    let at = wicket.console();
+    let (status, _) = console(at, "GET", "/api/routes", false, Bytes::new()).await;
+    assert_eq!(status, 401, "no token");
+    let taken = console(
+        at,
+        "PATCH",
+        "/api/routes/shared.local?mem=256",
+        true,
+        Bytes::new(),
+    );
+    let (status, refused) = taken.await;
+    assert_eq!(status, 409, "{refused}");
+    let path = "/api/routes/console.local?name=app.ext4&mode=per-connection&warm=1";
+    let not_image = Bytes::from(vec![0u8; 4096]);
+    let (status, refused) = console(at, "PUT", path, true, not_image).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (
+            400,
+            Some("not an ext4 image (no ext2/3/4 superblock magic at byte 1080)")
+        )
+    );
+    let image = Bytes::from(std::fs::read(rootfs).unwrap());
+    let (status, deployed) = console(at, "PUT", path, true, image.clone()).await;
+    assert_eq!(status, 200, "{deployed}; {}", wicket.log());
+    assert_eq!(deployed["message"], "added console.local");
+
+    let digests: Vec<PathBuf> = std::fs::read_dir(dir.join("rootfs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    let [digest] = &digests[..] else {
+        panic!("one image kept: {digests:?}");
+    };
+    let kept = digest.join("app.ext4");
+    assert_eq!(std::fs::read(&kept).unwrap(), image, "kept as it came");
+    let routes = std::fs::read_to_string(dir.join("routes.yaml")).unwrap();
+    assert!(routes.contains("host: \"console.local\""), "{routes}");
+
+    let advertised = tunnel.advertise().await;
+    let up = advertised
+        .upstreams
+        .iter()
+        .find(|up| up.host == "console.local");
+    let target = up.expect("console.local advertised").target_url.clone();
+    let kept = kept.canonicalize().unwrap();
+    assert_eq!(
+        target,
+        format!("firecracker:{}?mode=per-connection&warm=1", kept.display())
+    );
+    *conn_id += 1;
+    let route = Route {
+        tunnel,
+        host: "console.local",
+        address: dial_address(&target),
+        listen: None,
+    };
+    assert_eq!(served(&route.keep_alive(*conn_id).await), [1, 2, 3]);
+
+    let (status, listing) = console(at, "GET", "/api/routes", true, Bytes::new()).await;
+    assert_eq!(status, 200, "{listing}");
+    let routes = listing["routes"].as_array().unwrap();
+    let route = |host: &str| {
+        routes
+            .iter()
+            .find(|route| route["host"] == host)
+            .unwrap_or_else(|| panic!("{host} not listed: {listing}"))
+    };
+    let deployed = route("console.local");
+    assert_eq!(deployed["origin"], "console");
+    assert_eq!(
+        deployed["rootfs"]["sha256"].as_str(),
+        digest.file_name().and_then(|name| name.to_str())
+    );
+    assert_eq!(
+        deployed["options"],
+        serde_json::json!({"mode": "per-connection", "warm": "1"})
+    );
+    assert!(
+        deployed["snapshot"]["memory_bytes"].as_u64() > Some(0),
+        "{deployed}"
+    );
+    assert_eq!(route("shared.local")["origin"], "config");
+    assert!(route("shared.local")["vms"]["shared"].as_bool().unwrap());
+    let budget = &listing["budget"];
+    assert!(budget["vms"].as_u64() >= Some(1), "{budget}");
+    assert_eq!(budget["max_vms"], 64);
 }
 
 /// The field `name` of the status of `pid` (empty: none, or no such process).
@@ -1402,6 +1587,22 @@ impl Wicket {
                 return line.split(',').next().unwrap().parse().unwrap();
             }
             assert!(Instant::now() < deadline, "not listening; {}", self.log());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The address its console listens on, from its log.
+    fn console(&self) -> std::net::SocketAddr {
+        let deadline = Instant::now() + HANG;
+        loop {
+            let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+            let line = log
+                .lines()
+                .find_map(|line| line.strip_prefix("console on http://"));
+            if let Some(line) = line {
+                return line.split(' ').next().unwrap().parse().unwrap();
+            }
+            assert!(Instant::now() < deadline, "no console; {}", self.log());
             std::thread::sleep(Duration::from_millis(50));
         }
     }

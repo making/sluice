@@ -30,12 +30,18 @@
 //! their route's `egress` reach the wicket over vsock, which connects to them
 //! (`egress`).
 //!
+//! `--console` serves a page and an API (`console`) deploying uploaded rootfs
+//! images as routes without a restart, kept in the console's directory
+//! (`deployed`) across restarts.
+//!
 //! In jail mode (`--jail-ids`) the process started as root is the keeper
 //! (`keeper`): it runs the wicket as `--jail-user` and spawns the VMs at its
 //! request, each in a jail of its own (`jail`).
 
 pub mod capacity;
 pub mod config;
+pub mod console;
+pub mod deployed;
 pub mod egress;
 pub mod head;
 pub mod hpack;
@@ -61,6 +67,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use capacity::Capacity;
+use console::Console;
+use deployed::Deployed;
 use output::{Printer, Sink};
 use routes::Reloader;
 use vm::Launcher;
@@ -109,9 +117,10 @@ pub async fn run(
         watch_interval,
         state_dir: _,
         flume,
-        jail: _,
-        routes,
-        specs,
+        jail,
+        mut console,
+        mut routes,
+        specs: _,
     } = settings;
     println!("wicket build: {}", describe_build());
     // installed whether or not a drain follows: as the init (pid 1) of a
@@ -141,7 +150,16 @@ pub async fn run(
         tap: tap.clone(),
     });
     let places = Arc::new(launcher.start()?);
-    let reloader = Reloader::start(routes, specs, capacity, places, sink, workers.clone()).await?;
+    // opened by the wicket, its user's (jail mode: not the keeper's)
+    let mut intake = None;
+    if let Some(console) = &mut console {
+        let deployed = Deployed::open(&console.dir)?;
+        // named as it resolved from here on: the log says where the files are
+        console.dir = deployed.dir().to_path_buf();
+        intake = Some(deployed.images().intake());
+        routes.deploy(deployed);
+    }
+    let reloader = Reloader::start(routes, capacity.clone(), places, sink, workers.clone()).await?;
     let routes = reloader.routes().clone();
     if let Some(flume) = flume {
         flume::start(flume, tap, &client_id)?;
@@ -153,8 +171,10 @@ pub async fn run(
     );
     let (hangups, hangups_received) = mpsc::channel(1);
     signals::forward_hangups(hangups)?;
+    let mut listening = None;
     if let Some(address) = listen {
         let listener = sluice_wicket_tunnel::listener::bind(&address).await?;
+        listening = Some(listener.local_addr()?);
         println!(
             "listening on {}, {max_connections} connections at most",
             listener.local_addr()?
@@ -166,9 +186,43 @@ pub async fn run(
             max_connections,
         ));
     }
+    let (requests, requests_received) = mpsc::channel(8);
+    match console.zip(intake) {
+        Some((console, intake)) => {
+            let listener = console.bind().await?;
+            println!(
+                "console on http://{} ({}); its routes kept in {}",
+                listener.local_addr()?,
+                console.credentials(),
+                console.dir.display()
+            );
+            tokio::spawn(sluice_wicket_console::serve::run(
+                listener,
+                console.gate("sluice-wicket-runtime-firecracker")?,
+                Arc::new(Console {
+                    routes: routes.clone(),
+                    status: reloader.status(),
+                    requests,
+                    capacity,
+                    dir: console.dir,
+                    intake,
+                    jailed: jail.is_some(),
+                    server: server.clone(),
+                    listen: listening,
+                }),
+            ));
+        }
+        // no console: the reloader sees the channel closed, no edit comes
+        None => drop(requests),
+    }
     let Some(server) = server else {
         // local mode alone: nothing to drain, a signal ends the process at once
-        let reloads = reloader.run(watch_interval, hangups_received, CancellationToken::new());
+        let reloads = reloader.run(
+            watch_interval,
+            hangups_received,
+            requests_received,
+            CancellationToken::new(),
+        );
         tokio::select! {
             () = reloads => {}
             name = signals.recv() => println!("{name}: ending at once"),
@@ -189,6 +243,11 @@ pub async fn run(
         Arc::clone(&routes),
     );
     // the drain stops the reloads: the routes are withdrawn
-    tokio::spawn(reloader.run(watch_interval, hangups_received, shared.drain.begin.clone()));
+    tokio::spawn(reloader.run(
+        watch_interval,
+        hangups_received,
+        requests_received,
+        shared.drain.begin.clone(),
+    ));
     sluice_wicket_tunnel::serve(shared, server, drain_grace, &mut signals).await
 }

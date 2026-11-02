@@ -72,7 +72,8 @@ Two Cargo workspaces:
   `output.rs` the VMs' output, `egress.rs` their egress, `wire.rs` the vsock framing, the
   restore notice and the egress rules,
   `listener.rs` `--listen` (`head.rs` the request head routing a connection, `hpack.rs`
-  an h2c one's), `state.rs` the state dir, `seccomp.rs` the seccomp filters;
+  an h2c one's), `console.rs` the console (its page in `src/console/`), `deployed.rs` its
+  routes kept, `state.rs` the state dir, `seccomp.rs` the seccomp filters;
   jail mode's `keeper.rs` (the privileged half, and the wicket's client of it) and
   `jail.rs` (one VM's jail, the VMs' cgroups)
 - `guest/` -- the VMs' `/init`, built for `x86_64-unknown-linux-musl` or
@@ -262,7 +263,81 @@ removed ...; restarted ...`):
   before)
 
 Only the routes, the kernel and the firecracker binary are reloaded; the other settings apply
-at startup.
+at startup. The console's edits go through the same reload (see [Console](#console)).
+
+### Console
+
+`--console <host:port>` (`console`) serves a page and a JSON API deploying rootfs images as
+routes at once, without a restart: drop an ext4 image on the page (or choose one), give it a
+host and the route's options, and it is served -- on the tunnel and on `--listen` alike.
+Dropped on a route of the console, an image replaces its own; renamed, a route moves to
+another host with its image and options. The routes of the config file and the `--vm` flags
+are listed too, read-only. The page shows what the wasm wicket's has no counterpart for:
+each route's VMs (shared, warm, kept, pooled, starting, all alive), its connections, a cloned
+route's snapshot (its memory file, the template's boot and snapshot times) and the budget
+(`--max-vms`, `--max-memory`) taken.
+
+```text
+target/debug/sluice-wicket-runtime-firecracker --kernel vmlinux --listen 127.0.0.1:8080 \
+    --console 127.0.0.1:9090
+# open http://127.0.0.1:9090/ and drop target/guest.ext4 on it: served as guest.localhost
+curl http://guest.localhost:8080/   # *.localhost is the loopback, in browsers too
+```
+
+A deploy is a reload (see [Reloading routes](#reloading-routes)) of the routes as they would be
+with it, kept only when its VMs started: options a route refuses, an image that does not boot,
+a host the config file or a flag routes, routes past the budget refuse it with the reason, and
+the routes stay as they were. The image is received to the console's directory as it comes
+(4 GiB at most), hashed on the way, and refused unless it carries an ext2/3/4 superblock.
+
+The console keeps its routes in `--console-dir` (`console-dir`, default `deployed` next to the
+config file, else in the working directory: `/data/deployed` in the image) and serves them again
+after a restart:
+
+```text
+deployed/routes.yaml                    the routes, in the config file's route shape (and their time)
+deployed/rootfs/<sha256>/<name>.ext4    the images they name, never rewritten
+```
+
+`routes.yaml` is written once a change started (0600), and an image no route names is
+removed. An image's path names its digest, so other content is another target: the route's
+VMs start anew, and its old target drains as a removed one does. Without `--console` the
+directory is not read. One wicket per directory. In jail mode the console is the wicket's,
+run as `--jail-user`: the directory is its user's, and an image is opened by it and passed to
+the keeper as the config file's are.
+
+The credentials are the wasm wicket's console's (its README, [Console](../sluice-wicket-runtime-wasi/README.md#console)):
+`--console-token <token>` (`console-token`, `SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE_TOKEN`) as
+the HTTP Basic password or a Bearer token, or a browser's sign-in through an OpenID Provider
+(`--oidc-issuer`, `--oidc-client-id`, `--oidc-client-secret`, `--oidc-claim`, `--oidc-scopes`,
+`--oidc-ca-cert`); without either the console must listen on a loopback address and answers
+only requests for an IP address or `localhost` (no DNS rebinding). An edit from another origin
+is refused.
+
+The API the page uses; `<options>` are the `--vm` route options, all of them (one left out takes
+its default):
+
+| request | |
+|---|---|
+| `GET /api/routes[?after=<revision>]` | every route with its VMs, the budget and the last failed reload of the files, as JSON; with `after` the current `revision`, held until the routes change (25s at most; the VMs' counts move without a revision) |
+| `PUT /api/routes/<host>?name=<file>&<options>` | deploys the body, an ext4 image, to the host (replacing the console's route of the host) |
+| `PATCH /api/routes/<host>?<options>` | gives the console's route of the host other options |
+| `PATCH /api/routes/<host>?host=<to>` | moves the console's route of the host to `<to>` as it is |
+| `DELETE /api/routes/<host>` | removes the console's route of the host |
+
+```text
+curl -T guest.ext4 -H 'Authorization: Bearer SECRET' \
+    'http://127.0.0.1:9090/api/routes/hello.localhost?name=guest.ext4&mode=per-connection&warm=2'
+{"generation":2,"message":"added hello.localhost"}
+```
+
+An edit is answered 400 (a bad host name, option or image), 404 (no route of the console), 409
+(a host the config file or a flag routes; for a move, any routed host), 413, 422 (the routes
+did not start with it; the reason follows) or 503 (draining). The options are checked before
+the image is read: a client sending `Expect: 100-continue` (curl does for a large file) is
+refused before it uploads. The listing names each route's `origin` (`config`, `flag`,
+`console`), its advertised `target`, its `rootfs` (a console route's path in the directory and
+its digest), its `options` set to other than their defaults, its `vms` and `snapshot`.
 
 ### Limits
 
@@ -271,7 +346,7 @@ templates, clones warm, in use, kept and pooled -- and `--max-memory MiB` (defau
 `--max-vms` x the largest `mem` bounds it) their guest memory (`mem`). A cloned route's
 `vms=N` caps its own (at least `warm`). A VM takes its share before its `firecracker` starts
 and gives it back once killed; a startup whose shared VMs, pools' `warm` VMs and largest
-template do not fit fails.
+template do not fit fails, and so does a reload (a console's edit included).
 
 A connection whose clone finds no room waits for one in turn (one held back by its own
 route's `vms` alone keeps no other route waiting), at most its route's `wait-ms` (default
@@ -949,5 +1024,7 @@ Caveats:
 ## Not yet
 
 A shared VM replaced when it fails (a pool's are: `mode=pool&vms=1` is one), a pool
-spreading by load rather than by connections, CPU limits without the jail, the wasm
-wicket's console, and egress over UDP or to names a route does not list (`*.example.com`).
+spreading by load rather than by connections, CPU limits without the jail, the console's apps
+API (what `sluice-wicket-cf-api` deploys through on the wasm wicket) with a rootfs made from an
+OCI / CNB image on the wicket, and egress over UDP or to names a route does not list
+(`*.example.com`).
