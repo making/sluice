@@ -54,7 +54,9 @@ The rootfs is either the built-in sample (`scripts/build-guest.sh`: `/init` serv
 itself) or an OCI image converted by `scripts/cnb-rootfs.sh`, e.g. a Cloud Native
 Buildpacks image: `/init` starts the image's `Entrypoint` + `Cmd` as its `User` in its
 `WorkingDir` with its `Env` (and `PORT`), and opens the vsock port once the process
-accepts on `127.0.0.1:$PORT`. The process's output reaches the wicket's stdout / stderr,
+accepts on `127.0.0.1:$PORT`. `/dev/stdin`, `/dev/stdout` and `/dev/stderr` exist and its
+output is its user's, so an image's log files linked to them open as they do under runc.
+The process's output reaches the wicket's stdout / stderr,
 and with `--flume` the live access log (see [Output](#output-and-the-live-access-log)). A
 guest has no network device: it connects to the destinations its route allows through
 the wicket (see [Egress](#egress)).

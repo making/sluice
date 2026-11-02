@@ -1337,6 +1337,9 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     assert_eq!(status, 200, "{body}");
     for expected in [
         "uid 1000 gid 1001\n",
+        // its output opened by path, as an image's logs linked to /dev/stderr are
+        "/dev/stdout: opened\n",
+        "/dev/stderr: opened\n",
         "/app/data uid 1000 gid 1001 mode 640\n",
         "/app/tool uid 0 gid 1 mode 4755\n",
         "GREETING=hello world\n",

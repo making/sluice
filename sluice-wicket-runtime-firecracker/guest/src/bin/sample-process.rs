@@ -1,5 +1,5 @@
 //! A sample of what an image runs, for the tests of an image's rootfs: a static HTTP/1.1
-//! server on `PORT` answering what the process is as text -- its uid and gid, the owner and
+//! server on `PORT` answering what the process is as text -- its uid and gid, whether it opens `/dev/stdout` and `/dev/stderr` by path, the owner and
 //! mode of each path of its arguments, its environment -- and printing a line per request,
 //! as a process's output. `/egress?to=<host>:<port>` connects as a process does, half-closes
 //! and answers with what came, `/exit` answers and exits. `SAMPLE_WAIT_MS` delays its listening,
@@ -70,6 +70,14 @@ fn answer() -> String {
     // SAFETY: getuid and getgid
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let mut text = format!("uid {uid} gid {gid}\n");
+    // by path, as an image's log files linked to them do
+    for path in ["/dev/stdout", "/dev/stderr"] {
+        let opened = std::fs::OpenOptions::new().append(true).open(path);
+        text.push_str(&match opened {
+            Ok(_) => format!("{path}: opened\n"),
+            Err(e) => format!("{path}: {e}\n"),
+        });
+    }
     for path in std::env::args().skip(1) {
         match std::fs::metadata(&path) {
             Ok(file) => text.push_str(&format!(

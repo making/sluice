@@ -133,6 +133,7 @@ fn main() {
     egress.name();
     mount("tmpfs", "/tmp", "tmpfs", 0);
     mount("tmpfs", "/dev/shm", "tmpfs", 0);
+    link_standard_fds();
     let mut launch = std::fs::read(LAUNCH_CONFIG).ok().map(|json| {
         serde_json::from_slice::<Launch>(&json).unwrap_or_else(|e| {
             eprintln!("guest: {LAUNCH_CONFIG}: {e}");
@@ -258,6 +259,33 @@ fn park() -> ! {
     loop {
         std::thread::park();
     }
+}
+
+/// `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd`, which an image's process opens by
+/// path (its logs link to them) and which the kernel's devtmpfs does not have: runc makes them.
+fn link_standard_fds() {
+    for (link, target) in [
+        ("/dev/fd", "/proc/self/fd"),
+        ("/dev/stdin", "/proc/self/fd/0"),
+        ("/dev/stdout", "/proc/self/fd/1"),
+        ("/dev/stderr", "/proc/self/fd/2"),
+    ] {
+        if let Err(e) = std::os::unix::fs::symlink(target, link)
+            && e.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            eprintln!("guest: {link}: {e}");
+        }
+    }
+}
+
+/// Makes `fd` (a pipe `start` made as root) the `uid`'s: a process opening its output again by
+/// path needs the owner's access, as runc's `fixStdioPermissions` gives a container's.
+fn chown_fd(fd: libc::c_int, uid: u32) -> std::io::Result<()> {
+    // SAFETY: fchown on an open descriptor; the gid is left as it is
+    if unsafe { libc::fchown(fd, uid, u32::MAX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn mount(source: &str, target: &str, fstype: &str, flags: libc::c_ulong) {
@@ -451,6 +479,9 @@ fn start(launch: Launch, log: &Arc<Log>) -> std::io::Result<()> {
     // the supplementary groups
     unsafe {
         command.pre_exec(move || {
+            // before setuid, while it may: the pipes are the process's to open by path
+            chown_fd(1, uid)?;
+            chown_fd(2, uid)?;
             if libc::setgroups(0, std::ptr::null()) != 0
                 || libc::setgid(gid) != 0
                 || libc::setuid(uid) != 0
@@ -577,6 +608,9 @@ async fn restored(
     // SAFETY: as for the process (`start`)
     unsafe {
         command.pre_exec(move || {
+            // before setuid, while it may: the pipes are the process's to open by path
+            chown_fd(1, uid)?;
+            chown_fd(2, uid)?;
             if libc::setgroups(0, std::ptr::null()) != 0
                 || libc::setgid(gid) != 0
                 || libc::setuid(uid) != 0
