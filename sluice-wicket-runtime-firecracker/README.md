@@ -40,6 +40,16 @@ route's VMs are:
 
 The cloned modes (per-connection, reuse, pool) take `prime`, `warm`, `vms` and `wait-ms`.
 
+| mode | VMs | a connection gets | between connections | idle | a VM failing | memory | new connections/s |
+|---|---|---|---|---|---|---|---|
+| `shared` | 1, booted at start | the VM | one guest for all | the VM stays | every connection fails until a reload | the pages its guest touched | 3,060 (1 vCPU), 7,072 (4) |
+| `per-connection` | 1 per open connection, `warm` ahead | a clone of its own, killed with it | a clone each | `warm` clones stay | that connection | the snapshot (`mem`) + a few MiB a clone | 1,600 (`warm=16`) |
+| `reuse` | 1 per open connection, kept ones, `warm` ahead | the clone used last, else a fresh one | a clone's connections in turn share its guest | kept clones killed after `keep-ms`: none left | that connection | as per connection | 8,918 |
+| `pool` | `warm` to `vms`, many connections each | the VM holding the fewest | a VM's connections share its guest | down to `warm` after `keep-ms` (`warm=0`: none) | its connections; a VM started in its place | as per connection | 7,493 (4 VMs of 1 vCPU) |
+
+The rates are the sample guest's through the server, `oha -c 16 --disable-keepalive` (see
+[Findings](#findings)).
+
 The rootfs is either the built-in sample (`scripts/build-guest.sh`: `/init` serves HTTP
 itself) or an OCI image converted by `scripts/cnb-rootfs.sh`, e.g. a Cloud Native
 Buildpacks image: `/init` starts the image's `Entrypoint` + `Cmd` as its `User` in its
