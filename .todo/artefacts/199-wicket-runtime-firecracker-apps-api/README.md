@@ -38,3 +38,7 @@ TRANSCRIPT=1 node --experimental-vm-modules fc-harness.js $F/index.html fc-listi
   mode switching the fields, the PUT and PATCH URLs, the 5 s refresh, a file refused.
   `XMLHttpRequest` stubbed, `Blob.arrayBuffer` polyfilled (jsdom's Blob lacks it).
 - The listings are fakes in the shape of each console's `GET /api/routes`.
+
+`real-image.sh`: `PUT /api/images` on a real image (a Paketo run image with a binary on top) from a
+local registry, served in a VM: the image's user, a setuid file, the env, the same digest again,
+e2fsck. Needs docker and KVM, so it is not with the jsdom checks above.
