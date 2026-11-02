@@ -282,6 +282,16 @@ impl Cf {
 /// An http/1.0 GET of `path` at `address` with `host` (no chunking: the
 /// body is read to the close): the status and the body.
 fn get(address: &str, host: &str, path: &str, authorization: Option<&str>) -> (u16, String) {
+    fetch(address, host, path, authorization).expect("a head")
+}
+
+/// [`get`], None on a connection cut or ended with no answer.
+fn fetch(
+    address: &str,
+    host: &str,
+    path: &str,
+    authorization: Option<&str>,
+) -> Option<(u16, String)> {
     let mut stream = TcpStream::connect(address).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -294,16 +304,16 @@ fn get(address: &str, host: &str, path: &str, authorization: Option<&str>) -> (u
             format!("GET {path} HTTP/1.0\r\nHost: {host}\r\n{auth}Connection: close\r\n\r\n")
                 .as_bytes(),
         )
-        .unwrap();
+        .ok()?;
     let mut response = String::new();
-    stream.read_to_string(&mut response).expect("read");
-    let (head, body) = response.split_once("\r\n\r\n").expect("a head");
+    stream.read_to_string(&mut response).ok()?;
+    let (head, body) = response.split_once("\r\n\r\n")?;
     let status = head
         .split(' ')
         .nth(1)
         .and_then(|status| status.parse().ok())
         .expect("a status");
-    (status, body.to_string())
+    Some((status, body.to_string()))
 }
 
 /// The wicket's apps, through its console.
@@ -1487,6 +1497,20 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     cf.ok(&["delete-security-group", "web", "-f"]);
     cf.ok(&["restart", "fc"]);
     assert_eq!(get(&listen, "fc.localhost", "/", None).0, 200);
+
+    // a process ending: the wicket starts its VM again by itself
+    assert_eq!(get(&listen, "fc.localhost", "/exit", None).0, 200);
+    let deadline = Instant::now() + HANG;
+    loop {
+        let logs = cf.ok(&["logs", "fc", "--recent"]);
+        if logs.contains("exit status: 83")
+            && fetch(&listen, "fc.localhost", "/", None).is_some_and(|got| got.0 == 200)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no process again: {logs}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
     // a process exiting before it listens is refused at once, not at the health check's
     // timeout (60s), its output in the logs; a push over the crashed app goes through

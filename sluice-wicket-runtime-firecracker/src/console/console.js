@@ -283,6 +283,9 @@ function vmsView(route) {
   const counts = [h("span", { class: "num", title: "its VMs alive, as the budget counts them" }, plural(vms.alive, "VM"))];
   if (route.mode === "shared") {
     counts.push(vms.shared ? "up" : "down");
+    if (vms.restarts) {
+      counts.push(`restarted ${plural(vms.restarts, "time")}`);
+    }
   }
   else if (route.mode === "pool") {
     counts.push(`${vms.pooled} pooled`);
@@ -298,6 +301,9 @@ function vmsView(route) {
   }
   counts.push(plural(vms.connections, "connection"));
   const lines = [h("span", { class: "route__meta", "data-testid": "vms" }, joined(counts))];
+  if (vms.down) {
+    lines.push(h("span", { class: "route__meta", title: "its VM starts again by itself" }, vms.down));
+  }
   if (snapshot) {
     lines.push(h("span", { class: "route__meta", title: `snapshot taken ${snapshot.at}` }, joined([
       `snapshot ${humanBytes(snapshot.memory_bytes)}`,

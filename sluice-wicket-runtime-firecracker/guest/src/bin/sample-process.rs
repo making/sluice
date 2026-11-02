@@ -2,8 +2,8 @@
 //! server on `PORT` answering what the process is as text -- its uid and gid, the owner and
 //! mode of each path of its arguments, its environment -- and printing a line per request,
 //! as a process's output. `/egress?to=<host>:<port>` connects as a process does, half-closes
-//! and answers with what came. `SAMPLE_WAIT_MS` delays its listening, `SAMPLE_EXIT` has it exit
-//! instead, as a process failing to start does.
+//! and answers with what came, `/exit` answers and exits. `SAMPLE_WAIT_MS` delays its listening,
+//! `SAMPLE_EXIT` has it exit instead, as a process failing to start does.
 
 use std::io::{Read as _, Write as _};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -46,6 +46,10 @@ fn main() {
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
+        if path == "/exit" {
+            drop(stream);
+            std::process::exit(83);
+        }
     }
 }
 

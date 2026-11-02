@@ -97,6 +97,12 @@ const EXT4_IOC_RESIZE_FS: libc::c_ulong = 0x4008_6610;
 /// How long a process killed may take to end, before all is written all the same.
 const KILLED_WAIT: Duration = Duration::from_secs(1);
 
+/// Hello mode's `POST /exit`: its server ends.
+static EXIT: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// On the disk, hello mode's server exits once more, before it listens (`POST /exit?again=1`).
+const EXIT_ONCE: &str = ".exit-once";
+
 /// Where the VM's disk is mounted, or why it is not; unset without a disk.
 static DISK: OnceLock<Result<String, String>> = OnceLock::new();
 
@@ -213,6 +219,13 @@ fn main() {
                 port
             }
             None => {
+                if let Some(Ok(mount)) = DISK.get()
+                    && std::fs::remove_file(std::path::Path::new(mount).join(EXIT_ONCE)).is_ok()
+                {
+                    log.line(Stream::Stderr, b"guest: exiting before it listens, as told");
+                    log.exited();
+                    std::future::pending::<()>().await;
+                }
                 let listener = tokio::net::TcpListener::bind(("127.0.0.1", HELLO_PORT)).await?;
                 tokio::spawn(hello(listener, booted, log));
                 HELLO_PORT
@@ -661,7 +674,8 @@ async fn relay(port: u16, booted: Instant) -> std::io::Result<()> {
 }
 
 /// Hello mode: the guest's own HTTP server, its lines to `log` as a process's
-/// output: one at its start, two (stdout, stderr) per request for `/log`.
+/// output: one at its start, two (stdout, stderr) per request for `/log`; until a
+/// `POST /exit`, its end told as a process's is.
 async fn hello(listener: tokio::net::TcpListener, booted: Instant, log: Arc<Log>) {
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|id| id.trim().to_string())
@@ -676,7 +690,11 @@ async fn hello(listener: tokio::net::TcpListener, booted: Instant, log: Arc<Log>
     RANDOM.store(u64::from_le_bytes(seed), Ordering::Relaxed);
     let boot_id: &'static str = Box::leak(boot_id.into_boxed_str());
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            () = EXIT.notified() => break,
+        };
+        let Ok((stream, _)) = accepted else {
             continue;
         };
         let log = log.clone();
@@ -695,6 +713,30 @@ async fn hello(listener: tokio::net::TcpListener, booted: Instant, log: Arc<Log>
             }
         });
     }
+    drop(listener);
+    log.line(Stream::Stderr, b"guest: exited, as told");
+    log.exited();
+}
+
+/// Hello mode's `POST /exit`: its server ends just after the answer, as a process does, or with
+/// `?listening=1` says so and goes on, as a launcher leaving a daemon does; `?again=1` has the
+/// next boot's exit once more, before it listens.
+fn exit_answer(query: &str, log: &Log) -> String {
+    if query == "listening=1" {
+        log.exited();
+        return "exited, listening\n".into();
+    }
+    if query == "again=1"
+        && let Some(Ok(mount)) = DISK.get()
+        && let Err(e) = std::fs::write(std::path::Path::new(mount).join(EXIT_ONCE), b"")
+    {
+        return format!("error: {e}\n");
+    }
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        EXIT.notify_one();
+    });
+    "exiting\n".into()
 }
 
 /// Hello mode's `/disk`: `?write=<name>` keeps the body as that file, by a rename, with
@@ -784,6 +826,10 @@ async fn answer(
     }
     if head.uri.path() == "/disk" {
         let answer = disk_answer(head.uri.query().unwrap_or_default(), &body);
+        return Ok(Response::new(Full::new(Bytes::from(answer))));
+    }
+    if head.uri.path() == "/exit" {
+        let answer = exit_answer(head.uri.query().unwrap_or_default(), &log);
         return Ok(Response::new(Full::new(Bytes::from(answer))));
     }
     if head.uri.path() == "/log" {

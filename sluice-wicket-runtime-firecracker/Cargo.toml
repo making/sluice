@@ -13,7 +13,7 @@ exclude = ["guest"]
 sluice-wicket-tunnel = { path = "../sluice-wicket-tunnel" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs", "process", "signal"] }
 # the reloads' stop: the drain's token
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 # the Firecracker API: HTTP/1.1 over its Unix socket
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

@@ -433,9 +433,9 @@ curl http://web.localhost:8080/
 - **a backup**: [the disk's](../sluice-wicket-runtime-firecracker/README.md#disks), whose file is
   `deployed/disks/ops/cf-api.ext4` in the volume. Lost, the apps serve on, a new cf-api leaves
   them (see Behavior)
-- **a crash of the cf-api** (not a stop) leaves its VM up without it, the wicket's stderr saying
-  `guest: /usr/local/bin/sluice-wicket-cf-api exited`: a PUT with another env starts it again.
-  The apps serve on meanwhile
+- **a crash of the cf-api** (not a stop): the wicket stops its VM and starts another one on the
+  disk, [waiting between starts](../sluice-wicket-runtime-firecracker/README.md#a-shared-vm-going-down)
+  if it keeps crashing: a boot long of no API. The apps serve on meanwhile
 
 ### Docker Compose
 
@@ -709,7 +709,7 @@ What holds on both wickets; a component's and a VM's are in
 | app stopped, or without a route | no app in the wicket |
 | route `<host>.<domain>` | a host: labels of `a-z`, `0-9` and `-`. No path, port or wildcard (422). A route serves one app: a second destination is refused; zero-downtime updates are `--strategy rolling` |
 | shared domain | `--domain` |
-| instance state | `RUNNING` once the wicket took the app; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable |
+| instance state | `RUNNING` once the wicket took the app, its VM going down and started again by the wicket included; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable |
 | rolling deployment | the app put with the new droplet: the wicket swaps it in place; finalized at once |
 | org / space | one of each |
 | health check, log rate, stack, buildpacks | accepted and shown, no effect |

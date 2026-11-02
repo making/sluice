@@ -160,18 +160,43 @@ impl Sink {
     }
 }
 
+/// What ended, as a VM's log stream tells.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ended {
+    /// The guest said its process did.
+    Process,
+    /// The stream did, the VM with it.
+    Vm,
+}
+
+/// Resolves once `flag` is on; never if it never will be.
+async fn turned_on(flag: &mut watch::Receiver<bool>) {
+    if flag.wait_for(|on| *on).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// A VM's output being followed ([`follow`]).
 pub struct Output {
     syncs: mpsc::Sender<()>,
     synced: watch::Receiver<u64>,
     exited: watch::Receiver<bool>,
+    gone: watch::Receiver<bool>,
 }
 
 impl Output {
     /// Resolves once the guest said its process ended; never if the stream ends first.
     pub async fn exited(&mut self) {
-        if self.exited.wait_for(|exited| *exited).await.is_err() {
-            std::future::pending::<()>().await;
+        turned_on(&mut self.exited).await;
+    }
+
+    /// Resolves once the VM is gone, or its process ended unless that was `told` before; never
+    /// on a stream given up with the VM alive.
+    pub async fn ended(&mut self, told: bool) -> Ended {
+        tokio::select! {
+            biased;
+            () = turned_on(&mut self.gone) => Ended::Vm,
+            () = turned_on(&mut self.exited), if !told => Ended::Process,
         }
     }
 
@@ -194,6 +219,7 @@ pub fn follow(mut stream: UnixStream, sink: Arc<Sink>, hosts: Arc<Hosts>, vm: St
     let (syncs, mut asked) = mpsc::channel(1);
     let (count, synced) = watch::channel(0u64);
     let (ended, exited) = watch::channel(false);
+    let (vm_gone, gone) = watch::channel(false);
     tokio::spawn(async move {
         // borrowed halves: an owned write half shuts the socket down when dropped,
         // which Firecracker takes as the end of the whole stream
@@ -210,13 +236,20 @@ pub fn follow(mut stream: UnixStream, sink: Arc<Sink>, hosts: Arc<Hosts>, vm: St
                     }
                     Ok(Some(LogFrame::Synced)) => count.send_modify(|count| *count += 1),
                     Ok(Some(LogFrame::Exited)) => drop(ended.send(true)),
-                    Ok(None) => return,
+                    Ok(None) => {
+                        let _ = vm_gone.send(true);
+                        return;
+                    }
                     Err(e) => {
                         let note = format!(
                             "route {} {vm}: its output: {e}; no more of it is read\n",
                             hosts.current().label
                         );
                         sink.printer.print(Stream::Stderr, note.into_bytes()).await;
+                        // a frame not taken: the VM lives on
+                        if e.kind() != std::io::ErrorKind::InvalidData {
+                            let _ = vm_gone.send(true);
+                        }
                         return;
                     }
                 }
@@ -240,6 +273,7 @@ pub fn follow(mut stream: UnixStream, sink: Arc<Sink>, hosts: Arc<Hosts>, vm: St
         syncs,
         synced,
         exited,
+        gone,
     }
 }
 

@@ -3,6 +3,9 @@
 //! named after the route's hosts and the VM (`output`): `vm-0` a shared VM,
 //! `template` a cloned route's template, `vm-<n>` its clones in the order they were
 //! restored.
+//!
+//! A pool replaces a VM that fails itself. A shared VM is watched ([`watch`]), and its going
+//! down told ([`Down`]): the routes start another one.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -21,7 +24,7 @@ use crate::capacity::{Capacity, Need, Pool, Slot};
 use crate::disk::{self, Disk};
 use crate::egress::Egress;
 use crate::keeper::Role;
-use crate::output::{self, Hosts, Output, Sink};
+use crate::output::{self, Ended, Hosts, Output, Sink};
 use crate::vm::{self, Place, Places, Snapshot, Spec, Vm};
 use crate::wire::{self, Rule};
 
@@ -67,6 +70,9 @@ const DEFAULT_CONNS: usize = 16;
 
 /// How long a pool waits before it replaces a VM it failed to start.
 const POOL_RETRY: Duration = Duration::from_secs(1);
+
+/// How long after a look that found it refusing a shared VM's process is looked at again.
+const LOOK_AGAIN: Duration = Duration::from_millis(100);
 
 /// Names the routes for the budget, over every route the wicket ever started.
 static NEXT_ROUTE: AtomicU64 = AtomicU64::new(0);
@@ -513,6 +519,8 @@ pub struct Vms {
     pub starting: usize,
     /// Its connections open.
     pub connections: u64,
+    /// Shared mode: VMs started in the place of one that went down.
+    pub restarts: u64,
 }
 
 /// A cloned route's snapshot of its template.
@@ -622,6 +630,28 @@ impl Cloned {
     }
 }
 
+/// A route's shared VM serves no more.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Down {
+    /// [`Route::id`].
+    pub route: u64,
+    pub why: &'static str,
+}
+
+/// Where a route starts, and what it is given to.
+pub struct Starting {
+    pub places: Arc<Places>,
+    /// The route is the `n`th started of `places`.
+    pub n: u64,
+    /// Where its VMs take their room.
+    pub capacity: Arc<Capacity>,
+    /// The room its shared VM comes back on ([`Capacity::hold`]), instead of taking it.
+    pub held: Option<Arc<Slot>>,
+    /// Where its VMs' output goes.
+    pub sink: Arc<Sink>,
+    pub workers: Arc<Workers>,
+}
+
 pub struct Route {
     pub spec: RouteSpec,
     /// The hosts the route serves, which the log and its VMs' output name.
@@ -639,11 +669,23 @@ pub struct Route {
     open: Arc<AtomicU64>,
     /// Cloned modes: its template's snapshot.
     taken: Option<Taken>,
+    /// Shared mode: the VMs started in the place of one that went down, this one included.
+    restarts: AtomicU64,
+    /// Shared mode: why its VM is down.
+    down: Mutex<Option<String>>,
 }
 
+/// A shared route's VM; none once stopped ([`Route::stop`]).
+type SharedVm = Mutex<Option<Arc<Vm>>>;
+
 enum Backend {
-    /// Its VM; none once stopped ([`Route::stop`]).
-    Shared(Mutex<Option<Arc<Vm>>>),
+    Shared {
+        vm: Arc<SharedVm>,
+        /// Has its watch look at the VM: a connection failed.
+        suspects: mpsc::Sender<()>,
+        /// What its watch follows, until it starts ([`Route::watch`]).
+        unwatched: Mutex<Option<(Option<Output>, mpsc::Receiver<()>)>>,
+    },
     /// Per-connection and reuse modes: a clone per connection at a time.
     Cloned {
         cloner: Arc<Cloner>,
@@ -1223,20 +1265,111 @@ impl Cloner {
     }
 }
 
+/// Follows a shared VM until it serves no more: why, or None when the route is gone.
+///
+/// - the log stream ended: the VM is gone
+/// - the guest said its process ended, and its port refuses at once (`accepting`, given how long
+///   to look): a launcher that left a daemon listening is no end. A process ending on purpose is
+///   not told apart: a route's process is to serve, and the wicket's own stop empties the route
+///   first (the routes then take no notice)
+/// - a connection failed (`suspected`), and the port refuses for as long as the guest may take
+///   to listen at a boot (`boot`): one process's restart in place is no end, nor is a client
+///   gone. What lives, listens and does not answer is not seen
+async fn watch<F>(
+    mut output: Option<Output>,
+    mut suspected: mpsc::Receiver<()>,
+    accepting: impl Fn(Duration) -> F,
+    boot: Duration,
+) -> Option<&'static str>
+where
+    F: Future<Output = bool>,
+{
+    let mut told = false;
+    loop {
+        let ended = async {
+            match &mut output {
+                Some(output) => output.ended(told).await,
+                None => std::future::pending().await,
+            }
+        };
+        let ended = tokio::select! {
+            biased;
+            ended = ended => Some(ended),
+            suspect = suspected.recv() => {
+                suspect?;
+                None
+            }
+        };
+        match ended {
+            Some(Ended::Vm) => return Some("its VM ended"),
+            Some(Ended::Process) => {
+                told = true;
+                if !accepting(Duration::ZERO).await {
+                    return Some("its process ended");
+                }
+            }
+            None => {
+                if !accepting(boot).await {
+                    return Some("its guest accepts no connection");
+                }
+            }
+        }
+    }
+}
+
+/// [`watch`] of the route `route`'s VM `vm`, on its `port`, its going down told to `down`. A look
+/// holds the VM only as long as it takes: a stop kills it.
+async fn watched(
+    vm: Weak<SharedVm>,
+    port: u32,
+    boot: Duration,
+    output: Option<Output>,
+    suspected: mpsc::Receiver<()>,
+    down: mpsc::UnboundedSender<Down>,
+    route: u64,
+) {
+    let accepting = |within: Duration| {
+        let vm = vm.clone();
+        async move {
+            let deadline = Instant::now() + within;
+            loop {
+                let held = vm.upgrade().and_then(|vm| vm.lock().unwrap().clone());
+                let Some(held) = held else {
+                    return false;
+                };
+                if held.accepting(port).await {
+                    return true;
+                }
+                drop(held);
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(LOOK_AGAIN).await;
+            }
+        }
+    };
+    if let Some(why) = watch(output, suspected, accepting, boot).await {
+        let _ = down.send(Down { route, why });
+    }
+}
+
 impl Route {
     /// Boots the route's VM (shared), or boots a template VM, snapshots it once its
     /// guest listens and kills it (the cloned modes; a pool's `warm` VMs restored then);
-    /// the route is the `n`th started of `places`, `hosts` name it in the log. Its VMs
-    /// take their room from `capacity`; their output goes to `sink`.
+    /// `hosts` name it in the log. See [`Starting`].
     pub async fn start(
         spec: RouteSpec,
         hosts: &[String],
-        places: &Places,
-        n: u64,
-        capacity: Arc<Capacity>,
-        sink: Arc<Sink>,
-        workers: Arc<Workers>,
+        starting: Starting,
     ) -> Result<Route, BoxError> {
+        let Starting {
+            places,
+            n,
+            capacity,
+            held,
+            sink,
+            workers,
+        } = starting;
         let hosts = Hosts::new(hosts);
         let label = hosts.current().label.clone();
         let need = Need {
@@ -1244,10 +1377,13 @@ impl Route {
             route: NEXT_ROUTE.fetch_add(1, Ordering::Relaxed),
             cap: spec.vms,
         };
-        let slot = capacity
-            .take(need, START_WAIT)
-            .await
-            .map_err(|e| format!("route {label}: {e}"))?;
+        let slot = match &held {
+            Some(held) => capacity.in_room_of(held, need),
+            None => capacity
+                .take(need, START_WAIT)
+                .await
+                .map_err(|e| format!("route {label}: {e}"))?,
+        };
         if let Some(disk) = &spec.vm.disk {
             disk.ready()
                 .await
@@ -1268,7 +1404,18 @@ impl Route {
             .then(|| Egress::new(spec.vm.egress.clone(), hosts.clone(), sink.clone(), workers));
         let named = egress.as_ref().map(|egress| (egress, name.to_string()));
         let vm = Vm::boot(&spec.vm, &place, role, slot, named).await?;
-        let mut output = ready(&vm, spec.port, spec.boot, &sink, &hosts, name).await?;
+        let mut output = match ready(&vm, spec.port, spec.boot, &sink, &hosts, name).await {
+            Ok(output) => output,
+            Err(e) => {
+                // what it wrote before it failed is on its disk all the same
+                if spec.vm.disk.is_some()
+                    && let Err(stop) = vm.stop(disk::STOP_GRACE).await
+                {
+                    eprintln!("route {label}: its VM's stop: {stop}; killed");
+                }
+                return Err(e);
+            }
+        };
         let booted = started.elapsed();
         let mut taken = None;
         let backend = match spec.mode {
@@ -1277,7 +1424,13 @@ impl Route {
                     "route {label}: VM booted, guest listening after {}ms",
                     booted.as_millis()
                 );
-                Backend::Shared(Mutex::new(Some(Arc::new(vm))))
+                let vm = Arc::new(Mutex::new(Some(Arc::new(vm))));
+                let (suspects, suspected) = mpsc::channel(1);
+                Backend::Shared {
+                    vm,
+                    suspects,
+                    unwatched: Mutex::new(Some((output, suspected))),
+                }
             }
             Mode::PerConnection | Mode::Reuse | Mode::Pool => {
                 // its clones are told they were restored: a guest predating the
@@ -1406,7 +1559,34 @@ impl Route {
             clients: Arc::default(),
             open: Arc::default(),
             taken,
+            restarts: AtomicU64::new(0),
+            down: Mutex::default(),
         })
+    }
+
+    /// Starts the watch of its shared VM, its going down told to `down`: the route is one of
+    /// those the routes know of ([`Down::route`]), so it is once it serves. What ended before
+    /// is told all the same.
+    pub fn watch(&self, down: mpsc::UnboundedSender<Down>) {
+        let Backend::Shared { vm, unwatched, .. } = &self.backend else {
+            return;
+        };
+        if let Some((output, suspected)) = unwatched.lock().unwrap().take() {
+            tokio::spawn(watched(
+                Arc::downgrade(vm),
+                self.spec.port,
+                self.spec.boot,
+                output,
+                suspected,
+                down,
+                self.need.route,
+            ));
+        }
+    }
+
+    /// What tells it from any other route, over every route the wicket ever started.
+    pub fn id(&self) -> u64 {
+        self.need.route
     }
 
     /// What its VMs are now.
@@ -1414,10 +1594,11 @@ impl Route {
         let mut vms = Vms {
             alive: self.capacity.alive(self.need.route),
             connections: self.open.load(Ordering::Relaxed),
+            restarts: self.restarts.load(Ordering::Relaxed),
             ..Vms::default()
         };
         match &self.backend {
-            Backend::Shared(vm) => vms.shared = vm.lock().unwrap().is_some(),
+            Backend::Shared { vm, .. } => vms.shared = vm.lock().unwrap().is_some(),
             Backend::Cloned { warm, kept, .. } => {
                 vms.warm = warm.clones.lock().unwrap().len();
                 vms.kept = kept
@@ -1456,25 +1637,51 @@ impl Route {
 
     /// Whether its shared VM was stopped: its connections fail from then on.
     pub fn stopped(&self) -> bool {
-        matches!(&self.backend, Backend::Shared(vm) if vm.lock().unwrap().is_none())
+        matches!(&self.backend, Backend::Shared { vm, .. } if vm.lock().unwrap().is_none())
     }
 
-    /// Stops the VM of a route with a disk, for good: what the process wrote is all on the
-    /// disk, as far as it ended within [`disk::STOP_GRACE`], and its open connections end.
-    /// It gives the disk up as it is gone (the lock tells, [`Disk::ready`]). Any other route's
-    /// VMs end with their last connection.
+    /// Why its shared VM is down, as far as told.
+    pub fn down(&self) -> Option<String> {
+        self.down.lock().unwrap().clone()
+    }
+
+    pub fn set_down(&self, why: String) {
+        *self.down.lock().unwrap() = Some(why);
+    }
+
+    /// The VMs started in the place of one that went down, this one included.
+    pub fn set_restarts(&self, restarts: u64) {
+        self.restarts.store(restarts, Ordering::Relaxed);
+    }
+
+    /// Stops its shared VM, for good ([`Route::stopping`]).
     pub async fn stop(&self) {
-        let Backend::Shared(vm) = &self.backend else {
-            return;
+        self.stopping().await;
+    }
+
+    /// Takes its shared VM out now, its connections failing from then on, and what stops it:
+    /// what the process wrote is all on the disk, as far as it ended within
+    /// [`disk::STOP_GRACE`], and its open connections end. It gives the disk up as it is gone
+    /// (the lock tells, [`Disk::ready`]). A cloned route's VMs end with their last connection.
+    pub fn stopping(&self) -> impl Future<Output = ()> + Send + 'static {
+        let vm = match &self.backend {
+            Backend::Shared { vm, .. } => vm.lock().unwrap().take(),
+            Backend::Cloned { .. } | Backend::Pool(_) => None,
         };
-        if self.spec.vm.disk.is_none() {
-            return;
+        let label = self.label();
+        async move {
+            if let Some(vm) = vm
+                && let Err(e) = vm.stop(disk::STOP_GRACE).await
+            {
+                eprintln!("route {label}: its VM's stop: {e}; killed");
+            }
         }
-        let vm = vm.lock().unwrap().take();
-        if let Some(vm) = vm
-            && let Err(e) = vm.stop(disk::STOP_GRACE).await
-        {
-            eprintln!("route {}: its VM's stop: {e}; killed", self.label());
+    }
+
+    /// Has its shared VM looked at: a connection of it failed.
+    pub fn suspect(&self) {
+        if let Backend::Shared { suspects, .. } = &self.backend {
+            let _ = suspects.try_send(());
         }
     }
 
@@ -1502,10 +1709,16 @@ impl Route {
     async fn dial(&self) -> Result<(UnixStream, Held), BoxError> {
         let trace = std::env::var_os("SLUICE_WICKET_RUNTIME_FIRECRACKER_TRACE").is_some();
         match &self.backend {
-            Backend::Shared(vm) => {
+            Backend::Shared { vm, .. } => {
                 let vm = vm.lock().unwrap().clone();
                 let vm = vm.ok_or("its VM was stopped: the route is restarting")?;
-                Ok((vm.dial(self.spec.port).await?, Held::Shared))
+                match vm.dial(self.spec.port).await {
+                    Ok(stream) => Ok((stream, Held::Shared)),
+                    Err(e) => {
+                        self.suspect();
+                        Err(e)
+                    }
+                }
             }
             Backend::Pool(pool) => {
                 let (stream, seat) = pool.open().await?;
@@ -1813,6 +2026,94 @@ mod tests {
                 expected.map_err(String::from)
             );
         }
+    }
+
+    /// What a shared VM's watch makes of what it is told: only an end it finds true, a stream
+    /// given up telling nothing; the route's end ends it.
+    #[tokio::test]
+    async fn a_shared_vm_is_down_when_its_port_refuses_too() {
+        use std::collections::VecDeque;
+
+        use crate::output::{Printer, Written};
+        use crate::wire::LogFrame;
+        use sluice_wicket_tunnel::flume::Tap;
+
+        const BOOT: Duration = Duration::from_secs(7);
+        let sink = Arc::new(Sink {
+            printer: Printer::new(Written::default(), Written::default()),
+            tap: Tap::off(),
+        });
+        let hosts = Hosts::new(&["a.local".into()]);
+        let log = || {
+            let (wicket, guest) = UnixStream::pair().unwrap();
+            let followed = output::follow(wicket, sink.clone(), hosts.clone(), "vm-0".to_string());
+            (followed, guest)
+        };
+        let exited = {
+            let mut frame = Vec::new();
+            wire::put_log_frame(&mut frame, &LogFrame::Exited);
+            frame
+        };
+        // the answers of the looks, in turn, which are asked with how long they may take
+        let answers = |looks: &[(Duration, bool)]| {
+            let looks: VecDeque<_> = looks.iter().copied().collect();
+            let looks = Arc::new(Mutex::new(looks));
+            move |within: Duration| {
+                let look = looks.lock().unwrap().pop_front();
+                async move {
+                    let (asked, answer) = look.expect("no more looks");
+                    assert_eq!(within, asked);
+                    answer
+                }
+            }
+        };
+
+        // its process ended, a look finding it refusing
+        let (followed, mut guest) = log();
+        guest.write_all(&exited).await.unwrap();
+        let (_suspects, suspected) = mpsc::channel(1);
+        let accepting = answers(&[(Duration::ZERO, false)]);
+        let why = watch(Some(followed), suspected, accepting, BOOT).await;
+        assert_eq!(why, Some("its process ended"));
+
+        // a launcher's end, a daemon accepting: then nothing told of the process again; a
+        // connection failing while it accepts, then not: down
+        let (followed, mut guest) = log();
+        guest.write_all(&exited).await.unwrap();
+        let (suspects, suspected) = mpsc::channel(1);
+        let looks = answers(&[(Duration::ZERO, true), (BOOT, true), (BOOT, false)]);
+        let (looked, mut told) = mpsc::unbounded_channel();
+        let accepting = move |within| {
+            let _ = looked.send(());
+            looks(within)
+        };
+        let watching = tokio::spawn(watch(Some(followed), suspected, accepting, BOOT));
+        told.recv().await.unwrap();
+        for _ in 0..2 {
+            suspects.send(()).await.unwrap();
+        }
+        let why = watching.await.unwrap();
+        assert_eq!(why, Some("its guest accepts no connection"));
+
+        // its VM gone: no look to take. A guest without a log stream, the route gone: no end
+        let (followed, guest) = log();
+        drop(guest);
+        let (_suspects, suspected) = mpsc::channel(1);
+        let why = watch(Some(followed), suspected, answers(&[]), BOOT).await;
+        assert_eq!(why, Some("its VM ended"));
+        let (suspects, suspected) = mpsc::channel(1);
+        drop(suspects);
+        assert_eq!(watch(None, suspected, answers(&[]), BOOT).await, None);
+
+        // a frame the wicket does not take: the stream given up, the VM alive
+        let (followed, mut guest) = log();
+        guest.write_all(&[99, 0, 0, 0, 0]).await.unwrap();
+        let (suspects, suspected) = mpsc::channel(1);
+        let watching = tokio::spawn(watch(Some(followed), suspected, answers(&[]), BOOT));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!watching.is_finished());
+        drop(suspects);
+        assert_eq!(watching.await.unwrap(), None);
     }
 
     /// The log stream in flight as the guest comes to listen is followed, not dropped:

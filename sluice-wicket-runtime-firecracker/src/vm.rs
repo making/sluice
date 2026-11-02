@@ -51,7 +51,7 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use sluice_wicket_console::env::Env;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{oneshot, watch};
@@ -97,6 +97,9 @@ const STOP_WRITES: Duration = Duration::from_secs(10);
 /// How long a guest may take to take a vsock stream: its kernel's, its process's business
 /// aside. Past it the guest is wedged, and no connection, stop or reload waits on for it.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long `/init` may take to drop a stream the process refuses.
+const REFUSAL_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The longest answer of a guest's control stream the wicket reads.
 const MAX_CONTROL_ANSWER: usize = 1024;
@@ -846,6 +849,25 @@ impl Vm {
     }
 
     /// [`Vm::dial`] retried until the guest listens on `port`, within `timeout`.
+    /// Whether the guest's process accepts on `port`: a dial alone says nothing, `/init`'s vsock
+    /// port stays open once the process listened; `/init` drops a stream the process refuses
+    /// at once. A process's first bytes, or no drop in time, are its answer.
+    pub async fn accepting(&self, port: u32) -> bool {
+        let Ok(mut stream) = self.dial(port).await else {
+            return false;
+        };
+        let mut first = [0u8];
+        let accepted = match tokio::time::timeout(REFUSAL_TIMEOUT, stream.read(&mut first)).await {
+            Err(_) | Ok(Ok(1..)) => true,
+            Ok(Ok(0) | Err(_)) => false,
+        };
+        if accepted {
+            // the process sees a client gone, not a stream cut
+            let _ = wire::write_close(&mut stream).await;
+        }
+        accepted
+    }
+
     pub async fn dial_ready(&self, port: u32, timeout: Duration) -> Result<UnixStream, BoxError> {
         let deadline = Instant::now() + timeout;
         loop {

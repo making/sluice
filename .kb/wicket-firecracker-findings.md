@@ -369,6 +369,11 @@ Through the wicket:
   0.7-0.8s). A start failing starts the old VM again, the PUT refused (with a process that never
   listens: 11.5s, the 10s of its boot's bound)
 - a growth, by `/init` at its next mount: online, 0.2s to 64 GiB
+- a shared VM going down, the sample guest on a disk, from its end to the route's listing saying
+  it is up (polled every 20ms, on the 64-core host; three runs): its process ended 0.79s (64 MiB),
+  its `firecracker` killed 0.71-0.74s (128 MiB), the journal replayed. A dial alone says nothing of the process:
+  `/init`'s vsock port stays open once the process listened, and `/init` drops the stream of a
+  connection refused, so a look reads the stream for a drop (`Vm::accepting`)
 
 ## Docker image memory
 

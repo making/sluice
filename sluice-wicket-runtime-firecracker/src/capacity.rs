@@ -28,6 +28,9 @@ pub struct Need {
     pub cap: Option<usize>,
 }
 
+/// What a hold counts as in the routes' VMs: no route's.
+const HELD: u64 = u64::MAX;
+
 /// Spare VMs a route keeps: serving no connection, and not needed for one.
 pub trait Pool: Send + Sync {
     /// Kills one spare VM, freeing its slot; false when there is none.
@@ -152,6 +155,26 @@ impl Capacity {
             .iter()
             .take_while(|(queued, _)| Some(*queued) != ticket)
             .any(|(_, need)| self.short(state, need) != Some(Short::Route))
+    }
+
+    /// The room of a VM going down, beside the budget as long as it is not gone, for the one
+    /// that comes back: its room is not taken meanwhile, for as long as that takes.
+    pub fn hold(self: &Arc<Self>, memory: u64) -> Slot {
+        let mut state = self.state.lock().unwrap();
+        self.grant(
+            &mut state,
+            Need {
+                memory,
+                route: HELD,
+                cap: None,
+            },
+        )
+    }
+
+    /// A slot for `need` whatever the budget: `held` holds its room, and goes once it has it.
+    pub fn in_room_of(self: &Arc<Self>, _held: &Slot, need: Need) -> Slot {
+        let mut state = self.state.lock().unwrap();
+        self.grant(&mut state, need)
     }
 
     /// A slot if one fits now and no VM waits for one: a warm clone's.
@@ -314,7 +337,8 @@ mod tests {
 
     /// The limits count VMs, memory and a route's VMs; a wait gets the slot
     /// a VM gives back, in the order of asking, and a warm clone only takes
-    /// room nobody waits for.
+    /// room nobody waits for. A hold keeps the room of a VM gone from them, and gives it to
+    /// the VM that comes back.
     #[tokio::test(start_paused = true)]
     async fn slots_go_in_turn_within_the_limits() {
         let capacity = Capacity::new(3, Some(1024));
@@ -357,6 +381,16 @@ mod tests {
             "and the rest"
         );
         drop((small, third));
+
+        let vm = capacity.try_take(need(1024, 5, None)).unwrap();
+        let held = capacity.hold(1024);
+        drop(vm);
+        assert!(capacity.try_take(need(64, 6, None)).is_none(), "held");
+        let back = capacity.in_room_of(&held, need(1024, 7, None));
+        assert_eq!(capacity.alive(7), 1);
+        drop(held);
+        assert_eq!(capacity.usage(), (1, 1024));
+        drop(back);
     }
 
     /// The first in line short of global room has another route's spare VM

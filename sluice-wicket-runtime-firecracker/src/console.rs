@@ -224,6 +224,8 @@ impl Console {
                         pooled: vms.pooled,
                         starting: vms.starting,
                         connections: vms.connections,
+                        restarts: vms.restarts,
+                        down: route.down().filter(|_| route.stopped()),
                     },
                     snapshot: route.taken().map(|taken| SnapshotView {
                         memory_bytes: taken.memory,
@@ -807,6 +809,8 @@ struct VmsView {
     pooled: usize,
     starting: usize,
     connections: u64,
+    restarts: u64,
+    down: Option<String>,
 }
 
 #[derive(Serialize)]

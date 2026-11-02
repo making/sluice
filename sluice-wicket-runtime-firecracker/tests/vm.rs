@@ -746,7 +746,105 @@ async fn deploy(
     let (status, same) = console(at, "PUT", "/api/apps/shop", true, body()).await;
     assert_eq!((status, same["message"].as_str()), (200, Some("no change")));
 
+    restarting_app(tunnel, wicket, &sha256, conn_id).await;
     disk_app(tunnel, wicket, &sha256, dir, conn_id, jailed).await;
+}
+
+/// How long a route's VM may take to come back.
+const RESTART: Duration = Duration::from_secs(60);
+
+/// The listing of `host` once it was restarted `times` and is up again.
+async fn restarted(wicket: &Wicket, host: &str, times: u64) -> serde_json::Value {
+    let at = wicket.console();
+    let deadline = Instant::now() + RESTART;
+    loop {
+        let (status, listing) = console(at, "GET", "/api/routes", true, Bytes::new()).await;
+        assert_eq!(status, 200, "{listing}");
+        let route = listing["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|route| route["host"] == host)
+            .unwrap_or_else(|| panic!("{host} not listed: {listing}"));
+        let vms = &route["vms"];
+        if vms["restarts"] == times && vms["shared"] == true {
+            return route.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{host}: not restarted {times} time(s): {route}; {}",
+            wicket.log()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// An app's shared VM, without a disk, its process ended: a launcher leaving a daemon listening
+/// changes nothing until the daemon goes too, which a connection failing tells; a VM of its
+/// env comes up in its place, at once, then only after a wait, as the process keeps ending.
+async fn restarting_app(
+    tunnel: &mut ServerTunnel,
+    wicket: &Wicket,
+    sha256: &str,
+    conn_id: &mut i64,
+) {
+    let at = wicket.console();
+    let app = serde_json::json!({
+        "owner": "cf",
+        "hosts": ["crash.local"],
+        "component": {"sha256": sha256, "name": "app.ext4"},
+        "sandbox": {"boot-ms": 1000, "env": {"RUN": "1"}},
+    });
+    let body = Bytes::from(app.to_string());
+    let (status, put) = console(at, "PUT", "/api/apps/crash", true, body).await;
+    assert_eq!(status, 200, "{put}; {}", wicket.log());
+    let advertised = tunnel.advertise().await;
+    let up = advertised
+        .upstreams
+        .iter()
+        .find(|up| up.host == "crash.local");
+    let address = dial_address(&up.expect("crash.local advertised").target_url);
+    let route = Route {
+        tunnel,
+        host: "crash.local",
+        address,
+        listen: None,
+    };
+    let mut next = || {
+        *conn_id += 1;
+        *conn_id
+    };
+    let boot_id = field(&route.get(next(), "/").await, "boot id").to_string();
+
+    let told = route.post(next(), "/exit?listening=1", "").await;
+    assert_eq!(told, "exited, listening\n");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let same = route.get(next(), "/").await;
+    assert_eq!(field(&same, "boot id"), boot_id, "its VM serves on");
+    let listed = restarted(wicket, "crash.local", 0).await;
+    assert_eq!(listed["vms"]["down"], serde_json::Value::Null, "{listed}");
+
+    assert_eq!(route.post(next(), "/exit", "").await, "exiting\n");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // no process: the connection fails, which has the wicket look
+    assert_eq!(route.half_closed(next()).await, "");
+    restarted(wicket, "crash.local", 1).await;
+    let again = route.get(next(), "/").await;
+    assert_ne!(field(&again, "boot id"), boot_id, "another VM");
+    assert_eq!(route.get(next(), "/env").await, "RUN=1\n");
+
+    // the next end, soon after: told at once, the VM started after a wait
+    let ended = Instant::now();
+    assert_eq!(route.post(next(), "/exit", "").await, "exiting\n");
+    restarted(wicket, "crash.local", 2).await;
+    let waited = ended.elapsed();
+    assert!(waited >= Duration::from_secs(1), "{waited:?}");
+    assert_eq!(route.get(next(), "/env").await, "RUN=1\n");
+
+    let gone = "/api/apps/crash?owner=cf";
+    let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
+    assert_eq!(status, 200, "{removed}");
+    tunnel.advertise().await;
 }
 
 /// The app `data` with `sandbox`, of the image `sha256`, on the wicket at `at`.
@@ -867,6 +965,23 @@ async fn disk_app(
     let read = on_data(tunnel, &address, conn_id, "/disk?read=b", "").await;
     assert_eq!(read, "written", "the stop wrote it out");
 
+    // its process ended: another VM on the disk, what it wrote kept, unsynced too (the stop
+    // writes it out); the next VM's exiting before it listens is tried again after a wait
+    let wrote = on_data(tunnel, &address, conn_id, "/disk?write=d", "unsynced").await;
+    assert!(wrote.starts_with("wrote "), "{wrote}");
+    let told = on_data(tunnel, &address, conn_id, "/exit", "").await;
+    assert_eq!(told, "exiting\n");
+    restarted(wicket, "data.local", 1).await;
+    let read = on_data(tunnel, &address, conn_id, "/disk?read=d", "").await;
+    assert_eq!(read, "unsynced");
+    let told = on_data(tunnel, &address, conn_id, "/exit?again=1", "").await;
+    assert_eq!(told, "exiting\n");
+    restarted(wicket, "data.local", 2).await;
+    let read = on_data(tunnel, &address, conn_id, "/disk?read=a", "").await;
+    assert_eq!(read, "fsynced");
+    let log = wicket.log();
+    assert!(log.contains("exited before it listened"), "{log}");
+
     // a start that fails, a disk nowhere to go, its file grown by then: refused, the old VM
     // started again on it, of the size the file has now
     let (status, refused) = put_data(
@@ -916,6 +1031,18 @@ async fn disk_app(
             (200, Some("restarted data.local")),
             "{put}"
         );
+        let read = on_data(tunnel, &address, conn_id, "/disk?read=a", "").await;
+        assert_eq!(read, "fsynced");
+
+        // its VM killed: another one, on what it made durable; the stops on purpose before
+        // counted none
+        let held = vms_on(wicket.child.id() as i32, &file);
+        let [vm] = held[..] else {
+            panic!("one VM on the disk: {held:?}");
+        };
+        // SAFETY: a plain kill of the wicket's child
+        assert_eq!(unsafe { libc::kill(vm, libc::SIGKILL) }, 0);
+        restarted(wicket, "data.local", 1).await;
         let read = on_data(tunnel, &address, conn_id, "/disk?read=a", "").await;
         assert_eq!(read, "fsynced");
     }
