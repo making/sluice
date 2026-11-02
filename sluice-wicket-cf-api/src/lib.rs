@@ -129,8 +129,7 @@ pub fn check_data_dir(dir: &std::path::Path) -> Result<(), String> {
         .map_err(|e| format!("--data-dir {}: {e}", dir.display()))
 }
 
-/// Binds `listen`; `loopback_only` (no provider: the API takes any
-/// credentials) refuses any other address.
+/// Binds `listen`; `loopback_only` (`--any-credentials`) refuses any other address.
 pub async fn bind(listen: &str, loopback_only: bool) -> Result<TcpListener, String> {
     let failed = |e: std::io::Error| format!("--listen {listen}: {e}");
     let resolved: Vec<SocketAddr> = tokio::net::lookup_host(listen)
@@ -139,7 +138,7 @@ pub async fn bind(listen: &str, loopback_only: bool) -> Result<TcpListener, Stri
         .collect();
     if loopback_only && resolved.iter().any(|at| !at.ip().is_loopback()) {
         return Err(format!(
-            "--listen {listen}: without --oidc-issuer the API takes any credentials, so it listens on a loopback address only"
+            "--listen {listen}: with --any-credentials the API listens on a loopback address only"
         ));
     }
     TcpListener::bind(&resolved[..]).await.map_err(failed)

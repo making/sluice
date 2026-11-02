@@ -16,8 +16,8 @@
 //! rootfs of a zip, the wicket's
 //! directory lost and the image's rootfs made again, of the digest it had; then the
 //! cf-api itself an app of that wicket, in a VM with a disk, the flume and a provider
-//! through its egress: its apps and logins kept across a restart of the VM, a wicket
-//! killed right after a push and an upgrade.
+//! through its egress: refused with no word on who logs in, its apps and logins kept
+//! across a restart of the VM, a wicket killed right after a push and an upgrade.
 
 mod registry;
 
@@ -460,12 +460,14 @@ fn the_cf_cli_deploys_to_the_wicket() {
     // a data directory it cannot write: no listener first, which a VM's /init takes for ready
     let unwritable = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-cf-api"))
         .args(["--wicket", "http://127.0.0.1:1", "--listen", "127.0.0.1:0"])
-        .args(["--data-dir", "/proc/sluice-cf-api"])
+        .args(["--any-credentials", "--data-dir", "/proc/sluice-cf-api"])
         .output()
         .unwrap();
     assert!(!unwritable.status.success());
     let said = String::from_utf8_lossy(&unwritable.stdout);
     assert!(!said.contains("listening on"), "{said}");
+    let why = String::from_utf8_lossy(&unwritable.stderr);
+    assert!(why.contains("--data-dir /proc/sluice-cf-api"), "{why}");
     let hello = std::fs::read(guests.join("hello.wasm")).unwrap();
     std::fs::write(dir.join("app/hello.wasm"), &hello).unwrap();
     std::fs::write(dir.join("app2/hello.wasm"), variant(&hello)).unwrap();
@@ -511,7 +513,13 @@ fn the_cf_cli_deploys_to_the_wicket() {
         .unwrap()
         .port();
     let api_listen = format!("127.0.0.1:{port}");
-    let (mut api, url) = start_api(&api_listen, &console, &flume_url, &dir.join("cf"), &[]);
+    let (mut api, url) = start_api(
+        &api_listen,
+        &console,
+        &flume_url,
+        &dir.join("cf"),
+        &["--any-credentials"],
+    );
     let provider = MockProvider::start("cf-api", "s3");
     let http = Http::new();
     let cf = Cf {
@@ -809,7 +817,13 @@ fn the_cf_cli_deploys_to_the_wicket() {
 
     // a lost state (a new data directory): the wicket's apps of the owner stay, and the
     // log says so
-    let (lost, _) = start_api(&api_listen, &console, &flume_url, &dir.join("cf-lost"), &[]);
+    let (lost, _) = start_api(
+        &api_listen,
+        &console,
+        &flume_url,
+        &dir.join("cf-lost"),
+        &["--any-credentials"],
+    );
     let left = lost.line("CELL: ");
     assert!(left.contains("left in the wicket"), "{left}");
     assert_eq!(listing(&console)["generation"], generation);
@@ -1272,7 +1286,11 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         &console,
         &flume_url,
         &dir.join("cf"),
-        &["--security-group-editor", "user_name=me"],
+        &[
+            "--any-credentials",
+            "--security-group-editor",
+            "user_name=me",
+        ],
     );
     let cf = Cf {
         cli: cf_cli(),
@@ -1669,7 +1687,17 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         )
     };
     let sha256 = made(&cf_api);
+    // no provider and nothing saying who logs in: nothing starts, its VM's loopback or not
     let (status, put) = put_cf_api(&sha256, json!({}));
+    assert_eq!(status, 422, "{put}");
+    assert!(
+        put.to_string().contains("exited before it listened"),
+        "{put}"
+    );
+    let (status, put) = put_cf_api(
+        &sha256,
+        json!({"SLUICE_WICKET_CF_API_ANY_CREDENTIALS": "true"}),
+    );
     assert_eq!(status, 200, "{put}");
     assert_eq!(put["message"], "added 127.0.0.1");
     let vm_url = format!("http://127.0.0.1:{}", port_of(&listen));
@@ -1719,7 +1747,10 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         }
     };
     let generation = listing(&console)["generation"].as_u64().unwrap();
-    let (status, put) = put_cf_api(&sha256, json!({"RESTART": "1"}));
+    let (status, put) = put_cf_api(
+        &sha256,
+        json!({"SLUICE_WICKET_CF_API_ANY_CREDENTIALS": "true", "RESTART": "1"}),
+    );
     assert_eq!(status, 200, "{put}");
     assert_eq!(put["message"], "restarted 127.0.0.1");
     answers();

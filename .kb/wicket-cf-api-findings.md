@@ -10,6 +10,14 @@ The cf-api in a VM of the wicket, on its disk (its README,
 - an upgrade: the new one boots on the disk: 0.7-0.8s of no API. A new image that does not start is
   refused (422, 11.5s)
 
+## Who logs in
+
+Neither `--oidc-issuer` nor `--any-credentials`: no start, on a host as in a VM. A flag, not
+finding out it is in a VM: what the loopback check misses is any relay to the loopback (a
+Firecracker wicket's route, a sluice client, a proxy), and a VM's marker would name the first
+alone. On the wicket's side, a route served to loopback peers only would refuse the README's setup
+too: a port Docker publishes does not come from its loopback, nor a tunnel's connection.
+
 ## Security groups
 
 A guest takes 1024 bytes of rules (`vm::MAX_EGRESS`), so that is the bound of a port range too,

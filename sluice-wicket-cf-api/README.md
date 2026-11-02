@@ -4,8 +4,8 @@ A Cloud Foundry API facade for one sluice wicket: the subset of the Cloud Contro
 UAA token endpoints and log-cache's read API the stock `cf` CLI uses, on one origin. It keeps the
 desired state of its apps and has the wicket serve them through the wicket's app API, so routes,
 scaling, rolling updates, stop and start and `cf logs` work as the CLI expects. Users log in
-through an OpenID Provider (`cf login --sso`; see [Login](#login)), or, on the loopback, with any
-credentials.
+through an OpenID Provider (`cf login --sso`; see [Login](#login)), or, with `--any-credentials`,
+on the loopback with any credentials.
 
 What `cf push` deploys depends on the wicket, whose listing names its runtime:
 
@@ -55,9 +55,9 @@ sluice-wicket-runtime-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090 --co
 
 # the cf-api, on http://127.0.0.1:9091
 target/release/sluice-wicket-cf-api --wicket http://127.0.0.1:9090 --wicket-token SECRET \
-  --flume grpc://127.0.0.1:8002 --flume-token FLUME_SECRET
+  --flume grpc://127.0.0.1:8002 --flume-token FLUME_SECRET --any-credentials
 
-cf login -a http://127.0.0.1:9091 -u me -p x   # any credentials: no --oidc-issuer (see Login)
+cf login -a http://127.0.0.1:9091 -u me -p x   # any credentials: --any-credentials (see Login)
 cf push hello -p hello/                        # hello/ holds hello.wasm (a wasi:http 0.3 component)
 curl http://hello.localhost:8080/              # the wicket's --listen; *.localhost is the loopback
 # an image (see Images): the wicket's hello example, as its CI publishes it
@@ -345,6 +345,7 @@ curl -sS -X PUT -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9090/api/apps
     "disk-mib": 4096,
     "egress": ["localhost:9090", "flume:8002"],
     "env": {
+      "SLUICE_WICKET_CF_API_ANY_CREDENTIALS": "true",
       "SLUICE_WICKET_CF_API_WICKET": "http://localhost:9090",
       "SLUICE_WICKET_CF_API_WICKET_TOKEN": "$TOKEN",
       "SLUICE_WICKET_CF_API_FLUME": "grpc://flume:8002",
@@ -400,12 +401,13 @@ curl http://web.localhost:8080/
 
 ### Operating it
 
-- **who reaches it**: without a provider the cf-api takes any credentials, and that it listens on
-  its VM's loopback protects nothing here: the wicket relays its route to whoever reaches
-  `--listen`, or the sluice server with `--server`, saying `Host: cf.localhost`. Keep them on the
-  host's loopback as above until it has a provider: `..._OIDC_ISSUER`, `..._OIDC_CLIENT_ID`,
-  `..._OIDC_CLIENT_SECRET`, `..._OIDC_CLAIM` in `env` (see [Login](#login)), the provider's
-  `host:port` in `egress`. Then `-p 8080:8080`, `cf login --sso`
+- **who reaches it**: `..._ANY_CREDENTIALS` lets whoever reaches the cf-api log in and deploy, and
+  that it listens on its VM's loopback protects nothing here: the wicket relays its route to whoever
+  reaches `--listen`, or the sluice server with `--server`, saying `Host: cf.localhost`. Keep them on
+  the host's loopback as above until it has a provider: `..._OIDC_ISSUER`, `..._OIDC_CLIENT_ID`,
+  `..._OIDC_CLIENT_SECRET`, `..._OIDC_CLAIM` in `env` in place of `..._ANY_CREDENTIALS` (see
+  [Login](#login)), the provider's `host:port` in `egress`. Then `-p 8080:8080`, `cf login --sso`.
+  With neither it does not start: the PUT is refused (422), `docker logs wicket` saying why
 - **jail mode**, for tenants on the wicket: in `docker run`, `-u 0 --cap-add SYS_ADMIN --security-opt
   apparmor=unconfined --security-opt seccomp=unconfined` for `--group-add`, and `--jail-ids
   900000-900127 --jail-user nonroot` (see the wicket's
@@ -668,7 +670,7 @@ cf restart blog
 
 | option | |
 |---|---|
-| `--listen <host:port>` | bind address (default `127.0.0.1:9091`); without `--oidc-issuer` a loopback address only, as the API takes any credentials then |
+| `--listen <host:port>` | bind address (default `127.0.0.1:9091`); with `--any-credentials` a loopback address only |
 | `--wicket <url>` | the wicket's console, `http://host:port` |
 | `--wicket-token <token>` / `--wicket-token-file <path>` | its `--console-token` |
 | `--domain <name>` | a shared domain; repeatable (or comma-separated): the first takes the default and random routes (default `localhost`). Through a sluice server, a suffix whose wildcard DNS reaches it |
@@ -677,6 +679,7 @@ cf restart blog
 | `--flume <url>` | the sluice-flume the wicket feeds (`grpc://host:port` / `grpcs://host:port`): the apps' output and requests reach `cf logs` from it |
 | `--flume-token <token>` / `--flume-token-file <path>` | its bearer token |
 | `--flume-ca-cert <path>` / `--flume-insecure` | a `grpcs://` flume verified against this PEM CA (default the webPKI roots), or not at all |
+| `--any-credentials` | no provider: whoever reaches the API logs in and deploys (see [Login](#login)). This or `--oidc-issuer` is required |
 | `--oidc-issuer <url>` | the OpenID Provider users log in through (`cf login --sso`); its discovery document is at `<url>/.well-known/openid-configuration` |
 | `--oidc-client-id <id>` | the client registered with the provider, whose redirect URI is `<API URL>/uaa/callback` (required with `--oidc-issuer`) |
 | `--oidc-client-secret <secret>` / `--oidc-client-secret-file <path>` | its secret; none = a public client (PKCE only) |
@@ -691,8 +694,8 @@ cf restart blog
 
 Each option also reads `SLUICE_WICKET_CF_API_<NAME>` from the environment. The image
 `ghcr.io/making/sluice/sluice-wicket-cf-api` (`latest` / `<sha>`, built from
-`Dockerfile` at the repository root) keeps `/data` as the working directory; without
-`--oidc-issuer` it listens on the loopback, so it is reached from the wicket's network
+`Dockerfile` at the repository root) keeps `/data` as the working directory; with
+`--any-credentials` it listens on the loopback, so it is reached from the wicket's network
 namespace (`--network host`, a sidecar, `kubectl port-forward`).
 
 ## Mapping
@@ -761,11 +764,14 @@ What holds on both wickets; a component's and a VM's are in
 The cf-api is its own UAA: `POST /uaa/oauth/token` answers a JWT (HS256) signed with the key in
 `--data-dir` (`jwt.key`), good for 12 hours, with a refresh token good for 30 days and once: a
 refresh answers a new pair and the old refresh token is spent (`sessions.json` keeps the logins,
-so they outlive a restart). Who gets a token:
+so they outlive a restart). Who gets a token is said at the start, one or the other, or it does
+not start:
 
-- without `--oidc-issuer`, anyone: the password, client_credentials and refresh_token grants
-  take any credentials (`cf login -u me -p x`). That is why the listener then binds a loopback
-  address only
+- with `--any-credentials`, anyone: the password, client_credentials and refresh_token grants
+  take any credentials (`cf login -u me -p x`). The listener then binds a loopback address only,
+  which guards nothing once something relays to it: a route of a Firecracker wicket it runs in, a
+  sluice client, a proxy. The cf-api cannot tell, so the flag is required wherever it runs, and who
+  reaches it is yours to keep
 - with `--oidc-issuer`, the users an OpenID Provider signs in and the clients configured. The
   listener may bind any address, with TLS of its own (`--tls-cert`, `--tls-key`) or behind a
   TLS proxy:

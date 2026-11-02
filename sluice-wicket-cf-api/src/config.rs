@@ -12,8 +12,8 @@ use crate::{Settings, TlsSettings};
 pub const USAGE: &str = "\
 usage: sluice-wicket-cf-api --wicket <url> [options]
 
-  --listen <host:port>        bind address (default 127.0.0.1:9091); without --oidc-issuer a
-                              loopback address only: the API takes any credentials then
+  --listen <host:port>        bind address (default 127.0.0.1:9091); with --any-credentials a
+                              loopback address only
   --wicket <url>              the wicket's console, http://host:port
   --wicket-token <token>      its --console-token
   --wicket-token-file <path>  read the token from a file instead
@@ -29,6 +29,9 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
   --flume-token-file <path>   read the token from a file instead
   --flume-ca-cert <path>      PEM CA verifying a grpcs:// flume (default the webPKI roots)
   --flume-insecure            skip the verification of a grpcs:// flume
+  --any-credentials           no provider: whoever reaches the API logs in and deploys, any
+                              relay to its loopback included (a wicket's route, a tunnel, a
+                              proxy). This or --oidc-issuer is required
   --oidc-issuer <url>         the OpenID Provider users log in through (cf login --sso);
                               its discovery is at <url>/.well-known/openid-configuration
   --oidc-client-id <id>       the client registered with it, whose redirect URI is
@@ -114,6 +117,7 @@ pub fn parse(
     let mut given: HashMap<&str, Vec<String>> = HashMap::new();
     let mut exit_on_stdin_close = false;
     let mut flume_insecure = false;
+    let mut any_credentials = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -121,6 +125,7 @@ pub fn parse(
             "-V" | "--version" => return Ok(Command::Version),
             "--exit-on-stdin-close" => exit_on_stdin_close = true,
             "--flume-insecure" => flume_insecure = true,
+            "--any-credentials" => any_credentials = true,
             _ => {
                 let (name, inline) = match arg.strip_prefix("--").map(|rest| rest.split_once('=')) {
                     Some(Some((name, value))) => (name, Some(value.to_string())),
@@ -306,6 +311,21 @@ pub fn parse(
         (false, false) => None,
         _ => return Err("--tls-cert and --tls-key go together".into()),
     };
+    let any_credentials = any_credentials
+        || env("SLUICE_WICKET_CF_API_ANY_CREDENTIALS").is_some_and(|value| value == "true");
+    match (&oidc, any_credentials) {
+        (None, false) => {
+            return Err(
+                "who logs in is not said: --oidc-issuer for an OpenID Provider, or --any-credentials for whoever reaches the API, any relay to its loopback included (a wicket's route, a tunnel, a proxy)".into(),
+            );
+        }
+        (Some(_), true) => {
+            return Err(
+                "--any-credentials goes without --oidc-issuer: with it the provider says who logs in".into(),
+            );
+        }
+        _ => {}
+    }
     Ok(Command::Serve(Box::new(Config {
         listen: value("listen").unwrap_or_else(|| "127.0.0.1:9091".to_string()),
         exit_on_stdin_close: exit_on_stdin_close
@@ -419,13 +439,13 @@ mod tests {
         );
         assert!(config.settings.tls.is_none());
         let config = serve(parse(
-            args("--wicket http://w:1 --domain x.io --domain y.io,Z.io."),
+            args("--wicket http://w:1 --any-credentials --domain x.io --domain y.io,Z.io."),
             |_| None,
         ));
         assert_eq!(config.settings.domains, ["x.io", "y.io", "z.io"]);
         let config = serve(parse(
             args("--wicket http://w:1 --exit-on-stdin-close"),
-            |_| None,
+            |name| (name == "SLUICE_WICKET_CF_API_ANY_CREDENTIALS").then(|| "true".to_string()),
         ));
         assert_eq!(config.settings.domains, ["localhost"]);
         assert!(config.exit_on_stdin_close);
@@ -479,6 +499,14 @@ mod tests {
                 .contains("not a client of --client-credentials")
         );
         assert!(error("--wicket http://w:1 --tls-key k.pem").contains("go together"));
+        // who logs in is said, wherever it runs: nothing tells what relays to its loopback
+        for named in ["--oidc-issuer", "--any-credentials"] {
+            assert!(error("--wicket http://w:1").contains(named));
+        }
+        assert!(
+            error(&format!("{oidc} --oidc-claim email=* --any-credentials"))
+                .contains("--any-credentials goes without --oidc-issuer")
+        );
         assert!(matches!(
             parse(args("--wicket http://w:1 --help"), none),
             Ok(Command::Help)

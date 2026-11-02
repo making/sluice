@@ -54,7 +54,7 @@ listed() {
   curl -sS -H "$auth" "$api/api/apps" |
     python3 -I -c 'import json,sys;print(sorted(a["owner"] for a in json.load(sys.stdin)["apps"]))'
 }
-common="\"SLUICE_WICKET_CF_API_WICKET\":\"http://localhost:$console\",\"SLUICE_WICKET_CF_API_WICKET_TOKEN\":\"$token\""
+common="\"SLUICE_WICKET_CF_API_ANY_CREDENTIALS\":\"true\",\"SLUICE_WICKET_CF_API_WICKET\":\"http://localhost:$console\",\"SLUICE_WICKET_CF_API_WICKET_TOKEN\":\"$token\""
 
 echo "1. the default data directory: the rootfs is read-only"
 expect "refused" "$(put_cf_api "{$common}")" "guest not listening"
