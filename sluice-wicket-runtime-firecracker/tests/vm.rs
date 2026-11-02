@@ -390,8 +390,15 @@ async fn every_route_serves_http_through_the_tunnel() {
     match (jailed, &image) {
         // the image's keeper in the container's cgroup, the wicket its nonroot user
         (true, Some(_)) => jails(&wicket, None, NONROOT),
-        // SAFETY: getuid
-        (true, None) => jails(&wicket, Some(&cgroup), unsafe { libc::getuid() }),
+        (true, None) => {
+            assert!(
+                tokio::time::timeout(HANG, settled(&wicket)).await.is_ok(),
+                "the VMs did not settle: {}",
+                wicket.log()
+            );
+            // SAFETY: getuid
+            jails(&wicket, Some(&cgroup), unsafe { libc::getuid() })
+        }
         // the wicket's seccomp filter, on the test's (if any)
         (false, None) => assert_eq!(
             filters(wicket.child.id() as i32),
@@ -706,6 +713,37 @@ fn filters(pid: i32) -> u32 {
     status(pid, "Seccomp_filters:").parse().unwrap_or(0)
 }
 
+/// The keeper's children: its VMs (an id of `JAIL_IDS`), and the others.
+fn jailed_children(keeper: i32) -> (Vec<i32>, Vec<i32>) {
+    children(keeper).into_iter().partition(|pid| {
+        let uid: u32 = status(*pid, "Uid:")
+            .split_whitespace()
+            .next()
+            .and_then(|uid| uid.parse().ok())
+            .unwrap_or(0);
+        (JAIL_IDS.0..=JAIL_IDS.1).contains(&uid)
+    })
+}
+
+/// Until `deploy`'s connection's clone is gone (it ends after the connection, its output
+/// first) and the keeper's VMs are the ones the budget counts (it counts one no longer once
+/// it asked for its end): `jails` reads each VM, and one ending fails it.
+async fn settled(wicket: &Wicket) {
+    let keeper = wicket.keeper();
+    loop {
+        let (_, listing) =
+            console(wicket.console(), "GET", "/api/routes", true, Bytes::new()).await;
+        let routes = listing["routes"].as_array().unwrap();
+        let deployed = routes.iter().find(|route| route["host"] == "console.local");
+        let clones = &deployed.expect("console.local listed")["vms"];
+        let vms = jailed_children(keeper).0.len() as u64;
+        if clones["alive"] == 1 && clones["warm"] == 1 && listing["budget"]["vms"] == vms {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// The jails of the VMs alive (the shared VM and the warm clones): each a
 /// `firecracker` of an id of its own, PID 1 of its namespace, without capability or
 /// new privileges, its seccomp filter on, in a cgroup of the keeper's limiting its
@@ -731,14 +769,7 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
         own.strip_suffix("/keeper").unwrap_or(&own).to_string()
     });
     let user = user.to_string();
-    let (vms, others): (Vec<i32>, Vec<i32>) = children(keeper).into_iter().partition(|pid| {
-        let uid: u32 = status(*pid, "Uid:")
-            .split_whitespace()
-            .next()
-            .and_then(|uid| uid.parse().ok())
-            .unwrap_or(0);
-        (JAIL_IDS.0..=JAIL_IDS.1).contains(&uid)
-    });
+    let (vms, others) = jailed_children(keeper);
     assert!(
         vms.len() >= 2,
         "the shared VM and warm clones: {vms:?}; {}",

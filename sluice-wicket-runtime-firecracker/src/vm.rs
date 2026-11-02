@@ -784,12 +784,12 @@ pub fn log_tail(path: &Path) -> String {
     )
 }
 
-/// No serial console unless `SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE` is set (the kernel's and
+/// No serial console unless `SLUICE_WICKET_RUNTIME_FIRECRACKER_SERIAL_CONSOLE` is set (the kernel's and
 /// `/init`'s own output then goes to the VM's log; the processes' goes to the wicket's
 /// stdout / stderr regardless): printing to it is the slowest part of a boot. The route's
 /// `egress`, if any, for `/init`, and that its env is coming (`env`).
 fn boot_args(egress: &[Rule], env: bool) -> String {
-    let console = match std::env::var_os("SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE") {
+    let console = match std::env::var_os("SLUICE_WICKET_RUNTIME_FIRECRACKER_SERIAL_CONSOLE") {
         Some(_) => "console=ttyS0",
         None => "console=none 8250.nr_uarts=0",
     };

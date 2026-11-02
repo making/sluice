@@ -59,7 +59,7 @@ pub fn vm_overhead_mib(mem: u64) -> u64 {
 }
 
 /// A VM's log at most (`RLIMIT_FSIZE`; past it Firecracker ends the VM): its own lines,
-/// and its guest's console with `SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE` (or a
+/// and its guest's console with `SLUICE_WICKET_RUNTIME_FIRECRACKER_SERIAL_CONSOLE` (or a
 /// guest re-enabling its serial device).
 const LOG_MIB: u64 = 16;
 

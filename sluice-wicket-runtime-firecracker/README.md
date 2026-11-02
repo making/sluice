@@ -83,15 +83,17 @@ Two Cargo workspaces:
   `reaper.rs` PID 1's reaping; `guest/src/wire.rs` is a copy of `src/wire.rs`: keep them
   alike; `src/bin/sample-process.rs` what the tests' images run
 - `scripts/` -- `build-guest.sh` (the sample rootfs), `cnb-rootfs.sh` (an OCI image's),
-  `guest.sh` (the guest, which both build), `try.sh` (the debug build on `--listen`)
+  `guest.sh` (the guest, which both build), `try.sh` (the debug build on `--listen`),
+  `lima.sh` (a command in a VM of a Mac, see [On a Mac](#on-a-mac))
 - `tests/vm.rs` -- the VM test (see [Tests](#tests))
 
 ## Setup
 
 x86_64 or aarch64 Linux with KVM (bare metal, or a VM with nested virtualization):
 `/dev/kvm` must exist. Ubuntu 24.04 on x86_64 was used; the versions below are the ones
-tested (aarch64: see [aarch64](#aarch64)). The [Docker image](#docker-image) holds steps 2
-and 3. A host serving others: also [Host setup](#host-setup).
+tested (aarch64: see [aarch64](#aarch64); a Mac: [On a Mac](#on-a-mac)). The
+[Docker image](#docker-image) holds steps 2 and 3. A host serving others: also
+[Host setup](#host-setup).
 
 1. Access to `/dev/kvm` through the `kvm` group (an ACL set by hand is rewritten by udev):
 
@@ -207,7 +209,7 @@ command line every user of the host sees it), `--client-id`, `--ca-cert`,
 connections ended; a second signal ends at once). Each also reads
 `SLUICE_WICKET_RUNTIME_FIRECRACKER_<NAME>` from the environment, e.g. `SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN`.
 
-`SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE=1` gives the VMs a serial console, the kernel's and
+`SLUICE_WICKET_RUNTIME_FIRECRACKER_SERIAL_CONSOLE=1` gives the VMs a serial console, the kernel's and
 `/init`'s own output into each VM's `firecracker.log` (the processes' reaches the wicket
 regardless, see [Output](#output-and-the-live-access-log));
 `SLUICE_WICKET_RUNTIME_FIRECRACKER_TRACE=1` logs each clone's restore time.
@@ -673,7 +675,7 @@ What applies, in both modes unless said:
   and in jail mode on each jail before its `firecracker`; the keeper runs under the same but
   for the jails' namespace and mount calls
 - **the serial console and the logs**: the VMs boot with `8250.nr_uarts=0` (the console
-  only with `SLUICE_WICKET_RUNTIME_FIRECRACKER_CONSOLE`), which a guest's root may undo. A
+  only with `SLUICE_WICKET_RUNTIME_FIRECRACKER_SERIAL_CONSOLE`), which a guest's root may undo. A
   VM's log (`firecracker.log` in the state dir, on a tmpfs: memory) is bounded at 16 MiB
   (`RLIMIT_FSIZE`, a template's at its `mem` more for its snapshot; past it Firecracker
   ends the VM), and a VM dumps no core (of its memory)
@@ -800,6 +802,26 @@ aarch64 host:
 - **VMGenID and vsock** are as on x86_64 (Firecracker gives an aarch64 VM its VMGenID
   through the device tree)
 
+### On a Mac
+
+macOS has no KVM, but an Apple silicon Mac (M3 or later, macOS 15 or later) runs Linux with
+nested virtualization, whose `/dev/kvm` boots Firecracker. OrbStack's containers and machines
+have no `/dev/kvm`; Lima's `vz` VMs with `--nested-virt` do. `scripts/lima.sh` makes such a
+VM (`brew install lima`; Ubuntu 24.04, the CI's tools, the release and the kernel above) at
+its first run, copies the work tree into it at each, and runs a command there:
+
+```text
+scripts/lima.sh                     # the VM test
+scripts/lima.sh env SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL=1 cargo test --locked --test vm
+scripts/lima.sh bash -c 'cargo build --locked && scripts/build-guest.sh'
+limactl shell sluice-firecracker    # a shell; the copy is ~/sluice
+limactl delete -f sluice-firecracker
+```
+
+From the VM a sluice server on the Mac is `grpc://host.lima.internal:8001`; a port the wicket
+listens at on the VM's loopback (`--listen`, `--console`) is forwarded to the Mac's. A Mac's
+timings say nothing of a real host (see [Findings](#findings)).
+
 ## Tests
 
 ```text
@@ -841,7 +863,8 @@ wicket's filter.
 The CI runs it on an x86_64 and an aarch64 runner, where the runner exposes `/dev/kvm`,
 with the Firecracker release and the kernel above pinned, and again jailed, on the runner
 and in the image; a runner without `/dev/kvm` still builds both arches' guests and its
-arch's image.
+arch's image. `ubuntu-24.04-arm` has none: the test passes there without a VM, so run it
+on a Mac ([On a Mac](#on-a-mac)) when changing what differs on aarch64.
 
 ## Findings
 
@@ -1067,12 +1090,21 @@ plus its snapshot on the tmpfs (128 MiB, `mem`):
   `mount`, `umount2` pass), and its AppArmor profile mounts: jail mode runs unconfined in a
   container.
 
-[aarch64](#aarch64) had no machine of its own: the VM test ran on an emulated one -- QEMU
-8.2 TCG (`-M virt,virtualization=on,gic-version=3 -cpu max,pauth-impdef=on`), Ubuntu 24.04
-arm64, whose KVM ran Firecracker v1.17.0 and the 6.18.56 kernel -- with the wicket's boot and
-restore timeouts raised to its pace (a guest boots in about 6s), and passed plain and jailed:
-the clones' clock and random state, the half-close framing, the output, the reloads, the
-jails. Its timings say nothing of a real host.
+[aarch64](#aarch64) first ran on an emulated machine -- QEMU 8.2 TCG (`-M
+virt,virtualization=on,gic-version=3 -cpu max,pauth-impdef=on`), Ubuntu 24.04 arm64, whose KVM
+ran Firecracker v1.17.0 and the 6.18.56 kernel -- with the wicket's boot and restore timeouts
+raised to its pace (a guest boots in about 6s), and passed plain and jailed: the clones' clock
+and random state, the half-close framing, the output, the reloads, the jails. Its timings say
+nothing of a real host.
+
+Then on an M4 Max, macOS 26.3 ([On a Mac](#on-a-mac): Lima 2.1, `vz`, 8 vCPUs, Ubuntu 24.04's
+6.8 kernel at EL2, KVM's vGICv3), at the wicket's own timeouts: the VM test plain, jailed and
+through the image, and a sluice server on the Mac serving a shared VM and clones over its tunnel
+(http/1.1, h2c, a 5MB POST).
+
+- **Boots contend under nested virtualization**: a guest alone is listening after about 1s, and
+  four started at once after about 4.5s. The kernel's clock at one point of its boot read
+  0.43s alone, 0.74s for 2 at once, 1.83s for 4, 4.74s for 8, the VM's vCPUs not all busy.
 
 - **A clone's clock is its snapshot's without the notice's time**: 46.6s behind there (the
   snapshot taken at startup), within the test's second with it.
