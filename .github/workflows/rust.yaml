@@ -44,6 +44,7 @@ jobs:
       build-info: ${{ steps.filter.outputs.build-info }}
       oidc: ${{ steps.filter.outputs.oidc }}
       console: ${{ steps.filter.outputs.console }}
+      registry: ${{ steps.filter.outputs.registry }}
       tunnel: ${{ steps.filter.outputs.tunnel }}
       flume: ${{ steps.filter.outputs.flume }}
       wicket: ${{ steps.filter.outputs.wicket }}
