@@ -48,7 +48,6 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.microsoft.playwright.Browser;
 import com.microsoft.playwright.BrowserContext;
-import com.microsoft.playwright.BrowserType;
 import com.microsoft.playwright.Page;
 import com.microsoft.playwright.Playwright;
 import com.microsoft.playwright.Response;
@@ -384,9 +383,7 @@ class ForceHttp1MisdirectedE2ETest {
 	@Test
 	void aBrowserReachesAForceHttp1RouteOnceItsGateOpened() {
 		try (Playwright playwright = Playwright.create();
-				Browser browser = playwright.chromium()
-					.launch(new BrowserType.LaunchOptions()
-						.setArgs(List.of("--host-resolver-rules=MAP " + H1_HOST + " 127.0.0.1")));
+				Browser browser = Chromium.launch(playwright, "--host-resolver-rules=MAP " + H1_HOST + " 127.0.0.1");
 				BrowserContext context = browser.newContext(new Browser.NewContextOptions().setIgnoreHTTPSErrors(true));
 				Page page = context.newPage()) {
 			String url = "https://" + H1_HOST + ":" + dataPort + "/";

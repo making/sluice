@@ -4,7 +4,7 @@ TCP tunnel over a single gRPC bidirectional stream; the HTTP reverse proxy is it
 
 ## Layout
 
-Maven multi-module. Build + test with `./mvnw verify` (JDK 25, a Rust toolchain and `protoc`
+Maven multi-module. Build + test with `./mvnw verify` (JDK 25, a Rust toolchain, `cc` and `protoc`
 required: `sluice-it` builds `sluice-flume` with cargo). Always run
 the reactor build from the root: `./mvnw -pl <module>` resolves the other modules from
 stale `~/.m2` snapshots and fails with misleading `NoSuchMethodError`s.
@@ -38,7 +38,7 @@ The data plane relays raw bytes (the request head is inspected for routing; ever
 - Native image (`-Pnative`, client/server): console view records are rendered via Mustache reflection -- when adding/renaming a record under `console/web`, register it in `sluice-server/src/main/resources/META-INF/native-image/am.ik.sluice/sluice-server/reflect-config.json`. Build args go in `META-INF/native-image/am.ik.sluice/<module>-netty/native-image.properties`: Spring AOT overwrites the one under `am.ik.sluice/<module>`. `./mvnw -pl sluice-client -am -PnativeTest test -Dtest=<class>` runs a test on a native image (CI runs `DirectBufferReleaseTest` so).
 - Tests that need a port before the server starts take it from `TestPorts.freePort()` (sluice-it), never by probing `new ServerSocket(0)` and closing it: the OS may hand that port out again.
 - `sluice-it` classes run in 6 surefire forks at once (`-Dsluice.it.forks=N`), one class at a time per fork: a test must not depend on a quiet machine or on state outside its JVM (ports only via `TestPorts`, which reserves them across JVMs).
-- Console E2E tests use Playwright (`ConsoleE2ETest`); the first run downloads Chromium.
+- Console E2E tests use Playwright (`ConsoleE2ETest`); the first run downloads Chromium. Launch it through `Chromium.launch` (sluice-it), never `playwright.chromium().launch()`: a browser that sees the host's interfaces fails a request with `net::ERR_NETWORK_CHANGED` when another fork's container starts or stops.
 - Tests needing a flume run `sluice-flume` as a child process via `Flume.start()` (sluice-it), one per class; it exits with the JVM (stdin EOF).
 - `.todo` numbers come from `.todo/claim-number.sh`.
 

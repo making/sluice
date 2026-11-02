@@ -61,7 +61,7 @@ class NoRouteE2ETest {
 	@BeforeAll
 	void setUp() {
 		this.playwright = Playwright.create();
-		this.browser = this.playwright.chromium().launch();
+		this.browser = Chromium.launch(this.playwright);
 	}
 
 	@AfterAll

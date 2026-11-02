@@ -7,6 +7,7 @@ import java.nio.file.Path;
 import java.security.KeyStore;
 import java.util.concurrent.TimeUnit;
 
+import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 
@@ -38,6 +39,19 @@ public final class TestKeystore {
 		}
 		keystore.toFile().deleteOnExit();
 		return keystore;
+	}
+
+	/** A server context presenting the keystore's certificate. */
+	public static SSLContext serverContext(Path keystore) throws Exception {
+		KeyStore keyStore = KeyStore.getInstance("PKCS12");
+		try (InputStream in = Files.newInputStream(keystore)) {
+			keyStore.load(in, PASSWORD.toCharArray());
+		}
+		KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+		keyManagerFactory.init(keyStore, PASSWORD.toCharArray());
+		SSLContext sslContext = SSLContext.getInstance("TLS");
+		sslContext.init(keyManagerFactory.getKeyManagers(), null, null);
+		return sslContext;
 	}
 
 	/** A client context trusting the keystore's certificate. */

@@ -209,7 +209,7 @@ class ConsoleE2ETest {
 		// the server is up without its flume: the feed redials until it comes
 		flume = Flume.start(flumePort);
 		this.playwright = Playwright.create();
-		this.browser = this.playwright.chromium().launch();
+		this.browser = Chromium.launch(this.playwright);
 	}
 
 	/** Accepts connections and keeps each open until the peer closes it. */

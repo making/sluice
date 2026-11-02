@@ -162,7 +162,7 @@ class ConsolePeerBuildE2ETest {
 				.stream()
 				.allMatch(id -> this.sessions.find(id).map(TunnelSession::advertised).orElse(false)));
 		this.playwright = Playwright.create();
-		this.browser = this.playwright.chromium().launch();
+		this.browser = Chromium.launch(this.playwright);
 	}
 
 	/** Opens a raw tunnel stream as the given client and waits for the ack. */

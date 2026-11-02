@@ -129,4 +129,44 @@
 		</plugins>
 	</build>
 
+	<profiles>
+		<profile>
+			<!-- What Chromium.java preloads into the browser tests' Chromium. -->
+			<id>no-netlink</id>
+			<activation>
+				<os>
+					<name>Linux</name>
+				</os>
+			</activation>
+			<build>
+				<plugins>
+					<plugin>
+						<groupId>org.codehaus.mojo</groupId>
+						<artifactId>exec-maven-plugin</artifactId>
+						<executions>
+							<execution>
+								<id>build-no-netlink</id>
+								<phase>process-test-classes</phase>
+								<goals>
+									<goal>exec</goal>
+								</goals>
+								<configuration>
+									<skip>${skipTests}</skip>
+									<executable>cc</executable>
+									<arguments>
+										<argument>-shared</argument>
+										<argument>-fPIC</argument>
+										<argument>-o</argument>
+										<argument>${project.build.directory}/no-netlink.so</argument>
+										<argument>${project.basedir}/src/test/c/no-netlink.c</argument>
+									</arguments>
+								</configuration>
+							</execution>
+						</executions>
+					</plugin>
+				</plugins>
+			</build>
+		</profile>
+	</profiles>
+
 </project>
