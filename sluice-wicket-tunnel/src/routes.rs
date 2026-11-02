@@ -27,6 +27,16 @@ pub trait Table: Send + Sync + Sized + 'static {
     /// The upstreams every stream advertises.
     fn advertised(&self) -> &[Upstream];
 
+    /// The advertised route of `host` (no port, see
+    /// [`crate::listener::host_of`]) on a wicket's listener, compared ignoring
+    /// case; or the sole route whatever the host. None for an unknown host.
+    fn host_route(&self, host: &str) -> Option<&Upstream> {
+        match self.advertised() {
+            [sole] => Some(sole),
+            all => all.iter().find(|up| up.host.eq_ignore_ascii_case(host)),
+        }
+    }
+
     /// What serves a connection to `address` (the dial address the server
     /// derived from an advertised target): its binding, or the ERROR message
     /// refusing the connection. `routes` holds this table as the current

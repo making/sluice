@@ -125,18 +125,11 @@ impl Table {
         self.entries.get(target).map(|entry| &entry.handler)
     }
 
-    /// The handler serving a request for `host` (no port) on the listener:
-    /// the route of that host, or the sole route whatever the host; None for
-    /// an unknown host.
+    /// The handler serving a request for `host` (no port) on the listener
+    /// (`sluice_wicket_tunnel::routes::Table::host_route`); None for an unknown
+    /// host.
     pub fn by_host(&self, host: &str) -> Option<Arc<Handler>> {
-        let target = match self.advertised.as_slice() {
-            [sole] => &sole.target_url,
-            all => {
-                &all.iter()
-                    .find(|up| up.host.eq_ignore_ascii_case(host))?
-                    .target_url
-            }
-        };
+        let target = &sluice_wicket_tunnel::routes::Table::host_route(self, host)?.target_url;
         self.entries.get(target).map(|entry| entry.handler.clone())
     }
 }

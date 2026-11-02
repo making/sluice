@@ -26,11 +26,15 @@
 //! once the server acknowledged it and no connection is left on it, within
 //! the drain grace ([`serve`]).
 //!
+//! A wicket serves its routes over plain TCP as well in local mode
+//! ([`listener`]: `--listen`), routed by the host its client asks for.
+//!
 //! A wicket feeds its live access log -- its guests' output, the requests it
 //! answered -- to a sluice-flume as a node does ([`flume`]).
 
 pub mod drain;
 pub mod flume;
+pub mod listener;
 pub mod routes;
 pub mod session;
 pub mod signals;
