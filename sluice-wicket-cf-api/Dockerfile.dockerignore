@@ -5,6 +5,8 @@
 !sluice-build-info/src
 !sluice-wicket-oidc/Cargo.toml
 !sluice-wicket-oidc/src
+!sluice-wicket-server/Cargo.toml
+!sluice-wicket-server/src
 !sluice-wicket-registry/Cargo.toml
 !sluice-wicket-registry/src
 !sluice-wicket-cf-api/Cargo.toml

@@ -1,7 +1,8 @@
 # sluice-wicket-runtime-wasi on distroless cc (glibc: wasmtime's many threads allocate through
 # glibc's malloc, not musl's). The proto lives in sluice-proto, the tunnel client in
-# sluice-wicket-tunnel, the OpenID Provider client in sluice-wicket-oidc and the console's
-# shared parts in sluice-wicket-console, so the build context is the repository root:
+# sluice-wicket-tunnel, the OpenID Provider client in sluice-wicket-oidc, the connections in
+# sluice-wicket-server and the console's shared parts in sluice-wicket-console, so the build
+# context is the repository root:
 #   docker build -f sluice-wicket-runtime-wasi/Dockerfile --build-arg GIT_COMMIT=$(git rev-parse HEAD) .
 FROM rust:1.99-slim-trixie AS build
 RUN apt-get update -q && apt-get install -y --no-install-recommends protobuf-compiler \
@@ -12,6 +13,8 @@ COPY sluice-build-info/Cargo.toml sluice-build-info/
 COPY sluice-build-info/src sluice-build-info/src
 COPY sluice-wicket-oidc/Cargo.toml sluice-wicket-oidc/
 COPY sluice-wicket-oidc/src sluice-wicket-oidc/src
+COPY sluice-wicket-server/Cargo.toml sluice-wicket-server/
+COPY sluice-wicket-server/src sluice-wicket-server/src
 COPY sluice-wicket-console/Cargo.toml sluice-wicket-console/
 COPY sluice-wicket-console/src sluice-wicket-console/src
 COPY sluice-wicket-tunnel/Cargo.toml sluice-wicket-tunnel/build.rs sluice-wicket-tunnel/

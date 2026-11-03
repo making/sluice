@@ -15,6 +15,7 @@ on:
     - 'sluice-wicket-runtime-firecracker/**'
     - 'sluice-build-info/**'
     - 'sluice-wicket-oidc/**'
+    - 'sluice-wicket-server/**'
     - 'sluice-wicket-console/**'
     - 'sluice-wicket-registry/**'
     - 'sluice-wicket-tunnel/**'
@@ -43,6 +44,7 @@ jobs:
     outputs:
       build-info: ${{ steps.filter.outputs.build-info }}
       oidc: ${{ steps.filter.outputs.oidc }}
+      server: ${{ steps.filter.outputs.server }}
       console: ${{ steps.filter.outputs.console }}
       registry: ${{ steps.filter.outputs.registry }}
       tunnel: ${{ steps.filter.outputs.tunnel }}
@@ -63,8 +65,12 @@ jobs:
           oidc:
           - 'sluice-wicket-oidc/**'
           - '.github/workflows/rust.yaml'
+          server:
+          - 'sluice-wicket-server/**'
+          - '.github/workflows/rust.yaml'
           console:
           - 'sluice-wicket-console/**'
+          - 'sluice-wicket-server/**'
           - 'sluice-wicket-oidc/**'
           - '.github/workflows/rust.yaml'
           registry:
@@ -85,6 +91,7 @@ jobs:
           - 'sluice-wicket-runtime-wasi/**'
           - 'sluice-build-info/**'
           - 'sluice-wicket-oidc/**'
+          - 'sluice-wicket-server/**'
           - 'sluice-wicket-console/**'
           - 'sluice-wicket-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
@@ -97,6 +104,7 @@ jobs:
           - 'sluice-flume/**'
           - 'sluice-build-info/**'
           - 'sluice-wicket-oidc/**'
+          - 'sluice-wicket-server/**'
           - 'sluice-wicket-console/**'
           - 'sluice-wicket-registry/**'
           - 'sluice-wicket-tunnel/**'
@@ -110,6 +118,7 @@ jobs:
           - 'sluice-flume/**'
           - 'sluice-build-info/**'
           - 'sluice-wicket-oidc/**'
+          - 'sluice-wicket-server/**'
           - 'sluice-wicket-console/**'
           - 'sluice-wicket-registry/**'
           - 'sluice-wicket-tunnel/**'
@@ -184,6 +193,33 @@ jobs:
           ~/.cargo/git
           sluice-wicket-console/target
         key: cargo-wicket-console-${{ runner.os }}-${{ hashFiles('sluice-wicket-console/Cargo.lock', 'sluice-wicket-console/rust-toolchain.toml') }}
+    - name: Format
+      run: cargo fmt --check
+    - name: Clippy
+      run: cargo clippy --all-targets --locked -- -D warnings
+    - name: Test
+      run: cargo test --locked
+  sluice-wicket-server:
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sluice-wicket-server
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    # the toolchain rust-toolchain.toml pins
+    - name: Toolchain
+      run: rustup toolchain install
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          sluice-wicket-server/target
+        key: cargo-wicket-server-${{ runner.os }}-${{ hashFiles('sluice-wicket-server/Cargo.lock', 'sluice-wicket-server/rust-toolchain.toml') }}
     - name: Format
       run: cargo fmt --check
     - name: Clippy

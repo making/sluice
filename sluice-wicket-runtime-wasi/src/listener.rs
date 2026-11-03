@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
-use sluice_wicket_tunnel::listener::{self, Replay};
+use sluice_wicket_server::accept;
+use sluice_wicket_tunnel::listener::Replay;
 use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -40,14 +41,14 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_PROBES: usize = 4;
 
 /// Accepts connections for good, at most `max_connections` open at once (see
-/// `sluice_wicket_tunnel::listener::run`).
+/// `sluice_wicket_server::accept::run`).
 pub async fn run(
     listener: TcpListener,
     routes: Arc<Routes>,
     instances: Arc<Instances>,
     max_connections: usize,
 ) {
-    listener::run(listener, max_connections, |stream, peer, slot| {
+    accept::run(listener, max_connections, "--listen", |stream, peer, slot| {
         let (routes, instances) = (routes.clone(), instances.clone());
         tokio::spawn(async move {
             let _slot = slot;

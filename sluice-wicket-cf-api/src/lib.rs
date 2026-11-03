@@ -242,3 +242,58 @@ pub async fn serve(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use sluice_wicket_server::http::QUIET;
+    use tokio::io::AsyncReadExt as _;
+    use tokio::net::TcpStream;
+    use tokio::time::Instant;
+
+    use super::*;
+
+    fn settings(data_dir: PathBuf, tls: Option<TlsSettings>) -> Settings {
+        Settings {
+            wicket: "http://127.0.0.1:1".into(),
+            wicket_token: None,
+            domains: vec!["apps.test".into()],
+            data_dir,
+            org: "org".into(),
+            space: "space".into(),
+            flume: None,
+            oidc: None,
+            clients: Vec::new(),
+            security_group_editors: security_groups::Editors::default(),
+            tls,
+        }
+    }
+
+    /// A client sending nothing loses its connection after the bound, in the
+    /// TLS handshake as in the wait for a request's head: it holds no slot for
+    /// good.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_connection_is_closed() {
+        let certified = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+        let tls = TlsSettings {
+            cert_pem: certified.cert.pem().into_bytes(),
+            key_pem: certified.signing_key.serialize_pem().into_bytes(),
+        };
+        let dir = std::env::temp_dir().join(format!("cf-api-quiet-{}", store::guid()));
+        for tls in [None, Some(tls)] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let dir = dir.join(store::guid());
+            tokio::spawn(async move {
+                serve(listener, settings(dir, tls), std::future::pending())
+                    .await
+                    .unwrap()
+            });
+            let started = Instant::now();
+            let mut client = TcpStream::connect(address).await.unwrap();
+            assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+            assert!(started.elapsed() >= QUIET, "{:?}", started.elapsed());
+            assert!(started.elapsed() < QUIET * 2, "{:?}", started.elapsed());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

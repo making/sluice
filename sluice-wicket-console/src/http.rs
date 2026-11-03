@@ -8,10 +8,11 @@ use bytes::Bytes;
 use http::request::Parts;
 use http::{HeaderValue, StatusCode, header};
 use http_body_util::{BodyExt as _, Full, LengthLimitError, Limited};
-use hyper::body::Incoming;
 use serde::Serialize;
 use sha2::Digest as _;
 use tokio::io::AsyncWriteExt as _;
+
+pub use sluice_wicket_server::http::Body;
 
 pub type Response = hyper::Response<Full<Bytes>>;
 
@@ -145,7 +146,7 @@ fn declared(parts: &Parts) -> Option<u64> {
 /// to the reset of the connection (see [`drain`]).
 pub async fn read(
     parts: &Parts,
-    body: Incoming,
+    body: Body,
     limit: usize,
     too_large: &str,
 ) -> Result<Bytes, Refusal> {
@@ -170,7 +171,7 @@ pub async fn read(
 /// client: a refusal of an upload would read as a network error. A request
 /// that expects `100 Continue` and was not read is not: its client sent no
 /// body, and takes the answer instead.
-pub async fn drain(parts: &Parts, mut body: Incoming, limit: u64) {
+pub async fn drain(parts: &Parts, mut body: Body, limit: u64) {
     let continues = parts
         .headers
         .get(header::EXPECT)
@@ -252,7 +253,7 @@ pub struct Intake<'a, F> {
 /// has it.
 pub async fn receive<F: Fn(&[u8]) -> Result<(), String>>(
     parts: &Parts,
-    mut body: Incoming,
+    mut body: Body,
     intake: Intake<'_, F>,
 ) -> Result<Received, Refusal> {
     let Intake {

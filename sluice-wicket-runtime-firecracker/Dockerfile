@@ -1,8 +1,9 @@
 # sluice-wicket-runtime-firecracker on distroless cc (glibc), with the pinned Firecracker release,
 # a guest kernel of Firecracker's CI, the guest (/init of the wicket's own version) and the
-# sample rootfs. The proto lives in sluice-proto, the tunnel client in sluice-wicket-tunnel and
-# the console's shared parts in sluice-wicket-console (its sign-in in sluice-wicket-oidc) and the
-# image pulls in sluice-wicket-registry, so the build context is the repository root:
+# sample rootfs. The proto lives in sluice-proto, the tunnel client in sluice-wicket-tunnel, the
+# connections in sluice-wicket-server, the console's shared parts in sluice-wicket-console (its
+# sign-in in sluice-wicket-oidc) and the image pulls in sluice-wicket-registry, so the build
+# context is the repository root:
 #   docker build -f sluice-wicket-runtime-firecracker/Dockerfile --build-arg GIT_COMMIT=$(git rev-parse HEAD) .
 # amd64 and arm64: the release, the kernel and the guest are the target's (a VM's arch is
 # its host's).
@@ -49,6 +50,8 @@ COPY sluice-build-info/Cargo.toml sluice-build-info/
 COPY sluice-build-info/src sluice-build-info/src
 COPY sluice-wicket-oidc/Cargo.toml sluice-wicket-oidc/
 COPY sluice-wicket-oidc/src sluice-wicket-oidc/src
+COPY sluice-wicket-server/Cargo.toml sluice-wicket-server/
+COPY sluice-wicket-server/src sluice-wicket-server/src
 COPY sluice-wicket-console/Cargo.toml sluice-wicket-console/
 COPY sluice-wicket-console/src sluice-wicket-console/src
 COPY sluice-wicket-registry/Cargo.toml sluice-wicket-registry/

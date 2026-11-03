@@ -1,0 +1,21 @@
+[package]
+name = "sluice-wicket-server"
+version = "0.0.1-SNAPSHOT"
+edition = "2024"
+publish = false
+
+# What the listeners of sluice-wicket-runtime-wasi, sluice-wicket-runtime-firecracker and
+# sluice-wicket-cf-api (all their own workspaces) have alike, so it is one too.
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["net", "sync", "time", "io-util"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+# TCP keepalive on a connection whose peer may vanish; all: the probes' interval and count
+socket2 = { version = "0.6", features = ["all"] }
+
+[dev-dependencies]
+# paused time for the bounds' waits
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }
+http-body-util = "0.1"

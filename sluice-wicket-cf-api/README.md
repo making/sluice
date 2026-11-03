@@ -854,6 +854,9 @@ shared VM has no snapshot to clone the second from ([weighed](../.kb/wicket-fire
   everything but edit the [security groups](#security-groups)
 - errors are in CC's shape (`{"errors": [{"code", "title", "detail"}]}`); `/v3/info` names
   this API
+- connections: 64 at once (one beyond waits in the backlog). TCP keepalive ends one whose client
+  is gone, and a client that leaves one waiting for 60s, in its TLS handshake, not sending a
+  request or not reading its answer, loses it; the CLI opens another when it needs one
 
 ## Login
 

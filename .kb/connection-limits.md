@@ -128,8 +128,22 @@ relay and releases its slot. A peer that is there answers the probes; only the v
 idle timeout closes a live connection for idling.
 
 The wickets set the same, fixed, on every `--listen` socket and, on
-sluice-wicket-runtime-firecracker, every egress socket to a destination (`listener::keep_alive`).
+sluice-wicket-runtime-firecracker, every egress socket to a destination, and so do their
+consoles and sluice-wicket-cf-api on every connection (`sluice_wicket_server::accept::keep_alive`).
 A route's `idle-ms` does not stand in for it: it is off by default, and cuts live peers too.
+
+## The wickets' consoles and sluice-wicket-cf-api
+
+Each serves 64 connections at once, one beyond waiting in the backlog, and is reachable by
+whoever can open a TCP connection, signed in or not. Keepalive tells of a client gone, not
+of one merely quiet, so `sluice_wicket_server::http` closes a connection once its client left
+it waiting for 60s, wherever: in cf-api's TLS handshake, sending a request's head or the next
+one's (hyper's `header_read_timeout`), a request's body (`Body`: the handler reading it sees an
+error and answers, the connection closing behind the answer), or not reading an answer (a
+write pending so long). Any byte moving starts the wait over, and a request being handled
+waits on no one: a long poll (25s) or a slow upload stays. An idle connection is closed like
+any other quiet one; sluice-wicket-cf-api's client of its wicket lets go of its own after 30s, so
+no request meets one closing.
 
 ## Half-close probes
 

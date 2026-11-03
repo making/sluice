@@ -37,6 +37,7 @@ sluice-wicket-oidc = { path = "../sluice-wicket-oidc" }
 sluice-wicket-console = { path = "../sluice-wicket-console" }
 # the tunnel client: node streams, flow control, the drain
 sluice-wicket-tunnel = { path = "../sluice-wicket-tunnel" }
+sluice-wicket-server = { path = "../sluice-wicket-server" }
 # wasmtime's ResourceLimiterAsync is #[async_trait]; the impl must match
 async-trait = "0.1"
 # the --config file: YAML with ${NAME} interpolation from the environment

@@ -365,7 +365,9 @@ another host with its image and options. The routes of the config file and the `
 are listed too, read-only. The page shows what the wasm wicket's has no counterpart for:
 each route's VMs (shared or pooled and their restarts, warm, kept, starting, all alive), its connections, a cloned
 route's snapshot (its memory file, the template's boot and snapshot times) and the budget
-(`--max-vms`, `--max-memory`) taken.
+(`--max-vms`, `--max-memory`) taken. It takes 64 connections at once (one beyond waits in the
+backlog); TCP keepalive ends one whose client is gone, and a client that leaves one waiting for
+60s, not sending a request or not reading its answer, loses it.
 
 ```text
 target/debug/sluice-wicket-runtime-firecracker --kernel vmlinux --listen 127.0.0.1:8080 \

@@ -859,11 +859,11 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
- "hyper-util",
  "serde",
  "serde_json",
  "sha2",
  "sluice-wicket-oidc",
+ "sluice-wicket-server",
  "tokio",
 ]
 
@@ -881,6 +881,16 @@ dependencies = [
  "sha2",
  "tokio",
  "webpki-roots",
+]
+
+[[package]]
+name = "sluice-wicket-server"
+version = "0.0.1-SNAPSHOT"
+dependencies = [
+ "hyper",
+ "hyper-util",
+ "socket2",
+ "tokio",
 ]
 
 [[package]]

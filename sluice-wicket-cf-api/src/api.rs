@@ -14,17 +14,16 @@
 //! environment variables in [`crate::env`], the security groups, which
 //! apply at a start too, in [`crate::security_groups`].
 
-use std::convert::Infallible;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use http::header::{HeaderMap, HeaderValue};
 use http::{Method, StatusCode, header};
 use http_body_util::{BodyExt as _, Full, Limited};
-use hyper::body::Incoming;
-use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use sluice_wicket_server::accept;
+use sluice_wicket_server::http::{self as connection, Body};
 use tokio::net::TcpListener;
 
 use crate::controller::Controller;
@@ -228,52 +227,43 @@ impl Req {
 /// Serves the API on `listener` for good, [`MAX_CONNECTIONS`] at once; with
 /// `tls`, each connection's handshake first.
 pub async fn run(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, api: Arc<Api>) {
-    let open = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
-    loop {
-        let permit = open.clone().acquire_owned().await.expect("never closed");
-        let stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
-            Err(e) => {
-                eprintln!("accept failed: {e}");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                continue;
-            }
-        };
+    accept::run(listener, MAX_CONNECTIONS, "--listen", |stream, _, slot| {
         let api = api.clone();
         let tls = tls.clone();
         tokio::spawn(async move {
-            match tls {
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(stream) => serve_connection(stream, api).await,
-                    Err(e) => eprintln!("tls handshake failed: {e}"),
-                },
-                None => serve_connection(stream, api).await,
+            let _slot = slot;
+            let Some(acceptor) = tls else {
+                return serve_connection(stream, api).await;
+            };
+            // a client quiet in its handshake is no client hyper bounds yet
+            match tokio::time::timeout(connection::QUIET, acceptor.accept(stream)).await {
+                Ok(Ok(stream)) => serve_connection(stream, api).await,
+                Ok(Err(e)) => eprintln!("tls handshake failed: {e}"),
+                Err(e) => eprintln!("tls handshake failed: {e}"),
             }
-            drop(permit);
         });
-    }
+    })
+    .await
 }
 
 async fn serve_connection<S>(stream: S, api: Arc<Api>)
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let service = hyper::service::service_fn(move |request| {
+    connection::serve(stream, |request| {
         let api = api.clone();
         async move {
             // in a task of its own: an edit goes on when its client gives up (a start may take
             // the health check's whole timeout), the state and the wicket's answer kept
             let handled = tokio::spawn(async move { api.handle(request).await }).await;
-            Ok::<_, Infallible>(handled.unwrap_or_else(|e| ApiError::internal(&e).into()))
+            handled.unwrap_or_else(|e| ApiError::internal(&e).into())
         }
-    });
-    let _ = hyper::server::conn::http1::Builder::new()
-        .serve_connection(TokioIo::new(stream), service)
-        .await;
+    })
+    .await
 }
 
 impl Api {
-    async fn handle(&self, request: hyper::Request<Incoming>) -> Response {
+    async fn handle(&self, request: hyper::Request<Body>) -> Response {
         let (parts, body) = request.into_parts();
         let path = parts.uri.path().to_string();
         // a package to a file as it comes: it may be larger than this process's memory; and
@@ -507,7 +497,7 @@ impl Api {
     }
 
     /// `body` in a file, [`MAX_UPLOAD_BYTES`] at most.
-    async fn spooled(&self, mut body: Incoming) -> Result<Spool, ApiError> {
+    async fn spooled(&self, mut body: Body) -> Result<Spool, ApiError> {
         use std::io::Write as _;
         let (spool, mut file) = self.store.spool()?;
         let failed = |e: std::io::Error| ApiError::from(format!("{}: {e}", spool.path().display()));

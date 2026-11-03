@@ -265,7 +265,7 @@ async fn connect(to: &Rule) -> std::io::Result<TcpStream> {
     };
     // the relay adds no delay to the guest's writes
     stream.set_nodelay(true)?;
-    sluice_wicket_tunnel::listener::keep_alive(&stream)?;
+    sluice_wicket_server::accept::keep_alive(&stream)?;
     Ok(stream)
 }
 

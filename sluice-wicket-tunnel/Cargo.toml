@@ -16,8 +16,6 @@ tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-
 # rt: the TaskTracker the drain waits on
 tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = "0.3"
-# TCP keepalive on a connection whose peer may vanish; all: the probes' interval and count
-socket2 = { version = "0.6", features = ["all"] }
 # the reconnect backoff's jitter
 uuid = { version = "1", features = ["v4"] }
 # control-plane TLS (grpcs / --insecure); the ring provider matches tonic's tls-ring

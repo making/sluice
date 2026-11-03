@@ -777,7 +777,6 @@ dependencies = [
  "http",
  "prost",
  "rustls",
- "socket2",
  "tokio",
  "tokio-util",
  "tonic",

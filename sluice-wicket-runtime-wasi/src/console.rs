@@ -40,9 +40,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::request::Parts;
 use http::{Method, StatusCode};
-use hyper::body::Incoming;
 use serde::{Deserialize, Serialize};
-use sluice_wicket_console::http::{Edited, Refusal, Response, error, json, pairs, read};
+use sluice_wicket_console::http::{Body, Edited, Refusal, Response, error, json, pairs, read};
 use sluice_wicket_console::serve::{self, Service};
 use sluice_wicket_console::status::{Alive, Status, alive, settled};
 use sluice_wicket_console::store;
@@ -92,7 +91,7 @@ impl Console {
     async fn route(
         &self,
         parts: &Parts,
-        body: &mut Option<Incoming>,
+        body: &mut Option<Body>,
         user: Option<String>,
     ) -> Response {
         let (method, path, query) = (&parts.method, parts.uri.path(), parts.uri.query());
@@ -266,7 +265,7 @@ impl Console {
             .collect()
     }
 
-    async fn deploy(&self, host: &str, parts: &Parts, body: Incoming) -> Response {
+    async fn deploy(&self, host: &str, parts: &Parts, body: Body) -> Response {
         let component = match component(parts, body).await {
             Ok(component) => component,
             Err(refused) => return refused.into(),
@@ -325,7 +324,7 @@ impl Console {
     }
 
     /// Keeps the body under its digest `sha256` for an app to name.
-    async fn upload(&self, sha256: &str, parts: &Parts, body: Incoming) -> Response {
+    async fn upload(&self, sha256: &str, parts: &Parts, body: Body) -> Response {
         let component = match component(parts, body).await {
             Ok(component) => component,
             Err(refused) => return refused.into(),
@@ -350,7 +349,7 @@ impl Console {
 
     /// Serves the app `name` as the body has it; every check of its own
     /// before the reloader's, so a malformed app is a 400 first.
-    async fn put_app(&self, name: &str, parts: &Parts, body: Incoming) -> Response {
+    async fn put_app(&self, name: &str, parts: &Parts, body: Body) -> Response {
         let too_large = format!("an app is {} KiB at most", MAX_APP_BYTES >> 10);
         let body = match read(parts, body, MAX_APP_BYTES, &too_large).await {
             Ok(body) => body,
@@ -501,7 +500,7 @@ impl Console {
 /// The component an upload carries, read before anything is answered: a
 /// refusal answered before would be lost to the reset of the connection
 /// (see [`drain`]).
-async fn component(parts: &Parts, body: Incoming) -> Result<Bytes, Refusal> {
+async fn component(parts: &Parts, body: Body) -> Result<Bytes, Refusal> {
     let too_large = format!("a component is {} MiB at most", MAX_COMPONENT_BYTES >> 20);
     read(parts, body, MAX_COMPONENT_BYTES, &too_large).await
 }

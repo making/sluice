@@ -12,7 +12,6 @@ publish = false
 tokio = { version = "1", features = ["net", "sync", "time", "fs", "io-util", "rt"] }
 http = "1"
 hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
@@ -25,8 +24,10 @@ form_urlencoded = "1"
 sha2 = "0.10"
 # the names of the uploads being received
 getrandom = "0.4"
+# its connections
+sluice-wicket-server = { path = "../sluice-wicket-server" }
 # the browsers' sign-in
 sluice-wicket-oidc = { path = "../sluice-wicket-oidc" }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

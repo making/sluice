@@ -252,6 +252,8 @@ impl Wicket {
         Wicket {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
+                // let go of before its console closes it: no request lands on a closing one
+                .pool_idle_timeout(Duration::from_secs(30))
                 .build()
                 .expect("a plain client"),
             base: base.trim_end_matches('/').to_string(),

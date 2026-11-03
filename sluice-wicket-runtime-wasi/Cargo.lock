@@ -2292,11 +2292,11 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
- "hyper-util",
  "serde",
  "serde_json",
  "sha2",
  "sluice-wicket-oidc",
+ "sluice-wicket-server",
  "tokio",
 ]
 
@@ -2341,6 +2341,7 @@ dependencies = [
  "sluice-build-info",
  "sluice-wicket-console",
  "sluice-wicket-oidc",
+ "sluice-wicket-server",
  "sluice-wicket-tunnel",
  "tokio",
  "tokio-stream",
@@ -2349,6 +2350,16 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
+]
+
+[[package]]
+name = "sluice-wicket-server"
+version = "0.0.1-SNAPSHOT"
+dependencies = [
+ "hyper",
+ "hyper-util",
+ "socket2",
+ "tokio",
 ]
 
 [[package]]
@@ -2361,7 +2372,6 @@ dependencies = [
  "http",
  "prost",
  "rustls",
- "socket2",
  "tokio",
  "tokio-util",
  "tonic",

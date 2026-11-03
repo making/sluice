@@ -44,12 +44,11 @@ use std::sync::Arc;
 
 use http::request::Parts;
 use http::{Method, StatusCode};
-use hyper::body::Incoming;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sluice_wicket_console::env::Env;
 use sluice_wicket_console::http::{
-    Edited, Intake, Received, Refusal, Response, error, json, pairs, read, receive,
+    Body, Edited, Intake, Received, Refusal, Response, error, json, pairs, read, receive,
 };
 use sluice_wicket_console::serve::{self, Service};
 use sluice_wicket_console::status::{Alive, FailureView, Shortage, Status, alive, settled};
@@ -310,7 +309,7 @@ impl Console {
 
     /// Keeps the body under its digest `sha256` for an app to name. The digest
     /// is checked before the image is read.
-    async fn upload(&self, sha256: &str, parts: &Parts, body: Incoming) -> Response {
+    async fn upload(&self, sha256: &str, parts: &Parts, body: Body) -> Response {
         let sha256 = match check_digest(sha256) {
             Ok(sha256) => sha256,
             Err(e) => return error(StatusCode::BAD_REQUEST, e),
@@ -332,7 +331,7 @@ impl Console {
 
     /// Makes the image the body names, kept as if uploaded: its digest is what an app
     /// names. Held until it is made: minutes, for a large one.
-    async fn make_image(&self, parts: &Parts, body: Incoming) -> Response {
+    async fn make_image(&self, parts: &Parts, body: Body) -> Response {
         let Some(images) = &self.images else {
             return error(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -383,7 +382,7 @@ impl Console {
 
     /// Serves the app `name` as the body has it; every check of its own before
     /// the reloader's, so a malformed app is a 400 first.
-    async fn put_app(&self, name: &str, parts: &Parts, body: Incoming) -> Response {
+    async fn put_app(&self, name: &str, parts: &Parts, body: Body) -> Response {
         let too_large = format!("an app is {} KiB at most", MAX_APP_BYTES >> 10);
         let body = match read(parts, body, MAX_APP_BYTES, &too_large).await {
             Ok(body) => body,
@@ -448,7 +447,7 @@ impl Console {
 
     /// The options are checked before the image is read: a refusal skips the
     /// upload of a client expecting `100 Continue`.
-    async fn deploy(&self, host: &str, parts: &Parts, body: Incoming) -> Response {
+    async fn deploy(&self, host: &str, parts: &Parts, body: Body) -> Response {
         let host = match check_host(host) {
             Ok(host) => host,
             Err(e) => return error(StatusCode::BAD_REQUEST, e),
@@ -479,7 +478,7 @@ impl Console {
     }
 
     /// The ext4 image of a request's body, received to the images' directory.
-    async fn image(&self, parts: &Parts, body: Incoming) -> Result<Received, Refusal> {
+    async fn image(&self, parts: &Parts, body: Body) -> Result<Received, Refusal> {
         let too_large = format!("an image is {} GiB at most", MAX_ROOTFS_BYTES >> 30);
         let intake = Intake {
             dir: &self.intake,

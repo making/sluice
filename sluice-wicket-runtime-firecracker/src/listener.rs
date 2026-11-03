@@ -16,7 +16,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sluice_wicket_tunnel::listener::{self, Replay, host_of};
+use sluice_wicket_server::accept;
+use sluice_wicket_tunnel::listener::{Replay, host_of};
 use sluice_wicket_tunnel::routes::Routes;
 use sluice_wicket_tunnel::workers::Workers;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -35,7 +36,7 @@ pub const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const LINGER: Duration = Duration::from_secs(2);
 
 /// Serves each connection, at most `max_connections` at once (see
-/// `sluice_wicket_tunnel::listener::run`), on a worker, by the table of the
+/// `sluice_wicket_server::accept::run`), on a worker, by the table of the
 /// moment.
 pub async fn run(
     listener: TcpListener,
@@ -43,19 +44,24 @@ pub async fn run(
     workers: Arc<Workers>,
     max_connections: usize,
 ) {
-    listener::run(listener, max_connections, |client, peer, slot| {
-        let Ok(client) = client.into_std() else {
-            return;
-        };
-        let routes = routes.clone();
-        workers.place().spawn(async move {
-            let _slot = slot;
-            // the worker's from here on
-            if let Ok(client) = TcpStream::from_std(client) {
-                serve(Replay::new(client), peer, &routes).await;
-            }
-        });
-    })
+    accept::run(
+        listener,
+        max_connections,
+        "--listen",
+        |client, peer, slot| {
+            let Ok(client) = client.into_std() else {
+                return;
+            };
+            let routes = routes.clone();
+            workers.place().spawn(async move {
+                let _slot = slot;
+                // the worker's from here on
+                if let Ok(client) = TcpStream::from_std(client) {
+                    serve(Replay::new(client), peer, &routes).await;
+                }
+            });
+        },
+    )
     .await
 }
 

@@ -1,7 +1,7 @@
 # sluice-wicket-cf-api as a static musl binary on distroless static. The flume proto lives
 # in sluice-proto, the build script dependency in sluice-build-info, the OpenID Provider
-# client in sluice-wicket-oidc and the image pulls in sluice-wicket-registry, so the build
-# context is the repository root:
+# client in sluice-wicket-oidc, the connections in sluice-wicket-server and the image pulls in
+# sluice-wicket-registry, so the build context is the repository root:
 #   docker build -f sluice-wicket-cf-api/Dockerfile --build-arg GIT_COMMIT=$(git rev-parse HEAD) .
 FROM rust:1.99-alpine AS build
 RUN apk add --no-cache musl-dev protoc
@@ -11,6 +11,8 @@ COPY sluice-build-info/Cargo.toml sluice-build-info/
 COPY sluice-build-info/src sluice-build-info/src
 COPY sluice-wicket-oidc/Cargo.toml sluice-wicket-oidc/
 COPY sluice-wicket-oidc/src sluice-wicket-oidc/src
+COPY sluice-wicket-server/Cargo.toml sluice-wicket-server/
+COPY sluice-wicket-server/src sluice-wicket-server/src
 COPY sluice-wicket-registry/Cargo.toml sluice-wicket-registry/
 COPY sluice-wicket-registry/src sluice-wicket-registry/src
 COPY sluice-wicket-cf-api/Cargo.toml sluice-wicket-cf-api/Cargo.lock sluice-wicket-cf-api/build.rs sluice-wicket-cf-api/

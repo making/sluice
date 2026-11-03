@@ -328,7 +328,9 @@ host and a sandbox, and it is served -- on the tunnel and on `--listen` alike. D
 route of the console, a file replaces its component; renamed, a route moves to another host
 with its component and sandbox. The routes of the config file and the `--wasm` flags are
 listed too, read-only, and so are the [apps](#apps) a controller deploys through the API: hosts
-served by one component in one sandbox.
+served by one component in one sandbox. It takes 64 connections at once (one beyond waits in the
+backlog); TCP keepalive ends one whose client is gone, and a client that leaves one waiting for
+60s, not sending a request or not reading its answer, loses it.
 
 ```text
 target/debug/sluice-wicket-runtime-wasi --listen 127.0.0.1:8080 --console 127.0.0.1:9090
