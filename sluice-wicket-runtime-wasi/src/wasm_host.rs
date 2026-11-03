@@ -5556,70 +5556,106 @@ pub(crate) mod tests {
     /// for it, though a slot is free -- per request and on a pooled unit.
     /// The next stream goes to a handler of the default budget, so a spin
     /// interrupted late (seconds on a busy machine) only delays its answer.
-    /// Multi-threaded, as the spin holds its worker.
+    /// A reset reaching the store before its guest spins stops the store at
+    /// once, which rightly frees the share and shows nothing: only such a
+    /// stop, seen in the log, excuses an early answer, and the attempt is
+    /// made again. Multi-threaded, as the spin holds its worker.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_reset_stream_keeps_its_share_until_its_instance_is_gone() {
         let loaded = hello().await;
         let budget = Duration::from_secs(1);
         for pooled in [false, true] {
-            let instances = Instances::new(2);
-            let mut sandbox = Sandbox::default();
-            sandbox.limits.budget = budget;
-            sandbox.pool = usize::from(pooled);
-            let spinning = Handler::new(loaded.clone(), sandbox, None, &instances).unwrap();
-            if pooled {
-                restocked(&spinning, 1).await;
-            }
-            let current = Arc::new(Mutex::new(spinning.clone()));
-            let peer = Peer::new(crate::routes::fixed(HashMap::new()));
-            peer.serve(
-                1,
-                Binding {
-                    opened: spinning.clone(),
-                    current: Box::new({
-                        let current = current.clone();
-                        move || Some(current.lock().unwrap().clone())
-                    }),
-                    gone: CancellationToken::new(),
-                },
-            );
-            let (mut client, _connection) = h2_client_on(peer).await;
-            let started = Instant::now();
-            let (first, _) = client.send_request(h2_get("/spin"), true).unwrap();
-            eventually("the first is served", Duration::from_secs(10), || {
-                if pooled {
-                    pool(&spinning).served() == 1
-                } else {
-                    spinning.stores_created() == 1
+            for attempt in 0.. {
+                assert!(attempt < 10, "pooled {pooled}: every reset beat the spin");
+                // its own label: only this attempt's store logs this stop
+                let label = format!("reset-{pooled}-{attempt}.wasm");
+                let answered = after_a_reset(&loaded, &label, budget, pooled).await;
+                // the spin ends at its budget at the earliest: half of it is
+                // well past a second stream served at once, and leaves the
+                // epoch ticker room to have lagged when the deadline was set
+                if answered >= budget / 2 {
+                    break;
                 }
-            })
-            .await;
-            eventually("the one-stream SETTINGS", Duration::from_secs(10), || {
-                client.current_max_send_streams() == 1
-            })
-            .await;
-
-            // the reset ends the stream; the spinning guest keeps its
-            // instance and the share
-            drop(first);
-            let patient = limited(&loaded, &instances, None);
-            *current.lock().unwrap() = patient.clone();
-            client = client.ready().await.unwrap();
-            let (second, _) = client.send_request(h2_get("/"), true).unwrap();
-            let second = tokio::time::timeout(Duration::from_secs(20), second)
-                .await
-                .expect("the second stream is answered")
-                .unwrap();
-            assert_eq!(second.status(), 200, "pooled {pooled}");
-            // the spin ends at its budget at the earliest: half of it is
-            // well past a second stream served at once, and leaves the epoch
-            // ticker room to have lagged when the deadline was set
-            assert!(
-                started.elapsed() >= budget / 2,
-                "pooled {pooled}: answered only once the spin's budget ended it: {:?}",
-                started.elapsed()
-            );
+                // within what is left of that half: the spin cannot have
+                // ended, so what the log shows came before it
+                let stop = format!("[wasm] {label} client went away: store stopped");
+                eventually(
+                    &format!(
+                        "pooled {pooled}: answered at {answered:?}, \
+                         with neither the spin ended nor its store stopped"
+                    ),
+                    budget / 2 - answered,
+                    || String::from_utf8_lossy(&captured_log().lock().unwrap()).contains(&stop),
+                )
+                .await;
+            }
         }
+    }
+
+    /// Resets a spinning stream of a handler of `budget`, whose component logs
+    /// as `label`, on a connection of one stream, and returns how long after
+    /// its start the connection's next stream was answered.
+    async fn after_a_reset(
+        loaded: &Arc<Loaded>,
+        label: &str,
+        budget: Duration,
+        pooled: bool,
+    ) -> Duration {
+        let instances = Instances::new(2);
+        let mut sandbox = Sandbox::default();
+        sandbox.limits.budget = budget;
+        sandbox.pool = usize::from(pooled);
+        let labelled = Arc::new(Loaded {
+            service_pre: loaded.service_pre.clone(),
+            label: label.to_string(),
+            digest: loaded.digest.clone(),
+            size: loaded.size,
+        });
+        let spinning = Handler::new(labelled, sandbox, None, &instances).unwrap();
+        if pooled {
+            restocked(&spinning, 1).await;
+        }
+        let current = Arc::new(Mutex::new(spinning.clone()));
+        let peer = Peer::new(crate::routes::fixed(HashMap::new()));
+        peer.serve(
+            1,
+            Binding {
+                opened: spinning.clone(),
+                current: Box::new({
+                    let current = current.clone();
+                    move || Some(current.lock().unwrap().clone())
+                }),
+                gone: CancellationToken::new(),
+            },
+        );
+        let (mut client, _connection) = h2_client_on(peer).await;
+        let started = Instant::now();
+        let (first, _) = client.send_request(h2_get("/spin"), true).unwrap();
+        eventually("the first is served", Duration::from_secs(10), || {
+            if pooled {
+                pool(&spinning).served() == 1
+            } else {
+                spinning.stores_created() == 1
+            }
+        })
+        .await;
+        eventually("the one-stream SETTINGS", Duration::from_secs(10), || {
+            client.current_max_send_streams() == 1
+        })
+        .await;
+
+        // the reset ends the stream; the spinning guest keeps its instance
+        // and the share
+        drop(first);
+        *current.lock().unwrap() = limited(loaded, &instances, None);
+        client = client.ready().await.unwrap();
+        let (second, _) = client.send_request(h2_get("/"), true).unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(20), second)
+            .await
+            .expect("the second stream is answered")
+            .unwrap();
+        assert_eq!(second.status(), 200, "pooled {pooled}");
+        started.elapsed()
     }
 
     // -- per-route cap ------------------------------------------------------
