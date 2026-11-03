@@ -4,21 +4,28 @@ Difficulty: Medium
 
 An app's mode cannot be chosen: `vm_sandbox` (`controller.rs`) derives it from the web process's
 `instances` alone (0 `per-connection`, 1 `shared`, more `pool`), and the README's table has annotations at
-"no effect" on this wicket. `reuse` cannot be reached at all, and a pool of one or a per-connection app
-that `cf app` shows as running neither.
+"no effect" on this wicket. `reuse` cannot be reached at all.
 
-Take an annotation, `wicket.sluice.ik.am/mode`, beside `budget-ms` and `instances` (`store.rs`, set from
-`cf push`'s manifest `metadata` and the v3 API alike): a setting of the sandbox is what the annotations already
-hold, and a label is for selecting apps. No annotation keeps today's mapping.
+The user's direction: **`cf scale` sets the upper limit, annotations set the lifetime.**
 
-- settle what `instances` means under each mode: `pool` its `vms`; `shared` above 1 and `per-connection` /
-  `reuse` with a count: refused or what the count becomes, the instance state `cf app` shows in step
-- a value that is no mode is refused at the push, as `manifest.rs` refuses `instances: many` (that check
-  is for numbers), and by the v3 API
-- `reuse`'s and the cloned modes' options (`keep-ms`, `uses`, `lifetime-ms`, `warm`, `conns`): which become
-  annotations, or are left at the wicket's defaults and the README says so
+- `cf scale -i N` is the route's `vms=N`, the cap of VMs, under every cloned mode
+- annotations beside `budget-ms` and `instances` (`store.rs`, set from `cf push`'s manifest `metadata` and
+  the v3 API alike; a label is for selecting apps): `wicket.sluice.ik.am/mode`, and how long a VM lives:
+  `keep-ms`, `uses`, `lifetime-ms`. No annotation keeps today's mapping
+
+To settle:
+
+- a pool's `warm` defaults to `vms`: a fixed size, no VM beyond `warm`, so `keep-ms` never applies and N is
+  a floor as much as a cap. For N to be a limit, what does `warm` become when a lifetime is annotated: an
+  annotation of its own, or 0 once a lifetime is set (scaling to zero, a cold request paying the restore)
+- what `instances` 0 and 1 mean once a count is a cap: today they pick the mode. With a mode annotated, is
+  `-i 0` refused, and `shared` above 1 refused or the VM still one; the instance state and count `cf app`
+  shows when VMs come and go below the cap
+- an annotation its mode does not take (`uses` and `lifetime-ms` are `reuse`'s, `keep-ms` `reuse`'s and
+  `pool`'s): refused, not ignored. A value that is no mode or no number is refused at the push and by the
+  v3 API (`check_annotations` in `manifest.rs` holds numbers only)
 - a mode a disk cannot take (a disk is `mode=shared` alone) and a wasi wicket's app: what each does with
-  the annotation
+  the annotations
 - a changed annotation applies as `instances` does, or from the next start: `desired` in `controller.rs`
   compares `sandbox.mode`, so check a reload and a VM's start follow it
 - the instance index of `cf logs` (todo 212) under each mode
