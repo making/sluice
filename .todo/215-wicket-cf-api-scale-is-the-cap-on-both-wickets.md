@@ -1,40 +1,54 @@
 Difficulty: High
 
-# sluice-wicket-cf-api: `cf scale -i N` is the upper limit on both wickets
+# sluice-wicket-cf-api: `cf scale -i N` means N CF instances on both wickets
 
-The user's decision: `cf scale` sets the upper limit on the wasi wicket too, and annotations how an instance
-lives. Today only a Firecracker app's cloned modes have it:
+The user's decision: `cf scale` sets the upper limit on the wasi wicket too. And a limit that serves one request
+at a time at the `instances: 1` of most manifests is not acceptable: the spec below is the common-sense one.
 
-- wasi: `instances` is the route's `pool` (warm instances), the limit the annotation
-  `wicket.sluice.ik.am/instances`, unset unbounded (`controller.rs`, `Controller::desired`). `-i 1` with
-  `warm: 0` runs any number of instances while `cf app` says `1/1`. The Firecracker app refuses that
-  annotation saying "`cf scale -i` caps them"
-- Firecracker, none annotated: `-i N` is a fixed size, a floor as much as a limit, and 1 to 2 is no change of
-  count: `shared` to `pool`, the VM replaced, a snapshot's memory taken
+Today only a Firecracker app's cloned modes have a limit by `cf scale`. On wasi, `instances` is the route's
+`pool`, the limit the annotation `wicket.sluice.ik.am/instances`, unset bounded by `--max-instances` alone
+(`Controller::desired`). `-i 1` with `warm: 0` runs any number of instances while `cf app` says `1/1`.
 
-Do:
+## The spec
 
-- wasi: the route's `instances` from the process's `instances`, `pool` from `warm`. The annotation
-  `wicket.sluice.ik.am/instances` goes, and an app holding it gets what the README's upgrade note says
-- `cf logs`' index then stays within `0` to `N - 1` on wasi too (`.kb/live-access-log.md`: "one of its own the
-  lowest free from `pool` up")
+**An instance is what CF calls one: it takes many requests at once.** The limit is N instances, each taking
+`concurrency` at once, as Cloud Run's maximum instances and concurrency.
 
-To settle, for the long term rather than the smallest change:
+| | `-i N` limits | at once |
+|---|---|---|
+| wasi | `N x concurrency` slots (the route's `instances`); `pool` stays N unless `warm` says | `N x concurrency` requests |
+| Firecracker `shared` (N = 1) | 1 VM | any |
+| Firecracker `pool` | N VMs (`vms`), `concurrency` the route's `conns` | as the wicket's `conns` has it |
+| Firecracker `per-connection`, `reuse` | N VMs (`vms`): the memory is N x `mem`, as CF's quota counts it | N connections |
 
-- **what 1 means where an instance is per request or per connection**. A CF instance takes many requests at
-  once; a wasi instance or a `per-connection` / `reuse` VM takes one. `cf push` without `instances` gives
-  1, so a literal limit serves one request at a time and the next waits (on Firecracker up to `wait-ms`, 10s,
-  then 502). Options: the literal limit, said by the README and by the error; a larger count for a push
-  naming none, shown as such by `cf app`; an operator's default. A limit `cf app` does not show is not an
-  option: it is the mismatch this item removes. The README's migration "annotate it `per-connection` and
-  `cf scale -i 1`" is one connection at a time as it stands, and is rewritten either way
-- `warm`'s default on each wicket once N is a limit, and what a wasi `-i N` keeps warm on the upgrade
-- whether the unannotated Firecracker mapping stays (1 `shared`, more a fixed `pool`), and if so that
-  `cf scale` across 1 and 2 says what it replaces
-- the options a limit makes matter: `wait-ms`, `conns`, and `prime`, none of them annotations today
-- what a wicket's route without a limit means in the cf-api's listing comparison (`same`), so an app
-  upgraded is not restarted twice
+- the annotation `wicket.sluice.ik.am/concurrency`, from 1, default 16 (the wicket's `conns`): taken by wasi and
+  `pool`; `shared` has none, and `per-connection` / `reuse` are 1 by definition, so both refuse it. A wasi app
+  wanting one request at a time per instance annotates 1
+- `-i 1` with no annotation behaves as a CF app: a wasi app takes 16 requests at once, a Firecracker app is a
+  shared VM. No annotation is N instances kept up, as on CF: the limit only differs from the count below
+  it where `warm` or `keep-ms` ask for that
+- `per-connection` and `reuse` keep N literal: a VM is memory, and whoever annotates them chose one connection
+  per VM. Their README example names a real count, and `-i 1` is one connection at a time, so say it where
+  it is met: a warning on `cf push` / `cf scale` (`X-Cf-Warnings`, which the CLI prints, if it reads so), and the
+  502 of a connection finding no room. Rewrite the migration "annotate it `per-connection` and `cf scale -i 1`":
+  it should name a count of connections
+- the annotation `wicket.sluice.ik.am/instances` goes, refused saying `cf scale -i` and `concurrency` replace it.
+  An app holding it gets the README's upgrade note
+- `cf logs`' index stays in `0` to `N - 1`, what `cf app` lists: more units alive than N are instances' work, so
+  a wasi unit past N names `index % N` (settle whether the wicket or the cf-api maps it). A pool's and a VM's
+  index stay as they are: they are within N already
 
-The test: `vm_sandbox`'s table and `desired` in `controller.rs`, the scale steps of `tests/cli.rs` on both
-wickets, seen failing first. The cf-api's README tables, "How long a VM lives" and the upgrade notes in step.
-Mind todo 214 (the scale's check) and todo 216 (`warm`'s default), which touch the same lines.
+## To settle
+
+- a wasi route's slots counted against `--max-instances` (default 64): N x 16 may exceed it, which the wicket
+  refuses or not. A limit above the wicket's own should run, bounded by the wicket
+- `pool`'s `conns` is soft (past it a connection goes to the VM holding the fewest when no VM can start), wasi's
+  limit hard (it waits within the budget, then 503): the README says each, or they get closer
+- a wasi `warm` above N stays refused; `warm` up to `N x concurrency` is not needed
+- what `same` in `controller.rs` compares, so an app upgraded is not restarted twice
+- `wait-ms`, `prime`: annotations or not, by whether anything here needs them
+
+The test: `vm_sandbox`'s table and `desired` in `controller.rs`, the scale steps of `tests/cli.rs` on both wickets:
+a wasi app at `-i 1` answering requests at once, and limited at `-i 1` with `concurrency: 1`, seen failing first.
+The cf-api's README tables, "How long a VM lives", the upgrade notes and `.kb/live-access-log.md` in step. Mind todo
+214 (the scale's check) and todo 216 (`warm`'s default), which touch the same lines.
