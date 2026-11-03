@@ -504,7 +504,9 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
 - a PUT is one reload, as a deploy: every host of the app or none, kept only when the routes
   load; the same app again changes nothing, and an app keeps its `deployed` time while its
   component and sandbox stay. An app listed by `GET /api/apps` is a body its PUT takes (less
-  `name` and `deployed`, and the env's values); a PUT is 1MiB at most
+  `name`, `deployed` and `alive`, and the env's values); a PUT is 1MiB at most
+- `alive` in a listing: the [indices](#live-access-log) of its instances alive, lowest first, a
+  warm one's and a request's own while it runs
 - an app's routes share a handler, and never with another app (its target names it,
   `…/counter.wasm?app=counter&…`): its pool, its `instances` cap and its guests' output stay
   its own. Its target names neither `pool` nor `instances`: a PUT changing them is [no change of

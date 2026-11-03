@@ -25,6 +25,8 @@ const EDIT_TIMEOUT: Duration = Duration::from_secs(240);
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(660);
 /// A listing with `after` is held 25s at most.
 const LIST_TIMEOUT: Duration = Duration::from_secs(40);
+/// One without is answered at once: `cf app` does not wait long to show the wicket away.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Wicket {
     client: reqwest::Client,
@@ -173,6 +175,11 @@ pub struct ListedApp {
     #[serde(flatten)]
     pub app: AppBody,
     pub deployed: String,
+    /// The wicket's indices of the instances alive, as the live access log names them.
+    pub alive: Vec<u64>,
+    /// Why a VM it keeps went down, until one is up in its place.
+    #[serde(default)]
+    pub down: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -240,11 +247,14 @@ impl Wicket {
     /// The apps; with `after` the current revision, once they changed (25s
     /// at most).
     pub async fn list(&self, after: Option<u64>) -> Result<Listing, Failure> {
-        let url = match after {
-            Some(after) => format!("{}/api/apps?after={after}", self.base),
-            None => format!("{}/api/apps", self.base),
+        let (url, timeout) = match after {
+            Some(after) => (
+                format!("{}/api/apps?after={after}", self.base),
+                LIST_TIMEOUT,
+            ),
+            None => (format!("{}/api/apps", self.base), READ_TIMEOUT),
         };
-        let request = self.client.get(url).timeout(LIST_TIMEOUT);
+        let request = self.client.get(url).timeout(timeout);
         let (status, body) = self.send(request).await?;
         if !status.is_success() {
             return Err(refused(status, &body));

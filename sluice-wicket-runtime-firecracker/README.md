@@ -465,6 +465,8 @@ digest, or made of an OCI image, first; the app names it:
   listings name the variables only (`"env": ["GREETING"]`), never a value
 - `tag` (optional) is opaque to the wicket, kept and listed as given: a controller tells by it
   what it put, an env it cannot read back included. A tag or hosts alone start no VM
+- `alive` in a listing: the `instance` indices of its VMs alive, lowest first; `down`, when told:
+  why a VM it keeps went down, until one is up in its place
 - a PUT is one reload: every host of the app or none, kept only when its VMs started; the same
   app again changes nothing. An app's target names it (`?app=<name>`), so its VMs are its own,
   whoever else names the image; the env is in no target: another env starts its VMs anew. Its

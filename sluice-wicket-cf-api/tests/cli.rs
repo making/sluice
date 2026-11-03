@@ -350,7 +350,8 @@ fn listing(console: &str) -> Value {
     serde_json::from_str(&body).unwrap()
 }
 
-/// What `cf app` shows of the instances: `<running>/<wanted>`.
+/// What `cf app` shows of the instances: `<running>/<listed>`, those alive once the wicket took
+/// the app.
 fn instances_shown(cf: &Cf, app: &str) -> String {
     let shown = cf.ok(&["app", app]);
     let line = shown.lines().find(|line| line.starts_with("instances:"));
@@ -358,6 +359,22 @@ fn instances_shown(cf: &Cf, app: &str) -> String {
     count
         .unwrap_or_else(|| panic!("no instances: {shown}"))
         .to_string()
+}
+
+/// Waits for `cf app` to show `count` of the instances: they come and go as it reads them.
+fn instances_come_to(cf: &Cf, app: &str, count: &str) {
+    let deadline = Instant::now() + HANG;
+    loop {
+        let shown = instances_shown(cf, app);
+        if shown == count {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{app} shows {shown}, not {count}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Merges `annotations` into the app's through the v3 API: the answer, an error's too.
@@ -762,6 +779,26 @@ fn the_cf_cli_deploys_to_the_wicket() {
     cf.ok(&["restart", "hello"]);
     assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 0);
     assert_eq!(get(&listen, "hello.localhost", "/", None).0, 200);
+    // `cf app` lists what is alive: none between requests, which nothing waiting for a start
+    // takes for a failure, and a request's own while it runs
+    instances_come_to(&cf, "hello", "0/0");
+    cf.ok(&["restart", "hello"]);
+    cf.ok(&["restart", "hello", "--strategy", "rolling"]);
+    let deadline = Instant::now() + HANG;
+    loop {
+        let stream = held(&listen, "hello.localhost", "/stream");
+        let shown = cf.ok(&["app", "hello"]);
+        drop(stream);
+        if shown
+            .lines()
+            .any(|line| line.starts_with("#0") && line.contains("running"))
+        {
+            assert_eq!(shown.matches("\n#").count(), 1, "{shown}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "{shown}");
+    }
+    instances_come_to(&cf, "hello", "0/0");
     // refused, a PATCH changes nothing, of what came with the annotation neither
     let guid = cf.ok(&["app", "hello", "--guid"]);
     let path = format!("/v3/apps/{}", guid.trim());
@@ -1849,6 +1886,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         (&"pool".into(), &2.into())
     );
     assert_eq!(target(), advertised, "nothing to advertise");
+    instances_come_to(&cf, "fc", "2/2");
     // the first VM counts on, the second counts from 1
     let deadline = Instant::now() + HANG;
     let mut counts = std::collections::BTreeSet::new();
@@ -1894,8 +1932,11 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         );
         std::thread::sleep(Duration::from_millis(500));
     }
-    // the last one past the limit: no request reaches it, whatever it keeps of its time
+    instances_come_to(&cf, "fc", "3/3");
+    // the last one past the limit: no request reaches it, whatever it keeps of its time, and it
+    // is named as one of those within it while it is there
     cf.ok(&["scale", "fc", "-i", "2"]);
+    assert_eq!(instances_shown(&cf, "fc"), "2/2");
     assert_eq!(target(), advertised);
     for _ in 0..6 {
         assert_eq!(get(&listen, "fc.localhost", "/after-scale", None).0, 200);
@@ -1938,9 +1979,16 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
             assert!(Instant::now() < deadline, "{what}: VMs stay");
             std::thread::sleep(Duration::from_millis(200));
         }
-        // the cap, whatever comes and goes below it
-        assert_eq!(instances_shown(&cf, "fc"), "2/2", "{what}");
+        // none alive: none listed, which nothing waiting for a start takes for a failure, and
+        // the VM of a connection while it is there
+        assert_eq!(instances_shown(&cf, "fc"), "0/0", "{what}");
+        cf.ok(&["restart", "fc"]);
+        cf.ok(&["restart", "fc", "--strategy", "rolling"]);
+        let holding = held(&listen, "fc.localhost", "/");
         shows("fc", "running");
+        assert_eq!(instances_shown(&cf, "fc"), "1/1", "{what}");
+        drop(holding);
+        instances_come_to(&cf, "fc", "0/0");
     };
     let reuse = json!({
         "wicket.sluice.ik.am/mode": "reuse",

@@ -595,6 +595,7 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
     let listed_app = listed.as_object_mut().unwrap();
     assert_eq!(listed_app.remove("name"), Some("shop".into()));
     assert!(listed_app.remove("deployed").is_some());
+    assert!(listed_app.remove("alive").is_some());
     let again = listed.to_string().into_bytes();
     let (status, _, body) = console(&at, "PUT /api/apps/shop", &[bearer], &again).await;
     assert_eq!(

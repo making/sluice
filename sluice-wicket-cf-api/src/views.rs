@@ -1,6 +1,8 @@
 //! The resources in Cloud Controller v3's shapes, their lists filtered,
 //! ordered and paginated as the CLI asks.
 
+use std::collections::BTreeSet;
+
 use serde_json::{Value, json};
 
 use crate::controller::Controller;
@@ -8,7 +10,7 @@ use crate::store::{
     App, Build, Deployment, Droplet, Job, Lifecycle, Named, Outcome, Package, ROOTFS_STACK, Route,
     STACK, SecurityGroup, State, epoch_secs, now,
 };
-use crate::wicket::Runtime;
+use crate::wicket::{ListedApp, Runtime};
 
 /// The Cloud Controller version announced.
 pub const CC_VERSION: &str = "3.200.0";
@@ -251,26 +253,40 @@ pub fn process(base: &str, state: &State, app: &App) -> Value {
     })
 }
 
-/// The process stats: `instances` entries, none at 0, whatever is alive below them,
-/// `RUNNING` once the wicket took the app, `CRASHED` with its refusal as `details`, `STARTING` while it
-/// is unreachable, `DOWN` for a stopped app.
-pub fn stats(state: &State, app: &App, owner: &str) -> Value {
-    let (instance_state, details, since) = match (&app.running, app.started) {
-        (Some(running), true) => match state.wicket.get(&app.guid) {
-            Some(Outcome::Running) => ("RUNNING", None, running.since),
-            Some(Outcome::Refused(detail)) => ("CRASHED", Some(detail.clone()), running.since),
-            Some(Outcome::Unreachable) => ("STARTING", None, running.since),
-            // no answer yet: an app without a route is nothing the wicket serves
-            None if Controller::desired(state, app, owner).is_none() => {
-                ("RUNNING", None, running.since)
-            }
-            None => ("STARTING", None, running.since),
-        },
-        _ => ("DOWN", None, epoch_secs()),
+/// What `cf app` lists, as the CLI reads it: it counts the entries and, at a start, waits for an
+/// entry `RUNNING` or for none, failing once all are `CRASHED`.
+///
+/// `DOWN` for a stopped app and, of `instances` entries too, `CRASHED` with the wicket's refusal
+/// as `details` and `STARTING` until it serves the app (`listed`, as it answers now). Serving it,
+/// an entry `RUNNING` per instance alive, by the index `cf logs` names, and `CRASHED` for a VM it
+/// keeps gone down: none is a limit not reached, no failure, as is an app the wicket has no reason
+/// to serve (at 0, without a route).
+pub fn stats(state: &State, app: &App, owner: &str, listed: Option<&ListedApp>) -> Value {
+    let instances = app.process.instances;
+    let all = |instance_state, details: Option<&String>| -> Vec<(u64, &str, Option<String>)> {
+        (0..instances)
+            .map(|index| (index, instance_state, details.cloned()))
+            .collect()
+    };
+    let (entries, since) = match (&app.running, app.started) {
+        (Some(running), true) => (
+            match state.wicket.get(&app.guid) {
+                _ if Controller::desired(state, app, owner).is_none() => Vec::new(),
+                Some(Outcome::Refused(detail)) => all("CRASHED", Some(detail)),
+                Some(Outcome::Running) => match listed {
+                    Some(listed) => alive(listed, instances),
+                    None => all("STARTING", None),
+                },
+                Some(Outcome::Unreachable) | None => all("STARTING", None),
+            },
+            running.since,
+        ),
+        _ => (all("DOWN", None), epoch_secs()),
     };
     let uptime = epoch_secs().saturating_sub(since);
-    let resources: Vec<Value> = (0..app.process.instances)
-        .map(|index| {
+    let resources: Vec<Value> = entries
+        .into_iter()
+        .map(|(index, instance_state, details)| {
             json!({
                 "type": "web", "index": index, "state": instance_state, "routable": true,
                 "usage": {"time": now(), "cpu": 0.0, "cpu_entitlement": 0.0, "mem": 0, "disk": 0, "log_rate": 0},
@@ -285,6 +301,27 @@ pub fn stats(state: &State, app: &App, owner: &str) -> Value {
         })
         .collect();
     json!({"resources": resources})
+}
+
+/// The entries of what the wicket lists alive of an app of `instances`, by index, those it names
+/// by one index as one; and of a VM gone down, at the first index below `instances` no other holds.
+fn alive(listed: &ListedApp, instances: u64) -> Vec<(u64, &'static str, Option<String>)> {
+    let indices: BTreeSet<u64> = listed
+        .alive
+        .iter()
+        .map(|index| crate::flume::listed(*index, instances))
+        .collect();
+    let down = listed.down.as_ref().and_then(|why| {
+        let free = (0..instances).find(|index| !indices.contains(index))?;
+        Some((free, "CRASHED", Some(why.clone())))
+    });
+    let mut entries: Vec<_> = indices
+        .into_iter()
+        .map(|index| (index, "RUNNING", None))
+        .chain(down)
+        .collect();
+    entries.sort_by_key(|entry| entry.0);
+    entries
 }
 
 pub fn route(base: &str, state: &State, route: &Route) -> Value {
@@ -718,6 +755,107 @@ mod tests {
         form_urlencoded::parse(text.as_bytes())
             .into_owned()
             .collect()
+    }
+
+    /// What the stats give of an app of 2 instances, as the CLI reads them.
+    #[test]
+    fn the_stats_list_what_is_alive() {
+        let mut state = State::new("o", "s", &["localhost".into()]);
+        let guid = state.create_app("a", crate::store::STACK).guid.clone();
+        let domain = state.domains[0].guid.clone();
+        let app = state.app_mut(&guid).unwrap();
+        app.process.instances = 2;
+        let listed = |alive: Value, down: Value| -> ListedApp {
+            serde_json::from_value(json!({
+                "name": "a", "owner": "cf", "hosts": [], "deployed": "now",
+                "component": {"sha256": "", "name": ""}, "sandbox": {},
+                "alive": alive, "down": down,
+            }))
+            .unwrap()
+        };
+        let entries = |state: &State, listed: Option<&ListedApp>| {
+            let app = state.app(&guid).unwrap();
+            let stats = stats(state, app, "cf", listed);
+            let resources = stats["resources"].as_array().unwrap().clone();
+            let entry = |entry: &Value| {
+                let details = entry["details"].as_str().map(String::from);
+                let index = entry["index"].as_u64().unwrap();
+                (index, entry["state"].as_str().unwrap().to_string(), details)
+            };
+            resources.iter().map(entry).collect::<Vec<_>>()
+        };
+        let some = |index, instance_state: &str| (index, instance_state.to_string(), None);
+        let one = listed(json!([0]), Value::Null);
+
+        // stopped, never started: down
+        let down = vec![some(0, "DOWN"), some(1, "DOWN")];
+        assert_eq!(entries(&state, Some(&one)), down);
+        let app = state.app_mut(&guid).unwrap();
+        app.started = true;
+        app.running = Some(crate::store::Running {
+            droplet: "d".into(),
+            sha256: "ab".repeat(32),
+            file: "a.wasm".into(),
+            memory_mib: 64,
+            budget_ms: None,
+            lifetime: crate::store::Lifetime::default(),
+            wasi: Vec::new(),
+            keyvalue: Default::default(),
+            env: Default::default(),
+            egress: Vec::new(),
+            tag: None,
+            since: 0,
+        });
+
+        // without a route: nothing for the wicket to serve
+        assert_eq!(entries(&state, None), vec![]);
+        let route = state.create_route("a", &domain).guid.clone();
+        state.map(&route, &guid);
+
+        // the wicket's answer awaited, away, refused
+        let starting = vec![some(0, "STARTING"), some(1, "STARTING")];
+        assert_eq!(entries(&state, None), starting);
+        state.wicket.insert(guid.clone(), Outcome::Unreachable);
+        assert_eq!(entries(&state, None), starting);
+        let refused = Outcome::Refused("no".into());
+        state.wicket.insert(guid.clone(), refused);
+        let crashed = |index| (index, "CRASHED".to_string(), Some("no".to_string()));
+        assert_eq!(entries(&state, None), [crashed(0), crashed(1)]);
+
+        // taken, and gone from its listing or the listing not read
+        state.wicket.insert(guid.clone(), Outcome::Running);
+        assert_eq!(entries(&state, None), starting);
+
+        // what is alive, by the index `cf logs` names, one index one entry; none is no failure
+        for (alive, listed_as) in [
+            (json!([]), vec![]),
+            (json!([0]), vec![some(0, "RUNNING")]),
+            (json!([1]), vec![some(1, "RUNNING")]),
+            (json!([2]), vec![some(0, "RUNNING")]),
+            (json!([0, 2, 4]), vec![some(0, "RUNNING")]),
+            (json!([1, 2]), vec![some(0, "RUNNING"), some(1, "RUNNING")]),
+        ] {
+            assert_eq!(
+                entries(&state, Some(&listed(alive.clone(), Value::Null))),
+                listed_as,
+                "{alive}"
+            );
+        }
+
+        // a VM it keeps gone down, at an index no other holds: a failure of all at none alive
+        let why = |index| (index, "CRASHED".to_string(), Some("exit 83".to_string()));
+        for (alive, listed_as) in [
+            (json!([]), vec![why(0)]),
+            (json!([0]), vec![some(0, "RUNNING"), why(1)]),
+            (json!([1]), vec![why(0), some(1, "RUNNING")]),
+            (json!([0, 1]), vec![some(0, "RUNNING"), some(1, "RUNNING")]),
+        ] {
+            assert_eq!(
+                entries(&state, Some(&listed(alive.clone(), json!("exit 83")))),
+                listed_as,
+                "{alive}"
+            );
+        }
     }
 
     #[test]

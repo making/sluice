@@ -241,6 +241,7 @@ impl Console {
                 },
                 tag: tag.clone(),
                 deployed: deployed.clone(),
+                alive: handler.alive(),
             });
         }
         AppsView {
@@ -655,7 +656,7 @@ struct AppsView {
 }
 
 /// An app as listed: what its PUT takes -- but the env, named only -- its
-/// name, and since when it serves this component and sandbox.
+/// name, since when it serves this component and sandbox, and what of it is up.
 #[derive(Serialize)]
 struct AppView {
     name: String,
@@ -666,6 +667,8 @@ struct AppView {
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<String>,
     deployed: String,
+    /// The instance indices of its instances alive, lowest first.
+    alive: Vec<usize>,
 }
 
 /// An app's sandbox as listed: the env's names in place of the env, left

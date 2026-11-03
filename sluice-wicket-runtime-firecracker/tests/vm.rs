@@ -1111,13 +1111,39 @@ async fn restarting_app(
     assert_ne!(field(&again, "boot id"), boot_id, "another VM");
     assert_eq!(route.get(next(), "/env").await, "RUN=1\n");
 
-    // the next end, soon after: told at once, the VM started after a wait
+    let up = async || {
+        let (status, listing) = console(at, "GET", "/api/apps", true, Bytes::new()).await;
+        assert_eq!(status, 200, "{listing}");
+        let apps = listing["apps"].as_array().unwrap();
+        let app = apps.iter().find(|app| app["name"] == "crash").unwrap();
+        (app["alive"].clone(), app["down"].clone())
+    };
+    assert_eq!(
+        up().await,
+        (serde_json::json!([0]), serde_json::Value::Null)
+    );
+
+    // the next end, soon after: told at once, the VM started after a wait, the app listed with
+    // none alive and why until then
     let ended = Instant::now();
     assert_eq!(route.post(next(), "/exit", "").await, "exiting\n");
+    let (alive, down) = loop {
+        let (alive, down) = up().await;
+        if !down.is_null() {
+            break (alive, down);
+        }
+        assert!(ended.elapsed() < RESTART, "not told: {}", wicket.log());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(alive, serde_json::json!([]), "{down}");
     restarted(wicket, "crash.local", 2).await;
     let waited = ended.elapsed();
     assert!(waited >= Duration::from_secs(1), "{waited:?}");
     assert_eq!(route.get(next(), "/env").await, "RUN=1\n");
+    assert_eq!(
+        up().await,
+        (serde_json::json!([0]), serde_json::Value::Null)
+    );
 
     let gone = "/api/apps/crash?owner=cf";
     let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;

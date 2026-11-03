@@ -717,7 +717,7 @@ impl Api {
                     &store.read(|state| views::process(base, state, &app)),
                 ))
             }
-            (&Method::GET, ["apps", guid, "processes", "web", "stats"]) => self.stats(guid),
+            (&Method::GET, ["apps", guid, "processes", "web", "stats"]) => self.stats(guid).await,
             (&Method::POST, ["apps", guid, "processes", "web", "actions", "scale"]) => {
                 self.scale(req, guid).await
             }
@@ -886,7 +886,7 @@ impl Api {
             (&Method::PATCH, ["processes", guid]) => self.patch_process(req, guid).await,
             (&Method::GET, ["processes", guid, "stats"]) => {
                 let app = self.app_of_process(guid)?;
-                self.stats(&app.guid)
+                self.stats(&app.guid).await
             }
             (&Method::GET, ["processes", guid, "sidecars"]) => {
                 self.app_of_process(guid)?;
@@ -1128,12 +1128,28 @@ impl Api {
         ))
     }
 
-    fn stats(&self, guid: &str) -> Reply {
+    /// The process stats, of the instances alive as the wicket lists them at this request: its
+    /// long poll answers when its apps change, not when an instance comes or goes. None read of
+    /// a wicket known away, or not serving the app.
+    async fn stats(&self, guid: &str) -> Reply {
         let app = self.app(guid)?;
-        let owner = &self.controller.wicket.owner;
+        let wicket = &self.controller.wicket;
+        let serving = self.store.read(|state| {
+            matches!(state.wicket.get(guid), Some(Outcome::Running))
+                && Controller::desired(state, &app, &wicket.owner).is_some()
+        });
+        let listed = match serving {
+            true => wicket.list(None).await.ok().and_then(|listing| {
+                let mut apps = listing.apps.into_iter();
+                apps.find(|listed| listed.name == guid && listed.app.owner == wicket.owner)
+            }),
+            false => None,
+        };
         Ok(json(
             StatusCode::OK,
-            &self.store.read(|state| views::stats(state, &app, owner)),
+            &self
+                .store
+                .read(|state| views::stats(state, &app, &wicket.owner, listed.as_ref())),
         ))
     }
 

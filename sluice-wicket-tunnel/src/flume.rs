@@ -334,6 +334,12 @@ impl Indices {
             index,
         }
     }
+
+    /// The indices held, lowest first: the instances alive.
+    pub fn held(&self) -> Vec<usize> {
+        let held = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        held.iter().copied().collect()
+    }
 }
 
 /// An instance's index, freed when it drops.

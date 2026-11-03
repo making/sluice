@@ -294,6 +294,8 @@ impl Console {
                 sandbox: sandbox_view(&route.spec()),
                 tag: tag.clone(),
                 deployed: deployed.clone(),
+                alive: route.alive(),
+                down: route.down(),
             });
         }
         AppsView {
@@ -708,7 +710,7 @@ struct AppsView {
 }
 
 /// An app as listed: what its PUT takes -- but the env, named only -- its name,
-/// and since when it serves this image, these options and this env.
+/// since when it serves this image, these options and this env, and what of it is up.
 #[derive(Serialize)]
 struct AppView {
     name: String,
@@ -719,6 +721,11 @@ struct AppView {
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<String>,
     deployed: String,
+    /// The instance indices of its VMs alive, lowest first.
+    alive: Vec<usize>,
+    /// Why a VM it keeps went down, as far as told, until one is up in its place.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    down: Option<String>,
 }
 
 /// The body of an app's PUT.

@@ -1968,6 +1968,19 @@ impl Route {
         vms
     }
 
+    /// The instance indices of its VMs alive, lowest first: a clone's from its restore on, the
+    /// shared VM's 0 (see the module's).
+    pub fn alive(&self) -> Vec<usize> {
+        match &self.backend {
+            Backend::Shared { vm, .. } => match vm.lock().unwrap().is_some() {
+                true => vec![0],
+                false => Vec::new(),
+            },
+            Backend::Cloned { cloner, .. } => cloner.indices.held(),
+            Backend::Pool(pool) => pool.cloner.indices.held(),
+        }
+    }
+
     /// Cloned modes: its template's snapshot.
     pub fn taken(&self) -> Option<&Taken> {
         self.taken.as_ref()

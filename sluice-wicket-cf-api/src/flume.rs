@@ -297,7 +297,7 @@ fn instance(event: &AccessEvent) -> Option<u64> {
 /// The wicket's instance `index` as `cf app` lists an app of `instances`: only the cf-api knows
 /// them, and a wasm wicket's route runs more at once, the requests of an instance. Of an app at
 /// 0, which lists none, or gone, as it came.
-fn listed(index: u64, instances: u64) -> u64 {
+pub(crate) fn listed(index: u64, instances: u64) -> u64 {
     index.checked_rem(instances).unwrap_or(index)
 }
 

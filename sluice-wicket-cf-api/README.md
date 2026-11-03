@@ -656,9 +656,8 @@ applications:
   so it must hold both as the app runs (what its last start took) and as annotated, refused
   naming which: `cf restart` undoes a difference. A manifest's `instances` the running app
   cannot take (`cf push` restarts it right after) waits for the next start, the log saying so
-  and `cf app` showing the new number
-- `cf app` shows the limit, `4/4`, `RUNNING` however many VMs are alive: the wicket took the app.
-  The wicket's `GET /api/routes` counts them (`vms.alive`)
+- `cf app` lists [the VMs alive](#instances), one coming with its restore and going as these say,
+  `0/0` with none
 
 ### Security groups
 
@@ -748,10 +747,10 @@ What holds on both wickets; a component's and a VM's are in
 | CF | wicket |
 |---|---|
 | app, started, with a droplet and a route | an app named by its guid, owner `cf`: its routes' hosts, the droplet's component, the sandbox below |
-| app stopped, scaled to 0, or without a route | no app in the wicket: a request gets the wicket's 404, as gorouter answers a route with no instance registered. `cf app` shows `0/0`, `cf push` of `instances: 0` waits for none |
+| app stopped, scaled to 0, or without a route | no app in the wicket: a request gets the wicket's 404, as gorouter answers a route with no instance registered. `cf app` shows `0/0` (stopped: `0/N`, each `DOWN`), `cf push` of `instances: 0` waits for none |
 | route `<host>.<domain>` | a host: labels of `a-z`, `0-9` and `-`. No path, port or wildcard (422). A route serves one app: a second destination is refused; zero-downtime updates are `--strategy rolling` |
 | shared domain | `--domain` |
-| instance state | `RUNNING` once the wicket took the app, its VM going down and started again by the wicket included; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable. One entry per `instances`, whatever is alive: a component's come per request, a VM's [per its annotations](#how-long-a-vm-lives) |
+| instance state | once the wicket took the app, an entry per [instance alive](#instances), `RUNNING`, and a VM it keeps gone down `CRASHED` with why as `details`, until one is up in its place; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable or has not taken the app. These two list `instances` entries |
 | rolling deployment | the app put with the new droplet: the wicket swaps it in place; finalized at once |
 | org / space | one of each |
 | health check, log rate, stack, buildpacks | accepted and shown, no effect |
@@ -791,10 +790,17 @@ shared VM has no snapshot to clone the second from ([weighed](../.kb/wicket-fire
   within the route's `wait-ms` (10s), then gets a 502 saying so
 - **A limit above the wicket's own** runs, bounded by the wicket: N x 16 past `--max-instances`
   is no refusal
-- **`cf logs`** stays within what `cf app` lists, `0` to `N - 1`: of a component the units alive may
+- **`cf app`** lists the instances alive, as the wicket has them at each request: a warm one, a VM
+  serving or kept, a request's own while it runs. So `3/3` below a limit of 4, and `0/0`,
+  `There are no running instances of this process`, with none: no failure, and `cf push`, `cf restart`
+  and `--strategy rolling` finish at it, the CLI's wait ending at an entry `RUNNING` or at no entry.
+  The CLI counts the entries, so the limit cannot show as `3/4`: entries for the rest would read
+  as failed, and at none alive keep that wait until its timeout. The limit is the process's
+  `instances` (`cf create-app-manifest`, `cf curl /v3/apps/<guid>/processes/web`)
+- **`cf logs`** names what `cf app` lists, `0` to `N - 1`: of a component the units alive may
   outnumber N, the work of N instances, and the cf-api names one `index % N`, knowing N as the
-  wicket does not. A VM's index is within N already, but for one past a scale down finishing its
-  connections, named so too
+  wicket does not; those of one index are one entry. A VM's index is within N already, but for one
+  past a scale down finishing its connections, named so too
 
 ## Behavior
 
