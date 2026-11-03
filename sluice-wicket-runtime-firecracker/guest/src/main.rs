@@ -538,7 +538,8 @@ struct Hook {
 /// waiting discarded (the snapshot's), the clock set (given a time), the seed into
 /// the kernel's random pool,
 /// the pool reseeded, hello mode's generator reseeded, the hook run (its output
-/// to `log`); then `OK`. And its question of the disk, and its stop notice (`stop`).
+/// to `log`); then `OK`. And its question of the disk, and its stop notice (`stop`): hello mode,
+/// given `STOP_UNANSWERED`, none answered, a wedged `/init` as the wicket sees one.
 async fn control_loop(listener: VsockListener, hook: Option<Hook>, log: Arc<Log>) {
     let hook = Arc::new(hook);
     loop {
@@ -562,6 +563,9 @@ async fn control_loop(listener: VsockListener, hook: Option<Hook>, log: Arc<Log>
                     None => Err(std::io::Error::other("no disk given")),
                 }
             } else if let Some(grace) = wire::parse_stop(line) {
+                if hook.is_none() && given("STOP_UNANSWERED").is_some() {
+                    std::future::pending::<()>().await;
+                }
                 stop(grace).await
             } else if let Some(notice) = wire::Notice::parse(line) {
                 restored(&notice, &hook, &log).await

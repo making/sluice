@@ -69,6 +69,8 @@ const REFILL_WORKERS: usize = 8;
 /// How long a route's start may wait for room for its VM (a shared one, or the
 /// template): the room another route's start holds frees within it.
 const START_WAIT: Duration = Duration::from_secs(60);
+// a VM stopping holds its room until it is gone
+const _: () = assert!(START_WAIT.as_secs() > disk::STOP_MOST.as_secs());
 
 /// Default of `wait-ms`: how long a connection may wait for room for its VM.
 const DEFAULT_WAIT: Duration = Duration::from_secs(10);

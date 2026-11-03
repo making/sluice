@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::BoxError;
 use crate::rootfs;
+use crate::vm;
 
 /// `disk-mib`'s default.
 pub const DEFAULT_MIB: u32 = 1024;
@@ -29,9 +30,14 @@ pub const MIN_MIB: u32 = 8;
 /// How long a stop gives the process to end before `/init` kills it and writes all out.
 pub const STOP_GRACE: Duration = Duration::from_secs(10);
 
-/// How long a VM's start waits for its disk: a VM stopping (`vm::Vm::stop`, 20s at most), then
-/// a connection's dial holding on to it (`vm::Vm::dial`, 10s at most), then its teardown.
+/// The longest a VM's stop takes (`vm::Vm::stop`), a wedged guest's: then it is killed.
+pub const STOP_MOST: Duration =
+    Duration::from_secs(STOP_GRACE.as_secs() + vm::STOP_WRITES.as_secs());
+
+/// How long a VM's start waits for its disk: a VM stopping ([`STOP_MOST`]), then a connection's
+/// dial holding on to it (`vm::Vm::dial`, 10s at most), then its teardown.
 const FREE_WAIT: Duration = Duration::from_secs(40);
+const _: () = assert!(FREE_WAIT.as_secs() > STOP_MOST.as_secs());
 
 /// A VM's disk.
 #[derive(Clone, Debug, PartialEq)]

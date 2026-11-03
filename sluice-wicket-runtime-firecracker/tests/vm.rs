@@ -19,7 +19,8 @@
 //! served on the tunnel, listed with its VMs, and an app of two hosts on one
 //! rootfs uploaded by digest, its env seen by the guest, and an app with a disk:
 //! what it wrote kept across a restart of its VM, a failed start, a growth and
-//! its app's removal, one VM at a time on it, an edit taking over from a reload there; a VM
+//! its app's removal, one VM at a time on it, an edit taking over from a reload, or from a restart
+//! there, or from a VM whose `/init` does not answer its stop; a VM
 //! never listening holding no other edit, by an app's edit, in the place of a disk's VM and
 //! through the config file;
 //! both served again after a restart from the console's directory (not with the
@@ -57,6 +58,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use sha2::Digest as _;
+use sluice_wicket_runtime_firecracker::{disk, jail};
 use sluice_wicket_tunnel::flume::testing::{FeedStream, flume_server};
 use sluice_wicket_tunnel::proto::{AccessFilter, feed_message};
 use sluice_wicket_tunnel::session::testing::{ServerTunnel, dial_address, tunnel_server};
@@ -377,17 +379,16 @@ async fn every_route_serves_http_through_the_tunnel() {
         wicket.log()
     );
 
-    // a pool's VMs killed: they are the wicket's children unjailed
-    if !jailed && image.is_none() {
+    // a pool's VMs killed: nothing of an image in it, its VMs out of the test's reach there
+    if image.is_none() {
         let pool = Route {
             tunnel: &tunnel,
             host: "pool.local",
             address: dial_address(&target("pool.local")),
             listen: None,
         };
-        let pid = wicket.child.id() as i32;
         let rootfs = dir.0.join("pool.ext4");
-        let replaced = pool.replaced(&mut conn_id, pid, &rootfs, &mut feed);
+        let replaced = pool.replaced(&mut conn_id, &wicket, &rootfs, &mut feed);
         assert!(
             tokio::time::timeout(HANG, replaced).await.is_ok(),
             "pool.local: its VMs killed: hung; {}",
@@ -398,9 +399,8 @@ async fn every_route_serves_http_through_the_tunnel() {
     // the config file's numbers of a route changed: its VMs stay
     let mut tunnel = tunnel;
     if image.is_none() {
-        let pid = wicket.child.id() as i32;
         let rootfs = dir.0.join("pool.ext4");
-        let vms = || (!jailed).then(|| vms_on(pid, &rootfs));
+        let vms = || (!jailed).then(|| wicket.vms_on(&rootfs));
         let address = dial_address(&target("pool.local"));
         let adjusted = adjusted_route(&mut tunnel, &wicket, &config, address, &mut conn_id, vms);
         assert!(
@@ -459,10 +459,9 @@ async fn every_route_serves_http_through_the_tunnel() {
             &console_dir,
             &config,
             &mut conn_id,
-            jailed,
         );
         assert!(
-            tokio::time::timeout(HANG, deployed).await.is_ok(),
+            tokio::time::timeout(2 * HANG, deployed).await.is_ok(),
             "the console: hung; {}",
             wicket.log()
         );
@@ -522,7 +521,7 @@ async fn every_route_serves_http_through_the_tunnel() {
             "{}",
             wicket.log()
         );
-        let kept = disk_kept(&mut tunnel, &wicket, &console_dir, &advertise, jailed);
+        let kept = disk_kept(&mut tunnel, &wicket, &console_dir, &advertise);
         assert!(
             tokio::time::timeout(HANG, kept).await.is_ok(),
             "the disk after a restart: hung; {}",
@@ -702,7 +701,6 @@ async fn deploy(
     dir: &Path,
     config: &Path,
     conn_id: &mut i64,
-    jailed: bool,
 ) {
     let at = wicket.console();
     let (status, _) = console(at, "GET", "/api/routes", false, Bytes::new()).await;
@@ -911,7 +909,7 @@ async fn deploy(
     let upload = format!("/api/components/{sha256}");
     let (status, uploaded) = console(at, "PUT", &upload, true, image).await;
     assert_eq!(status, 200, "{uploaded}");
-    disk_app(tunnel, wicket, &sha256, dir, conn_id, jailed).await;
+    disk_app(tunnel, wicket, &sha256, dir, conn_id).await;
 }
 
 /// The body of an app of `host` and `sandbox`, on the image `sha256`.
@@ -1551,19 +1549,21 @@ async fn on_data(
 /// An app with a disk: refused in a cloned mode; made once, what the guest wrote kept across
 /// its VM's restart, fsynced or not (the stop writes it out), a start that fails (the old VM
 /// started again on it) and its growth, a smaller size refused; a VM never listening in its
-/// place holding no other edit, none coming back on the disk meanwhile; for the app's VM alone,
-/// its id's in a jail; listed, and not removed under its app. One more file left unsynced, and a
-/// start under way: the wicket's end writes them out.
+/// place holding no other edit, none coming back on the disk meanwhile, and taken over from: so
+/// a VM whose `/init` does not answer its stop, killed at that stop's end, and a VM started again
+/// after its process ended; for the app's VM alone, its id's in a jail; listed, and not removed
+/// under its app. One more file left unsynced, and a start under way: the wicket's end writes them
+/// out.
 async fn disk_app(
     tunnel: &mut ServerTunnel,
     wicket: &Wicket,
     sha256: &str,
     dir: &Path,
     conn_id: &mut i64,
-    jailed: bool,
 ) {
     use std::os::unix::fs::MetadataExt as _;
     let at = wicket.console();
+    let jailed = wicket.jailed;
     let (status, refused) = put_data(
         at,
         sha256,
@@ -1680,54 +1680,92 @@ async fn disk_app(
 
     // a VM never listening in its place: the old one stopped, no edit waiting for its start, no
     // VM coming back on the disk meanwhile; the next edit takes over, all on the disk kept, what
-    // the VM taken over from wrote too (its stop writes it out)
+    // the VM taken over from wrote too (its stop writes it out). With an `/init` not answering, its
+    // stop takes as long as a stop can: the edit waits for it, the disk free as the VM is killed
     let again = "its VM starts again";
     let starts = wicket.log().matches(again).count();
-    let hung = serde_json::json!({"disk": "/tmp/data", "disk-mib": 128, "port": 9999, "boot-ms": 60_000, "env": {"RUN": "2", "WRITE_AT_START": "hung"}});
-    let image = sha256.to_string();
-    let hanging = tokio::spawn(async move { put_data(at, &image, hung).await });
-    let deadline = Instant::now() + SAID;
-    while listed(wicket, "data.local").await["vms"]["shared"] == true {
-        assert!(Instant::now() < deadline, "not stopped; {}", wicket.log());
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    for (name, unanswered, next) in [("hung", false, "2b"), ("wedged", true, "2c")] {
+        let mut hung = serde_json::json!({"disk": "/tmp/data", "disk-mib": 128, "port": 9999, "boot-ms": 60_000, "env": {"RUN": "2", "WRITE_AT_START": name}});
+        if unanswered {
+            hung["env"]["STOP_UNANSWERED"] = "1".into();
+        }
+        let image = sha256.to_string();
+        let hanging = tokio::spawn(async move { put_data(at, &image, hung).await });
+        let deadline = Instant::now() + SAID;
+        while listed(wicket, "data.local").await["vms"]["shared"] == true {
+            assert!(Instant::now() < deadline, "not stopped; {}", wicket.log());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        said(wicket, &format!("wrote {name}")).await;
+        another_app(tunnel, wicket, sha256).await;
+        assert!(!hanging.is_finished(), "it waited for the start");
+        assert_eq!(listed(wicket, "data.local").await["vms"]["shared"], false);
+        assert_eq!(
+            wicket.log().matches(again).count(),
+            starts,
+            "{}",
+            wicket.log()
+        );
+        let edited = Instant::now();
+        let (status, put) = put_data(at, sha256, sandbox(128, next)).await;
+        let took = edited.elapsed();
+        assert_eq!(
+            (status, put["message"].as_str()),
+            (200, Some("restarted data.local")),
+            "{put}; {}",
+            wicket.log()
+        );
+        assert_eq!(took >= disk::STOP_MOST, unanswered, "{took:?}");
+        let (status, refused) = hanging.await.unwrap();
+        assert_eq!(status, 422, "{refused}");
+        assert!(
+            refused["error"].as_str().unwrap().contains("took over"),
+            "{refused}"
+        );
+        let read = on_data(tunnel, &address, conn_id, "/disk?read=a", "").await;
+        assert_eq!(read, "fsynced");
+        if unanswered {
+            said(wicket, "its VM's stop: no answer within 20s").await;
+        } else {
+            let path = format!("/disk?read={name}");
+            let read = on_data(tunnel, &address, conn_id, &path, "").await;
+            assert_eq!(read, "unsynced", "{}", wicket.log());
+        }
     }
-    said(wicket, "wrote hung").await;
-    another_app(tunnel, wicket, sha256).await;
-    assert!(!hanging.is_finished(), "it waited for the start");
-    assert_eq!(listed(wicket, "data.local").await["vms"]["shared"], false);
-    assert_eq!(
-        wicket.log().matches(again).count(),
-        starts,
-        "{}",
-        wicket.log()
-    );
-    let (status, put) = put_data(at, sha256, sandbox(128, "2b")).await;
+
+    // its process ended, an edit taking over from the VM starting in its place: that VM stopped
+    // too, what it wrote over a file kept, and no other VM coming back on the disk
+    let slow = serde_json::json!({"disk": "/tmp/data", "disk-mib": 128, "env": {"WRITE_AT_START": "restart", "LISTEN_AFTER_MS": "2000"}});
+    let (status, put) = put_data(at, sha256, slow).await;
+    assert_eq!(status, 200, "{put}; {}", wicket.log());
+    let path = "/disk?write=restart&sync=1";
+    let wrote = on_data(tunnel, &address, conn_id, path, "before").await;
+    assert!(wrote.starts_with("wrote "), "{wrote}");
+    let mark = wicket.log().len();
+    let told = on_data(tunnel, &address, conn_id, "/exit", "").await;
+    assert_eq!(told, "exiting\n");
+    said_after(wicket, mark, "wrote restart").await;
+    let (status, put) = put_data(at, sha256, sandbox(128, "2d")).await;
     assert_eq!(
         (status, put["message"].as_str()),
         (200, Some("restarted data.local")),
         "{put}; {}",
         wicket.log()
     );
-    let (status, refused) = hanging.await.unwrap();
-    assert_eq!(status, 422, "{refused}");
-    assert!(
-        refused["error"].as_str().unwrap().contains("took over"),
-        "{refused}"
-    );
-    let read = on_data(tunnel, &address, conn_id, "/disk?read=a", "").await;
-    assert_eq!(read, "fsynced");
-    let read = on_data(tunnel, &address, conn_id, "/disk?read=hung", "").await;
+    let read = on_data(tunnel, &address, conn_id, "/disk?read=restart", "").await;
     assert_eq!(read, "unsynced", "{}", wicket.log());
+    let log = wicket.log();
+    assert_eq!(log[mark..].matches(again).count(), 1, "{log}");
 
-    // a wedged guest (its children, unjailed): its stop gives up in time, the VM killed, the
-    // next one started on what it had made durable
+    // a guest frozen whole, a dial not answered: its stop gives up in time, the VM killed, the next
+    // one started on what it had made durable (unjailed: a jail adds nothing the steps above and a
+    // pool's VMs killed do not show)
     if !jailed {
-        let held = vms_on(wicket.child.id() as i32, &file);
+        let held = wicket.vms_on(&file);
         let [vm] = held[..] else {
             panic!("one VM on the disk: {held:?}");
         };
-        // SAFETY: a plain kill of the wicket's child
-        assert_eq!(unsafe { libc::kill(vm, libc::SIGSTOP) }, 0);
+        wicket.signal("STOP", vm);
         let (status, put) = put_data(at, sha256, sandbox(128, "3")).await;
         assert_eq!(
             (status, put["message"].as_str()),
@@ -1739,12 +1777,11 @@ async fn disk_app(
 
         // its VM killed: another one, on what it made durable; the stops on purpose before
         // counted none
-        let held = vms_on(wicket.child.id() as i32, &file);
+        let held = wicket.vms_on(&file);
         let [vm] = held[..] else {
             panic!("one VM on the disk: {held:?}");
         };
-        // SAFETY: a plain kill of the wicket's child
-        assert_eq!(unsafe { libc::kill(vm, libc::SIGKILL) }, 0);
+        wicket.signal("KILL", vm);
         restarted(wicket, "data.local", 1).await;
         let read = on_data(tunnel, &address, conn_id, "/disk?read=a", "").await;
         assert_eq!(read, "fsynced");
@@ -1785,16 +1822,16 @@ async fn disk_app(
     }
 }
 
-/// The disk after the wicket's restart (a kill of the keeper, when `jailed`; else its end):
-/// what the app wrote; an edit taking over from a reload starting a VM on it (the reload's
-/// made after it, no poll to find the files changed: on SIGHUP, the wicket's own unjailed); its app
-/// removed, it stays for the next app of that name and owner, and goes once no VM holds it.
+/// The disk after the wicket's restart (a kill of the keeper, jailed; else its end):
+/// what the app wrote; an edit taking over from a reload starting a VM on it, what that VM wrote
+/// over a file kept (the reload's made after it, no poll to find the files changed: on SIGHUP,
+/// which a keeper passes on); its app removed, it stays for the next app of that name and owner,
+/// and goes once no VM holds it.
 async fn disk_kept(
     tunnel: &mut ServerTunnel,
     wicket: &Wicket,
     dir: &Path,
     advertised: &sluice_wicket_tunnel::proto::Advertise,
-    jailed: bool,
 ) {
     let at = wicket.console();
     let up = advertised
@@ -1805,46 +1842,44 @@ async fn disk_kept(
     let mut conn_id = 10;
     let read = on_data(tunnel, &address, &mut conn_id, "/disk?read=a", "").await;
     assert_eq!(read, "fsynced");
-    if !jailed {
+    if !wicket.jailed {
         let read = on_data(tunnel, &address, &mut conn_id, "/disk?read=c", "").await;
         assert_eq!(read, "at the end");
     }
     let sha256 = up.unwrap().target_url.split("/rootfs/").nth(1).unwrap();
     let sha256 = sha256.split('/').next().unwrap().to_string();
-    if !jailed {
-        let slow = serde_json::json!({"disk": "/tmp/data", "disk-mib": 128, "env": {"WRITE_AT_START": "swap", "LISTEN_AFTER_MS": "2000"}});
-        let (status, put) = put_data(at, &sha256, slow).await;
-        assert_eq!(status, 200, "{put}; {}", wicket.log());
-        let mark = wicket.log().len();
-        std::fs::File::open(dir.join("rootfs").join(&sha256).join("app.ext4"))
-            .unwrap()
-            .set_modified(std::time::SystemTime::now())
-            .unwrap();
-        // SAFETY: a plain kill of the wicket
-        assert_eq!(
-            unsafe { libc::kill(wicket.child.id() as i32, libc::SIGHUP) },
-            0
-        );
-        said_after(wicket, mark, "wrote swap").await;
-        let edit =
-            serde_json::json!({"disk": "/tmp/data", "disk-mib": 128, "env": {"RUN": "edit"}});
-        let (status, put) = put_data(at, &sha256, edit).await;
-        assert_eq!(
-            (status, put["message"].as_str()),
-            (200, Some("restarted data.local")),
-            "{put}; {}",
-            wicket.log()
-        );
-        said_after(wicket, mark, "routes reload (SIGHUP) failed").await;
-        said_after(wicket, mark, "took over from it").await;
-        said_after(wicket, mark, "routes reload (SIGHUP): no change").await;
-        let log = wicket.log();
-        assert!(!log[mark..].contains("its VM starts again"), "{log}");
-        let env = on_data(tunnel, &address, &mut conn_id, "/env", "").await;
-        assert_eq!(env, "RUN=edit\n");
-        let held = vms_on(wicket.child.id() as i32, &dir.join("disks/cf/data.ext4"));
-        assert_eq!(held.len(), 1, "one VM on the disk: {held:?}");
-    }
+    let slow = serde_json::json!({"disk": "/tmp/data", "disk-mib": 128, "env": {"WRITE_AT_START": "swap", "LISTEN_AFTER_MS": "2000"}});
+    let (status, put) = put_data(at, &sha256, slow).await;
+    assert_eq!(status, 200, "{put}; {}", wicket.log());
+    let path = "/disk?write=swap&sync=1";
+    let wrote = on_data(tunnel, &address, &mut conn_id, path, "before").await;
+    assert!(wrote.starts_with("wrote "), "{wrote}");
+    let mark = wicket.log().len();
+    std::fs::File::open(dir.join("rootfs").join(&sha256).join("app.ext4"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now())
+        .unwrap();
+    wicket.hang_up();
+    said_after(wicket, mark, "wrote swap").await;
+    let edit = serde_json::json!({"disk": "/tmp/data", "disk-mib": 128, "env": {"RUN": "edit"}});
+    let (status, put) = put_data(at, &sha256, edit).await;
+    assert_eq!(
+        (status, put["message"].as_str()),
+        (200, Some("restarted data.local")),
+        "{put}; {}",
+        wicket.log()
+    );
+    said_after(wicket, mark, "routes reload (SIGHUP) failed").await;
+    said_after(wicket, mark, "took over from it").await;
+    said_after(wicket, mark, "routes reload (SIGHUP): no change").await;
+    let log = wicket.log();
+    assert!(!log[mark..].contains("its VM starts again"), "{log}");
+    let env = on_data(tunnel, &address, &mut conn_id, "/env", "").await;
+    assert_eq!(env, "RUN=edit\n");
+    let read = on_data(tunnel, &address, &mut conn_id, "/disk?read=swap", "").await;
+    assert_eq!(read, "unsynced", "its stop wrote it out");
+    let held = wicket.vms_on(&dir.join("disks/cf/data.ext4"));
+    assert_eq!(held.len(), 1, "one VM on the disk: {held:?}");
     let path = "/api/apps/data?owner=cf";
     let (status, removed) = console(at, "DELETE", path, true, Bytes::new()).await;
     assert_eq!(status, 200, "{removed}");
@@ -2076,28 +2111,6 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
             .unwrap();
         assert!(cleaned.success());
     }
-}
-
-/// The VMs of the wicket `pid` (unjailed: its children) with `rootfs` open.
-fn vms_on(pid: i32, rootfs: &Path) -> Vec<i32> {
-    let threads = std::fs::read_dir(format!("/proc/{pid}/task")).unwrap();
-    threads
-        .filter_map(|thread| thread.ok()?.file_name().to_str()?.parse().ok())
-        .flat_map(|thread: i32| {
-            std::fs::read_to_string(format!("/proc/{pid}/task/{thread}/children"))
-                .unwrap_or_default()
-                .split_whitespace()
-                .filter_map(|child| child.parse().ok())
-                .collect::<Vec<i32>>()
-        })
-        .filter(|vm| {
-            std::fs::read_dir(format!("/proc/{vm}/fd")).is_ok_and(|mut fds| {
-                fds.any(|fd| {
-                    fd.is_ok_and(|fd| std::fs::read_link(fd.path()).is_ok_and(|to| to == rootfs))
-                })
-            })
-        })
-        .collect()
 }
 
 /// The children of `pid`.
@@ -2570,9 +2583,7 @@ impl Route<'_> {
 
     /// A pool route of 2 VMs at most, 1 kept, growing as each holds `conns=1`: a
     /// connection held, the next goes to a VM started for it; a third shares one of
-    /// them. Idle, the pool shrinks to one, and grows again with a VM of its own. With
-    /// the wicket's `pid` (its VMs its children), its VMs on `rootfs` killed: the next
-    /// connection gets a VM started in their place.
+    /// them. Idle, the pool shrinks to one, and grows again with a VM of its own.
     async fn pooled(&self, conn_id: &mut i64) {
         let mut next = || {
             *conn_id += 1;
@@ -2593,14 +2604,19 @@ impl Route<'_> {
         drop((p, q));
     }
 
-    /// A pool's VMs on `rootfs`, the children of `pid`, killed: the request after it gets a VM
-    /// in their place, of the instance index they freed.
-    async fn replaced(&self, conn_id: &mut i64, pid: i32, rootfs: &Path, feed: &mut FeedStream) {
-        let killed = vms_on(pid, rootfs);
+    /// A pool's VMs on `rootfs`, of `wicket`, killed: the request after it gets a VM in their
+    /// place, of the instance index they freed.
+    async fn replaced(
+        &self,
+        conn_id: &mut i64,
+        wicket: &Wicket,
+        rootfs: &Path,
+        feed: &mut FeedStream,
+    ) {
+        let killed = wicket.vms_on(rootfs);
         assert!(!killed.is_empty(), "{}: no VM", self.host);
         for &vm in &killed {
-            // SAFETY: kill
-            assert_eq!(unsafe { libc::kill(vm, libc::SIGKILL) }, 0);
+            wicket.signal("KILL", vm);
         }
         // ended: gone, or a zombie (its sockets closed)
         let ended = |vm: &i32| {
@@ -2862,6 +2878,8 @@ struct Wicket {
     log: PathBuf,
     /// The container's name, when run as an image.
     container: Option<String>,
+    /// In jail mode: its VMs the keeper's.
+    jailed: bool,
 }
 
 impl Wicket {
@@ -2872,7 +2890,7 @@ impl Wicket {
             .arg(firecracker)
             .arg("--kernel")
             .arg(kernel);
-        Wicket::spawn(command, server, args, None)
+        Wicket::spawn(command, server, args, None, false)
     }
 
     /// The wicket in jail mode, started as root (`sudo -n`), as the test's user, its
@@ -2898,7 +2916,7 @@ impl Wicket {
             .arg(kernel)
             .args(["--jail-ids", &format!("{}-{}", JAIL_IDS.0, JAIL_IDS.1)])
             .args(["--jail-user", &user, "--jail-cgroup", cgroup]);
-        Wicket::spawn(command, server, args, None)
+        Wicket::spawn(command, server, args, None, true)
     }
 
     /// The wicket as the Docker `image`, with its own Firecracker and kernel,
@@ -2942,7 +2960,7 @@ impl Wicket {
                 .args(["--jail-ids", &format!("{}-{}", JAIL_IDS.0, JAIL_IDS.1)])
                 .args(["--jail-user", "nonroot"]);
         }
-        Wicket::spawn(command, server, args, Some(name))
+        Wicket::spawn(command, server, args, Some(name), jailed)
     }
 
     /// The keeper (jail mode): sudo's child, or the container's first process.
@@ -2968,6 +2986,7 @@ impl Wicket {
         server: &str,
         args: &[String],
         container: Option<String>,
+        jailed: bool,
     ) -> Wicket {
         let log = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("wicket-{}.log", std::process::id()));
@@ -2986,7 +3005,75 @@ impl Wicket {
             child,
             log,
             container,
+            jailed,
         }
+    }
+
+    /// Its VMs (not an image's) with `file` open, a rootfs or a disk: its children; jailed, the
+    /// keeper's, whose jail binds that file.
+    fn vms_on(&self, file: &Path) -> Vec<i32> {
+        use std::os::unix::fs::MetadataExt as _;
+        if self.jailed {
+            let file = std::fs::metadata(file).unwrap();
+            let file = format!("{} {}", file.dev(), file.ino());
+            let mut vms = jailed_children(self.keeper()).0;
+            vms.retain(|vm| {
+                [jail::ROOTFS, jail::DISK].iter().any(|bound| {
+                    let stat = Command::new("sudo")
+                        .args(["-n", "stat", "-L", "-c", "%d %i"])
+                        .arg(format!("/proc/{vm}/root{bound}"))
+                        .output()
+                        .unwrap();
+                    String::from_utf8_lossy(&stat.stdout).trim() == file
+                })
+            });
+            return vms;
+        }
+        let pid = self.child.id();
+        let threads = std::fs::read_dir(format!("/proc/{pid}/task")).unwrap();
+        threads
+            .filter_map(|thread| thread.ok()?.file_name().to_str()?.parse().ok())
+            .flat_map(|thread: i32| {
+                std::fs::read_to_string(format!("/proc/{pid}/task/{thread}/children"))
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .filter_map(|child| child.parse().ok())
+                    .collect::<Vec<i32>>()
+            })
+            .filter(|vm| {
+                std::fs::read_dir(format!("/proc/{vm}/fd")).is_ok_and(|mut fds| {
+                    fds.any(|fd| {
+                        fd.is_ok_and(|fd| std::fs::read_link(fd.path()).is_ok_and(|to| to == file))
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// Sends `signal` to `pid`, as root when it is one of the keeper's.
+    fn signal(&self, signal: &str, pid: i32) {
+        let mut command = match self.jailed {
+            true => Command::new("sudo"),
+            false => Command::new("kill"),
+        };
+        if self.jailed {
+            command.args(["-n", "kill"]);
+        }
+        let sent = command
+            .arg(format!("-{signal}"))
+            .arg(pid.to_string())
+            .status()
+            .unwrap();
+        assert!(sent.success(), "{signal} to {pid}");
+    }
+
+    /// SIGHUP to it: through the keeper, jailed.
+    fn hang_up(&self) {
+        let pid = match self.jailed {
+            true => self.keeper(),
+            false => self.child.id() as i32,
+        };
+        self.signal("HUP", pid);
     }
 
     /// The address `--listen` bound, from its log.

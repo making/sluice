@@ -94,7 +94,7 @@ const ENV_TIMEOUT: Duration = Duration::from_secs(10);
 const DISK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a guest may take to write all out once its process ended (a stop).
-const STOP_WRITES: Duration = Duration::from_secs(10);
+pub const STOP_WRITES: Duration = Duration::from_secs(10);
 
 /// How long a guest may take to take a vsock stream: its kernel's, its process's business
 /// aside. Past it the guest is wedged, and no connection, stop or reload waits on for it.

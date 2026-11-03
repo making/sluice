@@ -446,6 +446,8 @@ Through the wicket:
   written at the start gone from the next VM, 1-2s later). So a `Vm` on a disk stops as it is dropped
   (`vm.rs`), in a task the wicket's end waits for, however it was dropped; before `/init` answered of
   the disk it is still killed: no process ran
+- an edit taking over from a start on a disk (the sample guest, 128 MiB), to its PUT's answer, the same
+  jailed: 0.74s; 20.7s with an `/init` not answering the stop, its 20s then a boot
 
 ## Docker image memory
 
