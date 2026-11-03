@@ -7,8 +7,10 @@ The cf-api in a VM of the wicket, on its disk (its README,
 
 - `mem`: an upload, a package and a droplet go through files, not memory: 128 MiB took a push of a
   150 MiB zip
-- an upgrade: the new one boots on the disk: 0.7-0.8s of no API. A new image that does not start is
-  refused (422, 11.5s)
+- an upgrade: the new one boots on the disk: 0.7-0.8s of no API. A new image that never listens is
+  refused (422, 11.5s), one whose process exits sooner (`--listen` on a port it may not bind: 1.55s)
+- its VM killed: the API back in 782ms, an app answering throughout (16 of 16 requests), its state
+  there
 
 ## A start that never listens
 

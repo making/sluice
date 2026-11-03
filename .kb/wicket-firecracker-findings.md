@@ -374,6 +374,12 @@ Through the wicket:
   its `firecracker` killed 0.71-0.74s (128 MiB), the journal replayed. A dial alone says nothing of the process:
   `/init`'s vsock port stays open once the process listened, and `/init` drops the stream of a
   connection refused, so a look reads the stream for a drop (`Vm::accepting`)
+- the wait before it, `firecracker` killed, from the kill to the route answering (the sample guest,
+  64 MiB): killed again at once 0.76s, 1.74s, 2.75s, 4.75s; after 30s up 8.75s; after 65s up 0.76s,
+  and 1.76s the next
+- an edit during a disk's VM replaced by a reload takes over: one VM throughout, the PUT a boot long,
+  what the VM before it wrote there, the reload made again finding no change. What the VM taken over
+  from wrote and did not sync did not stay (a counter: 1, then 2 of three starts)
 
 ## Docker image memory
 
