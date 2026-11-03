@@ -30,6 +30,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::SystemTime;
 
 use http_body_util::BodyExt as _;
+use sluice_wicket_server::http::QUIET;
 use tokio::io::AsyncWrite;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -46,7 +47,7 @@ use sluice_wicket_tunnel::tunnel::TunnelIo;
 const RELAY_BUFFER: usize = 2;
 
 /// Sniff timeout for the first bytes of a connection (h2 preface check).
-pub(crate) const SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Granularity of every request budget: the shared engine's epoch is
 /// incremented at this interval, and budgets are denominated in ticks.
@@ -2580,7 +2581,10 @@ pub async fn serve(mut io: TunnelIo, binding: Binding) {
 /// its message when none), until the connection ends; once `gone` is
 /// cancelled it shuts down gracefully. `label` names the connection in the
 /// log; `accepted` is its client, None for a tunnel connection (whose client
-/// is the last entry of each request's `X-Forwarded-For`).
+/// is the last entry of each request's `X-Forwarded-For`, and which the
+/// server's limits bound: `.kb/connection-limits.md`). On a connection of a
+/// client of its own, http/1.1 waits for a head for [`QUIET`] at most, the next
+/// request's included; the caller bounds h2 by [`Accepted::on_guest`].
 pub(crate) async fn serve_http<I, R>(
     io: I,
     h2: bool,
@@ -2600,10 +2604,12 @@ pub(crate) async fn serve_http<I, R>(
     let share = instances.share();
     let tap = instances.tap.clone();
     let route = Arc::new(route);
+    let accepted_itself = accepted.is_some();
     let service = hyper::service::service_fn(move |req| {
         let (handler, share) = (route(&req), share.clone());
         let mut answered = Answered::of(&tap, &req, accepted.as_ref().map(|a| a.peer));
         let head_owed = accepted.as_ref().and_then(|a| HeadOwed::of(a, &req));
+        let h2_request = accepted.as_ref().filter(|_| h2).map(H2Request::of);
         async move {
             let _head_owed = head_owed;
             let response = match handler {
@@ -2617,12 +2623,17 @@ pub(crate) async fn serve_http<I, R>(
                 }
                 Err(message) => plain_response(404, message),
             };
-            Ok::<_, std::convert::Infallible>(match answered {
+            let response = match answered {
                 Some(answered) => answered.counting(response),
+                None => response,
+            };
+            Ok::<_, std::convert::Infallible>(match h2_request {
+                Some(request) => request.answering(response),
                 None => response,
             })
         }
     });
+    let shutting_down = gone.clone();
     let served = async {
         if h2 {
             let connection = hyper::server::conn::http2::Builder::new(TokioExecutor)
@@ -2633,16 +2644,26 @@ pub(crate) async fn serve_http<I, R>(
             })
             .await
         } else {
-            let connection = hyper::server::conn::http1::Builder::new()
-                .half_close(true)
-                .serve_connection(hyper_util::rt::TokioIo::new(io), service);
+            let mut builder = hyper::server::conn::http1::Builder::new();
+            builder.half_close(true);
+            if accepted_itself {
+                builder
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .header_read_timeout(QUIET);
+            }
+            let connection = builder.serve_connection(hyper_util::rt::TokioIo::new(io), service);
             until_gone(connection, gone, |connection| {
                 connection.graceful_shutdown()
             })
             .await
         }
     };
-    if let Err(e) = served.await {
+    // no news: the wait for a head running out, an idle connection's usual end,
+    // and a client leaving as it was told to, before hyper is through with it
+    if let Err(e) = served.await
+        && !e.is_timeout()
+        && !shutting_down.is_cancelled()
+    {
         eprintln!("[wasm] {label} serve error: {e}");
     }
 }
@@ -2653,6 +2674,111 @@ pub(crate) struct Accepted {
     /// True while a request that may be sent a `100 Continue` awaits its
     /// response's head.
     pub(crate) head_owed: watch::Sender<bool>,
+    /// On an h2 connection, how many of its requests await their guest
+    /// ([`H2Request`]); any other send tells of a stream moving on.
+    pub(crate) on_guest: watch::Sender<usize>,
+}
+
+/// An h2 request of a connection accepted here, while it lives: from its
+/// arrival until its response's body was dropped. It awaits its guest but for
+/// the time hyper keeps from polling the body, which is the client's: its
+/// stream's or its connection's window, or a socket it does not read.
+struct H2Request {
+    on_guest: watch::Sender<usize>,
+    awaits: bool,
+}
+
+impl H2Request {
+    fn of(accepted: &Accepted) -> H2Request {
+        accepted.on_guest.send_modify(|awaiting| *awaiting += 1);
+        H2Request {
+            on_guest: accepted.on_guest.clone(),
+            awaits: true,
+        }
+    }
+
+    /// Tells whether it awaits its guest now, and that it moved on.
+    fn awaits(&mut self, awaits: bool) {
+        self.on_guest.send_modify(|awaiting| {
+            *awaiting = *awaiting + usize::from(awaits) - usize::from(self.awaits);
+        });
+        self.awaits = awaits;
+    }
+
+    /// The response, its head on its way to the client: this request's wait
+    /// goes by its body from here on.
+    fn answering(mut self, response: hyper::Response<RelayBody>) -> hyper::Response<RelayBody> {
+        self.awaits(false);
+        response.map(|body| {
+            H2Answer {
+                body,
+                rest: bytes::Bytes::new(),
+                request: self,
+            }
+            .boxed_unsync()
+        })
+    }
+}
+
+impl Drop for H2Request {
+    fn drop(&mut self) {
+        self.awaits(false);
+    }
+}
+
+/// An [`H2Request`]'s response body, in pieces of at most [`H2_PIECE`]: hyper
+/// polls it only as its client takes them, so the time between polls tells of
+/// the client, whatever size of frames its guest writes.
+struct H2Answer {
+    body: RelayBody,
+    /// What is left of the frame polled last.
+    rest: bytes::Bytes,
+    request: H2Request,
+}
+
+/// The most of an answer a client of an h2 connection must take within [`QUIET`].
+const H2_PIECE: usize = 16 * 1024;
+
+impl http_body::Body for H2Answer {
+    type Data = bytes::Bytes;
+    type Error = RelayError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        if this.rest.is_empty() {
+            let polled = Pin::new(&mut this.body).poll_frame(cx);
+            this.request.awaits(polled.is_pending());
+            match std::task::ready!(polled) {
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(data) => this.rest = data,
+                    Err(frame) => return Poll::Ready(Some(Ok(frame))),
+                },
+                ended => return Poll::Ready(ended),
+            }
+        } else {
+            this.request.awaits(false);
+        }
+        let piece = this.rest.split_to(this.rest.len().min(H2_PIECE));
+        Poll::Ready(Some(Ok(http_body::Frame::data(piece))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.rest.is_empty() && self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        let rest = self.rest.len() as u64;
+        let body = self.body.size_hint();
+        let mut hint = http_body::SizeHint::new();
+        hint.set_lower(body.lower() + rest);
+        if let Some(upper) = body.upper() {
+            hint.set_upper(upper + rest);
+        }
+        hint
+    }
 }
 
 /// An http/1.1 request awaiting its response's head, while it lives. Only
@@ -3058,7 +3184,7 @@ pub(crate) mod tests {
     }
 
     /// A route handler without an instance limit to speak of.
-    fn route(loaded: Arc<Loaded>, sandbox: Sandbox) -> Arc<Handler> {
+    pub(crate) fn route(loaded: Arc<Loaded>, sandbox: Sandbox) -> Arc<Handler> {
         Handler::new(loaded, sandbox, None, &Instances::new(Instances::MAX)).unwrap()
     }
 
@@ -3167,7 +3293,7 @@ pub(crate) mod tests {
         println!("cold: {cold:?} / pooled(4): {pooled:?} per request (mean of {iterations})");
     }
 
-    async fn hello() -> Arc<Loaded> {
+    pub(crate) async fn hello() -> Arc<Loaded> {
         load(&Locator::File(hello_wasm()), Caps::default())
             .await
             .unwrap()
@@ -5613,6 +5739,30 @@ pub(crate) mod tests {
         });
         let (client, connection) = h2::client::handshake(io).await.expect("h2 handshake");
         (client, tokio::spawn(connection))
+    }
+
+    /// A tunnel connection is the server's to bound: quiet past the bound on a
+    /// listener's client, it goes on.
+    #[tokio::test]
+    async fn a_quiet_tunnel_connection_stays() {
+        let handler = route(hello().await, Sandbox::default());
+        tokio::time::pause();
+        let request = "GET / HTTP/1.1\r\nhost: t\r\n\r\n";
+        let mut peer = open(&handler, request);
+        let answered = async |peer: &mut Peer<Table>| {
+            let mut raw = Vec::new();
+            while !String::from_utf8_lossy(&raw).contains("hello from wasm") {
+                match peer.recv().await.and_then(|frame| frame.body) {
+                    Some(Body::Data(data)) => raw.extend_from_slice(&data.payload),
+                    Some(Body::Close(_) | Body::Error(_)) | None => panic!("cut"),
+                    Some(_) => {}
+                }
+            }
+        };
+        answered(&mut peer).await;
+        tokio::time::sleep(QUIET * 3).await;
+        peer.data(1, request.as_bytes());
+        answered(&mut peer).await;
     }
 
     /// A connection serves each request with its target's current handler,

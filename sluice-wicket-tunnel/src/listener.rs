@@ -60,14 +60,15 @@ impl<S: AsyncRead + Unpin> Replay<S> {
     }
 
     /// Reads at most `max` more bytes behind those read so far; 0 at the
-    /// stream's end. Only before the stream is read.
+    /// stream's end. Only before the stream is read. Dropped before its end it
+    /// read nothing.
     pub async fn fill(&mut self, max: usize) -> io::Result<usize> {
         debug_assert_eq!(self.replayed, 0, "filled after a read");
-        let start = self.read.len();
-        self.read.resize(start + max, 0);
-        let read = self.stream.read(&mut self.read[start..]).await;
-        self.read.truncate(start + *read.as_ref().unwrap_or(&0));
-        read
+        self.read.reserve(max);
+        (&mut self.stream)
+            .take(max as u64)
+            .read_buf(&mut self.read)
+            .await
     }
 }
 
@@ -145,12 +146,16 @@ mod tests {
         assert_eq!(routed(&several, "c.local"), None);
     }
 
-    /// The bytes filled are read again first, then the rest of the stream.
+    /// The bytes filled are read again first, then the rest of the stream; a
+    /// fill given up on added none.
     #[tokio::test]
     async fn the_bytes_filled_are_replayed_first() {
         let (client, server) = tokio::io::duplex(64);
         let mut replay = Replay::new(server);
         let mut client = client;
+        let wait = std::time::Duration::from_millis(1);
+        assert!(tokio::time::timeout(wait, replay.fill(4)).await.is_err());
+        assert_eq!(replay.read_so_far(), b"");
         client.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
         assert_eq!(replay.fill(4).await.unwrap(), 4);
         assert_eq!(replay.read_so_far(), b"GET ");

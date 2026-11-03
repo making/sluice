@@ -189,9 +189,32 @@ pub type Routes = sluice_wicket_tunnel::routes::Routes<Table>;
 /// Routes serving `handlers` by target for good, advertising nothing.
 #[cfg(test)]
 pub fn fixed(handlers: HashMap<String, Arc<Handler>>) -> Arc<Routes> {
+    fixed_advertising(handlers, Vec::new())
+}
+
+/// Routes serving `handlers` for good, each on the listener for the host its
+/// target names.
+#[cfg(test)]
+pub fn by_host(handlers: HashMap<String, Arc<Handler>>) -> Arc<Routes> {
+    let advertised = handlers
+        .keys()
+        .map(|host| Upstream {
+            host: host.clone(),
+            target_url: host.clone(),
+            ..Default::default()
+        })
+        .collect();
+    fixed_advertising(handlers, advertised)
+}
+
+#[cfg(test)]
+fn fixed_advertising(
+    handlers: HashMap<String, Arc<Handler>>,
+    advertised: Vec<Upstream>,
+) -> Arc<Routes> {
     Routes::new(Table {
         generation: 1,
-        advertised: Vec::new(),
+        advertised,
         origins: HashMap::new(),
         entries: handlers
             .into_iter()

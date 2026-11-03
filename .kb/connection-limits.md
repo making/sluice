@@ -145,6 +145,38 @@ waits on no one: a long poll (25s) or a slow upload stays. An idle connection is
 any other quiet one; sluice-wicket-cf-api's client of its wicket lets go of its own after 30s, so
 no request meets one closing.
 
+## sluice-wicket-runtime-wasi's `--listen`
+
+A connection holds one of `--max-connections` slots, and whoever reaches the port can open one, so
+it closes once its client left it waiting for the same 60s (`sluice_wicket_server::http::QUIET`, no
+option: the server's default `idle-timeout` too). Before a request's first bytes the sniff waits so
+long, and http/1.1 then has `header_read_timeout` for a head or the next one's. A write of an answer
+pending so long fails, on http/1.1 and h2 alike (`Unread`).
+
+hyper has no timer on h2 streams, and `http2::Builder::keep_alive_*` only finds a client not
+answering PINGs, which any h2 stack answers. So an h2 connection goes by what its requests wait on
+(`listener::h2_quiet`): once for 60s no request awaited its guest and none moved on (a request
+arriving or ending, a piece of its answer taken, 16KiB at most, whatever frames its guest writes), it
+gets a GOAWAY `NO_ERROR`, which ends an idle connection; a client that does not go -- it answers no
+PING, or grants an answer no window -- loses the connection after 60s more. Its PINGs count for
+nothing. A client reading under 16KiB per 60s is cut as well.
+
+A guest's time is not the client's. A request in progress is bounded by its route's `budget-ms`
+(10s by default), a body its client stopped sending included: the guest reads it or not as it likes,
+it ends with a 504 or a truncated answer, and the connection closes behind it. A body has no bound of
+its own, unlike the consoles': a route given a long budget may be streaming both ways, and a request
+body quiet for a minute is legitimate there. The wicket serves no upgrades, so no WebSocket is held.
+
+`serve_http` serves the tunnel's connections too, without any of this: `sluice.limits.head-timeout`,
+`idle-timeout` and `stall-timeout` bound their public clients on the data plane (on by default). A
+timer here would undercut an `idle-timeout` set above a front end's and race the server's next request
+on the connection, which nothing could retry. Whoever relays a tunnel connection is a sluice server
+holding a token, and a server's operator turning its limits off asked for that.
+
+sluice-wicket-runtime-firecracker's `--listen` has only its head's 10s (none on a sole route, whose
+guest may speak first): it relays verbatim after that, so a quiet client is its guest's and the route's
+`idle-ms`'s to end.
+
 ## Half-close probes
 
 A client's FIN does not tell whether it half-closed or left: HTTP/1.1 lets a half-closed

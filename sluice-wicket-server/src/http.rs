@@ -83,12 +83,19 @@ impl hyper::body::Body for Body {
 /// A connection's stream, failing a write its client took none of for
 /// [`QUIET`]. TCP keepalive does not tell: the kernel of a client not reading
 /// answers its probes.
-struct Unread<I> {
+pub struct Unread<I> {
     io: I,
     wait: Wait,
 }
 
 impl<I> Unread<I> {
+    pub fn new(io: I) -> Unread<I> {
+        Unread {
+            io,
+            wait: Wait::default(),
+        }
+    }
+
     fn writing<T>(
         &mut self,
         cx: &mut Context<'_>,
@@ -166,15 +173,11 @@ where
         }));
         async move { Ok::<_, Infallible>(answer.await) }
     });
-    let io = Unread {
-        io,
-        wait: Wait::default(),
-    };
     // a client leaving, or left behind, is no news
     let _ = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(QUIET)
-        .serve_connection(TokioIo::new(io), service)
+        .serve_connection(TokioIo::new(Unread::new(io)), service)
         .await;
 }
 

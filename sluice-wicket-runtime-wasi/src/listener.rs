@@ -8,8 +8,16 @@
 //! A client's leaving is watched here as the server does for a tunnel
 //! connection ([`client_gone`]): hyper's `half_close` does not read between a
 //! request's end and its response's end.
+//!
+//! Nor does a client hold a connection by going quiet (`.kb/connection-limits.md`):
+//! it has [`QUIET`] to go on with a request's head or the next one's
+//! (`wasm_host::serve_http`), or to take a write of an answer ([`Unread`]). h2 has
+//! neither on its streams, so an h2 connection goes by what its requests wait on
+//! ([`h2_quiet`]). A request's body is left to its route: a guest reads it or not
+//! as it likes, within `budget-ms`.
 
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +25,7 @@ use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use sluice_wicket_server::accept;
+use sluice_wicket_server::http::{QUIET, Unread};
 use sluice_wicket_tunnel::listener::Replay;
 use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -48,32 +57,69 @@ pub async fn run(
     instances: Arc<Instances>,
     max_connections: usize,
 ) {
-    accept::run(listener, max_connections, "--listen", |stream, peer, slot| {
-        let (routes, instances) = (routes.clone(), instances.clone());
-        tokio::spawn(async move {
-            let _slot = slot;
-            let stream = Arc::new(stream);
-            let unflushed = Arc::new(AtomicBool::new(false));
-            let (io, h2) = sniff(HyperIo {
-                stream: stream.clone(),
-                unflushed: unflushed.clone(),
-            })
-            .await;
-            let route =
-                move |request: &hyper::Request<hyper::body::Incoming>| route(&routes, request);
-            let label = format!("listener conn {peer}");
-            // never gone: a reload changes the routes request by request
-            let gone = CancellationToken::new();
-            let (head_owed, owed) = watch::channel(false);
-            let accepted = Some(Accepted { peer, head_owed });
-            tokio::select! {
-                () = wasm_host::serve_http(io, h2, &instances, route, gone, &label, accepted) => {}
-                // dropping hyper drops the request in flight
-                () = client_gone(&stream, owed, &unflushed) => {}
-            }
-        });
-    })
+    accept::run(
+        listener,
+        max_connections,
+        "--listen",
+        |stream, peer, slot| {
+            let (routes, instances) = (routes.clone(), instances.clone());
+            tokio::spawn(async move {
+                let _slot = slot;
+                let stream = Arc::new(stream);
+                let unflushed = Arc::new(AtomicBool::new(false));
+                let (head_owed, owed) = watch::channel(false);
+                let io = HyperIo {
+                    stream: stream.clone(),
+                    unflushed: unflushed.clone(),
+                };
+                tokio::select! {
+                    () = serve(io, &routes, &instances, peer, head_owed) => {}
+                    // dropping hyper drops the request in flight
+                    () = client_gone(&stream, owed, &unflushed) => {}
+                }
+            });
+        },
+    )
     .await
+}
+
+/// Serves a connection, http/1.1 or h2c sniffed, until it ended or its client
+/// left it waiting.
+async fn serve<S>(
+    stream: S,
+    routes: &Arc<Routes>,
+    instances: &Instances,
+    peer: SocketAddr,
+    head_owed: watch::Sender<bool>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let Some((io, h2)) = sniff(Unread::new(stream)).await else {
+        return;
+    };
+    let routes = routes.clone();
+    let route = move |request: &hyper::Request<hyper::body::Incoming>| route(&routes, request);
+    let label = format!("listener conn {peer}");
+    // no reload ends it, changing the routes request by request
+    let gone = CancellationToken::new();
+    let (on_guest, waiting) = watch::channel(0);
+    let accepted = Some(Accepted {
+        peer,
+        head_owed,
+        on_guest,
+    });
+    let shutdown = gone.clone();
+    let quiet = async {
+        if h2 {
+            h2_quiet(waiting, &shutdown).await;
+        } else {
+            std::future::pending().await
+        }
+    };
+    tokio::select! {
+        () = wasm_host::serve_http(io, h2, instances, route, gone, &label, accepted) => {}
+        () = quiet => {}
+    }
 }
 
 /// The handler of `request`'s host (`wasm_host::request_host`).
@@ -128,6 +174,28 @@ async fn client_gone(stream: &TcpStream, mut owed: watch::Receiver<bool>, unflus
         _ = stream.ready(Interest::ERROR) => {}
         () = probing => {}
     }
+}
+
+/// Resolves once an h2 client left its connection waiting on it alone: first
+/// `shutdown` is cancelled, the client told to go (GOAWAY) when for [`QUIET`] no
+/// request of it awaited its guest and none moved on, which an idle connection
+/// ends with; a client not going ends the connection after as long again. Its
+/// PINGs count for nothing, and a guest's time is bounded by its budget.
+async fn h2_quiet(mut waiting: watch::Receiver<usize>, shutdown: &CancellationToken) {
+    let mut quiet = async || {
+        loop {
+            // failing only once hyper is done, which ends the caller
+            let _ = waiting.wait_for(|on_guest| *on_guest == 0).await;
+            match tokio::time::timeout(QUIET, waiting.changed()).await {
+                Err(_) => return,
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => std::future::pending().await,
+            }
+        }
+    };
+    quiet().await;
+    shutdown.cancel();
+    quiet().await;
 }
 
 /// Whether the client ended its side, whether or not hyper read that far.
@@ -191,19 +259,234 @@ impl AsyncWrite for HyperIo {
     }
 }
 
-/// Reads until the h2 preface's `PRI` is seen or ruled out, within
-/// `wasm_host::SNIFF_TIMEOUT`; true for h2. The bytes read are read again.
-async fn sniff(stream: HyperIo) -> (Replay<HyperIo>, bool) {
+/// Reads until the h2 preface's `PRI` is seen or ruled out; true for h2. The
+/// bytes read are read again. None once that took its client longer than
+/// [`QUIET`].
+async fn sniff<S: AsyncRead + Unpin>(stream: S) -> Option<(Replay<S>, bool)> {
     const H2: &[u8] = b"PRI";
-    let deadline = tokio::time::Instant::now() + wasm_host::SNIFF_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + QUIET;
     let mut io = Replay::new(stream);
     while io.read_so_far().len() < H2.len() && H2.starts_with(io.read_so_far()) {
         let wanted = H2.len() - io.read_so_far().len();
         match tokio::time::timeout_at(deadline, io.fill(wanted)).await {
             Ok(Ok(read)) if read > 0 => {}
-            _ => break,
+            Ok(_) => break,
+            Err(_) => return None,
         }
     }
     let h2 = io.read_so_far() == H2;
-    (io, h2)
+    Some((io, h2))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
+    use tokio::task::JoinHandle;
+    use tokio::time::{Instant, sleep, timeout};
+
+    use super::*;
+    use crate::wasm_host::tests::{hello, route};
+    use crate::wasm_host::{Handler, Limits, Sandbox};
+
+    /// How far from a bound the connection is taken to end.
+    const NEAR: Duration = Duration::from_secs(1);
+    const ROOMY: usize = 64 * 1024;
+
+    /// A connection of `buffer` bytes each way to the routes of `handlers`, by
+    /// host: its client, and its service, which ends with it.
+    fn connection(
+        buffer: usize,
+        handlers: &HashMap<String, Arc<Handler>>,
+    ) -> (DuplexStream, JoinHandle<()>) {
+        let (client, server) = tokio::io::duplex(buffer);
+        let routes = crate::routes::by_host(handlers.clone());
+        let served = tokio::spawn(async move {
+            let instances = Instances::new(Instances::MAX);
+            let peer = "127.0.0.1:1".parse().unwrap();
+            let (head_owed, _) = watch::channel(false);
+            serve(server, &routes, &instances, peer, head_owed).await;
+        });
+        (client, served)
+    }
+
+    /// `served` ends after `bound`, and not before.
+    async fn ends(served: &mut JoinHandle<()>, bound: Duration, what: &str) {
+        let early = timeout(bound - NEAR, &mut *served).await.is_ok();
+        assert!(!early, "ended early: {what}");
+        timeout(NEAR * 2, &mut *served)
+            .await
+            .unwrap_or_else(|_| panic!("still open: {what}"))
+            .unwrap();
+    }
+
+    fn get(host: &str, path: &str) -> String {
+        format!("GET {path} HTTP/1.1\r\nhost: {host}\r\n\r\n")
+    }
+
+    /// What is sent on `client` up to the text `until`.
+    async fn read_to(client: &mut DuplexStream, until: &str) -> String {
+        let mut read = Vec::new();
+        loop {
+            let text = String::from_utf8_lossy(&read);
+            if text.contains(until) {
+                return text.to_string();
+            }
+            let text = text.to_string();
+            assert_ne!(client.read_buf(&mut read).await.unwrap(), 0, "cut: {text}");
+        }
+    }
+
+    /// A client that stopped at any point before a guest's answer loses its
+    /// connection after the bound, as long again for an h2 one not going when
+    /// told to; one going on within the bound, however late, is served.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_client_loses_its_connection() {
+        let none = HashMap::new();
+        let request = get("nowhere", "/");
+        let preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0";
+        for (buffer, sent, bound) in [
+            (ROOMY, "", QUIET),
+            (ROOMY, "P", QUIET),
+            (ROOMY, "GET / HTTP/1.1\r\nhost", QUIET),
+            // its answer waits to be read
+            (ROOMY, request.as_str(), QUIET),
+            (16, request.as_str(), QUIET),
+            (ROOMY, "PRI", QUIET * 2),
+            (ROOMY, preface, QUIET * 2),
+        ] {
+            let (mut client, mut served) = connection(buffer, &none);
+            let (_reading, mut writing) = tokio::io::split(&mut client);
+            writing.write_all(sent.as_bytes()).await.unwrap();
+            ends(&mut served, bound, &format!("{buffer}: {sent:?}")).await;
+        }
+
+        let (mut client, served) = connection(ROOMY, &none);
+        for _ in 0..3 {
+            sleep(QUIET - NEAR).await;
+            client.write_all(request.as_bytes()).await.unwrap();
+            read_to(&mut client, "no wasm route").await;
+        }
+        assert!(!served.is_finished());
+
+        // a body no one reads goes with its answer
+        let (mut client, mut served) = connection(ROOMY, &none);
+        let upload = "POST / HTTP/1.1\r\nhost: nowhere\r\ncontent-length: 5\r\n\r\nab";
+        client.write_all(upload.as_bytes()).await.unwrap();
+        timeout(NEAR, &mut served).await.unwrap().unwrap();
+        read_to(&mut client, "no wasm route").await;
+    }
+
+    /// An idle h2 connection is told to go after the bound and ends then, its
+    /// client's pings counting for nothing; one whose client grants its answer
+    /// no window ends after as long again, the pings answered all along.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_h2_connection_ends() {
+        let none = HashMap::new();
+        let request = || http::Request::get("http://nowhere/").body(()).unwrap();
+
+        let (stream, mut served) = connection(ROOMY, &none);
+        let (client, mut idle) = h2::client::handshake(stream).await.unwrap();
+        let mut pings = idle.ping_pong().unwrap();
+        let idle = tokio::spawn(idle);
+        let mut client = client.ready().await.unwrap();
+        let (response, _) = client.send_request(request(), true).unwrap();
+        let mut body = response.await.unwrap().into_body();
+        while let Some(chunk) = body.data().await {
+            let _ = body.flow_control().release_capacity(chunk.unwrap().len());
+        }
+        tokio::spawn(async move {
+            while pings.ping(h2::Ping::opaque()).await.is_ok() {
+                sleep(NEAR).await;
+            }
+        });
+        ends(&mut served, QUIET, "idle").await;
+        idle.await.unwrap().expect("a clean end");
+
+        let (stream, mut served) = connection(ROOMY, &none);
+        let (client, unread) = h2::client::Builder::new()
+            .initial_window_size(0)
+            .handshake::<_, bytes::Bytes>(stream)
+            .await
+            .unwrap();
+        tokio::spawn(unread);
+        let mut client = client.ready().await.unwrap();
+        let (response, _) = client.send_request(request(), true).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), 404);
+        ends(&mut served, QUIET * 2, "no window").await;
+    }
+
+    /// A guest's time is no client's: a request it holds stays past any bound,
+    /// and its connection goes on, on http/1.1 and h2, as does an answer read
+    /// slowly. A request its client does not finish ends at its route's budget.
+    #[tokio::test]
+    async fn a_guests_time_is_bounded_by_its_budget() {
+        let loaded = hello().await;
+        let budgeted = |budget| {
+            let limits = Limits {
+                budget,
+                ..Limits::default()
+            };
+            route(
+                loaded.clone(),
+                Sandbox {
+                    limits,
+                    ..Sandbox::default()
+                },
+            )
+        };
+        let budget = Duration::from_secs(5);
+        let routes = HashMap::from([
+            ("slow".to_string(), budgeted(QUIET * 8)),
+            ("short".to_string(), budgeted(budget)),
+        ]);
+        tokio::time::pause();
+        let held = format!("/hold/{}", (QUIET * 3).as_millis());
+
+        let (mut client, served) = connection(ROOMY, &routes);
+        for path in [held.as_str(), "/"] {
+            client
+                .write_all(get("slow", path).as_bytes())
+                .await
+                .unwrap();
+            read_to(&mut client, "hello from wasm").await;
+        }
+        assert!(!served.is_finished());
+
+        let (stream, served) = connection(ROOMY, &routes);
+        let (client, h2) = h2::client::handshake(stream).await.unwrap();
+        tokio::spawn(h2);
+        let mut client = client.ready().await.unwrap();
+        let mut send = async |path: &str| {
+            let request = http::Request::get(format!("http://slow{path}")).body(());
+            let (response, _) = client.send_request(request.unwrap(), true).unwrap();
+            response.await.unwrap()
+        };
+        assert_eq!(send(&held).await.status(), 200);
+        let mut body = send("/stream").await.into_body();
+        for _ in 0..4 {
+            sleep(QUIET - NEAR).await;
+            let mut window = 0;
+            while window < 64 * 1024 {
+                let chunk = body.data().await.expect("more of it").unwrap();
+                window += chunk.len();
+                let _ = body.flow_control().release_capacity(chunk.len());
+            }
+        }
+        assert!(!served.is_finished());
+
+        let (mut client, mut served) = connection(ROOMY, &routes);
+        let upload = "POST / HTTP/1.1\r\nhost: short\r\ncontent-length: 5\r\n\r\nab";
+        client.write_all(upload.as_bytes()).await.unwrap();
+        let started = Instant::now();
+        read_to(&mut client, "HTTP/1.1 504").await;
+        assert!(
+            started.elapsed() >= budget - NEAR,
+            "{:?}",
+            started.elapsed()
+        );
+        timeout(NEAR, &mut served).await.expect("closed").unwrap();
+    }
 }

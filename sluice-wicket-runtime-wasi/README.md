@@ -75,7 +75,10 @@ a route of the config file or the console, whose routes come and go. An unknown 
 answered 404. Both `--server` and `--listen` serve the tunnel and the listener at once.
 `--max-connections` bounds the listener's connections too, apart from the tunnel's (one
 beyond waits in the backlog); TCP keepalive (60s idle, then 3 probes 10s apart) ends one whose
-client is gone without a FIN or reset. Without `--server` nothing drains: SIGTERM / SIGINT end
+client is gone without a FIN or reset, and a client quiet for 60s -- sending no request head on a
+new or an idle connection, reading nothing of an answer -- loses one that is there (an h2 one is told
+to go by a GOAWAY first, 60s before it is cut); a request in progress goes by its `budget-ms`
+([details](../.kb/connection-limits.md#sluice-wicket-runtime-wasis---listen)). Without `--server` nothing drains: SIGTERM / SIGINT end
 the process at once.
 
 The image `ghcr.io/making/sluice/sluice-wicket-runtime-wasi` (`latest` / `<sha>`, amd64 /
