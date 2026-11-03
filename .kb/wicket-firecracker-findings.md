@@ -273,10 +273,15 @@ as a VM's PSS, plus the snapshot on the tmpfs (`du`).
 - **The VMs past the limit are the highest indices**, by count: a pool of `warm=0` may hold the indices
   0 and 2 at `vms=2`, both within it. By index, the VM of 2 would go while room for another one is
   taken until it did, and a pool holding only it would serve none
-- **A restore failing at `warm=0` is tried again**, a pool's with the wait of a VM going down, a warm
-  clone's every second, in room no VM waits for, not left to the next connection: nothing else would
-  end the `CRASHED` of an idle app once its cause is gone. A pool's success keeps its VM for
-  `keep-ms`, a per-connection route's is killed at once
+- **A restore failing at `warm=0` is tried again**, with the wait of a VM going down (`route::Backoff`:
+  1s, 2s, 4s up to 60s, anew after a success), a warm clone's one at a time in room no VM waits for,
+  not left to the next connection: nothing else would end the `CRASHED` of an idle app once its cause
+  is gone. A pool's success keeps its VM for `keep-ms`, a per-connection route's is killed at once.
+  Every second, a night of it was tens of thousands of Firecrackers and stderr lines per route; the
+  wait costs a `CRASHED` up to 60s past its cause. What does not wait: a connection (its own restore
+  anyway: a success ends the failure and refills `warm` at once, a failure counts as a try) and a
+  change of the bounds, `cf scale` among them (someone asked, one try per request; of a pool too). A
+  reload changing nothing keeps the wait: it says nothing of the cause, and a pool's does the same
 
 ## Booted VMs against a pool
 

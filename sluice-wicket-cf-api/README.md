@@ -657,8 +657,8 @@ applications:
   naming which: `cf restart` undoes a difference. A manifest's `instances` the running app
   cannot take (`cf push` restarts it right after) waits for the next start, the log saying so
 - `cf app` lists [the VMs alive](#instances), one coming with its restore and going as these say,
-  `0/0` with none, `CRASHED` with why if a request's restore failed, until the wicket's next try
-  succeeds, every second
+  `0/0` with none, `CRASHED` with why if a request's restore failed, until a restore succeeds: the
+  next request's, a `cf scale`'s at once, or the wicket's own, [1s to 60s apart](../sluice-wicket-runtime-firecracker/README.md#a-vm-going-down)
 
 ### Security groups
 

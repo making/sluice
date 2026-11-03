@@ -621,6 +621,17 @@ async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> 
     let up =
         |n| move |route: &serde_json::Value| pooled(n)(route) && route["vms"]["down"].is_null();
     listed_as(wicket, POOL, up(1)).await;
+    let serving = async |host: &str| {
+        let mut client = tokio::net::TcpStream::connect(wicket.listening())
+            .await
+            .unwrap();
+        let request = format!("GET / HTTP/1.1\r\nhost: {host}\r\n\r\n");
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = [0; 15];
+        client.read_exact(&mut answer).await.unwrap();
+        assert_eq!(&answer, b"HTTP/1.1 200 OK", "{host}");
+        client
+    };
 
     let snapshots: Vec<PathBuf> = std::fs::read_dir(&state)
         .unwrap()
@@ -656,7 +667,23 @@ async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> 
     let why = failing["vms"]["down"]["why"].as_str().unwrap();
     assert!(why.starts_with("its restore failed: "), "{failing}");
     assert_eq!(failing["vms"]["warm"], 0, "{failing}");
+    // tried again later and later: of three tries, 1s and then 2s apart at the least
+    let next_try = async || {
+        let mark = wicket.log().len();
+        said_after(wicket, mark, "warm clone: ").await;
+    };
+    next_try().await;
+    let first = Instant::now();
+    next_try().await;
+    next_try().await;
+    let waited = first.elapsed();
+    assert!(waited >= Duration::from_millis(2500), "{waited:?}");
     snapshots_back();
+    // a connection does not wait for that: its own restore ends the failure, the rest following
+    let connection = serving(CLONES).await;
+    let over = listed(wicket, CLONES).await;
+    assert_eq!(over["vms"]["down"], serde_json::Value::Null, "{over}");
+    drop(connection);
     listed_as(wicket, CLONES, |route| {
         route["vms"]["warm"] == 1 && route["vms"]["down"].is_null()
     })
@@ -704,17 +731,6 @@ async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> 
     listed_as(wicket, POOL, up(1)).await;
 
     // the budget's last room clones'; a connection on the pool's VM has one more started ahead
-    let serving = async |host: &str| {
-        let mut client = tokio::net::TcpStream::connect(wicket.listening())
-            .await
-            .unwrap();
-        let request = format!("GET / HTTP/1.1\r\nhost: {host}\r\n\r\n");
-        client.write_all(request.as_bytes()).await.unwrap();
-        let mut answer = [0; 15];
-        client.read_exact(&mut answer).await.unwrap();
-        assert_eq!(&answer, b"HTTP/1.1 200 OK", "{host}");
-        client
-    };
     let clones = (serving(CLONES).await, serving(CLONES).await);
     let mark = wicket.log().len();
     let on_the_pool = serving(POOL).await;

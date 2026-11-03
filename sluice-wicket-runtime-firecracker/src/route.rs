@@ -83,7 +83,8 @@ const DEFAULT_KEEP: Duration = Duration::from_secs(60);
 /// Default of `conns`: the connections every VM of a pool holds before it grows.
 const DEFAULT_CONNS: usize = 16;
 
-/// How long a pool waits at least before it starts again a VM it failed to start.
+/// How long a pool waits before it starts again a VM it found no room for: no VM failing, so no
+/// [`Backoff`].
 const POOL_RETRY: Duration = Duration::from_secs(1);
 
 /// How long after a look that found it refusing a VM's process is looked at again.
@@ -774,13 +775,22 @@ impl Current {
     }
 }
 
+/// Restores failing for anything but room, until one succeeds.
+#[derive(Default)]
+struct Failing {
+    /// Why the last one failed, since when: none while they do not fail.
+    down: Option<Shortage>,
+    /// The wait after each one that fails.
+    backoff: Backoff,
+    /// No restore is tried before then ([`Warm::wanted`]); unset, one is at once.
+    retry: Option<Instant>,
+}
+
 /// A route's warm clones, kept to `warm` ([`keep_warm`]), which give their room up to another
 /// route's VM.
 struct Warm {
     clones: Mutex<VecDeque<Instance>>,
-    /// Why the last restore failed for anything but room, until one succeeds: another one is
-    /// tried until then, whatever `warm` asks ([`Warm::wanted`]).
-    failed: Mutex<Option<Shortage>>,
+    failed: Mutex<Failing>,
     bounds: Current,
     capacity: Arc<Capacity>,
     route: u64,
@@ -803,32 +813,49 @@ impl Warm {
         self.bounds.get().warm.saturating_sub(held)
     }
 
-    /// The clones to restore: those missing to `warm`, at least one while restores fail: at
-    /// `warm` 0 nothing else tells they stopped failing but the next connection.
-    fn wanted(&self) -> usize {
-        let failing = self.failed.lock().unwrap().is_some();
-        self.missing().max(usize::from(failing))
+    /// The clones to restore at `now`, and when to look again: those missing to `warm`; while
+    /// restores fail, none until their wait is over, then one, whatever `warm` asks: at `warm` 0
+    /// nothing else tells they stopped failing but the next connection.
+    fn wanted(&self, now: Instant) -> (usize, Option<Instant>) {
+        let missing = self.missing();
+        let failed = self.failed.lock().unwrap();
+        match failed.retry {
+            _ if failed.down.is_none() => (missing, None),
+            Some(retry) if retry > now => (0, Some(retry)),
+            _ => (1, None),
+        }
     }
 
-    /// A clone's restore failed with `e`, as a connection's or its own.
+    /// A clone's restore failed with `e`, as a connection's or its own: both tell the same, so the
+    /// next one waits, however many came. Those under way are given up ([`keep_warm`]).
     fn failing(&self, e: &BoxError) {
-        Shortage::keep(
-            &mut self.failed.lock().unwrap(),
-            format!("its restore failed: {e}"),
-        );
+        let mut failed = self.failed.lock().unwrap();
+        Shortage::keep(&mut failed.down, format!("its restore failed: {e}"));
+        failed.retry = Some(Instant::now() + failed.backoff.failed());
         self.changed.notify_one();
+    }
+
+    /// A clone's restore succeeded, as a connection's or its own: the wait is over and starts
+    /// anew, those missing restored at once.
+    fn restored(&self) {
+        let mut failed = self.failed.lock().unwrap();
+        if failed.down.is_some() {
+            *failed = Failing::default();
+            self.changed.notify_one();
+        }
     }
 
     /// One more clone, unless `warm` or `vms` went down meanwhile: then it is killed.
     fn put(&self, clone: Instance) {
-        *self.failed.lock().unwrap() = None;
+        self.restored();
         let mut clones = self.clones.lock().unwrap();
         if clones.len() < self.bounds.get().warm && !self.capacity.over(self.route) {
             clones.push_back(clone);
         }
     }
 
-    /// Kills what is past `warm`.
+    /// Its bounds changed: kills what is past `warm`, and a failing restore is tried at once, the
+    /// wait after it going on from where it was.
     fn adjust(&self) {
         let warm = self.bounds.get().warm;
         let past = {
@@ -837,6 +864,7 @@ impl Warm {
             clones.split_off(kept)
         };
         drop(past);
+        self.failed.lock().unwrap().retry = None;
         self.changed.notify_one();
     }
 }
@@ -1129,7 +1157,7 @@ impl Fallen {
         Shortage::keep(&mut self.down, why);
         let wait = match full {
             true => POOL_RETRY,
-            false => self.backoff.next_wait().max(POOL_RETRY),
+            false => self.backoff.failed(),
         };
         self.retry = Some(Instant::now() + wait);
         self.starting = false;
@@ -1222,6 +1250,15 @@ impl Members {
         }
         let fallen = self.fallen.get_mut(&at).expect("just there");
         fallen.failed(why, full);
+    }
+
+    /// Its bounds changed: those it waits to start again are started at once, the wait after that
+    /// going on from where it was; and the room it was short of is not what it was.
+    fn bounds_changed(&mut self) {
+        self.full = None;
+        for fallen in self.fallen.values_mut() {
+            fallen.retry = None;
+        }
     }
 
     /// [`Route::down`] of a pool keeping `warm`: the lowest index's.
@@ -1770,7 +1807,8 @@ async fn tend(pool: Weak<VmPool>, changed: Arc<Notify>) {
 }
 
 /// The wait before a VM in the place of one that went down: none, then [`RESTART_WAIT`] doubled
-/// as it keeps going down, none again past one up for [`RESTART_STABLE`].
+/// as it keeps going down, none again past one up for [`RESTART_STABLE`]; and before the next try
+/// of a start or a restore that failed: never none.
 #[derive(Default)]
 pub struct Backoff {
     wait: Duration,
@@ -1789,6 +1827,12 @@ impl Backoff {
         let wait = self.wait;
         self.wait = (wait * 2).clamp(RESTART_WAIT, RESTART_WAIT_MAX);
         wait
+    }
+
+    /// A start or a restore failed: the wait before the next try; the one after it is longer.
+    pub fn failed(&mut self) -> Duration {
+        self.wait = self.wait.max(RESTART_WAIT);
+        self.next_wait()
     }
 }
 
@@ -2329,7 +2373,7 @@ impl Route {
     /// Takes `bounds` from now on, its VMs and their snapshot kept: whether they changed. VMs are
     /// started for a higher `warm` or `vms` as there is room, touching no other; past a lower
     /// `vms`, a pool's VMs take no connection any more and go as `keep-ms` has them go, once theirs ended, and of a VM per
-    /// connection what serves none goes at once.
+    /// connection what serves none goes at once. What waits to be tried again is tried at once.
     pub fn adjust(&self, bounds: Bounds) -> bool {
         {
             let mut current = self.bounds.0.lock().unwrap();
@@ -2351,14 +2395,7 @@ impl Route {
                 }
             }
             Backend::Pool(pool) => {
-                // tried again at once: the room it was short of before is not this
-                let mut members = pool.members.lock().unwrap();
-                if members.full.take().is_some() {
-                    for fallen in members.fallen.values_mut() {
-                        fallen.retry = None;
-                    }
-                }
-                drop(members);
+                pool.members.lock().unwrap().bounds_changed();
                 pool.changed.notify_waiters();
             }
         }
@@ -2455,7 +2492,7 @@ impl Route {
                 pool.members.lock().unwrap().short(warm)
             }
             Backend::Cloned { cloner, warm, .. } => {
-                let failed = warm.failed.lock().unwrap().clone();
+                let failed = warm.failed.lock().unwrap().down.clone();
                 failed.filter(|_| warm.missing() > 0 || cloner.indices.held().is_empty())
             }
         }
@@ -2579,7 +2616,7 @@ impl Route {
                         let slot = self.capacity.take(self.need, wait).await?;
                         let restored = cloner.restore(slot, self.port, None).await;
                         if restored.is_ok() {
-                            *warm.failed.lock().unwrap() = None;
+                            warm.restored();
                         }
                         restored
                     }
@@ -2752,7 +2789,8 @@ async fn prime<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// Keeps `warm`'s clones restored as its `warm` asks, in room no VM waits for, until the route
 /// is gone: restores run in parallel, up to [`REFILL_WORKERS`], as one at a time caps the clone
-/// rate at about 1 / restore time; those no more asked for are given up.
+/// rate at about 1 / restore time; those no more asked for are given up, so restores failing cost
+/// one VM and one line per try ([`Warm::wanted`]).
 async fn keep_warm(
     warm: Weak<Warm>,
     changed: Arc<Notify>,
@@ -2766,11 +2804,11 @@ async fn keep_warm(
         let notified = changed.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        {
+        let retry = {
             let Some(warm) = warm.upgrade() else {
                 return;
             };
-            let wanted = warm.wanted();
+            let (wanted, retry) = warm.wanted(Instant::now());
             if restoring.len() > wanted {
                 restoring.abort_all();
             }
@@ -2778,9 +2816,17 @@ async fn keep_warm(
                 let restored = warm_clone(cloner.clone(), port, capacity.clone(), need);
                 restoring.spawn(restored);
             }
-        }
+            retry
+        };
+        let waited = async {
+            match retry {
+                Some(retry) => tokio::time::sleep_until(retry.into()).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             () = notified => {}
+            () = waited => {}
             Some(restored) = restoring.join_next() => {
                 if let Ok(restored) = restored
                     && let Some(warm) = warm.upgrade()
@@ -2795,8 +2841,8 @@ async fn keep_warm(
     }
 }
 
-/// A clone restored in room no VM waits for, ready: it answers at once as it is handed out. Why
-/// not, once it is time to try again.
+/// A clone restored in room no VM waits for, ready: it answers at once as it is handed out; or why
+/// not.
 async fn warm_clone(
     cloner: Arc<Cloner>,
     port: u32,
@@ -2808,7 +2854,6 @@ async fn warm_clone(
         Ok((clone, _probe)) => Ok(clone),
         Err(e) => {
             eprintln!("warm clone: {e}");
-            tokio::time::sleep(Duration::from_secs(1)).await;
             Err(e)
         }
     }
@@ -2961,8 +3006,64 @@ mod tests {
             assert_eq!(next, Duration::from_secs(wait), "{up}s up");
         }
         // starts failing: no VM up, no going down in between
-        let failing: Vec<u64> = (0..7).map(|_| backoff.next_wait().as_secs()).collect();
-        assert_eq!(failing, [2, 4, 8, 16, 32, 60, 60]);
+        assert_eq!(backoff.failed(), Duration::from_secs(2));
+        let mut failing = Backoff::default();
+        let waits: Vec<u64> = (0..8).map(|_| failing.failed().as_secs()).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60], "never none");
+    }
+
+    /// Restores failing are tried one at a time after a longer and longer wait: a change of the
+    /// bounds tries at once, the wait going on; a success goes back to `warm` at once, the wait
+    /// anew.
+    #[tokio::test]
+    async fn warm_clones_failing_wait_longer_and_longer() {
+        let spec = RouteSpec::configure(
+            "r",
+            "a.local",
+            PathBuf::from("/a.ext4"),
+            [("mode", "per-connection"), ("warm", "2")].into_iter(),
+            std::path::Path::new("firecracker"),
+            std::path::Path::new("vmlinux"),
+        )
+        .unwrap();
+        let changed = Arc::new(Notify::new());
+        let warm = Warm {
+            clones: Mutex::default(),
+            failed: Mutex::default(),
+            bounds: Current(Arc::new(Mutex::new(spec.bounds))),
+            capacity: Capacity::new(1, None),
+            route: 1,
+            changed: changed.clone(),
+        };
+        assert_eq!(warm.wanted(Instant::now()), (2, None));
+        let failure: BoxError = "gone".into();
+        let tried_after = || {
+            let before = Instant::now();
+            warm.failing(&failure);
+            let (none, retry) = warm.wanted(Instant::now());
+            assert_eq!(none, 0, "none during the wait");
+            let retry = retry.expect("a wait");
+            assert_eq!(warm.wanted(retry), (1, None), "one, whatever `warm` asks");
+            (retry - before).as_secs()
+        };
+        for wait in [1, 2, 4, 8, 16, 32, 60, 60] {
+            assert_eq!(tried_after(), wait);
+        }
+        let since = warm.failed.lock().unwrap().down.clone().unwrap().since;
+
+        warm.adjust();
+        assert_eq!(warm.wanted(Instant::now()), (1, None), "at once");
+        assert_eq!(tried_after(), 60, "going on");
+        let down = warm.failed.lock().unwrap().down.clone().unwrap();
+        assert_eq!(down.since, since);
+
+        changed.notified().await;
+        warm.restored();
+        tokio::time::timeout(Duration::ZERO, changed.notified())
+            .await
+            .expect("what keeps them told");
+        assert_eq!(warm.wanted(Instant::now()), (2, None));
+        assert_eq!(tried_after(), 1, "anew");
     }
 
     /// What a VM's watch makes of what it is told: only an end it finds true, a stream
@@ -3070,10 +3171,15 @@ mod tests {
         assert_eq!(members.kept(), 2);
         assert_eq!(members.short(3).unwrap().why, "its start failed: it died");
         assert_eq!(indices.take(0).index, 3, "the indices stay theirs");
-        // once more of the one, its own wait: over the first's minimum, the other's untouched
+        // once more of the one, its own wait: the other's untouched
         members.failed("it died".into(), one, 3);
-        assert_eq!(members.fallen[&1].backoff.wait, Duration::from_secs(2));
-        assert_eq!(members.fallen[&2].backoff.wait, Duration::from_secs(1));
+        assert_eq!(members.fallen[&1].backoff.wait, Duration::from_secs(4));
+        assert_eq!(members.fallen[&2].backoff.wait, Duration::from_secs(2));
+        // a change of the bounds: all at once, their waits going on
+        assert!(members.fallen[&2].retry.is_some());
+        members.bounds_changed();
+        assert!(members.fallen.values().all(|fallen| fallen.retry.is_none()));
+        assert_eq!(members.fallen[&1].backoff.wait, Duration::from_secs(4));
         // below what it keeps no more: nothing started in its place
         members.failed("it died".into(), zero, 2);
         assert!(!members.fallen.contains_key(&0));

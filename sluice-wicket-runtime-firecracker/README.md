@@ -345,6 +345,7 @@ first: SIGTERM to what is left, all written out, the disk free), the new one on 
 budget the old one held (no other route takes it meanwhile), its env and disk as they were. Per
 VM: the first start is at once; a VM that goes down within 60s of its start, or a start that fails,
 waits 1s, then 2s, 4s, up to 60s between starts, and a VM up for 60s starts that count anew.
+A change of its bounds (`warm`, `vms`, `cf scale -i`, ...) starts it at once, that count going on.
 `vms.down` says why (the lowest index's), an app's listing `crashed` for each index. With none up,
 a booted route's connections fail at once (`guest unreachable: no VM up: the route is restarting`;
 the open ones end with their VM), a boot long when all goes well; a clone pool's wait for its
@@ -360,7 +361,12 @@ spec, and `vms.down`, why it is short (the page shows both).
 
 A clone pool's VM comes back in a restore's time, from the snapshot, the VMs it keeps being those
 below `warm`. A start failing for room within `wait-ms` is tried again every second, one failing
-otherwise (its snapshot gone) after the same waits, and a warm clone's restores every second:
+otherwise (its snapshot gone) after the same waits. So are a warm clone's restores: one at a time
+while they fail, 1s, then 2s, 4s, up to 60s apart, the count starting anew once one succeeds, so
+a route can read as down for up to 60s after the cause ended. A connection waits for none of this
+(room within `wait-ms`, then its own restore, whose failure counts as a try and whose success
+restores the warm clones missing at once); nor does a change of the route's bounds, which tries
+at once, the count going on. A reload that changes nothing leaves the wait as it is.
 `vms.down` says why until `warm` are up. What fails beyond `warm` is the connection's
 to be told, and waiting for room within `wait-ms`, or for a warm clone's, is no failure, unless no VM
 is alive and the restore failed for anything but room: then `warm=0` would read as idle at none, so
