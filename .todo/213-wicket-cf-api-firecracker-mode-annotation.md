@@ -17,12 +17,11 @@ The user's direction: **`cf scale` sets the upper limit, annotations set the lif
   one). Per connection is reached by the annotation, with a cap from 1. Follow what `cf stop` does to the
   wicket's route and what a request then gets, and check it against CF; `cf app` shows `0/0` and `cf push`
   of `instances: 0` waits for no instance. An app already at 0 stops serving on the upgrade: the README says so
+- the wasi wicket's 0 means the same (the user's decision): today the README's table has "0 still serves", a
+  request getting an instance of its own, and that is how an app has no warm instance. Its scale to zero is
+  kept by an annotation
 
 To settle:
-
-- the wasi wicket has the same 0 (the README's table: "0 still serves", a request getting an instance of
-  its own), where it is how an app has no warm instance. Change it the same way, with its scale to zero
-  kept by an annotation, so both wickets mean one thing by 0
 
 - a pool's `warm` defaults to `vms`: a fixed size, no VM beyond `warm`, so `keep-ms` never applies and N is
   a floor as much as a cap. For N to be a limit, what does `warm` become when a lifetime is annotated: an
