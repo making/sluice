@@ -17,9 +17,18 @@ by default). Before, the edit lock and the wicket's reload both waited for it: `
 app was seen past a 20s client timeout. With one such start under way (40s timeout), of another app:
 `cf set-env` 41ms, `cf restart` 797ms.
 
+`ghcr.io/categolj/blog-frontend-htmx:jvm` (Tomcat on 8081 of its own, `-m 1G -t 60`), a9e77bd, with
+`nginx-unprivileged:alpine` as the other app: `cf set-env` 37ms and `cf restart` 819ms with its Tomcat
+up and the app `starting` (38ms, 803ms with nothing starting); the `cf push` refused 61s after its
+start. Its start is not tried again as the revision moves (45s, two edits), once at the cf-api's start
+(`cf set-env` 40ms, `cf restart` 787ms meanwhile). A `cf restart` given SIGINT at 12s: `crashed` is
+recorded 62s after its start. With `SERVER_PORT=8080` the app runs (`cf restart` 12.9s), its `/` 500
+for want of an egress.
+
 A disk's VM replaced and a reload of the wicket's files or on SIGHUP start beside the edits as well:
 the wicket's reloader awaits no boot. A pool's fill failing for room is no `did_not_start`: tried
-again as the routes change.
+again as the routes change. On SIGHUP (`port: 9999`, `boot-ms: 60000`): a PUT of another app 0.75s
+meanwhile; a second SIGHUP with the file restored takes over at once.
 
 ## Who logs in
 
