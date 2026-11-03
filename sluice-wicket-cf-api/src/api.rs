@@ -22,7 +22,7 @@ use http::{Method, StatusCode, header};
 use http_body_util::{BodyExt as _, Full, Limited};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use sluice_wicket_server::accept;
+use sluice_wicket_server::accept::{self, Slot};
 use sluice_wicket_server::http::{self as connection, Body};
 use tokio::net::TcpListener;
 
@@ -47,8 +47,9 @@ use crate::wicket::{AppBody, Failure, Runtime};
 pub(crate) const MAX_UPLOAD_BYTES: usize = 160 << 20;
 /// Largest body of any other request.
 const MAX_BODY_BYTES: usize = 1 << 20;
-/// Connections open at once.
-const MAX_CONNECTIONS: usize = 64;
+/// Connections open at once; one beyond takes the place of one without an
+/// authenticated request, or waits in the backlog for one.
+pub(crate) const MAX_CONNECTIONS: usize = 64;
 /// How long a build's request waits for its staging: a longer pull goes on,
 /// the CLI polling the build (every 3s).
 const STAGING_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -231,13 +232,18 @@ pub async fn run(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, 
         let api = api.clone();
         let tls = tls.clone();
         tokio::spawn(async move {
-            let _slot = slot;
             let Some(acceptor) = tls else {
-                return serve_connection(stream, api).await;
+                return serve_connection(stream, slot, api).await;
             };
             // a client quiet in its handshake is no client hyper bounds yet
-            match tokio::time::timeout(connection::QUIET, acceptor.accept(stream)).await {
-                Ok(Ok(stream)) => serve_connection(stream, api).await,
+            slot.claim().yields();
+            let handshake = tokio::time::timeout(connection::QUIET, acceptor.accept(stream));
+            let handshake = tokio::select! {
+                handshake = handshake => handshake,
+                () = slot.asked() => return,
+            };
+            match handshake {
+                Ok(Ok(stream)) => serve_connection(stream, slot, api).await,
                 Ok(Err(e)) => eprintln!("tls handshake failed: {e}"),
                 Err(e) => eprintln!("tls handshake failed: {e}"),
             }
@@ -246,11 +252,11 @@ pub async fn run(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, 
     .await
 }
 
-async fn serve_connection<S>(stream: S, api: Arc<Api>)
+async fn serve_connection<S>(stream: S, slot: Slot, api: Arc<Api>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    connection::serve(stream, |request| {
+    connection::serve(stream, slot, |request| {
         let api = api.clone();
         async move {
             // in a task of its own: an edit goes on when its client gives up (a start may take
@@ -266,16 +272,21 @@ impl Api {
     async fn handle(&self, request: hyper::Request<Body>) -> Response {
         let (parts, body) = request.into_parts();
         let path = parts.uri.path().to_string();
+        let authenticated = self.authenticated(&parts.headers).is_ok();
+        if authenticated {
+            body.admit();
+        }
         // a package to a file as it comes: it may be larger than this process's memory; and
         // only from whoever may leave one, the others refused below, their body unread.
         // Any other body is small
         let (body, spool) = if path.ends_with("/upload") {
-            match self.authenticated(&parts.headers) {
-                Ok(()) => match self.spooled(body).await {
+            if authenticated {
+                match self.spooled(body).await {
                     Ok(spool) => (Bytes::new(), Some(spool)),
                     Err(error) => return error.into(),
-                },
-                Err(_) => (Bytes::new(), None),
+                }
+            } else {
+                (Bytes::new(), None)
             }
         } else {
             match Limited::new(body, MAX_BODY_BYTES).collect().await {

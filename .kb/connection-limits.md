@@ -134,8 +134,8 @@ A route's `idle-ms` does not stand in for it: it is off by default, and cuts liv
 
 ## The wickets' consoles and sluice-wicket-cf-api
 
-Each serves 64 connections at once, one beyond waiting in the backlog, and is reachable by
-whoever can open a TCP connection, signed in or not. Keepalive tells of a client gone, not
+Each serves 64 connections at once, and is reachable by whoever can open a TCP connection, signed
+in or not. Keepalive tells of a client gone, not
 of one merely quiet, so `sluice_wicket_server::http` closes a connection once its client left
 it waiting for 60s, wherever: in cf-api's TLS handshake, sending a request's head or the next
 one's (hyper's `header_read_timeout`), a request's body (`Body`: the handler reading it sees an
@@ -144,6 +144,27 @@ write pending so long). Any byte moving starts the wait over, and a request bein
 waits on no one: a long poll (25s) or a slow upload stays. An idle connection is closed like
 any other quiet one; sluice-wicket-cf-api's client of its wicket lets go of its own after 30s, so
 no request meets one closing.
+
+Whoever can open 64 connections can open them again, so with all taken the next does not wait: one
+gives way, closed at once (`sluice_wicket_server::accept`). Only a connection at work for an admitted
+request keeps its slot, from the request's head to the last byte of its answer written: the gate let it
+through, or on sluice-wicket-cf-api its token is valid (`Body::admit`). A handshake, a head, the wait
+for the next request and an anonymous request (a sign-in, a body drained behind a refusal, `/v3/info`)
+give way however they keep moving, so bytes dripped hold nothing against anyone. The one going is the
+one waiting longest (since it connected, its last request or answer) of the source holding the most
+connections, a source being an address, an IPv6 one by its /64: a client opening many pushes out only
+its own.
+
+No fixed limit per address: it would have to fit a browser's 6 and its long poll, and sluice-wicket-cf-api's
+client (one per request at once), and it would refuse the clients sharing an address behind a NAT or a
+proxy, or on `/init`'s relay in a VM. The forwarded address is no help at accept, where a quiet
+connection has sent no header. With one address for all, the longest waiting goes.
+
+All 64 at work for admitted requests, the next waits in the backlog: a long poll ends within 25s, and
+a token's holder may do worse than hold a connection (sluice-wicket-cf-api without a provider hands
+one to anyone: such an API trusts its network). Connections flooding in from many addresses can push
+out a client between its connect and its head, 64 connections later; and an idle connection a client
+reuses just then may fail its request, as with the close at 60s, only while all are taken.
 
 ## sluice-wicket-runtime-wasi's `--listen`
 
@@ -172,6 +193,9 @@ body quiet for a minute is legitimate there. The wicket serves no upgrades, so n
 timer here would undercut an `idle-timeout` set above a front end's and race the server's next request
 on the connection, which nothing could retry. Whoever relays a tunnel connection is a sluice server
 holding a token, and a server's operator turning its limits off asked for that.
+
+The slots of either wicket's `--listen` do not give way as the consoles' do: all taken, the next
+waits in the backlog.
 
 sluice-wicket-runtime-firecracker's `--listen` has only its head's 10s (none on a sole route, whose
 guest may speak first): it relays verbatim after that, so a quiet client is its guest's and the route's

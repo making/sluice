@@ -246,7 +246,7 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use sluice_wicket_server::http::QUIET;
-    use tokio::io::AsyncReadExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpStream;
     use tokio::time::Instant;
 
@@ -269,8 +269,8 @@ mod tests {
     }
 
     /// A client sending nothing loses its connection after the bound, in the
-    /// TLS handshake as in the wait for a request's head: it holds no slot for
-    /// good.
+    /// TLS handshake as in the wait for a request's head, and at once to another
+    /// connection when all slots are taken: it holds no slot.
     #[tokio::test(start_paused = true)]
     async fn a_quiet_connection_is_closed() {
         let certified = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
@@ -293,7 +293,71 @@ mod tests {
             assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
             assert!(started.elapsed() >= QUIET, "{:?}", started.elapsed());
             assert!(started.elapsed() < QUIET * 2, "{:?}", started.elapsed());
+
+            let started = Instant::now();
+            let mut quiet = Vec::new();
+            for _ in 0..api::MAX_CONNECTIONS {
+                quiet.push(TcpStream::connect(address).await.unwrap());
+            }
+            let _next = TcpStream::connect(address).await.unwrap();
+            assert_eq!(quiet[0].read(&mut [0; 1]).await.unwrap(), 0);
+            assert!(started.elapsed() < QUIET, "{:?}", started.elapsed());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// All slots taken, a request with a token keeps its connection, one without
+    /// gives way, each still sending its body.
+    #[tokio::test(start_paused = true)]
+    async fn only_an_authenticated_request_keeps_its_slot() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let dir = std::env::temp_dir().join(format!("cf-api-held-{}", store::guid()));
+        let data_dir = dir.clone();
+        tokio::spawn(async move {
+            serve(listener, settings(data_dir, None), std::future::pending())
+                .await
+                .unwrap()
+        });
+        let grant = "grant_type=password&username=u";
+        let mut signing_in = TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "POST /uaa/oauth/token HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\
+             content-length: {}\r\n\r\n{grant}",
+            grant.len()
+        );
+        signing_in.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = String::new();
+        signing_in.read_to_string(&mut answer).await.unwrap();
+        let (_, tokens) = answer.split_once("\r\n\r\n").unwrap();
+        let tokens: serde_json::Value = serde_json::from_str(tokens).unwrap();
+        let token = tokens["access_token"].as_str().unwrap();
+
+        let mut admitted = TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "POST /v3/x HTTP/1.1\r\nhost: t\r\nauthorization: bearer {token}\r\n\
+             content-length: 5\r\n\r\nab"
+        );
+        admitted.write_all(request.as_bytes()).await.unwrap();
+        let mut anyone = TcpStream::connect(address).await.unwrap();
+        anyone
+            .write_all(b"POST /v3/x HTTP/1.1\r\nhost: t\r\ncontent-length: 5\r\n\r\nab")
+            .await
+            .unwrap();
+        // both reach their handler
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let mut quiet = Vec::new();
+        for _ in 2..api::MAX_CONNECTIONS {
+            quiet.push(TcpStream::connect(address).await.unwrap());
+        }
+        let _next = TcpStream::connect(address).await.unwrap();
+        assert_eq!(anyone.read(&mut [0; 1]).await.unwrap(), 0);
+
+        admitted.write_all(b"cde").await.unwrap();
+        let mut status = [0; 8];
+        admitted.read_exact(&mut status).await.unwrap();
+        assert_eq!(&status, b"HTTP/1.1");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

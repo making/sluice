@@ -3,7 +3,8 @@
 //! served here -- its style (`/console.css`), its fonts and the script
 //! helpers its own script imports (`/kit.js`) -- and the wicket's page
 //! (`/`, `/console.js`) and API by its [`Service`]. A connection's client going
-//! quiet gives its slot back (`sluice_wicket_server::http`).
+//! quiet gives its slot back, and all taken, one without a request the gate
+//! admitted gives way (`sluice_wicket_server::http`).
 
 use std::sync::Arc;
 
@@ -15,7 +16,8 @@ use tokio::net::TcpListener;
 use crate::gate::Gate;
 use crate::http::{Body, Response, asset, drain, error, secure};
 
-/// Connections open at once; one beyond waits in the backlog.
+/// Connections open at once; one beyond takes the place of one without a request
+/// admitted, or waits in the backlog for one.
 const MAX_CONNECTIONS: usize = 64;
 
 const CSS: &str = include_str!("assets/console.css");
@@ -56,8 +58,7 @@ pub async fn run<S: Service>(listener: TcpListener, gate: Gate, service: Arc<S>)
         move |stream, _, slot| {
             let (gate, service) = (gate.clone(), service.clone());
             tokio::spawn(async move {
-                let _slot = slot;
-                sluice_wicket_server::http::serve(stream, |request| {
+                sluice_wicket_server::http::serve(stream, slot, |request| {
                     answer(&gate, &*service, request)
                 })
                 .await;
@@ -69,38 +70,37 @@ pub async fn run<S: Service>(listener: TcpListener, gate: Gate, service: Arc<S>)
 
 async fn answer<S: Service>(gate: &Gate, service: &S, request: hyper::Request<Body>) -> Response {
     let (parts, body) = request.into_parts();
+    let refusal = (!gate.signs_in(&parts)).then(|| gate.refusal(&parts));
+    if let Some(None) = refusal {
+        body.admit();
+    }
     let mut body = Some(body);
-    let mut response = if gate.signs_in(&parts) {
-        gate.sign_in_route(&parts).await
-    } else {
-        match gate.refusal(&parts) {
-            Some(refused) => refused,
-            None => match (&parts.method, parts.uri.path()) {
-                (&Method::GET, "/") => asset("text/html; charset=utf-8", S::INDEX.as_bytes()),
-                (&Method::GET, "/console.js") => {
-                    asset("text/javascript; charset=utf-8", S::SCRIPT.as_bytes())
-                }
-                (&Method::GET, "/kit.js") => {
-                    asset("text/javascript; charset=utf-8", KIT.as_bytes())
-                }
-                (&Method::GET, "/console.css") => asset("text/css; charset=utf-8", CSS.as_bytes()),
-                (&Method::GET, "/fonts/overpass.woff2") => asset("font/woff2", OVERPASS),
-                (&Method::GET, "/fonts/overpass-mono.woff2") => asset("font/woff2", OVERPASS_MONO),
-                (_, path) if !path.starts_with("/api/") => {
-                    error(StatusCode::NOT_FOUND, format!("nothing at {path}"))
-                }
-                _ => {
-                    let user = gate.session(&parts.headers);
-                    service
-                        .handle(Request {
-                            parts: &parts,
-                            body: &mut body,
-                            user,
-                        })
-                        .await
-                }
-            },
-        }
+    let mut response = match refusal {
+        None => gate.sign_in_route(&parts).await,
+        Some(Some(refused)) => refused,
+        Some(None) => match (&parts.method, parts.uri.path()) {
+            (&Method::GET, "/") => asset("text/html; charset=utf-8", S::INDEX.as_bytes()),
+            (&Method::GET, "/console.js") => {
+                asset("text/javascript; charset=utf-8", S::SCRIPT.as_bytes())
+            }
+            (&Method::GET, "/kit.js") => asset("text/javascript; charset=utf-8", KIT.as_bytes()),
+            (&Method::GET, "/console.css") => asset("text/css; charset=utf-8", CSS.as_bytes()),
+            (&Method::GET, "/fonts/overpass.woff2") => asset("font/woff2", OVERPASS),
+            (&Method::GET, "/fonts/overpass-mono.woff2") => asset("font/woff2", OVERPASS_MONO),
+            (_, path) if !path.starts_with("/api/") => {
+                error(StatusCode::NOT_FOUND, format!("nothing at {path}"))
+            }
+            _ => {
+                let user = gate.session(&parts.headers);
+                service
+                    .handle(Request {
+                        parts: &parts,
+                        body: &mut body,
+                        user,
+                    })
+                    .await
+            }
+        },
     };
     if let Some(body) = body {
         drain(&parts, body, S::DRAIN_LIMIT).await;
@@ -114,50 +114,74 @@ mod tests {
     use sluice_wicket_server::http::QUIET;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpStream;
-    use tokio::time::Instant;
+    use tokio::time::{Duration, Instant, sleep};
 
     use super::*;
+
+    /// How long the [`Page`]'s API takes to answer: past [`QUIET`].
+    const HOLD: Duration = Duration::from_secs(90);
 
     struct Page;
 
     impl Service for Page {
         const INDEX: &'static str = "page";
         const SCRIPT: &'static str = "";
-        const DRAIN_LIMIT: u64 = 0;
+        const DRAIN_LIMIT: u64 = 1 << 20;
 
         async fn handle(&self, _: Request<'_>) -> Response {
+            sleep(HOLD).await;
             error(StatusCode::NOT_FOUND, "nothing")
         }
     }
 
-    /// Connections left open taking every slot stop no one for longer than the
-    /// bound on a quiet client: each is closed, and the next one answered.
+    /// Connections left open taking every slot stop no one: the next one is
+    /// answered at once, the one waiting longest gone, here a request the gate
+    /// refused, its body unfinished. A request it admitted stays, and the others
+    /// until the bound on a quiet client.
     #[tokio::test(start_paused = true)]
-    async fn quiet_connections_give_their_slots_back() {
+    async fn connections_give_way_unless_admitted() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let gate = Gate {
-            token: None,
+            token: Some("token".to_string()),
             sign_in: None,
             realm: "test",
         };
         tokio::spawn(run(listener, gate, Arc::new(Page)));
         let started = Instant::now();
+        let mut admitted = TcpStream::connect(address).await.unwrap();
+        admitted
+            .write_all(b"GET /api/hold HTTP/1.1\r\nhost: t\r\nauthorization: Bearer token\r\n\r\n")
+            .await
+            .unwrap();
+        let mut refused = TcpStream::connect(address).await.unwrap();
+        refused
+            .write_all(b"POST /api/x HTTP/1.1\r\nhost: t\r\ncontent-length: 5\r\n\r\nab")
+            .await
+            .unwrap();
+        // both reach the gate
+        sleep(Duration::from_secs(1)).await;
         let mut quiet = Vec::new();
-        for _ in 0..MAX_CONNECTIONS {
+        for _ in 2..MAX_CONNECTIONS {
             quiet.push(TcpStream::connect(address).await.unwrap());
         }
+
         let mut next = TcpStream::connect(address).await.unwrap();
-        next.write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")
+        next.write_all(b"GET / HTTP/1.1\r\nhost: t\r\nauthorization: Bearer token\r\n\r\n")
             .await
             .unwrap();
         let mut status = [0; 12];
         next.read_exact(&mut status).await.unwrap();
         assert_eq!(&status, b"HTTP/1.1 200");
-        assert!(started.elapsed() >= QUIET, "{:?}", started.elapsed());
-        assert!(started.elapsed() < QUIET * 2, "{:?}", started.elapsed());
+        assert_eq!(refused.read(&mut [0; 1]).await.unwrap(), 0);
+        assert!(started.elapsed() < QUIET, "{:?}", started.elapsed());
+
         for mut client in quiet {
             assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+            assert!(started.elapsed() >= QUIET, "{:?}", started.elapsed());
         }
+        admitted.read_exact(&mut status).await.unwrap();
+        assert_eq!(&status, b"HTTP/1.1 404");
+        assert!(started.elapsed() >= HOLD, "{:?}", started.elapsed());
     }
 }
