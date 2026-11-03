@@ -251,7 +251,7 @@ another OpenID Provider and the like.
 | web process `instances` | `pool`: warm instances, taking the requests in turn. A request beyond them gets an instance of its own, as on every route. 0 is [as on CF](#mapping): no app in the wicket. `cf logs` names the instance (`APP/PROC/WEB/<index>`, the requests' `app_index`): a warm one's `0` to `pool - 1`, one of its own the lowest index free from `pool` up |
 | web process `memory` | `memory-mib` |
 | annotations `wicket.sluice.ik.am/budget-ms`, `wicket.sluice.ik.am/instances` | `budget-ms`, `instances` (the route's cap; below `pool` the wicket refuses) |
-| annotation `wicket.sluice.ik.am/warm` | `pool` in the place of the process's `instances`, at most those: 0 keeps no instance warm, each request getting its own. An app at 0 instances for that before stops serving on the upgrade: annotate it and `cf scale -i 1` |
+| annotation `wicket.sluice.ik.am/warm` | `pool` in the place of the process's `instances`, at most those, [as a VM's](#how-long-a-vm-lives) from the next start, `cf scale -i` at once: 0 keeps no instance warm, each request getting its own. An app at 0 instances for that before stops serving on the upgrade: annotate it and `cf scale -i 1` |
 | environment variables (`cf set-env`, a manifest's `env:`), `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: what the guest's `wasi:cli/environment` answers |
 | disk | accepted and shown, no effect |
 | security groups | accepted and shown, no effect: a component's network is the capabilities below |
@@ -648,7 +648,11 @@ applications:
 - refused, by `cf push`, the v3 API and `cf scale -i`, naming it: an option without a `mode` or its
   mode not taking it, what is no mode or no number, `shared` above 1 instance, `warm` above the
   instances. A wicket not answering, by the app's next start
-- as `budget-ms` and the rest of the sandbox they apply at the next start; `cf scale -i` at once
+- as `budget-ms` and the rest of the sandbox they apply at the next start; `cf scale -i` at once,
+  so it must hold both as the app runs (what its last start took) and as annotated, refused
+  naming which: `cf restart` undoes a difference. A manifest's `instances` the running app
+  cannot take (`cf push` restarts it right after) waits for the next start, the log saying so
+  and `cf app` showing the new number
 - `cf app` shows the limit, `4/4`, `RUNNING` however many VMs are alive: the wicket took the app.
   The wicket's `GET /api/routes` counts them (`vms.alive`)
 

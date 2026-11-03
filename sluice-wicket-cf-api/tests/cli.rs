@@ -721,7 +721,16 @@ fn the_cf_cli_deploys_to_the_wicket() {
     let refused = cf.ok(&["curl", "-X", "POST", "/v3/apps", "-d", &create]);
     assert!(refused.contains("no VMs"), "{refused}");
     assert!(!cf.ok(&["apps"]).contains("refused"), "no app comes of it");
+    // a scale holds as the app runs and as annotated, refused naming which
+    let warm = json!({"wicket.sluice.ik.am/warm": "2"});
+    annotate(&cf, "hello", &warm);
+    let refused = cf.fails(&["scale", "hello", "-i", "1"]);
+    assert!(refused.contains("annotation"), "{refused}");
+    cf.ok(&["restart", "hello"]);
     annotate(&cf, "hello", &json!({"wicket.sluice.ik.am/warm": null}));
+    let refused = cf.fails(&["scale", "hello", "-i", "1"]);
+    assert!(refused.contains("cf restart"), "{refused}");
+    assert_eq!(instances_shown(&cf, "hello"), "2/2");
     cf.ok(&["restart", "hello"]);
     assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 2);
 
@@ -1789,6 +1798,19 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         let refused = annotate(&cf, "fc", &annotation);
         assert!(refused.contains(reason), "{annotation}: {refused}");
     }
+    // a manifest's count below what the start keeps warm waits for the next start, the
+    // wicket's route as it is: `cf push` restarts the app right after
+    annotate(&cf, "fc", &json!({"wicket.sluice.ik.am/warm": "2"}));
+    cf.ok(&["restart", "fc"]);
+    let manifest = dir.join("scaled.yml");
+    let scaled = "applications:\n- name: fc\n  instances: 1\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/warm: null\n";
+    std::fs::write(&manifest, scaled).unwrap();
+    cf.ok(&["apply-manifest", "-f", manifest.to_str().unwrap()]);
+    assert_eq!(sandbox().unwrap()["vms"], 2);
+    assert!(cf.ok(&["logs", "fc", "--recent"]).contains("next start"));
+    cf.ok(&["restart", "fc"]);
+    let fresh = sandbox().unwrap();
+    assert_eq!((&fresh["vms"], &fresh["warm"]), (&1.into(), &0.into()));
     // a shared VM is one
     cf.ok(&["scale", "fc", "-i", "1"]);
     let shared = json!({"wicket.sluice.ik.am/mode": "shared", "wicket.sluice.ik.am/keep-ms": null});
@@ -1797,6 +1819,14 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     assert_eq!(sandbox().unwrap()["mode"], "shared");
     let refused = cf.fails(&["scale", "fc", "-i", "2"]);
     assert!(refused.contains("one VM"), "{refused}");
+    assert_eq!(instances_shown(&cf, "fc"), "1/1");
+    // so with the annotation gone: the running VM stays the one, until the next start
+    annotate(&cf, "fc", &json!({"wicket.sluice.ik.am/mode": null}));
+    let refused = cf.fails(&["scale", "fc", "-i", "2"]);
+    assert!(
+        refused.contains("one VM") && refused.contains("cf restart"),
+        "{refused}"
+    );
     assert_eq!(instances_shown(&cf, "fc"), "1/1");
     // per connection, from a cap of one
     annotate(

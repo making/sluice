@@ -96,6 +96,12 @@ impl Controller {
             return None;
         }
         hosts.sort();
+        // no count below what the last start keeps warm, which a manifest may leave (`cf push`
+        // restarts the app right after, `cf scale` refuses it): the next start takes it
+        let vms = app
+            .process
+            .instances
+            .max(running.lifetime.warm.unwrap_or(0));
         Some(AppBody {
             owner: owner.to_string(),
             hosts,
@@ -106,7 +112,7 @@ impl Controller {
             sandbox: match running.file.ends_with(crate::staging::ROOTFS) {
                 true => vm_sandbox(
                     running.memory_mib,
-                    app.process.instances,
+                    vms,
                     app.process
                         .health_check
                         .timeout
@@ -673,6 +679,17 @@ mod tests {
         listed.sandbox.pool = Some(2);
         listed.sandbox.budget_ms = Some(10_000);
         assert!(same(&listed, &unset));
+        // a count below what the start keeps warm, as a manifest leaves it: the wicket's kept
+        let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
+        (running.file, running.lifetime.mode, running.lifetime.warm) =
+            ("hello.ext4".into(), Some("pool".into()), Some(3));
+        let floored = Controller::desired(&state, state.app(&guid).unwrap(), "cf").unwrap();
+        assert_eq!(
+            (floored.sandbox.vms, floored.sandbox.warm),
+            (Some(3), Some(3))
+        );
+        let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
+        (running.file, running.lifetime.mode) = ("hello.wasm".into(), None);
         // no warm instance is the annotation's; 0 is as stopped, on any wicket
         let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
         running.lifetime.warm = Some(0);

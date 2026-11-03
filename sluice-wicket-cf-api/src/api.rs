@@ -1315,6 +1315,17 @@ impl Api {
         };
         for guid in &guids {
             self.logs.add(guid, "API", "Applied the manifest");
+            let waits = self.store.read(|state| {
+                let app = state.app(guid)?;
+                manifest::check_running(app, app.process.instances).err()
+            });
+            if let Some(waits) = waits {
+                self.logs.add(
+                    guid,
+                    "API",
+                    format!("The instances wait for the next start: {waits}"),
+                );
+            }
         }
         for (app, instance) in bound {
             self.logs.add(
@@ -1527,8 +1538,9 @@ impl Api {
         Ok(json(StatusCode::OK, &view))
     }
 
-    /// `instances` applies at once; memory and disk at the next start (the
-    /// CLI restarts the app for `-m`).
+    /// `instances` applies at once, refused if the app as it runs or as annotated cannot
+    /// take it (`manifest::check_scale`); memory and disk at the next start (the CLI
+    /// restarts the app for `-m`).
     async fn scale(&self, req: &Req, guid: &str) -> Reply {
         let body: Value = req.json()?;
         self.app(guid)?;
@@ -1570,7 +1582,7 @@ impl Api {
                     .app_mut(&guid)
                     .ok_or_else(|| ApiError::not_found("App"))?;
                 if let Some(instances) = instances {
-                    manifest::check_annotations(&app.annotations, instances, runtime)?;
+                    manifest::check_scale(app, instances, runtime)?;
                     app.process.instances = instances;
                 }
                 if let Some(memory) = memory {

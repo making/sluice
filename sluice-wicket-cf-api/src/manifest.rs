@@ -13,7 +13,7 @@ use serde::de::IgnoredAny;
 
 use crate::services::{self, Unbound};
 use crate::store::{
-    BUDGET_ANNOTATION, INSTANCES_ANNOTATION, KEEP_ANNOTATION, LIFETIME_ANNOTATION, Lifecycle,
+    App, BUDGET_ANNOTATION, INSTANCES_ANNOTATION, KEEP_ANNOTATION, LIFETIME_ANNOTATION, Lifecycle,
     Lifetime, MODE_ANNOTATION, STACK, State, USES_ANNOTATION, WARM_ANNOTATION, now,
 };
 use crate::wicket::Runtime;
@@ -570,9 +570,15 @@ pub fn check_annotations(
             None => format!("annotation {key} needs annotation {MODE_ANNOTATION}"),
         });
     }
+    check_count(&lifetime, instances).map_err(|e| format!("annotation {e}"))?;
+    Ok(lifetime)
+}
+
+/// Whether `lifetime` holds at `instances`: at 0 nothing is kept.
+fn check_count(lifetime: &Lifetime, instances: u64) -> Result<(), String> {
     if lifetime.mode.as_deref() == Some("shared") && instances > 1 {
         return Err(format!(
-            "annotation {MODE_ANNOTATION}: shared is one VM, for {instances} instances"
+            "{MODE_ANNOTATION}: shared is one VM, for {instances} instances"
         ));
     }
     if let Some(warm) = lifetime
@@ -580,10 +586,28 @@ pub fn check_annotations(
         .filter(|warm| instances > 0 && *warm > instances)
     {
         return Err(format!(
-            "annotation {WARM_ANNOTATION}: {warm} is above the app's {instances} instances"
+            "{WARM_ANNOTATION}: {warm} is above the app's {instances} instances"
         ));
     }
-    Ok(lifetime)
+    Ok(())
+}
+
+/// Whether `app`, as its last start left it, holds at `instances`: annotations apply at a
+/// start, a count at once. A stopped app has nothing running.
+pub fn check_running(app: &App, instances: u64) -> Result<(), String> {
+    match app.running.as_ref().filter(|_| app.started) {
+        Some(running) => check_count(&running.lifetime, instances).map_err(|e| {
+            format!("as last started, {e}: `cf restart` takes the annotations as they are")
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Whether `cf scale` may take `app` to `instances`: it applies at once, to what the last start
+/// took, and is what the next start takes the annotations with.
+pub fn check_scale(app: &App, instances: u64, runtime: Option<Runtime>) -> Result<(), String> {
+    check_annotations(&app.annotations, instances, runtime)?;
+    check_running(app, instances)
 }
 
 #[cfg(test)]
@@ -1010,5 +1034,76 @@ mod tests {
         let web = "  processes:\n  - type: web\n    instances: 2\n";
         let refused = apply(&mut state, &manifest(web), Some(Firecracker));
         assert!(refused.unwrap_err().contains("one VM"));
+
+        // a scale holds as the app runs and as annotated, refused naming which
+        let guid = state.app_named("a").unwrap().guid.clone();
+        let running = |lifetime: &Lifetime| {
+            serde_json::from_value(json!({"droplet": "d", "sha256": "s", "file": "f",
+                "memory_mib": 1, "budget_ms": null, "instances": null, "lifetime": lifetime,
+                "since": 0}))
+            .unwrap()
+        };
+        let shared = Lifetime {
+            mode: Some("shared".into()),
+            ..Lifetime::default()
+        };
+        let warm = Lifetime {
+            warm: Some(3),
+            ..Lifetime::default()
+        };
+        let none = Lifetime::default();
+        let as_it_runs = ["as last started", "cf restart"];
+        let annotation = ["annotation", "above"];
+        for (annotated, ran, started, instances, runtime, refused) in [
+            // the annotation gone since the start: the wicket would refuse it, or stay at one VM
+            (&[][..], &warm, true, 2, Some(Firecracker), &as_it_runs[..]),
+            (&[], &warm, true, 2, Some(Wasm), &as_it_runs),
+            (&[], &warm, true, 2, None, &as_it_runs),
+            (&[], &shared, true, 2, Some(Firecracker), &as_it_runs),
+            // annotated for the next start, the running app able to
+            (
+                &[("mode", "pool"), ("warm", "3")],
+                &none,
+                true,
+                2,
+                Some(Firecracker),
+                &annotation,
+            ),
+            (&[("warm", "3")], &none, true, 2, Some(Wasm), &annotation),
+            // nothing runs: the annotations alone
+            (&[], &warm, false, 2, Some(Firecracker), &[]),
+            (&[], &shared, false, 2, Some(Firecracker), &[]),
+            // what it holds
+            (&[], &warm, true, 3, Some(Wasm), &[]),
+            (&[], &warm, true, 0, Some(Wasm), &[]),
+            (&[], &shared, true, 1, Some(Firecracker), &[]),
+            (&[], &shared, true, 0, Some(Firecracker), &[]),
+            (&[], &none, true, 2, Some(Firecracker), &[]),
+        ] {
+            let kept = state.app_mut(&guid).unwrap();
+            kept.annotations = annotated
+                .iter()
+                .map(|(key, value)| (format!("wicket.sluice.ik.am/{key}"), value.to_string()))
+                .collect();
+            kept.running = Some(running(ran));
+            kept.started = started;
+            let answer = check_scale(kept, instances, runtime);
+            let what = format!("{annotated:?} {ran:?} {started} {instances}: {answer:?}");
+            match refused {
+                [] => assert!(answer.is_ok(), "{what}"),
+                words => {
+                    let answer = answer.as_ref().unwrap_err();
+                    assert!(words.iter().all(|word| answer.contains(word)), "{what}");
+                }
+            }
+        }
+        // a manifest's count waits for the start that follows: `cf push` restarts the app
+        let kept = state.app_mut(&guid).unwrap();
+        kept.annotations.clear();
+        kept.running = Some(running(&shared));
+        kept.started = true;
+        let scaled = parse("applications:\n- name: a\n  no-route: true\n  instances: 2\n").unwrap();
+        apply(&mut state, &scaled, Some(Firecracker)).unwrap();
+        assert_eq!(state.app(&guid).unwrap().process.instances, 2);
     }
 }
