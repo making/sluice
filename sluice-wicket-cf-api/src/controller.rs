@@ -2,7 +2,8 @@
 //! a route is an app of the wicket, named by its guid (its routes' hosts,
 //! the snapshot's component and sandbox -- its env, which the wicket lists
 //! by the names only, told by the snapshot's tag -- and the process's
-//! instances as the pool, or a droplet's rootfs as a Firecracker wicket's
+//! instances as the pool and, each taking `concurrency` at once, the route's
+//! cap, or a droplet's rootfs as a Firecracker wicket's
 //! VMs: [`vm_sandbox`]); stopped, scaled to 0, or without a route, it is none. The
 //! desired state is the cf-api's: at startup and whenever the wicket's
 //! revision moves, its apps of the owner are listed and the difference put /
@@ -98,7 +99,7 @@ impl Controller {
         hosts.sort();
         // no count below what the last start keeps warm, which a manifest may leave (`cf push`
         // restarts the app right after, `cf scale` refuses it): the next start takes it
-        let vms = app
+        let instances = app
             .process
             .instances
             .max(running.lifetime.warm.unwrap_or(0));
@@ -112,7 +113,7 @@ impl Controller {
             sandbox: match running.file.ends_with(crate::staging::ROOTFS) {
                 true => vm_sandbox(
                     running.memory_mib,
-                    vms,
+                    instances,
                     app.process
                         .health_check
                         .timeout
@@ -126,7 +127,9 @@ impl Controller {
                     budget_ms: running.budget_ms,
                     memory_mib: Some(running.memory_mib),
                     pool: Some(running.lifetime.warm.unwrap_or(app.process.instances)),
-                    instances: running.instances,
+                    instances: Some(instances.saturating_mul(
+                        running.lifetime.concurrency.unwrap_or(DEFAULT_CONCURRENCY),
+                    )),
                     keyvalue: running.keyvalue.clone(),
                     env: running.env.clone(),
                     ..Sandbox::default()
@@ -529,11 +532,16 @@ const WICKET_DEFAULT_BOOT_MS: u64 = 10_000;
 /// What a Firecracker wicket does not list of a route's `keep-ms`: its default.
 const WICKET_DEFAULT_KEEP_MS: u64 = 60_000;
 
+/// What an instance takes at once, unannotated; a Firecracker wicket's default of a route's
+/// `conns`, which it does not list.
+const DEFAULT_CONCURRENCY: u64 = 16;
+
 /// A rootfs's sandbox on a Firecracker wicket: `instances` VMs at most (from 1: 0 is no app),
 /// living as `lifetime` says. None annotated, one is a shared VM, booted at once; more, a pool
 /// of that size cloned from a snapshot. A pool given a `keep-ms` keeps only the VMs annotated
-/// `warm`, none by default: the wicket's default of all of them would leave no VM to kill.
-/// Its process has `timeout` seconds to listen, and connects to the destinations of `egress`.
+/// `warm`, none by default: the wicket's default of all of them would leave no VM to kill; its
+/// `concurrency` is `conns`. Its process has `timeout` seconds to listen, and connects to the
+/// destinations of `egress`.
 fn vm_sandbox(
     memory_mib: u64,
     instances: u64,
@@ -557,6 +565,7 @@ fn vm_sandbox(
         keep_ms: lifetime.keep_ms,
         uses: lifetime.uses,
         lifetime_ms: lifetime.lifetime_ms,
+        conns: lifetime.concurrency,
         boot_ms: Some(timeout.clamp(1, MAXIMUM_HEALTH_CHECK_TIMEOUT) * 1000),
         egress: egress.to_vec(),
         env: env.clone(),
@@ -591,6 +600,7 @@ fn same(listed: &AppBody, desired: &AppBody) -> bool {
         (None, _) => 0,
     };
     let keep_ms = |sandbox: &Sandbox| sandbox.keep_ms.unwrap_or(WICKET_DEFAULT_KEEP_MS);
+    let conns = |sandbox: &Sandbox| sandbox.conns.unwrap_or(DEFAULT_CONCURRENCY);
     sorted(&listed.hosts) == desired.hosts
         && listed.component == desired.component
         && sorted(&listed.sandbox.wasi) == sorted(&desired.sandbox.wasi)
@@ -608,6 +618,7 @@ fn same(listed: &AppBody, desired: &AppBody) -> bool {
         && listed.sandbox.vms == desired.sandbox.vms
         && warm(&listed.sandbox) == warm(&desired.sandbox)
         && keep_ms(&listed.sandbox) == keep_ms(&desired.sandbox)
+        && conns(&listed.sandbox) == conns(&desired.sandbox)
         && listed.sandbox.uses == desired.sandbox.uses
         && listed.sandbox.lifetime_ms == desired.sandbox.lifetime_ms
         && desired.sandbox.boot_ms.is_none_or(|boot_ms| {
@@ -634,7 +645,6 @@ mod tests {
             file: "hello.wasm".into(),
             memory_mib: 64,
             budget_ms: Some(5000),
-            instances: None,
             lifetime: Lifetime::default(),
             wasi: vec!["keyvalue".into(), "cli".into()],
             keyvalue: [(String::new(), "local/cf/i".to_string())].into(),
@@ -690,13 +700,32 @@ mod tests {
         );
         let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
         (running.file, running.lifetime.mode) = ("hello.wasm".into(), None);
-        // no warm instance is the annotation's; 0 is as stopped, on any wicket
+        // `cf scale` a component's limit too: the instances kept unless annotated, each taking
+        // `concurrency` at once, past what the wicket runs or not; as a VM's, no lower than what
+        // the start keeps warm, which the wicket refuses
+        for (instances, warm, concurrency, pool, cap) in [
+            (1, None, None, 1, 16),
+            (2, None, None, 2, 32),
+            (2, None, Some(1), 2, 2),
+            (2, Some(0), None, 0, 32),
+            (2, Some(1), Some(3), 1, 6),
+            (1, Some(3), Some(1), 3, 3),
+            (u64::MAX, Some(0), None, 0, u64::MAX),
+        ] {
+            let app = state.app_mut(&guid).unwrap();
+            app.process.instances = instances;
+            let running = app.running.as_mut().unwrap();
+            (running.lifetime.warm, running.lifetime.concurrency) = (warm, concurrency);
+            let limited = Controller::desired(&state, state.app(&guid).unwrap(), "cf").unwrap();
+            assert_eq!(
+                (limited.sandbox.pool, limited.sandbox.instances),
+                (Some(pool), Some(cap)),
+                "{instances} {warm:?} {concurrency:?}"
+            );
+        }
         let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
-        running.lifetime.warm = Some(0);
-        let warmless = Controller::desired(&state, state.app(&guid).unwrap(), "cf").unwrap();
-        assert_eq!(warmless.sandbox.pool, Some(0));
-        let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
-        running.lifetime.warm = None;
+        (running.lifetime.warm, running.lifetime.concurrency) = (None, None);
+        // 0 is as stopped, on any wicket
         state.app_mut(&guid).unwrap().process.instances = 0;
         assert_eq!(
             Controller::desired(&state, state.app(&guid).unwrap(), "cf"),
@@ -749,6 +778,7 @@ mod tests {
             keep_ms,
             uses,
             lifetime_ms,
+            concurrency: None,
         };
         for (instances, annotated, mode, vms, warm) in [
             (1, Lifetime::default(), "shared", None, None),
@@ -802,6 +832,16 @@ mod tests {
                 Some(3),
                 Some(1),
             ),
+            (
+                3,
+                Lifetime {
+                    concurrency: Some(4),
+                    ..lifetime(Some("pool"), None, None, None, None)
+                },
+                "pool",
+                Some(3),
+                None,
+            ),
         ] {
             let sandbox = vm_sandbox(64, instances, 60, &BTreeMap::new(), &[], &annotated);
             assert_eq!(
@@ -809,8 +849,18 @@ mod tests {
                 (Some(mode), vms, warm)
             );
             assert_eq!(
-                (sandbox.keep_ms, sandbox.uses, sandbox.lifetime_ms),
-                (annotated.keep_ms, annotated.uses, annotated.lifetime_ms)
+                (
+                    sandbox.keep_ms,
+                    sandbox.uses,
+                    sandbox.lifetime_ms,
+                    sandbox.conns
+                ),
+                (
+                    annotated.keep_ms,
+                    annotated.uses,
+                    annotated.lifetime_ms,
+                    annotated.concurrency
+                )
             );
         }
         // the options the wicket lists only away from their defaults
@@ -830,15 +880,21 @@ mod tests {
             60,
             &BTreeMap::new(),
             &[],
-            &annotated(Some(2), Some(60_000)),
+            &Lifetime {
+                concurrency: Some(16),
+                ..annotated(Some(2), Some(60_000))
+            },
         );
         let mut told = asked.clone();
-        (told.warm, told.keep_ms) = (None, None);
+        (told.warm, told.keep_ms, told.conns) = (None, None, None);
         assert!(same(&body(told.clone()), &body(asked.clone())));
         told.warm = Some(0);
         assert!(!same(&body(told.clone()), &body(asked.clone())));
         told.warm = None;
         told.keep_ms = Some(500);
+        assert!(!same(&body(told.clone()), &body(asked.clone())));
+        told.keep_ms = None;
+        told.conns = Some(3);
         assert!(!same(&body(told), &body(asked)));
         // a removal the wicket did not take is tried again, but for another owner's app
         let refused = |status| Failure::Refused {

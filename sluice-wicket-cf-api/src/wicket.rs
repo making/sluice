@@ -91,6 +91,9 @@ pub struct Sandbox {
     /// A Firecracker wicket's: how long a VM serves at most.
     #[serde(rename = "lifetime-ms", skip_serializing_if = "Option::is_none")]
     pub lifetime_ms: Option<u64>,
+    /// A Firecracker wicket's: the connections a pool's VM holds before the pool grows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conns: Option<u64>,
     /// A Firecracker wicket's: how long a VM's process may take to listen.
     #[serde(rename = "boot-ms", skip_serializing_if = "Option::is_none")]
     pub boot_ms: Option<u64>,

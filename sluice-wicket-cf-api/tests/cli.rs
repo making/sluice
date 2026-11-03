@@ -2,6 +2,7 @@
 //! distribution refuses any other platform) against the cf-api and a wicket
 //! in local mode, both on a flume: login, push, the app's logs, map-route,
 //! scale, a rolling push with requests all along, stop and start, a scale to 0, the
+//! limit of a scale and of its `concurrency`, the
 //! user's environment variables and VCAP_*, a private component in an OCI
 //! registry (a stub) pushed by tag -- its credentials, a restart keeping
 //! the digest staged when the tag moves, a restage taking the new one --, a
@@ -13,8 +14,8 @@
 //! delete. And against a Firecracker wicket, where `/dev/kvm` is usable: a
 //! private image made into a rootfs by the wicket, its process's user, files and
 //! environment seen from the VM, its connections through the security groups, a scale, each
-//! mode and lifetime by annotation, a scale to 0, a
-//! rootfs of a zip, the wicket's
+//! mode and lifetime by annotation, a VM per connection warned of and finding no room, a scale
+//! to 0, a rootfs of a zip, the wicket's
 //! directory lost and the image's rootfs made again, of the digest it had; then the
 //! cf-api itself an app of that wicket, in a VM with a disk, the flume and a provider
 //! through its egress: refused with no word on who logs in, its apps and logins kept
@@ -315,6 +316,30 @@ fn fetch(
         .and_then(|status| status.parse().ok())
         .expect("a status");
     Some((status, body.to_string()))
+}
+
+/// A request at `path` whose answer has started, held open until the stream is dropped.
+fn held(address: &str, host: &str, path: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(address).expect("connect");
+    stream.set_read_timeout(Some(HANG)).unwrap();
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .unwrap();
+    let mut started = [0u8; 12];
+    stream.read_exact(&mut started).unwrap();
+    let started = String::from_utf8_lossy(&started);
+    assert_eq!(started, "HTTP/1.1 200", "GET {path} of {host}");
+    stream
+}
+
+/// [`get`] on a thread of its own: the status, once answered.
+fn answered(address: &str, host: &str, path: &str) -> mpsc::Receiver<u16> {
+    let (status, answer) = mpsc::channel();
+    let (address, host, path) = (address.to_string(), host.to_string(), path.to_string());
+    std::thread::spawn(move || {
+        let _ = status.send(get(&address, &host, &path, None).0);
+    });
+    answer
 }
 
 /// The wicket's apps, through its console.
@@ -625,7 +650,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
     assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 2);
     // the second warm instance takes its turn: its index in the output and in
     // app_index (a request before the units are up runs on an instance of its
-    // own, index 2)
+    // own, named as one of them)
     let deadline = Instant::now() + HANG;
     loop {
         assert_eq!(get(&listen, "hello.localhost", "/log", None).0, 200);
@@ -733,6 +758,81 @@ fn the_cf_cli_deploys_to_the_wicket() {
     assert_eq!(instances_shown(&cf, "hello"), "2/2");
     cf.ok(&["restart", "hello"]);
     assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 2);
+
+    // `cf scale` the limit: an instance takes 16 requests at once, the next waits for one of
+    // them to end; what serves past the instance kept is named as `cf app` lists it
+    let limited = "limited.localhost";
+    let manifest = dir.join("limited.yml");
+    let budget = "applications:\n- name: limited\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/budget-ms: 30000\n";
+    std::fs::write(&manifest, budget).unwrap();
+    cf.ok(&[
+        "push",
+        "-f",
+        manifest.to_str().unwrap(),
+        "-p",
+        dir.join("app").to_str().unwrap(),
+    ]);
+    // a response not read holds its instance a second at least (20 chunks 50ms apart), until a
+    // write finds its client gone
+    let beyond = |room: usize| {
+        let streams: Vec<TcpStream> = (0..room)
+            .map(|_| held(&listen, limited, "/stream"))
+            .collect();
+        let waiting = answered(&listen, limited, "/");
+        let wait = waiting.recv_timeout(Duration::from_millis(500));
+        assert_eq!(wait.ok(), None, "past {room} at once");
+        drop(streams);
+        assert_eq!(waiting.recv_timeout(HANG).ok(), Some(200));
+    };
+    beyond(16);
+    let stream = held(&listen, limited, "/stream");
+    assert_eq!(get(&listen, limited, "/log", None).0, 200);
+    drop(stream);
+    let deadline = Instant::now() + HANG;
+    let recent = loop {
+        let recent = cf.ok(&["logs", "limited", "--recent"]);
+        if recent.contains(&request("/log")) {
+            break recent;
+        }
+        assert!(Instant::now() < deadline, "the request's line never came");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(
+        recent.contains("[APP/PROC/WEB/0] OUT hello stdout: Method::Get /log")
+            && !recent.contains("[APP/PROC/WEB/1]")
+            && !recent.contains("app_index:\"1\""),
+        "{recent}"
+    );
+    // one at a time is the annotation's, from the next start; the limit follows the scale
+    let limits = || {
+        let listed = listing(&console);
+        let apps = listed["apps"].as_array().unwrap();
+        let app = apps.iter().find(|app| app["hosts"][0] == limited);
+        let sandbox = &app.unwrap()["sandbox"];
+        (sandbox["pool"].as_u64(), sandbox["instances"].as_u64())
+    };
+    assert_eq!(limits(), (Some(1), Some(16)));
+    annotate(
+        &cf,
+        "limited",
+        &json!({"wicket.sluice.ik.am/concurrency": "1"}),
+    );
+    assert_eq!(limits(), (Some(1), Some(16)), "until the next start");
+    cf.ok(&["restart", "limited"]);
+    assert_eq!(limits(), (Some(1), Some(1)));
+    beyond(1);
+    cf.ok(&["scale", "limited", "-i", "2"]);
+    assert_eq!(limits(), (Some(2), Some(2)));
+    let refused = annotate(
+        &cf,
+        "limited",
+        &json!({"wicket.sluice.ik.am/instances": "4"}),
+    );
+    assert!(
+        refused.contains("cf scale -i") && refused.contains("concurrency"),
+        "{refused}"
+    );
+    cf.ok(&["delete", "limited", "-f"]);
 
     // the user's variables, VCAP_APPLICATION and VCAP_SERVICES: the guest
     // gets them from the next start on; no log and no listing of the
@@ -1764,6 +1864,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     // a pool given a lifetime has no VM kept but those annotated: none here
     let pool = json!({
         "wicket.sluice.ik.am/mode": "pool",
+        "wicket.sluice.ik.am/concurrency": "3",
         "wicket.sluice.ik.am/uses": null,
         "wicket.sluice.ik.am/lifetime-ms": null,
     });
@@ -1775,9 +1876,10 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
             &fresh["mode"],
             &fresh["vms"],
             &fresh["warm"],
-            &fresh["keep-ms"]
+            &fresh["keep-ms"],
+            &fresh["conns"]
         ),
-        (&"pool".into(), &2.into(), &0.into(), &500.into()),
+        (&"pool".into(), &2.into(), &0.into(), &500.into(), &3.into()),
     );
     scales_to_zero("pool");
     // what a mode does not take is refused, as what is no mode and no number
@@ -1790,8 +1892,15 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
             json!({"wicket.sluice.ik.am/budget-ms": "5000"}),
             "budget-ms",
         ),
+        (json!({"wicket.sluice.ik.am/concurrency": "0"}), "no number"),
+        (json!({"wicket.sluice.ik.am/instances": "2"}), "cf scale -i"),
         (
-            json!({"wicket.sluice.ik.am/mode": "shared", "wicket.sluice.ik.am/keep-ms": null}),
+            json!({"wicket.sluice.ik.am/mode": "per-connection", "wicket.sluice.ik.am/keep-ms": null}),
+            "concurrency",
+        ),
+        (
+            json!({"wicket.sluice.ik.am/mode": "shared", "wicket.sluice.ik.am/keep-ms": null,
+                "wicket.sluice.ik.am/concurrency": null}),
             "one VM",
         ),
     ] {
@@ -1813,7 +1922,8 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     assert_eq!((&fresh["vms"], &fresh["warm"]), (&1.into(), &0.into()));
     // a shared VM is one
     cf.ok(&["scale", "fc", "-i", "1"]);
-    let shared = json!({"wicket.sluice.ik.am/mode": "shared", "wicket.sluice.ik.am/keep-ms": null});
+    let shared = json!({"wicket.sluice.ik.am/mode": "shared", "wicket.sluice.ik.am/keep-ms": null,
+        "wicket.sluice.ik.am/concurrency": null});
     assert!(annotate(&cf, "fc", &shared).contains("\"guid\""));
     cf.ok(&["restart", "fc"]);
     assert_eq!(sandbox().unwrap()["mode"], "shared");
@@ -1846,12 +1956,22 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         assert!(Instant::now() < deadline, "its VM outlives its connection");
         std::thread::sleep(Duration::from_millis(200));
     }
-    // scaled to 0: nothing runs, nothing serves, as stopped; the cap back, it serves again
-    cf.ok(&["scale", "fc", "-i", "0"]);
+    // its one VM a connection's: the next, finding no room, is told why
+    let holding = held(&listen, "fc.localhost", "/");
+    let (status, body) = get(&listen, "fc.localhost", "/", None);
+    assert_eq!(status, 502, "{body}");
+    let per_connection = "a VM per connection";
+    assert!(body.contains(per_connection), "{body}");
+    drop(holding);
+    // scaled to 0: nothing runs, nothing serves, as stopped; the cap back, it serves again,
+    // the scale saying what that count is
+    let scaled = cf.ok(&["scale", "fc", "-i", "0"]);
+    assert!(!scaled.contains(per_connection), "{scaled}");
     assert_eq!(sandbox(), None);
     assert_eq!(get(&listen, "fc.localhost", "/", None).0, 404);
     assert_eq!(instances_shown(&cf, "fc"), "0/0");
-    cf.ok(&["scale", "fc", "-i", "1"]);
+    let scaled = cf.ok(&["scale", "fc", "-i", "1"]);
+    assert!(scaled.contains(per_connection), "{scaled}");
     assert_eq!(get(&listen, "fc.localhost", "/", None).0, 200);
     // none annotated: 1 a shared VM, more a pool of a fixed size, as above
     annotate(&cf, "fc", &json!({"wicket.sluice.ik.am/mode": null}));
@@ -1874,6 +1994,18 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         "{shown}"
     );
     assert!(cf.ok(&["stacks"]).contains("firecracker "));
+    // a push says what the count is, as a scale does
+    let manifest = dir.join("reused.yml");
+    let reused = "applications:\n- name: zipped\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/mode: reuse\n";
+    std::fs::write(&manifest, reused).unwrap();
+    let pushed = cf.ok(&[
+        "push",
+        "-f",
+        manifest.to_str().unwrap(),
+        "-p",
+        dir.join("rootfs").to_str().unwrap(),
+    ]);
+    assert!(pushed.contains(per_connection), "{pushed}");
 
     // deleted while the wicket is down: removed when it is back
     cf.ok(&["push", "gone", "-p", dir.join("rootfs").to_str().unwrap()]);

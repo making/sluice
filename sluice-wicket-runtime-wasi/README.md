@@ -172,7 +172,8 @@ request finding the route at its cap waits for one of the route's slots within
 its budget (503 when it runs out, as above), holding no `--max-instances` slot
 meanwhile: requests waiting on a route's cap take no slot from the other
 routes. The cap reserves nothing: only `pool` does. It must be at least 1 and
-at least `pool` (a startup error otherwise). With a cap equal to `pool`, a
+at least `pool` (a startup error otherwise); above `--max-instances` it is no
+error, that limit bounding it. With a cap equal to `pool`, a
 request finding every unit busy waits for one instead of instantiating per
 request. A literal `?` in a file path needs URL-escaping.
 

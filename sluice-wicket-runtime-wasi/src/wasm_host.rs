@@ -1914,7 +1914,7 @@ impl Handler {
         let live = Arc::new(Gauge::default());
         let route = sandbox
             .instances
-            .map(|cap| Arc::new(tokio::sync::Semaphore::new(cap)));
+            .map(|cap| Arc::new(tokio::sync::Semaphore::new(cap.min(Instances::MAX))));
         let pool = match sandbox.pool {
             0 => None,
             _ => Some(Pool::new(
@@ -5712,6 +5712,10 @@ pub(crate) mod tests {
 
         // served within its 1s budget, while the occupant holds on for 10s
         let body = exchange(&other, &get("/")).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+        // a cap past anything the limit may be: the limit bounds it
+        let uncapped = capped(&loaded, &instances, usize::MAX, 0, None);
+        let body = exchange(&uncapped, &get("/")).await;
         assert!(body.starts_with("HTTP/1.1 200"), "{body}");
 
         occupant.error(1, "public peer left");

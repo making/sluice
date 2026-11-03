@@ -13,8 +13,9 @@ use serde::de::IgnoredAny;
 
 use crate::services::{self, Unbound};
 use crate::store::{
-    App, BUDGET_ANNOTATION, INSTANCES_ANNOTATION, KEEP_ANNOTATION, LIFETIME_ANNOTATION, Lifecycle,
-    Lifetime, MODE_ANNOTATION, STACK, State, USES_ANNOTATION, WARM_ANNOTATION, now,
+    App, BUDGET_ANNOTATION, CONCURRENCY_ANNOTATION, INSTANCES_ANNOTATION, KEEP_ANNOTATION,
+    LIFETIME_ANNOTATION, Lifecycle, Lifetime, MODE_ANNOTATION, STACK, State, USES_ANNOTATION,
+    WARM_ANNOTATION, now,
 };
 use crate::wicket::Runtime;
 
@@ -481,12 +482,17 @@ pub fn check_annotations(
     instances: u64,
     runtime: Option<Runtime>,
 ) -> Result<Lifetime, String> {
-    for key in [BUDGET_ANNOTATION, INSTANCES_ANNOTATION] {
-        if let Some(value) = annotations.get(key)
-            && value.parse::<u64>().ok().is_none_or(|number| number == 0)
-        {
-            return Err(format!("annotation {key}: '{value}' is no number from 1"));
-        }
+    if annotations.contains_key(INSTANCES_ANNOTATION) {
+        return Err(format!(
+            "annotation {INSTANCES_ANNOTATION}: `cf scale -i` and {CONCURRENCY_ANNOTATION} replace it"
+        ));
+    }
+    if let Some(value) = annotations.get(BUDGET_ANNOTATION)
+        && value.parse::<u64>().ok().is_none_or(|number| number == 0)
+    {
+        return Err(format!(
+            "annotation {BUDGET_ANNOTATION}: '{value}' is no number from 1"
+        ));
     }
     // as the wicket's options: 32 bits
     let number = |key: &str, least: u64| {
@@ -506,11 +512,7 @@ pub fn check_annotations(
         keep_ms: number(KEEP_ANNOTATION, 1)?,
         uses: number(USES_ANNOTATION, 1)?,
         lifetime_ms: number(LIFETIME_ANNOTATION, 1)?,
-    };
-    let given = |keys: &[&'static str]| {
-        keys.iter()
-            .copied()
-            .find(|key| annotations.contains_key(*key))
+        concurrency: number(CONCURRENCY_ANNOTATION, 1)?,
     };
     match runtime {
         Some(Runtime::Wasm) => {
@@ -520,25 +522,22 @@ pub fn check_annotations(
                 USES_ANNOTATION,
                 LIFETIME_ANNOTATION,
             ];
-            if let Some(key) = given(&vm) {
+            if let Some(key) = vm.iter().find(|key| annotations.contains_key(**key)) {
                 return Err(format!(
                     "annotation {key}: this wicket runs components, it has no VMs"
                 ));
             }
         }
-        Some(Runtime::Firecracker) => {
-            if let Some(key) = given(&[BUDGET_ANNOTATION, INSTANCES_ANNOTATION]) {
-                return Err(format!(
-                    "annotation {key}: this wicket runs VMs, it has no components: \
-                     `cf scale -i` caps them"
-                ));
-            }
+        Some(Runtime::Firecracker) if annotations.contains_key(BUDGET_ANNOTATION) => {
+            return Err(format!(
+                "annotation {BUDGET_ANNOTATION}: this wicket runs VMs, it has no components"
+            ));
         }
-        None => {}
+        _ => {}
     }
     let takes: &[&str] = match lifetime.mode.as_deref() {
-        // a wasm wicket's warm, that needs no mode
-        None if runtime != Some(Runtime::Firecracker) => &[WARM_ANNOTATION],
+        // a wasm wicket's, that need no mode
+        None if runtime != Some(Runtime::Firecracker) => &[WARM_ANNOTATION, CONCURRENCY_ANNOTATION],
         None | Some("shared") => &[],
         Some("per-connection") => &[WARM_ANNOTATION],
         Some("reuse") => &[
@@ -547,7 +546,7 @@ pub fn check_annotations(
             USES_ANNOTATION,
             LIFETIME_ANNOTATION,
         ],
-        Some("pool") => &[WARM_ANNOTATION, KEEP_ANNOTATION],
+        Some("pool") => &[WARM_ANNOTATION, KEEP_ANNOTATION, CONCURRENCY_ANNOTATION],
         Some(other) => {
             return Err(format!(
                 "annotation {MODE_ANNOTATION}: '{other}' is no mode: shared, per-connection, \
@@ -560,6 +559,7 @@ pub fn check_annotations(
         KEEP_ANNOTATION,
         USES_ANNOTATION,
         LIFETIME_ANNOTATION,
+        CONCURRENCY_ANNOTATION,
     ];
     if let Some(key) = options
         .into_iter()
@@ -608,6 +608,37 @@ pub fn check_running(app: &App, instances: u64) -> Result<(), String> {
 pub fn check_scale(app: &App, instances: u64, runtime: Option<Runtime>) -> Result<(), String> {
     check_annotations(&app.annotations, instances, runtime)?;
     check_running(app, instances)
+}
+
+/// What a `cf push` tells of `app`: [`connections_warning`] as its start takes the annotations.
+pub fn push_warning(app: &App) -> Option<String> {
+    let annotated = app.annotations.get(MODE_ANNOTATION);
+    connections_warning(app, annotated.map(String::as_str))
+}
+
+/// What a `cf scale` of its instances tells of `app`: [`connections_warning`] as it runs, a count
+/// applying at once, a stopped one as annotated.
+pub fn scale_warning(app: &App) -> Option<String> {
+    match app.running.as_ref().filter(|_| app.started) {
+        Some(running) => connections_warning(app, running.lifetime.mode.as_deref()),
+        None => push_warning(app),
+    }
+}
+
+/// `mode`, when it gives each connection a VM of its own, at `app`'s instances: how many
+/// connections it serves at a time, literally. Most manifests name no count.
+fn connections_warning(app: &App, mode: Option<&str>) -> Option<String> {
+    let mode = mode.filter(|mode| matches!(*mode, "per-connection" | "reuse"))?;
+    let connections = match app.process.instances {
+        0 => return None,
+        1 => "1 connection".to_string(),
+        count => format!("{count} connections"),
+    };
+    Some(format!(
+        "{}: mode {mode} is a VM per connection: {connections} at a time, the next waiting for \
+         room, then answered 502. cf scale -i sets how many",
+        app.name
+    ))
 }
 
 #[cfg(test)]
@@ -873,7 +904,7 @@ mod tests {
         );
         assert!(refused("applications:\n- name: a_b\n  default-route: true\n").contains("no host"));
         assert!(refused("applications:\n- name: a\n  memory: 2 pounds\n").contains("no size"));
-        assert!(refused("applications:\n- name: a\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/instances: many\n").contains("no number"));
+        assert!(refused("applications:\n- name: a\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/budget-ms: many\n").contains("no number"));
         assert!(parse("applications: [").is_err());
 
         // what the annotations ask, on each wicket and at each `cf scale`
@@ -926,6 +957,31 @@ mod tests {
             ),
             (&[("warm", "1")], 2, Some(Firecracker), "needs annotation"),
             (&[("uses", "1")], 2, None, "needs annotation"),
+            (
+                &[("concurrency", "1")],
+                2,
+                Some(Firecracker),
+                "needs annotation",
+            ),
+            // what has no concurrency of its own to set
+            (
+                &[("mode", "shared"), ("concurrency", "1")],
+                1,
+                Some(Firecracker),
+                "does not take",
+            ),
+            (
+                &[("mode", "per-connection"), ("concurrency", "1")],
+                1,
+                None,
+                "does not take",
+            ),
+            (
+                &[("mode", "reuse"), ("concurrency", "1")],
+                1,
+                Some(Firecracker),
+                "does not take",
+            ),
             // no mode, no number, not in the wicket's 32 bits
             (&[("mode", "fastest")], 1, Some(Firecracker), "no mode"),
             (&[("mode", "fastest")], 1, None, "no mode"),
@@ -948,6 +1004,7 @@ mod tests {
                 "no number from 1",
             ),
             (&[("warm", "-1")], 1, None, "no number from 0"),
+            (&[("concurrency", "0")], 1, Some(Wasm), "no number from 1"),
             // beyond the cap
             (&[("mode", "shared")], 2, Some(Firecracker), "one VM"),
             (
@@ -961,7 +1018,10 @@ mod tests {
             (&[("mode", "pool")], 2, Some(Wasm), "no VMs"),
             (&[("keep-ms", "1")], 2, Some(Wasm), "no VMs"),
             (&[("budget-ms", "1")], 2, Some(Firecracker), "no components"),
-            (&[("instances", "1")], 2, Some(Firecracker), "no components"),
+            // what `cf scale -i` and `concurrency` replace, on any wicket
+            (&[("instances", "1")], 2, Some(Firecracker), "cf scale -i"),
+            (&[("instances", "1")], 2, Some(Wasm), "concurrency"),
+            (&[("instances", "1")], 2, None, "replace it"),
         ] {
             let refused = check(pairs, instances, runtime).unwrap_err();
             assert!(refused.contains(reason), "{pairs:?}: {refused}");
@@ -986,7 +1046,12 @@ mod tests {
                 Some(Firecracker),
             ),
             (
-                &[("mode", "pool"), ("warm", "2"), ("keep-ms", "1")],
+                &[
+                    ("mode", "pool"),
+                    ("warm", "2"),
+                    ("keep-ms", "1"),
+                    ("concurrency", "4"),
+                ],
                 2,
                 Some(Firecracker),
             ),
@@ -994,11 +1059,11 @@ mod tests {
             (&[("mode", "shared")], 0, Some(Firecracker)),
             (&[("mode", "pool"), ("warm", "3")], 0, Some(Firecracker)),
             (
-                &[("warm", "0"), ("budget-ms", "1"), ("instances", "1")],
+                &[("warm", "0"), ("budget-ms", "1"), ("concurrency", "1")],
                 1,
                 Some(Wasm),
             ),
-            (&[("warm", "1")], 2, None),
+            (&[("warm", "1"), ("concurrency", "1")], 2, None),
             (&[("budget-ms", "1")], 2, None),
         ] {
             check(pairs, instances, runtime).unwrap_or_else(|e| panic!("{pairs:?}: {e}"));
@@ -1022,8 +1087,11 @@ mod tests {
                 keep_ms: Some(2),
                 uses: Some(3),
                 lifetime_ms: Some(4),
+                concurrency: None,
             }
         );
+        let concurrency = check(&[("concurrency", "5")], 1, Some(Wasm));
+        assert_eq!(concurrency.unwrap().concurrency, Some(5));
         // a push checks the instances it leaves, wherever it sets them
         let mut state = State::new("o", "s", &["localhost".into()]);
         let shared = "applications:\n- name: a\n  no-route: true\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/mode: shared\n";
@@ -1039,7 +1107,7 @@ mod tests {
         let guid = state.app_named("a").unwrap().guid.clone();
         let running = |lifetime: &Lifetime| {
             serde_json::from_value(json!({"droplet": "d", "sha256": "s", "file": "f",
-                "memory_mib": 1, "budget_ms": null, "instances": null, "lifetime": lifetime,
+                "memory_mib": 1, "budget_ms": null, "lifetime": lifetime,
                 "since": 0}))
             .unwrap()
         };
@@ -1105,5 +1173,52 @@ mod tests {
         let scaled = parse("applications:\n- name: a\n  no-route: true\n  instances: 2\n").unwrap();
         apply(&mut state, &scaled, Some(Firecracker)).unwrap();
         assert_eq!(state.app(&guid).unwrap().process.instances, 2);
+
+        // a VM per connection is said at its count, a push's as annotated, a scale's as it runs
+        let per_connection = Lifetime {
+            mode: Some("per-connection".into()),
+            ..Lifetime::default()
+        };
+        for (annotated, ran, started, instances, pushed, scaled) in [
+            (None, &none, true, 1, None, None),
+            (Some("pool"), &none, true, 1, None, None),
+            (Some("reuse"), &none, true, 1, Some("1 connection at"), None),
+            (
+                Some("reuse"),
+                &none,
+                false,
+                4,
+                Some("4 connections at"),
+                Some("4 connections at"),
+            ),
+            (Some("reuse"), &none, true, 0, None, None),
+            (
+                None,
+                &per_connection,
+                true,
+                2,
+                None,
+                Some("2 connections at"),
+            ),
+        ] {
+            let kept = state.app_mut(&guid).unwrap();
+            kept.annotations = annotated
+                .iter()
+                .map(|mode| (MODE_ANNOTATION.to_string(), mode.to_string()))
+                .collect();
+            kept.running = Some(running(ran));
+            kept.started = started;
+            kept.process.instances = instances;
+            let said = [push_warning(kept), scale_warning(kept)];
+            for (said, expected) in said.iter().zip([pushed, scaled]) {
+                match (said, expected) {
+                    (None, None) => {}
+                    (Some(said), Some(expected)) if said.contains(expected) => {
+                        assert!(said.contains("a VM per connection"), "{said}");
+                    }
+                    _ => panic!("{annotated:?} {ran:?} {instances}: {said:?}, not {expected:?}"),
+                }
+            }
+        }
     }
 }

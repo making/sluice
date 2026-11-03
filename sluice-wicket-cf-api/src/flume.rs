@@ -213,13 +213,17 @@ impl Taker<'_> {
                 let Some(app) = self.hosts.get(&event.route_key) else {
                     return;
                 };
+                let instances = self
+                    .store
+                    .read(|state| state.app(app).map_or(0, |app| app.process.instances));
+                let served = instance(&event).map(|index| listed(index, instances));
                 // a wicket predating the instance index names none: 0, as before
-                let index = instance(&event).unwrap_or(0);
+                let index = served.unwrap_or(0);
                 let (source, index, stream, text) = match event.kind.as_str() {
                     "stdout" => ("APP/PROC/WEB", index, Stream::Out, field(&event, "line")),
                     "stderr" => ("APP/PROC/WEB", index, Stream::Err, field(&event, "line")),
                     // the router's index: the wicket is the one router
-                    "response" => ("RTR", 0, Stream::Out, router_line(&event, app)),
+                    "response" => ("RTR", 0, Stream::Out, router_line(&event, app, served)),
                     _ => return,
                 };
                 self.logs.push(app, source, index, stream, text);
@@ -290,11 +294,18 @@ fn instance(event: &AccessEvent) -> Option<u64> {
         .and_then(|field| field.value.parse().ok())
 }
 
+/// The wicket's instance `index` as `cf app` lists an app of `instances`: only the cf-api knows
+/// them, and a wasm wicket's route runs more at once, the requests of an instance. Of an app at
+/// 0, which lists none, or gone, as it came.
+fn listed(index: u64, instances: u64) -> u64 {
+    index.checked_rem(instances).unwrap_or(index)
+}
+
 /// A response as the gorouter's access log has it: the host, when the
 /// request began, its line, the status, the bytes (received unknown, sent),
 /// the user agent, the client, the response time in seconds, the app and
-/// its instance that served it (`-` for none, as the gorouter has it).
-fn router_line(event: &AccessEvent, app: &str) -> String {
+/// its instance that `served` it (`-` for none, as the gorouter has it).
+fn router_line(event: &AccessEvent, app: &str, served: Option<u64>) -> String {
     let took: f64 = field(event, "durationMs").parse().unwrap_or(0.0);
     let began = event
         .time_unix_millis
@@ -316,7 +327,7 @@ fn router_line(event: &AccessEvent, app: &str) -> String {
         field(event, "userAgent"),
         field(event, "remote"),
         took / 1000.0,
-        instance(event).map_or_else(|| "-".to_string(), |index| index.to_string()),
+        served.map_or_else(|| "-".to_string(), |index| index.to_string()),
     )
 }
 
@@ -402,6 +413,11 @@ mod tests {
         store.update(|state| {
             state.flume = Some(FlumeCursor { epoch: 1, seq: 9 });
         });
+        let scaled = store.update(|state| {
+            let app = state.create_app("scaled", crate::store::STACK);
+            app.process.instances = 2;
+            app.guid.clone()
+        });
         let logs = Logs::default();
         let mut taker = Taker {
             store: &store,
@@ -410,6 +426,7 @@ mod tests {
                 ("a.localhost".to_string(), "app-a".to_string()),
                 ("b.localhost".to_string(), "app-b".to_string()),
                 ("hi.localhost".to_string(), "app-a".to_string()),
+                ("scaled.localhost".to_string(), scaled.clone()),
             ]),
             epoch: 1,
             moved: false,
@@ -508,6 +525,20 @@ mod tests {
             Some(FlumeCursor { epoch: 2, seq: 5 }),
             "the last line taken"
         );
+        // an instance past the app's, the requests of one, named as `cf app` lists it
+        for (seq, kind, index) in [(6, "stdout", "3"), (7, "response", "5")] {
+            taker.take(event(
+                seq,
+                kind,
+                "scaled.localhost",
+                &[("instance", index), ("line", "past")],
+            ));
+        }
+        let of_scaled = lines(&logs, &scaled);
+        let (out, router) = (&of_scaled[of_scaled.len() - 2], of_scaled.last().unwrap());
+        assert_eq!((out.0, out.1, out.3.as_str()), ("APP/PROC/WEB", 1, "past"));
+        assert!(router.3.ends_with("app_index:\"1\""), "{router:?}");
+        assert_eq!(listed(3, 0), 3, "at 0 it lists none");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -144,12 +144,14 @@ the log of the app holding its host, which `cf logs` shows as Cloud Foundry does
 [RTR/0] OUT hello.localhost - [2026-10-30T01:17:47.123Z] "GET /log HTTP/1.1" 200 - 58 "-" "curl/8.7.1" "10.0.0.1" "-" response_time:0.000522 app_id:"<guid>" app_index:"1"
 ```
 
-- An app's web process `instances` is its route's `pool`: with `cf scale -i 3`, requests
-  one after another rotate over instances 0 to 2; one arriving while all three are busy
-  runs on an instance of its own, index 3 or above. On a Firecracker wicket it is its VMs:
-  a pool of `cf scale -i 3` names 0 to 2 and nothing above, what `cf app` lists (its
-  entries are the process's `instances`, not the VMs alive: a VM being replaced is listed
-  all the same).
+- `cf logs` names what `cf app` lists, `0` to `instances - 1` of the web process (its entries
+  are the process's `instances`, not what is alive: a VM being replaced is listed all the
+  same): the cf-api takes the `instance` modulo `instances`, knowing them as the wicket does
+  not. With `cf scale -i 3`, `pool` is 3 and the route's cap 3 x `concurrency`: requests one
+  after another rotate over instances 0 to 2; one arriving while all three are busy runs on
+  an instance of its own, the wicket's index 3 or above, named as one of 0 to 2 (the requests
+  an instance takes at once). On a Firecracker wicket it is its VMs: a pool of
+  `cf scale -i 3` names 0 to 2 and nothing above, as they are.
 - The watch resumes past its cursor (kept in `state.json`) when the hosts change or the
   stream drops. Without a host it holds no watch: an empty filter passes every line.
 - Lines lost become an `LGR` ERR line in the log of every app watched, as they may be any

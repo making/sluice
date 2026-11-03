@@ -37,8 +37,8 @@ use crate::security_groups;
 use crate::services;
 use crate::staging::{self, Hashed};
 use crate::store::{
-    BUDGET_ANNOTATION, Blob, Build, Deployment, DockerImage, INSTANCES_ANNOTATION, JobError,
-    Lifecycle, Outcome, Package, Running, Spool, State, Store, epoch_secs, guid, now,
+    BUDGET_ANNOTATION, Blob, Build, Deployment, DockerImage, JobError, Lifecycle, Outcome, Package,
+    Running, Spool, State, Store, epoch_secs, guid, now,
 };
 use crate::uaa::{self, Uaa};
 use crate::views;
@@ -1313,12 +1313,17 @@ impl Api {
                 );
             }
         };
+        let mut warnings = Vec::new();
         for guid in &guids {
             self.logs.add(guid, "API", "Applied the manifest");
-            let waits = self.store.read(|state| {
-                let app = state.app(guid)?;
-                manifest::check_running(app, app.process.instances).err()
+            let (waits, warning) = self.store.read(|state| match state.app(guid) {
+                Some(app) => (
+                    manifest::check_running(app, app.process.instances).err(),
+                    manifest::push_warning(app),
+                ),
+                None => (None, None),
             });
+            warnings.extend(warning);
             if let Some(waits) = waits {
                 self.logs.add(
                     guid,
@@ -1334,12 +1339,13 @@ impl Api {
                 format!("Bound service instance {instance}: applies at the next start, restart or restage"),
             );
         }
-        self.job(
+        let job = self.job(
             req,
             "space.apply_manifest",
             Vec::new(),
             Some(("space".into(), format!("/v3/spaces/{space}"))),
-        )
+        )?;
+        Ok(warned(job, &warnings))
     }
 
     fn manifest_diff(&self, req: &Req) -> Reply {
@@ -1603,12 +1609,14 @@ impl Api {
         self.logs
             .add(&guid, "API", format!("Scaled the web process: {body}"));
         let app = self.app(&guid)?;
-        Ok(json(
+        let warning = instances.and_then(|_| manifest::scale_warning(&app));
+        let scaled = json(
             StatusCode::ACCEPTED,
             &self
                 .store
                 .read(|state| views::process(&req.base, state, &app)),
-        ))
+        );
+        Ok(warned(scaled, warning.as_slice()))
     }
 
     async fn set_current_droplet(&self, req: &Req, guid: &str) -> Reply {
@@ -2160,7 +2168,6 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
             .to_string(),
         memory_mib: app.process.memory_mb,
         budget_ms: annotation(BUDGET_ANNOTATION),
-        instances: annotation(INSTANCES_ANNOTATION),
         lifetime,
         wasi,
         keyvalue,
@@ -2243,6 +2250,22 @@ fn apply_metadata(
     app.labels = labels;
     app.annotations = annotations;
     Ok(())
+}
+
+/// `response` with `warnings` as the header the CLI prints, each encoded: it splits them at the
+/// commas.
+fn warned(mut response: Response, warnings: &[String]) -> Response {
+    if !warnings.is_empty() {
+        let encoded: Vec<String> = warnings
+            .iter()
+            .map(|warning| form_urlencoded::byte_serialize(warning.as_bytes()).collect())
+            .collect();
+        response.headers_mut().insert(
+            "x-cf-warnings",
+            HeaderValue::from_str(&encoded.join(",")).expect("form encoded"),
+        );
+    }
+    response
 }
 
 pub(crate) fn json(status: StatusCode, body: &Value) -> Response {

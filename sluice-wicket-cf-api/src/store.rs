@@ -17,8 +17,12 @@ use serde::{Deserialize, Serialize};
 
 /// The annotation of an app setting its routes' `budget-ms`.
 pub const BUDGET_ANNOTATION: &str = "wicket.sluice.ik.am/budget-ms";
-/// The annotation of an app setting its routes' `instances` cap.
+/// The annotation that set its routes' `instances` cap, refused: `cf scale -i` and
+/// [`CONCURRENCY_ANNOTATION`] replace it.
 pub const INSTANCES_ANNOTATION: &str = "wicket.sluice.ik.am/instances";
+/// The annotation of an app setting what an instance takes at once: a component's requests, a
+/// pool VM's connections (its routes' `conns`).
+pub const CONCURRENCY_ANNOTATION: &str = "wicket.sluice.ik.am/concurrency";
 /// The annotation of an app setting how a connection gets a VM: its routes' `mode`.
 pub const MODE_ANNOTATION: &str = "wicket.sluice.ik.am/mode";
 /// The annotation of an app setting how many of its instances are kept warm: a VM's `warm`, a
@@ -157,8 +161,8 @@ impl Default for HealthCheck {
     }
 }
 
-/// How an app's instances come and go below `cf scale`'s number, as annotated
-/// (`crate::manifest::check_annotations`); none annotated, the number alone says.
+/// How an app's instances come and go below `cf scale`'s number and what each takes at once, as
+/// annotated (`crate::manifest::check_annotations`); none annotated, the number alone says.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Lifetime {
     pub mode: Option<String>,
@@ -166,6 +170,7 @@ pub struct Lifetime {
     pub keep_ms: Option<u64>,
     pub uses: Option<u64>,
     pub lifetime_ms: Option<u64>,
+    pub concurrency: Option<u64>,
 }
 
 /// The droplet and the sandbox the wicket got at the last start.
@@ -178,7 +183,6 @@ pub struct Running {
     pub file: String,
     pub memory_mib: u64,
     pub budget_ms: Option<u64>,
-    pub instances: Option<u64>,
     #[serde(default)]
     pub lifetime: Lifetime,
     /// The capabilities the bindings granted.
