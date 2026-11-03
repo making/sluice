@@ -615,7 +615,7 @@ The wicket's listing says `runtime: firecracker`.
 | disk | no effect: the rootfs is read-only and `/tmp` a tmpfs of the VM's memory; a persistent disk is the wicket API's, with no CF counterpart |
 | services | none: the listing offers neither capabilities nor keyvalue stores |
 | outbound connections | the [security groups](#security-groups): the route's `egress`. An app reaches no other host |
-| `cf logs` | the process's output, instance 0; no `RTR` line: this wicket feeds no requests to the flume |
+| `cf logs` | the process's output, naming the VM (`APP/PROC/WEB/<index>`): a shared VM's 0, a pool's `0` to `instances - 1`, what `cf app` lists; with `instances` 0, a connection's VM the lowest index free. No `RTR` line: this wicket feeds no requests to the flume |
 | annotations | no effect: a VM's sandbox is its `mode`, `mem`, `vms` and `env` |
 
 ### Security groups

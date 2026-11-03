@@ -17,7 +17,7 @@
 //! and redialed with a backoff of 1s doubling to 30s whenever it ends; a
 //! flume down costs a warning per 5 minutes.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -309,6 +309,43 @@ impl Tap {
         self.state()
             .map(|state| state.ring.iter().cloned().collect())
             .unwrap_or_default()
+    }
+}
+
+/// The instance indices a route's instances hold, which the `instance` of
+/// their lines names: unique among those alive, as CF numbers an app's.
+#[derive(Default)]
+pub struct Indices(Mutex<BTreeSet<usize>>);
+
+impl Indices {
+    /// The lowest index from `from` up that no instance holds.
+    pub fn take(self: &Arc<Self>, from: usize) -> Index {
+        let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut index = from;
+        for taken in held.range(from..) {
+            if *taken != index {
+                break;
+            }
+            index += 1;
+        }
+        held.insert(index);
+        Index {
+            indices: self.clone(),
+            index,
+        }
+    }
+}
+
+/// An instance's index, freed when it drops.
+pub struct Index {
+    indices: Arc<Indices>,
+    pub index: usize,
+}
+
+impl Drop for Index {
+    fn drop(&mut self) {
+        let mut held = self.indices.0.lock().unwrap_or_else(|e| e.into_inner());
+        held.remove(&self.index);
     }
 }
 
@@ -604,6 +641,17 @@ mod tests {
     /// lines queued before them and ahead of those after, as are the lines
     /// dropped before the tap that pass. A stop empties the queue; a tap
     /// without a flume keeps nothing.
+    #[test]
+    fn an_index_is_the_lowest_free_until_it_drops() {
+        let indices = Arc::new(Indices::default());
+        let (zero, one) = (indices.take(0), indices.take(0));
+        assert_eq!((zero.index, one.index), (0, 1));
+        assert_eq!(indices.take(2).index, 2, "from where asked");
+        drop(zero);
+        assert_eq!(indices.take(0).index, 0, "the one freed");
+        assert_eq!(indices.take(1).index, 2, "past the one held");
+    }
+
     #[test]
     fn a_start_backfills_past_the_flume_and_queues_what_passes_with_its_drops_in_place() {
         let tap = Tap::new();

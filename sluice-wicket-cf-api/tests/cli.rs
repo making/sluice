@@ -1630,6 +1630,22 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         status == 200 && body.contains("GREETING=hello world\n"),
         "{status}: {body}"
     );
+    // the second VM takes its turn: its index in the output, one `cf app` shows
+    let deadline = Instant::now() + HANG;
+    loop {
+        assert_eq!(get(&listen, "fc.localhost", "/log", None).0, 200);
+        let recent = cf.ok(&["logs", "fc", "--recent"]);
+        if recent.contains("[APP/PROC/WEB/1] OUT GET /log HTTP/1.0") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "instance 1 never served: {recent}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let shown = cf.ok(&["app", "fc"]);
+    assert!(shown.contains("#1 "), "{shown}");
 
     // a rootfs in a zip: uploaded by the cf-api, as a component is
     cf.ok(&["push", "zipped", "-p", dir.join("rootfs").to_str().unwrap()]);

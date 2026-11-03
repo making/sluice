@@ -113,8 +113,21 @@ same start and stop, ring of 512, queue of 4096 and gaps -- as the node
 `sluice-wicket-runtime-firecracker --flume URL --flume-token TOKEN` feeds the same way (the
 feed is `sluice-wicket-tunnel`'s) the output of the processes in its VMs, `stdout` /
 `stderr` with the fields `vm` (`vm-0` a shared VM, `template` a cloned route's
-template, `vm-<n>` its clones) and `line`; the route key is the first host of the VM's
-route, as the VMs of one target serve all its hosts. A clone's lines are its own: the
+template, `vm-<n>` its clones), `instance` and `line`; the route key is the first host of
+the VM's route, as the VMs of one target serve all its hosts. `vm` names the VM in the
+wicket's run; `instance` is its index among the route's VMs alive:
+
+- a shared VM's is 0, the one started in its place too, and a template's: no other VM of
+  the route lives with it
+- a clone holds the lowest index free from its restore until it is gone, in every cloned
+  mode, warm or serving, an index below the route's `vms`. A pool's `warm` VMs start as
+  `0` to `warm - 1`, one in the place of a VM that failed takes the index it freed, one
+  beyond `warm` the next free. A pool shrinking may leave a gap: `keep-ms` kills the VM
+  idle longest, of any index
+- a reload starting a route's VMs anew numbers them from 0, beside the old VMs draining,
+  as a rolling deployment's new process does on CF
+
+A clone's lines are its own: the
 template's are taken before the snapshot, what a clone holds of them at its restore is
 discarded. The lines a VM's own buffer dropped (4096 lines waiting for the wicket) reach
 the flume as a gap. It relays bytes, not requests: no `response` lines.
@@ -133,7 +146,10 @@ the log of the app holding its host, which `cf logs` shows as Cloud Foundry does
 
 - An app's web process `instances` is its route's `pool`: with `cf scale -i 3`, requests
   one after another rotate over instances 0 to 2; one arriving while all three are busy
-  runs on an instance of its own, index 3 or above.
+  runs on an instance of its own, index 3 or above. On a Firecracker wicket it is its VMs:
+  a pool of `cf scale -i 3` names 0 to 2 and nothing above, what `cf app` lists (its
+  entries are the process's `instances`, not the VMs alive: a VM being replaced is listed
+  all the same).
 - The watch resumes past its cursor (kept in `state.json`) when the hosts change or the
   stream drops. Without a host it holds no watch: an empty filter passes every line.
 - Lines lost become an `LGR` ERR line in the log of every app watched, as they may be any

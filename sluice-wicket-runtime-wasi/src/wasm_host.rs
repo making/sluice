@@ -19,7 +19,7 @@
 //! flume they and a line per answered request reach the live access log too
 //! (`flume`).
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -36,7 +36,7 @@ use wasmtime::AsContextMut as _;
 
 use crate::env::Env;
 use crate::keyvalue;
-use sluice_wicket_tunnel::flume::Tap;
+use sluice_wicket_tunnel::flume::{Indices, Tap};
 use sluice_wicket_tunnel::tunnel::TunnelIo;
 
 /// Relay slots between the guest's store task and hyper; together with the
@@ -1786,41 +1786,6 @@ enum Admission {
     Full,
 }
 
-/// The indices a handler's per-request instances hold (see `respond`).
-#[derive(Default)]
-struct ColdIndices(Mutex<BTreeSet<usize>>);
-
-impl ColdIndices {
-    /// The lowest index from `from` up that no per-request instance holds.
-    fn take(self: &Arc<Self>, from: usize) -> ColdIndex {
-        let mut held = self.0.lock().unwrap();
-        let mut index = from;
-        for taken in held.range(from..) {
-            if *taken != index {
-                break;
-            }
-            index += 1;
-        }
-        held.insert(index);
-        ColdIndex {
-            indices: self.clone(),
-            index,
-        }
-    }
-}
-
-/// A per-request instance's index, freed when it drops.
-struct ColdIndex {
-    indices: Arc<ColdIndices>,
-    index: usize,
-}
-
-impl Drop for ColdIndex {
-    fn drop(&mut self) {
-        self.indices.0.lock().unwrap().remove(&self.index);
-    }
-}
-
 /// Serves `request` on an instance of `handler`'s route, telling `admitted`
 /// the instance's index among the route's instances alive, as CF numbers an
 /// app's: a pooled unit's `0..pool`, kept by its replacement, a per-request
@@ -1929,7 +1894,7 @@ pub struct Handler {
     live: Arc<Gauge>,
     /// The indices of the per-request instances alive, from the pool's
     /// size up.
-    cold: Arc<ColdIndices>,
+    cold: Arc<Indices>,
 }
 
 impl Handler {
@@ -4320,7 +4285,7 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(instances, ["2", "0"], "the cold request's, then the unit's");
         eventually("the cold index frees", Duration::from_secs(5), || {
-            handler.cold.0.lock().unwrap().is_empty()
+            handler.cold.take(1).index == 1
         })
         .await;
     }

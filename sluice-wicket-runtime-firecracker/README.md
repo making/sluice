@@ -600,7 +600,12 @@ show them:
 
 | kind | fields |
 |---|---|
-| `stdout` / `stderr` | `vm` (the prefix's), `line` |
+| `stdout` / `stderr` | `vm` (the prefix's), `instance`, `line` |
+
+`instance` is the VM's index among its route's VMs alive, as CF numbers an app's instances
+(`cf logs` shows it): 0 for a shared VM and a template; a clone holds the lowest index free
+while it lives, warm or serving, so a pool of `vms` VMs names `0` to `vms - 1` and one in the
+place of a VM that failed takes its index. `vm` is no such index: it counts the route's clones.
 
 A line's route key is the first host of its route (the hosts of one target share its VMs;
 a reload keeping the VMs names their lines after its hosts from then on), and the VMs'

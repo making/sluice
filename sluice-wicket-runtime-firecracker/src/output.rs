@@ -2,7 +2,7 @@
 //! its `/init` sends as lines on the VM's log stream (`wire::LOG_PORT`). Each line goes
 //! to the wicket's stdout / stderr with a prefix naming the route's hosts and the VM
 //! (`stdout [app.local vm-3] :: ...`), and to the live access log's tap (`--flume`) as a
-//! line of the route's first host.
+//! line of the route's first host, naming the VM and its instance index.
 //!
 //! ```text
 //! process --pipe--> /init --log stream (vsock)--> follow --Printer--> the wicket's stdout / stderr
@@ -124,8 +124,8 @@ pub struct Sink {
 }
 
 impl Sink {
-    /// A line of the VM `vm` of the route of `hosts`.
-    async fn line(&self, hosts: &Hosts, vm: &str, stream: Stream, line: &[u8]) {
+    /// A line of the VM `vm`, its route's instance `instance`, of the route of `hosts`.
+    async fn line(&self, hosts: &Hosts, vm: &str, instance: usize, stream: Stream, line: &[u8]) {
         let named = hosts.current();
         if self.tap.on() {
             let text = line.strip_suffix(b"\r").unwrap_or(line);
@@ -134,6 +134,7 @@ impl Sink {
                 named.key.clone(),
                 vec![
                     ("vm", vm.to_string()),
+                    ("instance", instance.to_string()),
                     ("line", String::from_utf8_lossy(text).into_owned()),
                 ],
             );
@@ -212,10 +213,16 @@ impl Output {
     }
 }
 
-/// Follows the log stream of the VM named `vm` of the route of `hosts` in a task of its
-/// own, until the stream ends (the VM gone): its lines to `sink`. A frame the wicket
-/// does not take (too long, of an unknown type) ends it too.
-pub fn follow(mut stream: UnixStream, sink: Arc<Sink>, hosts: Arc<Hosts>, vm: String) -> Output {
+/// Follows the log stream of the VM named `vm`, the instance `instance`, of the route of
+/// `hosts` in a task of its own, until the stream ends (the VM gone): its lines to `sink`. A
+/// frame the wicket does not take (too long, of an unknown type) ends it too.
+pub fn follow(
+    mut stream: UnixStream,
+    sink: Arc<Sink>,
+    hosts: Arc<Hosts>,
+    vm: String,
+    instance: usize,
+) -> Output {
     let (syncs, mut asked) = mpsc::channel(1);
     let (count, synced) = watch::channel(0u64);
     let (ended, exited) = watch::channel(false);
@@ -229,7 +236,7 @@ pub fn follow(mut stream: UnixStream, sink: Arc<Sink>, hosts: Arc<Hosts>, vm: St
             loop {
                 match wire::read_log_frame(&mut reader).await {
                     Ok(Some(LogFrame::Line(stream, line))) => {
-                        sink.line(&hosts, &vm, stream, &line).await;
+                        sink.line(&hosts, &vm, instance, stream, &line).await;
                     }
                     Ok(Some(LogFrame::Gap { stdout, stderr })) => {
                         sink.gap(&hosts, &vm, stdout, stderr).await;
@@ -334,7 +341,7 @@ mod tests {
         });
         let hosts = Hosts::new(&["a.local".into(), "b.local".into()]);
         let (wicket, mut guest) = UnixStream::pair().unwrap();
-        let mut output = follow(wicket, sink, hosts.clone(), "vm-3".into());
+        let mut output = follow(wicket, sink, hosts.clone(), "vm-3".into(), 2);
 
         let line = |stream, text: &str| LogFrame::Line(stream, text.as_bytes().to_vec());
         let gap = LogFrame::Gap {
@@ -355,7 +362,11 @@ mod tests {
             .map(|line| (line.kind, line.route_key.clone(), line.fields.clone()))
             .collect();
         let tapped_line = |kind, host: &str, text: &str| {
-            let fields = vec![("vm", "vm-3".to_string()), ("line", text.to_string())];
+            let fields = vec![
+                ("vm", "vm-3".to_string()),
+                ("instance", "2".to_string()),
+                ("line", text.to_string()),
+            ];
             (kind, host.to_string(), fields)
         };
         assert_eq!(

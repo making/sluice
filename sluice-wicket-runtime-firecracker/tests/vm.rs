@@ -317,10 +317,7 @@ async fn every_route_serves_http_through_the_tunnel() {
             continue;
         }
         if route.host == "pool.local" {
-            // its VMs killed: they are the wicket's children unjailed
-            let pid = (!jailed && image.is_none()).then(|| wicket.child.id() as i32);
-            let pool = dir.0.join("pool.ext4");
-            let checked = tokio::time::timeout(HANG, route.pooled(&mut conn_id, pid, &pool));
+            let checked = tokio::time::timeout(HANG, route.pooled(&mut conn_id));
             assert!(checked.await.is_ok(), "pool.local: hung; {}", wicket.log());
         }
         let before = counts.entry(upstream.target_url.clone()).or_insert(0);
@@ -376,6 +373,24 @@ async fn every_route_serves_http_through_the_tunnel() {
         "the VMs' output: hung; {}",
         wicket.log()
     );
+
+    // a pool's VMs killed: they are the wicket's children unjailed
+    if !jailed && image.is_none() {
+        let pool = Route {
+            tunnel: &tunnel,
+            host: "pool.local",
+            address: dial_address(&target("pool.local")),
+            listen: None,
+        };
+        let pid = wicket.child.id() as i32;
+        let rootfs = dir.0.join("pool.ext4");
+        let replaced = pool.replaced(&mut conn_id, pid, &rootfs, &mut feed);
+        assert!(
+            tokio::time::timeout(HANG, replaced).await.is_ok(),
+            "pool.local: its VMs killed: hung; {}",
+            wicket.log()
+        );
+    }
 
     // reloads, once a poll found the files quiet: the config file's alone
     // (capped.local removed), then the shared rootfs replaced
@@ -1803,9 +1818,10 @@ async fn egress(
 /// The VMs' output: the sample guest's line at its start and its two lines (stdout,
 /// stderr) per `/log` request, of a shared VM (serving two hosts), a template and a
 /// clone, reach the wicket's stdout / stderr named after the route's hosts and the VM,
-/// and the flume as lines of the route's first host naming the VM. A clone's lines are
-/// its own: the template's start line comes once, not again from its clones. The
-/// shared VM's egress to `egress` is on the flume too.
+/// and the flume as lines of the route's first host naming the VM and its instance index (0
+/// a shared VM's and a template's). A clone's lines are its own: the template's start line
+/// comes once, not again from its clones. The shared VM's egress to `egress` is on the flume
+/// too.
 async fn output(
     tunnel: &ServerTunnel,
     target: &impl Fn(&str) -> String,
@@ -1872,6 +1888,7 @@ async fn output(
     };
 
     let mut fed = Vec::new();
+    let mut instances = std::collections::HashMap::new();
     let expected = [
         ("stdout", "shared.local", "vm-0", started(booted)),
         ("stdout", "shared.local", "vm-0", request(served, booted)),
@@ -1916,8 +1933,20 @@ async fn output(
             .into_iter()
             .find(|host| *host == event.route_key)
             .unwrap_or("another");
+        if kind != "egress" {
+            instances.insert((route, vm), field("instance"));
+        }
         fed.push((kind, route, vm, line));
     }
+    let instance = |route, vm| instances[&(route, vm)].as_str();
+    assert_eq!(instance("shared.local", "vm-0"), "0", "{instances:?}");
+    assert_eq!(instance("clone.local", "template"), "0", "{instances:?}");
+    assert!(
+        instance("clone.local", clone.as_str())
+            .parse::<usize>()
+            .is_ok(),
+        "{instances:?}"
+    );
     let again = started(template);
     let starts = fed.iter().filter(|(_, _, _, line)| *line == again).count();
     assert_eq!(starts, 1, "the template's start, once: {fed:?}");
@@ -2111,7 +2140,7 @@ impl Route<'_> {
     /// them. Idle, the pool shrinks to one, and grows again with a VM of its own. With
     /// the wicket's `pid` (its VMs its children), its VMs on `rootfs` killed: the next
     /// connection gets a VM started in their place.
-    async fn pooled(&self, conn_id: &mut i64, pid: Option<i32>, rootfs: &Path) {
+    async fn pooled(&self, conn_id: &mut i64) {
         let mut next = || {
             *conn_id += 1;
             *conn_id
@@ -2129,11 +2158,13 @@ impl Route<'_> {
         assert_ne!(served(&[kept]), [1], "{}: the VM kept", self.host);
         let (q, _) = self.fresh(&mut next).await;
         drop((p, q));
-        let Some(pid) = pid else {
-            return;
-        };
+    }
+
+    /// A pool's VMs on `rootfs`, the children of `pid`, killed: the request after it gets a VM
+    /// in their place, of the instance index they freed.
+    async fn replaced(&self, conn_id: &mut i64, pid: i32, rootfs: &Path, feed: &mut FeedStream) {
         let killed = vms_on(pid, rootfs);
-        assert_eq!(killed.len(), 2, "{}: its VMs: {killed:?}", self.host);
+        assert!(!killed.is_empty(), "{}: no VM", self.host);
         for &vm in &killed {
             // SAFETY: kill
             assert_eq!(unsafe { libc::kill(vm, libc::SIGKILL) }, 0);
@@ -2149,13 +2180,31 @@ impl Route<'_> {
         while !killed.iter().all(ended) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let answer = self.half_closed(next()).await;
-        assert!(
-            answer.starts_with("HTTP/1.1 200"),
-            "{}: {answer:?}",
+        *conn_id += 1;
+        let answer = self.get(*conn_id, "/log").await;
+        assert_eq!(
+            field(&answer, "served by this VM: "),
+            "1",
+            "{}: a VM in their place",
             self.host
         );
-        assert_eq!(served(&[answer]), [1], "{}: a VM in their place", self.host);
+        let line = format!(
+            "GET /log, request 1 of boot id {}",
+            field(&answer, "boot id: ")
+        );
+        loop {
+            let feed_message::Body::Event(event) = feed.next().await else {
+                continue;
+            };
+            let field = |name: &str| {
+                let field = event.fields.iter().find(|field| field.name == name);
+                field.map_or("", |field| field.value.as_str())
+            };
+            if event.route_key == self.host && event.kind == "stdout" && field("line") == line {
+                assert_eq!(field("instance"), "0", "{}: {event:?}", self.host);
+                return;
+            }
+        }
     }
 
     /// Connections held on the route, dropped until one gets a VM started for it (its

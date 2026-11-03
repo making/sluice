@@ -2,7 +2,9 @@
 //! them. The VMs' output is followed from their boot (a clone's from its restore) and
 //! named after the route's hosts and the VM (`output`): `vm-0` a shared VM,
 //! `template` a cloned route's template, `vm-<n>` its clones in the order they were
-//! restored.
+//! restored. The live access log's lines name the instance too: a clone holds the lowest
+//! index free among its route's VMs alive from its restore on; the shared VM and the
+//! template, alone as they live, are 0.
 //!
 //! A pool replaces a VM that fails itself. A shared VM is watched ([`watch`]), and its going
 //! down told ([`Down`]): the routes start another one.
@@ -14,6 +16,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use sluice_wicket_console::env::Env;
+use sluice_wicket_tunnel::flume::{Index, Indices};
 use sluice_wicket_tunnel::workers::Workers;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::UnixStream;
@@ -615,6 +618,9 @@ impl Drop for Share {
 /// A clone, killed when dropped ([`Cloned::end`] once its output came), and its output
 /// followed.
 pub struct Cloned {
+    /// Its instance index: given back before the VM's room, so an index stays below the
+    /// route's `vms`.
+    _instance: Index,
     vm: Vm,
     output: Option<Output>,
     /// When it was restored.
@@ -1117,7 +1123,7 @@ impl SharedPool {
             match clone.vm.dial(self.port).await {
                 Ok(stream) => return Ok((stream, seat)),
                 Err(e) => {
-                    drop(seat);
+                    drop((seat, clone));
                     self.remove(id, &e);
                 }
             }
@@ -1136,6 +1142,8 @@ impl SharedPool {
                 "route {}: a pool VM failed, killed: {e}",
                 self.cloner.hosts.current().label
             );
+            // killed before a VM is started in its place, which takes its index
+            drop(gone);
             self.changed.notify_waiters();
         }
     }
@@ -1220,6 +1228,8 @@ struct Cloner {
     place: Arc<Place>,
     /// Numbers the clones.
     next: AtomicU64,
+    /// The instance indices its clones alive hold.
+    indices: Arc<Indices>,
     sink: Arc<Sink>,
     hosts: Arc<Hosts>,
     /// Whether the guest sends its output: its template's did.
@@ -1234,6 +1244,7 @@ impl Cloner {
     /// then on.
     async fn restore(&self, slot: Slot) -> Result<Cloned, BoxError> {
         let n = self.next.fetch_add(1, Ordering::Relaxed);
+        let instance = self.indices.take(0);
         let vm = Vm::restore(&self.snapshot, &self.place, n, slot, self.egress.as_ref()).await?;
         let mut seed = [0u8; 32];
         // SAFETY: getrandom into a buffer of its length
@@ -1267,6 +1278,7 @@ impl Cloner {
                     self.sink.clone(),
                     self.hosts.clone(),
                     format!("vm-{n}"),
+                    instance.index,
                 )),
                 Err(e) => {
                     eprintln!(
@@ -1279,6 +1291,7 @@ impl Cloner {
             false => None,
         };
         Ok(Cloned {
+            _instance: instance,
             vm,
             output,
             restored: Instant::now(),
@@ -1511,6 +1524,7 @@ impl Route {
                     snapshot,
                     place: place.clone(),
                     next: AtomicU64::new(0),
+                    indices: Arc::default(),
                     sink,
                     hosts: hosts.clone(),
                     output: output.is_some(),
@@ -1804,8 +1818,8 @@ impl Route {
     }
 }
 
-/// Waits for a guest just booted to listen on `port`, its output (the VM `name` of the
-/// route of `hosts`) followed meanwhile: `/init` opens the log stream before it starts
+/// Waits for a guest just booted to listen on `port`, its output (the VM `name`, the instance
+/// 0, of the route of `hosts`) followed meanwhile: `/init` opens the log stream before it starts
 /// the process, so the output of a process failing to start is printed too, and a process
 /// exiting before it listens ends the wait. None when the guest has no log stream (its
 /// `/init` predates it).
@@ -1820,7 +1834,7 @@ async fn ready(
     let output = followed(
         || vm.dial(wire::LOG_PORT),
         vm.dial_ready(port, boot),
-        |stream| output::follow(stream, sink.clone(), hosts.clone(), name.to_string()),
+        |stream| output::follow(stream, sink.clone(), hosts.clone(), name.to_string(), 0),
     )
     .await?;
     if output.is_none() {
@@ -2108,7 +2122,8 @@ mod tests {
         let hosts = Hosts::new(&["a.local".into()]);
         let log = || {
             let (wicket, guest) = UnixStream::pair().unwrap();
-            let followed = output::follow(wicket, sink.clone(), hosts.clone(), "vm-0".to_string());
+            let followed =
+                output::follow(wicket, sink.clone(), hosts.clone(), "vm-0".to_string(), 0);
             (followed, guest)
         };
         let exited = {
@@ -2196,7 +2211,7 @@ mod tests {
         });
         let hosts = Hosts::new(&["a.local".into()]);
         let follow =
-            |stream| output::follow(stream, sink.clone(), hosts.clone(), "vm-0".to_string());
+            |stream| output::follow(stream, sink.clone(), hosts.clone(), "vm-0".to_string(), 0);
         // the guest takes each stream at once, its lines on the first; its answer to the
         // handshake comes once it listens
         let (dials, listened) = (AtomicUsize::new(0), AtomicBool::new(false));
