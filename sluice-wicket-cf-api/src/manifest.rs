@@ -569,6 +569,15 @@ pub fn check_annotations(
             None => format!("annotation {key} needs annotation {MODE_ANNOTATION}"),
         });
     }
+    if matches!(lifetime.mode.as_deref(), None | Some("pool"))
+        && lifetime.keep_ms.is_some()
+        && lifetime.warm.is_none()
+    {
+        return Err(format!(
+            "annotation {KEEP_ANNOTATION}: a pool keeps all its VMs, none to let go, unless \
+             annotation {WARM_ANNOTATION} says how many: 0 keeps none"
+        ));
+    }
     check_count(&lifetime, instances).map_err(|e| format!("annotation {e}"))?;
     Ok(lifetime)
 }
@@ -1006,6 +1015,9 @@ mod tests {
                 "above",
             ),
             (&[("warm", "3")], 2, Some(Wasm), "above"),
+            // a pool with no VM beyond `warm`, all of them by default, has none to let go
+            (&[("keep-ms", "1")], 2, Some(Firecracker), "/warm"),
+            (&[("mode", "pool"), ("keep-ms", "1")], 2, None, "/warm"),
             // each wicket's own
             (&[("mode", "pool")], 2, Some(Wasm), "no VMs"),
             (&[("keep-ms", "1")], 2, Some(Wasm), "no VMs"),

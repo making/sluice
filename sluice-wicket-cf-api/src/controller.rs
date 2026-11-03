@@ -539,9 +539,8 @@ const DEFAULT_CONCURRENCY: u64 = 16;
 /// A rootfs's sandbox on a Firecracker wicket: `instances` VMs at most (from 1: 0 is no app),
 /// living as `lifetime` says. None annotated, a pool of that size cloned from a snapshot, at any
 /// size: a scale adds to the VMs running, and takes from them (a shared VM has no snapshot to
-/// clone another one from). A pool given a `keep-ms` keeps only the VMs annotated `warm`, none by
-/// default: the wicket's default of all of them would leave no VM to kill; its `concurrency` is
-/// `conns`. Its process has `timeout` seconds to listen, and connects to the destinations of
+/// clone another one from). What is not annotated is the wicket's default; a pool's `concurrency`
+/// is `conns`. Its process has `timeout` seconds to listen, and connects to the destinations of
 /// `egress`.
 fn vm_sandbox(
     memory_mib: u64,
@@ -552,14 +551,11 @@ fn vm_sandbox(
     lifetime: &Lifetime,
 ) -> Sandbox {
     let mode = lifetime.mode.as_deref().unwrap_or("pool");
-    let warm = lifetime
-        .warm
-        .or((mode == "pool" && lifetime.keep_ms.is_some()).then_some(0));
     Sandbox {
         mode: Some(mode.into()),
         mem: Some(memory_mib),
         vms: (mode != "shared").then_some(instances),
-        warm,
+        warm: lifetime.warm,
         keep_ms: lifetime.keep_ms,
         uses: lifetime.uses,
         lifetime_ms: lifetime.lifetime_ms,
@@ -769,7 +765,7 @@ mod tests {
             let desired = Controller::desired(&state, state.app(&guid).unwrap(), "cf").unwrap();
             assert_eq!(desired.sandbox.boot_ms, Some(boot_ms));
         }
-        // `cf scale` the cap, the annotations the lifetime; a pool's floor gone with a keep-ms
+        // `cf scale` the cap, the annotations the lifetime, each option only what it names
         let lifetime = |mode: Option<&str>, warm, keep_ms, uses, lifetime_ms| Lifetime {
             mode: mode.map(String::from),
             warm,
@@ -821,7 +817,7 @@ mod tests {
                 lifetime(Some("pool"), None, Some(500), None, None),
                 "pool",
                 Some(3),
-                Some(0),
+                None,
             ),
             (
                 3,

@@ -762,8 +762,16 @@ fn the_cf_cli_deploys_to_the_wicket() {
     cf.ok(&["restart", "hello"]);
     assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 0);
     assert_eq!(get(&listen, "hello.localhost", "/", None).0, 200);
-    let refused = annotate(&cf, "hello", &json!({"wicket.sluice.ik.am/mode": "pool"}));
+    // refused, a PATCH changes nothing, of what came with the annotation neither
+    let guid = cf.ok(&["app", "hello", "--guid"]);
+    let path = format!("/v3/apps/{}", guid.trim());
+    let before = cf.ok(&["curl", &path]);
+    let patch = json!({"name": "renamed", "metadata": {"labels": {"kept": "no"},
+        "annotations": {"wicket.sluice.ik.am/mode": "pool"}}})
+    .to_string();
+    let refused = cf.ok(&["curl", "-X", "PATCH", &path, "-d", &patch]);
     assert!(refused.contains("no VMs"), "{refused}");
+    assert_eq!(cf.ok(&["curl", &path]), before);
     let create = json!({"name": "refused", "metadata": {"annotations":
         {"wicket.sluice.ik.am/mode": "pool"}}})
     .to_string();
@@ -1961,9 +1969,10 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         ),
     );
     scales_to_zero("reuse");
-    // a pool given a lifetime has no VM kept but those annotated: none here
+    // a pool keeping none, as annotated: a `keep-ms` alone is refused below
     let pool = json!({
         "wicket.sluice.ik.am/mode": "pool",
+        "wicket.sluice.ik.am/warm": "0",
         "wicket.sluice.ik.am/concurrency": "3",
         "wicket.sluice.ik.am/uses": null,
         "wicket.sluice.ik.am/lifetime-ms": null,
@@ -1988,6 +1997,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         (json!({"wicket.sluice.ik.am/mode": "fastest"}), "no mode"),
         (json!({"wicket.sluice.ik.am/keep-ms": "soon"}), "no number"),
         (json!({"wicket.sluice.ik.am/warm": "3"}), "above"),
+        (json!({"wicket.sluice.ik.am/warm": null}), "/warm"),
         (
             json!({"wicket.sluice.ik.am/budget-ms": "5000"}),
             "budget-ms",
@@ -1999,20 +2009,26 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
             "concurrency",
         ),
         (
-            json!({"wicket.sluice.ik.am/mode": "shared", "wicket.sluice.ik.am/keep-ms": null,
-                "wicket.sluice.ik.am/concurrency": null}),
+            json!({"wicket.sluice.ik.am/mode": "shared", "wicket.sluice.ik.am/warm": null,
+                "wicket.sluice.ik.am/keep-ms": null, "wicket.sluice.ik.am/concurrency": null}),
             "one VM",
         ),
     ] {
         let refused = annotate(&cf, "fc", &annotation);
         assert!(refused.contains(reason), "{annotation}: {refused}");
     }
+    // a manifest meant for the other wicket is refused at the push, not at the start after it
+    let manifest = dir.join("budget.yml");
+    let budget = "applications:\n- name: fc\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/budget-ms: 5000\n";
+    std::fs::write(&manifest, budget).unwrap();
+    let refused = cf.fails(&["apply-manifest", "-f", manifest.to_str().unwrap()]);
+    assert!(refused.contains("no components"), "{refused}");
     // a manifest's count below what the start keeps warm waits for the next start, the
     // wicket's route as it is: `cf push` restarts the app right after
     annotate(&cf, "fc", &json!({"wicket.sluice.ik.am/warm": "2"}));
     cf.ok(&["restart", "fc"]);
     let manifest = dir.join("scaled.yml");
-    let scaled = "applications:\n- name: fc\n  instances: 1\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/warm: null\n";
+    let scaled = "applications:\n- name: fc\n  instances: 1\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/warm: 0\n";
     std::fs::write(&manifest, scaled).unwrap();
     cf.ok(&["apply-manifest", "-f", manifest.to_str().unwrap()]);
     assert_eq!(sandbox().unwrap()["vms"], 2);
@@ -2022,8 +2038,8 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     assert_eq!((&fresh["vms"], &fresh["warm"]), (&1.into(), &0.into()));
     // a shared VM is one
     cf.ok(&["scale", "fc", "-i", "1"]);
-    let shared = json!({"wicket.sluice.ik.am/mode": "shared", "wicket.sluice.ik.am/keep-ms": null,
-        "wicket.sluice.ik.am/concurrency": null});
+    let shared = json!({"wicket.sluice.ik.am/mode": "shared", "wicket.sluice.ik.am/warm": null,
+        "wicket.sluice.ik.am/keep-ms": null, "wicket.sluice.ik.am/concurrency": null});
     assert!(annotate(&cf, "fc", &shared).contains("\"guid\""));
     cf.ok(&["restart", "fc"]);
     assert_eq!(sandbox().unwrap()["mode"], "shared");

@@ -640,17 +640,17 @@ applications:
 |---|---|---|
 | `mode` | `shared`, `per-connection`, `reuse` or `pool` | |
 | `warm` | VMs kept, from 0 to `instances` | `per-connection`, `reuse`, `pool` |
-| `keep-ms` | how long a VM serving nothing is kept | `reuse`, `pool` |
+| `keep-ms` | how long a VM serving nothing is kept: a pool's beyond its `warm`, which it needs annotated | `reuse`, `pool` |
 | `uses`, `lifetime-ms` | the connections a VM serves, how long it serves | `reuse` |
 | `concurrency` | what an instance takes at once: [the limit](#instances) | `pool`, a component |
 
-- none annotated, a pool of a fixed size, of one VM at 1 instance. A pool keeps `warm` VMs: all of
-  them by default, none once given a `keep-ms`, the first request then paying a restore. `shared`
+- none annotated, a pool of a fixed size, of one VM at 1 instance. A pool keeps `warm` VMs, all of
+  them by default; at `warm: 0` the first request pays a restore. `shared`
   is one VM booted and never restored from a snapshot, for a process that does not take that: what
   it opened before its snapshot (a database's connections) is gone in a clone
 - refused, by `cf push`, the v3 API and `cf scale -i`, naming it: an option its mode does not take,
   none annotated being `pool`, what is no mode or no number, `shared` above 1 instance, `warm` above the
-  instances, `instances`, which `cf scale -i` and `concurrency` replace. A wicket not answering, by
+  instances, a pool's `keep-ms` without a `warm`, `instances`, which `cf scale -i` and `concurrency` replace. A wicket not answering, by
   the app's next start
 - as `budget-ms` and the rest of the sandbox they apply at the next start; `cf scale -i` at once,
   so it must hold both as the app runs (what its last start took) and as annotated, refused
@@ -761,7 +761,7 @@ What holds on both wickets; a component's and a VM's are in
 An instance is what CF calls one: it takes many requests at once. `cf scale -i N` is the limit of N
 of them, each taking `concurrency` at once, as Cloud Run's maximum instances and concurrency. With
 no annotation N are kept up, as on CF: the limit only differs from the count below it where `warm`
-or `keep-ms` ask for that.
+asks for that.
 
 As on CF, a scale keeps what runs. Up, one more instance starts and none of the others is touched:
 a VM cloned from the app's snapshot in a restore's time, whatever its boot takes, a component's unit
