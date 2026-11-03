@@ -57,7 +57,7 @@ listed() {
 common="\"SLUICE_WICKET_CF_API_ANY_CREDENTIALS\":\"true\",\"SLUICE_WICKET_CF_API_WICKET\":\"http://localhost:$console\",\"SLUICE_WICKET_CF_API_WICKET_TOKEN\":\"$token\""
 
 echo "1. the default data directory: the rootfs is read-only"
-expect "refused" "$(put_cf_api "{$common}")" "guest not listening"
+expect "refused" "$(put_cf_api "{$common}")" "exited before it listened"
 expect "its reason" "$(cat wicket.log)" "Read-only file system"
 
 echo "2. a disk at the image's working directory: the default data directory is on it"
@@ -124,9 +124,9 @@ wait "$watcher"
 echo "   the API did not answer for $(cat "$work/outage.ms")"
 expect "the app kept" "$(timeout 60 cf8 apps 2>&1)" "hello"
 
-echo "6. a start failing, a cf-api that never listens: the old VM started again on the disk"
+echo "6. a start failing, a cf-api refused its port: the old VM started again on the disk"
 started=$(date +%s%N)
-expect "refused" "$(put_cf_api "{$common,\"SLUICE_WICKET_CF_API_LISTEN\":\"127.0.0.1:1\"}" "$upgraded")" "guest not listening"
+expect "refused" "$(put_cf_api "{$common,\"SLUICE_WICKET_CF_API_LISTEN\":\"127.0.0.1:1\"}" "$upgraded")" "exited before it listened"
 echo "   the PUT took $(( ($(date +%s%N) - started) / 1000000 ))ms"
 expect "served again" "$(timeout 60 cf8 apps 2>&1)" "hello"
 
