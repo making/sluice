@@ -11,14 +11,16 @@
 //! a destination on the host, by name, address, range and IPv6, from a shared VM
 //! and a clone, and its records; the routes through `--listen` as well, by host
 //! (http/1.1 and h2c, an unknown one answered 404), a `--vm` route alone
-//! whatever the host; a reload of the `--config`
+//! whatever the host and handing through a guest speaking first, not with `--console` nor
+//! from the config file; a reload of the `--config`
 //! file, polled, removing a route and replacing a rootfs; the console deploying
 //! one more route from an uploaded rootfs (refusing what it does not take),
 //! served on the tunnel, listed with its VMs, and an app of two hosts on one
 //! rootfs uploaded by digest, its env seen by the guest, and an app with a disk:
 //! what it wrote kept across a restart of its VM, a failed start, a growth and
-//! its app's removal, one VM at a time on it; a VM never listening holding no other
-//! edit, by an app's edit, in the place of a disk's VM and through the config file;
+//! its app's removal, one VM at a time on it, an edit taking over from a reload there; a VM
+//! never listening holding no other edit, by an app's edit, in the place of a disk's VM and
+//! through the config file;
 //! both served again after a restart from the console's directory (not with the
 //! image: its directory is the test's).
 //!
@@ -473,7 +475,8 @@ async fn every_route_serves_http_through_the_tunnel() {
             std::fs::remove_file(&late).unwrap();
         }
         let (url, mut streams) = tunnel_server(None).await;
-        let wicket = start(&url, &console_args);
+        let no_poll = ["--watch-interval", "0"].map(String::from);
+        let wicket = start(&url, &[&console_args[..], &no_poll[..]].concat());
         let stream = tokio::time::timeout(HANG, streams.recv())
             .await
             .ok()
@@ -526,26 +529,103 @@ async fn every_route_serves_http_through_the_tunnel() {
         assert_eq!(served(&bodies), [1, 2, 3]);
         if !jailed {
             drop(wicket);
-            let wicket = start(
-                &url,
-                &[
-                    "--listen".to_string(),
-                    "127.0.0.1:0".to_string(),
-                    "--vm".to_string(),
-                    format!("sole.local={}", rootfs.display()),
-                ],
-            );
-            let sole = Route {
-                tunnel: &tunnel,
-                host: "any.local",
-                address: String::new(),
-                listen: Some(wicket.listening()),
-            };
-            let answered = tokio::time::timeout(HANG, sole.keep_alive(1)).await;
-            let bodies = answered.unwrap_or_else(|_| panic!("any.local: hung; {}", wicket.log()));
-            assert_eq!(served(&bodies), [1, 2, 3]);
+            sole_routes(&dir.0, &rootfs, |args| start(&url, args)).await;
         }
     }
+}
+
+/// A route given by `--vm` alone takes any host, nothing read first: a guest speaking first
+/// speaks to a connection that sent nothing. With `--console`, or as the config file's one route,
+/// a connection is routed by its first request: nothing reaches the guest before it, and another
+/// host is answered 404.
+async fn sole_routes(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> Wicket) {
+    const SPOKEN: &str = "220 speaking first";
+    let speaking = speaking_rootfs(scratch, rootfs, SPOKEN);
+    let config = scratch.join("sole.yaml");
+    let route = format!("- {{host: sole.local, rootfs: {}}}\n", speaking.display());
+    std::fs::write(&config, format!("routes:\n{route}")).unwrap();
+    let by_flag = ["--vm".into(), format!("sole.local={}", speaking.display())];
+    let console = ["--console", "127.0.0.1:0", "--console-dir", "sole"].map(String::from);
+    let by_file = ["--config".into(), config.display().to_string()];
+    let request = |host: &str| format!("GET / HTTP/1.1\r\nhost: {host}\r\n\r\n");
+    let wicket = |args: &[&[String]]| {
+        let listen = ["--listen", "127.0.0.1:0"].map(String::from);
+        start(&[&listen[..], &args.concat()].concat())
+    };
+
+    let sole = wicket(&[&by_flag]);
+    let checked = tokio::time::timeout(HANG, async {
+        let mut client = tokio::net::TcpStream::connect(sole.listening())
+            .await
+            .unwrap();
+        let mut spoken = vec![0; SPOKEN.len() + 1];
+        client.read_exact(&mut spoken).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&spoken), format!("{SPOKEN}\n"));
+        let answer = exchange(client, &request("any.local")).await;
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    });
+    assert!(checked.await.is_ok(), "any.local: hung; {}", sole.log());
+    drop(sole);
+
+    for args in [&[&by_flag[..], &console[..]], &[&by_file[..], &[]]] {
+        let routed = wicket(args);
+        let checked = tokio::time::timeout(HANG, async {
+            let connect = || tokio::net::TcpStream::connect(routed.listening());
+            let refused = exchange(connect().await.unwrap(), &request("any.local")).await;
+            assert!(refused.starts_with("HTTP/1.1 404"), "{args:?}: {refused}");
+            let message = "no firecracker route for host 'any.local'";
+            assert!(refused.ends_with(message), "{args:?}: {refused}");
+            let answer = exchange(connect().await.unwrap(), &request("sole.local")).await;
+            let spoken = format!("{SPOKEN}\nHTTP/1.1 200");
+            assert!(answer.starts_with(&spoken), "{args:?}: {answer}");
+        });
+        assert!(checked.await.is_ok(), "{args:?}: hung; {}", routed.log());
+    }
+}
+
+/// `what` sent on `client`, and what came until it ended.
+async fn exchange(mut client: tokio::net::TcpStream, what: &str) -> String {
+    client.write_all(what.as_bytes()).await.unwrap();
+    let mut got = Vec::new();
+    client.read_to_end(&mut got).await.unwrap();
+    String::from_utf8_lossy(&got).into_owned()
+}
+
+/// The sample rootfs running the sample process as an image's, speaking `line` first.
+fn speaking_rootfs(scratch: &Path, rootfs: &Path, line: &str) -> PathBuf {
+    let speaking = scratch.join("speaking.ext4");
+    std::fs::copy(rootfs, &speaking).unwrap();
+    let launch = scratch.join("init.json");
+    let config = serde_json::json!({
+        "argv": ["/serve"],
+        "env": [format!("SAMPLE_SPEAK_FIRST={line}")],
+        "uid": 0,
+        "gid": 0,
+        "workdir": "/",
+        "port": 8080,
+    });
+    std::fs::write(&launch, config.to_string()).unwrap();
+    let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "guest/target/{}-unknown-linux-musl/release/sample-process",
+        std::env::consts::ARCH
+    ));
+    let commands = scratch.join("speaking.debugfs");
+    let script = format!(
+        "mkdir sluice\nwrite {} sluice/init.json\nwrite {} serve\n",
+        launch.display(),
+        sample.display()
+    );
+    std::fs::write(&commands, script).unwrap();
+    let tools = sluice_wicket_runtime_firecracker::rootfs::Tools::find().unwrap();
+    let written = Command::new(&tools.debugfs)
+        .arg("-w")
+        .arg("-f")
+        .arg(&commands)
+        .arg(&speaking)
+        .output()
+        .unwrap();
+    assert!(written.status.success(), "{written:?}");
+    speaking
 }
 
 /// A request to the console at `address`, with its token or not: the status and
@@ -682,13 +762,15 @@ async fn deploy(
 
     // an app: refused until its image is uploaded under its digest, then two hosts on
     // one rootfs and VMs of its own, its env seen by the guest and listed by its names
-    let mut other = image.to_vec();
-    other.extend_from_slice(&[0; 4096]);
-    let image = Bytes::from(other);
-    let sha256: String = sha2::Sha256::digest(&image)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let padded = |image: &Bytes| {
+        let image = Bytes::from([&image[..], &[0; 4096]].concat());
+        let sha256: String = sha2::Sha256::digest(&image)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        (image, sha256)
+    };
+    let (image, sha256) = padded(&image);
     let app = serde_json::json!({
         "owner": "cf",
         "hosts": ["app2.local", "app1.local"],
@@ -789,6 +871,11 @@ async fn deploy(
 
     never_listening_app(tunnel, wicket, &sha256, config).await;
     restarting_app(tunnel, wicket, &sha256, conn_id).await;
+    // an image of its own: a change of its file a reload of that app's VM alone
+    let (image, sha256) = padded(&image);
+    let upload = format!("/api/components/{sha256}");
+    let (status, uploaded) = console(at, "PUT", &upload, true, image).await;
+    assert_eq!(status, 200, "{uploaded}");
     disk_app(tunnel, wicket, &sha256, dir, conn_id, jailed).await;
 }
 
@@ -826,8 +913,13 @@ const SAID: Duration = Duration::from_secs(10);
 
 /// Waits for `wicket`'s log to say `what`.
 async fn said(wicket: &Wicket, what: &str) {
+    said_after(wicket, 0, what).await;
+}
+
+/// Waits for `wicket`'s log to say `what`, past the first `mark` bytes of [`Wicket::log`].
+async fn said_after(wicket: &Wicket, mark: usize, what: &str) {
     let deadline = Instant::now() + SAID;
-    while !wicket.log().contains(what) {
+    while !wicket.log()[mark..].contains(what) {
         assert!(
             Instant::now() < deadline,
             "not said: {what}; {}",
@@ -1264,8 +1356,9 @@ async fn disk_app(
 }
 
 /// The disk after the wicket's restart (a kill of the keeper, when `jailed`; else its end):
-/// what the app wrote; its app removed, it stays for the next app of that name and owner, and
-/// goes once no VM holds it.
+/// what the app wrote; an edit taking over from a reload starting a VM on it (the reload's
+/// made after it, no poll to find the files changed: on SIGHUP, the wicket's own unjailed); its app
+/// removed, it stays for the next app of that name and owner, and goes once no VM holds it.
 async fn disk_kept(
     tunnel: &mut ServerTunnel,
     wicket: &Wicket,
@@ -1288,6 +1381,40 @@ async fn disk_kept(
     }
     let sha256 = up.unwrap().target_url.split("/rootfs/").nth(1).unwrap();
     let sha256 = sha256.split('/').next().unwrap().to_string();
+    if !jailed {
+        let slow = serde_json::json!({"disk": "/tmp/data", "disk-mib": 128, "env": {"WRITE_AT_START": "swap", "LISTEN_AFTER_MS": "2000"}});
+        let (status, put) = put_data(at, &sha256, slow).await;
+        assert_eq!(status, 200, "{put}; {}", wicket.log());
+        let mark = wicket.log().len();
+        std::fs::File::open(dir.join("rootfs").join(&sha256).join("app.ext4"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+        // SAFETY: a plain kill of the wicket
+        assert_eq!(
+            unsafe { libc::kill(wicket.child.id() as i32, libc::SIGHUP) },
+            0
+        );
+        said_after(wicket, mark, "wrote swap").await;
+        let edit =
+            serde_json::json!({"disk": "/tmp/data", "disk-mib": 128, "env": {"RUN": "edit"}});
+        let (status, put) = put_data(at, &sha256, edit).await;
+        assert_eq!(
+            (status, put["message"].as_str()),
+            (200, Some("restarted data.local")),
+            "{put}; {}",
+            wicket.log()
+        );
+        said_after(wicket, mark, "routes reload (SIGHUP) failed").await;
+        said_after(wicket, mark, "took over from it").await;
+        said_after(wicket, mark, "routes reload (SIGHUP): no change").await;
+        let log = wicket.log();
+        assert!(!log[mark..].contains("its VM starts again"), "{log}");
+        let env = on_data(tunnel, &address, &mut conn_id, "/env", "").await;
+        assert_eq!(env, "RUN=edit\n");
+        let held = vms_on(wicket.child.id() as i32, &dir.join("disks/cf/data.ext4"));
+        assert_eq!(held.len(), 1, "one VM on the disk: {held:?}");
+    }
     let path = "/api/apps/data?owner=cf";
     let (status, removed) = console(at, "DELETE", path, true, Bytes::new()).await;
     assert_eq!(status, 200, "{removed}");

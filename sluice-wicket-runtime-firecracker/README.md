@@ -963,7 +963,8 @@ idle connections failed, a reused clone serving the next connection until its `u
 VMs killed (unjailed), the VMs' output (a shared VM's, a template's, a clone's) on the wicket's
 stdout / stderr and on a flume (`sluice-wicket-tunnel`'s double), the guests' egress (a shared
 VM's and a clone's, to a destination on the host by name, address, range and IPv6, and its
-records), and reloads of the config file. It needs Firecracker
+records), reloads of the config file, an edit taking over from a reload on a disk, and a route
+given by `--vm` alone handing through a guest speaking first. It needs Firecracker
 (`SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER`, else `firecracker` on the PATH) and a guest
 kernel (`SLUICE_WICKET_RUNTIME_FIRECRACKER_KERNEL`, else `~/.local/firecracker/vmlinux`), the
 variables of the wicket's own `--firecracker` and `--kernel`, and builds the sample rootfs.

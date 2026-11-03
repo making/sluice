@@ -228,6 +228,9 @@ fn main() {
                     std::future::pending::<()>().await;
                 }
                 write_at_start(&log);
+                if let Some(ms) = given("LISTEN_AFTER_MS").and_then(|ms| ms.parse().ok()) {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
                 let listener = tokio::net::TcpListener::bind(("127.0.0.1", HELLO_PORT)).await?;
                 tokio::spawn(hello(listener, booted, log));
                 HELLO_PORT
@@ -776,14 +779,8 @@ fn exit_answer(query: &str, log: &Log) -> String {
 
 /// Hello mode, given `WRITE_AT_START=<name>`: that file kept on the disk, not durably, and said,
 /// as a process does before it listens. Given `LINGER_MS=<ms>` too, a process ignoring SIGTERM for
-/// that long: a stop takes as long.
+/// that long: a stop takes as long. Given `LISTEN_AFTER_MS=<ms>`, it listens that much later.
 fn write_at_start(log: &Log) {
-    let given = |name: &str| {
-        let variables = GIVEN_ENV.get().into_iter().flatten();
-        variables
-            .filter_map(|variable| variable.strip_prefix(name)?.strip_prefix('='))
-            .next()
-    };
     if let Some(name) = given("WRITE_AT_START") {
         let wrote = disk_answer(&format!("write={name}"), b"unsynced");
         log.line(Stream::Stdout, wrote.trim_end().as_bytes());
@@ -798,6 +795,14 @@ fn write_at_start(log: &Log) {
             }
         }
     }
+}
+
+/// The variable `name` the wicket gave on the env stream.
+fn given(name: &str) -> Option<&'static str> {
+    let variables = GIVEN_ENV.get().into_iter().flatten();
+    variables
+        .filter_map(|variable| variable.strip_prefix(name)?.strip_prefix('='))
+        .next()
 }
 
 /// Hello mode's `/disk`: `?write=<name>` keeps the body as that file, by a rename, with

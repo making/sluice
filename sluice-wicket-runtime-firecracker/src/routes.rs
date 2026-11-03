@@ -297,6 +297,27 @@ struct Restart {
     attempt: u64,
 }
 
+impl Restart {
+    /// Its VM went down at `now`: after [`RESTART_STABLE`] up, or none started so yet, the wait
+    /// starts over.
+    fn went_down(&mut self, now: SystemTime) {
+        let lived = self
+            .up
+            .and_then(|up| now.duration_since(up).ok())
+            .is_none_or(|up| up >= RESTART_STABLE);
+        if lived {
+            self.wait = Duration::ZERO;
+        }
+    }
+
+    /// The wait before its next start; the one after it is longer.
+    fn next_wait(&mut self) -> Duration {
+        let wait = self.wait;
+        self.wait = (wait * 2).clamp(RESTART_WAIT, RESTART_WAIT_MAX);
+        wait
+    }
+}
+
 /// A start of a [`Restart`] ended.
 struct Restarted {
     target: String,
@@ -1243,13 +1264,7 @@ impl Reloader {
         eprintln!("route {}: {}; its VM stopped", route.label(), down.why);
         route.set_down(down.why.to_string());
         let restart = self.restarts.entry(target).or_default();
-        let lived = restart
-            .up
-            .and_then(|up| up.elapsed().ok())
-            .is_none_or(|up| up >= RESTART_STABLE);
-        if lived {
-            restart.wait = Duration::ZERO;
-        }
+        restart.went_down(SystemTime::now());
         // what starts on its disk takes room of its own
         let replaced = route.spec.vm.disk.as_ref().is_some_and(|disk| {
             let file = std::slice::from_ref(&disk.file);
@@ -1289,9 +1304,8 @@ impl Reloader {
         for (target, spec, stamps) in due {
             let hosts = self.hosts_of(&target);
             let restart = self.restarts.entry(target.clone()).or_default();
-            let (wait, held, stopping) =
-                (restart.wait, restart.held.clone(), restart.stopping.take());
-            restart.wait = (wait * 2).clamp(RESTART_WAIT, RESTART_WAIT_MAX);
+            let wait = restart.next_wait();
+            let (held, stopping) = (restart.held.clone(), restart.stopping.take());
             self.attempts += 1;
             let attempt = self.attempts;
             restart.attempt = attempt;
@@ -1815,6 +1829,40 @@ fn fits(specs: &[(RouteSpec, Origin)], capacity: &Capacity) -> Result<(), BoxErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wait doubles as a VM keeps going down, up to its bound, and starts over once one
+    /// stayed up long enough.
+    #[test]
+    fn a_restarts_wait_starts_over_after_a_vm_stayed_up() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut restart = Restart::default();
+        restart.went_down(start);
+        assert_eq!(restart.next_wait(), Duration::ZERO, "none started so yet");
+        let waits = [
+            // up, the wait after it, in seconds
+            (0, 1),
+            (0, 2),
+            (0, 4),
+            (30, 8),
+            (59, 16),
+            (60, 0),
+            (0, 1),
+            (65, 0),
+            (0, 1),
+        ];
+        for (up, wait) in waits {
+            restart.up = Some(start);
+            restart.went_down(start + Duration::from_secs(up));
+            let next = restart.next_wait();
+            assert_eq!(next, Duration::from_secs(wait), "{up}s up");
+        }
+        // starts failing: no VM up, no going down in between
+        let failing: Vec<u64> = (0..7).map(|_| restart.next_wait().as_secs()).collect();
+        assert_eq!(failing, [2, 4, 8, 16, 32, 60, 60]);
+        restart.up = Some(start + Duration::from_secs(1));
+        restart.went_down(start);
+        assert_eq!(restart.next_wait(), Duration::ZERO, "the clock set back");
+    }
 
     /// A route takes any host alone, from a flag, on a wicket without a console.
     #[test]

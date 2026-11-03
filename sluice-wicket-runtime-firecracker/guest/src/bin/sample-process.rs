@@ -3,7 +3,8 @@
 //! mode of each path of its arguments, its environment -- and printing a line per request,
 //! as a process's output. `/egress?to=<host>:<port>` connects as a process does, half-closes
 //! and answers with what came, `/exit` answers and exits. `SAMPLE_WAIT_MS` delays its listening,
-//! `SAMPLE_EXIT` has it exit instead, as a process failing to start does.
+//! `SAMPLE_EXIT` has it exit instead, as a process failing to start does; `SAMPLE_SPEAK_FIRST`
+//! has it send that line as each connection opens, as a protocol whose server speaks first does.
 
 use std::io::{Read as _, Write as _};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -24,8 +25,12 @@ fn main() {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let listener = TcpListener::bind(("127.0.0.1", port.parse().expect("PORT"))).expect("bind");
     println!("sample process on port {port}");
+    let speak_first = std::env::var("SAMPLE_SPEAK_FIRST").ok();
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
+        if let Some(line) = &speak_first {
+            let _ = writeln!(stream, "{line}");
+        }
         let mut request = Vec::new();
         let mut chunk = [0u8; 1024];
         while !request.windows(4).any(|end| end == b"\r\n\r\n") {
