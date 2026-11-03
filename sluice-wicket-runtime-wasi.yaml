@@ -1,8 +1,8 @@
-image: ghcr.io/making/sluice/sluice-wicket-runtime-wasi@sha256:1acf42a9b8e2179f23b2ab01b5aa4837abf157b2307bac9ad028c9340bf085d2
-git_revision: 19d462c8aedf19bca43618fa9cc4c62d0b57c9e7
+image: ghcr.io/making/sluice/sluice-wicket-runtime-wasi@sha256:5c979889587a1c806ac3f8f9bdb8766eb0bdf42dbd1767a2f9e266f07a246ff9
+git_revision: 3f4ca0925d91ee9d2283d2b2ab49f99497811931
 deployment:
   image:
     repository: ghcr.io/making/sluice/sluice-wicket-runtime-wasi
-    digest: sha256:1acf42a9b8e2179f23b2ab01b5aa4837abf157b2307bac9ad028c9340bf085d2
+    digest: sha256:5c979889587a1c806ac3f8f9bdb8766eb0bdf42dbd1767a2f9e266f07a246ff9
   podLabels:
-    github.com/revision: 19d462c8aedf19bca43618fa9cc4c62d0b57c9e7
+    github.com/revision: 3f4ca0925d91ee9d2283d2b2ab49f99497811931
