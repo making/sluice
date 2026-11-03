@@ -39,6 +39,8 @@ route's VMs are:
   `warm`
 
 The cloned modes (per-connection, reuse, pool) take `prime`, `warm`, `vms` and `wait-ms`.
+`sluice-wicket-cf-api` sets `vms` by `cf scale -i`, the mode, `warm`, `keep-ms`, `uses` and
+`lifetime-ms` by [annotations](../sluice-wicket-cf-api/README.md#how-long-a-vm-lives).
 
 | mode | VMs | a connection gets | between connections | idle | a VM failing | memory |
 |---|---|---|---|---|---|---|

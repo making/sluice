@@ -12,7 +12,11 @@ use serde::Deserialize;
 use serde::de::IgnoredAny;
 
 use crate::services::{self, Unbound};
-use crate::store::{BUDGET_ANNOTATION, INSTANCES_ANNOTATION, Lifecycle, State, now};
+use crate::store::{
+    BUDGET_ANNOTATION, INSTANCES_ANNOTATION, KEEP_ANNOTATION, LIFETIME_ANNOTATION, Lifecycle,
+    Lifetime, MODE_ANNOTATION, STACK, State, USES_ANNOTATION, WARM_ANNOTATION, now,
+};
+use crate::wicket::Runtime;
 
 #[derive(Deserialize, Debug, Default)]
 pub struct Manifest {
@@ -122,16 +126,26 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
     serde_saphyr::from_str(text).map_err(|e| format!("the manifest: {e}"))
 }
 
-/// Applies `manifest` to `state`: the guids of the apps it names.
-pub fn apply(state: &mut State, manifest: &Manifest, stack: &str) -> Result<Vec<String>, String> {
+/// Applies `manifest` to `state`: the guids of the apps it names. `runtime` is what the wicket
+/// runs, None until it answers: a new app's stack then a wasm wicket's.
+pub fn apply(
+    state: &mut State,
+    manifest: &Manifest,
+    runtime: Option<Runtime>,
+) -> Result<Vec<String>, String> {
     let mut guids = Vec::new();
     for spec in &manifest.applications {
-        guids.push(apply_app(state, spec, stack)?);
+        guids.push(apply_app(state, spec, runtime)?);
     }
     Ok(guids)
 }
 
-fn apply_app(state: &mut State, spec: &AppManifest, stack: &str) -> Result<String, String> {
+fn apply_app(
+    state: &mut State,
+    spec: &AppManifest,
+    runtime: Option<Runtime>,
+) -> Result<String, String> {
+    let stack = runtime.map_or(STACK, Runtime::stack);
     let name = spec.name.trim();
     if name.is_empty() {
         return Err("an application needs a name".into());
@@ -174,7 +188,6 @@ fn apply_app(state: &mut State, spec: &AppManifest, stack: &str) -> Result<Strin
     if let Some(metadata) = &spec.metadata {
         merge(&mut app.labels, metadata.labels.as_ref());
         merge(&mut app.annotations, metadata.annotations.as_ref());
-        check_annotations(&app.annotations).map_err(|e| format!("{name}: {e}"))?;
     }
     // as cf push does: merged, the guest gets them at the start that follows
     let mut env = app.env.clone();
@@ -233,6 +246,8 @@ fn apply_app(state: &mut State, spec: &AppManifest, stack: &str) -> Result<Strin
     }
     process.updated_at = now();
     app.updated_at = now();
+    check_annotations(&app.annotations, app.process.instances, runtime)
+        .map_err(|e| format!("{name}: {e}"))?;
     apply_routes(state, &guid, spec)?;
     apply_services(state, &guid, spec)?;
     Ok(guid)
@@ -456,8 +471,16 @@ fn merge(into: &mut BTreeMap<String, String>, from: Option<&BTreeMap<String, Opt
     }
 }
 
-/// The wicket's annotations hold numbers.
-pub fn check_annotations(annotations: &BTreeMap<String, String>) -> Result<(), String> {
+/// What the wicket's annotations ask of an app of `instances`, on a wicket of `runtime` (None
+/// until it answers: what either refuses is left to the start, which knows the droplet). What
+/// does not apply is refused, not ignored: a wicket's option the other has, an option its mode
+/// does not take, more kept warm than the app may have. At 0 instances nothing is kept: the
+/// annotations wait for a scale up.
+pub fn check_annotations(
+    annotations: &BTreeMap<String, String>,
+    instances: u64,
+    runtime: Option<Runtime>,
+) -> Result<Lifetime, String> {
     for key in [BUDGET_ANNOTATION, INSTANCES_ANNOTATION] {
         if let Some(value) = annotations.get(key)
             && value.parse::<u64>().ok().is_none_or(|number| number == 0)
@@ -465,7 +488,102 @@ pub fn check_annotations(annotations: &BTreeMap<String, String>) -> Result<(), S
             return Err(format!("annotation {key}: '{value}' is no number from 1"));
         }
     }
-    Ok(())
+    // as the wicket's options: 32 bits
+    let number = |key: &str, least: u64| {
+        let Some(value) = annotations.get(key) else {
+            return Ok(None);
+        };
+        match value.parse::<u32>().map(u64::from) {
+            Ok(number) if number >= least => Ok(Some(number)),
+            _ => Err(format!(
+                "annotation {key}: '{value}' is no number from {least}"
+            )),
+        }
+    };
+    let lifetime = Lifetime {
+        mode: annotations.get(MODE_ANNOTATION).cloned(),
+        warm: number(WARM_ANNOTATION, 0)?,
+        keep_ms: number(KEEP_ANNOTATION, 1)?,
+        uses: number(USES_ANNOTATION, 1)?,
+        lifetime_ms: number(LIFETIME_ANNOTATION, 1)?,
+    };
+    let given = |keys: &[&'static str]| {
+        keys.iter()
+            .copied()
+            .find(|key| annotations.contains_key(*key))
+    };
+    match runtime {
+        Some(Runtime::Wasm) => {
+            let vm = [
+                MODE_ANNOTATION,
+                KEEP_ANNOTATION,
+                USES_ANNOTATION,
+                LIFETIME_ANNOTATION,
+            ];
+            if let Some(key) = given(&vm) {
+                return Err(format!(
+                    "annotation {key}: this wicket runs components, it has no VMs"
+                ));
+            }
+        }
+        Some(Runtime::Firecracker) => {
+            if let Some(key) = given(&[BUDGET_ANNOTATION, INSTANCES_ANNOTATION]) {
+                return Err(format!(
+                    "annotation {key}: this wicket runs VMs, it has no components: \
+                     `cf scale -i` caps them"
+                ));
+            }
+        }
+        None => {}
+    }
+    let takes: &[&str] = match lifetime.mode.as_deref() {
+        // a wasm wicket's warm, that needs no mode
+        None if runtime != Some(Runtime::Firecracker) => &[WARM_ANNOTATION],
+        None | Some("shared") => &[],
+        Some("per-connection") => &[WARM_ANNOTATION],
+        Some("reuse") => &[
+            WARM_ANNOTATION,
+            KEEP_ANNOTATION,
+            USES_ANNOTATION,
+            LIFETIME_ANNOTATION,
+        ],
+        Some("pool") => &[WARM_ANNOTATION, KEEP_ANNOTATION],
+        Some(other) => {
+            return Err(format!(
+                "annotation {MODE_ANNOTATION}: '{other}' is no mode: shared, per-connection, \
+                 reuse or pool"
+            ));
+        }
+    };
+    let options = [
+        WARM_ANNOTATION,
+        KEEP_ANNOTATION,
+        USES_ANNOTATION,
+        LIFETIME_ANNOTATION,
+    ];
+    if let Some(key) = options
+        .into_iter()
+        .find(|key| annotations.contains_key(*key) && !takes.contains(key))
+    {
+        return Err(match lifetime.mode.as_deref() {
+            Some(mode) => format!("annotation {key}: mode {mode} does not take it"),
+            None => format!("annotation {key} needs annotation {MODE_ANNOTATION}"),
+        });
+    }
+    if lifetime.mode.as_deref() == Some("shared") && instances > 1 {
+        return Err(format!(
+            "annotation {MODE_ANNOTATION}: shared is one VM, for {instances} instances"
+        ));
+    }
+    if let Some(warm) = lifetime
+        .warm
+        .filter(|warm| instances > 0 && *warm > instances)
+    {
+        return Err(format!(
+            "annotation {WARM_ANNOTATION}: {warm} is above the app's {instances} instances"
+        ));
+    }
+    Ok(lifetime)
 }
 
 #[cfg(test)]
@@ -499,7 +617,7 @@ mod tests {
             "applications:\n- name: counter\n  path: /tmp/x\n  command: counter.wasm\n  instances: 2\n  memory: 64M\n  default-route: true\n  routes:\n  - route: counter.localhost\n  - route: count.example.com\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/budget-ms: 5000\n  env:\n    GREETING: 'a: \"b\"'\n    WORKERS: 4\n  unknown-key: ignored\n",
         )
         .unwrap();
-        let guids = apply(&mut state, &manifest, crate::store::STACK).unwrap();
+        let guids = apply(&mut state, &manifest, None).unwrap();
         let app = state.app(&guids[0]).unwrap();
         assert_eq!(app.name, "counter");
         assert_eq!(app.process.instances, 2);
@@ -526,10 +644,7 @@ mod tests {
             "applications:\n- name: counter\n  default-route: true\n  memory: 128\n  env:\n    WORKERS: ~\n",
         )
         .unwrap();
-        assert_eq!(
-            apply(&mut state, &again, crate::store::STACK).unwrap(),
-            guids
-        );
+        assert_eq!(apply(&mut state, &again, None).unwrap(), guids);
         assert_eq!(state.app(&guids[0]).unwrap().process.memory_mb, 128);
         assert_eq!(state.routes_of(&guids[0]).count(), 2);
         assert_eq!(
@@ -539,7 +654,7 @@ mod tests {
 
         // a second app takes its default route; a route serves one app
         let other = parse("applications:\n- name: other\n  default-route: true\n").unwrap();
-        let other = apply(&mut state, &other, crate::store::STACK).unwrap()[0].clone();
+        let other = apply(&mut state, &other, None).unwrap()[0].clone();
         assert_eq!(
             state.url(state.routes_of(&other).next().unwrap()),
             "other.localhost"
@@ -548,17 +663,17 @@ mod tests {
             parse("applications:\n- name: other\n  routes:\n  - route: counter.localhost\n")
                 .unwrap();
         assert!(
-            apply(&mut state, &taken, crate::store::STACK)
+            apply(&mut state, &taken, None)
                 .unwrap_err()
                 .contains("mapped to counter")
         );
 
         // no-route unmaps; random-route names one
         let none = parse("applications:\n- name: other\n  no-route: true\n").unwrap();
-        apply(&mut state, &none, crate::store::STACK).unwrap();
+        apply(&mut state, &none, None).unwrap();
         assert_eq!(state.routes_of(&other).count(), 0);
         let random = parse("applications:\n- name: other\n  random-route: true\n").unwrap();
-        apply(&mut state, &random, crate::store::STACK).unwrap();
+        apply(&mut state, &random, None).unwrap();
         let url = state.url(state.routes_of(&other).next().unwrap());
         assert!(
             url.starts_with("other-") && url.ends_with(".localhost"),
@@ -574,8 +689,8 @@ mod tests {
             "applications:\n- name: counter\n  services:\n  - kv\n  - name: sessions\n    binding_name: s\n    parameters:\n      identifier: sessions\n  - net\n",
         )
         .unwrap();
-        apply(&mut state, &bound, crate::store::STACK).unwrap();
-        apply(&mut state, &bound, crate::store::STACK).unwrap();
+        apply(&mut state, &bound, None).unwrap();
+        apply(&mut state, &bound, None).unwrap();
         assert_eq!(state.bindings.len(), 3);
         let (wasi, keyvalue) = services::grants(&state, &guids[0]);
         assert_eq!(wasi, ["cli", "inherit-network", "keyvalue"]);
@@ -608,7 +723,7 @@ mod tests {
         let mut again = state.clone();
         again.bindings.clear();
         again.app_mut(&guids[0]).unwrap().env.clear();
-        apply(&mut again, &written, crate::store::STACK).unwrap();
+        apply(&mut again, &written, None).unwrap();
         assert_eq!(
             again.app(&guids[0]).unwrap().env,
             app.env,
@@ -634,8 +749,7 @@ mod tests {
         // (the CLI uploads the bits then); the manifest written names the
         // image of its newest package, the password never
         let docker = "applications:\n- name: img\n  docker:\n    image: ghcr.io/me/hello:1\n";
-        let img =
-            apply(&mut state, &parse(docker).unwrap(), crate::store::STACK).unwrap()[0].clone();
+        let img = apply(&mut state, &parse(docker).unwrap(), None).unwrap()[0].clone();
         assert_eq!(state.app(&img).unwrap().lifecycle, Lifecycle::Docker);
         state.packages.push(Package {
             guid: "p".into(),
@@ -661,11 +775,11 @@ mod tests {
         apply(
             &mut state,
             &parse("applications:\n- name: img\n  path: /x\n").unwrap(),
-            crate::store::STACK,
+            None,
         )
         .unwrap();
         assert_eq!(state.app(&img).unwrap().lifecycle, Lifecycle::Buildpack);
-        apply(&mut state, &parse(&written).unwrap(), crate::store::STACK).unwrap();
+        apply(&mut state, &parse(&written).unwrap(), None).unwrap();
         assert_eq!(state.app(&img).unwrap().lifecycle, Lifecycle::Docker);
     }
 
@@ -681,7 +795,7 @@ mod tests {
         }
         let mut refused = |text: &str| {
             let manifest = parse(text).unwrap();
-            apply(&mut state, &manifest, crate::store::STACK).unwrap_err()
+            apply(&mut state, &manifest, None).unwrap_err()
         };
         assert!(
             refused("applications:\n- name: a\n  env:\n    VCAP_SERVICES: v\n")
@@ -737,5 +851,164 @@ mod tests {
         assert!(refused("applications:\n- name: a\n  memory: 2 pounds\n").contains("no size"));
         assert!(refused("applications:\n- name: a\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/instances: many\n").contains("no number"));
         assert!(parse("applications: [").is_err());
+
+        // what the annotations ask, on each wicket and at each `cf scale`
+        use Runtime::{Firecracker, Wasm};
+        let check = |pairs: &[(&str, &str)], instances, runtime| {
+            let annotations = pairs
+                .iter()
+                .map(|(key, value)| (format!("wicket.sluice.ik.am/{key}"), value.to_string()))
+                .collect();
+            check_annotations(&annotations, instances, runtime)
+        };
+        for (pairs, instances, runtime, reason) in [
+            // what a mode does not take
+            (
+                &[("mode", "shared"), ("warm", "1")][..],
+                1,
+                Some(Firecracker),
+                "does not take",
+            ),
+            (
+                &[("mode", "per-connection"), ("keep-ms", "1")],
+                1,
+                Some(Firecracker),
+                "does not take",
+            ),
+            (
+                &[("mode", "per-connection"), ("uses", "1")],
+                1,
+                None,
+                "does not take",
+            ),
+            (
+                &[("mode", "pool"), ("uses", "1")],
+                2,
+                Some(Firecracker),
+                "does not take",
+            ),
+            (
+                &[("mode", "pool"), ("lifetime-ms", "1")],
+                2,
+                Some(Firecracker),
+                "does not take",
+            ),
+            // a lifetime needs a mode: what `cf scale` chooses would change what it means
+            (
+                &[("keep-ms", "1")],
+                2,
+                Some(Firecracker),
+                "needs annotation",
+            ),
+            (&[("warm", "1")], 2, Some(Firecracker), "needs annotation"),
+            (&[("uses", "1")], 2, None, "needs annotation"),
+            // no mode, no number, not in the wicket's 32 bits
+            (&[("mode", "fastest")], 1, Some(Firecracker), "no mode"),
+            (&[("mode", "fastest")], 1, None, "no mode"),
+            (
+                &[("mode", "reuse"), ("uses", "0")],
+                1,
+                Some(Firecracker),
+                "no number from 1",
+            ),
+            (
+                &[("mode", "reuse"), ("keep-ms", "soon")],
+                1,
+                None,
+                "no number from 1",
+            ),
+            (
+                &[("mode", "reuse"), ("lifetime-ms", "4294967296")],
+                1,
+                None,
+                "no number from 1",
+            ),
+            (&[("warm", "-1")], 1, None, "no number from 0"),
+            // beyond the cap
+            (&[("mode", "shared")], 2, Some(Firecracker), "one VM"),
+            (
+                &[("mode", "pool"), ("warm", "3")],
+                2,
+                Some(Firecracker),
+                "above",
+            ),
+            (&[("warm", "3")], 2, Some(Wasm), "above"),
+            // each wicket's own
+            (&[("mode", "pool")], 2, Some(Wasm), "no VMs"),
+            (&[("keep-ms", "1")], 2, Some(Wasm), "no VMs"),
+            (&[("budget-ms", "1")], 2, Some(Firecracker), "no components"),
+            (&[("instances", "1")], 2, Some(Firecracker), "no components"),
+        ] {
+            let refused = check(pairs, instances, runtime).unwrap_err();
+            assert!(refused.contains(reason), "{pairs:?}: {refused}");
+        }
+        for (pairs, instances, runtime) in [
+            (&[][..], 3, Some(Firecracker)),
+            (&[("mode", "shared")], 1, Some(Firecracker)),
+            (
+                &[("mode", "per-connection"), ("warm", "2")],
+                2,
+                Some(Firecracker),
+            ),
+            (
+                &[
+                    ("mode", "reuse"),
+                    ("warm", "0"),
+                    ("keep-ms", "1"),
+                    ("uses", "1"),
+                    ("lifetime-ms", "1"),
+                ],
+                1,
+                Some(Firecracker),
+            ),
+            (
+                &[("mode", "pool"), ("warm", "2"), ("keep-ms", "1")],
+                2,
+                Some(Firecracker),
+            ),
+            // 0 is no VM at all: nothing to be above, a shared VM's one included
+            (&[("mode", "shared")], 0, Some(Firecracker)),
+            (&[("mode", "pool"), ("warm", "3")], 0, Some(Firecracker)),
+            (
+                &[("warm", "0"), ("budget-ms", "1"), ("instances", "1")],
+                1,
+                Some(Wasm),
+            ),
+            (&[("warm", "1")], 2, None),
+            (&[("budget-ms", "1")], 2, None),
+        ] {
+            check(pairs, instances, runtime).unwrap_or_else(|e| panic!("{pairs:?}: {e}"));
+        }
+        let lifetime = check(
+            &[
+                ("mode", "reuse"),
+                ("warm", "1"),
+                ("keep-ms", "2"),
+                ("uses", "3"),
+                ("lifetime-ms", "4"),
+            ],
+            1,
+            Some(Firecracker),
+        );
+        assert_eq!(
+            lifetime.unwrap(),
+            Lifetime {
+                mode: Some("reuse".into()),
+                warm: Some(1),
+                keep_ms: Some(2),
+                uses: Some(3),
+                lifetime_ms: Some(4),
+            }
+        );
+        // a push checks the instances it leaves, wherever it sets them
+        let mut state = State::new("o", "s", &["localhost".into()]);
+        let shared = "applications:\n- name: a\n  no-route: true\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/mode: shared\n";
+        let manifest = |more: &str| parse(&format!("{shared}{more}")).unwrap();
+        apply(&mut state, &manifest(""), Some(Firecracker)).unwrap();
+        let refused = apply(&mut state, &manifest("  instances: 2\n"), Some(Firecracker));
+        assert!(refused.unwrap_err().contains("a: annotation"));
+        let web = "  processes:\n  - type: web\n    instances: 2\n";
+        let refused = apply(&mut state, &manifest(web), Some(Firecracker));
+        assert!(refused.unwrap_err().contains("one VM"));
     }
 }

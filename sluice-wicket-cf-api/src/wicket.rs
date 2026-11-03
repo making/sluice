@@ -79,6 +79,18 @@ pub struct Sandbox {
     /// A Firecracker wicket's: its pool's VMs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vms: Option<u64>,
+    /// A Firecracker wicket's: VMs kept ahead of the connections.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warm: Option<u64>,
+    /// A Firecracker wicket's: how long a VM serving nothing is kept.
+    #[serde(rename = "keep-ms", skip_serializing_if = "Option::is_none")]
+    pub keep_ms: Option<u64>,
+    /// A Firecracker wicket's: the connections a VM serves at most.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uses: Option<u64>,
+    /// A Firecracker wicket's: how long a VM serves at most.
+    #[serde(rename = "lifetime-ms", skip_serializing_if = "Option::is_none")]
+    pub lifetime_ms: Option<u64>,
     /// A Firecracker wicket's: how long a VM's process may take to listen.
     #[serde(rename = "boot-ms", skip_serializing_if = "Option::is_none")]
     pub boot_ms: Option<u64>,

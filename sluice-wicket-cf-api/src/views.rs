@@ -251,8 +251,8 @@ pub fn process(base: &str, state: &State, app: &App) -> Value {
     })
 }
 
-/// The process stats: `instances` entries, `RUNNING` once the wicket took
-/// the app, `CRASHED` with its refusal as `details`, `STARTING` while it
+/// The process stats: `instances` entries, none at 0, whatever is alive below them,
+/// `RUNNING` once the wicket took the app, `CRASHED` with its refusal as `details`, `STARTING` while it
 /// is unreachable, `DOWN` for a stopped app.
 pub fn stats(state: &State, app: &App, owner: &str) -> Value {
     let (instance_state, details, since) = match (&app.running, app.started) {

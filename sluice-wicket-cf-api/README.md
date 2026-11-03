@@ -248,9 +248,10 @@ another OpenID Provider and the like.
 | package (docker) | an image (`cf push --docker-image`, a manifest's `docker.image`) holding the component as one `application/wasm` layer, as `wkg oci push` and `oras push <ref> hello.wasm:application/wasm` push it (of an index, its `wasm` entry). `--docker-username` with `CF_DOCKER_PASSWORD` are its credentials |
 | build | picks the component: the one the web process command names (`-c hello.wasm`, `command:`), else the package's only `.wasm`; of an image, pulls it. It must be a component (`\0asm`, layer 1). Anything else fails the build, naming what it found |
 | droplet | that component, by sha256 (`process_types.web` its path; stack `wasip3`, buildpack `wasm`); of an image, the image by digest (`cf app`: `docker image:`), `process_types.web` the repository's last segment `.wasm` |
-| web process `instances` | `pool`: warm instances, taking the requests in turn. A request beyond them gets an instance of its own, as on every route: 0 still serves. `cf logs` names the instance (`APP/PROC/WEB/<index>`, the requests' `app_index`): a warm one's `0` to `instances - 1`, one of its own the lowest index free from `instances` up |
+| web process `instances` | `pool`: warm instances, taking the requests in turn. A request beyond them gets an instance of its own, as on every route. 0 is [as on CF](#mapping): no app in the wicket. `cf logs` names the instance (`APP/PROC/WEB/<index>`, the requests' `app_index`): a warm one's `0` to `pool - 1`, one of its own the lowest index free from `pool` up |
 | web process `memory` | `memory-mib` |
 | annotations `wicket.sluice.ik.am/budget-ms`, `wicket.sluice.ik.am/instances` | `budget-ms`, `instances` (the route's cap; below `pool` the wicket refuses) |
+| annotation `wicket.sluice.ik.am/warm` | `pool` in the place of the process's `instances`, at most those: 0 keeps no instance warm, each request getting its own. An app at 0 instances for that before stops serving on the upgrade: annotate it and `cf scale -i 1` |
 | environment variables (`cf set-env`, a manifest's `env:`), `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: what the guest's `wasi:cli/environment` answers |
 | disk | accepted and shown, no effect |
 | security groups | accepted and shown, no effect: a component's network is the capabilities below |
@@ -608,15 +609,48 @@ The wicket's listing says `runtime: firecracker`.
 | package (docker) | any container image, `--docker-username` with `CF_DOCKER_PASSWORD` its credentials: the build has the wicket make its rootfs (`PUT /api/images`), which pulls it. Listening on `PORT`, as on CF. Spring Boot reads `SERVER_PORT`, not `PORT`: its default fits, an app with another `server.port` takes `cf set-env <app> SERVER_PORT 8080` |
 | package (bits) | a zip holding the rootfs, `.ext4` as a component's `.wasm` is picked (160 MiB at most, unpacking to 4 GiB at most: an image is the way for more) |
 | droplet | the rootfs by sha256 (stack `firecracker`, buildpack `rootfs`; an image's has neither, as on CF): the wicket keeps an image's, the cf-api its reference pinned to the manifest's digest, and has it made again when the wicket lost it (the same digest, unless the wicket's guest changed) |
-| web process `instances` | 1: a shared VM; more: `mode=pool`, that many VMs cloned from a snapshot; 0: a VM of its own per connection, killed when it ends |
+| web process `instances` | `vms`, the cap of the app's VMs. 1: a shared VM; more: `mode=pool`, that many VMs cloned from a snapshot; [annotated](#how-long-a-vm-lives), any mode. 0 is [as on CF](#mapping): no VM and no app in the wicket. An app at 0 for a VM per connection before stops serving on the upgrade: annotate it `per-connection` and `cf scale -i 1` |
 | web process `memory` | `mem`, 1G by default as on CF: less fails a CNB Java image's memory calculator at its start. A pool's snapshot takes that much of the host's memory (`--tmpfs /run/sluice`): `cf scale -m` a small app |
 | web process `health_check` `timeout` (`cf push -t`) | `boot-ms`, 60s by default and 180s at most as on CF: how long the process may take to listen, in the request that starts it. A process exiting first is refused at once |
 | environment variables, `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: the process's environment, over the image's (its `PORT` is `/init`'s) |
 | disk | no effect: the rootfs is read-only and `/tmp` a tmpfs of the VM's memory; a persistent disk is the wicket API's, with no CF counterpart |
 | services | none: the listing offers neither capabilities nor keyvalue stores |
 | outbound connections | the [security groups](#security-groups): the route's `egress`. An app reaches no other host |
-| `cf logs` | the process's output, naming the VM (`APP/PROC/WEB/<index>`): a shared VM's 0, a pool's `0` to `instances - 1`, what `cf app` lists; with `instances` 0, a connection's VM the lowest index free. No `RTR` line: this wicket feeds no requests to the flume |
-| annotations | no effect: a VM's sandbox is its `mode`, `mem`, `vms` and `env` |
+| `cf logs` | the process's output, naming the VM (`APP/PROC/WEB/<index>`): a shared VM's 0, a clone's the lowest index free among the VMs alive, so `0` to `instances - 1` in every mode: what `cf app` lists. No `RTR` line: this wicket feeds no requests to the flume |
+| annotations | [how long a VM lives](#how-long-a-vm-lives); `budget-ms` and `instances`, a component's, are refused |
+
+### How long a VM lives
+
+`cf scale -i` sets the limit, annotations how long a VM lives below it: the route's options of the
+same names ([modes](../sluice-wicket-runtime-firecracker/README.md)), from a manifest's
+`metadata` or the v3 API.
+
+```yaml
+applications:
+- name: hello
+  instances: 4        # at most 4 VMs
+  metadata:
+    annotations:
+      wicket.sluice.ik.am/mode: reuse
+      wicket.sluice.ik.am/keep-ms: 30000
+```
+
+| annotation `wicket.sluice.ik.am/` | | taken by |
+|---|---|---|
+| `mode` | `shared`, `per-connection`, `reuse` or `pool` | |
+| `warm` | VMs kept, from 0 to `instances` | `per-connection`, `reuse`, `pool` |
+| `keep-ms` | how long a VM serving nothing is kept | `reuse`, `pool` |
+| `uses`, `lifetime-ms` | the connections a VM serves, how long it serves | `reuse` |
+
+- none annotated, 1 instance is a shared VM and more a pool of a fixed size. Annotated `pool`, it
+  keeps `warm` VMs: all of them by default, none once given a `keep-ms`, the first request then
+  paying a restore
+- refused, by `cf push`, the v3 API and `cf scale -i`, naming it: an option without a `mode` or its
+  mode not taking it, what is no mode or no number, `shared` above 1 instance, `warm` above the
+  instances. A wicket not answering, by the app's next start
+- as `budget-ms` and the rest of the sandbox they apply at the next start; `cf scale -i` at once
+- `cf app` shows the limit, `4/4`, `RUNNING` however many VMs are alive: the wicket took the app.
+  The wicket's `GET /api/routes` counts them (`vms.alive`)
 
 ### Security groups
 
@@ -706,10 +740,10 @@ What holds on both wickets; a component's and a VM's are in
 | CF | wicket |
 |---|---|
 | app, started, with a droplet and a route | an app named by its guid, owner `cf`: its routes' hosts, the droplet's component, the sandbox below |
-| app stopped, or without a route | no app in the wicket |
+| app stopped, scaled to 0, or without a route | no app in the wicket: a request gets the wicket's 404, as gorouter answers a route with no instance registered. `cf app` shows `0/0`, `cf push` of `instances: 0` waits for none |
 | route `<host>.<domain>` | a host: labels of `a-z`, `0-9` and `-`. No path, port or wildcard (422). A route serves one app: a second destination is refused; zero-downtime updates are `--strategy rolling` |
 | shared domain | `--domain` |
-| instance state | `RUNNING` once the wicket took the app, its VM going down and started again by the wicket included; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable |
+| instance state | `RUNNING` once the wicket took the app, its VM going down and started again by the wicket included; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable. One entry per `instances`, whatever is alive: a component's come per request, a VM's [per its annotations](#how-long-a-vm-lives) |
 | rolling deployment | the app put with the new droplet: the wicket swaps it in place; finalized at once |
 | org / space | one of each |
 | health check, log rate, stack, buildpacks | accepted and shown, no effect |

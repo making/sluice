@@ -1,7 +1,7 @@
 //! The OSS cf CLI (`SLUICE_CF_CLI`, else `cf8` on the PATH; the Tanzu
 //! distribution refuses any other platform) against the cf-api and a wicket
 //! in local mode, both on a flume: login, push, the app's logs, map-route,
-//! scale, a rolling push with requests all along, stop and start, the
+//! scale, a rolling push with requests all along, stop and start, a scale to 0, the
 //! user's environment variables and VCAP_*, a private component in an OCI
 //! registry (a stub) pushed by tag -- its credentials, a restart keeping
 //! the digest staged when the tag moves, a restage taking the new one --, a
@@ -12,7 +12,8 @@
 //! until a service binding grants what it needs, the services' lifecycle,
 //! delete. And against a Firecracker wicket, where `/dev/kvm` is usable: a
 //! private image made into a rootfs by the wicket, its process's user, files and
-//! environment seen from the VM, its connections through the security groups, a scale, a
+//! environment seen from the VM, its connections through the security groups, a scale, each
+//! mode and lifetime by annotation, a scale to 0, a
 //! rootfs of a zip, the wicket's
 //! directory lost and the image's rootfs made again, of the digest it had; then the
 //! cf-api itself an app of that wicket, in a VM with a disk, the flume and a provider
@@ -321,6 +322,24 @@ fn listing(console: &str) -> Value {
     let (status, body) = get(console, console, "/api/apps", Some(TOKEN));
     assert_eq!(status, 200, "{body}");
     serde_json::from_str(&body).unwrap()
+}
+
+/// What `cf app` shows of the instances: `<running>/<wanted>`.
+fn instances_shown(cf: &Cf, app: &str) -> String {
+    let shown = cf.ok(&["app", app]);
+    let line = shown.lines().find(|line| line.starts_with("instances:"));
+    let count = line.and_then(|line| line.split_whitespace().nth(1));
+    count
+        .unwrap_or_else(|| panic!("no instances: {shown}"))
+        .to_string()
+}
+
+/// Merges `annotations` into the app's through the v3 API: the answer, an error's too.
+fn annotate(cf: &Cf, app: &str, annotations: &Value) -> String {
+    let guid = cf.ok(&["app", app, "--guid"]);
+    let body = json!({"metadata": {"annotations": annotations}}).to_string();
+    let path = format!("/v3/apps/{}", guid.trim());
+    cf.ok(&["curl", "-X", "PATCH", &path, "-d", &body])
 }
 
 fn sha256(path: &Path) -> String {
@@ -672,6 +691,39 @@ fn the_cf_cli_deploys_to_the_wicket() {
     assert!(listing(&console)["apps"].as_array().unwrap().is_empty());
     cf.ok(&["start", "hello"]);
     assert_eq!(get(&listen, "hello.localhost", "/", None).0, 200);
+
+    // scaled to 0: as stopped, there and on CF; a push of 0 waits for no instance
+    cf.ok(&["scale", "hello", "-i", "0"]);
+    assert_eq!(get(&listen, "hello.localhost", "/", None).0, 404);
+    assert!(listing(&console)["apps"].as_array().unwrap().is_empty());
+    assert_eq!(instances_shown(&cf, "hello"), "0/0");
+    cf.ok(&["restart", "hello"]);
+    assert_eq!(get(&listen, "hello.localhost", "/", None).0, 404);
+    let app = dir.join("app");
+    cf.ok(&["push", "none", "-p", app.to_str().unwrap(), "-i", "0"]);
+    assert_eq!(get(&listen, "none.localhost", "/", None).0, 404);
+    assert_eq!(instances_shown(&cf, "none"), "0/0");
+    cf.ok(&["delete", "none", "-f"]);
+    cf.ok(&["scale", "hello", "-i", "2"]);
+    assert_eq!(get(&listen, "hello.localhost", "/", None).0, 200);
+    // no warm instance is the annotation's, from the next start; VMs' annotations are refused
+    let warm = json!({"wicket.sluice.ik.am/warm": "0"});
+    assert!(annotate(&cf, "hello", &warm).contains("\"guid\""));
+    assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 2);
+    cf.ok(&["restart", "hello"]);
+    assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 0);
+    assert_eq!(get(&listen, "hello.localhost", "/", None).0, 200);
+    let refused = annotate(&cf, "hello", &json!({"wicket.sluice.ik.am/mode": "pool"}));
+    assert!(refused.contains("no VMs"), "{refused}");
+    let create = json!({"name": "refused", "metadata": {"annotations":
+        {"wicket.sluice.ik.am/mode": "pool"}}})
+    .to_string();
+    let refused = cf.ok(&["curl", "-X", "POST", "/v3/apps", "-d", &create]);
+    assert!(refused.contains("no VMs"), "{refused}");
+    assert!(!cf.ok(&["apps"]).contains("refused"), "no app comes of it");
+    annotate(&cf, "hello", &json!({"wicket.sluice.ik.am/warm": null}));
+    cf.ok(&["restart", "hello"]);
+    assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 2);
 
     // the user's variables, VCAP_APPLICATION and VCAP_SERVICES: the guest
     // gets them from the next start on; no log and no listing of the
@@ -1646,6 +1698,135 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     }
     let shown = cf.ok(&["app", "fc"]);
     assert!(shown.contains("#1 "), "{shown}");
+
+    // `cf scale` the cap of VMs, the annotations how long one lives, from the next start
+    let sandbox = || {
+        let listed = listing(&console);
+        let apps = listed["apps"].as_array().unwrap();
+        let fc = apps.iter().find(|app| app["hosts"][0] == "fc.localhost");
+        fc.map(|fc| fc["sandbox"].clone())
+    };
+    let alive = || {
+        let (status, body) = get(&console, &console, "/api/routes", Some(TOKEN));
+        assert_eq!(status, 200, "{body}");
+        let routes: Value = serde_json::from_str(&body).unwrap();
+        let routes = routes["routes"].as_array().unwrap().clone();
+        let fc = routes.iter().find(|route| route["host"] == "fc.localhost");
+        fc.unwrap()["vms"]["alive"].as_u64().unwrap()
+    };
+    let scales_to_zero = |what: &str| {
+        assert_eq!(get(&listen, "fc.localhost", "/", None).0, 200, "{what}");
+        let deadline = Instant::now() + HANG;
+        while alive() > 0 {
+            assert!(Instant::now() < deadline, "{what}: VMs stay");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // the cap, whatever comes and goes below it
+        assert_eq!(instances_shown(&cf, "fc"), "2/2", "{what}");
+        shows("fc", "running");
+    };
+    let reuse = json!({
+        "wicket.sluice.ik.am/mode": "reuse",
+        "wicket.sluice.ik.am/keep-ms": "500",
+        "wicket.sluice.ik.am/uses": "2",
+        "wicket.sluice.ik.am/lifetime-ms": "60000",
+    });
+    assert!(annotate(&cf, "fc", &reuse).contains("\"guid\""));
+    assert_eq!(sandbox().unwrap()["mode"], "pool", "until the next start");
+    cf.ok(&["restart", "fc"]);
+    let fresh = sandbox().unwrap();
+    assert_eq!(
+        (
+            &fresh["mode"],
+            &fresh["vms"],
+            &fresh["keep-ms"],
+            &fresh["uses"],
+            &fresh["lifetime-ms"]
+        ),
+        (
+            &"reuse".into(),
+            &2.into(),
+            &500.into(),
+            &2.into(),
+            &60_000.into()
+        ),
+    );
+    scales_to_zero("reuse");
+    // a pool given a lifetime has no VM kept but those annotated: none here
+    let pool = json!({
+        "wicket.sluice.ik.am/mode": "pool",
+        "wicket.sluice.ik.am/uses": null,
+        "wicket.sluice.ik.am/lifetime-ms": null,
+    });
+    assert!(annotate(&cf, "fc", &pool).contains("\"guid\""));
+    cf.ok(&["restart", "fc"]);
+    let fresh = sandbox().unwrap();
+    assert_eq!(
+        (
+            &fresh["mode"],
+            &fresh["vms"],
+            &fresh["warm"],
+            &fresh["keep-ms"]
+        ),
+        (&"pool".into(), &2.into(), &0.into(), &500.into()),
+    );
+    scales_to_zero("pool");
+    // what a mode does not take is refused, as what is no mode and no number
+    for (annotation, reason) in [
+        (json!({"wicket.sluice.ik.am/uses": "2"}), "uses"),
+        (json!({"wicket.sluice.ik.am/mode": "fastest"}), "no mode"),
+        (json!({"wicket.sluice.ik.am/keep-ms": "soon"}), "no number"),
+        (json!({"wicket.sluice.ik.am/warm": "3"}), "above"),
+        (
+            json!({"wicket.sluice.ik.am/budget-ms": "5000"}),
+            "budget-ms",
+        ),
+        (
+            json!({"wicket.sluice.ik.am/mode": "shared", "wicket.sluice.ik.am/keep-ms": null}),
+            "one VM",
+        ),
+    ] {
+        let refused = annotate(&cf, "fc", &annotation);
+        assert!(refused.contains(reason), "{annotation}: {refused}");
+    }
+    // a shared VM is one
+    cf.ok(&["scale", "fc", "-i", "1"]);
+    let shared = json!({"wicket.sluice.ik.am/mode": "shared", "wicket.sluice.ik.am/keep-ms": null});
+    assert!(annotate(&cf, "fc", &shared).contains("\"guid\""));
+    cf.ok(&["restart", "fc"]);
+    assert_eq!(sandbox().unwrap()["mode"], "shared");
+    let refused = cf.fails(&["scale", "fc", "-i", "2"]);
+    assert!(refused.contains("one VM"), "{refused}");
+    assert_eq!(instances_shown(&cf, "fc"), "1/1");
+    // per connection, from a cap of one
+    annotate(
+        &cf,
+        "fc",
+        &json!({"wicket.sluice.ik.am/mode": "per-connection"}),
+    );
+    cf.ok(&["restart", "fc"]);
+    let fresh = sandbox().unwrap();
+    assert_eq!(
+        (&fresh["mode"], &fresh["vms"]),
+        (&"per-connection".into(), &1.into())
+    );
+    assert_eq!(get(&listen, "fc.localhost", "/", None).0, 200);
+    let deadline = Instant::now() + HANG;
+    while alive() > 0 {
+        assert!(Instant::now() < deadline, "its VM outlives its connection");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // scaled to 0: nothing runs, nothing serves, as stopped; the cap back, it serves again
+    cf.ok(&["scale", "fc", "-i", "0"]);
+    assert_eq!(sandbox(), None);
+    assert_eq!(get(&listen, "fc.localhost", "/", None).0, 404);
+    assert_eq!(instances_shown(&cf, "fc"), "0/0");
+    cf.ok(&["scale", "fc", "-i", "1"]);
+    assert_eq!(get(&listen, "fc.localhost", "/", None).0, 200);
+    // none annotated: 1 a shared VM, more a pool of a fixed size, as above
+    annotate(&cf, "fc", &json!({"wicket.sluice.ik.am/mode": null}));
+    cf.ok(&["restart", "fc"]);
+    assert_eq!(sandbox().unwrap()["mode"], "shared");
 
     // a rootfs in a zip: uploaded by the cf-api, as a component is
     cf.ok(&["push", "zipped", "-p", dir.join("rootfs").to_str().unwrap()]);

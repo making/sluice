@@ -19,6 +19,17 @@ use serde::{Deserialize, Serialize};
 pub const BUDGET_ANNOTATION: &str = "wicket.sluice.ik.am/budget-ms";
 /// The annotation of an app setting its routes' `instances` cap.
 pub const INSTANCES_ANNOTATION: &str = "wicket.sluice.ik.am/instances";
+/// The annotation of an app setting how a connection gets a VM: its routes' `mode`.
+pub const MODE_ANNOTATION: &str = "wicket.sluice.ik.am/mode";
+/// The annotation of an app setting how many of its instances are kept warm: a VM's `warm`, a
+/// component's `pool`.
+pub const WARM_ANNOTATION: &str = "wicket.sluice.ik.am/warm";
+/// The annotation of an app setting how long a VM serving nothing lives: its routes' `keep-ms`.
+pub const KEEP_ANNOTATION: &str = "wicket.sluice.ik.am/keep-ms";
+/// The annotation of an app setting how many connections a VM serves: its routes' `uses`.
+pub const USES_ANNOTATION: &str = "wicket.sluice.ik.am/uses";
+/// The annotation of an app setting how long a VM serves: its routes' `lifetime-ms`.
+pub const LIFETIME_ANNOTATION: &str = "wicket.sluice.ik.am/lifetime-ms";
 
 /// The stack of a wasm wicket's apps.
 pub const STACK: &str = "wasip3";
@@ -146,6 +157,17 @@ impl Default for HealthCheck {
     }
 }
 
+/// How an app's instances come and go below `cf scale`'s number, as annotated
+/// (`crate::manifest::check_annotations`); none annotated, the number alone says.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct Lifetime {
+    pub mode: Option<String>,
+    pub warm: Option<u64>,
+    pub keep_ms: Option<u64>,
+    pub uses: Option<u64>,
+    pub lifetime_ms: Option<u64>,
+}
+
 /// The droplet and the sandbox the wicket got at the last start.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Running {
@@ -157,6 +179,8 @@ pub struct Running {
     pub memory_mib: u64,
     pub budget_ms: Option<u64>,
     pub instances: Option<u64>,
+    #[serde(default)]
+    pub lifetime: Lifetime,
     /// The capabilities the bindings granted.
     #[serde(default)]
     pub wasi: Vec<String>,

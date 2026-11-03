@@ -3,7 +3,7 @@
 //! the snapshot's component and sandbox -- its env, which the wicket lists
 //! by the names only, told by the snapshot's tag -- and the process's
 //! instances as the pool, or a droplet's rootfs as a Firecracker wicket's
-//! VMs: [`vm_sandbox`]); stopped, or without a route, it is none. The
+//! VMs: [`vm_sandbox`]); stopped, scaled to 0, or without a route, it is none. The
 //! desired state is the cf-api's: at startup and whenever the wicket's
 //! revision moves, its apps of the owner are listed and the difference put /
 //! deleted. The wicket serves on while the cf-api is down.
@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use crate::logs::Logs;
 use crate::services::Offer;
-use crate::store::{App, Outcome, Purge, State, Store};
+use crate::store::{App, Lifetime, Outcome, Purge, State, Store};
 use crate::wicket::{AppBody, ComponentRef, Failure, ListedApp, Runtime, Sandbox, Wicket};
 
 pub struct Controller {
@@ -82,9 +82,12 @@ impl Controller {
     }
 
     /// The wicket's app of `app` as `state` wants it; None when the app is
-    /// stopped, was never started with a droplet, or has no route.
+    /// stopped, scaled to 0, was never started with a droplet, or has no route.
     pub fn desired(state: &State, app: &App, owner: &str) -> Option<AppBody> {
         let running = app.running.as_ref().filter(|_| app.started)?;
+        if app.process.instances == 0 {
+            return None;
+        }
         let mut hosts: Vec<String> = state
             .routes_of(&app.guid)
             .map(|route| state.url(route))
@@ -110,12 +113,13 @@ impl Controller {
                         .unwrap_or(DEFAULT_HEALTH_CHECK_TIMEOUT),
                     &running.env,
                     &running.egress,
+                    &running.lifetime,
                 ),
                 false => Sandbox {
                     wasi: running.wasi.clone(),
                     budget_ms: running.budget_ms,
                     memory_mib: Some(running.memory_mib),
-                    pool: Some(app.process.instances),
+                    pool: Some(running.lifetime.warm.unwrap_or(app.process.instances)),
                     instances: running.instances,
                     keyvalue: running.keyvalue.clone(),
                     env: running.env.clone(),
@@ -516,26 +520,37 @@ const MAXIMUM_HEALTH_CHECK_TIMEOUT: u64 = 180;
 /// What a Firecracker wicket does not list of a route's `boot-ms`: its default.
 const WICKET_DEFAULT_BOOT_MS: u64 = 10_000;
 
-/// A rootfs's sandbox on a Firecracker wicket: `instances` VMs, as a process's are. One
-/// is a shared VM, booted at once; more, a pool cloned from a snapshot; none still
-/// serves, as on a wasm wicket: a VM of its own per connection. Its process has `timeout`
-/// seconds to listen, and connects to the destinations of `egress`.
+/// What a Firecracker wicket does not list of a route's `keep-ms`: its default.
+const WICKET_DEFAULT_KEEP_MS: u64 = 60_000;
+
+/// A rootfs's sandbox on a Firecracker wicket: `instances` VMs at most (from 1: 0 is no app),
+/// living as `lifetime` says. None annotated, one is a shared VM, booted at once; more, a pool
+/// of that size cloned from a snapshot. A pool given a `keep-ms` keeps only the VMs annotated
+/// `warm`, none by default: the wicket's default of all of them would leave no VM to kill.
+/// Its process has `timeout` seconds to listen, and connects to the destinations of `egress`.
 fn vm_sandbox(
     memory_mib: u64,
     instances: u64,
     timeout: u64,
     env: &BTreeMap<String, String>,
     egress: &[String],
+    lifetime: &Lifetime,
 ) -> Sandbox {
-    let (mode, vms) = match instances {
-        0 => ("per-connection", None),
-        1 => ("shared", None),
-        n => ("pool", Some(n)),
-    };
+    let mode = lifetime.mode.as_deref().unwrap_or(match instances {
+        1 => "shared",
+        _ => "pool",
+    });
+    let warm = lifetime
+        .warm
+        .or((mode == "pool" && lifetime.keep_ms.is_some()).then_some(0));
     Sandbox {
         mode: Some(mode.into()),
         mem: Some(memory_mib),
-        vms,
+        vms: (mode != "shared").then_some(instances),
+        warm,
+        keep_ms: lifetime.keep_ms,
+        uses: lifetime.uses,
+        lifetime_ms: lifetime.lifetime_ms,
         boot_ms: Some(timeout.clamp(1, MAXIMUM_HEALTH_CHECK_TIMEOUT) * 1000),
         egress: egress.to_vec(),
         env: env.clone(),
@@ -555,14 +570,21 @@ fn gone(sha256: &str, path: &std::path::Path, e: std::io::Error) -> Failure {
 }
 
 /// Whether the wicket serves `desired` as listed: a `budget_ms` left to
-/// the wicket's default matches whatever it chose; the capabilities and the
-/// egress in any order; the env, which the wicket lists by its names, by the tag.
+/// the wicket's default matches whatever it chose; a VM's options the wicket lists only
+/// away from their defaults as those defaults; the capabilities and the egress in any order;
+/// the env, which the wicket lists by its names, by the tag.
 fn same(listed: &AppBody, desired: &AppBody) -> bool {
     let sorted = |list: &[String]| {
         let mut list = list.to_vec();
         list.sort();
         list
     };
+    let warm = |sandbox: &Sandbox| match (sandbox.warm, sandbox.mode.as_deref()) {
+        (Some(warm), _) => warm,
+        (None, Some("pool")) => sandbox.vms.unwrap_or(0),
+        (None, _) => 0,
+    };
+    let keep_ms = |sandbox: &Sandbox| sandbox.keep_ms.unwrap_or(WICKET_DEFAULT_KEEP_MS);
     sorted(&listed.hosts) == desired.hosts
         && listed.component == desired.component
         && sorted(&listed.sandbox.wasi) == sorted(&desired.sandbox.wasi)
@@ -578,6 +600,10 @@ fn same(listed: &AppBody, desired: &AppBody) -> bool {
         && listed.sandbox.mode == desired.sandbox.mode
         && listed.sandbox.mem == desired.sandbox.mem
         && listed.sandbox.vms == desired.sandbox.vms
+        && warm(&listed.sandbox) == warm(&desired.sandbox)
+        && keep_ms(&listed.sandbox) == keep_ms(&desired.sandbox)
+        && listed.sandbox.uses == desired.sandbox.uses
+        && listed.sandbox.lifetime_ms == desired.sandbox.lifetime_ms
         && desired.sandbox.boot_ms.is_none_or(|boot_ms| {
             listed.sandbox.boot_ms.unwrap_or(WICKET_DEFAULT_BOOT_MS) == boot_ms
         })
@@ -603,6 +629,7 @@ mod tests {
             memory_mib: 64,
             budget_ms: Some(5000),
             instances: None,
+            lifetime: Lifetime::default(),
             wasi: vec!["keyvalue".into(), "cli".into()],
             keyvalue: [(String::new(), "local/cf/i".to_string())].into(),
             env: [("GREETING".to_string(), "hello".to_string())].into(),
@@ -646,6 +673,19 @@ mod tests {
         listed.sandbox.pool = Some(2);
         listed.sandbox.budget_ms = Some(10_000);
         assert!(same(&listed, &unset));
+        // no warm instance is the annotation's; 0 is as stopped, on any wicket
+        let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
+        running.lifetime.warm = Some(0);
+        let warmless = Controller::desired(&state, state.app(&guid).unwrap(), "cf").unwrap();
+        assert_eq!(warmless.sandbox.pool, Some(0));
+        let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
+        running.lifetime.warm = None;
+        state.app_mut(&guid).unwrap().process.instances = 0;
+        assert_eq!(
+            Controller::desired(&state, state.app(&guid).unwrap(), "cf"),
+            None
+        );
+        state.app_mut(&guid).unwrap().process.instances = 2;
 
         // a rootfs is a Firecracker wicket's VMs, its env the same, the wasm options none
         let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
@@ -685,14 +725,104 @@ mod tests {
             let desired = Controller::desired(&state, state.app(&guid).unwrap(), "cf").unwrap();
             assert_eq!(desired.sandbox.boot_ms, Some(boot_ms));
         }
-        for (instances, mode, vms) in [
-            (0, "per-connection", None),
-            (1, "shared", None),
-            (3, "pool", Some(3)),
+        // `cf scale` the cap, the annotations the lifetime; a pool's floor gone with a keep-ms
+        let lifetime = |mode: Option<&str>, warm, keep_ms, uses, lifetime_ms| Lifetime {
+            mode: mode.map(String::from),
+            warm,
+            keep_ms,
+            uses,
+            lifetime_ms,
+        };
+        for (instances, annotated, mode, vms, warm) in [
+            (1, Lifetime::default(), "shared", None, None),
+            (3, Lifetime::default(), "pool", Some(3), None),
+            (
+                1,
+                lifetime(Some("shared"), None, None, None, None),
+                "shared",
+                None,
+                None,
+            ),
+            (
+                1,
+                lifetime(Some("per-connection"), None, None, None, None),
+                "per-connection",
+                Some(1),
+                None,
+            ),
+            (
+                3,
+                lifetime(Some("per-connection"), Some(1), None, None, None),
+                "per-connection",
+                Some(3),
+                Some(1),
+            ),
+            (
+                3,
+                lifetime(Some("reuse"), None, Some(500), Some(9), Some(800)),
+                "reuse",
+                Some(3),
+                None,
+            ),
+            (
+                1,
+                lifetime(Some("pool"), None, None, None, None),
+                "pool",
+                Some(1),
+                None,
+            ),
+            (
+                3,
+                lifetime(Some("pool"), None, Some(500), None, None),
+                "pool",
+                Some(3),
+                Some(0),
+            ),
+            (
+                3,
+                lifetime(Some("pool"), Some(1), Some(500), None, None),
+                "pool",
+                Some(3),
+                Some(1),
+            ),
         ] {
-            let sandbox = vm_sandbox(64, instances, 60, &BTreeMap::new(), &[]);
-            assert_eq!((sandbox.mode.as_deref(), sandbox.vms), (Some(mode), vms));
+            let sandbox = vm_sandbox(64, instances, 60, &BTreeMap::new(), &[], &annotated);
+            assert_eq!(
+                (sandbox.mode.as_deref(), sandbox.vms, sandbox.warm),
+                (Some(mode), vms, warm)
+            );
+            assert_eq!(
+                (sandbox.keep_ms, sandbox.uses, sandbox.lifetime_ms),
+                (annotated.keep_ms, annotated.uses, annotated.lifetime_ms)
+            );
         }
+        // the options the wicket lists only away from their defaults
+        let annotated = |warm, keep_ms| Lifetime {
+            mode: Some("pool".into()),
+            warm,
+            keep_ms,
+            ..Lifetime::default()
+        };
+        let body = |sandbox: Sandbox| AppBody {
+            sandbox,
+            ..desired.clone()
+        };
+        let asked = vm_sandbox(
+            64,
+            2,
+            60,
+            &BTreeMap::new(),
+            &[],
+            &annotated(Some(2), Some(60_000)),
+        );
+        let mut told = asked.clone();
+        (told.warm, told.keep_ms) = (None, None);
+        assert!(same(&body(told.clone()), &body(asked.clone())));
+        told.warm = Some(0);
+        assert!(!same(&body(told.clone()), &body(asked.clone())));
+        told.warm = None;
+        told.keep_ms = Some(500);
+        assert!(!same(&body(told), &body(asked)));
         // a removal the wicket did not take is tried again, but for another owner's app
         let refused = |status| Failure::Refused {
             status,

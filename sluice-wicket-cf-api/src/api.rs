@@ -1216,14 +1216,6 @@ impl Api {
 
     // --- the manifest
 
-    /// A new app's stack: of what the wicket runs, a wasm wicket's until it answers.
-    async fn stack_of_new_apps(&self) -> &'static str {
-        self.controller
-            .runtime()
-            .await
-            .map_or(crate::store::STACK, Runtime::stack)
-    }
-
     async fn apply_manifest(&self, req: &Req) -> Reply {
         let manifest = match manifest::parse(
             std::str::from_utf8(&req.body)
@@ -1239,7 +1231,7 @@ impl Api {
                 );
             }
         };
-        let stack = self.stack_of_new_apps().await;
+        let runtime = self.controller.runtime().await.ok();
         let named: Vec<String> = self.store.read(|state| {
             let named = manifest.applications.iter();
             named
@@ -1250,7 +1242,7 @@ impl Api {
         let _apps = self.controller.hold_all(&named).await;
         let (trial, guids) = {
             let mut trial = self.store.read(State::clone);
-            match manifest::apply(&mut trial, &manifest, stack) {
+            match manifest::apply(&mut trial, &manifest, runtime) {
                 Ok(guids) => (trial, guids),
                 Err(e) => {
                     return self.job(
@@ -1293,7 +1285,7 @@ impl Api {
         // none. An app new since the trial was not put: it is no started one
         let committed = self.store.update(|state| {
             let mut next = state.clone();
-            let guids = manifest::apply(&mut next, &manifest, stack)?;
+            let guids = manifest::apply(&mut next, &manifest, runtime)?;
             // the bindings `services:` made
             let bound: Vec<(String, String)> = next
                 .bindings
@@ -1375,7 +1367,9 @@ impl Api {
             }
         };
         let lifecycle = lifecycle(&body)?;
-        let stack = self.stack_of_new_apps().await;
+        // of what the wicket runs, a wasm wicket's until it answers
+        let runtime = self.controller.runtime().await.ok();
+        let stack = runtime.map_or(crate::store::STACK, Runtime::stack);
         let view = self.store.update(|state| {
             if state.app_named(name).is_some() {
                 return Err(ApiError {
@@ -1389,7 +1383,11 @@ impl Api {
             let app = state.app_mut(&guid).expect("just created");
             app.env = env;
             app.lifecycle = lifecycle.unwrap_or_default();
-            apply_metadata(app, &body["metadata"])?;
+            if let Err(refused) = apply_metadata(app, &body["metadata"], runtime) {
+                state.apps.retain(|app| app.guid != guid);
+                return Err(refused);
+            }
+            let app = state.app_mut(&guid).expect("just created");
             if let Some(buildpacks) = body["lifecycle"]["data"]["buildpacks"].as_array() {
                 app.buildpacks = buildpacks
                     .iter()
@@ -1410,6 +1408,7 @@ impl Api {
         let body: Value = req.json()?;
         let lifecycle = lifecycle(&body)?;
         self.app(guid)?;
+        let runtime = self.controller.runtime().await.ok();
         let view = self.store.update(|state| {
             if let Some(name) = body["name"].as_str()
                 && state
@@ -1423,6 +1422,8 @@ impl Api {
             let app = state
                 .app_mut(guid)
                 .ok_or_else(|| ApiError::not_found("App"))?;
+            // first: refused, it changes nothing
+            apply_metadata(app, &body["metadata"], runtime)?;
             if let Some(name) = body["name"].as_str() {
                 app.name = name.to_string();
             }
@@ -1439,7 +1440,6 @@ impl Api {
             if let Some(stack) = body["lifecycle"]["data"]["stack"].as_str() {
                 app.stack = stack.to_string();
             }
-            apply_metadata(app, &body["metadata"])?;
             app.updated_at = now();
             let app = app.clone();
             Ok(views::app(&req.base, state, &app))
@@ -1561,6 +1561,7 @@ impl Api {
         let log_rate = body
             .get("log_rate_limit_in_bytes_per_second")
             .and_then(Value::as_i64);
+        let runtime = self.controller.runtime().await.ok();
         let guid = guid.to_string();
         let change = {
             let guid = guid.clone();
@@ -1569,6 +1570,7 @@ impl Api {
                     .app_mut(&guid)
                     .ok_or_else(|| ApiError::not_found("App"))?;
                 if let Some(instances) = instances {
+                    manifest::check_annotations(&app.annotations, instances, runtime)?;
                     app.process.instances = instances;
                 }
                 if let Some(memory) = memory {
@@ -2123,7 +2125,12 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
     let droplet = state
         .droplet(current)
         .ok_or_else(|| ApiError::unprocessable("the current droplet is gone: push again"))?;
-    manifest::check_annotations(&app.annotations)?;
+    let runtime = match droplet.file.ends_with(staging::ROOTFS) {
+        true => Runtime::Firecracker,
+        false => Runtime::Wasm,
+    };
+    let lifetime =
+        manifest::check_annotations(&app.annotations, app.process.instances, Some(runtime))?;
     let annotation = |key: &str| {
         app.annotations
             .get(key)
@@ -2142,6 +2149,7 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
         memory_mib: app.process.memory_mb,
         budget_ms: annotation(BUDGET_ANNOTATION),
         instances: annotation(INSTANCES_ANNOTATION),
+        lifetime,
         wasi,
         keyvalue,
         env: env::guest(base, state, app),
@@ -2195,12 +2203,14 @@ fn feature_flag(name: &str) -> Value {
 }
 
 /// Merges `metadata` (labels and annotations; a null value removes the
-/// key) into the app, as CC does.
-fn apply_metadata(app: &mut crate::store::App, metadata: &Value) -> Result<(), ApiError> {
-    for (what, map) in [
-        ("labels", &mut app.labels),
-        ("annotations", &mut app.annotations),
-    ] {
+/// key) into the app, as CC does; refused, it changes nothing.
+fn apply_metadata(
+    app: &mut crate::store::App,
+    metadata: &Value,
+    runtime: Option<Runtime>,
+) -> Result<(), ApiError> {
+    let (mut labels, mut annotations) = (app.labels.clone(), app.annotations.clone());
+    for (what, map) in [("labels", &mut labels), ("annotations", &mut annotations)] {
         if let Some(given) = metadata[what].as_object() {
             for (key, value) in given {
                 match value {
@@ -2217,7 +2227,9 @@ fn apply_metadata(app: &mut crate::store::App, metadata: &Value) -> Result<(), A
             }
         }
     }
-    manifest::check_annotations(&app.annotations)?;
+    manifest::check_annotations(&annotations, app.process.instances, runtime)?;
+    app.labels = labels;
+    app.annotations = annotations;
     Ok(())
 }
 
