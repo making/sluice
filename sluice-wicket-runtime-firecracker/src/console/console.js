@@ -305,7 +305,7 @@ function vmsView(route) {
   counts.push(plural(vms.connections, "connection"));
   const lines = [h("span", { class: "route__meta", "data-testid": "vms" }, joined(counts))];
   if (vms.down) {
-    lines.push(h("span", { class: "route__meta", title: "its VM starts again by itself" }, vms.down));
+    lines.push(h("span", { class: "route__meta", title: "its VM starts again by itself" }, vms.down.why));
   }
   if (snapshot) {
     lines.push(h("span", { class: "route__meta", title: `snapshot taken ${snapshot.at}` }, joined([

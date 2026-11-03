@@ -657,7 +657,8 @@ applications:
   naming which: `cf restart` undoes a difference. A manifest's `instances` the running app
   cannot take (`cf push` restarts it right after) waits for the next start, the log saying so
 - `cf app` lists [the VMs alive](#instances), one coming with its restore and going as these say,
-  `0/0` with none
+  `0/0` with none, `CRASHED` with why if a request's restore failed, until the wicket's next try
+  succeeds, every second
 
 ### Security groups
 
@@ -750,7 +751,7 @@ What holds on both wickets; a component's and a VM's are in
 | app stopped, scaled to 0, or without a route | no app in the wicket: a request gets the wicket's 404, as gorouter answers a route with no instance registered. `cf app` shows `0/0` (stopped: `0/N`, each `DOWN`), `cf push` of `instances: 0` waits for none |
 | route `<host>.<domain>` | a host: labels of `a-z`, `0-9` and `-`. No path, port or wildcard (422). A route serves one app: a second destination is refused; zero-downtime updates are `--strategy rolling` |
 | shared domain | `--domain` |
-| instance state | once the wicket took the app, an entry per [instance alive](#instances), `RUNNING`, its `since` its own start, and for a VM it keeps gone down or not starting (no room in the wicket's budget, a snapshot gone) `CRASHED` with why as `details`, until it is up; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable or has not taken the app. These two list `instances` entries |
+| instance state | once the wicket took the app, an entry per [instance alive](#instances), `RUNNING`, its `since` its own start, and for a VM it keeps gone down or not starting (no room in the wicket's budget, a snapshot gone), or none alive at `warm: 0` with a request's restore failing for anything but room, `CRASHED` with why as `details`, `since` the failure began, until it is up; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable or has not taken the app. These two list `instances` entries |
 | rolling deployment | the app put with the new droplet: the wicket swaps it in place; finalized at once |
 | org / space | one of each |
 | health check, log rate, stack, buildpacks | accepted and shown, no effect |

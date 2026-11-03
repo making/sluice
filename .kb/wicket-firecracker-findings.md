@@ -275,6 +275,10 @@ as a VM's PSS, plus the snapshot on the tmpfs (`du`).
 - **The VMs past the limit are the highest indices**, by count: a pool of `warm=0` may hold the indices
   0 and 2 at `vms=2`, both within it. By index, the VM of 2 would go while room for another one is
   taken until it did, and a pool holding only it would serve none
+- **A restore failing at `warm=0` is tried again every second**, in room no VM waits for, not left to
+  the next connection: nothing else would end the `CRASHED` of an idle app once its cause is gone. It
+  costs a failing route a Firecracker per second, as `warm` above 0 already does; a pool's success
+  keeps its VM for `keep-ms`, a per-connection route's is killed at once
 
 ## Jail mode
 

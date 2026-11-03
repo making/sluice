@@ -177,9 +177,17 @@ pub struct ListedApp {
     pub deployed: String,
     /// The instances alive, lowest index first.
     pub alive: Vec<ListedInstance>,
-    /// Why it is short of the VMs it keeps: one went down, or does not start.
+    /// Why it is short of VMs: one it keeps went down or does not start, or none is alive and
+    /// their restores fail.
     #[serde(default)]
-    pub down: Option<String>,
+    pub down: Option<ListedDown>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct ListedDown {
+    pub why: String,
+    /// Since when it goes on, in seconds since the epoch.
+    pub since: u64,
 }
 
 #[derive(Deserialize, Clone, Debug)]

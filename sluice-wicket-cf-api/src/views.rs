@@ -259,8 +259,8 @@ pub fn process(base: &str, state: &State, app: &App) -> Value {
 /// `DOWN` for a stopped app and, of `instances` entries too, `CRASHED` with the wicket's refusal
 /// as `details` and `STARTING` until it serves the app (`listed`, as it answers now). Serving it,
 /// an entry `RUNNING` per instance alive, by the index `cf logs` names, up since its own start,
-/// and `CRASHED` for what it is short of the VMs it keeps: none is a limit not reached, no failure,
-/// as is an app the wicket has no reason to serve (at 0, without a route).
+/// and `CRASHED` for what it says it is short of, since then: none is a limit not reached, no
+/// failure, as is an app the wicket has no reason to serve (at 0, without a route).
 pub fn stats(state: &State, app: &App, owner: &str, listed: Option<&ListedApp>) -> Value {
     let all = |since, state, details: Option<&String>| -> Vec<Entry> {
         (0..app.process.instances)
@@ -279,7 +279,7 @@ pub fn stats(state: &State, app: &App, owner: &str, listed: Option<&ListedApp>) 
                 _ if Controller::desired(state, app, owner).is_none() => Vec::new(),
                 Some(Outcome::Refused(detail)) => all("CRASHED", Some(detail)),
                 Some(Outcome::Running) => match listed {
-                    Some(listed) => alive(listed, app.process.instances, running.since),
+                    Some(listed) => alive(listed, app.process.instances),
                     None => all("STARTING", None),
                 },
                 Some(Outcome::Unreachable) | None => all("STARTING", None),
@@ -316,22 +316,22 @@ struct Entry {
 
 /// The entries of what the wicket lists alive of an app of `instances`, by index, those it names
 /// by one index as one, up since the start of the lowest of them, the one staying as the others
-/// finish; and of what it is short of, at the first index below `instances` no other holds, with
-/// no start of its own: since `started`.
-fn alive(listed: &ListedApp, instances: u64, started: u64) -> Vec<Entry> {
+/// finish; and of what it is short of, at the first index below `instances` no other holds, since
+/// that goes on.
+fn alive(listed: &ListedApp, instances: u64) -> Vec<Entry> {
     let mut indices = BTreeMap::new();
     for instance in &listed.alive {
         indices
             .entry(crate::flume::listed(instance.index, instances))
             .or_insert(instance.since);
     }
-    let down = listed.down.as_ref().and_then(|why| {
+    let down = listed.down.as_ref().and_then(|down| {
         let index = (0..instances).find(|index| !indices.contains_key(index))?;
         Some(Entry {
             index,
             state: "CRASHED",
-            details: Some(why.clone()),
-            since: started,
+            details: Some(down.why.clone()),
+            since: down.since,
         })
     });
     let mut entries: Vec<_> = indices
@@ -875,6 +875,7 @@ mod tests {
 
         // a VM it keeps gone down, at an index no other holds: a failure of all at none alive
         let why = |index| (index, "CRASHED".to_string(), Some("exit 83".to_string()));
+        let exit_83 = json!({"why": "exit 83", "since": 1});
         for (alive, listed_as) in [
             (json!([]), vec![why(0)]),
             (json!([0]), vec![some(0, "RUNNING"), why(1)]),
@@ -882,16 +883,17 @@ mod tests {
             (json!([0, 1]), vec![some(0, "RUNNING"), some(1, "RUNNING")]),
         ] {
             assert_eq!(
-                entries(&state, Some(&listed(alive.clone(), json!("exit 83")))),
+                entries(&state, Some(&listed(alive.clone(), exit_83.clone()))),
                 listed_as,
                 "{alive}"
             );
         }
 
-        // each entry up since its own start: the lowest index's of those it holds; what has none,
-        // since the app's
+        // each entry up since its own start: the lowest index's of those it holds; what is short,
+        // since it went down
         let started = epoch_secs();
-        let mut one = listed(json!([0]), json!("exit 83"));
+        let down = json!({"why": "exit 83", "since": started - 50});
+        let mut one = listed(json!([0]), down);
         one.alive = serde_json::from_value(json!([
             {"index": 1, "since": started - 100},
             {"index": 3, "since": started - 200},
@@ -902,7 +904,7 @@ mod tests {
         assert_eq!(uptimes["resources"][1]["state"], "RUNNING");
         assert!((100..110).contains(&uptime(1)), "{uptimes}");
         assert_eq!(uptimes["resources"][0]["state"], "CRASHED");
-        assert!(uptime(0) >= started, "the app's: {uptimes}");
+        assert!((50..60).contains(&uptime(0)), "{uptimes}");
     }
 
     #[test]

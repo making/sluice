@@ -26,11 +26,35 @@ pub fn alive(held: BTreeMap<usize, SystemTime>) -> Vec<Alive> {
     held.into_iter()
         .map(|(index, start)| Alive {
             index,
-            since: start
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |since| since.as_secs()),
+            since: epoch_secs(start),
         })
         .collect()
+}
+
+fn epoch_secs(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// Why what is kept of an app is short of an instance, as a listing tells it.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct Shortage {
+    pub why: String,
+    /// Since when it goes on, in seconds since the epoch.
+    pub since: u64,
+}
+
+impl Shortage {
+    /// `shortage` from now on says `why`; since its start, when it goes on.
+    pub fn keep(shortage: &mut Option<Shortage>, why: impl Into<String>) {
+        let since = shortage
+            .as_ref()
+            .map_or_else(|| epoch_secs(SystemTime::now()), |going_on| going_on.since);
+        *shortage = Some(Shortage {
+            why: why.into(),
+            since,
+        });
+    }
 }
 
 /// What the console shows of the reloads besides the table.

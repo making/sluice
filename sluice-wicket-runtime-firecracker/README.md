@@ -349,7 +349,11 @@ snapshot: at once, then after the same waits below `warm` (a connection finding 
 meanwhile), with `vms.restarts` and `vms.down`, its other VMs serving on. A start failing below
 `warm` (no room within `wait-ms`, its snapshot gone) is tried again every second, and so are a warm
 clone's restores: `vms.down` says why until `warm` are up. What fails beyond `warm` is the connection's
-to be told, and waiting for room within `wait-ms`, or for a warm clone's, is no failure.
+to be told, and waiting for room within `wait-ms`, or for a warm clone's, is no failure, unless no VM
+is alive and the restore failed for anything but room: then `warm=0` would read as idle at none, so
+`vms.down` says why too and one VM is tried every second, in room no VM waits for, until one is up
+(gone again as `warm=0` has it). `vms.down` is `{"why": ..., "since": <seconds since the epoch>}`,
+`since` the start of what goes on, each failure after it changing only `why`.
 
 ### Console
 
@@ -470,8 +474,8 @@ digest, or made of an OCI image, first; the app names it:
 - `tag` (optional) is opaque to the wicket, kept and listed as given: a controller tells by it
   what it put, an env it cannot read back included. A tag or hosts alone start no VM
 - `alive` in a listing: its VMs alive, lowest first, `{"index": 0, "since": 1793000000}`: the
-  `instance` index and its start in seconds since the epoch, a clone's restore, a shared VM's boot;
-  `down`, when told: why it is short of the VMs it keeps (`vms.down`), until they are up
+  `instance` index and its start in seconds since the epoch, a clone's guest accepting, a shared
+  VM's boot; `down`, when told: why it is short of VMs, and since when (`vms.down`), until they are up
 - a PUT is one reload: every host of the app or none, kept only when its VMs started; the same
   app again changes nothing. An app's target names it (`?app=<name>`), so its VMs are its own,
   whoever else names the image; the env is in no target: another env starts its VMs anew. Its

@@ -52,7 +52,7 @@ use sluice_wicket_console::http::{
     Edited, Intake, Received, Refusal, Response, error, json, pairs, read, receive,
 };
 use sluice_wicket_console::serve::{self, Service};
-use sluice_wicket_console::status::{Alive, FailureView, Status, alive, settled};
+use sluice_wicket_console::status::{Alive, FailureView, Shortage, Status, alive, settled};
 use sluice_wicket_console::store::{
     check_digest, check_host, check_hosts, check_name, check_tag, rfc3339,
 };
@@ -723,9 +723,9 @@ struct AppView {
     deployed: String,
     /// Its VMs alive, lowest index first.
     alive: Vec<Alive>,
-    /// Why it is short of the VMs it keeps ([`Route::down`]).
+    /// Why it is short of VMs, since when ([`Route::down`]).
     #[serde(skip_serializing_if = "Option::is_none")]
-    down: Option<String>,
+    down: Option<Shortage>,
 }
 
 /// The body of an app's PUT.
@@ -822,7 +822,7 @@ struct VmsView {
     starting: usize,
     connections: u64,
     restarts: u64,
-    down: Option<String>,
+    down: Option<Shortage>,
 }
 
 #[derive(Serialize)]

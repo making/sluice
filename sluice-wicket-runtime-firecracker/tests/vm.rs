@@ -569,7 +569,9 @@ async fn every_route_serves_http_through_the_tunnel() {
 
 /// What keeps a route below its `warm` reads so in its `vms.down` until the VMs are up: the starts
 /// of a pool and the restores of warm clones failing, their snapshot gone, and of a pool finding no
-/// room in the budget. A VM beyond `warm` finding none is its connections' affair alone.
+/// room in the budget. A VM beyond `warm` finding none is its connections' affair alone. At `warm`
+/// 0, a connection's restore failing reads so too with no VM alive, since the first one: tried
+/// again, it is over as the restores are, with no other connection.
 async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> Wicket) {
     const POOL: &str = "pool.local";
     const CLONES: &str = "clones.local";
@@ -605,7 +607,7 @@ async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> 
     .map(String::from);
     let wicket = start(&args);
     let wicket = &wicket;
-    let short = |route: &serde_json::Value| route["vms"]["down"].is_string();
+    let short = |route: &serde_json::Value| route["vms"]["down"].is_object();
     let up =
         |n| move |route: &serde_json::Value| pooled(n)(route) && route["vms"]["down"].is_null();
     listed_as(wicket, POOL, up(1)).await;
@@ -631,7 +633,7 @@ async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> 
     snapshots_gone();
     warm(2, 0);
     let failing = listed_as(wicket, POOL, short).await;
-    let why = failing["vms"]["down"].as_str().unwrap();
+    let why = failing["vms"]["down"]["why"].as_str().unwrap();
     assert!(why.starts_with("its start failed: "), "{failing}");
     assert_eq!(failing["vms"]["pooled"], 1, "{failing}");
     snapshots_back();
@@ -641,7 +643,7 @@ async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> 
     warm(1, 1);
     listed_as(wicket, POOL, up(1)).await;
     let failing = listed_as(wicket, CLONES, short).await;
-    let why = failing["vms"]["down"].as_str().unwrap();
+    let why = failing["vms"]["down"]["why"].as_str().unwrap();
     assert!(why.starts_with("its restore failed: "), "{failing}");
     assert_eq!(failing["vms"]["warm"], 0, "{failing}");
     snapshots_back();
@@ -651,6 +653,45 @@ async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> 
     .await;
     warm(1, 0);
     listed_as(wicket, CLONES, |route| route["vms"]["alive"] == 0).await;
+
+    let refused = async |host: &str| {
+        let mut client = tokio::net::TcpStream::connect(wicket.listening())
+            .await
+            .unwrap();
+        let request = format!("GET / HTTP/1.1\r\nhost: {host}\r\n\r\n");
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = Vec::new();
+        let _ = client.read_to_end(&mut answer).await;
+        assert!(!answer.starts_with(b"HTTP/1.1 200"), "{host}");
+    };
+    snapshots_gone();
+    warm(0, 0);
+    listed_as(wicket, POOL, pooled(0)).await;
+    assert_eq!(
+        listed(wicket, POOL).await["vms"]["down"],
+        serde_json::Value::Null
+    );
+    for (host, says, tried) in [
+        (CLONES, "its restore failed: ", "warm clone: "),
+        (POOL, "its start failed: ", "pool VM: "),
+    ] {
+        refused(host).await;
+        let failing = listed_as(wicket, host, short).await;
+        let down = &failing["vms"]["down"];
+        assert!(down["why"].as_str().unwrap().starts_with(says), "{failing}");
+        let mark = wicket.log().len();
+        said_after(wicket, mark, tried).await;
+        let again = listed_as(wicket, host, short).await;
+        assert_eq!(again["vms"]["down"]["since"], down["since"], "{again}");
+    }
+    snapshots_back();
+    listed_as(wicket, CLONES, |route| {
+        route["vms"]["alive"] == 0 && route["vms"]["down"].is_null()
+    })
+    .await;
+    listed_as(wicket, POOL, |route| route["vms"]["down"].is_null()).await;
+    warm(1, 0);
+    listed_as(wicket, POOL, up(1)).await;
 
     // the budget's last room clones'; a connection on the pool's VM has one more started ahead
     let serving = async |host: &str| {
@@ -673,7 +714,7 @@ async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> 
 
     warm(2, 0);
     let failing = listed_as(wicket, POOL, short).await;
-    let why = failing["vms"]["down"].as_str().unwrap();
+    let why = failing["vms"]["down"]["why"].as_str().unwrap();
     assert!(why.starts_with("its start failed: no room"), "{failing}");
     assert_eq!(failing["vms"]["pooled"], 1, "{failing}");
     drop(clones);
@@ -1628,7 +1669,7 @@ async fn restarting_pool(
     let before = app_alive(wicket, "ending").await.0;
     let ended = Instant::now();
     assert_eq!(route.post(next(), "/exit", "").await, "exiting\n");
-    let down = listed_as(wicket, HOST, |route| route["vms"]["down"].is_string()).await;
+    let down = listed_as(wicket, HOST, |route| route["vms"]["down"].is_object()).await;
     assert_eq!(down["vms"]["pooled"], 0, "{down}");
     listed_as(wicket, HOST, replaced(2)).await;
     let waited = ended.elapsed();
