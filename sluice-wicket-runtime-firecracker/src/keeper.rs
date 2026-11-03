@@ -68,7 +68,7 @@ const LOG_MIB: u64 = 16;
 pub fn vm_file_size(role: Role, mem: u64) -> u64 {
     match role {
         Role::Template => (mem + LOG_MIB) << 20,
-        Role::Shared | Role::Clone => LOG_MIB << 20,
+        Role::Boot | Role::Clone => LOG_MIB << 20,
     }
 }
 
@@ -88,8 +88,8 @@ const ID_WAIT_MS: i32 = 5000;
 /// A VM's part in its route.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
-    /// A shared VM: booted, serving the route's connections.
-    Shared,
+    /// Booted, serving the route's connections.
+    Boot,
     /// A cloned route's template: booted, snapshotted into the route's
     /// directory.
     Template,
@@ -344,7 +344,7 @@ struct Route {
     /// `route-<n>`: its rootfs and kernel (attached in the template), its snapshot
     /// directory (`snapshot`).
     dir: PathBuf,
-    /// Its shared VM's or template's cgroup, made with the first.
+    /// Its template's cgroup, made with it.
     cgroup: Option<Cgroup>,
     /// An app's disk: attached in the template, its VM's to write once given its id, and
     /// locked per VM on an open file of its own.
@@ -931,7 +931,7 @@ impl Keeper {
             }
             Role::Clone if !route.sealed => return Err("the route's snapshot is not sealed".into()),
             Role::Template | Role::Clone if route.disk.is_some() => {
-                return Err("a disk has one VM: its route's shared one".into());
+                return Err("a disk has one VM: a booted one".into());
             }
             _ => {}
         }
@@ -962,7 +962,7 @@ impl Keeper {
 
     /// Starts the VM of `request` as the id `id`, its directory `dir`: the directory
     /// made for the id's first VM and kept (the reap empties its `run`), its log afresh,
-    /// its cgroup (the route's for a shared VM or template, the id's for a clone, in the
+    /// its cgroup (the route's for a template, the id's for a VM serving, in the
     /// class of its CPU, capped or not) made for the first and limited for each.
     fn jail(&mut self, id: u32, dir: &Path, request: &Waiting) -> io::Result<libc::pid_t> {
         let n = id - self.ids.first;
@@ -987,7 +987,7 @@ impl Keeper {
         let mem = u64::from(request.size.mem);
         let overhead = (vm_overhead_mib(mem) + LOG_MIB) << 20;
         let memory = match request.role {
-            Role::Shared | Role::Clone => (mem << 20) + overhead,
+            Role::Boot | Role::Clone => (mem << 20) + overhead,
             // its snapshot, which it writes, is charged to it (to the route's cgroup,
             // for the route's lifetime)
             Role::Template => ((2 * mem) << 20) + overhead,
@@ -1025,14 +1025,14 @@ impl Keeper {
         let capped = limits.cpu.is_some();
         let route = self.routes.get_mut(&request.route).expect("checked");
         let cgroup = match request.role {
-            Role::Shared | Role::Template => {
+            Role::Template => {
                 if route.cgroup.is_none() {
                     let name = format!("route-{}", request.route);
                     route.cgroup = Some(self.cgroups.child(&name, capped)?);
                 }
                 route.cgroup.as_mut().expect("made")
             }
-            Role::Clone => match self.clones.entry((id, capped)) {
+            Role::Boot | Role::Clone => match self.clones.entry((id, capped)) {
                 std::collections::hash_map::Entry::Occupied(cgroup) => cgroup.into_mut(),
                 std::collections::hash_map::Entry::Vacant(vacant) => {
                     vacant.insert(self.cgroups.child(&format!("vm-{n}"), capped)?)
@@ -1045,7 +1045,7 @@ impl Keeper {
         let run_in_dir = PathBuf::from(format!("vm-{n}/run"));
         let snapshot_in_dir = route_in_dir.join("snapshot");
         let snapshot = match request.role {
-            Role::Shared => None,
+            Role::Boot => None,
             Role::Template => {
                 owned(&route.dir.join("snapshot"), id, self.group, 0o2770)?;
                 Some((snapshot_in_dir.as_path(), Access::ReadWrite))

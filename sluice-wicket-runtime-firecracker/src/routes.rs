@@ -5,7 +5,7 @@
 //! The routes are reloaded without a restart ([`Reloader`]): on a change of
 //! their files (the `--config` file, a rootfs, the kernel, the firecracker
 //! binary) or on SIGHUP. A reload reads the routes again and starts the VMs
-//! of every target that is new or whose VMs or files changed -- a shared VM
+//! of every target that is new or whose VMs or files changed -- its VMs
 //! booted, a cloned route's template booted and snapshotted again --
 //! before it changes anything: one failure keeps the current table. A target
 //! kept as it was keeps its VMs. A changed target serves its next connection
@@ -22,16 +22,15 @@
 //!
 //! A disk has one writer (`disk`), so a route's VM on a disk is the exception to the
 //! order: once every other target started, the VM holding the disk is stopped, then
-//! the new one started. A start failing then starts the old one again, on the disk
+//! the new one started. A start failing then has the old route start one again, on the disk
 //! it left, and the reload fails as any other; failing as well, the route serves
 //! nothing until a restart succeeds, which the failure says. Its connections fail
 //! meanwhile, a boot long.
 //!
-//! A shared VM that goes down (`route::Down`) is replaced, in the order of a disk's: stopped
-//! at once, on the room it held, and another one started from the same spec, after a wait
-//! growing as they keep going down ([`Restart`]); a route stopped with none to follow (a start
-//! that failed) too. Its start is not the reloads': one route failing holds no other's edit,
-//! and no reload fails for it. A change of the target takes over from it.
+//! A VM that goes down is the route's to replace (`route::VmPool`), its start not the reloads':
+//! one route failing holds no other's edit, and no reload fails for it. A change of the target
+//! takes over from it. A route stopped with none to follow goes on once nothing starts a VM on
+//! its disk ([`Reloader::settled`]).
 //!
 //! The console's edits ([`Edit`]) are reloads too, of the routes as they would
 //! be with them: kept -- written to the console's directory -- only when they
@@ -41,7 +40,7 @@
 //!
 //! A reload's VMs start in a task ([`Ahead`]), in the order of a disk's too, and it is made once
 //! they did, on the routes as they are by then: nothing waits for a boot, which a process never
-//! listening takes a `boot-ms` long ([`Reloader::run`] awaits none). No VM comes back on a disk
+//! listening takes a `boot-ms` long ([`Reloader::run`] awaits none). No route stopped comes back on a disk
 //! such a task starts one on. A later edit of the same app or host takes over from an edit, its
 //! VMs ended (on a disk, stopped: `vm::Vm`'s drop; the next start waits for the disk); a later
 //! change of the files from a reload of them; an edit, on a disk, from a reload, which is made
@@ -60,17 +59,17 @@ use sluice_wicket_tunnel::routes::{Binding, Routes};
 use sluice_wicket_tunnel::tunnel::TunnelIo;
 use sluice_wicket_tunnel::workers::Workers;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use crate::BoxError;
-use crate::capacity::{Capacity, Full, Slot};
+use crate::capacity::{Capacity, Full};
 use crate::config::{File, Origin, RouteSource};
 use crate::deployed::{self, AppSpec, Deployed, Options};
 use crate::listener;
 use crate::output::Sink;
-use crate::route::{Backoff, Down, Lease, Route, RouteSpec, Starting};
+use crate::route::{Lease, Route, RouteSpec, Starting};
 use crate::vm::Places;
 use crate::wire;
 
@@ -217,7 +216,6 @@ impl Binding for Connection {
             Ok(()) => ending.finish(),
             Err(e) => {
                 eprintln!("conn {conn_id} ({}): {e}", self.route.label());
-                self.route.suspect();
                 ending.fail(&e.to_string());
             }
         }
@@ -282,44 +280,6 @@ enum Files {
     Followed,
     /// Leaves them, for a reload of the files: an edit.
     Aside,
-}
-
-/// A target's shared VM going down, and being started again.
-#[derive(Default)]
-struct Restart {
-    /// The VMs started so, since its spec was new.
-    count: u64,
-    /// The wait before its next start.
-    backoff: Backoff,
-    /// Since when its VM is up, once one was started so.
-    up: Option<SystemTime>,
-    /// The room of the VM that went down: none after a reload stopped it.
-    held: Option<Arc<Slot>>,
-    /// The stop of the VM that went down, which its next start waits for.
-    stopping: Option<JoinHandle<()>>,
-    /// Its start under way, ended with it: [`Restarted::attempt`] tells the one it is.
-    starting: Option<AbortOnDropHandle<()>>,
-    attempt: u64,
-}
-
-impl Restart {
-    /// Its VM went down at `now`.
-    fn went_down(&mut self, now: SystemTime) {
-        let lived = self.up.and_then(|up| now.duration_since(up).ok());
-        self.backoff.went_down(lived);
-    }
-
-    /// The wait before its next start; the one after it is longer.
-    fn next_wait(&mut self) -> Duration {
-        self.backoff.next_wait()
-    }
-}
-
-/// A start of a [`Restart`] ended.
-struct Restarted {
-    target: String,
-    attempt: u64,
-    started: Result<Started, BoxError>,
 }
 
 /// What a reload changed, by host.
@@ -597,22 +557,14 @@ struct Swapping<F> {
     holder: Arc<Route>,
     target: String,
     start: F,
-    /// The holder's target and what starts it again, as long as it is one the routes advertise.
-    back: Option<(String, F)>,
-}
-
-/// A route stopped for a swap that failed, and the VM started again in its place.
-struct Back {
-    target: String,
-    was: Arc<Route>,
-    started: Started,
+    /// The holder goes on, a swap failing: it is one the routes advertise.
+    back: bool,
 }
 
 /// The starts of an [`Ahead`] ended.
 struct StartedAhead {
     id: u64,
     started: Result<Vms, BoxError>,
-    back: Vec<Back>,
 }
 
 /// What an edit of the routes comes to.
@@ -650,18 +602,11 @@ pub struct Reloader {
     file: Option<Box<File>>,
     /// A reload of the files to make once no edit starts a VM on a disk it would: its reason.
     reload_due: Option<String>,
-    /// Targets whose shared VM went down -> how that goes.
-    restarts: HashMap<String, Restart>,
-    attempts: u64,
     /// Reloads waiting for their VMs, by a number of their own.
     ahead: HashMap<u64, Ahead>,
     next_ahead: u64,
     started_ahead: mpsc::UnboundedReceiver<StartedAhead>,
     tell_started_ahead: mpsc::UnboundedSender<StartedAhead>,
-    downs: mpsc::UnboundedReceiver<Down>,
-    tell_down: mpsc::UnboundedSender<Down>,
-    restarted: mpsc::UnboundedReceiver<Restarted>,
-    tell_restarted: mpsc::UnboundedSender<Restarted>,
 }
 
 impl Reloader {
@@ -676,8 +621,6 @@ impl Reloader {
         workers: Arc<Workers>,
         stops: TaskTracker,
     ) -> Result<Reloader, BoxError> {
-        let (tell_down, downs) = mpsc::unbounded_channel();
-        let (tell_restarted, restarted) = mpsc::unbounded_channel();
         let (tell_started_ahead, started_ahead) = mpsc::unbounded_channel();
         let mut reloader = Reloader {
             routes: Routes::new(Table {
@@ -700,16 +643,10 @@ impl Reloader {
             read: HashMap::new(),
             file: None,
             reload_due: None,
-            restarts: HashMap::new(),
-            attempts: 0,
             ahead: HashMap::new(),
             next_ahead: 0,
             started_ahead,
             tell_started_ahead,
-            downs,
-            tell_down,
-            restarted,
-            tell_restarted,
         };
         // read before it: a change while it starts is a change for the next poll
         reloader.read = stamps(reloader.source.config());
@@ -719,7 +656,7 @@ impl Reloader {
         let starting: Vec<_> = plan
             .starts
             .into_iter()
-            .map(|start| (start.target.clone(), reloader.starter(start, None)))
+            .map(|start| (start.target.clone(), reloader.starter(start)))
             .collect();
         let started = all_started(starting).await?;
         reloader.publish(specs, started, Moved::new());
@@ -737,8 +674,8 @@ impl Reloader {
 
     /// Reloads on SIGHUP (`hangups`) and on a change of the routes' files,
     /// polled every `interval` (zero: never), applies each of the console's
-    /// `requests`, drops a removed target once every stream acknowledged
-    /// its removal and starts again a shared VM that went down; until `stop`.
+    /// `requests` and drops a removed target once every stream acknowledged
+    /// its removal; until `stop`.
     pub async fn run(
         mut self,
         interval: Duration,
@@ -782,14 +719,6 @@ impl Reloader {
                 Some(started) = self.started_ahead.recv() => {
                     self.ahead_ended(started);
                     seen = self.watched();
-                    continue;
-                }
-                Some(down) = self.downs.recv() => {
-                    self.went_down(down);
-                    continue;
-                }
-                Some(restarted) = self.restarted.recv() => {
-                    self.restart_ended(restarted);
                     continue;
                 }
                 Some(()) = hangups.recv() => "SIGHUP",
@@ -876,13 +805,25 @@ impl Reloader {
         }
     }
 
-    /// What is left to do once a reload was made or a task started: a reload that was to wait,
-    /// the VMs to start again.
+    /// What is left to do once a reload was made or a task started: a reload that was to wait, a
+    /// route stopped for a swap that did not come to serve its target, nothing starting a VM on
+    /// its disk.
     fn settled(&mut self) {
         if let Some(reason) = self.reload_due.take() {
             self.reload(&reason);
         }
-        self.tend_restarts();
+        for started in self.started.values() {
+            let on_disk = started.spec.vm.disk.as_ref();
+            if started.route.stopped()
+                && on_disk.is_none_or(|disk| {
+                    let file = std::slice::from_ref(&disk.file);
+                    !self.ahead.values().any(|ahead| ahead.claims(file))
+                })
+            {
+                eprintln!("route {}: its VM starts again", started.route.label());
+                started.route.resume();
+            }
+        }
     }
 
     /// The edit as it goes on: a deploy's image kept.
@@ -1138,7 +1079,6 @@ impl Reloader {
                 self.taken_over(id, &why);
             }
         }
-        self.restarts_end_on(&disks);
         let images = match self.source.deployed() {
             Some(deployed) => plan
                 .specs()
@@ -1151,26 +1091,26 @@ impl Reloader {
         let Plan { starts, swaps, .. } = plan;
         let starts: Vec<_> = starts
             .into_iter()
-            .map(|start| (start.target.clone(), self.starter(start, None)))
+            .map(|start| (start.target.clone(), self.starter(start)))
             .collect();
         let swaps: Vec<_> = swaps
             .into_iter()
-            .map(|(holder, start)| {
-                let back = self.back_of(&holder);
-                Swapping {
-                    holder,
-                    target: start.target.clone(),
-                    start: self.starter(start, None),
-                    back: back.map(|back| (back.target.clone(), self.starter(back, None))),
-                }
+            .map(|(holder, start)| Swapping {
+                back: self
+                    .started
+                    .values()
+                    .any(|started| Arc::ptr_eq(&started.route, &holder)),
+                holder,
+                target: start.target.clone(),
+                start: self.starter(start),
             })
             .collect();
         self.next_ahead += 1;
         let id = self.next_ahead;
         let tell = self.tell_started_ahead.clone();
         let task = tokio::spawn(async move {
-            let (started, back) = started_ahead(starts, swaps, ready).await;
-            let _ = tell.send(StartedAhead { id, started, back });
+            let started = started_ahead(starts, swaps, ready).await;
+            let _ = tell.send(StartedAhead { id, started });
         });
         println!("routes reload ({reason}): its VMs starting");
         self.ahead.insert(
@@ -1185,55 +1125,14 @@ impl Reloader {
         );
     }
 
-    /// What starts `holder` again, as long as it is a route the routes advertise.
-    fn back_of(&self, holder: &Arc<Route>) -> Option<Start> {
-        let (target, was) = self
-            .started
-            .iter()
-            .find(|(_, started)| Arc::ptr_eq(&started.route, holder))?;
-        Some(Start {
-            target: target.clone(),
-            spec: was.spec.clone(),
-            hosts: self.hosts_of(target),
-            stamps: was.stamps.clone(),
-        })
-    }
-
-    /// A start on one of `disks` takes over from the start of the VM that went down there, on
-    /// its room.
-    fn restarts_end_on(&mut self, disks: &[PathBuf]) {
-        for (target, started) in &self.started {
-            let on = started.spec.vm.disk.as_ref();
-            if on.is_some_and(|disk| disks.contains(&disk.file))
-                && let Some(restart) = self.restarts.get_mut(target)
-            {
-                restart.starting = None;
-                restart.attempt = 0;
-                restart.held = None;
-            }
-        }
-    }
-
     /// The VMs of a reload started: it is made, of the routes as they are by now, or waits for
     /// what they need by then. Of one that was taken over: nothing, the VMs ending. Not started:
     /// it fails, the routes stopped for it back as far as they could.
     fn ahead_ended(&mut self, started: StartedAhead) {
-        let StartedAhead { id, started, back } = started;
+        let StartedAhead { id, started } = started;
         let Some(ahead) = self.ahead.remove(&id) else {
             return;
         };
-        for Back {
-            target,
-            was,
-            started,
-        } in back
-        {
-            let serves = self.started.get(&target);
-            if serves.is_some_and(|serves| Arc::ptr_eq(&serves.route, &was)) {
-                started.route.rename(&self.hosts_of(&target));
-                self.serve(target, started);
-            }
-        }
         let Ahead {
             awaited, reason, ..
         } = ahead;
@@ -1272,152 +1171,6 @@ impl Reloader {
             .collect()
     }
 
-    /// A shared VM serves no more: it is stopped, its room held, another one to start. Of a
-    /// route replaced or removed since, or that a reload stopped: nothing.
-    fn went_down(&mut self, down: Down) {
-        let found = self
-            .started
-            .iter()
-            .find(|(_, started)| started.route.id() == down.route)
-            .filter(|(_, started)| !started.route.stopped());
-        let Some((target, started)) = found else {
-            return;
-        };
-        let (target, route) = (target.clone(), started.route.clone());
-        eprintln!("route {}: {}; its VM stopped", route.label(), down.why);
-        route.set_down(down.why.to_string());
-        let restart = self.restarts.entry(target).or_default();
-        restart.went_down(SystemTime::now());
-        // what starts on its disk takes room of its own
-        let replaced = route.vm().disk.as_ref().is_some_and(|disk| {
-            let file = std::slice::from_ref(&disk.file);
-            self.ahead.values().any(|ahead| ahead.claims(file))
-        });
-        if !replaced {
-            let memory = u64::from(route.vm().mem_mib);
-            restart.held = Some(Arc::new(self.capacity.hold(memory)));
-        }
-        restart.stopping = Some(tokio::spawn(route.stopping()));
-        self.status.send_modify(|status| status.revision += 1);
-        self.tend_restarts();
-    }
-
-    /// Starts again, each in a task and after its wait, the targets stopped with no start under
-    /// way, nor a reload's starting a VM on their disk; forgets the restarts of the targets gone.
-    fn tend_restarts(&mut self) {
-        let started = &self.started;
-        self.restarts
-            .retain(|target, _| started.contains_key(target));
-        let restarts = &self.restarts;
-        let ahead = &self.ahead;
-        let due: Vec<(String, RouteSpec, Stamps)> = started
-            .iter()
-            .filter(|(target, started)| {
-                started.route.stopped()
-                    && restarts
-                        .get(*target)
-                        .is_none_or(|restart| restart.starting.is_none())
-                    && started.spec.vm.disk.as_ref().is_none_or(|disk| {
-                        let file = std::slice::from_ref(&disk.file);
-                        !ahead.values().any(|ahead| ahead.claims(file))
-                    })
-            })
-            .map(|(target, started)| (target.clone(), started.spec.clone(), started.stamps.clone()))
-            .collect();
-        for (target, spec, stamps) in due {
-            let hosts = self.hosts_of(&target);
-            let restart = self.restarts.entry(target.clone()).or_default();
-            let wait = restart.next_wait();
-            let (held, stopping) = (restart.held.clone(), restart.stopping.take());
-            self.attempts += 1;
-            let attempt = self.attempts;
-            restart.attempt = attempt;
-            eprintln!(
-                "route {}: its VM starts again in {}ms",
-                hosts.join(", "),
-                wait.as_millis()
-            );
-            let start = Start {
-                target: target.clone(),
-                spec,
-                hosts,
-                stamps,
-            };
-            let start = self.starter(start, held);
-            let tell = self.tell_restarted.clone();
-            let starting = {
-                let target = target.clone();
-                tokio::spawn(async move {
-                    if let Some(stopping) = stopping {
-                        let _ = stopping.await;
-                    }
-                    tokio::time::sleep(wait).await;
-                    let started = start.await;
-                    let _ = tell.send(Restarted {
-                        target,
-                        attempt,
-                        started,
-                    });
-                })
-            };
-            let restart = self.restarts.get_mut(&target).expect("just there");
-            restart.starting = Some(AbortOnDropHandle::new(starting));
-        }
-    }
-
-    /// A start of a shared VM ended: it serves the route, or the next one is due. Of one a change
-    /// of the target took over from: nothing.
-    fn restart_ended(&mut self, restarted: Restarted) {
-        let Restarted {
-            target,
-            attempt,
-            started,
-        } = restarted;
-        let hosts = self.hosts_of(&target);
-        let restart = self
-            .restarts
-            .get_mut(&target)
-            .filter(|restart| restart.attempt == attempt);
-        let Some(restart) = restart else {
-            return;
-        };
-        restart.starting = None;
-        match started {
-            Ok(started) => {
-                restart.count += 1;
-                restart.up = Some(SystemTime::now());
-                restart.held = None;
-                started.route.set_restarts(restart.count);
-                started.route.rename(&hosts);
-                self.serve(target, started);
-            }
-            Err(e) => {
-                eprintln!("route {}: its VM's start failed: {e}", hosts.join(", "));
-                if let Some(started) = self.started.get(&target) {
-                    started.route.set_down(format!("its start failed: {e}"));
-                }
-            }
-        }
-        self.status.send_modify(|status| status.revision += 1);
-        self.tend_restarts();
-    }
-
-    /// `started` serves `target` from now on, in the generation it is: nothing to advertise.
-    fn serve(&mut self, target: String, started: Started) {
-        let current = self.routes.current();
-        let mut routes = current.routes.clone();
-        routes.insert(target.clone(), started.route.clone());
-        started.route.watch(self.tell_down.clone());
-        self.started.insert(target, started);
-        self.routes.publish(Table {
-            generation: current.generation,
-            advertised: current.advertised.clone(),
-            routes,
-            origins: current.origins.clone(),
-            console: current.console,
-        });
-    }
-
     /// The files the routes come from, as they are now.
     fn watched(&self) -> Stamps {
         let mut paths: Vec<&Path> = self.source.config().into_iter().collect();
@@ -1448,7 +1201,7 @@ impl Reloader {
         files: Files,
         free: &[String],
     ) -> Way {
-        // stopped too: it comes back by itself, no reload failing for it
+        // stopped too: it goes on by itself, no reload failing for it
         if self
             .started
             .get(target)
@@ -1508,8 +1261,6 @@ impl Reloader {
             };
             if self.started.contains_key(&target) {
                 change.restarted.extend(hosts.iter().cloned());
-                // this start took over: on no room held, and with no wait
-                self.restarts.remove(&target);
             }
             started.route.rename(&hosts);
             // they may have changed as it started
@@ -1573,9 +1324,6 @@ impl Reloader {
                 Some((target, kept))
             })
             .collect();
-        for new in new.values() {
-            new.route.watch(self.tell_down.clone());
-        }
         started.extend(new);
         let mut routes: HashMap<String, Arc<Route>> = started
             .iter()
@@ -1602,11 +1350,10 @@ impl Reloader {
         change
     }
 
-    /// What starts `start`, the next place's, on the room `held` holds or else taking it.
+    /// What starts `start`, the next place's.
     fn starter(
         &mut self,
         start: Start,
-        held: Option<Arc<Slot>>,
     ) -> impl Future<Output = Result<Started, BoxError>> + Send + 'static + use<> {
         let Start {
             spec,
@@ -1620,10 +1367,10 @@ impl Reloader {
             places: self.places.clone(),
             n,
             capacity: self.capacity.clone(),
-            held,
             sink: self.sink.clone(),
             workers: self.workers.clone(),
             stops: self.stops.clone(),
+            status: self.status.clone(),
         };
         async move {
             let route = Route::start(spec.clone(), &hosts, starting)
@@ -1707,19 +1454,17 @@ fn targets(specs: Vec<RouteSpec>) -> Vec<(String, RouteSpec, Vec<String>)> {
 
 /// What an [`Ahead`] does: `starts`, then each of `swaps` in the order of a disk's: the route
 /// holding it stopped, its VM started; `ready` going along. A swap failing ends the VMs swapped
-/// in, and starts the routes it stopped again on their disks.
+/// in, and has the routes it stopped go on, on their disks: back, their first VM up, or the failure
+/// says so.
 async fn started_ahead<F>(
     starts: Vec<(String, F)>,
     swaps: Vec<Swapping<F>>,
     ready: Vms,
-) -> (Result<Vms, BoxError>, Vec<Back>)
+) -> Result<Vms, BoxError>
 where
     F: Future<Output = Result<Started, BoxError>> + Send + 'static,
 {
-    let mut new = match all_started(starts).await {
-        Ok(new) => new,
-        Err(e) => return (Err(e), Vec::new()),
-    };
+    let mut new = all_started(starts).await?;
     new.extend(ready);
     let mut swapped = Vec::new();
     let mut stopped = Vec::new();
@@ -1739,22 +1484,17 @@ where
                     }
                 }
                 drop(new);
-                let mut back = Vec::new();
                 let mut failed = None;
-                for (was, way_back) in stopped {
-                    let Some((target, start)) = way_back else {
+                for (was, back) in stopped {
+                    if !back {
                         continue;
-                    };
-                    match start.await {
-                        Ok(started) => back.push(Back {
-                            target,
-                            was,
-                            started,
-                        }),
-                        Err(again) => failed = Some(again),
+                    }
+                    was.resume();
+                    if let Err(again) = was.resumed().await {
+                        failed = Some(again);
                     }
                 }
-                let error = match failed {
+                return Err(match failed {
                     None => e,
                     Some(again) => {
                         let message = format!(
@@ -1766,12 +1506,11 @@ where
                             false => message.into(),
                         }
                     }
-                };
-                return (Err(error), back);
+                });
             }
         }
     }
-    (Ok(new), Vec::new())
+    Ok(new)
 }
 
 /// Runs the starts at once: the first failure ends the others, and with them their VMs and files.
@@ -1849,7 +1588,7 @@ fn taken(edit: &Edit, origins: &HashMap<String, Origin>) -> Result<(), Refused> 
     Ok(())
 }
 
-/// Whether the routes can start within `capacity`: their shared VMs and their pools' warm VMs for
+/// Whether the routes can start within `capacity`: their booted VMs and their pools' warm VMs for
 /// good, and a template at a time beside the other routes' (its own come as it is gone).
 fn fits(specs: &[(RouteSpec, Origin)], capacity: &Capacity) -> Result<(), BoxError> {
     let mut targets: Vec<(String, &RouteSpec)> = Vec::new();
@@ -1871,7 +1610,7 @@ fn fits(specs: &[(RouteSpec, Origin)], capacity: &Capacity) -> Result<(), BoxErr
         .fold(in_memory, u64::max);
     if vms > capacity.max_vms() || capacity.max_memory().is_some_and(|max| memory > max) {
         return Err(format!(
-            "the routes need {vms} VM(s) and {memory} MiB of guest memory to start (their shared \
+            "the routes need {vms} VM(s) and {memory} MiB of guest memory to start (their booted \
              VMs, their pools' warm VMs, and a template at a time beside the other routes'): over \
              --max-vms {} / --max-memory {}",
             capacity.max_vms(),
@@ -1915,12 +1654,17 @@ mod tests {
             ("warm", "0"),
             ("mem", "256"),
         ];
-        let shared: &[(&str, &str)] = &[("mem", "64")];
+        let booted: &[(&str, &str)] = &[("mem", "64")];
+        let scaled: &[(&str, &str)] = &[("mem", "64"), ("vms", "3")];
         for (routes, max_vms, max_memory, fit) in [
             (&[("a", pool), ("b", pool)][..], 2, 128, true),
             (&[("a", pool), ("b", pool)], 1, 128, false),
             (&[("a", pool), ("b", pool)], 2, 127, false),
-            (&[("a", shared), ("b", pool)], 2, 128, true),
+            (&[("a", booted), ("b", pool)], 2, 128, true),
+            // N x mem, all of them for good
+            (&[("a", scaled), ("b", pool)], 4, 256, true),
+            (&[("a", scaled), ("b", pool)], 3, 256, false),
+            (&[("a", scaled), ("b", pool)], 4, 255, false),
             // no VM of its own to take a template's place
             (&[("a", pool), ("b", large)], 1, 320, false),
             (&[("a", pool), ("b", large)], 2, 319, false),
@@ -1934,40 +1678,6 @@ mod tests {
                 "{hosts:?} {max_vms} {max_memory}"
             );
         }
-    }
-
-    /// The wait doubles as a VM keeps going down, up to its bound, and starts over once one
-    /// stayed up long enough.
-    #[test]
-    fn a_restarts_wait_starts_over_after_a_vm_stayed_up() {
-        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let mut restart = Restart::default();
-        restart.went_down(start);
-        assert_eq!(restart.next_wait(), Duration::ZERO, "none started so yet");
-        let waits = [
-            // up, the wait after it, in seconds
-            (0, 1),
-            (0, 2),
-            (0, 4),
-            (30, 8),
-            (59, 16),
-            (60, 0),
-            (0, 1),
-            (65, 0),
-            (0, 1),
-        ];
-        for (up, wait) in waits {
-            restart.up = Some(start);
-            restart.went_down(start + Duration::from_secs(up));
-            let next = restart.next_wait();
-            assert_eq!(next, Duration::from_secs(wait), "{up}s up");
-        }
-        // starts failing: no VM up, no going down in between
-        let failing: Vec<u64> = (0..7).map(|_| restart.next_wait().as_secs()).collect();
-        assert_eq!(failing, [2, 4, 8, 16, 32, 60, 60]);
-        restart.up = Some(start + Duration::from_secs(1));
-        restart.went_down(start);
-        assert_eq!(restart.next_wait(), Duration::ZERO, "the clock set back");
     }
 
     /// A route takes any host alone, from a flag, on a wicket without a console.

@@ -36,6 +36,22 @@ fn epoch_secs(at: SystemTime) -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
+/// An instance kept that is down, as an app's listing names it.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct Crashed {
+    /// As the live access log names it.
+    pub index: usize,
+    #[serde(flatten)]
+    pub shortage: Shortage,
+}
+
+/// `down`, the instances kept that are down and why, lowest index first.
+pub fn crashed(down: BTreeMap<usize, Shortage>) -> Vec<Crashed> {
+    down.into_iter()
+        .map(|(index, shortage)| Crashed { index, shortage })
+        .collect()
+}
+
 /// Why what is kept of an app is short of an instance, as a listing tells it.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Shortage {

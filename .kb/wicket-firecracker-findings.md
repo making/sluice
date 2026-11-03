@@ -11,11 +11,11 @@ Measured on a 64-core x86_64 host, through a sluice server on the same host, wit
 | | boot to accepting | keep-alive req/s | new connection req/s (p50) |
 |---|---|---|---|
 | Java client -> Jetty (TCP) | - | 22,695 | 12,418 (1.3ms) |
-| shared VM, sample guest | 0.70s | 10,762 | 3,060 (5.1ms) |
-| shared VM, sample guest, 2 vCPUs | 0.69s | 13,131 | 5,429 (2.9ms) |
-| shared VM, CNB Java (Jetty, 2 vCPUs, 512 MiB) | 2.0s | 8,228 | - |
-| shared VM, CNB Go | 0.74s | 8,382 | - |
-| shared VM, CNB Go, 4 vCPUs | 0.77s | 14,991 | - |
+| booted VM, sample guest | 0.70s | 10,762 | 3,060 (5.1ms) |
+| booted VM, sample guest, 2 vCPUs | 0.69s | 13,131 | 5,429 (2.9ms) |
+| booted VM, CNB Java (Jetty, 2 vCPUs, 512 MiB) | 2.0s | 8,228 | - |
+| booted VM, CNB Go | 0.74s | 8,382 | - |
+| booted VM, CNB Go, 4 vCPUs | 0.77s | 14,991 | - |
 | VM per connection, sample guest, warm=16 | - | - | 1,600 (13.3ms); c=1: 650 (1.5ms) |
 | VM per connection, CNB Java (2 vCPUs, 512 MiB), prime=200, warm=16 | - | - | 689 (18.1ms); c=1: 130 (7.2ms) |
 | clones reused, sample guest | - | 15,979 | 8,918 (1.8ms) |
@@ -35,7 +35,7 @@ New connections per mode. The rates are the sample guest's through the server,
 
 | mode | new connections/s |
 |---|---|
-| `shared` | 3,060 (1 vCPU), 7,072 (4) |
+| `boot` | 3,060 (1 vCPU), 7,072 (4) |
 | `per-connection` | 1,600 (`warm=16`) |
 | `reuse` | 8,918 |
 | `pool` | 7,493 (4 VMs of 1 vCPU) |
@@ -87,9 +87,9 @@ New connections per mode. The rates are the sample guest's through the server,
   refill time, before a clone is handed out, also takes the clone's first page faults out
   of its first request's way (773 to 1,170 req/s).
 
-## A shared VM's rate
+## A booted VM's rate
 
-- **A shared VM is bound by its vCPUs, not Firecracker's VMM thread**: at the rates above
+- **A booted VM is bound by its vCPUs, not Firecracker's VMM thread**: at the rates above
   the VMM thread is at most 57% busy while the vCPUs are at 85-97%: the guest's share of a
   request (a vsock and a loopback TCP leg, `/init`'s relay, the process) is the cost. A
   frame per write and buffered frame reads (`src/wire.rs`) cut the VMM thread's share
@@ -97,7 +97,7 @@ New connections per mode. The rates are the sample guest's through the server,
   vCPU took the sample on 2 vCPUs from 9.3k to 14k req/s. The gap to the Java client is the
   guest's two extra legs.
 - **The guest's allocator gives memory back at once** (musl): a 32KiB frame buffer per
-  connection cost about 10% of a shared VM's new connection rate in page faults; a page is
+  connection cost about 10% of a booted VM's new connection rate in page faults; a page is
   enough (a larger payload is read past it).
 
 ## A clone's clock
@@ -142,10 +142,10 @@ New connections per mode. The rates are the sample guest's through the server,
 
   | | 64 workers | 1 worker | `--workers 4` |
   |---|---|---|---|
-  | server, shared VM (2 vCPUs), keep-alive c=16 | 13.5-13.6k, 116-117us | 15.3-15.8k, 46us | 15.3-16.1k, 44-45us |
+  | server, booted VM (2 vCPUs), keep-alive c=16 | 13.5-13.6k, 116-117us | 15.3-15.8k, 46us | 15.3-16.1k, 44-45us |
   | server, 48 clones, keep-alive c=48 | 30.2-30.4k, 73-74us | 33.0-33.8k, 29-30us | 31.7-32.7k, 30-31us |
   | server, a clone per connection, c=16 | 1,505-1,555, 1,310us | 1,123-1,132, 733-739us | 1,472-1,488, 1,020-1,030us |
-  | `--listen`, shared VM, keep-alive c=16 | 17.4k, 74-76us | 14.7-15.8k, 37-39us | 18.8-20.0k, 61-62us |
+  | `--listen`, booted VM, keep-alive c=16 | 17.4k, 74-76us | 14.7-15.8k, 37-39us | 18.8-20.0k, 61-62us |
   | `--listen`, 48 clones, keep-alive c=48 | 82.4-82.9k, 47-49us | 47.5-49.6k, 20-21us | 87.7-87.9k, 40us |
   | egress, Redis PING over 16 connections (2 vCPUs) | 25.6-30.5k, 62-65us | 15.3-15.4k, 38us | 30.2-31.0k, 52us |
 
@@ -208,7 +208,7 @@ plus its snapshot on the tmpfs (128 MiB, `mem`):
   10s of keep-alive load at c=16, of a pool of 4: its 4 connections cut, no 502, the next
   connections on the others, a VM started in its place (new connections: 2 of 76,896 in
   flight on it answered 502). One VM of 4 vCPUs killed so: every request after it 502
-  (134,863 of 189,509), and the route stays so until a reload: a shared VM is not replaced.
+  (134,863 of 189,509), and the route stayed so until a reload, when a VM booted was not replaced.
 - **A pool's connections spread when they come, not after**: a keep-alive connection stays
   on its VM, so connections waiting for a VM being started take it as it comes, rather than
   all taking the VM first up: 8 keep-alive connections at once on an empty pool
@@ -227,13 +227,13 @@ as a VM's PSS, plus the snapshot on the tmpfs (`du`).
 
 | | first answer | memory | |
 |---|---|---|---|
-| sample guest, shared | 754ms | 73 MiB | |
+| sample guest, booted | 754ms | 73 MiB | |
 | sample guest, pool of one, `Full` | 1,423ms | 24 + 1,024 MiB | 8.1k req/s |
 | sample guest, pool of one, `Diff` | 794ms | 23 + 68 MiB | 9.4k |
-| CNB Go, shared | 873ms | 92 MiB | |
+| CNB Go, booted | 873ms | 92 MiB | |
 | CNB Go, pool of one, `Full` | 1,547ms | 38 + 1,024 MiB | 10.1k |
 | CNB Go, pool of one, `Diff` | 914ms | 37 + 86 MiB | 10.2k |
-| JVM (Jetty, `sluice-example-upstream`), shared | 2,605ms | 201 MiB | |
+| JVM (Jetty, `sluice-example-upstream`), booted | 2,605ms | 201 MiB | |
 | JVM, pool of one, `Full` | 3,328ms | 134 + 1,024 MiB | 6.1k |
 | JVM, pool of one, `Diff` | 2,904ms | 130 + 195 MiB | 5.9k |
 | JVM, pool of 2, `Diff` | 2,959ms | 2 x 111 + 213 MiB | 6.9k |
@@ -245,7 +245,7 @@ as a VM's PSS, plus the snapshot on the tmpfs (`du`).
   private copy for a write: 81 to 86 MiB (Go), 176 to 195 (the JVM) over these loads. `mem` at most,
   what `Full` takes from the start
 - **What a clone writes is there twice**, in the file and privately: the difference of a pool of one
-  from a shared VM, +18 MiB (sample), +31 (Go), +124 (the JVM)
+  from a booted VM, +18 MiB (sample), +31 (Go), +124 (the JVM)
 
 ## A scale
 
@@ -263,22 +263,51 @@ as a VM's PSS, plus the snapshot on the tmpfs (`du`).
   at its next request: harmless, and no way to leave a scale unseen. An app's name tells its VMs
   apart, so its numbers can leave the target. Routes on one image with other numbers have VMs of
   their own, which only their target tells: there it moves with them, as an edit of a file is rare
-- **`-i 1` is a pool of one rather than a shared VM staying as instance 0.** A shared VM has no
-  snapshot to clone instance 1 from. Staying, it saves the table's +18 to +124 MiB for an app never
-  scaled and spares its process a restore; but its first scale takes a template's boot beside it (12s
-  of a CNB Java app, a pool's restore 20ms), a route holds two kinds of VM going down two ways, what
-  runs depends on how it got there (`-i 1` to 2 against `-i 2` after a restart), and a process that
-  does not take a restore fails at its first scale, in production, rather than at its push. A process
-  like that annotates `shared`, one VM: the cost is the +18 to +124 MiB, and a pool's VM going down
-  must be seen as a shared one is. In return its process's end has another VM serving in 83-89ms
-  (`/exit` to the answer, polled), a boot long for a shared VM (0.7-0.8s, 12s of that Java app)
+- **`-i 1` is a pool of one rather than a booted VM by default.** A booted VM has no snapshot to
+  clone instance 1 from, so a scale takes a boot where a restore takes 20ms (12s of a CNB Java app).
+  Staying booted, it saves the table's +18 to +124 MiB for an app never scaled and spares its process
+  a restore; but a process that does not take a restore would fail at its first scale, in production,
+  rather than at its push, if it scaled by clones. A process like that annotates `boot`: `-i N` keeps N
+  VMs, each booted ([below](#booted-vms-against-a-pool)). Replacing one takes a boot long, a clone's
+  83-89ms (`/exit` to the answer, polled)
 - **The VMs past the limit are the highest indices**, by count: a pool of `warm=0` may hold the indices
   0 and 2 at `vms=2`, both within it. By index, the VM of 2 would go while room for another one is
   taken until it did, and a pool holding only it would serve none
-- **A restore failing at `warm=0` is tried again every second**, in room no VM waits for, not left to
-  the next connection: nothing else would end the `CRASHED` of an idle app once its cause is gone. It
-  costs a failing route a Firecracker per second, as `warm` above 0 already does; a pool's success
-  keeps its VM for `keep-ms`, a per-connection route's is killed at once
+- **A restore failing at `warm=0` is tried again**, a pool's with the wait of a VM going down, a warm
+  clone's every second, in room no VM waits for, not left to the next connection: nothing else would
+  end the `CRASHED` of an idle app once its cause is gone. A pool's success keeps its VM for
+  `keep-ms`, a per-connection route's is killed at once
+
+## Booted VMs against a pool
+
+`mode=boot&vms=2` and `mode=pool&vms=2` on one wicket, the sample guest at 1 GiB, 1 vCPU each, release
+build, through `--listen` (no server), `oha` for 5s, memory after that load:
+
+| | first VM up | a VM's PSS | snapshot | keep-alive c=16 | new connections c=16 | a VM killed to all up | again within 60s |
+|---|---|---|---|---|---|---|---|
+| `boot` | 692ms | 69-70 MiB | none | 19,345 req/s | 4,906 | 730-732ms | 1,734-1,742ms |
+| `pool` | 762ms (template, snapshot, restores) | 14 MiB | 68 MiB | 20,715 req/s | 5,530 | 25-36ms | 1,032-1,033ms |
+
+- **N x what a guest touched against a snapshot and N x what a clone wrote**: 2 VMs 140 MiB against 96,
+  10 VMs 700 against 208 (extrapolated from those figures). A JVM's booted VM is 201 MiB
+  ([A snapshot's memory](#a-snapshots-memory)), a clone of a pool of 2 111 beside its 213 MiB
+- **The rates are a pool's**: the same spreading; what is left is what a snapshot's clones share (7%
+  of the keep-alive rate at 2 VMs)
+- **Per VM, the wait before a replacement**: each index holds its own [wait](#disks) (0, 1s, 2s, 4s up to
+  60s, anew after 60s up), so one crashing keeps no other from being replaced at once: killing the two
+  in turn, 730, 732, 1,734, 1,742ms, each VM's second time 1s longer
+- **Up, a boot alone**: a third VM 691ms in its log, 866ms from the file's change to 3 up (two polls
+  of 100ms in it), none other touched, and a CNB Java app's 12s are `cf app`'s to show as they end:
+  `cf scale` returns at once, its count applied to what runs
+- **`cf push` and `cf start` return with the first VM accepting.** The OSS CLI's wait ends at an entry
+  `RUNNING`, or at none (`AnyRunning`, `Empty`), failing once all are `CRASHED`, and Diego starts
+  instances apart: CF does not wait for all of them, and one that crashes refuses nothing. All N would
+  also keep a route away from the VMs up while the slowest boots, and refuse a push for one VM's
+  failure where `cf app` says it. A route's first start fails when all its VMs did
+- **A booted VM's cgroup is its id's**, as a clone's: a route's own, the template's, would hold them
+  all under one VM's `memory.max`
+- **A dial failing kills a clone but has a booted VM looked at**: a restore is 20ms, a boot may be 12s,
+  and what fails a dial may be a guest that is only busy (`DIAL_TIMEOUT`)
 
 ## Jail mode
 
@@ -324,10 +353,10 @@ as a VM's PSS, plus the snapshot on the tmpfs (`du`).
   route's files are bound from mounts of the template made once per route (`open_tree` of
   the wicket's fds: a mount of another namespace cannot be bound in the jail's).
 - **A jailed VM's charge beyond its guest memory is 2.5-3 MiB** (its heap, KVM's
-  structures, page tables of 0.25% of what the guest touched): a shared CNB Java VM (512
+  structures, page tables of 0.25% of what the guest touched): a booted CNB Java VM (512
   MiB, 2 vCPUs) peaked at 248 MiB under load, its limit 564; its clones idle at 5-6 MiB and
   peak at 50-60 MiB under keep-alive load, the route's cgroup holding the 512 MiB snapshot.
-  Jailed, 13.0k keep-alive req/s for the shared JVM, 41.5k over 16 JVM clones, 596 new
+  Jailed, 13.0k keep-alive req/s for the booted JVM, 41.5k over 16 JVM clones, 596 new
   connections/s (689 through the server above).
 - **Docker's seccomp profile refuses `pivot_root`**, `CAP_SYS_ADMIN` or not (`unshare`,
   `mount`, `umount2` pass), and its AppArmor profile mounts: jail mode runs unconfined in a
@@ -346,7 +375,7 @@ nothing of a real host.
 
 Then on an M4 Max, macOS 26.3 ([On a Mac](../sluice-wicket-runtime-firecracker/README.md#on-a-mac): Lima 2.1, `vz`, 8 vCPUs, Ubuntu 24.04's
 6.8 kernel at EL2, KVM's vGICv3), at the wicket's own timeouts: the VM test plain, jailed and
-through the image, and a sluice server on the Mac serving a shared VM and clones over its tunnel
+through the image, and a sluice server on the Mac serving a booted VM and clones over its tunnel
 (http/1.1, h2c, a 5MB POST).
 
 - **Boots contend under nested virtualization**: a guest alone is listening after about 1s, and
@@ -435,7 +464,7 @@ Through the wicket:
   0.7-0.8s). A start failing starts the old VM again, the PUT refused (with a process that never
   listens: 11.5s, the 10s of its boot's bound)
 - a growth, by `/init` at its next mount: online, 0.2s to 64 GiB
-- a shared VM going down, the sample guest on a disk, from its end to the route's listing saying
+- a booted VM going down, the sample guest on a disk, from its end to the route's listing saying
   it is up (polled every 20ms, on the 64-core host; three runs): its process ended 0.79s (64 MiB),
   its `firecracker` killed 0.71-0.74s (128 MiB), the journal replayed. A dial alone says nothing of the process:
   `/init`'s vsock port stays open once the process listened, and `/init` drops the stream of a
@@ -459,8 +488,8 @@ Container memory, measured:
 
 | | container memory |
 |---|---|
-| shared VM, sample guest | 60 MiB |
-| shared VM, CNB Java (2 vCPUs, 512 MiB), after a load | 212 MiB |
+| booted VM, sample guest | 60 MiB |
+| booted VM, CNB Java (2 vCPUs, 512 MiB), after a load | 212 MiB |
 | VM per connection, sample guest, warm=16 | 175 MiB (128 snapshot) |
 | VM per connection, CNB Java, prime=200, warm=16 | 602 MiB (512 snapshot); 694 MiB at start, the template beside its snapshot |
 | the same, 48 keep-alive connections at 17k req/s | 3,277 MiB peak: about 56 MiB per busy JVM clone |
@@ -470,7 +499,7 @@ An idle clone costs its dirty pages (1-4 MiB here), a busy one up to its `mem`.
 ## Through the Docker image
 
 Through the image (`--network host` or a bridge, the same host) the cases above are within the
-spread of runs outside it: two runs each, e.g. a shared VM on 2 vCPUs
+spread of runs outside it: two runs each, e.g. a booted VM on 2 vCPUs
 13.5-13.8k keep-alive req/s (outside 13.8-13.9k, bridged 13.6-13.9k), a VM per connection
 1,603-1,614 new connections/s (outside 1,598-1,615, bridged 1,614-1,652), CNB Java per
 connection 647-737 (outside 623-672).

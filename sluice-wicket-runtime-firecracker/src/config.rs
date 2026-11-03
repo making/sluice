@@ -30,8 +30,9 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
                                   route alone without --console whatever the host, an
                                   unknown host answered 404
   --vm <host>=<rootfs>[?<opts>]   a route served by Firecracker microVMs booted from the
-                                  rootfs; repeatable. mode=shared (default: one VM serves
-                                  every connection), mode=per-connection (a VM cloned from
+                                  rootfs; repeatable. mode=boot (default: vms=N VMs, 1, each
+                                  booted, none restored, each serving many connections),
+                                  mode=per-connection (a VM cloned from
                                   a snapshot per connection; warm=N kept restored ahead,
                                   prime=N GET / sent before the snapshot, vms=N the
                                   route's VMs at most, wait-ms=N a connection may wait for
@@ -66,7 +67,7 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
   --insecure                      skip the verification of a grpcs:// server
   --max-connections <n>           connections open at once (default 256): the tunnel's,
                                   and --listen's apart
-  --max-vms <n>                   VMs alive at once over every route: shared, warm, in use,
+  --max-vms <n>                   VMs alive at once over every route: booted, warm, in use,
                                   templates (default 64)
   --max-memory <MiB>              their guest memory (mem) at most (default none: --max-vms
                                   x the largest mem bounds it)

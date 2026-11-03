@@ -177,10 +177,22 @@ pub struct ListedApp {
     pub deployed: String,
     /// The instances alive, lowest index first.
     pub alive: Vec<ListedInstance>,
+    /// The VMs it keeps that are down, each starting again.
+    #[serde(default)]
+    pub crashed: Vec<ListedCrashed>,
     /// Why it is short of VMs: one it keeps went down or does not start, or none is alive and
     /// their restores fail.
     #[serde(default)]
     pub down: Option<ListedDown>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct ListedCrashed {
+    /// The wicket's index, as the live access log names it.
+    pub index: u64,
+    pub why: String,
+    /// Since when it goes on, in seconds since the epoch.
+    pub since: u64,
 }
 
 #[derive(Deserialize, Clone, Debug)]

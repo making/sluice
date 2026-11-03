@@ -112,17 +112,16 @@ same start and stop, ring of 512, queue of 4096 and gaps -- as the node
 
 `sluice-wicket-runtime-firecracker --flume URL --flume-token TOKEN` feeds the same way (the
 feed is `sluice-wicket-tunnel`'s) the output of the processes in its VMs, `stdout` /
-`stderr` with the fields `vm` (`vm-0` a shared VM, `template` a cloned route's
+`stderr` with the fields `vm` (`vm-<index>` a booted VM, `template` a cloned route's
 template, `vm-<n>` its clones), `instance` and `line`; the route key is the first host of
 the VM's route, as the VMs of one target serve all its hosts. `vm` names the VM in the
 wicket's run; `instance` is its index among the route's VMs alive:
 
-- a shared VM's is 0, the one started in its place too, and a template's: no other VM of
-  the route lives with it
-- a clone holds the lowest index free from its restore until it is gone, in every cloned
-  mode, warm or serving, an index below the route's `vms`. A pool's `warm` VMs start as
-  `0` to `warm - 1`, one in the place of a VM that failed takes the index it freed, one
-  beyond `warm` the next free. A pool shrinking may leave a gap: `keep-ms` kills the VM
+- a template's is 0: no other VM of the route lives with it
+- a VM holds the lowest index free until it is gone, in every mode but the template's: a pool's
+  (booted or cloned) from its start, another clone from its restore, warm or serving, an index below
+  the route's `vms`. A pool's `warm` VMs start as `0` to `warm - 1`, one in the place of a VM that
+  failed holds its index, one beyond `warm` the next free. A pool shrinking may leave a gap: `keep-ms` kills the VM
   idle longest, of any index
 - a reload starting a route's VMs anew numbers them from 0, beside the old VMs draining,
   as a rolling deployment's new process does on CF

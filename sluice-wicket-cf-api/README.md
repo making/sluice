@@ -436,7 +436,7 @@ curl http://web.localhost:8080/
   `deployed/disks/ops/cf-api.ext4` in the volume. Lost, the apps serve on, a new cf-api leaves
   them (see Behavior)
 - **a crash of the cf-api** (not a stop): the wicket stops its VM and starts another one on the
-  disk, [waiting between starts](../sluice-wicket-runtime-firecracker/README.md#a-shared-vm-going-down)
+  disk, [waiting between starts](../sluice-wicket-runtime-firecracker/README.md#a-vm-going-down)
   if it keeps crashing: a boot long of no API. The apps serve on meanwhile
 
 ### Docker Compose
@@ -617,7 +617,7 @@ The wicket's listing says `runtime: firecracker`.
 | disk | no effect: the rootfs is read-only and `/tmp` a tmpfs of the VM's memory; a persistent disk is the wicket API's, with no CF counterpart |
 | services | none: the listing offers neither capabilities nor keyvalue stores |
 | outbound connections | the [security groups](#security-groups): the route's `egress`. An app reaches no other host |
-| `cf logs` | the process's output, naming the VM (`APP/PROC/WEB/<index>`): a shared VM's 0, a clone's the lowest index free among the VMs alive, so `0` to `instances - 1` in every mode, modulo `instances` for a VM past a scale down finishing its connections: what `cf app` lists. No `RTR` line: this wicket feeds no requests to the flume |
+| `cf logs` | the process's output, naming the VM (`APP/PROC/WEB/<index>`): the lowest index free among the VMs alive, so `0` to `instances - 1` in every mode, modulo `instances` for a VM past a scale down finishing its connections: what `cf app` lists. No `RTR` line: this wicket feeds no requests to the flume |
 | annotations | [how long a VM lives](#how-long-a-vm-lives); `budget-ms`, a component's, is refused |
 
 ### How long a VM lives
@@ -638,18 +638,18 @@ applications:
 
 | annotation `wicket.sluice.ik.am/` | | taken by |
 |---|---|---|
-| `mode` | `shared`, `per-connection`, `reuse` or `pool` | |
+| `mode` | `boot`, `per-connection`, `reuse` or `pool` | |
 | `warm` | VMs kept, from 0 to `instances` | `per-connection`, `reuse`, `pool` |
 | `keep-ms` | how long a VM serving nothing is kept: a pool's beyond its `warm`, which it needs annotated | `reuse`, `pool` |
 | `uses`, `lifetime-ms` | the connections a VM serves, how long it serves | `reuse` |
 | `concurrency` | what an instance takes at once: [the limit](#instances) | `pool`, a component |
 
 - none annotated, a pool of a fixed size, of one VM at 1 instance. A pool keeps `warm` VMs, all of
-  them by default; at `warm: 0` the first request pays a restore. `shared`
-  is one VM booted and never restored from a snapshot, for a process that does not take that: what
-  it opened before its snapshot (a database's connections) is gone in a clone
+  them by default; at `warm: 0` the first request pays a restore. `boot`
+  is `instances` VMs, each booted and never restored from a snapshot, for a process that does not
+  take that: what it opened before its snapshot (a database's connections) is gone in a clone
 - refused, by `cf push`, the v3 API and `cf scale -i`, naming it: an option its mode does not take,
-  none annotated being `pool`, what is no mode or no number, `shared` above 1 instance, `warm` above the
+  none annotated being `pool`, what is no mode or no number, `warm` above the
   instances, a pool's `keep-ms` without a `warm`, `instances`, which `cf scale -i` and `concurrency` replace. A wicket not answering, by
   the app's next start
 - as `budget-ms` and the rest of the sandbox they apply at the next start; `cf scale -i` at once,
@@ -766,21 +766,23 @@ asks for that.
 As on CF, a scale keeps what runs. Up, one more instance starts and none of the others is touched:
 a VM cloned from the app's snapshot in a restore's time, whatever its boot takes, a component's unit
 instantiated. Down, the highest indices take no more requests: a component's unit ends after its
-own, a VM after its connections and its `keep-ms` (60s by default). The server's route does not
-change, so a keep-alive connection stays on its VM. That is why a VM is a pool at 1 instance too: a
-shared VM has no snapshot to clone the second from ([weighed](../.kb/wicket-firecracker-findings.md#a-scale)).
+own, a VM after its connections and its `keep-ms` (60s by default; annotated `boot`, none). The server's
+route does not change, so a keep-alive connection stays on its VM. That is why a VM is a pool at 1
+instance too: the second comes in a restore's time, where `boot` has it take a boot, 12s of a CNB
+Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-findings.md#a-scale)).
 
 | | `-i N` limits | at once |
 |---|---|---|
 | component | `N x concurrency` slots (the route's `instances`); `pool` stays N unless `warm` says | `N x concurrency` requests |
-| `shared` VM (N = 1) | 1 VM | any |
+| `boot` VM | N VMs (`vms`), kept | any |
 | `pool` VM | N VMs (`vms`), `concurrency` the route's `conns` | as `conns` has it |
 | `per-connection`, `reuse` VM | N VMs (`vms`): the memory is N x `mem`, as CF's quota counts it | N connections |
 
 - **`concurrency`** (`wicket.sluice.ik.am/concurrency`) is from 1, 16 by default, the wicket's
   `conns`. `-i 1` with no annotation behaves as a CF app: a component takes 16 requests at once, a
   pool of one VM any number of connections. A component wanting one request at a time per instance
-  annotates 1. A shared VM has none and a VM per connection is 1 by definition: those modes refuse it
+  annotates 1. `boot`, growing none past N, has none to decide and a VM per connection is 1 by
+  definition: those modes refuse it
 - **It means what each can tell.** A component's counts requests, and is hard: one past the limit
   waits for an instance within its `budget-ms`, then gets a 503. A pool VM's counts connections,
   and is soft: the connections a VM holds before the pool grows, at N VMs one more going to the VM
@@ -796,6 +798,9 @@ shared VM has no snapshot to clone the second from ([weighed](../.kb/wicket-fire
   cloned anew: then; those of one index, as `cf logs` has them below: the lowest's). So `3/3` below a limit of 4, and `0/0`,
   `There are no running instances of this process`, with none: no failure, and `cf push`, `cf restart`
   and `--strategy rolling` finish at it, the CLI's wait ending at an entry `RUNNING` or at no entry.
+  So with `boot` they return with the first VM accepting, as on CF, the others coming as they boot,
+  none of them refused for one that fails (`CRASHED` at its index, with why, until another one is up
+  there, the others serving on). All of them failing is the start's failure.
   The CLI counts the entries, so the limit cannot show as `3/4`: entries for the rest would read
   as failed, and at none alive keep that wait until its timeout. The limit is the process's
   `instances` (`cf create-app-manifest`, `cf curl /v3/apps/<guid>/processes/web`)

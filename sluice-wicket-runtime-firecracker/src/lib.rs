@@ -15,7 +15,7 @@
 //! verbatim to a vsock stream of a guest (framed, see `wire`, to carry
 //! half-closes), as the Java client relays to a TCP upstream; the guest's
 //! `/init` relays it on to the process's TCP port (`routes`). A route's VMs
-//! are either one shared VM, or clones of a snapshot -- one per connection,
+//! are either VMs booted, or clones of a snapshot -- one per connection,
 //! reused by the next connections, or a pool serving many each -- (`route`, `vm`),
 //! within the VMs' budget (`capacity`).
 //!
@@ -32,7 +32,7 @@
 //!
 //! `--console` serves a page and an API (`console`) deploying uploaded rootfs
 //! images as routes without a restart, kept in the console's directory
-//! (`deployed`) across restarts. An app's shared VM may have a disk there that
+//! (`deployed`) across restarts. An app's booted VM may have a disk there that
 //! outlives it (`disk`).
 //!
 //! In jail mode (`--jail-ids`) the process started as root is the keeper
@@ -153,7 +153,7 @@ async fn serving(
         }
         None => None,
     };
-    // a shared VM's connections: the tunnel's and the listener's
+    // a VM's connections: the tunnel's and the listener's
     let serving = usize::from(server.is_some()) + usize::from(listen.is_some());
     let (open_files, vm_open_files) = vm::set_open_files(max_connections * serving)?;
     println!("open file limit {open_files}, each VM's {vm_open_files}");

@@ -11,11 +11,11 @@ import {
 } from "/kit.js";
 
 const CLONED = ["per-connection", "reuse", "pool"];
-const MODES = ["shared", ...CLONED];
+const MODES = ["boot", ...CLONED];
 
 // what each mode does, after the README's table
 const MODE_HINTS = {
-  shared: "one VM serves every connection",
+  boot: "VMs each booted, none restored, each serving many connections",
   "per-connection": "a clone of a snapshot per connection, killed when it ends",
   reuse: "a clone per connection at a time, kept for the next ones",
   pool: "clones each serving many connections, grown up to vms",
@@ -33,7 +33,7 @@ const NUMBERS = [
   { key: "cpu", group: "vm", label: "CPU", unit: "% of one", fallback: null, min: 1, modes: MODES, jailed: true },
   { key: "warm", group: "clones", label: "Warm", unit: "ahead", fallback: 0, min: 0, modes: CLONED },
   { key: "prime", group: "clones", label: "Prime", unit: "GET /", fallback: 0, min: 0, modes: CLONED },
-  { key: "vms", group: "clones", label: "VMs", unit: "at most", fallback: null, min: 1, modes: CLONED },
+  { key: "vms", group: "vm", label: "VMs", unit: "at most, boot: kept", fallback: null, min: 1, modes: MODES },
   { key: "wait-ms", group: "clones", label: "Wait", unit: "ms", fallback: 10000, min: 0, modes: CLONED },
   { key: "keep-ms", group: "clones", label: "Keep", unit: "ms", fallback: 60000, min: 1, modes: ["reuse", "pool"] },
   { key: "uses", group: "clones", label: "Uses", unit: "conns", fallback: null, min: 1, modes: ["reuse"] },
@@ -66,13 +66,16 @@ function optionsOf(route) {
       values[key] = String(value);
     }
   }
-  return { mode: route?.mode ?? "shared", values };
+  return { mode: route?.mode ?? "boot", values };
 }
 
-const defaultOptions = () => ({ mode: "shared", values: {} });
+const defaultOptions = () => ({ mode: "boot", values: {} });
 
-/** The default of option `number` under `options` (warm: a pool's vms). */
+/** The default of option `number` under `options` (warm: a pool's vms; vms: one VM booted). */
 function fallbackOf(number, options) {
+  if (number.key === "vms" && options.mode === "boot") {
+    return 1;
+  }
   if (number.key === "warm" && options.mode === "pool") {
     return options.values.vms === undefined || options.values.vms === "" ? null : Number(options.values.vms);
   }
@@ -80,13 +83,13 @@ function fallbackOf(number, options) {
 }
 
 /**
- * `options` as query pairs: the mode unless shared, each option its mode takes that is set to
+ * `options` as query pairs: the mode unless boot, each option its mode takes that is set to
  * other than its default, the egress rules. No value needs escaping but the egress (a host
  * name, an address, a range and a port).
  */
 function optionPairs(options) {
   const pairs = [];
-  if (options.mode !== "shared") {
+  if (options.mode !== "boot") {
     pairs.push(`mode=${options.mode}`);
   }
   for (const number of NUMBERS) {
@@ -165,7 +168,7 @@ function optionFields(initial, onChange) {
           "The destinations its guests may connect to through the wicket, comma-separated: host:port, address:port, range:port ([2001:db8::/32]:443)."))),
     h("div", { class: "field" }, h("span", { class: "field__label" }), h("div", { class: "field__control" }, note)));
 
-  const mode = () => [...radios].find(([, radio]) => radio.checked)?.[0] ?? "shared";
+  const mode = () => [...radios].find(([, radio]) => radio.checked)?.[0] ?? "boot";
   /** Shows the options the mode takes, and a pool's warm default. */
   const show = () => {
     const chosen = mode();
@@ -281,14 +284,8 @@ function modeCell(route) {
 function vmsView(route) {
   const { vms, snapshot } = route;
   const counts = [h("span", { class: "num", title: "its VMs alive, as the budget counts them" }, plural(vms.alive, "VM"))];
-  if (route.mode === "shared") {
-    counts.push(vms.shared ? "up" : "down");
-    if (vms.restarts) {
-      counts.push(`restarted ${plural(vms.restarts, "time")}`);
-    }
-  }
-  else if (route.mode === "pool") {
-    counts.push(`${vms.pooled} pooled`);
+  if (route.mode === "boot" || route.mode === "pool") {
+    counts.push(`${vms.pooled} ${route.mode === "boot" ? "up" : "pooled"}`);
     if (vms.starting) {
       counts.push(`${vms.starting} starting`);
     }
@@ -322,7 +319,7 @@ function budgetStatus(listing) {
   const { budget } = listing;
   const vms = field("budget-vms");
   vms.textContent = `${budget.vms} / ${budget.max_vms}`;
-  vms.title = "VMs alive over every route (shared, warm, in use, kept, pooled, templates) / --max-vms";
+  vms.title = "VMs alive over every route (booted, warm, in use, kept, pooled, templates) / --max-vms";
   const memory = field("budget-memory");
   memory.textContent = budget.max_memory_mib === null || budget.max_memory_mib === undefined
     ? `${budget.memory_mib} MiB`

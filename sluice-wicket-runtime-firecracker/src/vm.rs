@@ -31,7 +31,7 @@
 //! the kernel's command line, which any process of the guest reads, says only that they
 //! are coming.
 //!
-//! An app's shared VM may have a disk (`disk`), a second drive: the launcher takes its lock
+//! An app's booted VM may have a disk (`disk`), a second drive: the launcher takes its lock
 //! for `firecracker`, whose guest's flushes reach the host's disk (`Writeback`: its journal
 //! relies on them across a crash of the host). Its VM is stopped by a notice before it is
 //! killed ([`Vm::stop`]), dropped or not: a start given up drops it, and the stop then runs in a
@@ -269,7 +269,7 @@ pub struct Spec {
     pub egress: Vec<Rule>,
     /// The environment variables of its process, over the image's.
     pub env: Env,
-    /// Its disk: a shared VM's, an app's.
+    /// Its disk: a booted VM's, an app's.
     pub disk: Option<Disk>,
 }
 
@@ -398,7 +398,7 @@ impl Places {
 
 /// Where a route's VMs are started, and their files are; removed with the route.
 pub enum Place {
-    /// The route's directory: `boot`, `snapshot`, `clones/vm-<n>`.
+    /// The route's directory: `boot` (its template), `snapshot`, `clones/vm-<n>`, `vms/vm-<n>`.
     Dir(PathBuf),
     /// The keeper's route, and its snapshot directory.
     Jail {
@@ -596,13 +596,14 @@ impl Vm {
         Ok(())
     }
 
-    /// Boots a fresh VM of `spec` at `place` (cold boot), the route's shared VM or its
-    /// template (`role`); its egress served by `egress` as the VM named so. On a disk, a stop
-    /// as it is dropped goes to `stops`.
+    /// Boots a fresh VM of `spec` at `place` (cold boot), one serving the route or its
+    /// template (`role`), its files in the directory `name` of a place of directories; its egress
+    /// served by `egress` as the VM named so. On a disk, a stop as it is dropped goes to `stops`.
     pub async fn boot(
         spec: &Spec,
         place: &Arc<Place>,
         role: Role,
+        name: &str,
         slot: Slot,
         egress: Option<(&Arc<Egress>, String)>,
         stops: &TaskTracker,
@@ -611,7 +612,7 @@ impl Vm {
             Place::Dir(dir) => (
                 Vm::spawn(
                     &spec.firecracker,
-                    dir.join("boot"),
+                    dir.join(name),
                     vm_file_size(role, u64::from(spec.mem_mib)).max(
                         spec.disk
                             .as_ref()

@@ -1,4 +1,4 @@
-//! An app's disk: a writable drive of its shared VM, a file of the console's directory that
+//! An app's disk: a writable drive of its one booted VM, a file of the console's directory that
 //! outlives the VM, its image and its options. The wicket makes it (`mkfs.ext4`, with a
 //! journal: no fsck runs in a VM, and none of the guest's bytes are parsed on the host), and
 //! `/init` mounts it before the process starts (`wire::DISK_PARAMETER`).

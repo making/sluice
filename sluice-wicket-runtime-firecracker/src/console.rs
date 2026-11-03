@@ -51,7 +51,9 @@ use sluice_wicket_console::http::{
     Body, Edited, Intake, Received, Refusal, Response, error, json, pairs, read, receive,
 };
 use sluice_wicket_console::serve::{self, Service};
-use sluice_wicket_console::status::{Alive, FailureView, Shortage, Status, alive, settled};
+use sluice_wicket_console::status::{
+    Alive, Crashed, FailureView, Shortage, Status, alive, crashed, settled,
+};
 use sluice_wicket_console::store::{
     check_digest, check_host, check_hosts, check_name, check_tag, rfc3339,
 };
@@ -218,7 +220,6 @@ impl Console {
                     vcpus: spec.vm.vcpus,
                     vms: VmsView {
                         alive: vms.alive,
-                        shared: vms.shared,
                         warm: vms.warm,
                         kept: vms.kept,
                         pooled: vms.pooled,
@@ -294,6 +295,7 @@ impl Console {
                 tag: tag.clone(),
                 deployed: deployed.clone(),
                 alive: alive(route.alive()),
+                crashed: crashed(route.crashed()),
                 down: route.down(),
             });
         }
@@ -722,6 +724,9 @@ struct AppView {
     deployed: String,
     /// Its VMs alive, lowest index first.
     alive: Vec<Alive>,
+    /// The VMs it keeps that are down, lowest index first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    crashed: Vec<Crashed>,
     /// Why it is short of VMs, since when ([`Route::down`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     down: Option<Shortage>,
@@ -814,7 +819,6 @@ struct RootfsView {
 #[derive(Serialize)]
 struct VmsView {
     alive: usize,
-    shared: bool,
     warm: usize,
     kept: usize,
     pooled: usize,

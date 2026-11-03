@@ -538,8 +538,8 @@ const DEFAULT_CONCURRENCY: u64 = 16;
 
 /// A rootfs's sandbox on a Firecracker wicket: `instances` VMs at most (from 1: 0 is no app),
 /// living as `lifetime` says. None annotated, a pool of that size cloned from a snapshot, at any
-/// size: a scale adds to the VMs running, and takes from them (a shared VM has no snapshot to
-/// clone another one from). What is not annotated is the wicket's default; a pool's `concurrency`
+/// size: a scale adds to the VMs running, and takes from them, in a restore's time (`boot`, annotated,
+/// a boot's). What is not annotated is the wicket's default; a pool's `concurrency`
 /// is `conns`. Its process has `timeout` seconds to listen, and connects to the destinations of
 /// `egress`.
 fn vm_sandbox(
@@ -554,7 +554,7 @@ fn vm_sandbox(
     Sandbox {
         mode: Some(mode.into()),
         mem: Some(memory_mib),
-        vms: (mode != "shared").then_some(instances),
+        vms: Some(instances),
         warm: lifetime.warm,
         keep_ms: lifetime.keep_ms,
         uses: lifetime.uses,
@@ -593,6 +593,11 @@ fn same(listed: &AppBody, desired: &AppBody) -> bool {
         (None, Some("pool")) => sandbox.vms.unwrap_or(0),
         (None, _) => 0,
     };
+    // booted, 1 goes unlisted
+    let vms = |sandbox: &Sandbox| match sandbox.mode.as_deref() {
+        Some("boot") => Some(sandbox.vms.unwrap_or(1)),
+        _ => sandbox.vms,
+    };
     let keep_ms = |sandbox: &Sandbox| sandbox.keep_ms.unwrap_or(WICKET_DEFAULT_KEEP_MS);
     let conns = |sandbox: &Sandbox| sandbox.conns.unwrap_or(DEFAULT_CONCURRENCY);
     sorted(&listed.hosts) == desired.hosts
@@ -609,7 +614,7 @@ fn same(listed: &AppBody, desired: &AppBody) -> bool {
         && listed.sandbox.keyvalue == desired.sandbox.keyvalue
         && listed.sandbox.mode == desired.sandbox.mode
         && listed.sandbox.mem == desired.sandbox.mem
-        && listed.sandbox.vms == desired.sandbox.vms
+        && vms(&listed.sandbox) == vms(&desired.sandbox)
         && warm(&listed.sandbox) == warm(&desired.sandbox)
         && keep_ms(&listed.sandbox) == keep_ms(&desired.sandbox)
         && conns(&listed.sandbox) == conns(&desired.sandbox)
@@ -779,9 +784,16 @@ mod tests {
             (3, Lifetime::default(), "pool", Some(3), None),
             (
                 1,
-                lifetime(Some("shared"), None, None, None, None),
-                "shared",
+                lifetime(Some("boot"), None, None, None, None),
+                "boot",
+                Some(1),
                 None,
+            ),
+            (
+                3,
+                lifetime(Some("boot"), None, None, None, None),
+                "boot",
+                Some(3),
                 None,
             ),
             (
@@ -890,6 +902,19 @@ mod tests {
         told.keep_ms = None;
         told.conns = Some(3);
         assert!(!same(&body(told), &body(asked)));
+        // booted, one VM unlisted, more listed
+        let booted = |instances| {
+            let lifetime = Lifetime {
+                mode: Some("boot".into()),
+                ..Lifetime::default()
+            };
+            vm_sandbox(64, instances, 60, &BTreeMap::new(), &[], &lifetime)
+        };
+        let mut told = booted(1);
+        told.vms = None;
+        assert!(same(&body(told.clone()), &body(booted(1))));
+        assert!(!same(&body(told), &body(booted(2))));
+        assert!(same(&body(booted(2)), &body(booted(2))));
         // a removal the wicket did not take is tried again, but for another owner's app
         let refused = |status| Failure::Refused {
             status,

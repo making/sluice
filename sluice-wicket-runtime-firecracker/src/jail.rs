@@ -819,9 +819,9 @@ impl Ids {
 /// whose CPU their route's `cpu` caps (`cpu.max`), each a group of the cpu controller,
 /// `uncapped/` the others, without it (their class one group between them): a group per
 /// VM, scheduled on its own, cost 10% of the clone rate. In each, `route-<n>` for a
-/// route's shared VM or template (its snapshot, written by the template, is charged
-/// there as long as the route lives) and `vm-<n>` for a clone, one per uid of [`Ids`]
-/// and reused (no cgroup made and removed per clone).
+/// route's template (its snapshot, which it writes, is charged there as long as the route
+/// lives) and `vm-<n>` for a VM serving, one per uid of [`Ids`] and reused (no cgroup made and
+/// removed per clone).
 pub struct Cgroups {
     /// The parent, absolute.
     dir: PathBuf,

@@ -538,7 +538,7 @@ pub fn check_annotations(
     let takes: &[&str] = match lifetime.mode.as_deref() {
         // what a VM with no mode annotated is, a pool at any count, and a wasm wicket's
         None | Some("pool") => &[WARM_ANNOTATION, KEEP_ANNOTATION, CONCURRENCY_ANNOTATION],
-        Some("shared") => &[],
+        Some("boot") => &[],
         Some("per-connection") => &[WARM_ANNOTATION],
         Some("reuse") => &[
             WARM_ANNOTATION,
@@ -548,7 +548,7 @@ pub fn check_annotations(
         ],
         Some(other) => {
             return Err(format!(
-                "annotation {MODE_ANNOTATION}: '{other}' is no mode: shared, per-connection, \
+                "annotation {MODE_ANNOTATION}: '{other}' is no mode: boot, per-connection, \
                  reuse or pool"
             ));
         }
@@ -584,11 +584,6 @@ pub fn check_annotations(
 
 /// Whether `lifetime` holds at `instances`: at 0 nothing is kept.
 fn check_count(lifetime: &Lifetime, instances: u64) -> Result<(), String> {
-    if lifetime.mode.as_deref() == Some("shared") && instances > 1 {
-        return Err(format!(
-            "{MODE_ANNOTATION}: shared is one VM, for {instances} instances"
-        ));
-    }
     if let Some(warm) = lifetime
         .warm
         .filter(|warm| instances > 0 && *warm > instances)
@@ -927,7 +922,7 @@ mod tests {
         for (pairs, instances, runtime, reason) in [
             // what a mode does not take
             (
-                &[("mode", "shared"), ("warm", "1")][..],
+                &[("mode", "boot"), ("warm", "1")][..],
                 1,
                 Some(Firecracker),
                 "does not take",
@@ -966,7 +961,7 @@ mod tests {
             ),
             // what has no concurrency of its own to set
             (
-                &[("mode", "shared"), ("concurrency", "1")],
+                &[("mode", "boot"), ("concurrency", "1")],
                 1,
                 Some(Firecracker),
                 "does not take",
@@ -1007,7 +1002,6 @@ mod tests {
             (&[("warm", "-1")], 1, None, "no number from 0"),
             (&[("concurrency", "0")], 1, Some(Wasm), "no number from 1"),
             // beyond the cap
-            (&[("mode", "shared")], 2, Some(Firecracker), "one VM"),
             (
                 &[("mode", "pool"), ("warm", "3")],
                 2,
@@ -1037,7 +1031,8 @@ mod tests {
                 2,
                 Some(Firecracker),
             ),
-            (&[("mode", "shared")], 1, Some(Firecracker)),
+            (&[("mode", "boot")], 1, Some(Firecracker)),
+            (&[("mode", "boot")], 3, Some(Firecracker)),
             (
                 &[("mode", "per-connection"), ("warm", "2")],
                 2,
@@ -1064,8 +1059,8 @@ mod tests {
                 2,
                 Some(Firecracker),
             ),
-            // 0 is no VM at all: nothing to be above, a shared VM's one included
-            (&[("mode", "shared")], 0, Some(Firecracker)),
+            // 0 is no VM at all: nothing to be above
+            (&[("mode", "boot")], 0, Some(Firecracker)),
             (&[("mode", "pool"), ("warm", "3")], 0, Some(Firecracker)),
             (
                 &[("warm", "0"), ("budget-ms", "1"), ("concurrency", "1")],
@@ -1103,14 +1098,14 @@ mod tests {
         assert_eq!(concurrency.unwrap().concurrency, Some(5));
         // a push checks the instances it leaves, wherever it sets them
         let mut state = State::new("o", "s", &["localhost".into()]);
-        let shared = "applications:\n- name: a\n  no-route: true\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/mode: shared\n";
-        let manifest = |more: &str| parse(&format!("{shared}{more}")).unwrap();
-        apply(&mut state, &manifest(""), Some(Firecracker)).unwrap();
+        let warm = "applications:\n- name: a\n  no-route: true\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/warm: 3\n";
+        let manifest = |more: &str| parse(&format!("{warm}{more}")).unwrap();
+        apply(&mut state, &manifest("  instances: 3\n"), Some(Firecracker)).unwrap();
         let refused = apply(&mut state, &manifest("  instances: 2\n"), Some(Firecracker));
         assert!(refused.unwrap_err().contains("a: annotation"));
         let web = "  processes:\n  - type: web\n    instances: 2\n";
         let refused = apply(&mut state, &manifest(web), Some(Firecracker));
-        assert!(refused.unwrap_err().contains("one VM"));
+        assert!(refused.unwrap_err().contains("above"));
 
         // a scale holds as the app runs and as annotated, refused naming which
         let guid = state.app_named("a").unwrap().guid.clone();
@@ -1120,8 +1115,8 @@ mod tests {
                 "since": 0}))
             .unwrap()
         };
-        let shared = Lifetime {
-            mode: Some("shared".into()),
+        let booted = Lifetime {
+            mode: Some("boot".into()),
             ..Lifetime::default()
         };
         let warm = Lifetime {
@@ -1132,11 +1127,10 @@ mod tests {
         let as_it_runs = ["as last started", "cf restart"];
         let annotation = ["annotation", "above"];
         for (annotated, ran, started, instances, runtime, refused) in [
-            // the annotation gone since the start: the wicket would refuse it, or stay at one VM
+            // the annotation gone since the start: the wicket would refuse it
             (&[][..], &warm, true, 2, Some(Firecracker), &as_it_runs[..]),
             (&[], &warm, true, 2, Some(Wasm), &as_it_runs),
             (&[], &warm, true, 2, None, &as_it_runs),
-            (&[], &shared, true, 2, Some(Firecracker), &as_it_runs),
             // annotated for the next start, the running app able to
             (
                 &[("mode", "pool"), ("warm", "3")],
@@ -1149,12 +1143,13 @@ mod tests {
             (&[("warm", "3")], &none, true, 2, Some(Wasm), &annotation),
             // nothing runs: the annotations alone
             (&[], &warm, false, 2, Some(Firecracker), &[]),
-            (&[], &shared, false, 2, Some(Firecracker), &[]),
+            (&[], &booted, false, 2, Some(Firecracker), &[]),
             // what it holds
             (&[], &warm, true, 3, Some(Wasm), &[]),
             (&[], &warm, true, 0, Some(Wasm), &[]),
-            (&[], &shared, true, 1, Some(Firecracker), &[]),
-            (&[], &shared, true, 0, Some(Firecracker), &[]),
+            (&[], &booted, true, 2, Some(Firecracker), &[]),
+            (&[], &booted, true, 1, Some(Firecracker), &[]),
+            (&[], &booted, true, 0, Some(Firecracker), &[]),
             (&[], &none, true, 2, Some(Firecracker), &[]),
         ] {
             let kept = state.app_mut(&guid).unwrap();
@@ -1177,7 +1172,7 @@ mod tests {
         // a manifest's count waits for the start that follows: `cf push` restarts the app
         let kept = state.app_mut(&guid).unwrap();
         kept.annotations.clear();
-        kept.running = Some(running(&shared));
+        kept.running = Some(running(&booted));
         kept.started = true;
         let scaled = parse("applications:\n- name: a\n  no-route: true\n  instances: 2\n").unwrap();
         apply(&mut state, &scaled, Some(Firecracker)).unwrap();

@@ -2058,8 +2058,9 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         (
             json!({"wicket.sluice.ik.am/mode": "shared", "wicket.sluice.ik.am/warm": null,
                 "wicket.sluice.ik.am/keep-ms": null, "wicket.sluice.ik.am/concurrency": null}),
-            "one VM",
+            "no mode",
         ),
+        (json!({"wicket.sluice.ik.am/mode": "boot"}), "does not take"),
     ] {
         let refused = annotate(&cf, "fc", &annotation);
         assert!(refused.contains(reason), "{annotation}: {refused}");
@@ -2083,24 +2084,50 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     cf.ok(&["restart", "fc"]);
     let fresh = sandbox().unwrap();
     assert_eq!((&fresh["vms"], &fresh["warm"]), (&1.into(), &0.into()));
-    // a shared VM is one
+    // booted: a VM of its own per instance, none restored. A scale takes what runs: up, it returns
+    // without waiting for the boot, `cf app` listing what is alive; one VM's end is CRASHED at its
+    // index alone, the others serving on, until another one is up there
     cf.ok(&["scale", "fc", "-i", "1"]);
-    let shared = json!({"wicket.sluice.ik.am/mode": "shared", "wicket.sluice.ik.am/warm": null,
+    let booted = json!({"wicket.sluice.ik.am/mode": "boot", "wicket.sluice.ik.am/warm": null,
         "wicket.sluice.ik.am/keep-ms": null, "wicket.sluice.ik.am/concurrency": null});
-    assert!(annotate(&cf, "fc", &shared).contains("\"guid\""));
+    assert!(annotate(&cf, "fc", &booted).contains("\"guid\""));
     cf.ok(&["restart", "fc"]);
-    assert_eq!(sandbox().unwrap()["mode"], "shared");
-    let refused = cf.fails(&["scale", "fc", "-i", "2"]);
-    assert!(refused.contains("one VM"), "{refused}");
+    assert_eq!(sandbox().unwrap()["mode"], "boot");
+    assert_eq!(sandbox().unwrap().get("vms"), None, "one, its default");
     assert_eq!(instances_shown(&cf, "fc"), "1/1");
-    // so with the annotation gone: the running VM stays the one, until the next start
+    let advertised_booted = target();
+    cf.ok(&["scale", "fc", "-i", "3"]);
+    assert_eq!(sandbox().unwrap()["vms"], 3);
+    assert_eq!(target(), advertised_booted, "nothing to advertise");
+    instances_come_to(&cf, "fc", "3/3");
+    let boot_ids: std::collections::BTreeSet<_> = (0..12).map(|_| answered_by().0).collect();
+    assert_eq!(boot_ids.len(), 3, "{boot_ids:?}");
+    // the first start in its place is at once, a boot long: again until `cf app` sees one, each
+    // next one after a longer wait
+    let deadline = Instant::now() + HANG;
+    let crashed = loop {
+        assert_eq!(get(&listen, "fc.localhost", "/exit", None).0, 200);
+        let shown = cf.ok(&["app", "fc"]);
+        if shown.contains("crashed") {
+            break shown;
+        }
+        assert!(Instant::now() < deadline, "no crashed instance: {shown}");
+        instances_come_to(&cf, "fc", "3/3");
+    };
+    assert_eq!(crashed.matches("crashed").count(), 1, "{crashed}");
+    assert_eq!(crashed.matches("running").count(), 2, "{crashed}");
+    assert!(crashed.contains("its process ended"), "{crashed}");
+    assert_eq!(get(&listen, "fc.localhost", "/", None).0, 200, "{crashed}");
+    instances_come_to(&cf, "fc", "3/3");
+    cf.ok(&["scale", "fc", "-i", "1"]);
+    instances_come_to(&cf, "fc", "1/1");
+    assert_eq!(sandbox().unwrap().get("vms"), None);
+    // scaling as it runs: its annotation gone, what runs stays booted until the next start
     annotate(&cf, "fc", &json!({"wicket.sluice.ik.am/mode": null}));
-    let refused = cf.fails(&["scale", "fc", "-i", "2"]);
-    assert!(
-        refused.contains("one VM") && refused.contains("cf restart"),
-        "{refused}"
-    );
-    assert_eq!(instances_shown(&cf, "fc"), "1/1");
+    cf.ok(&["scale", "fc", "-i", "2"]);
+    assert_eq!(sandbox().unwrap()["mode"], "boot");
+    instances_come_to(&cf, "fc", "2/2");
+    cf.ok(&["scale", "fc", "-i", "1"]);
     // per connection, from a cap of one
     annotate(
         &cf,

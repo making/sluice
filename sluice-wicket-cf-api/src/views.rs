@@ -259,7 +259,7 @@ pub fn process(base: &str, state: &State, app: &App) -> Value {
 /// `DOWN` for a stopped app and, of `instances` entries too, `CRASHED` with the wicket's refusal
 /// as `details` and `STARTING` until it serves the app (`listed`, as it answers now). Serving it,
 /// an entry `RUNNING` per instance alive, by the index `cf logs` names, up since its own start,
-/// and `CRASHED` for what it says it is short of, since then: none is a limit not reached, no
+/// and `CRASHED` for what it says is down, since then: none is a limit not reached, no
 /// failure, as is an app the wicket has no reason to serve (at 0, without a route).
 pub fn stats(state: &State, app: &App, owner: &str, listed: Option<&ListedApp>) -> Value {
     let all = |since, state, details: Option<&String>| -> Vec<Entry> {
@@ -316,8 +316,8 @@ struct Entry {
 
 /// The entries of what the wicket lists alive of an app of `instances`, by index, those it names
 /// by one index as one, up since the start of the lowest of them, the one staying as the others
-/// finish; and of what it is short of, at the first index below `instances` no other holds, since
-/// that goes on.
+/// finish; each VM it lists as down at its own index, since that goes on; and what else it is short
+/// of, at the first index below `instances` no other holds.
 fn alive(listed: &ListedApp, instances: u64) -> Vec<Entry> {
     let mut indices = BTreeMap::new();
     for instance in &listed.alive {
@@ -325,15 +325,33 @@ fn alive(listed: &ListedApp, instances: u64) -> Vec<Entry> {
             .entry(crate::flume::listed(instance.index, instances))
             .or_insert(instance.since);
     }
-    let down = listed.down.as_ref().and_then(|down| {
-        let index = (0..instances).find(|index| !indices.contains_key(index))?;
-        Some(Entry {
+    let mut crashed = BTreeMap::new();
+    for down in &listed.crashed {
+        let index = crate::flume::listed(down.index, instances);
+        if !indices.contains_key(&index) {
+            crashed.entry(index).or_insert(down);
+        }
+    }
+    let mut down: Vec<Entry> = crashed
+        .into_iter()
+        .map(|(index, down)| Entry {
             index,
             state: "CRASHED",
             details: Some(down.why.clone()),
             since: down.since,
         })
-    });
+        .collect();
+    if down.is_empty()
+        && let Some(short) = &listed.down
+        && let Some(index) = (0..instances).find(|index| !indices.contains_key(index))
+    {
+        down.push(Entry {
+            index,
+            state: "CRASHED",
+            details: Some(short.why.clone()),
+            since: short.since,
+        });
+    }
     let mut entries: Vec<_> = indices
         .into_iter()
         .map(|(index, since)| Entry {
@@ -888,6 +906,27 @@ mod tests {
                 "{alive}"
             );
         }
+
+        // a VM of 3 down at its own index alone, the others serving on or starting unlisted
+        state.app_mut(&guid).unwrap().process.instances = 3;
+        let mut two = listed(json!([0]), exit_83.clone());
+        two.crashed =
+            serde_json::from_value(json!([{"index": 2, "why": "exit 83", "since": 1}])).unwrap();
+        assert_eq!(
+            entries(&state, Some(&two)),
+            [some(0, "RUNNING"), why(2)],
+            "index 1 still booting"
+        );
+        two.crashed = serde_json::from_value(json!([
+            {"index": 1, "why": "exit 83", "since": 1},
+            {"index": 2, "why": "exit 83", "since": 1},
+        ]))
+        .unwrap();
+        assert_eq!(
+            entries(&state, Some(&two)),
+            [some(0, "RUNNING"), why(1), why(2)]
+        );
+        state.app_mut(&guid).unwrap().process.instances = 2;
 
         // each entry up since its own start: the lowest index's of those it holds; what is short,
         // since it went down

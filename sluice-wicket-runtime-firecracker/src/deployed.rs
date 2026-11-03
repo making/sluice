@@ -771,8 +771,9 @@ mod tests {
             ("disk-mib=lots&disk=/data", "disk-mib=lots is not a number"),
             (
                 "disk=/data&mode=reuse",
-                "disk needs mode=shared: one VM writes",
+                "disk needs mode=boot: one VM writes",
             ),
+            ("disk=/data&vms=2", "disk needs vms=1: one VM writes"),
         ] {
             let refused = options("a.local", &pairs(query));
             assert!(
