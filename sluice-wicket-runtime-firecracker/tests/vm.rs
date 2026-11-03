@@ -3,7 +3,7 @@
 //! http/1.1 with keep-alive, h2c, a 5MB POST under the tunnel's flow control
 //! and a client half-closing after its request; a route of two VMs at most,
 //! one per client address, failing a client's connection past its share at
-//! once and the connection that finds no room in time, its idle connections
+//! once and answering the request that finds no room in time 502, its idle connections
 //! failed and their VMs ended, its clones restored with the clock of the
 //! moment and random state of their own; the VMs'
 //! output -- a shared VM's, a template's, a clone's -- on the wicket's stdout /
@@ -76,8 +76,9 @@ const NONROOT: u32 = 65532;
 /// Jail mode: clone.local's `cpu`, percent of a host CPU.
 const CLONE_CPU: u32 = 50;
 
-/// capped.local's `idle-ms`: above what its checks take before its VMs idle out.
-const CAPPED_IDLE: Duration = Duration::from_secs(5);
+/// capped.local's `idle-ms`: above what its checks take before its VMs idle out, four waits
+/// for room among them.
+const CAPPED_IDLE: Duration = Duration::from_secs(8);
 
 /// reuse.local's and pool.local's `keep-ms`: above what a check of theirs takes
 /// between connections.
@@ -312,7 +313,8 @@ async fn every_route_serves_http_through_the_tunnel() {
             .iter()
             .any(|vm| vm.starts_with(&format!("{}=", route.host)));
         if route.host == "capped.local" {
-            let checked = tokio::time::timeout(HANG, route.capped(&mut conn_id)).await;
+            let capped = route.capped(&mut conn_id, wicket.listening());
+            let checked = tokio::time::timeout(HANG, capped).await;
             assert!(checked.is_ok(), "capped.local: hung; {}", wicket.log());
             continue;
         }
@@ -2057,11 +2059,12 @@ impl Route<'_> {
     /// A route of two VMs, one per client address, cloned for each connection:
     /// a client's second connection fails at once while its first holds its VM,
     /// another client's gets the second VM, and a third client's, finding no
-    /// room, fails unanswered once its wait ran out. Idle past the route's
-    /// `idle-ms`, the connections fail and their VMs end: the first client's
-    /// next connection gets a VM. The clones, restored seconds after the
-    /// snapshot, tell the time of the moment and random values of their own.
-    async fn capped(&self, conn_id: &mut i64) {
+    /// room, is answered 502 saying so once its wait ran out, on the tunnel as on
+    /// `listen`. Idle past the route's `idle-ms`, the connections fail and their
+    /// VMs end: the first client's next connection gets a VM. The clones,
+    /// restored seconds after the snapshot, tell the time of the moment and
+    /// random values of their own.
+    async fn capped(&self, conn_id: &mut i64, listen: std::net::SocketAddr) {
         let mut next = || {
             *conn_id += 1;
             *conn_id
@@ -2093,7 +2096,24 @@ impl Route<'_> {
 
         let (second_sender, _, second_ended) = self.held(next(), "192.0.2.2").await;
         let refused = self.half_closed_from(next(), "192.0.2.3").await;
-        assert!(refused.is_empty(), "no room, no answer: {refused:?}");
+        let no_room = "no room for a VM within 1000ms: a VM per connection, 2 at most";
+        assert!(
+            refused.starts_with("HTTP/1.1 502") && refused.ends_with(no_room),
+            "{refused:?}"
+        );
+        // so on an h2c connection, and on --listen
+        let through = |listen| Route {
+            tunnel: self.tunnel,
+            host: self.host,
+            address: self.address.clone(),
+            listen,
+        };
+        let (status, body) = through(None).request(next(), true, Bytes::new()).await;
+        assert_eq!((status, body.as_str()), (502, no_room));
+        for h2 in [false, true] {
+            let (status, body) = through(Some(listen)).request(0, h2, Bytes::new()).await;
+            assert_eq!((status, body.as_str()), (502, no_room), "--listen, h2 {h2}");
+        }
 
         // idle, the connections fail (cut between answers: hyper's outcome
         // aside), and their VMs end; the senders kept

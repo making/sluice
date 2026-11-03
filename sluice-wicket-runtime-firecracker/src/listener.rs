@@ -7,9 +7,10 @@
 //! nothing first: its guest may speak first. What was read is relayed
 //! verbatim, as the rest: a later request of the connection, an h2 stream or a
 //! keep-alive request, stays on that route whatever its host, and no
-//! `X-Forwarded-*` header is added. An unknown host is answered 404; a
-//! connection that is not HTTP, or whose head runs past `head::MAX_HEAD` or
-//! takes longer than [`HEAD_TIMEOUT`], is closed.
+//! `X-Forwarded-*` header is added. An unknown host is answered 404, a request
+//! finding no room for its VM 502 ([`bad_gateway`]); a connection that is not
+//! HTTP, or whose head runs past `head::MAX_HEAD` or takes longer than
+//! [`HEAD_TIMEOUT`], is closed.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use std::time::Duration;
 use sluice_wicket_tunnel::listener::{self, Replay, host_of};
 use sluice_wicket_tunnel::routes::Routes;
 use sluice_wicket_tunnel::workers::Workers;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::head::{self, Head};
@@ -72,7 +73,10 @@ async fn serve(mut client: Replay<TcpStream>, peer: SocketAddr, routes: &Routes<
             };
             match routes.current().by_host(host_of(head.host())) {
                 Some(route) => route,
-                None => return refuse(&mut client, &head).await,
+                None => {
+                    let message = format!("no firecracker route for host '{}'", head.host());
+                    return answer(&mut client, &head, "404 Not Found", &message).await;
+                }
             }
         }
     };
@@ -87,22 +91,45 @@ async fn serve(mut client: Replay<TcpStream>, peer: SocketAddr, routes: &Routes<
             }
             ended.await;
         }
-        Err(e) => eprintln!("listener ({}): {e}", route.label()),
+        Err(e) => {
+            eprintln!("listener ({}): {e}", route.label());
+            if let Some(why) = route.no_room(&e) {
+                bad_gateway(&mut client, &why).await;
+            }
+        }
     }
 }
 
-/// Answers a connection to an unknown host 404, and closes it: http/1.1, or the
-/// h2 stream of its first request, the connection ended after it (GOAWAY).
-async fn refuse(client: &mut Replay<TcpStream>, head: &Head) {
-    let message = format!("no firecracker route for host '{}'", head.host());
+/// Answers the request of a connection its route found no room for 502, saying `why`: no guest
+/// answers it, and only the wicket knows. False when it is no HTTP request, or none came
+/// within [`HEAD_TIMEOUT`]; a tunnel's connection reads its head here, as a sole route's does.
+pub async fn bad_gateway<S>(client: &mut Replay<S>, why: &str) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(HEAD_TIMEOUT, head::read(client)).await {
+        Ok(Ok(head)) => {
+            answer(client, &head, "502 Bad Gateway", why).await;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Answers a connection `status` with `message`, and closes it: http/1.1, or the h2 stream of
+/// its first request, the connection ended after it (GOAWAY).
+async fn answer<S>(client: &mut Replay<S>, head: &Head, status: &str, message: &str)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let answer = match head {
         Head::Http1 { .. } => format!(
-            "HTTP/1.1 404 Not Found\r\ncache-control: no-store\r\ncontent-length: {}\r\n\
+            "HTTP/1.1 {status}\r\ncache-control: no-store\r\ncontent-length: {}\r\n\
              connection: close\r\n\r\n{message}",
             message.len()
         )
         .into_bytes(),
-        Head::H2 { stream, .. } => h2_not_found(*stream, &message),
+        Head::H2 { stream, .. } => h2_answer(*stream, status, message),
     };
     if client.write_all(&answer).await.is_err() || client.shutdown().await.is_err() {
         return;
@@ -114,15 +141,16 @@ async fn refuse(client: &mut Replay<TcpStream>, head: &Head) {
     .await;
 }
 
-/// The frames answering `stream` 404 with `message`: the server's SETTINGS, the
-/// client's acknowledged, the stream's response, a GOAWAY after it.
-fn h2_not_found(stream: u32, message: &str) -> Vec<u8> {
+/// The frames answering `stream` `status` (its code first) with `message`: the server's SETTINGS,
+/// the client's acknowledged, the stream's response, a GOAWAY after it.
+fn h2_answer(stream: u32, status: &str, message: &str) -> Vec<u8> {
     let frame = |kind: u8, flags: u8, stream: u32, payload: &[u8]| {
         let len = (payload.len() as u32).to_be_bytes();
         [&len[1..], &[kind, flags], &stream.to_be_bytes(), payload].concat()
     };
-    // HPACK: :status 404 (static index 13), cache-control (24): no-store, unindexed
-    let block = [&[0x8d, 0x0f, 0x09, 0x08][..], b"no-store"].concat();
+    // HPACK, unindexed: :status (static index 8), its code, cache-control (24): no-store
+    let code = &status.as_bytes()[..3];
+    let block = [&[0x08, 0x03][..], code, &[0x0f, 0x09, 0x08], b"no-store"].concat();
     let goaway = [stream.to_be_bytes(), 0u32.to_be_bytes()].concat();
     [
         frame(0x4, 0, 0, &[]),

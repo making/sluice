@@ -39,8 +39,8 @@ route's VMs are:
   `warm`
 
 The cloned modes (per-connection, reuse, pool) take `prime`, `warm`, `vms` and `wait-ms`.
-`sluice-wicket-cf-api` sets `vms` by `cf scale -i`, the mode, `warm`, `keep-ms`, `uses` and
-`lifetime-ms` by [annotations](../sluice-wicket-cf-api/README.md#how-long-a-vm-lives).
+`sluice-wicket-cf-api` sets `vms` by `cf scale -i`, the mode, `warm`, `keep-ms`, `uses`,
+`lifetime-ms` and `conns` by [annotations](../sluice-wicket-cf-api/README.md#how-long-a-vm-lives).
 
 | mode | VMs | a connection gets | between connections | idle | a VM failing | memory |
 |---|---|---|---|---|---|---|
@@ -192,8 +192,9 @@ b.local=<rootfs>` a second route). A connection goes to the route of its first r
 (the `Host` header, or the h2c `:authority`; the port left out, the case ignored). A single
 route given by `--vm`, on a wicket without `--console`, takes any host, nothing read first (its
 guest may speak first): not a route of the config file or the console, whose routes come and go.
-An unknown host is answered 404; a connection that is not HTTP, or whose head runs past 64KiB
-or takes over 10s, is closed. A process unaware of h2c answers prior-knowledge h2 with 502, as
+An unknown host is answered 404, a request finding no room for its VM 502 (see [Limits](#limits));
+a connection that is not HTTP, or whose head runs past 64KiB or takes over 10s, is closed. A
+process unaware of h2c answers prior-knowledge h2 with 502, as
 behind the Java client. The head is relayed verbatim with the rest: unlike the server,
 the wicket routes a connection once -- a later request on it (an h2 stream, a keep-alive
 request) for another host stays on the first one's route -- and adds no `X-Forwarded-*`
@@ -538,8 +539,10 @@ template do not fit fails, and so does a reload (a console's edit included).
 
 A connection whose clone finds no room waits for one in turn (one held back by its own
 route's `vms` alone keeps no other route waiting), at most its route's `wait-ms` (default
-10000), then fails with an ERROR (`no room for a VM within ...`), which
-the server answers with `502 Bad Gateway` (HTTP/1.1) or by closing the connection; a pool's
+10000), then its request is answered `502 Bad Gateway`, on the tunnel and on `--listen`, http/1.1
+and h2c, saying so (`no room for a VM within 10000ms: a VM per connection, 2 at most`; the
+budget's numbers stay in the wicket's log). A connection that is no HTTP request fails with an
+ERROR, which the server answers by closing the connection (`--listen`: closed); a pool's
 connection waiting for a VM being started takes one of the VMs up once its `wait-ms` ran out.
 Warm clones take room nobody waits for, and give it up: the first connection in line short of
 room has a spare VM of another route killed -- a warm clone, a reuse route's clone serving

@@ -49,6 +49,7 @@ use std::time::{Duration, SystemTime};
 
 use sluice_wicket_console::http::Received;
 use sluice_wicket_console::status::Status;
+use sluice_wicket_tunnel::listener::Replay;
 use sluice_wicket_tunnel::proto::Upstream;
 use sluice_wicket_tunnel::routes::{Binding, Routes};
 use sluice_wicket_tunnel::tunnel::TunnelIo;
@@ -62,6 +63,7 @@ use crate::BoxError;
 use crate::capacity::{Capacity, Full, Slot};
 use crate::config::{File, Origin, RouteSource};
 use crate::deployed::{self, AppSpec, Deployed, Options};
+use crate::listener;
 use crate::output::Sink;
 use crate::route::{Down, Lease, Route, RouteSpec, Starting};
 use crate::vm::Places;
@@ -184,11 +186,12 @@ pub struct Connection {
 
 impl Binding for Connection {
     /// Relays the connection to a guest stream of the route until both
-    /// directions closed, their CLOSEs passed on. A guest stream that could
-    /// not be had (the client's share of the route taken included), ended
-    /// without its CLOSE, or relaying no byte for the route's `idle-ms`, fails
-    /// the connection with an ERROR: the server drops its client's connection
-    /// instead of ending it as if the answer were complete.
+    /// directions closed, their CLOSEs passed on. A request finding no room for
+    /// its VM is answered so ([`listener::bad_gateway`]). A guest stream that
+    /// could not be had otherwise (the client's share of the route taken
+    /// included), ended without its CLOSE, or relaying no byte for the route's
+    /// `idle-ms`, fails the connection with an ERROR: the server drops its
+    /// client's connection instead of ending it as if the answer were complete.
     async fn serve(self, mut io: TunnelIo) {
         let conn_id = io.conn_id();
         let ending = io.ending();
@@ -197,6 +200,11 @@ impl Binding for Connection {
             Ok(lease) => lease,
             Err(e) => {
                 eprintln!("conn {conn_id} ({}): {e}", self.route.label());
+                if let Some(why) = self.route.no_room(&e)
+                    && listener::bad_gateway(&mut Replay::new(io), &why).await
+                {
+                    return ending.finish();
+                }
                 ending.fail(&format!("guest unreachable: {e}"));
                 return;
             }

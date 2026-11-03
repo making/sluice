@@ -1074,7 +1074,10 @@ impl SharedPool {
                     Some(at) => Some(at),
                     None => {
                         if least.is_none() && members.failures > failures {
-                            return Err(format!("no VM of the pool: {}", members.failed).into());
+                            return Err(match &members.full {
+                                Some(full) => full.clone().into(),
+                                None => format!("no VM of the pool: {}", members.failed).into(),
+                            });
                         }
                         if !waiter.counted {
                             waiter.counted = true;
@@ -1734,6 +1737,22 @@ impl Route {
         if let Backend::Shared { suspects, .. } = &self.backend {
             let _ = suspects.try_send(());
         }
+    }
+
+    /// What the client of a connection failed for `e` is told when that is room for its VM;
+    /// the budget's numbers are the log's.
+    pub fn no_room(&self, e: &BoxError) -> Option<String> {
+        if !e.is::<Full>() {
+            return None;
+        }
+        let within = format!("no room for a VM within {}ms", self.spec.wait.as_millis());
+        Some(match (self.spec.mode, self.spec.vms) {
+            (Mode::PerConnection | Mode::Reuse, Some(vms)) => {
+                format!("{within}: a VM per connection, {vms} at most")
+            }
+            (Mode::PerConnection | Mode::Reuse, None) => format!("{within}: a VM per connection"),
+            _ => within,
+        })
     }
 
     /// A stream to a guest for one connection of `client` (its IP address; empty when
