@@ -1,7 +1,7 @@
 //! Whether a connection relayed on `--listen` has a request in progress, or waits on its client
-//! alone: read from the bytes going by, which are relayed as they are. A request is in progress
-//! from the end of its head until its answer ended and its body too, an h2 connection's while a
-//! stream is open.
+//! alone ([`Standing`]): read from the bytes going by, which are relayed as they are. A request is
+//! in progress from the end of its head until its answer ended and its body too, an h2 connection's
+//! while a stream is open.
 //!
 //! What cannot be told is verbatim for good, its progress never its client's to lose: another
 //! protocol (a guest speaking first, what parses as no HTTP), an upgraded connection or a CONNECT's,
@@ -24,6 +24,17 @@ const RST_STREAM: u8 = 0x3;
 const PUSH_PROMISE: u8 = 0x5;
 const GOAWAY: u8 = 0x7;
 const END_STREAM: u8 = 0x1;
+
+/// What a connection's exchanges wait on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// Its client alone: no request in progress, a head on its way not being one yet.
+    Quiet,
+    /// A request's body its client did not finish, with no request sent whole to wait for.
+    Sending,
+    /// A request sent whole, or what cannot be told.
+    Busy,
+}
 
 /// A connection's exchanges so far, fed what it relayed.
 pub struct Exchanges(Wire);
@@ -82,13 +93,21 @@ impl Exchanges {
         }
     }
 
-    /// True while no request is in progress: a head on its way is not one yet.
-    pub fn waits_on_client(&self) -> bool {
+    pub fn standing(&self) -> Standing {
         match &self.0 {
-            Wire::Unknown(_) => true,
-            Wire::Http1(http1) => http1.owed.is_empty() && matches!(http1.request, Part::Head(_)),
-            Wire::H2(h2) => h2.streams.is_empty(),
-            Wire::Verbatim => false,
+            Wire::Unknown(_) => Standing::Quiet,
+            Wire::Http1(http1) => match (&http1.request, http1.owed.len()) {
+                (Part::Head(_), 0) => Standing::Quiet,
+                // the one owed, if any, is the one sending: its answer begun or not
+                (Part::Body(_), 0 | 1) => Standing::Sending,
+                _ => Standing::Busy,
+            },
+            Wire::H2(h2) => match (h2.streams.len(), h2.sent_whole) {
+                (0, _) => Standing::Quiet,
+                (_, 0) => Standing::Sending,
+                _ => Standing::Busy,
+            },
+            Wire::Verbatim => Standing::Busy,
         }
     }
 
@@ -412,6 +431,8 @@ struct H2 {
     client: Frames,
     guest: Frames,
     streams: HashMap<u32, Stream>,
+    /// How many of the streams their client ended.
+    sent_whole: usize,
     last_stream: u32,
 }
 
@@ -434,9 +455,7 @@ impl H2 {
                     self.ended(id, ended, false);
                 }
                 DATA => self.ended(id, ended, false),
-                RST_STREAM => {
-                    self.streams.remove(&id);
-                }
+                RST_STREAM => self.remove(id),
                 _ => {}
             }
         }
@@ -453,9 +472,7 @@ impl H2 {
             let ended = flags & END_STREAM != 0;
             match kind {
                 HEADERS | DATA => self.ended(id, false, ended),
-                RST_STREAM => {
-                    self.streams.remove(&id);
-                }
+                RST_STREAM => self.remove(id),
                 // an answer no client stream stands for
                 PUSH_PROMISE => return Err(Unreadable),
                 _ => {}
@@ -466,11 +483,18 @@ impl H2 {
 
     fn ended(&mut self, id: u32, client: bool, guest: bool) {
         if let Some(stream) = self.streams.get_mut(&id) {
+            self.sent_whole += usize::from(client && !stream.client);
             stream.client |= client;
             stream.guest |= guest;
             if stream.client && stream.guest {
-                self.streams.remove(&id);
+                self.remove(id);
             }
+        }
+    }
+
+    fn remove(&mut self, id: u32) {
+        if let Some(stream) = self.streams.remove(&id) {
+            self.sent_whole -= usize::from(stream.client);
         }
     }
 }
@@ -484,15 +508,17 @@ mod tests {
         [&len[1..], &[kind, flags], &stream.to_be_bytes(), payload].concat()
     }
 
-    /// Bytes of one side, whether the connection then waits on its client alone.
+    /// Bytes of one side, what the connection then stands at.
     enum Step {
-        Client(&'static [u8], bool),
-        Guest(&'static [u8], bool),
+        Client(&'static [u8], Standing),
+        Guest(&'static [u8], Standing),
     }
+    use Standing::{Busy, Quiet, Sending};
     use Step::{Client, Guest};
 
     /// An exchange ends where its message framing says, each of its bytes arriving alone or all
-    /// together; what cannot be followed never waits on its client again.
+    /// together; what cannot be followed never waits on its client again. A body its client did
+    /// not finish leaves a request not sent whole, whatever came of its answer.
     #[test]
     fn a_request_is_in_progress_until_its_answer_ended() {
         const GET: &[u8] = b"GET / HTTP/1.1\r\nhost: a\r\n\r\n";
@@ -502,40 +528,50 @@ mod tests {
             (
                 "keep-alive",
                 &[
-                    Client(GET, false),
-                    Guest(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh", false),
-                    Guest(b"i", true),
-                    Client(b"GET / HT", true),
-                    Client(b"TP/1.1\r\n\r\n", false),
-                    Guest(OK, true),
+                    Client(GET, Busy),
+                    Guest(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh", Busy),
+                    Guest(b"i", Quiet),
+                    Client(b"GET / HT", Quiet),
+                    Client(b"TP/1.1\r\n\r\n", Busy),
+                    Guest(OK, Quiet),
                 ],
             ),
             (
                 "an answer without a body",
                 &[
-                    Client(b"HEAD / HTTP/1.1\r\n\r\n", false),
-                    Guest(b"HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\n", true),
-                    Client(GET, false),
-                    Guest(b"HTTP/1.1 204 No Content\r\n\r\n", true),
-                    Client(GET, false),
-                    Guest(b"HTTP/1.1 304 Not Modified\r\n\r\n", true),
-                    Client(GET, false),
-                    Guest(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n", true),
+                    Client(b"HEAD / HTTP/1.1\r\n\r\n", Busy),
+                    Guest(b"HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\n", Quiet),
+                    Client(GET, Busy),
+                    Guest(b"HTTP/1.1 204 No Content\r\n\r\n", Quiet),
+                    Client(GET, Busy),
+                    Guest(b"HTTP/1.1 304 Not Modified\r\n\r\n", Quiet),
+                    Client(GET, Busy),
+                    Guest(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n", Quiet),
                 ],
             ),
             (
                 "a request's body and a chunked answer, an interim one first",
                 &[
-                    Client(b"POST / HTTP/1.1\r\ncontent-length: 5\r\n\r\nab", false),
-                    Guest(b"HTTP/1.1 100 Continue\r\n\r\n", false),
+                    Client(b"POST / HTTP/1.1\r\ncontent-length: 5\r\n\r\nab", Sending),
+                    Guest(b"HTTP/1.1 100 Continue\r\n\r\n", Sending),
                     Guest(
                         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, Chunked\r\n\r\n",
-                        false,
+                        Sending,
                     ),
-                    Guest(b"2;x=y\r\nhi\r\nA\r\n0123456789\r\n", false),
-                    Guest(b"0\r\nx: y\r\n\r\n", false),
+                    Guest(b"2;x=y\r\nhi\r\nA\r\n0123456789\r\n", Sending),
+                    Guest(b"0\r\nx: y\r\n\r\n", Sending),
                     // the answer ended, the body has not
-                    Client(b"cde", true),
+                    Client(b"cde", Quiet),
+                ],
+            ),
+            (
+                "a body whose answer is owed once it ended, behind a request sent whole",
+                &[
+                    Client(GET, Busy),
+                    Client(b"POST / HTTP/1.1\r\ncontent-length: 1\r\n\r\n", Busy),
+                    Guest(OK, Sending),
+                    Client(b"a", Busy),
+                    Guest(OK, Quiet),
                 ],
             ),
             (
@@ -544,65 +580,65 @@ mod tests {
                     Client(
                         b"POST / HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n\
                           GET / HTTP/1.1\r\n\r\n",
-                        false,
+                        Busy,
                     ),
-                    Guest(OK, false),
-                    Guest(OK, true),
+                    Guest(OK, Busy),
+                    Guest(OK, Quiet),
                 ],
             ),
             (
                 "a long poll's head with its body to come",
                 &[
-                    Client(GET, false),
-                    Guest(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n", false),
+                    Client(GET, Busy),
+                    Guest(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n", Busy),
                 ],
             ),
-            ("an upgrade", &[Client(GET, false), Guest(b"HTTP/1.1 101 Switching\r\n\r\n", false), Guest(OK, false)]),
+            ("an upgrade", &[Client(GET, Busy), Guest(b"HTTP/1.1 101 Switching\r\n\r\n", Busy), Guest(OK, Busy)]),
             (
                 "a CONNECT",
                 &[
-                    Client(b"CONNECT a:1 HTTP/1.1\r\n\r\n", false),
-                    Guest(b"HTTP/1.1 200 OK\r\n\r\n", false),
-                    Guest(OK, false),
+                    Client(b"CONNECT a:1 HTTP/1.1\r\n\r\n", Busy),
+                    Guest(b"HTTP/1.1 200 OK\r\n\r\n", Busy),
+                    Guest(OK, Busy),
                 ],
             ),
             (
                 "an answer running until its close",
-                &[Client(GET, false), Guest(b"HTTP/1.0 200 OK\r\n\r\nhi", false), Guest(OK, false)],
+                &[Client(GET, Busy), Guest(b"HTTP/1.0 200 OK\r\n\r\nhi", Busy), Guest(OK, Busy)],
             ),
-            ("a guest speaking first", &[Guest(b"220 hello\r\n", false), Client(GET, false)]),
+            ("a guest speaking first", &[Guest(b"220 hello\r\n", Busy), Client(GET, Busy)]),
             (
                 "a guest speaking unasked",
-                &[Client(GET, false), Guest(OK, true), Guest(b"more", false)],
+                &[Client(GET, Busy), Guest(OK, Quiet), Guest(b"more", Busy)],
             ),
-            ("no HTTP", &[Client(b"\x16\x03\x01", false), Guest(OK, false)]),
+            ("no HTTP", &[Client(b"\x16\x03\x01", Busy), Guest(OK, Busy)]),
             (
                 "another protocol after the guest's answer",
-                &[Client(GET, false), Guest(b"+PONG\r\n", false), Guest(OK, false)],
+                &[Client(GET, Busy), Guest(b"+PONG\r\n", Busy), Guest(OK, Busy)],
             ),
             (
                 "a body framed two ways",
                 &[
                     Client(
                         b"POST / HTTP/1.1\r\ncontent-length: 1\r\ntransfer-encoding: chunked\r\n\r\n",
-                        false,
+                        Busy,
                     ),
-                    Guest(OK, false),
+                    Guest(OK, Busy),
                 ],
             ),
             (
                 "a chunk not read as one",
-                &[Client(GET, false), Guest(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nxyz\r\n", false), Guest(OK, false)],
+                &[Client(GET, Busy), Guest(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nxyz\r\n", Busy), Guest(OK, Busy)],
             ),
         ];
         for (name, steps) in cases {
             for alone in [false, true] {
                 let mut exchanges = Exchanges::default();
-                assert!(exchanges.waits_on_client(), "{name}");
+                assert_eq!(exchanges.standing(), Quiet, "{name}");
                 for step in steps.iter() {
-                    let (bytes, waits, client_sent) = match step {
-                        Client(bytes, waits) => (bytes, waits, true),
-                        Guest(bytes, waits) => (bytes, waits, false),
+                    let (bytes, standing, client_sent) = match step {
+                        Client(bytes, standing) => (bytes, standing, true),
+                        Guest(bytes, standing) => (bytes, standing, false),
                     };
                     let pieces: Vec<&[u8]> = match alone {
                         true => bytes.chunks(1).collect(),
@@ -615,8 +651,8 @@ mod tests {
                         }
                     }
                     assert_eq!(
-                        exchanges.waits_on_client(),
-                        *waits,
+                        exchanges.standing(),
+                        *standing,
                         "{name}, one byte at a time: {alone}: {}",
                         String::from_utf8_lossy(bytes)
                     );
@@ -647,44 +683,49 @@ mod tests {
             };
             let mut exchanges = Exchanges::default();
             feed(&mut exchanges, true, &[PREFACE, &settings].concat());
-            assert!(exchanges.waits_on_client());
+            assert_eq!(exchanges.standing(), Quiet);
             assert_eq!(exchanges.goaway(), None, "the guest's preface not sent");
             feed(&mut exchanges, false, &settings);
             assert_eq!(exchanges.goaway(), Some(goaway(0)));
             // a PING is no request; a stream, its response begun, then ended, is
             feed(&mut exchanges, true, &ping);
-            assert!(exchanges.waits_on_client());
+            assert_eq!(exchanges.standing(), Quiet);
             feed(&mut exchanges, true, &frame(HEADERS, END_STREAM, 1, b"x"));
-            assert!(!exchanges.waits_on_client());
+            assert_eq!(exchanges.standing(), Busy);
             feed(&mut exchanges, false, &frame(HEADERS, 0, 1, b"y"));
             feed(&mut exchanges, false, &frame(DATA, 0, 1, b"z"));
-            assert!(!exchanges.waits_on_client());
+            assert_eq!(exchanges.standing(), Busy);
             let answer = frame(DATA, END_STREAM, 1, b"z");
             feed(&mut exchanges, false, &answer[..answer.len() - 1]);
             assert_eq!(exchanges.goaway(), None, "within a frame");
             feed(&mut exchanges, false, &answer[answer.len() - 1..]);
-            assert!(exchanges.waits_on_client());
+            assert_eq!(exchanges.standing(), Quiet);
             assert_eq!(exchanges.goaway(), Some(goaway(1)));
-            // its client's side still open; reset either way
+            // its client's side still open, sending but for another stream's request sent whole;
+            // reset either way
             feed(&mut exchanges, true, &frame(HEADERS, 0, 3, b"x"));
+            assert_eq!(exchanges.standing(), Sending);
+            feed(&mut exchanges, true, &frame(HEADERS, END_STREAM, 9, b"x"));
+            assert_eq!(exchanges.standing(), Busy);
+            feed(&mut exchanges, false, &frame(RST_STREAM, 0, 9, &[0; 4]));
             feed(&mut exchanges, false, &frame(HEADERS, END_STREAM, 3, b"y"));
-            assert!(!exchanges.waits_on_client());
+            assert_eq!(exchanges.standing(), Sending);
             feed(&mut exchanges, true, &frame(DATA, END_STREAM, 3, b"x"));
-            assert!(exchanges.waits_on_client());
+            assert_eq!(exchanges.standing(), Quiet);
             for (client_sent, reset) in [(true, 5), (false, 7)] {
                 feed(&mut exchanges, true, &frame(HEADERS, 0, reset, b"x"));
-                assert!(!exchanges.waits_on_client());
+                assert_eq!(exchanges.standing(), Sending);
                 feed(
                     &mut exchanges,
                     client_sent,
                     &frame(RST_STREAM, 0, reset, &[0; 4]),
                 );
-                assert!(exchanges.waits_on_client());
+                assert_eq!(exchanges.standing(), Quiet);
             }
-            assert_eq!(exchanges.goaway(), Some(goaway(7)));
+            assert_eq!(exchanges.goaway(), Some(goaway(9)));
             // pushing, the guest answers what no stream of the client's stands for
             feed(&mut exchanges, false, &frame(PUSH_PROMISE, 0, 1, &[0; 4]));
-            assert!(!exchanges.waits_on_client());
+            assert_eq!(exchanges.standing(), Busy);
             assert_eq!(exchanges.goaway(), None);
         }
     }
@@ -695,9 +736,9 @@ mod tests {
         let mut exchanges = Exchanges::default();
         let long = format!("GET /{}", "x".repeat(MAX_HEAD - 5));
         for piece in long.as_bytes().chunks(4096) {
-            assert!(exchanges.waits_on_client());
+            assert_eq!(exchanges.standing(), Standing::Quiet);
             exchanges.client_sent(piece);
         }
-        assert!(!exchanges.waits_on_client());
+        assert_eq!(exchanges.standing(), Standing::Busy);
     }
 }

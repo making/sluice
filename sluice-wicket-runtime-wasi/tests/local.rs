@@ -269,20 +269,15 @@ async fn local_mode_routes_by_host_and_keeps_the_keyvalue_file() {
     assert_eq!(get(&address, "a.local", "/").await.1, "hits 24\n");
     assert_eq!(get(&other, "a.local", "/kv/cas-hits").await.1, "20");
 
-    // its one connection taken, the next one waits in the backlog
-    let held = tokio::net::TcpStream::connect(&other).await.unwrap();
-    let waiting = tokio::spawn(async move { get(&other, "a.local", "/kv/cas-hits").await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        !waiting.is_finished(),
-        "answered beyond --max-connections 1"
-    );
-    drop(held);
-    assert_eq!(
-        waiting.await.unwrap().1,
-        "20",
-        "answered once the first closed"
-    );
+    // its one connection left quiet gives way to the next
+    let mut quiet = tokio::net::TcpStream::connect(&other).await.unwrap();
+    assert_eq!(get(&other, "a.local", "/kv/cas-hits").await.1, "20");
+    let mut rest = Vec::new();
+    tokio::time::timeout(HANG, quiet.read_to_end(&mut rest))
+        .await
+        .expect("closed")
+        .unwrap();
+    assert_eq!(rest, b"");
 
     drop(wicket);
     wicket = Wicket::start(&several);

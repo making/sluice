@@ -101,12 +101,29 @@ impl hyper::body::Body for Body {
 
 /// A connection's answer being written, to the last byte: an answer's body ends
 /// with its last frame still to be written, a whole answer's if it has but one.
-struct Writing {
+/// The answer's body ([`Writing::answer`]) and the connection's stream
+/// ([`Unread::writing`]) tell. HTTP/1.1 only: its answers come one at a time.
+pub struct Writing {
     claim: Claim,
     body_ended: AtomicBool,
 }
 
 impl Writing {
+    pub fn new(claim: Claim) -> Arc<Writing> {
+        Arc::new(Writing {
+            claim,
+            body_ended: AtomicBool::new(false),
+        })
+    }
+
+    /// `body`, the connection yielding once it ended and was written.
+    pub fn answer<B>(self: &Arc<Writing>, body: B) -> Answer<B> {
+        Answer {
+            body: Box::pin(body),
+            writing: self.clone(),
+        }
+    }
+
     /// The stream took all it was given: an ended answer's connection yields.
     fn flushed(&self) {
         if self.body_ended.swap(false, Ordering::Relaxed) {
@@ -116,7 +133,7 @@ impl Writing {
 }
 
 /// An answer's body, telling when it ended.
-struct Answer<B> {
+pub struct Answer<B> {
     body: Pin<Box<B>>,
     writing: Arc<Writing>,
 }
@@ -165,7 +182,15 @@ impl<I> Unread<I> {
         }
     }
 
-    fn writing<T>(
+    /// As [`Unread::new`], telling `writing` what was written.
+    pub fn writing(io: I, writing: Arc<Writing>) -> Unread<I> {
+        Unread {
+            writing: Some(writing),
+            ..Unread::new(io)
+        }
+    }
+
+    fn pending<T>(
         &mut self,
         cx: &mut Context<'_>,
         written: Poll<io::Result<T>>,
@@ -197,7 +222,7 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for Unread<I> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let written = Pin::new(&mut self.io).poll_write(cx, buf);
-        self.writing(cx, written)
+        self.pending(cx, written)
     }
 
     fn poll_write_vectored(
@@ -206,7 +231,7 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for Unread<I> {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let written = Pin::new(&mut self.io).poll_write_vectored(cx, bufs);
-        self.writing(cx, written)
+        self.pending(cx, written)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -220,12 +245,12 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for Unread<I> {
         {
             writing.flushed();
         }
-        self.writing(cx, flushed)
+        self.pending(cx, flushed)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let shut = Pin::new(&mut self.io).poll_shutdown(cx);
-        self.writing(cx, shut)
+        self.pending(cx, shut)
     }
 }
 
@@ -243,14 +268,8 @@ where
 {
     let claim = slot.claim();
     claim.yields();
-    let writing = Arc::new(Writing {
-        claim: claim.clone(),
-        body_ended: AtomicBool::new(false),
-    });
-    let io = Unread {
-        writing: Some(writing.clone()),
-        ..Unread::new(io)
-    };
+    let writing = Writing::new(claim.clone());
+    let io = Unread::writing(io, writing.clone());
     let service = hyper::service::service_fn(|request: hyper::Request<Incoming>| {
         // no longer the one that waited longest
         claim.yields();
@@ -260,12 +279,7 @@ where
             claim: claim.clone(),
         }));
         let writing = writing.clone();
-        async move {
-            Ok::<_, Infallible>(answer.await.map(|body| Answer {
-                body: Box::pin(body),
-                writing,
-            }))
-        }
+        async move { Ok::<_, Infallible>(answer.await.map(|body| writing.answer(body))) }
     });
     let connection = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
@@ -288,7 +302,7 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::*;
-    use crate::accept::Open;
+    use crate::accept::{FRESH, Open};
 
     /// How far from [`QUIET`] a bound is taken to expire.
     const NEAR: Duration = Duration::from_secs(1);
@@ -449,7 +463,7 @@ mod tests {
 
             let wanted = open.place(Ipv4Addr::LOCALHOST.into());
             if gives_way {
-                timeout(NEAR, wanted)
+                timeout(FRESH + NEAR, wanted)
                     .await
                     .unwrap_or_else(|_| panic!("kept after {sent:?}"));
                 continue;

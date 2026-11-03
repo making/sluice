@@ -155,6 +155,13 @@ one waiting longest (since it connected, its last request or answer) of the sour
 connections, a source being an address, an IPv6 one by its /64: a client opening many pushes out only
 its own.
 
+For the first second after its accept a connection does not go (`accept::FRESH`), an admitted request
+ending that second. The next waits for it: asked at once, each of a burst past the limit would go
+before its head was read, the next accepted before the task reading it ran (seen with 20 clients on one
+slot), and under a flood no client's head could arrive in time. A flood is so held to the slots per
+second (64 here), the rest waiting in the backlog; a client getting a slot has its second to send a
+head. So the next waits a second at most for connections just opened, none for one there longer.
+
 No fixed limit per address: it would have to fit a browser's 6 and its long poll, and sluice-wicket-cf-api's
 client (one per request at once), and it would refuse the clients sharing an address behind a NAT or a
 proxy, or on `/init`'s relay in a VM. The forwarded address is no help at accept, where a quiet
@@ -163,8 +170,8 @@ connection has sent no header. With one address for all, the longest waiting goe
 All 64 at work for admitted requests, the next waits in the backlog: a long poll ends within 25s, and
 a token's holder may do worse than hold a connection (sluice-wicket-cf-api without a provider hands
 one to anyone: such an API trusts its network). Connections flooding in from many addresses can push
-out a client between its connect and its head, 64 connections later; and an idle connection a client
-reuses just then may fail its request, as with the close at 60s, only while all are taken.
+out a client taking more than its second to its head, 64 connections later; and an idle connection a
+client reuses just then may fail its request, as with the close at 60s, only while all are taken.
 
 ## sluice-wicket-runtime-wasi's `--listen`
 
@@ -194,8 +201,21 @@ timer here would undercut an `idle-timeout` set above a front end's and race the
 on the connection, which nothing could retry. Whoever relays a tunnel connection is a sluice server
 holding a token, and a server's operator turning its limits off asked for that.
 
-The slots of either wicket's `--listen` do not give way as the consoles' do: all taken, the next
-waits in the backlog.
+Whoever can open `--max-connections` connections can open them again, so with all taken the next does
+not wait: one gives way, chosen as the consoles' (the longest waiting of the source holding the most,
+none in its first second), among those with no request in progress: from accept to the end of a
+request's head, and from the last
+byte of an answer written (http/1.1) or its last piece taken (h2, no stream left) to the next head. With
+no gate here, every request counts as admitted, and its budget bounds it. All in progress, the next
+waits in the backlog, within a budget. A body being sent is in progress here: its budget bounds it.
+
+A connection given way is closed at once. An h2 client is told by hyper's GOAWAY first (naming no last
+stream, as its graceful shutdown starts), written as the connection goes without waiting for the PING
+behind it: a client not answering would stall the accept loop, which waits for the slot. So an h2
+connection takes no longer than an http/1.1 one; the client reads the GOAWAY and then the end, its
+answer to the PING finding no one (`h2` reports a broken pipe). A request it sent just then fails, the
+GOAWAY not telling whether it was seen. An answer's last piece taken by hyper may still be queued at
+that moment, written unless the socket is full, only while all slots are taken.
 
 ## sluice-wicket-runtime-firecracker's `--listen`
 
@@ -233,6 +253,23 @@ speaking first or unasked, what parses as no HTTP (another protocol on a sole ro
 clients idling for minutes is legitimate), an upgrade (`101`, h2c's too), a CONNECT, an answer running
 until its close, a message framed two ways, a head past 64KiB, a response or stream the guest pushes.
 Such a bad request reaches the guest, whose answer is usually to close it.
+
+Whoever can open `--max-connections` connections can open them again, so with all taken the next does
+not wait: one gives way, chosen as the consoles' (none in its first second). It ends as at the minute: its guest told as of its
+client closing, a guest keeping it 2s more failing it, the slot free once it ended. Those that may go:
+
+- no request in progress, before a route is picked too (the head of a route by host, its 404, its 502);
+- a request whose body its client did not finish, dripped or not, its answer begun or not, with no
+  request sent whole on the connection (h2: no stream its client ended). Unlike on
+  sluice-wicket-runtime-wasi no budget bounds it, so it would hold a slot and a VM for as long as a
+  patient guest waits. A long upload or a stream both ways is lost so when all are taken and it is its
+  source's turn: dripped bytes do not make it the last to have waited, nor could they tell it from one
+  sending in earnest.
+
+Those that keep theirs: a request sent whole (what it waits on is its guest), what cannot be followed
+(verbatim for good), and a connection whose VM is being opened: `route.open` is bounded by the route's
+wait for room and its guest's boot, and cancelling it would throw away a VM. All those taken, the next
+waits in the backlog.
 
 On the tunnel none of this applies: the data plane has these limits (on by default) in front of it.
 

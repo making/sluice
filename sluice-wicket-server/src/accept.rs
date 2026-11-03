@@ -12,9 +12,15 @@ use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 /// How long the accept loop waits after an accept failed.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+
+/// How long a connection just accepted is left to show what it is at before it may give way: asked
+/// at once, one of a burst past the limit would go before its request was read, and at the rate of
+/// a flood before any client's could arrive.
+pub const FRESH: Duration = Duration::from_secs(1);
 
 /// [`keep_alive`]'s idle time, probe interval and probes left unanswered.
 const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(60);
@@ -22,7 +28,7 @@ const KEEP_ALIVE_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEP_ALIVE_PROBES: u32 = 3;
 
 /// A listener's connections open.
-pub(crate) struct Open {
+pub struct Open {
     max: usize,
     connections: Mutex<Connections>,
     /// A connection ended or now yields. Only the accept loop waits on it.
@@ -41,6 +47,8 @@ struct Connection {
     yields: bool,
     /// When it last turned to waiting on its client, on the clock.
     since: u64,
+    /// Until when it does not give way though it yields ([`FRESH`]).
+    fresh_until: Instant,
     /// Told to give way, and not gone yet.
     told: bool,
     asked: Arc<Notify>,
@@ -54,29 +62,37 @@ impl Connections {
 
     /// Tells a connection that yields to give way, unless one is on its way
     /// out: the one waiting longest of the source holding the most, so that a
-    /// source opening many pushes out only its own.
-    fn ask_one(&mut self) {
+    /// source opening many pushes out only its own. With all that yield still
+    /// fresh, when the first of them no longer is.
+    fn ask_one(&mut self) -> Option<Instant> {
         if self.by_id.values().any(|connection| connection.told) {
-            return;
+            return None;
         }
         let mut held: HashMap<IpAddr, usize> = HashMap::new();
         for connection in self.by_id.values() {
             *held.entry(connection.source).or_default() += 1;
         }
+        let now = Instant::now();
         let next = self
             .by_id
             .values_mut()
-            .filter(|connection| connection.yields)
+            .filter(|connection| connection.yields && connection.fresh_until <= now)
             .max_by_key(|connection| (held[&connection.source], Reverse(connection.since)));
         if let Some(connection) = next {
             connection.told = true;
             connection.asked.notify_one();
+            return None;
         }
+        self.by_id
+            .values()
+            .filter(|connection| connection.yields)
+            .map(|connection| connection.fresh_until)
+            .min()
     }
 }
 
 impl Open {
-    pub(crate) fn new(max: usize) -> Arc<Open> {
+    pub fn new(max: usize) -> Arc<Open> {
         Arc::new(Open {
             max,
             connections: Mutex::default(),
@@ -85,11 +101,11 @@ impl Open {
     }
 
     /// A slot for a connection from `peer`, once one is free: a connection that
-    /// yields is told to give way, and with none this waits for one to end or
-    /// yield.
-    pub(crate) async fn place(self: &Arc<Open>, peer: IpAddr) -> Slot {
+    /// yields is told to give way, once no longer [`FRESH`], and with none this
+    /// waits for one to end or yield.
+    pub async fn place(self: &Arc<Open>, peer: IpAddr) -> Slot {
         loop {
-            {
+            let fresh_until = {
                 let mut connections = self.connections.lock().expect("never poisoned");
                 if connections.by_id.len() < self.max {
                     let id = connections.tick();
@@ -100,6 +116,7 @@ impl Open {
                             source: source(peer),
                             yields: false,
                             since: id,
+                            fresh_until: Instant::now() + FRESH,
                             told: false,
                             asked: asked.clone(),
                         },
@@ -110,9 +127,15 @@ impl Open {
                     };
                     return Slot { claim, asked };
                 }
-                connections.ask_one();
+                connections.ask_one()
+            };
+            let changed = self.changed.notified();
+            match fresh_until {
+                Some(at) => {
+                    let _ = tokio::time::timeout_at(at, changed).await;
+                }
+                None => changed.await,
             }
-            self.changed.notified().await;
         }
     }
 }
@@ -164,9 +187,9 @@ pub struct Claim {
 
 impl Claim {
     /// The connection only waits on its client, or serves one not known to be
-    /// anyone: it gives way when all slots are taken, the longest waiting first.
-    /// A connection is given its slot not yielding, and keeps it so unless this
-    /// is said.
+    /// anyone: it gives way when all slots are taken, the longest waiting first,
+    /// once no longer [`FRESH`]. A connection is given its slot not yielding, and
+    /// keeps it so unless this is said.
     pub fn yields(&self) {
         let mut connections = self.open.connections.lock().expect("never poisoned");
         let now = connections.tick();
@@ -178,11 +201,12 @@ impl Claim {
     }
 
     /// The connection is at work for someone admitted: it keeps its slot until
-    /// [`Claim::yields`] is said again.
+    /// [`Claim::yields`] is said again, with no time left of being [`FRESH`].
     pub fn holds(&self) {
         let mut connections = self.open.connections.lock().expect("never poisoned");
         if let Some(connection) = connections.by_id.get_mut(&self.id) {
             connection.yields = false;
+            connection.fresh_until = Instant::now();
         }
     }
 }
@@ -279,9 +303,10 @@ mod tests {
     }
 
     /// All slots taken, the one wanted comes from whoever yields: of the source
-    /// holding the most, the one waiting longest. One that holds is left alone;
-    /// with no other the next waits, for one to end or yield.
-    #[tokio::test]
+    /// holding the most, the one waiting longest. One that holds is left alone,
+    /// and one just accepted, for a moment; with no other the next waits, for one
+    /// to end or yield.
+    #[tokio::test(start_paused = true)]
     async fn the_slot_wanted_comes_from_the_largest_sources_longest_waiting() {
         let open = Open::new(5);
         let quiet = wanted(&open, "10.0.0.1").await.await.unwrap();
@@ -295,6 +320,9 @@ mod tests {
 
         // the /64 holds 3, 10.0.0.1 holds 2, its mapped address counted
         let next = wanted(&open, "10.0.0.2").await;
+        assert!(!asked(&longest).await, "just accepted");
+        tokio::time::sleep(FRESH).await;
+        yield_now().await;
         assert!(asked(&longest).await);
         for slot in [&quiet, &held, &later, &mapped] {
             assert!(!asked(slot).await);
@@ -309,13 +337,14 @@ mod tests {
         drop(quiet);
         let third = next.await.unwrap();
 
-        // none yields, those just placed included
+        // none yields, those just placed included; a request shown ends a slot's first moment
         later.claim().holds();
         mapped.claim().holds();
         let next = wanted(&open, "10.0.0.4").await;
         for slot in [&held, &later, &mapped, &second, &third] {
             assert!(!asked(slot).await);
         }
+        second.claim().holds();
         second.claim().yields();
         yield_now().await;
         assert!(asked(&second).await);

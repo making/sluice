@@ -10,7 +10,8 @@
 //! stderr and on a flume (`sluice-wicket-tunnel`'s double); the guests' egress to
 //! a destination on the host, by name, address, range and IPv6, from a shared VM
 //! and a clone, and its records; the routes through `--listen` as well, by host
-//! (http/1.1 and h2c, an unknown one answered 404), clients left quiet there, a `--vm` route alone
+//! (http/1.1 and h2c, an unknown one answered 404), clients left quiet there and their slots given
+//! way, a `--vm` route alone
 //! whatever the host and handing through a guest speaking first, not with `--console` nor
 //! from the config file; a reload of the `--config`
 //! file, polled, removing a route and replacing a rootfs; its numbers and an app's changed, the
@@ -570,6 +571,7 @@ async fn every_route_serves_http_through_the_tunnel() {
         if !jailed {
             drop(wicket);
             sole_routes(&dir.0, &rootfs, |args| start(&url, args)).await;
+            giving_way(&dir.0, &rootfs, |args| start(&url, args)).await;
             below_warm(&dir.0, &rootfs, |args| start(&url, args)).await;
         }
     }
@@ -793,6 +795,54 @@ async fn sole_routes(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) ->
     }
 }
 
+/// `--listen`'s one slot taken, the next connection is served at once: a head not ended gives way,
+/// and so does a connection with no request in progress, its guest told as of a client closing, so
+/// the next finds the reused clone.
+async fn giving_way(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> Wicket) {
+    let config = scratch.join("giving-way.yaml");
+    let route = format!(
+        "routes:\n- {{host: reuse.local, rootfs: {}, mode: reuse}}\n",
+        rootfs.display()
+    );
+    std::fs::write(&config, route).unwrap();
+    let args = [
+        "--listen",
+        "127.0.0.1:0",
+        "--max-connections",
+        "1",
+        "--config",
+    ];
+    let args: Vec<String> = args.map(String::from).into_iter().collect();
+    let wicket = start(&[args, vec![config.display().to_string()]].concat());
+    let connect = || tokio::net::TcpStream::connect(wicket.listening());
+    let checked = tokio::time::timeout(HANG, async {
+        let mut quiet = connect().await.unwrap();
+        quiet.write_all(b"GET / HT").await.unwrap();
+        let mut idle = connect().await.unwrap();
+        let count = counted(&mut idle).await;
+        let mut rest = Vec::new();
+        assert_eq!(quiet.read_to_end(&mut rest).await.unwrap(), 0);
+        assert_eq!(counted(&mut connect().await.unwrap()).await, count + 1);
+        assert_eq!(idle.read_to_end(&mut rest).await.unwrap(), 0);
+    });
+    assert!(checked.await.is_ok(), "hung; {}", wicket.log());
+}
+
+/// What reuse.local counts to, by a request on `client`.
+async fn counted(client: &mut tokio::net::TcpStream) -> u64 {
+    let request = "GET / HTTP/1.1\r\nhost: reuse.local\r\n\r\n";
+    client.write_all(request.as_bytes()).await.unwrap();
+    let mut answer = Vec::new();
+    let mut buffer = [0; 4096];
+    while !answer.ends_with(b"\n") {
+        let read = client.read(&mut buffer).await.unwrap();
+        assert_ne!(read, 0, "{}", String::from_utf8_lossy(&answer));
+        answer.extend_from_slice(&buffer[..read]);
+    }
+    let answer = String::from_utf8_lossy(&answer).into_owned();
+    served(&[answer])[0]
+}
+
 /// A client of `--listen` with no request in progress loses its connection a minute after its
 /// answer, and not before, its guest told as of a client closing: a reused clone serves the next
 /// connection, an h2c client reads a GOAWAY naming the stream it opened.
@@ -811,25 +861,12 @@ async fn quiet_clients(listening: std::net::SocketAddr) {
         );
         rest
     };
-    let get = async |client: &mut tokio::net::TcpStream| {
-        let request = "GET / HTTP/1.1\r\nhost: reuse.local\r\n\r\n";
-        client.write_all(request.as_bytes()).await.unwrap();
-        let mut answer = Vec::new();
-        let mut buffer = [0; 4096];
-        while !answer.ends_with(b"\n") {
-            let read = client.read(&mut buffer).await.unwrap();
-            assert_ne!(read, 0, "{}", String::from_utf8_lossy(&answer));
-            answer.extend_from_slice(&buffer[..read]);
-        }
-        let answer = String::from_utf8_lossy(&answer).into_owned();
-        served(&[answer])[0]
-    };
     let http1 = async {
         let mut client = connect().await.unwrap();
-        let count = get(&mut client).await;
+        let count = counted(&mut client).await;
         let answered = tokio::time::Instant::now();
         assert_eq!(ended(&mut client, answered).await, b"");
-        assert_eq!(get(&mut connect().await.unwrap()).await, count + 1);
+        assert_eq!(counted(&mut connect().await.unwrap()).await, count + 1);
     };
     let h2 = async {
         let frame = |kind: u8, flags: u8, stream: u32, payload: &[u8]| {

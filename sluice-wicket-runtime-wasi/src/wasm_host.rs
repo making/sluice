@@ -30,7 +30,8 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::SystemTime;
 
 use http_body_util::BodyExt as _;
-use sluice_wicket_server::http::QUIET;
+use sluice_wicket_server::accept::Claim;
+use sluice_wicket_server::http::{QUIET, Writing};
 use tokio::io::AsyncWrite;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -2584,7 +2585,7 @@ pub async fn serve(mut io: TunnelIo, binding: Binding) {
 /// is the last entry of each request's `X-Forwarded-For`, and which the
 /// server's limits bound: `.kb/connection-limits.md`). On a connection of a
 /// client of its own, http/1.1 waits for a head for [`QUIET`] at most, the next
-/// request's included; the caller bounds h2 by [`Accepted::on_guest`].
+/// request's included; the caller bounds h2 by [`Accepted::h2_requests`].
 pub(crate) async fn serve_http<I, R>(
     io: I,
     h2: bool,
@@ -2610,6 +2611,10 @@ pub(crate) async fn serve_http<I, R>(
         let mut answered = Answered::of(&tap, &req, accepted.as_ref().map(|a| a.peer));
         let head_owed = accepted.as_ref().and_then(|a| HeadOwed::of(a, &req));
         let h2_request = accepted.as_ref().filter(|_| h2).map(H2Request::of);
+        let writing = accepted.as_ref().filter(|_| !h2).map(|accepted| {
+            accepted.claim.holds();
+            accepted.writing.clone()
+        });
         async move {
             let _head_owed = head_owed;
             let response = match handler {
@@ -2627,9 +2632,10 @@ pub(crate) async fn serve_http<I, R>(
                 Some(answered) => answered.counting(response),
                 None => response,
             };
-            Ok::<_, std::convert::Infallible>(match h2_request {
-                Some(request) => request.answering(response),
-                None => response,
+            Ok::<_, std::convert::Infallible>(match (h2_request, writing) {
+                (Some(request), _) => request.answering(response),
+                (None, Some(writing)) => response.map(|body| writing.answer(body).boxed_unsync()),
+                (None, None) => response,
             })
         }
     });
@@ -2674,9 +2680,23 @@ pub(crate) struct Accepted {
     /// True while a request that may be sent a `100 Continue` awaits its
     /// response's head.
     pub(crate) head_owed: watch::Sender<bool>,
-    /// On an h2 connection, how many of its requests await their guest
-    /// ([`H2Request`]); any other send tells of a stream moving on.
-    pub(crate) on_guest: watch::Sender<usize>,
+    /// On an h2 connection, its requests ([`H2Request`]); any send tells of a
+    /// stream moving on.
+    pub(crate) h2_requests: watch::Sender<H2Requests>,
+    /// Told of each request in progress: only with none may the connection give
+    /// way.
+    pub(crate) claim: Claim,
+    /// When an http/1.1 request's answer was written, and it no more in progress.
+    pub(crate) writing: Arc<Writing>,
+}
+
+/// What an h2 connection's requests are at.
+#[derive(Default)]
+pub(crate) struct H2Requests {
+    /// In progress, from arriving until their answers ended.
+    pub(crate) open: usize,
+    /// Of them, awaiting their guest.
+    pub(crate) on_guest: usize,
 }
 
 /// An h2 request of a connection accepted here, while it lives: from its
@@ -2684,23 +2704,29 @@ pub(crate) struct Accepted {
 /// the time hyper keeps from polling the body, which is the client's: its
 /// stream's or its connection's window, or a socket it does not read.
 struct H2Request {
-    on_guest: watch::Sender<usize>,
+    requests: watch::Sender<H2Requests>,
+    claim: Claim,
     awaits: bool,
 }
 
 impl H2Request {
     fn of(accepted: &Accepted) -> H2Request {
-        accepted.on_guest.send_modify(|awaiting| *awaiting += 1);
+        accepted.h2_requests.send_modify(|requests| {
+            requests.open += 1;
+            requests.on_guest += 1;
+            accepted.claim.holds();
+        });
         H2Request {
-            on_guest: accepted.on_guest.clone(),
+            requests: accepted.h2_requests.clone(),
+            claim: accepted.claim.clone(),
             awaits: true,
         }
     }
 
     /// Tells whether it awaits its guest now, and that it moved on.
     fn awaits(&mut self, awaits: bool) {
-        self.on_guest.send_modify(|awaiting| {
-            *awaiting = *awaiting + usize::from(awaits) - usize::from(self.awaits);
+        self.requests.send_modify(|requests| {
+            requests.on_guest = requests.on_guest + usize::from(awaits) - usize::from(self.awaits);
         });
         self.awaits = awaits;
     }
@@ -2722,7 +2748,13 @@ impl H2Request {
 
 impl Drop for H2Request {
     fn drop(&mut self) {
-        self.awaits(false);
+        self.requests.send_modify(|requests| {
+            requests.on_guest -= usize::from(self.awaits);
+            requests.open -= 1;
+            if requests.open == 0 {
+                self.claim.yields();
+            }
+        });
     }
 }
 

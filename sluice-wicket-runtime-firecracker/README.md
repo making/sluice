@@ -203,12 +203,14 @@ the wicket routes a connection once -- a later request on it (an h2 stream, a ke
 request) for another host stays on the first one's route -- and adds no `X-Forwarded-*`
 header (the guest sees what the client sent: the sample's `x-forwarded-for -`), since only
 the first request of a connection would get them. `--max-connections` bounds the listener's
-connections too, apart from the tunnel's (one beyond waits in the backlog); TCP keepalive (60s
+connections too, apart from the tunnel's; TCP keepalive (60s
 idle, then 3 probes 10s apart) ends one whose client is gone without a FIN or reset. An HTTP
 connection with no request in progress for 60s is closed, as for its client closing it (a reused
 clone is kept, an h2c client reads a GOAWAY), and so is a connection sending nothing, or whose client
 reads nothing of an answer for 60s. A request waits on its guest for as long as it takes; what is
-not HTTP, a guest speaking first, an upgrade are relayed verbatim, only `idle-ms` ending them
+not HTTP, a guest speaking first, an upgrade are relayed verbatim, only `idle-ms` ending them. All
+taken, one with no request in progress, or whose request's body is not all sent, gives way to the next,
+the source holding the most first, closed the same way; with none, the next waits in the backlog
 ([details](../.kb/connection-limits.md#sluice-wicket-runtime-firecrackers---listen)).
 `--firecracker` names the binary (default `firecracker` on the PATH), `--state-dir` the VMs'
 files (their Unix sockets need paths below 108 bytes; the default is a directory of the
@@ -1026,7 +1028,7 @@ ending, and for a shared VM serving two hosts, a VM per connection, reused clone
 and a route of two VMs at most, one per client address, it checks http/1.1 with keep-alive,
 h2c, a 5MB POST under the tunnel's flow control and a client half-closing after its request,
 the clones' clock and random values, a client past its share, the connection finding no room,
-idle connections failed, clients left quiet on `--listen` closed, a reused clone serving the next connection until its `uses` or
+idle connections failed, clients left quiet on `--listen` closed and giving way, a reused clone serving the next connection until its `uses` or
 `keep-ms` ran out, a pool growing with the connections held, shrinking idle and replacing its
 VMs killed (unjailed) or their processes ended, a route's and an app's VMs kept as their numbers
 change, the VMs' output (a shared VM's, a template's, a clone's) on the wicket's
