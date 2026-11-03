@@ -2577,8 +2577,8 @@ pub async fn serve(mut io: TunnelIo, binding: Binding) {
 /// caller) else http/1.1, each by the handler `route` finds for it (404 with
 /// its message when none), until the connection ends; once `gone` is
 /// cancelled it shuts down gracefully. `label` names the connection in the
-/// log; `peer` is its client, None for a tunnel connection (whose client is
-/// the last entry of each request's `X-Forwarded-For`).
+/// log; `accepted` is its client, None for a tunnel connection (whose client
+/// is the last entry of each request's `X-Forwarded-For`).
 pub(crate) async fn serve_http<I, R>(
     io: I,
     h2: bool,
@@ -2586,7 +2586,7 @@ pub(crate) async fn serve_http<I, R>(
     route: R,
     gone: CancellationToken,
     label: &str,
-    peer: Option<SocketAddr>,
+    accepted: Option<Accepted>,
 ) where
     I: tokio::io::AsyncRead + AsyncWrite + Unpin + Send + 'static,
     R: Fn(&hyper::Request<hyper::body::Incoming>) -> Result<Arc<Handler>, String>
@@ -2600,8 +2600,10 @@ pub(crate) async fn serve_http<I, R>(
     let route = Arc::new(route);
     let service = hyper::service::service_fn(move |req| {
         let (handler, share) = (route(&req), share.clone());
-        let mut answered = Answered::of(&tap, &req, peer);
+        let mut answered = Answered::of(&tap, &req, accepted.as_ref().map(|a| a.peer));
+        let head_owed = accepted.as_ref().and_then(|a| HeadOwed::of(a, &req));
         async move {
+            let _head_owed = head_owed;
             let response = match handler {
                 Ok(handler) => {
                     let admitted = |index| {
@@ -2640,6 +2642,33 @@ pub(crate) async fn serve_http<I, R>(
     };
     if let Err(e) = served.await {
         eprintln!("[wasm] {label} serve error: {e}");
+    }
+}
+
+/// The client of a connection the wicket accepted itself (`--listen`).
+pub(crate) struct Accepted {
+    pub(crate) peer: SocketAddr,
+    /// True while a request that may be sent a `100 Continue` awaits its
+    /// response's head.
+    pub(crate) head_owed: watch::Sender<bool>,
+}
+
+/// An http/1.1 request awaiting its response's head, while it lives. Only
+/// http/1.1: http/1.0 must not get a 1xx, and h2 reads its client all along.
+struct HeadOwed(watch::Sender<bool>);
+
+impl HeadOwed {
+    fn of<B>(accepted: &Accepted, request: &hyper::Request<B>) -> Option<HeadOwed> {
+        (request.version() == http::Version::HTTP_11).then(|| {
+            accepted.head_owed.send_replace(true);
+            HeadOwed(accepted.head_owed.clone())
+        })
+    }
+}
+
+impl Drop for HeadOwed {
+    fn drop(&mut self) {
+        self.0.send_replace(false);
     }
 }
 

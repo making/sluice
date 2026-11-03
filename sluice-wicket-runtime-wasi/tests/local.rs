@@ -311,6 +311,90 @@ async fn local_mode_routes_by_host_and_keeps_the_keyvalue_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A client gone from an http/1.1 request frees its instance before the budget, with no help
+/// from its guest: its reset at once, its close once the probe that a request silent past 1s
+/// gets finds it gone. One of h2 too, read all along. A client that only half-closed is answered:
+/// the probes it reads (at most four, none to http/1.0, none into a response begun), then the
+/// response.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_gone_frees_its_instance_and_a_half_closed_one_is_answered() {
+    let hello = guests().join("hello.wasm").display().to_string();
+    let one = format!("one.local={hello}?instances=1&budget-ms=120000");
+    let any = format!("any.local={hello}?budget-ms=120000");
+    let wicket = Wicket::start(&["--wasm", &one, "--wasm", &any]);
+    let address = wicket.address();
+
+    let sent = async |host: &str, version: &str, path: &str| {
+        let mut stream = tokio::net::TcpStream::connect(&address).await.unwrap();
+        let request = format!("GET {path} HTTP/{version}\r\nhost: {host}\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream
+    };
+    // the route's next request waits while `leave`'s holds the instance, and is answered once it
+    // left, long before the budget
+    let frees = async |what: &str, leave: Box<dyn FnOnce() + Send>| {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let waiting = {
+            let address = address.clone();
+            tokio::spawn(async move { get(&address, "one.local", "/").await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "{what}: the instance is held");
+        leave();
+        let answered = tokio::time::timeout(Duration::from_secs(30), waiting).await;
+        assert_eq!(answered.expect(what).unwrap().0, 200, "{what}");
+    };
+
+    let silent = "/hold/120000";
+    frees("closed", {
+        let stream = sent("one.local", "1.1", silent).await;
+        Box::new(move || drop(stream))
+    })
+    .await;
+    for path in [silent, "/stall"] {
+        let stream = sent("one.local", "1.1", path).await;
+        stream.set_zero_linger().unwrap();
+        frees(path, Box::new(move || drop(stream))).await;
+    }
+    let stream = tokio::net::TcpStream::connect(&address).await.unwrap();
+    let (client, connection) = h2::client::handshake(stream).await.unwrap();
+    let connection = tokio::spawn(connection);
+    let mut client = client.ready().await.unwrap();
+    let request = http::Request::get(format!("http://one.local{silent}"));
+    let (response, _) = client
+        .send_request(request.body(()).unwrap(), true)
+        .unwrap();
+    frees("h2", Box::new(move || connection.abort())).await;
+    drop(response);
+
+    let half_closed = async |version: &str, path: &str| {
+        let mut stream = sent("any.local", version, path).await;
+        stream.shutdown().await.unwrap();
+        let mut raw = Vec::new();
+        tokio::time::timeout(HANG, stream.read_to_end(&mut raw))
+            .await
+            .expect("answered")
+            .unwrap();
+        raw
+    };
+    let (probed, http10, begun) = tokio::join!(
+        half_closed("1.1", "/hold/5500"),
+        half_closed("1.0", "/hold/1500"),
+        half_closed("1.1", "/stream"),
+    );
+    let probes = String::from_utf8_lossy(&probed);
+    let answer = probes
+        .strip_prefix(&"HTTP/1.1 100 Continue\r\n\r\n".repeat(4))
+        .unwrap_or_else(|| panic!("four probes: {probes}"));
+    assert!(answer.starts_with("HTTP/1.1 200"), "then it: {answer}");
+    assert!(answer.contains("hello from wasm"), "{answer}");
+    let http10 = String::from_utf8_lossy(&http10);
+    assert!(http10.starts_with("HTTP/1.0 200"), "{http10}");
+    assert!(begun.starts_with(b"HTTP/1.1 200"), "no probe in its head");
+    let head = begun.windows(4).position(|at| at == b"\r\n\r\n").unwrap();
+    assert_eq!(begun.len() - head - 4, 10 * 1024 * 1024, "nor in its body");
+}
+
 /// Two wickets sharing a redis store (over TLS, the server's certificate
 /// issued by the store's ca-cert) count right at once, by increment and by
 /// cas.

@@ -690,10 +690,18 @@ table dirty and is retired, so a guest opens its buckets per request (cheap: a t
   counts as done: hyper drops it there itself, trailers owed or not; a
   bodiless response -- HEAD, 1xx, 204, 304 -- is drained behind the scenes,
   never a departure)
-- only the server's ERROR counts as the client leaving. Its CLOSE (the
-  public client's FIN) is a half-close: an http/1.1 request already received
-  is still answered, and one whose guest stalls is held until the server's
-  ERROR or the budget
+- over the tunnel only the server's ERROR counts as the client leaving. Its
+  CLOSE (the public client's FIN) is a half-close: an http/1.1 request already
+  received is still answered, and one whose guest stalls is held until the
+  server's ERROR (the server probes a client that ended its side) or the budget
+- on `--listen` the wicket does the server's part for http/1.1: a client's reset
+  ends its request at once, and a client that ended its side while a response
+  head is owed gets a `100 Continue` each second, at most four: a client gone
+  answers with a reset, one that only half-closed reads them and its response.
+  http/1.0 gets none, and once a response began nothing can be added to it: such
+  a client that closed is noticed by a write, else its budget ends the request.
+  An h2 connection ends with its client's FIN or reset
+  ([details](../.kb/wicket-wasi-findings.md#a-client-gone-from---listen))
 - instances come from wasmtime's pooling allocator, a slot of each kind per
   `--max-instances` instance (4 linear memories and a GC heap, 16 tables of 100k elements,
   32 core instances, 8 fiber stacks), so an instantiate never finds the pool exhausted; a

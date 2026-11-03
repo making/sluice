@@ -128,6 +128,13 @@ impl Guest for Component {
             return Ok(response);
         }
 
+        if let Some(millis) = path.strip_prefix("/hold/") {
+            // A guest silent before its response: no head, no frame, for as
+            // many milliseconds as the path says, then the usual answer.
+            let millis: u64 = millis.parse().expect("/hold/<milliseconds>");
+            wasi::clocks::monotonic_clock::wait_for(millis * 1000 * 1000).await;
+        }
+
         if path == "/no-content" || path == "/not-modified" {
             // Bodiless demo: 204 / 304 -- hyper drops the declared body
             // unread, so the unit survives only if that is no departure.

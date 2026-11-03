@@ -12,6 +12,7 @@ sluice-wicket-runtime-wasi ... --wasm 'demo.local=examples/target/wasm32-wasip3/
 |---|---|
 | any path (`-d data` for a body) | echo of method / path / body size, h1 and h2c |
 | `/stream` | response streaming: 10 MiB in paced chunks |
+| `/hold/<ms>` | a guest silent for `ms` before its response: a client leaving meanwhile |
 | `/log` | guest stdout / stderr in the wicket log, line-prefixed |
 | `/panic` | guest trap -> 500; the tunnel and later requests survive |
 | `/spin` | CPU busy loop interrupted by `budget-ms` -> 504 |

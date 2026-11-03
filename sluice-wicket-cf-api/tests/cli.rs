@@ -786,7 +786,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
     cf.ok(&["restart", "hello", "--strategy", "rolling"]);
     let deadline = Instant::now() + HANG;
     loop {
-        let stream = held(&listen, "hello.localhost", "/stream");
+        let stream = held(&listen, "hello.localhost", "/stall");
         let shown = cf.ok(&["app", "hello"]);
         drop(stream);
         if shown
@@ -841,11 +841,10 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "-p",
         dir.join("app").to_str().unwrap(),
     ]);
-    // a response not read holds its instance a second at least (20 chunks 50ms apart), until a
-    // write finds its client gone
+    // a stalled response holds its instance until its client's reset (`held` leaves it unread)
     let beyond = |room: usize| {
         let streams: Vec<TcpStream> = (0..room)
-            .map(|_| held(&listen, limited, "/stream"))
+            .map(|_| held(&listen, limited, "/stall"))
             .collect();
         let waiting = answered(&listen, limited, "/");
         let wait = waiting.recv_timeout(Duration::from_millis(500));
@@ -854,7 +853,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
         assert_eq!(waiting.recv_timeout(HANG).ok(), Some(200));
     };
     beyond(16);
-    let stream = held(&listen, limited, "/stream");
+    let stream = held(&listen, limited, "/stall");
     assert_eq!(get(&listen, limited, "/log", None).0, 200);
     drop(stream);
     let deadline = Instant::now() + HANG;
