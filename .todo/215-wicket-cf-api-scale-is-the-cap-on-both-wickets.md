@@ -30,22 +30,22 @@ Today only a Firecracker app's cloned modes have a limit by `cf scale`. On wasi,
 - `per-connection` and `reuse` keep N literal: a VM is memory, and whoever annotates them chose one connection
   per VM. Their README example names a real count, and `-i 1` is one connection at a time, so say it where
   it is met: a warning on `cf push` / `cf scale` (`X-Cf-Warnings`, which the CLI prints, if it reads so), and the
-  502 of a connection finding no room. Rewrite the migration "annotate it `per-connection` and `cf scale -i 1`":
-  it should name a count of connections
-- the annotation `wicket.sluice.ik.am/instances` goes, refused saying `cf scale -i` and `concurrency` replace it.
-  An app holding it gets the README's upgrade note
+  502 of a connection finding no room
+- the annotation `wicket.sluice.ik.am/instances` goes, refused saying `cf scale -i` and `concurrency` replace it
 - `cf logs`' index stays in `0` to `N - 1`, what `cf app` lists: more units alive than N are instances' work, so
   a wasi unit past N names `index % N` (settle whether the wicket or the cf-api maps it). A pool's and a VM's
   index stay as they are: they are within N already
+- a limit above the wicket's own runs, bounded by the wicket: N x 16 past `--max-instances` is no refusal
+
+The user wants the ideal spec and does not hold back a change for what exists today: no compatibility path, no
+upgrade notes, and the notes the README has on apps at 0 instances go. If building this shows a better spec,
+take it and say so.
 
 ## To settle
 
-- a wasi route's slots counted against `--max-instances` (default 64): N x 16 may exceed it, which the wicket
-  refuses or not. A limit above the wicket's own should run, bounded by the wicket
 - `pool`'s `conns` is soft (past it a connection goes to the VM holding the fewest when no VM can start), wasi's
-  limit hard (it waits within the budget, then 503): the README says each, or they get closer
-- a wasi `warm` above N stays refused; `warm` up to `N x concurrency` is not needed
-- what `same` in `controller.rs` compares, so an app upgraded is not restarted twice
+  limit hard (it waits within the budget, then 503). One meaning of `concurrency`, if the two can have one
+  without an idle keep-alive connection holding a VM's share; otherwise the README says each
 - `wait-ms`, `prime`: annotations or not, by whether anything here needs them
 
 The test: `vm_sandbox`'s table and `desired` in `controller.rs`, the scale steps of `tests/cli.rs` on both wickets:

@@ -17,7 +17,8 @@ The wasi wicket's `warm` takes the same path (`pool` from `running.lifetime.warm
 
 - reproduce both cases with a failing test first: `check_annotations`'s table in `manifest.rs`, or the
   scale steps of `tests/cli.rs`
-- a scale is checked against what it applies, and a pending annotation it contradicts is refused, or
-  reported, by the next start with the scale's count: settle which, and that neither ends in a state the
-  wicket refuses
+- a scale must hold both now and at the next start: it is checked against what it applies
+  (`running.lifetime`) and against the annotations as they are, and refused naming which, the restart being
+  the way out of a difference. An annotation is checked against the count as it is. No state then reaches
+  the wicket only to be refused
 - the README's "How long a VM lives" in step
