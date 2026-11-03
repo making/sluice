@@ -339,7 +339,8 @@ the routes stay as they were. The image is received to the console's directory a
 
 An edit's VMs start beside everything else: none waits for a boot, which a process never listening
 takes a `boot-ms` long, whether a [disk](#disks)'s VM is replaced or the files are reloaded. A later
-edit of the same route or app takes over from it, ending its VMs (its request a 422). An edit goes
+edit of the same route or app takes over from it, ending its VMs (its request a 422; on a disk
+[stopped](#disks), the edit's own VM waiting for that, 20s at most). An edit goes
 by the config file as the routes last took it and leaves a changed file to its reload, whose failure
 refuses no edit; an edit needing a disk that reload starts a VM on takes over from it, the reload
 made again after it.
@@ -497,8 +498,9 @@ is where `/init` mounts it before the process starts, `disk-mib` its size (defau
 - **a stop** tells `/init`: SIGTERM to every process, 10s for them to end (then SIGKILL), what
   is dirty written out, the disk unmounted, the VM killed, 20s at most. So does the wicket's own
   end, after its drain (`--drain-grace` and these 20s: `--stop-timeout`, `TimeoutStopSec`), a
-  [process's end](#a-shared-vm-going-down), and a process exiting before it listens. A VM
-  simply killed,
+  [process's end](#a-shared-vm-going-down), a process exiting before it listens, and a start
+  taken over or given up once `/init` mounted the disk: the next start on the disk waits for it.
+  A VM simply killed,
   the wicket's or the host's crash, is a crash to the file system: the journal replays at the
   next mount, and what the process had not fsynced may be gone, up to the commit interval's
   5s. A file written and renamed stays the old one or the new one, not NUL bytes

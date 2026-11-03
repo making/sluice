@@ -69,6 +69,7 @@ use sluice_wicket_tunnel::signals::{self, Signals};
 use sluice_wicket_tunnel::workers::Workers;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use capacity::Capacity;
 use console::Console;
@@ -99,11 +100,25 @@ pub fn describe_build() -> String {
 /// Boots the routes' VMs as `launcher` starts them and serves them (through the
 /// server, on `--listen`, or both) until SIGTERM / SIGINT: until the drain
 /// after it ended, or at once where nothing drains (without `--server`, or
-/// with `--drain-grace 0`).
+/// with `--drain-grace 0`). However that ends, every VM on a disk is stopped by then.
 pub async fn run(
     settings: config::Settings,
     launcher: Launcher,
     workers: Arc<Workers>,
+) -> Result<(), BoxError> {
+    let stops = TaskTracker::new();
+    let ran = serving(settings, launcher, workers, stops.clone()).await;
+    stops.close();
+    stops.wait().await;
+    ran
+}
+
+/// [`run`], but for the stops under way in `stops`, which what it leaves behind goes to.
+async fn serving(
+    settings: config::Settings,
+    launcher: Launcher,
+    workers: Arc<Workers>,
+    stops: TaskTracker,
 ) -> Result<(), BoxError> {
     let config::Settings {
         server,
@@ -164,7 +179,15 @@ pub async fn run(
         intake = Some(deployed.images().intake());
         routes.deploy(deployed);
     }
-    let reloader = Reloader::start(routes, capacity.clone(), places, sink, workers.clone()).await?;
+    let reloader = Reloader::start(
+        routes,
+        capacity.clone(),
+        places,
+        sink,
+        workers.clone(),
+        stops,
+    )
+    .await?;
     let routes = reloader.routes().clone();
     if let Some(flume) = flume {
         flume::start(flume, tap, &client_id)?;
@@ -250,13 +273,16 @@ pub async fn run(
         Arc::clone(&routes),
     );
     // the drain stops the reloads: the routes are withdrawn
-    tokio::spawn(reloader.run(
+    let reloads = tokio::spawn(reloader.run(
         watch_interval,
         hangups_received,
         requests_received,
         shared.drain.begin.clone(),
     ));
     let served = sluice_wicket_tunnel::serve(shared, server, drain_grace, &mut signals).await;
+    // ended with what it held, the starts under way among it: done whatever ended the serving
+    reloads.abort();
+    let _ = reloads.await;
     routes.current().stop_disks().await;
     served
 }

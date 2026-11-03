@@ -38,8 +38,9 @@
 //! they did, on the routes as they are by then: nothing waits for a boot, which a process never
 //! listening takes a `boot-ms` long ([`Reloader::run`] awaits none). No VM comes back on a disk
 //! such a task starts one on. A later edit of the same app or host takes over from an edit, its
-//! VMs ended; a later change of the files from a reload of them; an edit, on a disk, from a
-//! reload, which is made again after it.
+//! VMs ended (on a disk, stopped: `vm::Vm`'s drop; the next start waits for the disk); a later
+//! change of the files from a reload of them; an edit, on a disk, from a reload, which is made
+//! again after it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -55,7 +56,7 @@ use sluice_wicket_tunnel::workers::Workers;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use crate::BoxError;
 use crate::capacity::{Capacity, Full, Slot};
@@ -606,6 +607,8 @@ pub struct Reloader {
     /// Where the routes' VMs start, the `n`th route started its place.
     places: Arc<Places>,
     next_place: u64,
+    /// The stops no route waits for any more, which the wicket's end does.
+    stops: TaskTracker,
     /// Target -> its route as started; the advertised targets only.
     started: HashMap<String, Started>,
     /// Removed targets still in the table -> the generation that removed them.
@@ -633,13 +636,14 @@ pub struct Reloader {
 impl Reloader {
     /// Starts the VMs of every route of `source` within `capacity`, each target
     /// in a place of its own of `places`, their output to `sink`; the first
-    /// failure ends them all.
+    /// failure ends them all. The stops of VMs on a disk that no route waits for go to `stops`.
     pub async fn start(
         source: RouteSource,
         capacity: Arc<Capacity>,
         places: Arc<Places>,
         sink: Arc<Sink>,
         workers: Arc<Workers>,
+        stops: TaskTracker,
     ) -> Result<Reloader, BoxError> {
         let (tell_down, downs) = mpsc::unbounded_channel();
         let (tell_restarted, restarted) = mpsc::unbounded_channel();
@@ -659,6 +663,7 @@ impl Reloader {
             workers,
             places,
             next_place: 0,
+            stops,
             started: HashMap::new(),
             lingering: HashMap::new(),
             read: HashMap::new(),
@@ -1542,6 +1547,7 @@ impl Reloader {
             held,
             sink: self.sink.clone(),
             workers: self.workers.clone(),
+            stops: self.stops.clone(),
         };
         async move {
             let route = Route::start(spec.clone(), &hosts, starting)
@@ -1575,7 +1581,7 @@ impl Reloader {
             if let Some(route) = current.routes.get(target).cloned()
                 && route.disk().is_some()
             {
-                tokio::spawn(async move { route.stop().await });
+                self.stops.spawn(async move { route.stop().await });
             }
         }
         self.routes.publish(Table {

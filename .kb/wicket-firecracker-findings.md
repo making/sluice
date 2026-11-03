@@ -378,8 +378,12 @@ Through the wicket:
   64 MiB): killed again at once 0.76s, 1.74s, 2.75s, 4.75s; after 30s up 8.75s; after 65s up 0.76s,
   and 1.76s the next
 - an edit during a disk's VM replaced by a reload takes over: one VM throughout, the PUT a boot long,
-  what the VM before it wrote there, the reload made again finding no change. What the VM taken over
-  from wrote and did not sync did not stay (a counter: 1, then 2 of three starts)
+  what the VM before it wrote there, the reload made again finding no change
+- a start given up (taken over, or ended with its reload) dropped its `Vm` in the aborted task: a
+  kill, and what it wrote and did not sync did not stay (a counter: 1, then 2 of three starts; a file
+  written at the start gone from the next VM, 1-2s later). So a `Vm` on a disk stops as it is dropped
+  (`vm.rs`), in a task the wicket's end waits for, however it was dropped; before `/init` answered of
+  the disk it is still killed: no process ran
 
 ## Docker image memory
 

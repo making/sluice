@@ -34,7 +34,8 @@
 //! An app's shared VM may have a disk (`disk`), a second drive: the launcher takes its lock
 //! for `firecracker`, whose guest's flushes reach the host's disk (`Writeback`: its journal
 //! relies on them across a crash of the host). Its VM is stopped by a notice before it is
-//! killed ([`Vm::stop`]).
+//! killed ([`Vm::stop`]), dropped or not: a start given up drops it, and the stop then runs in a
+//! task of its own (`StopOnDrop`), the disk held until the VM is gone.
 
 use std::ffi::OsString;
 use std::os::fd::OwnedFd;
@@ -42,7 +43,7 @@ use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -55,6 +56,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{oneshot, watch};
+use tokio_util::task::TaskTracker;
 
 use crate::BoxError;
 use crate::capacity::Slot;
@@ -439,13 +441,25 @@ enum Process {
         vm: u64,
         exited: watch::Receiver<Option<String>>,
     },
+    /// Handed over to the task of its stop, [`Vm::handed_over`].
+    HandedOver,
 }
 
-/// A running VM, killed (and its files removed) on drop.
+/// What stops a VM on a disk as it is dropped.
+struct StopOnDrop {
+    /// The disk's file, for the log.
+    file: PathBuf,
+    /// The VM's sockets are in there: not removed before its stop.
+    _place: Arc<Place>,
+    /// What the wicket's end waits for.
+    stops: TaskTracker,
+}
+
+/// A running VM, killed (and its files removed) on drop; on a disk, stopped first.
 pub struct Vm {
     process: Process,
     /// The VM's share of the budget, given back once it is killed.
-    _slot: Slot,
+    _slot: Option<Slot>,
     /// Its API socket, vsock socket and log, on the host.
     api: PathBuf,
     vsock: PathBuf,
@@ -454,6 +468,9 @@ pub struct Vm {
     vsock_inside: PathBuf,
     /// Its listener for the guest's egress streams, when its route has egress.
     egress: Option<Listening>,
+    stop_on_drop: Option<StopOnDrop>,
+    /// A stop ended: none more as it is dropped.
+    stopped: AtomicBool,
 }
 
 impl Vm {
@@ -513,12 +530,14 @@ impl Vm {
         let vsock = dir.join("v.sock");
         let mut vm = Vm {
             process: Process::Child { child, dir },
-            _slot: slot,
+            _slot: Some(slot),
             api,
             vsock_inside: vsock.clone(),
             vsock,
             log: vm_log,
             egress: None,
+            stop_on_drop: None,
+            stopped: AtomicBool::new(false),
         };
         vm.ready().await?;
         Ok(vm)
@@ -541,12 +560,14 @@ impl Vm {
                 vm: spawned.vm,
                 exited: spawned.exited,
             },
-            _slot: slot,
+            _slot: Some(slot),
             api: run.join("api.sock"),
             vsock: run.join("v.sock"),
             log: spawned.dir.join("firecracker.log"),
             vsock_inside: PathBuf::from(jail::VSOCK_SOCKET),
             egress: None,
+            stop_on_drop: None,
+            stopped: AtomicBool::new(false),
         };
         vm.ready().await?;
         Ok(vm)
@@ -562,6 +583,7 @@ impl Vm {
                     .map(|status| format!("{status}; {}", log_tail(&self.log))),
                 // its directory is gone: the keeper sent its log's tail
                 Process::Jailed { exited, .. } => exited.borrow().clone(),
+                Process::HandedOver => None,
             };
             if let Some(ended) = ended {
                 return Err(format!("the VM ended: {ended}").into());
@@ -575,15 +597,17 @@ impl Vm {
     }
 
     /// Boots a fresh VM of `spec` at `place` (cold boot), the route's shared VM or its
-    /// template (`role`); its egress served by `egress` as the VM named so.
+    /// template (`role`); its egress served by `egress` as the VM named so. On a disk, a stop
+    /// as it is dropped goes to `stops`.
     pub async fn boot(
         spec: &Spec,
-        place: &Place,
+        place: &Arc<Place>,
         role: Role,
         slot: Slot,
         egress: Option<(&Arc<Egress>, String)>,
+        stops: &TaskTracker,
     ) -> Result<Vm, BoxError> {
-        let (mut vm, kernel, rootfs, disk) = match place {
+        let (mut vm, kernel, rootfs, disk) = match &**place {
             Place::Dir(dir) => (
                 Vm::spawn(
                     &spec.firecracker,
@@ -666,8 +690,14 @@ impl Vm {
         if !spec.env.is_empty() {
             vm.give_env(&spec.env).await?;
         }
-        if spec.disk.is_some() {
+        if let Some(disk) = &spec.disk {
             vm.ask_disk().await?;
+            // from here on: no process ran before `/init` answered, nothing to write out
+            vm.stop_on_drop = Some(StopOnDrop {
+                file: disk.file.clone(),
+                _place: place.clone(),
+                stops: stops.clone(),
+            });
         }
         Ok(vm)
     }
@@ -729,9 +759,24 @@ impl Vm {
             let stream = self.dial(wire::CONTROL_PORT).await?;
             self.control(stream, &wire::stop_line(grace), within).await
         };
-        tokio::time::timeout(within, stopped)
-            .await
-            .map_err(|_| format!("no answer within {within:?}"))?
+        let stopped = tokio::time::timeout(within, stopped).await;
+        self.stopped.store(true, Ordering::Relaxed);
+        stopped.map_err(|_| format!("no answer within {within:?}"))?
+    }
+
+    /// All of it, for a task of its own; `self` left with nothing to end.
+    fn handed_over(&mut self) -> Vm {
+        Vm {
+            process: std::mem::replace(&mut self.process, Process::HandedOver),
+            _slot: self._slot.take(),
+            api: std::mem::take(&mut self.api),
+            vsock: std::mem::take(&mut self.vsock),
+            log: std::mem::take(&mut self.log),
+            vsock_inside: std::mem::take(&mut self.vsock_inside),
+            egress: self.egress.take(),
+            stop_on_drop: None,
+            stopped: AtomicBool::new(false),
+        }
     }
 
     /// Gives `/init`, waiting for it, the variables of the process's environment. An
@@ -924,6 +969,24 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        // a runtime ending takes the task with it, the VM killed
+        if let Some(on_drop) = self.stop_on_drop.take()
+            && !*self.stopped.get_mut()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let vm = self.handed_over();
+            let stops = on_drop.stops.clone();
+            stops.spawn_on(
+                async move {
+                    if let Err(e) = vm.stop(disk::STOP_GRACE).await {
+                        eprintln!("{}: its VM's stop: {e}; killed", on_drop.file.display());
+                    }
+                    drop(vm);
+                    drop(on_drop);
+                },
+                &runtime,
+            );
+        }
         match &mut self.process {
             Process::Child { child, dir } => {
                 let _ = child.start_kill();
@@ -931,6 +994,7 @@ impl Drop for Vm {
             }
             // the keeper reaps it and removes its directory
             Process::Jailed { keeper, vm, .. } => keeper.kill(*vm),
+            Process::HandedOver => {}
         }
     }
 }

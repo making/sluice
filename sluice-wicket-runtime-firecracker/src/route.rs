@@ -18,6 +18,7 @@ use sluice_wicket_tunnel::workers::Workers;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 use tokio::sync::{Notify, mpsc};
+use tokio_util::task::TaskTracker;
 
 use crate::BoxError;
 use crate::capacity::{Capacity, Full, Need, Pool, Slot};
@@ -650,6 +651,8 @@ pub struct Starting {
     /// Where its VMs' output goes.
     pub sink: Arc<Sink>,
     pub workers: Arc<Workers>,
+    /// Where the stop of its VM on a disk goes, dropped ([`Vm`]).
+    pub stops: TaskTracker,
 }
 
 pub struct Route {
@@ -1395,6 +1398,7 @@ impl Route {
             held,
             sink,
             workers,
+            stops,
         } = starting;
         let hosts = Hosts::new(hosts);
         let label = hosts.current().label.clone();
@@ -1429,7 +1433,7 @@ impl Route {
         let egress = (!spec.vm.egress.is_empty())
             .then(|| Egress::new(spec.vm.egress.clone(), hosts.clone(), sink.clone(), workers));
         let named = egress.as_ref().map(|egress| (egress, name.to_string()));
-        let vm = Vm::boot(&spec.vm, &place, role, slot, named).await?;
+        let vm = Vm::boot(&spec.vm, &place, role, slot, named, &stops).await?;
         let mut output = match ready(&vm, spec.port, spec.boot, &sink, &hosts, name).await {
             Ok(output) => output,
             Err(e) => {

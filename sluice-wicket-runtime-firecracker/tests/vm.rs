@@ -457,6 +457,21 @@ async fn every_route_serves_http_through_the_tunnel() {
     // the console's route after a restart: started again from its directory alone
     if image.is_none() {
         drop(wicket);
+        if !jailed {
+            let late = console_dir.join("disks/cf/late.ext4");
+            let tools = sluice_wicket_runtime_firecracker::rootfs::Tools::find().unwrap();
+            let read = Command::new(&tools.debugfs)
+                .args(["-R", "cat /late"])
+                .arg(&late)
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&read.stdout),
+                "unsynced",
+                "the start under way at the wicket's end, unmounted"
+            );
+            std::fs::remove_file(&late).unwrap();
+        }
         let (url, mut streams) = tunnel_server(None).await;
         let wicket = start(&url, &console_args);
         let stream = tokio::time::timeout(HANG, streams.recv())
@@ -1015,8 +1030,8 @@ async fn on_data(
 /// its VM's restart, fsynced or not (the stop writes it out), a start that fails (the old VM
 /// started again on it) and its growth, a smaller size refused; a VM never listening in its
 /// place holding no other edit, none coming back on the disk meanwhile; for the app's VM alone,
-/// its id's in a jail; listed, and not removed under its app. One more file left unsynced: the
-/// wicket's end writes it out.
+/// its id's in a jail; listed, and not removed under its app. One more file left unsynced, and a
+/// start under way: the wicket's end writes them out.
 async fn disk_app(
     tunnel: &mut ServerTunnel,
     wicket: &Wicket,
@@ -1142,10 +1157,11 @@ async fn disk_app(
     assert_eq!(field(&same, "boot id"), booted, "its VM untouched");
 
     // a VM never listening in its place: the old one stopped, no edit waiting for its start, no
-    // VM coming back on the disk meanwhile; the next edit takes over, all on the disk kept
+    // VM coming back on the disk meanwhile; the next edit takes over, all on the disk kept, what
+    // the VM taken over from wrote too (its stop writes it out)
     let again = "its VM starts again";
     let starts = wicket.log().matches(again).count();
-    let hung = serde_json::json!({"disk": "/tmp/data", "disk-mib": 128, "port": 9999, "boot-ms": 60_000, "env": {"RUN": "2"}});
+    let hung = serde_json::json!({"disk": "/tmp/data", "disk-mib": 128, "port": 9999, "boot-ms": 60_000, "env": {"RUN": "2", "WRITE_AT_START": "hung"}});
     let image = sha256.to_string();
     let hanging = tokio::spawn(async move { put_data(at, &image, hung).await });
     let deadline = Instant::now() + SAID;
@@ -1153,6 +1169,7 @@ async fn disk_app(
         assert!(Instant::now() < deadline, "not stopped; {}", wicket.log());
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    said(wicket, "wrote hung").await;
     another_app(tunnel, wicket, sha256).await;
     assert!(!hanging.is_finished(), "it waited for the start");
     assert_eq!(listed(wicket, "data.local").await["vms"]["shared"], false);
@@ -1177,6 +1194,8 @@ async fn disk_app(
     );
     let read = on_data(tunnel, &address, conn_id, "/disk?read=a", "").await;
     assert_eq!(read, "fsynced");
+    let read = on_data(tunnel, &address, conn_id, "/disk?read=hung", "").await;
+    assert_eq!(read, "unsynced", "{}", wicket.log());
 
     // a wedged guest (its children, unjailed): its stop gives up in time, the VM killed, the
     // next one started on what it had made durable
@@ -1233,6 +1252,15 @@ async fn disk_app(
     // for the wicket's end to write out, and the restart to find
     let wrote = on_data(tunnel, &address, conn_id, "/disk?write=c", "at the end").await;
     assert!(wrote.starts_with("wrote "), "{wrote}");
+
+    // a start under way at the wicket's end, on a disk of its own: stopped before it ends, its
+    // process longer in ending than every other stop
+    if !jailed {
+        let late = serde_json::json!({"disk": "/tmp/late", "disk-mib": 64, "port": 9999, "boot-ms": 60_000, "env": {"WRITE_AT_START": "late", "LINGER_MS": "2000"}});
+        let late = app_body("late.local", sha256, late);
+        tokio::spawn(async move { console(at, "PUT", "/api/apps/late", true, late).await });
+        said(wicket, "wrote late").await;
+    }
 }
 
 /// The disk after the wicket's restart (a kill of the keeper, when `jailed`; else its end):
