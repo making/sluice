@@ -49,6 +49,8 @@ hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 # paused time for the budget's waits
 tokio = { version = "1", features = ["test-util"] }
+# what a connection's socket was set to
+socket2 = "0.6"
 
 [build-dependencies]
 sluice-build-info = { path = "../sluice-build-info" }

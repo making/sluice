@@ -127,6 +127,10 @@ writes once 3 probes went unanswered or one was answered with a reset, which end
 relay and releases its slot. A peer that is there answers the probes; only the verbatim
 idle timeout closes a live connection for idling.
 
+The wickets set the same, fixed, on every `--listen` socket and, on
+sluice-wicket-runtime-firecracker, every egress socket to a destination (`listener::keep_alive`).
+A route's `idle-ms` does not stand in for it: it is off by default, and cuts live peers too.
+
 ## Half-close probes
 
 A client's FIN does not tell whether it half-closed or left: HTTP/1.1 lets a half-closed

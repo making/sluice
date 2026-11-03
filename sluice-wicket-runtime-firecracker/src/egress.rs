@@ -265,6 +265,7 @@ async fn connect(to: &Rule) -> std::io::Result<TcpStream> {
     };
     // the relay adds no delay to the guest's writes
     stream.set_nodelay(true)?;
+    sluice_wicket_tunnel::listener::keep_alive(&stream)?;
     Ok(stream)
 }
 
@@ -385,6 +386,9 @@ mod tests {
             let mut stream = open(&socket, &to).await.unwrap();
             assert_eq!(exchange(&mut stream, b"ping").await, b"got ping", "{to}");
         }
+        // a destination gone without a FIN or reset gives its slot back
+        let connected = connect(&rules[0].parse().unwrap()).await.unwrap();
+        assert!(socket2::SockRef::from(&connected).keepalive().unwrap());
         for to in [
             format!("localhost:{}", port + 1),
             format!("db.internal:{port}"),

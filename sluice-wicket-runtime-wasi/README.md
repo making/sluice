@@ -74,8 +74,9 @@ left out). A single route given by `--wasm`, on a wicket without `--console`, ta
 a route of the config file or the console, whose routes come and go. An unknown host is
 answered 404. Both `--server` and `--listen` serve the tunnel and the listener at once.
 `--max-connections` bounds the listener's connections too, apart from the tunnel's (one
-beyond waits in the backlog). Without `--server` nothing drains: SIGTERM / SIGINT end the
-process at once.
+beyond waits in the backlog); TCP keepalive (60s idle, then 3 probes 10s apart) ends one whose
+client is gone without a FIN or reset. Without `--server` nothing drains: SIGTERM / SIGINT end
+the process at once.
 
 The image `ghcr.io/making/sluice/sluice-wicket-runtime-wasi` (`latest` / `<sha>`, amd64 /
 aarch64) is published on every push to `main` changing the wicket; it takes the same

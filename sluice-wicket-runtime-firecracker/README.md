@@ -203,7 +203,8 @@ the wicket routes a connection once -- a later request on it (an h2 stream, a ke
 request) for another host stays on the first one's route -- and adds no `X-Forwarded-*`
 header (the guest sees what the client sent: the sample's `x-forwarded-for -`), since only
 the first request of a connection would get them. `--max-connections` bounds the listener's
-connections too, apart from the tunnel's (one beyond waits in the backlog).
+connections too, apart from the tunnel's (one beyond waits in the backlog); TCP keepalive (60s
+idle, then 3 probes 10s apart) ends one whose client is gone without a FIN or reset.
 `--firecracker` names the binary (default `firecracker` on the PATH), `--state-dir` the VMs'
 files (their Unix sockets need paths below 108 bytes; the default is a directory of the
 process's own, 0700, under `$XDG_RUNTIME_DIR` (a tmpfs where systemd sets it), else the
@@ -685,7 +686,8 @@ The process connects to them as named. Before it starts, `/init`:
 and relays each connection over vsock (port 1026) to the wicket. The wicket checks the
 destination against the route's rules (a guest's root may ask for any), connects within 10s
 and relays the connection, or refuses it: the process's connection is reset. A VM's egress
-connections open at once are 256 at most. Each is recorded once it ended or was refused, on
+connections open at once are 256 at most; TCP keepalive (as on `--listen`) ends one whose
+destination is gone without a FIN or reset. Each is recorded once it ended or was refused, on
 the wicket's stdout and as an `egress` line of the route's first host in the live access
 log (`vm`, `to`, `peer`, `ms`, `out`, `in`, `error`):
 
