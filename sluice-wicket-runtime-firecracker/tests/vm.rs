@@ -14,7 +14,8 @@
 //! whatever the host and handing through a guest speaking first, not with `--console` nor
 //! from the config file; a reload of the `--config`
 //! file, polled, removing a route and replacing a rootfs; its numbers and an app's changed, the
-//! VMs running kept; a pool's VM going down replaced; the console deploying
+//! VMs running kept; a pool's VM going down replaced; what keeps a route below its `warm` told; the
+//! console deploying
 //! one more route from an uploaded rootfs (refusing what it does not take),
 //! served on the tunnel, listed with its VMs, and an app of two hosts on one
 //! rootfs uploaded by digest, its env seen by the guest, and an app with a disk:
@@ -561,8 +562,137 @@ async fn every_route_serves_http_through_the_tunnel() {
         if !jailed {
             drop(wicket);
             sole_routes(&dir.0, &rootfs, |args| start(&url, args)).await;
+            below_warm(&dir.0, &rootfs, |args| start(&url, args)).await;
         }
     }
+}
+
+/// What keeps a route below its `warm` reads so in its `vms.down` until the VMs are up: the starts
+/// of a pool and the restores of warm clones failing, their snapshot gone, and of a pool finding no
+/// room in the budget. A VM beyond `warm` finding none is its connections' affair alone.
+async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> Wicket) {
+    const POOL: &str = "pool.local";
+    const CLONES: &str = "clones.local";
+    let (state, config) = (scratch.join("below"), scratch.join("below.yaml"));
+    let warm = |pool: u64, clones: u64| {
+        let (rootfs, keep) = (rootfs.display(), KEEP.as_millis());
+        let routes = format!(
+            "watch-interval: 100ms\nroutes:\n\
+             - {{host: {CLONES}, rootfs: {rootfs}, mode: per-connection, warm: {clones}}}\n\
+             - {{host: {POOL}, rootfs: {rootfs}, mode: pool, vms: 2, warm: {pool}, conns: 1, \
+             wait-ms: 200, keep-ms: {keep}}}\n",
+        );
+        std::fs::write(&config, routes).unwrap();
+    };
+    warm(1, 0);
+    let args = [
+        "--config",
+        &config.display().to_string(),
+        "--state-dir",
+        &state.display().to_string(),
+        // a pool's 2 VMs and a template beside them: a reload takes no less
+        "--max-vms",
+        "3",
+        "--listen",
+        "127.0.0.1:0",
+        "--console",
+        "127.0.0.1:0",
+        "--console-token",
+        CONSOLE_TOKEN,
+        "--console-dir",
+        "below-console",
+    ]
+    .map(String::from);
+    let wicket = start(&args);
+    let wicket = &wicket;
+    let short = |route: &serde_json::Value| route["vms"]["down"].is_string();
+    let up =
+        |n| move |route: &serde_json::Value| pooled(n)(route) && route["vms"]["down"].is_null();
+    listed_as(wicket, POOL, up(1)).await;
+
+    let snapshots: Vec<PathBuf> = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|route| route.unwrap().path().join("snapshot/vm.mem"))
+        .filter(|memory| memory.exists())
+        .collect();
+    assert_eq!(snapshots.len(), 2, "{snapshots:?}");
+    let away = |memory: &PathBuf| memory.with_extension("away");
+    let snapshots_gone = || {
+        for memory in &snapshots {
+            std::fs::rename(memory, away(memory)).unwrap();
+        }
+    };
+    let snapshots_back = || {
+        for memory in &snapshots {
+            std::fs::rename(away(memory), memory).unwrap();
+        }
+    };
+
+    snapshots_gone();
+    warm(2, 0);
+    let failing = listed_as(wicket, POOL, short).await;
+    let why = failing["vms"]["down"].as_str().unwrap();
+    assert!(why.starts_with("its start failed: "), "{failing}");
+    assert_eq!(failing["vms"]["pooled"], 1, "{failing}");
+    snapshots_back();
+    listed_as(wicket, POOL, up(2)).await;
+
+    snapshots_gone();
+    warm(1, 1);
+    listed_as(wicket, POOL, up(1)).await;
+    let failing = listed_as(wicket, CLONES, short).await;
+    let why = failing["vms"]["down"].as_str().unwrap();
+    assert!(why.starts_with("its restore failed: "), "{failing}");
+    assert_eq!(failing["vms"]["warm"], 0, "{failing}");
+    snapshots_back();
+    listed_as(wicket, CLONES, |route| {
+        route["vms"]["warm"] == 1 && route["vms"]["down"].is_null()
+    })
+    .await;
+    warm(1, 0);
+    listed_as(wicket, CLONES, |route| route["vms"]["alive"] == 0).await;
+
+    // the budget's last room clones'; a connection on the pool's VM has one more started ahead
+    let serving = async |host: &str| {
+        let mut client = tokio::net::TcpStream::connect(wicket.listening())
+            .await
+            .unwrap();
+        let request = format!("GET / HTTP/1.1\r\nhost: {host}\r\n\r\n");
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = [0; 15];
+        client.read_exact(&mut answer).await.unwrap();
+        assert_eq!(&answer, b"HTTP/1.1 200 OK", "{host}");
+        client
+    };
+    let clones = (serving(CLONES).await, serving(CLONES).await);
+    let mark = wicket.log().len();
+    let on_the_pool = serving(POOL).await;
+    said_after(wicket, mark, "pool VM: no room").await;
+    let beyond = listed(wicket, POOL).await;
+    assert_eq!(beyond["vms"]["down"], serde_json::Value::Null, "{beyond}");
+
+    warm(2, 0);
+    let failing = listed_as(wicket, POOL, short).await;
+    let why = failing["vms"]["down"].as_str().unwrap();
+    assert!(why.starts_with("its start failed: no room"), "{failing}");
+    assert_eq!(failing["vms"]["pooled"], 1, "{failing}");
+    drop(clones);
+    listed_as(wicket, POOL, up(2)).await;
+    drop(on_the_pool);
+}
+
+/// The instances the listing of the app `name` has alive, as `(index, since)`, and its `down`.
+async fn app_alive(wicket: &Wicket, name: &str) -> (Vec<(u64, u64)>, serde_json::Value) {
+    let (status, listing) = console(wicket.console(), "GET", "/api/apps", true, Bytes::new()).await;
+    assert_eq!(status, 200, "{listing}");
+    let apps = listing["apps"].as_array().unwrap();
+    let app = apps.iter().find(|app| app["name"] == name).unwrap();
+    let instance = |alive: &serde_json::Value| {
+        let field = |name| alive[name].as_u64().unwrap();
+        (field("index"), field("since"))
+    };
+    let alive = app["alive"].as_array().unwrap().iter().map(instance);
+    (alive.collect(), app["down"].clone())
 }
 
 /// A route given by `--vm` alone takes any host, nothing read first: a guest speaking first
@@ -1109,39 +1239,32 @@ async fn restarting_app(
     assert_ne!(field(&again, "boot id"), boot_id, "another VM");
     assert_eq!(route.get(next(), "/env").await, "RUN=1\n");
 
-    let up = async || {
-        let (status, listing) = console(at, "GET", "/api/apps", true, Bytes::new()).await;
-        assert_eq!(status, 200, "{listing}");
-        let apps = listing["apps"].as_array().unwrap();
-        let app = apps.iter().find(|app| app["name"] == "crash").unwrap();
-        (app["alive"].clone(), app["down"].clone())
-    };
-    assert_eq!(
-        up().await,
-        (serde_json::json!([0]), serde_json::Value::Null)
-    );
+    let (alive, down) = app_alive(wicket, "crash").await;
+    assert_eq!((alive.len(), alive[0].0), (1, 0), "{alive:?}");
+    assert_eq!(down, serde_json::Value::Null);
+    let replaced = alive[0].1;
 
     // the next end, soon after: told at once, the VM started after a wait, the app listed with
-    // none alive and why until then
+    // none alive and why until then, then up since its own start
     let ended = Instant::now();
     assert_eq!(route.post(next(), "/exit", "").await, "exiting\n");
     let (alive, down) = loop {
-        let (alive, down) = up().await;
+        let (alive, down) = app_alive(wicket, "crash").await;
         if !down.is_null() {
             break (alive, down);
         }
         assert!(ended.elapsed() < RESTART, "not told: {}", wicket.log());
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    assert_eq!(alive, serde_json::json!([]), "{down}");
+    assert_eq!(alive, [], "{down}");
     restarted(wicket, "crash.local", 2).await;
     let waited = ended.elapsed();
     assert!(waited >= Duration::from_secs(1), "{waited:?}");
     assert_eq!(route.get(next(), "/env").await, "RUN=1\n");
-    assert_eq!(
-        up().await,
-        (serde_json::json!([0]), serde_json::Value::Null)
-    );
+    let (alive, down) = app_alive(wicket, "crash").await;
+    assert_eq!((alive.len(), alive[0].0), (1, 0), "{alive:?}");
+    assert_eq!(down, serde_json::Value::Null);
+    assert!(alive[0].1 > replaced, "{alive:?}: not since {replaced}");
 
     let gone = "/api/apps/crash?owner=cf";
     let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
@@ -1501,7 +1624,8 @@ async fn restarting_pool(
     assert_eq!(field(&another, "boot id: "), boot_id, "of its snapshot");
     assert_eq!(served(&[another]), [1], "another VM");
 
-    // the next end, soon after: told at once, the VM cloned after a wait
+    // the next end, soon after: told at once, the VM cloned after a wait, up since its own restore
+    let before = app_alive(wicket, "ending").await.0;
     let ended = Instant::now();
     assert_eq!(route.post(next(), "/exit", "").await, "exiting\n");
     let down = listed_as(wicket, HOST, |route| route["vms"]["down"].is_string()).await;
@@ -1510,6 +1634,10 @@ async fn restarting_pool(
     let waited = ended.elapsed();
     assert!(waited >= Duration::from_secs(1), "{waited:?}");
     assert_eq!(served(&[route.get(next(), "/").await]), [1]);
+    let (after, down) = app_alive(wicket, "ending").await;
+    assert_eq!(down, serde_json::Value::Null);
+    assert_eq!((after.len(), after[0].0), (1, before[0].0), "{after:?}");
+    assert!(after[0].1 > before[0].1, "{after:?}: not since {before:?}");
     drop(route);
 
     let gone = "/api/apps/ending?owner=cf";

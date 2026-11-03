@@ -44,7 +44,7 @@ use hyper::body::Incoming;
 use serde::{Deserialize, Serialize};
 use sluice_wicket_console::http::{Edited, Refusal, Response, error, json, pairs, read};
 use sluice_wicket_console::serve::{self, Service};
-use sluice_wicket_console::status::{Status, settled};
+use sluice_wicket_console::status::{Alive, Status, alive, settled};
 use sluice_wicket_console::store;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -241,7 +241,7 @@ impl Console {
                 },
                 tag: tag.clone(),
                 deployed: deployed.clone(),
-                alive: handler.alive(),
+                alive: alive(handler.alive()),
             });
         }
         AppsView {
@@ -667,8 +667,8 @@ struct AppView {
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<String>,
     deployed: String,
-    /// The instance indices of its instances alive, lowest first.
-    alive: Vec<usize>,
+    /// Its instances alive, lowest index first.
+    alive: Vec<Alive>,
 }
 
 /// An app's sandbox as listed: the env's names in place of the env, left

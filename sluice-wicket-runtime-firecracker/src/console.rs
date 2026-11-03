@@ -52,7 +52,7 @@ use sluice_wicket_console::http::{
     Edited, Intake, Received, Refusal, Response, error, json, pairs, read, receive,
 };
 use sluice_wicket_console::serve::{self, Service};
-use sluice_wicket_console::status::{FailureView, Status, settled};
+use sluice_wicket_console::status::{Alive, FailureView, Status, alive, settled};
 use sluice_wicket_console::store::{
     check_digest, check_host, check_hosts, check_name, check_tag, rfc3339,
 };
@@ -294,7 +294,7 @@ impl Console {
                 sandbox: sandbox_view(&route.spec()),
                 tag: tag.clone(),
                 deployed: deployed.clone(),
-                alive: route.alive(),
+                alive: alive(route.alive()),
                 down: route.down(),
             });
         }
@@ -721,9 +721,9 @@ struct AppView {
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<String>,
     deployed: String,
-    /// The instance indices of its VMs alive, lowest first.
-    alive: Vec<usize>,
-    /// Why a VM it keeps went down, as far as told, until one is up in its place.
+    /// Its VMs alive, lowest index first.
+    alive: Vec<Alive>,
+    /// Why it is short of the VMs it keeps ([`Route::down`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     down: Option<String>,
 }

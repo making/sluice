@@ -345,7 +345,10 @@ is down (the page shows both).
 
 A pool's VM is watched alike. Another one is cloned in its place in a restore's time, from the
 snapshot: at once, then after the same waits below `warm` (a connection finding none has one started
-meanwhile), with `vms.restarts` and `vms.down`, its other VMs serving on.
+meanwhile), with `vms.restarts` and `vms.down`, its other VMs serving on. A start failing below
+`warm` (no room within `wait-ms`, its snapshot gone) is tried again every second, and so are a warm
+clone's restores: `vms.down` says why until `warm` are up. What fails beyond `warm` is the connection's
+to be told, and waiting for room within `wait-ms`, or for a warm clone's, is no failure.
 
 ### Console
 
@@ -465,8 +468,9 @@ digest, or made of an OCI image, first; the app names it:
   listings name the variables only (`"env": ["GREETING"]`), never a value
 - `tag` (optional) is opaque to the wicket, kept and listed as given: a controller tells by it
   what it put, an env it cannot read back included. A tag or hosts alone start no VM
-- `alive` in a listing: the `instance` indices of its VMs alive, lowest first; `down`, when told:
-  why a VM it keeps went down, until one is up in its place
+- `alive` in a listing: its VMs alive, lowest first, `{"index": 0, "since": 1793000000}`: the
+  `instance` index and its start in seconds since the epoch, a clone's restore, a shared VM's boot;
+  `down`, when told: why it is short of the VMs it keeps (`vms.down`), until they are up
 - a PUT is one reload: every host of the app or none, kept only when its VMs started; the same
   app again changes nothing. An app's target names it (`?app=<name>`), so its VMs are its own,
   whoever else names the image; the env is in no target: another env starts its VMs anew. Its

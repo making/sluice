@@ -750,7 +750,7 @@ What holds on both wickets; a component's and a VM's are in
 | app stopped, scaled to 0, or without a route | no app in the wicket: a request gets the wicket's 404, as gorouter answers a route with no instance registered. `cf app` shows `0/0` (stopped: `0/N`, each `DOWN`), `cf push` of `instances: 0` waits for none |
 | route `<host>.<domain>` | a host: labels of `a-z`, `0-9` and `-`. No path, port or wildcard (422). A route serves one app: a second destination is refused; zero-downtime updates are `--strategy rolling` |
 | shared domain | `--domain` |
-| instance state | once the wicket took the app, an entry per [instance alive](#instances), `RUNNING`, and a VM it keeps gone down `CRASHED` with why as `details`, until one is up in its place; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable or has not taken the app. These two list `instances` entries |
+| instance state | once the wicket took the app, an entry per [instance alive](#instances), `RUNNING`, its `since` its own start, and for a VM it keeps gone down or not starting (no room in the wicket's budget, a snapshot gone) `CRASHED` with why as `details`, until it is up; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable or has not taken the app. These two list `instances` entries |
 | rolling deployment | the app put with the new droplet: the wicket swaps it in place; finalized at once |
 | org / space | one of each |
 | health check, log rate, stack, buildpacks | accepted and shown, no effect |
@@ -791,7 +791,8 @@ shared VM has no snapshot to clone the second from ([weighed](../.kb/wicket-fire
 - **A limit above the wicket's own** runs, bounded by the wicket: N x 16 past `--max-instances`
   is no refusal
 - **`cf app`** lists the instances alive, as the wicket has them at each request: a warm one, a VM
-  serving or kept, a request's own while it runs. So `3/3` below a limit of 4, and `0/0`,
+  serving or kept, a request's own while it runs, each `since` its own start (a unit replaced, a VM
+  cloned anew: then; those of one index, as `cf logs` has them below: the lowest's). So `3/3` below a limit of 4, and `0/0`,
   `There are no running instances of this process`, with none: no failure, and `cf push`, `cf restart`
   and `--strategy rolling` finish at it, the CLI's wait ending at an entry `RUNNING` or at no entry.
   The CLI counts the entries, so the limit cannot show as `3/4`: entries for the rest would read

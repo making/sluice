@@ -1,7 +1,7 @@
 //! The resources in Cloud Controller v3's shapes, their lists filtered,
 //! ordered and paginated as the CLI asks.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
@@ -258,69 +258,93 @@ pub fn process(base: &str, state: &State, app: &App) -> Value {
 ///
 /// `DOWN` for a stopped app and, of `instances` entries too, `CRASHED` with the wicket's refusal
 /// as `details` and `STARTING` until it serves the app (`listed`, as it answers now). Serving it,
-/// an entry `RUNNING` per instance alive, by the index `cf logs` names, and `CRASHED` for a VM it
-/// keeps gone down: none is a limit not reached, no failure, as is an app the wicket has no reason
-/// to serve (at 0, without a route).
+/// an entry `RUNNING` per instance alive, by the index `cf logs` names, up since its own start,
+/// and `CRASHED` for what it is short of the VMs it keeps: none is a limit not reached, no failure,
+/// as is an app the wicket has no reason to serve (at 0, without a route).
 pub fn stats(state: &State, app: &App, owner: &str, listed: Option<&ListedApp>) -> Value {
-    let instances = app.process.instances;
-    let all = |instance_state, details: Option<&String>| -> Vec<(u64, &str, Option<String>)> {
-        (0..instances)
-            .map(|index| (index, instance_state, details.cloned()))
+    let all = |since, state, details: Option<&String>| -> Vec<Entry> {
+        (0..app.process.instances)
+            .map(|index| Entry {
+                index,
+                state,
+                details: details.cloned(),
+                since,
+            })
             .collect()
     };
-    let (entries, since) = match (&app.running, app.started) {
-        (Some(running), true) => (
+    let entries = match (&app.running, app.started) {
+        (Some(running), true) => {
+            let all = |state, details| all(running.since, state, details);
             match state.wicket.get(&app.guid) {
                 _ if Controller::desired(state, app, owner).is_none() => Vec::new(),
                 Some(Outcome::Refused(detail)) => all("CRASHED", Some(detail)),
                 Some(Outcome::Running) => match listed {
-                    Some(listed) => alive(listed, instances),
+                    Some(listed) => alive(listed, app.process.instances, running.since),
                     None => all("STARTING", None),
                 },
                 Some(Outcome::Unreachable) | None => all("STARTING", None),
-            },
-            running.since,
-        ),
-        _ => (all("DOWN", None), epoch_secs()),
+            }
+        }
+        _ => all(epoch_secs(), "DOWN", None),
     };
-    let uptime = epoch_secs().saturating_sub(since);
     let resources: Vec<Value> = entries
         .into_iter()
-        .map(|(index, instance_state, details)| {
+        .map(|entry| {
             json!({
-                "type": "web", "index": index, "state": instance_state, "routable": true,
+                "type": "web", "index": entry.index, "state": entry.state, "routable": true,
                 "usage": {"time": now(), "cpu": 0.0, "cpu_entitlement": 0.0, "mem": 0, "disk": 0, "log_rate": 0},
                 "host": "wicket", "instance_internal_ip": "127.0.0.1", "instance_ports": [],
-                "uptime": uptime,
+                "uptime": epoch_secs().saturating_sub(entry.since),
                 "mem_quota": app.process.memory_mb << 20,
                 "disk_quota": app.process.disk_mb << 20,
                 "log_rate_limit": app.process.log_rate_limit,
                 "fds_quota": 16384, "isolation_segment": null,
-                "details": details, "port": null,
+                "details": entry.details, "port": null,
             })
         })
         .collect();
     json!({"resources": resources})
 }
 
+/// An entry of [`stats`], up `since` a time in seconds since the epoch.
+struct Entry {
+    index: u64,
+    state: &'static str,
+    details: Option<String>,
+    since: u64,
+}
+
 /// The entries of what the wicket lists alive of an app of `instances`, by index, those it names
-/// by one index as one; and of a VM gone down, at the first index below `instances` no other holds.
-fn alive(listed: &ListedApp, instances: u64) -> Vec<(u64, &'static str, Option<String>)> {
-    let indices: BTreeSet<u64> = listed
-        .alive
-        .iter()
-        .map(|index| crate::flume::listed(*index, instances))
-        .collect();
+/// by one index as one, up since the start of the lowest of them, the one staying as the others
+/// finish; and of what it is short of, at the first index below `instances` no other holds, with
+/// no start of its own: since `started`.
+fn alive(listed: &ListedApp, instances: u64, started: u64) -> Vec<Entry> {
+    let mut indices = BTreeMap::new();
+    for instance in &listed.alive {
+        indices
+            .entry(crate::flume::listed(instance.index, instances))
+            .or_insert(instance.since);
+    }
     let down = listed.down.as_ref().and_then(|why| {
-        let free = (0..instances).find(|index| !indices.contains(index))?;
-        Some((free, "CRASHED", Some(why.clone())))
+        let index = (0..instances).find(|index| !indices.contains_key(index))?;
+        Some(Entry {
+            index,
+            state: "CRASHED",
+            details: Some(why.clone()),
+            since: started,
+        })
     });
     let mut entries: Vec<_> = indices
         .into_iter()
-        .map(|index| (index, "RUNNING", None))
+        .map(|(index, since)| Entry {
+            index,
+            state: "RUNNING",
+            details: None,
+            since,
+        })
         .chain(down)
         .collect();
-    entries.sort_by_key(|entry| entry.0);
+    entries.sort_by_key(|entry| entry.index);
     entries
 }
 
@@ -765,7 +789,14 @@ mod tests {
         let domain = state.domains[0].guid.clone();
         let app = state.app_mut(&guid).unwrap();
         app.process.instances = 2;
+        // the instances of `alive`'s indices, each up since the epoch's first second
         let listed = |alive: Value, down: Value| -> ListedApp {
+            let alive: Vec<Value> = alive
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|index| json!({"index": index, "since": 1}))
+                .collect();
             serde_json::from_value(json!({
                 "name": "a", "owner": "cf", "hosts": [], "deployed": "now",
                 "component": {"sha256": "", "name": ""}, "sandbox": {},
@@ -856,6 +887,22 @@ mod tests {
                 "{alive}"
             );
         }
+
+        // each entry up since its own start: the lowest index's of those it holds; what has none,
+        // since the app's
+        let started = epoch_secs();
+        let mut one = listed(json!([0]), json!("exit 83"));
+        one.alive = serde_json::from_value(json!([
+            {"index": 1, "since": started - 100},
+            {"index": 3, "since": started - 200},
+        ]))
+        .unwrap();
+        let uptimes = stats(&state, state.app(&guid).unwrap(), "cf", Some(&one));
+        let uptime = |at: usize| uptimes["resources"][at]["uptime"].as_u64().unwrap();
+        assert_eq!(uptimes["resources"][1]["state"], "RUNNING");
+        assert!((100..110).contains(&uptime(1)), "{uptimes}");
+        assert_eq!(uptimes["resources"][0]["state"], "CRASHED");
+        assert!(uptime(0) >= started, "the app's: {uptimes}");
     }
 
     #[test]

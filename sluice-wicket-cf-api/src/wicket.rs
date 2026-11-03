@@ -175,11 +175,19 @@ pub struct ListedApp {
     #[serde(flatten)]
     pub app: AppBody,
     pub deployed: String,
-    /// The wicket's indices of the instances alive, as the live access log names them.
-    pub alive: Vec<u64>,
-    /// Why a VM it keeps went down, until one is up in its place.
+    /// The instances alive, lowest index first.
+    pub alive: Vec<ListedInstance>,
+    /// Why it is short of the VMs it keeps: one went down, or does not start.
     #[serde(default)]
     pub down: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct ListedInstance {
+    /// The wicket's index, as the live access log names it.
+    pub index: u64,
+    /// Its start, in seconds since the epoch.
+    pub since: u64,
 }
 
 #[derive(Deserialize, Debug)]

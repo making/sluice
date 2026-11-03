@@ -1,7 +1,8 @@
-//! What the page shows of a wicket's reloads besides its routes, and the long
-//! poll following them.
+//! What the page shows of a wicket's reloads besides its routes, the long poll
+//! following them, and what a listing says of an app's instances.
 
-use std::time::{Duration, SystemTime};
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tokio::sync::watch;
@@ -10,6 +11,27 @@ use crate::store::rfc3339;
 
 /// How long `GET /api/routes?after=<the current revision>` waits for a change.
 pub const LONG_POLL: Duration = Duration::from_secs(25);
+
+/// An instance alive, as an app's listing names it.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct Alive {
+    /// As the live access log names it.
+    pub index: usize,
+    /// Its start, in seconds since the epoch.
+    pub since: u64,
+}
+
+/// `held`, the instances alive and their starts, lowest index first.
+pub fn alive(held: BTreeMap<usize, SystemTime>) -> Vec<Alive> {
+    held.into_iter()
+        .map(|(index, start)| Alive {
+            index,
+            since: start
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs()),
+        })
+        .collect()
+}
 
 /// What the console shows of the reloads besides the table.
 #[derive(Clone, Default)]

@@ -505,8 +505,9 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
   load; the same app again changes nothing, and an app keeps its `deployed` time while its
   component and sandbox stay. An app listed by `GET /api/apps` is a body its PUT takes (less
   `name`, `deployed` and `alive`, and the env's values); a PUT is 1MiB at most
-- `alive` in a listing: the [indices](#live-access-log) of its instances alive, lowest first, a
-  warm one's and a request's own while it runs
+- `alive` in a listing: its instances alive, lowest first, a warm one's and a request's own while
+  it runs, `{"index": 0, "since": 1793000000}`: the [index](#live-access-log) and its start in seconds
+  since the epoch, a replacement's its own
 - an app's routes share a handler, and never with another app (its target names it,
   `…/counter.wasm?app=counter&…`): its pool, its `instances` cap and its guests' output stay
   its own. Its target names neither `pool` nor `instances`: a PUT changing them is [no change of

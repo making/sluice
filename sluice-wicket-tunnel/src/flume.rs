@@ -17,7 +17,7 @@
 //! and redialed with a backoff of 1s doubling to 30s whenever it ends; a
 //! flume down costs a warning per 5 minutes.
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -313,32 +313,32 @@ impl Tap {
 }
 
 /// The instance indices a route's instances hold, which the `instance` of
-/// their lines names: unique among those alive, as CF numbers an app's.
+/// their lines names: unique among those alive, as CF numbers an app's. Each with when it was
+/// taken: its instance's start.
 #[derive(Default)]
-pub struct Indices(Mutex<BTreeSet<usize>>);
+pub struct Indices(Mutex<BTreeMap<usize, SystemTime>>);
 
 impl Indices {
     /// The lowest index from `from` up that no instance holds.
     pub fn take(self: &Arc<Self>, from: usize) -> Index {
         let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let mut index = from;
-        for taken in held.range(from..) {
+        for (taken, _) in held.range(from..) {
             if *taken != index {
                 break;
             }
             index += 1;
         }
-        held.insert(index);
+        held.insert(index, SystemTime::now());
         Index {
             indices: self.clone(),
             index,
         }
     }
 
-    /// The indices held, lowest first: the instances alive.
-    pub fn held(&self) -> Vec<usize> {
-        let held = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        held.iter().copied().collect()
+    /// The indices held and their starts: the instances alive.
+    pub fn held(&self) -> BTreeMap<usize, SystemTime> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 

@@ -19,7 +19,7 @@
 //! flume they and a line per answered request reach the live access log too
 //! (`flume`).
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -27,6 +27,7 @@ use std::str::FromStr as _;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context as TaskContext, Poll};
+use std::time::SystemTime;
 
 use http_body_util::BodyExt as _;
 use tokio::io::AsyncWrite;
@@ -2085,12 +2086,12 @@ impl Handler {
         }
     }
 
-    /// The instance indices of the stores alive, lowest first: the pool's units on their slot and
-    /// the per-request ones, whose stores end with their requests.
-    pub fn alive(&self) -> Vec<usize> {
+    /// The instance indices of the stores alive and their starts: the pool's units on their slot
+    /// (a replacement's its own) and the per-request ones, whose stores end with their requests.
+    pub fn alive(&self) -> BTreeMap<usize, SystemTime> {
         let mut alive = self.pool.state.lock().unwrap().alive.clone();
         alive.extend(self.cold.held());
-        alive.into_iter().collect()
+        alive
     }
 
     /// Stores whose owning task is alive: the pool's units and the
@@ -2198,8 +2199,8 @@ struct PoolState {
     target: usize,
     /// The indices of the live unit tasks, the ones waiting for a slot included.
     units: BTreeSet<usize>,
-    /// Those of the units on their slot: a store is theirs from then on.
-    alive: BTreeSet<usize>,
+    /// Those of the units on their slot, and since when: a store is theirs from then on.
+    alive: BTreeMap<usize, SystemTime>,
     /// Units ever spawned; growth beyond the target signals recycling
     /// (diagnostics, and asserted in tests).
     spawned: usize,
@@ -2228,7 +2229,7 @@ impl Pool {
                 idle: VecDeque::new(),
                 target,
                 units: (0..target).collect(),
-                alive: BTreeSet::new(),
+                alive: BTreeMap::new(),
                 spawned: 0,
                 served: 0,
                 closed: false,
@@ -2425,7 +2426,8 @@ impl Drop for Retire {
 
 /// The body of the pooled unit `index`, on its instance slot.
 async fn run_unit(pool: Arc<Pool>, slot: Slot, index: usize) {
-    pool.state.lock().unwrap().alive.insert(index);
+    let started = SystemTime::now();
+    pool.state.lock().unwrap().alive.insert(index, started);
     // Declared first, so dropped last: after the store.
     let mut retire = Retire {
         pool: pool.clone(),
@@ -4309,6 +4311,7 @@ pub(crate) mod tests {
     async fn a_panicking_unit_is_replaced_and_requests_keep_serving() {
         let handler = pooled(&hello().await, Sandbox::default(), 1);
         restocked(&handler, 1).await;
+        let unit = handler.alive()[&0];
         let body = exchange(&handler, &get("/panic")).await;
         assert!(body.starts_with("HTTP/1.1 5"), "head: {body}");
 
@@ -4317,6 +4320,7 @@ pub(crate) mod tests {
         assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
         assert_eq!(pool(&handler).served(), 2, "both requests pooled");
         assert_eq!(pool(&handler).spawned(), 2, "one replacement");
+        assert!(handler.alive()[&0] > unit, "of its index, its own start");
     }
 
     /// `/spin` and `/balloon` degrade to clean responses on pooled units
@@ -4390,7 +4394,9 @@ pub(crate) mod tests {
         )
         .unwrap();
         restocked(&handler, 1).await;
-        assert_eq!(handler.alive(), [0], "the unit, serving none");
+        let alive = || handler.alive().into_keys().collect::<Vec<_>>();
+        assert_eq!(alive(), [0], "the unit, serving none");
+        let unit = handler.alive()[&0];
 
         // occupy the only unit for the ~1s the stream takes
         let streamed = handler.clone();
@@ -4402,7 +4408,10 @@ pub(crate) mod tests {
         // index another per-request instance holds
         let held = handler.cold.take(1);
         assert_eq!(held.index, 1, "the lowest from the pool's size up");
-        assert_eq!(handler.alive(), [0, 1]);
+        let starts = handler.alive();
+        assert_eq!(alive(), [0, 1]);
+        assert_eq!(starts[&0], unit, "the unit's own");
+        assert!(starts[&1] > unit, "the request's own");
         let body = exchange(&handler, &get("/")).await;
         assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
         assert_eq!(
@@ -4431,7 +4440,7 @@ pub(crate) mod tests {
         eventually(
             "the cold index is listed no more",
             Duration::from_secs(5),
-            || handler.alive() == [0],
+            || alive() == [0],
         )
         .await;
     }

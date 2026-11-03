@@ -15,11 +15,11 @@
 //! go as `keep-ms` has them go, once their connections ended. What serves none of a VM per
 //! connection goes at once: it has no connections to finish, and is in the way of the next.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use sluice_wicket_console::env::Env;
 use sluice_wicket_tunnel::flume::{Index, Indices};
@@ -589,7 +589,7 @@ pub struct Taken {
     pub booted: Duration,
     pub taken: Duration,
     /// When it was taken.
-    pub at: std::time::SystemTime,
+    pub at: SystemTime,
 }
 
 enum Held {
@@ -763,6 +763,8 @@ enum Backend {
         suspects: mpsc::Sender<()>,
         /// What its watch follows, until it starts ([`Route::watch`]).
         unwatched: Mutex<Option<(Option<Output>, mpsc::Receiver<()>)>>,
+        /// When its VM came up: a route has one VM, another one is another route.
+        started: SystemTime,
     },
     /// Per-connection and reuse modes: a clone per connection at a time.
     Cloned {
@@ -789,6 +791,8 @@ impl Current {
 /// route's VM.
 struct Warm {
     clones: Mutex<VecDeque<Cloned>>,
+    /// Why the last restore failed, until one succeeds.
+    failed: Mutex<Option<String>>,
     bounds: Current,
     capacity: Arc<Capacity>,
     route: u64,
@@ -813,6 +817,7 @@ impl Warm {
 
     /// One more clone, unless `warm` or `vms` went down meanwhile: then it is killed.
     fn put(&self, clone: Cloned) {
+        *self.failed.lock().unwrap() = None;
         let mut clones = self.clones.lock().unwrap();
         if clones.len() < self.bounds.get().warm && !self.capacity.over(self.route) {
             clones.push_back(clone);
@@ -821,6 +826,7 @@ impl Warm {
 
     /// Kills what is past `warm`.
     fn adjust(&self) {
+        *self.failed.lock().unwrap() = None;
         let warm = self.bounds.get().warm;
         let past = {
             let mut clones = self.clones.lock().unwrap();
@@ -1005,8 +1011,9 @@ struct Members {
     full: Option<Full>,
     /// No VM is started to make up `warm` again before then, after a failure or a VM going down.
     retry: Option<Instant>,
-    /// Counts the VMs that went down; why the last did, until another one is up.
+    /// Counts the VMs that went down.
     downs: u64,
+    /// Why the last VM went down or the last start failed, until `warm` are up ([`Route::down`]).
     down: Option<String>,
     backoff: Backoff,
 }
@@ -1029,6 +1036,7 @@ impl Members {
     fn failed(&mut self, e: BoxError) {
         self.failures += 1;
         self.failed = e.to_string();
+        self.down = Some(format!("its start failed: {e}"));
         self.full = e.downcast().ok().map(|full| *full);
         self.retry = Some(Instant::now() + POOL_RETRY);
     }
@@ -1173,7 +1181,6 @@ impl SharedPool {
                 Ok(mut clone) => {
                     let id = members.next_id;
                     members.next_id += 1;
-                    members.down = None;
                     let output = clone.output.take();
                     let (suspects, suspected) = mpsc::channel(1);
                     let clone = Arc::new(clone);
@@ -1187,6 +1194,9 @@ impl SharedPool {
                         since: Instant::now(),
                         suspects,
                     });
+                    if members.vms.len() >= self.bounds.get().warm {
+                        members.down = None;
+                    }
                 }
                 Err(e) => {
                     eprintln!("route {}: pool VM: {e}", self.cloner.hosts.current().label);
@@ -1472,7 +1482,7 @@ impl Cloner {
             time: match crate::vm::RESTORE_ADVANCES_CLOCK {
                 true => None,
                 false => Some(
-                    std::time::SystemTime::now()
+                    SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_err(std::io::Error::other)?,
                 ),
@@ -1719,6 +1729,7 @@ impl Route {
                     vm,
                     suspects,
                     unwatched: Mutex::new(Some((output, suspected))),
+                    started: SystemTime::now(),
                 }
             }
             Mode::PerConnection | Mode::Reuse | Mode::Pool => {
@@ -1759,7 +1770,7 @@ impl Route {
                     memory: size,
                     booted,
                     taken: started.elapsed(),
-                    at: std::time::SystemTime::now(),
+                    at: SystemTime::now(),
                 });
                 println!(
                     "route {label}: template booted in {}ms, primed with {} request(s), snapshot taken after {}ms ({} MiB memory file)",
@@ -1819,6 +1830,7 @@ impl Route {
                     let changed = Arc::new(Notify::new());
                     let warm = Arc::new(Warm {
                         clones: Mutex::default(),
+                        failed: Mutex::default(),
                         bounds: bounds.clone(),
                         capacity: capacity.clone(),
                         route: need.route,
@@ -1937,7 +1949,11 @@ impl Route {
                 }
             }
             Backend::Pool(pool) => {
-                pool.members.lock().unwrap().retry = None;
+                // tried again at once: what it was short for before is not this
+                let mut members = pool.members.lock().unwrap();
+                members.retry = None;
+                members.down = None;
+                drop(members);
                 pool.changed.notify_waiters();
             }
         }
@@ -1970,13 +1986,13 @@ impl Route {
         vms
     }
 
-    /// The instance indices of its VMs alive, lowest first: a clone's from its restore on, the
+    /// The instance indices of its VMs alive and their starts: a clone's from its restore on, the
     /// shared VM's 0 (see the module's).
-    pub fn alive(&self) -> Vec<usize> {
+    pub fn alive(&self) -> BTreeMap<usize, SystemTime> {
         match &self.backend {
-            Backend::Shared { vm, .. } => match vm.lock().unwrap().is_some() {
-                true => vec![0],
-                false => Vec::new(),
+            Backend::Shared { vm, started, .. } => match vm.lock().unwrap().is_some() {
+                true => BTreeMap::from([(0, *started)]),
+                false => BTreeMap::new(),
             },
             Backend::Cloned { cloner, .. } => cloner.indices.held(),
             Backend::Pool(pool) => pool.cloner.indices.held(),
@@ -2009,8 +2025,12 @@ impl Route {
         matches!(&self.backend, Backend::Shared { vm, .. } if vm.lock().unwrap().is_none())
     }
 
-    /// Why its shared VM is down, as far as told; why its pool's last VM went, while it is below
-    /// `warm`.
+    /// Why it is short of the VMs it keeps: its shared VM down, as far as told; a pool below `warm`,
+    /// its last VM gone or its last start failed; clones below `warm`, the last restore failed.
+    ///
+    /// None for what it does not keep, however it fails (a VM beyond `warm`: its connection is
+    /// told), and for what is only under way: a start waiting for room within `wait-ms`, warm
+    /// clones waiting for room, which they only take where no VM waits for it.
     pub fn down(&self) -> Option<String> {
         match &self.backend {
             Backend::Pool(pool) => {
@@ -2018,8 +2038,12 @@ impl Route {
                 let members = pool.members.lock().unwrap();
                 members.down.clone().filter(|_| members.vms.len() < warm)
             }
-            _ if self.stopped() => self.down.lock().unwrap().clone(),
-            _ => None,
+            Backend::Cloned { warm, .. } => {
+                let failed = warm.failed.lock().unwrap().clone();
+                failed.filter(|_| warm.missing() > 0)
+            }
+            Backend::Shared { .. } if self.stopped() => self.down.lock().unwrap().clone(),
+            Backend::Shared { .. } => None,
         }
     }
 
@@ -2347,36 +2371,41 @@ async fn keep_warm(
         tokio::select! {
             () = notified => {}
             Some(restored) = restoring.join_next() => {
-                if let Ok(Some(clone)) = restored
+                if let Ok(restored) = restored
                     && let Some(warm) = warm.upgrade()
                 {
-                    warm.put(clone);
+                    match restored {
+                        Ok(clone) => warm.put(clone),
+                        Err(why) => *warm.failed.lock().unwrap() = Some(why),
+                    }
                 }
             }
         }
     }
 }
 
-/// A clone restored in room no VM waits for, ready: it answers at once as it is handed out.
+/// A clone restored in room no VM waits for, ready: it answers at once as it is handed out. Why
+/// not, once it is time to try again.
 async fn warm_clone(
     cloner: Arc<Cloner>,
     port: u32,
     capacity: Arc<Capacity>,
     need: Need,
-) -> Option<Cloned> {
+) -> Result<Cloned, String> {
     let slot = capacity.take_spare(need).await;
+    let failed = |e: BoxError| {
+        eprintln!("warm clone: {e}");
+        format!("its restore failed: {e}")
+    };
     match cloner.restore(slot).await {
         Ok(clone) => match clone.vm.dial_ready(port, RESTORE_TIMEOUT).await {
-            Ok(_probe) => Some(clone),
-            Err(e) => {
-                eprintln!("warm clone: {e}");
-                None
-            }
+            Ok(_probe) => Ok(clone),
+            Err(e) => Err(failed(e)),
         },
         Err(e) => {
-            eprintln!("warm clone: {e}");
+            let why = failed(e);
             tokio::time::sleep(Duration::from_secs(1)).await;
-            None
+            Err(why)
         }
     }
 }
@@ -2405,6 +2434,9 @@ mod tests {
             let mut members = Members::default();
             members.failed(failed);
             assert_eq!(members.failures, 1);
+            let failure = members.failure().to_string();
+            let down = format!("its start failed: {failure}");
+            assert_eq!(members.down.as_ref(), Some(&down));
             let failure = pool_failure("a.local", members.failure());
             assert_eq!(failure.is::<Full>(), is_full, "{failure}");
             assert!(failure.to_string().starts_with(says), "{failure}");
