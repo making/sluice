@@ -5,7 +5,7 @@
 //! The routes are reloaded without a restart ([`Reloader`]): on a change of
 //! their files (the `--config` file, a rootfs, the kernel, the firecracker
 //! binary) or on SIGHUP. A reload reads the routes again and starts the VMs
-//! of every target that is new or whose spec or files changed -- a shared VM
+//! of every target that is new or whose VMs or files changed -- a shared VM
 //! booted, a cloned route's template booted and snapshotted again --
 //! before it changes anything: one failure keeps the current table. A target
 //! kept as it was keeps its VMs. A changed target serves its next connection
@@ -14,6 +14,11 @@
 //! acknowledged its removal: the server may have routed a connection to it
 //! before. A target kept serves under the hosts of the reload: its VMs' output
 //! is named after them.
+//!
+//! How many VMs and how long (`route::Bounds`) is no change of them: the route running takes it
+//! as it is ([`Route::adjust`]). An app's target names none of it, so nothing is advertised; a
+//! route's does, so its VMs go on under the target of its new numbers, the old one served by them
+//! as a removed one is.
 //!
 //! A disk has one writer (`disk`), so a route's VM on a disk is the exception to the
 //! order: once every other target started, the VM holding the disk is stopped, then
@@ -65,17 +70,9 @@ use crate::config::{File, Origin, RouteSource};
 use crate::deployed::{self, AppSpec, Deployed, Options};
 use crate::listener;
 use crate::output::Sink;
-use crate::route::{Down, Lease, Route, RouteSpec, Starting};
+use crate::route::{Backoff, Down, Lease, Route, RouteSpec, Starting};
 use crate::vm::Places;
 use crate::wire;
-
-/// The wait before a shared VM's next start, past the first: doubled up to [`RESTART_WAIT_MAX`].
-const RESTART_WAIT: Duration = Duration::from_secs(1);
-
-const RESTART_WAIT_MAX: Duration = Duration::from_secs(60);
-
-/// A shared VM up that long going down is started again at once, as the first one was.
-const RESTART_STABLE: Duration = Duration::from_secs(60);
 
 /// The routes at one point, as every node stream advertises them.
 pub struct Table {
@@ -141,7 +138,7 @@ impl Table {
         let disks = self
             .routes
             .values()
-            .filter(|route| route.spec.vm.disk.is_some());
+            .filter(|route| route.vm().disk.is_some());
         for route in disks {
             let route = route.clone();
             stopping.spawn(async move { route.stop().await });
@@ -211,7 +208,7 @@ impl Binding for Connection {
         };
         let failed = io.failed();
         let relayed = tokio::select! {
-            relayed = wire::relay(&mut io, stream, self.route.spec.idle) => relayed,
+            relayed = wire::relay(&mut io, stream, self.route.idle()) => relayed,
             // the server's ERROR or the stream's end: nothing is sent any more
             () = failed => Ok(()),
         };
@@ -260,8 +257,8 @@ fn stamps<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Stamps {
         .collect()
 }
 
-/// A target's route, and the spec and the stamps of its files it was started
-/// from.
+/// A target's route, the spec it takes (its bounds changing as it runs) and the stamps of the
+/// files it was started from.
 struct Started {
     spec: RouteSpec,
     stamps: Stamps,
@@ -292,8 +289,8 @@ enum Files {
 struct Restart {
     /// The VMs started so, since its spec was new.
     count: u64,
-    /// The wait before its next start: none, then [`RESTART_WAIT`] doubled.
-    wait: Duration,
+    /// The wait before its next start.
+    backoff: Backoff,
     /// Since when its VM is up, once one was started so.
     up: Option<SystemTime>,
     /// The room of the VM that went down: none after a reload stopped it.
@@ -306,23 +303,15 @@ struct Restart {
 }
 
 impl Restart {
-    /// Its VM went down at `now`: after [`RESTART_STABLE`] up, or none started so yet, the wait
-    /// starts over.
+    /// Its VM went down at `now`.
     fn went_down(&mut self, now: SystemTime) {
-        let lived = self
-            .up
-            .and_then(|up| now.duration_since(up).ok())
-            .is_none_or(|up| up >= RESTART_STABLE);
-        if lived {
-            self.wait = Duration::ZERO;
-        }
+        let lived = self.up.and_then(|up| now.duration_since(up).ok());
+        self.backoff.went_down(lived);
     }
 
     /// The wait before its next start; the one after it is longer.
     fn next_wait(&mut self) -> Duration {
-        let wait = self.wait;
-        self.wait = (wait * 2).clamp(RESTART_WAIT, RESTART_WAIT_MAX);
-        wait
+        self.backoff.next_wait()
     }
 }
 
@@ -338,13 +327,18 @@ struct Restarted {
 pub struct Change {
     added: Vec<String>,
     removed: Vec<String>,
-    /// Hosts whose VMs were started again: their spec or files changed.
+    /// Hosts whose VMs were started again: what they are or their files changed.
     restarted: Vec<String>,
+    /// Hosts whose VMs took how many and how long as they run.
+    adjusted: Vec<String>,
 }
 
 impl Change {
     pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty() && self.restarted.is_empty()
+        self.added.is_empty()
+            && self.removed.is_empty()
+            && self.restarted.is_empty()
+            && self.adjusted.is_empty()
     }
 }
 
@@ -355,6 +349,7 @@ impl std::fmt::Display for Change {
             ("added", &self.added),
             ("removed", &self.removed),
             ("restarted", &self.restarted),
+            ("adjusted", &self.adjusted),
         ] {
             if !hosts.is_empty() {
                 parts.push(format!("{what} {}", hosts.join(", ")));
@@ -526,6 +521,8 @@ struct Start {
 enum Way {
     /// It has them.
     Kept,
+    /// They serve this other target, which no route asks for any more: its numbers changed.
+    Moved(String),
     Start,
     /// Started once the route holding its disk stopped.
     Swap(Arc<Route>),
@@ -537,7 +534,12 @@ struct Plan {
     starts: Vec<Start>,
     /// Started after those, each once the route holding its disk stopped.
     swaps: Vec<(Arc<Route>, Start)>,
+    /// Target -> the target whose VMs it takes ([`Way::Moved`]): none to start.
+    moved: Moved,
 }
+
+/// Target -> the target whose VMs it takes.
+type Moved = HashMap<String, String>;
 
 impl Plan {
     fn is_empty(&self) -> bool {
@@ -720,7 +722,7 @@ impl Reloader {
             .map(|start| (start.target.clone(), reloader.starter(start, None)))
             .collect();
         let started = all_started(starting).await?;
-        reloader.publish(specs, started);
+        reloader.publish(specs, started, Moved::new());
         Ok(reloader)
     }
 
@@ -977,7 +979,7 @@ impl Reloader {
             self.source.deploy(previous);
             return Ok(Routed::Waits(plan, ready));
         }
-        let change = self.publish(specs, ready);
+        let change = self.publish(specs, ready, plan.moved);
         self.logged(&reason, &change);
         let saved = self.deployed().save();
         self.collect_garbage();
@@ -1048,7 +1050,7 @@ impl Reloader {
         let plan = self.plan(&specs, &mut ready, Files::Followed);
         if plan.is_empty() {
             self.file = file;
-            let change = self.publish(specs, ready);
+            let change = self.publish(specs, ready, plan.moved);
             self.logged(&reason, &change);
             Status::recovered(&self.status);
             return;
@@ -1073,12 +1075,25 @@ impl Reloader {
     /// not ask of `ready` goes.
     fn plan(&self, specs: &[(RouteSpec, Origin)], ready: &mut Vms, files: Files) -> Plan {
         let specs: Vec<RouteSpec> = specs.iter().map(|(spec, _)| spec.clone()).collect();
+        let targets = targets(specs);
+        // the VMs of the targets no route asks for any more, for one of other numbers to take
+        let mut free: Vec<String> = self
+            .started
+            .keys()
+            .filter(|running| !targets.iter().any(|(target, ..)| target == *running))
+            .cloned()
+            .collect();
+        free.sort();
         let mut plan = Plan::default();
         let mut taken = HashMap::new();
-        for (target, spec, hosts) in targets(specs) {
+        for (target, spec, hosts) in targets {
             let stamps = stamps(self::files(&spec));
-            let way = self.way(&target, &spec, &stamps, files);
-            if !matches!(way, Way::Kept)
+            let way = self.way(&target, &spec, &hosts, &stamps, files, &free);
+            if let Way::Moved(from) = &way {
+                free.retain(|running| running != from);
+                plan.moved.insert(target.clone(), from.clone());
+            }
+            if matches!(way, Way::Start | Way::Swap(_))
                 && let Some((target, started)) = ready
                     .remove_entry(&target)
                     .filter(|(_, started)| started.asked(&spec, &stamps, files))
@@ -1093,7 +1108,7 @@ impl Reloader {
                 stamps,
             };
             match way {
-                Way::Kept => {}
+                Way::Kept | Way::Moved(_) => {}
                 Way::Start => plan.starts.push(start),
                 Way::Swap(holder) => plan.swaps.push((holder, start)),
             }
@@ -1133,7 +1148,7 @@ impl Reloader {
                 .collect(),
             None => Vec::new(),
         };
-        let Plan { starts, swaps } = plan;
+        let Plan { starts, swaps, .. } = plan;
         let starts: Vec<_> = starts
             .into_iter()
             .map(|start| (start.target.clone(), self.starter(start, None)))
@@ -1274,12 +1289,12 @@ impl Reloader {
         let restart = self.restarts.entry(target).or_default();
         restart.went_down(SystemTime::now());
         // what starts on its disk takes room of its own
-        let replaced = route.spec.vm.disk.as_ref().is_some_and(|disk| {
+        let replaced = route.vm().disk.as_ref().is_some_and(|disk| {
             let file = std::slice::from_ref(&disk.file);
             self.ahead.values().any(|ahead| ahead.claims(file))
         });
         if !replaced {
-            let memory = u64::from(route.spec.vm.mem_mib);
+            let memory = u64::from(route.vm().mem_mib);
             restart.held = Some(Arc::new(self.capacity.hold(memory)));
         }
         restart.stopping = Some(tokio::spawn(route.stopping()));
@@ -1422,8 +1437,17 @@ impl Reloader {
         as_started
     }
 
-    /// How `target` gets the VMs `spec` asks, the files as `stamps` tell.
-    fn way(&self, target: &str, spec: &RouteSpec, stamps: &Stamps, files: Files) -> Way {
+    /// How `target` of `hosts` gets the VMs `spec` asks, the files as `stamps` tell, the VMs of
+    /// the targets `free` serving no route any more.
+    fn way(
+        &self,
+        target: &str,
+        spec: &RouteSpec,
+        hosts: &[String],
+        stamps: &Stamps,
+        files: Files,
+        free: &[String],
+    ) -> Way {
         // stopped too: it comes back by itself, no reload failing for it
         if self
             .started
@@ -1431,6 +1455,13 @@ impl Reloader {
             .is_some_and(|started| started.asked(spec, stamps, files))
         {
             return Way::Kept;
+        }
+        let from = free.iter().find(|from| {
+            self.started[*from].asked(spec, stamps, files)
+                && self.hosts_of(from).iter().any(|host| hosts.contains(host))
+        });
+        if let Some(from) = from {
+            return Way::Moved(from.clone());
         }
         let holder = spec.vm.disk.as_ref().and_then(|disk| {
             let current = self.routes.current();
@@ -1444,8 +1475,8 @@ impl Reloader {
     }
 
     /// Publishes `specs`, the VMs of `ready` serving their targets from now on, the other
-    /// targets' as they are.
-    fn publish(&mut self, specs: Vec<(RouteSpec, Origin)>, mut ready: Vms) -> Change {
+    /// targets' as they are, `moved`'s under the target of their numbers, each taking its bounds.
+    fn publish(&mut self, specs: Vec<(RouteSpec, Origin)>, mut ready: Vms, moved: Moved) -> Change {
         let (specs, origins): (Vec<RouteSpec>, Vec<Origin>) = specs.into_iter().unzip();
         let origins: HashMap<String, Origin> = specs
             .iter()
@@ -1464,9 +1495,15 @@ impl Reloader {
         let mut change = Change::default();
         let mut new = HashMap::new();
         let mut kept = Vec::new();
-        for (target, _, hosts) in targets(specs) {
-            let Some(started) = ready.remove(&target) else {
-                kept.push((target, hosts));
+        for (target, spec, hosts) in targets(specs) {
+            let Some(mut started) = ready.remove(&target) else {
+                let of = moved.get(&target).unwrap_or(&target);
+                if let Some(running) = self.started.get(of)
+                    && running.route.adjust(spec.bounds)
+                {
+                    change.adjusted.extend(hosts.iter().cloned());
+                }
+                kept.push((target, spec, hosts));
                 continue;
             };
             if self.started.contains_key(&target) {
@@ -1475,6 +1512,9 @@ impl Reloader {
                 self.restarts.remove(&target);
             }
             started.route.rename(&hosts);
+            // they may have changed as it started
+            started.route.adjust(spec.bounds);
+            started.spec = spec;
             new.insert(target, started);
         }
 
@@ -1483,7 +1523,9 @@ impl Reloader {
                 None => change.added.push(up.host.clone()),
                 // its image or options are another target's: VMs started anew all the same
                 Some(old)
-                    if old.target_url != up.target_url && !change.restarted.contains(&up.host) =>
+                    if old.target_url != up.target_url
+                        && !change.restarted.contains(&up.host)
+                        && !change.adjusted.contains(&up.host) =>
                 {
                     change.restarted.push(up.host.clone());
                 }
@@ -1495,10 +1537,18 @@ impl Reloader {
                 change.removed.push(up.host.clone());
             }
         }
-        if change.is_empty() && advertised == current.advertised {
-            // where a route comes from changed alone (a console route's time): in the
-            // generation it was, nothing to advertise
-            if origins != current.origins {
+        let same_routes =
+            change.added.is_empty() && change.removed.is_empty() && change.restarted.is_empty();
+        if same_routes && advertised == current.advertised {
+            for (target, spec, _) in kept {
+                if let Some(started) = self.started.get_mut(&target) {
+                    started.spec = spec;
+                }
+            }
+            // how many and how long, or where a route comes from (a console route's time),
+            // changed alone: in the generation it was, nothing to advertise
+            let moved_on = origins != current.origins;
+            if moved_on {
                 self.routes.publish(Table {
                     generation: current.generation,
                     advertised: current.advertised.clone(),
@@ -1506,6 +1556,8 @@ impl Reloader {
                     origins,
                     console: current.console,
                 });
+            }
+            if moved_on || !change.adjusted.is_empty() {
                 self.status.send_modify(|status| status.revision += 1);
             }
             return change;
@@ -1513,10 +1565,12 @@ impl Reloader {
         let generation = current.generation + 1;
         let mut started: HashMap<String, Started> = kept
             .into_iter()
-            .filter_map(|(target, hosts)| {
-                let kept = self.started.remove_entry(&target)?;
-                kept.1.route.rename(&hosts);
-                Some(kept)
+            .filter_map(|(target, spec, hosts)| {
+                let of = moved.get(&target).unwrap_or(&target);
+                let (_, mut kept) = self.started.remove_entry(of)?;
+                kept.route.rename(&hosts);
+                kept.spec = spec;
+                Some((target, kept))
             })
             .collect();
         for new in new.values() {
@@ -1795,8 +1849,8 @@ fn taken(edit: &Edit, origins: &HashMap<String, Origin>) -> Result<(), Refused> 
     Ok(())
 }
 
-/// Whether the routes can start within `capacity`: their shared VMs and their pools'
-/// warm VMs for good, beside a template at a time (the largest).
+/// Whether the routes can start within `capacity`: their shared VMs and their pools' warm VMs for
+/// good, and a template at a time beside the other routes' (its own come as it is gone).
 fn fits(specs: &[(RouteSpec, Origin)], capacity: &Capacity) -> Result<(), BoxError> {
     let mut targets: Vec<(String, &RouteSpec)> = Vec::new();
     for (spec, _) in specs {
@@ -1805,25 +1859,21 @@ fn fits(specs: &[(RouteSpec, Origin)], capacity: &Capacity) -> Result<(), BoxErr
             targets.push((target, spec));
         }
     }
-    let template = targets
-        .iter()
-        .filter(|(_, spec)| spec.mode.cloned())
-        .map(|(_, spec)| u64::from(spec.vm.mem_mib))
-        .max();
-    let vms = targets
-        .iter()
-        .map(|(_, spec)| spec.resident())
-        .sum::<usize>()
-        + usize::from(template.is_some());
-    let memory: u64 = targets
-        .iter()
-        .map(|(_, spec)| spec.resident() as u64 * u64::from(spec.vm.mem_mib))
-        .sum::<u64>()
-        + template.unwrap_or(0);
+    let kept = |spec: &RouteSpec| spec.resident() as u64 * u64::from(spec.vm.mem_mib);
+    let resident: usize = targets.iter().map(|(_, spec)| spec.resident()).sum();
+    let in_memory: u64 = targets.iter().map(|(_, spec)| kept(spec)).sum();
+    let cloned = || targets.iter().filter(|(_, spec)| spec.mode.cloned());
+    let vms = cloned()
+        .map(|(_, spec)| resident - spec.resident() + 1)
+        .fold(resident, usize::max);
+    let memory = cloned()
+        .map(|(_, spec)| in_memory - kept(spec) + u64::from(spec.vm.mem_mib))
+        .fold(in_memory, u64::max);
     if vms > capacity.max_vms() || capacity.max_memory().is_some_and(|max| memory > max) {
         return Err(format!(
             "the routes need {vms} VM(s) and {memory} MiB of guest memory to start (their shared \
-             VMs, their pools' warm VMs, and a template at a time): over --max-vms {} / --max-memory {}",
+             VMs, their pools' warm VMs, and a template at a time beside the other routes'): over \
+             --max-vms {} / --max-memory {}",
             capacity.max_vms(),
             capacity
                 .max_memory()
@@ -1837,6 +1887,54 @@ fn fits(specs: &[(RouteSpec, Origin)], capacity: &Capacity) -> Result<(), BoxErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The routes' VMs fit for good, and a template beside the other routes': a pool's own come
+    /// as it is gone, so a pool of one needs its one VM, what serves no connection none.
+    #[test]
+    fn the_routes_fit_with_a_template_beside_the_others() {
+        let specs = |routes: &[(&str, &[(&str, &str)])]| {
+            routes
+                .iter()
+                .map(|(host, options)| {
+                    let spec = RouteSpec::configure(
+                        host,
+                        host,
+                        PathBuf::from(format!("/{host}.ext4")),
+                        options.iter().copied(),
+                        Path::new("firecracker"),
+                        Path::new("vmlinux"),
+                    );
+                    (spec.unwrap(), Origin::Flag)
+                })
+                .collect::<Vec<_>>()
+        };
+        let pool: &[(&str, &str)] = &[("mode", "pool"), ("vms", "1"), ("mem", "64")];
+        let large: &[(&str, &str)] = &[
+            ("mode", "pool"),
+            ("vms", "1"),
+            ("warm", "0"),
+            ("mem", "256"),
+        ];
+        let shared: &[(&str, &str)] = &[("mem", "64")];
+        for (routes, max_vms, max_memory, fit) in [
+            (&[("a", pool), ("b", pool)][..], 2, 128, true),
+            (&[("a", pool), ("b", pool)], 1, 128, false),
+            (&[("a", pool), ("b", pool)], 2, 127, false),
+            (&[("a", shared), ("b", pool)], 2, 128, true),
+            // no VM of its own to take a template's place
+            (&[("a", pool), ("b", large)], 1, 320, false),
+            (&[("a", pool), ("b", large)], 2, 319, false),
+            (&[("a", pool), ("b", large)], 2, 320, true),
+        ] {
+            let capacity = Capacity::new(max_vms, Some(max_memory));
+            let hosts: Vec<_> = routes.iter().map(|(host, _)| host).collect();
+            assert_eq!(
+                fits(&specs(routes), &capacity).is_ok(),
+                fit,
+                "{hosts:?} {max_vms} {max_memory}"
+            );
+        }
+    }
 
     /// The wait doubles as a VM keeps going down, up to its bound, and starts over once one
     /// stayed up long enough.

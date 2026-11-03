@@ -294,13 +294,16 @@ pools past `--max-instances` or a host routed twice reject the whole reload, log
 (`routes reload (file change) failed; keeping generation N: ...`), and the routes
 stay as they were until a file changes again or SIGHUP. Otherwise
 (`routes reloaded (file change), generation N: added ...; removed ...; retargeted
-...; updated ...`):
+...; updated ...; adjusted ...`):
 
 - a route whose component (by sha256) and sandbox did not change keeps its handler
   and its warm pool. An `http(s)` component is fetched again only on SIGHUP
 - a component changed on disk serves the next request, of a connection already open
   too; a request in flight finishes on the one it started with. Its target is
   unchanged, so nothing is advertised again
+- a sandbox changed in `pool` or `instances` alone keeps its handler, what runs on it
+  included ([instance pool](#instance-pool)): a route's goes on under the target naming the new
+  numbers, an app's target names neither (`adjusted`), so nothing is advertised
 - an added or removed host, or a changed sandbox (a new target; its env included), is
   advertised again on every node stream. A removed target keeps being served -- a
   connection the server routed before it took the new routes included -- until every
@@ -504,7 +507,8 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
   `name` and `deployed`, and the env's values); a PUT is 1MiB at most
 - an app's routes share a handler, and never with another app (its target names it,
   `…/counter.wasm?app=counter&…`): its pool, its `instances` cap and its guests' output stay
-  its own
+  its own. Its target names neither `pool` nor `instances`: a PUT changing them is [no change of
+  what runs](#instance-pool), and advertises nothing
 - answered as the console's edits, and 409 for a host another source, the page or another app
   routes, for another owner's app, and for a component no upload kept (`"missing":
   ["<sha256>"]`); a 422 names the host whose route did not load (`"host"`; none when no one
@@ -736,6 +740,10 @@ routes together may not exceed the limit, which is checked at startup and on
 every reload. With no slot free, a request waits for whichever comes first, an
 idle unit or a free slot.
 
+A reload changing `pool` or `instances` keeps what runs: the units within the new `pool` serve on
+with what they hold, those missing start, those past it end, an idle one at once and a busy one
+after its request. A request open goes on past a lower cap, which bounds the next ones.
+
 Reuse assumes stateless / reentrant-safe guests: module state legitimately
 persists across a unit's requests, so a misbehaving guest poisons its own
 unit only. A unit is retired and replaced when its request ends in a trap, a
@@ -800,9 +808,9 @@ Kubernetes, `terminationGracePeriodSeconds` (30s by default) bounds it the same 
   `--max-instances` together
 - guest async tasks live within `wit-bindgen`'s runtime; the `spawn`
   caveats about task lifetime apply
-- a reload changing a route's sandbox gives it a new target with its own `instances`
-  cap: until the old target's requests ended, both caps count, so the route may hold
-  up to twice its cap
+- a reload changing a route's sandbox past `pool` and `instances` gives it a new target with its
+  own `instances` cap: until the old target's requests ended, both caps count, so the route may
+  hold up to twice its cap
 - wasi:keyvalue is draft2, without the `watcher` export, and its calls block the guest's
   instance (see [Key-value stores](#key-value-stores-experimental))
 - file changes are seen by modification time, size and inode: a component rewritten

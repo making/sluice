@@ -200,9 +200,10 @@ plus its snapshot on the tmpfs (128 MiB, `mem`):
   idles between requests and is woken for each, a request's latency the sum. New
   connections end at the wicket's worker relaying the node's stream (100% at 9k/s).
 - **A pool costs its snapshot**: its clones share the snapshot's pages, 3 MiB each of their
-  own (sample) or 9-10 (Go), but the snapshot is the whole guest memory (`mem`) on the
+  own (sample) or 9-10 (Go), and the snapshot was then the whole guest memory (`mem`) on the
   tmpfs, where one VM holds the pages its guest touched: 140 MiB for a pool of 4 against
-  56 for one VM of 4 vCPUs (sample).
+  56 for one VM of 4 vCPUs (sample). It now holds what its guest wrote
+  ([below](#a-snapshots-memory)), the table's snapshots at their `Full` size.
 - **A VM's failure takes its connections alone in a pool**: one VM killed (SIGKILL) 3s into
   10s of keep-alive load at c=16, of a pool of 4: its 4 connections cut, no 502, the next
   connections on the others, a VM started in its place (new connections: 2 of 76,896 in
@@ -213,6 +214,67 @@ plus its snapshot on the tmpfs (128 MiB, `mem`):
   all taking the VM first up: 8 keep-alive connections at once on an empty pool
   (`warm=0&conns=1&vms=4`, `--listen`) were served at 9.0k req/s by the first VM, the
   other three idling out; spread, 19.8-20.9k.
+
+## A snapshot's memory
+
+A `Full` snapshot writes all of `mem`. A `Diff` of a VM booted with `track_dirty_pages` writes what
+its guest wrote, the rest holes of a sparse file reading as the zeros that memory was, and resumes
+alone ("diff snapshots of booted VMs ... are immediately resumable", Firecracker's
+`snapshot-support.md`, which keeps Diff a developer preview; v1.17.0, the image's). The clones run
+untracked. `mem=1024`, one vCPU, the debug build, `--listen`, `oha -c 16` for 20,000 requests (Go and
+the JVM 40,000), on the 64-core host: the first answer from the wicket's start; memory after the load
+as a VM's PSS, plus the snapshot on the tmpfs (`du`).
+
+| | first answer | memory | |
+|---|---|---|---|
+| sample guest, shared | 754ms | 73 MiB | |
+| sample guest, pool of one, `Full` | 1,423ms | 24 + 1,024 MiB | 8.1k req/s |
+| sample guest, pool of one, `Diff` | 794ms | 23 + 68 MiB | 9.4k |
+| CNB Go, shared | 873ms | 92 MiB | |
+| CNB Go, pool of one, `Full` | 1,547ms | 38 + 1,024 MiB | 10.1k |
+| CNB Go, pool of one, `Diff` | 914ms | 37 + 86 MiB | 10.2k |
+| JVM (Jetty, `sluice-example-upstream`), shared | 2,605ms | 201 MiB | |
+| JVM, pool of one, `Full` | 3,328ms | 134 + 1,024 MiB | 6.1k |
+| JVM, pool of one, `Diff` | 2,904ms | 130 + 195 MiB | 5.9k |
+| JVM, pool of 2, `Diff` | 2,959ms | 2 x 111 + 213 MiB | 6.9k |
+
+- **What it holds grows with `mem` by the guest's own books** (its `struct page`s): 69 MiB at 1 GiB,
+  188 at 4, 407 at 16 (the sample guest). It takes 70-370ms at those sizes where `Full` takes 700ms
+  at 1 GiB, and restores past the 3 GiB of the MMIO gap
+- **Its holes fill as clones touch them**: shmem gives a fault on a hole a page of the file, then a
+  private copy for a write: 81 to 86 MiB (Go), 176 to 195 (the JVM) over these loads. `mem` at most,
+  what `Full` takes from the start
+- **What a clone writes is there twice**, in the file and privately: the difference of a pool of one
+  from a shared VM, +18 MiB (sample), +31 (Go), +124 (the JVM)
+
+## A scale
+
+`cf scale -i` through the OSS CLI, the sample guest at 1 GiB, the debug builds:
+
+| | `cf scale` | VMs |
+|---|---|---|
+| a target restarted: 1 to 2, 3, 2 | 1.4-1.5s | a template booted (690ms), 1,024 MiB written (640-710ms), every VM replaced, a generation more: its counts and memory lost |
+| adjusted: 1 to 2, 3, 2, 1 | 59-74ms | those kept the same processes, counting on; one restored in about 20ms; none past the limit serving; the same generation |
+
+- **Requests all along**: `oha -z 14s -c 8` on `--listen` through `cf scale -i` to 2, 4, 3, 1, 3, 2:
+  119,642 answers, all 200
+- **An app's target names no count, a route's does**: the server's `Router.Route` holds the dial
+  address, so a target advertised anew has `ReroutingRelay` replace every keep-alive connection's leg
+  at its next request: harmless, and no way to leave a scale unseen. An app's name tells its VMs
+  apart, so its numbers can leave the target. Routes on one image with other numbers have VMs of
+  their own, which only their target tells: there it moves with them, as an edit of a file is rare
+- **`-i 1` is a pool of one rather than a shared VM staying as instance 0.** A shared VM has no
+  snapshot to clone instance 1 from. Staying, it saves the table's +18 to +124 MiB for an app never
+  scaled and spares its process a restore; but its first scale takes a template's boot beside it (12s
+  of a CNB Java app, a pool's restore 20ms), a route holds two kinds of VM going down two ways, what
+  runs depends on how it got there (`-i 1` to 2 against `-i 2` after a restart), and a process that
+  does not take a restore fails at its first scale, in production, rather than at its push. A process
+  like that annotates `shared`, one VM: the cost is the +18 to +124 MiB, and a pool's VM going down
+  must be seen as a shared one is. In return its process's end has another VM serving in 83-89ms
+  (`/exit` to the answer, polled), a boot long for a shared VM (0.7-0.8s, 12s of that Java app)
+- **The VMs past the limit are the highest indices**, by count: a pool of `warm=0` may hold the indices
+  0 and 2 at `vms=2`, both within it. By index, the VM of 2 would go while room for another one is
+  taken until it did, and a pool holding only it would serve none
 
 ## Jail mode
 

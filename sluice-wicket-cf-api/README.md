@@ -383,7 +383,7 @@ cf restart hello                                 # the env applies at the next s
 curl http://hello.localhost:8080/env             # the sample guest's answer: the env it was given
 cf map-route hello localhost --hostname hi       # routes apply at once
 curl http://hi.localhost:8080/
-cf scale hello -i 2                              # a pool of 2 VMs, cloned from a snapshot
+cf scale hello -i 2                              # one more VM, cloned from the app's snapshot
 cf scale hello -m 256M -f                        # a VM's memory: stops and starts the app
 cf push hello -p hello/ --strategy rolling
 cf stop hello
@@ -573,7 +573,7 @@ mkdir hello                                # or a root filesystem of your own, h
 docker compose cp wicket:/usr/local/share/sluice-wicket-runtime-firecracker/guest.ext4 hello/hello.ext4
 cf push hello -p hello/
 curl http://hello.localhost:28000/
-cf scale hello -i 2                        # a pool of 2 VMs, cloned from a snapshot
+cf scale hello -i 2                        # one more VM, cloned from the app's snapshot
 # in a browser, http://127.0.0.1:9090/: the wicket's console, signed in through Dex too
 ```
 
@@ -610,14 +610,14 @@ The wicket's listing says `runtime: firecracker`.
 | package (docker) | any container image, `--docker-username` with `CF_DOCKER_PASSWORD` its credentials: the build has the wicket make its rootfs (`PUT /api/images`), which pulls it. Listening on `PORT`, as on CF. Spring Boot reads `SERVER_PORT`, not `PORT`: its default fits, an app with another `server.port` takes `cf set-env <app> SERVER_PORT 8080` |
 | package (bits) | a zip holding the rootfs, `.ext4` as a component's `.wasm` is picked (160 MiB at most, unpacking to 4 GiB at most: an image is the way for more) |
 | droplet | the rootfs by sha256 (stack `firecracker`, buildpack `rootfs`; an image's has neither, as on CF): the wicket keeps an image's, the cf-api its reference pinned to the manifest's digest, and has it made again when the wicket lost it (the same digest, unless the wicket's guest changed) |
-| web process `instances` | `vms`, [the limit](#instances) of the app's VMs. 1: a shared VM; more: `mode=pool`, that many VMs cloned from a snapshot; [annotated](#how-long-a-vm-lives), any mode. 0 is [as on CF](#mapping): no VM and no app in the wicket |
-| web process `memory` | `mem`, 1G by default as on CF: less fails a CNB Java image's memory calculator at its start. A pool's snapshot takes that much of the host's memory (`--tmpfs /run/sluice`): `cf scale -m` a small app |
+| web process `instances` | `vms`, [the limit](#instances) of the app's VMs: `mode=pool`, that many VMs cloned from a snapshot, one too; [annotated](#how-long-a-vm-lives), any mode. 0 is [as on CF](#mapping): no VM and no app in the wicket |
+| web process `memory` | `mem`, 1G by default as on CF: less fails a CNB Java image's memory calculator at its start. The snapshot takes what its guest wrote of it on the host's memory (`--tmpfs /run/sluice`; [measured](../.kb/wicket-firecracker-findings.md#a-snapshots-memory)), and at most all of it |
 | web process `health_check` `timeout` (`cf push -t`) | `boot-ms`, 60s by default and 180s at most as on CF: how long the process may take to listen, in the request that starts it. A process exiting first is refused at once |
 | environment variables, `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: the process's environment, over the image's (its `PORT` is `/init`'s) |
 | disk | no effect: the rootfs is read-only and `/tmp` a tmpfs of the VM's memory; a persistent disk is the wicket API's, with no CF counterpart |
 | services | none: the listing offers neither capabilities nor keyvalue stores |
 | outbound connections | the [security groups](#security-groups): the route's `egress`. An app reaches no other host |
-| `cf logs` | the process's output, naming the VM (`APP/PROC/WEB/<index>`): a shared VM's 0, a clone's the lowest index free among the VMs alive, so `0` to `instances - 1` in every mode: what `cf app` lists. No `RTR` line: this wicket feeds no requests to the flume |
+| `cf logs` | the process's output, naming the VM (`APP/PROC/WEB/<index>`): a shared VM's 0, a clone's the lowest index free among the VMs alive, so `0` to `instances - 1` in every mode, modulo `instances` for a VM past a scale down finishing its connections: what `cf app` lists. No `RTR` line: this wicket feeds no requests to the flume |
 | annotations | [how long a VM lives](#how-long-a-vm-lives); `budget-ms`, a component's, is refused |
 
 ### How long a VM lives
@@ -644,11 +644,12 @@ applications:
 | `uses`, `lifetime-ms` | the connections a VM serves, how long it serves | `reuse` |
 | `concurrency` | what an instance takes at once: [the limit](#instances) | `pool`, a component |
 
-- none annotated, 1 instance is a shared VM and more a pool of a fixed size. Annotated `pool`, it
-  keeps `warm` VMs: all of them by default, none once given a `keep-ms`, the first request then
-  paying a restore
-- refused, by `cf push`, the v3 API and `cf scale -i`, naming it: an option without a `mode` or its
-  mode not taking it, what is no mode or no number, `shared` above 1 instance, `warm` above the
+- none annotated, a pool of a fixed size, of one VM at 1 instance. A pool keeps `warm` VMs: all of
+  them by default, none once given a `keep-ms`, the first request then paying a restore. `shared`
+  is one VM booted and never restored from a snapshot, for a process that does not take that: what
+  it opened before its snapshot (a database's connections) is gone in a clone
+- refused, by `cf push`, the v3 API and `cf scale -i`, naming it: an option its mode does not take,
+  none annotated being `pool`, what is no mode or no number, `shared` above 1 instance, `warm` above the
   instances, `instances`, which `cf scale -i` and `concurrency` replace. A wicket not answering, by
   the app's next start
 - as `budget-ms` and the rest of the sandbox they apply at the next start; `cf scale -i` at once,
@@ -762,6 +763,13 @@ of them, each taking `concurrency` at once, as Cloud Run's maximum instances and
 no annotation N are kept up, as on CF: the limit only differs from the count below it where `warm`
 or `keep-ms` ask for that.
 
+As on CF, a scale keeps what runs. Up, one more instance starts and none of the others is touched:
+a VM cloned from the app's snapshot in a restore's time, whatever its boot takes, a component's unit
+instantiated. Down, the highest indices take no more requests: a component's unit ends after its
+own, a VM after its connections and its `keep-ms` (60s by default). The server's route does not
+change, so a keep-alive connection stays on its VM. That is why a VM is a pool at 1 instance too: a
+shared VM has no snapshot to clone the second from ([weighed](../.kb/wicket-firecracker-findings.md#a-scale)).
+
 | | `-i N` limits | at once |
 |---|---|---|
 | component | `N x concurrency` slots (the route's `instances`); `pool` stays N unless `warm` says | `N x concurrency` requests |
@@ -771,9 +779,8 @@ or `keep-ms` ask for that.
 
 - **`concurrency`** (`wicket.sluice.ik.am/concurrency`) is from 1, 16 by default, the wicket's
   `conns`. `-i 1` with no annotation behaves as a CF app: a component takes 16 requests at once, a
-  VM is shared. A component wanting one request at a time per instance annotates 1. A shared VM
-  has none and a VM per connection is 1 by definition: those modes refuse it, and a VM with no
-  `mode` annotated, which `cf scale` would turn into a pool
+  pool of one VM any number of connections. A component wanting one request at a time per instance
+  annotates 1. A shared VM has none and a VM per connection is 1 by definition: those modes refuse it
 - **It means what each can tell.** A component's counts requests, and is hard: one past the limit
   waits for an instance within its `budget-ms`, then gets a 503. A pool VM's counts connections,
   and is soft: the connections a VM holds before the pool grows, at N VMs one more going to the VM
@@ -786,7 +793,8 @@ or `keep-ms` ask for that.
   is no refusal
 - **`cf logs`** stays within what `cf app` lists, `0` to `N - 1`: of a component the units alive may
   outnumber N, the work of N instances, and the cf-api names one `index % N`, knowing N as the
-  wicket does not. A pool's and a VM's index are within N already
+  wicket does not. A VM's index is within N already, but for one past a scale down finishing its
+  connections, named so too
 
 ## Behavior
 

@@ -292,6 +292,9 @@ function vmsView(route) {
     if (vms.starting) {
       counts.push(`${vms.starting} starting`);
     }
+    if (vms.restarts) {
+      counts.push(`restarted ${plural(vms.restarts, "time")}`);
+    }
   }
   else {
     counts.push(`${vms.warm} warm`);

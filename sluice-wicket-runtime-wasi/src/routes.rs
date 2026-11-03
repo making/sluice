@@ -13,6 +13,11 @@
 //! acknowledged its removal, since the server may have routed a connection to
 //! it before, and its connections then shut down gracefully.
 //!
+//! A sandbox's `pool` and `instances` are no change of what serves: the handler takes them as
+//! it runs ([`Handler::resize`]). An app's target names neither, so nothing is advertised; a
+//! route's does, so its handler goes on under the target of its new numbers, the old one
+//! lingering as a removed one does.
+//!
 //! The console changes its own routes and its API's apps through the same
 //! reload ([`Reloader::apply`]): the routes as they would be are reloaded
 //! first, and kept only when they loaded.
@@ -89,7 +94,7 @@ pub fn route_target(locator: &str, sandbox: &Sandbox) -> String {
 /// route shares its handler: its pool, its `instances` cap and its guests'
 /// output stay its own. An app's name is unreserved chars: no escaping.
 fn app_target(locator: &str, sandbox: &Sandbox, app: &str) -> String {
-    match sandbox.query() {
+    match sandbox.query_of_app() {
         query if query.is_empty() => format!("{locator}?app={app}"),
         query => format!("{locator}?app={app}&{query}"),
     }
@@ -225,6 +230,9 @@ type Stamps = HashMap<PathBuf, Option<Stamp>>;
 enum Planned {
     /// The current entry: the component did not change.
     Keep(Entry),
+    /// The handler of another target, which no route asks for any more: a route of it asks for
+    /// other numbers, its target naming them.
+    Move(Arc<Handler>),
     /// A new handler on this component, with its keyvalue buckets.
     New(Arc<Loaded>, Option<Arc<keyvalue::Buckets>>),
 }
@@ -238,6 +246,8 @@ pub struct Change {
     pub retargeted: Vec<String>,
     /// Same target, new content.
     pub updated: Vec<String>,
+    /// Same target and content, another `pool` or `instances`.
+    pub adjusted: Vec<String>,
 }
 
 impl std::fmt::Display for Change {
@@ -247,6 +257,7 @@ impl std::fmt::Display for Change {
             ("removed", &self.removed),
             ("retargeted", &self.retargeted),
             ("updated", &self.updated),
+            ("adjusted", &self.adjusted),
         ];
         let described: Vec<_> = parts
             .iter()
@@ -757,6 +768,7 @@ impl Reloader {
             };
             plan.targets.push((target, spec.sandbox.clone(), planned));
         }
+        self.keep_moved(&mut plan);
         // every pooled unit holds a slot for good
         let pooled: usize = plan
             .targets
@@ -772,9 +784,46 @@ impl Reloader {
         Ok(plan)
     }
 
-    /// Publishes `plan` and retires the handlers it replaced; None when it
-    /// changes no route. Origins changed alone (an app's tag) are published
-    /// in the generation they were: nothing to advertise or acknowledge.
+    /// A target with a new handler of a component a target no route asks for any more serves, of
+    /// one of its hosts, in a sandbox differing in its numbers alone, takes that handler.
+    fn keep_moved(&self, plan: &mut Plan) {
+        let current = self.routes.current();
+        let asked: HashSet<String> = plan.targets.iter().map(|(at, ..)| at.clone()).collect();
+        let mut moved = HashSet::new();
+        for (target, sandbox, planned) in &mut plan.targets {
+            let Planned::New(loaded, _) = planned else {
+                continue;
+            };
+            let hosts: Vec<&String> = plan
+                .advertised
+                .iter()
+                .filter(|up| up.target_url == *target)
+                .map(|up| &up.host)
+                .collect();
+            let from = current
+                .advertised
+                .iter()
+                .filter(|up| hosts.contains(&&up.host))
+                .map(|up| &up.target_url)
+                .filter(|from| !asked.contains(*from) && !moved.contains(*from))
+                .filter(|from| !self.lingering.contains_key(*from))
+                .find_map(|from| {
+                    let handler = current.handler(from)?;
+                    (Arc::ptr_eq(handler.loaded(), loaded)
+                        && handler.sandbox().same_instances(sandbox))
+                    .then(|| (from.clone(), handler.clone()))
+                });
+            if let Some((from, handler)) = from {
+                moved.insert(from);
+                *planned = Planned::Move(handler);
+            }
+        }
+    }
+
+    /// Publishes `plan` and retires the handlers it replaced, the others taking their `pool` and
+    /// `instances`; None when it changes no route. Origins, `pool` or `instances` changed alone
+    /// (an app's tag, a scale) are published in the generation they were: nothing to advertise
+    /// or acknowledge.
     fn commit(&mut self, plan: Plan) -> Option<Change> {
         let current = self.routes.current();
         let unchanged = plan.advertised == current.advertised
@@ -782,8 +831,23 @@ impl Reloader {
                 .targets
                 .iter()
                 .all(|(_, _, planned)| matches!(planned, Planned::Keep(_)));
+        let mut adjusted = Vec::new();
+        for (target, sandbox, planned) in &plan.targets {
+            let handler = match planned {
+                Planned::Keep(entry) => &entry.handler,
+                Planned::Move(handler) => handler,
+                Planned::New(..) => continue,
+            };
+            if handler.resize(sandbox.pool, sandbox.instances)
+                && matches!(planned, Planned::Keep(_))
+            {
+                let hosts = plan.advertised.iter().filter(|up| up.target_url == *target);
+                adjusted.extend(hosts.map(|up| up.host.clone()));
+            }
+        }
         if unchanged && current.generation > 0 {
-            if plan.origins != current.origins {
+            let moved_on = plan.origins != current.origins;
+            if moved_on {
                 self.routes.publish(Table {
                     generation: current.generation,
                     advertised: current.advertised.clone(),
@@ -791,9 +855,14 @@ impl Reloader {
                     entries: current.entries.clone(),
                     console: current.console,
                 });
+            }
+            if moved_on || !adjusted.is_empty() {
                 self.status.send_modify(|status| status.revision += 1);
             }
-            return None;
+            return (!adjusted.is_empty()).then(|| Change {
+                adjusted,
+                ..Change::default()
+            });
         }
         let generation = current.generation + 1;
         let mut entries = HashMap::new();
@@ -803,6 +872,11 @@ impl Reloader {
             self.lingering.remove(&target);
             let entry = match planned {
                 Planned::Keep(entry) => entry,
+                // connections to the old target end as it does: their own token
+                Planned::Move(handler) => Entry {
+                    handler,
+                    gone: CancellationToken::new(),
+                },
                 Planned::New(loaded, buckets) => {
                     println!(
                         "loaded {} (sha256 {}) for {target}",
@@ -831,11 +905,17 @@ impl Reloader {
             // resolvable until every stream acknowledged the removal
             if !self.lingering.contains_key(target) {
                 self.lingering.insert(target.clone(), generation);
-                replaced.push(entry.handler.clone());
+                if !entries
+                    .values()
+                    .any(|kept: &Entry| Arc::ptr_eq(&kept.handler, &entry.handler))
+                {
+                    replaced.push(entry.handler.clone());
+                }
             }
             entries.insert(target.clone(), entry.clone());
         }
-        let change = change(&current.advertised, &plan.advertised, &updated);
+        let mut change = change(&current.advertised, &plan.advertised, &updated);
+        change.adjusted = adjusted;
         self.routes.publish(Table {
             generation,
             advertised: plan.advertised,
@@ -1295,6 +1375,7 @@ pub(crate) mod tests {
                 removed: vec!["b.local".into()],
                 retargeted: vec!["c.local".into()],
                 updated: vec!["a.local".into()],
+                ..Change::default()
             })
         );
         let after = reloader.routes().current();
@@ -1364,6 +1445,32 @@ pub(crate) mod tests {
             reloader.routes().current().handler(&b).unwrap()
         ));
         eventually("b's new pool takes its slot", || instances.held() == 2).await;
+
+        // a route's numbers alone: its handler under the target naming them, the old one served
+        // by it until acknowledged, its unit kept
+        dir.write(
+            "wicket.yaml",
+            config(&[
+                ("a.local", "a.wasm", "pool: 2"),
+                ("b.local", "b.wasm", "pool: 1"),
+                ("c.local", "c.wasm", "budget: 5s"),
+                ("d.local", "d.wasm", "env: {GREETING: s3cr3t-d}"),
+                ("e.local", "e.wasm", ""),
+                ("f.local", &remote, ""),
+            ]),
+        );
+        let table = reloader.routes().current();
+        let a = table.target("a.local");
+        let handler = table.handler(&a).unwrap().clone();
+        let change = reloader.reload(false).await.unwrap().unwrap();
+        assert_eq!(change.retargeted, ["a.local"]);
+        let moved = reloader.routes().current();
+        let to = moved.target("a.local");
+        assert_ne!(to, a);
+        assert!(Arc::ptr_eq(moved.handler(&to).unwrap(), &handler));
+        assert!(Arc::ptr_eq(moved.handler(&a).unwrap(), &handler));
+        assert_eq!(handler.sandbox().pool, 2);
+        eventually("its pool grows by one", || instances.held() == 3).await;
 
         // a remote component is fetched when its route is new, or on request
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
@@ -1730,6 +1837,39 @@ pub(crate) mod tests {
         assert_eq!(reloader.routes().current().origins["s1.local"], origin);
         assert!(status.borrow().revision > revision, "the console sees it");
         assert!(manifest().contains("tag: \"v2\""), "{}", manifest());
+        // nor does a scale: its target names no count, and the handler running takes it
+        let revision = status.borrow().revision;
+        let scaled = match shop(&["s1.local"], &fetch, &place) {
+            Edit::PutApp { name, mut app } => {
+                app.tag = Some("v2".into());
+                app.sandbox.pool = 1;
+                app.sandbox.instances = Some(3);
+                Edit::PutApp { name, app }
+            }
+            _ => unreachable!("an app's PUT"),
+        };
+        let unscaled = reloader.routes().current();
+        let unscaled_target = unscaled.target("s1.local");
+        assert_eq!(
+            reloader.apply(scaled).await,
+            Ok(Outcome {
+                generation: generation + 2,
+                change: Some(Change {
+                    adjusted: vec!["s1.local".into()],
+                    ..Change::default()
+                }),
+            })
+        );
+        let scaled = reloader.routes().current();
+        assert_eq!(scaled.target("s1.local"), unscaled_target);
+        assert!(Arc::ptr_eq(
+            scaled.handler(&unscaled_target).unwrap(),
+            unscaled.handler(&unscaled_target).unwrap()
+        ));
+        let sandbox = scaled.handler(&unscaled_target).unwrap().sandbox();
+        assert_eq!((sandbox.pool, sandbox.instances), (1, Some(3)));
+        assert!(status.borrow().revision > revision, "the console sees it");
+        assert!(manifest().contains("instances: 3"), "{}", manifest());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

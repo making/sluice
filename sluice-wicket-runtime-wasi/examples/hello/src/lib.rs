@@ -17,9 +17,14 @@ wit_bindgen::generate!({
     generate_all,
 });
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use exports::wasi::http::handler::Guest;
 use wasi::http::types::{ErrorCode, Request, Response};
 use wit_bindgen::StreamResult;
+
+/// The requests for `/served` the instance took: what a warm one keeps between requests.
+static SERVED: AtomicU64 = AtomicU64::new(0);
 
 struct Component;
 
@@ -135,6 +140,11 @@ impl Guest for Component {
                 let _ = trailers_tx.write(Ok(None)).await;
             });
             return Ok(response);
+        }
+
+        if path == "/served" {
+            let served = SERVED.fetch_add(1, Ordering::Relaxed) + 1;
+            return Ok(text(200, format!("{served}\n")));
         }
 
         if let Some(name) = path.strip_prefix("/env/") {

@@ -1,8 +1,8 @@
 //! The OSS cf CLI (`SLUICE_CF_CLI`, else `cf8` on the PATH; the Tanzu
 //! distribution refuses any other platform) against the cf-api and a wicket
 //! in local mode, both on a flume: login, push, the app's logs, map-route,
-//! scale, a rolling push with requests all along, stop and start, a scale to 0, the
-//! limit of a scale and of its `concurrency`, the
+//! scale keeping the warm instance, a rolling push with requests all along,
+//! stop and start, a scale to 0, the limit of a scale and of its `concurrency`, the
 //! user's environment variables and VCAP_*, a private component in an OCI
 //! registry (a stub) pushed by tag -- its credentials, a restart keeping
 //! the digest staged when the tag moves, a restage taking the new one --, a
@@ -13,7 +13,8 @@
 //! until a service binding grants what it needs, the services' lifecycle,
 //! delete. And against a Firecracker wicket, where `/dev/kvm` is usable: a
 //! private image made into a rootfs by the wicket, its process's user, files and
-//! environment seen from the VM, its connections through the security groups, a scale, each
+//! environment seen from the VM, its connections through the security groups, a scale keeping
+//! the VMs running, each
 //! mode and lifetime by annotation, a VM per connection warned of and finding no room, a scale
 //! to 0, a rootfs of a zip, the wicket's
 //! directory lost and the image's rootfs made again, of the digest it had; then the
@@ -646,8 +647,31 @@ fn the_cf_cli_deploys_to_the_wicket() {
         apps["apps"][0]["hosts"],
         serde_json::json!(["hello.localhost", "hi.localhost"])
     );
+    // a scale keeps the warm instance: what it holds counts on, its target stays
+    let served = || {
+        let (status, body) = get(&listen, "hello.localhost", "/served", None);
+        assert_eq!(status, 200, "{body}");
+        body.trim().parse::<u64>().unwrap()
+    };
+    let advertised = || {
+        let (status, body) = get(&console, &console, "/api/routes", Some(TOKEN));
+        assert_eq!(status, 200, "{body}");
+        let routes: Value = serde_json::from_str(&body).unwrap();
+        (
+            routes["generation"].clone(),
+            routes["routes"][0]["target"].clone(),
+        )
+    };
+    let count = (0..3).map(|_| served()).max().unwrap();
+    assert!(count >= 3, "{count}");
+    let before = advertised();
     cf.ok(&["scale", "hello", "-i", "2"]);
     assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 2);
+    assert_eq!(advertised(), before, "nothing to advertise");
+    let deadline = Instant::now() + HANG;
+    while served() <= count {
+        assert!(Instant::now() < deadline, "the warm instance was replaced");
+    }
     // the second warm instance takes its turn: its index in the output and in
     // app_index (a request before the units are up runs on an instance of its
     // own, named as one of them)
@@ -1515,7 +1539,11 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     let fc = &listed["apps"][0];
     assert_eq!(listed["runtime"], "firecracker");
     assert_eq!(fc["hosts"], json!(["fc.localhost"]));
-    assert_eq!(fc["sandbox"]["mode"], "shared");
+    // cloned from a snapshot at any count: a scale keeps what runs
+    assert_eq!(
+        (&fc["sandbox"]["mode"], &fc["sandbox"]["vms"]),
+        (&"pool".into(), &1.into())
+    );
     // as Cloud Controller's defaults: what a JVM needs of memory and of time to listen
     assert_eq!(fc["sandbox"]["mem"], 1024);
     assert_eq!(fc["sandbox"]["boot-ms"], 60_000);
@@ -1779,13 +1807,49 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     wicket = start_wicket();
     shows("fc", "running");
 
-    // two instances: a pool of two VMs cloned from a snapshot, env and all
+    // a scale touches no VM it keeps: their snapshot, the requests they served, the target
+    let served_by = |body: &str| {
+        let line = |name: &str| {
+            let line = body.lines().find_map(|line| line.strip_prefix(name));
+            line.unwrap_or_else(|| panic!("no {name} in {body}"))
+                .to_string()
+        };
+        (line("boot id: "), line("served: ").parse::<u64>().unwrap())
+    };
+    let answered_by = || {
+        let (status, body) = get(&listen, "fc.localhost", "/", None);
+        assert_eq!(status, 200, "{body}");
+        served_by(&body)
+    };
+    let (boot_id, count) = answered_by();
+    let target = || {
+        let (status, body) = get(&console, &console, "/api/routes", Some(TOKEN));
+        assert_eq!(status, 200, "{body}");
+        let routes: Value = serde_json::from_str(&body).unwrap();
+        (
+            routes["generation"].clone(),
+            routes["routes"][0]["target"].clone(),
+        )
+    };
+    let advertised = target();
+
+    // two instances, up to three and back: VMs cloned from a snapshot, env and all
     cf.ok(&["scale", "fc", "-i", "2"]);
     let scaled = &listing(&console)["apps"][0]["sandbox"];
     assert_eq!(
         (&scaled["mode"], &scaled["vms"]),
         (&"pool".into(), &2.into())
     );
+    assert_eq!(target(), advertised, "nothing to advertise");
+    // the first VM counts on, the second counts from 1
+    let deadline = Instant::now() + HANG;
+    let mut counts = std::collections::BTreeSet::new();
+    while !(counts.contains(&1) && counts.iter().any(|served| *served > count)) {
+        let (of, served) = answered_by();
+        assert_eq!(of, boot_id, "another snapshot");
+        counts.insert(served);
+        assert!(Instant::now() < deadline, "{count}: {counts:?}");
+    }
     let (status, body) = get(&listen, "fc.localhost", "/", None);
     assert!(
         status == 200 && body.contains("GREETING=hello world\n"),
@@ -1807,6 +1871,42 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     }
     let shown = cf.ok(&["app", "fc"]);
     assert!(shown.contains("#1 "), "{shown}");
+    cf.ok(&["scale", "fc", "-i", "3"]);
+    let deadline = Instant::now() + HANG;
+    loop {
+        assert_eq!(answered_by().0, boot_id);
+        assert_eq!(get(&listen, "fc.localhost", "/log", None).0, 200);
+        let recent = cf.ok(&["logs", "fc", "--recent"]);
+        if recent.contains("[APP/PROC/WEB/2] OUT GET /log HTTP/1.0") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "instance 2 never served: {recent}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // the last one past the limit: no request reaches it, whatever it keeps of its time
+    cf.ok(&["scale", "fc", "-i", "2"]);
+    assert_eq!(target(), advertised);
+    for _ in 0..6 {
+        assert_eq!(get(&listen, "fc.localhost", "/after-scale", None).0, 200);
+    }
+    let deadline = Instant::now() + HANG;
+    loop {
+        let recent = cf.ok(&["logs", "fc", "--recent"]);
+        let lines = recent.matches("OUT GET /after-scale HTTP/1.0").count();
+        assert!(
+            !recent.contains("[APP/PROC/WEB/2] OUT GET /after-scale"),
+            "{recent}"
+        );
+        if lines == 6 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the lines never came: {recent}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(answered_by().0, boot_id);
 
     // `cf scale` the cap of VMs, the annotations how long one lives, from the next start
     let sandbox = || {
@@ -1973,10 +2073,10 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     let scaled = cf.ok(&["scale", "fc", "-i", "1"]);
     assert!(scaled.contains(per_connection), "{scaled}");
     assert_eq!(get(&listen, "fc.localhost", "/", None).0, 200);
-    // none annotated: 1 a shared VM, more a pool of a fixed size, as above
+    // none annotated: a pool of a fixed size, as above
     annotate(&cf, "fc", &json!({"wicket.sluice.ik.am/mode": null}));
     cf.ok(&["restart", "fc"]);
-    assert_eq!(sandbox().unwrap()["mode"], "shared");
+    assert_eq!(sandbox().unwrap()["mode"], "pool");
 
     // a rootfs in a zip: uploaded by the cf-api, as a component is
     cf.ok(&["push", "zipped", "-p", dir.join("rootfs").to_str().unwrap()]);

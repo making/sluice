@@ -1,14 +1,20 @@
 //! A sample of what an image runs, for the tests of an image's rootfs: a static HTTP/1.1
-//! server on `PORT` answering what the process is as text -- its uid and gid, whether it opens `/dev/stdout` and `/dev/stderr` by path, the owner and
-//! mode of each path of its arguments, its environment -- and printing a line per request,
-//! as a process's output. `/egress?to=<host>:<port>` connects as a process does, half-closes
-//! and answers with what came, `/exit` answers and exits. `SAMPLE_WAIT_MS` delays its listening,
-//! `SAMPLE_EXIT` has it exit instead, as a process failing to start does; `SAMPLE_SPEAK_FIRST`
-//! has it send that line as each connection opens, as a protocol whose server speaks first does.
+//! server on `PORT` answering what the process is as text -- its VM's boot id (a clone's, its
+//! snapshot's), the requests it served, its uid and gid, whether it opens `/dev/stdout` and
+//! `/dev/stderr` by path, the owner and mode of each path of its arguments, its environment --
+//! and printing a line per request, as a process's output. `/egress?to=<host>:<port>` connects
+//! as a process does, half-closes and answers with what came, `/exit` answers and exits.
+//! `SAMPLE_WAIT_MS` delays its listening, `SAMPLE_EXIT` has it exit instead, as a process failing
+//! to start does; `SAMPLE_SPEAK_FIRST` has it send that line as each connection opens, as a
+//! protocol whose server speaks first does.
 
 use std::io::{Read as _, Write as _};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::fs::MetadataExt as _;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The requests the process served.
+static SERVED: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     if std::env::var_os("SAMPLE_EXIT").is_some() {
@@ -42,6 +48,10 @@ fn main() {
         let line = String::from_utf8_lossy(&request);
         let first = line.lines().next().unwrap_or_default();
         println!("{first}");
+        // a stream dropped with no request, a dial looking at the process, counts none
+        if !first.is_empty() {
+            SERVED.fetch_add(1, Ordering::Relaxed);
+        }
         let path = first.split(' ').nth(1).unwrap_or_default();
         let body = match path.strip_prefix("/egress?to=") {
             Some(to) => egress(to),
@@ -75,7 +85,9 @@ fn egress(to: &str) -> String {
 fn answer() -> String {
     // SAFETY: getuid and getgid
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    let mut text = format!("uid {uid} gid {gid}\n");
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+    let served = SERVED.load(Ordering::Relaxed);
+    let mut text = format!("boot id: {boot_id}served: {served}\nuid {uid} gid {gid}\n");
     // by path, as an image's log files linked to them do
     for path in ["/dev/stdout", "/dev/stderr"] {
         let opened = std::fs::OpenOptions::new().append(true).open(path);

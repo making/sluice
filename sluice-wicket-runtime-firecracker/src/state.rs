@@ -37,8 +37,8 @@ impl StateDir {
         };
         if !on_tmpfs(&dir) {
             eprintln!(
-                "warning: {} is not on a tmpfs: a cloned route's snapshot (its template's \
-                 whole memory) is written to disk",
+                "warning: {} is not on a tmpfs: a cloned route's snapshot (what its template \
+                 wrote of its memory) is written to disk",
                 dir.display()
             );
         }

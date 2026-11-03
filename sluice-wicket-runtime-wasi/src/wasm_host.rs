@@ -19,7 +19,7 @@
 //! flume they and a line per answered request reach the live access log too
 //! (`flume`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -695,6 +695,27 @@ impl Sandbox {
     /// component is its own dial address. The environment is its digest
     /// ([`Env::digest`]): the target never holds a value.
     pub fn query(&self) -> String {
+        self.pairs(true).join("&")
+    }
+
+    /// [`Sandbox::query`] without `pool` and `instances`: an app's, named by the app, which a
+    /// change of those need not advertise ([`Handler::resize`]).
+    pub fn query_of_app(&self) -> String {
+        self.pairs(false).join("&")
+    }
+
+    /// Whether `other` differs in `pool` and `instances` alone: its handler can take it.
+    pub fn same_instances(&self, other: &Sandbox) -> bool {
+        let of = |sandbox: &Sandbox| Sandbox {
+            pool: 0,
+            instances: None,
+            ..sandbox.clone()
+        };
+        of(self) == of(other)
+    }
+
+    /// The query's pairs, `counts` with `pool` and `instances`.
+    fn pairs(&self, counts: bool) -> Vec<String> {
         let defaults = Limits::default();
         let mut pairs = Vec::new();
         if self.limits.budget != defaults.budget {
@@ -703,7 +724,7 @@ impl Sandbox {
         if !self.env.is_empty() {
             pairs.push(format!("env={}", self.env.digest()));
         }
-        if let Some(cap) = self.instances {
+        if let Some(cap) = self.instances.filter(|_| counts) {
             pairs.push(format!("instances={cap}"));
         }
         if !self.keyvalue.is_empty() {
@@ -724,14 +745,14 @@ impl Sandbox {
         if self.limits.memory != defaults.memory {
             pairs.push(format!("memory-mib={}", self.limits.memory >> 20));
         }
-        if self.pool > 0 {
+        if self.pool > 0 && counts {
             pairs.push(format!("pool={}", self.pool));
         }
         let caps = self.caps.names();
         if !caps.is_empty() {
             pairs.push(format!("wasi={}", caps.join(",")));
         }
-        pairs.join("&")
+        pairs
     }
 }
 
@@ -1680,7 +1701,7 @@ pub struct Instances {
 /// One instance slot -- the process-wide one, plus the route's own under
 /// its `instances` cap -- freed when dropped.
 struct Slot {
-    _route: Option<tokio::sync::OwnedSemaphorePermit>,
+    _route: tokio::sync::OwnedSemaphorePermit,
     _global: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -1729,11 +1750,8 @@ impl Instances {
     /// no slot another route could use; the route's own slot it may hold
     /// meanwhile only delays the route's later requests, which queue behind
     /// it anyway.
-    async fn slot(&self, route: Option<&Arc<tokio::sync::Semaphore>>) -> Slot {
-        let route = match route {
-            Some(route) => Some(route.clone().acquire_owned().await.expect("never closed")),
-            None => None,
-        };
+    async fn slot(&self, route: &Arc<tokio::sync::Semaphore>) -> Slot {
+        let route = route.clone().acquire_owned().await.expect("never closed");
         let global = self
             .slots
             .clone()
@@ -1747,11 +1765,8 @@ impl Instances {
     }
 
     /// An instance slot if one is free at once, as [`Instances::slot`].
-    fn try_slot(&self, route: Option<&Arc<tokio::sync::Semaphore>>) -> Option<Slot> {
-        let route = match route {
-            Some(route) => Some(route.clone().try_acquire_owned().ok()?),
-            None => None,
-        };
+    fn try_slot(&self, route: &Arc<tokio::sync::Semaphore>) -> Option<Slot> {
+        let route = route.clone().try_acquire_owned().ok()?;
         let global = self.slots.clone().try_acquire_owned().ok()?;
         Some(Slot {
             _route: route,
@@ -1824,7 +1839,7 @@ async fn respond(
     } = job;
 
     let loaded = &handler.loaded;
-    let cold = handler.cold.take(handler.sandbox.pool);
+    let cold = handler.cold.take(handler.pool.target());
     admitted(cold.index);
     // Declared after the slot and share, so dropped before them on every
     // path.
@@ -1878,18 +1893,21 @@ async fn respond(
 
 /// A route's request handler: the component, the sandbox its instances run
 /// in, and the warm-instance pool built from both. The one source of a
-/// route's settings, so the cold and the pooled path cannot diverge.
+/// route's settings, so the cold and the pooled path cannot diverge. It takes
+/// another `pool` and `instances` as it runs ([`Handler::resize`]).
 pub struct Handler {
     loaded: Arc<Loaded>,
     sandbox: Sandbox,
+    /// The sandbox's `pool` and `instances` as they are now.
+    counts: Mutex<(usize, Option<usize>)>,
     /// The buckets of `sandbox.keyvalue`, resolved to their stores.
     keyvalue: Option<Arc<keyvalue::Buckets>>,
-    pool: Option<Arc<Pool>>,
+    pool: Arc<Pool>,
     /// The process-wide instance slots every store of the route takes.
     instances: Arc<Instances>,
-    /// The route's own slots under its `instances` cap, taken with every
-    /// process-wide one; None without a cap.
-    route: Option<Arc<tokio::sync::Semaphore>>,
+    /// The route's own slots under its `instances` cap (or [`UNCAPPED`]), taken with every
+    /// process-wide one.
+    route: Arc<tokio::sync::Semaphore>,
     /// Backing for `live_stores`, marked by `LiveStore`.
     live: Arc<Gauge>,
     /// The indices of the per-request instances alive, from the pool's
@@ -1897,8 +1915,17 @@ pub struct Handler {
     cold: Arc<Indices>,
 }
 
+/// A route's slots with no `instances` cap: far enough below the semaphore's limit for a cap's
+/// slots still to be forgotten on top ([`Handler::resize`]).
+const UNCAPPED: usize = Instances::MAX / 2;
+
+/// The route's own slots under the cap `instances`.
+fn route_slots(instances: Option<usize>) -> usize {
+    instances.unwrap_or(UNCAPPED).min(UNCAPPED)
+}
+
 impl Handler {
-    /// Starts the route's pool when its sandbox names one. Its units take
+    /// Starts the route's pool as its sandbox names one. Its units take
     /// their slots of `instances` (and of the route's cap) for good: at once
     /// while slots are free, as at startup, where the pools of all routes
     /// were checked to fit the limit; else -- the units of a replaced pool
@@ -1912,23 +1939,19 @@ impl Handler {
     ) -> Result<Arc<Handler>, String> {
         sandbox.check()?;
         let live = Arc::new(Gauge::default());
-        let route = sandbox
-            .instances
-            .map(|cap| Arc::new(tokio::sync::Semaphore::new(cap.min(Instances::MAX))));
-        let pool = match sandbox.pool {
-            0 => None,
-            _ => Some(Pool::new(
-                loaded.clone(),
-                sandbox.clone(),
-                keyvalue.clone(),
-                live.clone(),
-                instances.clone(),
-                route.clone(),
-            )),
-        };
+        let route = Arc::new(tokio::sync::Semaphore::new(route_slots(sandbox.instances)));
+        let pool = Pool::new(
+            loaded.clone(),
+            sandbox.clone(),
+            keyvalue.clone(),
+            live.clone(),
+            instances.clone(),
+            route.clone(),
+        );
         Ok(Arc::new(Handler {
             live,
             loaded,
+            counts: Mutex::new((sandbox.pool, sandbox.instances)),
             sandbox,
             keyvalue,
             pool,
@@ -1942,8 +1965,49 @@ impl Handler {
         &self.loaded
     }
 
-    pub fn sandbox(&self) -> &Sandbox {
-        &self.sandbox
+    /// Its sandbox as it is now.
+    pub fn sandbox(&self) -> Sandbox {
+        let (pool, instances) = *self.counts.lock().unwrap();
+        Sandbox {
+            pool,
+            instances,
+            ..self.sandbox.clone()
+        }
+    }
+
+    /// Takes `pool` and `instances` from now on, what runs kept: whether they changed. Units are
+    /// started up to `pool`; those past it end, an idle one at once, a busy one after its
+    /// request, and a request open goes on past a lower cap, whose slots go as they are freed.
+    pub fn resize(&self, pool: usize, instances: Option<usize>) -> bool {
+        let was_instances = {
+            let mut counts = self.counts.lock().unwrap();
+            let was = *counts;
+            if was == (pool, instances) {
+                return false;
+            }
+            *counts = (pool, instances);
+            was.1
+        };
+        let (from, to) = (route_slots(was_instances), route_slots(instances));
+        if to > from {
+            self.route.add_permits(to - from);
+        } else {
+            let forgotten = self.route.forget_permits(from - to);
+            if let Some(owed) = (from - to)
+                .checked_sub(forgotten)
+                .filter(|owed| *owed > 0)
+                .and_then(|owed| u32::try_from(owed).ok())
+            {
+                let route = self.route.clone();
+                tokio::spawn(async move {
+                    if let Ok(freed) = route.acquire_many_owned(owed).await {
+                        freed.forget();
+                    }
+                });
+            }
+        }
+        self.pool.resize(pool);
+        true
     }
 
     /// Takes the handler out of service: its pool closes (idle units end at
@@ -1951,23 +2015,21 @@ impl Handler {
     /// slots. Requests still routed here -- in flight, or on a connection
     /// opened before -- are served on the per-request path.
     pub fn retire(&self) {
-        if let Some(pool) = &self.pool {
-            pool.close();
-        }
+        self.pool.close();
     }
 
     /// Waits for an instance slot (`Instances::slot`) under the route's cap.
     async fn slot(&self) -> Slot {
-        self.instances.slot(self.route.as_ref()).await
+        self.instances.slot(&self.route).await
     }
 
     /// The route's slots held under its cap: its pooled units' and its
     /// requests'; 0 without a cap.
     #[cfg(test)]
     fn route_held(&self) -> usize {
-        match (&self.route, self.sandbox.instances) {
-            (Some(route), Some(cap)) => cap - route.available_permits(),
-            _ => 0,
+        match self.counts.lock().unwrap().1 {
+            Some(cap) => cap - self.route.available_permits(),
+            None => 0,
         }
     }
 
@@ -2001,14 +2063,8 @@ impl Handler {
         };
         let slot = self.slot();
         tokio::pin!(slot);
+        let pool = &self.pool;
         loop {
-            let Some(pool) = &self.pool else {
-                return tokio::select! {
-                    biased;
-                    slot = &mut slot => Admission::Cold(job, slot),
-                    () = &mut expired => Admission::Full,
-                };
-            };
             // Registered before the dispatch, so a unit offered in between
             // still wakes this request.
             let offered = pool.offered.notified();
@@ -2088,7 +2144,8 @@ struct Job {
 /// instance slot is free (within the route's cap, which counts the units), so
 /// the pool only ever improves the warm latency. The units take the requests
 /// in turn, the one idle longest first, as the gorouter balances an app's
-/// instances, and each has an index of `0..pool` (see `respond`).
+/// instances, and each has an index of `0..pool` (see `respond`). A route without
+/// a pool has one of no unit.
 /// Measured on the hello guest (the ignored `load_comparison_reference`,
 /// sequential requests, release profile): ~250us cold vs ~130us pooled per
 /// request (~360us cold with instances allocated on demand). Every unit
@@ -2102,7 +2159,8 @@ struct Job {
 ///
 /// A closed pool (`close`, its handler retired on a reload) replaces no unit:
 /// its idle units end at once, busy ones after their request, and units still
-/// waiting for a slot give up.
+/// waiting for a slot give up. A pool resized (`resize`) keeps the units within its
+/// new size, and starts those missing; those past it end as a closed pool's do.
 struct Pool {
     loaded: Arc<Loaded>,
     sandbox: Sandbox,
@@ -2111,7 +2169,7 @@ struct Pool {
     live: Arc<Gauge>,
     /// The handler's slots: the process-wide ones and the route's cap.
     instances: Arc<Instances>,
-    route: Option<Arc<tokio::sync::Semaphore>>,
+    route: Arc<tokio::sync::Semaphore>,
     state: Mutex<PoolState>,
     /// Signalled whenever a unit is offered, for requests waiting on an
     /// instance (`Handler::admit`).
@@ -2128,8 +2186,10 @@ struct PoolState {
     /// The idle units' indices and senders, the one idle longest first; one
     /// entry per instantiated unit between requests.
     idle: VecDeque<(usize, mpsc::Sender<UnitMessage>)>,
-    /// Live unit tasks, the ones waiting for a slot included.
-    units: usize,
+    /// The pool's size: units of the indices `0..target` are kept.
+    target: usize,
+    /// The indices of the live unit tasks, the ones waiting for a slot included.
+    units: BTreeSet<usize>,
     /// Units ever spawned; growth beyond the target signals recycling
     /// (diagnostics, and asserted in tests).
     spawned: usize,
@@ -2150,13 +2210,14 @@ impl Pool {
         keyvalue: Option<Arc<keyvalue::Buckets>>,
         live: Arc<Gauge>,
         instances: Arc<Instances>,
-        route: Option<Arc<tokio::sync::Semaphore>>,
+        route: Arc<tokio::sync::Semaphore>,
     ) -> Arc<Self> {
-        let units = sandbox.pool;
+        let target = sandbox.pool;
         let pool = Arc::new(Self {
             state: Mutex::new(PoolState {
                 idle: VecDeque::new(),
-                units,
+                target,
+                units: (0..target).collect(),
                 spawned: 0,
                 served: 0,
                 closed: false,
@@ -2170,11 +2231,47 @@ impl Pool {
             offered: tokio::sync::Notify::new(),
             closed: CancellationToken::new(),
         });
-        for index in 0..units {
-            let slot = pool.instances.try_slot(pool.route.as_ref());
+        for index in 0..target {
+            let slot = pool.instances.try_slot(&pool.route);
             Self::spawn_unit(pool.clone(), slot, index);
         }
         pool
+    }
+
+    /// The pool's size.
+    fn target(&self) -> usize {
+        self.state.lock().unwrap().target
+    }
+
+    /// Keeps the units within `target`, starts those missing, each as [`Pool::new`] does, and
+    /// ends those past it: an idle one now, a busy one as it would be offered. Nothing on a
+    /// closed pool.
+    fn resize(self: &Arc<Self>, target: usize) {
+        let (past, missing) = {
+            let mut state = self.state.lock().unwrap();
+            if state.closed {
+                return;
+            }
+            state.target = target;
+            let (past, idle) = std::mem::take(&mut state.idle)
+                .into_iter()
+                .partition(|(index, _)| *index >= target);
+            state.idle = idle;
+            let missing: Vec<usize> = (0..target)
+                .filter(|index| !state.units.contains(index))
+                .collect();
+            state.units.extend(&missing);
+            (past, missing)
+        };
+        let past: VecDeque<(usize, mpsc::Sender<UnitMessage>)> = past;
+        for (_, unit) in past {
+            // an idle unit's channel is empty; a stale entry's unit is gone
+            let _ = unit.try_send(None);
+        }
+        for index in missing {
+            let slot = self.instances.try_slot(&self.route);
+            Self::spawn_unit(self.clone(), slot, index);
+        }
     }
 
     /// Starts the unit `index`, already counted in `units`, on `slot` or,
@@ -2185,7 +2282,7 @@ impl Pool {
             let slot = match slot {
                 Some(slot) => slot,
                 None => tokio::select! {
-                    slot = pool.instances.slot(pool.route.as_ref()) => slot,
+                    slot = pool.instances.slot(&pool.route) => slot,
                     () = pool.closed.cancelled() => {
                         // gives its place up: the pool is closed, nothing respawns
                         drop(Retire {
@@ -2203,11 +2300,11 @@ impl Pool {
     }
 
     /// Offers the idle unit `index`, last in turn, and wakes a request
-    /// waiting for an instance; false once the pool closed: the unit ends.
+    /// waiting for an instance; false once the pool closed, or shrank past it: the unit ends.
     fn offer(&self, index: usize, unit: mpsc::Sender<UnitMessage>) -> bool {
         {
             let mut state = self.state.lock().unwrap();
-            if state.closed {
+            if state.closed || index >= state.target {
                 return false;
             }
             state.idle.push_back((index, unit));
@@ -2260,7 +2357,7 @@ impl Pool {
     // Diagnostics, asserted in tests.
     #[cfg(test)]
     fn units(&self) -> usize {
-        self.state.lock().unwrap().units
+        self.state.lock().unwrap().units.len()
     }
 
     /// Units ever spawned.
@@ -2283,9 +2380,9 @@ impl Pool {
 }
 
 /// Runs at unit exit, however it exits, after the unit's store is gone:
-/// frees the unit's place and, unless the unit never got viable or the pool
-/// closed, spawns a replacement on its instance slot and its index while the
-/// pool is below target; else the slot frees.
+/// frees the unit's place and, unless the unit never got viable, the pool
+/// closed or shrank past it, spawns a replacement on its instance slot and its
+/// index; else the slot frees.
 struct Retire {
     pool: Arc<Pool>,
     /// False when the unit never served (e.g. its instantiate failed): the
@@ -2301,10 +2398,9 @@ impl Drop for Retire {
     fn drop(&mut self) {
         let respawn = {
             let mut state = self.pool.state.lock().unwrap();
-            state.units -= 1;
-            let respawn = self.replace && !state.closed && state.units < self.pool.sandbox.pool;
-            if respawn {
-                state.units += 1;
+            let respawn = self.replace && !state.closed && self.index < state.target;
+            if !respawn {
+                state.units.remove(&self.index);
             }
             respawn
         };
@@ -4104,7 +4200,7 @@ pub(crate) mod tests {
     }
 
     fn pool(handler: &Handler) -> &Pool {
-        handler.pool.as_deref().expect("a pooled route")
+        &handler.pool
     }
 
     /// Waits until `idle` units are offered (instantiated and between
@@ -5314,6 +5410,60 @@ pub(crate) mod tests {
         assert_eq!(instances.held(), 2, "the second pool's units alone");
     }
 
+    /// A pool resized keeps what it has: up, a unit is started for the rest; down, the unit past
+    /// it ends after its request, the one within it serving on. The cap bounds the next requests
+    /// as it changes, its slots going as they are freed; a request waiting at it finds room as
+    /// it goes up.
+    #[tokio::test]
+    async fn a_resized_pool_keeps_its_units() {
+        let instances = Instances::new(4);
+        let handler = capped(&hello().await, &instances, 1, 1, None);
+        restocked(&handler, 1).await;
+        assert!(handler.resize(2, Some(3)));
+        assert!(!handler.resize(2, Some(3)), "the same");
+        restocked(&handler, 2).await;
+        assert_eq!(pool(&handler).spawned(), 2, "one more");
+        let sandbox = handler.sandbox();
+        assert_eq!((sandbox.pool, sandbox.instances), (2, Some(3)));
+
+        // the units wait for the rest of their bodies
+        let post = "POST / HTTP/1.1\r\nhost: t\r\ncontent-length: 4\r\nconnection: close\r\n\r\nab";
+        let mut peers = [open(&handler, post), open(&handler, post)];
+        restocked(&handler, 0).await;
+        assert!(handler.resize(1, Some(1)));
+        assert_eq!(pool(&handler).units(), 2, "none ended under its request");
+        for peer in &mut peers {
+            peer.data(1, b"cd");
+            let body = String::from_utf8(response_raw(peer).await).unwrap();
+            assert!(body.contains("body_bytes=4"), "{body}");
+        }
+        eventually("the unit past it ends", Duration::from_secs(5), || {
+            pool(&handler).units() == 1 && instances.held() == 1
+        })
+        .await;
+        restocked(&handler, 1).await;
+        assert_eq!(pool(&handler).spawned(), 2, "none replaced");
+        assert_eq!(
+            handler.route_held(),
+            1,
+            "the one slot of its cap, the unit's"
+        );
+
+        let occupant = stalled_connection(&handler).await;
+        let mut waiter = open(&handler, &get("/"));
+        assert_eq!(
+            answered(&mut waiter, Duration::from_millis(300)).await,
+            None,
+            "past the cap"
+        );
+        assert!(handler.resize(1, None));
+        assert_ok(
+            answered(&mut waiter, Duration::from_secs(3)).await,
+            "an instance of its own",
+        );
+        drop(occupant);
+    }
+
     /// A retired pool ends its idle units at once and a busy one after its
     /// request, replaces none, and frees their slots; the handler serves on
     /// the per-request path.
@@ -5796,7 +5946,7 @@ pub(crate) mod tests {
         let budget = Duration::from_millis(800);
         let handler = capped(&hello().await, &instances, 1, 0, Some(budget));
         // the occupant: the route's only slot, taken as a request would
-        let occupant = handler.route.clone().unwrap().try_acquire_owned().unwrap();
+        let occupant = handler.route.clone().try_acquire_owned().unwrap();
 
         let started = Instant::now();
         let mut peer = open(&handler, &get("/"));

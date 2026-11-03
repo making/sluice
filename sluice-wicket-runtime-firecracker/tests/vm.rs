@@ -13,7 +13,8 @@
 //! (http/1.1 and h2c, an unknown one answered 404), a `--vm` route alone
 //! whatever the host and handing through a guest speaking first, not with `--console` nor
 //! from the config file; a reload of the `--config`
-//! file, polled, removing a route and replacing a rootfs; the console deploying
+//! file, polled, removing a route and replacing a rootfs; its numbers and an app's changed, the
+//! VMs running kept; a pool's VM going down replaced; the console deploying
 //! one more route from an uploaded rootfs (refusing what it does not take),
 //! served on the tunnel, listed with its VMs, and an app of two hosts on one
 //! rootfs uploaded by digest, its env seen by the guest, and an app with a disk:
@@ -394,9 +395,23 @@ async fn every_route_serves_http_through_the_tunnel() {
         );
     }
 
+    // the config file's numbers of a route changed: its VMs stay
+    let mut tunnel = tunnel;
+    if image.is_none() {
+        let pid = wicket.child.id() as i32;
+        let rootfs = dir.0.join("pool.ext4");
+        let vms = || (!jailed).then(|| vms_on(pid, &rootfs));
+        let address = dial_address(&target("pool.local"));
+        let adjusted = adjusted_route(&mut tunnel, &wicket, &config, address, &mut conn_id, vms);
+        assert!(
+            tokio::time::timeout(HANG, adjusted).await.is_ok(),
+            "pool.local: adjusted: hung; {}",
+            wicket.log()
+        );
+    }
+
     // reloads, once a poll found the files quiet: the config file's alone
     // (capped.local removed), then the shared rootfs replaced
-    let mut tunnel = tunnel;
     std::fs::write(&config, &routes).unwrap();
     let reloaded = tunnel.advertise().await;
     let hosts: Vec<_> = reloaded.upstreams.iter().map(|up| &up.host).collect();
@@ -888,6 +903,9 @@ async fn deploy(
 
     never_listening_app(tunnel, wicket, &sha256, config).await;
     restarting_app(tunnel, wicket, &sha256, conn_id).await;
+    adjusted_pool_app(tunnel, wicket, &sha256, conn_id).await;
+    adjusted_clones_app(tunnel, wicket, &sha256, conn_id).await;
+    restarting_pool(tunnel, wicket, &sha256, conn_id).await;
     // an image of its own: a change of its file a reload of that app's VM alone
     let (image, sha256) = padded(&image);
     let upload = format!("/api/components/{sha256}");
@@ -1102,6 +1120,375 @@ async fn restarting_app(
     assert_eq!(route.get(next(), "/env").await, "RUN=1\n");
 
     let gone = "/api/apps/crash?owner=cf";
+    let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
+    assert_eq!(status, 200, "{removed}");
+    tunnel.advertise().await;
+}
+
+/// The sample guest's answer to one more `GET /` of `host` on the connection of `sender`.
+async fn again(
+    sender: &mut hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+    host: &str,
+) -> String {
+    let request = hyper::Request::get("/")
+        .header("host", host)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = sender.send_request(request).await.unwrap();
+    assert_eq!(response.status(), 200, "{host}: GET /");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8_lossy(&body).into_owned()
+}
+
+/// Waits for the listing of `host` to hold `what`; that listing.
+async fn listed_as(
+    wicket: &Wicket,
+    host: &str,
+    what: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = Instant::now() + RESTART;
+    loop {
+        let route = listed(wicket, host).await;
+        if what(&route) {
+            return route;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{host}: not as it should be: {route}; {}",
+            wicket.log()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Whether a route's listing has `n` VMs alive, all of them its pool's.
+fn pooled(n: u64) -> impl Fn(&serde_json::Value) -> bool {
+    move |route| route["vms"]["pooled"] == n && route["vms"]["alive"] == n
+}
+
+/// The address `host` is advertised at in `advertised`.
+fn advertised_at(advertised: &sluice_wicket_tunnel::proto::Advertise, host: &str) -> String {
+    let up = advertised.upstreams.iter().find(|up| up.host == host);
+    dial_address(
+        &up.unwrap_or_else(|| panic!("{host} not advertised"))
+            .target_url,
+    )
+}
+
+/// A route of the config file, its numbers changed (its target names them, so another one is
+/// advertised): the VMs it has stay on their snapshot, what they serve counting on, a VM cloned
+/// for a higher `warm`. Past a lower `vms` a VM takes no more connections, serves the ones it has
+/// and is gone once it served none for `keep-ms`. `vms` tells the wicket's VMs of it, unjailed.
+async fn adjusted_route(
+    tunnel: &mut ServerTunnel,
+    wicket: &Wicket,
+    config: &Path,
+    address: String,
+    conn_id: &mut i64,
+    vms: impl Fn() -> Option<Vec<i32>>,
+) {
+    const HOST: &str = "pool.local";
+    fn on<'a>(tunnel: &'a ServerTunnel, address: &str) -> Route<'a> {
+        Route {
+            tunnel,
+            host: HOST,
+            address: address.to_string(),
+            listen: None,
+        }
+    }
+    let mut next = || {
+        *conn_id += 1;
+        *conn_id
+    };
+    listed_as(wicket, HOST, pooled(1)).await;
+    let before = vms();
+    let (mut held, first, _) = on(tunnel, &address).held(next(), "").await;
+    let boot_id = field(&first, "boot id: ").to_string();
+    let count = served(&[first])[0];
+
+    let written = std::fs::read_to_string(config).unwrap();
+    let more = written.replace("vms: 2, warm: 1", "vms: 3, warm: 2");
+    assert_ne!(more, written);
+    std::fs::write(config, &more).unwrap();
+    let address = advertised_at(&tunnel.advertise().await, HOST);
+    assert!(address.contains("warm=2&vms=3"), "{address}");
+    listed_as(wicket, HOST, pooled(2)).await;
+    if let (Some(before), Some(after)) = (&before, vms()) {
+        assert_eq!(after.len(), 2, "{after:?}");
+        assert!(after.contains(&before[0]), "{before:?}: {after:?}");
+    }
+    assert_eq!(
+        served(&[again(&mut held, HOST).await]),
+        [count + 1],
+        "its VM serves on"
+    );
+    let (mut other, second, _) = on(tunnel, &address).held(next(), "").await;
+    assert_eq!(field(&second, "boot id: "), boot_id, "its snapshot's clone");
+    assert_eq!(served(&[second]), [1], "the VM cloned for it");
+    // all of them taken: one more, ahead of the next connection
+    listed_as(wicket, HOST, pooled(3)).await;
+    let three = vms();
+
+    let less = written.replace("vms: 2, warm: 1", "vms: 1, warm: 1");
+    std::fs::write(config, &less).unwrap();
+    let address = advertised_at(&tunnel.advertise().await, HOST);
+    assert!(address.contains("vms=1"), "{address}");
+    assert_eq!(served(&[again(&mut held, HOST).await]), [count + 2]);
+    assert_eq!(
+        served(&[again(&mut other, HOST).await]),
+        [2],
+        "its connection finishes"
+    );
+    // the next ones on the VM within the limit, whatever it holds
+    let (third, answer, _) = on(tunnel, &address).held(next(), "").await;
+    assert_eq!(served(&[answer]), [count + 3]);
+    // the one serving nothing goes, the one holding a connection stays
+    listed_as(wicket, HOST, pooled(2)).await;
+    tokio::time::sleep(KEEP).await;
+    assert_eq!(served(&[again(&mut other, HOST).await]), [3]);
+    drop((held, other, third));
+    let route = listed_as(wicket, HOST, pooled(1)).await;
+    assert_eq!(route["options"]["vms"], "1", "{route}");
+    if let (Some(three), Some(after)) = (three, vms()) {
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert!(three.contains(&after[0]), "{three:?}: {after:?}");
+    }
+    let last = on(tunnel, &address).get(next(), "/").await;
+    assert_eq!(served(&[last]), [count + 4], "the VM that stays");
+}
+
+/// An app's numbers of a pool changed, by its PUT: the target stays, so nothing is advertised,
+/// and the VMs serve on as a route's do ([`adjusted_route`]); up again before it went, the VM past
+/// the limit takes connections again. A connection's bound applies to the next ones. What a VM is
+/// still starts it anew.
+async fn adjusted_pool_app(
+    tunnel: &mut ServerTunnel,
+    wicket: &Wicket,
+    sha256: &str,
+    conn_id: &mut i64,
+) {
+    const HOST: &str = "sized.local";
+    let at = wicket.console();
+    let put = async |sandbox: serde_json::Value| {
+        let body = app_body(HOST, sha256, sandbox);
+        let (status, put) = console(at, "PUT", "/api/apps/sized", true, body).await;
+        assert_eq!(status, 200, "{put}; {}", wicket.log());
+        put["message"].as_str().unwrap().to_string()
+    };
+    let generation = async || {
+        let (status, listing) = console(at, "GET", "/api/routes", true, Bytes::new()).await;
+        assert_eq!(status, 200, "{listing}");
+        listing["generation"].as_u64().unwrap()
+    };
+    let adjusted = format!("adjusted {HOST}");
+    let keep = KEEP.as_millis() as u64;
+    let pool =
+        |vms: u64| serde_json::json!({"mode": "pool", "vms": vms, "keep-ms": keep, "warm": vms});
+
+    assert_eq!(put(pool(1)).await, format!("added {HOST}"));
+    let address = advertised_at(&tunnel.advertise().await, HOST);
+    assert!(address.ends_with("?app=sized&mode=pool"), "{address}");
+    let of = generation().await;
+    let route = Route {
+        tunnel,
+        host: HOST,
+        address,
+        listen: None,
+    };
+    let mut next = || {
+        *conn_id += 1;
+        *conn_id
+    };
+    let (mut held, first, _) = route.held(next(), "").await;
+    let boot_id = field(&first, "boot id: ").to_string();
+    let count = served(&[first])[0];
+
+    assert_eq!(put(pool(2)).await, adjusted);
+    assert_eq!(generation().await, of, "nothing to advertise");
+    listed_as(wicket, HOST, pooled(2)).await;
+    let (status, apps) = console(at, "GET", "/api/apps", true, Bytes::new()).await;
+    assert_eq!(status, 200, "{apps}");
+    let app = apps["apps"].as_array().unwrap();
+    let app = app.iter().find(|app| app["hosts"][0] == HOST).unwrap();
+    assert_eq!(app["sandbox"]["vms"], 2, "{app}");
+    assert_eq!(served(&[again(&mut held, HOST).await]), [count + 1]);
+    let (other, second, _) = route.held(next(), "").await;
+    assert_eq!(field(&second, "boot id: "), boot_id);
+    assert_eq!(served(&[second]), [1], "the VM cloned for the scale");
+
+    assert_eq!(put(pool(1)).await, adjusted);
+    assert_eq!(generation().await, of);
+    assert_eq!(served(&[again(&mut held, HOST).await]), [count + 2]);
+    let (third, answer, _) = route.held(next(), "").await;
+    assert_eq!(served(&[answer]), [count + 3], "within the limit");
+    let alive = listed(wicket, HOST).await["vms"]["alive"].clone();
+    assert_eq!(alive, 2, "its connection finishes");
+    drop((other, third));
+    listed_as(wicket, HOST, pooled(1)).await;
+    assert_eq!(served(&[again(&mut held, HOST).await]), [count + 4]);
+
+    assert_eq!(put(pool(2)).await, adjusted);
+    listed_as(wicket, HOST, pooled(2)).await;
+    assert_eq!(put(pool(1)).await, adjusted);
+    assert_eq!(put(pool(2)).await, adjusted);
+    tokio::time::sleep(KEEP + Duration::from_millis(500)).await;
+    assert_eq!(listed(wicket, HOST).await["vms"]["alive"], 2);
+
+    let per_client =
+        serde_json::json!({"mode": "pool", "vms": 2, "warm": 2, "keep-ms": keep, "per-client": 1});
+    assert_eq!(put(per_client).await, adjusted);
+    let (client, _, _) = route.held(next(), "192.0.2.9").await;
+    let refused = route.half_closed_from(next(), "192.0.2.9").await;
+    assert!(refused.is_empty(), "past its share: {refused:?}");
+    drop(client);
+
+    let env = serde_json::json!({"mode": "pool", "vms": 2, "warm": 2, "keep-ms": keep, "env": {"AGAIN": "1"}});
+    assert_eq!(put(env).await, format!("restarted {HOST}"));
+    let fresh = route.get(next(), "/").await;
+    assert_ne!(field(&fresh, "boot id: "), boot_id, "another template");
+    drop((held, route));
+
+    let gone = "/api/apps/sized?owner=cf";
+    let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
+    assert_eq!(status, 200, "{removed}");
+    tunnel.advertise().await;
+}
+
+/// An app's numbers of a VM per connection changed: a connection waiting for room finds it as
+/// `vms` grows, `warm` follows at once. Reused: a clone kept past the `uses` it is given goes.
+async fn adjusted_clones_app(
+    tunnel: &mut ServerTunnel,
+    wicket: &Wicket,
+    sha256: &str,
+    conn_id: &mut i64,
+) {
+    const HOST: &str = "clones.local";
+    let at = wicket.console();
+    let put = async |sandbox: serde_json::Value| {
+        let body = app_body(HOST, sha256, sandbox);
+        let (status, put) = console(at, "PUT", "/api/apps/clones", true, body).await;
+        assert_eq!(status, 200, "{put}; {}", wicket.log());
+        put["message"].as_str().unwrap().to_string()
+    };
+    let adjusted = format!("adjusted {HOST}");
+    let mut next = || {
+        *conn_id += 1;
+        *conn_id
+    };
+    let each = |vms: u64, warm: u64| serde_json::json!({"mode": "per-connection", "vms": vms, "warm": warm, "wait-ms": 60_000});
+    assert_eq!(put(each(1, 0)).await, format!("added {HOST}"));
+    let address = advertised_at(&tunnel.advertise().await, HOST);
+    {
+        let route = Route {
+            tunnel,
+            host: HOST,
+            address,
+            listen: None,
+        };
+        let (first, _, _) = route.held(next(), "").await;
+        let waiting = route.held(next(), "");
+        tokio::pin!(waiting);
+        let no_room = tokio::time::timeout(Duration::from_millis(300), &mut waiting).await;
+        assert!(no_room.is_err(), "no room for it yet");
+        assert_eq!(put(each(2, 0)).await, adjusted);
+        let (second, answer, _) = waiting.await;
+        assert_eq!(served(&[answer]), [1], "a VM of its own");
+        drop((first, second));
+        listed_as(wicket, HOST, |route| route["vms"]["alive"] == 0).await;
+        assert_eq!(put(each(2, 2)).await, adjusted);
+        listed_as(wicket, HOST, |route| route["vms"]["warm"] == 2).await;
+        assert_eq!(put(each(1, 1)).await, adjusted);
+        listed_as(wicket, HOST, |route| {
+            route["vms"]["warm"] == 1 && route["vms"]["alive"] == 1
+        })
+        .await;
+    }
+
+    let reused = |uses: u64| serde_json::json!({"mode": "reuse", "vms": 2, "uses": uses});
+    assert_eq!(put(reused(9)).await, format!("restarted {HOST}"));
+    let address = advertised_at(&tunnel.advertise().await, HOST);
+    let route = Route {
+        tunnel,
+        host: HOST,
+        address,
+        listen: None,
+    };
+    assert_eq!(served(&route.keep_alive(next()).await), [1, 2, 3]);
+    let kept = |route: &serde_json::Value| route["vms"]["kept"] == 1;
+    listed_as(wicket, HOST, kept).await;
+    assert_eq!(put(reused(1)).await, adjusted);
+    listed_as(wicket, HOST, |route| route["vms"]["alive"] == 0).await;
+    drop(route);
+
+    let gone = "/api/apps/clones?owner=cf";
+    let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
+    assert_eq!(status, 200, "{removed}");
+    tunnel.advertise().await;
+}
+
+/// A pool's VM, its process ended: told, and looked at as a shared VM is ([`restarting_app`]);
+/// another one cloned in its place, at once, then only after a wait, as its process keeps ending.
+async fn restarting_pool(
+    tunnel: &mut ServerTunnel,
+    wicket: &Wicket,
+    sha256: &str,
+    conn_id: &mut i64,
+) {
+    const HOST: &str = "ending.local";
+    let at = wicket.console();
+    let sandbox = serde_json::json!({"mode": "pool", "vms": 1, "boot-ms": 1000});
+    let body = app_body(HOST, sha256, sandbox);
+    let (status, put) = console(at, "PUT", "/api/apps/ending", true, body).await;
+    assert_eq!(status, 200, "{put}; {}", wicket.log());
+    let address = advertised_at(&tunnel.advertise().await, HOST);
+    let route = Route {
+        tunnel,
+        host: HOST,
+        address,
+        listen: None,
+    };
+    let mut next = || {
+        *conn_id += 1;
+        *conn_id
+    };
+    let first = route.get(next(), "/").await;
+    let boot_id = field(&first, "boot id: ").to_string();
+    let replaced = |times: u64| {
+        move |route: &serde_json::Value| {
+            route["vms"]["restarts"] == times && route["vms"]["pooled"] == 1
+        }
+    };
+
+    // a daemon left listening: its VM serves on
+    let told = route.post(next(), "/exit?listening=1", "").await;
+    assert_eq!(told, "exited, listening\n");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let same = route.get(next(), "/").await;
+    assert_eq!(field(&same, "boot id: "), boot_id);
+    assert_ne!(served(&[same]), [1], "its VM serves on");
+    assert_eq!(listed(wicket, HOST).await["vms"]["restarts"], 0);
+
+    // no process: the connection fails, which has the wicket look
+    assert_eq!(route.post(next(), "/exit", "").await, "exiting\n");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(route.half_closed(next()).await, "");
+    listed_as(wicket, HOST, replaced(1)).await;
+    let another = route.get(next(), "/").await;
+    assert_eq!(field(&another, "boot id: "), boot_id, "of its snapshot");
+    assert_eq!(served(&[another]), [1], "another VM");
+
+    // the next end, soon after: told at once, the VM cloned after a wait
+    let ended = Instant::now();
+    assert_eq!(route.post(next(), "/exit", "").await, "exiting\n");
+    let down = listed_as(wicket, HOST, |route| route["vms"]["down"].is_string()).await;
+    assert_eq!(down["vms"]["pooled"], 0, "{down}");
+    listed_as(wicket, HOST, replaced(2)).await;
+    let waited = ended.elapsed();
+    assert!(waited >= Duration::from_secs(1), "{waited:?}");
+    assert_eq!(served(&[route.get(next(), "/").await]), [1]);
+    drop(route);
+
+    let gone = "/api/apps/ending?owner=cf";
     let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
     assert_eq!(status, 200, "{removed}");
     tunnel.advertise().await;

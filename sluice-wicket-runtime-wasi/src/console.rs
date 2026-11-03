@@ -181,7 +181,7 @@ impl Console {
                         sha256: loaded.digest().to_string(),
                         bytes: loaded.size(),
                     },
-                    sandbox: SandboxView::of(handler.sandbox()),
+                    sandbox: SandboxView::of(&handler.sandbox()),
                 })
             })
             .collect();
@@ -236,7 +236,7 @@ impl Console {
                     name: handler.loaded().label().to_string(),
                 },
                 sandbox: AppSandboxView {
-                    body: SandboxBody::of(handler.sandbox()),
+                    body: SandboxBody::of(&handler.sandbox()),
                     env: handler.sandbox().env.names(),
                 },
                 tag: tag.clone(),

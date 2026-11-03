@@ -536,9 +536,9 @@ pub fn check_annotations(
         _ => {}
     }
     let takes: &[&str] = match lifetime.mode.as_deref() {
-        // a wasm wicket's, that need no mode
-        None if runtime != Some(Runtime::Firecracker) => &[WARM_ANNOTATION, CONCURRENCY_ANNOTATION],
-        None | Some("shared") => &[],
+        // what a VM with no mode annotated is, a pool at any count, and a wasm wicket's
+        None | Some("pool") => &[WARM_ANNOTATION, KEEP_ANNOTATION, CONCURRENCY_ANNOTATION],
+        Some("shared") => &[],
         Some("per-connection") => &[WARM_ANNOTATION],
         Some("reuse") => &[
             WARM_ANNOTATION,
@@ -546,7 +546,6 @@ pub fn check_annotations(
             USES_ANNOTATION,
             LIFETIME_ANNOTATION,
         ],
-        Some("pool") => &[WARM_ANNOTATION, KEEP_ANNOTATION, CONCURRENCY_ANNOTATION],
         Some(other) => {
             return Err(format!(
                 "annotation {MODE_ANNOTATION}: '{other}' is no mode: shared, per-connection, \
@@ -948,17 +947,10 @@ mod tests {
                 Some(Firecracker),
                 "does not take",
             ),
-            // a lifetime needs a mode: what `cf scale` chooses would change what it means
-            (
-                &[("keep-ms", "1")],
-                2,
-                Some(Firecracker),
-                "needs annotation",
-            ),
-            (&[("warm", "1")], 2, Some(Firecracker), "needs annotation"),
+            // none annotated is a pool, which reuses nothing
             (&[("uses", "1")], 2, None, "needs annotation"),
             (
-                &[("concurrency", "1")],
+                &[("lifetime-ms", "1")],
                 2,
                 Some(Firecracker),
                 "needs annotation",
@@ -1028,6 +1020,11 @@ mod tests {
         }
         for (pairs, instances, runtime) in [
             (&[][..], 3, Some(Firecracker)),
+            (
+                &[("warm", "1"), ("keep-ms", "1"), ("concurrency", "4")],
+                2,
+                Some(Firecracker),
+            ),
             (&[("mode", "shared")], 1, Some(Firecracker)),
             (
                 &[("mode", "per-connection"), ("warm", "2")],

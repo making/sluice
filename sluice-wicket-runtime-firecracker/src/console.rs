@@ -174,7 +174,8 @@ impl Console {
         let routes = table
             .served()
             .map(|(up, origin, route)| {
-                let rootfs = &route.spec.vm.rootfs;
+                let spec = route.spec();
+                let rootfs = &spec.vm.rootfs;
                 let (path, sha256) = match origin {
                     // its path below the directory names its digest
                     Origin::Console { .. } | Origin::Api { .. } => {
@@ -201,7 +202,7 @@ impl Console {
                         Origin::Api { owner, .. } => Some(owner.clone()),
                         _ => None,
                     },
-                    env: route.spec.vm.env.names(),
+                    env: spec.vm.env.names(),
                     target: up.target_url.clone(),
                     rootfs: RootfsView {
                         name: rootfs
@@ -212,10 +213,10 @@ impl Console {
                         sha256,
                         bytes: std::fs::metadata(rootfs).map_or(0, |metadata| metadata.len()),
                     },
-                    options: route.spec.options().into_iter().collect(),
-                    mode: route.spec.mode.name(),
-                    mem_mib: route.spec.vm.mem_mib,
-                    vcpus: route.spec.vm.vcpus,
+                    options: spec.options().into_iter().collect(),
+                    mode: spec.mode.name(),
+                    mem_mib: spec.vm.mem_mib,
+                    vcpus: spec.vm.vcpus,
                     vms: VmsView {
                         alive: vms.alive,
                         shared: vms.shared,
@@ -225,7 +226,7 @@ impl Console {
                         starting: vms.starting,
                         connections: vms.connections,
                         restarts: vms.restarts,
-                        down: route.down().filter(|_| route.stopped()),
+                        down: route.down(),
                     },
                     snapshot: route.taken().map(|taken| SnapshotView {
                         memory_bytes: taken.memory,
@@ -277,7 +278,7 @@ impl Console {
                 app.hosts.push(up.host.clone());
                 continue;
             }
-            let rootfs = &route.spec.vm.rootfs;
+            let rootfs = &route.vm().rootfs;
             let relative = rootfs.strip_prefix(&self.dir).unwrap_or(rootfs);
             apps.push(AppView {
                 name: name.clone(),
@@ -290,7 +291,7 @@ impl Console {
                         .map(|name| name.to_string_lossy().to_string())
                         .unwrap_or_default(),
                 },
-                sandbox: sandbox_view(&route.spec),
+                sandbox: sandbox_view(&route.spec()),
                 tag: tag.clone(),
                 deployed: deployed.clone(),
             });

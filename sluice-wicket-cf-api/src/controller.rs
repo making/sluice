@@ -537,11 +537,12 @@ const WICKET_DEFAULT_KEEP_MS: u64 = 60_000;
 const DEFAULT_CONCURRENCY: u64 = 16;
 
 /// A rootfs's sandbox on a Firecracker wicket: `instances` VMs at most (from 1: 0 is no app),
-/// living as `lifetime` says. None annotated, one is a shared VM, booted at once; more, a pool
-/// of that size cloned from a snapshot. A pool given a `keep-ms` keeps only the VMs annotated
-/// `warm`, none by default: the wicket's default of all of them would leave no VM to kill; its
-/// `concurrency` is `conns`. Its process has `timeout` seconds to listen, and connects to the
-/// destinations of `egress`.
+/// living as `lifetime` says. None annotated, a pool of that size cloned from a snapshot, at any
+/// size: a scale adds to the VMs running, and takes from them (a shared VM has no snapshot to
+/// clone another one from). A pool given a `keep-ms` keeps only the VMs annotated `warm`, none by
+/// default: the wicket's default of all of them would leave no VM to kill; its `concurrency` is
+/// `conns`. Its process has `timeout` seconds to listen, and connects to the destinations of
+/// `egress`.
 fn vm_sandbox(
     memory_mib: u64,
     instances: u64,
@@ -550,10 +551,7 @@ fn vm_sandbox(
     egress: &[String],
     lifetime: &Lifetime,
 ) -> Sandbox {
-    let mode = lifetime.mode.as_deref().unwrap_or(match instances {
-        1 => "shared",
-        _ => "pool",
-    });
+    let mode = lifetime.mode.as_deref().unwrap_or("pool");
     let warm = lifetime
         .warm
         .or((mode == "pool" && lifetime.keep_ms.is_some()).then_some(0));
@@ -781,7 +779,7 @@ mod tests {
             concurrency: None,
         };
         for (instances, annotated, mode, vms, warm) in [
-            (1, Lifetime::default(), "shared", None, None),
+            (1, Lifetime::default(), "pool", Some(1), None),
             (3, Lifetime::default(), "pool", Some(3), None),
             (
                 1,

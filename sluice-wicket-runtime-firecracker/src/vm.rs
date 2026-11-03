@@ -338,7 +338,7 @@ pub enum Places {
 
 impl Places {
     /// The place of the `n`th route started, of `spec`: `route-<n>` in the state dir
-    /// (0700: the snapshot is the template's whole memory), or a route of the keeper's
+    /// (0700: the snapshot is what the template wrote of its memory), or a route of the keeper's
     /// given the spec's kernel and rootfs, opened as the wicket's user.
     pub async fn place(&self, n: u64, spec: &Spec) -> Result<Place, BoxError> {
         match self {
@@ -637,7 +637,12 @@ impl Vm {
         vm.api(
             "PUT",
             "/machine-config",
-            json!({ "vcpu_count": spec.vcpus, "mem_size_mib": spec.mem_mib }),
+            json!({
+                "vcpu_count": spec.vcpus,
+                "mem_size_mib": spec.mem_mib,
+                // a template's snapshot holds what its guest wrote (`Vm::snapshot`)
+                "track_dirty_pages": matches!(role, Role::Template),
+            }),
         )
         .await?;
         vm.api(
@@ -828,8 +833,10 @@ impl Vm {
         Ok(vm)
     }
 
-    /// Pauses the VM (of `spec`) and writes its full snapshot into its place's snapshot
-    /// directory; the VM stays paused.
+    /// Pauses the VM (of `spec`) and writes its snapshot into its place's snapshot directory; the
+    /// VM stays paused. A VM booted tracking what its guest writes: its memory file holds that
+    /// alone, the rest holes reading as the zeros it is, so a snapshot takes what the guest
+    /// touched rather than all of `mem` (see findings, A snapshot's memory).
     pub async fn snapshot(&self, place: &Place, spec: &Spec) -> Result<Snapshot, BoxError> {
         let (inside, on_host) = match place {
             Place::Dir(dir) => {
@@ -852,7 +859,7 @@ impl Vm {
             "PUT",
             "/snapshot/create",
             json!({
-                "snapshot_type": "Full",
+                "snapshot_type": "Diff",
                 "snapshot_path": snapshot.state,
                 "mem_file_path": snapshot.memory,
             }),

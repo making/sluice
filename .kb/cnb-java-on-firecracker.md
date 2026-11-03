@@ -22,9 +22,10 @@ The Paketo memory calculator's fixed regions: 606135K (`-XX:MaxDirectMemorySize=
 
 ## A pool's cost at the default memory
 
-`cf scale hello -i 2` of the sample guest at 1G: template booted in 689ms, snapshot taken after
-1374ms, a 1024 MiB memory file. The wicket container's memory went from 359 MiB to 1.36 GiB, the
-snapshot on `--tmpfs /run/sluice`.
+The sample guest at 1G, a `Full` snapshot: template booted in 689ms, snapshot taken after 1374ms, a
+1024 MiB memory file, the wicket container's memory from 359 MiB to 1.36 GiB, the snapshot on
+`--tmpfs /run/sluice`. Now it holds what its guest wrote: 681ms, 767ms, 69 MiB
+([findings](wicket-firecracker-findings.md#a-snapshots-memory)).
 
 ## `docker compose down` and `up`
 

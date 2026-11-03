@@ -82,7 +82,7 @@ async fn serve(mut client: Replay<TcpStream>, peer: SocketAddr, routes: &Routes<
     };
     match route.open(&peer.ip().to_string()).await {
         Ok(Lease { stream, hold }) => {
-            let relayed = wire::relay(&mut client, stream, route.spec.idle).await;
+            let relayed = wire::relay(&mut client, stream, route.idle()).await;
             // a reused clone kept before the client sees the end
             let ended = hold.end(relayed.is_ok());
             drop(client);

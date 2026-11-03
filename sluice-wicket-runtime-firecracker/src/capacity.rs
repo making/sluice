@@ -1,7 +1,7 @@
 //! The VMs' budget: the VMs alive at once (`--max-vms`) and their guest memory
-//! (`--max-memory`) over every route, and a route's own cap (`vms=N`). A VM
-//! holds its share, a [`Slot`], from before its `firecracker` starts until it is
-//! killed.
+//! (`--max-memory`) over every route, and a route's own cap (`vms=N`), which a
+//! running route may change ([`Capacity::cap`]). A VM holds its share, a [`Slot`],
+//! from before its `firecracker` starts until it is killed.
 //!
 //! Slots go to the VMs asking for one in the order they asked
 //! ([`Capacity::take`]), but for one held back by its route's cap alone, which
@@ -24,8 +24,6 @@ pub struct Need {
     /// MiB.
     pub memory: u64,
     pub route: u64,
-    /// The route's VMs alive at once at most; None = the global limits alone.
-    pub cap: Option<usize>,
 }
 
 /// What a hold counts as in the routes' VMs: no route's.
@@ -49,14 +47,22 @@ pub struct Capacity {
 struct State {
     vms: usize,
     memory: u64,
-    /// Route -> its VMs alive.
-    routes: HashMap<u64, usize>,
+    /// Route -> its VMs alive and its cap.
+    routes: HashMap<u64, Room>,
     /// The VMs waiting for a slot, their tickets and needs, in the order they
     /// asked.
     waiting: VecDeque<(u64, Need)>,
     next_ticket: u64,
     /// Route -> its spare VMs (a route may have more than one kind).
     pools: Vec<(u64, Weak<dyn Pool>)>,
+}
+
+/// A route's share of the budget.
+#[derive(Default)]
+struct Room {
+    alive: usize,
+    /// Its VMs alive at once at most; None = the global limits alone.
+    cap: Option<usize>,
 }
 
 /// Why a VM finds no room.
@@ -86,8 +92,8 @@ impl Drop for Slot {
             let mut state = self.capacity.state.lock().unwrap();
             state.vms -= 1;
             state.memory -= self.need.memory;
-            if let Some(count) = state.routes.get_mut(&self.need.route) {
-                *count -= 1;
+            if let Some(room) = state.routes.get_mut(&self.need.route) {
+                room.alive -= 1;
             }
         }
         self.capacity.changed.notify_waiters();
@@ -130,10 +136,30 @@ impl Capacity {
         self.state.lock().unwrap().pools.push((route, pool));
     }
 
+    /// The VMs of `route` alive at once at most from now on (None = the global limits
+    /// alone), for what waits for room too. Those past it stay until they go.
+    pub fn cap(&self, route: u64, cap: Option<usize>) {
+        self.state
+            .lock()
+            .unwrap()
+            .routes
+            .entry(route)
+            .or_default()
+            .cap = cap;
+        self.changed.notify_waiters();
+    }
+
+    /// Whether `route` has more VMs alive than its cap: it was lowered.
+    pub fn over(&self, route: u64) -> bool {
+        let state = self.state.lock().unwrap();
+        let room = state.routes.get(&route);
+        room.is_some_and(|room| room.cap.is_some_and(|cap| room.alive > cap))
+    }
+
     /// What keeps `need` out of `state`, if anything.
     fn short(&self, state: &State, need: &Need) -> Option<Short> {
-        let alive = state.routes.get(&need.route).copied().unwrap_or(0);
-        if need.cap.is_some_and(|cap| alive >= cap) {
+        let room = state.routes.get(&need.route);
+        if room.is_some_and(|room| room.cap.is_some_and(|cap| room.alive >= cap)) {
             Some(Short::Route)
         } else if state.vms >= self.max_vms
             || state.memory.saturating_add(need.memory) > self.max_memory
@@ -147,7 +173,7 @@ impl Capacity {
     fn grant(self: &Arc<Self>, state: &mut State, need: Need) -> Slot {
         state.vms += 1;
         state.memory += need.memory;
-        *state.routes.entry(need.route).or_default() += 1;
+        state.routes.entry(need.route).or_default().alive += 1;
         Slot {
             capacity: self.clone(),
             need,
@@ -173,7 +199,6 @@ impl Capacity {
             Need {
                 memory,
                 route: HELD,
-                cap: None,
             },
         )
     }
@@ -236,6 +261,7 @@ impl Capacity {
                 () = notified => {}
                 () = tokio::time::sleep_until(deadline) => {
                     let state = self.state.lock().unwrap();
+                    let room = state.routes.get(&need.route);
                     return Err(Full(format!(
                         "no room for a VM within {}ms (VMs {}/{}, memory {}/{} MiB, the route's {}/{})",
                         wait.as_millis(),
@@ -243,8 +269,8 @@ impl Capacity {
                         self.max_vms,
                         state.memory,
                         if self.max_memory == u64::MAX { "-".to_string() } else { self.max_memory.to_string() },
-                        state.routes.get(&need.route).copied().unwrap_or(0),
-                        need.cap.map_or("-".to_string(), |cap| cap.to_string()),
+                        room.map_or(0, |room| room.alive),
+                        room.and_then(|room| room.cap).map_or("-".to_string(), |cap| cap.to_string()),
                     )));
                 }
             }
@@ -285,7 +311,7 @@ impl Capacity {
     /// The VMs alive of `route`.
     pub fn alive(&self, route: u64) -> usize {
         let state = self.state.lock().unwrap();
-        state.routes.get(&route).copied().unwrap_or(0)
+        state.routes.get(&route).map_or(0, |room| room.alive)
     }
 
     pub fn max_vms(&self) -> usize {
@@ -325,8 +351,8 @@ mod tests {
 
     use super::*;
 
-    fn need(memory: u64, route: u64, cap: Option<usize>) -> Need {
-        Need { memory, route, cap }
+    fn need(memory: u64, route: u64) -> Need {
+        Need { memory, route }
     }
 
     /// Warm clones held as slots, given up one by one.
@@ -349,51 +375,39 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn slots_go_in_turn_within_the_limits() {
         let capacity = Capacity::new(3, Some(1024));
-        let big = capacity
-            .take(need(768, 1, None), Duration::ZERO)
-            .await
-            .unwrap();
-        let small = capacity.try_take(need(128, 2, Some(1))).unwrap();
+        let big = capacity.take(need(768, 1), Duration::ZERO).await.unwrap();
+        capacity.cap(2, Some(1));
+        let small = capacity.try_take(need(128, 2)).unwrap();
+        assert!(capacity.try_take(need(128, 2)).is_none(), "the route's cap");
         assert!(
-            capacity.try_take(need(128, 2, Some(1))).is_none(),
-            "the route's cap"
-        );
-        assert!(
-            capacity.try_take(need(256, 3, None)).is_none(),
+            capacity.try_take(need(256, 3)).is_none(),
             "the memory: 768 + 128 + 256"
         );
         let full = capacity
-            .take(need(256, 3, None), Duration::from_millis(100))
+            .take(need(256, 3), Duration::from_millis(100))
             .await
             .unwrap_err();
         assert!(full.to_string().contains("memory 896/1024 MiB"), "{full}");
 
         let waiting = tokio::spawn({
             let capacity = capacity.clone();
-            async move {
-                capacity
-                    .take(need(256, 3, None), Duration::from_secs(10))
-                    .await
-            }
+            async move { capacity.take(need(256, 3), Duration::from_secs(10)).await }
         });
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(
-            capacity.try_take(need(64, 4, None)).is_none(),
+            capacity.try_take(need(64, 4)).is_none(),
             "room nobody waits for only"
         );
         drop(big);
         let third = waiting.await.unwrap().unwrap();
-        assert!(
-            capacity.try_take(need(64, 4, None)).is_some(),
-            "and the rest"
-        );
+        assert!(capacity.try_take(need(64, 4)).is_some(), "and the rest");
         drop((small, third));
 
-        let vm = capacity.try_take(need(1024, 5, None)).unwrap();
+        let vm = capacity.try_take(need(1024, 5)).unwrap();
         let held = capacity.hold(1024);
         drop(vm);
-        assert!(capacity.try_take(need(64, 6, None)).is_none(), "held");
-        let back = capacity.in_room_of(&held, need(1024, 7, None));
+        assert!(capacity.try_take(need(64, 6)).is_none(), "held");
+        let back = capacity.in_room_of(&held, need(1024, 7));
         assert_eq!(capacity.alive(7), 1);
         drop(held);
         assert_eq!(capacity.usage(), (1, 1024));
@@ -410,8 +424,8 @@ mod tests {
         capacity.register(4, Arc::downgrade(&empty));
         let warm = Arc::new(Warm(
             Mutex::new(vec![
-                capacity.try_take(need(128, 1, None)).unwrap(),
-                capacity.try_take(need(128, 1, None)).unwrap(),
+                capacity.try_take(need(128, 1)).unwrap(),
+                capacity.try_take(need(128, 1)).unwrap(),
             ]),
             AtomicUsize::new(0),
         ));
@@ -419,31 +433,55 @@ mod tests {
         capacity.register(1, Arc::downgrade(&pool));
 
         let slot = capacity
-            .take(need(128, 2, None), Duration::from_secs(1))
+            .take(need(128, 2), Duration::from_secs(1))
             .await
             .unwrap();
         assert_eq!(warm.1.load(Ordering::SeqCst), 1, "one clone gave way");
 
         // route 1 at its cap waits for its own VMs, and keeps nobody waiting
+        capacity.cap(1, Some(1));
         let capped = tokio::spawn({
             let capacity = capacity.clone();
-            async move {
-                capacity
-                    .take(need(128, 1, Some(1)), Duration::from_millis(50))
-                    .await
-            }
+            async move { capacity.take(need(128, 1), Duration::from_millis(50)).await }
         });
         tokio::time::sleep(Duration::from_millis(10)).await;
         drop(slot);
-        let other = capacity
-            .take(need(128, 3, None), Duration::ZERO)
-            .await
-            .unwrap();
+        let other = capacity.take(need(128, 3), Duration::ZERO).await.unwrap();
         assert!(
             capped.await.unwrap().is_err(),
             "its own route's clone is no room for a route at its cap"
         );
         assert_eq!(warm.1.load(Ordering::SeqCst), 1);
         drop(other);
+    }
+
+    /// A route's cap changed: what waits for room finds it at once, up; down, the VMs past it
+    /// stay until they go, and nothing more is started.
+    #[tokio::test(start_paused = true)]
+    async fn a_routes_cap_changes_under_its_vms() {
+        let capacity = Capacity::new(8, None);
+        capacity.cap(1, Some(1));
+        let first = capacity.try_take(need(128, 1)).unwrap();
+        let waiting = tokio::spawn({
+            let capacity = capacity.clone();
+            async move { capacity.take(need(128, 1), Duration::from_secs(10)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!waiting.is_finished(), "at its cap");
+        capacity.cap(1, Some(2));
+        let second = waiting.await.unwrap().unwrap();
+        assert!(!capacity.over(1));
+
+        capacity.cap(1, Some(1));
+        assert!(capacity.over(1), "2 alive past 1");
+        assert!(capacity.try_take(need(128, 1)).is_none());
+        drop(second);
+        assert!(!capacity.over(1));
+        assert!(capacity.try_take(need(128, 1)).is_none(), "1 alive of 1");
+        drop(first);
+        assert!(capacity.try_take(need(128, 1)).is_some());
+
+        capacity.cap(1, None);
+        assert!(!capacity.over(1), "no cap");
     }
 }
