@@ -10,7 +10,7 @@
 //! stderr and on a flume (`sluice-wicket-tunnel`'s double); the guests' egress to
 //! a destination on the host, by name, address, range and IPv6, from a shared VM
 //! and a clone, and its records; the routes through `--listen` as well, by host
-//! (http/1.1 and h2c, an unknown one answered 404), a `--vm` route alone
+//! (http/1.1 and h2c, an unknown one answered 404), clients left quiet there, a `--vm` route alone
 //! whatever the host and handing through a guest speaking first, not with `--console` nor
 //! from the config file; a reload of the `--config`
 //! file, polled, removing a route and replacing a rootfs; its numbers and an app's changed, the
@@ -338,6 +338,8 @@ async fn every_route_serves_http_through_the_tunnel() {
     // through --listen, by host: the shared VM counting on (by Host, then by h2c
     // :authority), a clone of its own, an unknown host answered 404
     let listening = wicket.listening();
+    // meanwhile the sections below: this waits for a minute
+    let quiet = tokio::spawn(quiet_clients(listening));
     let via = |host| Route {
         tunnel: &tunnel,
         host,
@@ -396,6 +398,12 @@ async fn every_route_serves_http_through_the_tunnel() {
             wicket.log()
         );
     }
+
+    assert!(
+        tokio::time::timeout(HANG, quiet).await.is_ok(),
+        "--listen: quiet clients: hung; {}",
+        wicket.log()
+    );
 
     // the config file's numbers of a route changed: its VMs stay
     let mut tunnel = tunnel;
@@ -783,6 +791,90 @@ async fn sole_routes(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) ->
         });
         assert!(checked.await.is_ok(), "{args:?}: hung; {}", routed.log());
     }
+}
+
+/// A client of `--listen` with no request in progress loses its connection a minute after its
+/// answer, and not before, its guest told as of a client closing: a reused clone serves the next
+/// connection, an h2c client reads a GOAWAY naming the stream it opened.
+async fn quiet_clients(listening: std::net::SocketAddr) {
+    /// How long past the minute a connection may take to end.
+    const LATE: Duration = Duration::from_secs(5);
+    const MINUTE: Duration = Duration::from_secs(60);
+    let connect = || tokio::net::TcpStream::connect(listening);
+    let ended = async |client: &mut tokio::net::TcpStream, answered: tokio::time::Instant| {
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).await.unwrap();
+        let waited = answered.elapsed();
+        assert!(
+            waited >= MINUTE - LATE && waited < MINUTE + LATE,
+            "{waited:?}"
+        );
+        rest
+    };
+    let get = async |client: &mut tokio::net::TcpStream| {
+        let request = "GET / HTTP/1.1\r\nhost: reuse.local\r\n\r\n";
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = Vec::new();
+        let mut buffer = [0; 4096];
+        while !answer.ends_with(b"\n") {
+            let read = client.read(&mut buffer).await.unwrap();
+            assert_ne!(read, 0, "{}", String::from_utf8_lossy(&answer));
+            answer.extend_from_slice(&buffer[..read]);
+        }
+        let answer = String::from_utf8_lossy(&answer).into_owned();
+        served(&[answer])[0]
+    };
+    let http1 = async {
+        let mut client = connect().await.unwrap();
+        let count = get(&mut client).await;
+        let answered = tokio::time::Instant::now();
+        assert_eq!(ended(&mut client, answered).await, b"");
+        assert_eq!(get(&mut connect().await.unwrap()).await, count + 1);
+    };
+    let h2 = async {
+        let frame = |kind: u8, flags: u8, stream: u32, payload: &[u8]| {
+            let len = (payload.len() as u32).to_be_bytes();
+            [&len[1..], &[kind, flags], &stream.to_be_bytes(), payload].concat()
+        };
+        // GET http:// /, :authority (literal, indexed name)
+        let block = [&[0x82, 0x86, 0x84, 0x41, 11][..], b"clone.local"].concat();
+        let opening = [
+            &b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..],
+            &frame(0x4, 0, 0, &[]),
+            &frame(0x1, 0x4 | 0x1, 1, &block),
+        ]
+        .concat();
+        let mut client = connect().await.unwrap();
+        client.write_all(&opening).await.unwrap();
+        let mut read = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let got = client.read(&mut buffer).await.unwrap();
+            assert_ne!(got, 0, "{read:?}");
+            read.extend_from_slice(&buffer[..got]);
+            let mut frames = &read[..];
+            let mut answered = false;
+            while let Some(head) = frames.get(..9) {
+                let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+                let Some(next) = frames.get(9 + len..) else {
+                    break;
+                };
+                // DATA or HEADERS ending the stream
+                answered |= head[3] <= 1 && head[4] & 0x1 != 0;
+                frames = next;
+            }
+            if answered {
+                break;
+            }
+        }
+        // the guest's SETTINGS acknowledged, as a client must
+        client.write_all(&frame(0x4, 0x1, 0, &[])).await.unwrap();
+        let answered = tokio::time::Instant::now();
+        let rest = ended(&mut client, answered).await;
+        let goaway = frame(0x7, 0, 0, &[0, 0, 0, 1, 0, 0, 0, 0]);
+        assert!(rest.ends_with(&goaway), "{rest:?}");
+    };
+    tokio::join!(http1, h2);
 }
 
 /// `what` sent on `client`, and what came until it ended.

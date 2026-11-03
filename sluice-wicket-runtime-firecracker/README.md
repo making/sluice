@@ -79,7 +79,7 @@ Two Cargo workspaces:
   `output.rs` the VMs' output, `egress.rs` their egress, `wire.rs` the vsock framing, the
   restore notice and the egress rules,
   `listener.rs` `--listen` (`head.rs` the request head routing a connection, `hpack.rs`
-  an h2c one's), `console.rs` the console (its page in `src/console/`), `deployed.rs` its
+  an h2c one's, `exchange.rs` whether a request is in progress), `console.rs` the console (its page in `src/console/`), `deployed.rs` its
   routes and apps kept, `disk.rs` an app's disk, `image.rs` an OCI image pulled, `rootfs.rs`
   its layers as an ext4 image, `state.rs` the state dir, `seccomp.rs` the seccomp filters;
   jail mode's `keeper.rs` (the privileged half, and the wicket's client of it) and
@@ -204,7 +204,12 @@ request) for another host stays on the first one's route -- and adds no `X-Forwa
 header (the guest sees what the client sent: the sample's `x-forwarded-for -`), since only
 the first request of a connection would get them. `--max-connections` bounds the listener's
 connections too, apart from the tunnel's (one beyond waits in the backlog); TCP keepalive (60s
-idle, then 3 probes 10s apart) ends one whose client is gone without a FIN or reset.
+idle, then 3 probes 10s apart) ends one whose client is gone without a FIN or reset. An HTTP
+connection with no request in progress for 60s is closed, as for its client closing it (a reused
+clone is kept, an h2c client reads a GOAWAY), and so is a connection sending nothing, or whose client
+reads nothing of an answer for 60s. A request waits on its guest for as long as it takes; what is
+not HTTP, a guest speaking first, an upgrade are relayed verbatim, only `idle-ms` ending them
+([details](../.kb/connection-limits.md#sluice-wicket-runtime-firecrackers---listen)).
 `--firecracker` names the binary (default `firecracker` on the PATH), `--state-dir` the VMs'
 files (their Unix sockets need paths below 108 bytes; the default is a directory of the
 process's own, 0700, under `$XDG_RUNTIME_DIR` (a tmpfs where systemd sets it), else the
@@ -600,7 +605,8 @@ room has a spare VM of another route killed -- a warm clone, a reuse route's clo
 no connection, a pool's VM beyond its `warm` serving none.
 
 Without more, one client holds as many of a route's VMs as it opens connections, until the
-server's `sluice.limits.idle-timeout` closes them. What bounds one client's share:
+server's `sluice.limits.idle-timeout` closes them (`--listen`: 60s with no request in progress). What
+bounds one client's share:
 
 - **`per-client=N`**: a client address's connections to the route open at once (a
   per-connection or reuse route's VMs, those waiting for room included); one past them fails
@@ -1020,7 +1026,7 @@ ending, and for a shared VM serving two hosts, a VM per connection, reused clone
 and a route of two VMs at most, one per client address, it checks http/1.1 with keep-alive,
 h2c, a 5MB POST under the tunnel's flow control and a client half-closing after its request,
 the clones' clock and random values, a client past its share, the connection finding no room,
-idle connections failed, a reused clone serving the next connection until its `uses` or
+idle connections failed, clients left quiet on `--listen` closed, a reused clone serving the next connection until its `uses` or
 `keep-ms` ran out, a pool growing with the connections held, shrinking idle and replacing its
 VMs killed (unjailed) or their processes ended, a route's and an app's VMs kept as their numbers
 change, the VMs' output (a shared VM's, a template's, a clone's) on the wicket's

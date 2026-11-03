@@ -197,9 +197,44 @@ holding a token, and a server's operator turning its limits off asked for that.
 The slots of either wicket's `--listen` do not give way as the consoles' do: all taken, the next
 waits in the backlog.
 
-sluice-wicket-runtime-firecracker's `--listen` has only its head's 10s (none on a sole route, whose
-guest may speak first): it relays verbatim after that, so a quiet client is its guest's and the route's
-`idle-ms`'s to end.
+## sluice-wicket-runtime-firecracker's `--listen`
+
+A connection holds a slot of `--max-connections`, and a VM on a per-connection or reuse route, so its
+client gets the same 60s (`QUIET`) from the moment no request is in progress. The relay stays verbatim;
+`exchange.rs` follows the bytes going by, as the server's data plane would: an http/1.1 request is in
+progress from the end of its head until its answer (`Content-Length`, chunked, none for HEAD / 204 /
+304) and its body ended, a pipelined one after it; an h2c connection has one while a stream is open.
+The minute is one wait, whatever goes by meanwhile: a next head that did not end, a PING. It covers a
+client connected and sending nothing, on a sole route too (a sole route reads no head; a route by host
+has its head's 10s first). Past it the guest is told as of a client closing (the framing's CLOSE), and
+ends the connection in turn, so a reused clone is kept for the next: a browser's idle connection
+usually ends this way, and failing it would kill the clone. An h2 client reads a GOAWAY naming the last
+stream it opened, if the guest sent its preface and stopped between two frames. A guest keeping the
+connection 2s more fails it, its clone killed; a client's own FIN meeting a guest that keeps the
+connection ends so too, 60s after the last request.
+
+A write of an answer pending for 60s fails the relay, whatever the protocol (`Unread`), its clone
+killed.
+
+Three other ways were weighed. A default `idle-ms` cuts a long poll, a stream or a WebSocket quiet for
+a minute, which the tunnel's HTTP connections keep (`idle-timeout` does not reach them). Who spoke last
+tells a long poll from an idle connection, but not an idle connection from a streaming response
+(server-sent events). Leaving it to the guest leaves the listener to any guest that sets no timeout
+(Go's default): 256 clients left it answering no one.
+
+What a request waits on is its guest's time. Without a budget as sluice-wicket-runtime-wasi's, nothing
+here bounds a guest not answering, nor a body its client stopped sending, but the guest's own read
+timeout and the route's `idle-ms`: this follows no flow control, so it could not tell a client not
+sending an h2 body from one the guest granted no window, nor is a client streaming to a quiet guest at
+fault.
+
+What cannot be followed is verbatim for good, as on the data plane, and only `idle-ms` ends it: a guest
+speaking first or unasked, what parses as no HTTP (another protocol on a sole route; a pool of its
+clients idling for minutes is legitimate), an upgrade (`101`, h2c's too), a CONNECT, an answer running
+until its close, a message framed two ways, a head past 64KiB, a response or stream the guest pushes.
+Such a bad request reaches the guest, whose answer is usually to close it.
+
+On the tunnel none of this applies: the data plane has these limits (on by default) in front of it.
 
 ## Half-close probes
 

@@ -45,6 +45,7 @@ pub mod console;
 pub mod deployed;
 pub mod disk;
 pub mod egress;
+pub mod exchange;
 pub mod head;
 pub mod hpack;
 pub mod image;

@@ -12,10 +12,10 @@ use crate::hpack;
 pub const MAX_HEAD: usize = 64 * 1024;
 
 /// The h2 connection preface (RFC 9113 3.4).
-const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+pub const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// The most header fields of an http/1.1 head.
-const MAX_FIELDS: usize = 256;
+pub const MAX_FIELDS: usize = 256;
 
 const HEADERS: u8 = 0x1;
 const CONTINUATION: u8 = 0x9;
