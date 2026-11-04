@@ -99,7 +99,7 @@ Type "clear"
 Enter
 Show
 
-Type "# routes apply at once; instances are VMs: 2 cloned from a snapshot"
+Type "# routes apply at once"
 Enter
 Sleep 1s
 Type "cf map-route hello localhost --hostname hi"
@@ -109,12 +109,25 @@ Sleep 1s
 Type "curl -s http://hi.localhost:8080/ | head -2"
 Enter
 Wait
-Sleep 1.5s
+Sleep 3s
+
+Hide
+Type "clear"
+Enter
+Show
+
+Type "# instances are VMs: a scale starts one more, cloned from the app's snapshot, and leaves #0 as it runs"
+Enter
+Sleep 1s
 Type "cf scale hello -i 2"
 Enter
 Wait
-Sleep 3s
-Type `curl -s -H 'Authorization: Bearer wicket-secret' http://127.0.0.1:9090/api/apps | jq '.apps[] | select(.owner == "cf") | {hosts, mode: .sandbox.mode, vms: .sandbox.vms}'`
+Sleep 2s
+Type "cf app hello | tail -3"
+Enter
+Wait
+Sleep 2s
+Type `curl -s -H 'Authorization: Bearer wicket-secret' http://127.0.0.1:9090/api/apps | jq '.apps[] | select(.hosts[0] == "hello.localhost") | {hosts, mode: .sandbox.mode, vms: .sandbox.vms}'`
 Enter
 Wait
 Sleep 4s
