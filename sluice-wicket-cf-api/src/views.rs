@@ -10,7 +10,7 @@ use crate::store::{
     App, Build, Deployment, Droplet, Job, Lifecycle, Named, Outcome, Package, ROOTFS_STACK, Route,
     STACK, SecurityGroup, State, epoch_secs, now,
 };
-use crate::wicket::{ListedApp, Runtime};
+use crate::wicket::{ListedApp, Runtime, Sandbox};
 
 /// The Cloud Controller version announced.
 pub const CC_VERSION: &str = "3.200.0";
@@ -259,8 +259,9 @@ pub fn process(base: &str, state: &State, app: &App) -> Value {
 /// `DOWN` for a stopped app and, of `instances` entries too, `CRASHED` with the wicket's refusal
 /// as `details` and `STARTING` until it serves the app (`listed`, as it answers now). Serving it,
 /// an entry `RUNNING` per instance alive, by the index `cf logs` names, up since its own start,
-/// and `CRASHED` for what it says is down, since then: none is a limit not reached, no
-/// failure, as is an app the wicket has no reason to serve (at 0, without a route).
+/// `CRASHED` for what it says is down, since then, and `STARTING` for a VM it keeps and has not up
+/// yet: none is a limit not reached, no failure, as is an app the wicket has no reason to serve
+/// (at 0, without a route).
 pub fn stats(state: &State, app: &App, owner: &str, listed: Option<&ListedApp>) -> Value {
     let all = |since, state, details: Option<&String>| -> Vec<Entry> {
         (0..app.process.instances)
@@ -291,7 +292,8 @@ pub fn stats(state: &State, app: &App, owner: &str, listed: Option<&ListedApp>) 
         .into_iter()
         .map(|entry| {
             json!({
-                "type": "web", "index": entry.index, "state": entry.state, "routable": true,
+                "type": "web", "index": entry.index, "state": entry.state,
+                "routable": entry.state == "RUNNING",
                 "usage": {"time": now(), "cpu": 0.0, "cpu_entitlement": 0.0, "mem": 0, "disk": 0, "log_rate": 0},
                 "host": "wicket", "instance_internal_ip": "127.0.0.1", "instance_ports": [],
                 "uptime": epoch_secs().saturating_sub(entry.since),
@@ -317,7 +319,9 @@ struct Entry {
 /// The entries of what the wicket lists alive of an app of `instances`, by index, those it names
 /// by one index as one, up since the start of the lowest of them, the one staying as the others
 /// finish; each VM it lists as down at its own index, since that goes on; and what else it is short
-/// of, at the first index below `instances` no other holds.
+/// of, at the first index below `instances` no other holds. Nothing down, the VMs it keeps and has
+/// not up yet are starting, at the lowest indices free: one down, an entry `STARTING` beside it
+/// would keep the CLI's wait going where all that it lists has failed.
 fn alive(listed: &ListedApp, instances: u64) -> Vec<Entry> {
     let mut indices = BTreeMap::new();
     for instance in &listed.alive {
@@ -352,6 +356,17 @@ fn alive(listed: &ListedApp, instances: u64) -> Vec<Entry> {
             since: short.since,
         });
     }
+    if down.is_empty() {
+        let short = kept(&listed.app.sandbox).saturating_sub(indices.len() as u64);
+        let free = (0..instances).filter(|index| !indices.contains_key(index));
+        let starting: Vec<u64> = free.take(short as usize).collect();
+        down.extend(starting.into_iter().map(|index| Entry {
+            index,
+            state: "STARTING",
+            details: None,
+            since: epoch_secs(),
+        }));
+    }
     let mut entries: Vec<_> = indices
         .into_iter()
         .map(|(index, since)| Entry {
@@ -364,6 +379,17 @@ fn alive(listed: &ListedApp, instances: u64) -> Vec<Entry> {
         .collect();
     entries.sort_by_key(|entry| entry.index);
     entries
+}
+
+/// The VMs a wicket keeps up of a route as listed, whatever its requests: of a pool `warm`, its
+/// default `vms`, booted `vms`, 1 going unlisted. None of the other modes, a clone coming and going
+/// with its connection, nor of a component, whose units the wicket lists as it has them.
+fn kept(sandbox: &Sandbox) -> u64 {
+    match sandbox.mode.as_deref() {
+        Some("pool") => sandbox.warm.or(sandbox.vms).unwrap_or(0),
+        Some("boot") => sandbox.vms.unwrap_or(1),
+        _ => 0,
+    }
 }
 
 pub fn route(base: &str, state: &State, route: &Route) -> Value {
@@ -907,6 +933,83 @@ mod tests {
             );
         }
 
+        // the VMs it keeps and has not up yet are starting, the rest of a limit is no entry, and
+        // one down leaves what the CLI takes for a failure of all
+        let running = |index| some(index, "RUNNING");
+        let starting = |index| some(index, "STARTING");
+        for (sandbox, alive, down, listed_as) in [
+            (
+                json!({"mode": "pool", "vms": 2}),
+                json!([0]),
+                Value::Null,
+                vec![running(0), starting(1)],
+            ),
+            (
+                json!({"mode": "pool", "vms": 2}),
+                json!([1]),
+                Value::Null,
+                vec![starting(0), running(1)],
+            ),
+            (
+                json!({"mode": "pool", "vms": 2}),
+                json!([]),
+                Value::Null,
+                vec![starting(0), starting(1)],
+            ),
+            (
+                json!({"mode": "pool", "vms": 2}),
+                json!([0, 1]),
+                Value::Null,
+                vec![running(0), running(1)],
+            ),
+            (
+                json!({"mode": "pool", "vms": 2}),
+                json!([]),
+                exit_83.clone(),
+                vec![why(0)],
+            ),
+            (
+                json!({"mode": "pool", "vms": 2, "warm": 1}),
+                json!([]),
+                Value::Null,
+                vec![starting(0)],
+            ),
+            (
+                json!({"mode": "pool", "vms": 2, "warm": 1}),
+                json!([1]),
+                Value::Null,
+                vec![running(1)],
+            ),
+            (
+                json!({"mode": "pool", "vms": 2, "warm": 0}),
+                json!([]),
+                Value::Null,
+                vec![],
+            ),
+            (
+                json!({"mode": "boot", "vms": 2}),
+                json!([0]),
+                Value::Null,
+                vec![running(0), starting(1)],
+            ),
+            (
+                json!({"mode": "boot"}),
+                json!([]),
+                Value::Null,
+                vec![starting(0)],
+            ),
+            (
+                json!({"mode": "reuse", "vms": 2, "warm": 1}),
+                json!([]),
+                Value::Null,
+                vec![],
+            ),
+        ] {
+            let mut kept = listed(alive.clone(), down);
+            kept.app.sandbox = serde_json::from_value(sandbox.clone()).unwrap();
+            assert_eq!(entries(&state, Some(&kept)), listed_as, "{sandbox} {alive}");
+        }
+
         // a VM of 3 down at its own index alone, the others serving on or starting unlisted
         state.app_mut(&guid).unwrap().process.instances = 3;
         let mut two = listed(json!([0]), exit_83.clone());
@@ -941,6 +1044,8 @@ mod tests {
         let uptimes = stats(&state, state.app(&guid).unwrap(), "cf", Some(&one));
         let uptime = |at: usize| uptimes["resources"][at]["uptime"].as_u64().unwrap();
         assert_eq!(uptimes["resources"][1]["state"], "RUNNING");
+        assert_eq!(uptimes["resources"][1]["routable"], true);
+        assert_eq!(uptimes["resources"][0]["routable"], false, "CRASHED");
         assert!((100..110).contains(&uptime(1)), "{uptimes}");
         assert_eq!(uptimes["resources"][0]["state"], "CRASHED");
         assert!((50..60).contains(&uptime(0)), "{uptimes}");

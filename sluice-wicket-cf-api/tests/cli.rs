@@ -2096,7 +2096,13 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     assert_eq!(sandbox().unwrap().get("vms"), None, "one, its default");
     assert_eq!(instances_shown(&cf, "fc"), "1/1");
     let advertised_booted = target();
-    cf.ok(&["scale", "fc", "-i", "3"]);
+    let scaled = cf.ok(&["scale", "fc", "-i", "3"]);
+    assert!(
+        scaled
+            .lines()
+            .any(|line| line.starts_with("instances:") && line.ends_with("/3")),
+        "{scaled}"
+    );
     assert_eq!(sandbox().unwrap()["vms"], 3);
     assert_eq!(target(), advertised_booted, "nothing to advertise");
     instances_come_to(&cf, "fc", "3/3");

@@ -657,6 +657,7 @@ applications:
   naming which: `cf restart` undoes a difference. A manifest's `instances` the running app
   cannot take (`cf push` restarts it right after) waits for the next start, the log saying so
 - `cf app` lists [the VMs alive](#instances), one coming with its restore and going as these say,
+  a VM the wicket keeps and has not up yet `STARTING` (`1/2` just after `cf scale -i 2`),
   `0/0` with none, `CRASHED` with why if a request's restore failed, until a restore succeeds: the
   next request's, a `cf scale`'s at once, or the wicket's own, [1s to 60s apart](../sluice-wicket-runtime-firecracker/README.md#a-vm-going-down)
 
@@ -751,7 +752,7 @@ What holds on both wickets; a component's and a VM's are in
 | app stopped, scaled to 0, or without a route | no app in the wicket: a request gets the wicket's 404, as gorouter answers a route with no instance registered. `cf app` shows `0/0` (stopped: `0/N`, each `DOWN`), `cf push` of `instances: 0` waits for none |
 | route `<host>.<domain>` | a host: labels of `a-z`, `0-9` and `-`. No path, port or wildcard (422). A route serves one app: a second destination is refused; zero-downtime updates are `--strategy rolling` |
 | shared domain | `--domain` |
-| instance state | once the wicket took the app, an entry per [instance alive](#instances), `RUNNING`, its `since` its own start, and for a VM it keeps gone down or not starting (no room in the wicket's budget, a snapshot gone), or none alive at `warm: 0` with a request's restore failing for anything but room, `CRASHED` with why as `details`, `since` the failure began, until it is up; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable or has not taken the app. These two list `instances` entries |
+| instance state | once the wicket took the app, an entry per [instance alive](#instances), `RUNNING`, its `since` its own start, for a VM it keeps and has not up yet `STARTING`, and for a VM it keeps gone down or not starting (no room in the wicket's budget, a snapshot gone), or none alive at `warm: 0` with a request's restore failing for anything but room, `CRASHED` with why as `details`, `since` the failure began, until it is up; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable or has not taken the app. These two list `instances` entries |
 | rolling deployment | the app put with the new droplet: the wicket swaps it in place; finalized at once |
 | org / space | one of each |
 | health check, log rate, stack, buildpacks | accepted and shown, no effect |
@@ -803,7 +804,9 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
   there, the others serving on). All of them failing is the start's failure.
   The CLI counts the entries, so the limit cannot show as `3/4`: entries for the rest would read
   as failed, and at none alive keep that wait until its timeout. The limit is the process's
-  `instances` (`cf create-app-manifest`, `cf curl /v3/apps/<guid>/processes/web`)
+  `instances` (`cf create-app-manifest`, `cf curl /v3/apps/<guid>/processes/web`). The VMs the wicket
+  keeps up are another matter, coming whatever the requests: `-i 2` of a pool or `boot` shows `1/2`,
+  the second `STARTING`, until it is up, unless one is down, which stays the `CRASHED` above
 - **`cf logs`** names what `cf app` lists, `0` to `N - 1`: of a component the units alive may
   outnumber N, the work of N instances, and the cf-api names one `index % N`, knowing N as the
   wicket does not; those of one index are one entry. A VM's index is within N already, but for one
