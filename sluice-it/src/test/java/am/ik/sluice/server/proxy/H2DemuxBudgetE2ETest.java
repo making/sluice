@@ -245,44 +245,59 @@ class H2DemuxBudgetE2ETest {
 	 * client holds a window past RFC 9113's, charged to its share, larger than the head:
 	 * the head is charged on top of that credit, not taken out of it. The same request on
 	 * a connection within its allowance reaches the upstream.
+	 * <p>
+	 * The refused connection sends alone, on a route of its own (its queue is its
+	 * route's), until nothing more fits its share. The tunnel and the upstream's socket
+	 * take in megabytes of what it sent: stopped sooner, for want of the budget another
+	 * connection took, it may hold nothing and so rightly admit the head.
 	 */
 	@Test
 	void newStreamIsRefusedOnlyOnAConnectionPastItsAllowance() throws Exception {
 		String route = "bud.refuse.test";
+		String otherRoute = "bud.refuse.other.test";
 		CountDownLatch gate = new CountDownLatch(1);
 		AtomicInteger heads = new AtomicInteger();
+		AtomicInteger otherHeads = new AtomicInteger();
 		startClient(route, stub(socket -> serveGated(socket, gate, heads)));
+		startClient(otherRoute, stub(socket -> serveGated(socket, gate, otherHeads)));
 		double refusedBefore = refused("budget");
 		int credit = HopWindow.FLOOR + 4096;
-		try (Stalled first = open(H2TestClient.connect(dataPort), route, 0, UNBOUNDED, credit, heads);
-				Stalled second = stall(route, heads)) {
-			awaitExhausted();
-			awaitStable(() -> queuedBytes(route));
-			assertThat(budgetUsed()).as("exhausted").isGreaterThanOrEqualTo(BUDGET);
-			assertThat(first.client().connectionWindow())
-				.as("its client holds a window past RFC 9113's: credit charged to its share")
-				.isGreaterThanOrEqualTo(credit);
-			int extra = 1 + 2 * STREAMS;
-			first.client()
-				.headers(extra, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/extra"));
-			assertThat(first.client().awaitTrue(() -> first.client().reset(extra) != null, Duration.ofSeconds(5)))
-				.isTrue();
-			assertThat(first.client().reset(extra)).isEqualTo(TestH2.REFUSED_STREAM);
-			assertThat(refused("budget")).isEqualTo(refusedBefore + 1);
-			assertThat(first.client().closed()).isFalse();
-			int headsBefore = heads.get();
-			try (H2TestClient fresh = H2TestClient.connect(dataPort)) {
-				fresh.headers(1, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/fresh"));
-				Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> heads.get() > headsBefore);
-				assertThat(fresh.reset(1)).isNull();
+		try (Stalled first = open(H2TestClient.connect(dataPort), route, 0, UNBOUNDED, credit, heads)) {
+			first.awaitWithheld();
+			assertThat(awaitSteady(() -> queuedBytes(route))).as("stopped past its allowance")
+				.isGreaterThan(NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE);
+			try (Stalled second = stall(otherRoute, otherHeads)) {
+				awaitExhausted();
+				assertThat(awaitSteady(this::budgetUsed)).as("exhausted, and staying so")
+					.isGreaterThanOrEqualTo(BUDGET);
+				assertThat(queuedBytes(route)).as("still past its allowance")
+					.isGreaterThan(NettyHttp2DemuxRelay.CONNECTION_ALLOWANCE);
+				assertThat(first.client().connectionWindow())
+					.as("its client holds a window past RFC 9113's: credit charged to its share")
+					.isGreaterThanOrEqualTo(credit);
+				int extra = 1 + 2 * STREAMS;
+				first.client()
+					.headers(extra, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/extra"));
+				assertThat(first.client().awaitTrue(() -> first.client().reset(extra) != null, Duration.ofSeconds(5)))
+					.isTrue();
+				assertThat(first.client().reset(extra)).isEqualTo(TestH2.REFUSED_STREAM);
+				assertThat(refused("budget")).isEqualTo(refusedBefore + 1);
+				assertThat(first.client().closed()).isFalse();
+				int headsBefore = heads.get();
+				try (H2TestClient fresh = H2TestClient.connect(dataPort)) {
+					fresh.headers(1, true, TestH2.headerBlock(":authority=" + route, ":method=GET", ":path=/fresh"));
+					Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> heads.get() > headsBefore);
+					assertThat(fresh.reset(1)).isNull();
+				}
+				gate.countDown();
+				first.end();
+				second.end();
+				first.awaitEnds();
+				second.awaitEnds();
 			}
-			gate.countDown();
-			first.end();
-			second.end();
-			first.awaitEnds();
-			second.awaitEnds();
 		}
 		awaitReleased(route);
+		awaitReleased(otherRoute);
 	}
 
 	/**
