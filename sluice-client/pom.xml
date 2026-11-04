@@ -17,6 +17,10 @@
 			<artifactId>sluice-proto</artifactId>
 		</dependency>
 		<dependency>
+			<groupId>run.endive</groupId>
+			<artifactId>runtime</artifactId>
+		</dependency>
+		<dependency>
 			<groupId>org.jspecify</groupId>
 			<artifactId>jspecify</artifactId>
 		</dependency>

@@ -107,6 +107,11 @@ message Connect {
   // and from a server before this field. A client may bound what one address
   // holds by it.
   string client_address = 5;
+  // The route this connection was opened for, by its key: the domain or host
+  // pattern the client advertised, `tcp:<port>` for a tcp route, `*` for the
+  // catch-all. Routes may share an address: a client holding settings per route
+  // tells them apart by it. Empty from a server before this field.
+  string route = 6;
 }
 
 message Close {

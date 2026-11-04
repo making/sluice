@@ -2,7 +2,9 @@ package am.ik.sluice.client.config;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -54,7 +56,7 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	 * @param id stable client identity sent as {@code x-sluice-id} on every tunnel
 	 * stream; blank = a random id is generated once per process
 	 * @param upstream upstream entries, bound from
-	 * {@code sluice.client.upstream[n].{host,host-pattern,target,rewrite-host,force-http1,listen-port,allowed-cidrs,verbatim-idle-timeout}}
+	 * {@code sluice.client.upstream[n].{host,host-pattern,target,rewrite-host,force-http1,listen-port,allowed-cidrs,verbatim-idle-timeout,filters}}
 	 * @param maxConnections upstream connections open at once over every server node; a
 	 * CONNECT beyond it is answered with an ERROR without dialing. {@code 0} = derived
 	 * from the maximum heap so what every connection buffers outside the tunnel budget,
@@ -77,11 +79,14 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	 * @param drainGrace how long a stopping client keeps relaying the connections open
 	 * after it withdrew its routes from every server node; the ones left past it are
 	 * closed. {@code 0} = no drain, the connections are closed at once
+	 * @param filters the filters defined here, by the name routes use them by: a plugin,
+	 * or the defaults of a filter of that name
 	 */
 	public record Client(@DefaultValue("") String id, @DefaultValue List<Upstream> upstream,
 			@DefaultValue("0") int maxConnections, @DefaultValue("60s") Duration tunnelStallTimeout,
 			@DefaultValue("0") DataSize tunnelBudget, @DefaultValue("60s") Duration tcpKeepAlive,
-			@DefaultValue("10s") Duration connectTimeout, @DefaultValue("20s") Duration drainGrace) {
+			@DefaultValue("10s") Duration connectTimeout, @DefaultValue("20s") Duration drainGrace,
+			@DefaultValue Map<String, FilterConfig> filters) {
 
 		public Client {
 			id = id == null ? "" : id;
@@ -94,6 +99,7 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 			connectTimeout = connectTimeout == null || connectTimeout.isNegative() || connectTimeout.isZero()
 					? DEFAULT_CONNECT_TIMEOUT : connectTimeout;
 			drainGrace = drainGrace == null || drainGrace.isNegative() ? DEFAULT_DRAIN_GRACE : drainGrace;
+			filters = filters == null ? Map.of() : Map.copyOf(filters);
 		}
 
 		public static Builder builder() {
@@ -117,6 +123,8 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 			private Duration connectTimeout = DEFAULT_CONNECT_TIMEOUT;
 
 			private Duration drainGrace = DEFAULT_DRAIN_GRACE;
+
+			private Map<String, FilterConfig> filters = Map.of();
 
 			private Builder() {
 			}
@@ -161,9 +169,14 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 				return this;
 			}
 
+			public Builder filters(Map<String, FilterConfig> filters) {
+				this.filters = filters;
+				return this;
+			}
+
 			public Client build() {
 				return new Client(this.id, this.upstream, this.maxConnections, this.tunnelStallTimeout,
-						this.tunnelBudget, this.tcpKeepAlive, this.connectTimeout, this.drainGrace);
+						this.tunnelBudget, this.tcpKeepAlive, this.connectTimeout, this.drainGrace, this.filters);
 			}
 
 		}
@@ -201,6 +214,16 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 	/** The configured drain grace; {@code 0} = no drain. */
 	public Duration drainGrace() {
 		return this.client == null ? DEFAULT_DRAIN_GRACE : this.client.drainGrace();
+	}
+
+	/** The configured upstreams, in declaration order. */
+	public List<Upstream> upstreams() {
+		return this.client == null ? List.of() : this.client.upstream();
+	}
+
+	/** The filters defined by name ({@code sluice.client.filters.<name>}). */
+	public Map<String, FilterConfig> filterDefinitions() {
+		return this.client == null ? Map.of() : this.client.filters();
 	}
 
 	/**
@@ -267,6 +290,8 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 
 		private final List<Upstream> upstreams = new ArrayList<>();
 
+		private final Map<String, FilterConfig> filters = new LinkedHashMap<>();
+
 		private int maxConnections;
 
 		private Duration tunnelStallTimeout = DEFAULT_STALL_TIMEOUT;
@@ -308,6 +333,12 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 
 		public Builder upstream(Upstream upstream) {
 			this.upstreams.add(upstream);
+			return this;
+		}
+
+		/** Defines a filter routes use by this name. */
+		public Builder filter(String name, FilterConfig definition) {
+			this.filters.put(name, definition);
 			return this;
 		}
 
@@ -387,6 +418,7 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 						.tcpKeepAlive(this.tcpKeepAlive)
 						.connectTimeout(this.connectTimeout)
 						.drainGrace(this.drainGrace)
+						.filters(Map.copyOf(this.filters))
 						.build(),
 					this.token == null ? "" : this.token, this.tokenFile, this.insecure, this.tlsBundle,
 					this.strictForwarding, this.keepAliveTime, this.keepAliveTimeout);

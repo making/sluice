@@ -1,6 +1,7 @@
 package am.ik.sluice.client.config;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 
 import org.junit.jupiter.api.Test;
@@ -9,6 +10,7 @@ import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.core.env.MapPropertySource;
 import org.springframework.core.env.StandardEnvironment;
+import org.springframework.util.unit.DataSize;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -70,6 +72,69 @@ class SluiceClientPropertiesTest {
 		assertThat(properties.client().upstream()).hasSize(2);
 		assertThat(properties.upstreamTargets()).containsExactly("http://127.0.0.1:8080", "https://fallback:8443");
 		assertThat(properties.toProtoUpstreams().get(1).getRewriteHost()).isTrue();
+	}
+
+	@Test
+	void filtersBindByNameAndPerRoute() {
+		Map<String, Object> source = new java.util.HashMap<>();
+		source.put("sluice.server-url", "grpc://127.0.0.1:8001");
+		source.put("sluice.client.filters.redact.plugin", "https://plugins.test/redact.wasm");
+		source.put("sluice.client.filters.redact.sha256", "AB".repeat(32));
+		source.put("sluice.client.filters.redact.vms", "2");
+		source.put("sluice.client.filters.redact.max-memory", "32MB");
+		source.put("sluice.client.filters.redact.paths", "/v1/*");
+		source.put("sluice.client.upstream[0].host", "a.local");
+		source.put("sluice.client.upstream[0].target", "http://127.0.0.1:8080");
+		source.put("sluice.client.upstream[0].filters[0].name", "redact");
+		source.put("sluice.client.upstream[0].filters[0].configuration", "{\"mask\":\"*\"}");
+		source.put("sluice.client.upstream[0].filters[0].fail-closed", "true");
+		source.put("sluice.client.upstream[0].filters[0].call-timeout", "2s");
+		source.put("sluice.client.upstream[0].filters[1].name", "llm-usage");
+		source.put("sluice.client.upstream[0].filters[1].args.include-usage", "true");
+		source.put("sluice.client.upstream[1].host", "b.local");
+		source.put("sluice.client.upstream[1].target", "http://127.0.0.1:8080");
+		StandardEnvironment environment = new StandardEnvironment();
+		environment.getPropertySources().addFirst(new MapPropertySource("test", source));
+
+		SluiceClientProperties properties = Binder.get(environment)
+			.bind("sluice", Bindable.of(SluiceClientProperties.class))
+			.get();
+
+		FilterConfig definition = java.util.Objects.requireNonNull(properties.filterDefinitions().get("redact"));
+		assertThat(definition.sha256()).isEqualTo("ab".repeat(32));
+		Upstream filtered = properties.upstreams().get(0);
+		assertThat(filtered.filters()).extracting(FilterConfig::name).containsExactly("redact", "llm-usage");
+		assertThat(filtered.filters().get(1).args()).isEqualTo(Map.of("include-usage", "true"));
+		FilterConfig use = definition.overriddenBy(filtered.filters().get(0));
+		assertThat(use.plugin()).isEqualTo("https://plugins.test/redact.wasm");
+		assertThat(use.vms()).isEqualTo(2);
+		assertThat(use.maxMemory()).isEqualTo(DataSize.ofMegabytes(32));
+		assertThat(use.paths()).containsExactly("/v1/*");
+		assertThat(use.configuration()).isEqualTo("{\"mask\":\"*\"}");
+		assertThat(use.failClosed()).isTrue();
+		assertThat(use.callTimeout()).isEqualTo(Duration.ofSeconds(2));
+		// an h2 connection would pass unfiltered: only the filtered route is force-http1
+		assertThat(properties.toProtoUpstreams().get(0).getForceHttp1()).isTrue();
+		assertThat(properties.toProtoUpstreams().get(1).getForceHttp1()).isFalse();
+	}
+
+	@Test
+	void whatAFilterCannotReadCannotHaveOne() {
+		List<FilterConfig> filters = List.of(FilterConfig.builder().name("llm-usage").build());
+		for (Upstream.Builder verbatim : List.of(
+				Upstream.builder().host("a").target("http://127.0.0.1:1").tlsPassthrough(true),
+				Upstream.builder().host("a").target("http://127.0.0.1:1").listenPort(10000),
+				Upstream.builder().host("a").target("tcp://127.0.0.1:1"))) {
+			assertThatThrownBy(() -> verbatim.filters(filters).build()).isInstanceOf(IllegalArgumentException.class)
+				.hasMessageContaining("it cannot have filters");
+		}
+		assertThatThrownBy(() -> Upstream.builder()
+			.target("http://127.0.0.1:1")
+			.filters(List.of(FilterConfig.builder().plugin("/x.wasm").name("x").build()))
+			.build()).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("sluice.client.filters.x");
+		assertThatThrownBy(() -> FilterConfig.builder().sha256("abc").build())
+			.isInstanceOf(IllegalArgumentException.class)
+			.hasMessageContaining("64 hex digits");
 	}
 
 	@Test

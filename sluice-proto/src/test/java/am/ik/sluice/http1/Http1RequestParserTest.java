@@ -1,4 +1,4 @@
-package am.ik.sluice.server.proxy;
+package am.ik.sluice.http1;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
@@ -11,7 +11,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import am.ik.sluice.server.proxy.Http1RequestParser.Listener;
+import am.ik.sluice.http1.Http1RequestParser.Listener;
 
 import static org.assertj.core.api.Assertions.assertThat;
 

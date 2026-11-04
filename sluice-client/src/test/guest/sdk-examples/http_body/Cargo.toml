@@ -1,0 +1,11 @@
+[package]
+name = "http_body"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "0.2.5"
+log = "0.4"

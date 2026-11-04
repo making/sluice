@@ -1,6 +1,5 @@
 package am.ik.sluice.server.proxy;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -25,6 +24,9 @@ import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import am.ik.sluice.http1.Http1Heads;
+import am.ik.sluice.http1.Http1RequestParser;
+import am.ik.sluice.http1.Http1ResponseParser;
 import am.ik.sluice.server.auth.Origin;
 import am.ik.sluice.server.auth.RouteAuthenticator;
 import am.ik.sluice.server.auth.Verdict;
@@ -730,7 +732,7 @@ final class ReroutingRelay {
 		if (closesConnection(head)) {
 			leg.closing = true;
 		}
-		leg.requestSent(host, request, Http1RequestParser.isUpgrade(head));
+		leg.requestSent(host, request, Http1Heads.isUpgrade(head));
 		this.lastRequest = System.nanoTime();
 		Forwarding.Headers forwarded = this.forwarding.headers(ConnectionHeadParser.http1Headers(head),
 				ConnectionHeadParser.http1HostOf(head));
@@ -889,7 +891,7 @@ final class ReroutingRelay {
 		Leg(Router.Route route, TunnelSession session) {
 			this.route = route;
 			this.session = session;
-			this.connection = session.open(route.address(), DataProxyServer.ALPN_HTTP_1_1, ReroutingRelay.this.peer);
+			this.connection = session.open(route, DataProxyServer.ALPN_HTTP_1_1, ReroutingRelay.this.peer);
 			this.inbound = meterRegistry.counter(METRIC_NAME, "direction", "inbound", "route", route.routeTag());
 			this.outbound = meterRegistry.counter(METRIC_NAME, "direction", "outbound", "route", route.routeTag());
 			this.tracker = new ResponseTracker(this);
@@ -1332,116 +1334,31 @@ final class ReroutingRelay {
 	}
 
 	/**
-	 * Tracks the response framing of one leg to mark its conversation drained: a response
-	 * is complete at the end of its body (Content-Length or last chunk), at its head when
-	 * it has no body (a response to HEAD, 204, 304), at the end of an unframed body, or
-	 * when it switches to a tunneled mode (101, a 2xx to CONNECT). Heads are read as
-	 * ISO-8859-1. A response the tracker cannot follow -- a head over 64KiB or without a
-	 * status code, an invalid Content-Length or chunk-size line, a chunk-size or trailer
-	 * line over 64KiB -- is taken as unframed: it ends when the upstream closes, and a
-	 * request awaiting an upgrade's answer is relayed verbatim. Exactly one completion is
-	 * counted per response.
+	 * Tracks the response framing of one leg ({@link Http1ResponseParser}) to mark its
+	 * conversation drained. A response the parser cannot follow ends when the upstream
+	 * closes, and a request awaiting an upgrade's answer is relayed verbatim. Exactly one
+	 * completion is counted per response.
 	 */
-	private final class ResponseTracker {
-
-		private enum Mode {
-
-			HEAD, BODY, CHUNK_SIZE, CHUNK_DATA, CHUNK_CRLF, TRAILERS, UNFRAMED, PASS
-
-		}
+	private final class ResponseTracker implements Http1ResponseParser.Listener {
 
 		private final Leg leg;
 
-		private final ByteArrayOutputStream head = new ByteArrayOutputStream(512);
-
-		private final ByteArrayOutputStream line = new ByteArrayOutputStream(64);
-
-		private Mode mode = Mode.HEAD;
-
-		private long remaining;
+		private final Http1ResponseParser parser = new Http1ResponseParser(this);
 
 		ResponseTracker(Leg leg) {
 			this.leg = leg;
 		}
 
 		void data(byte[] bytes, int offset, int length) {
-			int i = 0;
-			while (i < length) {
-				switch (this.mode) {
-					case HEAD -> {
-						this.head.write(bytes[offset + i]);
-						boolean lineEnded = bytes[offset + i] == '\n';
-						i++;
-						if (this.head.size() > Http1RequestParser.MAX_HEAD) {
-							this.head.reset();
-							this.untracked();
-						}
-						else if (lineEnded) {
-							this.onHeadByte();
-						}
-					}
-					case BODY -> {
-						int n = (int) Math.min(this.remaining, length - i);
-						i += n;
-						this.remaining -= n;
-						if (this.remaining == 0) {
-							this.drain(Mode.HEAD);
-						}
-					}
-					case CHUNK_SIZE -> {
-						this.line.write(bytes[offset + i]);
-						boolean lineEnded = bytes[offset + i] == '\n';
-						i++;
-						if (this.line.size() > Http1RequestParser.MAX_HEAD) {
-							this.line.reset();
-							this.untracked();
-						}
-						else if (lineEnded) {
-							this.onChunkSize();
-						}
-					}
-					case CHUNK_DATA -> {
-						int n = (int) Math.min(this.remaining, length - i);
-						i += n;
-						this.remaining -= n;
-						if (this.remaining == 0) {
-							this.mode = Mode.CHUNK_CRLF;
-						}
-					}
-					case CHUNK_CRLF -> {
-						boolean lineEnded = bytes[offset + i] == '\n';
-						i++;
-						if (lineEnded) {
-							this.mode = Mode.CHUNK_SIZE;
-						}
-					}
-					case TRAILERS -> {
-						this.line.write(bytes[offset + i]);
-						boolean lineEnded = bytes[offset + i] == '\n';
-						i++;
-						if (this.line.size() > Http1RequestParser.MAX_HEAD) {
-							this.line.reset();
-							this.untracked();
-						}
-						else if (lineEnded && this.onTrailerLine()) {
-							this.drain(Mode.HEAD);
-						}
-					}
-					case UNFRAMED -> i++; // an unframed body ends at EOF only
-					case PASS -> {
-						return;
-					}
-				}
-			}
+			this.parser.feed(bytes, offset, length);
 		}
 
 		/**
 		 * At the start of a response: none of the next head arrived, and no response is
-		 * in progress or untracked. An interim response the upstream relayed counts as
-		 * begun only while its head is incomplete.
+		 * in progress or untracked.
 		 */
 		boolean atResponseStart() {
-			return this.mode == Mode.HEAD && this.head.size() == 0;
+			return this.parser.atResponseStart();
 		}
 
 		/**
@@ -1450,31 +1367,24 @@ final class ReroutingRelay {
 		 * ({@link #lose}).
 		 */
 		void ended() {
-			if (this.mode != Mode.PASS && !this.atResponseStart()) {
-				this.leg.responseCompleted();
-				this.mode = Mode.PASS;
-			}
+			this.parser.finish();
 		}
 
-		private void onHeadByte() {
-			byte[] bytes = this.head.toByteArray();
-			int end = ConnectionHeadParser.headerEnd(bytes);
-			if (end < 0) {
-				return;
-			}
-			this.head.reset();
-			// a response head, interim or final: no 100 Continue is awaited any more
+		/** A response head, interim or final: no 100 Continue is awaited any more. */
+		private void headRead() {
 			ReroutingRelay.this.continueAwaited = false;
 			ReroutingRelay.this.clientWaits.update();
-			int status = statusOf(bytes);
-			if (status < 0) {
-				this.untracked();
-				return;
-			}
-			if (status >= 100 && status < 200 && status != 101) {
-				return; // interim: the final response follows on the same stream
-			}
-			if (closesConnection(bytes)) {
+		}
+
+		@Override
+		public void interimHead(byte[] head) {
+			headRead();
+		}
+
+		@Override
+		public Http1ResponseParser.Follows finalHead(byte[] head, int status) {
+			headRead();
+			if (closesConnection(head)) {
 				this.leg.closing = true;
 			}
 			Sent request = this.leg.nextRequest();
@@ -1484,113 +1394,28 @@ final class ReroutingRelay {
 				this.leg.upgradeAnswered(switched);
 			}
 			if (switched) {
-				this.drain(Mode.PASS);
-				return;
-			}
-			if ("HEAD".equals(method) || status == 204 || status == 304) {
-				// no body, whatever its framing headers say (RFC 9112 6.3)
-				this.drain(Mode.HEAD);
-				return;
-			}
-			String contentLength = header(bytes, "content-length");
-			if (contentLength != null) {
-				try {
-					long length = Long.parseLong(contentLength.trim());
-					if (length == 0) {
-						this.drain(Mode.HEAD);
-					}
-					else if (length > 0) {
-						this.remaining = length;
-						this.mode = Mode.BODY;
-					}
-					else {
-						this.untracked();
-					}
-					return;
-				}
-				catch (NumberFormatException e) {
-					this.untracked();
-					return;
-				}
-			}
-			String transferEncoding = header(bytes, "transfer-encoding");
-			if (transferEncoding != null && transferEncoding.toLowerCase(java.util.Locale.ROOT).contains("chunked")) {
-				this.mode = Mode.CHUNK_SIZE;
-				return;
-			}
-			this.mode = Mode.UNFRAMED;
-		}
-
-		private void onChunkSize() {
-			byte[] line = this.line.toByteArray();
-			this.line.reset();
-			String text = new String(line, StandardCharsets.ISO_8859_1);
-			if (text.endsWith("\r\n")) {
-				text = text.substring(0, text.length() - 2);
-			}
-			int semicolon = text.indexOf(';');
-			String hex = (semicolon < 0 ? text : text.substring(0, semicolon)).trim();
-			int size;
-			try {
-				size = Integer.parseUnsignedInt(hex, 16);
-			}
-			catch (NumberFormatException e) {
-				size = -1;
-			}
-			if (size < 0) {
-				this.untracked();
-			}
-			else if (size == 0) {
-				this.mode = Mode.TRAILERS;
-			}
-			else {
-				this.remaining = size;
-				this.mode = Mode.CHUNK_DATA;
-			}
-		}
-
-		private boolean onTrailerLine() {
-			byte[] line = this.line.toByteArray();
-			this.line.reset();
-			return line.length == 2 && line[0] == '\r' && line[1] == '\n';
-		}
-
-		/**
-		 * Takes the response in progress as unframed: it ends when the upstream closes;
-		 * an upgrade awaited is relayed verbatim.
-		 */
-		private void untracked() {
-			this.mode = Mode.UNFRAMED;
-			this.leg.upgradeAnswered(true);
-		}
-
-		private void drain(Mode next) {
-			this.mode = next;
-			if (next == Mode.PASS) {
-				// untracked from here on: an upgrade awaited is relayed verbatim
+				// not followed from here on: an upgrade awaited is relayed verbatim
 				this.leg.upgradeAnswered(true);
+				return Http1ResponseParser.Follows.SWITCH;
 			}
+			return "HEAD".equals(method) || status == 204 || status == 304 ? Http1ResponseParser.Follows.NOTHING
+					: Http1ResponseParser.Follows.BODY;
+		}
+
+		@Override
+		public void completed() {
 			this.leg.responseCompleted();
 		}
 
-		private static int statusOf(byte[] head) {
-			String text = new String(head, StandardCharsets.ISO_8859_1);
-			int eol = text.indexOf("\r\n");
-			String line = eol < 0 ? text : text.substring(0, eol);
-			String[] parts = line.trim().split(" ");
-			if (parts.length < 2) {
-				return -1;
-			}
-			try {
-				return Integer.parseInt(parts[1].trim());
-			}
-			catch (NumberFormatException e) {
-				return -1;
-			}
+		@Override
+		public void untracked(byte[] raw) {
+			headRead();
+			this.leg.upgradeAnswered(true);
 		}
 
-		private static @Nullable String header(byte[] head, String name) {
-			return ConnectionHeadParser.http1HeaderOf(head, name);
+		@Override
+		public void cut() {
+			this.leg.responseCompleted();
 		}
 
 	}

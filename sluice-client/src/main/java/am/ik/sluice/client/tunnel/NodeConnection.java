@@ -24,11 +24,14 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
+import am.ik.sluice.client.filter.UpstreamFilter;
+import am.ik.sluice.client.filter.UpstreamFilterPipe;
 import am.ik.sluice.tunnel.ConnectionLimit;
+import am.ik.sluice.tunnel.DuplexPipe;
+import am.ik.sluice.tunnel.StreamRelay;
 import am.ik.sluice.tunnel.TunnelBudget;
 import am.ik.sluice.tunnel.PeerBuilds;
 import am.ik.sluice.tunnel.SessionSender;
-import am.ik.sluice.tunnel.SocketRelay;
 import am.ik.sluice.tunnel.VirtualConnection;
 import am.ik.sluice.v1.proto.Advertise;
 import am.ik.sluice.v1.proto.AdvertiseAck;
@@ -117,6 +120,9 @@ public final class NodeConnection implements AutoCloseable {
 	private final Listener listener;
 
 	private final LocalConnector connector;
+
+	/** Which connections pass which filter. */
+	private final RouteFilters routeFilters;
 
 	/** The routes, the receive window and the build, sent on every stream. */
 	private final Advertise advertise;
@@ -213,6 +219,7 @@ public final class NodeConnection implements AutoCloseable {
 		this.clientId = Objects.requireNonNull(builder.clientId, "clientId is required");
 		this.taskExecutor = Objects.requireNonNull(builder.taskExecutor, "taskExecutor is required");
 		this.listener = Objects.requireNonNull(builder.listener, "listener is required");
+		this.routeFilters = builder.routeFilters;
 		this.connector = LocalConnector.builder()
 			.upstreams(builder.properties.upstreamTargets())
 			.strict(builder.properties.strictForwarding())
@@ -300,6 +307,8 @@ public final class NodeConnection implements AutoCloseable {
 
 		private @Nullable TunnelBudget budget;
 
+		private RouteFilters routeFilters = RouteFilters.none();
+
 		private Supplier<RandomGenerator> randomFactory = SplittableRandom::new;
 
 		private PeerBuild clientBuild = PeerBuild.newBuilder()
@@ -371,6 +380,12 @@ public final class NodeConnection implements AutoCloseable {
 		 */
 		public Builder budget(TunnelBudget budget) {
 			this.budget = budget;
+			return this;
+		}
+
+		/** The filters of the routes; none by default. */
+		Builder routeFilters(RouteFilters routeFilters) {
+			this.routeFilters = routeFilters;
 			return this;
 		}
 
@@ -913,6 +928,7 @@ public final class NodeConnection implements AutoCloseable {
 			if (!this.connector.permits(address)) {
 				throw new IllegalArgumentException("upstream not permitted: " + address);
 			}
+			UpstreamFilter filter = this.routeFilters.of(request);
 			Socket socket = this.connector.dial(address, request.getApplicationProtocol());
 			SessionSender sender = this.senderRef.get();
 			if (sender == null) {
@@ -920,7 +936,17 @@ public final class NodeConnection implements AutoCloseable {
 				this.forget(connectionId);
 				return;
 			}
-			SocketRelay relay = SocketRelay.builder(socket, connection, sender)
+			DuplexPipe pipe = DuplexPipe.of(socket);
+			if (filter != null) {
+				pipe = UpstreamFilterPipe.builder()
+					.upstream(pipe)
+					.filter(filter)
+					.route(request.getRoute())
+					.address(address)
+					.budget(this.budget)
+					.build();
+			}
+			StreamRelay relay = StreamRelay.builder(pipe, connection, sender)
 				.onComplete(() -> this.forget(connectionId))
 				.build();
 			relay.start();

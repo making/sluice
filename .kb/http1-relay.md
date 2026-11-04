@@ -1,7 +1,8 @@
 # HTTP/1.1 relay framing
 
 How the plaintext and TLS-terminated HTTP/1.1 relay parses heads and what it treats as
-malformed.
+malformed. Its parsers are in `sluice-proto` (`am.ik.sluice.http1`), shared with the client's
+[filters](client-filters.md), so both follow a connection's framing alike.
 
 The plaintext and TLS-terminated HTTP/1.1 relay reads request and response heads as
 ISO-8859-1, so a field value carrying non-ASCII bytes (a UTF-8 header value, RFC 9110

@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["test-plugin", "sdk-examples/http_body", "sdk-examples/http_headers"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

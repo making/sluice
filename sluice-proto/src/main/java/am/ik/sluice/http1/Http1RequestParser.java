@@ -1,4 +1,4 @@
-package am.ik.sluice.server.proxy;
+package am.ik.sluice.http1;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
@@ -28,13 +28,17 @@ import org.jspecify.annotations.Nullable;
  * chunked syntax. The parser then stops at {@link Position#MALFORMED}: the malformed
  * bytes are not relayed, and neither is anything after them.
  */
-final class Http1RequestParser {
+public final class Http1RequestParser {
 
 	/** The most a request head, a chunk-size line or a trailer section may take. */
-	static final int MAX_HEAD = 64 * 1024;
+	public static final int MAX_HEAD = 64 * 1024;
 
-	/** Receives the parsed events, in stream order. */
-	interface Listener {
+	/**
+	 * Receives the parsed events, in stream order. By default everything but a head
+	 * arrives as {@link #data}, to relay it unchanged; a listener telling a body's
+	 * payload from its framing overrides the rest.
+	 */
+	public interface Listener {
 
 		/**
 		 * A complete request head, terminator included, with the value of its Host header
@@ -45,10 +49,34 @@ final class Http1RequestParser {
 		/** Request bytes that are relayed unchanged. */
 		void data(byte[] bytes, int offset, int length);
 
+		/** Payload of a request body, without any framing. */
+		default void payload(byte[] bytes, int offset, int length) {
+			data(bytes, offset, length);
+		}
+
+		/** A chunk-size line but the last one's, or bytes of a chunk's terminator. */
+		default void framing(byte[] bytes, int offset, int length) {
+			data(bytes, offset, length);
+		}
+
+		/** The size line of the last chunk; the trailer section follows. */
+		default void lastChunk(byte[] line) {
+			data(line, 0, line.length);
+		}
+
+		/** The trailer section, its blank line included. */
+		default void trailers(byte[] section) {
+			data(section, 0, section.length);
+		}
+
+		/** A request message ended. */
+		default void messageEnd() {
+		}
+
 	}
 
 	/** Where the parser stands in the request stream. */
-	enum Position {
+	public enum Position {
 
 		/** At a request boundary with nothing of the next request read. */
 		BETWEEN_REQUESTS,
@@ -100,13 +128,16 @@ final class Http1RequestParser {
 	/** The bytes of a chunk terminator (CRLF) read so far. */
 	private int terminatorRead;
 
+	/** The head reported last announced a body. */
+	private boolean bodyFollows;
+
 	/** The malformed request's head had been relayed: the body was malformed. */
 	private boolean malformedInBody;
 
 	/** The part of the malformed request's head read; empty when it was relayed. */
 	private byte[] malformedHead = new byte[0];
 
-	Http1RequestParser(Listener listener) {
+	public Http1RequestParser(Listener listener) {
 		this.listener = listener;
 	}
 
@@ -114,7 +145,7 @@ final class Http1RequestParser {
 	 * Feeds the next bytes of the request stream; a single chunk may span several
 	 * requests.
 	 */
-	void feed(byte[] bytes, int offset, int length) {
+	public void feed(byte[] bytes, int offset, int length) {
 		int i = 0;
 		while (i < length) {
 			switch (this.mode) {
@@ -127,7 +158,7 @@ final class Http1RequestParser {
 						this.malformed();
 						return;
 					}
-					this.listener.data(bytes, offset + i, 1);
+					this.listener.framing(bytes, offset + i, 1);
 					i++;
 					if (++this.terminatorRead == 2) {
 						this.mode = Mode.CHUNK_SIZE;
@@ -204,7 +235,7 @@ final class Http1RequestParser {
 						this.malformed();
 						return;
 					}
-					this.listener.data(trailers, 0, trailers.length);
+					this.listener.trailers(trailers);
 					this.endMessage();
 				}
 			}
@@ -231,8 +262,9 @@ final class Http1RequestParser {
 			this.malformed();
 			return;
 		}
-		this.listener.head(head, ConnectionHeadParser.http1HostOf(head));
-		this.upgrading = isUpgrade(head);
+		this.bodyFollows = framing.chunked() || framing.length() > 0;
+		this.listener.head(head, Http1Heads.first(head, "host"));
+		this.upgrading = Http1Heads.isUpgrade(head);
 		if (framing.chunked()) {
 			this.mode = Mode.CHUNK_SIZE;
 		}
@@ -249,6 +281,7 @@ final class Http1RequestParser {
 	private void endMessage() {
 		this.mode = this.upgrading ? Mode.AWAIT_UPGRADE : Mode.HEAD;
 		this.upgrading = false;
+		this.listener.messageEnd();
 	}
 
 	/** Stops at a malformed request; what was read of it is dropped. */
@@ -266,7 +299,7 @@ final class Http1RequestParser {
 	 * bytes held and every byte after them pass through verbatim; declined, they are
 	 * parsed as the next request. Ignored unless the parser awaits an answer.
 	 */
-	void upgradeAnswered(boolean switched) {
+	public void upgradeAnswered(boolean switched) {
 		if (this.mode != Mode.AWAIT_UPGRADE) {
 			return;
 		}
@@ -286,7 +319,7 @@ final class Http1RequestParser {
 
 	private int passBody(byte[] bytes, int offset, int length) {
 		int n = (int) Math.min(this.remaining, length);
-		this.listener.data(bytes, offset, n);
+		this.listener.payload(bytes, offset, n);
 		this.remaining -= n;
 		if (this.remaining == 0) {
 			this.endMessage();
@@ -296,7 +329,7 @@ final class Http1RequestParser {
 
 	private int passChunk(byte[] bytes, int offset, int length) {
 		int n = (int) Math.min(this.remaining, length);
-		this.listener.data(bytes, offset, n);
+		this.listener.payload(bytes, offset, n);
 		this.remaining -= n;
 		if (this.remaining == 0) {
 			this.terminatorRead = 0;
@@ -312,18 +345,27 @@ final class Http1RequestParser {
 			return;
 		}
 		// the framing line is part of the stream
-		this.listener.data(line, 0, line.length);
 		if (size == 0) {
+			this.listener.lastChunk(line);
 			this.mode = Mode.TRAILERS;
 		}
 		else {
+			this.listener.framing(line, 0, line.length);
 			this.remaining = size;
 			this.mode = Mode.CHUNK_DATA;
 		}
 	}
 
+	/**
+	 * Whether a body follows the head being reported; meaningful during
+	 * {@link Listener#head}.
+	 */
+	public boolean bodyFollows() {
+		return this.bodyFollows;
+	}
+
 	/** Where the parser stands after the bytes fed so far. */
-	Position position() {
+	public Position position() {
 		return switch (this.mode) {
 			case HEAD -> this.line.size() == 0 ? Position.BETWEEN_REQUESTS : Position.IN_HEAD;
 			case BODY, CHUNK_SIZE, CHUNK_DATA, CHUNK_CRLF, TRAILERS -> Position.IN_BODY;
@@ -337,7 +379,7 @@ final class Http1RequestParser {
 	 * Whether the malformed request's head had been relayed, its body being malformed;
 	 * meaningful at {@link Position#MALFORMED}.
 	 */
-	boolean malformedInBody() {
+	public boolean malformedInBody() {
 		return this.malformedInBody;
 	}
 
@@ -345,14 +387,14 @@ final class Http1RequestParser {
 	 * What was read of the malformed request's head; empty when the head had been
 	 * relayed.
 	 */
-	byte[] malformedHead() {
+	public byte[] malformedHead() {
 		return this.malformedHead.clone();
 	}
 
 	/**
 	 * Flushes a partially consumed head or line, or held bytes, verbatim at end of input.
 	 */
-	void finish() {
+	public void finish() {
 		if (this.mode == Mode.MALFORMED) {
 			return;
 		}
@@ -366,17 +408,6 @@ final class Http1RequestParser {
 		if (bytes.length > 0) {
 			this.listener.data(bytes, 0, bytes.length);
 		}
-	}
-
-	/** Whether the request head asks for an upgrade or is a CONNECT. */
-	static boolean isUpgrade(byte[] head) {
-		ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser.http1RequestOf(head);
-		if (request != null && "CONNECT".equals(request.method())) {
-			return true;
-		}
-		String connection = ConnectionHeadParser.http1HeaderOf(head, "connection");
-		return connection != null && connection.toLowerCase(Locale.ROOT).contains("upgrade")
-				|| ConnectionHeadParser.http1HeaderOf(head, "upgrade") != null;
 	}
 
 	/** How a request head frames its body. */

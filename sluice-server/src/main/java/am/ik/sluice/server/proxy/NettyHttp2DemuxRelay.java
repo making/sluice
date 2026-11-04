@@ -1170,7 +1170,7 @@ final class NettyHttp2DemuxRelay {
 		}
 		VirtualConnection connection;
 		try {
-			connection = this.legSeam.open(session, route.address(), this.peer);
+			connection = this.legSeam.open(session, route, this.peer);
 		}
 		catch (RuntimeException e) {
 			releaseSlot.run();
@@ -2937,8 +2937,8 @@ final class NettyHttp2DemuxRelay {
 		 * Opens the leg's h2 connection for the data plane connection of {@code client};
 		 * throwing fails the leg's opening.
 		 */
-		default VirtualConnection open(TunnelSession session, String address, @Nullable InetAddress client) {
-			return session.open(address, DataProxyServer.ALPN_H2, client);
+		default VirtualConnection open(TunnelSession session, Router.Route route, @Nullable InetAddress client) {
+			return session.open(route, DataProxyServer.ALPN_H2, client);
 		}
 
 		/** Sees the leg's hop built; throwing fails the leg's configuration. */

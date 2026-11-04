@@ -24,6 +24,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.client.config.SluiceClientProperties;
+import am.ik.sluice.client.filter.Filters;
+import am.ik.sluice.client.filter.UpstreamFilterFactory;
 import am.ik.sluice.tunnel.ConnectionLimit;
 import am.ik.sluice.tunnel.TunnelBudget;
 import am.ik.sluice.tunnel.VirtualConnection;
@@ -34,11 +36,14 @@ import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.ssl.SslBundle;
 import org.springframework.boot.ssl.SslBundles;
 import org.springframework.context.SmartLifecycle;
+import org.springframework.core.io.DefaultResourceLoader;
+import org.springframework.core.io.ResourceLoader;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.stereotype.Component;
 
@@ -94,6 +99,9 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 	/** What the connections of every node stream buffer beyond their allowance. */
 	private final TunnelBudget budget;
 
+	/** The filters of its routes, shared by every node stream. */
+	private final RouteFilters routeFilters;
+
 	/** This client's build, announced on every stream. */
 	private final PeerBuild clientBuild;
 
@@ -109,12 +117,15 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 
 	@Autowired
 	TunnelClient(SluiceClientProperties properties, @Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor,
-			MeterRegistry meterRegistry, @Nullable SslBundles sslBundles, PeerBuild clientBuild) {
-		this(properties, taskExecutor, meterRegistry, sslBundles, clientBuild, SplittableRandom::new);
+			MeterRegistry meterRegistry, @Nullable SslBundles sslBundles, PeerBuild clientBuild,
+			ObjectProvider<UpstreamFilterFactory> filterFactories, ResourceLoader resourceLoader) {
+		this(properties, taskExecutor, meterRegistry, sslBundles, clientBuild, SplittableRandom::new,
+				filterFactories.orderedStream().toList(), resourceLoader);
 	}
 
 	private TunnelClient(SluiceClientProperties properties, TaskExecutor taskExecutor, MeterRegistry meterRegistry,
-			@Nullable SslBundles sslBundles, PeerBuild clientBuild, Supplier<RandomGenerator> randomFactory) {
+			@Nullable SslBundles sslBundles, PeerBuild clientBuild, Supplier<RandomGenerator> randomFactory,
+			List<UpstreamFilterFactory> filterFactories, ResourceLoader resourceLoader) {
 		this.properties = properties;
 		this.taskExecutor = taskExecutor;
 		this.meterRegistry = meterRegistry;
@@ -146,8 +157,22 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 			.baseUnit("bytes")
 			.description("Payload the server sent that the upstream connections have not taken yet")
 			.register(meterRegistry);
+		Filters filters = Filters.builder()
+			.definitions(properties.filterDefinitions())
+			.factories(filterFactories)
+			.meters(meterRegistry)
+			.budget(this.budget)
+			.resourceLoader(resourceLoader)
+			.build();
+		this.routeFilters = RouteFilters.of(properties.upstreams(), filters, meterRegistry);
+		long connectionBytes = ConnectionLimit.CONNECTION_BYTES + this.routeFilters.connectionBytes();
+		if (this.routeFilters.reservedBytes() > maxHeap / 2 - this.budget.max()) {
+			log.warn("the plugins' instances may hold {}MiB, past half of the max heap {}MiB less the tunnel budget: "
+					+ "lower their vms or max-memory", this.routeFilters.reservedBytes() >> 20, maxHeap >> 20);
+		}
 		this.connectionLimit = new ConnectionLimit(
-				ConnectionLimit.resolve(properties.maxConnections(), this.budget.max()));
+				properties.maxConnections() > 0 ? properties.maxConnections() : ConnectionLimit
+					.derive(maxHeap / 2 - this.budget.max() - this.routeFilters.reservedBytes(), connectionBytes));
 		Gauge.builder("sluice.connections.limit", this.connectionLimit, ConnectionLimit::max)
 			.description("Upstream connections allowed open at once")
 			.register(meterRegistry);
@@ -159,8 +184,8 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 						+ "to {}KiB against it), gRPC flow control window {}KiB",
 				this.connectionLimit.max(),
 				properties.maxConnections() > 0 ? "configured"
-						: "derived: (half of max heap %dMiB - tunnel budget) / %dKiB per connection"
-							.formatted(maxHeap >> 20, ConnectionLimit.CONNECTION_BYTES >> 10),
+						: "derived: (half of max heap %dMiB - tunnel budget - %dKiB of plugins) / %dKiB per connection"
+							.formatted(maxHeap >> 20, this.routeFilters.reservedBytes() >> 10, connectionBytes >> 10),
 				this.budget.max() >> 10,
 				properties.tunnelBudget().toBytes() > 0 ? "configured" : "derived: an eighth of half of max heap",
 				VirtualConnection.INITIAL_WINDOW >> 10, VirtualConnection.DEFAULT_WINDOW >> 10,
@@ -187,6 +212,8 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 		private @Nullable SslBundles sslBundles;
 
 		private Supplier<RandomGenerator> randomFactory = SplittableRandom::new;
+
+		private List<UpstreamFilterFactory> filterFactories = List.of();
 
 		private PeerBuild clientBuild = PeerBuild.newBuilder()
 			.setImplementation(ClientBuildConfiguration.IMPLEMENTATION)
@@ -229,11 +256,17 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 			return this;
 		}
 
+		/** The factories of custom filters, as a custom build's beans would be. */
+		public Builder filterFactories(List<UpstreamFilterFactory> filterFactories) {
+			this.filterFactories = filterFactories;
+			return this;
+		}
+
 		public TunnelClient build() {
 			return new TunnelClient(Objects.requireNonNull(this.properties, "properties is required"),
 					Objects.requireNonNull(this.taskExecutor, "taskExecutor is required"),
 					Objects.requireNonNull(this.meterRegistry, "meterRegistry is required"), this.sslBundles,
-					this.clientBuild, this.randomFactory);
+					this.clientBuild, this.randomFactory, this.filterFactories, new DefaultResourceLoader());
 		}
 
 	}
@@ -356,6 +389,7 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 			.meterRegistry(this.meterRegistry)
 			.connectionLimit(this.connectionLimit)
 			.budget(this.budget)
+			.routeFilters(this.routeFilters)
 			.clientBuild(this.clientBuild)
 			.randomFactory(this.randomFactory)
 			.build();

@@ -4,7 +4,6 @@ import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
@@ -18,6 +17,7 @@ import io.netty.handler.codec.http2.Http2Exception;
 import io.netty.handler.codec.http2.Http2Headers;
 import io.netty.util.AsciiString;
 
+import am.ik.sluice.http1.Http1Heads;
 import am.ik.sluice.server.auth.RequestHeaders;
 
 /**
@@ -221,14 +221,11 @@ public final class ConnectionHeadParser {
 	 * request-line.
 	 */
 	static Head.@Nullable Request http1RequestOf(byte[] head) {
-		String text = new String(head, StandardCharsets.ISO_8859_1);
-		int eol = text.indexOf("\r\n");
-		String line = eol < 0 ? text : text.substring(0, eol);
-		String[] parts = line.split(" ");
-		if (parts.length != 3 || !parts[2].startsWith("HTTP/")) {
+		Http1Heads.RequestLine line = Http1Heads.requestLine(head);
+		if (line == null) {
 			return null;
 		}
-		return new Head.Request(parts[0], parts[1], parts[2].substring("HTTP/".length()),
+		return new Head.Request(line.method(), line.target(), line.version(),
 				!htmlAccepted(http1HeaderValues(head, "accept")), http1HeaderOf(head, USER_AGENT));
 	}
 
@@ -237,7 +234,7 @@ public final class ConnectionHeadParser {
 	 * absent.
 	 */
 	public static @Nullable String http1HostOf(byte[] head) {
-		return http1HeaderOf(head, "host");
+		return Http1Heads.first(head, "host");
 	}
 
 	/**
@@ -245,12 +242,7 @@ public final class ConnectionHeadParser {
 	 * head; {@code null} when absent or blank.
 	 */
 	static @Nullable String http1HeaderOf(byte[] head, String name) {
-		List<String> values = http1HeaderValues(head, name);
-		if (values.isEmpty()) {
-			return null;
-		}
-		String value = values.get(0);
-		return value.isBlank() ? null : value;
+		return Http1Heads.first(head, name);
 	}
 
 	/**
@@ -259,20 +251,7 @@ public final class ConnectionHeadParser {
 	 * request) are not read.
 	 */
 	static List<String> http1HeaderValues(byte[] head, String name) {
-		int end = headerEnd(head);
-		String text = new String(head, 0, end < 0 ? head.length : end, StandardCharsets.ISO_8859_1);
-		String[] lines = text.split("\r\n");
-		List<String> values = new ArrayList<>(1);
-		for (int i = 1; i < lines.length; i++) {
-			int colon = lines[i].indexOf(':');
-			if (colon <= 0) {
-				continue;
-			}
-			if (name.equalsIgnoreCase(lines[i].substring(0, colon))) {
-				values.add(lines[i].substring(colon + 1).trim());
-			}
-		}
-		return values;
+		return Http1Heads.values(head, name);
 	}
 
 	/**
@@ -498,12 +477,7 @@ public final class ConnectionHeadParser {
 	 * incomplete.
 	 */
 	static int headerEnd(byte[] bytes) {
-		for (int i = 0; i + 3 < bytes.length; i++) {
-			if (bytes[i] == '\r' && bytes[i + 1] == '\n' && bytes[i + 2] == '\r' && bytes[i + 3] == '\n') {
-				return i + 4;
-			}
-		}
-		return -1;
+		return Http1Heads.end(bytes);
 	}
 
 	/**

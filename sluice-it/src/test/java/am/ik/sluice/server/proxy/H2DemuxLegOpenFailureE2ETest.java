@@ -116,11 +116,11 @@ class H2DemuxLegOpenFailureE2ETest {
 		AtomicBoolean fail = new AtomicBoolean();
 		Objects.requireNonNull(this.dataProxyServer).legSeam(new NettyHttp2DemuxRelay.LegSeam() {
 			@Override
-			public VirtualConnection open(TunnelSession session, String address, @Nullable InetAddress client) {
+			public VirtualConnection open(TunnelSession session, Router.Route route, @Nullable InetAddress client) {
 				if (fail.get()) {
 					throw new IllegalStateException("the session cannot open");
 				}
-				return NettyHttp2DemuxRelay.LegSeam.NONE.open(session, address, client);
+				return NettyHttp2DemuxRelay.LegSeam.NONE.open(session, route, client);
 			}
 		});
 		assertFailedLegsAreGivenBack(fail, "open");

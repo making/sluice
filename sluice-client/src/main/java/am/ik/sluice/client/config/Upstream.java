@@ -21,11 +21,14 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * server-wide allow list), and how long a connection relayed verbatim -- TLS passthrough,
  * a tcp route, a hostless connection, an upgraded HTTP/1.1 connection -- may relay no
  * byte in either direction before the server closes it ({@code verbatim-idle-timeout};
- * {@code 0} = the server's default).
+ * {@code 0} = the server's default), and the filters its HTTP/1.1 exchanges pass, in
+ * request order ({@code filters}): such an upstream is {@code force-http1}, and it cannot
+ * be relayed verbatim.
  */
 public record Upstream(String host, @DefaultValue("") String hostPattern, String target,
 		@DefaultValue("false") boolean rewriteHost, boolean tlsPassthrough, @DefaultValue("false") boolean forceHttp1,
-		int listenPort, @DefaultValue List<String> allowedCidrs, @DefaultValue("0") Duration verbatimIdleTimeout) {
+		int listenPort, @DefaultValue List<String> allowedCidrs, @DefaultValue("0") Duration verbatimIdleTimeout,
+		@DefaultValue List<FilterConfig> filters) {
 
 	public Upstream {
 		host = host == null ? "" : host.trim();
@@ -43,6 +46,43 @@ public record Upstream(String host, @DefaultValue("") String hostPattern, String
 		allowedCidrs = allowedCidrs == null ? List.of() : List.copyOf(allowedCidrs);
 		verbatimIdleTimeout = verbatimIdleTimeout == null || verbatimIdleTimeout.isNegative() ? Duration.ZERO
 				: verbatimIdleTimeout;
+		filters = filters == null ? List.of() : List.copyOf(filters);
+		if (!filters.isEmpty()) {
+			refuseVerbatim(target, tlsPassthrough, listenPort);
+			// an h2 connection would pass unfiltered
+			forceHttp1 = true;
+		}
+		for (FilterConfig filter : filters) {
+			if (filter.name().isEmpty()) {
+				throw new IllegalArgumentException("a filter of upstream " + target + " has no name");
+			}
+			if (!filter.plugin().isEmpty() || !filter.sha256().isEmpty()) {
+				throw new IllegalArgumentException("filter " + filter.name() + " of upstream " + target
+						+ " sets a plugin: define it under sluice.client.filters." + filter.name());
+			}
+		}
+	}
+
+	/** A filter reads HTTP: what is relayed verbatim would pass it unseen. */
+	private static void refuseVerbatim(String target, boolean tlsPassthrough, int listenPort) {
+		if (tlsPassthrough || listenPort > 0 || target.startsWith("tcp://")) {
+			throw new IllegalArgumentException("upstream " + target
+					+ " is relayed verbatim (tls-passthrough, listen-port or tcp://): it cannot have filters");
+		}
+	}
+
+	/**
+	 * The key the server knows this route by ({@code Connect.route}): {@code tcp:<port>}
+	 * for a tcp route, else the host pattern or host, {@code *} for the catch-all.
+	 */
+	public String routeKey() {
+		if (this.listenPort > 0) {
+			return "tcp:" + this.listenPort;
+		}
+		if (!this.hostPattern.isEmpty()) {
+			return this.hostPattern;
+		}
+		return this.host.isEmpty() ? "*" : this.host;
 	}
 
 	/**
@@ -90,6 +130,8 @@ public record Upstream(String host, @DefaultValue("") String hostPattern, String
 		private List<String> allowedCidrs = List.of();
 
 		private Duration verbatimIdleTimeout = Duration.ZERO;
+
+		private List<FilterConfig> filters = List.of();
 
 		private Builder() {
 		}
@@ -139,10 +181,15 @@ public record Upstream(String host, @DefaultValue("") String hostPattern, String
 			return this;
 		}
 
+		public Builder filters(List<FilterConfig> filters) {
+			this.filters = filters;
+			return this;
+		}
+
 		public Upstream build() {
 			return new Upstream(this.host, this.hostPattern, Objects.requireNonNull(this.target, "target is required"),
 					this.rewriteHost, this.tlsPassthrough, this.forceHttp1, this.listenPort, this.allowedCidrs,
-					this.verbatimIdleTimeout);
+					this.verbatimIdleTimeout, this.filters);
 		}
 
 	}

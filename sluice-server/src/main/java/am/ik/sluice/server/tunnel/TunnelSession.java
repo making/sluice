@@ -838,21 +838,30 @@ public final class TunnelSession implements AutoCloseable {
 	 * and its withdrawal was acknowledged
 	 */
 	public VirtualConnection open(String address) {
-		return this.open(address, "", null);
+		return this.open(Connect.newBuilder().setAddress(address));
 	}
 
 	/**
-	 * Opens a virtual connection as {@link #open(String)} does, on which this side speaks
-	 * the given protocol (an ALPN id, {@code h2} or {@code http/1.1}; empty for bytes
-	 * relayed verbatim): the client negotiates it with a TLS upstream. The CONNECT names
-	 * the client address of the data plane connection, by which the client may bound what
-	 * one address holds.
+	 * Opens a virtual connection to the route's dial address as {@link #open(String)}
+	 * does, on which this side speaks the given protocol (an ALPN id, {@code h2} or
+	 * {@code http/1.1}; empty for bytes relayed verbatim): the client negotiates it with
+	 * a TLS upstream. The CONNECT names the route, which routes sharing an address tell
+	 * apart by, and the client address of the data plane connection, by which the client
+	 * may bound what one address holds.
 	 * @param client the data plane connection's peer (its PROXY header's source where one
 	 * applies); null when unknown
 	 * @throws IllegalStateException when the client has not advertised yet, or withdrew
 	 * and its withdrawal was acknowledged
 	 */
-	public VirtualConnection open(String address, String applicationProtocol, @Nullable InetAddress client) {
+	public VirtualConnection open(Router.Route route, String applicationProtocol, @Nullable InetAddress client) {
+		return this.open(Connect.newBuilder()
+			.setAddress(route.address())
+			.setRoute(route.routeKey())
+			.setApplicationProtocol(applicationProtocol)
+			.setClientAddress((client != null) ? client.getHostAddress() : ""));
+	}
+
+	private VirtualConnection open(Connect.Builder connect) {
 		long clientWindow = this.clientWindow;
 		if (clientWindow == 0) {
 			throw new IllegalStateException("client " + this.clientId + " has not advertised yet");
@@ -871,13 +880,8 @@ public final class TunnelSession implements AutoCloseable {
 				.build();
 			this.connections.put(connectionId, connection);
 		}
-		this.sender.sendConnect(Connect.newBuilder()
-			.setConnId(connectionId)
-			.setAddress(address)
-			.setConnectionWindow(VirtualConnection.INITIAL_WINDOW)
-			.setApplicationProtocol(applicationProtocol)
-			.setClientAddress((client != null) ? client.getHostAddress() : "")
-			.build());
+		this.sender
+			.sendConnect(connect.setConnId(connectionId).setConnectionWindow(VirtualConnection.INITIAL_WINDOW).build());
 		return connection;
 	}
 

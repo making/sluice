@@ -357,6 +357,36 @@ sluice.route.session-secret=${SLUICE_SESSION_SECRET}
   proxy (`trusted-proxy-cidrs`) stating `X-Forwarded-Proto: https`. Over plaintext it is answered
   `403`.
 
+### Filters
+
+A route served by `sluice-client` can pass filters, which see and change its HTTP/1.1 requests and responses, bodies included, before they enter the tunnel. Use them to read what passes (the token usage of an LLM API) or to change it (a header, a redacted body), when no gateway is worth running beside the upstream. They are set per route, with settings per use.
+
+```properties
+sluice.client.upstream[0].host=llm.example.com
+sluice.client.upstream[0].target=https://api.anthropic.com
+sluice.client.upstream[0].rewrite-host=true
+# a built-in
+sluice.client.upstream[0].filters[0].name=llm-usage
+
+# a filter of your own: a proxy-wasm plugin defined once, by name ...
+sluice.client.filters.redact.plugin=https://plugins.example.com/redact.wasm
+sluice.client.filters.redact.sha256=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+sluice.client.filters.redact.configuration={"mask":"****"}
+# ... and used by routes, each with its own settings over those
+sluice.client.upstream[1].host=app.example.com
+sluice.client.upstream[1].target=http://127.0.0.1:3000
+sluice.client.upstream[1].filters[0].name=redact
+sluice.client.upstream[1].filters[0].paths=/api/*
+sluice.client.upstream[1].filters[0].fail-closed=true
+```
+
+- A filtered route is `force-http1`: browsers are served over HTTP/1.1, and an h2-only client (h2c with prior knowledge, gRPC) gets `421`. It cannot be `tls-passthrough`, have a `listen-port` or a `tcp://` target; bytes the server relays verbatim to it are refused.
+- Filters run in order on a request, in reverse on its response. Routes sharing a target keep their own filters.
+- `llm-usage` counts the tokens of the OpenAI compatible APIs and the Anthropic API from their JSON and SSE responses, by exact path, without holding them; `args.include-usage=true` adds `stream_options.include_usage` to OpenAI streaming requests, without which they report nothing. See [.kb/metrics.md](.kb/metrics.md).
+- Custom filters: a [proxy-wasm plugin](proxy-wasm-plugins.md), which needs no build of the client, or in a custom build a bean implementing `UpstreamFilterFactory`, far cheaper as it is not interpreted. Both are used by name as above.
+
+Details: [.kb/client-filters.md](.kb/client-filters.md).
+
 ## Cluster
 
 ### Scale-out
@@ -935,14 +965,34 @@ its discovery document advertises an `end_session_endpoint`; register
 | `sluice.client.upstream[n].listen-port` | `0` | public port the server listens on for this upstream; connections are relayed as raw TCP routed by the listen port -- no head parsing, no rewriting -- so any protocol (ssh, postgres, redis, ...) tunnels through. The listener is bound on advertise and released on disconnect or drain (then bound for another client serving the port); bind it on the host (`docker -p`, firewall) to expose it |
 | `sluice.client.upstream[n].allowed-cidrs` | (empty = the server-wide `sluice.access-control.allow-cidrs` applies) | CIDRs / bare addresses allowed to connect to this upstream on the data plane; replaces the server-wide allow list for the route (the deny list still applies) |
 | `sluice.client.upstream[n].verbatim-idle-timeout` | `0` = the server's `sluice.limits.verbatim-idle-timeout` applies | how long a connection of this upstream relayed verbatim (TLS passthrough, tcp route, hostless, upgraded HTTP/1.1) may relay no byte in either direction before the server closes it; replaces the server's default for the route; see "Connection limits" |
+| `sluice.client.upstream[n].filters[m]` | - | the filters of the route, in request order; see [Filters](#filters-1) |
 | `sluice.strict-forwarding` | `true` | only dial upstreams present in the map |
 | `sluice.client.connect-timeout` | `10s` | how long dialing an upstream may wait: for the TCP connect, then for each read of the TLS handshake of an `https` upstream; the `CONNECT` is answered with an ERROR past it |
+
+### Filters
+
+Under `sluice.client.upstream[n].filters[m]` they are a route's use of a filter, under `sluice.client.filters.<name>` its definition and defaults; a use's settings go over the defaults. `plugin` and `sha256` are the definition's only, `name` the use's.
+
+| Property | Default | Description |
+|---|---|---|
+| `name` | - | the filter: `llm-usage`, one defined under `sluice.client.filters`, or a factory's |
+| `plugin` | - | where a [proxy-wasm plugin](proxy-wasm-plugins.md) is read from at the start: `file:`, `classpath:`, `https:` (a Spring resource location), or a file path |
+| `sha256` | - | the plugin's SHA-256 in hex; the client does not start on a mismatch. Required unless it comes from a file or the class path |
+| `paths` | every path | the request paths the filter sees: exact, or a prefix ending in `*`, compared as sent |
+| `fail-closed` | `false` | a request or response fails with the filter failing on it; otherwise it goes on as if the filter were not there |
+| `args.<key>` | - | a built-in's or a factory's settings; `llm-usage`: `include-usage` |
+| `configuration` | - | what a plugin reads as its configuration |
+| `vms` | processors, at most 4 | instances of a plugin |
+| `max-memory` | `16MB` | the memory one instance may hold |
+| `call-timeout` | `1s` | how long one call into a plugin may run |
+| `max-body` | `16MB` | the bytes of a body a plugin or `include-usage` may hold, within the tunnel budget |
+| `max-meters` | `1024` | the counters a plugin may define |
 
 ### Limits
 
 | Property | Default | Description |
 |---|---|---|
-| `sluice.client.max-connections` | `0` = (half the max heap - `tunnel-budget`) / 293KiB | upstream connections open at once over every server node; a `CONNECT` beyond it is answered with an ERROR without dialing |
+| `sluice.client.max-connections` | `0` = (half the max heap - `tunnel-budget`) / 293KiB, less what [filters](.kb/client-filters.md) hold | upstream connections open at once over every server node; a `CONNECT` beyond it is answered with an ERROR without dialing |
 | `sluice.client.tunnel-budget` | `0` = an eighth of half the max heap | bytes the client's connections may buffer beyond each connection's allowance, shared by all of them, as `sluice.limits.tunnel-budget` on the server (twice it, at least 1MiB, is the gRPC flow control window) |
 | `sluice.client.tcp-keep-alive` | `60s` | TCP keepalive idle time of every upstream connection, as `sluice.limits.tcp-keep-alive` on the server; `0` = off |
 | `sluice.client.tunnel-stall-timeout` | `60s` | how long a tunnel stream may hold frames queued for the server while not ready, the server taking none of them, before the stream is cancelled and reconnected; `0` = off; see "Connection limits" |
@@ -957,7 +1007,7 @@ its discovery document advertises an `end_session_endpoint`; register
 
 ### Modules
 
-- `sluice-proto` - `.proto` contract, generated stubs, and the shared tunnel primitives (`VirtualConnection`, `SessionSender`, `SocketRelay`)
+- `sluice-proto` - `.proto` contract, generated stubs, and the shared tunnel primitives (`VirtualConnection`, `SessionSender`, `StreamRelay`) and HTTP/1.1 parsers
 - `sluice-server` - exit node: gRPC control plane (`spring.grpc.server.port`, default 8001) + raw TCP data plane (`sluice.data-port`, default 8000) + actuator and management console (`server.port`, default 8081)
 - `sluice-client` - tunnel client: connects to the server, advertises upstreams, dials local upstreams on CONNECT, reconnects with jittered exponential backoff (ceiling 1s..30s, each wait drawn from its upper half), actuator on `server.port` (default 9001)
 - `sluice-wicket-runtime-wasi` - experimental Rust client: like `sluice-client` on the tunnel side, but terminates HTTP and hands each request to a `wasi:http` component (wasmtime) instead of dialing a TCP upstream (also without a server: `--listen`; state in `wasi:keyvalue`; components deployed from its console by drag and drop, or as apps of several hosts by a controller through its API: `--console`, its browsers signing in through an OpenID Provider); see its README
