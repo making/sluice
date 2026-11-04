@@ -12,6 +12,8 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import am.ik.sluice.client.config.FilterConfig;
 import am.ik.sluice.client.filter.UpstreamFilter.BodyHandler;
@@ -216,18 +218,28 @@ class UpstreamFilterPipeTest {
 		assertThat(upstream.received()).endsWith("GET /next HTTP/1.1\r\nHost: a\r\nx-filtered: yes\r\n\r\n");
 	}
 
-	/** h2 past a 101 would pass unseen: to the upstream it is an ordinary request. */
-	@Test
-	void anUpgradeToH2cDoesNotReachTheUpstream() throws Exception {
-		String request = "GET / HTTP/1.1\r\nHost: a\r\nConnection: Upgrade, HTTP2-Settings, keep-alive\r\n"
-				+ "Upgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAoAAAAAIAAAAA\r\nX-Kept: 1\r\n\r\n";
+	/**
+	 * h2 past a 101 would pass unseen: to the upstream it is an ordinary request, or one
+	 * asking for the other upgrades, whatever form h2c came in.
+	 */
+	@ParameterizedTest
+	@CsvSource(delimiter = '|',
+			value = {
+					"Connection: Upgrade, HTTP2-Settings, keep-alive\\r\\nUpgrade: h2c\\r\\nHTTP2-Settings: AAMA"
+							+ "|Connection: keep-alive",
+					"Connection: Upgrade, HTTP2-Settings\\r\\nUpgrade: x, h2c\\r\\nHTTP2-Settings: AAMA"
+							+ "|Connection: Upgrade\\r\\nUpgrade: x",
+					"Connection: Upgrade\\r\\nUpgrade: h2c\\r\\nUpgrade: x|Connection: Upgrade\\r\\nUpgrade: x",
+					"Connection: Upgrade\\r\\nUpgrade: H2C/1, h2c y, x|Connection: Upgrade\\r\\nUpgrade: x" })
+	void anUpgradeToH2cDoesNotReachTheUpstream(String asked, String sent) throws Exception {
+		String request = "GET / HTTP/1.1\r\nHost: a\r\n" + asked.replace("\\r\\n", "\r\n") + "\r\nX-Kept: 1\r\n\r\n";
 		String response = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nz";
 
 		FilterTests.Exchanged exchanged = FilterTests.exchange((r, headers) -> null, request,
 				response.getBytes(StandardCharsets.US_ASCII), 1024);
 
 		assertThat(exchanged.upstream())
-			.isEqualTo("GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\r\nX-Kept: 1\r\n\r\n");
+			.isEqualTo("GET / HTTP/1.1\r\nHost: a\r\n" + sent.replace("\\r\\n", "\r\n") + "\r\nX-Kept: 1\r\n\r\n");
 		assertThat(exchanged.relayed()).isEqualTo(response);
 	}
 

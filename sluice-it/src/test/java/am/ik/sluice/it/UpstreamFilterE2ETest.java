@@ -517,7 +517,7 @@ class UpstreamFilterE2ETest {
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.setSoTimeout((int) TIMEOUT.toMillis());
 			OutputStream out = socket.getOutputStream();
-			write(out, "GET /ws HTTP/1.1\r\nHost: h1.test\r\nConnection: Upgrade\r\nUpgrade: x\r\n\r\n");
+			write(out, "GET /ws HTTP/1.1\r\nHost: h1.test\r\nConnection: Upgrade\r\nUpgrade: x, h2c\r\n\r\n");
 			InputStream in = socket.getInputStream();
 			StringBuilder head = new StringBuilder();
 			while (head.indexOf("\r\n\r\n") < 0) {
@@ -528,6 +528,10 @@ class UpstreamFilterE2ETest {
 			assertThat(new String(in.readNBytes(24), StandardCharsets.US_ASCII))
 				.isEqualTo("GET /length HTTP/1.1\r\n\r\n");
 		}
+		// the upgrade offered beside h2c goes on and switches
+		assertThat(this.upstream.heads).filteredOn(head -> head.startsWith("GET /ws"))
+			.isNotEmpty()
+			.allMatch(head -> head.contains("\r\nUpgrade: x\r\n"));
 		// h2 past a 101 could not be read: the upstream gets an ordinary request
 		assertThat(exchange("GET /verbatim HTTP/1.1\r\nHost: h1.test\r\nConnection: Upgrade, HTTP2-Settings, close\r\n"
 				+ "Upgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAoAAAAAIAAAAA\r\n\r\n"))

@@ -98,7 +98,7 @@ Per request, on the HTTP/1.1 connections of its route, for the `paths` it is set
 | `on_http_response_body` | each piece of the body, then `end_of_stream` | read it; replace it, as below |
 | `on_done`, `on_log`, `on_delete` | the response ended, was cut, or none came | last counts |
 
-A connection that upgraded (a WebSocket's `101`, a `CONNECT`'s 2xx) is not followed past that response: refuse the request if what follows matters. An upgrade to `h2c` does not reach the upstream: it answers an ordinary request.
+A connection that upgraded (a WebSocket's `101`, a `CONNECT`'s 2xx) is not followed past that response: refuse the request if what follows matters. `h2c` is removed from `Upgrade`, with `HTTP2-Settings`, before the plugin is called and on paths outside its `paths` too: the upstream answers an ordinary request, or switches to another upgrade offered beside it.
 
 Heads read as UTF-8: a byte that is not valid reads as a replacement character, and the line itself stays as it came unless edited. Header names read in lower case. A head of more than 256 fields is not offered: the plugin fails on it, as below. A plugin's edits cannot take a head past 256 fields or 64KiB. `:method`, `:path`, `:scheme`, `:authority` and `:status` are there to read.
 

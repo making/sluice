@@ -380,7 +380,8 @@ sluice.client.upstream[1].filters[0].paths=/api/*
 sluice.client.upstream[1].filters[0].fail-closed=true
 ```
 
-- A filtered route is `force-http1`: browsers are served over HTTP/1.1, and an h2-only client (h2c with prior knowledge, gRPC) gets `421`. It cannot be `tls-passthrough`, have a `listen-port` or a `tcp://` target; bytes the server relays verbatim to it are refused.
+- A filtered route is `force-http1`, with no need to set it: browsers are served over HTTP/1.1, and an h2-only client (h2c with prior knowledge, gRPC) gets `421`. It cannot be `tls-passthrough`, have a `listen-port` or a `tcp://` target; bytes the server relays verbatim to it are refused.
+- `h2c` is removed from `Upgrade` on every request of a filtered route, on paths outside a filter's `paths` too: h2 past the `101` would pass the filters on that connection. The upstream answers an ordinary request, or switches to another upgrade offered beside it. What follows a `101` (a WebSocket) or a `CONNECT`'s 2xx is not filtered.
 - Filters run in order on a request, in reverse on its response. Routes sharing a target keep their own filters.
 - `llm-usage` counts the tokens of the OpenAI compatible APIs and the Anthropic API from their JSON and SSE responses, by exact path, without holding them; `args.include-usage=true` adds `stream_options.include_usage` to OpenAI streaming requests, without which they report nothing. See [.kb/metrics.md](.kb/metrics.md).
 - Custom filters: a [proxy-wasm plugin](proxy-wasm-plugins.md), which needs no build of the client, or in a custom build a bean implementing `UpstreamFilterFactory`, far cheaper as it is not interpreted. Both are used by name as above.

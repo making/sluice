@@ -16,7 +16,9 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Predicate;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -340,38 +342,52 @@ public final class UpstreamFilterPipe implements DuplexPipe {
 	}
 
 	/**
-	 * h2 past a {@code 101} could not be read: asked for it, the upstream sees an
-	 * ordinary request, which RFC 9113 lets it answer as one. The relay awaits the answer
-	 * as for any upgrade, and takes this one as declined.
+	 * h2 past a {@code 101} could not be read: asked for it, the upstream sees the
+	 * request without it, which RFC 9113 lets it answer as an ordinary one, or by another
+	 * upgrade offered beside it. The relay awaits the answer as for any upgrade, and
+	 * takes anything but a {@code 101} as declined. Whatever names h2c goes, not only the
+	 * exact token: an upstream may well read {@code H2C/1} or {@code h2c x} as it.
 	 * @return whether the head changed
 	 */
 	private static boolean dropH2cUpgrade(List<String> lines) {
-		boolean h2c = lines.stream()
-			.anyMatch(line -> nameOf(line).equals("upgrade") && line.toLowerCase(Locale.ROOT).contains("h2c"));
+		boolean h2c = lines.stream().anyMatch(line -> nameOf(line).equals("upgrade") && namesH2c(line));
 		if (!h2c) {
 			return false;
 		}
-		lines.removeIf(line -> nameOf(line).equals("upgrade") || nameOf(line).equals("http2-settings"));
-		List<String> kept = new ArrayList<>();
-		for (String line : lines) {
-			if (!nameOf(line).equals("connection")) {
-				kept.add(line);
-				continue;
-			}
-			List<String> options = new ArrayList<>();
-			for (String option : line.substring(line.indexOf(':') + 1).split(",")) {
-				String trimmed = option.trim();
-				if (!trimmed.equalsIgnoreCase("upgrade") && !trimmed.equalsIgnoreCase("http2-settings")) {
-					options.add(trimmed);
-				}
-			}
-			if (!options.isEmpty()) {
-				kept.add(line.substring(0, line.indexOf(':') + 1) + " " + String.join(", ", options));
-			}
-		}
+		List<String> upgrades = lines.stream()
+			.flatMap(line -> nameOf(line).equals("upgrade") ? keepValues(line, value -> !namesH2c(value))
+					: Stream.of(line))
+			.toList();
+		boolean others = upgrades.stream().anyMatch(line -> nameOf(line).equals("upgrade"));
+		List<String> edited = upgrades.stream()
+			.filter(line -> !nameOf(line).equals("http2-settings"))
+			.flatMap(line -> nameOf(line).equals("connection") ? keepValues(line,
+					option -> !option.equalsIgnoreCase("http2-settings")
+							&& (others || !option.equalsIgnoreCase("upgrade")))
+					: Stream.of(line))
+			.toList();
 		lines.clear();
-		lines.addAll(kept);
+		lines.addAll(edited);
 		return true;
+	}
+
+	private static boolean namesH2c(String value) {
+		return value.toLowerCase(Locale.ROOT).contains("h2c");
+	}
+
+	/**
+	 * The line of a comma separated header with only the values kept, none when no value
+	 * is left. A line losing no value stays as it came.
+	 */
+	private static Stream<String> keepValues(String line, Predicate<String> kept) {
+		int colon = line.indexOf(':');
+		List<String> values = Stream.of(line.substring(colon + 1).split(",")).map(String::trim).toList();
+		if (values.stream().allMatch(kept)) {
+			return Stream.of(line);
+		}
+		List<String> left = values.stream().filter(value -> !value.isEmpty() && kept.test(value)).toList();
+		return left.isEmpty() ? Stream.empty()
+				: Stream.of(line.substring(0, colon + 1) + " " + String.join(", ", left));
 	}
 
 	/** A request whose response has not begun. */
