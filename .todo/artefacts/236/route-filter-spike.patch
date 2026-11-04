@@ -1,0 +1,1820 @@
+diff --git a/sluice-it/src/test/java/am/ik/sluice/it/RouteFilterE2ETest.java b/sluice-it/src/test/java/am/ik/sluice/it/RouteFilterE2ETest.java
+new file mode 100644
+index 0000000..c691e20
+--- /dev/null
++++ b/sluice-it/src/test/java/am/ik/sluice/it/RouteFilterE2ETest.java
+@@ -0,0 +1,474 @@
++package am.ik.sluice.it;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.InetSocketAddress;
++import java.net.ServerSocket;
++import java.net.Socket;
++import java.nio.ByteBuffer;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import io.netty.buffer.Unpooled;
++import io.netty.handler.codec.http2.DefaultHttp2HeadersDecoder;
++import io.netty.handler.codec.http2.Http2Headers;
++import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
++import org.awaitility.Awaitility;
++import org.junit.jupiter.api.AfterAll;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.TestInstance;
++import org.junit.jupiter.api.TestInstance.Lifecycle;
++
++import am.ik.sluice.client.config.SluiceClientProperties;
++import am.ik.sluice.client.config.Upstream;
++import am.ik.sluice.client.tunnel.TunnelClient;
++import am.ik.sluice.server.SluiceServerApplication;
++import am.ik.sluice.server.auth.RequestHeaders;
++import am.ik.sluice.server.filter.ExchangeObserver;
++import am.ik.sluice.server.filter.RouteFilter;
++import am.ik.sluice.server.route.Router;
++import am.ik.sluice.server.tunnel.SessionRegistry;
++
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.boot.test.context.TestConfiguration;
++import org.springframework.context.annotation.Bean;
++import org.springframework.test.context.DynamicPropertyRegistry;
++import org.springframework.test.context.DynamicPropertySource;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++/**
++ * Spike: a per-route filter on the data plane, through a real server and tunnel client,
++ * over HTTP/1.1 and h2: the request and response heads edited, the bodies observed
++ * decoded, the request answered, the relay's framing and its 502 kept, and an async
++ * decision holding its own h2 stream only.
++ */
++@SpringBootTest(classes = { SluiceServerApplication.class, RouteFilterE2ETest.Filters.class },
++		webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
++@TestInstance(Lifecycle.PER_CLASS)
++@SuppressWarnings("NullAway")
++class RouteFilterE2ETest {
++
++	private static final Duration TIMEOUT = Duration.ofSeconds(10);
++
++	private static int grpcPort;
++
++	private static int dataPort;
++
++	@TestConfiguration(proxyBeanMethods = false)
++	static class Filters {
++
++		@Bean
++		RecordingFilter recordingFilter() {
++			return new RecordingFilter();
++		}
++
++	}
++
++	/** What a filter saw of one exchange. */
++	static final class Recorded {
++
++		final ByteArrayOutputStream requestBody = new ByteArrayOutputStream();
++
++		final ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
++
++		final CompletableFuture<ExchangeObserver.Outcome> outcome = new CompletableFuture<>();
++
++		volatile int status = -1;
++
++		volatile List<String> upstreamPrivate = List.of();
++
++	}
++
++	/** Applies to the hosts under {@code filtered.test}; the path picks the behavior. */
++	static final class RecordingFilter implements RouteFilter {
++
++		final Map<String, Recorded> recorded = new ConcurrentHashMap<>();
++
++		final CompletableFuture<Decision> slow = new CompletableFuture<>();
++
++		final Map<String, List<String>> secretsSeen = new ConcurrentHashMap<>();
++
++		@Override
++		public boolean appliesTo(Router.Route route) {
++			return route.domain().endsWith("filtered.test");
++		}
++
++		@Override
++		public CompletableFuture<Decision> onRequest(Router.Route route, RequestHeaders request) {
++			String target = request.target();
++			this.secretsSeen.put(target, request.values("authorization"));
++			return switch (target) {
++				case "/blocked" -> CompletableFuture.completedFuture(new Decision.Answer(451,
++						"Unavailable For Legal Reasons", "text/plain", "blocked\n".getBytes(StandardCharsets.UTF_8)));
++				case "/boom" -> throw new IllegalStateException("the filter failed");
++				case "/inject" -> CompletableFuture
++					.completedFuture(new Decision.Proceed(Set.of(), Map.of("x-filtered", "a\r\nx-smuggled: b"), null));
++				case "/framing" ->
++					CompletableFuture.completedFuture(new Decision.Proceed(Set.of("content-length"), Map.of(), null));
++				case "/slow" -> this.slow.thenApply(ignored -> proceed(target));
++				default -> CompletableFuture.completedFuture(proceed(target));
++			};
++		}
++
++		private Decision proceed(String target) {
++			Recorded record = new Recorded();
++			this.recorded.put(target, record);
++			return new Decision.Proceed(Set.of("x-secret"), Map.of("x-filtered", "yes"), new ExchangeObserver() {
++
++				@Override
++				public void requestBody(ByteBuffer payload) {
++					write(record.requestBody, payload);
++				}
++
++				@Override
++				public ResponseEdit responseHead(int status, ResponseHeaders headers) {
++					record.status = status;
++					record.upstreamPrivate = headers.values("x-upstream-private");
++					return new ResponseEdit(Set.of("x-upstream-private"), Map.of("x-observed", String.valueOf(status)));
++				}
++
++				@Override
++				public void responseBody(ByteBuffer payload) {
++					write(record.responseBody, payload);
++				}
++
++				@Override
++				public void completed(Outcome outcome) {
++					record.outcome.complete(outcome);
++				}
++
++			});
++		}
++
++		private static void write(ByteArrayOutputStream out, ByteBuffer payload) {
++			synchronized (out) {
++				while (payload.hasRemaining()) {
++					out.write(payload.get());
++				}
++			}
++		}
++
++	}
++
++	/**
++	 * An HTTP/1.1 upstream by script: a response with its head split over two writes and
++	 * a chunked body, a connection closed unanswered ({@code /close}), or a connection
++	 * closed inside a response head ({@code /partial}). It tells in {@code x-saw} what it
++	 * got of the headers filters change, and in {@code x-body} the body it read.
++	 */
++	static final class ScriptedUpstream implements AutoCloseable {
++
++		final ServerSocket server = new ServerSocket();
++
++		final AtomicInteger requests = new AtomicInteger();
++
++		ScriptedUpstream() throws IOException {
++			this.server.bind(new InetSocketAddress("127.0.0.1", 0));
++			Thread.ofVirtual().start(() -> {
++				while (!this.server.isClosed()) {
++					try {
++						Socket socket = this.server.accept();
++						Thread.ofVirtual().start(() -> serve(socket));
++					}
++					catch (IOException e) {
++						return;
++					}
++				}
++			});
++		}
++
++		private void serve(Socket socket) {
++			try (socket) {
++				InputStream in = socket.getInputStream();
++				OutputStream out = socket.getOutputStream();
++				while (true) {
++					String head = readLine(in, "\r\n\r\n");
++					if (head == null) {
++						return;
++					}
++					this.requests.incrementAndGet();
++					String lower = head.toLowerCase();
++					String body;
++					if (lower.contains("transfer-encoding: chunked")) {
++						StringBuilder read = new StringBuilder();
++						while (true) {
++							int size = Integer.parseInt(readLine(in, "\r\n").trim(), 16);
++							read.append(new String(in.readNBytes(size), StandardCharsets.ISO_8859_1));
++							in.readNBytes(2);
++							if (size == 0) {
++								break;
++							}
++						}
++						body = read.toString();
++					}
++					else {
++						int at = lower.indexOf("content-length: ");
++						int length = at < 0 ? 0
++								: Integer.parseInt(lower.substring(at + 16, lower.indexOf('\r', at)).trim());
++						body = new String(in.readNBytes(length), StandardCharsets.ISO_8859_1);
++					}
++					if (head.startsWith("GET /close ")) {
++						return;
++					}
++					if (head.startsWith("GET /partial ")) {
++						out.write("HTTP/1.1 200 OK\r\nX-Par".getBytes(StandardCharsets.US_ASCII));
++						out.flush();
++						return;
++					}
++					String saw = (lower.contains("x-filtered: yes") ? "filtered" : "unfiltered")
++							+ (lower.contains("x-secret") ? "+secret" : "");
++					boolean close = lower.contains("connection: close");
++					write(out, "HTTP/1.1 200 OK\r\nX-Upstr");
++					Thread.sleep(20);
++					write(out,
++							"eam-Private: 1\r\nX-Saw: " + saw + "\r\nX-Body: " + body + "\r\n"
++									+ (close ? "Connection: close\r\n" : "")
++									+ "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n");
++					Thread.sleep(20);
++					write(out, "6\r\n world\r\n0\r\n\r\n");
++					if (close) {
++						return;
++					}
++				}
++			}
++			catch (Exception e) {
++				// the connection ended
++			}
++		}
++
++		private static void write(OutputStream out, String text) throws IOException {
++			out.write(text.getBytes(StandardCharsets.ISO_8859_1));
++			out.flush();
++		}
++
++		private static String readLine(InputStream in, String terminator) throws IOException {
++			StringBuilder line = new StringBuilder();
++			int b;
++			while ((b = in.read()) >= 0) {
++				line.append((char) b);
++				if (line.toString().endsWith(terminator)) {
++					return line.toString();
++				}
++			}
++			return null;
++		}
++
++		@Override
++		public void close() throws IOException {
++			this.server.close();
++		}
++
++	}
++
++	private final RecordingFilter filter;
++
++	private final SessionRegistry sessions;
++
++	private final java.util.List<TunnelClient> clients = new java.util.concurrent.CopyOnWriteArrayList<>();
++
++	private ScriptedUpstream scripted;
++
++	private HeaderEchoUpstream echo;
++
++	RouteFilterE2ETest(@Autowired RecordingFilter filter, @Autowired SessionRegistry sessions) {
++		this.filter = filter;
++		this.sessions = sessions;
++	}
++
++	@DynamicPropertySource
++	static void properties(DynamicPropertyRegistry registry) {
++		grpcPort = TestPorts.freePort();
++		dataPort = TestPorts.freePort();
++		registry.add("spring.grpc.server.port", () -> String.valueOf(grpcPort));
++		registry.add("sluice.data-port", () -> String.valueOf(dataPort));
++		registry.add("sluice.token", () -> "it-token");
++		registry.add("server.port", () -> String.valueOf(TestPorts.freePort()));
++	}
++
++	@BeforeAll
++	void start() throws Exception {
++		this.scripted = new ScriptedUpstream();
++		this.echo = new HeaderEchoUpstream("x-filtered", "x-secret");
++		startClient("h1.filtered.test", this.scripted.server.getLocalPort());
++		startClient("plain.test", this.scripted.server.getLocalPort());
++		startClient("h2.filtered.test", this.echo.port());
++	}
++
++	private void startClient(String host, int port) {
++		int before = this.sessions.count();
++		TunnelClient client = TunnelClient.builder()
++			.properties(SluiceClientProperties.builder()
++				.serverUrl("grpc://127.0.0.1:" + grpcPort)
++				.upstream(Upstream.builder().host(host).target("http://127.0.0.1:" + port).build())
++				.token("it-token")
++				.build())
++			.taskExecutor(task -> Thread.ofVirtual().start(task))
++			.meterRegistry(new SimpleMeterRegistry())
++			.build();
++		client.start();
++		this.clients.add(client);
++		Awaitility.await().atMost(TIMEOUT).until(() -> this.sessions.count() > before);
++	}
++
++	@AfterAll
++	void stop() throws Exception {
++		this.clients.forEach(TunnelClient::stop);
++		this.scripted.close();
++		this.echo.close();
++	}
++
++	/** Writes the bytes and reads to the connection's end. */
++	private static String exchange(String requests) throws Exception {
++		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
++			socket.setSoTimeout((int) TIMEOUT.toMillis());
++			socket.getOutputStream().write(requests.getBytes(StandardCharsets.ISO_8859_1));
++			socket.getOutputStream().flush();
++			return new String(socket.getInputStream().readAllBytes(), StandardCharsets.ISO_8859_1);
++		}
++	}
++
++	private static String post(String path, String body) {
++		return "POST " + path + " HTTP/1.1\r\nHost: h1.filtered.test\r\nX-Secret: s3cret\r\n"
++				+ "Authorization: Bearer spike\r\nContent-Length: " + body.length() + "\r\n\r\n" + body;
++	}
++
++	private static String get(String host, String path, boolean close) {
++		return "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\n" + (close ? "Connection: close\r\n" : "") + "\r\n";
++	}
++
++	@Test
++	void http1HeadsAreEditedAndBodiesObservedPerRequestOfAPipeline() throws Exception {
++		String chunked = "POST /chunked HTTP/1.1\r\nHost: h1.filtered.test\r\nTransfer-Encoding: chunked\r\n\r\n"
++				+ "3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
++		String response = exchange(post("/first", "one") + chunked + get("h1.filtered.test", "/last", true));
++
++		assertThat(response.split("HTTP/1.1 200 OK", -1)).hasSize(4);
++		assertThat(response).doesNotContain("X-Upstream-Private")
++			.contains("x-observed: 200")
++			.contains("X-Saw: filtered\r\n")
++			.doesNotContain("secret")
++			.contains("X-Body: one\r\n")
++			.contains("X-Body: abcde\r\n")
++			// the body stays chunked on the wire, and whole
++			.contains("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
++
++		for (String path : List.of("/first", "/chunked", "/last")) {
++			Recorded record = this.filter.recorded.get(path);
++			assertThat(record.outcome.get(10, TimeUnit.SECONDS)).isEqualTo(ExchangeObserver.Outcome.COMPLETE);
++			assertThat(record.status).isEqualTo(200);
++			assertThat(record.upstreamPrivate).containsExactly("1");
++			assertThat(record.responseBody.toString(StandardCharsets.ISO_8859_1)).isEqualTo("hello world");
++		}
++		assertThat(this.filter.recorded.get("/first").requestBody.toString(StandardCharsets.ISO_8859_1))
++			.isEqualTo("one");
++		assertThat(this.filter.recorded.get("/chunked").requestBody.toString(StandardCharsets.ISO_8859_1))
++			.isEqualTo("abcde");
++		assertThat(this.filter.secretsSeen.get("/first")).containsExactly("Bearer spike");
++	}
++
++	@Test
++	void aRouteWithoutFiltersIsRelayedUntouched() throws Exception {
++		String response = exchange(
++				"GET /plain HTTP/1.1\r\nHost: plain.test\r\nX-Secret: s\r\nConnection: close\r\n\r\n");
++
++		assertThat(response).contains("X-Upstream-Private: 1")
++			.doesNotContain("x-observed")
++			.contains("X-Saw: unfiltered+secret");
++		assertThat(this.filter.recorded).doesNotContainKey("/plain");
++	}
++
++	@Test
++	void http1RequestsTheFiltersDoNotPassNeverReachTheUpstream() throws Exception {
++		int before = this.scripted.requests.get();
++
++		assertThat(exchange(get("h1.filtered.test", "/blocked", false))).startsWith("HTTP/1.1 451 ")
++			.endsWith("blocked\n");
++		assertThat(exchange(get("h1.filtered.test", "/boom", false))).startsWith("HTTP/1.1 500 ");
++		assertThat(exchange(get("h1.filtered.test", "/inject", false))).startsWith("HTTP/1.1 500 ")
++			.doesNotContain("smuggled");
++		assertThat(exchange(get("h1.filtered.test", "/framing", false))).startsWith("HTTP/1.1 500 ");
++
++		assertThat(this.scripted.requests.get()).isEqualTo(before);
++	}
++
++	@Test
++	void http1UpstreamEndsAreAnsweredAsWithoutFilters() throws Exception {
++		assertThat(exchange(get("h1.filtered.test", "/close", false))).startsWith("HTTP/1.1 502 ");
++		assertThat(this.filter.recorded.get("/close").outcome.get(10, TimeUnit.SECONDS))
++			.isEqualTo(ExchangeObserver.Outcome.INCOMPLETE);
++
++		// a head begun is relayed as far as it came, as an unfiltered route relays it
++		assertThat(exchange(get("plain.test", "/partial", false))).isEqualTo("HTTP/1.1 200 OK\r\nX-Par");
++		assertThat(exchange(get("h1.filtered.test", "/partial", false))).isEqualTo("HTTP/1.1 200 OK\r\nX-Par");
++		assertThat(this.filter.recorded.get("/partial").outcome.get(10, TimeUnit.SECONDS))
++			.isEqualTo(ExchangeObserver.Outcome.INCOMPLETE);
++	}
++
++	@Test
++	void h2HeadsAreEditedAndBodiesObserved() throws Exception {
++		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
++			client.headers(1, false, h2Head("POST", "/h2", "x-secret=s3cret"));
++			assertThat(client.data(1, 32 * 1024, true, TIMEOUT)).isTrue();
++			assertThat(client.awaitEnd(1, TIMEOUT)).isTrue();
++
++			DefaultHttp2HeadersDecoder decoder = new DefaultHttp2HeadersDecoder(true);
++			Http2Headers response = decoder.decodeHeaders(1, Unpooled.wrappedBuffer(client.firstHeaderBlock(1)));
++			assertThat(response.status().toString()).isEqualTo("200");
++			assertThat(response.get("x-observed").toString()).isEqualTo("200");
++			String body = TestH2.bodyOf(client.frames(1));
++			assertThat(body).contains("x-filtered=yes").doesNotContain("x-secret");
++
++			Recorded record = this.filter.recorded.get("/h2");
++			assertThat(record.outcome.get(10, TimeUnit.SECONDS)).isEqualTo(ExchangeObserver.Outcome.COMPLETE);
++			assertThat(record.requestBody.size()).isEqualTo(32 * 1024);
++			assertThat(record.responseBody.toString(StandardCharsets.UTF_8)).isEqualTo(body);
++
++			// answered on its own stream, the connection going on
++			client.headers(3, true, h2Head("GET", "/blocked"));
++			assertThat(client.awaitEnd(3, TIMEOUT)).isTrue();
++			assertThat(decoder.decodeHeaders(3, Unpooled.wrappedBuffer(client.firstHeaderBlock(3))).status().toString())
++				.isEqualTo("451");
++			assertThat(client.goAwayCode()).isEqualTo(-1);
++		}
++	}
++
++	@Test
++	void h2AnAsyncDecisionHoldsItsOwnStreamOnly() throws Exception {
++		try (H2TestClient client = H2TestClient.connect(dataPort, 1, 3)) {
++			client.headers(1, false, h2Head("POST", "/slow"));
++			// sent while the decision is pending, held in the relay's account
++			assertThat(client.data(1, 1000, true, TIMEOUT)).isTrue();
++
++			client.headers(3, true, h2Head("GET", "/not-slow"));
++			assertThat(client.awaitEnd(3, TIMEOUT)).isTrue();
++			assertThat(client.ended(1)).isFalse();
++
++			this.filter.slow.complete(RouteFilter.Decision.Proceed.UNCHANGED);
++			assertThat(client.awaitEnd(1, TIMEOUT)).isTrue();
++			assertThat(TestH2.bodyOf(client.frames(1))).contains("x-filtered=yes");
++			Recorded record = this.filter.recorded.get("/slow");
++			assertThat(record.outcome.get(10, TimeUnit.SECONDS)).isEqualTo(ExchangeObserver.Outcome.COMPLETE);
++			assertThat(record.requestBody.size()).isEqualTo(1000);
++		}
++	}
++
++	private static byte[] h2Head(String method, String path, String... more) {
++		List<String> fields = new java.util.ArrayList<>(
++				List.of(":method=" + method, ":scheme=http", ":path=" + path, ":authority=h2.filtered.test"));
++		fields.addAll(List.of(more));
++		return TestH2.headerBlock(fields.toArray(String[]::new));
++	}
++
++}
+diff --git a/sluice-server/src/main/java/am/ik/sluice/server/auth/Verdict.java b/sluice-server/src/main/java/am/ik/sluice/server/auth/Verdict.java
+index 40b5438..5c71d31 100644
+--- a/sluice-server/src/main/java/am/ik/sluice/server/auth/Verdict.java
++++ b/sluice-server/src/main/java/am/ik/sluice/server/auth/Verdict.java
+@@ -7,6 +7,10 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ 
++import org.jspecify.annotations.Nullable;
++
++import am.ik.sluice.server.filter.ExchangeObserver;
++
+ /**
+  * What {@link RouteAuthenticator} made of a request: it passes -- the headers to remove
+  * before it is relayed with it, and those to add --, it is unauthorized, forbidden,
+@@ -24,8 +28,9 @@ public sealed interface Verdict {
+ 	 * @param strip the lowercase names of the headers removed before it is relayed
+ 	 * @param add the fields added after the removal, lowercase names to their values, in
+ 	 * order
++	 * @param observer told about the exchange once relayed; null when none
+ 	 */
+-	record Pass(Set<String> strip, Map<String, String> add) implements Verdict {
++	record Pass(Set<String> strip, Map<String, String> add, @Nullable ExchangeObserver observer) implements Verdict {
+ 
+ 		public Pass {
+ 			strip = Set.copyOf(strip);
+@@ -37,6 +42,11 @@ public sealed interface Verdict {
+ 			this(strip, Map.of());
+ 		}
+ 
++		/** Passes, unobserved. */
++		public Pass(Set<String> strip, Map<String, String> add) {
++			this(strip, add, null);
++		}
++
+ 	}
+ 
+ 	/**
+@@ -116,4 +126,15 @@ public sealed interface Verdict {
+ 	record Unavailable(Duration retryAfter) implements Verdict {
+ 	}
+ 
++	/**
++	 * The request is answered by a route's filter, never relayed.
++	 *
++	 * @param status the status code
++	 * @param reason the reason phrase
++	 * @param contentType the content type of the body
++	 * @param body the body
++	 */
++	record Answered(int status, String reason, String contentType, byte[] body) implements Verdict {
++	}
++
+ }
+diff --git a/sluice-server/src/main/java/am/ik/sluice/server/filter/ExchangeObserver.java b/sluice-server/src/main/java/am/ik/sluice/server/filter/ExchangeObserver.java
+new file mode 100644
+index 0000000..7fb420a
+--- /dev/null
++++ b/sluice-server/src/main/java/am/ik/sluice/server/filter/ExchangeObserver.java
+@@ -0,0 +1,63 @@
++package am.ik.sluice.server.filter;
++
++import java.nio.ByteBuffer;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * Sees one relayed exchange (spike): the payload of its bodies, decoded of the chunked
++ * framing, and its final response head, which it may edit. It sees interim heads and
++ * neither an upgraded connection's nor a CONNECT's bytes.
++ * <p>
++ * Every call runs on the relay's path and must not block: on h2 with the lock of the
++ * whole connection, on HTTP/1.1 with the lock of the client stream. The request and the
++ * response sides may run on two threads at once. A buffer is valid during its call only.
++ */
++public interface ExchangeObserver {
++
++	/** How an exchange ended. */
++	enum Outcome {
++
++		/** The request and the response both went through to their ends. */
++		COMPLETE,
++
++		/** The response was cut, or lost before any of it. */
++		INCOMPLETE
++
++	}
++
++	/** The headers of a response head. */
++	@FunctionalInterface
++	interface ResponseHeaders {
++
++		/**
++		 * Every value of the header, in order; empty when absent.
++		 * @param name the header name in lowercase
++		 */
++		List<String> values(String name);
++
++	}
++
++	/** What to change in a response head; the framing headers cannot be changed. */
++	record ResponseEdit(Set<String> strip, Map<String, String> add) {
++
++		public static final ResponseEdit NONE = new ResponseEdit(Set.of(), Map.of());
++
++	}
++
++	default void requestBody(ByteBuffer payload) {
++	}
++
++	default ResponseEdit responseHead(int status, ResponseHeaders headers) {
++		return ResponseEdit.NONE;
++	}
++
++	default void responseBody(ByteBuffer payload) {
++	}
++
++	/** Called once, last, for an exchange that was relayed. */
++	default void completed(Outcome outcome) {
++	}
++
++}
+diff --git a/sluice-server/src/main/java/am/ik/sluice/server/filter/RouteFilter.java b/sluice-server/src/main/java/am/ik/sluice/server/filter/RouteFilter.java
+new file mode 100644
+index 0000000..3ebdf4f
+--- /dev/null
++++ b/sluice-server/src/main/java/am/ik/sluice/server/filter/RouteFilter.java
+@@ -0,0 +1,58 @@
++package am.ik.sluice.server.filter;
++
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.CompletableFuture;
++
++import org.jspecify.annotations.Nullable;
++
++import am.ik.sluice.server.auth.RequestHeaders;
++import am.ik.sluice.server.route.Router;
++
++/**
++ * A per-route step over the requests the data plane reads (spike). It runs after the
++ * route's credential check, on the head with the credentials hidden, for every HTTP/1.1
++ * request head and h2 stream alike.
++ * <p>
++ * {@link #onRequest} must not block: on h2 it runs with the lock of the whole connection.
++ * What takes time goes in the returned future, which holds its own stream only.
++ */
++public interface RouteFilter {
++
++	boolean appliesTo(Router.Route route);
++
++	CompletableFuture<Decision> onRequest(Router.Route route, RequestHeaders request);
++
++	/** What a filter made of a request head. */
++	sealed interface Decision {
++
++		/**
++		 * The request goes on.
++		 *
++		 * @param strip the lowercase names of the headers removed
++		 * @param add the lowercase names and values of the headers added
++		 * @param observer told about the exchange once it is relayed; dropped unnoticed
++		 * when the request is not relayed after all
++		 */
++		record Proceed(Set<String> strip, Map<String, String> add,
++				@Nullable ExchangeObserver observer) implements Decision {
++
++			public static final Proceed UNCHANGED = new Proceed(Set.of(), Map.of(), null);
++
++		}
++
++		/**
++		 * The request is answered here and never relayed.
++		 *
++		 * @param status the status code
++		 * @param reason the reason phrase, also the access log's
++		 * {@code reason=filter-...}
++		 * @param contentType the content type of the body
++		 * @param body the body
++		 */
++		record Answer(int status, String reason, String contentType, byte[] body) implements Decision {
++		}
++
++	}
++
++}
+diff --git a/sluice-server/src/main/java/am/ik/sluice/server/filter/RouteFilterChain.java b/sluice-server/src/main/java/am/ik/sluice/server/filter/RouteFilterChain.java
+new file mode 100644
+index 0000000..e29fc5e
+--- /dev/null
++++ b/sluice-server/src/main/java/am/ik/sluice/server/filter/RouteFilterChain.java
+@@ -0,0 +1,310 @@
++package am.ik.sluice.server.filter;
++
++import java.nio.ByteBuffer;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.CompletableFuture;
++
++import org.jspecify.annotations.Nullable;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import org.springframework.beans.factory.ObjectProvider;
++import org.springframework.stereotype.Component;
++
++import am.ik.sluice.server.auth.RequestHeaders;
++import am.ik.sluice.server.auth.Verdict;
++import am.ik.sluice.server.route.Router;
++
++/**
++ * Runs a route's {@link RouteFilter}s after its credential check (spike): the outcome is
++ * a {@link Verdict}, so the relays need no new path for what a filter decides. A filter
++ * failing or timing out answers the request ({@code 500} / {@code 504}): a request the
++ * filters did not pass is never relayed. An observer failing is dropped and logged, the
++ * exchange going on.
++ */
++@Component
++public class RouteFilterChain {
++
++	private static final Logger log = LoggerFactory.getLogger(RouteFilterChain.class);
++
++	private static final Duration TIMEOUT = Duration.ofSeconds(5);
++
++	/** What a filter must not change: the framing, and what routed the request. */
++	private static final Set<String> PROTECTED = Set.of("content-length", "transfer-encoding", "connection", "upgrade",
++			"keep-alive", "proxy-connection", "te", "trailer", "host");
++
++	private final List<RouteFilter> filters;
++
++	public RouteFilterChain(ObjectProvider<RouteFilter> filters) {
++		List<RouteFilter> found = new ArrayList<>(filters.orderedStream().toList());
++		if ("1".equals(System.getenv("SLUICE_SPIKE_FILTER_ALL"))) {
++			found.add(new Passing());
++		}
++		this.filters = List.copyOf(found);
++	}
++
++	/** Whether the route has a filter: its relays hold its response heads. */
++	public boolean appliesTo(Router.Route route) {
++		for (RouteFilter filter : this.filters) {
++			if (filter.appliesTo(route)) {
++				return true;
++			}
++		}
++		return false;
++	}
++
++	/** The verdict on a head after the filters, for a relay on a thread of its own. */
++	public Verdict apply(Router.Route route, RequestHeaders request, Verdict verdict) {
++		if (!appliesTo(route)) {
++			return verdict;
++		}
++		return applyAsync(route, request, CompletableFuture.completedFuture(verdict)).join();
++	}
++
++	/** The verdict on a head after the filters; the check's own future without one. */
++	public CompletableFuture<Verdict> applyAsync(Router.Route route, RequestHeaders request,
++			CompletableFuture<Verdict> checked) {
++		if (!appliesTo(route)) {
++			return checked;
++		}
++		return checked.thenCompose(verdict -> {
++			if (!(verdict instanceof Verdict.Pass pass)) {
++				return CompletableFuture.completedFuture(verdict);
++			}
++			RequestHeaders visible = hiding(request, pass.strip());
++			CompletableFuture<Verdict> run = CompletableFuture.completedFuture(pass);
++			for (RouteFilter filter : this.filters) {
++				if (filter.appliesTo(route)) {
++					run = run.thenCompose(so -> so instanceof Verdict.Pass passed
++							? decide(filter, route, visible, passed) : CompletableFuture.completedFuture(so));
++				}
++			}
++			return run;
++		});
++	}
++
++	private static CompletableFuture<Verdict> decide(RouteFilter filter, Router.Route route, RequestHeaders request,
++			Verdict.Pass pass) {
++		CompletableFuture<RouteFilter.Decision> decided;
++		try {
++			decided = filter.onRequest(route, request);
++		}
++		catch (RuntimeException e) {
++			decided = CompletableFuture.failedFuture(e);
++		}
++		return decided.orTimeout(TIMEOUT.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS)
++			.<Verdict>thenApply(decision -> switch (decision) {
++				case RouteFilter.Decision.Answer answer ->
++					new Verdict.Answered(answer.status(), answer.reason(), answer.contentType(), answer.body());
++				case RouteFilter.Decision.Proceed proceed -> merged(pass, proceed);
++			})
++			.exceptionally(failure -> {
++				log.warn("a filter of route {} failed: {}", route.routeTag(), failure.toString());
++				boolean timedOut = failure instanceof java.util.concurrent.TimeoutException
++						|| failure.getCause() instanceof java.util.concurrent.TimeoutException;
++				return answered(timedOut ? 504 : 500, timedOut ? "Gateway Timeout" : "Internal Server Error");
++			});
++	}
++
++	private static Verdict answered(int status, String reason) {
++		return new Verdict.Answered(status, reason, "text/plain", (reason + "\n").getBytes(StandardCharsets.US_ASCII));
++	}
++
++	private static Verdict merged(Verdict.Pass pass, RouteFilter.Decision.Proceed proceed) {
++		validate(proceed.strip(), proceed.add());
++		Set<String> strip = new HashSet<>(pass.strip());
++		strip.addAll(proceed.strip());
++		Map<String, String> add = new LinkedHashMap<>(pass.add());
++		add.putAll(proceed.add());
++		ExchangeObserver observer = proceed.observer();
++		ExchangeObserver safe = observer == null ? null : new Safe(observer);
++		return new Verdict.Pass(strip, add, compose(pass.observer(), safe));
++	}
++
++	/**
++	 * A value going on the wire as is must not carry a line break, a name must be a
++	 * lowercase token: an edit must not be able to smuggle a header or change the framing
++	 * the relay follows.
++	 */
++	static void validate(Set<String> strip, Map<String, String> add) {
++		for (String name : strip) {
++			checkName(name);
++		}
++		add.forEach((name, value) -> {
++			checkName(name);
++			for (int i = 0; i < value.length(); i++) {
++				char c = value.charAt(i);
++				if (c < 0x20 && c != '\t' || c == 0x7f || c > 0xff) {
++					throw new IllegalArgumentException("invalid value of header " + name);
++				}
++			}
++		});
++	}
++
++	private static void checkName(String name) {
++		if (name.isEmpty() || PROTECTED.contains(name)) {
++			throw new IllegalArgumentException("header " + name + " cannot be changed by a filter");
++		}
++		for (int i = 0; i < name.length(); i++) {
++			char c = name.charAt(i);
++			boolean token = c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || "!#$%&'*+-.^_`|~".indexOf(c) >= 0;
++			if (!token) {
++				throw new IllegalArgumentException("invalid header name " + name);
++			}
++		}
++	}
++
++	private static RequestHeaders hiding(RequestHeaders request, Set<String> hidden) {
++		return new RequestHeaders() {
++
++			@Override
++			public String method() {
++				return request.method();
++			}
++
++			@Override
++			public String target() {
++				return request.target();
++			}
++
++			@Override
++			public List<String> values(String name) {
++				return hidden.contains(name) ? List.of() : request.values(name);
++			}
++
++		};
++	}
++
++	private static @Nullable ExchangeObserver compose(@Nullable ExchangeObserver first,
++			@Nullable ExchangeObserver second) {
++		if (first == null || second == null) {
++			return first == null ? second : first;
++		}
++		return new ExchangeObserver() {
++
++			@Override
++			public void requestBody(ByteBuffer payload) {
++				first.requestBody(payload.duplicate());
++				second.requestBody(payload.duplicate());
++			}
++
++			@Override
++			public ResponseEdit responseHead(int status, ResponseHeaders headers) {
++				// the last filter of the request is the first of the response
++				ResponseEdit inner = second.responseHead(status, headers);
++				ResponseEdit outer = first.responseHead(status, headers);
++				Set<String> strip = new HashSet<>(inner.strip());
++				strip.addAll(outer.strip());
++				Map<String, String> add = new LinkedHashMap<>(inner.add());
++				add.putAll(outer.add());
++				return new ResponseEdit(strip, add);
++			}
++
++			@Override
++			public void responseBody(ByteBuffer payload) {
++				first.responseBody(payload.duplicate());
++				second.responseBody(payload.duplicate());
++			}
++
++			@Override
++			public void completed(Outcome outcome) {
++				second.completed(outcome);
++				first.completed(outcome);
++			}
++
++		};
++	}
++
++	/** Drops an observer that failed: its failure must not reach a relay's thread. */
++	private static final class Safe implements ExchangeObserver {
++
++		private final ExchangeObserver delegate;
++
++		private volatile boolean failed;
++
++		Safe(ExchangeObserver delegate) {
++			this.delegate = delegate;
++		}
++
++		private void failed(RuntimeException e) {
++			this.failed = true;
++			log.warn("an exchange observer failed; dropping it", e);
++		}
++
++		@Override
++		public void requestBody(ByteBuffer payload) {
++			if (!this.failed) {
++				try {
++					this.delegate.requestBody(payload);
++				}
++				catch (RuntimeException e) {
++					failed(e);
++				}
++			}
++		}
++
++		@Override
++		public ResponseEdit responseHead(int status, ResponseHeaders headers) {
++			if (!this.failed) {
++				try {
++					ResponseEdit edit = this.delegate.responseHead(status, headers);
++					validate(edit.strip(), edit.add());
++					return edit;
++				}
++				catch (RuntimeException e) {
++					failed(e);
++				}
++			}
++			return ResponseEdit.NONE;
++		}
++
++		@Override
++		public void responseBody(ByteBuffer payload) {
++			if (!this.failed) {
++				try {
++					this.delegate.responseBody(payload);
++				}
++				catch (RuntimeException e) {
++					failed(e);
++				}
++			}
++		}
++
++		@Override
++		public void completed(Outcome outcome) {
++			try {
++				this.delegate.completed(outcome);
++			}
++			catch (RuntimeException e) {
++				log.warn("an exchange observer failed", e);
++			}
++		}
++
++	}
++
++	/**
++	 * For running the relay suites through the filter path; holds every response head.
++	 */
++	private static final class Passing implements RouteFilter {
++
++		@Override
++		public boolean appliesTo(Router.Route route) {
++			return true;
++		}
++
++		@Override
++		public CompletableFuture<Decision> onRequest(Router.Route route, RequestHeaders request) {
++			return CompletableFuture.completedFuture(new Decision.Proceed(Set.of(), Map.of(), new ExchangeObserver() {
++			}));
++		}
++
++	}
++
++}
+diff --git a/sluice-server/src/main/java/am/ik/sluice/server/proxy/AccessLogger.java b/sluice-server/src/main/java/am/ik/sluice/server/proxy/AccessLogger.java
+index fb6341f..8ecc1a6 100644
+--- a/sluice-server/src/main/java/am/ik/sluice/server/proxy/AccessLogger.java
++++ b/sluice-server/src/main/java/am/ik/sluice/server/proxy/AccessLogger.java
+@@ -430,6 +430,7 @@ public class AccessLogger {
+ 				case Verdict.Unavailable unavailable -> this.refused(route, logged, 503, "auth-unavailable");
+ 				case Verdict.Forbidden forbidden -> this.refused(route, logged, 403, "auth-" + forbidden.reason());
+ 				case Verdict.Redirect redirect -> this.refused(route, logged, 302, "auth-" + redirect.reason());
++				case Verdict.Answered answered -> this.refused(route, logged, answered.status(), "filter");
+ 				case Verdict.Pass pass -> {
+ 				}
+ 			}
+diff --git a/sluice-server/src/main/java/am/ik/sluice/server/proxy/DataProxyServer.java b/sluice-server/src/main/java/am/ik/sluice/server/proxy/DataProxyServer.java
+index 6a4866d..fa6c477 100644
+--- a/sluice-server/src/main/java/am/ik/sluice/server/proxy/DataProxyServer.java
++++ b/sluice-server/src/main/java/am/ik/sluice/server/proxy/DataProxyServer.java
+@@ -38,6 +38,7 @@ import org.springframework.stereotype.Component;
+ 
+ import am.ik.sluice.server.auth.RouteAuthenticator;
+ import am.ik.sluice.server.config.SluiceServerProperties;
++import am.ik.sluice.server.filter.RouteFilterChain;
+ import am.ik.sluice.server.proxyprotocol.ProxyProtocolParser;
+ import am.ik.sluice.server.route.Router;
+ import am.ik.sluice.server.tunnel.Drainable;
+@@ -115,6 +116,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
+ 
+ 	private final RouteAuthenticator routeAuth;
+ 
++	private final RouteFilterChain filters;
++
+ 	private final ConnectionLimits limits;
+ 
+ 	/** Handed to every HTTP/1.1 relay started from now on. */
+@@ -140,8 +143,9 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
+ 
+ 	DataProxyServer(Router router, SessionRegistry sessions, SluiceServerProperties properties,
+ 			MeterRegistry meterRegistry, AccessLogger accessLogger, AccessControl accessControl,
+-			RouteAuthenticator routeAuth, @Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor,
+-			ObjectProvider<SSLContext> sslContext, ErrorResponse errorResponse, ConnectionLimits limits) {
++			RouteAuthenticator routeAuth, RouteFilterChain filters,
++			@Qualifier("applicationTaskExecutor") TaskExecutor taskExecutor, ObjectProvider<SSLContext> sslContext,
++			ErrorResponse errorResponse, ConnectionLimits limits) {
+ 		this.router = router;
+ 		this.sessions = sessions;
+ 		this.properties = properties;
+@@ -150,6 +154,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
+ 		this.accessLogger = accessLogger;
+ 		this.accessControl = accessControl;
+ 		this.routeAuth = routeAuth;
++		this.filters = filters;
+ 		this.taskExecutor = taskExecutor;
+ 		this.sslContext = sslContext;
+ 		this.errorResponse = errorResponse;
+@@ -565,6 +570,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
+ 					.sessions(this.sessions)
+ 					.accessControl(this.accessControl)
+ 					.routeAuth(this.routeAuth)
++					.filters(this.filters)
+ 					.errorResponse(this.errorResponse)
+ 					.access(access)
+ 					.meters(this.h2DemuxMeters)
+@@ -592,8 +598,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
+ 				return true;
+ 			}
+ 			ReroutingRelay rerouting = new ReroutingRelay(this.clientPipeSeam.apply(conn.pipe()), conn.head(),
+-					this.router, this.sessions, this.accessControl, this.routeAuth, this.errorResponse, access,
+-					this.meterRegistry, route0, session, peer, forwarding, deadline,
++					this.router, this.sessions, this.accessControl, this.routeAuth, this.filters, this.errorResponse,
++					access, this.meterRegistry, route0, session, peer, forwarding, deadline,
+ 					this.properties.limits().halfCloseProbeInterval(), this.probeSeam, this.headSeam, relayed, release);
+ 			this.activeConnections.incrementAndGet();
+ 			try {
+diff --git a/sluice-server/src/main/java/am/ik/sluice/server/proxy/ErrorResponse.java b/sluice-server/src/main/java/am/ik/sluice/server/proxy/ErrorResponse.java
+index 5c1291b..831e582 100644
+--- a/sluice-server/src/main/java/am/ik/sluice/server/proxy/ErrorResponse.java
++++ b/sluice-server/src/main/java/am/ik/sluice/server/proxy/ErrorResponse.java
+@@ -126,6 +126,20 @@ public class ErrorResponse {
+ 	 * {@link Verdict.Unavailable}, the denied page of {@link Verdict.Forbidden} or the
+ 	 * redirect of {@link Verdict.Redirect}; empty for a verdict that passes.
+ 	 */
++	private static byte[] http1(ConnectionHeadParser.Head head, Verdict.Answered answered) {
++		ConnectionHeadParser.Head.@Nullable Request request = head.request();
++		boolean bodiless = request != null && "HEAD".equals(request.method());
++		byte[] start = ("HTTP/1.1 " + answered.status() + " " + answered.reason() + "\r\nContent-Type: "
++				+ answered.contentType() + "\r\nContent-Length: " + answered.body().length
++				+ "\r\nConnection: close\r\n\r\n")
++			.getBytes(StandardCharsets.ISO_8859_1);
++		byte[] response = java.util.Arrays.copyOf(start, start.length + (bodiless ? 0 : answered.body().length));
++		if (!bodiless) {
++			System.arraycopy(answered.body(), 0, response, start.length, answered.body().length);
++		}
++		return response;
++	}
++
+ 	public byte[] refusal(ConnectionHeadParser.Head head, Verdict verdict) {
+ 		return switch (verdict) {
+ 			case Verdict.Unauthorized unauthorized -> this.unauthorized(head, unauthorized.challenges());
+@@ -134,6 +148,7 @@ public class ErrorResponse {
+ 				this.render(head, this.busy.keysUnloaded().retryingAfter(unavailable.retryAfter().toSeconds()));
+ 			case Verdict.Forbidden forbidden -> this.render(head, this.denied.forbidding(forbidden.reason()));
+ 			case Verdict.Redirect redirect -> this.render(head, Page.redirecting(redirect));
++			case Verdict.Answered answered -> http1(head, answered);
+ 			case Verdict.Pass pass -> new byte[0];
+ 		};
+ 	}
+@@ -156,6 +171,13 @@ public class ErrorResponse {
+ 			case Verdict.Forbidden forbidden ->
+ 				this.streamPage(this.denied.forbidding(forbidden.reason()), host, request);
+ 			case Verdict.Redirect redirect -> this.streamPage(Page.redirecting(redirect), host, request);
++			case Verdict.Answered answered -> {
++				io.netty.handler.codec.http2.Http2Headers headers = new io.netty.handler.codec.http2.DefaultHttp2Headers()
++					.status(String.valueOf(answered.status()))
++					.set(io.netty.util.AsciiString.of("content-type"), answered.contentType())
++					.setInt(io.netty.util.AsciiString.of("content-length"), answered.body().length);
++				yield new StreamPage(headers, answered.body());
++			}
+ 			case Verdict.Pass pass -> throw new IllegalArgumentException("the request passed");
+ 		};
+ 	}
+diff --git a/sluice-server/src/main/java/am/ik/sluice/server/proxy/Http1RequestParser.java b/sluice-server/src/main/java/am/ik/sluice/server/proxy/Http1RequestParser.java
+index 10c7356..62d623b 100644
+--- a/sluice-server/src/main/java/am/ik/sluice/server/proxy/Http1RequestParser.java
++++ b/sluice-server/src/main/java/am/ik/sluice/server/proxy/Http1RequestParser.java
+@@ -45,6 +45,10 @@ final class Http1RequestParser {
+ 		/** Request bytes that are relayed unchanged. */
+ 		void data(byte[] bytes, int offset, int length);
+ 
++		/** Request body bytes among those of {@link #data}, without chunked framing. */
++		default void payload(byte[] bytes, int offset, int length) {
++		}
++
+ 	}
+ 
+ 	/** Where the parser stands in the request stream. */
+@@ -287,6 +291,7 @@ final class Http1RequestParser {
+ 	private int passBody(byte[] bytes, int offset, int length) {
+ 		int n = (int) Math.min(this.remaining, length);
+ 		this.listener.data(bytes, offset, n);
++		this.listener.payload(bytes, offset, n);
+ 		this.remaining -= n;
+ 		if (this.remaining == 0) {
+ 			this.endMessage();
+@@ -297,6 +302,7 @@ final class Http1RequestParser {
+ 	private int passChunk(byte[] bytes, int offset, int length) {
+ 		int n = (int) Math.min(this.remaining, length);
+ 		this.listener.data(bytes, offset, n);
++		this.listener.payload(bytes, offset, n);
+ 		this.remaining -= n;
+ 		if (this.remaining == 0) {
+ 			this.terminatorRead = 0;
+diff --git a/sluice-server/src/main/java/am/ik/sluice/server/proxy/NettyHttp2DemuxRelay.java b/sluice-server/src/main/java/am/ik/sluice/server/proxy/NettyHttp2DemuxRelay.java
+index 7db4ddc..d62499a 100644
+--- a/sluice-server/src/main/java/am/ik/sluice/server/proxy/NettyHttp2DemuxRelay.java
++++ b/sluice-server/src/main/java/am/ik/sluice/server/proxy/NettyHttp2DemuxRelay.java
+@@ -34,6 +34,8 @@ import org.slf4j.LoggerFactory;
+ 
+ import am.ik.sluice.server.auth.RouteAuthenticator;
+ import am.ik.sluice.server.auth.Verdict;
++import am.ik.sluice.server.filter.ExchangeObserver;
++import am.ik.sluice.server.filter.RouteFilterChain;
+ import am.ik.sluice.server.proxy.hop.Hop;
+ import am.ik.sluice.server.proxy.hop.HopHandler;
+ import am.ik.sluice.server.proxy.hop.Loop;
+@@ -367,6 +369,8 @@ final class NettyHttp2DemuxRelay {
+ 
+ 	private final RouteAuthenticator routeAuth;
+ 
++	private final RouteFilterChain filters;
++
+ 	private final ErrorResponse errorResponse;
+ 
+ 	private final AccessLogger.Connection access;
+@@ -520,6 +524,7 @@ final class NettyHttp2DemuxRelay {
+ 		this.sessions = Objects.requireNonNull(builder.sessions, "sessions is required");
+ 		this.accessControl = Objects.requireNonNull(builder.accessControl, "accessControl is required");
+ 		this.routeAuth = Objects.requireNonNull(builder.routeAuth, "routeAuth is required");
++		this.filters = Objects.requireNonNull(builder.filters, "filters is required");
+ 		this.errorResponse = Objects.requireNonNull(builder.errorResponse, "errorResponse is required");
+ 		this.access = Objects.requireNonNull(builder.access, "access is required");
+ 		this.meters = Objects.requireNonNull(builder.meters, "meters is required");
+@@ -704,9 +709,9 @@ final class NettyHttp2DemuxRelay {
+ 			session = serving;
+ 		}
+ 		NewStream stream = new NewStream(streamId, route, session, host, request, headers, endStream);
+-		CompletableFuture<Verdict> verdict = this.routeAuth.verifyAsync(route,
+-				ConnectionHeadParser.http2Headers(headers),
+-				this.forwarding.origin(ConnectionHeadParser.http2Headers(headers), host));
++		CompletableFuture<Verdict> verdict = this.filters.applyAsync(route, ConnectionHeadParser.http2Headers(headers),
++				this.routeAuth.verifyAsync(route, ConnectionHeadParser.http2Headers(headers),
++						this.forwarding.origin(ConnectionHeadParser.http2Headers(headers), host)));
+ 		if (verdict.isDone()) {
+ 			verifiedLocked(stream, verdict);
+ 		}
+@@ -786,6 +791,7 @@ final class NettyHttp2DemuxRelay {
+ 		Exchange exchange = new Exchange(streamId, legId, leg, client());
+ 		exchange.host = stream.host;
+ 		exchange.request = request;
++		exchange.observer = pass.observer();
+ 		exchange.requestEnded = stream.requestEnded;
+ 		exchange.tunnel = CONNECT.equals(request.method());
+ 		CharSequence expect = headers.get(EXPECT);
+@@ -823,6 +829,12 @@ final class NettyHttp2DemuxRelay {
+ 		else {
+ 			// what the client sent while the stream was parked follows its head
+ 			if (stream.dataRead) {
++				if (exchange.observer != null) {
++					// what the client sent while the filters or the check ran
++					ByteBuf held = stream.data.takeAll();
++					exchange.observer.requestBody(held.nioBuffer().asReadOnlyBuffer());
++					stream.data.append(held);
++				}
+ 				exchange.requestFlow.parked(stream.data, stream.dataEnds);
+ 			}
+ 			Http2Headers trailers = stream.trailers;
+@@ -2357,6 +2369,12 @@ final class NettyHttp2DemuxRelay {
+ 		 */
+ 		int interimBytes;
+ 
++		/** Told about the exchange; null when the route's filters observe nothing. */
++		@Nullable ExchangeObserver observer;
++
++		/** The final response head passed. */
++		boolean responseHeadSeen;
++
+ 		/** The client's DATA and trailers towards the leg. */
+ 		final Flow requestFlow;
+ 
+@@ -2658,6 +2676,9 @@ final class NettyHttp2DemuxRelay {
+ 			}
+ 			exchange.continueAwaited = false;
+ 			exchange.requestEnded |= endStream;
++			if (exchange.observer != null && data.isReadable()) {
++				exchange.observer.requestBody(data.nioBuffer().asReadOnlyBuffer());
++			}
+ 			exchange.requestFlow.data(data, endStream);
+ 			// padding is consumed at once
+ 			return padding;
+@@ -2705,6 +2726,12 @@ final class NettyHttp2DemuxRelay {
+ 			if (exchange == null) {
+ 				return;
+ 			}
++			if (exchange.observer != null) {
++				// not exchange.reset: the upstream's stream closing sets it on a response
++				// ended too
++				exchange.observer.completed(exchange.responseWritten ? ExchangeObserver.Outcome.COMPLETE
++						: ExchangeObserver.Outcome.INCOMPLETE);
++			}
+ 			exchange.leg.streams.remove(exchange.legId);
+ 			exchange.leg.routeMeters.trackedStreams().decrement();
+ 			exchange.responseFlow.drop();
+@@ -2733,6 +2760,24 @@ final class NettyHttp2DemuxRelay {
+ 	}
+ 
+ 	/** A leg's frames: heads, DATA and resets go to the client. */
++	/** Lets the observer edit a final response head, before its budget is counted. */
++	private static void editResponseHead(ExchangeObserver observer, Http2Headers headers) {
++		CharSequence status = headers.status();
++		int code;
++		try {
++			code = status == null ? -1 : Integer.parseInt(status.toString());
++		}
++		catch (NumberFormatException e) {
++			code = -1;
++		}
++		ExchangeObserver.ResponseEdit edit = observer.responseHead(code,
++				name -> headers.getAll(name).stream().map(CharSequence::toString).toList());
++		for (String name : edit.strip()) {
++			headers.remove(AsciiString.of(name));
++		}
++		edit.add().forEach((name, value) -> headers.add(AsciiString.of(name), value));
++	}
++
+ 	private final class LegListener extends Http2FrameAdapter {
+ 
+ 		private final Leg leg;
+@@ -2786,6 +2831,12 @@ final class NettyHttp2DemuxRelay {
+ 			if (exchange == null) {
+ 				return;
+ 			}
++			if (!interim(headers) && !exchange.responseHeadSeen) {
++				exchange.responseHeadSeen = true;
++				if (exchange.observer != null) {
++					editResponseHead(exchange.observer, headers);
++				}
++			}
+ 			int bytes = headerBytes(headers);
+ 			if (interim(headers)) {
+ 				exchange.interimBytes += bytes;
+@@ -2815,6 +2866,9 @@ final class NettyHttp2DemuxRelay {
+ 				return data.readableBytes() + padding;
+ 			}
+ 			exchange.responseEnded |= endStream;
++			if (exchange.observer != null && data.isReadable()) {
++				exchange.observer.responseBody(data.nioBuffer().asReadOnlyBuffer());
++			}
+ 			exchange.responseFlow.data(data, endStream);
+ 			// padding is consumed at once
+ 			return padding;
+@@ -2961,6 +3015,8 @@ final class NettyHttp2DemuxRelay {
+ 
+ 		private @Nullable RouteAuthenticator routeAuth;
+ 
++		private @Nullable RouteFilterChain filters;
++
+ 		private @Nullable ErrorResponse errorResponse;
+ 
+ 		private AccessLogger.@Nullable Connection access;
+@@ -3023,6 +3079,11 @@ final class NettyHttp2DemuxRelay {
+ 			return this;
+ 		}
+ 
++		Builder filters(RouteFilterChain filters) {
++			this.filters = filters;
++			return this;
++		}
++
+ 		Builder routeAuth(RouteAuthenticator routeAuth) {
+ 			this.routeAuth = routeAuth;
+ 			return this;
+diff --git a/sluice-server/src/main/java/am/ik/sluice/server/proxy/ReroutingRelay.java b/sluice-server/src/main/java/am/ik/sluice/server/proxy/ReroutingRelay.java
+index 6d42af1..962b7e0 100644
+--- a/sluice-server/src/main/java/am/ik/sluice/server/proxy/ReroutingRelay.java
++++ b/sluice-server/src/main/java/am/ik/sluice/server/proxy/ReroutingRelay.java
+@@ -5,6 +5,7 @@ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.OutputStream;
+ import java.net.InetAddress;
++import java.nio.ByteBuffer;
+ import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
+ import java.util.ArrayDeque;
+@@ -28,6 +29,8 @@ import org.slf4j.LoggerFactory;
+ import am.ik.sluice.server.auth.Origin;
+ import am.ik.sluice.server.auth.RouteAuthenticator;
+ import am.ik.sluice.server.auth.Verdict;
++import am.ik.sluice.server.filter.ExchangeObserver;
++import am.ik.sluice.server.filter.RouteFilterChain;
+ import am.ik.sluice.server.route.Router;
+ import am.ik.sluice.server.tunnel.SessionRegistry;
+ import am.ik.sluice.server.tunnel.TunnelSession;
+@@ -153,6 +156,11 @@ final class ReroutingRelay {
+ 
+ 	private final RouteAuthenticator routeAuth;
+ 
++	private final RouteFilterChain filters;
++
++	/** The observer of the request whose body is being read; outbound side only. */
++	private @Nullable ExchangeObserver requestObserver;
++
+ 	private final ErrorResponse errorResponse;
+ 
+ 	private final AccessLogger.Connection access;
+@@ -252,9 +260,9 @@ final class ReroutingRelay {
+ 	@Nullable private volatile Leg current;
+ 
+ 	ReroutingRelay(DuplexPipe pipe, ConnectionHeadParser.Head head, Router router, SessionRegistry sessions,
+-			AccessControl accessControl, RouteAuthenticator routeAuth, ErrorResponse errorResponse,
+-			AccessLogger.Connection access, MeterRegistry meterRegistry, Router.Route initialRoute,
+-			TunnelSession initialSession, @Nullable InetAddress peer, Forwarding forwarding,
++			AccessControl accessControl, RouteAuthenticator routeAuth, RouteFilterChain filters,
++			ErrorResponse errorResponse, AccessLogger.Connection access, MeterRegistry meterRegistry,
++			Router.Route initialRoute, TunnelSession initialSession, @Nullable InetAddress peer, Forwarding forwarding,
+ 			ConnectionLimits.KeepAliveDeadline deadline, Duration probeInterval, ProbeSeam probeSeam, HeadSeam headSeam,
+ 			Runnable onFinish, Runnable release) {
+ 		this.pipe = pipe;
+@@ -263,6 +271,7 @@ final class ReroutingRelay {
+ 		this.sessions = sessions;
+ 		this.accessControl = accessControl;
+ 		this.routeAuth = routeAuth;
++		this.filters = filters;
+ 		this.errorResponse = errorResponse;
+ 		this.access = access;
+ 		this.meterRegistry = meterRegistry;
+@@ -320,6 +329,14 @@ final class ReroutingRelay {
+ 				public void data(byte[] bytes, int offset, int length) {
+ 					ReroutingRelay.this.onRequestData(bytes, offset, length);
+ 				}
++
++				@Override
++				public void payload(byte[] bytes, int offset, int length) {
++					ExchangeObserver observer = ReroutingRelay.this.requestObserver;
++					if (observer != null && !ReroutingRelay.this.rejected && ReroutingRelay.this.refusal == null) {
++						observer.requestBody(ByteBuffer.wrap(bytes, offset, length).asReadOnlyBuffer());
++					}
++				}
+ 			});
+ 			parser.feed(this.seedHead, 0, this.seedHead.length);
+ 			if (this.refusal != null) {
+@@ -676,7 +693,8 @@ final class ReroutingRelay {
+ 		Router.Route route = resolved.route();
+ 		Origin origin = this.forwarding.origin(ConnectionHeadParser.http1Headers(head),
+ 				ConnectionHeadParser.http1HostOf(head));
+-		Verdict verdict = this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head), origin);
++		Verdict verdict = this.filters.apply(route, ConnectionHeadParser.http1Headers(head),
++				this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head), origin));
+ 		if (!(verdict instanceof Verdict.Pass pass)) {
+ 			this.access.refused(route, ConnectionHeadParser.http1RequestOf(head), verdict);
+ 			this.refusal = this.errorResponse.refusal(ConnectionHeadParser.Head.http1(head, host), verdict);
+@@ -702,7 +720,8 @@ final class ReroutingRelay {
+ 						return;
+ 					}
+ 					route = resolved.route();
+-					verdict = this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head), origin);
++					verdict = this.filters.apply(route, ConnectionHeadParser.http1Headers(head),
++							this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head), origin));
+ 					if (!(verdict instanceof Verdict.Pass passed)) {
+ 						this.access.refused(route, ConnectionHeadParser.http1RequestOf(head), verdict);
+ 						this.refusal = this.errorResponse.refusal(ConnectionHeadParser.Head.http1(head, host), verdict);
+@@ -730,7 +749,8 @@ final class ReroutingRelay {
+ 		if (closesConnection(head)) {
+ 			leg.closing = true;
+ 		}
+-		leg.requestSent(host, request, Http1RequestParser.isUpgrade(head));
++		this.requestObserver = pass.observer();
++		leg.requestSent(host, request, Http1RequestParser.isUpgrade(head), pass.observer());
+ 		this.lastRequest = System.nanoTime();
+ 		Forwarding.Headers forwarded = this.forwarding.headers(ConnectionHeadParser.http1Headers(head),
+ 				ConnectionHeadParser.http1HostOf(head));
+@@ -853,6 +873,9 @@ final class ReroutingRelay {
+ 
+ 		final VirtualConnection connection;
+ 
++		/** The route has filters: the tracker holds and writes the response heads. */
++		final boolean holding;
++
+ 		private final Counter inbound;
+ 
+ 		private final Counter outbound;
+@@ -889,6 +912,7 @@ final class ReroutingRelay {
+ 		Leg(Router.Route route, TunnelSession session) {
+ 			this.route = route;
+ 			this.session = session;
++			this.holding = filters.appliesTo(route);
+ 			this.connection = session.open(route.address(), DataProxyServer.ALPN_HTTP_1_1, ReroutingRelay.this.peer);
+ 			this.inbound = meterRegistry.counter(METRIC_NAME, "direction", "inbound", "route", route.routeTag());
+ 			this.outbound = meterRegistry.counter(METRIC_NAME, "direction", "outbound", "route", route.routeTag());
+@@ -963,10 +987,11 @@ final class ReroutingRelay {
+ 			}
+ 		}
+ 
+-		void requestSent(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request, boolean upgrade) {
++		void requestSent(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request, boolean upgrade,
++				@Nullable ExchangeObserver observer) {
+ 			synchronized (this) {
+ 				this.sent++;
+-				this.unanswered.addLast(new Sent(host, request, upgrade));
++				this.unanswered.addLast(new Sent(host, request, upgrade, observer));
+ 				if (upgrade) {
+ 					this.upgradeAwaited = true;
+ 					this.upgradeAnswer = null;
+@@ -1087,12 +1112,21 @@ final class ReroutingRelay {
+ 		/** The leg ended: the responses it still owed never come. */
+ 		void markEnded() {
+ 			int lost;
++			List<Sent> unanswered;
+ 			synchronized (this) {
+ 				this.ended = true;
+ 				lost = this.sent - this.completed;
+ 				this.completed = this.sent;
++				unanswered = List.copyOf(this.unanswered);
++				this.unanswered.clear();
+ 				this.notifyAll();
+ 			}
++			this.tracker.finish(ExchangeObserver.Outcome.INCOMPLETE);
++			for (Sent request : unanswered) {
++				if (request.observer() != null) {
++					request.observer().completed(ExchangeObserver.Outcome.INCOMPLETE);
++				}
++			}
+ 			owedChanged(-lost);
+ 		}
+ 
+@@ -1157,7 +1191,8 @@ final class ReroutingRelay {
+ 	 * A request relayed on a leg: its host, its request line (null for one that does not
+ 	 * parse), and whether it asked for an upgrade.
+ 	 */
+-	private record Sent(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request, boolean upgrade) {
++	private record Sent(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request, boolean upgrade,
++			@Nullable ExchangeObserver observer) {
+ 
+ 		String method() {
+ 			return this.request == null ? "" : this.request.method();
+@@ -1186,8 +1221,10 @@ final class ReroutingRelay {
+ 						return; // a malformed request ended the connection
+ 					}
+ 					// written and tracked at once: a probe sees the tracker's state of
+-					// the bytes written
+-					this.writeToClient(buffer, 0, n);
++					// the bytes written; a leg holding its heads has the tracker write
++					if (!leg.holding) {
++						this.writeToClient(buffer, 0, n);
++					}
+ 					tracker.data(buffer, 0, n);
+ 				}
+ 				finally {
+@@ -1360,20 +1397,36 @@ final class ReroutingRelay {
+ 
+ 		private long remaining;
+ 
++		/** The observer of the response in progress. */
++		private @Nullable ExchangeObserver active;
++
++		/** Holding: where the bytes not yet written begin in the buffer being tracked. */
++		private int unwritten;
++
+ 		ResponseTracker(Leg leg) {
+ 			this.leg = leg;
+ 		}
+ 
++		/**
++		 * Tracks the bytes. A leg holding its response heads has them written here: a
++		 * head once complete, and edited, everything else as it is passed, always before
++		 * its response counts as completed.
++		 */
+ 		void data(byte[] bytes, int offset, int length) {
++			this.unwritten = offset;
+ 			int i = 0;
+ 			while (i < length) {
+ 				switch (this.mode) {
+ 					case HEAD -> {
++						this.flush(bytes, offset + i);
+ 						this.head.write(bytes[offset + i]);
+ 						boolean lineEnded = bytes[offset + i] == '\n';
+ 						i++;
++						this.unwritten = offset + i;
+ 						if (this.head.size() > Http1RequestParser.MAX_HEAD) {
++							byte[] held = this.head.toByteArray();
+ 							this.head.reset();
++							this.emit(held);
+ 							this.untracked();
+ 						}
+ 						else if (lineEnded) {
+@@ -1382,9 +1435,11 @@ final class ReroutingRelay {
+ 					}
+ 					case BODY -> {
+ 						int n = (int) Math.min(this.remaining, length - i);
++						this.observe(bytes, offset + i, n);
+ 						i += n;
+ 						this.remaining -= n;
+ 						if (this.remaining == 0) {
++							this.flush(bytes, offset + i);
+ 							this.drain(Mode.HEAD);
+ 						}
+ 					}
+@@ -1402,6 +1457,7 @@ final class ReroutingRelay {
+ 					}
+ 					case CHUNK_DATA -> {
+ 						int n = (int) Math.min(this.remaining, length - i);
++						this.observe(bytes, offset + i, n);
+ 						i += n;
+ 						this.remaining -= n;
+ 						if (this.remaining == 0) {
+@@ -1424,15 +1480,49 @@ final class ReroutingRelay {
+ 							this.untracked();
+ 						}
+ 						else if (lineEnded && this.onTrailerLine()) {
++							this.flush(bytes, offset + i);
+ 							this.drain(Mode.HEAD);
+ 						}
+ 					}
+-					case UNFRAMED -> i++; // an unframed body ends at EOF only
++					case UNFRAMED -> { // an unframed body ends at EOF only
++						this.observe(bytes, offset + i, length - i);
++						i = length;
++					}
+ 					case PASS -> {
++						this.flush(bytes, offset + length);
+ 						return;
+ 					}
+ 				}
+ 			}
++			this.flush(bytes, offset + length);
++		}
++
++		private void flush(byte[] bytes, int end) {
++			if (this.leg.holding && end > this.unwritten) {
++				writeToClient(bytes, this.unwritten, end - this.unwritten);
++			}
++			this.unwritten = end;
++		}
++
++		private void emit(byte[] bytes) {
++			if (this.leg.holding) {
++				writeToClient(bytes, 0, bytes.length);
++			}
++		}
++
++		private void observe(byte[] bytes, int offset, int length) {
++			if (this.active != null) {
++				this.active.responseBody(ByteBuffer.wrap(bytes, offset, length).asReadOnlyBuffer());
++			}
++		}
++
++		/** The response in progress ended; its observer is told once. */
++		void finish(ExchangeObserver.Outcome outcome) {
++			ExchangeObserver observer = this.active;
++			this.active = null;
++			if (observer != null) {
++				observer.completed(outcome);
++			}
+ 		}
+ 
+ 		/**
+@@ -1450,8 +1540,13 @@ final class ReroutingRelay {
+ 		 * ({@link #lose}).
+ 		 */
+ 		void ended() {
++			if (this.head.size() > 0) {
++				this.emit(this.head.toByteArray());
++			}
+ 			if (this.mode != Mode.PASS && !this.atResponseStart()) {
+ 				this.leg.responseCompleted();
++				this.finish(this.mode == Mode.UNFRAMED ? ExchangeObserver.Outcome.COMPLETE
++						: ExchangeObserver.Outcome.INCOMPLETE);
+ 				this.mode = Mode.PASS;
+ 			}
+ 		}
+@@ -1468,16 +1563,30 @@ final class ReroutingRelay {
+ 			ReroutingRelay.this.clientWaits.update();
+ 			int status = statusOf(bytes);
+ 			if (status < 0) {
++				this.emit(bytes);
+ 				this.untracked();
+ 				return;
+ 			}
+ 			if (status >= 100 && status < 200 && status != 101) {
++				this.emit(bytes);
+ 				return; // interim: the final response follows on the same stream
+ 			}
+ 			if (closesConnection(bytes)) {
+ 				this.leg.closing = true;
+ 			}
+ 			Sent request = this.leg.nextRequest();
++			this.active = request == null ? null : request.observer();
++			if (this.active != null) {
++				byte[] original = bytes;
++				ExchangeObserver.ResponseEdit edit = this.active.responseHead(status,
++						name -> ConnectionHeadParser.http1HeaderValues(original, name));
++				// the framing is read from the head as the upstream sent it: an edit
++				// cannot touch it
++				this.emit(ConnectionHeadRewriter.withHeaders(bytes, edit.strip(), edit.add()));
++			}
++			else {
++				this.emit(bytes);
++			}
+ 			@Nullable String method = request == null ? null : request.method();
+ 			boolean switched = status == 101 || "CONNECT".equals(method) && status >= 200 && status < 300;
+ 			if (request != null && request.upgrade()) {
+@@ -1571,6 +1680,7 @@ final class ReroutingRelay {
+ 				this.leg.upgradeAnswered(true);
+ 			}
+ 			this.leg.responseCompleted();
++			this.finish(ExchangeObserver.Outcome.COMPLETE);
+ 		}
+ 
+ 		private static int statusOf(byte[] head) {
+diff --git a/sluice-wicket-runtime-wasi/examples/Cargo.lock b/sluice-wicket-runtime-wasi/examples/Cargo.lock
+index f74b722..b766ad4 100644
+--- a/sluice-wicket-runtime-wasi/examples/Cargo.lock
++++ b/sluice-wicket-runtime-wasi/examples/Cargo.lock
+@@ -34,6 +34,13 @@ dependencies = [
+  "wit-bindgen",
+ ]
+ 
++[[package]]
++name = "filter"
++version = "0.0.1-SNAPSHOT"
++dependencies = [
++ "wit-bindgen",
++]
++
+ [[package]]
+ name = "foldhash"
+ version = "0.2.0"
+diff --git a/sluice-wicket-runtime-wasi/examples/filter/Cargo.toml b/sluice-wicket-runtime-wasi/examples/filter/Cargo.toml
+new file mode 100644
+index 0000000..f43f52c
+--- /dev/null
++++ b/sluice-wicket-runtime-wasi/examples/filter/Cargo.toml
+@@ -0,0 +1,11 @@
++[package]
++name = "filter"
++version = "0.0.1-SNAPSHOT"
++edition = "2024"
++publish = false
++
++[lib]
++crate-type = ["cdylib"]
++
++[dependencies]
++wit-bindgen = { workspace = true }
+diff --git a/sluice-wicket-runtime-wasi/examples/filter/src/lib.rs b/sluice-wicket-runtime-wasi/examples/filter/src/lib.rs
+new file mode 100644
+index 0000000..123787f
+--- /dev/null
++++ b/sluice-wicket-runtime-wasi/examples/filter/src/lib.rs
+@@ -0,0 +1,140 @@
++// Spike: a route's filter as a guest. Forwards each request to one upstream
++// (wasi:http/client), its heads edited and both bodies streamed through a tap,
++// or answers it itself: what a gateway filter does, in the wicket's sandbox.
++//
++// Build (from `examples/`): FILTER_UPSTREAM=<host:port> cargo build --release -p filter
++wit_bindgen::generate!({
++    path: "../../wit",
++    inline: "
++        package sluice:filter;
++
++        world filter {
++            import wasi:http/client@0.3.0;
++            import wasi:http/types@0.3.0;
++            export wasi:http/handler@0.3.0;
++        }
++    ",
++    features: ["clocks-timezone"],
++    generate_all,
++});
++
++use std::cell::Cell;
++use std::rc::Rc;
++
++use exports::wasi::http::handler::Guest;
++use wasi::http::client;
++use wasi::http::types::{ErrorCode, Headers, Request, Response, Scheme};
++use wit_bindgen::{StreamReader, StreamResult, StreamWriter};
++
++const UPSTREAM: &str = match option_env!("FILTER_UPSTREAM") {
++    Some(upstream) => upstream,
++    None => "127.0.0.1:18099",
++};
++
++struct Component;
++
++impl Guest for Component {
++    async fn handle(request: Request) -> Result<Response, ErrorCode> {
++        let path = request.get_path_with_query().unwrap_or_else(|| "/".into());
++        if path.starts_with("/blocked") {
++            return answer(451, b"blocked\n".to_vec());
++        }
++        let method = request.get_method();
++        let headers = request.get_headers().clone();
++        let _ = headers.delete("x-secret");
++        let _ = headers.append("x-filtered", b"yes");
++        let (request_done, request_res) = wit_future::new(|| Ok(()));
++        let (body, trailers) = Request::consume_body(request, request_res);
++        let (request_body, request_bytes) = tapped(body);
++        let (outgoing, _transmit) = Request::new(headers, Some(request_body), trailers, None);
++        let _ = outgoing.set_method(&method);
++        let _ = outgoing.set_scheme(Some(&Scheme::Http));
++        let _ = outgoing.set_authority(Some(UPSTREAM));
++        let _ = outgoing.set_path_with_query(Some(&path));
++
++        let response = client::send(outgoing).await?;
++        drop(request_done);
++
++        let status = response.get_status_code();
++        let headers = response.get_headers().clone();
++        let _ = headers.delete("x-upstream-private");
++        let _ = headers.append("x-observed", status.to_string().as_bytes());
++        let (response_done, response_res) = wit_future::new(|| Ok(()));
++        let (body, trailers) = Response::consume_body(response, response_res);
++        let (response_body, response_bytes) = tapped(body);
++        let (filtered, _transmit) = Response::new(headers, Some(response_body), trailers);
++        let _ = filtered.set_status_code(status);
++        wit_bindgen::spawn_local(async move {
++            let _keep = response_done;
++            response_bytes.ended.wait().await;
++            eprintln!(
++                "filter: {path} -> {status} request={} response={}",
++                request_bytes.count.get(),
++                response_bytes.count.get()
++            );
++        });
++        Ok(filtered)
++    }
++}
++
++export!(Component);
++
++/// The bytes a tap passed, and its end.
++struct Tap {
++    count: Rc<Cell<u64>>,
++    ended: Ended,
++}
++
++struct Ended(Rc<Cell<Option<StreamReader<u8>>>>);
++
++impl Ended {
++    /// Waits for the tap's end: its signal stream closing.
++    async fn wait(&self) {
++        if let Some(mut signal) = self.0.take() {
++            let _ = signal.read(Vec::with_capacity(1)).await;
++        }
++    }
++}
++
++/// Streams `from` through a counting pump.
++fn tapped(mut from: StreamReader<u8>) -> (StreamReader<u8>, Tap) {
++    let (mut to, out) = wit_stream::new();
++    let (signal_tx, signal_rx): (StreamWriter<u8>, StreamReader<u8>) = wit_stream::new();
++    let count = Rc::new(Cell::new(0));
++    let counted = count.clone();
++    wit_bindgen::spawn_local(async move {
++        let _signal = signal_tx; // dropped at the end: the signal
++        let mut chunk = Vec::with_capacity(16 * 1024);
++        loop {
++            let (status, read) = from.read(chunk).await;
++            match status {
++                StreamResult::Complete(n) => {
++                    counted.set(counted.get() + n as u64);
++                    let rest = to.write_all(read).await;
++                    if !rest.is_empty() {
++                        break;
++                    }
++                    chunk = Vec::with_capacity(16 * 1024);
++                }
++                StreamResult::Dropped | StreamResult::Cancelled => break,
++            }
++        }
++    });
++    let ended = Ended(Rc::new(Cell::new(Some(signal_rx))));
++    (out, Tap { count, ended })
++}
++
++fn answer(status: u16, payload: Vec<u8>) -> Result<Response, ErrorCode> {
++    let headers = Headers::new();
++    let _ = headers.append("content-type", b"text/plain");
++    let (mut body_tx, body_rx) = wit_stream::new();
++    let (trailers_tx, trailers_rx) = wit_future::new(|| Ok(None));
++    let (response, _transmit) = Response::new(headers, Some(body_rx), trailers_rx);
++    let _ = response.set_status_code(status);
++    wit_bindgen::spawn_local(async move {
++        let _ = body_tx.write_all(payload).await;
++        drop(body_tx);
++        let _ = trailers_tx.write(Ok(None)).await;
++    });
++    Ok(response)
++}
