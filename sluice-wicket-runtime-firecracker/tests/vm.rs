@@ -412,7 +412,15 @@ async fn every_route_serves_http_through_the_tunnel() {
         let rootfs = dir.0.join("pool.ext4");
         let vms = || (!jailed).then(|| wicket.vms_on(&rootfs));
         let address = dial_address(&target("pool.local"));
-        let adjusted = adjusted_route(&mut tunnel, &wicket, &config, address, &mut conn_id, vms);
+        let adjusted = adjusted_route(
+            &mut tunnel,
+            &wicket,
+            &config,
+            address,
+            &mut feed,
+            &mut conn_id,
+            vms,
+        );
         assert!(
             tokio::time::timeout(HANG, adjusted).await.is_ok(),
             "pool.local: adjusted: hung; {}",
@@ -1340,6 +1348,10 @@ async fn never_listening_app(
 /// How long a route's VM may take to come back.
 const RESTART: Duration = Duration::from_secs(60);
 
+/// `boot-ms` of the VMs told to end: how long the wicket looks at a port refusing. Above a boot on
+/// a Mac (about 1s alone, nested); a daemon left listening is checked past it.
+const LOOKING: Duration = Duration::from_secs(5);
+
 /// The listing of `host`.
 async fn listed(wicket: &Wicket, host: &str) -> serde_json::Value {
     let at = wicket.console();
@@ -1386,7 +1398,7 @@ async fn restarting_app(
         "owner": "cf",
         "hosts": ["crash.local"],
         "component": {"sha256": sha256, "name": "app.ext4"},
-        "sandbox": {"boot-ms": 1000, "env": {"RUN": "1"}},
+        "sandbox": {"boot-ms": LOOKING.as_millis() as u64, "env": {"RUN": "1"}},
     });
     let body = Bytes::from(app.to_string());
     let (status, put) = console(at, "PUT", "/api/apps/crash", true, body).await;
@@ -1411,7 +1423,7 @@ async fn restarting_app(
 
     let told = route.post(next(), "/exit?listening=1", "").await;
     assert_eq!(told, "exited, listening\n");
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(LOOKING + Duration::from_millis(500)).await;
     let same = route.get(next(), "/").await;
     assert_eq!(field(&same, "boot id"), boot_id, "its VM serves on");
     let listed = restarted(wicket, "crash.local", 0).await;
@@ -1615,14 +1627,39 @@ async fn again(
     sender: &mut hyper::client::conn::http1::SendRequest<Full<Bytes>>,
     host: &str,
 ) -> String {
-    let request = hyper::Request::get("/")
+    again_at(sender, host, "/").await
+}
+
+/// [`again`], at `path`.
+async fn again_at(
+    sender: &mut hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+    host: &str,
+    path: &str,
+) -> String {
+    let request = hyper::Request::get(path)
         .header("host", host)
         .body(Full::new(Bytes::new()))
         .unwrap();
     let response = sender.send_request(request).await.unwrap();
-    assert_eq!(response.status(), 200, "{host}: GET /");
+    assert_eq!(response.status(), 200, "{host}: GET {path}");
     let body = response.into_body().collect().await.unwrap().to_bytes();
     String::from_utf8_lossy(&body).into_owned()
+}
+
+/// The instance index of the VM of `host` whose stdout on the feed says `line`.
+async fn instance_saying(feed: &mut FeedStream, host: &str, line: &str) -> String {
+    loop {
+        let feed_message::Body::Event(event) = feed.next().await else {
+            continue;
+        };
+        let field = |name: &str| {
+            let field = event.fields.iter().find(|field| field.name == name);
+            field.map_or("", |field| field.value.as_str())
+        };
+        if event.route_key == host && event.kind == "stdout" && field("line") == line {
+            return field("instance").to_string();
+        }
+    }
 }
 
 /// Waits for the listing of `host` to hold `what`; that listing.
@@ -1663,12 +1700,14 @@ fn advertised_at(advertised: &sluice_wicket_tunnel::proto::Advertise, host: &str
 /// A route of the config file, its numbers changed (its target names them, so another one is
 /// advertised): the VMs it has stay on their snapshot, what they serve counting on, a VM cloned
 /// for a higher `warm`. Past a lower `vms` a VM takes no more connections, serves the ones it has
-/// and is gone once it served none for `keep-ms`. `vms` tells the wicket's VMs of it, unjailed.
+/// and is gone once it served none for `keep-ms`: the lower index stays. `vms` tells the wicket's
+/// VMs of it, unjailed.
 async fn adjusted_route(
     tunnel: &mut ServerTunnel,
     wicket: &Wicket,
     config: &Path,
     address: String,
+    feed: &mut FeedStream,
     conn_id: &mut i64,
     vms: impl Fn() -> Option<Vec<i32>>,
 ) {
@@ -1689,7 +1728,12 @@ async fn adjusted_route(
     let before = vms();
     let (mut held, first, _) = on(tunnel, &address).held(next(), "").await;
     let boot_id = field(&first, "boot id: ").to_string();
-    let count = served(&[first])[0];
+    let logged = again_at(&mut held, HOST, "/log").await;
+    let count = served(&[logged])[0];
+    // what shrinking left it, either: a request has the pool start one more ahead, the VM
+    // serving none the longest going
+    let line = format!("GET /log, request {count} of boot id {boot_id}");
+    let index = instance_saying(feed, HOST, &line).await;
 
     let written = std::fs::read_to_string(config).unwrap();
     let more = written.replace("vms: 2, warm: 1", "vms: 3, warm: 2");
@@ -1724,14 +1768,19 @@ async fn adjusted_route(
         [2],
         "its connection finishes"
     );
+    // the VM cloned for `other` took the lowest index free
+    let (within, stays, mut past, past_count) = match index.as_str() {
+        "0" => (held, count + 2, other, 2),
+        _ => (other, 2, held, count + 2),
+    };
     // the next ones on the VM within the limit, whatever it holds
     let (third, answer, _) = on(tunnel, &address).held(next(), "").await;
-    assert_eq!(served(&[answer]), [count + 3]);
+    assert_eq!(served(&[answer]), [stays + 1]);
     // the one serving nothing goes, the one holding a connection stays
     listed_as(wicket, HOST, pooled(2)).await;
     tokio::time::sleep(KEEP).await;
-    assert_eq!(served(&[again(&mut other, HOST).await]), [3]);
-    drop((held, other, third));
+    assert_eq!(served(&[again(&mut past, HOST).await]), [past_count + 1]);
+    drop((within, past, third));
     let route = listed_as(wicket, HOST, pooled(1)).await;
     assert_eq!(route["options"]["vms"], "1", "{route}");
     if let (Some(three), Some(after)) = (three, vms()) {
@@ -1739,7 +1788,7 @@ async fn adjusted_route(
         assert!(three.contains(&after[0]), "{three:?}: {after:?}");
     }
     let last = on(tunnel, &address).get(next(), "/").await;
-    assert_eq!(served(&[last]), [count + 4], "the VM that stays");
+    assert_eq!(served(&[last]), [stays + 2], "the VM that stays");
 }
 
 /// An app's numbers of a pool changed, by its PUT: the target stays, so nothing is advertised,
@@ -1921,7 +1970,8 @@ async fn restarting_pool(
 ) {
     const HOST: &str = "ending.local";
     let at = wicket.console();
-    let sandbox = serde_json::json!({"mode": "pool", "vms": 1, "boot-ms": 1000});
+    let sandbox =
+        serde_json::json!({"mode": "pool", "vms": 1, "boot-ms": LOOKING.as_millis() as u64});
     let body = app_body(HOST, sha256, sandbox);
     let (status, put) = console(at, "PUT", "/api/apps/ending", true, body).await;
     assert_eq!(status, 200, "{put}; {}", wicket.log());
@@ -1947,7 +1997,7 @@ async fn restarting_pool(
     // a daemon left listening: its VM serves on
     let told = route.post(next(), "/exit?listening=1", "").await;
     assert_eq!(told, "exited, listening\n");
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(LOOKING + Duration::from_millis(500)).await;
     let same = route.get(next(), "/").await;
     assert_eq!(field(&same, "boot id: "), boot_id);
     assert_ne!(served(&[same]), [1], "its VM serves on");
@@ -3076,8 +3126,9 @@ impl Route<'_> {
         drop((p, q));
     }
 
-    /// A pool's VMs on `rootfs`, of `wicket`, killed: the request after it gets a VM in their
-    /// place, of the instance index they freed.
+    /// A pool's VMs on `rootfs`, of `wicket`, killed: a VM in their place, of an instance index
+    /// they freed, serves the request after it. A request sooner may have a VM started for it
+    /// besides.
     async fn replaced(
         &self,
         conn_id: &mut i64,
@@ -3087,6 +3138,10 @@ impl Route<'_> {
     ) {
         let killed = wicket.vms_on(rootfs);
         assert!(!killed.is_empty(), "{}: no VM", self.host);
+        let mark = wicket.log().len();
+        let restarts = listed(wicket, self.host).await["vms"]["restarts"]
+            .as_u64()
+            .unwrap();
         for &vm in &killed {
             wicket.signal("KILL", vm);
         }
@@ -3101,6 +3156,10 @@ impl Route<'_> {
         while !killed.iter().all(ended) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        listed_as(wicket, self.host, |route| {
+            route["vms"]["restarts"] == restarts + 1 && pooled(1)(route)
+        })
+        .await;
         *conn_id += 1;
         let answer = self.get(*conn_id, "/log").await;
         assert_eq!(
@@ -3113,19 +3172,10 @@ impl Route<'_> {
             "GET /log, request 1 of boot id {}",
             field(&answer, "boot id: ")
         );
-        loop {
-            let feed_message::Body::Event(event) = feed.next().await else {
-                continue;
-            };
-            let field = |name: &str| {
-                let field = event.fields.iter().find(|field| field.name == name);
-                field.map_or("", |field| field.value.as_str())
-            };
-            if event.route_key == self.host && event.kind == "stdout" && field("line") == line {
-                assert_eq!(field("instance"), "0", "{}: {event:?}", self.host);
-                return;
-            }
-        }
+        // whichever index the pool's shrinking left them
+        let index = instance_saying(feed, self.host, &line).await;
+        let freed = format!("route {}: VM {index}: ", self.host);
+        said_after(wicket, mark, &freed).await;
     }
 
     /// Connections held on the route, dropped until one gets a VM started for it (its

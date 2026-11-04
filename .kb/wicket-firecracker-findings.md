@@ -246,6 +246,7 @@ as a VM's PSS, plus the snapshot on the tmpfs (`du`).
   what `Full` takes from the start
 - **What a clone writes is there twice**, in the file and privately: the difference of a pool of one
   from a booted VM, +18 MiB (sample), +31 (Go), +124 (the JVM)
+- **aarch64 is alike**: 53 MiB at 1 GiB, 180 at 4 ([aarch64](#aarch64))
 
 ## A scale
 
@@ -393,6 +394,13 @@ through the image, and a sluice server on the Mac serving a booted VM and clones
   ... for cache level 1`): the guest then lacks the host's cache topology (its device
   tree's cache nodes, `CLIDR_EL1`), and a restore its CPU manufacturer check (`MIDR_EL1`,
   a warning on a mismatch). The jail's copy keeps a jailed VM's CPU an unjailed one's.
+- **A `Diff` snapshot holds what the guest wrote, and restores as it was**: the sample guest in a
+  pool of one, 53 MiB of a `mem=1024` file, 180 of a `mem=4096`, clones serving on (2,000 requests,
+  the file 53 MiB after them). A Python guest writing a heap of 100 or 300 MiB before the snapshot:
+  a clone's heap hashes as the same program's under Docker, a mapping it never touched reads as
+  zeros. The file holds what the guest freed too: 381 and 987 MiB, the heap's temporary copies.
+- **Touching much memory is slow, with or without a snapshot**: a request reading and copying that
+  100 MiB heap took 4-14s on a clone, up to 27s on a booted VM; at 300 MiB past 30s on a clone.
 
 On a Mac the wicket listens once every VM it restores has booted: 9.6s here with a Node.js image,
 3.7s with a Go one.
