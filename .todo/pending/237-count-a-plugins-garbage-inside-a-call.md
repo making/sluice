@@ -4,7 +4,7 @@ Difficulty: Medium
 
 Pending: this asks something of another project, so its maintainer starts it. An agent does not open an issue or a pull request there unasked.
 
-`PluginHeap` takes all a call allocates as held until the call has returned: the census needs the frames' references, and `StackFrame`'s `localRef` is package-private in Endive. So one call may allocate what is free of `max-memory`, garbage or not. `sluice-client/src/test/guest/rontolisp` shows what that costs: rontolisp's `search` over a 64KiB body allocates past the default 16MB in one call, all garbage (the numbers: rontolisp's `.todo/i60`).
+`PluginHeap` takes all a call allocates as held until the call has returned: the census needs the frames' references, and `StackFrame`'s `localRef` is package-private in Endive. So one call may allocate what is free of `max-memory`, garbage or not. rontolisp's `search` over a 64KiB body did, past the default 16MB in one call, until rontolisp allocated less there (its todo i60, removed). No plugin known here hits this now, which makes it the smaller reason.
 
 It also rests on `ExecutionListener`, which Endive marks experimental and calls on every instruction. And Endive keeps an `i8` of a `WasmArray` in a `long`, so a string costs 8 times its bytes.
 

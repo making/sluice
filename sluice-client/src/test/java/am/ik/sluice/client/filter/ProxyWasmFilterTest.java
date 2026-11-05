@@ -214,25 +214,19 @@ class ProxyWasmFilterTest {
 	}
 
 	/**
-	 * What a real compiler makes of it. rontolisp's start allocates and drops an array of
-	 * 16Mi elements, 128MiB here, which is what its limit is for: what it holds later
-	 * goes past that as well, each array 8MiB, and the VM started anew does not.
+	 * What a real compiler makes of it, at the default limit: of the arrays it holds,
+	 * 8MiB each, the second goes past that, and the VM started anew does not.
 	 */
 	@Test
 	void aPluginInLispRunsWithinItsMemory() throws Exception {
-		UpstreamFilter filter = filter(limits(LISP_PLUGIN).maxMemory(DataSize.ofMegabytes(129)).build(),
-				FilterConfig.builder().name("plugin").build());
+		UpstreamFilter filter = filter(LISP_PLUGIN);
 		String response = "HTTP/1.1 204 No Content\r\n\r\n";
 		String stamped = "HTTP/1.1 204 No Content\r\nx-filtered: yes\r\n\r\n";
 
 		assertThat(FilterTests.relayed(filter, "GET", "/", response, 1024)).isEqualTo(stamped);
 		assertThat(FilterTests.relayed(filter, "GET", "/hello", response, 1024))
 			.isEqualTo("HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nHello from Lisp\n");
-		assertThat(FilterTests.counters(this.registry)).isEmpty();
-
-		for (int i = 0; i < 16; i++) {
-			assertThat(FilterTests.relayed(filter, "GET", "/hold", response, 1024)).isEqualTo(stamped);
-		}
+		assertThat(FilterTests.relayed(filter, "GET", "/hold", response, 1024)).isEqualTo(stamped);
 		assertThat(FilterTests.counters(this.registry)).isEmpty();
 		assertThat(FilterTests.relayed(filter, "GET", "/hold", response, 1024)).isEqualTo(response);
 		assertThat(FilterTests.counters(this.registry)).isEqualTo(Map.of("failures plugin head", 1L));

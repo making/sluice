@@ -88,14 +88,7 @@ java -jar rontolisp-0.1.0-SNAPSHOT-exec.jar my_plugin.lisp -o my_plugin.wasm --n
 ./rontolisp-linux-amd64 my_plugin.lisp -o my_plugin.wasm --no-wasi --optimize=size
 ```
 
-Such a module allocates and drops an array of 16Mi elements as it starts, 128MiB here, and does not start at the default `max-memory`. An instance's `max-memory` comes off the client's connection limit, so use one instance, on a heap of 512MiB or more:
-
-```properties
-sluice.client.filters.my-plugin.max-memory=129MB
-sluice.client.filters.my-plugin.vms=1
-```
-
-Its runtime costs more than a filter's own code here: `search` over a body passes the default `call-timeout` from a few tens of KiB, where a typed loop over `get-buffer-octets` takes about a tenth of that. A plugin with a test: `sluice-client/src/test/guest/rontolisp`.
+It runs at the default limits. Its runtime costs more than a filter's own code here: holding a body and searching it with `search` passes the default `call-timeout` from about 1MiB. A plugin with a test: `sluice-client/src/test/guest/rontolisp`.
 
 ## Define and use it
 
