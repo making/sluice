@@ -71,7 +71,7 @@ sluice.client.upstream[0].filters[0].args.value=a
 
 ## Memory
 
-A filtered connection buffers up to 256KiB on top of its 293KiB (`UpstreamFilterPipe.CONNECTION_BYTES`): a head being read each way, the heads of the requests awaiting responses (a pipeline past 4 of them or 64KiB waits before its filters are called, holding the tunnel's flow control, and the wait ends with the responses), the output waiting for the relay (past 64KiB it charges the tunnel budget as it is written, or fails). What it reads of the upstream at once is below that, so what merely passes never depends on the budget. While it waits, it reads nothing of the tunnel: the client's end reaches the upstream only after, so a client gone is held until the upstream answers, as an unfiltered connection is when the upstream ignores its end. A route's plugin adds up to 256KiB more in the host: what it keeps of each head's fields, of at most 256 fields each and 5 streams. With a filter on any route every connection counts the most of these in the derived limit, and the plugins' `vms x max-memory` come off the bytes first: an instance's memory is taken as it grows, at worst to that. `max-connections` set, the count alone limits, as before.
+A filtered connection buffers up to 256KiB on top of its 293KiB (`UpstreamFilterPipe.CONNECTION_BYTES`): a head being read each way, the heads of the requests awaiting responses (a pipeline past 4 of them or 64KiB waits before its filters are called, holding the tunnel's flow control, and the wait ends with the responses), the output waiting for the relay (past 64KiB it charges the tunnel budget as it is written, or fails). What it reads of the upstream at once is below that, so what merely passes never depends on the budget. While it waits, it reads nothing of the tunnel: the client's end reaches the upstream only after, so a client gone is held until the upstream answers, as an unfiltered connection is when the upstream ignores its end. A route's plugin adds up to 256KiB more in the host: what it keeps of each head's fields, of at most 256 fields each and 5 streams. With a filter on any route every connection counts the most of these in the derived limit, and the plugins' `vms x max-memory` come off the bytes first: an instance's memory, its objects and tables with it, is taken as it grows, at worst to that. `max-connections` set, the count alone limits, as before.
 
 What a filter holds of a body charges the tunnel budget, not the limit: most hold nothing, and a body worth holding should not cost every connection its size. A hold that does not fit gives up: `include-usage` passes the body unchanged, a plugin fails. Windows shrink under the same budget, which is what they do under load anyway.
 
@@ -99,12 +99,27 @@ Decided of what the spike left open:
 - **A stream stays on its VM**, one call at a time: a plugin stuck for its `call-timeout` holds the other streams of that VM.
 - **A metric's tags are in its name** (`name;key=value`), a convention of ours a plugin would not carry to Envoy.
 - **The allocator** is exported as `malloc` by the Rust SDK on `wasm32-unknown-unknown` and as `proxy_on_memory_allocate` elsewhere: both are taken, as Envoy's host does. The test plugins cover one each.
+- **A plugin's objects** (Wasm GC) are counted, not refused: rontolisp compiles filters to them, on a linear memory for the ABI, and Envoy runs those. Its no-GC backend leaves `defclass`, `handler-case` and `car` behind, too high a price for a filter's author. `PluginHeap` is what makes this safe; see "Objects on the heap".
 
-Guests run on platform threads, the connection's virtual thread waiting unmounted: with a guest spinning on every processor, a virtual thread still started at once. The interpreter checks for an interrupt at each branch and call, which `call-timeout` relies on; a host call's work is bounded by itself, so a guest in a loop of them still meets a branch. What a guest makes the host hold is bounded: a head's fields, a metric's definition, a body by `max-body` and the budget. Not bounded: a module declaring a huge table at instantiation; modules are chosen by the operator.
+Guests run on platform threads, the connection's virtual thread waiting unmounted: with a guest spinning on every processor, a virtual thread still started at once. The interpreter checks for an interrupt at each branch and call, which `call-timeout` relies on; a host call's work is bounded by itself, so a guest in a loop of them still meets a branch. What a guest makes the host hold is bounded: a head's fields, a metric's definition, a body by `max-body` and the budget.
 
 The SDKs fail on a header that is not UTF-8. A client must not be able to do that, so a plugin reads replacement characters while the line on the wire stays as it came.
 
 A plugin is read from a Spring resource location, once at the start, under a deadline: most resources know no timeout of their own. The bytes read are the bytes checked and parsed. A location other than a file or the class path needs its `sha256`, as Envoy's remote sources do.
+
+### Objects on the heap
+
+Endive allocates a module's Wasm GC objects as JVM objects (`new long[len]` in `ARRAY_NEW_DEFAULT`) and counts nothing, so `max-memory` alone bounded linear memory, and the connection limit derived from it meant little. A hand-written plugin holding an array per response at `max-memory=128KB` took a 256MiB heap to 250MiB and out of memory, every run. The VM was discarded and the heap came back, but in 2 of 5 runs the error had hit other threads for good: the watchdog, after which `call-timeout` stopped nothing; the tunnel's sender, losing 125 of 901 requests on an unfiltered route; Tomcat's poller, after which `/actuator/health` did not answer.
+
+`PluginHeap` charges each allocation before it happens, from Endive's `ExecutionListener`, and refuses past the limit by failing the plugin. It counts what Endive's objects take on a 64-bit JVM, rounded up. A reference slot pays for the `WasmI31Ref` it may hold, one at a time, so boxing in a loop charges nothing. A census from the globals and tables, between calls when no frame holds anything, replaces what was charged by what is reachable: a bound, not a measure, and a root missed would only loosen it. It runs once what was charged since passes what it found last, or a call might not fit, so its work stays in proportion to what was allocated.
+
+- Why not the JVM's counters: `getThreadAllocatedBytes` reports after the allocation, so it cannot stop an array of 128MiB, and it counts allocated, not held.
+- The cost: the listener runs on every instruction, of a module with GC types or a growable table only, so a plugin of the Rust SDK has none. With and without it, in a prototype: within the runs' spread (below). The census took 10ms over 4000 exchanges of `http_headers` in Lisp.
+- The limit: the frames of a running call cannot be read (`StackFrame.localRef` is package-private), so one call may allocate only what is free, garbage or not.
+- The listener is experimental in Endive. A hook on allocation would be better; that, and the limit above, are for Endive to answer.
+- A module's tables count from its instantiation: past `max-memory` it is refused at the client's start.
+
+Reporting out of memory can run out of it too, which ended the watchdog from inside its own `catch`. Now that goes unreported instead.
 
 ## Measurements
 
@@ -128,6 +143,22 @@ So the built-in costs next to nothing on top of the relay's own work, and holds 
 
 The ratio, about 300, is the guest's scanning in the interpreter: a guest doing nothing costs 15ms for those 2000 events. The interpreter on a native image is about 1.5 times slower than on a JVM warmed for a few hundred calls. Endive's runtime compiler is documented as possibly unsupported on a native image, and its build time compiler cannot take a module added later: neither was tried. The image grows by about 2MB.
 
+### A plugin in Lisp
+
+rontolisp's filters on its SDK (`--optimize=size`, its release of 2026-11-05) against the Rust SDK's examples they follow. In-process, a JVM per plugin warmed for 3000 exchanges, on Linux x86_64 under another build's load, so a spread and not a figure:
+
+| Per exchange, p50 | Rust | Lisp |
+|---|---|---|
+| `http_body`, 5 bytes of body | 0.6-0.7ms | 1.1-1.6ms |
+| `http_headers`, logging each field, the log at `WARN` | 1.4-2.2ms | 20-38ms |
+| Holding a body of 64KiB and searching it, best of 5 | 17ms | 1.5-2.8s (`--optimize`, `--optimize=size`) |
+| The same with `get-buffer` alone | | 47ms |
+| With `get-buffer-octets` and a typed loop | | 218ms |
+
+`http_headers` allocates 350-390KiB per exchange through the run-time `format`. `search` allocates about 2 structs per byte of the body, all garbage: past the default `max-memory` in one call. What stays reachable is 2-6KiB. A start takes 0.3-0.8s on a cold JVM, the same as Rust's within the spread, and 0.1-0.2s more with the array of 16Mi elements every such module allocates and drops first, for wasmtime's collector: 128MiB here, as Endive keeps an `i8` in a `long`.
+
+That array is what makes such a plugin expensive to run: `max-memory=129MB` at the default `vms=4` took 516MiB off a 1GiB heap, leaving a connection limit of 1, and 11 of 12 requests at once got `502`. With `vms=1`: a limit of 120 on 512MiB and none refused, a limit of 1 on 256MiB.
+
 ## Verified
 
 - `sluice-it` whole with a filter observing both bodies on every HTTP/1.1 upstream connection (a temporary patch, not kept): 696 tests, 3 fail, all the `partial-head` parameter of `HalfCloseProbeE2ETest` (2) and `ProbeResponseRaceE2ETest` (1), which assert a partial head reaches the client before it is complete. A filtered route holds a response head until complete, by design.
@@ -135,4 +166,6 @@ The ratio, about 300, is the guest's scanning in the interpreter: a guest doing 
 - The native client on Linux by hand: the counters of each API, JSON and SSE; `include-usage`; a plugin over http with its `sha256`, a wrong one and none refusing the start; an `https://` upstream, an h2c client getting `421` with no `force-http1` set.
 - Misbehaving plugins, on a native image too: an endless loop, a trap, memory exhausted, a framing header edited, CRLF in a value, fields added for good, a malformed map. The response passes unchanged, a failure is counted, the VM starts anew.
 - An independent review of this code found what the tests had not, each with a test now: a body's framing lost to a VM failing between its head and its body (request smuggling), a pipeline waiting for good once the responses ended (a slot held), a stale stream's call discarding the VM started anew, WASI's `fd_write` misread.
-- Not run: the release images, a plugin from the Go SDK.
+- rontolisp's filters, from its release's executable JAR and binary, which build the same module: `ProxyWasmFilterTest` with `http_body`, `http_headers` and `test_plugin` in the place of the Rust ones, all passing on the host as it was, and on a native image with a test of its own (`lisp_plugin`). The real client with them at the settings above. `test_plugin` built with WASI is a command: it is what showed `_start` running twice.
+- Holding past `max-memory` with the limit in place, the real client on a 256MiB heap (a Lisp plugin on 512MiB), 60 responses, 3 runs each of arrays, structs, a growing table and Lisp: the plugin fails at the limit, no out of memory and no thread lost, another route losing nothing, `/actuator/health` answering, `call-timeout` stopping a plugin as before.
+- Not run: the release images, a plugin from the Go SDK, a plugin of objects in Envoy from here (rontolisp's `examples/proxy-wasm/check.sh` does that).

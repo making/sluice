@@ -385,6 +385,7 @@ sluice.client.upstream[1].filters[0].fail-closed=true
 - Filters run in order on a request, in reverse on its response. Routes sharing a target keep their own filters.
 - `llm-usage` counts the tokens of the OpenAI compatible APIs and the Anthropic API from their JSON and SSE responses, by exact path, without holding them; `args.include-usage=true` adds `stream_options.include_usage` to OpenAI streaming requests, without which they report nothing. See [.kb/metrics.md](.kb/metrics.md).
 - Custom filters: a [proxy-wasm plugin](proxy-wasm-plugins.md), which needs no build of the client, or in a custom build a bean implementing `UpstreamFilterFactory`, far cheaper as it is not interpreted. Both are used by name as above.
+- A plugin can be written in Rust or in Lisp. For Lisp, download the binary or the executable JAR of [rontolisp](https://github.com/making/rontolisp/releases/tag/0.1.0-SNAPSHOT) and build it with that: [the steps](proxy-wasm-plugins.md#in-lisp).
 
 Details: [.kb/client-filters.md](.kb/client-filters.md).
 
@@ -984,7 +985,7 @@ Under `sluice.client.upstream[n].filters[m]` they are a route's use of a filter,
 | `args.<key>` | - | a built-in's or a factory's settings; `llm-usage`: `include-usage` |
 | `configuration` | - | what a plugin reads as its configuration |
 | `vms` | processors, at most 4 | instances of a plugin |
-| `max-memory` | `16MB` | the memory one instance may hold |
+| `max-memory` | `16MB` | the memory one instance may hold: linear memory, Wasm GC objects and tables |
 | `call-timeout` | `1s` | how long one call into a plugin may run |
 | `max-body` | `16MB` | the bytes of a body a plugin or `include-usage` may hold, within the tunnel budget |
 | `max-meters` | `1024` | the counters a plugin may define |

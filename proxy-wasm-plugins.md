@@ -58,6 +58,45 @@ sha256sum target/wasm32-wasip1/release/my_plugin.wasm
 
 `wasm32-unknown-unknown` works as well. The SDK's own `http_body` and `http_headers` examples run unchanged (`sluice-client/src/test/guest/sdk-examples`).
 
+### In Lisp
+
+[rontolisp](https://github.com/making/rontolisp) compiles Lisp to a module of Wasm GC objects ("Memory" below). Download its executable JAR, or the binary of your platform, from [its release](https://github.com/making/rontolisp/releases/tag/0.1.0-SNAPSHOT), and its SDK from the same tag:
+
+```sh
+curl -fsSLO https://github.com/making/rontolisp/releases/download/0.1.0-SNAPSHOT/rontolisp-0.1.0-SNAPSHOT-exec.jar
+curl -fsSLO https://raw.githubusercontent.com/making/rontolisp/0.1.0-SNAPSHOT/examples/proxy-wasm/proxy-wasm.lisp
+```
+
+```lisp
+;; my_plugin.lisp
+(require :proxy-wasm "proxy-wasm.lisp")
+
+(defpackage :my-plugin (:use :cl))
+
+(in-package :my-plugin)
+
+(defmethod proxy-wasm:on-response-headers
+    ((stream proxy-wasm:http-context) num-headers end-of-stream)
+  (declare (ignore num-headers end-of-stream))
+  (proxy-wasm:add-header :response "x-filtered" "yes")
+  :continue)
+```
+
+```sh
+java -jar rontolisp-0.1.0-SNAPSHOT-exec.jar my_plugin.lisp -o my_plugin.wasm --no-wasi --optimize=size
+# or with the binary
+./rontolisp-linux-amd64 my_plugin.lisp -o my_plugin.wasm --no-wasi --optimize=size
+```
+
+Such a module allocates and drops an array of 16Mi elements as it starts, 128MiB here, and does not start at the default `max-memory`. An instance's `max-memory` comes off the client's connection limit, so use one instance, on a heap of 512MiB or more:
+
+```properties
+sluice.client.filters.my-plugin.max-memory=129MB
+sluice.client.filters.my-plugin.vms=1
+```
+
+Its runtime costs more than a filter's own code here: `search` over a body passes the default `call-timeout` from a few tens of KiB, where a typed loop over `get-buffer-octets` takes about a tenth of that. A plugin with a test: `sluice-client/src/test/guest/rontolisp`.
+
 ## Define and use it
 
 Define a plugin once by name, use it on routes by that name. Each use on a route has its own instances, settings and counters.
@@ -88,7 +127,7 @@ The settings: README "Configuration (client)", "Filters". `configuration` is wha
 
 ## What a plugin is called with
 
-Per request, on the HTTP/1.1 connections of its route, for the `paths` it is set to:
+An instance starts with `_initialize`, or `_start` in a module without one, then `on_vm_start` and `on_configure`. Per request, on the HTTP/1.1 connections of its route, for the `paths` it is set to:
 
 | Call | When | It may |
 |---|---|---|
@@ -171,6 +210,15 @@ A plugin fails when it traps (an SDK's panic among them), runs past `call-timeou
 | on a body it held but did not change, or past `max-body` | what it held goes on | the message is cut |
 
 One call at a time runs on an instance, and a stream stays on its instance: a plugin stuck for its `call-timeout` holds the other streams there for that long. A stream's state in the plugin lasts until its response ended; a client pipelining waits past 4 requests awaiting responses, so it cannot pile streams up.
+
+## Memory
+
+`max-memory` bounds what an instance holds: its linear memory and, on the client's heap, its Wasm GC objects, the exceptions it keeps and its tables. A plugin going past it fails, and a module whose memory and tables start past it is refused at the client's start.
+
+A module needs a linear memory and an allocator whatever else it uses, as the ABI passes pointers: a language with objects copies between the two.
+
+- An element of an array takes 8 bytes even as an `i8`, so a string of 1MiB takes 8MiB. A struct takes about 56 bytes and 16 to 32 per field.
+- What a plugin drops comes back between calls. Within a call all it allocates counts, so one call may allocate what is free of `max-memory`, garbage or not.
 
 ## What it reaches
 

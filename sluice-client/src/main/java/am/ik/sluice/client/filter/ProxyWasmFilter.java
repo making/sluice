@@ -86,7 +86,7 @@ final class ProxyWasmFilter implements UpstreamFilter {
 
 	private static final Logger log = LoggerFactory.getLogger(ProxyWasmFilter.class);
 
-	private static final int PAGE_SIZE = 64 * 1024;
+	static final int PAGE_SIZE = 64 * 1024;
 
 	private static final int ROOT_CONTEXT = 1;
 
@@ -154,6 +154,8 @@ final class ProxyWasmFilter implements UpstreamFilter {
 
 	private final String allocator;
 
+	private final boolean heapCharged;
+
 	private final int initialPages;
 
 	private final int maxPages;
@@ -212,9 +214,10 @@ final class ProxyWasmFilter implements UpstreamFilter {
 			.filter(memories -> memories.memoryCount() == 1)
 			.map(memories -> memories.getMemory(0).limits().initialPages())
 			.orElseThrow(() -> new IllegalArgumentException("plugin " + name + " must define one memory"));
-		if (this.initialPages > this.maxPages) {
-			throw new IllegalArgumentException("plugin " + name + " needs " + this.initialPages
-					+ " pages of memory, past its limit of " + this.maxPages);
+		long needed = (long) this.initialPages * PAGE_SIZE + PluginHeap.tableBytes(module);
+		if (needed > (long) this.maxPages * PAGE_SIZE) {
+			throw new IllegalArgumentException("plugin " + name + " needs " + needed
+					+ " bytes of memory and tables, past its limit of " + (long) this.maxPages * PAGE_SIZE);
 		}
 		for (String export : REQUIRED_EXPORTS) {
 			if (!exports(export)) {
@@ -226,6 +229,7 @@ final class ProxyWasmFilter implements UpstreamFilter {
 		if (!exports(this.allocator)) {
 			throw new IllegalArgumentException("plugin " + name + " is no proxy-wasm 0.2.1 plugin: no allocator");
 		}
+		this.heapCharged = PluginHeap.needed(module);
 		module.importSection().stream().forEach(i -> {
 			boolean known = i.module().equals("env") || i.module().equals("wasi_snapshot_preview1");
 			if (!known || !(i instanceof FunctionImport)) {
@@ -347,7 +351,7 @@ final class ProxyWasmFilter implements UpstreamFilter {
 	}
 
 	/** Interrupts the calls past their time: the interpreter checks at each branch. */
-	private static final class Watchdog {
+	static final class Watchdog {
 
 		private static final Set<Call> calls = ConcurrentHashMap.newKeySet();
 
@@ -371,8 +375,17 @@ final class ProxyWasmFilter implements UpstreamFilter {
 				}
 				catch (Throwable e) {
 					// out of memory, say: without this thread nothing would stop a plugin
-					log.warn("the plugins' watchdog goes on past: {}", e.toString());
+					report(e);
 				}
+			}
+		}
+
+		private static void report(Throwable e) {
+			try {
+				log.warn("the plugins' watchdog goes on past: {}", e.toString());
+			}
+			catch (Throwable reporting) {
+				// out of memory again: nothing is left to tell it with
 			}
 		}
 
@@ -419,6 +432,8 @@ final class ProxyWasmFilter implements UpstreamFilter {
 
 		private @Nullable Instance instance;
 
+		private @Nullable PluginHeap heap;
+
 		private volatile int generation;
 
 		private int nextContext = ROOT_CONTEXT + 1;
@@ -438,6 +453,10 @@ final class ProxyWasmFilter implements UpstreamFilter {
 		/** Runs a task in the VM, started if it is not; a failure discards the VM. */
 		<T> T run(Supplier<T> task) {
 			Future<T> future = this.thread.submit(() -> {
+				PluginHeap counted = this.heap;
+				if (counted != null) {
+					counted.betweenCalls();
+				}
 				Watchdog.Call call = new Watchdog.Call(ProxyWasmFilter.this.callTimeout);
 				try {
 					if (this.instance == null) {
@@ -452,6 +471,7 @@ final class ProxyWasmFilter implements UpstreamFilter {
 					// contexts keep counting: an old one must not be taken for a new
 					// one's
 					this.instance = null;
+					this.heap = null;
 					this.generation++;
 					throw e instanceof PluginFailure failure ? failure : new PluginFailure(e.toString(), e);
 				}
@@ -479,10 +499,20 @@ final class ProxyWasmFilter implements UpstreamFilter {
 
 		private void start() {
 			ProxyWasmFilter filter = ProxyWasmFilter.this;
-			Instance started = Instance.builder(filter.module)
+			Instance.Builder builder = Instance.builder(filter.module)
 				.withImportValues(imports())
 				.withMemoryLimits(new MemoryLimits(filter.initialPages, filter.maxPages))
-				.build();
+				// it would call _start, on a reactor too: called below instead
+				.withStart(false);
+			PluginHeap charged = filter.heapCharged ? new PluginHeap(filter.module, (long) filter.maxPages * PAGE_SIZE)
+					: null;
+			if (charged != null) {
+				builder.withUnsafeExecutionListener(charged);
+			}
+			Instance started = builder.build();
+			if (charged != null) {
+				charged.attach(started);
+			}
 			if (filter.exports("_initialize")) {
 				started.export("_initialize").apply();
 			}
@@ -495,6 +525,7 @@ final class ProxyWasmFilter implements UpstreamFilter {
 				throw new PluginFailure("the plugin refused its start");
 			}
 			this.instance = started;
+			this.heap = charged;
 		}
 
 		long[] call(@Nullable Stream stream, String export, long... args) {
