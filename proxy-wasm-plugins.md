@@ -75,11 +75,10 @@ curl -fsSLO https://raw.githubusercontent.com/making/rontolisp/0.1.0-SNAPSHOT/ex
 
 (in-package :my-plugin)
 
-(defmethod proxy-wasm:on-response-headers
-    ((stream proxy-wasm:http-context) num-headers end-of-stream)
-  (declare (ignore num-headers end-of-stream))
-  (proxy-wasm:add-header :response "x-filtered" "yes")
-  :continue)
+(proxy-wasm:define-filter
+  (:on-response-headers (stream num-headers end-of-stream)
+    (proxy-wasm:add-header :response "x-filtered" "yes")
+    :continue))
 ```
 
 ```sh
@@ -88,7 +87,7 @@ java -jar rontolisp-0.1.0-SNAPSHOT-exec.jar my_plugin.lisp -o my_plugin.wasm --n
 ./rontolisp-linux-amd64 my_plugin.lisp -o my_plugin.wasm --no-wasi --optimize=size
 ```
 
-It runs at the default limits. Its runtime costs more than a filter's own code here: holding a body and searching it with `search` passes the default `call-timeout` from about 1MiB. A plugin with a test: `sluice-client/src/test/guest/rontolisp`.
+It runs at the default limits. To search a body, use `proxy-wasm:with-buffer` and `proxy-wasm:search-bytes`, which read it where the host put it: `search` over `get-buffer` copies it first and costs several times more. A plugin with a test: `sluice-client/src/test/guest/rontolisp`.
 
 ## Define and use it
 

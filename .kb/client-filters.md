@@ -145,21 +145,23 @@ The ratio, about 300, is the guest's scanning in the interpreter: a guest doing 
 
 ### A plugin in Lisp
 
-rontolisp's filters on its SDK (`--optimize=size`) against the Rust SDK's examples they follow, on the same harness: its release at `2a82751e2`, and `b0bce92e3` built from source, which is not released yet and replaces the SDK's `defmethod` by `define-filter` and `search` by `search-bytes`. In-process at the default limits, a JVM per plugin warmed for 3000 exchanges, on Linux x86_64 under other builds' load, so a spread and not a figure. A plugin doing nothing takes 0.3ms:
+rontolisp's filters on its SDK (`--optimize=size`) against the Rust SDK's examples they follow, on the same harness: its release at `58f221883`, and at `2a82751e2`, before the SDK replaced `defmethod` by `define-filter` and `search` by `search-bytes`. In-process at the default limits, a JVM per plugin warmed for 3000 exchanges, on Linux x86_64 under other builds' load (a load average of 10-80 over 64 processors), so a spread and not a figure. A plugin doing nothing takes 0.3-0.4ms:
 
-| Per exchange | Rust | Release | `b0bce92e3` |
+| Per exchange | Rust | `2a82751e2` | `58f221883` |
 |---|---|---|---|
-| `http_body`, 5 bytes of body: instructions | 2,342 | 13,967 | 1,145 |
-| the same: p50 | 0.5-0.7ms | 0.9-1.4ms | 0.4-0.6ms |
-| `http_headers`, logging each field, the log at `WARN`: instructions | 28,124 | 118,699 | 19,936 |
-| the same: p50 | 1.6-2.1ms | 4.7-4.9ms | 1.3-2.2ms |
-| `http_body`, 64KiB: instructions | 462,207 | 3,227,624 | 223,013 |
-| the same: best of 5 | 32ms | 70ms | 17ms |
-| `http_body`, 1MiB: best of 5 | 185ms | 750ms | 97ms |
-| `http_body`, 4MiB: best of 5 | 471ms | fails, `call-timeout` | 335ms |
-| `http_body`'s module | 92,163 bytes | 59,634 bytes | 6,086 bytes |
+| `http_body`, 5 bytes of body: instructions | 2,342 | 13,967 | 1,116 |
+| the same: p50 | 0.5-0.7ms | 0.9-1.4ms | 0.5-0.7ms |
+| `http_headers`, logging each field, the log at `WARN`: instructions | 28,124 | 118,699 | 18,408 |
+| the same: p50 | 1.6-3.5ms | 4.7-4.9ms | 1.6-1.8ms |
+| `http_body`, 64KiB: instructions | 462,207 | 3,227,624 | 222,976 |
+| the same: best of 5 | 22-35ms | 70ms | 20ms |
+| `http_body`, 1MiB: best of 5 | 163-260ms | 750ms | 87ms |
+| `http_body`, 4MiB: best of 5 | 471-731ms | fails, `call-timeout` | 366ms |
+| `http_body`'s module | 92,163 bytes | 59,634 bytes | 4,872 bytes |
 
-So what made Lisp slower was not the collector: GC instructions are 15% of the release's `http_body` and 14% of `b0bce92e3`'s, which runs fewer instructions than Rust's on Wasm GC all the same. What it had too much of was runtime and generated code. What allocating costs on Endive by itself was not isolated, and the time per instruction differs: half of Rust's instructions take about the same time. A start takes 0.2-0.7s, no different from Rust's within the spread.
+Rust's `http_body` at 4MiB under the heavier load failed once in 6 by `call-timeout`. rontolisp's README counts 1,967,919 instructions for that 64KiB with `search` over `get-buffer`, which copies the body, where `search-bytes` reads it in place.
+
+So what made Lisp slower was not the collector: GC instructions are 15% of `2a82751e2`'s `http_body` and 13% of `58f221883`'s, which runs fewer instructions than Rust's on Wasm GC all the same. What it had too much of was runtime and generated code. What allocating costs on Endive by itself was not isolated, and the time per instruction differs: half of Rust's instructions take about the same time. A start takes 0.2-0.7s, no different from Rust's within the spread.
 
 Each instance of such a plugin takes what its `max-memory` says off the connection limit, like any other: at every default a limit of 61 on a 256MiB heap and 488 on 1GiB, 12 requests at once all passing.
 
@@ -170,6 +172,6 @@ Each instance of such a plugin takes what its `max-memory` says off the connecti
 - The native client on Linux by hand: the counters of each API, JSON and SSE; `include-usage`; a plugin over http with its `sha256`, a wrong one and none refusing the start; an `https://` upstream, an h2c client getting `421` with no `force-http1` set.
 - Misbehaving plugins, on a native image too: an endless loop, a trap, memory exhausted, a framing header edited, CRLF in a value, fields added for good, a malformed map. The response passes unchanged, a failure is counted, the VM starts anew.
 - An independent review of this code found what the tests had not, each with a test now: a body's framing lost to a VM failing between its head and its body (request smuggling), a pipeline waiting for good once the responses ended (a slot held), a stale stream's call discarding the VM started anew, WASI's `fd_write` misread.
-- rontolisp's filters, from its release's executable JAR and binary, which build the same module: `ProxyWasmFilterTest` with `http_body`, `http_headers` and `test_plugin` in the place of the Rust ones, all passing, of the release above and of `b0bce92e3`, and on a native image with a test of its own (`lisp_plugin`). The real client with them at every default. `test_plugin` built with WASI is a command: it is what showed `_start` running twice.
+- rontolisp's filters, from its release's executable JAR and binary, which build the same module: `ProxyWasmFilterTest` with `http_body`, `http_headers` and `test_plugin` in the place of the Rust ones, all passing, of the two releases above, and on a native image with a test of its own (`lisp_plugin`). The real client with them at every default. `test_plugin` built with WASI is a command: it is what showed `_start` running twice.
 - Holding past `max-memory` with the limit in place, the real client on a 256MiB heap, 60 responses, 3 runs each of arrays, structs, a growing table and Lisp: the plugin fails at the limit, no out of memory and no thread lost, another route losing nothing, `/actuator/health` answering, `call-timeout` stopping a plugin as before.
 - Not run: the release images, a plugin from the Go SDK, a plugin of objects in Envoy from here (rontolisp's `examples/proxy-wasm/check.sh` does that).
