@@ -37,7 +37,7 @@ Real h2 needs either an h2 endpoint on the client, with `proxy.hop` and netty's 
 
 ## Settings
 
-`sluice.client.filters.<name>` defines a filter: a plugin, or the defaults of a built-in or factory of that name. `sluice.client.upstream[n].filters[m]` uses it; what a use sets goes over the definition (`FilterConfig.overriddenBy`: `paths` and the plugin's limits replace, `args` merge key by key). Each use has its own filter: its instances of a plugin, its counters by `route`. The name is resolved at the start: unknown, it stops the client. A factory (`UpstreamFilterFactory`) is how a custom build adds one in Java, as a bean; the built-ins (`llm-usage`, `headers`) are factories too.
+`sluice.client.filters.<name>` defines a filter: a plugin, or the defaults of a built-in or factory of that name. `sluice.client.upstream[n].filters[m]` uses it; what a use sets goes over the definition (`FilterConfig.overriddenBy`: `paths` and the plugin's limits replace, `args` merge key by key). Each use has its own filter: its instances of a plugin, its counters by `route`. The name is resolved at the start: unknown, it stops the client. A factory (`UpstreamFilterFactory`) is how a custom build adds one in Java, as a bean; the built-ins (`llm-usage`, `headers`, `cors`) are factories too.
 
 A filter in Java, in a custom build of the client:
 
@@ -94,6 +94,26 @@ Each arg is one edit, `<request|response>.<set|add|remove>.<header>`, so a use's
 - Refused at the start: the framing and hop-by-hop headers the pipe protects (`content-length`, `transfer-encoding`, `connection`, `upgrade`, `keep-alive`, `proxy-connection`, `te`, `trailer`), `host`, a name that is not a token, a value with a control character or past Latin-1. What is left cannot fail on an exchange, but a head edited past 64KiB.
 - A value is in no message or log: it may be a secret.
 - No body is seen: one head edit per message.
+
+## cors
+
+CORS for a route's allowed origins, answered on the client so that an upstream with none of its own (a dev server) needs nothing. Lists are comma separated.
+
+| Arg | Default | |
+|---|---|---|
+| `allowed-origins` | - (required) | `scheme://host[:port]` (no path, no trailing `/`), `null`, or `*` alone; compared without case |
+| `allowed-methods` | `GET,HEAD,POST` | `*` allows the method a preflight asks for |
+| `allowed-headers` | none | `*` allows the headers a preflight asks for; compared without case |
+| `exposed-headers` | none | `Access-Control-Expose-Headers` on responses |
+| `allow-credentials` | `false` | `Access-Control-Allow-Credentials: true` |
+| `max-age` | none | `Access-Control-Max-Age`; seconds, or a duration (`30m`) |
+
+- A preflight is `OPTIONS` with one `Origin` and one `Access-Control-Request-Method`. From an allowed origin it is answered with `204` and the `Access-Control-Allow-*` headers (`Allow-Headers` echoes what was asked), or `403` when a method or header it asks for is not allowed; the upstream sees neither. As every local answer, it ends the connection. From another origin it goes to the upstream unchanged.
+- A response to an allowed origin's request gets `Access-Control-Allow-Origin`, the origin itself (`*` with `allowed-origins=*`), and `Allow-Credentials` / `Expose-Headers` as set; the upstream's three are removed first. Another origin's response keeps the upstream's.
+- Every response from the upstream gets `Origin` in `Vary` (unless there, or `Vary: *`), so a cache does not give one origin's response to another; a local preflight answer varies on the two request headers too.
+- Refused at the start: `*` with `allow-credentials=true` (in `allowed-origins` or `exposed-headers`: browsers reject the first and read the second as a header named `*`), `*` beside other values, an unknown arg.
+- The actual request's method is not checked: browsers send a simple request without a preflight, so refusing it protects nothing.
+- Route auth on the server runs first: a preflight carries no credentials, so the route needs `allow-preflight=true` (`.kb/route-auth.md`). A local answer of another filter (a plugin's `401`) gets no CORS headers: no filter sees one.
 
 ## The proxy-wasm host
 
