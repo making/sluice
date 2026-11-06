@@ -52,6 +52,8 @@ class ProxyWasmFilterTest {
 
 	private static final String LISP_PLUGIN = "src/test/resources/wasm/lisp_plugin.wasm";
 
+	private static final String JSON_PLUGIN = "src/test/resources/wasm/json_plugin.wasm";
+
 	private static final String SIZED = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabcde";
 
 	private static final String CHUNKED = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabcde\r\n0\r\n\r\n";
@@ -232,6 +234,32 @@ class ProxyWasmFilterTest {
 		assertThat(FilterTests.counters(this.registry)).isEqualTo(Map.of("failures plugin head", 1L));
 
 		assertThat(FilterTests.relayed(filter, "GET", "/", response, 1024)).isEqualTo(stamped);
+	}
+
+	@Test
+	void aPluginInLispAddsMetadataToAJsonResponse() throws Exception {
+		UpstreamFilter filter = filter(JSON_PLUGIN);
+		String object = "{\"name\":\"sluice\",\"tags\":[\"tunnel\"]}";
+
+		for (String response : List.of(
+				"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + object.length() + "\r\n\r\n"
+						+ object,
+				"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+						+ "a\r\n{\"name\":\"s\r\n" + Integer.toHexString(object.length() - 10) + "\r\n"
+						+ object.substring(10) + "\r\n0\r\n\r\n")) {
+			assertThat(decoded(FilterTests.relayed(filter, "GET", "/items?id=1", response, 16))).isEqualTo(
+					"content-type: application/json\nhttp/1.1 200 ok\n\n{\"name\":\"sluice\",\"tags\":[\"tunnel\"],"
+							+ "\"sluice\":{\"route\":\"route.test\",\"plugin\":\"plugin\",\"method\":\"GET\","
+							+ "\"path\":\"/items?id=1\",\"status\":200}}");
+		}
+		for (String body : List.of("[1,2]", "{\"name\":", "plain")) {
+			String type = body.equals("plain") ? "text/plain" : "application/json";
+			String response = "HTTP/1.1 200 OK\r\nContent-Type: " + type + "\r\nContent-Length: " + body.length()
+					+ "\r\n\r\n" + body;
+			assertThat(decoded(FilterTests.relayed(filter, "GET", "/", response, 1024))).as(body)
+				.isEqualTo(decoded(response));
+		}
+		assertThat(FilterTests.counters(this.registry)).isEmpty();
 	}
 
 	/** Without that thread nothing stops a plugin, so not even reporting may end it. */

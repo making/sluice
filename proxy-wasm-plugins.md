@@ -87,7 +87,7 @@ java -jar rontolisp-0.1.0-SNAPSHOT-exec.jar my_plugin.lisp -o my_plugin.wasm --n
 ./rontolisp-linux-amd64 my_plugin.lisp -o my_plugin.wasm --no-wasi --optimize=size
 ```
 
-It runs at the default limits. To search a body, use `proxy-wasm:with-buffer` and `proxy-wasm:search-bytes`, which read it where the host put it: `search` over `get-buffer` copies it first and costs several times more. A plugin with a test: `sluice-client/src/test/guest/rontolisp`.
+It runs at the default limits. To search a body, use `proxy-wasm:with-buffer` and `proxy-wasm:search-bytes`, which read it where the host put it: `search` over `get-buffer` copies it first and costs several times more. Plugins with tests, one of them adding a field to a JSON response with `rontolisp:json-parse` and `rontolisp:json-stringify`: `sluice-client/src/test/guest/rontolisp`.
 
 ## Define and use it
 
