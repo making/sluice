@@ -600,7 +600,18 @@ mod tests {
     async fn an_unreachable_provider_is_named_with_the_cause() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let issuer = format!("http://{}/dex", listener.local_addr().unwrap());
-        std::thread::spawn(move || listener.incoming().for_each(drop));
+        // closed once the request is read: closed with it unread, it would be reset
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut head = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                while std::io::BufRead::read_line(&mut head, &mut line).is_ok_and(|n| n > 0)
+                    && line != "\r\n"
+                {
+                    line.clear();
+                }
+            }
+        });
         let provider = Provider::new(OidcSettings {
             issuer: issuer.clone(),
             client_id: "sluice".into(),
