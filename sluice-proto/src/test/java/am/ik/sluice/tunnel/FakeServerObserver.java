@@ -67,10 +67,12 @@ final class FakeServerObserver extends ServerCallStreamObserver<Frame> {
 		if (this.die.get()) {
 			throw new RuntimeException("stream died");
 		}
-		this.sent.add(frame);
+		// not ready before the frame is seen: a test granting once it sees the frame
+		// must not have its grant undone
 		if (this.oneFramePerReady.get()) {
 			this.ready.set(false);
 		}
+		this.sent.add(frame);
 		this.firstSent.countDown();
 	}
 
