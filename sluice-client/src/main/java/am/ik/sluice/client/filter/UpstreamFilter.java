@@ -131,6 +131,13 @@ public interface UpstreamFilter {
 		void set(String name, String value);
 
 		/**
+		 * Adds this value of the header after its others, the name as given.
+		 * @throws IllegalArgumentException when the header cannot be changed, or the name
+		 * or value would make a line of its own
+		 */
+		void add(String name, String value);
+
+		/**
 		 * Removes the header.
 		 * @throws IllegalArgumentException when the header cannot be changed
 		 */

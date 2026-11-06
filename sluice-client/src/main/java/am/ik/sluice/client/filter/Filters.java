@@ -47,6 +47,7 @@ public final class Filters {
 		this.budget = Objects.requireNonNull(builder.budget, "budget is required");
 		this.resourceLoader = builder.resourceLoader;
 		register(LlmUsageFilter.factory());
+		register(HeadersFilter.factory());
 		builder.factories.forEach(this::register);
 		this.definitions.forEach((name, definition) -> {
 			if (!definition.plugin().isEmpty() && this.factories.containsKey(name)) {

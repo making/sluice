@@ -384,6 +384,7 @@ sluice.client.upstream[1].filters[0].fail-closed=true
 - `h2c` is removed from `Upgrade` on every request of a filtered route, on paths outside a filter's `paths` too: h2 past the `101` would pass the filters on that connection. The upstream answers an ordinary request, or switches to another upgrade offered beside it. What follows a `101` (a WebSocket) or a `CONNECT`'s 2xx is not filtered.
 - Filters run in order on a request, in reverse on its response. Routes sharing a target keep their own filters.
 - `llm-usage` counts the tokens of the OpenAI compatible APIs and the Anthropic API from their JSON and SSE responses, by exact path, without holding them; `args.include-usage=true` adds `stream_options.include_usage` to OpenAI streaming requests, without which they report nothing. See [.kb/metrics.md](.kb/metrics.md).
+- `headers` sets, adds and removes request and response headers, by args `<request|response>.<set|add|remove>.<header>`: `args[request.set.x-api-key]=${ANTHROPIC_API_KEY}` gives the upstream a credential the tunnel's users never hold, `args[response.remove.server]=true` hides what the upstream sends. An edit of the framing, of `Host` or with a control character stops the start.
 - Custom filters: a [proxy-wasm plugin](proxy-wasm-plugins.md), compiled by wasmtime inside the client and needing no build of it, or in a custom build a bean implementing `UpstreamFilterFactory`, cheaper still as nothing is copied into a plugin's memory or called through its ABI. Both are used by name as above.
 - A plugin can be written in Rust or in Lisp. For Lisp, download the binary or the executable JAR of [rontolisp](https://github.com/making/rontolisp/releases/tag/0.1.0-SNAPSHOT) and build it with that: [the steps](proxy-wasm-plugins.md#in-lisp).
 
@@ -977,12 +978,12 @@ Under `sluice.client.upstream[n].filters[m]` they are a route's use of a filter,
 
 | Property | Default | Description |
 |---|---|---|
-| `name` | - | the filter: `llm-usage`, one defined under `sluice.client.filters`, or a factory's |
+| `name` | - | the filter: `llm-usage`, `headers`, one defined under `sluice.client.filters`, or a factory's |
 | `plugin` | - | where a [proxy-wasm plugin](proxy-wasm-plugins.md) is read from at the start: `file:`, `classpath:`, `https:` (a Spring resource location), or a file path |
 | `sha256` | - | the plugin's SHA-256 in hex; the client does not start on a mismatch. Required unless it comes from a file or the class path |
 | `paths` | every path | the request paths the filter sees: exact, or a prefix ending in `*`, compared as sent |
 | `fail-closed` | `false` | a request or response fails with the filter failing on it; otherwise it goes on as if the filter were not there |
-| `args.<key>` | - | a built-in's or a factory's settings; `llm-usage`: `include-usage` |
+| `args.<key>` | - | a built-in's or a factory's settings; `llm-usage`: `include-usage`; `headers`: `<request\|response>.<set\|add\|remove>.<header>`, in brackets (`args[request.set.x-api-key]`) |
 | `configuration` | - | what a plugin reads as its configuration |
 | `vms` | processors, at most 4 | instances of a plugin |
 | `max-memory` | `16MB` | the memory one instance may hold: its linear memory, GC heap and tables together |

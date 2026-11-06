@@ -580,6 +580,10 @@ class ProxyWasmFilterTest {
 		}
 
 		@Override
+		public void add(String name, String value) {
+		}
+
+		@Override
 		public void remove(String name) {
 		}
 

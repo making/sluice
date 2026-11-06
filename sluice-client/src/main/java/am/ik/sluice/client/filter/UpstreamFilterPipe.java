@@ -1492,6 +1492,13 @@ public final class UpstreamFilterPipe implements DuplexPipe {
 		}
 
 		@Override
+		public void add(String name, String value) {
+			check(name, value);
+			this.lines.add(name + ": " + value);
+			this.edited = true;
+		}
+
+		@Override
 		public void remove(String name) {
 			check(name, null);
 			String lower = name.toLowerCase(Locale.ROOT);

@@ -37,7 +37,7 @@ Real h2 needs either an h2 endpoint on the client, with `proxy.hop` and netty's 
 
 ## Settings
 
-`sluice.client.filters.<name>` defines a filter: a plugin, or the defaults of a built-in or factory of that name. `sluice.client.upstream[n].filters[m]` uses it; what a use sets goes over the definition (`FilterConfig.overriddenBy`: `paths` and the plugin's limits replace, `args` merge key by key). Each use has its own filter: its instances of a plugin, its counters by `route`. The name is resolved at the start: unknown, it stops the client. A factory (`UpstreamFilterFactory`) is how a custom build adds one in Java, as a bean; `llm-usage` is one.
+`sluice.client.filters.<name>` defines a filter: a plugin, or the defaults of a built-in or factory of that name. `sluice.client.upstream[n].filters[m]` uses it; what a use sets goes over the definition (`FilterConfig.overriddenBy`: `paths` and the plugin's limits replace, `args` merge key by key). Each use has its own filter: its instances of a plugin, its counters by `route`. The name is resolved at the start: unknown, it stops the client. A factory (`UpstreamFilterFactory`) is how a custom build adds one in Java, as a bean; the built-ins (`llm-usage`, `headers`) are factories too.
 
 A filter in Java, in a custom build of the client:
 
@@ -84,6 +84,16 @@ One scanner of JSON and server-sent events, a dialect per API by exact request p
 - OpenAI's `input_tokens` (documentation of the Responses API) includes `cached_tokens` and `cache_write_tokens`; the filter assumes the same of `prompt_tokens`, which that page does not state, and counts `input` without them, as Anthropic reports it.
 - A cut stream leaves a partial count, recorded as `outcome=cut`.
 - `model` comes from a response: past 256 values per use it counts as `other`. Every series has the same tag keys, as Prometheus needs: what was not read has `model` and `stream` = `unknown`.
+
+## headers
+
+Each arg is one edit, `<request|response>.<set|add|remove>.<header>`, so a use's args go over the definition's edit by edit (`overriddenBy` merges `args` key by key). In properties the key goes in brackets, `args[request.set.x-api-key]`, which keeps its dots and case. An environment variable cannot carry the key: its `_` binds as `.`, and a header name with `.` is refused rather than sent as `x.api.key`. The value can come from one: `${ANTHROPIC_API_KEY}`.
+
+- `set` replaces every value, `add` adds one after the others, `remove` takes `true` (or empty) and `false`, which keeps a header a definition removes. Names are compared without case; the same edit of one name in two cases is refused.
+- On each head: removals, then sets, then adds. A request's edits apply on every request of the route, `paths` aside; a response's on every final response, a local answer of another filter excepted.
+- Refused at the start: the framing and hop-by-hop headers the pipe protects (`content-length`, `transfer-encoding`, `connection`, `upgrade`, `keep-alive`, `proxy-connection`, `te`, `trailer`), `host`, a name that is not a token, a value with a control character or past Latin-1. What is left cannot fail on an exchange, but a head edited past 64KiB.
+- A value is in no message or log: it may be a secret.
+- No body is seen: one head edit per message.
 
 ## The proxy-wasm host
 
