@@ -263,7 +263,12 @@ class ProxyWasmFilterTest {
 				"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
 						+ "a\r\n{\"name\":\"s\r\n" + Integer.toHexString(object.length() - 10) + "\r\n"
 						+ object.substring(10) + "\r\n0\r\n\r\n")) {
-			assertThat(decoded(FilterTests.relayed(filter, "GET", "/items?id=1", response, 16))).isEqualTo(
+			// asked for no encoding it could not read
+			FilterTests.Exchanged exchanged = FilterTests.exchange(filter,
+					"GET /items?id=1 HTTP/1.1\r\nHost: api.test\r\nAccept-Encoding: gzip, br\r\n\r\n",
+					response.getBytes(StandardCharsets.UTF_8), 16);
+			assertThat(exchanged.upstream()).isEqualTo("GET /items?id=1 HTTP/1.1\r\nHost: api.test\r\n\r\n");
+			assertThat(decoded(exchanged.relayed())).isEqualTo(
 					"content-type: application/json\nhttp/1.1 200 ok\n\n{\"name\":\"sluice\",\"tags\":[\"tunnel\"],"
 							+ "\"sluice\":{\"route\":\"route.test\",\"plugin\":\"plugin\",\"method\":\"GET\","
 							+ "\"path\":\"/items?id=1\",\"status\":200}}");

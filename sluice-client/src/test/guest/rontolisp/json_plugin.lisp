@@ -4,7 +4,8 @@
 ;;;; The body stays where the host put it: rontolisp:json-span checks that it is JSON and
 ;;;; finds the object's closing brace, and the field goes in before it. Nothing of the body
 ;;;; becomes a Lisp value. Anything else, an encoded body or one that is no JSON object
-;;;; among them, goes on as it came.
+;;;; among them, goes on as it came. A request asks for no encoding, so an upstream that
+;;;; would compress sends what the plugin can read.
 
 (require :proxy-wasm "proxy-wasm.lisp")
 
@@ -33,6 +34,9 @@
     fields))
 
 (proxy-wasm:define-filter
+  (:on-request-headers (stream num-headers end-of-stream)
+    (proxy-wasm:remove-header :request "accept-encoding")
+    :continue)
   (:on-response-headers (stream num-headers end-of-stream)
     ;; the body changes length: the client frames it anew
     (when (json-p)
