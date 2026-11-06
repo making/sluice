@@ -6,6 +6,13 @@
 //! droplet is a rootfs: an `.ext4` of the zip, or the wicket's make of the
 //! image, which it keeps (the cf-api the image's pinned reference, to have it
 //! made again).
+//!
+//! A zip of no component with an `index.html` at its root is a static site on a
+//! wasm wicket: the droplet is the component of sluice-wicket-site ([`SITE`],
+//! embedded at the build) and a tar of the zip's files, the
+//! wicket's read-only at `/` for it ([`pack_site`]): dot files (but
+//! `.well-known/`) and the manifest are left out, so a `.git`, a `.env` or the
+//! env of a `manifest.yml` never reaches the wicket.
 
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
@@ -15,11 +22,24 @@ use sha2::{Digest, Sha256};
 use crate::controller::Controller;
 use crate::logs::Logs;
 use crate::registry::Registry;
-use crate::store::{DockerImage, Droplet, Package, Store, guid, now};
+use crate::store::{DockerImage, Droplet, Files, Package, Store, guid, now};
 use crate::wicket::Runtime;
 
 /// A rootfs's file name ends so; a droplet's kind is its file's.
 pub const ROOTFS: &str = ".ext4";
+
+/// The component a static site is served by: sluice-wicket-site's (`build.rs`).
+pub const SITE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/site.wasm"));
+
+/// Its file name in the wicket.
+pub const SITE_FILE: &str = "site.wasm";
+
+/// What tells a zip of a static site: its page at the root.
+const SITE_INDEX: &str = "index.html";
+
+/// What a site's files may unpack to, and how many: the wicket's bounds of a tar.
+const MAX_SITE_BYTES: u64 = 1 << 30;
+const MAX_SITE_FILES: usize = 100_000;
 
 /// What a package's component may unpack to: the largest image a wicket takes. A zip takes
 /// any size down to next to nothing.
@@ -44,6 +64,8 @@ pub struct Staged {
     pub sha256: String,
     /// The image it was pulled from, pinned to its digest.
     pub image: Option<String>,
+    /// A static site's files, kept already.
+    pub files: Option<Files>,
 }
 
 /// Stages the build `build` of `package` and records how it went: STAGED
@@ -62,19 +84,21 @@ pub async fn run(
     let app = package.app.as_str();
     let staged = match &package.docker {
         None => {
+            let runtime = controller.runtime().await;
             logs.add(
                 app,
                 "STG",
-                match controller.runtime().await {
+                match runtime {
                     Ok(Runtime::Firecracker) => {
                         "Staging a rootfs: the web process command names the image, else the package's only .ext4"
                     }
                     _ => {
-                        "Staging with the wasm lifecycle: the web process command names the component, else the package's only .wasm"
+                        "Staging with the wasm lifecycle: the web process command names the component, else the package's only .wasm, else an index.html makes it a static site"
                     }
                 },
             );
-            unpack(store.clone(), &package.guid, command).await
+            let site = !matches!(runtime, Ok(Runtime::Firecracker));
+            unpack(store.clone(), &package.guid, command, site).await
         }
         Some(docker) => match controller.runtime().await {
             Ok(Runtime::Wasm) => pull(logs, registry, app, docker).await,
@@ -94,6 +118,7 @@ pub async fn run(
                         size: made.bytes,
                         sha256: made.sha256,
                         image: Some(made.image),
+                        files: None,
                     })
                     .map_err(|e| format!("{}: {e}", docker.image))
             }
@@ -115,14 +140,19 @@ pub async fn run(
                 app,
                 "STG",
                 format!(
-                    "Staged {} ({} bytes, sha256 {}){}",
+                    "Staged {} ({} bytes, sha256 {}){}{}",
                     staged.entry,
                     staged.size,
                     &staged.sha256[..12],
                     staged
                         .image
                         .as_ref()
-                        .map_or(String::new(), |image| format!(" from {image}"))
+                        .map_or(String::new(), |image| format!(" from {image}")),
+                    staged.files.as_ref().map_or(String::new(), |files| format!(
+                        ", serving the files of a {} byte tar (sha256 {})",
+                        files.bytes,
+                        &files.sha256[..12]
+                    ))
                 ),
             );
             let droplet = Droplet {
@@ -133,6 +163,7 @@ pub async fn run(
                 file: staged.entry,
                 bytes: staged.size,
                 image: staged.image,
+                files: staged.files,
                 created_at: at.clone(),
                 updated_at: at.clone(),
             };
@@ -159,12 +190,28 @@ pub async fn run(
 }
 
 /// Stages the zip of the package `guid`, its droplet made, on a blocking thread: a VM of one
-/// vCPU has one worker, which the API and the watch run on.
-async fn unpack(store: Arc<Store>, guid: &str, command: Option<&str>) -> Result<Staged, String> {
+/// vCPU has one worker, which the API and the watch run on. With `site`, a zip of a static
+/// site is one ([`is_site`]).
+async fn unpack(
+    store: Arc<Store>,
+    guid: &str,
+    command: Option<&str>,
+    site: bool,
+) -> Result<Staged, String> {
     let (guid, command) = (guid.to_string(), command.map(str::to_string));
     tokio::task::spawn_blocking(move || {
-        let zip = std::fs::File::open(store.package_path(&guid))
-            .map_err(|e| format!("the package is gone: {e}"))?;
+        let open = || {
+            std::fs::File::open(store.package_path(&guid))
+                .map_err(|e| format!("the package is gone: {e}"))
+        };
+        if site && command.is_none() {
+            let mut archive =
+                zip::ZipArchive::new(open()?).map_err(|e| format!("not a zip: {e}"))?;
+            if is_site(&archive) {
+                return stage_site(&store, &mut archive);
+            }
+        }
+        let zip = open()?;
         store.make_droplet(|droplet| {
             let staged = stage(zip, command.as_deref(), droplet, MAX_DROPLET_BYTES)?;
             let sha256 = staged.sha256.clone();
@@ -173,6 +220,185 @@ async fn unpack(store: Arc<Store>, guid: &str, command: Option<&str>) -> Result<
     })
     .await
     .map_err(|e| format!("staging: {e}"))?
+}
+
+/// Whether `archive` is a static site: no component, nor a rootfs, an `index.html` at its
+/// root.
+fn is_site<R: Read + Seek>(archive: &zip::ZipArchive<R>) -> bool {
+    let names: Vec<_> = archive.file_names().filter_map(|name| name.ok()).collect();
+    let component = |name: &str| name.ends_with(".wasm") || name.ends_with(ROOTFS);
+    !names.iter().any(|name| component(name)) && names.iter().any(|name| name == SITE_INDEX)
+}
+
+/// Stages the static site `archive`: its files packed, sluice-wicket-site its component.
+fn stage_site<R: Read + Seek>(
+    store: &Store,
+    archive: &mut zip::ZipArchive<R>,
+) -> Result<Staged, String> {
+    let packed = store.make_files(|tar| {
+        let packed = pack_site(archive, tar, MAX_SITE_BYTES)?;
+        let sha256 = packed.sha256.clone();
+        Ok((packed, sha256))
+    })?;
+    Ok(Staged {
+        entry: SITE_FILE.into(),
+        bytes: SITE.to_vec(),
+        size: SITE.len() as u64,
+        sha256: sha256(SITE),
+        image: None,
+        files: Some(Files {
+            sha256: packed.sha256,
+            bytes: packed.bytes,
+        }),
+    })
+}
+
+/// A static site's files as [`pack_site`] packed them.
+#[derive(Debug)]
+pub struct Packed {
+    /// The tar's digest and size.
+    pub sha256: String,
+    pub bytes: u64,
+    /// The files packed, and those left out (dot files, the manifest).
+    pub files: usize,
+    pub left_out: Vec<String>,
+}
+
+/// Writes the files of the zip `archive` to `tar` as the wicket takes them: regular
+/// files, sorted by name (the same files make the same digest, however zipped), each with
+/// its time (what sluice-wicket-site's `ETag` is made of), `max` bytes of them at most. Dot
+/// files and directories (but `.well-known/` at the root) and the manifest at the root
+/// are left out; a link fails it, as does a name out of the root.
+pub fn pack_site<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    tar: &mut impl Write,
+    max: u64,
+) -> Result<Packed, String> {
+    let mut entries: Vec<(String, usize)> = Vec::new();
+    let mut left_out = Vec::new();
+    for index in 0..archive.len() {
+        let file = archive
+            .by_index_raw(index)
+            .map_err(|e| format!("not a zip: {e}"))?;
+        if file.is_dir() {
+            continue;
+        }
+        let name = file
+            .name()
+            .map_err(|e| format!("not a zip: {e}"))?
+            .to_string();
+        if file.is_symlink() {
+            return Err(format!(
+                "'{name}' is a symbolic link: a site holds files only"
+            ));
+        }
+        let Some(path) = file.enclosed_name() else {
+            return Err(format!("'{name}' is no path below the site's root"));
+        };
+        let path: Vec<String> = path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let path = path.join("/");
+        if left_out_of_site(&path) {
+            left_out.push(path);
+            continue;
+        }
+        entries.push((path, index));
+    }
+    if entries.len() > MAX_SITE_FILES {
+        return Err(format!("more than {MAX_SITE_FILES} files"));
+    }
+    entries.sort();
+    if let Some(twice) = entries.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(format!("'{}' twice", twice[0].0));
+    }
+    let mut builder = tar::Builder::new(Hashed::new(Counted::new(tar)));
+    let mut left = max;
+    for (path, index) in &entries {
+        let mut file = archive
+            .by_index(*index)
+            .map_err(|e| format!("cannot read {path}: {e}"))?;
+        let size = file.size();
+        if size > left {
+            return Err(format!("the files are more than {} MiB", max >> 20));
+        }
+        left -= size;
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_mtime(file.last_modified().map_or(0, unix_time));
+        builder
+            .append_data(&mut header, path, &mut file)
+            .map_err(|e| format!("cannot pack {path}: {e}"))?;
+    }
+    let hashed = builder
+        .into_inner()
+        .map_err(|e| format!("cannot pack the site: {e}"))?;
+    let bytes = hashed.out.written;
+    Ok(Packed {
+        sha256: hashed.finish(),
+        bytes,
+        files: entries.len(),
+        left_out,
+    })
+}
+
+/// Whether the site's file `path` is left out: a dot file or directory (but
+/// `.well-known/` at the root), what `cf push` reads at the root (the manifest).
+fn left_out_of_site(path: &str) -> bool {
+    let mut segments = path.split('/');
+    let first = segments.next().unwrap_or_default();
+    let manifest = matches!(path, "manifest.yml" | "manifest.yaml");
+    let hidden = (first.starts_with('.') && first != ".well-known")
+        || segments.any(|segment| segment.starts_with('.'));
+    manifest || hidden
+}
+
+/// A zip time (local, as MS-DOS has it: taken as UTC) in seconds since the epoch.
+fn unix_time(time: zip::DateTime) -> u64 {
+    // days from the civil date (Howard Hinnant's days_from_civil)
+    let (year, month, day) = (
+        i64::from(time.year()),
+        i64::from(time.month()),
+        i64::from(time.day()),
+    );
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let of_era = year - era * 400;
+    let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let of_era_days = of_era * 365 + of_era / 4 - of_era / 100 + of_year;
+    let days = era * 146_097 + of_era_days - 719_468;
+    let seconds = days * 86_400
+        + i64::from(time.hour()) * 3600
+        + i64::from(time.minute()) * 60
+        + i64::from(time.second());
+    u64::try_from(seconds).unwrap_or(0)
+}
+
+/// A writer counting what passes it.
+pub struct Counted<W> {
+    out: W,
+    written: u64,
+}
+
+impl<W: Write> Counted<W> {
+    fn new(out: W) -> Counted<W> {
+        Counted { out, written: 0 }
+    }
+}
+
+impl<W: Write> Write for Counted<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.out.write(bytes)?;
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
 }
 
 /// The component of `docker`'s image, pulled from its registry with the package's
@@ -206,6 +432,7 @@ async fn pull(
             bytes: pulled.bytes,
             sha256: pulled.sha256,
             image: Some(pulled.image),
+            files: None,
         })
         .map_err(|e| format!("{}: {e}", docker.image))
 }
@@ -293,6 +520,7 @@ pub fn stage(
         entry,
         bytes: Vec::new(),
         image: None,
+        files: None,
     })
 }
 
@@ -381,9 +609,10 @@ mod tests {
 
     fn zipped(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let time = zip::DateTime::from_date_and_time(2024, 5, 6, 7, 8, 10).unwrap();
+        let options = zip::write::SimpleFileOptions::default().last_modified_time(time);
         for (name, bytes) in entries {
-            zip.start_file(*name, zip::write::SimpleFileOptions::default())
-                .unwrap();
+            zip.start_file(*name, options).unwrap();
             zip.write_all(bytes).unwrap();
         }
         zip.finish().unwrap().into_inner()
@@ -396,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn picks_the_only_component_or_the_one_the_command_names() {
+    fn picks_the_component_or_packs_a_site() {
         let (hello, droplet) = staged(
             &zipped(&[("hello.wasm", COMPONENT), ("README", b"x")]),
             None,
@@ -461,5 +690,76 @@ mod tests {
                 .unwrap_err()
                 .contains("not a zip")
         );
+
+        // a static site: no component, an index.html at the root; its files packed sorted,
+        // with their times, but the dot files and the manifest
+        let archive = |zip: Vec<u8>| zip::ZipArchive::new(Cursor::new(zip)).unwrap();
+        let entries = [
+            ("index.html", &b"<p>"[..]),
+            ("css/a.css", b"p{}"),
+            (".git/config", b"[core]"),
+            (".env", b"SECRET=x"),
+            (".well-known/security.txt", b"Contact: me"),
+            ("docs/.secret", b"x"),
+            ("manifest.yml", b"env: {SECRET: x}"),
+        ];
+        let site = archive(zipped(&entries));
+        assert!(is_site(&site));
+        assert!(!is_site(&archive(zipped(&[
+            ("index.html", b"<p>"),
+            ("a.wasm", COMPONENT)
+        ]))));
+        assert!(!is_site(&archive(zipped(&[("docs/index.html", b"<p>")]))));
+        let pack = |entries: &[(&str, &[u8])], max| {
+            let mut tar = Vec::new();
+            pack_site(&mut archive(zipped(entries)), &mut tar, max).map(|packed| (packed, tar))
+        };
+        let (packed, tar) = pack(&entries, 1 << 20).unwrap();
+        assert_eq!(
+            packed.left_out,
+            [".git/config", ".env", "docs/.secret", "manifest.yml"]
+        );
+        assert_eq!((packed.files, packed.bytes), (3, tar.len() as u64));
+        assert_eq!(packed.sha256, sha256(&tar));
+        let mut unpacked = tar::Archive::new(&tar[..]);
+        let files: Vec<(String, u64)> = unpacked
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.path().unwrap().to_string_lossy().into_owned();
+                (name, entry.header().mtime().unwrap())
+            })
+            .collect();
+        let at = 1_714_979_290;
+        assert_eq!(
+            files,
+            [
+                (".well-known/security.txt".to_string(), at),
+                ("css/a.css".into(), at),
+                ("index.html".into(), at)
+            ]
+        );
+        let mut reversed = entries;
+        reversed.reverse();
+        assert_eq!(
+            pack(&reversed, 1 << 20).unwrap().0.sha256,
+            packed.sha256,
+            "however zipped"
+        );
+        assert!(
+            pack(&entries, 4)
+                .unwrap_err()
+                .contains("the files are more than")
+        );
+        let mut linked = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        linked.start_file("index.html", options).unwrap();
+        linked
+            .add_symlink("passwd", "/etc/passwd", options)
+            .unwrap();
+        let linked = linked.finish().unwrap().into_inner();
+        let refused = pack_site(&mut archive(linked), &mut Vec::new(), 1 << 20).unwrap_err();
+        assert!(refused.contains("'passwd' is a symbolic link"), "{refused}");
     }
 }

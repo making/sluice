@@ -12,8 +12,9 @@
 //!
 //! The WASI surface follows `wasmtime serve` for p3: a route links http +
 //! the p3 cli/clocks/random interfaces, `cli` links the full wasi p3 set,
-//! `keyvalue` wasi:keyvalue (`keyvalue`), and the network capabilities and
-//! the route's environment (`env`) configure the per-request `WasiCtx`.
+//! `keyvalue` wasi:keyvalue (`keyvalue`), a route's files wasi:filesystem
+//! (its directory preopened read-only at `/`), and the network capabilities
+//! and the route's environment (`env`) configure the per-request `WasiCtx`.
 //! wasi p2 is unsupported: a p2-importing component is rejected at load.
 //! Guest stdout / stderr always reach the process log, line-prefixed; with a
 //! flume they and a line per answered request reach the live access log too
@@ -633,6 +634,11 @@ pub struct Sandbox {
     /// The guest's environment variables (`wasi:cli/environment`): the
     /// config file's and the apps'; the target holds their digest only.
     pub env: Env,
+    /// The directory preopened read-only at `/` (`wasi:filesystem`, linked
+    /// with it): a config file route's or a flag's `files`, an app's files
+    /// as uploaded. Never an option of the console's query: its path is the
+    /// wicket's to name.
+    pub files: Option<PathBuf>,
 }
 
 impl Sandbox {
@@ -727,6 +733,9 @@ impl Sandbox {
         if !self.env.is_empty() {
             pairs.push(format!("env={}", self.env.digest()));
         }
+        if let Some(files) = &self.files {
+            pairs.push(format!("files={}", escape(&files.to_string_lossy())));
+        }
         if let Some(cap) = self.instances.filter(|_| counts) {
             pairs.push(format!("instances={cap}"));
         }
@@ -792,7 +801,8 @@ pub async fn fetch(locator: &Locator) -> Result<Fetched, String> {
 }
 
 /// Compiles `fetched`, linked for the `caps` it runs with (only `cli` and
-/// `keyvalue` change the linker), unless a component of the same target,
+/// `keyvalue` change the linker) and, with `files`, wasi:filesystem, unless a
+/// component of the same target,
 /// digest and linker is still alive: then that one is shared. Only live
 /// components are kept, so a replaced one is freed with its last handler. The
 /// compilation runs on the blocking pool: a reload compiles while the wicket
@@ -801,10 +811,11 @@ pub async fn fetch(locator: &Locator) -> Result<Fetched, String> {
 pub async fn compile(
     fetched: Fetched,
     caps: Caps,
+    files: bool,
     shown: Option<&str>,
 ) -> Result<Arc<Loaded>, String> {
-    // (target, (cli, keyvalue), digest) -> component: the caps select the linker
-    type Cache = Mutex<HashMap<(String, (bool, bool), String), std::sync::Weak<Loaded>>>;
+    // (target, (cli, keyvalue, files), digest) -> component: they select the linker
+    type Cache = Mutex<HashMap<(String, (bool, bool, bool), String), std::sync::Weak<Loaded>>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let Fetched {
@@ -812,7 +823,7 @@ pub async fn compile(
         bytes,
         digest,
     } = fetched;
-    let key = (target, (caps.cli, caps.keyvalue), digest);
+    let key = (target, (caps.cli, caps.keyvalue, files), digest);
     if let Some(loaded) = cache
         .lock()
         .unwrap()
@@ -826,9 +837,10 @@ pub async fn compile(
         .unwrap_or_else(|| target.strip_prefix("wasm:").unwrap_or(&target))
         .to_string();
     let named = name.clone();
-    let loaded = tokio::task::spawn_blocking(move || link(&target, &named, &bytes, digest, caps))
-        .await
-        .map_err(|e| format!("compile {name}: {e}"))??;
+    let loaded =
+        tokio::task::spawn_blocking(move || link(&target, &named, &bytes, digest, caps, files))
+            .await
+            .map_err(|e| format!("compile {name}: {e}"))??;
     let loaded = Arc::new(loaded);
     let mut cache = cache.lock().unwrap();
     cache.retain(|_, weak| weak.strong_count() > 0);
@@ -839,7 +851,7 @@ pub async fn compile(
 /// Fetches and compiles the component behind `locator` ([`fetch`], [`compile`]).
 #[cfg(test)]
 pub async fn load(locator: &Locator, caps: Caps) -> Result<Arc<Loaded>, String> {
-    compile(fetch(locator).await?, caps, None).await
+    compile(fetch(locator).await?, caps, false, None).await
 }
 
 /// Compiles and pre-links `bytes` of the component at `target`, its errors
@@ -850,6 +862,7 @@ fn link(
     bytes: &[u8],
     digest: String,
     caps: Caps,
+    files: bool,
 ) -> Result<Loaded, String> {
     let label = target.rsplit('/').next().unwrap_or(target).to_string();
     let engine = engine().clone();
@@ -884,7 +897,16 @@ fn link(
             "component {name} imports {store}: the route needs wasi=keyvalue"
         ));
     }
-    let linker = linker(&engine, caps).map_err(|e| format!("linker: {e}"))?;
+    if let Some(filesystem) = wasi
+        .iter()
+        .find(|import| import.starts_with("wasi:filesystem/"))
+        .filter(|_| !caps.cli && !files)
+    {
+        return Err(format!(
+            "component {name} imports {filesystem}: the route grants no files"
+        ));
+    }
+    let linker = linker(&engine, caps, files).map_err(|e| format!("linker: {e}"))?;
     let pre = linker.instantiate_pre(&component).map_err(|e| {
         let hint = if caps.cli {
             ""
@@ -904,11 +926,13 @@ fn link(
 }
 
 /// The interfaces a route links, as `wasmtime serve` does for p3: http plus
-/// cli / clocks / random, or with `cli` the full wasi p3 set; with `keyvalue`
-/// wasi:keyvalue too. Unlike serve's `-Scli`, no p2 interface is linked.
+/// cli / clocks / random, or with `cli` the full wasi p3 set; with `files`
+/// wasi:filesystem, with `keyvalue` wasi:keyvalue too. Unlike serve's `-Scli`,
+/// no p2 interface is linked.
 fn linker(
     engine: &wasmtime::Engine,
     caps: Caps,
+    files: bool,
 ) -> wasmtime::Result<wasmtime::component::Linker<Ctx>> {
     let mut linker = wasmtime::component::Linker::<Ctx>::new(engine);
     if caps.cli {
@@ -917,6 +941,9 @@ fn linker(
         wasmtime_wasi::p3::clocks::add_to_linker(&mut linker)?;
         wasmtime_wasi::p3::random::add_to_linker(&mut linker)?;
         wasmtime_wasi::p3::cli::add_to_linker(&mut linker)?;
+        if files {
+            wasmtime_wasi::p3::filesystem::add_to_linker(&mut linker)?;
+        }
     }
     wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
     if caps.keyvalue {
@@ -965,6 +992,14 @@ impl Ctx {
         wasi.stderr(log(Output::Stderr));
         for (name, value) in sandbox.env.iter() {
             wasi.env(name, value);
+        }
+        if let Some(files) = &sandbox.files {
+            // gone, the guest finds no preopen and answers so: the route stays
+            let preopened =
+                wasi.preopened_dir(files, "/", wasmtime_wasi::filesystem::FsPerms::ReadOnly);
+            if let Err(e) = preopened {
+                eprintln!("[{label}] files {}: {e}", files.display());
+            }
         }
         sandbox.caps.configure(&mut wasi);
         Self {
@@ -3237,7 +3272,7 @@ pub(crate) mod tests {
         let bytes = std::fs::read(hello_wasm()).unwrap();
         let engine = engine().clone();
         let component = wasmtime::component::Component::new(&engine, &bytes).unwrap();
-        let linker = linker(&engine, Caps::default()).unwrap();
+        let linker = linker(&engine, Caps::default(), false).unwrap();
         fn bench_ctx() -> Ctx {
             Ctx::new(
                 &Sandbox::default(),
@@ -4175,7 +4210,7 @@ pub(crate) mod tests {
     #[test]
     fn p2_imports_are_never_linked() {
         for caps in [Caps::default(), Caps::parse("cli").unwrap()] {
-            let linker = linker(engine(), caps).unwrap();
+            let linker = linker(engine(), caps, false).unwrap();
             let p2 = linker.instantiate_pre(&importing_environment("0.2.6"));
             assert!(p2.is_err(), "{caps:?} linked wasi p2");
             linker

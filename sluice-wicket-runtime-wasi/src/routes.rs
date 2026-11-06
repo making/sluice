@@ -319,7 +319,8 @@ pub use sluice_wicket_console::status::Status;
 /// route maps a namespace while it is purged.
 pub enum Request {
     Edit {
-        edit: Edit,
+        /// Boxed: a channel's slot is the largest variant's.
+        edit: Box<Edit>,
         reply: oneshot::Sender<Result<Outcome, Refused>>,
     },
     /// Deletes the data of the namespace: the keys it held.
@@ -394,8 +395,9 @@ pub enum Refused {
     /// Another source routes the host, another owner has the app, or a
     /// route maps the keyvalue namespace.
     Taken(String),
-    /// No component of this digest (sha256) is kept: it takes an upload.
-    Missing(String),
+    /// No component or files of these digests (sha256) are kept: they take
+    /// an upload.
+    Missing(Vec<String>),
     /// The routes did not load with it: the reload's error.
     Rejected(Unloaded),
     /// The console's directory or the keyvalue store failed.
@@ -409,9 +411,11 @@ impl std::fmt::Display for Refused {
             | Refused::Unknown(message)
             | Refused::Taken(message)
             | Refused::Failed(message) => f.write_str(message),
-            Refused::Missing(sha256) => write!(
+            Refused::Missing(missing) => write!(
                 f,
-                "no component {sha256} is kept: upload it first (PUT /api/components/{sha256})"
+                "no component {0} is kept: upload it first (PUT /api/components/{0}, or \
+                 /api/files/{0} for an app's files)",
+                missing.join(", ")
             ),
             Refused::Rejected(unloaded) => unloaded.fmt(f),
         }
@@ -519,7 +523,7 @@ impl Reloader {
                 },
                 request = requests.recv(), if requests_open => match request {
                     Some(Request::Edit { edit, reply }) => {
-                        let _ = reply.send(self.apply(edit).await);
+                        let _ = reply.send(self.apply(*edit).await);
                     }
                     Some(Request::Purge { place, reply }) => {
                         let _ = reply.send(self.purge(&place).await);
@@ -744,6 +748,13 @@ impl Reloader {
                 error: format!("wasm route '{}': {e}", spec.host),
             };
             spec.sandbox.check().map_err(failed)?;
+            if let Some(files) = &spec.sandbox.files
+                && !tokio::fs::metadata(files)
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir())
+            {
+                return Err(failed(format!("files {}: no directory", files.display())));
+            }
             if let Some(path) = spec.component.path() {
                 // before the read: a write after it shows as a change
                 watched.insert(path.to_path_buf(), stamp(path).await);
@@ -778,9 +789,14 @@ impl Reloader {
                             Planned::Keep(entry.clone())
                         }
                         _ => Planned::New(
-                            wasm_host::compile(fetched, spec.sandbox.caps, spec.shown.as_deref())
-                                .await
-                                .map_err(failed)?,
+                            wasm_host::compile(
+                                fetched,
+                                spec.sandbox.caps,
+                                spec.sandbox.files.is_some(),
+                                spec.shown.as_deref(),
+                            )
+                            .await
+                            .map_err(failed)?,
                             self.stores
                                 .buckets(&spec.sandbox.keyvalue)
                                 .await
@@ -1646,6 +1662,7 @@ pub(crate) mod tests {
                         hosts: hosts.iter().map(|host| host.to_string()).collect(),
                         sha256: hex(component),
                         file: "app.wasm".into(),
+                        files: None,
                         sandbox,
                         tag: None,
                     },
@@ -1765,7 +1782,7 @@ pub(crate) mod tests {
         };
         assert_eq!(
             reloader.apply(shop(&["s1.local"], &hello, &[])).await,
-            Err(Refused::Missing(digest.clone()))
+            Err(Refused::Missing(vec![digest.clone()]))
         );
         assert_eq!(
             reloader.apply(upload(&hello, &hex(&fetch))).await,

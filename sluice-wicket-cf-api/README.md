@@ -12,7 +12,7 @@ What `cf push` deploys depends on the wicket, whose listing names its runtime:
 | | [On a wasi wicket](#on-a-wasi-wicket) | [On a Firecracker wicket](#on-a-firecracker-wicket) |
 |---|---|---|
 | the wicket | [sluice-wicket-runtime-wasi](../sluice-wicket-runtime-wasi/README.md#apps) | [sluice-wicket-runtime-firecracker](../sluice-wicket-runtime-firecracker/README.md#apps) |
-| an app | a wasm component: its bits, or an image in an OCI registry | a container image, a CNB image say, or a rootfs in a zip: microVMs |
+| an app | a wasm component: its bits, or an image in an OCI registry; or a [static site](#static-sites): html, css, js | a container image, a CNB image say, or a rootfs in a zip: microVMs |
 | the cf-api | a process or a container next to the wicket | an app of the wicket, in a VM with a disk, or next to it |
 | services | the wicket's keyvalue stores and capabilities | none |
 | `cf logs` | the app's output and requests | the process's output |
@@ -34,7 +34,7 @@ refuses any other platform.
 
 A wasm component deployed with `cf push`, from its bits or an image in an OCI registry
 (`--docker-image`), with the wicket's keyvalue stores and capabilities as
-[services](#services).
+[services](#services); or a directory of html, css and js, a [static site](#static-sites).
 
 [![cf login --sso through Dex, cf push, routes, scale, environment variables, a keyvalue service and cf logs against a wicket in local mode](demo/sluice-cf-demo.gif)](demo/sluice-cf-demo.mp4)
 
@@ -45,6 +45,8 @@ The GIF links to the [MP4](demo/sluice-cf-demo.mp4); both are recorded by `demo/
 
 ```text
 cargo build --release                                # needs protoc, and git (the build embeds the commit)
+# it embeds sluice-wicket-site, the guest of static sites, built on the toolchain it pins
+# (rustup installs it), or the one SLUICE_WICKET_SITE_WASM names (as the Docker build)
 
 # optional, for the apps' output and requests in cf logs: a flume (see sluice-flume)
 sluice-flume --token FLUME_SECRET                     # grpc://0.0.0.0:8002
@@ -60,6 +62,8 @@ target/release/sluice-wicket-cf-api --wicket http://127.0.0.1:9090 --wicket-toke
 cf login -a http://127.0.0.1:9091 -u me -p x   # any credentials: --any-credentials (see Login)
 cf push hello -p hello/                        # hello/ holds hello.wasm (a wasi:http 0.3 component)
 curl http://hello.localhost:8080/              # the wicket's --listen; *.localhost is the loopback
+cf push site -p public/                        # public/ holds index.html: a static site
+curl http://site.localhost:8080/
 # an image (see Images): the wicket's hello example, as its CI publishes it
 cf push img --docker-image ghcr.io/making/sluice/sluice-wicket-runtime-wasi/examples/hello
 cf map-route hello localhost --hostname hi
@@ -246,8 +250,8 @@ another OpenID Provider and the like.
 |---|---|
 | package (bits) | the uploaded zip: `cf push` takes a directory or a zip (`-p hello.wasm` fails in the CLI: `not a valid zip file`) |
 | package (docker) | an image (`cf push --docker-image`, a manifest's `docker.image`) holding the component as one `application/wasm` layer, as `wkg oci push` and `oras push <ref> hello.wasm:application/wasm` push it (of an index, its `wasm` entry). `--docker-username` with `CF_DOCKER_PASSWORD` are its credentials |
-| build | picks the component: the one the web process command names (`-c hello.wasm`, `command:`), else the package's only `.wasm`; of an image, pulls it. It must be a component (`\0asm`, layer 1). Anything else fails the build, naming what it found |
-| droplet | that component, by sha256 (`process_types.web` its path; stack `wasip3`, buildpack `wasm`); of an image, the image by digest (`cf app`: `docker image:`), `process_types.web` the repository's last segment `.wasm` |
+| build | picks the component: the one the web process command names (`-c hello.wasm`, `command:`), else the package's only `.wasm`, else of a package with an `index.html` sluice-wicket-site ([a static site](#static-sites)); of an image, pulls it. It must be a component (`\0asm`, layer 1). Anything else fails the build, naming what it found |
+| droplet | that component, by sha256 (`process_types.web` its path; stack `wasip3`, buildpack `wasm`, a static site's `site` with its files); of an image, the image by digest (`cf app`: `docker image:`), `process_types.web` the repository's last segment `.wasm` |
 | web process `instances` | [the limit](#instances): `pool`, warm instances taking the requests in turn, and with `concurrency` the route's `instances`. A request beyond the warm ones gets an instance of its own, as on every route, up to the limit. 0 is [as on CF](#mapping): no app in the wicket. `cf logs` names the instance (`APP/PROC/WEB/<index>`, the requests' `app_index`) within `0` to `instances - 1`, what `cf app` lists: the wicket's index, a warm one's `0` to `pool - 1`, one of its own the lowest free from `pool` up, modulo `instances` |
 | web process `memory` | `memory-mib` |
 | annotation `wicket.sluice.ik.am/budget-ms` | `budget-ms` |
@@ -261,6 +265,29 @@ another OpenID Provider and the like.
 | keyvalue service instance | the namespace `cf/<instance guid>` of its plan's store |
 | binding to a keyvalue instance | the sandbox's `keyvalue` map: its identifier (parameter `identifier`, default `""`) -> `<store>/cf/<instance guid>`, and the capability `keyvalue` |
 | binding to a wasi instance | the plan's capability; a network one `cli` too |
+
+### Static sites
+
+A package of no component, nor a rootfs, with an `index.html` at its root is a static site:
+`cf push site -p public/`. Its droplet is the site's component
+([sluice-wicket-site](../sluice-wicket-site/README.md),
+embedded in the cf-api at its build) and a tar of the package's files, which the wicket
+preopens read-only at `/` for it ([the app's `files`](../sluice-wicket-runtime-wasi/README.md#apps)):
+
+- the guest is a sandbox as any app's, of one capability: the files, read-only. It serves
+  `GET` and `HEAD` alone, a directory's `index.html`, the site's `404.html` for what is not
+  there, never a listing, a symbolic link or a dot file (but `/.well-known/`), with an `ETag`
+  (a 304 to `If-None-Match`), `Cache-Control: no-cache` and `X-Content-Type-Options: nosniff`.
+  A file streams from the wicket's disk: a site is not bounded by `cf push -m`
+- staging leaves out the dot files and directories (but `.well-known/`) and the manifest
+  at the root (`manifest.yml`, `manifest.yaml`; the CLI leaves out `.git` and its
+  `.cfignore`'s too): a `.env` or a manifest's env never reaches the wicket. A symbolic link
+  fails the build; 100000 files and 1GiB at most (the wicket's bounds of a tar)
+- the same files make the same tar, however zipped: a push of an unchanged site uploads
+  nothing new to the wicket; a file changed is served at the next start, as a component
+  (`cf push`, `cf restage`, a rolling deployment)
+- the droplet's buildpack is `site` (`cf app`); routes, scale, `cf logs` (its requests), env
+  and rolling deployments are as an app's; services have nothing to bind to
 
 ### Images
 

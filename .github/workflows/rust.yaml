@@ -12,6 +12,7 @@ on:
     - 'sluice-client-wasm/**'
     - 'sluice-flume/**'
     - 'sluice-wicket-runtime-wasi/**'
+    - 'sluice-wicket-site/**'
     - 'sluice-wicket-cf-api/**'
     - 'sluice-wicket-runtime-firecracker/**'
     - 'sluice-build-info/**'
@@ -94,6 +95,7 @@ jobs:
           - '.github/workflows/deploy-flume.yaml'
           wicket:
           - 'sluice-wicket-runtime-wasi/**'
+          - 'sluice-wicket-site/**'
           - 'sluice-build-info/**'
           - 'sluice-wicket-oidc/**'
           - 'sluice-wicket-server/**'
@@ -106,6 +108,7 @@ jobs:
           cf-api:
           - 'sluice-wicket-cf-api/**'
           - 'sluice-wicket-runtime-wasi/**'
+          - 'sluice-wicket-site/**'
           - 'sluice-flume/**'
           - 'sluice-build-info/**'
           - 'sluice-wicket-oidc/**'
@@ -120,6 +123,7 @@ jobs:
           firecracker:
           - 'sluice-wicket-runtime-firecracker/**'
           - 'sluice-wicket-cf-api/**'
+          - 'sluice-wicket-site/**'
           - 'sluice-flume/**'
           - 'sluice-build-info/**'
           - 'sluice-wicket-oidc/**'
@@ -353,9 +357,9 @@ jobs:
       run: cargo clippy --all-targets --locked -- -D warnings
     - name: Test
       run: cargo test --locked
-  # The wicket builds on its pinned stable toolchain; its tests build the example guests through
-  # the rustup cargo proxy in examples/, pinned to a nightly with wasm32-wasip3
-  # (examples/rust-toolchain.toml), and run redis-server (Debian's has TLS) for the redis
+  # The wicket builds on its pinned stable toolchain; its tests build the example guests and
+  # sluice-wicket-site through the rustup cargo proxy in examples/ and there, each pinned to a
+  # nightly with wasm32-wasip3 (their rust-toolchain.toml), and run redis-server (Debian's has TLS) for the redis
   # store. The build without it (--no-default-features) is linted, its tests are not run.
   sluice-wicket-runtime-wasi:
     needs: changes
@@ -379,26 +383,30 @@ jobs:
           ~/.cargo/git
           sluice-wicket-runtime-wasi/target
           sluice-wicket-runtime-wasi/examples/target
-        key: cargo-wicket-runtime-wasi-${{ runner.os }}-${{ hashFiles('sluice-wicket-runtime-wasi/Cargo.lock', 'sluice-wicket-runtime-wasi/examples/Cargo.lock', 'sluice-wicket-runtime-wasi/rust-toolchain.toml', 'sluice-wicket-runtime-wasi/examples/rust-toolchain.toml') }}
+          sluice-wicket-site/target
+        key: cargo-wicket-runtime-wasi-${{ runner.os }}-${{ hashFiles('sluice-wicket-runtime-wasi/Cargo.lock', 'sluice-wicket-runtime-wasi/examples/Cargo.lock', 'sluice-wicket-site/Cargo.lock', 'sluice-wicket-runtime-wasi/rust-toolchain.toml', 'sluice-wicket-runtime-wasi/examples/rust-toolchain.toml', 'sluice-wicket-site/rust-toolchain.toml') }}
     - name: Toolchains
       run: |
         rustup toolchain install
         (cd examples && rustup toolchain install)
+        (cd ../sluice-wicket-site && rustup toolchain install)
     - name: Format
       run: |
         cargo fmt --check
         (cd examples && cargo fmt --check)
+        (cd ../sluice-wicket-site && cargo fmt --check)
     - name: Clippy
       run: |
         cargo clippy --all-targets --locked -- -D warnings
         cargo clippy --locked --no-default-features -- -D warnings
         (cd examples && cargo clippy --all-targets --locked -- -D warnings)
+        (cd ../sluice-wicket-site && cargo clippy --all-targets --locked -- -D warnings)
     - name: Test
       run: cargo test --locked
   # The cf-api's integration test drives the OSS cf CLI (installed here) against the cf-api
   # and a wicket in local mode on a flume: the test builds the wicket (debug), its example
-  # guests (the nightly toolchain examples/ pins) and the flume with cargo, so their targets
-  # are cached too.
+  # guests (the nightly toolchain examples/ pins), sluice-wicket-site (the cf-api's build
+  # embeds it; the nightly it pins) and the flume with cargo, so their targets are cached too.
   sluice-wicket-cf-api:
     needs: changes
     if: needs.changes.outputs.cf-api == 'true'
@@ -426,13 +434,15 @@ jobs:
           sluice-wicket-cf-api/target
           sluice-wicket-runtime-wasi/target
           sluice-wicket-runtime-wasi/examples/target
+          sluice-wicket-site/target
           sluice-flume/target
-        key: cargo-cf-api-${{ runner.os }}-${{ hashFiles('sluice-wicket-cf-api/Cargo.lock', 'sluice-wicket-runtime-wasi/Cargo.lock', 'sluice-wicket-runtime-wasi/examples/Cargo.lock', 'sluice-flume/Cargo.lock', 'sluice-wicket-cf-api/rust-toolchain.toml', 'sluice-wicket-runtime-wasi/rust-toolchain.toml', 'sluice-wicket-runtime-wasi/examples/rust-toolchain.toml', 'sluice-flume/rust-toolchain.toml') }}
+        key: cargo-cf-api-${{ runner.os }}-${{ hashFiles('sluice-wicket-cf-api/Cargo.lock', 'sluice-wicket-runtime-wasi/Cargo.lock', 'sluice-wicket-runtime-wasi/examples/Cargo.lock', 'sluice-wicket-site/Cargo.lock', 'sluice-flume/Cargo.lock', 'sluice-wicket-cf-api/rust-toolchain.toml', 'sluice-wicket-runtime-wasi/rust-toolchain.toml', 'sluice-wicket-runtime-wasi/examples/rust-toolchain.toml', 'sluice-wicket-site/rust-toolchain.toml', 'sluice-flume/rust-toolchain.toml') }}
     - name: Toolchains
       run: |
         rustup toolchain install
         (cd ../sluice-wicket-runtime-wasi && rustup toolchain install)
         (cd ../sluice-wicket-runtime-wasi/examples && rustup toolchain install)
+        (cd ../sluice-wicket-site && rustup toolchain install)
         (cd ../sluice-flume && rustup toolchain install)
     - name: Format
       run: cargo fmt --check
@@ -531,6 +541,8 @@ jobs:
         if [ ! -e /dev/kvm ]; then echo "no /dev/kvm: skipped"; exit 0; fi
         curl -sSL https://github.com/cloudfoundry/cli/releases/download/v8.19.0/cf8-cli_8.19.0_linux_x86-64.tgz | sudo tar -xz -C /usr/local/bin cf8
         (cd ../sluice-flume && rustup toolchain install)
+        # the cf-api's build embeds sluice-wicket-site, built on the toolchain it pins
+        (cd ../sluice-wicket-site && rustup toolchain install)
         cd ../sluice-wicket-cf-api
         rustup toolchain install
         cargo test --locked --test cli the_cf_cli_deploys_to_a_firecracker_wicket

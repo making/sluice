@@ -2183,6 +2183,7 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
             .next()
             .unwrap_or(&droplet.file)
             .to_string(),
+        files: droplet.files.as_ref().map(|files| files.sha256.clone()),
         memory_mib: app.process.memory_mb,
         budget_ms: annotation(BUDGET_ANNOTATION),
         lifetime,

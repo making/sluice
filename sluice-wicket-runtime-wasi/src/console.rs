@@ -14,6 +14,7 @@
 //! PATCH  /api/routes/<host>?host=<to>           moves the console's route to another host
 //! DELETE /api/routes/<host>                     removes the console's route
 //! PUT    /api/components/<sha256>               keeps the body, a component, under its digest
+//! PUT    /api/files/<sha256>                    unpacks the body, a tar, under its digest
 //! GET    /api/apps[?after=<revision>]           the apps, as `/api/routes`
 //! PUT    /api/apps/<name>                       serves the app the body (JSON) has
 //! DELETE /api/apps/<name>?owner=<owner>         removes the app
@@ -27,13 +28,15 @@
 //! the listings name them, never their values; an app's `tag`, opaque to the
 //! console, tells its owner what it put); the apps' listing names what a
 //! sandbox may hold (the capabilities and the keyvalue stores), as the
-//! routes' does.
+//! routes' does. An app's files, a tar uploaded by digest too, are its
+//! instances' read-only at `/` (`files`).
 //!
 //! The credentials, the page's shared files and the persistence layout are
 //! `sluice-wicket-console`'s.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,7 +44,9 @@ use bytes::Bytes;
 use http::request::Parts;
 use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
-use sluice_wicket_console::http::{Body, Edited, Refusal, Response, error, json, pairs, read};
+use sluice_wicket_console::http::{
+    Body, Edited, Intake, Refusal, Response, error, json, pairs, read, receive,
+};
 use sluice_wicket_console::serve::{self, Service};
 use sluice_wicket_console::status::{Alive, Status, alive, settled};
 use sluice_wicket_console::store;
@@ -49,6 +54,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::deployed::{self, AppSpec};
 use crate::env::Env;
+use crate::files;
 use crate::keyvalue::{Place, Stores};
 use crate::routes::{Edit, Origin, Outcome, Refused, Request, Routes};
 use crate::wasm_host::{Caps, Limits, Sandbox};
@@ -74,12 +80,14 @@ pub struct Console {
     /// What the page shows besides the routes.
     pub server: Option<String>,
     pub listen: Option<SocketAddr>,
+    /// The console's directory, the apps' files below it.
+    pub dir: PathBuf,
 }
 
 impl Service for Console {
     const INDEX: &'static str = INDEX;
     const SCRIPT: &'static str = SCRIPT;
-    const DRAIN_LIMIT: u64 = MAX_COMPONENT_BYTES as u64;
+    const DRAIN_LIMIT: u64 = files::MAX_BYTES;
 
     async fn handle(&self, request: serve::Request<'_>) -> Response {
         self.route(request.parts, request.body, request.user).await
@@ -126,6 +134,11 @@ impl Console {
                     match *method {
                         Method::PUT => self.upload(sha256, parts, take()).await,
                         _ => error(StatusCode::METHOD_NOT_ALLOWED, "a component takes PUT"),
+                    }
+                } else if let Some(sha256) = path.strip_prefix("/api/files/") {
+                    match *method {
+                        Method::PUT => self.upload_files(sha256, parts, take()).await,
+                        _ => error(StatusCode::METHOD_NOT_ALLOWED, "files take PUT"),
                     }
                 } else if let Some(place) = path.strip_prefix("/api/keyvalue/") {
                     match *method {
@@ -226,6 +239,11 @@ impl Console {
             let Some(handler) = table.handler(&up.target_url) else {
                 continue;
             };
+            let sandbox = handler.sandbox();
+            let files = sandbox.files.as_ref().and_then(|files| {
+                let sha256 = files.file_name()?.to_str()?.to_string();
+                Some(FilesRef { sha256 })
+            });
             apps.push(AppView {
                 name: name.clone(),
                 owner: owner.clone(),
@@ -234,9 +252,10 @@ impl Console {
                     sha256: handler.loaded().digest().to_string(),
                     name: handler.loaded().label().to_string(),
                 },
+                files,
                 sandbox: AppSandboxView {
-                    body: SandboxBody::of(&handler.sandbox()),
-                    env: handler.sandbox().env.names(),
+                    body: SandboxBody::of(&sandbox),
+                    env: sandbox.env.names(),
                 },
                 tag: tag.clone(),
                 deployed: deployed.clone(),
@@ -347,6 +366,44 @@ impl Console {
         }
     }
 
+    /// Unpacks the body, a tar, as the files of the digest `sha256` for an
+    /// app to name; on a blocking thread, as large as it may be.
+    async fn upload_files(&self, sha256: &str, parts: &Parts, body: Body) -> Response {
+        let sha256 = match store::check_digest(sha256) {
+            Ok(sha256) => sha256,
+            Err(e) => return error(StatusCode::BAD_REQUEST, e),
+        };
+        let kept = self.dir.join(files::FILES);
+        let too_large = format!("files are a tar of {} MiB at most", files::MAX_BYTES >> 20);
+        let intake = Intake {
+            dir: &kept,
+            limit: files::MAX_BYTES,
+            too_large: &too_large,
+            empty: "no files: send a tar as the request body",
+            head: 0,
+            check: |_: &[u8]| Ok(()),
+        };
+        let received = match receive(parts, body, intake).await {
+            Ok(received) => received,
+            Err(refused) => return refused.into(),
+        };
+        if received.sha256 != sha256 {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!("the body's sha256 is {}, not {sha256}", received.sha256),
+            );
+        }
+        let bytes = received.bytes as usize;
+        match tokio::task::spawn_blocking(move || files::keep(&kept, received)).await {
+            Ok(Ok(())) => {
+                println!("console: files {sha256}: {bytes} bytes kept");
+                json(StatusCode::OK, &Uploaded { sha256, bytes })
+            }
+            Ok(Err(e)) => error(StatusCode::BAD_REQUEST, format!("the files: {e}")),
+            Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("the files: {e}")),
+        }
+    }
+
     /// Serves the app `name` as the body has it; every check of its own
     /// before the reloader's, so a malformed app is a 400 first.
     async fn put_app(&self, name: &str, parts: &Parts, body: Body) -> Response {
@@ -373,6 +430,12 @@ impl Console {
         store::check_name("owner", &body.owner)?;
         let sha256 = store::check_digest(&body.component.sha256)
             .map_err(|e| format!("component.sha256: {e}"))?;
+        let files = body
+            .files
+            .map(|files| {
+                store::check_digest(&files.sha256).map_err(|e| format!("files.sha256: {e}"))
+            })
+            .transpose()?;
         if let Some(tag) = &body.tag {
             store::check_tag(tag)?;
         }
@@ -381,6 +444,7 @@ impl Console {
             hosts: store::check_hosts(&body.hosts)?,
             sha256,
             file: body.component.name,
+            files,
             sandbox: body.sandbox.sandbox(&self.stores)?,
             tag: body.tag,
         })
@@ -455,6 +519,7 @@ impl Console {
     /// Has the reloader apply `edit`: its outcome, or the answer refusing it.
     async fn request(&self, edit: Edit) -> Result<Outcome, Refusal> {
         let (reply, outcome) = oneshot::channel();
+        let edit = Box::new(edit);
         self.reloader(Request::Edit { edit, reply }, outcome).await
     }
 
@@ -487,7 +552,7 @@ impl Console {
                 let mut refusal = Refusal::new(status, refused.to_string());
                 match refused {
                     Refused::Rejected(unloaded) => refusal.view.host = unloaded.host,
-                    Refused::Missing(sha256) => refusal.view.missing = vec![sha256],
+                    Refused::Missing(missing) => refusal.view.missing = missing,
                     _ => {}
                 }
                 Err(refusal)
@@ -662,6 +727,8 @@ struct AppView {
     owner: String,
     hosts: Vec<String>,
     component: ComponentRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<FilesRef>,
     sandbox: AppSandboxView,
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<String>,
@@ -687,6 +754,8 @@ struct AppBody {
     owner: String,
     hosts: Vec<String>,
     component: ComponentRef,
+    /// Its files, a tar uploaded by digest: read-only at `/`.
+    files: Option<FilesRef>,
     #[serde(default)]
     sandbox: SandboxBody,
     /// Opaque to the console, kept and listed as given
@@ -700,6 +769,13 @@ struct AppBody {
 struct ComponentRef {
     sha256: String,
     name: String,
+}
+
+/// An app's files, uploaded by digest.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FilesRef {
+    sha256: String,
 }
 
 /// An app's sandbox: the `--wasm` route options, its keyvalue map

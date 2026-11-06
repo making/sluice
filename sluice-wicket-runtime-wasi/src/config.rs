@@ -733,6 +733,8 @@ struct RouteFile {
     host: String,
     /// A path (relative to the config file), `file://` or `http(s)://` url.
     component: String,
+    /// The directory preopened read-only at `/`, relative to the config file.
+    files: Option<String>,
     #[serde(default)]
     sandbox: SandboxFile,
 }
@@ -745,7 +747,8 @@ impl RouteFile {
             }
             locator => locator,
         };
-        let sandbox = self.sandbox.sandbox(&self.host, stores)?;
+        let mut sandbox = self.sandbox.sandbox(&self.host, stores)?;
+        sandbox.files = self.files.map(|files| files_dir(dir, &files)).transpose()?;
         Ok(Spec {
             host: self.host,
             component,
@@ -1193,14 +1196,31 @@ pub fn parse_seconds(name: &str, value: &str) -> Result<Duration, String> {
         .map_err(|_| format!("--{name} must be a number of seconds (0 = off), got '{value}'"))
 }
 
-/// Splits `locator[?budget-ms=N&instances=N&memory-mib=N&pool=N&wasi=cap,...]`
-/// into the locator and the per-route sandbox. The `?` separator means literal `?` in file
-/// paths needs URL-escaping (`file://...%3F...`).
+/// Splits `locator[?budget-ms=N&files=DIR&instances=N&memory-mib=N&pool=N&wasi=cap,...]`
+/// into the locator and the per-route sandbox, `files` relative to the working directory.
+/// The `?` separator means literal `?` in file paths needs URL-escaping (`file://...%3F...`).
 pub fn parse_route_target(spec: &str) -> Result<(String, Sandbox), String> {
-    match spec.split_once('?') {
-        Some((target, query)) => Ok((target.to_string(), Sandbox::parse(query)?)),
-        None => Ok((spec.to_string(), Sandbox::default())),
+    let Some((target, query)) = spec.split_once('?') else {
+        return Ok((spec.to_string(), Sandbox::default()));
+    };
+    let (files, options): (Vec<&str>, Vec<&str>) = query
+        .split('&')
+        .partition(|pair| pair.starts_with("files="));
+    let mut sandbox = Sandbox::parse(&options.join("&"))?;
+    sandbox.files = match files.as_slice() {
+        [] => None,
+        [files] => Some(files_dir(Path::new("."), &files["files=".len()..])?),
+        _ => return Err("files: named twice".into()),
+    };
+    Ok((target.to_string(), sandbox))
+}
+
+/// The directory `files` names, relative to `dir`, as an absolute path.
+fn files_dir(dir: &Path, files: &str) -> Result<PathBuf, String> {
+    if files.is_empty() {
+        return Err("files: names no directory".into());
     }
+    std::path::absolute(dir.join(files)).map_err(|e| format!("files {files}: {e}"))
 }
 
 #[cfg(test)]
@@ -1294,6 +1314,7 @@ routes:
       instances: 4
   - host: b.local
     component: https://example.invalid/b.wasm
+    files: site
     sandbox:
       wasi: [keyvalue]
       keyvalue:
@@ -1379,6 +1400,7 @@ routes:
             routes[1].component,
             Locator::parse("https://example.invalid/b.wasm").unwrap()
         );
+        assert_eq!(routes[1].sandbox.files, Some(dir.0.join("site")));
         let vars = &routes[1].sandbox.env;
         let text = |pairs: [(&str, &str); 3]| {
             pairs.map(|(name, value)| (name.to_string(), value.to_string()))
@@ -1394,8 +1416,10 @@ routes:
         assert_eq!(
             route_target("b", &routes[1].sandbox),
             format!(
-                "b?env={}&keyvalue=:local/b.local,sessions:shared/demo%20sessions&wasi=keyvalue",
-                vars.digest()
+                "b?env={}&files={}&keyvalue=:local/b.local,sessions:shared/demo%20sessions\
+                 &wasi=keyvalue",
+                vars.digest(),
+                escape_path(&dir.0.join("site"))
             )
         );
         let stores = file.routes.stores();
@@ -1929,6 +1953,39 @@ routes:
         assert_eq!(sandbox.limits.budget, Duration::from_millis(250));
         assert_eq!(sandbox.limits.memory, 64 << 20);
         assert_eq!(sandbox.caps, wasm_host::Caps::default());
+        // the files' directory, relative to the working directory; never an option of the
+        // console's query
+        let (_, sandbox) = parse_route_target("./a.wasm?files=site&pool=1").unwrap();
+        let site = std::env::current_dir().unwrap().join("site");
+        assert_eq!((sandbox.files.as_ref(), sandbox.pool), (Some(&site), 1));
+        assert_eq!(
+            route_target("a", &sandbox),
+            format!("a?files={}&pool=1", escape_path(&site))
+        );
+        for (spec, error) in [
+            ("./a.wasm?files=a&files=b", "files: named twice"),
+            ("./a.wasm?files=", "files: names no directory"),
+        ] {
+            assert_eq!(parse_route_target(spec).unwrap_err(), error);
+        }
+        assert!(
+            Sandbox::parse("files=site")
+                .unwrap_err()
+                .contains("unknown option 'files'")
+        );
+    }
+
+    /// `path` percent-encoded as a route's target has it.
+    fn escape_path(path: &Path) -> String {
+        path.to_string_lossy()
+            .bytes()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    (byte as char).to_string()
+                }
+                _ => format!("%{byte:02X}"),
+            })
+            .collect()
     }
 
     #[test]

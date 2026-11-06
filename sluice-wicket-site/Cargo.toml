@@ -1,0 +1,20 @@
+[package]
+name = "sluice-wicket-site"
+version = "0.0.1-SNAPSHOT"
+edition = "2024"
+publish = false
+
+# Its own workspace: a guest component on a pinned nightly (wasm32-wasip3), built apart from
+# the wicket that runs it and the cf-api that embeds it.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# >= 0.62: older async runtimes keep their task state in context slot 0, which the
+# wasm32-wasip3 std also uses -- every async export panics there.
+wit-bindgen = { version = "0.62", features = ["async-spawn"] }
+
+[profile.release]
+strip = true

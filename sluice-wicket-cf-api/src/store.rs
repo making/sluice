@@ -3,7 +3,8 @@
 //! packages, builds, droplets, deployments and jobs, the service instances
 //! and their bindings. In memory, written by a rename to `state.json` in the
 //! data directory on every change; the blobs next to it
-//! (`packages/<guid>.zip`, `droplets/<sha256>.wasm`). Every file is its
+//! (`packages/<guid>.zip`, `droplets/<sha256>.wasm`, a static site's files
+//! `droplets/<sha256>.tar`). Every file is its
 //! owner's only (0600): the state holds the apps' environment and the
 //! credentials of their images. A write is durable when it returns, for a kill of a
 //! VM holding the directory on its disk.
@@ -181,6 +182,9 @@ pub struct Running {
     /// The component's file name in the wicket (the droplet's web process,
     /// less its directories).
     pub file: String,
+    /// The digest of a static site's files (`Files`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<String>,
     pub memory_mib: u64,
     pub budget_ms: Option<u64>,
     #[serde(default)]
@@ -355,8 +359,20 @@ pub struct Droplet {
     /// for a zip's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// A static site's files, the component serving them its `sha256`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<Files>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// A tar of a static site's files (`droplets/<sha256>.tar`), the wicket's
+/// read-only at `/` for its component.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Files {
+    pub sha256: String,
+    /// The tar's.
+    pub bytes: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -642,15 +658,7 @@ impl State {
             .cloned()
             .collect();
         self.droplets.retain(|droplet| droplet.app != guid);
-        for droplet in gone {
-            if !self
-                .droplets
-                .iter()
-                .any(|kept| kept.sha256 == droplet.sha256)
-            {
-                blobs.push(Blob::Droplet(droplet.sha256));
-            }
-        }
+        blobs.extend(self.unnamed(gone));
         self.apps.retain(|app| app.guid != guid);
         self.wicket.remove(guid);
         blobs
@@ -677,15 +685,34 @@ impl State {
             app.current_droplet = Some(droplet.to_string());
             app.updated_at = now();
         }
-        gone.into_iter()
-            .filter(|droplet| {
-                !self
-                    .droplets
-                    .iter()
-                    .any(|kept| kept.sha256 == droplet.sha256)
-            })
-            .map(|droplet| Blob::Droplet(droplet.sha256))
-            .collect()
+        self.unnamed(gone)
+    }
+
+    /// The blobs of the droplets `gone` no droplet kept names: their components, their
+    /// files.
+    fn unnamed(&self, gone: Vec<Droplet>) -> Vec<Blob> {
+        let mut blobs = Vec::new();
+        for droplet in gone {
+            let named = |kept: &Droplet| kept.sha256 == droplet.sha256;
+            let component = Blob::Droplet(droplet.sha256.clone());
+            if !self.droplets.iter().any(named) && !blobs.contains(&component) {
+                blobs.push(component);
+            }
+            let Some(files) = droplet.files else {
+                continue;
+            };
+            let files_named = |kept: &Droplet| {
+                kept.files
+                    .as_ref()
+                    .is_some_and(|kept| kept.sha256 == files.sha256)
+            };
+            let named = self.droplets.iter().any(files_named);
+            let files = Blob::Files(files.sha256);
+            if !named && !blobs.contains(&files) {
+                blobs.push(files);
+            }
+        }
+        blobs
     }
 
     /// Fails the builds a stop of the cf-api cut short: no staging outlives
@@ -756,6 +783,7 @@ impl Drop for Spool {
 pub enum Blob {
     Package(String),
     Droplet(String),
+    Files(String),
 }
 
 /// The state under a lock, written to the data directory on every change.
@@ -849,6 +877,11 @@ impl Store {
         self.dir.join("droplets").join(format!("{sha256}.wasm"))
     }
 
+    /// A static site's files, a tar.
+    pub fn files_path(&self, sha256: &str) -> PathBuf {
+        self.dir.join("droplets").join(format!("{sha256}.tar"))
+    }
+
     /// Makes the package `guid` of what `write` writes, by a rename.
     pub fn make_package<T>(
         &self,
@@ -872,12 +905,30 @@ impl Store {
         &self,
         write: impl FnOnce(&mut std::fs::File) -> Result<(T, String), String>,
     ) -> Result<T, String> {
+        self.make_digested(|sha256| self.droplet_path(sha256), write)
+    }
+
+    /// Makes a static site's files of what `write` writes, as [`Store::make_droplet`] a
+    /// droplet.
+    pub fn make_files<T>(
+        &self,
+        write: impl FnOnce(&mut std::fs::File) -> Result<(T, String), String>,
+    ) -> Result<T, String> {
+        self.make_digested(|sha256| self.files_path(sha256), write)
+    }
+
+    /// Makes the blob at `path_of` the digest `write` answers with of what it wrote.
+    fn make_digested<T>(
+        &self,
+        path_of: impl Fn(&str) -> PathBuf,
+        write: impl FnOnce(&mut std::fs::File) -> Result<(T, String), String>,
+    ) -> Result<T, String> {
         let partial = self
             .dir
             .join("droplets")
             .join(format!("{}.droplet", guid()));
         let (made, sha256) = make_by_rename(&partial, write)?;
-        let path = self.droplet_path(&sha256);
+        let path = path_of(&sha256);
         let failed = |e: std::io::Error| format!("{}: {e}", path.display());
         if path.exists() {
             std::fs::remove_file(&partial).map_err(failed)?;
@@ -910,6 +961,7 @@ impl Store {
             let path = match blob {
                 Blob::Package(guid) => self.package_path(guid),
                 Blob::Droplet(sha256) => self.droplet_path(sha256),
+                Blob::Files(sha256) => self.files_path(sha256),
             };
             if let Err(e) = std::fs::remove_file(&path)
                 && e.kind() != std::io::ErrorKind::NotFound
@@ -1022,6 +1074,7 @@ mod tests {
             file: "hello.wasm".into(),
             bytes: 1,
             image: None,
+            files: None,
             created_at: now(),
             updated_at: now(),
         };
@@ -1039,6 +1092,29 @@ mod tests {
         assert_eq!(
             state.set_current_droplet(&app, "d4"),
             vec![Blob::Droplet("b".into())]
+        );
+        // a static site's files go with the last droplet naming them, its component stays
+        let site = |guid: &str, files: &str| Droplet {
+            files: Some(Files {
+                sha256: files.into(),
+                bytes: 1,
+            }),
+            ..droplet(guid, "s")
+        };
+        state.droplets.push(site("d5", "f"));
+        assert_eq!(
+            state.set_current_droplet(&app, "d5"),
+            vec![Blob::Droplet("a".into())]
+        );
+        state.droplets.push(site("d6", "g"));
+        assert_eq!(
+            state.set_current_droplet(&app, "d6"),
+            vec![Blob::Droplet("c".into())]
+        );
+        state.droplets.push(site("d7", "g"));
+        assert_eq!(
+            state.set_current_droplet(&app, "d7"),
+            vec![Blob::Files("f".into())]
         );
         // a zip, then an image whose password no debug output shows
         for (guid, docker) in [
@@ -1104,8 +1180,8 @@ mod tests {
             state.remove_app(&app),
             vec![
                 Blob::Package("p2".into()),
-                Blob::Droplet("a".into()),
-                Blob::Droplet("c".into())
+                Blob::Droplet("s".into()),
+                Blob::Files("g".into())
             ]
         );
         assert!(state.apps.is_empty());

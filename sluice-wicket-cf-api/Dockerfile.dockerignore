@@ -1,4 +1,5 @@
-# the context is the repository root; the build needs the proto, the crate and its build script dependency only
+# the context is the repository root; the build needs the proto, the crate, its build script
+# dependency and sluice-wicket-site with the WIT it builds on only
 *
 !sluice-proto/src/main/proto
 !sluice-build-info/Cargo.toml
@@ -13,3 +14,9 @@
 !sluice-wicket-cf-api/Cargo.lock
 !sluice-wicket-cf-api/build.rs
 !sluice-wicket-cf-api/src
+!sluice-wicket-runtime-wasi/wit
+!sluice-wicket-site/.cargo
+!sluice-wicket-site/Cargo.toml
+!sluice-wicket-site/Cargo.lock
+!sluice-wicket-site/rust-toolchain.toml
+!sluice-wicket-site/src

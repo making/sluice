@@ -1,8 +1,20 @@
 # sluice-wicket-cf-api as a static musl binary on distroless static. The flume proto lives
 # in sluice-proto, the build script dependency in sluice-build-info, the OpenID Provider
-# client in sluice-wicket-oidc, the connections in sluice-wicket-server and the image pulls in
-# sluice-wicket-registry, so the build context is the repository root:
+# client in sluice-wicket-oidc, the connections in sluice-wicket-server, the image pulls in
+# sluice-wicket-registry and the component a static site is staged with in sluice-wicket-site
+# (on the WIT of sluice-wicket-runtime-wasi), so the build context is the repository root:
 #   docker build -f sluice-wicket-cf-api/Dockerfile --build-arg GIT_COMMIT=$(git rev-parse HEAD) .
+
+# sluice-wicket-site, on the nightly toolchain it pins (wasm32-wasip3), on glibc: the
+# component is the same wherever it is built
+FROM rust:1.99-slim-trixie AS site
+WORKDIR /src
+COPY sluice-wicket-runtime-wasi/wit sluice-wicket-runtime-wasi/wit
+COPY sluice-wicket-site sluice-wicket-site
+RUN cd sluice-wicket-site \
+    && rustup toolchain install \
+    && cargo build --release --locked
+
 FROM rust:1.99-alpine AS build
 RUN apk add --no-cache musl-dev protoc
 WORKDIR /src
@@ -17,9 +29,10 @@ COPY sluice-wicket-registry/Cargo.toml sluice-wicket-registry/
 COPY sluice-wicket-registry/src sluice-wicket-registry/src
 COPY sluice-wicket-cf-api/Cargo.toml sluice-wicket-cf-api/Cargo.lock sluice-wicket-cf-api/build.rs sluice-wicket-cf-api/
 COPY sluice-wicket-cf-api/src sluice-wicket-cf-api/src
+COPY --from=site /src/sluice-wicket-site/target/wasm32-wasip3/release/sluice_wicket_site.wasm /site.wasm
 # the context has no .git: the commit --version and /v3/info show comes from here
 ARG GIT_COMMIT=""
-RUN SLUICE_GIT_COMMIT=${GIT_COMMIT} \
+RUN SLUICE_GIT_COMMIT=${GIT_COMMIT} SLUICE_WICKET_SITE_WASM=/site.wasm \
     cargo build --release --locked --manifest-path sluice-wicket-cf-api/Cargo.toml \
     && mkdir /data
 

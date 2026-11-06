@@ -6,6 +6,8 @@
 //! GET    /api/apps[?after=<revision>]          the apps, the capabilities and the keyvalue
 //!                                              stores; held until they change with `after`
 //! PUT    /api/components/<sha256>              keeps the body under its digest
+//! PUT    /api/files/<sha256>                   a wasm wicket: unpacks the body, a tar of an
+//!                                              app's files, under its digest
 //! PUT    /api/images                           a Firecracker wicket: makes an ext4 image of
 //!                                              an OCI image, kept under its digest
 //! PUT    /api/apps/<name>                      serves the app of the body
@@ -41,6 +43,9 @@ pub struct AppBody {
     pub owner: String,
     pub hosts: Vec<String>,
     pub component: ComponentRef,
+    /// A static site's files, read-only at `/` for its component.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<FilesRef>,
     pub sandbox: Sandbox,
     /// Opaque to the wicket, listed as put: the snapshot's
     /// (`crate::env::tag`).
@@ -52,6 +57,11 @@ pub struct AppBody {
 pub struct ComponentRef {
     pub sha256: String,
     pub name: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct FilesRef {
+    pub sha256: String,
 }
 
 /// The sandbox: the route options in JSON, as the wicket runs apps: the `--wasm`
@@ -308,16 +318,34 @@ impl Wicket {
     /// Uploads the component in `file` as it is read: it may be larger than this process's
     /// memory.
     pub async fn upload(&self, sha256: &str, file: tokio::fs::File) -> Result<(), Failure> {
+        self.upload_as("components", "application/wasm", sha256, file)
+            .await
+    }
+
+    /// Uploads a static site's files, the tar in `file`, as [`Wicket::upload`] a component.
+    pub async fn upload_files(&self, sha256: &str, file: tokio::fs::File) -> Result<(), Failure> {
+        self.upload_as("files", "application/x-tar", sha256, file)
+            .await
+    }
+
+    /// PUTs `file`, of `content_type`, to `/api/<kind>/<sha256>`.
+    async fn upload_as(
+        &self,
+        kind: &str,
+        content_type: &str,
+        sha256: &str,
+        file: tokio::fs::File,
+    ) -> Result<(), Failure> {
         let bytes = file
             .metadata()
             .await
-            .map_err(|e| Failure::Unreachable(format!("the component: {e}")))?
+            .map_err(|e| Failure::Unreachable(format!("the upload of {kind}: {e}")))?
             .len();
         let request = self
             .client
-            .put(format!("{}/api/components/{sha256}", self.base))
+            .put(format!("{}/api/{kind}/{sha256}", self.base))
             .timeout(IMAGE_TIMEOUT)
-            .header("content-type", "application/wasm")
+            .header("content-type", content_type)
             .header("content-length", bytes)
             .body(file);
         let (status, body) = self.send(request).await?;

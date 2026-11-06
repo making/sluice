@@ -1,0 +1,7 @@
+# wasm32-wasip3 ships rust-std on nightly only: the nightly sluice-wicket-runtime-wasi's examples
+# pin, kept the same.
+[toolchain]
+channel = "nightly-2026-10-18"
+profile = "minimal"
+targets = ["wasm32-wasip3"]
+components = ["rustfmt", "clippy"]

@@ -28,21 +28,36 @@ const HANG: Duration = Duration::from_secs(60);
 /// build them.
 fn guests() -> PathBuf {
     let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    build(&examples, &["-p", "hello", "-p", "counter"])
+}
+
+/// The component of sluice-wicket-site, the static site's guest
+/// sluice-wicket-cf-api embeds.
+fn site() -> PathBuf {
+    let site = Path::new(env!("CARGO_MANIFEST_DIR")).join("../sluice-wicket-site");
+    build(&site, &[]).join("sluice_wicket_site.wasm")
+}
+
+/// Builds the guests of the workspace `dir` (release, `args` naming them) through the
+/// rustup proxy, on the toolchain it pins: their directory.
+fn build(dir: &Path, args: &[&str]) -> PathBuf {
     let output = Command::new("cargo")
-        .args(["build", "--release", "-p", "hello", "-p", "counter"])
+        .args(["build", "--release"])
+        .args(args)
         .env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("CARGO")
-        .current_dir(&examples)
+        .current_dir(dir)
         .output()
         .expect("run cargo (rustup) for the guest build");
     assert!(
         output.status.success(),
-        "guest build failed: {}",
+        "guest build in {} failed: {}",
+        dir.display(),
         String::from_utf8_lossy(&output.stderr)
     );
     std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| examples.join("target"))
+        .unwrap_or_else(|_| dir.join("target"))
         .join("wasm32-wasip3/release")
 }
 
@@ -169,9 +184,21 @@ async fn console_raw(
     headers: &[&str],
     body: &[u8],
 ) -> (u16, String, String) {
+    exchange(address, address, request, headers, body).await
+}
+
+/// An http/1.1 request with `host` to `address`, closed after it: the
+/// status, the head and the body.
+async fn exchange(
+    address: &str,
+    host: &str,
+    request: &str,
+    headers: &[&str],
+    body: &[u8],
+) -> (u16, String, String) {
     let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
     let mut head = format!(
-        "{request} HTTP/1.1\r\nhost: {address}\r\nconnection: close\r\ncontent-length: {}\r\n",
+        "{request} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\ncontent-length: {}\r\n",
         body.len()
     );
     for header in headers {
@@ -718,6 +745,116 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         )),
         "{error}"
     );
+    // an app's files: a tar uploaded by digest, its instances' read-only at /, served by
+    // sluice-wicket-site; one importing wasi:filesystem without them does not load
+    let site = std::fs::read(site()).unwrap();
+    let (status, _, _) = console(&at, &upload(&site), &[bearer], &site).await;
+    assert_eq!(status, 200);
+    let tar = {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, content) in [
+            ("index.html", "<p>home"),
+            ("docs/index.html", "<p>docs"),
+            ("404.html", "<p>lost"),
+            ("app.js", "go()"),
+            (".env", "SECRET=s3cr3t"),
+            (".well-known/security.txt", "Contact: me"),
+        ] {
+            let mut header = tar::Header::new_ustar();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(1_700_000_000);
+            builder
+                .append_data(&mut header, name, content.as_bytes())
+                .unwrap();
+        }
+        builder.into_inner().unwrap()
+    };
+    let site_app = |files: Option<&[u8]>| {
+        let mut app = serde_json::json!({"owner": "cf", "hosts": ["site.localhost"],
+            "component": {"sha256": digest(&site), "name": "site.wasm"}});
+        if let Some(files) = files {
+            app["files"] = serde_json::json!({"sha256": digest(files)});
+        }
+        app.to_string().into_bytes()
+    };
+    let (status, _, body) = console(&at, "PUT /api/apps/site", &[bearer], &site_app(None)).await;
+    assert_eq!(status, 422, "{body}");
+    assert!(body.contains("the route grants no files"), "{body}");
+    let put_site = site_app(Some(&tar));
+    let (status, _, body) = console(&at, "PUT /api/apps/site", &[bearer], &put_site).await;
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        (status, &body["missing"]),
+        (409, &serde_json::json!([digest(&tar)]))
+    );
+    let files = format!("PUT /api/files/{}", digest(&tar));
+    let (status, _, body) = console(&at, &files, &[bearer], b"not this").await;
+    assert_eq!(status, 400);
+    assert!(body.contains("the body's sha256 is"), "{body}");
+    let not_tar = b"not a tar".repeat(100);
+    let not_tar_files = format!("PUT /api/files/{}", digest(&not_tar));
+    let (status, _, body) = console(&at, &not_tar_files, &[bearer], &not_tar).await;
+    assert_eq!(status, 400, "{body}");
+    for _ in 0..2 {
+        // again: kept as it is
+        let (status, _, body) = console(&at, &files, &[bearer], &tar).await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let (status, _, body) = console(&at, "PUT /api/apps/site", &[bearer], &put_site).await;
+    assert_eq!(status, 200, "{body}");
+    let site_get = |path: &str, headers: &[&str]| {
+        let (address, request) = (address.clone(), path.to_string());
+        let headers: Vec<String> = headers.iter().map(|header| header.to_string()).collect();
+        async move {
+            let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+            let (status, head, body) =
+                exchange(&address, "site.localhost", &request, &headers, b"").await;
+            (status, head.to_lowercase(), body)
+        }
+    };
+    let (status, head, body) = site_get("GET /", &[]).await;
+    assert_eq!((status, body.as_str()), (200, "<p>home"));
+    assert!(
+        head.contains("content-type: text/html; charset=utf-8"),
+        "{head}"
+    );
+    assert!(head.contains("x-content-type-options: nosniff"), "{head}");
+    // as it came: a weak tag's W/ is case-sensitive
+    let (_, raw, _) = exchange(&address, "site.localhost", "GET /", &[], b"").await;
+    let etag = raw
+        .lines()
+        .find_map(|line| line.strip_prefix("etag: "))
+        .expect("an etag")
+        .to_string();
+    assert!(head.contains(&format!("etag: {}", etag.to_lowercase())));
+    let (status, _, body) = site_get("GET /", &[&format!("if-none-match: {etag}")]).await;
+    assert_eq!((status, body.as_str()), (304, ""));
+    let (status, head, _) = site_get("GET /docs?x=1", &[]).await;
+    assert_eq!(status, 301);
+    assert!(head.contains("location: /docs/?x=1"), "{head}");
+    assert_eq!(site_get("GET /docs/", &[]).await.2, "<p>docs");
+    let (status, head, body) = site_get("HEAD /app.js", &[]).await;
+    assert_eq!((status, body.as_str()), (200, ""));
+    assert!(head.contains("content-type: text/javascript"), "{head}");
+    assert!(head.contains("content-length: 4"), "{head}");
+    assert_eq!(
+        site_get("GET /.well-known/security.txt", &[]).await.2,
+        "Contact: me"
+    );
+    for hidden in ["/.env", "/docs/.env", "/nope"] {
+        let (status, _, body) = site_get(&format!("GET {hidden}"), &[]).await;
+        assert_eq!((status, body.as_str()), (404, "<p>lost"), "{hidden}");
+    }
+    assert_eq!(site_get("GET /%2e%2e/etc/passwd", &[]).await.0, 400);
+    assert_eq!(site_get("POST /", &[]).await.0, 405);
+    let (_, _, apps) = console(&at, "GET /api/apps", &[bearer], b"").await;
+    let apps: serde_json::Value = serde_json::from_str(&apps).unwrap();
+    let listed = apps["apps"].as_array().unwrap();
+    let listed = listed.iter().find(|app| app["name"] == "site").unwrap();
+    assert_eq!(listed["files"], serde_json::json!({"sha256": digest(&tar)}));
+    let (status, _, _) = console(&at, "DELETE /api/apps/site?owner=cf", &[bearer], b"").await;
+    assert_eq!(status, 200);
     // its keyvalue namespace's data is deleted once no route maps it
     let purge = "DELETE /api/keyvalue/local/cf%2Fshop";
     let (status, _, body) = console(&at, purge, &[bearer], b"").await;
@@ -739,7 +876,7 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         (status, body.as_str()),
         (
             200,
-            r#"{"generation":4,"message":"removed a.localhost, b.localhost"}"#
+            r#"{"generation":6,"message":"removed a.localhost, b.localhost"}"#
         )
     );
     assert_eq!(get(&address, "a.localhost", "/").await.0, 404);

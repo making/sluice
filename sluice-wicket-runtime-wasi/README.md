@@ -182,12 +182,17 @@ routes. The cap reserves nothing: only `pool` does. It must be at least 1 and
 at least `pool` (a startup error otherwise); above `--max-instances` it is no
 error, that limit bounding it. With a cap equal to `pool`, a
 request finding every unit busy waits for one instead of instantiating per
-request. A literal `?` in a file path needs URL-escaping.
+request. `files=<dir>` preopens the directory read-only at `/` for the route's instances
+(`wasi:filesystem`, linked for it without `cli`), relative to the working directory; a
+directory that is not there fails the route's load, and its files are read as they are
+(nothing is watched). The console's page takes no `files`: its directories are the
+wicket's to name. A literal `?` in a file path needs URL-escaping.
 
 ```text
 --wasm demo.local=hello.wasm?budget-ms=5000&memory-mib=64
 --wasm demo.local=hello.wasm?pool=8
 --wasm batch.local=batch.wasm?instances=4
+--wasm site.local=site.wasm?files=public     # a static site (sluice-wicket-site)
 curl -H 'Host: demo.local' http://127.0.0.1:8000/hello
 ```
 
@@ -267,6 +272,9 @@ routes:
       keyvalue:                 # optional: identifier -> store[/namespace]
         "": local               # the namespace defaults to the host
         sessions: shared/sessions
+  - host: site.local
+    component: site.wasm
+    files: public               # read-only at / (files= of the flag), relative to this file
 ```
 
 - durations take `ms`, `s`, `m` or `h` (`tunnel-stall-timeout`, `drain-grace` and
@@ -479,6 +487,7 @@ removed by its owner: the API of a controller keeping the desired state of its a
 | request | |
 |---|---|
 | `PUT /api/components/<sha256>` | keeps the body, a component of 128MiB at most, under its digest (400 when the body has another): `{"sha256": .., "bytes": ..}` |
+| `PUT /api/files/<sha256>` | unpacks the body, a tar of an app's files (1GiB at most), under its digest, as the component's: `{"sha256": .., "bytes": ..}`; 400 naming what of the tar is refused |
 | `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "capabilities", "keyvalue_stores", "apps": [..]}`; `capabilities` and `keyvalue_stores` name what a sandbox may hold |
 | `PUT /api/apps/<name>` | serves the app of the body (JSON, below) |
 | `DELETE /api/apps/<name>?owner=<owner>` | removes the app of `owner` |
@@ -489,6 +498,7 @@ removed by its owner: the API of a controller keeping the desired state of its a
   "owner": "cf",
   "hosts": ["counter.localhost", "count.localhost"],
   "component": {"sha256": "0954dc11…e8", "name": "counter.wasm"},
+  "files": {"sha256": "7a1c…04"},
   "sandbox": {"wasi": ["keyvalue"], "budget_ms": 10000, "memory_mib": 256, "pool": 1,
               "instances": null, "keyvalue": {"": "local/cf/5d2f-guid"},
               "env": {"GREETING": "hello"}},
@@ -509,6 +519,13 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
   host to default the namespace to), the stores those of `keyvalue_stores`; and its `env`,
   `name -> value` as a config file route's (strings). The listings name the variables only
   (`"env": ["GREETING"]`, left out without one), never a value
+- `files` (optional) are the app's files, its instances' read-only at `/` (as `files=` of a
+  route): a tar uploaded by digest first, of regular files and directories only (a link, a
+  device or a name out of the root fails the upload), each name once, 100000 entries and
+  1GiB unpacked at most; a file keeps the tar's time. A component importing
+  `wasi:filesystem` gets no app without them, nor `wasi=cli`. Files no app names are
+  removed once `UPLOAD_GRACE` (10 minutes) passed since their upload. `sluice-wicket-cf-api`
+  serves a static site so, with [sluice-wicket-site](../sluice-wicket-site/README.md)
 - `tag` (optional; 1 to 128 printable ASCII chars but the space) is opaque to the wicket:
   kept and listed as given, so a controller tells what it put, an env it cannot read back
   included (`sluice-wicket-cf-api` tags each start's snapshot with a random tag). A tag alone
@@ -525,9 +542,9 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
   its own. Its target names neither `pool` nor `instances`: a PUT changing them is [no change of
   what runs](#instance-pool), and advertises nothing
 - answered as the console's edits, and 409 for a host another source, the page or another app
-  routes, for another owner's app, and for a component no upload kept (`"missing":
-  ["<sha256>"]`); a 422 names the host whose route did not load (`"host"`; none when no one
-  route failed, e.g. pools past `--max-instances`)
+  routes, for another owner's app, and for a component or files no upload kept (`"missing":
+  ["<sha256>", ..]`, every digest missing); a 422 names the host whose route did not load
+  (`"host"`; none when no one route failed, e.g. pools past `--max-instances`)
 - the page lists an app's routes read-only (`origin: "api"`, with `app` and `owner`), and its
   per-host endpoints refuse their hosts (409)
 - an app and an owner are named by 1 to 100 of `A-Z`, `a-z`, `0-9`, `.`, `_` and `-`, starting

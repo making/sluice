@@ -31,7 +31,9 @@ use std::time::Duration;
 use crate::logs::Logs;
 use crate::services::Offer;
 use crate::store::{App, Lifetime, Outcome, Purge, State, Store};
-use crate::wicket::{AppBody, ComponentRef, Failure, ListedApp, Runtime, Sandbox, Wicket};
+use crate::wicket::{
+    AppBody, ComponentRef, Failure, FilesRef, ListedApp, Runtime, Sandbox, Wicket,
+};
 
 pub struct Controller {
     pub store: Arc<Store>,
@@ -110,6 +112,7 @@ impl Controller {
                 sha256: running.sha256.clone(),
                 name: running.file.clone(),
             },
+            files: running.files.clone().map(|sha256| FilesRef { sha256 }),
             sandbox: match running.file.ends_with(crate::staging::ROOTFS) {
                 true => vm_sandbox(
                     running.memory_mib,
@@ -316,6 +319,17 @@ impl Controller {
     /// wicket of another guest makes another digest: the droplet and the running app are
     /// that one's from here on, a rebuild of the same image and guest the same.
     async fn provide(&self, sha256: &str, app: &mut AppBody) -> Result<(), Failure> {
+        if app
+            .files
+            .as_ref()
+            .is_some_and(|files| files.sha256 == sha256)
+        {
+            let path = self.store.files_path(sha256);
+            return match tokio::fs::File::open(&path).await {
+                Ok(files) => self.wicket.upload_files(sha256, files).await,
+                Err(e) => Err(gone(sha256, &path, e)),
+            };
+        }
         let path = self.store.droplet_path(sha256);
         match tokio::fs::File::open(&path).await {
             Ok(component) => return self.wicket.upload(sha256, component).await,
@@ -602,6 +616,7 @@ fn same(listed: &AppBody, desired: &AppBody) -> bool {
     let conns = |sandbox: &Sandbox| sandbox.conns.unwrap_or(DEFAULT_CONCURRENCY);
     sorted(&listed.hosts) == desired.hosts
         && listed.component == desired.component
+        && listed.files == desired.files
         && sorted(&listed.sandbox.wasi) == sorted(&desired.sandbox.wasi)
         && sorted(&listed.sandbox.egress) == sorted(&desired.sandbox.egress)
         && listed.sandbox.pool == desired.sandbox.pool
@@ -642,6 +657,7 @@ mod tests {
             droplet: "d".into(),
             sha256: "ab".repeat(32),
             file: "hello.wasm".into(),
+            files: Some("cd".repeat(32)),
             memory_mib: 64,
             budget_ms: Some(5000),
             lifetime: Lifetime::default(),
@@ -661,6 +677,12 @@ mod tests {
         state.map(&route, &guid);
         let desired = Controller::desired(&state, state.app(&guid).unwrap(), "cf").unwrap();
         assert_eq!(desired.hosts, ["hello.localhost"]);
+        assert_eq!(
+            desired.files,
+            Some(FilesRef {
+                sha256: "cd".repeat(32)
+            })
+        );
         assert_eq!(desired.sandbox.pool, Some(2));
         assert_eq!(desired.sandbox.memory_mib, Some(64));
         assert_eq!(desired.sandbox.keyvalue[""], "local/cf/i");
@@ -677,6 +699,9 @@ mod tests {
         listed.tag = Some("t0".into());
         assert!(!same(&listed, &desired), "another snapshot");
         listed.tag = desired.tag.clone();
+        listed.files = None;
+        assert!(!same(&listed, &desired), "other files");
+        listed.files = desired.files.clone();
         listed.sandbox.budget_ms = Some(5000);
         // the wicket lists the capabilities in its order
         listed.sandbox.wasi = vec!["cli".into(), "keyvalue".into()];

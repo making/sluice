@@ -487,6 +487,7 @@ pub fn build(base: &str, state: &State, build: &Build) -> Value {
 pub fn droplet(base: &str, droplet: &Droplet) -> Value {
     let (buildpack, stack) = match droplet.file.ends_with(crate::staging::ROOTFS) {
         true => ("rootfs", ROOTFS_STACK),
+        false if droplet.files.is_some() => ("site", STACK),
         false => ("wasm", STACK),
     };
     let (kind, buildpacks, stack) = match droplet.image {
@@ -871,6 +872,7 @@ mod tests {
             droplet: "d".into(),
             sha256: "ab".repeat(32),
             file: "a.wasm".into(),
+            files: None,
             memory_mib: 64,
             budget_ms: None,
             lifetime: crate::store::Lifetime::default(),

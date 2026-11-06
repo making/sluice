@@ -57,6 +57,7 @@
 pub mod config;
 mod console;
 mod deployed;
+mod files;
 mod keyvalue;
 mod listener;
 mod routes;
@@ -189,6 +190,7 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
                 stores: reloader.stores().clone(),
                 server: server.clone(),
                 listen: listening,
+                dir: console.dir.clone(),
             }),
         ));
     } else {

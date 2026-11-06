@@ -30,6 +30,9 @@ serde-saphyr = { version = "2", default-features = false, features = ["deseriali
 sha2 = "0.10"
 # the package cf push uploads
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# a static site's files, as the wicket takes them (and the layers of the image the test
+# pushes for a Firecracker wicket)
+tar = { version = "0.4", default-features = false }
 # the guids
 uuid = { version = "1", features = ["v4"] }
 form_urlencoded = "1"
@@ -54,7 +57,6 @@ sluice-wicket-oidc = { path = "../sluice-wicket-oidc", features = ["mock"] }
 # paused time for the bound on a quiet connection
 tokio = { version = "1", features = ["test-util"] }
 # the layers of the image the test pushes for a Firecracker wicket
-tar = { version = "0.4", default-features = false }
 flate2 = "1"
 
 [build-dependencies]

@@ -47,3 +47,17 @@ beside it on the same socket, polled with it and never at once: a probe cannot l
 writes (no probe while they are unflushed, as a pipelined request's predecessor may still be). The FIN is
 tokio's sticky `READ_CLOSED`, read each interval rather than awaited: bytes pipelined behind the request
 keep the socket readable, and waiting for it would spin.
+
+## A guest's files, and a response's headers
+
+An app's files reach its guest as a directory preopened read-only at `/` (`wasi:filesystem`,
+`FsPerms::ReadOnly`), linked for the route alone without `cli`: the guest opens and reads, and its
+reads stream from the host (`read-via-stream` hands back the stream a response body takes as it is,
+so a file is never copied into linear memory and a site is not bounded by `memory-mib`). The
+directory is unpacked once from a tar uploaded by digest, files and directories only, and keeps the
+tar's times: a guest's `ETag` of size and time is the tar's, the same on every wicket and across
+restarts. A preopen is opened per store: a request without a pool opens it per request.
+
+In wasi:http 0.3, `response.get-headers` (and the request's) answers an immutable copy: an `append`
+on it fails, and with `let _ =` silently. Every header goes into the `fields` before
+`Response::new` (sluice-wicket-site's `text` takes them so).

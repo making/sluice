@@ -1327,8 +1327,41 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "{body}"
     );
 
+    // a static site: a directory of no component with an index.html, served by the site
+    // guest from its files, read-only; its dot files never reach the wicket
+    let site = dir.join("site");
+    std::fs::create_dir_all(site.join("docs")).unwrap();
+    for (name, body) in [
+        ("index.html", "<h1>home</h1>"),
+        ("docs/index.html", "<h1>docs</h1>"),
+        ("style.css", "h1{}"),
+        (".env", "SECRET=s3cr3t"),
+    ] {
+        std::fs::write(site.join(name), body).unwrap();
+    }
+    cf.ok(&["push", "site", "-p", site.to_str().unwrap()]);
+    let page = |path: &str| get(&listen, "site.localhost", path, None);
+    assert_eq!(page("/"), (200, "<h1>home</h1>".into()));
+    assert_eq!(page("/docs/"), (200, "<h1>docs</h1>".into()));
+    assert_eq!(page("/.env").0, 404);
+    let kept: Vec<PathBuf> = std::fs::read_dir(dir.join("deployed/files"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert!(kept[0].join("style.css").is_file() && !kept[0].join(".env").exists());
+    let staged = cf.ok(&["logs", "site", "--recent"]);
+    assert!(
+        staged.contains("Staged site.wasm") && staged.contains("serving the files of a"),
+        "{staged}"
+    );
+    // pushed again with a page changed: the new files served
+    std::fs::write(site.join("index.html"), "<h1>home, again</h1>").unwrap();
+    cf.ok(&["push", "site", "-p", site.to_str().unwrap()]);
+    assert_eq!(page("/"), (200, "<h1>home, again</h1>".into()));
+
     // gone from the wicket; their instances stay, unbound
-    for app in ["hello", "counter", "relay", "img"] {
+    for app in ["hello", "counter", "relay", "img", "site"] {
         cf.ok(&["delete", app, "-r", "-f"]);
     }
     assert!(listing(&console)["apps"].as_array().unwrap().is_empty());

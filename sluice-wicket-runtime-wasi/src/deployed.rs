@@ -4,12 +4,13 @@
 //! uploaded with it, the default keyvalue map. An app is the API's (a
 //! controller's): hosts served by one component in one sandbox, its component
 //! uploaded by digest first, its keyvalue map named, changed by its owner
-//! only.
+//! only; its files too, if any (`files`).
 //!
 //! ```text
 //! <dir>/routes.yaml                      the routes and the apps, in the --config file's route shape
 //! <dir>/components/<sha256>/<name>.wasm  the components they name, never rewritten
 //! <dir>/uploads/<sha256>.wasm            the components uploaded by digest, for UPLOAD_GRACE
+//! <dir>/files/<sha256>/                  the apps' files, unpacked from a tar of that digest
 //! ```
 //!
 //! A component's path names its digest, so other content is another target:
@@ -33,6 +34,7 @@ use sluice_wicket_console::store::{
 };
 
 use crate::config::{SandboxFile, quote, sandbox_yaml};
+use crate::files::{self, FILES};
 use crate::keyvalue::{BucketMap, Place, Stores};
 use crate::routes::{Origin, Refused, Spec};
 use crate::wasm_host::{Caps, Locator, Sandbox};
@@ -68,8 +70,10 @@ pub struct App {
     /// The component file relative to the directory,
     /// `components/<sha256>/<name>`.
     pub component: String,
+    /// Its files' directory relative to the directory, `files/<sha256>`.
+    pub files: Option<String>,
     /// With its keyvalue map in full: an app has no one host to default a
-    /// namespace to.
+    /// namespace to; without its files (`files`).
     pub sandbox: Sandbox,
     /// The owner's, kept and listed as given ([`check_tag`]).
     pub tag: Option<String>,
@@ -86,6 +90,8 @@ pub struct AppSpec {
     pub sha256: String,
     /// The file name the component is kept as.
     pub file: String,
+    /// The digest of its files' tar.
+    pub files: Option<String>,
     /// With its keyvalue map ([`app_map`]).
     pub sandbox: Sandbox,
     pub tag: Option<String>,
@@ -114,7 +120,7 @@ impl Deployed {
             Err(e) => return Err(format!("{}: {e}", manifest.display())),
         };
         let deployed = Deployed { dir, routes, apps };
-        deployed.collect_garbage();
+        deployed.collect(true);
         Ok(deployed)
     }
 
@@ -142,11 +148,15 @@ impl Deployed {
             }
         });
         let apps = self.apps.iter().flat_map(|app| {
-            app.hosts.iter().map(|host| Spec {
+            let sandbox = Sandbox {
+                files: app.files.as_ref().map(|files| self.dir.join(files)),
+                ..app.sandbox.clone()
+            };
+            app.hosts.iter().map(move |host| Spec {
                 host: host.clone(),
                 component: Locator::File(self.dir.join(&app.component)),
                 shown: Some(app.component.clone()),
-                sandbox: app.sandbox.clone(),
+                sandbox: sandbox.clone(),
                 origin: Origin::Api {
                     name: app.name.clone(),
                     owner: app.owner.clone(),
@@ -265,9 +275,10 @@ impl Deployed {
 
     /// The apps with the app `name` as `app` has it since `now`: its
     /// component made from an upload or another file of its digest, in place
-    /// of the app of that name -- which keeps its time when its component and
-    /// sandbox stay, its tag changing or not -- or added last. Another
-    /// owner's app is refused, and so is a component of a digest not kept.
+    /// of the app of that name -- which keeps its time when its component,
+    /// files and sandbox stay, its tag changing or not -- or added last.
+    /// Another owner's app is refused, and so are a component and files of a
+    /// digest not kept (all of them named).
     pub fn with_app(&self, name: &str, app: AppSpec, now: SystemTime) -> Result<Deployed, Refused> {
         check_name("app", name).map_err(Refused::Invalid)?;
         check_name("owner", &app.owner).map_err(Refused::Invalid)?;
@@ -291,18 +302,48 @@ impl Deployed {
                 kept.owner, app.owner
             )));
         }
+        debug_assert!(app.sandbox.files.is_none(), "an app's files are its own");
+        let files = app
+            .files
+            .as_deref()
+            .map(|files| {
+                check_digest(files).map_err(|e| Refused::Invalid(format!("files.sha256: {e}")))
+            })
+            .transpose()?;
+        let component = self.materialize(&sha256, &app.file);
+        let kept_files = files.as_ref().map(|files| {
+            let relative = format!("{FILES}/{files}");
+            match files::is_dir(&self.dir.join(&relative)) {
+                true => Ok(relative),
+                false => Err(files.clone()),
+            }
+        });
+        let (component, files) = match (component, kept_files.transpose()) {
+            (Ok(component), Ok(files)) => (component, files),
+            (Err(Refused::Missing(mut missing)), Err(files)) => {
+                missing.push(files);
+                return Err(Refused::Missing(missing));
+            }
+            (Ok(_), Err(files)) => return Err(Refused::Missing(vec![files])),
+            (Err(refused), _) => return Err(refused),
+        };
         let app = App {
             name: name.to_string(),
             owner: app.owner,
             hosts,
-            component: self.materialize(&sha256, &app.file)?,
+            component,
+            files,
             sandbox: app.sandbox,
             tag: app.tag,
             deployed: rfc3339(now),
         };
         let mut deployed = self.clone();
         match deployed.apps.iter_mut().find(|kept| kept.name == app.name) {
-            Some(kept) if kept.component == app.component && kept.sandbox == app.sandbox => {
+            Some(kept)
+                if kept.component == app.component
+                    && kept.files == app.files
+                    && kept.sandbox == app.sandbox =>
+            {
                 kept.hosts = app.hosts;
                 kept.tag = app.tag;
             }
@@ -340,7 +381,7 @@ impl Deployed {
         self.components()
             .materialize(sha256, file, &upload)
             .map_err(Refused::Failed)?
-            .ok_or_else(|| Refused::Missing(sha256.to_string()))
+            .ok_or_else(|| Refused::Missing(vec![sha256.to_string()]))
     }
 
     /// Writes `component` as `components/<sha256>/<name>` unless it is there
@@ -368,9 +409,16 @@ impl Deployed {
     }
 
     /// Removes the files below `components/` nothing names, and the
-    /// directories they leave empty, and the uploads kept for
-    /// `UPLOAD_GRACE`. Links are removed, never followed.
+    /// directories they leave empty, the uploads kept for `UPLOAD_GRACE`,
+    /// and the apps' files nothing names kept for as long. Links are removed,
+    /// never followed.
     pub fn collect_garbage(&self) {
+        self.collect(false);
+    }
+
+    /// [`Deployed::collect_garbage`]; at `startup` the files an unpack cut
+    /// short too (else they may be being unpacked).
+    fn collect(&self, startup: bool) {
         let named = self
             .routes
             .iter()
@@ -379,6 +427,13 @@ impl Deployed {
         // the components are written on the reloader's task alone: none is being written
         self.components().collect_garbage(named, true);
         collect_uploads(&self.dir);
+        let named: HashSet<&str> = self
+            .apps
+            .iter()
+            .filter_map(|app| app.files.as_deref())
+            .filter_map(|files| files.strip_prefix(&format!("{FILES}/")))
+            .collect();
+        files::collect_garbage(&self.dir.join(FILES), &named, startup);
     }
 }
 
@@ -452,6 +507,7 @@ struct ManifestApp {
     owner: String,
     hosts: Vec<String>,
     component: String,
+    files: Option<String>,
     deployed: String,
     tag: Option<String>,
     #[serde(default)]
@@ -506,6 +562,11 @@ fn read(text: &str) -> Result<(Vec<Route>, Vec<App>), String> {
             return Err(failed(format!("host '{host}' twice")));
         }
         let component = check_component(&app.component).map_err(failed)?;
+        let files = app
+            .files
+            .map(|files| check_files(&files).map(|()| files))
+            .transpose()
+            .map_err(failed)?;
         if let Some(tag) = &app.tag {
             check_tag(tag).map_err(failed)?;
         }
@@ -516,12 +577,24 @@ fn read(text: &str) -> Result<(Vec<Route>, Vec<App>), String> {
             owner: app.owner,
             hosts,
             component,
+            files,
             sandbox,
             tag: app.tag,
             deployed: app.deployed,
         });
     }
     Ok((routes, apps))
+}
+
+/// `files` when it names an app's files as [`Deployed::with_app`] keeps them:
+/// `files/<sha256>`.
+fn check_files(files: &str) -> Result<(), String> {
+    files
+        .strip_prefix(&format!("{FILES}/"))
+        .and_then(|sha256| check_digest(sha256).ok())
+        .filter(|sha256| files.ends_with(sha256.as_str()))
+        .map(|_| ())
+        .ok_or_else(|| format!("files: '{files}' is no {FILES}/<sha256>"))
 }
 
 /// `component` when it names a file as [`Deployed::store`] writes it.
@@ -560,6 +633,9 @@ fn write(routes: &[Route], apps: &[App]) -> String {
         yaml.push_str(&format!("    owner: {}\n", quote(&app.owner)));
         yaml.push_str(&format!("    hosts: [{}]\n", hosts.join(", ")));
         yaml.push_str(&format!("    component: {}\n", quote(&app.component)));
+        if let Some(files) = &app.files {
+            yaml.push_str(&format!("    files: {}\n", quote(files)));
+        }
         yaml.push_str(&format!("    deployed: {}\n", quote(&app.deployed)));
         if let Some(tag) = &app.tag {
             yaml.push_str(&format!("    tag: {}\n", quote(tag)));
@@ -627,6 +703,7 @@ mod tests {
                 owner: "cf-api".into(),
                 hosts: vec!["c.local".into(), "d.local".into()],
                 component: format!("components/{}/c.wasm", "0".repeat(64)),
+                files: Some(format!("files/{}", "f".repeat(64))),
                 sandbox,
                 tag: Some("0123456789abcdef:\"#{}".into()),
                 deployed: rfc3339(UNIX_EPOCH),
@@ -636,6 +713,7 @@ mod tests {
                 owner: "cf-api".into(),
                 hosts: vec!["e.local".into()],
                 component: format!("components/{}/e.wasm", "e".repeat(64)),
+                files: None,
                 sandbox: Sandbox::default(),
                 tag: None,
                 deployed: rfc3339(UNIX_EPOCH),
@@ -778,6 +856,10 @@ mod tests {
                 "routes[0]: sandbox.env: the console's routes take none".into(),
             ),
             (apps(", tag: 'a b'"), "apps[0]: tag: 'a b' is no tag".into()),
+            (
+                apps(", files: files/../etc"),
+                "apps[0]: files: 'files/../etc' is no files/<sha256>".into(),
+            ),
             // a line, never the file's text: it holds the apps' env
             (
                 apps(", sandbox: {env: {K: s3cr3t}}, fuel: 1"),

@@ -47,6 +47,8 @@ serde-saphyr = { version = "2", default-features = false, features = ["deseriali
 sha2 = "0.10"
 # the console: its JSON API
 serde_json = "1"
+# the console: an app's files, uploaded as a tar
+tar = { version = "0.4", default-features = false }
 # the console: a keyvalue namespace in a path (it may hold '/')
 percent-encoding = "2"
 # the sqlite keyvalue store; bundled: no system libsqlite3 (the build compiles C for ring already)
