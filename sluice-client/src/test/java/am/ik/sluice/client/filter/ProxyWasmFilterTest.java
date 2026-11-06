@@ -256,6 +256,29 @@ class ProxyWasmFilterTest {
 	void aPluginInLispAddsMetadataToAJsonResponse() throws Exception {
 		UpstreamFilter filter = filter(JSON_PLUGIN);
 		String object = "{\"name\":\"sluice\",\"tags\":[\"tunnel\"]}";
+		String added = "{\"name\":\"sluice\",\"tags\":[\"tunnel\"],\"sluice\":{\"route\":\"route.test\",\"plugin\":\"plugin\","
+				+ "\"method\":\"GET\",\"path\":\"/items?id=1\",\"status\":200}}";
+		String request = "GET /items?id=1 HTTP/1.1\r\nHost: api.test\r\nAccept-Encoding: gzip, br\r\n\r\n";
+
+		// compression in front: the upstream compresses, the plugin reads it decoded
+		UpstreamFilter decoding = Filters.builder()
+			.definitions(Map.of("plugin", limits(JSON_PLUGIN).build()))
+			.meters(this.registry)
+			.budget(TunnelBudget.unlimited())
+			.build()
+			.forRoute("route.test", List.of(FilterConfig.builder().name(CompressionFilter.NAME).build(),
+					FilterConfig.builder().name("plugin").build()));
+		byte[] gzip = FilterTests.gzip(object.getBytes(StandardCharsets.UTF_8));
+		FilterTests.Exchanged coded = FilterTests.exchange(decoding, request,
+				("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: "
+						+ gzip.length + "\r\n\r\n" + new String(gzip, StandardCharsets.ISO_8859_1))
+					.getBytes(StandardCharsets.ISO_8859_1),
+				16);
+		assertThat(coded.upstream())
+			.isEqualTo("GET /items?id=1 HTTP/1.1\r\nHost: api.test\r\nAccept-Encoding: gzip\r\n\r\n");
+		assertThat(
+				new String(FilterTests.gunzip(FilterTests.Chunked.of(coded.relayed()).body()), StandardCharsets.UTF_8))
+			.isEqualTo(added);
 
 		for (String response : List.of(
 				"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + object.length() + "\r\n\r\n"
@@ -264,14 +287,11 @@ class ProxyWasmFilterTest {
 						+ "a\r\n{\"name\":\"s\r\n" + Integer.toHexString(object.length() - 10) + "\r\n"
 						+ object.substring(10) + "\r\n0\r\n\r\n")) {
 			// asked for no encoding it could not read
-			FilterTests.Exchanged exchanged = FilterTests.exchange(filter,
-					"GET /items?id=1 HTTP/1.1\r\nHost: api.test\r\nAccept-Encoding: gzip, br\r\n\r\n",
+			FilterTests.Exchanged exchanged = FilterTests.exchange(filter, request,
 					response.getBytes(StandardCharsets.UTF_8), 16);
 			assertThat(exchanged.upstream()).isEqualTo("GET /items?id=1 HTTP/1.1\r\nHost: api.test\r\n\r\n");
-			assertThat(decoded(exchanged.relayed())).isEqualTo(
-					"content-type: application/json\nhttp/1.1 200 ok\n\n{\"name\":\"sluice\",\"tags\":[\"tunnel\"],"
-							+ "\"sluice\":{\"route\":\"route.test\",\"plugin\":\"plugin\",\"method\":\"GET\","
-							+ "\"path\":\"/items?id=1\",\"status\":200}}");
+			assertThat(decoded(exchanged.relayed()))
+				.isEqualTo("content-type: application/json\nhttp/1.1 200 ok\n\n" + added);
 		}
 		for (String body : List.of("[1,2]", "{\"name\":", "plain")) {
 			String type = body.equals("plain") ? "text/plain" : "application/json";

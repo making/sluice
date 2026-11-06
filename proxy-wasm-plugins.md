@@ -166,7 +166,7 @@ impl HttpContext for Stream {
 - A replaced request goes out with a `Content-Length` if the plugin held it to its end, chunked if a part went on before. A request with `Expect: 100-continue` goes out chunked, not held. An HTTP/1.0 request takes no chunks: replacing it in pieces fails it.
 - A chunked body the plugin only reads goes the same way: the payload is the same, the chunks may be split otherwise, and `Transfer-Encoding` moves to the end of the head.
 - What is held is bounded by `max-body` and by what the tunnel budget has left. Past it the plugin has failed: see below.
-- A compressed body arrives compressed. Remove `accept-encoding` in the request's call, or decompress it yourself.
+- A compressed body arrives compressed. Put the built-in `compression` filter before the plugin on the route: it arrives decoded (gzip, deflate), and what the plugin leaves is compressed again for the client. Otherwise remove `accept-encoding` in the request's call, or decompress it yourself.
 
 ## Answering in the upstream's place
 

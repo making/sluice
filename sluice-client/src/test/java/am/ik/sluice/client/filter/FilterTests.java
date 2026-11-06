@@ -13,6 +13,8 @@ import java.util.TreeMap;
 import java.util.concurrent.Callable;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
 
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Meter;
@@ -227,6 +229,42 @@ final class FilterTests {
 
 	static String head(String method, String target) {
 		return method + " " + target + " HTTP/1.1\r\nHost: api.test\r\n\r\n";
+	}
+
+	static byte[] gzip(byte[] bytes) throws IOException {
+		ByteArrayOutputStream out = new ByteArrayOutputStream();
+		try (GZIPOutputStream gzip = new GZIPOutputStream(out)) {
+			gzip.write(bytes);
+		}
+		return out.toByteArray();
+	}
+
+	static byte[] gunzip(byte[] bytes) throws IOException {
+		try (InputStream in = new GZIPInputStream(new ByteArrayInputStream(bytes))) {
+			return in.readAllBytes();
+		}
+	}
+
+	/** A chunked response as relayed: its head, and the payload of its chunks. */
+	record Chunked(String head, byte[] body) {
+
+		static Chunked of(String relayed) {
+			int end = relayed.indexOf("\r\n\r\n") + 4;
+			byte[] bytes = relayed.substring(end).getBytes(StandardCharsets.ISO_8859_1);
+			ByteArrayOutputStream payload = new ByteArrayOutputStream();
+			int at = 0;
+			while (at < bytes.length) {
+				int eol = at;
+				while (bytes[eol] != '\r') {
+					eol++;
+				}
+				int size = Integer.parseInt(new String(bytes, at, eol - at, StandardCharsets.US_ASCII), 16);
+				payload.write(bytes, eol + 2, size);
+				at = eol + 2 + size + 2;
+			}
+			return new Chunked(relayed.substring(0, end), payload.toByteArray());
+		}
+
 	}
 
 	/** What a response's bytes read as, as {@link #exchange} gives them. */

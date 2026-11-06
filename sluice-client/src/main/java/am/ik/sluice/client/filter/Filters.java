@@ -49,6 +49,7 @@ public final class Filters {
 		register(LlmUsageFilter.factory());
 		register(HeadersFilter.factory());
 		register(CorsFilter.factory());
+		register(CompressionFilter.factory());
 		builder.factories.forEach(this::register);
 		this.definitions.forEach((name, definition) -> {
 			if (!definition.plugin().isEmpty() && this.factories.containsKey(name)) {
@@ -121,19 +122,37 @@ public final class Filters {
 	 * @throws IllegalArgumentException when one of them is unknown or invalid
 	 */
 	public UpstreamFilter forRoute(String route, List<FilterConfig> uses) {
-		List<FilterChain.Link> links = new ArrayList<>(uses.size());
 		int plugins = 0;
 		for (FilterConfig use : uses) {
-			String name = use.name();
-			FilterConfig definition = this.definitions.get(name);
-			FilterConfig settings = definition == null ? use : definition.overriddenBy(use);
-			FilterFailures failures = new FilterFailures(this.meters, route, name);
-			plugins += settings.plugin().isEmpty() ? 0 : 1;
-			links.add(new FilterChain.Link(create(route, name, settings, failures), settings.paths(),
-					Boolean.TRUE.equals(settings.failClosed()), failures));
+			plugins += settings(use).plugin().isEmpty() ? 0 : 1;
 		}
+		UpstreamFilter chain = chain(route, uses);
 		this.mostPlugins = Math.max(this.mostPlugins, plugins);
-		return new FilterChain(links);
+		return chain;
+	}
+
+	private FilterConfig settings(FilterConfig use) {
+		FilterConfig definition = this.definitions.get(use.name());
+		return definition == null ? use : definition.overriddenBy(use);
+	}
+
+	/** The filters in request order; one coding the responses wraps those after it. */
+	private UpstreamFilter chain(String route, List<FilterConfig> uses) {
+		List<FilterChain.Link> links = new ArrayList<>(uses.size());
+		for (int i = 0; i < uses.size(); i++) {
+			FilterConfig use = uses.get(i);
+			String name = use.name();
+			FilterConfig settings = settings(use);
+			FilterFailures failures = new FilterFailures(this.meters, route, name);
+			UpstreamFilter filter = create(route, name, settings, failures);
+			if (filter instanceof CompressionFilter compression) {
+				UpstreamFilter inner = chain(route, uses.subList(i + 1, uses.size()));
+				return new FilterChain(links, compression.around(inner, failures));
+			}
+			links.add(new FilterChain.Link(filter, settings.paths(), Boolean.TRUE.equals(settings.failClosed()),
+					failures));
+		}
+		return new FilterChain(links, null);
 	}
 
 	private UpstreamFilter create(String route, String name, FilterConfig settings, FilterFailures failures) {

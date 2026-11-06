@@ -38,12 +38,12 @@ class LlmUsageFilterTest {
 	private record Usage(String target, String response, Map<String, Long> expected) {
 	}
 
-	private static UpstreamFilter filter(MeterRegistry registry, FilterConfig use) {
+	private static UpstreamFilter filter(MeterRegistry registry, FilterConfig... uses) {
 		return Filters.builder()
 			.meters(registry)
 			.budget(TunnelBudget.unlimited())
 			.build()
-			.forRoute("route.test", List.of(use));
+			.forRoute("route.test", List.of(uses));
 	}
 
 	private static FilterConfig.Builder usage() {
@@ -177,7 +177,7 @@ class LlmUsageFilterTest {
 	}
 
 	@Test
-	void aCompressedBodyIsAvoidedOnTheApisOnly() throws Exception {
+	void aCompressedBodyIsAvoidedOnTheApisOnlyOrDecodedInFront() throws Exception {
 		String response = "HTTP/1.1 204 No Content\r\n\r\n";
 		String requests = "POST /v1/messages HTTP/1.1\r\nHost: a\r\nAccept-Encoding: gzip\r\nContent-Length: 0\r\n\r\n";
 		String other = "GET /health HTTP/1.1\r\nHost: a\r\nAccept-Encoding: gzip\r\n\r\n";
@@ -188,6 +188,23 @@ class LlmUsageFilterTest {
 			.upstream();
 
 		assertThat(upstream).isEqualTo("POST /v1/messages HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n" + other);
+
+		// compression in front decodes it for the filter, and encodes it again
+		SimpleMeterRegistry registry = new SimpleMeterRegistry();
+		byte[] body = "{\"model\":\"claude\",\"usage\":{\"input_tokens\":12,\"output_tokens\":34}}"
+			.getBytes(StandardCharsets.US_ASCII);
+		byte[] gzip = FilterTests.gzip(body);
+		String coded = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: "
+				+ gzip.length + "\r\n\r\n" + new String(gzip, StandardCharsets.ISO_8859_1);
+		FilterTests.Exchanged exchanged = FilterTests.exchange(
+				filter(registry, FilterConfig.builder().name(CompressionFilter.NAME).build(), usage().build()),
+				requests, coded.getBytes(StandardCharsets.ISO_8859_1), 7);
+
+		assertThat(exchanged.upstream()).isEqualTo(requests.replace("Accept-Encoding: gzip\r\nContent-Length: 0",
+				"Content-Length: 0\r\nAccept-Encoding: gzip"));
+		assertThat(FilterTests.gunzip(FilterTests.Chunked.of(exchanged.relayed()).body())).isEqualTo(body);
+		assertThat(FilterTests.counters(registry))
+			.isEqualTo(tokens("anthropic", "claude", 12, 34, 0, 0, "false", "complete"));
 	}
 
 	@Test

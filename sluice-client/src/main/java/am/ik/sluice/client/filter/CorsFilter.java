@@ -203,7 +203,7 @@ final class CorsFilter implements UpstreamFilter {
 					responseHeaders.set("Access-Control-Expose-Headers", String.join(", ", this.exposed));
 				}
 			}
-			vary(responseHeaders);
+			responseHeaders.vary("Origin");
 			return null;
 		};
 	}
@@ -258,16 +258,6 @@ final class CorsFilter implements UpstreamFilter {
 			lines.add("Access-Control-Max-Age: " + this.maxAge.toSeconds());
 		}
 		return new LocalResponse(204, lines, new byte[0]);
-	}
-
-	/** Adds {@code Origin} to the response's {@code Vary}, unless it is there. */
-	private static void vary(Headers headers) {
-		for (String name : list(headers.values("vary"))) {
-			if (name.equals("*") || name.equalsIgnoreCase("origin")) {
-				return;
-			}
-		}
-		headers.add("Vary", "Origin");
 	}
 
 }

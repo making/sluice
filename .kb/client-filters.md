@@ -25,7 +25,7 @@ Body rewriting on the data plane is not worth it: h2 grants a window back per by
 - A local answer (`Exchange.localResponse`) replaces the upstream's response in the order of responses: once the responses before it ended. The upstream is closed then, or at once when nothing is awaited, which is also what wakes the response side reading it. Nothing more of the connection goes on. A request whose response has begun cannot be answered: the connection is cut.
 - `close` may run on the tunnel's receive path, which must not wait on a filter: it closes the upstream, which ends what the pumps wait on, and tells the filters on a thread of its own.
 
-Not interpreted: a filter sees bytes as sent, so `Content-Encoding`, `ETag`, `Range` (206) and `Digest` are its own to handle. The `llm-usage` filter removes `accept-encoding` towards the upstream on its paths, and counts what still comes compressed as `outcome=encoded`.
+Not interpreted: a filter sees bytes as sent, so `Content-Encoding`, `ETag`, `Range` (206) and `Digest` are its own to handle, unless `compression` is in front of it (below). The `llm-usage` filter removes `accept-encoding` towards the upstream on its paths, and counts what still comes compressed as `outcome=encoded`.
 
 ## A route's filter
 
@@ -37,7 +37,7 @@ Real h2 needs either an h2 endpoint on the client, with `proxy.hop` and netty's 
 
 ## Settings
 
-`sluice.client.filters.<name>` defines a filter: a plugin, or the defaults of a built-in or factory of that name. `sluice.client.upstream[n].filters[m]` uses it; what a use sets goes over the definition (`FilterConfig.overriddenBy`: `paths` and the plugin's limits replace, `args` merge key by key). Each use has its own filter: its instances of a plugin, its counters by `route`. The name is resolved at the start: unknown, it stops the client. A factory (`UpstreamFilterFactory`) is how a custom build adds one in Java, as a bean; the built-ins (`llm-usage`, `headers`, `cors`) are factories too.
+`sluice.client.filters.<name>` defines a filter: a plugin, or the defaults of a built-in or factory of that name. `sluice.client.upstream[n].filters[m]` uses it; what a use sets goes over the definition (`FilterConfig.overriddenBy`: `paths` and the plugin's limits replace, `args` merge key by key). Each use has its own filter: its instances of a plugin, its counters by `route`. The name is resolved at the start: unknown, it stops the client. A factory (`UpstreamFilterFactory`) is how a custom build adds one in Java, as a bean; the built-ins (`llm-usage`, `headers`, `cors`, `compression`) are factories too.
 
 A filter in Java, in a custom build of the client:
 
@@ -114,6 +114,54 @@ CORS for a route's allowed origins, answered on the client so that an upstream w
 - Refused at the start: `*` with `allow-credentials=true` (in `allowed-origins` or `exposed-headers`: browsers reject the first and read the second as a header named `*`), `*` beside other values, an unknown arg.
 - The actual request's method is not checked: browsers send a simple request without a preflight, so refusing it protects nothing.
 - Route auth on the server runs first: a preflight carries no credentials, so the route needs `allow-preflight=true` (`.kb/route-auth.md`). A local answer of another filter (a plugin's `401`) gets no CORS headers: no filter sees one.
+
+## compression
+
+Placed first, it codes the responses of the filters after it: they read a body decoded, and what they leave enters the tunnel gzip when the client takes it. One filter does both, around the filters after it (`FilterChain`'s last link, unguarded, as their failures pass through it): a decoding the pipe offered to every filter would leave each to encode again. Filters before it see what it sends.
+
+| Arg | Default | |
+|---|---|---|
+| `types` | `text/*`, JSON, XML, JavaScript, NDJSON, Wasm, SVG | media types to compress: exact, `type/*`, `type/*+suffix` |
+| `min-length` | `1KB` | a body told shorter is not compressed; one of no told length always is |
+| `level` | `6` (zlib's) | 1-9 |
+| `max-ratio` | `100` | what a body may decode to, times its bytes read (1MiB free) |
+
+- `Accept-Encoding` towards the upstream is its own: `gzip` (else `deflate`) when the client takes it, none otherwise, whatever the filters after it set: `llm-usage` and `json_plugin` remove it, and read a gzip response all the same.
+- A coded body (`gzip`, `x-gzip`, `deflate` in zlib's format or raw) is decoded when a filter after it reads it or the client does not take its coding; one no filter reads and the client takes passes as it came. Others (`br`, `zstd`, two codings) pass undecoded: the filters after it see them coded.
+- Encoded with gzip: a body of `types` not told shorter than `min-length`, or one that came coded, to a client whose `Accept-Encoding` takes gzip (an absent header takes anything by RFC 9110, no reason to compress). It gets `Content-Encoding: gzip`, its strong `ETag` made weak, and `Vary: Accept-Encoding`, as does one it would compress for another client.
+- Left alone: `Cache-Control: no-transform`, `206`, a transfer coding other than chunked, a bodiless response. Request bodies are not coded.
+- A body of no told length (chunked, or to the connection's end) is flushed (`SYNC_FLUSH`) after each upstream read, so SSE events arrive one by one; a sized one only at its end, as a flush costs a few bytes and what the window held.
+- What it holds charges the tunnel budget: a decoder's state (56KiB) and an encoder's (280KiB: zlib's window and hash chains at its defaults, native memory), and what one read decodes to until the pipe takes it. Past the budget a body is not decoded (the filters after it see it coded) or not encoded. A body decoding past `max-ratio`, cut inside its coding, or not of its coding fails: counted as `failures{phase=body}`, the response cut.
+- `paths` limits what it codes; the filters after it see their own paths either way.
+
+Measured in-process (`UpstreamFilterPipe` over a scripted upstream, 64KiB reads, a platform thread's CPU, best of 40, JVM, a load average of 9-11). Bytes out include the chunks' framing, 14KiB of the SSE's:
+
+| Response | Out | CPU |
+|---|---|---|
+| JSON, 829KiB sized, passed | 829KiB | 0.2-0.5ms |
+| the same, gzip `level=1` | 231KiB (28%) | 8ms |
+| the same, gzip `level=6` | 172KiB (21%) | 33ms |
+| the same from a gzip upstream, decoded for `llm-usage`, gzip again | 172KiB | 37ms |
+| the same, decoded for a client not taking gzip | 829KiB | 5-6ms |
+| the same, passed coded and unseen | 172KiB | 0.2-0.3ms |
+| SSE, 2000 events of about 126 bytes, a chunk each (259KiB), passed | 259KiB | 1.0-1.5ms |
+| the same, gzip `level=1` / `level=6` | 39KiB / 34KiB (13%) | 5.4-6.0ms / 6.7-6.9ms |
+| the same, `level=6` with `llm-usage` after it | 34KiB | 8.9-9.3ms |
+
+So level 6 costs about 40ms a MiB of JSON (25MiB/s a processor), above most uplinks a client sits behind; `level=1` a quarter of it for a third more bytes. Flushed per event, the level matters little. Decoding costs a few ms a MiB.
+
+Brotli and zstd need a native library (here brotli4j 1.22.0 and zstd-jni 1.5.6-3, JVM), measured on the same JSON and SSE and this repository's README (72KiB, written in 16KiB parts), size / CPU per MiB in:
+
+| | JSON | README | SSE, flushed per event |
+|---|---|---|---|
+| gzip 1 | 27.8% / 11ms | 38.0% / 13ms | 11.6% / 19ms |
+| gzip 6 | 20.7% / 46ms | 32.2% / 39ms | 9.8% / 25ms |
+| brotli 4 | 24.2% / 19ms | 32.7% / 24ms | 14.4% / 68ms |
+| brotli 6 | 21.3% / 39ms | 30.5% / 40ms | 12.6% / 73ms |
+| zstd 1 | 23.2% / 4ms | 36.3% / 7ms | 15.6% / 15ms |
+| zstd 3 | 22.3% / 6ms | 33.5% / 10ms | 13.5% / 15ms |
+
+Not worth a native library for now: at the levels a response on its way can afford neither is smaller than gzip 6 (brotli 6 by 5% on text, at its CPU), and flushed per event both are larger. zstd's CPU, a seventh of gzip 6's on JSON, is its one gain: the reason to add it if CPU becomes the limit, with decoding of upstreams' `br` and `zstd` for the filters. Not measured on a native image: the JDK's zlib is all the filter uses.
 
 ## The proxy-wasm host
 

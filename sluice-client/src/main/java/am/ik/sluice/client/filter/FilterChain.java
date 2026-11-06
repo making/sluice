@@ -10,7 +10,8 @@ import org.jspecify.annotations.Nullable;
  * response last to first, each body through what the filter before it left. A filter sees
  * only the paths it is set to, before anything of it runs. A filter failing is counted
  * and, unless it fails closed, left out of that exchange; a rewriter failing always fails
- * the message, part of which it may have changed.
+ * the message, part of which it may have changed. A filter coding the responses comes
+ * last, around the filters after it on the route ({@link CompressionFilter}).
  */
 final class FilterChain implements UpstreamFilter {
 
@@ -18,8 +19,34 @@ final class FilterChain implements UpstreamFilter {
 
 	private final List<Link> links;
 
-	FilterChain(List<Link> links) {
+	private final @Nullable UpstreamFilter around;
+
+	/**
+	 * The chain of these links, then of a filter around the ones after them.
+	 * @param around a filter that wraps the rest of the route's filters, if any: it runs
+	 * unguarded, as their failures are theirs and pass through it
+	 */
+	FilterChain(List<Link> links, @Nullable UpstreamFilter around) {
 		this.links = List.copyOf(links);
+		this.around = around;
+	}
+
+	/**
+	 * Whether a path is one of these: exact, or a prefix ending in {@code *}; empty =
+	 * all.
+	 */
+	static boolean matches(List<String> paths, String path) {
+		if (paths.isEmpty()) {
+			return true;
+		}
+		for (String pattern : paths) {
+			boolean matches = pattern.endsWith("*") ? path.startsWith(pattern.substring(0, pattern.length() - 1))
+					: path.equals(pattern);
+			if (matches) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/**
@@ -33,17 +60,7 @@ final class FilterChain implements UpstreamFilter {
 	record Link(UpstreamFilter filter, List<String> paths, boolean failClosed, FilterFailures failures) {
 
 		boolean sees(String path) {
-			if (this.paths.isEmpty()) {
-				return true;
-			}
-			for (String pattern : this.paths) {
-				boolean matches = pattern.endsWith("*") ? path.startsWith(pattern.substring(0, pattern.length() - 1))
-						: path.equals(pattern);
-				if (matches) {
-					return true;
-				}
-			}
-			return false;
+			return matches(this.paths, path);
 		}
 
 		/** Counts a failure; goes on with what it returns, unless it fails closed. */
@@ -79,8 +96,22 @@ final class FilterChain implements UpstreamFilter {
 				Exchange guarded = new Guarded(link, exchange);
 				taken.add(guarded);
 				if (guarded.localResponse() != null) {
-					break;
+					return taken.size() == 1 ? guarded : new Chained(taken);
 				}
+			}
+		}
+		if (this.around != null) {
+			Exchange exchange;
+			try {
+				exchange = this.around.onRequest(request, headers);
+			}
+			catch (RuntimeException e) {
+				// one of the filters it wraps failed closed
+				abandonAll(taken);
+				throw e;
+			}
+			if (exchange != null) {
+				taken.add(exchange);
 			}
 		}
 		return switch (taken.size()) {

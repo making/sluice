@@ -143,6 +143,22 @@ public interface UpstreamFilter {
 		 */
 		void remove(String name);
 
+		/**
+		 * Adds the name to {@code Vary}, unless it is there or the message varies on
+		 * everything ({@code *}).
+		 */
+		default void vary(String name) {
+			for (String value : values("vary")) {
+				for (String listed : value.split(",")) {
+					String trimmed = listed.trim();
+					if (trimmed.equals("*") || trimmed.equalsIgnoreCase(name)) {
+						return;
+					}
+				}
+			}
+			add("Vary", name);
+		}
+
 		/** The fields as lines, {@code name: value}, in order. */
 		List<String> lines();
 
