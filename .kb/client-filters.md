@@ -22,7 +22,7 @@ Body rewriting on the data plane is not worth it: h2 grants a window back per by
 - Whatever a filter leaves of a head's framing, a body not rewritten goes as it was framed: without it the body would read as the next message, from a public client's bytes. An edit past 64KiB of head fails: the relay would stop following it.
 - `h2c` does not reach the upstream: h2 past a `101` could not be read, and RFC 9113 lets the upstream answer an ordinary request. The pipe removes it from `Upgrade`, with `HTTP2-Settings`, on every request of the route before any filter: `paths` cannot exempt it, as h2 switched to on one path would carry every path of that connection. Anything naming h2c goes (`H2C/1`, `h2c x`), not only the exact token, as an upstream may read those as it. Other upgrades, one offered beside `h2c` too, pass past their `101`: a filter whose `paths` match sees the request and may refuse it.
 - A filter failing, on either side, fails the relay's call: the server answers `502`, or cuts the response begun.
-- A local answer (`Exchange.localResponse`) replaces the upstream's response in the order of responses: once the responses before it ended. The upstream is closed then, or at once when nothing is awaited, which is also what wakes the response side reading it. Nothing more of the connection goes on. A request whose response has begun cannot be answered: the connection is cut.
+- A local answer (`Exchange.localResponse`) replaces the upstream's response in the order of responses. It is asked after the request head and after each call on its body, a rewriter's last part kept until then, so a filter holding the body refuses it with nothing of it sent. It is given once the responses before it ended. The upstream is closed then, or at once when nothing is awaited, which is also what wakes the response side reading it. Nothing more of the connection goes on. A request whose response has begun cannot be answered: the connection is cut.
 - `close` may run on the tunnel's receive path, which must not wait on a filter: it closes the upstream, which ends what the pumps wait on, and tells the filters on a thread of its own.
 
 Not interpreted: a filter sees bytes as sent, so `Content-Encoding`, `ETag`, `Range` (206) and `Digest` are its own to handle, unless `compression` is in front of it (below). The `llm-usage` and `redact` filters remove `accept-encoding` towards the upstream on their paths, and count what still comes compressed as `outcome=encoded`.
@@ -37,7 +37,7 @@ Real h2 needs either an h2 endpoint on the client, with `proxy.hop` and netty's 
 
 ## Settings
 
-`sluice.client.filters.<name>` defines a filter: a plugin, or the defaults of a built-in or factory of that name. `sluice.client.upstream[n].filters[m]` uses it; what a use sets goes over the definition (`FilterConfig.overriddenBy`: `paths` and the plugin's limits replace, `args` merge key by key). Each use has its own filter: its instances of a plugin, its counters by `route`. The name is resolved at the start: unknown, it stops the client. A factory (`UpstreamFilterFactory`) is how a custom build adds one in Java, as a bean; the built-ins (`llm-usage`, `headers`, `cors`, `compression`, `redact`) are factories too.
+`sluice.client.filters.<name>` defines a filter: a plugin, or the defaults of a built-in or factory of that name. `sluice.client.upstream[n].filters[m]` uses it; what a use sets goes over the definition (`FilterConfig.overriddenBy`: `paths` and the plugin's limits replace, `args` merge key by key). Each use has its own filter: its instances of a plugin, its counters by `route`. The name is resolved at the start: unknown, it stops the client. A factory (`UpstreamFilterFactory`) is how a custom build adds one in Java, as a bean; the built-ins (`llm-usage`, `llm-guard`, `headers`, `cors`, `compression`, `redact`) are factories too.
 
 A filter in Java, in a custom build of the client:
 
@@ -73,7 +73,7 @@ sluice.client.upstream[0].filters[0].args.value=a
 
 A filtered connection buffers up to 256KiB on top of its 293KiB (`UpstreamFilterPipe.CONNECTION_BYTES`): a head being read each way, the heads of the requests awaiting responses (a pipeline past 4 of them or 64KiB waits before its filters are called, holding the tunnel's flow control, and the wait ends with the responses), the output waiting for the relay (past 64KiB it charges the tunnel budget as it is written, or fails). What it reads of the upstream at once is below that, so what merely passes never depends on the budget. While it waits, it reads nothing of the tunnel: the client's end reaches the upstream only after, so a client gone is held until the upstream answers, as an unfiltered connection is when the upstream ignores its end. A route's plugin adds up to 256KiB more in the host: what it keeps of each head's fields, of at most 256 fields each and 5 streams. With a filter on any route every connection counts the most of these in the derived limit. The plugins' instances, `vms x max-memory` at most, are native memory and not part of it: the heap it derives from holds none of them (the startup log tells their sum). `max-connections` set, the count alone limits, as before.
 
-What a filter holds of a body charges the tunnel budget, not the limit: most hold nothing, and a body worth holding should not cost every connection its size. A hold that does not fit gives up: `include-usage` passes the body unchanged, a plugin fails. Windows shrink under the same budget, which is what they do under load anyway.
+What a filter holds of a body charges the tunnel budget, not the limit: most hold nothing, and a body worth holding should not cost every connection its size. A hold that does not fit gives up: `include-usage` passes the body unchanged, `llm-guard` refuses it, a plugin fails. Windows shrink under the same budget, which is what they do under load anyway.
 
 ## llm-usage
 
@@ -84,6 +84,26 @@ One scanner of JSON and server-sent events, a dialect per API by exact request p
 - OpenAI's `input_tokens` (documentation of the Responses API) includes `cached_tokens` and `cache_write_tokens`; the filter assumes the same of `prompt_tokens`, which that page does not state, and counts `input` without them, as Anthropic reports it.
 - A cut stream leaves a partial count, recorded as `outcome=cut`.
 - `model` comes from a response: past 256 values per use it counts as `other`. Every series has the same tag keys, as Prometheus needs: what was not read has `model` and `stream` = `unknown`.
+
+## llm-guard
+
+Limits what a request of `llm-usage`'s APIs may ask for, answering one past them in the upstream's place: a route sharing a key spends within its list and ceiling.
+
+| Arg | Default | |
+|---|---|---|
+| `models` | any | the models allowed, comma separated: exact, or a prefix ending in `*` (`claude-sonnet-*`), with case |
+| `max-output-tokens` | none | the ceiling of `max_tokens`, `max_completion_tokens` and `max_output_tokens` |
+| `over-max-output-tokens` | `reject` | `lower`: a value past the ceiling, `null` or absent becomes it |
+| `other-paths` | every one passes | the paths but the APIs' that pass, as `paths`, compared as sent; set, the rest get `403` |
+
+- The APIs are `llm-usage`'s, by a loose reading of the path: percent-decoded once, `\` as `/`, segment parameters, empty and dot segments removed, in lower case, so `/V1//%6Dessages/` is guarded as an upstream may route it. Every method but `GET`, `HEAD` and `OPTIONS` is.
+- The body is held whole, charging the tunnel budget, up to `max-body` (`16MB`), and decided on at its end: nothing of the request reaches the upstream before, but with `Expect: 100-continue` its head, as its client waits for the upstream's `100`. Refused, it is answered `400` (`413` past what is held) in OpenAI's error format (`error.message`, `type`, `param`) or Anthropic's (`type: error`, `error.type`, `error.message`), and as every local answer ends the connection. A stream is refused the same way: the APIs refuse an invalid one with JSON before any event.
+- Read by a strict parser (Jackson's), not `JsonFields`: a limit reads what the upstream reads, and the body is held anyway. `JsonFields` keeps no escape (`"gpt-4\u006f"` is `gpt-4o` upstream), cuts a value at 128 bytes and reads a malformed body. Unreadable, so refused: a body not one JSON object (cut, trailing data, `NaN`), coded (`Content-Encoding`), missing, past what is held, or with a deciding field twice, as parsers differ on which counts (Python's on the last).
+- `models`: `model` is a string the list allows; absent, refused.
+- `max-output-tokens`: each of the three fields, on any API, at most the ceiling; a non-number is refused. One of the API's own (`max_completion_tokens` or `max_tokens` on chat, `max_tokens` on completions and Anthropic, `max_output_tokens` on responses) must bound the output: absent or `null`, the model's maximum applies, past the ceiling. Lowered, a value is replaced where it is, the rest of the body as it came, an absent one added before the closing brace (`max_completion_tokens` on chat); the request goes with its new length.
+- Not bounded: OpenAI's `n` choices, each up to the ceiling; Anthropic's `thinking.budget_tokens` must stay under `max_tokens`, so lowered past it the upstream refuses. Other paths carry models it does not read (`/v1/messages/batches`, OpenAI's batches by file): `other-paths` keeps them out.
+- It fails closed unless `fail-closed=false`: its failure fails the request (`502`), never passes it unread. `paths` would keep it from what `other-paths` refuses: leave it unset.
+- Not here: a budget of tokens per period from `llm-usage`'s counters.
 
 ## headers
 

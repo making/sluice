@@ -51,6 +51,7 @@ public final class Filters {
 		register(CorsFilter.factory());
 		register(CompressionFilter.factory());
 		register(RedactFilter.factory());
+		register(LlmGuardFilter.factory());
 		builder.factories.forEach(this::register);
 		this.definitions.forEach((name, definition) -> {
 			if (!definition.plugin().isEmpty() && this.factories.containsKey(name)) {
@@ -150,8 +151,10 @@ public final class Filters {
 				UpstreamFilter inner = chain(route, uses.subList(i + 1, uses.size()));
 				return new FilterChain(links, compression.around(inner, failures));
 			}
-			links.add(new FilterChain.Link(filter, settings.paths(), Boolean.TRUE.equals(settings.failClosed()),
-					failures));
+			// a limit fails closed unless told otherwise
+			boolean failClosed = settings.failClosed() == null ? filter instanceof LlmGuardFilter
+					: settings.failClosed();
+			links.add(new FilterChain.Link(filter, settings.paths(), failClosed, failures));
 		}
 		return new FilterChain(links, null);
 	}

@@ -384,6 +384,7 @@ sluice.client.upstream[1].filters[0].fail-closed=true
 - `h2c` is removed from `Upgrade` on every request of a filtered route, on paths outside a filter's `paths` too: h2 past the `101` would pass the filters on that connection. The upstream answers an ordinary request, or switches to another upgrade offered beside it. What follows a `101` (a WebSocket) or a `CONNECT`'s 2xx is not filtered.
 - Filters run in order on a request, in reverse on its response. Routes sharing a target keep their own filters.
 - `llm-usage` counts the tokens of the OpenAI compatible APIs and the Anthropic API from their JSON and SSE responses, by exact path, without holding them; `args.include-usage=true` adds `stream_options.include_usage` to OpenAI streaming requests, without which they report nothing. See [.kb/metrics.md](.kb/metrics.md).
+- `llm-guard` limits the requests of the same APIs: the models in `args.models` (exact, or a prefix ending in `*`), `max_tokens` / `max_completion_tokens` / `max_output_tokens` at most `args.max-output-tokens` (absent is past it). A request past them, streaming or not, is answered `400` in the API's error format and never reaches the upstream; `args.over-max-output-tokens=lower` lowers the value to the ceiling instead. A body it cannot read (encoded, not one JSON object, past `max-body`) is refused, and so is it failing. Other paths pass, `/v1/messages/batches` among them, unless `args.other-paths` lists those that may: the rest get `403`.
 - `headers` sets, adds and removes request and response headers, by args `<request|response>.<set|add|remove>.<header>`: `args[request.set.x-api-key]=${ANTHROPIC_API_KEY}` gives the upstream a credential the tunnel's users never hold, `args[response.remove.server]=true` hides what the upstream sends. An edit of the framing, of `Host` or with a control character stops the start.
 - `cors` answers the CORS preflights of the origins in `args.allowed-origins` (exact, or `*`) and gives their responses the CORS headers, the upstream's replaced; another origin's pass as they are. Settings: `allowed-methods` (`GET,HEAD,POST`), `allowed-headers`, `exposed-headers`, `allow-credentials`, `max-age`. Behind route auth, preflights need `allow-preflight=true` on the server to reach it.
 - `compression`, placed first, decodes a gzip or deflate response for the filters after it, and compresses what they leave with gzip for a client that takes it; alone, it compresses what an upstream sends uncompressed. It sets `Accept-Encoding` towards the upstream, so `llm-usage` and plugins after it read a compressed upstream's responses. A stream (SSE) is flushed per read. Settings: `types` (text, JSON, XML, JavaScript, SVG, ...), `min-length` (`1KB`), `level` (`6`), `max-ratio` (`100`). Brotli and zstd responses pass undecoded.
@@ -981,17 +982,17 @@ Under `sluice.client.upstream[n].filters[m]` they are a route's use of a filter,
 
 | Property | Default | Description |
 |---|---|---|
-| `name` | - | the filter: `llm-usage`, `headers`, `cors`, `compression`, `redact`, one defined under `sluice.client.filters`, or a factory's |
+| `name` | - | the filter: `llm-usage`, `llm-guard`, `headers`, `cors`, `compression`, `redact`, one defined under `sluice.client.filters`, or a factory's |
 | `plugin` | - | where a [proxy-wasm plugin](proxy-wasm-plugins.md) is read from at the start: `file:`, `classpath:`, `https:` (a Spring resource location), or a file path |
 | `sha256` | - | the plugin's SHA-256 in hex; the client does not start on a mismatch. Required unless it comes from a file or the class path |
 | `paths` | every path | the request paths the filter sees: exact, or a prefix ending in `*`, compared as sent |
-| `fail-closed` | `false` | a request or response fails with the filter failing on it; otherwise it goes on as if the filter were not there |
-| `args.<key>` | - | a built-in's or a factory's settings; `llm-usage`: `include-usage`; `headers`: `<request\|response>.<set\|add\|remove>.<header>`, in brackets (`args[request.set.x-api-key]`); `cors`: `allowed-origins`, `allowed-methods`, `allowed-headers`, `exposed-headers`, `allow-credentials`, `max-age`; `compression`: `types`, `min-length`, `level`, `max-ratio`; `redact`: `<rule>.literal`, `<rule>.regex`, `<rule>.replacement`, `side`, `types` |
+| `fail-closed` | `false` (`llm-guard`: `true`) | a request or response fails with the filter failing on it; otherwise it goes on as if the filter were not there |
+| `args.<key>` | - | a built-in's or a factory's settings; `llm-usage`: `include-usage`; `llm-guard`: `models`, `max-output-tokens`, `over-max-output-tokens`, `other-paths`; `headers`: `<request\|response>.<set\|add\|remove>.<header>`, in brackets (`args[request.set.x-api-key]`); `cors`: `allowed-origins`, `allowed-methods`, `allowed-headers`, `exposed-headers`, `allow-credentials`, `max-age`; `compression`: `types`, `min-length`, `level`, `max-ratio`; `redact`: `<rule>.literal`, `<rule>.regex`, `<rule>.replacement`, `side`, `types` |
 | `configuration` | - | what a plugin reads as its configuration |
 | `vms` | processors, at most 4 | instances of a plugin |
 | `max-memory` | `16MB` | the memory one instance may hold: its linear memory, GC heap and tables together |
 | `call-timeout` | `1s` | how long one call into a plugin may run |
-| `max-body` | `16MB` | the bytes of a body a plugin or `include-usage` may hold, within the tunnel budget |
+| `max-body` | `16MB` | the bytes of a body a plugin, `include-usage` or `llm-guard` may hold, within the tunnel budget |
 | `max-meters` | `1024` | the counters a plugin may define |
 
 ### Limits

@@ -572,6 +572,10 @@ public final class UpstreamFilterPipe implements DuplexPipe {
 			this.chunked = chunked;
 		}
 
+		boolean rewrites() {
+			return this.rewriter != null;
+		}
+
 		void hold(HeldHead head) {
 			this.held = head;
 		}
@@ -618,15 +622,31 @@ public final class UpstreamFilterPipe implements DuplexPipe {
 		}
 
 		/**
+		 * A rewrite that met no last chunk is asked for its last part, kept until
+		 * {@link #completed()}; failing, its handler is told.
+		 */
+		void finish() {
+			BodyRewriter rewriting = this.rewriter;
+			if (rewriting != null && !this.lastWritten && this.lastPart == null) {
+				try {
+					this.lastPart = rewriting.onEnd();
+				}
+				catch (RuntimeException e) {
+					close(false);
+					throw e;
+				}
+			}
+		}
+
+		/**
 		 * The message ended: a rewrite that met no last chunk ends here. However that
 		 * goes, its handler is told: what it holds is given back.
 		 */
 		void completed() throws IOException {
 			boolean complete = false;
 			try {
-				BodyRewriter rewriting = this.rewriter;
-				if (rewriting != null && !this.lastWritten) {
-					this.lastPart = rewriting.onEnd();
+				finish();
+				if (this.rewriter != null && !this.lastWritten) {
 					writeLast(CRLF);
 				}
 				complete = true;
@@ -1049,16 +1069,25 @@ public final class UpstreamFilterPipe implements DuplexPipe {
 			if (this.discarding) {
 				return;
 			}
-			this.flow = null;
 			if (body != null) {
 				try {
-					body.completed();
-					answerIfAsked();
+					// a rewrite's last part is asked for before it goes: an answer then
+					// takes the upstream's place with nothing of the body sent
+					body.finish();
+					if (body.rewrites()) {
+						answerIfAsked();
+					}
+					if (!this.discarding) {
+						this.flow = null;
+						body.completed();
+						answerIfAsked();
+					}
 				}
 				catch (IOException e) {
 					throw new UncheckedIOException(e);
 				}
 			}
+			this.flow = null;
 			this.current = null;
 		}
 

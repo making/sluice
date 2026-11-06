@@ -98,33 +98,9 @@ public final class LlmUsageFilter implements UpstreamFilter {
 		};
 	}
 
-	private enum Api {
-
-		CHAT("openai"), RESPONSES("openai"), ANTHROPIC("anthropic");
-
-		final String tag;
-
-		Api(String tag) {
-			this.tag = tag;
-		}
-
-		static @Nullable Api of(String method, String path) {
-			if (!method.equals("POST")) {
-				return null;
-			}
-			return switch (path.endsWith("/") ? path.substring(0, path.length() - 1) : path) {
-				case "/v1/chat/completions", "/v1/completions" -> CHAT;
-				case "/v1/responses" -> RESPONSES;
-				case "/v1/messages" -> ANTHROPIC;
-				default -> null;
-			};
-		}
-
-	}
-
 	@Override
 	public @Nullable Exchange onRequest(Request request, Headers headers) {
-		Api api = Api.of(request.method(), request.path());
+		LlmApi api = LlmApi.of(request.method(), request.path());
 		if (api == null) {
 			return null;
 		}
@@ -133,7 +109,7 @@ public final class LlmUsageFilter implements UpstreamFilter {
 		return new UsageExchange(api);
 	}
 
-	private void requests(Api api, String model, String stream, String outcome) {
+	private void requests(LlmApi api, String model, String stream, String outcome) {
 		Counter.builder("sluice.client.filter.llm.requests")
 			.description("Requests of an LLM API a route's filter saw the responses of")
 			.tag("route", this.route)
@@ -145,7 +121,7 @@ public final class LlmUsageFilter implements UpstreamFilter {
 			.increment();
 	}
 
-	private void tokens(Api api, String model, String type, @Nullable Long value) {
+	private void tokens(LlmApi api, String model, String type, @Nullable Long value) {
 		if (value != null && value > 0) {
 			Counter.builder("sluice.client.filter.llm.tokens")
 				.description("Tokens the responses of an LLM API report, by type")
@@ -176,15 +152,15 @@ public final class LlmUsageFilter implements UpstreamFilter {
 	/** One request of an API. */
 	private final class UsageExchange implements Exchange {
 
-		private final Api api;
+		private final LlmApi api;
 
-		UsageExchange(Api api) {
+		UsageExchange(LlmApi api) {
 			this.api = api;
 		}
 
 		@Override
 		public @Nullable BodyHandler onRequestBody() {
-			return LlmUsageFilter.this.includeUsage && this.api == Api.CHAT ? new IncludeUsage() : null;
+			return LlmUsageFilter.this.includeUsage && this.api.completions() ? new IncludeUsage() : null;
 		}
 
 		@Override
@@ -303,7 +279,7 @@ public final class LlmUsageFilter implements UpstreamFilter {
 	/** Reads one response as it passes. */
 	private final class Reading implements BodyObserver, JsonFields.Sink {
 
-		private final Api api;
+		private final LlmApi api;
 
 		private final boolean stream;
 
@@ -343,7 +319,7 @@ public final class LlmUsageFilter implements UpstreamFilter {
 		/** Nothing but a CR read of this line. */
 		private boolean blank = true;
 
-		Reading(Api api, boolean stream) {
+		Reading(LlmApi api, boolean stream) {
 			this.api = api;
 			this.stream = stream;
 		}
@@ -499,14 +475,14 @@ public final class LlmUsageFilter implements UpstreamFilter {
 		 * it; the Anthropic API reports them apart.
 		 */
 		private void updateTokens() {
-			if (this.api == Api.ANTHROPIC) {
+			if (this.api == LlmApi.ANTHROPIC) {
 				this.input = this.numbers.getOrDefault("input_tokens", this.input);
 				this.output = this.numbers.getOrDefault("output_tokens", this.output);
 				this.cacheRead = this.numbers.getOrDefault("cache_read_input_tokens", this.cacheRead);
 				this.cacheCreation = this.numbers.getOrDefault("cache_creation_input_tokens", this.cacheCreation);
 				return;
 			}
-			boolean chat = this.api == Api.CHAT;
+			boolean chat = this.api.completions();
 			String details = chat ? "prompt_tokens_details." : "input_tokens_details.";
 			Long total = this.numbers.get(chat ? "prompt_tokens" : "input_tokens");
 			if (total != null) {
