@@ -130,6 +130,12 @@ drained to nothing in about a second and was within its allowance again: its new
 to the upstream however exhausted the budget, as promised for a connection within its
 allowance. Connections sending the same 4.7MB to 5.2MB held 0.9MB to 2.3MB otherwise.
 
+Any release that leaves the budget below its limit wakes every relay withheld for it, and
+each grants its peers at least the floor's refill (uncharged). With the budget 1 byte past
+its limit, one trailers reset releasing 4083 bytes woke a connection withheld for the budget,
+and its client sent 65535 bytes more before the arrivals took the budget past its limit
+again (`H2DemuxBudgetE2ETest`, which therefore keeps that connection on a route of its own).
+
 ## Settings, resets and flow control
 
 h2 flow control (plaintext and TLS-terminated h2): the windows are per hop (see "Windows" above). Request DATA towards an upstream stays within the upstream's windows, response DATA towards the client within the client's; a stream without window holds back neither the other streams to its upstream nor the other streams of the client. DATA is relayed without its padding. The settings are per hop too: the client gets the relay's SETTINGS (100 concurrent streams, a 1MiB initial stream window, the 64KiB header list limit), each upstream the relay's own (push off, a 1MiB initial stream window, the 64KiB header list limit) once as its connection opens, whatever the client announces, and each a connection window growing from 65535 bytes to 1MiB with what it sends. A reset the relay writes -- one relayed from one side to the other, one netty's codec answers a frame with, or the relay's own (a header block past the budget, interim heads past 64KiB) -- is never followed by DATA of its stream, even when the read that caused it also opened the stream's window: what the relay held of it for the peer goes out before the `RST_STREAM` or is dropped. An upstream sending past the stream window the relay granted it gets its stream reset with `FLOW_CONTROL_ERROR`, its connection going on. A client that half-closes its TCP connection after its requests still gets the responses, within the windows it granted before (see "Half-close probes" in [connection-limits.md](connection-limits.md)). A client that never grants window is cut by the stall timeout.

@@ -22,7 +22,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
@@ -308,13 +307,20 @@ class H2DemuxBudgetE2ETest {
 	 * dynamic table entry) but not relayed --, so is the reset the upstream answers with,
 	 * and the other streams of the connection complete. The stream stays tracked until
 	 * its reset is written to the upstream.
+	 * <p>
+	 * The connection exhausting the budget sends on a route of its own (its queue is its
+	 * route's): the reset frees budget, which wakes it, withheld for the budget, and its
+	 * client sends a window more.
 	 */
 	@Test
 	void trailersPastTheAllowanceWithTheBudgetExhaustedResetOnlyTheirStream() throws Exception {
 		String route = "bud.trailers.test";
+		String otherRoute = "bud.trailers.other.test";
 		CountDownLatch gate = new CountDownLatch(1);
 		UpstreamLog log = new UpstreamLog();
+		AtomicInteger otherHeads = new AtomicInteger();
 		startClient(route, stub(socket -> serveGatedLogging(socket, gate, log)));
+		startClient(otherRoute, stub(socket -> serveGated(socket, gate, otherHeads)));
 		int reset = streamId(0);
 		int after = streamId(STREAMS + 1);
 		int body = 4096;
@@ -322,7 +328,7 @@ class H2DemuxBudgetE2ETest {
 		H2TestClient client = H2TestClient.connect(dataPort, reset);
 		client.headers(reset, false, head(route, "/reset"));
 		try (Stalled first = open(client, route, 1, UNBOUNDED, body + late, log.heads());
-				Stalled second = stall(route, log.heads())) {
+				Stalled second = stall(otherRoute, otherHeads)) {
 			// the first connection may stop at its share before the second exhausts the
 			// budget
 			first.awaitWithheld();
@@ -347,7 +353,7 @@ class H2DemuxBudgetE2ETest {
 				.untilAsserted(
 						() -> assertThat(queuedBytes(route)).as("the stream's queued data dropped, a reset queued")
 							.isLessThanOrEqualTo(queued - body + RST_STREAM_BYTES));
-			assertThat(trackedStreams(route)).as("forgotten once its client stream closed").isEqualTo(2 * STREAMS);
+			assertThat(trackedStreams(route)).as("forgotten once its client stream closed").isEqualTo(STREAMS);
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 			assertThat(client.closed()).isFalse();
 			gate.countDown();
@@ -372,6 +378,7 @@ class H2DemuxBudgetE2ETest {
 			assertThat(client.goAwayCode()).isEqualTo(-1);
 		}
 		awaitReleased(route);
+		awaitReleased(otherRoute);
 	}
 
 	/**
@@ -757,7 +764,6 @@ class H2DemuxBudgetE2ETest {
 							TestH2.int32(Integer.MAX_VALUE - 65535));
 				}
 			}
-			log.idle.set(out);
 			gate.await();
 			while ((frame = TestH2.readFrame(in)) != null) {
 				int streamId = frame.streamId();
@@ -807,21 +813,9 @@ class H2DemuxBudgetE2ETest {
 
 		private final List<String> afterReset = new CopyOnWriteArrayList<>();
 
-		/**
-		 * The output of the route's upstream once it stopped reading for the gate; one
-		 * connection per route.
-		 */
-		private final AtomicReference<@Nullable OutputStream> idle = new AtomicReference<>();
-
 		/** The request heads read before the gate opened. */
 		AtomicInteger heads() {
 			return this.heads;
-		}
-
-		/** Waits until the route's upstream stopped reading for the gate. */
-		OutputStream awaitIdle() {
-			Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> this.idle.get() != null);
-			return Objects.requireNonNull(this.idle.get());
 		}
 
 	}
