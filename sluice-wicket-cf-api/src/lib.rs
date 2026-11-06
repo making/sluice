@@ -271,7 +271,7 @@ mod tests {
     /// A client sending nothing loses its connection after the bound, in the
     /// TLS handshake as in the wait for a request's head, and at once to another
     /// connection when all slots are taken: it holds no slot.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_quiet_connection_is_closed() {
         let certified = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
         let tls = TlsSettings {
@@ -283,6 +283,8 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let dir = dir.join(store::guid());
+            // the bound on the paused clock, advanced whenever the runtime idles
+            tokio::time::pause();
             tokio::spawn(async move {
                 serve(listener, settings(dir, tls), std::future::pending())
                     .await
@@ -294,6 +296,10 @@ mod tests {
             assert!(started.elapsed() >= QUIET, "{:?}", started.elapsed());
             assert!(started.elapsed() < QUIET * 2, "{:?}", started.elapsed());
 
+            // on the real clock (a second: the first waits out FRESH before it gives way):
+            // idling on the OS's connects would advance a paused one past the bound, which
+            // would close the connection in place of the eviction
+            tokio::time::resume();
             let started = Instant::now();
             let mut quiet = Vec::new();
             for _ in 0..api::MAX_CONNECTIONS {
