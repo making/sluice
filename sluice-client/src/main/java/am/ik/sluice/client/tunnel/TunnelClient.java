@@ -166,13 +166,12 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 			.build();
 		this.routeFilters = RouteFilters.of(properties.upstreams(), filters, meterRegistry);
 		long connectionBytes = ConnectionLimit.CONNECTION_BYTES + this.routeFilters.connectionBytes();
-		if (this.routeFilters.reservedBytes() > maxHeap / 2 - this.budget.max()) {
-			log.warn("the plugins' instances may hold {}MiB, past half of the max heap {}MiB less the tunnel budget: "
-					+ "lower their vms or max-memory", this.routeFilters.reservedBytes() >> 20, maxHeap >> 20);
+		if (this.routeFilters.reservedBytes() > 0) {
+			// native memory: none of the heap the connection limit derives from
+			log.info("the plugins' instances may hold {}MiB outside the heap", this.routeFilters.reservedBytes() >> 20);
 		}
-		this.connectionLimit = new ConnectionLimit(
-				properties.maxConnections() > 0 ? properties.maxConnections() : ConnectionLimit
-					.derive(maxHeap / 2 - this.budget.max() - this.routeFilters.reservedBytes(), connectionBytes));
+		this.connectionLimit = new ConnectionLimit(properties.maxConnections() > 0 ? properties.maxConnections()
+				: ConnectionLimit.derive(maxHeap / 2 - this.budget.max(), connectionBytes));
 		Gauge.builder("sluice.connections.limit", this.connectionLimit, ConnectionLimit::max)
 			.description("Upstream connections allowed open at once")
 			.register(meterRegistry);
@@ -184,8 +183,8 @@ public class TunnelClient implements SmartLifecycle, NodeConnection.Listener {
 						+ "to {}KiB against it), gRPC flow control window {}KiB",
 				this.connectionLimit.max(),
 				properties.maxConnections() > 0 ? "configured"
-						: "derived: (half of max heap %dMiB - tunnel budget - %dKiB of plugins) / %dKiB per connection"
-							.formatted(maxHeap >> 20, this.routeFilters.reservedBytes() >> 10, connectionBytes >> 10),
+						: "derived: (half of max heap %dMiB - tunnel budget) / %dKiB per connection"
+							.formatted(maxHeap >> 20, connectionBytes >> 10),
 				this.budget.max() >> 10,
 				properties.tunnelBudget().toBytes() > 0 ? "configured" : "derived: an eighth of half of max heap",
 				VirtualConnection.INITIAL_WINDOW >> 10, VirtualConnection.DEFAULT_WINDOW >> 10,

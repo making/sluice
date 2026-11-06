@@ -1,6 +1,6 @@
 # Proxy-Wasm plugins
 
-A filter of your own on a route of `sluice-client`, without building the client: a [proxy-wasm](https://github.com/proxy-wasm/spec) module (ABI 0.2.1), the kind you would write for Envoy, interpreted inside the client, the released native image included. Use it for one user's traffic or a small gateway's. It is interpreted: for what must keep up with a busy route, a Java filter in a custom build costs far less ([.kb/client-filters.md](.kb/client-filters.md) has the numbers). Filters in general: README "Filters".
+A filter of your own on a route of `sluice-client`, without building the client: a [proxy-wasm](https://github.com/proxy-wasm/spec) module (ABI 0.2.1), the kind you would write for Envoy, compiled by [wasmtime](https://wasmtime.dev) inside the client at its start, the released images included. A body it reads is copied into its memory and every host call crosses the ABI, so a Java filter in a custom build still costs less on a busy route ([.kb/client-filters.md](.kb/client-filters.md) has the numbers). Filters in general: README "Filters".
 
 ## Write one
 
@@ -87,7 +87,7 @@ java -jar rontolisp-0.1.0-SNAPSHOT-exec.jar my_plugin.lisp -o my_plugin.wasm --n
 ./rontolisp-linux-amd64 my_plugin.lisp -o my_plugin.wasm --no-wasi --optimize=size
 ```
 
-It runs at the default limits. To search a body, use `proxy-wasm:with-buffer` and `proxy-wasm:search-bytes`, which read it where the host put it: `search` over `get-buffer` copies it first and costs several times more. Plugins with tests, one of them adding a field to a JSON response with `rontolisp:json-parse` and `rontolisp:json-stringify`: `sluice-client/src/test/guest/rontolisp`.
+It runs at the default limits, but for what it parses into objects: a body parsed takes many times its size ("Memory"). To search a body, use `proxy-wasm:with-buffer` and `proxy-wasm:search-bytes`, which read it where the host put it: `search` over `get-buffer` copies it first and costs several times more. `rontolisp:json-span` does so for JSON: it checks a body and finds a value's bounds without parsing it into objects. Plugins with tests, one of them adding a field to a JSON response with it: `sluice-client/src/test/guest/rontolisp`.
 
 ## Define and use it
 
@@ -192,7 +192,7 @@ The answer follows the responses to the requests before it, with `Content-Length
 
 ## When it fails
 
-A plugin fails when it traps (an SDK's panic among them), runs past `call-timeout`, or runs out of `max-memory`. The instance is discarded and started anew for the next stream; the streams it was serving lose their plugin from there. Counted as `sluice.client.filter.failures`, by `phase`.
+A plugin fails when it traps (an SDK's panic among them), runs past `call-timeout`, runs out of `max-memory`, or recurses past the stack a call may take (1MiB). The instance is discarded and started anew for the next stream; the streams it was serving lose their plugin from there. Counted as `sluice.client.filter.failures`, by `phase`.
 
 | The failure | `fail-closed=false` (default) | `fail-closed=true` |
 |---|---|---|
@@ -205,12 +205,13 @@ One call at a time runs on an instance, and a stream stays on its instance: a pl
 
 ## Memory
 
-`max-memory` bounds what an instance holds: its linear memory and, on the client's heap, its Wasm GC objects, the exceptions it keeps and its tables. A plugin going past it fails, and a module whose memory and tables start past it is refused at the client's start.
+`max-memory` bounds all an instance holds, at the size each part has grown to: its linear memory, its GC heap (Wasm GC objects and exceptions) and its tables, 8 bytes an element. It is native memory, outside the client's heap: count `vms x max-memory` per use beside the heap when sizing the client's container. A module whose memory and tables start past it is refused at the client's start. Past it a linear memory or a table does not grow (`memory.grow` and `table.grow` give -1, which the SDKs' allocators take for out of memory, failing the plugin), and an object is not allocated (the plugin fails).
 
 A module needs a linear memory and an allocator whatever else it uses, as the ABI passes pointers: a language with objects copies between the two.
 
-- An element of an array takes 8 bytes even as an `i8`, so a string of 1MiB takes 8MiB. A struct takes about 56 bytes and 16 to 32 per field.
-- What a plugin drops comes back between calls. Within a call all it allocates counts, so one call may allocate what is free of `max-memory`, garbage or not.
+- Objects are collected inside a call as between calls: what a plugin drops comes back.
+- The collector copies, so its heap holds two halves, and the heap grows by doubling: a plugin holds objects of between a quarter and a half of what its linear memory leaves of `max-memory`.
+- A body parsed into objects takes many times its size: raise `max-memory` for a plugin parsing large bodies, or read the body where the host put it, as the plugin in Lisp adding a field to a JSON response does (`sluice-client/src/test/guest/rontolisp`). What each takes is in [.kb/client-filters.md](.kb/client-filters.md). Past it the plugin fails, and a body it held unchanged goes on.
 
 ## What it reaches
 

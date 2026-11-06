@@ -85,7 +85,7 @@ final class RouteFilters {
 		return this.filtered;
 	}
 
-	/** The most the plugins' instances hold. */
+	/** The most the plugins' instances hold, outside the heap. */
 	long reservedBytes() {
 		return this.reservedBytes;
 	}

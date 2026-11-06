@@ -10,6 +10,7 @@ on:
     - 'sluice-proto/**'
     - 'sluice-server/**'
     - 'sluice-client/**'
+    - 'sluice-client-wasm/**'
     - 'sluice-example-upstream/**'
     - 'sluice-it/**'
     - 'sluice-flume/**'
@@ -31,7 +32,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -45,8 +46,8 @@ jobs:
       with:
         path: ~/.cache/ms-playwright
         key: playwright-${{ runner.os }}-${{ hashFiles('pom.xml') }}
-    # sluice-it builds sluice-flume (cargo, preinstalled on the runner) for its live
-    # access log tests; prost needs protoc
+    # sluice-client builds sluice-client-wasm and sluice-it sluice-flume (cargo, preinstalled
+    # on the runner), the latter for its live access log tests; prost needs protoc
     - name: Install protoc
       run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends protobuf-compiler
     - uses: actions/cache@v4
@@ -55,9 +56,43 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           sluice-flume/target
-        key: cargo-test-${{ runner.os }}-${{ hashFiles('sluice-flume/Cargo.lock') }}
+          sluice-client-wasm/target
+        key: cargo-test-${{ runner.os }}-${{ hashFiles('sluice-flume/Cargo.lock', 'sluice-client-wasm/Cargo.lock') }}
     - name: Test
       run: ./mvnw -V -B --no-transfer-progress verify
     # what only a native image runs into (the released images are native)
     - name: Native test
       run: ./mvnw -B --no-transfer-progress -pl sluice-client -am -PnativeTest test -Dtest='DirectBufferReleaseTest,ProxyWasmFilterTest,LlmUsageFilterTest' -Dsurefire.failIfNoSpecifiedTests=false
+  # The plugins' library with the JVM where the test job does not run: on aarch64, as the
+  # aarch64 images run it (on a native image too), and on macOS, where a client built there
+  # carries it.
+  plugins:
+    name: plugins (${{ matrix.runs_on }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - { runs_on: ubuntu-24.04-arm, native: true }
+        - { runs_on: macos-latest, native: false }
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 40
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - uses: graalvm/setup-graalvm@v1
+      with:
+        java-version: '25'
+        distribution: graalvm
+        cache: 'maven'
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          sluice-client-wasm/target
+        key: cargo-plugins-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('sluice-client-wasm/Cargo.lock') }}
+    - name: Test
+      run: ./mvnw -V -B --no-transfer-progress -pl sluice-client -am test -Dtest='ProxyWasmFilterTest,PluginModuleTest' -Dsurefire.failIfNoSpecifiedTests=false
+    - name: Native test
+      if: matrix.native
+      run: ./mvnw -B --no-transfer-progress -pl sluice-client -am -PnativeTest test -Dtest='ProxyWasmFilterTest' -Dsurefire.failIfNoSpecifiedTests=false

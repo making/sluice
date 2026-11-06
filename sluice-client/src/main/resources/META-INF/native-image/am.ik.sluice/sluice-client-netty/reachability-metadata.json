@@ -1,0 +1,49 @@
+{
+  "reflection": [
+    {
+      "type": "am.ik.sluice.client.filter.PluginInstance",
+      "methods": [
+        {
+          "name": "host",
+          "parameterTypes": ["int", "long", "int", "long", "long"]
+        }
+      ]
+    }
+  ],
+  "resources": [
+    {
+      "glob": "META-INF/native/*/libsluice_client_wasm.*"
+    }
+  ],
+  "foreign": {
+    "downcalls": [
+      { "returnType": "jint", "parameterTypes": ["void*", "jlong", "jlong"] },
+      { "returnType": "jlong", "parameterTypes": ["void*", "jlong"] },
+      { "returnType": "jlong", "parameterTypes": ["jlong", "void*", "jlong"] },
+      { "returnType": "jlong", "parameterTypes": ["jlong", "jlong", "jlong"] },
+      { "returnType": "void", "parameterTypes": ["jlong"] },
+      { "returnType": "jint", "parameterTypes": ["jlong", "jint", "jlong", "jint"] },
+      {
+        "returnType": "jlong",
+        "parameterTypes": ["jlong", "jlong"],
+        "options": { "critical": { "allowHeapAccess": false } }
+      },
+      {
+        "returnType": "void",
+        "parameterTypes": ["jlong", "jlong"],
+        "options": { "critical": { "allowHeapAccess": false } }
+      }
+    ],
+    "upcalls": [
+      { "returnType": "jint", "parameterTypes": ["jint", "jlong", "jint", "jlong", "jlong"] }
+    ],
+    "directUpcalls": [
+      {
+        "class": "am.ik.sluice.client.filter.PluginInstance",
+        "method": "host",
+        "returnType": "jint",
+        "parameterTypes": ["jint", "jlong", "jint", "jlong", "jlong"]
+      }
+    ]
+  }
+}

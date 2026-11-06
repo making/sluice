@@ -9,19 +9,13 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 
-import ch.qos.logback.classic.Logger;
-import ch.qos.logback.classic.spi.ILoggingEvent;
-import ch.qos.logback.core.AppenderBase;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
-import org.slf4j.LoggerFactory;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import am.ik.sluice.client.config.FilterConfig;
 import am.ik.sluice.client.filter.UpstreamFilter.BodyHandler;
@@ -36,7 +30,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 /**
- * Plugins of the proxy-wasm SDK, the SDK's own examples among them, interpreted by Endive
+ * Plugins of the proxy-wasm SDK, the SDK's own examples among them, compiled by wasmtime
  * behind the pipe: the same on a JVM and, with {@code -PnativeTest}, on a native image.
  */
 @SuppressWarnings("NullAway")
@@ -174,7 +168,8 @@ class ProxyWasmFilterTest {
 
 	/**
 	 * A command, not a reactor, of objects on the heap: it refuses a second start. What
-	 * it drops comes back, here ten times its limit.
+	 * it drops comes back, here more than its limit. A recursion past the stack a call
+	 * may take fails it, and the VM starts anew.
 	 */
 	@Test
 	void aPluginOfObjectsRuns() throws Exception {
@@ -189,35 +184,57 @@ class ProxyWasmFilterTest {
 		assertThat(FilterTests.relayed(filter, "GET", "/edit", response, 1024))
 			.isEqualTo("HTTP/1.1 204 No Content\r\nx-plugin: built on the heap\r\nx-count: 2\r\n\r\n");
 		assertThat(FilterTests.counters(this.registry)).isEmpty();
+
+		assertThat(FilterTests.relayed(filter, "GET", "/deep", response, 1024)).isEqualTo(response);
+		assertThat(FilterTests.counters(this.registry)).isEqualTo(Map.of("failures plugin head", 1L));
+		assertThat(FilterTests.relayed(filter, "GET", "/edit", response, 1024))
+			.isEqualTo("HTTP/1.1 204 No Content\r\nx-plugin: built on the heap\r\nx-count: 1\r\n\r\n");
 	}
 
 	/**
-	 * Its limit of 16MB bounds what it holds on the heap with its memory. The last path
-	 * of each takes it past that; each array here is 8MiB, and the one of {@code /huge}
-	 * 128MiB, which the JVM would give it.
+	 * Its limit of 16MB bounds what it holds of each kind, its GC heap, memory and tables
+	 * together: held again and again, it fails by the call {@code most} at the latest,
+	 * 16MiB in all, and the VM started anew holds nothing of it. An array here is 1MiB,
+	 * 64Ki structs about as much, 32Ki exceptions less, a table's growth 8MiB, a memory's
+	 * 4MiB, the array of {@code /huge} 16MiB.
 	 */
 	@ParameterizedTest
-	@ValueSource(strings = { "/array /array", "/structs /structs /structs", "/raised /raised /raised", "/table /table",
-			"/array /memory /memory", "/huge" })
-	void aPluginHoldingPastItsMemoryFails(String paths) throws Exception {
+	@CsvSource({ "/array, 16", "/structs, 16", "/raised, 16", "/table, 2", "/memory, 4", "/huge, 1" })
+	void aPluginHoldingPastItsMemoryFails(String path, int most) throws Exception {
 		UpstreamFilter filter = filter(GC_PLUGIN);
 		String response = "HTTP/1.1 204 No Content\r\n\r\n";
 
-		for (String path : paths.split(" ")) {
-			assertThat(FilterTests.counters(this.registry)).as(path).isEmpty();
-			assertThat(FilterTests.relayed(filter, "GET", path, response, 1024)).as(path).isEqualTo(response);
-		}
+		int failed = holdUntilItFails(filter, path, most);
 
-		assertThat(FilterTests.counters(this.registry)).isEqualTo(Map.of("failures plugin head", 1L));
+		// what fits in the limit is held: the first call fails only past it
+		assertThat(failed).isBetween(Math.min(2, most), most);
 		// the VM started anew holds nothing of it
 		assertThat(FilterTests.relayed(filter, "GET", "/edit", response, 1024))
 			.isEqualTo("HTTP/1.1 204 No Content\r\nx-plugin: built on the heap\r\nx-count: 1\r\n\r\n");
-		assertThat(FilterTests.relayed(filter, "GET", paths.split(" ")[0], response, 1024)).isEqualTo(response);
+		if (most > 1) {
+			assertThat(FilterTests.relayed(filter, "GET", path, response, 1024)).isEqualTo(response);
+			assertThat(FilterTests.counters(this.registry)).isEqualTo(Map.of("failures plugin head", 1L));
+		}
+	}
+
+	/**
+	 * The call of {@code path} that failed, the first of all, by the call {@code most}.
+	 */
+	private int holdUntilItFails(UpstreamFilter filter, String path, int most) throws Exception {
+		String response = "HTTP/1.1 204 No Content\r\n\r\n";
+		for (int call = 1; call <= most; call++) {
+			assertThat(FilterTests.relayed(filter, "GET", path, response, 1024)).as(path).startsWith("HTTP/1.1 204");
+			if (!FilterTests.counters(this.registry).isEmpty()) {
+				assertThat(FilterTests.counters(this.registry)).isEqualTo(Map.of("failures plugin head", 1L));
+				return call;
+			}
+		}
+		throw new AssertionError(path + " held " + most + " times past its limit");
 	}
 
 	/**
 	 * What a real compiler makes of it, at the default limit: of the arrays it holds,
-	 * 8MiB each, the second goes past that, and the VM started anew does not.
+	 * 1MiB each, one goes past that, and the VM started anew does not.
 	 */
 	@Test
 	void aPluginInLispRunsWithinItsMemory() throws Exception {
@@ -230,8 +247,7 @@ class ProxyWasmFilterTest {
 			.isEqualTo("HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nHello from Lisp\n");
 		assertThat(FilterTests.relayed(filter, "GET", "/hold", response, 1024)).isEqualTo(stamped);
 		assertThat(FilterTests.counters(this.registry)).isEmpty();
-		assertThat(FilterTests.relayed(filter, "GET", "/hold", response, 1024)).isEqualTo(response);
-		assertThat(FilterTests.counters(this.registry)).isEqualTo(Map.of("failures plugin head", 1L));
+		assertThat(holdUntilItFails(filter, "/hold", 16)).isGreaterThan(1);
 
 		assertThat(FilterTests.relayed(filter, "GET", "/", response, 1024)).isEqualTo(stamped);
 	}
@@ -260,52 +276,6 @@ class ProxyWasmFilterTest {
 				.isEqualTo(decoded(response));
 		}
 		assertThat(FilterTests.counters(this.registry)).isEmpty();
-	}
-
-	/** Without that thread nothing stops a plugin, so not even reporting may end it. */
-	@Test
-	void theWatchdogOutlivesRunningOutOfMemory() throws Exception {
-		Logger logger = (Logger) LoggerFactory.getLogger(ProxyWasmFilter.class);
-		CountDownLatch reported = new CountDownLatch(1);
-		AppenderBase<ILoggingEvent> noMemory = new AppenderBase<>() {
-			@Override
-			protected void append(ILoggingEvent event) {
-				reported.countDown();
-				throw new OutOfMemoryError("reporting");
-			}
-		};
-		noMemory.start();
-		logger.addAppender(noMemory);
-		try {
-			Thread running = new Thread(() -> {
-				ProxyWasmFilter.Watchdog.Call call = new ProxyWasmFilter.Watchdog.Call(Duration.ZERO);
-				try {
-					reported.await();
-				}
-				catch (InterruptedException ex) {
-					Thread.currentThread().interrupt();
-				}
-				call.end();
-			}) {
-				@Override
-				public void interrupt() {
-					throw new OutOfMemoryError("a round");
-				}
-			};
-			running.start();
-			assertThat(reported.await(30, TimeUnit.SECONDS)).isTrue();
-			running.join();
-		}
-		finally {
-			logger.detachAppender(noMemory);
-		}
-
-		SimpleMeterRegistry registry = new SimpleMeterRegistry();
-		UpstreamFilter filter = filter(registry, limits(TEST_PLUGIN).callTimeout(Duration.ofMillis(200)).build(),
-				FilterConfig.builder().name("plugin").build());
-		assertTimeoutPreemptively(Duration.ofSeconds(30),
-				() -> FilterTests.relayed(filter, "GET", "/spin-head", SIZED, 1024));
-		assertThat(FilterTests.counters(registry)).isEqualTo(Map.of("failures plugin head", 1L));
 	}
 
 	@Test
@@ -579,7 +549,7 @@ class ProxyWasmFilterTest {
 		Files.write(module, new byte[] { 0, 'a', 's', 'm', 1, 0, 0, 0, 4, 7, 1, 0x70, 0, (byte) 0x80, (byte) 0xad,
 				(byte) 0xe2, 4, 5, 3, 1, 0, 1 });
 		assertThatThrownBy(() -> filter(module.toString())).isInstanceOf(IllegalArgumentException.class)
-			.hasMessage("plugin plugin needs 120065536 bytes of memory and tables, past its limit of 16777216");
+			.hasMessage("plugin plugin needs 80065536 bytes of memory and tables, past its limit of 16777216");
 	}
 
 	private static final class NoHeaders implements UpstreamFilter.Headers {

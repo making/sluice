@@ -10,15 +10,16 @@
 	<artifactId>sluice-client</artifactId>
 	<properties>
 		<java.version>25</java.version>
+		<!-- the library running the proxy-wasm plugins (Rust, its own Cargo workspace) -->
+		<sluice.client-wasm.dir>${project.basedir}/../sluice-client-wasm</sluice.client-wasm.dir>
+		<!-- where the client looks for it among its resources (Wasmtime.platform()), set by
+			 the profiles below; no profile matching, no plugin runs -->
+		<sluice.client-wasm.platform>unsupported</sluice.client-wasm.platform>
 	</properties>
 	<dependencies>
 		<dependency>
 			<groupId>am.ik.sluice</groupId>
 			<artifactId>sluice-proto</artifactId>
-		</dependency>
-		<dependency>
-			<groupId>run.endive</groupId>
-			<artifactId>runtime</artifactId>
 		</dependency>
 		<dependency>
 			<groupId>org.jspecify</groupId>
@@ -78,6 +79,10 @@
 					<classifier>exec</classifier>
 					<image>
 						<env>
+							<!-- the JVM image runs the classes, not the JAR, so its manifest's
+								 Enable-Native-Access does not apply; the buildpack adds its
+								 options to these -->
+							<BPE_DEFAULT_JAVA_TOOL_OPTIONS>--enable-native-access=ALL-UNNAMED</BPE_DEFAULT_JAVA_TOOL_OPTIONS>
 							<BP_OCI_SOURCE>https://github.com/${env.GITHUB_REPOSITORY}</BP_OCI_SOURCE>
 							<BP_OCI_REVISION>${env.GITHUB_SHA}</BP_OCI_REVISION>
 						</env>
@@ -120,16 +125,168 @@
 				<groupId>am.ik.maven</groupId>
 				<artifactId>nullability-maven-plugin</artifactId>
 			</plugin>
-
+			<plugin>
+				<!-- Builds sluice-client-wasm for this platform (release: the plugins run
+					 compiled by it); a missing Rust toolchain fails the build. -->
+				<groupId>org.codehaus.mojo</groupId>
+				<artifactId>exec-maven-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>build-sluice-client-wasm</id>
+						<phase>generate-resources</phase>
+						<goals>
+							<goal>exec</goal>
+						</goals>
+						<configuration>
+							<!-- in the crate, so rustup picks its rust-toolchain.toml -->
+							<workingDirectory>${sluice.client-wasm.dir}</workingDirectory>
+							<executable>cargo</executable>
+							<arguments>
+								<argument>build</argument>
+								<argument>--release</argument>
+								<argument>--locked</argument>
+								<argument>--manifest-path</argument>
+								<argument>${sluice.client-wasm.dir}/Cargo.toml</argument>
+								<argument>--target-dir</argument>
+								<argument>${sluice.client-wasm.dir}/target</argument>
+							</arguments>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<!-- the library as a resource of the client: the JAR, the image's and the
+					 native image's (embedded, extracted when a plugin is first defined) -->
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-resources-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>copy-sluice-client-wasm</id>
+						<phase>process-resources</phase>
+						<goals>
+							<goal>copy-resources</goal>
+						</goals>
+						<configuration>
+							<outputDirectory>${project.build.outputDirectory}/META-INF/native/${sluice.client-wasm.platform}</outputDirectory>
+							<resources>
+								<resource>
+									<directory>${sluice.client-wasm.dir}/target/release</directory>
+									<includes>
+										<include>libsluice_client_wasm.so</include>
+										<include>libsluice_client_wasm.dylib</include>
+									</includes>
+								</resource>
+							</resources>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<!-- the library is called through FFM, a restricted API: no warning for it -->
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-jar-plugin</artifactId>
+				<configuration>
+					<archive>
+						<manifestEntries>
+							<Enable-Native-Access>ALL-UNNAMED</Enable-Native-Access>
+						</manifestEntries>
+					</archive>
+				</configuration>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<configuration>
+					<argLine>--enable-native-access=ALL-UNNAMED</argLine>
+				</configuration>
+			</plugin>
 		</plugins>
 	</build>
 
 	<profiles>
+		<profile>
+			<id>sluice-client-wasm-linux-x86_64</id>
+			<activation>
+				<os>
+					<name>Linux</name>
+					<arch>amd64</arch>
+				</os>
+			</activation>
+			<properties>
+				<sluice.client-wasm.platform>linux-x86_64</sluice.client-wasm.platform>
+			</properties>
+		</profile>
+		<profile>
+			<id>sluice-client-wasm-linux-aarch64</id>
+			<activation>
+				<os>
+					<name>Linux</name>
+					<arch>aarch64</arch>
+				</os>
+			</activation>
+			<properties>
+				<sluice.client-wasm.platform>linux-aarch64</sluice.client-wasm.platform>
+			</properties>
+		</profile>
+		<profile>
+			<id>sluice-client-wasm-macos-aarch64</id>
+			<activation>
+				<os>
+					<family>mac</family>
+					<arch>aarch64</arch>
+				</os>
+			</activation>
+			<properties>
+				<sluice.client-wasm.platform>macos-aarch64</sluice.client-wasm.platform>
+			</properties>
+		</profile>
+		<profile>
+			<id>sluice-client-wasm-macos-x86_64</id>
+			<activation>
+				<os>
+					<family>mac</family>
+					<arch>x86_64</arch>
+				</os>
+			</activation>
+			<properties>
+				<sluice.client-wasm.platform>macos-x86_64</sluice.client-wasm.platform>
+			</properties>
+		</profile>
 		<!-- GraalVM native image: ./mvnw -pl sluice-client -am -Pnative -DskipTests package -->
 		<profile>
 			<id>native</id>
+			<dependencies>
+				<!-- the SubstrateVM API src/native/java compiles against; provided: the image
+					 builder's own at build time -->
+				<dependency>
+					<groupId>org.graalvm.sdk</groupId>
+					<artifactId>nativeimage</artifactId>
+					<version>25.0.4</version>
+					<scope>provided</scope>
+				</dependency>
+			</dependencies>
 			<build>
 				<plugins>
+					<plugin>
+						<!-- src/native/java: the plugins' calls through C function pointers
+							 (Target_am_ik_sluice_client_filter_Wasmtime) -->
+						<groupId>org.codehaus.mojo</groupId>
+						<artifactId>build-helper-maven-plugin</artifactId>
+						<executions>
+							<execution>
+								<id>add-native-source</id>
+								<phase>generate-sources</phase>
+								<goals>
+									<goal>add-source</goal>
+								</goals>
+								<configuration>
+									<sources>
+										<source>${project.basedir}/src/native/java</source>
+									</sources>
+								</configuration>
+							</execution>
+						</executions>
+					</plugin>
 					<plugin>
 						<groupId>org.graalvm.buildtools</groupId>
 						<artifactId>native-maven-plugin</artifactId>
@@ -149,8 +306,38 @@
 		<!-- tests on a native image: ./mvnw -pl sluice-client -am -PnativeTest test -Dtest=<class> -->
 		<profile>
 			<id>nativeTest</id>
+			<dependencies>
+				<!-- the SubstrateVM API src/native/java compiles against; provided: the image
+					 builder's own at build time -->
+				<dependency>
+					<groupId>org.graalvm.sdk</groupId>
+					<artifactId>nativeimage</artifactId>
+					<version>25.0.4</version>
+					<scope>provided</scope>
+				</dependency>
+			</dependencies>
 			<build>
 				<plugins>
+					<plugin>
+						<!-- src/native/java: the plugins' calls through C function pointers
+							 (Target_am_ik_sluice_client_filter_Wasmtime) -->
+						<groupId>org.codehaus.mojo</groupId>
+						<artifactId>build-helper-maven-plugin</artifactId>
+						<executions>
+							<execution>
+								<id>add-native-source</id>
+								<phase>generate-sources</phase>
+								<goals>
+									<goal>add-source</goal>
+								</goals>
+								<configuration>
+									<sources>
+										<source>${project.basedir}/src/native/java</source>
+									</sources>
+								</configuration>
+							</execution>
+						</executions>
+					</plugin>
 					<plugin>
 						<groupId>org.graalvm.buildtools</groupId>
 						<artifactId>native-maven-plugin</artifactId>

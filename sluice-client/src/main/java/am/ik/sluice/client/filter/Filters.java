@@ -8,7 +8,6 @@ import java.util.Map;
 import java.util.Objects;
 
 import org.jspecify.annotations.Nullable;
-import run.endive.wasm.WasmModule;
 
 import am.ik.sluice.client.config.FilterConfig;
 import am.ik.sluice.tunnel.TunnelBudget;
@@ -29,7 +28,7 @@ public final class Filters {
 
 	private final Map<String, UpstreamFilterFactory> factories = new LinkedHashMap<>();
 
-	private final Map<String, WasmModule> modules = new HashMap<>();
+	private final Map<String, PluginModule> modules = new HashMap<>();
 
 	private final MeterRegistry meters;
 
@@ -143,7 +142,7 @@ public final class Filters {
 			.budget(this.budget)
 			.build();
 		if (!settings.plugin().isEmpty()) {
-			WasmModule module = this.modules.computeIfAbsent(name,
+			PluginModule module = this.modules.computeIfAbsent(name,
 					key -> PluginModule.load(name, settings.plugin(), settings.sha256(), this.resourceLoader));
 			this.reservedBytes += ProxyWasmFilter.reservedBytes(settings);
 			return new ProxyWasmFilter(name, module, context, failures);
@@ -157,8 +156,8 @@ public final class Filters {
 	}
 
 	/**
-	 * The most the instances of the plugins made so far hold: out of what the connection
-	 * limit derives from.
+	 * The most the instances of the plugins made so far hold: native memory, outside the
+	 * heap the connection limit derives from.
 	 */
 	public long reservedBytes() {
 		return this.reservedBytes;

@@ -1,7 +1,10 @@
 ;;;; A plugin in Lisp that adds a "sluice" field to a JSON object a response carries: the
 ;;;; route, the plugin, the request and the status the client relayed it for.
 ;;;;
-;;;; Anything else, an encoded body or one that does not parse among them, goes on as it came.
+;;;; The body stays where the host put it: rontolisp:json-span checks that it is JSON and
+;;;; finds the object's closing brace, and the field goes in before it. Nothing of the body
+;;;; becomes a Lisp value. Anything else, an encoded body or one that is no JSON object
+;;;; among them, goes on as it came.
 
 (require :proxy-wasm "proxy-wasm.lisp")
 
@@ -40,9 +43,17 @@
           ;; held until the whole of it is here
           ((not end-of-stream) :pause)
           (t
-           (let ((document
-                  (ignore-errors (rontolisp:json-parse (proxy-wasm:get-buffer :response-body)))))
-             (when (hash-table-p document)
-               (setf (gethash "sluice" document) (metadata))
-               (proxy-wasm:set-buffer :response-body (rontolisp:json-stringify document))))
+           (proxy-wasm:with-buffer (address size :response-body 0 body-size)
+             ;; the document, its members when it is a container; NIL when it is no
+             ;; JSON (not IGNORE-ERRORS, whose second value is the condition)
+             (multiple-value-bind (start end members)
+                 (handler-case (rontolisp:json-span address size) (error () nil))
+               (when (and members (eql (proxy-wasm:load8 (+ address start)) 123))
+                 ;; before the closing brace, a comma after a member
+                 (proxy-wasm:set-buffer :response-body
+                                        (concatenate 'string (if (plusp members) "," "")
+                                                     "\"sluice\":"
+                                                     (rontolisp:json-stringify (metadata)))
+                                        :start (- end 1)
+                                        :size 0))))
            :continue))))

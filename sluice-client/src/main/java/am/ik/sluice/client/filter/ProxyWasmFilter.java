@@ -30,35 +30,28 @@ import io.micrometer.core.instrument.Tags;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import run.endive.runtime.HostFunction;
-import run.endive.runtime.ImportFunction;
-import run.endive.runtime.ImportValues;
-import run.endive.runtime.Instance;
-import run.endive.runtime.Memory;
-import run.endive.runtime.WasmFunctionHandle;
-import run.endive.wasm.WasmModule;
-import run.endive.wasm.types.FunctionImport;
-import run.endive.wasm.types.FunctionType;
-import run.endive.wasm.types.MemoryLimits;
 
 import am.ik.sluice.client.config.FilterConfig;
+import am.ik.sluice.client.filter.PluginInstance.HostFunction;
+import am.ik.sluice.client.filter.PluginInstance.Memory;
 import am.ik.sluice.tunnel.TunnelBudget;
 
 import org.springframework.util.unit.DataSize;
 
 /**
- * A filter that is a proxy-wasm plugin (ABI 0.2.1), interpreted by Endive: what a user
- * compiles with the proxy-wasm SDKs, as for Envoy, and adds to the released native image.
+ * A filter that is a proxy-wasm plugin (ABI 0.2.1), compiled by wasmtime: what a user
+ * builds with the proxy-wasm SDKs, as for Envoy, and adds to the released native image.
  * What it offers of the ABI, and why not the rest, is in {@code proxy-wasm-plugins.md}.
  * <p>
- * As in a proxy, an instance serves many streams, one call at a time on its own thread: a
+ * As in a proxy, an instance serves many streams, one call at a time on its own thread
+ * (of a stack above what a call may take, or a deep recursion would end the process): a
  * stream costs a context, not an instance, and stays on its VM. A connection's virtual
  * thread waits unmounted meanwhile, so a plugin computing holds no carrier. A VM failing
  * is discarded with its streams, and started anew for the next stream.
  * <p>
- * The plugin is not trusted: it reaches nothing but the imports below, its memory and
- * each call's time are bounded, and what it sends is validated. A body it holds charges
- * the tunnel budget.
+ * The plugin is not trusted: it reaches nothing but the imports below, all it holds (its
+ * memory, GC heap and tables) and each call's time are bounded, and what it sends is
+ * validated. A body it holds charges the tunnel budget.
  */
 final class ProxyWasmFilter implements UpstreamFilter {
 
@@ -85,8 +78,6 @@ final class ProxyWasmFilter implements UpstreamFilter {
 	static final long CONNECTION_BYTES = 256 * 1024;
 
 	private static final Logger log = LoggerFactory.getLogger(ProxyWasmFilter.class);
-
-	static final int PAGE_SIZE = 64 * 1024;
 
 	private static final int ROOT_CONTEXT = 1;
 
@@ -150,15 +141,11 @@ final class ProxyWasmFilter implements UpstreamFilter {
 
 	private final String route;
 
-	private final WasmModule module;
+	private final PluginModule module;
 
 	private final String allocator;
 
-	private final boolean heapCharged;
-
-	private final int initialPages;
-
-	private final int maxPages;
+	private final long maxMemory;
 
 	private final byte[] configuration;
 
@@ -186,7 +173,7 @@ final class ProxyWasmFilter implements UpstreamFilter {
 
 	private final Counter dropped;
 
-	ProxyWasmFilter(String name, WasmModule module, UpstreamFilterFactory.Context context, FilterFailures failures) {
+	ProxyWasmFilter(String name, PluginModule module, UpstreamFilterFactory.Context context, FilterFailures failures) {
 		this.name = name;
 		this.module = module;
 		this.context = context;
@@ -198,7 +185,7 @@ final class ProxyWasmFilter implements UpstreamFilter {
 		}
 		String text = settings.configuration();
 		this.configuration = (text == null ? "" : text).getBytes(StandardCharsets.UTF_8);
-		this.maxPages = maxPages(settings);
+		this.maxMemory = maxMemory(settings);
 		this.callTimeout = callTimeout(settings);
 		DataSize body = settings.maxBody();
 		this.maxBody = (int) Math.min((body == null ? DEFAULT_MAX_BODY : body).toBytes(), Integer.MAX_VALUE - 8);
@@ -210,14 +197,13 @@ final class ProxyWasmFilter implements UpstreamFilter {
 			.tag("route", this.route)
 			.tag("filter", name)
 			.register(context.meters());
-		this.initialPages = module.memorySection()
-			.filter(memories -> memories.memoryCount() == 1)
-			.map(memories -> memories.getMemory(0).limits().initialPages())
-			.orElseThrow(() -> new IllegalArgumentException("plugin " + name + " must define one memory"));
-		long needed = (long) this.initialPages * PAGE_SIZE + PluginHeap.tableBytes(module);
-		if (needed > (long) this.maxPages * PAGE_SIZE) {
+		if (module.memories() != 1) {
+			throw new IllegalArgumentException("plugin " + name + " must define one memory");
+		}
+		long needed = module.initialBytes();
+		if (needed > this.maxMemory) {
 			throw new IllegalArgumentException("plugin " + name + " needs " + needed
-					+ " bytes of memory and tables, past its limit of " + (long) this.maxPages * PAGE_SIZE);
+					+ " bytes of memory and tables, past its limit of " + this.maxMemory);
 		}
 		for (String export : REQUIRED_EXPORTS) {
 			if (!exports(export)) {
@@ -229,13 +215,16 @@ final class ProxyWasmFilter implements UpstreamFilter {
 		if (!exports(this.allocator)) {
 			throw new IllegalArgumentException("plugin " + name + " is no proxy-wasm 0.2.1 plugin: no allocator");
 		}
-		this.heapCharged = PluginHeap.needed(module);
-		module.importSection().stream().forEach(i -> {
+		for (PluginModule.Import i : module.imports()) {
 			boolean known = i.module().equals("env") || i.module().equals("wasi_snapshot_preview1");
-			if (!known || !(i instanceof FunctionImport)) {
+			if (!known || !i.function()) {
 				throw new IllegalArgumentException("plugin " + name + " imports " + i.module() + "." + i.name());
 			}
-		});
+			if (!i.plain()) {
+				throw new IllegalArgumentException("plugin " + name + " imports " + i.module() + "." + i.name()
+						+ " of values no host function of the ABI passes");
+			}
+		}
 		this.vms = new Vm[vms(settings)];
 		for (int i = 0; i < this.vms.length; i++) {
 			this.vms[i] = new Vm(i);
@@ -249,10 +238,11 @@ final class ProxyWasmFilter implements UpstreamFilter {
 		return vms == null ? Math.min(Runtime.getRuntime().availableProcessors(), 4) : vms;
 	}
 
-	private static int maxPages(FilterConfig settings) {
+	/** At least a page, at most what a 32-bit memory addresses. */
+	private static long maxMemory(FilterConfig settings) {
 		DataSize memory = settings.maxMemory();
 		long bytes = (memory == null ? DEFAULT_MAX_MEMORY : memory).toBytes();
-		return (int) Math.clamp(bytes / PAGE_SIZE, 1, 65536);
+		return Math.clamp(bytes, 64 * 1024, 4L * 1024 * 1024 * 1024);
 	}
 
 	private static Duration callTimeout(FilterConfig settings) {
@@ -262,16 +252,17 @@ final class ProxyWasmFilter implements UpstreamFilter {
 
 	/** The most the VMs of a plugin set so hold: counted out of the connection limit. */
 	static long reservedBytes(FilterConfig settings) {
-		return (long) vms(settings) * maxPages(settings) * PAGE_SIZE;
+		return vms(settings) * maxMemory(settings);
 	}
 
 	private boolean exports(String export) {
-		for (int i = 0; i < this.module.exportSection().exportCount(); i++) {
-			if (this.module.exportSection().getExport(i).name().equals(export)) {
-				return true;
-			}
-		}
-		return false;
+		return this.module.exports(export);
+	}
+
+	/** What a call may take: the epoch's ticks of its timeout, a tick at least. */
+	private long ticks() {
+		long millis = this.callTimeout.toMillis();
+		return Math.max(1, (millis + Wasmtime.TICK_MILLIS - 1) / Wasmtime.TICK_MILLIS);
 	}
 
 	@Override
@@ -350,89 +341,14 @@ final class ProxyWasmFilter implements UpstreamFilter {
 
 	}
 
-	/** Interrupts the calls past their time: the interpreter checks at each branch. */
-	static final class Watchdog {
-
-		private static final Set<Call> calls = ConcurrentHashMap.newKeySet();
-
-		static {
-			Thread.ofPlatform().daemon().name("sluice-plugin-watchdog").start(Watchdog::run);
-		}
-
-		private static void run() {
-			while (true) {
-				try {
-					Thread.sleep(20);
-					long now = System.nanoTime();
-					for (Call call : calls) {
-						if (now - call.deadline > 0) {
-							call.interrupt();
-						}
-					}
-				}
-				catch (InterruptedException e) {
-					return;
-				}
-				catch (Throwable e) {
-					// out of memory, say: without this thread nothing would stop a plugin
-					report(e);
-				}
-			}
-		}
-
-		private static void report(Throwable e) {
-			try {
-				log.warn("the plugins' watchdog goes on past: {}", e.toString());
-			}
-			catch (Throwable reporting) {
-				// out of memory again: nothing is left to tell it with
-			}
-		}
-
-		/** One call into a plugin. */
-		static final class Call {
-
-			private final Thread thread = Thread.currentThread();
-
-			private final long deadline;
-
-			private boolean ended;
-
-			private boolean interrupted;
-
-			Call(Duration timeout) {
-				this.deadline = System.nanoTime() + timeout.toNanos();
-				calls.add(this);
-			}
-
-			private synchronized void interrupt() {
-				if (!this.ended && !this.interrupted) {
-					this.interrupted = true;
-					this.thread.interrupt();
-				}
-			}
-
-			/** After it no interrupt comes, for the thread's next task. */
-			synchronized void end() {
-				this.ended = true;
-				calls.remove(this);
-				if (this.interrupted) {
-					Thread.interrupted();
-				}
-			}
-
-		}
-
-	}
-
 	/** A plugin instance and the thread it runs on. */
 	private final class Vm {
 
 		private final ExecutorService thread;
 
-		private @Nullable Instance instance;
+		private final HostFunction[] functions;
 
-		private @Nullable PluginHeap heap;
+		private @Nullable PluginInstance instance;
 
 		private volatile int generation;
 
@@ -445,22 +361,28 @@ final class ProxyWasmFilter implements UpstreamFilter {
 					Thread.ofPlatform()
 						.daemon()
 						.name("sluice-plugin-" + ProxyWasmFilter.this.name + "-" + index)
+						.stackSize(Wasmtime.THREAD_STACK)
 						.factory());
 			pool.allowCoreThreadTimeOut(true);
 			this.thread = pool;
+			List<PluginModule.Import> imports = ProxyWasmFilter.this.module.imports();
+			this.functions = new HostFunction[imports.size()];
+			for (int i = 0; i < imports.size(); i++) {
+				PluginModule.Import function = imports.get(i);
+				this.functions[i] = handle(function.module(), function.name());
+			}
 		}
 
 		/** Runs a task in the VM, started if it is not; a failure discards the VM. */
 		<T> T run(Supplier<T> task) {
 			Future<T> future = this.thread.submit(() -> {
-				PluginHeap counted = this.heap;
-				if (counted != null) {
-					counted.betweenCalls();
-				}
-				Watchdog.Call call = new Watchdog.Call(ProxyWasmFilter.this.callTimeout);
 				try {
-					if (this.instance == null) {
+					PluginInstance started = this.instance;
+					if (started == null) {
 						start();
+					}
+					else {
+						started.deadline(ticks());
 					}
 					return task.get();
 				}
@@ -470,14 +392,16 @@ final class ProxyWasmFilter implements UpstreamFilter {
 				catch (RuntimeException | StackOverflowError | OutOfMemoryError e) {
 					// contexts keep counting: an old one must not be taken for a new
 					// one's
+					PluginInstance failed = this.instance;
+					if (failed != null) {
+						failed.close();
+					}
 					this.instance = null;
-					this.heap = null;
 					this.generation++;
 					throw e instanceof PluginFailure failure ? failure : new PluginFailure(e.toString(), e);
 				}
 				finally {
 					this.current = null;
-					call.end();
 				}
 			});
 			try {
@@ -499,126 +423,107 @@ final class ProxyWasmFilter implements UpstreamFilter {
 
 		private void start() {
 			ProxyWasmFilter filter = ProxyWasmFilter.this;
-			Instance.Builder builder = Instance.builder(filter.module)
-				.withImportValues(imports())
-				.withMemoryLimits(new MemoryLimits(filter.initialPages, filter.maxPages))
-				// it would call _start, on a reactor too: called below instead
-				.withStart(false);
-			PluginHeap charged = filter.heapCharged ? new PluginHeap(filter.module, (long) filter.maxPages * PAGE_SIZE)
-					: null;
-			if (charged != null) {
-				builder.withUnsafeExecutionListener(charged);
+			// a start function of the module runs here; _start, on a reactor too, below
+			PluginInstance started = new PluginInstance(filter.module, this.functions, filter.maxMemory, ticks());
+			try {
+				if (filter.exports("_initialize")) {
+					started.call("_initialize");
+				}
+				else if (filter.exports("_start")) {
+					started.call("_start");
+				}
+				started.call("proxy_on_context_create", ROOT_CONTEXT, 0);
+				if (started.call("proxy_on_vm_start", ROOT_CONTEXT, 0) == 0
+						|| started.call("proxy_on_configure", ROOT_CONTEXT, filter.configuration.length) == 0) {
+					throw new PluginFailure("the plugin refused its start");
+				}
 			}
-			Instance started = builder.build();
-			if (charged != null) {
-				charged.attach(started);
-			}
-			if (filter.exports("_initialize")) {
-				started.export("_initialize").apply();
-			}
-			else if (filter.exports("_start")) {
-				started.export("_start").apply();
-			}
-			started.export("proxy_on_context_create").apply(ROOT_CONTEXT, 0);
-			if (started.export("proxy_on_vm_start").apply(ROOT_CONTEXT, 0)[0] == 0
-					|| started.export("proxy_on_configure").apply(ROOT_CONTEXT, filter.configuration.length)[0] == 0) {
-				throw new PluginFailure("the plugin refused its start");
+			catch (RuntimeException ex) {
+				started.close();
+				throw ex;
 			}
 			this.instance = started;
-			this.heap = charged;
 		}
 
-		long[] call(@Nullable Stream stream, String export, long... args) {
+		long call(@Nullable Stream stream, String export, long... args) {
 			this.current = stream;
-			return Objects.requireNonNull(this.instance, "the VM").export(export).apply(args);
+			return Objects.requireNonNull(this.instance, "the VM").call(export, args);
 		}
 
-		private ImportValues imports() {
-			List<ImportFunction> functions = new ArrayList<>();
-			WasmModule module = ProxyWasmFilter.this.module;
-			module.importSection().stream().forEach(i -> {
-				FunctionImport function = (FunctionImport) i;
-				FunctionType type = module.typeSection().getType(function.typeIndex());
-				functions.add(new HostFunction(i.module(), i.name(), type, handle(i.module(), i.name(), type)));
-			});
-			return ImportValues.builder().withFunctions(functions).build();
+		private HostFunction handle(String importModule, String importName) {
+			return importModule.equals("wasi_snapshot_preview1") ? wasi(importName) : proxy(importName);
 		}
 
-		private WasmFunctionHandle handle(String importModule, String importName, FunctionType type) {
-			return importModule.equals("wasi_snapshot_preview1") ? wasi(importName, type) : proxy(importName, type);
-		}
-
-		private WasmFunctionHandle wasi(String importName, FunctionType type) {
+		private HostFunction wasi(String importName) {
 			return switch (importName) {
 				case "clock_time_get" -> (instance, args) -> {
 					instance.memory().writeLong((int) args[2], System.currentTimeMillis() * 1_000_000L);
-					return status(WASI_SUCCESS);
+					return WASI_SUCCESS;
 				};
 				case "random_get" -> (instance, args) -> {
 					byte[] random = new byte[Math.min((int) args[1], 1024 * 1024)];
 					RANDOM.nextBytes(random);
 					instance.memory().write((int) args[0], random);
-					return status(WASI_SUCCESS);
+					return WASI_SUCCESS;
 				};
 				case "environ_sizes_get", "args_sizes_get" -> (instance, args) -> {
 					instance.memory().writeI32((int) args[0], 0);
 					instance.memory().writeI32((int) args[1], 0);
-					return status(WASI_SUCCESS);
+					return WASI_SUCCESS;
 				};
-				case "environ_get", "args_get" -> (instance, args) -> status(WASI_SUCCESS);
+				case "environ_get", "args_get" -> (instance, args) -> WASI_SUCCESS;
 				case "fd_write" -> this::fdWrite;
 				case "proc_exit" -> (instance, args) -> {
 					throw new PluginFailure("the plugin exited with " + args[0]);
 				};
-				default -> (instance, args) -> stub(type, WASI_ENOSYS);
+				default -> (instance, args) -> WASI_ENOSYS;
 			};
 		}
 
-		private WasmFunctionHandle proxy(String importName, FunctionType type) {
+		private HostFunction proxy(String importName) {
 			return switch (importName) {
 				case "proxy_log" -> (instance, args) -> {
 					pluginLog((int) args[0], text(instance, args[1], Math.min(args[2] & 0xffffffffL, MAX_LOG)));
-					return status(OK);
+					return OK;
 				};
 				case "proxy_get_log_level" -> (instance, args) -> {
 					instance.memory().writeI32((int) args[0], 2);
-					return status(OK);
+					return OK;
 				};
 				case "proxy_get_current_time_nanoseconds" -> (instance, args) -> {
 					instance.memory().writeLong((int) args[0], System.currentTimeMillis() * 1_000_000L);
-					return status(OK);
+					return OK;
 				};
-				case "proxy_set_effective_context", "proxy_done", "proxy_continue_stream" ->
-					(instance, args) -> status(OK);
+				case "proxy_set_effective_context", "proxy_done", "proxy_continue_stream" -> (instance, args) -> OK;
 				case "proxy_get_buffer_bytes" -> this::getBuffer;
 				case "proxy_set_buffer_bytes" -> this::setBuffer;
 				case "proxy_get_buffer_status" -> (instance, args) -> {
 					Buffer buffer = buffer((int) args[0]);
 					if (buffer == null) {
-						return status(NOT_FOUND);
+						return NOT_FOUND;
 					}
 					instance.memory().writeI32((int) args[1], buffer.size());
 					instance.memory().writeI32((int) args[2], 0);
-					return status(OK);
+					return OK;
 				};
 				case "proxy_get_header_map_size" -> (instance, args) -> {
 					List<Field> map = map((int) args[0]);
 					if (map == null) {
-						return status(NOT_FOUND);
+						return NOT_FOUND;
 					}
 					instance.memory().writeI32((int) args[1], serialized(map).length);
-					return status(OK);
+					return OK;
 				};
 				case "proxy_get_header_map_pairs" -> (instance, args) -> {
 					List<Field> map = map((int) args[0]);
 					if (map == null) {
-						return status(NOT_FOUND);
+						return NOT_FOUND;
 					}
 					giveBack(instance, serialized(map), args[1], args[2]);
-					return status(OK);
+					return OK;
 				};
-				case "proxy_set_header_map_pairs" -> (instance, args) -> status(
-						setPairs((int) args[0], deserialized(bytes(instance, args[1], args[2], MAX_NAME))));
+				case "proxy_set_header_map_pairs" -> (instance,
+						args) -> (setPairs((int) args[0], deserialized(bytes(instance, args[1], args[2], MAX_NAME))));
 				case "proxy_get_header_map_value" -> (instance, args) -> {
 					List<Field> map = map((int) args[0]);
 					String key = text(instance, args[1], args[2]).toLowerCase(Locale.ROOT);
@@ -626,71 +531,66 @@ final class ProxyWasmFilter implements UpstreamFilter {
 						for (Field field : map) {
 							if (field.name().equals(key)) {
 								giveBack(instance, field.value().getBytes(StandardCharsets.UTF_8), args[3], args[4]);
-								return status(OK);
+								return OK;
 							}
 						}
 					}
-					return status(NOT_FOUND);
+					return NOT_FOUND;
 				};
 				case "proxy_replace_header_map_value", "proxy_add_header_map_value" -> (instance, args) -> {
 					boolean add = importName.equals("proxy_add_header_map_value");
-					return status(edit((int) args[0], text(instance, args[1], args[2]),
-							text(instance, args[3], args[4]), add));
+					return (edit((int) args[0], text(instance, args[1], args[2]), text(instance, args[3], args[4]),
+							add));
 				};
 				case "proxy_remove_header_map_value" ->
-					(instance, args) -> status(edit((int) args[0], text(instance, args[1], args[2]), null, false));
+					(instance, args) -> edit((int) args[0], text(instance, args[1], args[2]), null, false);
 				case "proxy_define_metric" -> (instance, args) -> {
 					if (args[0] != METRIC_COUNTER) {
-						return status(BAD_ARGUMENT);
+						return BAD_ARGUMENT;
 					}
 					int id = defineMetric(text(instance, args[1], args[2]));
 					if (id == -2) {
-						return status(BAD_ARGUMENT);
+						return BAD_ARGUMENT;
 					}
 					instance.memory().writeI32((int) args[3], id);
-					return status(OK);
+					return OK;
 				};
 				case "proxy_increment_metric" -> (instance, args) -> {
 					int id = (int) args[0];
 					if (id == -1) {
 						ProxyWasmFilter.this.dropped.increment();
-						return status(OK);
+						return OK;
 					}
 					if (id < 0 || id >= ProxyWasmFilter.this.metrics.size()) {
-						return status(NOT_FOUND);
+						return NOT_FOUND;
 					}
 					if (args[1] < 0) {
-						return status(BAD_ARGUMENT);
+						return BAD_ARGUMENT;
 					}
 					ProxyWasmFilter.this.metrics.get(id).increment(args[1]);
-					return status(OK);
+					return OK;
 				};
 				case "proxy_get_property" -> this::getProperty;
 				case "proxy_send_local_response" -> this::sendLocalResponse;
 				// what the SDKs let a plugin handle: reaching nothing outside is an
 				// answer
-				case "proxy_http_call", "proxy_grpc_call", "proxy_grpc_stream" ->
-					(instance, args) -> stub(type, INTERNAL_FAILURE);
+				case "proxy_http_call", "proxy_grpc_call", "proxy_grpc_stream" -> (instance, args) -> INTERNAL_FAILURE;
 				default -> (instance, args) -> {
 					if (ProxyWasmFilter.this.refusedCalls.add(importName)) {
 						log.warn("filter {}: the plugin called {}, which this host does not offer",
 								ProxyWasmFilter.this.name, importName);
 					}
-					return stub(type, UNIMPLEMENTED);
+					return UNIMPLEMENTED;
 				};
 			};
 		}
 
-		private long @Nullable [] stub(FunctionType type, int status) {
-			return type.returns().isEmpty() ? null : status(status);
-		}
-
 		/** {@code fd, iovs, iovs length, written}; of what is written, a line of log. */
-		private long[] fdWrite(Instance instance, long... args) {
+		private long fdWrite(PluginInstance instance, long... args) {
 			Memory memory = instance.memory();
 			int vectors = (int) args[2];
 			if (vectors < 0 || vectors > MAX_IOVS) {
-				return status(WASI_EINVAL);
+				return WASI_EINVAL;
 			}
 			long written = 0;
 			ByteArrayOutputStream text = new ByteArrayOutputStream();
@@ -706,7 +606,7 @@ final class ProxyWasmFilter implements UpstreamFilter {
 			}
 			memory.writeI32((int) args[3], (int) written);
 			pluginLog(2, text.toString(StandardCharsets.UTF_8));
-			return status(WASI_SUCCESS);
+			return WASI_SUCCESS;
 		}
 
 		private void pluginLog(int level, String message) {
@@ -731,33 +631,33 @@ final class ProxyWasmFilter implements UpstreamFilter {
 			return stream != null && type == stream.bodyType ? stream.body : null;
 		}
 
-		private long[] getBuffer(Instance instance, long... args) {
+		private long getBuffer(PluginInstance instance, long... args) {
 			Buffer buffer = buffer((int) args[0]);
 			if (buffer == null) {
-				return status(NOT_FOUND);
+				return NOT_FOUND;
 			}
 			long start = args[1] & 0xffffffffL;
 			long max = args[2] & 0xffffffffL;
 			if (start > buffer.size()) {
-				return status(BAD_ARGUMENT);
+				return BAD_ARGUMENT;
 			}
 			int length = (int) Math.min(max, buffer.size() - start);
 			giveBack(instance, buffer.copy((int) start, length), args[3], args[4]);
-			return status(OK);
+			return OK;
 		}
 
-		private long[] setBuffer(Instance instance, long... args) {
+		private long setBuffer(PluginInstance instance, long... args) {
 			Stream stream = this.current;
 			Buffer body = stream == null ? null : stream.body;
 			if (stream == null || body == null || args[0] != stream.bodyType || !stream.replaceable) {
-				return status(NOT_FOUND);
+				return NOT_FOUND;
 			}
 			int limit = ProxyWasmFilter.this.maxBody;
 			byte[] value = bytes(instance, args[3], args[4], limit);
 			long start = Math.min(args[1] & 0xffffffffL, body.size());
 			long size = Math.min(args[2] & 0xffffffffL, body.size() - start);
 			if (body.size() - size + value.length > limit) {
-				return status(BAD_ARGUMENT);
+				return BAD_ARGUMENT;
 			}
 			body.replace((int) start, (int) size, value);
 			if (stream.bodyType == BUFFER_REQUEST_BODY) {
@@ -766,18 +666,18 @@ final class ProxyWasmFilter implements UpstreamFilter {
 			else {
 				stream.responseModified = true;
 			}
-			return status(OK);
+			return OK;
 		}
 
-		private long[] getProperty(Instance instance, long... args) {
+		private long getProperty(PluginInstance instance, long... args) {
 			Stream stream = this.current;
 			String path = text(instance, args[0], args[1]).replace('\0', '.');
 			byte[] value = property(stream, path);
 			if (value == null) {
-				return status(NOT_FOUND);
+				return NOT_FOUND;
 			}
 			giveBack(instance, value, args[2], args[3]);
-			return status(OK);
+			return OK;
 		}
 
 		/** As Envoy serves them: a string as it is, a number as 8 little endian bytes. */
@@ -814,11 +714,11 @@ final class ProxyWasmFilter implements UpstreamFilter {
 		 * length, grpc status}: while the request is offered only, an upstream's answer
 		 * having begun to come otherwise.
 		 */
-		private long[] sendLocalResponse(Instance instance, long... args) {
+		private long sendLocalResponse(PluginInstance instance, long... args) {
 			Stream stream = this.current;
 			int code = (int) args[0];
 			if (stream == null || !stream.answerable || code < 200 || code > 599) {
-				return status(BAD_ARGUMENT);
+				return BAD_ARGUMENT;
 			}
 			byte[] body = bytes(instance, args[3], args[4], ProxyWasmFilter.this.maxBody);
 			List<String> lines = new ArrayList<>();
@@ -831,12 +731,12 @@ final class ProxyWasmFilter implements UpstreamFilter {
 					UpstreamFilterPipe.checkEdit(pair[0], wire);
 				}
 				catch (IllegalArgumentException e) {
-					return status(BAD_ARGUMENT);
+					return BAD_ARGUMENT;
 				}
 				lines.add(pair[0] + ": " + wire);
 			}
 			stream.localResponse = new LocalResponse(code, lines, body);
-			return status(OK);
+			return OK;
 		}
 
 		private @Nullable List<Field> map(int type) {
@@ -933,28 +833,26 @@ final class ProxyWasmFilter implements UpstreamFilter {
 		}
 
 		/** Into memory the plugin allocated, as the ABI has it. */
-		private void giveBack(Instance instance, byte[] bytes, long pointerAt, long sizeAt) {
-			long pointer = instance.export(ProxyWasmFilter.this.allocator).apply(bytes.length)[0];
+		private void giveBack(PluginInstance instance, byte[] bytes, long pointerAt, long sizeAt) {
+			long pointer = instance.call(ProxyWasmFilter.this.allocator, bytes.length);
 			if (pointer == 0 && bytes.length > 0) {
 				throw new PluginFailure("the plugin allocated nothing");
 			}
-			instance.memory().write((int) pointer, bytes);
-			instance.memory().writeI32((int) pointerAt, (int) pointer);
-			instance.memory().writeI32((int) sizeAt, bytes.length);
+			// after the allocation, which may have grown it
+			Memory memory = instance.memory();
+			memory.write((int) pointer, bytes);
+			memory.writeI32((int) pointerAt, (int) pointer);
+			memory.writeI32((int) sizeAt, bytes.length);
 		}
 
 	}
 
-	private static long[] status(int status) {
-		return new long[] { status };
-	}
-
-	private static String text(Instance instance, long pointer, long length) {
+	private static String text(PluginInstance instance, long pointer, long length) {
 		return new String(bytes(instance, pointer, length, MAX_NAME), StandardCharsets.UTF_8);
 	}
 
 	/** The plugin's pointers are not trusted; the memory checks the range. */
-	private static byte[] bytes(Instance instance, long pointer, long length, int limit) {
+	private static byte[] bytes(PluginInstance instance, long pointer, long length, int limit) {
 		int len = (int) length;
 		if (len < 0 || len > limit) {
 			throw new PluginFailure("a length of " + (length & 0xffffffffL) + " past " + limit);
@@ -1301,7 +1199,7 @@ final class ProxyWasmFilter implements UpstreamFilter {
 				call(() -> {
 					if (!this.closed) {
 						this.closed = true;
-						if (this.vm.call(this, "proxy_on_done", this.context)[0] != 0) {
+						if (this.vm.call(this, "proxy_on_done", this.context) != 0) {
 							this.vm.call(this, "proxy_on_log", this.context);
 							this.vm.call(this, "proxy_on_delete", this.context);
 						}
@@ -1327,7 +1225,7 @@ final class ProxyWasmFilter implements UpstreamFilter {
 				this.body = buffer;
 				this.replaceable = replaces;
 				this.answerable = type == BUFFER_REQUEST_BODY;
-				long action = this.vm.call(this, callback, this.context, buffer.size(), end ? 1 : 0)[0];
+				long action = this.vm.call(this, callback, this.context, buffer.size(), end ? 1 : 0);
 				this.bodyType = -1;
 				this.body = null;
 				this.answerable = false;

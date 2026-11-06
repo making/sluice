@@ -47,11 +47,6 @@
 				<version>${project.version}</version>
 			</dependency>
 			<dependency>
-				<groupId>run.endive</groupId>
-				<artifactId>runtime</artifactId>
-				<version>1.2.0</version>
-			</dependency>
-			<dependency>
 				<groupId>com.tngtech.archunit</groupId>
 				<artifactId>archunit-junit5</artifactId>
 				<version>1.5.1</version>

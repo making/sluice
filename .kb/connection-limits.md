@@ -346,8 +346,8 @@ it admitted 46 h2 connections; before a writer queue's DATA and header blocks we
 from its control frames, an h2 connection reserved 1127KiB (a writer queue's 320KiB per
 hop) and it admitted 109. The client derives its limit the same way:
 `max(1, (max heap / 2 - tunnel budget) / 293KiB)`. With a filter on any route, every connection
-counts what a filtered one adds and the plugins' instances come out first:
-`max(1, (max heap / 2 - tunnel budget - plugins' vms x max-memory) / (293KiB + 256KiB))`; see
+counts what a filtered one adds: `max(1, (max heap / 2 - tunnel budget) / (293KiB + 256KiB))`.
+The plugins' instances (`vms x max-memory`) are native memory, outside the heap; see
 [client-filters.md](client-filters.md).
 The effective values are logged at startup (`data plane connection limit` / `upstream
 connection limit`) and exported as gauges; with the 512Mi container of `k8s.md` they

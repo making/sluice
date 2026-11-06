@@ -66,6 +66,7 @@
     (if (i32.eq (local.get $action) (i32.const 0x74 (; t ;))) (then (call $grow_table)))
     (if (i32.eq (local.get $action) (i32.const 0x6d (; m ;))) (then (call $grow_memory)))
     (if (i32.eq (local.get $action) (i32.const 0x68 (; h ;))) (then (call $huge)))
+    (if (i32.eq (local.get $action) (i32.const 0x64 (; d ;))) (then (drop (call $deep (i32.const 0)))))
     (i32.const 0))
 
   (func (export "proxy_on_response_body") (param i32 i32 i32) (result i32) (i32.const 0))
@@ -123,11 +124,18 @@
         (throw $error))
       (ref.null exn)))
 
+  ;; A growth refused is -1, which an allocator takes for out of memory: it traps.
   (func $grow_table
-    (drop (table.grow $table (ref.null func) (i32.const 0x100000))))
+    (if (i32.eq (table.grow $table (ref.null func) (i32.const 0x100000)) (i32.const -1))
+      (then unreachable)))
 
   (func $grow_memory
-    (drop (memory.grow (i32.const 64))))
+    (if (i32.eq (memory.grow (i32.const 64)) (i32.const -1))
+      (then unreachable)))
+
+  ;; A recursion with no end: past the stack a call may take.
+  (func $deep (param $n i32) (result i32)
+    (i32.add (call $deep (i32.add (local.get $n) (i32.const 1))) (i32.const 1)))
 
   (func $huge
     (drop (array.new_default $bytes (i32.const 0x1000000))))

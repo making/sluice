@@ -61,7 +61,7 @@ jobs:
           ahead)
             # the compare lists at most 300 files: a longer list counts as an image change
             FILES=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${DEPLOYED}...${TARGET}" --jq 'if (.files | length) >= 300 then "TRUNCATED" else .files[].filename end')
-            if echo "${FILES}" | grep -qE '^(TRUNCATED$|pom\.xml$|mvnw|\.mvn/|sluice-proto/|sluice-server/|sluice-client/|\.github/workflows/deploy\.yaml$)'; then
+            if echo "${FILES}" | grep -qE '^(TRUNCATED$|pom\.xml$|mvnw|\.mvn/|sluice-proto/|sluice-server/|sluice-client/|sluice-client-wasm/|\.github/workflows/deploy\.yaml$)'; then
               echo "revision=${TARGET}" >> "${GITHUB_OUTPUT}"
             else
               echo "Skipped: nothing the images are built from changed since ${DEPLOYED}" | tee -a "${GITHUB_STEP_SUMMARY}"

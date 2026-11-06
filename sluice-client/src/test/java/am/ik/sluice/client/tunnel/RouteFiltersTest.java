@@ -111,7 +111,10 @@ class RouteFiltersTest {
 		return registry.get("sluice.connections.limit").gauge().value();
 	}
 
-	/** What a filtered connection and a plugin's VMs hold counts in the derived limit. */
+	/**
+	 * What a filtered connection holds counts in the derived limit; a plugin's VMs,
+	 * native memory, do not, but for what the host keeps of a connection's heads.
+	 */
 	@Test
 	void theDerivedConnectionLimitCountsWhatFiltersHold() {
 		long maxHeap = Runtime.getRuntime().maxMemory();
@@ -140,8 +143,8 @@ class RouteFiltersTest {
 						.build())
 			.upstream(route("a.test").filters(List.of(FilterConfig.builder().name("custom").build())).build())
 			.build();
-		assertThat(limitOf(plugin, List.of())).isEqualTo(
-				ConnectionLimit.derive(maxHeap / 2 - budget - 2 * 8 * 1024 * 1024, connectionBytes + 256 * 1024));
+		assertThat(limitOf(plugin, List.of()))
+			.isEqualTo(ConnectionLimit.derive(maxHeap / 2 - budget, connectionBytes + 256 * 1024));
 
 		SluiceClientProperties configured = SluiceClientProperties.builder()
 			.serverUrl("grpc://127.0.0.1:1")

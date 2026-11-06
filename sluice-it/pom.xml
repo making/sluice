@@ -120,7 +120,8 @@
 				<configuration>
 					<forkCount>${sluice.it.forks}</forkCount>
 					<reuseForks>true</reuseForks>
-					<argLine>-XX:TieredStopAtLevel=1</argLine>
+					<!-- the client's plugins run through FFM, a restricted API -->
+					<argLine>-XX:TieredStopAtLevel=1 --enable-native-access=ALL-UNNAMED</argLine>
 					<systemPropertyVariables>
 						<sluice.flume.binary>${sluice.flume.dir}/target/debug/sluice-flume</sluice.flume.binary>
 					</systemPropertyVariables>

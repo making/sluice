@@ -1,0 +1,25 @@
+[package]
+name = "sluice-client-wasm"
+version = "0.0.1-SNAPSHOT"
+edition = "2024"
+publish = false
+
+# sluice-client's proxy-wasm plugins on wasmtime, loaded by the JVM through FFM; built by
+# sluice-client's Maven build, its own workspace like the other Rust components.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# the copying collector only: the reference counting one leaks cycles until its store goes;
+# no async, components, cache or parallel compilation (no thread pool in the client)
+wasmtime = { version = "=50.0.0", default-features = false, features = ["cranelift", "runtime", "std", "gc", "gc-copying", "reexport-wasmparser"] }
+
+[dev-dependencies]
+wat = "1"
+
+[profile.release]
+# a panic unwinds to the boundary, which turns it into an error
+panic = "unwind"
+strip = true

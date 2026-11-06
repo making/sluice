@@ -9,6 +9,7 @@ on:
     branches:
     - main
     paths: &rust-paths
+    - 'sluice-client-wasm/**'
     - 'sluice-flume/**'
     - 'sluice-wicket-runtime-wasi/**'
     - 'sluice-wicket-cf-api/**'
@@ -42,6 +43,7 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
+      client-wasm: ${{ steps.filter.outputs.client-wasm }}
       build-info: ${{ steps.filter.outputs.build-info }}
       oidc: ${{ steps.filter.outputs.oidc }}
       server: ${{ steps.filter.outputs.server }}
@@ -59,6 +61,9 @@ jobs:
       id: filter
       with:
         filters: |
+          client-wasm:
+          - 'sluice-client-wasm/**'
+          - '.github/workflows/rust.yaml'
           build-info:
           - 'sluice-build-info/**'
           - '.github/workflows/rust.yaml'
@@ -282,6 +287,43 @@ jobs:
       run: cargo clippy --all-targets --all-features --locked -- -D warnings
     - name: Test
       run: cargo test --all-features --locked
+  # sluice-client's plugins run on it, a library the JVM loads: its gates on each platform
+  # the client may carry it for (CI's Java build tests it with the JVM on x86_64 and aarch64).
+  sluice-client-wasm:
+    needs: changes
+    if: needs.changes.outputs.client-wasm == 'true'
+    name: sluice-client-wasm (${{ matrix.runs_on }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runs_on:
+        - ubuntu-latest
+        - ubuntu-24.04-arm
+        - macos-latest
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: sluice-client-wasm
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    # the toolchain rust-toolchain.toml pins
+    - name: Toolchain
+      run: rustup toolchain install
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          sluice-client-wasm/target
+        key: cargo-client-wasm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('sluice-client-wasm/Cargo.lock', 'sluice-client-wasm/rust-toolchain.toml') }}
+    - name: Format
+      run: cargo fmt --check
+    - name: Clippy
+      run: cargo clippy --all-targets --locked -- -D warnings
+    - name: Test
+      run: cargo test --locked
   sluice-flume:
     needs: changes
     if: needs.changes.outputs.flume == 'true'
