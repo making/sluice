@@ -735,7 +735,8 @@ cf restart blog
 | `--tls-cert <path>` / `--tls-key <path>` | serve TLS: the certificate chain and its private key, PEM. Without them, behind a TLS proxy, `X-Forwarded-Proto: https` makes the links `https` |
 | `--exit-on-stdin-close` | exit when stdin reaches its end (a parent's child process) |
 
-Each option also reads `SLUICE_WICKET_CF_API_<NAME>` from the environment. The image
+Each option also reads `SLUICE_WICKET_CF_API_<NAME>` from the environment; another variable of that
+prefix, a misspelled one, is refused at the start. The image
 `ghcr.io/making/sluice/sluice-wicket-cf-api` (`latest` / `<sha>`, built from
 `Dockerfile` at the repository root) keeps `/data` as the working directory; with
 `--any-credentials` it listens on the loopback, so it is reached from the wicket's network

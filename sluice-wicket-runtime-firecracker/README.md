@@ -231,7 +231,8 @@ command line every user of the host sees it), `--client-id`, `--ca-cert`,
 `--insecure` (`grpcs://`), `--max-connections` (256), `--tunnel-stall-timeout` (60s) and
 `--drain-grace` (20s: SIGTERM / SIGINT withdraw the routes and end the streams once their
 connections ended; a second signal ends at once). Each also reads
-`SLUICE_WICKET_RUNTIME_FIRECRACKER_<NAME>` from the environment, e.g. `SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN`.
+`SLUICE_WICKET_RUNTIME_FIRECRACKER_<NAME>` from the environment, e.g. `SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN`;
+another variable of that prefix but the two below, a misspelled one, is refused at the start.
 `--workers` (4, at most the CPUs) sets the threads relaying the connections (see
 [findings](../.kb/wicket-firecracker-findings.md#relay-workers)).
 

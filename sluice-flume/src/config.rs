@@ -19,7 +19,8 @@ usage: sluice-flume --token <token> [options]
   --exit-on-stdin-close   exit when stdin reaches its end (a parent's child process)
   --version               print the build (version, commit, build time) and exit
 
-Each option also reads SLUICE_FLUME_<NAME> from the environment, e.g. SLUICE_FLUME_TOKEN.";
+Each option also reads SLUICE_FLUME_<NAME> from the environment, e.g. SLUICE_FLUME_TOKEN;
+another variable of that prefix is refused.";
 
 /// What to run: print something and exit, or serve.
 #[derive(Debug)]
@@ -47,6 +48,35 @@ const VALUED: &[&str] = &[
     "ring-size",
     "backfill",
 ];
+
+/// The switches read from the environment too.
+const SWITCHES: &[&str] = &["exit-on-stdin-close"];
+
+/// Refuses the variables named as an option's (`SLUICE_FLUME_<NAME>`) that name
+/// none, a misspelled one among them: it would go unread.
+pub fn check_env(names: impl IntoIterator<Item = String>) -> Result<(), String> {
+    let option = |suffix: &str| {
+        VALUED
+            .iter()
+            .chain(SWITCHES)
+            .any(|known| known.to_uppercase().replace('-', "_") == suffix)
+    };
+    let mut unknown: Vec<String> = names
+        .into_iter()
+        .filter(|name| {
+            name.strip_prefix("SLUICE_FLUME_")
+                .is_some_and(|suffix| !option(suffix))
+        })
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort();
+    Err(format!(
+        "unknown environment variable: {} (no option reads it)",
+        unknown.join(", ")
+    ))
+}
 
 /// Parses the arguments (without the program name) over the environment.
 pub fn parse(
@@ -165,6 +195,22 @@ mod tests {
         assert!(!config.exit_on_stdin_close);
         assert!(
             serve(parse(args("--token t --exit-on-stdin-close"), |_| None)).exit_on_stdin_close
+        );
+        // a variable of the options' prefix naming none is refused, not left unread
+        assert_eq!(
+            check_env(
+                [
+                    "PATH",
+                    "SLUICE_FLUME_TOKEN",
+                    "SLUICE_FLUME_EXIT_ON_STDIN_CLOSE"
+                ]
+                .map(String::from)
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_env(["SLUICE_FLUME_TOKNE", "SLUICE_FLUME_PORT"].map(String::from)),
+            Err("unknown environment variable: SLUICE_FLUME_TOKNE (no option reads it)".into())
         );
     }
 

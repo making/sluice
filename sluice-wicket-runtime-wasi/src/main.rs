@@ -3,7 +3,11 @@ use std::process::ExitCode;
 use sluice_wicket_runtime_wasi::config::{self, Command};
 
 fn main() -> ExitCode {
-    let settings = match config::parse(std::env::args().skip(1), |name| std::env::var(name).ok()) {
+    let settings = match config::parse(std::env::args().skip(1), |name| std::env::var(name).ok())
+        .and_then(|command| match command {
+            Command::Run(_) => config::check_env(env_names()).map(|()| command),
+            command => Ok(command),
+        }) {
         Ok(Command::Help) => {
             println!("{}", config::USAGE);
             return ExitCode::SUCCESS;
@@ -36,4 +40,9 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The names of the process's environment variables.
+fn env_names() -> impl Iterator<Item = String> {
+    std::env::vars_os().map(|(name, _)| name.to_string_lossy().into_owned())
 }

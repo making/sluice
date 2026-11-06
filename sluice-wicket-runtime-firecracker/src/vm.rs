@@ -80,6 +80,9 @@ pub const RESTORE_ADVANCES_CLOCK: bool = cfg!(target_arch = "x86_64");
 /// The first argument of the wicket's launcher mode, see [`launch`].
 pub const LAUNCH: &str = "--launch-vm";
 
+/// Set, the VMs have a serial console (`boot_args`).
+pub const SERIAL_CONSOLE: &str = "SLUICE_WICKET_RUNTIME_FIRECRACKER_SERIAL_CONSOLE";
+
 /// The launcher's disk argument for a VM without one.
 const NO_DISK: &str = "-";
 
@@ -1030,7 +1033,7 @@ pub fn log_tail(path: &Path) -> String {
 /// stdout / stderr regardless): printing to it is the slowest part of a boot. The route's
 /// `egress`, if any, for `/init`, that its env is coming (`env`), and where its disk goes.
 fn boot_args(egress: &[Rule], env: bool, disk: Option<&str>) -> String {
-    let console = match std::env::var_os("SLUICE_WICKET_RUNTIME_FIRECRACKER_SERIAL_CONSOLE") {
+    let console = match std::env::var_os(SERIAL_CONSOLE) {
         Some(_) => "console=ttyS0",
         None => "console=none 8250.nr_uarts=0",
     };

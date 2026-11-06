@@ -3404,6 +3404,13 @@ struct Wicket {
     jailed: bool,
 }
 
+/// The variables this test reads that no option of the wicket does.
+const TEST_ONLY: [&str; 3] = [
+    "SLUICE_WICKET_RUNTIME_FIRECRACKER_IMAGE",
+    "SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL",
+    "SLUICE_WICKET_RUNTIME_FIRECRACKER_VMS",
+];
+
 impl Wicket {
     fn start(server: &str, firecracker: &Path, kernel: &Path, args: &[String]) -> Wicket {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-runtime-firecracker"));
@@ -3513,6 +3520,10 @@ impl Wicket {
         let log = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("wicket-{}.log", std::process::id()));
         let file = std::fs::File::create(&log).unwrap();
+        // the test's own switches, of the options' prefix: the wicket refuses them
+        for name in TEST_ONLY {
+            command.env_remove(name);
+        }
         let child = command
             // the drain is the tunnel's, tested there: Ctrl-C ends the wicket at once
             .args(["--server", server, "--drain-grace", "0"])

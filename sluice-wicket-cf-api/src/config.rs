@@ -64,7 +64,7 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
   --version                   print the build (version, commit, build time) and exit
 
 Each option also reads SLUICE_WICKET_CF_API_<NAME> from the environment, e.g.
-SLUICE_WICKET_CF_API_WICKET_TOKEN.";
+SLUICE_WICKET_CF_API_WICKET_TOKEN; another variable of that prefix is refused.";
 
 /// What to run: print something and exit, or serve.
 #[derive(Debug)]
@@ -108,6 +108,35 @@ const VALUED: &[&str] = &[
     "tls-cert",
     "tls-key",
 ];
+
+/// The switches read from the environment too.
+const SWITCHES: &[&str] = &["any-credentials", "exit-on-stdin-close", "flume-insecure"];
+
+/// Refuses the variables named as an option's (`SLUICE_WICKET_CF_API_<NAME>`) that name
+/// none, a misspelled one among them: it would go unread.
+pub fn check_env(names: impl IntoIterator<Item = String>) -> Result<(), String> {
+    let option = |suffix: &str| {
+        VALUED
+            .iter()
+            .chain(SWITCHES)
+            .any(|known| known.to_uppercase().replace('-', "_") == suffix)
+    };
+    let mut unknown: Vec<String> = names
+        .into_iter()
+        .filter(|name| {
+            name.strip_prefix("SLUICE_WICKET_CF_API_")
+                .is_some_and(|suffix| !option(suffix))
+        })
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort();
+    Err(format!(
+        "unknown environment variable: {} (no option reads it)",
+        unknown.join(", ")
+    ))
+}
 
 /// Parses the arguments (without the program name) over the environment.
 pub fn parse(
@@ -454,6 +483,28 @@ mod tests {
         assert!(config.settings.oidc.is_none());
         assert!(config.settings.clients.is_empty());
         assert_eq!(config.settings.security_group_editors, Editors::default());
+        // a variable of the options' prefix naming none is refused, not left unread
+        assert_eq!(
+            check_env(
+                [
+                    "PATH",
+                    "SLUICE_WICKET_CF_API_FLUME",
+                    "SLUICE_WICKET_CF_API_FLUME_TOKEN_FILE",
+                    "SLUICE_WICKET_CF_API_ANY_CREDENTIALS"
+                ]
+                .map(String::from)
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_env(
+                ["SLUICE_WICKET_CF_API_FLUNE", "SLUICE_WICKET_CF_API_FLUME"].map(String::from)
+            ),
+            Err(
+                "unknown environment variable: SLUICE_WICKET_CF_API_FLUNE (no option reads it)"
+                    .into()
+            )
+        );
     }
 
     #[test]

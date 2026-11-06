@@ -77,7 +77,7 @@ usage: sluice-wicket-runtime-wasi --server <url> --wasm <host>=<locator>[?<optio
   --version                       print the build (version, commit, build time) and exit
 
 Each option but --wasm also reads SLUICE_WICKET_RUNTIME_WASI_<NAME> from the environment, e.g.
-SLUICE_WICKET_RUNTIME_WASI_TOKEN.";
+SLUICE_WICKET_RUNTIME_WASI_TOKEN; another variable of that prefix is refused.";
 
 /// Default of `--max-instances`: 64 guest instances alive at once, i.e. at
 /// most 64 x the largest `memory-mib` of guest linear memory (16GiB at the
@@ -187,6 +187,36 @@ const VALUED: &[&str] = &[
     "flume-ca-cert",
     "wasm",
 ];
+
+/// The switches read from the environment too.
+const SWITCHES: &[&str] = &["insecure", "flume-insecure"];
+
+/// Refuses the variables named as an option's (`SLUICE_WICKET_RUNTIME_WASI_<NAME>`) that name
+/// none (`--wasm` is not read from it), a misspelled one among them: it would go unread.
+pub fn check_env(names: impl IntoIterator<Item = String>) -> Result<(), String> {
+    let option = |suffix: &str| {
+        VALUED
+            .iter()
+            .filter(|known| **known != "wasm")
+            .chain(SWITCHES)
+            .any(|known| known.to_uppercase().replace('-', "_") == suffix)
+    };
+    let mut unknown: Vec<String> = names
+        .into_iter()
+        .filter(|name| {
+            name.strip_prefix("SLUICE_WICKET_RUNTIME_WASI_")
+                .is_some_and(|suffix| !option(suffix))
+        })
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort();
+    Err(format!(
+        "unknown environment variable: {} (no option reads it)",
+        unknown.join(", ")
+    ))
+}
 
 /// Parses the arguments (without the program name) over the environment, and
 /// the `--config` file they name.
@@ -1551,6 +1581,23 @@ routes:
             sqlite(local),
             PathBuf::from("keyvalue.db"),
             "the working directory's"
+        );
+        // a variable of the options' prefix naming none is refused, not left unread
+        assert_eq!(
+            check_env(
+                [
+                    "PATH",
+                    "SLUICE_WICKET_RUNTIME_WASI_FLUME",
+                    "SLUICE_WICKET_RUNTIME_WASI_CONFIG",
+                    "SLUICE_WICKET_RUNTIME_WASI_FLUME_INSECURE"
+                ]
+                .map(String::from)
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_env(["SLUICE_WICKET_RUNTIME_WASI_FLUNE", "SLUICE_WICKET_RUNTIME_WASI_WASM", "SLUICE_WICKET_RUNTIME_WASI_FLUME"].map(String::from)),
+            Err("unknown environment variable: SLUICE_WICKET_RUNTIME_WASI_FLUNE, SLUICE_WICKET_RUNTIME_WASI_WASM (no option reads it)".into())
         );
     }
 

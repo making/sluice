@@ -23,7 +23,11 @@ fn main() -> ExitCode {
     // the keeper's end, when it started this wicket (jail mode): taken from the
     // environment before anything else, single-threaded
     let keeper = Client::fd_from_env();
-    let settings = match config::parse(std::env::args().skip(1), |name| std::env::var(name).ok()) {
+    let settings = match config::parse(std::env::args().skip(1), |name| std::env::var(name).ok())
+        .and_then(|command| match command {
+            Command::Run(_) => config::check_env(env_names()).map(|()| command),
+            command => Ok(command),
+        }) {
         Ok(Command::Help) => {
             println!("{}", config::USAGE);
             return ExitCode::SUCCESS;
@@ -121,4 +125,9 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The names of the process's environment variables.
+fn env_names() -> impl Iterator<Item = String> {
+    std::env::vars_os().map(|(name, _)| name.to_string_lossy().into_owned())
 }

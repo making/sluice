@@ -116,7 +116,8 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
   --version                      print the build (version, commit, build time) and exit
 
 Each option but --vm also reads SLUICE_WICKET_RUNTIME_FIRECRACKER_<NAME> from the environment, e.g.
-SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN.";
+SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN; another variable of that prefix (but those of the
+serial console and the trace) is refused.";
 
 /// Default of `--max-vms`.
 pub const DEFAULT_MAX_VMS: usize = 64;
@@ -219,6 +220,47 @@ const VALUED: &[&str] = &[
     "oidc-ca-cert",
     "vm",
 ];
+
+/// The switches read from the environment too.
+const SWITCHES: &[&str] = &["insecure", "flume-insecure"];
+
+/// The variables of the options' prefix that are no option's: the keeper's end
+/// handed to the wicket, and the switches of a VM's serial console and the
+/// restores' trace.
+const READ_ELSEWHERE: &[&str] = &[
+    crate::keeper::KEEPER_FD,
+    crate::route::TRACE,
+    crate::vm::SERIAL_CONSOLE,
+];
+
+/// Refuses the variables named as an option's (`SLUICE_WICKET_RUNTIME_FIRECRACKER_<NAME>`) that name
+/// none (`--vm` is not read from it), a misspelled one among them: it would go unread.
+pub fn check_env(names: impl IntoIterator<Item = String>) -> Result<(), String> {
+    let option = |suffix: &str| {
+        VALUED
+            .iter()
+            .filter(|known| **known != "vm")
+            .chain(SWITCHES)
+            .any(|known| known.to_uppercase().replace('-', "_") == suffix)
+    };
+    let mut unknown: Vec<String> = names
+        .into_iter()
+        .filter(|name| {
+            !READ_ELSEWHERE.contains(&name.as_str())
+                && name
+                    .strip_prefix("SLUICE_WICKET_RUNTIME_FIRECRACKER_")
+                    .is_some_and(|suffix| !option(suffix))
+        })
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort();
+    Err(format!(
+        "unknown environment variable: {} (no option reads it)",
+        unknown.join(", ")
+    ))
+}
 
 /// Parses the arguments (without the program name) over the environment, and
 /// the `--config` file they name.
@@ -1171,5 +1213,25 @@ mod tests {
             assert!(failed.contains(error), "{args:?}: {failed}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+        // a variable of the options' prefix naming none is refused, not left unread
+        assert_eq!(
+            check_env(
+                [
+                    "PATH",
+                    "SLUICE_WICKET_RUNTIME_FIRECRACKER_FLUME",
+                    "SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL_USER",
+                    "SLUICE_WICKET_RUNTIME_FIRECRACKER_INSECURE",
+                    "SLUICE_WICKET_RUNTIME_FIRECRACKER_KEEPER_FD",
+                    "SLUICE_WICKET_RUNTIME_FIRECRACKER_SERIAL_CONSOLE",
+                    "SLUICE_WICKET_RUNTIME_FIRECRACKER_TRACE"
+                ]
+                .map(String::from)
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_env(["SLUICE_WICKET_RUNTIME_FIRECRACKER_FLUNE", "SLUICE_WICKET_RUNTIME_FIRECRACKER_VM", "SLUICE_WICKET_RUNTIME_FIRECRACKER_FLUME"].map(String::from)),
+            Err("unknown environment variable: SLUICE_WICKET_RUNTIME_FIRECRACKER_FLUNE, SLUICE_WICKET_RUNTIME_FIRECRACKER_VM (no option reads it)".into())
+        );
     }
 }

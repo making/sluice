@@ -41,6 +41,9 @@ use crate::output::{self, Ended, Hosts, Output, Sink};
 use crate::vm::{self, Place, Places, Snapshot, Spec, Vm};
 use crate::wire::{self, Rule};
 
+/// Set, the wicket logs each clone's restore time.
+pub const TRACE: &str = "SLUICE_WICKET_RUNTIME_FIRECRACKER_TRACE";
+
 /// Default of `boot-ms`: how long a cold-booted guest may take to listen on its port.
 const DEFAULT_BOOT: Duration = Duration::from_secs(10);
 
@@ -2584,7 +2587,7 @@ impl Route {
 
     /// A stream to a guest, and the VM the connection holds.
     async fn dial(&self) -> Result<(UnixStream, Held), BoxError> {
-        let trace = std::env::var_os("SLUICE_WICKET_RUNTIME_FIRECRACKER_TRACE").is_some();
+        let trace = std::env::var_os(TRACE).is_some();
         match &self.backend {
             Backend::Pool(pool) => {
                 let (stream, seat) = pool.open().await?;

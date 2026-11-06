@@ -26,7 +26,8 @@ sluice-flume/target/release/sluice-flume --token FLUME_SECRET            # grpc:
 --sluice.live-log.url=grpc://flume-host:8002 --sluice.live-log.token=FLUME_SECRET
 ```
 
-Every flume option is also an environment variable `SLUICE_FLUME_<NAME>` (`--help`):
+Every flume option is also an environment variable `SLUICE_FLUME_<NAME>` (`--help`; another
+variable of that prefix, a misspelled one, is refused at the start):
 `--host`, `--port` (8002), `--token` / `--token-file` (required), `--tls-cert` /
 `--tls-key` (PEM, serves `grpcs://`), `--ring-size`, `--backfill` (200: the newest lines a
 new view begins with), `--exit-on-stdin-close`. `--version` prints its build (version, git
