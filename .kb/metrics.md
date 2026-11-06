@@ -36,6 +36,8 @@ carry a `node` common tag. User-facing summary: README "Health / metrics".
 | `sluice_client_filter_refused_total` | connections of a route with filters refused, by `route`, `reason` = `not-http1` (relayed verbatim or as h2: nothing could read them), `no-route` (a server naming no route, routes at the address differing by their filters) |
 | `sluice_client_filter_llm_requests_total` | requests of an LLM API the `llm-usage` filter saw the responses of, by `route`, `api` (`openai` / `anthropic`), `model`, `stream`, `outcome`: `complete`, `no_usage`, `cut`, `error`, `status_<n>` (`4` for a 4xx, ...), `encoded`, `other_type`; those it did not read have `model` and `stream` = `unknown` |
 | `sluice_client_filter_llm_tokens_total` | tokens those responses report, by `route`, `api`, `model`, `type` (`input`, `output`, `cache_read`, `cache_creation`); `input` excludes what the two cache types count. Past 256 models per use on a route, `model` = `other` |
+| `sluice_client_filter_redact_bodies_total` | bodies the `redact` filter saw, by `route`, `side` (`request` / `response`), `outcome`: `redacted`, `clean` (no match), `cut`, `encoded`, `other_type` |
+| `sluice_client_filter_redact_replacements_total` | matches it replaced, by `route`, `side`, `rule` |
 | `sluice_client_filter_<name>_total` | a plugin's counter `<name>`, by `route`, `filter` and the tags in its definition |
 | `sluice_client_filter_plugin_meters_dropped_total` | updates of a plugin's counters past its `max-meters`, by `route`, `filter` |
 

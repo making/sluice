@@ -1,7 +1,6 @@
 package am.ik.sluice.client.filter;
 
 import java.io.ByteArrayOutputStream;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -60,7 +59,7 @@ final class CompressionFilter implements UpstreamFilter {
 
 	private static final byte[] GZIP_HEADER = { 0x1f, (byte) 0x8b, 8, 0, 0, 0, 0, 0, 0, (byte) 0xff };
 
-	private final List<String> types;
+	private final MediaTypes types;
 
 	private final long minLength;
 
@@ -94,17 +93,7 @@ final class CompressionFilter implements UpstreamFilter {
 				throw new IllegalArgumentException("filter " + NAME + " takes no argument " + arg);
 			}
 		}
-		List<String> types = new ArrayList<>();
-		for (String type : args.getOrDefault("types", DEFAULT_TYPES).split(",")) {
-			String trimmed = type.trim().toLowerCase(Locale.ROOT);
-			if (!trimmed.isEmpty()) {
-				if (trimmed.indexOf('/') <= 0) {
-					throw new IllegalArgumentException("filter " + NAME + " takes media types in types, not " + type);
-				}
-				types.add(trimmed);
-			}
-		}
-		this.types = List.copyOf(types);
+		this.types = MediaTypes.parse(NAME, args.getOrDefault("types", DEFAULT_TYPES));
 		String minLength = args.get("min-length");
 		this.minLength = (minLength == null ? DEFAULT_MIN_LENGTH : DataSize.parse(minLength.trim())).toBytes();
 		this.level = intArg(args, "level", Deflater.DEFAULT_COMPRESSION, 1, 9);
@@ -174,35 +163,6 @@ final class CompressionFilter implements UpstreamFilter {
 		return new Coding(exchange, accepted);
 	}
 
-	/** Whether the body's media type is one to compress. */
-	private boolean compressible(Headers headers) {
-		List<String> values = headers.values("content-type");
-		if (values.isEmpty()) {
-			return false;
-		}
-		String type = values.get(0);
-		int parameters = type.indexOf(';');
-		type = (parameters < 0 ? type : type.substring(0, parameters)).trim().toLowerCase(Locale.ROOT);
-		int slash = type.indexOf('/');
-		if (slash <= 0) {
-			return false;
-		}
-		String main = type.substring(0, slash);
-		String subtype = type.substring(slash + 1);
-		for (String pattern : this.types) {
-			int at = pattern.indexOf('/');
-			if (!pattern.substring(0, at).equals(main)) {
-				continue;
-			}
-			String wanted = pattern.substring(at + 1);
-			if (wanted.equals("*") || wanted.equals(subtype)
-					|| wanted.startsWith("*+") && subtype.endsWith(wanted.substring(1))) {
-				return true;
-			}
-		}
-		return false;
-	}
-
 	/** Whether the body is told to be shorter than what pays for compressing it. */
 	private boolean small(Headers headers) {
 		List<String> lengths = headers.values("content-length");
@@ -217,35 +177,15 @@ final class CompressionFilter implements UpstreamFilter {
 		}
 	}
 
-	private static List<String> elements(List<String> values) {
-		List<String> elements = new ArrayList<>();
-		for (String value : values) {
-			for (String element : value.split(",")) {
-				String trimmed = element.trim().toLowerCase(Locale.ROOT);
-				if (!trimmed.isEmpty()) {
-					elements.add(trimmed);
-				}
-			}
-		}
-		return elements;
-	}
-
-	/** The content codings of a body, identity left out. */
-	private static List<String> codings(Headers headers) {
-		List<String> codings = elements(headers.values("content-encoding"));
-		codings.removeIf("identity"::equals);
-		return codings;
-	}
-
 	/**
 	 * What may not be coded anew: what the upstream said not to transform, a part of a
 	 * representation, a body with a transfer coding of its own.
 	 */
 	private static boolean untouchable(int status, Headers headers) {
-		if (status == 206 || elements(headers.values("cache-control")).contains("no-transform")) {
+		if (status == 206 || MediaTypes.elements(headers.values("cache-control")).contains("no-transform")) {
 			return true;
 		}
-		List<String> transfer = elements(headers.values("transfer-encoding"));
+		List<String> transfer = MediaTypes.elements(headers.values("transfer-encoding"));
 		transfer.removeIf("chunked"::equals);
 		return !transfer.isEmpty();
 	}
@@ -285,7 +225,7 @@ final class CompressionFilter implements UpstreamFilter {
 			double gzip = -1;
 			double deflate = -1;
 			double any = -1;
-			for (String element : elements(values)) {
+			for (String element : MediaTypes.elements(values)) {
 				String[] parts = element.split(";");
 				double quality = 1;
 				for (int i = 1; i < parts.length; i++) {
@@ -351,7 +291,7 @@ final class CompressionFilter implements UpstreamFilter {
 
 		@Override
 		public @Nullable BodyHandler onResponse(int status, Headers headers, boolean bodiless) {
-			List<String> codings = codings(headers);
+			List<String> codings = MediaTypes.codings(headers);
 			Codec upstream = Codec.of(codings);
 			if (bodiless || untouchable(status, headers) || !codings.isEmpty() && upstream == null) {
 				return inner(status, headers, bodiless);
@@ -376,7 +316,7 @@ final class CompressionFilter implements UpstreamFilter {
 				account.close();
 				throw e;
 			}
-			boolean compressible = upstream != null || compressible(headers) && !small(headers);
+			boolean compressible = upstream != null || CompressionFilter.this.types.matches(headers) && !small(headers);
 			if (upstream != null && handler == null && this.accepted.takes(upstream)) {
 				// unseen, and taken as it came
 				account.close();

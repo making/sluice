@@ -50,6 +50,7 @@ public final class Filters {
 		register(HeadersFilter.factory());
 		register(CorsFilter.factory());
 		register(CompressionFilter.factory());
+		register(RedactFilter.factory());
 		builder.factories.forEach(this::register);
 		this.definitions.forEach((name, definition) -> {
 			if (!definition.plugin().isEmpty() && this.factories.containsKey(name)) {

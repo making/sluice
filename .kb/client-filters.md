@@ -25,7 +25,7 @@ Body rewriting on the data plane is not worth it: h2 grants a window back per by
 - A local answer (`Exchange.localResponse`) replaces the upstream's response in the order of responses: once the responses before it ended. The upstream is closed then, or at once when nothing is awaited, which is also what wakes the response side reading it. Nothing more of the connection goes on. A request whose response has begun cannot be answered: the connection is cut.
 - `close` may run on the tunnel's receive path, which must not wait on a filter: it closes the upstream, which ends what the pumps wait on, and tells the filters on a thread of its own.
 
-Not interpreted: a filter sees bytes as sent, so `Content-Encoding`, `ETag`, `Range` (206) and `Digest` are its own to handle, unless `compression` is in front of it (below). The `llm-usage` filter removes `accept-encoding` towards the upstream on its paths, and counts what still comes compressed as `outcome=encoded`.
+Not interpreted: a filter sees bytes as sent, so `Content-Encoding`, `ETag`, `Range` (206) and `Digest` are its own to handle, unless `compression` is in front of it (below). The `llm-usage` and `redact` filters remove `accept-encoding` towards the upstream on their paths, and count what still comes compressed as `outcome=encoded`.
 
 ## A route's filter
 
@@ -37,7 +37,7 @@ Real h2 needs either an h2 endpoint on the client, with `proxy.hop` and netty's 
 
 ## Settings
 
-`sluice.client.filters.<name>` defines a filter: a plugin, or the defaults of a built-in or factory of that name. `sluice.client.upstream[n].filters[m]` uses it; what a use sets goes over the definition (`FilterConfig.overriddenBy`: `paths` and the plugin's limits replace, `args` merge key by key). Each use has its own filter: its instances of a plugin, its counters by `route`. The name is resolved at the start: unknown, it stops the client. A factory (`UpstreamFilterFactory`) is how a custom build adds one in Java, as a bean; the built-ins (`llm-usage`, `headers`, `cors`, `compression`) are factories too.
+`sluice.client.filters.<name>` defines a filter: a plugin, or the defaults of a built-in or factory of that name. `sluice.client.upstream[n].filters[m]` uses it; what a use sets goes over the definition (`FilterConfig.overriddenBy`: `paths` and the plugin's limits replace, `args` merge key by key). Each use has its own filter: its instances of a plugin, its counters by `route`. The name is resolved at the start: unknown, it stops the client. A factory (`UpstreamFilterFactory`) is how a custom build adds one in Java, as a bean; the built-ins (`llm-usage`, `headers`, `cors`, `compression`, `redact`) are factories too.
 
 A filter in Java, in a custom build of the client:
 
@@ -162,6 +162,41 @@ Brotli and zstd need a native library (here brotli4j 1.22.0 and zstd-jni 1.5.6-3
 | zstd 3 | 22.3% / 6ms | 33.5% / 10ms | 13.5% / 15ms |
 
 Not worth a native library for now: at the levels a response on its way can afford neither is smaller than gzip 6 (brotli 6 by 5% on text, at its CPU), and flushed per event both are larger. zstd's CPU, a seventh of gzip 6's on JSON, is its one gain: the reason to add it if CPU becomes the limit, with decoding of upstreams' `br` and `zstd` for the filters. Not measured on a native image: the JDK's zlib is all the filter uses.
+
+## redact
+
+Replaces what a route's text bodies match as they stream: masking what must not leave the host without a plugin, its copies into a plugin's memory, or holding a body.
+
+| Arg | Default | |
+|---|---|---|
+| `<rule>.literal` | - | text to replace, matched as its UTF-8 bytes |
+| `<rule>.regex` | - | a Java regex of a bounded match, ASCII (below); in a properties file `\\` is one `\` |
+| `<rule>.replacement` | `[REDACTED]` | what replaces a match, as it is: no group references |
+| `side` | `response` | `request`, `response` or `both` |
+| `types` | `text/*`, JSON, `+json`, NDJSON | as `compression`'s |
+
+- A rule has a literal or a regex. Matches are found leftmost first and do not overlap; at one place, the first rule by name wins.
+- What the next read could still make part of a match is held, from the first place a match attempt read to the end of what came: at most the longest match and 4 bytes. The rest goes on with that read, so one ending in nothing that begins a match (an SSE event's blank line) goes out whole at once; a match split across reads is replaced all the same. A body with no match passes byte for byte, chunked: at its head its length is not known. A request's body goes chunked too, so an HTTP/1.0 request with one fails.
+- A regex reads the bytes as ISO-8859-1 chars: `.` or a class takes one byte, so it is ASCII, and other text goes in a literal. Its longest match is read from its syntax, `java.util.regex` telling none: `*`, `+`, `{n,}`, lookaround, backreferences, `\G`, `\X`, `\b{...}` and the `x` flag are refused, as is a regex that may match nothing or one past 4096 bytes. Where to hold is the `Matcher`'s `hitEnd`: an attempt that did not read to the end of what came is final. `^` and `\A` are the body's start, `$` its end (a line's with `(?m)`): 2 bytes before what is held are kept for `^` and `\b`, when a rule has them.
+- An unbounded regex is refused rather than the body held whole: holding breaks a stream and costs the budget the body's size, and a secret has a longest form (`{20,120}`).
+- A literal is in no message: it may be the secret.
+- Read: a body of `types` with no content coding; another passes, counted `other_type` or `encoded`. `compression` before it decodes gzip and deflate. On the response side it removes `Accept-Encoding` (`compression` in front sets its own), `Range` and `If-Range` towards the upstream (parts would split a match between responses: a client gets a body whole, a download resumed on its paths too), and makes a strong `ETag` weak.
+- What a body holds charges the tunnel budget from its first read: the longest match and 6 bytes. Past the budget the message fails: a body unread would pass what it should not.
+- Literals alone are found by a loop over the bytes; with a regex among the rules, all are one alternation, each rule a named group.
+
+Measured in-process as `compression` (a load average of 100-175, best of 40): 829KiB of JSON, sized, read in 64KiB, and an SSE of 2000 events, a chunk each (206KiB). The email regex is `[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,24}`:
+
+| Rules | JSON | SSE |
+|---|---|---|
+| none, passed | 0.8ms | 1.4ms |
+| 2 literals | 4.3ms | 2.3ms |
+| `sk-ant-[A-Za-z0-9_-]{20,120}` | 8.9ms | 8.9ms |
+| the email regex | 53ms | 19ms |
+| the same, `{1,64}+` (possessive) | 47ms | 17ms |
+| the same, `\b` before it | 32ms | 8.5ms |
+| 2 literals and the email regex | 78ms | 24ms |
+
+So literals cost about 5ms a MiB; a regex its tries at each place, a run of its first class tried at each of its bytes: start one on something rare, or `\b`. Per read a regex costs its tries at the last places too (about 3us here), which is the SSE's share.
 
 ## The proxy-wasm host
 

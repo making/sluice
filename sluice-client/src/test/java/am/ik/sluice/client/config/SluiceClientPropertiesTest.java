@@ -78,14 +78,14 @@ class SluiceClientPropertiesTest {
 	void filtersBindByNameAndPerRoute() {
 		Map<String, Object> source = new java.util.HashMap<>();
 		source.put("sluice.server-url", "grpc://127.0.0.1:8001");
-		source.put("sluice.client.filters.redact.plugin", "https://plugins.test/redact.wasm");
-		source.put("sluice.client.filters.redact.sha256", "AB".repeat(32));
-		source.put("sluice.client.filters.redact.vms", "2");
-		source.put("sluice.client.filters.redact.max-memory", "32MB");
-		source.put("sluice.client.filters.redact.paths", "/v1/*");
+		source.put("sluice.client.filters.mask.plugin", "https://plugins.test/mask.wasm");
+		source.put("sluice.client.filters.mask.sha256", "AB".repeat(32));
+		source.put("sluice.client.filters.mask.vms", "2");
+		source.put("sluice.client.filters.mask.max-memory", "32MB");
+		source.put("sluice.client.filters.mask.paths", "/v1/*");
 		source.put("sluice.client.upstream[0].host", "a.local");
 		source.put("sluice.client.upstream[0].target", "http://127.0.0.1:8080");
-		source.put("sluice.client.upstream[0].filters[0].name", "redact");
+		source.put("sluice.client.upstream[0].filters[0].name", "mask");
 		source.put("sluice.client.upstream[0].filters[0].configuration", "{\"mask\":\"*\"}");
 		source.put("sluice.client.upstream[0].filters[0].fail-closed", "true");
 		source.put("sluice.client.upstream[0].filters[0].call-timeout", "2s");
@@ -94,6 +94,9 @@ class SluiceClientPropertiesTest {
 		source.put("sluice.client.upstream[0].filters[2].name", "headers");
 		// a key with dots, the header's case kept
 		source.put("sluice.client.upstream[0].filters[2].args[request.set.X-Api-Key]", "k");
+		// a key with dots, no brackets needed
+		source.put("sluice.client.upstream[0].filters[3].name", "redact");
+		source.put("sluice.client.upstream[0].filters[3].args.key.regex", "sk-[a-z]{1,9}");
 		source.put("sluice.client.upstream[1].host", "b.local");
 		source.put("sluice.client.upstream[1].target", "http://127.0.0.1:8080");
 		StandardEnvironment environment = new StandardEnvironment();
@@ -103,14 +106,16 @@ class SluiceClientPropertiesTest {
 			.bind("sluice", Bindable.of(SluiceClientProperties.class))
 			.get();
 
-		FilterConfig definition = java.util.Objects.requireNonNull(properties.filterDefinitions().get("redact"));
+		FilterConfig definition = java.util.Objects.requireNonNull(properties.filterDefinitions().get("mask"));
 		assertThat(definition.sha256()).isEqualTo("ab".repeat(32));
 		Upstream filtered = properties.upstreams().get(0);
-		assertThat(filtered.filters()).extracting(FilterConfig::name).containsExactly("redact", "llm-usage", "headers");
+		assertThat(filtered.filters()).extracting(FilterConfig::name)
+			.containsExactly("mask", "llm-usage", "headers", "redact");
 		assertThat(filtered.filters().get(1).args()).isEqualTo(Map.of("include-usage", "true"));
 		assertThat(filtered.filters().get(2).args()).isEqualTo(Map.of("request.set.X-Api-Key", "k"));
+		assertThat(filtered.filters().get(3).args()).isEqualTo(Map.of("key.regex", "sk-[a-z]{1,9}"));
 		FilterConfig use = definition.overriddenBy(filtered.filters().get(0));
-		assertThat(use.plugin()).isEqualTo("https://plugins.test/redact.wasm");
+		assertThat(use.plugin()).isEqualTo("https://plugins.test/mask.wasm");
 		assertThat(use.vms()).isEqualTo(2);
 		assertThat(use.maxMemory()).isEqualTo(DataSize.ofMegabytes(32));
 		assertThat(use.paths()).containsExactly("/v1/*");

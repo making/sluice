@@ -369,13 +369,13 @@ sluice.client.upstream[0].rewrite-host=true
 sluice.client.upstream[0].filters[0].name=llm-usage
 
 # a filter of your own: a proxy-wasm plugin defined once, by name ...
-sluice.client.filters.redact.plugin=https://plugins.example.com/redact.wasm
-sluice.client.filters.redact.sha256=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
-sluice.client.filters.redact.configuration={"mask":"****"}
+sluice.client.filters.mask.plugin=https://plugins.example.com/mask.wasm
+sluice.client.filters.mask.sha256=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+sluice.client.filters.mask.configuration={"mask":"****"}
 # ... and used by routes, each with its own settings over those
 sluice.client.upstream[1].host=app.example.com
 sluice.client.upstream[1].target=http://127.0.0.1:3000
-sluice.client.upstream[1].filters[0].name=redact
+sluice.client.upstream[1].filters[0].name=mask
 sluice.client.upstream[1].filters[0].paths=/api/*
 sluice.client.upstream[1].filters[0].fail-closed=true
 ```
@@ -387,6 +387,7 @@ sluice.client.upstream[1].filters[0].fail-closed=true
 - `headers` sets, adds and removes request and response headers, by args `<request|response>.<set|add|remove>.<header>`: `args[request.set.x-api-key]=${ANTHROPIC_API_KEY}` gives the upstream a credential the tunnel's users never hold, `args[response.remove.server]=true` hides what the upstream sends. An edit of the framing, of `Host` or with a control character stops the start.
 - `cors` answers the CORS preflights of the origins in `args.allowed-origins` (exact, or `*`) and gives their responses the CORS headers, the upstream's replaced; another origin's pass as they are. Settings: `allowed-methods` (`GET,HEAD,POST`), `allowed-headers`, `exposed-headers`, `allow-credentials`, `max-age`. Behind route auth, preflights need `allow-preflight=true` on the server to reach it.
 - `compression`, placed first, decodes a gzip or deflate response for the filters after it, and compresses what they leave with gzip for a client that takes it; alone, it compresses what an upstream sends uncompressed. It sets `Accept-Encoding` towards the upstream, so `llm-usage` and plugins after it read a compressed upstream's responses. A stream (SSE) is flushed per read. Settings: `types` (text, JSON, XML, JavaScript, SVG, ...), `min-length` (`1KB`), `level` (`6`), `max-ratio` (`100`). Brotli and zstd responses pass undecoded.
+- `redact` replaces what text bodies match as they stream: `args.<rule>.literal` (any text) or `args.<rule>.regex` (a Java regex of a bounded match: `{1,64}`, not `+` or `*`; at most 4096 bytes), by `args.<rule>.replacement` (`[REDACTED]`). Settings: `side` (`response`, `request`, `both`), `types` (text, JSON, NDJSON). Only what may begin a match waits for the next read, so a stream (SSE) stays live. A compressed body passes as it came, counted: put `compression` before it.
 - Custom filters: a [proxy-wasm plugin](proxy-wasm-plugins.md), compiled by wasmtime inside the client and needing no build of it, or in a custom build a bean implementing `UpstreamFilterFactory`, cheaper still as nothing is copied into a plugin's memory or called through its ABI. Both are used by name as above.
 - A plugin can be written in Rust or in Lisp. For Lisp, download the binary or the executable JAR of [rontolisp](https://github.com/making/rontolisp/releases/tag/0.1.0-SNAPSHOT) and build it with that: [the steps](proxy-wasm-plugins.md#in-lisp).
 
@@ -980,12 +981,12 @@ Under `sluice.client.upstream[n].filters[m]` they are a route's use of a filter,
 
 | Property | Default | Description |
 |---|---|---|
-| `name` | - | the filter: `llm-usage`, `headers`, `cors`, `compression`, one defined under `sluice.client.filters`, or a factory's |
+| `name` | - | the filter: `llm-usage`, `headers`, `cors`, `compression`, `redact`, one defined under `sluice.client.filters`, or a factory's |
 | `plugin` | - | where a [proxy-wasm plugin](proxy-wasm-plugins.md) is read from at the start: `file:`, `classpath:`, `https:` (a Spring resource location), or a file path |
 | `sha256` | - | the plugin's SHA-256 in hex; the client does not start on a mismatch. Required unless it comes from a file or the class path |
 | `paths` | every path | the request paths the filter sees: exact, or a prefix ending in `*`, compared as sent |
 | `fail-closed` | `false` | a request or response fails with the filter failing on it; otherwise it goes on as if the filter were not there |
-| `args.<key>` | - | a built-in's or a factory's settings; `llm-usage`: `include-usage`; `headers`: `<request\|response>.<set\|add\|remove>.<header>`, in brackets (`args[request.set.x-api-key]`); `cors`: `allowed-origins`, `allowed-methods`, `allowed-headers`, `exposed-headers`, `allow-credentials`, `max-age`; `compression`: `types`, `min-length`, `level`, `max-ratio` |
+| `args.<key>` | - | a built-in's or a factory's settings; `llm-usage`: `include-usage`; `headers`: `<request\|response>.<set\|add\|remove>.<header>`, in brackets (`args[request.set.x-api-key]`); `cors`: `allowed-origins`, `allowed-methods`, `allowed-headers`, `exposed-headers`, `allow-credentials`, `max-age`; `compression`: `types`, `min-length`, `level`, `max-ratio`; `redact`: `<rule>.literal`, `<rule>.regex`, `<rule>.replacement`, `side`, `types` |
 | `configuration` | - | what a plugin reads as its configuration |
 | `vms` | processors, at most 4 | instances of a plugin |
 | `max-memory` | `16MB` | the memory one instance may hold: its linear memory, GC heap and tables together |
