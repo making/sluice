@@ -70,15 +70,20 @@ class ClientActuatorE2ETest {
 		return rest.get().uri(path).exchange().expectBody(String.class).returnResult().getResponseBody();
 	}
 
+	/**
+	 * The overall health by its status code: a body containing {@code "status":"UP"} may
+	 * be another component's while the tunnel is still down.
+	 */
+	private int healthStatus(RestTestClient rest) {
+		return rest.get().uri("/actuator/health").exchange().returnResult().getStatus().value();
+	}
+
 	@Test
 	void healthTracksTheTunnelAndPrometheusServesMetrics() {
 		startApps();
 		RestTestClient rest = RestTestClient.bindToServer().baseUrl("http://127.0.0.1:" + this.clientPort).build();
 		// connected: UP with the per-node states as details
-		Awaitility.await().atMost(Duration.ofSeconds(15)).until(() -> {
-			String health = body(rest, "/actuator/health");
-			return health != null && health.contains("\"status\":\"UP\"");
-		});
+		Awaitility.await().atMost(Duration.ofSeconds(15)).until(() -> healthStatus(rest) == 200);
 		rest.get()
 			.uri("/actuator/health")
 			.exchange()
@@ -104,10 +109,7 @@ class ClientActuatorE2ETest {
 		// server gone: the tunnel health goes DOWN (503)
 		Objects.requireNonNull(this.serverContext).close();
 		this.serverContext = null;
-		Awaitility.await().atMost(Duration.ofSeconds(15)).until(() -> {
-			String health = body(rest, "/actuator/health");
-			return health != null && health.contains("\"status\":\"DOWN\"");
-		});
+		Awaitility.await().atMost(Duration.ofSeconds(15)).until(() -> healthStatus(rest) == 503);
 		rest.get()
 			.uri("/actuator/health")
 			.exchange()
