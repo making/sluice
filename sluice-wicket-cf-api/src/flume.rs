@@ -71,9 +71,10 @@ pub async fn watch(flume: FlumeSettings, store: Arc<Store>, logs: Arc<Logs>) {
     let mut backoff = MIN_BACKOFF;
     let mut warned: Option<Instant> = None;
     let mut suppressed = 0u64;
+    let mut announced = None;
     loop {
         let began = Instant::now();
-        let Err(e) = session(&flume, &store, &logs).await;
+        let Err(e) = session(&flume, &store, &logs, &mut announced).await;
         if warned.is_none_or(|at| at.elapsed() >= WARN_EVERY) {
             let more = match suppressed {
                 0 => String::new(),
@@ -85,6 +86,8 @@ pub async fn watch(flume: FlumeSettings, store: Arc<Store>, logs: Arc<Logs>) {
             );
             warned = Some(Instant::now());
             suppressed = 0;
+            // the watch taken up again after the warning is said too
+            announced = None;
         } else {
             suppressed += 1;
         }
@@ -98,11 +101,14 @@ pub async fn watch(flume: FlumeSettings, store: Arc<Store>, logs: Arc<Logs>) {
 }
 
 /// Watches until the stream ends: opened once an app has a host, opened
-/// again past the cursor whenever the hosts change.
+/// again past the cursor whenever the hosts change. A watch opened for hosts
+/// other than those `announced` last is said, with the hosts: a line of a
+/// host none of them is in no app's log.
 async fn session(
     flume: &FlumeSettings,
     store: &Store,
     logs: &Logs,
+    announced: &mut Option<Vec<String>>,
 ) -> Result<Infallible, BoxError> {
     let mut client = None;
     loop {
@@ -131,6 +137,15 @@ async fn session(
             .metadata_mut()
             .insert("authorization", format!("Bearer {}", flume.token).parse()?);
         let mut events = client.watch(request).await?.into_inner();
+        let watched: Vec<String> = hosts.keys().cloned().collect();
+        if announced.as_ref() != Some(&watched) {
+            println!(
+                "cf logs: watching the flume {} for {}",
+                flume.url,
+                watched.join(", ")
+            );
+            *announced = Some(watched);
+        }
         let mut taker = Taker {
             store,
             logs,

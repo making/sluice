@@ -152,6 +152,10 @@ the log of the app holding its host, which `cf logs` shows as Cloud Foundry does
   `cf scale -i 3` names 0 to 2 and nothing above, as they are.
 - The watch resumes past its cursor (kept in `state.json`) when the hosts change or the
   stream drops. Without a host it holds no watch: an empty filter passes every line.
+- Its startup line names the flume (`flume none` without `--flume`); a watch opened for
+  other hosts than the last one said, or after a failure was reported (`cf logs: the watch
+  of the flume ... ended`), logs `cf logs: watching the flume <url> for <hosts>`. The hosts
+  are matched exactly: a line whose route key is none of them reaches no app.
 - Lines lost become an `LGR` ERR line in the log of every app watched, as they may be any
   app's: a wicket's drops, `Up to N lines missed` when the watch fell behind, a flume
   restart. A node's drops are never an app's lines and are left out.

@@ -855,8 +855,10 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
   With `--flume`, the app's own too, from the live access log the wicket feeds: its output
   (`APP/PROC/WEB` OUT / ERR), on a wasi wicket its requests (`RTR`, in the gorouter's access log
   format), each naming its instance, and the lines lost on the way (`LGR`). The cf-api
-  watches its apps' hosts and resumes past the last line it took (kept in `state.json`); see
-  [Live access log](../.kb/live-access-log.md#wickets-and-the-cf-api)
+  watches its apps' hosts and resumes past the last line it took (kept in `state.json`); its
+  log names the flume on start (`flume none` without one), and the hosts each watch opened for
+  (`cf logs: watching the flume <url> for <hosts>`): a request whose `Host` is none of them is in
+  no app's log. See [Live access log](../.kb/live-access-log.md#wickets-and-the-cf-api)
 - auth: see [Login](#login). Every request but the root document, `/v3`, `/v3/info` and the
   UAA endpoints needs a valid token (log-cache's included), and whoever holds one may do
   everything but edit the [security groups](#security-groups)

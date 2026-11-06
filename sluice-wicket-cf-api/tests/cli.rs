@@ -430,7 +430,10 @@ fn start_api(
     ];
     args.extend_from_slice(more);
     let api = Process::spawn(Path::new(env!("CARGO_BIN_EXE_sluice-wicket-cf-api")), &args);
-    let url = api.logged("listening on ");
+    let started = api.line("listening on ");
+    assert!(started.contains(&format!("flume {flume})")), "{started}");
+    let (_, rest) = started.split_once("listening on ").unwrap();
+    let url = rest.split(' ').next().unwrap().to_string();
     (api, url)
 }
 
@@ -648,6 +651,11 @@ fn the_cf_cli_deploys_to_the_wicket() {
         assert!(Instant::now() < deadline, "the app's lines never came");
         std::thread::sleep(Duration::from_millis(500));
     }
+    let watching = api.line("cf logs: watching the flume ");
+    assert!(
+        watching.ends_with(&format!("{flume_url} for hello.localhost")),
+        "{watching}"
+    );
     let streaming = Process::start(cf.command(&["logs", "hello"]));
     streaming.logged("Retrieving logs");
     assert_eq!(get(&listen, "hello.localhost", "/streamed", None).0, 200);

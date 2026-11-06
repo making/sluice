@@ -37,7 +37,7 @@ async fn main() -> ExitCode {
         .map_or_else(|_| config.listen.clone(), |a| a.to_string());
     // a parent process waits for this line before it dials
     println!(
-        "{} listening on {}://{address} (wicket {}, domains {}, data {}, auth {})",
+        "{} listening on {}://{address} (wicket {}, domains {}, data {}, auth {}, flume {})",
         sluice_wicket_cf_api::describe_build(),
         if config.settings.tls.is_some() {
             "https"
@@ -51,7 +51,12 @@ async fn main() -> ExitCode {
             .settings
             .oidc
             .as_ref()
-            .map_or("any credentials".to_string(), |oidc| oidc.issuer.clone())
+            .map_or("any credentials".to_string(), |oidc| oidc.issuer.clone()),
+        config
+            .settings
+            .flume
+            .as_ref()
+            .map_or("none", |flume| flume.url.as_str())
     );
     let exit_on_stdin_close = config.exit_on_stdin_close;
     match sluice_wicket_cf_api::serve(listener, config.settings, shutdown(exit_on_stdin_close))
