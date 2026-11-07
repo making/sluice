@@ -1598,7 +1598,7 @@ fn fits(specs: &[(RouteSpec, Origin)], capacity: &Capacity) -> Result<(), BoxErr
             targets.push((target, spec));
         }
     }
-    let kept = |spec: &RouteSpec| spec.resident() as u64 * u64::from(spec.vm.mem_mib);
+    let kept = |spec: &RouteSpec| spec.resident() as u64 * u64::from(spec.vm.memory_mib);
     let resident: usize = targets.iter().map(|(_, spec)| spec.resident()).sum();
     let in_memory: u64 = targets.iter().map(|(_, spec)| kept(spec)).sum();
     let cloned = || targets.iter().filter(|(_, spec)| spec.mode.cloned());
@@ -1606,16 +1606,16 @@ fn fits(specs: &[(RouteSpec, Origin)], capacity: &Capacity) -> Result<(), BoxErr
         .map(|(_, spec)| resident - spec.resident() + 1)
         .fold(resident, usize::max);
     let memory = cloned()
-        .map(|(_, spec)| in_memory - kept(spec) + u64::from(spec.vm.mem_mib))
+        .map(|(_, spec)| in_memory - kept(spec) + u64::from(spec.vm.memory_mib))
         .fold(in_memory, u64::max);
-    if vms > capacity.max_vms() || capacity.max_memory().is_some_and(|max| memory > max) {
+    if vms > capacity.max_instances() || capacity.max_memory_mib().is_some_and(|max| memory > max) {
         return Err(format!(
             "the routes need {vms} VM(s) and {memory} MiB of guest memory to start (their booted \
              VMs, their pools' warm VMs, and a template at a time beside the other routes'): over \
-             --max-vms {} / --max-memory {}",
-            capacity.max_vms(),
+             --max-instances {} / --max-memory-mib {}",
+            capacity.max_instances(),
             capacity
-                .max_memory()
+                .max_memory_mib()
                 .map_or("-".to_string(), |mib| mib.to_string())
         )
         .into());
@@ -1647,21 +1647,21 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let pool: &[(&str, &str)] = &[("mode", "pool"), ("vms", "1"), ("mem", "64")];
+        let pool: &[(&str, &str)] = &[("mode", "pool"), ("instances", "1"), ("memory-mib", "64")];
         let large: &[(&str, &str)] = &[
             ("mode", "pool"),
-            ("vms", "1"),
+            ("instances", "1"),
             ("warm", "0"),
-            ("mem", "256"),
+            ("memory-mib", "256"),
         ];
-        let booted: &[(&str, &str)] = &[("mem", "64")];
-        let scaled: &[(&str, &str)] = &[("mem", "64"), ("vms", "3")];
-        for (routes, max_vms, max_memory, fit) in [
+        let booted: &[(&str, &str)] = &[("memory-mib", "64")];
+        let scaled: &[(&str, &str)] = &[("memory-mib", "64"), ("instances", "3")];
+        for (routes, max_instances, max_memory_mib, fit) in [
             (&[("a", pool), ("b", pool)][..], 2, 128, true),
             (&[("a", pool), ("b", pool)], 1, 128, false),
             (&[("a", pool), ("b", pool)], 2, 127, false),
             (&[("a", booted), ("b", pool)], 2, 128, true),
-            // N x mem, all of them for good
+            // N x memory-mib, all of them for good
             (&[("a", scaled), ("b", pool)], 4, 256, true),
             (&[("a", scaled), ("b", pool)], 3, 256, false),
             (&[("a", scaled), ("b", pool)], 4, 255, false),
@@ -1670,12 +1670,12 @@ mod tests {
             (&[("a", pool), ("b", large)], 2, 319, false),
             (&[("a", pool), ("b", large)], 2, 320, true),
         ] {
-            let capacity = Capacity::new(max_vms, Some(max_memory));
+            let capacity = Capacity::new(max_instances, Some(max_memory_mib));
             let hosts: Vec<_> = routes.iter().map(|(host, _)| host).collect();
             assert_eq!(
                 fits(&specs(routes), &capacity).is_ok(),
                 fit,
-                "{hosts:?} {max_vms} {max_memory}"
+                "{hosts:?} {max_instances} {max_memory_mib}"
             );
         }
     }

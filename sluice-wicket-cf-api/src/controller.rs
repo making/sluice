@@ -2,7 +2,7 @@
 //! a route is an app of the wicket, named by its guid (its routes' hosts,
 //! the snapshot's component and sandbox -- its env, which the wicket lists
 //! by the names only, told by the snapshot's tag -- and the process's
-//! instances as the route's cap of instances and the pool, each taking `concurrency`
+//! instances as the route's `instances` and its `warm`, each taking `concurrency`
 //! requests at once, or a droplet's rootfs as a Firecracker wicket's
 //! VMs: [`vm_sandbox`]); stopped, scaled to 0, or without a route, it is none. The
 //! desired state is the cf-api's: at startup and whenever the wicket's
@@ -32,7 +32,8 @@ use crate::logs::Logs;
 use crate::services::Offer;
 use crate::store::{App, Lifetime, Outcome, Purge, State, Store};
 use crate::wicket::{
-    AppBody, ComponentRef, Failure, FilesRef, ListedApp, Runtime, Sandbox, Wicket,
+    AppBody, ComponentRef, Failure, FilesRef, ListedApp, Runtime, Sandbox, VmSandbox, WasmSandbox,
+    Wicket,
 };
 
 pub struct Controller {
@@ -114,7 +115,7 @@ impl Controller {
             },
             files: running.files.clone().map(|sha256| FilesRef { sha256 }),
             sandbox: match running.file.ends_with(crate::staging::ROOTFS) {
-                true => vm_sandbox(
+                true => Sandbox::Vm(vm_sandbox(
                     running.memory_mib,
                     instances,
                     app.process
@@ -124,19 +125,18 @@ impl Controller {
                     &running.env,
                     &running.egress,
                     &running.lifetime,
-                ),
-                false => Sandbox {
+                )),
+                false => Sandbox::Wasm(WasmSandbox {
                     wasi: running.wasi.clone(),
                     budget_ms: running.budget_ms,
                     memory_mib: Some(running.memory_mib),
-                    pool: Some(running.lifetime.warm.unwrap_or(app.process.instances)),
+                    warm: Some(running.lifetime.warm.unwrap_or(app.process.instances)),
                     instances: Some(instances),
+                    keep_ms: running.lifetime.keep_ms,
                     concurrency: Some(running.lifetime.concurrency.unwrap_or(DEFAULT_CONCURRENCY)),
-                    wasm_keep_ms: running.lifetime.keep_ms,
                     keyvalue: running.keyvalue.clone(),
                     env: running.env.clone(),
-                    ..Sandbox::default()
-                },
+                }),
             },
             tag: running.tag.clone(),
         })
@@ -547,15 +547,14 @@ const WICKET_DEFAULT_BOOT_MS: u64 = 10_000;
 const WICKET_DEFAULT_KEEP_MS: u64 = 60_000;
 
 /// What an instance takes at once, unannotated; a Firecracker wicket's default of a route's
-/// `conns`, which it does not list.
+/// `concurrency`, which it does not list.
 const DEFAULT_CONCURRENCY: u64 = 16;
 
 /// A rootfs's sandbox on a Firecracker wicket: `instances` VMs at most (from 1: 0 is no app),
 /// living as `lifetime` says. None annotated, a pool of that size cloned from a snapshot, at any
 /// size: a scale adds to the VMs running, and takes from them, in a restore's time (`boot`, annotated,
-/// a boot's). What is not annotated is the wicket's default; a pool's `concurrency`
-/// is `conns`. Its process has `timeout` seconds to listen, and connects to the destinations of
-/// `egress`.
+/// a boot's). What is not annotated is the wicket's default. Its process has `timeout` seconds to
+/// listen, and connects to the destinations of `egress`.
 fn vm_sandbox(
     memory_mib: u64,
     instances: u64,
@@ -563,21 +562,20 @@ fn vm_sandbox(
     env: &BTreeMap<String, String>,
     egress: &[String],
     lifetime: &Lifetime,
-) -> Sandbox {
+) -> VmSandbox {
     let mode = lifetime.mode.as_deref().unwrap_or("pool");
-    Sandbox {
+    VmSandbox {
         mode: Some(mode.into()),
-        mem: Some(memory_mib),
-        vms: Some(instances),
+        memory_mib: Some(memory_mib),
+        instances: Some(instances),
         warm: lifetime.warm,
         keep_ms: lifetime.keep_ms,
         uses: lifetime.uses,
         lifetime_ms: lifetime.lifetime_ms,
-        conns: lifetime.concurrency,
+        concurrency: lifetime.concurrency,
         boot_ms: Some(timeout.clamp(1, MAXIMUM_HEALTH_CHECK_TIMEOUT) * 1000),
         egress: egress.to_vec(),
         env: env.clone(),
-        ..Sandbox::default()
     }
 }
 
@@ -592,55 +590,69 @@ fn gone(sha256: &str, path: &std::path::Path, e: std::io::Error) -> Failure {
     }
 }
 
-/// Whether the wicket serves `desired` as listed: a `budget_ms` left to
-/// the wicket's default matches whatever it chose; a VM's options the wicket lists only
-/// away from their defaults as those defaults; the capabilities and the egress in any order;
-/// the env, which the wicket lists by its names, by the tag.
+/// Whether the wicket serves `desired` as listed: the capabilities and the egress in any order;
+/// the env, which the wicket lists by its names, by the tag; the sandbox as its wicket lists it
+/// ([`same_wasm`], [`same_vm`]).
 fn same(listed: &AppBody, desired: &AppBody) -> bool {
-    let sorted = |list: &[String]| {
-        let mut list = list.to_vec();
-        list.sort();
-        list
-    };
-    let warm = |sandbox: &Sandbox| match (sandbox.warm, sandbox.mode.as_deref()) {
-        (Some(warm), _) => warm,
-        (None, Some("pool")) => sandbox.vms.unwrap_or(0),
-        (None, _) => 0,
-    };
-    // booted, 1 goes unlisted
-    let vms = |sandbox: &Sandbox| match sandbox.mode.as_deref() {
-        Some("boot") => Some(sandbox.vms.unwrap_or(1)),
-        _ => sandbox.vms,
-    };
-    let keep_ms = |sandbox: &Sandbox| sandbox.keep_ms.unwrap_or(WICKET_DEFAULT_KEEP_MS);
-    let conns = |sandbox: &Sandbox| sandbox.conns.unwrap_or(DEFAULT_CONCURRENCY);
     sorted(&listed.hosts) == desired.hosts
         && listed.component == desired.component
         && listed.files == desired.files
-        && sorted(&listed.sandbox.wasi) == sorted(&desired.sandbox.wasi)
-        && sorted(&listed.sandbox.egress) == sorted(&desired.sandbox.egress)
-        && listed.sandbox.pool == desired.sandbox.pool
-        && listed.sandbox.instances == desired.sandbox.instances
-        && listed.sandbox.wasm_keep_ms == desired.sandbox.wasm_keep_ms
-        && listed.sandbox.concurrency == desired.sandbox.concurrency
-        && listed.sandbox.memory_mib == desired.sandbox.memory_mib
-        && desired
-            .sandbox
-            .budget_ms
-            .is_none_or(|budget| listed.sandbox.budget_ms == Some(budget))
-        && listed.sandbox.keyvalue == desired.sandbox.keyvalue
-        && listed.sandbox.mode == desired.sandbox.mode
-        && listed.sandbox.mem == desired.sandbox.mem
-        && vms(&listed.sandbox) == vms(&desired.sandbox)
-        && warm(&listed.sandbox) == warm(&desired.sandbox)
-        && keep_ms(&listed.sandbox) == keep_ms(&desired.sandbox)
-        && conns(&listed.sandbox) == conns(&desired.sandbox)
-        && listed.sandbox.uses == desired.sandbox.uses
-        && listed.sandbox.lifetime_ms == desired.sandbox.lifetime_ms
-        && desired.sandbox.boot_ms.is_none_or(|boot_ms| {
-            listed.sandbox.boot_ms.unwrap_or(WICKET_DEFAULT_BOOT_MS) == boot_ms
-        })
         && listed.tag == desired.tag
+        && match (&listed.sandbox, &desired.sandbox) {
+            (Sandbox::Wasm(listed), Sandbox::Wasm(desired)) => same_wasm(listed, desired),
+            (Sandbox::Vm(listed), Sandbox::Vm(desired)) => same_vm(listed, desired),
+            _ => false,
+        }
+}
+
+/// A wasm wicket's sandbox: a `budget-ms` left to the wicket's default matches whatever it
+/// chose.
+fn same_wasm(listed: &WasmSandbox, desired: &WasmSandbox) -> bool {
+    sorted(&listed.wasi) == sorted(&desired.wasi)
+        && listed.warm == desired.warm
+        && listed.instances == desired.instances
+        && listed.keep_ms == desired.keep_ms
+        && listed.concurrency == desired.concurrency
+        && listed.memory_mib == desired.memory_mib
+        && desired
+            .budget_ms
+            .is_none_or(|budget| listed.budget_ms == Some(budget))
+        && listed.keyvalue == desired.keyvalue
+}
+
+/// A Firecracker wicket's sandbox: the options it lists only away from their defaults as those
+/// defaults.
+fn same_vm(listed: &VmSandbox, desired: &VmSandbox) -> bool {
+    let warm = |sandbox: &VmSandbox| match (sandbox.warm, sandbox.mode.as_deref()) {
+        (Some(warm), _) => warm,
+        (None, Some("pool")) => sandbox.instances.unwrap_or(0),
+        (None, _) => 0,
+    };
+    // booted, 1 goes unlisted
+    let instances = |sandbox: &VmSandbox| match sandbox.mode.as_deref() {
+        Some("boot") => Some(sandbox.instances.unwrap_or(1)),
+        _ => sandbox.instances,
+    };
+    let keep_ms = |sandbox: &VmSandbox| sandbox.keep_ms.unwrap_or(WICKET_DEFAULT_KEEP_MS);
+    let concurrency = |sandbox: &VmSandbox| sandbox.concurrency.unwrap_or(DEFAULT_CONCURRENCY);
+    sorted(&listed.egress) == sorted(&desired.egress)
+        && listed.mode == desired.mode
+        && listed.memory_mib == desired.memory_mib
+        && instances(listed) == instances(desired)
+        && warm(listed) == warm(desired)
+        && keep_ms(listed) == keep_ms(desired)
+        && concurrency(listed) == concurrency(desired)
+        && listed.uses == desired.uses
+        && listed.lifetime_ms == desired.lifetime_ms
+        && desired
+            .boot_ms
+            .is_none_or(|boot_ms| listed.boot_ms.unwrap_or(WICKET_DEFAULT_BOOT_MS) == boot_ms)
+}
+
+fn sorted(list: &[String]) -> Vec<String> {
+    let mut list = list.to_vec();
+    list.sort();
+    list
 }
 
 #[cfg(test)]
@@ -685,10 +697,9 @@ mod tests {
                 sha256: "cd".repeat(32)
             })
         );
-        assert_eq!(desired.sandbox.pool, Some(2));
-        assert_eq!(desired.sandbox.memory_mib, Some(64));
-        assert_eq!(desired.sandbox.keyvalue[""], "local/cf/i");
-        assert!(desired.sandbox.egress.is_empty(), "no VM: nothing to bound");
+        let wasm = desired.sandbox.wasm();
+        assert_eq!((wasm.warm, wasm.memory_mib), (Some(2), Some(64)));
+        assert_eq!(wasm.keyvalue[""], "local/cf/i");
         // the env put, listed by its names: told by the tag
         let mut body = serde_json::to_value(&desired).unwrap();
         assert_eq!(
@@ -696,7 +707,11 @@ mod tests {
             (&"hello".into(), &"t1".into())
         );
         body["sandbox"]["env"] = serde_json::json!(["GREETING"]);
-        let mut listed: AppBody = serde_json::from_value(body).unwrap();
+        let listed = |body| {
+            let body: AppBody<serde_json::Value> = serde_json::from_value(body).unwrap();
+            body.typed(Runtime::Wasm).unwrap()
+        };
+        let mut listed = listed(body);
         assert!(same(&listed, &desired));
         listed.tag = Some("t0".into());
         assert!(!same(&listed, &desired), "another snapshot");
@@ -704,39 +719,46 @@ mod tests {
         listed.files = None;
         assert!(!same(&listed, &desired), "other files");
         listed.files = desired.files.clone();
-        listed.sandbox.budget_ms = Some(5000);
+        listed.sandbox.wasm_mut().budget_ms = Some(5000);
         // the wicket lists the capabilities in its order
-        listed.sandbox.wasi = vec!["cli".into(), "keyvalue".into()];
+        listed.sandbox.wasm_mut().wasi = vec!["cli".into(), "keyvalue".into()];
         assert!(same(&listed, &desired));
-        listed.sandbox.pool = Some(3);
+        listed.sandbox.wasm_mut().warm = Some(3);
         assert!(!same(&listed, &desired));
         let mut unset = desired.clone();
-        unset.sandbox.budget_ms = None;
-        listed.sandbox.pool = Some(2);
-        listed.sandbox.budget_ms = Some(10_000);
+        unset.sandbox.wasm_mut().budget_ms = None;
+        listed.sandbox.wasm_mut().warm = Some(2);
+        listed.sandbox.wasm_mut().budget_ms = Some(10_000);
         assert!(same(&listed, &unset));
-        listed.sandbox.wasm_keep_ms = Some(500);
+        listed.sandbox.wasm_mut().keep_ms = Some(500);
         assert!(!same(&listed, &unset), "another keep-ms");
-        listed.sandbox.wasm_keep_ms = None;
-        listed.sandbox.concurrency = Some(1);
+        listed.sandbox.wasm_mut().keep_ms = None;
+        listed.sandbox.wasm_mut().concurrency = Some(1);
         assert!(!same(&listed, &unset), "another concurrency");
-        listed.sandbox.concurrency = unset.sandbox.concurrency;
+        listed.sandbox.wasm_mut().concurrency = unset.sandbox.wasm().concurrency;
+        // the same options of a VM are not a component's
+        let vm = Sandbox::Vm(VmSandbox::default());
+        assert!(!same(
+            &AppBody {
+                sandbox: vm,
+                ..listed.clone()
+            },
+            &unset
+        ));
         // a count below what the start keeps warm, as a manifest leaves it: the wicket's kept
         let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
         (running.file, running.lifetime.mode, running.lifetime.warm) =
             ("hello.ext4".into(), Some("pool".into()), Some(3));
         let floored = Controller::desired(&state, state.app(&guid).unwrap(), "cf").unwrap();
-        assert_eq!(
-            (floored.sandbox.vms, floored.sandbox.warm),
-            (Some(3), Some(3))
-        );
+        let vm = floored.sandbox.vm();
+        assert_eq!((vm.instances, vm.warm), (Some(3), Some(3)));
         let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
         (running.file, running.lifetime.mode) = ("hello.wasm".into(), None);
         // `cf scale` a component's limit too: the instances kept unless annotated, each taking
         // `concurrency` at once (16 unless annotated), past what the wicket runs or not; as a
         // VM's, no lower than what the start keeps warm, which the wicket refuses. `keep-ms` as
         // annotated
-        for (instances, warm, concurrency, keep_ms, pool, cap) in [
+        for (instances, warm, concurrency, keep_ms, kept, cap) in [
             (1, None, None, None, 1, 1),
             (2, Some(1), None, Some(500), 1, 2),
             (2, None, Some(1), None, 2, 2),
@@ -754,15 +776,16 @@ mod tests {
                 running.lifetime.keep_ms,
             ) = (warm, concurrency, keep_ms);
             let limited = Controller::desired(&state, state.app(&guid).unwrap(), "cf").unwrap();
+            let limited = limited.sandbox.wasm();
             assert_eq!(
                 (
-                    limited.sandbox.pool,
-                    limited.sandbox.instances,
-                    limited.sandbox.concurrency,
-                    limited.sandbox.wasm_keep_ms
+                    limited.warm,
+                    limited.instances,
+                    limited.concurrency,
+                    limited.keep_ms
                 ),
                 (
-                    Some(pool),
+                    Some(kept),
                     Some(cap),
                     Some(concurrency.unwrap_or(16)),
                     keep_ms
@@ -791,7 +814,7 @@ mod tests {
         let body = serde_json::to_value(&desired).unwrap();
         assert_eq!(
             body["sandbox"],
-            serde_json::json!({"mode": "pool", "mem": 64, "vms": 2, "boot-ms": 60_000,
+            serde_json::json!({"mode": "pool", "memory-mib": 64, "instances": 2, "boot-ms": 60_000,
                 "egress": ["db.internal:5432", "10.0.0.0/24:443"], "env": {"GREETING": "hello"}})
         );
         // as the wicket lists it: its vCPUs too, the env by its names
@@ -800,27 +823,28 @@ mod tests {
         listed["sandbox"]["env"] = serde_json::json!(["GREETING"]);
         // the egress in the wicket's order
         listed["sandbox"]["egress"] = serde_json::json!(["10.0.0.0/24:443", "db.internal:5432"]);
-        let mut listed: AppBody = serde_json::from_value(listed).unwrap();
+        let listed: AppBody<serde_json::Value> = serde_json::from_value(listed).unwrap();
+        let mut listed = listed.typed(Runtime::Firecracker).unwrap();
         assert!(same(&listed, &desired));
-        listed.sandbox.egress.pop();
+        listed.sandbox.vm_mut().egress.pop();
         assert!(!same(&listed, &desired), "another group's rules");
-        listed.sandbox.egress = desired.sandbox.egress.clone();
-        listed.sandbox.vms = Some(3);
+        listed.sandbox.vm_mut().egress = desired.sandbox.vm().egress.clone();
+        listed.sandbox.vm_mut().instances = Some(3);
         assert!(!same(&listed, &desired));
-        listed.sandbox.vms = Some(2);
-        listed.sandbox.boot_ms = Some(10_000);
+        listed.sandbox.vm_mut().instances = Some(2);
+        listed.sandbox.vm_mut().boot_ms = Some(10_000);
         assert!(!same(&listed, &desired));
         // the wicket's default goes unlisted
         let mut asked = desired.clone();
-        asked.sandbox.boot_ms = Some(10_000);
-        listed.sandbox.boot_ms = None;
+        asked.sandbox.vm_mut().boot_ms = Some(10_000);
+        listed.sandbox.vm_mut().boot_ms = None;
         assert!(same(&listed, &asked));
         // the health check's timeout, within Cloud Controller's maximum
         for (timeout, boot_ms) in [(None, 60_000), (Some(5), 5_000), (Some(9_999), 180_000)] {
             let app = state.app_mut(&guid).unwrap();
             app.process.health_check.timeout = timeout;
             let desired = Controller::desired(&state, state.app(&guid).unwrap(), "cf").unwrap();
-            assert_eq!(desired.sandbox.boot_ms, Some(boot_ms));
+            assert_eq!(desired.sandbox.vm().boot_ms, Some(boot_ms));
         }
         // `cf scale` the cap, the annotations the lifetime, each option only what it names
         let lifetime = |mode: Option<&str>, warm, keep_ms, uses, lifetime_ms| Lifetime {
@@ -831,7 +855,7 @@ mod tests {
             lifetime_ms,
             concurrency: None,
         };
-        for (instances, annotated, mode, vms, warm) in [
+        for (instances, annotated, mode, cap, warm) in [
             (1, Lifetime::default(), "pool", Some(1), None),
             (3, Lifetime::default(), "pool", Some(3), None),
             (
@@ -903,15 +927,15 @@ mod tests {
         ] {
             let sandbox = vm_sandbox(64, instances, 60, &BTreeMap::new(), &[], &annotated);
             assert_eq!(
-                (sandbox.mode.as_deref(), sandbox.vms, sandbox.warm),
-                (Some(mode), vms, warm)
+                (sandbox.mode.as_deref(), sandbox.instances, sandbox.warm),
+                (Some(mode), cap, warm)
             );
             assert_eq!(
                 (
                     sandbox.keep_ms,
                     sandbox.uses,
                     sandbox.lifetime_ms,
-                    sandbox.conns
+                    sandbox.concurrency
                 ),
                 (
                     annotated.keep_ms,
@@ -928,8 +952,8 @@ mod tests {
             keep_ms,
             ..Lifetime::default()
         };
-        let body = |sandbox: Sandbox| AppBody {
-            sandbox,
+        let body = |sandbox: VmSandbox| AppBody {
+            sandbox: Sandbox::Vm(sandbox),
             ..desired.clone()
         };
         let asked = vm_sandbox(
@@ -944,7 +968,7 @@ mod tests {
             },
         );
         let mut told = asked.clone();
-        (told.warm, told.keep_ms, told.conns) = (None, None, None);
+        (told.warm, told.keep_ms, told.concurrency) = (None, None, None);
         assert!(same(&body(told.clone()), &body(asked.clone())));
         told.warm = Some(0);
         assert!(!same(&body(told.clone()), &body(asked.clone())));
@@ -952,7 +976,7 @@ mod tests {
         told.keep_ms = Some(500);
         assert!(!same(&body(told.clone()), &body(asked.clone())));
         told.keep_ms = None;
-        told.conns = Some(3);
+        told.concurrency = Some(3);
         assert!(!same(&body(told), &body(asked)));
         // booted, one VM unlisted, more listed
         let booted = |instances| {
@@ -963,7 +987,7 @@ mod tests {
             vm_sandbox(64, instances, 60, &BTreeMap::new(), &[], &lifetime)
         };
         let mut told = booted(1);
-        told.vms = None;
+        told.instances = None;
         assert!(same(&body(told.clone()), &body(booted(1))));
         assert!(!same(&body(told), &body(booted(2))));
         assert!(same(&body(booted(2)), &body(booted(2))));

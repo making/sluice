@@ -562,7 +562,7 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         route["sandbox"]["wasi"],
         serde_json::json!(["cli", "inherit-network"])
     );
-    assert_eq!(route["sandbox"]["budget_ms"], 5000);
+    assert_eq!(route["sandbox"]["budget-ms"], 5000);
     let (status, body) = get(&address, "hello.localhost", "/").await;
     assert_eq!(status, 200);
     assert!(body.starts_with("hello from wasm"), "{body}");
@@ -573,7 +573,7 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
     );
 
     // a move takes the host alone: a sandbox left out would read as the defaults
-    let mixed = "PATCH /api/routes/hello.localhost?host=greet.localhost&pool=1";
+    let mixed = "PATCH /api/routes/hello.localhost?host=greet.localhost&warm=1";
     let (status, _, body) = console(&at, mixed, &[bearer], b"").await;
     assert_eq!(status, 400, "{body}");
     let moved = "PATCH /api/routes/hello.localhost?host=greet.localhost";
@@ -595,7 +595,7 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
     assert_eq!(
         (
             route["host"].as_str(),
-            route["sandbox"]["budget_ms"].as_u64()
+            route["sandbox"]["budget-ms"].as_u64()
         ),
         (Some("greet.localhost"), Some(5000)),
         "moved as it was, and kept across the restart"
@@ -628,8 +628,8 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
     assert_eq!((status, body), (200, uploaded));
     let app = |hosts: &[&str], component: &[u8]| {
         let component = serde_json::json!({"sha256": digest(component), "name": "app.wasm"});
-        let sandbox = serde_json::json!({"wasi": ["cli", "keyvalue"], "pool": 1,
-                                         "keep_ms": 500, "keyvalue": {"": "local/cf/shop"},
+        let sandbox = serde_json::json!({"wasi": ["cli", "keyvalue"], "warm": 1,
+                                         "keep-ms": 500, "keyvalue": {"": "local/cf/shop"},
                                          "env": {"GREETING": "s3cr3t-greeting"}});
         let app = serde_json::json!({"owner": "cf", "hosts": hosts, "component": component,
                                      "sandbox": sandbox, "tag": "v1"});
@@ -696,7 +696,7 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
     assert_eq!(
         (
             &listed["sandbox"]["env"],
-            &listed["sandbox"]["keep_ms"],
+            &listed["sandbox"]["keep-ms"],
             &listed["tag"]
         ),
         (&serde_json::json!(["GREETING"]), &500.into(), &"v1".into())

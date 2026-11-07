@@ -672,14 +672,14 @@ mod tests {
                 host: "b.local".into(),
                 component: format!("components/{}/b.wasm", "f".repeat(64)),
                 sandbox: Sandbox::parse(
-                    "budget-ms=250&concurrency=3&instances=4&keep-ms=500&memory-mib=64&pool=2&wasi=cli,\
+                    "budget-ms=250&concurrency=3&instances=4&keep-ms=500&memory-mib=64&warm=2&wasi=cli,\
                      inherit-network,keyvalue",
                 )
                 .unwrap(),
                 deployed: rfc3339(UNIX_EPOCH + Duration::from_secs(1_793_276_096)),
             },
         ];
-        let mut sandbox = Sandbox::parse("pool=1&wasi=keyvalue").unwrap();
+        let mut sandbox = Sandbox::parse("warm=1&wasi=keyvalue").unwrap();
         sandbox.keyvalue = app_map(
             sandbox.caps,
             BTreeMap::from([
@@ -799,9 +799,9 @@ mod tests {
             ),
             (
                 routes(&format!(
-                    "component: {component}, sandbox: {{pool: 2, instances: 1}}"
+                    "component: {component}, sandbox: {{warm: 2, instances: 1}}"
                 )),
-                "routes[0]: sandbox: instances=1 is below pool=2".into(),
+                "routes[0]: sandbox: instances=1 is below warm=2".into(),
             ),
             (
                 format!(

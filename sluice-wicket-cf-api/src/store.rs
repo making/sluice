@@ -22,14 +22,13 @@ pub const BUDGET_ANNOTATION: &str = "wicket.sluice.ik.am/budget-ms";
 /// [`CONCURRENCY_ANNOTATION`] replace it.
 pub const INSTANCES_ANNOTATION: &str = "wicket.sluice.ik.am/instances";
 /// The annotation of an app setting what an instance takes at once: a component's requests, a
-/// pool VM's connections (its routes' `conns`).
+/// pool VM's connections: its routes' `concurrency`.
 pub const CONCURRENCY_ANNOTATION: &str = "wicket.sluice.ik.am/concurrency";
 /// The annotation of an app setting how a connection gets a VM: its routes' `mode`.
 pub const MODE_ANNOTATION: &str = "wicket.sluice.ik.am/mode";
-/// The annotation of an app setting how many of its instances are kept warm: a VM's `warm`, a
-/// component's `pool`.
+/// The annotation of an app setting how many of its instances are kept warm: its routes' `warm`.
 pub const WARM_ANNOTATION: &str = "wicket.sluice.ik.am/warm";
-/// The annotation of an app setting how long a VM, or a component's unit beyond its `pool`,
+/// The annotation of an app setting how long a VM, or a component's instance beyond its `warm`,
 /// serving nothing lives: its routes' `keep-ms`.
 pub const KEEP_ANNOTATION: &str = "wicket.sluice.ik.am/keep-ms";
 /// The annotation of an app setting how many connections a VM serves: its routes' `uses`.

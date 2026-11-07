@@ -10,10 +10,10 @@
 //! ([`watch`]), each going down replaced by the pool.
 //!
 //! What says how many VMs and how long ([`Bounds`]) a running route takes as it is, its VMs and
-//! their snapshot kept ([`Route::adjust`]): VMs are started for more, and those past a lower `vms`
-//! (the highest indices, so what stays is what `cf logs` lists) take no connection any more, and
-//! go as `keep-ms` has them go, once their connections ended. What serves none of a VM per
-//! connection goes at once: it has no connections to finish, and is in the way of the next.
+//! their snapshot kept ([`Route::adjust`]): VMs are started for more, and those past a lower
+//! `instances` (the highest indices, so what stays is what `cf logs` lists) take no connection any
+//! more, and go as `keep-ms` has them go, once their connections ended. What serves none of a VM
+//! per connection goes at once: it has no connections to finish, and is in the way of the next.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -83,8 +83,8 @@ const DEFAULT_WAIT: Duration = Duration::from_secs(10);
 /// Default of `keep-ms`: how long a VM serving no connection is kept (reuse, pool).
 const DEFAULT_KEEP: Duration = Duration::from_secs(60);
 
-/// Default of `conns`: the connections every VM of a pool holds before it grows.
-const DEFAULT_CONNS: usize = 16;
+/// Default of `concurrency`: the connections every VM of a pool holds before it grows.
+const DEFAULT_CONCURRENCY: usize = 16;
 
 /// How long a pool waits before it starts again a VM it found no room for: no VM failing, so no
 /// [`Backoff`].
@@ -108,9 +108,9 @@ static NEXT_ROUTE: AtomicU64 = AtomicU64::new(0);
 /// How a connection of the route gets its VM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// `vms` VMs (1 by default), each booted, none restored, keep serving many connections at
+    /// `instances` VMs (1 by default), each booted, none restored, keep serving many connections at
     /// once: a pool but for how a VM starts, for a process that does not survive a restore. A
-    /// connection takes the VM holding the fewest; none is grown past `vms`.
+    /// connection takes the VM holding the fewest; none is grown past `instances`.
     Boot,
     /// Every connection gets a VM of its own, cloned from the route's snapshot and
     /// killed when the connection ends: the isolation of the wasm wicket's
@@ -123,8 +123,8 @@ pub enum Mode {
     /// ones left in the guest.
     Reuse,
     /// A pool of VMs cloned from the route's snapshot, each serving many connections
-    /// at once: `warm` of them kept, grown up to `vms` with the
-    /// connections (`conns` each), a VM beyond `warm` serving none killed after
+    /// at once: `warm` of them kept, grown up to `instances` with the
+    /// connections (`concurrency` each), a VM beyond `warm` serving none killed after
     /// `keep-ms`.
     Pool,
 }
@@ -156,7 +156,7 @@ const MODE_OPTIONS: &[(&str, &[Mode])] = &[
     ("keep-ms", &[Mode::Reuse, Mode::Pool]),
     ("uses", &[Mode::Reuse]),
     ("lifetime-ms", &[Mode::Reuse]),
-    ("conns", &[Mode::Pool]),
+    ("concurrency", &[Mode::Pool]),
 ];
 
 /// One route as configured: a `--vm` flag, or a route of the `--config` file.
@@ -181,23 +181,23 @@ pub struct RouteSpec {
 pub struct Bounds {
     /// How long a cold-booted guest may take to listen on its port.
     pub boot: Duration,
-    /// Per-connection and reuse modes: clones kept restored ahead of the connections;
-    /// pool mode: the pool's VMs kept serving no connection (default `vms`); boot mode: `vms`.
+    /// Per-connection and reuse modes: clones kept restored ahead of the connections; pool mode:
+    /// the pool's VMs kept serving no connection (default `instances`); boot mode: `instances`.
     pub warm: usize,
     /// The route's VMs alive at once (warm, in use, kept, the template) at most; None = the
     /// global limits alone (pool mode needs it: its size; boot mode has it, from 1).
-    pub vms: Option<usize>,
+    pub instances: Option<usize>,
     /// Cloned modes: how long a connection may wait for room for its VM.
     pub wait: Duration,
     /// Reuse and pool modes: how long a VM serving no connection is kept (a pool's
-    /// beyond its `warm`); boot mode: none, past `vms` it goes with its last connection.
+    /// beyond its `warm`); boot mode: none, past `instances` it goes with its last connection.
     pub keep: Duration,
     /// Reuse mode: the connections a clone serves at most; None = no bound.
     pub uses: Option<u32>,
     /// Reuse mode: how long a clone serves from its restore at most; None = no bound.
     pub lifetime: Option<Duration>,
     /// Pool mode: the connections every VM of the pool holds before it grows by one.
-    pub conns: usize,
+    pub concurrency: usize,
     /// The route's connections of one client address open at once at most (in
     /// per-connection and reuse modes, its VMs); None = no bound of its own.
     pub per_client: Option<usize>,
@@ -207,9 +207,9 @@ pub struct Bounds {
 }
 
 impl Bounds {
-    /// A pool's `vms`.
+    /// A pool's `instances`.
     fn pool_size(&self) -> usize {
-        self.vms.unwrap_or(self.warm)
+        self.instances.unwrap_or(self.warm)
     }
 }
 
@@ -217,18 +217,18 @@ impl Bounds {
 const BOUNDS: &[&str] = &[
     "boot-ms",
     "warm",
-    "vms",
+    "instances",
     "wait-ms",
     "keep-ms",
     "uses",
     "lifetime-ms",
-    "conns",
+    "concurrency",
     "per-client",
     "idle-ms",
 ];
 
 impl RouteSpec {
-    /// Parses `host=<rootfs>[?mode=boot|per-connection|reuse|pool&vcpus=N&mem=MiB&cpu=N&port=N&boot-ms=N&warm=N&prime=N&vms=N&wait-ms=N&keep-ms=N&uses=N&lifetime-ms=N&conns=N&per-client=N&idle-ms=N&egress=<rule>,...&disk=<path>&disk-mib=N]`.
+    /// Parses `host=<rootfs>[?mode=boot|per-connection|reuse|pool&vcpus=N&memory-mib=N&cpu=N&port=N&boot-ms=N&warm=N&prime=N&instances=N&wait-ms=N&keep-ms=N&uses=N&lifetime-ms=N&concurrency=N&per-client=N&idle-ms=N&egress=<rule>,...&disk=<path>&disk-mib=N]`.
     pub fn parse(
         flag: &str,
         firecracker: &std::path::Path,
@@ -292,7 +292,7 @@ impl RouteSpec {
                 kernel: kernel.to_path_buf(),
                 rootfs,
                 vcpus: 1,
-                mem_mib: 128,
+                memory_mib: 128,
                 cpu: None,
                 egress: Vec::new(),
                 env: Env::default(),
@@ -305,12 +305,12 @@ impl RouteSpec {
             bounds: Bounds {
                 boot: DEFAULT_BOOT,
                 warm: 0,
-                vms: None,
+                instances: None,
                 wait: DEFAULT_WAIT,
                 keep: DEFAULT_KEEP,
                 uses: None,
                 lifetime: None,
-                conns: DEFAULT_CONNS,
+                concurrency: DEFAULT_CONCURRENCY,
                 per_client: None,
                 idle: None,
             },
@@ -337,17 +337,17 @@ impl RouteSpec {
                         .ok_or_else(|| format!("{named}: unknown mode {value}"))?;
                 }
                 "vcpus" => spec.vm.vcpus = number()?,
-                "mem" => spec.vm.mem_mib = number()?,
+                "memory-mib" => spec.vm.memory_mib = number()?,
                 "port" => spec.port = number()?,
                 "boot-ms" => spec.bounds.boot = millis()?,
                 "warm" => spec.bounds.warm = number()? as usize,
                 "prime" => spec.prime = number()?,
-                "vms" => spec.bounds.vms = Some(number()? as usize),
+                "instances" => spec.bounds.instances = Some(number()? as usize),
                 "wait-ms" => spec.bounds.wait = Duration::from_millis(u64::from(number()?)),
                 "keep-ms" => spec.bounds.keep = millis()?,
                 "uses" => spec.bounds.uses = Some(positive()?),
                 "lifetime-ms" => spec.bounds.lifetime = Some(millis()?),
-                "conns" => spec.bounds.conns = positive()? as usize,
+                "concurrency" => spec.bounds.concurrency = positive()? as usize,
                 "cpu" => spec.vm.cpu = Some(positive()?),
                 "per-client" => spec.bounds.per_client = Some(positive()? as usize),
                 "idle-ms" => spec.bounds.idle = Some(millis()?),
@@ -395,8 +395,10 @@ impl RouteSpec {
                      snapshot holds its guest's page cache of it"
                 ));
             }
-            (Some(_), _) if spec.bounds.vms.is_some_and(|vms| vms > 1) => {
-                return Err(format!("{named}: disk needs vms=1: one VM writes a disk"));
+            (Some(_), _) if spec.bounds.instances.is_some_and(|vms| vms > 1) => {
+                return Err(format!(
+                    "{named}: disk needs instances=1: one VM writes a disk"
+                ));
             }
             (Some(mount), mib) => {
                 spec.vm.disk = Some(Disk {
@@ -416,23 +418,27 @@ impl RouteSpec {
             }
         }
         if spec.mode == Mode::Boot {
-            let vms = spec.bounds.vms.unwrap_or(1);
-            spec.bounds.vms = Some(vms);
+            let vms = spec.bounds.instances.unwrap_or(1);
+            spec.bounds.instances = Some(vms);
             spec.bounds.warm = vms;
             spec.bounds.keep = Duration::ZERO;
         }
         if spec.mode == Mode::Pool {
-            let Some(vms) = spec.bounds.vms else {
-                return Err(format!("{named}: mode=pool needs vms (its VMs at most)"));
+            let Some(vms) = spec.bounds.instances else {
+                return Err(format!(
+                    "{named}: mode=pool needs instances (its VMs at most)"
+                ));
             };
             if !given.contains(&"warm") {
                 spec.bounds.warm = vms;
             }
         }
-        if let Some(vms) = spec.bounds.vms
+        if let Some(vms) = spec.bounds.instances
             && (vms == 0 || vms < spec.bounds.warm)
         {
-            return Err(format!("{named}: vms must be at least 1 and at least warm"));
+            return Err(format!(
+                "{named}: instances must be at least 1 and at least warm"
+            ));
         }
         Ok(spec)
     }
@@ -490,16 +496,16 @@ impl RouteSpec {
             options.push(("mode", self.mode.name().to_string()));
         }
         let bounds = &self.bounds;
-        // boot mode: what `vms` makes them, nobody's to set
+        // boot mode: what `instances` makes them, nobody's to set
         let (warm, vms, keep) = match self.mode {
             Mode::Boot => (bounds.warm, 1, bounds.keep),
-            Mode::Pool => (bounds.vms.unwrap_or(0), 0, DEFAULT_KEEP),
+            Mode::Pool => (bounds.instances.unwrap_or(0), 0, DEFAULT_KEEP),
             _ => (0, 0, DEFAULT_KEEP),
         };
         let millis = |duration: Option<Duration>| duration.map_or(0, |d| d.as_millis() as u32);
         for (key, value, default) in [
             ("vcpus", self.vm.vcpus, 1),
-            ("mem", self.vm.mem_mib, 128),
+            ("memory-mib", self.vm.memory_mib, 128),
             ("cpu", self.vm.cpu.unwrap_or(0), 0),
             ("port", self.port, 8080),
             (
@@ -509,7 +515,11 @@ impl RouteSpec {
             ),
             ("warm", bounds.warm as u32, warm as u32),
             ("prime", self.prime, 0),
-            ("vms", bounds.vms.unwrap_or(0) as u32, vms as u32),
+            (
+                "instances",
+                bounds.instances.unwrap_or(0) as u32,
+                vms as u32,
+            ),
             (
                 "wait-ms",
                 bounds.wait.as_millis() as u32,
@@ -522,7 +532,11 @@ impl RouteSpec {
             ),
             ("uses", bounds.uses.unwrap_or(0), 0),
             ("lifetime-ms", millis(bounds.lifetime), 0),
-            ("conns", bounds.conns as u32, DEFAULT_CONNS as u32),
+            (
+                "concurrency",
+                bounds.concurrency as u32,
+                DEFAULT_CONCURRENCY as u32,
+            ),
             ("per-client", bounds.per_client.unwrap_or(0) as u32, 0),
             ("idle-ms", millis(bounds.idle), 0),
         ] {
@@ -691,7 +705,7 @@ impl Drop for Share {
 /// [`Instance::end`] once its output came), and its output followed.
 pub struct Instance {
     /// Its instance index, held by what comes in its place too: given back before the VM's room,
-    /// so an index stays below the route's `vms`.
+    /// so an index stays below the route's `instances`.
     index: Arc<Index>,
     vm: Vm,
     output: Option<Output>,
@@ -848,7 +862,7 @@ impl Warm {
         }
     }
 
-    /// One more clone, unless `warm` or `vms` went down meanwhile: then it is killed.
+    /// One more clone, unless `warm` or `instances` went down meanwhile: then it is killed.
     fn put(&self, clone: Instance) {
         self.restored();
         let mut clones = self.clones.lock().unwrap();
@@ -915,7 +929,7 @@ impl Kept {
     }
 
     /// Keeps `reused` for the next connection, or gives its clone back, to be ended,
-    /// when it served its last, or `vms` went down.
+    /// when it served its last, or `instances` went down.
     fn put(&self, reused: Reused) -> Option<Instance> {
         let now = Instant::now();
         if self.spent(&reused, now) || self.capacity.over(self.route) {
@@ -1011,12 +1025,13 @@ async fn sweep(kept: Weak<Kept>, changed: Arc<Notify>) {
 /// ([`Starter`]).
 ///
 /// A connection takes the VM holding the fewest (in turn among them). A clone pool's while it holds
-/// fewer than `conns`; past that it waits for a VM being started, one started for every `conns`
-/// connections waiting, up to `vms`, and takes the VM holding the fewest once none is starting (the
-/// pool at `vms`) or its wait ran out. The connection taking the last room has the next VM started
-/// ahead. A VM beyond `warm` serving none for `keep` is killed, as is one past `vms`, which takes no
-/// connection any more. A booted pool keeps `vms`, none grown past it nor waited for: a boot is too
-/// slow to ask for one on demand, so a connection finding none up fails.
+/// fewer than `concurrency`; past that it waits for a VM being started, one started for every
+/// `concurrency` connections waiting, up to `instances`, and takes the VM holding the fewest once
+/// none is starting (the pool at `instances`) or its wait ran out. The connection taking the last
+/// room has the next VM started ahead. A VM beyond `warm` serving none for `keep` is killed, as is
+/// one past `instances`, which takes no connection any more. A booted pool keeps `instances`, none
+/// grown past it nor waited for: a boot is too slow to ask for one on demand, so a connection
+/// finding none up fails.
 ///
 /// A VM going down ([`watch`]), or a clone that does not answer, is killed, its connections alone
 /// cut. One it keeps is replaced ([`Fallen`]) on the room it held and under its index, after a wait
@@ -1198,7 +1213,7 @@ struct Members {
 
 struct Member {
     id: u64,
-    /// Its instance index, what tells which VMs are past `vms`.
+    /// Its instance index, what tells which VMs are past `instances`.
     index: usize,
     instance: Arc<Instance>,
     /// Its connections open.
@@ -1367,7 +1382,7 @@ impl Drop for Seat {
                         member.since = Instant::now();
                     }
                     // one more VM may idle out, a waiting connection take the room
-                    (shrinks && member.conns == 0) || (waiting && member.conns < bounds.conns)
+                    (shrinks && member.conns == 0) || (waiting && member.conns < bounds.concurrency)
                 }
                 None => false,
             }
@@ -1433,8 +1448,8 @@ impl VmPool {
         }
     }
 
-    /// Starts one more VM at the lowest index free, unless the pool holds `vms` with those starting
-    /// and waiting to.
+    /// Starts one more VM at the lowest index free, unless the pool holds `instances` with those
+    /// starting and waiting to.
     fn start_fresh(self: &Arc<Self>, members: &mut Members, wait: Duration) -> bool {
         if members.kept() >= self.bounds.get().pool_size() {
             return false;
@@ -1570,7 +1585,7 @@ impl VmPool {
                 let bounds = self.bounds.get();
                 let mut members = self.members.lock().unwrap();
                 let least = members.least(bounds.pool_size());
-                let at = match least.filter(|&at| members.vms[at].conns < bounds.conns) {
+                let at = match least.filter(|&at| members.vms[at].conns < bounds.concurrency) {
                     Some(at) => Some(at),
                     None => {
                         if least.is_none() && members.failures > failures {
@@ -1583,7 +1598,7 @@ impl VmPool {
                             waiter.counted = true;
                             members.waiting += 1;
                         }
-                        if members.waiting > members.starting * bounds.conns {
+                        if members.waiting > members.starting * bounds.concurrency {
                             self.grow(&mut members, wait);
                         }
                         match least {
@@ -1606,7 +1621,7 @@ impl VmPool {
                     }
                     let seat = members.seat(at);
                     if members.starting == 0
-                        && members.vms.iter().all(|vm| vm.conns >= bounds.conns)
+                        && members.vms.iter().all(|vm| vm.conns >= bounds.concurrency)
                     {
                         self.grow(&mut members, wait);
                     }
@@ -1700,7 +1715,7 @@ impl VmPool {
         }
     }
 
-    /// Takes out the VMs past `vms` or beyond `warm` serving none for `keep` at `now`, and
+    /// Takes out the VMs past `instances` or beyond `warm` serving none for `keep` at `now`, and
     /// starts those missing to `warm`, the wait of those that went down over; and when to look
     /// again.
     fn tend(self: &Arc<Self>, now: Instant) -> (Vec<Member>, Option<Instant>) {
@@ -1720,7 +1735,7 @@ impl VmPool {
             .idlest(min, max)
             .map(|at| members.vms[at].since + bounds.keep);
         let up = members.wanted(min);
-        // those past what it keeps, a lower `vms` come: the highest go
+        // those past what it keeps, a lower `instances` come: the highest go
         while members.kept() > up {
             let waiting = members.fallen.iter().rev();
             let highest = waiting
@@ -2078,10 +2093,10 @@ impl Route {
         let label = hosts.current().label.clone();
         let bounds = Current(Arc::new(Mutex::new(spec.bounds)));
         let need = Need {
-            memory: u64::from(spec.vm.mem_mib),
+            memory: u64::from(spec.vm.memory_mib),
             route: NEXT_ROUTE.fetch_add(1, Ordering::Relaxed),
         };
-        capacity.cap(need.route, spec.bounds.vms);
+        capacity.cap(need.route, spec.bounds.instances);
         // the place opens the disk's file: made by then
         if let Some(disk) = &spec.vm.disk {
             disk.ready()
@@ -2172,10 +2187,10 @@ impl Route {
         let label = hosts.current().label.clone();
         let bounds = Current(Arc::new(Mutex::new(spec.bounds)));
         let need = Need {
-            memory: u64::from(spec.vm.mem_mib),
+            memory: u64::from(spec.vm.memory_mib),
             route: NEXT_ROUTE.fetch_add(1, Ordering::Relaxed),
         };
-        capacity.cap(need.route, spec.bounds.vms);
+        capacity.cap(need.route, spec.bounds.instances);
         let slot = capacity
             .take(need, START_WAIT)
             .await
@@ -2374,9 +2389,10 @@ impl Route {
     }
 
     /// Takes `bounds` from now on, its VMs and their snapshot kept: whether they changed. VMs are
-    /// started for a higher `warm` or `vms` as there is room, touching no other; past a lower
-    /// `vms`, a pool's VMs take no connection any more and go as `keep-ms` has them go, once theirs ended, and of a VM per
-    /// connection what serves none goes at once. What waits to be tried again is tried at once.
+    /// started for a higher `warm` or `instances` as there is room, touching no other; past a lower
+    /// `instances`, a pool's VMs take no connection any more and go as `keep-ms` has them go, once
+    /// theirs ended, and of a VM per connection what serves none goes at once. What waits to be
+    /// tried again is tried at once.
     pub fn adjust(&self, bounds: Bounds) -> bool {
         {
             let mut current = self.bounds.0.lock().unwrap();
@@ -2385,7 +2401,7 @@ impl Route {
             }
             *current = bounds;
         }
-        self.capacity.cap(self.need.route, bounds.vms);
+        self.capacity.cap(self.need.route, bounds.instances);
         match &self.backend {
             Backend::Cloned { warm, kept, .. } => {
                 warm.adjust();
@@ -2556,7 +2572,7 @@ impl Route {
         }
         let bounds = self.bounds.get();
         let within = format!("no room for a VM within {}ms", bounds.wait.as_millis());
-        Some(match (self.mode, bounds.vms) {
+        Some(match (self.mode, bounds.instances) {
             (Mode::PerConnection | Mode::Reuse, Some(vms)) => {
                 format!("{within}: a VM per connection, {vms} at most")
             }
@@ -3188,8 +3204,8 @@ mod tests {
         assert!(!members.fallen.contains_key(&0));
     }
 
-    /// A mode's options as the docs have them: `boot` takes `vms` and none that grows, shrinks or
-    /// waits for a VM; its `warm` is `vms`, its options what was asked.
+    /// A mode's options as the docs have them: `boot` takes `instances` and none that grows,
+    /// shrinks or waits for a VM; its `warm` is `instances`, its options what was asked.
     #[test]
     fn a_booted_route_keeps_its_vms() {
         let spec = |options: &[(&'static str, &'static str)]| {
@@ -3205,19 +3221,19 @@ mod tests {
         let one = spec(&[]).unwrap();
         assert_eq!((one.mode, one.resident()), (Mode::Boot, 1));
         assert_eq!(one.target(), "firecracker:/a.ext4");
-        let three = spec(&[("mode", "boot"), ("vms", "3")]).unwrap();
+        let three = spec(&[("mode", "boot"), ("instances", "3")]).unwrap();
         assert_eq!(three.resident(), 3);
-        assert_eq!(three.target(), "firecracker:/a.ext4?vms=3");
+        assert_eq!(three.target(), "firecracker:/a.ext4?instances=3");
         assert_eq!(three.bounds.keep, Duration::ZERO);
-        for key in ["warm", "keep-ms", "conns", "prime", "wait-ms"] {
-            let refused = spec(&[("vms", "2"), (key, "1")]).unwrap_err();
+        for key in ["warm", "keep-ms", "concurrency", "prime", "wait-ms"] {
+            let refused = spec(&[("instances", "2"), (key, "1")]).unwrap_err();
             assert!(refused.contains(&format!("{key} needs mode=")), "{refused}");
         }
         let refused = spec(&[("mode", "shared")]).unwrap_err();
         assert!(refused.contains("unknown mode shared"), "{refused}");
-        let refused = spec(&[("vms", "2"), ("disk", "/data")]).unwrap_err();
-        assert!(refused.contains("disk needs vms=1"), "{refused}");
-        assert!(spec(&[("vms", "1"), ("disk", "/data")]).is_ok());
+        let refused = spec(&[("instances", "2"), ("disk", "/data")]).unwrap_err();
+        assert!(refused.contains("disk needs instances=1"), "{refused}");
+        assert!(spec(&[("instances", "1"), ("disk", "/data")]).is_ok());
     }
 
     /// The log stream in flight as the guest comes to listen is followed, not dropped:

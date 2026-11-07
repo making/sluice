@@ -89,7 +89,7 @@ curl -fsS -X PUT -H "$auth" http://127.0.0.1:9090/api/apps/cf-api -d @- > /dev/n
   "hosts": ["cf.localhost"],
   "component": {"sha256": "$sha256", "name": "sluice-wicket-cf-api.ext4"},
   "sandbox": {
-    "mem": 256,
+    "memory-mib": 256,
     "disk": "/data",
     "disk-mib": 4096,
     "egress": ["localhost:9090", "flume:8002", "dex.localhost:5556"],

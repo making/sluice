@@ -30,7 +30,7 @@ usage: sluice-wicket-runtime-wasi --server <url> --wasm <host>=<locator>[?<optio
                                   TCP, http/1.1 and h2c, routed by the request's host
   --wasm <host>=<locator>         a route: a component path, file:// or http(s):// url;
                                   repeatable. ?budget-ms=N&concurrency=N&instances=N&keep-ms=N
-                                  &memory-mib=N&pool=N&wasi=<cap>,... sets its sandbox (wasi=keyvalue: the
+                                  &memory-mib=N&warm=N&wasi=<cap>,... sets its sandbox (wasi=keyvalue: the
                                   default store, namespaced by the host)
   --config <file>                 YAML settings and routes, the routes reloaded on change
   --console <host:port>           serve the console: a page and an API deploying uploaded
@@ -770,9 +770,10 @@ pub(crate) struct SandboxFile {
     budget: Option<Scalar>,
     /// The per-instance memory cap, whole MiB (`64Mi`).
     memory: Option<Scalar>,
-    pool: Option<usize>,
+    /// The units kept warm (`warm`).
+    warm: Option<usize>,
     instances: Option<usize>,
-    /// How long a unit beyond the pool is kept serving none, a duration (`keep-ms`).
+    /// How long a unit beyond `warm` is kept serving none, a duration (`keep-ms`).
     keep: Option<Scalar>,
     /// The requests an instance takes at once (`concurrency`).
     concurrency: Option<usize>,
@@ -791,7 +792,7 @@ impl SandboxFile {
             wasi,
             budget,
             memory,
-            pool,
+            warm,
             instances,
             keep,
             concurrency,
@@ -818,7 +819,7 @@ impl SandboxFile {
         if let Some(memory) = memory {
             sandbox.limits.memory = memory.mebibytes("sandbox.memory")?;
         }
-        sandbox.pool = pool.unwrap_or(0);
+        sandbox.warm = warm.unwrap_or(0);
         sandbox.instances = match instances {
             Some(0) => return Err("sandbox.instances: must be at least 1".into()),
             cap => cap,
@@ -876,8 +877,8 @@ pub(crate) fn sandbox_yaml(sandbox: &Sandbox, map: bool) -> Option<String> {
     if sandbox.limits.memory != defaults.memory {
         pairs.push(format!("memory: {}Mi", sandbox.limits.memory >> 20));
     }
-    if sandbox.pool > 0 {
-        pairs.push(format!("pool: {}", sandbox.pool));
+    if sandbox.warm > 0 {
+        pairs.push(format!("warm: {}", sandbox.warm));
     }
     if let Some(cap) = sandbox.instances {
         pairs.push(format!("instances: {cap}"));
@@ -1215,7 +1216,7 @@ pub fn parse_seconds(name: &str, value: &str) -> Result<Duration, String> {
         .map_err(|_| format!("--{name} must be a number of seconds (0 = off), got '{value}'"))
 }
 
-/// Splits `locator[?budget-ms=N&concurrency=N&files=DIR&instances=N&keep-ms=N&memory-mib=N&pool=N
+/// Splits `locator[?budget-ms=N&concurrency=N&files=DIR&instances=N&keep-ms=N&memory-mib=N&warm=N
 /// &wasi=cap,...]`
 /// into the locator and the per-route sandbox, `files` relative to the working directory.
 /// The `?` separator means literal `?` in file paths needs URL-escaping (`file://...%3F...`).
@@ -1330,7 +1331,7 @@ routes:
       wasi: [cli, inherit-network]
       budget: 250ms
       memory: 64Mi
-      pool: 2
+      warm: 2
       instances: 4
       keep: 30s
       concurrency: 8
@@ -1416,7 +1417,7 @@ routes:
         assert_eq!(routes[0].component, Locator::File(dir.0.join("a.wasm")));
         assert_eq!(
             route_target("a", &routes[0].sandbox),
-            "a?budget-ms=250&concurrency=8&instances=4&keep-ms=30000&memory-mib=64&pool=2&wasi=cli,\
+            "a?budget-ms=250&concurrency=8&instances=4&keep-ms=30000&memory-mib=64&warm=2&wasi=cli,\
              inherit-network"
         );
         assert_eq!(
@@ -1514,7 +1515,7 @@ routes:
                 "/var/kept",
                 "--flume",
                 "grpc://flag:8002",
-                "--wasm=c.local=c.wasm?pool=1&wasi=keyvalue",
+                "--wasm=c.local=c.wasm?warm=1&wasi=keyvalue",
             ],
             env,
         )
@@ -1558,7 +1559,7 @@ routes:
         assert_eq!(routes[2].component, Locator::File("c.wasm".into()));
         assert_eq!(
             route_target("c", &routes[2].sandbox),
-            "c?keyvalue=:local/c.local&pool=1&wasi=keyvalue"
+            "c?keyvalue=:local/c.local&warm=1&wasi=keyvalue"
         );
 
         dir.write("wicket.yaml", yaml("grpc://moved:8001"));
@@ -1700,7 +1701,8 @@ routes:
                 "server: s\ndrain-grace: 20\n".into(),
                 "drain-grace: expected a duration like 250ms, 20s, 5m or 1h (0 = off), got '20'",
             ),
-            (route("fuel: 1"), "unknown field `fuel`"),
+            // the name it had
+            (route("pool: 1"), "unknown field `pool`"),
             (route("wasi: [fs]"), "unknown wasi capability 'fs'"),
             (route("wasi: [tcp]"), "need 'cli'"),
             (route("budget: 0ms"), "sandbox.budget: must be positive"),
@@ -1711,7 +1713,7 @@ routes:
             ),
             (route("memory: 64"), "sandbox.memory: expected a size like 64Mi or 1Gi"),
             (route("instances: 0"), "sandbox.instances: must be at least 1"),
-            (route("pool: 2, instances: 1"), "instances=1 is below pool=2"),
+            (route("warm: 2, instances: 1"), "instances=1 is below warm=2"),
             (
                 "server: s\nkeyvalue: {stores: {local: {type: mem}}}\n".into(),
                 "keyvalue.stores.local.type: unknown store type 'mem' (sqlite, redis)",
@@ -1978,12 +1980,12 @@ routes:
         assert_eq!(sandbox.caps, wasm_host::Caps::default());
         // the files' directory, relative to the working directory; never an option of the
         // console's query
-        let (_, sandbox) = parse_route_target("./a.wasm?files=site&pool=1").unwrap();
+        let (_, sandbox) = parse_route_target("./a.wasm?files=site&warm=1").unwrap();
         let site = std::env::current_dir().unwrap().join("site");
-        assert_eq!((sandbox.files.as_ref(), sandbox.pool), (Some(&site), 1));
+        assert_eq!((sandbox.files.as_ref(), sandbox.warm), (Some(&site), 1));
         assert_eq!(
             route_target("a", &sandbox),
-            format!("a?files={}&pool=1", escape_path(&site))
+            format!("a?files={}&warm=1", escape_path(&site))
         );
         for (spec, error) in [
             ("./a.wasm?files=a&files=b", "files: named twice"),
@@ -2028,8 +2030,9 @@ routes:
     fn route_target_rejects_unknown_capabilities_and_options() {
         let error = parse_route_target("./a.wasm?wasi=cli,fs").unwrap_err();
         assert!(error.contains("unknown wasi capability 'fs'"), "{error}");
-        let error = parse_route_target("./a.wasm?fuel=1").unwrap_err();
-        assert!(error.contains("unknown option 'fuel'"), "{error}");
+        // the name it had
+        let error = parse_route_target("./a.wasm?pool=1").unwrap_err();
+        assert!(error.contains("unknown option 'pool'"), "{error}");
     }
 
     /// `http` is accepted for flag parity with `-S http` but changes nothing:
@@ -2047,26 +2050,26 @@ routes:
     }
 
     /// `instances=N` caps the route's slots and is part of the advertised
-    /// target; a cap equal to the pool is accepted.
+    /// target; a cap equal to `warm` is accepted.
     #[test]
     fn route_target_caps_the_routes_instances() {
-        let (_, sandbox) = parse_route_target("./a.wasm?pool=2&instances=4").unwrap();
+        let (_, sandbox) = parse_route_target("./a.wasm?warm=2&instances=4").unwrap();
         assert_eq!(sandbox.instances, Some(4));
-        assert_eq!(sandbox.pool, 2);
+        assert_eq!(sandbox.warm, 2);
         assert_eq!(
             route_target("wasm:file:///a.wasm", &sandbox),
-            "wasm:file:///a.wasm?instances=4&pool=2"
+            "wasm:file:///a.wasm?instances=4&warm=2"
         );
-        let (_, sandbox) = parse_route_target("./a.wasm?instances=2&pool=2").unwrap();
+        let (_, sandbox) = parse_route_target("./a.wasm?instances=2&warm=2").unwrap();
         assert_eq!(sandbox.instances, Some(2));
         let (_, sandbox) = parse_route_target("./a.wasm").unwrap();
         assert_eq!(sandbox.instances, None, "no cap unless set");
     }
 
-    /// A zero cap or limit, a cap below the pool (in either order) and a
+    /// A zero cap or limit, a cap below `warm` (in either order) and a
     /// non-number are startup errors.
     #[test]
-    fn route_target_rejects_zero_and_a_cap_below_the_pool() {
+    fn route_target_rejects_zero_and_a_cap_below_warm() {
         for zero in ["instances", "budget-ms", "memory-mib"] {
             assert_eq!(
                 parse_route_target(&format!("./a.wasm?{zero}=0")).unwrap_err(),
@@ -2077,14 +2080,14 @@ routes:
             parse_route_target("./a.wasm?memory-mib=18446744073709551615").unwrap_err(),
             "memory-mib: too large '18446744073709551615'"
         );
-        let below = "instances=1 is below pool=2: every pooled unit holds one of the route's \
+        let below = "instances=1 is below warm=2: every pooled unit holds one of the route's \
                      instance slots";
         assert_eq!(
-            parse_route_target("./a.wasm?instances=1&pool=2").unwrap_err(),
+            parse_route_target("./a.wasm?instances=1&warm=2").unwrap_err(),
             below
         );
         assert_eq!(
-            parse_route_target("./a.wasm?pool=2&instances=1").unwrap_err(),
+            parse_route_target("./a.wasm?warm=2&instances=1").unwrap_err(),
             below
         );
         assert_eq!(

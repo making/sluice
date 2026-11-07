@@ -252,12 +252,12 @@ another OpenID Provider and the like.
 | package (docker) | an image (`cf push --docker-image`, a manifest's `docker.image`) holding the component as one `application/wasm` layer, as `wkg oci push` and `oras push <ref> hello.wasm:application/wasm` push it (of an index, its `wasm` entry). `--docker-username` with `CF_DOCKER_PASSWORD` are its credentials |
 | build | picks the component: the one the web process command names (`-c hello.wasm`, `command:`), else the package's only `.wasm`, else of a package with an `index.html` sluice-wicket-site ([a static site](#static-sites)); of an image, pulls it. It must be a component (`\0asm`, layer 1). Anything else fails the build, naming what it found |
 | droplet | that component, by sha256 (`process_types.web` its path; stack `wasip3`, buildpack `wasm`, a static site's `site` with its files); of an image, the image by digest (`cf app`: `docker image:`), `process_types.web` the repository's last segment `.wasm` |
-| web process `instances` | [the limit](#instances) N: the route's `instances`, each a wasm instance (a store) taking `concurrency` requests at once, its `pool` `warm`, N by default. A request no warm instance has room for gets an instance of its own, up to the limit. 0 is [as on CF](#mapping): no app in the wicket. `cf logs` names the instance (`APP/PROC/WEB/<index>`, the requests' `app_index`) within `0` to `instances - 1`, what `cf app` lists: the wicket's index, a warm one's `0` to `pool - 1`, one of its own the lowest free from `pool` up, modulo `instances` |
+| web process `instances` | [the limit](#instances) N: the route's `instances`, each a wasm instance (a store) taking `concurrency` requests at once, its `warm` N by default. A request no warm instance has room for gets an instance of its own, up to the limit. 0 is [as on CF](#mapping): no app in the wicket. `cf logs` names the instance (`APP/PROC/WEB/<index>`, the requests' `app_index`) within `0` to `instances - 1`, what `cf app` lists: the wicket's index, a warm one's `0` to `warm - 1`, one of its own the lowest free from `warm` up, modulo `instances` |
 | web process `memory` | `memory-mib`: what an instance holds, its requests' together |
 | annotation `wicket.sluice.ik.am/budget-ms` | `budget-ms`: each request's |
 | annotation `wicket.sluice.ik.am/concurrency` | `concurrency`: [the requests an instance takes at once](#instances), at once |
 | annotation `wicket.sluice.ik.am/keep-ms` | `keep-ms`: [how long an instance beyond `warm` is kept](#instances) serving none, at once |
-| annotation `wicket.sluice.ik.am/warm` | `pool`: [the instances kept up](#instances), at once |
+| annotation `wicket.sluice.ik.am/warm` | `warm`: [the instances kept up](#instances), at once |
 | environment variables (`cf set-env`, a manifest's `env:`), `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: what the guest's `wasi:cli/environment` answers |
 | disk | accepted and shown, no effect |
 | security groups | accepted and shown, no effect: a component's network is the capabilities below |
@@ -370,7 +370,7 @@ curl -sS -X PUT -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9090/api/apps
   "hosts": ["cf.localhost"],
   "component": {"sha256": "$sha256", "name": "sluice-wicket-cf-api.ext4"},
   "sandbox": {
-    "mem": 256,
+    "memory-mib": 256,
     "disk": "/data",
     "disk-mib": 4096,
     "egress": ["localhost:9090", "flume:8002"],
@@ -453,7 +453,7 @@ curl http://web.localhost:8080/
   `/init` relays to). TLS is the sluice server's in front of it (`X-Forwarded-Proto` makes the
   links `https://`): `--tls-cert` here has no host to be routed by on `--listen`, the wicket
   reading a request's `Host`
-- **`mem`**: an upload, a package and a droplet go through files, not memory: a `mem` below a zip's
+- **`memory-mib`**: an upload, a package and a droplet go through files, not memory: a `memory-mib` below a zip's
   size takes its push. **`disk-mib`**: an image's droplet is a reference, a zip's is kept as a file
   for each app (that one, the one before, and its package, with the upload while it comes)
 - **an upgrade**: `PUT /api/images` of the new image, then this app with its `sha256` (or another
@@ -638,8 +638,8 @@ The wicket's listing says `runtime: firecracker`.
 | package (docker) | any container image, `--docker-username` with `CF_DOCKER_PASSWORD` its credentials: the build has the wicket make its rootfs (`PUT /api/images`), which pulls it. Listening on `PORT`, as on CF. Spring Boot reads `SERVER_PORT`, not `PORT`: its default fits, an app with another `server.port` takes `cf set-env <app> SERVER_PORT 8080` |
 | package (bits) | a zip holding the rootfs, `.ext4` as a component's `.wasm` is picked (160 MiB at most, unpacking to 4 GiB at most: an image is the way for more) |
 | droplet | the rootfs by sha256 (stack `firecracker`, buildpack `rootfs`; an image's has neither, as on CF): the wicket keeps an image's, the cf-api its reference pinned to the manifest's digest, and has it made again when the wicket lost it (the same digest, unless the wicket's guest changed) |
-| web process `instances` | `vms`, [the limit](#instances) of the app's VMs: `mode=pool`, that many VMs cloned from a snapshot, one too; [annotated](#how-long-a-vm-lives), any mode. 0 is [as on CF](#mapping): no VM and no app in the wicket |
-| web process `memory` | `mem`, 1G by default as on CF: less fails a CNB Java image's memory calculator at its start. The snapshot takes what its guest wrote of it on the host's memory (`--tmpfs /run/sluice`; [measured](../.kb/wicket-firecracker-findings.md#a-snapshots-memory)), and at most all of it |
+| web process `instances` | `instances`, [the limit](#instances) of the app's VMs: `mode=pool`, that many VMs cloned from a snapshot, one too; [annotated](#how-long-a-vm-lives), any mode. 0 is [as on CF](#mapping): no VM and no app in the wicket |
+| web process `memory` | `memory-mib`, 1G by default as on CF: less fails a CNB Java image's memory calculator at its start. The snapshot takes what its guest wrote of it on the host's memory (`--tmpfs /run/sluice`; [measured](../.kb/wicket-firecracker-findings.md#a-snapshots-memory)), and at most all of it |
 | web process `health_check` `timeout` (`cf push -t`) | `boot-ms`, 60s by default and 180s at most as on CF: how long the process may take to listen, in the request that starts it. A process exiting first is refused at once |
 | environment variables, `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: the process's environment, over the image's (its `PORT` is `/init`'s) |
 | disk | no effect: the rootfs is read-only and `/tmp` a tmpfs of the VM's memory; a persistent disk is the wicket API's, with no CF counterpart |
@@ -803,7 +803,7 @@ Cloud Run's do:
   one process: `memory` bounds it, its requests' together, the guest's module state is theirs to
   share, and a trap ends every one of them. `budget-ms` stays each request's: one past it is
   answered 504 at its deadline, and its instance, taking no more, ends once the others are
-  done and is replaced. `warm: N` keeps N of them, units of the wicket's `pool`. At `-i 1`
+  done and is replaced. `warm: N` keeps N of them, the route's `warm`. At `-i 1`
   requests are served so:
 
   | request | served by |
@@ -859,13 +859,13 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
 
 | | `-i N` limits | at once |
 |---|---|---|
-| component | N wasm instances (the route's `instances`), each taking `concurrency` requests; `pool` stays N unless `warm` says | `N x concurrency` requests |
-| `boot` VM | N VMs (`vms`), kept | any |
-| `pool` VM | N VMs (`vms`), `concurrency` the route's `conns` | as `conns` has it |
-| `per-connection`, `reuse` VM | N VMs (`vms`): the memory is N x `mem`, as CF's quota counts it | N connections |
+| component | N wasm instances (the route's `instances`), each taking `concurrency` requests; `warm` N unless annotated | `N x concurrency` requests |
+| `boot` VM | N VMs (`instances`), kept | any |
+| `pool` VM | N VMs (`instances`), each taking `concurrency` connections before the pool grows | as `concurrency` has it |
+| `per-connection`, `reuse` VM | N VMs (`instances`): the memory is N x `memory-mib`, as CF's quota counts it | N connections |
 
-- **`concurrency`** (`wicket.sluice.ik.am/concurrency`) is from 1, 16 by default, the wicket's
-  `conns`. `-i 1` with no annotation behaves as a CF app: a component takes 16 requests at once, a
+- **`concurrency`** (`wicket.sluice.ik.am/concurrency`) is from 1, 16 by default, the route's
+  `concurrency`. `-i 1` with no annotation behaves as a CF app: a component takes 16 requests at once, a
   pool of one VM any number of connections. A component wanting one request at a time per instance
   annotates 1. `boot`, growing none past N, has none to decide and a VM per connection is 1 by
   definition: those modes refuse it

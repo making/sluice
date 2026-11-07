@@ -1,5 +1,5 @@
-//! The VMs' budget: the VMs alive at once (`--max-vms`) and their guest memory
-//! (`--max-memory`) over every route, and a route's own cap (`vms=N`), which a
+//! The VMs' budget: the VMs alive at once (`--max-instances`) and their guest memory
+//! (`--max-memory-mib`) over every route, and a route's own cap (`instances=N`), which a
 //! running route may change ([`Capacity::cap`]). A VM holds its share, a [`Slot`],
 //! from before its `firecracker` starts until it is killed.
 //!
@@ -36,9 +36,9 @@ pub trait Pool: Send + Sync {
 }
 
 pub struct Capacity {
-    max_vms: usize,
+    max_instances: usize,
     /// MiB.
-    max_memory: u64,
+    max_memory_mib: u64,
     state: Mutex<State>,
     changed: Notify,
 }
@@ -68,7 +68,7 @@ struct Room {
 /// Why a VM finds no room.
 #[derive(Debug, PartialEq, Eq)]
 enum Short {
-    /// `--max-vms` or `--max-memory`: another route's spare VM may give way.
+    /// `--max-instances` or `--max-memory-mib`: another route's spare VM may give way.
     Global,
     /// The route's own cap.
     Route,
@@ -120,12 +120,12 @@ impl std::fmt::Display for Full {
 impl std::error::Error for Full {}
 
 impl Capacity {
-    /// `max_memory` in MiB; None = no memory budget (`max_vms` x the largest
+    /// `max_memory_mib` in MiB; None = no memory budget (`max_instances` x the largest
     /// VM bounds it).
-    pub fn new(max_vms: usize, max_memory: Option<u64>) -> Arc<Capacity> {
+    pub fn new(max_instances: usize, max_memory_mib: Option<u64>) -> Arc<Capacity> {
         Arc::new(Capacity {
-            max_vms,
-            max_memory: max_memory.unwrap_or(u64::MAX),
+            max_instances,
+            max_memory_mib: max_memory_mib.unwrap_or(u64::MAX),
             state: Mutex::default(),
             changed: Notify::new(),
         })
@@ -161,8 +161,8 @@ impl Capacity {
         let room = state.routes.get(&need.route);
         if room.is_some_and(|room| room.cap.is_some_and(|cap| room.alive >= cap)) {
             Some(Short::Route)
-        } else if state.vms >= self.max_vms
-            || state.memory.saturating_add(need.memory) > self.max_memory
+        } else if state.vms >= self.max_instances
+            || state.memory.saturating_add(need.memory) > self.max_memory_mib
         {
             Some(Short::Global)
         } else {
@@ -266,9 +266,9 @@ impl Capacity {
                         "no room for a VM within {}ms (VMs {}/{}, memory {}/{} MiB, the route's {}/{})",
                         wait.as_millis(),
                         state.vms,
-                        self.max_vms,
+                        self.max_instances,
                         state.memory,
-                        if self.max_memory == u64::MAX { "-".to_string() } else { self.max_memory.to_string() },
+                        if self.max_memory_mib == u64::MAX { "-".to_string() } else { self.max_memory_mib.to_string() },
                         room.map_or(0, |room| room.alive),
                         room.and_then(|room| room.cap).map_or("-".to_string(), |cap| cap.to_string()),
                     )));
@@ -314,13 +314,13 @@ impl Capacity {
         state.routes.get(&route).map_or(0, |room| room.alive)
     }
 
-    pub fn max_vms(&self) -> usize {
-        self.max_vms
+    pub fn max_instances(&self) -> usize {
+        self.max_instances
     }
 
     /// MiB; None = no memory budget.
-    pub fn max_memory(&self) -> Option<u64> {
-        (self.max_memory != u64::MAX).then_some(self.max_memory)
+    pub fn max_memory_mib(&self) -> Option<u64> {
+        (self.max_memory_mib != u64::MAX).then_some(self.max_memory_mib)
     }
 }
 

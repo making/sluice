@@ -18,7 +18,7 @@ On demand, each instance's memory and fiber stack were mapped and unmapped, and 
 few workers the CPU went to the kernel's memory map lock and TLB shootdowns
 (`rwsem_spin_on_owner`, `smp_call_function_many_cond` in `perf`: an unmapping
 interrupts every core running one of the process's threads); pooled, no memory map call
-is left per request. A `pool=16` route serves 66k at 0.23ms either way.
+is left per request. A `warm=16` route serves 66k at 0.23ms either way.
 
 ## A pooled unit's latency
 
@@ -44,7 +44,7 @@ read faults the shared page in. A written page is the cost: a fresh instance fau
 heap writes (past the 4MiB the pooling allocator keeps resident), a unit wrote them on its first
 request. Without copy-on-write (macOS) the data section is copied per instance. So the gap grows
 with what a guest writes and computes at its start, 1-1.6ms here against 20-30us for the hello
-guest: what `keep-ms` keeps beyond `pool`.
+guest: what `keep-ms` keeps beyond `warm`.
 
 ## Concurrency
 
@@ -54,15 +54,15 @@ request:
 
 | route | `-c 16` | `-c 64` |
 |---|---|---|
-| `pool=16` / `pool=64`, one request a store | 92k, 62us | 110k, 66us |
-| `pool=4&concurrency=4` / `pool=16&concurrency=4` | 89k, 62us | 110k |
-| `pool=4&concurrency=16` | | 99k, 64us |
-| `pool=1&concurrency=16` / `pool=1&concurrency=64` | 40-41k, 61us | 36k, 63us |
+| `warm=16` / `warm=64`, one request a store | 92k, 62us | 110k, 66us |
+| `warm=4&concurrency=4` / `warm=16&concurrency=4` | 89k, 62us | 110k |
+| `warm=4&concurrency=16` | | 99k, 64us |
+| `warm=1&concurrency=16` / `warm=1&concurrency=64` | 40-41k, 61us | 36k, 63us |
 | no pool, one request a store | 22k | |
 
 A request costs the same CPU in a shared store; one store's requests share one core, which caps
 it near 40k/s for the hello guest. `/hold/5` (the guest waits 5ms on a host timer) at `-c 16`:
-2.1k/s on `pool=1&concurrency=16` and on `pool=16` alike, 145/s on one unit of one request.
+2.1k/s on `warm=1&concurrency=16` and on `warm=16` alike, 145/s on one unit of one request.
 So the default stays 1 and CPU-bound routes spread over stores; the cf-api maps a CF instance
 to one store (memory, indices and the trap's reach as CF has them), `cf scale -i` adding cores.
 

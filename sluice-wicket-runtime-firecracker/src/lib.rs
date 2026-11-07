@@ -131,8 +131,8 @@ async fn serving(
         max_connections,
         stall_timeout,
         drain_grace,
-        max_vms,
-        max_memory,
+        max_instances,
+        max_memory_mib,
         workers: _,
         watch_interval,
         state_dir: _,
@@ -157,10 +157,10 @@ async fn serving(
     let serving = usize::from(server.is_some()) + usize::from(listen.is_some());
     let (open_files, vm_open_files) = vm::set_open_files(max_connections * serving)?;
     println!("open file limit {open_files}, each VM's {vm_open_files}");
-    let capacity = Capacity::new(max_vms, max_memory);
+    let capacity = Capacity::new(max_instances, max_memory_mib);
     println!(
-        "VM limit {max_vms}, guest memory limit {}",
-        max_memory.map_or("none".to_string(), |mib| format!("{mib} MiB"))
+        "VM limit {max_instances}, guest memory limit {}",
+        max_memory_mib.map_or("none".to_string(), |mib| format!("{mib} MiB"))
     );
     let tap = match flume {
         Some(_) => Tap::new(),

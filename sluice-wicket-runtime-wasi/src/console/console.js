@@ -24,7 +24,7 @@ const CAP_HINTS = {
 // until the first listing names them
 const FALLBACK = {
   capabilities: ["cli", "inherit-network", "allow-ip-name-lookup", "tcp", "udp", "keyvalue"],
-  defaults: { budget_ms: 10000, memory_mib: 256 },
+  defaults: { "budget-ms": 10000, "memory-mib": 256 },
 };
 
 const defaults = () => currentListing()?.defaults ?? FALLBACK.defaults;
@@ -45,20 +45,20 @@ function sandboxPairs(sandbox) {
   if (sandbox.wasi.length) {
     pairs.push(`wasi=${sandbox.wasi.join(",")}`);
   }
-  if (sandbox.budget_ms !== defaults().budget_ms) {
-    pairs.push(`budget-ms=${sandbox.budget_ms}`);
+  if (sandbox["budget-ms"] !== defaults()["budget-ms"]) {
+    pairs.push(`budget-ms=${sandbox["budget-ms"]}`);
   }
-  if (sandbox.memory_mib !== defaults().memory_mib) {
-    pairs.push(`memory-mib=${sandbox.memory_mib}`);
+  if (sandbox["memory-mib"] !== defaults()["memory-mib"]) {
+    pairs.push(`memory-mib=${sandbox["memory-mib"]}`);
   }
-  if (sandbox.pool > 0) {
-    pairs.push(`pool=${sandbox.pool}`);
+  if (sandbox.warm > 0) {
+    pairs.push(`warm=${sandbox.warm}`);
   }
   if (sandbox.instances !== null && sandbox.instances !== undefined) {
     pairs.push(`instances=${sandbox.instances}`);
   }
-  if (sandbox.keep_ms !== null && sandbox.keep_ms !== undefined) {
-    pairs.push(`keep-ms=${sandbox.keep_ms}`);
+  if (sandbox["keep-ms"] !== null && sandbox["keep-ms"] !== undefined) {
+    pairs.push(`keep-ms=${sandbox["keep-ms"]}`);
   }
   if ((sandbox.concurrency ?? 1) !== 1) {
     pairs.push(`concurrency=${sandbox.concurrency}`);
@@ -103,13 +103,13 @@ function sandboxFields(initial, onChange) {
     });
     return { input, element: limitView(input, label, unit) };
   };
-  const budget = number("budget", "Budget", "ms", initial.budget_ms, { min: 1 });
-  const memory = number("memory", "Memory", "MiB", initial.memory_mib, { min: 1 });
-  const pool = number("pool", "Pool", "warm", initial.pool, { min: 0 });
+  const budget = number("budget", "Budget", "ms", initial["budget-ms"], { min: 1 });
+  const memory = number("memory", "Memory", "MiB", initial["memory-mib"], { min: 1 });
+  const warm = number("warm", "Warm", "kept", initial.warm, { min: 0 });
   const instances = number("instances", "Instances", "at most", initial.instances, { min: 1, placeholder: "no cap" });
-  const keep = number("keep", "Keep", "ms idle", initial.keep_ms, { min: 1, placeholder: "none" });
+  const keep = number("keep", "Keep", "ms idle", initial["keep-ms"], { min: 1, placeholder: "none" });
   const concurrency = number("concurrency", "Concurrency", "at once", initial.concurrency ?? 1, { min: 1 });
-  const inputs = [budget.input, memory.input, pool.input, instances.input, keep.input, concurrency.input];
+  const inputs = [budget.input, memory.input, warm.input, instances.input, keep.input, concurrency.input];
   const note = h("p", { class: "sandbox__note", id: `${id}-note` });
 
   const element = h("fieldset", { class: "sandbox" },
@@ -118,7 +118,7 @@ function sandboxFields(initial, onChange) {
     h("div", { class: "field" },
       h("span", { class: "field__label" }, "Limits"),
       h("div", { class: "field__control" },
-        h("div", { class: "limits" }, budget.element, memory.element, pool.element, instances.element, keep.element, concurrency.element),
+        h("div", { class: "limits" }, budget.element, memory.element, warm.element, instances.element, keep.element, concurrency.element),
         note)));
   element.addEventListener("input", () => onChange?.());
   element.addEventListener("change", () => onChange?.());
@@ -140,21 +140,21 @@ function sandboxFields(initial, onChange) {
       inputs.forEach((input) => input.removeAttribute("aria-invalid"));
       const sandbox = {
         wasi: [...boxes].filter(([, box]) => box.checked).map(([name]) => name),
-        budget_ms: whole(budget.input, 1, "The budget"),
-        memory_mib: whole(memory.input, 1, "The memory"),
-        pool: whole(pool.input, 0, "The pool"),
+        "budget-ms": whole(budget.input, 1, "The budget"),
+        "memory-mib": whole(memory.input, 1, "The memory"),
+        warm: whole(warm.input, 0, "Warm"),
         instances: null,
-        keep_ms: null,
+        "keep-ms": null,
         concurrency: whole(concurrency.input, 1, "The concurrency"),
       };
       if (instances.input.value.trim() !== "") {
         sandbox.instances = whole(instances.input, 1, "Instances");
-        if (sandbox.instances < sandbox.pool) {
-          fail(instances.input, "Instances must be at least the pool: every pooled unit holds one of the route's instance slots.");
+        if (sandbox.instances < sandbox.warm) {
+          fail(instances.input, "Instances must be at least warm: every pooled unit holds one of the route's instance slots.");
         }
       }
       if (keep.input.value.trim() !== "") {
-        sandbox.keep_ms = whole(keep.input, 1, "Keep");
+        sandbox["keep-ms"] = whole(keep.input, 1, "Keep");
       }
       return sandbox;
     },
@@ -162,11 +162,11 @@ function sandboxFields(initial, onChange) {
       for (const [name, box] of boxes) {
         box.checked = sandbox.wasi.includes(name);
       }
-      budget.input.value = sandbox.budget_ms;
-      memory.input.value = sandbox.memory_mib;
-      pool.input.value = sandbox.pool;
+      budget.input.value = sandbox["budget-ms"];
+      memory.input.value = sandbox["memory-mib"];
+      warm.input.value = sandbox.warm;
       instances.input.value = sandbox.instances ?? "";
-      keep.input.value = sandbox.keep_ms ?? "";
+      keep.input.value = sandbox["keep-ms"] ?? "";
       concurrency.input.value = sandbox.concurrency ?? 1;
     },
     focus() {
@@ -175,7 +175,7 @@ function sandboxFields(initial, onChange) {
   };
 }
 
-const defaultSandbox = () => ({ wasi: [], budget_ms: defaults().budget_ms, memory_mib: defaults().memory_mib, pool: 0, instances: null, keep_ms: null, concurrency: 1 });
+const defaultSandbox = () => ({ wasi: [], "budget-ms": defaults()["budget-ms"], "memory-mib": defaults()["memory-mib"], warm: 0, instances: null, "keep-ms": null, concurrency: 1 });
 
 /** The note on moving `route` to the free host `to`. */
 function renamed(route, to) {
@@ -205,20 +205,20 @@ function componentCell(route) {
 function sandboxCell({ sandbox }) {
   const parts = sandbox.wasi.map((cap) => h("span", { class: "tag", title: CAP_HINTS[cap] ?? null }, cap));
   const limit = (text) => h("span", { class: "route__limit" }, text);
-  if (sandbox.budget_ms !== defaults().budget_ms) {
-    parts.push(limit(`budget ${formatMs(sandbox.budget_ms)}`));
+  if (sandbox["budget-ms"] !== defaults()["budget-ms"]) {
+    parts.push(limit(`budget ${formatMs(sandbox["budget-ms"])}`));
   }
-  if (sandbox.memory_mib !== defaults().memory_mib) {
-    parts.push(limit(`memory ${sandbox.memory_mib} MiB`));
+  if (sandbox["memory-mib"] !== defaults()["memory-mib"]) {
+    parts.push(limit(`memory ${sandbox["memory-mib"]} MiB`));
   }
-  if (sandbox.pool > 0) {
-    parts.push(limit(`pool ${sandbox.pool}`));
+  if (sandbox.warm > 0) {
+    parts.push(limit(`warm ${sandbox.warm}`));
   }
   if (sandbox.instances !== null && sandbox.instances !== undefined) {
     parts.push(limit(`≤ ${sandbox.instances} instance${sandbox.instances === 1 ? "" : "s"}`));
   }
-  if (sandbox.keep_ms !== null && sandbox.keep_ms !== undefined) {
-    parts.push(limit(`keep ${formatMs(sandbox.keep_ms)}`));
+  if (sandbox["keep-ms"] !== null && sandbox["keep-ms"] !== undefined) {
+    parts.push(limit(`keep ${formatMs(sandbox["keep-ms"])}`));
   }
   if ((sandbox.concurrency ?? 1) !== 1) {
     parts.push(limit(`${sandbox.concurrency} at once`));

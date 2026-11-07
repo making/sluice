@@ -25,7 +25,7 @@
 //! DELETE /api/disks/<name>?owner=<owner>        removes the disk of an app that was
 //! ```
 //!
-//! The options are the `--vm` route's (`mode`, `vcpus`, `mem`, `warm`, `vms`,
+//! The options are the `--vm` route's (`mode`, `vcpus`, `memory-mib`, `warm`, `instances`,
 //! `egress`, ...), all of them: an option left out takes its default. The
 //! image is received to the console's directory as it comes, hashed on the
 //! way (images run to hundreds of MiB), and kept under its digest. An app's
@@ -216,9 +216,9 @@ impl Console {
                     },
                     options: spec.options().into_iter().collect(),
                     mode: spec.mode.name(),
-                    mem_mib: spec.vm.mem_mib,
+                    memory_mib: spec.vm.memory_mib,
                     vcpus: spec.vm.vcpus,
-                    vms: VmsView {
+                    instances: InstancesView {
                         alive: vms.alive,
                         warm: vms.warm,
                         kept: vms.kept,
@@ -237,7 +237,7 @@ impl Console {
                 }
             })
             .collect();
-        let (vms, memory) = self.capacity.usage();
+        let (instances, memory) = self.capacity.usage();
         Listing {
             revision: status.revision,
             generation: table.generation(),
@@ -249,9 +249,9 @@ impl Console {
             runtime: RUNTIME,
             jailed: self.jailed,
             budget: BudgetView {
-                max_vms: self.capacity.max_vms(),
-                max_memory_mib: self.capacity.max_memory(),
-                vms,
+                max_instances: self.capacity.max_instances(),
+                max_memory_mib: self.capacity.max_memory_mib(),
+                instances,
                 memory_mib: memory,
             },
             reload_failure: status.failure_view(),
@@ -645,7 +645,7 @@ fn sandbox_view(spec: &RouteSpec) -> Map<String, Value> {
     let mut sandbox = Map::new();
     sandbox.insert("mode".into(), spec.mode.name().into());
     sandbox.insert("vcpus".into(), spec.vm.vcpus.into());
-    sandbox.insert("mem".into(), spec.vm.mem_mib.into());
+    sandbox.insert("memory-mib".into(), spec.vm.memory_mib.into());
     for (key, value) in spec.options() {
         let value = match key {
             "mode" => continue,
@@ -777,10 +777,11 @@ struct Listing {
 /// The VMs' budget and what of it is taken.
 #[derive(Serialize)]
 struct BudgetView {
-    max_vms: usize,
+    max_instances: usize,
     /// None: no memory budget.
     max_memory_mib: Option<u64>,
-    vms: usize,
+    /// The VMs alive over every route.
+    instances: usize,
     memory_mib: u64,
 }
 
@@ -799,9 +800,10 @@ struct RouteView {
     /// The options set to other than their defaults, as a PATCH takes them.
     options: BTreeMap<&'static str, String>,
     mode: &'static str,
-    mem_mib: u32,
+    memory_mib: u32,
     vcpus: u32,
-    vms: VmsView,
+    /// Its VMs, as the budget counts them.
+    instances: InstancesView,
     /// Cloned modes: the template's snapshot.
     snapshot: Option<SnapshotView>,
 }
@@ -817,7 +819,7 @@ struct RootfsView {
 }
 
 #[derive(Serialize)]
-struct VmsView {
+struct InstancesView {
     alive: usize,
     warm: usize,
     kept: usize,

@@ -30,19 +30,20 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
                                   route alone without --console whatever the host, an
                                   unknown host answered 404
   --vm <host>=<rootfs>[?<opts>]   a route served by Firecracker microVMs booted from the
-                                  rootfs; repeatable. mode=boot (default: vms=N VMs, 1, each
-                                  booted, none restored, each serving many connections),
-                                  mode=per-connection (a VM cloned from
+                                  rootfs; repeatable. mode=boot (default: instances=N VMs,
+                                  1, each booted, none restored, each serving many
+                                  connections), mode=per-connection (a VM cloned from
                                   a snapshot per connection; warm=N kept restored ahead,
-                                  prime=N GET / sent before the snapshot, vms=N the
+                                  prime=N GET / sent before the snapshot, instances=N the
                                   route's VMs at most, wait-ms=N a connection may wait for
                                   room for its VM, 10000), mode=reuse (as per-connection, a
                                   clone serving the next connection until kept unused for
                                   keep-ms=N (60000), uses=N connections, lifetime-ms=N) or
-                                  mode=pool (vms=N clones each serving many connections,
-                                  warm=N kept (vms), grown by one while each holds conns=N
-                                  (16), one beyond warm idle keep-ms killed), vcpus=N (1),
-                                  mem=MiB (128), port=N (the guest's vsock port, 8080),
+                                  mode=pool (instances=N clones each serving many
+                                  connections, warm=N kept (instances), grown by one while
+                                  each holds concurrency=N (16), one beyond warm idle
+                                  keep-ms killed), vcpus=N (1), memory-mib=N (128),
+                                  port=N (the guest's vsock port, 8080),
                                   boot-ms=N a cold-booted guest may take to listen (10000),
                                   per-client=N a client address's connections at once,
                                   idle-ms=N a connection may relay no byte, cpu=N (jail
@@ -67,10 +68,10 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
   --insecure                      skip the verification of a grpcs:// server
   --max-connections <n>           connections open at once (default 256): the tunnel's,
                                   and --listen's apart
-  --max-vms <n>                   VMs alive at once over every route: booted, warm, in use,
+  --max-instances <n>             VMs alive at once over every route: booted, warm, in use,
                                   templates (default 64)
-  --max-memory <MiB>              their guest memory (mem) at most (default none: --max-vms
-                                  x the largest mem bounds it)
+  --max-memory-mib <MiB>          their guest memory (memory-mib) at most (default none:
+                                  --max-instances x the largest memory-mib bounds it)
   --workers <n>                   threads relaying the connections, a node's tunnel stream
                                   and its connections on one (default 4, at most the CPUs)
   --tunnel-stall-timeout <secs>   give a stream up once its frames wait that long untaken
@@ -119,8 +120,8 @@ Each option but --vm also reads SLUICE_WICKET_RUNTIME_FIRECRACKER_<NAME> from th
 SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN; another variable of that prefix (but those of the
 serial console and the trace) is refused.";
 
-/// Default of `--max-vms`.
-pub const DEFAULT_MAX_VMS: usize = 64;
+/// Default of `--max-instances`.
+pub const DEFAULT_MAX_INSTANCES: usize = 64;
 
 /// Default of `--workers`, at most the CPUs: a worker per node stream of a small
 /// cluster, and a few for `--listen`'s and the egress's connections (more cost more
@@ -148,9 +149,9 @@ pub struct Settings {
     pub max_connections: usize,
     pub stall_timeout: Duration,
     pub drain_grace: Duration,
-    pub max_vms: usize,
+    pub max_instances: usize,
     /// MiB; None = no memory budget.
-    pub max_memory: Option<u64>,
+    pub max_memory_mib: Option<u64>,
     /// The relay workers (`sluice_wicket_tunnel::workers`).
     pub workers: usize,
     /// How often the routes' files are polled; zero = SIGHUP only.
@@ -196,8 +197,8 @@ const VALUED: &[&str] = &[
     "client-id",
     "ca-cert",
     "max-connections",
-    "max-vms",
-    "max-memory",
+    "max-instances",
+    "max-memory-mib",
     "workers",
     "tunnel-stall-timeout",
     "drain-grace",
@@ -355,9 +356,9 @@ pub fn parse(
         file.and_then(|file| file.max_connections),
     )?
     .map_or(DEFAULT_MAX_CONNECTIONS, |max| max as usize);
-    let max_vms = positive("max-vms", file.and_then(|file| file.max_vms))?
-        .map_or(DEFAULT_MAX_VMS, |max| max as usize);
-    let max_memory = positive("max-memory", file.and_then(|file| file.max_memory))?;
+    let max_instances = positive("max-instances", file.and_then(|file| file.max_instances))?
+        .map_or(DEFAULT_MAX_INSTANCES, |max| max as usize);
+    let max_memory_mib = positive("max-memory-mib", file.and_then(|file| file.max_memory_mib))?;
     let workers = positive("workers", file.and_then(|file| file.workers))?.map_or_else(
         || {
             std::thread::available_parallelism()
@@ -488,8 +489,8 @@ pub fn parse(
             file.and_then(|file| file.drain_grace.as_ref()),
             DEFAULT_DRAIN_GRACE,
         )?,
-        max_vms,
-        max_memory,
+        max_instances,
+        max_memory_mib,
         workers,
         watch_interval: seconds(
             "watch-interval",
@@ -715,8 +716,8 @@ pub struct File {
     state_dir: Option<PathBuf>,
     guest: Option<PathBuf>,
     max_connections: Option<u64>,
-    max_vms: Option<u64>,
-    max_memory: Option<u64>,
+    max_instances: Option<u64>,
+    max_memory_mib: Option<u64>,
     workers: Option<u64>,
     tunnel_stall_timeout: Option<Scalar>,
     drain_grace: Option<Scalar>,
@@ -775,17 +776,17 @@ pub(crate) struct FileRoute {
     pub(crate) deployed: Option<String>,
     mode: Option<String>,
     vcpus: Option<u32>,
-    mem: Option<u32>,
+    memory_mib: Option<u32>,
     port: Option<u32>,
     boot_ms: Option<u32>,
     warm: Option<u32>,
     prime: Option<u32>,
-    vms: Option<u32>,
+    instances: Option<u32>,
     wait_ms: Option<u32>,
     keep_ms: Option<u32>,
     uses: Option<u32>,
     lifetime_ms: Option<u32>,
-    conns: Option<u32>,
+    concurrency: Option<u32>,
     cpu: Option<u32>,
     per_client: Option<u32>,
     idle_ms: Option<u32>,
@@ -799,18 +800,18 @@ impl FileRoute {
     pub(crate) const KEYS: [&'static str; 19] = [
         "mode",
         "vcpus",
-        "mem",
+        "memory-mib",
         "cpu",
         "port",
         "boot-ms",
         "warm",
         "prime",
-        "vms",
+        "instances",
         "wait-ms",
         "keep-ms",
         "uses",
         "lifetime-ms",
-        "conns",
+        "concurrency",
         "per-client",
         "idle-ms",
         "egress",
@@ -823,18 +824,18 @@ impl FileRoute {
     pub(crate) fn options(&self) -> Vec<(&'static str, String)> {
         let numbers = [
             ("vcpus", self.vcpus),
-            ("mem", self.mem),
+            ("memory-mib", self.memory_mib),
             ("cpu", self.cpu),
             ("port", self.port),
             ("boot-ms", self.boot_ms),
             ("warm", self.warm),
             ("prime", self.prime),
-            ("vms", self.vms),
+            ("instances", self.instances),
             ("wait-ms", self.wait_ms),
             ("keep-ms", self.keep_ms),
             ("uses", self.uses),
             ("lifetime-ms", self.lifetime_ms),
-            ("conns", self.conns),
+            ("concurrency", self.concurrency),
             ("per-client", self.per_client),
             ("idle-ms", self.idle_ms),
         ];
@@ -923,7 +924,7 @@ mod tests {
         let config = dir.join("wicket.yaml");
         std::fs::write(
             &config,
-            "server: grpc://file:8001\ntoken: from-file\nkernel: vmlinux\nmax-vms: 8\nworkers: 2\n\
+            "server: grpc://file:8001\ntoken: from-file\nkernel: vmlinux\nmax-instances: 8\nworkers: 2\n\
              drain-grace: 5s\nflume: grpc://file:8002\nflume-token: from-file\n\
              flume-ca-cert: flume-ca.pem\njail-ids: 900000-900063\njail-user: from-file\n\
              console: 127.0.0.1:9090\nconsole-dir: kept\noidc-claim: [email=*]\n\
@@ -933,7 +934,7 @@ mod tests {
         )
         .unwrap();
         let vm = format!(
-            "b.local={}?mode=pool&vms=4&warm=1&conns=8&keep-ms=60000&boot-ms=90000",
+            "b.local={}?mode=pool&instances=4&warm=1&concurrency=8&keep-ms=60000&boot-ms=90000",
             rootfs.display()
         );
         let config_flag = config.display().to_string();
@@ -980,7 +981,7 @@ mod tests {
             ("127.0.0.1:9090", &dir.join("kept"), None),
             "its directory relative to the file"
         );
-        assert_eq!(settings.max_vms, 8);
+        assert_eq!(settings.max_instances, 8);
         assert_eq!(settings.workers, 2);
         assert_eq!(settings.drain_grace, Duration::from_secs(5));
         assert_eq!(settings.max_connections, DEFAULT_MAX_CONNECTIONS);
@@ -1000,10 +1001,10 @@ mod tests {
         assert_eq!(
             settings.specs[1].target(),
             format!(
-                "firecracker:{}?mode=pool&boot-ms=90000&warm=1&vms=4&conns=8",
+                "firecracker:{}?mode=pool&boot-ms=90000&warm=1&instances=4&concurrency=8",
                 rootfs.display()
             ),
-            "a pool's warm by default its vms"
+            "a pool's warm by default its instances"
         );
 
         let settings = run(
@@ -1012,7 +1013,7 @@ mod tests {
                 &config_flag,
                 "--token",
                 "flag",
-                "--max-vms=4",
+                "--max-instances=4",
                 "--workers=3",
                 "--flume=grpcs://flag:8002",
                 "--flume-ca-cert",
@@ -1045,7 +1046,7 @@ mod tests {
             "the flags' rules add up, over the file's"
         );
         assert_eq!(settings.token, "flag");
-        assert_eq!(settings.max_vms, 4);
+        assert_eq!(settings.max_instances, 4);
         assert_eq!(settings.workers, 3);
         assert_eq!(
             settings.jail,
@@ -1106,7 +1107,7 @@ mod tests {
             ),
             (
                 vec!["--server", "s", "--kernel", "k", "--vm", &unsized_pool],
-                "mode=pool needs vms",
+                "mode=pool needs instances",
             ),
             (
                 vec!["--server", "s", "--kernel", "k", "--vm", &cpu],

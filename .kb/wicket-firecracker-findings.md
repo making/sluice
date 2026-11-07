@@ -21,7 +21,7 @@ Measured on a 64-core x86_64 host, through a sluice server on the same host, wit
 | clones reused, sample guest | - | 15,979 | 8,918 (1.8ms) |
 | clones reused, CNB Go | - | 12,587 | 8,649 (1.8ms) |
 | pool of 4 VMs of 1 vCPU, sample guest | - | 16,552 | 7,493 (2.1ms) |
-| pool grown from 1 VM to 4 (`warm=1&conns=4`), sample guest | - | 17,648 | 7,880 (2.0ms) |
+| pool grown from 1 VM to 4 (`warm=1&concurrency=4`), sample guest | - | 17,648 | 7,880 (2.0ms) |
 | pool of 4 VMs, CNB Go | - | 16,729 | 7,497 (2.1ms) |
 
 - **A reused clone serves new connections at 5.7 times a fresh one's rate**: 8,918 new
@@ -169,10 +169,10 @@ New connections per mode. The rates are the sample guest's through the server,
 
 ## Pools against one VM
 
-N VMs of 1 vCPU (`mode=pool&vms=N`) against one VM of N, the same session, keep-alive
+N VMs of 1 vCPU (`mode=pool&instances=N`) against one VM of N, the same session, keep-alive
 req/s, through the server (`oha -c 16`, and `--disable-keepalive`) and through `--listen`
 (no server, c=16 and c=64); the VMs' memory after a load is their private pages, a pool's
-plus its snapshot on the tmpfs (128 MiB, `mem`):
+plus its snapshot on the tmpfs (128 MiB, `memory-mib`):
 
 | | server, keep-alive | server, new connection | `--listen` c=16 | `--listen` c=64 | memory |
 |---|---|---|---|---|---|
@@ -200,7 +200,7 @@ plus its snapshot on the tmpfs (128 MiB, `mem`):
   idles between requests and is woken for each, a request's latency the sum. New
   connections end at the wicket's worker relaying the node's stream (100% at 9k/s).
 - **A pool costs its snapshot**: its clones share the snapshot's pages, 3 MiB each of their
-  own (sample) or 9-10 (Go), and the snapshot was then the whole guest memory (`mem`) on the
+  own (sample) or 9-10 (Go), and the snapshot was then the whole guest memory (`memory-mib`) on the
   tmpfs, where one VM holds the pages its guest touched: 140 MiB for a pool of 4 against
   56 for one VM of 4 vCPUs (sample). It now holds what its guest wrote
   ([below](#a-snapshots-memory)), the table's snapshots at their `Full` size.
@@ -212,16 +212,16 @@ plus its snapshot on the tmpfs (128 MiB, `mem`):
 - **A pool's connections spread when they come, not after**: a keep-alive connection stays
   on its VM, so connections waiting for a VM being started take it as it comes, rather than
   all taking the VM first up: 8 keep-alive connections at once on an empty pool
-  (`warm=0&conns=1&vms=4`, `--listen`) were served at 9.0k req/s by the first VM, the
+  (`warm=0&concurrency=1&instances=4`, `--listen`) were served at 9.0k req/s by the first VM, the
   other three idling out; spread, 19.8-20.9k.
 
 ## A snapshot's memory
 
-A `Full` snapshot writes all of `mem`. A `Diff` of a VM booted with `track_dirty_pages` writes what
+A `Full` snapshot writes all of `memory-mib`. A `Diff` of a VM booted with `track_dirty_pages` writes what
 its guest wrote, the rest holes of a sparse file reading as the zeros that memory was, and resumes
 alone ("diff snapshots of booted VMs ... are immediately resumable", Firecracker's
 `snapshot-support.md`, which keeps Diff a developer preview; v1.17.0, the image's). The clones run
-untracked. `mem=1024`, one vCPU, the debug build, `--listen`, `oha -c 16` for 20,000 requests (Go and
+untracked. `memory-mib=1024`, one vCPU, the debug build, `--listen`, `oha -c 16` for 20,000 requests (Go and
 the JVM 40,000), on the 64-core host: the first answer from the wicket's start; memory after the load
 as a VM's PSS, plus the snapshot on the tmpfs (`du`).
 
@@ -238,11 +238,11 @@ as a VM's PSS, plus the snapshot on the tmpfs (`du`).
 | JVM, pool of one, `Diff` | 2,904ms | 130 + 195 MiB | 5.9k |
 | JVM, pool of 2, `Diff` | 2,959ms | 2 x 111 + 213 MiB | 6.9k |
 
-- **What it holds grows with `mem` by the guest's own books** (its `struct page`s): 69 MiB at 1 GiB,
+- **What it holds grows with `memory-mib` by the guest's own books** (its `struct page`s): 69 MiB at 1 GiB,
   188 at 4, 407 at 16 (the sample guest). It takes 70-370ms at those sizes where `Full` takes 700ms
   at 1 GiB, and restores past the 3 GiB of the MMIO gap
 - **Its holes fill as clones touch them**: shmem gives a fault on a hole a page of the file, then a
-  private copy for a write: 81 to 86 MiB (Go), 176 to 195 (the JVM) over these loads. `mem` at most,
+  private copy for a write: 81 to 86 MiB (Go), 176 to 195 (the JVM) over these loads. `memory-mib` at most,
   what `Full` takes from the start
 - **What a clone writes is there twice**, in the file and privately: the difference of a pool of one
   from a booted VM, +18 MiB (sample), +31 (Go), +124 (the JVM)
@@ -272,7 +272,7 @@ as a VM's PSS, plus the snapshot on the tmpfs (`du`).
   VMs, each booted ([below](#booted-vms-against-a-pool)). Replacing one takes a boot long, a clone's
   83-89ms (`/exit` to the answer, polled)
 - **The VMs past the limit are the highest indices**, by count: a pool of `warm=0` may hold the indices
-  0 and 2 at `vms=2`, both within it. By index, the VM of 2 would go while room for another one is
+  0 and 2 at `instances=2`, both within it. By index, the VM of 2 would go while room for another one is
   taken until it did, and a pool holding only it would serve none
 - **A restore failing at `warm=0` is tried again**, with the wait of a VM going down (`route::Backoff`:
   1s, 2s, 4s up to 60s, anew after a success), a warm clone's one at a time in room no VM waits for,
@@ -286,7 +286,7 @@ as a VM's PSS, plus the snapshot on the tmpfs (`du`).
 
 ## Booted VMs against a pool
 
-`mode=boot&vms=2` and `mode=pool&vms=2` on one wicket, the sample guest at 1 GiB, 1 vCPU each, release
+`mode=boot&instances=2` and `mode=pool&instances=2` on one wicket, the sample guest at 1 GiB, 1 vCPU each, release
 build, through `--listen` (no server), `oha` for 5s, memory after that load:
 
 | | first VM up | a VM's PSS | snapshot | keep-alive c=16 | new connections c=16 | a VM killed to all up | again within 60s |
@@ -395,7 +395,7 @@ through the image, and a sluice server on the Mac serving a booted VM and clones
   tree's cache nodes, `CLIDR_EL1`), and a restore its CPU manufacturer check (`MIDR_EL1`,
   a warning on a mismatch). The jail's copy keeps a jailed VM's CPU an unjailed one's.
 - **A `Diff` snapshot holds what the guest wrote, and restores as it was**: the sample guest in a
-  pool of one, 53 MiB of a `mem=1024` file, 180 of a `mem=4096`, clones serving on (2,000 requests,
+  pool of one, 53 MiB of a `memory-mib=1024` file, 180 of a `memory-mib=4096`, clones serving on (2,000 requests,
   the file 53 MiB after them). A Python guest writing a heap of 100 or 300 MiB before the snapshot:
   a clone's heap hashes as the same program's under Docker, a mapping it never touched reads as
   zeros. The file holds what the guest freed too: 381 and 987 MiB, the heap's temporary copies.
@@ -507,7 +507,7 @@ Container memory, measured:
 | VM per connection, CNB Java, prime=200, warm=16 | 602 MiB (512 snapshot); 694 MiB at start, the template beside its snapshot |
 | the same, 48 keep-alive connections at 17k req/s | 3,277 MiB peak: about 56 MiB per busy JVM clone |
 
-An idle clone costs its dirty pages (1-4 MiB here), a busy one up to its `mem`.
+An idle clone costs its dirty pages (1-4 MiB here), a busy one up to its `memory-mib`.
 
 ## Through the Docker image
 

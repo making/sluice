@@ -37,16 +37,17 @@ pub struct Wicket {
     pub owner: String,
 }
 
-/// The body of an app's PUT, and an app as listed.
+/// The body of an app's PUT, and an app as listed: `S` its sandbox, as a wicket of a runtime has
+/// it ([`Sandbox`]), or as listed before the listing's runtime tells which.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct AppBody {
+pub struct AppBody<S = Sandbox> {
     pub owner: String,
     pub hosts: Vec<String>,
     pub component: ComponentRef,
     /// A static site's files, read-only at `/` for its component.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<FilesRef>,
-    pub sandbox: Sandbox,
+    pub sandbox: S,
     /// Opaque to the wicket, listed as put: the snapshot's
     /// (`crate::env::tag`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,63 +65,132 @@ pub struct FilesRef {
     pub sha256: String,
 }
 
-/// The sandbox: the route options in JSON, as the wicket runs apps: the `--wasm`
-/// options, the keyvalue map and the env; or the `--vm` options and the env. A key left
-/// out takes the wicket's default; a listing names every one the wicket has, the env by
-/// the names only.
+/// The sandbox: the route options in JSON, named as the wicket's route options are, as the
+/// wicket of each runtime runs apps. A key left out takes the wicket's default; a listing names
+/// the keys as [`WasmSandbox`] and [`VmSandbox`] say, the env by the names only.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum Sandbox {
+    Wasm(WasmSandbox),
+    Vm(VmSandbox),
+}
+
+/// A wasm wicket's: the `--wasm` options, the keyvalue map and the env. Listed, every key is
+/// named but `instances` and `keep-ms`, unset.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
-pub struct Sandbox {
+#[serde(rename_all = "kebab-case")]
+pub struct WasmSandbox {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wasi: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_mib: Option<u64>,
+    /// The instances kept warm.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pool: Option<u64>,
+    pub warm: Option<u64>,
+    /// The instances alive at once at most.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instances: Option<u64>,
-    /// A wasm wicket's: how long a unit beyond `pool` serving nothing is kept.
-    #[serde(rename = "keep_ms", skip_serializing_if = "Option::is_none")]
-    pub wasm_keep_ms: Option<u64>,
-    /// A wasm wicket's: the requests an instance (a store) takes at once.
+    /// How long an instance beyond `warm` serving nothing is kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_ms: Option<u64>,
+    /// The requests an instance (a store) takes at once.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub keyvalue: BTreeMap<String, String>,
-    /// A Firecracker wicket's: how a connection gets its VM.
+    /// Put, never read back: the app's tag tells what the wicket serves.
+    #[serde(skip_deserializing, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+
+/// A Firecracker wicket's: the `--vm` options and the env. Listed, `mode` and `memory-mib` are
+/// named, the rest away from their defaults.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct VmSandbox {
+    /// How a connection gets its VM.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
-    /// A Firecracker wicket's: a VM's memory in MiB.
+    /// A VM's memory in MiB.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mem: Option<u64>,
-    /// A Firecracker wicket's: its pool's VMs.
+    pub memory_mib: Option<u64>,
+    /// The VMs alive at once at most: a pool's size, the VMs booted.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub vms: Option<u64>,
-    /// A Firecracker wicket's: VMs kept ahead of the connections.
+    pub instances: Option<u64>,
+    /// The VMs kept ahead of the connections.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warm: Option<u64>,
-    /// A Firecracker wicket's: how long a VM serving nothing is kept.
-    #[serde(rename = "keep-ms", skip_serializing_if = "Option::is_none")]
+    /// How long a VM serving nothing is kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_ms: Option<u64>,
-    /// A Firecracker wicket's: the connections a VM serves at most.
+    /// The connections a VM serves at most.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uses: Option<u64>,
-    /// A Firecracker wicket's: how long a VM serves at most.
-    #[serde(rename = "lifetime-ms", skip_serializing_if = "Option::is_none")]
-    pub lifetime_ms: Option<u64>,
-    /// A Firecracker wicket's: the connections a pool's VM holds before the pool grows.
+    /// How long a VM serves at most.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub conns: Option<u64>,
-    /// A Firecracker wicket's: how long a VM's process may take to listen.
-    #[serde(rename = "boot-ms", skip_serializing_if = "Option::is_none")]
+    pub lifetime_ms: Option<u64>,
+    /// The connections a pool's VM holds before the pool grows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u64>,
+    /// How long a VM's process may take to listen.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub boot_ms: Option<u64>,
-    /// A Firecracker wicket's: the destinations its VMs may connect to.
+    /// The destinations its VMs may connect to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<String>,
     /// Put, never read back: the app's tag tells what the wicket serves.
     #[serde(skip_deserializing, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+}
+
+impl AppBody<serde_json::Value> {
+    /// The app as a wicket of `runtime` lists it.
+    pub fn typed(self, runtime: Runtime) -> serde_json::Result<AppBody> {
+        Ok(AppBody {
+            owner: self.owner,
+            hosts: self.hosts,
+            component: self.component,
+            files: self.files,
+            sandbox: match runtime {
+                Runtime::Wasm => Sandbox::Wasm(serde_json::from_value(self.sandbox)?),
+                Runtime::Firecracker => Sandbox::Vm(serde_json::from_value(self.sandbox)?),
+            },
+            tag: self.tag,
+        })
+    }
+}
+
+#[cfg(test)]
+impl Sandbox {
+    pub fn wasm(&self) -> &WasmSandbox {
+        match self {
+            Sandbox::Wasm(sandbox) => sandbox,
+            Sandbox::Vm(_) => panic!("a VM's sandbox"),
+        }
+    }
+
+    pub fn wasm_mut(&mut self) -> &mut WasmSandbox {
+        match self {
+            Sandbox::Wasm(sandbox) => sandbox,
+            Sandbox::Vm(_) => panic!("a VM's sandbox"),
+        }
+    }
+
+    pub fn vm(&self) -> &VmSandbox {
+        match self {
+            Sandbox::Vm(sandbox) => sandbox,
+            Sandbox::Wasm(_) => panic!("a component's sandbox"),
+        }
+    }
+
+    pub fn vm_mut(&mut self) -> &mut VmSandbox {
+        match self {
+            Sandbox::Vm(sandbox) => sandbox,
+            Sandbox::Wasm(_) => panic!("a component's sandbox"),
+        }
+    }
 }
 
 /// What a wicket runs apps as.
@@ -152,8 +222,9 @@ pub struct MadeImage {
     pub bytes: u64,
 }
 
+/// The wicket's apps: `S` their sandboxes, as [`AppBody`]'s.
 #[derive(Deserialize, Clone, Debug)]
-pub struct Listing {
+pub struct Listing<S = Sandbox> {
     pub revision: u64,
     pub generation: u64,
     /// `firecracker`, or none from a wasm wicket.
@@ -164,15 +235,35 @@ pub struct Listing {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub keyvalue_stores: Vec<ListedStore>,
-    pub apps: Vec<ListedApp>,
+    pub apps: Vec<ListedApp<S>>,
 }
 
-impl Listing {
+impl<S> Listing<S> {
     pub fn runtime(&self) -> Runtime {
         match self.runtime.as_deref() {
             Some("firecracker") => Runtime::Firecracker,
             _ => Runtime::Wasm,
         }
+    }
+}
+
+impl Listing<serde_json::Value> {
+    /// The listing, its apps' sandboxes those of its runtime.
+    fn typed(self) -> serde_json::Result<Listing> {
+        let runtime = self.runtime();
+        let apps = self
+            .apps
+            .into_iter()
+            .map(|listed| listed.typed(runtime))
+            .collect::<serde_json::Result<_>>()?;
+        Ok(Listing {
+            revision: self.revision,
+            generation: self.generation,
+            runtime: self.runtime,
+            capabilities: self.capabilities,
+            keyvalue_stores: self.keyvalue_stores,
+            apps,
+        })
     }
 }
 
@@ -186,10 +277,10 @@ pub struct ListedStore {
 }
 
 #[derive(Deserialize, Clone, Debug)]
-pub struct ListedApp {
+pub struct ListedApp<S = Sandbox> {
     pub name: String,
     #[serde(flatten)]
-    pub app: AppBody,
+    pub app: AppBody<S>,
     pub deployed: String,
     /// The instances alive, lowest index first.
     pub alive: Vec<ListedInstance>,
@@ -200,6 +291,20 @@ pub struct ListedApp {
     /// their restores fail.
     #[serde(default)]
     pub down: Option<ListedDown>,
+}
+
+impl ListedApp<serde_json::Value> {
+    /// The app as a wicket of `runtime` lists it.
+    pub fn typed(self, runtime: Runtime) -> serde_json::Result<ListedApp> {
+        Ok(ListedApp {
+            name: self.name,
+            app: self.app.typed(runtime)?,
+            deployed: self.deployed,
+            alive: self.alive,
+            crashed: self.crashed,
+            down: self.down,
+        })
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -305,7 +410,9 @@ impl Wicket {
         if !status.is_success() {
             return Err(refused(status, &body));
         }
-        serde_json::from_slice(&body).map_err(|e| Failure::Unreachable(format!("the listing: {e}")))
+        serde_json::from_slice::<Listing<serde_json::Value>>(&body)
+            .and_then(Listing::typed)
+            .map_err(|e| Failure::Unreachable(format!("the listing: {e}")))
     }
 
     pub async fn put(&self, name: &str, app: &AppBody) -> Result<Edited, Failure> {

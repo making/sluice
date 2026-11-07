@@ -22,8 +22,9 @@
 //! ```
 //!
 //! The options are the `--wasm` route's (`budget-ms`, `concurrency`, `instances`, `keep-ms`,
-//! `memory-mib`, `pool`, `wasi`), the whole sandbox: an option left out takes
-//! its default. An app's sandbox is the same in JSON, with its keyvalue map
+//! `memory-mib`, `warm`, `wasi`), the whole sandbox: an option left out takes
+//! its default. An app's sandbox is the same in JSON, the options' names its keys (a
+//! sandbox in a listing too), with its keyvalue map
 //! and its env (the guest's environment variables, which may hold secrets:
 //! the listings name them, never their values; an app's `tag`, opaque to the
 //! console, tells its owner what it put); the apps' listing names what a
@@ -634,7 +635,9 @@ struct Listing {
     routes: Vec<RouteView>,
 }
 
+/// The defaults of a sandbox's limits, keyed as a sandbox is.
 #[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
 struct Defaults {
     budget_ms: u128,
     memory_mib: usize,
@@ -669,11 +672,12 @@ struct ComponentView {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
 struct SandboxView {
     wasi: Vec<&'static str>,
     budget_ms: u128,
     memory_mib: usize,
-    pool: usize,
+    warm: usize,
     instances: Option<usize>,
     keep_ms: Option<u128>,
     concurrency: usize,
@@ -688,7 +692,7 @@ impl SandboxView {
             wasi: sandbox.caps.names(),
             budget_ms: sandbox.limits.budget.as_millis(),
             memory_mib: sandbox.limits.memory >> 20,
-            pool: sandbox.pool,
+            warm: sandbox.warm,
             instances: sandbox.instances,
             keep_ms: sandbox.keep.map(|keep| keep.as_millis()),
             concurrency: sandbox.concurrency,
@@ -787,14 +791,14 @@ struct FilesRef {
 /// left out takes its default; a listing names every one but the env
 /// ([`AppSandboxView`]).
 #[derive(Deserialize, Serialize, Default)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct SandboxBody {
     #[serde(default)]
     wasi: Vec<String>,
     budget_ms: Option<u64>,
     memory_mib: Option<u64>,
     #[serde(default)]
-    pool: usize,
+    warm: usize,
     instances: Option<usize>,
     keep_ms: Option<u64>,
     concurrency: Option<usize>,
@@ -811,7 +815,7 @@ impl SandboxBody {
             wasi: sandbox.caps.names().into_iter().map(String::from).collect(),
             budget_ms: Some(sandbox.limits.budget.as_millis() as u64),
             memory_mib: Some((sandbox.limits.memory >> 20) as u64),
-            pool: sandbox.pool,
+            warm: sandbox.warm,
             instances: sandbox.instances,
             keep_ms: sandbox.keep.map(|keep| keep.as_millis() as u64),
             concurrency: Some(sandbox.concurrency),
@@ -824,21 +828,21 @@ impl SandboxBody {
     fn sandbox(self, stores: &Stores) -> Result<Sandbox, String> {
         let mut sandbox = Sandbox {
             caps: Caps::parse(&self.wasi.join(",")).map_err(|e| format!("sandbox.wasi: {e}"))?,
-            pool: self.pool,
+            warm: self.warm,
             ..Sandbox::default()
         };
         match self.budget_ms {
-            Some(0) => return Err("sandbox.budget_ms: must be at least 1".into()),
+            Some(0) => return Err("sandbox.budget-ms: must be at least 1".into()),
             Some(budget) => sandbox.limits.budget = Duration::from_millis(budget),
             None => {}
         }
         match self.memory_mib {
-            Some(0) => return Err("sandbox.memory_mib: must be at least 1".into()),
+            Some(0) => return Err("sandbox.memory-mib: must be at least 1".into()),
             Some(memory) => {
                 sandbox.limits.memory = memory
                     .checked_mul(1 << 20)
                     .and_then(|bytes| usize::try_from(bytes).ok())
-                    .ok_or_else(|| format!("sandbox.memory_mib: too large '{memory}'"))?;
+                    .ok_or_else(|| format!("sandbox.memory-mib: too large '{memory}'"))?;
             }
             None => {}
         }
@@ -847,7 +851,7 @@ impl SandboxBody {
             cap => cap,
         };
         sandbox.keep = match self.keep_ms {
-            Some(0) => return Err("sandbox.keep_ms: must be at least 1".into()),
+            Some(0) => return Err("sandbox.keep-ms: must be at least 1".into()),
             keep => keep.map(Duration::from_millis),
         };
         sandbox.concurrency = match self.concurrency {

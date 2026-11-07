@@ -172,18 +172,18 @@ request's instance: `budget-ms` is the request's wall-clock budget, covering
 the wait for an instance slot, instantiation, handler and response relay
 (exceeded -> 504, or a truncated body once streaming, or 503 while still
 waiting for a slot; defaults 10000) and `memory-mib` the per-instance linear
-memory cap in MiB (exceeded -> guest trap, 500; defaults 256). `pool=N`
+memory cap in MiB (exceeded -> guest trap, 500; defaults 256). `warm=N`
 keeps `N` warm instances per route (see [Instance pool](#instance-pool)).
 `instances=N` caps the instance slots the route holds at once, its pooled
 units included; unset, the route is bounded by `--max-instances` alone. A
 request finding the route at its cap waits for one of the route's slots within
 its budget (503 when it runs out, as above), holding no `--max-instances` slot
 meanwhile: requests waiting on a route's cap take no slot from the other
-routes. The cap reserves nothing: only `pool` does. It must be at least 1 and
-at least `pool` (a startup error otherwise); above `--max-instances` it is no
-error, that limit bounding it. With a cap equal to `pool`, a
+routes. The cap reserves nothing: only `warm` does. It must be at least 1 and
+at least `warm` (a startup error otherwise); above `--max-instances` it is no
+error, that limit bounding it. With a cap equal to `warm`, a
 request finding every unit busy waits for one instead of instantiating per
-request. `keep-ms=N` keeps the instance of a request beyond the pool as a spare unit,
+request. `keep-ms=N` keeps the instance of a request beyond `warm` as a spare unit,
 ended once it served none for N ms (see [Instance pool](#instance-pool)); unset, none is
 kept. `concurrency=N` (default 1) has an instance take up to N requests at once, `memory-mib`
 and `instances` then counting instances, not requests, and `budget-ms` staying each request's
@@ -195,10 +195,10 @@ wicket's to name. A literal `?` in a file path needs URL-escaping.
 
 ```text
 --wasm demo.local=hello.wasm?budget-ms=5000&memory-mib=64
---wasm demo.local=hello.wasm?pool=8
+--wasm demo.local=hello.wasm?warm=8
 --wasm batch.local=batch.wasm?instances=4
---wasm api.local=api.wasm?pool=1&instances=8&keep-ms=60000
---wasm cf.local=cf.wasm?pool=1&instances=4&concurrency=16
+--wasm api.local=api.wasm?warm=1&instances=8&keep-ms=60000
+--wasm cf.local=cf.wasm?warm=1&instances=4&concurrency=16
 --wasm site.local=site.wasm?files=public     # a static site (sluice-wicket-site)
 curl -H 'Host: demo.local' http://127.0.0.1:8000/hello
 ```
@@ -270,7 +270,7 @@ routes:
       wasi: [cli, inherit-network]
       budget: 250ms             # budget-ms
       memory: 64Mi              # memory-mib: a whole number of MiB (Ki/Mi/Gi, K/M/G)
-      pool: 2
+      warm: 2
       instances: 4
       keep: 60s                 # keep-ms
       concurrency: 4
@@ -325,7 +325,7 @@ stay as they were until a file changes again or SIGHUP. Otherwise
 - a component changed on disk serves the next request, of a connection already open
   too; a request in flight finishes on the one it started with. Its target is
   unchanged, so nothing is advertised again
-- a sandbox changed in `pool`, `instances`, `keep-ms` or `concurrency` alone keeps its handler, what runs on it
+- a sandbox changed in `warm`, `instances`, `keep-ms` or `concurrency` alone keeps its handler, what runs on it
   included ([instance pool](#instance-pool)): a route's goes on under the target naming the new
   numbers, an app's target names none of them (`adjusted`), so nothing is advertised
 - an added or removed host, or a changed sandbox (a new target; its env included), is
@@ -508,8 +508,8 @@ removed by its owner: the API of a controller keeping the desired state of its a
   "hosts": ["counter.localhost", "count.localhost"],
   "component": {"sha256": "0954dc11…e8", "name": "counter.wasm"},
   "files": {"sha256": "7a1c…04"},
-  "sandbox": {"wasi": ["keyvalue"], "budget_ms": 10000, "memory_mib": 256, "pool": 1,
-              "instances": null, "keep_ms": null, "concurrency": 1,
+  "sandbox": {"wasi": ["keyvalue"], "budget-ms": 10000, "memory-mib": 256, "warm": 1,
+              "instances": null, "keep-ms": null, "concurrency": 1,
               "keyvalue": {"": "local/cf/5d2f-guid"},
               "env": {"GREETING": "hello"}},
   "tag": "3f1c…9a"
@@ -523,8 +523,9 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
 {"generation":3,"message":"added count.localhost, counter.localhost"}
 ```
 
-- the sandbox is the route options of `--wasm` in JSON (`wasi` a list, `budget_ms`,
-  `memory_mib`, `pool`, `instances`, `keep_ms`, `concurrency`), each left out taking its default, and the keyvalue map:
+- the sandbox is the route options of `--wasm` in JSON, keyed by their names (`wasi` a list,
+  `budget-ms`, `memory-mib`, `warm`, `instances`, `keep-ms`, `concurrency`), each left out taking
+  its default, and the keyvalue map:
   with `keyvalue` granted, each identifier to `store/namespace` in full (an app has no one
   host to default the namespace to), the stores those of `keyvalue_stores`; and its `env`,
   `name -> value` as a config file route's (strings). The listings name the variables only
@@ -549,7 +550,7 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
   since the epoch, a replacement's its own
 - an app's routes share a handler, and never with another app (its target names it,
   `…/counter.wasm?app=counter&…`): its pool, its `instances` cap and its guests' output stay
-  its own. Its target names none of `pool`, `instances`, `keep_ms` and `concurrency`: a PUT changing them is
+  its own. Its target names none of `warm`, `instances`, `keep-ms` and `concurrency`: a PUT changing them is
   [no change of what runs](#instance-pool), and advertises nothing
 - answered as the console's edits, and 409 for a host another source, the page or another app
   routes, for another owner's app, and for a component or files no upload kept (`"missing":
@@ -613,8 +614,8 @@ cf-api (`cf logs`) see the wicket's lines:
   (wasmtime's task groups: a task the request's handler spawned is its too), a line written
   outside any (the guest's own background) the request started last
 - `instance` is the index of the instance writing the line or serving the request among
-  its route's instances alive: a pooled unit's `0..pool` (its replacement keeps it), a
-  per-request instance's or a spare unit's the lowest free from `pool` up. A request no instance served (no
+  its route's instances alive: a pooled unit's `0..warm` (its replacement keeps it), a
+  per-request instance's or a spare unit's the lowest free from `warm` up. A request no instance served (no
   route, none within its budget, its client gone while it waited) has none
 - `remote` is the last entry of the request's `X-Forwarded-For` (the node's peer), the
   client's `ip:port` on `--listen`; `durationMs` runs from the request's arrival to the end
@@ -774,7 +775,7 @@ table dirty and is retired, so a guest opens its buckets per request (cheap: a t
 
 ### Instance pool
 
-`pool=N` (opt-in, per route) keeps `N` warm `(Store, Service)` pairs. Each is
+`warm=N` (opt-in, per route) keeps `N` warm `(Store, Service)` pairs. Each is
 a detached task that runs `Store::run_concurrent` once (it consumes the
 store) with a job loop inside, so reuse cannot hand instances
 back: a unit serves `concurrency` requests at once (one by default) and the pool size times
@@ -783,7 +784,7 @@ flight first and of those the one idle longest, as
 the gorouter balances an app's instances; each has an index of `0..N`, kept by
 its replacement (the `instance` of its lines in the
 [live access log](#live-access-log)). A unit is offered once instantiated; a
-request beyond the stock, or on a route without `pool`, uses the per-request
+request beyond the stock, or on a route without `warm`, uses the per-request
 path above while an instance slot is free (and the route's `instances` cap
 allows), so the pool only ever improves the warm latency
 ([measured](../.kb/wicket-wasi-findings.md#a-pooled-units-latency)). Each unit holds an
@@ -794,21 +795,21 @@ every reload. With no slot free, a request waits for whichever comes first, a
 unit with room or a free slot.
 
 `keep-ms=N` lets the pool grow with the requests: a request finding no unit with room starts a
-spare one in place of its per-request instance (on its slot, an index from `pool` up, as a
-per-request instance's), which serves it and stays. `pool` is the floor (`0`: down to none):
+spare one in place of its per-request instance (on its slot, an index from `warm` up, as a
+per-request instance's), which serves it and stays. `warm` is the floor (`0`: down to none):
 the units take requests the pool's own first, then the spare that went idle last, so the
 other spares age out; one ends once it served none for N ms, and gives its
 slot up to a request or unit of any route waiting for one, an idle spare at once, a busy one
-after its request (a spare reserves none: the startup and reload check counts `pool` alone).
+after its request (a spare reserves none: the startup and reload check counts `warm` alone).
 A spare is never replaced. The route's `instances` cap bounds the spares with
 the rest; unset, `--max-instances` does. Worth it for a guest whose start costs more than a
 hello's: one writing an 8MiB heap answers in 1.6ms cold against 30us pooled
 ([measured](../.kb/wicket-wasi-findings.md#a-pooled-units-latency)).
 
-A reload changing `pool`, `instances`, `keep-ms` or `concurrency` keeps what runs: the units
-within the new `pool` serve on with what they hold, those missing start, those past it end, an
+A reload changing `warm`, `instances`, `keep-ms` or `concurrency` keeps what runs: the units
+within the new `warm` serve on with what they hold, those missing start, those past it end, an
 idle one at once and a busy one after its requests, as do the spares in the way of the new
-`pool`'s indices and those idle past the new `keep-ms` (every one without it). A request open
+`warm`'s indices and those idle past the new `keep-ms` (every one without it). A request open
 goes on past a lower cap, which bounds the next ones, and a unit past a lower `concurrency`
 takes none until below it.
 
@@ -846,7 +847,7 @@ spare one (as with `keep-ms`; without it, ended once it serves none), within the
   request`) as it stops
 - a trap ends every request of the store: a 500, or a truncated body
 - a store is one task: its requests share one core. On an M4 Max, keep-alive `GET /` to the
-  hello guest at 16 connections served 92k/s on 16 stores (`pool=16`), 89k/s on 4 x 4 and
+  hello guest at 16 connections served 92k/s on 16 stores (`warm=16`), 89k/s on 4 x 4 and
   40k/s on one store of 16, at the same ~60us of CPU a request; a guest waiting (5ms on a
   timer) served 2.1k/s either way, against 145/s one at a time
   ([measured](../.kb/wicket-wasi-findings.md#concurrency)). Spread a CPU-bound route over
@@ -899,11 +900,11 @@ Kubernetes, `terminationGracePeriodSeconds` (30s by default) bounds it the same 
   budgets stretch by the excess
 - routes without `instances` share the instance slots unbounded: busy ones can
   hold every slot not pooled and delay the others. A route keeps slots of its
-  own only through `pool`, or by capping the other routes below
+  own only through `warm`, or by capping the other routes below
   `--max-instances` together
 - guest async tasks live within `wit-bindgen`'s runtime; the `spawn`
   caveats about task lifetime apply
-- a reload changing a route's sandbox past `pool`, `instances`, `keep-ms` and `concurrency` gives it a new target with its
+- a reload changing a route's sandbox past `warm`, `instances`, `keep-ms` and `concurrency` gives it a new target with its
   own `instances` cap: until the old target's requests ended, both caps count, so the route may
   hold up to twice its cap
 - wasi:keyvalue is draft2, without the `watcher` export, and its calls block the guest's

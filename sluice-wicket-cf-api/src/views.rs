@@ -382,12 +382,16 @@ fn alive(listed: &ListedApp, instances: u64) -> Vec<Entry> {
 }
 
 /// The VMs a wicket keeps up of a route as listed, whatever its requests: of a pool `warm`, its
-/// default `vms`, booted `vms`, 1 going unlisted. None of the other modes, a clone coming and going
-/// with its connection, nor of a component, whose units the wicket lists as it has them.
+/// default `instances`, booted `instances`, 1 going unlisted. None of the other modes, a clone
+/// coming and going with its connection, nor of a component, whose units the wicket lists as it
+/// has them.
 fn kept(sandbox: &Sandbox) -> u64 {
-    match sandbox.mode.as_deref() {
-        Some("pool") => sandbox.warm.or(sandbox.vms).unwrap_or(0),
-        Some("boot") => sandbox.vms.unwrap_or(1),
+    let Sandbox::Vm(vm) = sandbox else {
+        return 0;
+    };
+    match vm.mode.as_deref() {
+        Some("pool") => vm.warm.or(vm.instances).unwrap_or(0),
+        Some("boot") => vm.instances.unwrap_or(1),
         _ => 0,
     }
 }
@@ -842,12 +846,13 @@ mod tests {
                 .iter()
                 .map(|index| json!({"index": index, "since": 1}))
                 .collect();
-            serde_json::from_value(json!({
+            let listed: ListedApp<Value> = serde_json::from_value(json!({
                 "name": "a", "owner": "cf", "hosts": [], "deployed": "now",
                 "component": {"sha256": "", "name": ""}, "sandbox": {},
                 "alive": alive, "down": down,
             }))
-            .unwrap()
+            .unwrap();
+            listed.typed(Runtime::Wasm).unwrap()
         };
         let entries = |state: &State, listed: Option<&ListedApp>| {
             let app = state.app(&guid).unwrap();
@@ -941,55 +946,55 @@ mod tests {
         let starting = |index| some(index, "STARTING");
         for (sandbox, alive, down, listed_as) in [
             (
-                json!({"mode": "pool", "vms": 2}),
+                json!({"mode": "pool", "instances": 2}),
                 json!([0]),
                 Value::Null,
                 vec![running(0), starting(1)],
             ),
             (
-                json!({"mode": "pool", "vms": 2}),
+                json!({"mode": "pool", "instances": 2}),
                 json!([1]),
                 Value::Null,
                 vec![starting(0), running(1)],
             ),
             (
-                json!({"mode": "pool", "vms": 2}),
+                json!({"mode": "pool", "instances": 2}),
                 json!([]),
                 Value::Null,
                 vec![starting(0), starting(1)],
             ),
             (
-                json!({"mode": "pool", "vms": 2}),
+                json!({"mode": "pool", "instances": 2}),
                 json!([0, 1]),
                 Value::Null,
                 vec![running(0), running(1)],
             ),
             (
-                json!({"mode": "pool", "vms": 2}),
+                json!({"mode": "pool", "instances": 2}),
                 json!([]),
                 exit_83.clone(),
                 vec![why(0)],
             ),
             (
-                json!({"mode": "pool", "vms": 2, "warm": 1}),
+                json!({"mode": "pool", "instances": 2, "warm": 1}),
                 json!([]),
                 Value::Null,
                 vec![starting(0)],
             ),
             (
-                json!({"mode": "pool", "vms": 2, "warm": 1}),
+                json!({"mode": "pool", "instances": 2, "warm": 1}),
                 json!([1]),
                 Value::Null,
                 vec![running(1)],
             ),
             (
-                json!({"mode": "pool", "vms": 2, "warm": 0}),
+                json!({"mode": "pool", "instances": 2, "warm": 0}),
                 json!([]),
                 Value::Null,
                 vec![],
             ),
             (
-                json!({"mode": "boot", "vms": 2}),
+                json!({"mode": "boot", "instances": 2}),
                 json!([0]),
                 Value::Null,
                 vec![running(0), starting(1)],
@@ -1001,14 +1006,14 @@ mod tests {
                 vec![starting(0)],
             ),
             (
-                json!({"mode": "reuse", "vms": 2, "warm": 1}),
+                json!({"mode": "reuse", "instances": 2, "warm": 1}),
                 json!([]),
                 Value::Null,
                 vec![],
             ),
         ] {
             let mut kept = listed(alive.clone(), down);
-            kept.app.sandbox = serde_json::from_value(sandbox.clone()).unwrap();
+            kept.app.sandbox = Sandbox::Vm(serde_json::from_value(sandbox.clone()).unwrap());
             assert_eq!(entries(&state, Some(&kept)), listed_as, "{sandbox} {alive}");
         }
 

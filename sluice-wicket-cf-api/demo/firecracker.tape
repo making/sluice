@@ -127,7 +127,7 @@ Type "cf app hello | tail -3"
 Enter
 Wait
 Sleep 2s
-Type `curl -s -H 'Authorization: Bearer wicket-secret' http://127.0.0.1:9090/api/apps | jq '.apps[] | select(.hosts[0] == "hello.localhost") | {hosts, mode: .sandbox.mode, vms: .sandbox.vms}'`
+Type `curl -s -H 'Authorization: Bearer wicket-secret' http://127.0.0.1:9090/api/apps | jq '.apps[] | select(.hosts[0] == "hello.localhost") | {hosts, mode: .sandbox.mode, instances: .sandbox.instances}'`
 Enter
 Wait
 Sleep 4s

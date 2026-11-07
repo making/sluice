@@ -2,7 +2,7 @@
 //!
 //! The tunnel connection's byte stream is served by hyper (http/1.1 vs h2c
 //! sniffed from the first bytes); every request is handled by a fresh
-//! instance of the guest component (or, with `pool=N`, a warm one, which with
+//! instance of the guest component (or, with `warm=N`, a warm one, which with
 //! `concurrency=N` takes several at once) through
 //! `wasmtime-wasi-http`'s p3 `Service.handle`. Instantiation is pre-linked
 //! (`InstancePre`) and bounded by per-route epoch budgets and memory caps,
@@ -417,7 +417,7 @@ pub struct Loaded {
     /// `instantiation_latency_reference`): ~60us full vs ~35us pre-linked
     /// (release profile, ~140us vs ~95us with instances allocated on demand)
     /// per instantiation, i.e. the warm path stays far below a
-    /// millisecond -- so instances are not pooled by default. `pool=N` opts a
+    /// millisecond -- so instances are not pooled by default. `warm=N` opts a
     /// route into `Pool`, which amortizes even that by keeping whole
     /// `(Store, Service)` units warm; pooling assumes stateless guests (see
     /// `Pool`).
@@ -625,14 +625,14 @@ impl Caps {
 pub struct Sandbox {
     pub limits: Limits,
     pub caps: Caps,
-    /// Warm `(Store, Service)` units kept for the route (see `Pool`); 0
+    /// Warm `(Store, Service)` units kept for the route (`warm`, see `Pool`); 0
     /// instantiates per request.
-    pub pool: usize,
+    pub warm: usize,
     /// The route's cap on the instance slots it holds at once, its pooled
     /// units included (`Handler::admit`); None leaves the route bounded by
     /// `Instances` alone.
     pub instances: Option<usize>,
-    /// How long a unit beyond `pool` is kept serving none (`keep-ms`): with it, a request
+    /// How long a unit beyond `warm` is kept serving none (`keep-ms`): with it, a request
     /// finding no idle unit starts one in place of a per-request instance (see `Pool`); None
     /// keeps none.
     pub keep: Option<std::time::Duration>,
@@ -658,7 +658,7 @@ impl Default for Sandbox {
         Self {
             limits: Limits::default(),
             caps: Caps::default(),
-            pool: 0,
+            warm: 0,
             instances: None,
             keep: None,
             concurrency: 1,
@@ -671,7 +671,7 @@ impl Default for Sandbox {
 
 impl Sandbox {
     /// Parses the route query
-    /// (`budget-ms=N&concurrency=N&instances=N&keep-ms=N&memory-mib=N&pool=N&wasi=cli,tcp`).
+    /// (`budget-ms=N&concurrency=N&instances=N&keep-ms=N&memory-mib=N&warm=N&wasi=cli,tcp`).
     pub fn parse(query: &str) -> Result<Sandbox, String> {
         let mut pairs = Vec::new();
         for pair in query.split('&').filter(|pair| !pair.is_empty()) {
@@ -697,8 +697,8 @@ impl Sandbox {
             };
             if key == "wasi" {
                 sandbox.caps = Caps::parse(value)?;
-            } else if key == "pool" {
-                sandbox.pool = count()?;
+            } else if key == "warm" {
+                sandbox.warm = count()?;
             } else if key == "instances" {
                 sandbox.instances = match count()? {
                     0 => return Err("instances: must be at least 1".into()),
@@ -718,7 +718,7 @@ impl Sandbox {
             } else if !sandbox.limits.set(key, value)? {
                 return Err(format!(
                     "unknown option '{key}' (budget-ms, concurrency, instances, keep-ms, \
-                     memory-mib, pool, wasi)"
+                     memory-mib, warm, wasi)"
                 ));
             }
         }
@@ -726,14 +726,14 @@ impl Sandbox {
         Ok(sandbox)
     }
 
-    /// Rejects a cap below the route's pool: every pooled unit holds one of
+    /// Rejects a cap below the route's `warm`: every pooled unit holds one of
     /// the route's slots for its lifetime.
     pub fn check(&self) -> Result<(), String> {
         match self.instances {
-            Some(cap) if cap < self.pool => Err(format!(
-                "instances={cap} is below pool={}: every pooled unit holds one of the \
+            Some(cap) if cap < self.warm => Err(format!(
+                "instances={cap} is below warm={}: every pooled unit holds one of the \
                  route's instance slots",
-                self.pool
+                self.warm
             )),
             _ => Ok(()),
         }
@@ -747,17 +747,17 @@ impl Sandbox {
         self.pairs(true).join("&")
     }
 
-    /// [`Sandbox::query`] without the counts (`pool`, `instances`, `keep-ms`, `concurrency`): an
+    /// [`Sandbox::query`] without the counts (`warm`, `instances`, `keep-ms`, `concurrency`): an
     /// app's, named by the app, which a change of those need not advertise ([`Handler::resize`]).
     pub fn query_of_app(&self) -> String {
         self.pairs(false).join("&")
     }
 
-    /// Whether `other` differs in the counts alone (`pool`, `instances`, `keep-ms`,
+    /// Whether `other` differs in the counts alone (`warm`, `instances`, `keep-ms`,
     /// `concurrency`): its handler can take it.
     pub fn same_instances(&self, other: &Sandbox) -> bool {
         let of = |sandbox: &Sandbox| Sandbox {
-            pool: 0,
+            warm: 0,
             instances: None,
             keep: None,
             concurrency: 1,
@@ -766,7 +766,7 @@ impl Sandbox {
         of(self) == of(other)
     }
 
-    /// The query's pairs, `counts` with `pool`, `instances`, `keep-ms` and `concurrency`.
+    /// The query's pairs, `counts` with `warm`, `instances`, `keep-ms` and `concurrency`.
     fn pairs(&self, counts: bool) -> Vec<String> {
         let defaults = Limits::default();
         let mut pairs = Vec::new();
@@ -806,8 +806,8 @@ impl Sandbox {
         if self.limits.memory != defaults.memory {
             pairs.push(format!("memory-mib={}", self.limits.memory >> 20));
         }
-        if self.pool > 0 && counts {
-            pairs.push(format!("pool={}", self.pool));
+        if self.warm > 0 && counts {
+            pairs.push(format!("warm={}", self.warm));
         }
         let caps = self.caps.names();
         if !caps.is_empty() {
@@ -2051,7 +2051,7 @@ impl Instances {
         self.waiting.load(Ordering::Relaxed) > 0
     }
 
-    /// Takes `pool`'s spare units into account from now on.
+    /// Takes `warm`'s spare units into account from now on.
     fn register(&self, pool: &Arc<Pool>) {
         let mut pools = self.pools.lock().unwrap();
         pools.retain(|pool| pool.strong_count() > 0);
@@ -2120,8 +2120,8 @@ enum Admission {
 
 /// Serves `request` on an instance of `handler`'s route, telling `admitted`
 /// the instance's index among the route's instances alive, as CF numbers an
-/// app's: a pooled unit's `0..pool`, kept by its replacement, a per-request
-/// instance's or a spare unit's the lowest free from `pool` up while its store
+/// app's: a pooled unit's `0..warm`, kept by its replacement, a per-request
+/// instance's or a spare unit's the lowest free from `warm` up while its store
 /// lives. Nothing is told for a request finding no instance within its budget
 /// (503). With `keep-ms`, a request finding no idle unit starts a spare one on
 /// its slot instead of an instance of its own.
@@ -2231,7 +2231,7 @@ async fn respond(
 /// A route's request handler: the component, the sandbox its instances run
 /// in, and the warm-instance pool built from both. The one source of a
 /// route's settings, so the cold and the pooled path cannot diverge. It takes
-/// another `pool`, `instances` and `keep-ms` as it runs ([`Handler::resize`]).
+/// another `warm`, `instances` and `keep-ms` as it runs ([`Handler::resize`]).
 pub struct Handler {
     loaded: Arc<Loaded>,
     sandbox: Sandbox,
@@ -2252,7 +2252,7 @@ pub struct Handler {
     cold: Arc<Indices>,
 }
 
-/// A sandbox's counts, `pool`, `instances`, `keep-ms` and `concurrency`: what a handler takes as
+/// A sandbox's counts, `warm`, `instances`, `keep-ms` and `concurrency`: what a handler takes as
 /// it runs.
 type Counts = (usize, Option<usize>, Option<std::time::Duration>, usize);
 
@@ -2295,7 +2295,7 @@ impl Handler {
             live,
             loaded,
             counts: Mutex::new((
-                sandbox.pool,
+                sandbox.warm,
                 sandbox.instances,
                 sandbox.keep,
                 sandbox.concurrency,
@@ -2317,7 +2317,7 @@ impl Handler {
     pub fn sandbox(&self) -> Sandbox {
         let (pool, instances, keep, concurrency) = *self.counts.lock().unwrap();
         Sandbox {
-            pool,
+            warm: pool,
             instances,
             keep,
             concurrency,
@@ -2325,15 +2325,15 @@ impl Handler {
         }
     }
 
-    /// Takes the counts of `sandbox` (`pool`, `instances`, `keep-ms`, `concurrency`) from now
-    /// on, what runs kept: whether they changed. Units are started up to `pool`; those past it
+    /// Takes the counts of `sandbox` (`warm`, `instances`, `keep-ms`, `concurrency`) from now
+    /// on, what runs kept: whether they changed. Units are started up to `warm`; those past it
     /// end, an idle one at once, a busy one after its requests, as do the spare units in the way
     /// of the new pool's indices and those idle longer than the new `keep-ms` (all of them
     /// without one); a request open goes on past a lower cap, whose slots go as they are freed,
     /// and a unit past a lower `concurrency` takes none until below it.
     pub fn resize(&self, sandbox: &Sandbox) -> bool {
         let counts = (
-            sandbox.pool,
+            sandbox.warm,
             sandbox.instances,
             sandbox.keep,
             sandbox.concurrency,
@@ -2513,7 +2513,7 @@ struct Job {
 /// route's cap, which counts the units), so the pool only ever improves the warm
 /// latency. The units take the requests in turn, the one with the fewest in
 /// flight first and of those the one idle longest, as the gorouter balances an
-/// app's instances, and each has an index of `0..pool` (see `respond`). A route
+/// app's instances, and each has an index of `0..warm` (see `respond`). A route
 /// without a pool has one of no unit.
 /// Measured on the hello guest (the ignored `load_comparison_reference`,
 /// sequential requests, release profile): ~250us cold vs ~130us pooled per
@@ -2522,7 +2522,7 @@ struct Job {
 ///
 /// With `keep-ms`, or a `concurrency` above 1, a request finding no unit with
 /// room starts a spare one in place of its per-request instance (`spare`), on
-/// its slot and an index from `pool` up: it serves the request, and takes others
+/// its slot and an index from `warm` up: it serves the request, and takes others
 /// as the pool's own do, after them: one of the pool's own with room first, else
 /// the spare that went idle last with room, so those idle longest age out. A
 /// spare unit ends once idle for `keep-ms` (`reap`; at once without it), or at
@@ -2639,7 +2639,7 @@ impl PoolState {
 }
 
 impl Pool {
-    /// Spawns `sandbox.pool` units, indices `0..pool`, each on a slot taken
+    /// Spawns `sandbox.warm` units, indices `0..warm`, each on a slot taken
     /// at once when one is free, else waiting for one. Each instantiates
     /// asynchronously and is offered once ready; until then requests take
     /// the per-request path.
@@ -2652,7 +2652,7 @@ impl Pool {
         route: Arc<tokio::sync::Semaphore>,
         cold: Arc<Indices>,
     ) -> Arc<Self> {
-        let target = sandbox.pool;
+        let target = sandbox.warm;
         let pool = Arc::new(Self {
             state: Mutex::new(PoolState {
                 offered: VecDeque::new(),
@@ -4699,7 +4699,7 @@ pub(crate) mod tests {
         let pooled = Handler::new(
             loaded,
             Sandbox {
-                pool: 2,
+                warm: 2,
                 ..Sandbox::default()
             },
             None,
@@ -5088,7 +5088,7 @@ pub(crate) mod tests {
         route(
             loaded.clone(),
             Sandbox {
-                pool: units,
+                warm: units,
                 ..sandbox
             },
         )
@@ -5241,7 +5241,7 @@ pub(crate) mod tests {
         let handler = Handler::new(
             hello().await,
             Sandbox {
-                pool: 1,
+                warm: 1,
                 ..Sandbox::default()
             },
             None,
@@ -5566,7 +5566,7 @@ pub(crate) mod tests {
         let handler = Handler::new(
             loaded,
             Sandbox {
-                pool: 1,
+                warm: 1,
                 ..Sandbox::default()
             },
             None,
@@ -6226,7 +6226,7 @@ pub(crate) mod tests {
             let mut sandbox = Sandbox::default();
             sandbox.limits.budget = budget;
             let (holder, waiter) = if pooled {
-                sandbox.pool = 1;
+                sandbox.warm = 1;
                 let handler = Handler::new(loaded.clone(), sandbox, None, &instances).unwrap();
                 restocked(&handler, 1).await;
                 (handler.clone(), handler)
@@ -6394,7 +6394,7 @@ pub(crate) mod tests {
         let handler = Handler::new(
             hello().await,
             Sandbox {
-                pool: 1,
+                warm: 1,
                 ..Sandbox::default()
             },
             None,
@@ -6437,7 +6437,7 @@ pub(crate) mod tests {
         let handler = Handler::new(
             hello().await,
             Sandbox {
-                pool: 1,
+                warm: 1,
                 limits: Limits {
                     memory: 1 << 20,
                     ..Limits::default()
@@ -6464,7 +6464,7 @@ pub(crate) mod tests {
         let loaded = hello().await;
         let instances = Instances::new(3);
         let sandbox = Sandbox {
-            pool: 2,
+            warm: 2,
             ..Sandbox::default()
         };
         let first = Handler::new(loaded.clone(), sandbox.clone(), None, &instances).unwrap();
@@ -6494,7 +6494,7 @@ pub(crate) mod tests {
         restocked(&handler, 2).await;
         assert_eq!(pool(&handler).spawned(), 2, "one more");
         let sandbox = handler.sandbox();
-        assert_eq!((sandbox.pool, sandbox.instances), (2, Some(3)));
+        assert_eq!((sandbox.warm, sandbox.instances), (2, Some(3)));
 
         // the units wait for the rest of their bodies
         let post = "POST / HTTP/1.1\r\nhost: t\r\ncontent-length: 4\r\nconnection: close\r\n\r\nab";
@@ -6584,10 +6584,10 @@ pub(crate) mod tests {
         drop((occupant, second));
     }
 
-    /// A sandbox of `pool`, `instances` and `keep-ms` alone, as a handler takes them.
+    /// A sandbox of `warm`, `instances` and `keep-ms` alone, as a handler takes them.
     fn counts(pool: usize, instances: Option<usize>, keep_ms: Option<u64>) -> Sandbox {
         Sandbox {
-            pool,
+            warm: pool,
             instances,
             keep: keep_ms.map(Duration::from_millis),
             ..Sandbox::default()
@@ -6603,7 +6603,7 @@ pub(crate) mod tests {
         let handler = Handler::new(
             hello().await,
             Sandbox {
-                pool: 2,
+                warm: 2,
                 ..Sandbox::default()
             },
             None,
@@ -6908,7 +6908,7 @@ pub(crate) mod tests {
         let instances = Instances::new(2);
         let mut sandbox = Sandbox::default();
         sandbox.limits.budget = budget;
-        sandbox.pool = usize::from(pooled);
+        sandbox.warm = usize::from(pooled);
         let labelled = Arc::new(Loaded {
             service_pre: loaded.service_pre.clone(),
             label: label.to_string(),
@@ -6964,7 +6964,7 @@ pub(crate) mod tests {
 
     // -- per-route cap ------------------------------------------------------
 
-    /// A route on `instances` capped at `cap` of the slots, keeping `pool`
+    /// A route on `instances` capped at `cap` of the slots, keeping `warm`
     /// units, with `budget` (the default when None).
     fn capped(
         loaded: &Arc<Loaded>,
@@ -6975,7 +6975,7 @@ pub(crate) mod tests {
     ) -> Arc<Handler> {
         let mut sandbox = Sandbox {
             instances: Some(cap),
-            pool,
+            warm: pool,
             ..Sandbox::default()
         };
         if let Some(budget) = budget {
@@ -7200,7 +7200,7 @@ pub(crate) mod tests {
     /// Asserts `handler`'s route slots and the process-wide ones free.
     async fn assert_route_slots_freed(handler: &Handler, instances: &Instances, what: &str) {
         eventually(what, Duration::from_secs(3), || {
-            handler.route_held() == handler.sandbox.pool && instances.held() == handler.sandbox.pool
+            handler.route_held() == handler.sandbox.warm && instances.held() == handler.sandbox.warm
         })
         .await;
     }
@@ -7242,7 +7242,7 @@ pub(crate) mod tests {
         let tiny = |pool| {
             let sandbox = Sandbox {
                 instances: Some(1),
-                pool,
+                warm: pool,
                 limits: Limits {
                     memory: 1 << 20,
                     ..Limits::default()
@@ -7321,16 +7321,16 @@ pub(crate) mod tests {
         let instances = Instances::new(2);
         let sandbox = Sandbox {
             instances: Some(1),
-            pool: 2,
+            warm: 2,
             ..Sandbox::default()
         };
         let error = match Handler::new(loaded.clone(), sandbox, None, &instances) {
-            Ok(_) => panic!("pool=2 fit a cap of 1"),
+            Ok(_) => panic!("warm=2 fit a cap of 1"),
             Err(error) => error,
         };
         assert_eq!(
             error,
-            "instances=1 is below pool=2: every pooled unit holds one of the route's \
+            "instances=1 is below warm=2: every pooled unit holds one of the route's \
              instance slots"
         );
         assert_eq!(instances.held(), 0, "the failed route took no slot");

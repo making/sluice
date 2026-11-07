@@ -82,7 +82,7 @@ Type "cf scale hello -i 2"
 Enter
 Wait
 Sleep 3s
-Type "curl -s -H 'Authorization: Bearer wicket-secret' http://127.0.0.1:9090/api/apps | jq '.apps[] | {hosts, component: .component.name, pool: .sandbox.pool}'"
+Type "curl -s -H 'Authorization: Bearer wicket-secret' http://127.0.0.1:9090/api/apps | jq '.apps[] | {hosts, component: .component.name, warm: .sandbox.warm}'"
 Enter
 Wait
 Sleep 4s

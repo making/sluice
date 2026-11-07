@@ -18,7 +18,7 @@ const MODE_HINTS = {
   boot: "VMs each booted, none restored, each serving many connections",
   "per-connection": "a clone of a snapshot per connection, killed when it ends",
   reuse: "a clone per connection at a time, kept for the next ones",
-  pool: "clones each serving many connections, grown up to vms",
+  pool: "clones each serving many connections, grown up to instances",
 };
 
 /**
@@ -27,18 +27,18 @@ const MODE_HINTS = {
  */
 const NUMBERS = [
   { key: "vcpus", group: "vm", label: "vCPUs", unit: "", fallback: 1, min: 1, modes: MODES },
-  { key: "mem", group: "vm", label: "Memory", unit: "MiB", fallback: 128, min: 1, modes: MODES },
+  { key: "memory-mib", group: "vm", label: "Memory", unit: "MiB", fallback: 128, min: 1, modes: MODES },
   { key: "port", group: "vm", label: "Port", unit: "vsock", fallback: 8080, min: 0, modes: MODES },
   { key: "boot-ms", group: "vm", label: "Boot", unit: "ms to listen", fallback: 10000, min: 1, modes: MODES },
   { key: "cpu", group: "vm", label: "CPU", unit: "% of one", fallback: null, min: 1, modes: MODES, jailed: true },
   { key: "warm", group: "clones", label: "Warm", unit: "ahead", fallback: 0, min: 0, modes: CLONED },
   { key: "prime", group: "clones", label: "Prime", unit: "GET /", fallback: 0, min: 0, modes: CLONED },
-  { key: "vms", group: "vm", label: "VMs", unit: "at most, boot: kept", fallback: null, min: 1, modes: MODES },
+  { key: "instances", group: "vm", label: "VMs", unit: "at most, boot: kept", fallback: null, min: 1, modes: MODES },
   { key: "wait-ms", group: "clones", label: "Wait", unit: "ms", fallback: 10000, min: 0, modes: CLONED },
   { key: "keep-ms", group: "clones", label: "Keep", unit: "ms", fallback: 60000, min: 1, modes: ["reuse", "pool"] },
   { key: "uses", group: "clones", label: "Uses", unit: "conns", fallback: null, min: 1, modes: ["reuse"] },
   { key: "lifetime-ms", group: "clones", label: "Lifetime", unit: "ms", fallback: null, min: 1, modes: ["reuse"] },
-  { key: "conns", group: "clones", label: "Conns", unit: "per VM", fallback: 16, min: 1, modes: ["pool"] },
+  { key: "concurrency", group: "clones", label: "Concurrency", unit: "conns per VM", fallback: 16, min: 1, modes: ["pool"] },
   { key: "per-client", group: "connections", label: "Per client", unit: "conns", fallback: null, min: 1, modes: MODES },
   { key: "idle-ms", group: "connections", label: "Idle", unit: "ms", fallback: null, min: 1, modes: MODES },
 ];
@@ -71,13 +71,13 @@ function optionsOf(route) {
 
 const defaultOptions = () => ({ mode: "boot", values: {} });
 
-/** The default of option `number` under `options` (warm: a pool's vms; vms: one VM booted). */
+/** The default of option `number` under `options` (warm: a pool's instances; instances: one VM booted). */
 function fallbackOf(number, options) {
-  if (number.key === "vms" && options.mode === "boot") {
+  if (number.key === "instances" && options.mode === "boot") {
     return 1;
   }
   if (number.key === "warm" && options.mode === "pool") {
-    return options.values.vms === undefined || options.values.vms === "" ? null : Number(options.values.vms);
+    return options.values.instances === undefined || options.values.instances === "" ? null : Number(options.values.instances);
   }
   return number.fallback;
 }
@@ -181,7 +181,7 @@ function optionFields(initial, onChange) {
       groupFields.get(group).hidden = shown === 0;
     }
     const warm = inputs.get("warm");
-    warm.placeholder = chosen === "pool" ? "vms" : "0";
+    warm.placeholder = chosen === "pool" ? "instances" : "0";
   };
   show();
   element.addEventListener("change", (event) => {
@@ -216,11 +216,11 @@ function optionFields(initial, onChange) {
         options.values[number.key] = String(value);
       }
       const { values } = options;
-      if (options.mode === "pool" && values.vms === undefined) {
-        fail(inputs.get("vms"), "A pool needs its VMs at most (vms): its size.");
+      if (options.mode === "pool" && values.instances === undefined) {
+        fail(inputs.get("instances"), "A pool needs its VMs at most (instances): its size.");
       }
-      if (values.vms !== undefined && values.warm !== undefined && Number(values.vms) < Number(values.warm)) {
-        fail(inputs.get("vms"), "VMs must be at least warm: the warm clones are among them.");
+      if (values.instances !== undefined && values.warm !== undefined && Number(values.instances) < Number(values.warm)) {
+        fail(inputs.get("instances"), "VMs must be at least warm: the warm clones are among them.");
       }
       const rules = egress.value.trim();
       if (rules !== "") {
@@ -264,10 +264,10 @@ function rootfsCell(route) {
 function modeCell(route) {
   const limit = (text, title = null) => h("span", { class: "route__limit", title }, text);
   const parts = [h("span", { class: "tag", title: MODE_HINTS[route.mode] ?? null }, route.mode)];
-  parts.push(limit(`${plural(route.vcpus, "vCPU")}, ${route.mem_mib} MiB`));
+  parts.push(limit(`${plural(route.vcpus, "vCPU")}, ${route.memory_mib} MiB`));
   for (const number of NUMBERS) {
     const value = route.options[number.key];
-    if (value === undefined || number.key === "vcpus" || number.key === "mem") {
+    if (value === undefined || number.key === "vcpus" || number.key === "memory-mib") {
       continue;
     }
     parts.push(limit(number.unit === "ms" ? `${number.key.replace(/-ms$/, "")} ${formatMs(Number(value))}` : `${number.key} ${value}`));
@@ -282,7 +282,7 @@ function modeCell(route) {
 
 /** What a route's VMs are: alive, then by mode, its connections, the template's snapshot. */
 function vmsView(route) {
-  const { vms, snapshot } = route;
+  const { instances: vms, snapshot } = route;
   const counts = [h("span", { class: "num", title: "its VMs alive, as the budget counts them" }, plural(vms.alive, "VM"))];
   if (route.mode === "boot" || route.mode === "pool") {
     counts.push(`${vms.pooled} ${route.mode === "boot" ? "up" : "pooled"}`);
@@ -300,7 +300,7 @@ function vmsView(route) {
     }
   }
   counts.push(plural(vms.connections, "connection"));
-  const lines = [h("span", { class: "route__meta", "data-testid": "vms" }, joined(counts))];
+  const lines = [h("span", { class: "route__meta", "data-testid": "instances" }, joined(counts))];
   if (vms.down) {
     lines.push(h("span", { class: "route__meta", title: "its VM starts again by itself" }, vms.down.why));
   }
@@ -318,15 +318,15 @@ function vmsView(route) {
 function budgetStatus(listing) {
   const { budget } = listing;
   const vms = field("budget-vms");
-  vms.textContent = `${budget.vms} / ${budget.max_vms}`;
-  vms.title = "VMs alive over every route (booted, warm, in use, kept, pooled, templates) / --max-vms";
+  vms.textContent = `${budget.instances} / ${budget.max_instances}`;
+  vms.title = "VMs alive over every route (booted, warm, in use, kept, pooled, templates) / --max-instances";
   const memory = field("budget-memory");
   memory.textContent = budget.max_memory_mib === null || budget.max_memory_mib === undefined
     ? `${budget.memory_mib} MiB`
     : `${budget.memory_mib} / ${budget.max_memory_mib} MiB`;
   memory.title = budget.max_memory_mib === null || budget.max_memory_mib === undefined
-    ? "their guest memory; no memory budget (--max-memory)"
-    : "their guest memory / --max-memory";
+    ? "their guest memory; no memory budget (--max-memory-mib)"
+    : "their guest memory / --max-memory-mib";
 }
 
 consolePage({
@@ -363,7 +363,7 @@ consolePage({
 
 // ----------------------------------------------------------------------- the link
 
-const counts = (listing) => JSON.stringify(listing && [listing.budget, listing.routes.map((route) => [route.vms, route.snapshot])]);
+const counts = (listing) => JSON.stringify(listing && [listing.budget, listing.routes.map((route) => [route.instances, route.snapshot])]);
 
 follow((listing, moved) => {
   showListing(listing, moved || counts(currentListing()) !== counts(listing));

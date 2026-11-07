@@ -101,8 +101,8 @@ same start and stop, ring of 512, queue of 4096 and gaps -- as the node
   a pooled unit one at a time, so the attribution is exact. A pooled unit's output before
   its first request has an empty route key.
 - `instance` is the index of the instance among its route's instances alive, as CF numbers
-  an app's: a pooled unit's `0..pool`, kept by its replacement, and a per-request
-  instance's the lowest free from `pool` up while its store lives. The units take requests
+  an app's: a pooled unit's `0..warm`, kept by its replacement, and a per-request
+  instance's the lowest free from `warm` up while its store lives. The units take requests
   in turn, the one idle longest first, as the gorouter's round-robin does. A `response`
   no instance served (no route, none within its budget, its client gone while it waited)
   has none.
@@ -121,7 +121,7 @@ wicket's run; `instance` is its index among the route's VMs alive:
 - a template's is 0: no other VM of the route lives with it
 - a VM holds the lowest index free until it is gone, in every mode but the template's: a pool's
   (booted or cloned) from its start, another clone from its restore, warm or serving, an index below
-  the route's `vms`. A pool's `warm` VMs start as `0` to `warm - 1`, one in the place of a VM that
+  the route's `instances`. A pool's `warm` VMs start as `0` to `warm - 1`, one in the place of a VM that
   failed holds its index, one beyond `warm` the next free. A pool shrinking may leave a gap: `keep-ms` kills the VM
   idle longest, of any index
 - a reload starting a route's VMs anew numbers them from 0, beside the old VMs draining,
@@ -146,7 +146,7 @@ the log of the app holding its host, which `cf logs` shows as Cloud Foundry does
 
 - `cf logs` names what `cf app` lists, `0` to `instances - 1` of the web process (its entries
   are the instances alive, the `alive` of the wicket's `GET /api/apps` taken the same way):
-  the cf-api takes the `instance` modulo `instances`, knowing them as the wicket does not. With `cf scale -i 3`, `pool` is 3 and the route's cap 3 x `concurrency`: requests one
+  the cf-api takes the `instance` modulo `instances`, knowing them as the wicket does not. With `cf scale -i 3`, `warm` is 3 and the route's cap 3 x `concurrency`: requests one
   after another rotate over instances 0 to 2; one arriving while all three are busy runs on
   an instance of its own, the wicket's index 3 or above, named as one of 0 to 2 (the requests
   an instance takes at once). On a Firecracker wicket it is its VMs: a pool of

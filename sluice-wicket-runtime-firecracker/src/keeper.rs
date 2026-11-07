@@ -51,7 +51,7 @@ const MESSAGE: usize = 16 * 1024;
 const MAX_FDS: usize = 3;
 
 /// What a VM is charged besides its guest memory, its log and a template's snapshot, in
-/// MiB, for `mem` MiB of guest memory: `firecracker`'s heap and KVM's structures (about
+/// MiB, for `memory-mib` MiB of guest memory: `firecracker`'s heap and KVM's structures (about
 /// 3 MiB measured), a vsock stream's buffers (64KiB each at most), and the page tables
 /// of the guest memory (about 0.25% of what it touched).
 pub fn vm_overhead_mib(mem: u64) -> u64 {
@@ -63,7 +63,7 @@ pub fn vm_overhead_mib(mem: u64) -> u64 {
 /// guest re-enabling its serial device).
 const LOG_MIB: u64 = 16;
 
-/// A VM's `RLIMIT_FSIZE`, bytes, for `mem` MiB of guest memory: its log, and a
+/// A VM's `RLIMIT_FSIZE`, bytes, for `memory-mib` MiB of guest memory: its log, and a
 /// template's snapshot, which it writes.
 pub fn vm_file_size(role: Role, mem: u64) -> u64 {
     match role {
@@ -317,14 +317,14 @@ pub fn run(
     jail: &JailSettings,
     firecracker: PathBuf,
     state: Option<PathBuf>,
-    max_vms: usize,
+    max_instances: usize,
 ) -> ExitCode {
     // first, single-threaded: the wicket and the jails inherit it
     if let Err(e) = Filter::keeper().install() {
         eprintln!("keeper: the seccomp filter: {e}");
         return ExitCode::FAILURE;
     }
-    match Keeper::start(jail, firecracker, state, max_vms) {
+    match Keeper::start(jail, firecracker, state, max_instances) {
         Ok(mut keeper) => {
             let code = keeper.serve();
             keeper.close();
@@ -418,7 +418,7 @@ impl Keeper {
         jail: &JailSettings,
         firecracker: PathBuf,
         state: Option<PathBuf>,
-        max_vms: usize,
+        max_instances: usize,
     ) -> io::Result<Keeper> {
         let user = User::resolve(&jail.user)?;
         if user.uid == 0 {
@@ -433,9 +433,9 @@ impl Keeper {
                 ids.first, ids.last
             )));
         }
-        if (ids.count() as usize) < max_vms {
+        if (ids.count() as usize) < max_instances {
             return Err(io::Error::other(format!(
-                "jail-ids {}-{}: {} ids for --max-vms {max_vms}: one per VM alive",
+                "jail-ids {}-{}: {} ids for --max-instances {max_instances}: one per VM alive",
                 ids.first,
                 ids.last,
                 ids.count()

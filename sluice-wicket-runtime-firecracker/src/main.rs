@@ -66,7 +66,12 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            return keeper::run(jail, firecracker, settings.state_dir, settings.max_vms);
+            return keeper::run(
+                jail,
+                firecracker,
+                settings.state_dir,
+                settings.max_instances,
+            );
         }
         (Some(_), None) => {
             eprintln!(

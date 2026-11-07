@@ -692,7 +692,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
     assert!(count >= 3, "{count}");
     let before = advertised();
     cf.ok(&["scale", "hello", "-i", "2"]);
-    assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 2);
+    assert_eq!(listing(&console)["apps"][0]["sandbox"]["warm"], 2);
     assert_eq!(advertised(), before, "nothing to advertise");
     let deadline = Instant::now() + HANG;
     while served() <= count {
@@ -756,7 +756,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
         sha256(&dir.join("app2/hello.wasm"))
     );
     assert_eq!(
-        apps["apps"][0]["sandbox"]["pool"], 2,
+        apps["apps"][0]["sandbox"]["warm"], 2,
         "kept across the push"
     );
 
@@ -784,7 +784,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
     // no warm instance is the annotation's, at once; VMs' annotations are refused
     let warm = json!({"wicket.sluice.ik.am/warm": "0"});
     assert!(annotate(&cf, "hello", &warm).contains("\"guid\""));
-    assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 0);
+    assert_eq!(listing(&console)["apps"][0]["sandbox"]["warm"], 0);
     assert_eq!(get(&listen, "hello.localhost", "/", None).0, 200);
     // `cf app` lists what is alive: none between requests, which nothing waiting for a start
     // takes for a failure, and a request's own while it runs
@@ -829,7 +829,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
     assert!(refused.contains("annotation"), "{refused}");
     annotate(&cf, "hello", &json!({"wicket.sluice.ik.am/warm": null}));
     instances_come_to(&cf, "hello", "2/2");
-    assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 2);
+    assert_eq!(listing(&console)["apps"][0]["sandbox"]["warm"], 2);
 
     // `cf scale` the limit: an instance takes 16 requests at once, the next waits for one of
     // them to end; what serves beside them is named as `cf app` lists it
@@ -886,10 +886,10 @@ fn the_cf_cli_deploys_to_the_wicket() {
         let sandbox = app_of()["sandbox"].clone();
         let count = |key: &str| sandbox[key].as_u64();
         (
-            count("pool"),
+            count("warm"),
             count("instances"),
             count("concurrency"),
-            count("keep_ms"),
+            count("keep-ms"),
         )
     };
     assert_eq!(limits(), (Some(1), Some(1), Some(16), None));
@@ -1652,11 +1652,11 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     assert_eq!(fc["hosts"], json!(["fc.localhost"]));
     // cloned from a snapshot at any count: a scale keeps what runs
     assert_eq!(
-        (&fc["sandbox"]["mode"], &fc["sandbox"]["vms"]),
+        (&fc["sandbox"]["mode"], &fc["sandbox"]["instances"]),
         (&"pool".into(), &1.into())
     );
     // as Cloud Controller's defaults: what a JVM needs of memory and of time to listen
-    assert_eq!(fc["sandbox"]["mem"], 1024);
+    assert_eq!(fc["sandbox"]["memory-mib"], 1024);
     assert_eq!(fc["sandbox"]["boot-ms"], 60_000);
     assert!(
         fc["sandbox"]["env"]
@@ -1842,7 +1842,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     let pushed = |extra: &[&str]| pushed_as("fc", extra);
     let (ok, output) = pushed(&["-m", "512M"]);
     assert!(ok, "{output}");
-    assert_eq!(listing(&console)["apps"][0]["sandbox"]["mem"], 512);
+    assert_eq!(listing(&console)["apps"][0]["sandbox"]["memory-mib"], 512);
     // cf push -t is how long it may take to listen
     cf.ok(&["set-env", "fc", "SAMPLE_WAIT_MS", "3000"]);
     let (ok, output) = pushed(&["-t", "1"]);
@@ -1948,7 +1948,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     cf.ok(&["scale", "fc", "-i", "2"]);
     let scaled = &listing(&console)["apps"][0]["sandbox"];
     assert_eq!(
-        (&scaled["mode"], &scaled["vms"]),
+        (&scaled["mode"], &scaled["instances"]),
         (&"pool".into(), &2.into())
     );
     assert_eq!(target(), advertised, "nothing to advertise");
@@ -2038,7 +2038,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         let routes: Value = serde_json::from_str(&body).unwrap();
         let routes = routes["routes"].as_array().unwrap().clone();
         let fc = routes.iter().find(|route| route["host"] == "fc.localhost");
-        fc.unwrap()["vms"][count].as_u64().unwrap()
+        fc.unwrap()["instances"][count].as_u64().unwrap()
     };
     let alive = || vms("alive");
     let scales_to_zero = |what: &str| {
@@ -2077,7 +2077,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     assert_eq!(
         (
             &fresh["mode"],
-            &fresh["vms"],
+            &fresh["instances"],
             &fresh["keep-ms"],
             &fresh["uses"],
             &fresh["lifetime-ms"]
@@ -2105,10 +2105,10 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     assert_eq!(
         (
             &fresh["mode"],
-            &fresh["vms"],
+            &fresh["instances"],
             &fresh["warm"],
             &fresh["keep-ms"],
-            &fresh["conns"]
+            &fresh["concurrency"]
         ),
         (&"pool".into(), &2.into(), &0.into(), &500.into(), &3.into()),
     );
@@ -2146,17 +2146,17 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     std::fs::write(&manifest, budget).unwrap();
     let refused = cf.fails(&["apply-manifest", "-f", manifest.to_str().unwrap()]);
     assert!(refused.contains("no components"), "{refused}");
-    // how many and how long at once, the wicket adjusting the pool in place
+    // how many and how long at once, the wicket adjusting its route in place
     let adjusted = json!({"wicket.sluice.ik.am/warm": "2", "wicket.sluice.ik.am/concurrency": "2"});
     assert!(annotate(&cf, "fc", &adjusted).contains("\"guid\""));
-    assert_eq!(sandbox().unwrap()["conns"], 2);
+    assert_eq!(sandbox().unwrap()["concurrency"], 2);
     // a manifest's count below what the running mode keeps warm waits with another mode for the
     // next start, the wicket's route as it is: `cf push` restarts the app right after
     let manifest = dir.join("scaled.yml");
     let scaled = "applications:\n- name: fc\n  instances: 1\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/mode: boot\n      wicket.sluice.ik.am/warm: null\n      wicket.sluice.ik.am/keep-ms: null\n      wicket.sluice.ik.am/concurrency: null\n";
     std::fs::write(&manifest, scaled).unwrap();
     cf.ok(&["apply-manifest", "-f", manifest.to_str().unwrap()]);
-    assert_eq!(sandbox().unwrap()["vms"], 2);
+    assert_eq!(sandbox().unwrap()["instances"], 2);
     let recent = cf.ok(&["logs", "fc", "--recent"]);
     assert!(
         recent.contains("instances wait for the next start"),
@@ -2167,7 +2167,11 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     // index alone, the others serving on, until another one is up there
     cf.ok(&["restart", "fc"]);
     assert_eq!(sandbox().unwrap()["mode"], "boot");
-    assert_eq!(sandbox().unwrap().get("vms"), None, "one, its default");
+    assert_eq!(
+        sandbox().unwrap().get("instances"),
+        None,
+        "one, its default"
+    );
     assert_eq!(instances_shown(&cf, "fc"), "1/1");
     let advertised_booted = target();
     let scaled = cf.ok(&["scale", "fc", "-i", "3"]);
@@ -2177,7 +2181,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
             .any(|line| line.starts_with("instances:") && line.ends_with("/3")),
         "{scaled}"
     );
-    assert_eq!(sandbox().unwrap()["vms"], 3);
+    assert_eq!(sandbox().unwrap()["instances"], 3);
     assert_eq!(target(), advertised_booted, "nothing to advertise");
     instances_come_to(&cf, "fc", "3/3");
     let boot_ids: std::collections::BTreeSet<_> = (0..12).map(|_| answered_by().0).collect();
@@ -2204,7 +2208,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     instances_come_to(&cf, "fc", "3/3");
     cf.ok(&["scale", "fc", "-i", "1"]);
     instances_come_to(&cf, "fc", "1/1");
-    assert_eq!(sandbox().unwrap().get("vms"), None);
+    assert_eq!(sandbox().unwrap().get("instances"), None);
     // scaling as it runs: its annotation gone, what runs stays booted until the next start
     annotate(&cf, "fc", &json!({"wicket.sluice.ik.am/mode": null}));
     cf.ok(&["scale", "fc", "-i", "2"]);
@@ -2220,7 +2224,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     cf.ok(&["restart", "fc"]);
     let fresh = sandbox().unwrap();
     assert_eq!(
-        (&fresh["mode"], &fresh["vms"]),
+        (&fresh["mode"], &fresh["instances"]),
         (&"per-connection".into(), &1.into())
     );
     assert_eq!(get(&listen, "fc.localhost", "/", None).0, 200);
@@ -2374,7 +2378,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
                 "hosts": ["127.0.0.1"],
                 "component": {"sha256": sha256, "name": "cf-api.ext4"},
                 "sandbox": {
-                    "mem": 256,
+                    "memory-mib": 256,
                     "disk": "/data",
                     "disk-mib": 256,
                     "egress": [

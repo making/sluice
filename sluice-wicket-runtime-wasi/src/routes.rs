@@ -13,7 +13,7 @@
 //! acknowledged its removal, since the server may have routed a connection to
 //! it before, and its connections then shut down gracefully.
 //!
-//! A sandbox's `pool`, `instances`, `keep-ms` and `concurrency` are no change of what serves:
+//! A sandbox's `warm`, `instances`, `keep-ms` and `concurrency` are no change of what serves:
 //! the handler takes them as it runs ([`Handler::resize`]). An app's target names none of them,
 //! so nothing is advertised; a route's does, so its handler goes on under the target of its new
 //! numbers, the old one lingering as a removed one does.
@@ -269,7 +269,7 @@ pub struct Change {
     pub retargeted: Vec<String>,
     /// Same target, new content.
     pub updated: Vec<String>,
-    /// Same target and content, another `pool`, `instances`, `keep-ms` or `concurrency`.
+    /// Same target and content, another `warm`, `instances`, `keep-ms` or `concurrency`.
     pub adjusted: Vec<String>,
 }
 
@@ -812,7 +812,7 @@ impl Reloader {
         let pooled: usize = plan
             .targets
             .iter()
-            .map(|(_, sandbox, _)| sandbox.pool)
+            .map(|(_, sandbox, _)| sandbox.warm)
             .sum();
         if pooled > self.instances.max() {
             return Err(Unloaded::of(format!(
@@ -859,7 +859,7 @@ impl Reloader {
         }
     }
 
-    /// Publishes `plan` and retires the handlers it replaced, the others taking their `pool`,
+    /// Publishes `plan` and retires the handlers it replaced, the others taking their `warm`,
     /// `instances`, `keep-ms` and `concurrency`; None when it changes no route. Origins or those changed alone
     /// (an app's tag, a scale) are published in the generation they were: nothing to advertise
     /// or acknowledge.
@@ -1303,7 +1303,7 @@ pub(crate) mod tests {
             component: Locator::parse(path.to_str().unwrap()).unwrap(),
             shown: None,
             sandbox: Sandbox {
-                pool: 1,
+                warm: 1,
                 instances: Some(1),
                 ..Sandbox::default()
             },
@@ -1378,8 +1378,8 @@ pub(crate) mod tests {
         let path = dir.write(
             "wicket.yaml",
             config(&[
-                ("a.local", "a.wasm", "pool: 1"),
-                ("b.local", "b.wasm", "pool: 1"),
+                ("a.local", "a.wasm", "warm: 1"),
+                ("b.local", "b.wasm", "warm: 1"),
                 ("c.local", "c.wasm", ""),
                 ("d.local", "d.wasm", "env: {GREETING: hello-d}"),
                 ("f.local", &remote, ""),
@@ -1397,7 +1397,7 @@ pub(crate) mod tests {
         dir.write(
             "wicket.yaml",
             config(&[
-                ("a.local", "a.wasm", "pool: 1"),
+                ("a.local", "a.wasm", "warm: 1"),
                 ("c.local", "c.wasm", "budget: 5s"),
                 ("d.local", "d.wasm", "env: {GREETING: hello-d}"),
                 ("e.local", "e.wasm", ""),
@@ -1452,8 +1452,8 @@ pub(crate) mod tests {
         dir.write(
             "wicket.yaml",
             config(&[
-                ("a.local", "a.wasm", "pool: 1"),
-                ("b.local", "b.wasm", "pool: 1"),
+                ("a.local", "a.wasm", "warm: 1"),
+                ("b.local", "b.wasm", "warm: 1"),
                 ("c.local", "c.wasm", "budget: 5s"),
                 ("d.local", "d.wasm", "env: {GREETING: s3cr3t-d}"),
                 ("e.local", "e.wasm", ""),
@@ -1488,8 +1488,8 @@ pub(crate) mod tests {
         dir.write(
             "wicket.yaml",
             config(&[
-                ("a.local", "a.wasm", "pool: 2"),
-                ("b.local", "b.wasm", "pool: 1"),
+                ("a.local", "a.wasm", "warm: 2"),
+                ("b.local", "b.wasm", "warm: 1"),
                 ("c.local", "c.wasm", "budget: 5s"),
                 ("d.local", "d.wasm", "env: {GREETING: s3cr3t-d}"),
                 ("e.local", "e.wasm", ""),
@@ -1506,7 +1506,7 @@ pub(crate) mod tests {
         assert_ne!(to, a);
         assert!(Arc::ptr_eq(moved.handler(&to).unwrap(), &handler));
         assert!(Arc::ptr_eq(moved.handler(&a).unwrap(), &handler));
-        assert_eq!(handler.sandbox().pool, 2);
+        assert_eq!(handler.sandbox().warm, 2);
         eventually("its pool grows by one", || instances.held() == 3).await;
 
         // a remote component is fetched when its route is new, or on request
@@ -1564,13 +1564,13 @@ pub(crate) mod tests {
             ),
             (
                 "pools past the limit",
-                config(&[("a.local", "a.wasm", "pool: 5")]),
+                config(&[("a.local", "a.wasm", "warm: 5")]),
                 &hello,
                 "need 5 instance slots, more than --max-instances 4",
             ),
             (
                 "a host twice",
-                config(&[("a.local", "a.wasm", ""), ("a.local", "a.wasm", "pool: 1")]),
+                config(&[("a.local", "a.wasm", ""), ("a.local", "a.wasm", "warm: 1")]),
                 &hello,
                 "route host 'a.local' is configured twice",
             ),
@@ -1727,7 +1727,7 @@ pub(crate) mod tests {
         assert_eq!(components().len(), 1, "the replaced component removed");
         let resandboxed = Edit::Sandbox {
             host: "b.local".into(),
-            sandbox: Sandbox::parse("pool=1&wasi=keyvalue").unwrap(),
+            sandbox: Sandbox::parse("warm=1&wasi=keyvalue").unwrap(),
         };
         let change = reloader.apply(resandboxed).await.unwrap();
         assert_eq!(change.change.unwrap().retargeted, ["b.local"]);
@@ -1737,7 +1737,7 @@ pub(crate) mod tests {
             .unwrap()
             .sandbox()
             .clone();
-        assert_eq!(sandbox.pool, 1);
+        assert_eq!(sandbox.warm, 1);
         assert_eq!(
             sandbox.keyvalue[""].namespace, "b.local",
             "the default map, the host as the namespace"
@@ -1880,7 +1880,7 @@ pub(crate) mod tests {
         let scaled = match shop(&["s1.local"], &fetch, &place) {
             Edit::PutApp { name, mut app } => {
                 app.tag = Some("v2".into());
-                app.sandbox.pool = 1;
+                app.sandbox.warm = 1;
                 app.sandbox.instances = Some(3);
                 app.sandbox.keep = Some(Duration::from_millis(500));
                 app.sandbox.concurrency = 4;
@@ -1909,7 +1909,7 @@ pub(crate) mod tests {
         let sandbox = scaled.handler(&unscaled_target).unwrap().sandbox();
         assert_eq!(
             (
-                sandbox.pool,
+                sandbox.warm,
                 sandbox.instances,
                 sandbox.keep,
                 sandbox.concurrency
@@ -1998,7 +1998,7 @@ pub(crate) mod tests {
                 ),
             ),
             (
-                deploy("c.local", &hello, "pool=5"),
+                deploy("c.local", &hello, "warm=5"),
                 "rejected",
                 "more than --max-instances 4".into(),
             ),
@@ -2117,7 +2117,7 @@ pub(crate) mod tests {
         assert_eq!(change.change.unwrap().removed, ["b1.local"]);
         assert_eq!(components(), [format!("{}/app.wasm", hex(&fetch))]);
 
-        let sandbox = "budget-ms=250&instances=2&memory-mib=64&pool=1&wasi=cli,keyvalue";
+        let sandbox = "budget-ms=250&instances=2&memory-mib=64&warm=1&wasi=cli,keyvalue";
         reloader
             .apply(deploy("d.local", &hello, sandbox))
             .await

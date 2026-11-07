@@ -16,10 +16,10 @@ the drain) and relays each tunnel connection verbatim (no HTTP termination) to a
 of a guest. The guest's `/init` (`guest/`, static musl) relays it on to the process. A
 route's VMs are:
 
-- `mode=boot` (default): `vms=N` VMs (default 1), each booted and none restored from a snapshot,
+- `mode=boot` (default): `instances=N` VMs (default 1), each booted and none restored from a snapshot,
   for a process that does not survive a restore (what it opened before its snapshot is gone in a
-  clone). A connection goes to the VM holding the fewest connections; none is grown past `vms` nor
-  waited for, a boot being too slow to ask for on demand, so `warm`, `keep-ms`, `conns`, `prime` and
+  clone). A connection goes to the VM holding the fewest connections; none is grown past `instances` nor
+  waited for, a boot being too slow to ask for on demand, so `warm`, `keep-ms`, `concurrency`, `prime` and
   `wait-ms` are refused
 - `mode=per-connection`: each connection gets a VM of its own, cloned from a snapshot of
   a template VM taken once its process accepted (`prime=N` sends N `GET /` first, so the
@@ -32,31 +32,31 @@ route's VMs are:
   the route scales to zero when idle. It gives up the isolation: a connection sees what the
   previous ones left in the guest (its memory, its files, a session cached). A connection
   failing (the guest's stream cut, `idle-ms`) kills its clone
-- `mode=pool`: `vms=N` VMs at most, cloned from the snapshot as per connection, each serving
-  many connections; `warm=N` of them (default `vms`: a pool of a fixed size)
+- `mode=pool`: `instances=N` VMs at most, cloned from the snapshot as per connection, each serving
+  many connections; `warm=N` of them (default `instances`: a pool of a fixed size)
   are kept. A connection goes to the VM holding the fewest connections (not requests: a
-  keep-alive connection stays on its VM) while it holds fewer than `conns=N` (16); past
-  that it waits for a VM being started (one started for every `conns` connections waiting,
-  up to `vms`), or goes to the VM holding the fewest when none is. A VM beyond `warm`
+  keep-alive connection stays on its VM) while it holds fewer than `concurrency=N` (16); past
+  that it waits for a VM being started (one started for every `concurrency` connections waiting,
+  up to `instances`), or goes to the VM holding the fewest when none is. A VM beyond `warm`
   serving none is killed after `keep-ms` (`warm=0` scales to zero); a VM going down
   ([A VM going down](#a-vm-going-down)) or that does not answer is killed, the
   connection served by another, and one started in its place below `warm`
 
-The cloned modes (per-connection, reuse, pool) take `prime`, `warm` and `wait-ms`, every mode `vms`.
-`sluice-wicket-cf-api` sets `vms` by `cf scale -i`, the mode, `warm`, `keep-ms`, `uses`,
-`lifetime-ms` and `conns` by [annotations](../sluice-wicket-cf-api/README.md#how-long-a-vm-lives).
+The cloned modes (per-connection, reuse, pool) take `prime`, `warm` and `wait-ms`, every mode `instances`.
+`sluice-wicket-cf-api` sets `instances` by `cf scale -i`, the mode, `warm`, `keep-ms`, `uses`,
+`lifetime-ms` and `concurrency` by [annotations](../sluice-wicket-cf-api/README.md#how-long-a-vm-lives).
 
 | mode | VMs | a connection gets | between connections | idle | a VM failing | memory |
 |---|---|---|---|---|---|---|
-| `boot` | `vms`, 1 by default, booted at start | the VM holding the fewest | a VM's connections share its guest | they stay | its connections; a VM started in its place ([A VM going down](#a-vm-going-down)); with none up, every connection | `vms` x the pages a guest touched |
+| `boot` | `instances`, 1 by default, booted at start | the VM holding the fewest | a VM's connections share its guest | they stay | its connections; a VM started in its place ([A VM going down](#a-vm-going-down)); with none up, every connection | `instances` x the pages a guest touched |
 | `per-connection` | 1 per open connection, `warm` ahead | a clone of its own, killed with it | a clone each | `warm` clones stay | that connection | the snapshot + a few MiB a clone |
 | `reuse` | 1 per open connection, kept ones, `warm` ahead | the clone used last, else a fresh one | a clone's connections in turn share its guest | kept clones killed after `keep-ms`: none left | that connection | as per connection |
-| `pool` | `warm` to `vms`, many connections each | the VM holding the fewest | a VM's connections share its guest | down to `warm` after `keep-ms` (`warm=0`: none) | its connections; a VM started in its place | as per connection |
+| `pool` | `warm` to `instances`, many connections each | the VM holding the fewest | a VM's connections share its guest | down to `warm` after `keep-ms` (`warm=0`: none) | its connections; a VM started in its place | as per connection |
 
 A fresh clone takes a restore per connection, a reused clone or a pool's VM a vsock dial: several
 times the rate of new connections ([by mode](../.kb/wicket-firecracker-findings.md#rates-by-mode)).
-A snapshot holds what the template's guest wrote, the rest of `mem` holes of a sparse file; clones
-touching the rest add to it, up to `mem`
+A snapshot holds what the template's guest wrote, the rest of `memory-mib` holes of a sparse file; clones
+touching the rest add to it, up to `memory-mib`
 ([measured](../.kb/wicket-firecracker-findings.md#a-snapshots-memory)).
 
 The rootfs is either the built-in sample (`scripts/build-guest.sh`: `/init` serves HTTP
@@ -173,7 +173,7 @@ sg kvm -c "target/release/sluice-wicket-runtime-firecracker \
     --firecracker ~/.local/bin/firecracker --kernel ~/.local/firecracker/vmlinux \
     --server grpc://127.0.0.1:8001 --token SECRET \
     --vm hello.local=target/guest.ext4 \
-    --vm 'app.local=target/upstream.ext4?mode=per-connection&mem=512&vcpus=2&prime=200&warm=4'"
+    --vm 'app.local=target/upstream.ext4?mode=per-connection&memory-mib=512&vcpus=2&prime=200&warm=4'"
 
 curl -H 'Host: hello.local' http://127.0.0.1:8000/
 ```
@@ -183,12 +183,12 @@ The scripts build the guest for the host's arch, a VM's; `SLUICE_GUEST_ARCH=aarc
 platform, `linux/arm64` or `linux/amd64`).
 
 `--vm host=<rootfs>[?<options>]` adds a route: `mode=boot|per-connection|reuse|pool`,
-`vcpus=N` (1), `mem=MiB` (128), `port=N` (the guest's vsock port, 8080), `boot-ms=N` (how long
+`vcpus=N` (1), `memory-mib=N` (128), `port=N` (the guest's vsock port, 8080), `boot-ms=N` (how long
 a cold-booted guest may take to listen, 10000; its process exiting first fails it at once: a
 JVM on one vCPU can take more), `per-client=N`,
-`idle-ms=N`, `cpu=N` (jail mode), `vms=N`, for the cloned modes `warm=N`, `prime=N` and
+`idle-ms=N`, `cpu=N` (jail mode), `instances=N`, for the cloned modes `warm=N`, `prime=N` and
 `wait-ms=N` (see [Limits](#limits)), `keep-ms=N` (reuse, pool), `uses=N` and `lifetime-ms=N`
-(reuse), `conns=N` (pool), `egress=<host>:<port>,...` (see [Egress](#egress)). The advertised
+(reuse), `concurrency=N` (pool), `egress=<host>:<port>,...` (see [Egress](#egress)). The advertised
 target is `firecracker:<rootfs>` plus the options set to other than their defaults; the server
 dials it verbatim, and the hosts of one target share its VMs.
 
@@ -223,7 +223,7 @@ system's temp dir, removed at the end; a `--state-dir` given gets a `route-<n>` 
 (0700) per route started, removed with it). A cloned route's snapshot there is what its
 template wrote of its memory, unencrypted: keep the state dir on a tmpfs (the wicket warns
 otherwise), or it is on disk until the route ends, and after a crash. The tmpfs must hold
-every cloned route's snapshot, its `mem` at most (systemd sizes `$XDG_RUNTIME_DIR` to 10% of
+every cloned route's snapshot, its `memory-mib` at most (systemd sizes `$XDG_RUNTIME_DIR` to 10% of
 the host's memory: `RuntimeDirectorySize` in `logind.conf`).
 
 The tunnel's settings are `sluice-wicket-runtime-wasi`'s: `--token` (or `--token-file`; on the
@@ -253,8 +253,8 @@ server: grpc://127.0.0.1:8001
 token: ${SLUICE_TOKEN}           # or token-file: <path>
 kernel: /opt/firecracker/vmlinux
 firecracker: firecracker        # on the PATH
-max-vms: 64
-max-memory: 16384               # MiB of guest memory
+max-instances: 64
+max-memory-mib: 16384           # of guest memory
 workers: 4                      # threads relaying the connections
 watch-interval: 1s              # 0 = SIGHUP only
 drain-grace: 20s
@@ -265,10 +265,11 @@ drain-grace: 20s
 # jail-cgroup: sluice
 routes:
   - {host: hello.local, rootfs: guest.ext4}
-  - {host: app.local, rootfs: upstream.ext4, mode: per-connection, mem: 512, vcpus: 2,
-     prime: 200, warm: 4, vms: 16, wait-ms: 10000, per-client: 4, idle-ms: 30000,
+  - {host: app.local, rootfs: upstream.ext4, mode: per-connection, memory-mib: 512, vcpus: 2,
+     prime: 200, warm: 4, instances: 16, wait-ms: 10000, per-client: 4, idle-ms: 30000,
      egress: [db.internal:5432, 10.0.0.0/24:6379, '[2001:db8::/32]:443']}
-  - {host: api.local, rootfs: go.ext4, mode: pool, vms: 8, warm: 1, conns: 16, keep-ms: 60000}
+  - {host: api.local, rootfs: go.ext4, mode: pool, instances: 8, warm: 1, concurrency: 16,
+     keep-ms: 60000}
   - {host: fn.local, rootfs: go.ext4, mode: reuse, keep-ms: 60000, uses: 1000,
      lifetime-ms: 3600000}
 ```
@@ -304,14 +305,14 @@ at startup. The console's edits go through the same reload (see [Console](#conso
 
 ### How many VMs and how long
 
-`vms`, `warm`, `conns`, `wait-ms`, `keep-ms`, `uses`, `lifetime-ms`, `per-client`, `idle-ms` and
+`instances`, `warm`, `concurrency`, `wait-ms`, `keep-ms`, `uses`, `lifetime-ms`, `per-client`, `idle-ms` and
 `boot-ms` say how many VMs and how long, not what a VM is: a running target takes a change of them
 as it is, by a reload or a console's edit, its VMs and their snapshot kept (`adjusted <host>`):
 
-- `vms` or `warm` up: VMs cloned as there is room, in a restore's time, or at `mode=boot` booted, a
+- `instances` or `warm` up: VMs cloned as there is room, in a restore's time, or at `mode=boot` booted, a
   connection reaching one once its guest accepts, none other touched; a connection waiting for
   room finds it
-- `vms` down: of a pool, the VMs past it (the highest indices) take no connection any more, and
+- `instances` down: of a pool, the VMs past it (the highest indices) take no connection any more, and
   are killed once their own ended and `keep-ms` passed (at `mode=boot`, none: with their last
   connection); up again before that, they serve on. Per connection and reused, what serves none past it is killed at once, and the connections open
   finish
@@ -346,8 +347,8 @@ first: SIGTERM to what is left, all written out, the disk free), the new one on 
 budget the old one held (no other route takes it meanwhile), its env and disk as they were. Per
 VM: the first start is at once; a VM that goes down within 60s of its start, or a start that fails,
 waits 1s, then 2s, 4s, up to 60s between starts, and a VM up for 60s starts that count anew.
-A change of its bounds (`warm`, `vms`, `cf scale -i`, ...) starts it at once, that count going on.
-`vms.down` says why (the lowest index's), an app's listing `crashed` for each index. With none up,
+A change of its bounds (`warm`, `instances`, `cf scale -i`, ...) starts it at once, that count going on.
+`instances.down` says why (the lowest index's), an app's listing `crashed` for each index. With none up,
 a booted route's connections fail at once (`guest unreachable: no VM up: the route is restarting`;
 the open ones end with their VM), a boot long when all goes well; a clone pool's wait for its
 `wait-ms`, one asking for a VM ahead of its wait.
@@ -357,8 +358,8 @@ one. A reload keeps a route down as it is, unless its spec or files changed: tha
 takes over at once, the wait forgotten. So does `PUT` of another env; the same `PUT` is `no
 change`, the VM coming back by itself. The wicket's stderr says each step (`route <hosts>: VM 1: its
 process ended; killed`, `VM 1 starts again in 2000ms`, `pool VM: ... (instance 1)`),
-`GET /api/routes` a route's `vms.restarts`, the VMs up in the place of one, reset by a change of its
-spec, and `vms.down`, why it is short (the page shows both).
+`GET /api/routes` a route's `instances.restarts`, the VMs up in the place of one, reset by a change of its
+spec, and `instances.down`, why it is short (the page shows both).
 
 A clone pool's VM comes back in a restore's time, from the snapshot, the VMs it keeps being those
 below `warm`. A start failing for room within `wait-ms` is tried again every second, one failing
@@ -368,11 +369,11 @@ a route can read as down for up to 60s after the cause ended. A connection waits
 (room within `wait-ms`, then its own restore, whose failure counts as a try and whose success
 restores the warm clones missing at once); nor does a change of the route's bounds, which tries
 at once, the count going on. A reload that changes nothing leaves the wait as it is.
-`vms.down` says why until `warm` are up. What fails beyond `warm` is the connection's
+`instances.down` says why until `warm` are up. What fails beyond `warm` is the connection's
 to be told, and waiting for room within `wait-ms`, or for a warm clone's, is no failure, unless no VM
 is alive and the restore failed for anything but room: then `warm=0` would read as idle at none, so
-`vms.down` says why too and one VM is tried again, as above, until one is up
-(gone again as `warm=0` has it). `vms.down` is `{"why": ..., "since": <seconds since the epoch>}`,
+`instances.down` says why too and one VM is tried again, as above, until one is up
+(gone again as `warm=0` has it). `instances.down` is `{"why": ..., "since": <seconds since the epoch>}`,
 `since` the start of what goes on, each failure after it changing only `why`.
 
 ### Console
@@ -385,7 +386,7 @@ another host with its image and options. The routes of the config file and the `
 are listed too, read-only. The page shows what the wasm wicket's has no counterpart for:
 each route's VMs (up or pooled and their restarts, warm, kept, starting, all alive), its connections, a cloned
 route's snapshot (its memory file, the template's boot and snapshot times) and the budget
-(`--max-vms`, `--max-memory`) taken. It takes 64 connections at once; TCP keepalive ends one whose
+(`--max-instances`, `--max-memory-mib`) taken. It takes 64 connections at once; TCP keepalive ends one whose
 client is gone, and a client that leaves one waiting for 60s, not sending a request or not reading
 its answer, loses it. All taken, one without a request the gate let through gives way to the next,
 the source holding the most first
@@ -463,7 +464,7 @@ did not start with it; the reason follows) or 503 (draining). The options are ch
 the image is read: a client sending `Expect: 100-continue` (curl does for a large file) is
 refused before it uploads. The listing names each route's `origin` (`config`, `flag`,
 `console`, `api`), its advertised `target`, its `rootfs` (a console route's path in the directory
-and its digest), its `options` set to other than their defaults, its `vms` and `snapshot`, an
+and its digest), its `options` set to other than their defaults, its `instances` and `snapshot`, an
 app's name and owner, and the names of its env.
 
 #### Apps
@@ -487,7 +488,7 @@ digest, or made of an OCI image, first; the app names it:
   "owner": "cf",
   "hosts": ["shop.localhost", "store.localhost"],
   "component": {"sha256": "0954dc11…e8", "name": "shop.ext4"},
-  "sandbox": {"mode": "pool", "vms": 2, "mem": 256, "egress": ["db.internal:5432"],
+  "sandbox": {"mode": "pool", "instances": 2, "memory-mib": 256, "egress": ["db.internal:5432"],
               "env": {"GREETING": "hello"}},
   "tag": "3f1c…9a"
 }
@@ -501,7 +502,7 @@ digest, or made of an OCI image, first; the app names it:
 - `alive` in a listing: its VMs alive, lowest first, `{"index": 0, "since": 1793000000}`: the
   `instance` index and its start in seconds since the epoch, its guest accepting; `crashed`, those it
   keeps that are down, `{"index": 1, "why": "its process ended", "since": 1793000000}`, each until
-  another one is up there; `down`, when told: why it is short of VMs, and since when (`vms.down`),
+  another one is up there; `down`, when told: why it is short of VMs, and since when (`instances.down`),
   until they are up
 - a PUT is one reload: every host of the app or none, kept only when its VMs started; the same
   app again changes nothing. An app's target names it (`?app=<name>`), so its VMs are its own,
@@ -549,7 +550,7 @@ is where `/init` mounts it before the process starts, `disk-mib` its size (defau
 
 ```json
 {"owner": "ops", "hosts": ["db.localhost"], "component": {"sha256": "0954dc11…e8", "name": "db.ext4"},
- "sandbox": {"mem": 256, "disk": "/data", "disk-mib": 4096}}
+ "sandbox": {"memory-mib": 256, "disk": "/data", "disk-mib": 4096}}
 ```
 
 - **made** at the app's first start, by `mkfs.ext4` (the wicket needs it, e2fsprogs: in the
@@ -560,7 +561,7 @@ is where `/init` mounts it before the process starts, `disk-mib` its size (defau
   Its root goes to the image's user at each mount; what is below stays as it was, whoever wrote
   it. Refused with the guest's reason (`the guest's disk: ...`, 422) when it cannot mount, and an
   image whose `/init` predates disks is refused too: it would serve without one
-- **one VM writes it**: `mode=boot` at `vms=1` alone (a clone's snapshot holds its guest's page
+- **one VM writes it**: `mode=boot` at `instances=1` alone (a clone's snapshot holds its guest's page
   cache of the drive; refused otherwise), and the file is locked by its `firecracker`
   (`flock`, the kernel's: gone with the process, whatever became of the wicket), so a second
   wicket on the directory, or a VM not yet gone, is waited for and then refused. A change of
@@ -602,17 +603,17 @@ is where `/init` mounts it before the process starts, `disk-mib` its size (defau
 
 ### Limits
 
-`--max-vms N` (default 64) caps the VMs alive at once over every route -- booted ones,
-templates, clones warm, in use, kept and pooled -- and `--max-memory MiB` (default none:
-`--max-vms` x the largest `mem` bounds it) their guest memory (`mem`). A route's
-`vms=N` caps its own (at least `warm`). A VM takes its share before its `firecracker` starts
+`--max-instances N` (default 64) caps the VMs alive at once over every route -- booted ones,
+templates, clones warm, in use, kept and pooled -- and `--max-memory-mib N` (default none:
+`--max-instances` x the largest `memory-mib` bounds it) their guest memory (`memory-mib`). A route's
+`instances=N` caps its own (at least `warm`). A VM takes its share before its `firecracker` starts
 and gives it back once killed, and one going down holds it for the VM in its place; a startup whose
-booted VMs (`vms` x `mem`) and pools' `warm` VMs do not fit, with
+booted VMs (`instances` x `memory-mib`) and pools' `warm` VMs do not fit, with
 a template at a time beside the other routes', fails, and so does a reload (a console's edit
 included).
 
 A connection whose clone finds no room waits for one in turn (one held back by its own
-route's `vms` alone keeps no other route waiting), at most its route's `wait-ms` (default
+route's `instances` alone keeps no other route waiting), at most its route's `wait-ms` (default
 10000), then its request is answered `502 Bad Gateway`, on the tunnel and on `--listen`, http/1.1
 and h2c, saying so (`no room for a VM within 10000ms: a VM per connection, 2 at most`; the
 budget's numbers stay in the wicket's log). A connection that is no HTTP request fails with an
@@ -684,7 +685,7 @@ show them:
 
 `instance` is the VM's index among its route's VMs alive, as CF numbers an app's instances
 (`cf logs` shows it): 0 for a template; a VM holds the lowest index free while it lives, warm,
-serving or booting, so a route of `vms` VMs names `0` to `vms - 1` and one in the place of a VM that
+serving or booting, so a route of `instances` VMs names `0` to `instances - 1` and one in the place of a VM that
 failed takes its index. `vm` is no such index: it counts the route's clones.
 
 A line's route key is the first host of its route (the hosts of one target share its VMs;
@@ -800,9 +801,9 @@ Each VM's `firecracker`:
 - runs its route's copy of `firecracker` (a sealed memfd): the jailer copies the binary into
   every jail so that VMs share none of its pages; the clones of a route share their
   snapshot's pages anyway, so they share their route's copy, and routes share nothing
-- is in a cgroup (v2) of its own: `memory.max` its `mem` plus 32 MiB plus `mem`/128 (its
+- is in a cgroup (v2) of its own: `memory.max` its `memory-mib` plus 32 MiB plus `memory-mib`/128 (its
   page tables) plus 16 MiB (its log, bound by `RLIMIT_FSIZE`, a disk's size with a disk: the
-  limit holds for an offset in any file), its `mem` twice for a template (it writes its
+  limit holds for an offset in any file), its `memory-mib` twice for a template (it writes its
   snapshot), `pids.max` its vCPUs plus 16. Past its limit the kernel's OOM
   killer ends the VM, nothing else. A cloned route's snapshot stays charged to the
   route's cgroup (`route-<n>`) as long as the route lives; a serving VM's cgroup (`vm-<n>`, one
@@ -821,7 +822,7 @@ What it needs:
   `/run/sluice-wicket-runtime-firecracker-<pid>` (a tmpfs), or such a directory in
   `--state-dir`
 - `--jail-ids`: a range no user of the host has, nor a subordinate range of `/etc/subuid`, of
-  `--max-vms` ids at least (one per VM alive)
+  `--max-instances` ids at least (one per VM alive)
 - `--jail-user` reads what the wicket reads: the config file, the token, the CA certificates,
   the rootfs images and the kernel. The VMs read the images and the kernel as ids of their
   own: the files need others' read permission (`o+r`); their directory may stay private (a
@@ -885,7 +886,7 @@ What applies, in both modes unless said:
 - **the serial console and the logs**: the VMs boot with `8250.nr_uarts=0` (the console
   only with `SLUICE_WICKET_RUNTIME_FIRECRACKER_SERIAL_CONSOLE`), which a guest's root may undo. A
   VM's log (`firecracker.log` in the state dir, on a tmpfs: memory) is bounded at 16 MiB
-  (`RLIMIT_FSIZE`, a template's at its `mem` more for its snapshot; past it Firecracker
+  (`RLIMIT_FSIZE`, a template's at its `memory-mib` more for its snapshot; past it Firecracker
   ends the VM), and a VM dumps no core (of its memory)
 - **network and disk**: the VMs have no network interface (vsock only; jailed, a network
   namespace without one either): their [egress](#egress) is the wicket's connections, which
@@ -898,7 +899,7 @@ What applies, in both modes unless said:
   (the wicket's, a container's or a unit's `MemoryMax=`, holds them all). Tenants on one
   wicket call for jail mode
 - **`/dev/kvm`**: unjailed, the wicket's user in the `kvm` group (see [Setup](#setup)), and
-  nobody else: a member boots VMs past `--max-vms` and `--max-memory`. Jailed, nobody: the
+  nobody else: a member boots VMs past `--max-instances` and `--max-memory-mib`. Jailed, nobody: the
   keeper (root) makes each jail a node of its own, its VM's id's alone, so the host's may
   stay root's (`--jail-user` needs no group)
 - **x86_64's `kvm-pit/<pid>`**: a VM's PIT kernel thread stays in the root cgroup (the
@@ -973,10 +974,10 @@ docker run --rm --device /dev/kvm -u 0 --cap-add SYS_ADMIN \
 The VMs' memory counts against the container's memory cgroup: a VM's guest memory as the
 guest touches it, the `firecracker` process's few MiB, and a cloned route's snapshot
 on the tmpfs, what its template and its clones touched (shmem: never reclaimed without swap). An idle clone costs its dirty
-pages, a busy one up to its `mem` ([measured](../.kb/wicket-firecracker-findings.md#docker-image-memory)).
+pages, a busy one up to its `memory-mib` ([measured](../.kb/wicket-firecracker-findings.md#docker-image-memory)).
 The bound
-to set (`--memory`, a Pod's limit): `--max-memory` (every VM at its `mem`; without it,
-`--max-vms` x the largest `mem`) plus each cloned route's `mem` (its snapshot; twice
+to set (`--memory`, a Pod's limit): `--max-memory-mib` (every VM at its `memory-mib`; without it,
+`--max-instances` x the largest `memory-mib`) plus each cloned route's `memory-mib` (its snapshot; twice
 while a reload restarts it and the old clones live) plus 64 MiB for the wicket. Past it,
 the kernel's OOM killer ends a `firecracker` or the wicket.
 
@@ -1061,8 +1062,8 @@ CNB images), checked by the answers' status:
 
 ```text
 T=$PWD/target
-sg kvm -c "SLUICE_WICKET_RUNTIME_FIRECRACKER_VMS='java.local=$T/upstream.ext4?mem=512&vcpus=2 \
-    jclone.local=$T/upstream.ext4?mode=per-connection&mem=512&vcpus=2&prime=200&warm=4' cargo test"
+sg kvm -c "SLUICE_WICKET_RUNTIME_FIRECRACKER_VMS='java.local=$T/upstream.ext4?memory-mib=512&vcpus=2 \
+    jclone.local=$T/upstream.ext4?mode=per-connection&memory-mib=512&vcpus=2&prime=200&warm=4' cargo test"
 ```
 
 `SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL=1` runs it in [jail mode](#jail-mode), the wicket

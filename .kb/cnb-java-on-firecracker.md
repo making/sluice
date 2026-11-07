@@ -8,7 +8,7 @@ Measured 2026-11-02: amd64, Linux 6.8, KVM, the cf-api's Docker Compose with loc
 The Paketo memory calculator's fixed regions: 606135K (`-XX:MaxDirectMemorySize=10M`,
 `-XX:MaxMetaspaceSize=94135K`, `-XX:ReservedCodeCacheSize=240M`, `-Xss1M` * 250 threads).
 
-| VM `mem` | available to the calculator | result |
+| VM `memory-mib` | available to the calculator | result |
 |---|---|---|
 | 256M | 202940K | fails the launch: `fixed memory regions require 606135K` |
 | 1G | 890340K | `-Xmx284204K` |

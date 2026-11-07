@@ -745,20 +745,24 @@ mod tests {
     fn the_options_and_the_routes_file() {
         let kept = options(
             "a.local",
-            &pairs("egress=db.internal:5432,10.0.0.0/24:6379&warm=02&mode=pool&vms=4"),
+            &pairs("egress=db.internal:5432,10.0.0.0/24:6379&warm=02&mode=pool&instances=4"),
         )
         .unwrap();
         assert_eq!(
             kept,
-            pairs("mode=pool&warm=2&vms=4&egress=db.internal:5432,10.0.0.0/24:6379"),
+            pairs("mode=pool&warm=2&instances=4&egress=db.internal:5432,10.0.0.0/24:6379"),
             "in the file's order, the numbers normalized"
         );
         for (query, error) in [
             ("fuel=1", "unknown option 'fuel'"),
-            ("mem=1&mem=2", "mem given twice"),
-            ("mem=lots", "mem=lots is not a number"),
+            // the names before the wickets named alike
+            ("vms=1", "unknown option 'vms'"),
+            ("conns=1", "unknown option 'conns'"),
+            ("mem=1", "unknown option 'mem'"),
+            ("memory-mib=1&memory-mib=2", "memory-mib given twice"),
+            ("memory-mib=lots", "memory-mib=lots is not a number"),
             ("warm=1", "warm needs mode=per-connection"),
-            ("mode=pool", "mode=pool needs vms"),
+            ("mode=pool", "mode=pool needs instances"),
             ("mode=fork", "unknown mode fork"),
             (
                 "egress=db.internal",
@@ -773,7 +777,10 @@ mod tests {
                 "disk=/data&mode=reuse",
                 "disk needs mode=boot: one VM writes",
             ),
-            ("disk=/data&vms=2", "disk needs vms=1: one VM writes"),
+            (
+                "disk=/data&instances=2",
+                "disk needs instances=1: one VM writes",
+            ),
         ] {
             let refused = options("a.local", &pairs(query));
             assert!(
@@ -803,7 +810,7 @@ mod tests {
                 owner: "cf".into(),
                 hosts: vec!["c.local".into(), "d.local".into()],
                 rootfs: image("0", "c.ext4"),
-                options: pairs("mode=pool&vms=2&egress=db.internal:5432,10.0.0.0/24:6379"),
+                options: pairs("mode=pool&instances=2&egress=db.internal:5432,10.0.0.0/24:6379"),
                 env: Env::new(BTreeMap::from([
                     ("GREETING".into(), "hello".into()),
                     (
@@ -912,7 +919,7 @@ mod tests {
             (apps(", tag: 'a b'"), "apps[0]: tag: 'a b' is no tag"),
             (
                 apps(", options: {mode: pool}"),
-                "apps[0]: the route: mode=pool needs vms",
+                "apps[0]: the route: mode=pool needs instances",
             ),
             (
                 apps(", env: {'A=B': s3cr3t}"),
@@ -927,7 +934,7 @@ mod tests {
             (route("").replace(".ext4", ".img"), "routes[0]: rootfs: "),
             (
                 route(", mode: pool"),
-                "routes[0]: the route: mode=pool needs vms",
+                "routes[0]: the route: mode=pool needs instances",
             ),
             (
                 route("").replace(", deployed: x", ""),

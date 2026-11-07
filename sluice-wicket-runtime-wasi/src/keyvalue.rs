@@ -798,7 +798,7 @@ mod tests {
     sandbox: {{wasi: [keyvalue], keyvalue: {{'': local/shared, own: local}}}}
   - host: b.local
     component: counter.wasm
-    sandbox: {{wasi: [keyvalue], keyvalue: {{'': local/shared}}, pool: 1}}
+    sandbox: {{wasi: [keyvalue], keyvalue: {{'': local/shared}}, warm: 1}}
 "
             ),
         );

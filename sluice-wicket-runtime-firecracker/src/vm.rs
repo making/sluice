@@ -263,7 +263,7 @@ pub struct Spec {
     pub kernel: PathBuf,
     pub rootfs: PathBuf,
     pub vcpus: u32,
-    pub mem_mib: u32,
+    pub memory_mib: u32,
     /// Jail mode: the host CPU time a VM may take, in percent of one CPU (its cgroup's
     /// `cpu.max`); None = its vCPUs bound it.
     pub cpu: Option<u32>,
@@ -287,7 +287,7 @@ impl Spec {
     fn size(&self) -> Size {
         Size {
             vcpus: self.vcpus,
-            mem: self.mem_mib,
+            mem: self.memory_mib,
             cpu: self.cpu,
         }
     }
@@ -616,7 +616,7 @@ impl Vm {
                 Vm::spawn(
                     &spec.firecracker,
                     dir.join(name),
-                    vm_file_size(role, u64::from(spec.mem_mib)).max(
+                    vm_file_size(role, u64::from(spec.memory_mib)).max(
                         spec.disk
                             .as_ref()
                             .map_or(Ok(0), Disk::file_bytes)
@@ -643,7 +643,7 @@ impl Vm {
             "/machine-config",
             json!({
                 "vcpu_count": spec.vcpus,
-                "mem_size_mib": spec.mem_mib,
+                "mem_size_mib": spec.memory_mib,
                 // a template's snapshot holds what its guest wrote (`Vm::snapshot`)
                 "track_dirty_pages": matches!(role, Role::Template),
             }),
@@ -840,7 +840,7 @@ impl Vm {
     /// Pauses the VM (of `spec`) and writes its snapshot into its place's snapshot directory; the
     /// VM stays paused. A VM booted tracking what its guest writes: its memory file holds that
     /// alone, the rest holes reading as the zeros it is, so a snapshot takes what the guest
-    /// touched rather than all of `mem` (see findings, A snapshot's memory).
+    /// touched rather than all of `memory-mib` (see findings, A snapshot's memory).
     pub async fn snapshot(&self, place: &Place, spec: &Spec) -> Result<Snapshot, BoxError> {
         let (inside, on_host) = match place {
             Place::Dir(dir) => {
