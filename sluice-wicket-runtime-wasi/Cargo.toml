@@ -20,8 +20,9 @@ tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = "0.3"
 # random default client id, same policy as the Java client
 uuid = { version = "1", features = ["v4"] }
-# wasi 0.3 (p3) host support only; p2 guests are unsupported
-wasmtime = "50"
+# wasi 0.3 (p3) host support only; p2 guests are unsupported. task-group-hook: which request
+# of a store taking several at once its guest's output is of
+wasmtime = { version = "50", features = ["task-group-hook"] }
 wasmtime-wasi = { version = "50", default-features = false, features = ["p3"] }
 wasmtime-wasi-http = { version = "50", default-features = false, features = ["default-send-request", "p3"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }

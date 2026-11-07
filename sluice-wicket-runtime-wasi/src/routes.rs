@@ -13,10 +13,10 @@
 //! acknowledged its removal, since the server may have routed a connection to
 //! it before, and its connections then shut down gracefully.
 //!
-//! A sandbox's `pool`, `instances` and `keep-ms` are no change of what serves: the handler
-//! takes them as it runs ([`Handler::resize`]). An app's target names none of them, so nothing
-//! is advertised; a route's does, so its handler goes on under the target of its new numbers,
-//! the old one lingering as a removed one does.
+//! A sandbox's `pool`, `instances`, `keep-ms` and `concurrency` are no change of what serves:
+//! the handler takes them as it runs ([`Handler::resize`]). An app's target names none of them,
+//! so nothing is advertised; a route's does, so its handler goes on under the target of its new
+//! numbers, the old one lingering as a removed one does.
 //!
 //! The console changes its own routes and its API's apps through the same
 //! reload ([`Reloader::apply`]): the routes as they would be are reloaded
@@ -269,7 +269,7 @@ pub struct Change {
     pub retargeted: Vec<String>,
     /// Same target, new content.
     pub updated: Vec<String>,
-    /// Same target and content, another `pool`, `instances` or `keep-ms`.
+    /// Same target and content, another `pool`, `instances`, `keep-ms` or `concurrency`.
     pub adjusted: Vec<String>,
 }
 
@@ -860,7 +860,7 @@ impl Reloader {
     }
 
     /// Publishes `plan` and retires the handlers it replaced, the others taking their `pool`,
-    /// `instances` and `keep-ms`; None when it changes no route. Origins or those changed alone
+    /// `instances`, `keep-ms` and `concurrency`; None when it changes no route. Origins or those changed alone
     /// (an app's tag, a scale) are published in the generation they were: nothing to advertise
     /// or acknowledge.
     fn commit(&mut self, plan: Plan) -> Option<Change> {
@@ -1883,6 +1883,7 @@ pub(crate) mod tests {
                 app.sandbox.pool = 1;
                 app.sandbox.instances = Some(3);
                 app.sandbox.keep = Some(Duration::from_millis(500));
+                app.sandbox.concurrency = 4;
                 Edit::PutApp { name, app }
             }
             _ => unreachable!("an app's PUT"),
@@ -1907,12 +1908,17 @@ pub(crate) mod tests {
         ));
         let sandbox = scaled.handler(&unscaled_target).unwrap().sandbox();
         assert_eq!(
-            (sandbox.pool, sandbox.instances, sandbox.keep),
-            (1, Some(3), Some(Duration::from_millis(500)))
+            (
+                sandbox.pool,
+                sandbox.instances,
+                sandbox.keep,
+                sandbox.concurrency
+            ),
+            (1, Some(3), Some(Duration::from_millis(500)), 4)
         );
         assert!(status.borrow().revision > revision, "the console sees it");
         assert!(
-            manifest().contains("instances: 3, keep: 500ms"),
+            manifest().contains("instances: 3, keep: 500ms, concurrency: 4"),
             "{}",
             manifest()
         );

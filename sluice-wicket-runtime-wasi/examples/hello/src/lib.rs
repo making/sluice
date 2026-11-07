@@ -59,6 +59,13 @@ impl Guest for Component {
             eprintln!("hello stderr: {method:?} {path}");
         }
 
+        if let Some(millis) = path.strip_prefix("/log-after/") {
+            // Attribution demo: a line written after a wait, other requests started meanwhile.
+            let millis: u64 = millis.parse().expect("/log-after/<milliseconds>");
+            wasi::clocks::monotonic_clock::wait_for(millis * 1000 * 1000).await;
+            println!("hello stdout: logged after {millis}ms");
+        }
+
         if path == "/panic" {
             // Sandbox demo: a guest trap must not take the tunnel down.
             panic!("guest panic (PoC)");

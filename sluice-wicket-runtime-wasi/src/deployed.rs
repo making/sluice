@@ -672,7 +672,7 @@ mod tests {
                 host: "b.local".into(),
                 component: format!("components/{}/b.wasm", "f".repeat(64)),
                 sandbox: Sandbox::parse(
-                    "budget-ms=250&instances=4&keep-ms=500&memory-mib=64&pool=2&wasi=cli,\
+                    "budget-ms=250&concurrency=3&instances=4&keep-ms=500&memory-mib=64&pool=2&wasi=cli,\
                      inherit-network,keyvalue",
                 )
                 .unwrap(),

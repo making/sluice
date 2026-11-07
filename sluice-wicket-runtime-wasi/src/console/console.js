@@ -60,6 +60,9 @@ function sandboxPairs(sandbox) {
   if (sandbox.keep_ms !== null && sandbox.keep_ms !== undefined) {
     pairs.push(`keep-ms=${sandbox.keep_ms}`);
   }
+  if ((sandbox.concurrency ?? 1) !== 1) {
+    pairs.push(`concurrency=${sandbox.concurrency}`);
+  }
   return pairs;
 }
 
@@ -105,7 +108,8 @@ function sandboxFields(initial, onChange) {
   const pool = number("pool", "Pool", "warm", initial.pool, { min: 0 });
   const instances = number("instances", "Instances", "at most", initial.instances, { min: 1, placeholder: "no cap" });
   const keep = number("keep", "Keep", "ms idle", initial.keep_ms, { min: 1, placeholder: "none" });
-  const inputs = [budget.input, memory.input, pool.input, instances.input, keep.input];
+  const concurrency = number("concurrency", "Concurrency", "at once", initial.concurrency ?? 1, { min: 1 });
+  const inputs = [budget.input, memory.input, pool.input, instances.input, keep.input, concurrency.input];
   const note = h("p", { class: "sandbox__note", id: `${id}-note` });
 
   const element = h("fieldset", { class: "sandbox" },
@@ -114,7 +118,7 @@ function sandboxFields(initial, onChange) {
     h("div", { class: "field" },
       h("span", { class: "field__label" }, "Limits"),
       h("div", { class: "field__control" },
-        h("div", { class: "limits" }, budget.element, memory.element, pool.element, instances.element, keep.element),
+        h("div", { class: "limits" }, budget.element, memory.element, pool.element, instances.element, keep.element, concurrency.element),
         note)));
   element.addEventListener("input", () => onChange?.());
   element.addEventListener("change", () => onChange?.());
@@ -141,6 +145,7 @@ function sandboxFields(initial, onChange) {
         pool: whole(pool.input, 0, "The pool"),
         instances: null,
         keep_ms: null,
+        concurrency: whole(concurrency.input, 1, "The concurrency"),
       };
       if (instances.input.value.trim() !== "") {
         sandbox.instances = whole(instances.input, 1, "Instances");
@@ -162,6 +167,7 @@ function sandboxFields(initial, onChange) {
       pool.input.value = sandbox.pool;
       instances.input.value = sandbox.instances ?? "";
       keep.input.value = sandbox.keep_ms ?? "";
+      concurrency.input.value = sandbox.concurrency ?? 1;
     },
     focus() {
       element.querySelector("input")?.focus();
@@ -169,7 +175,7 @@ function sandboxFields(initial, onChange) {
   };
 }
 
-const defaultSandbox = () => ({ wasi: [], budget_ms: defaults().budget_ms, memory_mib: defaults().memory_mib, pool: 0, instances: null, keep_ms: null });
+const defaultSandbox = () => ({ wasi: [], budget_ms: defaults().budget_ms, memory_mib: defaults().memory_mib, pool: 0, instances: null, keep_ms: null, concurrency: 1 });
 
 /** The note on moving `route` to the free host `to`. */
 function renamed(route, to) {
@@ -213,6 +219,9 @@ function sandboxCell({ sandbox }) {
   }
   if (sandbox.keep_ms !== null && sandbox.keep_ms !== undefined) {
     parts.push(limit(`keep ${formatMs(sandbox.keep_ms)}`));
+  }
+  if ((sandbox.concurrency ?? 1) !== 1) {
+    parts.push(limit(`${sandbox.concurrency} at once`));
   }
   for (const entry of sandbox.keyvalue ?? []) {
     const identifier = entry.identifier === "" ? '""' : entry.identifier;

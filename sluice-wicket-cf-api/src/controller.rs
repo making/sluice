@@ -2,8 +2,8 @@
 //! a route is an app of the wicket, named by its guid (its routes' hosts,
 //! the snapshot's component and sandbox -- its env, which the wicket lists
 //! by the names only, told by the snapshot's tag -- and the process's
-//! instances as the pool and, each taking `concurrency` at once, the route's
-//! cap, or a droplet's rootfs as a Firecracker wicket's
+//! instances as the route's cap of instances and the pool, each taking `concurrency`
+//! requests at once, or a droplet's rootfs as a Firecracker wicket's
 //! VMs: [`vm_sandbox`]); stopped, scaled to 0, or without a route, it is none. The
 //! desired state is the cf-api's: at startup and whenever the wicket's
 //! revision moves, its apps of the owner are listed and the difference put /
@@ -130,9 +130,8 @@ impl Controller {
                     budget_ms: running.budget_ms,
                     memory_mib: Some(running.memory_mib),
                     pool: Some(running.lifetime.warm.unwrap_or(app.process.instances)),
-                    instances: Some(instances.saturating_mul(
-                        running.lifetime.concurrency.unwrap_or(DEFAULT_CONCURRENCY),
-                    )),
+                    instances: Some(instances),
+                    concurrency: Some(running.lifetime.concurrency.unwrap_or(DEFAULT_CONCURRENCY)),
                     wasm_keep_ms: running.lifetime.keep_ms,
                     keyvalue: running.keyvalue.clone(),
                     env: running.env.clone(),
@@ -623,6 +622,7 @@ fn same(listed: &AppBody, desired: &AppBody) -> bool {
         && listed.sandbox.pool == desired.sandbox.pool
         && listed.sandbox.instances == desired.sandbox.instances
         && listed.sandbox.wasm_keep_ms == desired.sandbox.wasm_keep_ms
+        && listed.sandbox.concurrency == desired.sandbox.concurrency
         && listed.sandbox.memory_mib == desired.sandbox.memory_mib
         && desired
             .sandbox
@@ -718,6 +718,9 @@ mod tests {
         listed.sandbox.wasm_keep_ms = Some(500);
         assert!(!same(&listed, &unset), "another keep-ms");
         listed.sandbox.wasm_keep_ms = None;
+        listed.sandbox.concurrency = Some(1);
+        assert!(!same(&listed, &unset), "another concurrency");
+        listed.sandbox.concurrency = unset.sandbox.concurrency;
         // a count below what the start keeps warm, as a manifest leaves it: the wicket's kept
         let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
         (running.file, running.lifetime.mode, running.lifetime.warm) =
@@ -730,14 +733,15 @@ mod tests {
         let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
         (running.file, running.lifetime.mode) = ("hello.wasm".into(), None);
         // `cf scale` a component's limit too: the instances kept unless annotated, each taking
-        // `concurrency` at once, past what the wicket runs or not; as a VM's, no lower than what
-        // the start keeps warm, which the wicket refuses. `keep-ms` as annotated
+        // `concurrency` at once (16 unless annotated), past what the wicket runs or not; as a
+        // VM's, no lower than what the start keeps warm, which the wicket refuses. `keep-ms` as
+        // annotated
         for (instances, warm, concurrency, keep_ms, pool, cap) in [
-            (1, None, None, None, 1, 16),
-            (2, None, None, Some(500), 2, 32),
+            (1, None, None, None, 1, 1),
+            (2, Some(1), None, Some(500), 1, 2),
             (2, None, Some(1), None, 2, 2),
-            (2, Some(0), None, Some(60_000), 0, 32),
-            (2, Some(1), Some(3), None, 1, 6),
+            (2, Some(0), None, Some(60_000), 0, 2),
+            (2, Some(1), Some(3), None, 1, 2),
             (1, Some(3), Some(1), None, 3, 3),
             (u64::MAX, Some(0), None, None, 0, u64::MAX),
         ] {
@@ -754,9 +758,15 @@ mod tests {
                 (
                     limited.sandbox.pool,
                     limited.sandbox.instances,
+                    limited.sandbox.concurrency,
                     limited.sandbox.wasm_keep_ms
                 ),
-                (Some(pool), Some(cap), keep_ms),
+                (
+                    Some(pool),
+                    Some(cap),
+                    Some(concurrency.unwrap_or(16)),
+                    keep_ms
+                ),
                 "{instances} {warm:?} {concurrency:?} {keep_ms:?}"
             );
         }

@@ -29,7 +29,7 @@ usage: sluice-wicket-runtime-wasi --server <url> --wasm <host>=<locator>[?<optio
   --listen <host:port>            also (or only, without --server) serve the routes over plain
                                   TCP, http/1.1 and h2c, routed by the request's host
   --wasm <host>=<locator>         a route: a component path, file:// or http(s):// url;
-                                  repeatable. ?budget-ms=N&instances=N&keep-ms=N
+                                  repeatable. ?budget-ms=N&concurrency=N&instances=N&keep-ms=N
                                   &memory-mib=N&pool=N&wasi=<cap>,... sets its sandbox (wasi=keyvalue: the
                                   default store, namespaced by the host)
   --config <file>                 YAML settings and routes, the routes reloaded on change
@@ -774,6 +774,8 @@ pub(crate) struct SandboxFile {
     instances: Option<usize>,
     /// How long a unit beyond the pool is kept serving none, a duration (`keep-ms`).
     keep: Option<Scalar>,
+    /// The requests an instance takes at once (`concurrency`).
+    concurrency: Option<usize>,
     /// Keyvalue identifier -> `store[/namespace]` (`wasi: [keyvalue]`); the
     /// namespace defaults to the host, the map to `"": <default store>`.
     keyvalue: Option<BTreeMap<String, String>>,
@@ -792,6 +794,7 @@ impl SandboxFile {
             pool,
             instances,
             keep,
+            concurrency,
             keyvalue,
             env,
         } = self;
@@ -819,6 +822,10 @@ impl SandboxFile {
         sandbox.instances = match instances {
             Some(0) => return Err("sandbox.instances: must be at least 1".into()),
             cap => cap,
+        };
+        sandbox.concurrency = match concurrency {
+            Some(0) => return Err("sandbox.concurrency: must be at least 1".into()),
+            concurrency => concurrency.unwrap_or(1),
         };
         if let Some(env) = env {
             sandbox.env = Env::new(env).map_err(|e| format!("sandbox.env: {e}"))?;
@@ -877,6 +884,9 @@ pub(crate) fn sandbox_yaml(sandbox: &Sandbox, map: bool) -> Option<String> {
     }
     if let Some(keep) = sandbox.keep {
         pairs.push(format!("keep: {}ms", keep.as_millis()));
+    }
+    if sandbox.concurrency != 1 {
+        pairs.push(format!("concurrency: {}", sandbox.concurrency));
     }
     if map && !sandbox.keyvalue.is_empty() {
         let places: Vec<String> = sandbox
@@ -1205,7 +1215,8 @@ pub fn parse_seconds(name: &str, value: &str) -> Result<Duration, String> {
         .map_err(|_| format!("--{name} must be a number of seconds (0 = off), got '{value}'"))
 }
 
-/// Splits `locator[?budget-ms=N&files=DIR&instances=N&keep-ms=N&memory-mib=N&pool=N&wasi=cap,...]`
+/// Splits `locator[?budget-ms=N&concurrency=N&files=DIR&instances=N&keep-ms=N&memory-mib=N&pool=N
+/// &wasi=cap,...]`
 /// into the locator and the per-route sandbox, `files` relative to the working directory.
 /// The `?` separator means literal `?` in file paths needs URL-escaping (`file://...%3F...`).
 pub fn parse_route_target(spec: &str) -> Result<(String, Sandbox), String> {
@@ -1322,6 +1333,7 @@ routes:
       pool: 2
       instances: 4
       keep: 30s
+      concurrency: 8
   - host: b.local
     component: https://example.invalid/b.wasm
     files: site
@@ -1404,7 +1416,7 @@ routes:
         assert_eq!(routes[0].component, Locator::File(dir.0.join("a.wasm")));
         assert_eq!(
             route_target("a", &routes[0].sandbox),
-            "a?budget-ms=250&instances=4&keep-ms=30000&memory-mib=64&pool=2&wasi=cli,\
+            "a?budget-ms=250&concurrency=8&instances=4&keep-ms=30000&memory-mib=64&pool=2&wasi=cli,\
              inherit-network"
         );
         assert_eq!(

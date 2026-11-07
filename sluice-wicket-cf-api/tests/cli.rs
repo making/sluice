@@ -832,7 +832,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
     assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 2);
 
     // `cf scale` the limit: an instance takes 16 requests at once, the next waits for one of
-    // them to end; what serves past the instance kept is named as `cf app` lists it
+    // them to end; what serves beside them is named as `cf app` lists it
     let limited = "limited.localhost";
     let manifest = dir.join("limited.yml");
     let budget = "applications:\n- name: limited\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/budget-ms: 30000\n";
@@ -885,9 +885,23 @@ fn the_cf_cli_deploys_to_the_wicket() {
     let limits = || {
         let sandbox = app_of()["sandbox"].clone();
         let count = |key: &str| sandbox[key].as_u64();
-        (count("pool"), count("instances"), count("keep_ms"))
+        (
+            count("pool"),
+            count("instances"),
+            count("concurrency"),
+            count("keep_ms"),
+        )
     };
-    assert_eq!(limits(), (Some(1), Some(16), None));
+    assert_eq!(limits(), (Some(1), Some(1), Some(16), None));
+    annotate(
+        &cf,
+        "limited",
+        &json!({"wicket.sluice.ik.am/concurrency": "1"}),
+    );
+    assert_eq!(limits(), (Some(1), Some(1), Some(1), None));
+    beyond(1);
+    cf.ok(&["scale", "limited", "-i", "2"]);
+    assert_eq!(limits(), (Some(2), Some(2), Some(1), None));
     // a request past the warm instance has one of its own kept `keep-ms` after it, at once; none
     // kept without it
     let alive_come_to = |count: usize| {
@@ -897,9 +911,10 @@ fn the_cf_cli_deploys_to_the_wicket() {
             std::thread::sleep(Duration::from_millis(100));
         }
     };
-    let keep = json!({"wicket.sluice.ik.am/keep-ms": "60000"});
+    let keep = json!({"wicket.sluice.ik.am/warm": "1", "wicket.sluice.ik.am/keep-ms": "60000"});
     assert!(annotate(&cf, "limited", &keep).contains("\"guid\""));
-    assert_eq!(limits(), (Some(1), Some(16), Some(60_000)));
+    assert_eq!(limits(), (Some(1), Some(2), Some(1), Some(60_000)));
+    alive_come_to(1);
     let stream = held(&listen, limited, "/stall");
     assert_eq!(get(&listen, limited, "/", None).0, 200);
     drop(stream);
@@ -910,15 +925,6 @@ fn the_cf_cli_deploys_to_the_wicket() {
         &json!({"wicket.sluice.ik.am/keep-ms": null}),
     );
     alive_come_to(1);
-    annotate(
-        &cf,
-        "limited",
-        &json!({"wicket.sluice.ik.am/concurrency": "1"}),
-    );
-    assert_eq!(limits(), (Some(1), Some(1), None));
-    beyond(1);
-    cf.ok(&["scale", "limited", "-i", "2"]);
-    assert_eq!(limits(), (Some(2), Some(2), None));
     let refused = annotate(
         &cf,
         "limited",
@@ -2025,14 +2031,16 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         let fc = apps.iter().find(|app| app["hosts"][0] == "fc.localhost");
         fc.map(|fc| fc["sandbox"].clone())
     };
-    let alive = || {
+    // a count of the route's VMs, as the wicket's console lists them
+    let vms = |count: &str| {
         let (status, body) = get(&console, &console, "/api/routes", Some(TOKEN));
         assert_eq!(status, 200, "{body}");
         let routes: Value = serde_json::from_str(&body).unwrap();
         let routes = routes["routes"].as_array().unwrap().clone();
         let fc = routes.iter().find(|route| route["host"] == "fc.localhost");
-        fc.unwrap()["vms"]["alive"].as_u64().unwrap()
+        fc.unwrap()["vms"][count].as_u64().unwrap()
     };
+    let alive = || vms("alive");
     let scales_to_zero = |what: &str| {
         assert_eq!(get(&listen, "fc.localhost", "/", None).0, 200, "{what}");
         let deadline = Instant::now() + HANG;
@@ -2175,16 +2183,19 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     let boot_ids: std::collections::BTreeSet<_> = (0..12).map(|_| answered_by().0).collect();
     assert_eq!(boot_ids.len(), 3, "{boot_ids:?}");
     // the first start in its place is at once, a boot long: again until `cf app` sees one, each
-    // next one after a longer wait
+    // next one after a longer wait. Each next exit once the last one's VM is up again: one whose
+    // end the wicket has yet to see takes a connection only to cut it
     let deadline = Instant::now() + HANG;
-    let crashed = loop {
+    let crashed = 'exits: loop {
+        let restarts = vms("restarts");
         assert_eq!(get(&listen, "fc.localhost", "/exit", None).0, 200);
-        let shown = cf.ok(&["app", "fc"]);
-        if shown.contains("crashed") {
-            break shown;
+        while vms("restarts") == restarts {
+            let shown = cf.ok(&["app", "fc"]);
+            if shown.contains("crashed") {
+                break 'exits shown;
+            }
+            assert!(Instant::now() < deadline, "no crashed instance: {shown}");
         }
-        assert!(Instant::now() < deadline, "no crashed instance: {shown}");
-        instances_come_to(&cf, "fc", "3/3");
     };
     assert_eq!(crashed.matches("crashed").count(), 1, "{crashed}");
     assert_eq!(crashed.matches("running").count(), 2, "{crashed}");

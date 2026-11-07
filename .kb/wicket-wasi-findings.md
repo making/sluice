@@ -46,6 +46,44 @@ request. Without copy-on-write (macOS) the data section is copied per instance. 
 with what a guest writes and computes at its start, 1-1.6ms here against 20-30us for the hello
 guest: what `keep-ms` keeps beyond `pool`.
 
+## Concurrency
+
+A store is driven by one task. On an M4 Max (16 cores, default workers), keep-alive `GET /`
+to the hello guest, `oha` for 5s on `--listen`, release profile; rate, and the wicket's CPU per
+request:
+
+| route | `-c 16` | `-c 64` |
+|---|---|---|
+| `pool=16` / `pool=64`, one request a store | 92k, 62us | 110k, 66us |
+| `pool=4&concurrency=4` / `pool=16&concurrency=4` | 89k, 62us | 110k |
+| `pool=4&concurrency=16` | | 99k, 64us |
+| `pool=1&concurrency=16` / `pool=1&concurrency=64` | 40-41k, 61us | 36k, 63us |
+| no pool, one request a store | 22k | |
+
+A request costs the same CPU in a shared store; one store's requests share one core, which caps
+it near 40k/s for the hello guest. `/hold/5` (the guest waits 5ms on a host timer) at `-c 16`:
+2.1k/s on `pool=1&concurrency=16` and on `pool=16` alike, 145/s on one unit of one request.
+So the default stays 1 and CPU-bound routes spread over stores; the cf-api maps a CF instance
+to one store (memory, indices and the trap's reach as CF has them), `cf scale -i` adding cores.
+
+What wasmtime 50 lets the host do with several requests in one store:
+
+- no guest task can be cancelled (wasmtime#11833; `wasmtime_wasi_http::handler` lets an expired
+  task run on, as here). Dropping a call's future leaves its task in the store: a request past
+  its budget is answered from outside, its store drained and dropped once its others are done
+- busy wasm, the epoch callback and sync host calls hold the store (wasmtime#11869, #11870):
+  nothing else in it runs, the closure passed to `run_concurrent` included, so timers live
+  outside it. An epoch callback returning `UpdateDeadline::Yield` suspends the fiber and returns
+  `Pending` from the store's poll, which lets the watchdog beside it run; a tokio `Sleep` past
+  due may still be unfired then (the worker was held), so the watchdog checks its deadline at
+  every poll. Requests handed to a store held so are never taken: answered 503 at its end
+- a trap poisons the store: every request in it fails
+- the task group hook (feature `task-group-hook`) tells which call's task group runs at each
+  thread switch. A guest's write to stdout reaches the host's `StreamConsumer` within the write
+  (`Instance::consume`, polled synchronously), in the writer's group, so a line is attributed
+  so. Binding at `write-via-stream` would not do: Rust's wasm32-wasip3 std opens stdout's stream
+  once per instance (one `async_stream()` for every request a unit served)
+
 ## Transport flow control
 
 A unit test sends 32MiB through a proxy that holds the wicket's answers back one round trip at a

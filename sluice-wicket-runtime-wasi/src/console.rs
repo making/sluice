@@ -21,7 +21,7 @@
 //! DELETE /api/keyvalue/<store>/<namespace>      deletes the data of a namespace no route maps
 //! ```
 //!
-//! The options are the `--wasm` route's (`budget-ms`, `instances`, `keep-ms`,
+//! The options are the `--wasm` route's (`budget-ms`, `concurrency`, `instances`, `keep-ms`,
 //! `memory-mib`, `pool`, `wasi`), the whole sandbox: an option left out takes
 //! its default. An app's sandbox is the same in JSON, with its keyvalue map
 //! and its env (the guest's environment variables, which may hold secrets:
@@ -676,6 +676,7 @@ struct SandboxView {
     pool: usize,
     instances: Option<usize>,
     keep_ms: Option<u128>,
+    concurrency: usize,
     keyvalue: Vec<BucketView>,
     /// The names of the guest's environment variables, never their values.
     env: Vec<String>,
@@ -690,6 +691,7 @@ impl SandboxView {
             pool: sandbox.pool,
             instances: sandbox.instances,
             keep_ms: sandbox.keep.map(|keep| keep.as_millis()),
+            concurrency: sandbox.concurrency,
             keyvalue: sandbox
                 .keyvalue
                 .iter()
@@ -795,6 +797,7 @@ struct SandboxBody {
     pool: usize,
     instances: Option<usize>,
     keep_ms: Option<u64>,
+    concurrency: Option<usize>,
     #[serde(default)]
     keyvalue: BTreeMap<String, String>,
     #[serde(default, skip_serializing)]
@@ -811,6 +814,7 @@ impl SandboxBody {
             pool: sandbox.pool,
             instances: sandbox.instances,
             keep_ms: sandbox.keep.map(|keep| keep.as_millis() as u64),
+            concurrency: Some(sandbox.concurrency),
             keyvalue: deployed::map_specs(&sandbox.keyvalue),
             env: BTreeMap::new(),
         }
@@ -845,6 +849,10 @@ impl SandboxBody {
         sandbox.keep = match self.keep_ms {
             Some(0) => return Err("sandbox.keep_ms: must be at least 1".into()),
             keep => keep.map(Duration::from_millis),
+        };
+        sandbox.concurrency = match self.concurrency {
+            Some(0) => return Err("sandbox.concurrency: must be at least 1".into()),
+            concurrency => concurrency.unwrap_or(1),
         };
         sandbox.check().map_err(|e| format!("sandbox: {e}"))?;
         sandbox.env = Env::new(self.env).map_err(|e| format!("sandbox.env: {e}"))?;

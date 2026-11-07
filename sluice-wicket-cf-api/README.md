@@ -252,11 +252,11 @@ another OpenID Provider and the like.
 | package (docker) | an image (`cf push --docker-image`, a manifest's `docker.image`) holding the component as one `application/wasm` layer, as `wkg oci push` and `oras push <ref> hello.wasm:application/wasm` push it (of an index, its `wasm` entry). `--docker-username` with `CF_DOCKER_PASSWORD` are its credentials |
 | build | picks the component: the one the web process command names (`-c hello.wasm`, `command:`), else the package's only `.wasm`, else of a package with an `index.html` sluice-wicket-site ([a static site](#static-sites)); of an image, pulls it. It must be a component (`\0asm`, layer 1). Anything else fails the build, naming what it found |
 | droplet | that component, by sha256 (`process_types.web` its path; stack `wasip3`, buildpack `wasm`, a static site's `site` with its files); of an image, the image by digest (`cf app`: `docker image:`), `process_types.web` the repository's last segment `.wasm` |
-| web process `instances` | [the limit](#instances) N: the route's `instances` is N x `concurrency`, its `pool` `warm`, N by default. A request no warm instance takes gets an instance of its own, up to the limit. 0 is [as on CF](#mapping): no app in the wicket. `cf logs` names the instance (`APP/PROC/WEB/<index>`, the requests' `app_index`) within `0` to `instances - 1`, what `cf app` lists: the wicket's index, a warm one's `0` to `pool - 1`, one of its own the lowest free from `pool` up, modulo `instances` |
-| web process `memory` | `memory-mib` |
-| annotation `wicket.sluice.ik.am/budget-ms` | `budget-ms` |
-| annotation `wicket.sluice.ik.am/concurrency` | [the requests an instance takes at once](#instances), at once |
-| annotation `wicket.sluice.ik.am/keep-ms` | `keep-ms`: [how long a request's own wasm instance is kept](#instances) after it, at once |
+| web process `instances` | [the limit](#instances) N: the route's `instances`, each a wasm instance (a store) taking `concurrency` requests at once, its `pool` `warm`, N by default. A request no warm instance has room for gets an instance of its own, up to the limit. 0 is [as on CF](#mapping): no app in the wicket. `cf logs` names the instance (`APP/PROC/WEB/<index>`, the requests' `app_index`) within `0` to `instances - 1`, what `cf app` lists: the wicket's index, a warm one's `0` to `pool - 1`, one of its own the lowest free from `pool` up, modulo `instances` |
+| web process `memory` | `memory-mib`: what an instance holds, its requests' together |
+| annotation `wicket.sluice.ik.am/budget-ms` | `budget-ms`: each request's |
+| annotation `wicket.sluice.ik.am/concurrency` | `concurrency`: [the requests an instance takes at once](#instances), at once |
+| annotation `wicket.sluice.ik.am/keep-ms` | `keep-ms`: [how long an instance beyond `warm` is kept](#instances) serving none, at once |
 | annotation `wicket.sluice.ik.am/warm` | `pool`: [the instances kept up](#instances), at once |
 | environment variables (`cf set-env`, a manifest's `env:`), `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: what the guest's `wasi:cli/environment` answers |
 | disk | accepted and shown, no effect |
@@ -668,7 +668,7 @@ applications:
 |---|---|---|
 | `mode` | `boot`, `per-connection`, `reuse` or `pool` | |
 | `warm` | VMs kept, from 0 to `instances` | `per-connection`, `reuse`, `pool` |
-| `keep-ms` | how long a VM serving nothing is kept: a pool's beyond its `warm`, which it needs annotated; a component's wasm instance beyond `warm` ([Instances](#instances)) | `reuse`, `pool`, a component |
+| `keep-ms` | how long a VM serving nothing is kept: a pool's beyond its `warm`, which it needs annotated; a component's instance so ([Instances](#instances)) | `reuse`, `pool`, a component |
 | `uses`, `lifetime-ms` | the connections a VM serves, how long it serves | `reuse` |
 | `concurrency` | what an instance takes at once: [the limit](#instances) | `pool`, a component |
 
@@ -678,7 +678,7 @@ applications:
   take that: what it opened before its snapshot (a database's connections) is gone in a clone
 - refused, by `cf push`, the v3 API and `cf scale -i`, naming it: an option its mode does not take,
   none annotated being `pool`, what is no mode or no number, `warm` above the
-  instances, a VM pool's `keep-ms` without a `warm`, `instances`, which `cf scale -i` and `concurrency` replace. A wicket not answering, by
+  instances, a pool's `keep-ms` without a `warm` (a component's too), `instances`, which `cf scale -i` and `concurrency` replace. A wicket not answering, by
   the app's next start
 - at once, as `cf scale -i`: the wicket adjusts the running VMs, none restarted. `mode` is what
   a VM is: another one than the running one waits for the next start, the others with it, the
@@ -798,27 +798,34 @@ Cloud Run's do:
 | annotation `wicket.sluice.ik.am/concurrency` | what an instance takes at once: a component's requests, a `pool` VM's connections | concurrency | 16 |
 | annotation `wicket.sluice.ik.am/warm` | the instances kept up with no request, from 0 to N | minimum instances | N, as on CF; a VM per connection: 0 |
 
-- **A component's instance** is no wasm instance but room for `concurrency` of them at once: the
-  wicket's wasm instance (a store) takes one request at a time, its budget, memory cap and trap
-  being that request's. `warm: N` keeps N of them, units of the wicket's `pool`: N requests' worth
-  warm, not N x `concurrency`. At `-i 1`, 16 requests at once are served so:
+- **A component's instance** is one wasm instance (a store) taking `concurrency` requests at
+  once ([the wicket's](../sluice-wicket-runtime-wasi/README.md#concurrency)), as a CF instance is
+  one process: `memory` bounds it, its requests' together, the guest's module state is theirs to
+  share, and a trap ends every one of them. `budget-ms` stays each request's: one past it is
+  answered 504 at its deadline, and its instance, taking no more, ends once the others are
+  done and is replaced. `warm: N` keeps N of them, units of the wicket's `pool`. At `-i 1`
+  requests are served so:
 
   | request | served by |
   |---|---|
-  | the 1st | the warm unit |
-  | the 2nd to the 16th | a wasm instance of its own, instantiated for it (~250us of a hello component) and ended with it; annotated `keep-ms`, kept until it served none for that long, taking the next request finding the warm unit busy |
+  | the 1st to the 16th | the warm instance, at once |
   | the 17th | the first of them to end, waited for within its `budget-ms`, then a 503 |
 
-  `keep-ms` pays for a component whose start costs more than a hello's: one writing an 8MiB heap
-  answers in 1.6ms cold against 30us warm ([measured](../.kb/wicket-wasi-findings.md#a-pooled-units-latency)).
+  A request no warm instance has room for, within `instances`, starts one, which takes the next
+  ones as the warm do and ends once it serves none; annotated `keep-ms`, it is kept until it
+  served none for that long. That pays for a component whose start costs more than a hello's:
+  one writing an 8MiB heap answers in 1.6ms cold against 30us warm
+  ([measured](../.kb/wicket-wasi-findings.md#a-pooled-units-latency)). Such an instance is named in
+  `cf logs` by the lowest index free from `warm` up.
 
-  `memory` bounds each wasm instance: an instance taking 16 requests may take 16 x `memory`. A
-  request's own is named in `cf logs` by the lowest index free from `warm` up, modulo `instances`:
-  `0` at `-i 1`
-- **Scale to zero** is `warm: 0`. A component then has each request instantiate its own (~250us
-  against ~130us warm of a hello component, [measured](../.kb/wicket-wasi-findings.md#a-pooled-units-latency))
-  and keeps none between requests, unless `keep-ms` keeps each until it served none for that
-  long: an idle app holds none once it passed. A `pool` VM grows to N on demand, and one
+  An instance is one task of the wicket: its requests share a core. A hello component's
+  instance serves ~40k requests a second where 16 serve 92k, a component waiting on its
+  upstreams as much either way ([measured](../.kb/wicket-wasi-findings.md#concurrency)): `cf scale
+  -i` adds cores to a CPU-bound app, `concurrency` room to a waiting one
+- **Scale to zero** is `warm: 0`. A component then has a request start an instance (~250us
+  against ~130us warm of a hello component, [measured](../.kb/wicket-wasi-findings.md#a-pooled-units-latency)),
+  which takes the others arriving while it serves and ends once it serves none, unless
+  `keep-ms` keeps it until it served none for that long: an idle app holds none once it passed. A `pool` VM grows to N on demand, and one
   serving none is stopped after `keep-ms` (60s by default), so an idle app holds no VM and its next
   request pays a restore. `reuse` keeps a clone `keep-ms` after its connection, `per-connection`
   none; `boot` keeps its N VMs
@@ -852,7 +859,7 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
 
 | | `-i N` limits | at once |
 |---|---|---|
-| component | `N x concurrency` slots (the route's `instances`); `pool` stays N unless `warm` says | `N x concurrency` requests |
+| component | N wasm instances (the route's `instances`), each taking `concurrency` requests; `pool` stays N unless `warm` says | `N x concurrency` requests |
 | `boot` VM | N VMs (`vms`), kept | any |
 | `pool` VM | N VMs (`vms`), `concurrency` the route's `conns` | as `conns` has it |
 | `per-connection`, `reuse` VM | N VMs (`vms`): the memory is N x `mem`, as CF's quota counts it | N connections |
@@ -870,10 +877,10 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
 - **A VM per connection** keeps N literal: a VM is memory, and whoever annotates the mode chose it.
   `cf push` and `cf scale` warn of the count, and the connection finding no room waits for it
   within the route's `wait-ms` (10s), then gets a 502 saying so
-- **A limit above the wicket's own** runs, bounded by the wicket: N x 16 past `--max-instances`
+- **A limit above the wicket's own** runs, bounded by the wicket: N past `--max-instances`
   is no refusal
 - **`cf app`** lists the instances alive, as the wicket has them at each request: a warm one, a VM
-  serving or kept, a request's own while it runs, each `since` its own start (a unit replaced, a VM
+  serving or kept, one started for a request while it serves, each `since` its own start (a unit replaced, a VM
   cloned anew: then; those of one index, as `cf logs` has them below: the lowest's). So `3/3` below a limit of 4, and `0/0`,
   `There are no running instances of this process`, with none: no failure, and `cf push`, `cf restart`
   and `--strategy rolling` finish at it, the CLI's wait ending at an entry `RUNNING` or at no entry.
