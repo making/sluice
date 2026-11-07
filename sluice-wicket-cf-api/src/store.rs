@@ -29,7 +29,8 @@ pub const MODE_ANNOTATION: &str = "wicket.sluice.ik.am/mode";
 /// The annotation of an app setting how many of its instances are kept warm: a VM's `warm`, a
 /// component's `pool`.
 pub const WARM_ANNOTATION: &str = "wicket.sluice.ik.am/warm";
-/// The annotation of an app setting how long a VM serving nothing lives: its routes' `keep-ms`.
+/// The annotation of an app setting how long a VM, or a component's unit beyond its `pool`,
+/// serving nothing lives: its routes' `keep-ms`.
 pub const KEEP_ANNOTATION: &str = "wicket.sluice.ik.am/keep-ms";
 /// The annotation of an app setting how many connections a VM serves: its routes' `uses`.
 pub const USES_ANNOTATION: &str = "wicket.sluice.ik.am/uses";

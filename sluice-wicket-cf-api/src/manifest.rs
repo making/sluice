@@ -517,12 +517,7 @@ pub fn check_annotations(
     };
     match runtime {
         Some(Runtime::Wasm) => {
-            let vm = [
-                MODE_ANNOTATION,
-                KEEP_ANNOTATION,
-                USES_ANNOTATION,
-                LIFETIME_ANNOTATION,
-            ];
+            let vm = [MODE_ANNOTATION, USES_ANNOTATION, LIFETIME_ANNOTATION];
             if let Some(key) = vm.iter().find(|key| annotations.contains_key(**key)) {
                 return Err(format!(
                     "annotation {key}: this wicket runs components, it has no VMs"
@@ -570,10 +565,12 @@ pub fn check_annotations(
             None => format!("annotation {key} needs annotation {MODE_ANNOTATION}"),
         });
     }
-    if matches!(lifetime.mode.as_deref(), None | Some("pool"))
-        && lifetime.keep_ms.is_some()
-        && lifetime.warm.is_none()
-    {
+    // a component's pool has units beyond it, up to its `instances` x `concurrency`
+    let vm_pool = match lifetime.mode.as_deref() {
+        None => runtime == Some(Runtime::Firecracker),
+        mode => mode == Some("pool"),
+    };
+    if vm_pool && lifetime.keep_ms.is_some() && lifetime.warm.is_none() {
         return Err(format!(
             "annotation {KEEP_ANNOTATION}: a pool keeps all its VMs, none to let go, unless \
              annotation {WARM_ANNOTATION} says how many: 0 keeps none"
@@ -1047,7 +1044,7 @@ mod tests {
             (&[("mode", "pool"), ("keep-ms", "1")], 2, None, "/warm"),
             // each wicket's own
             (&[("mode", "pool")], 2, Some(Wasm), "no VMs"),
-            (&[("keep-ms", "1")], 2, Some(Wasm), "no VMs"),
+            (&[("uses", "1")], 2, Some(Wasm), "no VMs"),
             (&[("budget-ms", "1")], 2, Some(Firecracker), "no components"),
             // what `cf scale -i` and `concurrency` replace, on any wicket
             (&[("instances", "1")], 2, Some(Firecracker), "cf scale -i"),
@@ -1101,6 +1098,9 @@ mod tests {
                 Some(Wasm),
             ),
             (&[("warm", "1"), ("concurrency", "1")], 2, None),
+            // a component's units beyond its pool, `warm` or not
+            (&[("keep-ms", "1")], 2, Some(Wasm)),
+            (&[("keep-ms", "1")], 2, None),
             (&[("budget-ms", "1")], 2, None),
         ] {
             check(pairs, instances, runtime).unwrap_or_else(|e| panic!("{pairs:?}: {e}"));

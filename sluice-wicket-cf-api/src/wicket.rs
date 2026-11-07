@@ -80,6 +80,9 @@ pub struct Sandbox {
     pub pool: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instances: Option<u64>,
+    /// A wasm wicket's: how long a unit beyond `pool` serving nothing is kept.
+    #[serde(rename = "keep_ms", skip_serializing_if = "Option::is_none")]
+    pub wasm_keep_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub keyvalue: BTreeMap<String, String>,
     /// A Firecracker wicket's: how a connection gets its VM.

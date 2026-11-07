@@ -24,6 +24,28 @@ is left per request. A `pool=16` route serves 66k at 0.23ms either way.
 
 Hello guest, release profile: ~250us cold vs ~130us pooled per request.
 
+A guest with a costly start against the hello guest (the ignored `load_comparison_reference`,
+sequential requests, release profile, mean of 200; the guest built for it, not kept): one with a
+16MiB data section (a snapshotted JS / Python runtime's size), per request touching nothing,
+reading a byte of each of its pages, writing a byte of each page of an 8MiB heap, or running
+~0.5ms of init once per instance. Cold / pooled:
+
+| guest, request | Linux 7.2 (aarch64, a container on OrbStack) | macOS (M-series) |
+|---|---|---|
+| hello | 34-40us / 14-18us | 51us / 20us |
+| 16MiB data | 83-85us / 13-14us | 975-983us / 17us |
+| 16MiB data, read | 95-103us / 39-43us | 1.04ms / 30us |
+| 8MiB heap, written | 1.62-1.67ms / 28-29us | 1.37-1.40ms / 26us |
+| both | 1.24-1.26ms / 52-55us | 1.42-1.49ms / 38-39us |
+| init | 470-473us / 14us | 1.44-1.49ms / 18-19us |
+
+On Linux a data section costs a cold instance little: its image is mapped copy-on-write, and a
+read faults the shared page in. A written page is the cost: a fresh instance faults every page its
+heap writes (past the 4MiB the pooling allocator keeps resident), a unit wrote them on its first
+request. Without copy-on-write (macOS) the data section is copied per instance. So the gap grows
+with what a guest writes and computes at its start, 1-1.6ms here against 20-30us for the hello
+guest: what `keep-ms` keeps beyond `pool`.
+
 ## Transport flow control
 
 A unit test sends 32MiB through a proxy that holds the wicket's answers back one round trip at a

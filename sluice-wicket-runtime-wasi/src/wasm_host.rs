@@ -40,7 +40,7 @@ use wasmtime::AsContextMut as _;
 
 use crate::env::Env;
 use crate::keyvalue;
-use sluice_wicket_tunnel::flume::{Indices, Tap};
+use sluice_wicket_tunnel::flume::{Index, Indices, Tap};
 use sluice_wicket_tunnel::tunnel::TunnelIo;
 
 /// Relay slots between the guest's store task and hyper; together with the
@@ -628,6 +628,10 @@ pub struct Sandbox {
     /// units included (`Handler::admit`); None leaves the route bounded by
     /// `Instances` alone.
     pub instances: Option<usize>,
+    /// How long a unit beyond `pool` is kept serving none (`keep-ms`): with it, a request
+    /// finding no idle unit starts one in place of a per-request instance (see `Pool`); None
+    /// keeps none.
+    pub keep: Option<std::time::Duration>,
     /// The keyvalue identifiers the guest may open, with `caps.keyvalue`;
     /// filled in by the route's source (the map named, or the default one).
     pub keyvalue: keyvalue::BucketMap,
@@ -643,7 +647,7 @@ pub struct Sandbox {
 
 impl Sandbox {
     /// Parses the route query
-    /// (`budget-ms=N&instances=N&memory-mib=N&pool=N&wasi=cli,tcp`).
+    /// (`budget-ms=N&instances=N&keep-ms=N&memory-mib=N&pool=N&wasi=cli,tcp`).
     pub fn parse(query: &str) -> Result<Sandbox, String> {
         let mut pairs = Vec::new();
         for pair in query.split('&').filter(|pair| !pair.is_empty()) {
@@ -676,9 +680,16 @@ impl Sandbox {
                     0 => return Err("instances: must be at least 1".into()),
                     cap => Some(cap),
                 };
+            } else if key == "keep-ms" {
+                sandbox.keep = match value.parse() {
+                    Ok(0) => return Err("keep-ms: must be at least 1".into()),
+                    Ok(millis) => Some(std::time::Duration::from_millis(millis)),
+                    Err(_) => return Err(format!("{key}: not a number '{value}'")),
+                };
             } else if !sandbox.limits.set(key, value)? {
                 return Err(format!(
-                    "unknown option '{key}' (budget-ms, instances, memory-mib, pool, wasi)"
+                    "unknown option '{key}' (budget-ms, instances, keep-ms, memory-mib, pool, \
+                     wasi)"
                 ));
             }
         }
@@ -707,23 +718,25 @@ impl Sandbox {
         self.pairs(true).join("&")
     }
 
-    /// [`Sandbox::query`] without `pool` and `instances`: an app's, named by the app, which a
-    /// change of those need not advertise ([`Handler::resize`]).
+    /// [`Sandbox::query`] without `pool`, `instances` and `keep-ms`: an app's, named by the app,
+    /// which a change of those need not advertise ([`Handler::resize`]).
     pub fn query_of_app(&self) -> String {
         self.pairs(false).join("&")
     }
 
-    /// Whether `other` differs in `pool` and `instances` alone: its handler can take it.
+    /// Whether `other` differs in `pool`, `instances` and `keep-ms` alone: its handler can take
+    /// it.
     pub fn same_instances(&self, other: &Sandbox) -> bool {
         let of = |sandbox: &Sandbox| Sandbox {
             pool: 0,
             instances: None,
+            keep: None,
             ..sandbox.clone()
         };
         of(self) == of(other)
     }
 
-    /// The query's pairs, `counts` with `pool` and `instances`.
+    /// The query's pairs, `counts` with `pool`, `instances` and `keep-ms`.
     fn pairs(&self, counts: bool) -> Vec<String> {
         let defaults = Limits::default();
         let mut pairs = Vec::new();
@@ -738,6 +751,9 @@ impl Sandbox {
         }
         if let Some(cap) = self.instances.filter(|_| counts) {
             pairs.push(format!("instances={cap}"));
+        }
+        if let Some(keep) = self.keep.filter(|_| counts) {
+            pairs.push(format!("keep-ms={}", keep.as_millis()));
         }
         if !self.keyvalue.is_empty() {
             let map: Vec<_> = self
@@ -1727,13 +1743,36 @@ pub const INSTANCE_LIMIT_REACHED: &str = "wasm instance limit reached";
 /// one slot from before its creation until after it was dropped. A request
 /// finding none free waits for one within its budget (`Handler::admit`); the
 /// semaphore hands them out in request order. A route's `instances` cap
-/// bounds its share of them (`Handler::slot`) but reserves none.
+/// bounds its share of them (`Handler::slot`) but reserves none. A spare unit,
+/// kept beyond its pool's size (`keep-ms`), holds a slot nobody reserved: one
+/// waiting for a slot ends such a unit if one is idle, and none goes idle while
+/// one waits.
 pub struct Instances {
     slots: Arc<tokio::sync::Semaphore>,
     max: usize,
+    /// Those waiting for a process-wide slot now.
+    waiting: AtomicUsize,
+    /// The pools of the routes, whose spare units give their slots up.
+    pools: Mutex<Vec<std::sync::Weak<Pool>>>,
     /// Where the guests' output and the answered requests go besides the
     /// process log: the live access log's tap, off without a flume.
     tap: Arc<Tap>,
+}
+
+/// A wait for a process-wide slot, counted on [`Instances::waiting`] while it lasts.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn of(waiting: &'a AtomicUsize) -> Self {
+        waiting.fetch_add(1, Ordering::Relaxed);
+        Self(waiting)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// One instance slot -- the process-wide one, plus the route's own under
@@ -1759,6 +1798,8 @@ impl Instances {
         Arc::new(Instances {
             slots: Arc::new(tokio::sync::Semaphore::new(max)),
             max,
+            waiting: AtomicUsize::new(0),
+            pools: Mutex::new(Vec::new()),
             tap,
         })
     }
@@ -1788,17 +1829,63 @@ impl Instances {
     /// no slot another route could use; the route's own slot it may hold
     /// meanwhile only delays the route's later requests, which queue behind
     /// it anyway.
+    ///
+    /// Short of a process-wide slot, it counts as waiting and ends the spare unit idle longest, if
+    /// any ([`Instances::reclaim`]).
     async fn slot(&self, route: &Arc<tokio::sync::Semaphore>) -> Slot {
         let route = route.clone().acquire_owned().await.expect("never closed");
-        let global = self
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("never closed");
+        let global = match self.slots.clone().try_acquire_owned() {
+            Ok(global) => global,
+            Err(_) => {
+                // counted until the wait ends, however it ends (a request giving up drops it)
+                let _waiting = Waiting::of(&self.waiting);
+                self.reclaim();
+                self.slots
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("never closed")
+            }
+        };
         Slot {
             _route: route,
             _global: global,
+        }
+    }
+
+    /// Whether one waits for a process-wide slot: a spare unit gives its own up rather than going
+    /// idle.
+    fn wanted(&self) -> bool {
+        self.waiting.load(Ordering::Relaxed) > 0
+    }
+
+    /// Takes `pool`'s spare units into account from now on.
+    fn register(&self, pool: &Arc<Pool>) {
+        let mut pools = self.pools.lock().unwrap();
+        pools.retain(|pool| pool.strong_count() > 0);
+        pools.push(Arc::downgrade(pool));
+    }
+
+    /// Ends the spare unit idle longest over every route, if any: its slot frees once its store
+    /// is gone.
+    fn reclaim(&self) {
+        let pools: Vec<Arc<Pool>> = self
+            .pools
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        // another wait may take the one found first: look again
+        while let Some(pool) = pools
+            .iter()
+            .filter_map(|pool| Some((pool.spare_since()?, pool)))
+            .min_by_key(|(since, _)| *since)
+            .map(|(_, pool)| pool)
+        {
+            if pool.end_spare() {
+                return;
+            }
         }
     }
 
@@ -1842,8 +1929,10 @@ enum Admission {
 /// Serves `request` on an instance of `handler`'s route, telling `admitted`
 /// the instance's index among the route's instances alive, as CF numbers an
 /// app's: a pooled unit's `0..pool`, kept by its replacement, a per-request
-/// instance's the lowest free from `pool` up while its store lives. Nothing
-/// is told for a request finding no instance within its budget (503).
+/// instance's or a spare unit's the lowest free from `pool` up while its store
+/// lives. Nothing is told for a request finding no instance within its budget
+/// (503). With `keep-ms`, a request finding no idle unit starts a spare one on
+/// its slot instead of an instance of its own.
 async fn respond(
     handler: &Handler,
     share: &Arc<tokio::sync::Semaphore>,
@@ -1869,6 +1958,13 @@ async fn respond(
     // may stay here, or a task dying before the head would leave the head
     // channel open, and `Awaited::response` would never fall back to its 500.
     drop(reply);
+    let (job, slot) = match handler.pool.spare(job, slot) {
+        Ok(index) => {
+            admitted(index);
+            return awaited.response().await;
+        }
+        Err(cold) => cold,
+    };
     let Job {
         request,
         reply,
@@ -1932,12 +2028,12 @@ async fn respond(
 /// A route's request handler: the component, the sandbox its instances run
 /// in, and the warm-instance pool built from both. The one source of a
 /// route's settings, so the cold and the pooled path cannot diverge. It takes
-/// another `pool` and `instances` as it runs ([`Handler::resize`]).
+/// another `pool`, `instances` and `keep-ms` as it runs ([`Handler::resize`]).
 pub struct Handler {
     loaded: Arc<Loaded>,
     sandbox: Sandbox,
-    /// The sandbox's `pool` and `instances` as they are now.
-    counts: Mutex<(usize, Option<usize>)>,
+    /// The sandbox's `pool`, `instances` and `keep-ms` as they are now.
+    counts: Mutex<Counts>,
     /// The buckets of `sandbox.keyvalue`, resolved to their stores.
     keyvalue: Option<Arc<keyvalue::Buckets>>,
     pool: Arc<Pool>,
@@ -1948,10 +2044,13 @@ pub struct Handler {
     route: Arc<tokio::sync::Semaphore>,
     /// Backing for `live_stores`, marked by `LiveStore`.
     live: Arc<Gauge>,
-    /// The indices of the per-request instances alive, from the pool's
+    /// The indices of the per-request instances and the spare units alive, from the pool's
     /// size up.
     cold: Arc<Indices>,
 }
+
+/// A sandbox's `pool`, `instances` and `keep-ms`: what a handler takes as it runs.
+type Counts = (usize, Option<usize>, Option<std::time::Duration>);
 
 /// A route's slots with no `instances` cap: far enough below the semaphore's limit for a cap's
 /// slots still to be forgotten on top ([`Handler::resize`]).
@@ -1978,6 +2077,7 @@ impl Handler {
         sandbox.check()?;
         let live = Arc::new(Gauge::default());
         let route = Arc::new(tokio::sync::Semaphore::new(route_slots(sandbox.instances)));
+        let cold: Arc<Indices> = Arc::default();
         let pool = Pool::new(
             loaded.clone(),
             sandbox.clone(),
@@ -1985,17 +2085,18 @@ impl Handler {
             live.clone(),
             instances.clone(),
             route.clone(),
+            cold.clone(),
         );
         Ok(Arc::new(Handler {
             live,
             loaded,
-            counts: Mutex::new((sandbox.pool, sandbox.instances)),
+            counts: Mutex::new((sandbox.pool, sandbox.instances, sandbox.keep)),
             sandbox,
             keyvalue,
             pool,
             instances: instances.clone(),
             route,
-            cold: Arc::default(),
+            cold,
         }))
     }
 
@@ -2005,27 +2106,32 @@ impl Handler {
 
     /// Its sandbox as it is now.
     pub fn sandbox(&self) -> Sandbox {
-        let (pool, instances) = *self.counts.lock().unwrap();
+        let (pool, instances, keep) = *self.counts.lock().unwrap();
         Sandbox {
             pool,
             instances,
+            keep,
             ..self.sandbox.clone()
         }
     }
 
-    /// Takes `pool` and `instances` from now on, what runs kept: whether they changed. Units are
-    /// started up to `pool`; those past it end, an idle one at once, a busy one after its
-    /// request, and a request open goes on past a lower cap, whose slots go as they are freed.
-    pub fn resize(&self, pool: usize, instances: Option<usize>) -> bool {
+    /// Takes the `pool`, `instances` and `keep-ms` of `sandbox` from now on, what runs kept:
+    /// whether they changed. Units are started up to `pool`; those past it end, an idle one at
+    /// once, a busy one after its request, as do the spare units in the way of the new pool's
+    /// indices and those idle longer than the new `keep-ms` (all of them without one); a
+    /// request open goes on past a lower cap, whose slots go as they are freed.
+    pub fn resize(&self, sandbox: &Sandbox) -> bool {
+        let counts = (sandbox.pool, sandbox.instances, sandbox.keep);
         let was_instances = {
-            let mut counts = self.counts.lock().unwrap();
-            let was = *counts;
-            if was == (pool, instances) {
+            let mut held = self.counts.lock().unwrap();
+            let was = *held;
+            if was == counts {
                 return false;
             }
-            *counts = (pool, instances);
+            *held = counts;
             was.1
         };
+        let (pool, instances, keep) = counts;
         let (from, to) = (route_slots(was_instances), route_slots(instances));
         if to > from {
             self.route.add_permits(to - from);
@@ -2044,7 +2150,7 @@ impl Handler {
                 });
             }
         }
-        self.pool.resize(pool);
+        self.pool.resize(pool, keep);
         true
     }
 
@@ -2197,6 +2303,14 @@ struct Job {
 /// request (~360us cold with instances allocated on demand). Every unit
 /// holds an instance slot for its lifetime, handed on to its replacement.
 ///
+/// With `keep-ms`, a request finding no idle unit starts a spare one in place of
+/// its per-request instance (`spare`), on its slot and an index from `pool` up: it
+/// serves the request, then is offered as the others are, after them: an idle
+/// unit of the pool's own first, else the spare idle shortest, so those idle
+/// longest age out. A spare unit ends once idle for `keep-ms` (`reap`), or at
+/// once when a request of any route waits for a process-wide slot
+/// (`Instances::reclaim`), and is never replaced.
+///
 /// Reuse assumes stateless / reentrant-safe guests: module state legitimately
 /// persists across a unit's requests. A guest that misbehaves poisons its own
 /// unit only: a trap, a failed conversion, an interrupted relay, an overrun
@@ -2206,7 +2320,9 @@ struct Job {
 /// A closed pool (`close`, its handler retired on a reload) replaces no unit:
 /// its idle units end at once, busy ones after their request, and units still
 /// waiting for a slot give up. A pool resized (`resize`) keeps the units within its
-/// new size, and starts those missing; those past it end as a closed pool's do.
+/// new size, and starts those missing; those past it end as a closed pool's do,
+/// as do the spare units in the way of its new size and those idle past its new
+/// `keep-ms`.
 struct Pool {
     loaded: Arc<Loaded>,
     sandbox: Sandbox,
@@ -2216,10 +2332,14 @@ struct Pool {
     /// The handler's slots: the process-wide ones and the route's cap.
     instances: Arc<Instances>,
     route: Arc<tokio::sync::Semaphore>,
+    /// The handler's indices from the pool's size up, which the spare units take too.
+    cold: Arc<Indices>,
     state: Mutex<PoolState>,
     /// Signalled whenever a unit is offered, for requests waiting on an
     /// instance (`Handler::admit`).
     offered: tokio::sync::Notify,
+    /// Signalled whenever a spare unit goes idle or `keep` changes: the reaper looks again.
+    reaped: tokio::sync::Notify,
     /// Cancelled once the pool closed: units waiting for a slot give up.
     closed: CancellationToken,
 }
@@ -2228,20 +2348,47 @@ struct Pool {
 /// closed.
 type UnitMessage = Option<Job>;
 
+/// A unit between requests.
+struct Idle {
+    index: usize,
+    unit: mpsc::Sender<UnitMessage>,
+    /// A spare unit's: since when it is idle.
+    spare: Option<tokio::time::Instant>,
+}
+
+/// Where a unit stands: one of the pool's own, of an index in `0..target`, or a spare one
+/// beyond them, its index held until it is gone.
+enum Place {
+    Own(usize),
+    Spare(Index),
+}
+
+impl Place {
+    fn index(&self) -> usize {
+        match self {
+            Place::Own(index) => *index,
+            Place::Spare(index) => index.index,
+        }
+    }
+}
+
 struct PoolState {
-    /// The idle units' indices and senders, the one idle longest first; one
-    /// entry per instantiated unit between requests.
-    idle: VecDeque<(usize, mpsc::Sender<UnitMessage>)>,
+    /// The idle units, the one idle longest first; one entry per instantiated
+    /// unit between requests.
+    idle: VecDeque<Idle>,
     /// The pool's size: units of the indices `0..target` are kept.
     target: usize,
-    /// The indices of the live unit tasks, the ones waiting for a slot included.
+    /// How long a spare unit is kept idle; None keeps none.
+    keep: Option<std::time::Duration>,
+    /// The indices of the pool's own live unit tasks, the ones waiting for a slot included.
     units: BTreeSet<usize>,
-    /// Those of the units on their slot, and since when: a store is theirs from then on.
+    /// Those of the pool's own units on their slot, and since when: a store is theirs from then
+    /// on.
     alive: BTreeMap<usize, SystemTime>,
-    /// Units ever spawned; growth beyond the target signals recycling
+    /// The pool's own units ever spawned; growth beyond the target signals recycling
     /// (diagnostics, and asserted in tests).
     spawned: usize,
-    /// Requests served by a pooled unit instead of the per-request path.
+    /// Requests handed to an idle unit instead of the per-request path.
     served: usize,
     /// No unit is offered or replaced any more.
     closed: bool,
@@ -2259,12 +2406,14 @@ impl Pool {
         live: Arc<Gauge>,
         instances: Arc<Instances>,
         route: Arc<tokio::sync::Semaphore>,
+        cold: Arc<Indices>,
     ) -> Arc<Self> {
         let target = sandbox.pool;
         let pool = Arc::new(Self {
             state: Mutex::new(PoolState {
                 idle: VecDeque::new(),
                 target,
+                keep: sandbox.keep,
                 units: (0..target).collect(),
                 alive: BTreeMap::new(),
                 spawned: 0,
@@ -2277,9 +2426,13 @@ impl Pool {
             keyvalue,
             instances,
             route,
+            cold,
             offered: tokio::sync::Notify::new(),
+            reaped: tokio::sync::Notify::new(),
             closed: CancellationToken::new(),
         });
+        pool.instances.register(&pool);
+        tokio::spawn(pool.clone().reap());
         for index in 0..target {
             let slot = pool.instances.try_slot(&pool.route);
             Self::spawn_unit(pool.clone(), slot, index);
@@ -2293,18 +2446,24 @@ impl Pool {
     }
 
     /// Keeps the units within `target`, starts those missing, each as [`Pool::new`] does, and
-    /// ends those past it: an idle one now, a busy one as it would be offered. Nothing on a
-    /// closed pool.
-    fn resize(self: &Arc<Self>, target: usize) {
+    /// ends those past it: an idle one now, a busy one as it would be offered. A spare unit in
+    /// the way of the indices `0..target` ends so too, and the idle ones are kept for `keep`
+    /// from now on. Nothing on a closed pool.
+    fn resize(self: &Arc<Self>, target: usize, keep: Option<std::time::Duration>) {
         let (past, missing) = {
             let mut state = self.state.lock().unwrap();
             if state.closed {
                 return;
             }
             state.target = target;
+            state.keep = keep;
             let (past, idle) = std::mem::take(&mut state.idle)
                 .into_iter()
-                .partition(|(index, _)| *index >= target);
+                .partition(|unit| match unit.spare {
+                    None => unit.index >= target,
+                    // in the way of the pool's own
+                    Some(_) => unit.index < target,
+                });
             state.idle = idle;
             let missing: Vec<usize> = (0..target)
                 .filter(|index| !state.units.contains(index))
@@ -2312,11 +2471,12 @@ impl Pool {
             state.units.extend(&missing);
             (past, missing)
         };
-        let past: VecDeque<(usize, mpsc::Sender<UnitMessage>)> = past;
-        for (_, unit) in past {
+        let past: VecDeque<Idle> = past;
+        for idle in past {
             // an idle unit's channel is empty; a stale entry's unit is gone
-            let _ = unit.try_send(None);
+            let _ = idle.unit.try_send(None);
         }
+        self.reaped.notify_one();
         for index in missing {
             let slot = self.instances.try_slot(&self.route);
             Self::spawn_unit(self.clone(), slot, index);
@@ -2338,27 +2498,58 @@ impl Pool {
                             pool,
                             replace: false,
                             slot: None,
-                            index,
+                            place: Place::Own(index),
                         });
                         return;
                     }
                 },
             };
-            run_unit(pool, slot, index).await;
+            run_unit(pool, slot, Place::Own(index), None).await;
         });
     }
 
-    /// Offers the idle unit `index`, last in turn, and wakes a request
-    /// waiting for an instance; false once the pool closed, or shrank past it: the unit ends.
-    fn offer(&self, index: usize, unit: mpsc::Sender<UnitMessage>) -> bool {
+    /// Starts a spare unit serving `job` on `slot`, with the lowest index free from the pool's
+    /// size up, when the pool keeps them (`keep-ms`) and is open: its index. Else both are
+    /// handed back, for an instance of the request's own.
+    #[expect(
+        clippy::result_large_err,
+        reason = "handed back to the caller, which instantiates anyway"
+    )]
+    fn spare(self: &Arc<Self>, job: Job, slot: Slot) -> Result<usize, (Job, Slot)> {
+        let target = {
+            let state = self.state.lock().unwrap();
+            if state.closed || state.keep.is_none() {
+                return Err((job, slot));
+            }
+            state.target
+        };
+        let index = self.cold.take(target);
+        let at = index.index;
+        tokio::spawn(run_unit(self.clone(), slot, Place::Spare(index), Some(job)));
+        Ok(at)
+    }
+
+    /// Offers the idle unit `index` (a `spare` one or one of the pool's own), last in turn, and
+    /// wakes a request waiting for an instance; false once the pool closed, or shrank past an
+    /// own one, or for a spare one the pool keeps no more (none kept, or in the way of its own
+    /// indices) or whose slot a request waits for: the unit ends.
+    fn offer(&self, index: usize, spare: bool, unit: mpsc::Sender<UnitMessage>) -> bool {
         {
             let mut state = self.state.lock().unwrap();
-            if state.closed || index >= state.target {
+            let kept = match spare {
+                false => index < state.target,
+                true => index >= state.target && state.keep.is_some() && !self.instances.wanted(),
+            };
+            if state.closed || !kept {
                 return false;
             }
-            state.idle.push_back((index, unit));
+            let spare = spare.then(tokio::time::Instant::now);
+            state.idle.push_back(Idle { index, unit, spare });
         }
         self.offered.notify_one();
+        if spare {
+            self.reaped.notify_one();
+        }
         true
     }
 
@@ -2371,14 +2562,14 @@ impl Pool {
             std::mem::take(&mut state.idle)
         };
         self.closed.cancel();
-        for (_, unit) in idle {
+        for idle in idle {
             // an idle unit's channel is empty; a stale entry's unit is gone
-            let _ = unit.try_send(None);
+            let _ = idle.unit.try_send(None);
         }
     }
 
-    /// Hands the job to the unit idle longest, returning its index.
-    /// `Err(job)` when none accepted it (no stock, or a unit vanished): the
+    /// Hands the job to an idle unit, returning its index: the pool's own idle longest, else the
+    /// spare idle shortest. `Err(job)` when none accepted it (no stock, or a unit vanished): the
     /// caller instantiates per request.
     #[expect(
         clippy::result_large_err,
@@ -2386,10 +2577,18 @@ impl Pool {
     )]
     fn dispatch(&self, mut job: Job) -> Result<usize, Job> {
         loop {
-            let Some((index, tx)) = self.state.lock().unwrap().idle.pop_front() else {
+            let picked = {
+                let mut state = self.state.lock().unwrap();
+                // entries are in the order they went idle
+                let at = (state.idle.iter())
+                    .position(|idle| idle.spare.is_none())
+                    .or(state.idle.len().checked_sub(1));
+                at.and_then(|at| state.idle.remove(at))
+            };
+            let Some(Idle { index, unit, .. }) = picked else {
                 return Err(job);
             };
-            job = match tx.try_send(Some(job)) {
+            job = match unit.try_send(Some(job)) {
                 Ok(()) => {
                     self.state.lock().unwrap().served += 1;
                     return Ok(index);
@@ -2403,19 +2602,90 @@ impl Pool {
         }
     }
 
+    /// Since when the spare unit idle longest is, if one is.
+    fn spare_since(&self) -> Option<tokio::time::Instant> {
+        let state = self.state.lock().unwrap();
+        state.idle.iter().find_map(|idle| idle.spare)
+    }
+
+    /// Ends the spare unit idle longest; false when none is idle.
+    fn end_spare(&self) -> bool {
+        let idle = {
+            let mut state = self.state.lock().unwrap();
+            let at = state.idle.iter().position(|idle| idle.spare.is_some());
+            at.and_then(|at| state.idle.remove(at))
+        };
+        let Some(idle) = idle else {
+            return false;
+        };
+        // an idle unit's channel is empty; a stale entry's unit is gone
+        let _ = idle.unit.try_send(None);
+        true
+    }
+
+    /// Ends the spare units idle for `keep-ms` (all of them without), for as long as the pool is
+    /// open: a task of its own, as a timer raced inside a store's `run_concurrent` may never
+    /// fire.
+    async fn reap(self: Arc<Self>) {
+        loop {
+            let looked = self.reaped.notified();
+            tokio::pin!(looked);
+            // registered before the look, so a change in between is not missed
+            looked.as_mut().enable();
+            let next = self.expire(tokio::time::Instant::now());
+            let due = async {
+                match next {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                () = self.closed.cancelled() => return,
+                () = looked => {}
+                () = due => {}
+            }
+        }
+    }
+
+    /// Ends the spare units idle for `keep-ms` at `now` (all of them without), returning when
+    /// the next of those left is.
+    fn expire(&self, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
+        let (ended, next) = {
+            let mut state = self.state.lock().unwrap();
+            let keep = state.keep;
+            let (ended, idle): (VecDeque<Idle>, VecDeque<Idle>) = std::mem::take(&mut state.idle)
+                .into_iter()
+                .partition(|idle| {
+                    idle.spare
+                        .is_some_and(|since| keep.is_none_or(|keep| since + keep <= now))
+                });
+            state.idle = idle;
+            let next = keep.and_then(|keep| {
+                let since = state.idle.iter().find_map(|idle| idle.spare)?;
+                Some(since + keep)
+            });
+            (ended, next)
+        };
+        for idle in ended {
+            // an idle unit's channel is empty; a stale entry's unit is gone
+            let _ = idle.unit.try_send(None);
+        }
+        next
+    }
+
     // Diagnostics, asserted in tests.
     #[cfg(test)]
     fn units(&self) -> usize {
         self.state.lock().unwrap().units.len()
     }
 
-    /// Units ever spawned.
+    /// The pool's own units ever spawned.
     #[cfg(test)]
     fn spawned(&self) -> usize {
         self.state.lock().unwrap().spawned
     }
 
-    /// Requests served by the pool.
+    /// Requests handed to an idle unit.
     #[cfg(test)]
     fn served(&self) -> usize {
         self.state.lock().unwrap().served
@@ -2426,51 +2696,70 @@ impl Pool {
     fn idle(&self) -> usize {
         self.state.lock().unwrap().idle.len()
     }
+
+    /// Idle spare units.
+    #[cfg(test)]
+    fn idle_spares(&self) -> usize {
+        let state = self.state.lock().unwrap();
+        state
+            .idle
+            .iter()
+            .filter(|idle| idle.spare.is_some())
+            .count()
+    }
 }
 
 /// Runs at unit exit, however it exits, after the unit's store is gone:
 /// frees the unit's place and, unless the unit never got viable, the pool
 /// closed or shrank past it, spawns a replacement on its instance slot and its
-/// index; else the slot frees.
+/// index; else the slot frees. A spare unit is never replaced: its slot and
+/// its index free.
 struct Retire {
     pool: Arc<Pool>,
     /// False when the unit never served (e.g. its instantiate failed): the
     /// pool shrinks instead of respawning into the same failure.
     replace: bool,
+    /// Dropped before the slot: an index is free once its slot is.
+    place: Place,
     /// The unit's instance slot.
     slot: Option<Slot>,
-    /// The unit's index.
-    index: usize,
 }
 
 impl Drop for Retire {
     fn drop(&mut self) {
+        let Place::Own(index) = self.place else {
+            return;
+        };
         let respawn = {
             let mut state = self.pool.state.lock().unwrap();
-            state.alive.remove(&self.index);
-            let respawn = self.replace && !state.closed && self.index < state.target;
+            state.alive.remove(&index);
+            let respawn = self.replace && !state.closed && index < state.target;
             if !respawn {
-                state.units.remove(&self.index);
+                state.units.remove(&index);
             }
             respawn
         };
         if respawn {
             let slot = self.slot.take().expect("a unit holds its slot");
-            Pool::spawn_unit(self.pool.clone(), Some(slot), self.index);
+            Pool::spawn_unit(self.pool.clone(), Some(slot), index);
         }
     }
 }
 
-/// The body of the pooled unit `index`, on its instance slot.
-async fn run_unit(pool: Arc<Pool>, slot: Slot, index: usize) {
+/// The body of a pooled unit, on its instance slot, at `place`; a spare one
+/// serves `first`, the request it was started for, before it is offered.
+async fn run_unit(pool: Arc<Pool>, slot: Slot, place: Place, first: Option<Job>) {
     let started = SystemTime::now();
-    pool.state.lock().unwrap().alive.insert(index, started);
+    let (index, spare) = (place.index(), matches!(place, Place::Spare(_)));
+    if !spare {
+        pool.state.lock().unwrap().alive.insert(index, started);
+    }
     // Declared first, so dropped last: after the store.
     let mut retire = Retire {
         pool: pool.clone(),
         replace: true,
         slot: Some(slot),
-        index,
+        place,
     };
     let loaded = pool.loaded.clone();
     let budget = pool.sandbox.limits.budget;
@@ -2488,12 +2777,19 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot, index: usize) {
     let mut store = wasmtime::Store::new(engine(), ctx);
     store.limiter_async(|ctx| &mut ctx.limiter);
     // As in `respond`: the deadline must exist before any wasm runs.
-    store.set_epoch_deadline(budget_ticks(budget));
+    store.set_epoch_deadline(budget_ticks(match &first {
+        Some(job) => remaining(job.deadline),
+        None => budget,
+    }));
     let service = match loaded.service_pre.instantiate_async(&mut store).await {
         Ok(service) => service,
         Err(e) => {
             eprintln!("[wasm] pooled instance of {} failed: {e}", loaded.label);
             retire.replace = false;
+            if let Some(job) = first {
+                let message = format!("wasm instantiate failed: {e}");
+                failed(job.reply.head, 500, message).await;
+            }
             return;
         }
     };
@@ -2501,8 +2797,10 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot, index: usize) {
     // Offered only now: a request never queues behind an instantiate that
     // may fail.
     let (tx, mut rx) = mpsc::channel::<UnitMessage>(1);
-    if !pool.offer(index, tx.clone()) {
-        return;
+    match first {
+        Some(job) => assert!(tx.try_send(Some(job)).is_ok(), "an empty channel"),
+        None if !pool.offer(index, false, tx.clone()) => return,
+        None => {}
     }
 
     let (watch, watched) = watch::channel(None);
@@ -2546,7 +2844,7 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot, index: usize) {
                 eprintln!("[wasm] recycling {} pool unit: {reason}", pool.loaded.label);
                 break;
             }
-            if !pool.offer(index, tx.clone()) {
+            if !pool.offer(index, spare, tx.clone()) {
                 break;
             }
         }
@@ -4572,10 +4870,14 @@ pub(crate) mod tests {
     /// Beyond the pool's size requests fall back to per-request instantiation:
     /// a second concurrent connection is served while the single unit streams,
     /// by an instance taking the lowest index free from the pool's size up,
-    /// freed with its store.
+    /// freed with its store. With `keep-ms` such a request starts a spare unit
+    /// there instead, which stays and serves the next request finding the pool's
+    /// own busy, and gives its slot up to a request of another route waiting for
+    /// one.
     #[tokio::test]
     async fn pool_exhaustion_falls_back_to_per_request_instantiation() {
         let tap = Tap::new();
+        let instances = Instances::fed(2, tap.clone());
         let handler = Handler::new(
             hello().await,
             Sandbox {
@@ -4583,7 +4885,7 @@ pub(crate) mod tests {
                 ..Sandbox::default()
             },
             None,
-            &Instances::fed(Instances::MAX, tap.clone()),
+            &instances,
         )
         .unwrap();
         restocked(&handler, 1).await;
@@ -4621,11 +4923,11 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&first)
         );
         assert!(first.len() > 1000, "streaming body arrived");
-        let instances: Vec<String> = tapped(&tap, "response", "t")
+        let answered: Vec<String> = tapped(&tap, "response", "t")
             .into_iter()
             .map(|fields| fields["instance"].clone())
             .collect();
-        assert_eq!(instances, ["2", "0"], "the cold request's, then the unit's");
+        assert_eq!(answered, ["2", "0"], "the cold request's, then the unit's");
         eventually("the cold index frees", Duration::from_secs(5), || {
             handler.cold.take(1).index == 1
         })
@@ -4636,6 +4938,45 @@ pub(crate) mod tests {
             || alive() == [0],
         )
         .await;
+
+        assert!(handler.resize(&counts(1, None, Some(60_000))));
+        restocked(&handler, 1).await;
+        let occupant = stalled_connection(&handler).await;
+        let created = handler.stores_created();
+        let body = exchange(&handler, &get("/")).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
+        eventually("the spare unit stays", Duration::from_secs(5), || {
+            pool(&handler).idle_spares() == 1
+        })
+        .await;
+        assert_eq!(alive(), [0, 1], "the spare's index from the pool's size up");
+        let body = exchange(&handler, &get("/")).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
+        assert_eq!(
+            handler.stores_created(),
+            created + 1,
+            "the spare served again"
+        );
+        assert_eq!(
+            pool(&handler).spawned(),
+            1,
+            "no unit of the pool's own started"
+        );
+        let instances_of = |tap: &Tap| -> Vec<String> {
+            tapped(tap, "response", "t")
+                .into_iter()
+                .map(|fields| fields["instance"].clone())
+                .collect()
+        };
+        assert_eq!(instances_of(&tap)[2..], ["1", "1"]);
+
+        // the unit and the spare hold both slots: the spare gives its own up
+        let other = limited(&handler.loaded, &instances, Some(Duration::from_secs(2)));
+        let body = exchange(&other, &get("/")).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
+        assert_eq!(alive(), [0], "the spare ended");
+        assert_eq!(pool(&handler).idle_spares(), 0);
+        drop(occupant);
     }
 
     /// A job lost by its unit (dropped before it was served) fails with a
@@ -4646,12 +4987,11 @@ pub(crate) mod tests {
         restocked(&handler, 1).await;
         // a unit that takes the job and dies with it, first in turn
         let (tx, mut rx) = mpsc::channel::<UnitMessage>(1);
-        pool(&handler)
-            .state
-            .lock()
-            .unwrap()
-            .idle
-            .push_front((0, tx));
+        pool(&handler).state.lock().unwrap().idle.push_front(Idle {
+            index: 0,
+            unit: tx,
+            spare: None,
+        });
         tokio::spawn(async move { drop(rx.recv().await) });
 
         let answered =
@@ -5671,8 +6011,8 @@ pub(crate) mod tests {
         let instances = Instances::new(4);
         let handler = capped(&hello().await, &instances, 1, 1, None);
         restocked(&handler, 1).await;
-        assert!(handler.resize(2, Some(3)));
-        assert!(!handler.resize(2, Some(3)), "the same");
+        assert!(handler.resize(&counts(2, Some(3), None)));
+        assert!(!handler.resize(&counts(2, Some(3), None)), "the same");
         restocked(&handler, 2).await;
         assert_eq!(pool(&handler).spawned(), 2, "one more");
         let sandbox = handler.sandbox();
@@ -5682,7 +6022,7 @@ pub(crate) mod tests {
         let post = "POST / HTTP/1.1\r\nhost: t\r\ncontent-length: 4\r\nconnection: close\r\n\r\nab";
         let mut peers = [open(&handler, post), open(&handler, post)];
         restocked(&handler, 0).await;
-        assert!(handler.resize(1, Some(1)));
+        assert!(handler.resize(&counts(1, Some(1), None)));
         assert_eq!(pool(&handler).units(), 2, "none ended under its request");
         for peer in &mut peers {
             peer.data(1, b"cd");
@@ -5708,12 +6048,54 @@ pub(crate) mod tests {
             None,
             "past the cap"
         );
-        assert!(handler.resize(1, None));
+        assert!(handler.resize(&counts(1, None, None)));
         assert_ok(
             answered(&mut waiter, Duration::from_secs(3)).await,
             "an instance of its own",
         );
-        drop(occupant);
+
+        // a spare unit in the way of a grown pool's own ends, one of those is started
+        assert!(handler.resize(&counts(1, None, Some(60_000))));
+        let body = exchange(&handler, &get("/")).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+        eventually("a spare unit", Duration::from_secs(5), || {
+            pool(&handler).idle_spares() == 1
+        })
+        .await;
+        assert!(handler.resize(&counts(2, None, Some(60_000))));
+        restocked(&handler, 1).await;
+        assert_eq!(
+            pool(&handler).idle_spares(),
+            0,
+            "the spare in the way ended"
+        );
+        assert_eq!(pool(&handler).spawned(), 3, "the unit in its place");
+
+        // the spares idle past a lower keep-ms end
+        let second = stalled_connection(&handler).await;
+        let body = exchange(&handler, &get("/")).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+        eventually("a spare unit", Duration::from_secs(5), || {
+            pool(&handler).idle_spares() == 1
+        })
+        .await;
+        assert_eq!(handler.alive().into_keys().collect::<Vec<_>>(), [0, 1, 2]);
+        assert!(handler.resize(&counts(2, None, Some(1))));
+        eventually("the spare ends", Duration::from_secs(5), || {
+            handler.alive().len() == 2 && instances.held() == 2
+        })
+        .await;
+        drop((occupant, second));
+    }
+
+    /// A sandbox of `pool`, `instances` and `keep-ms` alone, as a handler takes them.
+    fn counts(pool: usize, instances: Option<usize>, keep_ms: Option<u64>) -> Sandbox {
+        Sandbox {
+            pool,
+            instances,
+            keep: keep_ms.map(Duration::from_millis),
+            ..Sandbox::default()
+        }
     }
 
     /// A retired pool ends its idle units at once and a busy one after its

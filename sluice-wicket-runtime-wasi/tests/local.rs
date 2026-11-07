@@ -629,7 +629,7 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
     let app = |hosts: &[&str], component: &[u8]| {
         let component = serde_json::json!({"sha256": digest(component), "name": "app.wasm"});
         let sandbox = serde_json::json!({"wasi": ["cli", "keyvalue"], "pool": 1,
-                                         "keyvalue": {"": "local/cf/shop"},
+                                         "keep_ms": 500, "keyvalue": {"": "local/cf/shop"},
                                          "env": {"GREETING": "s3cr3t-greeting"}});
         let app = serde_json::json!({"owner": "cf", "hosts": hosts, "component": component,
                                      "sandbox": sandbox, "tag": "v1"});
@@ -694,8 +694,12 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         serde_json::json!(["a.localhost", "b.localhost"])
     );
     assert_eq!(
-        (&listed["sandbox"]["env"], &listed["tag"]),
-        (&serde_json::json!(["GREETING"]), &"v1".into())
+        (
+            &listed["sandbox"]["env"],
+            &listed["sandbox"]["keep_ms"],
+            &listed["tag"]
+        ),
+        (&serde_json::json!(["GREETING"]), &500.into(), &"v1".into())
     );
     listed["sandbox"]["env"] = serde_json::json!({"GREETING": "s3cr3t-greeting"});
     let listed_app = listed.as_object_mut().unwrap();

@@ -256,6 +256,7 @@ another OpenID Provider and the like.
 | web process `memory` | `memory-mib` |
 | annotation `wicket.sluice.ik.am/budget-ms` | `budget-ms` |
 | annotation `wicket.sluice.ik.am/concurrency` | [the requests an instance takes at once](#instances), at once |
+| annotation `wicket.sluice.ik.am/keep-ms` | `keep-ms`: [how long a request's own wasm instance is kept](#instances) after it, at once |
 | annotation `wicket.sluice.ik.am/warm` | `pool`: [the instances kept up](#instances), at once |
 | environment variables (`cf set-env`, a manifest's `env:`), `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: what the guest's `wasi:cli/environment` answers |
 | disk | accepted and shown, no effect |
@@ -667,7 +668,7 @@ applications:
 |---|---|---|
 | `mode` | `boot`, `per-connection`, `reuse` or `pool` | |
 | `warm` | VMs kept, from 0 to `instances` | `per-connection`, `reuse`, `pool` |
-| `keep-ms` | how long a VM serving nothing is kept: a pool's beyond its `warm`, which it needs annotated | `reuse`, `pool` |
+| `keep-ms` | how long a VM serving nothing is kept: a pool's beyond its `warm`, which it needs annotated; a component's wasm instance beyond `warm` ([Instances](#instances)) | `reuse`, `pool`, a component |
 | `uses`, `lifetime-ms` | the connections a VM serves, how long it serves | `reuse` |
 | `concurrency` | what an instance takes at once: [the limit](#instances) | `pool`, a component |
 
@@ -677,7 +678,7 @@ applications:
   take that: what it opened before its snapshot (a database's connections) is gone in a clone
 - refused, by `cf push`, the v3 API and `cf scale -i`, naming it: an option its mode does not take,
   none annotated being `pool`, what is no mode or no number, `warm` above the
-  instances, a pool's `keep-ms` without a `warm`, `instances`, which `cf scale -i` and `concurrency` replace. A wicket not answering, by
+  instances, a VM pool's `keep-ms` without a `warm`, `instances`, which `cf scale -i` and `concurrency` replace. A wicket not answering, by
   the app's next start
 - at once, as `cf scale -i`: the wicket adjusts the running VMs, none restarted. `mode` is what
   a VM is: another one than the running one waits for the next start, the others with it, the
@@ -805,15 +806,19 @@ Cloud Run's do:
   | request | served by |
   |---|---|
   | the 1st | the warm unit |
-  | the 2nd to the 16th | a wasm instance of its own, instantiated for it (~250us of a hello component) and ended with it |
+  | the 2nd to the 16th | a wasm instance of its own, instantiated for it (~250us of a hello component) and ended with it; annotated `keep-ms`, kept until it served none for that long, taking the next request finding the warm unit busy |
   | the 17th | the first of them to end, waited for within its `budget-ms`, then a 503 |
+
+  `keep-ms` pays for a component whose start costs more than a hello's: one writing an 8MiB heap
+  answers in 1.6ms cold against 30us warm ([measured](../.kb/wicket-wasi-findings.md#a-pooled-units-latency)).
 
   `memory` bounds each wasm instance: an instance taking 16 requests may take 16 x `memory`. A
   request's own is named in `cf logs` by the lowest index free from `warm` up, modulo `instances`:
   `0` at `-i 1`
 - **Scale to zero** is `warm: 0`. A component then has each request instantiate its own (~250us
   against ~130us warm of a hello component, [measured](../.kb/wicket-wasi-findings.md#a-pooled-units-latency))
-  and keeps none between requests: `keep-ms` is refused. A `pool` VM grows to N on demand, and one
+  and keeps none between requests, unless `keep-ms` keeps each until it served none for that
+  long: an idle app holds none once it passed. A `pool` VM grows to N on demand, and one
   serving none is stopped after `keep-ms` (60s by default), so an idle app holds no VM and its next
   request pays a restore. `reuse` keeps a clone `keep-ms` after its connection, `per-connection`
   none; `boot` keeps its N VMs

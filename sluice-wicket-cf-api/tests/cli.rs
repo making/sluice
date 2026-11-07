@@ -2,7 +2,8 @@
 //! distribution refuses any other platform) against the cf-api and a wicket
 //! in local mode, both on a flume: login, push, the app's logs, map-route,
 //! scale keeping the warm instance, a rolling push with requests all along,
-//! stop and start, a scale to 0, the limit of a scale and of its `concurrency`, the
+//! stop and start, a scale to 0, the limit of a scale and of its `concurrency`, an
+//! instance of a request's own kept by `keep-ms`, the
 //! user's environment variables and VCAP_*, a private component in an OCI
 //! registry (a stub) pushed by tag -- its credentials, a restart keeping
 //! the digest staged when the tag moves, a restage taking the new one --, a
@@ -874,23 +875,50 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "{recent}"
     );
     // one at a time is the annotation's, at once; the limit follows the scale
-    let limits = || {
+    let app_of = || {
         let listed = listing(&console);
-        let apps = listed["apps"].as_array().unwrap();
-        let app = apps.iter().find(|app| app["hosts"][0] == limited);
-        let sandbox = &app.unwrap()["sandbox"];
-        (sandbox["pool"].as_u64(), sandbox["instances"].as_u64())
+        let apps = listed["apps"].as_array().unwrap().clone();
+        apps.into_iter()
+            .find(|app| app["hosts"][0] == limited)
+            .unwrap()
     };
-    assert_eq!(limits(), (Some(1), Some(16)));
+    let limits = || {
+        let sandbox = app_of()["sandbox"].clone();
+        let count = |key: &str| sandbox[key].as_u64();
+        (count("pool"), count("instances"), count("keep_ms"))
+    };
+    assert_eq!(limits(), (Some(1), Some(16), None));
+    // a request past the warm instance has one of its own kept `keep-ms` after it, at once; none
+    // kept without it
+    let alive_come_to = |count: usize| {
+        let deadline = Instant::now() + HANG;
+        while app_of()["alive"].as_array().unwrap().len() != count {
+            assert!(Instant::now() < deadline, "{}", app_of()["alive"]);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let keep = json!({"wicket.sluice.ik.am/keep-ms": "60000"});
+    assert!(annotate(&cf, "limited", &keep).contains("\"guid\""));
+    assert_eq!(limits(), (Some(1), Some(16), Some(60_000)));
+    let stream = held(&listen, limited, "/stall");
+    assert_eq!(get(&listen, limited, "/", None).0, 200);
+    drop(stream);
+    alive_come_to(2);
+    annotate(
+        &cf,
+        "limited",
+        &json!({"wicket.sluice.ik.am/keep-ms": null}),
+    );
+    alive_come_to(1);
     annotate(
         &cf,
         "limited",
         &json!({"wicket.sluice.ik.am/concurrency": "1"}),
     );
-    assert_eq!(limits(), (Some(1), Some(1)));
+    assert_eq!(limits(), (Some(1), Some(1), None));
     beyond(1);
     cf.ok(&["scale", "limited", "-i", "2"]);
-    assert_eq!(limits(), (Some(2), Some(2)));
+    assert_eq!(limits(), (Some(2), Some(2), None));
     let refused = annotate(
         &cf,
         "limited",

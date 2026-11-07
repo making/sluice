@@ -133,6 +133,7 @@ impl Controller {
                     instances: Some(instances.saturating_mul(
                         running.lifetime.concurrency.unwrap_or(DEFAULT_CONCURRENCY),
                     )),
+                    wasm_keep_ms: running.lifetime.keep_ms,
                     keyvalue: running.keyvalue.clone(),
                     env: running.env.clone(),
                     ..Sandbox::default()
@@ -621,6 +622,7 @@ fn same(listed: &AppBody, desired: &AppBody) -> bool {
         && sorted(&listed.sandbox.egress) == sorted(&desired.sandbox.egress)
         && listed.sandbox.pool == desired.sandbox.pool
         && listed.sandbox.instances == desired.sandbox.instances
+        && listed.sandbox.wasm_keep_ms == desired.sandbox.wasm_keep_ms
         && listed.sandbox.memory_mib == desired.sandbox.memory_mib
         && desired
             .sandbox
@@ -713,6 +715,9 @@ mod tests {
         listed.sandbox.pool = Some(2);
         listed.sandbox.budget_ms = Some(10_000);
         assert!(same(&listed, &unset));
+        listed.sandbox.wasm_keep_ms = Some(500);
+        assert!(!same(&listed, &unset), "another keep-ms");
+        listed.sandbox.wasm_keep_ms = None;
         // a count below what the start keeps warm, as a manifest leaves it: the wicket's kept
         let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
         (running.file, running.lifetime.mode, running.lifetime.warm) =
@@ -726,29 +731,41 @@ mod tests {
         (running.file, running.lifetime.mode) = ("hello.wasm".into(), None);
         // `cf scale` a component's limit too: the instances kept unless annotated, each taking
         // `concurrency` at once, past what the wicket runs or not; as a VM's, no lower than what
-        // the start keeps warm, which the wicket refuses
-        for (instances, warm, concurrency, pool, cap) in [
-            (1, None, None, 1, 16),
-            (2, None, None, 2, 32),
-            (2, None, Some(1), 2, 2),
-            (2, Some(0), None, 0, 32),
-            (2, Some(1), Some(3), 1, 6),
-            (1, Some(3), Some(1), 3, 3),
-            (u64::MAX, Some(0), None, 0, u64::MAX),
+        // the start keeps warm, which the wicket refuses. `keep-ms` as annotated
+        for (instances, warm, concurrency, keep_ms, pool, cap) in [
+            (1, None, None, None, 1, 16),
+            (2, None, None, Some(500), 2, 32),
+            (2, None, Some(1), None, 2, 2),
+            (2, Some(0), None, Some(60_000), 0, 32),
+            (2, Some(1), Some(3), None, 1, 6),
+            (1, Some(3), Some(1), None, 3, 3),
+            (u64::MAX, Some(0), None, None, 0, u64::MAX),
         ] {
             let app = state.app_mut(&guid).unwrap();
             app.process.instances = instances;
             let running = app.running.as_mut().unwrap();
-            (running.lifetime.warm, running.lifetime.concurrency) = (warm, concurrency);
+            (
+                running.lifetime.warm,
+                running.lifetime.concurrency,
+                running.lifetime.keep_ms,
+            ) = (warm, concurrency, keep_ms);
             let limited = Controller::desired(&state, state.app(&guid).unwrap(), "cf").unwrap();
             assert_eq!(
-                (limited.sandbox.pool, limited.sandbox.instances),
-                (Some(pool), Some(cap)),
-                "{instances} {warm:?} {concurrency:?}"
+                (
+                    limited.sandbox.pool,
+                    limited.sandbox.instances,
+                    limited.sandbox.wasm_keep_ms
+                ),
+                (Some(pool), Some(cap), keep_ms),
+                "{instances} {warm:?} {concurrency:?} {keep_ms:?}"
             );
         }
         let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
-        (running.lifetime.warm, running.lifetime.concurrency) = (None, None);
+        (
+            running.lifetime.warm,
+            running.lifetime.concurrency,
+            running.lifetime.keep_ms,
+        ) = (None, None, None);
         // 0 is as stopped, on any wicket
         state.app_mut(&guid).unwrap().process.instances = 0;
         assert_eq!(

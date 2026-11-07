@@ -57,6 +57,9 @@ function sandboxPairs(sandbox) {
   if (sandbox.instances !== null && sandbox.instances !== undefined) {
     pairs.push(`instances=${sandbox.instances}`);
   }
+  if (sandbox.keep_ms !== null && sandbox.keep_ms !== undefined) {
+    pairs.push(`keep-ms=${sandbox.keep_ms}`);
+  }
   return pairs;
 }
 
@@ -101,7 +104,8 @@ function sandboxFields(initial, onChange) {
   const memory = number("memory", "Memory", "MiB", initial.memory_mib, { min: 1 });
   const pool = number("pool", "Pool", "warm", initial.pool, { min: 0 });
   const instances = number("instances", "Instances", "at most", initial.instances, { min: 1, placeholder: "no cap" });
-  const inputs = [budget.input, memory.input, pool.input, instances.input];
+  const keep = number("keep", "Keep", "ms idle", initial.keep_ms, { min: 1, placeholder: "none" });
+  const inputs = [budget.input, memory.input, pool.input, instances.input, keep.input];
   const note = h("p", { class: "sandbox__note", id: `${id}-note` });
 
   const element = h("fieldset", { class: "sandbox" },
@@ -110,7 +114,7 @@ function sandboxFields(initial, onChange) {
     h("div", { class: "field" },
       h("span", { class: "field__label" }, "Limits"),
       h("div", { class: "field__control" },
-        h("div", { class: "limits" }, budget.element, memory.element, pool.element, instances.element),
+        h("div", { class: "limits" }, budget.element, memory.element, pool.element, instances.element, keep.element),
         note)));
   element.addEventListener("input", () => onChange?.());
   element.addEventListener("change", () => onChange?.());
@@ -136,12 +140,16 @@ function sandboxFields(initial, onChange) {
         memory_mib: whole(memory.input, 1, "The memory"),
         pool: whole(pool.input, 0, "The pool"),
         instances: null,
+        keep_ms: null,
       };
       if (instances.input.value.trim() !== "") {
         sandbox.instances = whole(instances.input, 1, "Instances");
         if (sandbox.instances < sandbox.pool) {
           fail(instances.input, "Instances must be at least the pool: every pooled unit holds one of the route's instance slots.");
         }
+      }
+      if (keep.input.value.trim() !== "") {
+        sandbox.keep_ms = whole(keep.input, 1, "Keep");
       }
       return sandbox;
     },
@@ -153,6 +161,7 @@ function sandboxFields(initial, onChange) {
       memory.input.value = sandbox.memory_mib;
       pool.input.value = sandbox.pool;
       instances.input.value = sandbox.instances ?? "";
+      keep.input.value = sandbox.keep_ms ?? "";
     },
     focus() {
       element.querySelector("input")?.focus();
@@ -160,7 +169,7 @@ function sandboxFields(initial, onChange) {
   };
 }
 
-const defaultSandbox = () => ({ wasi: [], budget_ms: defaults().budget_ms, memory_mib: defaults().memory_mib, pool: 0, instances: null });
+const defaultSandbox = () => ({ wasi: [], budget_ms: defaults().budget_ms, memory_mib: defaults().memory_mib, pool: 0, instances: null, keep_ms: null });
 
 /** The note on moving `route` to the free host `to`. */
 function renamed(route, to) {
@@ -201,6 +210,9 @@ function sandboxCell({ sandbox }) {
   }
   if (sandbox.instances !== null && sandbox.instances !== undefined) {
     parts.push(limit(`≤ ${sandbox.instances} instance${sandbox.instances === 1 ? "" : "s"}`));
+  }
+  if (sandbox.keep_ms !== null && sandbox.keep_ms !== undefined) {
+    parts.push(limit(`keep ${formatMs(sandbox.keep_ms)}`));
   }
   for (const entry of sandbox.keyvalue ?? []) {
     const identifier = entry.identifier === "" ? '""' : entry.identifier;
