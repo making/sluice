@@ -797,9 +797,20 @@ Cloud Run's do:
 | annotation `wicket.sluice.ik.am/concurrency` | what an instance takes at once: a component's requests, a `pool` VM's connections | concurrency | 16 |
 | annotation `wicket.sluice.ik.am/warm` | the instances kept up with no request, from 0 to N | minimum instances | N, as on CF; a VM per connection: 0 |
 
-- **A component's warm instance** is a unit of the wicket's `pool`, taking one request at a time:
-  `warm: N` keeps N requests' worth warm, not N x `concurrency`. A request no warm unit takes gets
-  an instance of its own, ended with it, up to N x `concurrency` at once
+- **A component's instance** is no wasm instance but room for `concurrency` of them at once: the
+  wicket's wasm instance (a store) takes one request at a time, its budget, memory cap and trap
+  being that request's. `warm: N` keeps N of them, units of the wicket's `pool`: N requests' worth
+  warm, not N x `concurrency`. At `-i 1`, 16 requests at once are served so:
+
+  | request | served by |
+  |---|---|
+  | the 1st | the warm unit |
+  | the 2nd to the 16th | a wasm instance of its own, instantiated for it (~250us of a hello component) and ended with it |
+  | the 17th | the first of them to end, waited for within its `budget-ms`, then a 503 |
+
+  `memory` bounds each wasm instance: an instance taking 16 requests may take 16 x `memory`. A
+  request's own is named in `cf logs` by the lowest index free from `warm` up, modulo `instances`:
+  `0` at `-i 1`
 - **Scale to zero** is `warm: 0`. A component then has each request instantiate its own (~250us
   against ~130us warm of a hello component, [measured](../.kb/wicket-wasi-findings.md#a-pooled-units-latency))
   and keeps none between requests: `keep-ms` is refused. A `pool` VM grows to N on demand, and one
