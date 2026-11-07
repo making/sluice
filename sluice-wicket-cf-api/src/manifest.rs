@@ -249,6 +249,7 @@ fn apply_app(
     app.updated_at = now();
     check_annotations(&app.annotations, app.process.instances, runtime)
         .map_err(|e| format!("{name}: {e}"))?;
+    take_annotations(app);
     apply_routes(state, &guid, spec)?;
     apply_services(state, &guid, spec)?;
     Ok(guid)
@@ -595,8 +596,40 @@ fn check_count(lifetime: &Lifetime, instances: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether `app`, as its last start left it, holds at `instances`: annotations apply at a
-/// start, a count at once. A stopped app has nothing running.
+/// What the running `app` takes of its annotations at once, as it takes a count: how many
+/// instances and how long, which the wicket adjusts in place. Another mode than the one running
+/// is what an instance is: then none is taken, why being the error, and the next start takes
+/// them. None for an app that runs nothing.
+pub fn live_lifetime(app: &App) -> Option<Result<Lifetime, String>> {
+    let running = app.running.as_ref().filter(|_| app.started)?;
+    let runtime = match running.file.ends_with(crate::staging::ROOTFS) {
+        true => Runtime::Firecracker,
+        false => Runtime::Wasm,
+    };
+    let mode = |lifetime: &Lifetime| lifetime.mode.clone().unwrap_or_else(|| "pool".into());
+    Some(
+        check_annotations(&app.annotations, app.process.instances, Some(runtime)).and_then(
+            |annotated| match mode(&annotated) == mode(&running.lifetime) {
+                true => Ok(annotated),
+                false => Err(format!(
+                    "annotation {MODE_ANNOTATION}: {} runs as {}",
+                    mode(&running.lifetime),
+                    mode(&annotated)
+                )),
+            },
+        ),
+    )
+}
+
+/// Takes what [`live_lifetime`] says the running `app` takes of its annotations.
+pub fn take_annotations(app: &mut App) {
+    if let Some(Ok(lifetime)) = live_lifetime(app) {
+        app.running.as_mut().expect("running").lifetime = lifetime;
+    }
+}
+
+/// Whether `app`, as its last start left it, holds at `instances`: a count applies at once,
+/// annotations of another mode at a start. A stopped app has nothing running.
 pub fn check_running(app: &App, instances: u64) -> Result<(), String> {
     match app.running.as_ref().filter(|_| app.started) {
         Some(running) => check_count(&running.lifetime, instances).map_err(|e| {

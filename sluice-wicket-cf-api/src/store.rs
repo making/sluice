@@ -187,6 +187,8 @@ pub struct Running {
     pub files: Option<String>,
     pub memory_mib: u64,
     pub budget_ms: Option<u64>,
+    /// As annotated since: an edit of them in the mode of this start is taken at once
+    /// (`crate::manifest::live_lifetime`).
     #[serde(default)]
     pub lifetime: Lifetime,
     /// The capabilities the bindings granted.

@@ -255,8 +255,8 @@ another OpenID Provider and the like.
 | web process `instances` | [the limit](#instances) N: the route's `instances` is N x `concurrency`, its `pool` `warm`, N by default. A request no warm instance takes gets an instance of its own, up to the limit. 0 is [as on CF](#mapping): no app in the wicket. `cf logs` names the instance (`APP/PROC/WEB/<index>`, the requests' `app_index`) within `0` to `instances - 1`, what `cf app` lists: the wicket's index, a warm one's `0` to `pool - 1`, one of its own the lowest free from `pool` up, modulo `instances` |
 | web process `memory` | `memory-mib` |
 | annotation `wicket.sluice.ik.am/budget-ms` | `budget-ms` |
-| annotation `wicket.sluice.ik.am/concurrency` | [the requests an instance takes at once](#instances), from the next start as [a VM's](#how-long-a-vm-lives) |
-| annotation `wicket.sluice.ik.am/warm` | `pool`: [the instances kept up](#instances), from the next start as [a VM's](#how-long-a-vm-lives) (`cf scale -i` at once) |
+| annotation `wicket.sluice.ik.am/concurrency` | [the requests an instance takes at once](#instances), at once |
+| annotation `wicket.sluice.ik.am/warm` | `pool`: [the instances kept up](#instances), at once |
 | environment variables (`cf set-env`, a manifest's `env:`), `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: what the guest's `wasi:cli/environment` answers |
 | disk | accepted and shown, no effect |
 | security groups | accepted and shown, no effect: a component's network is the capabilities below |
@@ -651,7 +651,7 @@ The wicket's listing says `runtime: firecracker`.
 
 `cf scale -i` sets [the limit](#instances), annotations how long a VM lives below it: the route's
 options of the same names ([modes](../sluice-wicket-runtime-firecracker/README.md)), from a
-manifest's `metadata` or the v3 API.
+manifest's `metadata` or [the v3 API](#instances).
 
 ```yaml
 applications:
@@ -679,8 +679,9 @@ applications:
   none annotated being `pool`, what is no mode or no number, `warm` above the
   instances, a pool's `keep-ms` without a `warm`, `instances`, which `cf scale -i` and `concurrency` replace. A wicket not answering, by
   the app's next start
-- as `budget-ms` and the rest of the sandbox they apply at the next start; `cf scale -i` at once,
-  so it must hold both as the app runs (what its last start took) and as annotated, refused
+- at once, as `cf scale -i`: the wicket adjusts the running VMs, none restarted. `mode` is what
+  a VM is: another one than the running one waits for the next start, the others with it, the
+  log saying so, and `cf scale -i` must hold both as the app runs and as annotated, refused
   naming which: `cf restart` undoes a difference. A manifest's `instances` the running app
   cannot take (`cf push` restarts it right after) waits for the next start, the log saying so
 - `cf app` lists [the VMs alive](#instances), one coming with its restore and going as these say,
@@ -816,6 +817,15 @@ applications:
       wicket.sluice.ik.am/keep-ms: 60000   # a VM serving none stops after 60s
 ```
 
+The CLI has no command for annotations: without a manifest, the v3 API sets them (a string each,
+a `null` removing one), at once:
+
+```text
+cf curl -X PATCH "/v3/apps/$(cf app hello --guid)" \
+  -d '{"metadata": {"annotations": {"wicket.sluice.ik.am/warm": "0"}}}'
+cf curl "/v3/apps/$(cf app hello --guid)" | jq .metadata
+```
+
 As on CF, a scale keeps what runs. Up, one more instance starts and none of the others is touched:
 a VM cloned from the app's snapshot in a restore's time, whatever its boot takes, a component's unit
 instantiated. Down, the highest indices take no more requests: a component's unit ends after its
@@ -866,10 +876,11 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
 
 ## Behavior
 
-- as on CF, routes and `instances` apply at once; the droplet and the rest of the sandbox
-  (memory, annotations, the service bindings, the environment variables, the security groups) at a
-  start, restart, restage or deployment: the running app is the snapshot taken then. For `scale -m`
-  the CLI stops and starts the app itself
+- as on CF, routes and `instances` apply at once, and so do the annotations of how many
+  instances and how long ([Instances](#instances)); the droplet and the rest of the sandbox
+  (memory, `mode`, `budget-ms`, the service bindings, the environment variables, the security
+  groups) at a start, restart, restage or deployment: the running app is the snapshot taken then.
+  For `scale -m` the CLI stops and starts the app itself
 - environment variables: `cf set-env` / `unset-env`, a manifest's `env:` (merged, as `cf push`
   does) and `cf env` work as on CF. Refused: the names CF reserves (`VCAP_*`, `VMC*`, `PORT`),
   what the wicket refuses (`=` or a control character in a name, a NUL in a value) and more

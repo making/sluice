@@ -1333,14 +1333,12 @@ impl Api {
         let mut warnings = Vec::new();
         for guid in &guids {
             self.logs.add(guid, "API", "Applied the manifest");
-            let (waits, warning) = self.store.read(|state| match state.app(guid) {
-                Some(app) => (
-                    manifest::check_running(app, app.process.instances).err(),
-                    manifest::push_warning(app),
-                ),
-                None => (None, None),
-            });
-            warnings.extend(warning);
+            let Some(app) = self.store.read(|state| state.app(guid).cloned()) else {
+                continue;
+            };
+            self.annotations_waiting(&app);
+            let waits = manifest::check_running(&app, app.process.instances).err();
+            warnings.extend(manifest::push_warning(&app));
             if let Some(waits) = waits {
                 self.logs.add(
                     guid,
@@ -1438,12 +1436,14 @@ impl Api {
         Ok(json(StatusCode::CREATED, &view))
     }
 
+    /// Renames the app, sets its lifecycle and merges its metadata: the annotations of how many
+    /// instances and how long at once, once the wicket took them (`manifest::live_lifetime`).
     async fn patch_app(&self, req: &Req, guid: &str) -> Reply {
         let body: Value = req.json()?;
         let lifecycle = lifecycle(&body)?;
         self.app(guid)?;
         let runtime = self.controller.runtime().await.ok();
-        let view = self.store.update(|state| {
+        let change = |state: &mut State| {
             if let Some(name) = body["name"].as_str()
                 && state
                     .app_named(name)
@@ -1458,6 +1458,7 @@ impl Api {
                 .ok_or_else(|| ApiError::not_found("App"))?;
             // first: refused, it changes nothing
             apply_metadata(app, &body["metadata"], runtime)?;
+            manifest::take_annotations(app);
             if let Some(name) = body["name"].as_str() {
                 app.name = name.to_string();
             }
@@ -1475,10 +1476,26 @@ impl Api {
                 app.stack = stack.to_string();
             }
             app.updated_at = now();
-            let app = app.clone();
-            Ok(views::app(&req.base, state, &app))
-        })?;
+            Ok(())
+        };
+        self.edit_at_once(&[guid.to_string()], &change).await?;
+        let app = self.app(guid)?;
+        if body["metadata"]["annotations"].is_object() {
+            self.annotations_waiting(&app);
+        }
+        let view = self.store.read(|state| views::app(&req.base, state, &app));
         Ok(json(StatusCode::OK, &view))
+    }
+
+    /// Logs why the running `app` takes none of its annotations until its next start.
+    fn annotations_waiting(&self, app: &crate::store::App) {
+        if let Some(Err(waits)) = manifest::live_lifetime(app) {
+            self.logs.add(
+                &app.guid,
+                "API",
+                format!("The annotations wait for the next start: {waits}"),
+            );
+        }
     }
 
     /// Merges the body's `var` into the app's environment variables (a null

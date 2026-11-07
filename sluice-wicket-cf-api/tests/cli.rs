@@ -780,11 +780,9 @@ fn the_cf_cli_deploys_to_the_wicket() {
     cf.ok(&["delete", "none", "-f"]);
     cf.ok(&["scale", "hello", "-i", "2"]);
     assert_eq!(get(&listen, "hello.localhost", "/", None).0, 200);
-    // no warm instance is the annotation's, from the next start; VMs' annotations are refused
+    // no warm instance is the annotation's, at once; VMs' annotations are refused
     let warm = json!({"wicket.sluice.ik.am/warm": "0"});
     assert!(annotate(&cf, "hello", &warm).contains("\"guid\""));
-    assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 2);
-    cf.ok(&["restart", "hello"]);
     assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 0);
     assert_eq!(get(&listen, "hello.localhost", "/", None).0, 200);
     // `cf app` lists what is alive: none between requests, which nothing waiting for a start
@@ -823,17 +821,13 @@ fn the_cf_cli_deploys_to_the_wicket() {
     let refused = cf.ok(&["curl", "-X", "POST", "/v3/apps", "-d", &create]);
     assert!(refused.contains("no VMs"), "{refused}");
     assert!(!cf.ok(&["apps"]).contains("refused"), "no app comes of it");
-    // a scale holds as the app runs and as annotated, refused naming which
+    // a scale holds as annotated, refused naming it
     let warm = json!({"wicket.sluice.ik.am/warm": "2"});
     annotate(&cf, "hello", &warm);
     let refused = cf.fails(&["scale", "hello", "-i", "1"]);
     assert!(refused.contains("annotation"), "{refused}");
-    cf.ok(&["restart", "hello"]);
     annotate(&cf, "hello", &json!({"wicket.sluice.ik.am/warm": null}));
-    let refused = cf.fails(&["scale", "hello", "-i", "1"]);
-    assert!(refused.contains("cf restart"), "{refused}");
-    assert_eq!(instances_shown(&cf, "hello"), "2/2");
-    cf.ok(&["restart", "hello"]);
+    instances_come_to(&cf, "hello", "2/2");
     assert_eq!(listing(&console)["apps"][0]["sandbox"]["pool"], 2);
 
     // `cf scale` the limit: an instance takes 16 requests at once, the next waits for one of
@@ -879,7 +873,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
             && !recent.contains("app_index:\"1\""),
         "{recent}"
     );
-    // one at a time is the annotation's, from the next start; the limit follows the scale
+    // one at a time is the annotation's, at once; the limit follows the scale
     let limits = || {
         let listed = listing(&console);
         let apps = listed["apps"].as_array().unwrap();
@@ -893,8 +887,6 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "limited",
         &json!({"wicket.sluice.ik.am/concurrency": "1"}),
     );
-    assert_eq!(limits(), (Some(1), Some(16)), "until the next start");
-    cf.ok(&["restart", "limited"]);
     assert_eq!(limits(), (Some(1), Some(1)));
     beyond(1);
     cf.ok(&["scale", "limited", "-i", "2"]);
@@ -1997,7 +1989,8 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     }
     assert_eq!(answered_by().0, boot_id);
 
-    // `cf scale` the cap of VMs, the annotations how long one lives, from the next start
+    // `cf scale` the cap of VMs, the annotations how long one lives: another mode from the next
+    // start
     let sandbox = || {
         let listed = listing(&console);
         let apps = listed["apps"].as_array().unwrap();
@@ -2038,6 +2031,11 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     });
     assert!(annotate(&cf, "fc", &reuse).contains("\"guid\""));
     assert_eq!(sandbox().unwrap()["mode"], "pool", "until the next start");
+    let recent = cf.ok(&["logs", "fc", "--recent"]);
+    assert!(
+        recent.contains("annotations wait for the next start"),
+        "{recent}"
+    );
     cf.ok(&["restart", "fc"]);
     let fresh = sandbox().unwrap();
     assert_eq!(
@@ -2112,26 +2110,25 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     std::fs::write(&manifest, budget).unwrap();
     let refused = cf.fails(&["apply-manifest", "-f", manifest.to_str().unwrap()]);
     assert!(refused.contains("no components"), "{refused}");
-    // a manifest's count below what the start keeps warm waits for the next start, the
-    // wicket's route as it is: `cf push` restarts the app right after
-    annotate(&cf, "fc", &json!({"wicket.sluice.ik.am/warm": "2"}));
-    cf.ok(&["restart", "fc"]);
+    // how many and how long at once, the wicket adjusting the pool in place
+    let adjusted = json!({"wicket.sluice.ik.am/warm": "2", "wicket.sluice.ik.am/concurrency": "2"});
+    assert!(annotate(&cf, "fc", &adjusted).contains("\"guid\""));
+    assert_eq!(sandbox().unwrap()["conns"], 2);
+    // a manifest's count below what the running mode keeps warm waits with another mode for the
+    // next start, the wicket's route as it is: `cf push` restarts the app right after
     let manifest = dir.join("scaled.yml");
-    let scaled = "applications:\n- name: fc\n  instances: 1\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/warm: 0\n";
+    let scaled = "applications:\n- name: fc\n  instances: 1\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/mode: boot\n      wicket.sluice.ik.am/warm: null\n      wicket.sluice.ik.am/keep-ms: null\n      wicket.sluice.ik.am/concurrency: null\n";
     std::fs::write(&manifest, scaled).unwrap();
     cf.ok(&["apply-manifest", "-f", manifest.to_str().unwrap()]);
     assert_eq!(sandbox().unwrap()["vms"], 2);
-    assert!(cf.ok(&["logs", "fc", "--recent"]).contains("next start"));
-    cf.ok(&["restart", "fc"]);
-    let fresh = sandbox().unwrap();
-    assert_eq!((&fresh["vms"], &fresh["warm"]), (&1.into(), &0.into()));
+    let recent = cf.ok(&["logs", "fc", "--recent"]);
+    assert!(
+        recent.contains("instances wait for the next start"),
+        "{recent}"
+    );
     // booted: a VM of its own per instance, none restored. A scale takes what runs: up, it returns
     // without waiting for the boot, `cf app` listing what is alive; one VM's end is CRASHED at its
     // index alone, the others serving on, until another one is up there
-    cf.ok(&["scale", "fc", "-i", "1"]);
-    let booted = json!({"wicket.sluice.ik.am/mode": "boot", "wicket.sluice.ik.am/warm": null,
-        "wicket.sluice.ik.am/keep-ms": null, "wicket.sluice.ik.am/concurrency": null});
-    assert!(annotate(&cf, "fc", &booted).contains("\"guid\""));
     cf.ok(&["restart", "fc"]);
     assert_eq!(sandbox().unwrap()["mode"], "boot");
     assert_eq!(sandbox().unwrap().get("vms"), None, "one, its default");
