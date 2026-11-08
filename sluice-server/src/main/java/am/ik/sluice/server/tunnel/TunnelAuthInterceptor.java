@@ -38,6 +38,12 @@ public class TunnelAuthInterceptor implements ServerInterceptor {
 	/** Context key carrying the resolved client id. */
 	public static final Context.Key<String> CLIENT_ID = Context.key("sluice-client-id");
 
+	/**
+	 * Context key carrying the tunnel credential the stream presented: a session may only
+	 * replace one registered under the same credential.
+	 */
+	public static final Context.Key<String> CREDENTIAL = Context.key("sluice-tunnel-credential");
+
 	/** Context key carrying the peer address ({@code host:port}) of the client. */
 	public static final Context.Key<String> REMOTE_ADDRESS = Context.key("sluice-remote-address");
 
@@ -69,6 +75,7 @@ public class TunnelAuthInterceptor implements ServerInterceptor {
 		SocketAddress peer = call.getAttributes().get(Grpc.TRANSPORT_ATTR_REMOTE_ADDR);
 		Context context = Context.current()
 			.withValue(CLIENT_ID, clientId)
+			.withValue(CREDENTIAL, authorization == null ? "" : authorization)
 			.withValue(REMOTE_ADDRESS, remoteAddress(peer))
 			.withValue(SOURCE_ADDRESS, sourceAddress(peer));
 		return Contexts.interceptCall(context, call, headers, next);

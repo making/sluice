@@ -61,9 +61,15 @@ class TunnelSessionRegisteredLimitTest {
 	}
 
 	private TunnelSession session(SessionRegistry registry, String clientId, String source, RecordingStream stream) {
+		return session(registry, clientId, source, stream, "");
+	}
+
+	private TunnelSession session(SessionRegistry registry, String clientId, String source, RecordingStream stream,
+			String credential) {
 		TunnelSession session = TunnelSession.builder()
 			.clientId(clientId)
 			.sourceAddress(source)
+			.credential(credential)
 			.router(this.router)
 			.sender(new SessionSender(stream))
 			.registry(registry)
@@ -78,7 +84,12 @@ class TunnelSessionRegisteredLimitTest {
 
 	/** A session admitted, not advertised yet. */
 	private TunnelSession pending(SessionRegistry registry, String clientId, String source, RecordingStream stream) {
-		TunnelSession session = session(registry, clientId, source, stream);
+		return pending(registry, clientId, source, stream, "");
+	}
+
+	private TunnelSession pending(SessionRegistry registry, String clientId, String source, RecordingStream stream,
+			String credential) {
+		TunnelSession session = session(registry, clientId, source, stream, credential);
 		assertThat(session.start()).as("precondition: %s admitted", clientId).isEmpty();
 		return session;
 	}
@@ -272,6 +283,32 @@ class TunnelSessionRegisteredLimitTest {
 		assertThat(this.router.resolve("a.example.com")).as("the old session's routes stay").isPresent();
 		assertThat(registry.sessions("10.0.0.1")).isEqualTo(1);
 		assertThat(registry.sessions("10.0.0.9")).isEqualTo(1);
+	}
+
+	/**
+	 * A pending stream of a client id whose registered session presented another token is
+	 * refused at its advertise: the id belongs to the credential that registered it, and
+	 * the old session keeps its routes.
+	 */
+	@Test
+	void aSessionWhoseTokenDiffersCannotReplaceTheRegisteredOne() throws Exception {
+		SessionRegistry registry = registry(10, 0);
+		RecordingStream newerStream = new RecordingStream();
+		TunnelSession newer = pending(registry, "a", "10.0.0.1", newerStream, "Bearer other");
+		RecordingStream firstStream = new RecordingStream();
+		TunnelSession first = session(registry, "a", "10.0.0.1", firstStream, "Bearer shared");
+		first.start();
+		first.handle(advertise("a.example.com"));
+		firstStream.await(Frame.BodyCase.ADVERTISE_ACK, 1);
+
+		newer.handle(advertise("a.example.com"));
+		Status status = Status.fromThrowable(newerStream.awaitFailure());
+
+		assertThat(status.getCode()).isEqualTo(Status.Code.PERMISSION_DENIED);
+		assertThat(status.getDescription())
+			.isEqualTo(SessionRegistry.Refusal.CLIENT_TOKEN_MISMATCH.status().getDescription());
+		assertThat(registry.find("a")).contains(first);
+		assertThat(this.router.resolve("a.example.com")).as("the first session's routes stay").isPresent();
 	}
 
 	@Test

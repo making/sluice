@@ -65,8 +65,16 @@ public class SessionRegistry {
 		 * {@code sluice.limits.max-pending-tunnel-streams-per-address} streams from the
 		 * source address are pending.
 		 */
-		PENDING_ADDRESS_LIMIT("pending-address-limit", Status.RESOURCE_EXHAUSTED.withDescription(
-				"too many tunnel streams from this address are waiting for their client's first Advertise"));
+		PENDING_ADDRESS_LIMIT("pending-address-limit",
+				Status.RESOURCE_EXHAUSTED.withDescription(
+						"too many tunnel streams from this address are waiting for their client's first Advertise")),
+
+		/**
+		 * The client id is registered under another credential: only the token that
+		 * registered it may replace it.
+		 */
+		CLIENT_TOKEN_MISMATCH("client-token-mismatch",
+				Status.PERMISSION_DENIED.withDescription("the client id is registered under another tunnel token"));
 
 		private final String reason;
 
@@ -209,6 +217,9 @@ public class SessionRegistry {
 		@Nullable TunnelSession existing = this.sessions.get(session.clientId());
 		if (existing == session) {
 			return Optional.empty();
+		}
+		if (existing != null && !existing.credential().equals(session.credential())) {
+			return Optional.of(Refusal.CLIENT_TOKEN_MISMATCH);
 		}
 		if (existing == null && this.sessions.size() >= this.maxSessions) {
 			return Optional.of(Refusal.SESSION_LIMIT);

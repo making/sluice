@@ -247,6 +247,7 @@ public class TunnelService extends TunnelGrpc.TunnelImplBase {
 			.nodeId(this.properties.node().id())
 			.remoteAddress(remoteAddress)
 			.sourceAddress(Objects.requireNonNullElse(TunnelAuthInterceptor.SOURCE_ADDRESS.get(), ""))
+			.credential(Objects.requireNonNullElse(TunnelAuthInterceptor.CREDENTIAL.get(), ""))
 			.router(this.router)
 			.sender(sender)
 			.registry(this.sessions)

@@ -96,6 +96,9 @@ public final class TunnelSession implements AutoCloseable {
 
 	private final String sourceAddress;
 
+	/** The tunnel credential the client presented; only it may replace the session. */
+	private final String credential;
+
 	private final Instant connectedAt = Instant.now();
 
 	private final AtomicLong bytesInbound = new AtomicLong();
@@ -225,6 +228,7 @@ public final class TunnelSession implements AutoCloseable {
 		this.nodeId = builder.nodeId;
 		this.remoteAddress = builder.remoteAddress;
 		this.sourceAddress = builder.sourceAddress;
+		this.credential = builder.credential;
 		this.router = Objects.requireNonNull(builder.router, "router is required");
 		this.sender = Objects.requireNonNull(builder.sender, "sender is required");
 		this.tcpRoutes = Objects.requireNonNull(builder.tcpRoutes, "tcpRoutes is required");
@@ -257,6 +261,8 @@ public final class TunnelSession implements AutoCloseable {
 		private String remoteAddress = "";
 
 		private String sourceAddress = "";
+
+		private String credential = "";
 
 		private @Nullable Router router;
 
@@ -320,6 +326,15 @@ public final class TunnelSession implements AutoCloseable {
 		 */
 		public Builder sourceAddress(String sourceAddress) {
 			this.sourceAddress = sourceAddress;
+			return this;
+		}
+
+		/**
+		 * The tunnel credential the client presented; a session may only replace one
+		 * registered under the same credential.
+		 */
+		public Builder credential(String credential) {
+			this.credential = credential == null ? "" : credential;
 			return this;
 		}
 
@@ -454,6 +469,11 @@ public final class TunnelSession implements AutoCloseable {
 
 	public String clientId() {
 		return this.clientId;
+	}
+
+	/** The tunnel credential the client presented; empty when its stream carried none. */
+	String credential() {
+		return this.credential;
 	}
 
 	public FrameWriter sender() {
